@@ -4,19 +4,19 @@
 //! gate is syntax only and implies no simulation support.
 use std::path::Path;
 
-use ngspice_rs::analysis::RunConfig;
+use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::Netlist;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::SpiceError;
 
-fn run_op(n: &Netlist) -> Result<(RunConfig, String), SpiceError> {
+fn run_op(n: &Netlist) -> Result<(RunConfig, Plot), SpiceError> {
     let config = RunConfig::from_netlist(n)?;
     let mut circuit = config.circuit(n)?;
     let card = &n.analyses[0];
     let request = config.plan_for(card)?;
     let plot = request.run(&mut circuit, &config.context())?;
-    Ok((config, format!("{plot:?}")))
+    Ok((config, plot))
 }
 
 fn fixture() -> Netlist {

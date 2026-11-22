@@ -151,7 +151,10 @@ fn unknown_unimplemented_and_conflicting_options_are_errors() {
 fn method_and_maxord_reach_the_companion_driver() {
     use ngspice_rs::maths::integrator::IntegrationMethod;
     let c = config(".options method=Gear maxord=2").unwrap();
-    assert_eq!((c.method(), c.maxord()), (Some("gear"), Some(2)));
+    assert_eq!(
+        (c.method(), c.maxord()),
+        (Some(ngspice_rs::analysis::IntegrationFamily::Gear), Some(2))
+    );
     let ordinary = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m"]);
     for (options, method, order) in [
         (".options method=trap", IntegrationMethod::Trapezoidal, 2),

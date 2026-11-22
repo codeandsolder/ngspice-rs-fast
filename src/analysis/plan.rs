@@ -26,25 +26,32 @@ enum Schedule {
     Ladder,
 }
 
+/// Integration method independent of the deck's separate maximum order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Method {
+pub enum IntegrationFamily {
+    /// Trapezoidal integration.
     Trapezoidal,
+    /// Gear backward differentiation.
     Gear,
 }
 
-impl Method {
-    fn parse(text: &str) -> SpiceResult<Self> {
-        match text.to_ascii_lowercase().as_str() {
-            "trap" | "trapezoidal" => Ok(Self::Trapezoidal),
-            "gear" => Ok(Self::Gear),
-            "bdf" => Err(unsupported(
-                "method=bdf: ngspice has no BDF integrator (the diffsol backend was \
-                 removed); the companion methods are trap and gear",
-            )),
-            _ => Err(unsupported(format!(
-                "unknown transient method '{text}'; expected trap, trapezoidal or gear"
-            ))),
+impl IntegrationFamily {
+    pub(super) const fn from_name(text: &str) -> Option<Self> {
+        match IntegrationMethod::parse(text, 2) {
+            Some(IntegrationMethod::Trapezoidal) => Some(Self::Trapezoidal),
+            Some(IntegrationMethod::Gear { .. }) => Some(Self::Gear),
+            None => None,
         }
+    }
+
+    fn parse(text: &str) -> SpiceResult<Self> {
+        Self::from_name(text).ok_or_else(|| {
+            if text.eq_ignore_ascii_case("bdf") {
+                unsupported("method=bdf: ngspice has no BDF integrator (the diffsol backend was removed); the companion methods are trap and gear")
+            } else {
+                unsupported(format!("unknown transient method '{text}'; expected trap, trapezoidal or gear"))
+            }
+        })
     }
 
     const fn with_order(self, order: u8) -> IntegrationMethod {
@@ -117,7 +124,7 @@ impl SolverOverrides {
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct TransientOverrides {
-    method: Option<Method>,
+    method: Option<IntegrationFamily>,
     max_order: Option<u8>,
     chgtol: Option<Real>,
     trtol: Option<Real>,
@@ -142,15 +149,11 @@ impl TransientOverrides {
     fn resolve(self, config: &RunConfig) -> SpiceResult<TransientOptions> {
         let deck = config.transient();
         let max_order = self.max_order.or(config.maxord()).unwrap_or(2);
-        let method = match self.method {
-            Some(method) => method,
-            None => config
-                .method()
-                .map(Method::parse)
-                .transpose()?
-                .unwrap_or(Method::Trapezoidal),
-        }
-        .with_order(max_order);
+        let method = self
+            .method
+            .or(config.method())
+            .unwrap_or(IntegrationFamily::Trapezoidal)
+            .with_order(max_order);
         method.validate_runtime()?;
         Ok(TransientOptions {
             method,
@@ -276,7 +279,7 @@ impl TransientOverrides {
                     "unknown transient backend '{text}'; expected companion (default)"
                 )));
             }
-            "method" => self.method = Some(Method::parse(text)?),
+            "method" => self.method = Some(IntegrationFamily::parse(text)?),
             "maxord" => {
                 self.max_order = Some(
                     text.parse::<u8>()
@@ -360,7 +363,7 @@ pub(super) fn resolve_options(
 pub(super) enum PlanKind {
     OperatingPoint,
     Dc {
-        axes: Vec<crate::analysis::sweep::AxisPlan>,
+        axes: crate::analysis::sweep::DcSweepPlan,
         point_iterations: Option<usize>,
     },
     Ac {
@@ -847,5 +850,132 @@ mod tests {
             let input = AnalysisInput::with_arguments(AnalysisKind::Transient, args);
             assert!(resolve_options(&input, &RunConfig::default()).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use crate::analysis::{AnalysisContext, DRIVERS, NoiseOptions, has_driver};
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use crate::primitives::SpiceError;
+    use std::path::Path;
+
+    #[test]
+    fn every_supported_driver_has_a_resolvable_plan() {
+        let inputs = [
+            (AnalysisKind::OperatingPoint, ""),
+            (AnalysisKind::DcSweep, "v1 0 1 0.1"),
+            (AnalysisKind::Ac, "lin 3 1 3"),
+            (AnalysisKind::Transient, "1u 1m"),
+            (AnalysisKind::PoleZero, "in 0 out 0 vol pz"),
+            (AnalysisKind::TransferFunction, "v ( out ) v1"),
+            (AnalysisKind::SParameter, "lin 3 1 3"),
+            (AnalysisKind::Noise, "v(out) v1 lin 3 1 3"),
+            (AnalysisKind::Distortion, "dec 2 1k 10k"),
+            (AnalysisKind::Sensitivity, "v ( out )"),
+        ];
+        assert_eq!(inputs.map(|(kind, _)| kind), DRIVERS);
+        for (kind, arguments) in inputs {
+            let plan = AnalysisInput::with_arguments(kind, arguments.split_whitespace())
+                .resolve()
+                .unwrap();
+            assert!(has_driver(kind));
+            assert_eq!(plan.kind(), kind);
+        }
+        let error = AnalysisInput::new(AnalysisKind::Fourier)
+            .resolve()
+            .unwrap_err();
+        assert!(!error.is_not_yet_ported());
+        assert!(error.to_string().contains("four"));
+        assert!(!has_driver(AnalysisKind::Fourier));
+    }
+
+    #[test]
+    fn invalid_dc_geometry_fails_without_a_circuit() {
+        for arguments in [
+            "v1 0 1 0",
+            "v1 0 1 -1",
+            "v1 -1e308 1e308 1",
+            "v1 0 1e6 1",
+            "v1 0 999 1 v2 0 100 1",
+            "temp -300 0 100",
+            "temp 0 1e-12 1e-15",
+        ] {
+            let error =
+                AnalysisInput::with_arguments(AnalysisKind::DcSweep, arguments.split_whitespace())
+                    .resolve()
+                    .unwrap_err();
+            assert!(
+                matches!(error, SpiceError::Unsupported { .. }),
+                "{arguments}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn irrelevant_flags_are_rejected_and_explicit_values_override_deck() {
+        let deck = parse_deck_text(
+            Path::new("flags.cir"),
+            "flags\nv1 a 0 dc 0 ac 1\nr1 a 0 1k\n.control\nset sqrnoise\nset ngbehavior=s3\n.endc\n.options keepopinfo\n.noise v(a) v1 lin 3 1 3\n.op\n.end\n",
+        );
+        let netlist = Parser::new().parse_deck(&deck).unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+        assert_eq!(
+            plan.noise_options(),
+            Some(NoiseOptions {
+                squared: true,
+                spice3: true
+            })
+        );
+        assert!(plan.retains_bias());
+        assert_eq!(plan.plot_count(), 3);
+        let mut input = AnalysisInput::from(&netlist.analyses[0]);
+        input.noise = Some(NoiseOptions::default());
+        input.keep_op_info = Some(false);
+        let plan = config.plan(input).unwrap();
+        assert_eq!(plan.noise_options(), Some(NoiseOptions::default()));
+        assert!(!plan.retains_bias());
+        assert_eq!(plan.plot_count(), 2);
+        let mut op = AnalysisInput::new(AnalysisKind::OperatingPoint);
+        assert_eq!(config.plan(op.clone()).unwrap().noise_options(), None);
+        op.noise = Some(NoiseOptions::default());
+        assert!(config.plan(op.clone()).is_err());
+        op.noise = None;
+        op.keep_op_info = Some(false);
+        assert!(config.plan(op.clone()).is_err());
+        op.keep_op_info = None;
+        op.uic = true;
+        assert!(config.plan(op).is_err());
+    }
+
+    #[test]
+    fn invalid_deck_plan_diagnostics_retain_card_location() {
+        let deck = parse_deck_text(
+            Path::new("invalid.cir"),
+            "invalid\nr1 a 0 1k\n.op\n.dc v1 0 1000000 1\n.end\n",
+        );
+        let netlist = Parser::new().parse_deck(&deck).unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let error = config.plans_for(&netlist.analyses).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SpiceError::Unsupported { location: Some(ref location), .. }
+                if location == &netlist.analyses[1].location
+            ),
+            "{error}"
+        );
+        let plan = AnalysisInput::new(AnalysisKind::OperatingPoint)
+            .resolve()
+            .unwrap();
+        let error = plan
+            .run(
+                &mut crate::devices::Circuit::new(),
+                &AnalysisContext::default(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("nonempty square"), "{error}");
     }
 }

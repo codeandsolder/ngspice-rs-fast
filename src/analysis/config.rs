@@ -77,7 +77,7 @@
 //! word, never an expression.
 //!
 //! `.ic` and `.nodeset` cards are not options: [`RunConfig::from_netlist`]
-//! evaluates them against `.param` and [`RunConfig::request`] attaches them to
+//! evaluates them against `.param` and [`RunConfig::plan`] attaches them to
 //! every analysis request (`AnalysisInput::initial_conditions`/`nodesets`).
 //!
 //! # Precedence
@@ -97,8 +97,8 @@
 //! conflict error. A [`RunConfig`] is a plain value computed per deck, so
 //! nothing leaks between decks.
 
+use crate::analysis::IntegrationFamily;
 use crate::devices::Circuit;
-use crate::maths::integrator::IntegrationMethod;
 use crate::netlist::ast::{AnalysisCard, Netlist, OptionCard, OptionSetting};
 use crate::netlist::eval::{EvalBudget, ParamScope};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
@@ -403,7 +403,7 @@ pub struct RunConfig {
     context: AnalysisContext,
     transient: TransientSettings,
     dc: DcOptions,
-    method: Option<(String, SourceLoc)>,
+    method: Option<IntegrationFamily>,
     maxord: Option<(u8, SourceLoc)>,
     applied: Vec<AppliedOption>,
     ignored: Vec<IgnoredOption>,
@@ -834,16 +834,15 @@ impl RunConfig {
         let location = &setting.location;
         match name {
             "method" => {
-                if IntegrationMethod::parse(&value.text, 2).is_none() {
-                    return Err(SpiceError::parse(
+                self.method = Some(IntegrationFamily::from_name(&value.text).ok_or_else(|| {
+                    SpiceError::parse(
                         value.location.clone(),
                         format!(
                             "method must be trap, trapezoidal or gear, not '{}'",
                             value.text
                         ),
-                    ));
-                }
-                self.method = Some((value.text.to_ascii_lowercase(), location.clone()));
+                    )
+                })?);
             }
             "maxord" => {
                 let order = input
@@ -986,10 +985,10 @@ impl RunConfig {
         &self.dc
     }
 
-    /// Retained `method=` selection, lowercased, if the deck gave one.
+    /// Typed integration family, if the deck selected one.
     #[must_use]
-    pub fn method(&self) -> Option<&str> {
-        self.method.as_ref().map(|(name, _)| name.as_str())
+    pub const fn method(&self) -> Option<IntegrationFamily> {
+        self.method
     }
 
     /// Retained `maxord=` selection, if the deck gave one.

@@ -607,7 +607,10 @@ fn existing_effective_options_are_still_applied() {
         (t.rtol, t.vntol, t.abstol, t.chgtol, t.trtol),
         (Some(1e-4), Some(2e-6), Some(3e-12), Some(1e-13), Some(5.))
     );
-    assert_eq!((c.method(), c.maxord()), (Some("gear"), Some(1)));
+    assert_eq!(
+        (c.method(), c.maxord()),
+        (Some(ngspice_rs::analysis::IntegrationFamily::Gear), Some(1))
+    );
     assert_eq!(
         (c.dc().srcsteps, c.dc().gminsteps, c.dc().gminfactor),
         (Some(2), Some(4), Some(5.))
