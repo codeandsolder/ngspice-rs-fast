@@ -250,10 +250,10 @@ impl Waveform {
                 "breakpoint window must be finite with t0 <= t1",
             ));
         }
-        let fixed: Vec<Real> = match self {
-            Self::Constant(_) => vec![],
+        let (fixed, kind) = match self {
+            Self::Constant(_) => (vec![], WaveformEventKind::FunctionCorner),
             Self::PortSeries { baseline, .. } => return baseline.breakpoints_in(t0, t1),
-            Self::Step { time, .. } => vec![*time],
+            Self::Step { time, .. } => (vec![*time], WaveformEventKind::StepJump),
             Self::Pulse(pulse) => {
                 return Ok(WaveformBreakpoints(Inner::Pulse(
                     pulse.breakpoints_in(t0, t1)?,
@@ -262,7 +262,7 @@ impl Waveform {
             Self::Pwl(pwl) => {
                 return Ok(WaveformBreakpoints(Inner::Pwl(pwl.breakpoints_in(t0, t1)?)));
             }
-            Self::Function(function) => function.corners(),
+            Self::Function(function) => (function.corners(), WaveformEventKind::FunctionCorner),
             Self::PulseDefaults(_) | Self::FunctionDefaults(_) => {
                 return Err(SpiceError::circuit(
                     "source defaults are unresolved; bind transient timing before enumerating breakpoints",
@@ -273,10 +273,57 @@ impl Waveform {
             fixed
                 .into_iter()
                 .filter(|t| (t0..=t1).contains(t))
+                .map(|time| WaveformEvent { time, kind })
                 .collect::<Vec<_>>()
                 .into_iter(),
         )))
     }
+}
+
+/// Provenance of an event in a resolved source waveform. A waveform corner
+/// is not necessarily an accepted simulator breakpoint: C's accept callbacks
+/// apply their own rounding, coalescing and source-specific scheduling policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveformEventKind {
+    /// Start of a pulse (also a possible transition at a truncated period).
+    PulsePeriodStart,
+    /// An ordinary rise/plateau/fall corner.
+    PulseEdge,
+    /// A fractional pulse count terminates an active pulse.
+    PulseCountCut,
+    /// C's final accept request beyond the pulse count; not a forcing corner.
+    PulseTrailingRequest,
+    /// A supplied PWL knot.
+    PwlKnot,
+    /// A PWL end knot that also starts the next repetition (possibly a jump).
+    PwlRepeatBoundary,
+    /// A programmatically constructed step discontinuity.
+    StepJump,
+    /// SIN/EXP/SFFM/AM delay or slope corner; C does not request a breakpoint.
+    FunctionCorner,
+}
+
+/// One event, at its exact generated time before any comparison tolerance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaveformEvent {
+    /// Absolute time.
+    pub time: Real,
+    /// Its origin in the waveform.
+    pub kind: WaveformEventKind,
+}
+
+/// A finalized circuit's independent source, resolved for one transient plan.
+/// The same validated waveform type supplies simulation forcing and events.
+/// Source identity is separate from time because different sources may have
+/// coincident corners.
+#[derive(Debug, Clone)]
+pub struct SourceTimeline<'a> {
+    /// Elaborated instance name (including its subcircuit path).
+    pub name: &'a str,
+    /// Physical source type.
+    pub kind: SourceKind,
+    /// Analysis-resolved waveform.
+    pub waveform: Waveform,
 }
 
 /// Lazy breakpoint sequence of one [`Waveform`] (see [`Waveform::breakpoints_in`]).
@@ -284,18 +331,25 @@ impl Waveform {
 pub struct WaveformBreakpoints(Inner);
 #[derive(Debug, Clone)]
 enum Inner {
-    Fixed(std::vec::IntoIter<Real>),
+    Fixed(std::vec::IntoIter<WaveformEvent>),
     Pulse(crate::devices::pulse::PulseBreakpoints),
     Pwl(crate::devices::functions::PwlBreakpoints),
+}
+impl WaveformBreakpoints {
+    /// Advance the same sequence as the time-only iterator, retaining event
+    /// provenance. Use this when deciding which events require C samples.
+    pub fn next_event(&mut self) -> Option<WaveformEvent> {
+        match &mut self.0 {
+            Inner::Fixed(it) => it.next(),
+            Inner::Pulse(it) => it.next_event(),
+            Inner::Pwl(it) => it.next_event(),
+        }
+    }
 }
 impl Iterator for WaveformBreakpoints {
     type Item = Real;
     fn next(&mut self) -> Option<Real> {
-        match &mut self.0 {
-            Inner::Fixed(it) => it.next(),
-            Inner::Pulse(it) => it.next(),
-            Inner::Pwl(it) => it.next(),
-        }
+        self.next_event().map(|event| event.time)
     }
 }
 
