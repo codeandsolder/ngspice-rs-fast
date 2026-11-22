@@ -583,6 +583,34 @@ fn weighted_difference(weight: Real, left: Real, right: Real, addend: Real) -> R
     }
 }
 
+/// Extrapolate two estimates over a positive distance relative to the interval
+/// between their nodes. Retain the ratio's exponent until multiplication when
+/// the ratio itself cannot be represented normally.
+fn extrapolate(left: Real, right: Real, distance: (Real, i32), interval: (Real, i32)) -> Real {
+    if left == right {
+        return left;
+    }
+    let mantissa = distance.0 / interval.0;
+    let exponent = distance.1 - interval.1;
+    let ratio = finish_weight(mantissa, exponent);
+    if ratio.is_normal() {
+        return weighted_difference(ratio, left, right, left);
+    }
+    let difference = left - right;
+    let (difference, adjustment) = if difference.is_finite() {
+        (difference, 0)
+    } else {
+        (left * 0.5 - right * 0.5, 1)
+    };
+    // The difference is nonzero for unequal finite operands, but an
+    // overflowing intermediate estimate must remain a numerical failure.
+    let Some(power) = crate::primitives::numeric::binary_exponent(difference) else {
+        return difference;
+    };
+    let normalized = difference / span_power(power);
+    left + finish_weight(mantissa * normalized, exponent + power + adjustment)
+}
+
 impl Coefficients {
     /// The integration rule.
     #[must_use]
@@ -681,17 +709,19 @@ impl Coefficients {
                 -self.ag[0] * charge[1],
             )
         } else {
-            // Gear weights annihilate constants. Shift charges by the trial
-            // value before the dot product to avoid catastrophic cancellation
-            // of large, nearly equal absolute charges. Form the history source
-            // independently, not by subtracting the rounded present term.
-            let mut derivative = 0.;
-            let mut current = 0.;
-            for k in (1..needed).rev() {
-                derivative = weighted_difference(self.ag[k], charge[k], charge[0], derivative);
-                current = self.ag[k].mul_add(charge[k], current);
+            // Anchor at the most recent accepted charge. The two largest
+            // history weights can nearly cancel after an abruptly shortened
+            // accepted step; never reconstruct the present weight from them.
+            // The same correction contributes to the derivative and history
+            // source, and constant charge has an exactly zero derivative.
+            let mut correction = 0.;
+            for k in (2..needed).rev() {
+                correction = weighted_difference(self.ag[k], charge[k], charge[1], correction);
             }
-            (derivative, current)
+            (
+                weighted_difference(self.ag[0], charge[0], charge[1], correction),
+                (-self.ag[0]).mul_add(charge[1], correction),
+            )
         };
         Ok(Companion {
             derivative: finite(derivative, "integrated derivative")?,
@@ -752,23 +782,20 @@ impl Coefficients {
                 }
             }
             IntegrationMethod::Gear { .. } => {
-                // Lagrange extrapolation to the trial time from nodes at
-                // distance t_{n+1} - t_{n-i}.
-                let mut nodes = [0.0; HISTORY_LEN + 1];
-                let mut sum = 0.0;
-                for (i, node) in nodes.iter_mut().take(order + 1).enumerate() {
-                    sum += d[i];
-                    *node = sum;
+                // Neville extrapolation combines adjacent polynomials in
+                // difference form. It preserves constants exactly, without
+                // forming large cancelling Lagrange weights or subtracting
+                // nearly equal cumulative timestamps.
+                let mut values = [0.; HISTORY_LEN + 1];
+                values[..=order].copy_from_slice(x);
+                for width in 1..=order {
+                    for i in 0..=order - width {
+                        let distance = scaled_span(&d[..=i]);
+                        let interval = scaled_span(&d[i + 1..=i + width]);
+                        values[i] = extrapolate(values[i], values[i + 1], distance, interval);
+                    }
                 }
-                (0..=order)
-                    .map(|i| {
-                        let weight: Real = (0..=order)
-                            .filter(|&j| j != i)
-                            .map(|j| nodes[j] / (nodes[j] - nodes[i]))
-                            .product();
-                        weight * x[i]
-                    })
-                    .sum()
+                values[0]
             }
         };
         finite(predicted, "prediction")
@@ -1170,6 +1197,36 @@ mod tests {
         let result = c.integrate(&charge, Some(0.), 1.).unwrap();
         assert_eq!(result.derivative, f64::MAX);
         assert_eq!(result.current, f64::MAX * 0.5);
+    }
+
+    #[test]
+    fn gear_history_uses_the_well_conditioned_present_coefficient() {
+        // q(t) = max(t, 0) is affine across the trial interval and constant
+        // over the two historical nodes. The exact interpolant derivative is
+        // ag0 * (q0 - q1), not the difference of two huge history weights.
+        let warm = history(&[1e-15]);
+        let c = warm.trial(GEAR2, 2, 1., DEFAULT_XMU).unwrap();
+        let a = c.integrate(&[1., 0., 0.], None, 1.).unwrap();
+        assert_eq!(a.derivative.to_bits(), c.ag()[0].to_bits());
+        let b = c.integrate(&[2., 1., 1.], None, 1.).unwrap();
+        assert_eq!(b.derivative.to_bits(), a.derivative.to_bits());
+        assert_eq!(b.current.to_bits(), (-c.ag()[0]).to_bits());
+    }
+
+    #[test]
+    fn gear_predictor_preserves_constants_and_extreme_linear_extrapolation() {
+        for (trial, old) in [(1e12, 1e-6), (1e308, 1e-308), (1e-300, 1e300)] {
+            let warm = history(&[old]);
+            let c = warm.trial(GEAR6, 1, trial, DEFAULT_XMU).unwrap();
+            assert_eq!(c.predict(&[1e200; 2]).unwrap(), 1e200);
+            let estimate = c.predict(&[0., -old]).unwrap();
+            assert!((estimate / trial - 1.).abs() <= 4. * f64::EPSILON);
+        }
+        let warm = history(&[1e-15; 6]);
+        for order in 1..=6 {
+            let c = warm.trial(GEAR6, order, 1., DEFAULT_XMU).unwrap();
+            assert_eq!(c.predict(&[1e200; 7]).unwrap(), 1e200);
+        }
     }
 
     #[test]
