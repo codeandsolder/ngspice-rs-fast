@@ -824,6 +824,7 @@ struct RowEntry {
     imaginary: CompensatedSum,
 }
 
+#[cfg(test)]
 impl RowEntry {
     const fn value(&self) -> Complex {
         Complex::new(self.real.total(), self.imaginary.total())
@@ -973,7 +974,7 @@ impl PerturbedAssembly<'_> {
     fn visit_products(
         self,
         x: &[Complex],
-        mut visit: impl FnMut(usize, Complex),
+        mut visit: impl FnMut(usize, [CompensatedSum; 2]),
     ) -> SpiceResult<()> {
         if x.len() != self.matrix.numbering.internal.len() {
             return Err(SpiceError::Numerical {
@@ -988,12 +989,14 @@ impl PerturbedAssembly<'_> {
             // but compensate each component of the cancellation-prone dot.
             if self.matrix.rows[row].first.is_some() {
                 for entry in self.matrix.fold_row(row, self.base_count) {
-                    let product = entry.value() * x[entry.col.0];
-                    real.add(product.re);
-                    imaginary.add(product.im);
+                    let value = x[entry.col.0];
+                    entry.real.multiply_into(value.re, &mut real);
+                    entry.imaginary.multiply_into(-value.im, &mut real);
+                    entry.real.multiply_into(value.im, &mut imaginary);
+                    entry.imaginary.multiply_into(value.re, &mut imaginary);
                 }
             }
-            visit(row, Complex::new(real.total(), imaginary.total()));
+            visit(row, [real, imaginary]);
         }
         Ok(())
     }
@@ -1235,8 +1238,13 @@ impl DcState<'_> {
         scratch.matrix.clear();
         self.load(index, perturbed, &mut scratch.matrix, &mut scratch.rhs)?;
         assembly.add(real_stamps(&scratch.matrix))?;
-        assembly.visit_products(&self.solution, |row, product| {
-            scratch.rhs.as_mut_slice()[row] -= product.re;
+        assembly.visit_products(&self.solution, |row, [mut real, _]| {
+            // Round delta_I - delta_Y E only after the residual is assembled,
+            // not after the potentially cancelling matrix-vector product.
+            let value = &mut scratch.rhs.as_mut_slice()[row];
+            real.negate();
+            real.add(*value);
+            *value = real.total();
         })?;
         // Nonfinite loads poison the entire connected block, as in C.
         // The mask remains unallocated on the normal path and reuses capacity.
@@ -1331,9 +1339,13 @@ impl AcState<'_> {
             *base = Complex::new(-base.re + perturbed.re, -base.im + perturbed.im);
         }
         assembly.add(self.stamps(&scratch.system))?;
-        assembly.visit_products(&self.solution, |row, product| {
-            scratch.rhs[row].re -= product.re;
-            scratch.rhs[row].im -= product.im;
+        assembly.visit_products(&self.solution, |row, [mut real, mut imaginary]| {
+            let value = &mut scratch.rhs[row];
+            real.negate();
+            imaginary.negate();
+            real.add(value.re);
+            imaginary.add(value.im);
+            *value = Complex::new(real.total(), imaginary.total());
         })?;
         self.factors
             .solve_with_workspace(&scratch.rhs, &mut scratch.solve)
@@ -1825,7 +1837,9 @@ mod tests {
         let x = [Complex::real(1.); 3];
         let mut result = [Complex::ZERO; 3];
         perturbed
-            .visit_products(&x, |row, sum| result[row] = sum)
+            .visit_products(&x, |row, [real, imaginary]| {
+                result[row] = Complex::new(real.total(), imaginary.total())
+            })
             .unwrap();
         assert_eq!(result, [Complex::real(1.), Complex::ZERO, Complex::ZERO]);
         let stamp_capacity = matrix.stamps.capacity();
@@ -1834,7 +1848,9 @@ mod tests {
             .begin([(1, 0)])
             .unwrap()
             .negate()
-            .visit_products(&x, |row, sum| result[row] = sum)
+            .visit_products(&x, |row, [real, imaginary]| {
+                result[row] = Complex::new(real.total(), imaginary.total())
+            })
             .unwrap();
         assert_eq!(result, [Complex::ZERO; 3]);
         assert_eq!(matrix.stamps.capacity(), stamp_capacity);
@@ -1847,6 +1863,26 @@ mod tests {
                 Some(super::InternalIndex(0))
             ]
         );
+    }
+
+    #[test]
+    fn perturbation_residual_retains_product_roundoff_across_rhs_cancellation() {
+        use super::DeltaMatrix;
+        use crate::primitives::Complex;
+
+        let small = 2_f64.powi(-27);
+        let mut matrix = DeltaMatrix::new(1);
+        let mut perturbed = matrix.begin([]).unwrap().negate();
+        perturbed
+            .add([stamp(0, 0, Complex::real(1. + small))])
+            .unwrap();
+        perturbed
+            .visit_products(&[Complex::real(1. - small)], |_, [mut real, _]| {
+                real.negate();
+                real.add(1.);
+                assert_eq!(real.total(), small * small);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1915,7 +1951,9 @@ mod tests {
         }
         let mut seen = Vec::new();
         perturbed
-            .visit_products(&[Complex::real(1.); 4], |row, sum| seen.push((row, sum)))
+            .visit_products(&[Complex::real(1.); 4], |row, [real, imaginary]| {
+                seen.push((row, Complex::new(real.total(), imaginary.total())))
+            })
             .unwrap();
         assert_eq!(
             seen,

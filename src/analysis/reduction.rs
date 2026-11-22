@@ -39,6 +39,23 @@ impl CompensatedSum {
         self.sum = next;
     }
 
+    /// Accumulate the two parts of this sum multiplied by another value,
+    /// retaining the rounding residual of each finite product.
+    pub(super) fn multiply_into(self, multiplier: Real, target: &mut Self) {
+        target.add_product(self.sum, multiplier);
+        if self.correction != 0. {
+            target.add_product(self.correction, multiplier);
+        }
+    }
+
+    fn add_product(&mut self, left: Real, right: Real) {
+        let product = left * right;
+        self.add(product);
+        if product.is_finite() {
+            self.add(left.mul_add(right, -product));
+        }
+    }
+
     pub(super) const fn total(self) -> Real {
         if self.correction == 0. {
             self.sum

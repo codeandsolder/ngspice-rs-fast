@@ -788,3 +788,12 @@ result: with three steps and log10(high/low) equal to the binary64
 0.6633333333333332, the separately rounded product plus 1.01 truncates to
 three points, whereas a fused multiply-add truncates to two. The discrete
 count and existing stepping policy therefore remain unchanged in this audit.
+
+
+The perturbation product keeps both parts of each compensated matrix
+entry, and adds the FMA residual of each finite real multiplication.
+The right-hand side is combined with the compensated row product before
+rounding the final residual. This retains terms lost by rounding the dot
+product alone: for example, 1 - (1 + 2^-27)(1 - 2^-27) is 2^-54, not zero.
+This does not recover information already rounded inside a device load,
+nor change the finite parameter-perturbation policy.
