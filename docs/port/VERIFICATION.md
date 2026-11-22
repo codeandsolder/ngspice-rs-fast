@@ -1109,7 +1109,7 @@ registered in `golden verify` with `compare::TRAN`: `rc_sin_tran`,
 repetition boundaries C's single loaded value depends on ulp-level rounding of
 its landing time, while the port always takes the left limit (see
 [TRANSIENT.md](TRANSIENT.md#source-functions-94-95)). `tran::breakpoints` uses the resolved waveform timeline: nominal PULSE
-corners up to `TD + NP*PER`, delayed and repeated PWL knots, none for
+corners up to `TD + NP*PER` (including physical count cuts), delayed and repeated PWL knots, none for
 SIN/EXP/SFFM/AM. The SIN and EXP decks therefore add a constant PWL marker whose
 knots make C land on the function's corners; without it the comparator would
 interpolate C's plot across a slope corner that only the port lands on.
@@ -1742,8 +1742,8 @@ that mention BDF, `TRAN_RESTART` and variants are that historical record.)
   analysis defaults for simulation and comparison. Lazy events retain source
   identity, exact times and kind (PULSE edge/period/count cut, PWL knot/repeat
   boundary, step jump, analytic-function corner or trailing accept request).
-  Nominal PULSE/PWL/step corners require samples in both plots; analytic
-  corners, fractional count cuts without C accept requests, and post-count
+  Nominal PULSE/PWL/step corners, including physical fractional-count cuts,
+  require samples in both plots; analytic corners and post-count
   scheduling-only requests do not. The global event budget is checked before
   filtering or tolerance coalescing. The comparator reports a missing sample
   rather than smoothing over the required corner. C's accept callbacks keep

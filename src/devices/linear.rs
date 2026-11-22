@@ -313,6 +313,7 @@ impl WaveformEventKind {
             self,
             Self::PulsePeriodStart
                 | Self::PulseEdge
+                | Self::PulseCountCut
                 | Self::PwlKnot
                 | Self::PwlRepeatBoundary
                 | Self::StepJump

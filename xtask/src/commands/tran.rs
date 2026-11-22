@@ -357,8 +357,9 @@ pub(super) fn transient(
 /// Source breakpoints required to have samples in both transient plots.
 /// Uses the same validated, elaborated forcing as the driver, including
 /// nested parameterized sources and the effective last waveform setter.
-/// The timeline distinguishes physical-only corners and trailing scheduling
-/// requests, neither of which requires a C plot to supply a one-sided limit.
+/// Analytic function corners and trailing scheduling requests are not
+/// required; an actual pulse-count cut is a discontinuity and must not be
+/// interpolated across, even if C did not schedule a landing there.
 pub(super) fn breakpoints(circuit: &Circuit, timing: &TransientTiming) -> Result<Vec<f64>, String> {
     let stop_time = timing.final_time();
     let eps = TIME_EPS_REL * stop_time;
@@ -880,6 +881,13 @@ mod tests {
                 "{card}"
             );
         }
+    }
+
+    #[test]
+    fn fractional_count_cut_is_required_but_trailing_request_is_not() {
+        let netlist = deck("v1 in 0 pulse(0 5 2 1 2 3 10 1.25)");
+        let found = deck_breakpoints(&netlist, 0.1, 30.0).unwrap();
+        assert_eq!(found, vec![2.0, 3.0, 6.0, 8.0, 12.0, 13.0, 14.5]);
     }
 
     #[test]
