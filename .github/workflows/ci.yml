@@ -28,7 +28,7 @@ jobs:
 
   strict-rust:
     name: Strict Rust and workflow policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@6b9048b1c624a0041b14ac2ea53ff63722966e30 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@073d436b3d759343900bdc5e4ddecfa120792b8c # main
     with:
       allow-test-panics: true
       rust-toolchain: nightly-2026-11-20
