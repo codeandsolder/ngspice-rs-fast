@@ -73,7 +73,7 @@ pub const C_REFERENCE: &str = "src/frontend/numparam/xpressn.c (formula, operate
 /// Work bounds for evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvalLimits {
-    /// Maximum number of `name=expression` definitions in one scope.
+    /// Maximum definitions in one scope, or sequential measurement records.
     pub definitions: usize,
     /// Maximum expression nodes evaluated by one [`EvalBudget`].
     pub nodes: usize,
@@ -172,6 +172,84 @@ pub struct ParamScope {
     entries: Vec<ParamEntry>,
     active: HashMap<String, usize>,
     functions: Option<Arc<FunctionScope>>,
+}
+
+/// Already evaluated values published in sequence over an immutable parameter
+/// environment. This is a single namespace, not one lexical scope per value.
+/// Lookups never traverse earlier publications, and the parent's lifetime
+/// is borrowed rather than cloned.
+pub(crate) struct SequentialBindings<'a> {
+    base: &'a ParamScope,
+    values: HashMap<String, Real>,
+    remaining: usize,
+}
+
+impl<'a> SequentialBindings<'a> {
+    pub(crate) fn new(base: &'a ParamScope, bindings: usize) -> Self {
+        Self {
+            base,
+            values: HashMap::new(),
+            remaining: bindings,
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<Real> {
+        let key = canonical_lookup(name);
+        self.values
+            .get(key.as_ref())
+            .copied()
+            .or_else(|| self.base.get(key.as_ref()))
+    }
+
+    /// Publish one finite result after successful evaluation. A repeated
+    /// name replaces only its active value; callers retain ordered results.
+    pub(crate) fn publish(
+        &mut self,
+        name: &str,
+        value: Real,
+        location: &SourceLoc,
+    ) -> SpiceResult<()> {
+        if !value.is_finite() {
+            return Err(SpiceError::parse(
+                location.clone(),
+                format!("binding '{name}' is not finite"),
+            ));
+        }
+        if self.remaining == 0 {
+            return Err(SpiceError::parse(
+                location.clone(),
+                "sequential binding limit exceeded",
+            ));
+        }
+        let key = canonical_lookup(name);
+        if let Some(previous) = self.values.get_mut(key.as_ref()) {
+            *previous = value;
+        } else {
+            self.values.try_reserve(1).map_err(|error| {
+                SpiceError::parse(
+                    location.clone(),
+                    format!("allocating result binding: {error}"),
+                )
+            })?;
+            self.values.insert(key.into_owned(), value);
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+
+    pub(crate) fn evaluate(
+        &self,
+        expression: &ParameterExpression,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Real> {
+        evaluate_root(
+            expression,
+            &|name| self.get(name),
+            self.base.functions.as_deref(),
+            budget,
+        )
+        .map_err(Failure::into_error)
+    }
 }
 
 struct Failure {
@@ -1611,5 +1689,41 @@ fn apply(function: Function, args: &[Real]) -> Real {
         Function::Acosh => x.acosh(),
         Function::Atanh => x.atanh(),
         Function::Tan => x.tan(),
+    }
+}
+
+#[cfg(test)]
+mod sequential_bindings_tests {
+    use super::{EvalBudget, ParamBinding, ParamScope, SequentialBindings};
+    use crate::primitives::SourceLoc;
+    use std::path::PathBuf;
+
+    #[test]
+    fn publishing_is_bounded_atomic_and_does_not_mutate_the_base() {
+        let location = SourceLoc::new(PathBuf::from("overlay.cir"), 2, 1);
+        let mut budget = EvalBudget::default();
+        let base = ParamScope::resolve(
+            None,
+            &[ParamBinding {
+                name: "base".into(),
+                value: 7.,
+                location: location.clone(),
+            }],
+            &[],
+            &mut budget,
+        )
+        .unwrap();
+        let mut overlay = SequentialBindings::new(&base, 2);
+        assert_eq!(overlay.get("BASE"), Some(7.));
+        overlay.publish("BASE", 1., &location).unwrap();
+        assert!(overlay.publish("base", f64::NAN, &location).is_err());
+        assert_eq!(overlay.get("base"), Some(1.));
+        overlay.publish("base", -0., &location).unwrap();
+        assert_eq!(overlay.get("BASE").unwrap().to_bits(), (-0_f64).to_bits());
+        assert!(overlay.publish("base", 2., &location).is_err());
+        assert!(overlay.publish("new", 3., &location).is_err());
+        assert!(overlay.get("new").is_none());
+        assert_eq!(base.get("base"), Some(7.));
+        assert_eq!(base.entries().len(), 1);
     }
 }

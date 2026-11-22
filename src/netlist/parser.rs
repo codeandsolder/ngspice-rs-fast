@@ -300,9 +300,9 @@ pub fn load_classified(path: impl AsRef<Path>) -> SpiceResult<(Deck, Vec<RawCard
 ///
 /// # Errors
 /// Expression evaluation or measurement grammar failures.
-pub fn resolve_measure_card(
+pub(crate) fn resolve_measure_card(
     card: &MeasureCard,
-    scope: &crate::netlist::eval::ParamScope,
+    scope: &crate::netlist::eval::SequentialBindings<'_>,
     budget: &mut crate::netlist::eval::EvalBudget,
 ) -> SpiceResult<MeasureCard> {
     let crate::netlist::ast::MeasureRequest::Deferred {
