@@ -139,7 +139,7 @@ pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
     tokenize_bounded(line, &mut SourceBudget::new(SourceLimits::default()))
 }
 
-pub(crate) fn tokenize_bounded(
+pub(super) fn tokenize_bounded(
     line: &LogicalLine,
     budget: &mut SourceBudget,
 ) -> SpiceResult<Vec<Token>> {

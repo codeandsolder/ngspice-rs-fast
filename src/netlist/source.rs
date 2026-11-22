@@ -199,7 +199,7 @@ impl LogicalLine {
         }
     }
 
-    pub(crate) fn retained_physical_lines(&self) -> usize {
+    pub(super) fn retained_physical_lines(&self) -> usize {
         1 + (self.continuations as usize).max(self.source_map.continuation_count())
     }
 
@@ -261,7 +261,7 @@ pub fn load(path: impl AsRef<Path>) -> SpiceResult<Deck> {
     fold_bounded(path, &text, true, &mut budget)
 }
 
-pub(crate) fn read_text(
+pub(super) fn read_text(
     path: &Path,
     remaining: usize,
     location: &SourceLoc,
@@ -547,7 +547,7 @@ fn fold_into<'a, 'b>(
 }
 
 /// Bounded source construction. The caller has already charged file visits and bytes.
-pub(crate) fn fold_bounded(
+pub(super) fn fold_bounded(
     file: &Path,
     text: &str,
     has_title: bool,

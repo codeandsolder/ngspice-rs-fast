@@ -281,7 +281,7 @@ impl RawCard {
         Self::parse_bounded(line, &mut SourceBudget::new(SourceLimits::default()))
     }
 
-    pub(crate) fn parse_bounded(
+    pub(super) fn parse_bounded(
         line: &LogicalLine,
         budget: &mut SourceBudget,
     ) -> SpiceResult<Self> {
