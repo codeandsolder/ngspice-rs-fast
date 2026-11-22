@@ -28,7 +28,10 @@ observation does not turn a different valid observation into a NaN.
   exact-coordinate group agreement, not an invented value at a jump.
   Direction changes (e.g. nested DC sweep resets), nonfinite coordinates,
   and queries outside the interval are explicit errors. Trace/last
-  observations need not have an ordered axis. A sorted coordinate
+  observations need not have an ordered axis. Last values capture one
+  compact row of shared dependencies and evaluate each requested expression
+  only once at finish; invalid earlier rows cannot poison the last value.
+  A sorted coordinate
   schedule dispatches only the targets bracketed by each adjacent sample,
   retaining two rows of only the query operand columns. Results stay in
   request order, including duplicate names/targets. Dispatch work is
@@ -135,3 +138,59 @@ Run with the pinned nightly in release mode and interleave
 measurements. Raw logs: `arch-1122-a7c9-114-final-bench-perf.log`
 and `arch-1122-a7c9-114-final-{full_plot_batch,objective_only_batch}-dhat.log`
 in campaign logs.
+
+### Indexed direct-coordinate dispatch
+
+Acer, 2026-11-22: native optimized dev profile, pinned nightly and
+managed sccache. Compare commit `54e7845` (direction-independent
+individual query scans) with `db39d74` (coordinate cursor). Each plot
+has 50,001 accepted rows and 65 raw columns; the requested operands span
+1–64 distinct columns. Five alternating process CPU measurements after
+warmup, medians below. Candidate repetition counts vary across cases,
+not between variants; includes constructing rows and reducing/finishing
+the scenario, excludes actual circuit solving.
+
+| Queries | Raw operand columns | Candidates | Before (ms) | Cursor (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 1 | 20 | 34.505 | 35.180 |
+| 2 | 1 | 20 | 47.834 | 37.424 |
+| 16 | 4 | 10 | 122.666 | 24.490 |
+| 64 | 64 | 4 | 194.140 | 42.723 |
+| 256 | 1 | 3 | 517.413 | 7.564 |
+| 2,048 | 8 | 1 | 1,430.632 | 6.473 |
+
+All checksum strings match for both variants and all repetitions. The
+single-query case requests the initial sample and is effectively
+unchanged; the largest case is 221x faster. The cursor retains two
+compact operand rows, plus per-target result states. It has no
+accepted-row history and does not skip subsequent physical-axis
+validation after all targets are dispatched. Exact-coordinate groups
+still require all their accepted samples to agree.
+
+Probe source `query_batch.rs`, link script, timing script and raw
+logs are in the campaign evidence folder
+`logs/worker-arch-1122-b6d9-issue114/probe/`.
+
+### Final-value expression deferral
+
+Same Acer native optimized-dev setup, 50,001 accepted rows per
+candidate, 65 raw producer columns, five alternating CPU-time trials
+after warmup. Compare `af1bc01` (per-row Last evaluation) to
+`a76a8f5` (single evaluation from the final compact dependency row).
+Requests mix untransformed complex values, magnitude, phase and dB.
+The first row is zero, so a dB request's intermediate failure is
+irrelevant to the final value. Results and error policy are unchanged.
+
+| Last requests | Raw operand columns | Candidates | Before (ms) | After (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 1 | 20 | 43.328 | 36.517 |
+| 4 | 1 | 20 | 164.385 | 34.429 |
+| 16 | 4 | 10 | 297.032 | 20.329 |
+| 64 | 64 | 4 | 455.081 | 45.129 |
+| 256 | 1 | 3 | 1,245.299 | 7.102 |
+| 1,024 | 8 | 1 | 1,313.571 | 3.773 |
+
+All checksum strings match across both variants, each case and trial.
+This is output processing only; it excludes the numerical solver.
+Source, link script, timing script and raw measurements:
+`logs/worker-arch-1122-b6d9-issue114/last-probe/`.

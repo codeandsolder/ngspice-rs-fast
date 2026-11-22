@@ -125,6 +125,49 @@ struct BoundObservation {
     reduction: ObservationReduction,
 }
 
+/// Last-value expressions are evaluated once, after the final accepted
+/// sample. Only their shared raw columns and optional physical scale need
+/// to survive each point callback.
+struct LastProjection {
+    columns: Vec<usize>,
+    axis: Option<usize>,
+}
+
+impl LastProjection {
+    fn bind(
+        observations: &mut [BoundObservation],
+        trace_axis: Option<usize>,
+    ) -> SpiceResult<Option<Self>> {
+        let mut columns = Vec::new();
+        let mut present = false;
+        for observation in observations.iter() {
+            if matches!(observation.reduction, ObservationReduction::Last) {
+                present = true;
+                columns.extend(observation.column.input_columns());
+            }
+        }
+        if !present {
+            return Ok(None);
+        }
+        columns.extend(trace_axis);
+        columns.sort_unstable();
+        columns.dedup();
+        for observation in observations.iter_mut() {
+            if matches!(observation.reduction, ObservationReduction::Last) {
+                observation.column.remap_inputs(&columns)?;
+            }
+        }
+        let axis = trace_axis
+            .map(|index| {
+                columns
+                    .binary_search(&index)
+                    .map_err(|_| invalid("missing last observation scale"))
+            })
+            .transpose()?;
+        Ok(Some(Self { columns, axis }))
+    }
+}
+
 struct Projection {
     header: Plot,
     columns: Vec<usize>,
@@ -139,6 +182,8 @@ pub struct PlotObjectivePlan {
     reductions: Vec<Option<BoundMeasure>>,
     observations: Vec<BoundObservation>,
     queries: QueryPlan,
+    last: Option<LastProjection>,
+    traces: Vec<usize>,
     fourier: Vec<FourierCard>,
     axis: Option<AxisTracker>,
     trace_axis: Option<usize>,
@@ -341,6 +386,14 @@ impl PlotObjectivePlan {
             })
             .collect::<SpiceResult<Vec<_>>>()?;
         let queries = QueryPlan::bind(&mut observations)?;
+        let last = LastProjection::bind(&mut observations, trace_axis)?;
+        let traces = observations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, observation)| {
+                matches!(observation.reduction, ObservationReduction::Trace { .. }).then_some(index)
+            })
+            .collect();
         if !fourier.is_empty() {
             if kind != AnalysisKind::Transient {
                 return Err(invalid("Fourier objectives require a transient plot"));
@@ -368,6 +421,8 @@ impl PlotObjectivePlan {
             reductions,
             observations,
             queries,
+            last,
+            traces,
             fourier,
             axis,
             trace_axis,
@@ -400,8 +455,30 @@ impl PlotObjectivePlan {
     }
 }
 
+impl BoundObservation {
+    fn point(
+        &self,
+        row: &[Complex],
+        axis: Option<usize>,
+    ) -> Result<ObservationPoint, ObservationFailure> {
+        let coordinate = axis.map(|index| row[index]);
+        if coordinate.is_some_and(|value| !value.is_finite()) {
+            return Err(ObservationFailure::Invalid(invalid(
+                "nonfinite observation coordinate",
+            )));
+        }
+        Ok(ObservationPoint {
+            coordinate: coordinate.map(|value| value.re),
+            value: self
+                .column
+                .value(row)
+                .map_err(ObservationFailure::Invalid)?,
+        })
+    }
+}
+
 enum ObservationState {
-    Last(Option<Result<ObservationPoint, ObservationFailure>>),
+    Last,
     Query(PointQuery),
     Trace(Result<Vec<ObservationPoint>, ObservationFailure>),
 }
@@ -409,7 +486,7 @@ enum ObservationState {
 impl ObservationState {
     const fn new(bound: &BoundObservation) -> Self {
         match bound.reduction {
-            ObservationReduction::Last => Self::Last(None),
+            ObservationReduction::Last => Self::Last,
             ObservationReduction::At(at) => Self::Query(PointQuery::new(at, false)),
             ObservationReduction::Trace { .. } => Self::Trace(Ok(Vec::new())),
         }
@@ -422,23 +499,8 @@ impl ObservationState {
         axis: Option<Real>,
         trace_axis: Option<usize>,
     ) {
-        let point = || {
-            let coordinate = trace_axis.map(|index| row[index]);
-            if coordinate.is_some_and(|value| !value.is_finite()) {
-                return Err(ObservationFailure::Invalid(invalid(
-                    "nonfinite observation coordinate",
-                )));
-            }
-            Ok(ObservationPoint {
-                coordinate: coordinate.map(|value| value.re),
-                value: bound
-                    .column
-                    .value(row)
-                    .map_err(ObservationFailure::Invalid)?,
-            })
-        };
         match self {
-            Self::Last(last) => *last = Some(point()),
+            Self::Last => {}
             Self::Query(query) => {
                 if let Some(x) = axis {
                     query.observe(x, || bound.column.value(row));
@@ -454,7 +516,7 @@ impl ObservationState {
                 let result = if values.len() == max_points {
                     Err(ObservationFailure::TraceLimit { max_points })
                 } else {
-                    point().and_then(|point| {
+                    bound.point(row, trace_axis).and_then(|point| {
                         values.try_reserve(1).map_err(|error| {
                             ObservationFailure::Invalid(invalid(format!(
                                 "allocating objective trace: {error}"
@@ -471,10 +533,16 @@ impl ObservationState {
         }
     }
 
-    fn finish(self, bound: &BoundObservation, axis: Option<&AxisTracker>) -> ObservationResult {
+    fn finish(
+        self,
+        bound: &BoundObservation,
+        axis: Option<&AxisTracker>,
+        last: Option<(&[Complex], Option<usize>)>,
+    ) -> ObservationResult {
         let value = match self {
-            Self::Last(last) => last
-                .unwrap_or(Err(ObservationFailure::Empty))
+            Self::Last => last
+                .ok_or(ObservationFailure::Empty)
+                .and_then(|(row, axis)| bound.point(row, axis))
                 .map(ObservationValue::Scalar),
             Self::Trace(trace) => trace.map(ObservationValue::Trace),
             Self::Query(query) => (|| {
@@ -536,6 +604,7 @@ struct ActivePlot<'a> {
     measurements: Vec<Option<MeasureState<'a>>>,
     observations: Vec<ObservationState>,
     query_rows: QueryRows,
+    last_row: Vec<Complex>,
     retained: SpiceResult<Option<Plot>>,
     scratch: Vec<Complex>,
     rows: usize,
@@ -561,6 +630,7 @@ impl<'a> ActivePlot<'a> {
             measurements,
             observations,
             query_rows: QueryRows::new(&plan.queries),
+            last_row: Vec::with_capacity(plan.last.as_ref().map_or(0, |last| last.columns.len())),
             retained: Ok(plan
                 .projection
                 .as_ref()
@@ -588,7 +658,12 @@ impl<'a> ActivePlot<'a> {
                 measure.observe(x, row);
             }
         }
-        for &index in &self.plan.queries.ordinary {
+        if let Some(last) = &self.plan.last {
+            self.last_row.clear();
+            self.last_row
+                .extend(last.columns.iter().map(|&index| row[index]));
+        }
+        for &index in &self.plan.traces {
             self.observations[index].observe(
                 &self.plan.observations[index],
                 row,
@@ -669,11 +744,17 @@ impl<'a> ActivePlot<'a> {
                 },
             )
         })();
+        let last = self
+            .plan
+            .last
+            .as_ref()
+            .filter(|_| self.rows != 0)
+            .map(|plan| (self.last_row.as_slice(), plan.axis));
         let observations = self
             .observations
             .into_iter()
             .zip(&self.plan.observations)
-            .map(|(state, bound)| state.finish(bound, self.axis.as_ref()))
+            .map(|(state, bound)| state.finish(bound, self.axis.as_ref(), last))
             .collect();
         let fourier = (|| {
             if self.plan.fourier.is_empty() {
