@@ -453,24 +453,65 @@ impl Sine {
     }
 }
 
-impl Exponential {
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "C EXP adds the rise contribution before the separately rounded fall contribution"
-    )]
-    fn value_at(self, time: Real) -> Real {
-        let rise = |time: Real| {
-            (self.pulsed - self.initial) * (1. - (-(time - self.rise_delay) / self.rise_tau).exp())
-        };
-        if time <= self.rise_delay {
-            self.initial
-        } else if time <= self.fall_delay {
-            self.initial + rise(time)
+/// Affine evaluation from an anchor. Use the half difference only when
+/// the ordinary difference of two finite ordinates overflows.
+fn blend_from_anchor(anchor: Real, other: Real, fraction: Real) -> Real {
+    if fraction == 0. {
+        return anchor;
+    }
+    let difference = other - anchor;
+    if difference.is_finite() {
+        fraction.mul_add(difference, anchor)
+    } else {
+        let half_anchor = 0.5 * anchor;
+        let half_other = 0.5 * other;
+        (2. * fraction).mul_add(half_other - half_anchor, anchor)
+    }
+}
+
+/// exp(a) - exp(b), with cancellation removed when the exponents are close.
+#[expect(
+    clippy::float_cmp,
+    reason = "identical exponents cancel exactly, including the common negative infinity limit"
+)]
+fn exp_difference(a: Real, b: Real) -> Real {
+    if a == b {
+        if a.is_infinite() && a.is_sign_positive() {
+            Real::NAN
         } else {
-            self.initial
-                + rise(time)
-                + (self.initial - self.pulsed)
-                    * (1. - (-(time - self.fall_delay) / self.fall_tau).exp())
+            0.
+        }
+    } else if a > b {
+        -a.exp() * (b - a).exp_m1()
+    } else {
+        b.exp() * (a - b).exp_m1()
+    }
+}
+
+impl Exponential {
+    fn value_at(self, time: Real) -> Real {
+        if time <= self.rise_delay {
+            return self.initial;
+        }
+        let rise = -(time - self.rise_delay) / self.rise_tau;
+        if time <= self.fall_delay {
+            // The nearer anchor is selected using the exponent, not a
+            // rounded fraction. This retains the tail even when 1-exp(rise)
+            // rounds to exactly one.
+            if rise >= -std::f64::consts::LN_2 {
+                blend_from_anchor(self.initial, self.pulsed, -rise.exp_m1())
+            } else {
+                blend_from_anchor(self.pulsed, self.initial, rise.exp())
+            }
+        } else {
+            let fall = -(time - self.fall_delay) / self.fall_tau;
+            let weight = exp_difference(fall, rise);
+            if weight > 0.5 && weight <= 1. {
+                let complement = rise.exp() - fall.exp_m1();
+                blend_from_anchor(self.pulsed, self.initial, complement)
+            } else {
+                blend_from_anchor(self.initial, self.pulsed, weight)
+            }
         }
     }
 }
@@ -784,17 +825,7 @@ impl PwlSource {
                 (t1, v1, t0, v0)
             };
             let fraction = (time - near_time) / (far_time - near_time);
-            let difference = far - near;
-            if difference.is_finite() {
-                fraction.mul_add(difference, near)
-            } else {
-                // The exact difference can overflow for opposite-sign
-                // endpoints. The nearer-anchor fraction is <= 1/2, so
-                // halve the difference before multiplying by twice it.
-                let half_near = 0.5 * near;
-                let half_far = 0.5 * far;
-                (2. * fraction).mul_add(half_far - half_near, near)
-            }
+            blend_from_anchor(near, far, fraction)
         })
     }
 
@@ -1051,6 +1082,37 @@ mod tests {
             + 2. * (2. * PI * 10. * 0.0125 + 30f64.to_radians()).sin() * (-2.0_f64 * 0.0125).exp();
         assert!(close(s.value_at(t, R).unwrap(), want));
         assert_eq!(s.corners(), [0.1]);
+    }
+
+    #[test]
+    fn exponential_retains_the_initial_slope_and_decay_tails() {
+        let rising = Exponential {
+            initial: 0.,
+            pulsed: 1.,
+            rise_delay: 0.,
+            rise_tau: 1.,
+            fall_delay: 1.,
+            fall_tau: 2.,
+        };
+        assert_eq!(rising.value_at(1e-20), 1e-20);
+        let expected_tail = (-49.5_f64).exp() - (-100_f64).exp();
+        assert!(
+            (rising.value_at(100.) - expected_tail).abs() <= 2. * Real::EPSILON * expected_tail
+        );
+        let falling = Exponential {
+            initial: 1e300,
+            pulsed: 0.,
+            fall_delay: 200.,
+            ..rising
+        };
+        let expected = 1e300 * (-100_f64).exp();
+        assert_eq!(falling.value_at(100.), expected);
+        let extreme = Exponential {
+            initial: -Real::MAX,
+            pulsed: Real::MAX,
+            ..rising
+        };
+        assert!((extreme.value_at(std::f64::consts::LN_2)).abs() <= Real::EPSILON * Real::MAX);
     }
 
     #[test]
