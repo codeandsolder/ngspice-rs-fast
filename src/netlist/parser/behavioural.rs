@@ -28,6 +28,7 @@ use winnow::stream::Stream as _;
 use winnow::token::any;
 
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind, poly_dimension};
+use crate::netlist::behavioural::forms::B_SETTERS;
 use crate::netlist::bexpr::BehaviouralExpression;
 use crate::netlist::token::{Token, TokenKind};
 
@@ -36,17 +37,6 @@ use super::syntax::{
     canonical_node, equals, malformed, named, named_device, skip_terminal_punctuation,
     terminal_name, value,
 };
-
-/// The B-source instance setters of `ASRCpTable` (`asrc.c`) besides `v`/`i`.
-pub(super) const B_SETTERS: &[&str] = &[
-    "m",
-    "tc1",
-    "tc2",
-    "temp",
-    "dtemp",
-    "reciproctc",
-    "reciprocm",
-];
 
 pub(super) fn behavioural_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     let (instance, _) = named_device("b")

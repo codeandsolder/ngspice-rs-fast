@@ -642,6 +642,12 @@ fn duplicate_card_ordinals_are_not_a_valid_scope() {
     let mut deck = parse("title\nr1 a 0 1k\nr2 b 0 2k\n.end\n");
     deck.cards[1].kind = ScopedCardKind::Device(0);
     refused(&deck, "exactly once");
+    assert!(
+        ngspice_rs::netlist::behavioural::lower_nonlinear_sources(&deck)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly once")
+    );
 }
 
 #[test]
