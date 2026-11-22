@@ -329,9 +329,45 @@ pub(super) struct DelaySamples<'a, const N: usize> {
     history: &'a WaveformHistory,
 }
 
+/// One complete accepted sample of a width-checked history.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct DelaySample<const N: usize> {
+    pub(super) time: Real,
+    pub(super) values: [Real; N],
+}
+
 impl<'a, const N: usize> DelaySamples<'a, N> {
     pub(super) const fn times(self) -> &'a VecDeque<Real> {
         &self.history.times
+    }
+
+    /// First logical index whose time is at or after the target. The
+    /// returned index may equal the length. No monotonic query assumption.
+    pub(super) fn lower_bound(self, target: Real) -> usize {
+        self.history.times.partition_point(|&time| time < target)
+    }
+
+    /// First logical index strictly after the target, including exact knots
+    /// in the prefix. Interpolation and pruning deliberately use different
+    /// bounds. Both searches operate directly on the wrapped ring.
+    pub(super) fn upper_bound(self, target: Real) -> usize {
+        self.history.times.partition_point(|&time| time <= target)
+    }
+
+    /// Retrieve a fixed-size nonempty window ending at a logical index.
+    /// Check bounds once, then copy only its samples, not the full history.
+    pub(super) fn window<const K: usize>(self, end: usize) -> Option<[DelaySample<N>; K]> {
+        if K == 0 || end >= self.history.len() {
+            return None;
+        }
+        let start = (end + 1).checked_sub(K)?;
+        Some(std::array::from_fn(|offset| {
+            let index = start + offset;
+            DelaySample {
+                time: self.history.times[index],
+                values: self.sample(index),
+            }
+        }))
     }
 
     pub(super) fn sample(self, index: usize) -> [Real; N] {
@@ -446,6 +482,7 @@ pub trait DelayLine: fmt::Debug {
 #[cfg(test)]
 mod tests {
     use super::{WaveformHistory, WaveformUpdate};
+    use crate::primitives::Real;
 
     fn sample(time: f64, value: f64) -> (f64, Vec<f64>) {
         (time, vec![value, -value])
@@ -474,6 +511,133 @@ mod tests {
         }
         history.clear();
         assert!(history.samples::<2>().is_err());
+    }
+
+    #[test]
+    fn indexed_windows_preserve_strict_and_inclusive_boundaries_in_wrapped_ring() {
+        let mut history = WaveformHistory::new(2);
+        // Keep the most recent eight samples, forcing both deques to wrap.
+        for tick in -8_i32..=4 {
+            let time = f64::from(tick) / 4.;
+            history
+                .apply(&WaveformUpdate {
+                    append: Some(sample(time, time)),
+                    drop_front: usize::from(history.len() >= 8),
+                    ..WaveformUpdate::default()
+                })
+                .unwrap();
+        }
+        assert!(!history.times.as_slices().1.is_empty());
+        assert!(!history.values.as_slices().1.is_empty());
+        let view = history.samples::<2>().unwrap();
+        let times = view.times();
+        let mut targets = vec![
+            Real::NEG_INFINITY,
+            -10.,
+            -0.,
+            0.,
+            10.,
+            Real::INFINITY,
+            Real::NAN,
+        ];
+        for &t in times {
+            targets.extend([t.next_down(), t, t.next_up()]);
+        }
+        // Repeated and decreasing queries model retries and rejected steps.
+        targets.extend([times[6], times[2], times[6], times[0]]);
+        let last = times.len() - 1;
+        for target in targets {
+            let old = |inclusive| {
+                let mut index = 2;
+                while index < last
+                    && if inclusive {
+                        times[index] <= target
+                    } else {
+                        times[index] < target
+                    }
+                {
+                    index += 1;
+                }
+                index
+            };
+            let upper = view.upper_bound(target).clamp(2, last);
+            let lower = view.lower_bound(target).clamp(2, last);
+            assert_eq!(upper, old(true));
+            assert_eq!(lower, old(false));
+            let window = view.window::<3>(upper).unwrap();
+            for (offset, sample) in window.into_iter().enumerate() {
+                let index = upper - 2 + offset;
+                assert_eq!(sample.time.to_bits(), times[index].to_bits());
+                assert_eq!(
+                    sample.values.map(Real::to_bits),
+                    view.sample(index).map(Real::to_bits)
+                );
+            }
+        }
+        assert!(view.window::<0>(last).is_none());
+        assert!(view.window::<3>(1).is_none());
+        assert!(view.window::<1>(times.len()).is_none());
+        assert!(view.window::<2>(usize::MAX).is_none());
+    }
+
+    /// A reproducible lookup-only microbenchmark; build an optimized test
+    /// binary and run this test explicitly with --ignored --nocapture.
+    #[test]
+    #[ignore = "lookup microbenchmark, no timing assertion"]
+    fn indexed_history_lookup_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        for count in [1024_i32, 16_384, 262_144] {
+            let mut history = WaveformHistory::new(2);
+            history
+                .apply(&WaveformUpdate {
+                    reset: Some(
+                        (0..count)
+                            .map(|i| sample(Real::from(i), Real::from(i)))
+                            .collect(),
+                    ),
+                    ..WaveformUpdate::default()
+                })
+                .unwrap();
+            let view = history.samples::<2>().unwrap();
+            let samples = view.times();
+            let last = samples.len() - 1;
+            let queries = (0_u32..2048)
+                .map(|i| {
+                    let tick = i.wrapping_mul(2_654_435_761) & (u32::try_from(count).unwrap() - 1);
+                    Real::from(tick) + if i % 2 == 0 { 0. } else { 0.25 }
+                })
+                .collect::<Vec<_>>();
+            let start = Instant::now();
+            let mut expected = 0;
+            for &query in &queries {
+                let query = black_box(query);
+                let mut upper = 2;
+                while upper < last && samples[upper] <= query {
+                    upper += 1;
+                }
+                let mut lower = 2;
+                while lower < last && samples[lower] < query {
+                    lower += 1;
+                }
+                expected += black_box(upper + lower);
+            }
+            let linear = start.elapsed();
+            let start = Instant::now();
+            let mut actual = 0;
+            for &query in &queries {
+                let query = black_box(query);
+                actual += black_box(
+                    view.upper_bound(query).clamp(2, last) + view.lower_bound(query).clamp(2, last),
+                );
+            }
+            let indexed = start.elapsed();
+            assert_eq!(actual, expected);
+            println!(
+                "{count} samples, {} queries: linear {linear:?}, indexed {indexed:?}, ratio {:.2}x",
+                queries.len(),
+                linear.as_secs_f64() / indexed.as_secs_f64()
+            );
+        }
     }
 
     #[test]
