@@ -73,6 +73,38 @@ fn DEXP(A: f64) -> (f64, f64) {
     }
 }
 
+/// The positive gap between a voltage and the smoothed minimum.
+fn smoothed_gap(upper: f64, shift: f64, root: f64, delta: f64) -> f64 {
+    if shift >= 0. {
+        shift.midpoint(root)
+    } else {
+        upper * (delta / (-shift).midpoint(root))
+    }
+}
+
+/// Scale only the root and denominator, not the smaller physical voltage.
+/// This retains a representable effective voltage even when the sum or
+/// discriminant exceeds the floating-point range (or the normalized small
+/// voltage would underflow).
+fn smooth_vds_scaled(saturation: f64, drain: f64, delta: f64) -> (f64, f64, f64) {
+    let scale = saturation.max(drain).max(delta);
+    let scaled_saturation = saturation / scale;
+    let scaled_drain = drain / scale;
+    let scaled_delta = delta / scale;
+    let shift = scaled_saturation - scaled_drain - scaled_delta;
+    let root = shift.hypot(2. * scaled_saturation.sqrt() * scaled_delta.sqrt());
+    let denominator = scaled_saturation.midpoint(scaled_drain) + scaled_delta.midpoint(root);
+    let value = (scaled_saturation.max(scaled_drain) / denominator) * saturation.min(drain);
+    let saturation_gap = smoothed_gap(scaled_saturation, shift, root, scaled_delta);
+    let drain_gap = smoothed_gap(
+        scaled_drain,
+        scaled_drain - scaled_saturation - scaled_delta,
+        root,
+        scaled_delta,
+    );
+    (value, drain_gap / root, saturation_gap / root)
+}
+
 /// The smoothed minimum of positive saturation and drain voltages and its
 /// two independent derivatives. The smaller root satisfies
 /// v² - (saturation + drain + delta) v + saturation * drain = 0.
@@ -88,16 +120,16 @@ fn smooth_vds(saturation: f64, drain: f64, delta: f64) -> (f64, f64, f64) {
     } else {
         discriminant.sqrt()
     };
-    let gap = |upper: f64, shift: f64| {
-        if shift >= 0. {
-            shift.midpoint(root)
-        } else {
-            upper * (delta / (-shift).midpoint(root))
-        }
-    };
-    let saturation_gap = gap(saturation, shift);
+    let saturation_gap = smoothed_gap(saturation, shift, root, delta);
     if saturation >= 0. && drain >= 0. && delta > 0. {
         let denominator = saturation.midpoint(drain) + delta.midpoint(root);
+        if (!root.is_finite() || !denominator.is_finite())
+            && saturation.is_finite()
+            && drain.is_finite()
+            && delta.is_finite()
+        {
+            return smooth_vds_scaled(saturation, drain, delta);
+        }
         let (large, small) = if saturation >= drain {
             (saturation, drain)
         } else {
@@ -108,7 +140,7 @@ fn smooth_vds(saturation: f64, drain: f64, delta: f64) -> (f64, f64, f64) {
         } else {
             (large / denominator) * small
         };
-        let drain_gap = gap(drain, drain - saturation - delta);
+        let drain_gap = smoothed_gap(drain, drain - saturation - delta, root, delta);
         (value, drain_gap / root, saturation_gap / root)
     } else {
         let value = saturation - saturation_gap;
@@ -123,6 +155,21 @@ fn difference_of_products(a: f64, b: f64, c: f64, d: f64) -> f64 {
     let product = c * d;
     if product.is_finite() {
         a.mul_add(b, -product) - c.mul_add(d, -product)
+    } else if [a, b, c, d].iter().all(|value| value.is_finite()) {
+        // The second product overflowed before it could be subtracted.
+        // Scale the larger factor of each product by the same exact power
+        // of two. At most two such reductions suffice for finite f64 inputs.
+        const SCALE: f64 = f64::from_bits((1023 - 512) << 52);
+        let scale_product = |left: f64, right: f64| {
+            if left.abs() >= right.abs() {
+                (left * SCALE, right)
+            } else {
+                (left, right * SCALE)
+            }
+        };
+        let (a, b) = scale_product(a, b);
+        let (c, d) = scale_product(c, d);
+        difference_of_products(a, b, c, d) / SCALE
     } else {
         a.mul_add(b, -product)
     }
@@ -226,6 +273,22 @@ mod tests {
     }
 
     #[test]
+    fn smoothed_voltage_retains_finite_values_after_intermediate_overflow() {
+        let expected = smooth_vds(1., 1., 1.);
+        for scale in [1e155, 1e300, 1e308, f64::MAX] {
+            let (value, ds, dd) = smooth_vds(scale, scale, scale);
+            assert!((value / scale - expected.0).abs() < 1e-14);
+            assert!((ds - expected.1).abs() < 1e-14);
+            assert!((dd - expected.2).abs() < 1e-14);
+        }
+        // Normalizing the smaller voltage itself would underflow to zero.
+        let (value, ds, dd) = smooth_vds(1e-200, 1e308, 1e308);
+        assert!((value / 5e-201 - 1.).abs() < 1e-14);
+        assert!((ds - 0.5).abs() < 1e-14);
+        assert_eq!(dd, 0.);
+    }
+
+    #[test]
     fn product_difference_preserves_zero_and_small_discriminant() {
         let epsilon = 2_f64.powi(-27);
         assert_eq!(
@@ -235,6 +298,15 @@ mod tests {
         let x = 1. + epsilon;
         let y = 1. - epsilon;
         assert_eq!(difference_of_products(x, y, x, y), 0.);
+    }
+
+    #[test]
+    fn product_difference_handles_overflow_before_cancellation() {
+        let max = f64::MAX;
+        assert_eq!(difference_of_products(max, max, max, max), 0.);
+        assert_eq!(difference_of_products(max, 2., max, 2.), 0.);
+        assert_eq!(difference_of_products(max, 2., max, 1.5), max * 0.5);
+        assert_eq!(difference_of_products(max, 1.5, max, 2.), -max * 0.5);
     }
 
     #[test]

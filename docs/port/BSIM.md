@@ -19,8 +19,8 @@ parameters), `.ac`, `.noise`, `.pz`, `.tf`, `.disto` (BSIM4 has no `DEVdisto`,
 so it is linear there, as in C) and `.tran`, in every `capMod`, `mobMod`,
 `rdsMod`, `rgateMod`, `rbodyMod`, `igcMod`/`igbMod`, `tempMod`, `mtrlMod`,
 `gidlMod`, `dioMod`, `tnoiMod`/`fnoiMod` and NQS (`trnqsMod`/`acnqsMod`)
-selection, bit-identical to an FMA-free build of the reference C (see
-[BSIM4](#bsim4) below), and DC/AC `.sens` (`sens.rs`, see
+selection, numerically verified against the reference C (see the BSIM4
+[numerical arithmetic audit](#numerical-arithmetic-audit-89) below), and DC/AC `.sens` (`sens.rs`, see
 [SENSITIVITY.md](SENSITIVITY.md)). The B3-0/B4-0
 physical-unit audit of `Parameter::input_unit` is still partial.
 
@@ -434,7 +434,9 @@ remain unchanged.
 - Rationalize the smoothed drain-voltage root and both derivative gaps in the
   channel, charge and noise paths. Compute the transport discriminant as an
   accurate difference of products and differentiate the saturation equation
-  implicitly. Preserve small junction currents using `expm1` with the
+  implicitly. Scale the smoothed-root denominator and overflowing products only
+when an intermediate exceeds the finite range, preserving finite results after
+cancellation without affecting the ordinary operating path. Preserve small junction currents using `expm1` with the
   reference clamp boundaries; extrapolate accepted-state differences rather
   than subtracting scaled nearly identical history values.
 - Retain a narrowly scoped arithmetic expectation for junction equivalent
@@ -459,8 +461,11 @@ loads per mode, median thread CPU time in microseconds per load):
 
 The native builds show no clear throughput loss; the generic build pays for
 out-of-line fused operations. These are busy-host measurements and CPU clock
-variation remains. A runtime FMA specialization experiment investigates
-recovering that generic-target overhead without changing the arithmetic.
+variation remains. A runtime FMA specialization prototype required an unsafe
+target-feature dispatch, which is forbidden by the crate; it was not adopted.
+Native compilation can use hardware FMA directly without changing the model's
+arithmetic. The generic-target performance penalty is retained in the interest
+of numerical accuracy rather than adding architecture-specific unsafe code.
 The numerical audit passes 75 focused tests (including live C comparisons)
 and the full golden verification: 219 verified, one existing unsupported
 fixture, zero failures.
