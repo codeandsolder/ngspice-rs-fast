@@ -60,3 +60,39 @@ is a baseline for #114, not evidence that unrequested observations are skipped.
 Later add genuine worker/lanewise statuses, topology-change and invalid-model
 fixtures, allocation profiles and lifecycle counters as relevant production APIs
 land. Keep actual measurements with a dated revision and host-load context.
+
+## Initial measurement — 2026-11-22
+
+Revision `2716b19f714383fd6847b0de6ed8bd5e9535c811`, Acer Ryzen 7 4700U,
+pinned nightly, generic release, managed sccache, concurrent fleet activity.
+One initial measurement per mode; not a controlled timing comparison.
+
+| Mode (128 candidates, 512 scenarios) | Parse ms | Prepare ms | Evaluate ms | Total ms |
+|---|---:|---:|---:|---:|
+| Retained plots | 27.122 | 32.296 | 317.218 | 376.636 |
+| Streaming objectives | 20.878 | 31.465 | 341.388 | 393.731 |
+
+Both modes validated every sample against independent physical equations
+and equivalent objectives in reversed candidate order. The small A/B/A
+and invalid-domain tests also passed. Full scenario evaluation still
+constructs topology per case. Streaming lowers the required result retention
+but does not yet avoid full row/observation generation; this run does not
+establish a runtime benefit.
+
+| Independent divider operating points (16,384) | Time ms |
+|---|---:|
+| Fresh topology per candidate | 740.463 |
+| Reuse finalized circuit and existing numeric overrides | 65.795 |
+
+The latter is 11.25x faster in this initial run. Both paths use independent
+initial conditions and verify every solution against the analytic divider
+formula. This is strong evidence for prioritizing reusable topology and
+parameter slots, not a general speedup claim for nonlinear/transient
+optimization. Test execution time 1.59s; build times excluded.
+
+The existing reference includes two topology strategies but the simulator
+does not yet support arbitrary prepared numeric parameter evaluation or
+general independent multi-analysis sessions. #112/#113 must add those
+without introducing state leakage. #114 tracks selective objective
+execution; #115 tracks reuse of sensitivities/adjoints to avoid repeated
+primal solves for smooth objectives.
