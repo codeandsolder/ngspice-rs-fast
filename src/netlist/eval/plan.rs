@@ -242,7 +242,7 @@ impl ParameterPlan {
             // A reference map is keyed by canonical name. A slot can only be
             // reached through its one name in this lexical environment.
             dependencies.extend(self.nodes[dependent].references.values().copied());
-            for dependency in dependencies.drain(..) {
+            while let Some(dependency) = dependencies.pop() {
                 self.nodes[dependency].dependents.push(dependent);
             }
         }
