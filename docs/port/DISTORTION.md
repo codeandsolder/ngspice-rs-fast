@@ -247,4 +247,3 @@ The benchmark builds the same parsed and reactive diode/RC circuits in baseline 
 All digests match on all runs, including DHAT. Cumulative allocation savings are substantial but the CPU changes are mostly small, as assembly/factorization dominates and the runs are short. The large harmonic sample is slightly slower (3.7%); do not infer a universal speedup. No matrix factorization behavior or tolerance changed.
 
 Reproduce using `cargo +nightly test --locked --release --test distortion_workspace_bench -- --ignored --nocapture`; run the individual exact tests under perf stat and valgrind --tool=dhat (same benchmark file in a detached baseline). Logs `arch-1122-a7c9-next-125-perf.log` and `arch-1122-a7c9-next-125-{baseline,candidate}-*-dhat.log` under the campaign state logs.
-
