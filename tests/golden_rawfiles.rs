@@ -72,14 +72,15 @@ fn production_linear_drivers_match_c_goldens() {
             .parse_deck(&deck)
             .unwrap();
         let mut circuit = ngspice_rs::devices::Circuit::from_netlist(&netlist).unwrap();
-        let request = ngspice_rs::analysis::AnalysisRequest::from(&netlist.analyses[0]);
-        let got = ngspice_rs::analysis::runner(request.kind)
-            .unwrap()
-            .run(
-                &mut circuit,
-                &request,
-                &ngspice_rs::analysis::AnalysisContext::default(),
-            )
+        let request = ngspice_rs::analysis::AnalysisInput::from(&netlist.analyses[0]);
+        let got = request
+            .resolve()
+            .and_then(|plan| {
+                plan.run(
+                    &mut circuit,
+                    &ngspice_rs::analysis::AnalysisContext::default(),
+                )
+            })
             .unwrap();
         let golden = RawFile::parse(&golden_text(name)).unwrap();
         let want = &golden.plots[0].plot;

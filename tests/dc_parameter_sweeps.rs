@@ -3,7 +3,7 @@
 //! rejection of what C does not sweep (model parameters, more than two axes)
 //! or the port does not yet, and immutability of the swept circuit.
 use ngspice_rs::analysis::sweep::{ParameterRoute, SweepTarget, resolve};
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
 use ngspice_rs::devices::{Circuit, MAX_INSTANCE_OVERRIDES, ModelContext};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -19,20 +19,18 @@ fn circuit(body: &str) -> Circuit {
         .unwrap();
     Circuit::from_netlist(&netlist).unwrap()
 }
-fn request(args: &str) -> AnalysisRequest {
-    AnalysisRequest::with_arguments(AnalysisKind::DcSweep, args.split_whitespace())
+fn request(args: &str) -> AnalysisInput {
+    AnalysisInput::with_arguments(AnalysisKind::DcSweep, args.split_whitespace())
 }
 fn run(c: &mut Circuit, args: &str) -> SpiceResult<Plot> {
-    runner(AnalysisKind::DcSweep)?.run(c, &request(args), &AnalysisContext::default())
+    request(args)
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
 }
 fn op(c: &mut Circuit) -> Plot {
-    runner(AnalysisKind::OperatingPoint)
-        .unwrap()
-        .run(
-            c,
-            &AnalysisRequest::new(AnalysisKind::OperatingPoint),
-            &AnalysisContext::default(),
-        )
+    AnalysisInput::new(AnalysisKind::OperatingPoint)
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
         .unwrap()
 }
 fn column(p: &Plot, name: &str) -> Vec<f64> {
@@ -194,7 +192,7 @@ fn resolve_names_parameter_targets_canonically() {
     let c = circuit("V1 in 0 1\nR1 in a 1k\nD1 a 0 dx\n.model dx d");
     let axes = resolve(
         &c,
-        &request("@d1[PERIM] 0 1 1 @v1[dc] 1 2 1"),
+        &request("@d1[PERIM] 0 1 1 @v1[dc] 1 2 1").resolve().unwrap(),
         &AnalysisContext::default(),
     )
     .unwrap();
@@ -212,7 +210,12 @@ fn resolve_names_parameter_targets_canonically() {
         &axes[1].target,
         SweepTarget::InstanceParameter { route: ParameterRoute::VoltageSource, name, .. } if name == "@v1[dc]"
     ));
-    let axes = resolve(&c, &request("@r1[r] 1k 2k 1k"), &AnalysisContext::default()).unwrap();
+    let axes = resolve(
+        &c,
+        &request("@r1[r] 1k 2k 1k").resolve().unwrap(),
+        &AnalysisContext::default(),
+    )
+    .unwrap();
     assert!(matches!(
         axes[0].target,
         SweepTarget::InstanceParameter {
@@ -324,7 +327,12 @@ fn unsupported_targets_fail_before_any_sample() {
                 .model rm r(r=1k)\n.model dx d(is=1e-14)";
     let mut c = circuit(body);
     let context = AnalysisContext::default();
-    let resolve_error = |args: &str| resolve(&c, &request(args), &context).unwrap_err();
+    let resolve_error = |args: &str| {
+        request(args)
+            .resolve()
+            .and_then(|plan| resolve(&c, &plan, &context))
+            .unwrap_err()
+    };
     // Model parameters: C's DCTfindInstParam only searches instances.
     for args in [
         "@dx[is] 1e-14 2e-14 1e-14",
@@ -361,7 +369,13 @@ fn unsupported_targets_fail_before_any_sample() {
         "@i1[m] 1 2 1",
         "@v1[acmag] 1 2 1",
     ] {
-        assert!(resolve(&c, &request(args), &context).is_ok(), "{args}");
+        assert!(
+            request(args)
+                .resolve()
+                .and_then(|plan| resolve(&c, &plan, &context))
+                .is_ok(),
+            "{args}"
+        );
     }
     // Two nesting levels only (C silently ignores a third axis).
     assert!(unsupported(&resolve_error(

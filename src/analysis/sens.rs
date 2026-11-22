@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{PlotFlags, Variable};
-use crate::analysis::{AnalysisContext, AnalysisRequest, Plot};
+use crate::analysis::{AnalysisContext, AnalysisPlan, Plot};
 use crate::devices::linear::LinearSystem;
 use crate::devices::sensitivity::{
     AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
@@ -95,12 +95,18 @@ struct Sweep {
 
 /// A parsed `.sens` card.
 #[derive(Debug, Clone, PartialEq)]
-struct SensCard {
+pub(super) struct SensCard {
     output: Output,
     /// Name filters (`Sens_filter`), lowercased; empty for every parameter.
     filters: Vec<String>,
     /// `None` for DC.
     sweep: Option<Sweep>,
+}
+
+impl SensCard {
+    pub(super) fn grid(&self) -> SpiceResult<Option<Vec<Real>>> {
+        self.sweep.as_ref().map(frequencies).transpose()
+    }
 }
 
 fn syntax(message: impl std::fmt::Display) -> SpiceError {
@@ -122,7 +128,7 @@ fn integer(text: Option<&str>) -> SpiceResult<i32> {
 }
 
 /// Parses the arguments of a `.sens` card (`dot_sens()`).
-fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
+pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
     let mut tokens = arguments.iter().map(String::as_str).peekable();
     let expect = |wanted: &str, token: Option<&str>| match token {
         Some(text) if text == wanted => Ok(()),
@@ -1119,22 +1125,12 @@ impl AcState<'_> {
 /// operating-point failures and singular or nonfinite solves.
 pub(super) fn run(
     circuit: &mut Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &AnalysisContext,
+    card: &SensCard,
+    grid: Option<&[Real]>,
 ) -> SpiceResult<Plot> {
-    // Named `key=value` arguments are the operating point's Newton and
-    // continuation settings (the deck's `.options reltol=...`, which C's
-    // CKTop for `.sens` honours like any other analysis); DcSettings rejects
-    // any it does not know, so the card itself is the positional rest.
-    let settings = crate::analysis::bias::DcSettings::from_request(request)?;
-    let positional: Vec<String> = request
-        .arguments
-        .iter()
-        .filter(|argument| !argument.contains('='))
-        .cloned()
-        .collect();
-    let card = parse(&positional)?;
-    let grid = card.sweep.as_ref().map(frequencies).transpose()?;
+    let settings = request.dc_settings();
     let ac = grid.is_some();
     circuit.finalize()?;
     let circuit: &Circuit = circuit;
@@ -1149,7 +1145,7 @@ pub(super) fn run(
     };
     // The operating point, exactly as `.op` solves it (`CKTop`).
     let solved = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?
-        .solve(circuit, &model, &settings)?;
+        .solve(circuit, &model, settings)?;
 
     let mut plot = workspace.plot(ac);
     if let Some(grid) = grid {
@@ -1312,7 +1308,7 @@ fn run_ac(
     bias: &Vector,
     model: crate::devices::ModelContext,
     probe: Probe,
-    grid: Vec<Real>,
+    grid: &[Real],
     plot: &mut Plot,
 ) -> SpiceResult<()> {
     let circuit = walk.circuit;
@@ -1323,7 +1319,7 @@ fn run_ac(
         zeros: Vector::zeros(circuit.unknown_count()),
         state: vec![0.; circuit.state_history().len()],
     };
-    for frequency in grid {
+    for &frequency in grid {
         let omega = 2. * std::f64::consts::PI * frequency;
         let reset = walk.reset_ac()?;
         let system = sweep.assemble(walk, &reset, omega)?;

@@ -78,7 +78,7 @@
 //!
 //! `.ic` and `.nodeset` cards are not options: [`RunConfig::from_netlist`]
 //! evaluates them against `.param` and [`RunConfig::request`] attaches them to
-//! every analysis request (`AnalysisRequest::initial_conditions`/`nodesets`).
+//! every analysis request (`AnalysisInput::initial_conditions`/`nodesets`).
 //!
 //! # Precedence
 //!
@@ -101,11 +101,9 @@ use crate::devices::Circuit;
 use crate::maths::integrator::IntegrationMethod;
 use crate::netlist::ast::{AnalysisCard, Netlist, OptionCard, OptionSetting};
 use crate::netlist::eval::{EvalBudget, ParamScope};
-use crate::primitives::{
-    AnalysisKind, Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number,
-};
+use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
-use crate::analysis::{AnalysisContext, AnalysisRequest, NodeCondition};
+use crate::analysis::{AnalysisContext, AnalysisInput, NodeCondition};
 
 const C_REFERENCE: &str = "src/spicelib/analysis/cktsopt.c, src/spicelib/parser/inpdoopt.c";
 const FRONTEND_REFERENCE: &str =
@@ -1021,19 +1019,17 @@ impl RunConfig {
         Circuit::from_netlist_with_context(netlist, &self.context.model_context())
     }
 
-    /// Build the request for an analysis card, evaluating braced `{expr}`
-    /// arguments against the deck's `.param` scope and filling deck-level
-    /// settings the card did not state itself.
+    /// Resolve an analysis card with its deck's parameter scope and options.
     ///
     /// # Errors
-    /// As [`Self::request`].
-    pub fn request_for(&self, card: &AnalysisCard) -> SpiceResult<AnalysisRequest> {
+    /// Invalid expressions, analysis syntax, ranges, or options.
+    pub fn plan_for(&self, card: &AnalysisCard) -> SpiceResult<crate::analysis::AnalysisPlan> {
         if card.expressions.is_empty() {
-            return self.request(AnalysisRequest::from(card));
+            return self.plan(AnalysisInput::from(card));
         }
         let Some(scope) = &self.params else {
             return Err(SpiceError::Unsupported {
-                feature: "braced analysis arguments need a RunConfig built with \
+                feature: "braced analysis arguments need a RunConfig built with \\
                           RunConfig::from_netlist (no parameter scope here)"
                     .into(),
                 location: Some(card.location.clone()),
@@ -1044,141 +1040,58 @@ impl RunConfig {
             scope,
             &mut crate::netlist::eval::EvalBudget::default(),
         )?;
-        self.request(AnalysisRequest::from(&literal))
+        self.plan(AnalysisInput::from(&literal))
     }
 
-    /// Add deck settings to a request. Explicit request arguments win.
-    ///
-    /// * `.op`, `.dc`, `.ac`, `.noise`, `.disto`, `.pz`, `.sens`, `.tf`, `.sp`:
-    ///   `reltol`/`vntol`/`abstol` (as `rtol`/`vntol`/
-    ///   `abstol`), `itl1` (as `maxiter`), `srcsteps`, `gminsteps`,
-    ///   `gminfactor` and, when the deck sets `itl1` or `itl2`, the
-    ///   continuation stage limit `stagemaxiter` (`itl2`, else C's effective
-    ///   default 100); `.dc` also `itl2` (as `trcvmaxiter`).
-    /// * `.tran`: the tolerances plus `chgtol`, `trtol`, `method`, `maxord`,
-    ///   `itl4` (as `tranmaxiter`), `xmu` and the initial-bias DC options
-    ///   (`maxiter`, `stagemaxiter`, `srcsteps`, `gminsteps`, `gminfactor`)
-    ///   for the companion driver.
+    /// Resolve all analysis cards before scheduling or executing any of them.
     ///
     /// # Errors
-    /// [`SpiceError::Unsupported`] when the deck's `method`/`maxord` selection
-    /// is not available at run time (`IntegrationMethod::validate_runtime`).
+    /// As [Self::plan_for], at the invalid card.
+    pub fn plans_for(
+        &self,
+        cards: &[AnalysisCard],
+    ) -> SpiceResult<Vec<crate::analysis::AnalysisPlan>> {
+        cards.iter().map(|card| self.plan_for(card)).collect()
+    }
+
+    /// Resolve explicit analysis input over this configuration's typed deck
+    /// defaults. Explicit options and hints win; absent fields inherit deck
+    /// settings, followed by the reference defaults.
     ///
-    /// # Panics
-    /// If the stored `method`/`maxord` pair no longer parses; deck parsing has
-    /// already validated it.
-    pub fn request(&self, mut request: AnalysisRequest) -> SpiceResult<AnalysisRequest> {
-        request.noise.squared |= self.squared_noise;
-        request.noise.spice3 |= self.spice3_noise;
-        request.keep_op_info |= self.keep_op_info;
-        // Deck-level hints travel with every request (explicit request entries
-        // win); each driver validates them against its circuit.
-        if request.initial_conditions.is_empty() {
-            request
+    /// # Errors
+    /// Invalid syntax, option combinations, ranges, or unsupported analyses.
+    pub fn plan(&self, mut input: AnalysisInput) -> SpiceResult<crate::analysis::AnalysisPlan> {
+        if input.initial_conditions.is_empty() {
+            input
                 .initial_conditions
                 .clone_from(&self.initial_conditions);
         }
-        if request.nodesets.is_empty() {
-            request.nodesets.clone_from(&self.nodesets);
+        if input.nodesets.is_empty() {
+            input.nodesets.clone_from(&self.nodesets);
         }
-        if request.kind != AnalysisKind::Transient {
-            if matches!(
-                request.kind,
-                AnalysisKind::OperatingPoint
-                    | AnalysisKind::DcSweep
-                    | AnalysisKind::Ac
-                    | AnalysisKind::Noise
-                    | AnalysisKind::Distortion
-                    | AnalysisKind::PoleZero
-                    | AnalysisKind::Sensitivity
-                    | AnalysisKind::TransferFunction
-                    | AnalysisKind::SParameter
-            ) {
-                for (key, value) in [
-                    ("rtol", self.transient.rtol),
-                    ("vntol", self.transient.vntol),
-                    ("abstol", self.transient.abstol),
-                ] {
-                    push_real(&mut request, key, value);
-                }
-                self.push_dc(&mut request);
-                if request.kind == AnalysisKind::DcSweep {
-                    push_count(
-                        &mut request,
-                        crate::analysis::sweep::POINT_ITERATIONS_KEY,
-                        self.dc.itl2,
-                    );
-                }
+        let location = input.location().cloned();
+        crate::analysis::AnalysisPlan::resolve(
+            input,
+            self,
+            crate::analysis::NoiseOptions {
+                squared: self.squared_noise,
+                spice3: self.spice3_noise,
+            },
+            self.keep_op_info,
+        )
+        .map_err(|error| match (error, location) {
+            (
+                SpiceError::Unsupported {
+                    feature,
+                    location: None,
+                },
+                location,
+            ) => SpiceError::Unsupported { feature, location },
+            (SpiceError::Numerical { context, message }, Some(location)) => {
+                SpiceError::parse(location, format!("{context}: {message}"))
             }
-            return Ok(request);
-        }
-        if let Some((name, location)) = &self.method {
-            let order = self.maxord.as_ref().map_or(2, |(order, _)| *order);
-            let method = IntegrationMethod::parse(name, order).ok_or_else(|| {
-                SpiceError::parse(
-                    location.clone(),
-                    format!("invalid integration method '{name}'"),
-                )
-            })?;
-            method.validate_runtime()?;
-            if request.named("method").is_none() {
-                request.arguments.push(format!("method={name}"));
-            }
-        }
-        if let Some((order, _)) = &self.maxord
-            && request.named("maxord").is_none()
-        {
-            request.arguments.push(format!("maxord={order}"));
-        }
-        for (key, value) in [
-            ("rtol", self.transient.rtol),
-            ("vntol", self.transient.vntol),
-            ("abstol", self.transient.abstol),
-            ("chgtol", self.transient.chgtol),
-            ("trtol", self.transient.trtol),
-            ("xmu", self.transient.xmu),
-        ] {
-            push_real(&mut request, key, value);
-        }
-        push_count(&mut request, "tranmaxiter", self.transient.itl4);
-        self.push_dc(&mut request);
-        Ok(request)
-    }
-
-    /// DC Newton/continuation settings shared by `.op`/`.dc`/`.ac` and the
-    /// companion transient initial bias.
-    ///
-    /// C (`cktop.c`) bounds the direct solve with `itl1` and every gmin/source
-    /// stepping stage with `itl2`, so once the deck sets either, the stages get
-    /// `itl2` (or C's effective default 100) instead of following `itl1`.
-    /// Without deck limits the port's own defaults apply to all stages.
-    fn push_dc(&self, request: &mut AnalysisRequest) {
-        push_count(request, "maxiter", self.dc.itl1);
-        if self.dc.itl1.is_some() || self.dc.itl2.is_some() {
-            push_count(
-                request,
-                crate::analysis::newton::STAGE_ITERATIONS_KEY,
-                Some(self.dc.itl2.unwrap_or(C_DEFAULT_ITL2_EFFECTIVE)),
-            );
-        }
-        push_count(request, "srcsteps", self.dc.srcsteps);
-        push_count(request, "gminsteps", self.dc.gminsteps);
-        push_real(request, "gminfactor", self.dc.gminfactor);
-        // The written itl2 steers only ngspice's adaptive strategies; a
-        // request that selects the port's fixed ladders has none to steer.
-        let ladder = request
-            .named(crate::analysis::newton::SCHEDULE_KEY)
-            .is_some_and(|schedule| schedule.trim().eq_ignore_ascii_case("ladder"));
-        if !ladder {
-            push_count(
-                request,
-                crate::analysis::newton::ADAPT_ITERATIONS_KEY,
-                self.dc.itl2_written,
-            );
-        }
-        if self.dc.noopiter {
-            push_count(request, crate::analysis::newton::SKIP_DIRECT_KEY, Some(1));
-        }
+            (error, _) => error,
+        })
     }
 }
 
@@ -1217,18 +1130,6 @@ fn accepted(name: &str) -> bool {
                 | "gminsteps"
                 | "gminfactor"
         )
-}
-
-fn push_real(request: &mut AnalysisRequest, key: &str, value: Option<Real>) {
-    if let (Some(value), None) = (value, request.named(key)) {
-        request.arguments.push(format!("{key}={value:e}"));
-    }
-}
-
-fn push_count(request: &mut AnalysisRequest, key: &str, value: Option<usize>) {
-    if let (Some(value), None) = (value, request.named(key)) {
-        request.arguments.push(format!("{key}={value}"));
-    }
 }
 
 /// C's `IF_INTEGER` option conversion, `floor(0.5 + value)`

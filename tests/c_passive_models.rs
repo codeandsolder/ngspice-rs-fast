@@ -1,5 +1,5 @@
 //! Opt-in C effective-value queries plus production DC/AC conformance.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, RawFile, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RawFile};
 use ngspice_rs::devices::{Circuit, ModelResolver};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -161,13 +161,9 @@ fn passive_model_production_dc_ac_matches_c() {
         ] {
             let mut circuit =
                 Circuit::from_netlist_with_context(&n, &context.model_context()).unwrap();
-            let got = runner(kind)
-                .unwrap()
-                .run(
-                    &mut circuit,
-                    &AnalysisRequest::with_arguments(kind, args),
-                    &context,
-                )
+            let got = AnalysisInput::with_arguments(kind, args)
+                .resolve()
+                .and_then(|plan| plan.run(&mut circuit, &context))
                 .unwrap();
             let text = format!(
                 "responses\n{body}\n.options temp={} tnom={}\n.control\nset filetype=ascii\nset numdgt=17\n{command}\nwrite response.raw\nquit\n.endc\n.end\n",

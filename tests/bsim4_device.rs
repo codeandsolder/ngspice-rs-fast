@@ -10,7 +10,7 @@
 //! differ).
 use std::path::Path;
 
-use ngspice_rs::analysis::{Plot, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 
@@ -22,12 +22,9 @@ fn plots(text: &str) -> Vec<Plot> {
         .parse_deck(&parse_deck_text(Path::new("bsim4.cir"), text))
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    runner(request.kind)
-        .unwrap()
-        .run_plots(&mut circuit, &request, &config.context())
-        .unwrap()
+    request.run_plots(&mut circuit, &config.context()).unwrap()
 }
 
 fn same(actual: f64, expected: f64, label: &str) {

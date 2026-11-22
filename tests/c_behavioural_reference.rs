@@ -10,7 +10,7 @@
 //! `PTdifferentiate` quirks the port reproduces — are compared at several
 //! bias points with `|Rust - C| <= 1e-12 |C| + 1e-15`, tight enough to
 //! resolve `inp_modify_exp()`'s 11-digit literal rounding (the last case).
-use ngspice_rs::analysis::{Plot, RawFile, RunConfig, runner};
+use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
@@ -126,12 +126,9 @@ fn run_rust(cards: &str, analysis: &str) -> Plot {
         ))
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap()
+    request.run(&mut circuit, &config.context()).unwrap()
 }
 
 #[test]

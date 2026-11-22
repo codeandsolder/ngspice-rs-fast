@@ -54,7 +54,7 @@
 use crate::analysis::frequency::{Advance, FrequencyGrid, MAX_POINTS};
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{Plot, PlotFlags, Variable};
-use crate::analysis::{AnalysisContext, AnalysisRequest};
+use crate::analysis::{AnalysisContext, AnalysisPlan};
 use crate::devices::noise::{InstanceNoise, circuit_noise, squared_gain};
 use crate::devices::{Circuit, LinearSystem, SourceKind};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
@@ -67,9 +67,6 @@ const N_MINGAIN: Real = 1e-20;
 const N_INTFTHRESH: Real = 1e-10;
 /// C `N_INTUSELOG`: the region around a slope of -1 integrated as `ln f`.
 const N_INTUSELOG: Real = 1e-10;
-/// C's default `CKTreltol`, the frequency-loop tolerance without `.option
-/// reltol`.
-const DEFAULT_RELTOL: Real = 1e-3;
 /// The spectrum plot's title (`noisean.c`, without `sqrnoise`).
 pub const SPECTRUM_PLOTNAME: &str = "Noise Spectral Density Curves";
 /// The integrated plot's title (`noisean.c`, without `sqrnoise`).
@@ -114,15 +111,48 @@ impl Stepping {
 
 /// A parsed `.noise` card, after C's single-frequency adjustments.
 #[derive(Debug, Clone, PartialEq)]
-struct NoiseCard {
-    positive: NodeId,
-    negative: NodeId,
+pub(super) struct NoiseCard {
+    positive: String,
+    negative: Option<String>,
     input: String,
     stepping: Stepping,
     steps: u32,
     start: Real,
     stop: Real,
     summary: usize,
+}
+
+impl NoiseCard {
+    pub(super) const fn plot_count(&self) -> usize {
+        if self.start.to_bits() == self.stop.to_bits() {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn output(&self, circuit: &Circuit) -> SpiceResult<[NodeId; 2]> {
+        let node = |name: &str| {
+            circuit.nodes().get(name).ok_or_else(|| {
+                unsupported(format!(
+                    ".noise output node '{name}' is not in the circuit (C would create a floating node)"
+                ))
+            })
+        };
+        let positive = node(&self.positive)?;
+        let negative = self
+            .negative
+            .as_deref()
+            .map(node)
+            .transpose()?
+            .unwrap_or(NodeId::GROUND);
+        if positive == negative {
+            return Err(unsupported(
+                ".noise output nodes must differ (the output voltage is identically zero)",
+            ));
+        }
+        Ok([positive, negative])
+    }
 }
 
 /// C's `INPgetValue(IF_INTEGER)`: `floor(value + 0.5)`.
@@ -178,78 +208,18 @@ fn split_output(arguments: &[String]) -> SpiceResult<Positional> {
 
 /// Determine the number of plots emitted by a noise-analysis card.
 ///
-/// How many plots a `.noise` card produces: two (the spectrum and the
-/// integrated noise), or one when C normalizes the stop to the start.
-/// A one-point linear sweep with distinct, nearly equal bounds is the
-/// exception: the integrated plot still exists. Used by the batch
-/// scheduler to name the plots before anything runs; a card the driver would
-/// reject (or one with braced, not yet evaluated, arguments) counts two.
-#[must_use]
-pub fn plot_count(arguments: &[String]) -> usize {
-    let positional: Vec<String> = arguments
-        .iter()
-        .filter(|argument| !argument.contains('='))
-        .cloned()
-        .collect();
-    let Ok(Positional { rest, .. }) = split_output(&positional) else {
-        return 2;
-    };
-    let (Some(kind), Ok(steps), Ok(start), Ok(stop)) = (
-        rest.get(1),
-        integer(rest.get(2).map(String::as_str), "point count"),
-        number(rest.get(3).map(String::as_str), "start frequency"),
-        number(rest.get(4).map(String::as_str), "stop frequency"),
-    ) else {
-        return 2;
-    };
-    let Some(stepping) = Stepping::parse(kind) else {
-        return 2;
-    };
-    let Ok(steps) = usize::try_from(steps) else {
-        return 2;
-    };
-    if steps == 0 || start <= 0. || stop < start {
-        return 2;
-    }
-    let (_, stop) = stepping.normalize(steps, start, stop);
-    if start.to_bits() == stop.to_bits() {
-        1
-    } else {
-        2
-    }
-}
-
-fn parse(circuit: &Circuit, request: &AnalysisRequest) -> SpiceResult<NoiseCard> {
-    let positional: Vec<String> = request
-        .arguments
-        .iter()
-        .filter(|argument| !argument.contains('='))
-        .cloned()
-        .collect();
-    let Positional { output, rest } = split_output(&positional)?;
+pub(super) fn parse(positional: &[String]) -> SpiceResult<NoiseCard> {
+    let Positional { output, rest } = split_output(positional)?;
     if !(5..=6).contains(&rest.len()) {
         return Err(unsupported(
             ".noise needs v(out[,ref]) src {dec|oct|lin} pts fstart fstop [pts_per_summary]",
         ));
     }
-    let node = |name: &str| {
-        circuit.nodes().get(name).ok_or_else(|| {
-            unsupported(format!(
-                ".noise output node '{name}' is not in the circuit (C would create a floating \
-                 node)"
-            ))
-        })
-    };
-    let positive = node(&output[0])?;
-    let negative = match output.get(1) {
-        Some(name) => node(name)?,
-        None => NodeId::GROUND,
-    };
-    if positive == negative {
-        return Err(unsupported(
-            ".noise output nodes must differ (the output voltage is identically zero)",
-        ));
-    }
+    let mut output = output.into_iter();
+    let positive = output
+        .next()
+        .ok_or_else(|| unsupported(".noise output node"))?;
+    let negative = output.next();
     let stepping = Stepping::parse(&rest[1]).ok_or_else(|| {
         unsupported(format!(
             ".noise sweep must be dec, oct or lin, not '{}'",
@@ -688,7 +658,7 @@ fn input_kind(circuit: &Circuit, name: &str) -> SpiceResult<SourceKind> {
 }
 
 /// C's frequency grid, with exactly representable bounded point counts.
-fn frequency_grid(card: &NoiseCard, reltol: Real) -> SpiceResult<FrequencyGrid> {
+pub(super) fn frequency_grid(card: &NoiseCard, reltol: Real) -> SpiceResult<FrequencyGrid> {
     let delta = match card.stepping {
         Stepping::Decade => (10f64.ln() / Real::from(card.steps)).exp(),
         Stepping::Octave => (2f64.ln() / Real::from(card.steps)).exp(),
@@ -772,19 +742,18 @@ fn spectrum_plot(representation: Representation, spectrum_variables: Vec<Variabl
 
 /// Runs `.noise` and returns its plots: the spectrum and, unless the sweep is
 /// a single frequency, the integrated noise.
-pub(crate) fn run(
+pub(super) fn run(
     circuit: &mut Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &AnalysisContext,
+    card: &NoiseCard,
+    frequencies: &[Real],
+    options: crate::analysis::NoiseOptions,
     include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
-    let settings = crate::analysis::bias::DcSettings::from_request(request)?;
-    let reltol = match request.named("rtol") {
-        Some(text) => number(Some(text), "rtol")?,
-        None => DEFAULT_RELTOL,
-    };
+    let settings = request.dc_settings().clone();
     circuit.finalize()?;
-    let card = parse(circuit, request)?;
+    let output = card.output(circuit)?;
     let input_kind = input_kind(circuit, &card.input)?;
     // The operating point and small-signal system exactly as `.ac` builds
     // them (`noisean.c`: `CKTop`, then a `MODEINITSMSIG` load; a
@@ -792,7 +761,7 @@ pub(crate) fn run(
     let mut small = crate::analysis::ac::SmallSignal::prepare(circuit, request, context, settings)?;
     let mut plots = small.retained_bias(circuit, request, context, include_bias)?;
     let mut model = context.model_context();
-    model.spice3_noise = request.noise.spice3;
+    model.spice3_noise = options.spice3;
     // Generators that depend on the frequency are described at the first
     // frequency; they are re-described at every frequency below.
     let first = if small.reassembles() {
@@ -806,18 +775,15 @@ pub(crate) fn run(
             .map(Generators::new)
             .collect();
 
-    let representation = Representation::from_squared(request.noise.squared);
+    let representation = Representation::from_squared(options.squared);
     let (spectrum_variables, integrated_variables) =
         plot_names(&generators, input_kind, card.summary != 0, representation);
     let mut spectrum = spectrum_plot(representation, spectrum_variables);
-    let output = [card.positive, card.negative];
     let adjoint_rhs = output_excitation(circuit, output);
 
-    let frequencies = frequency_grid(&card, reltol)?;
     let mut integrated_power = Power::default();
     let mut last = card.start;
-    for (step, frequency) in frequencies.enumerate() {
-        let freq = frequency?;
+    for (step, &freq) in frequencies.iter().enumerate() {
         let input_name = card.input.as_str();
         let (forward, adjoint) = small.at_frequency(circuit, context, freq, |system| {
             let matrix =
@@ -892,7 +858,7 @@ pub(crate) fn run(
 mod tests {
     use super::{
         Generators, NoiseRow, NoiseSample, Power, Representation, Step, almost_equal_ulps,
-        nintegrate, plot_count,
+        nintegrate,
     };
     use crate::devices::noise::{InstanceNoise, NoiseKind, NoiseSource};
     use crate::primitives::{Complex, NodeId};
@@ -1035,16 +1001,28 @@ mod tests {
 
     #[test]
     fn plot_count_follows_the_single_frequency_rules() {
+        use crate::analysis::AnalysisInput;
+        use crate::primitives::AnalysisKind;
+        let plot_count = |arguments: &[String]| {
+            AnalysisInput::with_arguments(AnalysisKind::Noise, arguments.iter().cloned())
+                .resolve()
+                .unwrap()
+                .plot_count()
+        };
         assert_eq!(plot_count(&args("v ( out ) v1 dec 10 1 1k")), 2);
         assert_eq!(plot_count(&args("v ( out ) v1 dec 10 1k 1k")), 1);
         assert_eq!(plot_count(&args("v ( out , ref ) v1 lin 1 1 1k 2")), 1);
         assert_eq!(plot_count(&args("v ( out ) v1 lin 2 1 1k rtol=1e-3")), 2);
-        assert_eq!(plot_count(&args("garbage")), 2);
+        assert!(
+            AnalysisInput::with_arguments(AnalysisKind::Noise, ["garbage"])
+                .resolve()
+                .is_err()
+        );
     }
 
     #[test]
     fn almost_equal_linear_singleton_retains_integrated_plot_like_c() {
-        use crate::analysis::{AnalysisContext, AnalysisRequest, runner};
+        use crate::analysis::{AnalysisContext, AnalysisInput};
         use crate::devices::Circuit;
         use crate::netlist::{Parser, source::parse_deck_text};
         use crate::primitives::AnalysisKind;
@@ -1060,8 +1038,7 @@ mod tests {
             let stop = f64::from_bits(start.to_bits() + distance);
             for mode in ["lin", "dec", "oct"] {
                 let arguments = args(&format!("v ( a ) v1 {mode} 1 {start:.17} {stop:.17}"));
-                let request =
-                    AnalysisRequest::with_arguments(AnalysisKind::Noise, arguments.clone());
+                let request = AnalysisInput::with_arguments(AnalysisKind::Noise, arguments.clone());
                 let parsed_start = crate::primitives::parse_spice_number(&arguments[7]).unwrap();
                 let parsed_stop = crate::primitives::parse_spice_number(&arguments[8]).unwrap();
                 let equal = almost_equal_ulps(parsed_start, parsed_stop, 3);
@@ -1072,12 +1049,12 @@ mod tests {
                 };
                 let expected = 1 + usize::from(integrated);
                 let mut circuit = Circuit::from_netlist(&netlist).unwrap();
-                let plots = runner(AnalysisKind::Noise)
-                    .unwrap()
-                    .run_plots(&mut circuit, &request, &AnalysisContext::default())
+                let plan = request.resolve().unwrap();
+                assert_eq!(plan.plot_count(), expected);
+                let plots = plan
+                    .run_plots(&mut circuit, &AnalysisContext::default())
                     .unwrap();
                 assert_eq!(plots.len(), expected, "{mode} {distance}");
-                assert_eq!(plot_count(&arguments), expected);
                 assert_eq!(plots[0].point_count(), 1);
                 if let Some(integrated) = plots.get(1) {
                     assert_eq!(integrated.points()[0], [Complex::ZERO; 2]);

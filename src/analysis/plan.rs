@@ -1,0 +1,851 @@
+//! Resolution of analysis options at the input boundary.
+//!
+//! Deck setters have already been evaluated and applied in source order.
+//! Literal request overrides are decoded once into the same typed domains;
+//! no deck option goes through a formatted argument on its way to a solver.
+
+use crate::analysis::AnalysisInput;
+use crate::analysis::bias::{
+    ContinuationPolicy, DcSettings, IterationLimit, MAX_GMIN_STAGES, MAX_SOURCE_STEPS,
+};
+use crate::analysis::config::{C_DEFAULT_ITL2_EFFECTIVE, RunConfig};
+use crate::analysis::linear::unsupported;
+use crate::analysis::newton::{MAX_ITERATIONS, NewtonOptions, StepLimiting};
+use crate::maths::integrator::{DEFAULT_XMU, IntegrationMethod};
+use crate::primitives::{
+    AnalysisKind, Real, SpiceResult, exact_nonnegative_integer, parse_spice_number,
+};
+
+const DEFAULT_MAX_STEPS: usize = 1_000_000;
+const MAX_STEPS_LIMIT: usize = 10_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Schedule {
+    #[default]
+    Ngspice,
+    Ladder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Method {
+    Trapezoidal,
+    Gear,
+}
+
+impl Method {
+    fn parse(text: &str) -> SpiceResult<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "trap" | "trapezoidal" => Ok(Self::Trapezoidal),
+            "gear" => Ok(Self::Gear),
+            "bdf" => Err(unsupported(
+                "method=bdf: ngspice has no BDF integrator (the diffsol backend was \
+                 removed); the companion methods are trap and gear",
+            )),
+            _ => Err(unsupported(format!(
+                "unknown transient method '{text}'; expected trap, trapezoidal or gear"
+            ))),
+        }
+    }
+
+    const fn with_order(self, order: u8) -> IntegrationMethod {
+        match self {
+            Self::Trapezoidal => IntegrationMethod::Trapezoidal,
+            Self::Gear => IntegrationMethod::Gear { order },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct SolverOverrides {
+    reltol: Option<Real>,
+    vntol: Option<Real>,
+    abstol: Option<Real>,
+    direct: Option<usize>,
+    stage: Option<usize>,
+    adapt: Option<usize>,
+    source: Option<usize>,
+    gmin_steps: Option<usize>,
+    gmin_factor: Option<Real>,
+    skip: Option<bool>,
+    schedule: Schedule,
+    limiting: Option<StepLimiting>,
+}
+
+impl SolverOverrides {
+    fn resolve(self, config: &RunConfig) -> SpiceResult<DcSettings> {
+        let dc = config.dc();
+        let tran = config.transient();
+        let mut newton = NewtonOptions::default();
+        newton.reltol = self.reltol.or(tran.rtol).unwrap_or(newton.reltol);
+        newton.vntol = self.vntol.or(tran.vntol).unwrap_or(newton.vntol);
+        newton.abstol = self.abstol.or(tran.abstol).unwrap_or(newton.abstol);
+        newton.max_iterations = self.direct.or(dc.itl1).unwrap_or(newton.max_iterations);
+        newton.limiting = self.limiting.unwrap_or(newton.limiting);
+        newton.validate()?;
+
+        let source = self.source.or(dc.srcsteps);
+        let gmin_steps = self.gmin_steps.or(dc.gminsteps);
+        let factor = self.gmin_factor.or(dc.gminfactor);
+        let stage = self.stage.or_else(|| {
+            (dc.itl1.is_some() || dc.itl2.is_some())
+                .then(|| dc.itl2.unwrap_or(C_DEFAULT_ITL2_EFFECTIVE))
+        });
+        let mut continuation = match self.schedule {
+            Schedule::Ngspice => ContinuationPolicy::from_ngspice_steps(
+                source,
+                gmin_steps,
+                factor,
+                self.adapt.or(dc.itl2_written),
+            )?,
+            Schedule::Ladder => {
+                if self.adapt.is_some() {
+                    return Err(unsupported(
+                        "adaptiter steers the ngspice schedule only, not continuation=ladder",
+                    ));
+                }
+                ContinuationPolicy::from_steps(source, gmin_steps, factor)?
+            }
+        };
+        continuation.stage_max_iterations = stage.map(IterationLimit::new).transpose()?;
+        continuation.skip_direct = self.skip.unwrap_or(dc.noopiter);
+        Ok(DcSettings {
+            newton,
+            continuation,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct TransientOverrides {
+    method: Option<Method>,
+    max_order: Option<u8>,
+    chgtol: Option<Real>,
+    trtol: Option<Real>,
+    max_steps: Option<usize>,
+    tran_max_iter: Option<usize>,
+    xmu: Option<Real>,
+}
+
+/// The transient-only part of a resolved plan, independent of time bounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct TransientOptions {
+    pub method: IntegrationMethod,
+    pub max_order: u8,
+    pub chgtol: Real,
+    pub trtol: Real,
+    pub max_steps: usize,
+    pub tran_max_iter: usize,
+    pub xmu: Real,
+}
+
+impl TransientOverrides {
+    fn resolve(self, config: &RunConfig) -> SpiceResult<TransientOptions> {
+        let deck = config.transient();
+        let max_order = self.max_order.or(config.maxord()).unwrap_or(2);
+        let method = match self.method {
+            Some(method) => method,
+            None => config
+                .method()
+                .map(Method::parse)
+                .transpose()?
+                .unwrap_or(Method::Trapezoidal),
+        }
+        .with_order(max_order);
+        method.validate_runtime()?;
+        Ok(TransientOptions {
+            method,
+            max_order,
+            chgtol: self.chgtol.or(deck.chgtol).unwrap_or(1e-14),
+            trtol: self.trtol.or(deck.trtol).unwrap_or(7.),
+            max_steps: self.max_steps.unwrap_or(DEFAULT_MAX_STEPS),
+            tran_max_iter: self.tran_max_iter.or(deck.itl4).unwrap_or(100),
+            xmu: self.xmu.or(deck.xmu).unwrap_or(DEFAULT_XMU),
+        })
+    }
+}
+
+/// The analysis-specific options that cannot be passed to another kind.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum SpecificOptions {
+    Ordinary,
+    Dc { point_iterations: Option<usize> },
+    Transient(TransientOptions),
+}
+
+/// One resolution of literal arguments and the deck's typed defaults.
+#[derive(Debug, PartialEq)]
+pub(super) struct ResolvedOptions {
+    pub positional: Vec<String>,
+    pub dc: DcSettings,
+    pub specific: SpecificOptions,
+}
+
+/// Literal option decoding. The same explicit key cannot occur twice, even
+/// with different case. Deck duplicates are independently last-writer-wins.
+#[derive(Default)]
+struct Overrides {
+    solver: SolverOverrides,
+    tran: TransientOverrides,
+    point_iterations: Option<usize>,
+}
+
+fn real(text: &str, key: &str) -> SpiceResult<Real> {
+    parse_spice_number(text)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| unsupported(format!("nonfinite/nonliteral option {key}")))
+}
+
+fn positive(text: &str, key: &str) -> SpiceResult<Real> {
+    let value = real(text, key)?;
+    if value > 0. {
+        Ok(value)
+    } else {
+        Err(unsupported(format!("option {key} must be positive")))
+    }
+}
+
+fn count(text: &str, key: &str, minimum: usize, maximum: usize) -> SpiceResult<usize> {
+    exact_nonnegative_integer::<usize>(real(text, key)?)
+        .filter(|n| (minimum..=maximum).contains(n))
+        .ok_or_else(|| {
+            unsupported(format!(
+                "{key} must be an integer in {minimum}..={maximum}, not '{text}'"
+            ))
+        })
+}
+
+impl Overrides {
+    fn set(&mut self, kind: AnalysisKind, key: &str, text: &str) -> SpiceResult<()> {
+        let solver = &mut self.solver;
+        match key {
+            "rtol" => solver.reltol = Some(positive(text, key)?),
+            "vntol" => solver.vntol = Some(positive(text, key)?),
+            "abstol" => solver.abstol = Some(positive(text, key)?),
+            "maxiter" => solver.direct = Some(count(text, key, 1, MAX_ITERATIONS)?),
+            "stagemaxiter" => solver.stage = Some(count(text, key, 1, MAX_ITERATIONS)?),
+            "adaptiter" => solver.adapt = Some(count(text, key, 1, MAX_ITERATIONS)?),
+            "srcsteps" => solver.source = Some(count(text, key, 0, MAX_SOURCE_STEPS)?),
+            "gminsteps" => solver.gmin_steps = Some(count(text, key, 0, MAX_GMIN_STAGES)?),
+            "gminfactor" => solver.gmin_factor = Some(real(text, key)?),
+            "noopiter" => solver.skip = Some(count(text, key, 0, 1)? == 1),
+            "continuation" => {
+                solver.schedule = match text.to_ascii_lowercase().as_str() {
+                    "ngspice" => Schedule::Ngspice,
+                    "ladder" => Schedule::Ladder,
+                    _ => {
+                        return Err(unsupported(format!(
+                            "continuation must be 'ngspice' or 'ladder', not '{text}'"
+                        )));
+                    }
+                };
+            }
+            "limiting" => {
+                solver.limiting = Some(match text.to_ascii_lowercase().as_str() {
+                    "device" => StepLimiting::Device,
+                    "global" => StepLimiting::Global,
+                    _ => {
+                        return Err(unsupported(format!(
+                            "limiting must be 'device' or 'global', not '{text}'"
+                        )));
+                    }
+                });
+            }
+            "trcvmaxiter" if kind == AnalysisKind::DcSweep => {
+                self.point_iterations = Some(count(text, key, 1, MAX_ITERATIONS)?);
+            }
+            _ if kind == AnalysisKind::Transient => self.tran.set(key, text)?,
+            _ => return Err(unsupported(format!("convergence option {key}"))),
+        }
+        Ok(())
+    }
+}
+
+impl TransientOverrides {
+    fn set(&mut self, key: &str, text: &str) -> SpiceResult<()> {
+        match key {
+            "backend" if text.eq_ignore_ascii_case("companion") => {}
+            "backend" if text.eq_ignore_ascii_case("diffsol") => {
+                return Err(unsupported(
+                    "backend=diffsol: the adaptive BDF backend was removed with diffsol; ngspice has \
+                     no BDF integrator. Omit backend= to run the trapezoidal/Gear companion driver \
+                     (dctran.c)",
+                ));
+            }
+            "backend" => {
+                return Err(unsupported(format!(
+                    "unknown transient backend '{text}'; expected companion (default)"
+                )));
+            }
+            "method" => self.method = Some(Method::parse(text)?),
+            "maxord" => {
+                self.max_order = Some(
+                    text.parse::<u8>()
+                        .ok()
+                        .filter(|n| (1..=IntegrationMethod::MAX_GEAR_ORDER).contains(n))
+                        .ok_or_else(|| {
+                            unsupported(format!(
+                                "maxord must be an integer in 1..={}, not '{text}'",
+                                IntegrationMethod::MAX_GEAR_ORDER
+                            ))
+                        })?,
+                );
+            }
+            "chgtol" => self.chgtol = Some(positive(text, key)?),
+            "trtol" => self.trtol = Some(positive(text, key)?),
+            "maxsteps" => {
+                self.max_steps = Some(
+                    text.parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=MAX_STEPS_LIMIT).contains(n))
+                        .ok_or_else(|| {
+                            unsupported(format!(
+                                "maxsteps must be an integer in 1..={MAX_STEPS_LIMIT}"
+                            ))
+                        })?,
+                );
+            }
+            "tranmaxiter" => self.tran_max_iter = Some(count(text, key, 1, MAX_ITERATIONS)?),
+            "xmu" => {
+                self.xmu = Some(
+                    parse_spice_number(text)
+                        .filter(|v| (0. ..=0.5).contains(v))
+                        .ok_or_else(|| {
+                            unsupported(format!("xmu must be in [0, 0.5], not '{text}'"))
+                        })?,
+                );
+            }
+            _ => return Err(unsupported(format!("companion transient option '{key}'"))),
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn resolve_options(
+    input: &AnalysisInput,
+    config: &RunConfig,
+) -> SpiceResult<ResolvedOptions> {
+    let mut overrides = Overrides::default();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut positional = Vec::with_capacity(input.arguments.len());
+    for argument in &input.arguments {
+        match argument.split_once('=') {
+            Some((key, value)) => {
+                let key = key.trim().to_ascii_lowercase();
+                if !seen.insert(key.clone()) {
+                    return Err(unsupported(format!("duplicate analysis option {key}")));
+                }
+                overrides.set(input.kind, &key, value.trim())?;
+            }
+            None => positional.push(argument.clone()),
+        }
+    }
+    let dc = overrides.solver.resolve(config)?;
+    let specific = match input.kind {
+        AnalysisKind::Transient => SpecificOptions::Transient(overrides.tran.resolve(config)?),
+        AnalysisKind::DcSweep => SpecificOptions::Dc {
+            point_iterations: overrides.point_iterations.or(config.dc().itl2),
+        },
+        _ => SpecificOptions::Ordinary,
+    };
+    Ok(ResolvedOptions {
+        positional,
+        dc,
+        specific,
+    })
+}
+
+/// An analysis with its own validated input grammar and supported flags.
+/// Circuit identities are intentionally still names until a circuit exists.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum PlanKind {
+    OperatingPoint,
+    Dc {
+        axes: Vec<crate::analysis::sweep::AxisPlan>,
+        point_iterations: Option<usize>,
+    },
+    Ac {
+        frequencies: Vec<Real>,
+        retain_bias: bool,
+    },
+    Transient {
+        settings: crate::analysis::TransientPlan,
+        uic: bool,
+    },
+    PoleZero {
+        card: crate::analysis::pz::Card,
+        retain_bias: bool,
+    },
+    TransferFunction(crate::analysis::tf::TransferRequest),
+    SParameter {
+        frequencies: Vec<Real>,
+        donoise: bool,
+        retain_bias: bool,
+    },
+    Noise {
+        card: crate::analysis::noise::NoiseCard,
+        frequencies: Vec<Real>,
+        options: crate::analysis::NoiseOptions,
+        retain_bias: bool,
+    },
+    Distortion {
+        card: crate::analysis::disto::DistoCard,
+        frequencies: Vec<Real>,
+        retain_bias: bool,
+    },
+    Sensitivity {
+        card: crate::analysis::sens::SensCard,
+        frequencies: Option<Vec<Real>>,
+    },
+}
+
+/// A resolved, immutable analysis execution plan.
+///
+/// All numeric request arguments and named analysis options have been
+/// interpreted. Circuit-dependent node, source and device identities bind to
+/// the circuit at execution; no driver interprets the original arguments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalysisPlan {
+    analysis: PlanKind,
+    dc: DcSettings,
+    initial_conditions: Vec<crate::analysis::NodeCondition>,
+    nodesets: Vec<crate::analysis::NodeCondition>,
+}
+
+impl AnalysisPlan {
+    pub(super) fn resolve(
+        input: AnalysisInput,
+        config: &RunConfig,
+        deck_noise: crate::analysis::NoiseOptions,
+        deck_keep_op_info: bool,
+    ) -> SpiceResult<Self> {
+        use crate::analysis::{
+            ac, companion::TransientPlan, disto, noise, pz, sens, sparam, sweep, tf,
+        };
+        let kind = input.kind;
+        let retains = matches!(
+            kind,
+            AnalysisKind::Ac
+                | AnalysisKind::PoleZero
+                | AnalysisKind::SParameter
+                | AnalysisKind::Noise
+                | AnalysisKind::Distortion
+        );
+        if input.uic && kind != AnalysisKind::Transient {
+            return Err(unsupported("uic is valid only for .tran"));
+        }
+        if input.noise.is_some() && kind != AnalysisKind::Noise {
+            return Err(unsupported("noise options are valid only for .noise"));
+        }
+        if input.keep_op_info.is_some() && !retains {
+            return Err(unsupported(
+                "retaining the bias plot is not supported for this analysis",
+            ));
+        }
+        let retain_bias = input.keep_op_info.unwrap_or(deck_keep_op_info);
+        let ResolvedOptions {
+            positional,
+            dc,
+            specific,
+        } = resolve_options(&input, config)?;
+        let reltol = dc.newton.reltol;
+        let analysis = match kind {
+            AnalysisKind::OperatingPoint => {
+                if !positional.is_empty() {
+                    return Err(unsupported(".op arguments"));
+                }
+                PlanKind::OperatingPoint
+            }
+            AnalysisKind::DcSweep => {
+                let SpecificOptions::Dc { point_iterations } = specific else {
+                    return Err(unsupported("missing DC sweep options"));
+                };
+                PlanKind::Dc {
+                    axes: sweep::parse_axes(&positional)?,
+                    point_iterations,
+                }
+            }
+            AnalysisKind::Ac => {
+                if positional.len() != 4 {
+                    return Err(unsupported(".ac lin|dec|oct points start stop"));
+                }
+                PlanKind::Ac {
+                    frequencies: ac::frequency_grid(&positional, reltol, ac::GridKind::Ac)?,
+                    retain_bias,
+                }
+            }
+            AnalysisKind::Transient => {
+                let SpecificOptions::Transient(options) = specific else {
+                    return Err(unsupported("missing transient options"));
+                };
+                PlanKind::Transient {
+                    settings: TransientPlan::resolve(&positional, options, &dc.newton)?,
+                    uic: input.uic,
+                }
+            }
+            AnalysisKind::PoleZero => PlanKind::PoleZero {
+                card: pz::parse(&positional)?,
+                retain_bias,
+            },
+            AnalysisKind::TransferFunction => PlanKind::TransferFunction(tf::parse(
+                &positional.iter().map(String::as_str).collect::<Vec<_>>(),
+            )?),
+            AnalysisKind::SParameter => {
+                let (frequencies, donoise) = sparam::parse(&positional, reltol)?;
+                PlanKind::SParameter {
+                    frequencies,
+                    donoise,
+                    retain_bias,
+                }
+            }
+            AnalysisKind::Noise => {
+                let card = noise::parse(&positional)?;
+                let frequencies =
+                    noise::frequency_grid(&card, reltol)?.collect::<SpiceResult<_>>()?;
+                PlanKind::Noise {
+                    card,
+                    frequencies,
+                    options: input.noise.unwrap_or(deck_noise),
+                    retain_bias,
+                }
+            }
+            AnalysisKind::Distortion => {
+                let card = disto::parse(&positional)?;
+                let frequencies = disto::frequencies(&card, reltol)?;
+                PlanKind::Distortion {
+                    card,
+                    frequencies,
+                    retain_bias,
+                }
+            }
+            AnalysisKind::Sensitivity => {
+                let card = sens::parse(&positional)?;
+                let frequencies = card.grid()?;
+                PlanKind::Sensitivity { card, frequencies }
+            }
+            AnalysisKind::Fourier => {
+                return Err(unsupported(format!(
+                    ".four analysis has no driver in the port yet (see {})",
+                    crate::analysis::C_REFERENCE_ANALYSIS,
+                )));
+            }
+        };
+        Ok(Self {
+            analysis,
+            dc,
+            initial_conditions: input.initial_conditions,
+            nodesets: input.nodesets,
+        })
+    }
+
+    /// The kind encoded by the checked analysis payload.
+    #[must_use]
+    pub const fn kind(&self) -> AnalysisKind {
+        match self.analysis {
+            PlanKind::OperatingPoint => AnalysisKind::OperatingPoint,
+            PlanKind::Dc { .. } => AnalysisKind::DcSweep,
+            PlanKind::Ac { .. } => AnalysisKind::Ac,
+            PlanKind::Transient { .. } => AnalysisKind::Transient,
+            PlanKind::PoleZero { .. } => AnalysisKind::PoleZero,
+            PlanKind::TransferFunction(_) => AnalysisKind::TransferFunction,
+            PlanKind::SParameter { .. } => AnalysisKind::SParameter,
+            PlanKind::Noise { .. } => AnalysisKind::Noise,
+            PlanKind::Distortion { .. } => AnalysisKind::Distortion,
+            PlanKind::Sensitivity { .. } => AnalysisKind::Sensitivity,
+        }
+    }
+
+    /// The resolved Newton and continuation settings shared by bias solves.
+    #[must_use]
+    pub const fn dc_settings(&self) -> &DcSettings {
+        &self.dc
+    }
+
+    /// Explicit or deck-supplied DC point iteration limit, if present.
+    #[must_use]
+    pub const fn point_iterations(&self) -> Option<usize> {
+        match self.analysis {
+            PlanKind::Dc {
+                point_iterations, ..
+            } => point_iterations,
+            _ => None,
+        }
+    }
+
+    /// The transient settings, if this is a transient plan.
+    #[must_use]
+    pub const fn transient(&self) -> Option<&crate::analysis::TransientPlan> {
+        match &self.analysis {
+            PlanKind::Transient { settings, .. } => Some(settings),
+            _ => None,
+        }
+    }
+
+    /// Whether this transient starts from the user initial conditions.
+    #[must_use]
+    pub const fn uic(&self) -> bool {
+        matches!(self.analysis, PlanKind::Transient { uic: true, .. })
+    }
+
+    /// Noise representation and model options, only for noise plans.
+    #[must_use]
+    pub const fn noise_options(&self) -> Option<crate::analysis::NoiseOptions> {
+        match self.analysis {
+            PlanKind::Noise { options, .. } => Some(options),
+            _ => None,
+        }
+    }
+
+    /// Checked frequency points in the reference algorithm's order.
+    #[must_use]
+    pub fn frequencies(&self) -> Option<&[Real]> {
+        match &self.analysis {
+            PlanKind::Ac { frequencies, .. }
+            | PlanKind::SParameter { frequencies, .. }
+            | PlanKind::Noise { frequencies, .. }
+            | PlanKind::Distortion { frequencies, .. } => Some(frequencies),
+            PlanKind::Sensitivity { frequencies, .. } => frequencies.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Evaluated initial-condition assignments, in deck order.
+    #[must_use]
+    pub fn initial_conditions(&self) -> &[crate::analysis::NodeCondition] {
+        &self.initial_conditions
+    }
+
+    /// Evaluated nodeset assignments, in deck order.
+    #[must_use]
+    pub fn nodesets(&self) -> &[crate::analysis::NodeCondition] {
+        &self.nodesets
+    }
+
+    /// Whether this plan retains its small-signal bias in multi-plot output.
+    #[must_use]
+    pub const fn retains_bias(&self) -> bool {
+        match self.analysis {
+            PlanKind::Ac { retain_bias, .. }
+            | PlanKind::PoleZero { retain_bias, .. }
+            | PlanKind::SParameter { retain_bias, .. }
+            | PlanKind::Noise { retain_bias, .. }
+            | PlanKind::Distortion { retain_bias, .. } => retain_bias,
+            _ => false,
+        }
+    }
+
+    /// Exact number of plots emitted by this resolved multi-plot analysis.
+    #[must_use]
+    pub const fn plot_count(&self) -> usize {
+        let count = match &self.analysis {
+            PlanKind::Noise { card, .. } => card.plot_count(),
+            PlanKind::Distortion { card, .. } => card.plot_count(),
+            _ => 1,
+        };
+        count + if self.retains_bias() { 1 } else { 0 }
+    }
+
+    pub(super) const fn analysis(&self) -> &PlanKind {
+        &self.analysis
+    }
+
+    /// Run the analysis and return its primary plot (without retaining bias).
+    ///
+    /// # Errors
+    /// Circuit binding/elaboration or numerical errors.
+    pub fn run(
+        &self,
+        circuit: &mut crate::devices::Circuit,
+        context: &crate::analysis::AnalysisContext,
+    ) -> SpiceResult<crate::analysis::Plot> {
+        self.execute(circuit, context, false)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::primitives::SpiceError::Numerical {
+                context: format!(".{} analysis", self.kind().as_str()),
+                message: "the analysis returned no plot".into(),
+            })
+    }
+
+    /// Run the analysis and return every plot in C output order.
+    ///
+    /// # Errors
+    /// Circuit binding/elaboration or numerical errors.
+    pub fn run_plots(
+        &self,
+        circuit: &mut crate::devices::Circuit,
+        context: &crate::analysis::AnalysisContext,
+    ) -> SpiceResult<Vec<crate::analysis::Plot>> {
+        self.execute(circuit, context, self.retains_bias())
+    }
+
+    fn execute(
+        &self,
+        circuit: &mut crate::devices::Circuit,
+        context: &crate::analysis::AnalysisContext,
+        retain_bias: bool,
+    ) -> SpiceResult<Vec<crate::analysis::Plot>> {
+        use crate::analysis::{ac, disto, linear, noise, pz, sens, sparam, sweep, tf};
+        match &self.analysis {
+            PlanKind::OperatingPoint => Ok(vec![linear::op(circuit, self, context)?]),
+            PlanKind::Dc {
+                axes,
+                point_iterations,
+            } => Ok(vec![sweep::run(
+                circuit,
+                self,
+                context,
+                axes,
+                *point_iterations,
+            )?]),
+            PlanKind::Ac { frequencies, .. } => {
+                ac::run(circuit, self, context, frequencies, retain_bias)
+            }
+            PlanKind::Transient { .. } => Ok(vec![
+                crate::analysis::companion_transient(circuit, self, context)?.0,
+            ]),
+            PlanKind::PoleZero { card, .. } => pz::run(circuit, self, context, card, retain_bias),
+            PlanKind::TransferFunction(card) => Ok(vec![tf::run(circuit, self, context, card)?]),
+            PlanKind::SParameter {
+                frequencies,
+                donoise,
+                ..
+            } => sparam::run(circuit, self, context, frequencies, *donoise, retain_bias),
+            PlanKind::Noise {
+                card,
+                frequencies,
+                options,
+                ..
+            } => noise::run(
+                circuit,
+                self,
+                context,
+                card,
+                frequencies,
+                *options,
+                retain_bias,
+            ),
+            PlanKind::Distortion {
+                card, frequencies, ..
+            } => disto::run(circuit, self, context, card, frequencies, retain_bias),
+            PlanKind::Sensitivity { card, frequencies } => Ok(vec![sens::run(
+                circuit,
+                self,
+                context,
+                card,
+                frequencies.as_deref(),
+            )?]),
+        }
+    }
+
+    /// Run the primary analysis, sending accepted points to a sink.
+    /// Transients stream directly; other analyses replay their completed plot.
+    ///
+    /// # Errors
+    /// As [Self::run], or an error from the point sink.
+    pub fn run_into(
+        &self,
+        circuit: &mut crate::devices::Circuit,
+        context: &crate::analysis::AnalysisContext,
+        sink: &mut dyn crate::analysis::PointSink,
+    ) -> SpiceResult<crate::analysis::Plot> {
+        if matches!(self.analysis, PlanKind::Transient { .. }) {
+            return crate::analysis::companion_transient_into(circuit, self, context, sink)
+                .map(|(plot, _)| plot);
+        }
+        let mut plot = self.run(circuit, context)?;
+        let points = plot.take_points();
+        sink.begin(&plot)?;
+        for point in &points {
+            sink.point(point)?;
+        }
+        Ok(plot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::bias::{ContinuationSchedule, Stepping};
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+
+    fn config(text: &str) -> RunConfig {
+        let deck = parse_deck_text(
+            Path::new("plan.cir"),
+            &format!("plan\nr1 a 0 1k\n{text}\n.end\n"),
+        );
+        let netlist = Parser::new().parse_deck(&deck).unwrap();
+        RunConfig::from_netlist(&netlist).unwrap()
+    }
+
+    #[test]
+    fn typed_precedence_preserves_stage_and_adaptation_limits() {
+        let config = config(
+            ".options itl1=200 itl2=9 gminsteps=5 srcsteps=0\n.options itl1=300 srcsteps=8 reltol=1e-6",
+        );
+        let input = AnalysisInput::with_arguments(
+            AnalysisKind::DcSweep,
+            ["v1", "0", "1", "0.1", "MAXITER=7", "srcsteps=3"],
+        );
+        let options = resolve_options(&input, &config).unwrap();
+        assert_eq!(options.positional, ["v1", "0", "1", "0.1"]);
+        assert_eq!(options.dc.newton.max_iterations, 7);
+        assert_eq!(options.dc.newton.reltol, 1e-6);
+        assert_eq!(
+            options
+                .dc
+                .continuation
+                .stage_max_iterations
+                .map(IterationLimit::get),
+            Some(100)
+        );
+        let ContinuationSchedule::Ngspice(schedule) = options.dc.continuation.schedule else {
+            panic!("wrong schedule")
+        };
+        assert_eq!(schedule.adapt_iterations(), 9);
+        assert_eq!(schedule.source, Stepping::from_count(3).unwrap());
+        assert_eq!(schedule.gmin, Stepping::from_count(5).unwrap());
+        assert_eq!(
+            options.specific,
+            SpecificOptions::Dc {
+                point_iterations: Some(100)
+            }
+        );
+    }
+
+    #[test]
+    fn transient_overrides_are_typed_and_do_not_leak() {
+        let config = config(".options method=gear maxord=4 itl4=200 chgtol=1p xmu=0.25");
+        let input = AnalysisInput::with_arguments(
+            AnalysisKind::Transient,
+            ["1u", "1m", "maxord=3", "tranmaxiter=7"],
+        );
+        let options = resolve_options(&input, &config).unwrap();
+        let SpecificOptions::Transient(tran) = options.specific else {
+            panic!("wrong kind")
+        };
+        assert_eq!(tran.method, IntegrationMethod::Gear { order: 3 });
+        assert_eq!(tran.tran_max_iter, 7);
+        assert_eq!(tran.chgtol, 1e-12);
+        assert_eq!(tran.xmu, 0.25);
+        for key in ["method=gear", "tranmaxiter=20", "trcvmaxiter=1"] {
+            let input = AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, [key]);
+            assert!(resolve_options(&input, &config).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn duplicate_invalid_and_cross_analysis_explicit_options_fail() {
+        for args in [
+            vec!["maxiter=1", "MAXITER=2"],
+            vec!["srcsteps=-1"],
+            vec!["continuation=ladder", "adaptiter=10"],
+            vec!["rtol=0"],
+            vec!["backend=diffsol"],
+            vec!["trcvmaxiter=5"],
+        ] {
+            let input = AnalysisInput::with_arguments(AnalysisKind::Transient, args);
+            assert!(resolve_options(&input, &RunConfig::default()).is_err());
+        }
+    }
+}

@@ -1,5 +1,5 @@
 //! #16 run configuration: precedence, validation and per-deck isolation.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, RunConfig, RunOverrides, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, RunConfig, RunOverrides};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::Netlist;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -27,8 +27,8 @@ fn defaults_are_unchanged() {
     assert_eq!(c.context().nominal_temperature, 27.0);
     assert_eq!(*c.transient(), Default::default());
     assert!(c.applied().is_empty() && c.method().is_none() && c.maxord().is_none());
-    let tran = AnalysisRequest::with_arguments(AnalysisKind::Transient, ["1u", "1m"]);
-    assert_eq!(c.request(tran.clone()).unwrap(), tran);
+    let tran = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m"]);
+    assert_eq!(c.plan(tran.clone()).unwrap(), tran.resolve().unwrap());
 }
 
 #[test]
@@ -64,19 +64,30 @@ fn overrides_beat_deck_and_request_arguments_beat_deck() {
         .is_err()
     );
 
-    let request =
-        AnalysisRequest::with_arguments(AnalysisKind::Transient, ["1u", "1m", "RTOL=5e-5"]);
-    let merged = c.request(request).unwrap();
-    assert_eq!(merged.named("rtol"), Some("5e-5"));
-    assert_eq!(merged.named("vntol"), Some("2e-6"));
-    assert_eq!(merged.named("abstol"), Some("3e-12"));
+    let request = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "RTOL=5e-5"]);
+    let merged = c.plan(request).unwrap();
+    assert_eq!(
+        merged.dc_settings().newton.reltol,
+        ngspice_rs::primitives::parse_spice_number("5e-5").unwrap()
+    );
+    assert_eq!(
+        merged.dc_settings().newton.vntol,
+        c.transient().vntol.unwrap()
+    );
+    assert_eq!(
+        merged.dc_settings().newton.abstol,
+        c.transient().abstol.unwrap()
+    );
     // M4 forwards the same physical tolerances to the reusable DC Newton solve.
     let op = c
-        .request(AnalysisRequest::new(AnalysisKind::OperatingPoint))
+        .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
         .unwrap();
-    assert_eq!(op.named("rtol"), Some("1e-3"));
-    assert_eq!(op.named("vntol"), Some("2e-6"));
-    assert_eq!(op.named("abstol"), Some("3e-12"));
+    assert_eq!(op.dc_settings().newton.reltol, c.transient().rtol.unwrap());
+    assert_eq!(op.dc_settings().newton.vntol, c.transient().vntol.unwrap());
+    assert_eq!(
+        op.dc_settings().newton.abstol,
+        c.transient().abstol.unwrap()
+    );
 }
 
 #[test]
@@ -138,44 +149,62 @@ fn unknown_unimplemented_and_conflicting_options_are_errors() {
 
 #[test]
 fn method_and_maxord_reach_the_companion_driver() {
+    use ngspice_rs::maths::integrator::IntegrationMethod;
     let c = config(".options method=Gear maxord=2").unwrap();
     assert_eq!((c.method(), c.maxord()), (Some("gear"), Some(2)));
-    let ordinary = AnalysisRequest::with_arguments(AnalysisKind::Transient, ["1u", "1m"]);
-    for (options, forwarded) in [
-        (".options method=trap", vec!["method=trap"]),
-        (".options method=trapezoidal", vec!["method=trapezoidal"]),
-        (".options method=gear", vec!["method=gear"]),
-        (".options maxord=2", vec!["maxord=2"]),
+    let ordinary = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m"]);
+    for (options, method, order) in [
+        (".options method=trap", IntegrationMethod::Trapezoidal, 2),
+        (
+            ".options method=trapezoidal",
+            IntegrationMethod::Trapezoidal,
+            2,
+        ),
+        (
+            ".options method=gear",
+            IntegrationMethod::Gear { order: 2 },
+            2,
+        ),
+        (".options maxord=2", IntegrationMethod::Trapezoidal, 2),
         (
             ".options method=gear maxord=1",
-            vec!["method=gear", "maxord=1"],
+            IntegrationMethod::Gear { order: 1 },
+            1,
         ),
     ] {
         let c = config(options).unwrap();
-        let mut want = ordinary.clone();
-        want.arguments
-            .extend(forwarded.into_iter().map(String::from));
-        assert_eq!(c.request(ordinary.clone()).unwrap(), want, "{options}");
-        // Analyses that do not integrate are unaffected by the retained selection.
-        let ac = AnalysisRequest::new(AnalysisKind::Ac);
-        assert_eq!(c.request(ac.clone()).unwrap(), ac);
+        let plan = c.plan(ordinary.clone()).unwrap();
+        let settings = plan.transient().unwrap();
+        assert_eq!(
+            (settings.method(), settings.max_order()),
+            (method, order),
+            "{options}"
+        );
+        let ac = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "3", "1", "3"]);
+        assert_eq!(c.plan(ac.clone()).unwrap(), ac.resolve().unwrap());
     }
     // An explicit request selection beats the deck's.
     let c = config(".options method=gear maxord=1").unwrap();
-    let explicit = AnalysisRequest::with_arguments(
+    let explicit = AnalysisInput::with_arguments(
         AnalysisKind::Transient,
         ["1u", "1m", "method=trap", "maxord=2"],
     );
-    assert_eq!(c.request(explicit.clone()).unwrap(), explicit);
+    assert_eq!(
+        c.plan(explicit.clone()).unwrap(),
+        explicit.resolve().unwrap()
+    );
     // Gear orders up to ngspice's 6 are forwarded (#98); the companion driver
     // follows dctran.c, which never runs above order 2.
     let request = config(".options method=gear maxord=4")
         .unwrap()
-        .request(ordinary.clone())
+        .plan(ordinary.clone())
         .unwrap();
     assert_eq!(
-        (request.named("method"), request.named("maxord")),
-        (Some("gear"), Some("4"))
+        (
+            request.transient().unwrap().method(),
+            request.transient().unwrap().max_order()
+        ),
+        (IntegrationMethod::Gear { order: 4 }, 4)
     );
     assert!(config(".options method=gear maxord=7").is_err());
     // trtol/chgtol are companion truncation options.
@@ -184,10 +213,13 @@ fn method_and_maxord_reach_the_companion_driver() {
         (c.transient().trtol, c.transient().chgtol),
         (Some(3.), Some(1e-13))
     );
-    let request = c.request(ordinary.clone()).unwrap();
+    let request = c.plan(ordinary.clone()).unwrap();
     assert_eq!(
-        (request.named("trtol"), request.named("chgtol")),
-        (Some("3e0"), Some("1e-13"))
+        (
+            request.transient().unwrap().trtol(),
+            request.transient().unwrap().chgtol()
+        ),
+        (3., c.transient().chgtol.unwrap())
     );
     assert!(config(".options trtol=0").is_err());
 }
@@ -200,11 +232,8 @@ fn deck_options_take_effect_in_a_real_transient_and_do_not_leak() {
     let run = |n: &Netlist| {
         let c = RunConfig::from_netlist(n).unwrap();
         let mut circuit = c.circuit(n).unwrap();
-        let request = c.request_for(&n.analyses[0]).unwrap();
-        let plot =
-            runner(AnalysisKind::Transient)
-                .unwrap()
-                .run(&mut circuit, &request, &c.context());
+        let request = c.plan_for(&n.analyses[0]).unwrap();
+        let plot = request.run(&mut circuit, &c.context());
         (c, plot)
     };
     let (c_loose, loose_plot) = run(&loose);
@@ -226,13 +255,9 @@ fn temperatures_reach_elaboration_and_plain_elaboration_refuses_options() {
     let mut hot = c.circuit(&n).unwrap();
     let mut cold = RunConfig::default().circuit(&n).unwrap();
     let op = |circuit: &mut ngspice_rs::devices::Circuit, ctx: &AnalysisContext| {
-        runner(AnalysisKind::OperatingPoint)
-            .unwrap()
-            .run(
-                circuit,
-                &AnalysisRequest::new(AnalysisKind::OperatingPoint),
-                ctx,
-            )
+        AnalysisInput::new(AnalysisKind::OperatingPoint)
+            .resolve()
+            .and_then(|plan| plan.run(circuit, ctx))
             .unwrap()
             .value("i(v1)", 0)
             .unwrap()
@@ -263,17 +288,17 @@ fn parsed_ic_and_nodeset_cards_travel_with_every_request() {
     );
     let config = RunConfig::from_netlist(&netlist).unwrap();
     for analysis in &netlist.analyses {
-        let request = config.request_for(analysis).unwrap();
+        let request = config.plan_for(analysis).unwrap();
         let ic: Vec<_> = request
-            .initial_conditions
+            .initial_conditions()
             .iter()
             .map(|c| (c.node.as_str(), c.value))
             .collect();
         // numparam's "1.500000000000000e+00" read by INPevaluate.
         assert_eq!(ic, [("a", 1.), ("a", 1.5000000000000002)]);
-        assert_eq!(request.nodesets.len(), 1);
-        assert_eq!(request.nodesets[0].value, 2.);
-        assert_eq!(request.nodesets[0].location.line, 5);
+        assert_eq!(request.nodesets().len(), 1);
+        assert_eq!(request.nodesets()[0].value, 2.);
+        assert_eq!(request.nodesets()[0].location.line, 5);
     }
     // An undefined parameter is an error, not a silently dropped entry.
     let netlist = deck("r1 a 0 1k\n.ic v(a)={nope}\n.tran 1u 1m");
@@ -284,12 +309,9 @@ fn parsed_ic_and_nodeset_cards_travel_with_every_request() {
 fn tran_uic_is_a_request_flag_the_companion_driver_runs() {
     let netlist = deck("v1 a 0 0\nr1 a b 1k\nc1 b 0 1u\n.tran 1u 10u uic");
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
-    assert!(request.uic);
-    assert!(!request.arguments.iter().any(|a| a == "uic"));
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
+    assert!(request.uic());
+    assert!(!netlist.analyses[0].arguments.iter().any(|a| a == "uic"));
     let mut circuit = config.circuit(&netlist).unwrap();
-    runner(AnalysisKind::Transient)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    request.run(&mut circuit, &config.context()).unwrap();
 }

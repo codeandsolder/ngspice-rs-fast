@@ -1,6 +1,6 @@
 //! #15: top-level `.param` decks produce the same results as literal decks
 //! through the production RunConfig/Circuit/runner APIs.
-use ngspice_rs::analysis::{RunConfig, runner};
+use ngspice_rs::analysis::RunConfig;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::Netlist;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -21,8 +21,8 @@ fn run_first(body: &str) -> Result<String, SpiceError> {
     let config = RunConfig::from_netlist(&n)?;
     let mut circuit = config.circuit(&n)?;
     let card = &n.analyses[0];
-    let request = config.request_for(card)?;
-    let plot = runner(card.kind)?.run(&mut circuit, &request, &config.context())?;
+    let request = config.plan_for(card)?;
+    let plot = request.run(&mut circuit, &config.context())?;
     Ok(format!("{plot:?}"))
 }
 
@@ -84,7 +84,7 @@ fn failures_are_explicit_with_source_context() {
     let n = deck("v1 a 0 1\nr1 a 0 1k\n.dc v1 0 {1+1} 1");
     let c = RunConfig::from_options(&n.options, &Default::default()).unwrap();
     assert!(matches!(
-        c.request_for(&n.analyses[0]),
+        c.plan_for(&n.analyses[0]),
         Err(SpiceError::Unsupported { .. })
     ));
 }

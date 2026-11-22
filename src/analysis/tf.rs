@@ -49,7 +49,7 @@
 
 use crate::analysis::linear::unsupported;
 use crate::analysis::results::{PlotFlags, Variable};
-use crate::analysis::{AnalysisContext, AnalysisRequest, Plot};
+use crate::analysis::{AnalysisContext, AnalysisPlan, Plot};
 use crate::devices::Circuit;
 use crate::maths::Vector;
 use crate::primitives::{Complex, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
@@ -326,18 +326,11 @@ fn resistance(current: Real) -> Real {
 /// failures, and singular or non-finite small-signal solves.
 pub(super) fn run(
     circuit: &mut Circuit,
-    request: &AnalysisRequest,
+    request: &AnalysisPlan,
     context: &AnalysisContext,
+    card: &TransferRequest,
 ) -> SpiceResult<Plot> {
-    let settings = crate::analysis::bias::DcSettings::from_request(request)?;
-    let positional: Vec<&str> = request
-        .arguments
-        .iter()
-        .filter(|argument| !argument.contains('='))
-        .map(String::as_str)
-        .collect();
-    let card = parse(&positional)?;
-
+    let settings = request.dc_settings();
     circuit.finalize()?;
     let input = resolve_input(circuit, &card.input)?;
     let (probe, [pos_name, neg_name]) = resolve_output(circuit, &card.output)?;
@@ -348,7 +341,7 @@ pub(super) fn run(
     crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?.solve(
         circuit,
         &context.model_context(),
-        &settings,
+        settings,
     )?;
 
     // tfanal.c solves with the LU factors CKTop's last NIiter pass left in

@@ -1,5 +1,5 @@
 //! Opt-in #35 live C checks; no committed oracle data is overwritten.
-use ngspice_rs::analysis::{RawFile, RunConfig, runner};
+use ngspice_rs::analysis::{RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::AnalysisKind;
@@ -46,13 +46,10 @@ fn typed_resistor_temperature_and_nested_source_sweeps_match_c() {
             ))
             .unwrap();
         let config = RunConfig::from_netlist(&netlist).unwrap();
-        let request = config.request_for(&netlist.analyses[0]).unwrap();
-        assert_eq!(request.kind, AnalysisKind::DcSweep);
+        let request = config.plan_for(&netlist.analyses[0]).unwrap();
+        assert_eq!(request.kind(), AnalysisKind::DcSweep);
         let mut c = config.circuit(&netlist).unwrap();
-        let got = runner(request.kind)
-            .unwrap()
-            .run(&mut c, &request, &config.context())
-            .unwrap();
+        let got = request.run(&mut c, &config.context()).unwrap();
         fs::write(dir.join("sweep.cir"), format!(
             "DC oracle\n{body}\n.control\nset filetype=ascii\ndc {sweep}\nwrite result.raw\nquit\n.endc\n.end\n"
         )).unwrap();

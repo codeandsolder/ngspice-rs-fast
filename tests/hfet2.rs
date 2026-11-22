@@ -8,7 +8,7 @@
 //! verify` checks six of them (`m10_hfet2_{op,dc,ac,tran,pz}` and the `.sens`
 //! fixture `sens_hfet2`).
 
-use ngspice_rs::analysis::{AnalysisContext, AnalysisRequest, Plot, RunConfig, runner};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -25,11 +25,9 @@ fn circuit(body: &str) -> Result<Circuit, SpiceError> {
     Circuit::from_netlist(&deck(body)?)
 }
 fn attempt(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> SpiceResult<Plot> {
-    runner(kind).unwrap().run(
-        c,
-        &AnalysisRequest::with_arguments(kind, arguments.iter().copied()),
-        &AnalysisContext::default(),
-    )
+    AnalysisInput::with_arguments(kind, arguments.iter().copied())
+        .resolve()
+        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
 }
 fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
     attempt(c, kind, arguments).unwrap()
@@ -264,12 +262,9 @@ fn sensitivity_covers_hfet2s_tables() {
     )
     .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
     let names: Vec<&str> = plot
         .variables()
         .iter()
@@ -300,12 +295,9 @@ fn sensitivity_reports_cs_given_flag_topology_switches() {
         ))
         .unwrap();
         let config = RunConfig::from_netlist(&netlist).unwrap();
-        let request = config.request_for(&netlist.analyses[0]).unwrap();
+        let request = config.plan_for(&netlist.analyses[0]).unwrap();
         let mut circuit = config.circuit(&netlist).unwrap();
-        let plot = runner(request.kind)
-            .unwrap()
-            .run(&mut circuit, &request, &config.context())
-            .unwrap();
+        let plot = request.run(&mut circuit, &config.context()).unwrap();
         (value(&plot, "v(z1:d2)", 0), value(&plot, "v(z1:eta2)", 0))
     };
     // Both given: the branch is on for both loads, so both rows are the
@@ -348,12 +340,9 @@ fn sensitivity_perturbs_the_temperature_in_celsius() {
     )
     .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.request_for(&netlist.analyses[0]).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    let plot = runner(request.kind)
-        .unwrap()
-        .run(&mut circuit, &request, &config.context())
-        .unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
     close(
         value(&plot, "v(z1_temp)", 0),
         -1.431_432_772_145_406e-6,
