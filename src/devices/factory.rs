@@ -1,5 +1,5 @@
 //! Scalar linear-device elaboration; unsupported parameters never disappear.
-use crate::devices::models::ModelFamily;
+use crate::devices::models::ModelBackend;
 use crate::devices::passive::PassiveKind;
 use crate::devices::rlc::ResistorNoise;
 use crate::devices::sources::{SourceExcitation, SourceInputs};
@@ -19,47 +19,9 @@ use crate::primitives::{
 
 /// Designators [`instantiate`] builds from the card alone (the registry's
 /// `ported` entries). `tests/registry_support.rs` elaborates one instance of
-/// every designator to keep this list and [`ELABORATED`] honest.
+/// every designator to keep this list and the model catalog honest.
 pub(super) const CARD_FACTORY: &[char] =
     &['r', 'c', 'l', 'v', 'i', 'e', 'f', 'g', 'h', 'b', 'k', 't'];
-
-/// Designators built only while elaborating a deck, with the subset built:
-/// D/Q/M/S/W from a resolved `.model` card ([`instantiate_with_models`]) and X
-/// by subcircuit expansion (`crate::devices::subckt`). The registry's `bounded` entries.
-pub(super) const ELABORATED: &[(char, &str)] = &[
-    ('d', "junction diode (dioload.c subset)"),
-    ('q', "Gummel-Poon BJT level 1 (bjtload.c)"),
-    (
-        'm',
-        "MOS1, MOS2, MOS3, MOS6 and MOS9 (levels 1, 2, 3, 6 and 9), plus \
-         BSIM3v3.3 (levels 8/49, DC operating point only)",
-    ),
-    ('s', "voltage-controlled switch (companion .tran, no BDF)"),
-    ('w', "current-controlled switch (companion .tran, no BDF)"),
-    ('x', "expanded before device elaboration"),
-    (
-        'j',
-        "JFET levels 1 (jfetload.c, Sydney B tail) and 2 (Parker-Skellern psmodel.c)",
-    ),
-    (
-        'u',
-        "uniform RC line expanded into R/C/D sections (urcsetup.c)",
-    ),
-    (
-        'o',
-        "lossy line: LC, RLC, RC and RG cases (ltraload.c; companion .tran, no BDF)",
-    ),
-    (
-        'y',
-        "single lossy transmission line (TXL): `ReadTxL`'s Padé DC load and \
-         recursive-convolution transient, or `inp2y.c`'s three-pi fallback \
-         expansion; Padé AC/SP/pole-zero are refused (C reuses its time-domain load)",
-    ),
-    (
-        'z',
-        "every C level: MES (level 1, Statz), MESA 2-4 (mesa1/mesa2/mesa3) and HFET1/HFET2 (levels 5/6)",
-    ),
-];
 
 pub(super) fn from_card(card: &RawCard, nodes: &mut NodeTable) -> SpiceResult<Box<dyn Device>> {
     let deck = Deck {
@@ -99,64 +61,62 @@ pub(super) fn instantiate_with_models(
     let Some(model) = models.resolve(instance)? else {
         return instantiate(instance, nodes);
     };
-    // The resolver validates supported levels. Keep dispatch explicit so
-    // adding a new supported level cannot silently select a different backend.
-    let unsupported_level = || {
-        SpiceError::not_yet_ported(
-            format!(
-                "{}: model-backed {:?} level {} factory for '{}'",
-                instance.location,
-                model.family(),
-                model.levels().selector,
-                instance.name
-            ),
-            "src/spicelib/parser/inpdomod.c",
-        )
-    };
-    match model.family() {
-        ModelFamily::Resistor | ModelFamily::Capacitor | ModelFamily::Inductor => {
+    // The resolver has already selected a concrete backend. Exhaustive
+    // dispatch means a new catalog backend cannot silently choose another.
+    match model.levels().backend {
+        ModelBackend::Resistor | ModelBackend::Capacitor | ModelBackend::Inductor => {
             crate::devices::passive::instantiate(instance, nodes, &model, context)
         }
-        ModelFamily::Diode => {
+        ModelBackend::Diode => {
             crate::devices::nonlinear::Diode::instantiate(instance, nodes, &model, context)
         }
-        ModelFamily::Npn | ModelFamily::Pnp => {
+        ModelBackend::Bjt => {
             crate::devices::bjt::Bjt::instantiate(instance, nodes, &model, context)
         }
-        ModelFamily::Nmos | ModelFamily::Pmos => match model.levels().selector {
-            1 => crate::devices::mos1::Mos1::instantiate(instance, nodes, &model, context),
-            2 => crate::devices::mos2::Mos2::instantiate(instance, nodes, &model, context),
-            3 => crate::devices::mos3::Mos3::instantiate(instance, nodes, &model, context),
-            6 => crate::devices::mos6::Mos6::instantiate(instance, nodes, &model, context),
-            9 => crate::devices::mos9::Mos9::instantiate(instance, nodes, &model, context),
-            8 | 49 => crate::devices::bsim3::instantiate(instance, nodes, &model, context),
-            14 | 54 => crate::devices::bsim4::instantiate(instance, nodes, &model, context),
-            _ => Err(unsupported_level()),
-        },
-        ModelFamily::Njf | ModelFamily::Pjf => match model.levels().selector {
-            1 => crate::devices::jfet::Jfet::instantiate(instance, nodes, &model, context),
-            2 => crate::devices::jfet2::Jfet2::instantiate(instance, nodes, &model, context),
-            _ => Err(unsupported_level()),
-        },
-        ModelFamily::Nmf | ModelFamily::Pmf => match model.levels().selector {
-            1 => crate::devices::mesfet::Mesfet::instantiate(instance, nodes, &model, context),
-            2..=4 => {
-                crate::devices::hfet::mesa::Mesa::instantiate(instance, nodes, &model, context)
-            }
-            5 => crate::devices::hfet::hfet1::Hfet1::instantiate(instance, nodes, &model, context),
-            6 => crate::devices::hfet::hfet2::Hfet2::instantiate(instance, nodes, &model, context),
-            _ => Err(unsupported_level()),
-        },
-        ModelFamily::Switch | ModelFamily::CurrentSwitch => {
+        ModelBackend::Mos1 => {
+            crate::devices::mos1::Mos1::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Mos2 => {
+            crate::devices::mos2::Mos2::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Mos3 => {
+            crate::devices::mos3::Mos3::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Mos6 => {
+            crate::devices::mos6::Mos6::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Mos9 => {
+            crate::devices::mos9::Mos9::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Bsim3 => crate::devices::bsim3::instantiate(instance, nodes, &model, context),
+        ModelBackend::Bsim4 => crate::devices::bsim4::instantiate(instance, nodes, &model, context),
+        ModelBackend::Jfet => {
+            crate::devices::jfet::Jfet::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Jfet2 => {
+            crate::devices::jfet2::Jfet2::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Mesfet => {
+            crate::devices::mesfet::Mesfet::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Mesa => {
+            crate::devices::hfet::mesa::Mesa::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Hfet1 => {
+            crate::devices::hfet::hfet1::Hfet1::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Hfet2 => {
+            crate::devices::hfet::hfet2::Hfet2::instantiate(instance, nodes, &model, context)
+        }
+        ModelBackend::Switch | ModelBackend::CurrentSwitch => {
             crate::devices::switch::Switch::instantiate(instance, nodes, &model, context)
         }
-        ModelFamily::Txl => crate::devices::txl::Txl::instantiate(instance, nodes, &model),
-        ModelFamily::Ltra => {
+        ModelBackend::Txl => crate::devices::txl::Txl::instantiate(instance, nodes, &model),
+        ModelBackend::Ltra => {
             crate::devices::ltra::LossyLine::instantiate(instance, nodes, models, context)
                 .map(|line| Box::new(line) as Box<dyn Device>)
         }
-        // URC elaborates to a ladder, not a single device.
-        ModelFamily::Urc => Err(SpiceError::circuit(format!(
+        ModelBackend::Urc => Err(SpiceError::circuit(format!(
             "URC {} is expanded by Circuit::add_instances, not built as one device",
             instance.name
         ))),

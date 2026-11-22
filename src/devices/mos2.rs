@@ -214,7 +214,7 @@ impl Level2 {
 
 impl MosLevel for Level2 {
     type Params = Params;
-    const LEVEL: u8 = 2;
+    const BACKEND: crate::devices::ModelBackend = crate::devices::ModelBackend::Mos2;
     const LABEL: &'static str = "MOS2";
     const DEVICE_TYPE: CDeviceType = CDeviceType::Mos2;
     const NOISE_FAMILY: Option<NoiseFamily> = Some(NoiseFamily::Mos2);

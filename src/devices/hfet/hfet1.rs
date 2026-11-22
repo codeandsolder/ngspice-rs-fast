@@ -469,7 +469,7 @@ impl Hfet1 {
         resolved: &ResolvedModel<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        if resolved.levels().selector != 5 {
+        if resolved.levels().backend != crate::devices::ModelBackend::Hfet1 {
             return Err(SpiceError::circuit(format!(
                 "{}: HFET1 needs level 5",
                 i.name
