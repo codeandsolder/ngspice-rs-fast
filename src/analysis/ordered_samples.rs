@@ -393,7 +393,7 @@ mod tests {
         );
         let event_segments = window
             .event_segments()
-            .map(|s| (s.left, s.right(), s.is_jump()))
+            .map(|s| (s.left, s.right(), super::same_coordinate(s.x0, s.x1)))
             .collect::<Vec<_>>();
         assert_eq!(event_segments, [(0, 1, false), (1, 2, true), (2, 3, false)]);
         assert!(axis.sample_window(2.25, 2.75).is_none());
