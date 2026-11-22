@@ -139,7 +139,7 @@ impl DcExcitation {
 pub struct SourceInputs {
     /// Explicit DC level; omitted uses the waveform at time zero.
     pub dc: Option<Real>,
-    /// AC inputs; omitted means no excitation, even for a zero phasor.
+    /// AC inputs; omitted means no AC setter, unlike explicit zero magnitude.
     pub ac: Option<AcInput>,
     /// Time forcing; omitted uses the explicit DC level or implicit zero.
     pub waveform: Option<Waveform>,
@@ -911,5 +911,42 @@ mod tests {
             .with_instance_parameter("dc", 7., &crate::devices::ModelContext::default())
             .unwrap();
         assert_eq!(coefficients(swept).dc, 7.);
+    }
+    #[test]
+    fn current_multiplier_is_replayed_once_with_its_given_state() {
+        use crate::devices::sensitivity::{RecordPair, SensitivityLoad, SensitivityMode};
+        let context = crate::devices::ModelContext::default();
+        let source = polar_source(
+            false,
+            Some(AcInput {
+                magnitude: Some(2.),
+                phase: None,
+            }),
+            Some(3.),
+            None,
+        );
+        let swept = source.with_instance_parameter("m", 2.5, &context).unwrap();
+        let sensitivity = swept.sensitivity(&context).unwrap();
+        let (model, instance) = sensitivity.records().unwrap();
+        assert!(instance.given("m"));
+        assert_eq!(instance.value("m").unwrap(), 2.5);
+        let records = RecordPair {
+            model: &model,
+            instance: &instance,
+        };
+        let SensitivityLoad::Replacement(replayed) = sensitivity
+            .load(records, records, SensitivityMode::Dc)
+            .unwrap()
+        else {
+            panic!("expected replacement");
+        };
+        assert_eq!(
+            replayed.observation_source_current(None).unwrap(),
+            Some(7.5)
+        );
+        let linear = coefficients(replayed);
+        assert_eq!(linear.dc, 3.);
+        assert_eq!(linear.rows[0].1, -2.5);
+        assert_eq!(linear.ac, Complex::new(2., 0.));
     }
 }

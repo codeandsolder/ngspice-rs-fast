@@ -746,4 +746,32 @@ mod tests {
         assert_eq!(p.stop(), Some(0.5));
         assert_eq!(p.value_at(0.65, R).unwrap(), 0.);
     }
+    #[test]
+    fn input_validation_does_not_invent_transient_timing() {
+        let spec = PulseSpec {
+            initial: 0.,
+            pulsed: 1.,
+            delay: None,
+            rise: None,
+            fall: None,
+            width: None,
+            period: None,
+            count: None,
+        };
+        assert_eq!(spec.validate().unwrap(), 0);
+        assert!(
+            spec.resolve(&TransientTiming::new(1e-3, 1.).unwrap())
+                .is_ok()
+        );
+        assert!(
+            spec.resolve(&TransientTiming::new(Real::MAX, 1.).unwrap())
+                .is_err()
+        );
+        let overflow = PulseSpec {
+            initial: -Real::MAX,
+            pulsed: Real::MAX,
+            ..spec
+        };
+        assert!(overflow.validate().is_err());
+    }
 }
