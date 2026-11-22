@@ -104,3 +104,6 @@ Keep raw logs, compiler/host details and actual measurements with a revision.
 Do not declare a measured baseline from source dimensions or estimated
 complexity alone. The workload contract lives here; dated measurement records
 belong in the issue/worklog.
+
+- [2026-11-22 scalar reference](performance-baselines/2026-11-22.md):
+  generic/native release timing, nine allocation profiles and numerical records.
