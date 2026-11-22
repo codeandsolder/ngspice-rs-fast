@@ -392,7 +392,7 @@ impl RawFileWriter {
             .open(&path)
             .map_err(|error| SpiceError::io(&path, &error))?;
         let mut header = header;
-        header.plot.points = Vec::new();
+        header.plot.clear_points();
         Ok(StreamedPlot {
             header,
             format: self.format,
@@ -518,7 +518,7 @@ impl Drop for StreamedPlot {
 
 /// Checks that every point of `plot` has one value per variable.
 fn validate_plot(plot: &Plot) -> SpiceResult<()> {
-    plot.points
+    plot.points()
         .iter()
         .try_for_each(|point| plot.check_point(point))
 }
@@ -539,8 +539,8 @@ fn write_plot(
     byte_order: BinaryByteOrder,
 ) -> io::Result<()> {
     let plot = &raw_plot.plot;
-    render_header(out, raw_plot, plot.points.len(), format)?;
-    for (index, point) in plot.points.iter().enumerate() {
+    render_header(out, raw_plot, plot.points().len(), format)?;
+    for (index, point) in plot.points().iter().enumerate() {
         write_point(out, plot, format, index, point, byte_order)?;
     }
     Ok(())
@@ -570,9 +570,9 @@ fn render_ascii_point(
     point: &[Complex],
 ) -> io::Result<()> {
     write!(out, " {index}")?;
-    for (variable, value) in plot.variables.iter().zip(point) {
+    for (variable, value) in plot.variables().iter().zip(point) {
         let real = SpiceNumber(value.re);
-        match plot.flags {
+        match plot.flags() {
             PlotFlags::Real => writeln!(out, "\t{real}")?,
             PlotFlags::Complex if variable.is_real => writeln!(out, "\t{real},0.0")?,
             PlotFlags::Complex => writeln!(out, "\t{real},{}", SpiceNumber(value.im))?,
@@ -593,11 +593,11 @@ fn render_header(
     writeln!(out, "Date: {}", raw_plot.date)?;
     writeln!(out, "Command: {}", raw_plot.command)?;
     writeln!(out, "Plotname: {}", plot.plotname)?;
-    writeln!(out, "Flags: {}", plot.flags.as_rawfile())?;
-    writeln!(out, "No. Variables: {}", plot.variables.len())?;
+    writeln!(out, "Flags: {}", plot.flags().as_rawfile())?;
+    writeln!(out, "No. Variables: {}", plot.variables().len())?;
     writeln!(out, "No. Points: {point_count}")?;
     writeln!(out, "Variables:")?;
-    for (index, variable) in plot.variables.iter().enumerate() {
+    for (index, variable) in plot.variables().iter().enumerate() {
         writeln!(out, "\t{index}\t{}\t{}", variable.name, variable.unit)?;
     }
     out.write_all(section_line(format))
@@ -945,8 +945,8 @@ impl<R: BufRead> RawFileReader<R> {
         } else {
             0
         };
-        let mut plot = Plot::new(plotname.clone(), plotname, flags);
-        plot.variables = variables;
+        let realness = variables.iter().map(|v| v.is_real).collect();
+        let plot = Plot::new(plotname.clone(), plotname, flags, variables);
         Ok(Some(RawPlotRows {
             reader: self,
             header: RawPlot {
@@ -961,6 +961,7 @@ impl<R: BufRead> RawFileReader<R> {
             payload_len,
             consumed: 0,
             row: Vec::new(),
+            realness,
             failed: false,
         }))
     }
@@ -977,7 +978,7 @@ impl<R: BufRead> RawFileReader<R> {
                 points.push(row.to_vec());
             }
             let mut raw_plot = rows.finish()?;
-            raw_plot.plot.points = points;
+            raw_plot.plot = raw_plot.plot.with_points(points)?;
             plots.push(raw_plot);
         }
         Ok(RawFile { plots })
@@ -997,11 +998,12 @@ pub struct RawPlotRows<'a, R> {
     payload_len: usize,
     consumed: usize,
     row: Vec<Complex>,
+    realness: Vec<bool>,
     failed: bool,
 }
 
 impl<R: BufRead> RawPlotRows<'_, R> {
-    /// Header and currently inferred column flags; points are not retained.
+    /// Provisional header; ASCII complex column flags are finalized by finish.
     #[must_use]
     pub const fn header(&self) -> &RawPlot {
         &self.header
@@ -1036,8 +1038,8 @@ impl<R: BufRead> RawPlotRows<'_, R> {
     }
 
     fn decode_ascii_row(&mut self) -> SpiceResult<()> {
-        let columns = self.header.plot.variables.len();
-        for (column, variable) in self.header.plot.variables.iter_mut().enumerate() {
+        let columns = self.header.plot.variables().len();
+        for (column, is_real) in self.realness.iter_mut().enumerate() {
             let Some(line) = self.reader.cursor.next(true)? else {
                 return Err(unsupported(format!(
                     "truncated rawfile: expected {} point(s) of {columns} value(s)",
@@ -1055,8 +1057,8 @@ impl<R: BufRead> RawPlotRows<'_, R> {
                 )));
             }
             let parsed = parse_value(value_text)?;
-            if self.header.plot.flags.is_complex() && !parsed.real_short_form {
-                variable.is_real = false;
+            if self.header.plot.flags().is_complex() && !parsed.real_short_form {
+                *is_real = false;
             }
             self.row.push(parsed.value);
         }
@@ -1064,11 +1066,11 @@ impl<R: BufRead> RawPlotRows<'_, R> {
     }
 
     fn decode_binary_row(&mut self) -> SpiceResult<()> {
-        let columns = self.header.plot.variables.len();
+        let columns = self.header.plot.variables().len();
         for _ in 0..columns {
             let Some(value) = binary::read_value(
                 &mut self.reader.cursor.input,
-                self.header.plot.flags,
+                self.header.plot.flags(),
                 self.reader.byte_order,
                 &mut self.consumed,
             )
@@ -1091,6 +1093,24 @@ impl<R: BufRead> RawPlotRows<'_, R> {
     pub fn finish(mut self) -> SpiceResult<RawPlot> {
         while self.next_row()?.is_some() {}
         self.reader.blocked = false;
+        let plot = &self.header.plot;
+        if plot
+            .variables()
+            .iter()
+            .zip(&self.realness)
+            .any(|(v, real)| v.is_real != *real)
+        {
+            let mut variables = plot.variables().to_vec();
+            for (v, real) in variables.iter_mut().zip(self.realness) {
+                v.is_real = real;
+            }
+            self.header.plot = Plot::new(
+                plot.name.clone(),
+                plot.plotname.clone(),
+                plot.flags(),
+                variables,
+            );
+        }
         Ok(self.header)
     }
 }
@@ -1249,11 +1269,11 @@ Values:
         let raw_plot = &rawfile.plots[0];
         assert_eq!(raw_plot.title, "rc divider");
         assert_eq!(raw_plot.plot.plotname, "Operating Point");
-        assert_eq!(raw_plot.plot.flags, PlotFlags::Real);
-        assert_eq!(raw_plot.plot.variables.len(), 3);
-        assert_eq!(raw_plot.plot.variables[1].name, "v(out)");
-        assert_eq!(raw_plot.plot.variables[1].unit, "voltage");
-        assert_eq!(raw_plot.plot.points.len(), 1);
+        assert_eq!(raw_plot.plot.flags(), PlotFlags::Real);
+        assert_eq!(raw_plot.plot.variables().len(), 3);
+        assert_eq!(raw_plot.plot.variables()[1].name, "v(out)");
+        assert_eq!(raw_plot.plot.variables()[1].unit, "voltage");
+        assert_eq!(raw_plot.plot.points().len(), 1);
         assert_eq!(raw_plot.plot.value("v(out)", 0), Some(Complex::real(2.5)));
         assert_eq!(raw_plot.plot.value("v(in)", 0), Some(Complex::real(5.0)));
         assert_eq!(
@@ -1266,8 +1286,8 @@ Values:
     fn parses_complex_values_and_point_indices() {
         let rawfile = RawFile::parse(AC_RAWFILE).expect("parses");
         let plot = &rawfile.single_plot().expect("one plot");
-        assert_eq!(plot.flags, PlotFlags::Complex);
-        assert_eq!(plot.points.len(), 2);
+        assert_eq!(plot.flags(), PlotFlags::Complex);
+        assert_eq!(plot.points().len(), 2);
         assert_eq!(plot.value("frequency", 1), Some(Complex::new(1e3, 0.0)));
         assert_eq!(plot.value("v(out)", 1), Some(Complex::new(0.9, -0.1)));
         assert_eq!(plot.value("i(v1)", 0), Some(Complex::new(-1e-3, 1e-5)));
@@ -1435,15 +1455,18 @@ Values:
         // `re,im` otherwise, so the spelling in the file tells the two apart.
         let rawfile = RawFile::parse(MIXED_RAWFILE).expect("parses");
         let plot = &rawfile.plots[0].plot;
-        assert!(plot.variables[0].is_real, "frequency was written as re,0.0");
-        assert!(!plot.variables[1].is_real);
+        assert!(
+            plot.variables()[0].is_real,
+            "frequency was written as re,0.0"
+        );
+        assert!(!plot.variables()[1].is_real);
         assert_eq!(rawfile.to_ascii().unwrap(), MIXED_RAWFILE);
     }
 
     #[test]
     fn a_real_plot_flags_every_column_real() {
         let rawfile = RawFile::parse(OP_RAWFILE).expect("parses");
-        assert!(rawfile.plots[0].plot.variables.iter().all(|v| v.is_real));
+        assert!(rawfile.plots[0].plot.variables().iter().all(|v| v.is_real));
     }
 
     #[test]
@@ -1451,7 +1474,7 @@ Values:
         // ngspice stores AC results as complex vectors, so even `frequency` is
         // written as `re,0.000000000000000e+00`.
         let rawfile = RawFile::parse(AC_RAWFILE).expect("parses");
-        assert!(rawfile.plots[0].plot.variables.iter().all(|v| !v.is_real));
+        assert!(rawfile.plots[0].plot.variables().iter().all(|v| !v.is_real));
     }
 
     #[test]
@@ -1464,9 +1487,7 @@ Values:
     #[test]
     fn validate_catches_ragged_plots() {
         let mut rawfile = RawFile::parse(OP_RAWFILE).expect("parses");
-        rawfile.plots[0].plot.points[0].pop();
-        assert!(rawfile.validate().is_err());
-        assert!(rawfile.to_ascii().is_err());
-        assert!(rawfile.to_binary().is_err());
+        assert!(rawfile.plots[0].plot.push_point(Vec::new()).is_err());
+        assert!(rawfile.validate().is_ok());
     }
 }

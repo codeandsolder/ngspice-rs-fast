@@ -113,9 +113,9 @@ fn the_plot_has_c_names_units_and_order() {
     )
     .unwrap();
     assert_eq!(plot.plotname, "SP Analysis");
-    assert!(plot.flags.is_complex());
+    assert!(plot.flags().is_complex());
     let names: Vec<_> = plot
-        .variables
+        .variables()
         .iter()
         .map(|v| (v.name.as_str(), v.unit.as_str(), v.is_real))
         .collect();
@@ -152,12 +152,12 @@ fn the_plot_has_c_names_units_and_order() {
     let text = RawFile::single(plot.clone()).to_ascii().unwrap();
     let back = RawFile::parse(&text).unwrap();
     let back = back.single_plot().unwrap();
-    assert_eq!(back.variables, plot.variables);
+    assert_eq!(back.variables(), plot.variables());
     // The ASCII rawfile does not round-trip every bit, and the native sparse
     // solver's rounding can land a value on a last-ulp neighbour, so compare
     // to 1e-12 relative rather than bit for bit.
-    assert_eq!(back.points.len(), plot.points.len());
-    for (row, want_row) in back.points.iter().zip(&plot.points) {
+    assert_eq!(back.points().len(), plot.points().len());
+    for (row, want_row) in back.points().iter().zip(plot.points()) {
         for (got, want) in row.iter().zip(want_row) {
             close(*got, *want);
         }
@@ -329,8 +329,8 @@ fn the_ac_excitation_of_ordinary_sources_is_off() {
         ".sp lin 2 1k 2k",
     )
     .unwrap();
-    assert_eq!(driven.points, quiet.points);
-    assert_ne!(reference.points, quiet.points);
+    assert_eq!(driven.points(), quiet.points());
+    assert_ne!(reference.points(), quiet.points());
 }
 
 #[test]
@@ -490,7 +490,7 @@ fn the_port_power_function_runs_where_c_uses_it() {
         ".sp lin 2 1k 2k",
     )
     .unwrap();
-    assert_eq!(plain.points, powered.points);
+    assert_eq!(plain.points(), powered.points());
     sp(&format!("v1 1 0 dc 1 portnum 1 pwr 1m\n{tail}"), ".op").unwrap();
     sp(
         &format!("v1 1 0 dc 1 portnum 1 freq 1meg\nc1 1 0 1n\n{tail}"),
@@ -556,7 +556,7 @@ fn reactive_ladder_runs_ac_and_sp_across_the_residual_regression_band() {
     for kind in ["ac", "sp"] {
         let plot = sp(body, &format!(".{kind} dec 100 1 1e6")).unwrap();
         assert_eq!(plot.point_count(), 601);
-        assert!(plot.points.iter().flatten().all(|v| v.is_finite()));
+        assert!(plot.points().iter().flatten().all(|v| v.is_finite()));
     }
 }
 

@@ -57,7 +57,7 @@ fn close(got: f64, want: f64, relative: f64, absolute: f64) {
 fn compare(got: &Plot, want: &Plot, ac: bool) {
     assert_eq!(got.point_count(), want.point_count());
     assert_eq!(got.variable_count(), want.variable_count());
-    for var in &want.variables {
+    for var in want.variables() {
         for point in 0..want.point_count() {
             let a = got.value(&var.name, point).unwrap();
             let b = want.value(&var.name, point).unwrap();

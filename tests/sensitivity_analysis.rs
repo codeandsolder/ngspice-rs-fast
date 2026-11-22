@@ -46,7 +46,7 @@ fn value(plot: &Plot, name: &str) -> f64 {
 }
 
 fn names(plot: &Plot) -> Vec<&str> {
-    plot.variables.iter().map(|v| v.name.as_str()).collect()
+    plot.variables().iter().map(|v| v.name.as_str()).collect()
 }
 
 fn close(got: f64, want: f64, relative: f64) {
@@ -65,10 +65,10 @@ const DIVIDER: &str = "v1 in 0 dc 10\nr1 in out 1k\nr2 out 0 2k";
 #[test]
 fn a_divider_matches_its_closed_form_derivatives() {
     let plot = sens(&format!("{DIVIDER}\n.sens v(out)")).unwrap();
-    assert_eq!(plot.flags, PlotFlags::Real);
+    assert_eq!(plot.flags(), PlotFlags::Real);
     assert_eq!(plot.point_count(), 1);
     assert!(
-        plot.variables
+        plot.variables()
             .iter()
             .all(|v| v.unit == "voltage" && v.is_real)
     );
@@ -258,8 +258,8 @@ fn current_and_differential_outputs() {
 fn an_rc_low_pass_has_closed_form_ac_sensitivities() {
     let plot =
         sens("v1 in 0 dc 0 ac 1\nr1 in out 1k\nc1 out 0 1u\n.sens v(out) ac dec 1 10 1k").unwrap();
-    assert_eq!(plot.flags, PlotFlags::Complex);
-    assert_eq!(plot.variables[0].name, "frequency");
+    assert_eq!(plot.flags(), PlotFlags::Complex);
+    assert_eq!(plot.variables()[0].name, "frequency");
     assert_eq!(plot.point_count(), 3);
     for point in 0..3 {
         let f = plot.value("frequency", point).unwrap().re;

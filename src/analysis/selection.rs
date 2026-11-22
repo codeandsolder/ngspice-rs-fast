@@ -8,7 +8,7 @@
 //! the measurement work that follows and only the written plot is narrowed.
 //! The selection depends only on the plot's variables, so a caller that
 //! streams the points ([`crate::analysis::PointSink`]) applies it one row at a
-//! time ([`Selection::header`], [`Selection::apply_point`]).
+//! time ([`Selection::header`], [`RowProjection::project`]).
 //!
 //! C reference: `ft_dotsaves()`/`ft_savedotargs()` in `src/frontend/dotcards.c`
 //! collect the deck's cards into the `dbs` save list via `com_save()`
@@ -24,7 +24,8 @@ use crate::netlist::ast::{OutputCards, RequestedVector, VectorComponent, VectorR
 use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
 
 use crate::analysis::ordered_samples::column_names;
-use crate::analysis::results::{Plot, PlotFlags, Variable};
+use crate::analysis::results::{Plot, PlotFlags, PlotSchema, Variable};
+use std::sync::Arc;
 
 /// The `.save` and `.print` requests that apply to `kind`.
 ///
@@ -136,6 +137,7 @@ pub(crate) struct Column {
 /// render it with [`Selection::to_text`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Selection {
+    schema: Arc<PlotSchema>,
     /// True when the deck asked for `all` (or for nothing): the full plot is
     /// written unchanged.
     full: bool,
@@ -179,6 +181,7 @@ impl Selection {
         let mut requests = requests.into_iter().peekable();
         if requests.peek().is_none() {
             return Ok(Self {
+                schema: Arc::clone(plot.schema()),
                 full: true,
                 columns: driver_columns(plot),
             });
@@ -190,7 +193,7 @@ impl Selection {
         let mut seen = std::collections::HashSet::new();
         // C's `beginPlot()` pass 0: the reference vector is always written first.
         if kind != AnalysisKind::OperatingPoint
-            && let Some(scale) = plot.variables.first()
+            && let Some(scale) = plot.variables().first()
         {
             seen.insert((Terms::Positive(0), None));
             columns.push(Column {
@@ -219,11 +222,13 @@ impl Selection {
             // columns describe the driver's variables; the report and the text
             // table would otherwise claim a successful run wrote nothing.
             return Ok(Self {
+                schema: Arc::clone(plot.schema()),
                 full: true,
                 columns: driver_columns(plot),
             });
         }
         Ok(Self {
+            schema: Arc::clone(plot.schema()),
             full: false,
             columns,
         })
@@ -253,50 +258,118 @@ impl Selection {
     /// instance `vdb` of a zero magnitude), so a selection never makes a
     /// rawfile carry `inf` or `NaN`.
     pub fn apply(&self, plot: &Plot) -> SpiceResult<Plot> {
+        self.check_schema(plot)?;
         if self.full {
             return Ok(plot.clone());
         }
-        let mut selected = self.header(plot);
-        selected.points.reserve_exact(plot.points.len());
-        for point in &plot.points {
-            selected.push_point(self.apply_point(point)?)?;
+        let mut selected = self.header(plot)?;
+        selected.reserve_points(plot.points().len());
+        for point in plot.points() {
+            selected.push_point(self.project_row(point)?)?;
         }
         Ok(selected)
     }
 
-    /// The written plot's names, flags and variables, without points: what
-    /// [`Selection::apply`] returns before its first row.
-    #[must_use]
-    pub fn header(&self, plot: &Plot) -> Plot {
-        let mut selected = Plot::new(plot.name.clone(), plot.plotname.clone(), plot.flags);
-        if self.full {
-            selected.variables.clone_from(&plot.variables);
-            return selected;
+    fn check_schema(&self, plot: &Plot) -> SpiceResult<()> {
+        if Arc::ptr_eq(&self.schema, plot.schema()) || self.schema == *plot.schema() {
+            Ok(())
+        } else {
+            Err(SpiceError::Numerical {
+                context: format!("selection: {}", plot.name),
+                message: "projection was resolved against a different plot schema".into(),
+            })
         }
-        for column in &self.columns {
-            selected.push_variable(Variable {
+    }
+
+    /// Transfer ownership of the full plot when no projection is needed.
+    ///
+    /// # Errors
+    /// Schema mismatch or a nonfinite computed result.
+    pub fn into_plot(self, mut plot: Plot) -> SpiceResult<Plot> {
+        self.check_schema(&plot)?;
+        if self.full {
+            return Ok(plot);
+        }
+        // Consume source rows one at a time; a narrowed result need not keep
+        // all the original row allocations alive until projection finishes.
+        let points = plot
+            .take_points()
+            .into_iter()
+            .map(|point| self.project_row(&point))
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let variables = self
+            .columns
+            .into_iter()
+            .map(|column| Variable {
+                name: column.name,
+                unit: column.unit,
+                is_real: column.is_real,
+            })
+            .collect();
+        let flags = plot.flags();
+        Plot::new(plot.name, plot.plotname, flags, variables).with_points(points)
+    }
+
+    /// The selected header, after verifying the original ordered schema.
+    ///
+    /// # Errors
+    /// The supplied plot has a different schema.
+    pub fn header(&self, plot: &Plot) -> SpiceResult<Plot> {
+        self.check_schema(plot)?;
+        if self.full {
+            return Ok(plot.header());
+        }
+        let variables = self
+            .columns
+            .iter()
+            .map(|column| Variable {
                 name: column.name.clone(),
                 unit: column.unit.clone(),
                 is_real: column.is_real,
-            });
-        }
-        selected
+            })
+            .collect();
+        Ok(Plot::new(
+            plot.name.clone(),
+            plot.plotname.clone(),
+            plot.flags(),
+            variables,
+        ))
     }
 
-    /// The written row for one full-plot `point`, for a caller that receives
-    /// the points one at a time ([`crate::analysis::PointSink`]).
-    ///
-    /// # Errors
-    ///
-    /// The same [`SpiceError::Numerical`] as [`Selection::apply`].
-    pub fn apply_point(&self, point: &[Complex]) -> SpiceResult<Vec<Complex>> {
-        if self.full {
-            return Ok(point.to_vec());
+    fn check_width(&self, point: &[Complex]) -> SpiceResult<()> {
+        if point.len() == self.schema.variables().len() {
+            Ok(())
+        } else {
+            Err(SpiceError::Numerical {
+                context: "selection".into(),
+                message: format!(
+                    "point has {} value(s), expected {}",
+                    point.len(),
+                    self.schema.variables().len()
+                ),
+            })
         }
+    }
+
+    fn project_row(&self, point: &[Complex]) -> SpiceResult<Vec<Complex>> {
+        self.check_width(point)?;
         self.columns
             .iter()
             .map(|column| column.value(point))
             .collect()
+    }
+
+    /// Bind this selection to a driver header before projecting streamed rows.
+    ///
+    /// # Errors
+    /// The driver header has a different schema.
+    pub fn bind(self, header: &Plot) -> SpiceResult<RowProjection> {
+        self.check_schema(header)?;
+        let capacity = if self.full { 0 } else { self.columns.len() };
+        Ok(RowProjection {
+            selection: self,
+            buffer: Vec::with_capacity(capacity),
+        })
     }
 
     /// Renders the written vectors of `plot` as text, for the CLI's report.
@@ -311,6 +384,7 @@ impl Selection {
     pub fn to_text(&self, plot: &Plot) -> SpiceResult<String> {
         use std::fmt::Write as _;
 
+        self.check_schema(plot)?;
         let mut out = String::new();
         let names = self.variable_names();
         let _ = writeln!(
@@ -326,7 +400,7 @@ impl Selection {
         let _ = writeln!(
             out,
             "values: {}; computed from the plot, not the rawfile's own spelling",
-            if plot.flags.is_complex() {
+            if plot.flags().is_complex() {
                 "complex as `re,im` with 15 fractional digits, except that a component which is \
                  real for every point prints as one number (C's print behaviour; the rawfile \
                  spells that column `re,0.0`); vm is |v|, vp is the phase in radians in \
@@ -339,13 +413,13 @@ impl Selection {
             return Ok(out);
         }
         let _ = writeln!(out, "{:>7}  {}", "point", names.join("  "));
-        for (index, point) in plot.points.iter().enumerate() {
+        for (index, point) in plot.points().iter().enumerate() {
             let _ = write!(out, "{index:>7}");
             for column in &self.columns {
                 let value = column.value(point)?;
                 out.push_str("  ");
                 out.push_str(&crate::primitives::format_spice_number(value.re));
-                if plot.flags == PlotFlags::Complex && !column.is_real {
+                if plot.flags() == PlotFlags::Complex && !column.is_real {
                     out.push(',');
                     out.push_str(&crate::primitives::format_spice_number(value.im));
                 }
@@ -353,6 +427,31 @@ impl Selection {
             out.push('\n');
         }
         Ok(out)
+    }
+}
+
+/// A schema-bound streaming projection with reusable row storage.
+pub struct RowProjection {
+    selection: Selection,
+    buffer: Vec<Complex>,
+}
+
+impl RowProjection {
+    /// Project one row following the bound header; identity projections borrow
+    /// the input directly, and narrowed projections reuse an owned buffer.
+    ///
+    /// # Errors
+    /// Row width mismatch or a nonfinite computed result.
+    pub fn project<'a>(&'a mut self, point: &'a [Complex]) -> SpiceResult<&'a [Complex]> {
+        self.selection.check_width(point)?;
+        if self.selection.full {
+            return Ok(point);
+        }
+        self.buffer.clear();
+        for column in &self.selection.columns {
+            self.buffer.push(column.value(point)?);
+        }
+        Ok(&self.buffer)
     }
 }
 
@@ -418,7 +517,7 @@ fn component_value(component: VectorComponent, value: Complex) -> Complex {
 /// A full selection writes the plot unchanged, but its columns still describe
 /// what is written so reports and text tables are not empty.
 fn driver_columns(plot: &Plot) -> Vec<Column> {
-    plot.variables
+    plot.variables()
         .iter()
         .enumerate()
         .map(|(index, variable)| Column {
@@ -456,7 +555,7 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
                     column_names(plot)
                 ))
             })?;
-            let variable = &plot.variables[index];
+            let variable = &plot.variables()[index];
             let unit = match component {
                 Some(VectorComponent::Phase) => "phase".to_owned(),
                 Some(VectorComponent::Decibels) => "db".to_owned(),
@@ -481,28 +580,26 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
                 unit: if negative.is_none()
                     && let Terms::Positive(index) = terms
                 {
-                    plot.variables[index].unit.clone()
+                    plot.variables()[index].unit.clone()
                 } else {
                     "voltage".to_owned()
                 },
-                is_real: !plot.flags.is_complex(),
+                is_real: !plot.flags().is_complex(),
                 terms,
                 component: None,
             })
         }
         RequestedVector::Current { device } => {
-            let column = plot
-                .variable_index(&format!("i({device})"))
-                .ok_or_else(|| {
-                    unsupported(format!(
-                        "{name}: the analysis has no branch-current vector; it carries {}",
-                        column_names(plot)
-                    ))
-                })?;
+            let column = plot.schema().current(device).ok_or_else(|| {
+                unsupported(format!(
+                    "{name}: the analysis has no branch-current vector; it carries {}",
+                    column_names(plot)
+                ))
+            })?;
             Ok(Column {
                 name,
                 unit: "current".to_owned(),
-                is_real: plot.variables[column].is_real,
+                is_real: plot.variables()[column].is_real,
                 terms: Terms::Positive(column),
                 component: None,
             })
@@ -512,7 +609,7 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
             positive,
             negative,
         } => {
-            if !plot.flags.is_complex() {
+            if !plot.flags().is_complex() {
                 return Err(unsupported(format!(
                     "{name} asks for an AC component, which needs a complex plot; this analysis \
                      produced a real one (docs/port/OUTPUT_SELECTION.md)"
@@ -528,7 +625,7 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
                 ) && negative.is_none()
                     && let Terms::Positive(index) = terms
                 {
-                    plot.variables[index].unit.clone()
+                    plot.variables()[index].unit.clone()
                 } else {
                     component_unit(*component).to_owned()
                 },
@@ -542,16 +639,7 @@ pub(crate) fn resolve_request(plot: &Plot, request: &VectorRequest) -> SpiceResu
 
 /// Resolve C branch-vector aliases without changing the requested output name.
 fn named_vector_index(plot: &Plot, vector: &str) -> Option<usize> {
-    // C's canonical branch-vector spelling, `<source>#branch`
-    // (`CKTmkCur`, `copynode()` in `breakp2.c`): it is an alias of
-    // `i(<source>)`, but the written name stays as requested.
-    plot.variable_index(vector)
-        .or_else(|| plot.variable_index(&format!("v({vector})")))
-        .or_else(|| plot.variable_index(&format!("i({vector})")))
-        .or_else(|| {
-            let device = vector.strip_suffix("#branch")?;
-            (!device.is_empty()).then(|| plot.variable_index(&format!("i({device})")))?
-        })
+    plot.schema().named(vector)
 }
 
 /// The unit of a computed AC component.
@@ -580,7 +668,8 @@ fn difference(
         if node == "0" {
             return Ok(None);
         }
-        plot.variable_index(&format!("v({node})"))
+        plot.schema()
+            .voltage(node)
             .or_else(|| plot.variable_index(node))
             .map(Some)
             .ok_or_else(|| {
@@ -656,10 +745,11 @@ mod tests {
 
     /// An operating-point-like real plot: `v(in)`, `v(out)`, `i(v1)`.
     fn op_plot() -> Plot {
-        let mut plot = Plot::new("op1", "Operating Point", PlotFlags::Real);
+        let mut plot = Plot::builder("op1", "Operating Point", PlotFlags::Real);
         plot.push_variable(Variable::new("v(in)", "voltage"));
         plot.push_variable(Variable::new("v(out)", "voltage"));
         plot.push_variable(Variable::new("i(v1)", "current"));
+        let mut plot = plot.build();
         plot.push_point(vec![
             Complex::real(5.0),
             Complex::real(2.5),
@@ -671,9 +761,10 @@ mod tests {
 
     /// A transient-like real plot with a `time` scale.
     fn tran_plot() -> Plot {
-        let mut plot = Plot::new("tran1", "Transient Analysis", PlotFlags::Real);
+        let mut plot = Plot::builder("tran1", "Transient Analysis", PlotFlags::Real);
         plot.push_variable(Variable::new("time", "time"));
         plot.push_variable(Variable::new("v(out)", "voltage"));
+        let mut plot = plot.build();
         for (time, out) in [(0.0, 0.0), (1e-6, 0.5), (2e-6, 1.0)] {
             plot.push_point(vec![Complex::real(time), Complex::real(out)])
                 .unwrap();
@@ -683,12 +774,13 @@ mod tests {
 
     /// An AC-like complex plot: `frequency`, `v(out)`, `i(v1)`.
     fn ac_plot() -> Plot {
-        let mut plot = Plot::new("ac1", "AC Analysis", PlotFlags::Complex);
+        let mut plot = Plot::builder("ac1", "AC Analysis", PlotFlags::Complex);
         // The AC driver flags every column complex, including the scale.
         plot.push_variable(Variable::complex("frequency", "frequency"));
         plot.push_variable(Variable::complex("v(out)", "voltage"));
         plot.push_variable(Variable::complex("i(v1)", "current"));
         // 3, 4 -> magnitude 5, phase atan2(4, 3) = 0.9272952180016122 rad.
+        let mut plot = plot.build();
         plot.push_point(vec![
             Complex::new(100.0, 0.0),
             Complex::new(3.0, 4.0),
@@ -793,17 +885,20 @@ mod tests {
         );
         assert_eq!(names(&selection), ["v(out)", "i(v1)"]);
         let written = selection.apply(&op).unwrap();
-        assert_eq!(written.variables[0].unit, "voltage");
+        assert_eq!(written.variables()[0].unit, "voltage");
         assert_eq!(written.point_count(), 1);
-        assert_eq!(written.points[0][1], Complex::real(-2.5e-3));
+        assert_eq!(written.points()[0][1], Complex::real(-2.5e-3));
 
         let tran = tran_plot();
         let selection = resolve(&tran, AnalysisKind::Transient, &[voltage("out", None)]);
         assert_eq!(names(&selection), ["time", "v(out)"]);
         let written = selection.apply(&tran).unwrap();
-        assert_eq!(written.variables[0].unit, "time");
-        assert_eq!(written.points.len(), 3);
-        assert_eq!(written.points[2], [Complex::real(2e-6), Complex::real(1.0)]);
+        assert_eq!(written.variables()[0].unit, "time");
+        assert_eq!(written.points().len(), 3);
+        assert_eq!(
+            written.points()[2],
+            [Complex::real(2e-6), Complex::real(1.0)]
+        );
 
         let ac = ac_plot();
         let selection = resolve(&ac, AnalysisKind::Ac, &[voltage("out", None)]);
@@ -829,7 +924,7 @@ mod tests {
         );
         let written = selection.apply(&plot).unwrap();
         assert_eq!(
-            written.points[0],
+            written.points()[0],
             [
                 Complex::real(2.5),
                 Complex::real(2.5),
@@ -858,9 +953,9 @@ mod tests {
         let written = selection.apply(&plot).unwrap();
         // C prints `i(v1)` as the current into the positive terminal: -2.5 mA
         // through a 5 V source feeding a 2 k divider.
-        assert_eq!(written.points[0][0], Complex::real(-2.5e-3));
-        assert_eq!(written.variables[0].unit, "current");
-        assert!(written.variables[0].is_real);
+        assert_eq!(written.points()[0][0], Complex::real(-2.5e-3));
+        assert_eq!(written.variables()[0].unit, "current");
+        assert!(written.variables()[0].is_real);
     }
 
     #[test]
@@ -888,7 +983,7 @@ mod tests {
         );
         let written = selection.apply(&plot).unwrap();
         assert_eq!(
-            written.points[0],
+            written.points()[0],
             [2.5, -2.5, 2.5, -2.5, 0.].map(Complex::real)
         );
     }
@@ -950,15 +1045,15 @@ mod tests {
             ]
         );
         let written = selection.apply(&plot).unwrap();
-        assert_eq!(written.flags, PlotFlags::Complex);
-        assert_eq!(written.variables[1].unit, "voltage");
-        assert_eq!(written.variables[2].unit, "phase");
-        assert_eq!(written.variables[5].unit, "db");
+        assert_eq!(written.flags(), PlotFlags::Complex);
+        assert_eq!(written.variables()[1].unit, "voltage");
+        assert_eq!(written.variables()[2].unit, "phase");
+        assert_eq!(written.variables()[5].unit, "db");
         // A computed component is a real vector inside a complex plot, which the
         // rawfile writes as `re,0.0`.
-        assert!(written.variables[1].is_real);
-        assert!(!written.variables[0].is_real);
-        let point = &written.points[0];
+        assert!(written.variables()[1].is_real);
+        assert!(!written.variables()[0].is_real);
+        let point = &written.points()[0];
         assert_eq!(point[1], Complex::real(5.0));
         assert!((point[2].re - 4.0f64.atan2(3.0)).abs() < 1e-15);
         assert_eq!(point[3], Complex::real(3.0));
@@ -969,7 +1064,7 @@ mod tests {
     #[test]
     fn a_non_finite_computed_value_is_an_error_not_a_written_infinity() {
         let mut plot = ac_plot();
-        plot.points[0][1] = Complex::real(0.0);
+        plot.point_mut(0).unwrap()[1] = Complex::real(0.0);
         let selection = resolve(
             &plot,
             AnalysisKind::Ac,
@@ -1041,7 +1136,7 @@ mod tests {
         assert!(full.is_full());
         assert_eq!(names(&full), ["v(in)", "v(out)", "i(v1)"]);
         let written = full.apply(&plot).unwrap();
-        assert_eq!(written.points, plot.points);
+        assert_eq!(written.points(), plot.points());
         assert_eq!(
             full.to_text(&plot).unwrap().lines().next().unwrap(),
             "print: 3 vector(s): v(in) v(out) i(v1)"
@@ -1058,5 +1153,134 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("v(nope)"), "{error}");
+    }
+    #[test]
+    fn projection_rejects_stale_equal_width_schemas() {
+        let plot = op_plot();
+        let mut variables = plot.variables().to_vec();
+        variables.swap(0, 1);
+        let reordered = Plot::new("same", "same", plot.flags(), variables);
+        let modified = Plot::new(
+            "same",
+            "same",
+            PlotFlags::Complex,
+            plot.variables().to_vec(),
+        );
+        for requests in [vec![], vec![voltage("out", None)]] {
+            let selection = resolve(&plot, AnalysisKind::OperatingPoint, &requests);
+            for wrong in [&reordered, &modified] {
+                assert!(selection.header(wrong).is_err());
+                assert!(selection.apply(wrong).is_err());
+                assert!(selection.to_text(wrong).is_err());
+                assert!(selection.clone().bind(wrong).is_err());
+            }
+            let equivalent = Plot::new("other", "other", plot.flags(), plot.variables().to_vec())
+                .with_points(plot.points().to_vec())
+                .unwrap();
+            assert!(selection.apply(&equivalent).is_ok());
+        }
+    }
+
+    #[test]
+    fn streaming_projection_checks_all_widths_and_reuses_storage() {
+        let plot = op_plot();
+        let selection = resolve(&plot, AnalysisKind::OperatingPoint, &[voltage("out", None)]);
+        let mut rows = selection.bind(&plot.header()).unwrap();
+        let point = &plot.points()[0];
+        let first = rows.project(point).unwrap();
+        assert_eq!(first, &[Complex::real(2.5)]);
+        let address = first.as_ptr();
+        assert!(rows.project(&point[..2]).is_err());
+        assert!(rows.project(&[Complex::ZERO; 4]).is_err());
+        assert_eq!(rows.project(point).unwrap().as_ptr(), address);
+        let full = resolve(&plot, AnalysisKind::OperatingPoint, &[]);
+        let mut rows = full.clone().bind(&plot.header()).unwrap();
+        assert!(rows.project(&point[..2]).is_err());
+        assert!(rows.project(&[Complex::ZERO; 4]).is_err());
+        assert_eq!(rows.project(point).unwrap().as_ptr(), point.as_ptr());
+        let owned = plot.clone();
+        let points_address = owned.points().as_ptr();
+        let written = full.into_plot(owned).unwrap();
+        assert_eq!(written.points().as_ptr(), points_address);
+    }
+    #[test]
+    #[ignore = "opt-in large-deck projection benchmark"]
+    fn large_schema_lookup_and_streaming_benchmark() {
+        use std::fmt::Write as _;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const NODES: u32 = 16_384;
+        const ROWS: usize = 65_536;
+        let mut deck = String::from("large saved-vector deck\nv1 input 0 1\n");
+        for i in 0..NODES {
+            writeln!(deck, "r{i} input n{i} 1k").unwrap();
+        }
+        for i in (0..NODES).rev().step_by(2) {
+            writeln!(deck, ".save v(n{i})").unwrap();
+        }
+        deck.push_str(".op\n.end\n");
+        let parsed = crate::netlist::Parser::new()
+            .parse_deck_with_output(&crate::netlist::source::parse_deck_text(
+                std::path::Path::new("projection-bench.cir"),
+                &deck,
+            ))
+            .unwrap();
+        let mut circuit = crate::devices::Circuit::from_netlist(&parsed.netlist).unwrap();
+        circuit.finalize().unwrap();
+        let start = Instant::now();
+        let plot =
+            crate::analysis::linear::plot(&circuit, "op1", "Operating Point", None, false).unwrap();
+        let setup = start.elapsed();
+        let requests = write_requests(&parsed.output, AnalysisKind::OperatingPoint).unwrap();
+        let names = requests.iter().map(|r| r.vector.name()).collect::<Vec<_>>();
+        let start = Instant::now();
+        let linear = names
+            .iter()
+            .map(|name| {
+                plot.variables()
+                    .iter()
+                    .position(|variable| variable.name.eq_ignore_ascii_case(name))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let linear_elapsed = start.elapsed();
+        let start = Instant::now();
+        let indexed = names
+            .iter()
+            .map(|name| plot.variable_index(name).unwrap())
+            .collect::<Vec<_>>();
+        let indexed_elapsed = start.elapsed();
+        assert_eq!(linear, indexed);
+        let start = Instant::now();
+        let selection = resolve(&plot, AnalysisKind::OperatingPoint, &requests);
+        let resolve_elapsed = start.elapsed();
+        assert_eq!(selection.variable_names().len(), names.len());
+        println!(
+            "{} columns, {} requests; schema {setup:?}, linear lookup {linear_elapsed:?}, indexed lookup {indexed_elapsed:?}, full resolution {resolve_elapsed:?}",
+            plot.variable_count(),
+            requests.len()
+        );
+        // Small output from the same wide input: isolate per-row allocation.
+        let selection = resolve(&plot, AnalysisKind::OperatingPoint, &requests[..32]);
+        let row = vec![Complex::real(2.); plot.variable_count()];
+        let start = Instant::now();
+        for _ in 0..ROWS {
+            black_box(selection.project_row(black_box(&row)).unwrap());
+        }
+        let allocated_elapsed = start.elapsed();
+        let mut stream = selection.bind(&plot).unwrap();
+        let address = stream.project(&row).unwrap().as_ptr();
+        let start = Instant::now();
+        for _ in 0..ROWS {
+            let output = stream.project(black_box(&row)).unwrap();
+            assert_eq!(output.as_ptr(), address);
+            black_box(output);
+        }
+        let reuse_elapsed = start.elapsed();
+        println!(
+            "{ROWS} x 32 projected values: allocated row {allocated_elapsed:?}, reused row {reuse_elapsed:?}; row allocations eliminated: {}",
+            ROWS - 1
+        );
     }
 }

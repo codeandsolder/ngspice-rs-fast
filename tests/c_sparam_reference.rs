@@ -93,7 +93,7 @@ fn run_both_decks(name: &str, deck_text: &str, rust_deck: &str) -> (RawFile, Raw
 }
 
 fn sorted_names(plot: &Plot) -> Vec<String> {
-    let mut names: Vec<_> = plot.variables.iter().map(|v| v.name.clone()).collect();
+    let mut names: Vec<_> = plot.variables().iter().map(|v| v.name.clone()).collect();
     names.sort();
     names
 }
@@ -109,7 +109,7 @@ fn compare_with_bound(name: &str, deck_text: &str, singular_z: bool, relative: f
     for (index, (got, want)) in got.plots.iter().zip(&want.plots).enumerate() {
         let (got, want) = (&got.plot, &want.plot);
         assert_eq!(got.plotname, want.plotname, "{name}: plot {index}");
-        assert_eq!(got.flags, want.flags, "{name}: plot {index}");
+        assert_eq!(got.flags(), want.flags(), "{name}: plot {index}");
         assert_eq!(
             sorted_names(got)
                 .into_iter()
@@ -121,10 +121,10 @@ fn compare_with_bound(name: &str, deck_text: &str, singular_z: bool, relative: f
             want.plotname
         );
         assert_eq!(got.point_count(), want.point_count(), "{name}: points");
-        for variable in &want.variables {
+        for variable in want.variables() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got.column(&variable.name).unwrap();
-            let unit = &got.variables[got.variable_index(&variable.name).unwrap()].unit;
+            let unit = &got.variables()[got.variable_index(&variable.name).unwrap()].unit;
             assert_eq!(*unit, variable.unit, "{name}: {} unit", variable.name);
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {
                 if singular_z && variable.name.starts_with("Z_") {

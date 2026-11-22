@@ -12,9 +12,10 @@ fn evaluate(body: &str) -> ngspice_rs::primitives::SpiceResult<Vec<measure::Meas
     let parsed =
         Parser::new().parse_deck_with_output(&parse_deck_text(Path::new("scalar.cir"), body))?;
     let scope = ParamScope::for_netlist(&parsed.netlist)?;
-    let mut plot = Plot::new("tran1", "Transient Analysis", PlotFlags::Real);
+    let mut plot = Plot::builder("tran1", "Transient Analysis", PlotFlags::Real);
     plot.push_variable(Variable::new("time", "time"));
     plot.push_variable(Variable::new("v(out)", "voltage"));
+    let mut plot = plot.build();
     for t in [0., 0.5, 1.] {
         plot.push_point(vec![Complex::real(t), Complex::real(2. * t)])?;
     }

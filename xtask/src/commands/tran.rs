@@ -93,16 +93,16 @@ impl<'a> Series<'a> {
         eps: f64,
     ) -> Result<Self, String> {
         let columns = compare::validate(plot, label)?;
-        if plot.flags != PlotFlags::Real {
+        if plot.flags() != PlotFlags::Real {
             return Err(format!("{label}: transient data must be a real plot"));
         }
         let &time = columns
             .get("time")
             .ok_or_else(|| format!("{label}: missing axis 'time'"))?;
-        if plot.variables[time].unit != "time" {
+        if plot.variables()[time].unit != "time" {
             return Err(format!("{label}: axis 'time' must have unit 'time'"));
         }
-        let times: Vec<f64> = plot.points.iter().map(|row| row[time].re).collect();
+        let times: Vec<f64> = plot.points().iter().map(|row| row[time].re).collect();
         if (times[0] - grid.start).abs() > eps {
             return Err(format!(
                 "{label}: transient starts at {:e}, not {:e}",
@@ -171,7 +171,7 @@ impl<'a> Series<'a> {
 
     /// Value of column `column` at `t` on `side`.
     fn value(&self, column: usize, t: f64, side: Side) -> Result<f64, String> {
-        let at = |index: usize| self.plot.points[index][column].re;
+        let at = |index: usize| self.plot.points()[index][column].re;
         if let Some(b) = self.breakpoint_near(t) {
             let near: Vec<usize> = (0..self.times.len())
                 .filter(|&i| (self.times[i] - b).abs() <= self.eps)
@@ -298,13 +298,13 @@ pub(super) fn transient(
         if name == "time" {
             continue;
         }
-        let absolute = match want.variables[column].unit.as_str() {
+        let absolute = match want.variables()[column].unit.as_str() {
             "voltage" => tolerance.voltage_absolute,
             "current" => tolerance.current_absolute,
             other => return Err(format!("signal '{name}' has unsupported unit '{other}'")),
         };
         let peak = (0..want.point_count())
-            .map(|row| want.points[row][column].re.abs())
+            .map(|row| want.points()[row][column].re.abs())
             .fold(0.0, f64::max);
         let peak_allowance = tolerance.peak_relative * peak;
         let absolute = absolute + peak_allowance;
@@ -623,16 +623,29 @@ mod tests {
     const STOP: f64 = 10.0;
 
     fn plot(rows: &[(f64, f64)]) -> Plot {
-        let mut plot = Plot::new("tran1", "Transient Analysis", PlotFlags::Real);
-        plot.variables = vec![
-            Variable::new("time", "time"),
-            Variable::new("v(out)", "voltage"),
-        ];
-        plot.points = rows
-            .iter()
-            .map(|&(t, v)| vec![Complex::real(t), Complex::real(v)])
-            .collect();
-        plot
+        Plot::new(
+            "tran1",
+            "Transient Analysis",
+            PlotFlags::Real,
+            vec![
+                Variable::new("time", "time"),
+                Variable::new("v(out)", "voltage"),
+            ],
+        )
+        .with_points(
+            rows.iter()
+                .map(|&(t, v)| vec![Complex::real(t), Complex::real(v)])
+                .collect(),
+        )
+        .unwrap()
+    }
+    fn edit(plot: &Plot, change: impl FnOnce(&mut PlotFlags, &mut [Variable])) -> Plot {
+        let mut flags = plot.flags();
+        let mut variables = plot.variables().to_vec();
+        change(&mut flags, &mut variables);
+        Plot::new(plot.name.clone(), plot.plotname.clone(), flags, variables)
+            .with_points(plot.points().to_vec())
+            .unwrap()
     }
     /// Samples of `f` at the given times.
     fn sampled(times: &[f64], f: impl Fn(f64) -> f64) -> Plot {
@@ -719,7 +732,7 @@ mod tests {
         let want = plot(&[(0.0, 1.0), (10.0, 3.0)]);
         run(&got, &want, &[]).unwrap();
         let mut wrong = want.clone();
-        wrong.points[1][1] = Complex::real(3.1);
+        wrong.point_mut(1).unwrap()[1] = Complex::real(3.1);
         let error = run(&got, &wrong, &[]).unwrap_err();
         assert!(
             error.contains("first: t=") && error.contains("worst"),
@@ -770,20 +783,20 @@ mod tests {
         // plots above only agree because each side is handled on its own.
         let mut bad_right = jump_plot(0.5);
         let last_at_five = bad_right
-            .points
+            .points()
             .iter()
             .rposition(|row| row[0].re == 5.0)
             .unwrap();
-        bad_right.points[last_at_five][1] = Complex::real(8.5);
+        bad_right.point_mut(last_at_five).unwrap()[1] = Complex::real(8.5);
         let error = run(&bad_right, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Right)"), "{error}");
         let mut bad_left = jump_plot(0.5);
         let first_at_five = bad_left
-            .points
+            .points()
             .iter()
             .position(|row| row[0].re == 5.0)
             .unwrap();
-        bad_left.points[first_at_five][1] = Complex::real(0.5);
+        bad_left.point_mut(first_at_five).unwrap()[1] = Complex::real(0.5);
         let error = run(&bad_left, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Left)"), "{error}");
     }
@@ -794,8 +807,12 @@ mod tests {
         // sample at 5 is both limits, so the C jump (0 vs 8) must be caught.
         let want = jump_plot(0.5);
         let mut smeared = jump_plot(0.5);
-        let first = smeared.points.iter().position(|r| r[0].re == 5.0).unwrap();
-        smeared.points.remove(first);
+        let first = smeared
+            .points()
+            .iter()
+            .position(|r| r[0].re == 5.0)
+            .unwrap();
+        smeared.remove_point(first).unwrap();
         let error = run(&smeared, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Left)"), "{error}");
         // And with no declared event the repeated instant is invalid input.
@@ -825,26 +842,22 @@ mod tests {
     #[test]
     fn missing_extra_and_unsupported_signals_fail() {
         let want = sampled(&times(1.0), |t| t);
-        let mut missing_time = want.clone();
-        missing_time.variables[0].name = "t".into();
+        let missing_time = edit(&want, |_, v| v[0].name = "t".into());
         assert!(run(&missing_time, &want, &[]).unwrap_err().contains("time"));
-        let mut missing = want.clone();
-        missing.variables[1].name = "v(other)".into();
+        let missing = edit(&want, |_, v| v[1].name = "v(other)".into());
         let error = run(&missing, &want, &[]).unwrap_err();
         assert!(
             error.contains("missing") && error.contains("v(out)"),
             "{error}"
         );
         assert!(run(&want, &missing, &[]).unwrap_err().contains("extra"));
-        let mut odd_unit = want.clone();
-        odd_unit.variables[1].unit = "charge".into();
+        let odd_unit = edit(&want, |_, v| v[1].unit = "charge".into());
         assert!(
             run(&odd_unit, &odd_unit, &[])
                 .unwrap_err()
                 .contains("unsupported unit")
         );
-        let mut complex = want.clone();
-        complex.flags = PlotFlags::Complex;
+        let complex = edit(&want, |f, _| *f = PlotFlags::Complex);
         assert!(run(&complex, &complex, &[]).is_err());
     }
 
@@ -854,44 +867,45 @@ mod tests {
         for value in [f64::NAN, f64::INFINITY] {
             for column in [0, 1] {
                 let mut bad = good.clone();
-                bad.points[3][column] = Complex::real(value);
+                bad.point_mut(3).unwrap()[column] = Complex::real(value);
                 assert!(run(&bad, &good, &[]).is_err());
                 assert!(run(&good, &bad, &[]).is_err());
             }
         }
         let mut backwards = good.clone();
-        backwards.points[4][0] = Complex::real(1.0);
+        backwards.point_mut(4).unwrap()[0] = Complex::real(1.0);
         assert!(
             run(&backwards, &good, &[])
                 .unwrap_err()
                 .contains("decreases")
         );
         let mut empty = good.clone();
-        empty.points.clear();
+        empty.clear_points();
         assert!(run(&empty, &good, &[]).is_err());
     }
 
     #[test]
     fn current_uses_its_own_absolute_floor_and_relative_scales_with_value() {
-        let mut want = sampled(&times(1.0), |_| 0.0);
-        want.variables[1] = Variable::new("i(v1)", "current");
+        let want = edit(&sampled(&times(1.0), |_| 0.0), |_, v| {
+            v[1] = Variable::new("i(v1)", "current")
+        });
         let mut got = want.clone();
-        for row in &mut got.points {
+        for row in got.rows_mut() {
             row[1] = Complex::real(0.5 * compare::TRAN.current_absolute);
         }
         run(&got, &want, &[]).unwrap();
-        for row in &mut got.points {
+        for row in got.rows_mut() {
             row[1] = Complex::real(2.0 * compare::TRAN.current_absolute);
         }
         assert!(run(&got, &want, &[]).is_err());
         // Voltage uses relative 1e-3 of a 1 V value: 0.5 mV passes, 2 mV fails.
         let mut volts = sampled(&times(1.0), |_| 1.0);
         let reference = volts.clone();
-        for row in &mut volts.points {
+        for row in volts.rows_mut() {
             row[1] = Complex::real(1.0 + 0.5e-3);
         }
         run(&volts, &reference, &[]).unwrap();
-        for row in &mut volts.points {
+        for row in volts.rows_mut() {
             row[1] = Complex::real(1.0 + 2e-3);
         }
         assert!(run(&volts, &reference, &[]).is_err());

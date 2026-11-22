@@ -128,13 +128,14 @@ pub(crate) fn nested(
             assert_eq!(raw.plots.len(), 1, "C point {index}: one OP plot");
             let sample = raw.plots.into_iter().next().unwrap().plot;
             assert_eq!(sample.plotname, "Operating Point");
-            assert_eq!(sample.points.len(), 1);
+            assert_eq!(sample.points().len(), 1);
             if let Some(reference) = &mut reference {
                 assert_eq!(
-                    reference.variables, sample.variables,
+                    reference.variables(),
+                    sample.variables(),
                     "C vectors changed at point {index}"
                 );
-                reference.points.push(sample.points[0].clone());
+                reference.push_point(sample.points()[0].clone()).unwrap();
             } else {
                 reference = Some(sample);
             }
@@ -148,14 +149,14 @@ pub(crate) fn nested(
     let raw = RawFile::load(dir.join("r.raw")).unwrap();
     assert_eq!(raw.plots.len(), 1);
     let ours = raw.plots.into_iter().next().unwrap().plot;
-    assert_eq!(ours.points.len(), index);
+    assert_eq!(ours.points().len(), index);
 
     // Only the inner axis is written to the Rust DC plot. Check that its
     // order agrees with the explicit C point order, not merely its count.
     let axis = ours
         .variable_index("v(param-sweep)")
         .expect("inner parameter scale");
-    for (point, expected) in ours.points.iter().zip(inner.1.iter().cycle()) {
+    for (point, expected) in ours.points().iter().zip(inner.1.iter().cycle()) {
         assert_eq!(point[axis].re, *expected, "parameter sweep point order");
     }
 

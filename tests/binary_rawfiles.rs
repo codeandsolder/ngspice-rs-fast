@@ -112,14 +112,14 @@ fn reads_a_hand_constructed_real_plot() {
     let plot = &raw_plot.plot;
     assert_eq!(plot.plotname, "Operating Point");
     assert_eq!(plot.name, "Operating Point");
-    assert_eq!(plot.flags, PlotFlags::Real);
+    assert_eq!(plot.flags(), PlotFlags::Real);
     assert_eq!(plot.variable_count(), 3);
     assert_eq!(plot.point_count(), 2);
-    let names: Vec<&str> = plot.variables.iter().map(|v| v.name.as_str()).collect();
+    let names: Vec<&str> = plot.variables().iter().map(|v| v.name.as_str()).collect();
     assert_eq!(names, ["v(in)", "v(out)", "i(v1)"]);
-    let units: Vec<&str> = plot.variables.iter().map(|v| v.unit.as_str()).collect();
+    let units: Vec<&str> = plot.variables().iter().map(|v| v.unit.as_str()).collect();
     assert_eq!(units, ["voltage", "voltage", "current"]);
-    assert!(plot.variables.iter().all(|variable| variable.is_real));
+    assert!(plot.variables().iter().all(|variable| variable.is_real));
 
     assert_eq!(plot.value("v(in)", 0), Some(Complex::real(2.0)));
     assert_eq!(plot.value("v(out)", 0), Some(Complex::real(1.0)));
@@ -135,11 +135,11 @@ fn reads_a_hand_constructed_complex_plot() {
 
     let rawfile = RawFile::parse_bytes(&bytes).expect("parses");
     let plot = &rawfile.plots[0].plot;
-    assert_eq!(plot.flags, PlotFlags::Complex);
+    assert_eq!(plot.flags(), PlotFlags::Complex);
     assert_eq!(plot.point_count(), 2);
     // The binary form does not record `isreal(v)`, so no column claims to be
     // real; see `docs/port/RAWFILES.md`.
-    assert!(plot.variables.iter().all(|variable| !variable.is_real));
+    assert!(plot.variables().iter().all(|variable| !variable.is_real));
 
     assert_eq!(plot.value("frequency", 0), Some(Complex::new(1e2, 0.0)));
     assert_eq!(plot.value("v(out)", 0), Some(Complex::new(0.99, -0.01)));
@@ -155,8 +155,8 @@ fn multiple_binary_plots_keep_their_order_and_count() {
     assert_eq!(rawfile.len(), 2);
     assert_eq!(rawfile.plots[0].plot.plotname, "Operating Point");
     assert_eq!(rawfile.plots[1].plot.plotname, "AC Analysis");
-    assert_eq!(rawfile.plots[0].plot.flags, PlotFlags::Real);
-    assert_eq!(rawfile.plots[1].plot.flags, PlotFlags::Complex);
+    assert_eq!(rawfile.plots[0].plot.flags(), PlotFlags::Real);
+    assert_eq!(rawfile.plots[1].plot.flags(), PlotFlags::Complex);
     assert_eq!(
         rawfile.plots[1].plot.value("v(out)", 1),
         Some(Complex::new(0.9, -0.1))
@@ -363,8 +363,8 @@ fn variable_options_are_dropped_like_the_ascii_reader_drops_them() {
     );
     let rawfile = RawFile::parse_bytes(&binary_rawfile(&header, &AC_VALUES)).expect("parses");
     let plot = &rawfile.plots[0].plot;
-    assert_eq!(plot.variables[0].name, "frequency");
-    assert_eq!(plot.variables[0].unit, "frequency");
+    assert_eq!(plot.variables()[0].name, "frequency");
+    assert_eq!(plot.variables()[0].unit, "frequency");
     assert_eq!(plot.value("frequency", 0), Some(Complex::new(1e2, 0.0)));
 
     // Re-rendering drops exactly the option and changes nothing else.
@@ -381,7 +381,7 @@ fn unknown_flag_words_are_ignored_as_the_c_reader_ignores_them() {
     let header = OP_HEADER.replace("Flags: real", "Flags: real spectra");
     let rawfile = RawFile::parse_bytes(&binary_rawfile(&header, &OP_VALUES)).expect("parses");
     let plot = &rawfile.plots[0].plot;
-    assert_eq!(plot.flags, PlotFlags::Real);
+    assert_eq!(plot.flags(), PlotFlags::Real);
     assert_eq!(plot.value("v(in)", 1), Some(Complex::real(3.0)));
 }
 
@@ -469,7 +469,7 @@ fn detection_reads_only_the_header_and_never_decodes_the_payload() {
     assert!(
         rawfile.plots[0]
             .plot
-            .points
+            .points()
             .iter()
             .flatten()
             .all(|value| value.re.is_nan())
@@ -550,13 +550,16 @@ fn a_binary_round_trip_loses_the_real_spelling_of_a_complex_column() {
     let parsed = RawFile::parse(REAL_SPELLING_RAWFILE).unwrap();
     let before = parsed.single_plot().unwrap();
     assert!(
-        before.variables[0].is_real,
+        before.variables()[0].is_real,
         "frequency was written `re,0.0`"
     );
     let round_tripped = RawFile::parse_bytes(&parsed.to_binary().unwrap()).unwrap();
     let after = round_tripped.single_plot().unwrap();
-    assert!(!after.variables[0].is_real, "the flag is not in the bytes");
-    assert_eq!(after.flags, before.flags);
+    assert!(
+        !after.variables()[0].is_real,
+        "the flag is not in the bytes"
+    );
+    assert_eq!(after.flags(), before.flags());
     assert_eq!(after.variable_count(), before.variable_count());
     assert_eq!(after.point_count(), before.point_count());
     assert_eq!(
@@ -602,10 +605,10 @@ fn lending_rows_match_collected_data_with_small_input_buffers() {
         let mut decoder = RawFileReader::new(input).with_byte_order(order);
         for expected_plot in &expected.plots {
             let mut rows = decoder.next_plot().unwrap().unwrap();
-            assert!(rows.header().plot.points.is_empty());
-            assert_eq!(rows.point_count(), expected_plot.plot.points.len());
+            assert!(rows.header().plot.points().is_empty());
+            assert_eq!(rows.point_count(), expected_plot.plot.points().len());
             let mut address = None;
-            for expected_row in &expected_plot.plot.points {
+            for expected_row in expected_plot.plot.points() {
                 let row = rows.next_row().unwrap().unwrap();
                 assert_eq!(row, expected_row);
                 if let Some(previous) = address {
@@ -615,7 +618,7 @@ fn lending_rows_match_collected_data_with_small_input_buffers() {
             }
             assert!(rows.next_row().unwrap().is_none());
             let mut header = expected_plot.clone();
-            header.plot.points.clear();
+            header.plot.clear_points();
             assert_eq!(rows.finish().unwrap(), header);
         }
         assert!(decoder.next_plot().unwrap().is_none());
@@ -662,11 +665,11 @@ fn ascii_iteration_infers_mixed_column_flags_and_rejects_binary_followers() {
     let mut reader = RawFileReader::new(text.as_bytes());
     let mut rows = reader.next_plot().unwrap().unwrap();
     assert!(rows.next_row().unwrap().is_some());
-    assert!(rows.header().plot.variables.iter().all(|v| v.is_real));
+    assert!(rows.header().plot.variables().iter().all(|v| v.is_real));
     assert!(rows.next_row().unwrap().is_some());
     let header = rows.finish().unwrap();
-    assert!(header.plot.variables[0].is_real);
-    assert!(!header.plot.variables[1].is_real);
+    assert!(header.plot.variables()[0].is_real);
+    assert!(!header.plot.variables()[1].is_real);
 
     let mut bytes = text.as_bytes().to_vec();
     bytes.extend_from_slice(&binary_rawfile(OP_HEADER, &OP_VALUES));

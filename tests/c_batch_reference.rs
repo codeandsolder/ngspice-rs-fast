@@ -95,9 +95,9 @@ fn compare_with_c_batch(name: &str, deck_text: &str) {
     for (index, (got, want)) in got.plots.iter().zip(&want.plots).enumerate() {
         let (got, want) = (&got.plot, &want.plot);
         assert_eq!(got.plotname, want.plotname, "{name}: plot {index}");
-        assert_eq!(got.flags, want.flags, "{name}: plot {index}");
+        assert_eq!(got.flags(), want.flags(), "{name}: plot {index}");
         let names = |plot: &ngspice_rs::analysis::Plot| -> Vec<String> {
-            plot.variables
+            plot.variables()
                 .iter()
                 .map(|variable| variable.name.clone())
                 .collect()
@@ -109,9 +109,9 @@ fn compare_with_c_batch(name: &str, deck_text: &str) {
             "{name}: plot {index} ({})",
             got.plotname
         );
-        for (column, variable) in got.variables.iter().enumerate() {
+        for (column, variable) in got.variables().iter().enumerate() {
             let want_name = &names(want)[column];
-            let want_column = want.column(&want.variables[column].name).unwrap();
+            let want_column = want.column(&want.variables()[column].name).unwrap();
             let got_column = got.column(&variable.name).unwrap();
             for (point, (a, b)) in got_column.iter().zip(&want_column).enumerate() {
                 // C's incremental batch writer leaves the AC scale's imaginary

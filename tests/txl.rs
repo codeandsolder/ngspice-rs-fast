@@ -52,16 +52,16 @@ fn run_with_options(body: &str, kind: AnalysisKind, arguments: &[&str]) -> Plot 
 fn value(plot: &Plot, name: &str, point: usize) -> f64 {
     let index = plot
         .variable_index(name)
-        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables));
-    plot.points[point][index].re
+        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
+    plot.points()[point][index].re
 }
 /// The `occurrence`-th variable with this name (`i(y1)` twice).
 fn values(plot: &Plot, name: &str, point: usize) -> Vec<f64> {
-    plot.variables
+    plot.variables()
         .iter()
         .enumerate()
         .filter(|(_, variable)| variable.name == name)
-        .map(|(index, _)| plot.points[point][index].re)
+        .map(|(index, _)| plot.points()[point][index].re)
         .collect()
 }
 /// The TXL instance of a circuit (`v1` and the load come first in deck order).
@@ -212,7 +212,7 @@ fn the_high_resistance_fallback_expands_to_the_c_ladder() {
     let plot = run(&mut c, AnalysisKind::OperatingPoint, &[]);
     // Three 100 ohm sections into the 1 kohm load: 5/1300 A.
     assert_eq!(
-        plot.variables
+        plot.variables()
             .iter()
             .map(|v| v.name.as_str())
             .collect::<Vec<_>>(),
@@ -287,7 +287,7 @@ fn the_pade_dc_stamp_matches_the_reference_binary() {
     let mut c = circuit(PADE).unwrap();
     let plot = run(&mut c, AnalysisKind::OperatingPoint, &[]);
     assert_eq!(
-        plot.variables
+        plot.variables()
             .iter()
             .map(|v| v.name.as_str())
             .collect::<Vec<_>>(),

@@ -35,8 +35,8 @@ fn noise_prints_route_spectrum_and_integrated_vectors_with_retained_bias() {
     assert_eq!(raw.plots[0].plot.value("v(out)", 0).unwrap().re, 0.5);
     assert!(report.contains("onoise_spectrum"), "{report}");
     assert!(report.contains("onoise_total"), "{report}");
-    assert_eq!(raw.plots[1].plot.variables.len(), 3);
-    assert_eq!(raw.plots[2].plot.variables.len(), 1);
+    assert_eq!(raw.plots[1].plot.variables().len(), 3);
+    assert_eq!(raw.plots[2].plot.variables().len(), 1);
 }
 
 #[test]
