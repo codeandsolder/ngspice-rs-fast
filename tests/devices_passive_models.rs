@@ -173,7 +173,6 @@ fn all_raw_setters_are_validated_even_if_overwritten_or_unused_by_precedence() {
         "tnom=-273.15",
         "noisy=0",
         "res=2k",
-        "tce=1e999 tce=1",
         "w=1u",
     ] {
         let n = deck(&format!("r1 a 0 1k mdl\n.model mdl r({setter})"));
@@ -186,7 +185,6 @@ fn all_raw_setters_are_validated_even_if_overwritten_or_unused_by_precedence() {
         ('l', "inductance=-1"),
         ('l', "scale=-1"),
         ('r', "temp=-273.15"),
-        ('r', "dtemp=1e999"),
         ('r', "ac=0"),
         ('r', "tc=1"),
         ('c', "bv_max=1"),
@@ -224,6 +222,19 @@ fn nonfinite_programmatic_values_and_arithmetic_overflow_are_rejected() {
         n.devices[0].parameters[0].value = text.into();
         assert!(parameters(&n, 0).is_err());
     }
+    // Written but overwritten/unused inputs must still be validated. The
+    // parser correctly rejects nonfinite literals before reaching this path.
+    let mut n = deck("r1 a 0 1k mdl dtemp=5 dtemp=0\n.model mdl r(tce=2 tce=0)");
+    n.models[0].parameters[0].value = "1e999".into();
+    assert!(parameters(&n, 0).is_err());
+    n.models[0].parameters[0].value = "2".into();
+    let bad = n.devices[0]
+        .parameters
+        .iter_mut()
+        .find(|p| p.name == "dtemp")
+        .unwrap();
+    bad.value = "1e999".into();
+    assert!(parameters(&n, 0).is_err());
     for body in [
         "r1 a 0 mdl\n.model mdl r(rsh=1e300 l=1e300 defw=1e-300)",
         "r1 a 0 mdl\n.model mdl r(rsh=1 narrow=1e308)",
@@ -261,7 +272,7 @@ fn failed_instance_elaboration_preserves_all_circuit_namespaces() {
         "r2 new 0 mdl\n.model mdl c(cap=1u)",
         "r2 new 0 mdl\n.model mdl r(rsh=100 narrow=10u)",
         "c2 new 0 mdl\n.model mdl c(cj=1m)",
-        "l2 new 0 mdl\n.model mdl l(ind=1m mu=2)",
+        "l2 new 0 mdl\n.model mdl l(ind=1m mu=0)",
         "r2 new 0 mdl temp=40\n.model mdl r(r=1 tc1=-1 tnom=20)",
         "r2 new 0 mdl\n.model mdl r(level=2 r=1)",
         "v1 new 0 1",
