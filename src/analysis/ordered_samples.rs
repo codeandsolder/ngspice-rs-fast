@@ -20,10 +20,10 @@ pub(super) enum AxisError {
 }
 
 pub(super) fn column_names(plot: &Plot) -> String {
-    if plot.variables.is_empty() {
+    if plot.variables().is_empty() {
         return "no vectors".to_owned();
     }
-    plot.variables
+    plot.variables()
         .iter()
         .map(|v| v.name.as_str())
         .collect::<Vec<_>>()
@@ -41,7 +41,7 @@ impl OrderedAxis<'static> {
     pub(super) fn from_plot(plot: &Plot, name: &str) -> Result<Self, AxisError> {
         let column = plot.variable_index(name).ok_or(AxisError::MissingColumn)?;
         let values = plot
-            .points
+            .points()
             .iter()
             .enumerate()
             .map(|(index, point)| {

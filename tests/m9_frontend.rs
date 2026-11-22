@@ -225,7 +225,7 @@ fn scoped_frontend_translation_and_repetition_match_c() {
     let raw = ngspice_rs::analysis::RawFile::load(scratch.0.join("output.raw")).unwrap();
     let variables: Vec<_> = raw.plots[0]
         .plot
-        .variables
+        .variables()
         .iter()
         .map(|variable| variable.name.as_str())
         .collect();

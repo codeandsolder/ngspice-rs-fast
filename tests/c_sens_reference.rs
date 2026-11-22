@@ -133,12 +133,12 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
     for (index, (got, want)) in got.plots.iter().zip(&want.plots).enumerate() {
         let (got, want) = (&got.plot, &want.plot);
         assert_eq!(got.plotname, want.plotname, "{name}: plot {index}");
-        assert_eq!(got.flags, want.flags, "{name}: plot {index}");
+        assert_eq!(got.flags(), want.flags(), "{name}: plot {index}");
         if want.plotname != "Sensitivity Analysis" {
             continue;
         }
         let names = |plot: &ngspice_rs::analysis::Plot| -> Vec<(String, String)> {
-            plot.variables
+            plot.variables()
                 .iter()
                 .map(|variable| (variable.name.clone(), variable.unit.clone()))
                 .collect()
@@ -149,8 +149,8 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
             "{name}: plot {index} names in order"
         );
         assert_eq!(got.point_count(), want.point_count(), "{name}");
-        for (point, (a, b)) in got.points.iter().zip(&want.points).enumerate() {
-            for ((x, y), variable) in a.iter().zip(b).zip(&want.variables) {
+        for (point, (a, b)) in got.points().iter().zip(want.points()).enumerate() {
+            for ((x, y), variable) in a.iter().zip(b).zip(want.variables()) {
                 if y.re.is_nan() || y.im.is_nan() {
                     assert!(
                         x.re.is_nan(),

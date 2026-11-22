@@ -93,7 +93,7 @@ fn compare(name: &str, deck_text: &str) {
     assert_eq!(titles(&got), titles(&want), "{name}: plot sequence");
     for (index, (got, want)) in got.plots.iter().zip(&want.plots).enumerate() {
         let (got, want) = (&got.plot, &want.plot);
-        assert_eq!(got.flags, want.flags, "{name}: plot {index}");
+        assert_eq!(got.flags(), want.flags(), "{name}: plot {index}");
         assert_eq!(
             got.point_count(),
             want.point_count(),
@@ -102,7 +102,7 @@ fn compare(name: &str, deck_text: &str) {
         if is_noise(want) {
             // The noise layout is C's own: names, order and units.
             let layout = |plot: &Plot| -> Vec<(String, String)> {
-                plot.variables
+                plot.variables()
                     .iter()
                     .map(|v| (v.name.clone(), v.unit.clone()))
                     .collect()
@@ -114,7 +114,7 @@ fn compare(name: &str, deck_text: &str) {
         // the nonlinear DC/AC bound. Values are compared by C's names (the
         // port writes simulator-internal nodes that C's batch plots omit).
         let floor = if is_noise(want) { 1e-20 } else { 1e-12 };
-        for variable in &want.variables {
+        for variable in want.variables() {
             let want_column = want.column(&variable.name).unwrap();
             let got_column = got
                 .column(&variable.name)
@@ -182,7 +182,7 @@ fn bsim3_noise_sources_match_c_batch_mode() {
                  m1 d g s 0 nn {instance}\n\
                  .model nn nmos level=8 cgdo=1e-10 cgso=1e-10 cj=1e-3 {extra}\n\
                  .options reltol=1e-6\n\
-                 .noise v(d) vin dec 2 1k 10meg\n.end\n"
+                 .noise v(d) vin dec 2 1k 10meg 1\n.end\n"
             ),
         );
     }
@@ -401,4 +401,29 @@ fn spice3_mos1_flicker_matches_c() {
         "mos1-spice3",
         &deck.replace(".end", ".control\nset ngbehavior=s3\n.endc\n.end"),
     );
+}
+
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; runs C batch mode out of process"]
+fn bsim4_correlated_noise_preserves_ordered_generators_and_integration() {
+    let deck =
+        fs::read_to_string(workspace().join("conformance/netlists/m11_bsim4_noise.cir")).unwrap();
+    // Compare individual generators (including the frequency-local coherent
+    // pair), totals and input referral over a frequency sweep, not just the
+    // final output spectrum. Exercise both BSIM4 flicker formulations.
+    for (name, flicker) in [
+        ("bsim4-correlated-fnoimod0", "fnoimod=0 kf=1e-26"),
+        ("bsim4-correlated-fnoimod1", "fnoimod=1"),
+    ] {
+        let deck = deck
+            .replace(
+                ".options reltol",
+                &format!("+ tnoimod=2 {flicker}\n.options reltol"),
+            )
+            .replace(
+                ".noise v(d) vg dec 4 1e3 1e10",
+                ".noise v(d) vg dec 4 1e3 1e10 1",
+            );
+        compare(name, &deck);
+    }
 }

@@ -10,7 +10,9 @@ use ngspice_rs::netlist::elaborate::literalize;
 use ngspice_rs::netlist::eval::{EvalBudget, FunctionScope, ParamScope};
 use ngspice_rs::netlist::expr::ExprKind;
 use ngspice_rs::netlist::source::parse_deck_text;
-use ngspice_rs::netlist::{Parser, semantic_diff, semantic_eq, write_netlist};
+use ngspice_rs::netlist::{
+    Parser, parse_parameter_expression, semantic_diff, semantic_eq, write_netlist,
+};
 use ngspice_rs::primitives::SpiceError;
 
 fn parse(body: &str) -> Result<Netlist, SpiceError> {
@@ -520,7 +522,7 @@ fn function_scope_api_resolves_lexically() {
     // The scope used by literalize and RunConfig exposes the functions.
     let scope = ParamScope::for_netlist(&n).unwrap();
     assert!(scope.functions().is_some_and(|f| f.get("f").is_some()));
-    let expression = Parser::parse_expression("f(2)+g(2)", &n.location).unwrap();
+    let expression = parse_parameter_expression("f(2)+g(2)", &n.location).unwrap();
     assert_eq!(
         scope
             .evaluate(&expression, &mut EvalBudget::default())

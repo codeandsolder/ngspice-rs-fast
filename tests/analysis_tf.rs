@@ -44,16 +44,16 @@ fn values(plot: &Plot) -> [f64; 3] {
     assert_eq!(plot.point_count(), 1);
     assert_eq!(plot.variable_count(), 3);
     assert!(
-        plot.variables
+        plot.variables()
             .iter()
             .all(|v| v.unit == "voltage" && v.is_real)
     );
-    assert!(plot.points[0].iter().all(|v| v.im == 0.));
-    [0, 1, 2].map(|column| plot.points[0][column].re)
+    assert!(plot.points()[0].iter().all(|v| v.im == 0.));
+    [0, 1, 2].map(|column| plot.points()[0][column].re)
 }
 
 fn names(plot: &Plot) -> Vec<&str> {
-    plot.variables.iter().map(|v| v.name.as_str()).collect()
+    plot.variables().iter().map(|v| v.name.as_str()).collect()
 }
 
 fn close(got: f64, want: f64, relative: f64) {

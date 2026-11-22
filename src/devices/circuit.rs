@@ -1319,7 +1319,7 @@ impl Circuit {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, device)| {
-                        device.delay_line().map(|line| (index, line.width()))
+                        device.delay_line().map(|line| (index, line.new_history()))
                     }),
             )
     }
@@ -2137,7 +2137,7 @@ impl Circuit {
             };
             let update = if delay.start {
                 let update = line.start(&context)?;
-                if update.reset.is_none() {
+                if !update.is_reset() {
                     return Err(SpiceError::circuit(format!(
                         "{}: a delay-line start must reset its history",
                         device.name()

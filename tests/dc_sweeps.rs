@@ -72,12 +72,12 @@ fn assert_column(p: &Plot, name: &str, want: &[f64], relative: f64, absolute: f6
     }
 }
 fn unit(p: &Plot, name: &str) -> String {
-    p.variables[p.variable_index(name).unwrap()].unit.clone()
+    p.variables()[p.variable_index(name).unwrap()].unit.clone()
 }
 /// dctrcurv.c writes only the inner axis' scale: no vector holds the outer
 /// value of a nested sweep (the port once appended one as `sweep(<outer>)`).
 fn assert_no_outer_column(p: &Plot) {
-    let names: Vec<_> = p.variables.iter().map(|v| v.name.as_str()).collect();
+    let names: Vec<_> = p.variables().iter().map(|v| v.name.as_str()).collect();
     assert!(names.iter().all(|n| !n.starts_with("sweep")), "{names:?}");
 }
 fn grid(start: f64, stop: f64, step: f64) -> SpiceResult<Vec<f64>> {
@@ -211,7 +211,7 @@ fn endpoint_rounding_reaches_the_run() {
         Some(&2.7755575615628914e-17)
     );
     assert_eq!(p.point_count(), 4);
-    assert_eq!(p.variables[0].name, "v(v-sweep)");
+    assert_eq!(p.variables()[0].name, "v(v-sweep)");
     assert_eq!(unit(&p, "v(v-sweep)"), "voltage");
 }
 
@@ -557,7 +557,7 @@ fn programmatic_names_resolve_by_physical_kind_and_keep_their_case() {
     );
     let p = run(&mut c, &["r9", "0", "2", "1", "load", "1k", "3k", "2k"]).unwrap();
     // r9 is a voltage source; the outer `Load` axis gets no column.
-    assert_eq!(p.variables[0].name, "v(v-sweep)");
+    assert_eq!(p.variables()[0].name, "v(v-sweep)");
     assert_no_outer_column(&p);
     let want = [
         (0., 1e3),

@@ -207,5 +207,6 @@ fn continuations_and_unicode_columns_keep_original_assignment_positions() {
     assert_eq!(p[0].location.column, 9); // UTF-8 byte columns, not character count.
     assert_eq!(p[1].value, "2u");
     assert_eq!(p[2].value, "3k");
-    assert!(p[1].location.column > p[0].location.column);
+    assert_eq!((p[1].location.line, p[1].location.column), (3, 3));
+    assert_eq!((p[2].location.line, p[2].location.column), (3, 8));
 }

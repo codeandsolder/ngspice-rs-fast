@@ -26,11 +26,11 @@ fn run(cards: &str, analysis: &str) -> SpiceResult<Plot> {
 }
 
 fn roots(plot: &Plot, kind: &str) -> Vec<Complex> {
-    plot.variables
+    plot.variables()
         .iter()
         .enumerate()
         .filter(|(_, v)| v.name.starts_with(&format!("v({kind}(")))
-        .map(|(i, _)| plot.points[0][i])
+        .map(|(i, _)| plot.points()[0][i])
         .collect()
 }
 
@@ -54,16 +54,16 @@ const RC: &str = "v1 in 0 dc 0 ac 1\nr1 in out 1k\nc1 out 0 1u\n";
 fn an_rc_lowpass_has_one_real_pole_and_no_finite_zero() {
     let plot = run(RC, ".pz in 0 out 0 vol pz").unwrap();
     assert_eq!(plot.plotname, "Pole-Zero Analysis");
-    assert_eq!(plot.flags, PlotFlags::Complex);
+    assert_eq!(plot.flags(), PlotFlags::Complex);
     assert_eq!(plot.point_count(), 1);
-    assert_eq!(plot.variables.len(), 1);
-    let pole = &plot.variables[0];
+    assert_eq!(plot.variables().len(), 1);
+    let pole = &plot.variables()[0];
     assert_eq!(
         (pole.name.as_str(), pole.unit.as_str(), pole.is_real),
         ("v(pole(1))", "voltage", false)
     );
-    assert_eq!(plot.points[0][0].im, 0.0);
-    assert_close(plot.points[0][0], -1e3, 0.0, 1e-12);
+    assert_eq!(plot.points()[0][0].im, 0.0);
+    assert_close(plot.points()[0][0], -1e3, 0.0, 1e-12);
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn a_two_pole_rc_ladder_matches_its_characteristic_polynomial() {
     let (a, b) = (r1 * r2 * c1 * c2, r1 * c1 + r2 * c2 + r1 * c2);
     let disc = (b * b - 4.0 * a).sqrt();
     let poles = roots(&plot, "pole");
-    assert_eq!(plot.variables.len(), 2, "pol computes no zeros");
+    assert_eq!(plot.variables().len(), 2, "pol computes no zeros");
     // Ascending real part, as C lists them.
     assert_close(poles[0], (-b - disc) / (2.0 * a), 0.0, 1e-12);
     assert_close(poles[1], (-b + disc) / (2.0 * a), 0.0, 1e-12);
@@ -191,8 +191,8 @@ fn a_resistive_circuit_gives_an_empty_real_plot() {
     )
     .unwrap();
     // C writes `Flags: real`, no variables and one point.
-    assert_eq!(plot.flags, PlotFlags::Real);
-    assert!(plot.variables.is_empty());
+    assert_eq!(plot.flags(), PlotFlags::Real);
+    assert!(plot.variables().is_empty());
     assert_eq!(plot.point_count(), 1);
 }
 
@@ -317,7 +317,7 @@ fn simulate_writes_c_layout_and_composes_with_other_analyses() {
     let names = |i: usize| -> Vec<String> {
         raw.plots[i]
             .plot
-            .variables
+            .variables()
             .iter()
             .map(|v| v.name.clone())
             .collect()

@@ -52,20 +52,18 @@
     reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
+use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step, prime_prime};
 use super::{NodeSetup, TemperatureCache, given_celsius, physical_temperature, stamp_reset};
 use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE};
-use crate::devices::limiting;
-use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::sensitivity::{
     AcReset, DeviceSensitivity, ParameterScope, RecordPair, SensitivityFamily, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::sweep::check_swept;
 use crate::devices::{
-    AnalysisMode, Device, DeviceState, IterationPhase, LinearContext, ModelContext, ResolvedModel,
-    StampContext,
+    AnalysisMode, Device, DeviceState, LinearContext, ModelContext, ResolvedModel, StampContext,
 };
 use crate::maths::Vector;
 use crate::netlist::ast::DeviceInstance;
@@ -196,27 +194,6 @@ struct Point {
     /// small-signal load.
     capgs: Real,
     capgd: Real,
-}
-
-/// `mesaload.c`'s start states, and the linear prediction C compares the
-/// converged currents against.
-#[derive(Debug, Clone, Copy)]
-enum Start {
-    /// The `uic` initial load.
-    Conditions,
-    /// A load with limiting inactive: the solution itself.
-    Exact,
-    /// `MODEINITJCT`/`MODEINITFIX`: always nonconvergent.
-    Fixed,
-    /// A held `off` load (the shared rule of the port's other nonlinear
-    /// devices).
-    HeldOff { raw: [Real; 2] },
-    /// C's `DEVpnjlim`/`DEVfetlim` limited the step.
-    Limited {
-        icheck: bool,
-        cghat: Real,
-        cdhat: Real,
-    },
 }
 
 /// `mesasetup.c`'s internal nodes and the intrinsic terminals they lead to.
@@ -520,64 +497,29 @@ impl Mesa {
         raw: [Real; 2],
         ic: [Real; 2],
     ) -> ([Real; 2], Start) {
-        if states.initial_conditions() {
-            let vds = ic[0];
-            let vgs = ic[1];
-            return ([vgs, vgs - vds], Start::Conditions);
-        }
-        if !states.device_limiting() {
-            return (raw, Start::Exact);
-        }
-        let new = match states.phase() {
-            IterationPhase::Junction => {
-                let v = if self.initial.off { 0. } else { -1. };
-                return ([v, v], Start::Fixed);
-            }
-            IterationPhase::Fix if self.initial.off => return ([0.; 2], Start::HeldOff { raw }),
-            IterationPhase::Predict => [
-                states.predicted(slot::VGS, 1.),
-                states.predicted(slot::VGD, 1.),
+        Start::select(
+            states,
+            raw,
+            ic,
+            self.initial.off,
+            [slot::VGS, slot::VGD],
+            [
+                slot::CG,
+                slot::CD,
+                slot::GM,
+                slot::GDS,
+                slot::GGS,
+                slot::GGD,
             ],
-            IterationPhase::Fix | IterationPhase::Float => raw.map(Some),
-        };
-        let old = |index: usize| match states.phase() {
-            IterationPhase::Predict => states.accepted(1, index),
-            _ => states.iterate(index),
-        };
-        let [Some(vgs), Some(vgd)] = new else {
-            return (raw, Start::Exact);
-        };
-        let previous: Option<Vec<Real>> = [
-            slot::VGS,
-            slot::VGD,
-            slot::CG,
-            slot::CD,
-            slot::GM,
-            slot::GDS,
-            slot::GGS,
-            slot::GGD,
-        ]
-        .into_iter()
-        .map(|index| old(index).filter(|v| v.is_finite()))
-        .collect();
-        let Some(&[vgs0, vgd0, cg0, cd0, gm0, gds0, ggs0, ggd0]) = previous.as_deref() else {
-            return ([vgs, vgd], Start::Exact);
-        };
-        let delvgs = vgs - vgs0;
-        let delvgd = vgd - vgd0;
-        let delvds = delvgs - delvgd;
-        let cghat = cg0 + ggd0 * delvgd + ggs0 * delvgs;
-        let cdhat = cd0 + gm0 * delvgs + gds0 * delvds - ggd0 * delvgd;
-        let gs = limiting::pnjlim(vgs, vgs0, derived.vtes, derived.vcrits);
-        let gd = limiting::pnjlim(vgd, vgd0, derived.vted, derived.vcritd);
-        let vgs = limiting::fetlim(gs.value, vgs0, derived.tvto);
-        let vgd = limiting::fetlim(gd.value, vgd0, derived.tvto);
-        (
-            [vgs, vgd],
-            Start::Limited {
-                icheck: gs.limited || gd.limited,
-                cghat,
-                cdhat,
+            |voltage, previous, history| {
+                Start::limit_junctions(
+                    voltage,
+                    previous,
+                    history,
+                    [derived.vtes, derived.vted],
+                    [derived.vcrits, derived.vcritd],
+                    derived.tvto,
+                )
             },
         )
     }
@@ -1341,31 +1283,19 @@ impl Device for Mesa {
         // node between the two. The `MODEINITJCT` branches set a fresh 0
         // instead; that differs on the first iteration only, and the port's
         // DC goldens pin the converged result either way.
-        let pp = |aliased: bool, node: NodeId, limited: Real, slot: usize| {
-            if aliased {
-                return limited;
-            }
-            let solved = || voltage(self.nodes.gp) - voltage(node);
-            if context.states.phase() == IterationPhase::Predict {
-                return context
-                    .states
-                    .accepted(1, slot)
-                    .filter(|v| v.is_finite())
-                    .unwrap_or_else(solved);
-            }
-            solved()
-        };
-        let vgspp = pp(
+        let vgspp = prime_prime(
+            &context.states,
             self.nodes.spp == self.nodes.sp,
-            self.nodes.spp,
             vgs,
             slot::VGSPP,
+            || voltage(self.nodes.gp) - voltage(self.nodes.spp),
         );
-        let vgdpp = pp(
+        let vgdpp = prime_prime(
+            &context.states,
             self.nodes.dpp == self.nodes.dp,
-            self.nodes.dpp,
             vgd,
             slot::VGDPP,
+            || voltage(self.nodes.gp) - voltage(self.nodes.dpp),
         );
         let von = derived.tvto + self.model.ks * (voltage(self.nodes.sp) - self.model.vsg);
         let point = self.point(&derived, vgs, vgd, von, gmin)?;
@@ -1376,8 +1306,6 @@ impl Device for Mesa {
         // computes a closed-form charge - and only a transient load
         // integrates it. `.dc` still accumulates (C's `MODEDCTRANCURVE`), so
         // `@z1[qgs]` reports it mid-sweep without changing a stamp.
-        let initial_transient =
-            context.states.initial_transient() && context.states.phase() == IterationPhase::Predict;
         let mut cg = point.cg;
         let mut cd = point.cd;
         let (mut ggspp, mut ggdpp, mut cgspp, mut cgdpp) = (0., 0., 0., 0.);
@@ -1386,125 +1314,46 @@ impl Device for Mesa {
             context.mode,
             AnalysisMode::Transient { .. } | AnalysisMode::DcSweep
         ) {
-            // C reads `state1[MESAvgspp]`/`state1[MESAvgdpp]` first, patches
-            // `state1[MESAqgs]` for `MODEINITTRAN`, and only then accumulates.
-            let vgs1 = context
-                .states
-                .accepted(1, slot::VGSPP)
-                .filter(|v| v.is_finite())
-                .unwrap_or(vgspp);
-            let vgd1 = context
-                .states
-                .accepted(1, slot::VGDPP)
-                .filter(|v| v.is_finite())
-                .unwrap_or(vgdpp);
-            if initial_transient {
-                context
-                    .states
-                    .patch_state1(slot::QGS, point.capgs * vgspp)?;
-                context
-                    .states
-                    .patch_state1(slot::QGD, point.capgd * vgdpp)?;
-            }
-            let qgs1 = context
-                .states
-                .accepted(1, slot::QGS)
-                .filter(|v| v.is_finite())
-                .unwrap_or(0.);
-            let qgd1 = context
-                .states
-                .accepted(1, slot::QGD)
-                .filter(|v| v.is_finite())
-                .unwrap_or(0.);
-            qgs = qgs1 + point.capgs * (vgspp - vgs1);
-            qgd = qgd1 + point.capgd * (vgdpp - vgd1);
-            if initial_transient {
-                // C copies the accumulated charge into `CKTstate1` before
-                // `NIintegrate`, so the integration history starts there.
-                context.states.patch_state1(slot::QGS, qgs)?;
-                context.states.patch_state1(slot::QGD, qgd)?;
-            }
-            if let Some(coefficients) = context.integration {
-                let AnalysisMode::Transient { dt, .. } = context.mode else {
-                    return Err(SpiceError::circuit(
-                        "MESA charge companion outside transient",
-                    ));
-                };
-                if dt != coefficients.dt() {
-                    return Err(SpiceError::circuit("MESA charge timestep mismatch"));
-                }
-                let junction = |charge, capacitance| JunctionPoint {
-                    current: 0.,
-                    conductance: 0.,
-                    charge,
-                    capacitance,
-                };
-                let (geq, cqgs) = junction_companion(
-                    context,
-                    coefficients,
-                    junction(qgs, point.capgs),
-                    slot::QGS,
-                )?;
-                ggspp = geq;
-                cgspp = cqgs;
-                cg += cqgs;
-                let (geq, cqgd) = junction_companion(
-                    context,
-                    coefficients,
-                    junction(qgd, point.capgd),
-                    slot::QGD,
-                )?;
-                ggdpp = geq;
-                cgdpp = cqgd;
-                cg += cqgd;
-                cd -= cqgd;
-                if initial_transient {
-                    context.states.patch_state1(slot::CQGS, cqgs)?;
-                    context.states.patch_state1(slot::CQGD, cqgd)?;
-                }
+            let previous = [
+                accepted(&context.states, slot::VGSPP, vgspp),
+                accepted(&context.states, slot::VGDPP, vgdpp),
+            ];
+            let step = charge_step(
+                &mut context.states,
+                context.mode,
+                context.integration,
+                "MESA",
+                [
+                    ChargeInput::new(slot::QGS, vgspp, previous[0], point.capgs),
+                    ChargeInput::new(slot::QGD, vgdpp, previous[1], point.capgd),
+                ],
+            )?;
+            [qgs, qgd] = step.charges;
+            if let Some([gs, gd]) = step.companions {
+                ggspp = gs.conductance;
+                cgspp = gs.derivative;
+                cg += gs.derivative;
+                ggdpp = gd.conductance;
+                cgdpp = gd.derivative;
+                cg += gd.derivative;
+                cd -= gd.derivative;
             }
         }
         // The convergence test compares the predicted currents with the
         // integrated ones (C's `cg`/`cd` after the charge block).
         let point = Point { cd, cg, ..point };
-        let nonconvergent = match start {
-            Start::Fixed => true,
-            Start::Conditions | Start::Exact => false,
-            Start::HeldOff { raw } => {
-                let delvgs = raw[0] - point.vgs;
-                let delvgd = raw[1] - point.vgd;
-                let delvds = delvgs - delvgd;
-                let cghat = point.cg + point.ggd * delvgd + point.ggs * delvgs;
-                let cdhat = point.cd + point.gm * delvgs + point.gds * delvds - point.ggd * delvgd;
-                context
-                    .states
-                    .convergence_tolerances()
-                    .is_some_and(|(reltol, abstol)| {
-                        (cghat - point.cg).abs() > reltol * cghat.abs().max(point.cg.abs()) + abstol
-                            || (cdhat - point.cd).abs()
-                                > reltol * cdhat.abs().max(point.cd.abs()) + abstol
-                    })
-            }
-            Start::Limited {
-                icheck,
-                cghat,
-                cdhat,
-            } => {
-                icheck
-                    || context
-                        .states
-                        .convergence_tolerances()
-                        .is_some_and(|(reltol, abstol)| {
-                            (cghat - point.cg).abs()
-                                >= reltol * cghat.abs().max(point.cg.abs()) + abstol
-                                || (cdhat - point.cd).abs()
-                                    > reltol * cdhat.abs().max(point.cd.abs()) + abstol
-                        })
-            }
-        };
-        if nonconvergent {
-            context.states.report_nonconvergence()?;
-        }
+        start.report(
+            &mut context.states,
+            Linearization {
+                voltage: [point.vgs, point.vgd],
+                gate_current: point.cg,
+                drain_current: point.cd,
+                transconductance: point.gm,
+                output_conductance: point.gds,
+                source_conductance: point.ggs,
+                drain_conductance: point.ggd,
+            },
+        )?;
         for (index, value) in [
             (slot::VGS, vgs),
             (slot::VGSPP, vgspp),

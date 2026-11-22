@@ -40,17 +40,132 @@ fn delay_error(message: impl Into<String>) -> SpiceError {
     }
 }
 
+/// Accepted delay state, using the physical model's own time coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DelayHistory {
+    /// TRA/LTRA use continuous physical time and waveform samples.
+    Waveform(WaveformHistory),
+    /// TXL uses integer picosecond ticks and one accepted convolution state.
+    Txl(Box<crate::devices::txl::TxlHistory>),
+}
+
+impl DelayHistory {
+    /// Construct continuous-time waveform history.
+    #[must_use]
+    pub const fn waveform(width: usize) -> Self {
+        Self::Waveform(WaveformHistory::new(width))
+    }
+
+    /// Access the continuous-time waveform history.
+    ///
+    /// # Errors
+    /// This line uses a different history representation.
+    pub fn as_waveform(&self) -> SpiceResult<&WaveformHistory> {
+        match self {
+            Self::Waveform(history) => Ok(history),
+            Self::Txl(_) => Err(delay_error("expected continuous waveform history")),
+        }
+    }
+
+    /// Access TXL history.
+    ///
+    /// # Errors
+    /// This line uses a different history representation.
+    pub fn as_txl(&self) -> SpiceResult<&crate::devices::txl::TxlHistory> {
+        match self {
+            Self::Txl(history) => Ok(history),
+            Self::Waveform(_) => Err(delay_error("expected TXL tick history")),
+        }
+    }
+
+    /// Number of accepted samples.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Waveform(history) => history.len(),
+            Self::Txl(history) => history.len(),
+        }
+    }
+
+    /// True before the line is initialized.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Check a typed update before any state is committed.
+    ///
+    /// # Errors
+    /// Incompatible history or invalid update.
+    pub fn check(&self, update: &DelayUpdate) -> SpiceResult<()> {
+        match (self, update) {
+            (Self::Waveform(history), DelayUpdate::Waveform(update)) => history.check(update),
+            (Self::Txl(history), DelayUpdate::Txl(update)) => history.check(update),
+            _ => Err(delay_error("incompatible delay update")),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply(&mut self, update: &DelayUpdate) -> SpiceResult<()> {
+        self.check(update)?;
+        self.apply_validated(update);
+        Ok(())
+    }
+
+    pub(super) fn apply_validated(&mut self, update: &DelayUpdate) {
+        match (self, update) {
+            (Self::Waveform(history), DelayUpdate::Waveform(update)) => {
+                history.apply_validated(update);
+            }
+            (Self::Txl(history), DelayUpdate::Txl(update)) => history.apply_validated(update),
+            _ => unreachable!("delay updates were validated before committing"),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        match self {
+            Self::Waveform(history) => history.clear(),
+            Self::Txl(history) => history.clear(),
+        }
+    }
+}
+
+/// Model-specific update prepared before atomic transient acceptance.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DelayUpdate {
+    /// Continuous waveform update, possibly including future breakpoints.
+    Waveform(WaveformUpdate),
+    /// Integer-tick TXL update and its accepted convolution state.
+    Txl(crate::devices::txl::TxlUpdate),
+}
+
+impl DelayUpdate {
+    pub(super) const fn is_reset(&self) -> bool {
+        match self {
+            Self::Waveform(update) => update.reset.is_some(),
+            Self::Txl(update) => update.is_reset(),
+        }
+    }
+
+    pub(super) fn into_breakpoints(self) -> Vec<Real> {
+        match self {
+            Self::Waveform(update) => update.breakpoints,
+            Self::Txl(_) => Vec::new(),
+        }
+    }
+}
+
 /// Accepted samples of one delay device, oldest first (C `TRAdelays`: rows of
 /// `time, values...`). Times are finite and strictly increasing; every sample
 /// holds [`Self::width`] finite values.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct DelayHistory {
+pub struct WaveformHistory {
     width: usize,
     times: VecDeque<Real>,
     values: VecDeque<Real>,
 }
 
-impl DelayHistory {
+impl WaveformHistory {
     /// An empty history with `width` values per sample.
     #[must_use]
     pub const fn new(width: usize) -> Self {
@@ -121,7 +236,7 @@ impl DelayHistory {
     /// # Errors
     ///
     /// [`SpiceError::Numerical`] describing the first violation.
-    pub fn check(&self, update: &DelayUpdate) -> SpiceResult<()> {
+    pub fn check(&self, update: &WaveformUpdate) -> SpiceResult<()> {
         let check_sample = |time: Real, values: &[Real]| {
             if values.len() != self.width {
                 return Err(delay_error(format!(
@@ -174,7 +289,7 @@ impl DelayHistory {
     /// Checked standalone application for line-model unit tests. Production
     /// updates are committed together by StateHistory::accept_transaction.
     #[cfg(test)]
-    pub(crate) fn apply(&mut self, update: &DelayUpdate) -> SpiceResult<()> {
+    pub(crate) fn apply(&mut self, update: &WaveformUpdate) -> SpiceResult<()> {
         self.check(update)?;
         self.apply_validated(update);
         Ok(())
@@ -182,7 +297,7 @@ impl DelayHistory {
 
     /// Publish an update preflighted by the owning state transaction.
     /// No fallible validation remains after fixed state has been committed.
-    pub(super) fn apply_validated(&mut self, update: &DelayUpdate) {
+    pub(super) fn apply_validated(&mut self, update: &WaveformUpdate) {
         if let Some(reset) = &update.reset {
             self.times.clear();
             self.values.clear();
@@ -211,7 +326,7 @@ impl DelayHistory {
 /// All indices are logical oldest-first indices, including after pruning.
 #[derive(Clone, Copy)]
 pub(super) struct DelaySamples<'a, const N: usize> {
-    history: &'a DelayHistory,
+    history: &'a WaveformHistory,
 }
 
 impl<'a, const N: usize> DelaySamples<'a, N> {
@@ -225,12 +340,12 @@ impl<'a, const N: usize> DelaySamples<'a, N> {
     }
 }
 
-/// What one accepted transient point does to one device's [`DelayHistory`].
+/// What one accepted transient point does to one device's [`WaveformHistory`].
 ///
 /// Applied atomically after the fixed device state is committed: first
 /// `reset` (the transient start) or `drop_front`, then `append`.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct DelayUpdate {
+pub struct WaveformUpdate {
     /// Replace the whole history with these samples (C `MODEINITTRAN`
     /// initialization of `TRAdelays`).
     pub reset: Option<Vec<(Real, Vec<Real>)>>,
@@ -294,12 +409,12 @@ impl DelayContext<'_> {
 /// documentation). Every method is a pure function of its arguments: the
 /// device never mutates itself or the history.
 pub trait DelayLine: fmt::Debug {
-    /// Values recorded per accepted point.
-    fn width(&self) -> usize;
+    /// Construct empty model-specific accepted state.
+    fn new_history(&self) -> DelayHistory;
 
     /// The history at the transient start (`context.time` is 0), from the
     /// initial operating point or, under `uic`, the instance initial
-    /// conditions. Must set [`DelayUpdate::reset`].
+    /// conditions. Must return a reset update.
     ///
     /// # Errors
     /// Device-specific failures.
@@ -330,7 +445,7 @@ pub trait DelayLine: fmt::Debug {
 
 #[cfg(test)]
 mod tests {
-    use super::{DelayHistory, DelayUpdate};
+    use super::{WaveformHistory, WaveformUpdate};
 
     fn sample(time: f64, value: f64) -> (f64, Vec<f64>) {
         (time, vec![value, -value])
@@ -338,13 +453,13 @@ mod tests {
 
     #[test]
     fn typed_samples_preserve_ring_order_after_pruning() {
-        let mut history = DelayHistory::new(2);
+        let mut history = WaveformHistory::new(2);
         for time in 0_i32..32 {
             history
-                .apply(&DelayUpdate {
+                .apply(&WaveformUpdate {
                     append: Some(sample(f64::from(time), f64::from(time))),
                     drop_front: usize::from(time >= 4),
-                    ..DelayUpdate::default()
+                    ..WaveformUpdate::default()
                 })
                 .unwrap();
             let expected = ((time - 3).max(0)..=time)
@@ -363,12 +478,12 @@ mod tests {
 
     #[test]
     fn updates_reset_drop_and_append_atomically() {
-        let mut history = DelayHistory::new(2);
+        let mut history = WaveformHistory::new(2);
         assert!(history.is_empty());
         history
-            .apply(&DelayUpdate {
+            .apply(&WaveformUpdate {
                 reset: Some(vec![sample(-2., 1.), sample(-1., 1.), sample(0., 1.)]),
-                ..DelayUpdate::default()
+                ..WaveformUpdate::default()
             })
             .unwrap();
         assert_eq!(history.len(), 3);
@@ -378,10 +493,10 @@ mod tests {
         assert_eq!(history.value(usize::MAX, 0), None);
         assert_eq!(history.value(usize::MAX / 2 + 1, 0), None);
         history
-            .apply(&DelayUpdate {
+            .apply(&WaveformUpdate {
                 drop_front: 1,
                 append: Some(sample(0.5, 3.)),
-                ..DelayUpdate::default()
+                ..WaveformUpdate::default()
             })
             .unwrap();
         assert_eq!(history.len(), 3);
@@ -390,29 +505,29 @@ mod tests {
         assert_eq!(history.value(2, 0), Some(3.));
         let before = history.clone();
         for bad in [
-            DelayUpdate {
+            WaveformUpdate {
                 append: Some(sample(0.5, 1.)),
-                ..DelayUpdate::default()
+                ..WaveformUpdate::default()
             },
-            DelayUpdate {
+            WaveformUpdate {
                 drop_front: 4,
-                ..DelayUpdate::default()
+                ..WaveformUpdate::default()
             },
-            DelayUpdate {
+            WaveformUpdate {
                 append: Some((1., vec![1.])),
-                ..DelayUpdate::default()
+                ..WaveformUpdate::default()
             },
-            DelayUpdate {
+            WaveformUpdate {
                 append: Some(sample(1., f64::NAN)),
-                ..DelayUpdate::default()
+                ..WaveformUpdate::default()
             },
-            DelayUpdate {
+            WaveformUpdate {
                 reset: Some(vec![sample(0., 1.), sample(0., 1.)]),
-                ..DelayUpdate::default()
+                ..WaveformUpdate::default()
             },
-            DelayUpdate {
+            WaveformUpdate {
                 breakpoints: vec![f64::INFINITY],
-                ..DelayUpdate::default()
+                ..WaveformUpdate::default()
             },
         ] {
             assert!(history.apply(&bad).is_err(), "{bad:?}");

@@ -104,28 +104,28 @@ card 10 @netlists/sens_mesfet.cir:14:1 lines=14-15 continuations=1
   token 23 14:65 word "rs"
   token 24 14:67 equals "="
   token 25 14:68 number "4" value=4e0
-  token 26 14:70 word "cgs"
-  token 27 14:73 equals "="
-  token 28 14:74 number "2p" value=2e-12
-  token 29 14:77 word "cgd"
-  token 30 14:80 equals "="
-  token 31 14:81 number "0.5p" value=5e-13
-  token 32 14:86 word "pb"
-  token 33 14:88 equals "="
-  token 34 14:89 number "0.8" value=8e-1
-  token 35 14:93 word "is"
-  token 36 14:95 equals "="
-  token 37 14:96 number "1e-14" value=1e-14
-  token 38 14:102 word "fc"
-  token 39 14:104 equals "="
-  token 40 14:105 number "0.4" value=4e-1
-  token 41 14:109 word "kf"
-  token 42 14:111 equals "="
-  token 43 14:112 number "1e-26" value=1e-26
-  token 44 14:118 word "af"
-  token 45 14:120 equals "="
-  token 46 14:121 number "1.1" value=1.1e0
-  token 47 14:124 rparen ")"
+  token 26 15:3 word "cgs"
+  token 27 15:6 equals "="
+  token 28 15:7 number "2p" value=2e-12
+  token 29 15:10 word "cgd"
+  token 30 15:13 equals "="
+  token 31 15:14 number "0.5p" value=5e-13
+  token 32 15:19 word "pb"
+  token 33 15:21 equals "="
+  token 34 15:22 number "0.8" value=8e-1
+  token 35 15:26 word "is"
+  token 36 15:28 equals "="
+  token 37 15:29 number "1e-14" value=1e-14
+  token 38 15:35 word "fc"
+  token 39 15:37 equals "="
+  token 40 15:38 number "0.4" value=4e-1
+  token 41 15:42 word "kf"
+  token 42 15:44 equals "="
+  token 43 15:45 number "1e-26" value=1e-26
+  token 44 15:51 word "af"
+  token 45 15:53 equals "="
+  token 46 15:54 number "1.1" value=1.1e0
+  token 47 15:57 rparen ")"
 card 11 @netlists/sens_mesfet.cir:16:1 lines=16-16 continuations=0
   raw: ".model zp pmf(vto=-1.2 beta=2m cgs=1p cgd=1p pb=0.9 alpha=3)"
   kind: dot(.model)

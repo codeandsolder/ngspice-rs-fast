@@ -9,7 +9,8 @@
 //! (instance setters such as `m=2`) or an error. Every failure after a
 //! recognised prefix is committed and carries a byte column.
 
-use crate::primitives::{SourceLoc, SpiceError, SpiceResult, parse_spice_number_prefix};
+use crate::netlist::source::SourcePosition;
+use crate::primitives::{SpiceError, SpiceResult, parse_spice_number_prefix};
 use winnow::Parser as _;
 use winnow::combinator::{opt, peek};
 use winnow::error::ErrMode;
@@ -22,7 +23,7 @@ use crate::netlist::expr::{MAX_NESTING, SourceSpan};
 use super::expression::{Ctx, Fail, In, Res, cut, into_error};
 
 /// Parses the longest behavioural expression at the start of `text` (whose
-/// first byte is at `column` on `origin`'s line). Returns the expression and
+/// first byte is at `origin`). Returns the expression and
 /// the number of bytes consumed, trailing whitespace included.
 ///
 /// In a `=pwl(` line (`verbatim`) a `{...}` or `'...'` group is a numparam
@@ -34,8 +35,7 @@ use super::expression::{Ctx, Fail, In, Res, cut, into_error};
 /// expression.
 pub(super) fn parse_prefix(
     text: &str,
-    origin: &SourceLoc,
-    column: u32,
+    origin: SourcePosition<'_>,
     verbatim: bool,
     auto_gnd: bool,
 ) -> SpiceResult<(BehaviouralExpression, usize)> {
@@ -56,7 +56,6 @@ pub(super) fn parse_prefix(
         input: prepared.as_str(),
         state: Ctx {
             origin,
-            column,
             total: prepared.len(),
             depth: 0,
             shadowing: &[],
@@ -77,10 +76,10 @@ pub(super) fn parse_prefix(
             let consumed = prepared.len() - input.input.len();
             let start_offset = text.len() - text.trim_start().len();
             let written = text[start_offset..consumed].trim_end();
-            let span = SourceSpan {
-                start: origin.at_column(column + offset_u32(start_offset)),
-                end: origin.at_column(column + offset_u32(start_offset + written.len())),
-            };
+            let span = SourceSpan::from_positions(
+                origin.advance(start_offset),
+                origin.advance(start_offset + written.len()),
+            );
             Ok((
                 BehaviouralExpression {
                     text: written.to_owned(),
@@ -92,7 +91,7 @@ pub(super) fn parse_prefix(
             ))
         }
         Err(ErrMode::Backtrack(fail) | ErrMode::Cut(fail)) => {
-            Err(into_error(origin, column, prepared.len(), fail))
+            Err(into_error(origin, prepared.len(), fail))
         }
         Err(ErrMode::Incomplete(_)) => unreachable!("complete input"),
     }
@@ -104,15 +103,14 @@ pub(super) fn parse_prefix(
 /// As [`parse_prefix`], plus anything left after a complete expression.
 pub(super) fn parse_complete(
     text: &str,
-    origin: &SourceLoc,
-    column: u32,
+    origin: SourcePosition<'_>,
     verbatim: bool,
     auto_gnd: bool,
 ) -> SpiceResult<BehaviouralExpression> {
-    let (expression, consumed) = parse_prefix(text, origin, column, verbatim, auto_gnd)?;
+    let (expression, consumed) = parse_prefix(text, origin, verbatim, auto_gnd)?;
     if consumed < text.len() {
         return Err(SpiceError::parse(
-            origin.at_column(column + offset_u32(consumed)),
+            origin.advance(consumed).location(),
             format!(
                 "unexpected '{}' after a complete behavioural expression",
                 text[consumed..].chars().next().unwrap_or(' ')
@@ -120,10 +118,6 @@ pub(super) fn parse_complete(
         ));
     }
     Ok(expression)
-}
-
-fn offset_u32(offset: usize) -> u32 {
-    u32::try_from(offset).unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,16 +133,26 @@ fn ws(input: &mut In<'_>) -> Res<()> {
 }
 
 fn span(input: &In<'_>, start: usize, end: usize) -> SourceSpan {
-    SourceSpan {
-        start: input.state.location(start),
-        end: input.state.location(end),
-    }
+    SourceSpan::from_positions(input.state.position(start), input.state.position(end))
 }
 
 fn joined(lhs: &BExpr, rhs: &BExpr) -> SourceSpan {
     SourceSpan {
         start: lhs.span.start.clone(),
         end: rhs.span.end.clone(),
+        logical: lhs.span.logical.start..rhs.span.logical.end,
+    }
+}
+
+fn binary(op: BBinaryOp, lhs: BExpr, rhs: BExpr) -> BExpr {
+    let span = joined(&lhs, &rhs);
+    BExpr {
+        kind: BExprKind::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        },
+        span,
     }
 }
 
@@ -250,15 +254,7 @@ fn binary_level(input: &mut In<'_>, options: Options, level: usize) -> Res<BExpr
         };
         take(symbol.len()).void().parse_next(input)?;
         let rhs = binary_level(input, options, level + 1)?;
-        let span = joined(&lhs, &rhs);
-        lhs = BExpr {
-            kind: BExprKind::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            },
-            span,
-        };
+        lhs = binary(op, lhs, rhs);
     }
 }
 
@@ -284,6 +280,7 @@ fn unary(input: &mut In<'_>, options: Options) -> Res<BExpr> {
     let operand = unary(input, options)?;
     leave(input);
     let end = operand.span.end.clone();
+    let logical = input.state.position(start).logical_offset()..operand.span.logical.end;
     Ok(BExpr {
         kind: BExprKind::Unary {
             op,
@@ -292,6 +289,7 @@ fn unary(input: &mut In<'_>, options: Options) -> Res<BExpr> {
         span: SourceSpan {
             start: input.state.location(start),
             end,
+            logical,
         },
     })
 }
@@ -317,15 +315,7 @@ fn power(input: &mut In<'_>, options: Options) -> Res<BExpr> {
         } else {
             primary(input, options)?
         };
-        let span = joined(&lhs, &rhs);
-        lhs = BExpr {
-            kind: BExprKind::Binary {
-                op: BBinaryOp::Pow,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            },
-            span,
-        };
+        lhs = binary(BBinaryOp::Pow, lhs, rhs);
     }
 }
 
@@ -546,17 +536,20 @@ fn numparam_value(input: &mut In<'_>) -> Res<BExpr> {
         return Err(cut(start, format!("unterminated '{open}' value")));
     };
     let inner = &text[1..=length];
-    let column = input.state.location(start).column + 1;
-    let parsed =
-        super::expression::parse_delimited(inner, input.state.origin, column, true, open == '\'')
-            .map_err(|error| {
-            ErrMode::Cut(Fail {
-                remaining: start,
-                message: error.to_string(),
-                unsupported: false,
-                resolved: Some(error),
-            })
-        })?;
+    let parsed = super::expression::parse_delimited(
+        inner,
+        input.state.position(start).advance(1),
+        true,
+        open == '\'',
+    )
+    .map_err(|error| {
+        ErrMode::Cut(Fail {
+            remaining: start,
+            message: error.to_string(),
+            unsupported: false,
+            resolved: Some(error),
+        })
+    })?;
     take(length + 2).void().parse_next(input)?;
     Ok(BExpr {
         kind: BExprKind::Value(Box::new(parsed)),
@@ -567,11 +560,12 @@ fn numparam_value(input: &mut In<'_>) -> Res<BExpr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::SourceLoc;
     use std::path::PathBuf;
 
     fn parse(text: &str) -> BehaviouralExpression {
         let origin = SourceLoc::new(PathBuf::from("t.cir"), 1, 1);
-        parse_complete(text, &origin, 1, false, true).unwrap()
+        parse_complete(text, SourcePosition::physical(&origin), false, true).unwrap()
     }
 
     fn shape(expr: &BExpr) -> String {
@@ -635,10 +629,12 @@ mod tests {
     #[test]
     fn the_expression_stops_where_c_stops() {
         let origin = SourceLoc::new(PathBuf::from("t.cir"), 1, 1);
-        let (expression, consumed) = parse_prefix("2*v(1) m=3", &origin, 1, false, true).unwrap();
+        let (expression, consumed) =
+            parse_prefix("2*v(1) m=3", SourcePosition::physical(&origin), false, true).unwrap();
         assert_eq!(expression.text, "2*v(1)");
         assert_eq!(consumed, 7);
-        let (_, consumed) = parse_prefix("2 3", &origin, 1, false, true).unwrap();
+        let (_, consumed) =
+            parse_prefix("2 3", SourcePosition::physical(&origin), false, true).unwrap();
         assert_eq!(consumed, 2);
     }
 
@@ -646,7 +642,8 @@ mod tests {
     fn malformed_expressions_are_positioned_errors() {
         let origin = SourceLoc::new(PathBuf::from("t.cir"), 1, 1);
         for (text, column) in [("2*", 3), ("(1+2", 5), ("v(a", 4), ("1 ? 2", 6), ("", 1)] {
-            let error = parse_complete(text, &origin, 1, false, true).unwrap_err();
+            let error =
+                parse_complete(text, SourcePosition::physical(&origin), false, true).unwrap_err();
             match error {
                 SpiceError::Parse { location, .. } => assert_eq!(location.column, column, "{text}"),
                 other => panic!("{text}: {other}"),
@@ -657,7 +654,13 @@ mod tests {
     #[test]
     fn verbatims_keep_numparam_values() {
         let origin = SourceLoc::new(PathBuf::from("t.cir"), 1, 1);
-        let parsed = parse_complete("pwl(v(1), 0, 0, {a*2}, 1)", &origin, 1, true, true).unwrap();
+        let parsed = parse_complete(
+            "pwl(v(1), 0, 0, {a*2}, 1)",
+            SourcePosition::physical(&origin),
+            true,
+            true,
+        )
+        .unwrap();
         assert_eq!(shape(&parsed.root), "pwl[v(1),0,0,{a*2},1]");
     }
 }

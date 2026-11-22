@@ -338,7 +338,7 @@ fn the_netlist_keeps_the_card_and_the_writer_round_trips_it() {
             .netlist
             .cards
             .iter()
-            .any(|card| card.kind == ScopedCardKind::Measure)
+            .any(|card| card.kind == ScopedCardKind::Measure(0))
     );
     let netlist = Parser::new().parse_deck(&deck).unwrap();
     assert_eq!(netlist.top_level_device_count(), 2);

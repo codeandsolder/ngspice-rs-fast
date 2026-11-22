@@ -26,8 +26,8 @@ use std::sync::Arc;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{
-    AnalysisCard, Netlist, NodeHint, NodeHintCard, NodeHintValue, ParameterAssignment,
-    ParameterKind,
+    AnalysisCard, DeviceInstance, ModelCard, Netlist, NodeHint, NodeHintCard, NodeHintValue,
+    ParameterAssignment, ParameterKind, Subcircuit,
 };
 use crate::netlist::eval::{EvalBudget, EvalLimits, FunctionScope, ParamScope};
 
@@ -182,22 +182,13 @@ pub fn literalize_with(
 ) -> SpiceResult<ElaboratedNetlist> {
     let mut out = netlist.clone();
     let mut sites = Vec::new();
-    for (di, device) in out.devices.iter_mut().enumerate() {
-        literalize_parameters(&mut device.parameters, &scope, budget, &mut sites, |p| {
-            SiteKind::DeviceParameter {
-                device: di,
-                parameter: p,
-            }
-        })?;
-    }
-    for (mi, model) in out.models.iter_mut().enumerate() {
-        literalize_parameters(&mut model.parameters, &scope, budget, &mut sites, |p| {
-            SiteKind::ModelParameter {
-                model: mi,
-                parameter: p,
-            }
-        })?;
-    }
+    literalize_device_models(
+        &mut out.devices,
+        &mut out.models,
+        &scope,
+        budget,
+        Some(&mut sites),
+    )?;
     for (ai, (before, card)) in netlist.analyses.iter().zip(&mut out.analyses).enumerate() {
         literalize_analysis_into(before, card, &scope, budget)?;
         for e in &before.expressions {
@@ -232,17 +223,89 @@ pub fn literalize_with(
         &mut out.initial_conditions,
         &scope,
         budget,
-        &mut sites,
+        Some(&mut sites),
         |c, e| SiteKind::InitialCondition { card: c, entry: e },
     )?;
-    literalize_hints(&mut out.nodesets, &scope, budget, &mut sites, |c, e| {
-        SiteKind::Nodeset { card: c, entry: e }
-    })?;
+    literalize_hints(
+        &mut out.nodesets,
+        &scope,
+        budget,
+        Some(&mut sites),
+        |c, e| SiteKind::Nodeset { card: c, entry: e },
+    )?;
     Ok(ElaboratedNetlist {
         netlist: out,
         scope,
         sites,
     })
+}
+
+fn literalize_device_models(
+    devices: &mut [DeviceInstance],
+    models: &mut [ModelCard],
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+    mut sites: Option<&mut Vec<ResolvedSite>>,
+) -> SpiceResult<()> {
+    for (di, device) in devices.iter_mut().enumerate() {
+        literalize_parameters(
+            &mut device.parameters,
+            scope,
+            budget,
+            sites.as_deref_mut(),
+            |p| SiteKind::DeviceParameter {
+                device: di,
+                parameter: p,
+            },
+        )?;
+    }
+    for (mi, model) in models.iter_mut().enumerate() {
+        literalize_parameters(
+            &mut model.parameters,
+            scope,
+            budget,
+            sites.as_deref_mut(),
+            |p| SiteKind::ModelParameter {
+                model: mi,
+                parameter: p,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Instance-scoped semantic values, without copying lexical declarations or
+/// creating a synthetic root deck.
+pub(crate) struct LiteralizedBody {
+    pub(crate) devices: Vec<DeviceInstance>,
+    pub(crate) models: Vec<ModelCard>,
+    pub(crate) initial_conditions: Vec<NodeHintCard>,
+    pub(crate) nodesets: Vec<NodeHintCard>,
+}
+
+pub(crate) fn literalize_body(
+    body: &Subcircuit,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<LiteralizedBody> {
+    let mut values = LiteralizedBody {
+        devices: body.devices.clone(),
+        models: body.models.clone(),
+        initial_conditions: body.initial_conditions.clone(),
+        nodesets: body.nodesets.clone(),
+    };
+    literalize_device_models(&mut values.devices, &mut values.models, scope, budget, None)?;
+    literalize_hints(
+        &mut values.initial_conditions,
+        scope,
+        budget,
+        None,
+        |c, e| SiteKind::InitialCondition { card: c, entry: e },
+    )?;
+    literalize_hints(&mut values.nodesets, scope, budget, None, |c, e| {
+        SiteKind::Nodeset { card: c, entry: e }
+    })?;
+    Ok(values)
 }
 
 /// Evaluate .ic and .nodeset entries without elaborating the whole deck.
@@ -258,13 +321,12 @@ pub fn literalize_node_hints(
     scope: &ParamScope,
     budget: &mut EvalBudget,
 ) -> SpiceResult<(Vec<NodeHintCard>, Vec<NodeHintCard>)> {
-    let mut sites = Vec::new();
     let mut initial = netlist.initial_conditions.clone();
     let mut nodesets = netlist.nodesets.clone();
-    literalize_hints(&mut initial, scope, budget, &mut sites, |c, e| {
+    literalize_hints(&mut initial, scope, budget, None, |c, e| {
         SiteKind::InitialCondition { card: c, entry: e }
     })?;
-    literalize_hints(&mut nodesets, scope, budget, &mut sites, |c, e| {
+    literalize_hints(&mut nodesets, scope, budget, None, |c, e| {
         SiteKind::Nodeset { card: c, entry: e }
     })?;
     Ok((initial, nodesets))
@@ -274,7 +336,7 @@ fn literalize_hints(
     cards: &mut [NodeHintCard],
     scope: &ParamScope,
     budget: &mut EvalBudget,
-    sites: &mut Vec<ResolvedSite>,
+    mut sites: Option<&mut Vec<ResolvedSite>>,
     kind: impl Fn(usize, usize) -> SiteKind,
 ) -> SpiceResult<()> {
     for (ci, card) in cards.iter_mut().enumerate() {
@@ -294,16 +356,18 @@ fn literalize_hints(
                     ),
                     other => other,
                 })?;
-            sites.push(ResolvedSite {
-                kind: kind(ci, ei),
-                original: if expression.braced {
-                    format!("{{{}}}", expression.text)
-                } else {
-                    expression.text.clone()
-                },
-                location: expression.span.start.clone(),
-                value,
-            });
+            if let Some(sites) = sites.as_deref_mut() {
+                sites.push(ResolvedSite {
+                    kind: kind(ci, ei),
+                    original: if expression.braced {
+                        format!("{{{}}}", expression.text)
+                    } else {
+                        expression.text.clone()
+                    },
+                    location: expression.span.start.clone(),
+                    value,
+                });
+            }
             // numparam's text, read back by INPevaluate as the card is.
             let text = format_literal(value);
             hint.value = NodeHintValue::Literal {
@@ -319,7 +383,7 @@ fn literalize_parameters(
     parameters: &mut [ParameterAssignment],
     scope: &ParamScope,
     budget: &mut EvalBudget,
-    sites: &mut Vec<ResolvedSite>,
+    mut sites: Option<&mut Vec<ResolvedSite>>,
     kind: impl Fn(usize) -> SiteKind,
 ) -> SpiceResult<()> {
     for (index, parameter) in parameters.iter_mut().enumerate() {
@@ -357,12 +421,14 @@ fn literalize_parameters(
                 ),
                 other => other,
             })?;
-        sites.push(ResolvedSite {
-            kind: kind(index),
-            original: parameter.value.clone(),
-            location: expression.span.start.clone(),
-            value,
-        });
+        if let Some(sites) = sites.as_deref_mut() {
+            sites.push(ResolvedSite {
+                kind: kind(index),
+                original: parameter.value.clone(),
+                location: expression.span.start.clone(),
+                value,
+            });
+        }
         parameter.value = format_literal(value);
         parameter.kind = ParameterKind::Scalar;
     }

@@ -356,7 +356,7 @@ pub struct PlotOutputs {
 /// Whatever [`Selection::resolve`], [`measure::resolve`] or
 /// [`fourier::resolve`] report for this plot.
 pub fn resolve_outputs(
-    plot: &Plot,
+    plot: Plot,
     scheduled: &ScheduledAnalysis,
     output: &OutputCards,
     measures: &[MeasureCard],
@@ -369,6 +369,7 @@ pub fn resolve_outputs(
         measures,
         fourier_cards,
         &crate::netlist::eval::ParamScope::root(&[])?,
+        None,
     )
 }
 
@@ -377,29 +378,30 @@ pub fn resolve_outputs(
 /// # Errors
 /// As [`resolve_outputs`], including scalar expression evaluation errors.
 pub fn resolve_outputs_with_scope(
-    plot: &Plot,
+    plot: Plot,
     scheduled: &ScheduledAnalysis,
     output: &OutputCards,
     measures: &[MeasureCard],
     fourier_cards: &[FourierCard],
     scope: &crate::netlist::eval::ParamScope,
+    fourier_settings: Option<fourier::FourierSettings>,
 ) -> SpiceResult<PlotOutputs> {
     let kind = scheduled.kind;
-    if is_operating_point_prelude(plot) {
+    if is_operating_point_prelude(&plot) {
         return Ok(PlotOutputs {
-            written: written_selection(plot, scheduled, output)?.apply(plot)?,
+            written: written_selection(&plot, scheduled, output)?.into_plot(plot)?,
             printed: None,
             measurements: Vec::new(),
             fourier: Vec::new(),
         });
     }
-    let own = own_cards(plot, scheduled, output)?;
-    let selection = Selection::resolve_refs(plot, kind, own.write_requests())?;
+    let own = own_cards(&plot, scheduled, output)?;
+    let selection = Selection::resolve_refs(&plot, kind, own.write_requests())?;
     let mut print_requests = own.print_requests().peekable();
     let mut printed = if print_requests.peek().is_none() {
         None
     } else {
-        Some(Selection::resolve_refs(plot, kind, print_requests)?.to_text(plot)?)
+        Some(Selection::resolve_refs(&plot, kind, print_requests)?.to_text(&plot)?)
     };
     for card in own
         .prints
@@ -407,29 +409,51 @@ pub fn resolve_outputs_with_scope(
         .filter(|card| card.ascii_plot && !card.requests.is_empty())
     {
         let selected =
-            Selection::resolve_refs(plot, kind, card.requests.iter().copied())?.apply(plot)?;
+            Selection::resolve_refs(&plot, kind, card.requests.iter().copied())?.apply(&plot)?;
         printed
             .get_or_insert_with(String::new)
             .push_str(&super::asciiplot::render(&selected)?);
     }
     let measurements = if scheduled.last_of_kind {
         let own = measures.iter().filter(|card| card.analysis == kind);
-        measure::resolve_refs_with_scope(plot, kind, own, scope)?
+        measure::resolve_refs_with_scope(&plot, kind, own, scope)?
     } else {
         Vec::new()
     };
-    let fourier = if scheduled.last_of_kind && kind == AnalysisKind::Transient {
-        fourier::resolve(plot, kind, fourier_cards)?
-    } else {
-        Vec::new()
-    };
-    let written = selection.apply(plot)?;
+    let (written, fourier) =
+        finish_projection(plot, selection, scheduled, fourier_cards, fourier_settings)?;
     Ok(PlotOutputs {
         written,
         printed,
         measurements,
         fourier,
     })
+}
+
+// The configured Fourier path historically projected the output before
+// evaluating Fourier settings. Keep that error order for narrowed output;
+// an identity projection cannot fail after its own schema was resolved.
+fn finish_projection(
+    plot: Plot,
+    selection: Selection,
+    scheduled: &ScheduledAnalysis,
+    cards: &[FourierCard],
+    settings: Option<fourier::FourierSettings>,
+) -> SpiceResult<(Plot, Vec<FourierAnalysis>)> {
+    if !scheduled.last_of_kind || scheduled.kind != AnalysisKind::Transient {
+        return Ok((selection.into_plot(plot)?, Vec::new()));
+    }
+    if let Some(settings) = settings {
+        if !selection.is_full() {
+            let written = selection.apply(&plot)?;
+            let fourier = fourier::resolve_with_settings(&plot, scheduled.kind, cards, settings)?;
+            return Ok((written, fourier));
+        }
+        let fourier = fourier::resolve_with_settings(&plot, scheduled.kind, cards, settings)?;
+        return Ok((selection.into_plot(plot)?, fourier));
+    }
+    let fourier = fourier::resolve(&plot, scheduled.kind, cards)?;
+    Ok((selection.into_plot(plot)?, fourier))
 }
 
 /// The `.save`/`.print` selection one scheduled plot is written with: the

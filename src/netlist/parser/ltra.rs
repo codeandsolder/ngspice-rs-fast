@@ -30,7 +30,7 @@ use crate::netlist::ast::{DeviceInstance, InitialCondition, ParameterAssignment,
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Failure, Input, ParsedCard, Result, keyword, location};
-use super::syntax::{canonical_node, equals, malformed, name, named, value};
+use super::syntax::{canonical_node, equals, malformed, name, named, named_device, value};
 use super::vector::{numeric, positioned};
 
 /// Scalar setters of `LTRApTable`.
@@ -40,16 +40,7 @@ const SCALARS: [&str; 4] = ["v1", "v2", "i1", "i2"];
 const IC_COMPONENTS: [&str; 4] = ["v1", "i1", "v2", "i2"];
 
 pub(super) fn ltra_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|token: &Token| {
-            token.is_name_like()
-                && token
-                    .text
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&'o'))
-        })
-        .parse_next(input)?;
+    let (instance, _) = named_device("o").parse_next(input)?;
     cut_err(move |input: &mut Input<'_>| body(input, instance)).parse_next(input)
 }
 

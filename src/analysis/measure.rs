@@ -447,7 +447,7 @@ impl<'a> Operand<'a> {
 
     /// The operand's value at one plot point.
     fn value(&self, index: usize) -> SpiceResult<Real> {
-        let Some(point) = self.plot.points.get(index) else {
+        let Some(point) = self.plot.points().get(index) else {
             return Err(SpiceError::Numerical {
                 context: format!("measure {}", self.name),
                 message: format!("the plot has no point {index}"),
@@ -844,7 +844,7 @@ fn margin(
     phase_margin: bool,
     card: &MeasureCard,
 ) -> SpiceResult<(Real, Real)> {
-    if axis.name != "frequency" || !operand.plot.flags.is_complex() {
+    if axis.name != "frequency" || !operand.plot.flags().is_complex() {
         return Err(unsupported(
             card,
             "margin measurements require complex AC/SP data".into(),
@@ -853,7 +853,7 @@ fn margin(
     let mut previous: Option<(Real, Real, Real)> = None;
     let mut raw_previous = 0.;
     let mut offset = 0.;
-    for (i, point) in operand.plot.points.iter().enumerate() {
+    for (i, point) in operand.plot.points().iter().enumerate() {
         let value = operand.column.value(point)?;
         let db = 20. * value.re.hypot(value.im).log10();
         let raw = value.im.atan2(value.re).to_degrees();
@@ -1196,9 +1196,10 @@ mod tests {
 
     /// A real sweep plot: `time` then `v(out)`, from `(time, value)` rows.
     fn tran(rows: &[(Real, Real)]) -> Plot {
-        let mut plot = Plot::new("tran1", "Transient Analysis", PlotFlags::Real);
+        let mut plot = Plot::builder("tran1", "Transient Analysis", PlotFlags::Real);
         plot.push_variable(Variable::new("time", "time"));
         plot.push_variable(Variable::new("v(out)", "voltage"));
+        let mut plot = plot.build();
         for (time, value) in rows {
             plot.push_point(vec![Complex::real(*time), Complex::real(*value)])
                 .unwrap();
@@ -1895,7 +1896,7 @@ mod tests {
         assert!(error.to_string().contains("v(nosuch)"), "{error}");
 
         // An axis the plot does not carry.
-        let no_time = Plot::new("op1", "Operating Point", PlotFlags::Real);
+        let no_time = Plot::new("op1", "Operating Point", PlotFlags::Real, Vec::new());
         let error = resolve(
             &plot,
             AnalysisKind::Ac,
@@ -1940,9 +1941,10 @@ mod tests {
 
         // An AC plot: the frequency axis and the real part of a complex vector,
         // exactly as C's `get_value()` defaults.
-        let mut ac = Plot::new("ac1", "AC Analysis", PlotFlags::Complex);
+        let mut ac = Plot::builder("ac1", "AC Analysis", PlotFlags::Complex);
         ac.push_variable(Variable::complex("frequency", "frequency"));
         ac.push_variable(Variable::complex("v(out)", "voltage"));
+        let mut ac = ac.build();
         for frequency in [100.0, 200.0, 400.0] {
             ac.push_point(vec![
                 Complex::real(frequency),
@@ -1962,7 +1964,7 @@ mod tests {
     fn a_deck_without_measure_cards_produces_no_results_and_no_failure() {
         // The CLI relies on this: a plot with no measurement axis (`op`) and no
         // `.measure` card must not fail.
-        let op = Plot::new("op1", "Operating Point", PlotFlags::Real);
+        let op = Plot::new("op1", "Operating Point", PlotFlags::Real, Vec::new());
         assert_eq!(
             resolve(&op, AnalysisKind::OperatingPoint, &[]).unwrap(),
             Vec::new()

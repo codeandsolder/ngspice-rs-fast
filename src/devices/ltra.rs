@@ -112,7 +112,10 @@
 
 pub mod convolution;
 
-use crate::devices::delay::{DelayContext, DelayHistory, DelayLine, DelaySamples, DelayUpdate};
+use crate::devices::delay::{
+    DelayContext, DelayHistory, DelayLine, DelaySamples, DelayUpdate, WaveformHistory,
+    WaveformUpdate,
+};
 use crate::devices::linear::LinearContext;
 use crate::devices::models::{ModelContext, ModelFamily, ModelResolver};
 use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit};
@@ -843,7 +846,7 @@ impl LossyLine {
     }
 
     /// `ltraload.c` for a transient load at `time`.
-    fn transient_load(&self, history: &DelayHistory, time: Real) -> SpiceResult<Load> {
+    fn transient_load(&self, history: &WaveformHistory, time: Real) -> SpiceResult<Load> {
         let history = history.samples::<4>()?;
         let coefficients = self.coefficients(history, time);
         let tdover =
@@ -1166,7 +1169,7 @@ impl Device for LossyLine {
                         self.name
                     ))
                 })?;
-                let load = self.transient_load(history, time)?;
+                let load = self.transient_load(history.as_waveform()?, time)?;
                 self.transient_entries(load.first, context.gmin)
                     .stamp(context)?;
                 context.stamp_rhs(self.ibr1(), load.inputs[0])?;
@@ -1227,8 +1230,8 @@ impl Device for LossyLine {
 }
 
 impl DelayLine for LossyLine {
-    fn width(&self) -> usize {
-        4
+    fn new_history(&self) -> DelayHistory {
+        DelayHistory::waveform(4)
     }
 
     /// The `t = 0` sample (C stores the operating point at `CKTtimeIndex`
@@ -1241,10 +1244,10 @@ impl DelayLine for LossyLine {
                 "src/spicelib/devices/ltra/ltraload.c (MODEINITTRAN | MODEUIC)",
             ));
         }
-        Ok(DelayUpdate {
+        Ok(DelayUpdate::Waveform(WaveformUpdate {
             reset: Some(vec![(context.time, self.port_values(context).to_vec())]),
-            ..DelayUpdate::default()
-        })
+            ..WaveformUpdate::default()
+        }))
     }
 
     /// `ltraacct.c` (without `trytocompact`): record the point, and request a
@@ -1255,6 +1258,7 @@ impl DelayLine for LossyLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<DelayUpdate> {
+        let history = history.as_waveform()?;
         let m = &self.model;
         let values = self.port_values(context);
         let history = history.samples::<4>()?;
@@ -1289,9 +1293,9 @@ impl DelayLine for LossyLine {
             a.max(b).max(c) - a.min(b).min(c)
                 >= (50.0 * (context.reltol / 3.0 * (a + b + c) + context.abstol)).abs()
         };
-        let mut update = DelayUpdate {
+        let mut update = WaveformUpdate {
             append: Some((time, values.to_vec())),
-            ..DelayUpdate::default()
+            ..WaveformUpdate::default()
         };
         let fire = (self.slope_changed(d1, d2) && check(v1, v2, v3))
             || (self.slope_changed(d3, d4) && check(v4, v5, v6));
@@ -1309,7 +1313,7 @@ impl DelayLine for LossyLine {
                 update.breakpoints.push(when);
             }
         }
-        Ok(update)
+        Ok(DelayUpdate::Waveform(update))
     }
 
     /// `ltratrun.c` (the reachable part: `LTRAlteConType` is always
@@ -1319,6 +1323,7 @@ impl DelayLine for LossyLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<Option<Real>> {
+        let history = history.as_waveform()?;
         let m = &self.model;
         if !matches!(m.case, LtraCase::Lc | LtraCase::Rlc) {
             return Ok(None);
@@ -1394,7 +1399,7 @@ mod tests {
     #[test]
     fn delayed_values_preserve_strict_bracket_and_mixed_fallback() {
         let mut line = line("l=1 c=1 len=1 mixedinterp");
-        let mut history = DelayHistory::new(4);
+        let mut history = WaveformHistory::new(4);
         // At t=2.5 the interpolated third component overshoots the [0,1]
         // interval, whereas the first component follows a quadratic.
         for (time, values) in [
@@ -1403,9 +1408,9 @@ mod tests {
             (2., vec![4., 2., 1., -2.]),
         ] {
             history
-                .apply(&DelayUpdate {
+                .apply(&WaveformUpdate {
                     append: Some((time, values)),
-                    ..DelayUpdate::default()
+                    ..WaveformUpdate::default()
                 })
                 .unwrap();
         }
@@ -1431,13 +1436,13 @@ mod tests {
             "r=1 g=1 len=1",
         ] {
             let line = line(model);
-            let mut history = DelayHistory::new(4);
+            let mut history = WaveformHistory::new(4);
             for time in 0..4 {
                 let t = Real::from(time);
                 history
-                    .apply(&DelayUpdate {
+                    .apply(&WaveformUpdate {
                         append: Some((t, vec![t, 0.5 * t, -t, -0.5 * t])),
-                        ..DelayUpdate::default()
+                        ..WaveformUpdate::default()
                     })
                     .unwrap();
             }

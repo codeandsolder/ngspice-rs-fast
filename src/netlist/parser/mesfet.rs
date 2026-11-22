@@ -29,19 +29,10 @@ use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Input, ParsedCard, Result, gap};
-use super::syntax::{canonical_node, equals, malformed, name, named, value};
+use super::syntax::{canonical_node, equals, malformed, name, named, named_device, value};
 
 pub(super) fn mesfet_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|token: &Token| {
-            token.is_name_like()
-                && token
-                    .text
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&b'z'))
-        })
-        .parse_next(input)?;
+    let (instance, _) = named_device("z").parse_next(input)?;
     let (drain, gate, source, model, parameters) = cut_err((
         name("drain terminal"),
         name("gate terminal"),

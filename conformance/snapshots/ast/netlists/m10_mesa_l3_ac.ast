@@ -46,9 +46,9 @@ scope root
         [4] name="vto" kind=scalar value="-1" @netlists/m10_mesa_l3_ac.cir:6:43
         [5] name="eta" kind=scalar value="1.5" @netlists/m10_mesa_l3_ac.cir:6:50
         [6] name="sigma0" kind=scalar value="0.02" @netlists/m10_mesa_l3_ac.cir:6:58
-        [7] name="vsigmat" kind=scalar value="1.37" @netlists/m10_mesa_l3_ac.cir:6:70
-        [8] name="delta" kind=scalar value="5" @netlists/m10_mesa_l3_ac.cir:6:83
-        [9] name="beta" kind=scalar value="0.0085" @netlists/m10_mesa_l3_ac.cir:6:91
+        [7] name="vsigmat" kind=scalar value="1.37" @netlists/m10_mesa_l3_ac.cir:7:3
+        [8] name="delta" kind=scalar value="5" @netlists/m10_mesa_l3_ac.cir:7:16
+        [9] name="beta" kind=scalar value="0.0085" @netlists/m10_mesa_l3_ac.cir:7:24
   subcircuits (0):
   analyses (1):
     analysis [0] kind=ac @netlists/m10_mesa_l3_ac.cir:10:1

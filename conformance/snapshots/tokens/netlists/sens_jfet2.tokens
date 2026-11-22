@@ -103,45 +103,45 @@ card 10 @netlists/sens_jfet2.cir:16:1 lines=16-18 continuations=2
   token 22 16:64 word "cds"
   token 23 16:67 equals "="
   token 24 16:68 number "1p" value=1e-12
-  token 25 16:71 word "cgs"
-  token 26 16:74 equals "="
-  token 27 16:75 number "2p" value=2e-12
-  token 28 16:78 word "cgd"
-  token 29 16:81 equals "="
-  token 30 16:82 number "1p" value=1e-12
-  token 31 16:85 word "vbi"
-  token 32 16:88 equals "="
-  token 33 16:89 number "0.8" value=8e-1
-  token 34 16:93 word "is"
-  token 35 16:95 equals "="
-  token 36 16:96 number "1e-14" value=1e-14
-  token 37 16:102 word "n"
-  token 38 16:103 equals "="
-  token 39 16:104 number "1.2" value=1.2000000000000002e0
-  token 40 16:108 word "fc"
-  token 41 16:110 equals "="
-  token 42 16:111 number "0.4" value=4e-1
-  token 43 16:115 word "ibd"
-  token 44 16:118 equals "="
-  token 45 16:119 number "1e-9" value=1e-9
-  token 46 16:124 word "vbd"
-  token 47 16:127 equals "="
-  token 48 16:128 number "1.2" value=1.2000000000000002e0
-  token 49 16:132 word "taud"
-  token 50 16:136 equals "="
-  token 51 16:137 number "1e-9" value=1e-9
-  token 52 16:142 word "taug"
-  token 53 16:146 equals "="
-  token 54 16:147 number "1e-9" value=1e-9
-  token 55 16:152 word "vst"
-  token 56 16:155 equals "="
-  token 57 16:156 number "0.5" value=5e-1
-  token 58 16:160 word "ver"
-  token 59 16:163 equals "="
-  token 60 16:164 number "1" value=1e0
-  token 61 16:166 word "tnom"
-  token 62 16:170 equals "="
-  token 63 16:171 number "30" value=3e1
+  token 25 17:3 word "cgs"
+  token 26 17:6 equals "="
+  token 27 17:7 number "2p" value=2e-12
+  token 28 17:10 word "cgd"
+  token 29 17:13 equals "="
+  token 30 17:14 number "1p" value=1e-12
+  token 31 17:17 word "vbi"
+  token 32 17:20 equals "="
+  token 33 17:21 number "0.8" value=8e-1
+  token 34 17:25 word "is"
+  token 35 17:27 equals "="
+  token 36 17:28 number "1e-14" value=1e-14
+  token 37 17:34 word "n"
+  token 38 17:35 equals "="
+  token 39 17:36 number "1.2" value=1.2000000000000002e0
+  token 40 17:40 word "fc"
+  token 41 17:42 equals "="
+  token 42 17:43 number "0.4" value=4e-1
+  token 43 17:47 word "ibd"
+  token 44 17:50 equals "="
+  token 45 17:51 number "1e-9" value=1e-9
+  token 46 17:56 word "vbd"
+  token 47 17:59 equals "="
+  token 48 17:60 number "1.2" value=1.2000000000000002e0
+  token 49 18:3 word "taud"
+  token 50 18:7 equals "="
+  token 51 18:8 number "1e-9" value=1e-9
+  token 52 18:13 word "taug"
+  token 53 18:17 equals "="
+  token 54 18:18 number "1e-9" value=1e-9
+  token 55 18:23 word "vst"
+  token 56 18:26 equals "="
+  token 57 18:27 number "0.5" value=5e-1
+  token 58 18:31 word "ver"
+  token 59 18:34 equals "="
+  token 60 18:35 number "1" value=1e0
+  token 61 18:37 word "tnom"
+  token 62 18:41 equals "="
+  token 63 18:42 number "30" value=3e1
 card 11 @netlists/sens_jfet2.cir:19:1 lines=19-19 continuations=0
   raw: ".model jp pjf level=2 vto=-1.5 beta=5e-4 rd=5 rs=5 tnom=40"
   kind: dot(.model)

@@ -22,7 +22,7 @@
 
 use crate::primitives::SpiceError;
 use winnow::Parser as _;
-use winnow::combinator::{cut_err, repeat};
+use winnow::combinator::cut_err;
 use winnow::error::ErrMode;
 use winnow::stream::Stream as _;
 use winnow::token::any;
@@ -32,7 +32,10 @@ use crate::netlist::bexpr::BehaviouralExpression;
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Failure, Input, ParsedCard, Result, location};
-use super::syntax::{canonical_node, equals, name, named, value};
+use super::syntax::{
+    canonical_node, equals, malformed, named, named_device, skip_terminal_punctuation,
+    terminal_name, value,
+};
 
 /// The B-source instance setters of `ASRCpTable` (`asrc.c`) besides `v`/`i`.
 pub(super) const B_SETTERS: &[&str] = &[
@@ -46,25 +49,23 @@ pub(super) const B_SETTERS: &[&str] = &[
 ];
 
 pub(super) fn behavioural_card(input: &mut Input<'_>) -> Result<ParsedCard> {
-    let instance = any
-        .verify(|token: &Token| {
-            token.is_name_like() && token.text.starts_with(['b', 'B']) && token.text.len() > 1
-        })
+    let (instance, _) = named_device("b")
+        .verify(|&(token, _): &(&Token, char)| token.text.len() > 1)
         .parse_next(input)?;
     cut_err(move |input: &mut Input<'_>| b_body(input, instance)).parse_next(input)
 }
 
 fn b_body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
     let auto_gnd = input.state.auto_gnd;
-    let positive = terminal(input, "positive terminal")?;
-    let negative = terminal(input, "negative terminal")?;
+    let positive = terminal_name(input, "positive terminal")?;
+    let negative = terminal_name(input, "negative terminal")?;
     let keyword = input.input.first();
     let output = match keyword {
         Some(token) if token.is_keyword("v") || token.is_keyword("i") => {
             token.text.to_ascii_lowercase()
         }
         _ => {
-            return Err(parse_error(
+            return Err(malformed(
                 input,
                 "expected v=expression or i=expression (C: Bname n+ n- v=expr | i=expr)",
             ));
@@ -73,7 +74,7 @@ fn b_body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
     let keyword = any.parse_next(input)?;
     let equal = equals
         .parse_next(input)
-        .map_err(|_| parse_error(input, "expected '=' after v or i"))?;
+        .map_err(|_| malformed(input, "expected '=' after v or i"))?;
     let verbatim = is_verbatim(&input.state.card.raw);
     let expression = expression_after(input, equal, verbatim)?;
     let mut parameters = vec![behavioural(&output, keyword, expression)];
@@ -121,12 +122,10 @@ pub(super) fn expression_after(
     verbatim: bool,
 ) -> Result<BehaviouralExpression> {
     let raw = &input.state.card.raw;
-    let start = raw_offset(after) + after.text.len();
-    let column = after.location.column + u32::try_from(after.text.len()).unwrap_or(u32::MAX);
+    let start = after.raw_offset + after.text.len();
     let (expression, consumed) = super::bexpression::parse_prefix(
-        &raw[start.min(raw.len())..],
-        &input.state.card.location,
-        column,
+        &raw[start..],
+        input.state.card.position().advance(start),
         verbatim,
         input.state.auto_gnd,
     )
@@ -135,25 +134,17 @@ pub(super) fn expression_after(
     Ok(expression)
 }
 
-/// Byte offset of a token in its card's joined text (`tokenize` columns are
-/// one-based byte offsets).
-const fn raw_offset(token: &Token) -> usize {
-    token.location.column.saturating_sub(1) as usize
-}
-
 /// Consumes every token that starts before `end`; a token that starts before
 /// `end` but extends past it was split by the expression and is an error.
 fn skip_to(input: &mut Input<'_>, end: usize) -> Result<()> {
     while let Some(token) = input.input.first() {
-        let start = raw_offset(token);
+        let start = token.raw_offset;
         if start >= end {
             break;
         }
         if start + token.text.len() > end {
             return Err(ErrMode::Cut(Failure(SpiceError::parse(
-                token
-                    .location
-                    .at_column(u32::try_from(end + 1).unwrap_or(u32::MAX)),
+                input.state.card.position().advance(end).location(),
                 format!(
                     "unexpected text after a complete behavioural expression in '{}'",
                     token.text
@@ -176,7 +167,7 @@ fn b_setters(input: &mut Input<'_>, output: &str) -> Result<Vec<ParameterAssignm
             .get(1)
             .is_some_and(|next| next.kind == TokenKind::Equals);
         if is_setter && matches!(lowered.as_str(), "v" | "i") {
-            return Err(parse_error(
+            return Err(malformed(
                 input,
                 &format!(
                     "a B source takes exactly one v= or i= expression ({output}= was already given)"
@@ -184,7 +175,7 @@ fn b_setters(input: &mut Input<'_>, output: &str) -> Result<Vec<ParameterAssignm
             ));
         }
         if !is_setter || !B_SETTERS.contains(&lowered.as_str()) {
-            return Err(parse_error(
+            return Err(malformed(
                 input,
                 &format!(
                     "unexpected '{}' after the behavioural expression; expected one of {} as name=value",
@@ -205,30 +196,6 @@ fn setter(input: &mut Input<'_>) -> Result<ParameterAssignment> {
         token.location.clone(),
         value,
     ))
-}
-
-/// A node or source name after any `(`, `)` or `,` that C's token readers skip.
-pub(super) fn terminal<'a>(input: &mut Input<'a>, expected: &'static str) -> Result<&'a Token> {
-    let _: () = repeat(0.., punctuation).parse_next(input)?;
-    name(expected).parse_next(input)
-}
-
-fn punctuation<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
-    any.verify(|token: &Token| {
-        matches!(
-            token.kind,
-            TokenKind::LParen | TokenKind::RParen | TokenKind::Comma
-        )
-    })
-    .parse_next(input)
-}
-
-fn skip_punctuation(input: &mut Input<'_>) -> Result<()> {
-    repeat(0.., punctuation).parse_next(input)
-}
-
-pub(super) fn parse_error(input: &Input<'_>, message: &str) -> ErrMode<Failure> {
-    ErrMode::Cut(Failure(SpiceError::parse(location(input), message)))
 }
 
 fn is_named(input: &Input<'_>, keyword: &str) -> bool {
@@ -254,7 +221,7 @@ pub(super) fn value_form(
     any.parse_next(input)?;
     let equal = equals
         .parse_next(input)
-        .map_err(|_| parse_error(input, "expected '=' after VALUE/VOL/CUR"))?;
+        .map_err(|_| malformed(input, "expected '=' after VALUE/VOL/CUR"))?;
     let expression = expression_after(input, equal, false)?;
     let mut parameters = vec![behavioural("value", keyword, expression)];
     if designator == 'e' {
@@ -265,7 +232,7 @@ pub(super) fn value_form(
         parameters.push(setter(input)?);
     }
     if !input.input.is_empty() {
-        return Err(parse_error(
+        return Err(malformed(
             input,
             &format!(
                 "unexpected '{}' after the VALUE expression",
@@ -300,7 +267,7 @@ pub(super) fn table_form(
             .first()
             .filter(|t| super::expression::is_expression_token(t))
         else {
-            return Err(parse_error(
+            return Err(malformed(
                 input,
                 "expected the TABLE input expression in braces (TABLE {expr} = (x0,y0) ...)",
             ));
@@ -312,8 +279,7 @@ pub(super) fn table_form(
         let verbatim = inner.trim_start().to_ascii_lowercase().starts_with("pwl(");
         let expression = super::bexpression::parse_complete(
             inner,
-            &token.location,
-            token.location.column + 1,
+            token.position().advance(1),
             verbatim,
             input.state.auto_gnd,
         )
@@ -324,7 +290,7 @@ pub(super) fn table_form(
     }
     let mut values = Vec::new();
     loop {
-        skip_punctuation(input)?;
+        skip_terminal_punctuation(input)?;
         let Some(token) = input.input.first() else {
             break;
         };
@@ -332,7 +298,7 @@ pub(super) fn table_form(
             break;
         }
         if !is_value_token(token) {
-            return Err(parse_error(
+            return Err(malformed(
                 input,
                 &format!(
                     "expected a TABLE point value (a number or {{expression}}), found '{}'",
@@ -344,7 +310,7 @@ pub(super) fn table_form(
         values.push(value);
     }
     if values.is_empty() || values.len() % 2 != 0 {
-        return Err(parse_error(
+        return Err(malformed(
             input,
             &format!(
                 "TABLE needs (x, y) pairs; found {} value(s) (C: missing token)",
@@ -359,7 +325,7 @@ pub(super) fn table_form(
     }
     if is_named(input, "m") {
         if designator != 'g' {
-            return Err(parse_error(
+            return Err(malformed(
                 input,
                 "m= is not accepted on an E TABLE source (C reads it as a missing point)",
             ));
@@ -367,7 +333,7 @@ pub(super) fn table_form(
         parameters.push(setter(input)?);
     }
     if !input.input.is_empty() {
-        return Err(parse_error(
+        return Err(malformed(
             input,
             &format!(
                 "unexpected '{}' after the TABLE points",
@@ -386,13 +352,13 @@ pub(super) fn poly_form(
     nodes: &mut Vec<String>,
 ) -> Result<Vec<ParameterAssignment>> {
     let keyword = any.parse_next(input)?;
-    skip_punctuation(input)?;
+    skip_terminal_punctuation(input)?;
     let count = input
         .input
         .first()
         .and_then(|token| poly_dimension(&token.text))
         .ok_or_else(|| {
-            parse_error(
+            malformed(
                 input,
                 "expected a positive integer POLY dimension (POLY(n), n <= 64)",
             )
@@ -419,12 +385,12 @@ fn controls(
     let auto_gnd = input.state.auto_gnd;
     if matches!(designator, 'e' | 'g') {
         for _ in 0..2 * count {
-            let node = terminal(input, "controlling node of the POLY source")?;
+            let node = terminal_name(input, "controlling node of the POLY source")?;
             nodes.push(canonical_node(node, auto_gnd));
         }
     } else {
         for _ in 0..count {
-            let source = terminal(input, "controlling source of the POLY source")?;
+            let source = terminal_name(input, "controlling source of the POLY source")?;
             parameters.push(ParameterAssignment {
                 name: "control".to_owned(),
                 value: source.text.to_ascii_lowercase(),
@@ -445,7 +411,7 @@ pub(super) fn coefficients(
 ) -> Result<()> {
     let mut found = 0usize;
     loop {
-        skip_punctuation(input)?;
+        skip_terminal_punctuation(input)?;
         let Some(token) = input.input.first() else {
             break;
         };
@@ -453,7 +419,7 @@ pub(super) fn coefficients(
             break;
         }
         if !is_value_token(token) {
-            return Err(parse_error(
+            return Err(malformed(
                 input,
                 &format!(
                     "expected a POLY coefficient (a number or {{expression}}), found '{}'",
@@ -467,7 +433,7 @@ pub(super) fn coefficients(
         found += 1;
     }
     if found == 0 {
-        return Err(parse_error(
+        return Err(malformed(
             input,
             "a POLY source needs at least one coefficient (C: number of connections differs \
              from poly dimension)",
@@ -486,7 +452,7 @@ pub(super) fn coefficients(
         parameters.push(setter(input)?);
     }
     if !input.input.is_empty() {
-        return Err(parse_error(
+        return Err(malformed(
             input,
             &format!(
                 "unexpected '{}' after the POLY coefficients",

@@ -110,8 +110,8 @@ fn relative_sources_expand_in_order_and_inherit_the_insertion_scope() {
         [4, 2]
     );
     assert_eq!(
-        s.devices[1].parameters[1].location.line, 3,
-        "joined logical-card contract"
+        s.devices[1].parameters[1].location.line, 4,
+        "physical continuation line"
     );
     assert_eq!(s.devices[1].parameters[0].value, "2K");
 }
@@ -447,4 +447,36 @@ fn default_card_budget_stops_runaway_repeated_includes() {
         "{error}"
     );
     assert!(error.to_string().contains("body.inc"), "{error}");
+}
+
+#[test]
+fn included_and_library_continuations_use_fragment_physical_coordinates() {
+    let f = Files::new();
+    f.write("main.cir", "title\r\n  .include 'part.inc'\r\n.end\r\n");
+    let part = f.write(
+        "part.inc",
+        "* comment\r\n  R1 α 0\r\n* between\r\n   + 1k\r\n",
+    );
+    let n = f.parse("main.cir").unwrap();
+    let at = &n.devices[0].parameters[0].location;
+    assert_eq!(at.path(), fs::canonicalize(&part).unwrap());
+    assert_eq!((at.line, at.column), (4, 6));
+    assert_eq!(
+        (
+            n.cards[1].include_chain[0].line,
+            n.cards[1].include_chain[0].column
+        ),
+        (2, 3)
+    );
+
+    f.write("main.cir", "title\n  .lib 'models.lib' chosen\n.end\n");
+    let library = f.write(
+        "models.lib",
+        ".lib ignored\n.endl ignored\n.lib chosen\n  R1 a 0 1k\n* comment\n  + tc1= ; absent\n.endl chosen\n",
+    );
+    let SpiceError::Parse { location, .. } = f.parse("main.cir").unwrap_err() else {
+        panic!("expected located library parse error");
+    };
+    assert_eq!(location.path(), fs::canonicalize(library).unwrap());
+    assert_eq!((location.line, location.column), (6, 9));
 }

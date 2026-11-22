@@ -106,17 +106,17 @@ use std::fmt::Write as _;
 
 use crate::primitives::{AnalysisKind, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
-use crate::netlist::Parser;
 use crate::netlist::ast::{
     AnalysisCard, DeviceInstance, FuncCard, FuncSpelling, GlobalCard, IncludeDirective, ModelCard,
     Netlist, NodeHintCard, NodeHintValue, OptionCard, ParamCard, ParameterAssignment,
-    ParameterKind, PositionedValue, ScopedCard, ScopedCardKind, SourceWaveform, Subcircuit,
-    poly_dimension,
+    ParameterKind, PositionedValue, ScopeEntry, ScopeView, ScopedCardKind, SourceWaveform,
+    Subcircuit, poly_dimension,
 };
 use crate::netlist::expr::ParameterExpression;
 use crate::netlist::semantic::{bexpr_form, expr_form};
 use crate::netlist::source::{LogicalLine, parse_deck_text, strip_comment};
 use crate::netlist::token::{Token, TokenKind, tokenize};
+use crate::netlist::{Parser, parse_parameter_expression};
 
 /// Serializes `netlist` as a normalized deck. See the [module documentation](self)
 /// for the contract.
@@ -135,24 +135,7 @@ pub fn write_netlist(netlist: &Netlist) -> SpiceResult<String> {
     let mut writer = Writer { out: String::new() };
     writer.out.push_str(&netlist.title);
     writer.out.push('\n');
-    writer.scope(
-        &Scope {
-            devices: &netlist.devices,
-            models: &netlist.models,
-            subcircuits: &netlist.subcircuits,
-            analyses: &netlist.analyses,
-            includes: &netlist.includes,
-            params: &netlist.params,
-            functions: &netlist.functions,
-            options: &netlist.options,
-            globals: &netlist.globals,
-            initial_conditions: &netlist.initial_conditions,
-            nodesets: &netlist.nodesets,
-            cards: &netlist.cards,
-        },
-        0,
-        false,
-    )?;
+    writer.scope(ScopeView::from(netlist), 0, false)?;
     Ok(writer.out)
 }
 
@@ -163,58 +146,8 @@ fn refuse(what: impl Into<String>, location: Option<&SourceLoc>) -> SpiceError {
     }
 }
 
-/// Typed vectors and ordered cards of one scope.
-struct Scope<'a> {
-    devices: &'a [DeviceInstance],
-    models: &'a [ModelCard],
-    subcircuits: &'a [Subcircuit],
-    analyses: &'a [AnalysisCard],
-    includes: &'a [IncludeDirective],
-    params: &'a [ParamCard],
-    functions: &'a [FuncCard],
-    options: &'a [OptionCard],
-    globals: &'a [GlobalCard],
-    initial_conditions: &'a [NodeHintCard],
-    nodesets: &'a [NodeHintCard],
-    cards: &'a [ScopedCard],
-}
-
-impl Scope<'_> {
-    fn verify_usage(&self, used: [usize; 11]) -> SpiceResult<()> {
-        let lengths = [
-            self.devices.len(),
-            self.models.len(),
-            self.subcircuits.len(),
-            self.analyses.len(),
-            self.includes.len(),
-            self.params.len(),
-            self.options.len(),
-            self.globals.len(),
-            self.initial_conditions.len(),
-            self.nodesets.len(),
-            self.functions.len(),
-        ];
-        if used != lengths {
-            return Err(refuse(
-                "the ordered cards do not reference every typed entry exactly once",
-                None,
-            ));
-        }
-        Ok(())
-    }
-}
-
 struct Writer {
     out: String,
-}
-
-fn entry<'a, T>(items: &'a [T], index: usize, what: &str) -> SpiceResult<&'a T> {
-    items.get(index).ok_or_else(|| {
-        refuse(
-            format!("card index {index} is out of range for {what}"),
-            None,
-        )
-    })
 }
 
 impl Writer {
@@ -233,66 +166,56 @@ impl Writer {
         Ok(())
     }
 
-    /// Resolve included entries as well as local ones, but emit only local cards.
-    fn scoped_item<T>(
-        &mut self,
-        items: &[T],
-        index: usize,
-        what: &str,
-        skip: bool,
-        depth: usize,
-        write: impl FnOnce(&mut Self, &T, usize) -> SpiceResult<()>,
-    ) -> SpiceResult<()> {
-        let item = entry(items, index, what)?;
-        if !skip {
-            write(self, item, depth)?;
-        }
-        Ok(())
-    }
-
-    fn scope(&mut self, scope: &Scope<'_>, depth: usize, body: bool) -> SpiceResult<()> {
-        let mut used = [0usize; 11];
+    fn scope(&mut self, scope: ScopeView<'_>, depth: usize, body: bool) -> SpiceResult<()> {
+        scope
+            .validate_order()
+            .map_err(|error| refuse(error.to_string(), None))?;
         for card in scope.cards {
             // Cards read from an include/lib file are represented by their
             // directive; they are counted but not written.
             let skip = !card.include_chain.is_empty();
             let location = &card.source.location;
-            match card.kind {
-                ScopedCardKind::Device(i) => {
-                    used[0] += 1;
-                    self.scoped_item(scope.devices, i, "devices", skip, depth, Self::device)?;
+            match scope
+                .entry(card.kind)
+                .map_err(|error| refuse(error.to_string(), Some(location)))?
+            {
+                ScopeEntry::Device(item) => {
+                    if !skip {
+                        self.device(item, depth)?;
+                    }
                 }
-                ScopedCardKind::Model(i) => {
-                    used[1] += 1;
-                    self.scoped_item(scope.models, i, "models", skip, depth, Self::model)?;
+                ScopeEntry::Model(item) => {
+                    if !skip {
+                        self.model(item, depth)?;
+                    }
                 }
-                ScopedCardKind::Subcircuit(i) => {
-                    used[2] += 1;
-                    let sub = entry(scope.subcircuits, i, "subcircuits")?;
+                ScopeEntry::Subcircuit(sub) => {
                     check_closed(sub, &card.include_chain)?;
                     if !skip {
                         self.subcircuit(sub, depth)?;
                     }
                 }
-                ScopedCardKind::Analysis(i) => {
-                    used[3] += 1;
-                    self.scoped_item(scope.analyses, i, "analyses", skip, depth, Self::analysis)?;
+                ScopeEntry::Analysis(item) => {
+                    if !skip {
+                        self.analysis(item, depth)?;
+                    }
                 }
-                ScopedCardKind::Include(i) => {
-                    used[4] += 1;
-                    self.scoped_item(scope.includes, i, "includes", skip, depth, Self::include)?;
+                ScopeEntry::Include(item) => {
+                    if !skip {
+                        self.include(item, depth)?;
+                    }
                 }
-                ScopedCardKind::Param(i) => {
-                    used[5] += 1;
-                    self.scoped_item(scope.params, i, "params", skip, depth, Self::param)?;
+                ScopeEntry::Param(item) => {
+                    if !skip {
+                        self.param(item, depth)?;
+                    }
                 }
-                ScopedCardKind::Func(i) => {
-                    used[10] += 1;
-                    self.scoped_item(scope.functions, i, "functions", skip, depth, Self::func)?;
+                ScopeEntry::Func(item) => {
+                    if !skip {
+                        self.func(item, depth)?;
+                    }
                 }
-                ScopedCardKind::Options(i) => {
-                    used[6] += 1;
-                    let options = entry(scope.options, i, "options")?;
+                ScopeEntry::Options(options) => {
                     if !skip {
                         if card
                             .source
@@ -306,20 +229,17 @@ impl Writer {
                         }
                     }
                 }
-                ScopedCardKind::Global(i) => {
-                    used[7] += 1;
-                    self.scoped_item(scope.globals, i, "globals", skip, depth, Self::global)?;
+                ScopeEntry::Global(item) => {
+                    if !skip {
+                        self.global(item, depth)?;
+                    }
                 }
-                ScopedCardKind::InitialCondition(i) => {
-                    used[8] += 1;
-                    let card_ = entry(scope.initial_conditions, i, "initial conditions")?;
+                ScopeEntry::InitialCondition(card_) => {
                     if !skip {
                         self.hints(".ic", card_, depth)?;
                     }
                 }
-                ScopedCardKind::Nodeset(i) => {
-                    used[9] += 1;
-                    let card_ = entry(scope.nodesets, i, "nodesets")?;
+                ScopeEntry::Nodeset(card_) => {
                     if !skip {
                         self.hints(".nodeset", card_, depth)?;
                     }
@@ -329,19 +249,23 @@ impl Writer {
                 // (`ParsedDeck::fourier`) are returned beside the netlist, so
                 // their typed index lives outside the netlist and the card is
                 // reproduced from its own spelling.
-                ScopedCardKind::Output | ScopedCardKind::Measure | ScopedCardKind::Fourier => {
+                ScopeEntry::Save(_)
+                | ScopeEntry::Print(_)
+                | ScopeEntry::Measure(_)
+                | ScopeEntry::Fourier(_)
+                | ScopeEntry::Control => {
                     if !skip {
                         self.line(depth, card.source.raw.trim(), location)?;
                     }
                 }
                 // The closing `.ends` is written by `subcircuit`; it was
                 // verified there to be the final card.
-                ScopedCardKind::Ends => {
+                ScopeEntry::Ends => {
                     if !body {
                         return Err(refuse("`.ends` outside a subcircuit", Some(location)));
                     }
                 }
-                ScopedCardKind::End => {
+                ScopeEntry::End => {
                     if body {
                         return Err(refuse("`.end` inside a subcircuit", Some(location)));
                     }
@@ -351,7 +275,7 @@ impl Writer {
                 }
             }
         }
-        scope.verify_usage(used)
+        Ok(())
     }
 
     fn subcircuit(&mut self, sub: &Subcircuit, depth: usize) -> SpiceResult<()> {
@@ -367,24 +291,7 @@ impl Writer {
             }
         }
         self.line(depth, &parts.join(" "), location)?;
-        self.scope(
-            &Scope {
-                devices: &sub.devices,
-                models: &sub.models,
-                subcircuits: &sub.subcircuits,
-                analyses: &sub.analyses,
-                includes: &sub.includes,
-                params: &sub.params,
-                functions: &sub.functions,
-                options: &sub.options,
-                globals: &sub.globals,
-                initial_conditions: &sub.initial_conditions,
-                nodesets: &sub.nodesets,
-                cards: &sub.cards,
-            },
-            depth + 1,
-            true,
-        )?;
+        self.scope(ScopeView::from(sub), depth + 1, true)?;
         self.line(depth, &format!(".ends {}", sub.name), &sub.end_location)
     }
 
@@ -914,13 +821,7 @@ fn check_closed(sub: &Subcircuit, chain: &[SourceLoc]) -> SpiceResult<()> {
 }
 
 fn lex(text: &str, location: &SourceLoc) -> SpiceResult<Vec<Token>> {
-    tokenize(&LogicalLine {
-        location: location.clone(),
-        end_line: location.line,
-        continuations: 0,
-        text: text.to_owned(),
-    })
-    .map_err(|error| {
+    tokenize(&LogicalLine::single(location.clone(), text.to_owned())).map_err(|error| {
         refuse(
             format!("text {text:?} does not tokenize: {error}"),
             Some(location),
@@ -987,7 +888,7 @@ fn node(name: &str, location: &SourceLoc) -> SpiceResult<String> {
 /// The expression text must re-parse to the stored tree, so writing the text
 /// preserves the grouping (parentheses) of the source.
 fn check_expression(expression: &ParameterExpression, location: &SourceLoc) -> SpiceResult<()> {
-    let reparsed = Parser::parse_expression(&expression.text, location).map_err(|error| {
+    let reparsed = parse_parameter_expression(&expression.text, location).map_err(|error| {
         refuse(
             format!(
                 "expression {:?} does not re-parse: {error}",

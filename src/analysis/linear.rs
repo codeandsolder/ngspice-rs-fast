@@ -23,7 +23,7 @@ pub(super) fn plot(
     scale: Option<(&str, &str)>,
     complex: bool,
 ) -> SpiceResult<Plot> {
-    let mut plot = Plot::new(
+    let mut plot = Plot::builder(
         name,
         title,
         if complex {
@@ -84,7 +84,7 @@ pub(super) fn plot(
     for name in circuit.observations() {
         plot.push_variable(Variable::new(name, crate::devices::observe::unit(name)));
     }
-    Ok(plot)
+    Ok(plot.build())
 }
 
 pub(super) fn op(

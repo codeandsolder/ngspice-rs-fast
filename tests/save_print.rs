@@ -191,13 +191,20 @@ fn the_netlist_keeps_the_card_and_the_writer_round_trips_it() {
     let deck = parse_deck_text(Path::new("save.cir"), &format!("Title\n{body}"));
     let parsed = Parser::new().parse_deck_with_output(&deck).unwrap();
     // The netlist still describes the circuit; the ordered cards record the
-    // output cards as `Output`, and `parse_deck` still returns the netlist.
+    // output cards as typed ordinals; `parse_deck` still returns the netlist.
     assert!(
         parsed
             .netlist
             .cards
             .iter()
-            .any(|card| card.kind == ScopedCardKind::Output)
+            .any(|card| card.kind == ScopedCardKind::Save(0))
+    );
+    assert!(
+        parsed
+            .netlist
+            .cards
+            .iter()
+            .any(|card| card.kind == ScopedCardKind::Print(0))
     );
     let netlist = Parser::new().parse_deck(&deck).unwrap();
     assert_eq!(netlist.top_level_device_count(), 1);

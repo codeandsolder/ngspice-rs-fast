@@ -98,7 +98,7 @@ fn coupled_ac_matches_c() {
             .unwrap_or_else(|e| panic!("{what}: {e}"));
         let want = c_ac(body, command);
         assert_eq!(got.point_count(), want.point_count(), "{what}");
-        for variable in &want.variables {
+        for variable in want.variables() {
             for point in 0..want.point_count() {
                 let a = got.value(&variable.name, point).unwrap();
                 let b = want.value(&variable.name, point).unwrap();

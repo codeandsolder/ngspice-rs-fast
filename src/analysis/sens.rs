@@ -1204,7 +1204,7 @@ impl<'a> ParameterWalk<'a> {
     }
 
     fn plot(&self, ac: bool) -> Plot {
-        let mut plot = Plot::new(
+        let mut plot = Plot::builder(
             "sens1",
             PLOTNAME,
             if ac {
@@ -1224,7 +1224,7 @@ impl<'a> ParameterWalk<'a> {
                 Variable::new(name, "voltage")
             });
         }
-        plot
+        plot.build()
     }
 
     /// `CKTunsetup`, then `CKTsetup` and `CKTtemp` in sgen order. The reset-load
@@ -1348,7 +1348,7 @@ fn run_ac(
                 &sweep.state,
             )?)
         };
-        let mut point = Vec::with_capacity(plot.variables.len());
+        let mut point = Vec::with_capacity(plot.variables().len());
         point.push(Complex::real(frequency));
         walk.sweep(
             |slot, member, setup, current| {
@@ -1430,7 +1430,7 @@ fn run_dc(
         trial,
         circuit,
     };
-    let mut point = Vec::with_capacity(plot.variables.len());
+    let mut point = Vec::with_capacity(plot.variables().len());
     walk.sweep(
         |_, member, setup, current| member.sensitivity.load(setup, current, SensitivityMode::Dc),
         |numbering, index, base, perturbed, delta| {

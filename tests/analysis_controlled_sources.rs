@@ -228,7 +228,11 @@ fn branch_currents_are_selectable_and_measurable() {
     let requests = write_requests(&netlist.output, AnalysisKind::OperatingPoint).unwrap();
     let selection = Selection::resolve(&plot, AnalysisKind::OperatingPoint, &requests).unwrap();
     let written = selection.apply(&plot).unwrap();
-    let names: Vec<_> = written.variables.iter().map(|v| v.name.as_str()).collect();
+    let names: Vec<_> = written
+        .variables()
+        .iter()
+        .map(|v| v.name.as_str())
+        .collect();
     assert_eq!(names, ["i(e.x1.e1)", "i(h1)", "v(o2)"]);
     close(re(&written, "i(e.x1.e1)", 0), -2e-3, 1e-12);
     close(re(&written, "i(h1)", 0), 1e-5, 1e-12);

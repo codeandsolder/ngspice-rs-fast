@@ -91,7 +91,7 @@ use crate::devices::rlc::{Capacitor, Resistor};
 use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit};
 use crate::devices::traits::{Device, StampContext};
 use crate::maths::Vector;
-use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment, ParameterKind};
+use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// The most sections one instance may expand into. C has no limit; the bound
@@ -434,18 +434,6 @@ fn integer(value: Real, at: Option<&SourceLoc>, owner: &SourceLoc) -> SpiceResul
     })
 }
 
-/// A scalar setter as the deck would have written it. `{:e}` is Rust's
-/// shortest round-trip spelling, which `parse_spice_number` reads back
-/// exactly.
-fn setter(name: &str, value: Real, location: &SourceLoc) -> ParameterAssignment {
-    ParameterAssignment {
-        name: name.to_owned(),
-        value: format!("{value:e}"),
-        kind: ParameterKind::Scalar,
-        location: location.clone(),
-    }
-}
-
 fn build(
     instance: &DeviceInstance,
     sections: &UrcSections,
@@ -455,12 +443,24 @@ fn build(
     deck_nodes: &BTreeSet<String>,
 ) -> SpiceResult<Vec<Box<dyn Device>>> {
     let name = &instance.name;
+    // The diode ladder's generated model (`<name>#diodemod`: cjo, rs, is set
+    // in that order by URCsetup); every diode references it.
+    let diode_model = sections
+        .diode
+        .map(|(i1, rd)| {
+            crate::devices::nonlinear::UrcDiodeModel::new(
+                format!("{name}#diodemod"),
+                sections.capacitance,
+                rd,
+                i1,
+                model_location,
+            )
+        })
+        .transpose()?;
     crate::devices::factory::append_nodes(nodes, |nodes| {
         // The terminals exist before setup in C (INP2U binds them at parse time).
-        for terminal in &instance.nodes {
-            nodes.intern(terminal)?;
-        }
-        let fresh = |staged: &mut NodeTable, suffix: String| -> SpiceResult<String> {
+        let [mut lowl, mut hir, reference] = nodes.intern_array(&instance.nodes)?;
+        let fresh = |staged: &mut NodeTable, suffix: String| {
             let node = format!("{name}#{suffix}");
             // C's CKTmkVolt fails (E_EXISTS) on a name the deck already uses,
             // whichever card comes first.
@@ -471,25 +471,8 @@ fn build(
                     "URC internal-node name collision: {node}"
                 )));
             }
-            staged.intern(&node)?;
-            Ok(node)
+            staged.intern(&node)
         };
-        // The diode ladder's generated model (`<name>#diodemod`: cjo, rs, is set
-        // in that order by URCsetup); every diode references it.
-        let diode_model = sections.diode.map(|(i1, rd)| ModelCard {
-            name: format!("{name}#diodemod"),
-            base: "d".to_owned(),
-            level: None,
-            parameters: vec![
-                setter("cjo", sections.capacitance, model_location),
-                setter("rs", rd, model_location),
-                setter("is", i1, model_location),
-            ],
-            location: model_location.clone(),
-        });
-        let diode_models = diode_model.into_iter().collect::<Vec<_>>();
-        let diode_resolver = ModelResolver::new(&diode_models)?;
-        let reference = instance.nodes[2].clone();
         let mut devices: Vec<Box<dyn Device>> = Vec::with_capacity(4 * sections.lumps + 1);
         // C keeps the URC instance itself (created by INP2U, before setup) next
         // to the elements URCsetup generates.
@@ -498,53 +481,45 @@ fn build(
             length: sections.length,
             lumps: sections.lumps,
         }));
-        let mut lowl = instance.nodes[0].clone();
-        let mut hir = instance.nodes[1].clone();
         let mut prop: Real = 1.;
 
         for section in 1..=sections.lumps {
             let hil = fresh(nodes, format!("hi{section}"))?;
             let lowr = if section == sections.lumps {
-                hil.clone()
+                hil
             } else {
                 fresh(nodes, format!("lo{section}"))?
             };
             let r = prop * sections.resistance;
             let c = prop * sections.capacitance;
-            let terminals = [nodes.intern(&lowl)?, nodes.intern(&lowr)?];
+            let terminals = [lowl, lowr];
             devices.push(Box::new(Resistor::new(
                 format!("{name}#rlo{section}"),
                 terminals,
                 r,
             )?));
-            let terminals = [nodes.intern(&hil)?, nodes.intern(&hir)?];
+            let terminals = [hil, hir];
             devices.push(Box::new(Resistor::new(
                 format!("{name}#rhi{section}"),
                 terminals,
                 r,
             )?));
-            let mut shunts = vec![("lo", lowr.clone())];
-            if section != sections.lumps {
-                shunts.push(("hi", hil.clone()));
-            }
-            for (side, node) in shunts {
-                if sections.diode.is_some() {
-                    let diode = DeviceInstance {
-                        name: format!("{name}#d{side}{section}"),
-                        designator: 'd',
-                        nodes: vec![node, reference.clone()],
-                        model: Some(format!("{name}#diodemod")),
-                        parameters: vec![setter("area", prop, &instance.location)],
-                        location: instance.location.clone(),
-                    };
-                    let model = diode_resolver.resolve(&diode)?.ok_or_else(|| {
-                        SpiceError::circuit(format!("URC {name}: generated diode model missing"))
-                    })?;
-                    devices.push(crate::devices::nonlinear::Diode::instantiate(
-                        &diode, nodes, &model, context,
+            let shunts = [
+                Some(("lo", lowr)),
+                (section != sections.lumps).then_some(("hi", hil)),
+            ];
+            for (side, node) in shunts.into_iter().flatten() {
+                let terminals = [node, reference];
+                if let Some(model) = &diode_model {
+                    devices.push(model.bind_section(
+                        &format!("{name}#d{side}{section}"),
+                        prop,
+                        &instance.location,
+                        nodes,
+                        terminals,
+                        context,
                     )?);
                 } else {
-                    let terminals = [nodes.intern(&node)?, nodes.intern(&reference)?];
                     devices.push(Box::new(Capacitor::new(
                         format!("{name}#c{side}{section}"),
                         terminals,
@@ -748,20 +723,37 @@ mod tests {
     }
 
     #[test]
-    fn generated_setters_round_trip_exactly() {
-        for value in [
-            1.379_310_344_827_586_2e-20,
-            0.1 + 0.2,
-            1.5f64.powf(7.),
-            3e-3,
-        ] {
-            let text = setter(
-                "x",
-                value,
-                &SourceLoc::new(std::path::PathBuf::from("t.cir"), 1, 1),
-            )
-            .value;
-            assert_eq!(crate::primitives::parse_spice_number(&text), Some(value));
-        }
+    fn late_generated_diode_prime_collision_rolls_back_whole_ladder() {
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use crate::primitives::NodeKind;
+        use std::path::Path;
+
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("urc.cir"),
+                "t\nu1 in out 0 m l=1m n=3\n.model m urc isperl=1e-15 rsperl=10\n.end\n",
+            ))
+            .unwrap();
+        let models = ModelResolver::new(&netlist.models).unwrap();
+        let mut nodes = NodeTable::new();
+        let existing = nodes.intern("u1#dlo3#internal").unwrap();
+        nodes.set_kind(existing, NodeKind::Internal);
+        let before = nodes.nodes().to_vec();
+        let error = expand(
+            &netlist.devices[0],
+            &mut nodes,
+            &models,
+            &ModelContext::default(),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("diode internal-node name collision"),
+            "{error}"
+        );
+        assert_eq!(nodes.nodes(), before);
+        assert_eq!(nodes.get("u1#dlo3#internal"), Some(existing));
     }
 }
