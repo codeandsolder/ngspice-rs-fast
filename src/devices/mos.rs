@@ -1669,7 +1669,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
                 (dp, g, f64::mul_add(xnrm - xrev, gm, -gcgd)),
                 (dp, b, f64::mul_add(xnrm - xrev, gmbs, -gbd)),
                 (dp, sp, f64::mul_add(xnrm, -(gm + gmbs), -gds)),
-                (sp, g, f64::mul_add((-(xnrm - xrev)), gm, -gcgs)),
+                (sp, g, f64::mul_add(-(xnrm - xrev), gm, -gcgs)),
                 (sp, s, -gsr),
                 (sp, b, f64::mul_add(xnrm - xrev, -gmbs, -gbs)),
                 (sp, dp, f64::mul_add(xrev, -(gm + gmbs), -gds)),

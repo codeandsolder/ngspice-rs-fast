@@ -440,7 +440,7 @@ impl Model {
         let (hfe, hfe1, hfe2) = (self.hfeta, self.hfe1, self.hfe2);
         let mut vgst = vgs - self.vto;
         vgst = f64::mul_add(
-            (f64::mul_add(lfg1, -vgstrap, lfg) + lfg2 * vgdtrap),
+            f64::mul_add(lfg1, -vgstrap, lfg) + lfg2 * vgdtrap,
             -vgdtrap,
             vgst,
         );

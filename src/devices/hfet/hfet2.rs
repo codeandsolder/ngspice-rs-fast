@@ -53,7 +53,7 @@ use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step}
 use super::{CELSIUS_TO_KELVIN, HfetInstance as Instance};
 use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
 use crate::devices::initial::InstanceInitial;
-use crate::devices::jfet::{BOLTZMANN, CHARGE, p};
+use crate::devices::jfet::{self, BOLTZMANN, CHARGE, p};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };

@@ -42,7 +42,7 @@ use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step,
 use super::{NodeSetup, TemperatureCache, given_celsius, physical_temperature, stamp_reset};
 use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
-use crate::devices::jfet::{BOLTZMANN, CHARGE};
+use crate::devices::jfet::{self, BOLTZMANN, CHARGE};
 use crate::devices::sensitivity::{
     AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
@@ -705,8 +705,8 @@ impl Mesa {
         let sigma = model.sigma0 * rolloff;
         let vgt = sigma.mul_add(vds, vgt0);
         let u = 0.5 * vgt / vt - 1.;
-        let t = (derived.delta_sqr + u * u).sqrt();
-        let vgte = vt * (2. + u + t);
+        let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
+        let vgte = (2. * vt) * (1. + smoothed.high);
         let (population, population_slope) = super::softplus(vgt / etavth - std::f64::consts::LN_2);
         let nsm = 2. * derived.n0 * population;
         if nsm < N_MIN {
@@ -796,8 +796,8 @@ impl Mesa {
         let vl = model.vs / mu * self.instance.l;
         let beta = derived.beta / 3.0f64.mul_add(vl, derived.vpo);
         let u = vgt / vt - 1.;
-        let t = (derived.delta_sqr + u * u).sqrt();
-        let vgte = 0.5 * vt * (2. + u + t);
+        let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
+        let vgte = vt * (1. + smoothed.high);
         let a = 2. * beta * vgte;
         let b = (-vgt / etavth).exp();
         let sqrt1 = if vgte > derived.vpo {
