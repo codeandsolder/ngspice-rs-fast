@@ -234,9 +234,9 @@ pub fn straight_line_check(
     reltol: Real,
     abstol: Real,
 ) -> bool {
-    let quad1 = (y2.abs() + y1.abs()) * 0.5 * (x2 - x1).abs();
-    let quad2 = (y3.abs() + y2.abs()) * 0.5 * (x3 - x2).abs();
-    let quad3 = (y3.abs() + y1.abs()) * 0.5 * (x3 - x1).abs();
+    let quad1 = y2.abs().midpoint(y1.abs()) * (x2 - x1).abs();
+    let quad2 = y3.abs().midpoint(y2.abs()) * (x3 - x2).abs();
+    let quad3 = y3.abs().midpoint(y1.abs()) * (x3 - x1).abs();
     let triangle = (quad3 - quad1 - quad2).abs();
     let area = quad1 + quad2;
     area * reltol + abstol > triangle
@@ -732,7 +732,7 @@ mod tests {
         let weights = quad_interp(1.5 * h, 0., h, 2. * h).unwrap();
         assert!((weights[1] + 4. * weights[2] - 2.25).abs() <= 8. * Real::EPSILON);
         // h(t)=2+3t. Integral [10,11] is 33.5; integrating
-        // its primitive from 4 gives 6*10? use explicit antiderivative.
+        // its primitive from 4 has the antiderivative below.
         assert_eq!(intlinfunc(10., 11., 2., 5., 0., 1.), 33.5);
         let f = |t: Real| t * t + 0.5 * t * t * t - 32. * t;
         assert!((twiceintlinfunc(10., 11., 4., 2., 5., 0., 1.) - (f(11.) - f(10.))).abs() < 1e-12);

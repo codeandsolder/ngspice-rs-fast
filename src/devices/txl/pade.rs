@@ -5,20 +5,12 @@
 // C-compatible numerical expressions are kept in their reference order:
 // Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::imprecise_flops,
-    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
 )]
 #![expect(
     clippy::suboptimal_flops,
@@ -182,39 +174,52 @@ fn admittance_series(a: Real, b: Real) -> [Real; 5] {
     std::array::from_fn(|i| y[i + 1])
 }
 
-/// `find_roots`/`exp_find_roots`: Cardano seed, at most 31 Newton updates,
-/// and stable quadratic deflation. For complex propagation roots the last
-/// two entries hold the real and imaginary part of the conjugate pair.
+/// Cardano seed followed by Newton refinement and stable quadratic
+/// deflation. Solve in a dimensionless coordinate so neither the cubic
+/// discriminant nor its residual need overflow for large physical rates.
 fn roots([a, b, c]: [Real; 3], propagation: bool) -> SpiceResult<([Real; 3], bool)> {
-    let q = (a * a - 3. * b) / 9.;
-    let p = (2. * a * a * a - 9. * a * b + 27. * c) / 54.;
-    let d = q * q * q - p * p;
-    let mut x = if d >= 0. {
-        -2. * q.sqrt() * ((p / (q * q.sqrt())).acos() / 3.).cos() - a / 3.
-    } else if p > 0. {
-        let t = ((-d).sqrt() + p).powf(1. / 3.);
-        -(t + q / t) - a / 3.
-    } else if p == 0. {
+    let scale = a.abs().max(b.abs().sqrt()).max(c.abs().cbrt());
+    if !scale.is_finite() || scale == 0. {
+        return Err(error("degenerate cubic scale"));
+    }
+    let a = a / scale;
+    let b = (b / scale) / scale;
+    let c = ((c / scale) / scale) / scale;
+    let q = a.mul_add(a, -3. * b) / 9.;
+    let p = (2. * a * a).mul_add(a, (-9. * a).mul_add(b, 27. * c)) / 54.;
+    let d = (q * q).mul_add(q, -p * p);
+    let mut x = if q == 0. && p == 0. {
         -a / 3.
+    } else if d >= 0. {
+        let root = q.sqrt();
+        let angle = (p / (q * root)).clamp(-1., 1.).acos() / 3.;
+        (-2. * root).mul_add(angle.cos(), -a / 3.)
+    } else if p >= 0. {
+        let t = ((-d).sqrt() + p).cbrt();
+        -(t + q / t) - a / 3.
     } else {
-        let t = ((-d).sqrt() - p).powf(1. / 3.);
+        let t = ((-d).sqrt() - p).cbrt();
         t + q / t - a / 3.
     };
-    let backup = x;
-    for i in 1..=32 {
-        let t = x - (x * x * x + a * x * x + b * x + c) / (3. * x * x + 2. * a * x + b);
-        if (t - x).abs() <= 5e-4 || !t.is_finite() {
+    // Retain the C choice of the real pole and bounded refinement.
+    // Accept only updates that improve the actual polynomial residual.
+    let residual = |x: Real| (x + a).mul_add(x, b).mul_add(x, c);
+    for _ in 0..31 {
+        let current = residual(x);
+        let derivative = 3_f64.mul_add(x, 2. * a).mul_add(x, b);
+        let next = x - current / derivative;
+        if !next.is_finite() || residual(next).abs() >= current.abs() {
             break;
         }
-        if i == 32 {
-            x = backup;
+        let converged = (next - x).abs() <= 2. * Real::EPSILON * next.abs();
+        x = next;
+        if converged {
             break;
         }
-        x = t;
     }
-    let a = a + x;
-    let b = -c / x;
-    let d = a * a - 4. * b;
+    let quadratic_a = a + x;
+    let quadratic_b = if x == 0. { b } else { -c / x };
+    let d = quadratic_a.mul_add(quadratic_a, -4. * quadratic_b);
     let pair = d < 0.;
     let (y, z) = if pair {
         if !propagation {
@@ -222,21 +227,18 @@ fn roots([a, b, c]: [Real; 3], propagation: bool) -> SpiceResult<([Real; 3], boo
                 "two imaginary characteristic-admittance roots (C rejects this model)",
             ));
         }
-        (-0.5 * a, 0.5 * (-d).sqrt())
+        (-0.5 * quadratic_a, 0.5 * (-d).sqrt())
     } else {
-        let scale: Real = if propagation { 1e-16 } else { 1e-18 };
-        let d = (d * scale).sqrt() / scale.sqrt();
-        let y = if a >= 0. {
-            -0.5 * (a + d)
-        } else {
-            -0.5 * (a - d)
-        };
-        (y, b / y)
+        let d = d.sqrt();
+        let y = -quadratic_a.midpoint(d.copysign(quadratic_a));
+        let z = if y == 0. { 0. } else { quadratic_b / y };
+        (y, z)
     };
-    if [x, y, z].iter().any(|x| !x.is_finite()) {
+    let roots = [x, y, z].map(|root| root * scale);
+    if roots.iter().any(|x| !x.is_finite()) {
         return Err(error("nonfinite cubic roots"));
     }
-    Ok(([x, y, z], pair))
+    Ok((roots, pair))
 }
 fn residues(p: [Real; 3], q: [Real; 3], x: [Real; 3], pair: bool) -> [Real; 3] {
     let [p1, p2, p3] = p;
@@ -442,6 +444,26 @@ mod tests {
         let expected = [0.5, -1., 2., -4., 8.].map(|factor| factor * delta);
         for (actual, expected) in admittance_series(a, b).into_iter().zip(expected) {
             assert!((actual - expected).abs() <= 8. * Real::EPSILON * expected.abs());
+        }
+    }
+
+    #[test]
+    fn cubic_poles_have_small_residuals_across_physical_scales() {
+        for scale in [1e-100, 1., 1e100] {
+            let coefficients = [6. * scale, 11. * scale * scale, 6. * scale * scale * scale];
+            let (poles, pair) = roots(coefficients, false).unwrap();
+            assert!(!pair);
+            let mut normalized = poles.map(|pole| pole / scale);
+            normalized.sort_by(Real::total_cmp);
+            for (pole, expected) in normalized.into_iter().zip([-3., -2., -1.]) {
+                assert!((pole - expected).abs() <= 32. * Real::EPSILON);
+            }
+        }
+        // (x + 2)(x^2 + 2x + 5), with poles -2 and -1 ± 2i.
+        let (poles, pair) = roots([4., 9., 10.], true).unwrap();
+        assert!(pair);
+        for (actual, expected) in poles.into_iter().zip([-2., -1., 2.]) {
+            assert!((actual - expected).abs() <= 32. * Real::EPSILON);
         }
     }
 

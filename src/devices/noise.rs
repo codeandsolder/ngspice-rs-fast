@@ -600,7 +600,7 @@ mod tests {
     use super::{
         BOLTZMANN, CHARGE, FlickerLaw, NoiseKind, NoiseSource, correlated_gain, squared_gain,
     };
-    use crate::primitives::{Complex, NodeId, SpiceError};
+    use crate::primitives::{Complex, NodeId, Real, SpiceError};
 
     #[test]
     fn densities_follow_nevalsrc() {
