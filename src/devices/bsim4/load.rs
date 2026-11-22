@@ -113,7 +113,7 @@ fn smooth_vds_scaled(saturation: f64, drain: f64, delta: f64) -> (f64, f64, f64)
 fn smooth_vds(saturation: f64, drain: f64, delta: f64) -> (f64, f64, f64) {
     let shift = saturation - drain - delta;
     let discriminant = (4. * delta).mul_add(saturation, shift * shift);
-    let root = if discriminant.is_finite() && discriminant > 0. {
+    let root = if discriminant.is_normal() && discriminant > 0. {
         discriminant.sqrt()
     } else if saturation >= 0. && delta >= 0. {
         shift.hypot(2. * saturation.sqrt() * delta.sqrt())
@@ -123,7 +123,7 @@ fn smooth_vds(saturation: f64, drain: f64, delta: f64) -> (f64, f64, f64) {
     let saturation_gap = smoothed_gap(saturation, shift, root, delta);
     if saturation >= 0. && drain >= 0. && delta > 0. {
         let denominator = saturation.midpoint(drain) + delta.midpoint(root);
-        if (!root.is_finite() || !denominator.is_finite())
+        if (!root.is_normal() || !denominator.is_normal())
             && saturation.is_finite()
             && drain.is_finite()
             && delta.is_finite()
@@ -286,6 +286,18 @@ mod tests {
         assert!((value / 5e-201 - 1.).abs() < 1e-14);
         assert!((ds - 0.5).abs() < 1e-14);
         assert_eq!(dd, 0.);
+    }
+
+    #[test]
+    fn smoothed_voltage_derivatives_remain_scale_invariant_near_underflow() {
+        let expected = smooth_vds(1., 1., 1.);
+        for scale in [1e-160, 1e-250, 1e-308, 1e-320, f64::from_bits(1)] {
+            let (value, ds, dd) = smooth_vds(scale, scale, scale);
+            let expected_value = expected.0 * scale;
+            assert!(value.to_bits().abs_diff(expected_value.to_bits()) <= 1);
+            assert!((ds - expected.1).abs() < 1e-14);
+            assert!((dd - expected.2).abs() < 1e-14);
+        }
     }
 
     #[test]

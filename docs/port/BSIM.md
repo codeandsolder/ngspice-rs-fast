@@ -435,7 +435,7 @@ remain unchanged.
   channel, charge and noise paths. Compute the transport discriminant as an
   accurate difference of products and differentiate the saturation equation
   implicitly. Scale the smoothed-root denominator and overflowing products only
-when an intermediate exceeds the finite range, preserving finite results after
+when an intermediate exceeds the normal floating-point range, preserving finite results after
 cancellation without affecting the ordinary operating path. Preserve small junction currents using `expm1` with the
   reference clamp boundaries; extrapolate accepted-state differences rather
   than subtracting scaled nearly identical history values.
