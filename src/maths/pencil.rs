@@ -86,7 +86,7 @@ impl PencilTerm {
     /// The value this term adds at `s`.
     fn at(&self, s: Cx) -> Complex {
         match (self.conductance, self.capacitance) {
-            (Some(g), Some(c)) => Complex::new(g + c * s.re, c * s.im),
+            (Some(g), Some(c)) => Complex::new(c.mul_add(s.re, g), c * s.im),
             (Some(g), None) => Complex::new(g, 0.0),
             (None, Some(c)) => Complex::new(c * s.re, c * s.im),
             (None, None) => Complex::ZERO,
@@ -201,7 +201,7 @@ impl PencilLoad {
     }
 }
 
-/// `SPcomplex` arithmetic with the exact C macro formulas (`complex.h`).
+/// Complex arithmetic for the scaled determinant search.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Cx {
     re: Real,
@@ -226,16 +226,12 @@ impl Cx {
     }
     /// `C_MULEQ` / `C_MUL`.
     fn mul(self, b: Self) -> Self {
-        Self::new(
-            self.re * b.re - self.im * b.im,
-            self.re * b.im + self.im * b.re,
-        )
+        let product = Complex::new(self.re, self.im) * Complex::new(b.re, b.im);
+        Self::new(product.re, product.im)
     }
     /// `C_DIV` / `C_DIVEQ`.
     fn div(self, b: Self) -> Self {
-        // The C numerator's imaginary sum is the same finite binary64
-        // operation as Complex::div (including signed zeros). Share its
-        // exceptional exponent-scaled path as well.
+        // Use the shared cancellation-aware and exponent-scaled kernel.
         let quotient = Complex::new(self.re, self.im) / Complex::new(b.re, b.im);
         Self::new(quotient.re, quotient.im)
     }

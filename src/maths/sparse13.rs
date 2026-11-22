@@ -129,7 +129,7 @@ impl Scalar for f64 {
         self * other
     }
     fn mul_sub(self, a: Self, b: Self) -> Self {
-        self - a * b
+        a.mul_add(-b, self)
     }
     fn is_zero(self) -> bool {
         self == 0.0
@@ -156,11 +156,11 @@ impl Scalar for Complex {
         let result =
             if (den.re >= den.im && den.re > -den.im) || (den.re < den.im && den.re <= -den.im) {
                 let r = den.im / den.re;
-                let re = 1.0 / (den.re + r * den.im);
+                let re = 1.0 / (r.mul_add(den.im, den.re));
                 Self::new(re, -r * re)
             } else {
                 let r = den.re / den.im;
-                let im = -1.0 / (den.im + r * den.re);
+                let im = -1.0 / (r.mul_add(den.re, den.im));
                 Self::new(-r * im, im)
             };
         if !result.is_finite() || result == Self::ZERO {
@@ -172,16 +172,10 @@ impl Scalar for Complex {
         }
     }
     fn mul(self, b: Self) -> Self {
-        Self::new(
-            self.re * b.re - self.im * b.im,
-            self.re * b.im + self.im * b.re,
-        )
+        self * b
     }
     fn mul_sub(self, a: Self, b: Self) -> Self {
-        Self::new(
-            self.re - (a.re * b.re - a.im * b.im),
-            self.im - (a.re * b.im + a.im * b.re),
-        )
+        self - a * b
     }
     fn is_zero(self) -> bool {
         self.re == 0.0 && self.im == 0.0
