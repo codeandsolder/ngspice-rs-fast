@@ -30,7 +30,7 @@ pub struct RawReadPolicy {
 /// Logical retained-data limits, across all plots in a single collection.
 ///
 /// These count rows, cells and input header bytes, not allocator RSS. The row
-/// ceiling controls per-row allocation overhead even for narrow plots; the
+/// ceiling controls traversal work even for narrow plots; the
 /// header and variable ceilings control metadata and schema indexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawCollectPolicy {

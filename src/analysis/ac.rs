@@ -39,17 +39,19 @@ pub(super) fn run(
     // later frequencies refactor (`SMPcLUfac`) and reorder only after a zero
     // pivot. See [`ac_matrix`].
     let shared: &Circuit = circuit;
+    let mut point = Vec::with_capacity(plot.variable_count());
     for &f in grid {
         let x = small_signal.at_frequency(shared, context, f, |system| {
             ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
                 .factorize()?
                 .solve(&system.ac_rhs())
         })?;
-        let mut point = vec![Complex::real(f)];
+        point.clear();
+        point.push(Complex::real(f));
         point.extend(x);
         point.extend(circuit.observe_parameters(&context.model_context().with_frequency(f))?);
         plot.check_point(&point)?;
-        sink.point(point)?;
+        sink.point(&point)?;
     }
     sink.end()
 }
@@ -251,7 +253,7 @@ impl SmallSignal {
         // Spectral observations support scalar instance parameters. Include
         // them in the bias row as well; its header already names them.
         point.extend(circuit.observe_parameters(&context.model_context())?);
-        plot.push_point(point)?;
+        plot.push_point(&point)?;
         Ok(vec![plot])
     }
 

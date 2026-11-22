@@ -154,7 +154,7 @@ impl<'a> Series<'a> {
         if plot.variables()[time].unit != "time" {
             return Err(format!("{label}: axis 'time' must have unit 'time'"));
         }
-        let times: Vec<f64> = plot.points().iter().map(|row| row[time].re).collect();
+        let times: Vec<f64> = plot.rows().map(|row| row[time].re).collect();
         if (times[0] - grid.start).abs() > eps {
             return Err(format!(
                 "{label}: transient starts at {:e}, not {:e}",
@@ -182,8 +182,9 @@ impl<'a> Series<'a> {
         Ok(series)
     }
 
-    /// Times must not decrease; two samples may share an instant only at a
-    /// declared breakpoint (left/right limits), and never three.
+    /// Decreases greater than the time tolerance are invalid. Two samples
+    /// may coincide within tolerance only at a declared breakpoint, and
+    /// never three consecutive samples.
     fn check_times(&self) -> Result<(), String> {
         for (index, pair) in self.times.windows(2).enumerate() {
             let step = pair[1] - pair[0];
@@ -222,7 +223,11 @@ impl<'a> Series<'a> {
 
     /// Bind the sample once, independent of the requested signal.
     fn sample(&self, t: f64, side: Side) -> Result<SamplePlan<'a>, String> {
-        let row = |index: usize| self.plot.points()[index].as_slice();
+        let row = |index| {
+            self.plot
+                .row(index)
+                .ok_or_else(|| format!("{}: no sample {index}", self.label))
+        };
         if let Some(index) = nearby_breakpoint_index(self.breakpoints, t, self.eps) {
             let b = self.breakpoints[index];
             let Some((first, last)) = self.event_rows[index] else {
@@ -232,8 +237,8 @@ impl<'a> Series<'a> {
                 ));
             };
             return match side {
-                Side::Left => Ok(SamplePlan::Exact(row(first))),
-                Side::Right => Ok(SamplePlan::Exact(row(last))),
+                Side::Left => row(first).map(SamplePlan::Exact),
+                Side::Right => row(last).map(SamplePlan::Exact),
                 Side::Interior => Err(format!(
                     "{}: interior evaluation requested at breakpoint {b:e}",
                     self.label
@@ -248,7 +253,7 @@ impl<'a> Series<'a> {
             return Err(format!("{}: time {t:e} is beyond the samples", self.label));
         }
         if (self.times[upper] - t).abs() <= self.eps {
-            return Ok(SamplePlan::Exact(row(upper)));
+            return row(upper).map(SamplePlan::Exact);
         }
         if upper == 0 {
             return Err(format!("{}: time {t:e} precedes the samples", self.label));
@@ -263,8 +268,8 @@ impl<'a> Series<'a> {
         }
         let fraction = (t - t0) / (t1 - t0);
         Ok(SamplePlan::Linear {
-            lower: row(upper - 1),
-            upper: row(upper),
+            lower: row(upper - 1)?,
+            upper: row(upper)?,
             lower_weight: 1.0 - fraction,
             upper_weight: fraction,
         })
@@ -379,8 +384,11 @@ pub(super) fn transient(
             "current" => tolerance.current_absolute,
             other => return Err(format!("signal '{name}' has unsupported unit '{other}'")),
         };
-        let peak = (0..want.point_count())
-            .map(|row| want.points()[row][column].re.abs())
+        let peak = want
+            .column_at(column)
+            .ok_or_else(|| format!("C: missing column {column} for '{name}'"))?
+            .iter()
+            .map(|value| value.re.abs())
             .fold(0.0, f64::max);
         let peak_allowance = tolerance.peak_relative * peak;
         let absolute = absolute + peak_allowance;
@@ -527,10 +535,9 @@ mod tests {
                 Variable::new("v(out)", "voltage"),
             ],
         )
-        .with_points(
+        .with_rows(
             rows.iter()
-                .map(|&(t, v)| vec![Complex::real(t), Complex::real(v)])
-                .collect(),
+                .map(|&(t, v)| [Complex::real(t), Complex::real(v)]),
         )
         .unwrap()
     }
@@ -539,7 +546,7 @@ mod tests {
         let mut variables = plot.variables().to_vec();
         change(&mut flags, &mut variables);
         Plot::new(plot.name.clone(), plot.plotname.clone(), flags, variables)
-            .with_points(plot.points().to_vec())
+            .with_rows(plot.rows())
             .unwrap()
     }
     /// Samples of `f` at the given times.
@@ -585,7 +592,7 @@ mod tests {
     // Pre-refactor oracle. Keep the original row scan, arithmetic and
     // per-call bracket lookup independent of the indexed implementation.
     fn legacy_value(series: &Series<'_>, column: usize, t: f64, side: Side) -> Result<f64, String> {
-        let at = |index: usize| series.plot.points()[index][column].re;
+        let at = |index| series.plot.row(index).unwrap()[column].re;
         if let Some(b) = series.breakpoint_near(t) {
             let near: Vec<usize> = (0..series.times.len())
                 .filter(|&i| (series.times[i] - b).abs() <= series.eps)
@@ -834,16 +841,18 @@ mod tests {
         let events: Vec<_> = (1..500).map(|i| f64::from(i * 40) * grid.step).collect();
         let mut variables = vec![Variable::new("time", "time")];
         variables.extend((0..32).map(|i| Variable::new(format!("v({i})"), "voltage")));
-        let points = (0..=20_000)
-            .map(|i| {
-                let t = f64::from(i) * grid.step;
-                std::iter::once(Complex::real(t))
-                    .chain((0..32).map(|j| Complex::real(t * f64::from(j + 1))))
-                    .collect()
+        let rows = (0..=20_000).map(|i| {
+            let t = f64::from(i) * grid.step;
+            std::array::from_fn::<_, 33, _>(|j| {
+                Complex::real(if j == 0 {
+                    t
+                } else {
+                    t * f64::from(u32::try_from(j).unwrap())
+                })
             })
-            .collect();
+        });
         let p = Plot::new("tran1", "Transient Analysis", PlotFlags::Real, variables)
-            .with_points(points)
+            .with_rows(rows)
             .unwrap();
         let baseline = Series::new("test", &p, &events, &grid, eps).unwrap();
         let start = Instant::now();
@@ -983,20 +992,12 @@ mod tests {
         // Interpolating across the jump would pass 4.5..5.5 values wrongly; the
         // plots above only agree because each side is handled on its own.
         let mut bad_right = jump_plot(0.5);
-        let last_at_five = bad_right
-            .points()
-            .iter()
-            .rposition(|row| row[0].re == 5.0)
-            .unwrap();
+        let last_at_five = bad_right.rows().rposition(|row| row[0].re == 5.0).unwrap();
         bad_right.point_mut(last_at_five).unwrap()[1] = Complex::real(8.5);
         let error = run(&bad_right, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Right)"), "{error}");
         let mut bad_left = jump_plot(0.5);
-        let first_at_five = bad_left
-            .points()
-            .iter()
-            .position(|row| row[0].re == 5.0)
-            .unwrap();
+        let first_at_five = bad_left.rows().position(|row| row[0].re == 5.0).unwrap();
         bad_left.point_mut(first_at_five).unwrap()[1] = Complex::real(0.5);
         let error = run(&bad_left, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Left)"), "{error}");
@@ -1008,12 +1009,8 @@ mod tests {
         // sample at 5 is both limits, so the C jump (0 vs 8) must be caught.
         let want = jump_plot(0.5);
         let mut smeared = jump_plot(0.5);
-        let first = smeared
-            .points()
-            .iter()
-            .position(|r| r[0].re == 5.0)
-            .unwrap();
-        smeared.remove_point(first).unwrap();
+        let first = smeared.rows().position(|r| r[0].re == 5.0).unwrap();
+        assert!(smeared.remove_point(first));
         let error = run(&smeared, &want, &[5.0]).unwrap_err();
         assert!(error.contains("(Left)"), "{error}");
         // And with no declared event the repeated instant is invalid input.

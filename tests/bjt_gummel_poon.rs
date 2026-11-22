@@ -468,7 +468,7 @@ fn column(plot: &Plot, name: &str) -> f64 {
     let index = plot
         .variable_index(name)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
-    plot.points()[0][index].re
+    plot.row(0).unwrap()[index].re
 }
 
 /// `.sens` over `bjt.c`'s tables (#164): 103 model setters and six instance

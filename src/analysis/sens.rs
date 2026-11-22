@@ -1588,7 +1588,7 @@ fn run_ac(
                 Ok(())
             },
         )?;
-        plot.push_point(point)?;
+        plot.push_point(&point)?;
     }
     Ok(())
 }
@@ -1656,7 +1656,7 @@ fn run_dc(
             Ok(())
         },
     )?;
-    plot.push_point(point)?;
+    plot.push_point(&point)?;
     Ok(())
 }
 

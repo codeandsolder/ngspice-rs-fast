@@ -14,7 +14,7 @@ fn run(text: &str) -> SpiceResult<Plot> {
     request.run(&mut config.circuit(&netlist)?, &config.context())
 }
 fn value(plot: &Plot, name: &str) -> f64 {
-    plot.points()[0][plot
+    plot.row(0).unwrap()[plot
         .variable_index(name)
         .unwrap_or_else(|| panic!("missing {name}"))]
     .re
@@ -45,7 +45,7 @@ fn fixture(level: u8, per_device: usize) {
         variables(reference),
         "level {level}: names/units"
     );
-    assert_eq!(plot.points().len(), 1);
+    assert_eq!(plot.point_count(), 1);
     for variable in reference.variables() {
         let a = value(&plot, &variable.name);
         let b = value(reference, &variable.name);

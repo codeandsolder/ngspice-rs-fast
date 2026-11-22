@@ -2154,27 +2154,39 @@ const C_UNSAVED_SUFFIXES: [&str; 7] = [
 /// [`run_card_plots`]). Vector names already follow C, including the DC
 /// sweep scales (`dctrcurv.c`).
 fn project(
-    mut got: ngspice_rs::analysis::Plot,
+    got: ngspice_rs::analysis::Plot,
     internal: &[String],
 ) -> Result<ngspice_rs::analysis::Plot, String> {
-    let mut variables = got.variables().to_vec();
-    let mut points = got.take_points();
-    for column in (0..variables.len()).rev() {
-        if internal.contains(&variables[column].name) {
-            variables.remove(column);
-            for row in &mut points {
-                row.remove(column);
-            }
-        }
+    let columns: Vec<_> = got
+        .variables()
+        .iter()
+        .enumerate()
+        .filter(|(_, variable)| !internal.contains(&variable.name))
+        .map(|(index, _)| index)
+        .collect();
+    if columns.len() == got.variable_count() {
+        return Ok(got);
     }
-    ngspice_rs::analysis::Plot::new(
+    let variables = columns
+        .iter()
+        .map(|&index| got.variables()[index].clone())
+        .collect();
+    let mut output = ngspice_rs::analysis::Plot::new(
         got.name.clone(),
         got.plotname.clone(),
         got.flags(),
         variables,
-    )
-    .with_points(points)
-    .map_err(|err| err.to_string())
+    );
+    output
+        .reserve_points(got.point_count())
+        .map_err(|err| err.to_string())?;
+    let mut row = Vec::with_capacity(columns.len());
+    for values in got.rows() {
+        row.clear();
+        row.extend(columns.iter().map(|&column| values[column]));
+        output.push_point(&row).map_err(|err| err.to_string())?;
+    }
+    Ok(output)
 }
 
 /// The committed C golden of `name`.
