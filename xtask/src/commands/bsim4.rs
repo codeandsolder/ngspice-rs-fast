@@ -49,7 +49,7 @@ pub(super) fn main(root: &std::path::Path, args: &[String]) -> Result<(), String
     defaults.push_str(&super::bsim4_fields::independent_defaults(
         &header, &setup, &facts,
     )?);
-    let fields = super::bsim4_fields::fields(&header, &revision)?;
+    let fields = super::bsim4_fields::fields(root, &header, &revision)?;
     let asks = super::bsim4_fields::asks(&read("b4mask.c")?, &read("b4ask.c")?, &revision)?;
     for (path, text) in [
         ("src/devices/bsim4/asks.rs", asks),

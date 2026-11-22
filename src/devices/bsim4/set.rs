@@ -1077,21 +1077,22 @@ mod tests {
     fn independent_default_stage_never_writes_given_parameters_or_given_bits() {
         let facts = super::super::defaults_data::LITERALS;
         let sentinel: Real = -123_456.25;
-        let mut both = [Model::default(), Model::default()];
+        let mut ungiven = Model::default();
+        let mut given_model = Model::default();
         for &(keyword, _) in facts {
             let p = super::super::DEVICE.model.get(keyword).unwrap();
             let field = p.c_field.unwrap();
             let given = p.c_given.unwrap();
-            for (index, m) in both.iter_mut().enumerate() {
+            for (m, explicitly_given) in [(&mut ungiven, false), (&mut given_model, true)] {
                 if let Some(slot) = m.real_mut(field) {
                     *slot = sentinel;
                 } else {
                     *m.int_mut(field).unwrap() = -123_456;
                 }
-                *m.flag_mut(given).unwrap() = index == 1;
+                *m.flag_mut(given).unwrap() = explicitly_given;
             }
         }
-        for m in &mut both {
+        for m in [&mut ungiven, &mut given_model] {
             super::super::defaults_data::apply_independent_defaults(m);
         }
         let mut changed = 0;
@@ -1099,7 +1100,6 @@ mod tests {
             let p = super::super::DEVICE.model.get(keyword).unwrap();
             let field = p.c_field.unwrap();
             let given = p.c_given.unwrap();
-            let [ungiven, given_model] = &mut both;
             let (actual, original) = if let Some(slot) = ungiven.real_mut(field) {
                 (*slot, sentinel)
             } else {
@@ -1262,6 +1262,188 @@ mod tests {
             bNode: node::B,
             ..Instance::default()
         }
+    }
+
+    #[test]
+    fn normalized_model_and_instance_selectors_keep_c_warning_order() {
+        let mut model = Model {
+            version: "unknown".into(),
+            versionGiven: true,
+            wpemod: 3.,
+            wpemodGiven: true,
+            ..Model::default()
+        };
+        let selectors = [
+            ("mobMod", 0),
+            ("dioMod", 1),
+            ("capMod", 2),
+            ("rdsMod", 0),
+            ("rbodyMod", 0),
+            ("rgateMod", 0),
+            ("perMod", 1),
+            ("fnoiMod", 1),
+            ("tnoiMod", 0),
+            ("trnqsMod", 0),
+            ("acnqsMod", 0),
+            ("mtrlMod", 0),
+            ("mtrlCompatMod", 0),
+            ("igcMod", 0),
+            ("igbMod", 0),
+            ("tempMod", 0),
+        ];
+        let mut expected = Vec::new();
+        for (name, fallback) in selectors {
+            *model.int_mut(&format!("BSIM4{name}")).unwrap() = -1;
+            *model.flag_mut(&format!("BSIM4{name}Given")).unwrap() = true;
+            expected.push(format!(
+                "Warning: {name} has been set to its default value: {fallback}."
+            ));
+        }
+        expected.push("Warning: unknown BSIM4 version. Working now with BSIM4.8.3.".into());
+        expected.push("Warning: wpemod has been set to its default value: 0.".into());
+        let mut prepared = prepare_model(model, 300.15);
+        assert_eq!(prepared.warnings, expected);
+        for (name, fallback) in selectors {
+            assert_eq!(
+                *prepared.model.int_mut(&format!("BSIM4{name}")).unwrap(),
+                fallback
+            );
+            assert!(
+                *prepared
+                    .model
+                    .flag_mut(&format!("BSIM4{name}Given"))
+                    .unwrap()
+            );
+        }
+        let h = Instance {
+            rbodyMod: -1,
+            rbodyModGiven: true,
+            rgateMod: -1,
+            rgateModGiven: true,
+            trnqsMod: -1,
+            trnqsModGiven: true,
+            acnqsMod: -1,
+            acnqsModGiven: true,
+            ..instance()
+        };
+        let result = prepared.prepare_instance(h, false);
+        assert_eq!(
+            &result.warnings[expected.len()..],
+            [
+                "Warning: rbodyMod has been set to its global value 0.",
+                "Warning: rgateMod has been set to its global value 0.",
+                "Warning: trnqsMod has been set to its global value 0.",
+                "Warning: acnqsMod has been set to its global value 0.",
+            ]
+        );
+    }
+
+    #[test]
+    fn topology_order_and_aliases_cover_all_selector_combinations() {
+        for rds in [0, 1] {
+            for noise_mode in [0, 1, 2] {
+                for gate in 0..=3 {
+                    for body in 0..=2 {
+                        for nqs in [0, 1] {
+                            let prepared = prepare_model(
+                                Model {
+                                    rdsMod: rds,
+                                    rdsModGiven: true,
+                                    tnoiMod: noise_mode,
+                                    tnoiModGiven: true,
+                                    rgateMod: gate,
+                                    rgateModGiven: true,
+                                    rbodyMod: body,
+                                    rbodyModGiven: true,
+                                    trnqsMod: nqs,
+                                    trnqsModGiven: true,
+                                    sheetResistance: 10.,
+                                    sheetResistanceGiven: true,
+                                    ..Model::default()
+                                },
+                                300.15,
+                            );
+                            for noise_analysis in [false, true] {
+                                for squares in
+                                    [[false, false], [true, false], [false, true], [true, true]]
+                                {
+                                    let h = Instance {
+                                        drainSquares: 2.,
+                                        drainSquaresGiven: squares[0],
+                                        sourceSquares: 2.,
+                                        sourceSquaresGiven: squares[1],
+                                        ..instance()
+                                    };
+                                    let result =
+                                        prepared.clone().prepare_instance(h, noise_analysis);
+                                    let forced = rds == 1 || (noise_mode == 1 && noise_analysis);
+                                    assert_topology(
+                                        &result,
+                                        [
+                                            forced || squares[0],
+                                            forced || squares[1],
+                                            gate != 0,
+                                            gate == 3,
+                                            body != 0,
+                                            body != 0,
+                                            body != 0,
+                                            nqs != 0,
+                                        ],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_topology(result: &PreparedSetup, flags: [bool; 8]) {
+        let own = [
+            node::DP,
+            node::SP,
+            node::GP,
+            node::GM,
+            node::DB,
+            node::BP,
+            node::SB,
+            node::Q,
+        ];
+        let alias = [
+            node::D,
+            node::S,
+            node::G_EXT,
+            node::G_EXT,
+            node::B,
+            node::B,
+            node::B,
+            node::GROUND,
+        ];
+        let expected: Vec<_> = own
+            .into_iter()
+            .zip([
+                "drain", "source", "gate", "midgate", "dbody", "body", "sbody", "charge",
+            ])
+            .zip(flags)
+            .filter_map(|(node, create)| create.then_some(node))
+            .collect();
+        assert_eq!(result.created, expected);
+        let h = &result.instance;
+        let actual = [
+            h.dNodePrime,
+            h.sNodePrime,
+            h.gNodePrime,
+            h.gNodeMid,
+            h.dbNode,
+            h.bNodePrime,
+            h.sbNode,
+            h.qNode,
+        ];
+        for (((actual, own), alias), create) in actual.into_iter().zip(own).zip(alias).zip(flags) {
+            assert_eq!(actual, if create { own } else { alias });
+        }
+        assert!(result.warnings.is_empty());
     }
 
     #[test]
