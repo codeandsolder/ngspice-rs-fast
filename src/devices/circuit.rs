@@ -233,8 +233,9 @@ impl std::ops::Deref for PreparedMutualTerms {
     }
 }
 
-/// Analysis-owned effective device preparation. The circuit is borrowed
-/// immutably for the run, so no topology edit can invalidate a live view.
+/// Analysis-owned effective device preparation.
+///
+/// The circuit is borrowed immutably for the run, so no topology edit can invalidate a live view.
 /// Only the most recent exact context is retained; neither trial history nor
 /// solver workspaces are owned by this object.
 pub struct PreparedRun<'a> {
@@ -248,15 +249,22 @@ pub(super) struct PreparedPoint {
     mutual: std::cell::OnceCell<PreparedMutualTerms>,
 }
 
+fn effective_device<'a>(
+    circuit: &'a Circuit,
+    replacements: &'a [(usize, Box<dyn Device>)],
+    ordinal: usize,
+) -> &'a dyn Device {
+    replacements
+        .binary_search_by_key(&ordinal, |(index, _)| *index)
+        .map_or_else(
+            |_| circuit.devices[ordinal].as_ref(),
+            |index| replacements[index].1.as_ref(),
+        )
+}
+
 impl PreparedPoint {
     pub(super) fn device<'a>(&'a self, circuit: &'a Circuit, ordinal: usize) -> &'a dyn Device {
-        match self
-            .replacements
-            .binary_search_by_key(&ordinal, |(index, _)| *index)
-        {
-            Ok(index) => self.replacements[index].1.as_ref(),
-            Err(_) => circuit.devices[ordinal].as_ref(),
-        }
+        effective_device(circuit, &self.replacements, ordinal)
     }
 
     pub(super) fn mutual(&self, circuit: &Circuit) -> SpiceResult<PreparedMutualTerms> {
@@ -279,24 +287,22 @@ impl<'a> PreparedRun<'a> {
         &self,
         context: &ModelContext,
     ) -> SpiceResult<std::cell::Ref<'_, PreparedPoint>> {
-        let current = self.point.borrow();
-        if !current
-            .as_ref()
-            .is_some_and(|point| point.context.same_preparation(context))
-        {
-            drop(current);
-            // Validate once on a context transition. Do not discard a valid
-            // preparation on error (including a foreign override).
-            context.validate(&MODEL_CONTEXT_LOCATION)?;
-            let replacements = self.circuit.replacements(context)?;
-            self.point.replace(Some(PreparedPoint {
-                context: *context,
-                replacements,
-                mutual: std::cell::OnceCell::new(),
-            }));
-        } else {
-            drop(current);
+        if let Ok(point) = std::cell::Ref::filter_map(self.point.borrow(), |current| {
+            current
+                .as_ref()
+                .filter(|point| point.context.same_preparation(context))
+        }) {
+            return Ok(point);
         }
+        // Validate once on a context transition. Do not discard a valid
+        // preparation on error (including a foreign override).
+        context.validate(&MODEL_CONTEXT_LOCATION)?;
+        let replacements = self.circuit.replacements(context)?;
+        self.point.replace(Some(PreparedPoint {
+            context: *context,
+            replacements,
+            mutual: std::cell::OnceCell::new(),
+        }));
         std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
             .map_err(|_| SpiceError::circuit("missing prepared model context"))
     }
@@ -1043,12 +1049,8 @@ impl Circuit {
         if self.bindings.mutual.pairs.is_empty() {
             return Ok(PreparedMutualTerms::default());
         }
-        let device_at = |index: usize| -> &dyn Device {
-            match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
-                Ok(found) => replacements[found].1.as_ref(),
-                Err(_) => self.devices[index].as_ref(),
-            }
-        };
+        let device_at =
+            |index: usize| -> &dyn Device { effective_device(self, replacements, index) };
         let mut values = BTreeMap::new();
         for &index in self.bindings.mutual.degrees.keys() {
             let device = device_at(index);
@@ -2242,7 +2244,13 @@ impl Circuit {
                 )),
             }
         }
-        for (index, replacement) in &replacements {
+        self.validate_replacements(&replacements)?;
+        replacements.sort_unstable_by_key(|(index, _)| *index);
+        Ok(replacements)
+    }
+
+    fn validate_replacements(&self, replacements: &[(usize, Box<dyn Device>)]) -> SpiceResult<()> {
+        for (index, replacement) in replacements {
             let original = &self.devices[*index];
             if original.name() != replacement.name()
                 || original.c_device_type() != replacement.c_device_type()
@@ -2268,8 +2276,7 @@ impl Circuit {
                 )));
             }
         }
-        replacements.sort_unstable_by_key(|(index, _)| *index);
-        Ok(replacements)
+        Ok(())
     }
 
     fn check_matrix_pattern(&self, matrix: &SparseMatrix) -> SpiceResult<()> {
