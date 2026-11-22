@@ -95,6 +95,23 @@ Multiple plots are concatenated, exactly as they are in ASCII: a payload ends an
 the next plot's header begins at the next byte. `raw_read()` re-enters its line
 loop, so a file of many binary plots is what C expects too.
 
+The binary row decoder lends complete cell blocks from the existing buffered
+input, using endian-aware binary64 conversion on byte arrays. Only a cell
+straddling an input-buffer boundary needs a copied fragment (at most 16 bytes).
+Every consume is bounded by the current row, so lending a larger buffer
+containing the next plot's header cannot advance past the declared payload.
+Short fragments, interrupted reads, and partial final words retain exact
+consumed-byte diagnostics and the failed-row latch.
+
+Binary output uses one lazily allocated 32 KiB encoding block, independent of
+the plot or row size. Retained plots coalesce complete rows and flush at the
+plot boundary; very wide rows span blocks. Streamed rows reuse the same
+bounded block and flush its contents to the existing spool writer at the
+end of each pushed row, so no extra deferred write errors are introduced.
+No column metadata, floating-point bits, explicit byte order, collection
+limit or atomic transaction rule changes. ASCII and the zero-width rootless
+pole-zero result require no binary scratch allocation.
+
 That is also the layout of a multi-analysis batch run (`ngspice -b -r`, #96):
 one plot per analysis, in `CKTdoJob()` order. The opt-in
 `tests/c_batch_reference.rs` reads such a C binary file with

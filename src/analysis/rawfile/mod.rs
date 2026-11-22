@@ -283,8 +283,9 @@ impl RawFile {
     fn encode(&self, format: RawFormat, byte_order: BinaryByteOrder) -> SpiceResult<Vec<u8>> {
         self.validate()?;
         let mut bytes = Vec::new();
+        let mut binary = binary::Encoder::new();
         for raw_plot in &self.plots {
-            write_plot(&mut bytes, raw_plot, format, byte_order)
+            write_plot(&mut bytes, raw_plot, format, byte_order, &mut binary)
                 .map_err(|error| SpiceError::io("<rawfile memory buffer>", &error))?;
         }
         Ok(bytes)
@@ -310,8 +311,14 @@ impl RawFile {
         self.validate()?;
         let mut writer = RawFileWriter::create(path, format, byte_order)?;
         for raw_plot in &self.plots {
-            write_plot(&mut writer.out, raw_plot, format, byte_order)
-                .map_err(|error| writer.io_error(&error))?;
+            write_plot(
+                &mut writer.out,
+                raw_plot,
+                format,
+                byte_order,
+                &mut writer.binary,
+            )
+            .map_err(|error| writer.io_error(&error))?;
         }
         writer.finish()
     }
@@ -332,6 +339,7 @@ impl RawFile {
 #[derive(Debug)]
 pub struct RawFileWriter {
     out: BufWriter<File>,
+    binary: binary::Encoder,
     path: PathBuf,
     format: RawFormat,
     byte_order: BinaryByteOrder,
@@ -361,6 +369,7 @@ impl RawFileWriter {
     ) -> Self {
         Self {
             out: BufWriter::new(file),
+            binary: binary::Encoder::new(),
             path,
             format,
             byte_order,
@@ -381,8 +390,14 @@ impl RawFileWriter {
     /// variable (nothing is written then), or [`SpiceError::Io`].
     pub fn write_plot(&mut self, raw_plot: &RawPlot) -> SpiceResult<()> {
         validate_plot(&raw_plot.plot)?;
-        write_plot(&mut self.out, raw_plot, self.format, self.byte_order)
-            .map_err(|error| self.io_error(&error))
+        write_plot(
+            &mut self.out,
+            raw_plot,
+            self.format,
+            self.byte_order,
+            &mut self.binary,
+        )
+        .map_err(|error| self.io_error(&error))
     }
 
     /// Starts a plot whose points are pushed one at a time with
@@ -420,6 +435,7 @@ impl RawFileWriter {
             format: self.format,
             byte_order: self.byte_order,
             point_count: 0,
+            binary: binary::Encoder::new(),
             spool: BufWriter::new(file),
             temporary,
         }
@@ -489,6 +505,7 @@ pub struct StreamedPlot {
     format: RawFormat,
     byte_order: BinaryByteOrder,
     point_count: usize,
+    binary: binary::Encoder,
     // Field order closes the spool before the owned path is removed.
     spool: BufWriter<File>,
     temporary: OwnedTemporary,
@@ -530,14 +547,15 @@ impl StreamedPlot {
                 "zero variables with nonzero points outside a rootless pole-zero result",
             ));
         }
-        write_point(
-            &mut self.spool,
-            &self.header.plot,
-            self.format,
-            self.point_count,
-            values,
-            self.byte_order,
-        )
+        match self.format {
+            RawFormat::Ascii => {
+                render_ascii_point(&mut self.spool, &self.header.plot, self.point_count, values)
+            }
+            RawFormat::Binary => self
+                .binary
+                .write_row(&mut self.spool, &self.header.plot, values, self.byte_order)
+                .and_then(|()| self.binary.flush(&mut self.spool)),
+        }
         .map_err(|error| SpiceError::io(self.temporary.path(), &error))?;
         self.point_count = next_count;
         Ok(())
@@ -571,30 +589,24 @@ fn write_plot(
     raw_plot: &RawPlot,
     format: RawFormat,
     byte_order: BinaryByteOrder,
+    binary: &mut binary::Encoder,
 ) -> io::Result<()> {
     let plot = &raw_plot.plot;
     render_header(out, raw_plot, plot.point_count(), format)?;
-    for (index, point) in plot.rows().enumerate() {
-        write_point(out, plot, format, index, point, byte_order)?;
+    match format {
+        RawFormat::Ascii => {
+            for (index, point) in plot.rows().enumerate() {
+                render_ascii_point(out, plot, index, point)?;
+            }
+        }
+        RawFormat::Binary => {
+            for point in plot.rows() {
+                binary.write_row(out, plot, point, byte_order)?;
+            }
+            binary.flush(out)?;
+        }
     }
     Ok(())
-}
-
-/// Writes point `index` of `plot` in `format`, as `raw_write()` does: in ASCII
-/// the index, one tab-led line per value and a blank line; in binary one
-/// `double` (or `re, im` pair) per value in the selected byte order.
-fn write_point(
-    out: &mut impl Write,
-    plot: &Plot,
-    format: RawFormat,
-    index: usize,
-    point: &[Complex],
-    byte_order: BinaryByteOrder,
-) -> io::Result<()> {
-    match format {
-        RawFormat::Ascii => render_ascii_point(out, plot, index, point),
-        RawFormat::Binary => binary::write_point(out, plot, point, byte_order),
-    }
 }
 
 fn render_ascii_point(
@@ -1293,21 +1305,20 @@ impl<R: BufRead> RawPlotRows<'_, R> {
 
     fn decode_binary_row(&mut self) -> SpiceResult<()> {
         let columns = self.header.plot.variables().len();
-        for _ in 0..columns {
-            let Some(value) = binary::read_value(
-                &mut self.reader.cursor.input,
-                self.header.plot.flags(),
-                self.reader.byte_order,
-                &mut self.consumed,
-            )
-            .map_err(|error| input_error(&error))?
-            else {
-                return Err(unsupported(format!(
-                    "truncated binary rawfile: No. Variables: {columns} x No. Points: {} needs {} byte(s) of data, but only {} byte(s) remain",
-                    self.point_count, self.payload_len, self.consumed,
-                )));
-            };
-            self.row.push(value);
+        if !binary::read_row(
+            &mut self.reader.cursor.input,
+            columns,
+            self.header.plot.flags(),
+            self.reader.byte_order,
+            &mut self.consumed,
+            &mut self.row,
+        )
+        .map_err(|error| input_error(&error))?
+        {
+            return Err(unsupported(format!(
+                "truncated binary rawfile: No. Variables: {columns} x No. Points: {} needs {} byte(s) of data, but only {} byte(s) remain",
+                self.point_count, self.payload_len, self.consumed,
+            )));
         }
         Ok(())
     }
