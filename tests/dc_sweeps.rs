@@ -49,7 +49,7 @@ fn op(c: &mut Circuit, context: &AnalysisContext) -> Plot {
 }
 fn close(got: f64, want: f64, relative: f64, absolute: f64) {
     assert!(
-        (got - want).abs() <= relative * want.abs() + absolute,
+        (got - want).abs() <= relative.mul_add(want.abs(), absolute),
         "{got:e} != {want:e}"
     );
 }
@@ -74,12 +74,12 @@ fn assert_no_outer_column(p: &Plot) {
     let names: Vec<_> = p.variables().iter().map(|v| v.name.as_str()).collect();
     assert!(names.iter().all(|n| !n.starts_with("sweep")), "{names:?}");
 }
-fn grid(start: f64, stop: f64, step: f64) -> SpiceResult<Vec<f64>> {
+fn grid(start: f64, stop: f64, increment: f64) -> SpiceResult<Vec<f64>> {
     SweepSpec {
         target: SweepTarget::VoltageSource("v1".into()),
         start,
         stop,
-        step,
+        step: increment,
     }
     .grid()
 }
@@ -93,7 +93,7 @@ fn reachable_inclusive_endpoints_survive_binary_rounding() {
     assert_eq!(g.len(), 4);
     assert_eq!(*g.last().unwrap(), 0.3);
     for (i, v) in g.iter().enumerate() {
-        close(*v, 0.1 * i as f64, 1e-12, 1e-15);
+        close(*v, 0.1 * f64::from(u32::try_from(i).unwrap()), 1e-12, 1e-15);
     }
     let g = grid(0., 1., 0.1).unwrap();
     assert_eq!((g.len(), *g.last().unwrap()), (11, 1.));
@@ -138,12 +138,17 @@ fn invalid_grids_are_rejected_before_any_value_is_produced() {
         (-1e308, 1e308, 1.),    // span overflows
         (0., 1e300, 1.),        // step count overflows the point limit
         (0., 1., 1e-6),         // too many points
-        (0., MAX_SWEEP_POINTS as f64, 1.), // one past the limit
+        (0., f64::from(u32::try_from(MAX_SWEEP_POINTS).unwrap()), 1.), // one past the limit
     ] {
         assert!(grid(start, stop, step).is_err(), "{start} {stop} {step}");
     }
     // Exactly the limit is allowed.
-    let g = grid(0., (MAX_SWEEP_POINTS - 1) as f64, 1.).unwrap();
+    let g = grid(
+        0.,
+        f64::from(u32::try_from(MAX_SWEEP_POINTS - 1).unwrap()),
+        1.,
+    )
+    .unwrap();
     assert_eq!(
         (g.len(), g[MAX_SWEEP_POINTS - 1]),
         (MAX_SWEEP_POINTS, 99_999.)
@@ -194,7 +199,7 @@ fn endpoint_rounding_reaches_the_run() {
     // Accumulated sweep endpoint: three binary64 additions, not a literal.
     assert_eq!(
         *column(&p, "v(v-sweep)").last().unwrap(),
-        0.30000000000000004
+        0.300_000_000_000_000_04
     );
     assert_column(&p, "i(v1)", &[0., -1e-4, -2e-4, -3e-4], 1e-12, 1e-18);
     // Reverse sweep starts at the correctly rounded 0.3. Sequential
@@ -202,7 +207,7 @@ fn endpoint_rounding_reaches_the_run() {
     let p = run(&mut c, &["v1", "0.3", "0", "-0.1"]).unwrap();
     assert_eq!(
         column(&p, "v(v-sweep)").last(),
-        Some(&(-2.7755575615628914e-17))
+        Some(&(-2.775_557_561_562_891_4e-17))
     );
     assert_eq!(p.point_count(), 4);
     assert_eq!(p.variables()[0].name, "v(v-sweep)");
@@ -242,7 +247,7 @@ fn nested_voltage_grids_are_inner_fast_forward_and_reverse() {
 fn nested_current_and_voltage_grids_forward_and_reverse() {
     // KCL at a: I = va/1k + (va - V2)/1k.
     let mut c = circuit("i1 0 a 0\nv2 b 0 0\nr1 a 0 1k\nr2 a b 1k");
-    let va = |i: f64, v2: f64| (i * 1e3 + v2) / 2.;
+    let va = |i: f64, v2: f64| (i * 1e3).midpoint(v2);
     let p = run(&mut c, &["i1", "0", "2m", "1m", "v2", "0", "2", "2"]).unwrap();
     assert_column(
         &p,
@@ -383,7 +388,7 @@ fn model_backed_sweeps_sweep_the_supplied_scalar_and_keep_temperature_scale_and_
 #[test]
 fn resistor_and_temperature_axes_in_both_orders_recompute_model_backed_values() {
     let mut c = circuit("v1 a 0 1\nr1 a 0 rm\n.model rm r(r=1k tc1=0.01)");
-    let r = |supplied: f64, t: f64| supplied * (1. + 0.01 * (t - 27.));
+    let r = |supplied: f64, t: f64| supplied * (0.01_f64.mul_add(t - 27., 1.));
     let p = run(&mut c, &["r1", "1k", "2k", "1k", "temp", "27", "47", "20"]).unwrap();
     // Only the inner scale is written; i(v1) carries the outer value.
     assert_column(&p, "res-sweep", &[1e3, 2e3, 1e3, 2e3], 1e-12, 0.);
@@ -409,7 +414,7 @@ fn temperature_sweeps_recompute_models_and_instance_temp_stays_fixed() {
     assert_column(&p, "temp-sweep", &[27., 37., 47.], 0., 0.);
     let want: Vec<_> = [27., 37., 47.]
         .iter()
-        .map(|t| -(1. / 1500. + 1. / (1e3 * (1. + 0.01 * (t - 27.)))))
+        .map(|t| -(1. / 1500. + 1. / (1e3 * (0.01_f64.mul_add(t - 27., 1.)))))
         .collect();
     assert_column(&p, "i(v1)", &want, 1e-9, 0.);
 }
@@ -440,11 +445,11 @@ fn nonlinear_circuits_converge_at_every_resistor_point() {
     )
     .unwrap();
     assert_eq!(p.point_count(), 4);
-    let vt = (1.38064852e-23 / 1.6021766208e-19) * 300.15;
+    let vt = (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
     let mut previous = f64::INFINITY;
     for (row, supplied) in [1e3, 2e3, 3e3, 4e3].iter().enumerate() {
         let v = p.value("v(d)", row).unwrap().re;
-        let diode = 1e-14 * ((v / vt).exp() - 1.) + 1e-12 * v;
+        let diode = 1e-12_f64.mul_add(v, 1e-14 * (v / vt).exp_m1());
         close((1. - v) / supplied, diode, 1e-9, 1e-15);
         close(p.value("i(v1)", row).unwrap().re, -diode, 1e-9, 1e-15);
         assert!(
@@ -572,7 +577,7 @@ struct Probe {
     accepted: Rc<Cell<usize>>,
 }
 impl Device for Probe {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "x2"
     }
     fn designator(&self) -> char {
@@ -611,7 +616,7 @@ fn probe(c: &mut Circuit, node: &str) -> (Rc<Cell<usize>>, Rc<Cell<usize>>) {
 struct DcOnlyProbe(NodeId);
 
 impl Device for DcOnlyProbe {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "x_dc_only"
     }
     fn designator(&self) -> char {
@@ -650,7 +655,7 @@ struct ContextProbe {
     accepted: Rc<Cell<usize>>,
 }
 impl Device for ContextProbe {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "x_context"
     }
     fn designator(&self) -> char {
@@ -717,7 +722,7 @@ struct Gate {
     accepted: Rc<Cell<usize>>,
 }
 impl Device for Gate {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "x1"
     }
     fn designator(&self) -> char {

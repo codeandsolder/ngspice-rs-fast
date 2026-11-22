@@ -28,7 +28,7 @@ impl PointSink for TimedSink {
         Ok(())
     }
     fn end(&mut self) -> SpiceResult<()> {
-        self.solve = self.start.elapsed() - self.prepared;
+        self.solve = self.start.elapsed().checked_sub(self.prepared).unwrap();
         Ok(())
     }
 }
