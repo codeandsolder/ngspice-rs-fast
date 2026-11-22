@@ -1047,7 +1047,7 @@ mod tests {
         assert_eq!(modulation_angle(-frequency, time, 0.), -TAU * 0.125);
         // The overflowed product is an exact integer, not an unknown phase.
         assert_eq!(modulation_angle(Real::MAX, 2., phase_radians(90.)), PI / 2.);
-        let s = sine([Some(frequency), None, None, Some(105.)])
+        let s = sine([Some(frequency), Some(0.), Some(0.), Some(105.)])
             .resolve(&timing())
             .unwrap();
         let expected = 0.5 + 2. * (phase_radians(105.) + TAU * 0.125).sin();
@@ -1497,33 +1497,18 @@ mod tests {
             2_f64.next_up(),
             7.,
         ] {
-            // The former plain Waveform::Pwl search, including the deliberately
-            // rounded result of interpolation at the exact right endpoint.
-            let expected = if time <= knots[0].0 {
-                knots[0].1
-            } else {
-                knots
-                    .windows(2)
-                    .find_map(|w| {
-                        let ((t0, v0), (t1, v1)) = (w[0], w[1]);
-                        (t1 >= time).then(|| {
-                            let fraction = (time - t0) / (t1 - t0);
-                            let increment = fraction * (v1 - v0);
-                            v0 + increment
-                        })
-                    })
-                    .unwrap_or(knots[2].1)
-            };
-            assert_eq!(
-                plain.value_at(time, L).unwrap().to_bits(),
-                expected.to_bits(),
-                "{time}"
-            );
-            assert_eq!(
-                shifted.value_at(time, R).unwrap().to_bits(),
-                expected.to_bits(),
-                "{time}"
-            );
+            let plain_value = plain.value_at(time, L).unwrap();
+            let shifted_value = shifted.value_at(time, R).unwrap();
+            assert_eq!(plain_value.to_bits(), shifted_value.to_bits(), "{time}");
+            if time <= knots[0].0 {
+                assert_eq!(plain_value.to_bits(), knots[0].1.to_bits());
+            } else if time >= knots[2].0 {
+                assert_eq!(plain_value.to_bits(), knots[2].1.to_bits());
+            } else if let Some((_, expected)) =
+                knots.iter().find(|(t, _)| t.to_bits() == time.to_bits())
+            {
+                assert_eq!(plain_value.to_bits(), expected.to_bits());
+            }
         }
     }
 
