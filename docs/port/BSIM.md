@@ -342,6 +342,31 @@ The AC/NQS changes do not execute in those cases and must not be used to
 justify altering the established reference tolerances.
 
 
+### BSIM4 noise trap-density conditioning (#89)
+
+The flicker-noise kernel (`noise.rs`) removes its blanket
+`clippy::suboptimal_flops` suppression (16 reviewed FMA sites) and now
+retains physically measurable carrier depletion even if the factor
+`1 - Vdseff*AbovVgst2Vtm` rounds to exactly one. The trap density
+change is evaluated as `N0 * depletion` while depletion is small, rather
+than subtracting two independently rounded large densities. This value
+feeds both the B term and the factored quadratic C term
+`(N0 - Nl) * (N0 + Nl) / 2`, avoiding cancellation in `N0² - Nl²`.
+The A logarithmic term uses `ln1p(density_drop/(Nl+nstar))` over the
+positive finite physical domain, falling back to the original clamped
+formula for invalid or boundary values. The correlated thermal-noise
+branch likewise uses its direct depletion product instead of
+`1 - (1 - depletion)`, which would lose sub-ULP signal. No threshold
+or temperature/state selector was altered.
+
+The regression uses the actual flicker-noise model with charge depletion
+`2^-55`, at which both old `N0 - Nl` and old `N0² - Nl²` are zero after
+binary64 rounding, and verifies the logarithmic A and quadratic C
+noise-density components against independent analytic expressions. Pinned
+C full-noise goldens and all noise-mode integration tests provide the
+normal-domain guard; the tiny-gradient result intentionally improves
+on C's lost precision.
+
 ### Pole-zero NQS charge-partition accuracy (#89)
 
 The PZ kernel (`pzld.rs`) no longer suppresses 40 FMA opportunities,
