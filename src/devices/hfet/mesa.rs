@@ -199,6 +199,25 @@ struct Nodes {
     dpp: NodeId,
 }
 
+impl Nodes {
+    /// The five resistive edges are absent when both ends are the same
+    /// circuit unknown. In sensitivity replay a zero-valued resistance may
+    /// acquire a large conductance without changing the prepared topology:
+    /// exclude it before grouping any diagonal terms, not after rounding.
+    fn series(self, derived: &Derived) -> [Real; 5] {
+        let edge = |a, b, conductance| {
+            if a == b { 0. } else { conductance }
+        };
+        [
+            edge(self.d, self.dp, derived.gdpr),
+            edge(self.s, self.sp, derived.gspr),
+            edge(self.g, self.gp, derived.ggate),
+            edge(self.sp, self.spp, derived.tgi),
+            edge(self.dp, self.dpp, derived.tgf),
+        ]
+    }
+}
+
 /// MESA level 2.
 #[derive(Debug, Clone)]
 pub(in crate::devices) struct Mesa {
@@ -1420,9 +1439,8 @@ impl Device for Mesa {
         context.stamp_rhs(self.nodes.spp, f64::mul_add(ggspp, -vgspp, cgspp))?;
         let (gds, gm) = (point.gds, point.gm);
         let (ggs, ggd) = (point.ggs, point.ggd);
-        let (gdpr, gspr, ggate) = (derived.gdpr, derived.gspr, derived.ggate);
-        let (tgi, tgf) = (derived.tgi, derived.tgf);
         let n = self.nodes;
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&derived);
         for (row, col, value) in [
             (n.d, n.d, m * gdpr),
             (n.s, n.s, m * gspr),
@@ -1520,8 +1538,7 @@ impl Device for Mesa {
             context.model_context.frequency,
         )?;
         let n = self.nodes;
-        let (gdpr, gspr, ggate) = (derived.gdpr, derived.gspr, derived.ggate);
-        let (tgi, tgf) = (derived.tgi, derived.tgf);
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&derived);
         for (a, b, value) in [
             (n.d, n.d, m * gdpr),
             (n.s, n.s, m * gspr),
@@ -2076,9 +2093,9 @@ impl Device for ResetMesa {
         let (ggs, ggd, ggspp, ggdpp) = (point.ggs, point.ggd, 0., 0.);
         let current = &self.current;
         let c = current.derived(temperature, nominal)?;
-        let (gdpr, gspr, ggate, tgi, tgf) = (c.gdpr, c.gspr, c.ggate, c.tgi, c.tgf);
         let m = current.instance.m;
         let n = current.nodes;
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&c);
         let stamps = [
             (n.d, n.d, m * gdpr),
             (n.s, n.s, m * gspr),
