@@ -168,6 +168,53 @@ impl ExactSum {
         }
     }
 
+    /// Insert one exact signed finite binary64 product, without forming a
+    /// potentially overflowing binary64 intermediate. Used by explicitly
+    /// requested original-unit solver residual diagnostics.
+    pub(crate) fn add_product(&mut self, lhs: Real, rhs: Real) {
+        self.add(ExactTerm::from_real(lhs).product(ExactTerm::from_real(rhs)));
+    }
+
+    /// Round the full signed product sum once, including recoverable
+    /// cancellation across otherwise overflowing or subnormal products.
+    pub(crate) fn rounded_sum(&self) -> Real {
+        let normalized = Self {
+            bins: self.bins,
+            terms: self.terms,
+        }
+        .magnitude()
+        .scaled();
+        scale_power(normalized.mantissa, normalized.exponent)
+    }
+
+    /// The absolute quotient of two superaccumulators. The components are
+    /// rounded independently into binary mantissas and their physical
+    /// exponents remain separate until the final dimensionless division.
+    /// A tiny finite ratio is permitted to underflow; the opposite overflow
+    /// is meaningful (the requested error is genuinely unbounded).
+    pub(crate) fn magnitude_ratio(&self, denominator: &Self) -> Real {
+        let numerator = Self {
+            bins: self.bins,
+            terms: self.terms,
+        }
+        .magnitude()
+        .scaled();
+        let denominator = Self {
+            bins: denominator.bins,
+            terms: denominator.terms,
+        }
+        .magnitude()
+        .scaled();
+        if denominator.mantissa == 0. {
+            return if numerator.mantissa == 0. {
+                0.
+            } else {
+                Real::INFINITY
+            };
+        }
+        numerator.divide(denominator).abs()
+    }
+
     fn add(&mut self, term: ExactTerm) {
         self.add_unsigned(
             term.significand.unsigned_abs(),
@@ -559,6 +606,30 @@ mod tests {
             rounded_product_ratio([(Real::from_bits(3), 1., false)], [(2., false)]).to_bits(),
             Real::from_bits(2).to_bits()
         );
+    }
+
+    #[test]
+    fn exact_signed_sum_rounds_boundary_values_and_cancellation() {
+        let tiny = Real::from_bits(1);
+        for value in [0., tiny, -tiny, 1., -1., Real::MAX, -Real::MAX] {
+            let mut total = ExactSum::new();
+            total.add_product(value, 1.);
+            assert_eq!(total.rounded_sum().to_bits(), value.to_bits(), "{value:e}");
+        }
+        let mut total = ExactSum::new();
+        total.add_product(Real::MAX, 2.);
+        total.add_product(-Real::MAX, 1.);
+        assert_eq!(total.rounded_sum(), Real::MAX);
+        total.add_product(-Real::MAX, 1.);
+        assert_eq!(total.rounded_sum(), 0.);
+        total.add_product(-Real::MAX, 3.);
+        assert_eq!(total.rounded_sum(), Real::NEG_INFINITY);
+        let mut tie = ExactSum::new();
+        tie.add_product(1., 1.);
+        tie.add_product(2_f64.powi(-53), 1.);
+        assert_eq!(tie.rounded_sum(), 1.);
+        tie.add_product(2_f64.powi(-53), 1.);
+        assert_eq!(tie.rounded_sum(), 1. + f64::EPSILON);
     }
 
     #[test]
