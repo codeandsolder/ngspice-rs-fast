@@ -38,7 +38,7 @@ use crate::devices::{MnaUnknowns, ModelContext, SourceKind};
 use crate::maths::Vector;
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 
-mod layout;
+pub(crate) mod layout;
 pub(crate) use layout::BoundTransfer;
 pub use layout::{BoundNoiseSource, NoiseInstance, NoisePlan};
 
