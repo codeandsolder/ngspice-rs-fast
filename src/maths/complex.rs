@@ -4,13 +4,14 @@
 //! C: `SMPcLUfac`/`SMPcReorder`/`SMPcSolve`/`SMPcaSolve` (`spsmp.c`). As in
 //! [`crate::maths::linear`], there is no condition estimate or residual check;
 //! singular pivots and non-finite solutions are errors.
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::maths::linear::{
     BatchSolveFailure, ComplexFactors, PivotTolerances, SolveBatchWorkspace, check_status,
     numerical, order_fresh, square,
 };
-use crate::maths::sparse13::{Sparse, Status};
+use crate::maths::sparse13::{IndependentFactorTileWorkspace, Sparse, Status};
 use crate::maths::{FactorStorage, FactorWork, Pattern, SparseMatrix};
 use crate::primitives::{Complex, SpiceResult};
 
@@ -598,6 +599,80 @@ impl ComplexMatrix {
         }
     }
 
+    /// The numeric original-element stream in this matrix's creation order.
+    /// Bound circuit matrices borrow their values; standalone matrices
+    /// materialize only their folded numeric entries when needed.
+    fn original_values(&self) -> Cow<'_, [Complex]> {
+        match &self.assembly {
+            Assembly::Bound { values, .. } => Cow::Borrowed(values),
+            Assembly::Standalone(entries) => {
+                Cow::Owned(entries.iter().map(|&(_, _, value)| value).collect())
+            }
+        }
+    }
+
+    fn shares_order_with(&self, previous: &ComplexLu) -> bool {
+        previous.n == self.n
+            && match (&self.assembly, &previous.order) {
+                (Assembly::Bound { pattern, .. }, ComplexOrder::Bound(old)) => {
+                    Arc::ptr_eq(pattern, old)
+                }
+                (Assembly::Standalone(entries), order) => order.matches(entries),
+                _ => false,
+            }
+    }
+
+    /// Factor an independent complex operator with another point's symbolic
+    /// topology, without mutating the circuit's cached pivot order.
+    ///
+    /// Numeric factors and per-point pivot status remain owned independently.
+    /// A zero pivot retries with a fresh threshold order for this point only.
+    /// Callers must not use this for a warm-started, frequency-dependent bias.
+    ///
+    /// # Errors
+    /// Invalid or singular numeric factorization.
+    pub fn factorize_independent(&self, previous: Option<&ComplexLu>) -> SpiceResult<ComplexLu> {
+        let Some(previous) = previous else {
+            return self.factorize_new_matrix();
+        };
+        if !self.shares_order_with(previous) {
+            return self.factorize_new_matrix();
+        }
+        let mut sparse = match &self.assembly {
+            Assembly::Bound { values, .. } => {
+                previous.factors.sparse.fork_loaded(values.iter().copied())
+            }
+            Assembly::Standalone(entries) => previous
+                .factors
+                .sparse
+                .fork_loaded(entries.iter().map(|&(_, _, value)| value)),
+        };
+        let mut status = sparse.factor_with_workspace(&mut Vec::new());
+        let mut work = sparse.last_attempt();
+        if status == Status::ZeroDiag {
+            work.zero_pivot_retries += 1;
+            match &self.assembly {
+                Assembly::Bound { values, .. } => {
+                    sparse.reload_originals_iter(values.iter().copied());
+                }
+                Assembly::Standalone(entries) => {
+                    sparse.reload_originals_iter(entries.iter().map(|&(_, _, value)| value));
+                }
+            }
+            status = sparse.order_and_factor(self.pivot.relative, self.pivot.absolute);
+            work += sparse.last_attempt();
+        }
+        check_status("complex sparse LU", status, &sparse, self.names.as_ref())?;
+        Ok(ComplexLu {
+            n: self.n,
+            order: self.order_key(),
+            factors: ComplexFactors {
+                work,
+                sparse: Arc::new(sparse),
+            },
+        })
+    }
+
     /// Refactors with the pivot order of `previous` when the pattern is
     /// identical (`SMPcLUfac`, `spFactor`), reordering after a zero pivot
     /// (`SMPcReorder`) as `NIacIter` does; otherwise orders afresh.
@@ -638,8 +713,192 @@ impl ComplexMatrix {
     }
 }
 
+/// Independent small-signal points share an immutable sparse elimination plan,
+/// never their numeric pivots or the circuit's mutable ordering cache.
+/// A tile contains at most four points and is allowed to fail per lane.
+#[derive(Debug, Default)]
+pub struct IndependentComplexBatch {
+    previous: Option<ComplexLu>,
+    workspace: IndependentFactorTileWorkspace,
+}
+
+impl IndependentComplexBatch {
+    /// Solve independent numerical matrices and right-hand sides without
+    /// constructing scalar factor snapshots for every successful SIMD lane.
+    /// Results retain one status per input matrix, including after failures.
+    /// All matrices must have a corresponding external-order RHS.
+    ///
+    /// # Errors
+    /// A missing RHS or failure to allocate the bounded result list.
+    pub fn solve(
+        &mut self,
+        matrices: &[ComplexMatrix],
+        rhs: &[&[Complex]],
+        transposed: bool,
+    ) -> SpiceResult<Vec<SpiceResult<Vec<Complex>>>> {
+        if matrices.len() != rhs.len() {
+            return Err(numerical(
+                "independent complex solve",
+                "matrix/RHS point count mismatch",
+            ));
+        }
+        let mut results = Vec::new();
+        results.try_reserve(matrices.len()).map_err(|error| {
+            numerical(
+                "independent complex solve",
+                format!("result allocation: {error}"),
+            )
+        })?;
+        let mut offset = 0;
+        if self.previous.is_none() && !matrices.is_empty() {
+            results.push(self.solve_one(&matrices[0], rhs[0], transposed));
+            offset = 1;
+        }
+        for (tile, source_tile) in matrices[offset..].chunks(4).zip(rhs[offset..].chunks(4)) {
+            if let Some(previous) = self.previous.as_ref().filter(|previous| {
+                tile.len() >= 2 && tile.iter().all(|matrix| matrix.shares_order_with(previous))
+            }) {
+                let inputs: Vec<_> = tile.iter().map(ComplexMatrix::original_values).collect();
+                let originals: Vec<&[Complex]> = inputs.iter().map(Cow::as_ref).collect();
+                if let Some((statuses, solutions)) = Sparse::factor_and_solve_independent_tile(
+                    &previous.factors.sparse,
+                    &originals,
+                    source_tile,
+                    &mut self.workspace,
+                    transposed,
+                ) {
+                    for ((matrix, rhs), (status, solution)) in tile
+                        .iter()
+                        .zip(source_tile.iter().copied())
+                        .zip(statuses.into_iter().zip(solutions))
+                    {
+                        if status == Status::Okay
+                            && let Some(solution) = solution
+                        {
+                            results.push(Ok(solution));
+                            continue;
+                        }
+                        // A failed lane is retried independently with the
+                        // exact scalar pivot/reordering and error policy.
+                        results.push(self.solve_one(matrix, rhs, transposed));
+                    }
+                    continue;
+                }
+            }
+            for (matrix, rhs) in tile.iter().zip(source_tile.iter().copied()) {
+                results.push(self.solve_one(matrix, rhs, transposed));
+            }
+        }
+        Ok(results)
+    }
+
+    fn solve_one(
+        &mut self,
+        matrix: &ComplexMatrix,
+        rhs: &[Complex],
+        transposed: bool,
+    ) -> SpiceResult<Vec<Complex>> {
+        let factors = matrix.factorize_independent(self.previous.as_ref())?;
+        let result = if transposed {
+            factors.solve_transposed(rhs)
+        } else {
+            factors.solve(rhs)
+        };
+        self.previous = Some(factors);
+        result
+    }
+
+    /// Factor independent matrices in input order, reporting every lane's
+    /// status even when another point fails. Zero pivots retry their own lane
+    /// with a scalar pivot search; tails use actual lanes, not dummy operators.
+    pub fn factorize(&mut self, matrices: &[ComplexMatrix]) -> Vec<SpiceResult<ComplexLu>> {
+        let mut results = Vec::with_capacity(matrices.len());
+        if matrices.is_empty() {
+            return results;
+        }
+        let mut offset = 0;
+        if self.previous.is_none() {
+            let first = matrices[0].factorize_independent(None);
+            match first {
+                Ok(factor) => {
+                    self.previous = Some(factor.clone());
+                    results.push(Ok(factor));
+                    offset = 1;
+                }
+                Err(error) => {
+                    results.push(Err(error));
+                    offset = 1;
+                }
+            }
+        }
+        if let Some(previous) = self.previous.as_ref().filter(|previous| {
+            matrices.len() - offset >= 2
+                && matrices[offset..]
+                    .iter()
+                    .all(|matrix| matrix.shares_order_with(previous))
+        }) {
+            let mut frames: Vec<_> = matrices[offset..]
+                .iter()
+                .map(|matrix| match &matrix.assembly {
+                    Assembly::Bound { values, .. } => {
+                        previous.factors.sparse.fork_loaded(values.iter().copied())
+                    }
+                    Assembly::Standalone(entries) => previous
+                        .factors
+                        .sparse
+                        .fork_loaded(entries.iter().map(|&(_, _, value)| value)),
+                })
+                .collect();
+            if let Some(statuses) =
+                Sparse::factor_independent_tile(&mut frames, &mut self.workspace)
+            {
+                for ((matrix, mut sparse), mut status) in
+                    matrices[offset..].iter().zip(frames).zip(statuses)
+                {
+                    let mut work = sparse.last_attempt();
+                    if status == Status::ZeroDiag {
+                        work.zero_pivot_retries += 1;
+                        status =
+                            sparse.order_and_factor(matrix.pivot.relative, matrix.pivot.absolute);
+                        work += sparse.last_attempt();
+                    }
+                    if let Err(error) =
+                        check_status("complex sparse LU", status, &sparse, matrix.names.as_ref())
+                    {
+                        results.push(Err(error));
+                        continue;
+                    }
+                    let factor = ComplexLu {
+                        n: matrix.n,
+                        order: matrix.order_key(),
+                        factors: ComplexFactors {
+                            sparse: Arc::new(sparse),
+                            work,
+                        },
+                    };
+                    self.previous = Some(factor.clone());
+                    results.push(Ok(factor));
+                }
+                return results;
+            }
+        }
+        for matrix in &matrices[offset..] {
+            match matrix.factorize_independent(self.previous.as_ref()) {
+                Ok(factor) => {
+                    self.previous = Some(factor.clone());
+                    results.push(Ok(factor));
+                }
+                Err(error) => {
+                    results.push(Err(error));
+                }
+            }
+        }
+        results
+    }
+}
+
 /// Owned complex factors; subsequent real operator mutations cannot stale them.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ComplexLu {
     n: usize,
     order: ComplexOrder,
@@ -774,6 +1033,265 @@ impl ComplexLu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_frequency_tiles_match_scalar_solve_and_transpose() {
+        let positions = (0..3).flat_map(|r| (0..3).map(move |c| (r, c)));
+        let pattern = Arc::new(Pattern::new(3, positions).unwrap());
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let mut e = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let coefficients = [
+            (0, 0, 5., 0.125),
+            (0, 1, -0.5, -0.05),
+            (1, 0, 0.75, 0.025),
+            (1, 1, 7., 0.3),
+            (1, 2, -0.25, 0.2),
+            (2, 1, -0.125, 0.08),
+            (2, 2, 9., 0.4),
+        ];
+        for &(r, c, conductance, capacitance) in &coefficients {
+            a.add(r, c, conductance).unwrap();
+            e.add(r, c, capacitance).unwrap();
+        }
+        let frequencies = [0., 0.01, 0.1, 1., 3., 10., 20.];
+        let matrices: Vec<_> = frequencies
+            .map(|omega| {
+                ComplexMatrix::from_operators_on(&pattern, &a, &e, omega)
+                    .unwrap()
+                    .unwrap()
+            })
+            .into();
+        let rhs = [
+            Complex::new(1., 2.),
+            Complex::new(-2., 3.),
+            Complex::new(4., -1.),
+        ];
+        let mut batch = IndependentComplexBatch::default();
+        let mut refactored = 0;
+        for tile in matrices.chunks(4) {
+            let factors = batch.factorize(tile);
+            assert_eq!(factors.len(), tile.len());
+            for (matrix, factor) in tile.iter().zip(factors) {
+                let factor = factor.unwrap();
+                refactored += factor.factor_work().fixed_refactors;
+                let scalar = matrix.factorize_new_matrix().unwrap();
+                for transpose in [false, true] {
+                    let actual = if transpose {
+                        factor.solve_transposed(&rhs).unwrap()
+                    } else {
+                        factor.solve(&rhs).unwrap()
+                    };
+                    let expected = if transpose {
+                        scalar.solve_transposed(&rhs).unwrap()
+                    } else {
+                        scalar.solve(&rhs).unwrap()
+                    };
+                    for (actual, expected) in actual.into_iter().zip(expected) {
+                        let scale = expected.re.abs().max(expected.im.abs()).max(1.);
+                        assert!((actual.re - expected.re).abs() <= 1e-12 * scale);
+                        assert!((actual.im - expected.im).abs() <= 1e-12 * scale);
+                    }
+                }
+            }
+        }
+        // The no-snapshot path keeps factors packed through the solve,
+        // including transposes and the final partial tile.
+        let rhs_lanes = vec![rhs.as_slice(); matrices.len()];
+        for transpose in [false, true] {
+            let mut solve_batch = IndependentComplexBatch::default();
+            let packed_solutions = solve_batch.solve(&matrices, &rhs_lanes, transpose).unwrap();
+            assert_eq!(packed_solutions.len(), matrices.len());
+            for (index, (matrix, solution)) in matrices.iter().zip(packed_solutions).enumerate() {
+                let scalar = matrix.factorize_new_matrix().unwrap();
+                let expected = if transpose {
+                    scalar.solve_transposed(&rhs).unwrap()
+                } else {
+                    scalar.solve(&rhs).unwrap()
+                };
+                let actual = solution.unwrap();
+                for (a, b) in actual.iter().zip(expected) {
+                    let scale = b.re.abs().max(b.im.abs()).max(1.);
+                    assert!((a.re - b.re).abs() <= 1e-12 * scale);
+                    assert!((a.im - b.im).abs() <= 1e-12 * scale);
+                }
+                // Independent physical backward-error check against A+jωE
+                // rather than trusting agreement between two LU algorithms.
+                let mut product = [Complex::ZERO; 3];
+                let mut row_norm = [0.; 3];
+                for &(r, c, conductance, capacitance) in &coefficients {
+                    let (row, col) = if transpose { (c, r) } else { (r, c) };
+                    let value = Complex::new(conductance, frequencies[index] * capacitance);
+                    product[row] += value * actual[col];
+                    row_norm[row] += value.magnitude();
+                }
+                let solution_norm = actual
+                    .iter()
+                    .map(|value| value.magnitude())
+                    .fold(0., f64::max);
+                for (row, value) in product.iter().enumerate() {
+                    let error = (*value - rhs[row]).magnitude();
+                    let scale = row_norm[row] * solution_norm + rhs[row].magnitude();
+                    assert!(
+                        error <= 1e-12 * scale,
+                        "backward residual at ω={} transpose={transpose} row={row}: {error:e} / {scale:e}",
+                        frequencies[index],
+                    );
+                }
+            }
+        }
+        assert!(
+            refactored >= 5,
+            "the independent SIMD refactor path was not used"
+        );
+    }
+
+    #[test]
+    fn independent_batch_recovers_one_lanes_zero_pivot_without_poisoning_peers() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
+        let e = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let mut matrices = Vec::new();
+        for diagonal in [3., 0., 4., 5., 6.] {
+            let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+            a.add(0, 0, diagonal).unwrap();
+            a.add(0, 1, 1.).unwrap();
+            a.add(1, 0, 1.).unwrap();
+            a.add(1, 1, 2.).unwrap();
+            matrices.push(
+                ComplexMatrix::from_operators_on(&pattern, &a, &e, 0.)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let rhs = [Complex::new(1., -2.), Complex::new(0.5, 3.)];
+        let mut batch = IndependentComplexBatch::default();
+        let factors = batch.factorize(&matrices);
+        assert_eq!(factors.len(), matrices.len());
+        for (matrix, candidate) in matrices.iter().zip(factors) {
+            let candidate = candidate.unwrap();
+            let scalar = matrix.factorize_new_matrix().unwrap();
+            for transpose in [false, true] {
+                let reference = if transpose {
+                    scalar.solve_transposed(&rhs).unwrap()
+                } else {
+                    scalar.solve(&rhs).unwrap()
+                };
+                let actual = if transpose {
+                    candidate.solve_transposed(&rhs).unwrap()
+                } else {
+                    candidate.solve(&rhs).unwrap()
+                };
+                for (a, b) in actual.iter().zip(reference.iter()) {
+                    assert!((*a - *b).magnitude() <= 1e-12);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn independent_batch_keeps_range_extreme_lanes_isolated() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (1, 1)]).unwrap());
+        let e = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let scales = [
+            (2., 4.),
+            (f64::MAX, 1.),
+            (1., f64::MAX),
+            (f64::MIN_POSITIVE, 1.),
+            (1e-300, 1e300),
+            (1e300, 1e-300),
+            (8., 1e-200),
+        ];
+        let matrices: Vec<_> = scales
+            .iter()
+            .map(|&(first, second)| {
+                let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+                a.add(0, 0, first).unwrap();
+                a.add(1, 1, second).unwrap();
+                ComplexMatrix::from_operators_on(&pattern, &a, &e, 0.)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let sources: Vec<_> = scales
+            .iter()
+            .map(|&(first, second)| [Complex::real(first), Complex::real(second)])
+            .collect();
+        let rhs: Vec<_> = sources.iter().map(<[Complex; 2]>::as_slice).collect();
+        for transposed in [false, true] {
+            let mut batch = IndependentComplexBatch::default();
+            let actual = batch.solve(&matrices, &rhs, transposed).unwrap();
+            assert_eq!(actual.len(), matrices.len());
+            for (index, (matrix, candidate)) in matrices.iter().zip(actual).enumerate() {
+                let reference = matrix.factorize_new_matrix().and_then(|factor| {
+                    if transposed {
+                        factor.solve_transposed(rhs[index])
+                    } else {
+                        factor.solve(rhs[index])
+                    }
+                });
+                match (reference, candidate) {
+                    (Ok(reference), Ok(candidate)) => {
+                        for (a, b) in candidate.iter().zip(reference) {
+                            let scale = b.re.abs().max(b.im.abs()).max(1.);
+                            assert!((a.re - b.re).abs() <= 1e-12 * scale);
+                            assert!((a.im - b.im).abs() <= 1e-12 * scale);
+                        }
+                    }
+                    (Err(_), Err(_)) => {}
+                    (reference, candidate) => panic!(
+                        "lane {index}, transposed={transposed}: scalar {reference:?}, batch {candidate:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn independent_tile_isolates_a_singular_frequency_lane() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (1, 1)]).unwrap());
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let mut e = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        a.add(0, 0, 2.).unwrap();
+        e.add(1, 1, 1.).unwrap();
+        let matrices: Vec<_> = [1., 2., 0., 4.]
+            .map(|omega| {
+                ComplexMatrix::from_operators_on(&pattern, &a, &e, omega)
+                    .unwrap()
+                    .unwrap()
+            })
+            .into();
+        let mut batch = IndependentComplexBatch::default();
+        let factors = batch.factorize(&matrices);
+        assert_eq!(factors.len(), 4);
+        assert!(factors[0].is_ok());
+        assert!(factors[1].is_ok());
+        assert!(factors[2].is_err());
+        assert!(factors[3].is_ok());
+        let rhs = [Complex::real(2.), Complex::real(1.)];
+        let reference = matrices[1].factorize_new_matrix().unwrap();
+        let actual = factors[1].as_ref().unwrap().solve(&rhs).unwrap();
+        assert_eq!(actual, reference.solve(&rhs).unwrap());
+        let rhs_lanes = [rhs.as_slice(); 4];
+        let solved = IndependentComplexBatch::default()
+            .solve(&matrices, &rhs_lanes, false)
+            .unwrap();
+        assert_eq!(solved.len(), 4);
+        assert!(solved[0].is_ok());
+        assert!(solved[1].is_ok());
+        assert!(solved[2].is_err());
+        assert!(solved[3].is_ok());
+        let solved_from_failure = IndependentComplexBatch::default()
+            .solve(&matrices[2..], &rhs_lanes[..2], false)
+            .unwrap();
+        assert_eq!(solved_from_failure.len(), 2);
+        assert!(solved_from_failure[0].is_err());
+        assert!(solved_from_failure[1].is_ok());
+        // A fresh batch can also recover when its very first point is
+        // singular: every subsequent independent point gets a status.
+        let from_singular = IndependentComplexBatch::default().factorize(&matrices[2..]);
+        assert_eq!(from_singular.len(), 2);
+        assert!(from_singular[0].is_err());
+        assert!(from_singular[1].is_ok());
+    }
 
     #[test]
     fn standalone_assembly_preserves_grouped_stamp_order_and_zero_bits() {
