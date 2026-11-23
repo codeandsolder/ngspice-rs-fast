@@ -298,7 +298,10 @@ fn parallel_tail_resource_limit_and_rebuilt_topology_are_explicit() {
     assert_eq!(stats.candidates, 9);
     assert_eq!(results.len(), 9);
     assert_eq!(results[0].1, Some(CandidateTopology::Reused));
-    assert!(stats.rebuilt > 0);
+    assert_eq!(
+        stats.rebuilt, 0,
+        "four safe scalar setters must reuse topology"
+    );
     assert_eq!(stats.failed, 0);
     let mut called = false;
     let result = run_parallel(
