@@ -585,12 +585,22 @@ fn modeled_noise_uses_the_same_resistor_kernel_and_model_identity() {
     let literal = Resistor::new("r1", [NodeId::new(1), NodeId::GROUND], 4.)
         .unwrap()
         .with_noise(p.resistor_noise("rm"));
+    let mut modeled_sources = Vec::new();
+    let mut literal_sources = Vec::new();
     assert_eq!(
-        circuit.devices()[0].noise(&context).unwrap(),
-        literal.noise(&context).unwrap()
+        circuit.devices()[0]
+            .noise(&context, &mut modeled_sources)
+            .unwrap(),
+        literal.noise(&context, &mut literal_sources).unwrap()
     );
+    assert_eq!(modeled_sources, literal_sources);
     for device in &circuit.devices()[1..] {
-        assert_eq!(device.noise(&context).unwrap(), DeviceNoise::Noiseless);
+        modeled_sources.clear();
+        assert_eq!(
+            device.noise(&context, &mut modeled_sources).unwrap(),
+            DeviceNoise::Noiseless
+        );
+        assert!(modeled_sources.is_empty());
     }
 }
 

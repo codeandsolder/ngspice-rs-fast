@@ -1848,7 +1848,11 @@ impl<L: MosLevel> Device for Mosfet<L> {
     /// `KF gm^2 / m / (f^AF W L Cox)`, with `cd` C's `MOS1cd` (channel
     /// current in the device frame minus the bulk-drain junction current)
     /// and the level's `W`, `L` and `Cox` ([`NoiseShape`]).
-    fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
         let (common, geometry) = (self.model.common(), &self.geometry);
         let (model_context, temperature) = L::noise_environment(context.model_context, geometry);
         let op = self.operating(&model_context)?;
@@ -1917,16 +1921,16 @@ impl<L: MosLevel> Device for Mosfet<L> {
             conductance,
             temperature,
         };
+        sources.extend([
+            NoiseSource::new("_rd", [d, self.terminals[0]], thermal(self.series[0])),
+            NoiseSource::new("_rs", [s, self.terminals[2]], thermal(self.series[1])),
+            NoiseSource::new("_id", [d, s], thermal(sid)),
+            NoiseSource::new("_1overf", [d, s], NoiseKind::Flicker { numerator, law }),
+        ]);
         Ok(DeviceNoise::Sources {
             family,
-            model: Some(self.model_name.clone()),
+            model: Some(&self.model_name),
             total: true,
-            sources: vec![
-                NoiseSource::new("_rd", [d, self.terminals[0]], thermal(self.series[0])),
-                NoiseSource::new("_rs", [s, self.terminals[2]], thermal(self.series[1])),
-                NoiseSource::new("_id", [d, s], thermal(sid)),
-                NoiseSource::new("_1overf", [d, s], NoiseKind::Flicker { numerator, law }),
-            ],
         })
     }
 }
