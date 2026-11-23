@@ -715,6 +715,7 @@ impl ComplexMatrix {
 
 /// Independent small-signal points share an immutable sparse elimination plan,
 /// never their numeric pivots or the circuit's mutable ordering cache.
+///
 /// A tile contains at most four points and is allowed to fail per lane.
 #[derive(Debug, Default)]
 pub struct IndependentComplexBatch {
@@ -749,11 +750,12 @@ impl IndependentComplexBatch {
                 format!("result allocation: {error}"),
             )
         })?;
-        let mut offset = 0;
-        if self.previous.is_none() && !matrices.is_empty() {
+        let offset = if self.previous.is_none() && !matrices.is_empty() {
             results.push(self.solve_one(&matrices[0], rhs[0], transposed));
-            offset = 1;
-        }
+            1
+        } else {
+            0
+        };
         for (tile, source_tile) in matrices[offset..].chunks(4).zip(rhs[offset..].chunks(4)) {
             if let Some(previous) = self.previous.as_ref().filter(|previous| {
                 tile.len() >= 2 && tile.iter().all(|matrix| matrix.shares_order_with(previous))
