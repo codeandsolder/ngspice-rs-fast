@@ -488,15 +488,12 @@ pub(in crate::analysis) fn physical_partials(
         sweep: None,
         physical: true,
     };
-    let point = frequency.map(|value| [value]);
-    let (plot, _) = run(
-        circuit,
-        request,
-        context,
-        &card,
-        point.as_ref().map(<[Real; 1]>::as_slice),
-        false,
-    )?;
+    // Exactly one conditioned small-signal point, using the same admitted
+    // frequency plan as the ordinary spectral analyses. No second sweep API.
+    let point = frequency
+        .map(|value| crate::analysis::frequency::FrequencyPlan::counted(value, 1., 1))
+        .transpose()?;
+    let (plot, _) = run(circuit, request, context, &card, point.as_ref(), false)?;
     let row = plot
         .rows()
         .next()
