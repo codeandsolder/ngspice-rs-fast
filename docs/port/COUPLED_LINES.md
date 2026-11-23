@@ -11,7 +11,10 @@ reference. Native DC and transient behavior is the parity target.
 
 Current native substrate: src/devices/cpl/plan.rs and
 src/devices/cpl/model.rs, with scoped vector literalization in
-src/netlist/elaborate.rs. The public P-device
+src/netlist/elaborate.rs. The internal src/devices/cpl/dc.rs device now
+implements real MNA branch rows for C-compatible OP/DC and linear DC
+assembly, but the public P-device registry remains disabled until the
+full transient propagation kernel is ready. The public P-device
 registration remains intentionally pending; parsing a model must not
 make an incomplete or uncoupled simulation silently executable.
 
@@ -76,9 +79,13 @@ per-component source positions and expressions.
    per-instance physical plans. Position-preserving component substitution
    records ModelVectorComponent sites for diagnostics. Refuse absent/invalid
    matrices and unsupported setters instead of defaulting coupling to zero.
-2. Build near/far MNA branch-current unknowns and DC equations with
-   the reference binary's actual coupled-line DC behavior and proper
-   terminal/return identities.
+2. Completed (internal): C-compatible DC MNA branch currents (2n rows),
+   real Circuit setup and Newton/linear paths, series max(Rii,1e-4)*length
+   KVL (C setup's 100 micro-ohm per-unit resistance floor), one
+   near/far current continuity constraint per conductor, and all four
+   +0.1*gmin C matrix cells. The reference C DC loader ignores mutual
+   R and shunt G, and does not stamp explicit near/far returns. These C
+   limitations are documented, not propagated to the transient model.
 3. Implement upstream CPL modal frequency fitting, Pade poles/residues,
    convolution and bidirectional delayed waveforms in the existing
    device-owned delay-history and transient-input architecture. Every
@@ -89,9 +96,15 @@ per-component source positions and expressions.
    near-zero coupling, passivity, sample/hold and rollback. Measure
    memory and CPU by conductor count and accepted-history length.
 
-The fixtures tests/cpl_lines.rs, tests/cpl_model.rs and
-tests/cpl_elaborate.rs cover immutable geometry, declaration binding and
-scoped model-vector evaluation, respectively. It is NOT a claim of complete P
+The fixtures tests/cpl_lines.rs, tests/cpl_model.rs,
+tests/cpl_elaborate.rs and tests/cpl_dc.rs cover immutable geometry,
+declaration binding, scoped model-vector evaluation and actual assembled
+DC and Newton equations, respectively. The one-wire 1V/1ohm-through-1ohm
+fixture matches the installed C ngspice operating point to 1e-12 V.
+The installed C binary aborts with double-free on even uncoupled two-wire
+CPL cards, so reference comparisons for multiple conductors currently
+use the upstream cplload.c source-level stamp order plus native matrix
+regression; there is no validated multiwire C numerical reference yet. It is NOT a claim of complete P
 device support, and no inconsistent partial simulation is exposed.
 
 References: upstream ngspice cplsetup.c/cplload.c/cplinit.c and
