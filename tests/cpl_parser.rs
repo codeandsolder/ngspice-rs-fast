@@ -60,7 +60,7 @@ fn three_conductor_cable_has_no_false_pairing_or_implicit_reference() {
         deck.devices[0].nodes,
         ["a", "b", "c", "ref1", "x", "y", "z", "ref2"]
     );
-    assert!(deck.devices[0].parameters.is_empty());
+    assert_eq!(deck.devices[0].parameters, []);
     let m = &deck.models[0];
     assert_eq!(m.parameters[1].name, "r");
     let ParameterKind::NumericVector(r) = &m.parameters[1].kind else {
