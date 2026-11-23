@@ -655,6 +655,19 @@ pub trait Device: fmt::Debug + std::any::Any {
         None
     }
 
+    /// Whether finalized topology must prepare per-candidate random streams.
+    /// False by default; deterministic sources add no candidate dispatch work.
+    fn has_stochastic_source(&self) -> bool {
+        false
+    }
+
+    /// Rebind only transient stochastic source identity for an independent
+    /// optimizer candidate, leaving terminal and state layout unchanged.
+    /// Other devices return None; this does not alter deterministic sources.
+    fn with_stochastic_candidate(&self, _identity: u64) -> Option<Box<dyn Device>> {
+        None
+    }
+
     /// The instance name, e.g. `r1`.
     fn name(&self) -> &str;
 

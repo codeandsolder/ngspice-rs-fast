@@ -171,6 +171,7 @@ struct TopologyBindings {
     control_rows: Vec<Vec<usize>>,
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
+    stochastic_sources: Vec<usize>,
     mutual: MutualBinding,
     identity: Option<TopologyId>,
 }
@@ -1590,6 +1591,12 @@ impl Circuit {
         }
         self.check_port_numbering()?;
         self.allocate_matrix(order)?;
+        self.bindings.stochastic_sources = self
+            .devices
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, device)| device.has_stochastic_source().then_some(ordinal))
+            .collect();
         self.bindings.names = names;
         self.bindings.identity = Some(TopologyId::allocate()?);
         Ok(())
@@ -2512,6 +2519,19 @@ impl Circuit {
     /// are untouched; callers stamp the replacement instead of the original for
     /// that ordinal. Several instance overrides of one device are applied in
     /// slot order to the same replacement.
+    /// Rebind stochastic source streams to the caller's candidate identity.
+    /// The replacement preserves terminals, branch rows and device state
+    /// layout so finalized topology and symbolic matrices remain valid.
+    pub(crate) fn reseed_stochastic_sources(&mut self, identity: u64) {
+        for &ordinal in &self.bindings.stochastic_sources {
+            if let Some(source) = self.devices.get_mut(ordinal)
+                && let Some(replacement) = source.device.with_stochastic_candidate(identity)
+            {
+                source.device = replacement;
+            }
+        }
+    }
+
     /// Clear analysis-scoped accepted/trial state when an optimizer session
     /// changes its candidate. Preserve finalized bindings, sparse pattern and
     /// prepared names; only independent simulation state is invalidated.

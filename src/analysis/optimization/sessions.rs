@@ -178,6 +178,7 @@ impl<'a> CandidateWorker<'a> {
             };
         }
         let topology = self.session.topology();
+        self.session.circuit_mut().reseed_stochastic_sources(job.id);
         let result = self.run_scenarios(scenarios);
         CandidateResult {
             id: job.id,
@@ -207,6 +208,7 @@ impl<'a> CandidateWorker<'a> {
             };
         }
         let topology = self.session.topology();
+        self.session.circuit_mut().reseed_stochastic_sources(job.id);
         self.session.circuit_mut().clear_candidate_analysis_state();
         CandidateDerivativeResult {
             id: job.id,

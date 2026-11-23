@@ -191,6 +191,7 @@ pub struct StochasticWaveform {
     spec: StochasticSpec,
     seed: u64,
     identity: u64,
+    candidate_identity: u64,
     dc: Real,
     flicker_bands: [Real; FLICKER_OCTAVES],
     cache: RefCell<RtsCache>,
@@ -201,6 +202,7 @@ impl Clone for StochasticWaveform {
             spec: self.spec,
             seed: self.seed,
             identity: self.identity,
+            candidate_identity: self.candidate_identity,
             dc: self.dc,
             flicker_bands: self.flicker_bands,
             cache: RefCell::default(),
@@ -212,6 +214,7 @@ impl PartialEq for StochasticWaveform {
         self.spec == rhs.spec
             && self.seed == rhs.seed
             && self.identity == rhs.identity
+            && self.candidate_identity == rhs.candidate_identity
             && self.dc == rhs.dc
     }
 }
@@ -231,6 +234,7 @@ impl StochasticWaveform {
             spec,
             seed: 0x4e47_5350_4943_4552,
             identity: 0,
+            candidate_identity: 0,
             dc: 0.,
             flicker_bands,
             cache: RefCell::default(),
@@ -252,6 +256,14 @@ impl StochasticWaveform {
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }
         self.identity = hash;
+        self.cache = RefCell::default();
+        self
+    }
+    /// Bind one optimizer candidate's stable identity without consuming RNG.
+    /// Rebinding A/B/A replays A bitwise, independent of worker scheduling.
+    #[must_use]
+    pub fn with_candidate_identity(mut self, candidate: u64) -> Self {
+        self.candidate_identity = candidate;
         self.cache = RefCell::default();
         self
     }
@@ -281,7 +293,7 @@ impl StochasticWaveform {
             }
     }
     const fn key(&self) -> u64 {
-        mix(self.seed ^ self.identity.rotate_left(23))
+        mix(self.seed ^ self.identity.rotate_left(23) ^ self.candidate_identity.rotate_left(7))
     }
     fn next_transition(&self, previous: Transition) -> SpiceResult<Transition> {
         let StochasticSpec::Noise(n) = self.spec else {

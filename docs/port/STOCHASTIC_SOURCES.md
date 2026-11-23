@@ -70,6 +70,18 @@ trials, rejected/truncated timesteps, backtracking or independent source
 evaluations. The default seed is fixed; callers may select a different
 stream with `StochasticWaveform::with_seed`.
 
+Optimizer `CandidateWorker` automatically incorporates the immutable caller
+`CandidateJob.id` into the source's stream identity **after** validated
+candidate preparation and before any scenario runs. The exact same candidate
+ID repeats a bitwise-identical physical process across workers and A/B/A
+execution; different IDs obtain independent random trajectories even when
+all numerical parameter coordinates are identical. The finalized topology
+stores only the ordinals of stochastic independent sources, so deterministic
+candidate workloads do not scan device lists or clone any source waveforms.
+Candidate replay is state-independent, and changing a source's candidate ID
+replaces its bound waveform without invalidating the MNA topology or the
+numeric parameter plan.
+
 Only a 32-event **derived** RTS timestamp cache is kept for fast sequential
 access; discarding/cloning it leaves every physical event unchanged. The
 sample grids and merged breakpoint stream are lazy; no array of the
@@ -87,8 +99,10 @@ coordinates are errors, not wrapped indices.
 The opt-in fixed-seed regression suite `tests/transient_noise.rs`
 compares Gaussian knot/midpoint variance, all four TRRANDOM
 mean/variance laws, RTS dwell times, seed/source isolation,
-one-sided event behavior and complete deck parse/write/simulate
-results. The unit tests in `src/devices/stochastic.rs` exercise
+one-sided event behavior, physical optimizer candidate A/B/A and
+one-/multi-worker dispatch equivalence, complete deck parse/write/simulate
+results, current-source held-random voltage against an independent resistor
+law, and exact RTS event landing under adaptive transient timesteps. The unit tests in `src/devices/stochastic.rs` exercise
 candidate-free replay and rejected-step lookup order; the tests in
 `src/devices/noise/transient.rs` check the analytic power and
 autocovariance formulas.

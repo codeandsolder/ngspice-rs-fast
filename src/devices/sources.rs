@@ -576,6 +576,37 @@ impl Device for IndependentSource {
     fn independent_waveform(&self) -> Option<(crate::devices::SourceKind, &Waveform)> {
         Some((self.source_kind(), self.effective_waveform()))
     }
+    fn has_stochastic_source(&self) -> bool {
+        fn has_source(waveform: &Waveform) -> bool {
+            match waveform {
+                Waveform::Stochastic(_) => true,
+                Waveform::PortSeries { baseline, .. } => has_source(baseline),
+                _ => false,
+            }
+        }
+        has_source(self.effective_waveform())
+    }
+    fn with_stochastic_candidate(&self, identity: u64) -> Option<Box<dyn Device>> {
+        // Reset derived RTS cache on each candidate transition without
+        // changing the physical source or the original random seed.
+        fn rebind(waveform: &mut Waveform, identity: u64) -> bool {
+            match waveform {
+                Waveform::Stochastic(process) => {
+                    *process = process.clone().with_candidate_identity(identity);
+                    true
+                }
+                Waveform::PortSeries { baseline, .. } => rebind(baseline, identity),
+                _ => false,
+            }
+        }
+        let mut source = self.clone();
+        let primary = rebind(&mut source.waveform, identity);
+        let accumulated = source
+            .accumulated_waveform
+            .as_mut()
+            .is_some_and(|waveform| rebind(waveform, identity));
+        (primary || accumulated).then(|| Box::new(source) as Box<dyn Device>)
+    }
 
     fn input_source(&self) -> Option<crate::devices::noise::InputSource> {
         Some(crate::devices::noise::InputSource {
