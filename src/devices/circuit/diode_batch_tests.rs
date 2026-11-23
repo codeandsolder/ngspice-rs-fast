@@ -192,8 +192,9 @@ fn compare_diode_load(
             ("n6", -0.3),
             ("n7", 0.),
         ] {
-            let node = batched.nodes.get(name).unwrap();
-            if let Some(row) = batched.bindings.unknowns.node_row(node) {
+            if let Some(node) = batched.nodes.get(name)
+                && let Some(row) = batched.bindings.unknowns.node_row(node)
+            {
                 solution.set(row, voltage).unwrap();
             }
         }
@@ -307,16 +308,7 @@ fn full_physical_diode_tiles_match_scalar_over_boundaries_and_phases() {
             IterationPhase::Fix,
             IterationPhase::Predict,
         ] {
-            compare_diode_load(
-                count,
-                count % 2 == 1,
-                phase,
-                true,
-                true,
-                -35.,
-                None,
-                true,
-            );
+            compare_diode_load(count, count % 2 == 1, phase, true, true, -35., None, true);
         }
     }
 }
@@ -454,9 +446,8 @@ fn diode_tile_load_and_solve_benchmark() {
             } else {
                 "is=1e-14 cjo=2p tt=3n"
             };
-            let mut deck = format!(
-                "diode benchmark\nv0 n0 0 dc 0\nr0 n0 n1 100\n.model dm d({model})\n"
-            );
+            let mut deck =
+                format!("diode benchmark\nv0 n0 0 dc 0\nr0 n0 n1 100\n.model dm d({model})\n");
             for index in 0..count {
                 if family == "full" {
                     writeln!(&mut deck, "d{index} n{} 0 dm pj=4", index % 8).unwrap();
