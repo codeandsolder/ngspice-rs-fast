@@ -11,6 +11,8 @@ use super::{
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::{collections::HashMap, sync::Arc};
 
+mod derivative;
+
 const MAX_INSTRUCTIONS: usize = 262_144;
 /// Index of an instruction and its corresponding scratch value.
 pub(super) type Slot = usize;
@@ -49,9 +51,11 @@ pub(super) struct Plan {
 pub(super) struct PlanBuilder {
     plan: Plan,
     instructions: HashMap<Instruction, Slot>,
-    // Source pointers remain valid for the whole compilation. A separate
-    // scratch map is cleared before each derivative tree is dropped.
+    // The old tree-based regression oracle uses pointer identity only
+    // while the corresponding tree allocations are alive.
+    #[cfg(test)]
     source_slots: HashMap<*const Node, Slot>,
+    #[cfg(test)]
     scratch_slots: HashMap<*const Node, Slot>,
     pwl: HashMap<*const PwlTable, usize>,
     tables: HashMap<*const XspicePwl, usize>,
@@ -72,22 +76,29 @@ fn table_index<T>(
 impl PlanBuilder {
     pub(super) fn lower_value(&mut self, tree: &Tree) -> SpiceResult<Slot> {
         let root = self.lower(tree)?;
-        self.source_slots = core::mem::take(&mut self.scratch_slots);
+        #[cfg(test)]
+        {
+            self.source_slots = core::mem::take(&mut self.scratch_slots);
+        }
         Ok(root)
     }
 
+    #[cfg(test)]
     pub(super) fn lower_derivative(&mut self, tree: &Tree) -> SpiceResult<Slot> {
         let result = self.lower(tree);
         self.scratch_slots.clear();
         result
     }
 
+    #[cfg(test)]
     pub(super) fn finish(self) -> Plan {
         self.plan
     }
 
     fn lower(&mut self, tree: &Tree) -> SpiceResult<Slot> {
+        #[cfg(test)]
         let pointer = Arc::as_ptr(tree);
+        #[cfg(test)]
         if let Some(&slot) = self
             .source_slots
             .get(&pointer)
@@ -107,25 +118,32 @@ impl PlanBuilder {
             Node::Ternary(c, a, b) => {
                 Instruction::Ternary(self.lower(c)?, self.lower(a)?, self.lower(b)?)
             }
-            Node::Pwl(arg, table) | Node::PwlDerivative(arg, table) => {
-                let arg = self.lower(arg)?;
-                let table = table_index(table, &mut self.pwl, &mut self.plan.pwl);
-                if matches!(&**tree, Node::Pwl(..)) {
-                    Instruction::Pwl(arg, table)
-                } else {
-                    Instruction::PwlDerivative(arg, table)
-                }
-            }
-            Node::Table(arg, table) | Node::TableSlope(arg, table) => {
-                let arg = self.lower(arg)?;
-                let table = table_index(table, &mut self.tables, &mut self.plan.tables);
-                if matches!(&**tree, Node::Table(..)) {
-                    Instruction::Table(arg, table)
-                } else {
-                    Instruction::TableSlope(arg, table)
-                }
-            }
+            Node::Pwl(arg, table) => Instruction::Pwl(
+                self.lower(arg)?,
+                table_index(table, &mut self.pwl, &mut self.plan.pwl),
+            ),
+            Node::Table(arg, table) => Instruction::Table(
+                self.lower(arg)?,
+                table_index(table, &mut self.tables, &mut self.plan.tables),
+            ),
+            #[cfg(test)]
+            Node::PwlDerivative(arg, table) => Instruction::PwlDerivative(
+                self.lower(arg)?,
+                table_index(table, &mut self.pwl, &mut self.plan.pwl),
+            ),
+            #[cfg(test)]
+            Node::TableSlope(arg, table) => Instruction::TableSlope(
+                self.lower(arg)?,
+                table_index(table, &mut self.tables, &mut self.plan.tables),
+            ),
         };
+        let slot = self.intern(op)?;
+        #[cfg(test)]
+        self.scratch_slots.insert(pointer, slot);
+        Ok(slot)
+    }
+
+    fn intern(&mut self, op: Instruction) -> SpiceResult<Slot> {
         let slot = if let Some(&slot) = self.instructions.get(&op) {
             slot
         } else {
@@ -140,7 +158,6 @@ impl PlanBuilder {
             self.instructions.insert(op, slot);
             slot
         };
-        self.scratch_slots.insert(pointer, slot);
         Ok(slot)
     }
 }
@@ -475,6 +492,27 @@ mod tests {
             .collect()
     }
 
+    fn tree_compiled(expr: &BExpr) -> Program {
+        let mut compiler = Compiler::default();
+        let value = Arc::new(compile(expr, &mut compiler).unwrap());
+        let mut builder = PlanBuilder::default();
+        let root = builder.lower_value(&value).unwrap();
+        let derivatives = (0..compiler.quantities.len())
+            .map(|variable| {
+                builder
+                    .lower_derivative(&differentiate(&value, variable))
+                    .unwrap()
+            })
+            .collect();
+        Program {
+            plan: Arc::new(builder.finish()),
+            root,
+            derivatives,
+            quantities: compiler.quantities,
+            uses_frequency: compiler.uses_frequency,
+        }
+    }
+
     #[test]
     fn shared_plan_matches_uncached_value_gradient_and_error_order() {
         for text in [
@@ -488,14 +526,27 @@ mod tests {
             "sqrt(v(a))+log(v(b))",
             "v(a)*0+v(b)",
             "v(a)/(v(b)-v(b))",
+            "v(a)+v(b)*(-0.0)",
+            "v(a)>0 ? v(b) : sqrt(0)",
+            "v(a)>0 ? sqrt(0) : v(b)",
+            "v(a)+sqrt(0)",
+            "v(a)+pow(0,v(b))",
+            "v(a)+pwr(-2,v(b))",
+            "v(a)+(-v(b))",
+            "v(a)>0 ? min(v(a),v(b)) : max(v(a),v(b))",
+            "v(a)>0 ? v(b) : -v(b)",
         ] {
-            let program = Program::compile(&parse(text)).unwrap();
+            let expr = parse(text);
+            let program = Program::compile(&expr).unwrap();
+            let old = tree_compiled(&expr);
+            assert_eq!(program.plan, old.plan, "{text}");
+            assert_eq!(program.derivatives, old.derivatives, "{text}");
             let mut scratch = Workspace::default();
             let mut reference_scratch = Workspace::default();
             for point in [[0., -0.], [-0., 0.], [1., 1.], [-2., 2.], [0.25, -0.5]] {
                 let env = environment(&point[..program.quantities().len()]);
                 let actual = program.evaluate_with_workspace(&env, &mut scratch);
-                let expected = reference(&program, &env, &mut reference_scratch, &mut 0);
+                let expected = reference(&old, &env, &mut reference_scratch, &mut 0);
                 match (actual, expected) {
                     (Ok(actual), Ok(expected)) => {
                         assert_eq!(bits(&actual), bits(&expected), "{text} at {point:?}")
@@ -508,6 +559,92 @@ mod tests {
                     (actual, expected) => panic!("{text} at {point:?}: {actual:?} != {expected:?}"),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn sparse_symbolic_unaries_match_tree_compilation() {
+        for name in [
+            "abs", "acos", "acosh", "asin", "asinh", "atan", "atanh", "cos", "cosh", "exp", "log",
+            "log10", "sgn", "sin", "sinh", "sqrt", "tan", "tanh", "u", "uramp", "ceil", "floor",
+            "nint",
+        ] {
+            for input in ["v(b)", "v(a)+v(b)", "0", "-1", "1"] {
+                let text = format!("v(a)+{name}({input})");
+                let expr = parse(&text);
+                let old = tree_compiled(&expr);
+                let new = Program::compile(&expr).unwrap();
+                assert_eq!(old.plan, new.plan, "{text}");
+                assert_eq!(old.derivatives, new.derivatives, "{text}");
+                for point in [[-2., -1.], [0., -0.], [0.25, 0.5], [1., 2.]] {
+                    let env = environment(&point[..new.quantities().len()]);
+                    match (old.evaluate(&env), new.evaluate(&env)) {
+                        (Ok(old), Ok(new)) => assert_eq!(bits(&old), bits(&new), "{text}"),
+                        (Err(old), Err(new)) => {
+                            assert_eq!(old.to_string(), new.to_string(), "{text}")
+                        }
+                        (old, new) => panic!("{text}: {old:?} != {new:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in symbolic compiler wall time and derivative allocation benchmark"]
+    fn sparse_and_dense_compilation_benchmarks() {
+        let sparse = parse(&balanced_sum(
+            (0..192).map(|n| format!("sin(v(n{n}))")).collect(),
+        ));
+        let mut dense = parse(&balanced_sum(
+            (0..80).map(|n| format!("{}*v(n{n})", n + 1)).collect(),
+        ));
+        for _ in 0..32 {
+            dense = BExpr {
+                span: dense.span.clone(),
+                kind: BExprKind::Call {
+                    name: "sin".into(),
+                    arguments: vec![dense],
+                },
+            };
+        }
+        for (name, expr) in [("sparse", sparse), ("dense", dense)] {
+            let mut old_samples = Vec::new();
+            let mut new_samples = Vec::new();
+            let mut old_allocations = 0;
+            let mut slots = 0;
+            for _ in 0..7 {
+                super::super::derivative_reference::take_allocations();
+                let now = std::time::Instant::now();
+                let old = std::hint::black_box(tree_compiled(std::hint::black_box(&expr)));
+                old_samples.push(now.elapsed());
+                old_allocations = super::super::derivative_reference::take_allocations();
+                let now = std::time::Instant::now();
+                let new =
+                    std::hint::black_box(Program::compile(std::hint::black_box(&expr)).unwrap());
+                new_samples.push(now.elapsed());
+                assert_eq!(old.plan, new.plan, "{name}");
+                assert_eq!(old.derivatives, new.derivatives, "{name}");
+                slots = new.plan.instructions.len();
+                let point = vec![0.125; new.quantities().len()];
+                let actual = new.evaluate(&environment(&point)).unwrap();
+                assert_eq!(
+                    bits(&old.evaluate(&environment(&point)).unwrap()),
+                    bits(&actual)
+                );
+                if name == "sparse" {
+                    assert!((actual.value - 192. * 0.125_f64.sin()).abs() < 1e-11);
+                    for derivative in &actual.gradient {
+                        assert!((derivative - 0.125_f64.cos()).abs() < 1e-12);
+                    }
+                }
+            }
+            old_samples.sort_unstable();
+            new_samples.sort_unstable();
+            eprintln!(
+                "{name}: old {:?}, new {:?}; old derivative Arc allocations {old_allocations}, new derivative Arcs 0; retained slots {slots}",
+                old_samples[3], new_samples[3]
+            );
         }
     }
 
@@ -533,12 +670,14 @@ mod tests {
         };
         **otherwise = table;
         let program = Program::compile(&expr).unwrap();
+        let old = tree_compiled(&expr);
+        assert_eq!(program.plan, old.plan);
         let mut workspace = Workspace::default();
         let mut reference_scratch = Workspace::default();
         for values in [[1., 0.], [0., 0.], [-1., 2.], [0., 2.], [1., 1.], [-1., 4.]] {
             let env = environment(&values);
             let actual = program.evaluate_with_workspace(&env, &mut workspace);
-            let expected = reference(&program, &env, &mut reference_scratch, &mut 0);
+            let expected = reference(&old, &env, &mut reference_scratch, &mut 0);
             match (actual, expected) {
                 (Ok(actual), Ok(expected)) => assert_eq!(bits(&actual), bits(&expected)),
                 (Err(actual), Err(expected)) => {
@@ -613,11 +752,27 @@ mod tests {
         );
 
         let wide = balanced_sum((0..512).map(|n| format!("v(n{n})")).collect());
+        let program = Program::compile(&parse(&wide)).unwrap();
+        let evaluation = program.evaluate(&environment(&[1.; 512])).unwrap();
+        assert_eq!(evaluation.value, 512.);
+        assert_eq!(evaluation.gradient, vec![1.; 512]);
+
+        let mut dense = parse(&balanced_sum(
+            (0..1024).map(|n| format!("{}*v(n{n})", n + 1)).collect(),
+        ));
+        for _ in 0..140 {
+            dense = BExpr {
+                span: dense.span.clone(),
+                kind: BExprKind::Call {
+                    name: "sin".into(),
+                    arguments: vec![dense],
+                },
+            };
+        }
+        let error = Program::compile(&dense).unwrap_err().to_string();
         assert!(
-            Program::compile(&parse(&wide))
-                .unwrap_err()
-                .to_string()
-                .contains("derivative expansion limit")
+            error.contains("derivative expansion limit") || error.contains("instruction limit"),
+            "{error}"
         );
 
         let number = parse("0");

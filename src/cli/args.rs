@@ -297,9 +297,9 @@ pub fn run(args: &Args) -> SpiceResult<()> {
         Command::Simulate => {
             let deck = required_path(args, args.netlist.as_deref(), "netlist")?;
             let output = required_path(args, args.output.as_deref(), "--output")?;
-            let report =
+            let mut report =
                 crate::cli::simulate::run_with_format(deck, output, args.auto_gnd, args.format)?;
-            print!("{}", crate::cli::simulate::report_text(&report));
+            crate::cli::simulate::write_report(&mut report, &mut std::io::stdout().lock())?;
         }
         Command::Summary | Command::Cards | Command::Tokens => {
             let path = required_path(args, args.netlist.as_deref(), "netlist")?;

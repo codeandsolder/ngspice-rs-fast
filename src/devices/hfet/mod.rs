@@ -53,6 +53,41 @@ use crate::devices::{LinearContext, ModelFamily, ResolvedModel};
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
+/// Return ln(1 + exp(x)) and its derivative without cancellation or overflow.
+fn softplus(x: Real) -> (Real, Real) {
+    if x > 0. {
+        let inverse = (-x).exp();
+        (x + inverse.ln_1p(), 1. / (1. + inverse))
+    } else {
+        let exp = x.exp();
+        (exp.ln_1p(), exp / (1. + exp))
+    }
+}
+
+/// Logistic roll-off and its derivative magnitude, retaining both tails.
+fn rolloff(x: Real) -> (Real, Real) {
+    let exp = (-x.abs()).exp();
+    let low = exp / (1. + exp);
+    let high = 1. / (1. + exp);
+    (if x > 0. { low } else { high }, low * high)
+}
+
+/// Two carrier populations in series. The weights are kept independently
+/// rather than subtracting either from one in a strongly asymmetric regime.
+fn series_density(a: Real, b: Real) -> (Real, Real, Real) {
+    if a == 0. && b == 0. {
+        (0., 0.5, 0.5)
+    } else if a <= b {
+        let ratio = a / b;
+        let weight = 1. / (1. + ratio);
+        (a * weight, weight, ratio * weight)
+    } else {
+        let ratio = b / a;
+        let weight = 1. / (1. + ratio);
+        (b * weight, ratio * weight, weight)
+    }
+}
+
 /// Staged node setup common to the three MESA/HFET levels.
 /// The caller commits the transaction only after temperature derivation succeeds.
 struct NodeSetup<'a, 'table> {
@@ -702,6 +737,22 @@ static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);
 mod tests {
     use super::*;
     use crate::primitives::NodeTable;
+
+    #[test]
+    fn carrier_kernels_keep_small_tails_and_extreme_ratios() {
+        let (value, slope) = softplus(-50.);
+        assert!(value > 0. && slope > 0.);
+        assert!((value / (-50_f64).exp() - 1.).abs() < 1e-14);
+        assert_eq!(softplus(1000.), (1000., 1.));
+        let (value, slope) = rolloff(500.);
+        assert!(value > 0. && slope > 0.);
+        assert!(rolloff(1000.).1.is_finite());
+        let (density, wa, wb) = series_density(1e-200, 1e200);
+        assert_eq!((density, wa, wb), (1e-200, 1., 0.));
+        assert_eq!(series_density(2., 2.), (1., 0.5, 0.5));
+        assert_eq!(series_density(0., 0.), (0., 0.5, 0.5));
+        assert_eq!(series_density(3., Real::INFINITY), (3., 1., 0.));
+    }
 
     #[test]
     fn borrowed_reset_stamps_match_owned_assembly_and_validate_before_mutation() {

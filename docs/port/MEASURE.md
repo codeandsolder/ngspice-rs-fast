@@ -259,15 +259,15 @@ after an already selected event.
 | `FIND` | the operand at one axis value | the operand's |
 | `MIN`/`MAX` | whole samples in the window | the operand's |
 | `AVG` | trapezoidal integral over the window ÷ the window's width | the operand's |
-| `RMS` | √(trapezoidal integral of the square over the window ÷ the width) | the operand's |
-| `INTEG` | trapezoidal integral over the window | `<operand>*<axis>` |
+| `RMS` | √(weighted quadrature of the square over the window ÷ the width) | the operand's |
+| `INTEG` | Simpson/trapezoidal quadrature over the window | `<operand>*<axis>` |
 | `TRIG/TARG` | `targ - trig` | the axis' |
 
-The trapezoid rule is exact for linear data and is the rule C uses for `AVG`;
-the port uses it for `INTEG` and `RMS` too, where C only reaches for Simpson's
-rules on uniformly spaced samples (see above). `AVG` and
-`INTEG/(to - from)` therefore agree exactly, which is C's own Enhancement-302
-contract.
+The trapezoid rule is exact for linear data and is the rule C uses for `AVG`.
+INTEG and RMS use greedy Simpson 3/8, Simpson 1/3 and trapezoidal panels.
+AVG and INTEG share clipped endpoints, but can use different quadrature
+rules and have different representable ranges: a valid AVG does not require
+the integral to fit in binary64.
 
 Every value the arithmetic touches comes from the **full** plot through the
 shared operand resolution, so a vector that the `.save`/`.print` selection
@@ -275,7 +275,7 @@ dropped is still measured, and every result is checked to be finite:
 
 * a non-finite operand value at a point the measurement uses is
   `SpiceError::Numerical`;
-* a non-finite result (an overflowing square, a sum that overflows) is
+* a non-finite final result is
   `SpiceError::Numerical`;
 * neither is ever written to stdout or to a rawfile.
 
@@ -440,7 +440,7 @@ duplicate names), and scalar/deferred expressions share the existing expression
 node budget. Independent analyses do not share published values. Results are
 returned in source order; undefined/forward scalar references, domain errors and nonfinite results
 fail the run before publication. Library callers use `measure::resolve_with_scope`
-using the scheduled `batch::plan_outputs` and scoped `batch::resolve_outputs` for retained plots.
+for retained plots. The ordinary batch CLI uses the same schema-bound objective reducers as optimization scenarios; only nonlocal operands retain selected history.
 The local C input preprocessor mishandles `EXPR` with a user function and a
 measurement-result argument; the live C regression uses its `PARAM` spelling.
 Numeric setters AT/VAL/TD/FROM/TO and crossing counts accept braced or
@@ -460,3 +460,32 @@ its equation functions are disabled empty stubs. No formulas are invented.
 left-minus-right samples, including both slopes. FIND and DERIV can use the
 same event. Nonfinite differences fail explicitly. Analytic tests and an opt-in
 C comparison cover moving references and both directions.
+
+
+## Numerical accuracy audit (#92)
+
+AVG retains trapezoidal panels, and INTEG/RMS retain the existing greedy
+Simpson 3/8, 1/3 and trapezoid selection based on 100-ULP positive widths.
+Signed quadrature (#138) uses exact products of the finite binary64
+ordinates and panel spans, with integer weights over a common denominator
+of 24. The fixed-size signed accumulator preserves small areas across
+large cancelling products and divides by the covered width for AVG before
+rounding once to binary64. A finite mean does not require a representable
+unnormalized integral. Only a nonfinite final value fails. Nearly equal steps retain the same Simpson selection, but
+the panel's actual covered span scales its normalized weights. RMS uses a
+weighted, scaled Euclidean norm instead of integrating squared raw samples:
+the square-root time fraction is calculated before multiplication and a
+power-of-two shifted accumulator retains subnormal weighted terms. The
+positive normalized quadrature is bounded by the largest absolute sample.
+RMS therefore accepts finite extreme magnitudes even when their squares
+would overflow or underflow. Zero-width panels contribute zero, including
+at discontinuities.
+Linear interpolation takes its fraction from the nearer endpoint and uses
+a fused multiply-add; scaled coordinate differences handle an otherwise
+overflowing finite span. Exact sample groups, clipping, crossing selection
+and the 100-ULP panel rule are unchanged. DERIV uses the same local
+quadratic stencil but evaluates its divided-difference derivative, avoiding
+large common-ordinate cancellation. Margins interpolate with fused arithmetic
+and preserve exact crossover endpoints. Tests include analytic cubic
+quadrature, a cancellation-sensitive signed integral, large-offset quadratic
+derivatives and finite interpolation across extreme endpoint values.
