@@ -52,6 +52,7 @@ use std::simd::{
     num::SimdFloat,
 };
 
+use crate::maths::complex::ComplexFactorBatch;
 use crate::maths::linear::{BatchSolveFailure, RHS_BATCH_WIDTH, SolveBatchWorkspace};
 use crate::primitives::{Complex, SpiceResult};
 
@@ -218,15 +219,6 @@ impl BatchUpdate {
     }
 }
 
-/// Four independent numeric matrices, packed by SPARSE element handle.
-/// Reused between tiles; no mutable topology or pivot state is shared.
-#[derive(Default)]
-pub(crate) struct ComplexFactorBatch {
-    values: Vec<LaneParts>,
-    scratch: Vec<LaneParts>,
-    inverses: Vec<LaneParts>,
-}
-
 impl LaneParts {
     fn complex_zero(self) -> LaneMask {
         self.re.simd_eq(f64x4::splat(0.)) & self.im.simd_eq(f64x4::splat(0.))
@@ -236,7 +228,7 @@ impl LaneParts {
         self.re.is_finite() & self.im.is_finite()
     }
 
-    /// Exactly Scalar::mul on each lane, including exponent-range recovery.
+    /// Exactly `Scalar::mul` on each lane, including exponent-range recovery.
     fn complex_pair_mul(self, rhs: Self) -> Self {
         let mut product = Self {
             re: self.re * rhs.re - self.im * rhs.im,
@@ -795,16 +787,16 @@ impl<I: PlanIndex> FactorRuns<I> {
                 work.values[diagonal[step]] = work.scratch[step];
             }
             let pivot = work.values[diagonal[step]];
-            for lane in 0..count {
+            for (lane, failure) in failures.iter_mut().enumerate().take(count) {
                 if !active.test(lane) {
                     continue;
                 }
                 let value = pivot.get::<Complex>(lane);
                 if value.is_zero() {
-                    failures[lane] = Some(Status::ZeroDiag);
+                    *failure = Some(Status::ZeroDiag);
                     active.set(lane, false);
                 } else if !value.is_finite() {
-                    failures[lane] = Some(Status::NonFinite);
+                    *failure = Some(Status::NonFinite);
                     active.set(lane, false);
                 } else {
                     work.inverses[step].set(lane, value.cached_recip());
@@ -814,14 +806,14 @@ impl<I: PlanIndex> FactorRuns<I> {
                 break;
             }
         }
-        for lane in 0..count {
+        for (lane, failure) in failures.iter_mut().enumerate().take(count) {
             if active.test(lane)
                 && work
                     .values
                     .iter()
                     .any(|value| !value.get::<Complex>(lane).is_finite())
             {
-                failures[lane] = Some(Status::NonFinite);
+                *failure = Some(Status::NonFinite);
             }
         }
         failures
@@ -1680,6 +1672,7 @@ impl Sparse<Complex> {
         coefficients: &[&[Complex]],
         work: &mut ComplexFactorBatch,
     ) -> SpiceResult<Vec<(Self, Status, crate::maths::FactorWork)>> {
+        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
         if coefficients.len() > RHS_BATCH_WIDTH
             || coefficients
                 .iter()
@@ -1735,7 +1728,6 @@ impl Sparse<Complex> {
                     *element = packed.get::<Complex>(lane);
                 }
                 let status = frame.done();
-                use crate::maths::telemetry::{AttemptPath, FactorAttempt};
                 frame.last_attempt = Some(FactorAttempt {
                     path: AttemptPath::Refactor,
                     status,

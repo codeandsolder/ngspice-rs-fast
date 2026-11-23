@@ -57,9 +57,8 @@ use crate::analysis::results::{Plot, PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan};
 use crate::devices::noise::{InstanceNoise, prepared_noise, squared_gain};
 use crate::devices::{Circuit, LinearSystem, SourceKind};
-use crate::maths::complex::ComplexMatrix;
+use crate::maths::complex::{ComplexFactorBatch, ComplexMatrix};
 use crate::maths::linear::RHS_BATCH_WIDTH;
-use crate::maths::sparse13::ComplexFactorBatch;
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
 
 mod integration;
@@ -715,6 +714,156 @@ fn spectrum_plot(representation: Representation, spectrum_variables: Vec<Variabl
     )
 }
 
+/// The streaming noise integrator. Numerical frequency factors can be
+/// prepared independently, but generator histories, integration intervals,
+/// summaries and emitted rows are consumed strictly in frequency order.
+struct NoiseAccumulator<'a> {
+    circuit: &'a Circuit,
+    card: &'a NoiseCard,
+    model: crate::devices::ModelContext,
+    context: &'a AnalysisContext,
+    output: [NodeId; 2],
+    representation: Representation,
+    sink: &'a mut dyn crate::analysis::PointSink,
+    spectrum: Plot,
+    generators: Vec<Generators>,
+    integrated_power: Power,
+    last: Real,
+    row: NoiseRow,
+}
+
+impl NoiseAccumulator<'_> {
+    fn observe(
+        &mut self,
+        small: &crate::analysis::ac::SmallSignal<'_>,
+        step: usize,
+        freq: Real,
+        forward: &[Complex],
+        adjoint: &[Complex],
+    ) -> SpiceResult<()> {
+        if small.varies() || small.reassembles() {
+            refresh_generators(
+                &mut self.generators,
+                prepared_noise(
+                    small.prepared(),
+                    &self.model.with_frequency(freq),
+                    small.bias(),
+                    Some(small.state()),
+                )?,
+            )?;
+        }
+        let gain_sq_inv = 1. / gain(self.circuit, forward, self.output)?.max(N_MINGAIN);
+        let sample = NoiseSample::new(
+            freq,
+            self.last,
+            gain_sq_inv,
+            self.card.start,
+            self.card.summary != 0,
+        );
+        let print_summary = self.card.summary != 0 && step.is_multiple_of(self.card.summary);
+        let mut out_density = 0.;
+        let emit = self.card.summary == 0 || print_summary;
+        self.row.values.clear();
+        if emit {
+            self.row.values.push(Complex::real(freq));
+        }
+        for g in &mut self.generators {
+            out_density += g.accumulate(
+                &sample,
+                |nodes| difference(self.circuit, adjoint, nodes),
+                &mut self.integrated_power,
+                print_summary.then_some(&mut self.row),
+            )?;
+        }
+        let in_density = out_density * gain_sq_inv;
+        if !out_density.is_finite() || !in_density.is_finite() {
+            return Err(noise_failure("nonfinite noise density"));
+        }
+        if emit {
+            self.row.push_power(out_density);
+            self.row.push_power(in_density);
+            self.spectrum.check_point(&self.row.values)?;
+            if !self.row.values.iter().all(|value| value.is_finite()) {
+                return Err(noise_failure("nonfinite noise density"));
+            }
+            self.sink.point(&self.row.values)?;
+        }
+        self.last = freq;
+        Ok(())
+    }
+
+    fn traverse(
+        &mut self,
+        small: &mut crate::analysis::ac::SmallSignal<'_>,
+        frequencies: &[Real],
+        adjoint_rhs: &[Complex],
+    ) -> SpiceResult<()> {
+        if frequencies.len() > 1 && !small.varies() && !small.reassembles() {
+            let input = input_rhs(small.system(), self.card.input.as_str())?;
+            let mut work = ComplexFactorBatch::default();
+            let mut previous = None;
+            for (tile, group) in frequencies.chunks(RHS_BATCH_WIDTH).enumerate() {
+                let mut matrices = Vec::new();
+                matrices
+                    .try_reserve(group.len())
+                    .map_err(|error| noise_failure(&format!("frequency tile capacity: {error}")))?;
+                for &freq in group {
+                    matrices.push(crate::analysis::ac::ac_matrix(
+                        self.circuit,
+                        small.system(),
+                        2. * std::f64::consts::PI * freq,
+                    )?);
+                }
+                let factors =
+                    ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
+                for (lane, (&freq, factor)) in group.iter().zip(&factors).enumerate() {
+                    let forward = factor.solve(&input)?;
+                    let adjoint = factor.solve_transposed(adjoint_rhs)?;
+                    self.observe(
+                        small,
+                        tile * RHS_BATCH_WIDTH + lane,
+                        freq,
+                        &forward,
+                        &adjoint,
+                    )?;
+                }
+                previous = factors.into_iter().last();
+            }
+        } else {
+            for (step, &freq) in frequencies.iter().enumerate() {
+                let (forward, adjoint) = small.at_frequency(self.context, freq, |system| {
+                    let matrix = crate::analysis::ac::ac_matrix(
+                        self.circuit,
+                        system,
+                        2. * std::f64::consts::PI * freq,
+                    )?;
+                    let lu = matrix.factorize()?;
+                    Ok((
+                        lu.solve(&input_rhs(system, self.card.input.as_str())?)?,
+                        lu.solve_transposed(adjoint_rhs)?,
+                    ))
+                })?;
+                self.observe(small, step, freq, &forward, &adjoint)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, integrated_variables: Vec<Variable>) -> SpiceResult<()> {
+        self.sink.end()?;
+        if self.card.start.to_bits() != self.card.stop.to_bits() {
+            self.sink.complete(integrated_plot(
+                self.representation,
+                integrated_variables,
+                &self.generators,
+                self.card.summary != 0,
+                self.integrated_power,
+            )?)?;
+        }
+        Ok(())
+    }
+}
+
 /// Emits the optional bias, streamed spectrum and, unless the sweep is a
 /// single frequency, its integrated noise in that order.
 pub(super) fn run(
@@ -749,7 +898,7 @@ pub(super) fn run(
     } else {
         model
     };
-    let mut generators: Vec<Generators> =
+    let generators: Vec<Generators> =
         prepared_noise(small.prepared(), &first, small.bias(), Some(small.state()))?
             .into_iter()
             .map(Generators::new)
@@ -762,127 +911,23 @@ pub(super) fn run(
     sink.begin(&spectrum)?;
     let adjoint_rhs = output_excitation(circuit, output);
 
-    let mut integrated_power = Power::default();
-    let mut last = card.start;
-    let mut row = NoiseRow::new(representation, spectrum.variable_count());
-    // The accumulator is strictly sequential: integration, generator state,
-    // summaries and sink rows keep the C frequency order even when numeric
-    // factorizations are produced in independent SIMD lanes.
-    let mut consume = |step: usize,
-                       freq: Real,
-                       forward: &[Complex],
-                       adjoint: &[Complex],
-                       small: &crate::analysis::ac::SmallSignal<'_>|
-     -> SpiceResult<()> {
-        // A device whose small-signal load depends on the frequency also
-        // describes its generators at that frequency (`b4noi.c` evaluates
-        // its flicker factor and correlated gate noise at `data->freq`).
-        if small.varies() || small.reassembles() {
-            refresh_generators(
-                &mut generators,
-                prepared_noise(
-                    small.prepared(),
-                    &model.with_frequency(freq),
-                    small.bias(),
-                    Some(small.state()),
-                )?,
-            )?;
-        }
-        let gain_sq_inv = 1. / gain(circuit, forward, output)?.max(N_MINGAIN);
-        let sample = NoiseSample::new(freq, last, gain_sq_inv, card.start, card.summary != 0);
-        let print_summary = card.summary != 0 && step.is_multiple_of(card.summary);
-        let mut out_density = 0.;
-        let emit = card.summary == 0 || print_summary;
-        row.values.clear();
-        if emit {
-            row.values.push(Complex::real(freq));
-        }
-        for g in &mut generators {
-            out_density += g.accumulate(
-                &sample,
-                |nodes| difference(circuit, adjoint, nodes),
-                &mut integrated_power,
-                print_summary.then_some(&mut row),
-            )?;
-        }
-        let in_density = out_density * gain_sq_inv;
-        if !out_density.is_finite() || !in_density.is_finite() {
-            return Err(noise_failure("nonfinite noise density"));
-        }
-        if emit {
-            row.push_power(out_density);
-            row.push_power(in_density);
-            spectrum.check_point(&row.values)?;
-            if !row.values.iter().all(|value| value.is_finite()) {
-                return Err(SpiceError::Numerical {
-                    context: ".noise".into(),
-                    message: "nonfinite noise density".into(),
-                });
-            }
-            sink.point(&row.values)?;
-        }
-        last = freq;
-        Ok(())
+    let width = spectrum.variable_count();
+    let mut accumulator = NoiseAccumulator {
+        circuit,
+        card,
+        model,
+        context,
+        output,
+        representation,
+        sink,
+        spectrum,
+        generators,
+        integrated_power: Power::default(),
+        last: card.start,
+        row: NoiseRow::new(representation, width),
     };
-    if frequencies.len() > 1 && !small.varies() && !small.reassembles() {
-        let input = input_rhs(small.system(), card.input.as_str())?;
-        let mut work = ComplexFactorBatch::default();
-        let mut previous = None;
-        for (tile, group) in frequencies.chunks(RHS_BATCH_WIDTH).enumerate() {
-            let mut matrices = Vec::new();
-            matrices
-                .try_reserve(group.len())
-                .map_err(|error| noise_failure(&format!("frequency tile capacity: {error}")))?;
-            for &freq in group {
-                matrices.push(crate::analysis::ac::ac_matrix(
-                    circuit,
-                    small.system(),
-                    2. * std::f64::consts::PI * freq,
-                )?);
-            }
-            let factors = ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
-            for (lane, (&freq, factor)) in group.iter().zip(&factors).enumerate() {
-                let forward = factor.solve(&input)?;
-                let adjoint = factor.solve_transposed(&adjoint_rhs)?;
-                consume(
-                    tile * RHS_BATCH_WIDTH + lane,
-                    freq,
-                    &forward,
-                    &adjoint,
-                    &small,
-                )?;
-            }
-            previous = factors.into_iter().last();
-        }
-    } else {
-        for (step, &freq) in frequencies.iter().enumerate() {
-            let input_name = card.input.as_str();
-            let (forward, adjoint) = small.at_frequency(context, freq, |system| {
-                let matrix = crate::analysis::ac::ac_matrix(
-                    circuit,
-                    system,
-                    2. * std::f64::consts::PI * freq,
-                )?;
-                let lu = matrix.factorize()?;
-                Ok((
-                    lu.solve(&input_rhs(system, input_name)?)?,
-                    lu.solve_transposed(&adjoint_rhs)?,
-                ))
-            })?;
-            consume(step, freq, &forward, &adjoint, &small)?;
-        }
-    }
-    sink.end()?;
-    if card.start.to_bits() != card.stop.to_bits() {
-        sink.complete(integrated_plot(
-            representation,
-            integrated_variables,
-            &generators,
-            card.summary != 0,
-            integrated_power,
-        )?)?;
-    }
-    Ok(())
+    accumulator.traverse(&mut small, frequencies, &adjoint_rhs)?;
+    accumulator.finish(integrated_variables)
 }
 
 #[cfg(test)]
