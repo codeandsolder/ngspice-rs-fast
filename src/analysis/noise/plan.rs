@@ -1,5 +1,6 @@
 //! Fixed input/output transfer binding and reused adjoint-solve buffers.
 use super::{N_MINGAIN, noise_failure};
+use crate::devices::linear::SourceRows;
 use crate::devices::noise::{BoundTransfer, squared_gain};
 use crate::devices::{Circuit, LinearSystem, SourceKind};
 use crate::maths::complex::ComplexLu;
@@ -11,7 +12,7 @@ pub(super) struct NoiseSolve<'a> {
     input: &'a str,
     input_slot: usize,
     input_kind: SourceKind,
-    input_rows: Vec<(usize, Real)>,
+    input_rows: SourceRows,
     input_rhs: Vec<Complex>,
     output: BoundTransfer,
     adjoint_rhs: Vec<Complex>,
@@ -55,7 +56,7 @@ impl<'a> NoiseSolve<'a> {
             input,
             input_slot,
             input_kind: source.kind,
-            input_rows: source.rows.clone(),
+            input_rows: source.rows,
             input_rhs,
             output,
             adjoint_rhs,

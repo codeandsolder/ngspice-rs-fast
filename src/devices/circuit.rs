@@ -3330,6 +3330,16 @@ impl Circuit {
         let point = run.point(context)?;
         let mutual = point.mutual(self)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
+        // Source collection size comes from finalized source identities.
+        // Pre-size once per assembly, preserving the device load order.
+        let source_count = self
+            .devices
+            .iter()
+            .filter(|device| matches!(device.designator(), 'v' | 'i'))
+            .count();
+        system.sources.try_reserve(source_count).map_err(|error| {
+            SpiceError::circuit(format!("independent source collection allocation: {error}"))
+        })?;
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
         for index in self.load_order() {
@@ -3527,6 +3537,16 @@ impl Circuit {
         let point = run.point(context)?;
         let mutual = point.mutual(self)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
+        // Source collection size comes from finalized source identities.
+        // Pre-size once per assembly, preserving the device load order.
+        let source_count = self
+            .devices
+            .iter()
+            .filter(|device| matches!(device.designator(), 'v' | 'i'))
+            .count();
+        system.sources.try_reserve(source_count).map_err(|error| {
+            SpiceError::circuit(format!("independent source collection allocation: {error}"))
+        })?;
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
         for index in self.load_order() {

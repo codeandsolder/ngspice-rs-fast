@@ -638,10 +638,10 @@ mod tests {
         LinearSource {
             name: "schedule-test".into(),
             kind,
-            rows: Vec::new(),
+            rows: crate::devices::linear::SourceRows::new(),
             dc: 0.,
             ac: Complex::ZERO,
-            waveform,
+            waveform: waveform.into(),
         }
     }
 
