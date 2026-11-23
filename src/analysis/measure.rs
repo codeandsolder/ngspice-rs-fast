@@ -1165,11 +1165,10 @@ fn event_at(
             crossing_samples(
                 axis,
                 |index| {
-                    let difference = lhs.value(index)? - rhs.value(index)?;
-                    if !difference.is_finite() {
-                        return Err(nonfinite(card, "WHEN", "vector difference overflow".into()));
-                    }
-                    Ok(difference)
+                    Ok(CrossingSample {
+                        lhs: lhs.value(index)?,
+                        rhs: rhs.value(index)?,
+                    })
                 },
                 0.0,
                 *transition,
@@ -1209,13 +1208,31 @@ fn crossing(
     let operand = Operand::resolve(plot, request, &card.name)?;
     crossing_samples(
         axis,
-        |index| operand.value(index),
+        |index| {
+            operand
+                .value(index)
+                .map(|lhs| CrossingSample { lhs, rhs: value })
+        },
         value,
         transition,
         window,
         card,
         &request.vector.name(),
     )
+}
+
+/// Keep finite operands separate until crossing selection. Subtracting them
+/// eagerly can overflow while the equality coordinate remains representable.
+#[derive(Clone, Copy)]
+struct CrossingSample {
+    lhs: Real,
+    rhs: Real,
+}
+
+impl CrossingSample {
+    fn high(self) -> bool {
+        self.lhs >= self.rhs
+    }
 }
 
 struct CrossingSelector {
@@ -1246,21 +1263,20 @@ impl CrossingSelector {
 
     fn include(
         &mut self,
-        (x0, before): (Real, Real),
-        (x1, after): (Real, Real),
-        value: Real,
+        (x0, before): (Real, CrossingSample),
+        (x1, after): (Real, CrossingSample),
         window: &Window,
         card: &MeasureCard,
     ) -> SpiceResult<()> {
-        let before_high = before >= value;
-        let after_high = after >= value;
+        let before_high = before.high();
+        let after_high = after.high();
         if before_high == after_high {
             return Ok(());
         }
         let x = if super::ordered_samples::same_coordinate(x0, x1) {
             x1
         } else {
-            interpolate_axis(x0, before, x1, after, value)
+            interpolate_crossing(x0, before, x1, after)
         };
         if !x.is_finite() {
             return Err(nonfinite(
@@ -1288,7 +1304,7 @@ impl CrossingSelector {
 
 fn crossing_samples(
     axis: &Axis,
-    sample: impl Fn(usize) -> SpiceResult<Real>,
+    sample: impl Fn(usize) -> SpiceResult<CrossingSample>,
     value: Real,
     transition: MeasureTransition,
     window: &Window,
@@ -1307,13 +1323,7 @@ fn crossing_samples(
         let mut before = sample(first.left)?;
         for segment in segments {
             let after = sample(segment.right())?;
-            selector.include(
-                (segment.x0, before),
-                (segment.x1, after),
-                value,
-                window,
-                card,
-            )?;
+            selector.include((segment.x0, before), (segment.x1, after), window, card)?;
             before = after;
         }
     }
@@ -1344,6 +1354,42 @@ fn statistic_unit(statistic: MeasureStatistic, unit: &str, axis: &str) -> String
         MeasureStatistic::Integ => format!("{unit}*{axis}"),
         _ => unit.to_owned(),
     }
+}
+
+/// Invert a crossing without first reducing finite opposing vectors to an
+/// overflowing scalar residual. The exact fallback operates directly on the
+/// signed four-product coordinate numerator and four-value denominator.
+fn interpolate_crossing(x0: Real, before: CrossingSample, x1: Real, after: CrossingSample) -> Real {
+    if same_coordinate(before.lhs, before.rhs) {
+        return x0;
+    }
+    if same_coordinate(after.lhs, after.rhs) {
+        return x1;
+    }
+    // Scalar thresholds preserve the original ordinary-regime interpolation.
+    if same_coordinate(before.rhs, after.rhs) {
+        return interpolate_axis(x0, before.lhs, x1, after.lhs, before.rhs);
+    }
+    let first = before.lhs - before.rhs;
+    let second = after.lhs - after.rhs;
+    if first.is_finite() && second.is_finite() {
+        return interpolate_axis(x0, first, x1, second, 0.);
+    }
+    crate::primitives::rounded_product_ratio(
+        [
+            (x0, after.lhs, false),
+            (x0, after.rhs, true),
+            (x1, before.lhs, true),
+            (x1, before.rhs, false),
+        ],
+        [
+            (after.lhs, false),
+            (after.rhs, true),
+            (before.lhs, true),
+            (before.rhs, false),
+        ],
+    )
+    .clamp(x0, x1)
 }
 
 /// The axis value at which the line through `(x0, y0)` and `(x1, y1)` reaches

@@ -1,6 +1,7 @@
 //! Exact finite binary64 product sums, with bounded exponent storage.
 use super::numeric::{scale_power, split_power};
 use super::{ExactSum, Real};
+use std::cmp::Ordering;
 
 /// A number represented outside the native binary64 exponent range.
 #[derive(Clone, Copy)]
@@ -100,6 +101,41 @@ fn scaled_integer(sum: i128, exponent: i32) -> ScaledNumber {
         mantissa,
         exponent: exponent + shift,
     }
+}
+
+/// Evaluate a quotient of exact signed binary64 products by an exact signed
+/// sum of binary64 values. The product and value accumulators intentionally
+/// share the same 68-limb arithmetic; the latter stores units of 2^-1074,
+/// while the former stores units of 2^-2148.
+#[cold]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-scoped re-export is necessary while unreachable_pub prohibits public visibility"
+)]
+pub(crate) fn rounded_product_ratio<const N: usize, const D: usize>(
+    products: [(Real, Real, bool); N],
+    values: [(Real, bool); D],
+) -> Real {
+    let mut numerator = ExactSum::new();
+    for (a, b, minus) in products {
+        let mut term = ExactTerm::from_real(a).product(ExactTerm::from_real(b));
+        if minus {
+            term.significand = -term.significand;
+        }
+        numerator.add(term);
+    }
+    let mut denominator = ExactSum::new();
+    for (value, minus) in values {
+        let mut term = ExactTerm::from_real(value);
+        term.exponent -= 1074;
+        if minus {
+            term.significand = -term.significand;
+        }
+        denominator.add(term);
+    }
+    let numerator = numerator.magnitude();
+    let denominator = denominator.magnitude();
+    numerator.round_ratio(&denominator)
 }
 
 // Product unit -2148, maximum product exponent <2048, panel weights
@@ -317,6 +353,133 @@ impl Magnitude {
         Real::from_bits(sign | bits)
     }
 
+    fn compare(&self, other: &Self) -> Ordering {
+        self.words.iter().rev().cmp(other.words.iter().rev())
+    }
+
+    fn subtract(&mut self, other: &Self) {
+        let mut borrow = false;
+        for (left, right) in self.words.iter_mut().zip(other.words) {
+            let (difference, first) = left.overflowing_sub(right);
+            let (difference, second) = difference.overflowing_sub(u64::from(borrow));
+            *left = difference;
+            borrow = first || second;
+        }
+        debug_assert!(!borrow, "exact remainder is nonnegative");
+    }
+
+    fn add_word(&mut self, mut index: usize, mut value: u64) {
+        while value != 0 {
+            let (sum, carry) = self.words[index].overflowing_add(value);
+            self.words[index] = sum;
+            value = u64::from(carry);
+            index += 1;
+        }
+    }
+
+    fn add_shifted_product(&mut self, product: u128, shift: usize) {
+        let index = shift / 64;
+        let offset = shift % 64;
+        let (lo, hi) = halves(product);
+        self.add_word(index, lo << offset);
+        if offset == 0 {
+            self.add_word(index + 1, hi);
+        } else {
+            self.add_word(index + 1, (lo >> (64 - offset)) | (hi << offset));
+            self.add_word(index + 2, hi >> (64 - offset));
+        }
+    }
+
+    fn mul_shifted(&self, multiplier: u64, shift: usize) -> Self {
+        let mut result = Self {
+            words: [0; LIMBS],
+            negative: false,
+        };
+        if multiplier != 0 {
+            for (index, &word) in self.words.iter().enumerate() {
+                if word != 0 {
+                    result.add_shifted_product(
+                        u128::from(word) * u128::from(multiplier),
+                        index * 64 + shift,
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    /// Round the ratio once, preserving a contribution that would disappear
+    /// if a tiny fraction were rounded before multiplication by a large span.
+    /// A denominator leading-word quotient estimate overstates by at most one:
+    /// the discarded denominator fraction is <2^-63 relative to its head,
+    /// and the retained quotient has at most 53 bits.
+    fn round_ratio(mut self, denominator: &Self) -> Real {
+        let sign = u64::from(self.negative != denominator.negative) << 63;
+        let (Some(n), Some(d)) = (self.highest_bit(), denominator.highest_bit()) else {
+            return Real::from_bits(sign);
+        };
+        let delta = i32::try_from(n).unwrap_or_default() - i32::try_from(d).unwrap_or_default();
+        // The numerator is in 2^-2148 units and the denominator in 2^-1074
+        // units. Values too small for half a subnormal or too large for
+        // finite binary64 do not require a wide quotient.
+        if delta < -1 {
+            return Real::from_bits(sign);
+        }
+        if delta > 2100 {
+            return Real::from_bits(sign | (0x7ff_u64 << 52));
+        }
+        let exponent = if delta >= 0
+            && self.compare(&denominator.mul_shifted(1, usize::try_from(delta).unwrap_or_default()))
+                == Ordering::Less
+        {
+            delta - 1
+        } else {
+            delta
+        };
+        let shift = usize::try_from((exponent - 52).max(0)).unwrap_or_default();
+        let scaled_denominator = denominator.mul_shifted(1, shift);
+        let mut mantissa = 0_u64;
+        if exponent >= 0 {
+            let head_shift = d.saturating_sub(63);
+            let head = denominator.shifted_word(head_shift);
+            let start = head_shift + shift;
+            let leading_numerator = u128::from(self.shifted_word(start))
+                | (u128::from(self.shifted_word(start + 64)) << 64);
+            mantissa = u64::try_from(leading_numerator / u128::from(head)).unwrap_or_default();
+            let mut product = denominator.mul_shifted(mantissa, shift);
+            if product.compare(&self) == Ordering::Greater {
+                mantissa -= 1;
+                product.subtract(&scaled_denominator);
+            }
+            self.subtract(&product);
+        }
+        match self.mul_shifted(2, 0).compare(&scaled_denominator) {
+            Ordering::Greater => mantissa += 1,
+            Ordering::Equal if mantissa & 1 != 0 => mantissa += 1,
+            _ => {}
+        }
+        if mantissa == 0 {
+            return Real::from_bits(sign);
+        }
+        let mut quantum = -1074 + i32::try_from(shift).unwrap_or_default();
+        if mantissa == 1_u64 << 53 {
+            mantissa >>= 1;
+            quantum += 1;
+        }
+        let high = i32::try_from(mantissa.ilog2()).unwrap_or_default();
+        let binade = quantum + high;
+        if binade > 1023 {
+            return Real::from_bits(sign | (0x7ff_u64 << 52));
+        }
+        let bits = if binade < -1022 {
+            mantissa << (quantum + 1074)
+        } else {
+            (u64::try_from(binade + 1023).unwrap_or_default() << 52)
+                | ((mantissa << (52 - high)) & ((1_u64 << 52) - 1))
+        };
+        Real::from_bits(sign | bits)
+    }
+
     fn scaled(&self) -> ScaledNumber {
         let Some(high_bit) = self.highest_bit() else {
             return ScaledNumber {
@@ -348,6 +511,55 @@ impl Magnitude {
 mod tests {
     use super::ExactSum;
     use crate::primitives::Real;
+
+    #[test]
+    fn exact_quotient_retains_signed_scale_and_small_results() {
+        use super::rounded_product_ratio;
+        let tiny = Real::from_bits(1);
+        let root = rounded_product_ratio(
+            [
+                (0., 1e308, false),
+                (0., 0., true),
+                (1e308, 0., false),
+                (1e308, -tiny, true),
+            ],
+            [(1e308, false), (-tiny, true)],
+        );
+        assert_eq!(root.to_bits(), tiny.to_bits());
+        let halfway = rounded_product_ratio([(1., 1., false)], [(2., false)]);
+        assert_eq!(halfway, 0.5);
+        let negative = rounded_product_ratio([(-1., 1., false)], [(2., false)]);
+        assert_eq!(negative, -0.5);
+    }
+
+    #[test]
+    fn exact_ratio_reproduces_independently_rounded_power_of_two_ratios() {
+        use super::rounded_product_ratio;
+        for exponent in -1074..=1021 {
+            let bits = if exponent < -1022 {
+                1_u64 << (exponent + 1074)
+            } else {
+                u64::try_from(exponent + 1023).unwrap() << 52
+            };
+            let p = Real::from_bits(bits);
+            // Both values are exactly represented. Ordinary float products
+            // would overflow for high p or underflow for low p, but the
+            // mathematical ratio is the correctly rounded native p / 3.
+            let ratio = rounded_product_ratio([(p, p, false)], [(3. * p, false)]);
+            assert_eq!(ratio.to_bits(), (p / 3.).to_bits(), "exponent {exponent}");
+        }
+        // A remainder exactly halfway between subnormal quanta rounds to
+        // the even bit, not toward the endpoint used for interpolation.
+        let tiny = Real::from_bits(1);
+        assert_eq!(
+            rounded_product_ratio([(tiny, 1., false)], [(2., false)]).to_bits(),
+            0_f64.to_bits()
+        );
+        assert_eq!(
+            rounded_product_ratio([(Real::from_bits(3), 1., false)], [(2., false)]).to_bits(),
+            Real::from_bits(2).to_bits()
+        );
+    }
 
     #[test]
     fn normalized_constants_cover_binary64_exponents_and_span_scales() {
