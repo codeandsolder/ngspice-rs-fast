@@ -257,48 +257,26 @@ const MAX_SOURCE_DEPTH: usize = crate::netlist::expr::MAX_TREE_DEPTH;
 const MAX_SOURCE_NODES: usize = crate::netlist::expr::MAX_TREE_NODES;
 
 fn check_source_limits(root: &BExpr) -> SpiceResult<()> {
-    fn walk(expr: &BExpr, depth: usize, remaining: &mut usize) -> SpiceResult<()> {
-        if depth > MAX_SOURCE_DEPTH || *remaining == 0 {
-            return Err(unsupported(
-                expr,
-                "behavioural expression source size/depth limit exceeded",
-            ));
-        }
-        *remaining -= 1;
-        let mut child = |node| walk(node, depth + 1, remaining);
-        match &expr.kind {
-            BExprKind::Unary { operand, .. } | BExprKind::Group(operand) => child(operand)?,
-            BExprKind::Binary { lhs, rhs, .. } => {
-                child(lhs)?;
-                child(rhs)?;
-            }
-            BExprKind::Ternary {
-                condition,
-                then,
-                otherwise,
-            } => {
-                child(condition)?;
-                child(then)?;
-                child(otherwise)?;
-            }
-            BExprKind::Call { arguments, .. } => {
-                for argument in arguments {
-                    child(argument)?;
-                }
-            }
-            BExprKind::Table(table) => {
-                child(&table.input)?;
-                for (x, y) in &table.points {
-                    child(x)?;
-                    child(y)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
     let mut remaining = MAX_SOURCE_NODES;
-    walk(root, 1, &mut remaining)
+    root.walk_bounded(
+        1,
+        &mut remaining,
+        &mut |node, depth, remaining| {
+            if depth > MAX_SOURCE_DEPTH || *remaining == 0 {
+                return Err(unsupported(
+                    node,
+                    "behavioural expression source size/depth limit exceeded",
+                ));
+            }
+            *remaining -= 1;
+            Ok(())
+        },
+        // An unevaluated Value is rejected by compile(); its numparam tree
+        // is not lowered into device instructions, so it cannot consume the
+        // device compiler's source budget. Front-end AST construction counts
+        // it against the shared TreeBudget before elaboration instead.
+        &mut |_, _, _| Ok(()),
+    )
 }
 
 /// A compiled behavioural value and its symbolic partial derivatives,
@@ -931,6 +909,90 @@ pub(super) fn power_h_for_tests(a: Real, b: Real) -> Real {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_expr(kind: BExprKind, line: u32) -> BExpr {
+        use crate::netlist::expr::SourceSpan;
+        let loc = crate::primitives::SourceLoc::new(
+            std::path::PathBuf::from("source-limit.cir"),
+            line,
+            1,
+        );
+        BExpr {
+            kind,
+            span: SourceSpan {
+                start: loc.clone(),
+                end: loc,
+                logical: 0..1,
+            },
+        }
+    }
+
+    fn leaf(line: u32) -> BExpr {
+        source_expr(
+            BExprKind::Number {
+                value: f64::from(line),
+                spelling: line.to_string(),
+            },
+            line,
+        )
+    }
+
+    #[test]
+    fn shared_preflight_accepts_exact_limits_and_rejects_the_next_node() {
+        // One Call wrapper + 99,999 leaves exactly fills the source-node
+        // budget. All children are visited in stored order, not re-sorted.
+        let mut tree = source_expr(
+            BExprKind::Call {
+                name: "test".into(),
+                arguments: (0..MAX_SOURCE_NODES - 1).map(|_| leaf(2)).collect(),
+            },
+            1,
+        );
+        check_source_limits(&tree).unwrap();
+        if let BExprKind::Call { arguments, .. } = &mut tree.kind {
+            arguments.push(leaf(3));
+        }
+        let error = check_source_limits(&tree).unwrap_err();
+        assert!(error.to_string().contains("source size/depth limit"));
+        assert!(error.to_string().contains("source-limit.cir:3:1"));
+    }
+
+    #[test]
+    fn shared_preflight_keeps_depth_boundary_and_first_error() {
+        // Build the nesting iteratively to avoid a parser's syntactic
+        // nesting limit and test only the compiler's structural bound.
+        let mut at_limit = leaf(1);
+        for _ in 1..MAX_SOURCE_DEPTH {
+            at_limit = source_expr(BExprKind::Group(Box::new(at_limit)), 2);
+        }
+        check_source_limits(&at_limit).unwrap();
+        let deeper = source_expr(BExprKind::Group(Box::new(at_limit)), 3);
+        let error = check_source_limits(&deeper).unwrap_err();
+        assert!(error.to_string().contains("source size/depth limit"));
+        assert!(error.to_string().contains("source-limit.cir:1:1"));
+    }
+
+    #[test]
+    fn unevaluated_numparam_value_is_not_lowered_into_device_program() {
+        // Front-end construction counts the embedded numparam tree, but a
+        // Value is terminal in the device compiler: compile rejects it
+        // before ever lowering the hidden subtree into device instructions.
+        use crate::netlist::expr::{Expr, ExprKind, ParameterExpression};
+        let value = ParameterExpression {
+            text: "unresolved".into(),
+            braced: true,
+            quoted: false,
+            span: source_expr(BExprKind::Name(String::new()), 2).span,
+            root: Expr {
+                kind: ExprKind::Identifier("unresolved".into()),
+                span: source_expr(BExprKind::Name(String::new()), 3).span,
+            },
+        };
+        let tree = source_expr(BExprKind::Value(Box::new(value)), 1);
+        check_source_limits(&tree).unwrap();
+        let error = Program::compile(&tree).unwrap_err();
+        assert!(error.to_string().contains("unevaluated numparam"));
+    }
 
     #[test]
     fn ulps_comparison_matches_dawson() {

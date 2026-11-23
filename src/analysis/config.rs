@@ -390,6 +390,25 @@ impl OptionInput<'_> {
     }
 }
 
+/// Independent admission limits for aggregate analysis-plan preparation.
+/// Each spectral/DC grid also retains its own reference-specific point cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanningLimits {
+    /// Number of analysis jobs, including point-free and adaptive ones.
+    pub max_jobs: usize,
+    /// Total deterministic frequency and DC Cartesian points.
+    pub max_grid_points: usize,
+}
+
+impl Default for PlanningLimits {
+    fn default() -> Self {
+        Self {
+            max_jobs: 10_000,
+            max_grid_points: 10_000_000,
+        }
+    }
+}
+
 /// Resolved, validated run configuration for one deck.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RunConfig {
@@ -1063,15 +1082,51 @@ impl RunConfig {
         self.plan(AnalysisInput::from(&literal))
     }
 
-    /// Resolve all analysis cards before scheduling or executing any of them.
+    /// Resolve all deck cards before executing any of them. Default limits
+    /// admit at most 10,000 jobs and 10 million deterministic grid points.
+    /// Adaptive transient stepping is governed separately by its own limits.
     ///
     /// # Errors
-    /// As [`Self::plan_for`], at the invalid card.
+    /// Invalid cards or aggregate work-budget overruns.
     pub fn plans_for(
         &self,
         cards: &[AnalysisCard],
     ) -> SpiceResult<Vec<crate::analysis::AnalysisPlan>> {
-        cards.iter().map(|card| self.plan_for(card)).collect()
+        self.plans_for_with_limits(cards, PlanningLimits::default())
+    }
+
+    /// Resolve a deck with independent limits on job count and deterministic
+    /// grid work. Checked addition rejects overflow before any execution.
+    /// This budgets preparation and intended solves, not streamed rows or
+    /// retained plots, which have their own independent resource policies.
+    ///
+    /// # Errors
+    /// As the ordinary plan resolver, plus either aggregate budget overrun.
+    pub fn plans_for_with_limits(
+        &self,
+        cards: &[AnalysisCard],
+        limits: PlanningLimits,
+    ) -> SpiceResult<Vec<crate::analysis::AnalysisPlan>> {
+        if cards.len() > limits.max_jobs {
+            return Err(crate::analysis::linear::unsupported(
+                "aggregate analysis job limit exceeded",
+            ));
+        }
+        let mut plans = Vec::with_capacity(cards.len());
+        let mut requested = 0usize;
+        for card in cards {
+            let plan = self.plan_for(card)?;
+            requested = requested
+                .checked_add(plan.requested_grid_points())
+                .filter(|count| *count <= limits.max_grid_points)
+                .ok_or_else(|| {
+                    crate::analysis::linear::unsupported(
+                        "aggregate deterministic analysis grid point limit exceeded",
+                    )
+                })?;
+            plans.push(plan);
+        }
+        Ok(plans)
     }
 
     /// Resolve explicit analysis input over this configuration's typed deck

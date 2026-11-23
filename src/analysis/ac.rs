@@ -4,8 +4,9 @@
 //! ([`SmallSignal`]) are shared with the `.sp` driver
 //! (`crate::analysis::sparam`), because `span.c` steps frequencies and
 //! prepares its operating point exactly as `acan.c` does.
-use crate::analysis::frequency::{Advance, FrequencyGrid};
+use crate::analysis::frequency::{Advance, FrequencyPlan};
 use crate::analysis::linear::{number, plot, unsupported};
+use crate::analysis::results::SelectedOutput;
 use crate::analysis::{AnalysisPlan, Plot, PointSink};
 use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
@@ -17,7 +18,7 @@ pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisPlan,
     context: &crate::analysis::AnalysisContext,
-    grid: &[Real],
+    grid: &FrequencyPlan,
     include_bias: bool,
     sink: &mut dyn PointSink,
 ) -> SpiceResult<()> {
@@ -35,28 +36,37 @@ pub(super) fn run(
         true,
     )?;
     sink.begin(&plot)?;
+    let mut selected = SelectedOutput::bind(sink, &plot, circuit.unknown_count(), true)?;
     // NIacIter on the circuit's own matrix: the first AC solve of the
     // circuit reorders (`SMPcReorder`, starting from the real pivot order),
     // later frequencies refactor (`SMPcLUfac`) and reorder only after a zero
     // pivot. See [`ac_matrix`].
     let shared: &Circuit = circuit;
     let mut point = Vec::with_capacity(plot.variable_count());
-    for &f in grid {
+    for f in grid.values() {
         let x = small_signal.at_frequency(context, f, |system| {
             ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
                 .factorize()?
                 .solve(&system.ac_rhs())
         })?;
-        point.clear();
-        point.push(Complex::real(f));
-        point.extend(x);
-        point.extend(
+        let model = context.model_context().with_frequency(f);
+        let observed = if let Some(output) = selected.as_ref() {
             small_signal
                 .prepared()
-                .observe_parameters(&context.model_context().with_frequency(f))?,
-        );
-        plot.check_point(&point)?;
-        sink.point(&point)?;
+                .observe_parameters_selected(&model, output.observations())?
+        } else {
+            small_signal.prepared().observe_parameters(&model)?
+        };
+        if let Some(output) = selected.as_mut() {
+            output.complex(sink, Some(f), &x, &observed)?;
+        } else {
+            point.clear();
+            point.push(Complex::real(f));
+            point.extend(x);
+            point.extend(observed);
+            plot.check_point(&point)?;
+            sink.point(&point)?;
+        }
     }
     sink.end()
 }
@@ -86,7 +96,7 @@ pub(super) fn frequency_grid(
     arguments: &[String],
     reltol: Real,
     kind: GridKind,
-) -> SpiceResult<Vec<Real>> {
+) -> SpiceResult<FrequencyPlan> {
     let argument = |index: usize| arguments.get(index).map(String::as_str);
     let mode = argument(0).unwrap_or_default().to_ascii_lowercase();
     // ACnumberSteps is IF_INTEGER: floor(0.5 + value).
@@ -139,7 +149,7 @@ pub(super) fn frequency_grid(
         GridKind::Ac => ".ac",
         GridKind::Sp => ".sp",
     };
-    FrequencyGrid::new(start, stop, tolerance, advance, analysis)?.collect()
+    FrequencyPlan::new(start, stop, tolerance, advance, analysis)
 }
 
 /// `CKTacLoad`: the small-signal system at `omega` loaded into the circuit's
@@ -346,6 +356,8 @@ mod tests {
             kind,
         )
         .unwrap()
+        .values()
+        .collect()
     }
 
     #[test]
