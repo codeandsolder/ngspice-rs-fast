@@ -6,6 +6,7 @@
 //! prepares its operating point exactly as `acan.c` does.
 use crate::analysis::frequency::{Advance, FrequencyGrid};
 use crate::analysis::linear::{number, plot, unsupported};
+use crate::analysis::results::SelectedOutput;
 use crate::analysis::{AnalysisPlan, Plot, PointSink};
 use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
@@ -35,6 +36,7 @@ pub(super) fn run(
         true,
     )?;
     sink.begin(&plot)?;
+    let mut selected = SelectedOutput::bind(sink, &plot, circuit.unknown_count(), true)?;
     // NIacIter on the circuit's own matrix: the first AC solve of the
     // circuit reorders (`SMPcReorder`, starting from the real pivot order),
     // later frequencies refactor (`SMPcLUfac`) and reorder only after a zero
@@ -47,16 +49,24 @@ pub(super) fn run(
                 .factorize()?
                 .solve(&system.ac_rhs())
         })?;
-        point.clear();
-        point.push(Complex::real(f));
-        point.extend(x);
-        point.extend(
+        let model = context.model_context().with_frequency(f);
+        let observed = if let Some(output) = selected.as_ref() {
             small_signal
                 .prepared()
-                .observe_parameters(&context.model_context().with_frequency(f))?,
-        );
-        plot.check_point(&point)?;
-        sink.point(&point)?;
+                .observe_parameters_selected(&model, output.observations())?
+        } else {
+            small_signal.prepared().observe_parameters(&model)?
+        };
+        if let Some(output) = selected.as_mut() {
+            output.complex(sink, Some(f), &x, &observed)?;
+        } else {
+            point.clear();
+            point.push(Complex::real(f));
+            point.extend(x);
+            point.extend(observed);
+            plot.check_point(&point)?;
+            sink.point(&point)?;
+        }
     }
     sink.end()
 }

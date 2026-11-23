@@ -7,6 +7,8 @@
 //! Operations that need arbitrary history use a bounded raw-column
 //! projection, not the producer's whole result schema.
 
+use std::cell::Cell;
+
 use crate::analysis::measure::online::{
     AxisTracker, BoundMeasure, MeasureState, PointQuery, QueryFailure,
 };
@@ -189,6 +191,10 @@ pub struct PlotObjectivePlan {
     trace_axis: Option<usize>,
     projection: Option<Projection>,
     required: Vec<usize>,
+    requests: ObjectiveRequests,
+    /// Compile the compact operand layout once for all candidate sessions.
+    /// The boxed child has no further compact plan.
+    compact: Option<Box<Self>>,
 }
 
 fn invalid(message: impl Into<String>) -> SpiceError {
@@ -317,6 +323,23 @@ fn bind_axes(
     Ok((axis, trace_axis))
 }
 
+fn bind_fourier_columns(
+    header: &Plot,
+    kind: AnalysisKind,
+    cards: &[FourierCard],
+    retained: &mut Vec<usize>,
+) -> SpiceResult<()> {
+    if !cards.is_empty() && kind != AnalysisKind::Transient {
+        return Err(invalid("Fourier objectives require a transient plot"));
+    }
+    for card in cards {
+        for vector in &card.vectors {
+            retained.extend(resolve_request(header, vector)?.input_columns());
+        }
+    }
+    Ok(())
+}
+
 impl PlotObjectivePlan {
     /// Bind one output's requirements against its immutable column schema.
     /// The header may come from a prepared schema or a representative run;
@@ -330,6 +353,17 @@ impl PlotObjectivePlan {
         kind: AnalysisKind,
         requests: ObjectiveRequests,
     ) -> SpiceResult<Self> {
+        let mut plan = Self::bind_schema(header, kind, requests)?;
+        plan.compact = Some(Box::new(plan.compact()?));
+        Ok(plan)
+    }
+
+    fn bind_schema(
+        header: &Plot,
+        kind: AnalysisKind,
+        requests: ObjectiveRequests,
+    ) -> SpiceResult<Self> {
+        let preserved = requests.clone();
         let ObjectiveRequests {
             measurements,
             observations,
@@ -390,20 +424,11 @@ impl PlotObjectivePlan {
         let traces = observations
             .iter()
             .enumerate()
-            .filter_map(|(index, observation)| {
-                matches!(observation.reduction, ObservationReduction::Trace { .. }).then_some(index)
+            .filter_map(|(i, o)| {
+                matches!(o.reduction, ObservationReduction::Trace { .. }).then_some(i)
             })
             .collect();
-        if !fourier.is_empty() {
-            if kind != AnalysisKind::Transient {
-                return Err(invalid("Fourier objectives require a transient plot"));
-            }
-            for card in &fourier {
-                for vector in &card.vectors {
-                    retained.extend(resolve_request(header, vector)?.input_columns());
-                }
-            }
-        }
+        bind_fourier_columns(header, kind, &fourier, &mut retained)?;
         let projection = bind_projection(
             header,
             kind,
@@ -428,7 +453,27 @@ impl PlotObjectivePlan {
             trace_axis,
             projection,
             required,
+            requests: preserved,
+            compact: None,
         })
+    }
+
+    /// Rebind every measurement/trace/query/Fourier operand once to a compact
+    /// raw schema containing exactly the requested original ordinals.
+    /// The full header is independently checked at sink.begin beforehand.
+    fn compact(&self) -> SpiceResult<Self> {
+        let variables = self
+            .required
+            .iter()
+            .map(|&column| self.source.variables()[column].clone())
+            .collect();
+        let header = Plot::new(
+            self.source.name.clone(),
+            self.source.plotname.clone(),
+            self.source.flags(),
+            variables,
+        );
+        Self::bind_schema(&header, self.kind, self.requests.clone())
     }
 
     /// Ordered raw observation indices required by the objectives, including
@@ -645,7 +690,13 @@ impl ActivePlot {
         plan: &PlotObjectivePlan,
         row: &[Complex],
     ) -> SpiceResult<()> {
-        plan.source.check_point(row)?;
+        // A ground-only objective legitimately requests no raw columns.
+        // The full producer header was checked at begin; a compact empty
+        // row is a valid accepted point even though Plot storage forbids
+        // zero-column non-PZ plots.
+        if !(plan.source.variable_count() == 0 && row.is_empty()) {
+            plan.source.check_point(row)?;
+        }
         self.rows = self
             .rows
             .checked_add(1)
@@ -821,6 +872,8 @@ impl ScenarioPlan {
             plan: self,
             scope,
             active: None,
+            scratch: Vec::new(),
+            selected: Cell::new(false),
             results: Vec::with_capacity(self.plots.len()),
             failed: false,
         }
@@ -878,6 +931,9 @@ pub struct ScenarioSink<'a> {
     plan: &'a ScenarioPlan,
     scope: &'a ParamScope,
     active: Option<ActivePlot>,
+    scratch: Vec<Complex>,
+    /// Set only when a producer negotiates compact rows for the active plot.
+    selected: Cell<bool>,
     results: Vec<PlotObjectives>,
     failed: bool,
 }
@@ -921,21 +977,56 @@ impl PointSink for ScenarioSink<'_> {
             {
                 return Err(lifecycle_error("objective plot identity or schema changed"));
             }
-            self.active = Some(ActivePlot::new(plan)?);
+            let compact = plan
+                .compact
+                .as_deref()
+                .ok_or_else(|| lifecycle_error("missing prepared compact objective plan"))?;
+            self.active = Some(ActivePlot::new(compact)?);
+            self.selected.set(false);
             Ok(())
         })();
         self.checked(result)
     }
 
+    fn selected_columns(&self) -> Option<&[usize]> {
+        let plan = self
+            .active
+            .as_ref()
+            .and_then(|_| self.plan.plots.get(self.results.len()))?;
+        self.selected.set(true);
+        Some(plan.required_columns())
+    }
+
     fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
-        let result = if self.failed {
-            Err(lifecycle_error("objective sink is poisoned"))
-        } else {
-            self.active
+        let result = (|| {
+            if self.failed {
+                return Err(lifecycle_error("objective sink is poisoned"));
+            }
+            let original = self
+                .plan
+                .plots
+                .get(self.results.len())
+                .ok_or_else(|| lifecycle_error("objective row without a scheduled plot"))?;
+            let compact = original
+                .compact
+                .as_deref()
+                .ok_or_else(|| lifecycle_error("objective row without a projection"))?;
+            let active = self
+                .active
                 .as_mut()
-                .ok_or_else(|| lifecycle_error("objective row without an active plot"))
-                .and_then(|active| active.point(&self.plan.plots[self.results.len()], values))
-        };
+                .ok_or_else(|| lifecycle_error("objective row without an active plot"))?;
+            if self.selected.get() {
+                active.point(compact, values)
+            } else {
+                // Materialized producers and direct PointSink consumers submit
+                // full rows. Validate their complete width before projecting.
+                original.source.check_point(values)?;
+                self.scratch.clear();
+                self.scratch
+                    .extend(original.required.iter().map(|&index| values[index]));
+                active.point(compact, &self.scratch)
+            }
+        })();
         self.checked(result)
     }
 
@@ -948,11 +1039,15 @@ impl PointSink for ScenarioSink<'_> {
                 .active
                 .take()
                 .ok_or_else(|| lifecycle_error("objective completion without active plot"))?;
-            self.results.push(active.finish(
-                &self.plan.plots[self.results.len()],
-                self.scope,
-                None,
-            ));
+            let compact = self
+                .plan
+                .plots
+                .get(self.results.len())
+                .and_then(|plan| plan.compact.as_deref())
+                .ok_or_else(|| {
+                    lifecycle_error("objective completion without a bound projection")
+                })?;
+            self.results.push(active.finish(compact, self.scope, None));
             Ok(())
         })();
         self.checked(result)
