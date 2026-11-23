@@ -16,6 +16,7 @@
 //! Behaviour documented here is ported from the C tree; the C file and function
 //! that define it are named in each doc comment.
 
+pub mod ascii;
 pub mod error;
 mod exact;
 pub(crate) use exact::{positive_axis_span, rounded_product_ratio};
