@@ -447,73 +447,84 @@ fn diode_tile_load_and_solve_benchmark() {
     use crate::netlist::{Parser, source::parse_deck_text};
     use std::{fmt::Write, hint::black_box, path::Path, time::Instant};
 
-    for count in [1, 4, 64, 256, 1_024, 4_096] {
-        let mut deck = String::from(
-            "diode benchmark\nv0 n0 0 dc 0\nr0 n0 n1 100\n.model dm d(is=1e-14 cjo=2p tt=3n)\n",
-        );
-        for index in 0..count {
-            writeln!(&mut deck, "d{index} n{} 0 dm", index % 8).unwrap();
-        }
-        deck.push_str(".op\n.end\n");
-        let parsed = Parser::new()
-            .parse_deck(&parse_deck_text(Path::new("tile-benchmark.cir"), &deck))
-            .unwrap();
-        let context = ModelContext::default();
-        for batched in [false, true] {
-            let mut circuit = Circuit::from_netlist(&parsed).unwrap();
-            let lanes = circuit
-                .bindings
-                .diode_batches
-                .iter()
-                .map(|b| b.len)
-                .sum::<usize>();
-            if !batched {
-                circuit.bindings.diode_batches.clear();
-            }
-            let history = circuit.state_history().unwrap();
-            let run = circuit.prepare_run();
-            let solution = Vector::zeros(circuit.unknown_count());
-            let request = LoadRequest {
-                mode: AnalysisMode::OperatingPoint,
-                solution: &solution,
-                model_context: &context,
-                integration: None,
-                history: &history,
-                forcing: None,
+    for family in ["simple", "full"] {
+        for count in [1, 4, 64, 256, 1_024, 4_096] {
+            let model = if family == "full" {
+                "is=1e-14 n=1.1 rs=2 cjo=30p tt=5n vj=0.8 m=0.4 fc=0.5              bv=5.1 ibv=5m nbv=1.4 jsw=2e-15 ns=1.6 cjsw=4p              isr=1e-11 nr=2.2 ikf=1m ikr=1u ikp=1u              jtun=1e-13 jtunsw=1e-14 ntun=20"
+            } else {
+                "is=1e-14 cjo=2p tt=3n"
             };
-            let mut matrix = circuit.new_matrix().unwrap();
-            let mut rhs = Vector::zeros(circuit.unknown_count());
-            let mut records = Vec::with_capacity(3);
-            for repeat in 0..4 {
-                let mut load_ns = 0_u128;
-                let mut solve_ns = 0_u128;
-                for _ in 0..48 {
-                    matrix.clear();
-                    rhs.clear();
-                    let mut trial = history.trial();
-                    let start = Instant::now();
-                    run.load(&request, &mut matrix, &mut rhs, &mut trial)
-                        .unwrap();
-                    load_ns += start.elapsed().as_nanos();
-                    black_box(&trial);
-                    let start = Instant::now();
-                    black_box(matrix.solve(&rhs).unwrap());
-                    solve_ns += start.elapsed().as_nanos();
-                }
-                if repeat > 0 {
-                    records.push((load_ns, solve_ns));
+            let mut deck = format!(
+                "diode benchmark\nv0 n0 0 dc 0\nr0 n0 n1 100\n.model dm d({model})\n"
+            );
+            for index in 0..count {
+                if family == "full" {
+                    writeln!(&mut deck, "d{index} n{} 0 dm pj=4", index % 8).unwrap();
+                } else {
+                    writeln!(&mut deck, "d{index} n{} 0 dm", index % 8).unwrap();
                 }
             }
-            let mut loads = records.iter().map(|&(load, _)| load).collect::<Vec<_>>();
-            let mut solves = records.iter().map(|&(_, solve)| solve).collect::<Vec<_>>();
-            loads.sort_unstable();
-            solves.sort_unstable();
-            println!(
-                "diode_count={count},active_lanes={lanes},batched={batched},load_ns_per_trial={},solve_ns_per_trial={},total_ns_per_trial={}",
-                loads[1] / 48,
-                solves[1] / 48,
-                (loads[1] + solves[1]) / 48
-            );
+            deck.push_str(".op\n.end\n");
+            let parsed = Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("tile-benchmark.cir"), &deck))
+                .unwrap();
+            let context = ModelContext::default();
+            for batched in [false, true] {
+                let mut circuit = Circuit::from_netlist(&parsed).unwrap();
+                let lanes = circuit
+                    .bindings
+                    .diode_batches
+                    .iter()
+                    .map(|b| b.len)
+                    .sum::<usize>();
+                if !batched {
+                    circuit.bindings.diode_batches.clear();
+                }
+                let history = circuit.state_history().unwrap();
+                let run = circuit.prepare_run();
+                let solution = Vector::zeros(circuit.unknown_count());
+                let request = LoadRequest {
+                    mode: AnalysisMode::OperatingPoint,
+                    solution: &solution,
+                    model_context: &context,
+                    integration: None,
+                    history: &history,
+                    forcing: None,
+                };
+                let mut matrix = circuit.new_matrix().unwrap();
+                let mut rhs = Vector::zeros(circuit.unknown_count());
+                let mut records = Vec::with_capacity(3);
+                for repeat in 0..4 {
+                    let mut load_ns = 0_u128;
+                    let mut solve_ns = 0_u128;
+                    for _ in 0..48 {
+                        matrix.clear();
+                        rhs.clear();
+                        let mut trial = history.trial();
+                        let start = Instant::now();
+                        run.load(&request, &mut matrix, &mut rhs, &mut trial)
+                            .unwrap();
+                        load_ns += start.elapsed().as_nanos();
+                        black_box(&trial);
+                        let start = Instant::now();
+                        black_box(matrix.solve(&rhs).unwrap());
+                        solve_ns += start.elapsed().as_nanos();
+                    }
+                    if repeat > 0 {
+                        records.push((load_ns, solve_ns));
+                    }
+                }
+                let mut loads = records.iter().map(|&(load, _)| load).collect::<Vec<_>>();
+                let mut solves = records.iter().map(|&(_, solve)| solve).collect::<Vec<_>>();
+                loads.sort_unstable();
+                solves.sort_unstable();
+                println!(
+                    "diode_family={family},diode_count={count},active_lanes={lanes},batched={batched},load_ns_per_trial={},solve_ns_per_trial={},total_ns_per_trial={}",
+                    loads[1] / 48,
+                    solves[1] / 48,
+                    (loads[1] + solves[1]) / 48
+                );
+            }
         }
     }
 }
