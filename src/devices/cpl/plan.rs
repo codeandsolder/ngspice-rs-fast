@@ -51,7 +51,7 @@ pub struct CplPlan {
     conductors: usize,
     length: Real,
     matrices: [Matrix; 4],
-    modal_delays: Vec<Real>,
+    modes: super::modal::CplModes,
 }
 
 impl CplPlan {
@@ -94,7 +94,7 @@ impl CplPlan {
         let matrices: [Matrix; 4] = matrices
             .try_into()
             .map_err(|_| SpiceError::circuit("CPL internal matrix count"))?;
-        let modal_delays = propagation_delays(
+        let modes = super::modal::CplModes::prepare(
             length,
             &matrices[CplMatrixKind::Inductance.index()],
             &matrices[CplMatrixKind::Capacitance.index()],
@@ -103,7 +103,7 @@ impl CplPlan {
             conductors,
             length,
             matrices,
-            modal_delays,
+            modes,
         })
     }
 
@@ -132,7 +132,13 @@ impl CplPlan {
     /// and convolution; they do not change these high-frequency wavefronts.
     #[must_use]
     pub fn modal_delays(&self) -> &[Real] {
-        &self.modal_delays
+        self.modes.delays()
+    }
+
+    /// Physical lossless high-frequency eigenbasis and wave impedance.
+    #[must_use]
+    pub const fn modes(&self) -> &super::modal::CplModes {
+        &self.modes
     }
 }
 
@@ -236,100 +242,4 @@ fn validate_spectrum(order: usize, kind: CplMatrixKind, matrix: &Matrix) -> Spic
         )));
     }
     Ok(())
-}
-
-/// The spectrum of the coupled LC product equals the symmetric similarity
-/// transformed by the Cholesky factor of C.
-/// Positive definiteness ensures real propagation delays without assuming
-/// that L and C commute or that their eigenvectors are already aligned.
-fn propagation_delays(
-    length: Real,
-    inductance: &Matrix,
-    capacitance: &Matrix,
-) -> SpiceResult<Vec<Real>> {
-    let order = inductance.rows();
-    let scale = |matrix: &Matrix| -> SpiceResult<Real> {
-        let maximum = (0..order)
-            .filter_map(|row| matrix.get(row, row))
-            .fold(0.0_f64, Real::max);
-        if !maximum.is_finite() || maximum <= 0. {
-            return Err(SpiceError::circuit(
-                "CPL propagation needs positive L and C scales",
-            ));
-        }
-        Ok(maximum)
-    };
-    let inductance_scale = scale(inductance)?;
-    let capacitance_scale = scale(capacitance)?;
-
-    // Cholesky of C/c_scale: lower-triangular S.
-    let mut lower = Matrix::zeros(order, order)?;
-    for row in 0..order {
-        for col in 0..=row {
-            let mut entry = capacitance
-                .get(row, col)
-                .ok_or_else(|| SpiceError::circuit("CPL capacitance index"))?
-                / capacitance_scale;
-            for index in 0..col {
-                let left = lower.get(row, index).unwrap_or(0.);
-                let right = lower.get(col, index).unwrap_or(0.);
-                entry = (-left).mul_add(right, entry);
-            }
-            if row == col {
-                if entry <= 0. || !entry.is_finite() {
-                    return Err(SpiceError::circuit(
-                        "CPL capacitance Cholesky is singular or indefinite",
-                    ));
-                }
-                lower.set(row, col, entry.sqrt())?;
-            } else {
-                let pivot = lower.get(col, col).unwrap_or(0.);
-                let value = entry / pivot;
-                if !value.is_finite() {
-                    return Err(SpiceError::circuit("CPL modal basis is nonfinite"));
-                }
-                lower.set(row, col, value)?;
-            }
-        }
-    }
-
-    let mut similarity = Matrix::zeros(order, order)?;
-    for row in 0..order {
-        for col in row..order {
-            let mut value = 0.;
-            for inner in 0..order {
-                let s_left = lower.get(inner, row).unwrap_or(0.);
-                for other in 0..order {
-                    let l = inductance.get(inner, other).unwrap_or(0.) / inductance_scale;
-                    let s_right = lower.get(other, col).unwrap_or(0.);
-                    value = (s_left * l).mul_add(s_right, value);
-                }
-            }
-            if !value.is_finite() {
-                return Err(SpiceError::circuit("CPL similarity transform overflowed"));
-            }
-            similarity.set(row, col, value)?;
-            if row != col {
-                similarity.set(col, row, value)?;
-            }
-        }
-    }
-    let eigenvalues = similarity.symmetric_eigenvalues()?;
-    let magnitude = length * inductance_scale.sqrt() * capacitance_scale.sqrt();
-    if !magnitude.is_finite() || magnitude <= 0. {
-        return Err(SpiceError::circuit("CPL propagation time scale overflows"));
-    }
-    eigenvalues
-        .into_iter()
-        .map(|value| {
-            if !value.is_finite() || value <= 0. {
-                return Err(SpiceError::circuit("CPL propagation mode is not positive"));
-            }
-            let delay = magnitude * value.sqrt();
-            if !delay.is_finite() || delay <= 0. {
-                return Err(SpiceError::circuit("CPL propagation delay is not finite"));
-            }
-            Ok(delay)
-        })
-        .collect()
 }
