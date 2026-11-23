@@ -519,6 +519,70 @@ mod tests {
     }
 
     #[test]
+    fn bounded_scanner_charges_tokens_before_invalid_lexemes() {
+        use crate::netlist::source::budget::{SourceBudget, SourceLimits};
+
+        let line = card("r1 α {unterminated");
+        let mut limits = SourceLimits {
+            tokens: 2,
+            ..SourceLimits::default()
+        };
+        let mut budget = SourceBudget::new(limits);
+        let error = super::tokenize_bounded(&line, &mut budget)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("source token work limit exceeded"),
+            "{error}"
+        );
+        assert!(budget.exhausted());
+
+        limits.tokens = 3;
+        let mut budget = SourceBudget::new(limits);
+        let error = super::tokenize_bounded(&line, &mut budget)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unterminated"), "{error}");
+        assert!(!budget.exhausted());
+
+        limits.tokens = 16;
+        limits.card_bytes = line.text.len() - 1;
+        let mut budget = SourceBudget::new(limits);
+        let error = super::tokenize_bounded(&line, &mut budget)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("logical card byte limit"), "{error}");
+    }
+
+    #[test]
+    fn owned_tokens_and_writer_lexemes_share_unicode_and_escaped_spellings() {
+        let line = card(r#"r1 "α \β" {max(1,{x})} 1k"#);
+        let tokens = tokenize(&line).unwrap();
+        let mut cursor = 0;
+        for token in &tokens {
+            let scanned = super::scan_next(
+                &line.text,
+                &mut cursor,
+                |offset| line.location_at(offset),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(scanned.start, token.raw_offset);
+            assert_eq!(scanned.text, token.text);
+            assert_eq!(scanned.kind.name(), token.kind.name());
+            assert_eq!(line.location_at(scanned.start), token.location);
+        }
+        assert!(
+            super::scan_next(&line.text, &mut cursor, |_| line.location.clone(), None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(tokens[1].kind, TokenKind::Quoted("α β".into()));
+        assert_eq!(tokens[2].kind, TokenKind::Expression("max(1,{x})".into()));
+    }
+
+    #[test]
     fn keyword_comparison_is_case_insensitive() {
         let tokens = tokens("R1 in out 1k");
         assert!(tokens[0].is_keyword("r1"));
