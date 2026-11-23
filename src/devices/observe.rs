@@ -180,17 +180,21 @@ impl TerminalLayout {
 }
 
 struct LoadedTerminals {
-    ready: bool,
+    /// Last point epoch with a successfully stamped, complete load.
+    epoch: u64,
+    /// Allocated on first use, then reused for every later selected point.
     currents: Vec<Real>,
 }
 
-/// Capacity is analysis-local; no previous point's currents or trial
-/// state are considered valid after the next call begins.
+/// Capacity and validity are local to one prepared run. An epoch change
+/// invalidates all prior point results without visiting the bound loads;
+/// epoch zero is permanently reserved for never-current entries.
 pub(super) struct ObservationWorkspace {
     matrix: SparseMatrix,
     rhs: IsolatedRhs,
     state: IsolatedState,
     loaded: Vec<LoadedTerminals>,
+    epoch: u64,
 }
 
 impl ObservationWorkspace {
@@ -203,17 +207,24 @@ impl ObservationWorkspace {
             loaded: plan
                 .loads
                 .iter()
-                .map(|layout| LoadedTerminals {
-                    ready: false,
-                    currents: vec![0.; layout.rows.len() + 1],
+                .map(|_| LoadedTerminals {
+                    epoch: 0,
+                    currents: Vec::new(),
                 })
                 .collect(),
+            epoch: 0,
         }
     }
 
     fn begin(&mut self) {
-        for load in &mut self.loaded {
-            load.ready = false;
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            // Very rare full sweep: discard all historical epoch tags before
+            // reusing epoch 1. Retain already initialized scratch buffers.
+            for load in &mut self.loaded {
+                load.epoch = 0;
+            }
+            self.epoch = 1;
         }
     }
 }
@@ -237,7 +248,7 @@ impl PointLoads<'_, '_> {
         let layout = &self.circuit.runtime.observations.loads[load];
         let work = &mut *self.workspace;
         let loaded = &mut work.loaded[load];
-        if !loaded.ready {
+        if loaded.epoch != work.epoch {
             if self.mutual.is_none() {
                 self.mutual = Some(self.point.mutual(self.circuit)?);
             }
@@ -276,13 +287,14 @@ impl PointLoads<'_, '_> {
                     }
                 }
             }
+            loaded.currents.resize(layout.rows.len() + 1, 0.);
             layout.residuals(
                 &work.matrix,
                 |row| work.rhs.get(row),
                 self.request.solution,
                 &mut loaded.currents,
             );
-            loaded.ready = true;
+            loaded.epoch = work.epoch;
         }
         loaded.currents.get(slot).copied().ok_or_else(|| gap(name))
     }
@@ -801,6 +813,152 @@ mod tests {
         );
     }
 
+    /// Reuse one prepared circuit and bound selector set over 1,001 points;
+    /// this is not a test of repeated topology construction.
+    fn measure_selected_workspace(load_count: usize, points: usize) {
+        use crate::devices::Resistor;
+        let mut circuit = Circuit::new();
+        let a = circuit.add_node("a").unwrap();
+        let mut names = Vec::with_capacity(load_count);
+        for index in 0..load_count {
+            let name = format!("r{index}");
+            circuit
+                .add_device(Box::new(
+                    Resistor::new(name.clone(), [a, NodeId::GROUND], 1_000.).unwrap(),
+                ))
+                .unwrap();
+            names.push(format!("i({name})"));
+        }
+        circuit.finalize().unwrap();
+        circuit.set_observations(&names).unwrap();
+        let history = circuit.state_history().unwrap();
+        let model = ModelContext::default();
+        let solution = Vector::from_slice(&[2.]);
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context: &model,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        let run = circuit.prepare_run();
+        let started = std::time::Instant::now();
+        let mut sample = Vec::new();
+        for _ in 0..points {
+            sample = run
+                .observe_real_selected(&request, &[], None, None, &[0])
+                .unwrap();
+        }
+        let sparse_elapsed = started.elapsed();
+        {
+            let borrowed = run.observation_work.borrow();
+            let work = borrowed.as_ref().unwrap();
+            assert_eq!(work.loaded.len(), load_count);
+            assert_eq!(work.epoch, points as u64);
+            assert_eq!(work.loaded[0].epoch, work.epoch);
+            assert!(work.loaded.iter().skip(1).all(|loaded| loaded.epoch == 0));
+            assert_eq!(
+                work.loaded
+                    .iter()
+                    .filter(|loaded| !loaded.currents.is_empty())
+                    .count(),
+                1
+            );
+            let cold_bytes: usize = circuit
+                .runtime
+                .observations
+                .loads
+                .iter()
+                .map(|layout| (layout.rows.len() + 1) * size_of::<Real>())
+                .sum();
+            let allocated_bytes: usize = work
+                .loaded
+                .iter()
+                .map(|loaded| loaded.currents.capacity() * size_of::<Real>())
+                .sum();
+            let metadata_bytes = work.loaded.len() * size_of::<LoadedTerminals>();
+            println!(
+                "{load_count} registered loads, {points} points: selected={sparse_elapsed:?},                  scratch {allocated_bytes}/{cold_bytes} eager bytes,                  per-load metadata {metadata_bytes} bytes, initialized buffers 1",
+            );
+            assert!(allocated_bytes < cold_bytes);
+        }
+        let full_started = std::time::Instant::now();
+        let all = run.observe_real(&request, &[], None, None).unwrap();
+        let full_elapsed = full_started.elapsed();
+        assert_eq!(sample, all[..1]);
+        let borrowed = run.observation_work.borrow();
+        let work = borrowed.as_ref().unwrap();
+        assert_eq!(
+            work.loaded
+                .iter()
+                .filter(|loaded| !loaded.currents.is_empty())
+                .count(),
+            load_count
+        );
+        println!("{load_count} full-selection point: {full_elapsed:?}");
+    }
+
+    #[test]
+    fn selected_observations_keep_cold_loads_unallocated_over_many_points() {
+        measure_selected_workspace(24, 1_001);
+    }
+
+    #[test]
+    #[ignore = "run separately for the thousand-load throughput measurement"]
+    fn selected_observation_thousand_load_benchmark() {
+        measure_selected_workspace(1_000, 1_001);
+    }
+
+    #[test]
+    fn lazy_workspace_metadata_and_epoch_rollover_preserve_warmed_scratch() {
+        let circuit = Circuit::new();
+        let plan = ObservationPlan {
+            loads: (0..1_000)
+                .map(|i| TerminalLayout {
+                    device: i,
+                    rows: vec![0, 1],
+                    by_row: vec![(0, 0), (1, 1)],
+                    ports: vec![0, 1],
+                })
+                .collect(),
+            ..ObservationPlan::default()
+        };
+        let mut work = ObservationWorkspace::new(&circuit, &plan);
+        assert_eq!(work.loaded.len(), 1_000);
+        assert!(work.loaded.iter().all(|load| load.currents.capacity() == 0));
+        assert!(work.loaded.iter().all(|load| load.epoch == 0));
+
+        work.begin();
+        assert_eq!(work.epoch, 1);
+        let first = &mut work.loaded[42];
+        first.currents.resize(3, 0.);
+        first.epoch = work.epoch;
+        let pointer = first.currents.as_ptr();
+        let capacity = first.currents.capacity();
+        for _ in 0..1_001 {
+            work.begin();
+        }
+        assert_eq!(
+            work.loaded
+                .iter()
+                .filter(|load| load.currents.capacity() > 0)
+                .count(),
+            1
+        );
+        assert_ne!(work.loaded[42].epoch, work.epoch);
+        assert_eq!(work.loaded[42].currents.as_ptr(), pointer);
+        assert_eq!(work.loaded[42].currents.capacity(), capacity);
+
+        work.epoch = u64::MAX;
+        work.loaded[17].epoch = 1;
+        work.loaded[42].epoch = 1;
+        work.begin();
+        assert_eq!(work.epoch, 1);
+        assert!(work.loaded.iter().all(|load| load.epoch == 0));
+        assert_eq!(work.loaded[42].currents.as_ptr(), pointer);
+    }
+
     #[test]
     fn selected_asks_only_isolate_selected_devices_once_per_point() {
         let mut circuit = Circuit::new();
@@ -849,6 +1007,14 @@ mod tests {
             [4., 8., 4.].map(Complex::real)
         );
         assert_eq!([first.get(), second.get()], [baseline[0] + 1, baseline[1]]);
+        {
+            let stored = run.observation_work.borrow();
+            let work = stored.as_ref().unwrap();
+            assert_eq!(work.loaded[0].epoch, work.epoch);
+            assert!(!work.loaded[0].currents.is_empty());
+            assert!(work.loaded[1].currents.is_empty());
+            assert_eq!(work.loaded[1].epoch, 0);
+        }
         assert_eq!(
             run.observe_real_selected(&request, &[], None, None, &[])
                 .unwrap(),
@@ -864,6 +1030,13 @@ mod tests {
             [first.get(), second.get()],
             [baseline[0] + 1, baseline[1] + 1]
         );
+        {
+            let stored = run.observation_work.borrow();
+            let work = stored.as_ref().unwrap();
+            assert_ne!(work.loaded[0].epoch, work.epoch);
+            assert_eq!(work.loaded[1].epoch, work.epoch);
+            assert!(work.loaded.iter().all(|load| !load.currents.is_empty()));
+        }
         assert!(
             run.observe_parameters_selected(&model, &[])
                 .unwrap()
@@ -978,7 +1151,7 @@ mod tests {
         );
         let work = run.observation_work.borrow();
         let work = work.as_ref().unwrap();
-        assert!(work.loaded.iter().all(|load| load.ready));
+        assert!(work.loaded.iter().all(|load| load.epoch == work.epoch));
     }
 
     #[test]
