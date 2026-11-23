@@ -2399,6 +2399,26 @@ impl Circuit {
     /// are untouched; callers stamp the replacement instead of the original for
     /// that ordinal. Several instance overrides of one device are applied in
     /// slot order to the same replacement.
+    /// Clear analysis-scoped accepted/trial state when an optimizer session
+    /// changes its candidate. Preserve finalized bindings, sparse pattern and
+    /// prepared names; only independent simulation state is invalidated.
+    pub(crate) fn clear_candidate_analysis_state(&mut self) {
+        self.runtime.completed.clear();
+        self.runtime.carried_state.get_mut().take();
+        self.runtime.final_transient.get_mut().take();
+        self.runtime.fixed_stamps.get_mut().forget();
+        self.runtime.mutual_evaluation.get_mut().take();
+        *self.runtime.initial_revision.get_mut() = Arc::new(());
+    }
+
+    /// Validate the candidate's effective physical inputs, mutual coupling
+    /// and unchanged topology using the same prepared replacement view as the
+    /// real Newton load. Unchanged device recipes were validated at setup;
+    /// only replaced devices are rechecked for each numeric candidate.
+    pub(crate) fn validate_candidate_context(&self, context: &ModelContext) -> SpiceResult<()> {
+        self.prepare_run().validate_dc_replacements(context, true)
+    }
+
     fn replacements(&self, context: &ModelContext) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
         let topology = self.topology_id()?;
         let mut replacements: Vec<(usize, Box<dyn Device>)> = Vec::new();
@@ -3647,6 +3667,25 @@ impl Circuit {
         mutual_limits: MutualLimits,
         elaboration_limits: ElaborationLimits,
     ) -> SpiceResult<Self> {
+        Self::from_netlist_with_scoped_limits(
+            netlist,
+            context,
+            mutual_limits,
+            elaboration_limits,
+            None,
+        )
+    }
+
+    /// Instantiate candidate parameters from the existing evaluated scope.
+    /// The same validated lowering, expansion and factory path as ordinary
+    /// elaboration is used, including model-bin and topology-dependent logic.
+    pub(crate) fn from_netlist_with_scoped_limits(
+        netlist: &crate::netlist::ast::Netlist,
+        context: &ModelContext,
+        mutual_limits: MutualLimits,
+        elaboration_limits: ElaborationLimits,
+        scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
+    ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
         if !netlist.includes.is_empty() {
             return Err(SpiceError::Unsupported {
@@ -3660,7 +3699,15 @@ impl Circuit {
         let lowered = crate::netlist::behavioural::lower_nonlinear_sources(netlist)?;
         // Top-level `.param` values and `{expr}` sites are evaluated into a
         // literal copy before any factory sees them (#15).
-        let elaborated = crate::netlist::elaborate::literalize(&lowered)?;
+        let elaborated = if let Some(scope) = scope {
+            crate::netlist::elaborate::literalize_with(
+                &lowered,
+                scope,
+                &mut crate::netlist::eval::EvalBudget::default(),
+            )?
+        } else {
+            crate::netlist::elaborate::literalize(&lowered)?
+        };
         let netlist = &elaborated.netlist;
         // `X` instances are expanded into a fresh device/model list before any
         // device is built, so a deck that fails to elaborate never leaves a

@@ -1,2 +1,3 @@
-//! Objective-only simulation output for optimization and model fitting.
+//! Scenario objectives and reusable candidate simulation preparation.
 pub mod objectives;
+pub mod parameters;
