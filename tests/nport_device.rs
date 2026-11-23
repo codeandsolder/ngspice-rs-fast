@@ -344,3 +344,108 @@ fn lossless_reactive_networks_have_zero_dissipative_hermitian_part() {
     assert_eq!(report.passivity, PropertyStatus::Verified);
     assert_eq!(report.reciprocity, PropertyStatus::Verified);
 }
+
+#[test]
+fn four_port_unequal_references_and_two_coupled_pairs_match_exact_spectral_algebra() {
+    use std::fmt::Write as _;
+    let refs = [25., 100., 50., 75.];
+    let mut text = String::from(
+        "[Version] 2.1\n# Hz S RI R 50\n[Number of Ports] 4\n[Number of Frequencies] 2\n[Reference] 25 100 50 75\n[Network Data]\n",
+    );
+    let s = [
+        [0., 0.5, 0., 0.],
+        [0.5, 0., 0., 0.],
+        [0., 0., 0., -0.25],
+        [0., 0., -0.25, 0.],
+    ];
+    for hz in [1000., 2000.] {
+        write!(text, "{hz}").unwrap();
+        for row in s {
+            for value in row {
+                write!(text, " {value} 0").unwrap();
+            }
+        }
+        text.push('\n');
+    }
+    text.push_str("[End]\n");
+    let nodes = (1..=4)
+        .map(|i| PortTerminals {
+            positive: NodeId::new(i),
+            negative: NodeId::GROUND,
+        })
+        .collect();
+    let four = measured(&text, nodes, Extrapolation::Reject);
+    for hz in [1000., 1500., 2000.] {
+        let y = four.admittance_at(hz).unwrap();
+        for (base, k) in [(0, 0.5_f64), (2, -0.25)] {
+            let first = refs[base];
+            let second = refs[base + 1];
+            let diagonal = k.mul_add(k, 1.) / k.mul_add(-k, 1.);
+            let mutual = -2. * k / k.mul_add(-k, 1.);
+            value(y.get(base, base).unwrap(), Complex::real(diagonal / first));
+            value(
+                y.get(base + 1, base + 1).unwrap(),
+                Complex::real(diagonal / second),
+            );
+            value(
+                y.get(base, base + 1).unwrap(),
+                Complex::real(mutual / (first * second).sqrt()),
+            );
+            value(
+                y.get(base + 1, base).unwrap(),
+                Complex::real(mutual / (first * second).sqrt()),
+            );
+        }
+        for row in 0..4 {
+            for col in 0..4 {
+                if row / 2 != col / 2 {
+                    assert_eq!(y.get(row, col), Some(Complex::ZERO));
+                }
+            }
+        }
+        let report = four.properties_at(hz).unwrap();
+        assert_eq!(report.passivity, PropertyStatus::Verified);
+        assert_eq!(report.reciprocity, PropertyStatus::Verified);
+    }
+    let file = four
+        .network()
+        .write(
+            ngspice_rs::analysis::touchstone::Version::V2_1,
+            ngspice_rs::analysis::touchstone::Encoding::Ri,
+        )
+        .unwrap();
+    let reloaded = Touchstone::parse(&file, "fourport.ts", TouchstoneLimits::default()).unwrap();
+    assert_eq!(reloaded.points, four.network().points);
+}
+
+#[test]
+fn active_nonreciprocal_four_port_is_reported_without_assuming_passivity() {
+    use std::fmt::Write as _;
+    let mut text = String::from(
+        "[Version] 2.1\n# Hz Y RI R 50\n[Number of Ports] 4\n[Number of Frequencies] 1\n[Network Data]\n1",
+    );
+    for row in 0..4 {
+        for col in 0..4 {
+            let value = if row == col {
+                if row == 0 { -1. } else { 0.01 }
+            } else if row == 0 && col == 1 {
+                2.
+            } else {
+                0.
+            };
+            write!(text, " {value} 0").unwrap();
+        }
+    }
+    text.push_str("\n[End]\n");
+    let nodes = (1..=4)
+        .map(|i| PortTerminals {
+            positive: NodeId::new(i),
+            negative: NodeId::GROUND,
+        })
+        .collect();
+    let four = measured(&text, nodes, Extrapolation::Reject);
+    let report = four.properties_at(1.).unwrap();
+    assert_eq!(report.passivity, PropertyStatus::Violated);
+    assert_eq!(report.reciprocity, PropertyStatus::Violated);
+    assert_eq!(report.causality, PropertyStatus::Undetermined);
+}

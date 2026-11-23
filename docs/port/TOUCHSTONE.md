@@ -109,3 +109,8 @@ establish the intended direct-network semantics. The architecture campaign
 serial validator performs full Rust strict lint and pinned golden verification
 before integration. See the separate Notion issue log for acceptance dates
 and unresolved engineering questions.
+
+The export path also supports `Touchstone::write_with_limits`, which uses a
+bounded formatting sink and rejects a byte-cap breach during streaming
+formatting, not after constructing an oversized output string. Every formatted
+numeric field, matrix row, metadata line, and noise record shares this cap.

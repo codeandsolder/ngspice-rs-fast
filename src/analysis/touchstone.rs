@@ -369,6 +369,57 @@ fn mixed_axes(
     Ok(descriptors)
 }
 
+/// Bounded output sink. Unlike formatting to a `String` and checking its
+/// length afterward, no temporary or final encoded source can ever grow
+/// beyond the specified byte budget. All `fmt::Write` calls are fallible.
+struct BoundedText {
+    bytes: String,
+    limit: usize,
+    exhausted: bool,
+}
+
+impl BoundedText {
+    const fn new(limit: usize) -> Self {
+        Self {
+            bytes: String::new(),
+            limit,
+            exhausted: false,
+        }
+    }
+
+    fn push_str(&mut self, text: &str) {
+        let _ = std::fmt::Write::write_str(self, text);
+    }
+
+    fn push(&mut self, character: char) {
+        let _ = std::fmt::Write::write_char(self, character);
+    }
+
+    fn finish(self) -> SpiceResult<String> {
+        if self.exhausted {
+            Err(error(
+                "output",
+                0,
+                "encoded Touchstone text exceeds source byte cap",
+            ))
+        } else {
+            Ok(self.bytes)
+        }
+    }
+}
+
+impl std::fmt::Write for BoundedText {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if self.exhausted || text.len() > remaining {
+            self.exhausted = true;
+            return Err(std::fmt::Error);
+        }
+        self.bytes.push_str(text);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     Header,
@@ -1125,7 +1176,7 @@ impl Touchstone {
         Ok(model)
     }
 
-    fn write_v2_header(&self, output: &mut String) -> SpiceResult<()> {
+    fn write_v2_header(&self, output: &mut BoundedText) -> SpiceResult<()> {
         let n = self.references.len();
         writeln!(output, "[Number of Ports] {n}")
             .map_err(|_| error("output", 0, "format failure"))?;
@@ -1185,7 +1236,7 @@ impl Touchstone {
 
     fn write_network_data(
         &self,
-        output: &mut String,
+        output: &mut BoundedText,
         version: Version,
         encoding: Encoding,
     ) -> SpiceResult<()> {
@@ -1233,8 +1284,20 @@ impl Touchstone {
     /// # Errors
     /// Unsupported format/version combinations or unrepresentable coefficients.
     pub fn write(&self, version: Version, encoding: Encoding) -> SpiceResult<String> {
-        self.validate(TouchstoneLimits::default())?;
-        let n = self.references.len();
+        self.write_with_limits(version, encoding, TouchstoneLimits::default())
+    }
+
+    /// Write to an owned bounded ASCII string; the encoded byte limit is
+    /// enforced *during* every append, not after allocation has grown.
+    /// # Errors
+    /// Invalid data, unsupported versions, or exceeded output byte/point caps.
+    pub fn write_with_limits(
+        &self,
+        version: Version,
+        encoding: Encoding,
+        limits: TouchstoneLimits,
+    ) -> SpiceResult<String> {
+        self.validate(limits)?;
         if !version.modern()
             && (self.mixed_mode.is_some() || self.matrix_format != MatrixFormat::Full)
         {
@@ -1264,7 +1327,7 @@ impl Touchstone {
             Encoding::Ma => "MA",
             Encoding::Db => "DB",
         };
-        let mut output = String::new();
+        let mut output = BoundedText::new(limits.max_source_bytes);
         if version.modern() {
             writeln!(output, "[Version] {}", version.label())
                 .map_err(|_| error("output", 0, "format failure"))?;
@@ -1309,13 +1372,6 @@ impl Touchstone {
         if version.modern() {
             output.push_str("[End]\n");
         }
-        if output.len() > TouchstoneLimits::default().max_source_bytes {
-            return Err(error(
-                "output",
-                0,
-                "encoded text exceeds source size budget",
-            ));
-        }
-        Ok(output)
+        output.finish()
     }
 }

@@ -263,3 +263,65 @@ fn sp_plot_to_touchstone_preserves_source_port_order_and_reference() {
     assert_eq!(parsed.references, [50., 75.]);
     assert!(Touchstone::from_sp_plot(&plot, Parameter::S, vec![49., 75.], LIMITS).is_err());
 }
+
+#[test]
+fn touchstone_writer_enforces_encoded_byte_budget_during_output() {
+    let network =
+        Touchstone::parse("# Hz S RI R 50\n1 0.5 0\n2 0.25 0\n", "one.s1p", LIMITS).unwrap();
+    for limit in [0, 1, 32, 96] {
+        let cap = TouchstoneLimits {
+            max_source_bytes: limit,
+            ..LIMITS
+        };
+        assert!(
+            network
+                .write_with_limits(Version::V1_0, Encoding::Ri, cap)
+                .is_err()
+        );
+    }
+    let text = network
+        .write_with_limits(Version::V1_0, Encoding::Ri, LIMITS)
+        .unwrap();
+    let exact = TouchstoneLimits {
+        max_source_bytes: text.len(),
+        ..LIMITS
+    };
+    assert_eq!(
+        network
+            .write_with_limits(Version::V1_0, Encoding::Ri, exact)
+            .unwrap(),
+        text
+    );
+    let too_small = TouchstoneLimits {
+        max_source_bytes: text.len() - 1,
+        ..LIMITS
+    };
+    assert!(
+        network
+            .write_with_limits(Version::V1_0, Encoding::Ri, too_small)
+            .is_err()
+    );
+}
+
+#[test]
+fn legacy_v1_two_port_noise_uses_normalized_resistance_and_independent_grid() {
+    let text = "# GHz S RI R 50\n\
+        1 0.1 0 0.2 0 0.3 0 0.4 0\n\
+        2 0.1 0 0.2 0 0.3 0 0.4 0\n\
+        0.5 1.2 0.3 45 0.5\n\
+        1 1.1 0.2 30 0.4\n";
+    let network = Touchstone::parse(text, "noisy.s2p", LIMITS).unwrap();
+    assert_eq!(network.points.len(), 2);
+    assert_eq!(network.noise.len(), 2);
+    assert_eq!(network.noise[0].hz, 5e8);
+    assert_eq!(network.noise[0].resistance_ohms, 25.);
+    assert_eq!(network.noise[1].resistance_ohms, 20.);
+    let text = network.write(Version::V1_0, Encoding::Ri).unwrap();
+    let recovered = Touchstone::parse(&text, "noisy.s2p", LIMITS).unwrap();
+    assert_eq!(recovered.points, network.points);
+    assert_eq!(recovered.noise.len(), 2);
+    for (a, b) in recovered.noise.iter().zip(&network.noise) {
+        assert!((a.resistance_ohms - b.resistance_ohms).abs() < 1e-12);
+        assert!((a.optimum_reflection.re - b.optimum_reflection.re).abs() < 1e-12);
+    }
+}
