@@ -3,7 +3,7 @@
 //! Exactly commensurate tones are locked explicitly. Silent near-integer
 //! guessing is incorrect for genuine two-tone intermodulation studies.
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
-use std::f64::consts::TAU;
+use std::{f64::consts::TAU, sync::Arc};
 
 /// A source tone and its requested harmonic range.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -123,6 +123,8 @@ pub struct HarmonicPlan {
     tones_hz: Vec<Real>,
     /// Per-tone group and signed integer weight, for load/forcing routing.
     weights: Vec<(usize, usize)>,
+    /// Reusable e^(-j k theta) per axis, [harmonic][sample].
+    twiddles: Vec<Arc<[Complex]>>,
 }
 
 impl HarmonicPlan {
@@ -339,12 +341,27 @@ impl HarmonicPlan {
                 )));
             }
         }
+        let mut twiddles = Vec::with_capacity(axes.len());
+        for axis in &axes {
+            let width = 2 * axis.order + 1;
+            let mut table = Vec::with_capacity(width * axis.samples);
+            for coefficient in 0..width {
+                let harmonic = coefficient as i32 - axis.order as i32;
+                for sample in 0..axis.samples {
+                    let angle = -TAU * Real::from(harmonic) * sample as Real / axis.samples as Real;
+                    let (sin, cos) = angle.sin_cos();
+                    table.push(Complex::new(cos, sin));
+                }
+            }
+            twiddles.push(Arc::from(table));
+        }
         Ok(Self {
             axes,
             modes,
             sample_count,
             tones_hz,
             weights,
+            twiddles,
         })
     }
 
@@ -378,15 +395,89 @@ impl HarmonicPlan {
         self.weights.get(source).copied()
     }
 
-    fn angle(&self, mode: &[i32], sample: usize) -> Real {
-        let mut remaining = sample;
-        let mut turns = 0.;
-        for (axis, &order) in self.axes.iter().zip(mode).rev() {
-            let digit = remaining % axis.samples;
-            remaining /= axis.samples;
-            turns += Real::from(order) * digit as Real / axis.samples as Real;
+    /// Return the deterministic flat ordinal of a full harmonic tuple.
+    ///
+    /// This is a checked row-major index, not a frequency search: distinct
+    /// physical harmonic slots cannot alias or silently select another tone.
+    #[must_use]
+    pub fn mode_ordinal(&self, coordinates: &[i32]) -> Option<usize> {
+        if coordinates.len() != self.axes.len() {
+            return None;
         }
-        TAU * turns
+        let mut offset = 0_usize;
+        for (&harmonic, axis) in coordinates.iter().zip(&self.axes) {
+            let order = i32::try_from(axis.order).ok()?;
+            if harmonic < -order || harmonic > order {
+                return None;
+            }
+            offset = offset
+                .checked_mul(2 * axis.order + 1)?
+                .checked_add(usize::try_from(harmonic + order).ok()?)?;
+        }
+        Some(offset)
+    }
+
+    /// Resolve a requested signed harmonic of one original source tone.
+    ///
+    /// Locked ratios return their single physical axis slot. If two source
+    /// excitations map to the same frequency the caller must add their
+    /// complex amplitudes, never overwrite one of them.
+    #[must_use]
+    pub fn tone_harmonic_ordinal(&self, source: usize, harmonic: i32) -> Option<usize> {
+        let (axis, weight) = self.tone_weight(source)?;
+        let scaled = i64::from(harmonic).checked_mul(i64::try_from(weight).ok()?)?;
+        let mut index = vec![0_i32; self.axes.len()];
+        index[axis] = i32::try_from(scaled).ok()?;
+        self.mode_ordinal(&index)
+    }
+
+    /// Separable dense DFT of a single axis, preserving row-major strides.
+    ///
+    /// Each axis is transformed exactly once. Reusing the bound twiddles
+    /// reduces trigonometric evaluations from O(samples*coefficients) per
+    /// Newton/Jv call to zero, and work from a product to a sum of axis
+    /// transforms. The arithmetic still projects every requested mode.
+    fn transform_axis(
+        &self,
+        input: &[Complex],
+        shape: &[usize],
+        axis_id: usize,
+        inverse: bool,
+    ) -> Vec<Complex> {
+        let axis = &self.axes[axis_id];
+        let input_width = shape[axis_id];
+        let output_width = if inverse {
+            axis.samples
+        } else {
+            2 * axis.order + 1
+        };
+        let inner = shape[axis_id + 1..].iter().product::<usize>();
+        let outer = shape[..axis_id].iter().product::<usize>();
+        let mut output = vec![Complex::ZERO; outer * output_width * inner];
+        let table = &self.twiddles[axis_id];
+        for prefix in 0..outer {
+            for suffix in 0..inner {
+                for destination in 0..output_width {
+                    let mut value = Complex::ZERO;
+                    for source in 0..input_width {
+                        let (mode, sample) = if inverse {
+                            (source, destination)
+                        } else {
+                            (destination, source)
+                        };
+                        let twiddle = table[mode * axis.samples + sample];
+                        let phase = if inverse { twiddle.conj() } else { twiddle };
+                        value =
+                            value + input[(prefix * input_width + source) * inner + suffix] * phase;
+                    }
+                    if !inverse {
+                        value = value / Complex::real(axis.samples as Real);
+                    }
+                    output[(prefix * output_width + destination) * inner + suffix] = value;
+                }
+            }
+        }
+        output
     }
 
     /// Project real torus samples to all full signed-frequency coefficients.
@@ -399,18 +490,21 @@ impl HarmonicPlan {
                 "nonfinite or incorrectly shaped real torus samples",
             ));
         }
-        let norm = self.sample_count as Real;
-        let mut coefficients = Vec::with_capacity(self.modes.len());
-        for mode in &self.modes {
-            let (mut re, mut im) = (0., 0.);
-            for (index, &value) in samples.iter().enumerate() {
-                let (sin, cos) = self.angle(&mode.index, index).sin_cos();
-                re += value * cos;
-                im -= value * sin;
-            }
-            coefficients.push(Complex::new(re / norm, im / norm));
+        let mut data = samples
+            .iter()
+            .copied()
+            .map(Complex::real)
+            .collect::<Vec<_>>();
+        let mut shape = self
+            .axes
+            .iter()
+            .map(|axis| axis.samples)
+            .collect::<Vec<_>>();
+        for axis in 0..self.axes.len() {
+            data = self.transform_axis(&data, &shape, axis, false);
+            shape[axis] = 2 * self.axes[axis].order + 1;
         }
-        Ok(coefficients)
+        Ok(data)
     }
 
     /// Synthesize real torus samples from conjugate-symmetric coefficients.
@@ -441,18 +535,23 @@ impl HarmonicPlan {
                 ));
             }
         }
-        let mut samples = Vec::with_capacity(self.sample_count);
-        for index in 0..self.sample_count {
-            let mut value = 0.;
-            for (mode, coefficient) in self.modes.iter().zip(coefficients) {
-                let (sin, cos) = self.angle(&mode.index, index).sin_cos();
-                value += coefficient.re * cos - coefficient.im * sin;
-            }
+        let mut data = coefficients.to_vec();
+        let mut shape = self
+            .axes
+            .iter()
+            .map(|axis| 2 * axis.order + 1)
+            .collect::<Vec<_>>();
+        for axis in (0..self.axes.len()).rev() {
+            data = self.transform_axis(&data, &shape, axis, true);
+            shape[axis] = self.axes[axis].samples;
+        }
+        let mut result = Vec::with_capacity(self.sample_count);
+        for value in data {
             if !value.is_finite() {
                 return Err(invalid("nonfinite synthesized real sample"));
             }
-            samples.push(value);
+            result.push(value.re);
         }
-        Ok(samples)
+        Ok(result)
     }
 }
