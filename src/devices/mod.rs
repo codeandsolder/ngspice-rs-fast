@@ -74,6 +74,7 @@ pub mod mos9;
 pub mod mutual;
 pub mod noise;
 pub mod nonlinear;
+pub mod nport;
 pub mod passive;
 pub mod pulse;
 pub use passive::PassiveParameters;

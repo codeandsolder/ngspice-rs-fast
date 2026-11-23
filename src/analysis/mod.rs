@@ -58,6 +58,7 @@ mod sens;
 mod sparam;
 pub mod sweep;
 mod tf;
+pub mod touchstone;
 
 pub use companion::{TransientPlan, TransientStats, companion_transient, companion_transient_into};
 pub use config::{
