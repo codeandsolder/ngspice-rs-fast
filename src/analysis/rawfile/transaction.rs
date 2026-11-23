@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::primitives::{Complex, SpiceError, SpiceResult};
 
 use super::{
-    BinaryByteOrder, FinishedPlot, RawFileWriter, RawFormat, RawPlot, StreamedPlot, unsupported,
+    BinaryByteOrder, FinishedPlot, RawFileWriter, RawFormat, RawPlot, StreamedPlot, TextSpool,
+    unsupported,
 };
 
 const ATTEMPTS: usize = 128;
@@ -150,14 +151,6 @@ fn anchor(output: &Path) -> SpiceResult<PathBuf> {
         )));
     }
     Ok(parent.join(name))
-}
-
-/// One transaction-owned report spool, with byte ranges for consecutive plots.
-/// Text is never exposed until the simulation and rawfile publication succeed.
-#[derive(Debug)]
-pub struct TextSpool {
-    file: BufWriter<File>,
-    temporary: OwnedTemporary,
 }
 
 impl TextSpool {
