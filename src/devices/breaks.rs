@@ -281,7 +281,7 @@ impl BreakTable {
 }
 
 /// Event state for a single source with a schedulable waveform.
-/// Source indices retain their original DEVaccept ordering within each kind.
+/// Source indices retain their original `DEVaccept` ordering within each kind.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ActiveSource {
     index: usize,
@@ -309,7 +309,8 @@ fn eligibility(waveform: &Waveform) -> Eligibility {
     }
 }
 
-/// Accept-time breakpoint scheduling bound to one immutable LinearSystem.
+/// Accept-time breakpoint scheduling bound to one immutable `LinearSystem`.
+///
 /// Owning a borrow prevents stale source indices after a system replacement.
 /// Construct a new scheduler for another system or reset the current one.
 #[derive(Debug, Clone)]
