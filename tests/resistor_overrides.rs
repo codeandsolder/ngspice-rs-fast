@@ -260,7 +260,7 @@ fn stale_or_mismatched_overrides_are_errors() {
 
 #[test]
 fn resistor_overrides_preserve_observed_recipe_and_noise() {
-    use ngspice_rs::devices::noise::circuit_noise;
+    use ngspice_rs::devices::noise::NoisePlan;
 
     let original =
         "r1 a 0 rm scale=2 m=4 temp=47\nr2 a 0 1k noisy=0\n.model rm r(r=1k tc1=0.01 kf=1e-12)";
@@ -275,12 +275,20 @@ fn resistor_overrides_preserve_observed_recipe_and_noise() {
         .with_resistor_override(c.resistor_override("r2", 2000.).unwrap())
         .unwrap();
     let bias = Vector::from_slice(&[2.]);
-    let swept = circuit_noise(&c, &context, &bias, None).unwrap();
+    let swept = NoisePlan::bind(&c.prepare_run(), &context, &bias, None).unwrap();
+    let expected = NoisePlan::bind(
+        &explicit.prepare_run(),
+        &ModelContext::default(),
+        &bias,
+        None,
+    )
+    .unwrap();
     assert_eq!(
-        swept,
-        circuit_noise(&explicit, &ModelContext::default(), &bias, None).unwrap()
+        swept.instances().collect::<Vec<_>>(),
+        expected.instances().collect::<Vec<_>>()
     );
-    assert_eq!(swept.len(), 1);
+    assert_eq!(swept.instances().len(), 1);
+    drop(swept);
     let mut c = c;
     c.set_observations(&[
         "@r1[resistance]".into(),
@@ -315,13 +323,16 @@ fn contextual_literal_sweep_preserves_default_model_and_noisy_flag() {
     let bias = Vector::from_slice(&[1.]);
     assert_eq!(
         replacement
-            .noise(&NoiseContext {
-                model_context: &context,
-                unknowns: c.unknowns(),
-                bias: &bias,
-                states: None,
-                controls: &[]
-            })
+            .noise(
+                &NoiseContext {
+                    model_context: &context,
+                    unknowns: c.unknowns(),
+                    bias: &bias,
+                    states: None,
+                    controls: &[]
+                },
+                &mut Vec::new()
+            )
             .unwrap(),
         DeviceNoise::Noiseless
     );
@@ -330,13 +341,16 @@ fn contextual_literal_sweep_preserves_default_model_and_noisy_flag() {
         .unwrap();
     assert_eq!(
         replacement
-            .noise(&NoiseContext {
-                model_context: &context,
-                unknowns: c.unknowns(),
-                bias: &bias,
-                states: None,
-                controls: &[]
-            })
+            .noise(
+                &NoiseContext {
+                    model_context: &context,
+                    unknowns: c.unknowns(),
+                    bias: &bias,
+                    states: None,
+                    controls: &[]
+                },
+                &mut Vec::new()
+            )
             .unwrap(),
         DeviceNoise::Noiseless
     );

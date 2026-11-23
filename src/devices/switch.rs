@@ -754,7 +754,11 @@ impl Device for Switch {
     /// temperature, decided like the small-signal stamp: from the supplied
     /// small-signal state (any non-zero code is on, as `(int) CKTstate0` in
     /// C), or from the instance flag's `MODEINITJCT` state without one.
-    fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
         let closed = self.small_signal_closed(context.states, "noise", || {
             self.control_value(
                 |node| context.voltage(node),
@@ -767,21 +771,21 @@ impl Device for Switch {
             )
         })?;
         let conductance = self.conductance(closed, context.model_context.gmin);
+        sources.extend([NoiseSource::new(
+            "",
+            [self.terminals[0], self.terminals[1]],
+            NoiseKind::Thermal {
+                conductance,
+                temperature: context.circuit_kelvin(),
+            },
+        )]);
         Ok(DeviceNoise::Sources {
             family: match self.kind {
                 SwitchKind::Voltage => NoiseFamily::VoltageSwitch,
                 SwitchKind::Current => NoiseFamily::CurrentSwitch,
             },
-            model: Some(self.model_name.clone()),
+            model: Some(&self.model_name),
             total: false,
-            sources: vec![NoiseSource::new(
-                "",
-                [self.terminals[0], self.terminals[1]],
-                NoiseKind::Thermal {
-                    conductance,
-                    temperature: context.circuit_kelvin(),
-                },
-            )],
         })
     }
 

@@ -1087,7 +1087,8 @@ impl Device for Bsim3 {
     fn noise(
         &self,
         context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         use crate::devices::noise::{DeviceNoise, FlickerLaw, NoiseFamily, NoiseKind, NoiseSource};
         let model = context.model_context;
         let cached = self.ensure(model.temperature, model.nominal_temperature)?;
@@ -1117,7 +1118,7 @@ impl Device for Bsim3 {
             conductance,
             temperature: context.circuit_kelvin(),
         };
-        let sources = vec![
+        sources.extend([
             NoiseSource::new(".rd", [dp, d], thermal(densities.drain_conductance)),
             NoiseSource::new(".rs", [sp, s], thermal(densities.source_conductance)),
             NoiseSource::new(".id", [dp, sp], thermal(densities.channel)),
@@ -1132,12 +1133,11 @@ impl Device for Bsim3 {
                     },
                 },
             ),
-        ];
+        ]);
         Ok(DeviceNoise::Sources {
             family: NoiseFamily::Bsim3,
-            model: Some(self.model_name.clone()),
+            model: Some(&self.model_name),
             total: true,
-            sources,
         })
     }
 }
