@@ -140,6 +140,18 @@ impl CplPlan {
     pub const fn modes(&self) -> &super::modal::CplModes {
         &self.modes
     }
+
+    /// Exact coupled two-port on the positive real Laplace axis, based
+    /// on C's transient setup, including its per-coefficient R floor of
+    /// 1e-4, for rational kernel fitting. Original physical matrices
+    /// remain unmodified.
+    ///
+    /// # Errors
+    /// Nonpositive/nonfinite rate, ill-conditioned lossy modal system or
+    /// unrepresentable characteristic/transfer admittances.
+    pub fn laplace_sample(&self, rate: Real) -> SpiceResult<super::spectral::CplSpectralSample> {
+        super::spectral::CplSpectralSample::prepare(self, rate)
+    }
 }
 
 fn unpack(order: usize, kind: CplMatrixKind, values: &[Real]) -> SpiceResult<Matrix> {

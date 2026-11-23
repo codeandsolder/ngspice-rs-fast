@@ -6,7 +6,7 @@
 //! `txlload.c` stamps DC or recursive-convolution transient equations.
 //! AC/SP are explicitly refused: C reuses `TXLload` with an unset delta.
 //! See `docs/port/TXL.md` for the compatibility boundaries.
-mod pade;
+pub(in crate::devices) mod pade;
 mod transient;
 use super::elaboration::{ElaborationSize, reserve};
 use crate::devices::linear::LinearContext;

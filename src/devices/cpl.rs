@@ -7,4 +7,6 @@ pub mod dc;
 pub mod history;
 pub mod modal;
 pub mod model;
+pub mod pade;
 pub mod plan;
+pub mod spectral;

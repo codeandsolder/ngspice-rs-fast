@@ -313,7 +313,10 @@ fn modal_bases(lower: &Matrix, eigenvectors: &Matrix) -> SpiceResult<(Matrix, Ma
 }
 
 /// The characteristic matrix is the modal current-basis congruence of\n/// the diagonal modal admittances; no coupling terms are omitted.
-fn matched_admittance(current_basis: &Matrix, admittances: &[Real]) -> SpiceResult<Matrix> {
+pub(super) fn matched_admittance(
+    current_basis: &Matrix,
+    admittances: &[Real],
+) -> SpiceResult<Matrix> {
     let order = current_basis.rows();
     let mut characteristic_admittance = Matrix::zeros(order, order)?;
     for row in 0..order {
