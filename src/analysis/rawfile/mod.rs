@@ -331,18 +331,12 @@ impl RawFile {
     }
 }
 
-/// Writes a rawfile one plot at a time, so no plot has to stay in memory until
-/// the whole file is known.
+/// Writes complete or streamed plots to one seekable file.
 ///
-/// [`RawFileWriter::write_plot`] writes a finished plot. A plot whose points
-/// arrive one by one, as `.tran` produces them, starts with
-/// [`RawFileWriter::begin_plot`]: its points are encoded into a spool file as
-/// they arrive and [`RawFileWriter::finish_plot`] writes the header, whose
-/// `No. Points:` is only then known, followed by the spooled points. The
-/// result is byte for byte what [`RawFile::write_with_format`] writes for the
-/// same plots. (C's batch writer, `outitf.c`, instead patches the count into a
-/// padded header field in place; the port keeps `raw_write()`'s unpadded
-/// header.)
+/// Complete plots keep C's compact header unchanged. Streamed plots reserve
+/// twenty ASCII bytes for the unknown point count and backpatch that field at
+/// completion; no second file, readback, or payload copy is required. All
+/// other bytes retain the ordinary rawfile encoder's representation.
 #[derive(Debug)]
 pub struct RawFileWriter {
     out: BufWriter<File>,
@@ -350,14 +344,22 @@ pub struct RawFileWriter {
     path: PathBuf,
     format: RawFormat,
     byte_order: BinaryByteOrder,
+    active: Option<ActivePlot>,
+    failed: bool,
+}
+
+#[derive(Debug)]
+struct ActivePlot {
+    header: RawPlot,
+    point_count: usize,
+    count_position: u64,
 }
 
 impl RawFileWriter {
-    /// Creates `path`, or truncates it when it exists. The byte order is used only for binary output.
+    /// Create or truncate `path`. The byte order is used only for binary output.
     ///
     /// # Errors
-    ///
-    /// [`SpiceError::Io`] when the file cannot be created.
+    /// Unable to create the destination file.
     pub fn create(
         path: impl AsRef<Path>,
         format: RawFormat,
@@ -380,6 +382,8 @@ impl RawFileWriter {
             path,
             format,
             byte_order,
+            active: None,
+            failed: false,
         }
     }
 
@@ -389,109 +393,159 @@ impl RawFileWriter {
         self.format
     }
 
-    /// Writes one complete plot: its header and every point.
+    pub(super) const fn has_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    // A write or validation error leaves output bytes potentially incomplete.
+    // Never allow further writes or a successful finish after that failure.
+    fn execute<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> SpiceResult<T>,
+    ) -> SpiceResult<T> {
+        if self.failed {
+            return Err(unsupported("rawfile writer has failed"));
+        }
+        let result = operation(self);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Write one complete plot using C's compact point-count header.
     ///
     /// # Errors
-    ///
-    /// [`SpiceError::Numerical`] when a point does not have one value per
-    /// variable (nothing is written then), or [`SpiceError::Io`].
+    /// An incomplete streamed plot, invalid shape or I/O failure.
     pub fn write_plot(&mut self, raw_plot: &RawPlot) -> SpiceResult<()> {
-        validate_plot(&raw_plot.plot)?;
-        write_plot(
-            &mut self.out,
-            raw_plot,
-            self.format,
-            self.byte_order,
-            &mut self.binary,
-        )
-        .map_err(|error| self.io_error(&error))
-    }
-
-    /// Starts a plot whose points are pushed one at a time with
-    /// [`StreamedPlot::push_point`].
-    ///
-    /// `header` supplies the headers and the variables; its points, if any, are
-    /// ignored. The encoded points go to a new file at `spool`, which must not
-    /// exist yet; it is removed when the [`StreamedPlot`] is finished or
-    /// dropped. Put it beside the rawfile, so it lives on the same filesystem.
-    ///
-    /// # Errors
-    ///
-    /// [`SpiceError::Io`] when the spool file cannot be created (including
-    /// when it already exists).
-    pub fn begin_plot(
-        &self,
-        header: RawPlot,
-        spool: impl AsRef<Path>,
-    ) -> SpiceResult<StreamedPlot> {
-        let path = spool.as_ref().to_path_buf();
-        let (file, temporary) =
-            OwnedTemporary::open(path.clone()).map_err(|error| SpiceError::io(&path, &error))?;
-        Ok(self.begin_owned_plot(header, file, temporary))
-    }
-
-    fn begin_owned_plot(
-        &self,
-        mut header: RawPlot,
-        file: File,
-        temporary: OwnedTemporary,
-    ) -> StreamedPlot {
-        header.plot.clear_points();
-        StreamedPlot {
-            header,
-            format: self.format,
-            byte_order: self.byte_order,
-            point_count: 0,
-            binary: binary::Encoder::new(),
-            spool: BufWriter::new(file),
-            temporary,
-        }
-    }
-
-    /// Writes a streamed plot: its header with the final point count, then the
-    /// spooled points. The spool file is removed.
-    ///
-    /// # Errors
-    ///
-    /// [`SpiceError::Io`] when the spool cannot be read back or the rawfile
-    /// cannot be written; [`SpiceError::Unsupported`] when the spool encoding
-    /// differs from this writer's encoding.
-    pub fn finish_plot(&mut self, plot: StreamedPlot) -> SpiceResult<FinishedPlot> {
-        if plot.format != self.format
-            || (self.format.is_binary() && plot.byte_order != self.byte_order)
-        {
-            return Err(unsupported(
-                "streamed plot encoding differs from rawfile writer",
-            ));
-        }
-        let StreamedPlot {
-            header,
-            point_count,
-            spool,
-            temporary,
-            ..
-        } = plot;
-        let spool_error = |error: io::Error| SpiceError::io(temporary.path(), &error);
-        let mut file = spool
-            .into_inner()
-            .map_err(|error| spool_error(error.into_error()))?;
-        file.seek(SeekFrom::Start(0)).map_err(spool_error)?;
-        render_header(&mut self.out, &header, point_count, self.format)
-            .map_err(|error| self.io_error(&error))?;
-        io::copy(&mut file, &mut self.out).map_err(|error| self.io_error(&error))?;
-        Ok(FinishedPlot {
-            header,
-            point_count,
+        self.execute(|this| {
+            if this.has_active() {
+                return Err(unsupported(
+                    "rawfile writer has an unfinished streamed plot",
+                ));
+            }
+            validate_plot(&raw_plot.plot)?;
+            write_plot(
+                &mut this.out,
+                raw_plot,
+                this.format,
+                this.byte_order,
+                &mut this.binary,
+            )
+            .map_err(|error| this.io_error(&error))
         })
     }
 
-    /// Flushes everything written so far and closes the file.
+    /// Start a streamed plot directly in the seekable destination.
+    /// The supplied header's existing rows, if any, are ignored.
     ///
     /// # Errors
+    /// Active plot, failed writer, invalid schema, seek or header write error.
+    pub fn begin_plot(&mut self, mut header: RawPlot) -> SpiceResult<()> {
+        self.execute(|this| {
+            if this.has_active() {
+                return Err(unsupported(
+                    "rawfile writer has an unfinished streamed plot",
+                ));
+            }
+            header.plot.clear_points();
+            validate_plot(&header.plot)?;
+            let count_position = render_reserved_header(&mut this.out, &header, this.format)
+                .map_err(|error| this.io_error(&error))?;
+            this.active = Some(ActivePlot {
+                header,
+                point_count: 0,
+                count_position,
+            });
+            Ok(())
+        })
+    }
+
+    /// Append one validated point without retaining its values.
     ///
-    /// [`SpiceError::Io`] when the buffered data cannot be written.
+    /// # Errors
+    /// No active plot, invalid row, nonrepresentable point count or I/O error.
+    pub fn push_point(&mut self, values: &[Complex]) -> SpiceResult<()> {
+        self.execute(|this| {
+            let active = this
+                .active
+                .as_mut()
+                .ok_or_else(|| unsupported("rawfile writer has no active streamed plot"))?;
+            active.header.plot.check_point(values)?;
+            let next = active
+                .point_count
+                .checked_add(1)
+                .ok_or_else(|| unsupported("rawfile point count overflows a usize"))?;
+            if active.header.plot.variable_count() == 0
+                && !super::results::valid_empty_shape(
+                    &active.header.plot.plotname,
+                    active.header.plot.flags(),
+                    next,
+                )
+            {
+                return Err(unsupported(
+                    "zero variables with nonzero points outside a rootless pole-zero result",
+                ));
+            }
+            match this.format {
+                RawFormat::Ascii => render_ascii_point(
+                    &mut this.out,
+                    &active.header.plot,
+                    active.point_count,
+                    values,
+                ),
+                RawFormat::Binary => this.binary.write_row(
+                    &mut this.out,
+                    &active.header.plot,
+                    values,
+                    this.byte_order,
+                ),
+            }
+            .map_err(|error| SpiceError::io(&this.path, &error))?;
+            active.point_count = next;
+            Ok(())
+        })
+    }
+
+    /// Patch the reserved decimal count in place and finish the active plot.
+    ///
+    /// # Errors
+    /// No active plot, failed writer, buffered write, seek or patch failure.
+    pub fn finish_plot(&mut self) -> SpiceResult<FinishedPlot> {
+        self.execute(|this| {
+            let active = this
+                .active
+                .take()
+                .ok_or_else(|| unsupported("rawfile writer has no active streamed plot"))?;
+            this.binary
+                .flush(&mut this.out)
+                .map_err(|error| this.io_error(&error))?;
+            let end = this
+                .out
+                .stream_position()
+                .map_err(|error| this.io_error(&error))?;
+            patch_point_count(&mut this.out, active.count_position, active.point_count)
+                .map_err(|error| this.io_error(&error))?;
+            this.out
+                .seek(SeekFrom::Start(end))
+                .map_err(|error| this.io_error(&error))?;
+            Ok(FinishedPlot {
+                header: active.header,
+                point_count: active.point_count,
+            })
+        })
+    }
+
+    /// Flush and close only a complete, successful writer.
+    ///
+    /// # Errors
+    /// Failed/incomplete plot or buffered write failure.
     pub fn finish(mut self) -> SpiceResult<()> {
-        // Flushed explicitly: dropping a `BufWriter` discards a write error.
+        if self.failed || self.has_active() {
+            return Err(unsupported(
+                "cannot finish a failed or unfinished rawfile writer",
+            ));
+        }
         self.out.flush().map_err(|error| self.io_error(&error))
     }
 
@@ -500,73 +554,33 @@ impl RawFileWriter {
     }
 }
 
-/// A rawfile plot being written point by point; see
-/// [`RawFileWriter::begin_plot`].
-///
-/// Dropping it without [`RawFileWriter::finish_plot`] abandons the plot and
-/// removes its spool file.
-#[derive(Debug)]
-pub struct StreamedPlot {
-    /// The headers and variables; `points` stays empty.
-    header: RawPlot,
+// Fixed width includes every 64-bit usize decimal representation. The blank
+// placeholder is deliberately not a valid count until the plot finishes.
+const POINT_COUNT_WIDTH: usize = 20;
+
+fn render_reserved_header(
+    out: &mut (impl Write + Seek),
+    raw_plot: &RawPlot,
     format: RawFormat,
-    byte_order: BinaryByteOrder,
-    point_count: usize,
-    binary: binary::Encoder,
-    // Field order closes the spool before the owned path is removed.
-    spool: BufWriter<File>,
-    temporary: OwnedTemporary,
+) -> io::Result<u64> {
+    render_header_start(out, raw_plot)?;
+    let position = out.stream_position()?;
+    out.write_all(&[b' '; POINT_COUNT_WIDTH])?;
+    render_header_end(out, raw_plot, format)?;
+    Ok(position)
 }
 
-impl StreamedPlot {
-    /// The plot's headers and variables (it holds no points).
-    #[must_use]
-    pub const fn header(&self) -> &RawPlot {
-        &self.header
-    }
-
-    /// How many points were pushed.
-    #[must_use]
-    pub const fn point_count(&self) -> usize {
-        self.point_count
-    }
-
-    /// Encodes one point, one value per variable.
-    ///
-    /// # Errors
-    ///
-    /// [`SpiceError::Numerical`] when the point does not have one value per
-    /// variable, or [`SpiceError::Io`] when the spool cannot be written.
-    pub fn push_point(&mut self, values: &[Complex]) -> SpiceResult<()> {
-        self.header.plot.check_point(values)?;
-        let next_count = self
-            .point_count
-            .checked_add(1)
-            .ok_or_else(|| unsupported("rawfile point count overflows a usize"))?;
-        if self.header.plot.variable_count() == 0
-            && !super::results::valid_empty_shape(
-                &self.header.plot.plotname,
-                self.header.plot.flags(),
-                next_count,
-            )
-        {
-            return Err(unsupported(
-                "zero variables with nonzero points outside a rootless pole-zero result",
-            ));
-        }
-        match self.format {
-            RawFormat::Ascii => {
-                render_ascii_point(&mut self.spool, &self.header.plot, self.point_count, values)
-            }
-            RawFormat::Binary => self
-                .binary
-                .write_row(&mut self.spool, &self.header.plot, values, self.byte_order)
-                .and_then(|()| self.binary.flush(&mut self.spool)),
-        }
-        .map_err(|error| SpiceError::io(self.temporary.path(), &error))?;
-        self.point_count = next_count;
-        Ok(())
-    }
+fn patch_point_count(out: &mut (impl Write + Seek), position: u64, count: usize) -> io::Result<()> {
+    let digits = count.to_string();
+    let padding = POINT_COUNT_WIDTH.checked_sub(digits.len()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rawfile point count exceeds reserved width",
+        )
+    })?;
+    out.seek(SeekFrom::Start(position))?;
+    out.write_all(&[b' '; POINT_COUNT_WIDTH][..padding])?;
+    out.write_all(digits.as_bytes())
 }
 
 /// Metadata of a completed streamed plot; rows were written without retention.
@@ -638,13 +652,19 @@ fn render_ascii_point(
     writeln!(out)
 }
 
-/// Writes the shared header and its encoding marker as `raw_write()` lays them out.
+/// Writes the shared header, including the compact point count.
 fn render_header(
     out: &mut impl Write,
     raw_plot: &RawPlot,
     point_count: usize,
     format: RawFormat,
 ) -> io::Result<()> {
+    render_header_start(out, raw_plot)?;
+    write!(out, "{point_count}")?;
+    render_header_end(out, raw_plot, format)
+}
+
+fn render_header_start(out: &mut impl Write, raw_plot: &RawPlot) -> io::Result<()> {
     let plot = &raw_plot.plot;
     writeln!(out, "Title: {}", raw_plot.title)?;
     writeln!(out, "Date: {}", raw_plot.date)?;
@@ -652,9 +672,17 @@ fn render_header(
     writeln!(out, "Plotname: {}", plot.plotname)?;
     writeln!(out, "Flags: {}", plot.flags().as_rawfile())?;
     writeln!(out, "No. Variables: {}", plot.variables().len())?;
-    writeln!(out, "No. Points: {point_count}")?;
+    out.write_all(b"No. Points: ")
+}
+
+fn render_header_end(
+    out: &mut impl Write,
+    raw_plot: &RawPlot,
+    format: RawFormat,
+) -> io::Result<()> {
+    writeln!(out)?;
     writeln!(out, "Variables:")?;
-    for (index, variable) in plot.variables().iter().enumerate() {
+    for (index, variable) in raw_plot.plot.variables().iter().enumerate() {
         writeln!(out, "\t{index}\t{}\t{}", variable.name, variable.unit)?;
     }
     out.write_all(section_line(format))
@@ -1640,35 +1668,50 @@ Values:
     }
 
     #[test]
-    fn finishing_a_spool_with_the_wrong_encoding_is_rejected_and_cleans_up() {
-        use std::fs;
-        let dir =
-            std::env::temp_dir().join(format!("spice-rs-spool-encoding-{}", std::process::id()));
-        fs::create_dir(&dir).unwrap();
-        let source = dir.join("source.raw");
-        let dest = dir.join("dest.raw");
-        let spool = dir.join("spool");
+    fn direct_point_count_patch_preserves_width_and_reports_seek_errors() {
+        use std::io::{Cursor, Seek, SeekFrom};
+        for count in [0, 1, 123_456, usize::MAX] {
+            let mut writer = Cursor::new(vec![b'?'; POINT_COUNT_WIDTH]);
+            patch_point_count(&mut writer, 0, count).unwrap();
+            assert_eq!(writer.into_inner(), format!("{count:>20}").into_bytes(),);
+        }
+        struct RefusesSeek(Cursor<Vec<u8>>);
+        impl Write for RefusesSeek {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.flush()
+            }
+        }
+        impl Seek for RefusesSeek {
+            fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "not seekable"))
+            }
+        }
+        let mut writer = RefusesSeek(Cursor::new(Vec::new()));
+        assert_eq!(
+            patch_point_count(&mut writer, 0, 1).unwrap_err().kind(),
+            io::ErrorKind::Unsupported,
+        );
+    }
+
+    #[test]
+    fn direct_writer_rejects_a_nonrepresentable_point_count_without_publishing() {
+        use ngspice_conformance::ngspice::Scratch;
+        let dir = Scratch::new("direct-count-overflow").unwrap();
+        let path = dir.path().join("out.raw");
+        let mut writer =
+            RawFileWriter::create(&path, RawFormat::Binary, BinaryByteOrder::LittleEndian).unwrap();
         let header = RawFile::parse(OP_RAWFILE).unwrap().plots.remove(0);
-        let origin = super::RawFileWriter::create(
-            &source,
-            super::RawFormat::Binary,
-            super::BinaryByteOrder::LittleEndian,
-        )
-        .unwrap();
-        let stream = origin.begin_plot(header, &spool).unwrap();
-        let mut writer = super::RawFileWriter::create(
-            &dest,
-            super::RawFormat::Ascii,
-            super::BinaryByteOrder::LittleEndian,
-        )
-        .unwrap();
-        let error = writer.finish_plot(stream).unwrap_err();
-        assert!(error.to_string().contains("encoding differs"));
-        writer.finish().unwrap();
-        origin.finish().unwrap();
-        assert!(!spool.exists());
-        assert_eq!(fs::metadata(&dest).unwrap().len(), 0);
-        fs::remove_dir_all(dir).unwrap();
+        writer.begin_plot(header).unwrap();
+        writer.active.as_mut().unwrap().point_count = usize::MAX;
+        assert!(
+            writer
+                .push_point(&[Complex::real(1.), Complex::real(2.)])
+                .is_err()
+        );
+        assert!(writer.finish().is_err());
     }
 
     #[test]

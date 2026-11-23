@@ -1,8 +1,8 @@
 //! Streamed output (M10 0.5g): [`ngspice_rs::analysis::AnalysisPlan::run_into`] hands an analysis's
 //! points to a [`PointSink`] instead of storing them, and [`RawFileWriter`]
-//! writes plots one at a time, spooling a streamed plot's points until its
-//! count is known. Both must reproduce the stored path exactly: the same rows,
-//! and a rawfile byte-identical to [`RawFile::write_with_format`].
+//! writes plots one at a time into a seekable destination with a fixed-width
+//! count reservation. All bytes match the stored path except leading spaces
+//! in the streamed plot's point-count field.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,33 @@ fn entries(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+// C's rawfile reader accepts whitespace before the decimal count. Undo
+// only that reservation padding to compare all other bytes including binary
+// payloads against the exact compact retained-format encoder.
+fn compact_count_fields(bytes: &[u8]) -> Vec<u8> {
+    let marker = b"No. Points: ";
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(start) = rest
+        .windows(marker.len())
+        .position(|window| window == marker)
+    {
+        let field = start + marker.len();
+        result.extend_from_slice(&rest[..field]);
+        rest = &rest[field..];
+        let end = rest.iter().position(|&byte| byte == b'\n').unwrap();
+        result.extend(
+            rest[..end]
+                .iter()
+                .skip_while(|&&byte| byte == b' ')
+                .copied(),
+        );
+        rest = &rest[end..];
+    }
+    result.extend_from_slice(rest);
+    result
 }
 
 /// Records what an analysis hands its sink.
@@ -330,20 +357,18 @@ fn streamed_and_stored_plots_write_the_same_bytes() {
         let stored = dir.join("stored.raw");
         rawfile.write_with_format(&stored, format, order).unwrap();
 
-        // The first plot whole, the rest streamed point by point.
+        // The first plot whole, the rest streamed in-place without a spool.
         let streamed = dir.join("streamed.raw");
-        let spool = dir.join("points.spool");
         let mut writer = RawFileWriter::create(&streamed, format, order).unwrap();
         writer.write_plot(&rawfile.plots[0]).unwrap();
         for raw_plot in &rawfile.plots[1..] {
-            let mut plot = writer.begin_plot(raw_plot.clone(), &spool).unwrap();
-            assert!(plot.header().plot.point_count() == 0);
+            writer.begin_plot(raw_plot.clone()).unwrap();
             for point in raw_plot.plot.rows() {
-                plot.push_point(point).unwrap();
+                writer.push_point(point).unwrap();
             }
-            assert_eq!(plot.point_count(), raw_plot.plot.point_count());
-            writer.finish_plot(plot).unwrap();
-            assert!(!spool.exists(), "finishing removes the spool");
+            let completed = writer.finish_plot().unwrap();
+            assert_eq!(completed.point_count, raw_plot.plot.point_count());
+            assert_eq!(completed.header.plot.point_count(), 0);
         }
         writer.finish().unwrap();
 
@@ -354,7 +379,16 @@ fn streamed_and_stored_plots_write_the_same_bytes() {
         let stored_bytes = fs::read(&stored).unwrap();
         let streamed_bytes = fs::read(&streamed).unwrap();
         assert_eq!(stored_bytes, expected_bytes, "{format:?} {order:?}");
-        assert_eq!(streamed_bytes, expected_bytes, "{format:?} {order:?}");
+        assert_eq!(
+            compact_count_fields(&streamed_bytes),
+            expected_bytes,
+            "{format:?} {order:?}"
+        );
+        assert!(
+            !streamed_bytes
+                .windows(b"No. Points:                    0".len())
+                .any(|bytes| bytes == b"No. Points:                    0")
+        );
         // The binary format does not record its byte order; use the selected order
         // when verifying real and complex rows.
         let parsed = RawFileReader::new(streamed_bytes.as_slice())
@@ -380,64 +414,43 @@ fn streamed_and_stored_plots_write_the_same_bytes() {
 }
 
 #[test]
-fn a_streamed_plot_rejects_ragged_points_and_cleans_up_when_abandoned() {
+fn a_direct_streamed_plot_rejects_ragged_points_and_poisoned_finish() {
     let dir = scratch("abandon");
     let rawfile = sample_plots();
-    let spool = dir.join("points.spool");
-    let writer = RawFileWriter::create(
+    let mut writer = RawFileWriter::create(
         dir.join("out.raw"),
         RawFormat::Binary,
         BinaryByteOrder::LittleEndian,
     )
     .unwrap();
-    let mut plot = writer.begin_plot(rawfile.plots[0].clone(), &spool).unwrap();
-    plot.push_point(&[Complex::real(0.0), Complex::real(1.0)])
+    writer.begin_plot(rawfile.plots[0].clone()).unwrap();
+    writer
+        .push_point(&[Complex::real(0.), Complex::real(1.)])
         .unwrap();
-    let error = plot.push_point(&[Complex::real(0.0)]).unwrap_err();
+    let error = writer.push_point(&[Complex::real(0.)]).unwrap_err();
     assert!(error.to_string().contains("1 value(s)"), "{error}");
-    assert_eq!(plot.point_count(), 1, "a rejected point is not counted");
-
-    // An existing spool is never overwritten.
-    let error = writer
-        .begin_plot(rawfile.plots[1].clone(), &spool)
-        .unwrap_err();
-    assert!(matches!(error, SpiceError::Io { .. }), "{error}");
-
-    assert!(spool.exists());
-    drop(plot);
-    assert!(
-        !spool.exists(),
-        "dropping an unfinished plot removes its spool"
-    );
-    drop(writer);
+    assert!(writer.finish_plot().is_err());
+    assert!(writer.finish().is_err());
     assert_eq!(entries(&dir), ["out.raw"]);
     fs::remove_dir_all(&dir).unwrap();
 }
+
 #[test]
-fn a_streamed_binary_plot_cannot_cross_byte_orders() {
-    let dir = scratch("byte-order");
+fn direct_writer_refuses_to_interleave_two_unfinished_plots() {
+    let dir = scratch("active");
     let rawfile = sample_plots();
-    let spool = dir.join("points.spool");
-    let origin = RawFileWriter::create(
-        dir.join("source.raw"),
+    let mut writer = RawFileWriter::create(
+        dir.join("out.raw"),
         RawFormat::Binary,
         BinaryByteOrder::BigEndian,
     )
     .unwrap();
-    let mut writer = RawFileWriter::create(
-        dir.join("dest.raw"),
-        RawFormat::Binary,
-        BinaryByteOrder::LittleEndian,
-    )
-    .unwrap();
-    let mut plot = origin.begin_plot(rawfile.plots[0].clone(), &spool).unwrap();
-    plot.push_point(rawfile.plots[0].plot.row(0).unwrap())
+    writer.begin_plot(rawfile.plots[0].clone()).unwrap();
+    writer
+        .push_point(rawfile.plots[0].plot.row(0).unwrap())
         .unwrap();
-    assert!(writer.finish_plot(plot).is_err());
-    writer.finish().unwrap();
-    origin.finish().unwrap();
-    assert!(!spool.exists());
-    assert_eq!(fs::metadata(dir.join("dest.raw")).unwrap().len(), 0);
+    assert!(writer.begin_plot(rawfile.plots[1].clone()).is_err());
+    assert!(writer.finish().is_err());
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -471,8 +484,41 @@ fn atomic_transaction_matches_stored_and_streamed_encodings() {
             RawFormat::Ascii => rawfile.to_ascii().unwrap().into_bytes(),
             RawFormat::Binary => rawfile.to_binary_with(order).unwrap(),
         };
-        assert_eq!(fs::read(&output).unwrap(), expected);
+        assert_eq!(compact_count_fields(&fs::read(&output).unwrap()), expected);
         assert_eq!(entries(&dir), ["out.raw"]);
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn rootless_pole_zero_and_zero_point_plots_stream_without_payload() {
+    use ngspice_rs::analysis::RawFileTransaction;
+    let dir = scratch("rootless");
+    let sample = sample_plots();
+    for format in [RawFormat::Ascii, RawFormat::Binary] {
+        let output = dir.join("rootless.raw");
+        let mut writer =
+            RawFileTransaction::create(&output, format, BinaryByteOrder::LittleEndian).unwrap();
+        let rootless = RawPlot {
+            title: "rootless test".into(),
+            date: "date".into(),
+            command: "command".into(),
+            plot: Plot::new("pz1", "Pole-Zero Analysis", PlotFlags::Real, vec![]),
+        };
+        writer.begin_plot(rootless).unwrap();
+        writer.push_point(&[]).unwrap();
+        assert_eq!(writer.finish_plot().unwrap().point_count, 1);
+        writer.begin_plot(sample.plots[2].clone()).unwrap();
+        assert_eq!(writer.finish_plot().unwrap().point_count, 0);
+        writer.write_plot(&sample.plots[0]).unwrap();
+        writer.publish().unwrap();
+        let bytes = fs::read(&output).unwrap();
+        let decoded = RawFileReader::new(bytes.as_slice()).read().unwrap();
+        assert_eq!(decoded.plots.len(), 3);
+        assert_eq!(decoded.plots[0].plot.variable_count(), 0);
+        assert_eq!(decoded.plots[0].plot.point_count(), 1);
+        assert_eq!(decoded.plots[1].plot.point_count(), 0);
+        assert_eq!(decoded.plots[2].plot.cells(), sample.plots[0].plot.cells());
     }
     fs::remove_dir_all(&dir).unwrap();
 }

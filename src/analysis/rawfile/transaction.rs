@@ -11,8 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::primitives::{Complex, SpiceError, SpiceResult};
 
 use super::{
-    BinaryByteOrder, FinishedPlot, RawFileWriter, RawFormat, RawPlot, StreamedPlot, TextSpool,
-    unsupported,
+    BinaryByteOrder, FinishedPlot, RawFileWriter, RawFormat, RawPlot, TextSpool, unsupported,
 };
 
 const ATTEMPTS: usize = 128;
@@ -210,7 +209,6 @@ impl TextSpool {
 #[derive(Debug)]
 pub struct RawFileTransaction {
     writer: RawFileWriter,
-    active: Option<StreamedPlot>,
     temporary: OwnedTemporary,
     output: PathBuf,
     failed: bool,
@@ -240,7 +238,6 @@ impl RawFileTransaction {
         let writer = RawFileWriter::from_file(file, temporary.path().to_path_buf(), format, order);
         Ok(Self {
             writer,
-            active: None,
             temporary,
             output,
             failed: false,
@@ -257,76 +254,41 @@ impl RawFileTransaction {
         let result = operation(self);
         if result.is_err() {
             self.failed = true;
-            self.active = None;
         }
         result
     }
 
-    /// Write a complete retained plot.
+    /// Append a complete retained plot to the same owned output.
     ///
     /// # Errors
-    /// Active streamed plot, previous failure, invalid rows or I/O failure.
+    /// Previous failure, active streamed plot, invalid rows or I/O failure.
     pub fn write_plot(&mut self, plot: &RawPlot) -> SpiceResult<()> {
-        self.execute(|this| {
-            if this.active.is_some() {
-                return Err(unsupported(
-                    "rawfile transaction has an unfinished streamed plot",
-                ));
-            }
-            this.writer.write_plot(plot)
-        })
+        self.execute(|this| this.writer.write_plot(plot))
     }
 
-    /// Begin a plot with an exclusively created, transaction-owned spool.
+    /// Start streaming directly to the exclusively owned destination.
+    /// There is no auxiliary point spool or second temporary file.
     ///
     /// # Errors
-    /// Active streamed plot, previous failure or spool creation failure.
+    /// Previous failure, active plot, invalid header, seek or I/O failure.
     pub fn begin_plot(&mut self, header: RawPlot) -> SpiceResult<()> {
-        self.begin_with(header, names("points"))
+        self.execute(|this| this.writer.begin_plot(header))
     }
 
-    fn begin_with(
-        &mut self,
-        header: RawPlot,
-        candidates: impl Iterator<Item = OsString>,
-    ) -> SpiceResult<()> {
-        self.execute(|this| {
-            if this.active.is_some() {
-                return Err(unsupported(
-                    "rawfile transaction has an unfinished streamed plot",
-                ));
-            }
-            let (file, temporary) = create_beside(&this.output, candidates)?;
-            this.active = Some(this.writer.begin_owned_plot(header, file, temporary));
-            Ok(())
-        })
-    }
-
-    /// Add one point to the active streamed plot.
+    /// Add one point directly to the active streamed plot.
     ///
     /// # Errors
-    /// Previous failure, no active plot, invalid row or spool write failure.
+    /// Previous failure, no active plot, invalid row or write failure.
     pub fn push_point(&mut self, values: &[Complex]) -> SpiceResult<()> {
-        self.execute(|this| {
-            this.active
-                .as_mut()
-                .ok_or_else(|| unsupported("rawfile transaction has no active streamed plot"))?
-                .push_point(values)
-        })
+        self.execute(|this| this.writer.push_point(values))
     }
 
-    /// Complete the active streamed plot, returning its summary.
+    /// Patch the point count and complete the streamed plot.
     ///
     /// # Errors
-    /// Previous failure, no active plot or I/O failure.
+    /// Previous failure, no active plot, seek/flush/write failure.
     pub fn finish_plot(&mut self) -> SpiceResult<FinishedPlot> {
-        self.execute(|this| {
-            let plot = this
-                .active
-                .take()
-                .ok_or_else(|| unsupported("rawfile transaction has no active streamed plot"))?;
-            this.writer.finish_plot(plot)
-        })
+        self.execute(|this| this.writer.finish_plot())
     }
 
     /// Flush and atomically replace the final output. A failed or incomplete
@@ -335,7 +297,7 @@ impl RawFileTransaction {
     /// # Errors
     /// Previous failure, an unfinished streamed plot, write/flush or rename failure.
     pub fn publish(self) -> SpiceResult<()> {
-        if self.failed || self.active.is_some() {
+        if self.failed || self.writer.has_active() {
             return Err(unsupported(
                 "cannot publish a failed or unfinished rawfile transaction",
             ));
@@ -475,9 +437,9 @@ mod tests {
             "unfinished",
             "ragged",
             "duplicate",
-            "collision",
+            "header_write",
             "write",
-            "spool",
+            "patch",
             "rename",
         ] {
             let mut transaction = RawFileTransaction::create(
@@ -500,11 +462,12 @@ mod tests {
                     transaction.begin_plot(header()).unwrap();
                     assert!(transaction.begin_plot(header()).is_err());
                 }
-                "collision" => {
-                    let error = transaction
-                        .begin_with(header(), std::iter::repeat(OsString::from("sentinel")))
-                        .unwrap_err();
-                    assert!(error.to_string().contains("attempts exhausted"));
+                "header_write" => {
+                    // BufWriter::stream_position flushes the header prefix;
+                    // a read-only descriptor rejects it before any row.
+                    transaction.writer.out =
+                        std::io::BufWriter::new(File::open(transaction.temporary.path()).unwrap());
+                    assert!(transaction.begin_plot(header()).is_err());
                 }
                 "write" => {
                     // An open read-only descriptor of the owned file injects
@@ -513,16 +476,12 @@ mod tests {
                         std::io::BufWriter::new(File::open(transaction.temporary.path()).unwrap());
                     transaction.write_plot(&header()).unwrap();
                 }
-                "spool" => {
-                    transaction
-                        .begin_with(header(), candidates(&["sentinel", "spool"]))
-                        .unwrap();
-                    let active = transaction.active.as_mut().unwrap();
-                    active.spool =
-                        std::io::BufWriter::new(File::open(active.temporary.path()).unwrap());
+                "patch" => {
+                    transaction.begin_plot(header()).unwrap();
                     transaction.push_point(&[Complex::real(1.)]).unwrap();
+                    transaction.writer.out =
+                        std::io::BufWriter::new(File::open(transaction.temporary.path()).unwrap());
                     assert!(transaction.finish_plot().is_err());
-                    assert!(!dir.path().join("spool").exists());
                 }
                 "rename" => {
                     // The writer can flush, but the destination cannot be
@@ -576,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_spool_retry_and_successful_replace() {
+    fn direct_stream_successfully_replaces_without_an_auxiliary_file() {
         let dir = Scratch::new("rawfile-transaction-success").unwrap();
         let output = dir.path().join("final.raw");
         let sentinel = dir.path().join("sentinel");
@@ -589,20 +548,21 @@ mod tests {
             candidates(&["owned"]),
         )
         .unwrap();
-        let mut choices = vec!["sentinel", "owned", "final.raw"];
         #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&sentinel, dir.path().join("link")).unwrap();
-            choices.push("link");
-        }
-        choices.push("spool");
-        transaction
-            .begin_with(header(), candidates(&choices))
-            .unwrap();
+        std::os::unix::fs::symlink(&sentinel, dir.path().join("link")).unwrap();
+        transaction.begin_plot(header()).unwrap();
+        let temporary_name = transaction
+            .temporary
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(entries(dir.path()).len(), if cfg!(unix) { 4 } else { 3 });
+        assert!(entries(dir.path()).contains(&temporary_name));
         transaction.push_point(&[Complex::real(12.)]).unwrap();
         let finished = transaction.finish_plot().unwrap();
         assert_eq!(finished.point_count, 1);
-        assert!(!dir.path().join("spool").exists());
         assert_eq!(fs::read_to_string(&output).unwrap(), "PREVIOUS");
         transaction.publish().unwrap();
         assert!(!dir.path().join("owned").exists());

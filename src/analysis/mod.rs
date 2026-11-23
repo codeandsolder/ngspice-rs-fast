@@ -71,7 +71,7 @@ pub use measure::{MeasureEvents, MeasureSpan, Measurement};
 pub use plan::{AnalysisPlan, IntegrationFamily};
 pub use rawfile::{
     BinaryByteOrder, RawCollectPolicy, RawFile, RawFileReader, RawFileWriter, RawFormat, RawPlot,
-    RawPlotRows, RawReadPolicy, StreamedPlot,
+    RawPlotRows, RawReadPolicy,
 };
 pub use rawfile::{FinishedPlot, RawFileTransaction};
 pub use results::{ColumnView, Plot, PlotBuilder, PlotFlags, PlotSchema, PointSink, Variable};
