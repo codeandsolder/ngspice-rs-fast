@@ -37,7 +37,10 @@
 
 use std::{collections::VecDeque, f64::consts::PI};
 
-use crate::primitives::Real;
+use crate::primitives::{
+    Real,
+    numeric::{scale_power, split_power, truncating_signed_integer},
+};
 
 /// `LTRAquadInterp`: coefficients `(c1, c2, c3)` of the quadratic through
 /// `(t1, t2, t3)` evaluated at `t`, or `None` for coincident times (C returns
@@ -273,19 +276,115 @@ fn bessel_pair_batch<const DIVIDED: bool>(
     )
 }
 
+/// The RLC time-of-flight radial coordinate sqrt(t² - delay²). The
+/// ordinary form follows C; the alternate product avoids overflow and
+/// underflow of squared times when the final coordinate is representable.
+fn rlc_radial(lag: Real, delay: Real) -> Real {
+    if lag <= delay {
+        return 0.;
+    }
+    let squared = lag * lag - delay * delay;
+    if squared.is_finite() && squared > 0. {
+        squared.sqrt()
+    } else {
+        // (lag-delay)(lag+delay), with a half-sum that cannot overflow.
+        (lag - delay).sqrt() * (0.5 * lag + 0.5 * delay).sqrt() * std::f64::consts::SQRT_2
+    }
+}
+
+/// Multiply finite factors by an exponential without forming an overflowing
+/// or underflowing intermediate. The exponent/mantissa decomposition covers
+/// every representable finite result of the already rounded input factors.
+fn scaled_exponential_product(factors: impl IntoIterator<Item = Real>, logarithm: Real) -> Real {
+    let mut mantissa = 1.;
+    let mut exponent = 0_i32;
+    for factor in factors {
+        if factor == 0. {
+            return factor;
+        }
+        if !factor.is_finite() {
+            return Real::NAN;
+        }
+        let (part, power) = split_power(factor);
+        mantissa *= part;
+        exponent += power;
+    }
+    if logarithm.is_nan() {
+        return Real::NAN;
+    }
+    // The finite binary64 input factors account for at most a few thousand
+    // binary exponent bits. Beyond these limits, the result cannot fit.
+    if logarithm < -4096. {
+        return 0.;
+    }
+    if logarithm > 4096. {
+        return mantissa.signum() * Real::INFINITY;
+    }
+    let ln_two = std::f64::consts::LN_2;
+    let Some(power) = truncating_signed_integer::<i32>((logarithm / ln_two).floor()) else {
+        return Real::NAN;
+    };
+    let remainder = logarithm - Real::from(power) * ln_two;
+    scale_power(mantissa * remainder.exp(), exponent + power)
+}
+
+/// Attenuation multiplied by an existing A&S modified-Bessel approximation,
+/// including an optional I1(x)/x and extra physical leading factors. For
+/// large x the exp(x) from Iν is combined with attenuation analytically.
+fn damped_bessel(argument: Real, exponent: Real, leading: &[Real], divided_i1: bool) -> Real {
+    let (polynomial, growth, root_inverse, argument_inverse) = if argument < 3.75 {
+        (
+            if divided_i1 {
+                bess_i1_x_over_x(argument)
+            } else {
+                bess_i0(argument)
+            },
+            0.,
+            1.,
+            1.,
+        )
+    } else {
+        let coefficients = if divided_i1 {
+            &I1_LARGE[..]
+        } else {
+            &I0_LARGE[..]
+        };
+        (
+            polynomial(3.75 / argument, coefficients, std::convert::identity),
+            argument,
+            1. / argument.sqrt(),
+            if divided_i1 { 1. / argument } else { 1. },
+        )
+    };
+    scaled_exponential_product(
+        leading
+            .iter()
+            .copied()
+            .chain([polynomial, root_inverse, argument_inverse]),
+        exponent + growth,
+    )
+}
+
 /// `LTRArlcH2Func`: `h2(t)` of the RLC line, zero before `T`.
 #[must_use]
 pub fn rlc_h2(time: Real, t: Real, alpha: Real, beta: Real) -> Real {
-    if alpha == 0.0 || time < t {
-        return 0.0;
+    if alpha == 0. || time < t || t == 0. {
+        return 0.;
     }
-    let besselarg = if time == t {
-        0.0
+    let argument = alpha * rlc_radial(time, t);
+    let exponent = -beta * time;
+    if argument >= 700. || exponent < -700. {
+        return damped_bessel(argument, exponent, &[alpha, alpha, t], true);
+    }
+    let leading = alpha * alpha * t;
+    let ordinary = leading * exponent.exp() * bess_i1_x_over_x(argument);
+    if ordinary.is_finite() && ordinary != 0. {
+        ordinary
     } else {
-        alpha * (time * time - t * t).sqrt()
-    };
-    let exparg = -beta * time;
-    alpha * alpha * t * exparg.exp() * bess_i1_x_over_x(besselarg)
+        // The physical leading product can be unrepresentable even when
+        // attenuation and the Bessel factor make the response finite.
+        damped_bessel(argument, exponent, &[alpha, alpha, t], true)
+    }
 }
 
 /// `LTRAstraightLineCheck`: whether three points lie close enough to a
@@ -711,12 +810,28 @@ fn rlc_aux_index(t: Real, curtime: Real, times: &VecDeque<Real>) -> usize {
 
 fn rlc_self_endpoint(lag: Real, beta: Real, exponent: Real, decay: Real) -> Real {
     if beta == 0. {
-        lag
-    } else if lag == 0. {
-        0.
-    } else {
-        (bess_i1(-exponent) + bess_i0(-exponent)) * lag * decay - lag
+        return lag;
     }
+    if lag == 0. {
+        return 0.;
+    }
+    let argument = -exponent;
+    if argument < 1e-4 {
+        // exp(-x)(I0(x)+I1(x))-1. Evaluate I0-1 and exp(-x)-1
+        // separately to retain the first-order -x/2 limit.
+        let reduced = argument / 3.75;
+        let squared = reduced * reduced;
+        let i0_minus_one = squared * polynomial(squared, &I0_SMALL[1..], std::convert::identity);
+        let i1 = argument * polynomial(squared, &I1_SMALL, std::convert::identity);
+        return lag * (exponent.exp_m1() + decay * (i0_minus_one + i1));
+    }
+    if argument >= 700. {
+        let reciprocal = 3.75 / argument;
+        let i0 = polynomial(reciprocal, &I0_LARGE, std::convert::identity);
+        let i1 = polynomial(reciprocal, &I1_LARGE, std::convert::identity);
+        return lag * ((i0 + i1) / argument.sqrt() - 1.);
+    }
+    (bess_i1(argument) + bess_i0(argument)) * lag * decay - lag
 }
 
 // With no accepted samples beyond the propagation delay, only the local
@@ -774,18 +889,18 @@ impl RlcKernels {
         if !(active[1] || active[2]) {
             return [h1, 0., 0.];
         }
-        let argument = if lag > self.delay {
-            self.alpha * (lag * lag - self.delay * self.delay).sqrt()
-        } else {
-            0.
-        };
+        let argument = self.alpha * rlc_radial(lag, self.delay);
         let h2 = if !active[1] || self.alpha == 0. || lag < self.delay {
             0.
+        } else if argument >= 700. || exponent < -700. || !self.alpha_squared_delay.is_finite() {
+            rlc_h2(lag, self.delay, self.alpha, self.beta)
         } else {
             self.alpha_squared_delay * decay * bess_i1_x_over_x(argument)
         };
         let h3 = if !active[2] || lag <= self.delay || self.beta == 0. {
             0.
+        } else if argument >= 700. || exponent < -700. {
+            damped_bessel(argument, exponent, &[1.], false) - self.delay_decay
         } else {
             decay * bess_i0(argument) - self.delay_decay
         };
@@ -798,6 +913,26 @@ impl RlcKernels {
             cmp::{SimdPartialEq, SimdPartialOrd},
             f64x4,
         };
+        // Keep the packed fast path only when its unscaled Bessel products
+        // and squared time coordinates are well-conditioned. Rare extreme
+        // or near-zero cases use the stable scalar kernel with the same
+        // accepted-history and coefficient ordering.
+        if lags.into_iter().any(|lag| {
+            let exponent = -self.beta * lag;
+            let near_zero = active[0] && self.beta != 0. && lag != 0. && exponent.abs() < 1e-4;
+            let large_decay = exponent < -700.;
+            let beyond = lag > self.delay;
+            let radial = lag * lag - self.delay * self.delay;
+            let unstable_radial = beyond && (!radial.is_finite() || radial <= 0.);
+            let argument = if beyond && radial > 0. && radial.is_finite() {
+                self.alpha * radial.sqrt()
+            } else {
+                0.
+            };
+            near_zero || large_decay || unstable_radial || argument >= 700.
+        }) {
+            return lags.map(|lag| self.at(lag, active));
+        }
         let lag = f64x4::from_array(lags);
         let zero = f64x4::splat(0.);
         let exponent = f64x4::splat(-self.beta) * lag;
@@ -1061,13 +1196,7 @@ mod tests {
                 for (vector, lag) in kernels.batch(lags, [true; 3]).into_iter().zip(lags) {
                     let exponent = -beta * lag;
                     let decay = exponent.exp();
-                    let h1 = if beta == 0. {
-                        lag
-                    } else if lag == 0. {
-                        0.
-                    } else {
-                        (bess_i1(-exponent) + bess_i0(-exponent)) * lag * decay - lag
-                    };
+                    let h1 = rlc_self_endpoint(lag, beta, exponent, decay);
                     let h2 = rlc_h2(lag, delay, alpha, beta);
                     let h3 = if lag <= delay || beta == 0. {
                         0.
@@ -1079,6 +1208,50 @@ mod tests {
                         assert_same(got, expected);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn rlc_scaled_bessel_products_preserve_finite_extreme_limits() {
+        let self_endpoint = rlc_self_endpoint(1., 1000., -1000., 0.);
+        // Decimal(150)-digit independent I0/I1 power series oracle.
+        assert!(self_endpoint.is_finite());
+        assert!((self_endpoint - (-0.974_771_829_287_180_1)).abs() < 1e-8);
+
+        let small = rlc_self_endpoint(1., 1e-10, -1e-10, (-1e-10_f64).exp());
+        assert!((small / (-4.999_999_999_75e-11) - 1.).abs() < 1e-6);
+
+        let radial = (1_f64 - 0.5).sqrt() * (1_f64 + 0.5).sqrt();
+        let asymptotic_h2 = 1e6 * 0.5 / (1000. * radial) / (2. * PI * 1000. * radial).sqrt()
+            * (1000. * radial - 1000.).exp();
+        let finite_subthreshold = rlc_h2(1., 0.5, 699. / 0.75_f64.sqrt(), 800.);
+        assert!(finite_subthreshold.is_finite() && finite_subthreshold > 0.);
+        let h2 = rlc_h2(1., 0.5, 1000., 1000.);
+        assert!(h2.is_finite() && h2 > 0.);
+        assert!((h2 / asymptotic_h2 - 1.).abs() < 1e-3);
+
+        // Squared times underflow, alpha² overflows, but the complete
+        // damped kernel remains finite and positive.
+        let extreme = rlc_h2(2e-200, 1e-200, 1e200, 1e200);
+        assert!(extreme.is_finite() && extreme > 0.);
+        assert!((extreme / 9.642_079_637_745_418e198 - 1.).abs() < 1e-6);
+        let kernels = RlcKernels {
+            delay: 0.5,
+            alpha: 1000.,
+            beta: 1000.,
+            alpha_squared_delay: 500_000.,
+            delay_decay: (-500_f64).exp(),
+        };
+        let h3 = kernels.at(1., [true; 3])[2];
+        assert!((h3 / 8.867_059_436_549_784e-61 - 1.).abs() < 1e-6);
+        let points = [0.5, 0.75, 1., 2.];
+        let batch = kernels.batch(points, [true; 3]);
+        for (at, scalars) in points.into_iter().zip(batch) {
+            let reference = kernels.at(at, [true; 3]);
+            for (actual, expected) in scalars.into_iter().zip(reference) {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+                assert!(actual.is_finite());
             }
         }
     }
