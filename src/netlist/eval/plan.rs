@@ -49,6 +49,8 @@ pub struct ParameterInput {
 /// through nested `.func` calls and any number of intermediate `.param` aliases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundExpression {
+    scope: ParameterScopeId,
+    direct: HashMap<String, usize>,
     inputs: Vec<usize>,
 }
 
@@ -57,6 +59,19 @@ impl BoundExpression {
     #[must_use]
     pub fn inputs(&self) -> &[usize] {
         &self.inputs
+    }
+
+    /// Whether any directly referenced resolved slot differs between two
+    /// candidate sessions. Derived values that cancel remain clean.
+    #[must_use]
+    pub fn changed_between(
+        &self,
+        previous: &CandidateParameters<'_>,
+        next: &CandidateParameters<'_>,
+    ) -> bool {
+        self.direct.values().any(|&index| {
+            previous.values[index].map(Real::to_bits) != next.values[index].map(Real::to_bits)
+        })
     }
 
     /// Whether the candidate can change this site relative to the baseline.
@@ -193,11 +208,11 @@ impl ParameterPlan {
             stack: Vec::new(),
             cuts: 0,
         };
-        let mut direct = Vec::new();
+        let mut direct = HashMap::new();
         let mut undefined = None;
         scan.refs(&expression.root, 0, &mut |name, location| {
             if let Some(index) = self.lookup_slot(Some(scope), name) {
-                direct.push(index);
+                direct.insert(canonical_lookup(name).into_owned(), index);
             } else if undefined.is_none() {
                 undefined = Some((name.to_owned(), location.clone()));
             }
@@ -210,12 +225,13 @@ impl ParameterPlan {
             ));
         }
         let mut visited = vec![false; self.nodes.len()];
-        while let Some(node) = direct.pop() {
+        let mut pending: Vec<_> = direct.values().copied().collect();
+        while let Some(node) = pending.pop() {
             if visited[node] {
                 continue;
             }
             visited[node] = true;
-            direct.extend(self.nodes[node].references.values().copied());
+            pending.extend(self.nodes[node].references.values().copied());
         }
         let inputs = self
             .inputs
@@ -227,7 +243,11 @@ impl ParameterPlan {
                     .map(|_| position)
             })
             .collect();
-        Ok(BoundExpression { inputs })
+        Ok(BoundExpression {
+            scope,
+            direct,
+            inputs,
+        })
     }
 
     fn node_index(&self, slot: ParameterSlot) -> Option<usize> {
@@ -510,6 +530,35 @@ impl CandidateParameters<'_> {
         evaluate_root(
             expression,
             &|name| self.get(scope, name),
+            baseline.functions.as_deref(),
+            budget,
+        )
+        .map_err(Failure::into_error)
+    }
+
+    /// Evaluate an immutable site against its pre-bound lexical slots.
+    /// Uses the scalar evaluator with identical domain, budget and error rules.
+    ///
+    /// # Errors
+    /// Invalid scope or ordinary expression evaluation errors.
+    pub fn evaluate_bound(
+        &self,
+        expression: &ParameterExpression,
+        bound: &BoundExpression,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Real> {
+        let baseline = self
+            .plan
+            .baseline(bound.scope)
+            .ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))?;
+        evaluate_root(
+            expression,
+            &|name| {
+                bound
+                    .direct
+                    .get(canonical_lookup(name).as_ref())
+                    .and_then(|&index| self.values[index])
+            },
             baseline.functions.as_deref(),
             budget,
         )
