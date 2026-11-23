@@ -3,7 +3,10 @@
 //! The model laws and fixture-specific tolerances remain in each test crate.
 //! Keeping the sparse stamp traversal here makes the A*x-b sign and triplet
 //! accumulation convention identical across all device families.
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "each device integration-test binary uses a different subset of the shared test harness"
+)]
 
 use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::{AnalysisMode, Circuit, LoadRequest, ModelContext, TrialState};
