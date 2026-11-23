@@ -224,9 +224,32 @@ fn residues(p: [Real; 3], q: [Real; 3], x: [Real; 3], pair: bool) -> [Real; 3] {
 impl Pade {
     pub(super) fn new(r: Real, l: Real, g: Real, c: Real, length: Real) -> SpiceResult<Self> {
         let l = l.max(1e-12);
-        let admit = (c / l).sqrt();
-        let tau = (l * c).sqrt();
-        let delay_ps = tau * length * 1e12;
+        // Calculate the geometric quantities without allowing an intermediate
+        // quotient or product to lose an exponent that the final square root
+        // would recover. Keep the ordinary C evaluation when its intermediate
+        // is normal: this also avoids needless extra rounding in that range.
+        let ratio = c / l;
+        let admit = if ratio.is_normal() {
+            ratio.sqrt()
+        } else {
+            c.sqrt() / l.sqrt()
+        };
+        let product = l * c;
+        let tau = if product.is_normal() {
+            product.sqrt()
+        } else {
+            l.sqrt() * c.sqrt()
+        };
+        // Scaling seconds to picoseconds last can lose an otherwise finite
+        // subnormal delay when tau*length underflows. Multiply the length by
+        // the unit conversion first only when that intermediate is subnormal
+        // or zero. If tau*length overflows, the final delay must overflow too.
+        let transit = tau * length;
+        let delay_ps = if transit.is_normal() {
+            transit * 1e12
+        } else {
+            tau * (length * 1e12)
+        };
         if !admit.is_finite() || admit <= 0. || !delay_ps.is_finite() || delay_ps <= 0. {
             return Err(error("nonfinite or degenerate line admittance/delay"));
         }
@@ -391,5 +414,110 @@ impl Pade {
             atten2,
             atten3,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pade;
+
+    #[test]
+    fn lossless_geometry_matches_independent_high_precision_square_roots() {
+        // Reference bits: 750-digit Decimal arithmetic on the exact binary64
+        // inputs, then correctly rounded once to binary64. These include
+        // overflowing C intermediates, a subnormal ratio, a subnormal
+        // product, and a transit product which rounds to zero before the
+        // picosecond conversion but must not lose the final delay.
+        for (l, c, length, admit_bits, delay_bits) in [
+            (
+                1e300,
+                1e-100,
+                1e-100,
+                0x1668_7e92_154e_f7ac,
+                0x426d_1a94_a200_0000,
+            ),
+            (
+                1e160,
+                1e160,
+                1e-150,
+                0x3ff0_0000_0000_0000,
+                0x4480_f0cf_064d_d592,
+            ),
+            (
+                1e-12,
+                1e308,
+                1.,
+                0x6126_c2d4_256f_fcc3,
+                0x6126_c2d4_256f_fcc3,
+            ),
+            (
+                1e308,
+                f64::from_bits(1),
+                1e-300,
+                0x0000_0000_02ae_7ad2,
+                0x028d_12d4_1afc_a3c3,
+            ),
+            (
+                1e-12,
+                f64::from_bits(1),
+                1e-164,
+                0x1f9e_8480_0000_0000,
+                0x0000_0000_0000_1193,
+            ),
+            (
+                1e308,
+                1e308,
+                1e-308,
+                0x3ff0_0000_0000_0000,
+                0x426d_1a94_a1ff_ffff,
+            ),
+            (
+                1e-12,
+                1e308,
+                1e-308,
+                0x6126_c2d4_256f_fcc3,
+                0x2134_756c_cb01_abfb,
+            ),
+        ] {
+            let coefficients = Pade::new(0., l, 0., c, length).unwrap();
+            assert!(coefficients.lossy.is_none());
+            assert_eq!(coefficients.atten2.to_bits(), 1_f64.to_bits());
+            assert_eq!(coefficients.atten3.to_bits(), coefficients.admit.to_bits());
+            assert!(
+                coefficients.admit.to_bits().abs_diff(admit_bits) <= 2,
+                "L={l:e} C={c:e}: admittance {:016x} vs {admit_bits:016x}",
+                coefficients.admit.to_bits()
+            );
+            assert!(
+                coefficients.delay_ps.to_bits().abs_diff(delay_bits) <= 2,
+                "L={l:e} C={c:e} length={length:e}: delay {:016x} vs {delay_bits:016x}",
+                coefficients.delay_ps.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_geometry_retains_the_original_c_evaluation() {
+        let l = 250e-9;
+        let c = 100e-12;
+        let length = 1.;
+        let coefficients = Pade::new(0., l, 0., c, length).unwrap();
+        assert_eq!(coefficients.admit.to_bits(), (c / l).sqrt().to_bits());
+        assert_eq!(
+            coefficients.delay_ps.to_bits(),
+            ((l * c).sqrt() * length * 1e12).to_bits()
+        );
+    }
+
+    #[test]
+    fn unrepresentable_final_quantities_still_fail() {
+        for (l, c, length) in [
+            (1e308, 1e308, 1.),
+            (1e-12, 1e-300, 1e-300),
+            (1e-12, f64::from_bits(1), 1e-180),
+            (1e-12, 0., 1.),
+        ] {
+            assert!(Pade::new(0., l, 0., c, length).is_err());
+        }
     }
 }
