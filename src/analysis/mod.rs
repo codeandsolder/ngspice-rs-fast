@@ -12,7 +12,7 @@
 //! | [`noise`] | `.noise`: adjoint small-signal noise spectra and integrated totals | resistor, diode, BJT, MOS1 and switch generators (`docs/port/NOISE.md`) |
 //! | [`driver`] | the typed [`AnalysisPlan`] and the `.op`/`.dc`/`.ac`/`.tran`/`.pz`/`.tf`/`.sp`/`.noise` drivers | linear DC/AC and the adaptive trap/Gear-2 companion transient |
 //! | `tf` | `.tf` DC small-signal gain, input and output resistance at the bias point | ported (`tfanal.c`; see [`AnalysisPlan`]) |
-//! | `sparam` | `.sp` S-parameter analysis over RF port sources (S, Y, Z) | ported without `donoise` (`docs/port/SPARAM.md`) |
+//! | `sparam` | `.sp` S-parameter analysis over RF port sources (S, Y, Z) | ported, including `donoise` (`docs/port/SPARAM.md`) |
 //!
 //! The C equivalent is `src/spicelib/analysis/` (21,993 lines: the `CKT*`
 //! job-control, loading and iteration machinery) and `src/frontend/rawfile.c`.
@@ -45,10 +45,12 @@ mod linear;
 pub mod measure;
 pub mod newton;
 pub mod noise;
+pub mod optimization;
 mod ordered_samples;
 mod plan;
 mod pz;
 pub mod rawfile;
+mod reduction;
 pub mod results;
 pub mod selection;
 mod sens;
@@ -74,6 +76,7 @@ pub use rawfile::{
 pub use rawfile::{FinishedPlot, RawFileTransaction};
 pub use results::{ColumnView, Plot, PlotBuilder, PlotFlags, PlotSchema, PointSink, Variable};
 pub use selection::{Selection, print_requests, write_requests};
+pub use sparam::RfLimits;
 
 /// The C reference for the analysis drivers.
 ///

@@ -8,7 +8,7 @@ card 1 @netlists/bsource_ac.cir:8:1 lines=8-8 continuations=0
   token 2 8:5 word "in"
   token 3 8:8 number "0" value=0e0
   token 4 8:10 word "dc"
-  token 5 8:13 number "0.6" value=6.000000000000001e-1
+  token 5 8:13 number "0.6" value=6e-1
   token 6 8:17 word "ac"
   token 7 8:20 number "1" value=1e0
 card 2 @netlists/bsource_ac.cir:9:1 lines=9-9 continuations=0
@@ -52,7 +52,7 @@ card 5 @netlists/bsource_ac.cir:12:1 lines=12-12 continuations=0
   token 1 12:1 word "c1"
   token 2 12:4 word "out1"
   token 3 12:9 number "0" value=0e0
-  token 4 12:11 number "100n" value=1.0000000000000001e-7
+  token 4 12:11 number "100n" value=1e-7
 card 6 @netlists/bsource_ac.cir:13:1 lines=13-13 continuations=0
   raw: "b2 0 out2 i=1e-6*exp(v(in)/0.1) + 2m*v(out1)"
   kind: device(b)
@@ -87,7 +87,7 @@ card 8 @netlists/bsource_ac.cir:15:1 lines=15-15 continuations=0
   token 1 15:1 word "c2"
   token 2 15:4 word "out2"
   token 3 15:9 number "0" value=0e0
-  token 4 15:11 number "47n" value=4.7000000000000004e-8
+  token 4 15:11 number "47n" value=4.7e-8
 card 9 @netlists/bsource_ac.cir:16:1 lines=16-16 continuations=0
   raw: "b3 cur 0 v=i(vin)*1k*v(in)"
   kind: device(b)

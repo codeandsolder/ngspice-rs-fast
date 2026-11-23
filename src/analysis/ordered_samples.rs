@@ -84,10 +84,6 @@ impl<'a> OrderedAxis<'a> {
         self.values.len()
     }
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
     pub(super) fn lower_bound(&self, x: Real) -> usize {
         self.values.partition_point(|t| *t < x)
     }
@@ -224,10 +220,6 @@ impl Segment {
     pub(super) const fn right(self) -> usize {
         self.left + 1
     }
-
-    pub(super) fn is_jump(self) -> bool {
-        same_coordinate(self.x0, self.x1)
-    }
 }
 
 const fn segment(values: &[Real], left: usize) -> Segment {
@@ -311,13 +303,81 @@ pub(super) enum SampleError {
     Operand(SpiceError),
 }
 
-fn interpolate(x0: Real, y0: Real, x1: Real, y1: Real, x: Real) -> Real {
-    y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+pub(super) fn interpolate(x0: Real, y0: Real, x1: Real, y1: Real, x: Real) -> Real {
+    if ![x0, y0, x1, y1, x].into_iter().all(Real::is_finite) {
+        return Real::NAN;
+    }
+    if same_coordinate(x, x0) {
+        return y0;
+    }
+    if same_coordinate(x, x1) {
+        return y1;
+    }
+    // Keep the common case on the conditioned, fused binary64 kernel.
+    // Exceptional spans and zero/one fractions need a rational quotient:
+    // rounding their fraction first can erase a representable increment.
+    let (near_x, near_y, far_x, far_y) = if x <= Real::midpoint(x0, x1) {
+        (x0, y0, x1, y1)
+    } else {
+        (x1, y1, x0, y0)
+    };
+    let width = far_x - near_x;
+    let delta = far_y - near_y;
+    if width.is_finite() && delta.is_finite() {
+        let fraction = (x - near_x) / width;
+        if fraction > 0. && fraction < 1. {
+            let result = fraction.mul_add(delta, near_y);
+            if result.is_finite() {
+                return result;
+            }
+        }
+    }
+    crate::primitives::rounded_product_ratio(
+        [
+            (y0, x1, false),
+            (y0, x, true),
+            (y1, x, false),
+            (y1, x0, true),
+        ],
+        [(x1, false), (x0, true)],
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AxisError, OrderedAxis, SampleError};
+
+    #[test]
+    fn interpolation_handles_overflowing_spans_and_anchor_differences() {
+        use super::interpolate;
+        assert_eq!(interpolate(-f64::MAX, -1., f64::MAX, 1., 0.), 0.);
+        assert_eq!(interpolate(0., -f64::MAX, 2., f64::MAX, 1.), 0.);
+        let x = 1_f64.next_down();
+        let expected = 1. - x;
+        assert_eq!(interpolate(0., 1., 1., 0., x), expected);
+    }
+
+    #[test]
+    fn interpolation_recovers_subnormal_increments_and_extreme_cancellation() {
+        use super::interpolate;
+        let tiny = f64::from_bits(1);
+        // The exact fallback operates exclusively on finite binary64 terms.
+        assert!(interpolate(0., 1., 1., f64::INFINITY, 0.5).is_nan());
+        // The interpolation fraction rounds to zero but multiplying it
+        // by the large endpoint range must recover a finite tiny result.
+        assert_eq!(
+            interpolate(-tiny, 0., 1e308, 1e308, 0.).to_bits(),
+            tiny.to_bits()
+        );
+        assert_eq!(
+            interpolate(0., 0., 1e308, 1e308, tiny).to_bits(),
+            tiny.to_bits()
+        );
+        assert_eq!(
+            interpolate(-f64::MAX, -f64::MAX, f64::MAX, f64::MAX, 0.),
+            0.
+        );
+    }
 
     #[test]
     fn duplicate_coordinates_use_exact_equality_including_signed_zero() {
@@ -397,7 +457,7 @@ mod tests {
         );
         let event_segments = window
             .event_segments()
-            .map(|s| (s.left, s.right(), s.is_jump()))
+            .map(|s| (s.left, s.right(), super::same_coordinate(s.x0, s.x1)))
             .collect::<Vec<_>>();
         assert_eq!(event_segments, [(0, 1, false), (1, 2, true), (2, 3, false)]);
         assert!(axis.sample_window(2.25, 2.75).is_none());

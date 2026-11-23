@@ -258,3 +258,15 @@ the normalized step-response deficit integrates to `9.8/1.3*1e-10 s`
   the load, a deck whose *first* step is oversized behaves identically only
   because that bound is withheld until an oversized gap exists in the
   history.
+
+## Materialization budget
+
+A prepared TXL input selects either a single native device (no fixed scalar
+state slots; its dynamic history is accounted separately) or the exact RC
+fallback plan, which owns seven device records, two generated nodes and eight
+capacitor state slots. Both intern the four written terminals, including
+references that the native device does not stamp; repeated node names count
+only once. The model and ordered instance setters are resolved once for the
+plan, not parsed again on the native path. The aggregate circuit budget
+checks all groups before creating generated ladders. See
+[the aggregate circuit policy](NATIVE_SOLVER.md#aggregate-elaboration-resources).

@@ -151,6 +151,26 @@ fn modified_load(
     load
 }
 
+fn prepared_load(
+    circuit: &Circuit,
+    small_signal: &crate::analysis::ac::SmallSignal<'_>,
+    context: &crate::analysis::AnalysisContext,
+    setups: u32,
+    input: [Option<usize>; 2],
+    output: Option<[Option<usize>; 2]>,
+) -> SpiceResult<PencilLoad> {
+    let terms = circuit.pole_zero_terms_at(
+        &context.model_context(),
+        small_signal.bias(),
+        Some(small_signal.state()),
+        setups,
+    )?;
+    let elements = circuit.pole_zero_elements(setups)?;
+    let mut load = modified_load(circuit.unknown_count(), &elements, &terms, input, output);
+    load.relative_threshold = context.pivot.relative;
+    Ok(load)
+}
+
 /// The finite roots of a modified pencil. A pencil whose determinant
 /// vanishes for every `s` has no defined roots; C reports that case (its
 /// search finds a "root" at every trial) as `E_SHORT`.
@@ -218,37 +238,28 @@ pub(super) fn run(
     // `CKTpzSetup` matrix (whose `DEVpzSetup` runs count, see
     // `MatrixSetup::pole_zero_setups`); `PZpost` lists poles first.
     let mut setups = 0;
-    let pencil = |setups: u32| -> SpiceResult<_> {
-        Ok((
-            circuit.pole_zero_terms_at(
-                &context.model_context(),
-                small_signal.bias(),
-                Some(small_signal.state()),
-                setups,
-            )?,
-            circuit.pole_zero_elements(setups)?,
-        ))
-    };
-    let order = circuit.unknown_count();
     let input = [in_pos, in_neg];
     let mut poles = if card.poles {
         setups += 1;
-        let (terms, elements) = pencil(setups)?;
         let output = match card.input {
             Input::Voltage => Some(input),
             Input::Current => None,
         };
-        let mut load = modified_load(order, &elements, &terms, input, output);
-        load.relative_threshold = context.pivot.relative;
+        let load = prepared_load(circuit, &small_signal, context, setups, input, output)?;
         roots(&load, "poles")?
     } else {
         Vec::new()
     };
     let zeros = if card.zeros {
         setups += 1;
-        let (terms, elements) = pencil(setups)?;
-        let mut load = modified_load(order, &elements, &terms, input, Some([out_pos, out_neg]));
-        load.relative_threshold = context.pivot.relative;
+        let load = prepared_load(
+            circuit,
+            &small_signal,
+            context,
+            setups,
+            input,
+            Some([out_pos, out_neg]),
+        )?;
         roots(&load, "zeros")?
     } else {
         Vec::new()
@@ -284,6 +295,137 @@ mod tests {
 
     fn request(arguments: &[&str]) -> Vec<String> {
         arguments.iter().map(|a| (*a).to_owned()).collect()
+    }
+
+    #[test]
+    #[ignore = "optional historical C trial-sequence diagnostic; numerical paths may differ"]
+    fn report_pinned_c_trial_sequences() {
+        use crate::analysis::RunConfig;
+        use crate::netlist::Parser;
+        use crate::netlist::source::parse_deck_text;
+        use std::path::Path;
+
+        let fixture = include_str!("../../conformance/pencil_search_traces.txt");
+        let mut cases = fixture.split("\ncase ").skip(1);
+        for expected in ["repeat", "near", "complex", "singular", "notch"] {
+            let case = cases.next().unwrap();
+            let (name, rest) = case.split_once('\n').unwrap();
+            assert_eq!(name, expected);
+            let (deck, trace) = rest.split_once("\ntrace\n").unwrap();
+            let netlist = Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("trace.cir"), deck))
+                .unwrap();
+            let config = RunConfig::from_netlist(&netlist).unwrap();
+            let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+            assert_eq!(netlist.analyses.len(), 1);
+            let card = parse(&netlist.analyses[0].arguments).unwrap();
+            assert_ne!(card.poles, card.zeros);
+            let context = config.context();
+            let mut circuit = config.circuit(&netlist).unwrap();
+            circuit.finalize().unwrap();
+            let input = [
+                node(&circuit, &card.nodes[0]).unwrap().1,
+                node(&circuit, &card.nodes[1]).unwrap().1,
+            ];
+            let output = if card.zeros {
+                Some([
+                    node(&circuit, &card.nodes[2]).unwrap().1,
+                    node(&circuit, &card.nodes[3]).unwrap().1,
+                ])
+            } else if card.input == Input::Voltage {
+                Some(input)
+            } else {
+                None
+            };
+            let signal = crate::analysis::ac::SmallSignal::prepare(
+                &circuit,
+                &plan,
+                &context,
+                plan.dc_settings().clone(),
+            )
+            .unwrap();
+            let load = prepared_load(&circuit, &signal, &context, 1, input, output).unwrap();
+            crate::maths::pencil::report_c_trace(&load, name, trace);
+        }
+        assert!(cases.next().is_none());
+    }
+
+    #[test]
+    #[ignore = "optional trace of a third-order pencil"]
+    fn report_cubic_pencil_trace() {
+        use crate::maths::pencil::{PencilLoad, PencilTerm};
+        // Companion matrix of the multi-analysis pole polynomial after
+        // scaling frequency by 10000. Actual circuit validation is in the
+        // integration tests; this only exposes the numerical root search.
+        let coefficients = [0.011, 0.0121, 0.01011, 0.0011];
+        let mut terms = Vec::new();
+        for row in 0..3 {
+            terms.push(PencilTerm {
+                row,
+                col: row,
+                conductance: None,
+                capacitance: Some(1.),
+            });
+        }
+        for row in 0..2 {
+            terms.push(PencilTerm {
+                row,
+                col: row + 1,
+                conductance: Some(-1.),
+                capacitance: None,
+            });
+        }
+        for (col, coefficient) in coefficients[..3].iter().enumerate() {
+            terms.push(PencilTerm {
+                row: 2,
+                col,
+                conductance: Some(coefficient / coefficients[3]),
+                capacitance: None,
+            });
+        }
+        let load = PencilLoad {
+            order: 3,
+            terms,
+            ..PencilLoad::default()
+        };
+        crate::maths::pencil::report_c_trace(&load, "multi-analysis companion", "");
+    }
+
+    #[test]
+    #[ignore = "optional independent polynomial-coefficient diagnostic"]
+    fn report_hfet2_pole_pencil() {
+        use crate::analysis::RunConfig;
+        use crate::netlist::Parser;
+        use crate::netlist::source::parse_deck_text;
+        use std::path::Path;
+        let deck = include_str!("../../conformance/netlists/m10_hfet2_pz.cir");
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("hfet2.cir"), deck))
+            .unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+        let context = config.context();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        circuit.finalize().unwrap();
+        let signal = crate::analysis::ac::SmallSignal::prepare(
+            &circuit,
+            &plan,
+            &context,
+            plan.dc_settings().clone(),
+        )
+        .unwrap();
+        let load = prepared_load(&circuit, &signal, &context, 1, [None, None], None).unwrap();
+        println!("order {}", load.order);
+        for term in &load.terms {
+            println!(
+                "term {} {} {:016x} {:016x}",
+                term.row,
+                term.col,
+                term.conductance.unwrap_or(0.).to_bits(),
+                term.capacitance.unwrap_or(0.).to_bits()
+            );
+        }
+        println!("roots {:?}", roots(&load, "poles").unwrap());
     }
 
     #[test]

@@ -15,10 +15,10 @@ card 1 @netlists/multi_analysis_rc.cir:2:1 lines=2-2 continuations=0
   token 9 2:24 lparen "("
   token 10 2:25 number "0" value=0e0
   token 11 2:27 number "1" value=1e0
-  token 12 2:29 number "100u" value=9.999999999999999e-5
-  token 13 2:34 number "10u" value=9.999999999999999e-6
-  token 14 2:38 number "10u" value=9.999999999999999e-6
-  token 15 2:42 number "400u" value=3.9999999999999996e-4
+  token 12 2:29 number "100u" value=1e-4
+  token 13 2:34 number "10u" value=1e-5
+  token 14 2:38 number "10u" value=1e-5
+  token 15 2:42 number "400u" value=4e-4
   token 16 2:47 number "1m" value=1e-3
   token 17 2:49 rparen ")"
 card 2 @netlists/multi_analysis_rc.cir:3:1 lines=3-3 continuations=0
@@ -41,12 +41,12 @@ card 4 @netlists/multi_analysis_rc.cir:5:1 lines=5-5 continuations=0
   token 1 5:1 word "c1"
   token 2 5:4 word "out"
   token 3 5:8 number "0" value=0e0
-  token 4 5:10 number "100n" value=1.0000000000000001e-7
+  token 4 5:10 number "100n" value=1e-7
 card 5 @netlists/multi_analysis_rc.cir:6:1 lines=6-6 continuations=0
   raw: ".tran 10u 1m"
   kind: dot(.tran)
   token 1 6:1 word ".tran"
-  token 2 6:7 number "10u" value=9.999999999999999e-6
+  token 2 6:7 number "10u" value=1e-5
   token 3 6:11 number "1m" value=1e-3
 card 6 @netlists/multi_analysis_rc.cir:7:1 lines=7-7 continuations=0
   raw: ".ac lin 5 100 10k"

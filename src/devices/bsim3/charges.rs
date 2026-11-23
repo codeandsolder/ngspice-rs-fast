@@ -12,8 +12,6 @@
 //! Every output keeps C's sign convention: charges on the gate, bulk and
 //! drain and the nine `c*xb` capacitance derivatives, before the multiplicity
 //! multiplier and before the overlap-charge adjustment the caller performs.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -23,20 +21,8 @@
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
-)]
-#![expect(
-    clippy::imprecise_flops,
-    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use super::dc::{Bias, DcEvaluation};
@@ -238,30 +224,37 @@ impl ChargeModel<'_> {
                 -cv.d_vth_dvb,
             )
         } else if vgst_nvt < -EXP_THRESHOLD {
-            let vgsteff = t0 * (1.0 + MIN_EXP).ln();
+            let vgsteff = t0 * MIN_EXP.ln_1p();
             let dvd = vgsteff / noff;
             (vgsteff, 0.0, dvd * dnoff_dvd, dvd * dnoff_dvb)
         } else {
             let exp_vgst = vgst_nvt.exp();
-            let vgsteff = t0 * (1.0 + exp_vgst).ln();
+            let vgsteff = t0 * exp_vgst.ln_1p();
             let dvg = exp_vgst / (1.0 + exp_vgst);
-            let dvd = -dvg * (cv.d_vth_dvd + (cv.vgst - voffcv) / noff * dnoff_dvd)
-                + vgsteff / noff * dnoff_dvd;
-            let dvb = -dvg * (cv.d_vth_dvb + (cv.vgst - voffcv) / noff * dnoff_dvb)
-                + vgsteff / noff * dnoff_dvb;
+            let dvd = (vgsteff / noff).mul_add(
+                dnoff_dvd,
+                -dvg * ((cv.vgst - voffcv) / noff).mul_add(dnoff_dvd, cv.d_vth_dvd),
+            );
+            let dvb = (vgsteff / noff).mul_add(
+                dnoff_dvb,
+                -dvg * ((cv.vgst - voffcv) / noff).mul_add(dnoff_dvb, cv.d_vth_dvb),
+            );
             (vgsteff, dvg * cv.d_vgs_eff_dvg, dvd, dvb)
         };
 
         // ---- capMod == 3, the charge-thickness model (CTM).
         let vfbzb = p.vfbzb;
         let v3 = vfbzb - cv.vgs_eff + vbseff_cv - DELTA_3;
-        let t0 = if vfbzb <= 0.0 {
-            (v3 * v3 - 4.0 * DELTA_3 * vfbzb).sqrt()
+        let discriminant_addend = 4.0 * DELTA_3 * vfbzb.abs();
+        let t0 = v3.mul_add(v3, discriminant_addend).sqrt();
+        let (flatband_drop, t1) = if v3 < 0.0 {
+            let conjugate = t0 - v3;
+            let drop = 0.5 * discriminant_addend / conjugate;
+            (drop, drop / t0)
         } else {
-            (v3 * v3 + 4.0 * DELTA_3 * vfbzb).sqrt()
+            (Real::midpoint(v3, t0), Real::midpoint(1.0, v3 / t0))
         };
-        let t1 = 0.5 * (1.0 + v3 / t0);
-        let vfbeff = vfbzb - 0.5 * (v3 + t0);
+        let vfbeff = vfbzb - flatband_drop;
         let dvfbeff_dvg = t1 * cv.d_vgs_eff_dvg;
         let dvfbeff_dvb = -t1 * dvbseff_cv_dvb;
 
@@ -290,9 +283,13 @@ impl ChargeModel<'_> {
         let link = 1.0e-3 * tox;
         // C reuses V3/V4/T1 here, after the Vfb-eff computation.
         let v3 = ldeb - tcen - link;
-        let v4 = (v3 * v3 + 4.0 * link * ldeb).sqrt();
-        let tcen = ldeb - 0.5 * (v3 + v4);
-        let t1 = 0.5 * (1.0 + v3 / v4);
+        let v4 = (4.0 * link).mul_add(ldeb, v3 * v3).sqrt();
+        let tcen = if ldeb > 0.0 && tcen >= 0.0 {
+            tcen * (2.0 * (ldeb / (ldeb + tcen + link + v4)))
+        } else {
+            ldeb - Real::midpoint(v3, v4)
+        };
+        let t1 = Real::midpoint(1.0, v3 / v4);
         dtcen_dvg *= t1;
         dtcen_dvb *= t1;
 
@@ -305,10 +302,10 @@ impl ChargeModel<'_> {
         dcoxeff_dvg *= dtcen_dvg;
         let cox_wl_cen = cox_wl * coxeff / cox;
 
-        let qac0 = cox_wl_cen * (vfbeff - vfbzb);
+        let qac0 = -cox_wl_cen * flatband_drop;
         let qov_cox = qac0 / coxeff;
-        let dqac0_dvg = cox_wl_cen * dvfbeff_dvg + qov_cox * dcoxeff_dvg;
-        let dqac0_dvb = cox_wl_cen * dvfbeff_dvb + qov_cox * dcoxeff_dvb;
+        let dqac0_dvg = qov_cox.mul_add(dcoxeff_dvg, cox_wl_cen * dvfbeff_dvg);
+        let dqac0_dvb = qov_cox.mul_add(dcoxeff_dvb, cox_wl_cen * dvfbeff_dvb);
 
         // Poly-gate depletion share of the bulk charge.
         let k1ox = p.derived.k1ox;
@@ -319,17 +316,30 @@ impl ChargeModel<'_> {
         } else if t3 < 0.0 {
             (t0 + t3 / k1ox, cox_wl_cen)
         } else {
-            let t1 = (t0 * t0 + t3).sqrt();
+            let t1 = t0.mul_add(t0, t3).sqrt();
             (t1, cox_wl_cen * t0 / t1)
         };
 
-        let qsub0 = cox_wl_cen * k1ox * (t1 - t0);
+        let potential_drop = if k1ox == 0.0 {
+            0.0
+        } else if t3 < 0.0 {
+            t3 / k1ox
+        } else if t0 >= 0.0 {
+            t3 / (t1 + t0)
+        } else {
+            t1 - t0
+        };
+        let qsub0 = cox_wl_cen * k1ox * potential_drop;
         let qov_cox = qsub0 / coxeff;
-        let dqsub0_dvg =
-            t2 * (cv.d_vgs_eff_dvg - dvfbeff_dvg - dvgsteff_dvg) + qov_cox * dcoxeff_dvg;
+        let dqsub0_dvg = qov_cox.mul_add(
+            dcoxeff_dvg,
+            t2 * (cv.d_vgs_eff_dvg - dvfbeff_dvg - dvgsteff_dvg),
+        );
         let dqsub0_dvd = -t2 * dvgsteff_dvd;
-        let dqsub0_dvb =
-            -t2 * (dvfbeff_dvb + dvbseff_cv_dvb + dvgsteff_dvb) + qov_cox * dcoxeff_dvb;
+        let dqsub0_dvb = qov_cox.mul_add(
+            dcoxeff_dvb,
+            -t2 * (dvfbeff_dvb + dvbseff_cv_dvb + dvgsteff_dvb),
+        );
 
         // Gate-bias-dependent surface potential (C's "Delta Phis").
         let (denomi, t0) = if k1ox <= 0.0 {
@@ -340,16 +350,20 @@ impl ChargeModel<'_> {
                 k1ox * p.derived.sqrtphi,
             )
         };
-        let t1 = 2.0 * t0 + vgsteff;
-        let delta_phi = cv.vtm * (1.0 + t1 * vgsteff / denomi).ln();
-        let ddelta_phi_dvg = 2.0 * cv.vtm * (t1 - t0) / (denomi + t1 * vgsteff);
+        let t1 = 2.0f64.mul_add(t0, vgsteff);
+        let delta_phi = cv.vtm * (t1 * vgsteff / denomi).ln_1p();
+        let ddelta_phi_dvg = 2.0 * cv.vtm * (t1 - t0) / f64::mul_add(t1, vgsteff, denomi);
 
         // Effective gate overdrive, `VgDP`.
         let t0 = vgsteff - delta_phi - 0.001;
         let dt0_dvg = 1.0 - ddelta_phi_dvg;
-        let t1 = (t0 * t0 + vgsteff * 0.004).sqrt();
-        let vgdp = 0.5 * (t0 + t1);
-        let dvgdp_dvg = 0.5 * (dt0_dvg + (t0 * dt0_dvg + 0.002) / t1);
+        let t1 = f64::mul_add(vgsteff, 0.004, t0 * t0).sqrt();
+        let vgdp = if t0 < 0.0 {
+            0.002 * vgsteff / (t1 - t0)
+        } else {
+            Real::midpoint(t0, t1)
+        };
+        let dvgdp_dvg = f64::midpoint(dt0_dvg, t0.mul_add(dt0_dvg, 0.002) / t1);
 
         // Bias-dependent channel thickness for the inversion charge.
         let t3 = 4.0 * (cv.vth - vfbzb - cv.phi);
@@ -357,8 +371,8 @@ impl ChargeModel<'_> {
         let (t0, dt0_dvd, dt0_dvb) = if t3 >= 0.0 {
             (
                 (vgsteff + t3) / tox_cm,
-                (dvgsteff_dvd + 4.0 * cv.d_vth_dvd) / tox_cm,
-                (dvgsteff_dvb + 4.0 * cv.d_vth_dvb) / tox_cm,
+                4.0f64.mul_add(cv.d_vth_dvd, dvgsteff_dvd) / tox_cm,
+                4.0f64.mul_add(cv.d_vth_dvb, dvgsteff_dvb) / tox_cm,
             )
         } else {
             (
@@ -394,14 +408,18 @@ impl ChargeModel<'_> {
         let t0 = vdsat_cv - vds_mode - DELTA_4;
         let dt0_dvg = dvgdp_dvg / abulk_cv;
         let dt0_dvb = -vdsat_cv * dabulk_cv_dvb / abulk_cv;
-        let t1 = (t0 * t0 + 4.0 * DELTA_4 * vdsat_cv).sqrt();
+        let t1 = (4.0 * DELTA_4).mul_add(vdsat_cv, t0 * t0).sqrt();
         let dt1_dvg0 = (t0 + DELTA_4 + DELTA_4) / t1;
         let dt1_dvd = -t0 / t1;
         let dt1_dvb0 = dt1_dvg0 * dt0_dvb;
         let dt1_dvg = dt1_dvg0 * dt0_dvg;
         let (mut vdseff_cv, mut dvdseff_cv_dvg, dvdseff_cv_dvd, mut dvdseff_cv_dvb) = if t0 >= 0.0 {
             (
-                vdsat_cv - 0.5 * (t0 + t1),
+                if vdsat_cv > 0.0 {
+                    vds_mode * (2.0 * (vdsat_cv / (vdsat_cv + vds_mode + DELTA_4 + t1)))
+                } else {
+                    vdsat_cv - Real::midpoint(t0, t1)
+                },
                 0.5 * (dt0_dvg - dt1_dvg),
                 0.5 * (1.0 - dt1_dvd),
                 0.5 * (dt0_dvb - dt1_dvb0),
@@ -413,9 +431,9 @@ impl ChargeModel<'_> {
             let t5 = vdsat_cv * t3 / (t1 - t0);
             (
                 vdsat_cv * t4,
-                dt0_dvg * t4 + t5 * (dt1_dvg - dt0_dvg),
+                t5.mul_add(dt1_dvg - dt0_dvg, dt0_dvg * t4),
                 t5 * (dt1_dvd + 1.0),
-                dt0_dvb * (1.0 - t5) + t5 * dt1_dvb0,
+                t5.mul_add(dt1_dvb0, dt0_dvb * (1.0 - t5)),
             )
         };
         // C zeroes VdseffCV's gate/body derivatives at Vds = 0 (not the drain
@@ -429,21 +447,28 @@ impl ChargeModel<'_> {
         // Gate charge and its derivatives.
         let t0 = abulk_cv * vdseff_cv;
         let t1 = vgdp;
-        let t2 = 12.0 * (t1 - 0.5 * t0 + 1.0e-20);
+        let t2 = 12.0 * (0.5f64.mul_add(-t0, t1) + 1.0e-20);
         let t3 = t0 / t2;
-        let t4 = 1.0 - 12.0 * t3 * t3;
-        let t5 = abulk_cv * (6.0 * t0 * (4.0 * t1 - t0) / (t2 * t2) - 0.5);
+        let t4 = (12.0 * t3).mul_add(-t3, 1.0);
+        let t5 = abulk_cv * (6.0 * t0 * 4.0f64.mul_add(t1, -t0) / (t2 * t2) - 0.5);
         let t6 = t5 * vdseff_cv / abulk_cv;
 
-        let qgate = cox_wl_cen * (t1 - t0 * (0.5 - t3));
+        let qgate = cox_wl_cen * t0.mul_add(-(0.5 - t3), t1);
         let qinoi = qgate;
         let qov_cox = qgate / coxeff;
-        let mut cgg1 = cox_wl_cen * (t4 * dvgdp_dvg + t5 * dvdseff_cv_dvg);
-        let cgd1 = cox_wl_cen * t5 * dvdseff_cv_dvd + cgg1 * dvgsteff_dvd + qov_cox * dcoxeff_dvd;
-        let cgb1 = cox_wl_cen * (t5 * dvdseff_cv_dvb + t6 * dabulk_cv_dvb)
-            + cgg1 * dvgsteff_dvb
-            + qov_cox * dcoxeff_dvb;
-        cgg1 = cgg1 * dvgsteff_dvg + qov_cox * dcoxeff_dvg;
+        let mut cgg1 = cox_wl_cen * t5.mul_add(dvdseff_cv_dvg, t4 * dvgdp_dvg);
+        let cgd1 = qov_cox.mul_add(
+            dcoxeff_dvd,
+            cgg1.mul_add(dvgsteff_dvd, cox_wl_cen * t5 * dvdseff_cv_dvd),
+        );
+        let cgb1 = qov_cox.mul_add(
+            dcoxeff_dvb,
+            cgg1.mul_add(
+                dvgsteff_dvb,
+                cox_wl_cen * t6.mul_add(dabulk_cv_dvb, t5 * dvdseff_cv_dvb),
+            ),
+        );
+        cgg1 = qov_cox.mul_add(dcoxeff_dvg, cgg1 * dvgsteff_dvg);
 
         // Bulk charge and its derivatives.
         let t7 = 1.0 - abulk_cv;
@@ -451,16 +476,23 @@ impl ChargeModel<'_> {
         let t9 = 12.0 * t7 * t0 * t0 / (t8 * abulk_cv);
         let t10 = t9 * dvgdp_dvg;
         let t11 = -t7 * t5 / abulk_cv;
-        let t12 = -(t9 * t1 / abulk_cv + vdseff_cv * (0.5 - t0 / t2));
+        let t12 = -f64::mul_add(vdseff_cv, 0.5 - t0 / t2, t9 * t1 / abulk_cv);
 
-        let qbulk = cox_wl_cen * t7 * (0.5 * vdseff_cv - t0 * vdseff_cv / t2);
+        let qbulk = cox_wl_cen * t7 * 0.5f64.mul_add(vdseff_cv, -(t0 * vdseff_cv / t2));
         let qov_cox = qbulk / coxeff;
-        let mut cbg1 = cox_wl_cen * (t10 + t11 * dvdseff_cv_dvg);
-        let cbd1 = cox_wl_cen * t11 * dvdseff_cv_dvd + cbg1 * dvgsteff_dvd + qov_cox * dcoxeff_dvd;
-        let cbb1 = cox_wl_cen * (t11 * dvdseff_cv_dvb + t12 * dabulk_cv_dvb)
-            + cbg1 * dvgsteff_dvb
-            + qov_cox * dcoxeff_dvb;
-        cbg1 = cbg1 * dvgsteff_dvg + qov_cox * dcoxeff_dvg;
+        let mut cbg1 = cox_wl_cen * t11.mul_add(dvdseff_cv_dvg, t10);
+        let cbd1 = qov_cox.mul_add(
+            dcoxeff_dvd,
+            cbg1.mul_add(dvgsteff_dvd, cox_wl_cen * t11 * dvdseff_cv_dvd),
+        );
+        let cbb1 = qov_cox.mul_add(
+            dcoxeff_dvb,
+            cbg1.mul_add(
+                dvgsteff_dvb,
+                cox_wl_cen * t12.mul_add(dabulk_cv_dvb, t11 * dvdseff_cv_dvb),
+            ),
+        );
+        cbg1 = qov_cox.mul_add(dcoxeff_dvg, cbg1 * dvgsteff_dvg);
 
         // Source charge partition (XPART: > 0.5 = 0/100, < 0.5 = 40/60).
         let xpart = m.values.xpart.value;
@@ -470,17 +502,23 @@ impl ChargeModel<'_> {
             let qov_cox = qsrc0 / coxeff;
             let t2 = t2 + t2;
             let t3 = t2 * t2;
-            let t7p = -(0.25 - 12.0 * t0 * (4.0 * t1 - t0) / t3);
+            let t7p = -(0.25 - 12.0 * t0 * 4.0f64.mul_add(t1, -t0) / t3);
             let t4p = -(0.5 + 24.0 * t0 * t0 / t3) * dvgdp_dvg;
             let t5p = t7p * abulk_cv;
             let t6p = t7p * vdseff_cv;
-            let csg0 = cox_wl_cen * (t4p + t5p * dvdseff_cv_dvg);
-            let csd0 =
-                cox_wl_cen * t5p * dvdseff_cv_dvd + csg0 * dvgsteff_dvd + qov_cox * dcoxeff_dvd;
-            let csb0 = cox_wl_cen * (t5p * dvdseff_cv_dvb + t6p * dabulk_cv_dvb)
-                + csg0 * dvgsteff_dvb
-                + qov_cox * dcoxeff_dvb;
-            let csg1 = csg0 * dvgsteff_dvg + qov_cox * dcoxeff_dvg;
+            let csg0 = cox_wl_cen * t5p.mul_add(dvdseff_cv_dvg, t4p);
+            let csd0 = qov_cox.mul_add(
+                dcoxeff_dvd,
+                csg0.mul_add(dvgsteff_dvd, cox_wl_cen * t5p * dvdseff_cv_dvd),
+            );
+            let csb0 = qov_cox.mul_add(
+                dcoxeff_dvb,
+                csg0.mul_add(
+                    dvgsteff_dvb,
+                    cox_wl_cen * t6p.mul_add(dabulk_cv_dvb, t5p * dvdseff_cv_dvb),
+                ),
+            );
+            let csg1 = qov_cox.mul_add(dcoxeff_dvg, csg0 * dvgsteff_dvg);
             qsrc = qsrc0;
             csg = csg1;
             csd = csd0;
@@ -489,22 +527,35 @@ impl ChargeModel<'_> {
             // 40/60 partition, C's default (`b3set.c` xpart = 0).
             let t2 = t2 / 12.0;
             let t3 = 0.5 * cox_wl_cen / (t2 * t2);
-            let t4 =
-                t1 * (2.0 * t0 * t0 / 3.0 + t1 * (t1 - 4.0 * t0 / 3.0)) - 2.0 * t0 * t0 * t0 / 15.0;
+            let t4 = f64::mul_add(
+                t1,
+                f64::mul_add(t1, t1 - 4.0 * t0 / 3.0, 2.0 * t0 * t0 / 3.0),
+                -(2.0 * t0 * t0 * t0 / 15.0),
+            );
             let qsrc0 = -t3 * t4;
             let qov_cox = qsrc0 / coxeff;
-            let t8 = 4.0 / 3.0 * t1 * (t1 - t0) + 0.4 * t0 * t0;
-            let t5 =
-                -2.0 * qsrc0 / t2 - t3 * (t1 * (3.0 * t1 - 8.0 * t0 / 3.0) + 2.0 * t0 * t0 / 3.0);
-            let t6 = abulk_cv * (qsrc0 / t2 + t3 * t8);
+            let t8 = (0.4 * t0).mul_add(t0, 4.0 / 3.0 * t1 * (t1 - t0));
+            let t5 = t3.mul_add(
+                -f64::mul_add(
+                    t1,
+                    3.0f64.mul_add(t1, -(8.0 * t0 / 3.0)),
+                    2.0 * t0 * t0 / 3.0,
+                ),
+                -2.0 * qsrc0 / t2,
+            );
+            let t6 = abulk_cv * t3.mul_add(t8, qsrc0 / t2);
             let t7 = t6 * vdseff_cv / abulk_cv;
-            let csg0 = t5 * dvgdp_dvg + t6 * dvdseff_cv_dvg;
-            let csd0 = csg0 * dvgsteff_dvd + t6 * dvdseff_cv_dvd + qov_cox * dcoxeff_dvd;
-            let csb0 = csg0 * dvgsteff_dvb
-                + t6 * dvdseff_cv_dvb
-                + t7 * dabulk_cv_dvb
-                + qov_cox * dcoxeff_dvb;
-            let csg1 = csg0 * dvgsteff_dvg + qov_cox * dcoxeff_dvg;
+            let csg0 = t6.mul_add(dvdseff_cv_dvg, t5 * dvgdp_dvg);
+            let csd0 =
+                qov_cox.mul_add(dcoxeff_dvd, t6.mul_add(dvdseff_cv_dvd, csg0 * dvgsteff_dvd));
+            let csb0 = qov_cox.mul_add(
+                dcoxeff_dvb,
+                t7.mul_add(
+                    dabulk_cv_dvb,
+                    t6.mul_add(dvdseff_cv_dvb, csg0 * dvgsteff_dvb),
+                ),
+            );
+            let csg1 = qov_cox.mul_add(dcoxeff_dvg, csg0 * dvgsteff_dvg);
             qsrc = qsrc0;
             csg = csg1;
             csd = csd0;
@@ -549,21 +600,8 @@ impl ChargeModel<'_> {
         let ck = p.binned.ckappa;
         let vgd = vgs - vds;
 
-        let t0 = vgd + DELTA_1;
-        let t1 = (t0 * t0 + 4.0 * DELTA_1).sqrt();
-        let t2 = 0.5 * (t0 - t1);
-        let t3 = p.weff_cv * p.binned.cgdl;
-        let t4 = (1.0 - 4.0 * t2 / ck).sqrt();
-        let cgdo = cgdo_param + t3 - t3 * (1.0 - 1.0 / t4) * (0.5 - 0.5 * t0 / t1);
-        let qgdo = (cgdo_param + t3) * vgd - t3 * (t2 + 0.5 * ck * (t4 - 1.0));
-
-        let t0 = vgs + DELTA_1;
-        let t1 = (t0 * t0 + 4.0 * DELTA_1).sqrt();
-        let t2 = 0.5 * (t0 - t1);
-        let t3 = p.weff_cv * p.binned.cgsl;
-        let t4 = (1.0 - 4.0 * t2 / ck).sqrt();
-        let cgso = cgso_param + t3 - t3 * (1.0 - 1.0 / t4) * (0.5 - 0.5 * t0 / t1);
-        let qgso = (cgso_param + t3) * vgs - t3 * (t2 + 0.5 * ck * (t4 - 1.0));
+        let (cgdo, qgdo) = overlap_cv(vgd, cgdo_param, p.weff_cv * p.binned.cgdl, ck);
+        let (cgso, qgso) = overlap_cv(vgs, cgso_param, p.weff_cv * p.binned.cgsl, ck);
 
         let cgbo = p.derived.cgbo;
 
@@ -667,6 +705,28 @@ fn junction_zero_bias(
     }
 }
 
+/// Bias-dependent overlap charge and its derivative. Rationalized
+/// square-root offsets retain the small correction for large positive bias.
+fn overlap_cv(v: Real, base: Real, extra: Real, kappa: Real) -> (Real, Real) {
+    let offset = v + DELTA_1;
+    let root = offset.mul_add(offset, 4.0 * DELTA_1).sqrt();
+    let negative_half = if offset > 0.0 {
+        -2.0 * DELTA_1 / (offset + root)
+    } else {
+        0.5 * (offset - root)
+    };
+    let ratio = -4.0 * negative_half / kappa;
+    let secondary = (1.0 + ratio).sqrt();
+    let secondary_offset = ratio / (secondary + 1.0);
+    let correction = secondary_offset / secondary * (-negative_half / root);
+    let capacitance = extra.mul_add(-correction, base + extra);
+    let charge = extra.mul_add(
+        -negative_half * (secondary_offset / (secondary + 1.0)),
+        (base + extra) * v,
+    );
+    (capacitance, charge)
+}
+
 /// `b3ld.c`'s source/drain bulk junction C-V for one junction, returning
 /// `(charge, capacitance)`.
 #[expect(
@@ -696,20 +756,25 @@ fn junction_cv(
             (czswg, mjswg, phibswg),
         ] {
             if cz > 0.0 {
-                let arg = 1.0 - v / phi;
-                let sarg = if m == 0.5 {
-                    1.0 / arg.sqrt()
+                let relative = -v / phi;
+                let arg = 1.0 + relative;
+                let (sarg, integral) = if m == 0.5 {
+                    let root = arg.sqrt();
+                    // 2*(1 - sqrt(1+x)) = -2*x/(1 + sqrt(1+x)).
+                    (1.0 / root, -2.0 * (relative / (1.0 + root)))
                 } else {
-                    (-m * arg.ln()).exp()
+                    let log = relative.ln_1p();
+                    let exponent = 1.0 - m;
+                    ((-m * log).exp(), -(exponent * log).exp_m1() / exponent)
                 };
-                charge += phi * cz * (1.0 - arg * sarg) / (1.0 - m);
-                cap += cz * sarg;
+                charge = f64::mul_add(phi * cz, integral, charge);
+                cap = cz.mul_add(sarg, cap);
             }
         }
         (charge, cap)
     } else {
         let t0 = czb + czsw + czswg;
         let t1 = v * (czb * mj / phib + czsw * mjsw / phibsw + czswg * mjswg / phibswg);
-        (v * (t0 + 0.5 * t1), t0 + t1)
+        (v * 0.5f64.mul_add(t1, t0), t0 + t1)
     }
 }

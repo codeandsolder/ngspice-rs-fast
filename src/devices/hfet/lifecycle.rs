@@ -265,10 +265,6 @@ pub(super) struct ChargeStep<const N: usize> {
 /// Incremental charge storage shared by the three families. HFET1 supplies
 /// an additional drain-source branch. Seed all accepted charges before
 /// accumulation, integrate in the supplied order, then seed all derivatives.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "preserve non-fused incremental charge arithmetic"
-)]
 #[expect(clippy::float_cmp, reason = "C companion timestep identity is exact")]
 pub(super) fn charge_step<const N: usize>(
     states: &mut DeviceState<'_>,
@@ -289,8 +285,10 @@ pub(super) fn charge_step<const N: usize>(
         }
     }
     let branches = inputs.map(|input| {
-        let charge =
-            accepted(states, input.slot, 0.) + input.capacitance * (input.voltage - input.previous);
+        let charge = input.capacitance.mul_add(
+            input.voltage - input.previous,
+            accepted(states, input.slot, 0.),
+        );
         ChargeBranch::new(input.slot, charge, input.capacitance)
     });
     if seed {

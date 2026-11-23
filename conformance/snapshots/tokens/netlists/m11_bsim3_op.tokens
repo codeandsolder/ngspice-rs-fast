@@ -115,7 +115,7 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 27 10:8 number "0.3694" value=3.694e-1
   token 28 10:15 word "k1"
   token 29 10:17 equals "="
-  token 30 10:18 number "0.5789" value=5.789000000000001e-1
+  token 30 10:18 number "0.5789" value=5.789e-1
   token 31 10:25 word "k2"
   token 32 10:27 equals "="
   token 33 10:28 number "1.10e-3" value=1.1e-3
@@ -124,13 +124,13 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 36 10:39 number "1e-3" value=1e-3
   token 37 10:44 word "k3b"
   token 38 10:47 equals "="
-  token 39 10:48 number "0.0295" value=2.9500000000000002e-2
+  token 39 10:48 number "0.0295" value=2.95e-2
   token 40 10:55 word "w0"
   token 41 10:57 equals "="
   token 42 10:58 number "1e-7" value=1e-7
   token 43 10:63 word "nlx"
   token 44 10:66 equals "="
-  token 45 10:67 number "1.919e-7" value=1.9190000000000002e-7
+  token 45 10:67 number "1.919e-7" value=1.919e-7
   token 46 10:76 word "dvt0w"
   token 47 10:81 equals "="
   token 48 10:82 number "0" value=0e0
@@ -142,7 +142,7 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 54 11:17 number "0" value=0e0
   token 55 11:19 word "dvt0"
   token 56 11:23 equals "="
-  token 57 11:24 number "1.0471" value=1.0471000000000001e0
+  token 57 11:24 number "1.0471" value=1.0471e0
   token 58 11:31 word "dvt1"
   token 59 11:35 equals "="
   token 60 11:36 number "0.3896" value=3.896e-1
@@ -160,13 +160,13 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 72 11:79 number "2.34e-18" value=2.34e-18
   token 73 12:3 word "uc"
   token 74 12:5 equals "="
-  token 75 12:6 number "5.42e-11" value=5.4200000000000004e-11
+  token 75 12:6 number "5.42e-11" value=5.42e-11
   token 76 12:15 word "vsat"
   token 77 12:19 equals "="
   token 78 12:20 number "1.07e5" value=1.07e5
   token 79 12:27 word "a0"
   token 80 12:29 equals "="
-  token 81 12:30 number "1.9" value=1.9000000000000001e0
+  token 81 12:30 number "1.9" value=1.9e0
   token 82 12:34 word "ags"
   token 83 12:37 equals "="
   token 84 12:38 number "0.42" value=4.2e-1
@@ -181,10 +181,10 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 93 12:68 number "-8.6e-3" value=-8.6e-3
   token 94 12:76 word "a1"
   token 95 12:78 equals "="
-  token 96 12:79 number "1.4e-4" value=1.4000000000000001e-4
+  token 96 12:79 number "1.4e-4" value=1.4e-4
   token 97 13:3 word "a2"
   token 98 13:5 equals "="
-  token 99 13:6 number "0.69" value=6.900000000000001e-1
+  token 99 13:6 number "0.69" value=6.9e-1
   token 100 13:11 word "rdsw"
   token 101 13:15 equals "="
   token 102 13:16 number "105" value=1.05e2
@@ -205,7 +205,7 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 117 13:56 number "1.69e-8" value=1.69e-8
   token 118 13:64 word "dwg"
   token 119 13:67 equals "="
-  token 120 13:68 number "-5.6e-9" value=-5.6000000000000005e-9
+  token 120 13:68 number "-5.6e-9" value=-5.6e-9
   token 121 13:76 word "dwb"
   token 122 13:79 equals "="
   token 123 13:80 number "6.1e-9" value=6.1e-9
@@ -220,7 +220,7 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 132 14:32 number "0" value=0e0
   token 133 14:34 word "cdsc"
   token 134 14:38 equals "="
-  token 135 14:39 number "2.4e-4" value=2.4000000000000003e-4
+  token 135 14:39 number "2.4e-4" value=2.4e-4
   token 136 14:46 word "cdscd"
   token 137 14:51 equals "="
   token 138 14:52 number "0" value=0e0
@@ -229,13 +229,13 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 141 14:60 number "0" value=0e0
   token 142 14:62 word "eta0"
   token 143 14:66 equals "="
-  token 144 14:67 number "2.74e-3" value=2.7400000000000002e-3
+  token 144 14:67 number "2.74e-3" value=2.74e-3
   token 145 14:75 word "etab"
   token 146 14:79 equals "="
   token 147 14:80 number "6.39e-5" value=6.39e-5
   token 148 15:3 word "dsub"
   token 149 15:7 equals "="
-  token 150 15:8 number "0.0156" value=1.5600000000000001e-2
+  token 150 15:8 number "0.0156" value=1.56e-2
   token 151 15:15 word "pclm"
   token 152 15:19 equals "="
   token 153 15:20 number "0.739" value=7.39e-1
@@ -244,7 +244,7 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 156 15:34 number "0.209" value=2.09e-1
   token 157 15:40 word "pdiblc2"
   token 158 15:47 equals "="
-  token 159 15:48 number "2.62e-3" value=2.6200000000000004e-3
+  token 159 15:48 number "2.62e-3" value=2.62e-3
   token 160 15:56 word "pdiblcb"
   token 161 15:63 equals "="
   token 162 15:64 number "-0.1" value=-1e-1
@@ -256,7 +256,7 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 168 16:10 number "8.2e9" value=8.2e9
   token 169 16:16 word "pscbe2"
   token 170 16:22 equals "="
-  token 171 16:23 number "1.1e-8" value=1.1000000000000001e-8
+  token 171 16:23 number "1.1e-8" value=1.1e-8
   token 172 16:30 word "pvag"
   token 173 16:34 equals "="
   token 174 16:35 number "2.4e-2" value=2.4e-2
@@ -265,7 +265,7 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 177 16:48 number "0.01" value=1e-2
   token 178 16:53 word "rsh"
   token 179 16:56 equals "="
-  token 180 16:57 number "6.8" value=6.800000000000001e0
+  token 180 16:57 number "6.8" value=6.8e0
   token 181 16:61 word "prt"
   token 182 16:64 equals "="
   token 183 16:65 number "0" value=0e0
@@ -283,7 +283,7 @@ card 7 @netlists/m11_bsim3_op.cir:9:1 lines=9-19 continuations=10
   token 195 17:14 number "0.022" value=2.2e-2
   token 196 17:20 word "ua1"
   token 197 17:23 equals "="
-  token 198 17:24 number "4.31e-9" value=4.309999999999999e-9
+  token 198 17:24 number "4.31e-9" value=4.31e-9
   token 199 17:32 word "ub1"
   token 200 17:35 equals "="
   token 201 17:36 number "-7.61e-18" value=-7.61e-18
@@ -367,7 +367,7 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 27 21:8 number "-0.39" value=-3.9e-1
   token 28 21:14 word "k1"
   token 29 21:16 equals "="
-  token 30 21:17 number "0.5789" value=5.789000000000001e-1
+  token 30 21:17 number "0.5789" value=5.789e-1
   token 31 21:24 word "k2"
   token 32 21:26 equals "="
   token 33 21:27 number "1.10e-3" value=1.1e-3
@@ -376,13 +376,13 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 36 21:38 number "1e-3" value=1e-3
   token 37 21:43 word "k3b"
   token 38 21:46 equals "="
-  token 39 21:47 number "0.0295" value=2.9500000000000002e-2
+  token 39 21:47 number "0.0295" value=2.95e-2
   token 40 21:54 word "w0"
   token 41 21:56 equals "="
   token 42 21:57 number "1e-7" value=1e-7
   token 43 21:62 word "nlx"
   token 44 21:65 equals "="
-  token 45 21:66 number "1.919e-7" value=1.9190000000000002e-7
+  token 45 21:66 number "1.919e-7" value=1.919e-7
   token 46 21:75 word "dvt0w"
   token 47 21:80 equals "="
   token 48 21:81 number "0" value=0e0
@@ -394,7 +394,7 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 54 22:17 number "0" value=0e0
   token 55 22:19 word "dvt0"
   token 56 22:23 equals "="
-  token 57 22:24 number "1.0471" value=1.0471000000000001e0
+  token 57 22:24 number "1.0471" value=1.0471e0
   token 58 22:31 word "dvt1"
   token 59 22:35 equals "="
   token 60 22:36 number "0.3896" value=3.896e-1
@@ -412,13 +412,13 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 72 22:77 number "2.34e-18" value=2.34e-18
   token 73 23:3 word "uc"
   token 74 23:5 equals "="
-  token 75 23:6 number "5.42e-11" value=5.4200000000000004e-11
+  token 75 23:6 number "5.42e-11" value=5.42e-11
   token 76 23:15 word "vsat"
   token 77 23:19 equals "="
   token 78 23:20 number "1.07e5" value=1.07e5
   token 79 23:27 word "a0"
   token 80 23:29 equals "="
-  token 81 23:30 number "1.9" value=1.9000000000000001e0
+  token 81 23:30 number "1.9" value=1.9e0
   token 82 23:34 word "ags"
   token 83 23:37 equals "="
   token 84 23:38 number "0.42" value=4.2e-1
@@ -433,10 +433,10 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 93 23:68 number "-8.6e-3" value=-8.6e-3
   token 94 23:76 word "a1"
   token 95 23:78 equals "="
-  token 96 23:79 number "1.4e-4" value=1.4000000000000001e-4
+  token 96 23:79 number "1.4e-4" value=1.4e-4
   token 97 24:3 word "a2"
   token 98 24:5 equals "="
-  token 99 24:6 number "0.69" value=6.900000000000001e-1
+  token 99 24:6 number "0.69" value=6.9e-1
   token 100 24:11 word "rdsw"
   token 101 24:15 equals "="
   token 102 24:16 number "105" value=1.05e2
@@ -457,7 +457,7 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 117 24:56 number "1.69e-8" value=1.69e-8
   token 118 24:64 word "dwg"
   token 119 24:67 equals "="
-  token 120 24:68 number "-5.6e-9" value=-5.6000000000000005e-9
+  token 120 24:68 number "-5.6e-9" value=-5.6e-9
   token 121 24:76 word "dwb"
   token 122 24:79 equals "="
   token 123 24:80 number "6.1e-9" value=6.1e-9
@@ -472,7 +472,7 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 132 25:32 number "0" value=0e0
   token 133 25:34 word "cdsc"
   token 134 25:38 equals "="
-  token 135 25:39 number "2.4e-4" value=2.4000000000000003e-4
+  token 135 25:39 number "2.4e-4" value=2.4e-4
   token 136 25:46 word "cdscd"
   token 137 25:51 equals "="
   token 138 25:52 number "0" value=0e0
@@ -481,13 +481,13 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 141 25:60 number "0" value=0e0
   token 142 25:62 word "eta0"
   token 143 25:66 equals "="
-  token 144 25:67 number "2.74e-3" value=2.7400000000000002e-3
+  token 144 25:67 number "2.74e-3" value=2.74e-3
   token 145 25:75 word "etab"
   token 146 25:79 equals "="
   token 147 25:80 number "6.39e-5" value=6.39e-5
   token 148 26:3 word "dsub"
   token 149 26:7 equals "="
-  token 150 26:8 number "0.0156" value=1.5600000000000001e-2
+  token 150 26:8 number "0.0156" value=1.56e-2
   token 151 26:15 word "pclm"
   token 152 26:19 equals "="
   token 153 26:20 number "0.739" value=7.39e-1
@@ -496,7 +496,7 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 156 26:34 number "0.209" value=2.09e-1
   token 157 26:40 word "pdiblc2"
   token 158 26:47 equals "="
-  token 159 26:48 number "2.62e-3" value=2.6200000000000004e-3
+  token 159 26:48 number "2.62e-3" value=2.62e-3
   token 160 26:56 word "pdiblcb"
   token 161 26:63 equals "="
   token 162 26:64 number "-0.1" value=-1e-1
@@ -508,7 +508,7 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 168 27:10 number "8.2e9" value=8.2e9
   token 169 27:16 word "pscbe2"
   token 170 27:22 equals "="
-  token 171 27:23 number "1.1e-8" value=1.1000000000000001e-8
+  token 171 27:23 number "1.1e-8" value=1.1e-8
   token 172 27:30 word "pvag"
   token 173 27:34 equals "="
   token 174 27:35 number "2.4e-2" value=2.4e-2
@@ -517,7 +517,7 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 177 27:48 number "0.01" value=1e-2
   token 178 27:53 word "rsh"
   token 179 27:56 equals "="
-  token 180 27:57 number "6.8" value=6.800000000000001e0
+  token 180 27:57 number "6.8" value=6.8e0
   token 181 27:61 word "prt"
   token 182 27:64 equals "="
   token 183 27:65 number "0" value=0e0
@@ -535,7 +535,7 @@ card 8 @netlists/m11_bsim3_op.cir:20:1 lines=20-30 continuations=10
   token 195 28:14 number "0.022" value=2.2e-2
   token 196 28:20 word "ua1"
   token 197 28:23 equals "="
-  token 198 28:24 number "4.31e-9" value=4.309999999999999e-9
+  token 198 28:24 number "4.31e-9" value=4.31e-9
   token 199 28:32 word "ub1"
   token 200 28:35 equals "="
   token 201 28:36 number "-7.61e-18" value=-7.61e-18

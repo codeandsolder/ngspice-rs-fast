@@ -249,7 +249,7 @@ comment at the divergence site.
 
 | Divergence | Reason |
 | --- | --- |
-| `parse_spice_number_prefix()` consumes `MEG`/`MIL` in full, while `INPevaluate()` leaves those letters unconsumed | `INPevaluate()` returns a value and a rest pointer; consumers (`inpcom.c` scale scanning, `INPevaluateRKM_*`) do the skipping themselves. The Rust API reports bytes consumed, so it consumes the whole recognised suffix. The numeric result is identical. |
+| `parse_spice_number_prefix()` consumes `MEG`/`MIL` in full, while `INPevaluate()` leaves those letters unconsumed | `INPevaluate()` returns a value and a rest pointer; consumers (`inpcom.c` scale scanning, `INPevaluateRKM_*`) do the skipping themselves. The Rust API reports bytes consumed, so it consumes the whole recognised suffix. The suffix grammar is identical; the port rounds the exact scaled decimal once instead of reproducing the C accumulator. |
 | RKM-style literals (`4k7` meaning `4.7k`, `inp2r.c`/`inp2c.c`/`inp2l.c`) are **not** accepted | Not ported yet; `parse_spice_number("4k7")` returns `None` and the semantic parser returns `NotYetPorted`. Tests pin this so the change is deliberate. |
 | Scalar grammars reject non-finite numeric literals instead of passing them to a device | Input validation prevents overflow/NaN from entering the solver; errors retain token locations. |
 | `gnd` aliasing is restricted to port positions, after model-name disambiguation | C's `inp_fix_gnd_name()` does a broader delimiter-based replacement in card text, including model identifiers. The AST deliberately preserves model/parameter spelling. Reserved-name collisions between `gnd` and `0` are not C-parity-proven. |

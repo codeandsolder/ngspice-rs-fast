@@ -581,3 +581,109 @@ fn the_registry_reports_a_bounded_y() {
     ));
     assert!(!entry.description.is_empty());
 }
+
+#[test]
+fn txl_fallback_and_native_plans_have_exact_distinct_resource_costs() {
+    use ngspice_rs::devices::{ElaborationLimits, ModelResolver};
+    for (body, limits, fallback) in [
+        (
+            LADDER,
+            ElaborationLimits {
+                devices: 9,
+                nodes: 4,
+                state_slots: 8,
+            },
+            true,
+        ),
+        (
+            PADE,
+            ElaborationLimits {
+                devices: 3,
+                nodes: 2,
+                state_slots: 0,
+            },
+            false,
+        ),
+    ] {
+        let parsed = deck(body).unwrap();
+        let models = ModelResolver::new(&parsed.models).unwrap();
+        let mut c = Circuit::with_elaboration_limits(limits);
+        c.add_instances(&parsed.devices, &models, &Default::default())
+            .unwrap();
+        c.finalize().unwrap();
+        assert_eq!(c.device_count(), limits.devices);
+        assert_eq!(c.nodes().len() - 1, limits.nodes);
+        assert_eq!(c.state_len(), limits.state_slots);
+        assert_eq!(c.device("y1").is_none(), fallback);
+        let reference = circuit(body).unwrap();
+        assert_eq!(c.unknown_names(), reference.unknown_names());
+        let too_small = [
+            ElaborationLimits {
+                devices: limits.devices - 1,
+                ..limits
+            },
+            ElaborationLimits {
+                nodes: limits.nodes - 1,
+                ..limits
+            },
+        ];
+        for limit in too_small {
+            let mut c = Circuit::with_elaboration_limits(limit);
+            let error = c
+                .add_instances(&parsed.devices, &models, &Default::default())
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("elaboration resource limit"),
+                "{error}"
+            );
+            assert_eq!(c.device_count(), 0);
+            assert_eq!(c.nodes().len(), 1);
+        }
+        if fallback {
+            let mut c = Circuit::with_elaboration_limits(ElaborationLimits {
+                state_slots: 7,
+                ..limits
+            });
+            let error = c
+                .add_instances(&parsed.devices, &models, &Default::default())
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("8 state slots exceed 7"),
+                "{error}"
+            );
+            assert_eq!(c.device_count(), 0);
+            assert_eq!(c.nodes().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn shared_model_defaults_do_not_capture_instance_lengths() {
+    let parsed = deck(
+        "y1 a 0 b 0 m\ny2 b 0 c 0 m len=3\ny3 c 0 d 0 m len=0\ny4 c 0 e 0 m\n.model m txl r=1 l=250e-9 c=100e-12 g=0 length=1 len=2 len=4",
+    )
+    .unwrap();
+    let models = ngspice_rs::devices::ModelResolver::new(&parsed.models).unwrap();
+    let context = ngspice_rs::devices::ModelContext::default();
+    let mut c = Circuit::new();
+    c.add_instances(&parsed.devices[..2], &models, &context)
+        .unwrap();
+    let length = |c: &Circuit, name| {
+        c.device(name)
+            .unwrap()
+            .observation_parameter("length", &context)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(length(&c, "y1"), 2.);
+    assert_eq!(length(&c, "y2"), 3.);
+    assert!(
+        c.add_instances(&parsed.devices[2..3], &models, &context)
+            .is_err()
+    );
+    assert_eq!(c.device_count(), 2);
+    c.add_instances(&parsed.devices[3..], &models, &context)
+        .unwrap();
+    assert_eq!(length(&c, "y4"), 2.);
+    assert_eq!(c.device_count(), 3);
+}

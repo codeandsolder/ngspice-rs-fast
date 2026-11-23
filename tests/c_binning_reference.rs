@@ -13,21 +13,15 @@
 //!
 //! Ordinary `cargo test` never needs C: everything here is `#[ignore]`d.
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use ngspice_rs::devices::ModelResolver;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::SpiceError;
-
-struct Cleanup(PathBuf);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 const BINS: &str = "\
 .model nch.1 nmos level=8 version=3.3 lmin=0.5u lmax=1u wmin=0.5u wmax=5u vth0=0.3
@@ -42,18 +36,13 @@ fn c_selection(tag: usize, body: &str) -> Option<String> {
         Path::new(&binary).is_absolute(),
         "NGSPICE_BIN must be absolute"
     );
-    let dir = std::env::temp_dir().join(format!("spice-binning-{}-{tag}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).unwrap();
-    let _cleanup = Cleanup(dir.clone());
+    let scratch =
+        Scratch::new("c-binning-reference").unwrap_or_else(|error| panic!("{tag}: {error}"));
+    let dir = scratch.path();
     let deck =
         format!("c\nvd d 0 1\nvg g 0 1\n{body}.control\nop\nshow all : model\nquit\n.endc\n.end\n");
     fs::write(dir.join("c.cir"), deck).unwrap();
-    let output = Command::new(&binary)
-        .args(["-b", "c.cir"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let output = run(&binary, dir, &["-b", "c.cir"], ProcessLimits::ORACLE).unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

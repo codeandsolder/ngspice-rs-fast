@@ -16,59 +16,54 @@
 //!   cargo test -p ngspice-rs --test c_noise_reference -- --ignored
 //! ```
 
+use ngspice_conformance::fixtures::DeckInputs;
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use ngspice_rs::analysis::{Plot, RawFile};
 
-fn workspace() -> PathBuf {
-    ngspice_conformance::fixtures::workspace_root().unwrap()
-}
-
-struct Cleanup(PathBuf);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Runs `deck_text` through C batch mode and `spice-rs simulate`; returns
+/// Runs the selected reference and original inputs; returns
 /// (Rust, C) rawfiles.
-fn run_both(name: &str, deck_text: &str) -> (RawFile, RawFile) {
+fn run_both(name: &str, inputs: &DeckInputs<'_>) -> (RawFile, RawFile) {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
-    let directory =
-        std::env::temp_dir().join(format!("spice-rs-c-noise-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    let _cleanup = Cleanup(directory.clone());
+    let scratch = Scratch::new("c-noise-reference").unwrap();
+    let directory = scratch.path();
     let deck = directory.join("deck.cir");
-    fs::write(&deck, deck_text).unwrap();
-    if deck_text.contains("set ngbehavior=s3") {
+    fs::write(&deck, inputs.reference()).unwrap();
+    if inputs.reference().contains("set ngbehavior=s3") {
         // newcompat is set before device setup in C, via its initialization file.
         fs::write(directory.join(".spiceinit"), "set ngbehavior=s3\n").unwrap();
     }
-    let c = Command::new(&binary)
-        .args(["-b", "-r", "c.raw", "deck.cir"])
-        .current_dir(&directory)
-        .output()
-        .expect("the C ngspice runs");
+    let c = run(
+        &binary,
+        directory,
+        &["-b", "-r", "c.raw", "deck.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .expect("the C ngspice runs");
     assert!(
         c.status.success(),
         "{name}: ngspice failed:\n{}\n{}",
         String::from_utf8_lossy(&c.stdout),
         String::from_utf8_lossy(&c.stderr)
     );
-    let rust = Command::new(
+    let rust_deck = directory.join("rust.cir");
+    fs::write(&rust_deck, inputs.rust()).unwrap();
+    let rust = run(
         std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
+        directory,
+        &[
+            std::ffi::OsStr::new("simulate"),
+            std::ffi::OsStr::new("--output"),
+            directory.join("rust.raw").as_os_str(),
+            rust_deck.as_os_str(),
+        ],
+        ProcessLimits::ORACLE,
     )
-    .arg("simulate")
-    .arg("--output")
-    .arg(directory.join("rust.raw"))
-    .arg(&deck)
-    .output()
     .expect("spice-rs runs");
     assert!(
         rust.status.success(),
@@ -85,12 +80,21 @@ fn is_noise(plot: &Plot) -> bool {
     plot.plotname.contains("Noise")
 }
 
-fn compare(name: &str, deck_text: &str) {
-    let (got, want) = run_both(name, deck_text);
+fn compare(name: &str, inputs: &DeckInputs<'_>) {
+    let (got, want) = run_both(name, inputs);
+    compare_rawfiles(name, &got, &want, None);
+}
+
+fn compare_rawfiles(
+    name: &str,
+    got: &RawFile,
+    want: &RawFile,
+    integrated_reference: Option<&BTreeMap<String, f64>>,
+) {
     let titles = |raw: &RawFile| -> Vec<String> {
         raw.plots.iter().map(|p| p.plot.plotname.clone()).collect()
     };
-    assert_eq!(titles(&got), titles(&want), "{name}: plot sequence");
+    assert_eq!(titles(got), titles(want), "{name}: plot sequence");
     for (index, (got, want)) in got.plots.iter().zip(&want.plots).enumerate() {
         let (got, want) = (&got.plot, &want.plot);
         assert_eq!(got.flags(), want.flags(), "{name}: plot {index}");
@@ -125,11 +129,17 @@ fn compare(name: &str, deck_text: &str) {
                     &variable.name,
                     [b.re, b.im],
                 );
-                let reference = ngspice_rs::primitives::Complex::new(re, im);
+                let reference = if want.plotname == "Integrated Noise"
+                    && let Some(reference) = integrated_reference
+                {
+                    ngspice_rs::primitives::Complex::real(reference[&variable.name])
+                } else {
+                    ngspice_rs::primitives::Complex::new(re, im)
+                };
                 let difference = (*a - reference).magnitude();
                 assert!(
                     difference <= 1e-6 * reference.magnitude() + floor,
-                    "{name}: plot {index} '{}' point {point}: {a} != {b}",
+                    "{name}: plot {index} '{}' point {point}: {a} != {reference}",
                     variable.name
                 );
             }
@@ -137,10 +147,126 @@ fn compare(name: &str, deck_text: &str) {
     }
 }
 
+/// Independently integrate ordinary full-summary oracle samples. This
+/// deliberately uses the elementary antiderivative of a*f^k, rather than
+/// the production log-mean/exponent-scaling implementation. On the bounded
+/// C fixtures all endpoint products and powers are representable.
+fn reference_area(f0: f64, f1: f64, y0: f64, y1: f64, c_floor: bool) -> f64 {
+    const FLOOR: f64 = 1e-38;
+    let (a, b) = if c_floor || y0 <= 0. || y1 <= 0. {
+        (y0.max(FLOOR), y1.max(FLOOR))
+    } else {
+        (y0, y1)
+    };
+    let log_width = (f1 / f0).ln();
+    let k = (b.ln() - a.ln()) / log_width;
+    if a.to_bits() == b.to_bits() || (c_floor && k.abs() < 1e-10) {
+        y1 * (f1 - f0)
+    } else if (k + 1.).abs() < 1e-10 {
+        f1 * b * log_width
+    } else {
+        (f1 * b - f0 * a) / (k + 1.)
+    }
+}
+
+/// Full-summary noise plots expose every individual generator's output
+/// amplitude and the total output/input amplitudes at every frequency.
+/// Reconstruct the current input gain from the latter pair and independently
+/// integrate each generator. The explicit groups describe the expected
+/// device layout (some generators use dots, others underscores); totals
+/// must be sums of individual integrals, never fits of the summed spectrum.
+fn summary_integrals(
+    spectrum: &Plot,
+    integrated: &Plot,
+    groups: &[(&str, &[&str])],
+    c_floor: bool,
+) -> BTreeMap<String, f64> {
+    let values = |name: &str| -> Vec<f64> {
+        spectrum
+            .column(name)
+            .unwrap()
+            .iter()
+            .map(|x| x.re)
+            .collect()
+    };
+    let frequency = values("frequency");
+    let output = values("onoise_spectrum");
+    let input = values("inoise_spectrum");
+    let gain: Vec<_> = input
+        .iter()
+        .zip(&output)
+        .map(|(i, o)| (i / o).powi(2))
+        .collect();
+    let mut reference = BTreeMap::new();
+    let mut total = [0.; 2];
+    let mut insert = |suffix: &str, [out, input]: [f64; 2]| {
+        for (prefix, value) in [("onoise", out), ("inoise", input)] {
+            assert!(
+                reference
+                    .insert(format!("v({prefix}_total{suffix})"), value.sqrt())
+                    .is_none()
+            );
+        }
+    };
+    for &(instance, sources) in groups {
+        let mut instance_total = [0.; 2];
+        for &source in sources {
+            let suffix = format!("{instance}{source}");
+            let density: Vec<_> = values(&format!("onoise{suffix}"))
+                .into_iter()
+                .map(|amplitude| amplitude * amplitude)
+                .collect();
+            let mut area = [0.; 2];
+            for index in 1..frequency.len() {
+                let contribution = reference_area(
+                    frequency[index - 1],
+                    frequency[index],
+                    density[index - 1],
+                    density[index],
+                    c_floor,
+                );
+                area[0] += contribution;
+                area[1] += contribution * gain[index];
+            }
+            insert(&suffix, area);
+            for k in 0..2 {
+                instance_total[k] += area[k];
+                total[k] += area[k];
+            }
+        }
+        insert(instance, instance_total);
+    }
+    insert("", total);
+    assert_eq!(reference.len(), integrated.variable_count());
+    reference
+}
+
+fn compare_full_summary(name: &str, inputs: &DeckInputs<'_>, groups: &[(&str, &[&str])]) {
+    let (got, want) = run_both(name, inputs);
+    let [spectrum, integrated] = &want.plots[..] else {
+        panic!("expected spectrum and integrated plots");
+    };
+    let spectrum = &spectrum.plot;
+    let integrated = &integrated.plot;
+    // First confirm C itself follows the independently calculated floor
+    // convention. Then compare the port with the actual positive-density
+    // integrals of those very same C spectra, at unchanged tolerances.
+    let historical = summary_integrals(spectrum, integrated, groups, true);
+    for variable in integrated.variables() {
+        let expected = integrated.column(&variable.name).unwrap()[0].re;
+        let calculated = historical[&variable.name];
+        assert!(
+            (calculated - expected).abs() <= 1e-6 * expected.abs() + 1e-20,
+            "{name}: floor-aware reference {}: {calculated:e} != {expected:e}",
+            variable.name
+        );
+    }
+    let physical = summary_integrals(spectrum, integrated, groups, false);
+    compare_rawfiles(name, &got, &want, Some(&physical));
+}
+
 fn fixture(name: &str) {
-    let deck =
-        fs::read_to_string(workspace().join(format!("conformance/netlists/{name}.cir"))).unwrap();
-    compare(name, &deck);
+    compare(name, &DeckInputs::fixture(name).unwrap());
 }
 
 #[test]
@@ -177,24 +303,26 @@ fn bsim3_noise_sources_match_c_batch_mode() {
     ] {
         compare(
             &format!("bsim3-{tag}"),
-            &format!(
+            &DeckInputs::same(&format!(
                 "bsim3 noise {tag}\n\
                  vin g 0 dc 1.2 ac 1\nvdd d 0 1.8\nvs s 0 0\nrl d 0 10k\n\
                  m1 d g s 0 nn {instance}\n\
                  .model nn nmos level=8 cgdo=1e-10 cgso=1e-10 cj=1e-3 {extra}\n\
                  .options reltol=1e-6\n\
                  .noise v(d) vin dec 2 1k 10meg 1\n.end\n"
-            ),
+            )),
         );
     }
     compare(
         "bsim3-pmos",
-        "bsim3 noise pmos\n\
+        &DeckInputs::same(
+            "bsim3 noise pmos\n\
          vin g 0 dc -1.2 ac 1\nvdd d 0 -1.8\nvs s 0 0\nrl d 0 10k\n\
          m1 d g s 0 nn l=0.25u w=2u\n\
          .model nn pmos level=8 cgdo=1e-10 cgso=1e-10\n\
          .options reltol=1e-6\n\
          .noise v(d) vin dec 2 1k 10meg\n.end\n",
+        ),
     );
 }
 
@@ -203,7 +331,8 @@ fn bsim3_noise_sources_match_c_batch_mode() {
 fn mixed_devices_octave_sweeps_and_current_inputs_match_c() {
     compare(
         "mixed",
-        "mixed noise
+        &DeckInputs::same(
+            "mixed noise
 vcc vcc 0 5
 v1 in 0 dc 0.7 ac 1
 rb in b 10k
@@ -222,12 +351,14 @@ rd vcc out 10k
 .noise v(out) v1 oct 2 10 1meg 2
 .end
 ",
+        ),
     );
     // RF port sources (#105): C's VSRC has no noise routine, so the z0
     // terminations are noiseless; a port can be the input reference.
     compare(
         "ports",
-        "port noise
+        &DeckInputs::same(
+            "port noise
 v1 in 0 dc 0 ac 1 portnum 1 z0 50
 r1 in out 100
 r2 out 0 200
@@ -237,10 +368,12 @@ r3 out out2 1k
 .noise v(out) v1 dec 2 1k 10meg 1
 .end
 ",
+        ),
     );
     compare(
         "pnp_current",
-        "pnp current input
+        &DeckInputs::same(
+            "pnp current input
 vee vee 0 -5
 i1 0 b dc -10u ac 1
 rbias b 0 100k
@@ -252,6 +385,7 @@ rc c vee 2k
 .noise v(c) i1 dec 3 100 10meg 1
 .end
 ",
+        ),
     );
 }
 
@@ -260,21 +394,24 @@ rc c vee 2k
 fn equal_braced_noise_bounds_match_c() {
     compare(
         "braced_bounds",
-        "noise expressions\n.param f0=1k\nv1 in 0 ac 1\nr1 in out 1k\nr2 out 0 1k\n.noise v(out) v1 dec 2 {f0} {2*f0/2}\n.noise v(out) v1 dec 2 1k 10k\n.end\n",
+        &DeckInputs::same(
+            "noise expressions\n.param f0=1k\nv1 in 0 ac 1\nr1 in out 1k\nr2 out 0 1k\n.noise v(out) v1 dec 2 {f0} {2*f0/2}\n.noise v(out) v1 dec 2 1k 10k\n.end\n",
+        ),
     );
 }
 
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs C batch mode out of process"]
 fn large_bjt_bypass_matches_c_at_high_frequency() {
-    let deck = fs::read_to_string(workspace().join("conformance/netlists/noise_bjt.cir"))
+    let inputs = DeckInputs::fixture("noise_bjt")
         .unwrap()
-        .replace("ce e 0 1n", "ce e 0 10u")
-        .replace(
-            ".noise v(c) i1 dec 4 10 100meg 3",
-            ".ac dec 4 10meg 100meg\n.noise v(c) i1 dec 4 10meg 100meg 3",
-        );
-    compare("large_bypass", &deck);
+        .transformed(|deck| {
+            deck.replace("ce e 0 1n", "ce e 0 10u").replace(
+                ".noise v(c) i1 dec 4 10 100meg 3",
+                ".ac dec 4 10meg 100meg\n.noise v(c) i1 dec 4 10meg 100meg 3",
+            )
+        });
+    compare("large_bypass", &inputs);
 }
 
 #[test]
@@ -286,10 +423,10 @@ fn squared_noise_and_retained_bias_match_c() {
     ] {
         compare(
             &format!("squared-{name}"),
-            &format!(
+            &DeckInputs::same(&format!(
                 "squared noise\n{input}\n.options keepopinfo\n.noise v(out) {} dec 2 10 1k 1\n.control\nset sqrnoise\n.endc\n.end\n",
                 if name == "voltage" { "v1" } else { "i1" }
-            ),
+            )),
         );
     }
 }
@@ -321,10 +458,12 @@ r2 vdd o2 20k
 #[test]
 #[ignore = "requires NGSPICE_BIN"]
 fn mos3_noise_matches_c() {
-    compare("mos3", MOS3_NOISE);
+    compare("mos3", &DeckInputs::same(MOS3_NOISE));
     compare(
         "mos3-spice3",
-        &MOS3_NOISE.replace(".end\n", ".control\nset ngbehavior=s3\n.endc\n.end\n"),
+        &DeckInputs::same(
+            &MOS3_NOISE.replace(".end\n", ".control\nset ngbehavior=s3\n.endc\n.end\n"),
+        ),
     );
 }
 
@@ -355,10 +494,12 @@ r2 vdd o2 20k
 #[test]
 #[ignore = "requires NGSPICE_BIN"]
 fn mos2_noise_matches_c() {
-    compare("mos2", MOS2_NOISE);
+    compare("mos2", &DeckInputs::same(MOS2_NOISE));
     compare(
         "mos2-spice3",
-        &MOS2_NOISE.replace(".end\n", ".control\nset ngbehavior=s3\n.endc\n.end\n"),
+        &DeckInputs::same(
+            &MOS2_NOISE.replace(".end\n", ".control\nset ngbehavior=s3\n.endc\n.end\n"),
+        ),
     );
 }
 
@@ -387,28 +528,28 @@ r2 vdd o2 20k
 #[test]
 #[ignore = "requires NGSPICE_BIN"]
 fn mos9_noise_matches_c() {
-    compare("mos9", MOS9_NOISE);
+    compare("mos9", &DeckInputs::same(MOS9_NOISE));
     compare(
         "mos9-spice3",
-        &MOS9_NOISE.replace(".end\n", ".control\nset ngbehavior=s3\n.endc\n.end\n"),
+        &DeckInputs::same(
+            &MOS9_NOISE.replace(".end\n", ".control\nset ngbehavior=s3\n.endc\n.end\n"),
+        ),
     );
 }
 
 #[test]
 #[ignore = "requires NGSPICE_BIN"]
 fn spice3_mos1_flicker_matches_c() {
-    let deck = fs::read_to_string(workspace().join("conformance/netlists/noise_mos1.cir")).unwrap();
-    compare(
-        "mos1-spice3",
-        &deck.replace(".end", ".control\nset ngbehavior=s3\n.endc\n.end"),
-    );
+    let inputs = DeckInputs::fixture("noise_mos1")
+        .unwrap()
+        .transformed(|deck| deck.replace(".end", ".control\nset ngbehavior=s3\n.endc\n.end"));
+    compare("mos1-spice3", &inputs);
 }
 
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs C batch mode out of process"]
 fn bsim4_correlated_noise_preserves_ordered_generators_and_integration() {
-    let deck =
-        fs::read_to_string(workspace().join("conformance/netlists/m11_bsim4_noise.cir")).unwrap();
+    let inputs = DeckInputs::fixture("m11_bsim4_noise").unwrap();
     // Compare individual generators (including the frequency-local coherent
     // pair), totals and input referral over a frequency sweep, not just the
     // final output spectrum. Exercise both BSIM4 flicker formulations.
@@ -416,15 +557,29 @@ fn bsim4_correlated_noise_preserves_ordered_generators_and_integration() {
         ("bsim4-correlated-fnoimod0", "fnoimod=0 kf=1e-26"),
         ("bsim4-correlated-fnoimod1", "fnoimod=1"),
     ] {
-        let deck = deck
-            .replace(
+        let derived = inputs.transformed(|deck| {
+            deck.replace(
                 ".options reltol",
                 &format!("+ tnoimod=2 {flicker}\n.options reltol"),
             )
             .replace(
                 ".noise v(d) vg dec 4 1e3 1e10",
                 ".noise v(d) vg dec 4 1e3 1e10 1",
-            );
-        compare(name, &deck);
+            )
+        });
+        compare_full_summary(
+            name,
+            &derived,
+            &[
+                (
+                    ".m1",
+                    &[
+                        ".rd", ".rs", ".rg", ".rbps", ".rbpd", ".rbpb", ".rbsb", ".rbdb", ".id",
+                        ".1overf", ".igs", ".igd", ".igb", ".corl",
+                    ],
+                ),
+                ("_rl", &["_thermal", "_1overf"]),
+            ],
+        );
     }
 }

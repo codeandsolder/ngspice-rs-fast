@@ -3,21 +3,14 @@
 //!
 //! Run: `NGSPICE_BIN=/abs/path/ngspice cargo test -p ngspice-rs --test c_param_eval -- --ignored`
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::eval::ParamScope;
 use ngspice_rs::netlist::source::parse_deck_text;
-
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Runs C on `params` plus a source reading `{probe}`; `Err` when C fails.
 fn c_value(label: &str, params: &str, probe: &str) -> Result<f64, String> {
@@ -29,21 +22,19 @@ fn c_value(label: &str, params: &str, probe: &str) -> Result<f64, String> {
         workspace.join(binary)
     };
     let binary = binary.canonicalize().expect("reference binary exists");
-    let nonce = scratch_nonce();
-    let scratch = Scratch(
-        std::env::temp_dir().join(format!("spice-eval-{label}-{}-{nonce}", std::process::id())),
-    );
-    fs::create_dir_all(&scratch.0).unwrap();
+    let scratch = Scratch::new("c-param-eval").unwrap_or_else(|error| panic!("{label}: {error}"));
     let deck = format!(
         "eval probe\n{params}\nv1 1 0 dc {{{probe}}}\nr1 1 0 1\n\
          .control\nset numdgt=17\nop\nprint v(1)\nquit\n.endc\n.end\n"
     );
-    fs::write(scratch.0.join("probe.cir"), deck).unwrap();
-    let output = Command::new(binary)
-        .args(["-b", "probe.cir"])
-        .current_dir(&scratch.0)
-        .output()
-        .expect("run reference ngspice");
+    fs::write(scratch.path().join("probe.cir"), deck).unwrap();
+    let output = run(
+        binary,
+        scratch.path(),
+        &["-b", "probe.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .expect("run reference ngspice");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     stdout
         .lines()
@@ -137,21 +128,3 @@ fn failures_c_reports_are_errors_here_too() {
     assert!(rust_value(".param c={1/0}", "3").is_err());
     assert!(rust_value(".param c={sqrt(-1)}", "3").is_err());
 }
-
-/// A process-local counter appended to scratch directory names.
-///
-/// `SystemTime::now()` is coarsened on some platforms (1 ms on macOS), so the
-/// process id and the clock alone do not distinguish two tests of one binary
-/// that start in the same tick - and tests run in parallel, so two of them
-/// collided and `create_dir(...).unwrap()` panicked.
-static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(0);
-
-fn scratch_nonce() -> u128 {
-    let clock = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after the epoch")
-        .as_nanos();
-    clock + u128::from(SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed))
-}
-
-use std::sync::atomic::{AtomicU64, Ordering};

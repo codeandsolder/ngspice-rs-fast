@@ -10,7 +10,9 @@
 use crate::analysis::newton::{
     self, CircuitLoad, CircuitNewton, NewtonFailure, NewtonOptions, NewtonSolution, PhasePolicy,
 };
-use crate::devices::{Circuit, Forcing, IterationPhase, ModelContext, StateHistory, TrialState};
+use crate::devices::{
+    Circuit, Forcing, IterationPhase, ModelContext, PreparedRun, StateHistory, TrialState,
+};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -856,23 +858,32 @@ impl OperatingPointStart {
 
     pub(super) fn solve(
         &self,
-        circuit: &Circuit,
+        prepared: &PreparedRun<'_>,
         model: &ModelContext,
         settings: &DcSettings,
     ) -> SpiceResult<NewtonSolution<TrialState>> {
-        self.solve_from(circuit, model, settings, &self.seed)
+        self.solve_from(prepared, model, settings, &self.seed)
     }
 
     /// Another operating point in the same analysis: keep MODEINITJCT and
     /// MODEINITFIX node forcing, but warm-start from the previous solution.
     pub(super) fn solve_from(
         &self,
-        circuit: &Circuit,
+        prepared: &PreparedRun<'_>,
         model: &ModelContext,
         settings: &DcSettings,
         seed: &Vector,
     ) -> SpiceResult<NewtonSolution<TrialState>> {
-        Ok(solve_dc_forced(circuit, model, settings, &[], Some(seed), None, &self.nodes)?.solution)
+        Ok(solve_dc_forced_prepared(
+            prepared,
+            model,
+            settings,
+            &[],
+            Some(seed),
+            None,
+            &self.nodes,
+        )?
+        .solution)
     }
 }
 
@@ -953,15 +964,42 @@ pub fn solve_dc_forced(
     forcing: Option<Forcing>,
     nodes: &NodeForcing,
 ) -> Result<DcSolution, DcFailure> {
+    solve_dc_forced_prepared(
+        &circuit.prepare_run(),
+        context,
+        settings,
+        overrides,
+        initial,
+        forcing,
+        nodes,
+    )
+}
+
+pub(super) fn solve_dc_forced_prepared(
+    prepared: &PreparedRun<'_>,
+    context: &ModelContext,
+    settings: &DcSettings,
+    overrides: &[(&str, f64)],
+    initial: Option<&Vector>,
+    forcing: Option<Forcing>,
+    nodes: &NodeForcing,
+) -> Result<DcSolution, DcFailure> {
+    let history = prepared
+        .circuit()
+        .state_history()
+        .map_err(|error| DcFailure {
+            error,
+            report: Box::new(DcReport::default()),
+        })?;
     solve(
-        circuit,
+        prepared,
         context,
         settings,
         overrides,
         &Start {
             initial,
             forcing,
-            history: &circuit.state_history(),
+            history: &history,
             policy: PhasePolicy::OperatingPoint,
             nodes,
         },
@@ -986,7 +1024,7 @@ pub fn solve_dc_forced(
     reason = "keeps the positional interface explicit at the reference solver or device boundary"
 )]
 pub fn solve_dc_from(
-    circuit: &Circuit,
+    prepared: &PreparedRun<'_>,
     context: &ModelContext,
     settings: &DcSettings,
     overrides: &[(&str, f64)],
@@ -996,7 +1034,7 @@ pub fn solve_dc_from(
     nodes: &NodeForcing,
 ) -> Result<DcSolution, DcFailure> {
     solve(
-        circuit,
+        prepared,
         context,
         settings,
         overrides,
@@ -1021,14 +1059,14 @@ struct Start<'a> {
 }
 
 fn solve(
-    circuit: &Circuit,
+    prepared: &PreparedRun<'_>,
     context: &ModelContext,
     settings: &DcSettings,
     overrides: &[(&str, f64)],
     start: &Start<'_>,
 ) -> Result<DcSolution, DcFailure> {
     let mut report = DcReport::default();
-    match run(circuit, context, settings, overrides, start, &mut report) {
+    match run(prepared, context, settings, overrides, start, &mut report) {
         Ok(solution) => Ok(DcSolution { solution, report }),
         Err(error) => Err(DcFailure {
             error,
@@ -1072,7 +1110,7 @@ impl Point {
 }
 
 struct Engine<'a> {
-    circuit: &'a Circuit,
+    prepared: &'a PreparedRun<'a>,
     context: &'a ModelContext,
     history: &'a StateHistory,
     policy: PhasePolicy,
@@ -1329,7 +1367,7 @@ impl Engine<'_> {
             .map_or(*self.context, |junction| self.context.with_gmin(junction))
             .with_source_factor(scale);
         let result = CircuitNewton {
-            circuit: self.circuit,
+            prepared: self.prepared,
             context: &context,
             history: self.history,
             branch_rows: &self.branches,
@@ -1422,7 +1460,7 @@ impl Engine<'_> {
         if let Some(from) = from {
             self.stage(report, stage, &from.values, Some(from.trial.clone()))
         } else {
-            let zero = Vector::zeros(self.circuit.unknown_count());
+            let zero = Vector::zeros(self.prepared.circuit().unknown_count());
             self.stage(report, stage, &zero, None)
         }
     }
@@ -1637,13 +1675,14 @@ impl Engine<'_> {
 }
 
 fn run(
-    circuit: &Circuit,
+    prepared: &PreparedRun<'_>,
     context: &ModelContext,
     settings: &DcSettings,
     overrides: &[(&str, f64)],
     start: &Start<'_>,
     report: &mut DcReport,
 ) -> SpiceResult<NewtonSolution<TrialState>> {
+    let circuit = prepared.circuit();
     let Start {
         initial,
         forcing,
@@ -1684,7 +1723,7 @@ fn run(
     let zero = Vector::zeros(n);
     let mut loaded = *context;
     for (name, value) in overrides {
-        loaded = loaded.with_instance_override(circuit.source_override(name, *value, context)?)?;
+        loaded = loaded.with_instance_override(circuit.bind_source_override(name, *value)?)?;
     }
     let context = &loaded;
     // Linear circuits take the same CKTop/NIiter path as nonlinear ones, as
@@ -1700,7 +1739,7 @@ fn run(
     );
     report.budget = budget;
     let mut engine = Engine {
-        circuit,
+        prepared,
         context,
         history,
         policy: phases,

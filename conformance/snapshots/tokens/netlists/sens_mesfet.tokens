@@ -135,7 +135,7 @@ card 11 @netlists/sens_mesfet.cir:16:1 lines=16-16 continuations=0
   token 4 16:14 lparen "("
   token 5 16:15 word "vto"
   token 6 16:18 equals "="
-  token 7 16:19 number "-1.2" value=-1.2000000000000002e0
+  token 7 16:19 number "-1.2" value=-1.2e0
   token 8 16:24 word "beta"
   token 9 16:28 equals "="
   token 10 16:29 number "2m" value=2e-3

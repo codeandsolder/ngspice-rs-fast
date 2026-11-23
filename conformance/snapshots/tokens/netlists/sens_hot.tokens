@@ -21,8 +21,8 @@ card 2 @netlists/sens_hot.cir:7:1 lines=7-7 continuations=0
   token 8 7:19 number "1u" value=1e-6
   token 9 7:22 number "1u" value=1e-6
   token 10 7:25 number "1u" value=1e-6
-  token 11 7:28 number "10u" value=9.999999999999999e-6
-  token 12 7:32 number "20u" value=1.9999999999999998e-5
+  token 11 7:28 number "10u" value=1e-5
+  token 12 7:32 number "20u" value=2e-5
   token 13 7:35 rparen ")"
 card 3 @netlists/sens_hot.cir:8:1 lines=8-8 continuations=0
   raw: "vm in2 0 dc 1"
@@ -69,7 +69,7 @@ card 7 @netlists/sens_hot.cir:12:1 lines=12-12 continuations=0
   token 4 12:8 word "rm"
   token 5 12:11 word "l"
   token 6 12:12 equals "="
-  token 7 12:13 number "20u" value=1.9999999999999998e-5
+  token 7 12:13 number "20u" value=2e-5
   token 8 12:17 word "w"
   token 9 12:18 equals "="
   token 10 12:19 number "2u" value=2e-6

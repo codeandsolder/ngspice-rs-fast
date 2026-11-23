@@ -1,8 +1,9 @@
 //! Opt-in BSIM3 input-setter queries against C, not Rust simulation parity.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::devices::{ModelResolver, bsim3};
 use ngspice_rs::netlist::Parser;
@@ -10,13 +11,6 @@ use ngspice_rs::netlist::source::parse_deck_text;
 
 use ngspice_rs::devices::ModelContext;
 use ngspice_rs::devices::bsim3::{InputType, parameters};
-
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Query every canonical numeric model field, not just hand-picked defaults.
 /// C alone runs OP to expose its model fields; Rust only computes model defaults.
@@ -46,10 +40,9 @@ fn model_defaults_match_all_c_numeric_fields() {
         let commands = queries.chunks(24).map(|chunk| format!("print {}\n", chunk.join(" "))).collect::<String>();
         let polarity = f64::from(model.polarity);
         let text = format!("BSIM3 model defaults\nvd d 0 {}\nvg g 0 {}\nm1 d g 0 0 nn l=1u w=2u\n{model_line}\n.options tnom={nominal} temp=37\n.control\nset numdgt=17\nop\n{commands}quit\n.endc\n.end\n", 0.1 * polarity, polarity);
-        let directory = Scratch(std::env::temp_dir().join(format!("bsim3-defaults-{}-{index}", std::process::id())));
-        fs::create_dir_all(&directory.0).unwrap();
-        fs::write(directory.0.join("probe.cir"), text).unwrap();
-        let output = Command::new(&binary).args(["-b", "probe.cir"]).current_dir(&directory.0).output().unwrap();
+        let directory = Scratch::new("c-bsim3-schema-reference").unwrap();
+        fs::write(directory.path().join("probe.cir"), text).unwrap();
+        let output = run(&binary, directory.path(), &["-b", "probe.cir"], ProcessLimits::ORACLE).unwrap();
         let log = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success() && !log.contains("Error") && !log.contains("aborted"), "case {index}: {log}");
         let actual: BTreeMap<_, _> = log.lines().filter_map(|line| {
@@ -108,16 +101,15 @@ fn explicit_bsim3_setters_match_c_fields_for_both_level_aliases() {
             ".end\n",
             &format!(".control\nset numdgt=17\nop\nprint {queries}\nquit\n.endc\n.end\n"),
         );
-        let directory = Scratch(
-            std::env::temp_dir().join(format!("bsim3-setters-{}-{level}", std::process::id())),
-        );
-        fs::create_dir_all(&directory.0).unwrap();
-        fs::write(directory.0.join("probe.cir"), instrumented).unwrap();
-        let output = Command::new(&binary)
-            .args(["-b", "probe.cir"])
-            .current_dir(&directory.0)
-            .output()
-            .unwrap();
+        let directory = Scratch::new("c-bsim3-schema-reference").unwrap();
+        fs::write(directory.path().join("probe.cir"), instrumented).unwrap();
+        let output = run(
+            &binary,
+            directory.path(),
+            &["-b", "probe.cir"],
+            ProcessLimits::ORACLE,
+        )
+        .unwrap();
         let log = String::from_utf8_lossy(&output.stdout).into_owned()
             + &String::from_utf8_lossy(&output.stderr);
         assert!(

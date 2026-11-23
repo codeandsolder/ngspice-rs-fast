@@ -14,7 +14,7 @@ card 1 @netlists/m10_hfet1_dc.cir:2:1 lines=2-2 continuations=0
   token 8 2:17 number "1u" value=1e-6
   token 9 2:20 word "w"
   token 10 2:21 equals "="
-  token 11 2:22 number "10u" value=9.999999999999999e-6
+  token 11 2:22 number "10u" value=1e-5
 card 2 @netlists/m10_hfet1_dc.cir:3:1 lines=3-3 continuations=0
   raw: "vgs 2 0 dc 0.3"
   kind: device(v)
@@ -22,7 +22,7 @@ card 2 @netlists/m10_hfet1_dc.cir:3:1 lines=3-3 continuations=0
   token 2 3:5 number "2" value=2e0
   token 3 3:7 number "0" value=0e0
   token 4 3:9 word "dc"
-  token 5 3:12 number "0.3" value=3.0000000000000004e-1
+  token 5 3:12 number "0.3" value=3e-1
 card 3 @netlists/m10_hfet1_dc.cir:4:1 lines=4-4 continuations=0
   raw: "vds 1 0 dc 1.0"
   kind: device(v)
@@ -72,7 +72,7 @@ card 4 @netlists/m10_hfet1_dc.cir:5:1 lines=5-7 continuations=2
   token 36 7:10 number "0.1" value=1e-1
   token 37 7:14 word "vsigmat"
   token 38 7:21 equals "="
-  token 39 7:22 number "0.3" value=3.0000000000000004e-1
+  token 39 7:22 number "0.3" value=3e-1
   token 40 7:26 word "js1s"
   token 41 7:30 equals "="
   token 42 7:31 number "0" value=0e0

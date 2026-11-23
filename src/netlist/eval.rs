@@ -52,6 +52,12 @@
 //! unbounded expansion. [`ParamScope::for_netlist`] is the entry point for
 //! evaluating anything against a deck's top-level parameters and functions.
 
+mod plan;
+pub use plan::{
+    CandidateParameters, ParameterInput, ParameterPlan, ParameterScopeId, ParameterScopeSpec,
+    ParameterSlot,
+};
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -512,6 +518,12 @@ impl DependencyGraph {
     }
 }
 
+/// Resolution of one free name under the same shadowing rules as evaluation.
+enum DependencyReference<'a> {
+    Local(usize),
+    Parent(&'a str),
+}
+
 impl ScopeDefinitions<'_> {
     fn dependency_graph(
         &self,
@@ -519,6 +531,7 @@ impl ScopeDefinitions<'_> {
         scope_parent: Option<&ParamScope>,
         scope_functions: Option<&FunctionScope>,
         budget: &mut EvalBudget,
+        mut reference: impl FnMut(usize, DependencyReference<'_>),
     ) -> SpiceResult<DependencyGraph> {
         let Self {
             entries,
@@ -541,16 +554,16 @@ impl ScopeDefinitions<'_> {
                 continue;
             };
             scan.refs(&expr.root, 0, &mut |name, loc| {
-                let known = |n: &str| {
-                    active.get(n).is_some_and(|&j| j < binding_count)
-                        || scope_parent.is_some_and(|p| p.get(n).is_some())
-                };
                 if name != entries[i].name
                     && let Some(&j) = active.get(name)
-                    && j >= binding_count
                 {
-                    graph.add_dependency(i, j);
-                } else if !known(name) && undefined.is_none() {
+                    if j >= binding_count {
+                        graph.add_dependency(i, j);
+                    }
+                    reference(i, DependencyReference::Local(j));
+                } else if scope_parent.is_some_and(|p| p.get(name).is_some()) {
+                    reference(i, DependencyReference::Parent(name));
+                } else if undefined.is_none() {
                     undefined = Some((i, name, loc));
                 }
             })
@@ -580,6 +593,43 @@ impl ScopeDefinitions<'_> {
         }
 
         Ok(graph)
+    }
+
+    fn schedule(
+        &self,
+        parent: Option<&ParamScope>,
+        functions: Option<&FunctionScope>,
+        budget: &mut EvalBudget,
+        reference: impl FnMut(usize, DependencyReference<'_>),
+    ) -> SpiceResult<Vec<usize>> {
+        let entries = &self.entries;
+        let live: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, entry)| {
+                matches!(entry.state, DefinitionState::Pending(_)).then_some(i)
+            })
+            .collect();
+        let graph = self.dependency_graph(&live, parent, functions, budget, reference)?;
+        // Report the cycle containing the earliest definition.
+        if let Some(path) = graph.cycle() {
+            let start = path[0];
+            let chain: Vec<String> = path
+                .iter()
+                .map(|&n| format!("'{}' ({})", entries[n].name, entries[n].location))
+                .collect();
+            return Err(SpiceError::parse(
+                entries[start].location.clone(),
+                format!("circular parameter definition: {}", chain.join(" -> ")),
+            ));
+        }
+        // Evaluate by (dependency level, deck order) like inp_sort_params.
+        graph.evaluation_order().map_err(|entry| {
+            SpiceError::parse(
+                entries[entry].location.clone(),
+                "circular parameter definition",
+            )
+        })
     }
 }
 
@@ -697,44 +747,24 @@ impl ParamScope {
         policy: Bindings,
     ) -> SpiceResult<Self> {
         let defs = collect_definitions(bindings, cards, budget.limits, policy)?;
+        let sequence = defs.schedule(parent.as_deref(), functions.as_deref(), budget, |_, _| {})?;
+        Self::resolve_definitions(parent, functions, defs, sequence, budget)
+    }
+
+    fn resolve_definitions(
+        parent: Option<Arc<Self>>,
+        functions: Option<Arc<FunctionScope>>,
+        defs: ScopeDefinitions<'_>,
+        sequence: Vec<usize>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Self> {
         let scope_parent = parent.as_deref();
         let scope_functions = functions.as_deref();
-        let live: Vec<usize> = defs
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, entry)| {
-                matches!(entry.state, DefinitionState::Pending(_)).then_some(i)
-            })
-            .collect();
-
-        let graph = defs.dependency_graph(&live, scope_parent, scope_functions, budget)?;
         let ScopeDefinitions {
             mut entries,
             active,
             ..
         } = defs;
-        // Cycles: report the one containing the earliest definition.
-        if let Some(path) = graph.cycle() {
-            let start = path[0];
-            let chain: Vec<String> = path
-                .iter()
-                .map(|&n| format!("'{}' ({})", entries[n].name, entries[n].location))
-                .collect();
-            return Err(SpiceError::parse(
-                entries[start].location.clone(),
-                format!("circular parameter definition: {}", chain.join(" -> ")),
-            ));
-        }
-
-        // Evaluate by (dependency level, deck order) like inp_sort_params.
-        let sequence = graph.evaluation_order().map_err(|entry| {
-            SpiceError::parse(
-                entries[entry].location.clone(),
-                "circular parameter definition",
-            )
-        })?;
-
         for i in sequence {
             let DefinitionState::Pending(expr) = entries[i].state else {
                 return Err(SpiceError::circuit(format!(
@@ -751,15 +781,14 @@ impl ParamScope {
                 }
                 scope_parent.and_then(|p| p.get(n))
             };
-            let value = evaluate_root(expr, &lookup, scope_functions, budget).map_err(|f| {
-                f.context(|| {
-                    format!(
-                        "while evaluating parameter '{name}' defined at {}",
-                        entries[i].location
-                    )
-                })
-                .into_error()
-            })?;
+            let value = evaluate_definition(
+                expr,
+                &lookup,
+                scope_functions,
+                budget,
+                name,
+                &entries[i].location,
+            )?;
             entries[i].state = DefinitionState::Complete(ParamState::Resolved(value));
         }
         let entries = entries
@@ -1331,6 +1360,21 @@ fn evaluate_root(
         frame: None,
     };
     eval(&root.root, root, env, budget, 0)
+}
+
+fn evaluate_definition(
+    expression: &ParameterExpression,
+    lookup: Lookup<'_>,
+    functions: Option<&FunctionScope>,
+    budget: &mut EvalBudget,
+    name: &str,
+    location: &SourceLoc,
+) -> SpiceResult<Real> {
+    evaluate_root(expression, lookup, functions, budget).map_err(|failure| {
+        failure
+            .context(|| format!("while evaluating parameter '{name}' defined at {location}"))
+            .into_error()
+    })
 }
 
 fn snippet<'a>(root: &'a ParameterExpression, node: &Expr) -> &'a str {

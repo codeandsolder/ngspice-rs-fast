@@ -346,7 +346,7 @@ fn the_dc_jacobian_matches_finite_differences_over_a_bias_grid() {
     for body in bodies {
         let c = circuit(&body).unwrap();
         let context = ModelContext::default();
-        let history = c.state_history();
+        let history = c.state_history().unwrap();
         let solved = ngspice_rs::analysis::bias::solve_dc(
             &c,
             &context,
@@ -689,10 +689,8 @@ fn the_transient_jacobian_follows_mesloads_matrix() {
             None,
         )
         .unwrap();
-        let mut history = c.state_history();
-        for _ in 0..ngspice_rs::devices::ACCEPTED_DEPTH {
-            history.commit(solved.trial.clone()).unwrap();
-        }
+        let mut history = c.state_history().unwrap();
+        history.initialize(solved.trial).unwrap();
         let dt = 1e-9;
         let mut steps = StepHistory::new();
         let first = steps
@@ -918,7 +916,7 @@ fn gate_pencils_keep_reference_diagonal_scaling_and_statement_order() {
                 for (r, v) in [(d, 1.71), (g, -0.21), (s, 0.12), (dp, 1.6), (sp, 0.)] {
                     bias.as_mut_slice()[r] = v;
                 }
-                let history = c.state_history();
+                let history = c.state_history().unwrap();
                 let mut trial = history.trial();
                 c.load_device(
                     0,
@@ -960,9 +958,9 @@ fn gate_pencils_keep_reference_diagonal_scaling_and_statement_order() {
                 let (capgd, capgs) = (*capgd, *capgs);
                 let (gg, dd, ss) = if family == "nmf" {
                     (
-                        m * ggd + ggs,
-                        m * gdpr + gds + ggd,
-                        m * gspr + gds + gm + ggs,
+                        m.mul_add(ggd, ggs),
+                        m.mul_add(gdpr, gds) + ggd,
+                        m.mul_add(gspr, gds) + gm + ggs,
                     )
                 } else {
                     (
@@ -971,7 +969,9 @@ fn gate_pencils_keep_reference_diagonal_scaling_and_statement_order() {
                         m * (gspr + gds + gm + ggs),
                     )
                 };
-                // Independent literal statement order from mespzld.c / jfetpzld.c.
+                // Independent statement order from mespzld.c / jfetpzld.c.
+                // The MES diagonals retain their unusual partial M scaling,
+                // but evaluate its initial multiply/add with one rounding.
                 let expected = [
                     (d, d, m * gdpr, None),
                     (g, g, gg, Some(m * (capgd + capgs))),

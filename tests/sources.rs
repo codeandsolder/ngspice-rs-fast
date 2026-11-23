@@ -3,6 +3,7 @@ use ngspice_rs::netlist::ast::ScopedCardKind;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::netlist::{Parser, SourceLimits};
 use ngspice_rs::primitives::SpiceError;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,7 +78,7 @@ fn relative_sources_expand_in_order_and_inherit_the_insertion_scope() {
             .collect::<Vec<_>>(),
         ["q1", "r1"]
     );
-    assert!(n.models.is_empty());
+    assert_eq!(n.models, []);
     assert_eq!(s.models[0].name, "qm");
     assert_eq!(
         s.cards.iter().map(|c| c.kind).collect::<Vec<_>>(),
@@ -326,6 +327,7 @@ fn file_depth_byte_and_card_work_limits_include_repeated_sources() {
         files: 3,
         bytes: 56,
         cards: 4,
+        ..defaults
     };
     assert_eq!(
         Parser::new()
@@ -414,7 +416,7 @@ fn default_card_budget_accepts_a_large_flat_deck() {
     let f = Files::new();
     let mut deck = String::from("large flat deck\nv1 n0 0 1\n");
     for i in 0..149_997 {
-        deck.push_str(&format!("r{i} n{i} n{} 1\n", i + 1));
+        writeln!(deck, "r{i} n{i} n{} 1", i + 1).unwrap();
     }
     deck.push_str(".op\n.end\n");
     f.write("main.cir", &deck);
@@ -430,7 +432,7 @@ fn default_card_budget_stops_runaway_repeated_includes() {
     let f = Files::new();
     let mut body = String::new();
     for i in 0..2_000 {
-        body.push_str(&format!("r{i} a 0 1\n"));
+        writeln!(body, "r{i} a 0 1").unwrap();
     }
     f.write("body.inc", &body);
     let mut deck = String::from("runaway includes\n");

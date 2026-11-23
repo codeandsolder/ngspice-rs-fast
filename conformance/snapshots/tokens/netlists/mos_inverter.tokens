@@ -35,7 +35,7 @@ card 4 @netlists/mos_inverter.cir:5:1 lines=5-5 continuations=0
   token 6 5:19 word "nmos"
   token 7 5:24 word "w"
   token 8 5:25 equals "="
-  token 9 5:26 number "10u" value=9.999999999999999e-6
+  token 9 5:26 number "10u" value=1e-5
   token 10 5:30 word "l"
   token 11 5:31 equals "="
   token 12 5:32 number "1u" value=1e-6

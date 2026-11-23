@@ -81,8 +81,8 @@ pub(super) fn plot(
     for (name, unit) in names.into_iter().flatten() {
         plot.push_variable(var(name, unit));
     }
-    for name in circuit.observations() {
-        plot.push_variable(Variable::new(name, crate::devices::observe::unit(name)));
+    for observation in circuit.observations() {
+        plot.push_variable(Variable::new(observation.name(), observation.unit()));
     }
     Ok(plot.build())
 }
@@ -97,13 +97,14 @@ pub(super) fn op(
     // solve and cannot change a linear operating point. Both are validated.
     circuit.finalize()?;
     let model = context.model_context();
+    let prepared = circuit.prepare_run();
     let x = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?
-        .solve(circuit, &model, request.dc_settings())?
+        .solve(&prepared, &model, request.dc_settings())?
         .values;
     let mut plot = plot(circuit, "op1", "Operating Point", None, false)?;
     circuit.accept_solution(&x, None)?;
-    let history = circuit.state_history();
-    let values = circuit.observe_real(
+    let history = circuit.state_history()?;
+    let values = prepared.observe_real(
         &crate::devices::LoadRequest {
             mode: crate::devices::AnalysisMode::OperatingPoint,
             solution: &x,
@@ -121,6 +122,6 @@ pub(super) fn op(
     plot.push_point(&point)?;
     // dcop.c performs MODEINITSMSIG after CKTop. Publish its persistent
     // device fields for the next analysis, just as the AC preparation does.
-    circuit.record_small_signal_state(&model, &x)?;
+    prepared.record_small_signal_state(&model, &x)?;
     Ok(plot)
 }

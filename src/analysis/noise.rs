@@ -55,22 +55,26 @@ use crate::analysis::frequency::{Advance, FrequencyGrid, MAX_POINTS};
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{Plot, PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan};
-use crate::devices::noise::{InstanceNoise, circuit_noise, squared_gain};
+use crate::devices::noise::{InstanceNoise, prepared_noise, squared_gain};
 use crate::devices::{Circuit, LinearSystem, SourceKind};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
 
-/// C `N_MINLOG`: the smallest number whose logarithm is taken.
-const N_MINLOG: Real = 1e-38;
+mod integration;
+use integration::Interval;
+
 /// C `N_MINGAIN`: the smallest squared input-output gain.
 const N_MINGAIN: Real = 1e-20;
-/// C `N_INTFTHRESH`: the largest log-log slope still integrated as flat.
-const N_INTFTHRESH: Real = 1e-10;
-/// C `N_INTUSELOG`: the region around a slope of -1 integrated as `ln f`.
-const N_INTUSELOG: Real = 1e-10;
 /// The spectrum plot's title (`noisean.c`, without `sqrnoise`).
 pub const SPECTRUM_PLOTNAME: &str = "Noise Spectral Density Curves";
 /// The integrated plot's title (`noisean.c`, without `sqrnoise`).
 pub const INTEGRATED_PLOTNAME: &str = "Integrated Noise";
+
+fn noise_failure(message: &str) -> SpiceError {
+    SpiceError::Numerical {
+        context: ".noise".into(),
+        message: message.into(),
+    }
+}
 
 /// The frequency stepping of a `.noise` card (`NOISEAN.NstpType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,41 +274,6 @@ pub(super) fn parse(positional: &[String]) -> SpiceResult<NoiseCard> {
     })
 }
 
-/// `ninteg.c`'s per-step frequency data.
-struct Step {
-    width: Real,
-    log_end: Real,
-    log_start: Real,
-    log_width: Real,
-}
-
-/// C's `limexp`.
-fn limexp(x: Real) -> Real {
-    if x > 700. {
-        700f64.exp() * (1. + x - 700.)
-    } else {
-        x.exp()
-    }
-}
-
-/// `Nintegrate`: the integral of `a f^k` between the previous and the present
-/// frequency, given the density and its logarithm at both ends.
-fn nintegrate(density: Real, ln_density: Real, ln_last_density: Real, step: &Step) -> Real {
-    let mut exponent = (ln_density - ln_last_density) / step.log_width;
-    if exponent.abs() < N_INTFTHRESH {
-        density * step.width
-    } else {
-        let log_frequency_power = exponent * step.log_end;
-        let a = limexp(ln_density - log_frequency_power);
-        exponent += 1.;
-        if exponent.abs() < N_INTUSELOG {
-            a * (step.log_end - step.log_start)
-        } else {
-            a * ((limexp(exponent * step.log_end) - limexp(exponent * step.log_start)) / exponent)
-        }
-    }
-}
-
 /// Front-end representation of the same underlying noise powers. In C
 /// `CKTnoise` writes raw powers and only applies sqrt when sqrnoise is off.
 #[derive(Clone, Copy)]
@@ -390,9 +359,22 @@ struct Power {
 }
 
 impl Power {
-    fn add(&mut self, contribution: Self) {
-        self.output += contribution.output;
-        self.input += contribution.input;
+    fn add(&mut self, contribution: Self) -> SpiceResult<()> {
+        let sum = Self {
+            output: self.output + contribution.output,
+            input: self.input + contribution.input,
+        };
+        sum.check()?;
+        *self = sum;
+        Ok(())
+    }
+
+    fn check(self) -> SpiceResult<()> {
+        if self.output.is_finite() && self.input.is_finite() {
+            Ok(())
+        } else {
+            Err(noise_failure("nonfinite integrated noise"))
+        }
     }
 
     fn append(self, row: &mut NoiseRow) {
@@ -404,27 +386,18 @@ impl Power {
 /// Frequency-local data shared by every generator.
 struct NoiseSample {
     frequency: Real,
-    step: Step,
+    interval: Interval,
     gain_sq_inv: Real,
-    ln_gain_inv: Real,
     reset: bool,
     summary: bool,
 }
 
 impl NoiseSample {
     fn new(frequency: Real, previous: Real, gain_sq_inv: Real, start: Real, summary: bool) -> Self {
-        let log_end = frequency.max(N_MINLOG).ln();
-        let log_start = previous.max(N_MINLOG).ln();
         Self {
             frequency,
-            step: Step {
-                width: frequency - previous,
-                log_end,
-                log_start,
-                log_width: log_end - log_start,
-            },
+            interval: Interval::new(previous, frequency),
             gain_sq_inv,
-            ln_gain_inv: gain_sq_inv.ln(),
             reset: frequency.to_bits() == start.to_bits(),
             summary,
         }
@@ -435,34 +408,30 @@ impl NoiseSample {
 /// total only accumulates power: it never enters the logarithmic integrator.
 #[derive(Debug, Clone, Copy, Default)]
 struct History {
-    ln_last: Real,
+    previous_density: Real,
     integrated: Power,
 }
 
 impl History {
-    fn advance(&mut self, density: Real, sample: &NoiseSample) -> Power {
-        let ln_density = density.max(N_MINLOG).ln();
-        if sample.step.width == 0. {
-            self.ln_last = ln_density;
+    fn advance(&mut self, density: Real, sample: &NoiseSample) -> SpiceResult<Power> {
+        if sample.interval.is_empty() {
+            self.previous_density = density;
             if sample.reset {
                 self.integrated = Power::default();
             }
-            return Power::default();
+            return Ok(Power::default());
         }
+        let area = sample.interval.integrate(self.previous_density, density);
         let contribution = Power {
-            output: nintegrate(density, ln_density, self.ln_last, &sample.step),
-            input: nintegrate(
-                density * sample.gain_sq_inv,
-                ln_density + sample.ln_gain_inv,
-                self.ln_last + sample.ln_gain_inv,
-                &sample.step,
-            ),
+            output: area.scaled(1.),
+            input: area.scaled(sample.gain_sq_inv),
         };
-        self.ln_last = ln_density;
+        contribution.check()?;
+        self.previous_density = density;
         if sample.summary {
-            self.integrated.add(contribution);
+            self.integrated.add(contribution)?;
         }
-        contribution
+        Ok(contribution)
     }
 }
 
@@ -520,7 +489,7 @@ impl Generators {
     ) -> SpiceResult<Real> {
         let mut density_sum = 0.;
         if sample.reset
-            && sample.step.width == 0.
+            && sample.interval.is_empty()
             && let Some(total) = &mut self.total
         {
             *total = Power::default();
@@ -528,18 +497,21 @@ impl Generators {
         for (source, history) in self.instance.sources.iter().zip(&mut self.history) {
             let density = source.output_density(&difference, sample.frequency)?;
             density_sum += density;
-            let contribution = history.advance(density, sample);
-            if sample.step.width != 0. {
-                integrated.add(contribution);
+            let contribution = history.advance(density, sample)?;
+            if !sample.interval.is_empty() {
+                integrated.add(contribution)?;
                 if sample.summary
                     && let Some(total) = &mut self.total
                 {
-                    total.add(contribution);
+                    total.add(contribution)?;
                 }
             }
             if let Some(row) = summary_row.as_deref_mut() {
                 row.push_power(density);
             }
+        }
+        if !density_sum.is_finite() {
+            return Err(noise_failure("nonfinite instance noise density"));
         }
         if self.total.is_some()
             && let Some(row) = summary_row
@@ -775,7 +747,7 @@ pub(super) fn run(
         model
     };
     let mut generators: Vec<Generators> =
-        circuit_noise(circuit, &first, small.bias(), Some(small.state()))?
+        prepared_noise(small.prepared(), &first, small.bias(), Some(small.state()))?
             .into_iter()
             .map(Generators::new)
             .collect();
@@ -792,7 +764,7 @@ pub(super) fn run(
     let mut row = NoiseRow::new(representation, spectrum.variable_count());
     for (step, &freq) in frequencies.iter().enumerate() {
         let input_name = card.input.as_str();
-        let (forward, adjoint) = small.at_frequency(circuit, context, freq, |system| {
+        let (forward, adjoint) = small.at_frequency(context, freq, |system| {
             let matrix =
                 crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * freq)?;
             let lu = matrix.factorize()?;
@@ -807,8 +779,8 @@ pub(super) fn run(
         if small.varies() || small.reassembles() {
             refresh_generators(
                 &mut generators,
-                circuit_noise(
-                    circuit,
+                prepared_noise(
+                    small.prepared(),
                     &model.with_frequency(freq),
                     small.bias(),
                     Some(small.state()),
@@ -832,9 +804,13 @@ pub(super) fn run(
                 print_summary.then_some(&mut row),
             )?;
         }
+        let in_density = out_density * gain_sq_inv;
+        if !out_density.is_finite() || !in_density.is_finite() {
+            return Err(noise_failure("nonfinite noise density"));
+        }
         if emit {
             row.push_power(out_density);
-            row.push_power(out_density * gain_sq_inv);
+            row.push_power(in_density);
             spectrum.check_point(&row.values)?;
             if !row.values.iter().all(|value| value.is_finite()) {
                 return Err(SpiceError::Numerical {
@@ -861,10 +837,7 @@ pub(super) fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Generators, NoiseRow, NoiseSample, Power, Representation, Step, almost_equal_ulps,
-        nintegrate,
-    };
+    use super::{Generators, NoiseRow, NoiseSample, Power, Representation, almost_equal_ulps};
     use crate::devices::noise::{InstanceNoise, NoiseKind, NoiseSource};
     use crate::primitives::{Complex, NodeId};
 
@@ -1077,27 +1050,23 @@ mod tests {
     }
 
     #[test]
-    fn nintegrate_is_exact_for_power_laws() {
-        // A flat density integrates to density * df.
-        let (f0, f1) = (10.0_f64, 100.0_f64);
-        let step = Step {
-            width: f1 - f0,
-            log_end: f1.ln(),
-            log_start: f0.ln(),
-            log_width: f1.ln() - f0.ln(),
-        };
-        let flat = nintegrate(2.0, 2f64.ln(), 2f64.ln(), &step);
-        assert!((flat - 180.0).abs() < 1e-12);
-        // 1/f integrates to ln(f1/f0).
-        let pink = nintegrate(1.0 / f1, (1.0 / f1).ln(), (1.0 / f0).ln(), &step);
-        assert!((pink - 10f64.ln()).abs() < 1e-12);
-        // 1/f^2 integrates to 1/f0 - 1/f1.
-        let brown = nintegrate(
-            1.0 / (f1 * f1),
-            (1.0 / (f1 * f1)).ln(),
-            (1.0 / (f0 * f0)).ln(),
-            &step,
+    fn nonfinite_noise_is_rejected_even_between_summary_rows() {
+        let mut generators = Generators::new(instance());
+        let mut integrated = Power::default();
+        let mut fresh = instance();
+        fresh.sources[0].kind = NoiseKind::Gain { factor: f64::MAX };
+        fresh.sources[1].kind = NoiseKind::Gain { factor: 0. };
+        generators.refresh(fresh).unwrap();
+        let transfer = |_| Complex::real(1.);
+        let first = NoiseSample::new(1., 1., 1., 1., true);
+        generators
+            .accumulate(&first, transfer, &mut integrated, None)
+            .unwrap();
+        let second = NoiseSample::new(3., 1., 1., 1., true);
+        assert!(
+            generators
+                .accumulate(&second, transfer, &mut integrated, None)
+                .is_err()
         );
-        assert!((brown - (1.0 / f0 - 1.0 / f1)).abs() < 1e-12);
     }
 }

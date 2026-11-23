@@ -7,9 +7,10 @@
 //! pins the deliberately stricter Rust forms: C silently accepts ground
 //! nodes, missing values, empty cards and non-finite values.
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -98,19 +99,12 @@ fn ic_nodeset_syntax_matches_or_is_documented_stricter_than_c() {
         let rust = Parser::new().parse_deck(&parse_deck_text(Path::new("p.cir"), &deck));
         assert_eq!(rust.is_ok(), probe.rust_accepts, "Rust on {:?}", probe.card);
 
-        let dir = std::env::temp_dir().join(format!(
-            "spice-ic-probe-{}-{}",
-            std::process::id(),
-            probe.card.len()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let scratch = Scratch::new("c-ic-nodeset").unwrap();
+        let dir = scratch.path();
         fs::write(dir.join("probe.cir"), &deck).unwrap();
-        let output = Command::new(&binary)
-            .args(["-b", "probe.cir"])
-            .current_dir(&dir)
-            .output()
-            .expect("run C ngspice");
-        let _ = fs::remove_dir_all(&dir);
+        let output =
+            run(&binary, dir, &["-b", "probe.cir"], ProcessLimits::ORACLE).expect("run C ngspice");
+
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),

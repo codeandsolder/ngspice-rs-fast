@@ -29,15 +29,16 @@
 //!    its current records, the result negated, the parameter set to
 //!    `p + delta` with `delta = 1e-6 p` (`1e-6` when `p = 0`), the device
 //!    loaded again on top, and the parameter set back to `p`: element by
-//!    element `delta_Y = -dY0 + dY1` and `delta_I = -dI0 + dI1` in C's
-//!    accumulation order. The sensitivity is `Y^-1 (delta_I - delta_Y x)`
-//!    read at the output and divided by `delta`, with `delta_Y x` summed per
+//!    element `delta_Y = -dY0 + dY1` and `delta_I = -dI0 + dI1` in original
+//!    stamp order with compensated accumulation. The sensitivity is `Y^-1 (delta_I - delta_Y x)`
+//!    read at the output and divided by `delta`, with `delta_Y x` summed with compensation per
 //!    row in the internal column order of C's `delta_Y` (see
 //!    [`DeltaNumbering`]).
 //!
 //! The device side, including C's side effects of the in-place perturbation,
 //! lives in [`crate::devices::sensitivity`]; see `docs/port/SENSITIVITY.md`.
 
+use super::reduction::CompensatedSum;
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan, Plot};
@@ -48,6 +49,9 @@ use crate::devices::sensitivity::{
 };
 use crate::devices::{AnalysisMode, Circuit, Device, IterationPhase, LoadRequest, TrialState};
 use crate::maths::complex::ComplexMatrix;
+use crate::maths::linear::{
+    BatchSolveFailure, RHS_BATCH_WIDTH, SolveBatchWorkspace, solve_last_factors_batch_into,
+};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{
     Complex, NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult, parse_spice_number,
@@ -231,7 +235,7 @@ pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
 /// divides `ln(fstop/fstart)` by `M_LOG2E` instead of multiplying.
 #[expect(
     clippy::suboptimal_flops,
-    reason = "preserve C count_steps and inc_freq rounding, including pow and truncation"
+    reason = "count_steps truncates a discrete sweep length: 3 * log10(4.6060996915966586) + 1.01 is 3 separately rounded but 2.9999999999999996 fused"
 )]
 fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
     let steps = Real::from(sweep.steps.max(1));
@@ -336,6 +340,23 @@ impl Probe {
         }
         .into_iter()
         .flatten()
+    }
+
+    /// Output-scale estimate before subtracting the two voltage terminals.
+    fn resolution_scale(self, values: &[Complex]) -> Real {
+        self.rows()
+            .map(|row| {
+                let value = values.get(row).copied().unwrap_or(Complex::ZERO);
+                value.re.abs().max(value.im.abs())
+            })
+            .sum()
+    }
+
+    const fn absolute_resolution(self, options: &crate::analysis::newton::NewtonOptions) -> Real {
+        match self {
+            Self::Voltage { .. } => options.vntol,
+            Self::Current { .. } => options.abstol,
+        }
     }
 
     fn read<T: Copy + std::ops::Sub<Output = T>>(&self, x: &[T], zero: T) -> T {
@@ -819,7 +840,15 @@ struct RowChain {
 struct RowEntry {
     col: ExternalIndex,
     internal_col: InternalIndex,
-    value: Complex,
+    real: CompensatedSum,
+    imaginary: CompensatedSum,
+}
+
+#[cfg(test)]
+impl RowEntry {
+    const fn value(&self) -> Complex {
+        Complex::new(self.real.total(), self.imaginary.total())
+    }
 }
 
 /// Reusable sparse perturbation assembly.
@@ -890,13 +919,14 @@ impl DeltaMatrix {
             self.row_entries.push(RowEntry {
                 col,
                 internal_col: stamp.internal_col,
-                value: zero,
+                real: CompensatedSum::with_initial(zero.re),
+                imaginary: CompensatedSum::with_initial(zero.im),
             });
             i
         });
-        let value = &mut self.row_entries[i].value;
-        value.re += stamp.value.re;
-        value.im += stamp.value.im;
+        let entry = &mut self.row_entries[i];
+        entry.real.add(stamp.value.re);
+        entry.imaginary.add(stamp.value.im);
     }
 
     /// Fold the base load, negate it, then add the perturbed load. The
@@ -910,8 +940,10 @@ impl DeltaMatrix {
             next = stamp.next;
         }
         for entry in &mut self.row_entries {
-            entry.value.re *= -1.;
-            entry.value.im *= -1.;
+            // Negate both components of the accumulator. Rounding the base
+            // sum before subtracting would lose a small derivative entirely.
+            entry.real.negate();
+            entry.imaginary.negate();
         }
         while let Some(i) = next {
             let stamp = self.stamps[i];
@@ -962,7 +994,7 @@ impl PerturbedAssembly<'_> {
     fn visit_products(
         self,
         x: &[Complex],
-        mut visit: impl FnMut(usize, Complex),
+        mut visit: impl FnMut(usize, [CompensatedSum; 2]),
     ) -> SpiceResult<()> {
         if x.len() != self.matrix.numbering.internal.len() {
             return Err(SpiceError::Numerical {
@@ -971,15 +1003,20 @@ impl PerturbedAssembly<'_> {
             });
         }
         for row in 0..x.len() {
-            let mut sum = Complex::ZERO;
-            // This is the ordinary C complex product and sum, not a fused
-            // dot product; each contribution is reduced before multiplication.
+            let mut real = CompensatedSum::default();
+            let mut imaginary = CompensatedSum::default();
+            // Preserve the sparse visitation and perturbation semantics,
+            // but compensate each component of the cancellation-prone dot.
             if self.matrix.rows[row].first.is_some() {
                 for entry in self.matrix.fold_row(row, self.base_count) {
-                    sum = sum + entry.value * x[entry.col.0];
+                    let value = x[entry.col.0];
+                    entry.real.multiply_into(value.re, &mut real);
+                    entry.imaginary.multiply_into(-value.im, &mut real);
+                    entry.real.multiply_into(value.im, &mut imaginary);
+                    entry.imaginary.multiply_into(value.re, &mut imaginary);
                 }
             }
-            visit(row, sum);
+            visit(row, [real, imaginary]);
         }
         Ok(())
     }
@@ -1037,7 +1074,7 @@ fn ac_state<'a>(
     omega: Real,
     model: crate::devices::ModelContext,
     zeros: &'a Vector,
-    state: &'a [Real],
+    state: &'a crate::devices::StateSnapshot,
 ) -> SpiceResult<AcState<'a>> {
     // CKTunsetup/CKTsetup make a new circuit matrix (elements in setup
     // order) and NIacIter reorders it from scratch.
@@ -1130,10 +1167,94 @@ struct DcState<'a> {
     circuit: &'a Circuit,
 }
 
+fn perturbation_error(label: &str, error: &SpiceError) -> SpiceError {
+    SpiceError::Numerical {
+        context: format!(".sens {label}: {error}"),
+        message: "the perturbed load could not be evaluated".to_owned(),
+    }
+}
+
+/// Residuals are prepared in the original record-walk order, then solved
+/// together. A solve never mutates parameter records or the pivot order.
+struct SensitivityBatch<T> {
+    rhs: Vec<T>,
+    work: SolveBatchWorkspace<T>,
+    solution: Vec<T>,
+    labels: [String; RHS_BATCH_WIDTH],
+    deltas: [Real; RHS_BATCH_WIDTH],
+    count: usize,
+}
+
+impl<T: Copy> SensitivityBatch<T> {
+    fn new() -> Self {
+        Self {
+            rhs: Vec::new(),
+            work: SolveBatchWorkspace::default(),
+            solution: Vec::new(),
+            labels: std::array::from_fn(|_| String::new()),
+            deltas: [0.; RHS_BATCH_WIDTH],
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, rhs: &[T], label: &str, delta: Real) -> SpiceResult<()> {
+        self.rhs.try_reserve(rhs.len()).map_err(|error| {
+            perturbation_error(
+                label,
+                &SpiceError::Numerical {
+                    context: ".sens batch".to_owned(),
+                    message: format!("cannot reserve RHS tile: {error}"),
+                },
+            )
+        })?;
+        self.rhs.extend_from_slice(rhs);
+        self.labels[self.count].clear();
+        self.labels[self.count].push_str(label);
+        self.deltas[self.count] = delta;
+        self.count += 1;
+        Ok(())
+    }
+
+    const fn full(&self) -> bool {
+        self.count == RHS_BATCH_WIDTH
+    }
+
+    fn flush(
+        &mut self,
+        solve: impl FnOnce(
+            &[T],
+            &mut SolveBatchWorkspace<T>,
+            &mut Vec<T>,
+        ) -> Result<(), BatchSolveFailure>,
+        mut emit: impl FnMut(usize, &mut [T], Real),
+    ) -> SpiceResult<()> {
+        let count = std::mem::take(&mut self.count);
+        if count == 0 {
+            return Ok(());
+        }
+        let n = self.rhs.len() / count;
+        let result = solve(&self.rhs, &mut self.work, &mut self.solution);
+        self.rhs.clear();
+        result.map_err(|error| {
+            perturbation_error(&self.labels[error.rhs_index.unwrap_or(0)], &error.cause)
+        })?;
+        for lane in 0..count {
+            emit(
+                lane,
+                &mut self.solution[lane * n..(lane + 1) * n],
+                self.deltas[lane],
+            );
+        }
+        Ok(())
+    }
+}
+
 struct DcAssembly {
     matrix: SparseMatrix,
     rhs: Vector,
     tainted: Vec<bool>,
+    tainted_lanes: [Vec<bool>; RHS_BATCH_WIDTH],
+    batch: SensitivityBatch<Real>,
 }
 
 impl DcAssembly {
@@ -1142,6 +1263,8 @@ impl DcAssembly {
             matrix: SparseMatrix::new(n, n),
             rhs: Vector::zeros(n),
             tainted: Vec::new(),
+            tainted_lanes: std::array::from_fn(|_| Vec::new()),
+            batch: SensitivityBatch::new(),
         }
     }
 }
@@ -1162,9 +1285,9 @@ fn mask_nonfinite(rhs: &mut Vector, blocks: &[usize], tainted: &mut Vec<bool>) {
     }
 }
 
-fn restore_nonfinite(solution: &mut Vector, blocks: &[usize], tainted: &[bool]) {
+fn restore_nonfinite(solution: &mut [Real], blocks: &[usize], tainted: &[bool]) {
     if !tainted.is_empty() {
-        for (row, value) in solution.as_mut_slice().iter_mut().enumerate() {
+        for (row, value) in solution.iter_mut().enumerate() {
             if tainted[blocks[row]] {
                 *value = Real::NAN;
             }
@@ -1201,14 +1324,14 @@ impl DcState<'_> {
 
     /// `Y^-1 (delta_I - delta_Y E)` of a base and a perturbed load, with
     /// `delta_I` and `delta_Y` accumulated as `sens_sens()` does.
-    fn delta(
+    fn residual(
         &self,
         mut assembly: BaseAssembly<'_>,
         scratch: &mut DcAssembly,
         index: usize,
         base: &SensitivityLoad,
         perturbed: &SensitivityLoad,
-    ) -> SpiceResult<Vector> {
+    ) -> SpiceResult<()> {
         scratch.matrix.clear();
         scratch.rhs.clear();
         self.load(index, base, &mut scratch.matrix, &mut scratch.rhs)?;
@@ -1221,19 +1344,43 @@ impl DcState<'_> {
         scratch.matrix.clear();
         self.load(index, perturbed, &mut scratch.matrix, &mut scratch.rhs)?;
         assembly.add(real_stamps(&scratch.matrix))?;
-        assembly.visit_products(&self.solution, |row, product| {
-            scratch.rhs.as_mut_slice()[row] -= product.re;
+        assembly.visit_products(&self.solution, |row, [mut real, _]| {
+            // Round delta_I - delta_Y E only after the residual is assembled,
+            // not after the potentially cancelling matrix-vector product.
+            let value = &mut scratch.rhs.as_mut_slice()[row];
+            real.negate();
+            real.add(*value);
+            *value = real.total();
         })?;
         // Nonfinite loads poison the entire connected block, as in C.
         // The mask remains unallocated on the normal path and reuses capacity.
         mask_nonfinite(&mut scratch.rhs, &self.blocks, &mut scratch.tainted);
-        let mut solved = crate::maths::solve_last_factors(&self.pattern, &scratch.rhs)?
-            .ok_or_else(|| SpiceError::Numerical {
-                context: ".sens".to_owned(),
-                message: "the operating point left no factored circuit matrix".to_owned(),
-            })?;
-        restore_nonfinite(&mut solved, &self.blocks, &scratch.tainted);
-        Ok(solved)
+        Ok(())
+    }
+
+    fn flush(
+        &self,
+        scratch: &mut DcAssembly,
+        probe: Probe,
+        point: &mut Vec<Complex>,
+    ) -> SpiceResult<()> {
+        scratch.batch.flush(
+            |rhs, work, solution| {
+                if solve_last_factors_batch_into(&self.pattern, rhs, work, solution)? {
+                    Ok(())
+                } else {
+                    Err(SpiceError::Numerical {
+                        context: ".sens".to_owned(),
+                        message: "the operating point left no factored circuit matrix".to_owned(),
+                    }
+                    .into())
+                }
+            },
+            |lane, solved, delta| {
+                restore_nonfinite(solved, &self.blocks, &scratch.tainted_lanes[lane]);
+                point.push(Complex::real(probe.read(solved, 0.) / delta));
+            },
+        )
     }
 }
 
@@ -1244,7 +1391,7 @@ struct AcState<'a> {
     solution: Vec<Complex>,
     model: crate::devices::ModelContext,
     bias: &'a Vector,
-    state: &'a [Real],
+    state: &'a crate::devices::StateSnapshot,
     circuit: &'a Circuit,
 }
 
@@ -1252,16 +1399,16 @@ struct AcAssembly {
     system: LinearSystem,
     rhs: Vec<Complex>,
     perturbed_rhs: Vec<Complex>,
-    solve: Vec<Complex>,
+    batch: SensitivityBatch<Complex>,
 }
 
 impl AcAssembly {
-    const fn new(n: usize) -> Self {
+    fn new(n: usize) -> Self {
         Self {
             system: LinearSystem::new(n),
             rhs: Vec::new(),
             perturbed_rhs: Vec::new(),
-            solve: Vec::new(),
+            batch: SensitivityBatch::new(),
         }
     }
 }
@@ -1298,14 +1445,14 @@ impl AcState<'_> {
         )
     }
 
-    fn delta(
+    fn residual(
         &self,
         mut assembly: BaseAssembly<'_>,
         scratch: &mut AcAssembly,
         index: usize,
         base: &SensitivityLoad,
         perturbed: &SensitivityLoad,
-    ) -> SpiceResult<Vec<Complex>> {
+    ) -> SpiceResult<()> {
         self.assemble(index, base, &mut scratch.system)?;
         scratch.system.ac_rhs_into(&mut scratch.rhs);
         assembly.add(self.stamps(&scratch.system))?;
@@ -1317,12 +1464,56 @@ impl AcState<'_> {
             *base = Complex::new(-base.re + perturbed.re, -base.im + perturbed.im);
         }
         assembly.add(self.stamps(&scratch.system))?;
-        assembly.visit_products(&self.solution, |row, product| {
-            scratch.rhs[row].re -= product.re;
-            scratch.rhs[row].im -= product.im;
+        assembly.visit_products(&self.solution, |row, [mut real, mut imaginary]| {
+            let value = &mut scratch.rhs[row];
+            real.negate();
+            imaginary.negate();
+            real.add(value.re);
+            imaginary.add(value.im);
+            *value = Complex::new(real.total(), imaginary.total());
         })?;
-        self.factors
-            .solve_with_workspace(&scratch.rhs, &mut scratch.solve)
+        if scratch.rhs.iter().any(|value| !value.is_finite()) {
+            return Err(SpiceError::Numerical {
+                context: "complex solve".to_owned(),
+                message: "invalid RHS".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn flush(
+        &self,
+        scratch: &mut AcAssembly,
+        probe: Probe,
+        point: &mut Vec<Complex>,
+    ) -> SpiceResult<()> {
+        scratch.batch.flush(
+            |rhs, work, solution| self.factors.solve_batch_into(rhs, work, solution, false),
+            |_, solved, delta| {
+                let value = probe.read(solved, Complex::ZERO);
+                point.push(Complex::new(value.re / delta, value.im / delta));
+            },
+        )
+    }
+}
+
+/// An estimated output-resolution floor divided by the actual finite-
+/// difference denominator. This is a conformance diagnostic, not a bound on
+/// the true derivative or a change to the sensitivity algorithm.
+struct Resolution {
+    plot: Plot,
+    absolute: Real,
+}
+
+impl Resolution {
+    fn row(&self, probe: Probe, solution: &[Complex]) -> (Real, Vec<Complex>) {
+        // Allow several rounding operations, including independent reference
+        // arithmetic. No claim of a certified forward-error bound.
+        let roundoff = 32. * Real::EPSILON * probe.resolution_scale(solution);
+        (
+            self.absolute.max(roundoff),
+            Vec::with_capacity(self.plot.variable_count()),
+        )
     }
 }
 
@@ -1337,7 +1528,8 @@ pub(super) fn run(
     context: &AnalysisContext,
     card: &SensCard,
     grid: Option<&[Real]>,
-) -> SpiceResult<Plot> {
+    estimate_resolution: bool,
+) -> SpiceResult<(Plot, Option<Plot>)> {
     let settings = request.dc_settings();
     let ac = grid.is_some();
     circuit.finalize()?;
@@ -1352,10 +1544,24 @@ pub(super) fn run(
         EarlierAcState::default()
     };
     // The operating point, exactly as `.op` solves it (`CKTop`).
-    let solved = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?
-        .solve(circuit, &model, settings)?;
+    let solved = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?.solve(
+        &circuit.prepare_run(),
+        &model,
+        settings,
+    )?;
 
     let mut plot = workspace.plot(ac);
+    if estimate_resolution {
+        workspace.resolution = Some(Resolution {
+            plot: workspace.plot(ac),
+            // AC is a linear small-signal solve, not a Newton convergence test.
+            absolute: if ac || !circuit.devices().iter().any(|device| device.is_nonlinear()) {
+                0.
+            } else {
+                probe.absolute_resolution(&settings.newton)
+            },
+        });
+    }
     if let Some(grid) = grid {
         run_ac(
             &mut workspace,
@@ -1376,7 +1582,7 @@ pub(super) fn run(
             &mut plot,
         )?;
     }
-    Ok(plot)
+    Ok((plot, workspace.resolution.map(|resolution| resolution.plot)))
 }
 
 /// One analysis's parameter sequence, owning all live mutable C records and
@@ -1389,6 +1595,7 @@ struct ParameterWalk<'a> {
     entries: Vec<Entry>,
     couplings: Vec<Option<Coupling>>,
     delta: DeltaMatrix,
+    resolution: Option<Resolution>,
 }
 
 impl<'a> ParameterWalk<'a> {
@@ -1413,6 +1620,7 @@ impl<'a> ParameterWalk<'a> {
             entries,
             couplings,
             delta: DeltaMatrix::new(circuit.unknown_count()),
+            resolution: None,
         })
     }
 
@@ -1465,7 +1673,7 @@ struct AcSweep<'a> {
     bias: &'a Vector,
     model: crate::devices::ModelContext,
     zeros: Vector,
-    state: Vec<Real>,
+    state: crate::devices::StateSnapshot,
 }
 
 impl AcSweep<'_> {
@@ -1526,7 +1734,7 @@ fn run_ac(
         bias,
         model,
         zeros: Vector::zeros(circuit.unknown_count()),
-        state: vec![0.; circuit.state_history().len()],
+        state: circuit.bind_state(vec![0.; circuit.state_len()])?,
     };
     let mut scratch = AcAssembly::new(circuit.unknown_count());
     let mut system = LinearSystem::new(circuit.unknown_count());
@@ -1566,7 +1774,16 @@ fn run_ac(
         };
         let mut point = Vec::with_capacity(plot.variables().len());
         point.push(Complex::real(frequency));
-        walk.sweep(
+        let mut resolution = walk.resolution.as_ref().map(|resolution| {
+            let (floor, mut row) = resolution.row(
+                probe,
+                at.as_ref()
+                    .map_or(&[][..], |state| state.solution.as_slice()),
+            );
+            row.push(Complex::ZERO); // frequency is not a derivative
+            (floor, row)
+        });
+        let walked = walk.sweep(
             |slot, member, setup, current| {
                 sweep.load(
                     circuit,
@@ -1577,18 +1794,33 @@ fn run_ac(
                     omega,
                 )
             },
-            |assembly, index, base, perturbed, delta| {
+            |assembly, index, base, perturbed, delta, label| {
+                if let Some((floor, row)) = &mut resolution {
+                    row.push(Complex::real(*floor / delta.abs()));
+                }
                 let Some(at) = &at else {
                     point.push(Complex::new(Real::NAN, Real::NAN));
                     return Ok(());
                 };
-                let dx = at.delta(assembly, &mut scratch, index, base, perturbed)?;
-                let value = probe.read(&dx, Complex::ZERO);
-                point.push(Complex::new(value.re / delta, value.im / delta));
+                at.residual(assembly, &mut scratch, index, base, perturbed)
+                    .map_err(|error| perturbation_error(label, &error))?;
+                scratch.batch.push(&scratch.rhs, label, delta)?;
+                if scratch.batch.full() {
+                    at.flush(&mut scratch, probe, &mut point)?;
+                }
                 Ok(())
             },
-        )?;
+        );
+        // A pending earlier solve must report its own failure before a
+        // later parameter load/restoration error can escape the walk.
+        if let Some(at) = &at {
+            at.flush(&mut scratch, probe, &mut point)?;
+        }
+        walked?;
         plot.push_point(&point)?;
+        if let (Some(resolution), Some((_, row))) = (&mut walk.resolution, resolution) {
+            resolution.plot.push_point(&row)?;
+        }
     }
     Ok(())
 }
@@ -1606,7 +1838,7 @@ fn run_dc(
     // `Y` is the matrix CKTop's last NIiter load left factored (its
     // load at CKTrhsOld), as for `.tf`; the devices are reloaded at that
     // iterate and `delta_Y` multiplies its solve, CKTrhs.
-    let history = circuit.state_history();
+    let history = circuit.state_history()?;
     let trial = history
         .trial_in(IterationPhase::Float, Some(&solved.trial))?
         .with_device_limiting(device_limiting)
@@ -1648,15 +1880,32 @@ fn run_dc(
     };
     let mut point = Vec::with_capacity(plot.variables().len());
     let mut scratch = DcAssembly::new(n);
-    walk.sweep(
+    let mut resolution = walk
+        .resolution
+        .as_ref()
+        .map(|resolution| resolution.row(probe, &at.solution));
+    let walked = walk.sweep(
         |_, member, setup, current| member.sensitivity.load(setup, current, SensitivityMode::Dc),
-        |assembly, index, base, perturbed, delta| {
-            let dx = at.delta(assembly, &mut scratch, index, base, perturbed)?;
-            point.push(Complex::real(probe.read(dx.as_slice(), 0.) / delta));
+        |assembly, index, base, perturbed, delta, label| {
+            if let Some((floor, row)) = &mut resolution {
+                row.push(Complex::real(*floor / delta.abs()));
+            }
+            at.residual(assembly, &mut scratch, index, base, perturbed)
+                .map_err(|error| perturbation_error(label, &error))?;
+            scratch.tainted_lanes[scratch.batch.count].clone_from(&scratch.tainted);
+            scratch.batch.push(scratch.rhs.as_slice(), label, delta)?;
+            if scratch.batch.full() {
+                at.flush(&mut scratch, probe, &mut point)?;
+            }
             Ok(())
         },
-    )?;
+    );
+    at.flush(&mut scratch, probe, &mut point)?;
+    walked?;
     plot.push_point(&point)?;
+    if let (Some(resolution), Some((_, row))) = (&mut walk.resolution, resolution) {
+        resolution.plot.push_point(&row)?;
+    }
     Ok(())
 }
 
@@ -1711,6 +1960,7 @@ impl ParameterWalk<'_> {
             &SensitivityLoad,
             &SensitivityLoad,
             Real,
+            &str,
         ) -> SpiceResult<()>,
     ) -> SpiceResult<()> {
         // A device that refuses `.sens` outright keeps its own error class; only a
@@ -1764,16 +2014,13 @@ impl ParameterWalk<'_> {
                 },
             )
             .map_err(|error| labelled(error, label, "the perturbed load failed"))?;
-            let measured = (|| {
-                let assembly =
-                    self.delta
-                        .begin(setup_elements(self.circuit, member.index, elements)?)?;
-                measure(assembly, member.index, &base, &perturbed, delta)
-            })();
-            measured.map_err(|error| SpiceError::Numerical {
-                context: format!(".sens {label}: {error}"),
-                message: "the perturbed load could not be evaluated".to_owned(),
-            })?;
+            let elements = setup_elements(self.circuit, member.index, elements)
+                .map_err(|error| perturbation_error(label, &error))?;
+            let assembly = self
+                .delta
+                .begin(elements)
+                .map_err(|error| perturbation_error(label, &error))?;
+            measure(assembly, member.index, &base, &perturbed, delta, label)?;
             device.set(entry.scope, entry.keyword, value, model, instance)?;
             device.temperature(model, instance)?;
         }
@@ -1794,6 +2041,35 @@ mod tests {
     }
 
     #[test]
+    fn resolution_is_measured_in_output_units_and_scaled_by_perturbation() {
+        use super::{Complex, Plot, PlotFlags, Probe, Real, Resolution};
+        let plot = Plot::new("test", "test", PlotFlags::Real, vec![]);
+        let probe = Probe::Current { row: 0 };
+        let options = crate::analysis::newton::NewtonOptions {
+            abstol: 1e-16,
+            vntol: 1e-13,
+            ..crate::analysis::newton::NewtonOptions::default()
+        };
+        let resolution = Resolution {
+            plot,
+            absolute: probe.absolute_resolution(&options),
+        };
+        let (floor, _) = resolution.row(probe, &[Complex::real(1e-4)]);
+        let tox_denominator = 20e-9 * super::RELATIVE_DELTA;
+        assert!((floor / tox_denominator - 0.005).abs() < 8. * Real::EPSILON);
+        let voltage = Probe::Voltage {
+            pos: Some(0),
+            neg: Some(1),
+        };
+        let scale = voltage.resolution_scale(&[Complex::real(2.), Complex::real(2.)]);
+        assert_eq!(scale.to_bits(), 4_f64.to_bits());
+        assert_eq!(
+            voltage.absolute_resolution(&options).to_bits(),
+            options.vntol.to_bits()
+        );
+    }
+
+    #[test]
     fn perturbation_products_follow_internal_column_order_and_clear_workspace() {
         use super::DeltaMatrix;
         use crate::primitives::Complex;
@@ -1811,7 +2087,9 @@ mod tests {
         let x = [Complex::real(1.); 3];
         let mut result = [Complex::ZERO; 3];
         perturbed
-            .visit_products(&x, |row, sum| result[row] = sum)
+            .visit_products(&x, |row, [real, imaginary]| {
+                result[row] = Complex::new(real.total(), imaginary.total())
+            })
             .unwrap();
         assert_eq!(result, [Complex::real(1.), Complex::ZERO, Complex::ZERO]);
         let stamp_capacity = matrix.stamps.capacity();
@@ -1820,7 +2098,9 @@ mod tests {
             .begin([(1, 0)])
             .unwrap()
             .negate()
-            .visit_products(&x, |row, sum| result[row] = sum)
+            .visit_products(&x, |row, [real, imaginary]| {
+                result[row] = Complex::new(real.total(), imaginary.total())
+            })
             .unwrap();
         assert_eq!(result, [Complex::ZERO; 3]);
         assert_eq!(matrix.stamps.capacity(), stamp_capacity);
@@ -1833,6 +2113,26 @@ mod tests {
                 Some(super::InternalIndex(0))
             ]
         );
+    }
+
+    #[test]
+    fn perturbation_residual_retains_product_roundoff_across_rhs_cancellation() {
+        use super::DeltaMatrix;
+        use crate::primitives::Complex;
+
+        let small = 2_f64.powi(-27);
+        let mut matrix = DeltaMatrix::new(1);
+        let mut perturbed = matrix.begin([]).unwrap().negate();
+        perturbed
+            .add([stamp(0, 0, Complex::real(1. + small))])
+            .unwrap();
+        perturbed
+            .visit_products(&[Complex::real(1. - small)], |_, [mut real, _]| {
+                real.negate();
+                real.add(1.);
+                assert_eq!(real.total(), small * small);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1870,7 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn separate_base_and_perturbed_reductions_preserve_duplicates_and_signed_zeros() {
+    fn separate_base_and_perturbed_reductions_retain_small_differences_and_signed_zeros() {
         use super::DeltaMatrix;
         use crate::primitives::Complex;
         let mut matrix = DeltaMatrix::new(4);
@@ -1891,26 +2191,53 @@ mod tests {
             .unwrap();
         let cutoff = perturbed.base_count;
         assert_eq!(
-            perturbed.matrix.fold_row(0, cutoff)[0].value.re.to_bits(),
-            2_f64.to_bits()
+            perturbed.matrix.fold_row(0, cutoff)[0].value().re.to_bits(),
+            1_f64.to_bits()
         );
         for row in [1, 2] {
             let entry = &perturbed.matrix.fold_row(row, cutoff)[0];
-            assert_eq!(entry.value.re.to_bits(), (-0_f64).to_bits());
-            assert_eq!(entry.value.im.to_bits(), (-0_f64).to_bits());
+            assert_eq!(entry.value().re.to_bits(), (-0_f64).to_bits());
+            assert_eq!(entry.value().im.to_bits(), (-0_f64).to_bits());
         }
         let mut seen = Vec::new();
         perturbed
-            .visit_products(&[Complex::real(1.); 4], |row, sum| seen.push((row, sum)))
+            .visit_products(&[Complex::real(1.); 4], |row, [real, imaginary]| {
+                seen.push((row, Complex::new(real.total(), imaginary.total())))
+            })
             .unwrap();
         assert_eq!(
             seen,
             [
-                (0, Complex::real(2.)),
+                (0, Complex::real(1.)),
                 (1, Complex::ZERO),
                 (2, Complex::ZERO),
                 (3, Complex::ZERO)
             ]
+        );
+    }
+
+    #[test]
+    fn perturbation_does_not_round_the_base_sum_before_subtraction() {
+        use super::DeltaMatrix;
+        use crate::primitives::Complex;
+        let mut matrix = DeltaMatrix::new(1);
+        let mut base = matrix.begin([(0, 0)]).unwrap();
+        base.add([
+            stamp(0, 0, Complex::new(1e16, -1e16)),
+            stamp(0, 0, Complex::new(1., -1.)),
+        ])
+        .unwrap();
+        let mut perturbed = base.negate();
+        perturbed
+            .add([
+                stamp(0, 0, Complex::new(1e16, -1e16)),
+                stamp(0, 0, Complex::new(2., -2.)),
+            ])
+            .unwrap();
+        let cutoff = perturbed.base_count;
+        assert_eq!(
+            perturbed.matrix.fold_row(0, cutoff)[0].value(),
+            Complex::new(1., -1.)
         );
     }
 
@@ -1926,14 +2253,14 @@ mod tests {
         assert_eq!(rhs.as_slice(), &[1., 0., -0., 3., 4.]);
         assert_eq!(rhs.as_slice()[2].to_bits(), (-0_f64).to_bits());
         let mut solved = Vector::from_slice(&[1., 2., 3., 4., 5.]);
-        restore_nonfinite(&mut solved, &blocks, &tainted);
+        restore_nonfinite(solved.as_mut_slice(), &blocks, &tainted);
         assert!(solved.as_slice()[..3].iter().all(|x| x.is_nan()));
         assert_eq!(solved.as_slice()[3..], [4., 5.]);
         let capacity = tainted.capacity();
         mask_nonfinite(&mut rhs, &blocks, &mut tainted);
         assert!(tainted.is_empty());
         assert_eq!(tainted.capacity(), capacity);
-        restore_nonfinite(&mut rhs, &blocks, &tainted);
+        restore_nonfinite(rhs.as_mut_slice(), &blocks, &tainted);
         assert!(rhs.is_finite());
     }
 
@@ -2006,6 +2333,26 @@ mod tests {
         assert!(scan(b"v1", b"v1"));
         assert!(scan(b"*_m", b"r2_m"));
         assert!(!scan(b"*_m", b"r2_ms"));
+    }
+
+    #[test]
+    fn frequency_count_rounding_is_a_discrete_grid_policy() {
+        // Exact binary64 log10(4.6060996915966586) on the reference platform.
+        let log = f64::from_bits(0x3fe5_3a06_d3a0_6d39);
+        let scaled = 3. * log;
+        assert_eq!((scaled + 1.01).trunc(), 3.);
+        assert_eq!(3_f64.mul_add(log, 1.01).trunc(), 2.);
+        let sweep = super::Sweep {
+            stepping: super::Stepping::Decade,
+            steps: 3,
+            start: 1.,
+            stop: 4.6060996915966586,
+        };
+        // On platforms whose log10 differs, still check the grid policy
+        // against the separately rounded product on that platform.
+        let scaled = 3. * sweep.stop.log10();
+        let want = (scaled + 1.01).trunc();
+        assert_eq!(super::frequencies(&sweep).unwrap().len() as f64, want);
     }
 
     #[test]

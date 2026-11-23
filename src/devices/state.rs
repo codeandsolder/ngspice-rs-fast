@@ -66,6 +66,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::devices::circuit::TopologyId;
 use crate::devices::delay::{DelayHistory, DelayUpdate};
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
@@ -127,10 +128,34 @@ impl State1Patches {
     }
 }
 
+/// An immutable state vector tied to one finalized topology.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateSnapshot {
+    pub(super) values: Arc<[Real]>,
+    pub(super) topology: TopologyId,
+}
+
+impl StateSnapshot {
+    /// The values in finalized state-row order.
+    #[must_use]
+    pub fn values(&self) -> &[Real] {
+        &self.values
+    }
+}
+
+/// Publication mode for an accepted trial.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum HistoryPublication {
+    Initialize,
+    Rotate,
+}
+
 /// Accepted device state vectors, most recent first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateHistory {
     len: usize,
+    binding: Option<StateBinding>,
+    revision: Arc<()>,
     accepted: Vec<Arc<[Real]>>,
     /// C's `CKTstate0` as the previous analysis of the deck left it (C runs
     /// every analysis on the same state vectors), read through
@@ -141,29 +166,72 @@ pub struct StateHistory {
     delays: BTreeMap<usize, DelayHistory>,
 }
 
+/// Immutable positional interpretation shared by all histories of a circuit.
+#[derive(Debug, Clone, PartialEq)]
+struct StateBinding {
+    topology: TopologyId,
+    rows: Arc<[Range<usize>]>,
+}
+
 impl StateHistory {
     /// An empty history for `len` state slots.
     #[must_use]
-    pub const fn new(len: usize) -> Self {
+    pub fn new(len: usize) -> Self {
         Self {
             len,
+            binding: None,
+            revision: Arc::new(()),
             accepted: Vec::new(),
             carried: None,
             delays: BTreeMap::new(),
         }
     }
 
-    /// This history with `carried` as the state vector the previous analysis
-    /// left behind (ignored unless it has [`Self::len`] slots).
-    #[must_use]
-    pub fn with_carried(self, carried: Option<Vec<Real>>) -> Self {
-        self.with_carried_snapshot(carried.map(Into::into))
+    pub(super) fn bound(
+        topology: TopologyId,
+        rows: Arc<[Range<usize>]>,
+        len: usize,
+        revision: Arc<()>,
+        carried: Option<Arc<[Real]>>,
+        delays: impl IntoIterator<Item = (usize, DelayHistory)>,
+    ) -> Self {
+        Self {
+            len,
+            binding: Some(StateBinding { topology, rows }),
+            revision,
+            accepted: Vec::new(),
+            carried,
+            delays: delays.into_iter().collect(),
+        }
     }
 
-    /// Share the immutable previous-analysis snapshot with its circuit owner.
-    pub(super) fn with_carried_snapshot(mut self, carried: Option<Arc<[Real]>>) -> Self {
-        self.carried = carried.filter(|vector| vector.len() == self.len);
+    /// A local device-kernel history with previous-analysis values.
+    #[cfg(test)]
+    pub(super) fn with_carried(mut self, carried: Option<Vec<Real>>) -> Self {
+        self.carried = carried
+            .filter(|values| values.len() == self.len)
+            .map(Into::into);
+        self.revision = Arc::new(());
         self
+    }
+
+    pub(super) fn matches_topology(&self, topology: TopologyId) -> bool {
+        self.binding
+            .as_ref()
+            .is_some_and(|binding| binding.topology == topology)
+    }
+
+    /// Check identity without inspecting or requiring the trial's values.
+    pub(super) fn check_trial(&self, trial: &TrialState) -> SpiceResult<()> {
+        if trial.topology != self.binding.as_ref().map(|binding| binding.topology)
+            || !Arc::ptr_eq(&self.revision, &trial.revision)
+            || trial.values.len() != self.len
+        {
+            return Err(state_error(
+                "trial belongs to a different state layout or accepted revision",
+            ));
+        }
+        Ok(())
     }
 
     /// Retain a snapshot after the history is discarded, without copying its
@@ -175,12 +243,10 @@ impl StateHistory {
     }
 
     /// The same state history with model-specific delay histories.
-    #[must_use]
-    pub fn with_delay_lines(
-        mut self,
-        lines: impl IntoIterator<Item = (usize, DelayHistory)>,
-    ) -> Self {
+    #[cfg(test)]
+    fn with_delay_lines(mut self, lines: impl IntoIterator<Item = (usize, DelayHistory)>) -> Self {
         self.delays = lines.into_iter().collect();
+        self.revision = Arc::new(());
         self
     }
 
@@ -229,14 +295,15 @@ impl StateHistory {
     pub(super) fn accept_transaction(
         &mut self,
         trial: TrialState,
+        publication: HistoryPublication,
         prepare: impl FnOnce(&Self, &TrialState) -> SpiceResult<Vec<(usize, DelayUpdate)>>,
         before_commit: impl FnOnce(&TrialState) -> SpiceResult<()>,
     ) -> SpiceResult<Vec<Real>> {
-        self.check(&trial)?;
+        self.check_publication(&trial, publication)?;
         let updates = prepare(self, &trial)?;
         let checked = self.prepare_delays(&updates)?;
         before_commit(&trial)?;
-        self.commit_validated(trial);
+        self.commit_validated(trial, publication);
         if !checked.is_empty() {
             for (device, history) in &mut self.delays {
                 if let Some(update) = checked.get(device) {
@@ -283,6 +350,8 @@ impl StateHistory {
     #[must_use]
     pub fn trial(&self) -> TrialState {
         TrialState {
+            topology: self.binding.as_ref().map(|binding| binding.topology),
+            revision: Arc::clone(&self.revision),
             values: std::iter::repeat_n(Real::NAN, self.len).collect(),
             mode: LoadMode::EXACT,
             previous: None,
@@ -305,10 +374,12 @@ impl StateHistory {
         phase: IterationPhase,
         previous: Option<&TrialState>,
     ) -> SpiceResult<TrialState> {
-        if previous.is_some_and(|previous| previous.values.len() != self.len) {
-            return Err(state_error("previous iterate does not match the history"));
+        if let Some(previous) = previous {
+            self.check_trial(previous)?;
         }
         Ok(TrialState {
+            topology: self.binding.as_ref().map(|binding| binding.topology),
+            revision: Arc::clone(&self.revision),
             values: std::iter::repeat_n(Real::NAN, self.len).collect(),
             mode: LoadMode::newton(phase),
             previous: previous.map(|previous| Arc::clone(&previous.values)),
@@ -331,6 +402,7 @@ impl StateHistory {
                 self.len
             )));
         }
+        self.check_trial(trial)?;
         if let Some(slot) = trial.values.iter().position(|v| !v.is_finite()) {
             return Err(state_error(format!(
                 "trial state slot {slot} is unset or nonfinite"
@@ -346,21 +418,80 @@ impl StateHistory {
     ///
     /// As [`Self::check`].
     pub fn commit(&mut self, trial: TrialState) -> SpiceResult<()> {
-        self.check(&trial)?;
-        self.commit_validated(trial);
+        self.check_publication(&trial, HistoryPublication::Rotate)?;
+        self.commit_validated(trial, HistoryPublication::Rotate);
         Ok(())
     }
 
-    fn commit_validated(&mut self, trial: TrialState) {
-        trial.patches.apply(&mut self.accepted);
-        self.accepted.insert(0, trial.values);
-        self.accepted.truncate(ACCEPTED_DEPTH);
+    fn check_publication(
+        &self,
+        trial: &TrialState,
+        publication: HistoryPublication,
+    ) -> SpiceResult<()> {
+        self.check(trial)?;
+        if publication == HistoryPublication::Initialize && !self.accepted.is_empty() {
+            return Err(state_error(
+                "initial publication requires empty accepted history",
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit_validated(&mut self, trial: TrialState, publication: HistoryPublication) {
+        match publication {
+            HistoryPublication::Initialize => self.accepted.resize(ACCEPTED_DEPTH, trial.values),
+            HistoryPublication::Rotate => {
+                trial.patches.apply(&mut self.accepted);
+                self.accepted.insert(0, trial.values);
+                self.accepted.truncate(ACCEPTED_DEPTH);
+            }
+        }
+        self.revision = Arc::new(());
+    }
+
+    /// Publish the initial accepted point into all integration history slots.
+    /// Each slot shares the same immutable state vector until modified.
+    ///
+    /// # Errors
+    /// Invalid or stale trial, or a history that already contains accepted points.
+    pub fn initialize(&mut self, trial: TrialState) -> SpiceResult<()> {
+        self.check_publication(&trial, HistoryPublication::Initialize)?;
+        self.commit_validated(trial, HistoryPublication::Initialize);
+        Ok(())
+    }
+
+    /// Begin a new inner DC sweep from the state just accepted.
+    pub(crate) fn retain_latest(&mut self) {
+        self.accepted.truncate(1);
+        self.revision = Arc::new(());
+        for history in self.delays.values_mut() {
+            history.clear();
+        }
+    }
+
+    /// Fill a constrained absolute UIC slot in the already loaded trial.
+    pub(crate) fn set_initial_slot(
+        &self,
+        trial: &mut TrialState,
+        slot: usize,
+        value: Real,
+    ) -> SpiceResult<()> {
+        self.check_trial(trial)?;
+        if !trial.initial_conditions() || self.depth() != 0 || !value.is_finite() {
+            return Err(state_error("invalid initial-state override"));
+        }
+        let target = Arc::make_mut(&mut trial.values)
+            .get_mut(slot)
+            .ok_or_else(|| set_error(slot, value))?;
+        *target = value;
+        Ok(())
     }
 
     /// Forgets every accepted vector and delay sample, e.g. when a run
     /// restarts.
     pub fn clear(&mut self) {
         self.accepted.clear();
+        self.revision = Arc::new(());
         for history in self.delays.values_mut() {
             history.clear();
         }
@@ -376,22 +507,76 @@ impl StateHistory {
         trial: &'a mut TrialState,
         range: Range<usize>,
     ) -> SpiceResult<DeviceState<'a>> {
+        if self.binding.is_some() {
+            return Err(state_error(
+                "circuit-bound device state requires a device ordinal",
+            ));
+        }
         self.window(trial, range, None)
     }
 
-    /// [`Self::device`] for the device with ordinal `device`, whose window
-    /// also exposes its delay history, if any ([`DeviceState::delay_history`]).
+    /// Get a circuit-bound device window from its finalized ordinal.
+    ///
+    /// The slot range and delay ordinal cannot be supplied independently.
     ///
     /// # Errors
-    ///
-    /// As [`Self::device`].
+    /// Unbound history, unknown device, or foreign/stale trial.
     pub fn device_of<'a>(
         &'a self,
         trial: &'a mut TrialState,
-        range: Range<usize>,
         device: usize,
     ) -> SpiceResult<DeviceState<'a>> {
+        let range = self
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.rows.get(device))
+            .cloned()
+            .ok_or_else(|| state_error("device ordinal not in finalized state layout"))?;
         self.window(trial, range, self.delays.get(&device))
+    }
+
+    /// Disposable local window with float-mode trial semantics and limiting
+    /// disabled. All source state is read-only; only one device's trial
+    /// slots are allocated. Writes cannot reach the accepted history.
+    pub(super) fn isolated_device<'a>(
+        &'a self,
+        scratch: &'a mut IsolatedState,
+        previous: Option<&'a TrialState>,
+        device: usize,
+    ) -> SpiceResult<DeviceState<'a>> {
+        if let Some(previous) = previous {
+            self.check_trial(previous)?;
+        }
+        let range = self
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.rows.get(device))
+            .cloned()
+            .ok_or_else(|| state_error("device ordinal not in finalized state layout"))?;
+        scratch.values.resize(range.len(), Real::NAN);
+        scratch.values.fill(Real::NAN);
+        scratch.nonconvergent = false;
+        scratch.patches = previous
+            .map(|trial| trial.patches.clone())
+            .unwrap_or_default();
+        let mut mode = LoadMode::newton(IterationPhase::Float);
+        mode.set(LoadFlag::DeviceLimiting, false);
+        let mut accepted = [&[][..]; ACCEPTED_DEPTH];
+        for (slot, vector) in accepted.iter_mut().zip(&self.accepted) {
+            *slot = &vector[range.clone()];
+        }
+        Ok(DeviceState {
+            trial: &mut scratch.values,
+            accepted,
+            depth: self.accepted.len(),
+            mode,
+            previous: previous.map(|trial| &trial.values[range.clone()]),
+            carried: self.carried.as_deref().map(|vector| &vector[range.clone()]),
+            nonconvergent: Some(&mut scratch.nonconvergent),
+            offset: range.start,
+            patches: Some(&mut scratch.patches),
+            delay: self.delays.get(&device),
+        })
     }
 
     fn window<'a>(
@@ -400,6 +585,7 @@ impl StateHistory {
         range: Range<usize>,
         delay: Option<&'a DelayHistory>,
     ) -> SpiceResult<DeviceState<'a>> {
+        self.check_trial(trial)?;
         let complete_trial = trial.values.len() == self.len;
         let ordered_range = range.start <= range.end;
         let bounded_range = range.end <= self.len;
@@ -416,6 +602,7 @@ impl StateHistory {
             previous,
             nonconvergent,
             patches,
+            ..
         } = trial;
         let carried = self.carried.as_deref().map(|vector| &vector[range.clone()]);
         let previous = previous.as_deref().map(|vector| &vector[range.clone()]);
@@ -513,6 +700,8 @@ impl LoadMode {
 /// its state slots; mutating a cloned trial detaches its own vector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrialState {
+    topology: Option<TopologyId>,
+    revision: Arc<()>,
     values: Arc<[Real]>,
     mode: LoadMode,
     previous: Option<Arc<[Real]>>,
@@ -524,6 +713,25 @@ pub struct TrialState {
 }
 
 impl TrialState {
+    /// Retain this load's values without copying its state slots.
+    ///
+    /// # Errors
+    /// The trial is unbound or contains unset or nonfinite values.
+    pub fn snapshot(&self) -> SpiceResult<StateSnapshot> {
+        let topology = self
+            .topology
+            .ok_or_else(|| state_error("unbound trial has no circuit snapshot"))?;
+        if self.values.iter().any(|value| !value.is_finite()) {
+            return Err(state_error(
+                "trial snapshot contains unset or nonfinite values",
+            ));
+        }
+        Ok(StateSnapshot {
+            topology,
+            values: Arc::clone(&self.values),
+        })
+    }
+
     /// The same trial carrying the Newton solve's `reltol` and current
     /// `abstol`, which C's device convergence tests (`DEVconvTest`, run by
     /// `NIconvTest`) use; see [`DeviceState::convergence_tolerances`].
@@ -614,6 +822,22 @@ impl TrialState {
     #[must_use]
     pub fn slice(&self, range: Range<usize>) -> Option<&[Real]> {
         self.values.get(range)
+    }
+}
+
+/// Reusable, device-local disposable state storage for isolated asks.
+#[derive(Debug, Default)]
+pub(super) struct IsolatedState {
+    values: Vec<Real>,
+    nonconvergent: bool,
+    patches: State1Patches,
+}
+
+impl IsolatedState {
+    pub(super) fn clear(&mut self) {
+        self.values.clear();
+        self.patches = State1Patches::default();
+        self.nonconvergent = false;
     }
 }
 
@@ -993,6 +1217,7 @@ mod tests {
         let error = history
             .accept_transaction(
                 trial.clone(),
+                super::HistoryPublication::Rotate,
                 |_, _| Ok(vec![(0, update(1., 3.)), (0, update(2., 4.))]),
                 |_| {
                     hook_ran = true;
@@ -1009,6 +1234,7 @@ mod tests {
             history
                 .accept_transaction(
                     trial.clone(),
+                    super::HistoryPublication::Rotate,
                     |_, _| Ok(updates()),
                     |_| Err(super::state_error("hook refused")),
                 )
@@ -1016,7 +1242,12 @@ mod tests {
         );
         assert_eq!(history, original);
         let breaks = history
-            .accept_transaction(trial, |_, _| Ok(updates()), |_| Ok(()))
+            .accept_transaction(
+                trial,
+                super::HistoryPublication::Rotate,
+                |_, _| Ok(updates()),
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(breaks, vec![4., 3.]);
         assert_eq!(history.accepted(1), Some(&[42.][..]));

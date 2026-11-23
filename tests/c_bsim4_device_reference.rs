@@ -4,9 +4,10 @@
 //! multiply-adds, so this checks agreement to 1e-6 relative; bit-exactness is
 //! judged against the FMA-free oracle with `fidelity-tools` (see
 //! `docs/port/BSIM.md`) and pinned offline in `bsim4_device.rs`.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
@@ -86,29 +87,22 @@ fn inverter(extra: &str) -> String {
     )
 }
 
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 fn c_plots(binary: &Path, deck: &str, label: &str) -> Vec<Plot> {
-    let dir =
-        Scratch(std::env::temp_dir().join(format!("bsim4-dev-{}-{label}", std::process::id())));
-    fs::create_dir_all(&dir.0).unwrap();
+    let dir = Scratch::new("c-bsim4-device-reference").unwrap();
     // The reference build defaults to KLU; the port is SPARSE.
     fs::write(
-        dir.0.join("c.cir"),
+        dir.path().join("c.cir"),
         deck.replace("\n.end\n", "\n.options sparse\n.end\n"),
     )
     .unwrap();
-    let output = Command::new(binary)
-        .args(["-b", "-r", "c.raw", "c.cir"])
-        .current_dir(&dir.0)
-        .output()
-        .unwrap();
-    let raw = RawFile::load(dir.0.join("c.raw")).unwrap_or_else(|e| {
+    let output = run(
+        binary,
+        dir.path(),
+        &["-b", "-r", "c.raw", "c.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .unwrap();
+    let raw = RawFile::load(dir.path().join("c.raw")).unwrap_or_else(|e| {
         panic!(
             "{label}: C wrote no rawfile ({e}): {}",
             String::from_utf8_lossy(&output.stdout)

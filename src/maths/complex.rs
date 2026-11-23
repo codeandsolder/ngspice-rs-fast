@@ -7,10 +7,11 @@
 use std::sync::Arc;
 
 use crate::maths::linear::{
-    ComplexFactors, PivotTolerances, check_status, numerical, order_fresh, square,
+    BatchSolveFailure, ComplexFactors, PivotTolerances, SolveBatchWorkspace, check_status,
+    numerical, order_fresh, square,
 };
 use crate::maths::sparse13::{Sparse, Status};
-use crate::maths::{Pattern, SparseMatrix};
+use crate::maths::{FactorStorage, FactorWork, Pattern, SparseMatrix};
 use crate::primitives::{Complex, SpiceResult};
 
 /// Capacitive contributions grouped at a single matrix element.
@@ -370,6 +371,7 @@ impl ComplexMatrix {
             n: self.n,
             order: self.order_key(),
             factors: ComplexFactors {
+                work: sparse.last_attempt(),
                 sparse: Arc::new(sparse),
             },
         })
@@ -404,6 +406,7 @@ impl ComplexMatrix {
             n: self.n,
             order: self.order_key(),
             factors: ComplexFactors {
+                work: sparse.last_attempt(),
                 sparse: Arc::new(sparse),
             },
         })
@@ -448,15 +451,19 @@ impl ComplexMatrix {
             sparse.reload_originals_iter(entries.iter().map(|&(_, _, v)| v));
         };
         let mut status = sparse.factor_with_workspace(&mut Vec::new());
+        let mut work = sparse.last_attempt();
         if status == Status::ZeroDiag {
+            work.zero_pivot_retries += 1;
             load(&mut sparse);
             status = sparse.order_and_factor(self.pivot.relative, self.pivot.absolute);
+            work += sparse.last_attempt();
         }
         check_status("complex sparse LU", status, &sparse, self.names.as_ref())?;
         Ok(ComplexLu {
             n: self.n,
             order: previous.order.clone(),
             factors: ComplexFactors {
+                work,
                 sparse: Arc::new(sparse),
             },
         })
@@ -471,6 +478,18 @@ pub struct ComplexLu {
     factors: ComplexFactors,
 }
 impl ComplexLu {
+    /// Actual structural and numeric storage in this immutable factor snapshot.
+    #[must_use]
+    pub fn factor_storage(&self) -> FactorStorage {
+        self.factors.sparse.storage()
+    }
+
+    /// Actual work of the operation producing this snapshot.
+    #[must_use]
+    pub const fn factor_work(&self) -> FactorWork {
+        self.factors.work
+    }
+
     /// Solves `A x = b` (`SMPcSolve`).
     /// # Errors
     /// Wrong RHS size, non-finite RHS or solution.
@@ -524,29 +543,62 @@ impl ComplexLu {
         transposed: bool,
         workspace: &mut Vec<Complex>,
     ) -> SpiceResult<Vec<Complex>> {
+        let mut out = Vec::new();
+        self.solve_into(rhs, workspace, &mut out, transposed)?;
+        Ok(out)
+    }
+
+    /// Solve into caller-owned buffers, retaining both internal scratch and
+    /// external-order result capacity between port excitations. The result
+    /// and scratch contents are unspecified on error.
+    pub(crate) fn solve_into(
+        &self,
+        rhs: &[Complex],
+        workspace: &mut Vec<Complex>,
+        out: &mut Vec<Complex>,
+        transposed: bool,
+    ) -> SpiceResult<()> {
         if rhs.len() != self.n || rhs.iter().any(|v| !v.is_finite()) {
             return Err(numerical("complex solve", "invalid RHS"));
         }
-        let factors = self.factors.sparse.factors()?;
-        let x = if transposed {
-            factors.solve_transposed(rhs, workspace)?
-        } else {
-            factors.solve(rhs, workspace)?
-        };
-        if x.iter().any(|v| !v.is_finite()) {
+        self.factors
+            .sparse
+            .factors()?
+            .solve_into(rhs, workspace, out, transposed)?;
+        if out.iter().any(|v| !v.is_finite()) {
             return Err(numerical(
                 "complex solve",
                 "non-finite solution/singular system",
             ));
         }
-        Ok(x)
+        Ok(())
     }
 
-    /// `spDeterminant`: `(mantissa, decimal exponent)`, with C's
-    /// `1 <= max(|re|, |im|) < 10` normalization.
+    /// Solve consecutive RHS-major vectors using one factor traversal per tile.
+    ///
+    /// Output preserves RHS order and external matrix ordering. Transposition
+    /// does not conjugate the factors. Scratch and output capacities are reusable.
+    ///
+    /// # Errors
+    /// Invalid RHS length, non-finite input or solution, or insufficient storage.
+    pub fn solve_batch_into(
+        &self,
+        rhs: &[Complex],
+        workspace: &mut SolveBatchWorkspace<Complex>,
+        out: &mut Vec<Complex>,
+        transposed: bool,
+    ) -> Result<(), BatchSolveFailure> {
+        self.factors
+            .sparse
+            .factors()?
+            .solve_batch_into(rhs, workspace, out, transposed)
+    }
+
+    /// Binary-scaled determinant: `(mantissa, base-2 exponent)` with
+    /// `1 <= max(|re|, |im|) < 2` normalization.
     /// # Errors
     /// Non-finite/invalid inverse factors or an out-of-range exponent.
-    pub fn determinant(&self) -> SpiceResult<(Complex, i32)> {
+    pub fn determinant(&self) -> SpiceResult<(Complex, i64)> {
         self.factors.sparse.factors()?.determinant()
     }
 }

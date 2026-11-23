@@ -2,7 +2,7 @@
 //! operation against independent restatements of `jfetload.c`, finite-
 //! difference Jacobians, gate charge, observations and explicit gaps.
 //! C-golden comparisons live in `xtask golden verify` (`m10_jfet_*`).
-use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
+use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
 use ngspice_rs::devices::{AnalysisMode, Circuit, LoadRequest, ModelContext};
 use ngspice_rs::maths::{SparseMatrix, Vector};
 use ngspice_rs::netlist::ast::ParameterKind;
@@ -231,7 +231,7 @@ fn the_dc_jacobian_matches_finite_differences_over_a_bias_grid() {
     for body in bodies {
         let c = circuit(&body).unwrap();
         let context = ModelContext::default();
-        let history = c.state_history();
+        let history = c.state_history().unwrap();
         let solved = ngspice_rs::analysis::bias::solve_dc(
             &c,
             &context,
@@ -468,4 +468,30 @@ fn decks_round_trip_through_the_writer() {
     )
     .unwrap();
     assert_eq!(write_netlist(&again).unwrap(), written, "{written}");
+}
+
+/// A zero model RD/RS aliases the external and prime nodes. Perturbing the
+/// resistance in the sensitivity replay cannot create an electrical edge.
+#[test]
+fn gate_device_alias_series_parameters_remain_unobservable() {
+    for (designator, model) in [
+        ("j", "njf level=1"),
+        ("j", "njf level=2"),
+        ("z", "nmf level=1"),
+    ] {
+        let card = format!(
+            "vds 1 0 dc 1.5\nvis 1 2 dc 0\nvg 3 0 dc 0.5\n\
+             {designator}1 2 3 0 gm area=2\n.model gm {model} rd=0 rs=0\n\
+             .sens i(vis)"
+        );
+        let netlist = deck(&card).unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let request = config.plan_for(&netlist.analyses[0]).unwrap();
+        let mut c = config.circuit(&netlist).unwrap();
+        let plot = request.run(&mut c, &config.context()).unwrap();
+        for field in ["rd", "rs"] {
+            let column = format!("v({designator}1:{field})");
+            assert_eq!(value(&plot, &column, 0), 0., "{model} {column}");
+        }
+    }
 }

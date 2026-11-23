@@ -455,10 +455,10 @@ fn single_quotes_are_braces_at_every_expression_site() {
         elaborated.netlist.models[0].parameters[0].value,
         "3.000000000000000e-14"
     );
-    // INPevaluate("3.000000000000000e+00") is 3e15 * 1e-15.
+    // The formatted decimal is read back with correct rounding.
     assert_eq!(
         elaborated.netlist.initial_conditions[0].entries[0].literal(),
-        Some(3.0000000000000004)
+        Some(3.)
     );
     // X and .subckt parameter sites.
     let n = deck("x1 a b sub w='2*k'\n.subckt sub a b params: w='1+1'\n.ends");

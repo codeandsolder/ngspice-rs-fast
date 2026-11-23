@@ -10,12 +10,13 @@
 //! `.options reltol=1e-8` (C's default reltol with bypass stops a warm-started
 //! sweep point up to ~4e-4 from its root) and use the `xtask::compare::NONLINEAR`
 //! bound `1e-6 |C| + 1e-12`.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 fn run_c(tag: &str, deck: &str) -> Plot {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN");
@@ -23,25 +24,14 @@ fn run_c(tag: &str, deck: &str) -> Plot {
         Path::new(&binary).is_absolute(),
         "NGSPICE_BIN must be absolute"
     );
-    let dir = std::env::temp_dir().join(format!("spice-dc-param-{}-{tag}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let _cleanup = Cleanup(dir.clone());
+    let scratch = Scratch::new("c-dc-param-sweep-reference").unwrap();
+    let dir = scratch.path();
     fs::write(
         dir.join("c.cir"),
         format!("{deck}\n.control\nset filetype=ascii\nrun\nwrite result.raw\nquit\n.endc\n.end\n"),
     )
     .unwrap();
-    let result = Command::new(binary)
-        .args(["-b", "c.cir"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let result = run(binary, dir, &["-b", "c.cir"], ProcessLimits::ORACLE).unwrap();
     assert!(
         result.status.success(),
         "{tag}: {}\n{}",

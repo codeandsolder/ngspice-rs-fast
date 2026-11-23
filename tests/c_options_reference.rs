@@ -8,26 +8,21 @@
 //! ngspice's default accuracy floors (`reltol` 1e-3, `vntol` 1 uV, `abstol`
 //! 1 pA, as `xtask::compare::TRAN`). Each test also shows that the option
 //! changes the C result beyond that bound, so agreement is not vacuous.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 /// Run `cards` (title first, no analysis, no `.end`) in C with the control
 /// `command` and return the first plot of the written rawfile.
 fn run_c(tag: &str, cards: &str, command: &str) -> Plot {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN");
-    let dir = std::env::temp_dir().join(format!("spice-options-ref-{}-{tag}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let _cleanup = Cleanup(dir.clone());
+    let scratch =
+        Scratch::new("c-options-reference").unwrap_or_else(|error| panic!("{tag}: {error}"));
+    let dir = scratch.path();
     fs::write(
         dir.join("c.cir"),
         format!(
@@ -35,11 +30,7 @@ fn run_c(tag: &str, cards: &str, command: &str) -> Plot {
         ),
     )
     .unwrap();
-    let result = Command::new(binary)
-        .args(["-b", "c.cir"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let result = run(binary, dir, &["-b", "c.cir"], ProcessLimits::ORACLE).unwrap();
     assert!(
         result.status.success(),
         "{}\n{}",

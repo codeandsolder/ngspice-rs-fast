@@ -11,11 +11,11 @@ card 1 @netlists/rc_gear_tran.cir:3:1 lines=3-3 continuations=0
   token 5 3:14 lparen "("
   token 6 3:15 number "0" value=0e0
   token 7 3:17 number "1" value=1e0
-  token 8 3:19 number "100u" value=9.999999999999999e-5
-  token 9 3:24 number "10u" value=9.999999999999999e-6
-  token 10 3:28 number "10u" value=9.999999999999999e-6
+  token 8 3:19 number "100u" value=1e-4
+  token 9 3:24 number "10u" value=1e-5
+  token 10 3:28 number "10u" value=1e-5
   token 11 3:32 number "300u" value=3e-4
-  token 12 3:37 number "800u" value=7.999999999999999e-4
+  token 12 3:37 number "800u" value=8e-4
   token 13 3:41 rparen ")"
 card 2 @netlists/rc_gear_tran.cir:4:1 lines=4-4 continuations=0
   raw: "r1 in out 1k"
@@ -43,7 +43,7 @@ card 5 @netlists/rc_gear_tran.cir:7:1 lines=7-7 continuations=0
   kind: dot(.tran)
   token 1 7:1 word ".tran"
   token 2 7:7 number "2u" value=2e-6
-  token 3 7:10 number "1.2m" value=1.2000000000000001e-3
+  token 3 7:10 number "1.2m" value=1.2e-3
 card 6 @netlists/rc_gear_tran.cir:8:1 lines=8-8 continuations=0
   raw: ".end"
   kind: dot(.end)

@@ -5,21 +5,15 @@
 //! so members `b4temp.c` rewrites are compared against their documented
 //! post-temperature value rather than skipped silently; see
 //! [`TEMPERATURE_REWRITTEN`].
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::devices::{ModelResolver, bsim4};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Members `b4temp.c` overwrites in the model struct after setup, so the C
 /// ask cannot see `b4set.c`'s value. Each is excluded with the C line that
@@ -130,22 +124,19 @@ fn bsim4_model_setup_matches_c_fields() {
             control.push_str(&format!("print {}\n", names.join(" ")));
         }
         control.push_str("quit\n.endc\n.end\n");
-        let directory = Scratch(std::env::temp_dir().join(format!(
-            "bsim4-setup-{}-{}",
-            std::process::id(),
-            label.replace(' ', "-")
-        )));
-        fs::create_dir_all(&directory.0).unwrap();
+        let directory = Scratch::new("c-bsim4-setup-reference").unwrap();
         fs::write(
-            directory.0.join("probe.cir"),
+            directory.path().join("probe.cir"),
             text.replace(".end\n", &control),
         )
         .unwrap();
-        let output = Command::new(&binary)
-            .args(["-b", "probe.cir"])
-            .current_dir(&directory.0)
-            .output()
-            .unwrap();
+        let output = run(
+            &binary,
+            directory.path(),
+            &["-b", "probe.cir"],
+            ProcessLimits::ORACLE,
+        )
+        .unwrap();
         let log = String::from_utf8_lossy(&output.stdout).into_owned()
             + &String::from_utf8_lossy(&output.stderr);
         let actual: BTreeMap<String, f64> = log

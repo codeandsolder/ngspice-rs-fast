@@ -69,6 +69,7 @@ struct PatternIndex {
 #[derive(Debug)]
 pub struct Pattern {
     index: PatternIndex,
+    namespace: Arc<()>,
     ordering: std::sync::Mutex<OrderingState>,
     /// The `(row, col, id)` sequence of the last load, replayed by bound
     /// matrices to skip lookups (ngspice's per-device element pointers).
@@ -84,6 +85,7 @@ pub struct Pattern {
 pub(super) struct OrderingState {
     pub(super) frame: Option<crate::maths::linear::CachedFrame>,
     pub(super) ac_reorder: bool,
+    pub(super) work: crate::maths::PatternWork,
     /// Reused real factor/triangular-solve scratch, owned by the circuit
     /// transaction rather than by an immutable factor snapshot.
     pub(super) solve_workspace: Vec<Real>,
@@ -94,6 +96,7 @@ impl Default for OrderingState {
         Self {
             frame: None,
             ac_reorder: true,
+            work: crate::maths::PatternWork::default(),
             solve_workspace: Vec::new(),
         }
     }
@@ -151,7 +154,9 @@ const FIXED_MAX: usize = u32::BITS as usize;
 impl Clone for Pattern {
     /// A copy without the cached pivot order.
     fn clone(&self) -> Self {
-        Self::with_index(self.index.clone())
+        let mut copy = Self::with_index(self.index.clone());
+        copy.namespace = Arc::clone(&self.namespace);
+        copy
     }
 }
 
@@ -229,6 +234,7 @@ impl Pattern {
     fn with_index(index: PatternIndex) -> Self {
         Self {
             index,
+            namespace: Arc::new(()),
             ordering: std::sync::Mutex::new(OrderingState::default()),
             trace: std::sync::Mutex::new(Arc::new(Trace::default())),
             complex_workspace: std::sync::Mutex::new(Vec::new()),
@@ -275,6 +281,19 @@ impl Pattern {
         result
     }
 
+    /// Read actual work and current valid factor storage in one cache transaction.
+    /// Independent factor snapshots do not update these counters.
+    #[must_use]
+    pub fn factor_telemetry(&self) -> crate::maths::PatternTelemetry {
+        self.with_ordering(|state| crate::maths::PatternTelemetry {
+            work: state.work,
+            storage: state
+                .frame
+                .as_ref()
+                .and_then(crate::maths::linear::CachedFrame::storage),
+        })
+    }
+
     /// Extend in creation order while retaining existing element ids.
     /// # Errors
     /// Invalid coordinates, unsupported compact handle count or allocation.
@@ -287,7 +306,13 @@ impl Pattern {
                 push_compact(&mut positions, position)?;
             }
         }
-        Self::index(self.index.n, positions)
+        let mut extended = Self::index(self.index.n, positions)?;
+        extended.namespace = Arc::clone(&self.namespace);
+        Ok(extended)
+    }
+
+    pub(crate) fn same_namespace(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.namespace, &other.namespace)
     }
 
     /// Matrix positions in stable creation order.
@@ -1466,6 +1491,7 @@ mod tests {
                     pattern.with_ordering(|state| {
                         state.ac_reorder = false;
                         state.solve_workspace.push(42.);
+                        state.work.factor.successful_factors = 9;
                         panic!("interrupted ordering transaction");
                     })
                 })
@@ -1475,6 +1501,7 @@ mod tests {
         pattern.with_ordering(|state| {
             assert!(state.ac_reorder);
             assert!(state.solve_workspace.is_empty());
+            assert_eq!(state.work, crate::maths::PatternWork::default());
             state.ac_reorder = false;
         });
         assert!(!pattern.ordering.is_poisoned());

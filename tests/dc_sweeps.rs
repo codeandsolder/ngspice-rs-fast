@@ -49,7 +49,7 @@ fn op(c: &mut Circuit, context: &AnalysisContext) -> Plot {
 }
 fn close(got: f64, want: f64, relative: f64, absolute: f64) {
     assert!(
-        (got - want).abs() <= relative * want.abs() + absolute,
+        (got - want).abs() <= relative.mul_add(want.abs(), absolute),
         "{got:e} != {want:e}"
     );
 }
@@ -74,12 +74,12 @@ fn assert_no_outer_column(p: &Plot) {
     let names: Vec<_> = p.variables().iter().map(|v| v.name.as_str()).collect();
     assert!(names.iter().all(|n| !n.starts_with("sweep")), "{names:?}");
 }
-fn grid(start: f64, stop: f64, step: f64) -> SpiceResult<Vec<f64>> {
+fn grid(start: f64, stop: f64, increment: f64) -> SpiceResult<Vec<f64>> {
     SweepSpec {
         target: SweepTarget::VoltageSource("v1".into()),
         start,
         stop,
-        step,
+        step: increment,
     }
     .grid()
 }
@@ -93,7 +93,7 @@ fn reachable_inclusive_endpoints_survive_binary_rounding() {
     assert_eq!(g.len(), 4);
     assert_eq!(*g.last().unwrap(), 0.3);
     for (i, v) in g.iter().enumerate() {
-        close(*v, 0.1 * i as f64, 1e-12, 1e-15);
+        close(*v, 0.1 * f64::from(u32::try_from(i).unwrap()), 1e-12, 1e-15);
     }
     let g = grid(0., 1., 0.1).unwrap();
     assert_eq!((g.len(), *g.last().unwrap()), (11, 1.));
@@ -138,12 +138,17 @@ fn invalid_grids_are_rejected_before_any_value_is_produced() {
         (-1e308, 1e308, 1.),    // span overflows
         (0., 1e300, 1.),        // step count overflows the point limit
         (0., 1., 1e-6),         // too many points
-        (0., MAX_SWEEP_POINTS as f64, 1.), // one past the limit
+        (0., f64::from(u32::try_from(MAX_SWEEP_POINTS).unwrap()), 1.), // one past the limit
     ] {
         assert!(grid(start, stop, step).is_err(), "{start} {stop} {step}");
     }
     // Exactly the limit is allowed.
-    let g = grid(0., (MAX_SWEEP_POINTS - 1) as f64, 1.).unwrap();
+    let g = grid(
+        0.,
+        f64::from(u32::try_from(MAX_SWEEP_POINTS - 1).unwrap()),
+        1.,
+    )
+    .unwrap();
     assert_eq!(
         (g.len(), g[MAX_SWEEP_POINTS - 1]),
         (MAX_SWEEP_POINTS, 99_999.)
@@ -191,18 +196,18 @@ fn endpoint_rounding_reaches_the_run() {
     let mut c = circuit("v1 a 0 0\nr1 a 0 1k");
     let p = run(&mut c, &["v1", "0", "0.3", "0.1"]).unwrap();
     assert_eq!(p.point_count(), 4);
-    // ngspice's last value: 0.1 + 0.1 + 0.1, also INPevaluate("0.3").
+    // Accumulated sweep endpoint: three binary64 additions, not a literal.
     assert_eq!(
         *column(&p, "v(v-sweep)").last().unwrap(),
-        0.30000000000000004
+        0.300_000_000_000_000_04
     );
     assert_column(&p, "i(v1)", &[0., -1e-4, -2e-4, -3e-4], 1e-12, 1e-18);
-    // dctrcurv.c accumulates `value += step`: the reverse sweep ends at
-    // 0.3 - 3 * 0.1 in floating point, as ngspice's output does.
+    // Reverse sweep starts at the correctly rounded 0.3. Sequential
+    // subtraction still accumulates in binary64, not exact decimal.
     let p = run(&mut c, &["v1", "0.3", "0", "-0.1"]).unwrap();
     assert_eq!(
         column(&p, "v(v-sweep)").last(),
-        Some(&2.7755575615628914e-17)
+        Some(&(-2.775_557_561_562_891_4e-17))
     );
     assert_eq!(p.point_count(), 4);
     assert_eq!(p.variables()[0].name, "v(v-sweep)");
@@ -242,7 +247,7 @@ fn nested_voltage_grids_are_inner_fast_forward_and_reverse() {
 fn nested_current_and_voltage_grids_forward_and_reverse() {
     // KCL at a: I = va/1k + (va - V2)/1k.
     let mut c = circuit("i1 0 a 0\nv2 b 0 0\nr1 a 0 1k\nr2 a b 1k");
-    let va = |i: f64, v2: f64| (i * 1e3 + v2) / 2.;
+    let va = |i: f64, v2: f64| (i * 1e3).midpoint(v2);
     let p = run(&mut c, &["i1", "0", "2m", "1m", "v2", "0", "2", "2"]).unwrap();
     assert_column(
         &p,
@@ -383,7 +388,7 @@ fn model_backed_sweeps_sweep_the_supplied_scalar_and_keep_temperature_scale_and_
 #[test]
 fn resistor_and_temperature_axes_in_both_orders_recompute_model_backed_values() {
     let mut c = circuit("v1 a 0 1\nr1 a 0 rm\n.model rm r(r=1k tc1=0.01)");
-    let r = |supplied: f64, t: f64| supplied * (1. + 0.01 * (t - 27.));
+    let r = |supplied: f64, t: f64| supplied * (0.01_f64.mul_add(t - 27., 1.));
     let p = run(&mut c, &["r1", "1k", "2k", "1k", "temp", "27", "47", "20"]).unwrap();
     // Only the inner scale is written; i(v1) carries the outer value.
     assert_column(&p, "res-sweep", &[1e3, 2e3, 1e3, 2e3], 1e-12, 0.);
@@ -409,7 +414,7 @@ fn temperature_sweeps_recompute_models_and_instance_temp_stays_fixed() {
     assert_column(&p, "temp-sweep", &[27., 37., 47.], 0., 0.);
     let want: Vec<_> = [27., 37., 47.]
         .iter()
-        .map(|t| -(1. / 1500. + 1. / (1e3 * (1. + 0.01 * (t - 27.)))))
+        .map(|t| -(1. / 1500. + 1. / (1e3 * (0.01_f64.mul_add(t - 27., 1.)))))
         .collect();
     assert_column(&p, "i(v1)", &want, 1e-9, 0.);
 }
@@ -440,11 +445,11 @@ fn nonlinear_circuits_converge_at_every_resistor_point() {
     )
     .unwrap();
     assert_eq!(p.point_count(), 4);
-    let vt = (1.38064852e-23 / 1.6021766208e-19) * 300.15;
+    let vt = (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
     let mut previous = f64::INFINITY;
     for (row, supplied) in [1e3, 2e3, 3e3, 4e3].iter().enumerate() {
         let v = p.value("v(d)", row).unwrap().re;
-        let diode = 1e-14 * ((v / vt).exp() - 1.) + 1e-12 * v;
+        let diode = 1e-12_f64.mul_add(v, 1e-14 * (v / vt).exp_m1());
         close((1. - v) / supplied, diode, 1e-9, 1e-15);
         close(p.value("i(v1)", row).unwrap().re, -diode, 1e-9, 1e-15);
         assert!(
@@ -572,7 +577,7 @@ struct Probe {
     accepted: Rc<Cell<usize>>,
 }
 impl Device for Probe {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "x2"
     }
     fn designator(&self) -> char {
@@ -588,9 +593,8 @@ impl Device for Probe {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal([self.node, NodeId::GROUND], 1e-3, false)
     }
-    fn accept(&self, _: &AcceptContext<'_>) -> SpiceResult<()> {
+    fn accept(&self, _: &AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
-        Ok(())
     }
 }
 fn probe(c: &mut Circuit, node: &str) -> (Rc<Cell<usize>>, Rc<Cell<usize>>) {
@@ -606,6 +610,109 @@ fn probe(c: &mut Circuit, node: &str) -> (Rc<Cell<usize>>, Rc<Cell<usize>>) {
     (loads, accepted)
 }
 
+/// A DC-capable device deliberately lacking AC assembly. A physical sweep
+/// must not require an unrelated analysis implementation at zero bias.
+#[derive(Debug)]
+struct DcOnlyProbe(NodeId);
+
+impl Device for DcOnlyProbe {
+    fn name(&self) -> &'static str {
+        "x_dc_only"
+    }
+    fn designator(&self) -> char {
+        'x'
+    }
+    fn terminals(&self) -> &[NodeId] {
+        std::slice::from_ref(&self.0)
+    }
+    fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+        context.stamp(self.0, self.0, 1e-3)
+    }
+}
+
+#[test]
+fn physical_dc_sweeps_do_not_require_small_signal_assembly() {
+    for args in [["temp", "27", "47", "20"], ["@d1[area]", "1", "2", "1"]] {
+        let mut c = circuit("v1 a 0 1\nd1 0 a dm\n.model dm d");
+        let node = c.nodes().get("a").unwrap();
+        c.add_device(Box::new(DcOnlyProbe(node))).unwrap();
+        c.finalize().unwrap();
+        // Establish that this topology really does support operating point.
+        let bias = op(&mut c, &AnalysisContext::default());
+        close(bias.value("v(a)", 0).unwrap().re, 1., 1e-12, 1e-15);
+        let swept = run(&mut c, &args).unwrap();
+        assert_column(&swept, "v(a)", &[1., 1.], 1e-12, 1e-15);
+    }
+}
+
+/// Input validation is distinct from stamping and solver acceptance. Count
+/// validations, forbid AC assembly, and reject the last physical context.
+#[derive(Debug)]
+struct ContextProbe {
+    node: NodeId,
+    validations: Rc<Cell<usize>>,
+    loads: Rc<Cell<usize>>,
+    accepted: Rc<Cell<usize>>,
+}
+impl Device for ContextProbe {
+    fn name(&self) -> &'static str {
+        "x_context"
+    }
+    fn designator(&self) -> char {
+        'x'
+    }
+    fn terminals(&self) -> &[NodeId] {
+        std::slice::from_ref(&self.node)
+    }
+    fn validate_dc_inputs(&self, context: &ngspice_rs::devices::ModelContext) -> SpiceResult<()> {
+        self.validations.set(self.validations.get() + 1);
+        if context.temperature > 60. {
+            return Err(SpiceError::circuit("context probe temperature limit"));
+        }
+        Ok(())
+    }
+    fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+        self.loads.set(self.loads.get() + 1);
+        context.stamp(self.node, self.node, 1e-3)
+    }
+    fn accept(&self, _: &AcceptContext<'_>) {
+        self.accepted.set(self.accepted.get() + 1);
+    }
+}
+
+#[test]
+fn late_physical_input_error_precedes_newton_and_acceptance() {
+    for args in [
+        ["v1", "0", "2", "1", "temp", "27", "67", "20"],
+        ["temp", "27", "67", "20", "v1", "0", "2", "1"],
+    ] {
+        let mut c = circuit("v1 a 0 1\nr1 a 0 1k");
+        let (validations, loads, accepted) = (
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        c.add_device(Box::new(ContextProbe {
+            node: c.nodes().get("a").unwrap(),
+            validations: validations.clone(),
+            loads: loads.clone(),
+            accepted: accepted.clone(),
+        }))
+        .unwrap();
+        c.finalize().unwrap();
+        let error = run(&mut c, &args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("context probe temperature limit"),
+            "{error}"
+        );
+        assert_eq!(validations.get(), 3);
+        assert_eq!(loads.get(), 0);
+        assert_eq!(accepted.get(), 0);
+    }
+}
+
 /// A nonlinear-flagged 1 mS device that fails numerically when |v| exceeds `limit`,
 /// as a stand-in for a point the nonlinear solver cannot converge.
 #[derive(Debug)]
@@ -615,7 +722,7 @@ struct Gate {
     accepted: Rc<Cell<usize>>,
 }
 impl Device for Gate {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "x1"
     }
     fn designator(&self) -> char {
@@ -640,9 +747,8 @@ impl Device for Gate {
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
         context.nodal([self.node, NodeId::GROUND], 1e-3, false)
     }
-    fn accept(&self, _: &AcceptContext<'_>) -> SpiceResult<()> {
+    fn accept(&self, _: &AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
-        Ok(())
     }
 }
 fn gated(body: &str, limit: f64) -> (Circuit, Rc<Cell<usize>>) {
@@ -792,8 +898,12 @@ fn sweep_points_are_seeded_from_the_previous_accepted_solution() {
 fn rejected(body: &str, args: &[&str], context: &AnalysisContext) -> SpiceError {
     let mut c =
         Circuit::from_netlist_with_context(&netlist(body), &context.model_context()).unwrap();
-    let (_, accepted) = probe(&mut c, "a");
-    let error = run_in(&mut c, args, context).unwrap_err();
+    rejected_circuit(&mut c, args, context)
+}
+
+fn rejected_circuit(c: &mut Circuit, args: &[&str], context: &AnalysisContext) -> SpiceError {
+    let (_, accepted) = probe(c, "a");
+    let error = run_in(c, args, context).unwrap_err();
     assert!(
         !matches!(error, SpiceError::Numerical { .. }),
         "{args:?} was rejected by a mid-run numerical failure, not up front: {error}"
@@ -872,6 +982,115 @@ fn invalid_resistor_and_temperature_values_are_rejected_before_any_sample() {
         &["r1", "1k", "2k", "1k", "temp", "27", "67", "20"],
         &ctx,
     );
+}
+
+#[test]
+fn resistance_only_preflight_validates_the_replacement_clamp() {
+    // The first supplied value is below C's model-backed resistor floor. The
+    // actual setter clamps it to 1e-12 before scale; validating an
+    // unclamped scalar would incorrectly underflow the effective resistance.
+    let mut c = circuit("i1 0 a 0\nr1 a 0 rm 1 scale=1e-290\n.model rm r");
+    let target = c.resistor_override("r1", 1e-200).unwrap();
+    let effective = c
+        .effective_resistance(&target, &AnalysisContext::default().model_context())
+        .unwrap();
+    assert_eq!(effective.to_bits(), (1e-12_f64 * 1e-290).to_bits());
+    let result = run(&mut c, &["r1", "1e-200", "1", "1"]).unwrap();
+    assert_eq!(result.point_count(), 2);
+    assert_column(&result, "v(a)", &[0., 0.], 0., 0.);
+    assert_eq!(c.resistor("r1").unwrap().1.supplied, 1.);
+}
+
+#[test]
+fn late_independent_source_forcing_overflow_is_an_input_error() {
+    let context = AnalysisContext::default();
+    // The parser does not yet accept the C current-source m card setter;
+    // instantiate the same effective source through its public device API.
+    let mut fixed = circuit("r1 a 0 1");
+    let source = IndependentSource::new(
+        "i1",
+        [NodeId::GROUND, fixed.nodes().get("a").unwrap()],
+        false,
+        0.,
+        Complex::real(0.),
+        Waveform::Constant(0.),
+    )
+    .unwrap();
+    fixed
+        .add_device(
+            source
+                .with_instance_parameter("m", 1e200, &context.model_context())
+                .unwrap(),
+        )
+        .unwrap();
+    fixed.finalize().unwrap();
+    let error = rejected_circuit(&mut fixed, &["i1", "0", "1e200", "1e200"], &context);
+    assert!(
+        error
+            .to_string()
+            .contains("nonfinite independent DC forcing"),
+        "{error}"
+    );
+    for (body, args) in [
+        (
+            "i1 0 a 0\nr1 a 0 1",
+            vec!["i1", "0", "1e200", "1e200", "@i1[m]", "0", "1e200", "1e200"],
+        ),
+        (
+            "i1 0 a 0\nr1 a 0 1",
+            vec![
+                "@i1[m]", "0", "1e200", "1e200", "i1", "0", "-1e200", "-1e200",
+            ],
+        ),
+    ] {
+        let error = rejected(body, &args, &context);
+        assert!(
+            error
+                .to_string()
+                .contains("nonfinite independent DC forcing"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn bias_independent_behavioural_overflow_is_rejected_before_samples() {
+    let context = AnalysisContext::default();
+    let error = rejected(
+        "v1 a 0 0\nb1 a 0 i=1e308*(temper-27)\nr1 a 0 1",
+        &["temp", "27", "29", "1"],
+        &context,
+    );
+    assert!(
+        error.to_string().contains("behavioural source b1"),
+        "{error}"
+    );
+}
+
+#[test]
+fn repeated_scalar_context_still_validates_changed_couplings() {
+    let body = "v1 a 0 1\nr1 a b 1\nl1 b 0 1m\nr2 a c 1\nl2 c 0 1m\nr3 a d 1\nl3 d 0 1m\nk1 l1 l2 0.5\nk2 l1 l3 0.5\nk3 l2 l3 0.5";
+    let context = AnalysisContext::default();
+    for args in [
+        vec!["@k3[k]", "0.5", "-0.9", "-0.7"],
+        vec![
+            "temp",
+            "27",
+            "29",
+            "1",
+            "@k3[coefficient]",
+            "0.5",
+            "-0.9",
+            "-0.7",
+        ],
+        vec!["@k3[k]", "0.5", "-0.9", "-0.7", "temp", "27", "29", "1"],
+    ] {
+        let error = rejected(body, &args, &context);
+        assert!(
+            error.to_string().contains("positive semidefinite"),
+            "{error}"
+        );
+    }
 }
 
 // ---- product and work limits ------------------------------------------------------------

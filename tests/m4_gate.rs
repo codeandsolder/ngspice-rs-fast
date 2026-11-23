@@ -193,10 +193,8 @@ fn all_device_charge_pairs_are_disposable_and_integrate_actual_nonlinear_q() {
             None,
         )
         .unwrap();
-        let mut history = c.state_history();
-        for _ in 0..ngspice_rs::devices::ACCEPTED_DEPTH {
-            history.commit(solved.trial.clone()).unwrap();
-        }
+        let mut history = c.state_history().unwrap();
+        history.initialize(solved.trial).unwrap();
         let before = history.clone();
         let mut x = solved.values;
         let row = c.unknowns().node_row(c.nodes().get("a").unwrap()).unwrap();
@@ -375,7 +373,7 @@ fn transistor_small_signal_jacobians_are_derivatives_of_the_dc_equations() {
     ] {
         let c = circuit(body);
         let context = ModelContext::default();
-        let history = c.state_history();
+        let history = c.state_history().unwrap();
         let bias = ngspice_rs::analysis::bias::solve_dc(
             &c,
             &context,
@@ -439,7 +437,7 @@ fn transistor_small_signal_jacobians_are_derivatives_of_the_dc_equations() {
 fn source_stepping_rescues_a_bounded_iteration_budget_without_changing_physics() {
     let c = circuit("i1 0 a 1m\nd1 a 0 dm\n.model dm d(is=1m)");
     let context = ModelContext::default();
-    let history = c.state_history();
+    let history = c.state_history().unwrap();
     let zero = Vector::zeros(c.unknown_count());
     // The legacy global-damping policy, whose iteration counts this bounded
     // budget was designed around (and which the unphased `newton::solve`
@@ -543,12 +541,8 @@ fn gmin_stepping_resolves_a_singular_initial_jacobian_without_accepting_trials()
                 .unwrap_or(0.);
             context.nodal(self.nodes, 3. * v * v, false)
         }
-        fn accept(
-            &self,
-            _: &ngspice_rs::devices::AcceptContext<'_>,
-        ) -> ngspice_rs::primitives::SpiceResult<()> {
+        fn accept(&self, _: &ngspice_rs::devices::AcceptContext<'_>) {
             self.accepted.set(self.accepted.get() + 1);
-            Ok(())
         }
     }
     let mut c = circuit("i1 0 a 1");

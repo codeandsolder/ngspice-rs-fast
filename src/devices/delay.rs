@@ -204,7 +204,7 @@ impl WaveformHistory {
     /// ring order. The update transaction guarantees finite values and
     /// strictly increasing times.
     pub(super) fn samples<const N: usize>(&self) -> SpiceResult<DelaySamples<'_, N>> {
-        if self.width != N || self.is_empty() {
+        if N == 0 || self.width != N || self.is_empty() {
             return Err(delay_error(format!(
                 "expected nonempty history of width {N}, got width {} and length {}",
                 self.width,
@@ -370,6 +370,34 @@ impl<'a, const N: usize> DelaySamples<'a, N> {
         }))
     }
 
+    /// Traverse complete sample rows directly from the two ring slices.
+    /// A wrap can split one row; reconstruct only that row, without copying
+    /// or indexing the rest of the history.
+    pub(super) fn rows(self) -> impl DoubleEndedIterator<Item = [Real; N]> + 'a {
+        let (first, second) = self.history.values.as_slices();
+        let (first_rows, tail) = first.as_chunks::<N>();
+        let (seam, second) = if tail.is_empty() {
+            (None, second)
+        } else {
+            let (head, remaining) = second.split_at(N - tail.len());
+            let seam = std::array::from_fn(|i| {
+                if i < tail.len() {
+                    tail[i]
+                } else {
+                    head[i - tail.len()]
+                }
+            });
+            (Some(seam), remaining)
+        };
+        let (second_rows, remainder) = second.as_chunks::<N>();
+        debug_assert_eq!(remainder, []);
+        first_rows
+            .iter()
+            .copied()
+            .chain(seam)
+            .chain(second_rows.iter().copied())
+    }
+
     pub(super) fn sample(self, index: usize) -> [Real; N] {
         let start = index * N;
         std::array::from_fn(|component| self.history.values[start + component])
@@ -483,6 +511,7 @@ pub trait DelayLine: fmt::Debug {
 mod tests {
     use super::{WaveformHistory, WaveformUpdate};
     use crate::primitives::Real;
+    use std::collections::VecDeque;
 
     fn sample(time: f64, value: f64) -> (f64, Vec<f64>) {
         (time, vec![value, -value])
@@ -511,6 +540,31 @@ mod tests {
         }
         history.clear();
         assert!(history.samples::<2>().is_err());
+    }
+
+    #[test]
+    fn slice_rows_preserve_a_split_sample_in_both_directions() {
+        // A VecDeque can have a capacity that is not a multiple of the row
+        // width. Construct a full logical history with a three-value seam.
+        let mut values = VecDeque::with_capacity(35);
+        let offset = values.capacity() - 3;
+        values.resize(offset, -1.);
+        values.drain(..offset - 1);
+        values.extend((0..32).map(Real::from));
+        assert_eq!(values.pop_front(), Some(-1.));
+        assert_eq!(values.as_slices().0.len(), 3);
+        let history = WaveformHistory {
+            width: 4,
+            times: (0..8).map(Real::from).collect(),
+            values,
+        };
+        let view = history.samples::<4>().unwrap();
+        let expected: Vec<_> = (0..8).map(|i| view.sample(i)).collect();
+        assert_eq!(view.rows().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            view.rows().rev().collect::<Vec<_>>(),
+            expected.into_iter().rev().collect::<Vec<_>>()
+        );
     }
 
     #[test]
