@@ -31,7 +31,10 @@ eliminate aliasing for arbitrary nonlinear exp/pow devices: harmonic
 order and sample-resolution convergence require independent checks.
 Mode order, samples, tone rational groups and conjugate mapping are
 deterministic and validated before allocating. Coefficient/sample and
-direct DFT-work budgets prevent combinatorial growth and overflow.
+separable DFT-work budgets prevent combinatorial growth and overflow.
+The transform uses per-axis cached twiddle factors, avoiding repeated
+sin/cos evaluations and reducing the direct multidimensional DFT
+product cost to the sum of axis transform costs.
 
 ## Physical MNA and analytical Jacobian
 

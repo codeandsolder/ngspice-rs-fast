@@ -246,13 +246,38 @@ impl HarmonicProblem {
         {
             return Err(numerical("invalid Newton tolerance or iteration budget"));
         }
-        // Upper bound for one full analytic Newton cycle, with the
-        // multidimensional direct DFT used for every Jv basis action.
-        let work = variables
-            .checked_mul(variables)
-            .and_then(|value| value.checked_mul(plan.sample_count()))
-            .and_then(|value| value.checked_mul(unknowns))
-            .ok_or_else(|| numerical("harmonic Newton work product overflow"))?;
+        // Charge actual separable transforms, nonlinear dense sample
+        // Jacobian products, linear MNA modes and factorization, rather
+        // than the obsolete full-grid DFT complexity. This is a bound
+        // on one complete analytical Newton assembly/solve attempt.
+        let square = unknowns
+            .checked_mul(unknowns)
+            .ok_or_else(|| numerical("MNA derivative work overflow"))?;
+        let dft = unknowns
+            .checked_mul(plan.transform_products())
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| numerical("harmonic transform work overflow"))?;
+        let nonlinear = square
+            .checked_mul(plan.sample_count())
+            .ok_or_else(|| numerical("nonlinear sample work overflow"))?;
+        let linear = square
+            .checked_mul(plan.modes().len())
+            .ok_or_else(|| numerical("linear harmonic work overflow"))?;
+        let basis = dft
+            .checked_add(nonlinear)
+            .and_then(|v| v.checked_add(linear))
+            .ok_or_else(|| numerical("harmonic basis work overflow"))?;
+        let dofs = variables;
+        let assembly = basis
+            .checked_mul(dofs.saturating_add(1))
+            .ok_or_else(|| numerical("harmonic Jacobian work overflow"))?;
+        let factor = dofs
+            .checked_mul(dofs)
+            .and_then(|v| v.checked_mul(dofs))
+            .ok_or_else(|| numerical("harmonic dense factor work overflow"))?;
+        let work = assembly
+            .checked_add(factor)
+            .ok_or_else(|| numerical("harmonic Newton work overflow"))?;
         if work > limits.work_units {
             return Err(numerical(
                 "harmonic Newton work exceeds the configured budget",

@@ -119,6 +119,8 @@ pub struct HarmonicPlan {
     axes: Vec<Axis>,
     modes: Vec<HarmonicPoint>,
     sample_count: usize,
+    /// Actual per-scalar forward plus inverse separable complex DFT products.
+    transform_products: usize,
     /// Physical source frequencies after explicit ratio resolution.
     tones_hz: Vec<Real>,
     /// Per-tone group and signed integer weight, for load/forcing routing.
@@ -261,13 +263,40 @@ impl HarmonicPlan {
                     .ok_or_else(|| invalid("harmonic axis size overflow"))?,
             )?;
         }
-        let dft_work = checked_mul(sample_count, mode_count)?;
+        // Count the multiplications performed by the actual separable
+        // transforms, not the old O(samples × modes) direct DFT. Both the
+        // forward and inverse passes have different intermediate shapes.
+        let mut forward_length = sample_count;
+        let mut forward_products = 0_usize;
+        for axis in &axes {
+            let modes = 2 * axis.order + 1;
+            forward_length = checked_mul(forward_length / axis.samples, modes)?;
+            let stage = checked_mul(forward_length, axis.samples)?;
+            forward_products = forward_products
+                .checked_add(stage)
+                .ok_or_else(|| invalid("forward transform work overflow"))?;
+        }
+        let mut inverse_length = mode_count;
+        let mut inverse_products = 0_usize;
+        for axis in axes.iter().rev() {
+            let modes = 2 * axis.order + 1;
+            inverse_length = checked_mul(inverse_length / modes, axis.samples)?;
+            let stage = checked_mul(inverse_length, modes)?;
+            inverse_products = inverse_products
+                .checked_add(stage)
+                .ok_or_else(|| invalid("inverse transform work overflow"))?;
+        }
+        debug_assert_eq!(forward_length, mode_count);
+        debug_assert_eq!(inverse_length, sample_count);
+        let transform_products = forward_products
+            .checked_add(inverse_products)
+            .ok_or_else(|| invalid("total separable transform work overflow"))?;
         if mode_count > limits.coefficients
             || sample_count > limits.samples
-            || dft_work > limits.dft_products
+            || transform_products > limits.dft_products
         {
             return Err(invalid(format!(
-                "lattice requires {mode_count} coefficients, {sample_count} samples, {dft_work} projection terms; budget is {}/{}/{}",
+                "lattice requires {mode_count} coefficients, {sample_count} samples, {transform_products} separable DFT products; budget is {}/{}/{}",
                 limits.coefficients, limits.samples, limits.dft_products
             )));
         }
@@ -359,6 +388,7 @@ impl HarmonicPlan {
             axes,
             modes,
             sample_count,
+            transform_products,
             tones_hz,
             weights,
             twiddles,
@@ -381,6 +411,13 @@ impl HarmonicPlan {
     #[must_use]
     pub const fn sample_count(&self) -> usize {
         self.sample_count
+    }
+
+    /// Exact estimated complex products for one forward and inverse
+    /// separable transform at a single MNA unknown.
+    #[must_use]
+    pub const fn transform_products(&self) -> usize {
+        self.transform_products
     }
 
     /// Original sources' physical frequencies in declaration order.
