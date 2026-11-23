@@ -535,6 +535,26 @@ fn the_lossless_shortcut_transmits_the_matched_wave() {
 }
 
 #[test]
+fn a_large_finite_delay_cannot_transmit_before_its_time_of_flight() {
+    // sqrt(L*C)*length = 10^10 seconds despite L*C overflowing binary64.
+    // The simulator still records history only in its existing signed-i32
+    // picosecond window; this run stays inside the window and before arrival.
+    let plot = run_with_options(
+        "v1 a 0 dc 0 pulse(0 1 1n 0.1n 0.1n 100n 200n)\n\
+         y1 a 0 b 0 ym\nrl b 0 1\n\
+         .model ym txl r=0 l=1e160 c=1e160 g=0 length=1e-150\n\
+         .options reltol=1e-6 vntol=1e-9 abstol=1e-14",
+        AnalysisKind::Transient,
+        &["0.1n", "8n"],
+    );
+    let last = plot.point_count() - 1;
+    close(value(&plot, "v(a)", last), 1., 1e-6, 1e-9);
+    for i in 0..plot.point_count() {
+        close(value(&plot, "v(b)", i), 0., 0., 1e-10);
+    }
+}
+
+#[test]
 fn invalid_domains_overflow_and_uic_are_explicit_errors() {
     for (from, to) in [
         ("r=12.45", "r=-1"),
@@ -548,7 +568,6 @@ fn invalid_domains_overflow_and_uic_are_explicit_errors() {
     // ReadTxL's lossless shortcut must not bypass finite derived-value checks.
     for model in [
         "r=0 l=1e308 c=1e308 g=0 length=1",
-        "r=0 l=1e-12 c=1e308 g=0 length=1",
         "r=0 l=1e-12 c=1e-300 g=0 length=1e-300",
     ] {
         let error = circuit(&format!(
@@ -557,6 +576,15 @@ fn invalid_domains_overflow_and_uic_are_explicit_errors() {
         .unwrap_err();
         assert!(error.to_string().contains("admittance/delay"), "{error}");
     }
+    // This previously failed because C/L overflowed, although its square
+    // root and complete propagation delay are both representable.
+    assert!(
+        circuit(
+            "v1 a 0 1\ny1 a 0 b 0 ym\nrl b 0 50\n\
+                 .model ym txl r=0 l=1e-12 c=1e308 g=0 length=1"
+        )
+        .is_ok()
+    );
     let mut c = circuit(PADE).unwrap();
     let mut request = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1n", "10n"]);
     request.uic = true;
@@ -566,6 +594,30 @@ fn invalid_domains_overflow_and_uic_are_explicit_errors() {
         .unwrap_err();
     assert!(error.is_not_yet_ported(), "{error}");
     assert!(error.to_string().contains("uic"), "{error}");
+}
+
+#[test]
+fn extreme_lossless_geometry_is_accepted_through_production_elaboration() {
+    for (l, c, length) in [
+        ("1e300", "1e-100", "1e-100"),
+        ("1e160", "1e160", "1e-150"),
+        ("1e-12", "1e308", "1"),
+        ("1e308", "1e308", "1e-308"),
+    ] {
+        let body = format!(
+            "v1 a 0 1\ny1 a 0 b 0 ym\nrl b 0 50\n.model ym txl r=0 l={l} c={c} g=0 length={length}"
+        );
+        let mut ckt = circuit(&body).unwrap_or_else(|error| panic!("{body}: {error}"));
+        let op = run(&mut ckt, AnalysisKind::OperatingPoint, &[]);
+        assert_eq!(op.point_count(), 1);
+        assert!(
+            op.row(0)
+                .unwrap()
+                .iter()
+                .all(|value| value.re.is_finite() && value.im.is_finite()),
+            "{body}"
+        );
+    }
 }
 
 /// Every unsupported path names its C reference instead of simulating
