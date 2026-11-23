@@ -58,11 +58,11 @@ pub use plan::{
     ParameterScopeSpec, ParameterSlot,
 };
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use crate::primitives::ascii::folded;
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 use petgraph::Direction;
 use petgraph::algo::{kosaraju_scc, toposort};
@@ -200,7 +200,7 @@ impl<'a> SequentialBindings<'a> {
     }
 
     fn get(&self, name: &str) -> Option<Real> {
-        let key = canonical_lookup(name);
+        let key = folded(name);
         self.values
             .get(key.as_ref())
             .copied()
@@ -227,7 +227,7 @@ impl<'a> SequentialBindings<'a> {
                 "sequential binding limit exceeded",
             ));
         }
-        let key = canonical_lookup(name);
+        let key = folded(name);
         if let Some(previous) = self.values.get_mut(key.as_ref()) {
             *previous = value;
         } else {
@@ -824,7 +824,7 @@ impl ParamScope {
     /// The value of `name` (case-insensitive), searching enclosing scopes.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Real> {
-        let key = canonical_lookup(name);
+        let key = folded(name);
         let mut scope = self;
         loop {
             if let Some(&i) = scope.active.get(key.as_ref())
@@ -1023,7 +1023,7 @@ impl FunctionScope {
     /// enclosing scopes, with the scope it was defined in.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<(&FunctionDef, &Self)> {
-        let key = canonical_lookup(name);
+        let key = folded(name);
         let mut scope = self;
         loop {
             if let Some(&i) = scope.active.get(key.as_ref()) {
@@ -1031,16 +1031,6 @@ impl FunctionScope {
             }
             scope = scope.parent.as_deref()?;
         }
-    }
-}
-
-/// Parser-produced names are already canonical. Public lookups also accept
-/// mixed ASCII case, without allocating for the common canonical path.
-fn canonical_lookup(name: &str) -> Cow<'_, str> {
-    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        Cow::Owned(name.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(name)
     }
 }
 

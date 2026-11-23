@@ -6,8 +6,9 @@
 //! variables and points, which is what a rawfile contains, and leaves plotting
 //! to whoever consumes the result.
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
+use crate::primitives::ascii::folded;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 /// Ordered output lifecycle for every plot produced by an analysis.
@@ -336,14 +337,6 @@ pub struct PlotSchema {
     names: HashMap<String, usize>,
     voltages: HashMap<String, usize>,
     currents: HashMap<String, usize>,
-}
-
-fn folded(name: &str) -> Cow<'_, str> {
-    if name.bytes().any(|b| b.is_ascii_uppercase()) {
-        Cow::Owned(name.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(name)
-    }
 }
 
 impl PlotSchema {

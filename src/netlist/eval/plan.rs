@@ -2,11 +2,12 @@
 
 use super::{
     Bindings, DefinitionState, DependencyReference, EvalBudget, Failure, FunctionScope,
-    ParamBinding, ParamScope, ParamState, RefScan, ScopeDefinitions, canonical_lookup,
-    collect_definitions, evaluate_definition, evaluate_root,
+    ParamBinding, ParamScope, ParamState, RefScan, ScopeDefinitions, collect_definitions,
+    evaluate_definition, evaluate_root,
 };
 use crate::netlist::ast::ParamCard;
 use crate::netlist::expr::ParameterExpression;
+use crate::primitives::ascii::folded;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -164,7 +165,7 @@ impl ParameterPlan {
     }
 
     fn lookup_slot(&self, mut scope: Option<ParameterScopeId>, name: &str) -> Option<usize> {
-        let key = canonical_lookup(name);
+        let key = folded(name);
         while let Some(id) = scope {
             let current = self.scopes.get(id.0)?;
             if let Some(&local) = current.baseline.active.get(key.as_ref()) {
@@ -212,7 +213,7 @@ impl ParameterPlan {
         let mut undefined = None;
         scan.refs(&expression.root, 0, &mut |name, location| {
             if let Some(index) = self.lookup_slot(Some(scope), name) {
-                direct.insert(canonical_lookup(name).into_owned(), index);
+                direct.insert(folded(name).into_owned(), index);
             } else if undefined.is_none() {
                 undefined = Some((name.to_owned(), location.clone()));
             }
@@ -429,7 +430,7 @@ fn select_tunables(
     let mut selected = HashSet::new();
     let mut inputs = Vec::with_capacity(tunables.len());
     for name in tunables {
-        let key = canonical_lookup(name);
+        let key = folded(name);
         let Some(&local) = definitions.active.get(key.as_ref()) else {
             return Err(SpiceError::circuit(format!(
                 "unknown local tunable '{name}'"
@@ -556,7 +557,7 @@ impl CandidateParameters<'_> {
             &|name| {
                 bound
                     .direct
-                    .get(canonical_lookup(name).as_ref())
+                    .get(folded(name).as_ref())
                     .and_then(|&index| self.values[index])
             },
             baseline.functions.as_deref(),
