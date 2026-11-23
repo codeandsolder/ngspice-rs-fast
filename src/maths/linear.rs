@@ -449,6 +449,14 @@ impl SparseSymbolic {
         solve_real(&self.sparse, self.n, rhs, workspace, false)
     }
 
+    fn solve_transposed_with_workspace(
+        &self,
+        rhs: &Vector,
+        workspace: &mut Vec<f64>,
+    ) -> SpiceResult<Vector> {
+        solve_real(&self.sparse, self.n, rhs, workspace, true)
+    }
+
     /// Whether a matrix has exactly this assembled pattern.
     pub fn matches(&self, matrix: &SparseMatrix) -> bool {
         if matrix.rows() != self.n || matrix.cols() != self.n {
@@ -856,47 +864,46 @@ fn ni_step(
 /// # Errors
 /// An invalid RHS or a non-finite solution.
 pub fn solve_last_factors(pattern: &Arc<Pattern>, rhs: &Vector) -> SpiceResult<Option<Vector>> {
+    solve_last_factors_direction(pattern, rhs, false)
+}
+
+/// Solve `A^T λ = g` from the circuit's retained primal factorization.
+///
+/// This is an ordinary *transpose*, not an inverse of the transposed input
+/// stamps and not a separately factorized Jacobian. Objective derivatives
+/// use one such solve for all parameter residuals at the same bias.
+///
+/// # Errors
+/// Invalid RHS or non-finite solution. Returns `None` if the circuit's
+/// previously factored matrix has been invalidated.
+pub(crate) fn solve_last_factors_transposed(
+    pattern: &Arc<Pattern>,
+    rhs: &Vector,
+) -> SpiceResult<Option<Vector>> {
+    solve_last_factors_direction(pattern, rhs, true)
+}
+
+fn solve_last_factors_direction(
+    pattern: &Arc<Pattern>,
+    rhs: &Vector,
+    transpose: bool,
+) -> SpiceResult<Option<Vector>> {
     pattern.with_ordering(|state| {
         match &state.frame {
             Some(CachedFrame::Real(symbolic))
                 if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
                     && symbolic.sparse.is_factored() =>
             {
-                let result = symbolic.solve_with_workspace(rhs, &mut state.solve_workspace);
+                let result = if transpose {
+                    symbolic.solve_transposed_with_workspace(rhs, &mut state.solve_workspace)
+                } else {
+                    symbolic.solve_with_workspace(rhs, &mut state.solve_workspace)
+                };
                 state.work.record_rhs(&result);
                 Some(result)
             }
             _ => None,
         }.transpose()
-    })
-}
-
-/// Solve independent RHS vectors while holding one cache transaction.
-/// Unlike a new factorization this cannot change the cached pivot order.
-pub(crate) fn solve_last_factors_batch_into(
-    pattern: &Arc<Pattern>,
-    rhs: &[f64],
-    workspace: &mut SolveBatchWorkspace<f64>,
-    out: &mut Vec<f64>,
-) -> Result<bool, BatchSolveFailure> {
-    pattern.with_ordering(|state| {
-        let Some(CachedFrame::Real(symbolic)) = &state.frame else {
-            return Ok(false);
-        };
-        if !matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
-            || !symbolic.sparse.is_factored()
-        {
-            return Ok(false);
-        }
-        let result = symbolic.sparse.factors()?.solve_batch_into(rhs, workspace, out, false);
-        // Count delivered RHS solutions, not traversals or SIMD tiles.
-        if result.is_ok() {
-            let count = rhs.len().checked_div(symbolic.n).unwrap_or(0);
-            state.work.rhs_solves = state.work.rhs_solves.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-        } else {
-            state.work.rhs_failures = state.work.rhs_failures.saturating_add(1);
-        }
-        result.map(|()| true)
     })
 }
 
@@ -1315,6 +1322,40 @@ mod tests {
         assert_ne!(read(), initial);
         assert_eq!(snapshot.solve(&[Complex::real(1.)]).unwrap(), x);
         assert_ne!(next.solve(&[Complex::real(1.)]).unwrap(), x);
+    }
+
+    #[test]
+    fn retained_sparse_transpose_projects_one_objective_without_refactoring() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
+        let mut matrix = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        for (r, c, value) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 2.), (1, 1, 4.)] {
+            matrix.set(r, c, value).unwrap();
+        }
+        let source = Vector::from_slice(&[5., 7.]);
+        assert!(matches!(
+            solve_ni(&matrix, &source, &mut None, false, 0.).unwrap(),
+            NiStep::Solved(_)
+        ));
+        let output = Vector::from_slice(&[1., -1.]);
+        let adjoint = solve_last_factors_transposed(&pattern, &output)
+            .unwrap()
+            .unwrap();
+        let expected = [0.6, -0.4];
+        for (actual, want) in adjoint.as_slice().iter().zip(expected) {
+            assert!((*actual - want).abs() < 1e-14);
+        }
+        let primal = solve_last_factors(&pattern, &source).unwrap().unwrap();
+        let projected = adjoint.as_slice()[0] * source.as_slice()[0]
+            + adjoint.as_slice()[1] * source.as_slice()[1];
+        let directly = primal.as_slice()[0] - primal.as_slice()[1];
+        assert!((projected - directly).abs() < 1e-14);
+        matrix.set(0, 0, f64::from_bits(1)).unwrap();
+        assert!(solve_ni(&matrix, &source, &mut None, false, 0.).is_err());
+        assert!(
+            solve_last_factors_transposed(&pattern, &output)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
