@@ -53,7 +53,7 @@ fn short_header(
     RawPlot {
         title: "direct rawfile C reader".to_owned(),
         date: "Mon Nov 23 12:00:00 2026".to_owned(),
-        command: "spice-rs".to_owned(),
+        command: "ngspice-47+, Build".to_owned(),
         plot: plot.build(),
     }
 }
@@ -177,7 +177,7 @@ fn c_reads_backpatched_counts_in_both_formats() {
             .begin_plot(short_header(
                 "pz1",
                 "Pole-Zero Analysis",
-                PlotFlags::Complex,
+                PlotFlags::Real,
                 &[],
             ))
             .unwrap();
@@ -188,7 +188,33 @@ fn c_reads_backpatched_counts_in_both_formats() {
         let parsed = RawFileReader::new(bytes.as_slice()).read().unwrap();
         assert_eq!(parsed.plots[0].plot.point_count(), 1);
         assert_eq!(parsed.plots[0].plot.variable_count(), 0);
-        c_loads_file(&ngspice, dir, name, &[]);
+        // C raw_read itself cannot materialize a plot with no vectors.
+        // In ASCII it rejects C's own rootless-PZ "0<TAB>" row; binary has
+        // no bytes for that row and may report "no data read". The Rust
+        // decoder must retain the authentic one-row/zero-column shape.
+        let script = dir.join("load.cir");
+        fs::write(
+            &script,
+            format!(
+                "Rootless PZ reader limit\n.control\nload {}\nquit\n.endc\n.end\n",
+                dir.join(name).display()
+            ),
+        )
+        .unwrap();
+        let result = run(&ngspice, dir, &["-b", "load.cir"], ProcessLimits::ORACLE).unwrap();
+        assert!(result.status.success());
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stdout.contains("Loading raw data file"),
+            "{stdout}\n{stderr}"
+        );
+        if format == RawFormat::Ascii {
+            assert!(
+                stderr.contains("strange line in rawfile"),
+                "C unexpectedly changed zero-column ASCII semantics:\n{stdout}\n{stderr}"
+            );
+        }
     }
 }
 
@@ -284,7 +310,7 @@ fn direct_zero_row_and_zero_width_pz_have_exact_shapes() {
             .unwrap();
         writer.finish_plot().unwrap();
         writer
-            .begin_plot(header("pz1", "Pole-Zero Analysis", PlotFlags::Complex, 0))
+            .begin_plot(header("pz1", "Pole-Zero Analysis", PlotFlags::Real, 0))
             .unwrap();
         writer.push_point(&[]).unwrap();
         writer.finish_plot().unwrap();

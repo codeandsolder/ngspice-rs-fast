@@ -365,7 +365,7 @@ pub struct RawFileWriter {
 
 impl RawFileWriter {
     /// Creates a non-atomic seekable rawfile writer, truncating an existing file.
-    /// Use RawFileTransaction to publish complete output atomically.
+    /// Use `RawFileTransaction` to publish complete output atomically.
     ///
     /// # Errors
     /// Failure to open or create the output.
@@ -488,7 +488,7 @@ impl RawFileWriter {
         self.active.as_ref().map(|plot| &plot.header)
     }
 
-    /// The number of points written since begin_plot.
+    /// The number of points written since `begin_plot`.
     #[must_use]
     pub fn active_point_count(&self) -> Option<usize> {
         self.active.as_ref().map(|plot| plot.point_count)

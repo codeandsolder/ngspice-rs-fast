@@ -163,7 +163,7 @@ pub(super) fn read_row(
 const BLOCK_BYTES: usize = 32 * 1024;
 
 /// Reusable encoding scratch. Both retained and directly streamed plots
-/// coalesce rows into bounded blocks; finish_plot flushes the final partial
+/// coalesce rows into bounded blocks; `finish_plot` flushes the final partial
 /// block before backpatching the point count. The allocation is lazy, so ASCII
 /// and zero-width binary plots do not allocate it.
 #[derive(Debug, Default)]
