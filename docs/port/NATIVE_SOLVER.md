@@ -389,3 +389,13 @@ transpose solves at 1, 2, 4, 8, 32 and 64 RHS with warm reusable buffers:
 ```sh
 cargo +nightly test --release --lib sparse_rhs_batch_benchmark -- --ignored --nocapture
 ```
+
+### Independent AC frequency factors
+
+Independent `.ac`, `.sp` and `.noise` frequency points reuse the previous valid complex pivot order and packed factor traversal. A bounded four-lane numeric tile stores real/imaginary coefficients and pivots in element-handle order (AoSoA), with one numeric factor snapshot per frequency. Ordinary Schur updates use portable SIMD; lanes near cancellation or exponent limits use scalar recovery. A zero/nonfinite pivot stops only its lane, which retries scalar refactoring and, on zero pivots, scalar reordering.
+
+The final numeric factor is committed to the circuit's factor cache. Frequency output, integration and RF resource accounting stay ordered. `hertz`-dependent rebiasing, frequency-dependent small-signal stamps and singleton sweeps remain sequential. The tile width is independent of logical sweep length. For a fair optional fixed-order benchmark:
+
+```sh
+cargo +nightly test --release --lib batched_complex_frequency_factor_benchmark -- --ignored --nocapture
+```

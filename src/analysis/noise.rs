@@ -57,6 +57,9 @@ use crate::analysis::results::{Plot, PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan};
 use crate::devices::noise::{InstanceNoise, prepared_noise, squared_gain};
 use crate::devices::{Circuit, LinearSystem, SourceKind};
+use crate::maths::complex::ComplexMatrix;
+use crate::maths::linear::RHS_BATCH_WIDTH;
+use crate::maths::sparse13::ComplexFactorBatch;
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
 
 mod integration;
@@ -762,17 +765,15 @@ pub(super) fn run(
     let mut integrated_power = Power::default();
     let mut last = card.start;
     let mut row = NoiseRow::new(representation, spectrum.variable_count());
-    for (step, &freq) in frequencies.iter().enumerate() {
-        let input_name = card.input.as_str();
-        let (forward, adjoint) = small.at_frequency(context, freq, |system| {
-            let matrix =
-                crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * freq)?;
-            let lu = matrix.factorize()?;
-            Ok((
-                lu.solve(&input_rhs(system, input_name)?)?,
-                lu.solve_transposed(&adjoint_rhs)?,
-            ))
-        })?;
+    // The accumulator is strictly sequential: integration, generator state,
+    // summaries and sink rows keep the C frequency order even when numeric
+    // factorizations are produced in independent SIMD lanes.
+    let mut consume = |step: usize,
+                       freq: Real,
+                       forward: &[Complex],
+                       adjoint: &[Complex],
+                       small: &crate::analysis::ac::SmallSignal<'_>|
+     -> SpiceResult<()> {
         // A device whose small-signal load depends on the frequency also
         // describes its generators at that frequency (`b4noi.c` evaluates
         // its flicker factor and correlated gate noise at `data->freq`).
@@ -787,7 +788,7 @@ pub(super) fn run(
                 )?,
             )?;
         }
-        let gain_sq_inv = 1. / gain(circuit, &forward, output)?.max(N_MINGAIN);
+        let gain_sq_inv = 1. / gain(circuit, forward, output)?.max(N_MINGAIN);
         let sample = NoiseSample::new(freq, last, gain_sq_inv, card.start, card.summary != 0);
         let print_summary = card.summary != 0 && step.is_multiple_of(card.summary);
         let mut out_density = 0.;
@@ -799,7 +800,7 @@ pub(super) fn run(
         for g in &mut generators {
             out_density += g.accumulate(
                 &sample,
-                |nodes| difference(circuit, &adjoint, nodes),
+                |nodes| difference(circuit, adjoint, nodes),
                 &mut integrated_power,
                 print_summary.then_some(&mut row),
             )?;
@@ -821,6 +822,55 @@ pub(super) fn run(
             sink.point(&row.values)?;
         }
         last = freq;
+        Ok(())
+    };
+    if frequencies.len() > 1 && !small.varies() && !small.reassembles() {
+        let input = input_rhs(small.system(), card.input.as_str())?;
+        let mut work = ComplexFactorBatch::default();
+        let mut previous = None;
+        for (tile, group) in frequencies.chunks(RHS_BATCH_WIDTH).enumerate() {
+            let mut matrices = Vec::new();
+            matrices
+                .try_reserve(group.len())
+                .map_err(|error| noise_failure(&format!("frequency tile capacity: {error}")))?;
+            for &freq in group {
+                matrices.push(crate::analysis::ac::ac_matrix(
+                    circuit,
+                    small.system(),
+                    2. * std::f64::consts::PI * freq,
+                )?);
+            }
+            let factors = ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
+            for (lane, (&freq, factor)) in group.iter().zip(&factors).enumerate() {
+                let forward = factor.solve(&input)?;
+                let adjoint = factor.solve_transposed(&adjoint_rhs)?;
+                consume(
+                    tile * RHS_BATCH_WIDTH + lane,
+                    freq,
+                    &forward,
+                    &adjoint,
+                    &small,
+                )?;
+            }
+            previous = factors.into_iter().last();
+        }
+    } else {
+        for (step, &freq) in frequencies.iter().enumerate() {
+            let input_name = card.input.as_str();
+            let (forward, adjoint) = small.at_frequency(context, freq, |system| {
+                let matrix = crate::analysis::ac::ac_matrix(
+                    circuit,
+                    system,
+                    2. * std::f64::consts::PI * freq,
+                )?;
+                let lu = matrix.factorize()?;
+                Ok((
+                    lu.solve(&input_rhs(system, input_name)?)?,
+                    lu.solve_transposed(&adjoint_rhs)?,
+                ))
+            })?;
+            consume(step, freq, &forward, &adjoint, &small)?;
+        }
     }
     sink.end()?;
     if card.start.to_bits() != card.stop.to_bits() {
