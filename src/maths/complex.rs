@@ -412,6 +412,87 @@ impl ComplexMatrix {
         })
     }
 
+    /// Factor at most four independent numeric points under a prior pivot
+    /// snapshot, never mutating that snapshot or the circuit pattern cache.
+    /// The numeric Schur updates run in four SIMD lanes with one independently
+    /// normalized pivot per lane; a failing lane is retried with scalar C
+    /// Markowitz ordering after reloading its own unmodified coefficients.
+    ///
+    /// Results preserve input frequency order, including isolated numerical
+    /// errors. Callers must not use this for a sequence that warm-starts its
+    /// bias or carries other mutable frequency-dependent state.
+    ///
+    /// # Errors
+    /// Each output independently reports an invalid or singular matrix.
+    pub(crate) fn factorize_independent_batch(
+        matrices: &[Self],
+        previous: &ComplexLu,
+    ) -> Vec<SpiceResult<ComplexLu>> {
+        use crate::maths::linear::RHS_BATCH_WIDTH;
+
+        let compatible = |matrix: &Self| {
+            previous.n == matrix.n
+                && match (&matrix.assembly, &previous.order) {
+                    (Assembly::Bound { pattern, .. }, ComplexOrder::Bound(other)) => {
+                        Arc::ptr_eq(pattern, other)
+                    }
+                    (Assembly::Standalone(entries), order) => order.matches(entries),
+                    _ => false,
+                }
+        };
+        let mut outputs = Vec::with_capacity(matrices.len());
+        for chunk in matrices.chunks(RHS_BATCH_WIDTH) {
+            if !chunk.iter().all(&compatible) {
+                outputs.extend(chunk.iter().map(Self::factorize_new_matrix));
+                continue;
+            }
+            let mut frames: Vec<Sparse<Complex>> = chunk
+                .iter()
+                .map(|matrix| match &matrix.assembly {
+                    Assembly::Bound { values, .. } => {
+                        previous.factors.sparse.fork_loaded(values.iter().copied())
+                    }
+                    Assembly::Standalone(entries) => previous
+                        .factors
+                        .sparse
+                        .fork_loaded(entries.iter().map(|&(_, _, value)| value)),
+                })
+                .collect();
+            let statuses = Sparse::<Complex>::refactor_independent_tile(&mut frames);
+            for ((matrix, mut frame), mut status) in chunk.iter().zip(frames).zip(statuses) {
+                let mut work = frame.last_attempt();
+                if status == Status::ZeroDiag {
+                    work.zero_pivot_retries += 1;
+                    match &matrix.assembly {
+                        Assembly::Bound { values, .. } => frame.reload_originals(values),
+                        Assembly::Standalone(entries) => {
+                            frame.reload_originals_iter(entries.iter().map(|&(_, _, value)| value));
+                        }
+                    }
+                    status = frame.order_and_factor(matrix.pivot.relative, matrix.pivot.absolute);
+                    work += frame.last_attempt();
+                }
+                outputs.push(
+                    check_status(
+                        "independent complex sparse LU",
+                        status,
+                        &frame,
+                        matrix.names.as_ref(),
+                    )
+                    .map(|()| ComplexLu {
+                        n: matrix.n,
+                        order: previous.order.clone(),
+                        factors: ComplexFactors {
+                            work,
+                            sparse: Arc::new(frame),
+                        },
+                    }),
+                );
+            }
+        }
+        outputs
+    }
+
     fn fresh_frame(&self) -> SpiceResult<Sparse<Complex>> {
         match &self.assembly {
             Assembly::Bound { pattern, values } => Sparse::from_pattern(pattern, values),
@@ -606,6 +687,157 @@ impl ComplexLu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_bound_factor_snapshots_preserve_residual_and_transpose_without_cache_mutation() {
+        let pattern = Arc::new(
+            Pattern::new(
+                3,
+                [
+                    (0, 0),
+                    (1, 1),
+                    (2, 2),
+                    (0, 1),
+                    (1, 0),
+                    (1, 2),
+                    (2, 1),
+                    (0, 2),
+                    (2, 0),
+                ],
+            )
+            .unwrap(),
+        );
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let mut e = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        for (r, c, v) in [
+            (0, 0, 4.),
+            (0, 1, 0.5),
+            (0, 2, 0.2),
+            (1, 0, -0.1),
+            (1, 1, 3.),
+            (1, 2, 0.4),
+            (2, 0, 0.02),
+            (2, 1, -0.25),
+            (2, 2, 2.),
+        ] {
+            a.set(r, c, v).unwrap();
+        }
+        for (r, c, v) in [
+            (0, 0, 1e-4),
+            (1, 1, 2e-4),
+            (2, 2, 1e-6),
+            (0, 2, 2e-5),
+            (1, 0, -3e-5),
+        ] {
+            e.set(r, c, v).unwrap();
+        }
+        let first = ComplexMatrix::from_operators_on(&pattern, &a, &e, 0.)
+            .unwrap()
+            .unwrap();
+        let seed = first.factorize().unwrap();
+        let original = seed
+            .solve(&[
+                Complex::real(1.),
+                Complex::imaginary(1.),
+                Complex::real(-1.),
+            ])
+            .unwrap();
+        let original_cache_work = pattern.factor_telemetry().work;
+        let rhs = [
+            Complex::new(1., 2.),
+            Complex::new(-3., 1.),
+            Complex::new(0.125, -0.5),
+        ];
+        let frequencies = [-1e6, 0., 1e-12, 0.1, 1e2, 1e6];
+        let matrices = frequencies.map(|omega| {
+            ComplexMatrix::from_operators_on(&pattern, &a, &e, omega)
+                .unwrap()
+                .unwrap()
+        });
+        // Four SIMD-independent numeric pivots, followed by a two-lane
+        // masked tail: both use the same original symbolic pivot snapshot.
+        let factors = ComplexMatrix::factorize_independent_batch(&matrices, &seed);
+        assert_eq!(factors.len(), frequencies.len());
+        for ((omega, matrix), factor) in frequencies.into_iter().zip(matrices).zip(factors) {
+            let factor = factor.unwrap();
+            let reference = matrix.factorize_new_matrix().unwrap();
+            assert!(factor.factor_work().fixed_refactors > 0);
+            let check = |transposed| {
+                let x = if transposed {
+                    factor.solve_transposed(&rhs).unwrap()
+                } else {
+                    factor.solve(&rhs).unwrap()
+                };
+                let y = if transposed {
+                    reference.solve_transposed(&rhs).unwrap()
+                } else {
+                    reference.solve(&rhs).unwrap()
+                };
+                for row in 0..3 {
+                    let mut reconstructed = Complex::ZERO;
+                    for col in 0..3 {
+                        let (r, c) = if transposed { (col, row) } else { (row, col) };
+                        let coeff = Complex::new(a.get(r, c), e.get(r, c) * omega);
+                        reconstructed = reconstructed + coeff * x[col];
+                    }
+                    let scale = rhs[row].magnitude().max(1.);
+                    assert!(
+                        (reconstructed - rhs[row]).magnitude() < scale * 1e-11,
+                        "omega={omega} transpose={transposed} row={row}, residual={}",
+                        (reconstructed - rhs[row]).magnitude()
+                    );
+                    assert!((x[row] - y[row]).magnitude() < scale * 1e-11);
+                }
+            };
+            check(false);
+            check(true);
+        }
+        assert_eq!(pattern.factor_telemetry().work, original_cache_work);
+        assert_eq!(
+            seed.solve(&[
+                Complex::real(1.),
+                Complex::imaginary(1.),
+                Complex::real(-1.)
+            ])
+            .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn independent_factor_singular_frequency_keeps_neighbor_and_seed_untouched() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (1, 1)]).unwrap());
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let mut e = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        a.set(0, 0, 1.).unwrap();
+        e.set(1, 1, 1.).unwrap();
+        let initial = ComplexMatrix::from_operators_on(&pattern, &a, &e, 1.)
+            .unwrap()
+            .unwrap();
+        let seed = initial.factorize().unwrap();
+        let rhs = [Complex::real(2.), Complex::imaginary(-4.)];
+        let original = seed.solve(&rhs).unwrap();
+        let frequencies = [2., 0., 3., 4., 1.];
+        let matrices = frequencies.map(|omega| {
+            ComplexMatrix::from_operators_on(&pattern, &a, &e, omega)
+                .unwrap()
+                .unwrap()
+        });
+        let factors = ComplexMatrix::factorize_independent_batch(&matrices, &seed);
+        assert_eq!(factors.len(), 5);
+        for (index, (omega, factor)) in frequencies.into_iter().zip(factors).enumerate() {
+            if index == 1 {
+                assert!(factor.is_err(), "the only zero-pivot lane should fail");
+                continue;
+            }
+            let recovered = factor.unwrap();
+            let expected = [Complex::real(2.), Complex::real(-4. / omega)];
+            assert_eq!(recovered.solve(&rhs).unwrap(), expected);
+            let transposed = recovered.solve_transposed(&rhs).unwrap();
+            assert_eq!(transposed, expected);
+        }
+        assert_eq!(seed.solve(&rhs).unwrap(), original);
+    }
 
     #[test]
     fn standalone_assembly_preserves_grouped_stamp_order_and_zero_bits() {
