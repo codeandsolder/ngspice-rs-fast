@@ -2,19 +2,11 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use super::{DeviceNoise, NoiseContext, NoiseFamily, NoiseKind, NoiseSource};
+use super::{BoundTransfer, DeviceNoise, NoiseContext, NoiseFamily, NoiseKind, NoiseSource};
 use crate::devices::circuit::PreparedPoint;
 use crate::devices::{Circuit, MnaUnknowns, ModelContext, PreparedRun, StateSnapshot};
 use crate::maths::Vector;
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
-
-/// A differential transfer bound to the finalized topology. Only ground
-/// maps to no row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BoundTransfer {
-    nodes: [NodeId; 2],
-    rows: [Option<usize>; 2],
-}
 
 impl BoundTransfer {
     pub(crate) fn bind(unknowns: &MnaUnknowns, nodes: [NodeId; 2]) -> SpiceResult<Self> {

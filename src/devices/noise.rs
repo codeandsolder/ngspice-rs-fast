@@ -39,7 +39,15 @@ use crate::maths::Vector;
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 
 pub(crate) mod layout;
-pub(crate) use layout::BoundTransfer;
+
+/// A differential transfer bound to the finalized topology. Only ground
+/// maps to no row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundTransfer {
+    nodes: [NodeId; 2],
+    rows: [Option<usize>; 2],
+}
+
 pub use layout::{BoundNoiseSource, NoiseInstance, NoisePlan};
 
 /// ngspice `CONSTboltz` (J/K).
