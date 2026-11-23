@@ -532,33 +532,22 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<V
                 };
                 let cosine = 1. / tangent.hypot(1.);
                 let sine = tangent * cosine;
-                // Split disjoint row regions around both pivots. Each
-                // off-pivot pair is read from two contiguous pivot rows and
-                // simultaneously written to their symmetric mirror cells.
-                // No strided input reads, second sweep, unsafe aliasing,
-                // scratch allocation, or independently rounded mirror.
-                {
-                    let (before_first, following_first) = data.split_at_mut(first * order);
-                    let (first_row, following_first) = following_first.split_at_mut(order);
-                    let (between, following_second) =
-                        following_first.split_at_mut((second - first - 1) * order);
-                    let (second_row, after_second) = following_second.split_at_mut(order);
-                    let mut rotate_region = |rows: &mut [Real], start: usize| {
-                        for (offset, row) in rows.chunks_exact_mut(order).enumerate() {
-                            let index = start + offset;
-                            let left = first_row[index];
-                            let right = second_row[index];
-                            let rotated_left = (-sine).mul_add(right, cosine * left);
-                            let rotated_right = sine.mul_add(left, cosine * right);
-                            first_row[index] = rotated_left;
-                            second_row[index] = rotated_right;
-                            row[first] = rotated_left;
-                            row[second] = rotated_right;
-                        }
-                    };
-                    rotate_region(before_first, 0);
-                    rotate_region(between, first + 1);
-                    rotate_region(after_second, second + 1);
+                // Only visit off-pivot pairs. Update each mirror from the
+                // same rounded value instead of rotating rows and columns
+                // independently, which creates skew and a false residual
+                // convergence floor around one ulp of the matrix norm.
+                for row in 0..order {
+                    if row == first || row == second {
+                        continue;
+                    }
+                    let left = data[row * order + first];
+                    let right = data[row * order + second];
+                    let rotated_left = (-sine).mul_add(right, cosine * left);
+                    let rotated_right = sine.mul_add(left, cosine * right);
+                    data[row * order + first] = rotated_left;
+                    data[first * order + row] = rotated_left;
+                    data[row * order + second] = rotated_right;
+                    data[second * order + row] = rotated_right;
                 }
                 let change = tangent * coupling;
                 data[first * order + first] = a - change;
