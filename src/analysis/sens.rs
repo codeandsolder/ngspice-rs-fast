@@ -38,6 +38,7 @@
 //! The device side, including C's side effects of the in-place perturbation,
 //! lives in [`crate::devices::sensitivity`]; see `docs/port/SENSITIVITY.md`.
 
+use super::frequency::FrequencyPlan;
 use super::reduction::CompensatedSum;
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{PlotFlags, Variable};
@@ -218,7 +219,7 @@ pub(super) struct SensCard {
 }
 
 impl SensCard {
-    pub(super) fn grid(&self) -> SpiceResult<Option<Vec<Real>>> {
+    pub(super) fn grid(&self) -> SpiceResult<Option<FrequencyPlan>> {
         self.sweep.as_ref().map(frequencies).transpose()
     }
 }
@@ -352,7 +353,7 @@ pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
     clippy::suboptimal_flops,
     reason = "count_steps truncates a discrete sweep length: 3 * log10(4.6060996915966586) + 1.01 is 3 separately rounded but 2.9999999999999996 fused"
 )]
-fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
+fn frequencies(sweep: &Sweep) -> SpiceResult<FrequencyPlan> {
     let steps = Real::from(sweep.steps.max(1));
     let (mut low, mut high) = (sweep.start, sweep.stop);
     let (count, factor) = match sweep.stepping {
@@ -396,19 +397,7 @@ fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
         crate::primitives::exact_nonnegative_integer::<usize>(count)
             .ok_or_else(|| unsupported(".sens AC sweep point count is not a valid integer"))?
     };
-    let mut frequencies = Vec::with_capacity(count);
-    let mut frequency = sweep.start;
-    for _ in 0..count {
-        if !(frequency.is_finite() && frequency > 0.) {
-            return Err(unsupported(format!(
-                ".sens AC frequency {frequency} is not positive and finite (C would \
-                 silently use the DC operating-point matrix for a zero frequency)"
-            )));
-        }
-        frequencies.push(frequency);
-        frequency *= factor;
-    }
-    Ok(frequencies)
+    FrequencyPlan::counted(sweep.start, factor, count)
 }
 
 /// `scan()` of `cktsens.c`: `*` matches any run, `?` any one character.
@@ -1563,7 +1552,7 @@ pub(super) fn run(
     request: &AnalysisPlan,
     context: &AnalysisContext,
     card: &SensCard,
-    grid: Option<&[Real]>,
+    grid: Option<&FrequencyPlan>,
     estimate_resolution: bool,
 ) -> SpiceResult<(Plot, Option<Plot>)> {
     let settings = request.dc_settings();
@@ -1605,7 +1594,7 @@ pub(super) fn run(
             &solved.values,
             model,
             probe,
-            grid.iter().copied(),
+            grid.values(),
             &mut plot,
         )?;
     } else {
@@ -2654,12 +2643,21 @@ mod tests {
                 .sweep
                 .unwrap()
         };
-        let f = frequencies(&sweep("dec 1 1k 100k")).unwrap();
+        let f: Vec<_> = frequencies(&sweep("dec 1 1k 100k"))
+            .unwrap()
+            .values()
+            .collect();
         assert_eq!(f.len(), 3);
         assert_eq!(f[0], 1e3);
         assert!((f[2] / 1e5 - 1.).abs() < 1e-12);
         // `lin` multiplies by (fstop - fstart)/pts (C's inc_freq defect).
-        assert_eq!(frequencies(&sweep("lin 2 1k 2k")).unwrap(), [1e3, 5e5]);
+        assert_eq!(
+            frequencies(&sweep("lin 2 1k 2k"))
+                .unwrap()
+                .values()
+                .collect::<Vec<_>>(),
+            [1e3, 5e5]
+        );
         // `oct` divides by M_LOG2E: 1 per octave over 1..16 gives 2 points.
         assert_eq!(frequencies(&sweep("oct 1 1 16")).unwrap().len(), 2);
         assert!(frequencies(&sweep("lin 2 1k 1k")).is_err());

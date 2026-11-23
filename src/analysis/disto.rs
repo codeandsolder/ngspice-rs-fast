@@ -37,7 +37,7 @@
 //! 1)` (so it measures `pts + 2` frequencies) while `f <= fstop +
 //! delta*reltol`.
 
-use crate::analysis::frequency::{Advance, FrequencyGrid};
+use crate::analysis::frequency::{Advance, FrequencyPlan};
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::results::Plot;
 use crate::analysis::{AnalysisContext, AnalysisPlan};
@@ -145,7 +145,7 @@ pub(super) fn parse(arguments: &[String]) -> SpiceResult<DistoCard> {
 }
 
 /// `distoan.c`'s frequency sweep.
-pub(super) fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<Vec<Real>> {
+pub(super) fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<FrequencyPlan> {
     let n = Real::from(card.steps);
     let (delta, tolerance) = match card.stepping {
         Stepping::Decade => {
@@ -170,7 +170,7 @@ pub(super) fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<Vec<Rea
         Stepping::Linear if delta == 0. => Advance::Single,
         Stepping::Linear => Advance::Add(delta),
     };
-    FrequencyGrid::new(card.start, card.stop, tolerance, advance, ".disto")?.collect()
+    FrequencyPlan::new(card.start, card.stop, tolerance, advance, ".disto")
 }
 
 fn output_plots(circuit: &Circuit, intermodulation: bool) -> SpiceResult<Vec<Plot>> {
@@ -201,7 +201,7 @@ pub(super) fn run(
     request: &AnalysisPlan,
     context: &AnalysisContext,
     card: &DistoCard,
-    grid: &[Real],
+    grid: &FrequencyPlan,
     include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
     let settings = request.dc_settings().clone();
@@ -223,7 +223,7 @@ pub(super) fn run(
     let omega2 = two_pi * card.start * card.f2_over_f1.unwrap_or(0.);
     let mut plots = output_plots(circuit, intermodulation)?;
     let mut workspace = Workspace::new(circuit, system, inputs, &mut plots, grid.len())?;
-    for &freq in grid {
+    for freq in grid.values() {
         workspace.frequency(&distortion, freq, two_pi * freq, omega2, &mut plots)?;
     }
     retained.extend(plots);
@@ -263,14 +263,26 @@ mod tests {
             f2_over_f1: None,
         };
         // lin measures pts + 2 frequencies.
-        let lin = frequencies(&card(Stepping::Linear, 3, 1e3, 4e3), 1e-3).unwrap();
+        let lin: Vec<_> = frequencies(&card(Stepping::Linear, 3, 1e3, 4e3), 1e-3)
+            .unwrap()
+            .values()
+            .collect();
         assert_eq!(lin, vec![1e3, 1.75e3, 2.5e3, 3.25e3, 4e3]);
-        let dec = frequencies(&card(Stepping::Decade, 2, 1e3, 1e5), 1e-3).unwrap();
+        let dec: Vec<_> = frequencies(&card(Stepping::Decade, 2, 1e3, 1e5), 1e-3)
+            .unwrap()
+            .values()
+            .collect();
         assert_eq!(dec.len(), 5);
         assert!((dec[4] / 1e5 - 1.).abs() < 1e-12);
-        let one = frequencies(&card(Stepping::Linear, 0, 1e3, 1e3), 1e-3).unwrap();
+        let one: Vec<_> = frequencies(&card(Stepping::Linear, 0, 1e3, 1e3), 1e-3)
+            .unwrap()
+            .values()
+            .collect();
         assert_eq!(one, vec![1e3]);
-        let oct = frequencies(&card(Stepping::Octave, 1, 1., 8.), 1e-3).unwrap();
+        let oct: Vec<_> = frequencies(&card(Stepping::Octave, 1, 1., 8.), 1e-3)
+            .unwrap()
+            .values()
+            .collect();
         assert_eq!(oct.len(), 4);
     }
     #[test]
