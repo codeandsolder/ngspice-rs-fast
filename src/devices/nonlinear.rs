@@ -29,8 +29,11 @@ use crate::devices::schema::{
     ScalarDomain as Domain, ScalarParameter as Parameter, ScalarSchema, ScalarUnit as Unit,
     ScalarValues,
 };
-use crate::devices::{Device, LinearContext, ModelContext, ResolvedModel, StampContext};
-use crate::maths::Vector;
+use crate::devices::{
+    AnalysisMode, Device, DeviceState, LinearContext, MnaUnknowns, ModelContext, ResolvedModel,
+    StampContext,
+};
+use crate::maths::{Coefficients, Vector};
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceError, SpiceResult};
 
@@ -483,7 +486,180 @@ struct DiodeParameters {
     instance: DiodeInstanceParameters,
     setup: DiodeSetup,
 }
+/// Gathered, state-independent diode physics inputs (one lane in a
+/// homogeneous load tile). All state/history decisions are already made, but
+/// no junction math or ordered commit has occurred.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiodeLoadSample {
+    thermal: Thermal,
+    limiter: Limiter,
+    raw: Real,
+    voltage: Real,
+    c_jacobian: bool,
+    lenient: bool,
+}
+
+impl DiodeLoadSample {
+    /// Run only the physical junction kernel. Can be evaluated in arbitrary
+    /// lane order after the sampling phase without accessing solver state.
+    /// # Errors
+    /// Nonfinite or unsupported junction physics.
+    pub(crate) fn evaluate(self, gmin: Real) -> SpiceResult<DiodeLoadEvaluation> {
+        let mut point = if self.lenient {
+            self.thermal.point_unchecked(self.voltage, gmin)?
+        } else {
+            self.thermal.point(self.voltage, gmin)?
+        };
+        if self.c_jacobian {
+            point.junction.conductance = point.ac_conductance;
+        }
+        Ok(DiodeLoadEvaluation {
+            thermal: self.thermal,
+            point,
+            limiter: self.limiter,
+            raw: self.raw,
+            voltage: self.voltage,
+        })
+    }
+}
+
+/// Pure junction result of one diode load, including its independently
+/// evaluated limiting decision. Matrix/RHS and trial-state writes happen
+/// only when this result reaches its original load-order position.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiodeLoadEvaluation {
+    thermal: Thermal,
+    point: DiodePoint,
+    limiter: Limiter,
+    raw: Real,
+    voltage: Real,
+}
+
 impl Diode {
+    /// Gather immutable model and prior-state inputs with C's limiter
+    /// semantics. This never writes a trial slot or MNA stamp.
+    /// # Errors
+    /// Invalid model input or missing accepted predictor history.
+    pub(crate) fn sample_load(
+        &self,
+        model: &ModelContext,
+        unknowns: &MnaUnknowns,
+        solution: &Vector,
+        states: &DeviceState<'_>,
+        mode: AnalysisMode,
+        integration: Option<&Coefficients>,
+    ) -> SpiceResult<DiodeLoadSample> {
+        if mode.is_ac() {
+            return Err(SpiceError::circuit("diode AC needs small-signal assembly"));
+        }
+        let thermal = self.thermal(model)?;
+        let mut limiter = Limiter::new(states);
+        let node_voltage = |node| {
+            unknowns
+                .node_row(node)
+                .and_then(|row| solution.get(row))
+                .unwrap_or(0.)
+        };
+        // Preserve C's predictor extrapolation before limiting, including
+        // a missing-state error and the DC sweep predictor ratio of one.
+        let raw = match (states.phase(), limiter.mode()) {
+            (crate::devices::IterationPhase::Predict, Linearization::Limited) => {
+                let ratio = integration.map_or(1., Coefficients::predictor_ratio);
+                states
+                    .predicted(DIODE_VOLTAGE_SLOT, ratio)
+                    .ok_or_else(|| SpiceError::circuit("missing accepted diode voltage"))?
+            }
+            _ => node_voltage(self.junction[0]) - node_voltage(self.junction[1]),
+        };
+        // C ignores instance ic= unless DIOinitCondGiven was separately set.
+        let start = node_voltage(self.terminals[0]) - node_voltage(self.terminals[1]);
+        let voltage = thermal.limit(&mut limiter, states, raw, start, self.initial.off);
+        Ok(DiodeLoadSample {
+            thermal,
+            limiter,
+            raw,
+            voltage,
+            c_jacobian: states.c_jacobian(),
+            lenient: self.lenient,
+        })
+    }
+
+    /// Ordered state and matrix commit of the previously independent diode
+    /// physics. An error from a later diode is reported only after earlier
+    /// devices have been stamped, exactly as in scalar load order.
+    /// # Errors
+    /// Invalid companion step, state access, or MNA bound element.
+    pub(crate) fn commit_load(
+        &self,
+        context: &mut StampContext<'_>,
+        evaluation: DiodeLoadEvaluation,
+    ) -> SpiceResult<()> {
+        let DiodeLoadEvaluation {
+            thermal,
+            point: p,
+            mut limiter,
+            raw,
+            voltage: v,
+        } = evaluation;
+        let held = p.junction.current;
+        let predicted_change = p.junction.conductance * (raw - v);
+        limiter.test_held(&context.states, &[(held, held + predicted_change)]);
+        self.stamp_junction(context, thermal, p, limiter, v)
+    }
+
+    fn stamp_junction(
+        &self,
+        context: &mut StampContext<'_>,
+        thermal: Thermal,
+        p: DiodePoint,
+        limiter: Limiter,
+        v: Real,
+    ) -> SpiceResult<()> {
+        let gspr = if self.junction[0] == self.terminals[0] {
+            0.
+        } else {
+            thermal.conductance
+        };
+        let (mut gd, mut cd) = (p.junction.conductance, p.junction.current);
+        let branch =
+            charge::ChargeBranch::new(DIODE_CHARGE_SLOT, p.junction.charge, p.junction.capacitance);
+        if let Some(coefficients) = context.integration {
+            let crate::devices::AnalysisMode::Transient { dt, .. } = context.mode else {
+                return Err(SpiceError::circuit("junction companion outside transient"));
+            };
+            if dt.to_bits() != coefficients.dt().to_bits() {
+                return Err(SpiceError::circuit("junction timestep mismatch"));
+            }
+            let companion = branch.integrate(&mut context.states, coefficients)?;
+            gd += companion.conductance;
+            cd += companion.derivative;
+        } else {
+            if context.mode.is_transient() {
+                return Err(SpiceError::circuit(
+                    "junction transient needs companion integration",
+                ));
+            }
+            branch.zero_derivative(&mut context.states)?;
+        }
+        branch.store(&mut context.states)?;
+        let linearized_current = gd * v;
+        let cdeq = cd - linearized_current;
+        let [pos, neg] = [self.terminals[0], self.terminals[1]];
+        let prime = self.junction[0];
+        context.stamp_rhs(neg, cdeq)?;
+        context.stamp_rhs(prime, -cdeq)?;
+        context.stamp_fixed([
+            (pos, pos, gspr),
+            (neg, neg, gd),
+            (prime, prime, gd + gspr),
+            (pos, prime, -gspr),
+            (neg, prime, -gd),
+            (prime, pos, -gspr),
+            (prime, neg, -gd),
+        ])?;
+        limiter.finish(&mut context.states, &[(DIODE_VOLTAGE_SLOT, v)])
+    }
+
     fn thermal(&self, context: &ModelContext) -> SpiceResult<Thermal> {
         self.derived
             .get_or_derive(DiodeThermalKey::context(context), || {
@@ -1775,95 +1951,15 @@ impl Device for Diode {
         Ok(Box::new(sens::DiodeSensitivity::new(self, context)))
     }
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        if context.mode.is_ac() {
-            return Err(SpiceError::circuit("diode AC needs small-signal assembly"));
-        }
-        let model = context.model_context();
-        let thermal = self.thermal(&model)?;
-        let mut limiter = Limiter::new(&context.states);
-        // dioload.c: MODEINITPRED extrapolates the junction voltage
-        // (`DEVpred`) before limiting it; otherwise the iterate's. Outside
-        // transient a predicted load is a `.dc` sweep point (dctrcurv.c),
-        // where `CKTdelta` and every `CKTdeltaOld` are the first axis's step,
-        // so DEVpred's ratio is 1: `2 state1 - state2`.
-        let raw = match (context.states.phase(), limiter.mode()) {
-            (crate::devices::IterationPhase::Predict, Linearization::Limited) => {
-                let ratio = context
-                    .integration
-                    .map_or(1., crate::maths::integrator::Coefficients::predictor_ratio);
-                context
-                    .states
-                    .predicted(DIODE_VOLTAGE_SLOT, ratio)
-                    .ok_or_else(|| SpiceError::circuit("missing accepted diode voltage"))?
-            }
-            _ => context.node_voltage(self.junction[0]) - context.node_voltage(self.junction[1]),
-        };
-        // diogetic.c takes the uic start across the external terminals unless
-        // `DIOinitCondGiven`, which no C setter ever sets (`dioparam.c`
-        // stores `ic=` without it): the instance `ic=` never reaches the load.
-        let start =
-            context.node_voltage(self.terminals[0]) - context.node_voltage(self.terminals[1]);
-        let v = thermal.limit(&mut limiter, &context.states, raw, start, self.initial.off);
-        let mut p = if self.lenient {
-            thermal.point_unchecked(v, model.gmin)?
-        } else {
-            thermal.point(v, model.gmin)?
-        };
-        // C's DEVload matrix (`.tf`, `.sens`): dioload.c's junction
-        // conductance, which differs from the exact derivative only with ISR.
-        if context.states.c_jacobian() {
-            p.junction.conductance = p.ac_conductance;
-        }
-        // DIOconvTest for an `off` diode held in MODEINITFIX.
-        let held = p.junction.current;
-        let predicted_change = p.junction.conductance * (raw - v);
-        limiter.test_held(&context.states, &[(held, held + predicted_change)]);
-        // dioload.c from here: the charge companion folds into gd and cd,
-        // then cdeq = cd - gd vd and the stamps, in C's order.
-        let gspr = if self.junction[0] == self.terminals[0] {
-            0.
-        } else {
-            thermal.conductance
-        };
-        let (mut gd, mut cd) = (p.junction.conductance, p.junction.current);
-        let branch =
-            charge::ChargeBranch::new(DIODE_CHARGE_SLOT, p.junction.charge, p.junction.capacitance);
-        if let Some(coefficients) = context.integration {
-            let crate::devices::AnalysisMode::Transient { dt, .. } = context.mode else {
-                return Err(SpiceError::circuit("junction companion outside transient"));
-            };
-            // Both timesteps are positive and finite; require the same step, not a tolerance.
-            if dt.to_bits() != coefficients.dt().to_bits() {
-                return Err(SpiceError::circuit("junction timestep mismatch"));
-            }
-            let companion = branch.integrate(&mut context.states, coefficients)?;
-            gd += companion.conductance;
-            cd += companion.derivative;
-        } else {
-            if context.mode.is_transient() {
-                return Err(SpiceError::circuit(
-                    "junction transient needs companion integration",
-                ));
-            }
-            branch.zero_derivative(&mut context.states)?;
-        }
-        branch.store(&mut context.states)?;
-        let linearized_current = gd * v;
-        let cdeq = cd - linearized_current;
-        let [pos, neg] = [self.terminals[0], self.terminals[1]];
-        let prime = self.junction[0];
-        context.stamp_rhs(neg, cdeq)?;
-        context.stamp_rhs(prime, -cdeq)?;
-        context.stamp_fixed([
-            (pos, pos, gspr),
-            (neg, neg, gd),
-            (prime, prime, gd + gspr),
-            (pos, prime, -gspr),
-            (neg, prime, -gd),
-            (prime, pos, -gspr),
-            (prime, neg, -gd),
-        ])?;
-        limiter.finish(&mut context.states, &[(DIODE_VOLTAGE_SLOT, v)])
+        let sample = self.sample_load(
+            &context.model_context(),
+            context.unknowns,
+            context.solution,
+            &context.states,
+            context.mode,
+            context.integration,
+        )?;
+        self.commit_load(context, sample.evaluate(context.gmin)?)
     }
     /// `dioacld.c`: series conductance, C's small-signal junction conductance
     /// and `j*omega` times its small-signal capacitance at the bias point.
