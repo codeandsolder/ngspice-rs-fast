@@ -670,7 +670,7 @@ impl Driver<'_> {
         let TransientPlan { stop, start, .. } = self.settings;
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
         let min_step = self.settings.min_step();
-        let mut breaks = BreakTable::new(stop, 10.0 * min_step);
+        let mut breaks = BreakTable::new(stop, 10.0 * min_step)?;
         let mut sources = SourceBreaks::new(self.system);
         let plot = plot(
             self.circuit,
