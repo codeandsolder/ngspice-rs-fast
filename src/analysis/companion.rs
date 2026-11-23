@@ -541,6 +541,9 @@ struct Driver<'a> {
     /// charge it hands `CKTterr` (`truncation_slots`), fixed for the run.
     truncation: Vec<(std::ops::Range<usize>, Vec<usize>)>,
     stats: TransientStats,
+    /// Reuse the ordinary Newton MNA/RHS/trial storage across timepoint
+    /// acceptance and rejected smaller-step retries.
+    workspace: crate::analysis::newton::CircuitNewtonWorkspace,
 }
 
 /// Runs an ordinary `.tran` with the companion backend, returning the plot and
@@ -663,6 +666,7 @@ pub fn companion_transient_into(
         limited_rows,
         truncation,
         stats: TransientStats::default(),
+        workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
     };
     driver.run(sink)
 }
@@ -825,7 +829,13 @@ impl Driver<'_> {
                     timing: self.timing,
                 },
             )?;
-            match self.solve_trial(&attempt, &mut prepared, &iterate)? {
+            // The candidate step borrows accepted history read-only; move
+            // the disposable numeric workspace out and back around the
+            // solve so retries reuse it without borrowing history mutably.
+            let mut workspace = std::mem::take(&mut self.workspace);
+            let outcome = self.solve_trial(&attempt, &mut prepared, &iterate, &mut workspace);
+            self.workspace = workspace;
+            match outcome? {
                 Trial::NotConverged { last } => {
                     iterate = last;
                     self.stats.rejected += 1;
@@ -1081,6 +1091,7 @@ impl Driver<'_> {
         attempt: &AttemptedStep,
         prepared: &mut crate::devices::circuit::PreparedTransient<'_>,
         previous: &Vector,
+        workspace: &mut crate::analysis::newton::CircuitNewtonWorkspace,
     ) -> SpiceResult<Trial> {
         let tolerance = &self.settings.tolerances;
         let options = crate::analysis::newton::NewtonOptions {
@@ -1106,6 +1117,7 @@ impl Driver<'_> {
                 attempt: prepared,
                 uic: self.uic,
             },
+            workspace,
         }
         .solve(previous, policy, None, |_, _, _| Ok(()));
         match solved {

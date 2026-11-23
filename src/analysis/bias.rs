@@ -1124,6 +1124,9 @@ struct Engine<'a> {
     /// Per-stage limit of the gmin/source-stepping strategies.
     stage_limit: usize,
     remaining: usize,
+    /// One numeric and disposable-state buffer across every continuation
+    /// attempt; an accepted history revision still invalidates spare state.
+    workspace: crate::analysis::newton::CircuitNewtonWorkspace,
 }
 
 #[derive(Clone, Copy)]
@@ -1313,6 +1316,48 @@ fn iteration_budget(plan: &[Plan<'_>], direct: usize, stage: usize) -> usize {
 }
 
 impl Engine<'_> {
+    /// Execute the validated, bounded continuation schedule and report
+    /// precisely which strategy succeeded or exhausted its budget.
+    fn execute_plan(
+        &mut self,
+        report: &mut DcReport,
+        plan: &[Plan<'_>],
+    ) -> SpiceResult<NewtonSolution<TrialState>> {
+        for planned in plan {
+            match self.attempt(report, planned) {
+                Ok(solved) => {
+                    report.outcome = DcOutcome::Converged(planned.strategy());
+                    return Ok(solved);
+                }
+                Err(Halt::Retry(_)) => {}
+                Err(Halt::Fatal(error)) => {
+                    report.outcome = DcOutcome::NonRetryableFailure;
+                    return Err(error);
+                }
+                Err(Halt::Budget(_)) => {
+                    report.outcome = DcOutcome::BudgetExhausted;
+                    return Err(SpiceError::Numerical {
+                        context: "DC continuation".into(),
+                        message: format!(
+                            "total iteration budget exhausted: {}; raise maxiter or \
+                         max_total_iterations, or simplify the circuit",
+                            report.summary()
+                        ),
+                    });
+                }
+            }
+        }
+        report.outcome = DcOutcome::Exhausted;
+        Err(SpiceError::Numerical {
+            context: "DC continuation".into(),
+            message: format!(
+                "direct Newton and every enabled continuation strategy failed: {}; \
+             {OPTRAN_NOT_PORTED}",
+                report.summary()
+            ),
+        })
+    }
+
     /// One disposable Newton solve of the typed stage; charges the budget.
     /// `continued` is the preceding stage's converged trial, if any.
     fn stage(
@@ -1366,8 +1411,10 @@ impl Engine<'_> {
         let context = junction
             .map_or(*self.context, |junction| self.context.with_gmin(junction))
             .with_source_factor(scale);
+        let nodes = self.nodes;
+        let branches = &self.branches;
         let result = CircuitNewton {
-            branch_rows: &self.branches,
+            branch_rows: branches,
             limited_rows: self.limited.as_deref(),
             options: &options,
             load: CircuitLoad::Bias {
@@ -1376,6 +1423,7 @@ impl Engine<'_> {
                 history: self.history,
                 forcing: self.forcing,
             },
+            workspace: &mut self.workspace,
         }
         .solve(
             guess,
@@ -1391,7 +1439,7 @@ impl Engine<'_> {
                 // cktload.c: nodeset rows only in MODEINITJCT/MODEINITFIX;
                 // .ic rows in every load, both scaled by CKTsrcFact.
                 let hinted = matches!(phase, IterationPhase::Junction | IterationPhase::Fix);
-                self.nodes.apply(matrix, rhs, scale, hinted, &self.branches)
+                nodes.apply(matrix, rhs, scale, hinted, branches)
             },
         );
         let (iterations, error) = match &result {
@@ -1750,40 +1798,9 @@ fn run(
         newton: *options,
         stage_limit,
         remaining: budget,
+        workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
     };
-    for planned in &plan {
-        match engine.attempt(report, planned) {
-            Ok(solved) => {
-                report.outcome = DcOutcome::Converged(planned.strategy());
-                return Ok(solved);
-            }
-            Err(Halt::Retry(_)) => {}
-            Err(Halt::Fatal(error)) => {
-                report.outcome = DcOutcome::NonRetryableFailure;
-                return Err(error);
-            }
-            Err(Halt::Budget(_)) => {
-                report.outcome = DcOutcome::BudgetExhausted;
-                return Err(SpiceError::Numerical {
-                    context: "DC continuation".into(),
-                    message: format!(
-                        "total iteration budget exhausted: {}; raise maxiter or \
-                         max_total_iterations, or simplify the circuit",
-                        report.summary()
-                    ),
-                });
-            }
-        }
-    }
-    report.outcome = DcOutcome::Exhausted;
-    Err(SpiceError::Numerical {
-        context: "DC continuation".into(),
-        message: format!(
-            "direct Newton and every enabled continuation strategy failed: {}; \
-             {OPTRAN_NOT_PORTED}",
-            report.summary()
-        ),
-    })
+    engine.execute_plan(report, &plan)
 }
 
 /// Appended to an exhausted continuation's error: ngspice's `CKTop` would

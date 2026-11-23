@@ -192,6 +192,7 @@ pub fn solve_counted_limited<T>(
     options: &NewtonOptions,
     mut load: impl FnMut(&Vector) -> SpiceResult<(SparseMatrix, Vector, T)>,
 ) -> Result<NewtonSolution<T>, NewtonFailure> {
+    let mut storage = LoadStorage::default();
     iterate(
         initial,
         branch_rows,
@@ -205,8 +206,14 @@ pub fn solve_counted_limited<T>(
             initial_transient: false,
             nodesets: options.had_nodeset,
         },
-        |x: &Vector, _, _: Option<&T>| load(x),
+        &mut storage,
+        |x: &Vector, _, _: Option<&T>, storage: &mut LoadStorage<T>| {
+            let (matrix, rhs, trial) = load(x)?;
+            storage.loaded(matrix, rhs);
+            Ok(trial)
+        },
         |_: &Vector, _: &Vector, _: &T| Ok(false),
+        |_: &mut T| {},
     )
 }
 
@@ -263,6 +270,46 @@ pub fn solve_phased(
     ) -> SpiceResult<(SparseMatrix, Vector, TrialState)>,
     device_test: impl FnMut(&Vector, &Vector, &TrialState) -> SpiceResult<bool>,
 ) -> Result<NewtonSolution<TrialState>, NewtonFailure> {
+    let mut storage = LoadStorage::default();
+    solve_phased_into(
+        initial,
+        branch_rows,
+        limited_rows,
+        options,
+        policy,
+        continued,
+        &mut storage,
+        |guess, phase, previous, storage| {
+            let (matrix, rhs, trial) = load(guess, phase, previous)?;
+            storage.loaded(matrix, rhs);
+            Ok(trial)
+        },
+        device_test,
+    )
+}
+
+/// The common reference phase/convergence engine for both the value-returning
+/// public solver and in-place circuit loads. No second Newton algorithm.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Newton phase inputs and independent load/accept callbacks are explicit"
+)]
+fn solve_phased_into(
+    initial: &Vector,
+    branch_rows: &[bool],
+    limited_rows: Option<&[bool]>,
+    options: &NewtonOptions,
+    policy: PhasePolicy,
+    continued: Option<TrialState>,
+    storage: &mut LoadStorage<TrialState>,
+    mut load: impl FnMut(
+        &Vector,
+        IterationPhase,
+        Option<&TrialState>,
+        &mut LoadStorage<TrialState>,
+    ) -> SpiceResult<TrialState>,
+    device_test: impl FnMut(&Vector, &Vector, &TrialState) -> SpiceResult<bool>,
+) -> Result<NewtonSolution<TrialState>, NewtonFailure> {
     let first = match (policy, &continued) {
         (_, Some(_)) => IterationPhase::Float,
         (PhasePolicy::OperatingPoint, None) => IterationPhase::Junction,
@@ -281,16 +328,18 @@ pub fn solve_phased(
             initial_transient: policy == PhasePolicy::InitialTransient,
             nodesets: options.had_nodeset,
         },
-        |x: &Vector, phase, previous: Option<&TrialState>| {
-            let loaded = load(x, phase, previous)?;
-            if loaded.2.device_limiting() != options.limiting.is_device() {
+        storage,
+        |x, phase, previous, storage| {
+            let trial = load(x, phase, previous, storage)?;
+            if trial.device_limiting() != options.limiting.is_device() {
                 return Err(failure(
                     "Newton load trial does not match the step-limiting policy",
                 ));
             }
-            Ok(loaded)
+            Ok(trial)
         },
         device_test,
+        TrialState::release_predecessor,
     )
 }
 
@@ -319,6 +368,7 @@ pub(super) struct CircuitNewton<'a, 'p> {
     pub limited_rows: Option<&'a [bool]>,
     pub options: &'a NewtonOptions,
     pub load: CircuitLoad<'a, 'p>,
+    pub workspace: &'a mut CircuitNewtonWorkspace,
 }
 
 impl CircuitNewton<'_, '_> {
@@ -353,18 +403,18 @@ impl CircuitNewton<'_, '_> {
         };
         let options = self.options;
         let circuit = prepared.circuit();
-        solve_phased(
+        solve_phased_into(
             initial,
             self.branch_rows,
             self.limited_rows,
             options,
             policy,
             continued,
-            |guess, phase, previous| {
-                let mut matrix = circuit.new_matrix()?;
-                let mut rhs = Vector::zeros(circuit.unknown_count());
+            &mut self.workspace.load,
+            |guess, phase, previous, storage| {
+                let spare = storage.spare_trial.take();
                 let mut trial = history
-                    .trial_in(phase, previous)?
+                    .trial_in_reusing(phase, previous, spare)?
                     .with_device_limiting(options.limiting.is_device())
                     .with_convergence_tolerances(options.reltol, options.abstol);
                 if let Some(uic) = uic {
@@ -375,8 +425,9 @@ impl CircuitNewton<'_, '_> {
                         )
                         .with_uic(uic);
                 }
+                let (matrix, rhs) = storage.prepare_load(circuit)?;
                 if let Some(attempt) = &mut attempt {
-                    attempt.load(guess, &mut matrix, &mut rhs, &mut trial)?;
+                    attempt.load(guess, matrix, rhs, &mut trial)?;
                 } else {
                     prepared.load(
                         &LoadRequest {
@@ -387,13 +438,13 @@ impl CircuitNewton<'_, '_> {
                             history,
                             forcing,
                         },
-                        &mut matrix,
-                        &mut rhs,
+                        matrix,
+                        rhs,
                         &mut trial,
                     )?;
                 }
-                after_load(phase, &mut matrix, &mut rhs)?;
-                Ok((matrix, rhs, trial))
+                after_load(phase, matrix, rhs)?;
+                Ok(trial)
             },
             |new, old, trial| {
                 prepared.convergence_test(&ConvergenceRequest {
@@ -412,6 +463,79 @@ impl CircuitNewton<'_, '_> {
     }
 }
 
+/// One ordinary Newton driver's disposable load slots. The matrix/RHS stay
+/// owned by the solve across loads; only the trial returned at convergence
+/// escapes to acceptance. This storage is also reused across DC continuation
+/// stages and transient rejected/accepted attempts.
+struct LoadStorage<T> {
+    matrix: Option<SparseMatrix>,
+    rhs: Option<Vector>,
+    spare_trial: Option<T>,
+}
+
+impl<T> Default for LoadStorage<T> {
+    fn default() -> Self {
+        Self {
+            matrix: None,
+            rhs: None,
+            spare_trial: None,
+        }
+    }
+}
+
+impl<T> LoadStorage<T> {
+    fn loaded(&mut self, matrix: SparseMatrix, rhs: Vector) {
+        self.matrix = Some(matrix);
+        self.rhs = Some(rhs);
+    }
+}
+
+/// Persistent numerical scratch for a single circuit/analysis driver. A
+/// changed matrix pattern is recognized before reusing any bound stamps;
+/// state reuse is checked independently against accepted history revision.
+#[derive(Default)]
+pub(super) struct CircuitNewtonWorkspace {
+    load: LoadStorage<TrialState>,
+}
+
+impl LoadStorage<TrialState> {
+    fn prepare_load(
+        &mut self,
+        circuit: &crate::devices::Circuit,
+    ) -> SpiceResult<(&mut SparseMatrix, &mut Vector)> {
+        let n = circuit.unknown_count();
+        let pattern = circuit.matrix_pattern();
+        let reusable = self.matrix.as_ref().is_some_and(|matrix| {
+            matrix.rows() == n
+                && matrix.cols() == n
+                && match (pattern.as_ref(), matrix.bound_values()) {
+                    (Some(pattern), Some((existing, _))) => {
+                        std::sync::Arc::ptr_eq(pattern, existing)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                }
+        });
+        if !reusable {
+            self.matrix = Some(circuit.new_matrix()?);
+        }
+        if self.rhs.as_ref().is_none_or(|rhs| rhs.len() != n) {
+            self.rhs = Some(Vector::zeros(n));
+        }
+        let matrix = self
+            .matrix
+            .as_mut()
+            .ok_or_else(|| failure("missing Newton matrix"))?;
+        let rhs = self
+            .rhs
+            .as_mut()
+            .ok_or_else(|| failure("missing Newton RHS"))?;
+        matrix.clear();
+        rhs.clear();
+        Ok((matrix, rhs))
+    }
+}
+
 struct Phases<T, F> {
     first: IterationPhase,
     previous: Option<T>,
@@ -426,6 +550,40 @@ struct Phases<T, F> {
     nodesets: bool,
 }
 
+impl<T, F> Phases<T, F> {
+    /// C's MODEINITF transition after a nonconverged/initializing load.
+    /// `MODEINITFLOAT` leaves the mode unchanged; its convergence decision
+    /// and special nodeset `ipass` still belong to the main iteration loop.
+    const fn advance(
+        initial_transient: bool,
+        phase: &mut IterationPhase,
+        reorder: &mut bool,
+        ipass: &mut bool,
+        noncon: bool,
+        iterno: usize,
+    ) {
+        match phase {
+            IterationPhase::Junction => {
+                *phase = IterationPhase::Fix;
+                *reorder = true;
+            }
+            IterationPhase::Fix => {
+                if !noncon {
+                    *phase = IterationPhase::Float;
+                }
+                *ipass = true;
+            }
+            IterationPhase::Predict => {
+                if initial_transient && iterno <= 1 {
+                    *reorder = true;
+                }
+                *phase = IterationPhase::Float;
+            }
+            IterationPhase::Float => {}
+        }
+    }
+}
+
 /// Counts load attempts and owns the retry iterate for all Newton entry points.
 #[derive(Default)]
 struct Progress {
@@ -433,14 +591,20 @@ struct Progress {
     last_iterate: Option<Vector>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one Newton traversal with separately owned load storage and state lifetime"
+)]
 fn iterate<T, F: Fn(&T) -> bool>(
     initial: &Vector,
     branch_rows: &[bool],
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
     phases: Phases<T, F>,
-    load: impl FnMut(&Vector, IterationPhase, Option<&T>) -> SpiceResult<(SparseMatrix, Vector, T)>,
+    storage: &mut LoadStorage<T>,
+    load: impl FnMut(&Vector, IterationPhase, Option<&T>, &mut LoadStorage<T>) -> SpiceResult<T>,
     device_test: impl FnMut(&Vector, &Vector, &T) -> SpiceResult<bool>,
+    release_previous: impl Fn(&mut T),
 ) -> Result<NewtonSolution<T>, NewtonFailure> {
     let mut progress = Progress::default();
     iterate_inner(
@@ -449,8 +613,10 @@ fn iterate<T, F: Fn(&T) -> bool>(
         limited_rows,
         options,
         phases,
+        storage,
         load,
         device_test,
+        release_previous,
         &mut progress,
     )
     .map_err(|error| NewtonFailure {
@@ -488,8 +654,10 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
     phases: Phases<T, F>,
-    mut load: impl FnMut(&Vector, IterationPhase, Option<&T>) -> SpiceResult<(SparseMatrix, Vector, T)>,
+    storage: &mut LoadStorage<T>,
+    mut load: impl FnMut(&Vector, IterationPhase, Option<&T>, &mut LoadStorage<T>) -> SpiceResult<T>,
     mut device_test: impl FnMut(&Vector, &Vector, &T) -> SpiceResult<bool>,
+    release_previous: impl Fn(&mut T),
     progress: &mut Progress,
 ) -> SpiceResult<NewtonSolution<T>> {
     options.validate()?;
@@ -513,14 +681,22 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         // NIiter increments before checking the CKTload return code.
         progress.iterations += 1;
         let iterno = progress.iterations;
-        let (mut matrix, rhs, trial) = load(&guess, phase, previous.as_ref())?;
+        let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
+        let matrix = storage
+            .matrix
+            .as_mut()
+            .ok_or_else(|| failure("Newton load returned no matrix"))?;
+        let rhs = storage
+            .rhs
+            .as_ref()
+            .ok_or_else(|| failure("Newton load returned no RHS"))?;
         let flagged = (phases.nonconvergent)(&trial);
-        check(&matrix, &rhs, n)?;
+        check(matrix, rhs, n)?;
         matrix.fold_duplicates();
         if phase == IterationPhase::Junction {
             reorder = true;
         }
-        let mut next = match linearised_solve(&matrix, &rhs, &mut ordering, reorder, options)? {
+        let mut next = match linearised_solve(matrix, rhs, &mut ordering, reorder, options)? {
             crate::maths::NiStep::Solved(next) => {
                 reorder = false;
                 next
@@ -529,7 +705,8 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
                 // E_SINGULAR from SMPluFac: NISHOULDREORDER and `continue`,
                 // reloading at the same iterate.
                 reorder = true;
-                previous = Some(trial);
+                release_previous(&mut trial);
+                storage.spare_trial = previous.replace(trial);
                 continue;
             }
         };
@@ -557,43 +734,41 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         } else {
             !converged(&next, &guess, branch_rows, options) || device_test(&next, &guess, &trial)?
         };
-        match phase {
-            IterationPhase::Float => {
-                if phases.nodesets {
-                    noncon |= ipass;
-                    ipass = false;
-                }
-                if !noncon {
-                    // NIiter returns before swapping CKTrhs and CKTrhsOld:
-                    // the solution ngspice keeps (CKTdump writes CKTrhsOld,
-                    // the next solve starts from it) is the iterate the last
-                    // load used, the one CKTstate0 belongs to.
-                    return Ok(NewtonSolution {
-                        values: guess,
-                        trial,
-                        next,
-                        iterations: iterno,
-                    });
-                }
+        if phase == IterationPhase::Float {
+            if phases.nodesets {
+                noncon |= ipass;
+                ipass = false;
             }
-            IterationPhase::Junction => {
-                phase = IterationPhase::Fix;
-                reorder = true;
-            }
-            IterationPhase::Fix => {
-                if !noncon {
-                    phase = IterationPhase::Float;
+            if !noncon {
+                // NIiter returns before swapping CKTrhs and CKTrhsOld:
+                // the solution ngspice keeps (CKTdump writes CKTrhsOld,
+                // the next solve starts from it) is the iterate the last
+                // load used, the one CKTstate0 belongs to.
+                // Keep the consumed predecessor as disposable scratch
+                // for the next timepoint. The returned trial still owns
+                // its previous-read snapshot; a shared slot can be
+                // poisoned/reused only after that owner releases it.
+                if storage.spare_trial.is_none() {
+                    storage.spare_trial = previous.take();
                 }
-                ipass = true;
-            }
-            IterationPhase::Predict => {
-                if phases.initial_transient && iterno <= 1 {
-                    reorder = true;
-                }
-                phase = IterationPhase::Float;
+                return Ok(NewtonSolution {
+                    values: guess,
+                    trial,
+                    next,
+                    iterations: iterno,
+                });
             }
         }
-        previous = Some(trial);
+        Phases::<T, F>::advance(
+            phases.initial_transient,
+            &mut phase,
+            &mut reorder,
+            &mut ipass,
+            noncon,
+            iterno,
+        );
+        release_previous(&mut trial);
+        storage.spare_trial = previous.replace(trial);
         guess = next;
     }
 }
@@ -665,6 +840,50 @@ fn failure(message: impl Into<String>) -> SpiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reusable_workspace_resets_values_and_rebinds_foreign_topology() {
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use std::{path::Path, sync::Arc};
+        let circuit = |body: &str| {
+            let netlist = Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("newton-workspace.cir"), body))
+                .unwrap();
+            crate::devices::Circuit::from_netlist(&netlist).unwrap()
+        };
+        let a = circuit("first circuit\nv1 in 0 1\nr1 in 0 1k\n.end\n");
+        let b = circuit("second circuit\nv1 in 0 1\nr1 in out 1k\nr2 out 0 1k\n.end\n");
+        assert_ne!(a.unknown_count(), b.unknown_count());
+        let mut storage = CircuitNewtonWorkspace::default();
+        let (matrix, rhs) = storage.load.prepare_load(&a).unwrap();
+        matrix.set(0, 0, 12.).unwrap();
+        rhs.set(0, 14.).unwrap();
+        let rhs_address = rhs.as_slice().as_ptr();
+        let (matrix, rhs) = storage.load.prepare_load(&a).unwrap();
+        assert_eq!(matrix.get(0, 0).to_bits(), 0_f64.to_bits());
+        assert_eq!(rhs.as_slice().as_ptr(), rhs_address);
+        assert!(
+            rhs.as_slice()
+                .iter()
+                .all(|&value| value.to_bits() == 0_f64.to_bits())
+        );
+
+        // A similarly sized, but foreign verified pattern must never be
+        // reused as another circuit's stamp workspace.
+        let foreign = Arc::new(crate::maths::Pattern::new(a.unknown_count(), [(0, 0)]).unwrap());
+        storage.load.matrix = Some(SparseMatrix::bound(Arc::clone(&foreign)).unwrap());
+        let (matrix, rhs) = storage.load.prepare_load(&a).unwrap();
+        assert_eq!(rhs.as_slice().as_ptr(), rhs_address);
+        assert!(
+            matrix
+                .bound_values()
+                .is_none_or(|(pattern, _)| !Arc::ptr_eq(pattern, &foreign))
+        );
+        let (matrix, rhs) = storage.load.prepare_load(&b).unwrap();
+        assert_eq!(matrix.rows(), b.unknown_count());
+        assert_eq!(rhs.len(), b.unknown_count());
+        assert!(rhs.as_slice().iter().all(|&value| value == 0.));
+    }
+
     #[test]
     fn solves_nonlinear_equation_and_returns_state_at_solution() {
         let initial = Vector::zeros(1);
