@@ -7,21 +7,26 @@ need not be rebuilt for every point. This is separate from the SIMD
 **multiple-RHS solve of one matrix** (#98): here each lane has a different
 numeric matrix and its own pivots, factors, status and solution.
 
-## Execution eligibility
+## Execution eligibility and production policy
 
-The `.ac` driver uses at most four frequency points per tile only when no
-device requires a frequency-dependent operating point
-(`depends_on_frequency`) or frequency-dependent small-signal reassembly
-(`small_signal_depends_on_frequency`). These cases continue to call
-`SmallSignal::at_frequency` sequentially, including the prior bias as the
-warm start and the accepted device-state recording. No transient, nonlinear
-continuation, noise or multiport execution is implicitly parallelized.
+The ordinary `.ac` driver retains C's sequential `SmallSignal::at_frequency`
+loop and the circuit-owned SPARSE ordering cache. Empirical test- and
+release-profile 1D/2D factor-and-solve measurements show no stable useful
+throughput crossover for the packed SIMD implementation. Thus automatic
+`.ac` SIMD dispatch is deliberately not enabled: this refactor must not
+regress common SPICE analysis throughput.
 
-Every point retains its original frequency index, its own assembled
-`A + j omega E`, and the parameter observation context at that frequency.
-The sink sees checked points strictly in grid order and stops on its first
-error. The independent numeric API can report subsequent lanes' errors and
-solutions without one failing lane poisoning its peers.
+The explicit `IndependentComplexBatch::solve` API operates on already
+assembled, independent `ComplexMatrix` values and one RHS per point.
+Callers that can establish independence may use it in bounded four-point
+tiles; it returns ordered per-point `SpiceResult<Vec<Complex>>`. The
+`factorize` variant retains independent factors for repeated RHS or
+transpose solves. A frequency-dependent operating point
+(`depends_on_frequency`) and frequency-dependent stamp reassembly
+(`small_signal_depends_on_frequency`) remain unsuitable for independent
+tiling: C's warm-start bias, accepted state, and stamp history semantics
+must not change. No transient, nonlinear continuation, noise or multiport
+execution is implicitly parallelized.
 
 ## Symbolic and numeric ownership
 
@@ -41,15 +46,16 @@ own lane using the standard threshold reorder. Scalar factors retain valid
 normal and transposed solves; no C bit-for-bit pivot sequence is promised.
 
 The logical tile width is four, independent of the potentially much larger
-frequency grid or optimization candidate batch. Tile scratch is reused,
-not retained once per point. Both bound circuit matrices and compatible
+frequency grid or optimization candidate batch. `solve` packs the numeric
+refactor and forward/back substitution without materializing a scalar LU for
+each normal lane; its reusable tile scratch is not retained per point. Both bound circuit matrices and compatible
 standalone sparse matrices are supported.
 
 ## Validation and crossover
 
 - `cargo +nightly test --locked --lib independent_` checks scalar-equivalent
-  normal/transposed solves, physical multi-point AC vs singleton AC, frequency
-  and observation ordering, and singular/zero-pivot isolation.
+  normal/transposed solves, an explicitly batched real AC circuit against the
+  scalar plot, observation ordering, and singular/zero-pivot isolation.
 - `cargo +nightly test --locked --test solver_workloads_bench independent_complex_ -- --ignored --nocapture`
   compares scalar and packed factorization separately from matrix assembly
   on 1D and 2D grounded complex workloads. All solutions and failures are
@@ -57,9 +63,13 @@ standalone sparse matrices are supported.
 - End-to-end and live-C analysis conformance remain authoritative for
   physical equations, event/error semantics and observation accuracy.
 
-On the initially measured narrow-band matrix workloads, the packed path was
-mostly slower than scalar before the vectorized-mask and reusable-workspace
-optimizations. The implementation must demonstrate a useful crossover (or
-use scalar dispatch where it does not) before being treated as a general
-throughput improvement; matrix assembly and sink overhead are distinct from
-the factorization microbenchmark.
+Performance data: seven serial test-profile and nine serial release-profile
+repetitions of representative 1D and 2D matrices compared factorization and
+direct factor+solve separately. The packed path is predominantly slower
+(including 1024-node meshes at about 0.26–0.28x scalar solve throughput in
+release) despite matching reference solutions. Some isolated noisy cases
+appear faster but do not establish a reliable crossover. The durable raw
+measurements, proposed next experiments and decisions live in the separate
+Notion architecture #97 worklog. Any later production dispatch must
+demonstrate useful end-to-end speed on comparable, representative workloads,
+not just correctness or synthetic peak width.

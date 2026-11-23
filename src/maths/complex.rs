@@ -587,14 +587,11 @@ impl IndependentComplexBatch {
             offset = 1;
         }
         for (tile, source_tile) in matrices[offset..].chunks(4).zip(rhs[offset..].chunks(4)) {
-            let shared = tile.len() >= 2
-                && self.previous.as_ref().is_some_and(|previous| {
-                    tile.iter().all(|matrix| matrix.shares_order_with(previous))
-                });
-            if shared {
+            if let Some(previous) = self.previous.as_ref().filter(|previous| {
+                tile.len() >= 2 && tile.iter().all(|matrix| matrix.shares_order_with(previous))
+            }) {
                 let inputs: Vec<_> = tile.iter().map(ComplexMatrix::original_values).collect();
                 let originals: Vec<&[Complex]> = inputs.iter().map(Cow::as_ref).collect();
-                let previous = self.previous.as_ref().expect("shared order has a factor");
                 if let Some((statuses, solutions)) = Sparse::factor_and_solve_independent_tile(
                     &previous.factors.sparse,
                     &originals,
@@ -607,11 +604,11 @@ impl IndependentComplexBatch {
                         .zip(source_tile.iter().copied())
                         .zip(statuses.into_iter().zip(solutions))
                     {
-                        if status == Status::Okay {
-                            if let Some(solution) = solution {
-                                results.push(Ok(solution));
-                                continue;
-                            }
+                        if status == Status::Okay
+                            && let Some(solution) = solution
+                        {
+                            results.push(Ok(solution));
+                            continue;
                         }
                         // A failed lane is retried independently with the
                         // exact scalar pivot/reordering and error policy.
@@ -666,16 +663,12 @@ impl IndependentComplexBatch {
                 }
             }
         }
-        let same_order = self.previous.as_ref().is_some_and(|previous| {
-            matrices[offset..]
-                .iter()
-                .all(|matrix| matrix.shares_order_with(previous))
-        });
-        if same_order && matrices.len() - offset >= 2 {
-            let previous = self
-                .previous
-                .as_ref()
-                .expect("same order implies a prior factor");
+        if let Some(previous) = self.previous.as_ref().filter(|previous| {
+            matrices.len() - offset >= 2
+                && matrices[offset..]
+                    .iter()
+                    .all(|matrix| matrix.shares_order_with(previous))
+        }) {
             let mut frames: Vec<_> = matrices[offset..]
                 .iter()
                 .map(|matrix| match &matrix.assembly {
@@ -997,6 +990,64 @@ mod tests {
                 };
                 for (a, b) in actual.iter().zip(reference.iter()) {
                     assert!((*a - *b).magnitude() <= 1e-12);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn independent_batch_keeps_range_extreme_lanes_isolated() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (1, 1)]).unwrap());
+        let e = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let scales = [
+            (2., 4.),
+            (f64::MAX, 1.),
+            (1., f64::MAX),
+            (f64::MIN_POSITIVE, 1.),
+            (1e-300, 1e300),
+            (1e300, 1e-300),
+            (8., 1e-200),
+        ];
+        let matrices: Vec<_> = scales
+            .iter()
+            .map(|&(first, second)| {
+                let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+                a.add(0, 0, first).unwrap();
+                a.add(1, 1, second).unwrap();
+                ComplexMatrix::from_operators_on(&pattern, &a, &e, 0.)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let sources: Vec<_> = scales
+            .iter()
+            .map(|&(first, second)| [Complex::real(first), Complex::real(second)])
+            .collect();
+        let rhs: Vec<_> = sources.iter().map(<[Complex; 2]>::as_slice).collect();
+        for transposed in [false, true] {
+            let mut batch = IndependentComplexBatch::default();
+            let actual = batch.solve(&matrices, &rhs, transposed).unwrap();
+            assert_eq!(actual.len(), matrices.len());
+            for (index, (matrix, candidate)) in matrices.iter().zip(actual).enumerate() {
+                let reference = matrix.factorize_new_matrix().and_then(|factor| {
+                    if transposed {
+                        factor.solve_transposed(rhs[index])
+                    } else {
+                        factor.solve(rhs[index])
+                    }
+                });
+                match (reference, candidate) {
+                    (Ok(reference), Ok(candidate)) => {
+                        for (a, b) in candidate.iter().zip(reference) {
+                            let scale = b.re.abs().max(b.im.abs()).max(1.);
+                            assert!((a.re - b.re).abs() <= 1e-12 * scale);
+                            assert!((a.im - b.im).abs() <= 1e-12 * scale);
+                        }
+                    }
+                    (Err(_), Err(_)) => {}
+                    (reference, candidate) => panic!(
+                        "lane {index}, transposed={transposed}: scalar {reference:?}, batch {candidate:?}"
+                    ),
                 }
             }
         }

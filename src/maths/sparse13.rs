@@ -783,19 +783,19 @@ impl<I: PlanIndex> FactorRuns<I> {
                 let (handle, row) = entry.indices();
                 values[handle] = scratch[row];
             }
-            for lane in 0..count {
-                if statuses[lane] != Status::Okay {
+            for (lane, status) in statuses.iter_mut().enumerate().take(count) {
+                if *status != Status::Okay {
                     continue;
                 }
                 let pivot = scratch[step].get::<Complex>(lane);
-                statuses[lane] = if pivot.is_zero() {
+                *status = if pivot.is_zero() {
                     Status::ZeroDiag
                 } else if !pivot.is_finite() {
                     Status::NonFinite
                 } else {
                     Status::Okay
                 };
-                if statuses[lane] == Status::Okay {
+                if *status == Status::Okay {
                     values[diag[step]].set(lane, pivot);
                     inverses[step].set(lane, pivot.cached_recip());
                 }
@@ -3397,6 +3397,9 @@ impl DeterminantScale for Complex {
     }
 }
 
+/// Numeric per-lane factorization outcomes and ordered external solutions.
+type IndependentTileSolutions = ([Status; RHS_BATCH_WIDTH], Vec<Option<Vec<Complex>>>);
+
 impl Sparse<Complex> {
     /// Factor independent original coefficient streams using one immutable
     /// ordered symbolic topology. The reference's numeric factors are never
@@ -3441,9 +3444,9 @@ impl Sparse<Complex> {
         let count = inputs.len();
         let mut status = [Status::Okay; RHS_BATCH_WIDTH];
         let first_pivot = topology.diag[1];
-        for lane in 0..count {
+        for (lane, lane_status) in status.iter_mut().enumerate().take(count) {
             let pivot = values[first_pivot].get::<Complex>(lane);
-            status[lane] = if pivot.is_zero() {
+            *lane_status = if pivot.is_zero() {
                 Status::ZeroDiag
             } else if !pivot.is_finite() {
                 Status::NonFinite
@@ -3538,7 +3541,7 @@ impl Sparse<Complex> {
         rhs: &[&[Complex]],
         workspace: &mut IndependentFactorTileWorkspace,
         transposed: bool,
-    ) -> Option<([Status; RHS_BATCH_WIDTH], Vec<Option<Vec<Complex>>>)> {
+    ) -> Option<IndependentTileSolutions> {
         if inputs.len() != rhs.len()
             || rhs.iter().any(|source| {
                 source.len() != reference.ext_size || source.iter().any(|value| !value.is_finite())
