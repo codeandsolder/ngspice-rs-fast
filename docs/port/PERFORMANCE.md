@@ -38,40 +38,31 @@ and check the loaded residual. Retained output is encoded and decoded
 losslessly; non-retaining output checks plot count, row count and row width.
 Existing live C conformance remains the detailed independent physics oracle.
 
-## Homogeneous nonlinear device loading (#99)
+## Direct nonlinear diode loading (#99, #164)
 
-The finalized C device load order now includes an immutable *typed* diode
-execution plan. Adjacent same-family/same-model diodes are grouped into
-bounded 64-instance tiles (singletons and every other family stay scalar).
-Each tile gathers the physical and state inputs, independently evaluates
-junction physics, and commits the original ordered MNA/RHS/charge/limiter
-writes and possible errors one device at a time. Only the prepared device
-recipes may change between parameter candidates; the underlying topology
-and tile identities cannot change. A tile uses one phase-tagged reusable
-within-load buffer, allocated only for circuits with eligible tiles. **This
-is a vectorization-ready architecture, not yet a hardware SIMD kernel.**
+The finalized topology preserves the C device load order. Each diode samples
+its model and accepted-state inputs, evaluates its complete junction physics,
+and commits the MNA/RHS, charge and limiting state before the next device.
+There is **no diode tile plan, buffering or separate SIMD load path**.
+The explicit diode sampling/evaluation/commit decomposition remains useful
+for independent numerical verification without changing scalar execution.
 
-The dedicated unit test module
-`src/devices/circuit/diode_batch_tests.rs` compares the same circuit with the
-plan enabled/disabled and checks exact matrix, RHS, state and error-order
-bits across 0–131 diodes, mixed models, limiting/predictor phases, temperature
-and instance overrides. The ignored `diode_tile_load_and_solve_benchmark`
-measures the *same* finalized diode network in scalar and tiled modes,
-recording separate load and sparse solve medians for 1–4,096 instances.
+The previous homogeneous 64-lane load planner (#99) was retired after release
+measurements showed that scalar gather/queue/commit was consistently slower
+than direct scalar loading. An experimental four-lane portable-SIMD finish
+for complete diode physics (#164) preserved all tested numerical bits but
+also slowed complete device loading. On native Ryzen 7 4700U and generic
+x86-64, and independently on Intel Celeron N4100, the overhead remained
+material across 4–4,096-device networks; exact full-physics and simpler
+diode model variants were both measured. No approximate vector exponential
+or reduced model coverage was accepted.
 
-~~~sh
-cargo +nightly test --locked --lib devices::circuit::diode_batch_tests
-cargo +nightly test --locked --lib diode_tile_load_and_solve_benchmark \
-  -- --ignored --nocapture --test-threads=1
-~~~
-
-Initial Acer test-profile (not release) measurements showed no small-circuit
-benefit, at most a modest 64–256-device overhead and a measurable improvement
-for 1,024 diodes after eliminating the second staging buffer; 4,096 diodes
-were near scalar parity on a heavily loaded host. The opt-in benchmark is
-not a CI threshold. Hardware SIMD and representative release-profile results
-remain a separate optimization step, without sacrificing the verified
-ordered reference semantics.
+The experimental branch commits, all three host/compiler results, individual
+load/factor+solve medians and the reproduction harness are recorded in the
+[issue #164 engineering log](https://app.notion.com/p/421f74be9020817eaefcd4ac4e1fb933).
+Future vectorization must show **whole-load** gains with C-reference fidelity
+before reinstating a batch planner. The regular diode physics tests, full C
+golden verification and ordered scalar stamps remain the regression gates.
 
 ## Measurements
 

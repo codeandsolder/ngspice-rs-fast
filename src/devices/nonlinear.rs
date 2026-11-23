@@ -486,9 +486,9 @@ struct DiodeParameters {
     instance: DiodeInstanceParameters,
     setup: DiodeSetup,
 }
-/// Gathered, state-independent diode physics inputs (one lane in a
-/// homogeneous load tile). All state/history decisions are already made, but
-/// no junction math or ordered commit has occurred.
+/// State-independent inputs for a single diode physical evaluation.
+/// Sampling determines limiting and accepted-history decisions before
+/// solving the pure junction equations and committing the ordered stamp.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DiodeLoadSample {
     thermal: Thermal,
@@ -500,8 +500,7 @@ pub(crate) struct DiodeLoadSample {
 }
 
 impl DiodeLoadSample {
-    /// Run only the physical junction kernel. Can be evaluated in arbitrary
-    /// lane order after the sampling phase without accessing solver state.
+    /// Evaluate physical junction equations without mutating solver state.
     /// # Errors
     /// Nonfinite or unsupported junction physics.
     pub(crate) fn evaluate(self, gmin: Real) -> SpiceResult<DiodeLoadEvaluation> {
@@ -524,8 +523,7 @@ impl DiodeLoadSample {
 }
 
 /// Pure junction result of one diode load, including its independently
-/// evaluated limiting decision. Matrix/RHS and trial-state writes happen
-/// only when this result reaches its original load-order position.
+/// evaluated limiting decision. The caller stamps it in original C order.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DiodeLoadEvaluation {
     thermal: Thermal,
