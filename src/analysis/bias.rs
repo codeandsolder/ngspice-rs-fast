@@ -1124,6 +1124,9 @@ struct Engine<'a> {
     /// Per-stage limit of the gmin/source-stepping strategies.
     stage_limit: usize,
     remaining: usize,
+    /// One numeric and disposable-state buffer across every continuation
+    /// attempt; an accepted history revision still invalidates spare state.
+    workspace: crate::analysis::newton::CircuitNewtonWorkspace,
 }
 
 #[derive(Clone, Copy)]
@@ -1366,8 +1369,10 @@ impl Engine<'_> {
         let context = junction
             .map_or(*self.context, |junction| self.context.with_gmin(junction))
             .with_source_factor(scale);
+        let nodes = self.nodes;
+        let branches = &self.branches;
         let result = CircuitNewton {
-            branch_rows: &self.branches,
+            branch_rows: branches,
             limited_rows: self.limited.as_deref(),
             options: &options,
             load: CircuitLoad::Bias {
@@ -1376,6 +1381,7 @@ impl Engine<'_> {
                 history: self.history,
                 forcing: self.forcing,
             },
+            workspace: &mut self.workspace,
         }
         .solve(
             guess,
@@ -1391,7 +1397,7 @@ impl Engine<'_> {
                 // cktload.c: nodeset rows only in MODEINITJCT/MODEINITFIX;
                 // .ic rows in every load, both scaled by CKTsrcFact.
                 let hinted = matches!(phase, IterationPhase::Junction | IterationPhase::Fix);
-                self.nodes.apply(matrix, rhs, scale, hinted, &self.branches)
+                nodes.apply(matrix, rhs, scale, hinted, branches)
             },
         );
         let (iterations, error) = match &result {
@@ -1750,6 +1756,7 @@ fn run(
         newton: *options,
         stage_limit,
         remaining: budget,
+        workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
     };
     for planned in &plan {
         match engine.attempt(report, planned) {
