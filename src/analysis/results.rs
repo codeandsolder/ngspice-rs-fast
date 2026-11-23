@@ -195,13 +195,44 @@ pub(super) fn lifecycle_error(message: &str) -> SpiceError {
 }
 
 /// Collect only when requested by the caller, never inside a streaming driver.
-#[derive(Default)]
 pub(super) struct PlotCollector {
     plots: Vec<Plot>,
     active: Option<Plot>,
+    remaining_cells: usize,
+    max_plots: usize,
+}
+
+impl Default for PlotCollector {
+    fn default() -> Self {
+        Self::bounded(usize::MAX, usize::MAX)
+    }
 }
 
 impl PlotCollector {
+    pub(super) fn bounded(max_plots: usize, max_cells: usize) -> Self {
+        Self {
+            plots: Vec::new(),
+            active: None,
+            remaining_cells: max_cells,
+            max_plots,
+        }
+    }
+
+    fn check_plot_limit(&self) -> SpiceResult<()> {
+        if self.plots.len() >= self.max_plots {
+            return Err(lifecycle_error("plot retention count limit exceeded"));
+        }
+        Ok(())
+    }
+
+    fn charge(&mut self, cells: usize) -> SpiceResult<()> {
+        self.remaining_cells = self
+            .remaining_cells
+            .checked_sub(cells)
+            .ok_or_else(|| lifecycle_error("plot retention cell limit exceeded"))?;
+        Ok(())
+    }
+
     pub(super) fn finish(self, expected: usize) -> SpiceResult<Vec<Plot>> {
         if self.active.is_some() || self.plots.len() != expected {
             return Err(lifecycle_error(
@@ -219,11 +250,13 @@ impl PointSink for PlotCollector {
                 "began a plot before completing the previous one",
             ));
         }
+        self.check_plot_limit()?;
         self.active = Some(header.header());
         Ok(())
     }
 
     fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
+        self.charge(values.len())?;
         self.active
             .as_mut()
             .ok_or_else(|| lifecycle_error("point without an active plot"))?
@@ -235,13 +268,16 @@ impl PointSink for PlotCollector {
             .active
             .take()
             .ok_or_else(|| lifecycle_error("end without an active plot"))?;
-        self.complete(plot)
+        self.plots.push(plot);
+        Ok(())
     }
 
     fn complete(&mut self, plot: Plot) -> SpiceResult<()> {
         if self.active.is_some() {
             return Err(lifecycle_error("completed a plot while another is active"));
         }
+        self.check_plot_limit()?;
+        self.charge(plot.cells().len())?;
         self.plots.push(plot);
         Ok(())
     }
