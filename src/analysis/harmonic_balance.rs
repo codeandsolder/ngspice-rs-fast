@@ -194,6 +194,8 @@ impl Coordinates {
 }
 
 struct Sampled {
+    /// Full mode-major complex state at the current Newton iterate.
+    spectrum: Vec<Complex>,
     di: Vec<Real>,
     dq: Vec<Real>,
     ispectrum: Vec<Complex>,
@@ -463,6 +465,7 @@ impl HarmonicProblem {
         Ok((
             encoded,
             Sampled {
+                spectrum,
                 di,
                 dq,
                 ispectrum,
@@ -559,12 +562,118 @@ impl HarmonicProblem {
                 let index = coord.mode * self.unknowns + coord.row;
                 let source = self.forcing[index].magnitude();
                 let conduction = sampled.ispectrum[index].magnitude();
-                let charge = TAU
-                    * self.plan.modes()[coord.mode].frequency_hz.abs()
-                    * sampled.qspectrum[index].magnitude();
-                let scale = source.max(conduction).max(charge);
+                let omega = TAU * self.plan.modes()[coord.mode].frequency_hz;
+                let charge = omega.abs() * sampled.qspectrum[index].magnitude();
+                let mut linear_conduction = Complex::ZERO;
+                let mut linear_storage = Complex::ZERO;
+                for col in 0..self.unknowns {
+                    let x = sampled.spectrum[coord.mode * self.unknowns + col];
+                    linear_conduction = linear_conduction
+                        + x * Complex::real(self.g[coord.row * self.unknowns + col]);
+                    linear_storage =
+                        linear_storage + x * Complex::real(self.c[coord.row * self.unknowns + col]);
+                }
+                let scale = source
+                    .max(conduction)
+                    .max(charge)
+                    .max(linear_conduction.magnitude())
+                    .max(omega.abs() * linear_storage.magnitude());
                 value.abs() / (self.limits.absolute + self.limits.relative * scale)
             })
             .fold(0., Real::max)
+    }
+}
+
+#[cfg(test)]
+mod jacobian_reference_tests {
+    use super::{Coordinates, HarmonicProblem, NonlinearConstitutive, SolveLimits};
+    use crate::primitives::{Complex, Real, SpiceResult};
+
+    struct CubicWithCharge;
+
+    impl NonlinearConstitutive for CubicWithCharge {
+        fn evaluate(
+            &mut self,
+            state: &[Real],
+            currents: &mut [Real],
+            charges: &mut [Real],
+            di: &mut [Real],
+            dq: &mut [Real],
+        ) -> SpiceResult<()> {
+            let x = state[0];
+            currents[0] = 0.3 * x * x * x;
+            charges[0] = 5e-6 * x * x;
+            di[0] = 0.9 * x * x;
+            dq[0] = 1e-5 * x;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn analytical_multitone_charge_jacobian_matches_independent_central_difference() {
+        let plan = super::plan::HarmonicPlan::new(
+            &[
+                super::plan::Tone::Independent {
+                    frequency_hz: 1000.,
+                    order: 1,
+                },
+                super::plan::Tone::Independent {
+                    frequency_hz: 1_414.213_562_373,
+                    order: 1,
+                },
+            ],
+            super::plan::HarmonicLimits::default(),
+        )
+        .unwrap();
+        let forcing = vec![Complex::ZERO; plan.modes().len()];
+        let problem = HarmonicProblem::new(
+            plan.clone(),
+            1,
+            vec![0.8],
+            vec![2e-5],
+            forcing,
+            SolveLimits::default(),
+        )
+        .unwrap();
+        let coords = Coordinates::new(&plan, 1);
+        let x: Vec<_> = (0..coords.independent.len())
+            .map(|i| 0.03 * (i as Real * 0.917 + 0.4).sin())
+            .collect();
+        let direction: Vec<_> = (0..coords.independent.len())
+            .map(|i| 0.7 * (i as Real * 0.719 + 0.3).cos())
+            .collect();
+        let base = problem.evaluate(&mut CubicWithCharge, &coords, &x).unwrap();
+        let analytical = problem
+            .jacobian_action(&coords, &base.1, &direction)
+            .unwrap();
+        let h = 2e-6;
+        let plus: Vec<_> = x
+            .iter()
+            .zip(&direction)
+            .map(|(&value, &dx)| value + h * dx)
+            .collect();
+        let minus: Vec<_> = x
+            .iter()
+            .zip(&direction)
+            .map(|(&value, &dx)| value - h * dx)
+            .collect();
+        let lhs = problem
+            .evaluate(&mut CubicWithCharge, &coords, &plus)
+            .unwrap()
+            .0;
+        let rhs = problem
+            .evaluate(&mut CubicWithCharge, &coords, &minus)
+            .unwrap()
+            .0;
+        for (i, (&actual, (&positive, &negative))) in
+            analytical.iter().zip(lhs.iter().zip(&rhs)).enumerate()
+        {
+            let derivative = (positive - negative) / (2. * h);
+            let bound = 1e-8 * derivative.abs().max(actual.abs()).max(1.);
+            assert!(
+                (actual - derivative).abs() <= bound,
+                "Jv[{i}]: analytic {actual:e}, finite-difference {derivative:e}"
+            );
+        }
     }
 }
