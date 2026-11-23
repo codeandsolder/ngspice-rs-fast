@@ -726,11 +726,14 @@ impl StampIdentity {
         }
     }
     fn advance(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
+        // Ungrouped Newton matrices need no generation writes.
+        if self.owner.get().is_some() {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
     fn reset(&mut self) {
         self.owner = OnceLock::new();
-        self.advance();
+        self.generation = 0;
     }
 }
 impl Clone for StampIdentity {

@@ -717,7 +717,7 @@ impl LinearContext<'_> {
                 start..end,
                 (r, c),
                 terms,
-                crate::maths::DynamicMode::Prescaled { scale },
+                crate::maths::DynamicMode::Prescaled { scale, divisor: 1. },
             )?;
         }
         Ok(())
@@ -738,7 +738,10 @@ impl LinearContext<'_> {
                 start..end,
                 (r, c),
                 std::slice::from_ref(&value),
-                crate::maths::DynamicMode::Prescaled { scale: 1. },
+                crate::maths::DynamicMode::Prescaled {
+                    scale: 1.,
+                    divisor: 1.,
+                },
             )?;
         }
         Ok(())

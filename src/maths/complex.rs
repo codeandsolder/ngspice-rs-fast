@@ -24,18 +24,22 @@ pub enum DynamicMode {
         /// Divider applied after multiplying the sum.
         divisor: f64,
     },
-    /// Terms already include angular frequency, so scale * sum(term).
+    /// Terms already include angular frequency: scale * sum(term)/divisor.
     Prescaled {
         /// Multiplier applied after summing the already-scaled terms.
         scale: f64,
+        /// Divider applied after scaling the sum.
+        divisor: f64,
     },
 }
 impl DynamicMode {
     const fn stamp(self, term: f64) -> f64 {
-        match self {
-            Self::Scaled { scale, divisor } => scale * term / divisor,
-            Self::Prescaled { scale } => scale * term,
-        }
+        let (scale, divisor) = match self {
+            Self::Scaled { scale, divisor } | Self::Prescaled { scale, divisor } => {
+                (scale, divisor)
+            }
+        };
+        scale * term / divisor
     }
 
     fn coefficient(self, terms: &[f64], omega: f64) -> f64 {
@@ -47,14 +51,16 @@ impl DynamicMode {
         for value in iter {
             sum += value;
         }
-        match self {
-            Self::Scaled { scale, divisor } => scale * sum / divisor,
-            Self::Prescaled { scale } => scale * sum,
-        }
+        let (scale, divisor) = match self {
+            Self::Scaled { scale, divisor } | Self::Prescaled { scale, divisor } => {
+                (scale, divisor)
+            }
+        };
+        scale * sum / divisor
     }
 
     fn pencil(self, terms: &[f64]) -> SpiceResult<f64> {
-        let Self::Scaled { scale, .. } = self else {
+        let Self::Scaled { scale, divisor } = self else {
             return Err(dynamic_error(
                 "prescaled AC terms cannot form a pole-zero pencil",
             ));
@@ -64,8 +70,9 @@ impl DynamicMode {
         for term in iter {
             sum += term;
         }
-        // Preserve the C pencil's original scale * sum coefficient.
-        Ok(scale * sum)
+        // The same physical E contribution is stamped in AC and PZ: an
+        // inductor with M parallel instances contributes -L/M, not -L.
+        Ok(scale * sum / divisor)
     }
 }
 
@@ -74,7 +81,6 @@ impl DynamicMode {
 struct Group {
     stamps: std::ops::Range<usize>,
     terms: std::ops::Range<usize>,
-    position: (usize, usize),
     mode: DynamicMode,
 }
 
@@ -136,6 +142,11 @@ impl DynamicGroups {
     pub fn capacities(&self) -> (usize, usize) {
         (self.groups.capacity(), self.terms.capacity())
     }
+    /// Reserved bytes in both dynamic-group arrays, excluding shared allocator metadata.
+    pub fn storage_bytes(&self) -> usize {
+        self.groups.capacity() * std::mem::size_of::<Group>()
+            + self.terms.capacity() * std::mem::size_of::<f64>()
+    }
 
     pub(crate) fn clear(&mut self) {
         self.groups.clear();
@@ -175,9 +186,17 @@ impl DynamicGroups {
         let candidate = Group {
             stamps: stamps.clone(),
             terms: 0..terms.len(),
-            position,
             mode,
         };
+        let at = e
+            .triplets()
+            .get(stamps.start)
+            .ok_or_else(|| dynamic_error("group start lies outside its E operator"))?;
+        if (at.row, at.col) != position {
+            return Err(dynamic_error(
+                "group first stamp has a different matrix coordinate",
+            ));
+        }
         Self::check_group(e, &candidate, terms)?;
         self.groups
             .try_reserve(1)
@@ -193,7 +212,6 @@ impl DynamicGroups {
         self.groups.push(Group {
             stamps,
             terms: begin..self.terms.len(),
-            position,
             mode,
         });
         self.sealed_generation = None;
@@ -210,6 +228,10 @@ impl DynamicGroups {
             .triplets()
             .get(group.stamps.clone())
             .ok_or_else(|| dynamic_error("group range exceeds its E operator"))?;
+        let first = stamps
+            .first()
+            .ok_or_else(|| dynamic_error("empty group stamp range"))?;
+        let position = (first.row, first.col);
         let mut index = 0;
         for &term in terms {
             let stamped = group.mode.stamp(term);
@@ -219,7 +241,7 @@ impl DynamicGroups {
             let Some(t) = stamps.get(index) else {
                 return Err(dynamic_error("group has fewer stamps than nonzero terms"));
             };
-            if (t.row, t.col) != group.position || t.value.to_bits() != stamped.to_bits() {
+            if (t.row, t.col) != position || t.value.to_bits() != stamped.to_bits() {
                 return Err(dynamic_error("group differs from ordered E stamps"));
             }
             index += 1;
@@ -932,7 +954,10 @@ mod tests {
                 0..2,
                 (0, 0),
                 &[1., 0., 2.],
-                DynamicMode::Prescaled { scale: 1. },
+                DynamicMode::Prescaled {
+                    scale: 1.,
+                    divisor: 1.,
+                },
             )
             .unwrap();
         prescaled.seal(&other).unwrap();
@@ -1105,7 +1130,7 @@ mod tests {
         }
         let mut e = SparseMatrix::new(2, 2);
         for v in [1e16, -1e16, 1.] {
-            e.add(0, 1, v).unwrap();
+            e.add(0, 1, 3. * v / 2.).unwrap();
         }
         e.add(1, 1, 0.5).unwrap();
         let mut groups = DynamicGroups::new();
@@ -1117,7 +1142,10 @@ mod tests {
                 0..3,
                 (0, 1),
                 &[1e16, -1e16, 1.],
-                DynamicMode::Prescaled { scale: 1. },
+                DynamicMode::Prescaled {
+                    scale: 3.,
+                    divisor: 2.,
+                },
             )
             .unwrap();
         groups

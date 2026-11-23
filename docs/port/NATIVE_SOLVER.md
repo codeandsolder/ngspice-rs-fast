@@ -74,6 +74,32 @@ configuration matches ngspice's `spconfig.h`: `TRANSLATE`, `EXPANDABLE`,
   whatever the deck's options, and `method=bdf` is an explicit error from the
   companion driver: ngspice has no BDF integrator.
 
+## Ordered dynamic contribution arena (#133)
+
+AC small-signal E remains an unfolded, chronologically ordered stamp stream:
+per-device groups replace contiguous same-element stamps by the sum of their
+original source terms, keeping zero terms and the C multiplication/division
+order. Each LinearSystem owns one reusable DynamicGroups term arena and one
+compact ordered group index, rather than a heap allocation per statement.
+Scaling is typed: Scaled terms are multiplied by angular frequency before
+summation; Prescaled terms already contain it (for frequency-dependent loads).
+Both retain the distinct multiplier and divisor until after summation.
+
+A group may only be registered over exactly its nonzero E stamps at the
+expected matrix coordinate. Completion validates ordered, disjoint ranges
+and seals the record to an E-operator identity and mutation generation;
+further stamp/clear/replace operations invalidate that seal. Cloning an
+entire LinearSystem rebinds its copied metadata to its copied E. AC,
+distortion and sensitivity validate before consuming the same ordered
+iterator, and reject malformed or stale metadata rather than skipping it.
+Pole-zero walks those validated records once per device, rejecting a group
+that crosses device boundaries or supplies pre-frequency-scaled AC values.
+Clear retains the index/term capacities for repeat assembly; a full operator
+reset creates a fresh identity. Grouped and ungrouped contributions preserve
+their original relative order. Benchmarks and pathological metadata tests
+live in tests/dynamic_group_bench.rs and maths::complex tests; the arithmetic
+policy is independent of the solver's numerical pivot behavior.
+
 ## SPARSE frame lifecycle (#34)
 
 A frame has one explicit ordering/factor lifecycle. Original columns are
