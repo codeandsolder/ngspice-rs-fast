@@ -594,6 +594,10 @@ impl Device for Behavioural {
         self.program.uses_frequency()
     }
 
+    fn depends_on_time(&self) -> bool {
+        self.program.uses_time()
+    }
+
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let time = match context.mode {
             AnalysisMode::Transient { time, .. } => time,

@@ -183,7 +183,10 @@ fn analysis_card(input: &mut Input<'_>) -> Result<ParsedCard> {
         rest,
     )
         .parse_next(input)?;
-    let (arguments, uic) = if kind == AnalysisKind::Transient {
+    let (arguments, uic) = if matches!(
+        kind,
+        AnalysisKind::Transient | AnalysisKind::PeriodicSteadyState
+    ) {
         split_uic(arguments)?
     } else {
         (arguments.iter().collect(), None)

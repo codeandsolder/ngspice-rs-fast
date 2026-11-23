@@ -2162,7 +2162,7 @@ impl Circuit {
             .map(|state| state.values.to_vec())
     }
 
-    pub(super) fn topology_id(&self) -> SpiceResult<TopologyId> {
+    pub(crate) fn topology_id(&self) -> SpiceResult<TopologyId> {
         self.bindings
             .identity
             .ok_or_else(|| SpiceError::circuit("circuit topology is stale or not finalized"))
