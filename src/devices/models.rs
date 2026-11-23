@@ -550,6 +550,17 @@ impl<'a> ModelResolver<'a> {
             (declaration, true)
         };
         let card = declaration.bin.card;
+        // CPL grammar is recognized, but the native coupled DC/transient
+        // backend cannot be substituted with an unrelated line device.
+        if matches!(card.base.as_str(), "cpl" | "cpllines") {
+            return Err(SpiceError::not_yet_ported(
+                format!(
+                    "coupled-line model '{}' referenced by {} (designator {})",
+                    card.name, instance.name, instance.designator
+                ),
+                "src/spicelib/parser/inp2p.c",
+            ));
+        }
         let family = declaration.family()?;
         if family.designator() != instance.designator.to_ascii_lowercase() {
             return Err(SpiceError::parse(
