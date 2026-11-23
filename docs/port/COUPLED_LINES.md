@@ -72,6 +72,13 @@ I = Y0 V - B_current diag(y_mode) received_launch. These identities
 describe only the lossless wavefront. General frequency-dependent
 R/G attenuation, convolution and accepted-step delay history remain
 separate requirements, never scalar per-conductor approximations.
+The read-only causal history sampler now evaluates each mode against
+accepted WaveformHistory samples using bounded binary search and stable
+affine interpolation. At the initial t=0 sample it supplies constant
+prehistory; after pruning, an absent required sample is explicitly
+rejected instead of being extrapolated. No trial mutates accepted
+history or partially writes the received output buffers. Full lossy
+Padé and CPL transient callback integration remain pending.
 
 ## Front-end representation
 
