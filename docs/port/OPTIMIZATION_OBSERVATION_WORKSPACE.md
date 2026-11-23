@@ -50,3 +50,28 @@ The 1,000-load measurement is excluded from ordinary CI and can be selected
 explicitly in a quiet benchmarking environment. Benchmark the already
 prepared circuit, not repeated topology construction.
 
+
+## Deterministic memory and isolated timing snapshot (2026-11-23)
+
+Run on the Acer campaign nightly with managed sccache. The fixtures use the
+same prepared circuit over 1,001 selected points, then a single full-output
+point; reported times are elapsed wall-clock, not a paired CPU benchmark.
+Acer was under concurrent compile load, so the 24-load and 1,000-load times
+must not be compared against one another or interpreted as speedup ratios.
+
+| Bound loads | Initialized current buffers after 1,001 selected points | Current scratch allocated / former eager baseline | Per-load metadata | Selected 1,001-point wall time | Subsequent full-selection wall time |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 24 | 1 | 32 / 384 bytes | 768 bytes | 2.588 ms | 14.087 us |
+| 1,000 | 1 | 32 / 16,000 bytes | 32,000 bytes | 0.275 ms | 224.796 us |
+
+The prior ready-flag model performed 24,024 or 1,001,000 flag resets for
+these selected loops. The epoch implementation instead performs 1,001 scalar
+increments and does not visit cold loads. The old implementation allocated
+one current vector per bound load at setup; the new one allocates only the
+selected load's vector on first use. The full-output point initializes all
+other buffers and returns the same first selected current.
+
+These memory and work counts are deterministic. Timing comparisons with the
+old implementation need interleaved runs on a quiet host and are not inferred
+from this concurrent-host snapshot.
+
