@@ -532,31 +532,33 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<V
                 };
                 let cosine = 1. / tangent.hypot(1.);
                 let sine = tangent * cosine;
-                // Rotate the two pivot rows contiguously: each off-pivot
-                // pair is read once, so SIMD and cache lines serve the full
-                // row. Only after the borrow ends do we mirror the results
-                // into the strided columns. Never compute the mirrored
-                // entries by a second, independently rounded rotation.
+                // Split disjoint row regions around both pivots. Each
+                // off-pivot pair is read from two contiguous pivot rows and
+                // simultaneously written to their symmetric mirror cells.
+                // No strided input reads, second sweep, unsafe aliasing,
+                // scratch allocation, or independently rounded mirror.
                 {
-                    let (before, after) = data.split_at_mut(second * order);
-                    let left_row = &mut before[first * order..][..order];
-                    let right_row = &mut after[..order];
-                    for (index, (left, right)) in left_row.iter_mut().zip(right_row).enumerate() {
-                        if index == first || index == second {
-                            continue;
+                    let (before_first, following_first) = data.split_at_mut(first * order);
+                    let (first_row, following_first) = following_first.split_at_mut(order);
+                    let (between, following_second) =
+                        following_first.split_at_mut((second - first - 1) * order);
+                    let (second_row, after_second) = following_second.split_at_mut(order);
+                    let mut rotate_region = |rows: &mut [Real], start: usize| {
+                        for (offset, row) in rows.chunks_exact_mut(order).enumerate() {
+                            let index = start + offset;
+                            let left = first_row[index];
+                            let right = second_row[index];
+                            let rotated_left = (-sine).mul_add(right, cosine * left);
+                            let rotated_right = sine.mul_add(left, cosine * right);
+                            first_row[index] = rotated_left;
+                            second_row[index] = rotated_right;
+                            row[first] = rotated_left;
+                            row[second] = rotated_right;
                         }
-                        let old_left = *left;
-                        let old_right = *right;
-                        *left = (-sine).mul_add(old_right, cosine * old_left);
-                        *right = sine.mul_add(old_left, cosine * old_right);
-                    }
-                }
-                for index in 0..order {
-                    if index == first || index == second {
-                        continue;
-                    }
-                    data[index * order + first] = data[first * order + index];
-                    data[index * order + second] = data[second * order + index];
+                    };
+                    rotate_region(before_first, 0);
+                    rotate_region(between, first + 1);
+                    rotate_region(after_second, second + 1);
                 }
                 let change = tangent * coupling;
                 data[first * order + first] = a - change;
