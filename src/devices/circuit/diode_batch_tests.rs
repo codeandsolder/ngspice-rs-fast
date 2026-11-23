@@ -1,0 +1,447 @@
+//! The same finalized diode circuits loaded with and without the homogeneous
+//! planning optimization. Inspect raw MNA/state bits, not merely solved plots.
+use super::Circuit;
+
+/// Two independently finalized copies of the same circuit exercise
+/// production `load_prepared` with and without the immutable batch plan.
+/// The scalar path is not a reimplementation: it is the exact same
+/// stamp loop with an empty homogeneous plan.
+fn compare_diode_load(
+    count: usize,
+    model_groups: bool,
+    phase: crate::devices::IterationPhase,
+    limiting: bool,
+    c_jacobian: bool,
+    temperature: f64,
+    bad_node: Option<&str>,
+) {
+    use crate::devices::{AnalysisMode, LoadRequest, ModelContext};
+    use crate::maths::Vector;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::{fmt::Write, path::Path};
+
+    let mut deck = String::from("batched device load\n");
+    deck.push_str("v1 n0 0 dc 0\nr1 n0 n1 100\n");
+    // ngspice rejects unused model declarations: each test size has
+    // precisely the models its source cards actually reference.
+    if count >= 2 || (count > 0 && !model_groups) {
+        deck.push_str(".model dm d(is=1e-14 rs=2 cjo=2p tt=3n)\n");
+    }
+    if count > 0 && model_groups {
+        deck.push_str(".model dn d(is=2e-14 rs=0 cjo=4p tt=1n)\n");
+    }
+    for index in 0..count {
+        let model = if model_groups && index % 5 == 0 {
+            "dn"
+        } else {
+            "dm"
+        };
+        let node = index % 8;
+        writeln!(&mut deck, "d{index} n{node} 0 {model}").unwrap();
+        if index % 23 == 0 {
+            writeln!(&mut deck, "r{index} n{node} 0 2k").unwrap();
+        }
+    }
+    deck.push_str(".op\n.end\n");
+    let parsed = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("diode-batches.cir"), &deck))
+        .unwrap();
+    let batched = Circuit::from_netlist(&parsed).unwrap();
+    let mut scalar = Circuit::from_netlist(&parsed).unwrap();
+    let active: usize = batched
+        .bindings
+        .diode_batches
+        .iter()
+        .map(|batch| batch.len)
+        .sum();
+    if count >= 2 {
+        assert!(
+            active >= count.saturating_sub(2),
+            "count={count}, active={active}"
+        );
+    } else {
+        assert_eq!(active, 0);
+    }
+    assert!(
+        batched
+            .bindings
+            .diode_batches
+            .iter()
+            .all(|batch| batch.len >= 2 && batch.len <= super::DIODE_TILE)
+    );
+    scalar.bindings.diode_batches.clear();
+    assert_eq!(batched.unknown_count(), scalar.unknown_count());
+    let n = batched.unknown_count();
+    let mut solution = Vector::zeros(n);
+    for row in 0..n {
+        solution.set(row, (row % 17) as f64 * 0.017 - 0.12).unwrap();
+    }
+    if let Some(name) = bad_node {
+        let node = batched.nodes.get(name).unwrap();
+        let row = batched.bindings.unknowns.node_row(node).unwrap();
+        solution.set(row, 1_000.).unwrap();
+    }
+    let context = ModelContext::new(temperature, 27.);
+    let mut history_a = batched.state_history().unwrap();
+    let mut history_b = scalar.state_history().unwrap();
+
+    // Predictor/limiter runs have a completed, equivalent accepted
+    // physical state; compare the actual C MODEINIT path to obtain it.
+    if phase != crate::devices::IterationPhase::Junction {
+        for (circuit, history) in [(&batched, &mut history_a), (&scalar, &mut history_b)] {
+            let mut matrix = circuit.new_matrix().unwrap();
+            let mut rhs = Vector::zeros(n);
+            let mut trial = history.trial();
+            circuit
+                .load(
+                    &LoadRequest {
+                        mode: AnalysisMode::OperatingPoint,
+                        solution: &solution,
+                        model_context: &context,
+                        integration: None,
+                        history,
+                        forcing: None,
+                    },
+                    &mut matrix,
+                    &mut rhs,
+                    &mut trial,
+                )
+                .unwrap();
+            history.initialize(trial).unwrap();
+        }
+    }
+    let previous_a = (phase != crate::devices::IterationPhase::Junction).then(|| history_a.trial());
+    let previous_b = (phase != crate::devices::IterationPhase::Junction).then(|| history_b.trial());
+    let mut trial_a = if phase == crate::devices::IterationPhase::Junction {
+        history_a.trial()
+    } else {
+        history_a.trial_in(phase, previous_a.as_ref()).unwrap()
+    }
+    .with_device_limiting(limiting)
+    .with_c_jacobian(c_jacobian);
+    let mut trial_b = if phase == crate::devices::IterationPhase::Junction {
+        history_b.trial()
+    } else {
+        history_b.trial_in(phase, previous_b.as_ref()).unwrap()
+    }
+    .with_device_limiting(limiting)
+    .with_c_jacobian(c_jacobian);
+    let mut matrix_a = batched.new_matrix().unwrap();
+    let mut matrix_b = scalar.new_matrix().unwrap();
+    let mut rhs_a = Vector::zeros(n);
+    let mut rhs_b = Vector::zeros(n);
+    let result_a = batched.load(
+        &LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context: &context,
+            integration: None,
+            history: &history_a,
+            forcing: None,
+        },
+        &mut matrix_a,
+        &mut rhs_a,
+        &mut trial_a,
+    );
+    let result_b = scalar.load(
+        &LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context: &context,
+            integration: None,
+            history: &history_b,
+            forcing: None,
+        },
+        &mut matrix_b,
+        &mut rhs_b,
+        &mut trial_b,
+    );
+    assert_eq!(
+        result_a.as_ref().err().map(ToString::to_string),
+        result_b.as_ref().err().map(ToString::to_string),
+        "count={count}"
+    );
+    for row in 0..n {
+        assert_eq!(
+            rhs_a.get(row).unwrap().to_bits(),
+            rhs_b.get(row).unwrap().to_bits(),
+            "count={count} row={row} RHS"
+        );
+        for col in 0..n {
+            assert_eq!(
+                matrix_a.get(row, col).to_bits(),
+                matrix_b.get(row, col).to_bits(),
+                "count={count} row={row} col={col} MNA"
+            );
+        }
+    }
+    assert_eq!(
+        trial_a
+            .values()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>(),
+        trial_b
+            .values()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>(),
+        "count={count} trial"
+    );
+    assert_eq!(trial_a.is_nonconvergent(), trial_b.is_nonconvergent());
+}
+
+#[test]
+fn diode_tiles_are_bitwise_equivalent_to_scalar_load_across_modes_and_sizes() {
+    use crate::devices::IterationPhase;
+    for &count in &[0, 1, 2, 3, 63, 64, 65, 66, 127, 128, 129, 131] {
+        compare_diode_load(
+            count,
+            count % 2 == 1,
+            IterationPhase::Junction,
+            false,
+            false,
+            27.,
+            None,
+        );
+    }
+    for &phase in &[
+        IterationPhase::Junction,
+        IterationPhase::Fix,
+        IterationPhase::Float,
+        IterationPhase::Predict,
+    ] {
+        compare_diode_load(68, true, phase, true, true, -35., None);
+        compare_diode_load(129, false, phase, false, false, 120., None);
+    }
+}
+
+#[test]
+fn diode_tile_defers_later_lane_error_until_the_original_stamp_position() {
+    use crate::devices::IterationPhase;
+    // dn has no internal series node, so 1000 V overflows its physical
+    // exponential. d0 in the same model group stamps successfully
+    // before d5 fails; neither the error nor the prefix load can move.
+    compare_diode_load(
+        68,
+        true,
+        IterationPhase::Junction,
+        false,
+        false,
+        27.,
+        Some("n5"),
+    );
+}
+
+/// A parameter walk must not invalidate the topology-bound physical tile.
+/// A new prepared point may own replacement diode recipes, but every batch
+/// still commits at the original order and each new context has its own
+/// thermal inputs without changing the model family or state layout.
+#[test]
+fn diode_tiles_follow_swept_instance_replacements_without_stale_physics() {
+    use crate::devices::{AnalysisMode, LoadRequest, ModelContext};
+    use crate::maths::Vector;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::{fmt::Write, path::Path};
+
+    let mut deck =
+        String::from("diode overrides\nv1 n0 0 dc 0\n.model dm d(is=1e-14 rs=0 cjo=2p tt=3n)\n");
+    for i in 0..77 {
+        writeln!(&mut deck, "d{i} n{} 0 dm", i % 8).unwrap();
+    }
+    deck.push_str(".op\n.end\n");
+    let parsed = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("diode-override-test.cir"),
+            &deck,
+        ))
+        .unwrap();
+    let batched = Circuit::from_netlist(&parsed).unwrap();
+    let mut scalar = Circuit::from_netlist(&parsed).unwrap();
+    assert_eq!(
+        batched
+            .bindings
+            .diode_batches
+            .iter()
+            .map(|b| b.len)
+            .sum::<usize>(),
+        77
+    );
+    scalar.bindings.diode_batches.clear();
+    let history_a = batched.state_history().unwrap();
+    let history_b = scalar.state_history().unwrap();
+    let run_a = batched.prepare_run();
+    let run_b = scalar.prepare_run();
+    let n = batched.unknown_count();
+    let mut bias = Vector::zeros(n);
+    for row in 0..n {
+        bias.set(row, ((row % 9) as f64 - 4.) * 0.025).unwrap();
+    }
+    let base = ModelContext::default();
+    for &(area, temp) in &[(1., 27.), (0.25, -10.), (3., 110.), (0.25, -10.), (1., 27.)] {
+        let effective = |circuit: &Circuit| {
+            let context = base
+                .with_instance_override(
+                    circuit
+                        .instance_override("d5", "area", area, &base)
+                        .unwrap(),
+                )
+                .unwrap();
+            context
+                .with_instance_override(
+                    circuit
+                        .instance_override("d13", "temp", temp, &context)
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        let ctx_a = effective(&batched);
+        let ctx_b = effective(&scalar);
+        let mut matrix_a = batched.new_matrix().unwrap();
+        let mut matrix_b = scalar.new_matrix().unwrap();
+        let mut rhs_a = Vector::zeros(n);
+        let mut rhs_b = Vector::zeros(n);
+        let mut trial_a = history_a.trial();
+        let mut trial_b = history_b.trial();
+        run_a
+            .load(
+                &LoadRequest {
+                    mode: AnalysisMode::OperatingPoint,
+                    solution: &bias,
+                    model_context: &ctx_a,
+                    history: &history_a,
+                    forcing: None,
+                    integration: None,
+                },
+                &mut matrix_a,
+                &mut rhs_a,
+                &mut trial_a,
+            )
+            .unwrap();
+        run_b
+            .load(
+                &LoadRequest {
+                    mode: AnalysisMode::OperatingPoint,
+                    solution: &bias,
+                    model_context: &ctx_b,
+                    history: &history_b,
+                    forcing: None,
+                    integration: None,
+                },
+                &mut matrix_b,
+                &mut rhs_b,
+                &mut trial_b,
+            )
+            .unwrap();
+        for row in 0..n {
+            assert_eq!(
+                rhs_a.get(row).unwrap().to_bits(),
+                rhs_b.get(row).unwrap().to_bits(),
+                "area={area} temp={temp}, RHS row={row}"
+            );
+            for col in 0..n {
+                assert_eq!(
+                    matrix_a.get(row, col).to_bits(),
+                    matrix_b.get(row, col).to_bits(),
+                    "area={area} temp={temp}, MNA ({row},{col})"
+                );
+            }
+        }
+        assert_eq!(
+            trial_a
+                .values()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            trial_b
+                .values()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(trial_a.is_nonconvergent(), trial_b.is_nonconvergent());
+    }
+}
+
+/// Opt-in end-to-end circuit *load and solve* cost for 1..4096 common
+/// physical diodes. The same finalized graph is used in each mode; the
+/// only difference is clearing the immutable homogeneous execution plan.
+/// This tests small-circuit overhead as well as large-device throughput.
+#[test]
+#[ignore = "manual scalar-versus-tiled diode load and solve throughput"]
+fn diode_tile_load_and_solve_benchmark() {
+    use crate::devices::{AnalysisMode, LoadRequest, ModelContext};
+    use crate::maths::Vector;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::{fmt::Write, hint::black_box, path::Path, time::Instant};
+
+    for count in [1, 4, 64, 256, 1_024, 4_096] {
+        let mut deck = String::from(
+            "diode benchmark\nv0 n0 0 dc 0\nr0 n0 n1 100\n.model dm d(is=1e-14 cjo=2p tt=3n)\n",
+        );
+        for index in 0..count {
+            writeln!(&mut deck, "d{index} n{} 0 dm", index % 8).unwrap();
+        }
+        deck.push_str(".op\n.end\n");
+        let parsed = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("tile-benchmark.cir"), &deck))
+            .unwrap();
+        let context = ModelContext::default();
+        for batched in [false, true] {
+            let mut circuit = Circuit::from_netlist(&parsed).unwrap();
+            let lanes = circuit
+                .bindings
+                .diode_batches
+                .iter()
+                .map(|b| b.len)
+                .sum::<usize>();
+            if !batched {
+                circuit.bindings.diode_batches.clear();
+            }
+            let history = circuit.state_history().unwrap();
+            let run = circuit.prepare_run();
+            let solution = Vector::zeros(circuit.unknown_count());
+            let request = LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &solution,
+                model_context: &context,
+                integration: None,
+                history: &history,
+                forcing: None,
+            };
+            let mut matrix = circuit.new_matrix().unwrap();
+            let mut rhs = Vector::zeros(circuit.unknown_count());
+            let mut records = Vec::with_capacity(3);
+            for repeat in 0..4 {
+                let mut load_ns = 0_u128;
+                let mut solve_ns = 0_u128;
+                for _ in 0..48 {
+                    matrix.clear();
+                    rhs.clear();
+                    let mut trial = history.trial();
+                    let start = Instant::now();
+                    run.load(&request, &mut matrix, &mut rhs, &mut trial)
+                        .unwrap();
+                    load_ns += start.elapsed().as_nanos();
+                    black_box(&trial);
+                    let start = Instant::now();
+                    black_box(matrix.solve(&rhs).unwrap());
+                    solve_ns += start.elapsed().as_nanos();
+                }
+                if repeat > 0 {
+                    records.push((load_ns, solve_ns));
+                }
+            }
+            let mut loads = records.iter().map(|&(load, _)| load).collect::<Vec<_>>();
+            let mut solves = records.iter().map(|&(_, solve)| solve).collect::<Vec<_>>();
+            loads.sort_unstable();
+            solves.sort_unstable();
+            println!(
+                "diode_count={count},active_lanes={lanes},batched={batched},load_ns_per_trial={:.1},solve_ns_per_trial={:.1},total_ns_per_trial={:.1}",
+                loads[1] as f64 / 48.,
+                solves[1] as f64 / 48.,
+                (loads[1] + solves[1]) as f64 / 48.
+            );
+        }
+    }
+}
