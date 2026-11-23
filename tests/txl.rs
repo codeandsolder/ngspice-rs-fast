@@ -178,8 +178,13 @@ fn every_model_parameter_is_required() {
 /// not implement.
 #[test]
 fn coupled_line_models_are_refused() {
-    let error = deck("y1 a 0 b 0 cm\nv1 a 0 1\nrl b 0 50\n.model cm cpl r=1 l=1 c=1 g=0 length=1")
-        .unwrap_err();
+    // The CPL physical matrix grammar is recognized independently of Y,
+    // but model dispatch must still refuse using a pending P device as a Y.
+    let netlist =
+        deck("y1 a 0 b 0 cm\nv1 a 0 1\nrl b 0 50\n.model cm cpl r=1 l=1 c=1 g=0 length=1").unwrap();
+    assert_eq!(netlist.models[0].base, "cpl");
+    let error = Circuit::from_netlist(&netlist).unwrap_err();
+    assert!(error.is_not_yet_ported(), "{error}");
     assert!(error.to_string().contains("inp2p.c"), "{error}");
 }
 
