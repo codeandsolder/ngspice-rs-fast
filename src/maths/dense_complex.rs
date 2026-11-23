@@ -417,9 +417,9 @@ fn accumulate_row<const SUBTRACT: bool>(
         }
         return;
     }
-    let mut out_chunks = destination.chunks_exact_mut(4);
-    let mut in_chunks = source.chunks_exact(4);
-    for (out, input) in out_chunks.by_ref().zip(in_chunks.by_ref()) {
+    let (out_chunks, out_tail) = destination.as_chunks_mut::<4>();
+    let (in_chunks, in_tail) = source.as_chunks::<4>();
+    for (out, input) in out_chunks.iter_mut().zip(in_chunks) {
         let (re, im, fast) = row_products(factor, input);
         if fast.all() {
             let old_re = f64x4::from_array(std::array::from_fn(|i| out[i].re));
@@ -452,11 +452,7 @@ fn accumulate_row<const SUBTRACT: bool>(
             }
         }
     }
-    for (out, &input) in out_chunks
-        .into_remainder()
-        .iter_mut()
-        .zip(in_chunks.remainder())
-    {
+    for (out, &input) in out_tail.iter_mut().zip(in_tail) {
         *out = if SUBTRACT {
             *out - factor * input
         } else {
@@ -475,8 +471,8 @@ fn multiply_row(row: &mut [Complex], factor: Complex) {
         }
         return;
     }
-    let mut chunks = row.chunks_exact_mut(4);
-    for chunk in chunks.by_ref() {
+    let (chunks, tail) = row.as_chunks_mut::<4>();
+    for chunk in chunks {
         let (re, im, fast) = row_products(factor, chunk);
         for lane in 0..4 {
             chunk[lane] = if fast.test(lane) {
@@ -486,7 +482,7 @@ fn multiply_row(row: &mut [Complex], factor: Complex) {
             };
         }
     }
-    for value in chunks.into_remainder() {
+    for value in tail {
         *value = *value * factor;
     }
 }
