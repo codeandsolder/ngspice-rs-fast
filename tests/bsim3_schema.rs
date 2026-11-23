@@ -2,14 +2,54 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use ngspice_rs::devices::bsim3::{
-    self, Access, InputType, Inputs, ModelParameters, Value, parameters,
-};
+use ngspice_rs::devices::bsim3::{self, Access, Inputs, ModelParameters, Value, parameters};
 use ngspice_rs::devices::{Circuit, ModelContext, ModelResolver};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::{Netlist, ParameterKind};
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::SpiceResult;
+
+#[path = "support/model_schema_contract.rs"]
+mod model_schema_contract;
+
+use model_schema_contract::SchemaContract;
+
+fn contract_model_inputs(assignment: &str) -> SpiceResult<Inputs> {
+    inputs(assignment, "").map(|(model, _)| model.inputs)
+}
+
+fn contract_instance_inputs(assignment: &str) -> SpiceResult<Inputs> {
+    inputs("", assignment).map(|(_, instance)| instance)
+}
+
+fn contract_prepare_instance(
+    model: &ngspice_rs::devices::ResolvedModel<'_>,
+    device: &ngspice_rs::netlist::ast::DeviceInstance,
+) -> SpiceResult<Inputs> {
+    bsim3::model_parameters(model)?.instance_parameters(device, 1.)
+}
+
+fn contract() -> SchemaContract {
+    SchemaContract {
+        family: "BSIM3",
+        level: 8,
+        model_version: "3.3.0",
+        model_table: parameters::MODEL,
+        instance_table: parameters::INSTANCE,
+        access_cases: &[
+            ("l", Access::ReadWrite),
+            ("w", Access::ReadWrite),
+            ("off", Access::ReadWrite),
+            ("ic", Access::Input),
+            ("gm", Access::Output),
+            ("vth", Access::Output),
+            ("id", Access::Output),
+        ],
+        model_inputs: contract_model_inputs,
+        instance_inputs: contract_instance_inputs,
+        instantiate: contract_prepare_instance,
+    }
+}
 
 fn deck(body: &str) -> Netlist {
     Parser::new()
@@ -72,21 +112,8 @@ fn generated_tables_preserve_every_entry_alias_and_setter_field() {
     );
     assert_eq!(parameters::MODEL[0].name, "capmod");
     assert_eq!(parameters::MODEL.last().unwrap().name, "pmos");
-    for table in [parameters::MODEL, parameters::INSTANCE] {
-        assert_eq!(
-            table.iter().map(|p| p.name).collect::<BTreeSet<_>>().len(),
-            table.len()
-        );
-        for p in table {
-            let canonical = table.iter().find(|q| q.name == p.canonical).unwrap();
-            assert_eq!(canonical.id, p.id);
-            assert_eq!(canonical.c_field, p.c_field);
-            assert!(p.c_id.starts_with("BSIM3_"));
-            if p.access != Access::Output && p.input_type != InputType::RealVector {
-                assert!(p.c_field.is_some(), "{}", p.name);
-            }
-        }
-    }
+    contract().assert_generated_tables();
+    contract().assert_independent_access_expectations();
     let nch = parameters::MODEL.iter().find(|p| p.name == "nch").unwrap();
     assert_eq!(nch.c_field, Some("BSIM3npeak"));
     assert_eq!(nch.c_given, Some("BSIM3npeakGiven"));
@@ -104,73 +131,12 @@ fn generated_tables_preserve_every_entry_alias_and_setter_field() {
 
 #[test]
 fn every_model_keyword_is_an_actual_typed_setter() {
-    for p in parameters::MODEL {
-        let assignment = match p.input_type {
-            InputType::Real => format!("{}=0.25", p.name),
-            InputType::Integer => format!("{}=1.4", p.name),
-            InputType::Flag => p.name.into(),
-            InputType::String => "version=3.3.0".into(),
-            InputType::RealVector => panic!("model has no vector setter"),
-        };
-        let (model, _) = inputs(&assignment, "").unwrap_or_else(|e| panic!("{}: {e}", p.name));
-        let value = &model.inputs.get(p.name).unwrap().value;
-        match p.input_type {
-            InputType::Real => assert!(matches!(value, Value::Real(v) if v.is_finite())),
-            InputType::Integer => assert_eq!(*value, Value::Integer(1)),
-            InputType::Flag => assert_eq!(*value, Value::Flag(true)),
-            InputType::String => assert_eq!(*value, Value::String("3.3.0".into())),
-            InputType::RealVector => unreachable!(),
-        }
-    }
+    contract().assert_model_setters();
 }
 
 #[test]
 fn instance_keywords_keep_types_and_ask_only_rows_are_not_setters() {
-    for p in parameters::INSTANCE {
-        let assignment = match p.input_type {
-            InputType::Real => format!("{}=0.25", p.name),
-            InputType::Integer => format!("{}=1.4", p.name),
-            InputType::Flag => p.name.into(),
-            InputType::RealVector => "ic=(0.1 0.2 -0.3)".into(),
-            InputType::String => unreachable!(),
-        };
-        if p.access == Access::Output {
-            // The textual grammar already refuses ask-only names. The public
-            // device API must reject a programmatically constructed AST too.
-            let netlist = deck("m1 d g s b nn\n.model nn nmos level=8");
-            let resolver = ModelResolver::new(&netlist.models).unwrap();
-            let model =
-                bsim3::model_parameters(&resolver.resolve(&netlist.devices[0]).unwrap().unwrap())
-                    .unwrap();
-            let mut device = netlist.devices[0].clone();
-            device
-                .parameters
-                .push(ngspice_rs::netlist::ast::ParameterAssignment {
-                    name: p.name.into(),
-                    value: "0.25".into(),
-                    kind: ParameterKind::Scalar,
-                    location: device.location.clone(),
-                });
-            assert!(
-                model
-                    .instance_parameters(&device, 1.)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("ask-only"),
-                "{}",
-                p.name
-            );
-        } else {
-            let (_, values) = inputs("", &assignment).unwrap_or_else(|e| panic!("{}: {e}", p.name));
-            if p.input_type == InputType::RealVector {
-                close(real(&values, "icvds"), 0.1);
-                close(real(&values, "icvgs"), 0.2);
-                close(real(&values, "icvbs"), -0.3);
-            } else {
-                assert!(values.get(p.name).is_some(), "{}", p.name);
-            }
-        }
-    }
+    contract().assert_instance_setters_and_asks();
 }
 
 #[test]
