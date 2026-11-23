@@ -11,7 +11,7 @@ use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 /// A differential transfer bound to the finalized topology. Only ground
 /// maps to no row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BoundTransfer {
+pub struct BoundTransfer {
     nodes: [NodeId; 2],
     rows: [Option<usize>; 2],
 }
@@ -115,8 +115,10 @@ pub struct NoiseInstance {
 }
 
 /// The noise layout bound to one finalized circuit, with double-buffered
-/// numeric slots. Model ranks and names are constructed only during binding.
-/// Failed refreshes leave the entire previous spectral point intact.
+/// numeric slots.
+///
+/// Model ranks and names are constructed only during binding. Failed
+/// refreshes leave the entire previous spectral point intact.
 pub struct NoisePlan<'a> {
     circuit: &'a Circuit,
     instances: Vec<NoiseInstance>,

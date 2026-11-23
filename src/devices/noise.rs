@@ -379,7 +379,7 @@ impl NoiseKind {
 
 /// Borrowed identity of a device's contribution to `.noise`.
 /// The device appends its ordered generators to the caller's scratch buffer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceNoise<'a> {
     /// No generators and no output columns: C's `DEVnoise = NULL` devices, and
     /// a resistor with `noisy=0` (`resnoise.c` skips it entirely).
