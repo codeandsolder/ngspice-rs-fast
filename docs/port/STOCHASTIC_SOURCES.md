@@ -15,7 +15,10 @@ than dependence on the number/order of Newton solves or rejected timesteps.
 | `TRNOISE(NA TS [NALPHA [NAMP [RTSAM [RTSCAPT [RTSEMT]]]]])` | Gaussian white-knot standard deviation `NA` in V or A; spacing `TS` in s; colored fractional exponent `NALPHA` in (0,2); Gaussian innovation amplitude `NAMP` in V or A; telegraph pulse amplitude `RTSAM` in V or A; mean capture and emission dwell times `RTSCAPT`, `RTSEMT` in s |
 | `TRRANDOM(TYPE TS [TD [PARAM1 [PARAM2]]])` | Distribution 1=uniform, 2=Gaussian, 3=exponential, 4=Poisson; fixed sample spacing `TS` in s, first-draw delay `TD` in s, distribution `PARAM1` (width/sigma/mean/lambda), `PARAM2` (offset/mean) |
 
-The trailing optional parameters take upstream defaults. For `TRRANDOM`,
+The trailing optional parameters take upstream defaults. As in
+`VSRCparam`/`ISRCparam`, supplying `NAMP` with zero `NALPHA` does not
+activate the colored generator; the original setter remains serialized.
+For `TRRANDOM`,
 `PARAM1` defaults to 1, `PARAM2` to 0, and `TD` to 0. Its
 type-1 distribution is *centered*:
 `PARAM2 + PARAM1 * U(-1,1)`, exactly as ngspice's `drand()` behaves.

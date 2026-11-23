@@ -658,7 +658,10 @@ fn source_waveform(
                         white_rms: values[0],
                         step: values[1],
                         alpha: get(2, 0.),
-                        flicker_drive_rms: get(3, 0.),
+                        // VSRCparam/ISRCparam ignore supplied NAMP when
+                        // NALPHA is zero; keep the AST text but resolve the
+                        // physical law to an inactive colored generator.
+                        flicker_drive_rms: if get(2, 0.) > 0. { get(3, 0.) } else { 0. },
                         rts_amplitude: get(4, 0.),
                         capture_mean: get(5, 0.),
                         emission_mean: get(6, 0.),

@@ -390,18 +390,23 @@ r1 out 0 1k\n\
         .with_source_name("i1")
         .with_dc(0.0002)
         .unwrap();
-    let mut sign_seen = [false, false];
+    let mut distinct_levels = std::collections::BTreeSet::new();
     for k in 0..result.rows().len() {
         let t = result.value("time", k).unwrap().re;
         let v = result.value("v(out)", k).unwrap().re;
-        let expected = -1000. * p.value_at(t, Limit::Right).unwrap();
+        // A saved step endpoint is the left limit at a TRRANDOM update;
+        // for interior points both physical one-sided limits agree.
+        let expected = -1000. * p.value_at(t, Limit::Left).unwrap();
         assert!(
             (v - expected).abs() < 1e-10,
             "source current mismatch time={t:e}: got {v:e}, expected {expected:e}"
         );
-        sign_seen[usize::from(v > 0.)] = true;
+        distinct_levels.insert(v.to_bits());
     }
-    assert!(sign_seen.into_iter().all(|present| present));
+    assert!(
+        distinct_levels.len() >= 4,
+        "no held-random sample changes observed"
+    );
 }
 
 #[test]
@@ -452,4 +457,17 @@ r1 out 0 1k\n\
         matched += 1;
     }
     assert!(matched >= 3, "no meaningful RTS transition coverage");
+}
+
+#[test]
+fn zero_flicker_exponent_ignores_colored_amplitude_as_upstream_c() {
+    let deck = "inactive colored generator\n\
+v1 out 0 dc 0 trnoise(0 1n 0 100)\n\
+r1 out 0 1k\n\
+.tran 0.25n 4n\n.end\n";
+    let out = plot(deck);
+    assert!(out.rows().len() > 5);
+    for row in 0..out.rows().len() {
+        assert_eq!(out.value("v(out)", row).unwrap().re, 0.);
+    }
 }
