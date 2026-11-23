@@ -20,8 +20,8 @@ use crate::netlist::token::Token;
 
 use super::scopes::ModelVisibility;
 use super::{
-    behavioural, controlled, diode, expression, fourier, func, hints, linear, ltra, measure, model,
-    mutual, options, param, save, structure, switch, tline, transistor, urc,
+    behavioural, controlled, cpl, diode, expression, fourier, func, hints, linear, ltra, measure,
+    model, mutual, options, param, save, structure, switch, tline, transistor, urc,
 };
 
 pub(super) enum ParsedCard {
@@ -138,6 +138,7 @@ pub(super) fn parse_card(
                 urc::urc_card,
                 tline::tline_card,
                 ltra::ltra_card,
+                cpl::p_card,
                 super::txl::txl_card,
                 super::mesfet::mesfet_card,
             )),
