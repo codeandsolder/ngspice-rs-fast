@@ -3,8 +3,6 @@
 //! Before per-instance effective geometry, junction-capacitance clamping,
 //! saturation currents and potentials follow C order and C constants. No load
 //! equations are evaluated here.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::float_cmp,
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
@@ -12,10 +10,6 @@
 #![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use super::Diagnostic;
@@ -126,7 +120,11 @@ impl TemperatureModel {
         let (jct_temp_sat_cur, jct_sidewall_temp_sat_cur) = if temp == tnom {
             (defaults.values.js.value, defaults.values.jsw.value)
         } else {
-            let exponent = eg0 / vtm0 - eg / vtm + defaults.values.xti.value * (temp / tnom).ln();
+            let exponent = defaults
+                .values
+                .xti
+                .value
+                .mul_add((temp / tnom).ln(), eg0 / vtm0 - eg / vtm);
             let scale = (exponent / defaults.values.nj.value).exp();
             (
                 defaults.values.js.value * scale,
@@ -169,22 +167,25 @@ impl TemperatureModel {
             "Temperature effect has caused cjswg to be negative. Cjswg is clamped to zero.",
         );
 
-        let phi_b = (pb - defaults.values.tpb.value * delta_temp).max(0.01);
-        let phi_bsw = (pbsw - defaults.values.tpbsw.value * delta_temp).max(0.01);
-        let phi_bswg = (pbswg - defaults.values.tpbswg.value * delta_temp).max(0.01);
-        if pb - defaults.values.tpb.value * delta_temp < 0.01 {
+        let raw_pb = defaults.values.tpb.value.mul_add(-delta_temp, pb);
+        let raw_pbsw = defaults.values.tpbsw.value.mul_add(-delta_temp, pbsw);
+        let raw_pbswg = defaults.values.tpbswg.value.mul_add(-delta_temp, pbswg);
+        let phi_b = raw_pb.max(0.01);
+        let phi_bsw = raw_pbsw.max(0.01);
+        let phi_bswg = raw_pbswg.max(0.01);
+        if raw_pb < 0.01 {
             warnings.push(Diagnostic::warning(
                 "Temperature effect has caused pb to be less than 0.01. Pb is clamped to 0.01.",
                 "src/spicelib/devices/bsim3/b3temp.c",
             ));
         }
-        if pbsw - defaults.values.tpbsw.value * delta_temp <= 0.01 {
+        if raw_pbsw <= 0.01 {
             warnings.push(Diagnostic::warning(
                 "Temperature effect has caused pbsw to be less than 0.01. Pbsw is clamped to 0.01.",
                 "src/spicelib/devices/bsim3/b3temp.c",
             ));
         }
-        if pbswg - defaults.values.tpbswg.value * delta_temp <= 0.01 {
+        if raw_pbswg <= 0.01 {
             warnings.push(Diagnostic::warning(
                 "Temperature effect has caused pbswg to be less than 0.01. Pbswg is clamped to 0.01.",
                 "src/spicelib/devices/bsim3/b3temp.c",

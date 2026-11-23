@@ -329,10 +329,10 @@ fn long_history_storage_and_search_comparison() {
 }
 
 #[test]
-fn exact_delayed_tick_uses_the_preceding_c_bracket() {
-    // C loops while next.time < target, then evaluates the interpolation
-    // expression even at fraction 1. A direct return of the right value
-    // is not bit-equivalent when cancellation is significant.
+fn exact_delayed_tick_returns_stored_value_from_preceding_bracket() {
+    // The bracket search retains C's strict comparison so the left sample
+    // still precedes an exact tick. The interpolated endpoint must reproduce
+    // the stored right value, not lose it by rounded cancellation.
     let mut left = sample(10);
     left.values.voltage[0] = 1e16;
     let mut right = sample(20);
@@ -342,10 +342,9 @@ fn exact_delayed_tick_uses_the_preceding_c_bracket() {
         state: Some(empty_state()),
     };
     let (value, _) = history.delayed(20., Tick(30), Tick(40)).unwrap();
-    let expected = left.values.voltage[0] + (right.values.voltage[0] - left.values.voltage[0]);
-    assert_eq!(value.voltage[0].to_bits(), expected.to_bits());
-    assert_ne!(
+    assert_eq!(
         value.voltage[0].to_bits(),
         right.values.voltage[0].to_bits()
     );
+    assert_ne!(value.voltage[0].to_bits(), 0.0_f64.to_bits());
 }

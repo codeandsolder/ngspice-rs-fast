@@ -135,3 +135,16 @@ simulation tolerance.
 
 - `.sens` (above); `.dc @u1[l]` sweeps (refused: the instance exposes no
   sweepable parameter, and C would not re-run `URCsetup` either).
+
+## Aggregate materialization limits
+
+The per-line section limit is not the circuit's device budget. For L validated
+sections URC prepares exactly 4L materialized records (one marker, 2L
+resistors, 2L−1 shunts), 2L−1 generated ladder nodes and another 2L−1 diode
+prime nodes only if the generated series resistance is positive. The
+capacitor ladder owns 2(2L−1) declared state slots; the diode ladder owns
+3(2L−1). The written terminals are counted once by node identity across all
+plans and previous batches. These counts are checked for the entire batch
+before materializing any ladder. The validated section data is reused for
+construction, retaining the original generated order and arithmetic.
+See [the aggregate circuit policy](NATIVE_SOLVER.md#aggregate-elaboration-resources).

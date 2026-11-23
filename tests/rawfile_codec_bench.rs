@@ -9,7 +9,7 @@
 
 use std::fs::File;
 use std::hint::black_box;
-use std::io::BufReader;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -27,22 +27,26 @@ fn fixture() -> PathBuf {
 }
 
 fn workload() -> RawFile {
-    let mut plot = Plot::builder("bench1", "AC Analysis", PlotFlags::Complex);
-    for column in 0..COLUMNS {
+    workload_for(ROWS, COLUMNS, PlotFlags::Complex)
+}
+
+fn workload_for(rows: u32, columns: u32, flags: PlotFlags) -> RawFile {
+    let mut plot = Plot::builder("bench1", "AC Analysis", flags);
+    for column in 0..columns {
         let name = format!("v({column})");
-        plot.push_variable(if column % 2 == 0 {
+        plot.push_variable(if !flags.is_complex() || column % 2 == 0 {
             Variable::new(name, "voltage")
         } else {
             Variable::complex(name, "voltage")
         });
     }
     let mut plot = plot.build();
-    let mut values = Vec::with_capacity(COLUMNS as usize);
-    for row in 0..ROWS {
+    let mut values = Vec::with_capacity(columns as usize);
+    for row in 0..rows {
         values.clear();
-        values.extend((0..COLUMNS).map(|column| {
+        values.extend((0..columns).map(|column| {
             let real = f64::from(row).mul_add(0.125, f64::from(column) + 1.0);
-            if column % 2 == 0 {
+            if !flags.is_complex() || column % 2 == 0 {
                 Complex::real(real)
             } else {
                 Complex::new(real, -0.5 * real)
@@ -125,4 +129,96 @@ fn iterate() {
     );
     assert!(reader.next_plot().unwrap().is_none());
     report(start);
+}
+
+// Count calls at the codec-facing interface, not the physical File reads
+// hidden behind the BufReader. A buffered syscall count alone cannot reveal
+// the cost of per-cell copying and dispatch.
+struct Counted<R> {
+    input: R,
+    reads: usize,
+    fills: usize,
+}
+
+impl<R: Read> Read for Counted<R> {
+    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+        self.reads += 1;
+        self.input.read(target)
+    }
+}
+
+impl<R: BufRead> BufRead for Counted<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.fills += 1;
+        self.input.fill_buf()
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.input.consume(count);
+    }
+}
+
+fn read_matrix(input: impl BufRead, rows: u32, columns: u32) -> (usize, usize) {
+    let mut input = Counted {
+        input,
+        reads: 0,
+        fills: 0,
+    };
+    let mut reader = RawFileReader::new(&mut input);
+    let mut plot = reader.next_plot().unwrap().unwrap();
+    let mut count = 0;
+    while let Some(row) = plot.next_row().unwrap() {
+        assert_eq!(row.len(), usize::try_from(columns).unwrap());
+        black_box(row);
+        count += 1;
+    }
+    assert_eq!(count, rows);
+    plot.finish().unwrap();
+    assert!(reader.next_plot().unwrap().is_none());
+    (input.reads, input.fills)
+}
+
+fn binary_matrix(file: bool) {
+    for (rows, columns) in [(262_144, 4), (256, 4097)] {
+        for flags in [PlotFlags::Real, PlotFlags::Complex] {
+            let raw = workload_for(rows, columns, flags);
+            let path = file.then(fixture);
+            // Repeat the full I/O phase, with fixture construction outside
+            // each timed interval. Memory decoding borrows the output bytes.
+            for trial in 0..3 {
+                let start = Instant::now();
+                let bytes = if let Some(path) = &path {
+                    raw.write_with_format(path, RawFormat::Binary, BinaryByteOrder::LittleEndian)
+                        .unwrap();
+                    Vec::new()
+                } else {
+                    raw.to_binary().unwrap()
+                };
+                let encode_ns = start.elapsed().as_nanos();
+                let start = Instant::now();
+                let (reads, fills) = if let Some(path) = &path {
+                    read_matrix(BufReader::new(File::open(path).unwrap()), rows, columns)
+                } else {
+                    read_matrix(bytes.as_slice(), rows, columns)
+                };
+                let decode_ns = start.elapsed().as_nanos();
+                println!(
+                    "matrix,file={file},rows={rows},columns={columns},flags={flags:?},trial={trial},encode_ns={encode_ns},decode_ns={decode_ns},read_calls={reads},fill_calls={fills}"
+                );
+                black_box(bytes);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "opt-in binary codec shape and call-count matrix"]
+fn binary_matrix_memory() {
+    binary_matrix(false);
+}
+
+#[test]
+#[ignore = "opt-in binary codec shape and call-count matrix"]
+fn binary_matrix_file() {
+    binary_matrix(true);
 }

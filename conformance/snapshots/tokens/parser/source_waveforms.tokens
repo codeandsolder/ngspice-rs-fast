@@ -20,9 +20,9 @@ card 1 @parser/source_waveforms.cir:2:1 lines=2-2 continuations=0
   token 14 2:35 number "5" value=5e0
   token 15 2:37 number "1n" value=1e-9
   token 16 2:40 number "2n" value=2e-9
-  token 17 2:43 number "3n" value=3.0000000000000004e-9
+  token 17 2:43 number "3n" value=3e-9
   token 18 2:46 number "4u" value=4e-6
-  token 19 2:49 number "5u" value=4.9999999999999996e-6
+  token 19 2:49 number "5u" value=5e-6
   token 20 2:51 rparen ")"
   token 21 2:53 word "dc"
   token 22 2:56 number "3" value=3e0

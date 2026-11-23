@@ -40,7 +40,7 @@ card 4 @netlists/m10_mesa_l3_ac.cir:5:1 lines=5-5 continuations=0
   token 8 5:15 number "1u" value=1e-6
   token 9 5:18 word "w"
   token 10 5:19 equals "="
-  token 11 5:20 number "20u" value=1.9999999999999998e-5
+  token 11 5:20 number "20u" value=2e-5
 card 5 @netlists/m10_mesa_l3_ac.cir:6:1 lines=6-7 continuations=1
   raw: ".model m3 nmf level=3 rd=31 rs=31 mu=0.25 vto=-1 eta=1.5 sigma0=0.02 vsigmat=1.37 delta=5 beta=0.0085"
   kind: dot(.model)

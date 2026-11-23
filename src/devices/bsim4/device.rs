@@ -1110,6 +1110,11 @@ fn parameter_ask(c_id: &str, h: &Instance) -> Option<Real> {
 }
 
 impl Device for Bsim4 {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.ensure(context.temperature, context.nominal_temperature)
+            .map(|_| ())
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

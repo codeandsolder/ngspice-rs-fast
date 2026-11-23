@@ -30,7 +30,7 @@ card 4 @netlists/rc_ic_uic_tran.cir:8:1 lines=8-8 continuations=0
   raw: ".tran 10u 5m uic"
   kind: dot(.tran)
   token 1 8:1 word ".tran"
-  token 2 8:7 number "10u" value=9.999999999999999e-6
+  token 2 8:7 number "10u" value=1e-5
   token 3 8:11 number "5m" value=5e-3
   token 4 8:14 word "uic"
 card 5 @netlists/rc_ic_uic_tran.cir:9:1 lines=9-9 continuations=0

@@ -346,13 +346,93 @@ impl ConvergenceContext<'_> {
     }
 }
 
+/// RHS sink used by full and isolated device loads. Isolated stamps retain
+/// only the rows actually written, rather than clearing a circuit-sized vector.
+#[derive(Debug)]
+pub struct StampRhs<'a>(RhsTarget<'a>);
+
+#[derive(Debug)]
+enum RhsTarget<'a> {
+    Dense(&'a mut Vector),
+    Sparse(&'a mut IsolatedRhs),
+}
+
+impl<'a> StampRhs<'a> {
+    /// Stamp into the complete solver RHS.
+    #[must_use]
+    pub const fn dense(rhs: &'a mut Vector) -> Self {
+        Self(RhsTarget::Dense(rhs))
+    }
+
+    pub(super) const fn isolated(rhs: &'a mut IsolatedRhs) -> Self {
+        Self(RhsTarget::Sparse(rhs))
+    }
+
+    /// Add a contribution at a matrix row, preserving stamp order.
+    ///
+    /// # Errors
+    /// The row is outside the finalized MNA dimensions.
+    #[inline]
+    pub fn add_to(&mut self, row: usize, value: Real) -> SpiceResult<()> {
+        match &mut self.0 {
+            RhsTarget::Dense(rhs) => rhs.add_to(row, value),
+            RhsTarget::Sparse(rhs) => rhs.write(row, |old| old + value),
+        }
+    }
+}
+
+/// Sparse scratch for a single isolated load. Capacity is retained across
+/// devices and points; rows are unique and sorted.
+#[derive(Debug)]
+pub(super) struct IsolatedRhs {
+    rows: usize,
+    values: Vec<(usize, Real)>,
+}
+
+impl IsolatedRhs {
+    pub(super) const fn new(rows: usize) -> Self {
+        Self {
+            rows,
+            values: Vec::new(),
+        }
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.values.clear();
+    }
+
+    fn write(&mut self, row: usize, update: impl FnOnce(Real) -> Real) -> SpiceResult<()> {
+        if row >= self.rows {
+            return Err(SpiceError::Numerical {
+                context: "isolated RHS".to_owned(),
+                message: format!("row {row} is out of range for length {}", self.rows),
+            });
+        }
+        match self.values.binary_search_by_key(&row, |&(row, _)| row) {
+            Ok(index) => self.values[index].1 = update(self.values[index].1),
+            Err(index) => self.values.insert(index, (row, update(0.))),
+        }
+        Ok(())
+    }
+
+    pub(super) fn set(&mut self, row: usize, value: Real) -> SpiceResult<()> {
+        self.write(row, |_| value)
+    }
+
+    pub(super) fn get(&self, row: usize) -> Real {
+        self.values
+            .binary_search_by_key(&row, |&(row, _)| row)
+            .map_or(0., |index| self.values[index].1)
+    }
+}
+
 /// Everything a device needs in order to stamp itself.
 #[derive(Debug)]
 pub struct StampContext<'a> {
     /// The MNA matrix being assembled.
     pub matrix: &'a mut SparseMatrix,
     /// The right-hand side being assembled.
-    pub rhs: &'a mut Vector,
+    pub rhs: StampRhs<'a>,
     /// Where the unknowns live.
     pub unknowns: &'a MnaUnknowns,
     /// The node table, for diagnostics.
@@ -365,6 +445,8 @@ pub struct StampContext<'a> {
     pub nominal_temperature: Real,
     /// Junction minimum conductance (S), [`crate::devices::ModelContext::gmin`].
     pub gmin: Real,
+    /// Resolved circuit relative tolerance, not a Newton-local override.
+    pub reltol: Real,
     /// The `hertz` frequency (Hz), [`crate::devices::ModelContext::frequency`].
     pub frequency: Real,
     /// Which analysis is loading the matrix.
@@ -400,6 +482,7 @@ impl StampContext<'_> {
     pub const fn model_context(&self) -> crate::devices::ModelContext {
         crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
             .with_gmin(self.gmin)
+            .with_reltol(self.reltol)
             .with_frequency(self.frequency)
     }
 
@@ -732,6 +815,22 @@ pub trait Device: fmt::Debug + std::any::Any {
         _context: &crate::devices::models::ModelContext,
     ) -> Option<SpiceResult<StorageElement>> {
         None
+    }
+
+    /// Validate bias-independent device inputs at a DC point, without an
+    /// AC load, Newton trial, or accepted-state mutation. Context-independent
+    /// devices need no extra checks beyond construction and replacement.
+    /// Context-dependent devices must check their thermal/effective parameters
+    /// here using the same derivation as their DC stamp. The recipe already
+    /// carries its own setters; the context contains common scalar inputs,
+    /// not per-device override tables. Cross-device mutual constraints are
+    /// validated by the circuit. Solution-dependent errors belong to the
+    /// actual solve, not to a fabricated zero bias.
+    ///
+    /// # Errors
+    /// Invalid contextual parameters or nonfinite derived device inputs.
+    fn validate_dc_inputs(&self, _context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        Ok(())
     }
 
     /// Loads the device's contribution into the MNA system for one trial.

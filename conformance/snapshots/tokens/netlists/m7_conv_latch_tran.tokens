@@ -21,11 +21,11 @@ card 2 @netlists/m7_conv_latch_tran.cir:5:1 lines=5-5 continuations=0
   token 7 5:18 lparen "("
   token 8 5:19 number "0" value=0e0
   token 9 5:21 number "3" value=3e0
-  token 10 5:23 number "20u" value=1.9999999999999998e-5
+  token 10 5:23 number "20u" value=2e-5
   token 11 5:27 number "1u" value=1e-6
   token 12 5:30 number "1u" value=1e-6
-  token 13 5:33 number "5u" value=4.9999999999999996e-6
-  token 14 5:36 number "100u" value=9.999999999999999e-5
+  token 13 5:33 number "5u" value=5e-6
+  token 14 5:36 number "100u" value=1e-4
   token 15 5:40 rparen ")"
 card 3 @netlists/m7_conv_latch_tran.cir:6:1 lines=6-6 continuations=0
   raw: "vr r 0 dc 0 pulse(0 3 50u 1u 1u 5u 100u)"
@@ -39,11 +39,11 @@ card 3 @netlists/m7_conv_latch_tran.cir:6:1 lines=6-6 continuations=0
   token 7 6:18 lparen "("
   token 8 6:19 number "0" value=0e0
   token 9 6:21 number "3" value=3e0
-  token 10 6:23 number "50u" value=4.9999999999999996e-5
+  token 10 6:23 number "50u" value=5e-5
   token 11 6:27 number "1u" value=1e-6
   token 12 6:30 number "1u" value=1e-6
-  token 13 6:33 number "5u" value=4.9999999999999996e-6
-  token 14 6:36 number "100u" value=9.999999999999999e-5
+  token 13 6:33 number "5u" value=5e-6
+  token 14 6:36 number "100u" value=1e-4
   token 15 6:40 rparen ")"
 card 4 @netlists/m7_conv_latch_tran.cir:7:1 lines=7-7 continuations=0
   raw: "rc1 vcc c1 1k"
@@ -152,7 +152,7 @@ card 16 @netlists/m7_conv_latch_tran.cir:19:1 lines=19-19 continuations=0
   kind: dot(.tran)
   token 1 19:1 word ".tran"
   token 2 19:7 number "0.5u" value=5e-7
-  token 3 19:12 number "80u" value=7.999999999999999e-5
+  token 3 19:12 number "80u" value=8e-5
   token 4 19:16 number "0" value=0e0
   token 5 19:18 number "10n" value=1e-8
 card 17 @netlists/m7_conv_latch_tran.cir:20:1 lines=20-20 continuations=0

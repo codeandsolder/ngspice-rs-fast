@@ -83,7 +83,7 @@ card 7 @parser/passive_models.cir:8:1 lines=8-8 continuations=0
   token 5 8:14 number "4u" value=4e-6
   token 6 8:17 word "c"
   token 7 8:18 equals "="
-  token 8 8:19 number "5u" value=4.9999999999999996e-6
+  token 8 8:19 number "5u" value=5e-6
 card 8 @parser/passive_models.cir:9:1 lines=9-9 continuations=0
   raw: "cgeom a 0 cm l=4u w=2u"
   kind: device(c)

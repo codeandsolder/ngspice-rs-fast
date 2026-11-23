@@ -42,9 +42,23 @@ behaviour only: `src/spicelib/analysis/noisean.c` (`NOISEan`), `cktnoise.c`
 
    The output noise density is the sum over every generator; the
    input-referred density divides it by `max(|H|^2, 1e-20)` (`N_MINGAIN`).
-4. Each generator is integrated over frequency separately with `Nintegrate`'s
-   piecewise power law (flat below a slope of `1e-10`, logarithmic at slope
-   `-1`) into the integrated output and input noise.
+4. Each generator is integrated over frequency separately using the piecewise
+   power law underlying C's `Nintegrate`. For positive endpoints, work in
+   log-frequency coordinates: the integral is the logarithmic mean of the
+   frequency-weighted endpoint densities times `ln(f1/f0)`. Evaluate the
+   log ratio with `ln_1p` near unity and the exponential-relative factor
+   with `exp_m1`, avoiding absolute powers and a dimensional prefactor.
+   Constant density uses an exact rectangular rule and a slope of -1 has the
+   continuous logarithmic limit. Positive frequencies and densities below
+   C's `1e-38` floor use their actual values. If either density is nonpositive,
+   use C's floored logarithm endpoints; equal floors retain C's signed
+   right-endpoint rectangular rule, including exact zero for an inactive
+   generator. The resulting signed density convention is unchanged.
+   Both input and output use the same endpoint fit; the integral's factors
+   are combined with the *current* input gain before rounding, preserving
+   C's input-referred gain convention without losing an otherwise
+   representable result. Nonfinite intermediate totals are explicit errors,
+   even between decimated summary points.
 
 The frequency loop is C's: `dec`/`oct` multiply by `exp(ln(10 or 2)/pts)` from
 `fstart`, `lin` adds `(fstop - fstart)/(pts - 1)`, and the loop continues while

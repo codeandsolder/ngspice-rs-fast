@@ -102,36 +102,23 @@ impl ResistorOverride {
 /// can override at once (a two-axis `.dc` can sweep two `@inst[param]` targets).
 pub const MAX_INSTANCE_OVERRIDES: usize = 2;
 
-/// One per-point replacement of a device instance parameter, the immutable
-/// form of C's `.dc @inst[param] ...` (`dctrcurv.c` `DCTsetInstParam`: the
-/// device's `DEVparam` setter followed by `DEVtemperature`).
+/// A value-independent instance parameter binding in a finalized topology.
 ///
-/// Created by [`crate::devices::Circuit::instance_override`], which resolves
-/// the instance and the parameter through [`crate::devices::Device::instance_parameter`]
-/// and validates the value by building the replacement once. Like
-/// [`ResistorOverride`] it names the device by its ordinal in
-/// [`crate::devices::Circuit::devices`] and is only meaningful for the circuit
-/// that made it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct InstanceOverride {
+/// The canonical keyword comes from the device's existing setter registry.
+/// The same binding can be used for every point or independent candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceTarget {
     topology: TopologyId,
     device: usize,
     parameter: &'static str,
-    value: Real,
 }
 
-impl InstanceOverride {
-    pub(crate) const fn new(
-        topology: TopologyId,
-        device: usize,
-        parameter: &'static str,
-        value: Real,
-    ) -> Self {
+impl InstanceTarget {
+    pub(crate) const fn new(topology: TopologyId, device: usize, parameter: &'static str) -> Self {
         Self {
             topology,
             device,
             parameter,
-            value,
         }
     }
 
@@ -139,20 +126,87 @@ impl InstanceOverride {
         self.topology
     }
 
-    /// The overridden device's ordinal in [`crate::devices::Circuit::devices`].
+    /// Device ordinal in the finalized circuit.
+    #[must_use]
+    pub const fn device(self) -> usize {
+        self.device
+    }
+
+    /// Canonical alias-folded keyword.
+    #[must_use]
+    pub const fn parameter(self) -> &'static str {
+        self.parameter
+    }
+
+    /// Bind a candidate scalar without looking up its name again.
+    /// Physical validation is performed against the effective model context.
+    ///
+    /// # Errors
+    /// A nonfinite candidate value.
+    pub fn at(self, value: Real) -> crate::primitives::SpiceResult<InstanceOverride> {
+        if !value.is_finite() {
+            return Err(crate::primitives::SpiceError::circuit(
+                "nonfinite instance override",
+            ));
+        }
+        Ok(InstanceOverride {
+            target: self,
+            value,
+        })
+    }
+
+    /// The ordinary DC resistance route retains its separately ordered
+    /// supplied-scalar override, rather than an arbitrary instance setter.
+    pub(crate) fn at_resistance(
+        self,
+        supplied: Real,
+    ) -> crate::primitives::SpiceResult<ResistorOverride> {
+        if self.parameter != "resistance"
+            || !supplied.is_finite()
+            || supplied == 0.
+            || !(1. / supplied).is_finite()
+        {
+            return Err(crate::primitives::SpiceError::circuit(
+                "supplied resistance must be finite and nonzero with finite conductance",
+            ));
+        }
+        Ok(ResistorOverride::new(self.topology, self.device, supplied))
+    }
+}
+
+/// One per-point replacement of a bound device instance parameter.
+/// The topology identity is retained with the value, so foreign and stale
+/// overrides cannot be applied to a structurally different circuit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InstanceOverride {
+    target: InstanceTarget,
+    value: Real,
+}
+
+impl InstanceOverride {
+    pub(super) const fn topology(self) -> TopologyId {
+        self.target.topology()
+    }
+
+    /// The value-independent typed target.
+    #[must_use]
+    pub const fn target(self) -> InstanceTarget {
+        self.target
+    }
+
+    /// The overridden device's ordinal.
     #[must_use]
     pub const fn device(&self) -> usize {
-        self.device
+        self.target.device()
     }
 
     /// The canonical (lowercase, alias-folded) parameter keyword.
     #[must_use]
     pub const fn parameter(&self) -> &'static str {
-        self.parameter
+        self.target.parameter()
     }
 
-    /// The value given to the parameter, in the setter's own unit (Celsius for
-    /// `temp`, as on the instance card).
+    /// Value in the setter's own unit (Celsius for temperature).
     #[must_use]
     pub const fn value(&self) -> Real {
         self.value

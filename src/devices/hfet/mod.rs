@@ -53,6 +53,70 @@ use crate::devices::{LinearContext, ModelFamily, ResolvedModel};
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
+/// Carrier density and its voltage derivative for the common HFET/MESA
+/// soft threshold. Evaluate log(1 + exp(x)/2) without losing weak-inversion
+/// charge when exp(x)/2 is smaller than one ULP of 1.
+fn soft_density(n0: Real, voltage: Real, thermal: Real) -> (Real, Real) {
+    let x = voltage / thermal;
+    // At b = exp(x)/2 <= 2^-55, replacing ln(1+b) and
+    // b/(1+b) by b incurs less than one binary64 rounding unit.
+    if x <= -54. * std::f64::consts::LN_2 {
+        let density = if x < -1022. * std::f64::consts::LN_2 {
+            // Preserve a large density scale even when exp(x) itself
+            // would round to zero before multiplication.
+            let half = (0.5 * x).exp();
+            (n0 * half) * half
+        } else {
+            n0 * x.exp()
+        };
+        return (density, density / thermal);
+    }
+    // For x >= 55 ln(2), the reciprocal correction 2 exp(-x)
+    // is at most 2^-54: below half an ULP of 1, and even further
+    // below half an ULP of x-ln(2). Avoid both transcendental calls.
+    if x >= 55. * std::f64::consts::LN_2 {
+        return (
+            n0 * (2. * (x - std::f64::consts::LN_2)),
+            2. * (n0 / thermal),
+        );
+    }
+    let b = 0.5 * x.exp();
+    let sum = 1. + b;
+    let logarithm = if x <= 1. { b.ln_1p() } else { sum.ln() };
+    (n0 * (2. * logarithm), (n0 / thermal) * (2. * (b / sum)))
+}
+
+/// Combine the two carrier populations in series, with derivative of
+/// the second population equal to its density divided by thermal voltage.
+/// Ratios avoid forming the product or squared sum of two large densities.
+fn series_density(first: Real, slope: Real, second: Real, thermal: Real) -> (Real, Real) {
+    // Both positive populations can underflow under a reverse gate bias.
+    // Their series density is then below the channel cutoff, not 0/0.
+    if first == 0. && second == 0. {
+        return (0., 0.);
+    }
+    let (density, first_fraction, second_fraction) = if first.abs() <= second.abs() {
+        let ratio = first / second;
+        let fraction = 1. / (1. + ratio);
+        (first * fraction, ratio * fraction, fraction)
+    } else {
+        let ratio = second / first;
+        let fraction = 1. / (1. + ratio);
+        (second * fraction, fraction, ratio * fraction)
+    };
+    let derivative =
+        (second_fraction * second_fraction).mul_add(slope, density / thermal * first_fraction);
+    (density, derivative)
+}
+
+/// Logistic roll-off and its derivative magnitude, retaining both tails.
+fn rolloff(x: Real) -> (Real, Real) {
+    let exp = (-x.abs()).exp();
+    let low = exp / (1. + exp);
+    let high = 1. / (1. + exp);
+    (if x > 0. { low } else { high }, low * high)
+}
+
 /// Staged node setup common to the three MESA/HFET levels.
 /// The caller commits the transaction only after temperature derivation succeeds.
 struct NodeSetup<'a, 'table> {
@@ -702,6 +766,134 @@ static MODEL_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(MODEL);
 mod tests {
     use super::*;
     use crate::primitives::NodeTable;
+
+    #[test]
+    fn soft_density_preserves_weak_inversion_and_avoids_exponential_overflow() {
+        let (density, slope) = super::soft_density(2., -50., 1.);
+        let asymptote = 2. * (-50_f64).exp();
+        assert!((density / asymptote - 1.).abs() < 4. * f64::EPSILON);
+        assert!((slope / asymptote - 1.).abs() < 4. * f64::EPSILON);
+        let (density, slope) = super::soft_density(2., 1000., 1.);
+        assert_eq!(density, 4. * (1000. - std::f64::consts::LN_2));
+        assert_eq!(slope, 4.);
+        // exp(-750) rounds to zero, but the scaled density need not.
+        // Decimal 100-digit evaluation gives 1.9016849634750064e-18.
+        let (density, slope) = super::soft_density(1e308, -750., 1.);
+        let reference = 1.901_684_963_475_006_4e-18;
+        assert!((density / reference - 1.).abs() <= 4. * Real::EPSILON);
+        assert_eq!(slope, density);
+    }
+
+    #[test]
+    fn series_density_avoids_overflow_and_matches_the_analytic_derivative() {
+        let (density, slope) = super::series_density(1e200, 2e200, 1e200, 0.5);
+        assert_eq!(density, 5e199);
+        assert_eq!(slope, 1e200);
+        let (density, slope) = super::series_density(1e-200, 2e-200, 1e-200, 0.5);
+        assert_eq!(density, 5e-201);
+        assert_eq!(slope, 1e-200);
+        let (density, slope) = super::series_density(1., 2., f64::INFINITY, 0.5);
+        assert_eq!(density, 1.);
+        assert_eq!(slope, 2.);
+    }
+
+    #[test]
+    fn series_density_has_a_zero_population_limit() {
+        for (first, slope, second) in [(0., 0., 0.), (0., 0., 1.), (1., 2., 0.)] {
+            assert_eq!(series_density(first, slope, second, 0.5), (0., 0.));
+        }
+        // At strong reverse gate bias both exponentials underflow even
+        // with ordinary room-temperature carrier scales.
+        let v = -100.;
+        let (first, slope) = soft_density(1e15, v, 0.026);
+        let second = 1e15 * (v / 0.04).exp();
+        assert_eq!(series_density(first, slope, second, 0.04), (0., 0.));
+    }
+
+    #[test]
+    fn carrier_density_derivative_agrees_with_independent_central_difference() {
+        let n0 = 1e15;
+        let thermal = 0.026;
+        let other_thermal = 0.04;
+        let density = |v: Real| {
+            let (first, slope) = soft_density(n0, v, thermal);
+            let second = n0 * (v / other_thermal).exp();
+            series_density(first, slope, second, other_thermal)
+        };
+        for voltage in [-1., -0.4, -0.1, 0., 0.1, 0.4, 1.] {
+            let (_, slope) = density(voltage);
+            let h = thermal * Real::EPSILON.cbrt();
+            let numerical = (density(voltage + h).0 - density(voltage - h).0) / (2. * h);
+            assert!((slope - numerical).abs() <= 2e-8 * slope.abs());
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in representative carrier-density value and derivative workload"]
+    fn carrier_density_numeric_workload() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const COUNT: u32 = 1_000_000;
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "benchmark retains the historical non-fused arithmetic as the comparison workload"
+        )]
+        fn old(voltage: Real) -> (Real, Real) {
+            let n0 = 1e15;
+            let thermal = 0.026;
+            let other_thermal = 0.04;
+            let b = (voltage / thermal).exp();
+            let nsn = 2. * n0 * (1. + 0.5 * b).ln();
+            let nsc = n0 * (voltage / other_thermal).exp();
+            let slope = n0 / thermal / (1. / b + 0.5);
+            let denominator = nsc + nsn;
+            (
+                nsn * nsc / denominator,
+                nsc * (nsc * slope + nsn * nsn / other_thermal) / denominator.powi(2),
+            )
+        }
+        let new = |voltage: Real| {
+            let (first, slope) = soft_density(1e15, voltage, 0.026);
+            let second = 1e15 * (voltage / 0.04).exp();
+            series_density(first, slope, second, 0.04)
+        };
+        // Identical repeating ordinary bias grid, independent of solver work.
+        // Validate both maps before timing; the analytic extreme cases above
+        // intentionally do not compare with inaccurate legacy values.
+        for i in 0..=1000_u32 {
+            let v = Real::from(i) / 1000. - 0.5;
+            let a = old(v);
+            let b = new(v);
+            for (reference, actual) in [(a.0, b.0), (a.1, b.1)] {
+                assert!((reference - actual).abs() <= 2e-7 * actual.abs());
+            }
+        }
+        let time = |label: &str, evaluate: &dyn Fn(Real) -> (Real, Real)| {
+            let start = Instant::now();
+            for i in 0..COUNT {
+                let v = Real::from(i % 1001) / 1000. - 0.5;
+                black_box(evaluate(black_box(v)));
+            }
+            println!(
+                "{label}: {COUNT} value/derivative pairs in {:?}",
+                start.elapsed()
+            );
+        };
+        for _ in 0..3 {
+            time("legacy density", &old);
+            time("conditioned density", &new);
+        }
+    }
+
+    #[test]
+    fn logistic_rolloff_preserves_weak_tails() {
+        let (value, slope) = super::rolloff(500.);
+        assert!(value > 0. && slope > 0.);
+        assert!(super::rolloff(1000.).1.is_finite());
+        let (value, slope) = super::rolloff(-500.);
+        assert!(value > 0. && value <= 1. && slope > 0.);
+    }
 
     #[test]
     fn borrowed_reset_stamps_match_owned_assembly_and_validate_before_mutation() {

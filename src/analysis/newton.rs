@@ -15,8 +15,8 @@
 //! `CKTstate0` survives between iterations) and refuses to converge on a load
 //! a device marked nonconvergent (C `CKTnoncon`), as the S/W switches need.
 use crate::devices::{
-    AnalysisMode, Circuit, ConvergenceRequest, Forcing, IterationPhase, LoadRequest, ModelContext,
-    StateHistory, TrialState,
+    AnalysisMode, ConvergenceRequest, Forcing, IterationPhase, LoadRequest, ModelContext,
+    PreparedRun, StateHistory, TrialState,
 };
 use crate::maths::{Coefficients, SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceError, SpiceResult};
@@ -81,7 +81,7 @@ impl Default for NewtonOptions {
         Self {
             max_iterations: 100,
             // ngspice's defaults (cktntask.c): CKTreltol, CKTvoltTol, CKTabstol.
-            reltol: 1e-3,
+            reltol: crate::devices::DEFAULT_RELTOL,
             vntol: 1e-6,
             abstol: 1e-12,
             voltage_step: 0.2,
@@ -313,7 +313,7 @@ pub(super) enum CircuitLoad<'a> {
 /// and runs device convergence tests with the same options that loaded it.
 /// Acceptance is deliberately left to the outer analysis.
 pub(super) struct CircuitNewton<'a> {
-    pub circuit: &'a Circuit,
+    pub prepared: &'a PreparedRun<'a>,
     pub context: &'a ModelContext,
     pub history: &'a StateHistory,
     pub branch_rows: &'a [bool],
@@ -351,6 +351,7 @@ impl CircuitNewton<'_> {
             ),
         };
         let options = self.options;
+        let circuit = self.prepared.circuit();
         solve_phased(
             initial,
             self.branch_rows,
@@ -359,8 +360,8 @@ impl CircuitNewton<'_> {
             policy,
             continued,
             |guess, phase, previous| {
-                let mut matrix = self.circuit.new_matrix()?;
-                let mut rhs = Vector::zeros(self.circuit.unknown_count());
+                let mut matrix = circuit.new_matrix()?;
+                let mut rhs = Vector::zeros(circuit.unknown_count());
                 let mut trial = self
                     .history
                     .trial_in(phase, previous)?
@@ -374,7 +375,7 @@ impl CircuitNewton<'_> {
                         )
                         .with_uic(uic);
                 }
-                self.circuit.load(
+                self.prepared.load(
                     &LoadRequest {
                         mode,
                         solution: guess,
@@ -391,7 +392,7 @@ impl CircuitNewton<'_> {
                 Ok((matrix, rhs, trial))
             },
             |new, old, trial| {
-                self.circuit.convergence_test(&ConvergenceRequest {
+                self.prepared.convergence_test(&ConvergenceRequest {
                     solution: new,
                     previous: old,
                     trial,

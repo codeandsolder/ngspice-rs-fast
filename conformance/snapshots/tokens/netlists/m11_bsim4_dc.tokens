@@ -7,14 +7,14 @@ card 1 @netlists/m11_bsim4_dc.cir:5:1 lines=5-5 continuations=0
   token 1 5:1 word "vdn"
   token 2 5:5 word "dn"
   token 3 5:8 number "0" value=0e0
-  token 4 5:10 number "1.2" value=1.2000000000000002e0
+  token 4 5:10 number "1.2" value=1.2e0
 card 2 @netlists/m11_bsim4_dc.cir:6:1 lines=6-6 continuations=0
   raw: "vdp dp 0 -1.2"
   kind: device(v)
   token 1 6:1 word "vdp"
   token 2 6:5 word "dp"
   token 3 6:8 number "0" value=0e0
-  token 4 6:10 number "-1.2" value=-1.2000000000000002e0
+  token 4 6:10 number "-1.2" value=-1.2e0
 card 3 @netlists/m11_bsim4_dc.cir:7:1 lines=7-7 continuations=0
   raw: "vg g 0 0.8"
   kind: device(v)
@@ -191,11 +191,11 @@ card 9 @netlists/m11_bsim4_dc.cir:16:1 lines=16-16 continuations=0
   token 1 16:1 word ".dc"
   token 2 16:5 word "vdn"
   token 3 16:9 number "0" value=0e0
-  token 4 16:11 number "1.2" value=1.2000000000000002e0
+  token 4 16:11 number "1.2" value=1.2e0
   token 5 16:15 number "0.1" value=1e-1
   token 6 16:19 word "vg"
   token 7 16:22 number "0.4" value=4e-1
-  token 8 16:26 number "1.2" value=1.2000000000000002e0
+  token 8 16:26 number "1.2" value=1.2e0
   token 9 16:30 number "0.4" value=4e-1
 card 10 @netlists/m11_bsim4_dc.cir:17:1 lines=17-17 continuations=0
   raw: ".end"

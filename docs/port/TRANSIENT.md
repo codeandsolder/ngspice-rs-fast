@@ -149,8 +149,21 @@ column (a node on a voltage source or inductor) gets C's `1e10` conductance, so
 for `v1 in 0 1` with `.ic v(in)=1` the branch current at `t = 0` is C's 0 A,
 not the physical current. Nodes whose voltage is already fixed by ideal voltage
 sources and inductors (DC shorts) chained to ground, or to another constrained
-node, are checked structurally first (petgraph spanning forest with `UnionFind`
-membership of the `v+ - v- = value` relations): an `.ic` that disagrees beyond
+node, are checked structurally first using a typed constraint graph. Its
+numeric spanning forest and structural components share the same edge
+provenance; E/H outputs connect the structural components without inventing
+a voltage. Redundant voltage checks walk from the positive terminal to the
+negative terminal along rooted forest links, preserving each reference
+addition/subtraction and visiting only that path. Connecting two components
+re-roots only the smaller component; redundant checks allocate no full-size
+potential vector. Scratch is reused. A weighted union-find would change
+rounding. In the opt-in `redundant_constraint_graph_benchmark` (Acer,
+optimized test profile, 2026-11-22), 9,999 adjacent redundant checks on
+a 10,001-vertex forest took 23.77 ms instead of 5.912 s for full DFS;
+19,998 path vertices versus 99,999,999 full traversal vertices. The ordinary
+rounding test compares all 8,192 ordered endpoint pairs in two insertion
+orders against the previous DFS. These local identity types do not preempt
+the wider MNA row API changes proposed in upstream issue #198. In particular, an `.ic` that disagrees beyond
 `reltol`/`vntol`, or two entries on rigidly tied nodes, is an explicit error
 instead of C's meaningless `1e10` compromise (`i(v1) = -1e10`). A node with
 only capacitors (no DC point) becomes solvable through its `.ic`.
@@ -170,8 +183,17 @@ contradictions (capacitor across an ideal source with another `ic`, a capacitor
 loop whose voltages break KVL, an inductor current against a series current
 source, a step source whose right limit at `t = 0` differs from the capacitor
 `ic`) are errors naming the element; anything else singular or non-square is
-reported as ill-posed. Failed initialization returns before any state exists
-(tested with an accept-hook probe: zero hooks called).
+reported as ill-posed (a singular system may be consistent but
+underdetermined, not necessarily impulsive). The reduced-system builder uses
+explicit ground vertices, absolute MNA row identities, eliminated fixed
+currents, and distinct reduced and compact equation/variable identities.
+It preserves RHS elimination and stamp order, folds duplicates before
+identifying empty equations/variables, and checks empty equations against
+their original current/voltage tolerances. Contradictions report the
+connecting voltage-relation path or the actual fixed-current row, including
+controlled-source provenance. No tolerance or general numerical rank policy
+is relaxed. Failed initialization returns before any state exists (tested with
+an accept-hook probe: zero hooks called).
 
 Divergences from C: `.ic` entries contradicting a source and impulsive `uic`
 states are errors where C produces garbage or a first-step spike; unknown nodes

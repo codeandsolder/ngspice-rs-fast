@@ -368,3 +368,371 @@ fn equal_size_foreign_and_reordered_override_targets_are_rejected() {
         1. / 500. + 1. / 2e3,
     );
 }
+
+#[derive(Debug, Clone)]
+struct PreparationProbe {
+    nodes: [NodeId; 2],
+    value: f64,
+    preparations: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl ngspice_rs::devices::Device for PreparationProbe {
+    fn name(&self) -> &str {
+        "rprobe"
+    }
+    fn designator(&self) -> char {
+        'r'
+    }
+    fn terminals(&self) -> &[NodeId] {
+        &self.nodes
+    }
+    fn state_count(&self) -> usize {
+        1
+    }
+    fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
+        match keyword {
+            "x" => Some("x"),
+            "y" => Some("y"),
+            _ => None,
+        }
+    }
+    fn with_instance_parameter(
+        &self,
+        _: &str,
+        value: f64,
+        _: &ModelContext,
+    ) -> ngspice_rs::primitives::SpiceResult<Box<dyn ngspice_rs::devices::Device>> {
+        self.preparations.set(self.preparations.get() + 1);
+        Ok(Box::new(Self {
+            value: self.value * 10. + value,
+            ..self.clone()
+        }))
+    }
+    fn stamp(
+        &self,
+        context: &mut ngspice_rs::devices::traits::StampContext<'_>,
+    ) -> ngspice_rs::primitives::SpiceResult<()> {
+        context.states.set(0, self.value)?;
+        context.stamp(self.nodes[0], self.nodes[0], self.value)
+    }
+    fn convergence_test(
+        &self,
+        context: &ngspice_rs::devices::traits::ConvergenceContext<'_>,
+    ) -> ngspice_rs::primitives::SpiceResult<bool> {
+        Ok(context.states[0].to_bits() != self.value.to_bits())
+    }
+    fn assemble_linear(
+        &self,
+        context: &mut ngspice_rs::devices::LinearContext<'_>,
+    ) -> ngspice_rs::primitives::SpiceResult<()> {
+        context.nodal(self.nodes, self.value, false)
+    }
+    fn observation_parameter(
+        &self,
+        keyword: &str,
+        _: &ModelContext,
+    ) -> ngspice_rs::primitives::SpiceResult<Option<f64>> {
+        Ok((keyword == "value").then_some(self.value))
+    }
+}
+
+#[test]
+fn prepared_point_reuses_ordered_setters_for_load_convergence_and_observation() {
+    use ngspice_rs::devices::ConvergenceRequest;
+    let mut c = Circuit::new();
+    let preparations = std::rc::Rc::new(std::cell::Cell::new(0));
+    let node = c.add_node("a").unwrap();
+    c.add_device(Box::new(PreparationProbe {
+        nodes: [node, NodeId::GROUND],
+        value: 1.,
+        preparations: preparations.clone(),
+    }))
+    .unwrap();
+    c.finalize().unwrap();
+    c.set_observations(&["@rprobe[value]".into()]).unwrap();
+    let base = ModelContext::default();
+    let x = c.instance_override("rprobe", "x", 2., &base).unwrap();
+    let y = c.instance_override("rprobe", "y", 3., &base).unwrap();
+    let a = base
+        .with_instance_override(x)
+        .unwrap()
+        .with_instance_override(y)
+        .unwrap();
+    let b = base
+        .with_instance_override(y)
+        .unwrap()
+        .with_instance_override(x)
+        .unwrap();
+    let run = c.prepare_run();
+    let history = c.state_history().unwrap();
+    let before = history.accepted(1).map(<[f64]>::to_vec);
+    let zero = Vector::zeros(1);
+    preparations.set(0);
+    for (model, value, count) in [
+        (a, 123., 2),
+        (a, 123., 2),
+        (b, 132., 4),
+        (a, 123., 6),
+        (a.with_frequency(-0.), 123., 8),
+        (a, 123., 10),
+        (
+            ModelContext {
+                temperature: 47.,
+                ..a
+            },
+            123.,
+            12,
+        ),
+    ] {
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &zero,
+            model_context: &model,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        for _ in 0..8 {
+            let mut trial = history.trial();
+            let mut matrix = c.new_matrix().unwrap();
+            run.load(&request, &mut matrix, &mut Vector::zeros(1), &mut trial)
+                .unwrap();
+            assert_eq!(matrix.get(0, 0), value);
+            assert_eq!(trial.values()[0], value);
+            assert!(
+                !run.convergence_test(&ConvergenceRequest {
+                    solution: &zero,
+                    previous: &zero,
+                    history: &history,
+                    trial: &trial,
+                    model_context: &model,
+                    time: 0.,
+                    reltol: 1e-3,
+                    abstol: 1e-12,
+                    vntol: 1e-6,
+                })
+                .unwrap()
+            );
+            assert_eq!(
+                run.observe_real(&request, &[], None, Some(&trial)).unwrap(),
+                [Complex::real(value)]
+            );
+        }
+        assert_eq!(
+            run.observe_parameters(&model).unwrap(),
+            [Complex::real(value)]
+        );
+        assert_eq!(
+            run.small_signal_system_at(&model, &zero, None)
+                .unwrap()
+                .a
+                .get(0, 0),
+            value
+        );
+        assert_eq!(preparations.get(), count);
+        assert_eq!(history.accepted(1).map(<[f64]>::to_vec), before);
+    }
+    let mut duplicate = a;
+    duplicate.instance_overrides = [Some(x), Some(x)];
+    assert!(
+        run.observe_parameters(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate instance")
+    );
+    let last = ModelContext {
+        temperature: 47.,
+        ..a
+    };
+    let count = preparations.get();
+    assert_eq!(
+        run.observe_parameters(&last).unwrap(),
+        [Complex::real(123.)]
+    );
+    assert_eq!(preparations.get(), count);
+    assert_eq!(
+        c.prepare_run().observe_parameters(&last).unwrap(),
+        [Complex::real(123.)]
+    );
+    assert_eq!(preparations.get(), count + 2);
+    assert_eq!(
+        c.device("rprobe")
+            .unwrap()
+            .observation_parameter("value", &base)
+            .unwrap(),
+        Some(1.)
+    );
+}
+
+#[test]
+fn prepared_scope_rejects_foreign_and_stale_overrides_and_failed_transition_preserves_point() {
+    let n = deck("r1 a 0 1k");
+    let mut c = Circuit::from_netlist(&n).unwrap();
+    c.set_observations(&["@r1[resistance]".into()]).unwrap();
+    let other = Circuit::from_netlist(&n).unwrap();
+    let base = ModelContext::default();
+    let target = c.resistor_override("r1", 250.).unwrap();
+    let own = base.with_resistor_override(target).unwrap();
+    {
+        let run = c.prepare_run();
+        assert_eq!(run.observe_parameters(&own).unwrap(), [Complex::real(250.)]);
+        let foreign = base
+            .with_resistor_override(other.resistor_override("r1", 500.).unwrap())
+            .unwrap();
+        assert!(
+            run.observe_parameters(&foreign)
+                .unwrap_err()
+                .to_string()
+                .contains("foreign or stale")
+        );
+        let conflict = own
+            .with_instance_override(c.instance_override("r1", "m", 2., &base).unwrap())
+            .unwrap();
+        assert!(
+            run.observe_parameters(&conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("both a resistor and an instance")
+        );
+        assert_eq!(run.observe_parameters(&own).unwrap(), [Complex::real(250.)]);
+    }
+    c.add_node("new").unwrap();
+    c.finalize().unwrap();
+    assert!(
+        c.prepare_run()
+            .small_signal_system_at(&own, &Vector::zeros(c.unknown_count()), None)
+            .unwrap_err()
+            .to_string()
+            .contains("foreign or stale")
+    );
+}
+
+#[test]
+#[ignore = "manual throughput benchmark; both paths execute the same physical load"]
+fn prepared_context_load_benchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    const LOADS: usize = 3000;
+    for (label, body, instance, parameter, value) in [
+        (
+            "resistor",
+            "r1 a 0 rm m=2\n.model rm r(r=1k tc1=0.01)",
+            "r1",
+            "m",
+            3.,
+        ),
+        (
+            "bjt",
+            "q1 c b 0 qm\n.model qm npn(is=1e-15 bf=100)",
+            "q1",
+            "area",
+            2.,
+        ),
+        (
+            "mos1",
+            "m1 d g 0 0 mm w=10u l=1u\n.model mm nmos level=1 vto=0.5 kp=100u",
+            "m1",
+            "w",
+            12e-6,
+        ),
+        (
+            "bsim4",
+            "m1 d g 0 0 mm w=1u l=0.1u\n.model mm nmos level=54 version=4.8.3",
+            "m1",
+            "w",
+            1.2e-6,
+        ),
+    ] {
+        let c = Circuit::from_netlist(&deck(body)).unwrap();
+        let base = ModelContext::default();
+        let model = base
+            .with_instance_override(
+                c.instance_override(instance, parameter, value, &base)
+                    .unwrap(),
+            )
+            .unwrap();
+        let history = c.state_history().unwrap();
+        let mut bias = Vector::zeros(c.unknown_count());
+        for (node, v) in [("a", 1.), ("b", 0.4), ("c", 1.), ("d", 1.), ("g", 0.7)] {
+            if let Some(row) = c
+                .nodes()
+                .get(node)
+                .and_then(|node| c.unknowns().node_row(node))
+            {
+                bias.as_mut_slice()[row] = v;
+            }
+        }
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &bias,
+            model_context: &model,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        let run = c.prepare_run();
+        let load = |reuse: bool| {
+            let mut trial = history.trial().with_device_limiting(false);
+            let mut matrix = c.new_matrix().unwrap();
+            let mut rhs = Vector::zeros(c.unknown_count());
+            if reuse {
+                run.load(&request, &mut matrix, &mut rhs, &mut trial)
+                    .unwrap();
+            } else {
+                c.load(&request, &mut matrix, &mut rhs, &mut trial).unwrap();
+            }
+            (matrix, rhs, trial)
+        };
+        let (a, ar, at) = load(false);
+        let (b, br, bt) = load(true);
+        for r in 0..c.unknown_count() {
+            for col in 0..c.unknown_count() {
+                assert_eq!(
+                    a.get(r, col).to_bits(),
+                    b.get(r, col).to_bits(),
+                    "{label} [{r},{col}]"
+                );
+            }
+        }
+        assert_eq!(
+            ar.as_slice()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            br.as_slice()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            at.values().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            bt.values().iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        let measure = |reuse| {
+            let start = Instant::now();
+            for _ in 0..LOADS {
+                black_box(load(reuse));
+            }
+            start.elapsed().as_secs_f64()
+        };
+        let mut cold = [0.; 3];
+        let mut hot = [0.; 3];
+        for repeat in 0..3 {
+            if repeat == 1 {
+                hot[repeat] = measure(true);
+                cold[repeat] = measure(false);
+            } else {
+                cold[repeat] = measure(false);
+                hot[repeat] = measure(true);
+            }
+        }
+        cold.sort_by(f64::total_cmp);
+        hot.sort_by(f64::total_cmp);
+        eprintln!(
+            "{label}: {LOADS} loads; one-shot {:.3} ms, prepared {:.3} ms, {:.3}x; bit-identical",
+            cold[1] * 1000.,
+            hot[1] * 1000.,
+            cold[1] / hot[1]
+        );
+    }
+}
