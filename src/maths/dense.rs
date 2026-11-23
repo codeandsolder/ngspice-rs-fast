@@ -479,22 +479,27 @@ pub(crate) fn symmetric_eigenvalue_cost(order: usize) -> Option<(usize, usize)> 
 /// Cyclic Jacobi eigenvalues of the symmetric row-major `a` (n x n), sorted.
 /// `None` if the off-diagonal mass fails to vanish within the sweep budget.
 fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<Vec<Real>>> {
-    let off_diagonal_norm = |data: &[Real]| -> Real {
-        let mut sum = 0.0;
-        for row in 0..order {
-            for col in 0..order {
-                if row != col {
-                    let entry = data[row * order + col];
-                    let squared = entry * entry;
-                    sum += squared;
-                }
+    let initial_norm: Real = data.iter().map(|value| value * value).sum();
+    // The omitted symmetric off-diagonal is exactly the backward perturbation
+    // to the diagonal eigensystem: Weyl bounds every eigenvalue error by its
+    // Frobenius norm. Permit four roundoff units per coordinate direction.
+    // Since ||A||_F <= sqrt(n) ||A||_2, this leaves an eigenvalue bound
+    // <= 4*n*eps*||A||_2, sixteen times below mutual validation's
+    // 64*n*eps*||A||_2 negative-eigenvalue acceptance threshold.
+    let dimension = Real::from(u32::try_from(order).map_err(|_| {
+        SpiceError::circuit("dense symmetric eigenvalue order exceeds numerical range")
+    })?);
+    let backward_limit = 4. * dimension.sqrt() * Real::EPSILON;
+    let threshold = backward_limit * backward_limit * initial_norm;
+    for _sweep in 0..JACOBI_MAX_SWEEPS {
+        let mut off_diagonal = 0.;
+        for first in 0..order {
+            for second in first + 1..order {
+                let entry = data[first * order + second];
+                off_diagonal = (2. * entry).mul_add(entry, off_diagonal);
             }
         }
-        sum
-    };
-    let total: Real = data.iter().map(|value| value * value).sum();
-    for _sweep in 0..JACOBI_MAX_SWEEPS {
-        if off_diagonal_norm(&data) <= Real::EPSILON * Real::EPSILON * total {
+        if off_diagonal <= threshold {
             let mut values = collect_dense(
                 (0..order).map(|index| data[index * order + index]),
                 "dense symmetric eigenvalues",
@@ -505,44 +510,54 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<V
         for first in 0..order {
             for second in first + 1..order {
                 let coupling = data[first * order + second];
-                if coupling == 0.0 {
+                if coupling == 0. {
                     continue;
                 }
-                let theta = (data[second * order + second] - data[first * order + first])
-                    / (2.0 * coupling);
-                let theta_squared = theta * theta;
-                let tangent = theta.signum() / (theta.abs() + (theta_squared + 1.0).sqrt());
-                let tangent = if theta == 0.0 { 1.0 } else { tangent };
-                let tangent_squared = tangent * tangent;
-                let cosine = 1.0 / (tangent_squared + 1.0).sqrt();
+                let a = data[first * order + first];
+                let b = data[second * order + second];
+                // A bounded tangent avoids overflow in (b-a)/(2*coupling)
+                // and cancellation near equal diagonal entries. The matrix
+                // was power-of-two scaled when its dynamic range demanded it.
+                let gap = b - a;
+                let twice = 2. * coupling;
+                let tangent = if gap == 0. {
+                    1.
+                } else {
+                    let magnitude = twice.abs() / (gap.abs() + gap.hypot(twice));
+                    if gap.is_sign_negative() == coupling.is_sign_negative() {
+                        magnitude
+                    } else {
+                        -magnitude
+                    }
+                };
+                let cosine = 1. / tangent.hypot(1.);
                 let sine = tangent * cosine;
-                // The column rotation is strided but each row is independent.
-                for row in data.chunks_exact_mut(order) {
-                    let (left, right) = rotate_pair(row[first], row[second], cosine, sine);
-                    row[first] = left;
-                    row[second] = right;
+                // Only visit off-pivot pairs. Update each mirror from the
+                // same rounded value instead of rotating rows and columns
+                // independently, which creates skew and a false residual
+                // convergence floor around one ulp of the matrix norm.
+                for row in 0..order {
+                    if row == first || row == second {
+                        continue;
+                    }
+                    let left = data[row * order + first];
+                    let right = data[row * order + second];
+                    let rotated_left = (-sine).mul_add(right, cosine * left);
+                    let rotated_right = sine.mul_add(left, cosine * right);
+                    data[row * order + first] = rotated_left;
+                    data[first * order + row] = rotated_left;
+                    data[row * order + second] = rotated_right;
+                    data[second * order + row] = rotated_right;
                 }
-                // The subsequent row rotation operates on two disjoint
-                // contiguous slices. Preserve its original order and
-                // separate products, permitting packed element operations.
-                let (before, after) = data.split_at_mut(second * order);
-                let first_row = &mut before[first * order..][..order];
-                let second_row = &mut after[..order];
-                for (first_entry, second_entry) in first_row.iter_mut().zip(second_row) {
-                    (*first_entry, *second_entry) =
-                        rotate_pair(*first_entry, *second_entry, cosine, sine);
-                }
+                let change = tangent * coupling;
+                data[first * order + first] = a - change;
+                data[second * order + second] = b + change;
+                data[first * order + second] = 0.;
+                data[second * order + first] = 0.;
             }
         }
     }
     Ok(None)
-}
-
-// Round the products separately, preserving the original rotation arithmetic.
-const fn rotate_pair(first: Real, second: Real, cosine: Real, sine: Real) -> (Real, Real) {
-    let direct = (cosine * first, cosine * second);
-    let crossed = (sine * second, sine * first);
-    (direct.0 - crossed.0, crossed.1 + direct.1)
 }
 
 /// A dense real vector, used for the MNA right-hand side and the solution.

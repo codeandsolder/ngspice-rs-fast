@@ -280,60 +280,153 @@ impl BreakTable {
     }
 }
 
-/// Per-source accept-time breakpoint state (`VSRCbreak_time`/`ISRCbreak_time`)
-/// of a [`LinearSystem`]'s independent sources, in system order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SourceBreaks {
-    break_time: Vec<Real>,
+/// Event state for a single source with a schedulable waveform.
+/// Source indices retain their original `DEVaccept` ordering within each kind.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ActiveSource {
+    index: usize,
+    break_time: Real,
 }
 
-impl SourceBreaks {
-    /// The state at the start of a run: `vsrcset.c` sets `VSRCbreak_time =
-    /// -1`; `ISRCbreak_time` is never initialized and starts at zero
-    /// (`calloc`). Both request their first corner at `t = 0`.
+/// A current PULSE only requests work when the driver landed on a break.
+/// Unknown defaults remain active to preserve unresolved-input errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eligibility {
+    Inert,
+    AtBreakOnly,
+    EveryAccept,
+}
+
+fn eligibility(waveform: &Waveform) -> Eligibility {
+    match waveform {
+        Waveform::Constant(_) | Waveform::Function(_) => Eligibility::Inert,
+        Waveform::PortSeries { baseline, .. } => eligibility(baseline),
+        Waveform::Pulse(_) => Eligibility::AtBreakOnly,
+        Waveform::Pwl(_)
+        | Waveform::Step { .. }
+        | Waveform::PulseDefaults(_)
+        | Waveform::FunctionDefaults(_) => Eligibility::EveryAccept,
+    }
+}
+
+/// Accept-time breakpoint scheduling bound to one immutable `LinearSystem`.
+///
+/// Owning a borrow prevents stale source indices after a system replacement.
+/// Construct a new scheduler for another system or reset the current one.
+#[derive(Debug, Clone)]
+pub struct SourceBreaks<'a> {
+    system: &'a LinearSystem,
+    voltage: Vec<ActiveSource>,
+    current: Vec<ActiveSource>,
+    /// Positions in the ordered current list checked off-break too.
+    current_always: Vec<usize>,
+}
+
+impl PartialEq for SourceBreaks<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.system, other.system)
+            && self.voltage == other.voltage
+            && self.current == other.current
+            && self.current_always == other.current_always
+    }
+}
+
+impl<'a> SourceBreaks<'a> {
+    /// Bind the event-capable source index once per immutable system.
+    /// C initializes voltage break-time to -1 and current break-time to 0.
     #[must_use]
-    pub fn new(system: &LinearSystem) -> Self {
+    pub fn new(system: &'a LinearSystem) -> Self {
+        let mut voltage = Vec::new();
+        let mut current = Vec::new();
+        let mut current_always = Vec::new();
+        for (index, source) in system.sources.iter().enumerate() {
+            let eligibility = eligibility(&source.waveform);
+            if eligibility == Eligibility::Inert {
+                continue;
+            }
+            match source.kind {
+                SourceKind::Voltage => voltage.push(ActiveSource {
+                    index,
+                    break_time: -1.,
+                }),
+                SourceKind::Current => {
+                    if eligibility != Eligibility::AtBreakOnly {
+                        current_always.push(current.len());
+                    }
+                    current.push(ActiveSource {
+                        index,
+                        break_time: 0.,
+                    });
+                }
+            }
+        }
         Self {
-            break_time: system
-                .sources
-                .iter()
-                .map(|source| match source.kind {
-                    SourceKind::Voltage => -1.,
-                    SourceKind::Current => 0.,
-                })
-                .collect(),
+            system,
+            voltage,
+            current,
+            current_always,
         }
     }
 
-    /// The `DEVaccept` breakpoint requests of the sources of one `kind`
-    /// (`ISRCaccept` or `VSRCaccept`) at the accepted time `now` (`CKTtime`),
-    /// in system (load) order. `CKTaccept` calls the two types separately, in
-    /// `dev.c` order: current sources, the other accepting devices, then
-    /// voltage sources. `at_break` is C's `CKTbreak` (the accepted step was
-    /// cut to land on a breakpoint, or `now` is the initial point).
+    /// Restart the phases on the same bound system without reallocating.
+    pub fn reset(&mut self) {
+        for source in &mut self.voltage {
+            source.break_time = -1.;
+        }
+        for source in &mut self.current {
+            source.break_time = 0.;
+        }
+    }
+
+    /// Request all source breakpoints for one physical source kind.
+    /// The driver visits current sources, then delay-device accept hooks,
+    /// then voltage sources. Within each phase source order is unchanged.
     ///
     /// # Errors
     /// A request in the past, or unresolved PULSE/function defaults.
     pub fn accept(
         &mut self,
-        system: &LinearSystem,
         kind: SourceKind,
         now: Real,
         at_break: bool,
         timing: &TransientTiming,
         table: &mut BreakTable,
     ) -> SpiceResult<()> {
-        for (source, break_time) in system.sources.iter().zip(&mut self.break_time) {
-            if source.kind != kind {
-                continue;
+        let request = Request {
+            now,
+            at_break,
+            timing,
+            kind,
+        };
+        match kind {
+            SourceKind::Voltage => {
+                for source in &mut self.voltage {
+                    request.waveform(
+                        &self.system.sources[source.index].waveform,
+                        &mut source.break_time,
+                        table,
+                    )?;
+                }
             }
-            let request = Request {
-                now,
-                at_break,
-                timing,
-                kind: source.kind,
-            };
-            request.waveform(&source.waveform, break_time, table)?;
+            SourceKind::Current if at_break => {
+                for source in &mut self.current {
+                    request.waveform(
+                        &self.system.sources[source.index].waveform,
+                        &mut source.break_time,
+                        table,
+                    )?;
+                }
+            }
+            SourceKind::Current => {
+                for &position in &self.current_always {
+                    let source = &mut self.current[position];
+                    request.waveform(
+                        &self.system.sources[source.index].waveform,
+                        &mut source.break_time,
+                        table,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -537,6 +630,216 @@ impl Request<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::Pulse;
+    use crate::devices::linear::LinearSource;
+    use crate::primitives::Complex;
+
+    fn schedulable_source(kind: SourceKind, waveform: Waveform) -> LinearSource {
+        LinearSource {
+            name: "schedule-test".into(),
+            kind,
+            rows: Vec::new(),
+            dc: 0.,
+            ac: Complex::ZERO,
+            waveform,
+        }
+    }
+
+    /// The pre-#136 accept loop: two full passes, with the original
+    /// initialization and no cached eligibility. Its Request kernel is
+    /// shared so the differential compares source visits, not arithmetic.
+    fn reference_accept(
+        system: &LinearSystem,
+        times: &mut [Real],
+        kind: SourceKind,
+        now: Real,
+        at_break: bool,
+        timing: &TransientTiming,
+        table: &mut BreakTable,
+    ) -> SpiceResult<()> {
+        for (source, break_time) in system.sources.iter().zip(times) {
+            if source.kind != kind {
+                continue;
+            }
+            Request {
+                now,
+                at_break,
+                timing,
+                kind,
+            }
+            .waveform(&source.waveform, break_time, table)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn active_source_schedule_matches_full_c_order_reference_and_rebinds() {
+        let mut system = LinearSystem::new(0);
+        for index in 0..128 {
+            system.sources.push(schedulable_source(
+                if index % 2 == 0 {
+                    SourceKind::Voltage
+                } else {
+                    SourceKind::Current
+                },
+                Waveform::Constant(0.),
+            ));
+        }
+        let pulse = Waveform::Pulse(Pulse::new(0., 1., 0., 0.1, 0.1, 0.4, 2.).unwrap());
+        system
+            .sources
+            .push(schedulable_source(SourceKind::Voltage, pulse.clone()));
+        system
+            .sources
+            .push(schedulable_source(SourceKind::Current, pulse));
+        system.sources.push(schedulable_source(
+            SourceKind::Voltage,
+            Waveform::Step {
+                before: 0.,
+                after: 1.,
+                time: 0.5,
+            },
+        ));
+        system.sources.push(schedulable_source(
+            SourceKind::Current,
+            Waveform::PortSeries {
+                baseline: Box::new(Waveform::Step {
+                    before: 0.,
+                    after: 1.,
+                    time: 1.5,
+                }),
+                tones: vec![],
+            },
+        ));
+        let timing = TransientTiming::new(0.05, 10.).unwrap();
+        let mut active = SourceBreaks::new(&system);
+        assert_eq!(active.voltage.len(), 2);
+        assert_eq!(active.current.len(), 2);
+        assert_eq!(active.current_always, [1]);
+        let initial = active.clone();
+        let mut time_state = system
+            .sources
+            .iter()
+            .map(|s| match s.kind {
+                SourceKind::Voltage => -1.,
+                SourceKind::Current => 0.,
+            })
+            .collect::<Vec<_>>();
+        let mut indexed = BreakTable::new(10., 1e-10).unwrap();
+        let mut reference = indexed.clone();
+        for (now, at_break) in [
+            (0., true),
+            (0.05, false),
+            (0.1, true),
+            (0.3, false),
+            (0.5, true),
+            (0.6, false),
+            (1., true),
+            (1.5, true),
+            (2., true),
+            (2.4, false),
+        ] {
+            for kind in [SourceKind::Current, SourceKind::Voltage] {
+                let old = reference_accept(
+                    &system,
+                    &mut time_state,
+                    kind,
+                    now,
+                    at_break,
+                    &timing,
+                    &mut reference,
+                );
+                let new = active.accept(kind, now, at_break, &timing, &mut indexed);
+                assert_eq!(
+                    old.as_ref().err().map(ToString::to_string),
+                    new.as_ref().err().map(ToString::to_string),
+                    "kind={kind:?} time={now} break={at_break}"
+                );
+                assert!(
+                    indexed
+                        .times()
+                        .map(Real::to_bits)
+                        .eq(reference.times().map(Real::to_bits)),
+                    "event table differs at {now} for {kind:?}"
+                );
+                if old.is_err() {
+                    break;
+                }
+            }
+        }
+        active.reset();
+        assert_eq!(active, initial);
+        let second = system.clone();
+        let rebound = SourceBreaks::new(&second);
+        assert_ne!(active, rebound, "bound identity must be part of equality");
+    }
+
+    #[test]
+    #[ignore = "opt-in 1k/10k/100k source-scheduler benchmark"]
+    fn active_scheduler_scales_with_active_not_total_sources() {
+        let timing = TransientTiming::new(0.1, 10.).unwrap();
+        for count in [1_000usize, 10_000, 100_000] {
+            let mut system = LinearSystem::new(0);
+            system.sources.reserve(count + 4);
+            for n in 0..count {
+                system.sources.push(schedulable_source(
+                    if n % 2 == 0 {
+                        SourceKind::Voltage
+                    } else {
+                        SourceKind::Current
+                    },
+                    Waveform::Constant(0.),
+                ));
+            }
+            for kind in [SourceKind::Current, SourceKind::Voltage] {
+                system.sources.push(schedulable_source(
+                    kind,
+                    Waveform::Step {
+                        before: 0.,
+                        after: 1.,
+                        time: 5.,
+                    },
+                ));
+            }
+            let mut schedule = SourceBreaks::new(&system);
+            assert_eq!(schedule.current.len() + schedule.voltage.len(), 2);
+            let mut time_state = system
+                .sources
+                .iter()
+                .map(|s| match s.kind {
+                    SourceKind::Voltage => -1.,
+                    SourceKind::Current => 0.,
+                })
+                .collect::<Vec<_>>();
+            let mut old = BreakTable::new(10., 1e-12).unwrap();
+            let mut new = old.clone();
+            let start = std::time::Instant::now();
+            for _ in 0..2000 {
+                for kind in [SourceKind::Current, SourceKind::Voltage] {
+                    reference_accept(&system, &mut time_state, kind, 0., false, &timing, &mut old)
+                        .unwrap();
+                }
+            }
+            let scan = start.elapsed();
+            let start = std::time::Instant::now();
+            for _ in 0..2000 {
+                for kind in [SourceKind::Current, SourceKind::Voltage] {
+                    schedule.accept(kind, 0., false, &timing, &mut new).unwrap();
+                }
+            }
+            let bound = start.elapsed();
+            assert!(
+                old.times()
+                    .map(Real::to_bits)
+                    .eq(new.times().map(Real::to_bits))
+            );
+            println!(
+                "sources={count} active=2 visits: old={} new={} scan={scan:?} bound={bound:?}",
+                count * 4000,
+                4000
+            );
+        }
+    }
 
     std::thread_local! {
         pub(super) static KEY_COMPARISONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };

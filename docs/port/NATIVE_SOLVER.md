@@ -439,3 +439,24 @@ transpose solves at 1, 2, 4, 8, 32 and 64 RHS with warm reusable buffers:
 ```sh
 cargo +nightly test --release --lib sparse_rhs_batch_benchmark -- --ignored --nocapture
 ```
+
+### Symmetric Jacobi validation of coupled inductances (#148)
+
+The dense fallback checks the signed spectrum of a normalized mutual
+inductance matrix only after inexpensive Gershgorin certificates fail. The
+matrix is symmetric by construction. Each cyclic Jacobi step now rotates an
+off-pivot pair once and copies the rounded result to both mirrored entries,
+while explicitly annihilating the pivot coupling and updating the two
+diagonals via its stable bounded tangent. Independent row and column rotations
+were producing false skew, preventing convergence for otherwise valid dense
+coupling (the exact 64×64 Hadamard example in `tests/mutual_jacobi.rs`).
+
+Stop only when the omitted symmetric off-diagonal Frobenius norm is at most
+`4*sqrt(n)*epsilon*||A||_F`. This is a backward perturbation: Weyl's bound
+then limits each eigenvalue change to that norm, in turn at most
+`4*n*epsilon*||A||_2`. The mutual validation acceptance budget is
+`64*n*epsilon*||A||_2`, so the solver residual is at least sixteenfold
+smaller than the physical decision margin. The 100-sweep numerical work
+budget, power-of-two scaling at extreme magnitudes, input symmetry checks
+and explicit failure behavior remain. This does not turn the eigensolver
+into an approximate general-purpose public API.

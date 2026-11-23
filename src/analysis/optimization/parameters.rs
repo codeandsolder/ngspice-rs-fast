@@ -20,7 +20,7 @@ use crate::netlist::eval::{
     ParameterScopeId, ParameterScopeSpec,
 };
 use crate::netlist::expr::ParameterExpression;
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 /// What candidate preparation did to the finalized circuit.
 ///
@@ -48,11 +48,27 @@ enum RouteSpec {
     Rebuild,
 }
 
-struct CandidateSite {
+/// Immutable numeric site from the original netlist, indexed by the
+/// shared parameter plan.
+pub struct CandidateSite {
+    /// Original site category and position.
+    pub kind: SiteKind,
+    /// Source expression location.
+    pub location: SourceLoc,
+    /// Baseline value after numparam decimal read-back.
+    pub baseline: Real,
+    raw_baseline: Real,
     expression: ParameterExpression,
     inputs: BoundExpression,
-    baseline: Real,
     route: RouteSpec,
+}
+
+impl CandidateSite {
+    /// Independent input coordinates which may affect this site.
+    #[must_use]
+    pub fn inputs(&self) -> &[usize] {
+        self.inputs.inputs()
+    }
 }
 
 /// Shareable immutable preparation of the original source and validated baseline.
@@ -114,9 +130,12 @@ impl CircuitParameterPlan {
                 RouteSpec::Rebuild
             };
             sites.push(CandidateSite {
+                kind: site.kind,
+                location: site.location.clone(),
                 expression: expression.clone(),
                 inputs,
                 baseline: site.read_back,
+                raw_baseline: site.value,
                 route,
             });
         }
@@ -156,6 +175,12 @@ impl CircuitParameterPlan {
         self.parameters.inputs()
     }
 
+    /// Parameter-dependent site schema and original source provenance.
+    #[must_use]
+    pub fn sites(&self) -> &[CandidateSite] {
+        &self.sites
+    }
+
     /// A fresh independent candidate session with its own mutable circuit
     /// and its own topology-bound instance setters. This prevents cross-lane
     /// solver state leaks and never copies one session's device bindings.
@@ -188,6 +213,11 @@ impl CircuitParameterPlan {
             routes,
             parameters: self.parameters.session(),
             values: self.inputs().iter().map(|input| input.default).collect(),
+            site_raw: self.sites.iter().map(|site| site.raw_baseline).collect(),
+            site_values: self.sites.iter().map(|site| site.baseline).collect(),
+            site_updates: Vec::new(),
+            last_site_evaluations: 0,
+            last_site_roundings: 0,
             prepared: None,
         })
     }
@@ -308,6 +338,12 @@ struct PreparedCandidate {
     circuit: Option<Circuit>,
 }
 
+struct SiteUpdate {
+    index: usize,
+    raw: Real,
+    value: Real,
+}
+
 /// Independent candidate state with transactional updates.
 ///
 /// A failed parameter evaluation, device setter or re-elaboration retains the prior
@@ -318,6 +354,11 @@ pub struct CircuitCandidate<'a> {
     routes: Vec<NumericRoute>,
     parameters: CandidateParameters<'a>,
     values: Vec<Real>,
+    site_raw: Vec<Real>,
+    site_values: Vec<Real>,
+    site_updates: Vec<SiteUpdate>,
+    last_site_evaluations: usize,
+    last_site_roundings: usize,
     prepared: Option<PreparedCandidate>,
 }
 
@@ -382,6 +423,24 @@ impl CircuitCandidate<'_> {
         }
     }
 
+    /// Current committed typed site value by stable plan site index.
+    #[must_use]
+    pub fn site_value(&self, index: usize) -> Option<Real> {
+        self.site_values.get(index).copied()
+    }
+
+    /// Site expressions evaluated by the last successful update.
+    #[must_use]
+    pub const fn last_site_evaluations(&self) -> usize {
+        self.last_site_evaluations
+    }
+
+    /// Decimal materializations by the last successful update.
+    #[must_use]
+    pub const fn last_site_roundings(&self) -> usize {
+        self.last_site_roundings
+    }
+
     /// Apply a full vector of finite independent coordinates. Returns the
     /// number of derived `.param` expressions recomputed by the shared DAG.
     /// Candidate geometry, context and circuit are published only on success.
@@ -396,11 +455,19 @@ impl CircuitCandidate<'_> {
                 .zip(&self.values)
                 .all(|(a, b)| a.to_bits() == b.to_bits())
         {
+            self.last_site_evaluations = 0;
+            self.last_site_roundings = 0;
             return Ok(0);
         }
         let mut numeric = self.parameters.clone();
         let evaluated = numeric.update(candidate, budget)?;
-        let prepared = self.prepare(&numeric, candidate, budget)?;
+        let (prepared, evaluations, roundings) = self.prepare(&numeric, budget)?;
+        for change in self.site_updates.drain(..) {
+            self.site_raw[change.index] = change.raw;
+            self.site_values[change.index] = change.value;
+        }
+        self.last_site_evaluations = evaluations;
+        self.last_site_roundings = roundings;
         self.parameters = numeric;
         self.baseline.clear_candidate_analysis_state();
         self.prepared = Some(prepared);
@@ -410,25 +477,38 @@ impl CircuitCandidate<'_> {
     }
 
     fn prepare(
-        &self,
+        &mut self,
         parameters: &CandidateParameters<'_>,
-        candidate: &[Real],
         budget: &mut EvalBudget,
-    ) -> SpiceResult<PreparedCandidate> {
+    ) -> SpiceResult<(PreparedCandidate, usize, usize)> {
+        self.site_updates.clear();
+        let mut evaluations = 0;
+        let mut roundings = 0;
         let mut context = self.plan.config.context().model_context();
         let mut structural = self.plan.requires_rebuild;
         let mut resistor_count = 0_usize;
         let mut instance_count = 0_usize;
-        for (site, &route) in self.plan.sites.iter().zip(&self.routes) {
-            if !site.inputs.affected(candidate, self.plan.inputs()) {
-                continue;
-            }
-            let raw = parameters.evaluate(self.plan.root, &site.expression, budget)?;
-            // C numparam materializes the rounded decimal spelling before
-            // factories interpret a setter; direct overlays must do the same.
-            let text = elaborate::format_literal(raw);
-            let value = crate::primitives::parse_spice_number(&text)
-                .ok_or_else(|| SpiceError::circuit("candidate scalar cannot be read back"))?;
+        for (index, (site, &route)) in self.plan.sites.iter().zip(&self.routes).enumerate() {
+            let value = if site.inputs.changed_between(&self.parameters, parameters) {
+                evaluations += 1;
+                let raw = parameters.evaluate_bound(&site.expression, &site.inputs, budget)?;
+                if raw.to_bits() == self.site_raw[index].to_bits() {
+                    self.site_values[index]
+                } else {
+                    // Preserve numparam decimal read-back for device setters.
+                    let text = elaborate::format_literal(raw);
+                    let value = crate::primitives::parse_spice_number(&text).ok_or_else(|| {
+                        SpiceError::circuit("candidate scalar cannot be read back")
+                    })?;
+                    roundings += 1;
+                    self.site_updates.push(SiteUpdate { index, raw, value });
+                    value
+                }
+            } else {
+                self.site_values[index]
+            };
+            // Every effective non-baseline site must be applied to each fresh
+            // context, even when it was unchanged since the previous candidate.
             if value.to_bits() == site.baseline.to_bits() {
                 continue;
             }
@@ -470,11 +550,15 @@ impl CircuitCandidate<'_> {
             // The circuit/configuration shape is unchanged, but independent
             // parameter values must still be visible to downstream objectives.
             let scope = parameters.resolved_scope(self.plan.root)?;
-            return Ok(PreparedCandidate {
-                context,
-                config: self.plan.config.clone().with_parameter_scope(scope),
-                circuit: None,
-            });
+            return Ok((
+                PreparedCandidate {
+                    context,
+                    config: self.plan.config.clone().with_parameter_scope(scope),
+                    circuit: None,
+                },
+                evaluations,
+                roundings,
+            ));
         }
         // Every dimension, including non-instance model and topology-changing
         // coordinates, is handled by this general scalar-equivalent path.
@@ -489,10 +573,14 @@ impl CircuitCandidate<'_> {
             crate::devices::ElaborationLimits::default(),
             Some(scope),
         )?;
-        Ok(PreparedCandidate {
-            context,
-            config,
-            circuit: Some(circuit),
-        })
+        Ok((
+            PreparedCandidate {
+                context,
+                config,
+                circuit: Some(circuit),
+            },
+            evaluations,
+            roundings,
+        ))
     }
 }

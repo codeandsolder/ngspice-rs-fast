@@ -105,7 +105,34 @@ the run with an error; no partial plot is returned.
   queued event lies beyond it: two ascending runs preserve the resulting
   sequence. Diagnostic iteration borrows this sequence without allocating
   a snapshot. Construction rejects non-finite or negative final times
-  and merge distances. Source traversal and corner calculations are unchanged.
+  and merge distances. The accept-time source scheduler now binds only
+  event-capable sources once to the immutable, resolved LinearSystem (#136),
+  retaining their original indices and two C-compatible type phases.
+  Constants and continuous-function sources are excluded from every
+  accept-point traversal; voltage PULSE/PWL and current PWL are checked at
+  every accepted time, while a current PULSE is checked only when CKTbreak
+  is set. Unknown waveform defaults remain checked, preserving the original
+  error rather than being treated as inert. A new scheduler is required
+  for another effective system; resetting the same bound schedule only
+  restores its per-source C break-time state. Source corner arithmetic,
+  merge priority, delay-device interleaving and accepted event grids are
+  unchanged.
+
+  The opt-in Acer #136 source-enumeration benchmark uses 2,000 accepted
+  points, both current and voltage phases, and two active Step sources
+  among 1,000/10,000/100,000 inert constants. Its full-scan reference
+  uses the identical Request physics kernel and compares every
+  BreakTable bit:
+
+  | Total sources | Old scanned visits | Bound visits | Old scan | Bound |
+  | --- | ---: | ---: | ---: | ---: |
+  | 1,002 | 4,000,000 | 4,000 | 14.28 ms | 45.40 µs |
+  | 10,002 | 40,000,000 | 4,000 | 134.50 ms | 45.57 µs |
+  | 100,002 | 400,000,000 | 4,000 | 5,059.97 ms | 45.97 µs |
+
+  Source requests and breakpoint bits match the old full scan.
+  These are source-enumeration times in the debug test binary under
+  concurrent host load, not entire transient-solver times.
   In the opt-in release breakpoint benchmark on Acer, three trials each
   at 4096, 16384 and 65536 distinct events in ascending and shuffled order
   used 9.09 s of CPU time with the former vector and 0.37 s with the index;

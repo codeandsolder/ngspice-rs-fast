@@ -690,7 +690,6 @@ impl Driver<'_> {
             // CKTaccept runs DEVaccept in dev.c type order: isrc, then tra
             // (the delay lines' requests), then vsrc.
             sources.accept(
-                self.system,
                 SourceKind::Current,
                 accepted.cursor.clock.time,
                 accepted.cursor.boundary.at_break(),
@@ -701,7 +700,6 @@ impl Driver<'_> {
                 breaks.set(accepted.cursor.clock.time, time)?;
             }
             sources.accept(
-                self.system,
                 SourceKind::Voltage,
                 accepted.cursor.clock.time,
                 accepted.cursor.boundary.at_break(),
