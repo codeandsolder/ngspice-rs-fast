@@ -391,6 +391,28 @@ impl Matrix {
     /// entries, an asymmetric matrix (entries must agree exactly), or a
     /// failed decomposition, or unavailable workspace storage.
     pub fn symmetric_eigenvalues(&self) -> SpiceResult<Vec<Real>> {
+        Ok(self.symmetric_decomposition(false)?.0)
+    }
+
+    /// Eigenvalues and the orthonormal eigenbasis of a real symmetric matrix.
+    /// Eigenvalues increase across the returned matrix's eigenvector columns.
+    /// Uses the same bounded Jacobi sweeps and scale handling as the
+    /// eigenvalue-only path, but accumulates rotations only when requested.
+    ///
+    /// # Errors
+    /// As for the eigenvalue-only decomposition, or if basis storage fails.
+    pub fn symmetric_eigendecomposition(&self) -> SpiceResult<(Vec<Real>, Self)> {
+        let (values, vectors) = self.symmetric_decomposition(true)?;
+        let vectors = vectors.ok_or_else(|| {
+            SpiceError::circuit("Jacobi decomposition did not construct the requested eigenbasis")
+        })?;
+        Ok((values, vectors))
+    }
+
+    fn symmetric_decomposition(
+        &self,
+        with_vectors: bool,
+    ) -> SpiceResult<(Vec<Real>, Option<Self>)> {
         let error = |message: String| SpiceError::Numerical {
             context: "dense symmetric eigenvalues".to_owned(),
             message,
@@ -428,7 +450,7 @@ impl Matrix {
                 *value /= scale;
             }
         }
-        let mut values = jacobi_eigenvalues(data, n)?
+        let (mut values, vectors) = jacobi_symmetric(data, n, with_vectors)?
             .ok_or_else(|| error("Jacobi rotations did not converge".to_owned()))?;
         if let Some(scale) = scale {
             for value in &mut values {
@@ -438,7 +460,13 @@ impl Matrix {
         if values.iter().any(|value| !value.is_finite()) {
             return Err(error("nonfinite eigenvalue".to_owned()));
         }
-        Ok(values)
+        Ok((
+            values,
+            vectors.map(|data| Self {
+                shape: self.shape,
+                data,
+            }),
+        ))
     }
 }
 
@@ -476,9 +504,46 @@ pub(crate) fn symmetric_eigenvalue_cost(order: usize) -> Option<(usize, usize)> 
     Some((bytes, work))
 }
 
-/// Cyclic Jacobi eigenvalues of the symmetric row-major `a` (n x n), sorted.
-/// `None` if the off-diagonal mass fails to vanish within the sweep budget.
-fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<Vec<Real>>> {
+/// Sorted eigenvalues and, when requested, basis columns in matching order.
+type JacobiSpectrum = (Vec<Real>, Option<Vec<Real>>);
+
+/// Sort the basis columns exactly as the corresponding Jacobi eigenvalues.
+fn sort_jacobi_eigenpairs(
+    values: &[Real],
+    basis: &[Real],
+    order: usize,
+) -> SpiceResult<(Vec<Real>, Vec<Real>)> {
+    let mut permutation = collect_dense(0..order, "dense symmetric eigenvector permutation")?;
+    permutation.sort_unstable_by(|&left, &right| values[left].total_cmp(&values[right]));
+    let sorted_values = collect_dense(
+        permutation.iter().map(|&index| values[index]),
+        "dense symmetric eigenvalues",
+    )?;
+    let mut sorted_basis = filled_vec(order * order, 0., "dense symmetric eigenvectors")?;
+    for (col, &source_col) in permutation.iter().enumerate() {
+        for row in 0..order {
+            sorted_basis[row * order + col] = basis[row * order + source_col];
+        }
+    }
+    Ok((sorted_values, sorted_basis))
+}
+
+/// Bounded cyclic Jacobi spectrum and optional eigenvector basis.
+/// The eigenvalue-only caller does not allocate or rotate the eigenbasis.
+fn jacobi_symmetric(
+    mut data: Vec<Real>,
+    order: usize,
+    with_vectors: bool,
+) -> SpiceResult<Option<JacobiSpectrum>> {
+    let mut vectors = if with_vectors {
+        let mut identity = filled_vec(order * order, 0., "dense symmetric eigenvectors")?;
+        for index in 0..order {
+            identity[index * order + index] = 1.;
+        }
+        Some(identity)
+    } else {
+        None
+    };
     let initial_norm: Real = data.iter().map(|value| value * value).sum();
     // The omitted symmetric off-diagonal is exactly the backward perturbation
     // to the diagonal eigensystem: Weyl bounds every eigenvalue error by its
@@ -504,8 +569,12 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<V
                 (0..order).map(|index| data[index * order + index]),
                 "dense symmetric eigenvalues",
             )?;
+            if let Some(basis) = vectors {
+                let (values, sorted_basis) = sort_jacobi_eigenpairs(&values, &basis, order)?;
+                return Ok(Some((values, Some(sorted_basis))));
+            }
             values.sort_unstable_by(Real::total_cmp);
-            return Ok(Some(values));
+            return Ok(Some((values, None)));
         }
         for first in 0..order {
             for second in first + 1..order {
@@ -554,6 +623,14 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<V
                 data[second * order + second] = b + change;
                 data[first * order + second] = 0.;
                 data[second * order + first] = 0.;
+                if let Some(basis) = vectors.as_deref_mut() {
+                    for row in 0..order {
+                        let left = basis[row * order + first];
+                        let right = basis[row * order + second];
+                        basis[row * order + first] = (-sine).mul_add(right, cosine * left);
+                        basis[row * order + second] = sine.mul_add(left, cosine * right);
+                    }
+                }
             }
         }
     }
@@ -705,6 +782,77 @@ fn out_of_range(index: usize, len: usize) -> SpiceError {
 #[cfg(test)]
 mod tests {
     use super::{Matrix, Vector};
+
+    fn verify_eigenbasis(matrix: &Matrix, eigenvalues: &[f64], basis: &Matrix) {
+        let order = eigenvalues.len();
+        let scale = matrix
+            .data()
+            .iter()
+            .fold(0.0_f64, |max, v| max.max(v.abs()));
+        assert_eq!(basis.rows(), order);
+        assert_eq!(basis.cols(), order);
+        for mode in 0..order {
+            for row in 0..order {
+                let lhs = (0..order)
+                    .map(|inner| matrix.get(row, inner).unwrap() * basis.get(inner, mode).unwrap())
+                    .sum::<f64>();
+                let rhs = eigenvalues[mode] * basis.get(row, mode).unwrap();
+                assert!((lhs / scale - rhs / scale).abs() < 5e-12);
+            }
+            for other in 0..order {
+                let dot = (0..order)
+                    .map(|row| basis.get(row, mode).unwrap() * basis.get(row, other).unwrap())
+                    .sum::<f64>();
+                let expected = if mode == other { 1. } else { 0. };
+                assert!((dot - expected).abs() < 5e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn symmetric_eigenvectors_have_sorted_modes_small_residual_and_orthogonality() {
+        let mut matrix = Matrix::zeros(3, 3).unwrap();
+        matrix
+            .data_mut()
+            .copy_from_slice(&[3., 2., 0.2, 2., 3., 0.3, 0.2, 0.3, 9.]);
+        let (eigenvalues, basis) = matrix.symmetric_eigendecomposition().unwrap();
+        assert!(eigenvalues.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(eigenvalues, matrix.symmetric_eigenvalues().unwrap());
+        verify_eigenbasis(&matrix, &eigenvalues, &basis);
+    }
+
+    #[test]
+    fn symmetric_eigenbasis_is_stable_at_extreme_physical_scales() {
+        for scale in [2.0_f64.powi(-1000), 2.0_f64.powi(1000)] {
+            let mut matrix = Matrix::zeros(2, 2).unwrap();
+            matrix
+                .data_mut()
+                .copy_from_slice(&[2. * scale, 0.5 * scale, 0.5 * scale, 3. * scale]);
+            let (eigenvalues, basis) = matrix.symmetric_eigendecomposition().unwrap();
+            verify_eigenbasis(&matrix, &eigenvalues, &basis);
+            assert!(eigenvalues.iter().all(|value| value.is_finite()));
+        }
+    }
+
+    #[test]
+    fn symmetric_eigenbasis_preserves_degenerate_and_zero_matrices() {
+        for diagonal in [0., 2.] {
+            let mut matrix = Matrix::zeros(3, 3).unwrap();
+            for index in 0..3 {
+                matrix.set(index, index, diagonal).unwrap();
+            }
+            let (values, basis) = matrix.symmetric_eigendecomposition().unwrap();
+            assert_eq!(values, vec![diagonal; 3]);
+            if diagonal != 0. {
+                verify_eigenbasis(&matrix, &values, &basis);
+            }
+            for row in 0..3 {
+                for col in 0..3 {
+                    assert_eq!(basis.get(row, col), Some(if row == col { 1. } else { 0. }),);
+                }
+            }
+        }
+    }
 
     #[test]
     fn symmetric_eigenvalues_do_not_converge_on_overflowed_or_underflowed_norms() {
