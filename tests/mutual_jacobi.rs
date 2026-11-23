@@ -33,9 +33,10 @@ fn orthogonal_hadamard_spectra_are_recovered_for_spd_psd_and_indefinite() {
         let spectrum: Vec<f64> = (0..order)
             .map(|index| {
                 let permutation = (13 * index) % order;
-                1. + (2. * f64::from(u32::try_from(permutation).unwrap())
-                    - f64::from(u32::try_from(order - 1).unwrap()))
-                    / (2. * f64::from(u32::try_from(order).unwrap()))
+                1. + 2.0_f64.mul_add(
+                    f64::from(u32::try_from(permutation).unwrap()),
+                    -f64::from(u32::try_from(order - 1).unwrap()),
+                ) / (2. * f64::from(u32::try_from(order).unwrap()))
             })
             .collect();
         for mode in 0..3 {
@@ -66,7 +67,9 @@ fn orthogonal_hadamard_spectra_are_recovered_for_spd_psd_and_indefinite() {
 fn analytic_normalized_coupling_is_strictly_positive_definite() {
     let order = 64_usize;
     let expected: Vec<f64> = (0..order)
-        .map(|k| 1. + (2. * f64::from(u32::try_from((13 * k) % order).unwrap()) - 63.) / 128.)
+        .map(|k| {
+            1. + 2.0_f64.mul_add(f64::from(u32::try_from((13 * k) % order).unwrap()), -63.) / 128.
+        })
         .collect();
     let matrix = hadamard_spectrum(order, &expected, 1.);
     for index in 0..order {
