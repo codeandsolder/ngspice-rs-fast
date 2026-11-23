@@ -2777,7 +2777,7 @@ impl Circuit {
                     .ok_or_else(|| {
                         SpiceError::circuit("effective diode changed finalized family type")
                     })?;
-                diode.commit_load(&mut context, evaluation)?;
+                diode.commit_load(&mut context, &evaluation)?;
             } else {
                 device.stamp(&mut context)?;
             }

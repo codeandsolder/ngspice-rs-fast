@@ -592,26 +592,22 @@ impl Diode {
     pub(crate) fn commit_load(
         &self,
         context: &mut StampContext<'_>,
-        evaluation: DiodeLoadEvaluation,
+        evaluation: &DiodeLoadEvaluation,
     ) -> SpiceResult<()> {
-        let DiodeLoadEvaluation {
-            thermal,
-            point: p,
-            mut limiter,
-            raw,
-            voltage: v,
-        } = evaluation;
+        let mut limiter = evaluation.limiter;
+        let p = &evaluation.point;
+        let v = evaluation.voltage;
         let held = p.junction.current;
-        let predicted_change = p.junction.conductance * (raw - v);
+        let predicted_change = p.junction.conductance * (evaluation.raw - v);
         limiter.test_held(&context.states, &[(held, held + predicted_change)]);
-        self.stamp_junction(context, thermal, p, limiter, v)
+        self.stamp_junction(context, &evaluation.thermal, p, limiter, v)
     }
 
     fn stamp_junction(
         &self,
         context: &mut StampContext<'_>,
-        thermal: Thermal,
-        p: DiodePoint,
+        thermal: &Thermal,
+        p: &DiodePoint,
         limiter: Limiter,
         v: Real,
     ) -> SpiceResult<()> {
@@ -1959,7 +1955,8 @@ impl Device for Diode {
             context.mode,
             context.integration,
         )?;
-        self.commit_load(context, sample.evaluate(context.gmin)?)
+        let evaluation = sample.evaluate(context.gmin)?;
+        self.commit_load(context, &evaluation)
     }
     /// `dioacld.c`: series conductance, C's small-signal junction conductance
     /// and `j*omega` times its small-signal capacitance at the bias point.
