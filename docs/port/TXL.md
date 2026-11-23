@@ -104,6 +104,14 @@ captured numeric cells against the committed C ASCII golden by variable name
 and occurrence (not header metadata or capture sort order). The independent
 Rust-to-golden verification remains `xtask golden verify`.
 
+As a wider numerical audit, 4,000 deterministic randomized positive
+binary64 L/C/length combinations across the full exponent range (with the
+original 1e-12 H inductance floor) were checked against 420-digit Decimal
+square roots of exact binary64 inputs. Of 7,396 representable positive final
+admittance/delay results, no acceptance/range discrepancies occurred and the
+largest error was 2 ULP in either quantity. The independent high-precision
+unit cases pin the key boundaries so normal tests do not need Decimal.
+
 `m10_txl_op`/`m10_txl_dc` pin the DC answer and `m10_txl_tran`/
 `m10_txl_early_tran`/`m10_txl_tran_step`/`m10_txl3_tran` the transient.
 `m10_txl_lossless_tran` covers the lossless shortcut; `m10_txl_fb_tran`
