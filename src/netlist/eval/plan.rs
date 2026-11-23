@@ -50,6 +50,9 @@ pub struct ParameterInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundExpression {
     inputs: Vec<usize>,
+    /// Site-local names are resolved once to their defining numeric slots.
+    /// A function's free names are included by the ordinary `RefScan`.
+    references: HashMap<String, usize>,
 }
 
 impl BoundExpression {
@@ -57,6 +60,26 @@ impl BoundExpression {
     #[must_use]
     pub fn inputs(&self) -> &[usize] {
         &self.inputs
+    }
+
+    /// Whether the effective values of this expression's directly used
+    /// parameter slots differ between two validated candidate sessions.
+    ///
+    /// A changed independent coordinate does not force site evaluation if
+    /// an intermediate parameter cancels to the same binary64 value.
+    #[must_use]
+    pub fn changed_between(
+        &self,
+        previous: &CandidateParameters<'_>,
+        next: &CandidateParameters<'_>,
+    ) -> bool {
+        self.references.values().any(|&slot| {
+            previous
+                .values
+                .get(slot)
+                .map(|value| value.map(Real::to_bits))
+                != next.values.get(slot).map(|value| value.map(Real::to_bits))
+        })
     }
 
     /// Whether the candidate can change this site relative to the baseline.
@@ -194,10 +217,12 @@ impl ParameterPlan {
             cuts: 0,
         };
         let mut direct = Vec::new();
+        let mut references = HashMap::new();
         let mut undefined = None;
         scan.refs(&expression.root, 0, &mut |name, location| {
             if let Some(index) = self.lookup_slot(Some(scope), name) {
                 direct.push(index);
+                references.entry(name.to_owned()).or_insert(index);
             } else if undefined.is_none() {
                 undefined = Some((name.to_owned(), location.clone()));
             }
@@ -227,7 +252,7 @@ impl ParameterPlan {
                     .map(|_| position)
             })
             .collect();
-        Ok(BoundExpression { inputs })
+        Ok(BoundExpression { inputs, references })
     }
 
     fn node_index(&self, slot: ParameterSlot) -> Option<usize> {
@@ -510,6 +535,38 @@ impl CandidateParameters<'_> {
         evaluate_root(
             expression,
             &|name| self.get(scope, name),
+            baseline.functions.as_deref(),
+            budget,
+        )
+        .map_err(Failure::into_error)
+    }
+
+    /// Evaluate an expression using the site's pre-bound lexical parameter
+    /// slots rather than looking up each identifier through the scope chain
+    /// for every candidate. Function calls, errors and the evaluation budget
+    /// still use the original scalar expression evaluator.
+    ///
+    /// # Errors
+    /// Invalid scope, mismatched bound site, expression or budget failure.
+    pub fn evaluate_bound(
+        &self,
+        scope: ParameterScopeId,
+        expression: &ParameterExpression,
+        bound: &BoundExpression,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Real> {
+        let baseline = self
+            .plan
+            .baseline(scope)
+            .ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))?;
+        evaluate_root(
+            expression,
+            &|name| {
+                bound
+                    .references
+                    .get(name)
+                    .and_then(|&index| self.values.get(index).copied().flatten())
+            },
             baseline.functions.as_deref(),
             budget,
         )

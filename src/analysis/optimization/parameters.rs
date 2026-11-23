@@ -20,7 +20,7 @@ use crate::netlist::eval::{
     ParameterScopeId, ParameterScopeSpec,
 };
 use crate::netlist::expr::ParameterExpression;
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 /// What candidate preparation did to the finalized circuit.
 ///
@@ -48,11 +48,42 @@ enum RouteSpec {
     Rebuild,
 }
 
-struct CandidateSite {
+/// One immutable source value site compiled against the parameter slot DAG.
+/// Source identity and provenance remain stable across candidate sessions.
+pub struct CandidateSite {
+    kind: SiteKind,
     expression: ParameterExpression,
     inputs: BoundExpression,
+    unrounded: Real,
     baseline: Real,
     route: RouteSpec,
+}
+
+impl CandidateSite {
+    /// Original location in the input netlist, including the original
+    /// device/model, analysis argument or node-hint index.
+    #[must_use]
+    pub const fn kind(&self) -> SiteKind {
+        self.kind
+    }
+
+    /// Source expression location, used for scalar-equivalent diagnostics.
+    #[must_use]
+    pub const fn location(&self) -> &SourceLoc {
+        &self.expression.span.start
+    }
+
+    /// Original validated, numparam-rounded numeric value.
+    #[must_use]
+    pub const fn baseline(&self) -> Real {
+        self.baseline
+    }
+
+    /// Independent candidate coordinates that could change this site.
+    #[must_use]
+    pub fn inputs(&self) -> &[usize] {
+        self.inputs.inputs()
+    }
 }
 
 /// Shareable immutable preparation of the original source and validated baseline.
@@ -114,8 +145,10 @@ impl CircuitParameterPlan {
                 RouteSpec::Rebuild
             };
             sites.push(CandidateSite {
+                kind: site.kind,
                 expression: expression.clone(),
                 inputs,
+                unrounded: site.value,
                 baseline: site.read_back,
                 route,
             });
@@ -156,6 +189,13 @@ impl CircuitParameterPlan {
         self.parameters.inputs()
     }
 
+    /// Immutable parameter-dependent numeric sites in original deck order.
+    /// Sites that cannot change with the selected tunables are not retained.
+    #[must_use]
+    pub fn sites(&self) -> &[CandidateSite] {
+        &self.sites
+    }
+
     /// A fresh independent candidate session with its own mutable circuit
     /// and its own topology-bound instance setters. This prevents cross-lane
     /// solver state leaks and never copies one session's device bindings.
@@ -188,6 +228,10 @@ impl CircuitParameterPlan {
             routes,
             parameters: self.parameters.session(),
             values: self.inputs().iter().map(|input| input.default).collect(),
+            site_values: self.sites.iter().map(|site| site.baseline).collect(),
+            raw_site_values: self.sites.iter().map(|site| site.unrounded).collect(),
+            last_site_evaluations: 0,
+            last_site_roundings: 0,
             prepared: None,
         })
     }
@@ -308,6 +352,15 @@ struct PreparedCandidate {
     circuit: Option<Circuit>,
 }
 
+/// Candidate-local numeric site evaluation transaction. None of the
+/// recorded values reaches the live session until validation succeeds.
+#[derive(Default)]
+struct PendingSiteEdits {
+    updated: Vec<(usize, Real, Real)>,
+    evaluated: usize,
+    rounded: usize,
+}
+
 /// Independent candidate state with transactional updates.
 ///
 /// A failed parameter evaluation, device setter or re-elaboration retains the prior
@@ -318,6 +371,12 @@ pub struct CircuitCandidate<'a> {
     routes: Vec<NumericRoute>,
     parameters: CandidateParameters<'a>,
     values: Vec<Real>,
+    /// Last committed read-back value of each prepared source site.
+    site_values: Vec<Real>,
+    /// Before numparam decimal formatting; changed raw bits alone trigger it.
+    raw_site_values: Vec<Real>,
+    last_site_evaluations: usize,
+    last_site_roundings: usize,
     prepared: Option<PreparedCandidate>,
 }
 
@@ -382,6 +441,27 @@ impl CircuitCandidate<'_> {
         }
     }
 
+    /// Current committed typed value at a source site, with numparam
+    /// read-back applied once when it last changed. Never creates a deck.
+    #[must_use]
+    pub fn site_value(&self, site: usize) -> Option<Real> {
+        self.site_values.get(site).copied()
+    }
+
+    /// Number of source value sites evaluated by the most recent successful
+    /// candidate transition. A repeated identical candidate evaluates none.
+    #[must_use]
+    pub const fn last_site_evaluations(&self) -> usize {
+        self.last_site_evaluations
+    }
+
+    /// Number of source-site numparam decimal formatting and read-back
+    /// operations in the most recent successful candidate transition.
+    #[must_use]
+    pub const fn last_site_roundings(&self) -> usize {
+        self.last_site_roundings
+    }
+
     /// Apply a full vector of finite independent coordinates. Returns the
     /// number of derived `.param` expressions recomputed by the shared DAG.
     /// Candidate geometry, context and circuit are published only on success.
@@ -396,12 +476,20 @@ impl CircuitCandidate<'_> {
                 .zip(&self.values)
                 .all(|(a, b)| a.to_bits() == b.to_bits())
         {
+            self.last_site_evaluations = 0;
+            self.last_site_roundings = 0;
             return Ok(0);
         }
         let mut numeric = self.parameters.clone();
         let evaluated = numeric.update(candidate, budget)?;
-        let prepared = self.prepare(&numeric, candidate, budget)?;
+        let (prepared, edits) = self.prepare(&numeric, budget)?;
         self.parameters = numeric;
+        for (site, raw, value) in edits.updated {
+            self.raw_site_values[site] = raw;
+            self.site_values[site] = value;
+        }
+        self.last_site_evaluations = edits.evaluated;
+        self.last_site_roundings = edits.rounded;
         self.baseline.clear_candidate_analysis_state();
         self.prepared = Some(prepared);
         self.values.clear();
@@ -409,26 +497,45 @@ impl CircuitCandidate<'_> {
         Ok(evaluated)
     }
 
+    fn evaluate_site(
+        &self,
+        index: usize,
+        site: &CandidateSite,
+        parameters: &CandidateParameters<'_>,
+        budget: &mut EvalBudget,
+        edits: &mut PendingSiteEdits,
+    ) -> SpiceResult<Real> {
+        if !site.inputs.changed_between(&self.parameters, parameters) {
+            return Ok(self.site_values[index]);
+        }
+        let raw =
+            parameters.evaluate_bound(self.plan.root, &site.expression, &site.inputs, budget)?;
+        edits.evaluated += 1;
+        // A changed direct reference can produce the identical result
+        // (e.g. x-x). Round only when the raw binary64 result changes.
+        if raw.to_bits() == self.raw_site_values[index].to_bits() {
+            return Ok(self.site_values[index]);
+        }
+        let text = elaborate::format_literal(raw);
+        let rounded = crate::primitives::parse_spice_number(&text)
+            .ok_or_else(|| SpiceError::circuit("candidate scalar cannot be read back"))?;
+        edits.rounded += 1;
+        edits.updated.push((index, raw, rounded));
+        Ok(rounded)
+    }
+
     fn prepare(
         &self,
         parameters: &CandidateParameters<'_>,
-        candidate: &[Real],
         budget: &mut EvalBudget,
-    ) -> SpiceResult<PreparedCandidate> {
+    ) -> SpiceResult<(PreparedCandidate, PendingSiteEdits)> {
         let mut context = self.plan.config.context().model_context();
         let mut structural = self.plan.requires_rebuild;
         let mut resistor_count = 0_usize;
         let mut instance_count = 0_usize;
-        for (site, &route) in self.plan.sites.iter().zip(&self.routes) {
-            if !site.inputs.affected(candidate, self.plan.inputs()) {
-                continue;
-            }
-            let raw = parameters.evaluate(self.plan.root, &site.expression, budget)?;
-            // C numparam materializes the rounded decimal spelling before
-            // factories interpret a setter; direct overlays must do the same.
-            let text = elaborate::format_literal(raw);
-            let value = crate::primitives::parse_spice_number(&text)
-                .ok_or_else(|| SpiceError::circuit("candidate scalar cannot be read back"))?;
+        let mut edits = PendingSiteEdits::default();
+        for (index, (site, &route)) in self.plan.sites.iter().zip(&self.routes).enumerate() {
+            let value = self.evaluate_site(index, site, parameters, budget, &mut edits)?;
             if value.to_bits() == site.baseline.to_bits() {
                 continue;
             }
@@ -470,11 +577,14 @@ impl CircuitCandidate<'_> {
             // The circuit/configuration shape is unchanged, but independent
             // parameter values must still be visible to downstream objectives.
             let scope = parameters.resolved_scope(self.plan.root)?;
-            return Ok(PreparedCandidate {
-                context,
-                config: self.plan.config.clone().with_parameter_scope(scope),
-                circuit: None,
-            });
+            return Ok((
+                PreparedCandidate {
+                    context,
+                    config: self.plan.config.clone().with_parameter_scope(scope),
+                    circuit: None,
+                },
+                edits,
+            ));
         }
         // Every dimension, including non-instance model and topology-changing
         // coordinates, is handled by this general scalar-equivalent path.
@@ -489,10 +599,13 @@ impl CircuitCandidate<'_> {
             crate::devices::ElaborationLimits::default(),
             Some(scope),
         )?;
-        Ok(PreparedCandidate {
-            context,
-            config,
-            circuit: Some(circuit),
-        })
+        Ok((
+            PreparedCandidate {
+                context,
+                config,
+                circuit: Some(circuit),
+            },
+            edits,
+        ))
     }
 }
