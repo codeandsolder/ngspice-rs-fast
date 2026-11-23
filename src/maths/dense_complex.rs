@@ -405,6 +405,18 @@ fn accumulate_row<const SUBTRACT: bool>(
     source: &[Complex],
 ) {
     debug_assert_eq!(destination.len(), source.len());
+    // Short port matrices are measurably faster with scalar code: packing
+    // and four-lane classification cost more than the few saved products.
+    if destination.len() < 32 {
+        for (out, &input) in destination.iter_mut().zip(source) {
+            *out = if SUBTRACT {
+                *out - factor * input
+            } else {
+                *out + factor * input
+            };
+        }
+        return;
+    }
     let mut out_chunks = destination.chunks_exact_mut(4);
     let mut in_chunks = source.chunks_exact(4);
     for (out, input) in out_chunks.by_ref().zip(in_chunks.by_ref()) {
@@ -457,6 +469,12 @@ fn accumulate_row<const SUBTRACT: bool>(
 /// lane requiring exponent-range or cancellation recovery.
 #[inline]
 fn multiply_row(row: &mut [Complex], factor: Complex) {
+    if row.len() < 32 {
+        for value in row {
+            *value = *value * factor;
+        }
+        return;
+    }
     let mut chunks = row.chunks_exact_mut(4);
     for chunk in chunks.by_ref() {
         let (re, im, fast) = row_products(factor, chunk);

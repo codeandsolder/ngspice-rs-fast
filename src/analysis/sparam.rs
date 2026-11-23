@@ -757,10 +757,18 @@ impl NoiseWorkspace {
                     let at = |row: Option<usize>| row.map_or(Complex::ZERO, |r| adjoint[r]);
                     *voltage = (at(rows[0]) - at(rows[1])) * Complex::real(amplitude);
                 }
-                for (i, current) in self.current.iter_mut().enumerate() {
+                // The Y schema already guarantees N×N shape. Traverse its
+                // actual row-major cells instead of rediscovering checked
+                // coordinates for every independent noise generator.
+                for (i, (current, y_row)) in self
+                    .current
+                    .iter_mut()
+                    .zip(y.data().chunks_exact(ports.len().max(1)))
+                    .enumerate()
+                {
                     *current = self.voltage[i] * ports[i].inverse_z0;
-                    for (j, v) in self.voltage.iter().enumerate() {
-                        *current = *current + y.get(i, j).unwrap_or(Complex::ZERO) * *v;
+                    for (&admittance, &v) in y_row.iter().zip(&self.voltage) {
+                        *current = *current + admittance * v;
                     }
                 }
                 // The voltage workspace is dead after computing this source's
