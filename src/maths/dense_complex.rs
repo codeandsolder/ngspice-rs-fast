@@ -10,6 +10,12 @@
 
 use super::dense::DenseShape;
 use crate::primitives::{Complex, SpiceError, SpiceResult, filled_vec};
+use std::simd::{
+    Mask,
+    cmp::{SimdPartialEq, SimdPartialOrd},
+    f64x4,
+    num::SimdFloat,
+};
 
 fn numerical(message: impl Into<String>) -> SpiceError {
     SpiceError::Numerical {
@@ -175,13 +181,25 @@ impl DenseComplex {
                     if a == Complex::ZERO {
                         continue;
                     }
-                    for (out, &b) in out_row.iter_mut().zip(b_row) {
-                        *out = *out + a * b;
-                    }
+                    accumulate_row::<false>(out_row, a, b_row);
                 }
             }
         }
         out.check_finite()
+    }
+
+    /// Accumulate an outer product using the same strict complex product and
+    /// addition order as the independent row-major scalar covariance loop.
+    /// The caller supplies already-conjugated right entries when needed.
+    pub(crate) fn add_outer(&mut self, left: &[Complex], right: &[Complex]) -> SpiceResult<()> {
+        let n = self.dim();
+        if left.len() != n || right.len() != n {
+            return Err(numerical("outer product dimension mismatch"));
+        }
+        for (&factor, out) in left.iter().zip(self.data.chunks_exact_mut(n.max(1))) {
+            accumulate_row::<false>(out, factor, right);
+        }
+        Ok(())
     }
 
     /// Right diagonal product in O(n²), equivalent to the finite generic
@@ -314,10 +332,8 @@ impl DenseComplex {
             let (a_before, a_pivot, a_after) = split_row(a, n, c);
             let (b_before, b_pivot, b_after) = split_row(b, n, c);
             let inverse_pivot = Complex::real(1.) / a_pivot[c];
-            for (a_value, b_value) in a_pivot.iter_mut().zip(b_pivot.iter_mut()) {
-                *a_value = *a_value * inverse_pivot;
-                *b_value = *b_value * inverse_pivot;
-            }
+            multiply_row(a_pivot, inverse_pivot);
+            multiply_row(b_pivot, inverse_pivot);
             let a_rows = a_before
                 .chunks_exact_mut(n)
                 .chain(a_after.chunks_exact_mut(n));
@@ -329,14 +345,8 @@ impl DenseComplex {
                 if factor == Complex::ZERO {
                     continue;
                 }
-                for ((a_value, b_value), (&a_p, &b_p)) in a_row
-                    .iter_mut()
-                    .zip(b_row)
-                    .zip(a_pivot.iter().zip(b_pivot.iter()))
-                {
-                    *a_value = *a_value - factor * a_p;
-                    *b_value = *b_value - factor * b_p;
-                }
+                accumulate_row::<true>(a_row, factor, a_pivot);
+                accumulate_row::<true>(b_row, factor, b_pivot);
             }
         }
         // If A was scaled down by s, A'^{-1} = s A^{-1}.
@@ -349,6 +359,117 @@ impl DenseComplex {
         }
         out.check_finite()?;
         Ok(true)
+    }
+}
+
+/// Compute four independent complex products in parallel without changing
+/// the C-compatible scalar product's exceptional/cancellation recovery.
+/// A lane takes the SIMD result only if *both* product components would take
+/// the scalar fast branch; otherwise the original Complex multiplication is
+/// evaluated for that lane. No FMA or reassociation is introduced.
+#[inline]
+fn row_products(factor: Complex, source: &[Complex]) -> ([f64; 4], [f64; 4], Mask<i64, 4>) {
+    let a_re = f64x4::splat(factor.re);
+    let a_im = f64x4::splat(factor.im);
+    let b_re = f64x4::from_array(std::array::from_fn(|i| source[i].re));
+    let b_im = f64x4::from_array(std::array::from_fn(|i| source[i].im));
+    let ac = a_re * b_re;
+    let bd = f64x4::splat(-factor.im) * b_im;
+    let ad = a_re * b_im;
+    let bc = a_im * b_re;
+    let real = ac + bd;
+    let imag = ad + bc;
+    let axial = Mask::splat(factor.re == 0. || factor.im == 0.)
+        | b_re.simd_eq(f64x4::splat(0.))
+        | b_im.simd_eq(f64x4::splat(0.));
+    let normal = real.is_normal() & imag.is_normal();
+    let well_separated = real
+        .abs()
+        .simd_gt(ac.abs().simd_max(bd.abs()) * f64x4::splat(0.5))
+        & imag
+            .abs()
+            .simd_gt(ad.abs().simd_max(bc.abs()) * f64x4::splat(0.5));
+    (
+        real.to_array(),
+        imag.to_array(),
+        axial | (normal & well_separated),
+    )
+}
+
+/// Add or subtract a product of one complex scalar and a dense row.
+/// Row order and the individual complex accumulation order remain unchanged.
+#[inline]
+fn accumulate_row<const SUBTRACT: bool>(
+    destination: &mut [Complex],
+    factor: Complex,
+    source: &[Complex],
+) {
+    debug_assert_eq!(destination.len(), source.len());
+    let mut out_chunks = destination.chunks_exact_mut(4);
+    let mut in_chunks = source.chunks_exact(4);
+    for (out, input) in out_chunks.by_ref().zip(in_chunks.by_ref()) {
+        let (re, im, fast) = row_products(factor, input);
+        if fast.all() {
+            let old_re = f64x4::from_array(std::array::from_fn(|i| out[i].re));
+            let old_im = f64x4::from_array(std::array::from_fn(|i| out[i].im));
+            let new_re = if SUBTRACT {
+                old_re - f64x4::from_array(re)
+            } else {
+                old_re + f64x4::from_array(re)
+            };
+            let new_im = if SUBTRACT {
+                old_im - f64x4::from_array(im)
+            } else {
+                old_im + f64x4::from_array(im)
+            };
+            for lane in 0..4 {
+                out[lane] = Complex::new(new_re[lane], new_im[lane]);
+            }
+        } else {
+            for lane in 0..4 {
+                let product = if fast.test(lane) {
+                    Complex::new(re[lane], im[lane])
+                } else {
+                    factor * input[lane]
+                };
+                out[lane] = if SUBTRACT {
+                    out[lane] - product
+                } else {
+                    out[lane] + product
+                };
+            }
+        }
+    }
+    for (out, &input) in out_chunks
+        .into_remainder()
+        .iter_mut()
+        .zip(in_chunks.remainder())
+    {
+        *out = if SUBTRACT {
+            *out - factor * input
+        } else {
+            *out + factor * input
+        };
+    }
+}
+
+/// Multiply a pivot row in place, preserving the scalar product for every
+/// lane requiring exponent-range or cancellation recovery.
+#[inline]
+fn multiply_row(row: &mut [Complex], factor: Complex) {
+    let mut chunks = row.chunks_exact_mut(4);
+    for chunk in chunks.by_ref() {
+        let (re, im, fast) = row_products(factor, chunk);
+        for lane in 0..4 {
+            chunk[lane] = if fast.test(lane) {
+                Complex::new(re[lane], im[lane])
+            } else {
+                chunk[lane] * factor
+            };
+        }
+    }
+    for value in chunks.into_remainder() {
+        *value = *value * factor;
     }
 }
 
@@ -376,6 +497,209 @@ mod tests {
             m.set(index / n, index % n, Complex::new(*re, *im)).unwrap();
         }
         m
+    }
+
+    fn bits(values: &[Complex]) -> Vec<[u64; 2]> {
+        values
+            .iter()
+            .map(|value| [value.re.to_bits(), value.im.to_bits()])
+            .collect()
+    }
+
+    /// Independent scalar reference to the *same* complex product and
+    /// accumulation operations, including IEEE zero signs.
+    fn scalar_mul(left: &DenseComplex, right: &DenseComplex) -> Result<DenseComplex, String> {
+        let n = left.dim();
+        let mut result = DenseComplex::zeros(n).unwrap();
+        if left
+            .data()
+            .iter()
+            .chain(right.data())
+            .any(|value| !value.is_finite())
+        {
+            return Err("non-finite entry".to_owned());
+        }
+        for (a_row, out_row) in left
+            .data
+            .chunks_exact(n.max(1))
+            .zip(result.data.chunks_exact_mut(n.max(1)))
+        {
+            for (&a, row) in a_row.iter().zip(right.data.chunks_exact(n.max(1))) {
+                if a == Complex::ZERO {
+                    continue;
+                }
+                for (out, &b) in out_row.iter_mut().zip(row) {
+                    *out = *out + a * b;
+                }
+            }
+        }
+        if result.data.iter().any(|v| !v.is_finite()) {
+            Err("non-finite result".to_owned())
+        } else {
+            Ok(result)
+        }
+    }
+
+    #[test]
+    fn vectorized_complex_rows_preserve_every_scalar_product_bit() {
+        let smallest = f64::from_bits(1);
+        let corpus = [
+            Complex::new(0., -0.),
+            Complex::new(-0., 0.),
+            Complex::new(-0., -0.),
+            Complex::new(1., -1.),
+            Complex::new(1e16, 1.),
+            Complex::new(-1e16, 1e-16),
+            Complex::new(smallest, -smallest),
+            Complex::new(1e-300, -1e300),
+            Complex::new(1e300, 1e-300),
+            Complex::new(f64::MAX, f64::MAX),
+            Complex::new(0.125, 0.25),
+            Complex::new(-0.125, -0.25),
+            Complex::new(3., -7.),
+            Complex::new(-2., 5.),
+        ];
+        for n in 0..=35 {
+            let source: Vec<_> = (0..n).map(|i| corpus[(7 * i + 3) % corpus.len()]).collect();
+            let initial: Vec<_> = (0..n).map(|i| corpus[(3 * i + 5) % corpus.len()]).collect();
+            for &factor in &corpus {
+                let mut optimized = initial.clone();
+                let mut reference = initial.clone();
+                super::accumulate_row::<false>(&mut optimized, factor, &source);
+                for (out, &value) in reference.iter_mut().zip(&source) {
+                    *out = *out + factor * value;
+                }
+                assert_eq!(
+                    bits(&optimized),
+                    bits(&reference),
+                    "add len={n} factor={factor:?}"
+                );
+
+                let mut optimized = initial.clone();
+                let mut reference = initial.clone();
+                super::accumulate_row::<true>(&mut optimized, factor, &source);
+                for (out, &value) in reference.iter_mut().zip(&source) {
+                    *out = *out - factor * value;
+                }
+                assert_eq!(
+                    bits(&optimized),
+                    bits(&reference),
+                    "subtract len={n} factor={factor:?}"
+                );
+
+                let mut optimized = source.clone();
+                let mut reference = source.clone();
+                super::multiply_row(&mut optimized, factor);
+                for value in &mut reference {
+                    *value = *value * factor;
+                }
+                assert_eq!(
+                    bits(&optimized),
+                    bits(&reference),
+                    "scale len={n} factor={factor:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_product_and_outer_covariance_match_scalar_order() {
+        let corpus = [
+            Complex::new(0., -0.),
+            Complex::new(-0., 0.),
+            Complex::new(1e16, -1.),
+            Complex::new(-1e16, 1.),
+            Complex::new(1., 1e-300),
+            Complex::new(1e-300, -1.),
+            Complex::new(-0.75, 0.5),
+            Complex::new(2., -1.),
+            Complex::new(1e150, 1e-150),
+        ];
+        for n in [0, 1, 2, 3, 4, 5, 7, 8, 9, 16, 32] {
+            let mut a = DenseComplex::zeros(n).unwrap();
+            let mut b = DenseComplex::zeros(n).unwrap();
+            for i in 0..n * n {
+                a.data[i] = corpus[(i * 5 + 1) % corpus.len()];
+                b.data[i] = corpus[(i * 7 + 3) % corpus.len()];
+            }
+            let scalar = scalar_mul(&a, &b);
+            let vectorized = a.mul(&b);
+            match (scalar, vectorized) {
+                (Ok(reference), Ok(actual)) => {
+                    assert_eq!(bits(reference.data()), bits(actual.data()), "product n={n}")
+                }
+                (Err(expected), Err(actual)) => assert!(
+                    actual.to_string().contains(&expected),
+                    "product n={n}: {actual}"
+                ),
+                (reference, actual) => {
+                    panic!("product n={n}: scalar {reference:?}, SIMD {actual:?}")
+                }
+            }
+            let lhs: Vec<_> = (0..n).map(|i| corpus[(i * 3 + 2) % corpus.len()]).collect();
+            let rhs: Vec<_> = (0..n).map(|i| corpus[(i * 7 + 1) % corpus.len()]).collect();
+            let mut optimized = DenseComplex::zeros(n).unwrap();
+            let mut reference = optimized.clone();
+            for _ in 0..3 {
+                optimized.add_outer(&lhs, &rhs).unwrap();
+                for (i, &factor) in lhs.iter().enumerate() {
+                    for (j, &value) in rhs.iter().enumerate() {
+                        let dest = &mut reference.data[i * n + j];
+                        *dest = *dest + factor * value;
+                    }
+                }
+                assert_eq!(
+                    bits(optimized.data()),
+                    bits(reference.data()),
+                    "outer n={n}"
+                );
+            }
+            if n > 0 {
+                assert!(optimized.add_outer(&lhs[..n - 1], &rhs).is_err());
+                assert!(optimized.add_outer(&lhs, &rhs[..n - 1]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in dense complex matrix microbenchmark"]
+    fn dense_complex_row_kernel_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for n in [2, 8, 16, 32, 64] {
+            let mut a = DenseComplex::zeros(n).unwrap();
+            let mut b = DenseComplex::zeros(n).unwrap();
+            for (i, value) in a.data.iter_mut().enumerate() {
+                *value = Complex::new((i % 31) as f64 / 31. + 0.1, (i % 19) as f64 / 19. + 0.1);
+            }
+            for (i, value) in b.data.iter_mut().enumerate() {
+                *value = Complex::new((i % 23) as f64 / 23. - 0.5, (i % 29) as f64 / 29. - 0.5);
+            }
+            let mut out = DenseComplex::zeros(n).unwrap();
+            let repeats = (2048 / n).max(2);
+            let mut baseline = Vec::new();
+            let mut vectorized = Vec::new();
+            for _ in 0..7 {
+                let start = Instant::now();
+                for _ in 0..repeats {
+                    let _ = black_box(scalar_mul(black_box(&a), black_box(&b)).unwrap());
+                }
+                baseline.push(start.elapsed());
+                let start = Instant::now();
+                for _ in 0..repeats {
+                    black_box(a.mul_into(black_box(&b), black_box(&mut out)).unwrap());
+                }
+                vectorized.push(start.elapsed());
+            }
+            baseline.sort();
+            vectorized.sort();
+            assert_eq!(bits(scalar_mul(&a, &b).unwrap().data()), bits(out.data()));
+            eprintln!(
+                "dense-complex n={n} reps={repeats} scalar_ns={} simd_ns={}",
+                baseline[3].as_nanos(),
+                vectorized[3].as_nanos()
+            );
+        }
     }
 
     #[test]

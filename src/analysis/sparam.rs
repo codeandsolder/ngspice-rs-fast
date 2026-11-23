@@ -764,16 +764,12 @@ impl NoiseWorkspace {
                         *current = *current + y.get(i, j).unwrap_or(Complex::ZERO) * *v;
                     }
                 }
-                for i in 0..count {
-                    for j in 0..count {
-                        self.cy.set(
-                            i,
-                            j,
-                            self.cy.get(i, j).unwrap_or(Complex::ZERO)
-                                + self.current[i] * self.current[j].conj(),
-                        )?;
-                    }
+                // The voltage workspace is dead after computing this source's
+                // port currents; reuse it for the conjugated covariance row.
+                for (conjugate, current) in self.voltage.iter_mut().zip(&self.current) {
+                    *conjugate = current.conj();
                 }
+                self.cy.add_outer(&self.current, &self.voltage)?;
             }
         }
         Ok(())
