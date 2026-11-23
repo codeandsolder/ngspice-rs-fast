@@ -98,8 +98,11 @@ tick width, propagation interpolation, Padé coefficient formulas, or AC
 capabilities. The focused unit cases use independently computed 750-digit
 decimal square-root references on exact binary64 inputs, with 2-ULP bounds.
 A transient regression checks that an extreme but representable delay does
-not produce an early arrival; existing live C and golden tests retain the
-ordinary numerical model coverage.
+not produce an early arrival. The ignored `tests/c_txl_reference.rs` runs
+three ordinary TXL fixtures through a pinned C batch binary and checks all
+captured numeric cells against the committed C ASCII golden by variable name
+and occurrence (not header metadata or capture sort order). The independent
+Rust-to-golden verification remains `xtask golden verify`.
 
 `m10_txl_op`/`m10_txl_dc` pin the DC answer and `m10_txl_tran`/
 `m10_txl_early_tran`/`m10_txl_tran_step`/`m10_txl3_tran` the transient.
