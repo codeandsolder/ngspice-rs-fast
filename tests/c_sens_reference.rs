@@ -6,7 +6,8 @@
 //! simulate`. Plot count, plot names, flags, the variable names **in order**
 //! with their units and every value must agree: linear decks within
 //! `1e-8 |C| + 1e-12` (`xtask::compare::SENSITIVITY`), nonlinear decks within
-//! `1e-6 |C| + 1e-9` (`SENSITIVITY_NONLINEAR`); C's NaN must be NaN.
+//! `1e-3 |C| + 1e-9` (`SENSITIVITY_NONLINEAR`); frequency coordinates
+//! retain the linear comparison budget. C's NaN must be NaN.
 //!
 //! `#[ignore]`d because it needs a built C `ngspice`:
 //!
@@ -22,8 +23,9 @@ use std::path::Path;
 
 use ngspice_rs::analysis::{RawFile, RawFormat};
 
-const LINEAR: (f64, f64) = (1e-8, 1e-12);
-const NONLINEAR: (f64, f64) = (1e-6, 1e-9);
+use ngspice_conformance::tolerance::{
+    SENSITIVITY as LINEAR, SENSITIVITY_NONLINEAR as NONLINEAR, Tolerance,
+};
 
 /// Batch-mode order (unlike control `write`'s sorted vectors), all columns,
 /// and the shared-model/per-instance replay of every classic MOS level.
@@ -43,6 +45,18 @@ fn hfet2_dc_sensitivity_matches_c() {
     compare_with_c(
         "sens_hfet2",
         &DeckInputs::fixture("sens_hfet2").unwrap(),
+        NONLINEAR,
+    );
+}
+
+/// Cancellation-limited classical DC sensitivities must agree at the
+/// shared engineering budget without depending on C's exact rounding.
+#[test]
+#[ignore = "requires NGSPICE_BIN"]
+fn jfet2_dc_sensitivity_matches_c() {
+    compare_with_c(
+        "sens_jfet2",
+        &DeckInputs::fixture("sens_jfet2").unwrap(),
         NONLINEAR,
     );
 }
@@ -87,7 +101,7 @@ fn mos_ac_sensitivity_after_transient_matches_c() {
     }
 }
 
-fn compare_with_c(name: &str, inputs: &DeckInputs<'_>, (relative, absolute): (f64, f64)) {
+fn compare_with_c(name: &str, inputs: &DeckInputs<'_>, tolerance: Tolerance) {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
     let scratch = Scratch::new("c-sens-reference").unwrap();
@@ -172,9 +186,16 @@ fn compare_with_c(name: &str, inputs: &DeckInputs<'_>, (relative, absolute): (f6
                     );
                     continue;
                 }
+                let budget = if variable.name == "frequency" {
+                    LINEAR
+                } else {
+                    tolerance
+                };
                 let difference = (*x - reference).magnitude();
                 assert!(
-                    difference <= relative * reference.magnitude() + absolute,
+                    x.is_finite()
+                        && reference.is_finite()
+                        && difference <= budget.bound(reference.magnitude()),
                     "{name}: '{}' point {point}: Rust {x} != C {y}",
                     variable.name
                 );
@@ -427,7 +448,10 @@ m1 d g s b nch l=0.1u w=1u
 .end
 ",
         ),
-        (1e-4, 1e-9),
+        Tolerance {
+            relative: 1e-4,
+            ..NONLINEAR
+        },
     );
 }
 

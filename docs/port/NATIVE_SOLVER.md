@@ -364,3 +364,28 @@ replacement obey the same aggregate limits. This bounds materialized records
 and state slots, not arbitrary strings, model caches or dynamic analysis
 history storage. Standard allocator-backed boxed devices and map/string
 construction remain subject to the system allocator.
+
+### Independent right-hand sides
+
+Real and complex sparse LU expose a reusable typed `SolveBatchWorkspace`.
+RHS and solution buffers are RHS-major in external node order; four
+independent RHS vectors share one factor traversal, using separate portable
+SIMD real/imaginary planes. Partial tiles use the scalar substitution
+kernel. Workspace storage is bounded by one full tile plus one scalar
+tail. Pivoting, normal/transpose ordering, untouched external rows and
+scalar exponent/cancellation recovery are unchanged. Nonfinite input or
+output reports the failing RHS index.
+
+RF excitations and RF noise adjoints are prepared and solved in port-order
+tiles; the numeric cell budget accounts for the tiles and optional scalar
+tail. DC and AC sensitivity prepare parameter residuals in the existing
+device-record walk, solve independently against the retained factors, and
+emit in parameter order. Ordinary single-excitation noise solves stay
+scalar. No new factorization or reassociation is introduced.
+
+The opt-in sparse RHS benchmark exercises real and complex normal and
+transpose solves at 1, 2, 4, 8, 32 and 64 RHS with warm reusable buffers:
+
+```sh
+cargo +nightly test --release --lib sparse_rhs_batch_benchmark -- --ignored --nocapture
+```
