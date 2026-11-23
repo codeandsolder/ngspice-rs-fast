@@ -3424,7 +3424,9 @@ impl Circuit {
             Some(&mut ranges),
         )?;
         let conductance_stamps = system.a.triplets();
+        system.e_groups.validate(&system.e)?;
         let capacitance_stamps = system.e.triplets();
+        let mut ordered_groups = system.e_groups.iter().peekable();
         let mut terms = Vec::new();
         for (conductance_range, capacitance_range, statements) in ranges {
             if !statements.is_empty() {
@@ -3459,25 +3461,42 @@ impl Circuit {
                 *conductance =
                     Some(conductance.map_or(stamp.value, |conductance| conductance + stamp.value));
             }
+            while ordered_groups
+                .peek()
+                .is_some_and(|group| group.range.end <= capacitance_range.start)
+            {
+                ordered_groups.next();
+            }
             let mut index = capacitance_range.start;
             while index < capacitance_range.end {
                 let stamp = &capacitance_stamps[index];
-                let (value, next) = system
-                    .e_groups
-                    .iter()
-                    .find(|group| {
-                        group.range.start == index && group.range.end <= capacitance_range.end
-                    })
-                    .map_or_else(
-                        || (stamp.value, index + 1),
-                        |group| {
-                            let mut sum = group.terms.first().copied().unwrap_or(0.);
-                            for term in group.terms.iter().skip(1) {
-                                sum += term;
-                            }
-                            (group.scale * sum, group.range.end.max(index + 1))
-                        },
-                    );
+                let (value, next) = match ordered_groups.peek() {
+                    Some(group) if group.range.start == index => {
+                        if group.range.end > capacitance_range.end {
+                            return Err(SpiceError::circuit(
+                                "dynamic group crosses pole-zero device boundary",
+                            ));
+                        }
+                        if group.prescaled {
+                            return Err(SpiceError::circuit(
+                                "prescaled AC dynamic group is not an s coefficient",
+                            ));
+                        }
+                        let mut sum = group.terms.first().copied().unwrap_or(0.);
+                        for term in group.terms.iter().skip(1) {
+                            sum += term;
+                        }
+                        let result = (group.scale * sum / group.divisor, group.range.end);
+                        ordered_groups.next();
+                        result
+                    }
+                    Some(group) if group.range.start < index => {
+                        return Err(SpiceError::circuit(
+                            "dynamic group crosses pole-zero stamp boundary",
+                        ));
+                    }
+                    _ => (stamp.value, index + 1),
+                };
                 let slot_index = slot(&mut terms, stamp.row, stamp.col);
                 let capacitance = &mut terms[slot_index].capacitance;
                 *capacitance = Some(capacitance.map_or(value, |capacitance| capacitance + value));

@@ -74,6 +74,34 @@ configuration matches ngspice's `spconfig.h`: `TRANSLATE`, `EXPANDABLE`,
   whatever the deck's options, and `method=bdf` is an explicit error from the
   companion driver: ngspice has no BDF integrator.
 
+## Packed ordered dynamic stamps (#133)
+
+Frequency-dependent small-signal loads keep one reusable term arena per
+LinearSystem rather than allocating a vector for each capacitance group.
+DynamicGroups holds ordered, nonoverlapping ranges of E triplets and ranges
+into contiguous unscaled source terms. Each group still computes its
+omega-scaled products in source order and applies the multiplier/divisor to
+the accumulated result, matching the original C per-term rounding. Device
+stamps that already contain omega use the explicit prescaled flag; the
+unscaled and prescaled modes are never treated as interchangeable.
+
+Group range shape, source-coordinate coherence and order are verified once
+as the device stamps them. SparseMatrix attaches a lazily minted operator
+identity only when grouping is used; clearing, folding or overwriting the
+operator invalidates its old groups. All AC, distortion and sensitivity
+consumers validate this identity before numeric iteration, returning an
+error for stale/foreign group metadata rather than skipping it. The pole-zero
+loader traverses the same validated group sequence, but applies the real
+s-coefficient rule (including the divisor) and rejects a prescaled AC
+coefficient instead of misidentifying it as capacitance. Complete reassembly
+retains the capacity of both the group descriptors and the term arena.
+
+The focused tests are tests/dynamic_group_bench.rs and the existing
+complex_solver, pole_zero, MESFET/JFET/HFET and reference-conformance
+suites. The ignored benchmark contains both the packed construction and a
+test-only historical per-group Vec allocation baseline for DHAT comparison.
+These paths do not change solver order, pivot selection or C device physics.
+
 ## SPARSE frame lifecycle (#34)
 
 A frame has one explicit ordering/factor lifecycle. Original columns are

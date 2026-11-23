@@ -20,6 +20,9 @@
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+static NEXT_DYNAMIC_OWNER: AtomicU64 = AtomicU64::new(1);
 
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 use petgraph::graphmap::UnGraphMap;
@@ -718,7 +721,7 @@ fn fold_triplets(triplets: &mut Vec<Triplet>) {
 /// [`SparseMatrix::fold_duplicates`]. Devices rely on this: a resistor between
 /// two non-ground nodes stamps four positions, and several devices may stamp the
 /// same position.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SparseMatrix {
     rows: usize,
     cols: usize,
@@ -731,9 +734,59 @@ pub struct SparseMatrix {
     /// Per row, the circuit unknown's name (C `NODENAME`), used by solver
     /// diagnostics; `None` for a standalone matrix.
     names: Option<crate::maths::UnknownNames>,
+    /// Logical stamped-operator identity, minted only for grouped dynamic E.
+    /// Ordinary ungrouped matrices incur no atomic or allocation cost.
+    dynamic_owner: u64,
+}
+
+impl PartialEq for SparseMatrix {
+    fn eq(&self, other: &Self) -> bool {
+        // Assembly identity is provenance, not part of numeric matrix value.
+        self.rows == other.rows
+            && self.cols == other.cols
+            && self.triplets == other.triplets
+            && self.folded == other.folded
+            && self.bound == other.bound
+            && self.pivot == other.pivot
+            && self.names == other.names
+    }
 }
 
 impl SparseMatrix {
+    /// Identity of the current unfolded grouped operator; zero means invalid.
+    pub(crate) const fn dynamic_owner(&self) -> u64 {
+        self.dynamic_owner
+    }
+
+    /// Bind one grouped operator to its logical stamp sequence.
+    /// Additional append-only stamps retain the binding. Reordering or
+    /// clearing the operator invalidates its groups.
+    ///
+    /// # Errors
+    /// Exhausted unique assembly IDs.
+    pub(crate) fn bind_dynamic_owner(&mut self) -> SpiceResult<u64> {
+        if self.dynamic_owner != 0 {
+            return Ok(self.dynamic_owner);
+        }
+        let mut current = NEXT_DYNAMIC_OWNER.load(AtomicOrdering::Relaxed);
+        let id = loop {
+            let next = current
+                .checked_add(1)
+                .ok_or_else(|| SpiceError::circuit("dynamic operator identity exhausted"))?;
+            match NEXT_DYNAMIC_OWNER.compare_exchange_weak(
+                current,
+                next,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(previous) => break previous,
+                Err(observed) => current = observed,
+            }
+        };
+        self.dynamic_owner = id;
+        Ok(id)
+    }
+
     /// An empty `rows` by `cols` matrix.
     #[must_use]
     pub const fn new(rows: usize, cols: usize) -> Self {
@@ -745,6 +798,7 @@ impl SparseMatrix {
             bound: None,
             pivot: crate::maths::PivotTolerances::DEFAULT,
             names: None,
+            dynamic_owner: 0,
         }
     }
 
@@ -794,6 +848,7 @@ impl SparseMatrix {
             }),
             pivot: crate::maths::PivotTolerances::DEFAULT,
             names: None,
+            dynamic_owner: 0,
         })
     }
 
@@ -994,6 +1049,7 @@ impl SparseMatrix {
     /// # Errors
     /// No bound pattern, or the handle lies outside it.
     pub fn add_element(&mut self, element: ElementId, value: Real) -> SpiceResult<()> {
+        self.dynamic_owner = 0;
         let bound = self
             .bound
             .as_mut()
@@ -1012,6 +1068,7 @@ impl SparseMatrix {
     /// through `SMPfindElt`). Returns whether a kept column holds an element.
     /// The predicate is a column selection, independent of traversal order.
     pub fn zero_row(&mut self, row: usize, keep: impl Fn(usize) -> bool) -> bool {
+        self.dynamic_owner = 0;
         let mut kept = false;
         if let Some(bound) = &mut self.bound
             && row < bound.pattern.order()
@@ -1053,6 +1110,7 @@ impl SparseMatrix {
     ///
     /// [`SpiceError::Numerical`] when the position is out of range.
     pub fn set(&mut self, row: usize, col: usize, value: Real) -> SpiceResult<()> {
+        self.dynamic_owner = 0;
         if let Some(bound) = &mut self.bound
             && let Some(id) = bound.pattern.find(row, col)
         {
@@ -1198,12 +1256,14 @@ impl SparseMatrix {
         if self.folded {
             return;
         }
+        self.dynamic_owner = 0;
         fold_triplets(&mut self.triplets);
         self.folded = true;
     }
 
     /// Drops every contribution, keeping the dimensions.
     pub fn clear(&mut self) {
+        self.dynamic_owner = 0;
         self.triplets.clear();
         self.folded = true;
         if let Some(bound) = &mut self.bound {
