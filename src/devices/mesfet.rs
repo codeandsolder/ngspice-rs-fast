@@ -220,34 +220,22 @@ fn qggnew(
     cgs: Real,
     cgd: Real,
 ) -> (Real, Real, Real) {
-    let gate_difference = vgs - vgd;
-    let gate_difference_squared = gate_difference * gate_difference;
-    let vcap_squared = vcap * vcap;
-    let veroot = (gate_difference_squared + vcap_squared).sqrt();
-    let veff1 = 0.5_f64.mul_add(veroot, Real::midpoint(vgs, vgd));
-    let veff2 = veff1 - veroot;
-    let overdrive = veff1 - vto;
-    let overdrive_squared = overdrive * overdrive;
-    let delta_squared = DEL * DEL;
-    let vnroot = (overdrive_squared + delta_squared).sqrt();
-    let mut vnew1 = 0.5_f64.mul_add(vnroot, Real::midpoint(veff1, vto));
-    let vnew3 = vnew1;
-    let ext = if vnew1 < VMAX {
+    let gate = jfet::smoothed_extrema(vgs, vgd, vcap);
+    let bounded = jfet::smoothed_extrema(gate.high, vto, DEL);
+    let voltage = bounded.high.min(VMAX);
+    let root = (1. - voltage / phib).sqrt();
+    let extension = if bounded.high < VMAX {
         0.
     } else {
-        vnew1 = VMAX;
-        (vnew3 - VMAX) / (1. - VMAX / phib).sqrt()
+        (bounded.high - VMAX) / root
     };
-    let qroot = (1. - vnew1 / phib).sqrt();
-    let qggval = cgs.mul_add(jfet::depletion_voltage(vnew1, qroot) + ext, cgd * veff2);
-    let par1 = Real::midpoint(1., (veff1 - vto) / vnroot);
-    let cfact = (vgs - vgd) / veroot;
-    let cplus = Real::midpoint(1., cfact);
-    let cminus = cplus - cfact;
+    let charge = cgs.mul_add(voltage / 1_f64.midpoint(root) + extension, cgd * gate.low);
+    let cap = (cgs / root) * bounded.high_weights[0];
+    let [cplus, cminus] = gate.high_weights;
     (
-        qggval,
-        cgd.mul_add(cminus, cgs / qroot * par1 * cplus),
-        cgd.mul_add(cplus, cgs / qroot * par1 * cminus),
+        charge,
+        cap.mul_add(cplus, cgd * cminus),
+        cap.mul_add(cminus, cgd * cplus),
     )
 }
 
@@ -261,65 +249,35 @@ impl Model {
             gm: 0.,
             gds: 0.,
         };
-        if vds >= 0. {
-            let vgst = vgs - self.vto;
-            if vgst <= 0. {
-                return off;
-            }
-            let prod = f64::mul_add(lambda, vds, 1.);
-            let betap = beta * prod;
-            let denom = f64::mul_add(b, vgst, 1.);
-            let invdenom = 1. / denom;
-            if vds >= 3. / alpha {
-                // Normal mode, saturation region.
-                Channel {
-                    current: betap * vgst * vgst * invdenom,
-                    gm: betap * vgst * (1. + denom) * invdenom * invdenom,
-                    gds: lambda * beta * vgst * vgst * invdenom,
-                }
-            } else {
-                // Normal mode, linear region.
-                let afact = 1. - alpha * vds / 3.;
-                let lfact = (afact * afact).mul_add(-afact, 1.);
-                Channel {
-                    current: betap * vgst * vgst * invdenom * lfact,
-                    gm: betap * vgst * (1. + denom) * invdenom * invdenom * lfact,
-                    gds: beta
-                        * vgst
-                        * vgst
-                        * invdenom
-                        * lfact.mul_add(lambda, alpha * afact * afact * prod),
-                }
-            }
+        let (gate, direction) = if vds >= 0. { (vgs, 1.) } else { (vgd, -1.) };
+        let overdrive = gate - self.vto;
+        if overdrive <= 0. {
+            return off;
+        }
+        let drain = vds.abs();
+        let prod = lambda.mul_add(drain, 1.);
+        let betap = beta * prod;
+        let denom = b.mul_add(overdrive, 1.);
+        let invdenom = denom.recip();
+        let (lfact, dl_drain) = if drain >= 3. / alpha {
+            (1., 0.)
         } else {
-            let vgdt = vgd - self.vto;
-            if vgdt <= 0. {
-                return off;
-            }
-            let prod = f64::mul_add(lambda, -vds, 1.);
-            let betap = beta * prod;
-            let denom = f64::mul_add(b, vgdt, 1.);
-            let invdenom = 1. / denom;
-            if -vds >= 3. / alpha {
-                // Inverse mode, saturation region.
-                let gm = -betap * vgdt * (1. + denom) * invdenom * invdenom;
-                Channel {
-                    current: -betap * vgdt * vgdt * invdenom,
-                    gm,
-                    gds: (lambda * beta * vgdt * vgdt).mul_add(invdenom, -gm),
-                }
-            } else {
-                // Inverse mode, linear region.
-                let afact = 1. + alpha * vds / 3.;
-                let lfact = (afact * afact).mul_add(-afact, 1.);
-                let gm = -betap * vgdt * (1. + denom) * invdenom * invdenom * lfact;
-                Channel {
-                    current: -betap * vgdt * vgdt * invdenom * lfact,
-                    gm,
-                    gds: (beta * vgdt * vgdt * invdenom)
-                        .mul_add(lfact.mul_add(lambda, alpha * afact * afact * prod), -gm),
-                }
-            }
+            let fraction = alpha * drain / 3.;
+            let complement = 1. - fraction;
+            // 1-(1-fraction)^3, without cancellation at tiny drain bias.
+            (
+                fraction * complement.mul_add(complement, 1. + complement),
+                alpha * complement * complement,
+            )
+        };
+        let intrinsic = overdrive * overdrive * invdenom;
+        let current = betap * intrinsic * lfact;
+        let gm = betap * overdrive * (1. + denom) * invdenom * invdenom * lfact;
+        let gds = beta * intrinsic * dl_drain.mul_add(prod, lambda * lfact);
+        Channel {
+            current: direction * current,
+            gm: direction * gm,
+            gds: if direction < 0. { gds + gm } else { gds },
         }
     }
 
@@ -1160,6 +1118,18 @@ mod tests {
                     assert!((gds - c.gds).abs() <= 1e-6 * scale, "{b} {vgs} {vds}: gds");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tiny_drain_bias_keeps_nonzero_channel_current_and_linear_slope() {
+        let (model, op) = device(0.3, 0.);
+        // Vgs=0 makes Vgd=-Vds independently representable even for a
+        // drain voltage far below one ULP of the gate overdrive.
+        let slope = model.channel(&op, 0., 0.).gds;
+        for drain in [1e-30, 1e-20] {
+            let current = model.channel(&op, 0., -drain).current;
+            assert!((current - slope * drain).abs() <= 8. * Real::EPSILON * current.abs());
         }
     }
 

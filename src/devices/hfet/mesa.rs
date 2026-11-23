@@ -42,7 +42,8 @@ use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step,
 use super::{NodeSetup, TemperatureCache, given_celsius, physical_temperature, stamp_reset};
 use crate::devices::hfet::{Instance, Model};
 use crate::devices::initial::InstanceInitial;
-use crate::devices::jfet::{BOLTZMANN, CHARGE};
+use crate::devices::jfet::{self, BOLTZMANN, CHARGE};
+use crate::devices::nonlinear::unaliased_conductance;
 use crate::devices::sensitivity::{
     AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
     SensitivityMode, SensitivityParameter, SensitivityRecord,
@@ -200,20 +201,14 @@ struct Nodes {
 }
 
 impl Nodes {
-    /// The five resistive edges are absent when both ends are the same
-    /// circuit unknown. In sensitivity replay a zero-valued resistance may
-    /// acquire a large conductance without changing the prepared topology:
-    /// exclude it before grouping any diagonal terms, not after rounding.
+    /// Series conductances restricted to distinct electrical nodes.
     fn series(self, derived: &Derived) -> [Real; 5] {
-        let edge = |a, b, conductance| {
-            if a == b { 0. } else { conductance }
-        };
         [
-            edge(self.d, self.dp, derived.gdpr),
-            edge(self.s, self.sp, derived.gspr),
-            edge(self.g, self.gp, derived.ggate),
-            edge(self.sp, self.spp, derived.tgi),
-            edge(self.dp, self.dpp, derived.tgf),
+            unaliased_conductance(self.d, self.dp, derived.gdpr),
+            unaliased_conductance(self.s, self.sp, derived.gspr),
+            unaliased_conductance(self.g, self.gp, derived.ggate),
+            unaliased_conductance(self.sp, self.spp, derived.tgi),
+            unaliased_conductance(self.dp, self.dpp, derived.tgf),
         ]
     }
 }
@@ -547,12 +542,10 @@ impl Mesa {
     ) -> (Real, Real) {
         let arg = -v * self.model.del / vt;
         let earg = arg.exp();
-        let ev = (v / vte).exp();
-        let conductance = (derived.ggrwl * earg).mul_add(1. - arg, csat * ev / vte) + gmin;
-        let current = gmin.mul_add(
-            v,
-            (derived.ggrwl * v).mul_add(earg, csat * (v / vte).exp_m1()),
-        );
+        let (diode_current, diode_conductance) =
+            crate::devices::nonlinear::exponential_junction(v, vte, csat);
+        let conductance = (derived.ggrwl * earg).mul_add(1. - arg, diode_conductance) + gmin;
+        let current = gmin.mul_add(v, (derived.ggrwl * v).mul_add(earg, diode_current));
         (current, conductance)
     }
 
@@ -597,12 +590,12 @@ impl Mesa {
         let etavth = derived.teta * vt;
         let rt = derived.trsi + derived.trdi;
         let vgt0 = vgs - von;
-        let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-        let sigma = model.sigma0 / (1. + s);
+        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
+        let sigma = model.sigma0 * rolloff;
         let vgt = sigma.mul_add(vds, vgt0);
         let t = vgt / vt - 1.;
-        let q = t.mul_add(t, derived.delta_sqr).sqrt();
-        let vgte = 0.5 * vt * (2. + t + q);
+        let smoothed = jfet::smoothed_extrema(t, 0., derived.delta_sqr.sqrt());
+        let vgte = vt * (1. + smoothed.high);
         let a = 2. * model.beta * vgte;
         // `mesa2` selects the donor density by where `vgte` sits relative to
         // the two threshold terms.
@@ -665,7 +658,7 @@ impl Mesa {
         let c = vsate / 2.0f64.mul_add(vsate, -vdse);
         let c = c * c;
         let capgd = (2. / 3. * cgc).mul_add(1. - c, derived.cf);
-        let delvgtevgt = Real::midpoint(1., t / q);
+        let delvgtevgt = smoothed.high_weights[0];
         let delidvds0 = gch / h;
         let delidvds1 = if vds == 0. {
             0.
@@ -688,7 +681,7 @@ impl Mesa {
         let delisatisatb = isata * isata / r;
         let delisatbvgt = isatb / etavth;
         let delvsategch = -vsate / gch;
-        let delvgtvgs = 1. - model.sigma0 * vds * s / model.vsigma / (1. + s) / (1. + s);
+        let delvgtvgs = (vds * model.sigma0 / model.vsigma).mul_add(-rolloff_slope, 1.);
         let p = delgchgchi * delgchins * delnsvgt;
         let delvsatevgt = delvsategch.mul_add(
             p,
@@ -722,12 +715,12 @@ impl Mesa {
         let vl = model.vs / derived.tmu * self.instance.l;
         let rt = derived.trsi + derived.trdi;
         let vgt0 = vgs - von;
-        let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-        let sigma = model.sigma0 / (1. + s);
+        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
+        let sigma = model.sigma0 * rolloff;
         let vgt = sigma.mul_add(vds, vgt0);
         let u = 0.5 * vgt / vt - 1.;
-        let t = u.mul_add(u, derived.delta_sqr).sqrt();
-        let vgte = vt * (2. + u + t);
+        let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
+        let vgte = (2. * vt) * (1. + smoothed.high);
         let (nsm, delnsmvgt) = super::soft_density(derived.n0, vgt, etavth);
         if nsm < N_MIN {
             return Ok((0., 0., 0., derived.cf, derived.cf));
@@ -763,19 +756,18 @@ impl Mesa {
         let a = a * a;
         let capgd = (third * cgc).mul_add(1. - a, derived.cf);
         let delidvsate = cdrain * d / vsate / (1. + d);
-        let delidvds = gch * (2. * lambda).mul_add(vds, 1.) / e
-            - cdrain * (vds / vsate).powf(model.m - 1.) / (vsate * (1. + d));
+        let delidvds = gch / e * lambda.mul_add(vds, lambda.mul_add(vds, 1.) / (1. + d));
         let a = gchi.mul_add(rt, 1.);
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
         let delnsnsm = ns / nsm / (1. + c);
-        let delvgtevgt = Real::midpoint(1., u / t);
+        let delvgtevgt = smoothed.high_weights[0];
         let delvsateisat = 1. / gch;
         let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
         let delvsategch = -vsate / gch;
         let delisatmgchim = vgte * (gchim * derived.trsi).mul_add(-(1. + 1. / h), p) / (p * p);
-        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * s / ((1. + s) * (1. + s));
+        let delvgtvgs = (vds * model.sigma0 / model.vsigma).mul_add(-rolloff_slope, 1.);
         let p = delgchgchi * delgchins * delnsnsm * delnsmvgt;
         let delvsatevgt = delvsategch.mul_add(
             p,
@@ -809,15 +801,15 @@ impl Mesa {
         let etavth = eta * vt;
         let rt = derived.trsi + derived.trdi;
         let vgt0 = vgs - von;
-        let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-        let sigma = model.sigma0 / (1. + s);
+        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
+        let sigma = model.sigma0 * rolloff;
         let vgt = sigma.mul_add(vds, vgt0);
         let mu = model.theta.mul_add(vgt, derived.tmu);
         let vl = model.vs / mu * self.instance.l;
         let beta = derived.beta / 3.0f64.mul_add(vl, derived.vpo);
         let u = vgt / vt - 1.;
-        let t = u.mul_add(u, derived.delta_sqr).sqrt();
-        let vgte = 0.5 * vt * (2. + u + t);
+        let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
+        let vgte = vt * (1. + smoothed.high);
         let a = 2. * beta * vgte;
         let b = (-vgt / etavth).exp();
         let sqrt1 = if vgte > derived.vpo {
@@ -871,7 +863,7 @@ impl Mesa {
         } else {
             0.5 * ns * ns / (derived.vpo * model.nd * model.d * sqrt1 * q * q)
         };
-        let delvgtevgt = Real::midpoint(1., u / t);
+        let delvgtevgt = smoothed.high_weights[0];
         let delidvds0 = gch / h;
         let delidvds1 = if vds == 0. {
             0.
@@ -891,7 +883,7 @@ impl Mesa {
         let delisatabeta = 2. * vgte * vgte * (a * e * derived.trsi).mul_add(-v, d * e) / temp;
         let delisatisatb = isata * isata / r;
         let delvsategch = -vsate / gch;
-        let dvgtvgs = 1. - model.sigma0 * vds * s / model.vsigma / ((1. + s) * (1. + s));
+        let dvgtvgs = (vds * model.sigma0 / model.vsigma).mul_add(-rolloff_slope, 1.);
         let temp = derived.gchi0 * ns * model.theta;
         let dgchivgt = delgchins.mul_add(f64::mul_add(delnsvgte, delvgtevgt, delnsvgt), temp);
         let dvgtevds = delvgtevgt * sigma;

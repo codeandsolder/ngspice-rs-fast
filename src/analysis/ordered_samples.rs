@@ -84,10 +84,6 @@ impl<'a> OrderedAxis<'a> {
         self.values.len()
     }
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
     pub(super) fn lower_bound(&self, x: Real) -> usize {
         self.values.partition_point(|t| *t < x)
     }

@@ -34,7 +34,7 @@ use std::sync::Arc;
 /// another analysis can never be honoured against this plot and is an explicit
 /// [`SpiceError::Unsupported`] rather than a silently dropped request. A
 /// multi-analysis deck routes each `.print` card to the plots of its own type
-/// first ([`crate::analysis::batch::resolve_outputs`]).
+/// first ([`crate::analysis::batch::OutputRoutes`]).
 ///
 /// Order is C's `dbs` order: every `.save` request in card order, then every
 /// applicable `.print` request in card order. Duplicates stay visible here;
@@ -399,19 +399,24 @@ impl Selection {
         })
     }
 
-    /// Renders the written vectors of `plot` as text, for the CLI's report.
-    ///
-    /// One line per point, preceded by the header naming the written vectors and
-    /// by the convention the values use: they are spelled exactly as the ASCII
-    /// rawfile spells them, so `re,im` in a complex plot.
+    /// Renders selected vectors using the same row formatter as the batch sink.
     ///
     /// # Errors
-    ///
     /// The same [`SpiceError::Numerical`] as [`Selection::apply`].
     pub fn to_text(&self, plot: &Plot) -> SpiceResult<String> {
+        self.check_schema(plot)?;
+        let mut out = self.text_header();
+        let mut row_text = String::new();
+        for (index, point) in plot.rows().enumerate() {
+            self.text_row(index, point, &mut row_text)?;
+            out.push_str(&row_text);
+        }
+        Ok(out)
+    }
+
+    pub(super) fn text_header(&self) -> String {
         use std::fmt::Write as _;
 
-        self.check_schema(plot)?;
         let mut out = String::new();
         let names = self.variable_names();
         let _ = writeln!(
@@ -427,33 +432,45 @@ impl Selection {
         let _ = writeln!(
             out,
             "values: {}; computed from the plot, not the rawfile's own spelling",
-            if plot.flags().is_complex() {
-                "complex as `re,im` with 15 fractional digits, except that a component which is \
-                 real for every point prints as one number (C's print behaviour; the rawfile \
-                 spells that column `re,0.0`); vm is |v|, vp is the phase in radians in \
+            if self.schema.flags().is_complex() {
+                "complex as `re,im` with 15 fractional digits, except that a component which is \\
+                 real for every point prints as one number (C's print behaviour; the rawfile \\
+                 spells that column `re,0.0`); vm is |v|, vp is the phase in radians in \\
                  (-pi, pi], vr/vi are the real and imaginary parts, vdb is 20*log10|v|"
             } else {
                 "real with 15 fractional digits"
             }
         );
-        if names.is_empty() {
-            return Ok(out);
+        if !names.is_empty() {
+            let _ = writeln!(out, "{:>7}  {}", "point", names.join("  "));
         }
-        let _ = writeln!(out, "{:>7}  {}", "point", names.join("  "));
-        for (index, point) in plot.rows().enumerate() {
-            let _ = write!(out, "{index:>7}");
-            for column in &self.columns {
-                let value = column.value(point)?;
-                out.push_str("  ");
-                out.push_str(&crate::primitives::format_spice_number(value.re));
-                if plot.flags() == PlotFlags::Complex && !column.is_real {
-                    out.push(',');
-                    out.push_str(&crate::primitives::format_spice_number(value.im));
-                }
+        out
+    }
+
+    pub(super) fn text_row(
+        &self,
+        index: usize,
+        point: &[Complex],
+        out: &mut String,
+    ) -> SpiceResult<()> {
+        use std::fmt::Write as _;
+        self.check_width(point)?;
+        out.clear();
+        if self.columns.is_empty() {
+            return Ok(());
+        }
+        let _ = write!(out, "{index:>7}");
+        for column in &self.columns {
+            let value = column.value(point)?;
+            out.push_str("  ");
+            out.push_str(&crate::primitives::format_spice_number(value.re));
+            if self.schema.flags() == PlotFlags::Complex && !column.is_real {
+                out.push(',');
+                out.push_str(&crate::primitives::format_spice_number(value.im));
             }
-            out.push('\n');
         }
-        Ok(out)
+        out.push('\n');
+        Ok(())
     }
 }
 

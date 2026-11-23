@@ -50,13 +50,6 @@
 //!   the model records in `sens`; invalid perturbations fail explicitly rather
 //!   than continuing with stale temperature fields as C does.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
-
 mod sens;
 
 use crate::devices::ModelContext;
@@ -189,7 +182,7 @@ pub(super) struct Params {
 impl Level2 {
     /// Effective channel length `L - 2 LD`.
     fn length(&self, geometry: &Geometry) -> Real {
-        geometry.l - 2. * self.common.ld
+        2.0f64.mul_add(-self.common.ld, geometry.l)
     }
 
     fn process(&self, tnom: Real) -> SpiceResult<Process> {
@@ -440,7 +433,7 @@ impl MosLevel for Level2 {
             / p.unscaled_oxide
             * length;
         let eta = 1.0 + factor;
-        let vbin = op.vbi * self.common.pol + factor * phi_min_vbs;
+        let vbin = factor.mul_add(phi_min_vbs, op.vbi * self.common.pol);
         let (gamasd, dgddvb, dgdvds, dgddb2);
         if gamma > 0.0 || p.doped {
             let xwd = xd * barg;
@@ -452,13 +445,13 @@ impl MosLevel for Level2 {
             let (mut args, mut argd, mut argxs, mut argxd) = (0.0, 0.0, 0.0, 0.0);
             if xj > 0.0 {
                 let tmp = 2.0 / xj;
-                argxs = 1.0 + xws * tmp;
-                argxd = 1.0 + xwd * tmp;
+                argxs = xws.mul_add(tmp, 1.0);
+                argxd = xwd.mul_add(tmp, 1.0);
                 args = argxs.sqrt();
                 argd = argxd.sqrt();
-                let tmp = 0.5 * xj / length;
-                argss = tmp * (args - 1.0);
-                argsd = tmp * (argd - 1.0);
+                // Rationalize sqrt(1+x)-1 using the unrounded increment.
+                argss = (xws / length) / (1. + args);
+                argsd = (xwd / length) / (1. + argd);
             }
             gamasd = gamma * (1.0 - argss - argsd);
             let dbxwd = xd * dbrgdb;
@@ -483,7 +476,7 @@ impl MosLevel for Level2 {
             dgdvds = 0.0;
             dgddb2 = 0.0;
         }
-        let mut von = vbin + gamasd * sarg1;
+        let mut von = f64::mul_add(gamasd, sarg1, vbin);
         let mut vdsat = 0.0;
         let off = |von: Real, vdsat: Real, gds: Real| DrainCurrent {
             cdrain: 0.0,
@@ -496,8 +489,8 @@ impl MosLevel for Level2 {
         let (mut xn, mut argg) = (0.0, 0.0);
         if nfs {
             let cfs = CHARGE * self.nfs * 1e4;
-            let cdonco = -(gamasd * dsrgdb + dgddvb * sarg1) + factor;
-            xn = 1.0 + cfs / p.unscaled_oxide * p.width * length + cdonco;
+            let cdonco = -f64::mul_add(dgddvb, sarg1, gamasd * dsrgdb) + factor;
+            xn = (cfs / p.unscaled_oxide * p.width).mul_add(length, 1.0) + cdonco;
             let tmp = vt * xn;
             von += tmp;
             argg = 1.0 / tmp;
@@ -511,15 +504,19 @@ impl MosLevel for Level2 {
         let sbiarg = p.bulk_potential.sqrt();
         let mut gammad = gamasd;
         let mut dgdvbs = dgddvb;
-        let mut body = barg * barg * barg - sarg3;
-        let mut gdbdv = 2.0 * gammad * (barg * barg * dbrgdb - sarg1 * sarg1 * dsrgdb);
-        let mut dodvbs = -factor + dgdvbs * sarg1 + gammad * dsrgdb;
+        let (mut body, body_bias) = body_integral(tphi, lvbs, lvds, sarg1, barg);
+        let mut gdbdv = gammad * body_bias;
+        let mut dodvbs = f64::mul_add(gammad, dsrgdb, f64::mul_add(dgdvbs, sarg1, -factor));
         let (mut dxndvb, mut dxndvd, mut dodvds) = (0.0, 0.0, 0.0);
         if nfs {
-            dxndvb = 2.0 * dgdvbs * dsrgdb + gammad * d2sdb2 + dgddb2 * sarg1;
-            dodvbs += vt * dxndvb;
+            dxndvb = f64::mul_add(
+                dgddb2,
+                sarg1,
+                f64::mul_add(gammad, d2sdb2, 2.0 * dgdvbs * dsrgdb),
+            );
+            dodvbs = vt.mul_add(dxndvb, dodvbs);
             dxndvd = dgdvds * dsrgdb;
-            dodvds = dgdvds * sarg1 + vt * dxndvd;
+            dodvds = vt.mul_add(dxndvd, dgdvds * sarg1);
         }
         // Effective mobility and its derivatives (C `line400`/`line410`).
         let udenom = vgst;
@@ -554,12 +551,15 @@ impl MosLevel for Level2 {
                 dsdvbs = 0.0;
             } else {
                 let arg1 = (1.0 + 4.0 * argv / gammd2).sqrt();
-                vdsat = (vgsx - vbin) / eta + gammd2 * (1.0 - arg1) / 2.0;
+                let increment = (4. * argv / gammd2) / (1. + arg1);
+                vdsat = (vgsx - vbin) / eta - 2. * argv / (1. + arg1);
                 vdsat = c_max(vdsat, 0.0);
-                dsdvgs = (1.0 - 1.0 / arg1) / eta;
-                dsdvbs = (gammad * (1.0 - arg1) + 2.0 * argv / (gammad * arg1)) / eta * dgdvbs
-                    + 1.0 / arg1
-                    + factor * dsdvgs;
+                dsdvgs = increment / arg1 / eta;
+                dsdvbs = factor.mul_add(
+                    dsdvgs,
+                    ((-gammad).mul_add(increment, 2.0 * argv / (gammad * arg1)) / eta)
+                        .mul_add(dgdvbs, 1.0 / arg1),
+                );
             }
         } else {
             vdsat = (vgsx - vbin) / eta;
@@ -577,7 +577,7 @@ impl MosLevel for Level2 {
                 gammad,
                 sarg3,
             }) {
-                vdsat = x * x - phi_min_vbs;
+                vdsat = f64::mul_add(x, x, -phi_min_vbs);
             }
         }
         // Effective channel length and its derivatives.
@@ -596,16 +596,21 @@ impl MosLevel for Level2 {
                 bsarg = sphi / (1.0 + 0.5 * (lvbs - vdsat) / tphi);
                 -0.5 * bsarg * bsarg / sphi3
             };
-            bodys = bsarg * bsarg * bsarg - sarg3;
-            gdbdvs = 2.0 * gammad * (bsarg * bsarg * dbsrdb - sarg1 * sarg1 * dsrgdb);
+            let (integral, bias) = body_integral(tphi, lvbs, vdsat, sarg1, bsarg);
+            bodys = integral;
+            gdbdvs = gammad * bias;
             // C: `if (substrateDoping == 0.0) goto line610; if (xlamda >
             // 0.0) goto line610;` (LAMBDA is finite and nonnegative).
             let derived = p.doped && xlamda <= 0.0;
             if self.vmax <= 0.0 {
                 if derived {
                     let argv = (lvds - vdsat) / 4.0;
-                    let sargv = (1.0 + argv * argv).sqrt();
-                    let arg1 = (argv + sargv).sqrt();
+                    let sargv = argv.mul_add(argv, 1.0).sqrt();
+                    let arg1 = if argv < 0. {
+                        (sargv - argv).sqrt().recip()
+                    } else {
+                        (argv + sargv).sqrt()
+                    };
                     let xlfact = xd / (length * lvds);
                     xlamda = xlfact * arg1;
                     dldsat = Some(lvds * xlamda / (8.0 * sargv));
@@ -614,20 +619,26 @@ impl MosLevel for Level2 {
                 let argv = (vgsx - vbin) / eta - vdsat;
                 let xdv = xd / self.neff.sqrt();
                 let xlv = self.vmax * xdv / (2.0 * ueff);
-                let vqchan = argv - gammad * bsarg;
-                let dqdsat = -1.0 + gammad * dbsrdb;
+                let vqchan = f64::mul_add(gammad, -bsarg, argv);
+                let dqdsat = f64::mul_add(gammad, dbsrdb, -1.0);
                 let vl = self.vmax * length;
-                let dfunds = vl * dqdsat - ueff * vqchan;
-                let dfundg = (vl - ueff * vdsat) / eta;
-                let dfundb = -vl * (1.0 + dqdsat - factor / eta)
-                    + ueff * (gdbdvs - dgdvbs * bodys / 1.5) / eta;
+                let dfunds = f64::mul_add(ueff, -vqchan, vl * dqdsat);
+                let dfundg = f64::mul_add(ueff, -vdsat, vl) / eta;
+                let dfundb = (-vl).mul_add(
+                    1.0 + dqdsat - factor / eta,
+                    ueff * (gdbdvs - dgdvbs * bodys / 1.5) / eta,
+                );
                 dsdvgs = -dfundg / dfunds;
                 dsdvbs = -dfundb / dfunds;
                 if derived {
                     let argv = c_max(lvds - vdsat, 0.0);
-                    let xls = (xlv * xlv + argv).sqrt();
+                    let xls = xlv.mul_add(xlv, argv).sqrt();
                     let xlfact = xdv / (length * lvds);
-                    xlamda = xlfact * (xls - xlv);
+                    xlamda = if xls + xlv == 0. {
+                        0.
+                    } else {
+                        xlfact * (argv / (xls + xlv))
+                    };
                     dldsat = Some(xdv / (2.0 * xls) / length);
                 }
             }
@@ -638,7 +649,7 @@ impl MosLevel for Level2 {
         // Limit channel shortening at punch-through.
         let mut xwb = xd * sbiarg;
         let xld = length - xwb;
-        let mut clfact = 1.0 - xlamda * lvds;
+        let mut clfact = xlamda.mul_add(-lvds, 1.0);
         dldvds = -xlamda - dldvds;
         let mut xleff = length * clfact;
         let deltal = xlamda * lvds * length;
@@ -661,12 +672,12 @@ impl MosLevel for Level2 {
         if lvds <= 1.0e-10 {
             let gds = if lvgs <= von {
                 if nfs {
-                    beta1 * (von - vbin - gammad * sarg1) * (argg * (lvgs - von)).exp()
+                    beta1 * f64::mul_add(gammad, -sarg1, von - vbin) * (argg * (lvgs - von)).exp()
                 } else {
                     0.0
                 }
             } else {
-                beta1 * (lvgs - vbin - gammad * sarg1)
+                beta1 * f64::mul_add(gammad, -sarg1, lvgs - vbin)
             };
             return off(von, vdsat, gds);
         }
@@ -686,22 +697,27 @@ impl MosLevel for Level2 {
                 body = bodys;
                 gdbdv = gdbdvs;
             }
-            let cdson = beta1 * ((von - vbin - eta * vdson * 0.5) * vdson - gammad * body / 1.5);
-            let didvds = beta1 * (von - vbin - eta * vdson - gammad * barg);
+            let cdson = beta1
+                * (eta * vdson)
+                    .mul_add(-0.5, von - vbin)
+                    .mul_add(vdson, -(gammad * body / 1.5));
+            let didvds = beta1 * f64::mul_add(gammad, -barg, eta.mul_add(-vdson, von - vbin));
             let mut gdson = -cdson * dldvds / clfact - beta1 * dgdvds * body / 1.5;
             if lvds < vdsat {
                 gdson += didvds;
             }
-            let mut gbson = -cdson * dldvbs / clfact
-                + beta1 * (dodvbs * vdson + factor * vdson - dgdvbs * body / 1.5 - gdbdv);
+            let mut gbson = beta1.mul_add(
+                factor.mul_add(vdson, dodvbs * vdson) - dgdvbs * body / 1.5 - gdbdv,
+                -cdson * dldvbs / clfact,
+            );
             if lvds > vdsat {
-                gbson += didvds * dsdvbs;
+                gbson = didvds.mul_add(dsdvbs, gbson);
             }
             let expg = (argg * (lvgs - von)).exp();
             let cdrain = cdson * expg;
             let gmw = cdrain * argg;
             let gm = if lvds > vdsat {
-                gmw + didvds * dsdvgs * expg
+                (didvds * dsdvgs).mul_add(expg, gmw)
             } else {
                 gmw
             };
@@ -709,8 +725,8 @@ impl MosLevel for Level2 {
             return DrainCurrent {
                 cdrain,
                 gm,
-                gds: gdson * expg - gm * dodvds - tmp * dxndvd,
-                gmbs: gbson * expg - gm * dodvbs - tmp * dxndvb,
+                gds: tmp.mul_add(-dxndvd, f64::mul_add(gm, -dodvds, gdson * expg)),
+                gmbs: tmp.mul_add(-dxndvb, f64::mul_add(gm, -dodvbs, gbson * expg)),
                 von,
                 vdsat,
             };
@@ -718,26 +734,32 @@ impl MosLevel for Level2 {
         // C `line900`.
         let (cdrain, gm, gds, gmbs) = if lvds <= vdsat {
             // Linear region.
-            let cdrain = beta1 * ((lvgs - vbin - eta * lvds / 2.0) * lvds - gammad * body / 1.5);
+            let cdrain =
+                beta1 * (lvgs - vbin - eta * lvds / 2.0).mul_add(lvds, -(gammad * body / 1.5));
             let arg1 = cdrain * (dudvgs / ufact - dldvgs / clfact);
-            let gm = arg1 + beta1 * lvds;
+            let gm = beta1.mul_add(lvds, arg1);
             let arg1 = cdrain * (dudvds / ufact - dldvds / clfact);
-            let gds =
-                arg1 + beta1 * (lvgs - vbin - eta * lvds - gammad * barg - dgdvds * body / 1.5);
+            let gds = beta1.mul_add(
+                f64::mul_add(gammad, -barg, eta.mul_add(-lvds, lvgs - vbin)) - dgdvds * body / 1.5,
+                arg1,
+            );
             let arg1 = cdrain * (dudvbs / ufact - dldvbs / clfact);
-            let gmbs = arg1 - beta1 * (gdbdv + dgdvbs * body / 1.5 - factor * lvds);
+            let gmbs = beta1.mul_add(-factor.mul_add(-lvds, gdbdv + dgdvbs * body / 1.5), arg1);
             (cdrain, gm, gds, gmbs)
         } else {
             // Saturation region.
-            let cdrain = beta1 * ((lvgs - vbin - eta * vdsat / 2.0) * vdsat - gammad * bodys / 1.5);
+            let cdrain =
+                beta1 * (lvgs - vbin - eta * vdsat / 2.0).mul_add(vdsat, -(gammad * bodys / 1.5));
             let arg1 = cdrain * (dudvgs / ufact - dldvgs / clfact);
-            let gm = arg1
-                + beta1 * vdsat
-                + beta1 * (lvgs - vbin - eta * vdsat - gammad * bsarg) * dsdvgs;
+            let gm = (beta1 * f64::mul_add(gammad, -bsarg, eta.mul_add(-vdsat, lvgs - vbin)))
+                .mul_add(dsdvgs, beta1.mul_add(vdsat, arg1));
             let gds = -cdrain * dldvds / clfact - beta1 * dgdvds * bodys / 1.5;
             let arg1 = cdrain * (dudvbs / ufact - dldvbs / clfact);
-            let gmbs = arg1 - beta1 * (gdbdvs + dgdvbs * bodys / 1.5 - factor * vdsat)
-                + beta1 * (lvgs - vbin - eta * vdsat - gammad * bsarg) * dsdvbs;
+            let gmbs = (beta1 * f64::mul_add(gammad, -bsarg, eta.mul_add(-vdsat, lvgs - vbin)))
+                .mul_add(
+                    dsdvbs,
+                    beta1.mul_add(-factor.mul_add(-vdsat, gdbdvs + dgdvbs * bodys / 1.5), arg1),
+                );
             (cdrain, gm, gds, gmbs)
         };
         DrainCurrent {
@@ -763,6 +785,34 @@ impl MosLevel for Level2 {
             cox_squared: cox * cox,
         })
     }
+}
+
+/// Difference of the source and drain body-root cubes and its bias derivative
+/// scaled by 2/3 (the factor used by the MOS2 current equations).
+///
+/// Rationalize the root difference before multiplying by the polynomial.
+/// In particular, a zero drain increment must give exactly zero even when
+/// the common root and its powers are rounded.
+fn body_integral(phi: Real, vbs: Real, vds: Real, source: Real, drain: Real) -> (Real, Real) {
+    let root = phi.sqrt();
+    let (delta, bias) = if vbs <= 0. {
+        let delta = vds / (source + drain);
+        (delta, -delta)
+    } else if vbs > vds {
+        let delta = source * (drain / root) * (0.5 * vds / phi);
+        let quartic = (source + drain) * (drain.mul_add(drain, source * source));
+        (delta, -(delta / root) * (quartic / phi))
+    } else {
+        let source_delta = source * (0.5 * vbs / phi);
+        let drain_delta = (vds - vbs) / (drain + root);
+        let quartic = (source + root) * source.mul_add(source, phi);
+        (
+            source_delta + drain_delta,
+            (-(source_delta / root)).mul_add(quartic / phi, -drain_delta),
+        )
+    };
+    let polynomial = drain.mul_add(drain, source.mul_add(drain, source * source));
+    (delta * polynomial, bias)
 }
 
 /// C's `MAX(a, b)`: `a > b ? a : b`.
@@ -820,10 +870,14 @@ fn baum_root(inputs: &BaumInputs) -> Option<Real> {
     let a1 = gammad / 0.75;
     let b1 = -2.0 * (v1 + xv);
     let c1 = -2.0 * gammad * xv;
-    let d1 = 2.0 * v1 * (v2 + xv) - v2 * v2 - 4.0 / 3.0 * gammad * sarg3;
+    let d1 = f64::mul_add(
+        4.0 / 3.0 * gammad,
+        -sarg3,
+        f64::mul_add(v2, -v2, 2.0 * v1 * (v2 + xv)),
+    );
     let a = -b1;
-    let b = a1 * c1 - 4.0 * d1;
-    let c = -d1 * (a1 * a1 - 4.0 * b1) - c1 * c1;
+    let b = 4.0f64.mul_add(-d1, a1 * c1);
+    let c = f64::mul_add(c1, -c1, -d1 * 4.0f64.mul_add(-b1, a1 * a1));
     let r = -a * a / 3.0 + b;
     let s = 2.0 * a * a * a / 27.0 - a * b / 3.0 + c;
     let r3 = r * r * r;
@@ -833,14 +887,14 @@ fn baum_root(inputs: &BaumInputs) -> Option<Real> {
     let p2 = p0.sqrt();
     let y3 = if p < 0.0 {
         let ro = (s2 / 4.0 + p0).sqrt();
-        let ro = (ro.ln() / 3.0).exp();
+        let ro = ro.cbrt();
         let fi = (-2.0 * p2 / s).atan();
-        2.0 * ro * (fi / 3.0).cos() - a / 3.0
+        f64::mul_add(2.0 * ro, (fi / 3.0).cos(), -(a / 3.0))
     } else {
         let p3 = -s / 2.0 + p2;
-        let p3 = (p3.abs().ln() / 3.0).exp();
+        let p3 = p3.abs().cbrt();
         let p4 = -s / 2.0 - p2;
-        let p4 = (p4.abs().ln() / 3.0).exp();
+        let p4 = p4.abs().cbrt();
         p3 + p4 - a / 3.0
     };
     let a3 = rounded_sqrt(a1 * a1 / 4.0 - b1 + y3, a1 * a1 / 4.0 + b1.abs() + y3.abs());
@@ -848,8 +902,8 @@ fn baum_root(inputs: &BaumInputs) -> Option<Real> {
     let mut x4 = [0.0; 8];
     let mut iknt = 0;
     for i in 0..4 {
-        let a4 = a1 / 2.0 + SIG1[i] * a3;
-        let b4 = y3 / 2.0 + SIG2[i] * b3;
+        let a4 = SIG1[i].mul_add(a3, a1 / 2.0);
+        let b4 = SIG2[i].mul_add(b3, y3 / 2.0);
         let delta4 = a4 * a4 / 4.0 - b4;
         if delta4 < 0.0 {
             continue;
@@ -864,8 +918,7 @@ fn baum_root(inputs: &BaumInputs) -> Option<Real> {
         if x <= 0.0 {
             continue;
         }
-        let poly = x * x * x * x + a1 * x * x * x;
-        let poly = poly + b1 * x * x + c1 * x + d1;
+        let poly = (x + a1).mul_add(x, b1).mul_add(x, c1).mul_add(x, d1);
         if poly.abs() > 1.0e-6 {
             continue;
         }
@@ -1151,6 +1204,33 @@ mod tests {
     /// Below the threshold without NFS (`vbin < vgs <= von`) C runs the
     /// saturation formulas at `vdsat = 0`: no current, but a negative `gm`
     /// from the unclamped `dsdvgs`, which the port keeps.
+    #[test]
+    fn body_integral_retains_tiny_drain_increment_and_exact_zero() {
+        let phi: Real = 0.7;
+        let root = |bias: Real| {
+            if bias <= 0. {
+                (phi - bias).sqrt()
+            } else {
+                phi.sqrt() / (1. + 0.5 * bias / phi)
+            }
+        };
+        for vbs in [-0.3, 0., 0.2] {
+            let source = root(vbs);
+            assert_eq!(body_integral(phi, vbs, 0., source, source), (0., 0.));
+            let (tiny, bias) = body_integral(phi, vbs, 1e-20, source, source);
+            assert!(tiny > 0. && bias < 0.);
+            for vds in [0.01, 0.2, 0.4] {
+                let drain = root(vbs - vds);
+                let (actual, derivative) = body_integral(phi, vbs, vds, source, drain);
+                assert!((actual - (drain.powi(3) - source.powi(3))).abs() < 2e-15);
+                let h = 1e-6;
+                let integral = |v: Real| root(v - vds).powi(3) - root(v).powi(3);
+                let numerical = (integral(vbs + h) - integral(vbs - h)) / (3. * h);
+                assert!((derivative - numerical).abs() < 2e-6);
+            }
+        }
+    }
+
     #[test]
     fn subthreshold_without_nfs_keeps_cs_negative_transconductance() {
         let l = level(0., 0., false, 0.);

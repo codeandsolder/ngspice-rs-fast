@@ -664,7 +664,7 @@ impl Hfet1 {
                 (is1 * (v / vt1).exp_m1(), iseff * (v / vteff).exp_m1())
             };
             let iaprox = if iaprox1 * iaprox2 == 0. {
-                Real::midpoint(iaprox1, iaprox2)
+                f64::midpoint(iaprox1, iaprox2)
             } else {
                 1. / (1. / iaprox1 + 1. / iaprox2)
             };
@@ -702,12 +702,12 @@ impl Hfet1 {
         let vl = model.vs / derived.tmu * self.instance.l;
         let rt = model.rsi + model.rdi;
         let vgt0 = vgs - derived.tvto;
-        let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-        let sigma = model.sigma0 / (1. + s);
+        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
+        let sigma = model.sigma0 * rolloff;
         let vgt = sigma.mul_add(vds, vgt0);
         let u = 0.5 * vgt / vt - 1.;
-        let t = u.mul_add(u, derived.delta_sqr).sqrt();
-        let vgte = vt * (2. + u + t);
+        let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
+        let vgte = (2. * vt) * (1. + smoothed.high);
         let (nsn, slope) = super::soft_density(derived.n0, vgt, etavth);
         let (nsm, delnsmvgt) = if derived.two_exponentials {
             let thermal = model.eta2 * vt;
@@ -748,19 +748,21 @@ impl Hfet1 {
         let delidgch = vds * derived.tlambda.mul_add(vds, 1.) / e;
         let cdrain = gch * delidgch;
         let delidvsate = cdrain * d / vsate / (1. + d);
-        let delidvds = gch * (2. * derived.tlambda).mul_add(vds, 1.) / e
-            - cdrain * (vds / vsate).powf(model.m - 1.) / (vsate * (1. + d));
+        let delidvds = gch / e
+            * derived
+                .tlambda
+                .mul_add(vds, derived.tlambda.mul_add(vds, 1.) / (1. + d));
         let a = gchi.mul_add(rt, 1.);
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
         let delnsnsm = ns / nsm / (1. + c);
-        let delvgtevgt = Real::midpoint(1., u / t);
+        let delvgtevgt = smoothed.high_weights[0];
         let delvsateisat = 1. / gch;
         let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
         let delvsategch = -vsate / gch;
         let delisatmgchim = vgte * (gchim * model.rsi).mul_add(-(1. + 1. / h), p) / (p * p);
-        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * s / ((1. + s) * (1. + s));
+        let delvgtvgs = (vds * model.sigma0 / model.vsigma).mul_add(-rolloff_slope, 1.);
         let p = delgchgchi * delgchins * delnsnsm * delnsmvgt;
         let delvsatevgt = delvsategch.mul_add(
             p,
@@ -811,7 +813,7 @@ impl Hfet1 {
             let b = (1. + a).powf(1. / model.mv1);
             let vdse = vds / b;
             let delvdsevmax = vdse * a / ((1. + a) * vmax);
-            let delvdsevds = (1. - a / (1. + a)) / b;
+            let delvdsevds = 1. / ((1. + a) * b);
             let dvdsevgs = delvdsevmax * model.cm3 * delvsatevgt * delvgtvgs;
             let dvdsevds = (delvdsevmax * model.cm3 * delvsatevgt).mul_add(sigma, delvdsevds);
             let c = vgte * vdse;
@@ -934,7 +936,7 @@ impl Hfet1 {
         let deltdvdse = model.talpha * vdse * (2. - c / (1. + c)) / d;
         let deltdvkneet = (td - temp) * c / ((1. + c) * vkneet);
         let delvdsevmax = vdse * a / ((1. + a) * vmax);
-        let delvdsevds = (1. - a / (1. + a)) / b;
+        let delvdsevds = 1. / ((1. + a) * b);
         let temp2 = delvsatevgt * delvgtvgs;
         let dvdsevgs = delvdsevmax * model.cm1 * temp2;
         let dtdvgs = (deltdvkneet * model.ck1).mul_add(temp2, deltdvdse * dvdsevgs);
@@ -950,9 +952,9 @@ impl Hfet1 {
             let ggs = -csat / vgs + gmin;
             (ggs * vgs, ggs)
         } else {
-            let evgs = (vgs / vtn).exp();
-            let ggs = csat * evgs / vtn + gmin;
-            (gmin.mul_add(vgs, csat * (vgs / vtn).exp_m1()), ggs)
+            let (current, conductance) =
+                crate::devices::nonlinear::exponential_junction(vgs, vtn, csat);
+            (gmin.mul_add(vgs, current), conductance + gmin)
         };
         Channel {
             cdrain: 0.,

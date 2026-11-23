@@ -58,6 +58,13 @@ mod transaction;
 
 use transaction::OwnedTemporary;
 pub use transaction::RawFileTransaction;
+/// One transaction-owned report spool, with byte ranges for consecutive plots.
+/// Text is not published until simulation and rawfile publication succeed.
+#[derive(Debug)]
+pub(crate) struct TextSpool {
+    file: BufWriter<File>,
+    temporary: OwnedTemporary,
+}
 
 use std::fmt;
 use std::fs::File;

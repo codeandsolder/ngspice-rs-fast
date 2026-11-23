@@ -109,6 +109,14 @@ fn series_density(first: Real, slope: Real, second: Real, thermal: Real) -> (Rea
     (density, derivative)
 }
 
+/// Logistic roll-off and its derivative magnitude, retaining both tails.
+fn rolloff(x: Real) -> (Real, Real) {
+    let exp = (-x.abs()).exp();
+    let low = exp / (1. + exp);
+    let high = 1. / (1. + exp);
+    (if x > 0. { low } else { high }, low * high)
+}
+
 /// Staged node setup common to the three MESA/HFET levels.
 /// The caller commits the transaction only after temperature derivation succeeds.
 struct NodeSetup<'a, 'table> {
@@ -876,6 +884,15 @@ mod tests {
             time("legacy density", &old);
             time("conditioned density", &new);
         }
+    }
+
+    #[test]
+    fn logistic_rolloff_preserves_weak_tails() {
+        let (value, slope) = super::rolloff(500.);
+        assert!(value > 0. && slope > 0.);
+        assert!(super::rolloff(1000.).1.is_finite());
+        let (value, slope) = super::rolloff(-500.);
+        assert!(value > 0. && value <= 1. && slope > 0.);
     }
 
     #[test]

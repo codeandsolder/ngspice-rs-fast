@@ -440,7 +440,7 @@ duplicate names), and scalar/deferred expressions share the existing expression
 node budget. Independent analyses do not share published values. Results are
 returned in source order; undefined/forward scalar references, domain errors and nonfinite results
 fail the run before publication. Library callers use `measure::resolve_with_scope`
-using the scheduled `batch::plan_outputs` and scoped `batch::resolve_outputs` for retained plots.
+for retained plots. The ordinary batch CLI uses the same schema-bound objective reducers as optimization scenarios; only nonlocal operands retain selected history.
 The local C input preprocessor mishandles `EXPR` with a user function and a
 measurement-result argument; the live C regression uses its `PARAM` spelling.
 Numeric setters AT/VAL/TD/FROM/TO and crossing counts accept braced or

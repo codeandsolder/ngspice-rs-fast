@@ -148,7 +148,7 @@ pub struct FourierAnalysis {
 /// * [`crate::primitives::SpiceError::Unsupported`], positioned at the card, for a card that names
 ///   another analysis than `kind` (C selects the `tran` plot; a multi-analysis
 ///   deck routes `.four` to its last `.tran` plot through
-///   [`crate::analysis::batch::resolve_outputs`]), for every condition listed in the module's
+///   [`crate::analysis::batch::OutputRoutes`]), for every condition listed in the module's
 ///   failure policy, and for a harmonic count outside this port's work budget;
 /// * [`crate::primitives::SpiceError::Numerical`] for a non-finite axis, operand or result value,
 ///   or a zero fundamental amplitude;

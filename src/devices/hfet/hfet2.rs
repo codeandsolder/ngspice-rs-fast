@@ -53,7 +53,7 @@ use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step}
 use super::{CELSIUS_TO_KELVIN, HfetInstance as Instance};
 use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
 use crate::devices::initial::InstanceInitial;
-use crate::devices::jfet::{BOLTZMANN, CHARGE, p};
+use crate::devices::jfet::{self, BOLTZMANN, CHARGE, p};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
@@ -460,12 +460,12 @@ impl Hfet2 {
         let vl = model.vs / derived.tmu * self.instance.l;
         let rt = model.rsi + model.rdi;
         let vgt0 = vgs - derived.tvto;
-        let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-        let sigma = model.sigma0 / (1. + s);
+        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
+        let sigma = model.sigma0 * rolloff;
         let vgt = sigma.mul_add(vds, vgt0);
         let u = 0.5 * vgt / vt - 1.;
-        let t = u.mul_add(u, derived.delta_sqr).sqrt();
-        let vgte = vt * (2. + u + t);
+        let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
+        let vgte = (2. * vt) * (1. + smoothed.high);
         let (nsn, slope) = super::soft_density(derived.n0, vgt, etavth);
         let (nsm, delnsmvgt) = if derived.two_exponentials {
             let thermal = model.eta2 * vt;
@@ -500,19 +500,21 @@ impl Hfet2 {
         let delidgch = vds * derived.tlambda.mul_add(vds, 1.) / e;
         let cdrain = gch * delidgch;
         let delidvsate = cdrain * d / vsate / (1. + d);
-        let delidvds = gch * (2. * derived.tlambda).mul_add(vds, 1.) / e
-            - cdrain * (vds / vsate).powf(model.m - 1.) / (vsate * (1. + d));
+        let delidvds = gch / e
+            * derived
+                .tlambda
+                .mul_add(vds, derived.tlambda.mul_add(vds, 1.) / (1. + d));
         let a = gchi.mul_add(rt, 1.);
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
         let delnsnsm = ns / nsm / (1. + c);
-        let delvgtevgt = Real::midpoint(1., u / t);
+        let delvgtevgt = smoothed.high_weights[0];
         let delvsateisat = 1. / gch;
         let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
         let delvsategch = -vsate / gch;
         let delisatmgchim = vgte * (gchim * model.rsi).mul_add(-(1. + 1. / h), p) / (p * p);
-        let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * s / ((1. + s) * (1. + s));
+        let delvgtvgs = (vds * model.sigma0 / model.vsigma).mul_add(-rolloff_slope, 1.);
         let p = delgchgchi * delgchins * delnsnsm * delnsmvgt;
         let delvsatevgt = delvsategch.mul_add(
             p,
@@ -617,14 +619,16 @@ impl Hfet2 {
         let vtn = model.n * vt;
         let arg = -vgs * model.del / vt;
         let earg = arg.exp();
-        let expe = (vgs / vtn).exp();
-        let ggs = (derived.ggrlw * earg).mul_add(1. - arg, derived.jslw * expe / vtn);
-        let mut cg = (derived.ggrlw * vgs).mul_add(earg, derived.jslw * (vgs / vtn).exp_m1());
+        let (current, conductance) =
+            crate::devices::nonlinear::exponential_junction(vgs, vtn, derived.jslw);
+        let ggs = (derived.ggrlw * earg).mul_add(1. - arg, conductance);
+        let mut cg = (derived.ggrlw * vgs).mul_add(earg, current);
         let arg = -vgd * model.del / vt;
         let earg = arg.exp();
-        let expe = (vgd / vtn).exp();
-        let ggd = (derived.ggrlw * earg).mul_add(1. - arg, derived.jslw * expe / vtn);
-        let cgd = (derived.ggrlw * vgd).mul_add(earg, derived.jslw * (vgd / vtn).exp_m1());
+        let (current, conductance) =
+            crate::devices::nonlinear::exponential_junction(vgd, vtn, derived.jslw);
+        let ggd = (derived.ggrlw * earg).mul_add(1. - arg, conductance);
+        let cgd = (derived.ggrlw * vgd).mul_add(earg, current);
         cg += cgd;
         let mut vds = vgs - vgd;
         let inverse = vds < 0.;

@@ -317,38 +317,33 @@ fn qgg(
 ) -> (Real, Real, Real) {
     let vds = vgs - vgd;
     let d1_xc = 1. - xc;
-    let vert = vds.mul_add(vds, alpha).sqrt();
-    let veff = gamma.mul_add(vds, 0.5_f64.mul_add(vert, Real::midpoint(vgs, vgd)));
+    let gate = jfet::smoothed_extrema(vgs, vgd, alpha.sqrt());
+    let veff = gamma.mul_add(vds, gate.high);
     let vnr = d1_xc * (veff - vto);
-    let vnrt = vnr.mul_add(vnr, 0.04).sqrt();
-    let vnew = 0.5f64.mul_add(vnrt - vnr, veff);
-    let (ext, qrt, cgso_eff, charge_voltage);
-    if vnew < vmax {
-        ext = 0.;
-        qrt = (1. - vnew / pb).sqrt();
-        charge_voltage = vnew;
-        cgso_eff = 0.5 * cgso / qrt * (1. + xc + d1_xc * vnr / vnrt);
+    let threshold = jfet::smoothed_extrema(vnr, 0., 0.2);
+    let vnew = if vnr < 0. {
+        xc.mul_add(veff, d1_xc * vto) + threshold.high
+    } else {
+        veff - threshold.low
+    };
+    let derivative = d1_xc.mul_add(threshold.high_weights[0], xc);
+    let voltage = vnew.min(vmax);
+    let qrt = (1. - voltage / pb).sqrt();
+    let (ext, cgso_eff) = if vnew < vmax {
+        (0., cgso * derivative / qrt)
     } else {
         let vx = 0.5 * (vnew - vmax);
         let par = 1. + vx / (pb - vmax);
-        qrt = (1. - vmax / pb).sqrt();
-        charge_voltage = vmax;
-        ext = vx * (1. + par) / qrt;
-        cgso_eff = 0.5 * cgso / qrt * (1. + xc + d1_xc * vnr / vnrt) * par;
-    }
-    let cpm = vds / vert;
-    let cplus = Real::midpoint(1., cpm);
-    let cminus = cplus - cpm;
-    let cgs = cgdo.mul_add(cminus + gamma, cgso_eff * (cplus + gamma));
-    let cgd = cgdo.mul_add(cplus - gamma, cgso_eff * (cminus - gamma));
-    (
-        cgso.mul_add(
-            jfet::depletion_voltage(charge_voltage, qrt) + ext,
-            cgdo * (veff - vert),
-        ),
-        cgs,
-        cgd,
-    )
+        (vx * (1. + par) / qrt, cgso * derivative / qrt * par)
+    };
+    let [cplus, cminus] = gate.high_weights;
+    let cgs = cgso_eff.mul_add(cplus + gamma, cgdo * (cminus + gamma));
+    let cgd = cgso_eff.mul_add(cminus - gamma, cgdo * (cplus - gamma));
+    let charge = cgso.mul_add(
+        voltage / 1_f64.midpoint(qrt) + ext,
+        cgdo * gamma.mul_add(vds, gate.low),
+    );
+    (charge, cgs, cgd)
 }
 
 /// One forward gate diode of `PSids` (`isat`, `N Vt`, `gmin`): current and
@@ -357,8 +352,9 @@ fn forward_diode(v: Real, isat: Real, nvt: Real, gmin: Real) -> (Real, Real) {
     let arg = v / nvt;
     if arg > FX {
         if arg < MX {
-            let zz = isat * arg.exp();
-            (isat.mul_add(arg.exp_m1(), gmin * v), zz / nvt + gmin)
+            let (current, conductance) =
+                crate::devices::nonlinear::exponential_junction_at_argument(arg, nvt, isat);
+            (gmin.mul_add(v, current), conductance + gmin)
         } else {
             let zz = isat * EMX;
             (
@@ -376,13 +372,14 @@ fn breakdown((mut i, mut g): (Real, Real), v: Real, ibd: Real, vbd: Real) -> (Re
     let arg = -v / vbd;
     if arg > FX {
         if arg < MX {
-            let zz = ibd * arg.exp();
-            g += zz / vbd;
-            i = (-ibd).mul_add(arg.exp_m1(), i);
+            let (current, conductance) =
+                crate::devices::nonlinear::exponential_junction_at_argument(arg, vbd, ibd);
+            g += conductance;
+            i -= current;
         } else {
             let zz = ibd * EMX;
             g += zz / vbd;
-            i -= zz.mul_add((arg - MX) + 1., -ibd);
+            i -= zz.mul_add(arg - MX + 1., -ibd);
         }
     } else {
         i += ibd;
@@ -459,16 +456,19 @@ impl Model {
             let mvst = self.mvst;
             let vst = self.vst * mvst.mul_add(vdst, 1.);
             if vgst > FX * vst {
-                let (vgt, subfac);
+                let (vgt, subfac, derivative);
                 let large = MX * vst;
                 if vgst > large {
                     // Numerically large.
                     subfac = EMX + 1.;
-                    vgt = (EMX / subfac).mul_add(vgst - large, large);
+                    derivative = EMX / subfac;
+                    vgt = derivative.mul_add(vgst - large, large);
                 } else {
                     // Limit gate bias exponentially.
-                    subfac = 1. + (vgst / vst).exp();
-                    vgt = vst * subfac.ln();
+                    let exp = (vgst / vst).exp();
+                    subfac = 1. + exp;
+                    vgt = vst * exp.ln_1p();
+                    derivative = exp / subfac;
                 }
                 // Dual power-law ids(vgt, vdst).
                 let m_q = self.q;
@@ -480,28 +480,39 @@ impl Model {
                 let mxi = self.mxi;
                 let vsat_fac = vgt / mxi.mul_add(vgt, op.xi_woo);
                 let vsat = vgt / (1. + vsat_fac);
-                let aa = za.mul_add(vdp, vsat / 2.0);
-                let a_aa = aa - vsat;
-                let knee = vsat * vsat * self.z / 4.0;
-                let rpt = aa.mul_add(aa, knee).sqrt();
-                let a_rpt = a_aa.mul_add(a_aa, knee).sqrt();
-                let vdt = rpt - a_rpt;
+                let half = vsat * 0.5;
+                let aa = za.mul_add(vdp, half);
+                let a_aa = za.mul_add(vdp, -half);
+                let knee = half * self.z.sqrt();
+                let rpt = aa.hypot(knee);
+                let a_rpt = a_aa.hypot(knee);
+                // Rationalized difference of the two positive roots.
+                let vdt = vsat * (za * vdp / rpt.midpoint(a_rpt));
                 let dvdt_dvdp = za * (aa / rpt - a_aa / a_rpt);
                 let dvdt_dvgt = vdp.mul_add(-dvdt_dvdp, vdt)
                     * (mxi * vsat_fac).mul_add(vsat_fac, 1.)
                     / (1. + vsat_fac)
                     / vgt;
                 // Intrinsic Q-law FET equation ids(vgt, vdt).
-                gds = (vgt - vdt).powf(m_q - 1.);
-                gm = vgt.powf(m_q - 1.) - gds;
-                idrain = f64::mul_add(vgt, gm, vdt * gds);
+                let exponent = m_q - 1.;
+                let full = vgt.powf(exponent);
+                let ratio = vdt / vgt;
+                if ratio.abs() < 0.5 {
+                    let increment = (exponent * (-ratio).ln_1p()).exp_m1();
+                    gds = full.mul_add(increment, full);
+                    gm = -full * increment;
+                } else {
+                    gds = (vgt - vdt).powf(exponent);
+                    gm = full - gds;
+                }
+                idrain = vdt.mul_add(gds, vgt * gm);
                 gds *= m_q;
                 gm *= m_q;
                 gm = f64::mul_add(gds, dvdt_dvgt, gm);
                 gds *= dvdt_dvdp;
                 gm += gds * p_m_q * vdp / vgt;
                 gds *= dvpd_dvdst;
-                let arg = 1. - 1. / subfac;
+                let arg = derivative;
                 if vst != 0. {
                     gds += gm * self.vst * mvst * vgst.mul_add(-arg, vgt) / vst;
                 }

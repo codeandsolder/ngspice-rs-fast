@@ -39,8 +39,38 @@ compile. The port reproduces `sens_sens()`.
    `Y^-1 ((dI1 - dI0) - (dY1 - dY0) x)` at the output, divided by `delta`.
    DC loads are `DEVload` at the operating point, AC loads `DEVacLoad`.
 
-So a sensitivity is a first-order forward difference (relative error about
-`1e-6`), not an exact derivative.
+So a sensitivity is a first-order forward difference, not an exact
+derivative. Its truncation error depends on local curvature and its
+roundoff error on the conditioning of the finite-difference numerator.
+
+### Numerical conformance resolution
+
+A reference sensitivity is a quotient of a small change in output by the
+step recorded in the actual parameter walk. A fixed percentage tolerance
+alone is meaningless when that change is below the output resolution.
+The conformance runner now obtains an optional, same-shaped diagnostic
+from the ordinary sensitivity evaluation, without changing its returned
+values, rawfile schema, parameter order, or numerical algorithm.
+
+For each column the comparison floor is `max(A, 32 eps × S) / |delta|`:
+`A` is the configured ABSTOL (current output) or VNTOL (voltage output)
+for nonlinear DC, zero for linear DC and AC; `S` is the magnitude of the
+probe's solved output components before any differential subtraction.
+The 32-epsilon term is a roundoff-scale estimate, not a rigorous
+forward-error bound. The existing relative target and baseline absolute
+floor remain; the latter is replaced by the larger of it and the
+diagnostic. Frequency axes get no extra budget. Independently captured
+C envelopes and mandatory exact-input captures are still checked, as are
+shape, metadata and finite values. A material discrepancy above the
+resolution still fails.
+
+For MOS3 TOX, `delta = 2e-14 m` and the deck specifies ABSTOL = 1e-16 A.
+The resulting resolution is 0.005 A/m, rather than insisting on an
+unresolvable 6.46e-20 A difference in the numerator. This is deliberately
+an engineering comparison criterion, not a claim that C's historical
+restoration-order-dependent derivative is physically correct. Independent
+Jacobian/central-difference tests remain the evidence for physical
+accuracy; do not tune individual model expressions to C roundoff.
 
 ## The AC reset state (#102)
 
@@ -512,8 +542,8 @@ binary:
 **The Gummel-Poon BJT is ported and verified** (`sens_bjt`): `bjt.c`'s 103
 model `IF_REAL` setters and six instance ones, over an NPN at `dtemp=-10` with
 `ISE` above 1e-4, `rb`/`re`/`irb`/`rbm`, area factors and a `BF` polynomial,
-and a PNP at `dtemp=20` with `tnom=50`. 291 columns, all inside 1e-6
-(`compare::SENSITIVITY_NONLINEAR`). The fixture senses the **emitter** current:
+and a PNP at `dtemp=20` with `tnom=50`. 291 columns, compared with the independently captured C envelope under the
+unchanged `compare::SENSITIVITY_NONLINEAR` tolerance. The fixture senses the **emitter** current:
 a collector-side ammeter hides `BF`/`ISE`/`NE`, which move the base current,
 because `Ie = Ic + Ib`.
 
@@ -592,14 +622,27 @@ the fixed record-loss defect.
 scaled to `1e-19` during setup, so the sensitivity step is `1e-25`. The
 same upstream C revision returns `q1:ise = 2.867749531079332e10` on macOS
 arm64 and `-1.5951873897539978e10` on Linux x86-64 GNU: a `4.46e-15`
-difference in the solved response. Linux C reproduces the Linux Rust values,
-including the other ten columns that failed against the macOS capture. The
-original golden is unchanged; `conformance/golden/linux-x86_64-gnu/sens_bjt.raw`
-is an independently captured C variant with build provenance in its README.
-`conformance/support/src/fixtures.rs` selects it for GNU Linux x86-64 in capture, drift
-checks, verification and the BJT production test. All 291 columns retain the
-same tolerance, with no skips or missing-file fallback. A large quotient in
-this fixture is not necessarily a portable physical derivative.
+difference in the solved response. The original golden is unchanged;
+`conformance/golden/linux-x86_64-gnu/sens_bjt.raw` is an independently captured
+C variant with build provenance in its README. Capture and drift checks still
+select the native file. Numerical comparisons require both captures, validate
+their complete schemas and point counts, and compare against the closest
+endpoint of the observed per-column interval (or zero distance inside it).
+Identical captures reduce to a single-reference test. The base 1 ppm + 1e-9
+target is supplemented by the output-resolution floor described above. No
+column is skipped. This is a measurement of C's cross-platform numerical
+uncertainty, not a claim that every value inside the interval is physically
+accurate.
+
+The improved thermal and ON-bias arithmetic (issue #90) places nine formerly
+platform-specific sensitivity residues inside the two independent C captures.
+In an independently selected `q1:eg` sensitivity, before IBE/IBC setters
+alter the model, C gives -1.4399171e-4 and independently solved central
+differences converge to -1.4399170e-4; Rust matches both. In the full parameter
+walk the same column's C results straddle zero (-1.589e-9 on Linux and
++2.431e-9 on macOS). Such a full-walk finite-difference residue cannot establish
+the physical derivative; the separate selected-parameter test does.
+
 
 ### Classic MOS (`M`, levels 1/2/3/6/9)
 
