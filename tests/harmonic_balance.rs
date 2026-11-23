@@ -664,3 +664,123 @@ fn harmonic_balance_full_solve_release_profile() {
         );
     }
 }
+
+#[test]
+fn separable_three_tone_projection_matches_independent_direct_dft() {
+    let plan = HarmonicPlan::new(
+        &[
+            Tone::Independent {
+                frequency_hz: 1_000_000.,
+                order: 1,
+            },
+            Tone::Independent {
+                frequency_hz: 1_414_213.562_373,
+                order: 1,
+            },
+            Tone::Independent {
+                frequency_hz: 1_732_050.807_568,
+                order: 1,
+            },
+        ],
+        HarmonicLimits::default(),
+    )
+    .unwrap();
+    let shapes = plan
+        .axes()
+        .iter()
+        .map(|axis| axis.samples)
+        .collect::<Vec<_>>();
+    let samples: Vec<_> = (0..plan.sample_count())
+        .map(|i| {
+            let a = (i / (shapes[1] * shapes[2])) as f64;
+            let b = ((i / shapes[2]) % shapes[1]) as f64;
+            let c = (i % shapes[2]) as f64;
+            let angles = [
+                TAU * a / shapes[0] as f64,
+                TAU * b / shapes[1] as f64,
+                TAU * c / shapes[2] as f64,
+            ];
+            0.11 + 0.3 * angles[0].sin()
+                + 0.5 * (angles[1] - angles[2]).cos()
+                + 0.2 * (angles[0] + angles[1] - angles[2]).sin()
+        })
+        .collect();
+    let projected = plan.project(&samples).unwrap();
+    for (mode, &actual) in plan.modes().iter().zip(&projected) {
+        let (mut real, mut imaginary) = (0., 0.);
+        for (i, &sample) in samples.iter().enumerate() {
+            let digits = [
+                i / (shapes[1] * shapes[2]),
+                (i / shapes[2]) % shapes[1],
+                i % shapes[2],
+            ];
+            let turns: f64 = mode
+                .index
+                .iter()
+                .zip(digits)
+                .zip(&shapes)
+                .map(|((&k, j), &width)| f64::from(k) * j as f64 / width as f64)
+                .sum();
+            let (sin, cos) = (TAU * turns).sin_cos();
+            real += sample * cos;
+            imaginary -= sample * sin;
+        }
+        let expected = Complex::new(
+            real / plan.sample_count() as f64,
+            imaginary / plan.sample_count() as f64,
+        );
+        close(actual.re, expected.re);
+        close(actual.im, expected.im);
+    }
+    let restored = plan.synthesize(&projected).unwrap();
+    for (&actual, &expected) in restored.iter().zip(&samples) {
+        close(actual, expected);
+    }
+}
+
+#[test]
+fn separable_transform_budget_accounts_for_true_axis_work_not_product() {
+    let plan = HarmonicPlan::new(
+        &[
+            Tone::Independent {
+                frequency_hz: 1_000.,
+                order: 4,
+            },
+            Tone::Independent {
+                frequency_hz: 1_414.213_562_37,
+                order: 4,
+            },
+        ],
+        HarmonicLimits {
+            dimensions: 2,
+            coefficients: 81,
+            samples: 289,
+            dft_products: 10_000,
+        },
+    )
+    .unwrap();
+    assert_eq!(plan.modes().len(), 81);
+    assert_eq!(plan.sample_count(), 289);
+    assert!(plan.transform_products() < 10_000);
+    assert!(plan.sample_count() * plan.modes().len() > 10_000);
+    let error = HarmonicPlan::new(
+        &[
+            Tone::Independent {
+                frequency_hz: 1_000.,
+                order: 4,
+            },
+            Tone::Independent {
+                frequency_hz: 1_414.213_562_37,
+                order: 4,
+            },
+        ],
+        HarmonicLimits {
+            dimensions: 2,
+            coefficients: 81,
+            samples: 289,
+            dft_products: plan.transform_products() - 1,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("budget"));
+}
