@@ -472,14 +472,14 @@ impl ComplexMatrix {
         if let Some(first) = first {
             factors.push(first);
         }
-        for (frame, status) in lane_frames {
+        for (frame, status, factor_work) in lane_frames {
             check_status(
                 "complex sparse LU",
                 status,
                 &frame,
                 matrices[factors.len()].names.as_ref(),
             )?;
-            let attempt = frame.last_attempt();
+            let attempt = factor_work;
             factors.push(ComplexLu {
                 n: matrices[0].n,
                 order: ComplexOrder::Bound(Arc::clone(pattern)),

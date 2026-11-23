@@ -1679,7 +1679,7 @@ impl Sparse<Complex> {
         baseline: &Self,
         coefficients: &[&[Complex]],
         work: &mut ComplexFactorBatch,
-    ) -> SpiceResult<Vec<(Self, Status)>> {
+    ) -> SpiceResult<Vec<(Self, Status, crate::maths::FactorWork)>> {
         if coefficients.len() > RHS_BATCH_WIDTH
             || coefficients
                 .iter()
@@ -1724,6 +1724,7 @@ impl Sparse<Complex> {
         sparse_reserve(&mut output, coefficients.len())?;
         for (lane, &values) in coefficients.iter().enumerate() {
             let mut frame = baseline.fork_loaded(values.iter().copied());
+            let mut attempts = crate::maths::FactorWork::default();
             let status = if failures[lane].is_none() {
                 for (element, packed) in frame.values.iter_mut().zip(&work.values) {
                     *element = packed.get::<Complex>(lane);
@@ -1739,16 +1740,20 @@ impl Sparse<Complex> {
                     path: AttemptPath::Refactor,
                     status,
                 });
+                attempts += frame.last_attempt();
                 status
             } else {
                 let mut status = frame.factor_with_workspace(&mut Vec::new());
+                attempts += frame.last_attempt();
                 if status == Status::ZeroDiag {
+                    attempts.zero_pivot_retries += 1;
                     frame.reload_originals(values);
                     status = frame.order_and_factor(baseline.rel_threshold, baseline.abs_threshold);
+                    attempts += frame.last_attempt();
                 }
                 status
             };
-            output.push((frame, status));
+            output.push((frame, status, attempts));
         }
         Ok(output)
     }
@@ -3877,7 +3882,7 @@ mod tests {
                 let refs: Vec<_> = inputs[..count].iter().map(Vec::as_slice).collect();
                 let batch = Sparse::factor_complex_batch(&baseline, &refs, &mut workspace).unwrap();
                 assert_eq!(batch.len(), count);
-                for (lane, (actual, status)) in batch.iter().enumerate() {
+                for (lane, (actual, status, _)) in batch.iter().enumerate() {
                     let (reference, expected) = scalar_refactor_reference(&baseline, refs[lane]);
                     assert_eq!(
                         *status, expected,
@@ -3960,15 +3965,23 @@ mod tests {
         let mut workspace = ComplexFactorBatch::default();
         let refs = inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let batch = Sparse::factor_complex_batch(&baseline, &refs, &mut workspace).unwrap();
-        for (lane, (frame, status)) in batch.iter().enumerate() {
+        for (lane, (frame, status, _)) in batch.iter().enumerate() {
             let (scalar, expected) = scalar_refactor_reference(&baseline, refs[lane]);
             assert_eq!(*status, expected, "lane={lane}");
             assert_eq!(frame.factors().is_ok(), scalar.factors().is_ok());
         }
         let good = [&inputs[0][..], &inputs[2][..]];
         let recovered = Sparse::factor_complex_batch(&baseline, &good, &mut workspace).unwrap();
-        assert!(recovered.iter().all(|(_, status)| *status == Status::Okay));
-        assert!(recovered.iter().all(|(frame, _)| frame.factors().is_ok()));
+        assert!(
+            recovered
+                .iter()
+                .all(|(_, status, _)| *status == Status::Okay)
+        );
+        assert!(
+            recovered
+                .iter()
+                .all(|(frame, _, _)| frame.factors().is_ok())
+        );
     }
 
     #[test]
