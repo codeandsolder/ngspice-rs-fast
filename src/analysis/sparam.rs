@@ -726,7 +726,6 @@ impl NoiseWorkspace {
         generators: &[InstanceNoise],
         solve: &mut SolveBuffers,
     ) -> SpiceResult<()> {
-        let count = ports.len();
         let n = circuit.unknown_count();
         for (tile, adjoints) in ports
             .chunks(RHS_BATCH_WIDTH)
