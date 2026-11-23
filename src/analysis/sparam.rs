@@ -38,7 +38,7 @@ use crate::analysis::{AnalysisPlan, Plot};
 use crate::devices::Circuit;
 use crate::devices::linear::SourceKind;
 use crate::devices::noise::NoisePlan;
-use crate::maths::complex::ComplexLu;
+use crate::maths::complex::{ComplexFactorBatch, ComplexLu, ComplexMatrix};
 use crate::maths::dense_complex::DenseComplex;
 use crate::maths::linear::{RHS_BATCH_WIDTH, SolveBatchWorkspace};
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, filled_vec, parse_spice_number};
@@ -315,44 +315,103 @@ pub(super) fn run(
     let mut workspace = RfWorkspace::new(&plan)?;
     let mut plot = parameter_plot(circuit, plan.ports.len(), donoise, plan.budget.width)?;
     plot.reserve_points(plan.grid.len())?;
+    let frequencies = plan.grid;
+    let batched = frequencies.len() > 1 && !small_signal.varies() && !small_signal.reassembles();
     let reference = plan.ports[0].z0;
-    let mut noise_plan: Option<NoisePlan<'_>> = None;
-    for &f in plan.grid {
-        let factor = small_signal.at_frequency(context, f, |system| {
-            let factor =
+    let mut output = RfPointOutput {
+        plan: &mut plan,
+        workspace: &mut workspace,
+        plot: &mut plot,
+        reference,
+        noise_plan: None,
+    };
+    if batched {
+        let mut work = ComplexFactorBatch::default();
+        let mut previous = None;
+        for group in frequencies.chunks(RHS_BATCH_WIDTH) {
+            let mut matrices = Vec::new();
+            matrices.try_reserve(group.len()).map_err(|error| {
+                crate::maths::linear::numerical(
+                    "RF frequency batch",
+                    format!("cannot reserve frequency tile: {error}"),
+                )
+            })?;
+            for &f in group {
+                matrices.push(crate::analysis::ac::ac_matrix(
+                    circuit,
+                    small_signal.system(),
+                    2. * std::f64::consts::PI * f,
+                )?);
+            }
+            let factors = ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
+            for (&f, result) in group.iter().zip(factors) {
+                let factor = result?;
+                output.record(circuit, context, &small_signal, f, &factor)?;
+                previous = Some(factor);
+            }
+        }
+    } else {
+        for &f in frequencies {
+            let factor = small_signal.at_frequency(context, f, |system| {
                 crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * f)?
-                    .factorize()?;
-            plan.budget.charge_factor(
-                factor.factor_storage().factor_entries,
-                plan.ports.len(),
-                plan.noise,
-            )?;
-            workspace.solve_ports(&plan.ports, &factor, f)?;
-            Ok(factor)
-        })?;
-        workspace.point.clear();
-        workspace.point.push(Complex::real(f));
-        workspace
+                    .factorize()
+            })?;
+            output.record(circuit, context, &small_signal, f, &factor)?;
+        }
+    }
+    plots.push(plot);
+    Ok(plots)
+}
+
+/// Output and resource state consumed strictly in frequency order. Only LU
+/// factors are prepared ahead of time; port solutions and noise generator
+/// refreshes still observe the original sequential C state transitions.
+struct RfPointOutput<'a, 'grid, 'circuit> {
+    plan: &'a mut RfPlan<'grid>,
+    workspace: &'a mut RfWorkspace,
+    plot: &'a mut Plot,
+    reference: Complex,
+    noise_plan: Option<NoisePlan<'circuit>>,
+}
+
+impl<'circuit> RfPointOutput<'_, '_, 'circuit> {
+    fn record(
+        &mut self,
+        circuit: &Circuit,
+        context: &crate::analysis::AnalysisContext,
+        small_signal: &SmallSignal<'circuit>,
+        f: Real,
+        factor: &ComplexLu,
+    ) -> SpiceResult<()> {
+        self.plan.budget.charge_factor(
+            factor.factor_storage().factor_entries,
+            self.plan.ports.len(),
+            self.plan.noise,
+        )?;
+        self.workspace.solve_ports(&self.plan.ports, factor, f)?;
+        self.workspace.point.clear();
+        self.workspace.point.push(Complex::real(f));
+        self.workspace
             .point
-            .extend_from_slice(workspace.solve.last_solution());
+            .extend_from_slice(self.workspace.solve.last_solution());
         if !circuit.observations().is_empty() {
-            workspace.point.extend(
+            self.workspace.point.extend(
                 small_signal
                     .prepared()
                     .observe_parameters(&context.model_context().with_frequency(f))?,
             );
         }
         for matrix in [
-            &workspace.algebra.s,
-            &workspace.algebra.y,
-            &workspace.algebra.z,
+            &self.workspace.algebra.s,
+            &self.workspace.algebra.y,
+            &self.workspace.algebra.z,
         ] {
-            workspace.point.extend_from_slice(matrix.data());
+            self.workspace.point.extend_from_slice(matrix.data());
         }
-        workspace.point.push(reference);
-        if let Some(noise) = &mut workspace.noise {
+        self.workspace.point.push(self.reference);
+        if let Some(noise) = &mut self.workspace.noise {
             let model = context.model_context().with_frequency(f);
-            let generators = match &mut noise_plan {
+            let generators = match &mut self.noise_plan {
                 Some(generators) => {
                     generators.refresh(
                         small_signal.prepared(),
@@ -362,34 +421,34 @@ pub(super) fn run(
                     )?;
                     generators
                 }
-                None => noise_plan.insert(NoisePlan::bind(
+                None => self.noise_plan.insert(NoisePlan::bind(
                     small_signal.prepared(),
                     &model,
                     small_signal.bias(),
                     Some(small_signal.state()),
                 )?),
             };
-            plan.budget
-                .charge_noise(plan.ports.len(), generators.source_count())?;
+            self.plan
+                .budget
+                .charge_noise(self.plan.ports.len(), generators.source_count())?;
             noise.evaluate(
                 circuit,
-                &plan.ports,
-                &factor,
-                &workspace.algebra.y,
+                &self.plan.ports,
+                factor,
+                &self.workspace.algebra.y,
                 generators,
-                &mut workspace.solve,
+                &mut self.workspace.solve,
             )?;
             noise.append_results(
-                &plan.ports,
-                &workspace.algebra.y,
+                &self.plan.ports,
+                &self.workspace.algebra.y,
                 context,
-                &mut workspace.point,
+                &mut self.workspace.point,
             )?;
         }
-        plot.push_point(&workspace.point)?;
+        self.plot.push_point(&self.workspace.point)?;
+        Ok(())
     }
-    plots.push(plot);
-    Ok(plots)
 }
 
 /// Fixed-dimensional port algebra. Every buffer is allocated once and

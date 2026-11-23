@@ -237,12 +237,15 @@ impl LaneParts {
         let ordinary = (product.re.abs() + product.im.abs()).is_normal()
             | self.complex_zero()
             | rhs.complex_zero();
-        for lane in 0..RHS_BATCH_WIDTH {
-            if !ordinary.test(lane) {
-                product.set(
-                    lane,
-                    self.get::<Complex>(lane).mul(rhs.get::<Complex>(lane)),
-                );
+        let exceptional = !ordinary;
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    product.set(
+                        lane,
+                        self.get::<Complex>(lane).mul(rhs.get::<Complex>(lane)),
+                    );
+                }
             }
         }
         product
@@ -253,13 +256,16 @@ impl LaneParts {
         let fast = !inverse.complex_zero()
             & ((candidate.re.abs() + candidate.im.abs()).is_normal() | self.complex_zero());
         let mut result = Self::select(active, candidate, Self::ZERO);
-        for lane in 0..RHS_BATCH_WIDTH {
-            if active.test(lane) && !fast.test(lane) {
-                result.set(
-                    lane,
-                    self.get::<Complex>(lane)
-                        .quotient(pivot.get(lane), inverse.get(lane)),
-                );
+        let exceptional = active & !fast;
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    result.set(
+                        lane,
+                        self.get::<Complex>(lane)
+                            .quotient(pivot.get(lane), inverse.get(lane)),
+                    );
+                }
             }
         }
         result
@@ -289,18 +295,21 @@ impl LaneParts {
         let fast = normal & norm.is_normal() & norm.simd_gt(scale)
             | ordinary.complex_finite() & (upper.complex_zero() | lower.complex_zero());
         let mut result = Self::select(active, ordinary, self);
-        for lane in 0..RHS_BATCH_WIDTH {
-            if active.test(lane) && !fast.test(lane) {
-                result.set(
-                    lane,
-                    self.get::<Complex>(lane).schur(
-                        pivot.get(lane),
-                        upper.get(lane),
-                        multiplier.get(lane),
-                        lower.get(lane),
-                        normal.test(lane),
-                    ),
-                );
+        let exceptional = active & !fast;
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    result.set(
+                        lane,
+                        self.get::<Complex>(lane).schur(
+                            pivot.get(lane),
+                            upper.get(lane),
+                            multiplier.get(lane),
+                            lower.get(lane),
+                            normal.test(lane),
+                        ),
+                    );
+                }
             }
         }
         result
@@ -765,8 +774,17 @@ impl<I: PlanIndex> FactorRuns<I> {
                     let (handle, row) = entry.indices();
                     let upper = work.scratch[row];
                     work.values[handle] = upper;
+                    // spFactor skips an empty upper entry entirely. Sparse
+                    // fill-in produces many exact zeros, especially in
+                    // bandwidth-limited circuits; do not perform cross
+                    // products or exceptional-lane recovery on those lanes.
+                    let participating = active & !upper.complex_zero();
+                    if !participating.any() {
+                        continue;
+                    }
                     let pivot = work.values[diagonal[row]];
-                    let mult = upper.complex_pair_quotient(pivot, work.inverses[row], active);
+                    let mult =
+                        upper.complex_pair_quotient(pivot, work.inverses[row], participating);
                     let normal = (mult.re.abs() + mult.im.abs()).is_normal();
                     for entry in self.columns.after_diagonal(row) {
                         let (handle, destination) = entry.indices();
@@ -776,7 +794,7 @@ impl<I: PlanIndex> FactorRuns<I> {
                             mult,
                             work.values[handle],
                             normal,
-                            active,
+                            participating,
                         );
                     }
                 }
@@ -806,13 +824,15 @@ impl<I: PlanIndex> FactorRuns<I> {
                 break;
             }
         }
+        let all_finite = work
+            .values
+            .iter()
+            .fold(LaneMask::splat(true), |mask, value| {
+                mask & value.complex_finite()
+            });
+        let nonfinite = active & !all_finite;
         for (lane, failure) in failures.iter_mut().enumerate().take(count) {
-            if active.test(lane)
-                && work
-                    .values
-                    .iter()
-                    .any(|value| !value.get::<Complex>(lane).is_finite())
-            {
+            if nonfinite.test(lane) {
                 *failure = Some(Status::NonFinite);
             }
         }
@@ -1716,17 +1736,25 @@ impl Sparse<Complex> {
         let mut output = Vec::new();
         sparse_reserve(&mut output, coefficients.len())?;
         for (lane, &values) in coefficients.iter().enumerate() {
-            let mut frame = baseline.fork_loaded(values.iter().copied());
+            // Successful SIMD lanes already contain complete factored values.
+            // Materialize each exactly once, without first copying originals
+            // and then overwriting every entry and pivot reciprocal.
+            let mut frame = if failures[lane].is_none() {
+                let mut lane_values = Vec::new();
+                sparse_reserve(&mut lane_values, work.values.len())?;
+                lane_values.extend(work.values.iter().map(|packed| packed.get::<Complex>(lane)));
+                baseline.fork_values(lane_values)
+            } else {
+                baseline.fork_loaded(values.iter().copied())
+            };
             let mut attempts = crate::maths::FactorWork::default();
             let status = if failures[lane].is_none() {
-                for (element, packed) in frame.values.iter_mut().zip(&work.values) {
-                    *element = packed.get::<Complex>(lane);
-                }
                 sparse_reserve(&mut frame.inverses, baseline.size + 1)?;
-                frame.inverses.resize(baseline.size + 1, Complex::ZERO);
-                for (element, packed) in frame.inverses.iter_mut().zip(&work.inverses) {
-                    *element = packed.get::<Complex>(lane);
-                }
+                frame.inverses.extend(
+                    work.inverses
+                        .iter()
+                        .map(|packed| packed.get::<Complex>(lane)),
+                );
                 let status = frame.done();
                 frame.last_attempt = Some(FactorAttempt {
                     path: AttemptPath::Refactor,

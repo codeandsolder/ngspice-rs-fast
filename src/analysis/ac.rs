@@ -65,7 +65,7 @@ pub(super) fn run(
                 )?);
             }
             let factors = ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
-            for (&f, result) in frequencies.iter().zip(factors.into_iter()) {
+            for (&f, result) in frequencies.iter().zip(factors) {
                 let factor = result?;
                 let x = factor.solve(&rhs)?;
                 point.clear();
