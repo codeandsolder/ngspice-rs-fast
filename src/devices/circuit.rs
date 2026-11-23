@@ -162,11 +162,26 @@ pub struct Circuit {
 /// Setup-only numbering and topology.
 ///
 /// The identity is published only after every validation and allocation succeeds.
+/// Original C load-order positions of one homogeneous diode physics tile.
+/// Its lanes are independent until their ordered MNA and trial-state commit.
+/// Bounded tiles avoid scratch proportional to the entire circuit and keep
+/// scalar loading optimal for singleton and non-diode instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiodeBatch {
+    start: usize,
+    len: usize,
+}
+
+/// Maximum number of independent physical junction evaluations in flight.
+const DIODE_TILE: usize = 64;
+
 #[derive(Default)]
 struct TopologyBindings {
     unknowns: MnaUnknowns,
     names: DeviceNames,
     order: Vec<usize>,
+    /// Immutable load-order runs of contiguous same-model diodes.
+    diode_batches: Vec<DiodeBatch>,
     branch_rows: Vec<std::ops::Range<usize>>,
     control_rows: Vec<Vec<usize>>,
     state_rows: Arc<[std::ops::Range<usize>]>,
@@ -1653,12 +1668,50 @@ impl Circuit {
         Ok(elements)
     }
 
+    /// Bind homogeneous diode tiles once, against finalized source devices.
+    /// A point's parameter replacements are checked to retain the same
+    /// device family and topology, so candidates reuse this immutable plan.
+    fn plan_diode_batches(&self, order: &[usize]) -> Vec<DiodeBatch> {
+        let mut batches = Vec::new();
+        let diode_type = std::any::TypeId::of::<crate::devices::nonlinear::Diode>();
+        let mut position = 0;
+        while position < order.len() {
+            let first = &self.devices[order[position]];
+            if first.as_ref().type_id() != diode_type {
+                position += 1;
+                continue;
+            }
+            let model = first.origin.model.as_deref();
+            let mut end = position + 1;
+            while end < order.len() {
+                let next = &self.devices[order[end]];
+                if next.as_ref().type_id() != diode_type || next.origin.model.as_deref() != model {
+                    break;
+                }
+                end += 1;
+            }
+            // Keep a lone diode on the scalar fast path. Each other lane
+            // belongs to a bounded tile; a final singleton is scalar too.
+            while end - position >= 2 {
+                let len = (end - position).min(DIODE_TILE);
+                batches.push(DiodeBatch {
+                    start: position,
+                    len,
+                });
+                position += len;
+            }
+            position = end;
+        }
+        batches
+    }
+
     /// C's `CKTsetup`: orders the devices and allocates the matrix elements
     /// they declare, in that order. A pattern that already starts with the
     /// same elements is kept, so its pivot order survives re-finalization
     /// (C sets a circuit up once).
     fn allocate_matrix(&mut self, order: Vec<usize>) -> SpiceResult<()> {
         let elements = self.ordered_elements(&order, 0)?;
+        self.bindings.diode_batches = self.plan_diode_batches(&order);
         self.bindings.order = order;
         let n = self.unknown_count();
         let mut slot = self.runtime.pattern.borrow_mut();
@@ -2751,7 +2804,60 @@ impl Circuit {
         voltage_source_value: &mut Real,
         mut ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
+        use crate::devices::nonlinear::{Diode, DiodeLoadEvaluation, DiodeLoadSample};
+
+        // One bounded type-safe lane array (not a pair of separately allocated
+        // sample and result queues). Gathering, pure evaluation and ordered
+        // commit remain distinct phases, but no lane is copied into a second
+        // large buffer. Singleton/non-diode loads allocate nothing here.
+        enum Lane {
+            Gathered(SpiceResult<DiodeLoadSample>),
+            Ready(SpiceResult<DiodeLoadEvaluation>),
+            Consumed,
+        }
+        let mut lanes: Vec<Lane> = Vec::new();
+        let mut active_start = 0;
+        let mut active_end = 0;
+        let mut batches = self.bindings.diode_batches.iter().peekable();
         for (position, index) in self.load_order().enumerate() {
+            if batches.peek().is_some_and(|batch| batch.start == position)
+                && let Some(batch) = batches.next()
+            {
+                active_start = position;
+                active_end = batch.start + batch.len;
+                lanes.clear();
+                for &ordinal in &self.bindings.order[batch.start..active_end] {
+                    // Gather does not evaluate physics, alter trial state or
+                    // touch matrix/RHS. Defer any per-device error until its
+                    // original position in the C load order.
+                    let sampled = (|| {
+                        let device = point.device(self, ordinal);
+                        let diode = (device as &dyn std::any::Any)
+                            .downcast_ref::<Diode>()
+                            .ok_or_else(|| {
+                                SpiceError::circuit("effective diode changed finalized family type")
+                            })?;
+                        let states = request.history.device_of(trial, ordinal)?;
+                        diode.sample_load(
+                            request.model_context,
+                            &self.bindings.unknowns,
+                            request.solution,
+                            &states,
+                            request.mode,
+                            request.integration,
+                        )
+                    })();
+                    lanes.push(Lane::Gathered(sampled));
+                }
+                for lane in &mut lanes {
+                    let Lane::Gathered(sample) = std::mem::replace(lane, Lane::Consumed) else {
+                        return Err(SpiceError::circuit("invalid diode tile evaluation phase"));
+                    };
+                    *lane = Lane::Ready(
+                        sample.and_then(|sample| sample.evaluate(request.model_context.gmin)),
+                    );
+                }
+            }
             let device = point.device(self, index);
             let states = request.history.device_of(trial, index)?.with_ltra(
                 ltra.as_deref_mut(),
@@ -2759,7 +2865,7 @@ impl Circuit {
                 index,
             );
             matrix.begin_device(position)?;
-            device.stamp(&mut StampContext {
+            let mut context = StampContext {
                 matrix: &mut *matrix,
                 rhs: StampRhs::dense(rhs),
                 unknowns: &self.bindings.unknowns,
@@ -2779,7 +2885,22 @@ impl Circuit {
                 forcing: request.forcing,
                 source_factor: request.model_context.source_factor,
                 voltage_source_value: &mut *voltage_source_value,
-            })?;
+            };
+            if position < active_end {
+                let lane = std::mem::replace(&mut lanes[position - active_start], Lane::Consumed);
+                let Lane::Ready(result) = lane else {
+                    return Err(SpiceError::circuit("invalid diode tile commit phase"));
+                };
+                let evaluation = result?;
+                let diode = (device as &dyn std::any::Any)
+                    .downcast_ref::<Diode>()
+                    .ok_or_else(|| {
+                        SpiceError::circuit("effective diode changed finalized family type")
+                    })?;
+                diode.commit_load(&mut context, &evaluation)?;
+            } else {
+                device.stamp(&mut context)?;
+            }
         }
         Ok(())
     }
@@ -3912,6 +4033,10 @@ type PoleZeroRange = (
     std::ops::Range<usize>,
     Vec<crate::maths::pencil::PencilTerm>,
 );
+
+#[cfg(test)]
+#[path = "circuit/diode_batch_tests.rs"]
+mod diode_batch_tests;
 
 #[cfg(test)]
 mod tests {
