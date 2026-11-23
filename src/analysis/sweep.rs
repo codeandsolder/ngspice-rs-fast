@@ -158,13 +158,13 @@ impl SweepSpec {
     /// # Errors
     /// As [`Self::grid`], including bounds on accumulated progress and work.
     pub fn accumulated_grid(&self) -> SpiceResult<Vec<Real>> {
-        let expected = self.exact_values()?.len();
+        let _ = self.exact_values()?;
         let temperature = self.target == SweepTarget::Temperature;
-        let values = self.range().accumulate(expected, temperature)?;
-        for &value in &values {
+        let values = self.range().accumulate(temperature)?;
+        for value in values.values() {
             check_domain(value, temperature, self.target.is_resistance())?;
         }
-        Ok(values)
+        Ok(values.values().collect())
     }
 }
 
@@ -209,6 +209,70 @@ impl ExactGrid {
     }
 }
 
+/// Compact, validated C accumulated traversal, including Kelvin offset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AccumulatedGrid {
+    range: SweepRange,
+    temperature: bool,
+    count: usize,
+}
+
+impl AccumulatedGrid {
+    fn values(self) -> GridValues {
+        let offset = if self.temperature {
+            CELSIUS_TO_KELVIN
+        } else {
+            0.
+        };
+        GridValues {
+            stored: self.range.start + offset,
+            offset,
+            step: self.range.step,
+            remaining: self.count,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GridValues {
+    stored: Real,
+    offset: Real,
+    step: Real,
+    remaining: usize,
+}
+
+impl GridValues {
+    const fn singleton(value: Real) -> Self {
+        Self {
+            stored: value,
+            offset: 0.,
+            step: 0.,
+            remaining: 1,
+        }
+    }
+}
+
+impl Iterator for GridValues {
+    type Item = Real;
+
+    fn next(&mut self) -> Option<Real> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let value = self.stored - self.offset;
+        self.remaining -= 1;
+        if self.remaining != 0 {
+            self.stored += self.step;
+        }
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+impl ExactSizeIterator for GridValues {}
+
 impl SweepRange {
     fn exact_grid(self) -> SpiceResult<ExactGrid> {
         let (start, stop, increment) = (self.start, self.stop, self.step);
@@ -245,25 +309,31 @@ impl SweepRange {
         Ok(grid)
     }
 
-    fn accumulate(self, expected: usize, temperature: bool) -> SpiceResult<Vec<Real>> {
+    fn accumulate(self, temperature: bool) -> SpiceResult<AccumulatedGrid> {
         let offset = if temperature { CELSIUS_TO_KELVIN } else { 0. };
         let tolerance = 1e3 * Real::EPSILON;
         let direction = self.step.signum();
         let mut stored = self.start + offset;
-        let mut values = Vec::with_capacity(expected);
+        let mut previous = None;
+        let mut count = 0;
         loop {
             let value = stored - offset;
             if direction * (value - self.stop) > tolerance {
                 break;
             }
-            if values.len() >= MAX_SWEEP_POINTS {
+            if count >= MAX_SWEEP_POINTS {
                 return Err(unsupported("DC sweep point limit exceeded"));
             }
-            self.check_progress(value, values.last().copied())?;
-            values.push(value);
+            self.check_progress(value, previous)?;
+            count += 1;
+            previous = Some(value);
             stored += self.step;
         }
-        Ok(values)
+        Ok(AccumulatedGrid {
+            range: self,
+            temperature,
+            count,
+        })
     }
 
     fn check_progress(self, value: Real, previous: Option<Real>) -> SpiceResult<()> {
@@ -322,7 +392,7 @@ impl AxisTarget {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct DcSweepPlan {
     axes: Vec<AxisPlan>,
-    grids: Vec<Vec<Real>>,
+    grids: Vec<AccumulatedGrid>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -352,10 +422,10 @@ pub(super) fn parse_axes(args: &[String]) -> SpiceResult<DcSweepPlan> {
         let expected = exact.values().len();
         exact_work = bounded_product(exact_work, expected)?;
         let temperature = target == AxisTarget::Temperature;
-        let values = range.accumulate(expected, temperature)?;
-        accumulated_work = bounded_product(accumulated_work, values.len())?;
+        let values = range.accumulate(temperature)?;
+        accumulated_work = bounded_product(accumulated_work, values.count)?;
         if temperature {
-            for value in exact.values().chain(values.iter().copied()) {
+            for value in exact.values().chain(values.values()) {
                 check_domain(value, true, false)?;
             }
         }
@@ -363,6 +433,12 @@ pub(super) fn parse_axes(args: &[String]) -> SpiceResult<DcSweepPlan> {
         grids.push(values);
     }
     Ok(DcSweepPlan { axes, grids })
+}
+
+impl DcSweepPlan {
+    pub(super) fn point_count(&self) -> usize {
+        self.grids.iter().map(|grid| grid.count).product()
+    }
 }
 
 fn bounded_product(work: usize, points: usize) -> SpiceResult<usize> {
@@ -582,7 +658,7 @@ fn bind_axes(circuit: &Circuit, plan: &DcSweepPlan) -> SpiceResult<Vec<BoundAxis
     for ((axis, written), grid) in plan.axes.iter().zip(&written).zip(&plan.grids) {
         let (target, binding) = resolve_target(circuit, written)?;
         if target.is_resistance() {
-            for value in axis.exact.values().chain(grid.iter().copied()) {
+            for value in axis.exact.values().chain(grid.values()) {
                 check_domain(value, false, true)?;
             }
         }
@@ -673,47 +749,47 @@ fn point_context<'a>(
 /// DC source values do not change thermal derivations; their largest absolute
 /// value additionally validates the worst-case linear forcing (including a
 /// concurrently swept current-source multiplier).
-struct GridPair<'a> {
-    inner: &'a [Real],
-    outer: &'a [Real],
+struct GridPair {
+    inner: GridValues,
+    outer: GridValues,
 }
 
-impl<'a> GridPair<'a> {
-    fn new(grids: &'a [Vec<Real>]) -> Self {
+impl GridPair {
+    fn new(grids: &[AccumulatedGrid]) -> Self {
         Self {
-            inner: &grids[0],
-            outer: grids.get(1).map_or(&[0.][..], Vec::as_slice),
+            inner: grids[0].values(),
+            outer: grids
+                .get(1)
+                .map_or(GridValues::singleton(0.), |grid| grid.values()),
         }
     }
 
-    fn physical_contexts(self, sources: [bool; 2]) -> Self {
-        let unique = |grid: &'a [Real], is_source| {
+    fn physical_contexts(mut self, sources: [bool; 2]) -> Self {
+        let unique = |grid: GridValues, is_source| {
             if is_source {
-                let first = &grid[..grid.len().min(1)];
-                let last = &grid[grid.len().saturating_sub(1)..];
-                if last
-                    .first()
-                    .zip(first.first())
-                    .is_some_and(|(last, first)| last.abs() > first.abs())
-                {
-                    last
-                } else {
-                    first
+                match (grid.clone().next(), grid.clone().last()) {
+                    (Some(first), Some(last)) => {
+                        GridValues::singleton(if last.abs() > first.abs() {
+                            last
+                        } else {
+                            first
+                        })
+                    }
+                    _ => grid,
                 }
             } else {
                 grid
             }
         };
-        Self {
-            inner: unique(self.inner, sources[0]),
-            outer: unique(self.outer, sources[1]),
-        }
+        self.inner = unique(self.inner, sources[0]);
+        self.outer = unique(self.outer, sources[1]);
+        self
     }
 
     fn points(&self) -> impl Iterator<Item = [Real; 2]> + '_ {
         self.outer
-            .iter()
-            .flat_map(|&outer| self.inner.iter().map(move |&inner| [inner, outer]))
+            .clone()
+            .flat_map(|outer| self.inner.clone().map(move |inner| [inner, outer]))
     }
 }
 
@@ -724,7 +800,7 @@ impl<'a> GridPair<'a> {
 fn preflight(
     prepared: &crate::devices::PreparedRun<'_>,
     axes: &[BoundAxis],
-    grids: &[Vec<Real>],
+    grids: &[AccumulatedGrid],
     context: &AnalysisContext,
 ) -> SpiceResult<()> {
     let circuit = prepared.circuit();
@@ -734,7 +810,11 @@ fn preflight(
         axes.get(1).is_some_and(|axis| axis.binding.is_source()),
     ];
     let contexts = GridPair::new(grids).physical_contexts(sources);
-    let start = [contexts.inner[0], contexts.outer[0]];
+    let (Some(inner), Some(outer)) = (contexts.inner.clone().next(), contexts.outer.clone().next())
+    else {
+        return Ok(());
+    };
+    let start = [inner, outer];
     // Check every coupled physical combination, but unchanged devices only
     // need validation once at each scalar temperature context. The grids
     // are strictly monotone, so the first value of the other axis identifies
@@ -775,7 +855,7 @@ fn preflight(
         if !matches!(axis.binding, AxisBinding::Resistor(_)) {
             continue;
         }
-        for &value in &grid[1..] {
+        for value in grid.values().skip(1) {
             let mut values = start;
             values[index] = value;
             let point = point_context(circuit, axes, values, base)?;
@@ -938,11 +1018,11 @@ pub(super) fn run(
         // instance flags like the very first point, and its converged state
         // then becomes the accepted history (C's `firstTime` memcpy).
         let mut first = true;
-        for inner_value in inner {
+        for inner_value in inner.clone() {
             let point_context = point_context(
                 circuit,
                 &axes,
-                [*inner_value, *outer_value],
+                [inner_value, outer_value],
                 context.model_context(),
             )?;
             let model = point_context.model;
@@ -985,10 +1065,10 @@ pub(super) fn run(
                 history.retain_latest();
             }
             if let Some(output) = selected.as_mut() {
-                output.real(sink, Some(*inner_value), x.as_slice(), &observed)?;
+                output.real(sink, Some(inner_value), x.as_slice(), &observed)?;
             } else {
                 point.clear();
-                point.push(Complex::real(*inner_value));
+                point.push(Complex::real(inner_value));
                 point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
                 point.extend(observed);
                 result.check_point(&point)?;
@@ -1024,7 +1104,22 @@ mod grid_tests {
 
     #[test]
     fn preflight_projects_only_source_axes_out_of_the_physical_grid() {
-        let grids = [vec![1., 2., 3.], vec![10., 20.]];
+        let grids = [
+            SweepRange {
+                start: 1.,
+                stop: 3.,
+                step: 1.,
+            }
+            .accumulate(false)
+            .unwrap(),
+            SweepRange {
+                start: 10.,
+                stop: 20.,
+                step: 10.,
+            }
+            .accumulate(false)
+            .unwrap(),
+        ];
         assert_eq!(GridPair::new(&grids).points().count(), 6);
         assert_eq!(
             GridPair::new(&grids)

@@ -32,6 +32,7 @@
 //! exactly singular matrix.
 
 use crate::analysis::ac::{GridKind, SmallSignal, frequency_grid};
+use crate::analysis::frequency::FrequencyPlan;
 use crate::analysis::linear::{plot, unsupported};
 use crate::analysis::results::Variable;
 use crate::analysis::{AnalysisPlan, Plot};
@@ -229,7 +230,7 @@ impl BoundPort {
     }
 }
 
-pub(super) fn parse(positional: &[String], reltol: Real) -> SpiceResult<(Vec<Real>, bool)> {
+pub(super) fn parse(positional: &[String], reltol: Real) -> SpiceResult<(FrequencyPlan, bool)> {
     if !matches!(positional.len(), 4 | 5) {
         return Err(unsupported(".sp lin|dec|oct points start stop [donoise]"));
     }
@@ -252,7 +253,7 @@ pub(super) fn parse(positional: &[String], reltol: Real) -> SpiceResult<(Vec<Rea
 /// circuit's row numbering for this sweep.
 struct RfPlan<'a> {
     ports: Vec<BoundPort>,
-    grid: &'a [Real],
+    grid: &'a FrequencyPlan,
     unknowns: usize,
     budget: RfBudget,
     noise: bool,
@@ -261,7 +262,7 @@ struct RfPlan<'a> {
 impl<'a> RfPlan<'a> {
     fn bind(
         circuit: &Circuit,
-        grid: &'a [Real],
+        grid: &'a FrequencyPlan,
         noise: bool,
         bias: bool,
         limits: RfLimits,
@@ -282,8 +283,8 @@ impl<'a> RfPlan<'a> {
             limits,
         )?;
         if grid
-            .iter()
-            .any(|&f| !(2. * std::f64::consts::PI * f).is_finite())
+            .values()
+            .any(|f| !(2. * std::f64::consts::PI * f).is_finite())
         {
             return Err(unsupported(".sp angular frequency is not finite"));
         }
@@ -302,7 +303,7 @@ pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisPlan,
     context: &crate::analysis::AnalysisContext,
-    grid: &[Real],
+    grid: &FrequencyPlan,
     donoise: bool,
     include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
@@ -317,7 +318,7 @@ pub(super) fn run(
     plot.reserve_points(plan.grid.len())?;
     let reference = plan.ports[0].z0;
     let mut noise_plan: Option<NoisePlan<'_>> = None;
-    for &f in plan.grid {
+    for f in plan.grid.values() {
         let factor = small_signal.at_frequency(context, f, |system| {
             let factor =
                 crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * f)?

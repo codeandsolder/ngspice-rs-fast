@@ -367,7 +367,7 @@ pub(super) enum PlanKind {
         point_iterations: Option<usize>,
     },
     Ac {
-        frequencies: Vec<Real>,
+        frequencies: super::frequency::FrequencyPlan,
         retain_bias: bool,
     },
     Transient {
@@ -380,24 +380,24 @@ pub(super) enum PlanKind {
     },
     TransferFunction(crate::analysis::tf::TransferRequest),
     SParameter {
-        frequencies: Vec<Real>,
+        frequencies: super::frequency::FrequencyPlan,
         donoise: bool,
         retain_bias: bool,
     },
     Noise {
         card: crate::analysis::noise::NoiseCard,
-        frequencies: Vec<Real>,
+        frequencies: super::frequency::FrequencyPlan,
         options: crate::analysis::NoiseOptions,
         retain_bias: bool,
     },
     Distortion {
         card: crate::analysis::disto::DistoCard,
-        frequencies: Vec<Real>,
+        frequencies: super::frequency::FrequencyPlan,
         retain_bias: bool,
     },
     Sensitivity {
         card: crate::analysis::sens::SensCard,
-        frequencies: Option<Vec<Real>>,
+        frequencies: Option<super::frequency::FrequencyPlan>,
     },
 }
 
@@ -515,8 +515,7 @@ impl AnalysisPlan {
             }
             AnalysisKind::Noise => {
                 let card = noise::parse(&positional)?;
-                let frequencies =
-                    noise::frequency_grid(&card, reltol)?.collect::<SpiceResult<_>>()?;
+                let frequencies = noise::frequency_grid(&card, reltol)?;
                 PlanKind::Noise {
                     card,
                     frequencies,
@@ -551,6 +550,22 @@ impl AnalysisPlan {
             initial_conditions: input.initial_conditions,
             nodesets: input.nodesets,
         })
+    }
+
+    /// Bounded deterministic coordinate work requested by this plan.
+    /// Adaptive transient stepping is separately governed by its own limits.
+    pub(super) fn requested_grid_points(&self) -> usize {
+        match &self.analysis {
+            PlanKind::Dc { axes, .. } => axes.point_count(),
+            PlanKind::Ac { frequencies, .. }
+            | PlanKind::SParameter { frequencies, .. }
+            | PlanKind::Noise { frequencies, .. }
+            | PlanKind::Distortion { frequencies, .. } => frequencies.len(),
+            PlanKind::Sensitivity { frequencies, .. } => frequencies
+                .as_ref()
+                .map_or(0, super::frequency::FrequencyPlan::len),
+            _ => 0,
+        }
     }
 
     /// The kind encoded by the checked analysis payload.
@@ -613,13 +628,15 @@ impl AnalysisPlan {
 
     /// Checked frequency points in the reference algorithm's order.
     #[must_use]
-    pub fn frequencies(&self) -> Option<&[Real]> {
+    pub fn frequencies(&self) -> Option<impl ExactSizeIterator<Item = Real> + Clone + '_> {
         match &self.analysis {
             PlanKind::Ac { frequencies, .. }
             | PlanKind::SParameter { frequencies, .. }
             | PlanKind::Noise { frequencies, .. }
-            | PlanKind::Distortion { frequencies, .. } => Some(frequencies),
-            PlanKind::Sensitivity { frequencies, .. } => frequencies.as_deref(),
+            | PlanKind::Distortion { frequencies, .. } => Some(frequencies.values()),
+            PlanKind::Sensitivity { frequencies, .. } => frequencies
+                .as_ref()
+                .map(super::frequency::FrequencyPlan::values),
             _ => None,
         }
     }
@@ -715,7 +732,7 @@ impl AnalysisPlan {
             return Err(unsupported("sensitivity resolution requires a .sens plan"));
         };
         let (plot, resolution) =
-            super::sens::run(circuit, self, context, card, frequencies.as_deref(), true)?;
+            super::sens::run(circuit, self, context, card, frequencies.as_ref(), true)?;
         let resolution = resolution.ok_or_else(|| unsupported("missing sensitivity resolution"))?;
         Ok((plot, resolution))
     }
@@ -759,7 +776,7 @@ impl AnalysisPlan {
                 card, frequencies, ..
             } => disto::run(circuit, self, context, card, frequencies, retain_bias)?,
             PlanKind::Sensitivity { card, frequencies } => {
-                vec![sens::run(circuit, self, context, card, frequencies.as_deref(), false)?.0]
+                vec![sens::run(circuit, self, context, card, frequencies.as_ref(), false)?.0]
             }
         };
         for plot in plots {
