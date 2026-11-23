@@ -53,7 +53,7 @@ fn reconstructs_three_distinct_real_stable_poles_and_dc_limit() {
 }
 
 fn complex_kernel(rate: f64, leading: f64, pole: Complex, residue: Complex) -> f64 {
-    leading + 2. * (residue / (Complex::real(rate) - pole)).re
+    2.0_f64.mul_add((residue / (Complex::real(rate) - pole)).re, leading)
 }
 
 #[test]
@@ -65,9 +65,8 @@ fn reconstructs_one_real_pole_plus_complex_conjugate_pair() {
     let leading = 1.5;
     let mut power = Complex::real(1.);
     let series = std::array::from_fn(|order| {
-        let value = (real_residue * real_pole.powi([0, 1, 2, 3, 4][order])
-            + 2. * (residue * power).re)
-            / leading;
+        let real_contribution = real_residue * real_pole.powi([0, 1, 2, 3, 4][order]);
+        let value = 2.0_f64.mul_add((residue * power).re, real_contribution) / leading;
         power = power * pole;
         value
     });
@@ -118,10 +117,11 @@ fn scalar_characteristic_admittance_matches_coupled_spectral_sampler() {
     // H(s)/H(infinity) = sqrt((1 + G/C/s) / (1 + R/L/s)).
     // Derive its inverse-rate coefficients by enforcing
     // H(y)^2(1+b*y) = 1+a*y, without numerical differentiation.
-    let (r, l, g, c): (f64, f64, f64, f64) = (3., 1e-6, 0.01, 1e-8);
-    let leading = (c / l).sqrt();
-    let dc = (g / r).sqrt();
-    let (a, b) = (g / c, r / l);
+    let (resistance, inductance, conductance, capacitance): (f64, f64, f64, f64) =
+        (3., 1e-6, 0.01, 1e-8);
+    let leading = (capacitance / inductance).sqrt();
+    let dc = (conductance / resistance).sqrt();
+    let (parallel_rate, series_rate) = (conductance / capacitance, resistance / inductance);
     let mut coefficients = [0.; 6];
     coefficients[0] = 1.;
     for order in 1..=5 {
@@ -131,12 +131,19 @@ fn scalar_characteristic_admittance_matches_coupled_spectral_sampler() {
         let previous_square: f64 = (0..order)
             .map(|i| coefficients[i] * coefficients[order - i - 1])
             .sum();
-        let input = if order == 1 { a } else { 0. };
-        coefficients[order] = (input - middle - b * previous_square) / 2.;
+        let input = if order == 1 { parallel_rate } else { 0. };
+        coefficients[order] = series_rate.mul_add(-previous_square, input - middle) / 2.;
     }
     let fit = CplPade::fit(leading, coefficients[1..].try_into().unwrap(), dc).unwrap();
-    let physical =
-        ngspice_rs::devices::cpl::plan::CplPlan::prepare(1, 1., &[r], &[l], &[g], &[c]).unwrap();
+    let physical = ngspice_rs::devices::cpl::plan::CplPlan::prepare(
+        1,
+        1.,
+        &[resistance],
+        &[inductance],
+        &[conductance],
+        &[capacitance],
+    )
+    .unwrap();
     for rate in [1e7, 2e7, 5e7, 1e8] {
         let true_sample = physical
             .laplace_sample(rate)
@@ -182,7 +189,7 @@ fn eight_sample_polynomial_matching_recovers_the_c_rational_fit() {
         let value = coefficients
             .iter()
             .rev()
-            .fold(0., |value, &coefficient| value * x + coefficient);
+            .fold(0.0_f64, |value, &coefficient| value.mul_add(x, coefficient));
         (x, value)
     });
     let dc = real_kernel(0., leading, poles, residues);

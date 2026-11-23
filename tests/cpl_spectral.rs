@@ -13,20 +13,29 @@ fn close(actual: f64, expected: f64, relative: f64) {
 
 #[test]
 fn single_wire_matches_exact_distributed_rlgc_two_port() {
-    let (r, l, g, c, length, rate) = (2., 3e-6, 5e-4, 9e-10, 0.8, 1e6);
-    let plan = CplPlan::prepare(1, length, &[r], &[l], &[g], &[c]).unwrap();
+    let (resistance, inductance, conductance, capacitance, length, rate) =
+        (2., 3e-6, 5e-4, 9e-10, 0.8, 1e6);
+    let plan = CplPlan::prepare(
+        1,
+        length,
+        &[resistance],
+        &[inductance],
+        &[conductance],
+        &[capacitance],
+    )
+    .unwrap();
     let sample = plan.laplace_sample(rate).unwrap();
-    let z = r + rate * l;
-    let y = g + rate * c;
-    let propagation = f64::sqrt(z * y) * length;
-    let admittance = f64::sqrt(y / z);
+    let series_impedance = rate.mul_add(inductance, resistance);
+    let shunt_admittance = rate.mul_add(capacitance, conductance);
+    let propagation = f64::sqrt(series_impedance * shunt_admittance) * length;
+    let admittance = f64::sqrt(shunt_admittance / series_impedance);
     let decay = f64::exp(-propagation);
     let denominator = -f64::exp_m1(-2. * propagation);
     close(sample.modes().modal_admittances()[0], admittance, 1e-12);
     close(sample.attenuation()[0], decay, 1e-12);
     close(
         sample.self_admittance().get(0, 0).unwrap(),
-        admittance * (1. + decay * decay) / denominator,
+        admittance * decay.mul_add(decay, 1.) / denominator,
         1e-12,
     );
     close(
@@ -126,7 +135,7 @@ fn noncommuting_lossy_coupling_has_symmetric_positive_two_port() {
     }
     // The 2n two-port [A,-B;-B,A] is SPD precisely when A+B and
     // A-B are both SPD. This asserts positive-real port passivity.
-    for polarity in [-1., 1.] {
+    for polarity in [-1.0_f64, 1.0_f64] {
         let mut block = Matrix::zeros(3, 3).unwrap();
         for row in 0..3 {
             for col in 0..3 {
@@ -134,7 +143,7 @@ fn noncommuting_lossy_coupling_has_symmetric_positive_two_port() {
                     .set(
                         row,
                         col,
-                        a.get(row, col).unwrap() + polarity * b.get(row, col).unwrap(),
+                        polarity.mul_add(b.get(row, col).unwrap(), a.get(row, col).unwrap()),
                     )
                     .unwrap();
             }
