@@ -484,11 +484,12 @@ fn diode_tile_load_and_solve_benchmark() {
                 };
                 let mut matrix = circuit.new_matrix().unwrap();
                 let mut rhs = Vector::zeros(circuit.unknown_count());
-                let mut records = Vec::with_capacity(3);
-                for repeat in 0..4 {
+                let trials = (65_536 / count).max(32);
+                let mut records = Vec::with_capacity(5);
+                for repeat in 0..6 {
                     let mut load_ns = 0_u128;
                     let mut solve_ns = 0_u128;
-                    for _ in 0..48 {
+                    for _ in 0..trials {
                         matrix.clear();
                         rhs.clear();
                         let mut trial = history.trial();
@@ -511,9 +512,9 @@ fn diode_tile_load_and_solve_benchmark() {
                 solves.sort_unstable();
                 println!(
                     "diode_family={family},diode_count={count},active_lanes={lanes},batched={batched},load_ns_per_trial={},solve_ns_per_trial={},total_ns_per_trial={}",
-                    loads[1] / 48,
-                    solves[1] / 48,
-                    (loads[1] + solves[1]) / 48
+                    loads[2] / trials as u128,
+                    solves[2] / trials as u128,
+                    (loads[2] + solves[2]) / trials as u128
                 );
             }
         }
