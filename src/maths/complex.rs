@@ -429,12 +429,14 @@ impl ComplexMatrix {
     /// to the circuit cache for the next spectral analysis.
     ///
     /// # Errors
-    /// A numerical failure is attributed to the earliest input point.
+    /// Resource and tile-shape errors abort the entire batch. Numerical
+    /// failures are returned in frequency order so earlier successful
+    /// outputs are emitted before the first failing point.
     pub(crate) fn factorize_batch(
         matrices: &[Self],
         previous: Option<&ComplexLu>,
         work: &mut ComplexFactorBatch,
-    ) -> SpiceResult<Vec<ComplexLu>> {
+    ) -> SpiceResult<Vec<SpiceResult<ComplexLu>>> {
         if matrices.is_empty() {
             return Ok(Vec::new());
         }
@@ -444,8 +446,23 @@ impl ComplexMatrix {
                 "too many frequency lanes",
             ));
         }
+        let serial = || -> SpiceResult<Vec<SpiceResult<ComplexLu>>> {
+            let mut results = Vec::new();
+            results.try_reserve(matrices.len()).map_err(|error| {
+                numerical("complex factor batch", format!("factor capacity: {error}"))
+            })?;
+            for matrix in matrices {
+                let factor = matrix.factorize();
+                let failed = factor.is_err();
+                results.push(factor);
+                if failed {
+                    break;
+                }
+            }
+            Ok(results)
+        };
         let Assembly::Bound { pattern, .. } = &matrices[0].assembly else {
-            return matrices.iter().map(Self::factorize).collect();
+            return serial();
         };
         if matrices.iter().any(|matrix| {
             !matches!(&matrix.assembly, Assembly::Bound { pattern: other, .. } if Arc::ptr_eq(pattern, other))
@@ -453,7 +470,7 @@ impl ComplexMatrix {
                 || matrix.pivot.relative.to_bits() != matrices[0].pivot.relative.to_bits()
                 || matrix.pivot.absolute.to_bits() != matrices[0].pivot.absolute.to_bits()
         }) {
-            return matrices.iter().map(Self::factorize).collect();
+            return serial();
         }
         let compatible = previous.filter(|factor| {
             factor.n == matrices[0].n
@@ -480,34 +497,42 @@ impl ComplexMatrix {
         let lane_frames =
             Sparse::factor_complex_batch(&baseline.factors.sparse, &coefficients, work)?;
         if let Some(first) = first {
-            factors.push(first);
+            factors.push(Ok(first));
         }
+        let mut work_used = FactorWork::default();
         for (frame, status, factor_work) in lane_frames {
-            check_status(
+            work_used += factor_work;
+            let result = check_status(
                 "complex sparse LU",
                 status,
                 &frame,
                 matrices[factors.len()].names.as_ref(),
-            )?;
-            let attempt = factor_work;
-            factors.push(ComplexLu {
+            )
+            .map(|()| ComplexLu {
                 n: matrices[0].n,
                 order: ComplexOrder::Bound(Arc::clone(pattern)),
                 factors: ComplexFactors {
                     sparse: Arc::new(frame),
-                    work: attempt,
+                    work: factor_work,
                 },
             });
+            let failed = result.is_err();
+            factors.push(result);
+            if failed {
+                break;
+            }
         }
         if factors.len() > start {
+            let last_good = factors
+                .iter()
+                .rev()
+                .find_map(|factor| factor.as_ref().ok().map(|factor| factor.factors.clone()));
             pattern.with_ordering(|state| {
-                for factor in &factors[start..] {
-                    state.work.factor += factor.factors.work;
+                state.work.factor += work_used;
+                if let Some(factors) = last_good {
+                    state.ac_reorder = false;
+                    state.frame = Some(CachedFrame::Complex(factors));
                 }
-                state.ac_reorder = false;
-                state.frame = factors
-                    .last()
-                    .map(|last| CachedFrame::Complex(last.factors.clone()));
             });
         }
         Ok(factors)
@@ -760,6 +785,65 @@ mod tests {
             overflow.add(0, 0, v).unwrap();
         }
         assert!(ComplexMatrix::from_operators(&overflow, &SparseMatrix::new(1, 1), 1.).is_err());
+    }
+
+    #[test]
+    fn frequency_batch_defers_later_failure_until_earlier_points_are_consumed() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
+        let mut a = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        a.set(0, 0, 3.).unwrap();
+        a.set(0, 1, 1.).unwrap();
+        a.set(1, 0, 1.).unwrap();
+        a.set(1, 1, 4.).unwrap();
+        let mut e = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        e.set(1, 1, 0.25).unwrap();
+        let frequencies = [1., 2., 3., 4.];
+        let mut matrices = frequencies.map(|f| {
+            ComplexMatrix::from_operators_on(&pattern, &a, &e, f)
+                .unwrap()
+                .unwrap()
+        });
+        let Assembly::Bound { values, .. } = &mut matrices[2].assembly else {
+            panic!("bound matrix");
+        };
+        values.fill(Complex::ZERO);
+
+        let mut work = ComplexFactorBatch::default();
+        let output = ComplexMatrix::factorize_batch(&matrices, None, &mut work).unwrap();
+        assert_eq!(output.len(), 3, "stop after first failing input");
+        assert!(output[0].is_ok());
+        assert!(output[1].is_ok());
+        assert!(output[2].is_err());
+        let rhs = [Complex::real(1.), Complex::real(-2.)];
+        for (index, result) in output.iter().take(2).enumerate() {
+            let independent = matrices[index].factorize().unwrap();
+            let batched = result.as_ref().unwrap();
+            for transposed in [false, true] {
+                let x = if transposed {
+                    independent.solve_transposed(&rhs).unwrap()
+                } else {
+                    independent.solve(&rhs).unwrap()
+                };
+                let y = if transposed {
+                    batched.solve_transposed(&rhs).unwrap()
+                } else {
+                    batched.solve(&rhs).unwrap()
+                };
+                assert_eq!(
+                    x.into_iter()
+                        .map(|v| [v.re.to_bits(), v.im.to_bits()])
+                        .collect::<Vec<_>>(),
+                    y.into_iter()
+                        .map(|v| [v.re.to_bits(), v.im.to_bits()])
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        let next =
+            ComplexMatrix::factorize_batch(&matrices[3..], output[1].as_ref().ok(), &mut work)
+                .unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(next[0].is_ok(), "later valid input remains factorable");
     }
 
     #[test]
