@@ -76,9 +76,12 @@ fn c_defaults_come_from_the_analysis_not_the_parser() {
 #[test]
 fn the_last_waveform_setter_wins_like_c() {
     let s = system("v1 in 0 pwl(0 1 1 2) pulse(5 6 0 1 1 1 4)\nr1 in 0 1k");
-    assert!(matches!(s.sources[0].waveform, Waveform::PulseDefaults(_)));
+    assert!(matches!(
+        s.sources[0].waveform.as_ref(),
+        Waveform::PulseDefaults(_)
+    ));
     let s = system("v1 in 0 pulse(5 6 0 1 1 1 4) pwl(0 1 1 2)\nr1 in 0 1k");
-    assert!(matches!(s.sources[0].waveform, Waveform::Pwl(_)));
+    assert!(matches!(s.sources[0].waveform.as_ref(), Waveform::Pwl(_)));
 }
 
 #[test]
@@ -126,7 +129,10 @@ fn invalid_decks_and_timing_are_explicit_errors() {
         assert!(TransientTiming::new(bad.0, bad.1).is_err());
     }
     assert!(s.transient_rhs(f64::NAN, Limit::Right).is_err());
-    assert!(matches!(s.sources[0].waveform, Waveform::PulseDefaults(_)));
+    assert!(matches!(
+        s.sources[0].waveform.as_ref(),
+        Waveform::PulseDefaults(_)
+    ));
 }
 
 fn build_error(body: &str) -> String {
@@ -267,12 +273,12 @@ fn every_r_setter_is_validated_in_order_like_c() {
     }
     // Valid setters: the last wins, and r=-1 switches repetition off again.
     let s = system("v1 a 0 pwl(0 0 1m 1 2m 0) r=1m r=0\nr1 a 0 1");
-    let Waveform::Pwl(pwl) = &s.sources[0].waveform else {
+    let Waveform::Pwl(pwl) = s.sources[0].waveform.as_ref() else {
         panic!("{:?}", s.sources[0].waveform);
     };
     assert_eq!(pwl.repeat(), Some(0));
     let s = system("v1 a 0 pwl(0 0 1m 1 2m 0) r=0 r=-1\nr1 a 0 1");
-    let Waveform::Pwl(pwl) = &s.sources[0].waveform else {
+    let Waveform::Pwl(pwl) = s.sources[0].waveform.as_ref() else {
         panic!("{:?}", s.sources[0].waveform);
     };
     assert_eq!(pwl.repeat(), None);

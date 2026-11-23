@@ -8,8 +8,10 @@
 //! therefore a Thevenin source with series resistance `z0`, and its branch
 //! current is the current through the ideal source from `<name>#res` to the
 //! negative terminal. See `docs/port/SPARAM.md`.
+use crate::devices::linear::SourceRows;
 use crate::devices::{AnalysisMode, Device, LinearContext, LinearSource, StampContext, Waveform};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
+use std::sync::Arc;
 
 /// The RFSPICE port data of a voltage source (C `VSRCisPort` and its
 /// `VSRCportNum`, `VSRCportZ0`, `VSRCportPower`, `VSRCportFreq`,
@@ -148,7 +150,7 @@ pub struct SourceInputs {
 /// Independent V or I source. AC, DC and transient excitations are distinct.
 #[derive(Debug, Clone)]
 pub struct IndependentSource {
-    name: String,
+    name: Arc<String>,
     /// Inline `[positive, negative, internal]`. The third entry is exposed
     /// only when a port is present.
     terminals: [NodeId; 3],
@@ -159,8 +161,8 @@ pub struct IndependentSource {
     pub(super) function_given: bool,
     /// The source's immutable original function. Only PORT accumulation
     /// has a second, derived waveform.
-    waveform: Waveform,
-    accumulated_waveform: Option<Box<Waveform>>,
+    waveform: Arc<Waveform>,
+    accumulated_waveform: Option<Arc<Waveform>>,
     power_tone: Option<(Real, Real)>,
     port: Option<RfPort>,
     /// `distof1`/`distof2` distortion inputs (C `VSRCdF1given`, ...).
@@ -230,7 +232,7 @@ impl SourceExcitation {
 
     pub(super) fn bind(self, name: impl Into<String>, terminals: [NodeId; 2]) -> IndependentSource {
         IndependentSource {
-            name: name.into(),
+            name: Arc::new(name.into()),
             terminals: [terminals[0], terminals[1], NodeId::GROUND],
             voltage: self.voltage,
             dc: self.dc,
@@ -239,7 +241,7 @@ impl SourceExcitation {
             function_given: self.function_given,
             accumulated_waveform: None,
             power_tone: None,
-            waveform: self.waveform,
+            waveform: Arc::new(self.waveform),
             port: None,
             distortion: [None, None],
         }
@@ -386,6 +388,13 @@ impl IndependentSource {
         self.accumulated_waveform
             .as_deref()
             .unwrap_or(&self.waveform)
+    }
+
+    fn effective_waveform_handle(&self) -> Arc<Waveform> {
+        self.accumulated_waveform
+            .as_ref()
+            .unwrap_or(&self.waveform)
+            .clone()
     }
 
     /// The terminals of the ideal source: `[positive, negative]`, or
@@ -604,7 +613,7 @@ impl Device for IndependentSource {
             tones.push(tone);
             let accumulated = Waveform::PortSeries { baseline, tones };
             accumulated.validate()?;
-            self.accumulated_waveform = Some(Box::new(accumulated));
+            self.accumulated_waveform = Some(Arc::new(accumulated));
             self.dc.accumulate(Some(previous_dc + tone.0));
             if !self.dc.value().is_finite() {
                 return Err(SpiceError::circuit("nonfinite PORT DC accumulation"));
@@ -694,26 +703,23 @@ impl Device for IndependentSource {
         if let Some(port) = &self.port {
             context.nodal([self.terminals[0], port.internal], 1. / port.z0, false)?;
         }
-        let rows = if self.voltage {
-            vec![(context.branch(self.ideal())?, 1.)]
+        let mut rows = SourceRows::new();
+        if self.voltage {
+            rows.push(context.branch(self.ideal())?, 1.)?;
         } else {
-            [(self.terminals[0], -1.), (self.terminals[1], 1.)]
-                .into_iter()
-                .filter_map(|(node, sign)| {
-                    context
-                        .unknowns
-                        .node_row(node)
-                        .map(|r| (r, sign * self.multiplier.unwrap_or(1.)))
-                })
-                .collect()
-        };
+            for (node, sign) in [(self.terminals[0], -1.), (self.terminals[1], 1.)] {
+                if let Some(row) = context.unknowns.node_row(node) {
+                    rows.push(row, sign * self.multiplier.unwrap_or(1.))?;
+                }
+            }
+        }
         context.system.sources.push(LinearSource {
             name: self.name.clone(),
             kind: self.source_kind(),
             rows,
             dc: self.dc.value(),
             ac: self.ac.phasor,
-            waveform: self.effective_waveform().clone(),
+            waveform: self.effective_waveform_handle(),
         });
         Ok(())
     }
@@ -790,7 +796,7 @@ mod tests {
                 .unwrap();
             assert_eq!(actual, expected);
             assert_eq!(dc, 0.);
-            assert_eq!(source.waveform, original);
+            assert_eq!(*source.waveform, original);
         }
         source.power_tone = None;
         let (actual, dc) = source

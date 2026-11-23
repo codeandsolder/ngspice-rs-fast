@@ -426,8 +426,18 @@ fn polar_ac_coefficients_and_phase_overrides_match_c() {
             .unwrap();
         let swept = circuit.linear_system_with_context(&overrides).unwrap();
         for (name, node, sign) in [("v1", "v(a)", 1.), ("i1", "v(b)", -1.)] {
-            let a = initial.sources.iter().find(|s| s.name == name).unwrap().ac;
-            let b = swept.sources.iter().find(|s| s.name == name).unwrap().ac;
+            let a = initial
+                .sources
+                .iter()
+                .find(|s| s.name.as_str() == name)
+                .unwrap()
+                .ac;
+            let b = swept
+                .sources
+                .iter()
+                .find(|s| s.name.as_str() == name)
+                .unwrap()
+                .ac;
             assert_eq!(
                 [a.re.to_bits(), a.im.to_bits()],
                 [b.re.to_bits(), b.im.to_bits()]
@@ -494,7 +504,7 @@ ra a 0 1\nrb b 0 1\nrc c 0 1\nrd d 0 1\n.tran 10u 2m\n.end\n";
         let source = system
             .sources
             .iter()
-            .find(|s| s.name == source_name)
+            .find(|s| s.name.as_str() == source_name)
             .unwrap();
         let expected = plot.column(node).unwrap();
         assert_eq!(times.len(), expected.len());
