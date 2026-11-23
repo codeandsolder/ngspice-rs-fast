@@ -39,6 +39,7 @@
 //! lives in [`crate::devices::sensitivity`]; see `docs/port/SENSITIVITY.md`.
 
 use super::frequency::FrequencyPlan;
+use super::output_probe::{self, Card, Output, Probe, parse_output};
 use super::reduction::CompensatedSum;
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{PlotFlags, Variable};
@@ -52,9 +53,7 @@ use crate::devices::{AnalysisMode, Circuit, Device, IterationPhase, LoadRequest,
 use crate::maths::complex::ComplexMatrix;
 use crate::maths::linear::solve_last_factors_transposed;
 use crate::maths::{SparseMatrix, Vector};
-use crate::primitives::{
-    Complex, NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult, parse_spice_number,
-};
+use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
 
 /// `Sens_Delta` of `cktsens.c`: the relative perturbation.
 pub(super) const RELATIVE_DELTA: Real = 1e-6;
@@ -178,15 +177,6 @@ pub(in crate::analysis) fn conditioned_derivative(
     }))
 }
 
-/// The `.sens` output variable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Output {
-    /// `v(pos)` or `v(pos,neg)`.
-    Voltage { pos: String, neg: Option<String> },
-    /// `i(source)`.
-    Current { source: String },
-}
-
 /// The AC stepping of `senssetp.c` (`SENS_DECADE`, `SENS_OCTAVE`,
 /// `SENS_LINEAR`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,49 +235,7 @@ fn integer(text: Option<&str>) -> SpiceResult<i32> {
 /// Parses the arguments of a `.sens` card (`dot_sens()`).
 pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
     let mut tokens = arguments.iter().map(String::as_str).peekable();
-    let expect = |wanted: &str, token: Option<&str>| match token {
-        Some(text) if text == wanted => Ok(()),
-        Some(text) => Err(syntax(format!("expected '{wanted}', found '{text}'"))),
-        None => Err(syntax(format!("is missing '{wanted}'"))),
-    };
-    let name = |token: Option<&str>, what: &str| -> SpiceResult<String> {
-        match token {
-            Some(text) if !matches!(text, "(" | ")" | ",") => Ok(text.to_ascii_lowercase()),
-            Some(text) => Err(syntax(format!("expected {what}, found '{text}'"))),
-            None => Err(syntax(format!("is missing {what}"))),
-        }
-    };
-    let kind = tokens
-        .next()
-        .ok_or_else(|| syntax("has no output variable"))?
-        .to_ascii_lowercase();
-    let output = match kind.as_str() {
-        "v" => {
-            expect("(", tokens.next())?;
-            let pos = name(tokens.next(), "an output node")?;
-            if tokens.peek().is_some_and(|token| *token == ",") {
-                tokens.next();
-            }
-            let neg = if tokens.peek().is_some_and(|token| *token == ")") {
-                None
-            } else {
-                Some(name(tokens.next(), "the negative output node")?)
-            };
-            expect(")", tokens.next())?;
-            Output::Voltage { pos, neg }
-        }
-        "i" => {
-            expect("(", tokens.next())?;
-            let source = name(tokens.next(), "an output source")?;
-            expect(")", tokens.next())?;
-            Output::Current { source }
-        }
-        other => {
-            return Err(syntax(format!(
-                "output '{other}' is neither a voltage v(...) nor a current i(...)"
-            )));
-        }
-    };
+    let output = parse_output(&mut tokens, syntax)?;
     let mut filters = Vec::new();
     let mut sweep = None;
     let mut physical = false;
@@ -624,18 +572,6 @@ fn scan(filter: &[u8], name: &[u8]) -> bool {
     n == name.len() && (f == filter.len() || (filter[f] == b'*' && f + 1 == filter.len()))
 }
 
-/// Where the output is read.
-#[derive(Debug, Clone, Copy)]
-enum Probe {
-    Voltage {
-        pos: Option<usize>,
-        neg: Option<usize>,
-    },
-    Current {
-        row: usize,
-    },
-}
-
 impl Probe {
     /// The unknowns the output reads.
     fn rows(&self) -> impl Iterator<Item = usize> {
@@ -680,67 +616,6 @@ impl Probe {
         match self {
             Self::Voltage { .. } => options.vntol,
             Self::Current { .. } => options.abstol,
-        }
-    }
-}
-
-fn not_found(message: impl std::fmt::Display) -> SpiceError {
-    SpiceError::Circuit {
-        message: format!("{message} (C: sens_sens in cktsens.c)"),
-    }
-}
-
-fn node_row(circuit: &Circuit, name: &str) -> SpiceResult<Option<usize>> {
-    let canonical = NodeTable::canonical_name(name, circuit.nodes().auto_gnd());
-    let id = circuit.nodes().get(&canonical).ok_or_else(|| {
-        not_found(format_args!(
-            ".sens output node {name} is not in the circuit"
-        ))
-    })?;
-    let row = circuit.unknowns().node_row(id);
-    let ground = circuit
-        .nodes()
-        .node(id)
-        .is_some_and(|node| node.kind == NodeKind::Ground);
-    if row.is_none() && !ground {
-        return Err(not_found(format_args!(
-            ".sens output node {name} has no matrix row"
-        )));
-    }
-    Ok(row)
-}
-
-fn resolve_output(circuit: &Circuit, output: &Output) -> SpiceResult<Probe> {
-    match output {
-        Output::Voltage { pos, neg } => Ok(Probe::Voltage {
-            pos: node_row(circuit, pos)?,
-            neg: match neg {
-                Some(neg) => node_row(circuit, neg)?,
-                None => None,
-            },
-        }),
-        Output::Current { source } => {
-            let device = circuit
-                .devices()
-                .iter()
-                .position(|device| device.name().eq_ignore_ascii_case(source))
-                .ok_or_else(|| {
-                    not_found(format_args!(
-                        ".sens output source {source} is not in the circuit"
-                    ))
-                })?;
-            let branch = circuit.devices()[device].findable_branch().ok_or_else(|| {
-                unsupported(format!(
-                    ".sens i({source}): the device has no findable branch current (only \
-                     independent voltage sources, E/H sources and voltage B sources can be \
-                     sensed, as by CKTfndBranch; C would silently read ground)"
-                ))
-            })?;
-            let row = circuit
-                .branch_rows(device)
-                .and_then(|mut rows| rows.nth(branch))
-                .ok_or_else(|| not_found(format_args!("{source}: missing branch row")))?;
-            Ok(Probe::Current { row })
         }
     }
 }
@@ -1762,7 +1637,7 @@ pub(super) fn run(
     let ac = grid.is_some();
     circuit.finalize()?;
     let circuit: &Circuit = circuit;
-    let probe = resolve_output(circuit, &card.output)?;
+    let probe = output_probe::bind(circuit, &card.output, Card::Sens)?.probe;
     let model = context.model_context();
 
     let mut workspace = ParameterWalk::new(circuit, &model, ac, &card.filters, card.physical)?;

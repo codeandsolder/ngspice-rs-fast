@@ -47,12 +47,13 @@
 //!   branch current (C `CKTfndBranch`: V, E, H and voltage B sources);
 //! * C ignores tokens after the input source; the port rejects them.
 
+use super::output_probe::{self, Card, Output, Probe, device_index, parse_output};
 use crate::analysis::linear::unsupported;
 use crate::analysis::results::{PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan, Plot};
 use crate::devices::Circuit;
 use crate::maths::Vector;
-use crate::primitives::{Complex, NodeKind, NodeTable, Real, SpiceError, SpiceResult};
+use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 /// `TFanal()`'s threshold below which a branch current is treated as zero and
 /// the resistance reported as [`OPEN_RESISTANCE`].
@@ -61,23 +62,6 @@ const ZERO_CURRENT: Real = 1e-20;
 /// The resistance `TFanal()` reports when the unit excitation drives no
 /// current.
 const OPEN_RESISTANCE: Real = 1e20;
-
-/// The `.tf` output variable as written on the card.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Output {
-    /// `v(pos)` or `v(pos,neg)`.
-    Voltage {
-        /// The positive node as written.
-        pos: String,
-        /// The negative node as written, `None` for ground.
-        neg: Option<String>,
-    },
-    /// `i(source)`: the branch current of a device with a findable branch.
-    Current {
-        /// The device name as written.
-        source: String,
-    },
-}
 
 /// A parsed `.tf` card.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,53 +88,13 @@ fn syntax(message: impl std::fmt::Display) -> SpiceError {
 /// [`SpiceError::Unsupported`] for anything but `v(n)`, `v(n,m)` or `i(src)`
 /// followed by exactly one input source name.
 pub(super) fn parse(positional: &[&str]) -> SpiceResult<TransferRequest> {
-    let name = |token: Option<&&str>, what: &str| -> SpiceResult<String> {
-        match token {
-            Some(text) if !matches!(*text, "(" | ")" | ",") => Ok(text.to_ascii_lowercase()),
-            Some(text) => Err(syntax(format!("expected {what}, found '{text}'"))),
-            None => Err(syntax(format!("is missing {what}"))),
-        }
+    let mut tokens = positional.iter().copied().peekable();
+    let output = parse_output(&mut tokens, syntax)?;
+    let input = match tokens.next() {
+        Some(text) if !matches!(text, "(" | ")" | ",") => text.to_ascii_lowercase(),
+        Some(text) => return Err(syntax(format!("expected the input source, found '{text}'"))),
+        None => return Err(syntax("is missing the input source")),
     };
-    let expect = |token: Option<&&str>, wanted: &str| -> SpiceResult<()> {
-        match token {
-            Some(text) if *text == wanted => Ok(()),
-            Some(text) => Err(syntax(format!("expected '{wanted}', found '{text}'"))),
-            None => Err(syntax(format!("is missing '{wanted}'"))),
-        }
-    };
-    let mut tokens = positional.iter().peekable();
-    let kind = tokens
-        .next()
-        .ok_or_else(|| syntax("has no output variable"))?
-        .to_ascii_lowercase();
-    let output = match kind.as_str() {
-        "v" => {
-            expect(tokens.next(), "(")?;
-            let pos = name(tokens.next(), "an output node")?;
-            if tokens.peek().is_some_and(|token| **token == ",") {
-                tokens.next();
-            }
-            let neg = if tokens.peek().is_some_and(|token| **token == ")") {
-                None
-            } else {
-                Some(name(tokens.next(), "the negative output node")?)
-            };
-            expect(tokens.next(), ")")?;
-            Output::Voltage { pos, neg }
-        }
-        "i" => {
-            expect(tokens.next(), "(")?;
-            let source = name(tokens.next(), "an output source")?;
-            expect(tokens.next(), ")")?;
-            Output::Current { source }
-        }
-        other => {
-            return Err(syntax(format!(
-                "output '{other}' is neither a voltage v(...) nor a current i(...)"
-            )));
-        }
-    };
-    let input = name(tokens.next(), "the input source")?;
     if let Some(extra) = tokens.next() {
         return Err(syntax(format!(
             "has an unexpected argument '{extra}' after the input source"
@@ -187,50 +131,13 @@ enum Input {
     },
 }
 
-/// Where the output is read.
-enum Probe {
-    /// `v(pos) - v(neg)`; `None` is ground.
-    Voltage {
-        pos: Option<usize>,
-        neg: Option<usize>,
-    },
-    /// The branch current in `row` of device `device`.
-    Current { device: usize, row: usize },
-}
-
 fn not_found(message: impl std::fmt::Display) -> SpiceError {
     SpiceError::Circuit {
         message: format!("{message} (C: TFanal in tfanal.c)"),
     }
 }
 
-fn node_row(circuit: &Circuit, name: &str) -> SpiceResult<(String, Option<usize>)> {
-    let canonical = NodeTable::canonical_name(name, circuit.nodes().auto_gnd());
-    let id = circuit
-        .nodes()
-        .get(&canonical)
-        .ok_or_else(|| not_found(format_args!(".tf output node {name} is not in the circuit")))?;
-    let row = circuit.unknowns().node_row(id);
-    let is_ground = circuit
-        .nodes()
-        .node(id)
-        .is_some_and(|node| node.kind == NodeKind::Ground);
-    if row.is_none() && !is_ground {
-        return Err(not_found(format_args!(
-            ".tf output node {name} has no matrix row"
-        )));
-    }
-    Ok((canonical, row))
-}
-
-fn device_index(circuit: &Circuit, name: &str) -> Option<usize> {
-    circuit
-        .devices()
-        .iter()
-        .position(|device| device.name().eq_ignore_ascii_case(name))
-}
-
-fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<Input> {
+fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<(Input, usize)> {
     let index = device_index(circuit, name).ok_or_else(|| {
         not_found(format_args!(
             "Transfer function source {name} not in circuit"
@@ -243,7 +150,7 @@ fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<Input> {
                 .branch_rows(index)
                 .and_then(|mut rows| rows.next())
                 .ok_or_else(|| not_found(format_args!("{name}: missing branch row")))?;
-            Ok(Input::Voltage { branch })
+            Ok((Input::Voltage { branch }, index))
         }
         'i' => {
             let row = |terminal: usize| {
@@ -254,50 +161,18 @@ fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<Input> {
                     .ok_or_else(|| not_found(format_args!("{name}: missing terminal")))
                     .map(|node| circuit.unknowns().node_row(node))
             };
-            Ok(Input::Current {
-                plus: row(0)?,
-                minus: row(1)?,
-            })
+            Ok((
+                Input::Current {
+                    plus: row(0)?,
+                    minus: row(1)?,
+                },
+                index,
+            ))
         }
         _ => Err(not_found(format_args!(
             "Transfer function source {name} not of proper type (an independent V or I \
              source is required)"
         ))),
-    }
-}
-
-fn resolve_output(circuit: &Circuit, output: &Output) -> SpiceResult<(Probe, [Option<String>; 2])> {
-    match output {
-        Output::Voltage { pos, neg } => {
-            let (pos_name, pos) = node_row(circuit, pos)?;
-            let (neg_name, neg) = match neg {
-                Some(neg) => {
-                    let (name, row) = node_row(circuit, neg)?;
-                    (Some(name), row)
-                }
-                None => (None, None),
-            };
-            Ok((Probe::Voltage { pos, neg }, [Some(pos_name), neg_name]))
-        }
-        Output::Current { source } => {
-            let device = device_index(circuit, source).ok_or_else(|| {
-                not_found(format_args!(
-                    ".tf output source {source} is not in the circuit"
-                ))
-            })?;
-            let branch = circuit.devices()[device].findable_branch().ok_or_else(|| {
-                unsupported(format!(
-                    ".tf i({source}): the device has no findable branch current (only \
-                         independent voltage sources, E/H sources and voltage B sources can be \
-                         sensed, as by CKTfndBranch; C would silently read ground)"
-                ))
-            })?;
-            let row = circuit
-                .branch_rows(device)
-                .and_then(|mut rows| rows.nth(branch))
-                .ok_or_else(|| not_found(format_args!("{source}: missing branch row")))?;
-            Ok((Probe::Current { device, row }, [None, None]))
-        }
     }
 }
 
@@ -332,8 +207,10 @@ pub(super) fn run(
 ) -> SpiceResult<Plot> {
     let settings = request.dc_settings();
     circuit.finalize()?;
-    let input = resolve_input(circuit, &card.input)?;
-    let (probe, [pos_name, neg_name]) = resolve_output(circuit, &card.output)?;
+    let (input, input_device) = resolve_input(circuit, &card.input)?;
+    let bound = output_probe::bind(circuit, &card.output, Card::Tf)?;
+    let probe = bound.probe;
+    let [pos_name, neg_name] = bound.names;
 
     // The operating point, exactly as `.op` solves it (`CKTop` in MODEDCOP;
     // `.ic` applies only to a transient operating point, `.nodeset` here too).
@@ -378,10 +255,7 @@ pub(super) fn run(
         Input::Current { plus, minus } => at(&x, minus) - at(&x, plus),
     };
 
-    let same_source = match probe {
-        Probe::Current { device, .. } => device_index(circuit, &card.input) == Some(device),
-        Probe::Voltage { .. } => false,
-    };
+    let same_source = bound.device == Some(input_device);
     let output_resistance = if same_source {
         input_resistance
     } else {
