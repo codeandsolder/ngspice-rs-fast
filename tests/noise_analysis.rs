@@ -193,6 +193,39 @@ fn resistor_flicker_noise_follows_kf_af_ef() {
 }
 
 #[test]
+fn extreme_frequency_flicker_integrates_the_finite_power_law() {
+    // The former absolute-frequency formula reconstructs f^2.5, which
+    // overflows at these frequencies even though the integral is finite.
+    let plots = run("extreme flicker
+v1 in 0 dc 2 ac 1
+r1 in out 1k
+r2 out 0 rf
+\
+        .model rf r(r=1k kf=1e-305 af=0 ef=-1.5)
+.noise v(out) v1 lin 2 1e200 2e200 1
+.end
+");
+    let spectrum = &plots[0];
+    let frequencies = column(spectrum, "frequency");
+    assert_eq!(frequencies, [1e200, 2e200]);
+    let powers = column(spectrum, "onoise_r2_1overf");
+    close(powers[0].powi(2), 2.5, 1e-12);
+    close(powers[1].powi(2), 2.5 * 2_f64.powf(1.5), 1e-12);
+    let expected = 1e200 * (2_f64.powf(2.5) - 1.);
+    let integrated = &plots[1];
+    close(
+        column(integrated, "v(onoise_total_r2_1overf)")[0].powi(2),
+        expected,
+        1e-12,
+    );
+    close(
+        column(integrated, "v(inoise_total_r2_1overf)")[0].powi(2),
+        4. * expected,
+        1e-12,
+    );
+}
+
+#[test]
 fn diode_shot_noise_is_2qi_relative_to_the_series_resistor() {
     let deck = "shot\nv1 in 0 dc 2 ac 1\nr1 in a 1k\nd1 a 0 dm\n.model dm d(is=1e-14)\n";
     let noise = run(&format!("{deck}.noise v(a) v1 lin 1 1k 1k 1\n.end\n"));

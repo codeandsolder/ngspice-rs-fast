@@ -57,7 +57,7 @@ card 7 @netlists/coupled_cap_tran.cir:10:1 lines=10-10 continuations=0
   raw: ".tran 10u 8m"
   kind: dot(.tran)
   token 1 10:1 word ".tran"
-  token 2 10:7 number "10u" value=9.999999999999999e-6
+  token 2 10:7 number "10u" value=1e-5
   token 3 10:11 number "8m" value=8e-3
 card 8 @netlists/coupled_cap_tran.cir:11:1 lines=11-11 continuations=0
   raw: ".end"

@@ -78,10 +78,10 @@ card 5 @netlists/m10_mos3_ac.cir:6:1 lines=6-6 continuations=0
   token 18 6:47 number "48p" value=4.8e-11
   token 19 6:51 word "pd"
   token 20 6:53 equals "="
-  token 21 6:54 number "38u" value=3.7999999999999995e-5
+  token 21 6:54 number "38u" value=3.8e-5
   token 22 6:58 word "ps"
   token 23 6:60 equals "="
-  token 24 6:61 number "38u" value=3.7999999999999995e-5
+  token 24 6:61 number "38u" value=3.8e-5
 card 6 @netlists/m10_mos3_ac.cir:7:1 lines=7-7 continuations=0
   raw: "cl drain 0 50f"
   kind: device(c)
@@ -211,7 +211,7 @@ card 8 @netlists/m10_mos3_ac.cir:11:1 lines=11-12 continuations=1
   token 46 12:56 number "0.2n" value=2e-10
   token 47 12:61 word "cj"
   token 48 12:63 equals "="
-  token 49 12:64 number "0.6m" value=6.000000000000001e-4
+  token 49 12:64 number "0.6m" value=6e-4
   token 50 12:69 word "cjsw"
   token 51 12:73 equals "="
   token 52 12:74 number "0.45n" value=4.5e-10

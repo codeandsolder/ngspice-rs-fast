@@ -769,3 +769,31 @@ deck that asks fails loudly.
   follow-on test covers MOS1/2/3/9, both polarities and trapezoidal/Gear
   integration with ordinary bias initialization, at the linear sensitivity
   bound; it also runs the new three-analysis fixture through the CLI.
+
+
+## Numerical accuracy audit (#92)
+
+The perturbation's sparse stamp ordering, separate base and perturbed load
+stages, step sizes, model callbacks and block-local nonfinite policy are
+unchanged. The signed real and imaginary contributions are accumulated with
+Neumaier compensation. At the base/perturbed boundary both the running value
+and its correction are negated, so the base load is not rounded down to a
+single binary64 value before subtraction. Row products are likewise summed
+with compensation. For a base load [1e16, 1] and perturbed load [1e16, 2],
+this recovers a delta of 1 instead of rounding the perturbation to 2.
+Signed zero and empty-row behavior have explicit regressions.
+
+Sweep-count arithmetic is a separate grid policy, not a continuous numerical
+result: with three steps and log10(high/low) equal to the binary64
+0.6633333333333332, the separately rounded product plus 1.01 truncates to
+three points, whereas a fused multiply-add truncates to two. The discrete
+count and existing stepping policy therefore remain unchanged in this audit.
+
+
+The perturbation product keeps both parts of each compensated matrix
+entry, and adds the FMA residual of each finite real multiplication.
+The right-hand side is combined with the compensated row product before
+rounding the final residual. This retains terms lost by rounding the dot
+product alone: for example, 1 - (1 + 2^-27)(1 - 2^-27) is 2^-54, not zero.
+This does not recover information already rounded inside a device load,
+nor change the finite parameter-perturbation policy.

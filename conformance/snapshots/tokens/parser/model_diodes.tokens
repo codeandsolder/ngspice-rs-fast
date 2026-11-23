@@ -54,10 +54,10 @@ card 4 @parser/model_diodes.cir:6:1 lines=6-6 continuations=0
   token 4 6:11 word "dm"
   token 5 6:14 word "w"
   token 6 6:15 equals "="
-  token 7 6:16 number "10u" value=9.999999999999999e-6
+  token 7 6:16 number "10u" value=1e-5
   token 8 6:20 word "l"
   token 9 6:21 equals "="
-  token 10 6:22 number "20u" value=1.9999999999999998e-5
+  token 10 6:22 number "20u" value=2e-5
 card 5 @parser/model_diodes.cir:7:1 lines=7-7 continuations=0
   raw: "dimplicit a 0 dm"
   kind: device(d)

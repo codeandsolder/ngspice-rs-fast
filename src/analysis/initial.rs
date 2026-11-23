@@ -45,11 +45,13 @@ use std::collections::BTreeMap;
 use crate::devices::{Circuit, ModelContext, StorageKind};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
-use petgraph::graph::{NodeIndex, UnGraph};
-use petgraph::unionfind::UnionFind;
-use petgraph::visit::{Control, DfsEvent, depth_first_search};
 
 use crate::analysis::{AnalysisPlan, NodeCondition};
+
+mod constraints;
+mod system;
+use constraints::{AbsoluteRow, ConstraintGraph, Join, Origin, VoltageVertex};
+use system::{InstantaneousSolution, InstantaneousSystem};
 
 fn failure(message: impl Into<String>) -> SpiceError {
     SpiceError::Numerical {
@@ -104,7 +106,7 @@ fn bind(circuit: &Circuit, entries: &[NodeCondition], card: &str) -> SpiceResult
                 )
             })
             .and_then(|id| {
-                circuit.unknowns().node_row(id).ok_or_else(|| {
+                circuit.unknowns().checked_node_row(id)?.ok_or_else(|| {
                     SpiceError::parse(
                         entry.location.clone(),
                         format!("{card} V({}) names the ground node", entry.node),
@@ -138,150 +140,6 @@ impl VoltageTolerance {
     }
 }
 
-/// Result of adding a voltage relation to [`Potentials`].
-enum Join {
-    /// The relation connected two previously independent groups of nodes.
-    Tree,
-    /// The nodes were already tied together; the existing structure forces the
-    /// difference `expected` (compare with the relation that was added).
-    Cycle { expected: Real },
-}
-
-/// Node potentials relative to each other from a growing set of voltage
-/// relations `v_a - v_b = value`: a petgraph spanning forest (edges carry the
-/// signed offset) plus a petgraph `UnionFind` for component membership. A
-/// relation between nodes already in one component closes a cycle; the forest
-/// is then traversed (depth-first) to find the difference it already forces.
-/// Vertex 0 is ground, vertex `row + 1` an MNA node row.
-struct Potentials {
-    forest: UnGraph<(), (usize, Real), usize>,
-    components: UnionFind<usize>,
-}
-
-impl Potentials {
-    fn new(vertices: usize) -> Self {
-        let mut forest = UnGraph::default();
-        for _ in 0..vertices {
-            forest.add_node(());
-        }
-        Self {
-            forest,
-            components: UnionFind::new(vertices),
-        }
-    }
-
-    /// `potential(b) - potential(a)` through the forest; `a` and `b` must be
-    /// in the same component.
-    fn difference(&self, a: usize, b: usize) -> Real {
-        let mut potential = vec![0.; self.forest.node_count()];
-        depth_first_search(&self.forest, [NodeIndex::new(a)], |event| {
-            if let DfsEvent::TreeEdge(from, to) = event
-                && let Some(edge) = self.forest.find_edge(from, to)
-            {
-                // Weight (tail, value): potential(tail) - potential(head) = value.
-                let &(tail, value) = &self.forest[edge];
-                potential[to.index()] = if tail == from.index() {
-                    potential[from.index()] - value
-                } else {
-                    potential[from.index()] + value
-                };
-            }
-            Control::<()>::Continue
-        });
-        potential[b]
-    }
-
-    fn join(&mut self, a: usize, b: usize, value: Real) -> Join {
-        if self.components.equiv(a, b) {
-            // v_a - v_b as already forced by the forest.
-            return Join::Cycle {
-                expected: -self.difference(a, b),
-            };
-        }
-        self.components.union(a, b);
-        self.forest
-            .add_edge(NodeIndex::new(a), NodeIndex::new(b), (a, value));
-        Join::Tree
-    }
-}
-
-/// The ideal voltage sources and inductors (DC shorts) of a circuit as
-/// relations `v_p - v_n = value`, with `rhs` giving the source values.
-fn source_relations(
-    circuit: &Circuit,
-    rhs: &Vector,
-    inductors_short: bool,
-) -> Vec<(usize, usize, Real)> {
-    let vertex = |node| circuit.unknowns().node_row(node).map_or(0, |row| row + 1);
-    let mut relations = Vec::new();
-    for (index, device) in circuit.devices().iter().enumerate() {
-        let designator = device.designator();
-        let rows = circuit.branch_rows(index).unwrap_or(0..0);
-        // An RF port's ideal source sits between its internal `#res` node and
-        // the negative terminal; `z0` separates it from the positive one.
-        let (positive, negative) = match (device.terminals(), device.rf_port()) {
-            ([_, negative, _], Some(port)) => (&port.internal, negative),
-            ([positive, negative], None) => (positive, negative),
-            _ => continue,
-        };
-        if rows.len() != 1 {
-            continue;
-        }
-        let value = match designator {
-            'v' => rhs.as_slice().get(rows.start).copied().unwrap_or(0.),
-            'l' if inductors_short => 0.,
-            _ => continue,
-        };
-        relations.push((vertex(*positive), vertex(*negative), value));
-    }
-    relations
-}
-
-/// The output terminal pairs of the voltage-type controlled sources (E and
-/// H) as vertex pairs. Each forces `v_p - v_n` to a value that depends on the
-/// rest of the solution, so it is a rigid relation of unknown value.
-fn controlled_output_edges(circuit: &Circuit) -> Vec<(usize, usize, String)> {
-    let vertex = |node| circuit.unknowns().node_row(node).map_or(0, |row| row + 1);
-    circuit
-        .devices()
-        .iter()
-        .filter(|device| matches!(device.designator(), 'e' | 'h'))
-        .filter_map(|device| match device.terminals() {
-            [positive, negative, ..] => Some((
-                vertex(*positive),
-                vertex(*negative),
-                device.name().to_owned(),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Structural rigidity: which vertices are tied together by ideal voltage
-/// relations of any value (independent sources, shorts, E/H outputs, kept
-/// constraints), and the E/H names involved.
-struct Rigid {
-    components: UnionFind<usize>,
-    controlled: Vec<String>,
-}
-
-impl Rigid {
-    fn new(vertices: usize, controlled: &[(usize, usize, String)]) -> Self {
-        let mut components = UnionFind::new(vertices);
-        for (p, n, _) in controlled {
-            components.union(*p, *n);
-        }
-        Self {
-            components,
-            controlled: controlled.iter().map(|(_, _, name)| name.clone()).collect(),
-        }
-    }
-
-    fn names(&self) -> String {
-        self.controlled.join(", ")
-    }
-}
-
 /// The `.ic` constraints of the initial bias, split by how they are handled.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct Constraints {
@@ -291,7 +149,13 @@ pub(super) struct Constraints {
     /// known after the solve): C keeps the controlled source's relation (its
     /// `1e10` conductance just loads the ideal output), so [`check_implied`]
     /// compares the entry with the solution.
-    pub implied: Vec<RowHint>,
+    implied: Vec<ImpliedHint>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ImpliedHint {
+    hint: RowHint,
+    provenance: String,
 }
 
 /// Checks each implied `.ic` entry against the bias solution `x`.
@@ -303,13 +167,13 @@ pub(super) fn check_implied(
     constraints: &Constraints,
     tolerance: VoltageTolerance,
 ) -> SpiceResult<()> {
-    for hint in &constraints.implied {
+    for ImpliedHint { hint, provenance } in &constraints.implied {
         let value = x.as_slice()[hint.row];
         if !tolerance.agree(value, hint.value) {
             return Err(failure(format!(
                 ".ic V({})={} at {} contradicts the {value} V that an ideal controlled \
                  source (E/H) output forces on this node, directly or through other ideal \
-                 relations; ngspice would return a meaningless 1e10-conductance compromise",
+                 relations (path: {provenance}); ngspice would return a meaningless 1e10-conductance compromise",
                 hint.node, hint.value, hint.location
             )));
         }
@@ -344,34 +208,35 @@ pub(super) fn irredundant_constraints(
     if hints.is_empty() {
         return Ok(Constraints::default());
     }
-    let vertices = circuit.unknown_count() + 1;
-    let mut potentials = Potentials::new(vertices);
-    let mut rigid = Rigid::new(vertices, &controlled_output_edges(circuit));
-    // Source loops are the solver's business (a singular system error).
-    for (p, n, value) in source_relations(circuit, rhs, true) {
-        potentials.join(p, n, value);
-        rigid.components.union(p, n);
-    }
+    let mut graph = ConstraintGraph::for_circuit(circuit, rhs, true)?;
     let mut kept = Constraints::default();
     for hint in hints {
-        let vertex = hint.row + 1;
-        if !potentials.components.equiv(vertex, 0) && rigid.components.equiv(vertex, 0) {
-            kept.implied.push(hint.clone());
+        let vertex = VoltageVertex::Node(AbsoluteRow(hint.row));
+        if graph.controlled_implies(vertex, VoltageVertex::Ground) {
+            kept.implied.push(ImpliedHint {
+                hint: hint.clone(),
+                provenance: graph.controlled_path(vertex, VoltageVertex::Ground)?,
+            });
             continue;
         }
-        match potentials.join(vertex, 0, hint.value) {
-            Join::Tree => {
-                rigid.components.union(vertex, 0);
-                kept.imposed.push(hint.clone());
-            }
+        match graph.join(
+            vertex,
+            VoltageVertex::Ground,
+            hint.value,
+            Origin::Hint(hint),
+        )? {
+            Join::Tree => kept.imposed.push(hint.clone()),
             Join::Cycle { expected } if tolerance.agree(expected, hint.value) => {}
             Join::Cycle { expected } => {
                 return Err(failure(format!(
                     ".ic V({})={} at {} contradicts the {expected} V that ideal voltage sources \
                      and inductors (DC shorts) force on this node, directly or through other \
-                     .ic entries; ngspice would return a meaningless 1e10-conductance \
+                     .ic entries (path: {}); ngspice would return a meaningless 1e10-conductance \
                      compromise",
-                    hint.node, hint.value, hint.location
+                    hint.node,
+                    hint.value,
+                    hint.location,
+                    graph.path_description()
                 )));
             }
         }
@@ -455,25 +320,29 @@ pub(super) struct Tolerances {
 
 /// Storage constraints for the instantaneous circuit, in device order.
 struct ImpulseStorage {
-    fixed_currents: BTreeMap<usize, Real>,
-    inductors: Vec<String>,
+    fixed_currents: BTreeMap<AbsoluteRow, FixedCurrent>,
     capacitors: Vec<CapacitorInitial>,
+}
+
+struct FixedCurrent {
+    name: String,
+    value: Real,
 }
 
 struct CapacitorInitial {
     name: String,
-    positive: usize,
-    negative: usize,
+    positive: VoltageVertex,
+    negative: VoltageVertex,
     voltage: Real,
 }
 
 impl ImpulseStorage {
     fn collect(circuit: &Circuit, initial: &Vector, context: &ModelContext) -> SpiceResult<Self> {
-        let node_row = |node| circuit.unknowns().node_row(node);
-        let vertex = |node| node_row(node).map_or(0, |row| row + 1);
+        if initial.len() != circuit.unknown_count() {
+            return Err(failure("initial vector does not match finalized circuit"));
+        }
         let mut storage = Self {
             fixed_currents: BTreeMap::new(),
-            inductors: Vec::new(),
             capacitors: Vec::new(),
         };
         for (index, device) in circuit.devices().iter().enumerate() {
@@ -485,22 +354,39 @@ impl ImpulseStorage {
             };
             match element.kind {
                 StorageKind::Inductor => {
-                    if let Some(row) = circuit.branch_rows(index).filter(|rows| rows.len() == 1) {
-                        storage
-                            .fixed_currents
-                            .insert(row.start, initial.as_slice()[row.start]);
-                        storage.inductors.push(device.name().to_owned());
-                    }
+                    let row = circuit
+                        .branch_rows(index)
+                        .filter(|rows| rows.len() == 1)
+                        .ok_or_else(|| {
+                            failure(format!("inductor {} has no branch row", device.name()))
+                        })?
+                        .start;
+                    let value = *initial
+                        .as_slice()
+                        .get(row)
+                        .ok_or_else(|| failure("inductor branch row outside finalized circuit"))?;
+                    storage.fixed_currents.insert(
+                        AbsoluteRow(row),
+                        FixedCurrent {
+                            name: device.name().to_owned(),
+                            value,
+                        },
+                    );
                 }
                 StorageKind::Capacitor => {
-                    let voltage = element.initial.unwrap_or_else(|| {
-                        let at = |node| node_row(node).map_or(0., |row| initial.as_slice()[row]);
-                        at(*positive) - at(*negative)
-                    });
+                    let positive = VoltageVertex::bind(circuit, *positive)?;
+                    let negative = VoltageVertex::bind(circuit, *negative)?;
+                    let at = |vertex| match vertex {
+                        VoltageVertex::Ground => 0.,
+                        VoltageVertex::Node(AbsoluteRow(row)) => initial.as_slice()[row],
+                    };
+                    let voltage = element
+                        .initial
+                        .unwrap_or_else(|| at(positive) - at(negative));
                     storage.capacitors.push(CapacitorInitial {
                         name: device.name().to_owned(),
-                        positive: vertex(*positive),
-                        negative: vertex(*negative),
+                        positive,
+                        negative,
                         voltage,
                     });
                 }
@@ -513,8 +399,12 @@ impl ImpulseStorage {
 /// Independent capacitor voltage relations and relations implied by E/H outputs.
 struct CapacitorRelations<'a> {
     kept: Vec<&'a CapacitorInitial>,
-    implied: Vec<&'a CapacitorInitial>,
-    rigid: Rigid,
+    implied: Vec<ImpliedCapacitor<'a>>,
+}
+
+struct ImpliedCapacitor<'a> {
+    capacitor: &'a CapacitorInitial,
+    provenance: String,
 }
 
 impl<'a> CapacitorRelations<'a> {
@@ -524,18 +414,11 @@ impl<'a> CapacitorRelations<'a> {
         capacitors: &'a [CapacitorInitial],
         tolerance: VoltageTolerance,
     ) -> SpiceResult<Self> {
-        let vertices = circuit.unknown_count() + 1;
-        let mut potentials = Potentials::new(vertices);
+        let mut graph = ConstraintGraph::for_circuit(circuit, rhs, false)?;
         let mut relations = Self {
             kept: Vec::new(),
             implied: Vec::new(),
-            rigid: Rigid::new(vertices, &controlled_output_edges(circuit)),
         };
-        // Voltage relations: ideal sources first, then the capacitors.
-        for (positive, negative, value) in source_relations(circuit, rhs, false) {
-            potentials.join(positive, negative, value);
-            relations.rigid.components.union(positive, negative);
-        }
         for capacitor in capacitors {
             let CapacitorInitial {
                 name,
@@ -543,24 +426,23 @@ impl<'a> CapacitorRelations<'a> {
                 negative,
                 voltage,
             } = capacitor;
-            if !potentials.components.equiv(*positive, *negative)
-                && relations.rigid.components.equiv(*positive, *negative)
-            {
-                relations.implied.push(capacitor);
+            if graph.controlled_implies(*positive, *negative) {
+                relations.implied.push(ImpliedCapacitor {
+                    capacitor,
+                    provenance: graph.controlled_path(*positive, *negative)?,
+                });
                 continue;
             }
-            match potentials.join(*positive, *negative, *voltage) {
-                Join::Tree => {
-                    relations.rigid.components.union(*positive, *negative);
-                    relations.kept.push(capacitor);
-                }
+            match graph.join(*positive, *negative, *voltage, Origin::Device(name))? {
+                Join::Tree => relations.kept.push(capacitor),
                 Join::Cycle { expected } if tolerance.agree(expected, *voltage) => {}
                 Join::Cycle { expected } => {
                     return Err(failure(format!(
                         "uic initial conditions are inconsistent with the circuit at t = 0+: \
                          capacitor {name} starts at {voltage} V but ideal sources and other \
-                         initial conditions force {expected} V across it, an impulse; make the \
-                         initial condition agree or add series impedance"
+                         initial conditions force {expected} V across it (path: {}), an impulse; make the \
+                         initial condition agree or add series impedance",
+                        graph.path_description()
                     )));
                 }
             }
@@ -573,7 +455,11 @@ impl<'a> CapacitorRelations<'a> {
         solution: &InstantaneousSolution,
         tolerance: VoltageTolerance,
     ) -> SpiceResult<()> {
-        for capacitor in &self.implied {
+        for ImpliedCapacitor {
+            capacitor,
+            provenance,
+        } in &self.implied
+        {
             let CapacitorInitial {
                 name,
                 positive,
@@ -585,208 +471,21 @@ impl<'a> CapacitorRelations<'a> {
             else {
                 return Err(failure(format!(
                     "uic initial conditions cannot be shown consistent: capacitor {name} is \
-                     across the output of controlled sources ({}) but its voltage is not \
-                     determined by the instantaneous system",
-                    self.rigid.names()
+                     across the output of controlled sources ({provenance}) but its voltage is not \
+                     determined by the instantaneous system"
                 )));
             };
             let expected = vp - vq;
             if !tolerance.agree(expected, *voltage) {
                 return Err(failure(format!(
                     "uic initial conditions are inconsistent with the circuit at t = 0+: \
-                     capacitor {name} starts at {voltage} V but ideal controlled sources ({}) \
+                     capacitor {name} starts at {voltage} V but ideal controlled sources ({provenance}) \
                      force {expected} V across it, an impulse; make the initial condition agree \
-                     or add series impedance",
-                    self.rigid.names()
+                     or add series impedance"
                 )));
             }
         }
         Ok(())
-    }
-}
-
-/// Solved compact system with the mapping from original vertex to solution index.
-struct InstantaneousSolution {
-    column_of: Vec<usize>,
-    column_index: Vec<usize>,
-    values: Vector,
-}
-
-impl InstantaneousSolution {
-    fn potential(&self, vertex: usize) -> Option<Real> {
-        if vertex == 0 {
-            return Some(0.);
-        }
-        let reduced = self.column_of[vertex - 1];
-        let index = *self.column_index.get(reduced)?;
-        self.values.as_slice().get(index).copied()
-    }
-}
-
-/// Reduced system with fixed inductor currents eliminated and free capacitor currents added.
-struct InstantaneousSystem {
-    column_of: Vec<usize>,
-    kept_rows: Vec<usize>,
-    entries: Vec<(usize, usize, Real)>,
-    rhs: Vec<Real>,
-    scale: Vec<Real>,
-}
-
-impl InstantaneousSystem {
-    fn assemble(
-        matrix: &SparseMatrix,
-        rhs: &Vector,
-        storage: &ImpulseStorage,
-        kept: &[&CapacitorInitial],
-        unknowns: usize,
-    ) -> Self {
-        let fixed = &storage.fixed_currents;
-        let mut column_of = vec![usize::MAX; unknowns];
-        let mut kept_rows = Vec::new();
-        for row in (0..unknowns).filter(|row| !fixed.contains_key(row)) {
-            column_of[row] = kept_rows.len();
-            kept_rows.push(row);
-        }
-        let size = kept_rows.len() + kept.len();
-        let mut system = Self {
-            column_of,
-            kept_rows,
-            entries: Vec::new(),
-            rhs: vec![0.; size],
-            scale: vec![0.; size],
-        };
-        for &row in &system.kept_rows {
-            let reduced = system.column_of[row];
-            system.rhs[reduced] = rhs.as_slice()[row];
-            system.scale[reduced] = rhs.as_slice()[row].abs();
-        }
-        for triplet in matrix.triplets() {
-            if fixed.contains_key(&triplet.row) {
-                continue;
-            }
-            let row = system.column_of[triplet.row];
-            if let Some(current) = fixed.get(&triplet.col) {
-                let contribution = triplet.value * current;
-                system.rhs[row] -= contribution;
-                system.scale[row] += contribution.abs();
-            } else {
-                system
-                    .entries
-                    .push((row, system.column_of[triplet.col], triplet.value));
-            }
-        }
-        for (index, capacitor) in kept.iter().enumerate() {
-            let current = system.kept_rows.len() + index;
-            for (vertex, sign) in [(capacitor.positive, 1.), (capacitor.negative, -1.)] {
-                if vertex > 0 {
-                    let node = system.column_of[vertex - 1];
-                    system.entries.push((node, current, sign));
-                    system.entries.push((current, node, sign));
-                }
-            }
-            system.rhs[current] = capacitor.voltage;
-            system.scale[current] = capacitor.voltage.abs();
-        }
-        system
-    }
-
-    fn check_empty_rows(
-        &self,
-        circuit: &Circuit,
-        row_used: &[bool],
-        inductors: &[String],
-        tolerances: Tolerances,
-    ) -> SpiceResult<()> {
-        let mut is_branch = vec![false; circuit.unknown_count()];
-        for index in 0..circuit.device_count() {
-            for row in circuit.branch_rows(index).unwrap_or(0..0) {
-                is_branch[row] = true;
-            }
-        }
-        for row in (0..self.rhs.len()).filter(|row| !row_used[*row]) {
-            let (absolute, what) = match self.kept_rows.get(row) {
-                Some(original) if !is_branch[*original] => {
-                    (tolerances.abstol, "currents into a node")
-                }
-                _ => (tolerances.vntol, "a voltage relation"),
-            };
-            let relative_limit = tolerances.reltol * self.scale[row];
-            if self.rhs[row].abs() > absolute + relative_limit {
-                let who = if inductors.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (inductors: {})", inductors.join(", "))
-                };
-                return Err(failure(format!(
-                    "uic initial conditions are inconsistent with the circuit at t = 0+: {what} \
-                     left over by fixed inductor currents and sources is {:e} instead of 0, an \
-                     impulse{who}",
-                    self.rhs[row]
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Solve after removing empty rows/columns. Return the potential at each
-    /// original vertex (including ground), or None when the system is empty.
-    fn solve(
-        self,
-        circuit: &Circuit,
-        inductors: &[String],
-        tolerances: Tolerances,
-    ) -> SpiceResult<Option<InstantaneousSolution>> {
-        let size = self.rhs.len();
-        let mut row_used = vec![false; size];
-        let mut column_used = vec![false; size];
-        for &(row, column, value) in &self.entries {
-            if value != 0. {
-                row_used[row] = true;
-                column_used[column] = true;
-            }
-        }
-        self.check_empty_rows(circuit, &row_used, inductors, tolerances)?;
-        let rows: Vec<usize> = (0..size).filter(|row| row_used[*row]).collect();
-        let columns: Vec<usize> = (0..size).filter(|column| column_used[*column]).collect();
-        if rows.len() != columns.len() {
-            return Err(failure(format!(
-                "uic initial conditions cannot be shown consistent: the instantaneous system has \
-                 {} equations for {} unknowns (over- or under-determined by ideal sources, \
-                 capacitors and inductors)",
-                rows.len(),
-                columns.len()
-            )));
-        }
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        let mut row_index = vec![usize::MAX; size];
-        let mut column_index = vec![usize::MAX; size];
-        for (index, &row) in rows.iter().enumerate() {
-            row_index[row] = index;
-        }
-        for (index, &column) in columns.iter().enumerate() {
-            column_index[column] = index;
-        }
-        let mut matrix = SparseMatrix::new(rows.len(), rows.len());
-        for (row, column, value) in self.entries {
-            if row_used[row] && column_used[column] {
-                matrix.add(row_index[row], column_index[column], value)?;
-            }
-        }
-        matrix.fold_duplicates();
-        let rhs = Vector::from_slice(&rows.iter().map(|row| self.rhs[*row]).collect::<Vec<_>>());
-        let solution = matrix.solve(&rhs).map_err(|error| {
-            failure(format!(
-                "uic initial conditions are over-determined or contradictory at t = 0+ (the \
-                 instantaneous constraint system is singular): {error}"
-            ))
-        })?;
-        Ok(Some(InstantaneousSolution {
-            column_of: self.column_of,
-            column_index,
-            values: solution,
-        }))
     }
 }
 
@@ -826,15 +525,19 @@ pub(super) fn check_impulse_free(
     };
     let relations =
         CapacitorRelations::classify(circuit, rhs, &storage.capacitors, voltage_tolerance)?;
-    let system =
-        InstantaneousSystem::assemble(a, rhs, &storage, &relations.kept, circuit.unknown_count());
-    match system.solve(circuit, &storage.inductors, tolerances)? {
+    let system = InstantaneousSystem::assemble(circuit, a, rhs, &storage, &relations.kept)?;
+    match system.solve(circuit, &storage, tolerances)? {
         Some(solution) => relations.check_implied(&solution, voltage_tolerance),
         None if relations.implied.is_empty() => Ok(()),
         None => Err(failure(format!(
             "uic initial conditions cannot be shown consistent: capacitors across the \
              output of controlled sources {} are left without an instantaneous system",
-            relations.rigid.names()
+            relations
+                .implied
+                .iter()
+                .map(|item| item.provenance.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
         ))),
     }
 }

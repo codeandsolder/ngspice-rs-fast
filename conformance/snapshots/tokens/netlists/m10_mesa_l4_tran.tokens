@@ -47,7 +47,7 @@ card 4 @netlists/m10_mesa_l4_tran.cir:5:1 lines=5-5 continuations=0
   token 8 5:15 number "1u" value=1e-6
   token 9 5:18 word "w"
   token 10 5:19 equals "="
-  token 11 5:20 number "20u" value=1.9999999999999998e-5
+  token 11 5:20 number "20u" value=2e-5
 card 5 @netlists/m10_mesa_l4_tran.cir:6:1 lines=6-6 continuations=0
   raw: "r1 1 2 1k"
   kind: device(r)
@@ -72,7 +72,7 @@ card 6 @netlists/m10_mesa_l4_tran.cir:7:1 lines=7-8 continuations=1
   token 12 7:32 number "31" value=3.1e1
   token 13 7:35 word "mu"
   token 14 7:37 equals "="
-  token 15 7:38 number "0.3" value=3.0000000000000004e-1
+  token 15 7:38 number "0.3" value=3e-1
   token 16 7:42 word "gamma"
   token 17 7:47 equals "="
   token 18 7:48 number "2.5" value=2.5e0
@@ -87,7 +87,7 @@ card 6 @netlists/m10_mesa_l4_tran.cir:7:1 lines=7-8 continuations=1
   token 27 8:15 number "1.1" value=1.1e0
   token 28 8:19 word "epsi"
   token 29 8:23 equals "="
-  token 30 8:24 number "1.142189e-10" value=1.1421889999999999e-10
+  token 30 8:24 number "1.142189e-10" value=1.142189e-10
 card 7 @netlists/m10_mesa_l4_tran.cir:9:1 lines=9-9 continuations=0
   raw: ".options reltol=1e-6 vntol=1e-10 abstol=1e-14"
   kind: dot(.options)
@@ -105,8 +105,8 @@ card 8 @netlists/m10_mesa_l4_tran.cir:10:1 lines=10-10 continuations=0
   raw: ".tran 0.05n 3n"
   kind: dot(.tran)
   token 1 10:1 word ".tran"
-  token 2 10:7 number "0.05n" value=4.9999999999999995e-11
-  token 3 10:13 number "3n" value=3.0000000000000004e-9
+  token 2 10:7 number "0.05n" value=5e-11
+  token 3 10:13 number "3n" value=3e-9
 card 9 @netlists/m10_mesa_l4_tran.cir:11:1 lines=11-11 continuations=0
   raw: ".end"
   kind: dot(.end)

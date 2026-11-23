@@ -33,7 +33,7 @@ card 4 @netlists/m10_txl_op.cir:5:1 lines=5-5 continuations=0
   token 3 5:11 word "txl"
   token 4 5:15 word "r"
   token 5 5:16 equals "="
-  token 6 5:17 number "12.45" value=1.2450000000000001e1
+  token 6 5:17 number "12.45" value=1.245e1
   token 7 5:23 word "l"
   token 8 5:24 equals "="
   token 9 5:25 number "8.972e-9" value=8.972e-9

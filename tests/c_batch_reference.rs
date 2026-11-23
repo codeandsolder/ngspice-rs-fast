@@ -17,16 +17,13 @@
 //!   cargo test -p ngspice-rs --test c_batch_reference -- --ignored
 //! ```
 
+use ngspice_conformance::fixtures::DeckInputs;
 use ngspice_conformance::ngspice::Scratch;
 use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ngspice_rs::analysis::{RawFile, RawFormat};
-
-fn workspace() -> PathBuf {
-    ngspice_conformance::fixtures::workspace_root().unwrap()
-}
 
 /// A deck with two `.dc` cards (same-type order) besides `.tran` and `.op`.
 const SAME_TYPE: &str = "\
@@ -42,13 +39,13 @@ c1 out 0 100n
 .end
 ";
 
-fn compare_with_c_batch(name: &str, deck_text: &str) {
+fn compare_with_c_batch(name: &str, inputs: &DeckInputs<'_>) {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
     let scratch = Scratch::new("c-batch-reference").unwrap();
     let directory = scratch.path();
     let deck = directory.join("deck.cir");
-    fs::write(&deck, deck_text).unwrap();
+    fs::write(&deck, inputs.reference()).unwrap();
 
     let c = run(
         &binary,
@@ -63,6 +60,8 @@ fn compare_with_c_batch(name: &str, deck_text: &str) {
         String::from_utf8_lossy(&c.stdout),
         String::from_utf8_lossy(&c.stderr)
     );
+    let rust_deck = directory.join("rust.cir");
+    fs::write(&rust_deck, inputs.rust()).unwrap();
     let rust = run(
         std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
         directory,
@@ -70,7 +69,7 @@ fn compare_with_c_batch(name: &str, deck_text: &str) {
             std::ffi::OsStr::new("simulate"),
             std::ffi::OsStr::new("--output"),
             directory.join("rust.raw").as_os_str(),
-            deck.as_os_str(),
+            rust_deck.as_os_str(),
         ],
         ProcessLimits::ORACLE,
     )
@@ -127,13 +126,14 @@ fn compare_with_c_batch(name: &str, deck_text: &str) {
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs C batch mode out of process"]
 fn the_multi_analysis_fixture_matches_c_batch_mode() {
-    let deck =
-        fs::read_to_string(workspace().join("conformance/netlists/multi_analysis_rc.cir")).unwrap();
-    compare_with_c_batch("multi_analysis_rc", &deck);
+    compare_with_c_batch(
+        "multi_analysis_rc",
+        &DeckInputs::fixture("multi_analysis_rc").unwrap(),
+    );
 }
 
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs C batch mode out of process"]
 fn same_type_analyses_match_c_batch_order() {
-    compare_with_c_batch("same_type", SAME_TYPE);
+    compare_with_c_batch("same_type", &DeckInputs::same(SAME_TYPE));
 }

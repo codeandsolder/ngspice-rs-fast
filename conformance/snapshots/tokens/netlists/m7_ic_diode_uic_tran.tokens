@@ -57,7 +57,7 @@ card 6 @netlists/m7_ic_diode_uic_tran.cir:12:1 lines=12-12 continuations=0
   token 7 12:16 number "1e-14" value=1e-14
   token 8 12:22 word "n"
   token 9 12:23 equals "="
-  token 10 12:24 number "1.2" value=1.2000000000000002e0
+  token 10 12:24 number "1.2" value=1.2e0
   token 11 12:28 word "rs"
   token 12 12:30 equals "="
   token 13 12:31 number "10" value=1e1
@@ -66,7 +66,7 @@ card 6 @netlists/m7_ic_diode_uic_tran.cir:12:1 lines=12-12 continuations=0
   token 16 12:38 number "20p" value=2e-11
   token 17 12:42 word "tt"
   token 18 12:44 equals "="
-  token 19 12:45 number "50n" value=5.0000000000000004e-8
+  token 19 12:45 number "50n" value=5e-8
   token 20 12:48 rparen ")"
 card 7 @netlists/m7_ic_diode_uic_tran.cir:13:1 lines=13-13 continuations=0
   raw: ".options reltol=1e-5"
@@ -80,7 +80,7 @@ card 8 @netlists/m7_ic_diode_uic_tran.cir:14:1 lines=14-14 continuations=0
   kind: dot(.tran)
   token 1 14:1 word ".tran"
   token 2 14:7 number "0.1u" value=1e-7
-  token 3 14:12 number "40u" value=3.9999999999999996e-5
+  token 3 14:12 number "40u" value=4e-5
   token 4 14:16 number "0" value=0e0
   token 5 14:18 number "20n" value=2e-8
   token 6 14:22 word "uic"

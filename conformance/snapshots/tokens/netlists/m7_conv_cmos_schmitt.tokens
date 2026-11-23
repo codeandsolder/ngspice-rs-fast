@@ -28,7 +28,7 @@ card 3 @netlists/m7_conv_cmos_schmitt.cir:6:1 lines=6-6 continuations=0
   token 6 6:18 word "pmod"
   token 7 6:23 word "w"
   token 8 6:24 equals "="
-  token 9 6:25 number "10u" value=9.999999999999999e-6
+  token 9 6:25 number "10u" value=1e-5
   token 10 6:29 word "l"
   token 11 6:30 equals "="
   token 12 6:31 number "2u" value=2e-6
@@ -43,7 +43,7 @@ card 4 @netlists/m7_conv_cmos_schmitt.cir:7:1 lines=7-7 continuations=0
   token 6 7:18 word "pmod"
   token 7 7:23 word "w"
   token 8 7:24 equals "="
-  token 9 7:25 number "10u" value=9.999999999999999e-6
+  token 9 7:25 number "10u" value=1e-5
   token 10 7:29 word "l"
   token 11 7:30 equals "="
   token 12 7:31 number "2u" value=2e-6
@@ -58,7 +58,7 @@ card 5 @netlists/m7_conv_cmos_schmitt.cir:8:1 lines=8-8 continuations=0
   token 6 8:16 word "nmod"
   token 7 8:21 word "w"
   token 8 8:22 equals "="
-  token 9 8:23 number "5u" value=4.9999999999999996e-6
+  token 9 8:23 number "5u" value=5e-6
   token 10 8:26 word "l"
   token 11 8:27 equals "="
   token 12 8:28 number "2u" value=2e-6
@@ -73,7 +73,7 @@ card 6 @netlists/m7_conv_cmos_schmitt.cir:9:1 lines=9-9 continuations=0
   token 6 9:14 word "nmod"
   token 7 9:19 word "w"
   token 8 9:20 equals "="
-  token 9 9:21 number "5u" value=4.9999999999999996e-6
+  token 9 9:21 number "5u" value=5e-6
   token 10 9:24 word "l"
   token 11 9:25 equals "="
   token 12 9:26 number "2u" value=2e-6
@@ -88,7 +88,7 @@ card 7 @netlists/m7_conv_cmos_schmitt.cir:10:1 lines=10-10 continuations=0
   token 6 10:17 word "pmod"
   token 7 10:22 word "w"
   token 8 10:23 equals "="
-  token 9 10:24 number "10u" value=9.999999999999999e-6
+  token 9 10:24 number "10u" value=1e-5
   token 10 10:28 word "l"
   token 11 10:29 equals "="
   token 12 10:30 number "2u" value=2e-6
@@ -103,7 +103,7 @@ card 8 @netlists/m7_conv_cmos_schmitt.cir:11:1 lines=11-11 continuations=0
   token 6 11:17 word "nmod"
   token 7 11:22 word "w"
   token 8 11:23 equals "="
-  token 9 11:24 number "5u" value=4.9999999999999996e-6
+  token 9 11:24 number "5u" value=5e-6
   token 10 11:27 word "l"
   token 11 11:28 equals "="
   token 12 11:29 number "2u" value=2e-6
@@ -122,7 +122,7 @@ card 9 @netlists/m7_conv_cmos_schmitt.cir:12:1 lines=12-12 continuations=0
   token 10 12:30 number "0.8" value=8e-1
   token 11 12:34 word "kp"
   token 12 12:36 equals "="
-  token 13 12:37 number "60u" value=5.9999999999999995e-5
+  token 13 12:37 number "60u" value=6e-5
   token 14 12:41 word "lambda"
   token 15 12:47 equals "="
   token 16 12:48 number "0.02" value=2e-2
@@ -142,7 +142,7 @@ card 10 @netlists/m7_conv_cmos_schmitt.cir:13:1 lines=13-13 continuations=0
   token 10 13:30 number "-0.8" value=-8e-1
   token 11 13:35 word "kp"
   token 12 13:37 equals "="
-  token 13 13:38 number "25u" value=2.4999999999999998e-5
+  token 13 13:38 number "25u" value=2.5e-5
   token 14 13:42 word "lambda"
   token 15 13:48 equals "="
   token 16 13:49 number "0.02" value=2e-2

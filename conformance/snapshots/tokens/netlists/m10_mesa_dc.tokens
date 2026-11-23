@@ -24,7 +24,7 @@ card 3 @netlists/m10_mesa_dc.cir:4:1 lines=4-4 continuations=0
   token 2 4:5 number "3" value=3e0
   token 3 4:7 number "0" value=0e0
   token 4 4:9 word "dc"
-  token 5 4:12 number "-1.2" value=-1.2000000000000002e0
+  token 5 4:12 number "-1.2" value=-1.2e0
 card 4 @netlists/m10_mesa_dc.cir:5:1 lines=5-5 continuations=0
   raw: "z1 2 3 0 mesmod l=1u w=20u"
   kind: device(z)
@@ -38,7 +38,7 @@ card 4 @netlists/m10_mesa_dc.cir:5:1 lines=5-5 continuations=0
   token 8 5:19 number "1u" value=1e-6
   token 9 5:22 word "w"
   token 10 5:23 equals "="
-  token 11 5:24 number "20u" value=1.9999999999999998e-5
+  token 11 5:24 number "20u" value=2e-5
 card 5 @netlists/m10_mesa_dc.cir:6:1 lines=6-6 continuations=0
   raw: ".model mesmod nmf(level=2)"
   kind: dot(.model)
@@ -73,9 +73,9 @@ card 8 @netlists/m10_mesa_dc.cir:9:1 lines=9-9 continuations=0
   kind: dot(.dc)
   token 1 9:1 word ".dc"
   token 2 9:5 word "vgs"
-  token 3 9:9 number "-1.2" value=-1.2000000000000002e0
+  token 3 9:9 number "-1.2" value=-1.2e0
   token 4 9:14 number "0" value=0e0
-  token 5 9:16 number "0.6" value=6.000000000000001e-1
+  token 5 9:16 number "0.6" value=6e-1
 card 9 @netlists/m10_mesa_dc.cir:10:1 lines=10-10 continuations=0
   raw: ".end"
   kind: dot(.end)

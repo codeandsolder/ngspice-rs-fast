@@ -38,7 +38,7 @@ pub(super) mod charge;
 mod sens;
 pub(super) mod thermal;
 use thermal::{
-    BOLTZMANN, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureCache, TemperatureKey, band_gap,
+    BOLTZMANN, DerivedCache, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureKey, band_gap,
     potential_shift,
 };
 
@@ -47,12 +47,21 @@ const DIODE_CHARGE_SLOT: usize = 0;
 const DIODE_VOLTAGE_SLOT: usize = 2;
 /// ngspice default `CKTepsmin` (`cktntask.c`): IS floor and knee-current cutoff.
 const EPSMIN: Real = 1e-28;
-/// C's breakdown matching stops once `|xcbv - cbv| <= CKTreltol * cbv`
-/// (`diotemp.c`). Device temperature setup has no access to the run's RELTOL,
-/// so the port applies ngspice's default RELTOL; a deck that changes `reltol`
-/// can see C stop the (rapidly contracting) iteration one step earlier or later,
-/// moving the knee voltage by at most that matching tolerance.
-const BREAKDOWN_RELTOL: Real = 1e-3;
+/// The diode breakdown derivation also depends on the circuit RELTOL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiodeThermalKey {
+    temperatures: TemperatureKey,
+    reltol: u64,
+}
+
+impl DiodeThermalKey {
+    const fn context(context: &ModelContext) -> Self {
+        Self {
+            temperatures: TemperatureKey::context(context),
+            reltol: context.reltol.to_bits(),
+        }
+    }
+}
 
 const fn scalar(
     name: &'static str,
@@ -313,7 +322,7 @@ pub struct Diode {
     terminals: Vec<NodeId>,
     junction: [NodeId; 2],
     parameters: DiodeParameters,
-    derived: TemperatureCache<Thermal>,
+    derived: DerivedCache<DiodeThermalKey, Thermal>,
     /// `off` and the instance `ic` (C `DIOoff`, `DIOinitCond`). The `ic`
     /// value is validated and kept but, exactly as in C, never used: see
     /// the `uic` start in `stamp`.
@@ -468,7 +477,7 @@ struct DiodeParameters {
 impl Diode {
     fn thermal(&self, context: &ModelContext) -> SpiceResult<Thermal> {
         self.derived
-            .get_or_derive(TemperatureKey::context(context), || {
+            .get_or_derive(DiodeThermalKey::context(context), || {
                 self.parameters.thermal(context)
             })
     }
@@ -528,7 +537,7 @@ struct DiodeInput {
     model: String,
     location: SourceLoc,
     parameters: DiodeParameters,
-    derived: TemperatureCache<Thermal>,
+    derived: DerivedCache<DiodeThermalKey, Thermal>,
     initial: crate::devices::initial::InstanceInitial,
     written_model: ScalarValues,
 }
@@ -551,7 +560,7 @@ impl DiodeInput {
             model: model.to_owned(),
             location: location.clone(),
             parameters,
-            derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
+            derived: DerivedCache::from_value(DiodeThermalKey::context(context), thermal),
             initial,
             written_model: m,
         })
@@ -833,6 +842,11 @@ impl DiodeParameters {
 
     /// `diotemp.c::DIOtempUpdate` at this run's instance temperature.
     fn thermal(&self, context: &ModelContext) -> SpiceResult<Thermal> {
+        // Low-level device callers can prepare without a circuit load.
+        // Reject an invalid matching tolerance before publishing a derivation.
+        if !(context.reltol.is_finite() && context.reltol > 0.) {
+            return Err(SpiceError::circuit("invalid diode circuit RELTOL"));
+        }
         let model = &self.model;
         let geometry = self.instance.geometry;
         // diotemp.c::DIOtemp: TEMP (dioparam.c adds CONSTCtoK), else the
@@ -912,6 +926,7 @@ impl DiodeParameters {
                 csat + csatsw,
                 vt,
                 model.nbv,
+                context.reltol,
             )?),
             None => None,
         };
@@ -1007,8 +1022,15 @@ const fn temperature_polynomial(linear: Real, quadratic: Real, delta: Real) -> R
 
 /// `diotemp.c` breakdown matching: the knee voltage `xbv` at which the
 /// reverse-breakdown exponential carries `cbv` at the temperature-adjusted
-/// breakdown voltage `bv`, iterated like C (see [`BREAKDOWN_RELTOL`]).
-fn breakdown_voltage(bv: Real, cbv: Real, total: Real, vt: Real, nbv: Real) -> SpiceResult<Real> {
+/// breakdown voltage `bv`, iterated with the resolved circuit RELTOL.
+fn breakdown_voltage(
+    bv: Real,
+    cbv: Real,
+    total: Real,
+    vt: Real,
+    nbv: Real,
+    reltol: Real,
+) -> SpiceResult<Real> {
     if cbv < total * bv / vt {
         // C keeps BV unmatched (its warning is TRACE-only).
         return Ok(bv);
@@ -1017,7 +1039,7 @@ fn breakdown_voltage(bv: Real, cbv: Real, total: Real, vt: Real, nbv: Real) -> S
         let exponential = ((bv - x) / (nbv * vt)).exp();
         total * (exponential - 1. + x / vt)
     };
-    let tolerance = BREAKDOWN_RELTOL * cbv;
+    let tolerance = reltol * cbv;
     let normalized_current = 1. + cbv / total;
     let initial_offset = nbv * vt * normalized_current.ln();
     let mut x = bv - initial_offset;
@@ -1675,7 +1697,7 @@ impl Device for Diode {
             terminals: self.terminals.clone(),
             junction: self.junction,
             parameters: p,
-            derived: TemperatureCache::from_value(TemperatureKey::context(context), thermal),
+            derived: DerivedCache::from_value(DiodeThermalKey::context(context), thermal),
             initial,
             location: self.location.clone(),
             written_model: self.written_model.clone(),
@@ -2148,6 +2170,28 @@ mod tests {
     ];
 
     #[test]
+    fn breakdown_matching_uses_circuit_tolerance_and_iteration_bound() {
+        // Independently evaluated from the pinned diotemp.c recurrence.
+        // The first four rows stop after 1, 3, 6 and 9 iterations; the
+        // last retains iteration 25 when rounding prevents convergence.
+        for (reltol, bits) in [
+            (0.1, 0x4013_a3c0_04f4_949f),
+            (1e-3, 0x4013_ae04_0454_e4e1),
+            (1e-6, 0x4013_ae2a_032b_09da),
+            (1e-9, 0x4013_ae2a_1443_b295),
+            (1e-16, 0x4013_ae2a_144b_67f2),
+        ] {
+            assert_eq!(
+                breakdown_voltage(5., 2e-9, 1e-11, 0.025_864, 1.3, reltol)
+                    .unwrap()
+                    .to_bits(),
+                bits,
+                "RELTOL={reltol}"
+            );
+        }
+    }
+
+    #[test]
     fn breakdown_jacobian_charge_and_matching() {
         for celsius in [-40., 27., 125.] {
             let t = thermal(
@@ -2165,7 +2209,9 @@ mod tests {
         // (TLEV 1) before matching against the heated saturation current.
         for (tlev, tbv) in [(0, 10. - 1e-3 * 100.), (1, 10. * (1. - 1e-3 * 100.))] {
             let t = thermal(&format!("bv=10 tcv=1m tlev={tlev} ibv=1e-3"), "", 127.);
-            let expected = breakdown_voltage(tbv, 1e-3, t.csat, t.vt, 1.).unwrap();
+            let expected =
+                breakdown_voltage(tbv, 1e-3, t.csat, t.vt, 1., crate::devices::DEFAULT_RELTOL)
+                    .unwrap();
             assert_eq!(t.breakdown, Some(expected));
             assert!(expected < tbv && expected > tbv - 0.5);
         }
@@ -2301,10 +2347,9 @@ mod tests {
     #[test]
     fn aliases_keep_last_set_precedence() {
         let p = parameters("cj0=1p cjo=2p cj=3p pb=0.6 mj=0.3 vb=7 ib=1u nz=2", "").unwrap();
-        // INPevaluate values: `0.6` is 6 * 0.1 and `0.3` is 3 * 0.1.
         assert_eq!(
             (p.model.cjo, p.model.vj, p.model.grading),
-            (3e-12, 6. * 0.1, 3. * 0.1)
+            (3e-12, 0.6, 0.3)
         );
         assert_eq!((p.model.bv, p.model.ibv, p.model.nbv), (Some(7.), 1e-6, 2.));
         let p = parameters("cjo=2p cj0=1p", "").unwrap();

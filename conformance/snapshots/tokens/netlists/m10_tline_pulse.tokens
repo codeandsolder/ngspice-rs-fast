@@ -98,7 +98,7 @@ card 9 @netlists/m10_tline_pulse.cir:18:1 lines=18-18 continuations=0
   raw: ".tran 0.05n 16n"
   kind: dot(.tran)
   token 1 18:1 word ".tran"
-  token 2 18:7 number "0.05n" value=4.9999999999999995e-11
+  token 2 18:7 number "0.05n" value=5e-11
   token 3 18:13 number "16n" value=1.6e-8
 card 10 @netlists/m10_tline_pulse.cir:19:1 lines=19-19 continuations=0
   raw: ".end"

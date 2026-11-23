@@ -7,7 +7,7 @@ card 1 @netlists/m11_bsim4_bin_dc.cir:6:1 lines=6-6 continuations=0
   token 1 6:1 word "vdd"
   token 2 6:5 word "dd"
   token 3 6:8 number "0" value=0e0
-  token 4 6:10 number "1.2" value=1.2000000000000002e0
+  token 4 6:10 number "1.2" value=1.2e0
 card 2 @netlists/m11_bsim4_bin_dc.cir:7:1 lines=7-7 continuations=0
   raw: "vg g 0 0.8"
   kind: device(v)
@@ -59,7 +59,7 @@ card 5 @netlists/m11_bsim4_bin_dc.cir:10:1 lines=10-10 continuations=0
   token 9 10:19 number "1u" value=1e-6
   token 10 10:22 word "w"
   token 11 10:23 equals "="
-  token 12 10:24 number "10u" value=9.999999999999999e-6
+  token 12 10:24 number "10u" value=1e-5
 card 6 @netlists/m11_bsim4_bin_dc.cir:11:1 lines=11-13 continuations=2
   raw: ".model nch.1 nmos lmin=1e-8 lmax=2e-7 wmin=1e-7 wmax=1e-4 level=54 version=4.8.3 rgatemod=1 rbodymod=1 igcmod=1 igbmod=1 xrcrg1=12 xrcrg2=5 rshg=0.4 rbpb=5 rbpd=15 rbps=15 rbdb=15 rbsb=15 cgso=1.5e-10 cgdo=1.5e-10 cgbo=1e-11 jss=1e-4 cjs=1e-3 cjsws=2e-10"
   kind: dot(.model)
@@ -234,7 +234,7 @@ card 8 @netlists/m11_bsim4_bin_dc.cir:18:1 lines=18-18 continuations=0
   token 1 18:1 word ".dc"
   token 2 18:5 word "vg"
   token 3 18:8 number "0" value=0e0
-  token 4 18:10 number "1.2" value=1.2000000000000002e0
+  token 4 18:10 number "1.2" value=1.2e0
   token 5 18:14 number "0.1" value=1e-1
 card 9 @netlists/m11_bsim4_bin_dc.cir:19:1 lines=19-19 continuations=0
   raw: ".end"

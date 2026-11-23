@@ -111,15 +111,16 @@ fn passive_model<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
         .get(1)
         .is_some_and(|token| token.kind == TokenKind::Equals);
     let declared = input.state.declared_models;
-    if input.input.first().is_some_and(|token| {
-        token.number().is_some() && declared.contains(&token.text.to_ascii_lowercase())
-    }) {
+    if input
+        .input
+        .first()
+        .is_some_and(|token| token.number().is_some() && declared.contains(&token.text, false))
+    {
         return Err(gap(input, "numeric-looking passive model references"));
     }
     if assignment
         && input.input.first().is_some_and(|token| {
-            declared.contains(&token.text.to_ascii_lowercase())
-                && scalar_name(designator, &token.text).is_none()
+            declared.contains(&token.text, false) && scalar_name(designator, &token.text).is_none()
         })
     {
         return Err(malformed(
@@ -131,7 +132,7 @@ fn passive_model<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
         token.is_name_like()
             && !assignment
             && !token.text.eq_ignore_ascii_case(&designator.to_string())
-            && declared.contains(&token.text.to_ascii_lowercase())
+            && declared.contains(&token.text, false)
     })
     .parse_next(input)
 }

@@ -11,6 +11,7 @@ use crate::netlist::ast::{
 use crate::netlist::card::{DotCommand, RawCard};
 use crate::netlist::source::Deck;
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -119,8 +120,9 @@ pub(super) fn assemble(
     cards: &[SpiceResult<InputCard>],
     auto_gnd: bool,
 ) -> SpiceResult<ParsedDeck> {
+    let models = ModelIndex::build(cards);
     let mut cursor = 0;
-    let scope = scope(cards, &mut cursor, auto_gnd, &BTreeSet::new(), None, 0)?;
+    let scope = scope(cards, &mut cursor, auto_gnd, &models, None, 0)?;
     Ok(ParsedDeck {
         netlist: Netlist {
             title: deck.title.clone(),
@@ -145,38 +147,145 @@ pub(super) fn assemble(
     })
 }
 
-// Read-only forward-name scan, bounded to this body and excluding children and
-// control scripts. Ancestors are visible; siblings/children never leak names.
-fn model_names(
-    cards: &[SpiceResult<InputCard>],
-    start: usize,
-    inherited: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let mut names = inherited.clone();
-    let mut depth = 0usize;
-    let mut in_control = false;
-    for entry in &cards[start..] {
-        let Ok(entry) = entry else { continue };
-        match entry.source.dot_command() {
-            Some(DotCommand::Control) => in_control = true,
-            Some(DotCommand::Endc) => in_control = false,
-            Some(DotCommand::Subckt) if !in_control => depth += 1,
-            Some(DotCommand::Ends) if !in_control => {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
+const MAX_SCOPE_DEPTH: usize = 64;
+
+/// Only declarations local to this lexical body. The parent edge represents
+/// ancestor visibility without copying any inherited names.
+#[derive(Debug, Default)]
+struct LexicalModels<'a> {
+    body_start: usize,
+    parent: Option<usize>,
+    names: BTreeSet<Cow<'a, str>>,
+    bins: BTreeSet<Cow<'a, str>>,
+}
+
+/// The token stream already owns the declaration spelling. Only names
+/// with ASCII uppercase letters need a separate canonical allocation.
+fn canonical_name(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+impl<'a> LexicalModels<'a> {
+    fn insert(&mut self, name: &'a str) {
+        // Bin candidates are identified during indexing, not by scanning a
+        // prefix range on every MOS terminal/model disambiguation.
+        if let Some((base, suffix)) = name.rsplit_once('.')
+            && !suffix.is_empty()
+            && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            self.bins.insert(canonical_name(base));
+        }
+        self.names.insert(canonical_name(name));
+    }
+}
+
+/// Occurrence-based structural index, independent of semantic validity.
+/// In particular two visits to the same included `RawCard` have distinct
+/// scope identities. The ordered body-start keys are unique and monotone.
+struct ModelIndex<'a> {
+    scopes: Vec<LexicalModels<'a>>,
+    #[cfg(test)]
+    inspected_cards: usize,
+}
+
+impl<'a> ModelIndex<'a> {
+    /// One read-only pass, with the same lexical control and terminator
+    /// policy as the semantic parser's former forward-name scans. Errors
+    /// remain in the input for ordered replay; this pass never emits one.
+    /// Do not allocate scope records beyond the semantic nesting budget.
+    fn build(cards: &'a [SpiceResult<InputCard>]) -> Self {
+        let mut scopes = vec![LexicalModels::default()];
+        let mut active = 0;
+        let mut depth = 0usize;
+        let mut in_control = false;
+        #[cfg(test)]
+        let mut inspected_cards = 0;
+        for (ordinal, entry) in cards.iter().enumerate() {
+            #[cfg(test)]
+            {
+                inspected_cards += 1;
             }
-            Some(DotCommand::End) => break,
-            Some(DotCommand::Model) if !in_control && depth == 0 => {
-                if let Some(name) = entry.source.tokens.get(1).filter(|t| t.is_name_like()) {
-                    names.insert(name.text.to_ascii_lowercase());
+            let Ok(entry) = entry else { continue };
+            match entry.source.dot_command() {
+                Some(DotCommand::Control) => in_control = true,
+                Some(DotCommand::Endc) => in_control = false,
+                Some(DotCommand::Subckt) if !in_control => {
+                    depth += 1;
+                    if depth <= MAX_SCOPE_DEPTH {
+                        let child = LexicalModels {
+                            body_start: ordinal + 1,
+                            parent: Some(active),
+                            ..LexicalModels::default()
+                        };
+                        active = scopes.len();
+                        scopes.push(child);
+                    }
                 }
+                Some(DotCommand::Ends) if !in_control => {
+                    if depth == 0 {
+                        break;
+                    }
+                    if depth <= MAX_SCOPE_DEPTH
+                        && let Some(parent) = scopes[active].parent
+                    {
+                        active = parent;
+                    }
+                    depth -= 1;
+                }
+                Some(DotCommand::End) => break,
+                Some(DotCommand::Model) if !in_control && depth <= MAX_SCOPE_DEPTH => {
+                    if let Some(name) = entry.source.tokens.get(1).filter(|t| t.is_name_like()) {
+                        scopes[active].insert(&name.text);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+        }
+        Self {
+            scopes,
+            #[cfg(test)]
+            inspected_cards,
         }
     }
-    names
+
+    fn visibility(&self, body_start: usize) -> SpiceResult<ModelVisibility<'_>> {
+        let scope = self
+            .scopes
+            .binary_search_by_key(&body_start, |scope| scope.body_start)
+            .map_err(|_| SpiceError::circuit("missing lexical model scope"))?;
+        Ok(ModelVisibility {
+            scopes: &self.scopes,
+            scope,
+        })
+    }
+}
+
+/// Borrowed model membership for grammar lookahead. Non-body grammar
+/// entry points (include directives, resolved measures) need no declarations.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ModelVisibility<'a> {
+    scopes: &'a [LexicalModels<'a>],
+    scope: usize,
+}
+
+impl ModelVisibility<'_> {
+    pub(super) fn contains(self, name: &str, allow_bins: bool) -> bool {
+        let name = canonical_name(name);
+        let mut current = self.scopes.get(self.scope);
+        while let Some(scope) = current {
+            if scope.names.contains(name.as_ref())
+                || (allow_bins && scope.bins.contains(name.as_ref()))
+            {
+                return true;
+            }
+            current = scope.parent.map(|index| &self.scopes[index]);
+        }
+        false
+    }
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -202,7 +311,7 @@ impl ControlScript {
         card: &RawCard,
         in_body: bool,
         auto_gnd: bool,
-        declared: &BTreeSet<String>,
+        declared: ModelVisibility<'_>,
     ) -> SpiceResult<Option<ParsedCard>> {
         if matches!(
             card.dot_command(),
@@ -299,11 +408,11 @@ fn scope(
     cards: &[SpiceResult<InputCard>],
     cursor: &mut usize,
     auto_gnd: bool,
-    inherited: &BTreeSet<String>,
+    models: &ModelIndex<'_>,
     opening: Option<(&str, &SourceLoc)>,
     depth: usize,
 ) -> SpiceResult<Scope> {
-    let declared = model_names(cards, *cursor, inherited);
+    let declared = models.visibility(*cursor)?;
     let mut result = Scope::default();
     let mut definitions = BTreeSet::new();
     let mut control = ControlScript::default();
@@ -311,7 +420,7 @@ fn scope(
         let entry = entry.as_ref().map_err(Clone::clone)?;
         *cursor += 1;
         let card = &entry.source;
-        let Some(parsed) = control.parse(card, opening.is_some(), auto_gnd, &declared)? else {
+        let Some(parsed) = control.parse(card, opening.is_some(), auto_gnd, declared)? else {
             result.cards.push(ordered(entry, ScopedCardKind::Control));
             continue;
         };
@@ -348,7 +457,7 @@ fn scope(
                         format!("duplicate subcircuit definition '{}' in this scope", s.name),
                     ));
                 }
-                if depth >= 64 {
+                if depth >= MAX_SCOPE_DEPTH {
                     return Err(SpiceError::parse(
                         s.location,
                         "subcircuit nesting limit (64) exceeded",
@@ -358,7 +467,7 @@ fn scope(
                     cards,
                     cursor,
                     auto_gnd,
-                    &declared,
+                    models,
                     Some((&s.name, &s.location)),
                     depth + 1,
                 )?;
@@ -447,4 +556,211 @@ fn reject_in_body(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netlist::source::parse_deck_text;
+    use std::fmt::Write;
+    use std::path::Path;
+
+    fn cards(body: &str) -> Vec<SpiceResult<InputCard>> {
+        let deck = parse_deck_text(Path::new("scope-index.cir"), &format!("Title\n{body}"));
+        deck.lines
+            .iter()
+            .map(|line| RawCard::parse(line).map(Into::into))
+            .collect()
+    }
+
+    // Former implementation, kept only as an independent differential
+    // oracle for lexical membership and the old operation count.
+    fn reference(
+        cards: &[SpiceResult<InputCard>],
+        start: usize,
+        inherited: &BTreeSet<String>,
+    ) -> (BTreeSet<String>, usize) {
+        let mut names = inherited.clone();
+        let mut depth = 0usize;
+        let mut in_control = false;
+        let mut inspected = 0;
+        for entry in &cards[start..] {
+            inspected += 1;
+            let Ok(entry) = entry else { continue };
+            match entry.source.dot_command() {
+                Some(DotCommand::Control) => in_control = true,
+                Some(DotCommand::Endc) => in_control = false,
+                Some(DotCommand::Subckt) if !in_control => depth += 1,
+                Some(DotCommand::Ends) if !in_control => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Some(DotCommand::End) => break,
+                Some(DotCommand::Model) if !in_control && depth == 0 => {
+                    if let Some(name) = entry.source.tokens.get(1).filter(|t| t.is_name_like()) {
+                        names.insert(name.text.to_ascii_lowercase());
+                    }
+                }
+                _ => {}
+            }
+        }
+        (names, inspected)
+    }
+
+    fn reference_contains(names: &BTreeSet<String>, candidate: &str, bins: bool) -> bool {
+        let name = candidate.to_ascii_lowercase();
+        names.contains(&name)
+            || (bins
+                && names.iter().any(|model| {
+                    model
+                        .strip_prefix(&name)
+                        .and_then(|rest| rest.strip_prefix('.'))
+                        .is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+                        })
+                }))
+    }
+
+    fn compare_index(
+        cards: &[SpiceResult<InputCard>],
+        index: &ModelIndex<'_>,
+        candidates: &[&str],
+    ) -> (usize, usize) {
+        let mut visible = Vec::new();
+        let mut visits = 0;
+        let mut copied = 0;
+        for scope in &index.scopes {
+            let empty = BTreeSet::new();
+            let inherited = scope.parent.map_or(&empty, |parent| &visible[parent]);
+            copied += inherited.len();
+            let (reference, inspected) = reference(cards, scope.body_start, inherited);
+            visits += inspected;
+            let view = index.visibility(scope.body_start).unwrap();
+            for candidate in candidates {
+                for bins in [false, true] {
+                    assert_eq!(
+                        view.contains(candidate, bins),
+                        reference_contains(&reference, candidate, bins),
+                        "body {} candidate {candidate} bins {bins}",
+                        scope.body_start
+                    );
+                }
+            }
+            visible.push(reference);
+        }
+        (visits, copied)
+    }
+
+    #[test]
+    fn index_preserves_lexical_membership_with_malformed_future_cards() {
+        // Exhaust a deterministic mixture of structural/control/lexical
+        // errors, including misplaced terminators and repeated model names.
+        // No semantic validation is performed by the index itself.
+        let choices = [
+            ".subckt child a b",
+            ".ends child",
+            ".control",
+            ".endc",
+            ".model RM r",
+            ".model Foo.12 NMOS",
+            ".model foo.a NMOS",
+            ".model deep.2.3 NMOS",
+            ".model Qm NPN",
+            "rbroken a {",
+            "r1 a b RM",
+            ".end",
+            ".model",
+            ".model rm r",
+        ];
+        let candidates = [
+            "rm", "RM", "foo", "foo.12", "foo.a", "deep", "deep.2", "deep.2.3", "QM", "absent",
+        ];
+        let mut rng = 0x7f4a7c159e3779b9_u64;
+        for _ in 0..512 {
+            let mut body = String::new();
+            for _ in 0..96 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let choice = usize::try_from(rng % u64::try_from(choices.len()).unwrap()).unwrap();
+                writeln!(body, "{}", choices[choice]).unwrap();
+            }
+            let cards = cards(&body);
+            let index = ModelIndex::build(&cards);
+            compare_index(&cards, &index, &candidates);
+            assert!(index.inspected_cards <= cards.len());
+        }
+    }
+
+    #[test]
+    fn canonical_index_keys_borrow_unchanged_token_spelling() {
+        let cards = cards(".model lowercase r\n.model nm.base.12 NMOS\n.model NM.Mixed.3 NMOS\n");
+        let index = ModelIndex::build(&cards);
+        let scope = &index.scopes[0];
+        assert!(matches!(
+            scope.names.get("lowercase"),
+            Some(Cow::Borrowed("lowercase"))
+        ));
+        assert!(matches!(
+            scope.bins.get("nm.base"),
+            Some(Cow::Borrowed("nm.base"))
+        ));
+        assert!(
+            matches!(scope.names.get("nm.mixed.3"), Some(Cow::Owned(name)) if name == "nm.mixed.3")
+        );
+        assert!(matches!(scope.bins.get("nm.mixed"), Some(Cow::Owned(name)) if name == "nm.mixed"));
+    }
+
+    #[test]
+    fn wide_and_deep_scopes_store_each_local_declaration_once() {
+        let mut body = String::new();
+        const ROOTS: usize = 256;
+        const SIBLINGS: usize = 256;
+        for model in 0..ROOTS {
+            writeln!(body, ".model root{model} r").unwrap();
+        }
+        for scope in 0..SIBLINGS {
+            writeln!(body, ".subckt sibling{scope} a b\n.model local r\n.ends").unwrap();
+        }
+        for scope in 0..MAX_SCOPE_DEPTH {
+            writeln!(body, ".subckt nested{scope} a b\n.model inside{scope} r").unwrap();
+        }
+        // This deliberately exceeds the parser's semantic depth limit. The
+        // index must scan across it, but never allocate a 65th scope record.
+        body.push_str(".subckt excessive a b\n.model ignored r\n.ends\n");
+        for _ in 0..MAX_SCOPE_DEPTH {
+            body.push_str(".ends\n");
+        }
+        body.push_str(".model final r\n.end\n.model after r\n");
+        let cards = cards(&body);
+        let index = ModelIndex::build(&cards);
+        assert_eq!(index.scopes.len(), 1 + SIBLINGS + MAX_SCOPE_DEPTH);
+        assert_eq!(
+            index.scopes.iter().map(|s| s.names.len()).sum::<usize>(),
+            ROOTS + SIBLINGS + MAX_SCOPE_DEPTH + 1
+        );
+        assert_eq!(index.scopes[0].names.len(), ROOTS + 1);
+        for scope in &index.scopes[1..=SIBLINGS] {
+            assert_eq!(scope.parent, Some(0));
+            assert_eq!(scope.names.len(), 1);
+        }
+        for (depth, scope) in index.scopes[SIBLINGS + 1..].iter().enumerate() {
+            assert_eq!(
+                scope.parent,
+                Some(if depth == 0 { 0 } else { SIBLINGS + depth })
+            );
+        }
+        let (visits, copied) = compare_index(
+            &cards,
+            &index,
+            &[
+                "root0", "root255", "local", "inside0", "inside63", "final", "after", "ignored",
+            ],
+        );
+        assert_eq!(index.inspected_cards, cards.len() - 1);
+        assert!(visits >= 3 * index.inspected_cards);
+        assert!(copied >= ROOTS * (SIBLINGS + MAX_SCOPE_DEPTH));
+    }
 }

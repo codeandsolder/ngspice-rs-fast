@@ -12,7 +12,7 @@
 //! each value in a `complex` plot.
 
 use std::fs;
-use std::io::BufReader;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::str;
 
@@ -89,6 +89,135 @@ fn big_endian_rawfile(header: &str, values: &[f64]) -> Vec<u8> {
         bytes.extend_from_slice(&value.to_be_bytes());
     }
     bytes
+}
+
+/// A buffered source with deliberately awkward fragments and recoverable
+/// interruptions. The permanent error is at an exact byte offset.
+struct Fragmented<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    fragment: usize,
+    calls: usize,
+    fail_at: Option<usize>,
+}
+
+impl<'a> Fragmented<'a> {
+    fn new(bytes: &'a [u8], fragment: usize) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            fragment,
+            calls: 0,
+            fail_at: None,
+        }
+    }
+}
+
+impl Read for Fragmented<'_> {
+    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+        let bytes = self.fill_buf()?;
+        let count = target.len().min(bytes.len());
+        target[..count].copy_from_slice(&bytes[..count]);
+        self.consume(count);
+        Ok(count)
+    }
+}
+
+impl BufRead for Fragmented<'_> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.calls += 1;
+        if self.calls % 3 == 0 {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let end = self
+            .fail_at
+            .unwrap_or(self.bytes.len())
+            .min(self.bytes.len());
+        if self.fail_at == Some(self.offset) {
+            return Err(io::Error::other("injected input failure"));
+        }
+        Ok(&self.bytes[self.offset..end.min(self.offset.saturating_add(self.fragment))])
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.offset += count;
+    }
+}
+
+#[test]
+fn fragmented_binary_rows_preserve_every_truncation_offset_and_plot_boundary() {
+    for (order, build) in [
+        (
+            BinaryByteOrder::LittleEndian,
+            binary_rawfile as fn(&str, &[f64]) -> Vec<u8>,
+        ),
+        (BinaryByteOrder::BigEndian, big_endian_rawfile),
+    ] {
+        for (header, values, columns, width) in [
+            (OP_HEADER, OP_VALUES.as_slice(), 3, 8),
+            (AC_HEADER, AC_VALUES.as_slice(), 2, 16),
+        ] {
+            let bytes = build(header, values);
+            let payload = header.len() + b"Binary:\n".len();
+            let total = bytes.len() - payload;
+            let mut concatenated = bytes.clone();
+            concatenated.extend_from_slice(&bytes);
+            for fragment in [1, 3, 7, 8, 15, 16, 17, 31, 8192] {
+                let mut input = Fragmented::new(&concatenated, fragment);
+                let mut reader = RawFileReader::new(&mut input).with_byte_order(order);
+                for _ in 0..2 {
+                    let mut rows = reader.next_plot().unwrap().unwrap();
+                    for expected in values.chunks_exact(columns * width / 8) {
+                        let row = rows.next_row().unwrap().unwrap();
+                        for (value, bits) in row.iter().zip(expected.chunks_exact(width / 8)) {
+                            assert_eq!(value.re.to_bits(), bits[0].to_bits());
+                            assert_eq!(
+                                value.im.to_bits(),
+                                bits.get(1).copied().unwrap_or(0.).to_bits()
+                            );
+                        }
+                    }
+                    assert!(rows.next_row().unwrap().is_none());
+                    rows.finish().unwrap();
+                }
+                assert!(reader.next_plot().unwrap().is_none());
+                assert_eq!(input.offset, concatenated.len());
+                for actual in 0..total {
+                    let mut input = Fragmented::new(&bytes[..payload + actual], fragment);
+                    let mut reader = RawFileReader::new(&mut input).with_byte_order(order);
+                    let mut rows = reader.next_plot().unwrap().unwrap();
+                    for _ in 0..actual / (columns * width) {
+                        assert_eq!(rows.next_row().unwrap().unwrap().len(), columns);
+                    }
+                    let error = rows.next_row().unwrap_err().to_string();
+                    assert!(
+                        error.contains(&format!("needs {total} byte(s) of data")),
+                        "{error}"
+                    );
+                    assert!(
+                        error.contains(&format!("only {actual} byte(s) remain")),
+                        "{error}"
+                    );
+                    assert!(rows.next_row().is_err());
+                    assert!(rows.finish().is_err());
+                    assert!(reader.next_plot().is_err());
+                    assert_eq!(input.offset, payload + actual);
+                }
+                // A partial second row must propagate I/O failure, not EOF.
+                let mut input = Fragmented::new(&concatenated, fragment);
+                input.fail_at = Some(payload + columns * width + 3);
+                let mut reader = RawFileReader::new(&mut input).with_byte_order(order);
+                let mut rows = reader.next_plot().unwrap().unwrap();
+                assert!(rows.next_row().unwrap().is_some());
+                let error = rows.next_row().unwrap_err().to_string();
+                assert!(error.contains("injected input failure"), "{error}");
+                assert!(rows.next_row().is_err());
+                assert!(rows.finish().is_err());
+                assert!(reader.next_plot().is_err());
+                assert_eq!(input.offset, payload + columns * width + 3);
+            }
+        }
+    }
 }
 
 struct Cleanup(PathBuf);

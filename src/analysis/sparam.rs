@@ -316,8 +316,11 @@ pub(super) fn run(
             let factor =
                 crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * f)?
                     .factorize()?;
-            plan.budget
-                .charge_factor(factor.stored_entries()?, plan.ports.len(), plan.noise)?;
+            plan.budget.charge_factor(
+                factor.factor_storage().factor_entries,
+                plan.ports.len(),
+                plan.noise,
+            )?;
             workspace.solve_ports(&plan.ports, &factor, f)?;
             Ok(factor)
         })?;

@@ -47,7 +47,7 @@ card 4 @netlists/m10_hfet2_tran.cir:5:1 lines=5-5 continuations=0
   token 8 5:15 number "1u" value=1e-6
   token 9 5:18 word "w"
   token 10 5:19 equals "="
-  token 11 5:20 number "20u" value=1.9999999999999998e-5
+  token 11 5:20 number "20u" value=2e-5
 card 5 @netlists/m10_hfet2_tran.cir:6:1 lines=6-6 continuations=0
   raw: "r1 1 2 1k"
   kind: device(r)
@@ -90,8 +90,8 @@ card 8 @netlists/m10_hfet2_tran.cir:9:1 lines=9-9 continuations=0
   raw: ".tran 0.05n 3n"
   kind: dot(.tran)
   token 1 9:1 word ".tran"
-  token 2 9:7 number "0.05n" value=4.9999999999999995e-11
-  token 3 9:13 number "3n" value=3.0000000000000004e-9
+  token 2 9:7 number "0.05n" value=5e-11
+  token 3 9:13 number "3n" value=3e-9
 card 9 @netlists/m10_hfet2_tran.cir:10:1 lines=10-10 continuations=0
   raw: ".end"
   kind: dot(.end)

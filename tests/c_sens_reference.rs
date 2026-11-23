@@ -14,6 +14,7 @@
 //! NGSPICE_BIN=/abs/path/to/ngspice cargo test -p ngspice-rs --test c_sens_reference -- --ignored
 //! ```
 
+use ngspice_conformance::fixtures::DeckInputs;
 use ngspice_conformance::ngspice::Scratch;
 use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
@@ -31,14 +32,19 @@ const NONLINEAR: (f64, f64) = (1e-6, 1e-9);
 fn classic_mos_dc_sensitivity_tables_and_values() {
     for level in [1, 2, 3, 6, 9] {
         let name = format!("sens_mos{level}");
-        let deck = fs::read_to_string(
-            ngspice_conformance::fixtures::workspace_root()
-                .unwrap()
-                .join(format!("conformance/netlists/{name}.cir")),
-        )
-        .unwrap();
-        compare_with_c(&name, &deck, NONLINEAR);
+        compare_with_c(&name, &DeckInputs::fixture(&name).unwrap(), NONLINEAR);
     }
+}
+
+/// Exercise the third explicitly selected equivalent-input fixture in batch mode.
+#[test]
+#[ignore = "requires NGSPICE_BIN"]
+fn hfet2_dc_sensitivity_matches_c() {
+    compare_with_c(
+        "sens_hfet2",
+        &DeckInputs::fixture("sens_hfet2").unwrap(),
+        NONLINEAR,
+    );
 }
 
 /// Final-load junction fields for both polarities and both integrators,
@@ -50,7 +56,7 @@ fn classic_mos_dc_sensitivity_tables_and_values() {
 fn mos_ac_sensitivity_after_transient_matches_c() {
     compare_with_c(
         "sens_mos_tran_batch",
-        include_str!("../conformance/netlists/sens_ac_mos_tran.cir"),
+        &DeckInputs::fixture("sens_ac_mos_tran").unwrap(),
         LINEAR,
     );
     for level in [1, 2, 3, 9] {
@@ -75,19 +81,19 @@ fn mos_ac_sensitivity_after_transient_matches_c() {
                      .tran 0.2u 1u\n\
                      .sens i({output}) m1:cgso m1:cgdo m1:cj m1:rsh m1_nrs ac dec 1 1k 1meg\n.end\n"
                 );
-                compare_with_c(&name, &deck, LINEAR);
+                compare_with_c(&name, &DeckInputs::same(&deck), LINEAR);
             }
         }
     }
 }
 
-fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64)) {
+fn compare_with_c(name: &str, inputs: &DeckInputs<'_>, (relative, absolute): (f64, f64)) {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
     let scratch = Scratch::new("c-sens-reference").unwrap();
     let directory = scratch.path();
     let deck = directory.join("deck.cir");
-    fs::write(&deck, deck_text).unwrap();
+    fs::write(&deck, inputs.reference()).unwrap();
 
     let c = run(
         &binary,
@@ -106,6 +112,8 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
         !log.contains("aborted") && !log.contains("Error"),
         "{name}: ngspice reported a problem:\n{log}"
     );
+    let rust_deck = directory.join("rust.cir");
+    fs::write(&rust_deck, inputs.rust()).unwrap();
     let rust = run(
         std::env::var_os("CARGO_BIN_EXE_spice-rs").expect("Cargo supplies the test executable"),
         directory,
@@ -113,7 +121,7 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
             std::ffi::OsStr::new("simulate"),
             std::ffi::OsStr::new("--output"),
             directory.join("rust.raw").as_os_str(),
-            deck.as_os_str(),
+            rust_deck.as_os_str(),
         ],
         ProcessLimits::ORACLE,
     )
@@ -182,7 +190,8 @@ fn compare_with_c(name: &str, deck_text: &str, (relative, absolute): (f64, f64))
 fn linear_dc_decks_match_c() {
     compare_with_c(
         "linear",
-        "\
+        &DeckInputs::same(
+            "\
 sens linear
 v1 in 0 dc 5
 i1 0 n2 dc 1m
@@ -206,11 +215,13 @@ rh h 0 1k
 .sens v(a)
 .end
 ",
+        ),
         LINEAR,
     );
     compare_with_c(
         "filtered",
-        "\
+        &DeckInputs::same(
+            "\
 sens filtered
 v1 in 0 dc 5
 r1 in a 1k
@@ -219,6 +230,7 @@ r3 a 0 3k
 .sens v(a) r?_m *:tc1 v1 dc
 .end
 ",
+        ),
         LINEAR,
     );
 }
@@ -231,7 +243,8 @@ r3 a 0 3k
 fn hot_and_behavioural_decks_match_c() {
     compare_with_c(
         "hot",
-        "\
+        &DeckInputs::same(
+            "\
 sens hot
 .options temp=60
 v1 in 0 pulse(2 5 1u 1u 1u 10u 20u)
@@ -255,6 +268,7 @@ rw w 0 1k
 .sens i(vm)
 .end
 ",
+        ),
         NONLINEAR,
     );
 }
@@ -267,7 +281,8 @@ rw w 0 1k
 fn diode_decks_match_c() {
     compare_with_c(
         "diode",
-        "\
+        &DeckInputs::same(
+            "\
 sens diode
 .options reltol=1e-9
 v1 in 0 dc 5
@@ -278,11 +293,13 @@ d1 a 0 dmod
 .sens v(a)
 .end
 ",
+        ),
         NONLINEAR,
     );
     compare_with_c(
         "diodes",
-        "\
+        &DeckInputs::same(
+            "\
 sens diodes
 .options reltol=1e-9 temp=50
 v1 in 0 dc 5
@@ -298,6 +315,7 @@ rc c 0 10k
 .sens v(c)
 .end
 ",
+        ),
         NONLINEAR,
     );
 }
@@ -327,7 +345,11 @@ fn diode_setup_quantities_survive_perturbations() {
              ikf=1.37m ikr=2.19m ikp=123u area=2.3 pj=1.2 tlev=2 tlevc=1 tnom=31)\n\
              .sens v(a) {filters} {analysis}\n.end\n"
             );
-            compare_with_c(&format!("{name}-{group}"), &deck, NONLINEAR);
+            compare_with_c(
+                &format!("{name}-{group}"),
+                &DeckInputs::same(&deck),
+                NONLINEAR,
+            );
         }
     }
 }
@@ -339,7 +361,8 @@ fn diode_setup_quantities_survive_perturbations() {
 fn ac_decks_match_c() {
     compare_with_c(
         "ac",
-        "\
+        &DeckInputs::same(
+            "\
 sens ac
 .options temp=40
 v1 in 0 dc 1 ac 1 30
@@ -363,11 +386,13 @@ rf f b 1k
 .sens v(a,b) ac oct 2 1k 16k
 .end
 ",
+        ),
         LINEAR,
     );
     compare_with_c(
         "ac-lin",
-        "\
+        &DeckInputs::same(
+            "\
 sens ac lin
 v1 in 0 dc 1 ac 1
 r1 in out 1k
@@ -375,6 +400,7 @@ c1 out 0 1n
 .sens i(v1) ac lin 3 10 100
 .end
 ",
+        ),
         LINEAR,
     );
 }
@@ -387,7 +413,8 @@ c1 out 0 1n
 fn bsim4_ac_temperature_drift_matches_c() {
     compare_with_c(
         "bsim4-ac-drift",
-        "\
+        &DeckInputs::same(
+            "\
 bsim4 filtered drift
 vdd dd 0 1
 rl dd d 1k
@@ -399,6 +426,27 @@ m1 d g s b nch l=0.1u w=1u
 .sens v(d) m1:tnom m1:cgdo m1:cgso m1_w ac dec 3 1e3 1e9
 .end
 ",
+        ),
         (1e-4, 1e-9),
     );
+}
+
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; diode breakdown sensitivity"]
+fn diode_breakdown_replay_uses_circuit_reltol() {
+    for reltol in ["1e-3", "1e-9"] {
+        for analysis in ["dc", "ac lin 2 1k 2k"] {
+            let text = format!(
+                "breakdown sensitivity\n.options reltol={reltol} vntol=1e-15 abstol=1e-18\n\
+                 v1 a 0 dc -5.1 ac 1\nd1 a 0 dm\n\
+                 .model dm d(is=1e-11 bv=5 ibv=2e-9 nbv=1.3 cjo=20p)\n\
+                 .sens i(v1) d1:ibv d1:bv d1:nbv {analysis}\n.end\n"
+            );
+            compare_with_c(
+                &format!("breakdown-{reltol}-{analysis}"),
+                &DeckInputs::same(&text),
+                NONLINEAR,
+            );
+        }
+    }
 }

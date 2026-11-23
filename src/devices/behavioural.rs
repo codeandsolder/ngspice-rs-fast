@@ -47,7 +47,9 @@ use crate::primitives::{
 };
 
 use crate::devices::linear::LinearContext;
-use crate::devices::traits::{AnalysisMode, ControlReference, Device, MnaUnknowns, StampContext};
+use crate::devices::traits::{
+    AnalysisMode, ControlReference, Device, MnaUnknowns, StampContext, StampRhs,
+};
 use program::{Environment, Evaluation, Program, Quantity, Workspace};
 use std::cell::RefCell;
 
@@ -257,7 +259,7 @@ impl Behavioural {
     fn stamp_into(
         &self,
         matrix: &mut SparseMatrix,
-        rhs: Option<&mut Vector>,
+        rhs: Option<&mut StampRhs<'_>>,
         unknowns: &MnaUnknowns,
         branch: Option<usize>,
         linearization: &Linearization,
@@ -550,7 +552,7 @@ impl Device for Behavioural {
         let branch = (!context.branches.is_empty()).then_some(context.branches.start);
         self.stamp_into(
             context.matrix,
-            Some(context.rhs),
+            Some(&mut context.rhs),
             context.unknowns,
             branch,
             &linearization,

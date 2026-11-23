@@ -81,8 +81,8 @@ pub(super) fn plot(
     for (name, unit) in names.into_iter().flatten() {
         plot.push_variable(var(name, unit));
     }
-    for name in circuit.observations() {
-        plot.push_variable(Variable::new(name, crate::devices::observe::unit(name)));
+    for observation in circuit.observations() {
+        plot.push_variable(Variable::new(observation.name(), observation.unit()));
     }
     Ok(plot.build())
 }

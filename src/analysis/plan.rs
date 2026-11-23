@@ -83,7 +83,7 @@ impl SolverOverrides {
         let dc = config.dc();
         let tran = config.transient();
         let mut newton = NewtonOptions::default();
-        newton.reltol = self.reltol.or(tran.rtol).unwrap_or(newton.reltol);
+        newton.reltol = self.reltol.unwrap_or_else(|| config.context().reltol);
         newton.vntol = self.vntol.or(tran.vntol).unwrap_or(newton.vntol);
         newton.abstol = self.abstol.or(tran.abstol).unwrap_or(newton.abstol);
         newton.max_iterations = self.direct.or(dc.itl1).unwrap_or(newton.max_iterations);

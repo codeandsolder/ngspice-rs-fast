@@ -368,6 +368,77 @@ fn weighted_bessel_pair<const DIVIDED: bool>(
     }
 }
 
+/// Scaled Bessel pairs for adjacent knots. Homogeneous polynomial regions
+/// use the same coefficients as the scalar kernels; mixed regions take the
+/// scalar path rather than evaluating multiple high-degree polynomials.
+fn weighted_bessel_batch<const DIVIDED: bool>(
+    x: std::simd::f64x4,
+    decay: std::simd::f64x4,
+    combined: std::simd::f64x4,
+) -> (std::simd::f64x4, std::simd::f64x4) {
+    use std::simd::{StdFloat, cmp::SimdPartialOrd, f64x4};
+    let small = x.simd_lt(f64x4::splat(3.75));
+    let far = x.simd_ge(f64x4::splat(15.));
+    if small.all() {
+        let y = x * f64x4::splat(0.5);
+        let y = y * y;
+        let factor = f64x4::from_array(decay.to_array().map(Real::exp));
+        let i0 = polynomial(y, &I0_SMALL, f64x4::splat);
+        let i1 = polynomial(y, &I1_SMALL, f64x4::splat);
+        (factor * i0, factor * if DIVIDED { i1 } else { x * i1 })
+    } else if !small.any() && (far.all() || !far.any()) {
+        let (y, c0, c1): (_, &[Real], &[Real]) = if far.all() {
+            (f64x4::splat(30.) / x - f64x4::splat(1.), &I0_FAR, &I1_FAR)
+        } else {
+            (
+                f64x4::splat(10.) / x - f64x4::splat(5. / 3.),
+                &I0_MID,
+                &I1_MID,
+            )
+        };
+        let factor = f64x4::from_array(combined.to_array().map(Real::exp)) / x.sqrt();
+        let i0 = factor * polynomial(y, c0, f64x4::splat);
+        let i1 = factor * polynomial(y, c1, f64x4::splat);
+        (i0, if DIVIDED { i1 / x } else { i1 })
+    } else {
+        let values = std::array::from_fn::<_, 4, _>(|i| {
+            weighted_bessel_pair::<DIVIDED>(x[i], decay[i], combined[i])
+        });
+        (
+            f64x4::from_array(values.map(|v| v.0)),
+            f64x4::from_array(values.map(|v| v.1)),
+        )
+    }
+}
+
+fn small_i0_delta_batch(x: std::simd::f64x4) -> std::simd::f64x4 {
+    use std::simd::f64x4;
+    let y = x * f64x4::splat(0.5);
+    let y = y * y;
+    y * polynomial(y, &I0_SMALL[1..], f64x4::splat)
+}
+
+fn self_endpoint_batch(lag: std::simd::f64x4, beta: Real) -> std::simd::f64x4 {
+    use std::simd::{StdFloat, cmp::SimdPartialOrd, f64x4};
+    if beta == 0. {
+        return lag;
+    }
+    let x = f64x4::splat(beta) * lag;
+    let small = x.simd_lt(f64x4::splat(3.75));
+    let one = f64x4::splat(1.);
+    if small.all() {
+        let y = x * f64x4::splat(0.5);
+        let delta = small_i0_delta_batch(x) + x * polynomial(y * y, &I1_SMALL, f64x4::splat);
+        let minus_one = f64x4::from_array((-x).to_array().map(Real::exp_m1));
+        lag * (one + minus_one).mul_add(delta, minus_one)
+    } else if !small.any() {
+        let (i0, i1) = weighted_bessel_batch::<false>(x, -x, f64x4::splat(0.));
+        lag * (i0 + i1 - one)
+    } else {
+        f64x4::from_array(lag.to_array().map(|t| rlc_self_endpoint(t, beta)))
+    }
+}
+
 /// The RLC self endpoint is lag * [exp(-x)*(I0(x)+I1(x))-1],
 /// with x=beta*lag. Preserve the small loss correction and evaluate
 /// the large-argument product in exponentially scaled form.
@@ -383,6 +454,35 @@ fn rlc_self_endpoint(lag: Real, beta: Real) -> Real {
     } else {
         let (i0, i1) = weighted_bessel_pair::<false>(x, -x, 0.);
         lag * (i0 + i1 - 1.)
+    }
+}
+
+// With no accepted samples beyond the propagation delay, only the local
+// kernel contributes. A short history cannot amortize the batched setup.
+fn short_self_coefficients(
+    beta: Real,
+    curtime: Real,
+    times: &VecDeque<Real>,
+    reltol: Real,
+    out: &mut Coefficients,
+) {
+    let endpoint = |lag| rlc_self_endpoint(lag, beta);
+    let index = times.len() - 1;
+    let lag = curtime - times[index];
+    let mut previous = endpoint(lag);
+    let mut slope = previous / lag;
+    out.first[0] = slope;
+    let threshold = (slope * reltol).abs();
+    for i in (1..=index).rev() {
+        let current = endpoint(curtime - times[i - 1]);
+        let next_slope = (current - previous) / (times[i] - times[i - 1]);
+        let weight = next_slope - slope;
+        out.weights[i][0] = weight;
+        if weight.abs() <= threshold {
+            break;
+        }
+        previous = current;
+        slope = next_slope;
     }
 }
 
@@ -409,16 +509,8 @@ impl RlcKernels {
         }
     }
 
-    fn at(self, lag: Real, active: [bool; 3]) -> [Real; 3] {
-        let h1 = if active[0] {
-            rlc_self_endpoint(lag, self.beta)
-        } else {
-            0.
-        };
-        if lag < self.delay || !(active[1] || active[2]) {
-            return [h1, 0., 0.];
-        }
-        let (argument, combined) = if lag == self.delay {
+    fn arguments(self, lag: Real) -> (Real, Real) {
+        if lag == self.delay {
             (0., -self.beta * lag)
         } else {
             let ratio = self.delay / lag;
@@ -429,7 +521,19 @@ impl RlcKernels {
                 argument,
                 (self.alpha - self.beta).mul_add(lag, -self.alpha * lag_difference),
             )
+        }
+    }
+
+    fn at(self, lag: Real, active: [bool; 3]) -> [Real; 3] {
+        let h1 = if active[0] {
+            rlc_self_endpoint(lag, self.beta)
+        } else {
+            0.
         };
+        if lag < self.delay || !(active[1] || active[2]) {
+            return [h1, 0., 0.];
+        }
+        let (argument, combined) = self.arguments(lag);
         let (i0, i1_over_x) = weighted_bessel_pair::<true>(argument, -self.beta * lag, combined);
         let h2 = if active[1] && self.alpha != 0. {
             self.alpha_squared_delay * i1_over_x
@@ -448,6 +552,68 @@ impl RlcKernels {
             i0 - self.delay_decay
         };
         [h1, h2, h3]
+    }
+
+    fn batch(self, lags: [Real; 4], active: [bool; 3]) -> [[Real; 3]; 4] {
+        use std::simd::{Select, StdFloat, cmp::SimdPartialOrd, f64x4};
+        let lag = f64x4::from_array(lags);
+        let zero = f64x4::splat(0.);
+        if lags.iter().any(|&t| t < 0. || !t.is_finite()) {
+            return lags.map(|t| self.at(t, active));
+        }
+        let h1 = if active[0] {
+            self_endpoint_batch(lag, self.beta)
+        } else {
+            zero
+        };
+        if !(active[1] || active[2]) {
+            return h1.to_array().map(|v| [v, 0., 0.]);
+        }
+        let transit = f64x4::splat(self.delay);
+        let arguments = lags.map(|t| {
+            if t >= self.delay {
+                self.arguments(t)
+            } else {
+                (0., -self.beta * t)
+            }
+        });
+        let x = f64x4::from_array(arguments.map(|v| v.0));
+        let combined = f64x4::from_array(arguments.map(|v| v.1));
+        let (i0, divided) =
+            weighted_bessel_batch::<true>(x, f64x4::splat(-self.beta) * lag, combined);
+        let h2 = if active[1] && self.alpha != 0. {
+            lag.simd_ge(transit)
+                .select(f64x4::splat(self.alpha_squared_delay) * divided, zero)
+        } else {
+            zero
+        };
+        let h3 = if !active[2] || self.beta == 0. {
+            zero
+        } else {
+            let small = x.simd_lt(f64x4::splat(3.75));
+            let base = f64x4::splat(self.delay_decay);
+            let far = i0 - base;
+            let values = if small.all() {
+                let local = f64x4::splat(-self.beta) * (lag - transit);
+                let exp = f64x4::from_array(local.to_array().map(Real::exp));
+                let exp_m1 = f64x4::from_array(local.to_array().map(Real::exp_m1));
+                base * exp.mul_add(small_i0_delta_batch(x), exp_m1)
+            } else if small.any() {
+                f64x4::from_array(std::array::from_fn(|i| {
+                    if small.test(i) && lags[i] > self.delay {
+                        let local = -self.beta * (lags[i] - self.delay);
+                        self.delay_decay * local.exp().mul_add(small_i0_delta(x[i]), local.exp_m1())
+                    } else {
+                        far[i]
+                    }
+                }))
+            } else {
+                far
+            };
+            lag.simd_gt(transit).select(values, zero)
+        };
+        let [h1, h2, h3] = [h1.to_array(), h2.to_array(), h3.to_array()];
+        std::array::from_fn(|i| [h1[i], h2[i], h3[i]])
     }
 }
 
@@ -577,6 +743,50 @@ fn erfc_tail(x: Real) -> [Real; 3] {
     [u, v, x + u]
 }
 
+/// Four independent convergent series on the small-erfc region.
+fn erfc_series_batch(x: std::simd::f64x4) -> std::simd::f64x4 {
+    use std::simd::{Mask, Select, StdFloat, cmp::SimdPartialOrd, f64x4, num::SimdFloat};
+    let x2 = x * x;
+    let mut term = x;
+    let mut sum = x;
+    let mut active = Mask::splat(true);
+    for n in 1..=201 {
+        let n = Real::from(n);
+        term *= -x2 / f64x4::splat(n);
+        let add = term / f64x4::splat(2_f64.mul_add(n, 1.));
+        sum = active.select(sum + add, sum);
+        active &= add.abs().simd_gt(f64x4::splat(1e-17) * sum.abs());
+        if !active.any() {
+            break;
+        }
+    }
+    f64x4::splat(-2. / PI.sqrt()).mul_add(sum, f64x4::splat(1.))
+}
+
+/// The positive continued fraction used in the cancellation-free RC tail.
+fn erfc_tail_batch(x: std::simd::f64x4) -> [std::simd::f64x4; 3] {
+    use std::simd::{Mask, Select, StdFloat, cmp::SimdPartialOrd, f64x4, num::SimdFloat};
+    let one = f64x4::splat(1.);
+    let mut f = x;
+    let mut c = f;
+    let mut d = f64x4::splat(0.);
+    let mut active = Mask::splat(true);
+    for n in 3..=500 {
+        let a = f64x4::splat(Real::from(n) / 2.);
+        d = a.mul_add(d, x).recip();
+        c = x + a / c;
+        let delta = c * d;
+        f = active.select(f * delta, f);
+        active &= (delta - one).abs().simd_gt(f64x4::splat(Real::EPSILON));
+        if !active.any() {
+            break;
+        }
+    }
+    let v = f.recip();
+    let u = f64x4::splat(0.5) / (x + v);
+    [u, v, x + u]
+}
+
 /// Multiply by exp(-z), retaining representable results even if exp(-z)
 /// itself is subnormal or rounds to zero.
 fn attenuated(value: Real, z: Real) -> Real {
@@ -587,6 +797,107 @@ fn attenuated(value: Real, z: Real) -> Real {
         let half = (-0.5 * z).exp();
         (value * half) * half
     }
+}
+
+/// SIMD lanes are independent port contributions; each lane retains
+/// reverse chronological order and its own Neumaier correction.
+fn accumulate<const N: usize>(
+    sum: &mut std::simd::Simd<Real, N>,
+    correction: &mut std::simd::Simd<Real, N>,
+    value: std::simd::Simd<Real, N>,
+    enabled: std::simd::Mask<i64, N>,
+) {
+    use std::simd::{Select, Simd, cmp::SimdPartialOrd, num::SimdFloat};
+    let next = *sum + value;
+    let error = sum
+        .abs()
+        .simd_ge(value.abs())
+        .select((*sum - next) + value, (value - next) + *sum);
+    let corrected = next
+        .is_finite()
+        .select(*correction + error, Simd::splat(0.));
+    *correction = enabled.select(corrected, *correction);
+    *sum = enabled.select(next, *sum);
+}
+
+fn total<const N: usize>(
+    sum: std::simd::Simd<Real, N>,
+    correction: std::simd::Simd<Real, N>,
+) -> std::simd::Simd<Real, N> {
+    use std::simd::{Select, Simd, cmp::SimdPartialEq};
+    correction
+        .simd_eq(Simd::splat(0.))
+        .select(sum, sum + correction)
+}
+
+/// Sum the three kernels in one reverse traversal; a zero coefficient
+/// skips the lane even if its waveform difference would overflow.
+pub(super) fn history_sums(
+    rows: impl DoubleEndedIterator<Item = [Real; 4]>,
+    weights: &[[Real; 3]],
+    initial: [Real; 4],
+    coupled_end: usize,
+    mut sums: [[Real; 2]; 3],
+) -> [[Real; 2]; 3] {
+    use std::simd::{Mask, cmp::SimdPartialEq, f64x2, f64x4};
+    let count = weights.len().saturating_sub(1);
+    let mut pairs = rows.rev().zip(weights.iter().rev()).take(count);
+    let uncoupled = count.saturating_sub(coupled_end);
+    let mut voltage_correction = f64x2::splat(0.);
+    if uncoupled != 0 {
+        let mut voltage = f64x2::from_array(sums[0]);
+        let initial_voltage = f64x2::from_array([initial[0], initial[2]]);
+        for ([v1, _, v2, _], weight) in pairs.by_ref().take(uncoupled) {
+            if weight[0] != 0. {
+                accumulate(
+                    &mut voltage,
+                    &mut voltage_correction,
+                    f64x2::splat(weight[0]) * (f64x2::from_array([v1, v2]) - initial_voltage),
+                    Mask::splat(true),
+                );
+            }
+        }
+        sums[0] = voltage.to_array();
+    }
+    if coupled_end == 0 {
+        sums[0] = total(f64x2::from_array(sums[0]), voltage_correction).to_array();
+        return sums;
+    }
+    let [h1, h2, h3] = sums;
+    let mut voltage = f64x4::from_array([h1[0], h1[1], h3[0], h3[1]]);
+    let [c0, c1] = voltage_correction.to_array();
+    let mut voltage_correction = f64x4::from_array([c0, c1, 0., 0.]);
+    let mut current = f64x2::from_array(h2);
+    let mut current_correction = f64x2::splat(0.);
+    let [iv1, ii1, iv2, ii2] = initial;
+    let initial_voltage = f64x4::from_array([iv1, iv2, iv2, iv1]);
+    let initial_current = f64x2::from_array([ii2, ii1]);
+    for ([v1, i1, v2, i2], &[h1, h2, h3]) in pairs {
+        if h1 != 0. || h3 != 0. {
+            let coefficient = f64x4::from_array([h1, h1, h3, h3]);
+            let delta = f64x4::from_array([v1, v2, v2, v1]) - initial_voltage;
+            accumulate(
+                &mut voltage,
+                &mut voltage_correction,
+                coefficient * delta,
+                coefficient.simd_ne(f64x4::splat(0.)),
+            );
+        }
+        if h2 != 0. {
+            accumulate(
+                &mut current,
+                &mut current_correction,
+                f64x2::splat(h2) * (f64x2::from_array([i2, i1]) - initial_current),
+                Mask::splat(true),
+            );
+        }
+    }
+    let [h1a, h1b, h3a, h3b] = total(voltage, voltage_correction).to_array();
+    [
+        [h1a, h1b],
+        total(current, current_correction).to_array(),
+        [h3a, h3b],
+    ]
 }
 
 /// The coefficients of one convolution step: the factor of the newest
@@ -663,6 +974,42 @@ impl RcKernel {
             if active[2] { h3 } else { 0. },
         ]
     }
+
+    fn batch(self, lags: [Real; 4]) -> [[Real; 3]; 4] {
+        use std::simd::{StdFloat, cmp::SimdPartialOrd, f64x4, num::SimdFloat};
+        let lag = f64x4::from_array(lags);
+        let root = lag.sqrt();
+        let z = (f64x4::splat(self.rclsqr) / lag) * f64x4::splat(0.25);
+        if lags.iter().any(|&t| t <= 0. || !t.is_finite()) || !z.is_finite().all() {
+            return lags.map(|t| self.at(t, [true; 3]));
+        }
+        let x = z.sqrt();
+        let small = x.simd_lt(f64x4::splat(2.));
+        let pi_root = f64x4::splat(PI.sqrt());
+        let scale = f64x4::splat(self.scale);
+        let (h2, h3) = if small.all() {
+            let erfc = erfc_series_batch(x);
+            let decay = f64x4::from_array((-z).to_array().map(Real::exp));
+            let h2 = f64x4::splat(2.)
+                .mul_add(z, f64x4::splat(1.))
+                .mul_add(erfc, f64x4::splat(-2.) * x * decay / pi_root);
+            let h3 = (-pi_root * x).mul_add(erfc, decay);
+            (lag * h2, (scale * root) * h3)
+        } else if !small.any() {
+            let [u, v, denominator] = erfc_tail_batch(x);
+            let h2 = lag * ((v / (x + v)) / denominator / pi_root);
+            let h3 = root * (u / denominator);
+            let decay = f64x4::from_array((-z).to_array().map(Real::exp));
+            if !decay.is_normal().all() {
+                return lags.map(|t| self.at(t, [true; 3]));
+            }
+            (h2 * decay, scale * (h3 * decay))
+        } else {
+            return lags.map(|t| self.at(t, [true; 3]));
+        };
+        let [root, h2, h3] = [root.to_array(), h2.to_array(), h3.to_array()];
+        std::array::from_fn(|i| [root[i], h2[i], h3[i]])
+    }
 }
 
 /// `LTRArcCoeffsSetup` (the `L = G = 0` line): coefficients at `curtime` over
@@ -692,41 +1039,54 @@ pub fn rc_coefficients(
     let mut earlier_root = 0.;
     let mut previous_delta = lag;
 
-    for i in (1..=index).rev() {
-        if !active.iter().any(|&enabled| enabled) {
-            break;
-        }
-        let delta = times[i] - times[i - 1];
-        let endpoint = kernel.at(curtime - times[i - 1], active);
-        let weight = &mut out.weights[i];
-        if active[0] {
-            // H1(t)=scale*sqrt(t). Rationalize both divided differences:
-            // S_new = scale/(sqrt(hi)+sqrt(lo)),
-            // S_new-S_old = -S_new*(sqrt(hi)-sqrt(earlier))/old_den.
-            // hi-earlier is the sum of the two actual accepted intervals,
-            // even if the absolute lag coordinates round to the same bits.
-            let root = endpoint[0];
-            let old_den = previous[0] + earlier_root;
-            let new_slope = kernel.scale / (root + previous[0]);
-            let root_difference = (delta + previous_delta) / (root + earlier_root);
-            weight[0] = -new_slope * (root_difference / old_den);
-            if weight[0].abs() < thresholds[0] {
-                active[0] = false;
+    'chunks: for (chunk_index, chunk) in out.weights[1..].rchunks_mut(4).enumerate() {
+        let newest = index - chunk_index * 4;
+        let batch = if reltol == 0. && chunk.len() == 4 {
+            Some(kernel.batch(std::array::from_fn(|lane| {
+                curtime - times[newest - lane - 1]
+            })))
+        } else {
+            None
+        };
+        for (lane, weight) in chunk.iter_mut().rev().enumerate() {
+            if !active.iter().any(|&enabled| enabled) {
+                break 'chunks;
             }
-        }
-        for k in 1..3 {
-            if active[k] {
-                let slope = (endpoint[k] - previous[k]) / delta;
-                weight[k] = slope - slopes[k];
-                slopes[k] = slope;
-                if weight[k].abs() < thresholds[k] {
-                    active[k] = false;
+            let i = newest - lane;
+            let delta = times[i] - times[i - 1];
+            let endpoint = batch.as_ref().map_or_else(
+                || kernel.at(curtime - times[i - 1], active),
+                |values| values[lane],
+            );
+            if active[0] {
+                // H1(t)=scale*sqrt(t). Rationalize both divided differences:
+                // S_new = scale/(sqrt(hi)+sqrt(lo)),
+                // S_new-S_old = -S_new*(sqrt(hi)-sqrt(earlier))/old_den.
+                // hi-earlier is the sum of the two actual accepted intervals,
+                // even if the absolute lag coordinates round to the same bits.
+                let root = endpoint[0];
+                let old_den = previous[0] + earlier_root;
+                let new_slope = kernel.scale / (root + previous[0]);
+                let root_difference = (delta + previous_delta) / (root + earlier_root);
+                weight[0] = -new_slope * (root_difference / old_den);
+                if weight[0].abs() < thresholds[0] {
+                    active[0] = false;
                 }
             }
+            for k in 1..3 {
+                if active[k] {
+                    let slope = (endpoint[k] - previous[k]) / delta;
+                    weight[k] = slope - slopes[k];
+                    slopes[k] = slope;
+                    if weight[k].abs() < thresholds[k] {
+                        active[k] = false;
+                    }
+                }
+            }
+            earlier_root = previous[0];
+            previous_delta = delta;
+            previous = endpoint;
         }
-        earlier_root = previous[0];
-        previous_delta = delta;
-        previous = endpoint;
     }
     out.aux_index = index;
     out
@@ -775,6 +1135,10 @@ pub fn rlc_coefficients(
     let (mut doh1, mut doh2, mut doh3) = (true, true, true);
 
     let aux = rlc_aux_index(t, curtime, times);
+    if aux == 0 && index < 32 {
+        short_self_coefficients(beta, curtime, times, reltol, &mut out);
+        return out;
+    }
 
     let kernels = RlcKernels::new(t, alpha, beta);
     let [
@@ -807,58 +1171,71 @@ pub fn rlc_coefficients(
     out.first[0] = h1dummy1;
     let h1relval = (h1dummy1 * reltol).abs();
 
-    let mut lolimit2;
-    let mut hilimit2 = 0.0;
-    lolimit2 = 0.0;
-
-    for i in (1..=index).rev() {
-        if doh1 || doh2 || doh3 {
-            lolimit2 = lolimit1;
-            hilimit2 = hilimit1;
+    'chunks: for (chunk_index, chunk) in out.weights[1..].rchunks_mut(4).enumerate() {
+        let newest = index - chunk_index * 4;
+        let batch = if reltol == 0. && chunk.len() == 4 {
+            let coupled = newest - (chunk.len() - 1) <= aux;
+            Some(kernels.batch(
+                std::array::from_fn(|lane| curtime - times[newest - lane - 1]),
+                [doh1, doh2 && coupled, doh3 && coupled],
+            ))
+        } else {
+            None
+        };
+        for (lane, weight) in chunk.iter_mut().rev().enumerate() {
+            if !(doh1 || doh2 || doh3) {
+                break 'chunks;
+            }
+            let i = newest - lane;
+            let lolimit2 = lolimit1;
+            let hilimit2 = hilimit1;
             lolimit1 = hilimit2;
             hilimit1 = curtime - times[i - 1];
             delta1 = times[i] - times[i - 1];
-        }
-        let endpoint = kernels.at(hilimit1, [doh1, doh2 && i <= aux, doh3 && i <= aux]);
-        if doh1 {
-            let h1lovalue1 = h1hivalue1;
-            let h1dummy2 = h1dummy1;
-            h1hivalue1 = endpoint[0];
-            h1dummy1 = (h1hivalue1 - h1lovalue1) / delta1;
-            out.weights[i][0] = h1dummy1 - h1dummy2;
-            if out.weights[i][0].abs() <= h1relval {
-                doh1 = false;
-            }
-        }
-        if i <= aux {
-            if doh2 {
-                let h2lovalue2 = h2lovalue1;
-                let h2hivalue2 = h2hivalue1;
-                let h2dummy2 = h2dummy1;
-                h2lovalue1 = h2hivalue2;
-                h2hivalue1 = endpoint[1];
-                h2dummy1 = twiceintlinfunc(
-                    lolimit1, hilimit1, lolimit1, h2lovalue1, h2hivalue1, lolimit1, hilimit1,
-                ) / delta1;
-                out.weights[i][1] = h2dummy1 - h2dummy2
-                    + intlinfunc(
-                        lolimit2, hilimit2, h2lovalue2, h2hivalue2, lolimit2, hilimit2,
-                    );
-                if out.weights[i][1].abs() <= h2relval {
-                    doh2 = false;
+
+            let endpoint = batch.as_ref().map_or_else(
+                || kernels.at(hilimit1, [doh1, doh2 && i <= aux, doh3 && i <= aux]),
+                |values| values[lane],
+            );
+            if doh1 {
+                let h1lovalue1 = h1hivalue1;
+                let h1dummy2 = h1dummy1;
+                h1hivalue1 = endpoint[0];
+                h1dummy1 = (h1hivalue1 - h1lovalue1) / delta1;
+                weight[0] = h1dummy1 - h1dummy2;
+                if weight[0].abs() <= h1relval {
+                    doh1 = false;
                 }
             }
-            if doh3 {
-                let h3hivalue2 = h3hivalue1;
-                let h3dummy2 = h3dummy1;
-                let h3lovalue1 = h3hivalue2;
-                h3hivalue1 = endpoint[2];
-                h3dummy1 = intlinfunc(
-                    lolimit1, hilimit1, h3lovalue1, h3hivalue1, lolimit1, hilimit1,
-                ) / delta1;
-                out.weights[i][2] = h3dummy1 - h3dummy2;
-                if out.weights[i][2].abs() <= h3relval {
-                    doh3 = false;
+            if i <= aux {
+                if doh2 {
+                    let h2lovalue2 = h2lovalue1;
+                    let h2hivalue2 = h2hivalue1;
+                    let h2dummy2 = h2dummy1;
+                    h2lovalue1 = h2hivalue2;
+                    h2hivalue1 = endpoint[1];
+                    h2dummy1 = twiceintlinfunc(
+                        lolimit1, hilimit1, lolimit1, h2lovalue1, h2hivalue1, lolimit1, hilimit1,
+                    ) / delta1;
+                    weight[1] = h2dummy1 - h2dummy2
+                        + intlinfunc(
+                            lolimit2, hilimit2, h2lovalue2, h2hivalue2, lolimit2, hilimit2,
+                        );
+                    if weight[1].abs() <= h2relval {
+                        doh2 = false;
+                    }
+                }
+                if doh3 {
+                    let h3lovalue1 = h3hivalue1;
+                    let h3dummy2 = h3dummy1;
+                    h3hivalue1 = endpoint[2];
+                    h3dummy1 = intlinfunc(
+                        lolimit1, hilimit1, h3lovalue1, h3hivalue1, lolimit1, hilimit1,
+                    ) / delta1;
+                    weight[2] = h3dummy1 - h3dummy2;
+                    if weight[2].abs() <= h3relval {
+                        doh3 = false;
+                    }
                 }
             }
         }
@@ -870,6 +1247,54 @@ pub fn rlc_coefficients(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_endpoints_match_the_conditioned_scalar_laws() {
+        let check = |got: Real, expected: Real| {
+            if !expected.is_finite() {
+                assert_eq!(got.to_bits(), expected.to_bits());
+            } else {
+                assert!(
+                    (got - expected).abs() <= 2e-12 * expected.abs(),
+                    "{got:e} vs {expected:e}"
+                );
+            }
+        };
+        let rc = RcKernel::new(1e-12, 4e-8);
+        for lags in [
+            [0., 1e-12, 1e-10, 1e-8],
+            [1e-9, 2e-9, 3e-9, 4e-9],
+            [1e-7, 1e-6, 1e-5, 1e-4],
+            [1e-11, 2e-11, 3e-11, 4e-11],
+        ] {
+            for (vector, lag) in rc.batch(lags).into_iter().zip(lags) {
+                for (got, expected) in vector.into_iter().zip(rc.at(lag, [true; 3])) {
+                    check(got, expected);
+                }
+            }
+        }
+        for (delay, alpha, beta) in [
+            (5e-9, 2e7, 2e7),
+            (5e-9, 0., 2e7),
+            (5e-9, 2e7, 0.),
+            (0., 2e7, 2e7),
+        ] {
+            let kernels = RlcKernels::new(delay, alpha, beta);
+            for lags in [
+                [0., delay.next_down(), delay, delay.next_up()],
+                [1e-8, 2e-8, 3e-8, 4e-8],
+                [2e-7, 4e-7, 8e-7, 1e-6],
+                [1e-4, 2e-4, 3e-4, 4e-4],
+                [1e-20, 2e-20, 3e-20, 4e-20],
+            ] {
+                for (vector, lag) in kernels.batch(lags, [true; 3]).into_iter().zip(lags) {
+                    for (got, expected) in vector.into_iter().zip(kernels.at(lag, [true; 3])) {
+                        check(got, expected);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn erfc_matches_reference_values() {

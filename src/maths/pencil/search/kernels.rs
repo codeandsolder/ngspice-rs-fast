@@ -1,4 +1,4 @@
-//! Deflated quadratic and Muller kernels in the original C arithmetic order.
+//! Deflated quadratic and Muller kernels with scaled numerical arithmetic.
 use super::{Cx, Real, Region, SpiceResult, Trial, materialize_power};
 use crate::maths::pencil::{normalize_muller, r_norm, zaddeq};
 
@@ -25,7 +25,7 @@ pub(super) fn sym2(
 ) -> SpiceResult<Real> {
     let mut dx0 = t1.s().re - t0.s().re;
     let mut dx1 = t2.s().re - t1.s().re;
-    let x0 = (t0.s().re + t1.s().re) / 2.0;
+    let x0 = t0.s().re.midpoint(t1.s().re);
     let mut d2x = (t2.s().re - t0.s().re) / 2.0;
 
     let (mut a, mut a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def)?;
@@ -113,13 +113,13 @@ pub(super) fn sym2(
     Ok(if outside(b) {
         if outside(c) {
             match region {
-                Region::LeftCrossing => (t0.s().re + t1.s().re) / 2.0,
-                Region::RightCrossing => (t1.s().re + t2.s().re) / 2.0,
+                Region::LeftCrossing => t0.s().re.midpoint(t1.s().re),
+                Region::RightCrossing => t1.s().re.midpoint(t2.s().re),
                 Region::Minimum => {
                     if (t1.s().re - c).abs() < (t1.s().re - b).abs() {
-                        (t1.s().re + c) / 2.0
+                        t1.s().re.midpoint(c)
                     } else {
-                        (t1.s().re + b) / 2.0
+                        t1.s().re.midpoint(b)
                     }
                 }
             }
@@ -189,7 +189,7 @@ pub(super) fn muller(t: [&Trial; 3]) -> SpiceResult<Cx> {
     let e = a.scale(4.0).mul(c);
     d = d.sub(e);
     d = d.sqrt();
-    let q = b.re * d.re + b.im * d.im;
+    let q = b.re.mul_add(d.re, b.im * d.im);
     b = if q > 0.0 { b.add(d) } else { b.sub(d) };
     c = c.div(b.scale(-0.5));
     Ok(h0.mul(c).add(t[0].s()))
