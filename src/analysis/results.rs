@@ -717,6 +717,53 @@ impl Plot {
         self.variables().is_empty() || self.point_count == 0
     }
 
+    /// Publish or replace a named vector in the packed table. Schema identity
+    /// changes only after its entire replacement column has been validated.
+    ///
+    /// # Errors
+    /// Invalid vector shape, nonfinite values or storage allocation failure.
+    pub(crate) fn set_column(&mut self, variable: Variable, values: &[Complex]) -> SpiceResult<()> {
+        self.validate_shape()?;
+        if values.len() != self.point_count || values.iter().any(|value| !value.is_finite()) {
+            return Err(self.storage_error("invalid derived vector shape or value"));
+        }
+        let mut variables = self.variables().to_vec();
+        let flags = if variable.is_real {
+            self.flags()
+        } else {
+            PlotFlags::Complex
+        };
+        if let Some(index) = self.variable_index(&variable.name) {
+            for (row, &value) in self.rows_mut().zip(values) {
+                row[index] = value;
+            }
+            variables[index] = variable;
+        } else {
+            let old_width = self.variable_count();
+            let width = old_width
+                .checked_add(1)
+                .ok_or_else(|| self.storage_error("derived vector width overflows"))?;
+            let count = self
+                .point_count
+                .checked_mul(width)
+                .ok_or_else(|| self.storage_error("derived vector cell count overflows"))?;
+            self.cells
+                .try_reserve_exact(values.len())
+                .map_err(|error| self.storage_error(error))?;
+            self.cells.resize(count, Complex::ZERO);
+            for (index, &value) in values.iter().enumerate().rev() {
+                let source = index * old_width;
+                let destination = index * width;
+                self.cells
+                    .copy_within(source..source + old_width, destination);
+                self.cells[destination + old_width] = value;
+            }
+            variables.push(variable);
+        }
+        self.schema = Arc::new(PlotSchema::new(flags, variables));
+        Ok(())
+    }
+
     /// Append a borrowed row, copying its cells once into the packed table.
     ///
     /// # Errors

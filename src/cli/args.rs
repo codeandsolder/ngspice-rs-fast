@@ -37,6 +37,8 @@ pub enum Command {
     Parse,
     /// Run every analysis of the deck and write one rawfile.
     Simulate,
+    /// Execute a deck's native .control script.
+    Control,
     /// List the device designators the registry knows.
     Devices,
     /// List the analyses and whether a driver exists.
@@ -57,6 +59,7 @@ impl Command {
             Self::Tokens => "tokens",
             Self::Parse => "parse",
             Self::Simulate => "simulate",
+            Self::Control => "control",
             Self::Devices => "devices",
             Self::Analyses => "analyses",
             Self::Help => "help",
@@ -73,6 +76,7 @@ impl Command {
             Self::Tokens,
             Self::Parse,
             Self::Simulate,
+            Self::Control,
             Self::Devices,
             Self::Analyses,
             Self::Help,
@@ -87,7 +91,12 @@ impl Command {
     pub const fn needs_netlist(self) -> bool {
         matches!(
             self,
-            Self::Summary | Self::Cards | Self::Tokens | Self::Parse | Self::Simulate
+            Self::Summary
+                | Self::Cards
+                | Self::Tokens
+                | Self::Parse
+                | Self::Simulate
+                | Self::Control
         )
     }
 
@@ -248,6 +257,7 @@ USAGE:
     spice-rs parse [OPTIONS] <netlist>    parse the deck into the netlist model
     spice-rs simulate (--output <path>) [OPTIONS] <netlist>
                                           run every analysis and write one rawfile
+    spice-rs control [OPTIONS] <netlist>   execute native .control commands
     spice-rs devices                      list the device designators known to the port
     spice-rs analyses                     list the analyses and their driver status
     spice-rs help | version
@@ -293,6 +303,15 @@ pub fn run(args: &Args) -> SpiceResult<()> {
         }
         Command::Analyses => {
             print!("{}", analyses_text());
+        }
+        Command::Control => {
+            let path = required_path(args, args.netlist.as_deref(), "netlist")?;
+            crate::cli::control::run_file(
+                path,
+                args.auto_gnd,
+                crate::cli::control::ScriptLimits::default(),
+                &mut std::io::stdout().lock(),
+            )?;
         }
         Command::Simulate => {
             let deck = required_path(args, args.netlist.as_deref(), "netlist")?;
