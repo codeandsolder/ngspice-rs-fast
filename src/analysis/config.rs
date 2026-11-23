@@ -420,14 +420,28 @@ impl RunConfig {
     /// Unknown, unimplemented, malformed, out-of-range or conflicting options,
     /// and option expressions that fail to evaluate.
     pub fn from_netlist(netlist: &Netlist) -> SpiceResult<Self> {
-        let scope = ParamScope::for_netlist(netlist)?;
+        let scope = std::sync::Arc::new(ParamScope::for_netlist(netlist)?);
+        Self::from_netlist_with_scope(netlist, scope)
+    }
+
+    /// Resolve a candidate's options and node hints against an already
+    /// evaluated immutable scope; no second dependency walk or parameter
+    /// evaluation. Caller controls when setup-shape changes invalidate plans.
+    pub(crate) fn from_netlist_with_scope(
+        netlist: &Netlist,
+        scope: std::sync::Arc<ParamScope>,
+    ) -> SpiceResult<Self> {
         // Body front-end cards follow expanded instance/card order, not definition order.
         let expanded = if netlist.subcircuits.iter().any(|sub| {
             !sub.options.is_empty()
                 || !sub.initial_conditions.is_empty()
                 || !sub.nodesets.is_empty()
         }) {
-            let literal = crate::netlist::elaborate::literalize(netlist)?;
+            let literal = crate::netlist::elaborate::literalize_with(
+                netlist,
+                std::sync::Arc::clone(&scope),
+                &mut EvalBudget::default(),
+            )?;
             Some(crate::devices::subckt::expand_subcircuits(
                 &literal.netlist,
                 &literal.scope,
@@ -468,8 +482,17 @@ impl RunConfig {
                 .as_ref()
                 .map_or(&nodesets, |expanded| &expanded.nodesets),
         );
-        config.params = Some(std::sync::Arc::new(scope));
+        config.params = Some(scope);
         Ok(config)
+    }
+
+    /// Replace only the already validated parameter environment. Numeric
+    /// candidates with unchanged options and topology retain the same run
+    /// settings but must expose their *current* parameter scope to objective
+    /// measurement and subsequent analysis binding.
+    pub(crate) fn with_parameter_scope(mut self, scope: std::sync::Arc<ParamScope>) -> Self {
+        self.params = Some(scope);
+        self
     }
 
     /// Explicit Fourier front-end settings.

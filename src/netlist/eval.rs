@@ -54,8 +54,8 @@
 
 mod plan;
 pub use plan::{
-    CandidateParameters, ParameterInput, ParameterPlan, ParameterScopeId, ParameterScopeSpec,
-    ParameterSlot,
+    BoundExpression, CandidateParameters, ParameterInput, ParameterPlan, ParameterScopeId,
+    ParameterScopeSpec, ParameterSlot,
 };
 
 use std::borrow::Cow;
