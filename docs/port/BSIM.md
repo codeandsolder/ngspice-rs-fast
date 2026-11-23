@@ -342,6 +342,20 @@ The AC/NQS changes do not execute in those cases and must not be used to
 justify altering the established reference tolerances.
 
 
+### Pole-zero NQS charge-partition accuracy (#89)
+
+The PZ kernel (`pzld.rs`) no longer suppresses 40 FMA opportunities,
+including six cancellation-sensitive drain/source charge-partition
+Jacobian derivatives. These are evaluated as an algebraic fused product
+plus the direct capacitance rather than a rounded product followed by
+subtraction. The branch at `abs(qcheq) <= 1e-5*CoxWL` remains unchanged:
+it is a physical model threshold, not a rounding artifact. The test
+`pz_nqs_partition_derivative_retains_sub_ulp_cancellation` assembles an
+actual `A+sE` PZ matrix whose analytic drain partition derivative is
+exactly `2^-55`; un-fused multiplication rounds it away, while FMA
+retains the derivative and equal-and-opposite source stamp (KCL).
+The same branch uses C's NQS setup, state, mode and charge-node ordering.
+
 ### Geometry/perimeter accuracy (#89)
 
 `geo.rs` removes another 28 blanket-fused-arithmetic suppressions in effective
