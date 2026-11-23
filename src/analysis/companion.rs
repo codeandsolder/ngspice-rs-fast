@@ -208,6 +208,12 @@ impl TransientPlan {
         self.step
     }
 
+    /// Requested first output time.
+    #[must_use]
+    pub const fn start(&self) -> Real {
+        self.start
+    }
+
     /// Final simulation time.
     #[must_use]
     pub const fn stop(&self) -> Real {
