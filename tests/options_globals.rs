@@ -159,7 +159,7 @@ fn braced_and_single_quoted_option_values_are_parsed_expressions() {
     let tnom = &settings[1];
     assert_eq!(tnom.value.as_ref().unwrap().text, "'t-5'");
     let expression = tnom.expression.as_ref().unwrap();
-    assert!(!expression.braced);
+    assert!(expression.braced && expression.quoted);
     assert_eq!(expression.text, "t-5");
     assert_eq!(expression.span.start.column, 30);
     assert!(settings[2].expression.is_none() && settings[3].expression.is_none());
