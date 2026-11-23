@@ -32,6 +32,7 @@ pub use crate::netlist::source::budget::SourceLimits;
 mod behavioural;
 mod bexpression;
 mod controlled;
+mod cpl;
 mod diode;
 mod expression;
 mod flags;
