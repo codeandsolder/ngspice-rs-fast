@@ -155,15 +155,16 @@ fn exact_difference(from: Real, to: Real) -> Option<Real> {
 /// Positive axis interval as a normalized mantissa/exponent pair. An exact
 /// large-coordinate sum is used when the rounded difference loses bits or
 /// overflows. This geometry feeds RMS without squaring an enormous width.
-#[cold]
 #[expect(
     clippy::redundant_pub_crate,
     reason = "re-exported crate-wide from the private exact primitives module"
 )]
 pub(crate) fn positive_axis_span(from: Real, to: Real) -> (Real, i32) {
-    if let Some(rounded) = exact_difference(from, to) {
-        return split_power(rounded);
-    }
+    exact_difference(from, to).map_or_else(|| wide_axis_span(from, to), split_power)
+}
+
+#[cold]
+fn wide_axis_span(from: Real, to: Real) -> (Real, i32) {
     let mut difference = ExactSum::new();
     difference.add(ExactTerm::from_real(to));
     difference.add(ExactTerm::from_real(-from));
