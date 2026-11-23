@@ -1121,7 +1121,7 @@ mod tests {
                 for &(r, c, conductance, capacitance) in &coefficients {
                     let (row, col) = if transpose { (c, r) } else { (r, c) };
                     let value = Complex::new(conductance, frequencies[index] * capacitance);
-                    product[row] += value * actual[col];
+                    product[row] = product[row] + value * actual[col];
                     row_norm[row] += value.magnitude();
                 }
                 let solution_norm = actual
