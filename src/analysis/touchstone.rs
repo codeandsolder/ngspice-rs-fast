@@ -1,6 +1,7 @@
 //! Bounded, typed Touchstone 1.0/1.1/2.0/2.1 ASCII codec.
+//!
 //! Matrices are row-major in their declared single-ended or mixed-mode basis.
-//! Conversion to physical port currents and voltages is in devices::nport.
+//! Conversion to physical port currents and voltages is in `devices::nport`.
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 use std::fmt::Write as _;
 
@@ -18,10 +19,11 @@ pub enum Version {
 }
 impl Version {
     /// Whether bracketed v2 section headers are mandatory.
+    #[must_use]
     pub const fn modern(self) -> bool {
         matches!(self, Self::V2_0 | Self::V2_1)
     }
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::V1_0 => "1.0",
             Self::V1_1 => "1.1",
@@ -68,6 +70,7 @@ pub enum Unit {
 }
 impl Unit {
     /// Multiplier converting this unit to hertz.
+    #[must_use]
     pub const fn scale(self) -> Real {
         match self {
             Self::Hz => 1.,
@@ -76,7 +79,7 @@ impl Unit {
             Self::GHz => 1e9,
         }
     }
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Hz => "Hz",
             Self::KHz => "kHz",
@@ -230,6 +233,21 @@ fn coordinates(n: usize, fmt: MatrixFormat, order: TwoPortOrder) -> Vec<(usize, 
 }
 /// Version-1 normalization of voltage/current hybrid parameters. These
 /// factors map dimensionless file values to physical SI coefficients.
+fn sp_variable_index(
+    plot: &crate::analysis::Plot,
+) -> SpiceResult<std::collections::BTreeMap<String, usize>> {
+    let mut columns = std::collections::BTreeMap::new();
+    for (index, column) in plot.variables().iter().enumerate() {
+        if columns
+            .insert(column.name.to_ascii_lowercase(), index)
+            .is_some()
+        {
+            return Err(error(".sp", 0, "duplicate SP variable name"));
+        }
+    }
+    Ok(columns)
+}
+
 fn legacy_factor(parameter: Parameter, references: &[Real], row: usize, col: usize) -> Real {
     let first = references[row].sqrt();
     let second = references[col].sqrt();
@@ -291,7 +309,7 @@ fn mixed_axes(
             "mixed-mode order must have N descriptors",
         ));
     }
-    let mut axes = Vec::new();
+    let mut descriptors = Vec::new();
     let mut singles = vec![false; n];
     let mut pairs = std::collections::BTreeMap::<(usize, usize), u8>::new();
     for word in words {
@@ -300,12 +318,12 @@ fn mixed_axes(
             .split(',')
             .map(|x| count(path, line, x, n).map(|v| v - 1))
             .collect::<SpiceResult<Vec<_>>>()?;
-        let axis = match (letter.to_ascii_uppercase().as_str(), ids.as_slice()) {
+        let descriptor = match (letter.to_ascii_uppercase().as_str(), ids.as_slice()) {
             ("S", &[a]) if !singles[a] => {
                 singles[a] = true;
                 MixedPort::Single(a)
             }
-            ("D" | "C", &[a, b]) if a != b && refs[a] == refs[b] => {
+            ("D" | "C", &[a, b]) if a != b && refs[a].to_bits() == refs[b].to_bits() => {
                 let bit = if letter.eq_ignore_ascii_case("d") {
                     1
                 } else {
@@ -330,17 +348,17 @@ fn mixed_axes(
                 ));
             }
         };
-        axes.push(axis);
+        descriptors.push(descriptor);
     }
     if pairs.values().any(|&m| m != 3) {
         return Err(error(path, line, "each D descriptor needs matching C"));
     }
-    for port in 0..n {
+    for (port, &is_single) in singles.iter().enumerate() {
         let occurrences = pairs
             .keys()
             .filter(|&&(a, b)| a == port || b == port)
             .count();
-        if usize::from(singles[port]) + occurrences != 1 {
+        if usize::from(is_single) + occurrences != 1 {
             return Err(error(
                 path,
                 line,
@@ -348,7 +366,7 @@ fn mixed_axes(
             ));
         }
     }
-    Ok(axes)
+    Ok(descriptors)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -371,6 +389,10 @@ impl Touchstone {
     /// # Errors
     /// Unsupported/invalid syntax, failed numeric conversion, violated
     /// resource caps or physically invalid reference impedances.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single-pass grammar state machine retains ordered line-numbered keyword and record diagnostics"
+    )]
     pub fn parse(source: &str, path: &str, limits: TouchstoneLimits) -> SpiceResult<Self> {
         if source.len() > limits.max_source_bytes
             || !source
@@ -597,7 +619,7 @@ impl Touchstone {
                 }
                 continue;
             }
-            if without_comment.starts_with('#') {
+            if let Some(stripped) = without_comment.strip_prefix('#') {
                 if section != Section::Header {
                     return Err(error(path, line, "option line after network data"));
                 }
@@ -605,7 +627,7 @@ impl Touchstone {
                     continue;
                 } // Subsequent option lines are ignored by IBIS.
                 option_seen = true;
-                let mut args = without_comment[1..].split_ascii_whitespace().peekable();
+                let mut args = stripped.split_ascii_whitespace().peekable();
                 while let Some(word) = args.next() {
                     match word.to_ascii_uppercase().as_str() {
                         "HZ" => result.unit = Unit::Hz,
@@ -621,8 +643,20 @@ impl Touchstone {
                         "MA" => result.encoding = Encoding::Ma,
                         "DB" => result.encoding = Encoding::Db,
                         "R" => {
-                            option_refs.extend(args.map(str::to_owned));
-                            break;
+                            if !option_refs.is_empty() {
+                                return Err(error(path, line, "duplicate reference option"));
+                            }
+                            // v1.0 permits option tokens in arbitrary order:
+                            // `# S R 100 GHz RI` is legal. Collect only numeric
+                            // reference fields, then resume parsing options.
+                            while args.peek().is_some_and(|word| word.parse::<Real>().is_ok()) {
+                                if let Some(value) = args.next() {
+                                    option_refs.push(value.to_owned());
+                                }
+                            }
+                            if option_refs.is_empty() {
+                                return Err(error(path, line, "R requires a reference impedance"));
+                            }
                         }
                         _ => return Err(error(path, line, format!("bad option token {word}"))),
                     }
@@ -697,8 +731,7 @@ impl Touchstone {
                     && result.points.last().is_some_and(|p| {
                         words[0]
                             .parse::<Real>()
-                            .ok()
-                            .is_some_and(|f| f * result.unit.scale() <= p.hz)
+                            .is_ok_and(|f| f * result.unit.scale() <= p.hz)
                     })
                 {
                     section = Section::Noise;
@@ -1020,15 +1053,7 @@ impl Touchstone {
         {
             return Err(error(".sp", 0, "retained network output exceeds limits"));
         }
-        let mut columns = std::collections::BTreeMap::new();
-        for (index, column) in plot.variables().iter().enumerate() {
-            if columns
-                .insert(column.name.to_ascii_lowercase(), index)
-                .is_some()
-            {
-                return Err(error(".sp", 0, "duplicate SP variable name"));
-            }
-        }
+        let columns = sp_variable_index(plot)?;
         let freq = columns
             .get("frequency")
             .copied()
@@ -1068,14 +1093,15 @@ impl Touchstone {
             {
                 return Err(error(".sp", 0, "invalid .sp output frequency grid"));
             }
-            if let Some(column) = rbase {
-                if source[column].im != 0. || source[column].re != references[0] {
-                    return Err(error(
-                        ".sp",
-                        0,
-                        "plot port-one reference impedance does not match",
-                    ));
-                }
+            if let Some(column) = rbase
+                && (source[column].im != 0.
+                    || source[column].re.to_bits() != references[0].to_bits())
+            {
+                return Err(error(
+                    ".sp",
+                    0,
+                    "plot port-one reference impedance does not match",
+                ));
             }
             points.push(NetworkPoint {
                 hz: hz.re,
@@ -1099,107 +1125,71 @@ impl Touchstone {
         Ok(model)
     }
 
-    /// Export a verified network in the requested official Touchstone version.
-    /// # Errors
-    /// Unsupported format/version combinations or unrepresentable coefficients.
-    pub fn write(&self, version: Version, encoding: Encoding) -> SpiceResult<String> {
-        self.validate(TouchstoneLimits::default())?;
+    fn write_v2_header(&self, output: &mut String) -> SpiceResult<()> {
         let n = self.references.len();
-        if !version.modern()
-            && (self.mixed_mode.is_some() || self.matrix_format != MatrixFormat::Full)
-        {
-            return Err(error(
-                "output",
-                0,
-                "v1 cannot encode mixed-mode or triangular matrices",
-            ));
-        }
-        if version == Version::V1_0 && self.references.iter().any(|&r| r != self.references[0]) {
-            return Err(error("output", 0, "v1.0 requires equal references"));
-        }
-        let name = match self.parameter {
-            Parameter::S => "S",
-            Parameter::Y => "Y",
-            Parameter::Z => "Z",
-            Parameter::G => "G",
-            Parameter::H => "H",
-        };
-        let pair = match encoding {
-            Encoding::Ri => "RI",
-            Encoding::Ma => "MA",
-            Encoding::Db => "DB",
-        };
-        let mut output = String::new();
-        if version.modern() {
-            writeln!(output, "[Version] {}", version.label())
-                .map_err(|_| error("output", 0, "format failure"))?;
-        }
-        write!(output, "# {} {name} {pair} R", self.unit.label())
+        writeln!(output, "[Number of Ports] {n}")
             .map_err(|_| error("output", 0, "format failure"))?;
-        if version == Version::V1_1 {
-            for &r in &self.references {
-                write!(output, " {r:.17e}").map_err(|_| error("output", 0, "format failure"))?;
-            }
-        } else {
-            write!(output, " {:.17e}", self.references[0])
+        if n == 2 {
+            let label = match self.two_port_order {
+                TwoPortOrder::N21BeforeN12 => "21_12",
+                TwoPortOrder::N12BeforeN21 => "12_21",
+            };
+            writeln!(output, "[Two-Port Data Order] {label}")
                 .map_err(|_| error("output", 0, "format failure"))?;
+        }
+        writeln!(output, "[Number of Frequencies] {}", self.points.len())
+            .map_err(|_| error("output", 0, "format failure"))?;
+        if !self.noise.is_empty() {
+            writeln!(output, "[Number of Noise Frequencies] {}", self.noise.len())
+                .map_err(|_| error("output", 0, "format failure"))?;
+        }
+        output.push_str("[Reference]");
+        for &r in &self.references {
+            write!(output, " {r:.17e}").map_err(|_| error("output", 0, "format failure"))?;
         }
         output.push('\n');
-        if version.modern() {
-            writeln!(output, "[Number of Ports] {n}")
+        if self.matrix_format != MatrixFormat::Full {
+            let label = if self.matrix_format == MatrixFormat::Lower {
+                "Lower"
+            } else {
+                "Upper"
+            };
+            writeln!(output, "[Matrix Format] {label}")
                 .map_err(|_| error("output", 0, "format failure"))?;
-            if n == 2 {
-                let label = match self.two_port_order {
-                    TwoPortOrder::N21BeforeN12 => "21_12",
-                    TwoPortOrder::N12BeforeN21 => "12_21",
-                };
-                writeln!(output, "[Two-Port Data Order] {label}")
+        }
+        if let Some(axes) = &self.mixed_mode {
+            output.push_str("[Mixed-Mode Order]");
+            for &axis in axes {
+                write!(output, " {}", axis.label())
                     .map_err(|_| error("output", 0, "format failure"))?;
-            }
-            writeln!(output, "[Number of Frequencies] {}", self.points.len())
-                .map_err(|_| error("output", 0, "format failure"))?;
-            if !self.noise.is_empty() {
-                writeln!(output, "[Number of Noise Frequencies] {}", self.noise.len())
-                    .map_err(|_| error("output", 0, "format failure"))?;
-            }
-            output.push_str("[Reference]");
-            for &r in &self.references {
-                write!(output, " {r:.17e}").map_err(|_| error("output", 0, "format failure"))?;
             }
             output.push('\n');
-            if self.matrix_format != MatrixFormat::Full {
-                let label = if self.matrix_format == MatrixFormat::Lower {
-                    "Lower"
-                } else {
-                    "Upper"
-                };
-                writeln!(output, "[Matrix Format] {label}")
-                    .map_err(|_| error("output", 0, "format failure"))?;
-            }
-            if let Some(axes) = &self.mixed_mode {
-                output.push_str("[Mixed-Mode Order]");
-                for &axis in axes {
-                    write!(output, " {}", axis.label())
-                        .map_err(|_| error("output", 0, "format failure"))?;
+        }
+        if !self.information.is_empty() {
+            output.push_str("[Begin Information]\n");
+            for line in &self.information {
+                if !line.is_ascii()
+                    || (line.contains('\r') || line.contains('\n'))
+                    || line.starts_with('[')
+                {
+                    return Err(error("output", 0, "invalid information text"));
                 }
+                output.push_str(line);
                 output.push('\n');
             }
-            if !self.information.is_empty() {
-                output.push_str("[Begin Information]\n");
-                for line in &self.information {
-                    if !line.is_ascii()
-                        || (line.contains('\r') || line.contains('\n'))
-                        || line.starts_with('[')
-                    {
-                        return Err(error("output", 0, "invalid information text"));
-                    }
-                    output.push_str(line);
-                    output.push('\n');
-                }
-                output.push_str("[End Information]\n");
-            }
-            output.push_str("[Network Data]\n");
+            output.push_str("[End Information]\n");
         }
+        output.push_str("[Network Data]\n");
+        Ok(())
+    }
+
+    fn write_network_data(
+        &self,
+        output: &mut String,
+        version: Version,
+        encoding: Encoding,
+    ) -> SpiceResult<()> {
+        let n = self.references.len();
         let order = coordinates(n, self.matrix_format, self.two_port_order);
         for point in &self.points {
             write!(output, "{:.17e}", point.hz / self.unit.scale())
@@ -1236,6 +1226,64 @@ impl Touchstone {
             }
             output.push('\n');
         }
+        Ok(())
+    }
+
+    /// Export a verified network in the requested official Touchstone version.
+    /// # Errors
+    /// Unsupported format/version combinations or unrepresentable coefficients.
+    pub fn write(&self, version: Version, encoding: Encoding) -> SpiceResult<String> {
+        self.validate(TouchstoneLimits::default())?;
+        let n = self.references.len();
+        if !version.modern()
+            && (self.mixed_mode.is_some() || self.matrix_format != MatrixFormat::Full)
+        {
+            return Err(error(
+                "output",
+                0,
+                "v1 cannot encode mixed-mode or triangular matrices",
+            ));
+        }
+        if version == Version::V1_0
+            && self
+                .references
+                .iter()
+                .any(|&r| r.to_bits() != self.references[0].to_bits())
+        {
+            return Err(error("output", 0, "v1.0 requires equal references"));
+        }
+        let name = match self.parameter {
+            Parameter::S => "S",
+            Parameter::Y => "Y",
+            Parameter::Z => "Z",
+            Parameter::G => "G",
+            Parameter::H => "H",
+        };
+        let pair = match encoding {
+            Encoding::Ri => "RI",
+            Encoding::Ma => "MA",
+            Encoding::Db => "DB",
+        };
+        let mut output = String::new();
+        if version.modern() {
+            writeln!(output, "[Version] {}", version.label())
+                .map_err(|_| error("output", 0, "format failure"))?;
+        }
+        write!(output, "# {} {name} {pair} R", self.unit.label())
+            .map_err(|_| error("output", 0, "format failure"))?;
+        if version == Version::V1_1 {
+            for &r in &self.references {
+                write!(output, " {r:.17e}").map_err(|_| error("output", 0, "format failure"))?;
+            }
+        } else {
+            write!(output, " {:.17e}", self.references[0])
+                .map_err(|_| error("output", 0, "format failure"))?;
+        }
+        output.push('\n');
+        if version.modern() {
+            self.write_v2_header(&mut output)?;
+        }
+        self.write_network_data(&mut output, version, encoding)?;
         if !self.noise.is_empty() {
             if version.modern() {
                 output.push_str("[Noise Data]\n");

@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use ngspice_rs::analysis::touchstone::{Touchstone, TouchstoneLimits};
 use ngspice_rs::devices::MnaUnknowns;
-use ngspice_rs::devices::nport::{Extrapolation, MeasuredNPort, PortTerminals};
+use ngspice_rs::devices::nport::{
+    Extrapolation, MeasuredNPort, NetworkProperties, PhysicalRequirements, PortTerminals,
+    PropertyStatus,
+};
 use ngspice_rs::primitives::{Complex, NodeId, NodeTable};
 
 fn measured(text: &str, nodes: Vec<PortTerminals>, interpolation: Extrapolation) -> MeasuredNPort {
@@ -232,4 +235,112 @@ fn attached_measured_nport_participates_in_full_ac_and_sp_solves() {
             assert!(plot.rows().flatten().all(|v| v.is_finite()));
         }
     }
+}
+
+#[test]
+fn sampled_network_physical_properties_reject_gain_nonreciprocity_and_unproved_causality() {
+    let passive = oneport("# Hz S RI R 50\n1 0.3333333333333333 0\n");
+    assert_eq!(
+        passive.properties_at(1.).unwrap(),
+        NetworkProperties {
+            reciprocity: PropertyStatus::Verified,
+            passivity: PropertyStatus::Verified,
+            causality: PropertyStatus::Undetermined,
+        }
+    );
+    assert!(
+        passive
+            .require_properties_at(
+                1.,
+                PhysicalRequirements {
+                    reciprocal: true,
+                    passive: true,
+                    causal: false,
+                }
+            )
+            .is_ok()
+    );
+    assert!(
+        passive
+            .require_properties_at(
+                1.,
+                PhysicalRequirements {
+                    reciprocal: false,
+                    passive: false,
+                    causal: true,
+                }
+            )
+            .is_err()
+    );
+
+    let active = oneport("# Hz S RI R 50\n1 2 0\n");
+    assert_eq!(
+        active.properties_at(1.).unwrap().passivity,
+        PropertyStatus::Violated
+    );
+    assert!(
+        active
+            .require_properties_at(
+                1.,
+                PhysicalRequirements {
+                    passive: true,
+                    ..PhysicalRequirements::default()
+                }
+            )
+            .is_err()
+    );
+
+    let nonreciprocal = "[Version] 2.1\n# Hz Y RI R 50\n[Number of Ports] 2\n\
+        [Two-Port Data Order] 12_21\n[Number of Frequencies] 1\n\
+        [Network Data]\n1 1 0 0.1 0 0.2 0 1 0\n[End]\n";
+    let network = measured(
+        nonreciprocal,
+        vec![
+            PortTerminals {
+                positive: NodeId::new(1),
+                negative: NodeId::GROUND,
+            },
+            PortTerminals {
+                positive: NodeId::new(2),
+                negative: NodeId::GROUND,
+            },
+        ],
+        Extrapolation::Reject,
+    );
+    let report = network.properties_at(1.).unwrap();
+    assert_eq!(report.passivity, PropertyStatus::Verified);
+    assert_eq!(report.reciprocity, PropertyStatus::Violated);
+    assert!(
+        network
+            .require_properties_at(
+                1.,
+                PhysicalRequirements {
+                    reciprocal: true,
+                    ..PhysicalRequirements::default()
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        network
+            .require_properties_at(
+                1.,
+                PhysicalRequirements {
+                    passive: true,
+                    ..PhysicalRequirements::default()
+                }
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn lossless_reactive_networks_have_zero_dissipative_hermitian_part() {
+    let reactive = oneport(
+        "[Version] 2.1\n# Hz Y RI R 50\n[Number of Ports] 1\n\
+        [Number of Frequencies] 1\n[Network Data]\n1 0 0.25\n[End]\n",
+    );
+    let report = reactive.properties_at(1.).unwrap();
+    assert_eq!(report.passivity, PropertyStatus::Verified);
+    assert_eq!(report.reciprocity, PropertyStatus::Verified);
 }

@@ -16,6 +16,13 @@ const LIMITS: TouchstoneLimits = TouchstoneLimits {
 fn touchstone_v1_two_port_legacy_column_order_is_not_row_major() {
     let text = "! nonreciprocal VNA data\n# GHz S RI R 50\n1 0.1 0 2 0 3 0 0.4 0\n";
     let network = Touchstone::parse(text, "amplifier.s2p", LIMITS).unwrap();
+    let reordered = text.replace("# GHz S RI R 50", "# S R 50 GHz RI");
+    assert_eq!(
+        Touchstone::parse(&reordered, "nonstandard.s2p", LIMITS)
+            .unwrap()
+            .points,
+        network.points
+    );
     assert_eq!(network.version, Version::V1_0);
     assert_eq!(network.points[0].hz, 1e9);
     assert_eq!(

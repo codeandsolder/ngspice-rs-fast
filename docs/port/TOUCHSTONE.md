@@ -76,6 +76,28 @@ imaginary bias admittance. The simulator may not treat an arbitrary sampled
 frequency response as a stable causal transient macromodel: transient
 stamping rejects it explicitly.
 
+## Optional physical audit
+
+`MeasuredNPort::properties_at(f)` reports separate `Verified`, `Violated`, or
+`Undetermined` verdicts for reciprocity and passivity, rather than assuming
+measured networks are passive or reciprocal. Reciprocity is compared in the
+single-ended physical Y basis with a finite backward-error envelope; a tiny
+nonzero mismatch is *undetermined*, not silently discarded. Passivity uses the
+smallest eigenvalue of the 2N×2N real-symmetric embedding of the Hermitian
+conductance `(Y + Yᴴ)/2`, which is equivalent to checking the sign of supplied
+real power for every port-voltage phasor. The existing bounded Jacobi solver
+and an explicit numerical error band distinguish proven passive, active, and
+indeterminate results. A purely reactive network has zero dissipative part and
+is passive.
+
+`MeasuredNPort::require_properties_at(f, PhysicalRequirements)` selectively
+enforces these findings, rejecting both known violations and uncertain cases.
+The check is per frequency and does not promise a global continuous-frequency
+result. Causality always reports *undetermined* for an arbitrary sampled file;
+a strict causality requirement fails until an independently validated stable
+rational macromodel exists. No positivity/reciprocity assumptions are silently
+inserted into AC computations.
+
 ## Testing and status
 
 `tests/touchstone.rs`: independent v1/v2 row-order/metadata/triangular/mixed-

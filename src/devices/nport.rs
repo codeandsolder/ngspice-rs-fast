@@ -10,7 +10,7 @@ use crate::devices::linear::LinearContext;
 use crate::devices::traits::{AnalysisMode, StampContext};
 use crate::devices::{Device, MnaUnknowns};
 use crate::maths::Vector;
-use crate::maths::dense_complex::DenseComplex;
+use crate::maths::{Matrix, dense_complex::DenseComplex};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 
 fn invalid(message: impl std::fmt::Display) -> SpiceError {
@@ -32,6 +32,42 @@ pub struct PortTerminals {
     pub positive: NodeId,
     /// Negative/reference terminal, possibly ground.
     pub negative: NodeId,
+}
+
+/// Whether a measured frequency sample establishes a physical property.
+///
+/// An ambiguous result is never silently promoted to a guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyStatus {
+    /// Established within the explicit numerical backward-error budget.
+    Verified,
+    /// An independently testable counterexample violates the property.
+    Violated,
+    /// The sampled data cannot resolve this property conclusively.
+    Undetermined,
+}
+
+/// Per-frequency physical checks on the measured network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkProperties {
+    /// Complex reciprocity in physical single-ended Y coordinates.
+    pub reciprocity: PropertyStatus,
+    /// Nonnegative real supplied power for every port-voltage phasor.
+    pub passivity: PropertyStatus,
+    /// Causality cannot be proven from finite sampled frequencies alone.
+    pub causality: PropertyStatus,
+}
+
+/// Opt-in requirements for physical network validation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhysicalRequirements {
+    /// Reject nonreciprocal or numerically ambiguous network data.
+    pub reciprocal: bool,
+    /// Reject active or numerically ambiguous network data.
+    pub passive: bool,
+    /// Require an independently certified rational causal model; not supplied
+    /// by sampled Touchstone data.
+    pub causal: bool,
 }
 
 /// Reusable measured linear N-port bound to circuit terminal identities.
@@ -90,7 +126,7 @@ impl MeasuredNPort {
 
     /// Real-positive reference port count.
     #[must_use]
-    pub fn port_count(&self) -> usize {
+    pub const fn port_count(&self) -> usize {
         self.terminals.len()
     }
 
@@ -123,8 +159,8 @@ impl MeasuredNPort {
                     // Interpolate the rectangular phasor, never the wrapped
                     // phase angle. This preserves phase continuity across 360°.
                     let value = Complex::new(
-                        a.re + fraction * (b.re - a.re),
-                        a.im + fraction * (b.im - a.im),
+                        fraction.mul_add(b.re - a.re, a.re),
+                        fraction.mul_add(b.im - a.im, a.im),
                     );
                     if !value.is_finite() {
                         return Err(invalid("interpolation overflow"));
@@ -263,6 +299,107 @@ impl MeasuredNPort {
             return Err(invalid("non-finite physical admittance"));
         }
         Ok(admittance)
+    }
+
+    /// Diagnose reciprocity, passivity and causality at one frequency.
+    ///
+    /// The passive criterion is `Re(Vᴴ Y V) >= 0` for every port excitation.
+    /// It is evaluated by the smallest eigenvalue of the Hermitian real part
+    /// of physical Y. A real 2N × 2N embedding retains complex cross terms;
+    /// a backward-error band reports `Undetermined`, never a false proof.
+    /// No finite collection of frequency samples proves causality, so it
+    /// remains explicitly undetermined until a rational model is verified.
+    /// # Errors
+    /// Invalid frequency, singular conversion or eigensolver failure.
+    pub fn properties_at(&self, hz: Real) -> SpiceResult<NetworkProperties> {
+        let y = self.admittance_at(hz)?;
+        let n = self.port_count();
+        let double = n
+            .checked_mul(2)
+            .ok_or_else(|| invalid("property matrix order overflow"))?;
+        let mut hermitian = Matrix::zeros(double, double)?;
+        let mut reciprocity = PropertyStatus::Verified;
+        let mut frobenius: Real = 0.;
+        let mut reference: Real = 0.;
+        for r in 0..n {
+            for c in 0..n {
+                let left = y.get(r, c).unwrap_or(Complex::ZERO);
+                let mirrored = y.get(c, r).unwrap_or(Complex::ZERO);
+                let real = 0.5_f64.mul_add(left.re, 0.5 * mirrored.re);
+                let imag = 0.5_f64.mul_add(left.im, -0.5 * mirrored.im);
+                hermitian.set(r, c, real)?;
+                hermitian.set(r + n, c + n, real)?;
+                hermitian.set(r, c + n, -imag)?;
+                hermitian.set(r + n, c, imag)?;
+                frobenius = frobenius.hypot(real.hypot(imag));
+                reference = reference.max(left.magnitude());
+            }
+        }
+        let n_as_real = Real::from(
+            u32::try_from(double)
+                .map_err(|_| invalid("property matrix dimension exceeds numeric bounds"))?,
+        );
+        let roundoff = 64. * n_as_real * Real::EPSILON * reference;
+        for row in 0..n {
+            for col in 0..row {
+                let first = y.get(row, col).unwrap_or(Complex::ZERO);
+                let second = y.get(col, row).unwrap_or(Complex::ZERO);
+                if first != second {
+                    reciprocity = if (first - second).magnitude() > roundoff {
+                        PropertyStatus::Violated
+                    } else if reciprocity == PropertyStatus::Violated {
+                        reciprocity
+                    } else {
+                        PropertyStatus::Undetermined
+                    };
+                }
+            }
+        }
+        let passivity = if frobenius <= 0. {
+            PropertyStatus::Verified
+        } else {
+            let smallest = hermitian
+                .symmetric_eigenvalues()?
+                .first()
+                .copied()
+                .ok_or_else(|| invalid("empty passivity spectrum"))?;
+            let backward = 64. * n_as_real * Real::EPSILON * frobenius;
+            if smallest < -backward {
+                PropertyStatus::Violated
+            } else if smallest > backward {
+                PropertyStatus::Verified
+            } else {
+                PropertyStatus::Undetermined
+            }
+        };
+        Ok(NetworkProperties {
+            reciprocity,
+            passivity,
+            causality: PropertyStatus::Undetermined,
+        })
+    }
+
+    /// Opt-in enforcement; uncertainty is an error, not a pass.
+    /// # Errors
+    /// A required physical property is violated or cannot be certified.
+    pub fn require_properties_at(
+        &self,
+        hz: Real,
+        requirements: PhysicalRequirements,
+    ) -> SpiceResult<NetworkProperties> {
+        let report = self.properties_at(hz)?;
+        if requirements.reciprocal && report.reciprocity != PropertyStatus::Verified {
+            return Err(invalid("reciprocity is violated or unverified"));
+        }
+        if requirements.passive && report.passivity != PropertyStatus::Verified {
+            return Err(invalid("passivity is violated or unverified"));
+        }
+        if requirements.causal && report.causality != PropertyStatus::Verified {
+            return Err(invalid(
+                "finite sampled network has no certified causal macromodel",
+            ));
+        }
+        Ok(report)
     }
 
     /// Expand physical node-pair currents into MNA stamps. A port current is
