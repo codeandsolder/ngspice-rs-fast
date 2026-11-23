@@ -996,6 +996,12 @@ pub(super) fn run(
         false,
     )?;
     sink.begin(&result)?;
+    let mut selected = crate::analysis::results::SelectedOutput::bind(
+        sink,
+        &result,
+        circuit.unknown_count(),
+        true,
+    )?;
     let mut previous = Vector::zeros(circuit.unknown_count());
     // dctrcurv.c rotates the state vectors before every point, so a point's
     // CKTstate1 is the previous point's state (the first point's own state is
@@ -1029,19 +1035,27 @@ pub(super) fn run(
             // Only a solved point is accepted; a failure above returns before
             // any accept hook runs for it. A nonlinear point's state becomes the
             // accepted history of the next one.
-            let observed = solver.prepared.observe_real(
-                &crate::devices::LoadRequest {
-                    mode: crate::devices::AnalysisMode::DcSweep,
-                    solution: &x,
-                    model_context: &model,
-                    integration: None,
-                    history: &history,
-                    forcing: None,
-                },
-                overrides,
-                None,
-                Some(&trial),
-            )?;
+            let load = crate::devices::LoadRequest {
+                mode: crate::devices::AnalysisMode::DcSweep,
+                solution: &x,
+                model_context: &model,
+                integration: None,
+                history: &history,
+                forcing: None,
+            };
+            let observed = if let Some(output) = selected.as_ref() {
+                solver.prepared.observe_real_selected(
+                    &load,
+                    overrides,
+                    None,
+                    Some(&trial),
+                    output.observations(),
+                )?
+            } else {
+                solver
+                    .prepared
+                    .observe_real(&load, overrides, None, Some(&trial))?
+            };
             // dctrcurv.c `firstTime`: after the first point of an inner
             // sweep C copies CKTstate0 into CKTstate1, so after the next
             // rotation CKTstate2 equals CKTstate1 (DEVpred extrapolates
@@ -1050,12 +1064,16 @@ pub(super) fn run(
             if first_point {
                 history.retain_latest();
             }
-            point.clear();
-            point.push(Complex::real(inner_value));
-            point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
-            point.extend(observed);
-            result.check_point(&point)?;
-            sink.point(&point)?;
+            if let Some(output) = selected.as_mut() {
+                output.real(sink, Some(inner_value), x.as_slice(), &observed)?;
+            } else {
+                point.clear();
+                point.push(Complex::real(inner_value));
+                point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
+                point.extend(observed);
+                result.check_point(&point)?;
+                sink.point(&point)?;
+            }
             previous = x;
         }
     }

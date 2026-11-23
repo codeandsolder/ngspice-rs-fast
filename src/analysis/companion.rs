@@ -668,6 +668,35 @@ pub fn companion_transient_into(
 }
 
 impl Driver<'_> {
+    fn observe_initial(
+        &self,
+        solution: &Vector,
+        selected: Option<&[usize]>,
+    ) -> SpiceResult<Vec<Complex>> {
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution,
+            model_context: &self.model_context,
+            integration: None,
+            history: &self.history,
+            forcing: None,
+        };
+        let forcing = Some((
+            0.,
+            Forcing {
+                limit: crate::devices::Limit::Left,
+                timing: self.timing,
+            },
+        ));
+        selected.map_or_else(
+            || self.prepared.observe_real(&request, &[], forcing, None),
+            |indices| {
+                self.prepared
+                    .observe_real_selected(&request, &[], forcing, None, indices)
+            },
+        )
+    }
+
     fn run(mut self, sink: &mut dyn PointSink) -> SpiceResult<TransientStats> {
         let TransientPlan { stop, start, .. } = self.settings;
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
@@ -682,6 +711,12 @@ impl Driver<'_> {
             false,
         )?;
         sink.begin(&plot)?;
+        let mut selected = crate::analysis::results::SelectedOutput::bind(
+            sink,
+            &plot,
+            self.circuit.unknown_count(),
+            true,
+        )?;
         let mut point = Vec::with_capacity(plot.variable_count());
         let mut accepted = self.initialize()?;
         loop {
@@ -712,31 +747,27 @@ impl Driver<'_> {
             if accepted.cursor.clock.time == 0. {
                 // C (dctran.c) writes no t = 0 row under uic.
                 if start <= 0. && !self.uic {
-                    let observed = self.prepared.observe_real(
-                        &LoadRequest {
-                            mode: AnalysisMode::OperatingPoint,
-                            solution: &accepted.solution,
-                            model_context: &self.model_context,
-                            integration: None,
-                            history: &self.history,
-                            forcing: None,
-                        },
-                        &[],
-                        Some((
-                            0.,
-                            Forcing {
-                                limit: crate::devices::Limit::Left,
-                                timing: self.timing,
-                            },
-                        )),
-                        None,
+                    let observed = self.observe_initial(
+                        &accepted.solution,
+                        selected
+                            .as_ref()
+                            .map(crate::analysis::results::SelectedOutput::observations),
                     )?;
-                    push(&plot, sink, &mut point, 0., &accepted.solution, &observed)?;
+                    push(
+                        &plot,
+                        sink,
+                        selected.as_mut(),
+                        &mut point,
+                        0.,
+                        &accepted.solution,
+                        &observed,
+                    )?;
                 }
             } else if accepted.cursor.clock.time >= start {
                 push(
                     &plot,
                     sink,
+                    selected.as_mut(),
                     &mut point,
                     accepted.cursor.clock.time,
                     &accepted.solution,
@@ -750,7 +781,13 @@ impl Driver<'_> {
                 cursor, solution, ..
             } = accepted;
             let ready = cursor.prepare(&self.settings, &mut breaks, self.uic)?;
-            accepted = self.advance(ready, solution)?;
+            accepted = self.advance(
+                ready,
+                solution,
+                selected
+                    .as_ref()
+                    .map(crate::analysis::results::SelectedOutput::observations),
+            )?;
         }
         sink.end()?;
         // C keeps the final load's instance fields, not values re-evaluated
@@ -763,7 +800,12 @@ impl Driver<'_> {
 
     /// Advance through rejected trials. Only Newton's starting iterate moves
     /// between attempts; device and integration histories remain accepted-only.
-    fn advance(&mut self, mut ready: ReadyStep, mut iterate: Vector) -> SpiceResult<AcceptedPoint> {
+    fn advance(
+        &mut self,
+        mut ready: ReadyStep,
+        mut iterate: Vector,
+        selected: Option<&[usize]>,
+    ) -> SpiceResult<AcceptedPoint> {
         let min_step = self.settings.min_step();
         loop {
             if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
@@ -809,6 +851,8 @@ impl Driver<'_> {
                         StepDecision::Accept(next) => {
                             let observed = if attempt.clock.time < self.settings.start {
                                 Vec::new()
+                            } else if let Some(selected) = selected {
+                                prepared.observe_selected(&x, &state, Some(selected))?
                             } else {
                                 prepared.observe(&x, &state)?
                             };
@@ -1176,11 +1220,15 @@ impl Driver<'_> {
 fn push(
     header: &Plot,
     sink: &mut dyn PointSink,
+    selected: Option<&mut crate::analysis::results::SelectedOutput>,
     point: &mut Vec<Complex>,
     time: Real,
     x: &Vector,
     observed: &[Complex],
 ) -> SpiceResult<()> {
+    if let Some(selected) = selected {
+        return selected.real(sink, Some(time), x.as_slice(), observed);
+    }
     point.clear();
     point.push(Complex::real(time));
     point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));

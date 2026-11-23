@@ -414,6 +414,17 @@ impl ObservationPlan {
     }
 }
 
+/// The physical observation inputs belonging to the same solved trial.
+/// Binds optional selection and transient/LTRA workspace together instead of
+/// adding loosely related positional parameters to the prepared loader.
+struct RealObservationInputs<'a> {
+    sources: &'a [(&'a str, Real)],
+    time: Option<(Real, Forcing)>,
+    previous: Option<&'a TrialState>,
+    ltra: Option<&'a mut super::ltra::LtraWorkspace>,
+    selected: Option<&'a [usize]>,
+}
+
 impl Circuit {
     /// Bind extra quantities to finalized devices and terminal roles.
     /// Existing branch-current columns are retained without duplication.
@@ -452,24 +463,28 @@ impl Circuit {
         &self,
         run: &PreparedRun<'_>,
         request: &LoadRequest<'_>,
-        sources: &[(&str, Real)],
-        time: Option<(Real, Forcing)>,
-        previous: Option<&TrialState>,
-        ltra: Option<&mut super::ltra::LtraWorkspace>,
+        inputs: RealObservationInputs<'_>,
     ) -> SpiceResult<Vec<Complex>> {
+        let RealObservationInputs {
+            sources,
+            time,
+            previous,
+            ltra,
+            selected,
+        } = inputs;
         self.validate_history(request.history)?;
         if let Some(trial) = previous {
             request.history.check_trial(trial)?;
         }
         let plan = &self.runtime.observations;
         plan.validate(self)?;
-        if plan.queries.is_empty() {
-            return Ok(Vec::new());
-        }
         if request.solution.len() != self.unknown_count() {
             return Err(SpiceError::circuit(
                 "isolated observation load does not match the circuit numbering",
             ));
+        }
+        if plan.queries.is_empty() || selected.is_some_and(<[usize]>::is_empty) {
+            return Ok(Vec::new());
         }
         let point = run.point(request.model_context)?;
         let mut workspace = run.observation_work.borrow_mut();
@@ -486,19 +501,31 @@ impl Circuit {
             workspace,
             ltra,
         };
-        plan.queries
-            .iter()
-            .map(|query| {
-                let value = loads.observe(query)?;
-                if !value.is_finite() {
-                    return Err(SpiceError::Numerical {
-                        context: query.name.clone(),
-                        message: "nonfinite device observation".into(),
-                    });
-                }
-                Ok(Complex::real(value))
-            })
-            .collect()
+        let mut observe = |query: &Observation| {
+            let value = loads.observe(query)?;
+            if !value.is_finite() {
+                return Err(SpiceError::Numerical {
+                    context: query.name.clone(),
+                    message: "nonfinite device observation".into(),
+                });
+            }
+            Ok(Complex::real(value))
+        };
+        if let Some(indices) = selected {
+            indices
+                .iter()
+                .map(|&index| {
+                    plan.queries
+                        .get(index)
+                        .ok_or_else(|| {
+                            SpiceError::circuit("selected observation index is out of range")
+                        })
+                        .and_then(&mut observe)
+                })
+                .collect()
+        } else {
+            plan.queries.iter().map(observe).collect()
+        }
     }
 
     /// Observe scalar instance parameters for a spectral point. Device current
@@ -514,49 +541,81 @@ impl Circuit {
         &self,
         run: &PreparedRun<'_>,
         context: &ModelContext,
+        selected: Option<&[usize]>,
     ) -> SpiceResult<Vec<Complex>> {
         let plan = &self.runtime.observations;
         plan.validate(self)?;
+        if selected.is_some_and(<[usize]>::is_empty) {
+            return Ok(Vec::new());
+        }
         let point = run.point(context)?;
-        plan.queries
-            .iter()
-            .map(|query| {
-                let key = match &query.selector {
-                    Selector::SourceDc => "dc",
-                    Selector::Parameter(key) => key,
-                    Selector::Current { .. } | Selector::Power { .. } => {
-                        return Err(gap(&format!("{}: AC current/power ask", query.name())));
-                    }
-                };
-                let value = point
-                    .device(self, query.device)
-                    .observation_parameter(key, context)?
-                    .ok_or_else(|| gap(query.name()))?;
-                if !value.is_finite() {
-                    return Err(gap(query.name()));
+        let ask = |query: &Observation| {
+            let key = match &query.selector {
+                Selector::SourceDc => "dc",
+                Selector::Parameter(key) => key,
+                Selector::Current { .. } | Selector::Power { .. } => {
+                    return Err(gap(&format!("{}: AC current/power ask", query.name())));
                 }
-                Ok(Complex::real(value))
-            })
-            .collect()
+            };
+            let value = point
+                .device(self, query.device)
+                .observation_parameter(key, context)?
+                .ok_or_else(|| gap(query.name()))?;
+            if !value.is_finite() {
+                return Err(gap(query.name()));
+            }
+            Ok(Complex::real(value))
+        };
+        selected.map_or_else(
+            || plan.queries.iter().map(ask).collect(),
+            |indices| {
+                indices
+                    .iter()
+                    .map(|&index| {
+                        plan.queries
+                            .get(index)
+                            .ok_or_else(|| {
+                                SpiceError::circuit("selected observation index is out of range")
+                            })
+                            .and_then(ask)
+                    })
+                    .collect()
+            },
+        )
     }
 }
 
 impl super::circuit::PreparedTransient<'_> {
-    /// Observe the converged solution with the same immutable delay inputs.
+    /// Observe a converged transient point with every ordinary device ask,
+    /// retaining the original pre-acceptance trial-history semantics.
     pub(crate) fn observe(
         &mut self,
         solution: &Vector,
         previous: &TrialState,
+    ) -> SpiceResult<Vec<Complex>> {
+        self.observe_selected(solution, previous, None)
+    }
+
+    /// Converged transient observation asks against pre-acceptance trial
+    /// history; unrequested device loads are never invoked.
+    pub(crate) fn observe_selected(
+        &mut self,
+        solution: &Vector,
+        previous: &TrialState,
+        selected: Option<&[usize]>,
     ) -> SpiceResult<Vec<Complex>> {
         let request = self.request(solution);
         let time = request.forcing.map(|forcing| (self.time(), forcing));
         self.run.circuit().observe_real_prepared(
             self.run,
             &request,
-            &[],
-            time,
-            Some(previous),
-            Some(&mut self.workspace),
+            RealObservationInputs {
+                sources: &[],
+                time,
+                previous: Some(previous),
+                ltra: Some(&mut self.workspace),
+                selected,
+            },
         )
     }
 }
@@ -572,15 +631,62 @@ impl PreparedRun<'_> {
         time: Option<(Real, Forcing)>,
         previous: Option<&TrialState>,
     ) -> SpiceResult<Vec<Complex>> {
-        self.circuit()
-            .observe_real_prepared(self, request, sources, time, previous, None)
+        self.circuit().observe_real_prepared(
+            self,
+            request,
+            RealObservationInputs {
+                sources,
+                time,
+                previous,
+                ltra: None,
+                selected: None,
+            },
+        )
+    }
+
+    /// Observe only selected bound device quantities for a real output.
+    /// # Errors
+    /// As [`Self::observe_real`], plus an invalid selected ordinal.
+    pub(crate) fn observe_real_selected(
+        &self,
+        request: &LoadRequest<'_>,
+        sources: &[(&str, Real)],
+        time: Option<(Real, Forcing)>,
+        previous: Option<&TrialState>,
+        selected: &[usize],
+    ) -> SpiceResult<Vec<Complex>> {
+        self.circuit().observe_real_prepared(
+            self,
+            request,
+            RealObservationInputs {
+                sources,
+                time,
+                previous,
+                ltra: None,
+                selected: Some(selected),
+            },
+        )
     }
 
     /// Observe scalar device parameters in the prepared context.
     /// # Errors
     /// As [`Circuit::observe_parameters`].
     pub fn observe_parameters(&self, context: &ModelContext) -> SpiceResult<Vec<Complex>> {
-        self.circuit().observe_parameters_prepared(self, context)
+        self.circuit()
+            .observe_parameters_prepared(self, context, None)
+    }
+
+    /// Observe only selected bound scalar device quantities in spectral mode.
+    /// Unrequested current/power asks are not evaluated.
+    /// # Errors
+    /// As [`Self::observe_parameters`], plus an invalid selected ordinal.
+    pub(crate) fn observe_parameters_selected(
+        &self,
+        context: &ModelContext,
+        selected: &[usize],
+    ) -> SpiceResult<Vec<Complex>> {
+        self.circuit()
+            .observe_parameters_prepared(self, context, Some(selected))
     }
 }
 
@@ -693,6 +799,77 @@ mod tests {
                 .to_string()
                 .contains("AC current/power")
         );
+    }
+
+    #[test]
+    fn selected_asks_only_isolate_selected_devices_once_per_point() {
+        let mut circuit = Circuit::new();
+        let a = circuit.add_node("a").unwrap();
+        let b = circuit.add_node("b").unwrap();
+        let first = Rc::new(Cell::new(0));
+        let second = Rc::new(Cell::new(0));
+        for (name, terminals, count) in [
+            ("r1", [a, b], Rc::clone(&first)),
+            ("r2", [NodeId::GROUND, a], Rc::clone(&second)),
+        ] {
+            circuit
+                .add_device(Box::new(Counted {
+                    name,
+                    nodes: terminals,
+                    count,
+                }))
+                .unwrap();
+        }
+        circuit.finalize().unwrap();
+        circuit
+            .set_observations(&[
+                "i(r1)".into(),
+                "@r2[i]".into(),
+                "@r1[p]".into(),
+                "@r2[power]".into(),
+                "@r1[current]".into(),
+            ])
+            .unwrap();
+        let baseline = [first.get(), second.get()];
+        let run = circuit.prepare_run();
+        let history = circuit.state_history().unwrap();
+        let model = ModelContext::default();
+        let solution = Vector::from_slice(&[3., 1.]);
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context: &model,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        assert_eq!(
+            run.observe_real_selected(&request, &[], None, None, &[0, 2, 4])
+                .unwrap(),
+            [4., 8., 4.].map(Complex::real)
+        );
+        assert_eq!([first.get(), second.get()], [baseline[0] + 1, baseline[1]]);
+        assert_eq!(
+            run.observe_real_selected(&request, &[], None, None, &[])
+                .unwrap(),
+            []
+        );
+        assert_eq!([first.get(), second.get()], [baseline[0] + 1, baseline[1]]);
+        assert_eq!(
+            run.observe_real_selected(&request, &[], None, None, &[1, 3])
+                .unwrap(),
+            [-6., 18.].map(Complex::real)
+        );
+        assert_eq!(
+            [first.get(), second.get()],
+            [baseline[0] + 1, baseline[1] + 1]
+        );
+        assert!(
+            run.observe_parameters_selected(&model, &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(run.observe_parameters_selected(&model, &[2]).is_err());
     }
 
     #[derive(Debug)]

@@ -488,7 +488,7 @@ pub struct LinearSystem {
     /// Contributions of `e` that one device adds to one element as a single
     /// `omega`-scaled sum ([`LinearContext::dynamic_sum`]); empty for most
     /// systems.
-    pub e_groups: Vec<crate::maths::DynamicGroup>,
+    pub e_groups: crate::maths::DynamicGroups,
 }
 impl LinearSystem {
     /// Empty assembly for n unknowns.
@@ -499,7 +499,7 @@ impl LinearSystem {
             e: SparseMatrix::new(n, n),
             sources: vec![],
             has_initial_conditions: false,
-            e_groups: vec![],
+            e_groups: crate::maths::DynamicGroups::new(),
         }
     }
     /// DC forcing, optionally overriding one independent source.
@@ -698,13 +698,9 @@ impl LinearContext<'_> {
         }
         let end = self.system.e.triplets().len();
         if end > start && self.system.e.overflow().is_none() {
-            self.system.e_groups.push(crate::maths::DynamicGroup {
-                range: start..end,
-                terms: terms.to_vec(),
-                scale,
-                divisor: 1.,
-                prescaled: true,
-            });
+            self.system
+                .e_groups
+                .push(&mut self.system.e, start..end, terms, scale, 1., true)?;
         }
         Ok(())
     }
@@ -719,13 +715,9 @@ impl LinearContext<'_> {
         self.system.e.add(r, c, value)?;
         let end = self.system.e.triplets().len();
         if end > start && self.system.e.overflow().is_none() {
-            self.system.e_groups.push(crate::maths::DynamicGroup {
-                range: start..end,
-                terms: vec![value],
-                scale: 1.,
-                divisor: 1.,
-                prescaled: true,
-            });
+            self.system
+                .e_groups
+                .push(&mut self.system.e, start..end, &[value], 1., 1., true)?;
         }
         Ok(())
     }
@@ -754,13 +746,14 @@ impl LinearContext<'_> {
                 || divisor.to_bits() != 1_f64.to_bits())
             && self.system.e.overflow().is_none()
         {
-            self.system.e_groups.push(crate::maths::DynamicGroup {
-                range: start..end,
-                terms: terms.to_vec(),
+            self.system.e_groups.push(
+                &mut self.system.e,
+                start..end,
+                terms,
                 scale,
                 divisor,
-                prescaled: false,
-            });
+                false,
+            )?;
         }
         Ok(())
     }

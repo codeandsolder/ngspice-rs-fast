@@ -865,7 +865,7 @@ fn ac_conductance_and_capacitance_stamps_preserve_c_grouping() {
                 assert_eq!(group.terms.len(), 2);
                 assert_eq!(group.scale.to_bits(), m.to_bits());
                 assert!(!group.prescaled);
-                let terms = group.terms.clone();
+                let terms = group.terms.to_vec();
                 (system, m, terms)
             });
             let [(unit, _, terms), (scaled, m, scaled_terms)] = systems;
@@ -952,7 +952,7 @@ fn gate_pencils_keep_reference_diagonal_scaling_and_statement_order() {
                         (t.row, t.col) == (g, g)
                     })
                     .unwrap();
-                let [capgd, capgs] = group.terms.as_slice() else {
+                let [capgd, capgs] = group.terms else {
                     panic!("gate capacitance pair")
                 };
                 let (capgd, capgs) = (*capgd, *capgs);
