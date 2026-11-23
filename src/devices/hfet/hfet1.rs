@@ -435,6 +435,20 @@ struct Nodes {
     dpp: NodeId,
 }
 
+impl Nodes {
+    /// Conductances of physically distinct edges in the prepared topology.
+    fn series(self, derived: &Derived) -> [Real; 5] {
+        let edge = |a, b, g| if a == b { 0. } else { g };
+        [
+            edge(self.d, self.dp, derived.gdpr),
+            edge(self.s, self.sp, derived.gspr),
+            edge(self.g, self.gp, derived.ggate),
+            edge(self.sp, self.spp, derived.tgi),
+            edge(self.dp, self.dpp, derived.tgf),
+        ]
+    }
+}
+
 /// HFET1, `Z` level 5.
 #[derive(Debug, Clone)]
 pub(in crate::devices) struct Hfet1 {
@@ -694,13 +708,13 @@ impl Hfet1 {
         let u = 0.5 * vgt / vt - 1.;
         let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
         let vgte = (2. * vt) * (1. + smoothed.high);
-        let (population, population_slope) = super::softplus(vgt / etavth - std::f64::consts::LN_2);
-        let nsn = 2. * derived.n0 * population;
-        let (nsm, weight_n, weight_c) = if derived.two_exponentials {
-            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / (model.eta2 * vt)).exp();
-            super::series_density(nsn, nsc)
+        let (nsn, slope) = super::soft_density(derived.n0, vgt, etavth);
+        let (nsm, delnsmvgt) = if derived.two_exponentials {
+            let thermal = model.eta2 * vt;
+            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / thermal).exp();
+            super::series_density(nsn, slope, nsc, thermal)
         } else {
-            (nsn, 1., 0.)
+            (nsn, slope)
         };
         if nsm < N_MIN {
             let terms = self.gatemod_terms(derived, vgs, vds, 0., 0., 0., gmin, (cgd, cgs, ggs));
@@ -743,15 +757,6 @@ impl Hfet1 {
         let delgchins = derived.gchi0;
         let delnsnsm = ns / nsm / (1. + c);
         let delvgtevgt = smoothed.high_weights[0];
-        let delnsmvgt = if derived.two_exponentials {
-            f64::mul_add(
-                weight_n * weight_n,
-                2. * derived.n0 / etavth * population_slope,
-                weight_c * nsm / (model.eta2 * vt),
-            )
-        } else {
-            2. * derived.n0 / etavth * population_slope
-        };
         let delvsateisat = 1. / gch;
         let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
@@ -1432,13 +1437,7 @@ impl Device for Hfet1 {
         let n = self.nodes;
         let (ggs, ggd, gmg, gmd) = (point.ggs, point.ggd, point.gmg, point.gmd);
         let (gm, gds) = (point.gm, point.gds);
-        let (gdpr, gspr, ggate, tgi, tgf) = (
-            derived.gdpr,
-            derived.gspr,
-            derived.ggate,
-            derived.tgi,
-            derived.tgf,
-        );
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&derived);
         let ceqgd = pol
             * f64::mul_add(
                 ggdpp,
@@ -1549,13 +1548,7 @@ impl Device for Hfet1 {
                 .mul_add(1. + ((f - derived.fgds) / derived.delf).tanh(), 1.);
         }
         let n = self.nodes;
-        let (gdpr, gspr, ggate, tgi, tgf) = (
-            derived.gdpr,
-            derived.gspr,
-            derived.ggate,
-            derived.tgi,
-            derived.tgf,
-        );
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&derived);
         for (a, b, value) in [
             (n.d, n.d, m * gdpr),
             (n.s, n.s, m * gspr),
@@ -2103,13 +2096,7 @@ impl Device for ResetHfet1 {
         }
         let m = current.instance.m;
         let n = current.nodes;
-        let (gdpr, gspr, ggate, tgi, tgf) = (
-            derived.gdpr,
-            derived.gspr,
-            derived.ggate,
-            derived.tgi,
-            derived.tgf,
-        );
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&derived);
         let real = [
             (n.d, n.d, m * gdpr),
             (n.s, n.s, m * gspr),

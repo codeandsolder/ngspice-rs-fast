@@ -721,8 +721,7 @@ impl Mesa {
         let u = 0.5 * vgt / vt - 1.;
         let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
         let vgte = (2. * vt) * (1. + smoothed.high);
-        let (population, population_slope) = super::softplus(vgt / etavth - std::f64::consts::LN_2);
-        let nsm = 2. * derived.n0 * population;
+        let (nsm, delnsmvgt) = super::soft_density(derived.n0, vgt, etavth);
         if nsm < N_MIN {
             return Ok((0., 0., 0., derived.cf, derived.cf));
         }
@@ -762,7 +761,6 @@ impl Mesa {
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
         let delnsnsm = ns / nsm / (1. + c);
-        let delnsmvgt = 2. * derived.n0 / etavth * population_slope;
         let delvgtevgt = smoothed.high_weights[0];
         let delvsateisat = 1. / gch;
         let delisatisatm = isat / isatm / (1. + g);

@@ -312,6 +312,16 @@ struct Nodes {
     dp: NodeId,
 }
 
+impl Nodes {
+    /// A resistance between aliased prepared nodes has no series branch.
+    fn series(self, derived: &Derived) -> [Real; 2] {
+        [
+            if self.d == self.dp { 0. } else { derived.gdpr },
+            if self.s == self.sp { 0. } else { derived.gspr },
+        ]
+    }
+}
+
 /// HFET2, `Z` level 6.
 #[derive(Debug, Clone)]
 pub(in crate::devices) struct Hfet2 {
@@ -456,13 +466,13 @@ impl Hfet2 {
         let u = 0.5 * vgt / vt - 1.;
         let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
         let vgte = (2. * vt) * (1. + smoothed.high);
-        let (population, population_slope) = super::softplus(vgt / etavth - std::f64::consts::LN_2);
-        let nsn = 2. * derived.n0 * population;
-        let (nsm, weight_n, weight_c) = if derived.two_exponentials {
-            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / (model.eta2 * vt)).exp();
-            super::series_density(nsn, nsc)
+        let (nsn, slope) = super::soft_density(derived.n0, vgt, etavth);
+        let (nsm, delnsmvgt) = if derived.two_exponentials {
+            let thermal = model.eta2 * vt;
+            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / thermal).exp();
+            super::series_density(nsn, slope, nsc, thermal)
         } else {
-            (nsn, 1., 0.)
+            (nsn, slope)
         };
         if nsm < N_MIN {
             return Ok(Channel {
@@ -499,15 +509,6 @@ impl Hfet2 {
         let delgchins = derived.gchi0;
         let delnsnsm = ns / nsm / (1. + c);
         let delvgtevgt = smoothed.high_weights[0];
-        let delnsmvgt = if derived.two_exponentials {
-            f64::mul_add(
-                weight_n * weight_n,
-                2. * derived.n0 / etavth * population_slope,
-                weight_c * nsm / (model.eta2 * vt),
-            )
-        } else {
-            2. * derived.n0 / etavth * population_slope
-        };
         let delvsateisat = 1. / gch;
         let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
@@ -886,7 +887,7 @@ impl Device for Hfet2 {
         let n = self.nodes;
         let (ggs, ggd) = (point.ggs, point.ggd);
         let (gm, gds, cgd, cg) = (point.gm, point.gds, point.cgd, point.cg);
-        let (gdpr, gspr) = (derived.gdpr, derived.gspr);
+        let [gdpr, gspr] = n.series(&derived);
         let ceqgd = pol * f64::mul_add(ggd, -point.vgd, cgd);
         let ceqgs = pol * f64::mul_add(ggs, -point.vgs, cg - cgd);
         let cdreq = pol
@@ -958,8 +959,8 @@ impl Device for Hfet2 {
         let m = self.instance.m;
         let point = self.point(&derived, vgs, vgd)?;
         let (gm, gds, ggs, ggd) = (point.gm, point.gds, point.ggs, point.ggd);
-        let (gdpr, gspr) = (derived.gdpr, derived.gspr);
         let n = self.nodes;
+        let [gdpr, gspr] = n.series(&derived);
         for (a, b, value) in [
             (n.d, n.d, m * gdpr),
             (n.g, n.g, m * (ggd + ggs)),
@@ -1340,9 +1341,9 @@ impl Device for ResetHfet2 {
         let point = state.point(&state.derived(temperature)?, zero, zero)?;
         let derived = self.current.derived(temperature)?;
         let (gm, gds, ggs, ggd) = (point.gm, point.gds, point.ggs, point.ggd);
-        let (gdpr, gspr) = (derived.gdpr, derived.gspr);
         let m = self.current.instance.m;
         let n = self.current.nodes;
+        let [gdpr, gspr] = n.series(&derived);
         let stamps = [
             (n.d, n.d, m * gdpr),
             (n.g, n.g, m * (ggd + ggs)),
