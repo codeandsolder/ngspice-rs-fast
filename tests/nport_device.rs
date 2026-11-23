@@ -449,3 +449,96 @@ fn active_nonreciprocal_four_port_is_reported_without_assuming_passivity() {
     assert_eq!(report.reciprocity, PropertyStatus::Violated);
     assert_eq!(report.causality, PropertyStatus::Undetermined);
 }
+
+#[test]
+fn four_port_measured_coupling_reappears_in_native_sp_without_port_permutations() {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs::netlist::Parser;
+    use ngspice_rs::netlist::source::parse_deck_text;
+    use std::fmt::Write as _;
+    use std::path::Path;
+
+    let z0 = [25., 100., 50., 75.];
+    let matrix = [
+        [0., 0.5, 0., 0.],
+        [0.5, 0., 0., 0.],
+        [0., 0., 0., -0.25],
+        [0., 0., -0.25, 0.],
+    ];
+    let mut imported = String::from(
+        "[Version] 2.1\n# Hz S RI R 50\n[Number of Ports] 4\n\
+        [Number of Frequencies] 1\n[Reference] 25 100 50 75\n[Network Data]\n1000",
+    );
+    for row in matrix {
+        for coefficient in row {
+            write!(imported, " {coefficient} 0").unwrap();
+        }
+    }
+    imported.push_str("\n[End]\n");
+    let network =
+        Arc::new(Touchstone::parse(&imported, "coupled.ts", TouchstoneLimits::default()).unwrap());
+    let mut deck = String::from("four-port measured network\n");
+    for (index, reference) in z0.iter().enumerate() {
+        writeln!(
+            deck,
+            "v{} p{} 0 dc 0 ac {} portnum {} z0 {reference}",
+            index + 1,
+            index + 1,
+            usize::from(index == 0),
+            index + 1
+        )
+        .unwrap();
+    }
+    deck.push_str(".sp lin 1 1k 1k\n.end\n");
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("measured4.cir"), &deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let mut terminals = Vec::new();
+    for index in 0..4 {
+        let id = circuit.add_node(&format!("p{}", index + 1)).unwrap();
+        terminals.push(PortTerminals {
+            positive: id,
+            negative: NodeId::GROUND,
+        });
+    }
+    circuit
+        .add_device(Box::new(
+            MeasuredNPort::new(
+                "nfourport",
+                Arc::clone(&network),
+                terminals,
+                Extrapolation::Hold,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+    let plot = plan.run(&mut circuit, &config.context()).unwrap();
+    assert_eq!(plot.point_count(), 1);
+    for (row, expected_row) in matrix.iter().enumerate() {
+        for (col, &expected) in expected_row.iter().enumerate() {
+            value(
+                plot.value(&format!("S_{}_{}", row + 1, col + 1), 0)
+                    .unwrap(),
+                Complex::real(expected),
+            );
+        }
+    }
+}
+
+#[test]
+fn resonant_phase_wrap_interpolation_tracks_rectangular_phasors() {
+    let text = "[Version] 2.1\n# Hz S RI R 50\n[Number of Ports] 1\n\
+        [Number of Frequencies] 2\n[Network Data]\n\
+        1 -0.9998476951563913 0.01745240643728344\n\
+        3 -0.9998476951563913 -0.01745240643728344\n[End]\n";
+    let model = oneport(text);
+    let y = model.admittance_at(2.).unwrap();
+    // Interpolated Γ is near -1 with zero imaginary part, not near +1
+    // because the input phases happened to straddle the ±180° cut.
+    let gamma = -0.999_847_695_156_391_3_f64;
+    let resistance = 50. * (1. + gamma) / (1. - gamma);
+    value(y.get(0, 0).unwrap(), Complex::real(1. / resistance));
+}

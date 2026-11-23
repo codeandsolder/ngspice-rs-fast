@@ -104,7 +104,10 @@ inserted into AC computations.
 mode/noise and normalization roundtrips, malformed and budget cases.
 `tests/nport_device.rs`: analytic resistor/open/short/ideal through,
 heterogeneous 50/75 ohm normalization, physical mixed-mode Y/S transforms,
-complex interpolation and signed nodal stamp conservation. These tests
+complex interpolation and signed nodal stamp conservation; 4-port paired
+couplings with 25/100/50/75 ohm references checked against independent 2×2
+closed-form Y and through the full native `.sp` solver, active nonreciprocal
+networks, and ±180° phase-wrap interpolation. These tests
 establish the intended direct-network semantics. The architecture campaign
 serial validator performs full Rust strict lint and pinned golden verification
 before integration. See the separate Notion issue log for acceptance dates
@@ -114,3 +117,10 @@ The export path also supports `Touchstone::write_with_limits`, which uses a
 bounded formatting sink and rejects a byte-cap breach during streaming
 formatting, not after constructing an oversized output string. Every formatted
 numeric field, matrix row, metadata line, and noise record shares this cap.
+
+The exported v2.1 four-port sample was also independently parsed using
+**scikit-rf 2.2.0**. Both measured frequencies (1 and 2 GHz), all 16 complex
+S coefficients, and each 25/100/50/75 ohm reference impedance matched
+exactly (`max |ΔS| = 0`). The external-parser fixture is retained in the
+campaign log directory under `worker-arch-1122-1944-b6e9-174-skrf/generated.s4p`,
+not in the repository, and the temporary fixture-emission test is removed.
