@@ -3061,12 +3061,22 @@ impl Circuit {
             setups.max(1),
             Some(&mut ranges),
         )?;
+        system.e_groups.validate_operator(&system.e)?;
         let conductance_stamps = system.a.triplets();
         let capacitance_stamps = system.e.triplets();
+        let mut grouped = system.e_groups.iter().peekable();
         let mut terms = Vec::new();
         for (conductance_range, capacitance_range, statements) in ranges {
             if !statements.is_empty() {
-                // The device recorded its C statements in order.
+                // Explicit C statements supersede all of this device's E
+                // stamps, but their groups still occupy that device's range.
+                while let Some(group) = grouped.next_if(|g| g.range.start < capacitance_range.end) {
+                    if group.range.start < capacitance_range.start
+                        || group.range.end > capacitance_range.end
+                    {
+                        return Err(SpiceError::circuit("dynamic group crosses device boundary"));
+                    }
+                }
                 terms.extend(statements);
                 continue;
             }
@@ -3100,27 +3110,33 @@ impl Circuit {
             let mut index = capacitance_range.start;
             while index < capacitance_range.end {
                 let stamp = &capacitance_stamps[index];
-                let (value, next) = system
-                    .e_groups
-                    .iter()
-                    .find(|group| {
-                        group.range.start == index && group.range.end <= capacitance_range.end
-                    })
-                    .map_or_else(
-                        || (stamp.value, index + 1),
-                        |group| {
-                            let mut sum = group.terms.first().copied().unwrap_or(0.);
-                            for term in group.terms.iter().skip(1) {
-                                sum += term;
-                            }
-                            (group.scale * sum, group.range.end.max(index + 1))
-                        },
-                    );
+                let (value, next) = match grouped.peek() {
+                    Some(group) if group.range.start < index => {
+                        return Err(SpiceError::circuit("dynamic group crosses device boundary"));
+                    }
+                    Some(group) if group.range.start == index => {
+                        if group.range.end > capacitance_range.end {
+                            return Err(SpiceError::circuit(
+                                "dynamic group crosses device boundary",
+                            ));
+                        }
+                        let value = system.e_groups.pencil_value(group)?;
+                        let end = group.range.end;
+                        grouped.next();
+                        (value, end)
+                    }
+                    _ => (stamp.value, index + 1),
+                };
                 let slot_index = slot(&mut terms, stamp.row, stamp.col);
                 let capacitance = &mut terms[slot_index].capacitance;
                 *capacitance = Some(capacitance.map_or(value, |capacitance| capacitance + value));
                 index = next;
             }
+        }
+        if grouped.next().is_some() {
+            return Err(SpiceError::circuit(
+                "dynamic group outside pole-zero device ranges",
+            ));
         }
         Ok(terms)
     }
@@ -3186,6 +3202,7 @@ impl Circuit {
                 ));
             }
         }
+        system.e_groups.seal(&system.e)?;
         if ranges.is_some() {
             // The caller reads the unfolded stamps.
             return Ok(system);

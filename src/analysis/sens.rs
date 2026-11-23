@@ -1098,19 +1098,21 @@ fn poisoned_rows(
 ) -> SpiceResult<std::collections::BTreeSet<usize>> {
     let n = system.a.rows();
     let entries = || {
-        system
-            .a
-            .triplets()
-            .iter()
-            .map(|t| (t.row, t.col, t.value))
-            .chain(crate::maths::complex::iter_dynamic_terms(
-                &system.e,
-                &system.e_groups,
-                omega,
-            ))
+        Ok::<_, SpiceError>(
+            system
+                .a
+                .triplets()
+                .iter()
+                .map(|t| (t.row, t.col, t.value))
+                .chain(crate::maths::complex::iter_dynamic_terms(
+                    &system.e,
+                    &system.e_groups,
+                    omega,
+                )?),
+        )
     };
     let mut bad = Vec::new();
-    for (row, col, value) in entries() {
+    for (row, col, value) in entries()? {
         if row >= n || col >= n {
             return Err(SpiceError::Numerical {
                 context: ".sens".into(),
@@ -1124,7 +1126,7 @@ fn poisoned_rows(
     if bad.is_empty() {
         return Ok(std::collections::BTreeSet::new());
     }
-    let blocks = blocks(n, entries().map(|(row, col, _)| (row, col)))?;
+    let blocks = blocks(n, entries()?.map(|(row, col, _)| (row, col)))?;
     let tainted: std::collections::BTreeSet<usize> = bad.iter().map(|&row| blocks[row]).collect();
     Ok((0..n)
         .filter(|&row| tainted.contains(&blocks[row]))
@@ -1416,15 +1418,18 @@ impl AcState<'_> {
 
     /// Real contributions, then frequency-scaled dynamic contributions,
     /// with each group's original arithmetic and stamp order.
-    fn stamps<'s>(&self, system: &'s LinearSystem) -> impl Iterator<Item = Stamp> + use<'s> {
-        real_stamps(&system.a).chain(
-            crate::maths::complex::iter_dynamic_terms(&system.e, &system.e_groups, self.omega).map(
-                |(row, col, value)| Stamp {
-                    row,
-                    col,
-                    value: Complex::new(0., value),
-                },
-            ),
+    fn stamps<'s>(
+        &self,
+        system: &'s LinearSystem,
+    ) -> SpiceResult<impl Iterator<Item = Stamp> + use<'s>> {
+        let dynamic =
+            crate::maths::complex::iter_dynamic_terms(&system.e, &system.e_groups, self.omega)?;
+        Ok(
+            real_stamps(&system.a).chain(dynamic.map(|(row, col, value)| Stamp {
+                row,
+                col,
+                value: Complex::new(0., value),
+            })),
         )
     }
 
@@ -1438,7 +1443,7 @@ impl AcState<'_> {
     ) -> SpiceResult<()> {
         self.assemble(index, base, &mut scratch.system)?;
         scratch.system.ac_rhs_into(&mut scratch.rhs);
-        assembly.add(self.stamps(&scratch.system))?;
+        assembly.add(self.stamps(&scratch.system)?)?;
         let mut assembly = assembly.negate();
         self.assemble(index, perturbed, &mut scratch.system)?;
         scratch.system.ac_rhs_into(&mut scratch.perturbed_rhs);
@@ -1446,7 +1451,7 @@ impl AcState<'_> {
         for (base, perturbed) in scratch.rhs.iter_mut().zip(&scratch.perturbed_rhs) {
             *base = Complex::new(-base.re + perturbed.re, -base.im + perturbed.im);
         }
-        assembly.add(self.stamps(&scratch.system))?;
+        assembly.add(self.stamps(&scratch.system)?)?;
         assembly.visit_products(&self.solution, |row, [mut real, mut imaginary]| {
             let value = &mut scratch.rhs[row];
             real.negate();

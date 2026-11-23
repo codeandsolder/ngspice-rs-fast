@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 use petgraph::graphmap::UnGraphMap;
@@ -712,6 +712,42 @@ fn fold_triplets(triplets: &mut Vec<Triplet>) {
     triplets.retain(|triplet| triplet.value != 0.0);
 }
 
+/// Operator identity and mutation generation for grouped stamp metadata.
+#[derive(Debug)]
+struct StampIdentity {
+    owner: OnceLock<Arc<()>>,
+    generation: u64,
+}
+impl StampIdentity {
+    const fn new() -> Self {
+        Self {
+            owner: OnceLock::new(),
+            generation: 0,
+        }
+    }
+    fn advance(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+    fn reset(&mut self) {
+        self.owner = OnceLock::new();
+        self.advance();
+    }
+}
+impl Clone for StampIdentity {
+    fn clone(&self) -> Self {
+        // A copied operator is a new owner, not a second name for the source.
+        Self {
+            owner: OnceLock::new(),
+            generation: self.generation,
+        }
+    }
+}
+impl PartialEq for StampIdentity {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 /// A sparse matrix as a list of contributions.
 ///
 /// Duplicate positions are allowed and are summed by [`SparseMatrix::get`] and by
@@ -731,6 +767,7 @@ pub struct SparseMatrix {
     /// Per row, the circuit unknown's name (C `NODENAME`), used by solver
     /// diagnostics; `None` for a standalone matrix.
     names: Option<crate::maths::UnknownNames>,
+    stamp_identity: StampIdentity,
 }
 
 impl SparseMatrix {
@@ -745,6 +782,7 @@ impl SparseMatrix {
             bound: None,
             pivot: crate::maths::PivotTolerances::DEFAULT,
             names: None,
+            stamp_identity: StampIdentity::new(),
         }
     }
 
@@ -794,7 +832,22 @@ impl SparseMatrix {
             }),
             pivot: crate::maths::PivotTolerances::DEFAULT,
             names: None,
+            stamp_identity: StampIdentity::new(),
         })
+    }
+
+    /// Immutable identity for a dynamic contribution stream.
+    pub(crate) fn stamp_owner(&self) -> Arc<()> {
+        Arc::clone(self.stamp_identity.owner.get_or_init(|| Arc::new(())))
+    }
+    pub(crate) const fn stamp_generation(&self) -> u64 {
+        self.stamp_identity.generation
+    }
+    pub(crate) fn has_stamp_owner(&self, owner: &Arc<()>) -> bool {
+        self.stamp_identity
+            .owner
+            .get()
+            .is_some_and(|actual| Arc::ptr_eq(actual, owner))
     }
 
     /// Pivot thresholds used when this matrix is ordered for factorization
@@ -937,6 +990,7 @@ impl SparseMatrix {
             }
         }
         bound.cursor = bound.end;
+        self.stamp_identity.advance();
         true
     }
 
@@ -1004,6 +1058,7 @@ impl SparseMatrix {
             .ok_or_else(|| pattern_error("element handle outside bound pattern"))?;
         *slot += value;
         bound.view.take();
+        self.stamp_identity.advance();
         Ok(())
     }
 
@@ -1043,6 +1098,7 @@ impl SparseMatrix {
                 triplet.value = 0.0;
             }
         }
+        self.stamp_identity.advance();
         kept
     }
 
@@ -1059,6 +1115,7 @@ impl SparseMatrix {
             // Overflow coordinates are disjoint from the pattern.
             bound.view.take();
             bound.values[id.index()] = value;
+            self.stamp_identity.advance();
             return Ok(());
         }
         if self.folded {
@@ -1132,9 +1189,12 @@ impl SparseMatrix {
         {
             bound.view.take();
             bound.values[id.index()] += value;
+            self.stamp_identity.advance();
             return Ok(());
         }
-        self.add_untraced(row, col, value)
+        self.add_untraced(row, col, value)?;
+        self.stamp_identity.advance();
+        Ok(())
     }
 
     /// [`Self::add`] off the replayed trace: range check, pattern lookup
@@ -1200,12 +1260,14 @@ impl SparseMatrix {
         }
         fold_triplets(&mut self.triplets);
         self.folded = true;
+        self.stamp_identity.advance();
     }
 
     /// Drops every contribution, keeping the dimensions.
     pub fn clear(&mut self) {
         self.triplets.clear();
         self.folded = true;
+        self.stamp_identity.reset();
         if let Some(bound) = &mut self.bound {
             bound.values.fill(0.0);
             bound.view.take();

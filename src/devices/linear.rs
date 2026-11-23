@@ -475,7 +475,7 @@ pub struct LinearSource {
 }
 
 /// Preassembled state-independent `E x' + A x = b(t)`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LinearSystem {
     /// Static conductances and branch constraints.
     pub a: SparseMatrix,
@@ -488,7 +488,21 @@ pub struct LinearSystem {
     /// Contributions of `e` that one device adds to one element as a single
     /// `omega`-scaled sum ([`LinearContext::dynamic_sum`]); empty for most
     /// systems.
-    pub e_groups: Vec<crate::maths::DynamicGroup>,
+    pub e_groups: crate::maths::DynamicGroups,
+}
+impl Clone for LinearSystem {
+    fn clone(&self) -> Self {
+        let e = self.e.clone();
+        let mut e_groups = self.e_groups.clone();
+        e_groups.rebind(&e);
+        Self {
+            a: self.a.clone(),
+            e,
+            sources: self.sources.clone(),
+            has_initial_conditions: self.has_initial_conditions,
+            e_groups,
+        }
+    }
 }
 impl LinearSystem {
     /// Empty assembly for n unknowns.
@@ -499,7 +513,7 @@ impl LinearSystem {
             e: SparseMatrix::new(n, n),
             sources: vec![],
             has_initial_conditions: false,
-            e_groups: vec![],
+            e_groups: crate::maths::DynamicGroups::new(),
         }
     }
     /// DC forcing, optionally overriding one independent source.
@@ -698,13 +712,13 @@ impl LinearContext<'_> {
         }
         let end = self.system.e.triplets().len();
         if end > start && self.system.e.overflow().is_none() {
-            self.system.e_groups.push(crate::maths::DynamicGroup {
-                range: start..end,
-                terms: terms.to_vec(),
-                scale,
-                divisor: 1.,
-                prescaled: true,
-            });
+            self.system.e_groups.register(
+                &self.system.e,
+                start..end,
+                (r, c),
+                terms,
+                crate::maths::DynamicMode::Prescaled { scale },
+            )?;
         }
         Ok(())
     }
@@ -719,13 +733,13 @@ impl LinearContext<'_> {
         self.system.e.add(r, c, value)?;
         let end = self.system.e.triplets().len();
         if end > start && self.system.e.overflow().is_none() {
-            self.system.e_groups.push(crate::maths::DynamicGroup {
-                range: start..end,
-                terms: vec![value],
-                scale: 1.,
-                divisor: 1.,
-                prescaled: true,
-            });
+            self.system.e_groups.register(
+                &self.system.e,
+                start..end,
+                (r, c),
+                std::slice::from_ref(&value),
+                crate::maths::DynamicMode::Prescaled { scale: 1. },
+            )?;
         }
         Ok(())
     }
@@ -754,13 +768,13 @@ impl LinearContext<'_> {
                 || divisor.to_bits() != 1_f64.to_bits())
             && self.system.e.overflow().is_none()
         {
-            self.system.e_groups.push(crate::maths::DynamicGroup {
-                range: start..end,
-                terms: terms.to_vec(),
-                scale,
-                divisor,
-                prescaled: false,
-            });
+            self.system.e_groups.register(
+                &self.system.e,
+                start..end,
+                (r, c),
+                terms,
+                crate::maths::DynamicMode::Scaled { scale, divisor },
+            )?;
         }
         Ok(())
     }
