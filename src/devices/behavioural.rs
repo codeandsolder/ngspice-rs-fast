@@ -208,7 +208,7 @@ impl Behavioural {
     /// matrix-column and derivative buffers for the duration of the caller.
     /// Resolving columns for each assembly is necessary: MNA numbering can
     /// change after an analysis rebuild and no topology generation token is
-    /// currently exposed by MnaUnknowns. No column allocations occur after
+    /// currently exposed by `MnaUnknowns`. No column allocations occur after
     /// the first load with a particular expression width.
     fn with_linearization<T>(
         &self,

@@ -181,6 +181,13 @@ impl Clone for Workspace {
     }
 }
 
+impl Workspace {
+    /// Transfer the one-shot evaluator's derivative buffer without copying.
+    pub(super) fn into_gradient(self) -> Vec<Real> {
+        self.gradient
+    }
+}
+
 impl Plan {
     pub(super) fn evaluate<'w>(
         &self,
@@ -554,7 +561,10 @@ mod tests {
                 match (actual, expected) {
                     (Ok(actual), Ok(expected)) => {
                         assert_eq!(
-                            bits(&actual.into_owned()),
+                            bits(&Evaluation {
+                                value: actual.value,
+                                gradient: actual.gradient.to_vec()
+                            }),
                             bits(&expected),
                             "{text} at {point:?}"
                         )
@@ -688,7 +698,13 @@ mod tests {
             let expected = reference(&old, &env, &mut reference_scratch, &mut 0);
             match (actual, expected) {
                 (Ok(actual), Ok(expected)) => {
-                    assert_eq!(bits(&actual.into_owned()), bits(&expected))
+                    assert_eq!(
+                        bits(&Evaluation {
+                            value: actual.value,
+                            gradient: actual.gradient.to_vec()
+                        }),
+                        bits(&expected)
+                    )
                 }
                 (Err(actual), Err(expected)) => {
                     assert_eq!(actual.to_string(), expected.to_string())
@@ -890,7 +906,13 @@ mod tests {
         let mut visits = 0;
         let expected = reference(&program, &env, &mut reference_scratch, &mut visits).unwrap();
         let actual = program.evaluate_with_workspace(&env, &mut scratch).unwrap();
-        assert_eq!(bits(&actual.into_owned()), bits(&expected));
+        assert_eq!(
+            bits(&Evaluation {
+                value: actual.value,
+                gradient: actual.gradient.to_vec()
+            }),
+            bits(&expected)
+        );
         let unique = scratch
             .values
             .iter()

@@ -84,15 +84,6 @@ pub(super) struct EvaluationView<'a> {
     pub(super) gradient: &'a [Real],
 }
 
-impl EvaluationView<'_> {
-    fn into_owned(self) -> Evaluation {
-        Evaluation {
-            value: self.value,
-            gradient: self.gradient.to_vec(),
-        }
-    }
-}
-
 /// One-argument functions (`inpptree.c` `funcs[]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Unary {
@@ -381,8 +372,14 @@ impl Program {
     /// [`SpiceError::Numerical`] when a function is evaluated outside its
     /// domain or any value/derivative is not finite.
     pub fn evaluate(&self, environment: &Environment<'_>) -> SpiceResult<Evaluation> {
-        self.evaluate_with_workspace(environment, &mut Workspace::default())
-            .map(EvaluationView::into_owned)
+        let mut workspace = Workspace::default();
+        let value = self
+            .evaluate_with_workspace(environment, &mut workspace)?
+            .value;
+        Ok(Evaluation {
+            value,
+            gradient: workspace.into_gradient(),
+        })
     }
 
     pub(super) fn evaluate_with_workspace<'w>(

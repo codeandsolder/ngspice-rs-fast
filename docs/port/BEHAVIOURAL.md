@@ -11,7 +11,7 @@ check, including when only the value is ultimately consumed. Lazy ternary
 execution never visits inactive branches; error diagnostics keep their source
 and derivative evaluation order.
 
-The public Program::evaluate returns an owned Evaluation to independent callers.
+The public Program::evaluate returns an owned Evaluation to independent callers, transferring the one-shot workspace's derivative Vec directly (no extra allocation/copy).
 Internal prepared-device evaluation returns EvaluationView borrowing the
 derivative slice from the caller's Workspace. The workspace holds reusable
 instruction values, demand stack, and derivative vector. Without ternaries,

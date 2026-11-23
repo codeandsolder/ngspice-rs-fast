@@ -92,7 +92,7 @@ fn stamp_bits(circuit: &Circuit, x: &Vector, repeats: usize) -> (Vec<u64>, f64) 
 }
 
 #[test]
-fn repeated_prepared_b_sources_preserve_exact_stamps_and_clone_separation() {
+fn repeated_prepared_b_sources_preserve_exact_stamps_across_independent_circuits() {
     let circuit = build_circuit();
     let x = point(&circuit);
     let (original, _) = stamp_bits(&circuit, &x, 8);
