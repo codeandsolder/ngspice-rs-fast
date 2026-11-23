@@ -193,6 +193,39 @@ fn resistor_flicker_noise_follows_kf_af_ef() {
 }
 
 #[test]
+fn extreme_frequency_flicker_integrates_the_finite_power_law() {
+    // The former absolute-frequency formula reconstructs f^2.5, which
+    // overflows at these frequencies even though the integral is finite.
+    let plots = run("extreme flicker
+v1 in 0 dc 2 ac 1
+r1 in out 1k
+r2 out 0 rf
+\
+        .model rf r(r=1k kf=1e-305 af=0 ef=-1.5)
+.noise v(out) v1 lin 2 1e200 2e200 1
+.end
+");
+    let spectrum = &plots[0];
+    let frequencies = column(spectrum, "frequency");
+    assert_eq!(frequencies, [1e200, 2e200]);
+    let powers = column(spectrum, "onoise_r2_1overf");
+    close(powers[0].powi(2), 2.5, 1e-12);
+    close(powers[1].powi(2), 2.5 * 2_f64.powf(1.5), 1e-12);
+    let expected = 1e200 * (2_f64.powf(2.5) - 1.);
+    let integrated = &plots[1];
+    close(
+        column(integrated, "v(onoise_total_r2_1overf)")[0].powi(2),
+        expected,
+        1e-12,
+    );
+    close(
+        column(integrated, "v(inoise_total_r2_1overf)")[0].powi(2),
+        4. * expected,
+        1e-12,
+    );
+}
+
+#[test]
 fn diode_shot_noise_is_2qi_relative_to_the_series_resistor() {
     let deck = "shot\nv1 in 0 dc 2 ac 1\nr1 in a 1k\nd1 a 0 dm\n.model dm d(is=1e-14)\n";
     let noise = run(&format!("{deck}.noise v(a) v1 lin 1 1k 1k 1\n.end\n"));
@@ -422,4 +455,184 @@ fn large_bjt_bypass_runs_ac_and_adjoint_noise_at_high_frequency() {
     );
     assert_eq!(run_at(&deck, 0).unwrap()[0].point_count(), 5);
     assert!(run_at(&deck, 1).unwrap()[0].point_count() >= 2);
+}
+
+/// Programmatic frequency-local laws, including adversarial layout changes.
+/// The topology and all control/state routes are fixed.
+#[derive(Debug)]
+struct ChangingNoise {
+    name: &'static str,
+    terminals: [NodeId; 2],
+    adversarial: bool,
+}
+
+impl Device for ChangingNoise {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn designator(&self) -> char {
+        'r'
+    }
+
+    fn terminals(&self) -> &[NodeId] {
+        &self.terminals
+    }
+
+    fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+        let [a, b] = self.terminals;
+        context.stamp(a, a, 1e-3)?;
+        context.stamp(b, b, 1e-3)?;
+        context.stamp(a, b, -1e-3)?;
+        context.stamp(b, a, -1e-3)
+    }
+
+    fn noise(
+        &self,
+        context: &ngspice_rs::devices::noise::NoiseContext<'_>,
+        sources: &mut Vec<ngspice_rs::devices::noise::NoiseSource>,
+    ) -> SpiceResult<ngspice_rs::devices::noise::DeviceNoise<'_>> {
+        use ngspice_rs::devices::noise::{DeviceNoise, NoiseFamily, NoiseKind, NoiseSource};
+        let frequency = context.model_context.frequency;
+        let is = |value: f64| self.adversarial && frequency.to_bits() == value.to_bits();
+        if is(7.) {
+            return Ok(DeviceNoise::Noiseless);
+        }
+        let [a, b] = self.terminals;
+        let nodes = if frequency < 2. {
+            [a, NodeId::GROUND]
+        } else if is(8.) {
+            [NodeId::new(u32::MAX), b]
+        } else {
+            [b, a]
+        };
+        let law = if frequency < 2. {
+            NoiseKind::Gain { factor: frequency }
+        } else {
+            NoiseKind::CorrelatedThermal {
+                conductance: if is(9.) { f64::NAN } else { frequency },
+                second: [a, b],
+                second_conductance: 1.,
+                phase: 0.,
+                temperature: KELVIN,
+            }
+        };
+        sources.push(NoiseSource::new("_a", nodes, law));
+        if !is(4.) {
+            sources.push(NoiseSource::new(
+                "_b",
+                [a, b],
+                NoiseKind::Gain { factor: 1. },
+            ));
+        }
+        if is(3.) {
+            sources.swap(0, 1);
+        }
+        Ok(DeviceNoise::Sources {
+            family: if is(10.) {
+                NoiseFamily::Diode
+            } else {
+                NoiseFamily::Resistor
+            },
+            model: Some(if is(6.) { "different" } else { "same" }),
+            total: !is(5.),
+        })
+    }
+}
+
+#[test]
+fn stable_noise_plan_rejects_changed_slots_and_bad_transfers_transactionally() {
+    use ngspice_rs::devices::{ModelContext, noise::NoisePlan};
+    use ngspice_rs::maths::Vector;
+
+    let mut circuit = Circuit::from_netlist(&parse("noise plan\nrbase a b 1k\n.end\n")).unwrap();
+    let terminals = ["a", "b"].map(|name| circuit.nodes().get(name).unwrap());
+    for (name, adversarial) in [("stable", false), ("unstable", true)] {
+        circuit
+            .add_device(Box::new(ChangingNoise {
+                name,
+                terminals,
+                adversarial,
+            }))
+            .unwrap();
+    }
+    circuit.finalize().unwrap();
+    let run = circuit.prepare_run();
+    let bias = Vector::zeros(circuit.unknown_count());
+    let model = |frequency| ModelContext::default().with_frequency(frequency);
+    let mut plan = NoisePlan::bind(&run, &model(1.), &bias, None).unwrap();
+    let names: Vec<_> = plan
+        .instances()
+        .map(|(instance, _)| instance.name.as_ptr())
+        .collect();
+    let snapshot = |plan: &NoisePlan<'_>| {
+        plan.instances()
+            .map(|(instance, sources)| (instance.clone(), sources.to_vec()))
+            .collect::<Vec<_>>()
+    };
+    plan.refresh(&run, &model(2.), &bias, None).unwrap();
+    let expected = NoisePlan::bind(&run, &model(2.), &bias, None).unwrap();
+    assert_eq!(snapshot(&plan), snapshot(&expected));
+    let valid = snapshot(&plan);
+    for frequency in 3..=10 {
+        let error = plan
+            .refresh(&run, &model(f64::from(frequency)), &bias, None)
+            .unwrap_err();
+        match frequency {
+            8 => assert!(error.to_string().contains("unmapped MNA node"), "{error}"),
+            9 => assert!(
+                error.to_string().contains("out-of-domain generator"),
+                "{error}"
+            ),
+            _ => assert!(
+                error.to_string().contains("noise generator layout changed"),
+                "{error}"
+            ),
+        }
+        assert_eq!(snapshot(&plan), valid, "failed refresh at {frequency} Hz");
+    }
+    plan.refresh(&run, &model(11.), &bias, None).unwrap();
+    let expected = NoisePlan::bind(&run, &model(11.), &bias, None).unwrap();
+    assert_eq!(snapshot(&plan), snapshot(&expected));
+    assert_eq!(
+        names,
+        plan.instances()
+            .map(|(instance, _)| instance.name.as_ptr())
+            .collect::<Vec<_>>()
+    );
+    let foreign = Circuit::from_netlist(&parse("different circuit\nr1 a b 1k\n.end\n")).unwrap();
+    assert!(
+        plan.refresh(&foreign.prepare_run(), &model(1.), &bias, None)
+            .unwrap_err()
+            .to_string()
+            .contains("different finalized circuit")
+    );
+}
+
+#[test]
+fn model_creation_rank_is_stable_across_families_and_interleaved_instances() {
+    let plots = run(
+        "mixed model order\nv1 in 0 dc 0 ac 1\nr1 in out ra\nr2 out 0 rb\nd1 out 0 dm\nr3 out 0 ra\nr4 out 0 rb\nd2 out 0 dm\n.model ra r(r=1k)\n.model rb r(r=2k)\n.model dm d\n.noise v(out) v1 lin 2 1k 2k 1\n.end\n",
+    );
+    let names = names(&plots[0]);
+    let totals: Vec<_> = names
+        .into_iter()
+        .filter(|name| {
+            matches!(
+                *name,
+                "onoise_d1" | "onoise_d2" | "onoise_r1" | "onoise_r2" | "onoise_r3" | "onoise_r4"
+            )
+        })
+        .collect();
+    assert_eq!(
+        totals,
+        [
+            "onoise_d2",
+            "onoise_d1",
+            "onoise_r4",
+            "onoise_r2",
+            "onoise_r3",
+            "onoise_r1"
+        ]
+    );
 }

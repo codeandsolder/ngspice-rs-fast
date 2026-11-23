@@ -45,10 +45,12 @@ mod linear;
 pub mod measure;
 pub mod newton;
 pub mod noise;
+pub mod optimization;
 mod ordered_samples;
 mod plan;
 mod pz;
 pub mod rawfile;
+mod reduction;
 pub mod results;
 pub mod selection;
 mod sens;
@@ -69,7 +71,7 @@ pub use measure::{MeasureEvents, MeasureSpan, Measurement};
 pub use plan::{AnalysisPlan, IntegrationFamily};
 pub use rawfile::{
     BinaryByteOrder, RawCollectPolicy, RawFile, RawFileReader, RawFileWriter, RawFormat, RawPlot,
-    RawPlotRows, RawReadPolicy, StreamedPlot,
+    RawPlotRows, RawReadPolicy,
 };
 pub use rawfile::{FinishedPlot, RawFileTransaction};
 pub use results::{ColumnView, Plot, PlotBuilder, PlotFlags, PlotSchema, PointSink, Variable};

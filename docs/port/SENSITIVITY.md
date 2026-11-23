@@ -39,8 +39,38 @@ compile. The port reproduces `sens_sens()`.
    `Y^-1 ((dI1 - dI0) - (dY1 - dY0) x)` at the output, divided by `delta`.
    DC loads are `DEVload` at the operating point, AC loads `DEVacLoad`.
 
-So a sensitivity is a first-order forward difference (relative error about
-`1e-6`), not an exact derivative.
+So a sensitivity is a first-order forward difference, not an exact
+derivative. Its truncation error depends on local curvature and its
+roundoff error on the conditioning of the finite-difference numerator.
+
+### Numerical conformance resolution
+
+A reference sensitivity is a quotient of a small change in output by the
+step recorded in the actual parameter walk. A fixed percentage tolerance
+alone is meaningless when that change is below the output resolution.
+The conformance runner now obtains an optional, same-shaped diagnostic
+from the ordinary sensitivity evaluation, without changing its returned
+values, rawfile schema, parameter order, or numerical algorithm.
+
+For each column the comparison floor is `max(A, 32 eps × S) / |delta|`:
+`A` is the configured ABSTOL (current output) or VNTOL (voltage output)
+for nonlinear DC, zero for linear DC and AC; `S` is the magnitude of the
+probe's solved output components before any differential subtraction.
+The 32-epsilon term is a roundoff-scale estimate, not a rigorous
+forward-error bound. The existing relative target and baseline absolute
+floor remain; the latter is replaced by the larger of it and the
+diagnostic. Frequency axes get no extra budget. Independently captured
+C envelopes and mandatory exact-input captures are still checked, as are
+shape, metadata and finite values. A material discrepancy above the
+resolution still fails.
+
+For MOS3 TOX, `delta = 2e-14 m` and the deck specifies ABSTOL = 1e-16 A.
+The resulting resolution is 0.005 A/m, rather than insisting on an
+unresolvable 6.46e-20 A difference in the numerator. This is deliberately
+an engineering comparison criterion, not a claim that C's historical
+restoration-order-dependent derivative is physically correct. Independent
+Jacobian/central-difference tests remain the evidence for physical
+accuracy; do not tune individual model expressions to C roundoff.
 
 ## The AC reset state (#102)
 
@@ -512,8 +542,8 @@ binary:
 **The Gummel-Poon BJT is ported and verified** (`sens_bjt`): `bjt.c`'s 103
 model `IF_REAL` setters and six instance ones, over an NPN at `dtemp=-10` with
 `ISE` above 1e-4, `rb`/`re`/`irb`/`rbm`, area factors and a `BF` polynomial,
-and a PNP at `dtemp=20` with `tnom=50`. 291 columns, all inside 1e-6
-(`compare::SENSITIVITY_NONLINEAR`). The fixture senses the **emitter** current:
+and a PNP at `dtemp=20` with `tnom=50`. 291 columns, compared with the independently captured C envelope under the
+unchanged `compare::SENSITIVITY_NONLINEAR` tolerance. The fixture senses the **emitter** current:
 a collector-side ammeter hides `BF`/`ISE`/`NE`, which move the base current,
 because `Ie = Ic + Ib`.
 
@@ -592,14 +622,27 @@ the fixed record-loss defect.
 scaled to `1e-19` during setup, so the sensitivity step is `1e-25`. The
 same upstream C revision returns `q1:ise = 2.867749531079332e10` on macOS
 arm64 and `-1.5951873897539978e10` on Linux x86-64 GNU: a `4.46e-15`
-difference in the solved response. Linux C reproduces the Linux Rust values,
-including the other ten columns that failed against the macOS capture. The
-original golden is unchanged; `conformance/golden/linux-x86_64-gnu/sens_bjt.raw`
-is an independently captured C variant with build provenance in its README.
-`conformance/support/src/fixtures.rs` selects it for GNU Linux x86-64 in capture, drift
-checks, verification and the BJT production test. All 291 columns retain the
-same tolerance, with no skips or missing-file fallback. A large quotient in
-this fixture is not necessarily a portable physical derivative.
+difference in the solved response. The original golden is unchanged;
+`conformance/golden/linux-x86_64-gnu/sens_bjt.raw` is an independently captured
+C variant with build provenance in its README. Capture and drift checks still
+select the native file. Numerical comparisons require both captures, validate
+their complete schemas and point counts, and compare against the closest
+endpoint of the observed per-column interval (or zero distance inside it).
+Identical captures reduce to a single-reference test. The base 1 ppm + 1e-9
+target is supplemented by the output-resolution floor described above. No
+column is skipped. This is a measurement of C's cross-platform numerical
+uncertainty, not a claim that every value inside the interval is physically
+accurate.
+
+The improved thermal and ON-bias arithmetic (issue #90) places nine formerly
+platform-specific sensitivity residues inside the two independent C captures.
+In an independently selected `q1:eg` sensitivity, before IBE/IBC setters
+alter the model, C gives -1.4399171e-4 and independently solved central
+differences converge to -1.4399170e-4; Rust matches both. In the full parameter
+walk the same column's C results straddle zero (-1.589e-9 on Linux and
++2.431e-9 on macOS). Such a full-walk finite-difference residue cannot establish
+the physical derivative; the separate selected-parameter test does.
+
 
 ### Classic MOS (`M`, levels 1/2/3/6/9)
 
@@ -720,6 +763,28 @@ deck that asks fails loudly.
 * C keeps going with a nonconverged operating point; the port propagates the
   failure.
 
+## Reference agreement versus physical accuracy (#146)
+
+A C sensitivity capture is not an exact mathematical derivative. Its
+fixed 1 ppm forward perturbation amplifies rounded device loads and
+independent operating-point errors. For the historical nonlinear JFET2
+fixture, the C DELTA result differs from the independent analytic derivative
+by about 8.4 ppm, even though the operating points agree much more closely.
+The reference comparison therefore uses **0.1% relative** (the default
+SPICE RELTOL engineering scale) plus the existing 1e-9 absolute floor for
+nonlinear sensitivity values. MESA level 2 retains its proven 5e-8
+absolute cancellation floor. Linear derivatives and sweep coordinates retain
+the 1e-8 relative, 1e-12 absolute budget. A sensitivity has units of output
+per parameter; the absolute floor is an existing numerical comparison
+budget, not a universal physical current or voltage measurement limit.
+
+Historical rawfiles, exact-input provenance, parameter coverage and
+metadata checks are preserved. The C reference budget does not control
+Newton convergence, actual derivative algorithms, or analytic and
+independent convergence assertions. #144 tracks improving the conditioning
+and accuracy of the derivatives themselves. A disagreement smaller than
+the interoperability budget is not proof of physical correctness.
+
 ## Verification
 
 * `tests/sensitivity_analysis.rs`: closed-form divider derivatives
@@ -739,10 +804,10 @@ deck that asks fails loudly.
   `.op` and a filtered `.sens` batch) under `compare::SENSITIVITY` (1e-8
   relative, 1e-12 absolute); `sens_hot` (60 C, geometry and TC resistors, a
   PULSE source, B source, switch, current output) and `sens_diode` (two diode
-  models, tightened RELTOL) under `compare::SENSITIVITY_NONLINEAR` (1e-6
-  relative, 1e-9 absolute; the floor covers forward differences of weak
-  parameters that are a few ulps of the node voltage, see
-  `xtask/src/commands/compare.rs`). The `j`/`z` family fixtures are there too:
+  models, tightened RELTOL) under `compare::SENSITIVITY_NONLINEAR` (1e-3
+  relative, 1e-9 absolute; engineering-scale C interoperability, with the
+  floor covering cancellation in weak parameters). See the shared policy
+  in `conformance/support/src/tolerance.rs`. The `j`/`z` family fixtures are there too:
   `sens_jfet`, `sens_jfet2`, `sens_mesfet`, `sens_hfet1`, `sens_hfet2`,
   `sens_mesa`, `sens_mesa3`, `sens_mesa4`, `sens_mesa4_ts` and `sens_bjt`.
   The AC reset state (#102): `sens_ac_reset` (diode, S/W switches, B sources),
@@ -769,3 +834,81 @@ deck that asks fails loudly.
   follow-on test covers MOS1/2/3/9, both polarities and trapezoidal/Gear
   integration with ordinary bias initialization, at the linear sensitivity
   bound; it also runs the new three-analysis fixture through the CLI.
+
+
+## Numerical accuracy audit (#92)
+
+The perturbation's sparse stamp ordering, separate base and perturbed load
+stages, step sizes, model callbacks and block-local nonfinite policy are
+unchanged. The signed real and imaginary contributions are accumulated with
+Neumaier compensation. At the base/perturbed boundary both the running value
+and its correction are negated, so the base load is not rounded down to a
+single binary64 value before subtraction. Row products are likewise summed
+with compensation. For a base load [1e16, 1] and perturbed load [1e16, 2],
+this recovers a delta of 1 instead of rounding the perturbation to 2.
+Signed zero and empty-row behavior have explicit regressions.
+
+Sweep-count arithmetic is a separate grid policy, not a continuous numerical
+result: with three steps and log10(high/low) equal to the binary64
+0.6633333333333332, the separately rounded product plus 1.01 truncates to
+three points, whereas a fused multiply-add truncates to two. The discrete
+count and existing stepping policy therefore remain unchanged in this audit.
+
+
+The perturbation product keeps both parts of each compensated matrix
+entry, and adds the FMA residual of each finite real multiplication.
+The right-hand side is combined with the compensated row product before
+rounding the final residual. This retains terms lost by rounding the dot
+product alone: for example, 1 - (1 + 2^-27)(1 - 2^-27) is 2^-54, not zero.
+This does not recover information already rounded inside a device load,
+nor change the finite parameter-perturbation policy.
+
+## Conditioned physical partials (issue #144)
+
+The existing `.sens` form remains a replay of the historical C `sens_sens()`
+record walk, including its `1e-6 * p` forward step, `given` transitions and
+non-smooth temperature/unit effects. Its captured C conformance values are
+not modified or relabeled as physical derivatives. To request **physical
+scalar partial derivatives at fixed accepted bias**, add the `physical` token
+before `dc` or `ac`, after any ordinary output-name filters:
+
+```text
+.sens v(2) j1:delta physical
+.sens i(vids) z3:d2 physical
+.sens v(out) c1 physical ac dec 1 10 1k
+```
+
+This mode reuses the same validated `DeviceSensitivity` model/instance
+records, primal factorization, parameter enumeration and physical device
+loaders, but clones independent typed records for every candidate rather
+than inheriting the previous C setter. The sample is a *local residual*
+`F(p+h) - F(p)` at the original bias. The objective dual is solved once per
+DC output or AC frequency (`A^T λ = g`, **not** a complex conjugate transpose),
+and each sample is projected using FMA-corrected compensated products
+`λ^T ΔF`. No new LU, no parameter-specific matrix inversion, no dependence
+on independent Newton convergence noise.
+
+For each scalar coordinate, candidate scales use ±4%, ±2%, ±1%, ±0.5% and
+±0.25% of the parameter's magnitude, or the same absolute scales for an
+exactly zero coordinate. Effective steps are taken from the actual binary64
+parameter values (`fl(p±h)-p`), never the nominal requested h. Two-sided
+secants are preferred. If only one side is valid, a one-sided estimate is
+refined independently. Full- and half-step slopes are extrapolated using
+Richardson's leading-order cancellation (factor four for symmetric
+second-order central slopes and factor two for first-order one-sided
+slopes); the pair with the least observed refinement discrepancy is used.
+Invalid setters, nonfinite parameter values, changes to the device's setup
+element pattern or lack of a representable physical neighborhood cannot
+silently turn into a purported gradient: they return NaN in that column.
+
+**Accuracy limitations:** the measured two-step discrepancy is a relative
+conditioning diagnostic, *not* a certified physical error bound. For a tiny
+parameter with a physical scale unlike its numeric value, or for a setter
+whose `given` flag alters the physical interpretation even at infinitesimal
+changes, this scheme can remain poorly conditioned. Physical-gradient
+consumers should reject nonfinite responses and independently check the
+accepted scale dependence; objective integration under #115 can surface
+explicit `Unsupported`/`IllConditioned` typed statuses instead of only
+rawfile-compatible NaN. Independent JFET2 DELTA/HFET2 D2 physical references
+and full C replay tests are the acceptance evidence, not a loose comparison
+to historically rounded finite differences.

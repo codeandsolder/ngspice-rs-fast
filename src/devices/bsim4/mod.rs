@@ -4,9 +4,11 @@
 //!
 //! The C-shaped modules keep C's struct members (`fields.rs`, generated from
 //! `bsim4def.h`) and see the circuit through `host.rs`; `device.rs` wires
-//! them into the solver. Every path is compared bit for bit with an FMA-free
-//! build of the reference ngspice (`tests/bsim4_device.rs`, the opt-in
-//! `c_bsim4_*` tests and `docs/port/BSIM.md`).
+//! them into the solver. Equations are verified against the pinned FMA-free
+//! C oracle and independent physical numerical invariants. Deliberate fused
+//! arithmetic and stable high-dynamic-range formulas need not preserve C's
+//! intermediate rounding (`tests/bsim4_device.rs`, opt-in `c_bsim4_*` tests,
+//! and `docs/port/BSIM.md`).
 //!
 //! BSIM4 was developed by the UC Berkeley BSIM Research Group. The translated
 //! files follow the upstream notice: Copyright (c) 2025 University of

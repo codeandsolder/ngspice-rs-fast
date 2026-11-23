@@ -83,7 +83,7 @@ impl SolverOverrides {
         let dc = config.dc();
         let tran = config.transient();
         let mut newton = NewtonOptions::default();
-        newton.reltol = self.reltol.or(tran.rtol).unwrap_or(newton.reltol);
+        newton.reltol = self.reltol.unwrap_or_else(|| config.context().reltol);
         newton.vntol = self.vntol.or(tran.vntol).unwrap_or(newton.vntol);
         newton.abstol = self.abstol.or(tran.abstol).unwrap_or(newton.abstol);
         newton.max_iterations = self.direct.or(dc.itl1).unwrap_or(newton.max_iterations);
@@ -699,6 +699,27 @@ impl AnalysisPlan {
         collector.finish(self.plot_count())
     }
 
+    /// Execute a sensitivity plan and return the ordinary plot plus a
+    /// same-shaped diagnostic plot of estimated absolute comparison floors.
+    /// The diagnostic uses each parameter's actual finite-difference denominator;
+    /// it is not emitted to rawfiles and is not a certified derivative error bound.
+    ///
+    /// # Errors
+    /// A non-sensitivity plan, or ordinary circuit/analysis failures.
+    pub fn run_sensitivity_with_resolution(
+        &self,
+        circuit: &mut crate::devices::Circuit,
+        context: &crate::analysis::AnalysisContext,
+    ) -> SpiceResult<(crate::analysis::Plot, crate::analysis::Plot)> {
+        let PlanKind::Sensitivity { card, frequencies } = &self.analysis else {
+            return Err(unsupported("sensitivity resolution requires a .sens plan"));
+        };
+        let (plot, resolution) =
+            super::sens::run(circuit, self, context, card, frequencies.as_deref(), true)?;
+        let resolution = resolution.ok_or_else(|| unsupported("missing sensitivity resolution"))?;
+        Ok((plot, resolution))
+    }
+
     fn execute(
         &self,
         circuit: &mut crate::devices::Circuit,
@@ -737,13 +758,9 @@ impl AnalysisPlan {
             PlanKind::Distortion {
                 card, frequencies, ..
             } => disto::run(circuit, self, context, card, frequencies, retain_bias)?,
-            PlanKind::Sensitivity { card, frequencies } => vec![sens::run(
-                circuit,
-                self,
-                context,
-                card,
-                frequencies.as_deref(),
-            )?],
+            PlanKind::Sensitivity { card, frequencies } => {
+                vec![sens::run(circuit, self, context, card, frequencies.as_deref(), false)?.0]
+            }
         };
         for plot in plots {
             sink.complete(plot)?;

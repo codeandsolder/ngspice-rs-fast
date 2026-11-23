@@ -1,5 +1,5 @@
 //! Opt-in equilibration: physical units, certified rank and failure policies.
-use ngspice_rs::maths::equilibration::MAX_SCALING_EXPONENT;
+use ngspice_rs::maths::equilibration::{MAX_SCALING_EXPONENT, RefinementPolicy, RefinementStatus};
 use ngspice_rs::maths::{
     EquilibratedComplexLu, EquilibratedDenseLu, EquilibratedSparseLu, Matrix, SparseMatrix, Vector,
 };
@@ -336,7 +336,18 @@ fn curtis_reid_balancing_solves_the_behavioural_zero_start_cycle() {
         assert_eq!(factor.log2().fract(), 0.0, "power of two: {factor}");
     }
     // Refinement recovers the 2 V source exactly beside the 1e99 unknown.
-    let x = balanced.solve_refined(&rhs, 3).unwrap();
+    let refined = balanced
+        .solve_refined(
+            &rhs,
+            RefinementPolicy {
+                max_steps: 3,
+                target_backward_error: 1e-12,
+            },
+        )
+        .unwrap();
+    assert_eq!(refined.status, RefinementStatus::TargetMet);
+    assert!(refined.quality.maximum <= 1e-12);
+    let x = &refined.solution;
     assert_eq!(x.as_slice()[0], 2.0);
     assert!((x.as_slice()[1] / (-1e99 + 1e32 * 2.0) - 1.0).abs() < 1e-15);
     assert!((x.as_slice()[2] + 2e-3).abs() < 1e-18);
@@ -355,4 +366,112 @@ fn balancing_keeps_singular_and_empty_systems_rejected() {
     empty_row.add(0, 0, 1.0).unwrap();
     empty_row.add(0, 1, 1.0).unwrap();
     assert!(EquilibratedSparseLu::new_balanced(&empty_row, None).is_err());
+}
+
+#[test]
+fn refinement_reports_explicit_policy_and_exhaustion_status() {
+    let (matrix, _) = matrices(&[&[2., 1.], &[1., 3.]]);
+    let factor = EquilibratedSparseLu::new(&matrix, None).unwrap();
+    let rhs = Vector::from_slice(&[1., 0.]);
+    assert!(
+        factor
+            .solve_refined(
+                &rhs,
+                RefinementPolicy {
+                    max_steps: usize::MAX,
+                    target_backward_error: 0.,
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        factor
+            .solve_refined(
+                &rhs,
+                RefinementPolicy {
+                    max_steps: 0,
+                    target_backward_error: f64::NAN,
+                }
+            )
+            .is_err()
+    );
+    let report = factor
+        .solve_refined(
+            &rhs,
+            RefinementPolicy {
+                max_steps: 0,
+                target_backward_error: 0.,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.corrections, 0);
+    assert!(report.solution.is_finite());
+    assert!(report.quality.maximum.is_finite());
+    assert_eq!(
+        report.status,
+        if report.quality.maximum == 0. {
+            RefinementStatus::TargetMet
+        } else {
+            RefinementStatus::Exhausted
+        }
+    );
+}
+
+/// Diagnostic overhead is measured against the same sparse factor solve
+/// with telemetry absent, not a different matrix/solver configuration.
+/// This manual benchmark is intentionally ignored by CI timing assertions.
+#[test]
+#[ignore = "manual, machine-dependent latency measurement"]
+fn original_backward_error_enabled_vs_disabled_cost() {
+    use ngspice_rs::maths::SparseLu;
+    use ngspice_rs::maths::equilibration::OriginalResidual;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    for order in [32, 128, 512] {
+        let mut matrix = SparseMatrix::new(order, order);
+        let mut entries = Vec::with_capacity(3 * order);
+        for row in 0..order {
+            for (col, coefficient) in [
+                (row, 4.),
+                (row.saturating_sub(1), -1.),
+                ((row + 1).min(order - 1), -1.),
+            ] {
+                if col == row && coefficient != 4. {
+                    continue;
+                }
+                matrix.add(row, col, coefficient).unwrap();
+                entries.push((row, col, coefficient));
+            }
+        }
+        let factors = SparseLu::new(&matrix, None).unwrap();
+        let rhs = Vector::from_slice(&vec![1.; order]);
+        let reference = OriginalResidual::real(order, &entries, false).unwrap();
+        let samples = 150;
+        let start = Instant::now();
+        for _ in 0..samples {
+            black_box(factors.solve(&rhs).unwrap());
+        }
+        let uninstrumented = start.elapsed();
+        let start = Instant::now();
+        let mut measured_max = 0_f64;
+        for _ in 0..samples {
+            let solution = factors.solve(&rhs).unwrap();
+            let quality = reference
+                .evaluate(rhs.as_slice(), solution.as_slice())
+                .unwrap();
+            measured_max = measured_max.max(quality.maximum);
+            black_box(quality);
+        }
+        let instrumented = start.elapsed();
+        eprintln!(
+            "original-error n={order} sample={samples} base_ns={} quality_ns={} incremental_ns={} max_error={measured_max:.3e}",
+            uninstrumented.as_nanos() / samples,
+            instrumented.as_nanos() / samples,
+            instrumented
+                .as_nanos()
+                .saturating_sub(uninstrumented.as_nanos())
+                / samples
+        );
+    }
 }

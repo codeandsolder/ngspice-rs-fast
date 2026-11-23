@@ -54,10 +54,6 @@
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 
 mod disto;
 mod physics;
@@ -74,12 +70,12 @@ use crate::devices::limiting::{self, Limiter, Linearization};
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
-use crate::devices::nonlinear::DepletionLaw;
 use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::nonlinear::thermal::{
     BOLTZMANN, CELSIUS_TO_KELVIN, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureCache,
     TemperatureKey, band_gap, potential_shift,
 };
+use crate::devices::nonlinear::{DepletionLaw, unaliased_conductance};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
@@ -304,7 +300,7 @@ fn given(values: &ScalarValues, name: &str) -> Option<Real> {
 type TempCo = [Real; 2];
 
 fn poly(c: TempCo, dt: Real) -> Real {
-    1. + c[0] * dt + c[1] * dt * dt
+    c[1].mul_add(dt, c[0]).mul_add(dt, 1.)
 }
 
 /// Validated model data at the parameter-measurement temperature.
@@ -625,9 +621,9 @@ impl Model {
         let vt = t * K_OVER_Q;
         let nominal = PotentialTemperature::new(tnom, pbfact(tnom));
         let actual = PotentialTemperature::new(t, pbfact(t));
-        let ratlog = (t / tnom).ln();
-        let ratio1 = t / tnom - 1.;
-        let factlog = ratio1 * self.eg / vt + self.xti * ratlog;
+        let ratio1 = dt / tnom;
+        let ratlog = ratio1.ln_1p();
+        let factlog = self.xti.mul_add(ratlog, ratio1 * self.eg / vt);
         let (is, is_be, mut is_bc, mut iss) = if self.tlev == 3 {
             let exponent = poly(self.tis, dt);
             let is = area * self.is.powf(exponent);
@@ -659,7 +655,7 @@ impl Model {
         }
         let bfactor = match self.tlev {
             0 => (ratlog * self.xtb).exp(),
-            1 => 1. + self.xtb * dt,
+            1 => self.xtb.mul_add(dt, 1.),
             _ => 1.,
         };
         let bf = self
@@ -694,7 +690,7 @@ impl Model {
         let mjs = grading(self.mjs, self.tmjs);
         let junction = |cap: Real, pot: Real, m: Real, ct: Real, tv: Real| {
             if self.tlevc == 1 {
-                (cap * (1. + ct * dt), pot - tv * dt)
+                (cap * ct.mul_add(dt, 1.), (-tv).mul_add(dt, pot))
             } else {
                 let correction = actual.junction(&nominal, pot);
                 let mut cap = cap / correction.nominal_denominator(m);
@@ -815,10 +811,10 @@ impl Thermal {
             self.vjs,
             self.be.f1,
             self.be.f2,
-            self.be.f3,
+            self.be.edge,
             self.bc.f1,
             self.bc.f2,
-            self.bc.f3,
+            self.bc.edge,
         ];
         if values.iter().any(|v| !v.is_finite())
             || [
@@ -1046,7 +1042,7 @@ impl Bjt {
         let icvbe = self.initial.values[0].unwrap_or_else(|| voltage(n.b) - voltage(n.e));
         let icvce = self.initial.values[1].unwrap_or_else(|| voltage(n.c) - voltage(n.e));
         let vbe = self.pol * icvbe;
-        let vbc = vbe - self.pol * icvce;
+        let vbc = self.pol.mul_add(-icvce, vbe);
         Bias {
             vbe,
             vbc,
@@ -1155,6 +1151,10 @@ impl Bjt {
 }
 
 impl Device for Bjt {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.thermal(context).map(|_| ())
+    }
+
     /// `bjtsetup.c` without quasi-saturation (`RCO`, which the port rejects),
     /// so `collCX` is the collector prime; a three-terminal device's
     /// substrate is ground and allocates nothing.
@@ -1401,8 +1401,8 @@ impl Device for Bjt {
             let raw = self.bias(|node| context.node_voltage(node));
             let delvbe = raw.vbe - vbe;
             let delvbc = raw.vbc - vbc;
-            let cchat = cc + (gm + go) * delvbe - (go + gmu) * delvbc;
-            let cbhat = cb + gpi * delvbe + gmu * delvbc;
+            let cchat = (-(go + gmu)).mul_add(delvbc, (gm + go).mul_add(delvbe, cc));
+            let cbhat = gmu.mul_add(delvbc, gpi.mul_add(delvbe, cb));
             limiter.test_held(&context.states, &[(cc, cchat), (cb, cbhat)]);
         }
         let be = ChargeBranch::new(slot::QBE, p.charges.qbe, p.charges.capbe);
@@ -1474,10 +1474,10 @@ impl Device for Bjt {
         let gcpr = t.gc;
         let gepr = t.ge;
         let geqsub = gcsub + gdsub;
-        let ceqsub = ttype * (cqsub + cdsub - vsub * geqsub);
-        let ceqbx = ty * (cqbx - vbx * geqbx);
-        let ceqbe = ty * (cc + cb - vbe * (gm + go + gpi) + vbc * (go - geqcb));
-        let ceqbc = ty * (-cc + vbe * (gm + go) - vbc * (gmu + go));
+        let ceqsub = ttype * (-vsub).mul_add(geqsub, cqsub + cdsub);
+        let ceqbx = ty * (-vbx).mul_add(geqbx, cqbx);
+        let ceqbe = ty * vbc.mul_add(go - geqcb, (-vbe).mul_add(gm + go + gpi, cc + cb));
+        let ceqbc = ty * (-vbc).mul_add(gmu + go, vbe.mul_add(gm + go, -cc));
         let Nodes {
             c,
             b,
@@ -1490,6 +1490,9 @@ impl Device for Bjt {
         } = self.nodes;
         // Without quasi-saturation `collCX` is the collector prime.
         let cx = cp;
+        let gcpr = unaliased_conductance(c, cx, gcpr);
+        let gx = unaliased_conductance(b, bp, gx);
+        let gepr = unaliased_conductance(e, ep, gepr);
         context.stamp_rhs(b, m * (-ceqbx))?;
         context.stamp_rhs(cp, m * (ceqbx + ceqbc))?;
         context.stamp_rhs(sc, m * ceqsub)?;
@@ -1586,6 +1589,9 @@ impl Device for Bjt {
             sc,
         } = self.nodes;
         let cx = cp;
+        let gcpr = unaliased_conductance(c, cx, gcpr);
+        let gx = unaliased_conductance(b, bp, gx);
+        let gepr = unaliased_conductance(e, ep, gepr);
         let mut add = |row: NodeId, col: NodeId, value: Real| -> SpiceResult<()> {
             if let (Some(r), Some(k)) = (unknowns.node_row(row), unknowns.node_row(col)) {
                 context.system.a.add(r, k, value)?;
@@ -1703,7 +1709,11 @@ impl Device for Bjt {
     /// between the internal base and emitter. The quasi-saturation `_rci`
     /// generator is zero: RCO is not ported, so C's `collCX` node is the
     /// internal collector.
-    fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
         let thermal = self.thermal(context.model_context)?;
         let v = self.bias(|node| context.voltage(node));
         let p = c_point(&thermal, v, context.model_context.gmin)?;
@@ -1719,26 +1729,26 @@ impl Device for Bjt {
             conductance,
             temperature,
         };
+        sources.extend([
+            NoiseSource::new("_rc", [n.cp, n.c], thermal_noise(thermal.gc * m)),
+            NoiseSource::new("_rci", [n.cp, n.cp], thermal_noise(0.)),
+            NoiseSource::new("_rb", [n.bp, n.b], thermal_noise(p.transport.gx * m)),
+            NoiseSource::new("_re", [n.ep, n.e], thermal_noise(thermal.ge * m)),
+            NoiseSource::new("_ic", [n.cp, n.ep], NoiseKind::Shot { current: cc * m }),
+            NoiseSource::new("_ib", [n.bp, n.ep], NoiseKind::Shot { current: cb * m }),
+            NoiseSource::new(
+                "_1overf",
+                [n.bp, n.ep],
+                NoiseKind::Flicker {
+                    numerator: flicker,
+                    law: FlickerLaw::PerHertz,
+                },
+            ),
+        ]);
         Ok(DeviceNoise::Sources {
             family: NoiseFamily::Bjt,
-            model: Some(self.model_name.clone()),
+            model: Some(&self.model_name),
             total: true,
-            sources: vec![
-                NoiseSource::new("_rc", [n.cp, n.c], thermal_noise(thermal.gc * m)),
-                NoiseSource::new("_rci", [n.cp, n.cp], thermal_noise(0.)),
-                NoiseSource::new("_rb", [n.bp, n.b], thermal_noise(p.transport.gx * m)),
-                NoiseSource::new("_re", [n.ep, n.e], thermal_noise(thermal.ge * m)),
-                NoiseSource::new("_ic", [n.cp, n.ep], NoiseKind::Shot { current: cc * m }),
-                NoiseSource::new("_ib", [n.bp, n.ep], NoiseKind::Shot { current: cb * m }),
-                NoiseSource::new(
-                    "_1overf",
-                    [n.bp, n.ep],
-                    NoiseKind::Flicker {
-                        numerator: flicker,
-                        law: FlickerLaw::PerHertz,
-                    },
-                ),
-            ],
         })
     }
 }
@@ -2421,7 +2431,7 @@ impl Device for ResetBjt {
             let arg = td * self.omega;
             gm += go;
             xgm = -gm * arg.sin();
-            gm = gm * arg.cos() - go;
+            gm = gm.mul_add(arg.cos(), -go);
         }
         let Nodes {
             c,
@@ -2434,6 +2444,9 @@ impl Device for ResetBjt {
             sc,
         } = self.current.nodes;
         let cx = cp;
+        let gcpr = unaliased_conductance(c, cx, gcpr);
+        let gx = unaliased_conductance(b, bp, gx);
+        let gepr = unaliased_conductance(e, ep, gepr);
         let real = [
             (c, c, m * (gcpr)),
             (b, b, m * (gx)),

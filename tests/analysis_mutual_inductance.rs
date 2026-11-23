@@ -74,10 +74,28 @@ const TRANSFORMER: &str = "vin in 0 dc 1 ac 1\nr1 in p 10\nl1 p 0 1m\nl2 s 0 4m\
 #[test]
 fn coupled_inductors_are_shorts_at_dc() {
     let p = run(&format!("{TRANSFORMER}\nk1 l1 l2 0.9\n.op"));
-    assert_eq!(complex(&p, "v(p)", 0).re, 0.0);
-    assert_eq!(complex(&p, "v(s)", 0).re, 0.0);
-    assert!((complex(&p, "i(l1)", 0).re - 0.1).abs() < 1e-15);
-    assert_eq!(complex(&p, "i(l2)", 0).re, 0.0);
+    // The ideal inductors are physical shorts, not a promise of bitwise-zero
+    // floating-point MNA residuals. Bound voltage error against the 1 V
+    // excitation and branch current error against its 1 V / 10 ohm scale.
+    let voltage_bound = 8. * f64::EPSILON;
+    let current_bound = 8. * f64::EPSILON * 0.1;
+    for node in ["v(p)", "v(s)"] {
+        let residual = complex(&p, node, 0).magnitude();
+        assert!(
+            residual <= voltage_bound,
+            "{node} DC short residual {residual:e} V exceeds {voltage_bound:e} V"
+        );
+    }
+    let primary_error = (complex(&p, "i(l1)", 0) - Complex::new(0.1, 0.)).magnitude();
+    assert!(
+        primary_error <= current_bound,
+        "primary current residual {primary_error:e} A exceeds {current_bound:e} A"
+    );
+    let secondary_residual = complex(&p, "i(l2)", 0).magnitude();
+    assert!(
+        secondary_residual <= current_bound,
+        "secondary current residual {secondary_residual:e} A exceeds {current_bound:e} A"
+    );
 }
 
 #[test]

@@ -82,7 +82,7 @@ impl Default for NewtonOptions {
         Self {
             max_iterations: 100,
             // ngspice's defaults (cktntask.c): CKTreltol, CKTvoltTol, CKTabstol.
-            reltol: 1e-3,
+            reltol: crate::devices::DEFAULT_RELTOL,
             vntol: 1e-6,
             abstol: 1e-12,
             voltage_step: 0.2,

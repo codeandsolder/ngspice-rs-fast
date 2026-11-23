@@ -16,11 +16,15 @@
 //! Comments may appear between the continuation lines of a card, and a blank
 //! line terminates the card being built.
 
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult};
+
+pub(super) mod budget;
+use budget::{SourceBudget, SourceLimits, copy_text};
 
 /// One physical line of a deck, with its 1-based line number.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,20 +69,34 @@ impl Continuations {
 pub(crate) struct SourceMap(Option<Arc<Continuations>>);
 
 impl SourceMap {
-    fn append(&mut self, logical_start: usize, line: u32, column: usize) {
+    fn append(
+        &mut self,
+        logical_start: usize,
+        location: &SourceLoc,
+        budget: &mut Option<&mut SourceBudget>,
+    ) -> SpiceResult<()> {
         let segment = SourceSegment {
             logical_start,
-            line,
-            column,
+            line: location.line,
+            column: location.column,
         };
         if let Some(segments) = &mut self.0 {
-            Arc::make_mut(segments).rest.push(segment);
+            let rest = &mut Arc::make_mut(segments).rest;
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.allocation(rest.try_reserve(1), location)?;
+            }
+            rest.push(segment);
         } else {
             self.0 = Some(Arc::new(Continuations {
                 first: segment,
                 rest: Vec::new(),
             }));
         }
+        Ok(())
+    }
+
+    fn continuation_count(&self) -> usize {
+        self.0.as_ref().map_or(0, |runs| 1 + runs.rest.len())
     }
 
     pub(crate) fn position<'a>(
@@ -181,6 +199,10 @@ impl LogicalLine {
         }
     }
 
+    pub(super) fn retained_physical_lines(&self) -> usize {
+        1 + (self.continuations as usize).max(self.source_map.continuation_count())
+    }
+
     /// Resolves a logical byte offset (including EOF) to its physical location.
     /// EOF denotes the exclusive end of the last retained text.
     #[must_use]
@@ -228,11 +250,57 @@ impl Deck {
 /// Reads a deck from disk.
 ///
 /// # Errors
-/// Returns [`SpiceError::Io`] if the file cannot be read as UTF-8.
+/// Invalid UTF-8, I/O or default source admission limits.
 pub fn load(path: impl AsRef<Path>) -> SpiceResult<Deck> {
-    let path = path.as_ref();
-    let text = fs::read_to_string(path).map_err(|error| SpiceError::io(path, &error))?;
-    Ok(parse_deck_text(path, &text))
+    load_bounded(
+        path.as_ref(),
+        &mut SourceBudget::new(SourceLimits::default()),
+    )
+}
+
+pub(super) fn load_bounded(path: &Path, budget: &mut SourceBudget) -> SpiceResult<Deck> {
+    let location = SourceLoc::new(path.to_path_buf(), 1, 1);
+    budget.validate(&location)?;
+    let remaining = budget.begin_file(&location)?;
+    let text = read_text(path, remaining, &location)?;
+    budget.bytes(text.len(), &location)?;
+    fold_bounded(path, &text, true, budget)
+}
+
+pub(super) fn read_text(
+    path: &Path,
+    remaining: usize,
+    location: &SourceLoc,
+) -> SpiceResult<String> {
+    let mut file = File::open(path).map_err(|error| SpiceError::io(path, &error))?;
+    let mut bytes = Vec::new();
+    let mut block = [0_u8; 8192];
+    loop {
+        let available = remaining - bytes.len();
+        let width = block.len().min(available.saturating_add(1));
+        let count = match file.read(&mut block[..width]) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(SpiceError::io(path, &error)),
+        };
+        if count > available {
+            return Err(SpiceError::parse(
+                location.clone(),
+                "source byte work limit exceeded",
+            ));
+        }
+        bytes.try_reserve(count).map_err(|error| {
+            SpiceError::parse(
+                location.clone(),
+                format!("allocating source bytes: {error}"),
+            )
+        })?;
+        bytes.extend_from_slice(&block[..count]);
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        SpiceError::parse(location.clone(), format!("source is not UTF-8: {error}"))
+    })
 }
 
 /// Splits text into physical lines, numbering from 1.
@@ -337,23 +405,26 @@ pub fn strip_comment(text: &str, in_control: bool) -> &str {
     text.trim_end()
 }
 
-/// Folds physical lines into a [`Deck`].
+/// Folds caller-trusted physical lines into an owned [`Deck`].
 #[must_use]
 pub fn fold_logical_lines(file: &Path, lines: &[PhysicalLine]) -> Deck {
     fold_lines(
         file,
         lines.iter().map(|line| (line.number, line.text.as_str())),
         true,
+        None,
     )
+    .0
 }
 
 /// The common folding pass borrows physical text until it becomes part of
 /// a logical card. Fragments have no title and need no synthetic first line.
 fn fold_lines<'a>(
     file: &Path,
-    mut lines: impl Iterator<Item = (u32, &'a str)>,
+    lines: impl Iterator<Item = (u32, &'a str)>,
     has_title: bool,
-) -> Deck {
+    budget: Option<&mut SourceBudget>,
+) -> (Deck, Option<SpiceError>) {
     let file: Arc<PathBuf> = Arc::new(file.to_path_buf());
     let mut deck = Deck {
         path: file.as_ref().clone(),
@@ -361,79 +432,135 @@ fn fold_lines<'a>(
         title_location: SourceLoc::new(file.clone(), 1, 1),
         lines: Vec::new(),
     };
+    // Every failure of fold_into originates from the supplied budget. The
+    // trusted input constructors (None) always complete the same traversal.
+    let error = fold_into(&mut deck, &file, lines, has_title, budget).err();
+    (deck, error)
+}
 
-    if has_title && let Some((_, title)) = lines.next() {
-        title.trim_end().clone_into(&mut deck.title);
+struct FoldState<'a> {
+    deck: &'a mut Deck,
+    pending: Option<LogicalLine>,
+    budget: Option<&'a mut SourceBudget>,
+    in_control: bool,
+}
+
+impl FoldState<'_> {
+    fn copy(&mut self, text: &str, location: &SourceLoc) -> SpiceResult<String> {
+        if let Some(budget) = self.budget.as_deref_mut() {
+            budget.card_size(text.len(), location)?;
+            copy_text(text, budget, location)
+        } else {
+            Ok(text.to_owned())
+        }
     }
 
-    let mut pending: Option<LogicalLine> = None;
-    let mut in_control = false;
-
-    for (number, line) in lines {
-        let trimmed = line.trim_start();
-        let begins_control = starts_with_ascii_case(trimmed, ".control");
-        let begins_endc = starts_with_ascii_case(trimmed, ".endc");
-
-        if is_comment_line(line) {
-            // Comments may sit between the continuation lines of a card, so a
-            // comment never terminates the card being built.
-            continue;
+    fn start(&mut self, location: SourceLoc, text: &str) -> SpiceResult<LogicalLine> {
+        if let Some(budget) = self.budget.as_deref_mut() {
+            budget.folded(&location)?;
+            budget.allocation(self.deck.lines.try_reserve(1), &location)?;
         }
+        let text = self.copy(text, &location)?;
+        Ok(LogicalLine::single(location, text))
+    }
 
+    fn flush(&mut self) {
+        if let Some(card) = self.pending.take() {
+            self.deck.lines.push(card);
+        }
+    }
+
+    fn continuation(&mut self, location: SourceLoc, body: &str) -> SpiceResult<()> {
+        if let Some(card) = self.pending.as_mut() {
+            if !body.is_empty() {
+                if let Some(budget) = self.budget.as_deref_mut() {
+                    let extra = body.len().saturating_add(1);
+                    budget.card_size(card.text.len().saturating_add(extra), &location)?;
+                    budget.allocation(card.text.try_reserve(extra), &location)?;
+                }
+                card.text.push(' ');
+                card.source_map
+                    .append(card.text.len(), &location, &mut self.budget)?;
+                card.text.push_str(body);
+            }
+            card.continuations = card.continuations.saturating_add(1);
+            card.end_line = location.line;
+        } else {
+            let card = self.start(location, body)?;
+            self.deck.lines.push(card);
+        }
+        Ok(())
+    }
+
+    fn line(&mut self, file: &Arc<PathBuf>, number: u32, line: &str) -> SpiceResult<()> {
+        if let Some(budget) = self.budget.as_deref_mut() {
+            budget.physical(1, &SourceLoc::new(file.clone(), number, 1))?;
+        }
+        if is_comment_line(line) {
+            return Ok(());
+        }
         if is_continuation(line) {
-            let text = strip_comment(line, in_control);
+            let text = strip_comment(line, self.in_control);
             let tail = text.trim_start().trim_start_matches('+');
             let body = tail.trim();
             let column = text.len() - tail.trim_start().len() + 1;
-            if let Some(card) = pending.as_mut() {
-                if !body.is_empty() {
-                    card.text.push(' ');
-                    card.source_map.append(card.text.len(), number, column);
-                    card.text.push_str(body);
-                }
-                card.continuations += 1;
-                card.end_line = number;
-            } else {
-                // ngspice would reject this while building the card list; there is
-                // no card to attach it to.
-                deck.lines.push(LogicalLine::single(
-                    SourceLoc::new(file.clone(), number, column),
-                    body.to_owned(),
-                ));
-            }
-            continue;
+            return self.continuation(SourceLoc::new(file.clone(), number, column), body);
         }
-
-        let text = strip_comment(line, in_control);
+        let trimmed = line.trim_start();
+        let begins_control = starts_with_ascii_case(trimmed, ".control");
+        let begins_endc = starts_with_ascii_case(trimmed, ".endc");
+        let text = strip_comment(line, self.in_control);
         let column = text.len() - text.trim_start().len() + 1;
         let text = text.trim();
-        if text.is_empty() {
-            // A blank line (or a line holding nothing but a comment) ends the
-            // current card.
-            if let Some(card) = pending.take() {
-                deck.lines.push(card);
-            }
-        } else {
-            if let Some(card) = pending.take() {
-                deck.lines.push(card);
-            }
-            pending = Some(LogicalLine::single(
-                SourceLoc::new(file.clone(), number, column),
-                text.to_owned(),
-            ));
+        self.flush();
+        if !text.is_empty() {
+            self.pending = Some(self.start(SourceLoc::new(file.clone(), number, column), text)?);
         }
-
         if begins_control {
-            in_control = true;
+            self.in_control = true;
         } else if begins_endc {
-            in_control = false;
+            self.in_control = false;
         }
+        Ok(())
     }
+}
 
-    if let Some(card) = pending.take() {
-        deck.lines.push(card);
+fn fold_into<'a, 'b>(
+    deck: &'b mut Deck,
+    file: &Arc<PathBuf>,
+    mut lines: impl Iterator<Item = (u32, &'a str)>,
+    has_title: bool,
+    budget: Option<&'b mut SourceBudget>,
+) -> SpiceResult<()> {
+    let mut state = FoldState {
+        deck,
+        pending: None,
+        budget,
+        in_control: false,
+    };
+    if has_title && let Some((_, title)) = lines.next() {
+        let location = state.deck.title_location.clone();
+        if let Some(budget) = state.budget.as_deref_mut() {
+            budget.physical(1, &location)?;
+        }
+        state.deck.title = state.copy(title.trim_end(), &location)?;
     }
-    deck
+    for (number, line) in lines {
+        state.line(file, number, line)?;
+    }
+    state.flush();
+    Ok(())
+}
+
+/// Bounded source construction. The caller has already charged file visits and bytes.
+pub(super) fn fold_bounded(
+    file: &Path,
+    text: &str,
+    has_title: bool,
+    budget: &mut SourceBudget,
+) -> SpiceResult<Deck> {
+    let (deck, error) = fold_lines(file, numbered_lines(text), has_title, Some(budget));
+    error.map_or(Ok(deck), Err)
 }
 
 /// This deliberately matches prefixes, including the legacy handling of
@@ -443,17 +570,22 @@ fn starts_with_ascii_case(text: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
-/// Splits `text` into a [`Deck`], as if it had been read from `file`.
+/// Constructs a folded [`Deck`] from caller-trusted text.
+///
+/// This low-level constructor does not admit source resources. For potentially
+/// large input use the bounded semantic text/file entrypoints on
+/// [`crate::netlist::Parser`]. Parsing an externally constructed deck still
+/// checks its visible metadata and lexical work.
 #[must_use]
 pub fn parse_deck_text(file: &Path, text: &str) -> Deck {
-    fold_lines(file, numbered_lines(text), true)
+    fold_lines(file, numbered_lines(text), true, None).0
 }
 
 /// Folds an included source fragment without treating its first line as a
 /// title. Physical line numbers and continuation/comment rules are unchanged.
 #[must_use]
 pub fn parse_fragment_text(file: &Path, text: &str) -> Deck {
-    fold_lines(file, numbered_lines(text), false)
+    fold_lines(file, numbered_lines(text), false, None).0
 }
 
 #[cfg(test)]

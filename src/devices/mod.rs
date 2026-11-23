@@ -80,8 +80,8 @@ pub use passive::PassiveParameters;
 pub mod schema;
 pub mod sensitivity;
 pub use models::{
-    DEFAULT_GMIN, DiodeInstanceParameters, DiodeModelParameters, LevelSelection, ModelBackend,
-    ModelContext, ModelFamily, ModelResolver, ResolvedModel,
+    DEFAULT_GMIN, DEFAULT_RELTOL, DiodeInstanceParameters, DiodeModelParameters, LevelSelection,
+    ModelBackend, ModelContext, ModelFamily, ModelResolver, ResolvedModel,
 };
 pub mod ltra;
 pub mod registry;
@@ -119,8 +119,8 @@ pub use state::{
     ACCEPTED_DEPTH, DeviceState, IterationPhase, StateHistory, StateSnapshot, TrialState,
 };
 pub use sweep::{
-    InstanceOverride, MAX_INSTANCE_OVERRIDES, MAX_RESISTOR_OVERRIDES, ResistorMetadata,
-    ResistorOrigin, ResistorOverride,
+    InstanceOverride, InstanceTarget, MAX_INSTANCE_OVERRIDES, MAX_RESISTOR_OVERRIDES,
+    ResistorMetadata, ResistorOrigin, ResistorOverride,
 };
 pub use switch::{Switch, SwitchKind, SwitchState};
 pub use traits::{

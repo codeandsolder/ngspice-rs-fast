@@ -5,10 +5,13 @@ method below was accepted and implemented in M8; it was replaced by a port of
 C's deflated Muller search when faer (which supplied the SVD and QZ) was
 removed. `src/maths/pencil.rs` now ports `CKTpzFindZeros` and its helpers
 (`cktpzstr.c`) with `NIpzSym2`/`NIpzMuller` (`nipzmeth.c`), taking each
-trial's determinant from the SPARSE 1.3 port, and reproduces C's failures
-too: the iteration limit and the "numerical aberrations" warning return the
-roots found so far. Against a `-ffp-contract=off` C build the search is
-bit-identical. The sections [Decision](#decision-finite-generalized-eigenvalues-of-the-modified-pencil),
+trial's determinant from the SPARSE 1.3 port. The later numerical-accuracy
+revision (#91) computes binary-normalized determinants, uses the actual
+conjugate-pair polynomial in deflation, checks convergence independently of
+trial collisions, and bounds root count by the reactive support. Both
+formerly iteration-limited cubic examples now return the complete roots.
+The iteration-limit warning still returns the roots found so far.
+The sections [Decision](#decision-finite-generalized-eigenvalues-of-the-modified-pencil),
 the completeness and accuracy items of [Divergences](#divergences-from-c) and
 the eigenvalue-era error figures describe the M8 method and are kept as the
 historical record; the card, loads, device support, output and CCVS sign
@@ -17,7 +20,7 @@ sections remain current.
 Code: `src/analysis/pz.rs` (card, C's drive/column conventions, plot),
 `src/maths/pencil.rs` (roots of `det(A + s E)`), `Device::assemble_pole_zero`
 (per-device loads). Tests: `tests/pole_zero.rs`, opt-in `tests/c_pole_zero.rs`,
-the `pz_*` goldens in `golden verify` (`multi_analysis_pz` is excluded, see
+the `pz_*` goldens in `golden verify` (including `multi_analysis_pz`, see
 [Verification](#verification)), unit tests in both
 modules.
 
@@ -176,11 +179,76 @@ Golden fixtures (captured once each with `cargo xtask golden capture
 --netlist <name>`; compared as unordered root sets under `compare::POLE_ZERO`,
 `|Rust - C| <= 1e-6 |C| + 1e-9 max|C root|`): `pz_ladder_cur`,
 `pz_bridge_diff`, `pz_transformer`, `pz_cv_loop`, `pz_diode`, `pz_mos1` and the
-batch `multi_analysis_pz` (`.ac`, `.op`, two `.pz`). Since the Muller port,
-`multi_analysis_pz` is excluded from `golden verify` (`EXCLUDED` in
-`xtask/src/commands/verify.rs`): the port matches a `-ffp-contract=off` C build bit
-for bit, which hits the 201-trial limit on the poles and writes an empty `pz2`
-plot, while the committed golden came from the FMA-built reference, whose
-search converges to three poles. See
+batch `multi_analysis_pz` (`.ac`, `.op`, two `.pz`). The historical
+`multi_analysis_pz` exclusion was caused by the no-FMA C search returning
+an empty pole plot. The fixture is now included in `golden verify` with
+its original C golden and tolerance. The accuracy revision instead checks the full numerator
+and denominator root sets in `tests/pole_zero.rs` via independently derived
+cubic residuals and Vieta coefficients. The notch case uses the same
+independent completeness criterion. See
 [VERIFICATION.md](VERIFICATION.md#m8-pole-zero-analysis-103) for the measured
 errors.
+
+### Independently certified HFET2 pole (#91)
+
+The committed `m10_hfet2_pz.raw` and pinned C binary contain only the
+slow pole and two zeros. C prints its iteration-limit warning (209 trials).
+The Rust search additionally finds a drain pole near -1e10 rad/s. To
+distinguish a genuine root from a numerical artifact, expand the determinant
+of the eight-row affine pencil by permutations, with each dumped stamp
+interpreted as an exact binary64 rational. The optional diagnostic
+`analysis::pz::tests::report_hfet2_pole_pencil` emits the original stamps
+as hexadecimal binary64 bits for independent reproduction. Only 11
+permutations contribute. Normalizing the polynomial by its linear
+coefficient yields the ascending coefficients
+
+```text
+ 1.9155254053259393e-4
+ 1
+ 9.9999999859988947e-11
+ 3.9307772294313934e-35
+ 1.4562552973164515e-70
+```
+
+The drain root is -10000000014.000953054..., with normalized determinant
+residual 2.22e-16 at the returned binary64 value. Two further roots lie
+near -2.54402613e24 and -2.69923635e35, outside the existing search range;
+the bounded Muller search does not claim a complete generalized
+eigenspectrum. The very slow root is sensitive to cancellation during
+binary64 stamp assembly (the exact affine-stamp polynomial gives
+-0.0001915525405..., while the rounded search reproduces C's
+-0.0001915532914...). The C rawfile is unchanged. The golden gate requires
+its original root set augmented by the independently certified drain
+pole, and the production-path regression checks that pole separately to
+1e-12 relative accuracy and verifies its polynomial residual. Neither
+missing the extra pole nor returning an arbitrary extra pole is accepted.
+
+### Near-real root acceptance and deflation (#151)
+
+A Muller trial with a small imaginary ordinate is not automatically a
+conjugate pair, nor may it be snapped to the real axis by an arbitrary
+imaginary-to-real magnitude threshold. The search first checks the ordinary
+coincident-root residual, then probes the already-deflated determinant at
+the trial's **real** coordinate and symmetric real displacements. Opposite
+endpoint signs establish a simple real-axis crossing, and the normalized
+first difference supplies a local Newton correction. Same-sign endpoints
+require the vanishing-vertex discriminant of the local quadratic (the
+real repeated-root case); a nonzero vertex residual distinguishes two
+nearby distinct real roots and a genuine lightly damped pair.
+
+The correction must remain within the local bracket and the existing
+convergence neighborhood and reduce the normalized determinant residual.
+A complex candidate that is already a bona fide complex zero is not
+reclassified as real merely because a real zero shares its real coordinate.
+Conversely, an imaginary displacement smaller than one real-coordinate
+binary64 ULP cannot be resolved against an exact real-axis determinant zero
+and is counted once, avoiding artificial conjugate duplication. These
+checks refine accepted roots; normal sampling and Muller's candidate
+generation do not perform determinant probes beyond their existing path.
+
+The regression tests cover a certified HFET2 drain pole, a real notch
+pole contaminated by sub-ULP imaginary noise, true near-real conjugate
+pairs, repeated and distinct close real roots, and coefficient scales
+spanning 24 decimal orders. Existing C golden values and tolerances are
+unchanged. The intentionally bounded search remains bounded; this does
+not claim roots outside its search horizon.

@@ -267,7 +267,8 @@ impl Device for MutualInductance {
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> crate::primitives::SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> crate::primitives::SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Ok(crate::devices::noise::DeviceNoise::Noiseless)
     }
 

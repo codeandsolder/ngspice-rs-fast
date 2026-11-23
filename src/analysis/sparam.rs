@@ -37,9 +37,10 @@ use crate::analysis::results::Variable;
 use crate::analysis::{AnalysisPlan, Plot};
 use crate::devices::Circuit;
 use crate::devices::linear::SourceKind;
-use crate::devices::noise::InstanceNoise;
+use crate::devices::noise::NoisePlan;
 use crate::maths::complex::ComplexLu;
 use crate::maths::dense_complex::DenseComplex;
+use crate::maths::linear::{RHS_BATCH_WIDTH, SolveBatchWorkspace};
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult, filled_vec, parse_spice_number};
 
 /// Resource limits for one retained RF sweep. They bound RF-specific
@@ -123,8 +124,8 @@ impl RfBudget {
         }
         // Thirteen dense port matrices (including constants and inverse
         // scratch); one additional covariance matrix and adjoint block
-        // only for noise. RHS, internal work (sentinel), output, row and
-        // bound impedance coefficient vectors.
+        // only for noise. One bounded RHS tile, four-lane internal work
+        // (including sentinel), output tile, row and impedance vectors.
         let retained = product(&[width, frequencies])?;
         let bias_cells = if bias {
             sum(&[unknowns, observations])?
@@ -143,8 +144,12 @@ impl RfBudget {
             width,
             matrices,
             adjoints,
-            product(&[unknowns, 3])?,
-            1,
+            product(&[unknowns, 2, ports.min(RHS_BATCH_WIDTH)])?,
+            product(&[
+                sum(&[unknowns, 1])?,
+                RHS_BATCH_WIDTH * usize::from(ports >= RHS_BATCH_WIDTH)
+                    + usize::from(!ports.is_multiple_of(RHS_BATCH_WIDTH)),
+            ])?,
             observations,
             product(&[ports, 6 + 2 * usize::from(noise)])?,
         ])?;
@@ -311,19 +316,25 @@ pub(super) fn run(
     let mut plot = parameter_plot(circuit, plan.ports.len(), donoise, plan.budget.width)?;
     plot.reserve_points(plan.grid.len())?;
     let reference = plan.ports[0].z0;
+    let mut noise_plan: Option<NoisePlan<'_>> = None;
     for &f in plan.grid {
         let factor = small_signal.at_frequency(context, f, |system| {
             let factor =
                 crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * f)?
                     .factorize()?;
-            plan.budget
-                .charge_factor(factor.stored_entries()?, plan.ports.len(), plan.noise)?;
+            plan.budget.charge_factor(
+                factor.factor_storage().factor_entries,
+                plan.ports.len(),
+                plan.noise,
+            )?;
             workspace.solve_ports(&plan.ports, &factor, f)?;
             Ok(factor)
         })?;
         workspace.point.clear();
         workspace.point.push(Complex::real(f));
-        workspace.point.extend_from_slice(&workspace.solve.solution);
+        workspace
+            .point
+            .extend_from_slice(workspace.solve.last_solution());
         if !circuit.observations().is_empty() {
             workspace.point.extend(
                 small_signal
@@ -340,22 +351,32 @@ pub(super) fn run(
         }
         workspace.point.push(reference);
         if let Some(noise) = &mut workspace.noise {
-            let generators = crate::devices::noise::prepared_noise(
-                small_signal.prepared(),
-                &context.model_context().with_frequency(f),
-                small_signal.bias(),
-                Some(small_signal.state()),
-            )?;
-            let sources = generators.iter().try_fold(0_usize, |total, instance| {
-                sum(&[total, instance.sources.len()])
-            })?;
-            plan.budget.charge_noise(plan.ports.len(), sources)?;
+            let model = context.model_context().with_frequency(f);
+            let generators = match &mut noise_plan {
+                Some(generators) => {
+                    generators.refresh(
+                        small_signal.prepared(),
+                        &model,
+                        small_signal.bias(),
+                        Some(small_signal.state()),
+                    )?;
+                    generators
+                }
+                None => noise_plan.insert(NoisePlan::bind(
+                    small_signal.prepared(),
+                    &model,
+                    small_signal.bias(),
+                    Some(small_signal.state()),
+                )?),
+            };
+            plan.budget
+                .charge_noise(plan.ports.len(), generators.source_count())?;
             noise.evaluate(
                 circuit,
                 &plan.ports,
                 &factor,
                 &workspace.algebra.y,
-                &generators,
+                generators,
                 &mut workspace.solve,
             )?;
             noise.append_results(
@@ -472,23 +493,37 @@ impl PortAlgebra {
 }
 
 struct SolveBuffers {
+    unknowns: usize,
     rhs: Vec<Complex>,
-    scratch: Vec<Complex>,
+    scratch: SolveBatchWorkspace<Complex>,
     solution: Vec<Complex>,
 }
 
 impl SolveBuffers {
-    fn new(unknowns: usize) -> SpiceResult<Self> {
-        let buffer = |length| filled_vec(length, Complex::ZERO, ".sp solve workspace");
+    fn new(unknowns: usize, ports: usize) -> SpiceResult<Self> {
+        let cells = product(&[unknowns, ports.min(RHS_BATCH_WIDTH)])?;
+        let buffer = || filled_vec(cells, Complex::ZERO, ".sp solve workspace");
         Ok(Self {
-            rhs: buffer(unknowns)?,
-            scratch: buffer(unknowns + 1)?,
-            solution: buffer(unknowns)?,
+            unknowns,
+            rhs: buffer()?,
+            scratch: SolveBatchWorkspace::default(),
+            solution: buffer()?,
         })
     }
 
+    fn prepare(&mut self, count: usize) {
+        self.rhs.resize(self.unknowns * count, Complex::ZERO);
+        self.rhs.fill(Complex::ZERO);
+    }
+
     fn solve(&mut self, factor: &ComplexLu, transpose: bool) -> SpiceResult<()> {
-        factor.solve_into(&self.rhs, &mut self.scratch, &mut self.solution, transpose)
+        factor
+            .solve_batch_into(&self.rhs, &mut self.scratch, &mut self.solution, transpose)
+            .map_err(Into::into)
+    }
+
+    fn last_solution(&self) -> &[Complex] {
+        &self.solution[self.solution.len() - self.unknowns..]
     }
 }
 
@@ -505,7 +540,7 @@ impl RfWorkspace {
         point.clear();
         Ok(Self {
             algebra: PortAlgebra::new(&plan.ports)?,
-            solve: SolveBuffers::new(plan.unknowns)?,
+            solve: SolveBuffers::new(plan.unknowns, plan.ports.len())?,
             point,
             noise: plan
                 .noise
@@ -515,21 +550,26 @@ impl RfWorkspace {
     }
 
     fn solve_ports(&mut self, ports: &[BoundPort], factor: &ComplexLu, f: Real) -> SpiceResult<()> {
-        self.solve.rhs.fill(Complex::ZERO);
-        for (column, driven) in ports.iter().enumerate() {
-            // VSRCspupdate: only the active source branch has a unit RHS.
-            self.solve.rhs[driven.branch] = Complex::real(1.);
+        let n = self.solve.unknowns;
+        for (batch, driven_ports) in ports.chunks(RHS_BATCH_WIDTH).enumerate() {
+            self.solve.prepare(driven_ports.len());
+            for (rhs, driven) in self.solve.rhs.chunks_exact_mut(n).zip(driven_ports) {
+                // VSRCspupdate: only the active source branch has a unit RHS.
+                rhs[driven.branch] = Complex::real(1.);
+            }
             self.solve.solve(factor, false)?;
-            self.solve.rhs[driven.branch] = Complex::ZERO;
-            for (row, port) in ports.iter().enumerate() {
-                let v = port.voltage(&self.solve.solution);
-                let i = -self.solve.solution[port.branch];
-                self.algebra
-                    .incident
-                    .set(row, column, port.ki * (v + port.z0 * i))?;
-                self.algebra
-                    .scattered
-                    .set(row, column, port.ki * (v - port.z0 * i))?;
+            for (lane, solution) in self.solve.solution.chunks_exact(n).enumerate() {
+                let column = batch * RHS_BATCH_WIDTH + lane;
+                for (row, port) in ports.iter().enumerate() {
+                    let v = port.voltage(solution);
+                    let i = -solution[port.branch];
+                    self.algebra
+                        .incident
+                        .set(row, column, port.ki * (v + port.z0 * i))?;
+                    self.algebra
+                        .scattered
+                        .set(row, column, port.ki * (v - port.z0 * i))?;
+                }
             }
         }
         self.algebra.calculate(f)
@@ -694,52 +734,57 @@ impl NoiseWorkspace {
         ports: &[BoundPort],
         factor: &ComplexLu,
         y: &DenseComplex,
-        generators: &[InstanceNoise],
+        generators: &NoisePlan<'_>,
         solve: &mut SolveBuffers,
     ) -> SpiceResult<()> {
-        let count = ports.len();
         let n = circuit.unknown_count();
-        // Preserve original assignment order even for coincident terminals.
-        for (port, adjoint) in ports.iter().zip(self.adjoints.chunks_exact_mut(n)) {
-            solve.rhs.fill(Complex::ZERO);
-            if let Some(row) = port.positive {
-                solve.rhs[row] = Complex::real(1.);
-            }
-            if let Some(row) = port.negative {
-                solve.rhs[row] = Complex::real(-1.);
+        for (tile, adjoints) in ports
+            .chunks(RHS_BATCH_WIDTH)
+            .zip(self.adjoints.chunks_mut(n * RHS_BATCH_WIDTH))
+        {
+            solve.prepare(tile.len());
+            // Preserve original assignment order even for coincident terminals.
+            for (rhs, port) in solve.rhs.chunks_exact_mut(n).zip(tile) {
+                if let Some(row) = port.positive {
+                    rhs[row] = Complex::real(1.);
+                }
+                if let Some(row) = port.negative {
+                    rhs[row] = Complex::real(-1.);
+                }
             }
             solve.solve(factor, true)?;
-            adjoint.copy_from_slice(&solve.solution);
+            adjoints.copy_from_slice(&solve.solution);
         }
         self.cy.clear();
-        for instance in generators {
-            for source in &instance.sources {
-                let Some(amplitude) = source.kind.rf_amplitude()? else {
+        for (_, sources) in generators.instances() {
+            for source in sources {
+                let Some(amplitude) = source.rf_amplitude()? else {
                     continue;
                 };
-                // Bind the two node rows once per generator, not per port.
-                let rows = source.nodes.map(|node| circuit.unknowns().node_row(node));
                 for (voltage, adjoint) in self.voltage.iter_mut().zip(self.adjoints.chunks_exact(n))
                 {
-                    let at = |row: Option<usize>| row.map_or(Complex::ZERO, |r| adjoint[r]);
-                    *voltage = (at(rows[0]) - at(rows[1])) * Complex::real(amplitude);
+                    *voltage = source.transfer(adjoint) * Complex::real(amplitude);
                 }
-                for (i, current) in self.current.iter_mut().enumerate() {
+                // The Y schema already guarantees N×N shape. Traverse its
+                // actual row-major cells instead of rediscovering checked
+                // coordinates for every independent noise generator.
+                for (i, (current, y_row)) in self
+                    .current
+                    .iter_mut()
+                    .zip(y.data().chunks_exact(ports.len().max(1)))
+                    .enumerate()
+                {
                     *current = self.voltage[i] * ports[i].inverse_z0;
-                    for (j, v) in self.voltage.iter().enumerate() {
-                        *current = *current + y.get(i, j).unwrap_or(Complex::ZERO) * *v;
+                    for (&admittance, &v) in y_row.iter().zip(&self.voltage) {
+                        *current = *current + admittance * v;
                     }
                 }
-                for i in 0..count {
-                    for j in 0..count {
-                        self.cy.set(
-                            i,
-                            j,
-                            self.cy.get(i, j).unwrap_or(Complex::ZERO)
-                                + self.current[i] * self.current[j].conj(),
-                        )?;
-                    }
+                // The voltage workspace is dead after computing this source's
+                // port currents; reuse it for the conjugated covariance row.
+                for (conjugate, current) in self.voltage.iter_mut().zip(&self.current) {
+                    *conjugate = current.conj();
                 }
+                self.cy.add_outer(&self.current, &self.voltage)?;
             }
         }
         Ok(())
@@ -866,7 +911,7 @@ mod tests {
         // Exact numeric bytes including retained bias, extra observations,
         // ports, row, thirteen algebra matrices and covariance, RHS/work/
         // result, two adjacent adjoints and noise scratch.
-        let cells = 3 * 29 + 7 + 29 + 14 * 4 + 2 * 6 + 3 * 6 + 1 + 1 + 8 * 2;
+        let cells = 3 * 29 + 7 + 29 + 14 * 4 + 2 * 6 + 2 * 2 * 6 + 7 + 1 + 8 * 2;
         let bytes = cells * std::mem::size_of::<Complex>();
         assert!(
             RfBudget::preflight(

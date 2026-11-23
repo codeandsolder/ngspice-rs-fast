@@ -154,12 +154,20 @@ pub struct AnalysisContext {
     /// default [`crate::devices::DEFAULT_GMIN`]. See
     /// [`crate::devices::ModelContext::gmin`].
     pub gmin: Real,
+    /// Resolved circuit relative tolerance (C `CKTreltol`). Device preparation
+    /// uses this value even when the analysis has a local Newton override.
+    pub reltol: Real,
     /// SPARSE pivot thresholds of the circuit matrix (`.option pivtol`/
     /// `pivrel`, C `CKTpivotAbsTol`/`CKTpivotRelTol`), default
     /// [`crate::maths::PivotTolerances::DEFAULT`].
     pub pivot: crate::maths::PivotTolerances,
     /// Limits for retained RF sweeps and their port algebra.
     pub rf_limits: crate::analysis::RfLimits,
+    /// Optional topology-bound numeric candidate overrides. Only the typed
+    /// resistor/instance replacement slots are copied to a model context;
+    /// temperature, gmin, pivot and tolerances remain this analysis's settings.
+    /// No effect unless explicitly supplied by an optimization candidate.
+    pub candidate_model_overrides: Option<crate::devices::ModelContext>,
 }
 
 impl AnalysisContext {
@@ -168,9 +176,29 @@ impl AnalysisContext {
     /// global state is used.
     #[must_use]
     pub const fn model_context(&self) -> crate::devices::ModelContext {
-        crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
-            .with_gmin(self.gmin)
-            .with_pivot_tolerances(self.pivot)
+        let mut context =
+            crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
+                .with_gmin(self.gmin)
+                .with_reltol(self.reltol)
+                .with_pivot_tolerances(self.pivot);
+        if let Some(overrides) = self.candidate_model_overrides {
+            context.resistor_overrides = overrides.resistor_overrides;
+            context.instance_overrides = overrides.instance_overrides;
+        }
+        context
+    }
+
+    /// Install one candidate's validated typed overrides for all analysis
+    /// drivers, including nonlinear Newton loads and output observations.
+    /// Changing frequency, temperature or tolerances on the analysis still
+    /// takes precedence over scalar settings in the supplied model context.
+    #[must_use]
+    pub const fn with_candidate_model_overrides(
+        mut self,
+        overrides: crate::devices::ModelContext,
+    ) -> Self {
+        self.candidate_model_overrides = Some(overrides);
+        self
     }
 }
 
@@ -180,8 +208,10 @@ impl Default for AnalysisContext {
             temperature: 27.0,
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
+            reltol: crate::devices::DEFAULT_RELTOL,
             pivot: crate::maths::PivotTolerances::DEFAULT,
             rf_limits: crate::analysis::RfLimits::default(),
+            candidate_model_overrides: None,
         }
     }
 }

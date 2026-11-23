@@ -217,41 +217,149 @@ impl Matrix {
             shape: self.shape.transpose(),
             data: filled_vec(self.len(), 0.0, "dense matrix transpose")?,
         };
-        if self.is_empty() {
-            return Ok(result);
+        self.write_transposed(&mut result.data);
+        Ok(result)
+    }
+
+    /// Transpose into existing storage without allocating.
+    ///
+    /// # Errors
+    /// [`SpiceError::Numerical`] when output dimensions are not transposed.
+    /// Shape mismatch leaves the destination unchanged.
+    pub fn transpose_into(&self, output: &mut Self) -> SpiceResult<()> {
+        if output.shape != self.shape.transpose() {
+            return Err(SpiceError::Numerical {
+                context: "dense matrix transpose".to_owned(),
+                message: format!(
+                    "expected {}x{} destination, got {}x{}",
+                    self.cols(),
+                    self.rows(),
+                    output.rows(),
+                    output.cols(),
+                ),
+            });
         }
-        for row in 0..self.shape.rows {
-            for col in 0..self.shape.cols {
-                result.data[col * self.shape.rows + row] = self.data[row * self.shape.cols + col];
+        self.write_transposed(&mut output.data);
+        Ok(())
+    }
+
+    fn write_transposed(&self, output: &mut [Real]) {
+        const TILE: usize = 32;
+        if self.is_empty() {
+            return;
+        }
+        let rows = self.rows();
+        let cols = self.cols();
+        if rows == 1 || cols == 1 {
+            output.copy_from_slice(&self.data);
+            return;
+        }
+
+        // A tiny matrix fits in a fraction of a cache line tile; avoid
+        // setting up blocked destination traversal for a handful of stores.
+        if self.len() <= TILE {
+            for (row, source) in self.data.chunks_exact(cols).enumerate() {
+                for (col, value) in source.iter().enumerate() {
+                    output[col * rows + row] = *value;
+                }
+            }
+            return;
+        }
+
+        // With one row tile, whole destination columns are contiguous.
+        if rows <= TILE {
+            for (col, column) in output.chunks_exact_mut(rows).enumerate() {
+                for (destination, source) in column.iter_mut().zip(self.data.chunks_exact(cols)) {
+                    *destination = source[col];
+                }
+            }
+            return;
+        }
+
+        // Bound the working set of the source and destination tiles to
+        // 16 KiB of coefficients, with contiguous destination writes.
+        for col_start in (0..cols).step_by(TILE) {
+            let col_end = (col_start + TILE).min(cols);
+            let output_columns = &mut output[col_start * rows..col_end * rows];
+            for row_start in (0..rows).step_by(TILE) {
+                let row_end = (row_start + TILE).min(rows);
+                let input_rows = &self.data[row_start * cols..row_end * cols];
+                for (offset, column) in output_columns.chunks_exact_mut(rows).enumerate() {
+                    let col = col_start + offset;
+                    for (destination, source) in column[row_start..row_end]
+                        .iter_mut()
+                        .zip(input_rows.chunks_exact(cols))
+                    {
+                        *destination = source[col];
+                    }
+                }
             }
         }
-        Ok(result)
     }
 
     /// Matrix–vector product.
     ///
     /// # Errors
-    ///
     /// [`SpiceError::Numerical`] when the dimensions do not agree or output storage cannot be allocated.
     pub fn mul_vector(&self, vector: &Vector) -> SpiceResult<Vector> {
-        if vector.len() != self.shape.cols {
-            return Err(length_error(self.shape.cols, vector.len()));
+        if vector.len() != self.cols() {
+            return Err(length_error(self.cols(), vector.len()));
         }
-        let mut result = Vector::from(filled_vec(self.shape.rows, 0.0, "dense matrix product")?);
-        if self.shape.cols != 0 {
-            for (row, output) in self
-                .data
-                .chunks_exact(self.shape.cols)
-                .zip(result.as_mut_slice())
-            {
-                let mut sum = 0.0;
-                for (entry, value) in row.iter().zip(vector.as_slice()) {
-                    sum += entry * value;
-                }
-                *output = sum;
-            }
-        }
+        let mut result = Vector::from(filled_vec(self.rows(), 0.0, "dense matrix product")?);
+        self.write_product(vector.as_slice(), result.as_mut_slice());
         Ok(result)
+    }
+
+    /// Matrix–vector product into existing storage without allocating.
+    ///
+    /// # Errors
+    /// [`SpiceError::Numerical`] when either vector has the wrong length.
+    /// A dimension mismatch leaves the destination unchanged.
+    pub fn mul_vector_into(&self, vector: &Vector, output: &mut Vector) -> SpiceResult<()> {
+        if vector.len() != self.cols() {
+            return Err(length_error(self.cols(), vector.len()));
+        }
+        if output.len() != self.rows() {
+            return Err(length_error(self.rows(), output.len()));
+        }
+        self.write_product(vector.as_slice(), output.as_mut_slice());
+        Ok(())
+    }
+
+    fn write_product(&self, vector: &[Real], output: &mut [Real]) {
+        let cols = self.cols();
+        if cols == 0 {
+            output.fill(0.0);
+            return;
+        }
+        // Four independent row accumulators expose instruction-level
+        // parallelism and packed arithmetic to LLVM. Each output still adds
+        // the individually rounded products in the original column order.
+        let (groups, tail) = output.as_chunks_mut::<4>();
+        let mut data = self.data.as_slice();
+        for group in groups {
+            let (first, rest) = data.split_at(cols);
+            let (second, rest) = rest.split_at(cols);
+            let (third, rest) = rest.split_at(cols);
+            let (fourth, rest) = rest.split_at(cols);
+            data = rest;
+            let mut sums = [0.0; 4];
+            for ((((first, second), third), fourth), coefficient) in
+                first.iter().zip(second).zip(third).zip(fourth).zip(vector)
+            {
+                sums[0] += first * coefficient;
+                sums[1] += second * coefficient;
+                sums[2] += third * coefficient;
+                sums[3] += fourth * coefficient;
+            }
+            *group = sums;
+        }
+        for (row, destination) in data.chunks_exact(cols).zip(tail) {
+            *destination = row
+                .iter()
+                .zip(vector)
+                .fold(0.0, |sum, (entry, value)| sum + entry * value);
+        }
     }
 
     /// Factors a snapshot without changing row-major storage.
@@ -408,21 +516,21 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<V
                 let tangent_squared = tangent * tangent;
                 let cosine = 1.0 / (tangent_squared + 1.0).sqrt();
                 let sine = tangent * cosine;
-                for index in 0..order {
-                    let first_slot = index * order + first;
-                    let second_slot = index * order + second;
-                    let (left, right) =
-                        rotate_pair(data[first_slot], data[second_slot], cosine, sine);
-                    data[first_slot] = left;
-                    data[second_slot] = right;
+                // The column rotation is strided but each row is independent.
+                for row in data.chunks_exact_mut(order) {
+                    let (left, right) = rotate_pair(row[first], row[second], cosine, sine);
+                    row[first] = left;
+                    row[second] = right;
                 }
-                for index in 0..order {
-                    let first_slot = first * order + index;
-                    let second_slot = second * order + index;
-                    let (left, right) =
-                        rotate_pair(data[first_slot], data[second_slot], cosine, sine);
-                    data[first_slot] = left;
-                    data[second_slot] = right;
+                // The subsequent row rotation operates on two disjoint
+                // contiguous slices. Preserve its original order and
+                // separate products, permitting packed element operations.
+                let (before, after) = data.split_at_mut(second * order);
+                let first_row = &mut before[first * order..][..order];
+                let second_row = &mut after[..order];
+                for (first_entry, second_entry) in first_row.iter_mut().zip(second_row) {
+                    (*first_entry, *second_entry) =
+                        rotate_pair(*first_entry, *second_entry, cosine, sine);
                 }
             }
         }

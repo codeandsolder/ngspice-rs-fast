@@ -52,7 +52,7 @@ card 6 @netlists/m10_hfet1_pz.cir:7:1 lines=7-7 continuations=0
   token 8 7:21 number "1u" value=1e-6
   token 9 7:24 word "w"
   token 10 7:25 equals "="
-  token 11 7:26 number "20u" value=1.9999999999999998e-5
+  token 11 7:26 number "20u" value=2e-5
 card 7 @netlists/m10_hfet1_pz.cir:8:1 lines=8-9 continuations=1
   raw: ".model hfet nhfet level=5 rd=31 rs=31 rg=10 ri=1e3 rf=2e3 rdi=50 rsi=50 js1s=1e-12 js1d=1e-12"
   kind: dot(.model)

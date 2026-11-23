@@ -132,7 +132,7 @@ card 10 @parser/passive_elaboration.cir:11:1 lines=11-11 continuations=0
   token 4 11:11 word "cg"
   token 5 11:14 word "l"
   token 6 11:15 equals "="
-  token 7 11:16 number "10u" value=9.999999999999999e-6
+  token 7 11:16 number "10u" value=1e-5
   token 8 11:20 word "w"
   token 9 11:21 equals "="
   token 10 11:22 number "6u" value=6e-6
@@ -291,7 +291,7 @@ card 20 @parser/passive_elaboration.cir:21:1 lines=21-21 continuations=0
   token 7 21:16 number "2m" value=2e-3
   token 8 21:19 word "cjsw"
   token 9 21:23 equals "="
-  token 10 21:24 number "3n" value=3.0000000000000004e-9
+  token 10 21:24 number "3n" value=3e-9
   token 11 21:27 word "defw"
   token 12 21:31 equals "="
   token 13 21:32 number "8u" value=8e-6

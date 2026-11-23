@@ -17,6 +17,7 @@ use std::fmt;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
+use crate::netlist::source::budget::{SourceBudget, SourceLimits, copy_text};
 use crate::netlist::source::{LogicalLine, SourceMap, SourcePosition};
 
 /// What kind of token this is.
@@ -83,14 +84,15 @@ pub struct Token {
 impl Token {
     fn new(
         kind: TokenKind,
-        text: impl Into<String>,
+        text: String,
         line: &LogicalLine,
         raw_offset: usize,
+        location: SourceLoc,
     ) -> Self {
         Self {
             kind,
-            text: text.into(),
-            location: line.location_at(raw_offset),
+            text,
+            location,
             raw_offset,
             source_map: line.source_map.clone(),
         }
@@ -134,107 +136,106 @@ const DELIMITERS: &[u8] = b"(),={}\"'";
 /// Returns [`SpiceError::Parse`] for an unterminated `{` expression, an
 /// unmatched `}` or an unterminated quoted string.
 pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
+    tokenize_bounded(line, &mut SourceBudget::new(SourceLimits::default()))
+}
+
+pub(super) fn tokenize_bounded(
+    line: &LogicalLine,
+    budget: &mut SourceBudget,
+) -> SpiceResult<Vec<Token>> {
+    budget.card_size(line.text.len(), &line.location)?;
     let text = line.text.as_str();
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
-
     while index < bytes.len() {
         if bytes[index].is_ascii_whitespace() {
             index += 1;
             continue;
         }
-
-        let start = index;
-        let location = || line.location_at(start);
-
-        match bytes[index] {
-            b'(' => {
-                tokens.push(Token::new(TokenKind::LParen, "(", line, start));
-                index += 1;
-            }
-            b')' => {
-                tokens.push(Token::new(TokenKind::RParen, ")", line, start));
-                index += 1;
-            }
-            b',' => {
-                tokens.push(Token::new(TokenKind::Comma, ",", line, start));
-                index += 1;
-            }
-            b'=' => {
-                tokens.push(Token::new(TokenKind::Equals, "=", line, start));
-                index += 1;
-            }
-            b'{' => {
-                let Some(end) = find_closing_brace(bytes, index) else {
-                    return Err(SpiceError::parse(
-                        location(),
-                        "unterminated '{' expression on this card",
-                    ));
-                };
-                let inner = text[index + 1..end].trim().to_owned();
-                tokens.push(Token::new(
-                    TokenKind::Expression(inner),
-                    &text[index..=end],
-                    line,
-                    start,
-                ));
-                index = end + 1;
-            }
-            b'}' => {
-                return Err(SpiceError::parse(
-                    location(),
-                    "unmatched '}' without an opening '{' on this card",
-                ));
-            }
-            quote @ (b'"' | b'\'') => {
-                let quote = quote as char;
-                let content_start = index + 1;
-                let mut characters = text[content_start..].char_indices();
-                let mut value = String::new();
-                let mut end = None;
-                while let Some((offset, character)) = characters.next() {
-                    if character == '\\'
-                        && let Some((_, escaped)) = characters.next()
-                    {
-                        value.push(escaped);
-                        continue;
-                    }
-                    if character == quote {
-                        end = Some(content_start + offset + character.len_utf8());
-                        break;
-                    }
-                    value.push(character);
-                }
-                let Some(cursor) = end else {
-                    return Err(SpiceError::parse(
-                        location(),
-                        format!("unterminated {quote} quoted string on this card"),
-                    ));
-                };
-                tokens.push(Token::new(
-                    TokenKind::Quoted(value),
-                    &text[index..cursor],
-                    line,
-                    start,
-                ));
-                index = cursor;
-            }
-            _ => {
-                while index < bytes.len()
-                    && !bytes[index].is_ascii_whitespace()
-                    && !DELIMITERS.contains(&bytes[index])
-                {
-                    index += 1;
-                }
-                let word = &text[start..index];
-                let kind = parse_spice_number(word).map_or(TokenKind::Word, TokenKind::Number);
-                tokens.push(Token::new(kind, word, line, start));
-            }
-        }
+        let location = line.location_at(index);
+        budget.tokens(1, &location)?;
+        budget.allocation(tokens.try_reserve(1), &location)?;
+        let (kind, end) = scan_token(text, index, budget, &location)?;
+        let spelling = copy_text(&text[index..end], budget, &location)?;
+        tokens.push(Token::new(kind, spelling, line, index, location));
+        index = end;
     }
-
     Ok(tokens)
+}
+
+fn scan_token(
+    text: &str,
+    start: usize,
+    budget: &mut SourceBudget,
+    location: &SourceLoc,
+) -> SpiceResult<(TokenKind, usize)> {
+    let bytes = text.as_bytes();
+    let kind = match bytes[start] {
+        b'(' => TokenKind::LParen,
+        b')' => TokenKind::RParen,
+        b',' => TokenKind::Comma,
+        b'=' => TokenKind::Equals,
+        b'{' => {
+            let end = find_closing_brace(bytes, start).ok_or_else(|| {
+                SpiceError::parse(location.clone(), "unterminated '{' expression on this card")
+            })?;
+            let inner = copy_text(text[start + 1..end].trim(), budget, location)?;
+            return Ok((TokenKind::Expression(inner), end + 1));
+        }
+        b'}' => {
+            return Err(SpiceError::parse(
+                location.clone(),
+                "unmatched '}' without an opening '{' on this card",
+            ));
+        }
+        quote @ (b'"' | b'\'') => {
+            return scan_quoted(text, start, char::from(quote), budget, location);
+        }
+        _ => {
+            let mut end = start + 1;
+            while end < bytes.len()
+                && !bytes[end].is_ascii_whitespace()
+                && !DELIMITERS.contains(&bytes[end])
+            {
+                end += 1;
+            }
+            let word = &text[start..end];
+            let kind = parse_spice_number(word).map_or(TokenKind::Word, TokenKind::Number);
+            return Ok((kind, end));
+        }
+    };
+    Ok((kind, start + 1))
+}
+
+fn scan_quoted(
+    text: &str,
+    start: usize,
+    quote: char,
+    budget: &mut SourceBudget,
+    location: &SourceLoc,
+) -> SpiceResult<(TokenKind, usize)> {
+    let content_start = start + 1;
+    let mut characters = text[content_start..].char_indices();
+    let mut value = String::new();
+    while let Some((offset, character)) = characters.next() {
+        let decoded = if character == '\\' {
+            characters.next().map_or(character, |(_, escaped)| escaped)
+        } else if character == quote {
+            return Ok((
+                TokenKind::Quoted(value),
+                content_start + offset + character.len_utf8(),
+            ));
+        } else {
+            character
+        };
+        budget.allocation(value.try_reserve(decoded.len_utf8()), location)?;
+        value.push(decoded);
+    }
+    Err(SpiceError::parse(
+        location.clone(),
+        format!("unterminated {quote} quoted string on this card"),
+    ))
 }
 
 /// Finds the `}` matching the `{` at `open`, accounting for nesting.

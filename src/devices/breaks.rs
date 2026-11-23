@@ -25,25 +25,120 @@ use super::pulse::cycle_position;
 use crate::devices::{LinearSystem, SourceKind, TransientTiming, Waveform};
 use crate::primitives::{Real, SpiceError, SpiceResult, almost_equal_ulps};
 
-/// C's breakpoint table `CKTbreaks`: sorted times, always at least two
-/// entries, the last of which is the final time until the run passes it.
-#[derive(Debug, Clone, PartialEq)]
+/// Numeric key within one ascending run of the table. Most of a transient
+/// uses only the first run. C's two-entry clear can append the final-time
+/// sentinel behind a later event; the second run represents that inversion
+/// without sorting it away or reverting to a linear scan.
+#[derive(Debug, Clone, Copy)]
+struct EventKey {
+    after_terminal: bool,
+    time: Real,
+}
+
+impl EventKey {
+    const fn new(time: Real, after_terminal: bool) -> Self {
+        // C compares signed zeros equal. Preserve their original bits in the
+        // bucket, while giving both the same numeric search key.
+        Self {
+            after_terminal,
+            time: if time.to_bits() << 1 == 0 { 0. } else { time },
+        }
+    }
+}
+
+impl PartialEq for EventKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for EventKey {}
+impl PartialOrd for EventKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for EventKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        #[cfg(test)]
+        tests::KEY_COMPARISONS.with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            }
+        });
+        self.after_terminal
+            .cmp(&other.after_terminal)
+            .then_with(|| self.time.total_cmp(&other.time))
+    }
+}
+
+/// Equal numeric events in insertion order. The common singleton requires
+/// no separate allocation. Duplicates preserve distinct signed-zero bits.
+#[derive(Debug, Clone)]
+struct Events {
+    first: Real,
+    rest: std::collections::VecDeque<Real>,
+}
+
+impl Events {
+    const fn new(first: Real) -> Self {
+        Self {
+            first,
+            rest: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn last(&self) -> Real {
+        self.rest.back().copied().unwrap_or(self.first)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Real> + '_ {
+        std::iter::once(self.first).chain(self.rest.iter().copied())
+    }
+}
+
+/// C's breakpoint table `CKTbreaks`: at least two entries, normally ascending.
+///
+/// Lookup and removal use the ordered index rather than scanning or shifting
+/// the pending events. Equal entries and the terminal sentinel retain C order.
+#[derive(Debug, Clone)]
 pub struct BreakTable {
-    breaks: Vec<Real>,
+    breaks: std::collections::BTreeMap<EventKey, Events>,
+    len: usize,
     min_break: Real,
     final_time: Real,
+}
+
+impl PartialEq for BreakTable {
+    fn eq(&self, other: &Self) -> bool {
+        (self.min_break, self.final_time, self.len).eq(&(
+            other.min_break,
+            other.final_time,
+            other.len,
+        )) && self.times().eq(other.times())
+    }
 }
 
 impl BreakTable {
     /// `dctran.c`'s initial table `{0, CKTfinalTime}` with merge distance
     /// `min_break` (`CKTminBreak`).
-    #[must_use]
-    pub fn new(final_time: Real, min_break: Real) -> Self {
-        Self {
-            breaks: vec![0., final_time],
+    /// # Errors
+    /// Nonfinite or negative final time or merge distance.
+    pub fn new(final_time: Real, min_break: Real) -> SpiceResult<Self> {
+        if !(final_time.is_finite() && final_time >= 0. && min_break.is_finite() && min_break >= 0.)
+        {
+            return Err(SpiceError::circuit(
+                "invalid final time or breakpoint merge distance",
+            ));
+        }
+        let mut table = Self {
+            breaks: std::collections::BTreeMap::new(),
+            len: 0,
             min_break,
             final_time,
-        }
+        };
+        table.insert(0., false);
+        table.insert(final_time, false);
+        Ok(table)
     }
 
     /// `CKTminBreak`.
@@ -55,26 +150,77 @@ impl BreakTable {
     /// `CKTbreaks[0]`, the next breakpoint.
     #[must_use]
     pub fn first(&self) -> Real {
-        self.breaks[0]
+        self.breaks
+            .first_key_value()
+            .map_or(self.final_time, |(_, events)| events.first)
     }
 
     /// `CKTbreaks[1]`, the breakpoint after the next.
     #[must_use]
     pub fn second(&self) -> Real {
-        self.breaks[1]
+        self.times().nth(1).unwrap_or(self.final_time)
     }
 
-    /// The whole table, ascending.
+    /// Borrow the event order (including duplicate sentinels); no snapshot
+    /// allocation is needed to inspect or iterate the pending table.
+    pub fn times(&self) -> impl Iterator<Item = Real> + '_ {
+        self.breaks.values().flat_map(Events::iter)
+    }
+
+    /// The pending entry count, including both terminal sentinel entries.
     #[must_use]
-    pub fn times(&self) -> &[Real] {
-        &self.breaks
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// A valid breakpoint table always has at least two entries.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn insert(&mut self, time: Real, after_terminal: bool) {
+        self.breaks
+            .entry(EventKey::new(time, after_terminal))
+            .and_modify(|events| events.rest.push_back(time))
+            .or_insert_with(|| Events::new(time));
+        self.len += 1;
+    }
+
+    fn remove_first_of(&mut self, key: EventKey) {
+        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.breaks.entry(key) {
+            let events = entry.get_mut();
+            if let Some(next) = events.rest.pop_front() {
+                events.first = next;
+            } else {
+                entry.remove();
+            }
+            self.len -= 1;
+        }
+    }
+
+    /// The first strictly greater entry in sequence order (not necessarily
+    /// the globally smallest greater time after C's terminal inversion).
+    fn successor(&self, time: Real) -> Option<(EventKey, Real)> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        self.breaks
+            .range((
+                Excluded(EventKey::new(time, false)),
+                Included(EventKey::new(Real::INFINITY, false)),
+            ))
+            .next()
+            .or_else(|| {
+                self.breaks
+                    .range((Excluded(EventKey::new(time, true)), Unbounded))
+                    .next()
+            })
+            .map(|(&key, events)| (key, events.first))
     }
 
     /// `CKTsetBreak(ckt, time)` with `CKTtime = now`.
     ///
-    /// A request within 3 ULPs of `now` is ignored. Requests within
-    /// `CKTminBreak` of an existing entry merge into the earlier of the two.
-    ///
+    /// A request within 3 ULPs of `now` is ignored. Preserve C's successor-
+    /// first merge priority, even if the predecessor is an exact duplicate.
     /// # Errors
     /// `time` is in the past (C: "breakpoint in the past - HELP!") or not finite.
     pub fn set(&mut self, now: Real, time: Real) -> SpiceResult<()> {
@@ -87,38 +233,49 @@ impl BreakTable {
                 message: format!("breakpoint {time:e} in the past (time {now:e})"),
             });
         }
-        for i in 0..self.breaks.len() {
-            if self.breaks[i] > time {
-                if self.breaks[i] - time <= self.min_break {
-                    // Very close together: take the earlier point.
-                    self.breaks[i] = time;
-                    return Ok(());
-                }
-                if i > 0 && time - self.breaks[i - 1] <= self.min_break {
-                    // Very close together, but after: skip.
-                    return Ok(());
-                }
-                self.breaks.insert(i, time);
-                return Ok(());
+        if let Some((key, successor)) = self.successor(time) {
+            if successor - time <= self.min_break {
+                // Replace exactly the first occurrence of the successor.
+                self.remove_first_of(key);
+                self.insert(time, key.after_terminal);
+            } else if !self
+                .breaks
+                .range(..key)
+                .next_back()
+                .is_some_and(|(_, events)| time - events.last() <= self.min_break)
+            {
+                self.insert(time, key.after_terminal);
             }
-        }
-        if let Some(last) = self.breaks.last()
-            && time - last <= self.min_break
+        } else if let Some((&key, events)) = self.breaks.last_key_value()
+            && time - events.last() > self.min_break
         {
-            return Ok(());
+            self.insert(time, key.after_terminal);
         }
-        self.breaks.push(time);
         Ok(())
     }
 
     /// `CKTclrBreak`: drops the first entry; a two-entry table becomes
-    /// `{CKTbreaks[1], CKTfinalTime}`.
+    /// `{CKTbreaks[1], CKTfinalTime}`, even if that reverses the order.
     pub fn clear(&mut self) {
-        if self.breaks.len() > 2 {
-            self.breaks.remove(0);
-        } else {
-            self.breaks[0] = self.breaks[1];
-            self.breaks[1] = self.final_time;
+        if let Some((&key, _)) = self.breaks.first_key_value() {
+            self.remove_first_of(key);
+        }
+        if self.len == 1
+            && let Some((&key, events)) = self.breaks.first_key_value()
+        {
+            let next = events.first;
+            if next > self.final_time {
+                // Re-establish at most one inversion. A lone event from the
+                // second run becomes the first run before appending the
+                // (smaller) sentinel.
+                if key.after_terminal {
+                    self.remove_first_of(key);
+                    self.insert(next, false);
+                }
+                self.insert(self.final_time, true);
+            } else {
+                self.insert(self.final_time, key.after_terminal);
+            }
         }
     }
 }
@@ -381,35 +538,257 @@ impl Request<'_> {
 mod tests {
     use super::*;
 
+    std::thread_local! {
+        pub(super) static KEY_COMPARISONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The former C-order vector implementation, including the terminal
+    /// inversion and exact comparisons. Independent oracle, not production.
+    struct Reference {
+        times: Vec<Real>,
+        final_time: Real,
+        min_break: Real,
+        visits: usize,
+        shifts: usize,
+    }
+
+    impl Reference {
+        fn new(final_time: Real, min_break: Real) -> Self {
+            Self {
+                times: vec![0., final_time],
+                final_time,
+                min_break,
+                visits: 0,
+                shifts: 0,
+            }
+        }
+
+        fn set(&mut self, now: Real, time: Real) -> bool {
+            if almost_equal_ulps(time, now, 3) {
+                return true;
+            }
+            if now > time || !time.is_finite() {
+                return false;
+            }
+            for i in 0..self.times.len() {
+                self.visits += 1;
+                if self.times[i] > time {
+                    if self.times[i] - time <= self.min_break {
+                        self.times[i] = time;
+                        return true;
+                    }
+                    if i > 0 && time - self.times[i - 1] <= self.min_break {
+                        return true;
+                    }
+                    self.shifts += self.times.len() - i;
+                    self.times.insert(i, time);
+                    return true;
+                }
+            }
+            if self
+                .times
+                .last()
+                .is_none_or(|last| time - last > self.min_break)
+            {
+                self.times.push(time);
+            }
+            true
+        }
+
+        fn clear(&mut self) {
+            if self.times.len() > 2 {
+                self.shifts += self.times.len() - 1;
+                self.times.remove(0);
+            } else {
+                self.times[0] = self.times[1];
+                self.times[1] = self.final_time;
+            }
+        }
+
+        fn compare(&self, table: &BreakTable) {
+            assert_eq!(table.len(), self.times.len());
+            assert_eq!(table.first().to_bits(), self.times[0].to_bits());
+            assert_eq!(table.second().to_bits(), self.times[1].to_bits());
+            assert!(
+                table
+                    .times()
+                    .map(Real::to_bits)
+                    .eq(self.times.iter().map(|x| x.to_bits())),
+                "indexed: {:?}; reference: {:?}",
+                table.times().collect::<Vec<_>>(),
+                self.times
+            );
+        }
+    }
+
+    #[test]
+    fn successor_priority_can_create_duplicates_and_preserves_zero_sign() {
+        let mut table = BreakTable::new(10., 0.25).unwrap();
+        for time in [1., 1.5, 1.25, 1.] {
+            table.set(-1., time).unwrap();
+        }
+        assert_eq!(table.times().collect::<Vec<_>>(), [0., 1., 1., 10.]);
+
+        let mut table = BreakTable::new(0.25, 0.25).unwrap();
+        table.set(-1., -0.).unwrap();
+        assert_eq!(
+            table.times().map(Real::to_bits).collect::<Vec<_>>(),
+            [0., -0.].map(Real::to_bits)
+        );
+        table.clear();
+        table.set(-1., 0.).unwrap();
+        assert_eq!(
+            table.times().map(Real::to_bits).collect::<Vec<_>>(),
+            [-0., 0.].map(Real::to_bits)
+        );
+        table.clear();
+        assert_eq!(table.first().to_bits(), Real::to_bits(0.));
+        assert_eq!(table.second().to_bits(), Real::to_bits(0.25));
+    }
+
+    #[test]
+    fn inversion_after_stop_is_not_reordered_and_can_accept_more_events() {
+        let mut table = BreakTable::new(10., 0.1).unwrap();
+        let mut reference = Reference::new(10., 0.1);
+        table.set(0., 12.).unwrap();
+        assert!(reference.set(0., 12.));
+        for _ in 0..2 {
+            table.clear();
+            reference.clear();
+        }
+        assert_eq!(table.times().collect::<Vec<_>>(), [12., 10.]);
+        for time in [11., 13., 12.5, 12.45, 9., 10., 15., 12.5] {
+            assert_eq!(table.set(0., time).is_ok(), reference.set(0., time));
+            reference.compare(&table);
+        }
+        while reference.times.len() > 2 {
+            table.clear();
+            reference.clear();
+            reference.compare(&table);
+        }
+        for _ in 0..5 {
+            table.clear();
+            reference.clear();
+            reference.compare(&table);
+        }
+    }
+
+    #[test]
+    fn indexed_table_matches_every_randomized_reference_transition() {
+        let mut random = 0x23a6_fce0_8125_c4d9_u64;
+        let mut next = || {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random
+        };
+        for final_time in [-0., 2., 10.] {
+            for min_break in [0., Real::from_bits(1), 0.125, 0.5, 1.] {
+                let mut table = BreakTable::new(final_time, min_break).unwrap();
+                let mut reference = Reference::new(final_time, min_break);
+                for _ in 0..5000 {
+                    let bits = next();
+                    if bits % 4 == 0 {
+                        table.clear();
+                        reference.clear();
+                    } else {
+                        let time = match bits % 19 {
+                            0 => 0.,
+                            1 => -0.,
+                            2 => Real::from_bits(bits % 8),
+                            3 => Real::INFINITY,
+                            4 => Real::NEG_INFINITY,
+                            5 => Real::NAN,
+                            6 => Real::MAX,
+                            7 => -Real::MAX,
+                            8 => table.first(),
+                            9 => table.second(),
+                            _ => Real::from(u32::try_from(next() % 161).unwrap()) / 8. - 5.,
+                        };
+                        let now = match next() % 6 {
+                            0 => time,
+                            1 => Real::from_bits(time.to_bits().wrapping_add(2)),
+                            2 => 0.,
+                            3 => Real::from(u32::try_from(next() % 81).unwrap()) / 8. - 5.,
+                            _ => -Real::MAX,
+                        };
+                        assert_eq!(
+                            table.set(now, time).is_ok(),
+                            reference.set(now, time),
+                            "now={now:e} time={time:e}"
+                        );
+                    }
+                    reference.compare(&table);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_constructor_inputs_cannot_enter_the_ordered_index() {
+        for invalid in [Real::NAN, Real::INFINITY, Real::NEG_INFINITY, -1.] {
+            assert!(BreakTable::new(invalid, 0.).is_err());
+            assert!(BreakTable::new(1., invalid).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual breakpoint lookup comparison count"]
+    fn indexed_breakpoint_work() {
+        for n in [4096_u32, 16_384, 65_536] {
+            let finish = Real::from(n) + 1.;
+            let mut table = BreakTable::new(finish, 0.).unwrap();
+            let mut reference = Reference::new(finish, 0.);
+            KEY_COMPARISONS.with(|count| count.set(Some(0)));
+            // Multiplication by an odd number permutes the power-of-two range.
+            for i in 0..n {
+                let time = Real::from((i.wrapping_mul(40503) & (n - 1)) + 1);
+                table.set(0., time).unwrap();
+                assert!(reference.set(0., time));
+            }
+            reference.compare(&table);
+            for _ in 0..n {
+                table.clear();
+                reference.clear();
+            }
+            reference.compare(&table);
+            let comparisons = KEY_COMPARISONS.with(|count| count.replace(None).unwrap());
+            println!(
+                "work,n={n},reference_visits={},reference_shifts={},tree_key_comparisons={comparisons}",
+                reference.visits, reference.shifts
+            );
+        }
+    }
+
     #[test]
     fn set_break_merges_like_cktsetbk() {
-        let mut table = BreakTable::new(10., 0.1);
+        let mut table = BreakTable::new(10., 0.1).unwrap();
         table.set(0., 5.).unwrap();
-        assert_eq!(table.times(), &[0., 5., 10.]);
+        assert_eq!(table.times().collect::<Vec<_>>(), [0., 5., 10.]);
         // Within min_break before an entry: the earlier time replaces it.
         table.set(0., 4.95).unwrap();
-        assert_eq!(table.times(), &[0., 4.95, 10.]);
+        assert_eq!(table.times().collect::<Vec<_>>(), [0., 4.95, 10.]);
         // Within min_break after an entry: skipped.
         table.set(0., 5.0).unwrap();
-        assert_eq!(table.times(), &[0., 4.95, 10.]);
+        assert_eq!(table.times().collect::<Vec<_>>(), [0., 4.95, 10.]);
         // Beyond the end, close to the last entry: skipped; farther: appended.
         table.set(0., 10.05).unwrap();
-        assert_eq!(table.times(), &[0., 4.95, 10.]);
+        assert_eq!(table.times().collect::<Vec<_>>(), [0., 4.95, 10.]);
         table.set(0., 12.).unwrap();
-        assert_eq!(table.times(), &[0., 4.95, 10., 12.]);
+        assert_eq!(table.times().collect::<Vec<_>>(), [0., 4.95, 10., 12.]);
         // A request at the current time is ignored, one in the past fails.
         table.set(4., 4.).unwrap();
-        assert_eq!(table.times().len(), 4);
+        assert_eq!(table.len(), 4);
         assert!(table.set(4., 3.).is_err());
     }
 
     #[test]
     fn clear_break_keeps_two_entries() {
-        let mut table = BreakTable::new(10., 0.1);
+        let mut table = BreakTable::new(10., 0.1).unwrap();
         table.set(0., 5.).unwrap();
         table.clear();
-        assert_eq!(table.times(), &[5., 10.]);
+        assert_eq!(table.times().collect::<Vec<_>>(), [5., 10.]);
         table.clear();
-        assert_eq!(table.times(), &[10., 10.]);
+        assert_eq!(table.times().collect::<Vec<_>>(), [10., 10.]);
     }
 }

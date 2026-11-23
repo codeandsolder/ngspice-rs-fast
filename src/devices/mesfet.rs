@@ -61,19 +61,9 @@
 //!
 //! `.disto` and `.sens` use the separate model-specific reference paths.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
-)]
-#![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use crate::devices::jfet::{
@@ -230,34 +220,22 @@ fn qggnew(
     cgs: Real,
     cgd: Real,
 ) -> (Real, Real, Real) {
-    let gate_difference = vgs - vgd;
-    let gate_difference_squared = gate_difference * gate_difference;
-    let vcap_squared = vcap * vcap;
-    let veroot = (gate_difference_squared + vcap_squared).sqrt();
-    let veff1 = 0.5 * (vgs + vgd + veroot);
-    let veff2 = veff1 - veroot;
-    let overdrive = veff1 - vto;
-    let overdrive_squared = overdrive * overdrive;
-    let delta_squared = DEL * DEL;
-    let vnroot = (overdrive_squared + delta_squared).sqrt();
-    let mut vnew1 = 0.5 * (veff1 + vto + vnroot);
-    let vnew3 = vnew1;
-    let ext = if vnew1 < VMAX {
+    let gate = jfet::smoothed_extrema(vgs, vgd, vcap);
+    let bounded = jfet::smoothed_extrema(gate.high, vto, DEL);
+    let voltage = bounded.high.min(VMAX);
+    let root = (1. - voltage / phib).sqrt();
+    let extension = if bounded.high < VMAX {
         0.
     } else {
-        vnew1 = VMAX;
-        (vnew3 - VMAX) / (1. - VMAX / phib).sqrt()
+        (bounded.high - VMAX) / root
     };
-    let qroot = (1. - vnew1 / phib).sqrt();
-    let qggval = cgs * (2. * phib * (1. - qroot) + ext) + cgd * veff2;
-    let par1 = 0.5 * (1. + (veff1 - vto) / vnroot);
-    let cfact = (vgs - vgd) / veroot;
-    let cplus = 0.5 * (1. + cfact);
-    let cminus = cplus - cfact;
+    let charge = cgs.mul_add(voltage / 1_f64.midpoint(root) + extension, cgd * gate.low);
+    let cap = (cgs / root) * bounded.high_weights[0];
+    let [cplus, cminus] = gate.high_weights;
     (
-        qggval,
-        cgs / qroot * par1 * cplus + cgd * cminus,
-        cgs / qroot * par1 * cminus + cgd * cplus,
+        charge,
+        cap.mul_add(cplus, cgd * cminus),
+        cap.mul_add(cminus, cgd * cplus),
     )
 }
 
@@ -271,69 +249,35 @@ impl Model {
             gm: 0.,
             gds: 0.,
         };
-        if vds >= 0. {
-            let vgst = vgs - self.vto;
-            if vgst <= 0. {
-                return off;
-            }
-            let prod = 1. + lambda * vds;
-            let betap = beta * prod;
-            let denom = 1. + b * vgst;
-            let invdenom = 1. / denom;
-            if vds >= 3. / alpha {
-                // Normal mode, saturation region.
-                Channel {
-                    current: betap * vgst * vgst * invdenom,
-                    gm: betap * vgst * (1. + denom) * invdenom * invdenom,
-                    gds: lambda * beta * vgst * vgst * invdenom,
-                }
-            } else {
-                // Normal mode, linear region.
-                let afact = 1. - alpha * vds / 3.;
-                let lfact = 1. - afact * afact * afact;
-                Channel {
-                    current: betap * vgst * vgst * invdenom * lfact,
-                    gm: betap * vgst * (1. + denom) * invdenom * invdenom * lfact,
-                    gds: beta
-                        * vgst
-                        * vgst
-                        * invdenom
-                        * (alpha * afact * afact * prod + lfact * lambda),
-                }
-            }
+        let (gate, direction) = if vds >= 0. { (vgs, 1.) } else { (vgd, -1.) };
+        let overdrive = gate - self.vto;
+        if overdrive <= 0. {
+            return off;
+        }
+        let drain = vds.abs();
+        let prod = lambda.mul_add(drain, 1.);
+        let betap = beta * prod;
+        let denom = b.mul_add(overdrive, 1.);
+        let invdenom = denom.recip();
+        let (lfact, dl_drain) = if drain >= 3. / alpha {
+            (1., 0.)
         } else {
-            let vgdt = vgd - self.vto;
-            if vgdt <= 0. {
-                return off;
-            }
-            let prod = 1. - lambda * vds;
-            let betap = beta * prod;
-            let denom = 1. + b * vgdt;
-            let invdenom = 1. / denom;
-            if -vds >= 3. / alpha {
-                // Inverse mode, saturation region.
-                let gm = -betap * vgdt * (1. + denom) * invdenom * invdenom;
-                Channel {
-                    current: -betap * vgdt * vgdt * invdenom,
-                    gm,
-                    gds: lambda * beta * vgdt * vgdt * invdenom - gm,
-                }
-            } else {
-                // Inverse mode, linear region.
-                let afact = 1. + alpha * vds / 3.;
-                let lfact = 1. - afact * afact * afact;
-                let gm = -betap * vgdt * (1. + denom) * invdenom * invdenom * lfact;
-                Channel {
-                    current: -betap * vgdt * vgdt * invdenom * lfact,
-                    gm,
-                    gds: beta
-                        * vgdt
-                        * vgdt
-                        * invdenom
-                        * (alpha * afact * afact * prod + lfact * lambda)
-                        - gm,
-                }
-            }
+            let fraction = alpha * drain / 3.;
+            let complement = 1. - fraction;
+            // 1-(1-fraction)^3, without cancellation at tiny drain bias.
+            (
+                fraction * complement.mul_add(complement, 1. + complement),
+                alpha * complement * complement,
+            )
+        };
+        let intrinsic = overdrive * overdrive * invdenom;
+        let current = betap * intrinsic * lfact;
+        let gm = betap * overdrive * (1. + denom) * invdenom * invdenom * lfact;
+        let gds = beta * intrinsic * dl_drain.mul_add(prod, lambda * lfact);
+        Channel {
+            current: direction * current,
+            gm: direction * gm,
+            gds: if direction < 0. { gds + gm } else { gds },
         }
     }
 
@@ -477,7 +421,7 @@ impl Mesfet {
     fn point(&self, op: &Operating, vgs: Real, vgd: Real, gmin: Real) -> SpiceResult<Point> {
         let junction = |v: Real| -> SpiceResult<(Real, Real)> {
             let (current, conductance) = junction_current(v, VT0, op.csat, ReverseBoundary::Cubic)?;
-            Ok((current + gmin * v, conductance + gmin))
+            Ok((gmin.mul_add(v, current), conductance + gmin))
         };
         let point = Point {
             channel: self.model.channel(op, vgs, vgd),
@@ -589,6 +533,10 @@ impl Mesfet {
 }
 
 impl Device for Mesfet {
+    fn validate_dc_inputs(&self, _context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.operating().map(|_| ())
+    }
+
     /// MES occupies its own C device type, before MESA and MOS.
     fn c_device_type(&self) -> crate::devices::setup::CDeviceType {
         crate::devices::setup::CDeviceType::Mes
@@ -796,7 +744,11 @@ impl Device for Mesfet {
     /// temperature), channel thermal noise `4 k T (2/3) |gm|` and flicker
     /// noise `KF |cd|^AF / f` between d' and s', every source scaled by `m`.
     /// `cd` is C's `MEScd`: the channel minus the gate-drain diode current.
-    fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
         let op = self.operating()?;
         let [vgs, vgd] = self.bias(context.unknowns, context.bias);
         let point = self.point(&op, vgs, vgd, context.model_context.gmin)?;
@@ -811,27 +763,27 @@ impl Device for Mesfet {
             conductance,
             temperature,
         };
+        sources.extend([
+            NoiseSource::new("_rd", [d, self.terminals[0]], thermal(gdpr * m)),
+            NoiseSource::new("_rs", [s, self.terminals[2]], thermal(gspr * m)),
+            NoiseSource::new(
+                "_id",
+                [d, s],
+                thermal(2.0 / 3.0 * m * point.channel.gm.abs()),
+            ),
+            NoiseSource::new(
+                "_1overf",
+                [d, s],
+                NoiseKind::Flicker {
+                    numerator: flicker,
+                    law: FlickerLaw::PerHertz,
+                },
+            ),
+        ]);
         Ok(DeviceNoise::Sources {
             family: NoiseFamily::Mes,
-            model: Some(self.model_name.clone()),
+            model: Some(&self.model_name),
             total: true,
-            sources: vec![
-                NoiseSource::new("_rd", [d, self.terminals[0]], thermal(gdpr * m)),
-                NoiseSource::new("_rs", [s, self.terminals[2]], thermal(gspr * m)),
-                NoiseSource::new(
-                    "_id",
-                    [d, s],
-                    thermal(2.0 / 3.0 * m * point.channel.gm.abs()),
-                ),
-                NoiseSource::new(
-                    "_1overf",
-                    [d, s],
-                    NoiseKind::Flicker {
-                        numerator: flicker,
-                        law: FlickerLaw::PerHertz,
-                    },
-                ),
-            ],
         })
     }
     fn distortion(
@@ -1174,6 +1126,18 @@ mod tests {
                     assert!((gds - c.gds).abs() <= 1e-6 * scale, "{b} {vgs} {vds}: gds");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tiny_drain_bias_keeps_nonzero_channel_current_and_linear_slope() {
+        let (model, op) = device(0.3, 0.);
+        // Vgs=0 makes Vgd=-Vds independently representable even for a
+        // drain voltage far below one ULP of the gate overdrive.
+        let slope = model.channel(&op, 0., 0.).gds;
+        for drain in [1e-30, 1e-20] {
+            let current = model.channel(&op, 0., -drain).current;
+            assert!((current - slope * drain).abs() <= 8. * Real::EPSILON * current.abs());
         }
     }
 

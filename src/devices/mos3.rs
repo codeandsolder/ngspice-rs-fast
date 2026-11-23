@@ -40,21 +40,6 @@
 //!   the model records in `sens`, including the scaled DELTA ask/raw setter
 //!   mismatch and zero columns for the three table-only model setters.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
-#![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
-    clippy::imprecise_flops,
-    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
-
 mod sens;
 
 use crate::devices::mos::bulk::{BulkJunctions, BulkLaw};
@@ -195,8 +180,8 @@ impl Level3 {
     /// C `EffectiveLength` and `EffectiveWidth` (`mos3load.c`).
     pub(super) fn effective(&self, geometry: &Geometry) -> (Real, Real) {
         (
-            geometry.l - 2. * self.common.ld + self.xl,
-            geometry.w - 2. * self.wd + self.xw,
+            2.0f64.mul_add(-self.common.ld, geometry.l) + self.xl,
+            2.0f64.mul_add(-self.wd, geometry.w) + self.xw,
         )
     }
 
@@ -456,15 +441,17 @@ impl MosLevel for Level3 {
             let xjonxl = self.xj * oneoverxl;
             let djonxj = self.common.ld * oneoverxj;
             let wponxj = wps * oneoverxj;
-            let wconxj = COEFF0 + COEFF1 * wponxj + COEFF2 * wponxj * wponxj;
+            let wconxj = COEFF2.mul_add(wponxj, COEFF1).mul_add(wponxj, COEFF0);
             let arga = wconxj + djonxj;
-            let argc = wponxj / (1.0 + wponxj);
-            let argb = (1.0 - argc * argc).sqrt();
-            let fshort = 1.0 - xjonxl * (arga * argb - djonxj);
+            let denominator = 1. + wponxj;
+            let argc = wponxj / denominator;
+            let complement = denominator.recip();
+            let argb = (complement * (1. + argc)).sqrt();
+            let fshort = xjonxl.mul_add(-arga.mul_add(argb, -djonxj), 1.0);
             let dwpdvb = p.depletion * dsqdvb;
-            let dadvb = (COEFF1 + COEFF2 * (wponxj + wponxj)) * dwpdvb * oneoverxj;
-            let dbdvb = -argc * argc * (1.0 - argc) * dwpdvb / (argb * wps);
-            (fshort, -xjonxl * (dadvb * argb + arga * dbdvb))
+            let dadvb = COEFF2.mul_add(wponxj + wponxj, COEFF1) * dwpdvb * oneoverxj;
+            let dbdvb = -argc * argc * complement * dwpdvb / (argb * wps);
+            (fshort, -xjonxl * arga.mul_add(dbdvb, dadvb * argb))
         } else {
             (1.0, 0.0)
         };
@@ -475,10 +462,10 @@ impl MosLevel for Level3 {
         let fbody = fbodys + p.narrow / width;
         let onfbdy = 1.0 / (1.0 + fbody);
         let dfbdvb = -fbodys * dsqdvb / sqphbs + fbodys * dfsdvb / fshort;
-        let qbonco = gammas * sqphbs + p.narrow * phibs / width;
-        let dqbdvb = gammas * dsqdvb + gamma * dfsdvb * sqphbs - p.narrow / width;
+        let qbonco = gammas.mul_add(sqphbs, p.narrow * phibs / width);
+        let dqbdvb = (gamma * dfsdvb).mul_add(sqphbs, gammas * dsqdvb) - p.narrow / width;
         // Static feedback effect.
-        let vbix = op.vbi * self.common.pol - eta * vds;
+        let vbix = eta.mul_add(-vds, op.vbi * self.common.pol);
         // Threshold voltage.
         let vth = vbix + qbonco;
         let dvtdvd = -eta;
@@ -489,10 +476,10 @@ impl MosLevel for Level3 {
         if self.nfs != 0.0 {
             let cdonco = qbonco / (phibs + phibs);
             xn = 1.0 + p.csonco + cdonco;
-            von = vth + vt * xn;
+            von = vt.mul_add(xn, vth);
             dxndvb = dqbdvb / (phibs + phibs) - qbonco * dsqdvb / (phibs * sqphbs);
             dvodvd = dvtdvd;
-            dvodvb = dvtdvb + vt * dxndvb;
+            dvodvb = vt.mul_add(dxndvb, dvtdvb);
         } else if vgs <= von {
             // Cutoff region.
             return DrainCurrent {
@@ -507,7 +494,7 @@ impl MosLevel for Level3 {
         // Device is on.
         let vgsx = vgs.max(von);
         // Mobility modulation by gate voltage.
-        let onfg = 1.0 + self.theta * (vgsx - vth);
+        let onfg = self.theta.mul_add(vgsx - vth, 1.0);
         let fgate = 1.0 / onfg;
         let us = p.mobility * 1e-4 * fgate;
         let dfgdvg = -self.theta * fgate * fgate;
@@ -519,18 +506,29 @@ impl MosLevel for Level3 {
         if self.vmax <= 0.0 {
             dvsdvg = onfbdy;
             dvsdvd = -dvsdvg * dvtdvd;
-            dvsdvb = -dvsdvg * dvtdvb - vdsat * dfbdvb * onfbdy;
+            dvsdvb = (vdsat * dfbdvb).mul_add(-onfbdy, -dvsdvg * dvtdvb);
             onvdsc = 0.0;
         } else {
             let vdsc = length * self.vmax / us;
             onvdsc = 1.0 / vdsc;
             let arga = (vgsx - vth) * onfbdy;
-            let argb = (arga * arga + vdsc * vdsc).sqrt();
-            vdsat = arga + vdsc - argb;
-            let dvsdga = (1.0 - arga / argb) * onfbdy;
-            dvsdvg = dvsdga - (1.0 - vdsc / argb) * vdsc * dfgdvg * onfg;
+            let argb = arga.hypot(vdsc);
+            // Rationalize a+b-hypot(a,b), scaled by its larger argument.
+            let large = arga.max(vdsc);
+            let small = arga.min(vdsc);
+            let ratio = small / large;
+            vdsat = if large == 0. {
+                0.
+            } else {
+                2. * (small / (1. + ratio + 1_f64.hypot(ratio)))
+            };
+            let gate_ratio = arga / argb;
+            let velocity_ratio = vdsc / argb;
+            let dvsdga = velocity_ratio * velocity_ratio / (1. + gate_ratio) * onfbdy;
+            let velocity_complement = gate_ratio * gate_ratio / (1. + velocity_ratio);
+            dvsdvg = (velocity_complement * vdsc * dfgdvg).mul_add(-onfg, dvsdga);
             dvsdvd = -dvsdvg * dvtdvd;
-            dvsdvb = -dvsdvg * dvtdvb - arga * dvsdga * dfbdvb;
+            dvsdvb = (arga * dvsdga).mul_add(-dfbdvb, -dvsdvg * dvtdvb);
         }
         // Current factors in the linear region.
         let vdsx = vds.min(vdsat);
@@ -551,41 +549,41 @@ impl MosLevel for Level3 {
                 vdsat,
             };
         }
-        let cdo = vgsx - vth - 0.5 * (1.0 + fbody) * vdsx;
-        let dcodvb = -dvtdvb - 0.5 * dfbdvb * vdsx;
+        let cdo = (f64::midpoint(1.0, fbody)).mul_add(-vdsx, vgsx - vth);
+        let dcodvb = (0.5 * dfbdvb).mul_add(-vdsx, -dvtdvb);
         // Normalized drain current.
         let cdnorm = cdo * vdsx;
         let mut gm = vdsx;
         let mut gds = if vds > vdsat {
             -dvtdvd * vdsx
         } else {
-            vgsx - vth - (1.0 + fbody + dvtdvd) * vdsx
+            (1.0 + fbody + dvtdvd).mul_add(-vdsx, vgsx - vth)
         };
         let mut gmbs = dcodvb * vdsx;
         // Drain current without velocity saturation effect.
         let cd1 = beta * cdnorm;
         beta *= fgate;
         let mut cdrain = beta * cdnorm;
-        gm = beta * gm + dfgdvg * cd1;
-        gds = beta * gds + dfgdvd * cd1;
-        gmbs = beta * gmbs + dfgdvb * cd1;
+        gm = dfgdvg.mul_add(cd1, beta * gm);
+        gds = dfgdvd.mul_add(cd1, beta * gds);
+        gmbs = dfgdvb.mul_add(cd1, beta * gmbs);
         // Velocity saturation factor.
         let (mut fdrain, mut dfddvg, mut dfddvd, mut dfddvb) = (0.0, 0.0, 0.0, 0.0);
         if self.vmax > 0.0 {
-            fdrain = 1.0 / (1.0 + vdsx * onvdsc);
+            fdrain = 1.0 / f64::mul_add(vdsx, onvdsc, 1.0);
             let fd2 = fdrain * fdrain;
             let arga = fd2 * vdsx * onvdsc * onfg;
             dfddvg = -dfgdvg * arga;
             dfddvd = if vds > vdsat {
                 -dfgdvd * arga
             } else {
-                -dfgdvd * arga - fd2 * onvdsc
+                f64::mul_add(fd2, -onvdsc, -dfgdvd * arga)
             };
             dfddvb = -dfgdvb * arga;
             // Drain current.
-            gm = fdrain * gm + dfddvg * cdrain;
-            gds = fdrain * gds + dfddvd * cdrain;
-            gmbs = fdrain * gmbs + dfddvb * cdrain;
+            gm = f64::mul_add(dfddvg, cdrain, fdrain * gm);
+            gds = f64::mul_add(dfddvd, cdrain, fdrain * gds);
+            gmbs = f64::mul_add(dfddvb, cdrain, fdrain * gmbs);
             cdrain *= fdrain;
         }
         // Channel length modulation: `delxl` and its derivatives (C's
@@ -612,33 +610,39 @@ impl MosLevel for Level3 {
             None
         } else {
             let cdsat = cdrain;
-            let gdsat = (cdsat * (1.0 - fdrain) * onvdsc).max(1.0e-12);
+            let drain_complement = vdsx * onvdsc * fdrain;
+            let gdsat = (cdsat * drain_complement * onvdsc).max(1.0e-12);
             let gdoncd = gdsat / cdsat;
-            let gdonfd = gdsat / (1.0 - fdrain);
+            let gdonfd = gdsat / drain_complement;
             let gdonfg = gdsat * onfg;
-            let dgdvg = gdoncd * gm - gdonfd * dfddvg + gdonfg * dfgdvg;
-            let dgdvd = gdoncd * gds - gdonfd * dfddvd + gdonfg * dfgdvd;
-            let dgdvb = gdoncd * gmbs - gdonfd * dfddvb + gdonfg * dfgdvb;
+            let dgdvg = gdonfg.mul_add(dfgdvg, gdonfd.mul_add(-dfddvg, gdoncd * gm));
+            let dgdvd = gdonfg.mul_add(dfgdvd, gdonfd.mul_add(-dfddvd, gdoncd * gds));
+            let dgdvb = gdonfg.mul_add(dfgdvb, gdonfd.mul_add(-dfddvb, gdoncd * gmbs));
             let emax = kappa * cdsat * oneoverxl / gdsat;
             let emoncd = emax / cdsat;
             let emongd = emax / gdsat;
-            let demdvg = emoncd * gm - emongd * dgdvg;
-            let demdvd = emoncd * gds - emongd * dgdvd;
-            let demdvb = emoncd * gmbs - emongd * dgdvb;
+            let demdvg = emongd.mul_add(-dgdvg, emoncd * gm);
+            let demdvd = emongd.mul_add(-dgdvd, emoncd * gds);
+            let demdvb = emongd.mul_add(-dgdvb, emoncd * gmbs);
             let arga = 0.5 * emax * alpha;
             let argc = kappa * alpha;
-            let argb = (arga * arga + argc * (vds - vdsat)).sqrt();
-            let delxl = argb - arga;
+            let excess = argc * (vds - vdsat);
+            let argb = arga.hypot(excess.sqrt());
+            let delxl = if argb + arga == 0. {
+                0.
+            } else {
+                excess / (argb + arga)
+            };
             let (dldvd, dldem) = if argb == 0.0 {
                 (0.0, 0.0)
             } else {
-                (argc / (argb + argb), 0.5 * (arga / argb - 1.0) * alpha)
+                (argc / (argb + argb), -0.5 * (delxl / argb) * alpha)
             };
             Some((
                 delxl,
                 dldvd,
                 dldem * demdvg,
-                dldem * demdvd - dldvd,
+                f64::mul_add(dldem, demdvd, -dldvd),
                 dldem * demdvb,
             ))
         };
@@ -658,12 +662,12 @@ impl MosLevel for Level3 {
             let xlfact = 1.0 / (1.0 - dlonxl);
             cdrain *= xlfact;
             let diddl = cdrain / (length - delxl);
-            gm = gm * xlfact + diddl * ddldvg;
-            gmbs = gmbs * xlfact + diddl * ddldvb;
+            gm = diddl.mul_add(ddldvg, gm * xlfact);
+            gmbs = diddl.mul_add(ddldvb, gmbs * xlfact);
             gds0 = diddl * ddldvd;
-            gm += gds0 * dvsdvg;
-            gmbs += gds0 * dvsdvb;
-            gds = gds * xlfact + diddl * dldvd + gds0 * dvsdvd;
+            gm = f64::mul_add(gds0, dvsdvg, gm);
+            gmbs = f64::mul_add(gds0, dvsdvb, gmbs);
+            gds = f64::mul_add(gds0, dvsdvd, diddl.mul_add(dldvd, gds * xlfact));
         }
         // Finish the strong inversion case (C `line700`).
         if vgs < von {
@@ -676,10 +680,11 @@ impl MosLevel for Level3 {
             let gmw = cdrain * ondvt;
             gm = gmw;
             if vds > vdsat {
-                gm += gds0 * dvsdvg * wfact;
+                gm = f64::mul_add(gds0 * dvsdvg, wfact, gm);
             }
-            gds = gds * wfact + (gms - gmw) * dvodvd;
-            gmbs = gmbs * wfact + (gms - gmw) * dvodvb - gmw * (vgs - von) * onxn * dxndvb;
+            gds = (gms - gmw).mul_add(dvodvd, gds * wfact);
+            gmbs = (gmw * (vgs - von) * onxn)
+                .mul_add(-dxndvb, (gms - gmw).mul_add(dvodvb, gmbs * wfact));
         }
         DrainCurrent {
             cdrain,
@@ -697,10 +702,10 @@ impl MosLevel for Level3 {
     /// SPICE3-compatible law).
     fn noise_shape(&self, geometry: &Geometry, op: &Operating<Params>) -> Option<NoiseShape> {
         let cox = 3.9 * EPSILON_0 / self.tox;
-        let length = geometry.l - 2. * self.common.ld;
+        let length = 2.0f64.mul_add(-self.common.ld, geometry.l);
         Some(NoiseShape {
             beta: op.params.kp * geometry.m * geometry.w / length,
-            width: geometry.w - 2. * self.wd,
+            width: 2.0f64.mul_add(-self.wd, geometry.w),
             length,
             cox,
             cox_squared: cox * cox,

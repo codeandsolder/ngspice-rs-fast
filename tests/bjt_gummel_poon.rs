@@ -443,7 +443,7 @@ fn single_sided_saturation_currents_follow_cs_restore_walk() {
             ],
         ),
     ] {
-        let plot = sensitivity(&format!(
+        let plot = run_deck(&format!(
             "vcc 1 0 dc 5\nvids 1 2 dc 0\n\
             vb 4 0 dc 0.7\nrbb 4 3 1k\nq1 2 3 0 qn\n\
             .model qn npn level=1 {card}\n.sens i(vids)"
@@ -454,8 +454,8 @@ fn single_sided_saturation_currents_follow_cs_restore_walk() {
     }
 }
 
-/// Runs the deck's own `.sens` analysis.
-fn sensitivity(body: &str) -> Plot {
+/// Runs the first analysis specified by the deck.
+fn run_deck(body: &str) -> Plot {
     let netlist = netlist(body);
     let config = ngspice_rs::analysis::RunConfig::from_netlist(&netlist).unwrap();
     let request = config.plan_for(&netlist.analyses[0]).unwrap();
@@ -476,7 +476,7 @@ fn column(plot: &Plot, name: &str) -> f64 {
 /// `rco` and the unported quasi-saturation/SOA parameters are still enumerated.
 #[test]
 fn sensitivity_covers_the_bjt_tables() {
-    let plot = sensitivity(
+    let plot = run_deck(
         "vcc 1 0 dc 5\nq1 1 3 2 qn area=2\nvids 2 0 dc 0\nvb 4 0 dc 0.72\n\
          rb 4 3 1k\n.model qn npn level=1\n.sens i(vids)",
     );
@@ -495,7 +495,7 @@ fn sensitivity_covers_the_bjt_tables() {
     }
 }
 
-/// `sensitivity()` refuses a card with `RC != 0`: `bjtsetup.c` then creates
+/// `run_deck()` refuses a card with `RC != 0`: `bjtsetup.c` then creates
 /// `collCX`, and C's walk marks `VO`/`GAMMA`/`QCO` given, switching the Kull
 /// quasi-saturation terms on in the perturbed loads (measured: `v(q1:gamma)`
 /// is 0.652 where the port has no such physics).
@@ -513,41 +513,80 @@ fn sensitivity_refuses_a_card_with_a_collector_resistance() {
     assert!(error.to_string().contains("RC"), "{error}");
 }
 
-/// The `sens_bjt` card: an NPN at `dtemp=-10` with `ISE > 1e-4` (rescales to
-/// `IS*ISE` in `bjtsetup.c`), `rb`/`re`/`irb`/`rbm`, area factors and a `BF`
-/// polynomial, plus a PNP at `dtemp=20` with `tnom=50`. The reference binary
-/// prints these columns; `rco` is zero because `sens_setp()` skips it, and
-/// `bf`/`vaf` are zero because C's own linearization does not see them here.
-/// Use the matching C platform: the 1e-25 ISE step amplifies libm differences
-/// enough to change the sign of C's own column between macOS and Linux.
-#[test]
-fn sensitivity_matches_the_reference_on_the_fixture_card() {
-    let plot = sensitivity(
-        ".options reltol=1e-10 vntol=1e-13 abstol=1e-16\n\
+const BJT_SENS_CARD: &str = ".options reltol=1e-10 vntol=1e-13 abstol=1e-16\n\
          vcc 1 0 dc 5\nq1 1 3 2 qn area=2 areab=3 areac=4 dtemp=-10\n\
          vids 2 0 dc 0\nvb 4 0 dc 0.72\nrb 4 3 1k\nvcc2 5 0 dc -5\n\
          q2 5 7 2 qp dtemp=20\nvb2 8 0 dc -0.68\nrb2 8 7 1k\n\
          .model qn npn level=1 ise=1e-3 rb=300 re=20 irb=1e-3 rbm=100 \
          tbf1=0.01 tbf2=1e-5\n\
-         .model qp pnp level=1 tnom=50 tbr1=0.02 tbr2=2e-5\n.sens i(vids)",
-    );
-    let raw = ngspice_rs::analysis::RawFile::load(fixtures::golden_path(
+         .model qp pnp level=1 tnom=50 tbr1=0.02 tbr2=2e-5\n.sens i(vids)";
+
+/// The `sens_bjt` card: an NPN at `dtemp=-10` with `ISE > 1e-4` (rescales to
+/// `IS*ISE` in `bjtsetup.c`), `rb`/`re`/`irb`/`rbm`, area factors and a `BF`
+/// polynomial, plus a PNP at `dtemp=20` with `tnom=50`. The reference binary
+/// prints these columns; `rco` is zero because `sens_setp()` skips it, and
+/// `bf`/`vaf` are zero because C's own linearization does not see them here.
+/// The ISE step is 1e-25, amplifying reference roundoff enough to
+/// reverse the sign between two independent C builds. Require both
+/// captures and apply the unchanged tolerance at their nearest endpoint.
+#[test]
+fn sensitivity_matches_the_reference_on_the_fixture_card() {
+    let plot = run_deck(BJT_SENS_CARD);
+    let references: Vec<_> = fixtures::numerical_golden_paths(
         &ngspice_conformance::fixtures::workspace_root().unwrap(),
         "sens_bjt",
-    ))
-    .unwrap();
-    let expected = &raw.plots[0].plot;
-    assert_eq!(plot.variable_count(), expected.variable_count());
-    assert_eq!(plot.point_count(), expected.point_count());
-    for variable in expected.variables() {
-        close(
-            column(&plot, &variable.name),
-            column(expected, &variable.name),
-            1e-6,
-            1e-9,
-        );
+    )
+    .iter()
+    .map(|path| ngspice_rs::analysis::RawFile::load(path).unwrap())
+    .collect();
+    let expected = &references[0].plots[0].plot;
+    for raw in &references {
+        assert_eq!(raw.plots.len(), 1);
+        let reference = &raw.plots[0].plot;
+        assert_eq!(plot.variable_count(), reference.variable_count());
+        assert_eq!(plot.point_count(), reference.point_count());
+        assert_eq!(plot.plotname, reference.plotname);
+        assert_eq!(plot.flags(), reference.flags());
+        for variable in expected.variables() {
+            let index = reference.variable_index(&variable.name).unwrap();
+            assert_eq!(reference.variables()[index], *variable);
+        }
     }
+    let mut mismatches = Vec::new();
+    for variable in expected.variables() {
+        let actual = column(&plot, &variable.name);
+        let reference = fixtures::nearest_reference(
+            actual,
+            references
+                .iter()
+                .map(|raw| column(&raw.plots[0].plot, &variable.name)),
+        )
+        .unwrap();
+        if (actual - reference).abs() > 1e-6 * reference.abs() + 1e-9 || !actual.is_finite() {
+            mismatches.push(format!("{}: {actual:e} != {reference:e}", variable.name));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     assert_eq!(column(&plot, "v(q1:rco)"), 0., "sens_setp skips RCO");
+}
+
+/// A selected parameter is perturbed before other setters alter its model.
+/// Check the actual temperature derivative against independent DC solves,
+/// as well as the pinned C reference for the same selected parameter.
+#[test]
+fn selected_bandgap_sensitivity_matches_physical_dc_derivative() {
+    let selected = BJT_SENS_CARD.replace(".sens i(vids)", ".sens i(vids) q1:eg");
+    let actual = column(&run_deck(&selected), "v(q1:eg)");
+    let dc = |eg: f64| {
+        let body = BJT_SENS_CARD
+            .replace(".sens i(vids)", ".op")
+            .replace("ise=1e-3 rb=300", &format!("ise=1e-3 eg={eg:.17} rb=300"));
+        column(&run_deck(&body), "i(vids)")
+    };
+    let h = 1e-4;
+    let derivative = (dc(1.11 + h) - dc(1.11 - h)) / (2. * h);
+    close(actual, derivative, 1e-6, 1e-10);
+    close(actual, -0.000_143_991_710_094_134_88, 1e-6, 1e-10);
 }
 
 #[test]

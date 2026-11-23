@@ -377,10 +377,6 @@ impl AcceptedCursor {
         }
     }
 
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "match C breakpoint projection rounding without FMA"
-    )]
     fn prepare(
         self,
         settings: &TransientPlan,
@@ -420,7 +416,7 @@ impl AcceptedCursor {
             clock.save_delta = clock.next.delta;
             clock.next.delta = breaks.first() - clock.time;
         } else if !almost_equal_ulps(clock.time + clock.next.delta, settings.stop, 100)
-            && clock.time + 1.9 * clock.next.delta > breaks.first()
+            && clock.next.delta.mul_add(1.9, clock.time) > breaks.first()
         {
             clock.save_delta = clock.next.delta;
             clock.next.delta = (breaks.first() - clock.time) / 2.0;
@@ -676,7 +672,7 @@ impl Driver<'_> {
         let TransientPlan { stop, start, .. } = self.settings;
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
         let min_step = self.settings.min_step();
-        let mut breaks = BreakTable::new(stop, 10.0 * min_step);
+        let mut breaks = BreakTable::new(stop, 10.0 * min_step)?;
         let mut sources = SourceBreaks::new(self.system);
         let plot = plot(
             self.circuit,

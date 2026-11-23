@@ -49,7 +49,7 @@ card 6 @netlists/switch_w_tran.cir:10:1 lines=10-10 continuations=0
   token 1 10:1 word "c1"
   token 2 10:4 word "c1"
   token 3 10:7 number "0" value=0e0
-  token 4 10:9 number "50n" value=5.0000000000000004e-8
+  token 4 10:9 number "50n" value=5e-8
 card 7 @netlists/switch_w_tran.cir:11:1 lines=11-11 continuations=0
   raw: "w1 c1 0 vsense wh"
   kind: device(w)
@@ -68,11 +68,11 @@ card 8 @netlists/switch_w_tran.cir:12:1 lines=12-12 continuations=0
   token 5 12:13 lparen "("
   token 6 12:14 number "0" value=0e0
   token 7 12:16 number "2" value=2e0
-  token 8 12:18 number "100u" value=9.999999999999999e-5
-  token 9 12:23 number "50u" value=4.9999999999999996e-5
-  token 10 12:27 number "50u" value=4.9999999999999996e-5
+  token 8 12:18 number "100u" value=1e-4
+  token 9 12:23 number "50u" value=5e-5
+  token 10 12:27 number "50u" value=5e-5
   token 11 12:31 number "300u" value=3e-4
-  token 12 12:36 number "800u" value=7.999999999999999e-4
+  token 12 12:36 number "800u" value=8e-4
   token 13 12:40 rparen ")"
 card 9 @netlists/switch_w_tran.cir:13:1 lines=13-13 continuations=0
   raw: "vsense2 p q dc 0"
@@ -102,7 +102,7 @@ card 12 @netlists/switch_w_tran.cir:16:1 lines=16-16 continuations=0
   token 1 16:1 word "c2"
   token 2 16:4 word "c2"
   token 3 16:7 number "0" value=0e0
-  token 4 16:9 number "100n" value=1.0000000000000001e-7
+  token 4 16:9 number "100n" value=1e-7
 card 13 @netlists/switch_w_tran.cir:17:1 lines=17-17 continuations=0
   raw: "w2 c2 c3 vsense2 wn on"
   kind: device(w)
@@ -118,7 +118,7 @@ card 14 @netlists/switch_w_tran.cir:18:1 lines=18-18 continuations=0
   token 1 18:1 word "c3"
   token 2 18:4 word "c3"
   token 3 18:7 number "0" value=0e0
-  token 4 18:9 number "100n" value=1.0000000000000001e-7
+  token 4 18:9 number "100n" value=1e-7
 card 15 @netlists/switch_w_tran.cir:19:1 lines=19-19 continuations=0
   raw: "r3 c3 0 10k"
   kind: device(r)
@@ -135,7 +135,7 @@ card 16 @netlists/switch_w_tran.cir:20:1 lines=20-20 continuations=0
   token 4 20:14 lparen "("
   token 5 20:15 word "it"
   token 6 20:17 equals "="
-  token 7 20:18 number "0.3m" value=3.0000000000000003e-4
+  token 7 20:18 number "0.3m" value=3e-4
   token 8 20:23 word "ih"
   token 9 20:25 equals "="
   token 10 20:26 number "0.1m" value=1e-4
@@ -158,7 +158,7 @@ card 17 @netlists/switch_w_tran.cir:21:1 lines=21-21 continuations=0
   token 7 21:18 number "1m" value=1e-3
   token 8 21:21 word "ih"
   token 9 21:23 equals "="
-  token 10 21:24 number "-0.3m" value=-3.0000000000000003e-4
+  token 10 21:24 number "-0.3m" value=-3e-4
   token 11 21:30 word "ron"
   token 12 21:33 equals "="
   token 13 21:34 number "500" value=5e2

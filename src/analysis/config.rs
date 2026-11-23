@@ -14,7 +14,7 @@
 //! | `temp`, `tnom` | [`AnalysisContext`] circuit/nominal temperature (Celsius, finite, above absolute zero) |
 //! | `gmin` | [`AnalysisContext::gmin`]: junction minimum conductance of every diode/BJT/MOS1 junction in all analyses (C `CKTgmin`, default 1e-12 S; finite, `>= 0`) |
 //! | `pivtol`, `pivrel` | [`AnalysisContext::pivot`]: SPARSE threshold-pivoting limits used whenever a circuit matrix is (re)ordered in any analysis (C `CKTpivotAbsTol`/`CKTpivotRelTol`, `SMPreorder`/`SMPcReorder`; defaults 1e-13 and 1e-3). `pivtol` must be finite and `>= 0`, `pivrel` in `(0, 1]`; C's `spOrderAndFactor` would silently use its default for other values |
-//! | `reltol` | transient relative tolerance (`rtol`): companion truncation/convergence; also the DC/AC Newton `rtol` |
+//! | `reltol` | circuit relative tolerance, including diode temperature matching; default for Newton and transient truncation/convergence |
 //! | `vntol` | voltage absolute tolerance (companion Newton test; DC/AC Newton) |
 //! | `abstol` | branch-current absolute tolerance (companion truncation/Newton test; DC/AC Newton) |
 //! | `chgtol`, `trtol` | companion local-truncation-error charge floor and overestimation factor |
@@ -216,8 +216,6 @@ pub struct RunOverrides {
 /// BDF defaults are unchanged unless a deck sets them.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TransientSettings {
-    /// `reltol` → BDF relative tolerance.
-    pub rtol: Option<Real>,
     /// `vntol` → voltage absolute tolerance.
     pub vntol: Option<Real>,
     /// `abstol` → branch-current absolute tolerance.
@@ -422,14 +420,28 @@ impl RunConfig {
     /// Unknown, unimplemented, malformed, out-of-range or conflicting options,
     /// and option expressions that fail to evaluate.
     pub fn from_netlist(netlist: &Netlist) -> SpiceResult<Self> {
-        let scope = ParamScope::for_netlist(netlist)?;
+        let scope = std::sync::Arc::new(ParamScope::for_netlist(netlist)?);
+        Self::from_netlist_with_scope(netlist, scope)
+    }
+
+    /// Resolve a candidate's options and node hints against an already
+    /// evaluated immutable scope; no second dependency walk or parameter
+    /// evaluation. Caller controls when setup-shape changes invalidate plans.
+    pub(crate) fn from_netlist_with_scope(
+        netlist: &Netlist,
+        scope: std::sync::Arc<ParamScope>,
+    ) -> SpiceResult<Self> {
         // Body front-end cards follow expanded instance/card order, not definition order.
         let expanded = if netlist.subcircuits.iter().any(|sub| {
             !sub.options.is_empty()
                 || !sub.initial_conditions.is_empty()
                 || !sub.nodesets.is_empty()
         }) {
-            let literal = crate::netlist::elaborate::literalize(netlist)?;
+            let literal = crate::netlist::elaborate::literalize_with(
+                netlist,
+                std::sync::Arc::clone(&scope),
+                &mut EvalBudget::default(),
+            )?;
             Some(crate::devices::subckt::expand_subcircuits(
                 &literal.netlist,
                 &literal.scope,
@@ -470,8 +482,17 @@ impl RunConfig {
                 .as_ref()
                 .map_or(&nodesets, |expanded| &expanded.nodesets),
         );
-        config.params = Some(std::sync::Arc::new(scope));
+        config.params = Some(scope);
         Ok(config)
+    }
+
+    /// Replace only the already validated parameter environment. Numeric
+    /// candidates with unchanged options and topology retain the same run
+    /// settings but must expose their *current* parameter scope to objective
+    /// measurement and subsequent analysis binding.
+    pub(crate) fn with_parameter_scope(mut self, scope: std::sync::Arc<ParamScope>) -> Self {
+        self.params = Some(scope);
+        self
     }
 
     /// Explicit Fourier front-end settings.
@@ -954,7 +975,7 @@ impl RunConfig {
                     ));
                 }
                 match name {
-                    "reltol" => self.transient.rtol = Some(number),
+                    "reltol" => self.context.reltol = number,
                     "vntol" => self.transient.vntol = Some(number),
                     "abstol" => self.transient.abstol = Some(number),
                     "chgtol" => self.transient.chgtol = Some(number),
@@ -965,8 +986,8 @@ impl RunConfig {
         Ok(())
     }
 
-    /// Temperatures and junction `gmin` shared by all analyses; defaults are
-    /// 27 C / 27 C / 1e-12 S.
+    /// Resolved circuit temperatures, junction gmin, RELTOL and other
+    /// physical settings shared by all analyses.
     #[must_use]
     pub const fn context(&self) -> AnalysisContext {
         self.context

@@ -390,7 +390,11 @@ impl Device for Resistor {
     /// `resnoise.c`: thermal noise `4 k T / R` at the instance temperature
     /// and the flicker law of [`ResistorNoise`], driven by the operating-point
     /// current (C `REScurrent`). `noisy=0` is noiseless.
-    fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
         Ok(resistor_noise(
             self.terminals,
             1. / self.resistance,
@@ -398,6 +402,7 @@ impl Device for Resistor {
             self.noise.model.as_deref(),
             context,
             None,
+            sources,
         ))
     }
 }
@@ -432,14 +437,15 @@ pub(super) fn assemble_conductance(
 }
 
 /// Evaluate the resistor's generators at the operating point.
-pub(super) fn resistor_noise(
+pub(super) fn resistor_noise<'a>(
     terminals: [NodeId; 2],
     conductance: Real,
     n: &ResistorNoise,
-    model: Option<&str>,
+    model: Option<&'a str>,
     context: &NoiseContext<'_>,
     temperature_kelvin: Option<Real>,
-) -> DeviceNoise {
+    sources: &mut Vec<NoiseSource>,
+) -> DeviceNoise<'a> {
     if !n.noisy {
         return DeviceNoise::Noiseless;
     }
@@ -451,31 +457,31 @@ pub(super) fn resistor_noise(
     // resnoise.c: `RESm * RESfNcoef * pow(fabs(REScurrent / RESm), RESfNexp)
     // / (RESeffNoiseArea * pow(freq, RESef))`.
     let numerator = n.multiplicity * n.kf * (current / n.multiplicity).abs().powf(n.af);
+    sources.extend([
+        NoiseSource::new(
+            "_thermal",
+            terminals,
+            NoiseKind::Thermal {
+                conductance,
+                temperature,
+            },
+        ),
+        NoiseSource::new(
+            "_1overf",
+            terminals,
+            NoiseKind::Flicker {
+                numerator,
+                law: FlickerLaw::Area {
+                    area: n.area,
+                    exponent: n.ef,
+                },
+            },
+        ),
+    ]);
     DeviceNoise::Sources {
         family: NoiseFamily::Resistor,
-        model: model.map(str::to_owned),
+        model,
         total: true,
-        sources: vec![
-            NoiseSource::new(
-                "_thermal",
-                terminals,
-                NoiseKind::Thermal {
-                    conductance,
-                    temperature,
-                },
-            ),
-            NoiseSource::new(
-                "_1overf",
-                terminals,
-                NoiseKind::Flicker {
-                    numerator,
-                    law: FlickerLaw::Area {
-                        area: n.area,
-                        exponent: n.ef,
-                    },
-                },
-            ),
-        ],
     }
 }
 
@@ -797,7 +803,8 @@ impl Device for Capacitor {
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> crate::primitives::SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> crate::primitives::SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Ok(crate::devices::noise::DeviceNoise::Noiseless)
     }
 
@@ -1012,7 +1019,8 @@ impl Device for Inductor {
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> crate::primitives::SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> crate::primitives::SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Ok(crate::devices::noise::DeviceNoise::Noiseless)
     }
 
@@ -1185,13 +1193,14 @@ mod tests {
         let solution = Vector::zeros(1);
         let mut context = crate::devices::traits::StampContext {
             matrix: &mut matrix,
-            rhs: &mut rhs,
+            rhs: crate::devices::traits::StampRhs::dense(&mut rhs),
             unknowns: &unknowns,
             nodes: &nodes,
             solution: &solution,
             temperature: 27.0,
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
+            reltol: crate::devices::DEFAULT_RELTOL,
             frequency: 0.,
             mode: crate::devices::traits::AnalysisMode::Transient { time: 0., dt: 1e-6 },
             branches: 0..0,
