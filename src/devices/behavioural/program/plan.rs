@@ -5,8 +5,8 @@
 //! finite successful results within a single evaluation environment.
 
 use super::{
-    Binary, Environment, Evaluation, Node, Operator, PwlTable, Tree, Unary, XspicePwl, divide,
-    power, power_h, pwr, unary_value,
+    Binary, Environment, Evaluation, EvaluationView, Node, Operator, PwlTable, Tree, Unary,
+    XspicePwl, divide, power, power_h, pwr, unary_value,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::{collections::HashMap, sync::Arc};
@@ -168,6 +168,7 @@ impl PlanBuilder {
 pub(in crate::devices::behavioural) struct Workspace {
     values: Vec<Real>,
     pending: Vec<Slot>,
+    gradient: Vec<Real>,
 }
 
 // Scratch has no circuit state: a cloned device starts with empty scratch
@@ -179,14 +180,15 @@ impl Clone for Workspace {
 }
 
 impl Plan {
-    pub(super) fn evaluate(
+    pub(super) fn evaluate<'w>(
         &self,
         root: Slot,
         derivatives: &[Slot],
         environment: &Environment<'_>,
-        workspace: &mut Workspace,
-    ) -> SpiceResult<Evaluation> {
+        workspace: &'w mut Workspace,
+    ) -> SpiceResult<EvaluationView<'w>> {
         workspace.values.resize(self.instructions.len(), Real::NAN);
+        workspace.gradient.clear();
         if self.has_ternary {
             workspace.values.fill(Real::NAN);
             workspace.pending.clear();
@@ -197,27 +199,27 @@ impl Plan {
             fudge: environment.gmin * 1e-20,
             workspace,
         };
-        // In the absence of ternaries, postorder construction already is
-        // the exact first-use evaluation order. Avoid the demand stack and
-        // its cache checks altogether on this common path.
-        if !self.has_ternary {
+        let value = if self.has_ternary {
+            evaluator.eval(root)?
+        } else {
             for (slot, instruction) in self.instructions.iter().enumerate() {
                 evaluator.workspace.values[slot] = evaluator.eval_ready(instruction)?;
             }
-            return Ok(Evaluation {
-                value: evaluator.workspace.values[root],
-                gradient: derivatives
-                    .iter()
-                    .map(|&slot| evaluator.workspace.values[slot])
-                    .collect(),
-            });
+            evaluator.workspace.values[root]
+        };
+        evaluator.workspace.gradient.reserve(derivatives.len());
+        for &slot in derivatives {
+            let derivative = if self.has_ternary {
+                evaluator.eval(slot)?
+            } else {
+                evaluator.workspace.values[slot]
+            };
+            evaluator.workspace.gradient.push(derivative);
         }
-        let value = evaluator.eval(root)?;
-        let gradient = derivatives
-            .iter()
-            .map(|&slot| evaluator.eval(slot))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        Ok(Evaluation { value, gradient })
+        Ok(EvaluationView {
+            value,
+            gradient: &evaluator.workspace.gradient,
+        })
     }
 }
 
@@ -549,7 +551,11 @@ mod tests {
                 let expected = reference(&old, &env, &mut reference_scratch, &mut 0);
                 match (actual, expected) {
                     (Ok(actual), Ok(expected)) => {
-                        assert_eq!(bits(&actual), bits(&expected), "{text} at {point:?}")
+                        assert_eq!(
+                            bits(&actual.into_owned()),
+                            bits(&expected),
+                            "{text} at {point:?}"
+                        )
                     }
                     (Err(actual), Err(expected)) => assert_eq!(
                         actual.to_string(),
@@ -679,7 +685,9 @@ mod tests {
             let actual = program.evaluate_with_workspace(&env, &mut workspace);
             let expected = reference(&old, &env, &mut reference_scratch, &mut 0);
             match (actual, expected) {
-                (Ok(actual), Ok(expected)) => assert_eq!(bits(&actual), bits(&expected)),
+                (Ok(actual), Ok(expected)) => {
+                    assert_eq!(bits(&actual.into_owned()), bits(&expected))
+                }
                 (Err(actual), Err(expected)) => {
                     assert_eq!(actual.to_string(), expected.to_string())
                 }
@@ -880,7 +888,7 @@ mod tests {
         let mut visits = 0;
         let expected = reference(&program, &env, &mut reference_scratch, &mut visits).unwrap();
         let actual = program.evaluate_with_workspace(&env, &mut scratch).unwrap();
-        assert_eq!(bits(&actual), bits(&expected));
+        assert_eq!(bits(&actual.into_owned()), bits(&expected));
         let unique = scratch
             .values
             .iter()

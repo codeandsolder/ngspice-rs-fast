@@ -77,6 +77,22 @@ pub struct Evaluation {
     pub gradient: Vec<Real>,
 }
 
+/// Workspace-backed value and derivatives, borrowed until the next evaluation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct EvaluationView<'a> {
+    pub(super) value: Real,
+    pub(super) gradient: &'a [Real],
+}
+
+impl EvaluationView<'_> {
+    fn into_owned(self) -> Evaluation {
+        Evaluation {
+            value: self.value,
+            gradient: self.gradient.to_vec(),
+        }
+    }
+}
+
 /// One-argument functions (`inpptree.c` `funcs[]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Unary {
@@ -366,13 +382,14 @@ impl Program {
     /// domain or any value/derivative is not finite.
     pub fn evaluate(&self, environment: &Environment<'_>) -> SpiceResult<Evaluation> {
         self.evaluate_with_workspace(environment, &mut Workspace::default())
+            .map(EvaluationView::into_owned)
     }
 
-    pub(super) fn evaluate_with_workspace(
+    pub(super) fn evaluate_with_workspace<'w>(
         &self,
         environment: &Environment<'_>,
-        workspace: &mut Workspace,
-    ) -> SpiceResult<Evaluation> {
+        workspace: &'w mut Workspace,
+    ) -> SpiceResult<EvaluationView<'w>> {
         if environment.values.len() != self.quantities.len() {
             return Err(SpiceError::circuit(
                 "behavioural expression evaluated with the wrong number of values",
