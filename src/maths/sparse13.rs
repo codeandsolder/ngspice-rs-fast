@@ -94,10 +94,19 @@ type LaneMask = Mask<i64, RHS_BATCH_WIDTH>;
 
 /// One SIMD tile, split by component so scatter updates never repack
 /// interleaved complex numbers. Real solves leave the imaginary plane empty.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct LaneParts {
     re: f64x4,
     im: f64x4,
+}
+
+/// Scratch for independent numeric factor tiles. Reuses the packed matrix,
+/// scatter rows and reciprocal storage across successive frequency tiles.
+#[derive(Debug, Default)]
+pub(super) struct IndependentFactorTileWorkspace {
+    values: Vec<LaneParts>,
+    scratch: Vec<LaneParts>,
+    inverses: Vec<LaneParts>,
 }
 
 impl LaneParts {
@@ -215,6 +224,86 @@ impl BatchUpdate {
             }
         }
         next
+    }
+}
+
+/// SIMD Schur update for distinct numeric matrices sharing one symbolic
+/// traversal. Unlike multiple-RHS updates, each lane owns its own pivot
+/// and reciprocal. Exceptional lanes use the ordinary scalar recovery.
+#[derive(Clone, Copy)]
+struct IndependentBatchUpdate {
+    numerator: LaneParts,
+    pivot: LaneParts,
+    multiplier: LaneParts,
+    normal: LaneMask,
+    active: LaneMask,
+}
+
+impl IndependentBatchUpdate {
+    fn new(numerator: LaneParts, pivot: LaneParts, inverse: LaneParts, enabled: LaneMask) -> Self {
+        let zero = f64x4::splat(0.);
+        let active = (numerator.re.simd_ne(zero) | numerator.im.simd_ne(zero)) & enabled;
+        let mut multiplier = LaneParts {
+            re: numerator.re * inverse.re - numerator.im * inverse.im,
+            im: numerator.re * inverse.im + numerator.im * inverse.re,
+        };
+        let normal = (multiplier.re.abs() + multiplier.im.abs()).is_normal();
+        let inverse_zero = inverse.re.simd_eq(zero) & inverse.im.simd_eq(zero);
+        let exceptional = active & (!normal | inverse_zero);
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    multiplier.set(
+                        lane,
+                        numerator
+                            .get::<Complex>(lane)
+                            .quotient(pivot.get::<Complex>(lane), inverse.get::<Complex>(lane)),
+                    );
+                }
+            }
+        }
+        Self {
+            numerator,
+            pivot,
+            multiplier,
+            normal: (multiplier.re.abs() + multiplier.im.abs()).is_normal(),
+            active,
+        }
+    }
+
+    fn apply(self, acc: LaneParts, lower: LaneParts) -> LaneParts {
+        let product = LaneParts {
+            re: self.multiplier.re * lower.re - self.multiplier.im * lower.im,
+            im: self.multiplier.re * lower.im + self.multiplier.im * lower.re,
+        };
+        let mut result = LaneParts {
+            re: acc.re - product.re,
+            im: acc.im - product.im,
+        };
+        let norm = result.re.abs() + result.im.abs();
+        let scale = (acc.re.abs() + acc.im.abs()) * f64x4::splat(0.0625);
+        let zero = f64x4::splat(0.);
+        let lower_zero = lower.re.simd_eq(zero) & lower.im.simd_eq(zero);
+        let finite = result.re.is_finite() & result.im.is_finite();
+        let fast = (self.normal & norm.is_normal() & norm.simd_gt(scale)) | (finite & lower_zero);
+        let exceptional = self.active & !fast;
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    result.set(
+                        lane,
+                        acc.get::<Complex>(lane).schur(
+                            self.pivot.get::<Complex>(lane),
+                            self.numerator.get::<Complex>(lane),
+                            self.multiplier.get::<Complex>(lane),
+                            lower.get::<Complex>(lane),
+                            self.normal.test(lane),
+                        ),
+                    );
+                }
+            }
+        }
+        LaneParts::select(self.active, result, acc)
     }
 }
 
@@ -654,6 +743,104 @@ impl<I: PlanIndex> FactorRuns<I> {
             inverses[step] = dest[step].cached_recip();
         }
         Ok(())
+    }
+
+    /// Refactor distinct numeric matrices with one immutable symbolic plan.
+    /// Coefficients and row scratch are packed by element/row into four SIMD
+    /// lanes. Pivots are independent; exceptional Schur updates use the
+    /// scalar range-preserving kernel for that lane.
+    fn refactor_independent_tile(
+        &self,
+        values: &mut [LaneParts],
+        diag: &[usize],
+        scratch: &mut [LaneParts],
+        inverses: &mut [LaneParts],
+        statuses: &mut [Status; RHS_BATCH_WIDTH],
+        count: usize,
+    ) {
+        for step in 2..=self.columns.runs.len() {
+            for entry in self.columns.all(step) {
+                let (handle, row) = entry.indices();
+                scratch[row] = values[handle];
+            }
+            for entry in self.columns.before_diagonal(step) {
+                let (handle, row) = entry.indices();
+                let upper = scratch[row];
+                values[handle] = upper;
+                let pivot = values[diag[row]];
+                let enabled = LaneMask::from_array(std::array::from_fn(|lane| {
+                    lane < count && statuses[lane] == Status::Okay
+                }));
+                let update = IndependentBatchUpdate::new(upper, pivot, inverses[row], enabled);
+                if update.active.any() {
+                    for entry in self.columns.after_diagonal(row) {
+                        let (handle, target) = entry.indices();
+                        scratch[target] = update.apply(scratch[target], values[handle]);
+                    }
+                }
+            }
+            for entry in self.columns.after_diagonal(step) {
+                let (handle, row) = entry.indices();
+                values[handle] = scratch[row];
+            }
+            for lane in 0..count {
+                if statuses[lane] != Status::Okay {
+                    continue;
+                }
+                let pivot = scratch[step].get::<Complex>(lane);
+                statuses[lane] = if pivot.is_zero() {
+                    Status::ZeroDiag
+                } else if !pivot.is_finite() {
+                    Status::NonFinite
+                } else {
+                    Status::Okay
+                };
+                if statuses[lane] == Status::Okay {
+                    values[diag[step]].set(lane, pivot);
+                    inverses[step].set(lane, pivot.cached_recip());
+                }
+            }
+        }
+    }
+
+    /// Solve independent, identically ordered complex factors in their
+    /// packed lanes. The same elimination traversal serves normal and
+    /// transposed solves without sharing numeric pivots.
+    fn solve_independent_tile(
+        &self,
+        values: &[LaneParts],
+        diag: &[usize],
+        inverses: &[LaneParts],
+        x: &mut [LaneParts],
+        enabled: LaneMask,
+        transposed: bool,
+    ) {
+        let axis = if transposed {
+            &self.rows
+        } else {
+            &self.columns
+        };
+        for step in 1..=self.columns.runs.len() {
+            let update =
+                IndependentBatchUpdate::new(x[step], values[diag[step]], inverses[step], enabled);
+            if update.active.any() {
+                for entry in axis.after_diagonal(step) {
+                    let (handle, row) = entry.indices();
+                    x[row] = update.apply(x[row], values[handle]);
+                }
+            }
+        }
+        for step in (1..=self.columns.runs.len()).rev() {
+            let update =
+                IndependentBatchUpdate::new(x[step], values[diag[step]], inverses[step], enabled);
+            if update.active.any() {
+                for entry in axis.before_diagonal(step) {
+                    let (handle, row) = entry.indices();
+                    x[row] = update.apply(x[row], values[handle]);
+                }
+                x[step] = LaneParts::select(update.active, update.multiplier, x[step]);
+            }
+        }
     }
 
     fn solve<T: Scalar>(
@@ -3207,6 +3394,225 @@ impl DeterminantScale for Complex {
             scale_power(self.re, exponent),
             scale_power(self.im, exponent),
         )
+    }
+}
+
+impl Sparse<Complex> {
+    /// Factor independent original coefficient streams using one immutable
+    /// ordered symbolic topology. The reference's numeric factors are never
+    /// read or mutated. On allocation or layout mismatch callers use scalar
+    /// factorization, which has smaller peak scratch requirements.
+    fn factor_independent_packed(
+        reference: &Self,
+        inputs: &[&[Complex]],
+        workspace: &mut IndependentFactorTileWorkspace,
+    ) -> Option<[Status; RHS_BATCH_WIDTH]> {
+        if !(2..=RHS_BATCH_WIDTH).contains(&inputs.len()) {
+            return None;
+        }
+        let plan = reference.lifecycle.plan()?;
+        let topology = &reference.topology;
+        let original_entries = topology.original_entries;
+        if reference.size == 0 || inputs.iter().any(|values| values.len() != original_entries) {
+            return None;
+        }
+        let values_len = reference.values.len();
+        let size = reference.size;
+        let IndependentFactorTileWorkspace {
+            values,
+            scratch,
+            inverses,
+        } = workspace;
+        sparse_reserve(values, values_len.saturating_sub(values.len())).ok()?;
+        sparse_reserve(scratch, (size + 1).saturating_sub(scratch.len())).ok()?;
+        sparse_reserve(inverses, (size + 1).saturating_sub(inverses.len())).ok()?;
+        values.resize(values_len, LaneParts::ZERO);
+        scratch.resize(size + 1, LaneParts::ZERO);
+        inverses.resize(size + 1, LaneParts::ZERO);
+        for (index, packed) in values.iter_mut().enumerate() {
+            *packed = LaneParts::from_lanes(std::array::from_fn(|lane| {
+                if index < original_entries {
+                    inputs.get(lane).map_or(Complex::ZERO, |input| input[index])
+                } else {
+                    Complex::ZERO
+                }
+            }));
+        }
+        let count = inputs.len();
+        let mut status = [Status::Okay; RHS_BATCH_WIDTH];
+        let first_pivot = topology.diag[1];
+        for lane in 0..count {
+            let pivot = values[first_pivot].get::<Complex>(lane);
+            status[lane] = if pivot.is_zero() {
+                Status::ZeroDiag
+            } else if !pivot.is_finite() {
+                Status::NonFinite
+            } else {
+                inverses[1].set(lane, pivot.cached_recip());
+                Status::Okay
+            };
+        }
+        match plan.as_ref() {
+            FactorPlan::Compact(runs) => runs.refactor_independent_tile(
+                values,
+                &topology.diag,
+                scratch,
+                inverses,
+                &mut status,
+                count,
+            ),
+            FactorPlan::Wide(runs) => runs.refactor_independent_tile(
+                values,
+                &topology.diag,
+                scratch,
+                inverses,
+                &mut status,
+                count,
+            ),
+        }
+        for (lane, status) in status.iter_mut().enumerate().take(count) {
+            if *status == Status::Okay && values.iter().any(|v| !v.get::<Complex>(lane).is_finite())
+            {
+                *status = Status::NonFinite;
+            }
+        }
+        Some(status)
+    }
+
+    /// Materialize independent immutable numeric factors for callers that
+    /// must retain snapshots, perform multiple RHS or transposed solves.
+    pub(super) fn factor_independent_tile(
+        frames: &mut [Self],
+        workspace: &mut IndependentFactorTileWorkspace,
+    ) -> Option<[Status; RHS_BATCH_WIDTH]> {
+        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
+
+        let first = frames.first()?;
+        let plan = first.lifecycle.plan()?;
+        if frames.iter().any(|frame| {
+            !frame.coefficients_loaded()
+                || !matches!(frame.lifecycle.plan(), Some(other)
+                    if std::sync::Arc::ptr_eq(other, plan))
+                || !std::sync::Arc::ptr_eq(&frame.topology, &first.topology)
+        }) {
+            return None;
+        }
+        let original_entries = first.topology.original_entries;
+        let inputs: [&[Complex]; RHS_BATCH_WIDTH] = std::array::from_fn(|lane| {
+            frames
+                .get(lane)
+                .map_or(&[][..], |frame| &frame.values[..original_entries])
+        });
+        let mut status =
+            Self::factor_independent_packed(first, &inputs[..frames.len()], workspace)?;
+        for (lane, frame) in frames.iter_mut().enumerate() {
+            if status[lane] == Status::Okay {
+                if frame.prepare_inverses().is_err() {
+                    status[lane] = Status::Resource;
+                } else {
+                    for (dst, packed) in frame.values.iter_mut().zip(&workspace.values) {
+                        *dst = packed.get::<Complex>(lane);
+                    }
+                    for (dst, packed) in frame.inverses.iter_mut().zip(&workspace.inverses) {
+                        *dst = packed.get::<Complex>(lane);
+                    }
+                    status[lane] = frame.done();
+                }
+            }
+            frame.last_attempt = Some(FactorAttempt {
+                path: AttemptPath::Refactor,
+                status: status[lane],
+            });
+        }
+        Some(status)
+    }
+
+    /// Factor and solve independent numeric matrices without creating one
+    /// scalar LU snapshot per lane. Each input is the original-element
+    /// stream in the reference's order, and each RHS is in external order.
+    /// None indicates an unsupported packed shape or exhausted scratch,
+    /// in which case the caller can use independent scalar factors.
+    pub(super) fn factor_and_solve_independent_tile(
+        reference: &Self,
+        inputs: &[&[Complex]],
+        rhs: &[&[Complex]],
+        workspace: &mut IndependentFactorTileWorkspace,
+        transposed: bool,
+    ) -> Option<([Status; RHS_BATCH_WIDTH], Vec<Option<Vec<Complex>>>)> {
+        if inputs.len() != rhs.len()
+            || rhs.iter().any(|source| {
+                source.len() != reference.ext_size || source.iter().any(|value| !value.is_finite())
+            })
+        {
+            return None;
+        }
+        let mut status = Self::factor_independent_packed(reference, inputs, workspace)?;
+        let count = inputs.len();
+        let active = LaneMask::from_array(std::array::from_fn(|lane| {
+            lane < count && status[lane] == Status::Okay
+        }));
+        let topology = &reference.topology;
+        if active.any() {
+            let gather = if transposed {
+                &topology.int_to_ext_col
+            } else {
+                &topology.int_to_ext_row
+            };
+            for (internal, &external) in gather[1..=reference.size].iter().enumerate() {
+                workspace.scratch[internal + 1] =
+                    LaneParts::from_lanes(std::array::from_fn(|lane| {
+                        rhs.get(lane)
+                            .map_or(Complex::ZERO, |source| source[external - 1])
+                    }));
+            }
+            match reference.lifecycle.plan()?.as_ref() {
+                FactorPlan::Compact(runs) => runs.solve_independent_tile(
+                    &workspace.values,
+                    &topology.diag,
+                    &workspace.inverses,
+                    &mut workspace.scratch,
+                    active,
+                    transposed,
+                ),
+                FactorPlan::Wide(runs) => runs.solve_independent_tile(
+                    &workspace.values,
+                    &topology.diag,
+                    &workspace.inverses,
+                    &mut workspace.scratch,
+                    active,
+                    transposed,
+                ),
+            }
+        }
+        let scatter = if transposed {
+            &topology.ext_to_int_row
+        } else {
+            &topology.ext_to_int_col
+        };
+        let mut output = Vec::new();
+        output.try_reserve(count).ok()?;
+        for lane in 0..count {
+            if status[lane] != Status::Okay {
+                output.push(None);
+                continue;
+            }
+            let mut solution = Vec::new();
+            solution.try_reserve(reference.ext_size).ok()?;
+            for (index, &internal) in scatter[1..].iter().enumerate() {
+                let value = if internal == NONE {
+                    rhs[lane][index]
+                } else {
+                    workspace.scratch[internal].get::<Complex>(lane)
+                };
+                if !value.is_finite() {
+                    status[lane] = Status::NonFinite;
+                    break;
+                }
+                solution.push(value);
+            }
+            output.push((status[lane] == Status::Okay).then_some(solution));
+        }
+        Some((status, output))
     }
 }
 
