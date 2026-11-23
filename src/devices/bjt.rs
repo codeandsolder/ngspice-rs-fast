@@ -1151,6 +1151,10 @@ impl Bjt {
 }
 
 impl Device for Bjt {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.thermal(context).map(|_| ())
+    }
+
     /// `bjtsetup.c` without quasi-saturation (`RCO`, which the port rejects),
     /// so `collCX` is the collector prime; a three-terminal device's
     /// substrate is ground and allocates nothing.

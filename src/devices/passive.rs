@@ -455,6 +455,13 @@ impl PassiveParameters {
         context: &ModelContext,
     ) -> SpiceResult<Real> {
         valid_value(self.kind, nominal, &self.location)?;
+        // An explicitly supplied model-backed resistance follows the same
+        // C RESparam floor as the actual instance replacement.
+        let nominal = if self.kind == PassiveKind::Resistor {
+            crate::devices::rlc::clamp_resistance(nominal)
+        } else {
+            nominal
+        };
         self.effective_value_for(nominal, context)
     }
 

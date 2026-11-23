@@ -1081,6 +1081,11 @@ impl Mesa {
 }
 
 impl Device for Mesa {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.derived(context.temperature, context.nominal_temperature)
+            .map(|_| ())
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
