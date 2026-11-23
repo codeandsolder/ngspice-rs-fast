@@ -500,16 +500,32 @@ pub(crate) struct DiodeLoadSample {
 }
 
 impl DiodeLoadSample {
-    /// Run only the physical junction kernel. Can be evaluated in arbitrary
-    /// lane order after the sampling phase without accessing solver state.
-    /// # Errors
-    /// Nonfinite or unsupported junction physics.
-    pub(crate) fn evaluate(self, gmin: Real) -> SpiceResult<DiodeLoadEvaluation> {
-        let mut point = if self.lenient {
-            self.thermal.point_unchecked(self.voltage, gmin)?
-        } else {
-            self.thermal.point(self.voltage, gmin)?
-        };
+    /// Four complete physical evaluations with scalar branch/transcendental
+    /// decisions and portable SIMD for their shared continuous algebra.
+    pub(crate) fn evaluate_four(
+        samples: [Self; 4],
+        gmin: Real,
+    ) -> [SpiceResult<DiodeLoadEvaluation>; 4] {
+        let parts = samples.map(|sample| sample.thermal.point_parts(sample.voltage, gmin));
+        match parts {
+            [Ok(a), Ok(b), Ok(c), Ok(d)] => {
+                let points = DiodePointParts::finish_four([a, b, c, d]);
+                std::array::from_fn(|i| samples[i].finish_evaluation(points[i]))
+            }
+            parts => std::array::from_fn(|i| {
+                parts[i]
+                    .as_ref()
+                    .map(|part| part.finish())
+                    .map_err(Clone::clone)
+                    .and_then(|point| samples[i].finish_evaluation(point))
+            }),
+        }
+    }
+
+    fn finish_evaluation(self, mut point: DiodePoint) -> SpiceResult<DiodeLoadEvaluation> {
+        if !self.lenient {
+            Thermal::check_point(point)?;
+        }
         if self.c_jacobian {
             point.junction.conductance = point.ac_conductance;
         }
@@ -520,6 +536,15 @@ impl DiodeLoadSample {
             raw: self.raw,
             voltage: self.voltage,
         })
+    }
+
+    /// Run only the physical junction kernel. Can be evaluated in arbitrary
+    /// lane order after the sampling phase without accessing solver state.
+    /// # Errors
+    /// Nonfinite or unsupported junction physics.
+    pub(crate) fn evaluate(self, gmin: Real) -> SpiceResult<DiodeLoadEvaluation> {
+        let point = self.thermal.point_unchecked(self.voltage, gmin)?;
+        self.finish_evaluation(point)
     }
 }
 
@@ -1377,6 +1402,13 @@ impl Thermal {
     /// soft recovery, no self-heating).
     fn point(&self, vd: Real, gmin: Real) -> SpiceResult<DiodePoint> {
         let point = self.point_unchecked(vd, gmin)?;
+        Self::check_point(point)?;
+        Ok(point)
+    }
+
+    /// [`Self::point`] without the final finiteness checks, for a `.sens`
+    /// stand-in that must carry C's NaN.
+    fn check_point(point: DiodePoint) -> SpiceResult<()> {
         point.junction.validate()?;
         if !point.ac_conductance.is_finite() || !point.ac_capacitance.is_finite() {
             return Err(SpiceError::Numerical {
@@ -1384,12 +1416,14 @@ impl Thermal {
                 message: "nonfinite small-signal junction values".into(),
             });
         }
-        Ok(point)
+        Ok(())
     }
 
-    /// [`Self::point`] without the final finiteness checks, for a `.sens`
-    /// stand-in that must carry C's NaN.
     fn point_unchecked(&self, vd: Real, gmin: Real) -> SpiceResult<DiodePoint> {
+        self.point_parts(vd, gmin).map(DiodePointParts::finish)
+    }
+
+    fn point_parts(&self, vd: Real, gmin: Real) -> SpiceResult<DiodePointParts> {
         let vte = self.n * self.vt;
         let vtebrk = self.nbv * self.vt;
         let breakdown = self.breakdown.map(|bv| (bv, vtebrk));
@@ -1479,28 +1513,98 @@ impl Thermal {
         if let Some(k) = self.ikp.filter(|_| cdsw > 1e-18) {
             (cdsw, gdsw) = high_injection(cdsw, gdsw, k, true);
         }
-        let shunt_current = gmin * vd;
-        let current = cdb + cdsw + shunt_current;
-        let conductance = gdb + gdsw + gmin;
-        let ac_conductance = ac_gdb + gdsw + gmin;
         let (charge, capacitance) = self.bottom.charge(vd, self.cjo, None);
         let (charge_sw, capacitance_sw) = self.sidewall.charge(vd, self.cjsw, None);
-        // dioload.c, in its order: diffusion (TT times the current including
-        // gmin), bottom depletion, sidewall depletion.
+        Ok(DiodePointParts {
+            cdb,
+            cdsw,
+            gdb,
+            gdsw,
+            ac_gdb,
+            gmin,
+            vd,
+            tt: self.tt,
+            charge,
+            capacitance,
+            charge_sw,
+            capacitance_sw,
+        })
+    }
+}
+
+/// The complete branch-dependent junction physics before C's shared
+/// current, derivative, depletion and diffusion-charge accumulation.
+#[derive(Clone, Copy)]
+struct DiodePointParts {
+    cdb: Real,
+    cdsw: Real,
+    gdb: Real,
+    gdsw: Real,
+    ac_gdb: Real,
+    gmin: Real,
+    vd: Real,
+    tt: Real,
+    charge: Real,
+    capacitance: Real,
+    charge_sw: Real,
+    capacitance_sw: Real,
+}
+
+impl DiodePointParts {
+    fn finish(self) -> DiodePoint {
+        let shunt_current = self.gmin * self.vd;
+        let current = self.cdb + self.cdsw + shunt_current;
+        let conductance = self.gdb + self.gdsw + self.gmin;
+        let ac_conductance = self.ac_gdb + self.gdsw + self.gmin;
+        // C: diffusion before bottom depletion before sidewall depletion.
         let diffusion_charge = self.tt * current;
         let diffusion_capacitance = self.tt * conductance;
         let ac_diffusion_capacitance = self.tt * ac_conductance;
-        let point = DiodePoint {
+        DiodePoint {
             junction: JunctionPoint {
                 current,
                 conductance,
-                charge: diffusion_charge + charge + charge_sw,
-                capacitance: diffusion_capacitance + capacitance + capacitance_sw,
+                charge: diffusion_charge + self.charge + self.charge_sw,
+                capacitance: diffusion_capacitance + self.capacitance + self.capacitance_sw,
             },
             ac_conductance,
-            ac_capacitance: ac_diffusion_capacitance + capacitance + capacitance_sw,
+            ac_capacitance: ac_diffusion_capacitance + self.capacitance + self.capacitance_sw,
+        }
+    }
+
+    fn finish_four(parts: [Self; 4]) -> [DiodePoint; 4] {
+        use std::simd::f64x4;
+
+        let lane = |project: fn(&Self) -> Real| {
+            f64x4::from_array(std::array::from_fn(|i| project(&parts[i])))
         };
-        Ok(point)
+        let shunt_current = lane(|p| p.gmin) * lane(|p| p.vd);
+        let current = lane(|p| p.cdb) + lane(|p| p.cdsw) + shunt_current;
+        let conductance = lane(|p| p.gdb) + lane(|p| p.gdsw) + lane(|p| p.gmin);
+        let ac_conductance = lane(|p| p.ac_gdb) + lane(|p| p.gdsw) + lane(|p| p.gmin);
+        let diffusion_charge = lane(|p| p.tt) * current;
+        let diffusion_capacitance = lane(|p| p.tt) * conductance;
+        let ac_diffusion_capacitance = lane(|p| p.tt) * ac_conductance;
+        let charge = (diffusion_charge + lane(|p| p.charge) + lane(|p| p.charge_sw)).to_array();
+        let capacitance =
+            (diffusion_capacitance + lane(|p| p.capacitance) + lane(|p| p.capacitance_sw))
+                .to_array();
+        let ac_capacitance =
+            (ac_diffusion_capacitance + lane(|p| p.capacitance) + lane(|p| p.capacitance_sw))
+                .to_array();
+        let current = current.to_array();
+        let conductance = conductance.to_array();
+        let ac_conductance = ac_conductance.to_array();
+        std::array::from_fn(|i| DiodePoint {
+            junction: JunctionPoint {
+                current: current[i],
+                conductance: conductance[i],
+                charge: charge[i],
+                capacitance: capacitance[i],
+            },
+            ac_conductance: ac_conductance[i],
+            ac_capacitance: ac_capacitance[i],
+        })
     }
 }
 
@@ -2223,6 +2327,166 @@ mod tests {
                 "{v}: dQ/dV {c} vs {}",
                 p.capacitance
             );
+        }
+    }
+
+    #[test]
+    fn four_lane_physical_assembly_preserves_every_scalar_result_bit() {
+        // Different thermal contexts, area and perimeter are intentional:
+        // a finalized same-model tile can contain independent instance states.
+        let cases = [
+            ("is=1e-14", ""),
+            ("is=1e-14 n=1.1 bv=5.1 ibv=5m nbv=1.4 cjo=30p tt=5n", "m=2"),
+            (
+                "is=1e-14 jsw=2e-15 ns=1.6 cjsw=4p vjsw=0.8 mjsw=0.3 fcs=0.4 bv=5.1",
+                "pj=10",
+            ),
+            (
+                "is=1e-14 jsw=2e-15 cjsw=4p vjsw=0.8 mjsw=0.3 fcs=0.4 ikp=1u",
+                "pj=10 m=2",
+            ),
+            ("isr=1e-11 nr=2.2 vj=0.8 m=0.4 cjo=5p", "pj=4"),
+            (
+                "jtun=1e-13 jtunsw=1e-14 ntun=20 xtitun=2 keg=0.9 bv=7",
+                "pj=4",
+            ),
+            ("ikf=1m ikr=1n is=1e-12", "pj=4"),
+            (
+                "isr=1e-11 jtun=1e-12 ikf=1m ikr=1u bv=5.1 jsw=1e-15 ns=1.2",
+                "pj=4",
+            ),
+        ];
+        let voltages = [
+            -1_000.,
+            -11.,
+            -7.,
+            -5.1,
+            -3.5,
+            -1.,
+            -0.3,
+            -0.1,
+            -0.08,
+            -0.0,
+            0.,
+            f64::MIN_POSITIVE,
+            1e-14,
+            0.025,
+            0.1,
+            0.25,
+            0.5,
+            0.7,
+            1.2,
+            1_000.,
+        ];
+        let mut evaluated = 0;
+        for (model, instance) in cases {
+            let ts = [
+                thermal(model, instance, -40.),
+                thermal(model, instance, 27.),
+                thermal(model, instance, 100.),
+                thermal(model, instance, 0.),
+            ];
+            for gmin in [0., 1e-12, 1e-8] {
+                for index in 0..voltages.len() {
+                    let voltages: [Real; 4] =
+                        std::array::from_fn(|i| voltages[(index + i) % voltages.len()]);
+                    let parts = std::array::from_fn(|i| ts[i].point_parts(voltages[i], gmin));
+                    if let [Ok(a), Ok(b), Ok(c), Ok(d)] = parts {
+                        let scalar = [a, b, c, d].map(DiodePointParts::finish);
+                        let vector = DiodePointParts::finish_four([a, b, c, d]);
+                        for i in 0..4 {
+                            let a = scalar[i];
+                            let b = vector[i];
+                            for (kind, actual, expected) in [
+                                ("current", b.junction.current, a.junction.current),
+                                (
+                                    "conductance",
+                                    b.junction.conductance,
+                                    a.junction.conductance,
+                                ),
+                                ("charge", b.junction.charge, a.junction.charge),
+                                (
+                                    "capacitance",
+                                    b.junction.capacitance,
+                                    a.junction.capacitance,
+                                ),
+                                ("ac conductance", b.ac_conductance, a.ac_conductance),
+                                ("ac capacitance", b.ac_capacitance, a.ac_capacitance),
+                            ] {
+                                assert_eq!(
+                                    actual.to_bits(),
+                                    expected.to_bits(),
+                                    "{model}: {kind}, lane={i}, v={:?}, gmin={gmin}",
+                                    voltages[i]
+                                );
+                            }
+                        }
+                        evaluated += 4;
+                    }
+                }
+            }
+        }
+        assert!(evaluated > 500, "insufficient valid model/voltage coverage");
+    }
+
+    /// Expensive transcendental work and AoS gathering may outweigh packed
+    /// arithmetic. Report whole physical evaluation, not SIMD math in isolation.
+    #[test]
+    #[ignore = "manual release profile physical SIMD throughput"]
+    fn four_lane_diode_physics_benchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        let models = [
+            thermal("is=1e-14", "", 27.),
+            thermal("isr=1e-11 nr=2.2 vj=0.8 m=0.4 cjo=5p", "", 100.),
+            thermal("is=1e-14 bv=5.1 ibv=5m nbv=1.4", "", -20.),
+            thermal("is=1e-14 jsw=2e-15 ns=1.6 cjsw=4p", "pj=10", 27.),
+            thermal("jtun=1e-13 jtunsw=1e-14 ntun=20", "pj=4", 100.),
+            thermal("ikf=1m ikr=1n is=1e-12", "", 27.),
+            thermal("isr=1e-11 jtun=1e-12 ikf=1m ikr=1u bv=5.1", "", -20.),
+            thermal("cjo=20p cjsw=2p mjsw=0.3", "pj=3", 27.),
+        ];
+        let voltages = [-0.3, -0.1, -0.0, 1e-20, 0.03, 0.2, 0.5, 0.7];
+        for count in [1, 4, 64, 256, 1_024, 4_096] {
+            let inputs: Vec<(Thermal, Real)> = (0..count)
+                .map(|i| (models[i % models.len()], voltages[i % voltages.len()]))
+                .collect();
+            let rounds = (16_384 / count).max(32);
+            for vectorized in [false, true] {
+                let evaluate = || {
+                    if vectorized {
+                        let mut chunks = inputs.chunks_exact(4);
+                        for group in &mut chunks {
+                            let parts: [DiodePointParts; 4] = std::array::from_fn(|i| {
+                                group[i].0.point_parts(group[i].1, 1e-12).unwrap()
+                            });
+                            black_box(DiodePointParts::finish_four(parts));
+                        }
+                        for &(thermal, voltage) in chunks.remainder() {
+                            black_box(thermal.point_unchecked(voltage, 1e-12).unwrap());
+                        }
+                    } else {
+                        for &(thermal, voltage) in &inputs {
+                            black_box(thermal.point_unchecked(voltage, 1e-12).unwrap());
+                        }
+                    }
+                };
+                let mut observations = Vec::with_capacity(3);
+                for repeat in 0..4 {
+                    let start = Instant::now();
+                    for _ in 0..rounds {
+                        evaluate();
+                    }
+                    if repeat > 0 {
+                        observations.push(start.elapsed().as_nanos());
+                    }
+                }
+                observations.sort_unstable();
+                println!(
+                    "diode_physics count={count} simd={vectorized} per_device_ns={:.2}",
+                    observations[1] as f64 / (count * rounds) as f64,
+                );
+            }
         }
     }
 

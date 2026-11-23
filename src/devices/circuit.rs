@@ -2849,13 +2849,42 @@ impl Circuit {
                     })();
                     lanes.push(Lane::Gathered(sampled));
                 }
-                for lane in &mut lanes {
+                let evaluate_one = |lane: &mut Lane| -> SpiceResult<()> {
                     let Lane::Gathered(sample) = std::mem::replace(lane, Lane::Consumed) else {
                         return Err(SpiceError::circuit("invalid diode tile evaluation phase"));
                     };
                     *lane = Lane::Ready(
                         sample.and_then(|sample| sample.evaluate(request.model_context.gmin)),
                     );
+                    Ok(())
+                };
+                let mut groups = lanes.chunks_exact_mut(4);
+                for group in &mut groups {
+                    // All lanes share the same checked physical model family,
+                    // not necessarily an identical temperature or geometry.
+                    if let [
+                        Lane::Gathered(Ok(a)),
+                        Lane::Gathered(Ok(b)),
+                        Lane::Gathered(Ok(c)),
+                        Lane::Gathered(Ok(d)),
+                    ] = &*group
+                    {
+                        let samples = [*a, *b, *c, *d];
+                        let results =
+                            DiodeLoadSample::evaluate_four(samples, request.model_context.gmin);
+                        for (lane, result) in group.iter_mut().zip(results) {
+                            *lane = Lane::Ready(result);
+                        }
+                    } else {
+                        // Preserve any sampling failure at its original load
+                        // position without changing a successful neighbor.
+                        for lane in group {
+                            evaluate_one(lane)?;
+                        }
+                    }
+                }
+                for lane in groups.into_remainder() {
+                    evaluate_one(lane)?;
                 }
             }
             let device = point.device(self, index);

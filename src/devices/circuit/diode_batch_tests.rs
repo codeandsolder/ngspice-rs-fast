@@ -2,7 +2,7 @@
 //! planning optimization. Inspect raw MNA/state bits, not merely solved plots.
 use super::Circuit;
 
-fn diode_circuits(count: usize, model_groups: bool) -> (Circuit, Circuit) {
+fn diode_circuits(count: usize, model_groups: bool, rich: bool) -> (Circuit, Circuit) {
     use crate::netlist::{Parser, source::parse_deck_text};
     use std::{fmt::Write, path::Path};
 
@@ -10,8 +10,13 @@ fn diode_circuits(count: usize, model_groups: bool) -> (Circuit, Circuit) {
     deck.push_str("v1 n0 0 dc 0\nr1 n0 n1 100\n");
     // ngspice rejects unused model declarations: each test size has
     // precisely the models its source cards actually reference.
+    const FULL_PHYSICS: &str = "is=1e-14 n=1.1 rs=2 cjo=30p tt=5n vj=0.8 m=0.4 fc=0.5          bv=5.1 ibv=5m nbv=1.4 jsw=2e-15 ns=1.6 cjsw=4p vjsw=0.8 mjsw=0.3          fcs=0.4 isr=1e-11 nr=2.2 ikf=1m ikr=1u ikp=1u          jtun=1e-13 jtunsw=1e-14 ntun=20";
     if count >= 2 || (count > 0 && !model_groups) {
-        deck.push_str(".model dm d(is=1e-14 rs=2 cjo=2p tt=3n)\n");
+        if rich {
+            writeln!(&mut deck, ".model dm d({FULL_PHYSICS})").unwrap();
+        } else {
+            deck.push_str(".model dm d(is=1e-14 rs=2 cjo=2p tt=3n)\n");
+        }
     }
     if count > 0 && model_groups {
         deck.push_str(".model dn d(is=2e-14 rs=0 cjo=4p tt=1n)\n");
@@ -23,7 +28,18 @@ fn diode_circuits(count: usize, model_groups: bool) -> (Circuit, Circuit) {
             "dm"
         };
         let node = index % 8;
-        writeln!(&mut deck, "d{index} n{node} 0 {model}").unwrap();
+        if rich {
+            let area = 1 + index % 4;
+            let perimeter = 1 + index % 7;
+            let temperature = 5 + (index % 5) * 20;
+            writeln!(
+                &mut deck,
+                "d{index} n{node} 0 {model} area={area} pj={perimeter} temp={temperature}"
+            )
+            .unwrap();
+        } else {
+            writeln!(&mut deck, "d{index} n{node} 0 {model}").unwrap();
+        }
         if index % 23 == 0 {
             writeln!(&mut deck, "r{index} n{node} 0 2k").unwrap();
         }
@@ -149,11 +165,12 @@ fn compare_diode_load(
     c_jacobian: bool,
     temperature: f64,
     bad_node: Option<&str>,
+    rich: bool,
 ) {
     use crate::devices::{AnalysisMode, LoadRequest, ModelContext};
     use crate::maths::Vector;
 
-    let (batched, scalar) = diode_circuits(count, model_groups);
+    let (batched, scalar) = diode_circuits(count, model_groups, rich);
     let n = batched.unknown_count();
     let mut solution = Vector::zeros(n);
     for row in 0..n {
@@ -163,6 +180,23 @@ fn compare_diode_load(
                 f64::from(u32::try_from(row % 17).unwrap()).mul_add(0.017, -0.12),
             )
             .unwrap();
+    }
+    if rich {
+        for (name, voltage) in [
+            ("n0", -6.),
+            ("n1", 0.8),
+            ("n2", -0.08),
+            ("n3", 1.),
+            ("n4", -5.5),
+            ("n5", 0.55),
+            ("n6", -0.3),
+            ("n7", 0.),
+        ] {
+            let node = batched.nodes.get(name).unwrap();
+            if let Some(row) = batched.bindings.unknowns.node_row(node) {
+                solution.set(row, voltage).unwrap();
+            }
+        }
     }
     if let Some(name) = bad_node {
         let node = batched.nodes.get(name).unwrap();
@@ -249,6 +283,7 @@ fn diode_tiles_are_bitwise_equivalent_to_scalar_load_across_modes_and_sizes() {
             false,
             27.,
             None,
+            false,
         );
     }
     for &phase in &[
@@ -257,8 +292,32 @@ fn diode_tiles_are_bitwise_equivalent_to_scalar_load_across_modes_and_sizes() {
         IterationPhase::Float,
         IterationPhase::Predict,
     ] {
-        compare_diode_load(68, true, phase, true, true, -35., None);
-        compare_diode_load(129, false, phase, false, false, 120., None);
+        compare_diode_load(68, true, phase, true, true, -35., None, false);
+        compare_diode_load(129, false, phase, false, false, 120., None, false);
+    }
+}
+
+#[test]
+fn full_physical_diode_tiles_match_scalar_over_boundaries_and_phases() {
+    use crate::devices::IterationPhase;
+    for &count in &[4, 63, 64, 65, 129] {
+        for &phase in &[
+            IterationPhase::Junction,
+            IterationPhase::Float,
+            IterationPhase::Fix,
+            IterationPhase::Predict,
+        ] {
+            compare_diode_load(
+                count,
+                count % 2 == 1,
+                phase,
+                true,
+                true,
+                -35.,
+                None,
+                true,
+            );
+        }
     }
 }
 
@@ -276,6 +335,7 @@ fn diode_tile_defers_later_lane_error_until_the_original_stamp_position() {
         false,
         27.,
         Some("n5"),
+        false,
     );
 }
 
@@ -288,7 +348,7 @@ fn diode_tiles_follow_swept_instance_replacements_without_stale_physics() {
     use crate::devices::{AnalysisMode, LoadRequest, ModelContext};
     use crate::maths::Vector;
 
-    let (batched, scalar) = diode_circuits(77, false);
+    let (batched, scalar) = diode_circuits(77, false, false);
     assert_eq!(
         batched
             .bindings
