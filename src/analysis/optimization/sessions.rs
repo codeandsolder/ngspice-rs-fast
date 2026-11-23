@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::mpsc;
 
+use crate::analysis::optimization::derivatives::{self, DerivativeRequest, InputDerivative};
 use crate::analysis::optimization::objectives::{PlotObjectives, ScenarioFailure, ScenarioPlan};
 use crate::analysis::optimization::parameters::{
     CandidateTopology, CircuitCandidate, CircuitParameterPlan,
@@ -96,6 +97,27 @@ pub struct CandidateResult {
     pub outcome: Result<Vec<Vec<PlotObjectives>>, CandidateFailure>,
 }
 
+/// One candidate's independently computed physical parameter gradient,
+/// without per-parameter circuit resimulation.
+pub struct CandidateDerivativeResult {
+    /// Original caller-defined candidate identity.
+    pub id: u64,
+    /// Validated topology, or None on failed parameter preparation.
+    pub topology: Option<CandidateTopology>,
+    /// Gradient statuses in root parameter input order.
+    pub outcome: Result<Vec<InputDerivative>, CandidateDerivativeFailure>,
+}
+
+/// Only preparation or common primal/adjoint execution failures abort the
+/// derivative result; unsupported individual coordinates stay in the vector.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CandidateDerivativeFailure {
+    /// Candidate coordinates could not be applied transactionally.
+    Preparation(SpiceError),
+    /// The shared physical sensitivity objective failed to execute.
+    Evaluation(SpiceError),
+}
+
 /// Counters for a bounded stream, including each failed candidate.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EnsembleStatistics {
@@ -161,6 +183,36 @@ impl<'a> CandidateWorker<'a> {
             id: job.id,
             topology: Some(topology),
             outcome: result,
+        }
+    }
+
+    /// Evaluate one direct smooth DC/AC objective's derivatives after
+    /// transactional parameter preparation. This uses the same independent
+    /// candidate worker state as black-box objective evaluation, but one
+    /// sensitivity adjoint instead of one simulation per tunable parameter.
+    ///
+    /// Unsupported input parameters have typed statuses in the successful
+    /// result; only common parameter preparation and solver failures abort.
+    pub fn evaluate_gradient(
+        &mut self,
+        job: &CandidateJob,
+        request: &DerivativeRequest,
+    ) -> CandidateDerivativeResult {
+        let mut budget = EvalBudget::new(self.limits);
+        if let Err(error) = self.session.update(&job.values, &mut budget) {
+            return CandidateDerivativeResult {
+                id: job.id,
+                topology: None,
+                outcome: Err(CandidateDerivativeFailure::Preparation(error)),
+            };
+        }
+        let topology = self.session.topology();
+        self.session.circuit_mut().clear_candidate_analysis_state();
+        CandidateDerivativeResult {
+            id: job.id,
+            topology: Some(topology),
+            outcome: derivatives::evaluate(&mut self.session, request, self.limits)
+                .map_err(CandidateDerivativeFailure::Evaluation),
         }
     }
 

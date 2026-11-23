@@ -10,17 +10,18 @@
 use std::sync::Arc;
 
 use crate::analysis::RunConfig;
+use crate::analysis::sens::{PhysicalParameter, conditioned_derivative};
 use crate::devices::circuit::Circuit;
 use crate::devices::models::ModelContext;
 use crate::devices::sweep::{InstanceTarget, MAX_INSTANCE_OVERRIDES, MAX_RESISTOR_OVERRIDES};
 use crate::netlist::ast::{Netlist, NodeHintValue, ParameterKind};
 use crate::netlist::elaborate::{self, SiteKind};
 use crate::netlist::eval::{
-    BoundExpression, CandidateParameters, EvalBudget, FunctionScope, ParameterPlan,
+    BoundExpression, CandidateParameters, EvalBudget, EvalLimits, FunctionScope, ParameterPlan,
     ParameterScopeId, ParameterScopeSpec,
 };
 use crate::netlist::expr::ParameterExpression;
-use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{Complex, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// What candidate preparation did to the finalized circuit.
 ///
@@ -81,6 +82,8 @@ pub struct CircuitParameterPlan {
     root: ParameterScopeId,
     config: RunConfig,
     sites: Vec<CandidateSite>,
+    /// Input coordinates affecting numeric options rather than device stamps.
+    option_dependencies: Vec<usize>,
     requires_rebuild: bool,
 }
 
@@ -139,6 +142,20 @@ impl CircuitParameterPlan {
                 route,
             });
         }
+        let mut option_dependencies = Vec::new();
+        for card in &source.options {
+            for setting in &card.settings {
+                if let Some(expression) = &setting.expression {
+                    option_dependencies.extend(
+                        parameters
+                            .bind_expression(root, expression, &mut budget)?
+                            .inputs(),
+                    );
+                }
+            }
+        }
+        option_dependencies.sort_unstable();
+        option_dependencies.dedup();
         // Other consumers of root `.param` are resolved by full elaboration:
         // options, nested formal scopes, behavioural expression rewriting,
         // and output expressions can change independently of scalar sites.
@@ -165,6 +182,7 @@ impl CircuitParameterPlan {
             root,
             config,
             sites,
+            option_dependencies,
             requires_rebuild,
         })
     }
@@ -344,6 +362,20 @@ struct SiteUpdate {
     value: Real,
 }
 
+/// One differentiable parameter site, retaining the typed device identity
+/// and its scalar chain-rule coefficient with respect to an input.
+pub(super) struct GradientSite {
+    pub parameter: PhysicalParameter,
+    pub scale: Real,
+}
+
+/// Whether a candidate root input cannot have a valid scalar chain rule.
+#[derive(Debug, Clone)]
+pub(super) enum GradientSiteFailure {
+    Unsupported(String),
+    NonSmooth(String),
+}
+
 /// Independent candidate state with transactional updates.
 ///
 /// A failed parameter evaluation, device setter or re-elaboration retains the prior
@@ -421,6 +453,148 @@ impl CircuitCandidate<'_> {
         } else {
             CandidateTopology::Reused
         }
+    }
+
+    /// Build a one-off physically re-elaborated circuit for a sensitivity
+    /// walk. A typed candidate overlay changes the *primal* stamps but device
+    /// sensitivity records still describe the original device literals;
+    /// evaluating those records against an overlaid baseline would produce
+    /// an inconsistent Jacobian and a false gradient. Re-elaborate exactly
+    /// once per requested direct objective, never per parameter.
+    pub(super) fn physical_sensitivity_circuit(&self) -> SpiceResult<Circuit> {
+        let scope = self.parameters.resolved_scope(self.plan.root)?;
+        let context = self.config().context().model_context();
+        Circuit::from_netlist_with_scoped_limits(
+            &self.plan.source,
+            &context,
+            crate::devices::MutualLimits::default(),
+            crate::devices::ElaborationLimits::default(),
+            Some(scope),
+        )
+    }
+
+    /// Stable name of one independent root coordinate in plan order.
+    pub(super) fn parameter_input_name(&self, index: usize) -> &str {
+        &self.plan.inputs()[index].name
+    }
+
+    /// Differentiate the compiled scalar parameter DAG without solving a
+    /// circuit for each coordinate. The physical derivative driver performs
+    /// one fresh elaboration, even if the optimized candidate's limited
+    /// numeric overlay capacity forced a structural rebuild. Unsupported
+    /// model/analysis sites invalidate only their dependent inputs.
+    pub(super) fn gradient_sites(
+        &self,
+        limits: EvalLimits,
+    ) -> Vec<Result<Vec<GradientSite>, GradientSiteFailure>> {
+        let mut output: Vec<Result<Vec<GradientSite>, GradientSiteFailure>> =
+            (0..self.values.len()).map(|_| Ok(Vec::new())).collect();
+        // Numeric options can change the solver's convergence regime.
+        // Unknown nested or behavioural expressions have no validated
+        // differentiable-site binding, though black-box evaluation still works.
+        if !self.plan.source.subcircuits.is_empty()
+            || self.plan.source.devices.iter().any(|device| {
+                device
+                    .parameters
+                    .iter()
+                    .any(|parameter| matches!(parameter.kind, ParameterKind::Behavioural(_)))
+            })
+        {
+            for result in &mut output {
+                *result = Err(GradientSiteFailure::Unsupported(
+                    "subcircuit or behavioural parameter dependency lacks a validated derivative binding"
+                        .to_owned(),
+                ));
+            }
+            return output;
+        }
+        for &input in &self.plan.option_dependencies {
+            output[input] = Err(GradientSiteFailure::Unsupported(
+                "input affects numerical analysis options".to_owned(),
+            ));
+        }
+        for (site_index, site) in self.plan.sites.iter().enumerate() {
+            for &input in site.inputs.inputs() {
+                if output[input].is_err() {
+                    continue;
+                }
+                let Some(physical_parameter) = (match (site.kind, site.route) {
+                    (
+                        SiteKind::DeviceParameter { device, parameter },
+                        RouteSpec::Resistor(_) | RouteSpec::Instance { .. },
+                    ) => self.plan.source.devices.get(device).and_then(|card| {
+                        card.parameters.get(parameter).map(|parameter| {
+                            PhysicalParameter::Instance {
+                                instance: card.name.to_ascii_lowercase(),
+                                keyword: parameter.name.clone(),
+                            }
+                        })
+                    }),
+                    (SiteKind::ModelParameter { model, parameter }, _) => {
+                        self.plan.source.models.get(model).and_then(|card| {
+                            card.parameters.get(parameter).map(|parameter| {
+                                PhysicalParameter::Model {
+                                    model: card.name.to_ascii_lowercase(),
+                                    keyword: parameter.name.clone(),
+                                }
+                            })
+                        })
+                    }
+                    _ => None,
+                }) else {
+                    output[input] = Err(GradientSiteFailure::Unsupported(format!(
+                        "input affects a structural, model or unbound site at {}",
+                        site.location
+                    )));
+                    continue;
+                };
+                let mut candidate_values = self.values.clone();
+                let base = self.site_values[site_index];
+                let derivative = conditioned_derivative(self.values[input], |point| {
+                    candidate_values[input] = point;
+                    let mut scratch = self.parameters.clone();
+                    let mut budget = EvalBudget::new(limits);
+                    if scratch.update(&candidate_values, &mut budget).is_err() {
+                        return Ok(None);
+                    }
+                    let raw =
+                        match scratch.evaluate_bound(&site.expression, &site.inputs, &mut budget) {
+                            Ok(value) if value.is_finite() => value,
+                            _ => return Ok(None),
+                        };
+                    let literal = elaborate::format_literal(raw);
+                    let Some(value) = crate::primitives::parse_spice_number(&literal) else {
+                        return Ok(None);
+                    };
+                    Ok(Some(Complex::real(value - base)))
+                });
+                match derivative {
+                    Ok(Some((scale, _))) if scale.re.is_finite() && scale.im == 0. => {
+                        if scale.re != 0. {
+                            if let Ok(ref mut links) = output[input] {
+                                links.push(GradientSite {
+                                    parameter: physical_parameter,
+                                    scale: scale.re,
+                                });
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        output[input] = Err(GradientSiteFailure::NonSmooth(format!(
+                            "non-smooth or unresolvable scalar parameter transformation at {}",
+                            site.location,
+                        )))
+                    }
+                    Err(error) => {
+                        output[input] = Err(GradientSiteFailure::NonSmooth(format!(
+                            "scalar parameter derivative failed at {}: {error}",
+                            site.location,
+                        )))
+                    }
+                }
+            }
+        }
+        output
     }
 
     /// Current committed typed site value by stable plan site index.
