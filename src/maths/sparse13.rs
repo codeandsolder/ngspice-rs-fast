@@ -219,6 +219,7 @@ impl BatchUpdate {
     }
 }
 
+#[cfg(target_feature = "avx2")]
 impl LaneParts {
     fn complex_zero(self) -> LaneMask {
         self.re.simd_eq(f64x4::splat(0.)) & self.im.simd_eq(f64x4::splat(0.))
@@ -756,6 +757,7 @@ impl<I: PlanIndex> FactorRuns<I> {
 
     /// A fixed-order refactor of independent complex matrix lanes. Failed
     /// pivots deactivate only their lane, pending a scalar reorder retry.
+    #[cfg(target_feature = "avx2")]
     fn refactor_complex_batch(
         &self,
         work: &mut ComplexFactorBatch,
@@ -1684,15 +1686,42 @@ impl<T: Clone> Clone for Sparse<T> {
 }
 
 impl Sparse<Complex> {
-    /// Numeric factorization of independent coefficient frames against one
-    /// immutable ordered topology. Each lane owns its numeric pivots/factors;
-    /// a failed fixed-order pivot is retried using scalar SPARSE reordering.
+    /// Independently refactor a coefficient frame with the shared fixed pivot
+    /// plan and its original scalar zero-pivot reordering fallback.
+    fn scalar_frequency_factor(
+        baseline: &Self,
+        values: &[Complex],
+        scratch: &mut Vec<Complex>,
+    ) -> (Self, Status, crate::maths::FactorWork) {
+        let mut frame = baseline.fork_loaded(values.iter().copied());
+        let mut attempts = crate::maths::FactorWork::default();
+        let mut status = frame.factor_with_workspace(scratch);
+        attempts += frame.last_attempt();
+        if status == Status::ZeroDiag {
+            attempts.zero_pivot_retries += 1;
+            frame.reload_originals(values);
+            status = frame.order_and_factor(baseline.rel_threshold, baseline.abs_threshold);
+            attempts += frame.last_attempt();
+        }
+        (frame, status, attempts)
+    }
+
+    /// Refactor one tile in the optimal numeric layout for the compile-time
+    /// feature set. Plain x86-64 and partial tiles use the scalar traversal
+    /// with one shared scratch buffer. A four-lane AVX2 build uses packed
+    /// real/imaginary planes and independent exceptional-pivot recovery.
+    #[cfg_attr(
+        not(target_feature = "avx2"),
+        expect(
+            clippy::needless_pass_by_ref_mut,
+            reason = "the AVX2 build mutates the shared batch scratch; generic targets reuse the scalar traversal without scratch"
+        )
+    )]
     pub(super) fn factor_complex_batch(
         baseline: &Self,
         coefficients: &[&[Complex]],
         work: &mut ComplexFactorBatch,
     ) -> SpiceResult<Vec<(Self, Status, crate::maths::FactorWork)>> {
-        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
         if coefficients.len() > RHS_BATCH_WIDTH
             || coefficients
                 .iter()
@@ -1703,9 +1732,46 @@ impl Sparse<Complex> {
                 "invalid lane or coefficient shape",
             ));
         }
-        let Some(plan) = baseline.lifecycle.plan() else {
+        if baseline.lifecycle.plan().is_none() {
             return Err(numerical("complex factor batch", "no ordered traversal"));
-        };
+        }
+        // A 256-bit vector is available in safe code when the build target
+        // explicitly guarantees AVX2. On baseline targets a four-component
+        // vector is split into narrower instructions and loses to scalar LU.
+        // Full lanes also avoid masked tail overhead and scalar is faster
+        // for very small matrices. No architecture-specific intrinsics or
+        // unsafe runtime feature dispatch is introduced.
+        #[cfg(target_feature = "avx2")]
+        if coefficients.len() == RHS_BATCH_WIDTH && baseline.size >= 16 {
+            return Self::factor_complex_batch_avx2(baseline, coefficients, work);
+        }
+
+        let _ = work;
+        let mut output = Vec::new();
+        sparse_reserve(&mut output, coefficients.len())?;
+        let mut scratch = Vec::new();
+        for &values in coefficients {
+            output.push(Self::scalar_frequency_factor(
+                baseline,
+                values,
+                &mut scratch,
+            ));
+        }
+        Ok(output)
+    }
+
+    /// Full-width AoSoA refactor; only instantiated on AVX2 build targets.
+    #[cfg(target_feature = "avx2")]
+    fn factor_complex_batch_avx2(
+        baseline: &Self,
+        coefficients: &[&[Complex]],
+        work: &mut ComplexFactorBatch,
+    ) -> SpiceResult<Vec<(Self, Status, crate::maths::FactorWork)>> {
+        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
+        let plan = baseline
+            .lifecycle
+            .plan()
+            .expect("validated ordered traversal");
         for (buffer, count) in [
             (&mut work.values, baseline.values.len()),
             (&mut work.scratch, baseline.size + 1),
@@ -1735,44 +1801,34 @@ impl Sparse<Complex> {
         };
         let mut output = Vec::new();
         sparse_reserve(&mut output, coefficients.len())?;
+        let mut scalar_scratch = Vec::new();
         for (lane, &values) in coefficients.iter().enumerate() {
-            // Successful SIMD lanes already contain complete factored values.
-            // Materialize each exactly once, without first copying originals
-            // and then overwriting every entry and pivot reciprocal.
-            let mut frame = if failures[lane].is_none() {
-                let mut lane_values = Vec::new();
-                sparse_reserve(&mut lane_values, work.values.len())?;
-                lane_values.extend(work.values.iter().map(|packed| packed.get::<Complex>(lane)));
-                baseline.fork_values(lane_values)
-            } else {
-                baseline.fork_loaded(values.iter().copied())
-            };
-            let mut attempts = crate::maths::FactorWork::default();
-            let status = if failures[lane].is_none() {
-                sparse_reserve(&mut frame.inverses, baseline.size + 1)?;
-                frame.inverses.extend(
-                    work.inverses
-                        .iter()
-                        .map(|packed| packed.get::<Complex>(lane)),
-                );
-                let status = frame.done();
-                frame.last_attempt = Some(FactorAttempt {
-                    path: AttemptPath::Refactor,
-                    status,
-                });
-                attempts += frame.last_attempt();
-                status
-            } else {
-                let mut status = frame.factor_with_workspace(&mut Vec::new());
-                attempts += frame.last_attempt();
-                if status == Status::ZeroDiag {
-                    attempts.zero_pivot_retries += 1;
-                    frame.reload_originals(values);
-                    status = frame.order_and_factor(baseline.rel_threshold, baseline.abs_threshold);
-                    attempts += frame.last_attempt();
-                }
-                status
-            };
+            if failures[lane].is_some() {
+                output.push(Self::scalar_frequency_factor(
+                    baseline,
+                    values,
+                    &mut scalar_scratch,
+                ));
+                continue;
+            }
+            // Materialize the already-factored lane once, without an
+            // intermediate copy of its original coefficients.
+            let mut lane_values = Vec::new();
+            sparse_reserve(&mut lane_values, work.values.len())?;
+            lane_values.extend(work.values.iter().map(|packed| packed.get::<Complex>(lane)));
+            let mut frame = baseline.fork_values(lane_values);
+            sparse_reserve(&mut frame.inverses, baseline.size + 1)?;
+            frame.inverses.extend(
+                work.inverses
+                    .iter()
+                    .map(|packed| packed.get::<Complex>(lane)),
+            );
+            let status = frame.done();
+            frame.last_attempt = Some(FactorAttempt {
+                path: AttemptPath::Refactor,
+                status,
+            });
+            let attempts = frame.last_attempt();
             output.push((frame, status, attempts));
         }
         Ok(output)
@@ -4085,6 +4141,96 @@ mod tests {
                 scalar[3].as_nanos(),
                 packed[3].as_nanos()
             );
+        }
+    }
+
+    fn factor_structure_fixture(n: usize, kind: &str) -> (Sparse<Complex>, Vec<Vec<Complex>>) {
+        let side = n.isqrt();
+        let mut entries = Vec::new();
+        for row in 1..=n {
+            for col in 1..=n {
+                let neighboring = (row == col + 1 || col == row + 1) && row.abs_diff(col) == 1;
+                let mesh = side * side == n
+                    && (row.abs_diff(col) == side
+                        || neighboring && (row - 1) / side == (col - 1) / side);
+                let include = row == col
+                    || match kind {
+                        "dense" => true,
+                        "mesh" => mesh,
+                        "banded" => neighboring,
+                        _ => panic!("unknown structure"),
+                    };
+                if include {
+                    let factor = if row == col { 8. } else { -0.24 };
+                    entries.push((
+                        row,
+                        col,
+                        Complex::new(factor, if row == col { 0.4 } else { 0.07 }),
+                    ));
+                }
+            }
+        }
+        let originals: Vec<_> = entries.iter().map(|entry| entry.2).collect();
+        let mut frame = Sparse::<Complex>::from_originals(n, entries).unwrap();
+        assert_eq!(frame.order_and_factor(1e-3, 0.), Status::Okay);
+        let inputs = (0..RHS_BATCH_WIDTH)
+            .map(|lane| {
+                originals
+                    .iter()
+                    .map(|&v| Complex::new(v.re + lane as f64 * 0.03125, v.im))
+                    .collect()
+            })
+            .collect();
+        (frame, inputs)
+    }
+
+    #[test]
+    #[ignore = "opt-in fixed-order numeric refactor crossover across topology classes"]
+    fn complex_factorization_structure_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for (kind, sizes) in [
+            ("banded", &[16, 64, 128, 256][..]),
+            ("mesh", &[16, 64, 144, 256][..]),
+            ("dense", &[16, 32, 64, 96][..]),
+        ] {
+            for &n in sizes {
+                let (base, inputs) = factor_structure_fixture(n, kind);
+                let mut work = ComplexFactorBatch::default();
+                for count in [2, 4] {
+                    let refs = inputs[..count]
+                        .iter()
+                        .map(Vec::as_slice)
+                        .collect::<Vec<_>>();
+                    let repetitions = if kind == "dense" { 3 } else { (128 / n).max(4) };
+                    let mut independent = Vec::new();
+                    let mut packed = Vec::new();
+                    for _ in 0..5 {
+                        let start = Instant::now();
+                        for _ in 0..repetitions {
+                            for &values in black_box(&refs) {
+                                black_box(scalar_refactor_reference(&base, values));
+                            }
+                        }
+                        independent.push(start.elapsed());
+                        let start = Instant::now();
+                        for _ in 0..repetitions {
+                            black_box(
+                                Sparse::factor_complex_batch(&base, black_box(&refs), &mut work)
+                                    .unwrap(),
+                            );
+                        }
+                        packed.push(start.elapsed());
+                    }
+                    independent.sort_unstable();
+                    packed.sort_unstable();
+                    println!(
+                        "structure={kind} n={n} lanes={count} scalar_ns={} batch_ns={}",
+                        independent[2].as_nanos(),
+                        packed[2].as_nanos(),
+                    );
+                }
+            }
         }
     }
 

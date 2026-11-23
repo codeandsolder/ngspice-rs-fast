@@ -392,10 +392,36 @@ cargo +nightly test --release --lib sparse_rhs_batch_benchmark -- --ignored --no
 
 ### Independent AC frequency factors
 
-Independent `.ac`, `.sp` and `.noise` frequency points reuse the previous valid complex pivot order and packed factor traversal. A bounded four-lane numeric tile stores real/imaginary coefficients and pivots in element-handle order (AoSoA), with one numeric factor snapshot per frequency. Ordinary Schur updates use portable SIMD; lanes near cancellation or exponent limits use scalar recovery. A zero/nonfinite pivot stops only its lane, which retries scalar refactoring and, on zero pivots, scalar reordering.
+Independent `.ac`, `.sp` and `.noise` points reuse one immutable complex
+SPARSE pivot order while retaining per-frequency coefficients, factors,
+inverses, diagnostic status and pivot-reorder fallback. Each sweep prepares
+at most four frequency matrices ahead. Output, RF resource accounting and
+noise integration still consume results in original frequency order; a later
+failed frequency does not suppress earlier successful points. `hertz`-dependent
+operating-point rebiasing, frequency-dependent device restamping and
+single-frequency sweeps remain fully sequential.
 
-The final numeric factor is committed to the circuit's factor cache. Frequency output, integration and RF resource accounting stay ordered. `hertz`-dependent rebiasing, frequency-dependent small-signal stamps and singleton sweeps remain sequential. The tile width is independent of logical sweep length. For a fair optional fixed-order benchmark:
+The numeric kernel is selected from the compiler's target features. With
+AVX2 enabled at build time, full four-point tiles at 16 or more rows use
+separate real/imaginary `f64x4` planes in element-handle order (AoSoA) and
+one common packed factor traversal. Ordinary complex Schur operations use
+portable SIMD; the original scalar cross-product handles cancellation,
+exponent extremes, and failing pivot lanes. Other targets, partial tiles
+and very small matrices use independent scalar refactors with one reusable
+scratch buffer and the same shared symbolic traversal. There are no
+target-specific intrinsics, unsafe code, or runtime CPU feature assumptions.
+The last successful factor is retained in the circuit's existing cache.
+
+Acer benchmark evidence: on the generic x86-64 compiler target, four-lane
+packed factorization loses to scalar in banded, mesh and dense matrices;
+compiling for fixed x86-64-v3 turns full four-lane batches faster by roughly
+8–18% in representative sizes, while two-lane batches remain slower. This
+determines the compile-time and tile-width selection rather than requiring
+a global feature flag. The opt-in tests are:
 
 ```sh
 cargo +nightly test --release --lib batched_complex_frequency_factor_benchmark -- --ignored --nocapture
+cargo +nightly test --release --lib complex_factorization_structure_benchmark -- --ignored --nocapture
+cargo +nightly --config 'build.rustflags=["-Ctarget-cpu=x86-64-v3"]' test --release --lib complex_factorization_structure_benchmark -- --ignored --nocapture
+cargo +nightly test --release --test solver_workloads_bench independent_ac_frequency_tiles -- --ignored --nocapture
 ```

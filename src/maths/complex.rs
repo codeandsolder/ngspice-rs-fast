@@ -10,7 +10,9 @@ use crate::maths::linear::{
     BatchSolveFailure, CachedFrame, ComplexFactors, PivotTolerances, SolveBatchWorkspace,
     check_status, numerical, order_fresh, square,
 };
-use crate::maths::sparse13::{LaneParts, Sparse, Status};
+#[cfg(target_feature = "avx2")]
+use crate::maths::sparse13::LaneParts;
+use crate::maths::sparse13::{Sparse, Status};
 use crate::maths::{FactorStorage, FactorWork, Pattern, SparseMatrix};
 use crate::primitives::{Complex, SpiceResult};
 
@@ -19,8 +21,11 @@ use crate::primitives::{Complex, SpiceResult};
 /// the owning spectral analysis between independent frequency groups.
 #[derive(Default)]
 pub(crate) struct ComplexFactorBatch {
+    #[cfg(target_feature = "avx2")]
     pub(super) values: Vec<LaneParts>,
+    #[cfg(target_feature = "avx2")]
     pub(super) scratch: Vec<LaneParts>,
+    #[cfg(target_feature = "avx2")]
     pub(super) inverses: Vec<LaneParts>,
 }
 
