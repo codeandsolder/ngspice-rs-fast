@@ -7,10 +7,10 @@
 use std::sync::Arc;
 
 use crate::maths::linear::{
-    BatchSolveFailure, ComplexFactors, PivotTolerances, SolveBatchWorkspace, check_status,
-    numerical, order_fresh, square,
+    BatchSolveFailure, CachedFrame, ComplexFactors, PivotTolerances, SolveBatchWorkspace,
+    check_status, numerical, order_fresh, square,
 };
-use crate::maths::sparse13::{Sparse, Status};
+use crate::maths::sparse13::{ComplexFactorBatch, Sparse, Status};
 use crate::maths::{FactorStorage, FactorWork, Pattern, SparseMatrix};
 use crate::primitives::{Complex, SpiceResult};
 
@@ -410,6 +410,97 @@ impl ComplexMatrix {
                 sparse: Arc::new(sparse),
             },
         })
+    }
+
+    /// Factor up to four independent frequency points sharing a circuit
+    /// pattern. The first point establishes the reference pivot order;
+    /// subsequent points use one AoSoA numeric traversal and independent
+    /// scalar reorders for exceptional lanes. The final factor is committed
+    /// to the circuit cache for the next spectral analysis.
+    ///
+    /// # Errors
+    /// A numerical failure is attributed to the earliest input point.
+    pub(crate) fn factorize_batch(
+        matrices: &[Self],
+        previous: Option<&ComplexLu>,
+        work: &mut ComplexFactorBatch,
+    ) -> SpiceResult<Vec<ComplexLu>> {
+        if matrices.is_empty() {
+            return Ok(Vec::new());
+        }
+        if matrices.len() > crate::maths::linear::RHS_BATCH_WIDTH {
+            return Err(numerical(
+                "complex factor batch",
+                "too many frequency lanes",
+            ));
+        }
+        let Assembly::Bound { pattern, .. } = &matrices[0].assembly else {
+            return matrices.iter().map(Self::factorize).collect();
+        };
+        if matrices.iter().any(|matrix| {
+            !matches!(&matrix.assembly, Assembly::Bound { pattern: other, .. } if Arc::ptr_eq(pattern, other))
+                || matrix.n != matrices[0].n
+                || matrix.pivot.relative.to_bits() != matrices[0].pivot.relative.to_bits()
+                || matrix.pivot.absolute.to_bits() != matrices[0].pivot.absolute.to_bits()
+        }) {
+            return matrices.iter().map(Self::factorize).collect();
+        }
+        let compatible = previous.filter(|factor| {
+            factor.n == matrices[0].n
+                && matches!(&factor.order, ComplexOrder::Bound(other) if Arc::ptr_eq(pattern, other))
+        });
+        let first = if compatible.is_none() {
+            Some(matrices[0].factorize()?)
+        } else {
+            None
+        };
+        let baseline = compatible.unwrap_or_else(|| first.as_ref().expect("first factorized"));
+        let start = usize::from(first.is_some());
+        let coefficients: Vec<&[Complex]> = matrices[start..]
+            .iter()
+            .map(|matrix| match &matrix.assembly {
+                Assembly::Bound { values, .. } => values.as_slice(),
+                Assembly::Standalone(_) => unreachable!("validated matrix shape"),
+            })
+            .collect();
+        let mut factors = Vec::new();
+        factors.try_reserve(matrices.len()).map_err(|error| {
+            numerical("complex factor batch", format!("factor capacity: {error}"))
+        })?;
+        let lane_frames =
+            Sparse::factor_complex_batch(&baseline.factors.sparse, &coefficients, work)?;
+        if let Some(first) = first {
+            factors.push(first);
+        }
+        for (frame, status) in lane_frames {
+            check_status(
+                "complex sparse LU",
+                status,
+                &frame,
+                matrices[factors.len()].names.as_ref(),
+            )?;
+            let attempt = frame.last_attempt();
+            factors.push(ComplexLu {
+                n: matrices[0].n,
+                order: ComplexOrder::Bound(Arc::clone(pattern)),
+                factors: ComplexFactors {
+                    sparse: Arc::new(frame),
+                    work: attempt,
+                },
+            });
+        }
+        if factors.len() > start {
+            pattern.with_ordering(|state| {
+                for factor in &factors[start..] {
+                    state.work.factor += factor.factors.work;
+                }
+                state.ac_reorder = false;
+                state.frame = factors
+                    .last()
+                    .map(|last| CachedFrame::Complex(last.factors.clone()));
+            });
+        }
+        Ok(factors)
     }
 
     fn fresh_frame(&self) -> SpiceResult<Sparse<Complex>> {

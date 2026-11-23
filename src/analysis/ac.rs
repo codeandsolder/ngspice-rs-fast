@@ -11,6 +11,7 @@ use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
 use crate::maths::Vector;
 use crate::maths::complex::ComplexMatrix;
+use crate::maths::sparse13::ComplexFactorBatch;
 use crate::primitives::{Complex, Real, SpiceResult};
 
 pub(super) fn run(
@@ -41,22 +42,63 @@ pub(super) fn run(
     // pivot. See [`ac_matrix`].
     let shared: &Circuit = circuit;
     let mut point = Vec::with_capacity(plot.variable_count());
-    for &f in grid {
-        let x = small_signal.at_frequency(context, f, |system| {
-            ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
-                .factorize()?
-                .solve(&system.ac_rhs())
-        })?;
-        point.clear();
-        point.push(Complex::real(f));
-        point.extend(x);
-        point.extend(
-            small_signal
-                .prepared()
-                .observe_parameters(&context.model_context().with_frequency(f))?,
-        );
-        plot.check_point(&point)?;
-        sink.point(&point)?;
+    // Each point is independent only when neither CKTop rebias nor device
+    // small-signal restamping carries state between frequencies. In that case
+    // four numeric factor frames share the immutable symbolic order, while
+    // every lane retains its own pivots, residual and failure handling.
+    if grid.len() > 1 && !small_signal.varies() && !small_signal.reassembles() {
+        let rhs = small_signal.system().ac_rhs();
+        let mut work = ComplexFactorBatch::default();
+        let mut previous = None;
+        for frequencies in grid.chunks(crate::maths::linear::RHS_BATCH_WIDTH) {
+            let mut matrices = Vec::new();
+            matrices.try_reserve(frequencies.len()).map_err(|error| {
+                crate::maths::linear::numerical(
+                    "AC frequency batch",
+                    format!("cannot reserve frequency tile: {error}"),
+                )
+            })?;
+            for &f in frequencies {
+                matrices.push(ac_matrix(
+                    shared,
+                    small_signal.system(),
+                    2. * std::f64::consts::PI * f,
+                )?);
+            }
+            let factors = ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
+            for (&f, factor) in frequencies.iter().zip(&factors) {
+                let x = factor.solve(&rhs)?;
+                point.clear();
+                point.push(Complex::real(f));
+                point.extend(x);
+                point.extend(
+                    small_signal
+                        .prepared()
+                        .observe_parameters(&context.model_context().with_frequency(f))?,
+                );
+                plot.check_point(&point)?;
+                sink.point(&point)?;
+            }
+            previous = factors.into_iter().last();
+        }
+    } else {
+        for &f in grid {
+            let x = small_signal.at_frequency(context, f, |system| {
+                ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
+                    .factorize()?
+                    .solve(&system.ac_rhs())
+            })?;
+            point.clear();
+            point.push(Complex::real(f));
+            point.extend(x);
+            point.extend(
+                small_signal
+                    .prepared()
+                    .observe_parameters(&context.model_context().with_frequency(f))?,
+            );
+            plot.check_point(&point)?;
+            sink.point(&point)?;
+        }
     }
     sink.end()
 }
