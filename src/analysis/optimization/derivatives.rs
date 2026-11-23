@@ -88,7 +88,7 @@ pub struct InputDerivative {
 /// Failure to assemble/solve the common operating point or the physical
 /// sensitivity adjoint, or invalid resource allocation.
 pub fn evaluate(
-    candidate: &mut CircuitCandidate<'_>,
+    candidate: &CircuitCandidate<'_>,
     request: &DerivativeRequest,
     limits: EvalLimits,
 ) -> SpiceResult<Vec<InputDerivative>> {

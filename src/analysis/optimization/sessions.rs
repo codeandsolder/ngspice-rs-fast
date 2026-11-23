@@ -211,7 +211,7 @@ impl<'a> CandidateWorker<'a> {
         CandidateDerivativeResult {
             id: job.id,
             topology: Some(topology),
-            outcome: derivatives::evaluate(&mut self.session, request, self.limits)
+            outcome: derivatives::evaluate(&self.session, request, self.limits)
                 .map_err(CandidateDerivativeFailure::Evaluation),
         }
     }
