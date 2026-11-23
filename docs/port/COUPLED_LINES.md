@@ -48,17 +48,35 @@ noncommuting L and C. These delays do not substitute for the
 frequency-dependent lossy R/G mode fitting or its transient
 convolution; those still require the CPL device solver.
 
+## Front-end representation
+
+The independent parser reads P card terminal groups in exact near/far
+order. For n conductors it requires exactly n near signal terminals,
+one near return, n far signal terminals, one far return and a final
+named model. An optional length override is a structured scalar or
+parameter expression. It does not silently substitute a shared ground
+for an explicitly different return terminal.
+
+CPL model R/L/G/C setters carry an ordered, source-positioned numeric
+vector in ParameterKind::NumericVector; scalar literals and braced
+expressions remain in their original written order and the complete
+model retains repeated setters. Vectors are bounded by the maximum
+eight-conductor packed upper triangle of 36 entries. Their exact
+physical dimension is checked when the instance's conductor count
+is known, not guessed during tokenization. The normalized writer,
+AST dump and semantic comparison preserve vector components, including
+per-component source positions and expressions.
+
 ## Remaining execution stages
 
-1. Parse P card terminal topology explicitly: near conductor nodes,
-   near return, far conductor nodes, far return, model name and the
-   optional length override. Model RLGC arguments are numeric vectors;
-   preserve their source positions and parameter expressions.
-2. Bind immutable per-instance model/mode plans at elaboration. Build
-   both branch-current unknown sets and the near/far MNA equations,
-   accounting for cross-conductor entries, accepted circuit topology,
-   model length override and the reference binary's DC behavior.
-3. Implement upstream CPL modal frequency fitting, Padé poles/residues,
+1. Resolve scoped model parameters, including vector expressions and
+   instance length override, into one immutable per-instance physical
+   plan. Refuse absent/invalid matrices rather than defaulting coupling
+   to zero.
+2. Build near/far MNA branch-current unknowns and DC equations with
+   the reference binary's actual coupled-line DC behavior and proper
+   terminal/return identities.
+3. Implement upstream CPL modal frequency fitting, Pade poles/residues,
    convolution and bidirectional delayed waveforms in the existing
    device-owned delay-history and transient-input architecture. Every
    rejected Newton or truncation attempt must leave accepted history
