@@ -36,15 +36,9 @@
 //!   the card gave both; `hfet2ask.c` has no `HFET2_M` case, so C reports no
 //!   multiplier column.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
-)]
-#![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
 )]
 #![expect(
     clippy::too_many_lines,
@@ -53,14 +47,6 @@
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::imprecise_flops,
-    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step};
@@ -401,10 +387,10 @@ impl Hfet2 {
         let derived = Derived {
             temp,
             vt,
-            tlambda: model.lambda + model.klambda * delta,
-            tmu: model.mu - model.kmu * delta,
-            tnmax: model.nmax - model.knmax * delta,
-            tvto: model.pol * model.threshold - model.kvto * delta,
+            tlambda: model.klambda.mul_add(delta, model.lambda),
+            tmu: model.kmu.mul_add(-delta, model.mu),
+            tnmax: model.knmax.mul_add(-delta, model.nmax),
+            tvto: model.kvto.mul_add(-delta, model.pol * model.threshold),
             // C leaves `HFET2_VT1`/`VT2` on the raw threshold, unlike `TVTO`.
             vt1: model
                 .vt1
@@ -419,8 +405,8 @@ impl Hfet2 {
             two_exponentials: model.eta2_given && model.d2_given,
             jslw: model.js * instance.l * instance.w / 2.,
             ggrlw: model.ggr * instance.l * instance.w / 2.,
-            gchi0: CHARGE * instance.w * (model.mu - model.kmu * delta) / instance.l,
-            imax: CHARGE * (model.nmax - model.knmax * delta) * model.vs * instance.w,
+            gchi0: CHARGE * instance.w * model.kmu.mul_add(-delta, model.mu) / instance.l,
+            imax: CHARGE * model.knmax.mul_add(-delta, model.nmax) * model.vs * instance.w,
             vcrit: vt * (vt / (std::f64::consts::SQRT_2 * VCRIT_CURRENT)).ln(),
             delta_sqr: model.delta * model.delta,
             gdpr: if model.rd == 0. { 0. } else { 1. / model.rd },
@@ -466,17 +452,17 @@ impl Hfet2 {
         let vgt0 = vgs - derived.tvto;
         let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
         let sigma = model.sigma0 / (1. + s);
-        let vgt = vgt0 + sigma * vds;
+        let vgt = sigma.mul_add(vds, vgt0);
         let u = 0.5 * vgt / vt - 1.;
-        let t = (derived.delta_sqr + u * u).sqrt();
+        let t = u.mul_add(u, derived.delta_sqr).sqrt();
         let vgte = vt * (2. + u + t);
-        let b = (vgt / etavth).exp();
-        let nsn = 2. * derived.n0 * (1. + 0.5 * b).ln();
-        let nsm = if derived.two_exponentials {
-            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / (model.eta2 * vt)).exp();
-            nsn * nsc / (nsn + nsc)
+        let (nsn, slope) = super::soft_density(derived.n0, vgt, etavth);
+        let (nsm, delnsmvgt) = if derived.two_exponentials {
+            let thermal = model.eta2 * vt;
+            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / thermal).exp();
+            super::series_density(nsn, slope, nsc, thermal)
         } else {
-            nsn
+            (nsn, slope)
         };
         if nsm < N_MIN {
             return Ok(Channel {
@@ -491,58 +477,55 @@ impl Hfet2 {
         let q = (1. + c).powf(1. / model.gamma);
         let ns = nsm / q;
         let gchi = derived.gchi0 * ns;
-        let gch = gchi / (1. + gchi * rt);
+        let gch = gchi / gchi.mul_add(rt, 1.);
         let gchim = derived.gchi0 * nsm;
-        let h = (1. + 2. * gchim * model.rsi + vgte * vgte / (vl * vl)).sqrt();
-        let p = 1. + gchim * model.rsi + h;
+        let h = ((2. * gchim).mul_add(model.rsi, 1.) + vgte * vgte / (vl * vl)).sqrt();
+        let p = gchim.mul_add(model.rsi, 1.) + h;
         let isatm = gchim * vgte / p;
         let g = (isatm / derived.imax).powf(model.gamma);
         let isat = isatm / (1. + g).powf(1. / model.gamma);
         let vsate = isat / gch;
         let d = (vds / vsate).powf(model.m);
         let e = (1. + d).powf(1. / model.m);
-        let delidgch = vds * (1. + derived.tlambda * vds) / e;
+        let delidgch = vds * derived.tlambda.mul_add(vds, 1.) / e;
         let cdrain = gch * delidgch;
         let delidvsate = cdrain * d / vsate / (1. + d);
-        let delidvds = gch * (1. + 2. * derived.tlambda * vds) / e
+        let delidvds = gch * (2. * derived.tlambda).mul_add(vds, 1.) / e
             - cdrain * (vds / vsate).powf(model.m - 1.) / (vsate * (1. + d));
-        let a = 1. + gchi * rt;
+        let a = gchi.mul_add(rt, 1.);
         let delgchgchi = 1. / (a * a);
         let delgchins = derived.gchi0;
-        let delnsnsm = ns / nsm * (1. - c / (1. + c));
-        let delvgtevgt = 0.5 * (1. + u / t);
-        let mut delnsmvgt = derived.n0 / etavth / (1. / b + 0.5);
-        if derived.two_exponentials {
-            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / (model.eta2 * vt)).exp();
-            delnsmvgt = nsc * (nsc * delnsmvgt + nsn * nsn / (model.eta2 * vt))
-                / ((nsc + nsn) * (nsc + nsn));
-        }
+        let delnsnsm = ns / nsm / (1. + c);
+        let delvgtevgt = Real::midpoint(1., u / t);
         let delvsateisat = 1. / gch;
-        let delisatisatm = isat / isatm * (1. - g / (1. + g));
+        let delisatisatm = isat / isatm / (1. + g);
         let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
         let delvsategch = -vsate / gch;
-        let delisatmgchim = vgte * (p - gchim * model.rsi * (1. + 1. / h)) / (p * p);
+        let delisatmgchim = vgte * (gchim * model.rsi).mul_add(-(1. + 1. / h), p) / (p * p);
         let delvgtvgs = 1. - vds * model.sigma0 / model.vsigma * s / ((1. + s) * (1. + s));
         let p = delgchgchi * delgchins * delnsnsm * delnsmvgt;
-        let delvsatevgt = delvsateisat
-            * delisatisatm
-            * (delisatmvgte * delvgtevgt + delisatmgchim * derived.gchi0 * delnsmvgt)
-            + delvsategch * p;
-        let g = delidgch * p + delidvsate * delvsatevgt;
+        let delvsatevgt = delvsategch.mul_add(
+            p,
+            delvsateisat
+                * delisatisatm
+                * (delisatmgchim * derived.gchi0).mul_add(delnsmvgt, delisatmvgte * delvgtevgt),
+        );
+        let g = delidvsate.mul_add(delvsatevgt, delidgch * p);
         let gm = g * delvgtvgs;
-        let gds = delidvds + g * sigma;
+        let gds = g.mul_add(sigma, delidvds);
         // Capacitances.
         let temp = model.eta1 * vt;
-        let cg1 = 1. / (model.d1 / model.epsi + temp * (-(vgs - derived.vt1) / temp).exp());
-        let cgc =
-            self.instance.w * self.instance.l * (CHARGE * delnsnsm * delnsmvgt * delvgtvgs + cg1);
+        let cg1 = 1. / temp.mul_add((-(vgs - derived.vt1) / temp).exp(), model.d1 / model.epsi);
+        let cgc = self.instance.w
+            * self.instance.l
+            * (CHARGE * delnsnsm * delnsmvgt).mul_add(delvgtvgs, cg1);
         let vdse = vds * (1. + (vds / vsate).powf(model.mc)).powf(-1. / model.mc);
-        let a = (vsate - vdse) / (2. * vsate - vdse);
+        let a = (vsate - vdse) / 2.0f64.mul_add(vsate, -vdse);
         let a = a * a;
         let third = 2.0 / 3.0;
-        let p = model.pm + (1. - model.pm) * (-vds / vsate).exp();
+        let p = (1. - model.pm).mul_add((-vds / vsate).exp(), model.pm);
         let capgs = model.cf + 2. * third * cgc * (1. - a) / (1. + p);
-        let a = vsate / (2. * vsate - vdse);
+        let a = vsate / 2.0f64.mul_add(vsate, -vdse);
         let a = a * a;
         let capgd = model.cf + 2. * p * third * cgc * (1. - a) / (1. + p);
         let values = [cdrain, gm, gds, capgs, capgd];
@@ -625,13 +608,13 @@ impl Hfet2 {
         let arg = -vgs * model.del / vt;
         let earg = arg.exp();
         let expe = (vgs / vtn).exp();
-        let ggs = derived.jslw * expe / vtn + derived.ggrlw * earg * (1. - arg);
-        let mut cg = derived.jslw * (expe - 1.) + derived.ggrlw * vgs * earg;
+        let ggs = (derived.ggrlw * earg).mul_add(1. - arg, derived.jslw * expe / vtn);
+        let mut cg = (derived.ggrlw * vgs).mul_add(earg, derived.jslw * (vgs / vtn).exp_m1());
         let arg = -vgd * model.del / vt;
         let earg = arg.exp();
         let expe = (vgd / vtn).exp();
-        let ggd = derived.jslw * expe / vtn + derived.ggrlw * earg * (1. - arg);
-        let cgd = derived.jslw * (expe - 1.) + derived.ggrlw * vgd * earg;
+        let ggd = (derived.ggrlw * earg).mul_add(1. - arg, derived.jslw * expe / vtn);
+        let cgd = (derived.ggrlw * vgd).mul_add(earg, derived.jslw * (vgd / vtn).exp_m1());
         cg += cgd;
         let mut vds = vgs - vgd;
         let inverse = vds < 0.;
@@ -760,8 +743,11 @@ impl Device for Hfet2 {
             "cs" => m * (-point.cd - point.cg),
             _ => {
                 let v = |n: NodeId| voltage(n);
-                m * (point.cd * v(self.nodes.d) + point.cg * v(self.nodes.g)
-                    - (point.cd + point.cg) * v(self.nodes.s))
+                m * f64::mul_add(
+                    point.cd + point.cg,
+                    -v(self.nodes.s),
+                    f64::mul_add(point.cg, v(self.nodes.g), point.cd * v(self.nodes.d)),
+                )
             }
         }))
     }
@@ -888,9 +874,14 @@ impl Device for Hfet2 {
         let (ggs, ggd) = (point.ggs, point.ggd);
         let (gm, gds, cgd, cg) = (point.gm, point.gds, point.cgd, point.cg);
         let (gdpr, gspr) = (derived.gdpr, derived.gspr);
-        let ceqgd = pol * (cgd - ggd * point.vgd);
-        let ceqgs = pol * ((cg - cgd) - ggs * point.vgs);
-        let cdreq = pol * ((point.cd + cgd) - gds * point.vds - gm * point.vgs);
+        let ceqgd = pol * f64::mul_add(ggd, -point.vgd, cgd);
+        let ceqgs = pol * f64::mul_add(ggs, -point.vgs, cg - cgd);
+        let cdreq = pol
+            * f64::mul_add(
+                gm,
+                -point.vgs,
+                f64::mul_add(gds, -point.vds, point.cd + cgd),
+            );
         context.stamp_rhs(n.g, m * (-ceqgs - ceqgd))?;
         context.stamp_rhs(n.dp, m * (-cdreq + ceqgd))?;
         context.stamp_rhs(n.sp, m * (cdreq + ceqgs))?;

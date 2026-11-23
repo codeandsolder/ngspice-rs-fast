@@ -64,8 +64,6 @@
 //! and thermal memory remain part of the Parker model, not the shared
 //! gate lifecycle.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -75,16 +73,8 @@
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use crate::devices::jfet::{
@@ -327,30 +317,35 @@ fn qgg(
 ) -> (Real, Real, Real) {
     let vds = vgs - vgd;
     let d1_xc = 1. - xc;
-    let vert = (vds * vds + alpha).sqrt();
-    let veff = 0.5 * (vgs + vgd + vert) + gamma * vds;
+    let vert = vds.mul_add(vds, alpha).sqrt();
+    let veff = gamma.mul_add(vds, 0.5_f64.mul_add(vert, Real::midpoint(vgs, vgd)));
     let vnr = d1_xc * (veff - vto);
-    let vnrt = (vnr * vnr + 0.04).sqrt();
-    let vnew = veff + 0.5 * (vnrt - vnr);
-    let (ext, qrt, cgso_eff);
+    let vnrt = vnr.mul_add(vnr, 0.04).sqrt();
+    let vnew = 0.5f64.mul_add(vnrt - vnr, veff);
+    let (ext, qrt, cgso_eff, charge_voltage);
     if vnew < vmax {
         ext = 0.;
         qrt = (1. - vnew / pb).sqrt();
+        charge_voltage = vnew;
         cgso_eff = 0.5 * cgso / qrt * (1. + xc + d1_xc * vnr / vnrt);
     } else {
         let vx = 0.5 * (vnew - vmax);
         let par = 1. + vx / (pb - vmax);
         qrt = (1. - vmax / pb).sqrt();
+        charge_voltage = vmax;
         ext = vx * (1. + par) / qrt;
         cgso_eff = 0.5 * cgso / qrt * (1. + xc + d1_xc * vnr / vnrt) * par;
     }
     let cpm = vds / vert;
-    let cplus = 0.5 * (1. + cpm);
+    let cplus = Real::midpoint(1., cpm);
     let cminus = cplus - cpm;
-    let cgs = cgso_eff * (cplus + gamma) + cgdo * (cminus + gamma);
-    let cgd = cgso_eff * (cminus - gamma) + cgdo * (cplus - gamma);
+    let cgs = cgdo.mul_add(cminus + gamma, cgso_eff * (cplus + gamma));
+    let cgd = cgdo.mul_add(cplus - gamma, cgso_eff * (cminus - gamma));
     (
-        cgso * ((pb + pb) * (1. - qrt) + ext) + cgdo * (veff - vert),
+        cgso.mul_add(
+            jfet::depletion_voltage(charge_voltage, qrt) + ext,
+            cgdo * (veff - vert),
+        ),
         cgs,
         cgd,
     )
@@ -363,13 +358,16 @@ fn forward_diode(v: Real, isat: Real, nvt: Real, gmin: Real) -> (Real, Real) {
     if arg > FX {
         if arg < MX {
             let zz = isat * arg.exp();
-            (zz - isat + gmin * v, zz / nvt + gmin)
+            (isat.mul_add(arg.exp_m1(), gmin * v), zz / nvt + gmin)
         } else {
             let zz = isat * EMX;
-            (zz * (arg - MX + 1.) - isat + gmin * v, zz / nvt + gmin)
+            (
+                gmin.mul_add(v, zz.mul_add(arg - MX + 1., -isat)),
+                zz / nvt + gmin,
+            )
         }
     } else {
-        (-isat + gmin * v, gmin)
+        (gmin.mul_add(v, -isat), gmin)
     }
 }
 
@@ -380,11 +378,11 @@ fn breakdown((mut i, mut g): (Real, Real), v: Real, ibd: Real, vbd: Real) -> (Re
         if arg < MX {
             let zz = ibd * arg.exp();
             g += zz / vbd;
-            i -= zz - ibd;
+            i = (-ibd).mul_add(arg.exp_m1(), i);
         } else {
             let zz = ibd * EMX;
             g += zz / vbd;
-            i -= zz * ((arg - MX) + 1.) - ibd;
+            i -= zz.mul_add((arg - MX) + 1., -ibd);
         }
     } else {
         i += ibd;
@@ -394,7 +392,7 @@ fn breakdown((mut i, mut g): (Real, Real), v: Real, ibd: Real, vbd: Real) -> (Re
 
 /// `(tau / (tau + step / 4))^4` (`psmodel.c`).
 fn relaxation(tau: Real, step: Real) -> Real {
-    let mut h = tau / (tau + step * FOURTH);
+    let mut h = tau / step.mul_add(FOURTH, tau);
     h *= h;
     h *= h;
     h
@@ -436,33 +434,37 @@ impl Model {
             let h = relaxation(self.taug, memory.step);
             (
                 h,
-                h * memory.vgdtrap + (1. - h) * vgd,
-                h * memory.vgstrap + (1. - h) * vgs,
+                (1. - h).mul_add(vgd, h * memory.vgdtrap),
+                (1. - h).mul_add(vgs, h * memory.vgstrap),
             )
         });
         let (lfg, lfg1, lfg2) = (self.lfgam, self.lfg1, self.lfg2);
         let (hfg, hfg1, hfg2) = (self.hfgam, self.hfg1, self.hfg2);
         let (hfe, hfe1, hfe2) = (self.hfeta, self.hfe1, self.hfe2);
         let mut vgst = vgs - self.vto;
-        vgst -= (lfg - lfg1 * vgstrap + lfg2 * vgdtrap) * vgdtrap;
-        let eta = hfe - hfe1 * vgdtrap + hfe2 * vgstrap;
+        vgst = f64::mul_add(
+            f64::mul_add(lfg2, vgdtrap, f64::mul_add(lfg1, -vgstrap, lfg)),
+            -vgdtrap,
+            vgst,
+        );
+        let eta = f64::mul_add(hfe2, vgstrap, f64::mul_add(hfe1, -vgdtrap, hfe));
         let dvgs = vgstrap - vgs;
-        vgst += eta * dvgs;
-        let gam = hfg - hfg1 * vgstrap + hfg2 * vgdtrap;
+        vgst = f64::mul_add(eta, dvgs, vgst);
+        let gam = f64::mul_add(hfg2, vgdtrap, f64::mul_add(hfg1, -vgstrap, hfg));
         let dvgd = vgdtrap - vgd;
-        vgst += gam * dvgd;
+        vgst = f64::mul_add(gam, dvgd, vgst);
         let (mut idrain, mut gm, mut gds);
         {
             // Exponential subthreshold effect ids(vgst, vdst).
             let mvst = self.mvst;
-            let vst = self.vst * (1. + mvst * vdst);
+            let vst = self.vst * mvst.mul_add(vdst, 1.);
             if vgst > FX * vst {
                 let (vgt, subfac);
                 let large = MX * vst;
                 if vgst > large {
                     // Numerically large.
                     subfac = EMX + 1.;
-                    vgt = (EMX / subfac) * (vgst - large) + large;
+                    vgt = (EMX / subfac).mul_add(vgst - large, large);
                 } else {
                     // Limit gate bias exponentially.
                     subfac = 1. + (vgst / vst).exp();
@@ -476,31 +478,32 @@ impl Model {
                 // Early saturation effect ids(vgt, vdp).
                 let za = op.za;
                 let mxi = self.mxi;
-                let vsat_fac = vgt / (mxi * vgt + op.xi_woo);
+                let vsat_fac = vgt / mxi.mul_add(vgt, op.xi_woo);
                 let vsat = vgt / (1. + vsat_fac);
-                let aa = za * vdp + vsat / 2.0;
+                let aa = za.mul_add(vdp, vsat / 2.0);
                 let a_aa = aa - vsat;
                 let knee = vsat * vsat * self.z / 4.0;
-                let rpt = (aa * aa + knee).sqrt();
-                let a_rpt = (a_aa * a_aa + knee).sqrt();
+                let rpt = aa.mul_add(aa, knee).sqrt();
+                let a_rpt = a_aa.mul_add(a_aa, knee).sqrt();
                 let vdt = rpt - a_rpt;
                 let dvdt_dvdp = za * (aa / rpt - a_aa / a_rpt);
-                let dvdt_dvgt = (vdt - vdp * dvdt_dvdp) * (1. + mxi * vsat_fac * vsat_fac)
+                let dvdt_dvgt = vdp.mul_add(-dvdt_dvdp, vdt)
+                    * (mxi * vsat_fac).mul_add(vsat_fac, 1.)
                     / (1. + vsat_fac)
                     / vgt;
                 // Intrinsic Q-law FET equation ids(vgt, vdt).
                 gds = (vgt - vdt).powf(m_q - 1.);
                 gm = vgt.powf(m_q - 1.) - gds;
-                idrain = vdt * gds + vgt * gm;
+                idrain = f64::mul_add(vgt, gm, vdt * gds);
                 gds *= m_q;
                 gm *= m_q;
-                gm += gds * dvdt_dvgt;
+                gm = f64::mul_add(gds, dvdt_dvgt, gm);
                 gds *= dvdt_dvdp;
                 gm += gds * p_m_q * vdp / vgt;
                 gds *= dvpd_dvdst;
                 let arg = 1. - 1. / subfac;
                 if vst != 0. {
-                    gds += gm * self.vst * mvst * (vgt - vgst * arg) / vst;
+                    gds += gm * self.vst * mvst * vgst.mul_add(-arg, vgt) / vst;
                 }
                 gm *= arg;
             } else {
@@ -510,15 +513,26 @@ impl Model {
                 gds = 0.;
             }
         }
-        let arg = h * gam
-            + (1. - h) * (hfe1 * dvgs - hfg2 * dvgd + 2. * lfg2 * vgdtrap - lfg1 * vgstrap + lfg);
-        gds += gm * arg;
-        gm *= 1. - h * eta + (1. - h) * (hfe2 * dvgs - hfg1 * dvgd + lfg1 * vgdtrap) - arg;
+        let arg = f64::mul_add(
+            1. - h,
+            f64::mul_add(
+                lfg1,
+                -vgstrap,
+                f64::mul_add(2. * lfg2, vgdtrap, f64::mul_add(hfg2, -dvgd, hfe1 * dvgs)),
+            ) + lfg,
+            h * gam,
+        );
+        gds = f64::mul_add(gm, arg, gds);
+        gm *= f64::mul_add(
+            1. - h,
+            f64::mul_add(lfg1, vgdtrap, f64::mul_add(hfg1, -dvgd, hfe2 * dvgs)),
+            f64::mul_add(h, -eta, 1.),
+        ) - arg;
 
         // Channel length modulation and beta scaling.
-        let arg = op.beta * (1. + self.lambda * vdst);
+        let arg = op.beta * self.lambda.mul_add(vdst, 1.);
         gm *= arg;
-        gds = op.beta * self.lambda * idrain + gds * arg;
+        gds = f64::mul_add(gds, arg, op.beta * self.lambda * idrain);
         idrain *= arg;
 
         // Thermal reduction of drain current.
@@ -531,17 +545,17 @@ impl Model {
             },
             |memory| {
                 let h = relaxation(self.taud, memory.step);
-                let pave = h * memory.powr + (1. - h) * vdst * idrain;
+                let pave = ((1. - h) * vdst).mul_add(idrain, h * memory.powr);
                 (h, pave, memory.powr)
             },
         );
-        let pfac = 1. + pave * delta;
+        let pfac = f64::mul_add(pave, delta, 1.);
         idrain /= pfac;
-        let arg = (h * delta * powr_before + 1.) / pfac / pfac;
+        let arg = (h * delta).mul_add(powr_before, 1.) / pfac / pfac;
         Ids {
             current: idrain,
             gm: gm * arg,
-            gds: gds * arg - (1. - h) * delta * idrain * idrain,
+            gds: ((1. - h) * delta * idrain).mul_add(-idrain, gds * arg),
             igs,
             igd,
             ggs,
@@ -590,40 +604,40 @@ impl Model {
         let hfeta = self.hfeta;
         let hfe1 = self.hfe1;
         let hfe2 = self.hfe2 * vgs;
-        let hfgam = self.hfgam - hfg1 * vgs + hfg2;
-        let eta = hfeta - hfe1 * vgd + hfe2;
-        let lfga = lfgam - lfg1 * vgs + lfg2 + lfg2;
-        let gmo = gm / (1. - lfga + lfg1 * vgd);
+        let hfgam = hfg1.mul_add(-vgs, self.hfgam) + hfg2;
+        let eta = hfe1.mul_add(-vgd, hfeta) + hfe2;
+        let lfga = lfg1.mul_add(-vgs, lfgam) + lfg2 + lfg2;
+        let gmo = gm / lfg1.mul_add(vgd, 1. - lfga);
 
         let wtg = self.taug * omega;
-        let wtgdet = 1. + wtg * wtg;
+        let wtgdet = wtg.mul_add(wtg, 1.);
         let gwtgdet = gmo / wtgdet;
 
         let arg = hfgam - lfga;
         let gdsi = arg * gwtgdet;
-        let gdsr = arg * gmo - gdsi;
-        let gmi = (eta + lfg1 * vgd) * gwtgdet + gdsi;
+        let gdsr = arg.mul_add(gmo, -gdsi);
+        let gmi = lfg1.mul_add(vgd, eta).mul_add(gwtgdet, gdsi);
 
         let xgds = wtg * gdsi;
         let gds = gds + gdsr;
         let xgm = -wtg * gmi;
-        let gm = gmi + gmo * (1. - eta - hfgam);
+        let gm = gmo.mul_add(1. - eta - hfgam, gmi);
 
         let delta = op.delta;
         let wtd = self.taud * omega;
-        let wtddet = 1. + wtd * wtd;
+        let wtddet = wtd.mul_add(wtd, 1.);
         let fac = delta * ids;
-        let del = 1. / (1. - fac * vds);
+        let del = 1. / fac.mul_add(-vds, 1.);
         let dd = (del - 1.) / wtddet;
         let dr = del - dd;
         let di = wtd * dd;
 
         let cdsqr = fac * ids * del * wtd / wtddet;
         (
-            dr * gm - di * xgm,
-            di * gm + dr * xgm,
-            dr * gds - di * xgds + cdsqr * wtd,
-            di * gds + dr * xgds + cdsqr,
+            di.mul_add(-xgm, dr * gm),
+            dr.mul_add(xgm, di * gm),
+            cdsqr.mul_add(wtd, di.mul_add(-xgds, dr * gds)),
+            dr.mul_add(xgds, di * gds) + cdsqr,
         )
     }
 }
@@ -1147,7 +1161,7 @@ impl Device for Jfet2 {
         let [dp, g, sp] = self.inner;
         if self.small_signal_depends_on_frequency() {
             // xgds += qds * CKTomega, with MODEINITSMSIG's qds = CDS * area.
-            let xgds = xgds + op.capds * omega;
+            let xgds = f64::mul_add(op.capds, omega, xgds);
             for (row, col, terms, scale) in [
                 (dp, dp, &[xgds][..], m),
                 (sp, sp, &[xgds, xgm][..], m),
@@ -1618,7 +1632,7 @@ impl Device for ResetJfet2 {
         let omega = self.omega;
         let (gm, xgm, gds, xgds) = current.model.acload(&op, vgs, vgd, cd, omega, gm, gds);
         // `xgds += qds * CKTomega` with the reset's zero charge.
-        let xgds = xgds + 0. * omega;
+        let xgds = 0.0f64.mul_add(omega, xgds);
         let m = current.instance.m;
         let [dp, g, sp] = current.inner;
         let imaginary = [

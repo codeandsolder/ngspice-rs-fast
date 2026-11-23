@@ -7,10 +7,6 @@
     reason = "C equation symbols preserve the reference operations"
 )]
 #![expect(
-    clippy::suboptimal_flops,
-    reason = "Preserve the non-fused C operation order"
-)]
-#![expect(
     clippy::many_single_char_names,
     reason = "C stamp and equation symbols"
 )]
@@ -238,8 +234,12 @@ fn predict_currents(
     let delvgd = vgd - vgd0;
     let delvds = delvgs - delvgd;
     [
-        cg0 + ggd0 * delvgd + ggs0 * delvgs,
-        cd0 + gm0 * delvgs + gds0 * delvds - ggd0 * delvgd,
+        f64::mul_add(ggs0, delvgs, f64::mul_add(ggd0, delvgd, cg0)),
+        f64::mul_add(
+            ggd0,
+            -delvgd,
+            f64::mul_add(gds0, delvds, f64::mul_add(gm0, delvgs, cd0)),
+        ),
     ]
 }
 
@@ -419,8 +419,8 @@ pub(in crate::devices) fn incremental_statz(
     let (qb, _, cgdnb) = evaluate(vgs1, vgd)?;
     let (qc, cgsnc, _) = evaluate(vgs, vgd1)?;
     let (qd, _, _) = evaluate(vgs1, vgd1)?;
-    let qgs = qgs1 + 0.5 * (qa - qb + qc - qd);
-    let qgd = qgd1 + 0.5 * (qa - qc + qb - qd);
+    let qgs = 0.5f64.mul_add(qa - qb + qc - qd, qgs1);
+    let qgd = 0.5f64.mul_add(qa - qc + qb - qd, qgd1);
     let (capgs, capgd) = match rule {
         StatzCapacitance::Averaged => {
             // Preserve the reference sum-then-scale order, including overflow.
@@ -523,13 +523,13 @@ fn exceeds(
     inclusive: bool,
 ) -> bool {
     let gate_error = (cghat - l.cg).abs();
-    let gate_limit = reltol * cghat.abs().max(l.cg.abs()) + abstol;
+    let gate_limit = f64::mul_add(reltol, cghat.abs().max(l.cg.abs()), abstol);
     let gate_failed = if inclusive {
         gate_error >= gate_limit
     } else {
         gate_error > gate_limit
     };
-    gate_failed || (cdhat - l.cd).abs() > reltol * cdhat.abs().max(l.cd.abs()) + abstol
+    gate_failed || (cdhat - l.cd).abs() > f64::mul_add(reltol, cdhat.abs().max(l.cd.abs()), abstol)
 }
 
 /// The end of `jfetload.c`/`jfet2load.c`: the convergence check (`icheck`,
@@ -586,9 +586,9 @@ impl GateStamp<'_> {
             ggs,
             ggd,
         } = *l;
-        let ceqgd = t * (cgd - ggd * vgd);
-        let ceqgs = t * ((cg - cgd) - ggs * vgs);
-        let cdreq = t * ((cd + cgd) - gds * vds - gm * vgs);
+        let ceqgd = t * f64::mul_add(ggd, -vgd, cgd);
+        let ceqgs = t * f64::mul_add(ggs, -vgs, cg - cgd);
+        let cdreq = t * f64::mul_add(gm, -vgs, f64::mul_add(gds, -vds, cd + cgd));
         let [d, g, s] = [0, 1, 2].map(|k| terminals[k]);
         let [dp, _, sp] = inner;
         context.stamp_rhs(g, m * (-ceqgs - ceqgd))?;

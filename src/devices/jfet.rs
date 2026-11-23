@@ -43,15 +43,9 @@
 //! error naming `jfetnoi.c`/`jfetdist.c` rather than contributing nothing.
 //! `.sens` is ported (#164) through [`JfetSensitivity`].
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 pub(super) mod lifecycle;
@@ -264,7 +258,7 @@ fn gate_diode(v: Real, vt_temp: Real, csat: Real, gmin: Real) -> (Real, Real) {
     } else {
         exponential_junction(v, vt_temp, csat)
     };
-    (current + gmin * v, conductance + gmin)
+    (gmin.mul_add(v, current), conductance + gmin)
 }
 
 impl Model {
@@ -282,15 +276,15 @@ impl Model {
             if vgst <= 0. {
                 return off;
             }
-            let betap = beta * (1. + lambda * vds);
+            let betap = beta * f64::mul_add(lambda, vds, 1.);
             if vgst >= vds {
                 // Normal mode, linear region.
-                let apart = 2. * b + 3. * op.bfac * (vgst - vds);
-                let cpart = vds * (vds * (op.bfac * vds - b) + vgst * apart);
+                let apart = (3. * op.bfac).mul_add(vgst - vds, 2. * b);
+                let cpart = vds * vgst.mul_add(apart, vds * op.bfac.mul_add(vds, -b));
                 Channel {
                     current: betap * cpart,
-                    gm: betap * vds * (apart + 3. * op.bfac * vgst),
-                    gds: betap * (vgst - vds) * apart + beta * lambda * cpart,
+                    gm: betap * vds * (3. * op.bfac).mul_add(vgst, apart),
+                    gds: f64::mul_add(beta * lambda, cpart, betap * (vgst - vds) * apart),
                 }
             } else {
                 // Normal mode, saturation region.
@@ -299,7 +293,7 @@ impl Model {
                 let cpart = vgst_squared * (b + bfac);
                 Channel {
                     current: betap * cpart,
-                    gm: betap * vgst * (2. * b + 3. * bfac),
+                    gm: betap * vgst * 3.0f64.mul_add(bfac, 2. * b),
                     gds: lambda * beta * cpart,
                 }
             }
@@ -308,31 +302,37 @@ impl Model {
             if vgdt <= 0. {
                 return off;
             }
-            let betap = beta * (1. - lambda * vds);
+            let betap = beta * f64::mul_add(lambda, -vds, 1.);
             if vgdt + vds >= 0. {
                 // Inverse mode, linear region.
-                let apart = 2. * b + 3. * op.bfac * (vgdt + vds);
-                let cpart = vds * (-vds * (-op.bfac * vds - b) + vgdt * apart);
-                let gm = betap * vds * (apart + 3. * op.bfac * vgdt);
+                let apart = (3. * op.bfac).mul_add(vgdt + vds, 2. * b);
+                let cpart = vds * vgdt.mul_add(apart, -vds * (-op.bfac).mul_add(vds, -b));
+                let gm = betap * vds * (3. * op.bfac).mul_add(vgdt, apart);
                 Channel {
                     current: betap * cpart,
                     gm,
-                    gds: betap * (vgdt + vds) * apart - beta * lambda * cpart - gm,
+                    gds: f64::mul_add(beta * lambda, -cpart, betap * (vgdt + vds) * apart) - gm,
                 }
             } else {
                 // Inverse mode, saturation region.
                 let bfac = vgdt * op.bfac;
-                let gm = -betap * vgdt * (2. * b + 3. * bfac);
+                let gm = -betap * vgdt * 3.0f64.mul_add(bfac, 2. * b);
                 let vgdt_squared = vgdt * vgdt;
                 let cpart = vgdt_squared * (b + bfac);
                 Channel {
                     current: -betap * cpart,
                     gm,
-                    gds: lambda * beta * cpart - gm,
+                    gds: f64::mul_add(lambda * beta, cpart, -gm),
                 }
             }
         }
     }
+}
+
+/// Rationalized integral of the inverse-square-root depletion capacitance,
+/// divided by its zero-bias capacitance.
+pub(super) fn depletion_voltage(voltage: Real, root: Real) -> Real {
+    voltage / Real::midpoint(1., root)
 }
 
 impl Operating {
@@ -343,13 +343,13 @@ impl Operating {
         let twop = 2. * self.pb;
         if v < self.cor_dep_cap {
             let sarg = (1. - v / self.pb).sqrt();
-            (twop * cz * (1. - sarg), cz / sarg)
+            (cz * depletion_voltage(v, sarg), cz / sarg)
         } else {
             let czf2 = cz / self.f2;
-            let fcpb2 = self.cor_dep_cap * self.cor_dep_cap;
+            let dv = v - self.cor_dep_cap;
+            let mean = self.f3 + Real::midpoint(v, self.cor_dep_cap) / twop;
             (
-                cz * self.f1
-                    + czf2 * (self.f3 * (v - self.cor_dep_cap) + (v * v - fcpb2) / (twop + twop)),
+                (czf2 * mean).mul_add(dv, cz * self.f1),
                 czf2 * (self.f3 + v / twop),
             )
         }
@@ -453,9 +453,9 @@ impl Jfet {
         let (model, instance) = (&self.model, &self.instance);
         let (tnom, temp) = temperatures(&self.name, model.tnom, instance, context)?;
         let junction = gate_junction(model.pb, tnom, temp);
-        let xfc = (1. - model.fc).ln();
+        let xfc = (-model.fc).ln_1p();
         let f2 = ((1. + 0.5) * xfc).exp();
-        let f3 = 1. - model.fc * (1. + 0.5);
+        let f3 = (-model.fc).mul_add(1.5, 1.);
         let bfac = (1. - model.b) / (model.pb - model.vto);
 
         let vt = temp * K_OVER_Q;
@@ -474,11 +474,10 @@ impl Jfet {
         let mut tcgd = model.cgd * cjfact;
         tcgs *= cjfact1;
         tcgd *= cjfact1;
-        let vto = model
-            .vtotc
-            .map_or(model.vto - model.tcv * (temp - tnom), |vtotc| {
-                model.vto + vtotc * (temp - tnom)
-            });
+        let vto = model.vtotc.map_or_else(
+            || model.tcv.mul_add(-(temp - tnom), model.vto),
+            |vtotc| f64::mul_add(vtotc, temp - tnom, model.vto),
+        );
         let beta = model.betatce.map_or_else(
             || model.beta * (temp / tnom).powf(model.bex),
             |betatce| model.beta * 1.01_f64.powf(betatce * (temp - tnom)),
@@ -498,7 +497,7 @@ impl Jfet {
             czgs: tcgs * area,
             czgd: tcgd * area,
             cor_dep_cap: model.fc * pb,
-            f1: pb * (1. - ((1. - 0.5) * xfc).exp()) / (1. - 0.5),
+            f1: depletion_voltage(model.fc * pb, (1. - model.fc).sqrt()),
             f2,
             f3,
             bfac,
@@ -1585,6 +1584,17 @@ mod tests {
             let forward = model.channel(&op, vgs, vgd).current;
             let reverse = model.channel(&op, vgd, vgs).current;
             assert!((forward + reverse).abs() <= 1e-15, "{vgs} {vgd}");
+        }
+    }
+
+    #[test]
+    fn depletion_charge_retains_the_linear_term_near_zero() {
+        let (_, op) = operating(1.);
+        for v in [-1e-20, 1e-20] {
+            let cz = 2e-12;
+            let (q, c) = op.charge(v, cz);
+            assert_eq!(q, cz * v);
+            assert_eq!(c, cz);
         }
     }
 

@@ -156,6 +156,140 @@ fn the_channel_matches_the_reference_binary() {
     );
 }
 
+/// Compare the intrinsic channel Jacobian with independent central
+/// differences, without the operating-point solve or gate leakage obscuring
+/// the result. Exercise both carrier-density branches and both polarities.
+#[test]
+fn channel_derivatives_agree_with_central_differences() {
+    use ngspice_rs::devices::ModelContext;
+
+    let context = ModelContext::default();
+    for (family, polarity) in [("nhfet", 1.), ("phfet", -1.)] {
+        for parameters in ["", "eta2=1.5 d2=0.1u"] {
+            let c = circuit(&format!(
+                "vd d 0 1\nvg g 0 0\nz1 d g 0 model l=2u w=20u\n\
+                 .model model {family} level=6 {parameters} rdi=5 rsi=7"
+            ))
+            .unwrap();
+            let device = c.device("z1").unwrap();
+            let drain = c.nodes().get("d").unwrap();
+            let gate = c.nodes().get("g").unwrap();
+            let observe = |key: &str, vgs: f64, vds: f64| {
+                device
+                    .observation_operating(
+                        key,
+                        &context,
+                        &|node| {
+                            if node == drain {
+                                polarity * vds
+                            } else if node == gate {
+                                polarity * vgs
+                            } else {
+                                0.
+                            }
+                        },
+                        false,
+                    )
+                    .unwrap()
+                    .unwrap()
+            };
+            for vgs in [-0.8, -0.3, 0., 0.25, 0.6, 1.] {
+                for vds in [0.001, 0.1, 0.8, 2.] {
+                    let h = 1e-6;
+                    let gm = (observe("cd", vgs + h, vds) - observe("cd", vgs - h, vds)) / (2. * h);
+                    let gds =
+                        (observe("cd", vgs, vds + h) - observe("cd", vgs, vds - h)) / (2. * h);
+                    close(observe("gm", vgs, vds), gm, 2e-6, 1e-18);
+                    close(observe("gds", vgs, vds), gds, 2e-6, 1e-18);
+                }
+            }
+        }
+    }
+}
+
+/// Both carrier populations underflow far below cutoff. No current or
+/// small-signal channel derivative may be manufactured by a 0/0 ratio.
+#[test]
+fn both_hfet_levels_have_a_finite_reverse_gate_cutoff() {
+    use ngspice_rs::devices::ModelContext;
+
+    for level in [5, 6] {
+        let c = circuit(&format!(
+            "vd d 0 1\nvg g 0 0\nz1 d g 0 model l=2u w=20u\n\
+             .model model nhfet level={level} eta2=1.5 d2=0.1u del=0 ggr=0"
+        ))
+        .unwrap();
+        let device = c.device("z1").unwrap();
+        let drain = c.nodes().get("d").unwrap();
+        let gate = c.nodes().get("g").unwrap();
+        for key in ["gm", "gds"] {
+            let derivative = device
+                .observation_operating(
+                    key,
+                    &ModelContext::default(),
+                    &|node| {
+                        if node == drain {
+                            1.
+                        } else if node == gate {
+                            -100.
+                        } else {
+                            0.
+                        }
+                    },
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(derivative, 0., "level={level} {key}");
+        }
+    }
+}
+
+/// Check the physical D2 derivative by re-solving the operating point,
+/// independently of the historical 1-ppm forward-difference sensitivity walk.
+/// With matching binary64 inputs, pinned C central differences at 2%, 1%,
+/// and 0.5% of D2 converge to -0.71587986 A/m (Richardson: -0.715879861
+/// and -0.715879870). The historical C sensitivity column instead reports
+/// -0.715869679, outside its own nonlinear sensitivity precision bound.
+/// See #144 for the sensitivity policy repair, not a changed C tolerance.
+#[test]
+fn p_channel_d2_physical_derivative_matches_independent_operating_points() {
+    let fixture = include_str!("../conformance/netlists/sens_hfet2.cir");
+    let current = |d2: f64| {
+        let text = fixture
+            .replace(
+                "phfet level=6 eta2=2 d2=0.3e-6",
+                &format!("phfet level=6 eta2=2 d2={d2:.17e}"),
+            )
+            .replace(".sens i(vids)", ".op")
+            .replace(
+                "reltol=1e-10 vntol=1e-13 abstol=1e-16",
+                "reltol=1e-13 vntol=1e-15 abstol=1e-19",
+            );
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("hfet2-d2.cir"), &text))
+            .unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let plot = plan.run(&mut circuit, &config.context()).unwrap();
+        value(&plot, "i(vids)", 0)
+    };
+    let central = |fraction: f64| {
+        let center = 0.3e-6;
+        let h = fraction * center;
+        let hi = center + h;
+        let lo = center - h;
+        (current(hi) - current(lo)) / (hi - lo)
+    };
+    let (coarse, medium, fine) = (central(0.02), central(0.01), central(0.005));
+    let a = (4. * medium - coarse) / 3.;
+    let b = (4. * fine - medium) / 3.;
+    close(a, b, 1e-6, 1e-9);
+    close(a, -0.715_879_861, 1e-6, 1e-9);
+    close(b, -0.715_879_870, 1e-6, 1e-9);
+}
+
 /// HFET2 limits with `DEVpnjlim` *and* `DEVfetlim` (HFET1 has only the
 /// latter), so a strongly forward-biased gate exercises a code path the other
 /// levels do not have. The reference binary answers
