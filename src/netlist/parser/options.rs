@@ -123,7 +123,7 @@ fn option_value(input: &mut Input<'_>) -> Result<OptionValue> {
     ))
 }
 
-/// A single-quoted option value as an (unbraced) expression. Double-quoted
+/// A single-quoted option value with its delimiter metadata. Double-quoted
 /// strings and quotes holding escapes are rejected: their byte columns would
 /// not map onto the card text.
 fn quoted_expression(token: &Token, inner: &str) -> SpiceResult<ParameterExpression> {
@@ -133,7 +133,7 @@ fn quoted_expression(token: &Token, inner: &str) -> SpiceResult<ParameterExpress
             "only single-quoted 'expression' option values (without escapes) are accepted",
         ));
     }
-    super::expression::parse_expression(inner, token.position().advance(1), false)
+    super::expression::parse_delimited(inner, token.position().advance(1), true, true)
 }
 
 fn global(input: &mut Input<'_>) -> Result<ParsedCard> {
