@@ -2,45 +2,30 @@
 //! operation against independent restatements of `jfetload.c`, finite-
 //! difference Jacobians, gate charge, observations and explicit gaps.
 //! C-golden comparisons live in `xtask golden verify` (`m10_jfet_*`).
+#[path = "support/mos_jfet.rs"]
+mod mos_jfet;
+use mos_jfet::{close, entry, value};
 use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot, RunConfig};
-use ngspice_rs::devices::{AnalysisMode, Circuit, LoadRequest, ModelContext};
-use ngspice_rs::maths::{SparseMatrix, Vector};
+use ngspice_rs::devices::{Circuit, ModelContext};
 use ngspice_rs::netlist::ast::ParameterKind;
-use ngspice_rs::netlist::source::parse_deck_text;
-use ngspice_rs::netlist::{Parser, write_netlist};
+use ngspice_rs::netlist::write_netlist;
 use ngspice_rs::primitives::{AnalysisKind, NodeKind, SpiceError};
-use std::path::Path;
 
 const GMIN: f64 = 1e-12;
 
+const FIXTURE: mos_jfet::Fixture = mos_jfet::Fixture {
+    path: "jfet.cir",
+    title: "JFET",
+};
 fn deck(body: &str) -> Result<ngspice_rs::netlist::ast::Netlist, SpiceError> {
-    Parser::new().parse_deck(&parse_deck_text(
-        Path::new("jfet.cir"),
-        &format!("JFET\n{body}\n.end\n"),
-    ))
+    FIXTURE.deck(body)
 }
 fn circuit(body: &str) -> Result<Circuit, SpiceError> {
-    Circuit::from_netlist(&deck(body)?)
+    FIXTURE.circuit(body)
 }
 fn run(c: &mut Circuit, kind: AnalysisKind, arguments: &[&str]) -> Plot {
-    AnalysisInput::with_arguments(kind, arguments.iter().copied())
-        .resolve()
-        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
-        .unwrap()
+    mos_jfet::run_request(c, kind, arguments).unwrap()
 }
-fn value(plot: &Plot, name: &str, point: usize) -> f64 {
-    let index = plot
-        .variable_index(name)
-        .unwrap_or_else(|| panic!("missing {name}: {:?}", plot.variables()));
-    plot.row(point).unwrap()[index].re
-}
-fn close(a: f64, b: f64, relative: f64, absolute: f64) {
-    assert!(
-        (a - b).abs() <= relative * b.abs() + absolute,
-        "{a:e} != {b:e}"
-    );
-}
-
 /// `jfetload.c` normal-mode drain current for `B = 1` (Shichman-Hodges).
 fn square_law(beta: f64, lambda: f64, vto: f64, vgs: f64, vds: f64) -> f64 {
     let vgst = vgs - vto;
@@ -190,97 +175,37 @@ fn series_resistance_creates_source_then_drain_internal_nodes() {
     assert!(c.nodes().get("j2#source").is_none() && c.nodes().get("j2#drain").is_none());
 }
 
-/// `r(x) = A(x) x - b(x)` of one load, for finite differences.
-fn residual(a: &SparseMatrix, b: &Vector, x: &Vector) -> Vec<f64> {
-    let mut r: Vec<f64> = b.as_slice().iter().map(|v| -v).collect();
-    for t in a.triplets() {
-        r[t.row] += t.value * x.as_slice()[t.col];
-    }
-    r
-}
-fn entry(matrix: &SparseMatrix, r: usize, col: usize) -> f64 {
-    matrix
-        .triplets()
-        .iter()
-        .filter(|t| t.row == r && t.col == col)
-        .map(|t| t.value)
-        .sum()
-}
-
 #[test]
 fn the_dc_jacobian_matches_finite_differences_over_a_bias_grid() {
     let model = "jm njf(vto=-2 beta=1.2m lambda=0.03 rd=20 rs=15 is=1e-14 n=1.1 b=0.7)";
     let pmodel = "jm pjf(vto=-1.5 beta=0.8m lambda=0.02 b=1.3 rs=10 tcv=1m)";
-    let mut bodies = Vec::new();
-    for (vd, vg) in [
-        (3., -1.),   // saturation
-        (0.4, -0.5), // linear
-        (-0.6, -1.), // inverse linear
-        (-3., -2.5), // inverse saturation (gate relative to drain)
-        (1., -2.6),  // cutoff
-        (0.2, 0.55), // forward-biased gate
-    ] {
-        bodies.push(format!(
-            "vd d 0 {vd}\nvg g 0 {vg}\nj1 d g 0 jm 1.5 m=2 temp=70\n.model {model}"
-        ));
-        bodies.push(format!(
-            "vd d 0 {}\nvg g 0 {}\nj1 d g 0 jm dtemp=-15\n.model {pmodel}",
-            -vd, -vg
-        ));
-    }
+    let bodies = mos_jfet::mirrored_bias_decks(
+        &[
+            (3., -1.),   // saturation
+            (0.4, -0.5), // linear
+            (-0.6, -1.), // inverse linear
+            (-3., -2.5), // inverse saturation (gate relative to drain)
+            (1., -2.6),  // cutoff
+            (0.2, 0.55), // forward-biased gate
+        ],
+        |vd, vg| format!("vd d 0 {vd}\nvg g 0 {vg}\nj1 d g 0 jm 1.5 m=2 temp=70\n.model {model}"),
+        |vd, vg| {
+            format!(
+                "vd d 0 {}\nvg g 0 {}\nj1 d g 0 jm dtemp=-15\n.model {pmodel}",
+                -vd, -vg
+            )
+        },
+    );
     for body in bodies {
         let c = circuit(&body).unwrap();
-        let context = ModelContext::default();
-        let history = c.state_history().unwrap();
-        let solved = ngspice_rs::analysis::bias::solve_dc(
+        mos_jfet::check_dc_jacobian(
             &c,
-            &context,
-            &Default::default(),
-            &[],
-            None,
-            None,
-        )
-        .unwrap();
-        let system = c.small_signal_system(&context, &solved.values).unwrap();
-        let n = c.unknown_count();
-        let load = |x: &Vector| {
-            let mut a = SparseMatrix::new(n, n);
-            let mut b = Vector::zeros(n);
-            let mut trial = history.trial();
-            c.load(
-                &LoadRequest {
-                    mode: AnalysisMode::OperatingPoint,
-                    solution: x,
-                    model_context: &context,
-                    integration: None,
-                    history: &history,
-                    forcing: None,
-                },
-                &mut a,
-                &mut b,
-                &mut trial,
-            )
-            .unwrap();
-            (a, b)
-        };
-        let (newton, _) = load(&solved.values);
-        for node in c.nodes().nodes() {
-            let Some(col) = c.unknowns().node_row(node.id) else {
-                continue;
-            };
-            let h = 1e-6;
-            let mut low = solved.values.clone();
-            let mut high = solved.values.clone();
-            low.as_mut_slice()[col] -= h;
-            high.as_mut_slice()[col] += h;
-            let ((al, bl), (ah, bh)) = (load(&low), load(&high));
-            let (rl, rh) = (residual(&al, &bl, &low), residual(&ah, &bh, &high));
-            for r in 0..n {
-                let numerical = (rh[r] - rl[r]) / (2. * h);
-                close(numerical, entry(&system.a, r, col), 1e-6, 1e-10);
-                close(numerical, entry(&newton, r, col), 1e-6, 1e-10);
-            }
-        }
+            &body,
+            1e-6,
+            1e-10,
+            mos_jfet::JacobianMatrices::SmallSignalAndNewton,
+            |_| false,
+        );
     }
 }
 
