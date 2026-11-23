@@ -218,6 +218,103 @@ impl BatchUpdate {
     }
 }
 
+/// Four independent numeric matrices, packed by SPARSE element handle.
+/// Reused between tiles; no mutable topology or pivot state is shared.
+#[derive(Default)]
+pub(crate) struct ComplexFactorBatch {
+    values: Vec<LaneParts>,
+    scratch: Vec<LaneParts>,
+    inverses: Vec<LaneParts>,
+}
+
+impl LaneParts {
+    fn complex_zero(self) -> LaneMask {
+        self.re.simd_eq(f64x4::splat(0.)) & self.im.simd_eq(f64x4::splat(0.))
+    }
+
+    fn complex_finite(self) -> LaneMask {
+        self.re.is_finite() & self.im.is_finite()
+    }
+
+    /// Exactly Scalar::mul on each lane, including exponent-range recovery.
+    fn complex_pair_mul(self, rhs: Self) -> Self {
+        let mut product = Self {
+            re: self.re * rhs.re - self.im * rhs.im,
+            im: self.re * rhs.im + self.im * rhs.re,
+        };
+        let ordinary = (product.re.abs() + product.im.abs()).is_normal()
+            | self.complex_zero()
+            | rhs.complex_zero();
+        for lane in 0..RHS_BATCH_WIDTH {
+            if !ordinary.test(lane) {
+                product.set(
+                    lane,
+                    self.get::<Complex>(lane).mul(rhs.get::<Complex>(lane)),
+                );
+            }
+        }
+        product
+    }
+
+    fn complex_pair_quotient(self, pivot: Self, inverse: Self, active: LaneMask) -> Self {
+        let candidate = self.complex_pair_mul(inverse);
+        let fast = !inverse.complex_zero()
+            & ((candidate.re.abs() + candidate.im.abs()).is_normal() | self.complex_zero());
+        let mut result = Self::select(active, candidate, Self::ZERO);
+        for lane in 0..RHS_BATCH_WIDTH {
+            if active.test(lane) && !fast.test(lane) {
+                result.set(
+                    lane,
+                    self.get::<Complex>(lane)
+                        .quotient(pivot.get(lane), inverse.get(lane)),
+                );
+            }
+        }
+        result
+    }
+
+    /// Ordinary Schur arithmetic first. Lanes near cancellation or numeric
+    /// range limits run the *original* cross-product recovery independently.
+    fn complex_pair_schur(
+        self,
+        pivot: Self,
+        upper: Self,
+        multiplier: Self,
+        lower: Self,
+        normal: LaneMask,
+        active: LaneMask,
+    ) -> Self {
+        let product = Self {
+            re: multiplier.re * lower.re - multiplier.im * lower.im,
+            im: multiplier.re * lower.im + multiplier.im * lower.re,
+        };
+        let ordinary = Self {
+            re: self.re - product.re,
+            im: self.im - product.im,
+        };
+        let norm = ordinary.re.abs() + ordinary.im.abs();
+        let scale = (self.re.abs() + self.im.abs()) * f64x4::splat(0.0625);
+        let fast = normal & norm.is_normal() & norm.simd_gt(scale)
+            | ordinary.complex_finite() & (upper.complex_zero() | lower.complex_zero());
+        let mut result = Self::select(active, ordinary, self);
+        for lane in 0..RHS_BATCH_WIDTH {
+            if active.test(lane) && !fast.test(lane) {
+                result.set(
+                    lane,
+                    self.get::<Complex>(lane).schur(
+                        pivot.get(lane),
+                        upper.get(lane),
+                        multiplier.get(lane),
+                        lower.get(lane),
+                        normal.test(lane),
+                    ),
+                );
+            }
+        }
+        result
+    }
+}
+
 /// Matrix entry type: `f64` for real systems, [`Complex`] for AC.
 pub(super) trait Scalar:
     Copy + PartialEq + std::fmt::Debug + std::ops::Div<Output = Self>
@@ -654,6 +751,80 @@ impl<I: PlanIndex> FactorRuns<I> {
             inverses[step] = dest[step].cached_recip();
         }
         Ok(())
+    }
+
+    /// A fixed-order refactor of independent complex matrix lanes. Failed
+    /// pivots deactivate only their lane, pending a scalar reorder retry.
+    fn refactor_complex_batch(
+        &self,
+        work: &mut ComplexFactorBatch,
+        diagonal: &[usize],
+        count: usize,
+    ) -> [Option<Status>; RHS_BATCH_WIDTH] {
+        let mut failures = [None; RHS_BATCH_WIDTH];
+        let mut active = LaneMask::from_array(std::array::from_fn(|lane| lane < count));
+        for step in 1..=self.columns.runs.len() {
+            if step > 1 {
+                for entry in self.columns.all(step) {
+                    let (handle, row) = entry.indices();
+                    work.scratch[row] = work.values[handle];
+                }
+                for entry in self.columns.before_diagonal(step) {
+                    let (handle, row) = entry.indices();
+                    let upper = work.scratch[row];
+                    work.values[handle] = upper;
+                    let pivot = work.values[diagonal[row]];
+                    let mult = upper.complex_pair_quotient(pivot, work.inverses[row], active);
+                    let normal = (mult.re.abs() + mult.im.abs()).is_normal();
+                    for entry in self.columns.after_diagonal(row) {
+                        let (handle, destination) = entry.indices();
+                        work.scratch[destination] = work.scratch[destination].complex_pair_schur(
+                            pivot,
+                            upper,
+                            mult,
+                            work.values[handle],
+                            normal,
+                            active,
+                        );
+                    }
+                }
+                for entry in self.columns.after_diagonal(step) {
+                    let (handle, row) = entry.indices();
+                    work.values[handle] = work.scratch[row];
+                }
+                work.values[diagonal[step]] = work.scratch[step];
+            }
+            let pivot = work.values[diagonal[step]];
+            for lane in 0..count {
+                if !active.test(lane) {
+                    continue;
+                }
+                let value = pivot.get::<Complex>(lane);
+                if value.is_zero() {
+                    failures[lane] = Some(Status::ZeroDiag);
+                    active.set(lane, false);
+                } else if !value.is_finite() {
+                    failures[lane] = Some(Status::NonFinite);
+                    active.set(lane, false);
+                } else {
+                    work.inverses[step].set(lane, value.cached_recip());
+                }
+            }
+            if !active.any() {
+                break;
+            }
+        }
+        for lane in 0..count {
+            if active.test(lane)
+                && work
+                    .values
+                    .iter()
+                    .any(|value| !value.get::<Complex>(lane).is_finite())
+            {
+                failures[lane] = Some(Status::NonFinite);
+            }
+        }
+        failures
     }
 
     fn solve<T: Scalar>(
@@ -1497,6 +1668,89 @@ impl<T: Clone> Clone for Sparse<T> {
             diagnostic: self.diagnostic,
             last_attempt: self.last_attempt,
         }
+    }
+}
+
+impl Sparse<Complex> {
+    /// Numeric factorization of independent coefficient frames against one
+    /// immutable ordered topology. Each lane owns its numeric pivots/factors;
+    /// a failed fixed-order pivot is retried using scalar SPARSE reordering.
+    pub(super) fn factor_complex_batch(
+        baseline: &Self,
+        coefficients: &[&[Complex]],
+        work: &mut ComplexFactorBatch,
+    ) -> SpiceResult<Vec<(Self, Status)>> {
+        if coefficients.len() > RHS_BATCH_WIDTH
+            || coefficients
+                .iter()
+                .any(|v| v.len() != baseline.topology.original_entries)
+        {
+            return Err(numerical(
+                "complex factor batch",
+                "invalid lane or coefficient shape",
+            ));
+        }
+        let Some(plan) = baseline.lifecycle.plan() else {
+            return Err(numerical("complex factor batch", "no ordered traversal"));
+        };
+        for (buffer, count) in [
+            (&mut work.values, baseline.values.len()),
+            (&mut work.scratch, baseline.size + 1),
+            (&mut work.inverses, baseline.size + 1),
+        ] {
+            buffer.clear();
+            sparse_reserve(buffer, count)?;
+            buffer.resize(count, LaneParts::ZERO);
+        }
+        for (handle, packed) in work
+            .values
+            .iter_mut()
+            .enumerate()
+            .take(baseline.topology.original_entries)
+        {
+            for (lane, values) in coefficients.iter().enumerate() {
+                packed.set(lane, values[handle]);
+            }
+        }
+        let failures = match plan.as_ref() {
+            FactorPlan::Compact(runs) => {
+                runs.refactor_complex_batch(work, &baseline.topology.diag, coefficients.len())
+            }
+            FactorPlan::Wide(runs) => {
+                runs.refactor_complex_batch(work, &baseline.topology.diag, coefficients.len())
+            }
+        };
+        let mut output = Vec::new();
+        sparse_reserve(&mut output, coefficients.len())?;
+        for (lane, &values) in coefficients.iter().enumerate() {
+            let mut frame = baseline.fork_loaded(values.iter().copied());
+            let status = if failures[lane].is_none() {
+                for (element, packed) in frame.values.iter_mut().zip(&work.values) {
+                    *element = packed.get::<Complex>(lane);
+                }
+                sparse_reserve(&mut frame.inverses, baseline.size + 1)?;
+                frame.inverses.resize(baseline.size + 1, Complex::ZERO);
+                for (element, packed) in frame.inverses.iter_mut().zip(&work.inverses) {
+                    *element = packed.get::<Complex>(lane);
+                }
+                let status = frame.done();
+                use crate::maths::telemetry::{AttemptPath, FactorAttempt};
+                frame.last_attempt = Some(FactorAttempt {
+                    path: AttemptPath::Refactor,
+                    status,
+                });
+                status
+            } else {
+                let mut status = frame.factor_with_workspace(&mut Vec::new());
+                if status == Status::ZeroDiag {
+                    frame.reload_originals(values);
+                    status = frame.order_and_factor(baseline.rel_threshold, baseline.abs_threshold);
+                }
+                status
+            };
+            output.push((frame, status));
+        }
+        Ok(output)
     }
 }
 
@@ -3555,6 +3809,203 @@ mod tests {
                 .unwrap();
             assert_eq!(output[1], 1. / f64::MIN_POSITIVE);
             assert_eq!(output[3].to_bits(), (-0.0_f64).to_bits());
+        }
+    }
+
+    fn small_signal_batch_fixture(n: usize) -> (Sparse<Complex>, Vec<Vec<Complex>>) {
+        let mut entries = Vec::new();
+        for row in 1..=n {
+            if row > 1 {
+                entries.push((row, row - 1, Complex::new(-0.35, 0.02)));
+            }
+            entries.push((row, row, Complex::new(4., 0.25)));
+            if row < n {
+                entries.push((row, row + 1, Complex::new(-0.75, -0.15)));
+            }
+        }
+        let base_values: Vec<_> = entries.iter().map(|&(_, _, value)| value).collect();
+        let mut base = Sparse::<Complex>::from_originals(n, entries).unwrap();
+        assert!(matches!(
+            base.order_and_factor(1e-3, 0.),
+            Status::Okay | Status::SmallPivot
+        ));
+        let inputs = (0..4)
+            .map(|lane| {
+                base_values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &value)| {
+                        if i == 0 && lane == 2 {
+                            // Pivot invalid in the reference order, but
+                            // the first offdiagonal still permits reordering.
+                            Complex::ZERO
+                        } else if lane == 3 && i == base_values.len() - 1 {
+                            // Select an exponent-range edge at the final row.
+                            Complex::new(1e-300, 0.)
+                        } else {
+                            Complex::new(
+                                value.re * (1. + f64::from(u8::try_from(lane).unwrap()) * 0.04),
+                                value.im,
+                            )
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        (base, inputs)
+    }
+
+    fn scalar_refactor_reference(
+        baseline: &Sparse<Complex>,
+        values: &[Complex],
+    ) -> (Sparse<Complex>, Status) {
+        let mut frame = baseline.fork_loaded(values.iter().copied());
+        let mut status = frame.factor_with_workspace(&mut Vec::new());
+        if status == Status::ZeroDiag {
+            frame.reload_originals(values);
+            status = frame.order_and_factor(baseline.rel_threshold, baseline.abs_threshold);
+        }
+        (frame, status)
+    }
+
+    #[test]
+    fn complex_frequency_factor_tiles_match_independent_scalar_factors_and_solutions() {
+        for n in [1, 2, 3, 4, 8, 16, 64] {
+            let (baseline, inputs) = small_signal_batch_fixture(n);
+            let mut workspace = ComplexFactorBatch::default();
+            for count in [4, 1, 3, 2, 4] {
+                let refs: Vec<_> = inputs[..count].iter().map(Vec::as_slice).collect();
+                let batch = Sparse::factor_complex_batch(&baseline, &refs, &mut workspace).unwrap();
+                assert_eq!(batch.len(), count);
+                for (lane, (actual, status)) in batch.iter().enumerate() {
+                    let (reference, expected) = scalar_refactor_reference(&baseline, refs[lane]);
+                    assert_eq!(
+                        *status, expected,
+                        "n={n} lane={lane}: different factor status"
+                    );
+                    if !matches!(expected, Status::Okay | Status::SmallPivot) {
+                        continue;
+                    }
+                    // Factored values, pivot reciprocals, transpose and normal
+                    // solutions are compared bitwise, including signed zeros.
+                    let bits = |v: Complex| [v.re.to_bits(), v.im.to_bits()];
+                    assert_eq!(
+                        actual.values.iter().copied().map(&bits).collect::<Vec<_>>(),
+                        reference
+                            .values
+                            .iter()
+                            .copied()
+                            .map(&bits)
+                            .collect::<Vec<_>>(),
+                        "n={n} lane={lane}: factor values",
+                    );
+                    assert_eq!(
+                        actual
+                            .inverses
+                            .iter()
+                            .copied()
+                            .map(&bits)
+                            .collect::<Vec<_>>(),
+                        reference
+                            .inverses
+                            .iter()
+                            .copied()
+                            .map(&bits)
+                            .collect::<Vec<_>>(),
+                        "n={n} lane={lane}: inverse pivots",
+                    );
+                    let rhs: Vec<_> = (0..n)
+                        .map(|i| {
+                            Complex::new(
+                                f64::from(u16::try_from(i + 1).unwrap()) * 0.125,
+                                f64::from(u16::try_from(i + 3).unwrap()) * -0.25,
+                            )
+                        })
+                        .collect();
+                    for transposed in [false, true] {
+                        let reference_factor = reference.factors().unwrap();
+                        let actual_factor = actual.factors().unwrap();
+                        let expected = if transposed {
+                            reference_factor.solve_transposed(&rhs, &mut Vec::new())
+                        } else {
+                            reference_factor.solve(&rhs, &mut Vec::new())
+                        };
+                        let actual = if transposed {
+                            actual_factor.solve_transposed(&rhs, &mut Vec::new())
+                        } else {
+                            actual_factor.solve(&rhs, &mut Vec::new())
+                        };
+                        assert_eq!(
+                            expected
+                                .as_ref()
+                                .map(|v| v.iter().copied().map(&bits).collect::<Vec<_>>())
+                                .map_err(ToString::to_string),
+                            actual
+                                .as_ref()
+                                .map(|v| v.iter().copied().map(&bits).collect::<Vec<_>>())
+                                .map_err(ToString::to_string),
+                            "n={n} lane={lane} transpose={transposed}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_singular_frequency_does_not_poison_neighboring_factor_lanes() {
+        let (baseline, mut inputs) = small_signal_batch_fixture(8);
+        inputs[1].fill(Complex::ZERO);
+        inputs[3][0] = Complex::new(f64::NAN, 0.);
+        let mut workspace = ComplexFactorBatch::default();
+        let refs = inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let batch = Sparse::factor_complex_batch(&baseline, &refs, &mut workspace).unwrap();
+        for (lane, (frame, status)) in batch.iter().enumerate() {
+            let (scalar, expected) = scalar_refactor_reference(&baseline, refs[lane]);
+            assert_eq!(*status, expected, "lane={lane}");
+            assert_eq!(frame.factors().is_ok(), scalar.factors().is_ok());
+        }
+        let good = [&inputs[0][..], &inputs[2][..]];
+        let recovered = Sparse::factor_complex_batch(&baseline, &good, &mut workspace).unwrap();
+        assert!(recovered.iter().all(|(_, status)| *status == Status::Okay));
+        assert!(recovered.iter().all(|(frame, _)| frame.factors().is_ok()));
+    }
+
+    #[test]
+    #[ignore = "opt-in batched AC numeric factorization throughput"]
+    fn batched_complex_frequency_factor_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for n in [8, 32, 128, 512] {
+            let (base, inputs) = small_signal_batch_fixture(n);
+            let refs = inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let mut work = ComplexFactorBatch::default();
+            let repeats = (512 / n).max(4);
+            let mut scalar = Vec::new();
+            let mut packed = Vec::new();
+            for _ in 0..7 {
+                let begin = Instant::now();
+                for _ in 0..repeats {
+                    for &values in &refs {
+                        black_box(scalar_refactor_reference(black_box(&base), values));
+                    }
+                }
+                scalar.push(begin.elapsed());
+                let begin = Instant::now();
+                for _ in 0..repeats {
+                    black_box(
+                        Sparse::factor_complex_batch(black_box(&base), &refs, &mut work).unwrap(),
+                    );
+                }
+                packed.push(begin.elapsed());
+            }
+            scalar.sort_unstable();
+            packed.sort_unstable();
+            println!(
+                "complex-factor size={n} repeats={repeats} scalar_ns={} batch_ns={}",
+                scalar[3].as_nanos(),
+                packed[3].as_nanos()
+            );
         }
     }
 
