@@ -578,6 +578,7 @@ impl StateHistory {
             offset: range.start,
             patches: Some(&mut scratch.patches),
             delay: self.delays.get(&device),
+            ltra: None,
         })
     }
 

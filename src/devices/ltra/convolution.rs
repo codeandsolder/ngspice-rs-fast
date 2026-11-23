@@ -1006,8 +1006,8 @@ pub fn rlc_coefficients(
 
     let aux = rlc_aux_index(t, curtime, times);
     if aux == 0 && index < 32 {
-        short_self_coefficients(beta, curtime, times, reltol, &mut out);
-        return out;
+        short_self_coefficients(beta, curtime, times, reltol, out);
+        return;
     }
 
     let kernels = RlcKernels {
