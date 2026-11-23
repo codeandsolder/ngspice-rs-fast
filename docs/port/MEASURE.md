@@ -489,3 +489,30 @@ large common-ordinate cancellation. Margins interpolate with fused arithmetic
 and preserve exact crossover endpoints. Tests include analytic cubic
 quadrature, a cancellation-sensitive signed integral, large-offset quadratic
 derivatives and finite interpolation across extreme endpoint values.
+
+
+### Finite-range crossing geometry
+
+Retained and objective-only streaming WHEN/TRIG/TARG event selectors now
+compare each finite left/right operand directly before choosing a side.
+They do not form an overflowing left-minus-right residual at each sample.
+For a crossing that requires interpolation, the common path keeps the
+original endpoint and jump policy, the existing conditioned binary64
+interpolation for ordinary finite spans, and an exact signed rational
+fallback for overflowing residuals and fractions that underflow before a
+large coordinate/ordinate difference can recover them.
+
+The fallback reuses the 68-limb finite-product accumulator from signed
+quadrature. It evaluates the four signed products in the coordinate
+numerator and up to four signed values in the denominator without separate
+wide-int arithmetic implementations. A leading-limb quotient estimate,
+at most one downward correction, and an exact remainder comparison round
+the output once to nearest-even binary64. No scale-normalization of
+independent residuals, tolerance snap, or extra retained history is used.
+The ordinary conditioned path remains the performance-critical default.
+
+Regression coverage includes opposite-sign MAX vector crossings,
+asymmetric residual magnitudes, a recovered minimum-subnormal crossing,
+falling transitions, duplicate-time jumps, and retained/objective-only
+agreement. The standalone 14,203-case exact-rational oracle and corrected
+quotient benchmark live in the campaign issue #139 evidence directory.

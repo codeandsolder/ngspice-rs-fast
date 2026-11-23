@@ -3,9 +3,9 @@
 //! and quadrature policies; only the traversal differs.
 
 use super::{
-    CrossingSelector, Extrema, Integral, MarginScan, MeasureEvents, MeasureSpan, Measurement,
-    Window, axis_name, descending_axis, missing_axis, nonfinite, nonfinite_axis, span_width,
-    unsupported,
+    CrossingSample, CrossingSelector, Extrema, Integral, MarginScan, MeasureEvents, MeasureSpan,
+    Measurement, Window, axis_name, descending_axis, missing_axis, nonfinite, nonfinite_axis,
+    span_width, unsupported,
 };
 use crate::analysis::ordered_samples::same_coordinate;
 use crate::analysis::results::Plot;
@@ -339,7 +339,7 @@ enum EventState {
     },
     Cross {
         selector: CrossingSelector,
-        previous: Option<(Real, SpiceResult<Real>)>,
+        previous: Option<(Real, SpiceResult<CrossingSample>)>,
         error: Option<SpiceError>,
         in_window: bool,
     },
@@ -396,22 +396,18 @@ impl EventState {
         if error.is_some() || x > bounds.to {
             return;
         }
-        let value = read(left, row, card).and_then(|a| {
-            let value = a - right
+        let value = read(left, row, card).and_then(|lhs| {
+            let rhs = right
                 .as_ref()
-                .map_or(Ok(0.), |column| read(column, row, card))?;
-            if value.is_finite() {
-                Ok(value)
-            } else {
-                Err(nonfinite(card, "WHEN", "vector difference overflow".into()))
-            }
+                .map_or(Ok(*threshold), |column| read(column, row, card))?;
+            Ok(CrossingSample { lhs, rhs })
         });
         if x >= bounds.from {
             *in_window = true;
             if let Some((x0, before)) = previous.as_ref() {
                 let step = before.as_ref().map_err(Clone::clone).and_then(|before| {
                     let after = value.as_ref().map_err(Clone::clone)?;
-                    selector.include((*x0, *before), (x, *after), *threshold, &bounds, card)
+                    selector.include((*x0, *before), (x, *after), &bounds, card)
                 });
                 if let Err(failure) = step {
                     *error = Some(failure);

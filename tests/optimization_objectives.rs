@@ -1286,3 +1286,74 @@ fn signed_panel_range_survives_both_measurement_paths() {
         }
     }
 }
+
+#[test]
+fn extreme_crossings_match_between_retained_and_objective_only_streaming() {
+    let scope = ParamScope::root(&[]).unwrap();
+    let tiny = Real::from_bits(1);
+    let fixtures: [(&str, Vec<(Real, Real, Real)>, Real); 7] = [
+        (
+            ".meas tran m WHEN v(out)=v(ref) RISE=1",
+            vec![(0., -Real::MAX, Real::MAX), (4., Real::MAX, -Real::MAX)],
+            2.,
+        ),
+        (
+            ".meas tran m WHEN v(out)=v(ref) RISE=1",
+            vec![(0., -Real::MAX, Real::MAX), (4., Real::MAX, 0.)],
+            8. / 3.,
+        ),
+        (
+            ".meas tran m WHEN v(out)=0 RISE=1",
+            vec![(0., -tiny, 0.), (1e308, 1e308, 0.)],
+            tiny,
+        ),
+        (
+            ".meas tran m WHEN v(out)=v(ref) FALL=1",
+            vec![(0., Real::MAX, -Real::MAX), (4., -Real::MAX, Real::MAX)],
+            2.,
+        ),
+        (
+            ".meas tran m WHEN v(out)=v(ref) RISE=1",
+            vec![(0., -1., 1.), (1., -1., 1.), (1., 1., -1.)],
+            1.,
+        ),
+        (
+            ".meas tran m FIND v(ref) WHEN v(out)=v(ref) RISE=1",
+            vec![(0., -Real::MAX, Real::MAX), (4., Real::MAX, -Real::MAX)],
+            0.,
+        ),
+        (
+            ".meas tran m TRIG v(out) VAL=0 RISE=1 TARG v(out) VAL=0 FALL=1",
+            vec![
+                (0., -Real::MAX, 0.),
+                (1., Real::MAX, 0.),
+                (2., -Real::MAX, 0.),
+            ],
+            1.,
+        ),
+    ];
+    for (source, rows, wanted) in fixtures {
+        let parsed = parsed(source);
+        let full = plot(&rows, 3);
+        let bound = PlotObjectivePlan::bind(
+            &full,
+            AnalysisKind::Transient,
+            ObjectiveRequests {
+                measurements: parsed.measurements.clone(),
+                ..ObjectiveRequests::default()
+            },
+        )
+        .unwrap();
+        assert!(bound.retained_columns().is_empty());
+        let streamed = finish(&ScenarioPlan::new(vec![bound]), &full, &scope);
+        assert_eq!(streamed.retained_cells, 0);
+        let retained = measure::resolve(&full, AnalysisKind::Transient, &parsed.measurements);
+        assert_eq!(streamed.measurements, retained, "{source}");
+        let value = retained.unwrap()[0].value;
+        assert_eq!(
+            value.to_bits(),
+            wanted.to_bits(),
+            "{source}: {value:e} vs {wanted:e}"
+        );
+    }
+}
