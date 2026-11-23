@@ -508,9 +508,12 @@ mod tests {
 
     /// Independent scalar reference to the *same* complex product and
     /// accumulation operations, including IEEE zero signs.
-    fn scalar_mul(left: &DenseComplex, right: &DenseComplex) -> Result<DenseComplex, String> {
+    fn scalar_mul_into(
+        left: &DenseComplex,
+        right: &DenseComplex,
+        out: &mut DenseComplex,
+    ) -> Result<(), String> {
         let n = left.dim();
-        let mut result = DenseComplex::zeros(n).unwrap();
         if left
             .data()
             .iter()
@@ -519,10 +522,11 @@ mod tests {
         {
             return Err("non-finite entry".to_owned());
         }
+        out.clear();
         for (a_row, out_row) in left
             .data
             .chunks_exact(n.max(1))
-            .zip(result.data.chunks_exact_mut(n.max(1)))
+            .zip(out.data.chunks_exact_mut(n.max(1)))
         {
             for (&a, row) in a_row.iter().zip(right.data.chunks_exact(n.max(1))) {
                 if a == Complex::ZERO {
@@ -533,11 +537,17 @@ mod tests {
                 }
             }
         }
-        if result.data.iter().any(|v| !v.is_finite()) {
+        if out.data.iter().any(|v| !v.is_finite()) {
             Err("non-finite result".to_owned())
         } else {
-            Ok(result)
+            Ok(())
         }
+    }
+
+    fn scalar_mul(left: &DenseComplex, right: &DenseComplex) -> Result<DenseComplex, String> {
+        let mut out = DenseComplex::zeros(left.dim()).unwrap();
+        scalar_mul_into(left, right, &mut out)?;
+        Ok(out)
     }
 
     #[test]
@@ -670,32 +680,82 @@ mod tests {
             let mut a = DenseComplex::zeros(n).unwrap();
             let mut b = DenseComplex::zeros(n).unwrap();
             for (i, value) in a.data.iter_mut().enumerate() {
-                *value = Complex::new((i % 31) as f64 / 31. + 0.1, (i % 19) as f64 / 19. + 0.1);
+                *value = Complex::new(
+                    f64::from(u8::try_from(i % 31).unwrap()) / 31. + 0.1,
+                    f64::from(u8::try_from(i % 19).unwrap()) / 19. + 0.1,
+                );
             }
             for (i, value) in b.data.iter_mut().enumerate() {
-                *value = Complex::new((i % 23) as f64 / 23. - 0.5, (i % 29) as f64 / 29. - 0.5);
+                *value = Complex::new(
+                    f64::from(u8::try_from(i % 23).unwrap()) / 23. - 0.5,
+                    f64::from(u8::try_from(i % 29).unwrap()) / 29. - 0.5,
+                );
             }
             let mut out = DenseComplex::zeros(n).unwrap();
+            let mut reference = out.clone();
             let repeats = (2048 / n).max(2);
             let mut baseline = Vec::new();
             let mut vectorized = Vec::new();
             for _ in 0..7 {
                 let start = Instant::now();
                 for _ in 0..repeats {
-                    let _ = black_box(scalar_mul(black_box(&a), black_box(&b)).unwrap());
+                    scalar_mul_into(black_box(&a), black_box(&b), black_box(&mut reference))
+                        .unwrap();
+                }
+                black_box(&reference);
+                baseline.push(start.elapsed());
+                let start = Instant::now();
+                for _ in 0..repeats {
+                    a.mul_into(black_box(&b), black_box(&mut out)).unwrap();
+                }
+                black_box(&out);
+                vectorized.push(start.elapsed());
+            }
+            baseline.sort();
+            vectorized.sort();
+            assert_eq!(bits(reference.data()), bits(out.data()));
+            eprintln!(
+                "dense-complex n={n} reps={repeats} scalar_ns={} simd_ns={}",
+                baseline[3].as_nanos(),
+                vectorized[3].as_nanos()
+            );
+            let currents = &a.data[..n];
+            let conjugates = currents
+                .iter()
+                .map(|value| value.conj())
+                .collect::<Vec<_>>();
+            let mut original_cov = DenseComplex::zeros(n).unwrap();
+            let mut simd_cov = original_cov.clone();
+            baseline.clear();
+            vectorized.clear();
+            for _ in 0..7 {
+                let start = Instant::now();
+                for _ in 0..repeats {
+                    original_cov.clear();
+                    for (row, &factor) in currents.iter().enumerate() {
+                        for (col, &value) in conjugates.iter().enumerate() {
+                            let cell = &mut original_cov.data[row * n + col];
+                            *cell = *cell + factor * value;
+                        }
+                    }
+                    black_box(&original_cov);
                 }
                 baseline.push(start.elapsed());
                 let start = Instant::now();
                 for _ in 0..repeats {
-                    black_box(a.mul_into(black_box(&b), black_box(&mut out)).unwrap());
+                    simd_cov.clear();
+                    simd_cov
+                        .add_outer(black_box(currents), black_box(&conjugates))
+                        .unwrap();
+                    black_box(&simd_cov);
                 }
                 vectorized.push(start.elapsed());
             }
             baseline.sort();
             vectorized.sort();
-            assert_eq!(bits(scalar_mul(&a, &b).unwrap().data()), bits(out.data()));
+            assert_eq!(bits(original_cov.data()), bits(simd_cov.data()));
             eprintln!(
-                "dense-complex n={n} reps={repeats} scalar_ns={} simd_ns={}",
+                "complex-outer n={n} reps={repeats} scalar_ns={} simd_ns={}",
                 baseline[3].as_nanos(),
                 vectorized[3].as_nanos()
             );
