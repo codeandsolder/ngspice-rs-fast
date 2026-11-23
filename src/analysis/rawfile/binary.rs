@@ -162,10 +162,10 @@ pub(super) fn read_row(
 /// count, and divisible by either cell width.
 const BLOCK_BYTES: usize = 32 * 1024;
 
-/// Reusable encoding scratch. Retained plots may coalesce multiple rows;
-/// spooled rows flush at the push boundary, preserving the existing writer
-/// error lifecycle. The allocation is lazy, so ASCII and zero-width binary
-/// plots do not allocate it.
+/// Reusable encoding scratch. Both retained and directly streamed plots
+/// coalesce rows into bounded blocks; finish_plot flushes the final partial
+/// block before backpatching the point count. The allocation is lazy, so ASCII
+/// and zero-width binary plots do not allocate it.
 #[derive(Debug, Default)]
 pub(super) struct Encoder {
     bytes: Vec<u8>,
