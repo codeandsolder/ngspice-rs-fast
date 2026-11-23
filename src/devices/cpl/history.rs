@@ -31,6 +31,9 @@ fn bracket(history: &WaveformHistory, target: Real) -> SpiceResult<Bracket> {
     let last = history
         .time(size - 1)
         .ok_or_else(|| error("missing newest CPL time"))?;
+    if target < first && first.partial_cmp(&0.) != Some(std::cmp::Ordering::Equal) {
+        return Err(error("required CPL wave sample was already pruned"));
+    }
     if target <= first {
         return Ok(Bracket {
             earlier: 0,
@@ -120,11 +123,14 @@ impl CplModes {
         if !time.is_finite() || time < 0. {
             return Err(error("CPL time must be finite and nonnegative"));
         }
-        if history.width() != 2 * n || history.is_empty() || history.time(0) != Some(0.) {
-            return Err(error(format!(
-                "CPL needs nonempty width {} history at t=0",
-                2 * n
-            )));
+        if history.width() != 2 * n || history.is_empty() {
+            return Err(error(format!("CPL needs nonempty width {} history", 2 * n)));
+        }
+        let first = history
+            .time(0)
+            .ok_or_else(|| error("missing CPL accepted time"))?;
+        if !first.is_finite() || first < 0. {
+            return Err(error("CPL accepted time must be finite and nonnegative"));
         }
         if near_received.len() != n || far_received.len() != n {
             return Err(error(format!(
@@ -248,6 +254,35 @@ mod tests {
         assert_eq!(near, [111.; 2]);
         assert_eq!(far, [222.; 2]);
         assert_eq!(history, before);
+    }
+
+    #[test]
+    fn pruned_history_is_supported_only_while_required_samples_are_retained() {
+        let modes = modes();
+        let mut history = history();
+        history
+            .apply(&WaveformUpdate {
+                drop_front: 1,
+                ..WaveformUpdate::default()
+            })
+            .unwrap();
+        assert_eq!(history.time(0), Some(1e-9));
+        let mut near = [0.; 2];
+        let mut far = [0.; 2];
+        modes
+            .delayed_launches_into(&history, 2.25e-9, &mut near, &mut far)
+            .unwrap();
+        assert!((near[0] - 40.5).abs() < 1e-12);
+        assert!((near[1] - 50.).abs() < 1e-12);
+        near = [111.; 2];
+        far = [222.; 2];
+        assert!(
+            modes
+                .delayed_launches_into(&history, 0.25e-9, &mut near, &mut far)
+                .is_err()
+        );
+        assert_eq!(near, [111.; 2]);
+        assert_eq!(far, [222.; 2]);
     }
 
     #[test]
