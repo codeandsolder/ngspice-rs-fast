@@ -1843,6 +1843,16 @@ fn waveform_text(
             }
             numeric_vector_text(parts, keyword, &function.values, ' ', location)
         }
+        SourceWaveform::Stochastic { values, .. } => {
+            let maximum = kind.maximum_fields();
+            if !(2..=maximum).contains(&values.len()) {
+                return Err(refuse(
+                    format!("{keyword} requires 2 to {maximum} fields"),
+                    Some(location),
+                ));
+            }
+            numeric_vector_text(parts, keyword, values, ' ', location)
+        }
     }
 }
 

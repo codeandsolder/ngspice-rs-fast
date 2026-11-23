@@ -137,6 +137,40 @@ pub enum SourceWaveform {
     Pwl(Vec<PwlPoint>),
     /// SIN/EXP/SFFM/AM: two required fields and a bounded optional prefix.
     Function(Box<FunctionWaveform>),
+    /// TRNOISE/TRRANDOM: immutable typed numeric field vectors.
+    Stochastic {
+        /// Noise law selected by the upstream waveform name.
+        function: StochasticFunction,
+        /// Two required fields and a contiguous optional prefix.
+        values: Vec<PositionedValue>,
+    },
+}
+
+/// Upstream time-domain stochastic-source waveform families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StochasticFunction {
+    /// TRNOISE(NA TS [NALPHA [NAMP [RTSAM [RTSCAPT [RTSEMT]]]]]).
+    Noise,
+    /// TRRANDOM(TYPE TS [TD [PARAM1 [PARAM2]]]).
+    Random,
+}
+impl StochasticFunction {
+    /// Number and name of all fields in upstream order.
+    #[must_use]
+    pub const fn fields(self) -> &'static [&'static str] {
+        match self {
+            Self::Noise => &["na", "ts", "nalpha", "namp", "rtsam", "rtscapt", "rtsemt"],
+            Self::Random => &["type", "ts", "td", "param1", "param2"],
+        }
+    }
+    /// Original ngspice waveform keyword.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Noise => "trnoise",
+            Self::Random => "trrandom",
+        }
+    }
 }
 
 /// Shared lexical classification for parsing and serializing waveform
@@ -146,6 +180,7 @@ pub(crate) enum WaveformKind {
     Pulse,
     Pwl,
     Function(SourceFunction),
+    Stochastic(StochasticFunction),
 }
 
 impl WaveformKind {
@@ -158,6 +193,8 @@ impl WaveformKind {
             ("exp", Self::Function(SourceFunction::Exp)),
             ("sffm", Self::Function(SourceFunction::Sffm)),
             ("am", Self::Function(SourceFunction::Am)),
+            ("trnoise", Self::Stochastic(StochasticFunction::Noise)),
+            ("trrandom", Self::Stochastic(StochasticFunction::Random)),
         ]
         .into_iter()
         .find_map(|(name, kind)| keyword.eq_ignore_ascii_case(name).then_some(kind))
@@ -168,6 +205,7 @@ impl WaveformKind {
             Self::Pulse => 8,
             Self::Pwl => 4096,
             Self::Function(function) => function.fields().len(),
+            Self::Stochastic(function) => function.fields().len(),
         }
     }
 
@@ -178,6 +216,7 @@ impl WaveformKind {
             Self::Pwl => "pwl",
             Self::Function(SourceFunction::Sin) if spelling == "sine" => "sine",
             Self::Function(function) => function.keyword(),
+            Self::Stochastic(function) => function.keyword(),
         }
     }
 }
@@ -188,6 +227,7 @@ impl SourceWaveform {
             Self::Pulse(_) => WaveformKind::Pulse,
             Self::Pwl(_) => WaveformKind::Pwl,
             Self::Function(function) => WaveformKind::Function(function.function),
+            Self::Stochastic { function, .. } => WaveformKind::Stochastic(*function),
         }
     }
 }

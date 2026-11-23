@@ -305,7 +305,8 @@ fn eligibility(waveform: &Waveform) -> Eligibility {
         Waveform::Pwl(_)
         | Waveform::Step { .. }
         | Waveform::PulseDefaults(_)
-        | Waveform::FunctionDefaults(_) => Eligibility::EveryAccept,
+        | Waveform::FunctionDefaults(_)
+        | Waveform::Stochastic(_) => Eligibility::EveryAccept,
     }
 }
 
@@ -457,6 +458,17 @@ impl Request<'_> {
                 self.pwl(pwl.knots(), pwl.delay(), pwl.repeat(), break_time, table)
             }
             Waveform::Step { time, .. } => self.pwl(&[(*time, 0.)], 0., None, break_time, table),
+            Waveform::Stochastic(process) => {
+                let mut events = process.events(self.now, table.final_time)?;
+                while let Some(event) = events.next_event() {
+                    if event.time > self.now {
+                        // One pending event per source; the accept callback
+                        // advances on physical time, never Newton trial count.
+                        return table.set(self.now, event.time);
+                    }
+                }
+                Ok(())
+            }
             Waveform::PulseDefaults(_) | Waveform::FunctionDefaults(_) => Err(SpiceError::circuit(
                 "source defaults are unresolved; bind transient timing before scheduling breakpoints",
             )),

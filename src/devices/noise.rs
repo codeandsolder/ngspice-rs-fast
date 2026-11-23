@@ -39,6 +39,7 @@ use crate::maths::Vector;
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 
 pub(crate) mod layout;
+pub mod transient;
 
 /// A differential transfer bound to the finalized topology. Only ground
 /// maps to no row.

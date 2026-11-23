@@ -219,6 +219,12 @@ impl SourceExcitation {
         if !dc.value().is_finite() || !ac.phasor.is_finite() {
             return Err(SpiceError::circuit("non-finite source excitation"));
         }
+        let waveform = match waveform {
+            Waveform::Stochastic(process) => {
+                Waveform::Stochastic(process.with_dc(if dc.given() { dc.value() } else { 0. })?)
+            }
+            waveform => waveform,
+        };
         Ok(Self {
             voltage,
             dc,
@@ -229,8 +235,13 @@ impl SourceExcitation {
     }
 
     pub(super) fn bind(self, name: impl Into<String>, terminals: [NodeId; 2]) -> IndependentSource {
+        let name = name.into();
+        let waveform = match self.waveform {
+            Waveform::Stochastic(process) => Waveform::Stochastic(process.with_source_name(&name)),
+            waveform => waveform,
+        };
         IndependentSource {
-            name: name.into(),
+            name,
             terminals: [terminals[0], terminals[1], NodeId::GROUND],
             voltage: self.voltage,
             dc: self.dc,
@@ -239,7 +250,7 @@ impl SourceExcitation {
             function_given: self.function_given,
             accumulated_waveform: None,
             power_tone: None,
-            waveform: self.waveform,
+            waveform,
             port: None,
             distortion: [None, None],
         }
@@ -508,6 +519,9 @@ impl Device for IndependentSource {
             // for each swept point.
             "dc" => {
                 copy.dc = DcExcitation::Explicit(value);
+                if let Waveform::Stochastic(process) = &copy.waveform {
+                    copy.waveform = Waveform::Stochastic(process.clone().with_dc(value)?);
+                }
             }
             _ => {
                 return Err(SpiceError::circuit(format!(

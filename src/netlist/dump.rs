@@ -902,6 +902,12 @@ fn write_waveform(ctx: &Ctx<'_>, out: &mut Out, indent: usize, waveform: &Source
                 out.line(indent + 1, format!("{name}: {}", positioned(ctx, value)));
             }
         }
+        SourceWaveform::Stochastic { function, values } => {
+            out.line(indent, function.keyword());
+            for (name, value) in function.fields().iter().zip(values) {
+                out.line(indent + 1, format!("{name}: {}", positioned(ctx, value)));
+            }
+        }
         SourceWaveform::Pwl(points) => {
             out.line(indent, "pwl");
             for (m, point) in points.iter().enumerate() {
