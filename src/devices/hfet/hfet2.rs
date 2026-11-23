@@ -660,6 +660,10 @@ impl Hfet2 {
 }
 
 impl Device for Hfet2 {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.derived(context.temperature).map(|_| ())
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
