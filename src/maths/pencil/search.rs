@@ -778,15 +778,177 @@ impl Search<'_> {
         Ok(true)
     }
 
+    /// The search's convergence radius is not a license to count a tiny
+    /// imaginary perturbation as a second pole. Resolve an accepted candidate
+    /// against the real determinant: a simple real root has a sign bracket and
+    /// a localized Newton correction, while a genuine conjugate pair has no
+    /// such nearby real crossing. An exact zero on the real axis also permits
+    /// repeated roots (where the first derivative necessarily vanishes).
+    ///
+    /// All determinant probes use the already-deflated pencil. This is called
+    /// only for candidates that have passed the ordinary residual test.
+    fn real_axis_root(&mut self, s: Cx) -> SpiceResult<Option<Cx>> {
+        let scale = s.re.abs().max(s.im);
+        let ulp = s.re.abs().next_up() - s.re.abs();
+        let step = (scale * 2_f64.powi(-20)).max(s.im * 32.).max(ulp * 32.);
+        if !step.is_finite() || step == 0. {
+            return Ok(None);
+        }
+        let (left_x, right_x) = (s.re - step, s.re + step);
+        if !left_x.is_finite() || !right_x.is_finite() || left_x == s.re || right_x == s.re {
+            return Ok(None);
+        }
+        let center = self.deflated_at(Cx::new(s.re, 0.))?;
+        if center.0.is_zero() {
+            // A true complex zero at the same real part must not be
+            // discarded merely because a real zero also exists. When
+            // the imaginary displacement is smaller than one real-axis
+            // ULP, the two evaluations are not numerically resolvable:
+            // the exact real zero is the supported classification.
+            if s.im == 0. || s.im <= ulp || !self.deflated_at(s)?.0.is_zero() {
+                return Ok(Some(Cx::new(s.re, 0.)));
+            }
+            return Ok(None);
+        }
+        let left = self.deflated_at(Cx::new(left_x, 0.))?;
+        let right = self.deflated_at(Cx::new(right_x, 0.))?;
+        let (difference, difference_exponent) = zaddeq(right.0.re, right.1, -left.0.re, left.1)?;
+        let repeated = sgn(left.0.re) == sgn(right.0.re);
+        let correction = if repeated {
+            // A repeated real zero has no sign change. Fit a *local*
+            // quadratic using the symmetric divided differences. Its
+            // discriminant vanishes up to uncertainty in the representable
+            // real coordinate. In contrast, conjugate pairs and two distinct
+            // neighboring real roots have respectively positive/negative
+            // nonzero vertex residuals.
+            let (ends, ends_exponent) = zaddeq(left.0.re, left.1, right.0.re, right.1)?;
+            let (curvature, curvature_exponent) =
+                zaddeq(ends, ends_exponent, -center.0.re, center.1 + 1)?;
+            if curvature == 0. {
+                return Ok(None);
+            }
+            let slope = materialize_power(
+                difference / curvature,
+                difference_exponent - curvature_exponent,
+            );
+            let offset = materialize_power(center.0.re / curvature, center.1 - curvature_exponent);
+            let normalized_vertex = offset - slope * slope / 8.;
+            if !slope.is_finite()
+                || !normalized_vertex.is_finite()
+                || normalized_vertex.abs() > 16. * (ulp / step).powi(2)
+            {
+                return Ok(None);
+            }
+            -0.5 * step * slope
+        } else {
+            if difference == 0. {
+                return Ok(None);
+            }
+            materialize_power(
+                (-center.0.re / difference) * step,
+                center.1 - difference_exponent + 1,
+            )
+        };
+        let accepted_radius = 4e-12_f64
+            .mul_add(scale.max(1e-12), 1e-20)
+            .max(8. * s.im)
+            .max(64. * ulp);
+        if !correction.is_finite()
+            || correction.abs() > accepted_radius
+            || correction.abs() > step * 0.5
+        {
+            return Ok(None);
+        }
+        let root_x = s.re + correction;
+        if !(left_x..=right_x).contains(&root_x) {
+            return Ok(None);
+        }
+        let complex = if s.im != 0. {
+            let value = self.deflated_at(s)?;
+            if value.0.is_zero() && s.im > ulp {
+                return Ok(None);
+            }
+            if !repeated && !value.0.is_zero() {
+                // At a simple real root, a complex displacement produces
+                // approximately i * Im(s) * D'(Re(s)). An actual complex
+                // root has a much smaller residual than this.
+                let complex_to_slope = materialize_power(
+                    value.0.re.hypot(value.0.im) / difference.abs(),
+                    value.1 - difference_exponent,
+                );
+                if complex_to_slope < s.im / (16. * step) {
+                    return Ok(None);
+                }
+            }
+            Some(value)
+        } else {
+            None
+        };
+        let refined = self.deflated_at(Cx::new(root_x, 0.))?;
+        if repeated && let Some(complex) = complex {
+            let residual_ratio = if refined.0.is_zero() {
+                0.
+            } else {
+                materialize_power(
+                    refined.0.re.hypot(refined.0.im) / complex.0.re.hypot(complex.0.im),
+                    refined.1 - complex.1,
+                )
+            };
+            if residual_ratio > 0.125 {
+                return Ok(None);
+            }
+        }
+        if root_x != s.re && !refined.0.is_zero() {
+            let residual_ratio = materialize_power(
+                refined.0.re.hypot(refined.0.im) / center.0.re.hypot(center.0.im),
+                refined.1 - center.1,
+            );
+            if residual_ratio > 0.5 {
+                // Around an exact real crossing the LU determinant can
+                // already be at its rounding floor. A correction of only
+                // a few representable coordinates need not monotonically
+                // reduce that cancellation-limited residual.
+                if correction.abs() <= 16. * ulp {
+                    return Ok(Some(Cx::new(s.re, 0.)));
+                }
+                return Ok(None);
+            }
+        }
+        Ok(Some(Cx::new(root_x, 0.)))
+    }
+
+    /// A root is linked in corrected frequency order, not in the original
+    /// Muller proposal order. Classification is shared by both exact-zero
+    /// trials and roots recognized through residual convergence.
+    fn insert_root(&mut self, s: Cx) -> SpiceResult<TrialId> {
+        let corrected = self.real_axis_root(s)?.unwrap_or(s);
+        let mut previous = None;
+        let mut current = self.arena.head();
+        while let Some(id) = current {
+            let trial = self.arena.get(id)?;
+            let diff = trial.s().sub(corrected);
+            if diff.re < 0. || (diff.re == 0. && diff.im < 0.) {
+                previous = Some(id);
+            }
+            current = trial.next();
+        }
+        self.arena.insert_after(
+            previous,
+            Trial::new(
+                corrected,
+                Cx::ZERO,
+                0,
+                TrialKind::Root(std::num::NonZeroU32::MIN),
+            ),
+        )
+    }
+
     /// Evaluate or merge a proposed trial. Preserve distinct roots and
     /// require a numerical residual check before declaring convergence.
     fn run_trial(&mut self, mut s: Cx, middle: Option<TrialId>) -> SpiceResult<TrialId> {
         const ABSTOL: Real = 1e-20;
         const RELTOL: Real = 1e-12;
         s.im = s.im.abs();
-        if s.im <= 8. * Real::EPSILON * s.re.abs() {
-            s.im = 0.;
-        }
         let mut shifted = false;
         let mut attempts = 0;
         loop {
@@ -834,13 +996,7 @@ impl Search<'_> {
                     }
                     TrialKind::Sample | TrialKind::Minimum => {
                         if self.coincident_root(s)? {
-                            let root = Trial::new(
-                                s,
-                                Cx::ZERO,
-                                0,
-                                TrialKind::Root(std::num::NonZeroU32::MIN),
-                            );
-                            return self.arena.insert_after(prev, root);
+                            return self.insert_root(s);
                         }
                         if s.im == 0. && self.trapped == Trap::Bracket(Region::Minimum) {
                             self.arena.get_mut(id)?.kind = TrialKind::Minimum;
@@ -866,14 +1022,12 @@ impl Search<'_> {
             #[cfg(test)]
             self.trace.push(TraceEvent::Load(s));
             let (value, exponent) = self.deflated_at(s)?;
-            let kind = if value.is_zero() {
-                TrialKind::Root(std::num::NonZeroU32::MIN)
-            } else {
-                TrialKind::Sample
-            };
+            if value.is_zero() {
+                return self.insert_root(s);
+            }
             return self
                 .arena
-                .insert_after(prev, Trial::new(s, value, exponent, kind));
+                .insert_after(prev, Trial::new(s, value, exponent, TrialKind::Sample));
         }
     }
 
@@ -1193,6 +1347,126 @@ pub(crate) fn report_c_trace(load: &PencilLoad, name: &str, trace: &str) {
 mod tests {
     use super::*;
     use crate::maths::pencil::PencilTerm;
+
+    #[test]
+    fn real_axis_certificate_distinguishes_simple_repeated_and_damped_roots() {
+        let location = 1e10;
+        let noise = 2e-5;
+        for gain in [1e-12, 1., 1e12] {
+            let simple = PencilLoad {
+                order: 1,
+                elements: vec![(0, 0)],
+                terms: vec![PencilTerm {
+                    row: 0,
+                    col: 0,
+                    conductance: Some(location * gain),
+                    capacitance: Some(gain),
+                }],
+                ..PencilLoad::default()
+            };
+            let mut search = Search::new(&simple).unwrap();
+            let real = search
+                .real_axis_root(Cx::new(-location - 0.02, noise))
+                .unwrap()
+                .unwrap();
+            assert_eq!(real.im, 0.);
+            assert!(
+                (real.re + location).abs() <= 2e-6,
+                "gain {gain:e}: refined {real:?}"
+            );
+            assert!(
+                search
+                    .real_axis_root(Cx::new(-location - 0.2, noise))
+                    .unwrap()
+                    .is_none(),
+                "a distant real crossing is not the complex trial's root"
+            );
+
+            let pair = PencilLoad {
+                order: 2,
+                elements: vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+                terms: vec![
+                    PencilTerm {
+                        row: 0,
+                        col: 0,
+                        conductance: Some(location * gain),
+                        capacitance: Some(gain),
+                    },
+                    PencilTerm {
+                        row: 0,
+                        col: 1,
+                        conductance: Some(-noise * gain),
+                        capacitance: None,
+                    },
+                    PencilTerm {
+                        row: 1,
+                        col: 0,
+                        conductance: Some(noise * gain),
+                        capacitance: None,
+                    },
+                    PencilTerm {
+                        row: 1,
+                        col: 1,
+                        conductance: Some(location * gain),
+                        capacitance: Some(gain),
+                    },
+                ],
+                ..PencilLoad::default()
+            };
+            assert!(
+                Search::new(&pair)
+                    .unwrap()
+                    .real_axis_root(Cx::new(-location, noise))
+                    .unwrap()
+                    .is_none(),
+                "gain {gain:e}: a true near-real conjugate pair remains complex"
+            );
+            let repeated = PencilLoad {
+                order: 2,
+                elements: vec![(0, 0), (1, 1)],
+                terms: vec![
+                    simple.terms[0],
+                    PencilTerm {
+                        row: 1,
+                        col: 1,
+                        ..simple.terms[0]
+                    },
+                ],
+                ..PencilLoad::default()
+            };
+            let split = PencilLoad {
+                order: 2,
+                elements: repeated.elements.clone(),
+                terms: vec![
+                    PencilTerm {
+                        conductance: Some((location - noise) * gain),
+                        ..repeated.terms[0]
+                    },
+                    PencilTerm {
+                        conductance: Some((location + noise) * gain),
+                        ..repeated.terms[1]
+                    },
+                ],
+                ..PencilLoad::default()
+            };
+            assert!(
+                Search::new(&split)
+                    .unwrap()
+                    .real_axis_root(Cx::new(-location, noise))
+                    .unwrap()
+                    .is_none(),
+                "gain {gain:e}: two distinct nearby real roots must not be merged"
+            );
+            assert_eq!(
+                Search::new(&repeated)
+                    .unwrap()
+                    .real_axis_root(Cx::new(-location, noise))
+                    .unwrap(),
+                Some(Cx::new(-location, 0.)),
+                "gain {gain:e}: a repeated real root remains real"
+            );
+        }
+    }
 
     #[test]
     fn deflation_is_a_polynomial_at_complex_frequencies() {
