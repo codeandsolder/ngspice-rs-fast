@@ -45,7 +45,7 @@ impl FrequencyPlan {
         })
     }
 
-    /// Sensitivity uses count_steps and multiplies even for a non-increasing
+    /// Sensitivity uses `count_steps` and multiplies even for a non-increasing
     /// factor; it has no endpoint-tolerance/monotonicity test.
     pub(super) fn counted(start: Real, factor: Real, count: usize) -> SpiceResult<Self> {
         let plan = Self {

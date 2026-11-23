@@ -233,7 +233,7 @@ impl AccumulatedGrid {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct GridValues {
     stored: Real,
     offset: Real,
@@ -767,13 +767,16 @@ impl GridPair {
     fn physical_contexts(mut self, sources: [bool; 2]) -> Self {
         let unique = |grid: GridValues, is_source| {
             if is_source {
-                let first = grid.clone().next().expect("validated nonempty grid");
-                let last = grid.last().expect("validated nonempty grid");
-                GridValues::singleton(if last.abs() > first.abs() {
-                    last
-                } else {
-                    first
-                })
+                match (grid.clone().next(), grid.clone().last()) {
+                    (Some(first), Some(last)) => {
+                        GridValues::singleton(if last.abs() > first.abs() {
+                            last
+                        } else {
+                            first
+                        })
+                    }
+                    _ => grid,
+                }
             } else {
                 grid
             }
@@ -807,10 +810,11 @@ fn preflight(
         axes.get(1).is_some_and(|axis| axis.binding.is_source()),
     ];
     let contexts = GridPair::new(grids).physical_contexts(sources);
-    let start = [
-        contexts.inner.clone().next().unwrap(),
-        contexts.outer.clone().next().unwrap(),
-    ];
+    let (Some(inner), Some(outer)) = (contexts.inner.clone().next(), contexts.outer.clone().next())
+    else {
+        return Ok(());
+    };
+    let start = [inner, outer];
     // Check every coupled physical combination, but unchanged devices only
     // need validation once at each scalar temperature context. The grids
     // are strictly monotone, so the first value of the other axis identifies

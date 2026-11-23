@@ -561,9 +561,9 @@ impl AnalysisPlan {
             | PlanKind::SParameter { frequencies, .. }
             | PlanKind::Noise { frequencies, .. }
             | PlanKind::Distortion { frequencies, .. } => frequencies.len(),
-            PlanKind::Sensitivity { frequencies, .. } => {
-                frequencies.as_ref().map_or(0, |grid| grid.len())
-            }
+            PlanKind::Sensitivity { frequencies, .. } => frequencies
+                .as_ref()
+                .map_or(0, super::frequency::FrequencyPlan::len),
             _ => 0,
         }
     }
