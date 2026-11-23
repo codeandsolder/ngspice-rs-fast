@@ -96,17 +96,28 @@ impl ScaledSquares {
         }
     }
 
-    /// Add a group of squared ordinates with a common positive scale and
-    /// individual nonnegative weights. Inputs are finite; split the three
-    /// factors before multiplying, including subnormal scales.
+    /// Add squared ordinates with a finite binary64 positive scale.
     pub(super) fn add_weighted(
         &mut self,
         scale: Real,
         samples: impl Iterator<Item = (Real, Real)>,
     ) {
-        let Some((sm, se)) = split(scale) else {
+        if let Some(scale) = split(scale) {
+            self.add_scaled(scale, samples);
+        }
+    }
+
+    /// Add squared ordinates with an interval represented outside binary64's
+    /// exponent range. The exact endpoint geometry is converted once to a
+    /// normalized significand/exponent; individual products never overflow.
+    pub(super) fn add_scaled(
+        &mut self,
+        (sm, se): (Real, i32),
+        samples: impl Iterator<Item = (Real, Real)>,
+    ) {
+        if sm <= 0. {
             return;
-        };
+        }
         for (value, weight) in samples {
             let (Some((m, me)), Some((w, we))) = (split(value.abs()), split(weight)) else {
                 continue;
@@ -138,12 +149,18 @@ impl ScaledSquares {
     /// exponent by two before taking the root, so a small weighted term
     /// is not rounded to zero before normalization.
     pub(super) fn root_mean(self, divisor: Real) -> Real {
+        split(divisor).map_or(Real::NAN, |scale| self.root_mean_scaled(scale))
+    }
+
+    /// Normalize by a positive axis span, even when its exact width cannot be
+    /// represented as a finite binary64 value.
+    pub(super) fn root_mean_scaled(self, (d, de): (Real, i32)) -> Real {
         let Some(exponent) = self.exponent else {
             return 0.;
         };
-        let Some((d, de)) = split(divisor) else {
+        if d <= 0. {
             return Real::NAN;
-        };
+        }
         let exponent = exponent - de;
         let odd = if exponent.rem_euclid(2) == 0 { 1. } else { 2. };
         let root = (self.squares.total() / d * odd).sqrt();

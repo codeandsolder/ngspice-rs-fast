@@ -138,6 +138,39 @@ pub(crate) fn rounded_product_ratio<const N: usize, const D: usize>(
     numerator.round_ratio(&denominator)
 }
 
+/// If subtraction is exact, return its finite positive binary64 result.
+/// Knuth's error-free TwoSum of `to + (-from)` detects a nonzero residual
+/// without allocating an arbitrary-precision accumulator on ordinary grids.
+fn exact_difference(from: Real, to: Real) -> Option<Real> {
+    let rounded = to - from;
+    if !rounded.is_finite() || rounded <= 0. {
+        return None;
+    }
+    let negative_from = -from;
+    let right_virtual = rounded - to;
+    let residual = (to - (rounded - right_virtual)) + (negative_from - right_virtual);
+    (residual == 0.).then_some(rounded)
+}
+
+/// Positive axis interval as a normalized mantissa/exponent pair. An exact
+/// large-coordinate sum is used when the rounded difference loses bits or
+/// overflows. This geometry feeds RMS without squaring an enormous width.
+#[cold]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "re-exported crate-wide from the private exact primitives module"
+)]
+pub(crate) fn positive_axis_span(from: Real, to: Real) -> (Real, i32) {
+    if let Some(rounded) = exact_difference(from, to) {
+        return split_power(rounded);
+    }
+    let mut difference = ExactSum::new();
+    difference.add(ExactTerm::from_real(to));
+    difference.add(ExactTerm::from_real(-from));
+    let exact = difference.magnitude().scaled();
+    (exact.mantissa, exact.exponent)
+}
+
 // Product unit -2148, maximum product exponent <2048, panel weights
 // fit in u8, and at most 4 * usize::MAX terms. 68 limbs cover the entire
 // range and sign, including all intermediate partial sums.
@@ -254,6 +287,44 @@ impl ExactSum {
             }
         }
         Magnitude { words, negative }
+    }
+
+    /// Add one panel with the *exact* binary64 endpoint difference. Fast-path
+    /// subtraction only when its full rounding residual is zero; otherwise
+    /// insert the positive and negative endpoint products separately. This
+    /// prevents any mismatched sum of rounded panel widths and window width.
+    pub(crate) fn add_axis_panel<const N: usize>(
+        &mut self,
+        from: Real,
+        to: Real,
+        samples: [Real; N],
+        weights: [u8; N],
+    ) {
+        if let Some(exact) = exact_difference(from, to) {
+            self.add_weighted(exact, samples, weights);
+        } else {
+            self.add_weighted(to, samples, weights);
+            self.add_weighted(-from, samples, weights);
+        }
+    }
+
+    /// Correctly round the mean of the exact weighted panel numerators,
+    /// divided by 24 times the exact coordinate interval, even when the
+    /// physical width overflows binary64 or the panel widths round apart.
+    pub(crate) fn panel_ratio_axis(self, from: Real, to: Real) -> Real {
+        if !(from.is_finite() && to.is_finite() && to > from) {
+            return Real::NAN;
+        }
+        // Match rounded_product_ratio's unit convention: numerator product
+        // bins are 2^-2148; denominator finite-value bins are 2^-1074.
+        let mut denominator = Self::new();
+        for value in [to, -from] {
+            let mut term = ExactTerm::from_real(value);
+            term.significand *= 24;
+            term.exponent -= 1074;
+            denominator.add(term);
+        }
+        self.magnitude().round_ratio(&denominator.magnitude())
     }
 
     /// Final integral or normalized mean, rounded once after the exact

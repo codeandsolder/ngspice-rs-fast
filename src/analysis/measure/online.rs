@@ -560,11 +560,9 @@ impl StatisticState {
             from: window.from,
             to: window.to,
         };
-        let width = if self.integral.is_some() {
-            Some(span_width(span, card)?)
-        } else {
-            None
-        };
+        if self.integral.is_some() {
+            span_width(span, card)?;
+        }
         if let Some(error) = error {
             return Err(error);
         }
@@ -572,10 +570,7 @@ impl StatisticState {
             return Err(no_samples(card));
         }
         if let Some(integral) = self.integral {
-            let value = integral.finish(
-                width.ok_or_else(|| SpiceError::circuit("missing integration width"))?,
-                card,
-            )?;
+            let value = integral.finish(span, card)?;
             Ok((value, None, Some(span)))
         } else if let Some(extrema) = self.extrema {
             let (value, at) = extrema.result(statistic)?;
