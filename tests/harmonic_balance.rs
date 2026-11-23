@@ -3,7 +3,7 @@
 //! This compiles and exercises the exact production plan source.
 pub use ngspice_rs::{maths, primitives};
 #[path = "../src/analysis/harmonic_balance.rs"]
-mod harmonic_balance;
+pub mod harmonic_balance;
 
 use harmonic_balance::plan::{HarmonicLimits, HarmonicPlan, Tone};
 use harmonic_balance::{HarmonicProblem, NonlinearConstitutive, SolveLimits};
@@ -282,7 +282,9 @@ fn linear_rc_harmonic_matches_analytic_complex_transfer_function() {
     )
     .unwrap();
     let result = circuit.solve(&mut Linear, None).unwrap();
+    assert_eq!(circuit.plan().modes().len(), plan.modes().len());
     assert_eq!(result.iterations, 1);
+    assert_eq!(result.sampled_model_calls, plan.sample_count() * 2);
     assert!(result.residual_ratio <= 1.);
     let omega = 2. * std::f64::consts::PI * 1_000.;
     let expected = Complex::real(5e-4) / Complex::new(1e-3, omega * 1e-7);
@@ -458,4 +460,200 @@ fn invalid_forcing_and_overbudget_newton_dimensions_are_rejected() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn rlc_mna_branch_unknown_follows_analytic_admittance() {
+    // The inductor branch is an algebraic current unknown with a
+    // frequency-dependent -L coefficient, not an extra node-voltage-only
+    // harmonic. This exercises the generic saddle-point MNA structure.
+    let plan = HarmonicPlan::new(
+        &[Tone::Independent {
+            frequency_hz: 1_000.,
+            order: 2,
+        }],
+        HarmonicLimits::default(),
+    )
+    .unwrap();
+    let r = 1_000.;
+    let c = 1e-9;
+    let l = 1e-3;
+    let mut forcing = vec![Complex::ZERO; plan.modes().len() * 2];
+    for tone in [1, -1] {
+        forcing[mode_at(&plan, &[tone]) * 2] = Complex::real(0.0005);
+    }
+    let problem = HarmonicProblem::new(
+        plan.clone(),
+        2,
+        vec![1. / r, 1., 1., 0.],
+        vec![c, 0., 0., -l],
+        forcing,
+        SolveLimits::default(),
+    )
+    .unwrap();
+    let solved = problem.solve(&mut Linear, None).unwrap();
+    let omega = TAU * 1_000.;
+    let total_admittance =
+        Complex::new(1. / r, omega * c) + Complex::real(1.) / Complex::imaginary(omega * l);
+    let expected_v = Complex::real(5e-4) / total_admittance;
+    let expected_i = expected_v / Complex::imaginary(omega * l);
+    let mode = mode_at(&plan, &[1]);
+    let actual_v = solved.spectrum[mode * 2];
+    let actual_i = solved.spectrum[mode * 2 + 1];
+    close(actual_v.re, expected_v.re);
+    close(actual_v.im, expected_v.im);
+    close(actual_i.re, expected_i.re);
+    close(actual_i.im, expected_i.im);
+    assert!(solved.residual_ratio <= 1.);
+}
+
+struct TwoTerminalJunction;
+
+impl NonlinearConstitutive for TwoTerminalJunction {
+    fn evaluate(
+        &mut self,
+        state: &[Real],
+        currents: &mut [Real],
+        charges: &mut [Real],
+        conductance: &mut [Real],
+        capacitance: &mut [Real],
+    ) -> SpiceResult<()> {
+        let voltage = state[0] - state[1];
+        let current = 1e-8 * (voltage / 0.04).exp_m1();
+        let g = 1e-8 * (voltage / 0.04).exp() / 0.04;
+        let q = 2e-9 * (voltage + 0.1 * voltage * voltage);
+        let c = 2e-9 * (1. + 0.2 * voltage);
+        currents[0] = current;
+        currents[1] = -current;
+        charges[0] = q;
+        charges[1] = -q;
+        conductance.copy_from_slice(&[g, -g, -g, g]);
+        capacitance.copy_from_slice(&[c, -c, -c, c]);
+        Ok(())
+    }
+}
+
+#[test]
+fn nonlinear_two_terminal_charge_and_current_preserve_kcl() {
+    let plan = HarmonicPlan::new(
+        &[Tone::Independent {
+            frequency_hz: 25_000.,
+            order: 3,
+        }],
+        HarmonicLimits::default(),
+    )
+    .unwrap();
+    let mut forcing = vec![Complex::ZERO; plan.modes().len() * 2];
+    for (mode, positive) in [(0, 2e-3), (-1, 3e-4), (1, 3e-4)] {
+        forcing[mode_at(&plan, &[mode]) * 2] = Complex::real(positive);
+    }
+    let problem = HarmonicProblem::new(
+        plan.clone(),
+        2,
+        vec![0.1, 0., 0., 0.2],
+        vec![0.; 4],
+        forcing,
+        SolveLimits::default(),
+    )
+    .unwrap();
+    let solved = problem.solve(&mut TwoTerminalJunction, None).unwrap();
+    assert!(solved.residual_ratio <= 1.);
+    let dc = mode_at(&plan, &[0]) * 2;
+    let positive = solved.spectrum[dc];
+    let negative = solved.spectrum[dc + 1];
+    assert!(positive.re > negative.re);
+    assert!(positive.re > 0.);
+    assert!(solved.spectrum.iter().all(|v| v.is_finite()));
+    for (mode, harmonic) in plan.modes().iter().enumerate() {
+        let conjugate = harmonic.conjugate;
+        for row in 0..2 {
+            let value = solved.spectrum[mode * 2 + row];
+            let opposite = solved.spectrum[conjugate * 2 + row];
+            close(value.re, opposite.re);
+            close(value.im, -opposite.im);
+        }
+    }
+}
+
+#[test]
+fn singular_nonlinear_start_fails_explicitly_without_fake_dc_fallback() {
+    let plan = HarmonicPlan::new(
+        &[Tone::Independent {
+            frequency_hz: 1000.,
+            order: 1,
+        }],
+        HarmonicLimits::default(),
+    )
+    .unwrap();
+    let mut forcing = vec![Complex::ZERO; plan.modes().len()];
+    forcing[mode_at(&plan, &[0])] = Complex::real(1.);
+    let problem =
+        HarmonicProblem::new(plan, 1, vec![0.], vec![0.], forcing, SolveLimits::default()).unwrap();
+    // All cubic first derivatives vanish at the zero initial guess.
+    let error = problem.solve(&mut Cubic, None).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("pivot") || message.contains("singular") || message.contains("zero"),
+        "{error}"
+    );
+}
+
+#[test]
+#[ignore = "manual: release-profile the complete coupled Newton workload"]
+fn harmonic_balance_full_solve_release_profile() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    for (dimensions, order) in [(1, 1), (1, 4), (1, 8), (2, 1), (2, 3), (2, 4)] {
+        let tones: Vec<_> = (0..dimensions)
+            .map(|index| Tone::Independent {
+                frequency_hz: if index == 0 {
+                    1_000_000.
+                } else {
+                    1_414_213.562_373
+                },
+                order,
+            })
+            .collect();
+        let plan = HarmonicPlan::new(&tones, HarmonicLimits::default()).unwrap();
+        let mut forcing = vec![Complex::ZERO; plan.modes().len()];
+        for axis in 0..dimensions {
+            for polarity in [-1, 1] {
+                let mut index = vec![0_i32; dimensions];
+                index[axis] = polarity;
+                forcing[mode_at(&plan, &index)] = Complex::real(0.06);
+            }
+        }
+        let problem = HarmonicProblem::new(
+            plan.clone(),
+            1,
+            vec![1.],
+            vec![0.],
+            forcing,
+            SolveLimits::default(),
+        )
+        .unwrap();
+        let mut durations = Vec::with_capacity(5);
+        let mut iterations = 0;
+        let mut calls = 0;
+        for _ in 0..6 {
+            let mut model = Cubic;
+            let start = Instant::now();
+            let solved = problem.solve(&mut model, None).unwrap();
+            let elapsed = start.elapsed();
+            assert!(solved.residual_ratio <= 1.);
+            iterations = solved.iterations;
+            calls = solved.sampled_model_calls;
+            black_box(&solved);
+            durations.push(elapsed.as_nanos());
+        }
+        let warm = durations.remove(0);
+        black_box(warm);
+        durations.sort_unstable();
+        println!(
+            "HB_PROFILE axes={dimensions} order={order} modes={} samples={} iterations={iterations} calls={calls} median_full_solve_ns={}",
+            plan.modes().len(),
+            plan.sample_count(),
+            durations[2]
+        );
+    }
 }

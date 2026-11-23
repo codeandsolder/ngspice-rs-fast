@@ -22,8 +22,11 @@ pub enum Tone {
     Locked {
         /// Earlier tone ordinal, whose group may itself be locked.
         to: usize,
+        /// Numerator of the exact rational relation.
         numerator: u32,
+        /// Denominator of the exact rational relation.
         denominator: u32,
+        /// Requested positive and negative harmonic bounds.
         order: u16,
     },
 }
@@ -357,11 +360,13 @@ impl HarmonicPlan {
         &self.modes
     }
 
+    /// Number of real torus samples per residual evaluation.
     #[must_use]
     pub const fn sample_count(&self) -> usize {
         self.sample_count
     }
 
+    /// Original sources' physical frequencies in declaration order.
     #[must_use]
     pub fn tone_frequencies(&self) -> &[Real] {
         &self.tones_hz

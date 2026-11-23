@@ -9,6 +9,7 @@
 //! The nonlinear callback is a contribution collector, not a replacement
 //! source of model physics. Circuit-device adapters must supply both its
 //! currents/charges and exact local Jacobian contributions.
+#[path = "harmonic_balance/plan.rs"]
 pub mod plan;
 
 use crate::maths::dense::{Matrix, Vector};
@@ -87,7 +88,9 @@ pub struct HarmonicSolution {
     pub spectrum: Vec<Complex>,
     /// Per-real-row maximum normalized nonlinear KCL/charge residual.
     pub residual_ratio: Real,
+    /// Number of accepted Newton updates.
     pub iterations: usize,
+    /// Number of real sample evaluations in completed residual attempts.
     pub sampled_model_calls: usize,
 }
 
@@ -272,6 +275,7 @@ impl HarmonicProblem {
         })
     }
 
+    /// The validated frequency basis used by this problem.
     #[must_use]
     pub const fn plan(&self) -> &HarmonicPlan {
         &self.plan
@@ -347,14 +351,14 @@ impl HarmonicProblem {
                     .zip(dx.as_slice())
                     .map(|(value, delta)| value + alpha * delta)
                     .collect();
-                if trial.iter().all(|value| value.is_finite()) {
-                    if let Ok(next) = self.evaluate(nonlinear, &coords, &trial) {
-                        model_calls += next.1.calls;
-                        let merit = self.residual_ratio(&next.0, &next.1);
-                        if merit.is_finite() && merit < ratio * (1. - 1e-4 * alpha) {
-                            accepted = Some((trial, next));
-                            break;
-                        }
+                if trial.iter().all(|value| value.is_finite())
+                    && let Ok(next) = self.evaluate(nonlinear, &coords, &trial)
+                {
+                    model_calls += next.1.calls;
+                    let merit = self.residual_ratio(&next.0, &next.1);
+                    if merit.is_finite() && merit < ratio * (1. - 1e-4 * alpha) {
+                        accepted = Some((trial, next));
+                        break;
                     }
                 }
                 alpha *= 0.5;
@@ -423,7 +427,10 @@ impl HarmonicProblem {
                 qspectrum[mode * n + row] = qh[mode];
             }
         }
-        let residual = self.residual_spectrum(&spectrum, &ispectrum, &qspectrum);
+        let mut residual = self.operator_spectrum(&spectrum, &ispectrum, &qspectrum);
+        for (entry, forcing) in residual.iter_mut().zip(&self.forcing) {
+            *entry = *entry - *forcing;
+        }
         let encoded = coords.encode(&residual);
         if encoded.iter().any(|value| !value.is_finite()) {
             return Err(numerical("nonfinite coupled harmonic KCL residual"));
@@ -440,7 +447,7 @@ impl HarmonicProblem {
         ))
     }
 
-    fn residual_spectrum(&self, x: &[Complex], i: &[Complex], q: &[Complex]) -> Vec<Complex> {
+    fn operator_spectrum(&self, x: &[Complex], i: &[Complex], q: &[Complex]) -> Vec<Complex> {
         let n = self.unknowns;
         let mut residual = vec![Complex::ZERO; x.len()];
         for (h, mode) in self.plan.modes().iter().enumerate() {
@@ -456,8 +463,7 @@ impl HarmonicProblem {
                     csum = csum + value * Complex::real(c);
                 }
                 let entry = h * n + row;
-                residual[entry] = gsum + i[entry] + (csum + q[entry]) * Complex::imaginary(omega)
-                    - self.forcing[entry];
+                residual[entry] = gsum + i[entry] + (csum + q[entry]) * Complex::imaginary(omega);
             }
         }
         residual
@@ -505,14 +511,10 @@ impl HarmonicProblem {
                 qspectrum[mode * n + row] = qh[mode];
             }
         }
-        let homogeneous = self.residual_spectrum(&full, &ispectrum, &qspectrum);
-        let encoded = coords.encode(
-            &homogeneous
-                .iter()
-                .zip(&self.forcing)
-                .map(|(&value, &forcing)| value + forcing)
-                .collect::<Vec<_>>(),
-        );
+        // The derivative of independent forcing is zero. Subtracting and
+        // re-adding it here loses small Jacobian entries by cancellation.
+        let homogeneous = self.operator_spectrum(&full, &ispectrum, &qspectrum);
+        let encoded = coords.encode(&homogeneous);
         if encoded.iter().any(|value| !value.is_finite()) {
             return Err(numerical("nonfinite analytical harmonic Jacobian action"));
         }
