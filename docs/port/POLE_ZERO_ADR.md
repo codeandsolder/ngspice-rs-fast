@@ -222,3 +222,33 @@ its original root set augmented by the independently certified drain
 pole, and the production-path regression checks that pole separately to
 1e-12 relative accuracy and verifies its polynomial residual. Neither
 missing the extra pole nor returning an arbitrary extra pole is accepted.
+
+### Near-real root acceptance and deflation (#151)
+
+A Muller trial with a small imaginary ordinate is not automatically a
+conjugate pair, nor may it be snapped to the real axis by an arbitrary
+imaginary-to-real magnitude threshold. The search first checks the ordinary
+coincident-root residual, then probes the already-deflated determinant at
+the trial's **real** coordinate and symmetric real displacements. Opposite
+endpoint signs establish a simple real-axis crossing, and the normalized
+first difference supplies a local Newton correction. Same-sign endpoints
+require the vanishing-vertex discriminant of the local quadratic (the
+real repeated-root case); a nonzero vertex residual distinguishes two
+nearby distinct real roots and a genuine lightly damped pair.
+
+The correction must remain within the local bracket and the existing
+convergence neighborhood and reduce the normalized determinant residual.
+A complex candidate that is already a bona fide complex zero is not
+reclassified as real merely because a real zero shares its real coordinate.
+Conversely, an imaginary displacement smaller than one real-coordinate
+binary64 ULP cannot be resolved against an exact real-axis determinant zero
+and is counted once, avoiding artificial conjugate duplication. These
+checks refine accepted roots; normal sampling and Muller's candidate
+generation do not perform determinant probes beyond their existing path.
+
+The regression tests cover a certified HFET2 drain pole, a real notch
+pole contaminated by sub-ULP imaginary noise, true near-real conjugate
+pairs, repeated and distinct close real roots, and coefficient scales
+spanning 24 decimal orders. Existing C golden values and tolerances are
+unchanged. The intentionally bounded search remains bounded; this does
+not claim roots outside its search horizon.
