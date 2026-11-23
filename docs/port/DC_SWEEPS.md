@@ -360,3 +360,35 @@ not trial vectors, time histories, Newton workspaces or accepted state.
 Independent runs and sensitivity perturbations do not share a live
 replacement scope. The public one-shot load and observation methods remain
 useful for isolated probes; repeated callers should use a prepared run.
+
+## Bound sweep measurements
+
+The focused sweep unit test records the actual shared preparation operations
+(thread-local test counters, absent from production). For example, three R
+values at each of three temperatures require one target binding, three full
+physical input validations and six replacement-only validations; neither
+preflight nor point preparation performs a name lookup or small-signal
+assembly. Two independent three-value resistor axes require one full
+validation and four replacement-only validations, not nine full validations.
+Every point preserves its exact numerical context and setter order.
+
+The ignored `dc_sweep_binding_bench` tests report preparation and solve time
+separately, plus a checksum of the complete output. Three alternating native
+runs per variant on Acer (baseline `705d102`, candidate `bd92837`, pinned
+campaign nightly, optimized test profile):
+
+| Workload (devices / rows) | Baseline prep (ms) | Bound prep (ms) | Baseline solve (s) | Bound solve (s) |
+| --- | ---: | ---: | ---: | ---: |
+| Source (8194 / 512) | 0.098 | 2.452 | 5.895 | 2.936 |
+| Resistance (8194 / 512) | 0.160 | 3.959 | 4.771 | 3.667 |
+| R/TEMP (1026 / 2048) | 203.572 | 4.107 | 0.976 | 0.916 |
+
+The checksums were identical across all runs for each workload. The mixed
+sweep validates unchanged recipes 16 times rather than 2048, while still
+validating every changed replacement. Source and resistance preparation now
+perform more comprehensive input validation; their increased preparation
+time is expected. Shared-host contention varied during the runs, so these are
+observed medians, not isolated estimates of solve-time speedup. No
+cross-context live replacement caching is assumed: device-local immutable
+derivation dependencies and mutable trial state would have to be explicitly
+separated before permitting that reuse.
