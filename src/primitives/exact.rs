@@ -139,7 +139,7 @@ pub(crate) fn rounded_product_ratio<const N: usize, const D: usize>(
 }
 
 /// If subtraction is exact, return its finite positive binary64 result.
-/// Knuth's error-free TwoSum of `to + (-from)` detects a nonzero residual
+/// Knuth's error-free `TwoSum` of `to + (-from)` detects a nonzero residual
 /// without allocating an arbitrary-precision accumulator on ordinary grids.
 fn exact_difference(from: Real, to: Real) -> Option<Real> {
     let rounded = to - from;
