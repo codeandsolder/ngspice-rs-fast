@@ -130,7 +130,7 @@ fn physical_slope(
 /// Richardson factor 4, while valid one-sided first-order differences use 2.
 /// Return `None` when no physical neighborhood could be sampled, rather
 /// than manufacturing a derivative at a nonsmooth/undefined boundary.
-fn conditioned_derivative(
+pub(in crate::analysis) fn conditioned_derivative(
     parameter: Real,
     mut sample: impl FnMut(Real) -> SpiceResult<Option<Complex>>,
 ) -> SpiceResult<Option<(Complex, Real)>> {
@@ -341,6 +341,207 @@ pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
         sweep,
         physical,
     })
+}
+
+/// A direct differentiable observation; no plot-column name guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::analysis) enum PhysicalProbe {
+    /// Voltage between two explicit nodes (or a node and ground).
+    Voltage { pos: String, neg: Option<String> },
+    /// Current through a source with a findable matrix branch.
+    Current { source: String },
+}
+
+/// Exactly one instance parameter from the existing typed sensitivity walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::analysis) enum PhysicalParameter {
+    /// One instance-owned device parameter.
+    Instance { instance: String, keyword: String },
+    /// One model parameter shared by every matching instance; the adjoint
+    /// contributions from all model users are accumulated in C source order.
+    Model { model: String, keyword: String },
+}
+
+impl PhysicalParameter {
+    fn matches(
+        &self,
+        scope: ParameterScope,
+        instance: &str,
+        model: Option<&str>,
+        keyword: &str,
+    ) -> bool {
+        match self {
+            Self::Instance {
+                instance: wanted,
+                keyword: field,
+            } => {
+                scope == ParameterScope::Instance
+                    && wanted.eq_ignore_ascii_case(instance)
+                    && field.eq_ignore_ascii_case(keyword)
+            }
+            Self::Model {
+                model: wanted,
+                keyword: field,
+            } => {
+                scope == ParameterScope::Model
+                    && model.is_some_and(|model| wanted.eq_ignore_ascii_case(model))
+                    && field.eq_ignore_ascii_case(keyword)
+            }
+        }
+    }
+
+    /// Error provenance without guessing names from rawfile columns.
+    pub(in crate::analysis) fn describe(&self) -> String {
+        match self {
+            Self::Instance { instance, keyword } => format!("{instance}:{keyword}"),
+            Self::Model { model, keyword } => format!("model {model}:{keyword}"),
+        }
+    }
+}
+
+/// A partial from the existing adjoint sensitivity walk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::analysis) enum PhysicalPartial {
+    Valid(Complex),
+    NonSmooth,
+    Missing,
+}
+
+/// Evaluate selected physical device partials at one operating point or AC
+/// frequency. The existing driver reuses one primal factor and adjoint,
+/// without a circuit simulation for every parameter. Selection is typed.
+///
+/// Missing and non-smooth physical parameters retain separate typed statuses.
+/// Operational solver failures retain their original error.
+///
+/// # Errors
+/// Underlying operating-point, AC, sensitivity or allocation failures.
+pub(in crate::analysis) fn physical_partials(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &AnalysisContext,
+    probe: &PhysicalProbe,
+    frequency: Option<Real>,
+    selected: &[PhysicalParameter],
+) -> SpiceResult<Vec<PhysicalPartial>> {
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    if frequency.is_some_and(|value| !(value.is_finite() && value > 0.)) {
+        return Err(SpiceError::circuit(
+            "physical AC derivative requires a positive finite frequency",
+        ));
+    }
+    let model = context.model_context();
+    let (listed, _) = members(circuit, &model)?;
+    let catalogue = entries(&listed, frequency.is_some(), &[]);
+    let mut filters = Vec::new();
+    for entry in &catalogue {
+        let member = &listed[entry.member];
+        if selected.iter().any(|wanted| {
+            wanted.matches(
+                entry.scope,
+                &member.name,
+                member.sensitivity.model(),
+                entry.keyword,
+            )
+        }) {
+            let label = entry
+                .name
+                .as_ref()
+                .ok_or_else(|| SpiceError::circuit("missing typed sensitivity label"))?;
+            filters.push(label.clone());
+        }
+    }
+    let result = vec![PhysicalPartial::Missing; selected.len()];
+    if filters.is_empty() {
+        return Ok(result);
+    }
+    // The original sensitivity filter grammar supports glob characters.
+    // Build the actual filtered column order using the *same* typed entry
+    // iterator the driver uses; a wildcard-bearing device label must never
+    // shift the mapping of the selected derivatives.
+    let ordered: Vec<_> = entries(&listed, frequency.is_some(), &filters)
+        .into_iter()
+        .filter(|entry| entry.name.is_some())
+        .map(|entry| {
+            (
+                listed[entry.member].name.clone(),
+                listed[entry.member].sensitivity.model().map(str::to_owned),
+                entry.scope,
+                entry.keyword.to_owned(),
+            )
+        })
+        .collect();
+    drop(listed);
+    let card = SensCard {
+        output: match probe {
+            PhysicalProbe::Voltage { pos, neg } => Output::Voltage {
+                pos: pos.clone(),
+                neg: neg.clone(),
+            },
+            PhysicalProbe::Current { source } => Output::Current {
+                source: source.clone(),
+            },
+        },
+        filters,
+        sweep: None,
+        physical: true,
+    };
+    // Exactly one conditioned small-signal point, using the same admitted
+    // frequency plan as the ordinary spectral analyses. No second sweep API.
+    let point = frequency
+        .map(|value| crate::analysis::frequency::FrequencyPlan::counted(value, 1., 1))
+        .transpose()?;
+    let (plot, _) = run(circuit, request, context, &card, point.as_ref(), false)?;
+    let row = plot
+        .rows()
+        .next()
+        .ok_or_else(|| SpiceError::circuit("sensitivity produced no physical derivative row"))?;
+    let offset = usize::from(frequency.is_some());
+    sum_physical_columns(row, &ordered, selected, offset)
+}
+
+/// Accumulate typed model/instance contributions using the original column
+/// order and compensated sums, preserving non-smooth and missing statuses.
+fn sum_physical_columns(
+    row: &[Complex],
+    ordered: &[(String, Option<String>, ParameterScope, String)],
+    selected: &[PhysicalParameter],
+    offset: usize,
+) -> SpiceResult<Vec<PhysicalPartial>> {
+    let mut result = vec![PhysicalPartial::Missing; selected.len()];
+    let mut real = vec![CompensatedSum::default(); selected.len()];
+    let mut imaginary = vec![CompensatedSum::default(); selected.len()];
+    for (column, (instance, model, scope, keyword)) in ordered.iter().enumerate() {
+        let value = row.get(column + offset).copied().ok_or_else(|| {
+            SpiceError::circuit("typed sensitivity derivative column count changed")
+        })?;
+        for (slot, wanted) in selected.iter().enumerate() {
+            if wanted.matches(*scope, instance, model.as_deref(), keyword) {
+                if value.is_finite() {
+                    if result[slot] != PhysicalPartial::NonSmooth {
+                        real[slot].add(value.re);
+                        imaginary[slot].add(value.im);
+                        result[slot] = PhysicalPartial::Valid(Complex::ZERO);
+                    }
+                } else {
+                    result[slot] = PhysicalPartial::NonSmooth;
+                }
+            }
+        }
+    }
+    for (slot, partial) in result.iter_mut().enumerate() {
+        if matches!(partial, PhysicalPartial::Valid(_)) {
+            let value = Complex::new(real[slot].total(), imaginary[slot].total());
+            *partial = if value.is_finite() {
+                PhysicalPartial::Valid(value)
+            } else {
+                PhysicalPartial::NonSmooth
+            };
+        }
+    }
+    Ok(result)
 }
 
 /// The frequencies of an AC sweep, exactly as `count_steps()` counts them and
