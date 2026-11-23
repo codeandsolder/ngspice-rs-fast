@@ -464,22 +464,26 @@ C comparison cover moving references and both directions.
 
 ## Numerical accuracy audit (#92)
 
-AVG retains trapezoidal panels, and INTEG/RMS retain the existing greedy
-Simpson 3/8, 1/3 and trapezoid selection based on 100-ULP positive widths.
-Signed quadrature (#138) uses exact products of the finite binary64
-ordinates and panel spans, with integer weights over a common denominator
-of 24. The fixed-size signed accumulator preserves small areas across
-large cancelling products and divides by the covered width for AVG before
-rounding once to binary64. A finite mean does not require a representable
-unnormalized integral. Only a nonfinite final value fails. Nearly equal steps retain the same Simpson selection, but
-the panel's actual covered span scales its normalized weights. RMS uses a
-weighted, scaled Euclidean norm instead of integrating squared raw samples:
-the square-root time fraction is calculated before multiplication and a
-power-of-two shifted accumulator retains subnormal weighted terms. The
-positive normalized quadrature is bounded by the largest absolute sample.
-RMS therefore accepts finite extreme magnitudes even when their squares
-would overflow or underflow. Zero-width panels contribute zero, including
-at discontinuities.
+AVG retains trapezoidal panels; INTEG and RMS retain C's greedy Simpson
+3/8, Simpson 1/3 and trapezoid selection on positive steps within 100 ULPs.
+Each selected panel uses the **exact difference of the actual binary64 axis
+endpoints** (#147). A subtraction with zero TwoSum residual uses the ordinary
+single-span fast path; otherwise the signed product accumulator (#138) adds
+weighted endpoint products separately, before any rounding. The full window
+denominator is likewise an exact endpoint difference, evaluated in the shared
+68-limb ratio engine (#139). The final AVG is rounded once even if a width
+would overflow binary64 or separately rounded panel widths disagree.
+
+RMS evaluates squared ordinates using the existing scaled-exponent accumulator,
+with exact endpoint geometry reduced to a normalized mantissa and exponent.
+The normalization does not need a finite binary64 width or squared ordinates;
+its result is bounded between the smallest and largest contributing absolute
+values, including a constant MAX or subnormal trace. INTEG divides the exact
+weighted sum by 24 without width normalization: only a genuinely nonfinite
+final integral is rejected. The fixed-size accumulators preserve cancellation
+and require no stored history. Zero-width repeated-axis panels contribute
+nothing, retaining discontinuity and clipped-window policies.
+
 Linear interpolation takes its fraction from the nearer endpoint and uses
 a fused multiply-add; scaled coordinate differences handle an otherwise
 overflowing finite span. Exact sample groups, clipping, crossing selection

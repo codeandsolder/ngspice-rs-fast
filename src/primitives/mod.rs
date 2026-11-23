@@ -18,7 +18,7 @@
 
 pub mod error;
 mod exact;
-pub(crate) use exact::rounded_product_ratio;
+pub(crate) use exact::{positive_axis_span, rounded_product_ratio};
 pub mod node;
 pub mod numeric;
 pub mod value;

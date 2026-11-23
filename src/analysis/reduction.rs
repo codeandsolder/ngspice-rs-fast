@@ -96,17 +96,17 @@ impl ScaledSquares {
         }
     }
 
-    /// Add a group of squared ordinates with a common positive scale and
-    /// individual nonnegative weights. Inputs are finite; split the three
-    /// factors before multiplying, including subnormal scales.
-    pub(super) fn add_weighted(
+    /// Add squared ordinates with an interval represented outside binary64's
+    /// exponent range. The exact endpoint geometry is converted once to a
+    /// normalized significand/exponent; individual products never overflow.
+    pub(super) fn add_scaled(
         &mut self,
-        scale: Real,
+        (sm, se): (Real, i32),
         samples: impl Iterator<Item = (Real, Real)>,
     ) {
-        let Some((sm, se)) = split(scale) else {
+        if sm <= 0. {
             return;
-        };
+        }
         for (value, weight) in samples {
             let (Some((m, me)), Some((w, we))) = (split(value.abs()), split(weight)) else {
                 continue;
@@ -137,13 +137,15 @@ impl ScaledSquares {
     /// Square root of the normalized positive sum. Split the remaining
     /// exponent by two before taking the root, so a small weighted term
     /// is not rounded to zero before normalization.
-    pub(super) fn root_mean(self, divisor: Real) -> Real {
+    /// Normalize by a positive axis span, even when its exact width cannot be
+    /// represented as a finite binary64 value.
+    pub(super) fn root_mean_scaled(self, (d, de): (Real, i32)) -> Real {
         let Some(exponent) = self.exponent else {
             return 0.;
         };
-        let Some((d, de)) = split(divisor) else {
+        if d <= 0. {
             return Real::NAN;
-        };
+        }
         let exponent = exponent - de;
         let odd = if exponent.rem_euclid(2) == 0 { 1. } else { 2. };
         let root = (self.squares.total() / d * odd).sqrt();
@@ -165,25 +167,31 @@ mod tests {
 
     #[test]
     fn scaled_weighted_constant_panels_cover_every_binary64_exponent() {
-        use super::{ScaledSquares, power_of_two};
+        use super::{ScaledSquares, power_of_two, split};
         for ye in -1074..=1023 {
             let value = power_of_two(ye);
             for se in [-1074, -536, 0, 536, 1023] {
                 let span = power_of_two(se);
                 let mut norm = ScaledSquares::new();
-                norm.add_weighted(
-                    span,
+                norm.add_scaled(
+                    split(span).unwrap(),
                     [0.125, 0.375, 0.375, 0.125]
                         .into_iter()
                         .map(|weight| (value, weight)),
                 );
-                assert_eq!(norm.root_mean(span).to_bits(), value.to_bits());
+                assert_eq!(
+                    norm.root_mean_scaled(split(span).unwrap()).to_bits(),
+                    value.to_bits()
+                );
             }
         }
         let mut norm = ScaledSquares::new();
-        norm.add_weighted(1e-100, [(1e-300, 1.)].into_iter());
-        norm.add_weighted(1e100, [(1e300, 1.)].into_iter());
-        assert!((norm.root_mean(1e100) - 1e300).abs() <= 4. * f64::EPSILON * 1e300);
+        norm.add_scaled(split(1e-100).unwrap(), [(1e-300, 1.)].into_iter());
+        norm.add_scaled(split(1e100).unwrap(), [(1e300, 1.)].into_iter());
+        assert!(
+            (norm.root_mean_scaled(split(1e100).unwrap()) - 1e300).abs()
+                <= 4. * f64::EPSILON * 1e300
+        );
     }
 
     #[test]
