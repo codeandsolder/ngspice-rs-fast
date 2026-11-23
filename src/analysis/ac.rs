@@ -385,6 +385,83 @@ mod tests {
     }
 
     #[test]
+    fn independent_ac_frequency_tiles_preserve_point_order_and_physical_solution() {
+        // Keep the scalar AC driver as the throughput baseline. Exercise
+        // the explicit independent batch against the same circuit and plot.
+        let text = "RC ladder\nv1 in 0 dc 2 ac 1\nr1 in mid 1k\nc1 mid 0 220n\nr2 mid out 680\nc2 out 0 47n\nr3 out 0 2k\n.end\n";
+        let parse = || {
+            Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("ac-independent.cir"), text))
+                .unwrap()
+        };
+        let context = AnalysisContext::default();
+        let request = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "9", "100", "900"])
+            .resolve()
+            .unwrap();
+        let mut reference_circuit = Circuit::from_netlist(&parse()).unwrap();
+        reference_circuit
+            .set_observations(&["@r1[resistance]".to_owned()])
+            .unwrap();
+        let reference = request.run(&mut reference_circuit, &context).unwrap();
+        assert_eq!(reference.point_count(), 9);
+        let mut circuit = Circuit::from_netlist(&parse()).unwrap();
+        circuit
+            .set_observations(&["@r1[resistance]".to_owned()])
+            .unwrap();
+        circuit.finalize().unwrap();
+        let small =
+            SmallSignal::prepare(&circuit, &request, &context, request.dc_settings().clone())
+                .unwrap();
+        assert!(!small.varies() && !small.reassembles());
+        let rhs = small.system().ac_rhs();
+        let rhs_lanes = [rhs.as_slice(); 4];
+        let mut batch = crate::maths::complex::IndependentComplexBatch::default();
+        let frequencies: Vec<_> = (1..=9).map(|index| f64::from(index) * 100.).collect();
+        let mut row = 0;
+        for tile in frequencies.chunks(4) {
+            let matrices = tile
+                .iter()
+                .map(|&f| ac_matrix(&circuit, small.system(), 2. * std::f64::consts::PI * f))
+                .collect::<SpiceResult<Vec<_>>>()
+                .unwrap();
+            let solved = batch
+                .solve(&matrices, &rhs_lanes[..matrices.len()], false)
+                .unwrap();
+            for (&f, solution) in tile.iter().zip(solved) {
+                let mut point = vec![Complex::real(f)];
+                point.extend(solution.unwrap());
+                point.extend(
+                    small
+                        .prepared()
+                        .observe_parameters(&context.model_context().with_frequency(f))
+                        .unwrap(),
+                );
+                assert_eq!(point.len(), reference.variable_count());
+                for (var, &actual) in reference.variables().iter().zip(&point) {
+                    let expected = reference.value(&var.name, row).unwrap();
+                    let scale = expected.re.abs().max(expected.im.abs()).max(1.);
+                    assert!(
+                        (actual.re - expected.re).abs() <= 2e-12 * scale,
+                        "{} at row {row}: {:?} != {:?}",
+                        var.name,
+                        actual,
+                        expected
+                    );
+                    assert!(
+                        (actual.im - expected.im).abs() <= 2e-12 * scale,
+                        "{} at row {row}: {:?} != {:?}",
+                        var.name,
+                        actual,
+                        expected
+                    );
+                }
+                row += 1;
+            }
+        }
+        assert_eq!(row, reference.point_count());
+    }
+
+    #[test]
     fn ordinary_operating_point_records_small_signal_state_for_later_analyses() {
         let netlist = Parser::new().parse_deck(&parse_deck_text(
             Path::new("op-state.cir"),
