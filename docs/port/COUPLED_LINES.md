@@ -9,7 +9,9 @@ has no AC or pole-zero loading callback (DEVacLoad = DEVpzLoad = NULL).
 It is therefore not correct to claim an upstream CPL AC/SP/PZ numeric
 reference. Native DC and transient behavior is the parity target.
 
-Current native substrate: src/devices/cpl/plan.rs. The public P-device
+Current native substrate: src/devices/cpl/plan.rs and
+src/devices/cpl/model.rs, with scoped vector literalization in
+src/netlist/elaborate.rs. The public P-device
 registration remains intentionally pending; parsing a model must not
 make an incomplete or uncoupled simulation silently executable.
 
@@ -69,10 +71,11 @@ per-component source positions and expressions.
 
 ## Remaining execution stages
 
-1. Resolve scoped model parameters, including vector expressions and
-   instance length override, into one immutable per-instance physical
-   plan. Refuse absent/invalid matrices rather than defaulting coupling
-   to zero.
+1. Completed: resolve scoped model parameters, including vector
+   expressions, .func calls and instance length overrides, into immutable
+   per-instance physical plans. Position-preserving component substitution
+   records ModelVectorComponent sites for diagnostics. Refuse absent/invalid
+   matrices and unsupported setters instead of defaulting coupling to zero.
 2. Build near/far MNA branch-current unknowns and DC equations with
    the reference binary's actual coupled-line DC behavior and proper
    terminal/return identities.
@@ -86,8 +89,9 @@ per-component source positions and expressions.
    near-zero coupling, passivity, sample/hold and rollback. Measure
    memory and CPU by conductor count and accepted-history length.
 
-The existing fixture tests/cpl_lines.rs exercise the immutable
-numerical preparation layer only. It is NOT a claim of complete P
+The fixtures tests/cpl_lines.rs, tests/cpl_model.rs and
+tests/cpl_elaborate.rs cover immutable geometry, declaration binding and
+scoped model-vector evaluation, respectively. It is NOT a claim of complete P
 device support, and no inconsistent partial simulation is exposed.
 
 References: upstream ngspice cplsetup.c/cplload.c/cplinit.c and

@@ -48,6 +48,15 @@ pub enum SiteKind {
         /// Parameter index.
         parameter: usize,
     },
+    /// An evaluated CPL model numeric-vector entry, retaining component order.
+    ModelVectorComponent {
+        /// Model index.
+        model: usize,
+        /// Model setter index.
+        parameter: usize,
+        /// Matrix component index.
+        component: usize,
+    },
     /// `Netlist::analyses[analysis].arguments[argument]`.
     AnalysisArgument {
         /// Analysis index.
@@ -415,6 +424,16 @@ fn literalize_parameters(
             parameter.kind = ParameterKind::Behavioural(Box::new(resolved));
             continue;
         }
+        if matches!(parameter.kind, ParameterKind::NumericVector(_)) {
+            literalize_vector_parameter(
+                parameter,
+                scope,
+                budget,
+                sites.as_deref_mut(),
+                kind(index),
+            )?;
+            continue;
+        }
         let ParameterKind::Expression(expression) = &parameter.kind else {
             continue;
         };
@@ -443,6 +462,89 @@ fn literalize_parameters(
         parameter.value = text;
         parameter.kind = ParameterKind::Scalar;
     }
+    Ok(())
+}
+
+/// Resolve a CPL physical matrix vector using the same scope and evaluation
+/// budget as the other model parameters. Preserve every numeric component's
+/// original spelling, and record the exact site of each substituted expression.
+fn literalize_vector_parameter(
+    parameter: &mut ParameterAssignment,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+    mut sites: Option<&mut Vec<ResolvedSite>>,
+    kind: SiteKind,
+) -> SpiceResult<()> {
+    let SiteKind::ModelParameter {
+        model,
+        parameter: setter,
+    } = kind
+    else {
+        return Err(SpiceError::parse(
+            parameter.location.clone(),
+            "numeric matrix vector is not a model parameter",
+        ));
+    };
+    let ParameterKind::NumericVector(components) = &mut parameter.kind else {
+        return Err(SpiceError::circuit("expected numeric matrix vector setter"));
+    };
+    for (index, component) in components.iter_mut().enumerate() {
+        if crate::primitives::parse_spice_number(&component.text).is_some_and(Real::is_finite) {
+            continue;
+        }
+        let original = component.text.clone();
+        let expression_text = original
+            .strip_prefix('{')
+            .and_then(|text| text.strip_suffix('}'))
+            .or_else(|| {
+                original
+                    .strip_prefix("'")
+                    .and_then(|text| text.strip_suffix("'"))
+            })
+            .ok_or_else(|| {
+                SpiceError::parse(
+                    component.location.clone(),
+                    format!("non-numeric CPL matrix component: {original}"),
+                )
+            })?;
+        let inner = component.location.at_column(component.location.column + 1);
+        let expression =
+            crate::netlist::parser::parse_parameter_expression(expression_text, &inner)?;
+        let value = scope
+            .evaluate(&expression, budget)
+            .map_err(|error| match error {
+                SpiceError::Parse { location, message } => SpiceError::parse(
+                    location,
+                    format!(
+                        "{message}\\n  while evaluating matrix '{}' component {} at {}",
+                        parameter.name,
+                        index + 1,
+                        component.location,
+                    ),
+                ),
+                other => other,
+            })?;
+        let formatted = format_literal(value);
+        if let Some(sites) = sites.as_deref_mut() {
+            sites.push(ResolvedSite::record(
+                SiteKind::ModelVectorComponent {
+                    model,
+                    parameter: setter,
+                    component: index,
+                },
+                original,
+                expression.span.start.clone(),
+                value,
+                &formatted,
+            )?);
+        }
+        component.text = formatted;
+    }
+    parameter.value = components
+        .iter()
+        .map(|component| component.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
     Ok(())
 }
 

@@ -255,6 +255,10 @@ fn expression_at(source: &Netlist, kind: SiteKind) -> Option<&ParameterExpressio
                 _ => None,
             }
         }
+        // CPL matrix components are positioned numeric-vector expressions
+        // rather than scalar sites. Their typed evaluation is owned by the
+        // netlist literalizer, not the scalar optimization DAG.
+        SiteKind::ModelVectorComponent { .. } => None,
         SiteKind::AnalysisArgument { analysis, argument } => source
             .analyses
             .get(analysis)?
