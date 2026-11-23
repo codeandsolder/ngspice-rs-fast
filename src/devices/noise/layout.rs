@@ -11,7 +11,7 @@ use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 /// A differential transfer bound to the finalized topology. Only ground
 /// maps to no row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BoundTransfer {
+pub(super) struct BoundTransfer {
     nodes: [NodeId; 2],
     rows: [Option<usize>; 2],
 }
