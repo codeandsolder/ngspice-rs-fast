@@ -636,7 +636,7 @@ mod tests {
 
     fn schedulable_source(kind: SourceKind, waveform: Waveform) -> LinearSource {
         LinearSource {
-            name: "schedule-test".into(),
+            name: std::sync::Arc::new("schedule-test".to_owned()),
             kind,
             rows: crate::devices::linear::SourceRows::new(),
             dc: 0.,

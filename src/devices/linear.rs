@@ -509,6 +509,12 @@ impl std::ops::Deref for SourceRows {
     }
 }
 
+impl std::ops::DerefMut for SourceRows {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries[..usize::from(self.len)]
+    }
+}
+
 impl<'a> IntoIterator for &'a SourceRows {
     type Item = &'a (usize, Real);
     type IntoIter = std::slice::Iter<'a, (usize, Real)>;
