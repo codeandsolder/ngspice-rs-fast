@@ -452,7 +452,7 @@ pub(in crate::analysis) fn physical_partials(
             filters.push(label.clone());
         }
     }
-    let mut result = vec![PhysicalPartial::Missing; selected.len()];
+    let result = vec![PhysicalPartial::Missing; selected.len()];
     if filters.is_empty() {
         return Ok(result);
     }
@@ -501,6 +501,18 @@ pub(in crate::analysis) fn physical_partials(
         .next()
         .ok_or_else(|| SpiceError::circuit("sensitivity produced no physical derivative row"))?;
     let offset = usize::from(frequency.is_some());
+    sum_physical_columns(row, &ordered, selected, offset)
+}
+
+/// Accumulate typed model/instance contributions using the original column
+/// order and compensated sums, preserving non-smooth and missing statuses.
+fn sum_physical_columns(
+    row: &[Complex],
+    ordered: &[(String, Option<String>, ParameterScope, String)],
+    selected: &[PhysicalParameter],
+    offset: usize,
+) -> SpiceResult<Vec<PhysicalPartial>> {
+    let mut result = vec![PhysicalPartial::Missing; selected.len()];
     let mut real = vec![CompensatedSum::default(); selected.len()];
     let mut imaginary = vec![CompensatedSum::default(); selected.len()];
     for (column, (instance, model, scope, keyword)) in ordered.iter().enumerate() {

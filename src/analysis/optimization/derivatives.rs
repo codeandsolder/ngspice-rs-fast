@@ -46,9 +46,7 @@ impl From<&DirectOutput> for PhysicalProbe {
     }
 }
 
-/// One point on a smooth DC or AC objective. The same type can name other
-/// analysis kinds; those return an explicit unsupported-gradient status
-/// rather than silently differentiating a transient/event objective.
+/// One direct DC/AC objective; transient and event objectives report a typed unsupported status.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DerivativeRequest {
     /// Objective variable with explicit node/branch identity.
@@ -80,15 +78,11 @@ pub struct InputDerivative {
     pub status: DerivativeStatus,
 }
 
-/// Evaluate all requested input derivatives without a full candidate
-/// simulation per perturbed parameter. Only small-signal AC with linear
-/// devices uses the C-reset AC sensitivity engine: nonlinear AC sensitivities
-/// would not be derivatives of the regular biased AC operating point.
+/// Evaluate requested input derivatives without one simulation per input.
 ///
-/// Structural candidate updates, model/analysis-driven parameter changes,
-/// transient/events, invalid local regimes and missing device sensitivity
-/// records are reported individually. Arbitrary objective algorithms and
-/// full candidate simulation remain available unchanged.
+/// Nonlinear AC is rejected because C-reset sensitivity is not the biased AC
+/// derivative. Unsupported parameters and objectives have typed statuses;
+/// ordinary black-box objective evaluation remains available unchanged.
 ///
 /// # Errors
 /// Failure to assemble/solve the common operating point or the physical
@@ -157,7 +151,7 @@ pub fn evaluate(
         return Ok(entries);
     }
     let config = candidate.config().clone();
-    let context = config.context().clone();
+    let context = config.context();
     let plan = config.plan(AnalysisInput::new(AnalysisKind::OperatingPoint))?;
     let mut physical = candidate.physical_sensitivity_circuit()?;
     let partials = sens::physical_partials(
@@ -169,48 +163,54 @@ pub fn evaluate(
         &selected,
     )?;
     for (result, bound) in entries.iter_mut().zip(links) {
-        let Ok(bound) = bound else {
-            continue;
-        };
-        let mut real = CompensatedSum::default();
-        let mut imaginary = CompensatedSum::default();
-        for site in bound {
-            let Some(slot) = selected.iter().position(|p| *p == site.parameter) else {
-                result.status = DerivativeStatus::Unsupported(
-                    "typed physical parameter selection lost its slot".to_owned(),
-                );
-                break;
-            };
-            match partials[slot] {
-                PhysicalPartial::Valid(value) => {
-                    CompensatedSum::with_initial(value.re).multiply_into(site.scale, &mut real);
-                    CompensatedSum::with_initial(value.im)
-                        .multiply_into(site.scale, &mut imaginary);
-                }
-                PhysicalPartial::NonSmooth => {
-                    result.status = DerivativeStatus::NonSmooth(format!(
-                        "{} has no stable physical derivative",
-                        site.parameter.describe()
-                    ));
-                    break;
-                }
-                PhysicalPartial::Missing => {
-                    result.status = DerivativeStatus::Unsupported(format!(
-                        "{} has no typed device sensitivity record",
-                        site.parameter.describe()
-                    ));
-                    break;
-                }
-            }
-        }
-        if matches!(result.status, DerivativeStatus::Defined(_)) {
-            let value = Complex::new(real.total(), imaginary.total());
-            result.status = if value.is_finite() {
-                DerivativeStatus::Defined(value)
-            } else {
-                DerivativeStatus::NonSmooth("nonfinite chain-rule projection".to_owned())
-            };
+        if let Ok(bound) = bound {
+            result.status = project_input(&bound, &selected, &partials);
         }
     }
     Ok(entries)
+}
+
+/// Project one coordinate through its validated device partials with
+/// compensated summation and explicit invalid-result statuses.
+fn project_input(
+    bound: &[crate::analysis::optimization::parameters::GradientSite],
+    selected: &[PhysicalParameter],
+    partials: &[PhysicalPartial],
+) -> DerivativeStatus {
+    let mut real = CompensatedSum::default();
+    let mut imaginary = CompensatedSum::default();
+    for site in bound {
+        let Some(slot) = selected
+            .iter()
+            .position(|parameter| *parameter == site.parameter)
+        else {
+            return DerivativeStatus::Unsupported(
+                "typed physical parameter selection lost its slot".to_owned(),
+            );
+        };
+        match partials[slot] {
+            PhysicalPartial::Valid(value) => {
+                CompensatedSum::with_initial(value.re).multiply_into(site.scale, &mut real);
+                CompensatedSum::with_initial(value.im).multiply_into(site.scale, &mut imaginary);
+            }
+            PhysicalPartial::NonSmooth => {
+                return DerivativeStatus::NonSmooth(format!(
+                    "{} has no stable physical derivative",
+                    site.parameter.describe()
+                ));
+            }
+            PhysicalPartial::Missing => {
+                return DerivativeStatus::Unsupported(format!(
+                    "{} has no typed device sensitivity record",
+                    site.parameter.describe()
+                ));
+            }
+        }
+    }
+    let value = Complex::new(real.total(), imaginary.total());
+    if value.is_finite() {
+        DerivativeStatus::Defined(value)
+    } else {
+        DerivativeStatus::NonSmooth("nonfinite chain-rule projection".to_owned())
+    }
 }

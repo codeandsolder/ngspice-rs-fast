@@ -110,7 +110,7 @@ pub struct CandidateDerivativeResult {
 
 /// Only preparation or common primal/adjoint execution failures abort the
 /// derivative result; unsupported individual coordinates stay in the vector.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CandidateDerivativeFailure {
     /// Candidate coordinates could not be applied transactionally.
     Preparation(SpiceError),

@@ -478,6 +478,80 @@ impl CircuitCandidate<'_> {
         &self.plan.inputs()[index].name
     }
 
+    /// Differentiate one bound site against one root coordinate using the
+    /// same scalar DAG and literal readback used in candidate preparation.
+    fn gradient_site(
+        &self,
+        site_index: usize,
+        input: usize,
+        limits: EvalLimits,
+    ) -> Result<Option<GradientSite>, GradientSiteFailure> {
+        let site = &self.plan.sites[site_index];
+        let Some(physical_parameter) = (match (site.kind, site.route) {
+            (
+                SiteKind::DeviceParameter { device, parameter },
+                RouteSpec::Resistor(_) | RouteSpec::Instance { .. },
+            ) => self.plan.source.devices.get(device).and_then(|card| {
+                card.parameters
+                    .get(parameter)
+                    .map(|parameter| PhysicalParameter::Instance {
+                        instance: card.name.to_ascii_lowercase(),
+                        keyword: parameter.name.clone(),
+                    })
+            }),
+            (SiteKind::ModelParameter { model, parameter }, _) => {
+                self.plan.source.models.get(model).and_then(|card| {
+                    card.parameters
+                        .get(parameter)
+                        .map(|parameter| PhysicalParameter::Model {
+                            model: card.name.to_ascii_lowercase(),
+                            keyword: parameter.name.clone(),
+                        })
+                })
+            }
+            _ => None,
+        }) else {
+            return Err(GradientSiteFailure::Unsupported(format!(
+                "input affects a structural, model or unbound site at {}",
+                site.location
+            )));
+        };
+        let mut candidate_values = self.values.clone();
+        let base = self.site_values[site_index];
+        let derivative = conditioned_derivative(self.values[input], |point| {
+            candidate_values[input] = point;
+            let mut scratch = self.parameters.clone();
+            let mut budget = EvalBudget::new(limits);
+            if scratch.update(&candidate_values, &mut budget).is_err() {
+                return Ok(None);
+            }
+            let raw = match scratch.evaluate_bound(&site.expression, &site.inputs, &mut budget) {
+                Ok(value) if value.is_finite() => value,
+                _ => return Ok(None),
+            };
+            let literal = elaborate::format_literal(raw);
+            let Some(value) = crate::primitives::parse_spice_number(&literal) else {
+                return Ok(None);
+            };
+            Ok(Some(Complex::real(value - base)))
+        });
+        match derivative {
+            Ok(Some((scale, _))) if scale.re.is_finite() && scale.im == 0. => Ok((scale.re != 0.)
+                .then_some(GradientSite {
+                    parameter: physical_parameter,
+                    scale: scale.re,
+                })),
+            Ok(_) => Err(GradientSiteFailure::NonSmooth(format!(
+                "non-smooth or unresolvable scalar parameter transformation at {}",
+                site.location,
+            ))),
+            Err(error) => Err(GradientSiteFailure::NonSmooth(format!(
+                "scalar parameter derivative failed at {}: {error}",
+                site.location,
+            ))),
+        }
+    }
+
     /// Differentiate the compiled scalar parameter DAG without solving a
     /// circuit for each coordinate. The physical derivative driver performs
     /// one fresh elaboration, even if the optimized candidate's limited
@@ -518,79 +592,14 @@ impl CircuitCandidate<'_> {
                 if output[input].is_err() {
                     continue;
                 }
-                let Some(physical_parameter) = (match (site.kind, site.route) {
-                    (
-                        SiteKind::DeviceParameter { device, parameter },
-                        RouteSpec::Resistor(_) | RouteSpec::Instance { .. },
-                    ) => self.plan.source.devices.get(device).and_then(|card| {
-                        card.parameters.get(parameter).map(|parameter| {
-                            PhysicalParameter::Instance {
-                                instance: card.name.to_ascii_lowercase(),
-                                keyword: parameter.name.clone(),
-                            }
-                        })
-                    }),
-                    (SiteKind::ModelParameter { model, parameter }, _) => {
-                        self.plan.source.models.get(model).and_then(|card| {
-                            card.parameters.get(parameter).map(|parameter| {
-                                PhysicalParameter::Model {
-                                    model: card.name.to_ascii_lowercase(),
-                                    keyword: parameter.name.clone(),
-                                }
-                            })
-                        })
-                    }
-                    _ => None,
-                }) else {
-                    output[input] = Err(GradientSiteFailure::Unsupported(format!(
-                        "input affects a structural, model or unbound site at {}",
-                        site.location
-                    )));
-                    continue;
-                };
-                let mut candidate_values = self.values.clone();
-                let base = self.site_values[site_index];
-                let derivative = conditioned_derivative(self.values[input], |point| {
-                    candidate_values[input] = point;
-                    let mut scratch = self.parameters.clone();
-                    let mut budget = EvalBudget::new(limits);
-                    if scratch.update(&candidate_values, &mut budget).is_err() {
-                        return Ok(None);
-                    }
-                    let raw =
-                        match scratch.evaluate_bound(&site.expression, &site.inputs, &mut budget) {
-                            Ok(value) if value.is_finite() => value,
-                            _ => return Ok(None),
-                        };
-                    let literal = elaborate::format_literal(raw);
-                    let Some(value) = crate::primitives::parse_spice_number(&literal) else {
-                        return Ok(None);
-                    };
-                    Ok(Some(Complex::real(value - base)))
-                });
-                match derivative {
-                    Ok(Some((scale, _))) if scale.re.is_finite() && scale.im == 0. => {
-                        if scale.re != 0. {
-                            if let Ok(ref mut links) = output[input] {
-                                links.push(GradientSite {
-                                    parameter: physical_parameter,
-                                    scale: scale.re,
-                                });
-                            }
+                match self.gradient_site(site_index, input, limits) {
+                    Ok(Some(link)) => {
+                        if let Ok(ref mut links) = output[input] {
+                            links.push(link);
                         }
                     }
-                    Ok(_) => {
-                        output[input] = Err(GradientSiteFailure::NonSmooth(format!(
-                            "non-smooth or unresolvable scalar parameter transformation at {}",
-                            site.location,
-                        )))
-                    }
-                    Err(error) => {
-                        output[input] = Err(GradientSiteFailure::NonSmooth(format!(
-                            "scalar parameter derivative failed at {}: {error}",
-                            site.location,
-                        )))
-                    }
+                    Ok(None) => {}
+                    Err(error) => output[input] = Err(error),
                 }
             }
         }

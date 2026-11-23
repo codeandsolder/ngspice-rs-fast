@@ -912,3 +912,52 @@ explicit `Unsupported`/`IllConditioned` typed statuses instead of only
 rawfile-compatible NaN. Independent JFET2 DELTA/HFET2 D2 physical references
 and full C replay tests are the acceptance evidence, not a loose comparison
 to historically rounded finite differences.
+
+## Optimizer gradients from physical adjoints (#115)
+
+The optimizer-facing API is in `analysis::optimization::derivatives`.
+`DerivativeRequest` names one **direct** DC voltage/current or one AC
+voltage/current at a finite positive frequency. `evaluate(candidate, request,
+limits)` returns one `InputDerivative` per independent root `.param`
+coordinate with a `Defined(Complex)`, `Unsupported(reason)`, or
+`NonSmooth(reason)` outcome. `CandidateWorker::evaluate_gradient`
+provides the same transactional candidate preparation and ID/failure
+semantics as black-box candidate evaluation. This does not introduce a
+particular optimizer or require derivatives of arbitrary measurements.
+
+The candidate parameter plan determines which typed device or model sites
+are affected by each root input and evaluates their numeric chain-rule
+coefficients using its existing bound scalar expression DAG, with physical
+step conditioning and the same decimal literal readback as candidate
+preparation. It does **not** run another SPICE simulation for each input.
+For each direct objective a single candidate-specific circuit is elaborated
+before calling the existing physical `.sens` walk; this is essential because
+optimistic model-context overrides change primal stamps but device
+sensitivity records otherwise retain the original literal parameters.
+The existing `.sens` primal/adjoint solve and per-device delta matrix
+assembly are reused unchanged. Duplicate model names across device instances
+contribute to the same typed model derivative and are combined with
+compensated summation; the chain rule is then projected to the root inputs.
+
+A changed model/topology may therefore still have well-defined gradients:
+re-elaboration is performed **once per objective**, not once per parameter.
+Purely unrelated root coordinates return exact zero. A dependent option,
+unsupported structural site, nonfinite or inconsistent local derivative,
+regime transition, or missing physical device sensitivity yields an explicit
+per-input status. Nonlinear AC is specifically unsupported here: the C-reset
+AC sensitivity state is not the biased AC objective's state; nonlinear DC
+and linear small-signal AC use their respective validated physical walks.
+Transient/event and arbitrary measurement derivatives retain the black-box
+API, without synthetic gradients or an adapter with incomplete semantics.
+
+The verification fixtures in `tests/optimization_derivatives.rs` compare
+DC and AC objective gradients against independent full-circuit central
+resimulations, shared model derivatives across multiple diode instances,
+A/B/A candidate state isolation, missing/unsupported requests, non-smooth
+scalar transformations, and multiple device sites with cancelling chain
+contributions. The opt-in 32-input fitting workload compares one adjoint
+step to 64 independently simulated central-difference evaluations:
+
+```sh
+cargo +nightly test --release --test optimization_derivatives parameter_fit_gradient_benchmark -- --ignored --nocapture
+```
