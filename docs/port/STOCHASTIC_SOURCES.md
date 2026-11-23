@@ -104,4 +104,3 @@ from C's global RNG and FFT implementation.
 
 The normal no-noise constant/PULSE/PWL/SIN waveform path remains
 unchanged and does not construct stochastic state.
-
