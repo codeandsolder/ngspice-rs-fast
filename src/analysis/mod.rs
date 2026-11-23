@@ -47,6 +47,7 @@ pub mod newton;
 pub mod noise;
 pub mod optimization;
 mod ordered_samples;
+mod output_probe;
 mod plan;
 mod pz;
 pub mod rawfile;
