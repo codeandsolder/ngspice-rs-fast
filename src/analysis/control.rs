@@ -171,7 +171,7 @@ impl<'a> ControlSession<'a> {
         Ok(origins
             .into_iter()
             .zip(collector.finish(expected)?)
-            .map(|((kind, grid), plot)| ControlPlot { kind, grid, plot })
+            .map(|((kind, grid), plot)| ControlPlot { kind, plot, grid })
             .collect())
     }
 
@@ -186,7 +186,7 @@ impl<'a> ControlSession<'a> {
     }
 
     /// Retain all output plots from one run under explicit plot and cell limits.
-    /// Use [Self::run_into] for streaming without plot retention.
+    /// Use [`Self::run_into`] for streaming without plot retention.
     ///
     /// # Errors
     /// Planning, simulation or plot-retention budget failure.

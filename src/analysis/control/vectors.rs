@@ -2,7 +2,7 @@
 //!
 //! Linearization shares the measurement/Fourier ordered-axis geometry.
 //! FFT uses a native radix-2 transform, with the single-sided normalization
-//! and periodic window conventions of frontend/com_fft.c and maths/fft/fftext.c.
+//! and periodic window conventions of `frontend/com_fft.c` and `maths/fft/fftext.c`.
 
 use std::f64::consts::TAU;
 
@@ -159,7 +159,7 @@ fn real_trace(plot: &Plot, index: usize) -> SpiceResult<Vec<Real>> {
     trace
         .try_reserve_exact(column.len())
         .map_err(|error| failure(format!("allocating transform trace: {error}")))?;
-    for value in column.iter() {
+    for value in &column {
         if !value.is_real() || !value.is_finite() {
             return Err(failure("non-real or nonfinite transform input"));
         }
@@ -262,17 +262,17 @@ impl SpectrumWindow {
         match self {
             Self::Rectangular => 1.,
             Self::Hann => 1. - c1,
-            Self::Hamming => 1. - (0.46 / 0.54) * c1,
+            Self::Hamming => (0.46_f64 / 0.54).mul_add(-c1, 1.),
             Self::Triangle => 4. * position.abs().min(1. - position.abs()),
             Self::Blackman => {
-                (0.08 / 0.42_f64).mul_add((2. * angle).cos(), 1. - (0.50 / 0.42) * c1)
+                (0.08 / 0.42_f64).mul_add((2. * angle).cos(), (0.50_f64 / 0.42).mul_add(-c1, 1.))
             }
             Self::BlackmanHarris => {
                 let c2 = (2. * angle).cos();
                 let c3 = (3. * angle).cos();
                 (-0.01168 / 0.35875_f64).mul_add(
                     c3,
-                    (0.14128 / 0.35875_f64).mul_add(c2, 1. - (0.48829 / 0.35875) * c1),
+                    (0.14128 / 0.35875_f64).mul_add(c2, (0.48829_f64 / 0.35875).mul_add(-c1, 1.)),
                 )
             }
             Self::FlatTop => {
@@ -281,7 +281,7 @@ impl SpectrumWindow {
                 let c4 = (4. * angle).cos();
                 0.032_f64.mul_add(
                     c4,
-                    (-0.388_f64).mul_add(c3, 1.29_f64.mul_add(c2, 1. - 1.93 * c1)),
+                    (-0.388_f64).mul_add(c3, 1.29_f64.mul_add(c2, 1.93_f64.mul_add(-c1, 1.))),
                 )
             }
         }
@@ -623,7 +623,7 @@ impl<F: Fn(&str) -> Option<Real>> VectorCompiler<'_, F> {
     fn compile(&mut self, node: &Expr) -> SpiceResult<()> {
         match &node.kind {
             ExprKind::Number { value, .. } => {
-                self.code.push(VectorOp::Constant(Complex::real(*value)))
+                self.code.push(VectorOp::Constant(Complex::real(*value)));
             }
             ExprKind::Identifier(name) => {
                 if let Some(value) = (self.scalar)(name) {
@@ -710,8 +710,9 @@ fn evaluate_row(
     Ok(result)
 }
 
-/// Evaluate a vector expression on the current plot. Scalar-only expressions
-/// return None so callers can use the ordinary scalar evaluator instead.
+/// Evaluate a vector expression on the current plot.
+///
+/// Scalar-only expressions return `None` so callers can use the ordinary scalar evaluator.
 /// Supported vector operands are named columns, v(node[, node]), i(source),
 /// numeric literals and scalar bindings. Vector arithmetic uses complex
 /// addition, subtraction, multiplication and division; real powers and

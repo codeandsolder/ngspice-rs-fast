@@ -209,7 +209,7 @@ impl Default for PlotCollector {
 }
 
 impl PlotCollector {
-    pub(super) fn bounded(max_plots: usize, max_cells: usize) -> Self {
+    pub(super) const fn bounded(max_plots: usize, max_cells: usize) -> Self {
         Self {
             plots: Vec::new(),
             active: None,
