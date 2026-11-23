@@ -147,7 +147,6 @@ fn clipped_window_and_repeated_axis_jumps_keep_their_actual_coverage() {
         MeasureWindow {
             from: Some(0.5),
             to: Some(1.5),
-            ..MeasureWindow::default()
         },
     );
     assert_eq!(result, [5., 5.]);
@@ -194,30 +193,32 @@ fn cancelling_maximum_panels_retain_zero_and_a_small_representable_residual() {
 }
 
 #[test]
-fn exact_dyadic_trapezoids_agree_with_independent_integer_rationals() {
+fn exact_dyadic_trapezoids_agree_with_independent_integer_rationals()
+-> Result<(), std::num::TryFromIntError> {
     // Integer denominators are powers of two, so all binary64 inputs below
     // are exact. An i128 oracle forms the rational trapezoid numerator and
     // total width without using the production weighted-sum implementation.
     let mut seed = 0xded3_74ae_19fc_ba87_u64;
     for _ in 0..256 {
-        let mut x = 0_i128;
-        let mut previous_y = 0_i128;
+        let mut x = 0_i32;
+        let mut previous_y = 0_i32;
         let mut expected_numerator = 0_i128;
         let mut points = Vec::new();
         for index in 0..17 {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            let y = i128::from((seed % 1001) as i64 - 500);
+            let y = i32::try_from(seed % 1001)? - 500;
             if index > 0 {
-                let step = i128::from(((seed >> 13) % 31 + 1) as i64);
+                let step = i32::try_from((seed >> 13) % 31 + 1)?;
                 x += step;
-                expected_numerator += step * (previous_y + y);
+                expected_numerator += i128::from(step) * i128::from(previous_y + y);
             }
-            points.push((x as Real / 1024., y as Real / 4096.));
+            points.push((Real::from(x) / 1024., Real::from(y) / 4096.));
             previous_y = y;
         }
-        let rational = expected_numerator as Real / (2. * x as Real * 4096.);
+        let rational =
+            Real::from(i32::try_from(expected_numerator)?) / (2. * Real::from(x) * 4096.);
         let result =
             retained_and_online(&points, &[MeasureStatistic::Avg], MeasureWindow::default());
         let tolerance = 2. * Real::EPSILON * rational.abs().max(1.);
@@ -226,4 +227,5 @@ fn exact_dyadic_trapezoids_agree_with_independent_integer_rationals() {
             "{points:?} {result:?}"
         );
     }
+    Ok(())
 }
