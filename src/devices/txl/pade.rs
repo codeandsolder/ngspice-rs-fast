@@ -28,23 +28,23 @@
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct Term {
+pub(in crate::devices) struct Term {
     pub c: Real,
     pub x: Real,
 }
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ComplexTerm {
+pub(in crate::devices) struct ComplexTerm {
     pub residue: Complex,
     pub pole: Complex,
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Propagation<const N: usize, const R: usize> {
+pub(in crate::devices) enum Propagation<const N: usize, const R: usize> {
     Real([Term; N]),
     Conjugate { real: [Term; R], pair: ComplexTerm },
 }
 impl<const N: usize, const R: usize> Propagation<N, R> {
-    fn from_c(terms: [Term; N], pair: bool) -> Self {
+    pub(in crate::devices) fn from_c(terms: [Term; N], pair: bool) -> Self {
         if pair {
             Self::Conjugate {
                 real: std::array::from_fn(|i| terms[i]),
@@ -142,7 +142,11 @@ fn eliminate(mut a: [[Real; 4]; 3], threshold: Real) -> SpiceResult<[Real; 3]> {
     }
     Ok([a[2][3], a[1][3], a[0][3]])
 }
-fn solve_series(b: [Real; 5], dc: Real, threshold: Real) -> SpiceResult<([Real; 3], [Real; 3])> {
+pub(in crate::devices) fn solve_series(
+    b: [Real; 5],
+    dc: Real,
+    threshold: Real,
+) -> SpiceResult<([Real; 3], [Real; 3])> {
     let [b1, b2, b3, b4, b5] = b;
     let p = eliminate(
         [[1. - dc, b1, b2, -b3], [b1, b2, b3, -b4], [b2, b3, b4, -b5]],
@@ -154,7 +158,10 @@ fn solve_series(b: [Real; 5], dc: Real, threshold: Real) -> SpiceResult<([Real; 
 /// `find_roots`/`exp_find_roots`: Cardano seed, at most 31 Newton updates,
 /// and stable quadratic deflation. For complex propagation roots the last
 /// two entries hold the real and imaginary part of the conjugate pair.
-fn roots([a, b, c]: [Real; 3], propagation: bool) -> SpiceResult<([Real; 3], bool)> {
+pub(in crate::devices) fn roots(
+    [a, b, c]: [Real; 3],
+    propagation: bool,
+) -> SpiceResult<([Real; 3], bool)> {
     let q = (a * a - 3. * b) / 9.;
     let p = (2. * a * a * a - 9. * a * b + 27. * c) / 54.;
     let d = q * q * q - p * p;
@@ -207,7 +214,12 @@ fn roots([a, b, c]: [Real; 3], propagation: bool) -> SpiceResult<([Real; 3], boo
     }
     Ok(([x, y, z], pair))
 }
-fn residues(p: [Real; 3], q: [Real; 3], x: [Real; 3], pair: bool) -> [Real; 3] {
+pub(in crate::devices) fn residues(
+    p: [Real; 3],
+    q: [Real; 3],
+    x: [Real; 3],
+    pair: bool,
+) -> [Real; 3] {
     let [p1, p2, p3] = p;
     let [a, b, c] = [q[0] - p1, q[1] - p2, q[2] - p3];
     let mut r = x.map(|x| eval(a, b, c, x) / eval(3., 2. * p1, p2, x));

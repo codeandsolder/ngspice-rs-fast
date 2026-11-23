@@ -80,6 +80,37 @@ rejected instead of being extrapolated. No trial mutates accepted
 history or partially writes the received output buffers. Full lossy
 Padé and CPL transient callback integration remain pending.
 
+## Lossy frequency-domain and rational-kernel substrate
+
+CplSpectralSample evaluates the full coupled telegrapher response at
+positive real Laplace rate s by factoring the scaled matrices L+R/s and
+C+G/s with the shared modal Cholesky/Jacobi eigensystem. If the resulting
+mode propagation exponent is u, it constructs the exact reciprocal
+physical two-port [A,-B;-B,A] using modal y*coth(u) and y*csch(u).
+Evaluation uses exp(-u) and -expm1(-2u) to avoid overflow and retain
+resolution for short cables. Mode attenuation and complete near/cross
+admittance blocks remain available without an AC P-device registration.
+
+For numerical parity, cplsetup.c floors EVERY upper-triangular R
+coefficient, including the mutual terms, at 1e-4 before transient
+fitting. This is done in the spectral calculation, not in the stored
+physical model, and differs from DC loading's use of diagonal R only.
+Upstream C setup also requires explicitly given model R/G/L/C/length,
+even though the standalone plan can represent physically absent R/G
+as zero; this requirement must be enforced at executable registration.
+
+The bounded CPL three-pole Padé primitive shares the already-native
+TXL 3x3 solve, cubic roots and real/conjugate pole residues rather than
+duplicating the numerical algorithms. It recognizes identically
+constant and zero kernels without inventing poles, rejects unstable
+fits and accepts C's eight inverse-rate samples through a bounded
+Neville/match polynomial expansion. These are *fitting primitives*:
+the matrix h1/h2/h3 channel assembly and causal recursive convolution
+are not yet integrated into the transient solver. Per-element unconstrained
+Padé h1 fitting can produce unstable poles for physically passive coupled
+cables; a complete backend must use stable coupled-matrix fitting rather
+than excluding those valid models or exposing growing impulse responses.
+
 ## Front-end representation
 
 The independent parser reads P card terminal groups in exact near/far
@@ -113,11 +144,12 @@ per-component source positions and expressions.
    +0.1*gmin C matrix cells. The reference C DC loader ignores mutual
    R and shunt G, and does not stamp explicit near/far returns. These C
    limitations are documented, not propagated to the transient model.
-3. Implement upstream CPL modal frequency fitting, Pade poles/residues,
-   convolution and bidirectional delayed waveforms in the existing
-   device-owned delay-history and transient-input architecture. Every
-   rejected Newton or truncation attempt must leave accepted history
-   intact. Model validation must reject unstable poles.
+3. In progress: spectral samples, Padé primitives, lossless port-wave
+   launching and causal read-only modal delay sampling exist. Complete
+   the coupled h1/h2/h3 matrix-channel frequency fitting, accepted-step
+   recursive convolution and physical transient branch stamps in the
+   shared delay-history and transient-input architecture. Every rejected
+   Newton or truncation attempt must leave accepted history intact.
 4. Differentially test C-backed CPL DC/transient examples,
    differential/common-mode and three-plus-conductor crosstalk,
    near-zero coupling, passivity, sample/hold and rollback. Measure
