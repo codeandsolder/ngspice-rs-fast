@@ -141,7 +141,7 @@ fn compiled_numeric_setters_reuse_session_topology_and_match_scalar_aba() {
 }
 
 #[test]
-fn arbitrary_number_of_independent_resistors_uses_validated_reelaboration() {
+fn arbitrary_number_of_independent_resistors_uses_validated_sparse_overlay() {
     let source = deck(
         ".param a=1k b=2k c=3k d=4k\nv1 in 0 10\nr1 in 0 {a}\nr2 in 0 {b}\nr3 in 0 {c}\nr4 in 0 {d}",
     );
@@ -150,7 +150,7 @@ fn arbitrary_number_of_independent_resistors_uses_validated_reelaboration() {
     session
         .update(&[1500., 2500., 3500., 4500.], &mut EvalBudget::default())
         .unwrap();
-    assert_eq!(session.topology(), CandidateTopology::Rebuilt);
+    assert_eq!(session.topology(), CandidateTopology::Reused);
     same_linear(
         &mut session,
         &deck(
@@ -161,6 +161,53 @@ fn arbitrary_number_of_independent_resistors_uses_validated_reelaboration() {
         .update(&[1000., 2000., 3000., 4000.], &mut EvalBudget::default())
         .unwrap();
     assert_eq!(session.topology(), CandidateTopology::Reused);
+}
+
+#[test]
+fn one_hundred_twenty_eight_typed_resistor_sites_keep_numeric_fidelity_and_aba_state() {
+    const N: usize = 128;
+    let netlist = |values: &[f64]| {
+        let mut body = String::from("v1 in 0 dc 10\n");
+        for (index, value) in values.iter().enumerate() {
+            body.push_str(&format!(".param p{index}={value:.17e}\n"));
+            let (pos, neg) = if index == 0 {
+                ("in", "out")
+            } else {
+                ("out", "0")
+            };
+            body.push_str(&format!("r{index} {pos} {neg} {{p{index}}}\n"));
+        }
+        deck(&body)
+    };
+    let starting: Vec<_> = (0..N).map(|index| 1000. + index as f64 * 7.).collect();
+    let names: Vec<_> = (0..N).map(|index| format!("p{index}")).collect();
+    let inputs: Vec<_> = names.iter().map(String::as_str).collect();
+    let plan = CircuitParameterPlan::new(netlist(&starting), &inputs).unwrap();
+    let mut session = plan.session().unwrap();
+    let a: Vec<_> = starting
+        .iter()
+        .enumerate()
+        .map(|(index, value)| value * (1. + (index % 13) as f64 * 0.001))
+        .collect();
+    let b: Vec<_> = starting
+        .iter()
+        .enumerate()
+        .map(|(index, value)| value * (1. + (index % 11) as f64 * 0.002))
+        .collect();
+    for values in [&a, &b, &a, &starting] {
+        session.update(values, &mut EvalBudget::default()).unwrap();
+        assert_eq!(session.topology(), CandidateTopology::Reused);
+        same_linear(&mut session, &netlist(values));
+    }
+    let mut invalid = a.clone();
+    invalid[0] = f64::NAN;
+    assert!(
+        session
+            .update(&invalid, &mut EvalBudget::default())
+            .is_err()
+    );
+    assert_eq!(session.topology(), CandidateTopology::Reused);
+    same_linear(&mut session, &netlist(&starting));
 }
 
 #[test]
