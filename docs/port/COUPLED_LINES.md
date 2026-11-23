@@ -53,6 +53,13 @@ noncommuting L and C. These delays do not substitute for the
 frequency-dependent lossy R/G mode fitting or its transient
 convolution; those still require the CPL device solver.
 
+The shared bounded Jacobi implementation also exposes a sorted,
+orthonormal eigenbasis via Matrix::symmetric_eigendecomposition.
+It accumulates rotations only when requested, so existing
+eigenvalue-only physical validations retain their cheaper path.
+Building the coupled forward/backward mode projection and characteristic
+admittance from that basis is the next transient prerequisite.
+
 ## Front-end representation
 
 The independent parser reads P card terminal groups in exact near/far
