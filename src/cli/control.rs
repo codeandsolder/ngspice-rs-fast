@@ -1,5 +1,6 @@
-//! Bounded execution of native control scripts, without shell commands or a
-//! second numerical engine. The circuit parser preserves positioned commands;
+//! Bounded native control script execution.
+//!
+//! The circuit parser preserves positioned commands;
 //! the entire script is compiled before the first simulation runs.
 
 use std::cmp::Ordering;
@@ -827,7 +828,7 @@ impl State<'_, '_> {
             Operation::Measure(card) => self.measure(card)?,
             Operation::Print(values) => self.print(values, location)?,
             Operation::Transform(transform, vectors) => {
-                self.transform(*transform, vectors, location)?
+                self.transform(*transform, vectors, location)?;
             }
             Operation::SetWindow(window) => self.window = *window,
             Operation::SetPlot(name) => self.select_plot(name, location)?,
@@ -844,8 +845,9 @@ impl State<'_, '_> {
     }
 }
 
-/// Compile and execute a deck's .control sections using bounded native
-/// commands. Includes resolve with the ordinary source admission policy.
+/// Compile and execute a deck's `.control` sections using bounded native commands.
+///
+/// Includes resolve with the ordinary source admission policy.
 /// Unsupported commands are rejected during compilation, before any run.
 ///
 /// # Errors
