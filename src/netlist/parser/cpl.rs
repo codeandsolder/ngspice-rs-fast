@@ -1,7 +1,7 @@
 //! P/CPL multiconductor line grammar, preserving ordered physical matrices.
 //!
-//! Pname in1 [in2 ...] reference_in out1 [out2 ...] reference_out model
-//!       [length=physical_length]
+//! A P card names n near conductors, their return, n far conductors,
+//! the far return, and a model. An optional length setter follows.
 //! .model model CPL [length=value] R=(packed upper triangle) ...
 //!
 //! A CPL terminal group always has one explicit return at each end. The
@@ -98,10 +98,7 @@ fn p_body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
 /// dimension checking occurs when associated with an instance.
 pub(super) fn model_parameters(input: &mut Input<'_>) -> Result<Vec<ParameterAssignment>> {
     let mut parameters = Vec::new();
-    loop {
-        let Some(next) = input.input.first() else {
-            break;
-        };
+    while let Some(next) = input.input.first() {
         if next.kind == TokenKind::RParen {
             break;
         }
