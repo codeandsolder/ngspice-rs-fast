@@ -51,7 +51,7 @@
 //! ported. `.option keepopinfo`'s extra operating-point plot is not produced
 //! (the option is not accepted by the port).
 
-use crate::analysis::frequency::{Advance, FrequencyGrid, MAX_POINTS};
+use crate::analysis::frequency::{Advance, FrequencyPlan, MAX_POINTS};
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{Plot, PlotFlags, Variable};
 use crate::analysis::{AnalysisContext, AnalysisPlan};
@@ -564,7 +564,7 @@ fn input_kind(circuit: &Circuit, name: &str) -> SpiceResult<SourceKind> {
 }
 
 /// C's frequency grid, with exactly representable bounded point counts.
-pub(super) fn frequency_grid(card: &NoiseCard, reltol: Real) -> SpiceResult<FrequencyGrid> {
+pub(super) fn frequency_grid(card: &NoiseCard, reltol: Real) -> SpiceResult<FrequencyPlan> {
     let delta = match card.stepping {
         Stepping::Decade => (10f64.ln() / Real::from(card.steps)).exp(),
         Stepping::Octave => (2f64.ln() / Real::from(card.steps)).exp(),
@@ -580,7 +580,7 @@ pub(super) fn frequency_grid(card: &NoiseCard, reltol: Real) -> SpiceResult<Freq
         Stepping::Linear if card.steps == 1 => Advance::Single,
         Stepping::Linear => Advance::Add(delta),
     };
-    FrequencyGrid::new(card.start, card.stop, tolerance, advance, ".noise")
+    FrequencyPlan::new(card.start, card.stop, tolerance, advance, ".noise")
 }
 
 fn integrated_plot(
@@ -629,7 +629,7 @@ pub(super) fn run(
     request: &AnalysisPlan,
     context: &AnalysisContext,
     card: &NoiseCard,
-    frequencies: &[Real],
+    frequencies: &FrequencyPlan,
     include_bias: bool,
     sink: &mut dyn crate::analysis::PointSink,
 ) -> SpiceResult<()> {
@@ -673,7 +673,7 @@ pub(super) fn run(
     let mut integrated_power = Power::default();
     let mut last = card.start;
     let mut row = NoiseRow::new(representation, spectrum.variable_count());
-    for (step, &freq) in frequencies.iter().enumerate() {
+    for (step, freq) in frequencies.values().enumerate() {
         let gain_sq_inv = small.at_frequency(context, freq, |system| {
             solve.validate(system)?;
             let matrix =

@@ -60,7 +60,8 @@ mod tf;
 
 pub use companion::{TransientPlan, TransientStats, companion_transient, companion_transient_into};
 pub use config::{
-    AppliedOption, DcOptions, IgnoredOption, RunConfig, RunOverrides, TransientSettings,
+    AppliedOption, DcOptions, IgnoredOption, PlanningLimits, RunConfig, RunOverrides,
+    TransientSettings,
 };
 pub use driver::{
     AnalysisContext, AnalysisInput, AnalysisSupport, DRIVERS, NodeCondition, NoiseOptions,
