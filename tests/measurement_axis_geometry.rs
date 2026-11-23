@@ -154,6 +154,46 @@ fn clipped_window_and_repeated_axis_jumps_keep_their_actual_coverage() {
 }
 
 #[test]
+fn cancelling_maximum_panels_retain_zero_and_a_small_representable_residual() {
+    // The repeated coordinate is an intentional step; neither the MAX
+    // intermediate products nor their total may be rounded in isolation.
+    let exact_cancel = [
+        (0., Real::MAX),
+        (1., Real::MAX),
+        (1., -Real::MAX),
+        (2., -Real::MAX),
+    ];
+    let result = retained_and_online(
+        &exact_cancel,
+        &[
+            MeasureStatistic::Avg,
+            MeasureStatistic::Integ,
+            MeasureStatistic::Rms,
+        ],
+        MeasureWindow::default(),
+    );
+    assert_eq!(result[0], 0.);
+    assert_eq!(result[1], 0.);
+    assert_eq!(result[2], Real::MAX);
+
+    let residual = -Real::MAX + 4e292;
+    let small = [
+        (0., Real::MAX),
+        (1., Real::MAX),
+        (1., residual),
+        (2., residual),
+    ];
+    let result = retained_and_online(
+        &small,
+        &[MeasureStatistic::Avg, MeasureStatistic::Integ],
+        MeasureWindow::default(),
+    );
+    let area = Real::MAX + residual;
+    assert_eq!(result[0], area / 2.);
+    assert_eq!(result[1], area);
+}
+
+#[test]
 fn exact_dyadic_trapezoids_agree_with_independent_integer_rationals() {
     // Integer denominators are powers of two, so all binary64 inputs below
     // are exact. An i128 oracle forms the rational trapezoid numerator and
