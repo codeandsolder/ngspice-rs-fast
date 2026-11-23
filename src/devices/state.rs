@@ -391,10 +391,11 @@ impl StateHistory {
     }
 
     /// Reset a discarded Newton trial without borrowing or modifying any
-    /// accepted/retained snapshot. The same slot allocation is reused only
-    /// when its Arc is unique and the accepted revision and topology match.
-    /// All slots are poisoned again so an unwritten device slot is still
-    /// detected at the existing acceptance boundary.
+    /// accepted/retained snapshot. Only an exclusively owned storage slice
+    /// is recycled. Its old revision/topology is deliberately *not* trusted:
+    /// all slots are overwritten with NaNs and the binding/revision rebound
+    /// to this accepted history. The previous *active* trial still must
+    /// match exactly; stale trials themselves can never be accepted.
     ///
     /// # Errors
     /// A previous trial from a foreign circuit or accepted revision.
@@ -407,16 +408,20 @@ impl StateHistory {
         if let Some(previous) = previous {
             self.check_trial(previous)?;
         }
-        let Some(mut reused) = spare.filter(|spare| self.check_trial(spare).is_ok()) else {
+        let Some(mut reused) = spare.filter(|spare| spare.values.len() == self.len) else {
             return self.trial_in(phase, previous);
         };
-        // Arc::make_mut would copy a shared state only to overwrite it with
-        // NaNs. A retained snapshot therefore gets fresh storage instead.
+        // The previous accepted revision invalidates *read access* to this
+        // trial's old data, but not reuse of uniquely owned raw storage.
+        // Rebind only after every slot has been overwritten. Arc::make_mut
+        // would copy a retained snapshot unnecessarily merely to poison it.
         if let Some(values) = Arc::get_mut(&mut reused.values) {
             values.fill(Real::NAN);
         } else {
             reused.values = std::iter::repeat_n(Real::NAN, self.len).collect();
         }
+        reused.topology = self.binding.as_ref().map(|binding| binding.topology);
+        reused.revision = Arc::clone(&self.revision);
         reused.mode = LoadMode::newton(phase);
         reused.previous = previous.map(|previous| Arc::clone(&previous.values));
         reused.nonconvergent = false;
@@ -1278,10 +1283,13 @@ mod tests {
         assert_eq!(&*held, &[17., 19.]);
         assert_ne!(trial.values.as_ptr(), held.as_ptr());
         let stale = trial;
+        let stale_ptr = stale.values.as_ptr();
         history.clear();
+        assert!(history.check_trial(&stale).is_err());
         let fresh = history
             .trial_in_reusing(IterationPhase::Predict, None, Some(stale))
             .unwrap();
+        assert_eq!(fresh.values.as_ptr(), stale_ptr);
         assert_eq!(fresh.phase(), IterationPhase::Predict);
         assert_eq!(fresh.values().len(), 2);
         assert!(fresh.values().iter().all(|value| value.is_nan()));
