@@ -344,10 +344,11 @@ pub(super) fn run(
                 }
                 let factors =
                     ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
-                for (&f, factor) in group.iter().zip(&factors) {
-                    output.record(circuit, context, &small_signal, f, factor)?;
+                for (&f, factor) in group.iter().zip(factors.into_iter()) {
+                    let factor = factor?;
+                    output.record(circuit, context, &small_signal, f, &factor)?;
+                    previous = Some(factor);
                 }
-                previous = factors.into_iter().last();
             }
         } else {
             for &f in frequencies {

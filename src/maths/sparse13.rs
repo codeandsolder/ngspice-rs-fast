@@ -3865,6 +3865,43 @@ mod tests {
         (frame, status)
     }
 
+    /// Componentwise scaled residual of the *unfactored* matrix, using the
+    /// original external row and column indices even after pivot exchange.
+    fn frequency_backward_error(
+        reference: &Sparse<Complex>,
+        originals: &[Complex],
+        rhs: &[Complex],
+        solution: &[Complex],
+        transposed: bool,
+    ) -> f64 {
+        let mut product = vec![Complex::ZERO; rhs.len()];
+        let mut scale = rhs
+            .iter()
+            .map(|value| value.magnitude())
+            .collect::<Vec<_>>();
+        for (element, &coefficient) in reference
+            .topology
+            .elements
+            .iter()
+            .take(reference.topology.original_entries)
+            .zip(originals)
+        {
+            let row = reference.topology.int_to_ext_row[element.row] - 1;
+            let col = reference.topology.int_to_ext_col[element.col] - 1;
+            let (destination, source) = if transposed { (col, row) } else { (row, col) };
+            product[destination] = product[destination] + coefficient * solution[source];
+            scale[destination] += coefficient.magnitude() * solution[source].magnitude();
+        }
+        product
+            .iter()
+            .zip(rhs)
+            .zip(scale)
+            .map(|((&computed, &expected), row_scale)| {
+                (computed - expected).magnitude() / row_scale.max(f64::MIN_POSITIVE)
+            })
+            .fold(0., f64::max)
+    }
+
     #[test]
     fn complex_frequency_factor_tiles_match_independent_scalar_factors_and_solutions() {
         for n in [1, 2, 3, 4, 8, 16, 64] {
@@ -3943,6 +3980,15 @@ mod tests {
                                 .map_err(ToString::to_string),
                             "n={n} lane={lane} transpose={transposed}",
                         );
+                        if let Ok(solution) = actual {
+                            let error = frequency_backward_error(
+                                &baseline, refs[lane], &rhs, &solution, transposed,
+                            );
+                            assert!(
+                                error <= 1e-9,
+                                "n={n} lane={lane} transpose={transposed}: backward error {error:e}",
+                            );
+                        }
                     }
                 }
             }

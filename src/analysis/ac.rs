@@ -65,7 +65,8 @@ pub(super) fn run(
                 )?);
             }
             let factors = ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
-            for (&f, factor) in frequencies.iter().zip(&factors) {
+            for (&f, result) in frequencies.iter().zip(factors.into_iter()) {
+                let factor = result?;
                 let x = factor.solve(&rhs)?;
                 point.clear();
                 point.push(Complex::real(f));
@@ -77,8 +78,8 @@ pub(super) fn run(
                 );
                 plot.check_point(&point)?;
                 sink.point(&point)?;
+                previous = Some(factor);
             }
-            previous = factors.into_iter().last();
         }
     } else {
         for &f in grid {

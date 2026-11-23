@@ -816,7 +816,8 @@ impl NoiseAccumulator<'_> {
                 }
                 let factors =
                     ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
-                for (lane, (&freq, factor)) in group.iter().zip(&factors).enumerate() {
+                for (lane, (&freq, factor)) in group.iter().zip(factors.into_iter()).enumerate() {
+                    let factor = factor?;
                     let forward = factor.solve(&input)?;
                     let adjoint = factor.solve_transposed(adjoint_rhs)?;
                     self.observe(
@@ -826,8 +827,8 @@ impl NoiseAccumulator<'_> {
                         &forward,
                         &adjoint,
                     )?;
+                    previous = Some(factor);
                 }
-                previous = factors.into_iter().last();
             }
         } else {
             for (step, &freq) in frequencies.iter().enumerate() {
