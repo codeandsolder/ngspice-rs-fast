@@ -342,6 +342,19 @@ The AC/NQS changes do not execute in those cases and must not be used to
 justify altering the established reference tolerances.
 
 
+### Geometry/perimeter accuracy (#89)
+
+`geo.rs` removes another 28 blanket-fused-arithmetic suppressions in effective
+source/drain perimeters and areas. For positive finite interior/end diffusion
+resistances the equivalent parallel resistance now uses
+`min(Rint,Rend) / (1 + min(Rint,Rend)/max(Rint,Rend))`; the older
+`Rint*Rend/(Rint+Rend)` overflowed for both ~1e200 Ω legs and underflowed
+for both ~1e-200 Ω legs, despite finite true resistance. The original
+nonfinite-input propagation and warning behavior is retained. Geometry unit
+tests include the analytic three-finger `Rsh/3` law from `Rsh=1e-200` to
+`Rsh≈9e307`. Pinned C goldens pass for `m11_bsim4_bin_dc` (13 points),
+`m11_bsim4_dc` (39 points), and `m11_bsim4_op` (1 point).
+
 ### How it is ported
 
 Unlike BSIM3 (a free reimplementation), BSIM4 is **translated statement by
