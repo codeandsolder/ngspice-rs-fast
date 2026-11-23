@@ -337,7 +337,9 @@ impl Semantic for ParameterAssignment {
             .map_err(|diff| diff.field("kind"))?;
         // Only the structured components carry semantics for vectors.
         match kind {
-            ParameterKind::Waveform(_) | ParameterKind::InitialConditions(_) => Ok(()),
+            ParameterKind::Waveform(_)
+            | ParameterKind::InitialConditions(_)
+            | ParameterKind::NumericVector(_) => Ok(()),
             ParameterKind::Scalar
             | ParameterKind::Textual
             | ParameterKind::Flag
@@ -464,6 +466,7 @@ semantic_enum!(ParameterKind {
     Expression(expression: rexpression),
     Behavioural(expression: rexpression),
     InitialConditions(components: rcomponents),
+    NumericVector(components: rcomponents),
     Waveform(waveform: rwaveform),
 });
 

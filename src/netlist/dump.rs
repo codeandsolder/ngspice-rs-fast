@@ -803,6 +803,7 @@ fn write_parameters(
             ParameterKind::Expression(_) => "expression",
             ParameterKind::Flag => "flag",
             ParameterKind::InitialConditions(_) => "initial-conditions",
+            ParameterKind::NumericVector(_) => "numeric-vector",
             ParameterKind::Waveform(_) => "waveform",
             ParameterKind::Instance => "instance",
             ParameterKind::Behavioural(_) => "behavioural",
@@ -835,6 +836,14 @@ fn write_parameters(
                     ),
                 );
                 write_bexpr(out, indent + 3, &expression.root);
+            }
+            ParameterKind::NumericVector(components) => {
+                for component in components {
+                    out.line(
+                        indent + 2,
+                        format!("component {}", positioned(ctx, component)),
+                    );
+                }
             }
             ParameterKind::InitialConditions(components) => {
                 for component in components {

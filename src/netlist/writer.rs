@@ -794,6 +794,8 @@ impl Writer<'_> {
                 // `inpdomod.c`'s HFET spellings of the same families.
                 | "nhfet"
                 | "phfet"
+                | "cpl"
+                | "cpllines"
         ) {
             return Err(refuse(
                 format!("model type {base:?} is outside the supported syntax"),
@@ -812,6 +814,12 @@ impl Writer<'_> {
                 parts.push(' ')?;
             }
             match &parameter.kind {
+                ParameterKind::NumericVector(components)
+                    if matches!(base, "cpl" | "cpllines")
+                        && matches!(parameter.name.as_str(), "r" | "l" | "g" | "c") =>
+                {
+                    cpl_vector_text(&mut parts, parameter, components)?;
+                }
                 ParameterKind::Flag => {
                     let allowed = model_flags(base);
                     if !allowed.contains(&parameter.name.as_str()) || !parameter.value.is_empty() {
@@ -896,6 +904,28 @@ impl Writer<'_> {
             's' | 'w' => switch_parameters(setters, designator, &mut parts)?,
             't' => tline_parameters(device, &mut parts)?,
             'o' => ltra_parameters(device, &mut parts)?,
+            'p' => {
+                if device.parameters.len() > 1 {
+                    return Err(refuse(
+                        "CPL accepts at most one length override",
+                        Some(location),
+                    ));
+                }
+                for parameter in &device.parameters {
+                    if parameter.name != "length"
+                        || !matches!(
+                            parameter.kind,
+                            ParameterKind::Scalar | ParameterKind::Expression(_)
+                        )
+                    {
+                        return Err(refuse(
+                            "CPL instance accepts length only",
+                            Some(&parameter.location),
+                        ));
+                    }
+                    named_value(&mut parts, parameter, false)?;
+                }
+            }
             'u' => urc_parameters(device, &mut parts)?,
             'y' => {
                 for p in &device.parameters {
@@ -958,6 +988,7 @@ fn device_prefix<'a>(
         'm' | 'e' | 'g' | 's' | 't' | 'o' | 'y' => count == 4,
         'j' | 'u' | 'z' => count == 3,
         'x' => true,
+        'p' => (4..=18).contains(&count) && count % 2 == 0,
         'k' => count == 0,
         _ => {
             return Err(refuse(
@@ -997,7 +1028,7 @@ fn device_prefix<'a>(
         ('v' | 'i' | 'e'..='h' | 'k' | 't', Some(_)) => {
             return Err(refuse("source with a model", Some(location)));
         }
-        ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y', None) => {
+        ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'p' | 'z' | 'y', None) => {
             return Err(refuse("device without a model/target", Some(location)));
         }
         (_, Some(model)) => {
@@ -1251,6 +1282,45 @@ fn positioned_number<'a>(
             Some(location),
         )),
     }
+}
+
+/// A CPL parameter vector retains every positioned source component,
+/// including brace expressions evaluated by the model-resolution stage.
+fn cpl_vector_text(
+    parts: &mut Card<'_>,
+    parameter: &ParameterAssignment,
+    components: &[PositionedValue],
+) -> SpiceResult<()> {
+    if components.is_empty() || components.len() > 36 {
+        return Err(refuse(
+            "invalid CPL matrix vector length",
+            Some(&parameter.location),
+        ));
+    }
+    parts.word(&parameter.name)?;
+    parts.push('=')?;
+    parts.push('(')?;
+    for (index, component) in components.iter().enumerate() {
+        if index != 0 {
+            parts.push(',')?;
+        }
+        parts.check_length(component.text.len())?;
+        let accepted = matches!(
+            single_token(&component.text, &component.location).map(|token| token.kind),
+            Some(TokenKind::Number(value)) if value.is_finite()
+        ) || matches!(
+            single_token(&component.text, &component.location).map(|token| token.kind),
+            Some(TokenKind::Expression(_) | TokenKind::Quoted(_))
+        );
+        if !accepted {
+            return Err(refuse(
+                "invalid CPL matrix vector component",
+                Some(&component.location),
+            ));
+        }
+        parts.push_str(&component.text)?;
+    }
+    parts.push(')')
 }
 
 fn numeric_vector_text<'a>(

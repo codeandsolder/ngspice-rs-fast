@@ -88,6 +88,10 @@ pub enum ParameterKind {
     Flag,
     /// Q/M IC values in C setter order, with omitted components left omitted.
     InitialConditions(Vec<InitialCondition>),
+    /// Ordered, positioned finite literal/parameter-expression components
+    /// of a native matrix-valued model setter (such as CPL R/L/G/C).
+    /// Exact source spelling is retained for delayed scope resolution.
+    NumericVector(Vec<PositionedValue>),
     /// A source waveform; analysis-dependent defaults are resolved by device elaboration.
     Waveform(SourceWaveform),
     /// A reference to another device instance by name (C `IF_INSTANCE`), such
