@@ -129,7 +129,7 @@ fn mos1_channel_derivatives_match_the_square_law() {
     for (k, expected) in [("v(m1:kp)", -1.7914), ("v(m1:vto)", 1.378e-4)] {
         let actual = value(&plot, k);
         assert!(
-            (actual - expected).abs() <= 1e-9 + 1e-6 * expected.abs(),
+            (actual - expected).abs() <= 1e-6_f64.mul_add(expected.abs(), 1e-9),
             "{k}: {actual} vs {expected}"
         );
     }
@@ -175,11 +175,11 @@ fn filtering_the_doping_parameter_avoids_the_failed_temperature_callback() {
     let stage = ".options reltol=1e-10 vntol=1e-13 abstol=1e-16\n\
         vd d 0 3\nvg g 0 2\nvsense s 0 0\nm1 d g s 0 mm l=10u w=20u\n";
     for (level, filter, name, reference) in [
-        (2, "m1:kp", "v(m1:kp)", 4.000000001197),
-        (2, "m1:vto", "v(m1:vto)", -0.000414377152),
-        (2, "m1_l", "v(m1_l)", -41.437684159635),
-        (3, "m1:theta", "v(m1:theta)", -0.000828752854),
-        (3, "m1_w", "v(m1_w)", 20.718862798921),
+        (2, "m1:kp", "v(m1:kp)", 4.000_000_001_197),
+        (2, "m1:vto", "v(m1:vto)", -0.000_414_377_152),
+        (2, "m1_l", "v(m1_l)", -41.437_684_159_635),
+        (3, "m1:theta", "v(m1:theta)", -0.000_828_752_854),
+        (3, "m1_w", "v(m1_w)", 20.718_862_798_921),
     ] {
         let plot = run(&format!(
             "{stage}.model mm nmos level={level} tox=20n\n.sens i(vsense) {filter}\n.end\n"

@@ -862,3 +862,53 @@ rounding the final residual. This retains terms lost by rounding the dot
 product alone: for example, 1 - (1 + 2^-27)(1 - 2^-27) is 2^-54, not zero.
 This does not recover information already rounded inside a device load,
 nor change the finite parameter-perturbation policy.
+
+## Conditioned physical partials (issue #144)
+
+The existing `.sens` form remains a replay of the historical C `sens_sens()`
+record walk, including its `1e-6 * p` forward step, `given` transitions and
+non-smooth temperature/unit effects. Its captured C conformance values are
+not modified or relabeled as physical derivatives. To request **physical
+scalar partial derivatives at fixed accepted bias**, add the `physical` token
+before `dc` or `ac`, after any ordinary output-name filters:
+
+```text
+.sens v(2) j1:delta physical
+.sens i(vids) z3:d2 physical
+.sens v(out) c1 physical ac dec 1 10 1k
+```
+
+This mode reuses the same validated `DeviceSensitivity` model/instance
+records, primal factorization, parameter enumeration and physical device
+loaders, but clones independent typed records for every candidate rather
+than inheriting the previous C setter. The sample is a *local residual*
+`F(p+h) - F(p)` at the original bias. The objective dual is solved once per
+DC output or AC frequency (`A^T λ = g`, **not** a complex conjugate transpose),
+and each sample is projected using FMA-corrected compensated products
+`λ^T ΔF`. No new LU, no parameter-specific matrix inversion, no dependence
+on independent Newton convergence noise.
+
+For each scalar coordinate, candidate scales use ±4%, ±2%, ±1%, ±0.5% and
+±0.25% of the parameter's magnitude, or the same absolute scales for an
+exactly zero coordinate. Effective steps are taken from the actual binary64
+parameter values (`fl(p±h)-p`), never the nominal requested h. Two-sided
+secants are preferred. If only one side is valid, a one-sided estimate is
+refined independently. Full- and half-step slopes are extrapolated using
+Richardson's leading-order cancellation (factor four for symmetric
+second-order central slopes and factor two for first-order one-sided
+slopes); the pair with the least observed refinement discrepancy is used.
+Invalid setters, nonfinite parameter values, changes to the device's setup
+element pattern or lack of a representable physical neighborhood cannot
+silently turn into a purported gradient: they return NaN in that column.
+
+**Accuracy limitations:** the measured two-step discrepancy is a relative
+conditioning diagnostic, *not* a certified physical error bound. For a tiny
+parameter with a physical scale unlike its numeric value, or for a setter
+whose `given` flag alters the physical interpretation even at infinitesimal
+changes, this scheme can remain poorly conditioned. Physical-gradient
+consumers should reject nonfinite responses and independently check the
+accepted scale dependence; objective integration under #115 can surface
+explicit `Unsupported`/`IllConditioned` typed statuses instead of only
+rawfile-compatible NaN. Independent JFET2 DELTA/HFET2 D2 physical references
+and full C replay tests are the acceptance evidence, not a loose comparison
+to historically rounded finite differences.
