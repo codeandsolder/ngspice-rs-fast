@@ -41,6 +41,7 @@ mod grammar;
 mod hints;
 mod ic;
 mod jfet;
+mod line_grammar;
 mod linear;
 mod ltra;
 mod measure;

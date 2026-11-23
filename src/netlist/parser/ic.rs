@@ -12,17 +12,25 @@ use super::syntax::equals;
 use super::vector::{numeric, positioned};
 
 pub(super) fn vector(input: &mut Input<'_>) -> Result<ParameterAssignment> {
+    let components: &[&str] = match input.state.card.designator() {
+        Some('q') => &["icvbe", "icvce"],
+        // jfetpar.c JFET_IC: the vector fills IC-VDS, then IC-VGS.
+        Some('j') => &["ic-vds", "ic-vgs"],
+        // mesparam.c MES_IC: the vector fills ICVDS, then ICVGS.
+        Some('z') => &["icvds", "icvgs"],
+        _ => &["icvds", "icvgs", "icvbs"],
+    };
+    vector_with_components(input, components)
+}
+
+/// Shared IC-vector parser, with the device's exact setter names in order.
+pub(super) fn vector_with_components(
+    input: &mut Input<'_>,
+    components: &[&str],
+) -> Result<ParameterAssignment> {
     let token = keyword("ic").parse_next(input)?;
     cut_err(|input: &mut Input<'_>| {
         opt(equals).parse_next(input)?;
-        let components: &[&str] = match input.state.card.designator() {
-            Some('q') => &["icvbe", "icvce"],
-            // jfetpar.c JFET_IC: the vector fills IC-VDS, then IC-VGS.
-            Some('j') => &["ic-vds", "ic-vgs"],
-            // mesparam.c MES_IC: the vector fills ICVDS, then ICVGS.
-            Some('z') => &["icvds", "icvgs"],
-            _ => &["icvds", "icvgs", "icvbs"],
-        };
         let vector = numeric(input, components.len())?;
         let values = vector
             .values
