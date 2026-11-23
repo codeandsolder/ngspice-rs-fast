@@ -26,7 +26,11 @@ impl CplModes {
     ///
     /// # Errors
     /// Ill-conditioned LC, nonfinite admittance, or invalid propagation modes.
-    pub fn prepare(length: Real, inductance: &Matrix, capacitance: &Matrix) -> SpiceResult<Self> {
+    pub(super) fn prepare(
+        length: Real,
+        inductance: &Matrix,
+        capacitance: &Matrix,
+    ) -> SpiceResult<Self> {
         propagation_modes(length, inductance, capacitance)
     }
 
@@ -59,6 +63,109 @@ impl CplModes {
     #[must_use]
     pub const fn characteristic_admittance(&self) -> &Matrix {
         &self.characteristic_admittance
+    }
+
+    /// Launch the **outgoing** modal wave at one physical port, where current
+    /// flows *into* the line. The wave is stored at twice its voltage
+    /// amplitude: modal voltage plus modal current divided by its
+    /// characteristic admittance. The counterpart's delayed launch
+    /// then supplies the received term in the modal current equation.
+    ///
+    /// No allocations, and the caller's output is unchanged on failure.
+    ///
+    /// # Errors
+    /// Wrong vector dimensions or nonfinite values/derived waves.
+    pub fn launch_into(
+        &self,
+        voltage: &[Real],
+        current: &[Real],
+        launched: &mut [Real],
+    ) -> SpiceResult<()> {
+        self.validate_port(voltage, current, launched)?;
+        let count = self.delays.len();
+        let mut pending = [0.; super::plan::MAX_CONDUCTORS];
+        for (mode, target) in pending.iter_mut().enumerate().take(count) {
+            let mut modal_voltage = 0.;
+            let mut modal_current = 0.;
+            for row in 0..count {
+                modal_voltage = self
+                    .current_basis
+                    .get(row, mode)
+                    .unwrap_or(0.)
+                    .mul_add(voltage[row], modal_voltage);
+                modal_current = self
+                    .voltage_basis
+                    .get(row, mode)
+                    .unwrap_or(0.)
+                    .mul_add(current[row], modal_current);
+            }
+            let value = modal_current / self.admittances[mode] + modal_voltage;
+            if !value.is_finite() {
+                return Err(SpiceError::circuit("CPL launched modal wave overflows"));
+            }
+            *target = value;
+        }
+        launched.copy_from_slice(&pending[..count]);
+        Ok(())
+    }
+
+    /// Compute physical currents into the line for the present conductor
+    /// voltages and the opposite port's *causally delayed* launched waves:
+    /// Conductor current equals characteristic admittance times conductor
+    /// voltage, minus the current-basis transform of delayed modal waves.
+    /// This is a purely lossless high-frequency relation, not the full
+    /// lossy CPL convolution. As with launch, inputs are checked and writes
+    /// are atomic; the caller owns all buffers.
+    ///
+    /// # Errors
+    /// Wrong dimensions or nonfinite voltages/waves/results.
+    pub fn receiving_currents_into(
+        &self,
+        voltage: &[Real],
+        received: &[Real],
+        current: &mut [Real],
+    ) -> SpiceResult<()> {
+        self.validate_port(voltage, received, current)?;
+        let count = self.delays.len();
+        let mut pending = [0.; super::plan::MAX_CONDUCTORS];
+        for (row, target) in pending.iter_mut().enumerate().take(count) {
+            let mut value = 0.;
+            for (col, &port_voltage) in voltage.iter().enumerate() {
+                value = self
+                    .characteristic_admittance
+                    .get(row, col)
+                    .unwrap_or(0.)
+                    .mul_add(port_voltage, value);
+            }
+            for (mode, &wave) in received.iter().enumerate() {
+                value = (-self.current_basis.get(row, mode).unwrap_or(0.) * self.admittances[mode])
+                    .mul_add(wave, value);
+            }
+            if !value.is_finite() {
+                return Err(SpiceError::circuit("CPL received modal current overflows"));
+            }
+            *target = value;
+        }
+        current.copy_from_slice(&pending[..count]);
+        Ok(())
+    }
+
+    fn validate_port(&self, voltage: &[Real], other: &[Real], output: &[Real]) -> SpiceResult<()> {
+        let count = self.delays.len();
+        if voltage.len() != count || other.len() != count || output.len() != count {
+            return Err(SpiceError::circuit(format!(
+                "CPL modal port width {count}, got {}/{}/{}",
+                voltage.len(),
+                other.len(),
+                output.len(),
+            )));
+        }
+        if voltage.iter().chain(other).any(|entry| !entry.is_finite()) {
+            return Err(SpiceError::circuit(
+                "CPL modal port contains nonfinite values",
+            ));
+        }
+        Ok(())
     }
 }
 

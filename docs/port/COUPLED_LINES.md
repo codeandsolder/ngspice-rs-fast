@@ -13,10 +13,9 @@ Current native substrate: src/devices/cpl/plan.rs and
 src/devices/cpl/model.rs, with scoped vector literalization in
 src/netlist/elaborate.rs. The internal src/devices/cpl/dc.rs device now
 implements real MNA branch rows for C-compatible OP/DC and linear DC
-assembly, but the public P-device registry remains disabled until the
-full transient propagation kernel is ready. The public P-device
-registration remains intentionally pending; parsing a model must not
-make an incomplete or uncoupled simulation silently executable.
+assembly. The public P-device registry remains intentionally disabled
+until the full lossy transient propagation kernel is ready; parsing a
+model must not silently execute an incomplete or uncoupled substitute.
 
 ## Physical model and validated geometry
 
@@ -57,8 +56,22 @@ The shared bounded Jacobi implementation also exposes a sorted,
 orthonormal eigenbasis via Matrix::symmetric_eigendecomposition.
 It accumulates rotations only when requested, so existing
 eigenvalue-only physical validations retain their cheaper path.
-Building the coupled forward/backward mode projection and characteristic
-admittance from that basis is the next transient prerequisite.
+The immutable CplPlan now stores a single CplModes with mode delays,
+power-reciprocal current/voltage bases, and the full positive-definite
+characteristic admittance Y0. With C/c_scale = S S^T, the symmetric
+basis Q diagonalizes S^T (L/l_scale) S. The physical bases are
+B_current = S Q and B_voltage = S^-T Q; they satisfy
+B_voltage^T B_current = identity, and the constructed characteristic
+admittance satisfies Y0 L Y0 = C. This includes off-diagonal
+matched-load coupling without assuming L and C commute.
+
+The allocation-free modal port interface launches the sum of modal
+voltage and modal current divided by modal admittance. At the other
+port, causally delayed received modal launches determine current as
+I = Y0 V - B_current diag(y_mode) received_launch. These identities
+describe only the lossless wavefront. General frequency-dependent
+R/G attenuation, convolution and accepted-step delay history remain
+separate requirements, never scalar per-conductor approximations.
 
 ## Front-end representation
 

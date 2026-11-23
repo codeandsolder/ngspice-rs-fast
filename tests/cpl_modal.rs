@@ -27,7 +27,10 @@ fn product(a: &Matrix, b: &Matrix) -> Matrix {
         for col in 0..b.cols() {
             let mut entry = 0.;
             for k in 0..a.cols() {
-                entry += a.get(row, k).unwrap() * b.get(k, col).unwrap();
+                entry = a
+                    .get(row, k)
+                    .unwrap()
+                    .mul_add(b.get(k, col).unwrap(), entry);
             }
             out.set(row, col, entry).unwrap();
         }
@@ -70,9 +73,7 @@ fn verify_lossless_modal_physics(plan: &CplPlan) {
     let c_max = c.data().iter().fold(0.0_f64, |v, e| v.max(e.abs()));
     assert!(
         discrepancy < c_max * 2e-10,
-        "YLY=C error {:.4e} / {:.4e}",
-        discrepancy,
-        c_max
+        "YLY=C error {discrepancy:.4e} / {c_max:.4e}"
     );
     for mode in 0..n {
         let admittance = modes.modal_admittances()[mode];
@@ -170,4 +171,112 @@ fn maximum_eight_conductors_have_valid_cross_modes_without_truncation() {
     let plan = CplPlan::prepare(MAX_CONDUCTORS, 1., &[], &l, &[], &c).unwrap();
     assert_eq!(plan.modes().delays().len(), MAX_CONDUCTORS);
     verify_lossless_modal_physics(&plan);
+}
+
+#[test]
+fn lossless_port_launch_and_delayed_receive_preserve_coupled_currents() {
+    let plan = CplPlan::prepare(
+        2,
+        0.8,
+        &[],
+        &[4e-7, 0.5e-7, 6e-7],
+        &[],
+        &[1e-10, -1.5e-11, 1.8e-10],
+    )
+    .unwrap();
+    let modes = plan.modes();
+    let voltage = [1.25, -0.3];
+    let y = modes.characteristic_admittance();
+    let mut matched_current = [0.; 2];
+    for (row, current) in matched_current.iter_mut().enumerate() {
+        *current = (0..2)
+            .map(|col| y.get(row, col).unwrap() * voltage[col])
+            .sum();
+    }
+    let mut launch = [0.; 2];
+    modes
+        .launch_into(&voltage, &matched_current, &mut launch)
+        .unwrap();
+    for (mode, &amplitude) in launch.iter().enumerate() {
+        let modal_voltage: f64 = (0..2)
+            .map(|row| modes.current_basis().get(row, mode).unwrap() * voltage[row])
+            .sum();
+        rel_close(amplitude, 2. * modal_voltage, 1e-12);
+    }
+
+    // At a port with zero incident wave, I=Y0 V. Recomputing currents
+    // from received=0 must match the physical characteristic admittance.
+    let mut computed = [0.; 2];
+    modes
+        .receiving_currents_into(&voltage, &[0., 0.], &mut computed)
+        .unwrap();
+    for (&actual, &expected) in computed.iter().zip(&matched_current) {
+        rel_close(actual, expected, 1e-12);
+    }
+    // Opposite port at zero voltage absorbs an arriving launched wave,
+    // with a nontrivial cross-conductor current driven by the other end.
+    modes
+        .receiving_currents_into(&[0., 0.], &launch, &mut computed)
+        .unwrap();
+    let mut back_launch = [31.; 2];
+    modes
+        .launch_into(&[0., 0.], &computed, &mut back_launch)
+        .unwrap();
+    for (actual, expected) in back_launch.iter().zip(&launch) {
+        rel_close(*actual, -*expected, 1e-12);
+    }
+}
+
+#[test]
+fn modal_wave_buffers_are_bounded_reusable_and_atomic_on_invalid_inputs() {
+    let n = MAX_CONDUCTORS;
+    let mut l = Vec::new();
+    let mut c = Vec::new();
+    for row in 0..n {
+        for col in row..n {
+            l.push(if row == col { 4e-7 } else { 0. });
+            c.push(if row == col { 1e-10 } else { 0. });
+        }
+    }
+    let plan = CplPlan::prepare(n, 2., &[], &l, &[], &c).unwrap();
+    let modes = plan.modes();
+    let mut output = [31.; MAX_CONDUCTORS];
+    let voltage = [1.; MAX_CONDUCTORS];
+    let current = [0.; MAX_CONDUCTORS];
+    modes.launch_into(&voltage, &current, &mut output).unwrap();
+    let launched = output;
+    assert!(launched.iter().all(|value| value.is_finite()));
+    let mut received = [44.; MAX_CONDUCTORS];
+    assert!(
+        modes
+            .launch_into(&[f64::NAN; MAX_CONDUCTORS], &current, &mut received)
+            .is_err()
+    );
+    assert_eq!(received, [44.; MAX_CONDUCTORS]);
+    assert!(
+        modes
+            .launch_into(&voltage[..3], &current, &mut received)
+            .is_err()
+    );
+    assert_eq!(received, [44.; MAX_CONDUCTORS]);
+    let mut huge_current = [0.; MAX_CONDUCTORS];
+    huge_current[0] = f64::MAX;
+    // The modal impedance is much larger than 1 ohm, so a finite
+    // current overflows the corresponding launched voltage wave.
+    assert!(
+        modes
+            .launch_into(&voltage, &huge_current, &mut received)
+            .is_err()
+    );
+    assert_eq!(received, [44.; MAX_CONDUCTORS]);
+    assert!(
+        modes
+            .receiving_currents_into(&voltage, &[f64::INFINITY; MAX_CONDUCTORS], &mut received)
+            .is_err()
+    );
+    assert_eq!(received, [44.; MAX_CONDUCTORS]);
+    modes
+        .receiving_currents_into(&[0.; MAX_CONDUCTORS], &launched, &mut received)
+        .unwrap();
+    assert!(received.iter().all(|value| value.is_finite()));
 }
