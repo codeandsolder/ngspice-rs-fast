@@ -10,8 +10,7 @@ use crate::analysis::{AnalysisPlan, Plot, PointSink};
 use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
 use crate::maths::Vector;
-use crate::maths::complex::ComplexMatrix;
-use crate::maths::sparse13::ComplexFactorBatch;
+use crate::maths::complex::{ComplexFactorBatch, ComplexMatrix};
 use crate::primitives::{Complex, Real, SpiceResult};
 
 pub(super) fn run(

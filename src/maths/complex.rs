@@ -10,9 +10,19 @@ use crate::maths::linear::{
     BatchSolveFailure, CachedFrame, ComplexFactors, PivotTolerances, SolveBatchWorkspace,
     check_status, numerical, order_fresh, square,
 };
-use crate::maths::sparse13::{ComplexFactorBatch, Sparse, Status};
+use crate::maths::sparse13::{LaneParts, Sparse, Status};
 use crate::maths::{FactorStorage, FactorWork, Pattern, SparseMatrix};
 use crate::primitives::{Complex, SpiceResult};
+
+/// Numeric work for a four-lane complex-factorization tile. Unlike the
+/// factor snapshots, the three packed planes are mutable and reused by
+/// the owning spectral analysis between independent frequency groups.
+#[derive(Default)]
+pub(crate) struct ComplexFactorBatch {
+    pub(super) values: Vec<LaneParts>,
+    pub(super) scratch: Vec<LaneParts>,
+    pub(super) inverses: Vec<LaneParts>,
+}
 
 /// Capacitive contributions grouped at a single matrix element.
 ///
@@ -414,7 +424,7 @@ impl ComplexMatrix {
 
     /// Factor up to four independent frequency points sharing a circuit
     /// pattern. The first point establishes the reference pivot order;
-    /// subsequent points use one AoSoA numeric traversal and independent
+    /// subsequent points use one `AoSoA` numeric traversal and independent
     /// scalar reorders for exceptional lanes. The final factor is committed
     /// to the circuit cache for the next spectral analysis.
     ///
