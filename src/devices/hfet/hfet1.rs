@@ -435,6 +435,20 @@ struct Nodes {
     dpp: NodeId,
 }
 
+impl Nodes {
+    /// Conductances of physically distinct edges in the prepared topology.
+    fn series(self, derived: &Derived) -> [Real; 5] {
+        let edge = |a, b, g| if a == b { 0. } else { g };
+        [
+            edge(self.d, self.dp, derived.gdpr),
+            edge(self.s, self.sp, derived.gspr),
+            edge(self.g, self.gp, derived.ggate),
+            edge(self.sp, self.spp, derived.tgi),
+            edge(self.dp, self.dpp, derived.tgf),
+        ]
+    }
+}
+
 /// HFET1, `Z` level 5.
 #[derive(Debug, Clone)]
 pub(in crate::devices) struct Hfet1 {
@@ -1421,13 +1435,7 @@ impl Device for Hfet1 {
         let n = self.nodes;
         let (ggs, ggd, gmg, gmd) = (point.ggs, point.ggd, point.gmg, point.gmd);
         let (gm, gds) = (point.gm, point.gds);
-        let (gdpr, gspr, ggate, tgi, tgf) = (
-            derived.gdpr,
-            derived.gspr,
-            derived.ggate,
-            derived.tgi,
-            derived.tgf,
-        );
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&derived);
         let ceqgd = pol
             * f64::mul_add(
                 ggdpp,
@@ -1538,13 +1546,7 @@ impl Device for Hfet1 {
                 .mul_add(1. + ((f - derived.fgds) / derived.delf).tanh(), 1.);
         }
         let n = self.nodes;
-        let (gdpr, gspr, ggate, tgi, tgf) = (
-            derived.gdpr,
-            derived.gspr,
-            derived.ggate,
-            derived.tgi,
-            derived.tgf,
-        );
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&derived);
         for (a, b, value) in [
             (n.d, n.d, m * gdpr),
             (n.s, n.s, m * gspr),
@@ -2092,13 +2094,7 @@ impl Device for ResetHfet1 {
         }
         let m = current.instance.m;
         let n = current.nodes;
-        let (gdpr, gspr, ggate, tgi, tgf) = (
-            derived.gdpr,
-            derived.gspr,
-            derived.ggate,
-            derived.tgi,
-            derived.tgf,
-        );
+        let [gdpr, gspr, ggate, tgi, tgf] = n.series(&derived);
         let real = [
             (n.d, n.d, m * gdpr),
             (n.s, n.s, m * gspr),

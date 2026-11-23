@@ -312,6 +312,16 @@ struct Nodes {
     dp: NodeId,
 }
 
+impl Nodes {
+    /// A resistance between aliased prepared nodes has no series branch.
+    fn series(self, derived: &Derived) -> [Real; 2] {
+        [
+            if self.d == self.dp { 0. } else { derived.gdpr },
+            if self.s == self.sp { 0. } else { derived.gspr },
+        ]
+    }
+}
+
 /// HFET2, `Z` level 6.
 #[derive(Debug, Clone)]
 pub(in crate::devices) struct Hfet2 {
@@ -873,7 +883,7 @@ impl Device for Hfet2 {
         let n = self.nodes;
         let (ggs, ggd) = (point.ggs, point.ggd);
         let (gm, gds, cgd, cg) = (point.gm, point.gds, point.cgd, point.cg);
-        let (gdpr, gspr) = (derived.gdpr, derived.gspr);
+        let [gdpr, gspr] = n.series(&derived);
         let ceqgd = pol * f64::mul_add(ggd, -point.vgd, cgd);
         let ceqgs = pol * f64::mul_add(ggs, -point.vgs, cg - cgd);
         let cdreq = pol
@@ -945,8 +955,8 @@ impl Device for Hfet2 {
         let m = self.instance.m;
         let point = self.point(&derived, vgs, vgd)?;
         let (gm, gds, ggs, ggd) = (point.gm, point.gds, point.ggs, point.ggd);
-        let (gdpr, gspr) = (derived.gdpr, derived.gspr);
         let n = self.nodes;
+        let [gdpr, gspr] = n.series(&derived);
         for (a, b, value) in [
             (n.d, n.d, m * gdpr),
             (n.g, n.g, m * (ggd + ggs)),
@@ -1327,9 +1337,9 @@ impl Device for ResetHfet2 {
         let point = state.point(&state.derived(temperature)?, zero, zero)?;
         let derived = self.current.derived(temperature)?;
         let (gm, gds, ggs, ggd) = (point.gm, point.gds, point.ggs, point.ggd);
-        let (gdpr, gspr) = (derived.gdpr, derived.gspr);
         let m = self.current.instance.m;
         let n = self.current.nodes;
+        let [gdpr, gspr] = n.series(&derived);
         let stamps = [
             (n.d, n.d, m * gdpr),
             (n.g, n.g, m * (ggd + ggs)),

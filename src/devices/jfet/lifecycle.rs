@@ -591,6 +591,10 @@ impl GateStamp<'_> {
         let cdreq = t * f64::mul_add(gm, -vgs, f64::mul_add(gds, -vds, cd + cgd));
         let [d, g, s] = [0, 1, 2].map(|k| terminals[k]);
         let [dp, _, sp] = inner;
+        // A perturbation cannot create an edge between prepared aliases:
+        // remove its conductance before summing an intrinsic diagonal.
+        let gdpr = if d == dp { 0. } else { gdpr };
+        let gspr = if s == sp { 0. } else { gspr };
         context.stamp_rhs(g, m * (-ceqgs - ceqgd))?;
         context.stamp_rhs(dp, m * (-cdreq + ceqgd))?;
         context.stamp_rhs(sp, m * (cdreq + ceqgs))?;

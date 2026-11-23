@@ -511,3 +511,30 @@ fn sensitivity_perturbs_the_temperature_in_celsius() {
         1e-15,
     );
 }
+
+/// HFET1/2 retain their setup alias graph while a sensitivity record changes
+/// zero-ohm series fields. None can contribute an imaginary circuit edge.
+#[test]
+fn hfet_alias_series_parameters_remain_unobservable() {
+    for level in [5, 6] {
+        let netlist = deck(&format!(
+            "vd 1 0 dc 1.5\nvis 1 2 dc 0\nvg 3 0 dc 0.5\n\
+             z1 2 3 0 hm l=2u w=20u\n.model hm nhfet level={level} rd=0 rs=0\n\
+             .sens i(vis)"
+        ))
+        .unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let request = config.plan_for(&netlist.analyses[0]).unwrap();
+        let mut c = config.circuit(&netlist).unwrap();
+        let plot = request.run(&mut c, &config.context()).unwrap();
+        let parameters = if level == 5 {
+            &["rd", "rs", "rg", "ri", "rf"][..]
+        } else {
+            &["rd", "rs"][..]
+        };
+        for &field in parameters {
+            let column = format!("v(z1:{field})");
+            assert_eq!(value(&plot, &column, 0), 0., "HFET{level} {column}");
+        }
+    }
+}

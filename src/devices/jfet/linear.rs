@@ -58,6 +58,9 @@ fn gate_entries(
     use GateCapacitance as Cap;
     let [d, g, s] = [0, 1, 2].map(|k| terminals[k]);
     let [dp, _, sp] = inner;
+    // Apply the DC topology rule before grouping AC and PZ diagonals.
+    let gdpr = if d == dp { 0. } else { gdpr };
+    let gspr = if s == sp { 0. } else { gspr };
     let [gg, dd, ss] = if mes_pencil {
         // mespzld.c's actual left-associated expressions. Do not correct
         // C's precedence mistake by scaling the whole diagonal.
