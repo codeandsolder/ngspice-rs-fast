@@ -394,6 +394,55 @@ pub struct CircuitCandidate<'a> {
     prepared: Option<PreparedCandidate>,
 }
 
+/// Prefer the allocation-free two-slot context. On overflow, move
+/// already validated site identities into a sparse worker-local list.
+fn append_numeric_override(
+    fixed: &mut ModelContext,
+    sparse: &mut Option<Vec<CandidateNumericOverride>>,
+    baseline: ModelContext,
+    next: CandidateNumericOverride,
+    capacity: usize,
+) -> SpiceResult<()> {
+    if let Some(values) = sparse {
+        values.push(next);
+        return Ok(());
+    }
+    let updated = match next {
+        CandidateNumericOverride::Resistor(value) => fixed.with_resistor_override(value),
+        CandidateNumericOverride::Instance(value) => fixed.with_instance_override(value),
+    };
+    if let Ok(updated) = updated {
+        *fixed = updated;
+        return Ok(());
+    }
+    let mut values = Vec::new();
+    values.try_reserve(capacity).map_err(|error| {
+        SpiceError::circuit(format!(
+            "cannot allocate candidate numeric overlay: {error}"
+        ))
+    })?;
+    values.extend(
+        fixed
+            .resistor_overrides
+            .iter()
+            .flatten()
+            .copied()
+            .map(CandidateNumericOverride::Resistor),
+    );
+    values.extend(
+        fixed
+            .instance_overrides
+            .iter()
+            .flatten()
+            .copied()
+            .map(CandidateNumericOverride::Instance),
+    );
+    values.push(next);
+    *sparse = Some(values);
+    *fixed = baseline;
+    Ok(())
+}
+
 impl CircuitCandidate<'_> {
     /// The baseline circuit or the current candidate's own finalized circuit.
     #[must_use]
@@ -719,58 +768,22 @@ impl CircuitCandidate<'_> {
                     continue;
                 }
             };
-            match selected {
-                Ok(replacement) => {
-                    if let Some(values) = &mut extra {
-                        values.push(replacement);
-                    } else {
-                        let fixed = match replacement {
-                            CandidateNumericOverride::Resistor(value) => {
-                                fixed_context.with_resistor_override(value)
-                            }
-                            CandidateNumericOverride::Instance(value) => {
-                                fixed_context.with_instance_override(value)
-                            }
-                        };
-                        match fixed {
-                            Ok(next) => fixed_context = next,
-                            Err(_) => {
-                                let mut values = Vec::new();
-                                values.try_reserve(self.plan.sites.len()).map_err(|error| {
-                                    SpiceError::circuit(format!(
-                                        "cannot allocate candidate numeric overlay: {error}"
-                                    ))
-                                })?;
-                                values.extend(
-                                    fixed_context
-                                        .resistor_overrides
-                                        .iter()
-                                        .flatten()
-                                        .copied()
-                                        .map(CandidateNumericOverride::Resistor),
-                                );
-                                values.extend(
-                                    fixed_context
-                                        .instance_overrides
-                                        .iter()
-                                        .flatten()
-                                        .copied()
-                                        .map(CandidateNumericOverride::Instance),
-                                );
-                                values.push(replacement);
-                                extra = Some(values);
-                                fixed_context = baseline_context;
-                            }
-                        }
-                    }
-                }
-                Err(_) => structural = true,
+            if let Ok(replacement) = selected {
+                append_numeric_override(
+                    &mut fixed_context,
+                    &mut extra,
+                    baseline_context,
+                    replacement,
+                    self.plan.sites.len(),
+                )?;
+            } else {
+                structural = true;
             }
         }
-        let (context, overrides) = match extra {
-            Some(overrides) => (baseline_context, overrides),
-            None => (fixed_context, Vec::new()),
-        };
+        let (context, overrides) = extra.map_or_else(
+            || (fixed_context, Vec::new()),
+            |sparse| (baseline_context, sparse),
+        );
         if !structural
             && self
                 .baseline

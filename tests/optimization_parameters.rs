@@ -211,6 +211,52 @@ fn one_hundred_twenty_eight_typed_resistor_sites_keep_numeric_fidelity_and_aba_s
 }
 
 #[test]
+fn multiple_instance_setters_on_one_device_preserve_order_and_atomicity() {
+    // One independent voltage source supports three independent typed
+    // numeric setters (DC bias, AC magnitude and AC phase) without a model
+    // selector or geometry change.
+    let netlist = |bias: f64, magnitude: f64, phase: f64| {
+        deck(&format!(
+            ".param bias={bias} mag={magnitude} phase={phase}\n\
+             v1 in 0 dc {{bias}} ac {{mag}} {{phase}}\n\
+             r1 in out 1k\n\
+             r2 out 0 2k"
+        ))
+    };
+    let plan = CircuitParameterPlan::new(netlist(10., 1., 0.), &["bias", "mag", "phase"]).unwrap();
+    let mut session = plan.session().unwrap();
+    let ac = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "1", "1k", "1k"])
+        .resolve()
+        .unwrap();
+    for &(bias, magnitude, phase) in &[(8., 2., 30.), (7., 1.5, 120.), (8., 2., 30.), (10., 1., 0.)]
+    {
+        session
+            .update(&[bias, magnitude, phase], &mut EvalBudget::default())
+            .unwrap();
+        assert_eq!(session.topology(), CandidateTopology::Reused);
+        let expected_netlist = netlist(bias, magnitude, phase);
+        same_linear(&mut session, &expected_netlist);
+        let actual_context = session.analysis_context();
+        let actual = ac.run(session.circuit_mut(), &actual_context).unwrap();
+        let mut fresh = Circuit::from_netlist(&expected_netlist).unwrap();
+        let expected = ac.run(&mut fresh, &AnalysisContext::default()).unwrap();
+        for variable in expected.variables() {
+            let a = actual.value(&variable.name, 0).unwrap();
+            let b = expected.value(&variable.name, 0).unwrap();
+            close(a.re, b.re);
+            close(a.im, b.im);
+        }
+    }
+    assert!(
+        session
+            .update(&[f64::NAN, 3., 45.], &mut EvalBudget::default())
+            .is_err()
+    );
+    assert_eq!(session.topology(), CandidateTopology::Reused);
+    same_linear(&mut session, &netlist(10., 1., 0.));
+}
+
+#[test]
 fn model_selectors_and_geometry_rebuild_and_failure_is_atomic() {
     let source = deck(
         ".param size=2 isat=1e-14 temp=27\n.option temp={temp}\nv1 in 0 2\nr1 in a 1k\nd1 a 0 dm area={size}\n.model dm d(is={isat})",

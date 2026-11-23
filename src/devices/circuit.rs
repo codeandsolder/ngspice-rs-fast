@@ -176,7 +176,7 @@ struct TopologyBindings {
 }
 
 /// Independently validated numeric candidate sites, in netlist setter order.
-/// A worker owns these values without changing the `Copy` ModelContext or the
+/// A worker owns these values without changing the `Copy` `ModelContext` or the
 /// original immutable device recipes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CandidateNumericOverride {
@@ -889,6 +889,35 @@ impl fmt::Debug for Circuit {
             )
             .finish_non_exhaustive()
     }
+}
+
+fn assemble_numeric_targets(
+    context: &ModelContext,
+    overrides: &[CandidateNumericOverride],
+    count: usize,
+) -> SpiceResult<Vec<CandidateNumericOverride>> {
+    let mut targets = Vec::new();
+    targets.try_reserve(count).map_err(|error| {
+        SpiceError::circuit(format!("cannot allocate candidate device sites: {error}"))
+    })?;
+    targets.extend(
+        context
+            .resistor_overrides
+            .iter()
+            .flatten()
+            .copied()
+            .map(CandidateNumericOverride::Resistor),
+    );
+    targets.extend(
+        context
+            .instance_overrides
+            .iter()
+            .flatten()
+            .copied()
+            .map(CandidateNumericOverride::Instance),
+    );
+    targets.extend_from_slice(overrides);
+    Ok(targets)
 }
 
 impl Circuit {
@@ -2575,6 +2604,63 @@ impl Circuit {
         self.replacements_with_overrides(context, &self.runtime.candidate_overrides)
     }
 
+    fn single_candidate_replacement(
+        &self,
+        context: &ModelContext,
+        overrides: &[CandidateNumericOverride],
+    ) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
+        // A single setter is the common DC/optimizer case: construct its
+        // validated device directly, without maps or staging allocations.
+        let target = context
+            .resistor_overrides
+            .iter()
+            .flatten()
+            .copied()
+            .map(CandidateNumericOverride::Resistor)
+            .chain(
+                context
+                    .instance_overrides
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .map(CandidateNumericOverride::Instance),
+            )
+            .chain(overrides.iter().copied())
+            .next()
+            .ok_or_else(|| SpiceError::circuit("missing candidate override"))?;
+        let topology = self.topology_id()?;
+        let ordinal = target.device();
+        let original = self
+            .devices
+            .get(ordinal)
+            .ok_or_else(|| SpiceError::circuit("stale candidate device override"))?;
+        let device = match target {
+            CandidateNumericOverride::Resistor(value) => {
+                if value.topology() != topology {
+                    return Err(SpiceError::circuit("foreign or stale resistor override"));
+                }
+                if original.terminals().len() != 2 || original.resistor_metadata().is_none() {
+                    return Err(SpiceError::circuit(format!(
+                        "resistor override targets {}, which is not a two-terminal resistor",
+                        original.name()
+                    )));
+                }
+                original.with_instance_parameter("resistance", value.supplied(), context)?
+            }
+            CandidateNumericOverride::Instance(value) => {
+                if value.topology() != topology {
+                    return Err(SpiceError::circuit("foreign or stale instance override"));
+                }
+                original.with_instance_parameter(value.parameter(), value.value(), context)?
+            }
+        };
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.setters += 1);
+        let replacements = vec![(ordinal, device)];
+        self.validate_replacements(&replacements)?;
+        Ok(replacements)
+    }
+
     fn replacements_with_overrides(
         &self,
         context: &ModelContext,
@@ -2587,79 +2673,10 @@ impl Circuit {
             return Ok(Vec::new());
         }
         if count == 1 {
-            // A single setter is the common DC/optimizer case: construct its
-            // validated device directly, without maps or staging allocations.
-            let target = context
-                .resistor_overrides
-                .iter()
-                .flatten()
-                .copied()
-                .map(CandidateNumericOverride::Resistor)
-                .chain(
-                    context
-                        .instance_overrides
-                        .iter()
-                        .flatten()
-                        .copied()
-                        .map(CandidateNumericOverride::Instance),
-                )
-                .chain(overrides.iter().copied())
-                .next()
-                .ok_or_else(|| SpiceError::circuit("missing candidate override"))?;
-            let topology = self.topology_id()?;
-            let ordinal = target.device();
-            let original = self
-                .devices
-                .get(ordinal)
-                .ok_or_else(|| SpiceError::circuit("stale candidate device override"))?;
-            let device = match target {
-                CandidateNumericOverride::Resistor(value) => {
-                    if value.topology() != topology {
-                        return Err(SpiceError::circuit("foreign or stale resistor override"));
-                    }
-                    if original.terminals().len() != 2 || original.resistor_metadata().is_none() {
-                        return Err(SpiceError::circuit(format!(
-                            "resistor override targets {}, which is not a two-terminal resistor",
-                            original.name()
-                        )));
-                    }
-                    original.with_instance_parameter("resistance", value.supplied(), context)?
-                }
-                CandidateNumericOverride::Instance(value) => {
-                    if value.topology() != topology {
-                        return Err(SpiceError::circuit("foreign or stale instance override"));
-                    }
-                    original.with_instance_parameter(value.parameter(), value.value(), context)?
-                }
-            };
-            #[cfg(test)]
-            preparation_metrics::record(|counts| counts.setters += 1);
-            let replacements = vec![(ordinal, device)];
-            self.validate_replacements(&replacements)?;
-            return Ok(replacements);
+            return self.single_candidate_replacement(context, overrides);
         }
 
-        let mut targets = Vec::new();
-        targets.try_reserve(count).map_err(|error| {
-            SpiceError::circuit(format!("cannot allocate candidate device sites: {error}"))
-        })?;
-        targets.extend(
-            context
-                .resistor_overrides
-                .iter()
-                .flatten()
-                .copied()
-                .map(CandidateNumericOverride::Resistor),
-        );
-        targets.extend(
-            context
-                .instance_overrides
-                .iter()
-                .flatten()
-                .copied()
-                .map(CandidateNumericOverride::Instance),
-        );
-        targets.extend_from_slice(overrides);
+        let targets = assemble_numeric_targets(context, overrides, count)?;
         let topology = self.topology_id()?;
         let mut replacements: Vec<(usize, Box<dyn Device>)> = Vec::new();
         let mut device_slots = BTreeMap::<usize, usize>::new();
@@ -2719,26 +2736,23 @@ impl Circuit {
                     }
                     #[cfg(test)]
                     preparation_metrics::record(|counts| counts.setters += 1);
-                    match device_slots.get(&ordinal).copied() {
-                        Some(index) => {
-                            let previous = replacements[index].1.as_ref();
-                            replacements[index].1 = previous.with_instance_parameter(
+                    if let Some(index) = device_slots.get(&ordinal).copied() {
+                        let previous = replacements[index].1.as_ref();
+                        replacements[index].1 = previous.with_instance_parameter(
+                            value.parameter(),
+                            value.value(),
+                            context,
+                        )?;
+                    } else {
+                        device_slots.insert(ordinal, replacements.len());
+                        replacements.push((
+                            ordinal,
+                            original.with_instance_parameter(
                                 value.parameter(),
                                 value.value(),
                                 context,
-                            )?;
-                        }
-                        None => {
-                            device_slots.insert(ordinal, replacements.len());
-                            replacements.push((
-                                ordinal,
-                                original.with_instance_parameter(
-                                    value.parameter(),
-                                    value.value(),
-                                    context,
-                                )?,
-                            ));
-                        }
+                            )?,
+                        ));
                     }
                 }
             }

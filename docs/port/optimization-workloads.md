@@ -26,6 +26,37 @@ Related issues: #111 (this workload), #112 (parameter dependency/variation plan)
 and refinement). Do not introduce an optimization algorithm or fitness convention
 into core numerical execution.
 
+## Current prepared candidate execution (2026-11-23)
+
+`CircuitParameterPlan` compiles parameter dependencies once. Persistent CPU
+workers own independent topology, state, and numerical scratch. The dispatcher
+streams compact objective results with stable IDs and a bounded 2×worker
+outstanding window; statistics record active workers and reorder occupancy.
+
+Validated scalar changes to one or two sites use the existing copyable
+`ModelContext` overrides. Larger sets use a worker-owned sparse numeric
+overlay without re-elaborating unchanged topology. The real prepared-device
+path validates device setters, coupling, state layout and branch identity;
+model/structural changes retain the full scalar rebuild. Failed candidate
+preparation is atomic.
+
+`tests/optimization_ensemble_bench.rs` covers 1k/10k/100k candidates, 8–128
+parameters, central pairs, sparse/dense seeded directions, DC/AC/transient
+objectives, one/four workers, ordered digest equality, occupancy and peak RSS.
+Its opt-in release run:
+
+~~~sh
+cargo +nightly test --release --locked --test optimization_ensemble_bench large_independent_candidate_cloud -- --ignored --nocapture
+~~~
+
+On Acer's initial non-isolated release runs, three changed sites across
+64 dimensions improved from 3.29 s to 0.63 s for 10k candidates; 1k dense
+64-dimensional DC candidates improved from 0.37 s to 0.11 s; 1k dense
+128-dimensional AC candidates from 0.67 s to 0.24 s. Numerical-only
+full rebuilds went to zero. Single-site timings varied with concurrent
+CI load and require an isolated A/B benchmark. SIMD lane compaction remains
+experimental; the persistent CPU-worker scheduler is the default.
+
 ## Reproducible baseline
 
 `tests/optimization_workloads_bench.rs` exercises arbitrary deterministic
@@ -90,9 +121,7 @@ formula. This is strong evidence for prioritizing reusable topology and
 parameter slots, not a general speedup claim for nonlinear/transient
 optimization. Test execution time 1.59s; build times excluded.
 
-The existing reference includes two topology strategies but the simulator
-does not yet support arbitrary prepared numeric parameter evaluation or
-general independent multi-analysis sessions. #112/#113 must add those
-without introducing state leakage. #114 tracks selective objective
-execution; #115 tracks reuse of sensitivities/adjoints to avoid repeated
-primal solves for smooth objectives.
+At the date of the initial benchmark, only two-site overrides were
+available. The general prepared candidate and objective-only dispatcher
+subsequently landed; their current contract is described above. #115
+tracks reuse of sensitivities and adjoints for smooth objectives.
