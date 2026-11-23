@@ -656,6 +656,116 @@ impl<I: PlanIndex> FactorRuns<I> {
         Ok(())
     }
 
+    /// Refactor distinct numeric matrices with one immutable symbolic plan.
+    /// Coefficients and row scratch are packed by element/row into four SIMD
+    /// lanes. Pivots are independent; exceptional Schur updates use the
+    /// scalar range-preserving kernel for that lane.
+    fn refactor_independent_tile(
+        &self,
+        values: &mut [LaneParts],
+        diag: &[usize],
+        scratch: &mut [LaneParts],
+        inverses: &mut [LaneParts],
+        statuses: &mut [Status; RHS_BATCH_WIDTH],
+        count: usize,
+    ) {
+        for step in 2..=self.columns.runs.len() {
+            for entry in self.columns.all(step) {
+                let (handle, row) = entry.indices();
+                scratch[row] = values[handle];
+            }
+            for entry in self.columns.before_diagonal(step) {
+                let (handle, row) = entry.indices();
+                let upper = scratch[row];
+                values[handle] = upper;
+                let pivot = values[diag[row]];
+                let mut multiplier = LaneParts::ZERO;
+                let mut normal = [false; RHS_BATCH_WIDTH];
+                let mut enabled = [false; RHS_BATCH_WIDTH];
+                for lane in 0..count {
+                    if statuses[lane] != Status::Okay {
+                        continue;
+                    }
+                    let numerator = upper.get::<Complex>(lane);
+                    if !numerator.is_zero() {
+                        let factor = numerator.quotient(
+                            pivot.get::<Complex>(lane),
+                            inverses[row].get::<Complex>(lane),
+                        );
+                        multiplier.set(lane, factor);
+                        normal[lane] = factor.normal_multiplier();
+                        enabled[lane] = true;
+                    }
+                }
+                if !enabled[..count].contains(&true) {
+                    continue;
+                }
+                for entry in self.columns.after_diagonal(row) {
+                    let (handle, target) = entry.indices();
+                    let original = scratch[target];
+                    let lower = values[handle];
+                    let product = LaneParts {
+                        re: multiplier.re * lower.re - multiplier.im * lower.im,
+                        im: multiplier.re * lower.im + multiplier.im * lower.re,
+                    };
+                    let mut result = LaneParts {
+                        re: original.re - product.re,
+                        im: original.im - product.im,
+                    };
+                    for lane in 0..count {
+                        if !enabled[lane] {
+                            continue;
+                        }
+                        let acc = original.get::<Complex>(lane);
+                        let candidate = result.get::<Complex>(lane);
+                        let norm = candidate.re.abs() + candidate.im.abs();
+                        let scale = (acc.re.abs() + acc.im.abs()) * 0.0625;
+                        let numerator = upper.get::<Complex>(lane);
+                        let coefficient = lower.get::<Complex>(lane);
+                        if !((normal[lane] && norm.is_normal() && norm > scale)
+                            || (candidate.is_finite()
+                                && (numerator.is_zero() || coefficient.is_zero())))
+                        {
+                            result.set(
+                                lane,
+                                acc.schur(
+                                    pivot.get::<Complex>(lane),
+                                    numerator,
+                                    multiplier.get::<Complex>(lane),
+                                    coefficient,
+                                    normal[lane],
+                                ),
+                            );
+                        }
+                    }
+                    let mask = LaneMask::from_array(enabled);
+                    scratch[target] = LaneParts::select(mask, result, original);
+                }
+            }
+            for entry in self.columns.after_diagonal(step) {
+                let (handle, row) = entry.indices();
+                values[handle] = scratch[row];
+            }
+            for lane in 0..count {
+                if statuses[lane] != Status::Okay {
+                    continue;
+                }
+                let pivot = scratch[step].get::<Complex>(lane);
+                statuses[lane] = if pivot.is_zero() {
+                    Status::ZeroDiag
+                } else if !pivot.is_finite() {
+                    Status::NonFinite
+                } else {
+                    Status::Okay
+                };
+                if statuses[lane] == Status::Okay {
+                    values[diag[step]].set(lane, pivot);
+                    inverses[step].set(lane, pivot.cached_recip());
+                }
+            }
+        }
+    }
+
     fn solve<T: Scalar>(
         &self,
         values: &[T],
@@ -3207,6 +3317,114 @@ impl DeterminantScale for Complex {
             scale_power(self.re, exponent),
             scale_power(self.im, exponent),
         )
+    }
+}
+
+impl Sparse<Complex> {
+    /// Pack up to four independent, identically ordered numeric frames into
+    /// a SIMD factor tile. Returns None when their symbolic plans differ.
+    /// Every output keeps its own factors and status, including a failing lane.
+    pub(super) fn factor_independent_tile(frames: &mut [Self]) -> Option<Vec<Status>> {
+        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
+
+        if !(2..=RHS_BATCH_WIDTH).contains(&frames.len()) {
+            return None;
+        }
+        let first = &frames[0];
+        if first.size == 0 || !first.coefficients_loaded() {
+            return None;
+        }
+        let Lifecycle::Symbolic(plan) = &first.lifecycle else {
+            return None;
+        };
+        let plan = std::sync::Arc::clone(plan);
+        let topology = std::sync::Arc::clone(&first.topology);
+        let size = first.size;
+        let values_len = first.values.len();
+        if frames.iter().any(|frame| {
+            !frame.coefficients_loaded()
+                || !matches!(&frame.lifecycle, Lifecycle::Symbolic(other)
+                    if std::sync::Arc::ptr_eq(other, &plan))
+                || !std::sync::Arc::ptr_eq(&frame.topology, &topology)
+        }) {
+            return None;
+        }
+        let count = frames.len();
+        let mut values = Vec::new();
+        let mut scratch = Vec::new();
+        let mut inverses = Vec::new();
+        let allocated = sparse_reserve(&mut values, values_len)
+            .and_then(|()| sparse_reserve(&mut scratch, size + 1))
+            .and_then(|()| sparse_reserve(&mut inverses, size + 1))
+            .and_then(|()| {
+                for frame in frames.iter_mut() {
+                    frame.prepare_inverses()?;
+                }
+                Ok(())
+            });
+        if allocated.is_err() {
+            return Some(vec![Status::Resource; count]);
+        }
+        values.resize(values_len, LaneParts::ZERO);
+        scratch.resize(size + 1, LaneParts::ZERO);
+        inverses.resize(size + 1, LaneParts::ZERO);
+        for (lane, frame) in frames.iter().enumerate() {
+            for (packed, &value) in values.iter_mut().zip(&frame.values) {
+                packed.set(lane, value);
+            }
+        }
+        let mut status = [Status::Okay; RHS_BATCH_WIDTH];
+        let first_pivot = topology.diag[1];
+        for lane in 0..count {
+            let pivot = values[first_pivot].get::<Complex>(lane);
+            status[lane] = if pivot.is_zero() {
+                Status::ZeroDiag
+            } else if !pivot.is_finite() {
+                Status::NonFinite
+            } else {
+                inverses[1].set(lane, pivot.cached_recip());
+                Status::Okay
+            };
+        }
+        match plan.as_ref() {
+            FactorPlan::Compact(runs) => runs.refactor_independent_tile(
+                &mut values,
+                &topology.diag,
+                &mut scratch,
+                &mut inverses,
+                &mut status,
+                count,
+            ),
+            FactorPlan::Wide(runs) => runs.refactor_independent_tile(
+                &mut values,
+                &topology.diag,
+                &mut scratch,
+                &mut inverses,
+                &mut status,
+                count,
+            ),
+        }
+        for (lane, frame) in frames.iter_mut().enumerate() {
+            if status[lane] == Status::Okay
+                && values.iter().any(|v| !v.get::<Complex>(lane).is_finite())
+            {
+                status[lane] = Status::NonFinite;
+            }
+            if status[lane] == Status::Okay {
+                for (dst, packed) in frame.values.iter_mut().zip(&values) {
+                    *dst = packed.get::<Complex>(lane);
+                }
+                for (dst, packed) in frame.inverses.iter_mut().zip(&inverses) {
+                    *dst = packed.get::<Complex>(lane);
+                }
+                status[lane] = frame.done();
+            }
+            frame.last_attempt = Some(FactorAttempt {
+                path: AttemptPath::Refactor,
+                status: status[lane],
+            });
+        }
+        Some(status[..count].to_vec())
     }
 }
 

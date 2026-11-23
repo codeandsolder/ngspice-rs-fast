@@ -41,22 +41,42 @@ pub(super) fn run(
     // pivot. See [`ac_matrix`].
     let shared: &Circuit = circuit;
     let mut point = Vec::with_capacity(plot.variable_count());
-    for &f in grid {
-        let x = small_signal.at_frequency(context, f, |system| {
-            ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
-                .factorize()?
-                .solve(&system.ac_rhs())
-        })?;
+    let mut emit = |f: Real, solution: Vec<Complex>, state: &SmallSignal<'_>| -> SpiceResult<()> {
         point.clear();
         point.push(Complex::real(f));
-        point.extend(x);
+        point.extend(solution);
         point.extend(
-            small_signal
+            state
                 .prepared()
                 .observe_parameters(&context.model_context().with_frequency(f))?,
         );
         plot.check_point(&point)?;
-        sink.point(&point)?;
+        sink.point(&point)
+    };
+    // Independent frequencies can share a symbolic order without borrowing
+    // another point's numeric pivots. A hertz-dependent DC solve must retain
+    // its scalar continuation and device-state side effects.
+    if grid.len() >= 4 && !small_signal.varies() && !small_signal.reassembles() {
+        let rhs = small_signal.system().ac_rhs();
+        let mut batch = crate::maths::complex::IndependentComplexBatch::default();
+        for frequencies in grid.chunks(4) {
+            let matrices = frequencies
+                .iter()
+                .map(|&f| ac_matrix(shared, small_signal.system(), 2. * std::f64::consts::PI * f))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            for (&f, factor) in frequencies.iter().zip(batch.factorize(&matrices)) {
+                emit(f, factor?.solve(&rhs)?, &small_signal)?;
+            }
+        }
+    } else {
+        for &f in grid {
+            let x = small_signal.at_frequency(context, f, |system| {
+                ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
+                    .factorize()?
+                    .solve(&system.ac_rhs())
+            })?;
+            emit(f, x, &small_signal)?;
+        }
     }
     sink.end()
 }
