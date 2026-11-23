@@ -237,6 +237,56 @@ complete root sets and multiplicities, and the live C cases that converge.
 floating nodes, current-source cutsets, near-singular, badly scaled, zero
 R/C/L) against C's answer or C's class of error.
 
+## Opt-in original-operator residual telemetry (#104)
+
+Ordinary C-compatible DC/Newton/AC solves still perform no implicit
+equilibration, residual acceptance or conditioning-based rejection. The
+maths-library diagnostic, `OriginalResidual::<f64>::real` or
+`OriginalResidual::<Complex>::complex`, instead borrows the **unscaled**
+original assembled entries. The constructor indexes normal or transposed
+orientation once; `evaluate` and `evaluate_many` reuse that
+index for one or several original-unit right-hand sides. Disabled telemetry
+has no runtime overhead and no duplicate numeric operator storage.
+
+`ComponentwiseBackwardError` is a non-rejecting, dimensionless
+per-row measure. For real rows it is
+`|Σ a_rc x_c - b_r| / (Σ |a_rc| |x_c| + |b_r|)`.
+Complex residuals evaluate the real and imaginary products separately and
+take the larger normalized component; the denominator bounds both using all
+four absolute real/imaginary cross-products for each coefficient/solution
+pair, plus both RHS components. An empty zero row with zero RHS has error
+zero. The metric does not imply a forward-error/condition-number guarantee.
+
+Exact binary64 product accumulation reuses `primitives::ExactSum`
+to avoid cancellation loss, overflow and underflow in the numerator and
+denominator, including products individually beyond binary64 range. They
+retain separate power-of-two exponents until the final quotient. Reports
+contain per-row ratios and their maximum. Invalid dimensions, non-finite
+operators, RHS or solutions are errors; poor scaling or a large finite
+backward error is *reported*, not rejected as singular.
+
+The diagnostic is opt-in, with `O(nnz)` integer traversal indices
+and `O(n)` reported errors, no deep copy of the numeric operator
+and no per-RHS reindexing. Ordinary LU/C parity are unchanged.
+
+The optional `EquilibratedSparseLu::solve_refined` now uses the
+same exact original-unit quality and once-rounded correction RHSs. It takes
+an explicit `RefinementPolicy { max_steps, target_backward_error }`
+(maximum 8 rounds) and returns `RefinedSolution` with its best
+finite solution, final componentwise quality, count of accepted corrections,
+and a structured status: target met, rounds exhausted, no improvement,
+unrepresentable correction, or a correction-solve failure message. Every
+accepted correction must strictly improve the maximum original-unit error.
+The refined path may return a nonconverged physical solution with its
+quality/status for a caller to decide; it does not silently relax the target
+or reject a solution on a global-norm conditioning heuristic. This is an
+opt-in numerical experiment, not an automatic replacement for C's solver.
+
+Regression tests cover maximum-scale and minimum-subnormal real products,
+exact cancellation, complex phases and unrepresentable imaginary products,
+normal/transposed and multiple-RHS comparisons and invalid dimensions and
+finite inputs.
+
 ## Library API contracts
 
 Running a deck's analyses from Rust, as the CLI does (`RunConfig` applies the

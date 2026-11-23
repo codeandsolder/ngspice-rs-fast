@@ -358,6 +358,332 @@ fn complex_entries(a: &[Triplet], e: &[Triplet], omega: f64) -> SpiceResult<Vec<
     Ok(entries)
 }
 
+/// Dimensionless per-equation backward errors against the original operator.
+///
+/// This is evidence, not an automatic circuit rejection or a forward-error
+/// guarantee. All terms are accumulated exactly before one normalized ratio.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentwiseBackwardError {
+    /// Per-row residual divided by the original-row absolute product sum
+    /// and RHS magnitude. Complex values use the sum of their components
+    /// for a finite, conservative bound at arbitrarily large input scales.
+    pub rows: Vec<f64>,
+    /// Largest componentwise backward error.
+    pub maximum: f64,
+}
+
+/// Borrowed, original-unit real or complex sparse operator.
+///
+/// Uses one reusable equation traversal. Preparation allocates only an index, not coefficient
+/// snapshots. No diagnostics run on the ordinary factor/solve fast path.
+#[derive(Debug)]
+pub struct OriginalResidual<'a, T> {
+    order: usize,
+    entries: &'a [(usize, usize, T)],
+    by_equation: Vec<usize>,
+    transposed: bool,
+}
+
+trait ResidualScalar: ScaleValue {
+    fn correction(
+        real: &crate::primitives::ExactSum,
+        imaginary: &crate::primitives::ExactSum,
+    ) -> Self;
+    fn product(
+        left: Self,
+        right: Self,
+        real: &mut crate::primitives::ExactSum,
+        imaginary: &mut crate::primitives::ExactSum,
+        denominator: &mut crate::primitives::ExactSum,
+    );
+    fn rhs(
+        rhs: Self,
+        real: &mut crate::primitives::ExactSum,
+        imaginary: &mut crate::primitives::ExactSum,
+        denominator: &mut crate::primitives::ExactSum,
+    );
+}
+
+impl ResidualScalar for f64 {
+    fn correction(
+        real: &crate::primitives::ExactSum,
+        _imaginary: &crate::primitives::ExactSum,
+    ) -> Self {
+        -real.rounded_sum()
+    }
+
+    fn product(
+        left: Self,
+        right: Self,
+        real: &mut crate::primitives::ExactSum,
+        _imaginary: &mut crate::primitives::ExactSum,
+        denominator: &mut crate::primitives::ExactSum,
+    ) {
+        real.add_product(left, right);
+        denominator.add_product(left.abs(), right.abs());
+    }
+
+    fn rhs(
+        rhs: Self,
+        real: &mut crate::primitives::ExactSum,
+        _imaginary: &mut crate::primitives::ExactSum,
+        denominator: &mut crate::primitives::ExactSum,
+    ) {
+        real.add_product(-rhs, 1.);
+        denominator.add_product(rhs.abs(), 1.);
+    }
+}
+
+impl ResidualScalar for Complex {
+    fn correction(
+        real: &crate::primitives::ExactSum,
+        imaginary: &crate::primitives::ExactSum,
+    ) -> Self {
+        Self::new(-real.rounded_sum(), -imaginary.rounded_sum())
+    }
+
+    fn product(
+        left: Self,
+        right: Self,
+        real: &mut crate::primitives::ExactSum,
+        imaginary: &mut crate::primitives::ExactSum,
+        denominator: &mut crate::primitives::ExactSum,
+    ) {
+        real.add_product(left.re, right.re);
+        real.add_product(-left.im, right.im);
+        imaginary.add_product(left.re, right.im);
+        imaginary.add_product(left.im, right.re);
+        for (a, b) in [
+            (left.re, right.re),
+            (left.im, right.im),
+            (left.re, right.im),
+            (left.im, right.re),
+        ] {
+            denominator.add_product(a.abs(), b.abs());
+        }
+    }
+
+    fn rhs(
+        rhs: Self,
+        real: &mut crate::primitives::ExactSum,
+        imaginary: &mut crate::primitives::ExactSum,
+        denominator: &mut crate::primitives::ExactSum,
+    ) {
+        real.add_product(-rhs.re, 1.);
+        imaginary.add_product(-rhs.im, 1.);
+        denominator.add_product(rhs.re.abs(), 1.);
+        denominator.add_product(rhs.im.abs(), 1.);
+    }
+}
+
+fn original_residual_prepare<T: ResidualScalar>(
+    order: usize,
+    entries: &[Entry<T>],
+    transposed: bool,
+) -> SpiceResult<OriginalResidual<'_, T>> {
+    if order == 0
+        || entries
+            .iter()
+            .any(|&(row, col, value)| row >= order || col >= order || !value.finite())
+    {
+        return Err(numerical(
+            "original operator residual",
+            "nonpositive dimension, out-of-bounds entry or non-finite coefficient",
+        ));
+    }
+    let mut by_equation = Vec::new();
+    by_equation.try_reserve_exact(entries.len()).map_err(|e| {
+        numerical(
+            "original operator residual",
+            format!("cannot allocate index: {e}"),
+        )
+    })?;
+    by_equation.extend(0..entries.len());
+    by_equation.sort_unstable_by_key(|&idx| {
+        let (row, col, _) = entries[idx];
+        if transposed { col } else { row }
+    });
+    Ok(OriginalResidual {
+        order,
+        entries,
+        by_equation,
+        transposed,
+    })
+}
+
+fn original_residual_measure<T: ResidualScalar>(
+    view: &OriginalResidual<'_, T>,
+    rhs: &[T],
+    solution: &[T],
+    mut correction: Option<&mut [T]>,
+) -> SpiceResult<ComponentwiseBackwardError> {
+    if rhs.len() != view.order
+        || solution.len() != view.order
+        || rhs.iter().chain(solution).any(|&value| !value.finite())
+        || correction
+            .as_ref()
+            .is_some_and(|values| values.len() != view.order)
+    {
+        return Err(numerical(
+            "original operator residual",
+            "invalid RHS/solution dimensions or non-finite values",
+        ));
+    }
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(view.order).map_err(|e| {
+        numerical(
+            "original operator residual",
+            format!("cannot allocate rows: {e}"),
+        )
+    })?;
+    let mut cursor = 0;
+    let mut maximum = 0.0_f64;
+    for (row, &rhs_value) in rhs.iter().enumerate() {
+        let mut real = crate::primitives::ExactSum::new();
+        let mut imaginary = crate::primitives::ExactSum::new();
+        let mut denominator = crate::primitives::ExactSum::new();
+        while let Some(&index) = view.by_equation.get(cursor) {
+            let (source_row, source_col, value) = view.entries[index];
+            let (actual_row, actual_col) = if view.transposed {
+                (source_col, source_row)
+            } else {
+                (source_row, source_col)
+            };
+            if actual_row != row {
+                break;
+            }
+            T::product(
+                value,
+                solution[actual_col],
+                &mut real,
+                &mut imaginary,
+                &mut denominator,
+            );
+            cursor += 1;
+        }
+        T::rhs(rhs_value, &mut real, &mut imaginary, &mut denominator);
+        if let Some(values) = correction.as_deref_mut() {
+            values[row] = T::correction(&real, &imaginary);
+        }
+        let relative = real
+            .magnitude_ratio(&denominator)
+            .max(imaginary.magnitude_ratio(&denominator));
+        maximum = maximum.max(relative);
+        rows.push(relative);
+    }
+    Ok(ComponentwiseBackwardError { rows, maximum })
+}
+
+fn original_residual_many<T: ResidualScalar>(
+    view: &OriginalResidual<'_, T>,
+    systems: &[(&[T], &[T])],
+) -> SpiceResult<Vec<ComponentwiseBackwardError>> {
+    let mut reports = Vec::new();
+    reports.try_reserve_exact(systems.len()).map_err(|e| {
+        numerical(
+            "original operator residual",
+            format!("cannot allocate reports: {e}"),
+        )
+    })?;
+    for &(rhs, solution) in systems {
+        reports.push(original_residual_measure(view, rhs, solution, None)?);
+    }
+    Ok(reports)
+}
+
+impl<'a> OriginalResidual<'a, f64> {
+    /// Prepare original real operator diagnostics. Duplicate entries are
+    /// accumulated exactly. A transposed view uses the same borrowed data.
+    /// # Errors
+    /// Invalid dimensions, coefficients or insufficient index storage.
+    pub fn real(order: usize, entries: &'a [Entry<f64>], transposed: bool) -> SpiceResult<Self> {
+        original_residual_prepare(order, entries, transposed)
+    }
+
+    /// Inspect one real solution against the original physical equations.
+    /// # Errors
+    /// Invalid RHS or solution, or insufficient report storage.
+    pub fn evaluate(
+        &self,
+        rhs: &[f64],
+        solution: &[f64],
+    ) -> SpiceResult<ComponentwiseBackwardError> {
+        original_residual_measure(self, rhs, solution, None)
+    }
+
+    /// Inspect one solution while rounding each exact physical correction
+    /// RHS only after accumulating its complete signed product row. A
+    /// nonrepresentable correction becomes infinite and must not be solved.
+    /// # Errors
+    /// Invalid dimensions/finite inputs or insufficient report storage.
+    pub fn evaluate_with_correction(
+        &self,
+        rhs: &[f64],
+        solution: &[f64],
+        correction: &mut [f64],
+    ) -> SpiceResult<ComponentwiseBackwardError> {
+        original_residual_measure(self, rhs, solution, Some(correction))
+    }
+
+    /// Inspect many real RHS and solution pairs, reusing the same operator.
+    /// # Errors
+    /// Invalid input or insufficient report storage.
+    pub fn evaluate_many(
+        &self,
+        systems: &[(&[f64], &[f64])],
+    ) -> SpiceResult<Vec<ComponentwiseBackwardError>> {
+        original_residual_many(self, systems)
+    }
+}
+
+impl<'a> OriginalResidual<'a, Complex> {
+    /// Prepare original complex operator diagnostics in normal or transposed
+    /// orientation, without projecting away imaginary contributions.
+    /// # Errors
+    /// Invalid dimensions, coefficients or insufficient index storage.
+    pub fn complex(
+        order: usize,
+        entries: &'a [Entry<Complex>],
+        transposed: bool,
+    ) -> SpiceResult<Self> {
+        original_residual_prepare(order, entries, transposed)
+    }
+
+    /// Inspect one complex solution and both residual components.
+    /// # Errors
+    /// Invalid RHS or solution, or insufficient report storage.
+    pub fn evaluate(
+        &self,
+        rhs: &[Complex],
+        solution: &[Complex],
+    ) -> SpiceResult<ComponentwiseBackwardError> {
+        original_residual_measure(self, rhs, solution, None)
+    }
+
+    /// Report exact complex-product residual quality while rounding both
+    /// physical correction components once into caller-owned storage.
+    /// # Errors
+    /// Invalid dimensions/finite inputs or insufficient report storage.
+    pub fn evaluate_with_correction(
+        &self,
+        rhs: &[Complex],
+        solution: &[Complex],
+        correction: &mut [Complex],
+    ) -> SpiceResult<ComponentwiseBackwardError> {
+        original_residual_measure(self, rhs, solution, Some(correction))
+    }
+
+    /// Inspect many complex RHS and solution pairs with a shared traversal.
+    /// # Errors
+    /// Invalid input or insufficient report storage.
+    pub fn evaluate_many(
+        &self,
+        systems: &[(&[Complex], &[Complex])],
+    ) -> SpiceResult<Vec<ComponentwiseBackwardError>> {
+        original_residual_many(self, systems)
+    }
+}
+
 /// Original-unit row residual magnitudes and unchanged LU backward-error bounds.
 ///
 /// A successful check guarantees each residual is at most its bound, not forward
@@ -478,6 +804,50 @@ impl EquilibratedDenseLu {
     }
 }
 
+/// Hard upper bound for explicit post-factorization refinement rounds.
+/// A caller must request fewer rounds instead of silently running forever.
+pub const MAX_REFINEMENT_STEPS: usize = 8;
+
+/// Explicit policy for an optional original-equation iterative refinement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RefinementPolicy {
+    /// Maximum attempted correction rounds, at most MAX_REFINEMENT_STEPS.
+    pub max_steps: usize,
+    /// Desired maximum componentwise backward error, finite and in [0, 1].
+    pub target_backward_error: f64,
+}
+
+/// Why bounded refinement stopped. A stopped solve still returns its best
+/// known candidate with original-unit measured quality for caller decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefinementStatus {
+    /// The requested componentwise backward-error target was met.
+    TargetMet,
+    /// Every allowed round was spent without reaching the target.
+    Exhausted,
+    /// A correction failed to reduce the exact backward-error ratio.
+    Stalled,
+    /// The correction residual or corrected solution was not representable
+    /// as finite binary64 data despite a representable normalized error.
+    UnrepresentableCorrection,
+    /// The existing factors could not solve a correction; includes the
+    /// numerical error for explicit fallback handling.
+    CorrectionSolveFailed(String),
+}
+
+/// Best solution and original-operator evidence after bounded refinement.
+#[derive(Debug)]
+pub struct RefinedSolution {
+    /// Best finite physical-unit solution.
+    pub solution: Vector,
+    /// Scale-aware per-row errors measured at the final solution.
+    pub quality: ComponentwiseBackwardError,
+    /// Number of accepted corrections (each strictly improved the metric).
+    pub corrections: usize,
+    /// Convergence or precise nonconvergence/fallback reason.
+    pub status: RefinementStatus,
+}
+
 /// Owned opt-in sparse LU with exact assembled-pattern symbolic reuse.
 #[derive(Debug)]
 pub struct EquilibratedSparseLu {
@@ -533,81 +903,82 @@ impl EquilibratedSparseLu {
         &self.scaling
     }
 
-    /// [`EquilibratedSparseLu::solve`] followed by at most `steps` rounds of
-    /// iterative refinement in physical units. A correction `M dx = b - M x`
-    /// is kept only while it lowers the componentwise backward error
-    /// `max_r |b - M x|_r / (sum_c |M[r,c]| |x_c| + |b_r|)`.
+    /// Refine the physical-unit solution against the original sparse
+    /// operator, using the existing factors for at most the requested
+    /// number of correction solves.
     ///
-    /// The normwise residual check of [`EquilibratedSparseLu::solve`] accepts
-    /// errors relative to the largest solution component; when the solution
-    /// spans tens of decades (a `1e99` unknown beside a `2 V` source), a small
-    /// component can be lost entirely within that bound. Refinement recovers
-    /// it without changing the factor or any guard.
+    /// Row residuals, normalization, and correction RHSs are exact binary64
+    /// product sums, each rounded once only when physically representable.
+    /// The best finite candidate is retained only on strict improvement in
+    /// maximum componentwise backward error. An unattainable target returns
+    /// a structured nonconvergence status, never a silently relaxed bound.
+    /// The ordinary solve path and its C compatibility are unaffected.
+    ///
     /// # Errors
-    /// As [`EquilibratedSparseLu::solve`], for the first solve; failing
-    /// corrections end refinement and keep the best solution so far.
-    pub fn solve_refined(&self, rhs: &Vector, steps: usize) -> SpiceResult<Vector> {
-        let mut workspace = Vec::new();
-        let mut x = self.solve_in(rhs, &mut workspace)?;
-        let mut residual = rhs.clone();
-        let mut scale = vec![0.0; rhs.len()];
-        let mut error = self.componentwise_error(rhs, &x, &mut residual, &mut scale);
-        for _ in 0..steps {
-            if error == 0.0 {
-                break;
-            }
-            // The error calculation leaves the physical residual in the
-            // workspace for the correction solve.
-            if !residual.is_finite() {
-                break;
-            }
-            let Ok(mut candidate) = self.solve_in(&residual, &mut workspace) else {
-                break;
-            };
-            for (delta, value) in candidate.as_mut_slice().iter_mut().zip(x.as_slice()) {
-                // Both operands are finite here; binary64 addition is
-                // commutative, including signed zeros.
-                *delta += *value;
-            }
-            let candidate_error =
-                self.componentwise_error(rhs, &candidate, &mut residual, &mut scale);
-            let improves = candidate_error.partial_cmp(&error) == Some(std::cmp::Ordering::Less);
-            if !improves || self.check_residual(rhs, &candidate).is_err() {
-                break;
-            }
-            x = candidate;
-            error = candidate_error;
-        }
-        Ok(x)
-    }
-
-    fn componentwise_error(
+    /// An invalid policy, failed initial factor solve or invalid original
+    /// operator/RHS data. Later correction failures are reported as status.
+    pub fn solve_refined(
         &self,
         rhs: &Vector,
-        x: &Vector,
-        residual: &mut Vector,
-        scale: &mut [f64],
-    ) -> f64 {
-        let b = rhs.as_slice();
-        let residual = residual.as_mut_slice();
-        residual.copy_from_slice(b);
-        for (s, v) in scale.iter_mut().zip(b) {
-            *s = v.abs();
+        policy: RefinementPolicy,
+    ) -> SpiceResult<RefinedSolution> {
+        if policy.max_steps > MAX_REFINEMENT_STEPS
+            || !policy.target_backward_error.is_finite()
+            || !(0. ..=1.).contains(&policy.target_backward_error)
+        {
+            return Err(numerical(
+                "equilibration refinement",
+                "invalid maximum corrections or target backward error",
+            ));
         }
-        for &(r, c, v) in &self.original {
-            let term = v * x.as_slice()[c];
-            residual[r] -= term;
-            scale[r] += term.abs();
-        }
-        residual
-            .iter()
-            .zip(scale.iter())
-            .map(|(r, s)| match (r.abs(), *s) {
-                (0.0, _) => 0.0,
-                (r, s) if s > 0.0 => r / s,
-                _ => f64::INFINITY,
-            })
-            .fold(0.0, f64::max)
+        let original = OriginalResidual::real(self.scaling.rows.len(), &self.original, false)?;
+        let mut workspace = Vec::new();
+        let mut x = self.solve_factors_in(rhs, &mut workspace)?;
+        let mut residual = Vector::zeros(rhs.len());
+        let mut quality = original.evaluate_with_correction(
+            rhs.as_slice(),
+            x.as_slice(),
+            residual.as_mut_slice(),
+        )?;
+        let mut corrections = 0;
+        let status = loop {
+            if quality.maximum <= policy.target_backward_error {
+                break RefinementStatus::TargetMet;
+            }
+            if corrections >= policy.max_steps {
+                break RefinementStatus::Exhausted;
+            }
+            if !residual.is_finite() {
+                break RefinementStatus::UnrepresentableCorrection;
+            }
+            let mut candidate = match self.solve_factors_in(&residual, &mut workspace) {
+                Ok(solution) => solution,
+                Err(error) => break RefinementStatus::CorrectionSolveFailed(error.to_string()),
+            };
+            for (delta, value) in candidate.as_mut_slice().iter_mut().zip(x.as_slice()) {
+                *delta += *value;
+            }
+            if !candidate.is_finite() {
+                break RefinementStatus::UnrepresentableCorrection;
+            }
+            let candidate_quality = original.evaluate_with_correction(
+                rhs.as_slice(),
+                candidate.as_slice(),
+                residual.as_mut_slice(),
+            )?;
+            if candidate_quality.maximum >= quality.maximum {
+                break RefinementStatus::Stalled;
+            }
+            x = candidate;
+            quality = candidate_quality;
+            corrections += 1;
+        };
+        Ok(RefinedSolution {
+            solution: x,
+            quality,
+            corrections,
+            status,
+        })
     }
 
     /// Reusable symbolic factors for an identical assembled sparse pattern.
@@ -624,11 +995,15 @@ impl EquilibratedSparseLu {
     }
 
     fn solve_in(&self, rhs: &Vector, workspace: &mut Vec<f64>) -> SpiceResult<Vector> {
-        let scaled_rhs = Equilibration::transform_real(rhs, &self.scaling.rows)?;
-        let y = self.factor.solve_with_workspace(&scaled_rhs, workspace)?;
-        let x = Equilibration::transform_real(&y, &self.scaling.columns)?;
+        let x = self.solve_factors_in(rhs, workspace)?;
         self.check_residual(rhs, &x)?;
         Ok(x)
+    }
+
+    fn solve_factors_in(&self, rhs: &Vector, workspace: &mut Vec<f64>) -> SpiceResult<Vector> {
+        let scaled_rhs = Equilibration::transform_real(rhs, &self.scaling.rows)?;
+        let y = self.factor.solve_with_workspace(&scaled_rhs, workspace)?;
+        Equilibration::transform_real(&y, &self.scaling.columns)
     }
 
     /// Checks a physical-unit candidate against the original assembled snapshot.

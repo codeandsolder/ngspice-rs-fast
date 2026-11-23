@@ -1,5 +1,5 @@
 //! Opt-in equilibration: physical units, certified rank and failure policies.
-use ngspice_rs::maths::equilibration::MAX_SCALING_EXPONENT;
+use ngspice_rs::maths::equilibration::{MAX_SCALING_EXPONENT, RefinementPolicy, RefinementStatus};
 use ngspice_rs::maths::{
     EquilibratedComplexLu, EquilibratedDenseLu, EquilibratedSparseLu, Matrix, SparseMatrix, Vector,
 };
@@ -336,7 +336,18 @@ fn curtis_reid_balancing_solves_the_behavioural_zero_start_cycle() {
         assert_eq!(factor.log2().fract(), 0.0, "power of two: {factor}");
     }
     // Refinement recovers the 2 V source exactly beside the 1e99 unknown.
-    let x = balanced.solve_refined(&rhs, 3).unwrap();
+    let refined = balanced
+        .solve_refined(
+            &rhs,
+            RefinementPolicy {
+                max_steps: 3,
+                target_backward_error: 1e-12,
+            },
+        )
+        .unwrap();
+    assert_eq!(refined.status, RefinementStatus::TargetMet);
+    assert!(refined.quality.maximum <= 1e-12);
+    let x = &refined.solution;
     assert_eq!(x.as_slice()[0], 2.0);
     assert!((x.as_slice()[1] / (-1e99 + 1e32 * 2.0) - 1.0).abs() < 1e-15);
     assert!((x.as_slice()[2] + 2e-3).abs() < 1e-18);
@@ -355,4 +366,53 @@ fn balancing_keeps_singular_and_empty_systems_rejected() {
     empty_row.add(0, 0, 1.0).unwrap();
     empty_row.add(0, 1, 1.0).unwrap();
     assert!(EquilibratedSparseLu::new_balanced(&empty_row, None).is_err());
+}
+
+#[test]
+fn refinement_reports_explicit_policy_and_exhaustion_status() {
+    let (matrix, _) = matrices(&[&[2., 1.], &[1., 3.]]);
+    let factor = EquilibratedSparseLu::new(&matrix, None).unwrap();
+    let rhs = Vector::from_slice(&[1., 0.]);
+    assert!(
+        factor
+            .solve_refined(
+                &rhs,
+                RefinementPolicy {
+                    max_steps: usize::MAX,
+                    target_backward_error: 0.,
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        factor
+            .solve_refined(
+                &rhs,
+                RefinementPolicy {
+                    max_steps: 0,
+                    target_backward_error: f64::NAN,
+                }
+            )
+            .is_err()
+    );
+    let report = factor
+        .solve_refined(
+            &rhs,
+            RefinementPolicy {
+                max_steps: 0,
+                target_backward_error: 0.,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.corrections, 0);
+    assert!(report.solution.is_finite());
+    assert!(report.quality.maximum.is_finite());
+    assert_eq!(
+        report.status,
+        if report.quality.maximum == 0. {
+            RefinementStatus::TargetMet
+        } else {
+            RefinementStatus::Exhausted
+        }
+    );
 }

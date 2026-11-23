@@ -168,6 +168,52 @@ impl ExactSum {
         }
     }
 
+    /// Insert one exact signed finite binary64 product, without forming a
+    /// potentially overflowing binary64 intermediate. Used by explicitly
+    /// requested original-unit solver residual diagnostics.
+    pub(crate) fn add_product(&mut self, lhs: Real, rhs: Real) {
+        self.add(ExactTerm::from_real(lhs).product(ExactTerm::from_real(rhs)));
+    }
+
+    /// Round the full signed product sum once, including recoverable
+    /// cancellation across otherwise overflowing or subnormal products.
+    pub(crate) fn rounded_sum(&self) -> Real {
+        Self {
+            bins: self.bins,
+            terms: self.terms,
+        }
+        .magnitude()
+        .rounded(1, MIN_EXP)
+    }
+
+    /// The absolute quotient of two superaccumulators. The components are
+    /// rounded independently into binary mantissas and their physical
+    /// exponents remain separate until the final dimensionless division.
+    /// A tiny finite ratio is permitted to underflow; the opposite overflow
+    /// is meaningful (the requested error is genuinely unbounded).
+    pub(crate) fn magnitude_ratio(&self, denominator: &Self) -> Real {
+        let numerator = Self {
+            bins: self.bins,
+            terms: self.terms,
+        }
+        .magnitude()
+        .scaled();
+        let denominator = Self {
+            bins: denominator.bins,
+            terms: denominator.terms,
+        }
+        .magnitude()
+        .scaled();
+        if denominator.mantissa == 0. {
+            return if numerator.mantissa == 0. {
+                0.
+            } else {
+                Real::INFINITY
+            };
+        }
+        numerator.divide(denominator).abs()
+    }
+
     fn add(&mut self, term: ExactTerm) {
         self.add_unsigned(
             term.significand.unsigned_abs(),
