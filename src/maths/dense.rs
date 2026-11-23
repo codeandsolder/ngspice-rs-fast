@@ -486,17 +486,17 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<V
     // Since ||A||_F <= sqrt(n) ||A||_2, this leaves an eigenvalue bound
     // <= 4*n*eps*||A||_2, sixteen times below mutual validation's
     // 64*n*eps*||A||_2 negative-eigenvalue acceptance threshold.
-    let size = Real::from(u32::try_from(order).map_err(|_| {
+    let dimension = Real::from(u32::try_from(order).map_err(|_| {
         SpiceError::circuit("dense symmetric eigenvalue order exceeds numerical range")
     })?);
-    let backward_limit = 4. * size.sqrt() * Real::EPSILON;
+    let backward_limit = 4. * dimension.sqrt() * Real::EPSILON;
     let threshold = backward_limit * backward_limit * initial_norm;
     for _sweep in 0..JACOBI_MAX_SWEEPS {
         let mut off_diagonal = 0.;
         for first in 0..order {
             for second in first + 1..order {
                 let entry = data[first * order + second];
-                off_diagonal += 2. * entry * entry;
+                off_diagonal = (2. * entry).mul_add(entry, off_diagonal);
             }
         }
         if off_diagonal <= threshold {
