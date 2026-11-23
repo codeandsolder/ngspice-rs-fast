@@ -7,7 +7,7 @@ card 1 @netlists/m10_mos9_tran.cir:2:1 lines=2-2 continuations=0
   token 1 2:1 word "vdd"
   token 2 2:5 word "vdd"
   token 3 2:9 number "0" value=0e0
-  token 4 2:11 number "3.3" value=3.3000000000000003e0
+  token 4 2:11 number "3.3" value=3.3e0
 card 2 @netlists/m10_mos9_tran.cir:3:1 lines=3-3 continuations=0
   raw: "vin in 0 pulse(0 3.3 1n 0.5n 0.5n 4n 10n)"
   kind: device(v)
@@ -17,7 +17,7 @@ card 2 @netlists/m10_mos9_tran.cir:3:1 lines=3-3 continuations=0
   token 4 3:10 word "pulse"
   token 5 3:15 lparen "("
   token 6 3:16 number "0" value=0e0
-  token 7 3:18 number "3.3" value=3.3000000000000003e0
+  token 7 3:18 number "3.3" value=3.3e0
   token 8 3:22 number "1n" value=1e-9
   token 9 3:25 number "0.5n" value=5e-10
   token 10 3:30 number "0.5n" value=5e-10
@@ -47,10 +47,10 @@ card 3 @netlists/m10_mos9_tran.cir:4:1 lines=4-4 continuations=0
   token 18 4:40 number "4p" value=4e-12
   token 19 4:43 word "pd"
   token 20 4:45 equals "="
-  token 21 4:46 number "10u" value=9.999999999999999e-6
+  token 21 4:46 number "10u" value=1e-5
   token 22 4:50 word "ps"
   token 23 4:52 equals "="
-  token 24 4:53 number "10u" value=9.999999999999999e-6
+  token 24 4:53 number "10u" value=1e-5
   token 25 4:57 word "nrd"
   token 26 4:60 equals "="
   token 27 4:61 number "2" value=2e0
@@ -68,7 +68,7 @@ card 4 @netlists/m10_mos9_tran.cir:5:1 lines=5-5 continuations=0
   token 6 5:19 word "pch"
   token 7 5:23 word "w"
   token 8 5:24 equals "="
-  token 9 5:25 number "10u" value=9.999999999999999e-6
+  token 9 5:25 number "10u" value=1e-5
   token 10 5:29 word "l"
   token 11 5:30 equals "="
   token 12 5:31 number "1.1u" value=1.1e-6
@@ -90,7 +90,7 @@ card 5 @netlists/m10_mos9_tran.cir:6:1 lines=6-6 continuations=0
   token 1 6:1 word "cl"
   token 2 6:4 word "out"
   token 3 6:8 number "0" value=0e0
-  token 4 6:10 number "20f" value=2.0000000000000003e-14
+  token 4 6:10 number "20f" value=2e-14
 card 6 @netlists/m10_mos9_tran.cir:10:1 lines=10-12 continuations=2
   raw: ".model nch nmos(level=9 vto=0.65 tox=9n nsub=3e16 xj=0.15u ld=0.04u uo=450 vmax=1.5e5 nfs=5e11 eta=0.1 theta=0.15 kappa=0.3 delta=0.5 cgso=0.3n cgdo=0.3n cgbo=0.1n cj=0.9m mj=0.5 cjsw=0.25n pb=0.9 rsh=20 js=1e-4)"
   kind: dot(.model)
@@ -106,7 +106,7 @@ card 6 @netlists/m10_mos9_tran.cir:10:1 lines=10-12 continuations=2
   token 10 10:29 number "0.65" value=6.5e-1
   token 11 10:34 word "tox"
   token 12 10:37 equals "="
-  token 13 10:38 number "9n" value=9.000000000000001e-9
+  token 13 10:38 number "9n" value=9e-9
   token 14 10:41 word "nsub"
   token 15 10:45 equals "="
   token 16 10:46 number "3e16" value=3e16
@@ -133,7 +133,7 @@ card 6 @netlists/m10_mos9_tran.cir:10:1 lines=10-12 continuations=2
   token 37 11:26 number "0.15" value=1.5e-1
   token 38 11:31 word "kappa"
   token 39 11:36 equals "="
-  token 40 11:37 number "0.3" value=3.0000000000000004e-1
+  token 40 11:37 number "0.3" value=3e-1
   token 41 11:41 word "delta"
   token 42 11:46 equals "="
   token 43 11:47 number "0.5" value=5e-1
@@ -148,13 +148,13 @@ card 6 @netlists/m10_mos9_tran.cir:10:1 lines=10-12 continuations=2
   token 52 11:76 number "0.1n" value=1e-10
   token 53 12:3 word "cj"
   token 54 12:5 equals "="
-  token 55 12:6 number "0.9m" value=9.000000000000001e-4
+  token 55 12:6 number "0.9m" value=9e-4
   token 56 12:11 word "mj"
   token 57 12:13 equals "="
   token 58 12:14 number "0.5" value=5e-1
   token 59 12:18 word "cjsw"
   token 60 12:22 equals "="
-  token 61 12:23 number "0.25n" value=2.4999999999999996e-10
+  token 61 12:23 number "0.25n" value=2.5e-10
   token 62 12:29 word "pb"
   token 63 12:31 equals "="
   token 64 12:32 number "0.9" value=9e-1
@@ -180,7 +180,7 @@ card 7 @netlists/m10_mos9_tran.cir:13:1 lines=13-15 continuations=2
   token 10 13:29 number "-0.75" value=-7.5e-1
   token 11 13:35 word "tox"
   token 12 13:38 equals "="
-  token 13 13:39 number "9n" value=9.000000000000001e-9
+  token 13 13:39 number "9n" value=9e-9
   token 14 13:42 word "nsub"
   token 15 13:46 equals "="
   token 16 13:47 number "2.5e16" value=2.5e16
@@ -247,7 +247,7 @@ card 9 @netlists/m10_mos9_tran.cir:17:1 lines=17-17 continuations=0
   raw: ".tran 0.05n 20n 0 2p"
   kind: dot(.tran)
   token 1 17:1 word ".tran"
-  token 2 17:7 number "0.05n" value=4.9999999999999995e-11
+  token 2 17:7 number "0.05n" value=5e-11
   token 3 17:13 number "20n" value=2e-8
   token 4 17:17 number "0" value=0e0
   token 5 17:19 number "2p" value=2e-12

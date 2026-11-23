@@ -513,6 +513,11 @@ fn pnjlim(vnew: Real, vold: Real, vt: Real, vcrit: Real) -> (Real, bool) {
 }
 
 impl Device for Bsim3 {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.ensure(context.temperature, context.nominal_temperature)
+            .map(|_| ())
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

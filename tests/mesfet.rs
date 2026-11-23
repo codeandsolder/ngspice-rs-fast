@@ -958,9 +958,9 @@ fn gate_pencils_keep_reference_diagonal_scaling_and_statement_order() {
                 let (capgd, capgs) = (*capgd, *capgs);
                 let (gg, dd, ss) = if family == "nmf" {
                     (
-                        m * ggd + ggs,
-                        m * gdpr + gds + ggd,
-                        m * gspr + gds + gm + ggs,
+                        m.mul_add(ggd, ggs),
+                        m.mul_add(gdpr, gds) + ggd,
+                        m.mul_add(gspr, gds) + gm + ggs,
                     )
                 } else {
                     (
@@ -969,7 +969,9 @@ fn gate_pencils_keep_reference_diagonal_scaling_and_statement_order() {
                         m * (gspr + gds + gm + ggs),
                     )
                 };
-                // Independent literal statement order from mespzld.c / jfetpzld.c.
+                // Independent statement order from mespzld.c / jfetpzld.c.
+                // The MES diagonals retain their unusual partial M scaling,
+                // but evaluate its initial multiply/add with one rounding.
                 let expected = [
                     (d, d, m * gdpr, None),
                     (g, g, gg, Some(m * (capgd + capgs))),

@@ -180,19 +180,32 @@ values: complex as `re,im` with 15 fractional digits, except that a component wh
       0  1.000000000000000e+02,0.000000000000000e+00  7.169568003248978e-01,-4.504772433683886e-01  …
 ```
 
-**Retention is per scheduled plot.** `batch::plan_outputs` assigns the
-rawfile projection, print, measurement and Fourier consumers to the ordered
-output identities before running a job. The optional small-signal bias
-receives only .save requests; noise spectra and integrated totals route
-by planned ordinal, not by the human-readable Plotname header. Only the
-last job of each kind receives its measurement/Fourier consumers. A consumer
-that needs the result retains one packed row-major table; `Selection::into_plot`
-transfers an identity projection without copying it, and compacts non-expanding consuming projections in place. All post-processing
-sees full unprojected data, including operands absent from the rawfile.
-For rawfile-only transient, AC, DC and noise spectrum output, selection
-binds against the announced header and projects each borrowed reusable row into the spool.
-Both paths use the same plan and write the same bytes; failure of any
-consumer leaves the previous destination unchanged.
+**Consumers are bound to each scheduled plot.** The deck-wide
+batch::OutputRoutes index classifies saves, print/plot cards and measurements
+once. Scheduled outputs borrow common route lists; the optional small-signal
+bias receives only saves, and noise spectrum/integrated requests are partitioned
+once. Measurement/Fourier cards target the last job of their kind.
+
+Rawfile projection, the row-oriented print formatter and the objective
+reducers consume the same full borrowed row. Scalar measurements share the
+fitting API's bounded online reducers; deferred setters and Fourier retain only
+the raw columns they need. ASCII plots retain only their selected values for
+global range calculation and rendering. For operations genuinely needing
+history, the sum of retained logical cells per plot is limited to 16 Mi cells
+(256 MiB of complex values, excluding metadata and allocator capacity).
+Exceeding the limit is an explicit error. Online measurements and tabular
+print require no history and have no row-count-dependent RAM consumption.
+
+A single exclusively created buffered report spool holds text in scheduled
+plot order; the report stores byte ranges instead of full table strings.
+The spool is flushed before rawfile publication, and the successful report
+streams its ranges to an output writer. A failing simulation or report spool
+write publishes neither a partial rawfile nor a partial report. Output-write
+failure after successful simulation is reported separately; stdout cannot
+be atomically rolled back. Dropping a report removes its owned spool.
+Drivers that already produce a complete plot transfer an identity rawfile
+projection without copying the original allocation, using the same consumers
+as streamed drivers.
 
 ## Divergence from C
 

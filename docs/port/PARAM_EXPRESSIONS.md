@@ -43,11 +43,14 @@ C's default `^` evaluates `pow(fabs(x), y)`; the evaluator implements exactly th
 
 ### Literals and names
 
-Numbers start with a digit or `.`: SPICE scale factors (`t g meg k m mil u n p
-f a`; `m` is milli) and trailing unit letters (`5V`, `1kohm`) are accepted and
-the original spelling is kept. A literal that overflows to a non-finite value
-(`1e999`) is a committed error at its first byte. RKM spellings (`4k7`) and
-hexadecimal/`inf`/`nan` forms are not numbers here.
+Numbers start with a digit or `.`. Numparam accepts e/E exponents and scale
+factors `t g meg k m u n p f a` (including `mil` as milli, unlike ordinary
+SPICE's thousandths-of-an-inch multiplier); trailing ASCII unit letters are
+swallowed and the original spelling is kept. The exact scaled decimal is
+rounded once to binary64, rather than rounding the coefficient before applying
+the scale. A literal that overflows after scaling (`1e999`) is a committed error
+at its first byte. RKM spellings (`4k7`), d/D exponents and hexadecimal/inf/nan
+forms are not numbers here.
 
 Names are `[A-Za-z_][A-Za-z0-9_.]*`, lowercased in the AST (case-insensitive,
 like numparam). `[`/`]` in names, `&` forms and vector access are not accepted.

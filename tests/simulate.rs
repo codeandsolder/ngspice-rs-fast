@@ -1281,7 +1281,7 @@ fn a_later_failing_measure_card_publishes_none_of_the_other_results() {
     let deck = write_deck(
         &dir,
         "rc delay\nv1 in 0 pulse(0 1 0 1n 1n 1 2)\nr1 in out 1k\nc1 out 0 1u\n\
-         .tran 1u 5m\n.meas tran first max v(out)\n.meas tran second find v(out) at=1\n\
+         .tran 1u 5m\n.print tran v(in)\n.meas tran first max v(out)\n.meas tran second find v(out) at=1\n\
          .meas tran third avg v(out)\n.end\n",
     );
     fs::write(&output, "PREVIOUS CONTENT\n").unwrap();

@@ -15,7 +15,7 @@ card 2 @netlists/m7_bjt_output.cir:3:1 lines=3-3 continuations=0
   token 2 3:4 number "0" value=0e0
   token 3 3:6 word "b"
   token 4 3:8 word "dc"
-  token 5 3:11 number "10u" value=9.999999999999999e-6
+  token 5 3:11 number "10u" value=1e-5
 card 3 @netlists/m7_bjt_output.cir:4:1 lines=4-4 continuations=0
   raw: "q1 c b 0 qgp"
   kind: device(q)
@@ -51,7 +51,7 @@ card 4 @netlists/m7_bjt_output.cir:5:1 lines=5-5 continuations=0
   token 22 5:59 number "5e-14" value=5e-14
   token 23 5:65 word "ne"
   token 24 5:67 equals "="
-  token 25 5:68 number "1.7" value=1.7000000000000002e0
+  token 25 5:68 number "1.7" value=1.7e0
   token 26 5:72 word "br"
   token 27 5:74 equals "="
   token 28 5:75 number "4" value=4e0
@@ -69,7 +69,7 @@ card 4 @netlists/m7_bjt_output.cir:5:1 lines=5-5 continuations=0
   token 40 5:102 number "1e-13" value=1e-13
   token 41 5:108 word "nc"
   token 42 5:110 equals "="
-  token 43 5:111 number "1.9" value=1.9000000000000001e0
+  token 43 5:111 number "1.9" value=1.9e0
   token 44 5:115 word "rb"
   token 45 5:117 equals "="
   token 46 5:118 number "150" value=1.5e2
@@ -102,9 +102,9 @@ card 6 @netlists/m7_bjt_output.cir:7:1 lines=7-7 continuations=0
   token 4 7:11 number "5" value=5e0
   token 5 7:13 number "0.1" value=1e-1
   token 6 7:17 word "ib"
-  token 7 7:20 number "5u" value=4.9999999999999996e-6
-  token 8 7:23 number "25u" value=2.4999999999999998e-5
-  token 9 7:27 number "5u" value=4.9999999999999996e-6
+  token 7 7:20 number "5u" value=5e-6
+  token 8 7:23 number "25u" value=2.5e-5
+  token 9 7:27 number "5u" value=5e-6
 card 7 @netlists/m7_bjt_output.cir:8:1 lines=8-8 continuations=0
   raw: ".end"
   kind: dot(.end)

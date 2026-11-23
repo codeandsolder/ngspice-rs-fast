@@ -26,7 +26,7 @@ card 3 @netlists/m10_hfet1_ac.cir:4:1 lines=4-4 continuations=0
   token 2 4:5 number "3" value=3e0
   token 3 4:7 number "0" value=0e0
   token 4 4:9 word "dc"
-  token 5 4:12 number "0.6" value=6.000000000000001e-1
+  token 5 4:12 number "0.6" value=6e-1
 card 4 @netlists/m10_hfet1_ac.cir:5:1 lines=5-5 continuations=0
   raw: "z1 2 3 0 hfem l=1u w=10u"
   kind: device(z)
@@ -40,7 +40,7 @@ card 4 @netlists/m10_hfet1_ac.cir:5:1 lines=5-5 continuations=0
   token 8 5:17 number "1u" value=1e-6
   token 9 5:20 word "w"
   token 10 5:21 equals "="
-  token 11 5:22 number "10u" value=9.999999999999999e-6
+  token 11 5:22 number "10u" value=1e-5
 card 5 @netlists/m10_hfet1_ac.cir:6:1 lines=6-6 continuations=0
   raw: "z2 2 3 0 hfet l=1u w=10u"
   kind: device(z)
@@ -54,7 +54,7 @@ card 5 @netlists/m10_hfet1_ac.cir:6:1 lines=6-6 continuations=0
   token 8 6:17 number "1u" value=1e-6
   token 9 6:20 word "w"
   token 10 6:21 equals "="
-  token 11 6:22 number "10u" value=9.999999999999999e-6
+  token 11 6:22 number "10u" value=1e-5
 card 6 @netlists/m10_hfet1_ac.cir:7:1 lines=7-8 continuations=1
   raw: ".model hfem nhfet level=5 gatemod=1 a1=0.02 a2=0.5 mv1=3 cm3=0.17 kappa=0.1 fgds=1e6 delf=1e5 rd=60 rs=60 vt0=0.3 js1s=1e-12 js1d=1e-12"
   kind: dot(.model)
@@ -96,7 +96,7 @@ card 6 @netlists/m10_hfet1_ac.cir:7:1 lines=7-8 continuations=1
   token 36 8:30 number "60" value=6e1
   token 37 8:33 word "vt0"
   token 38 8:36 equals "="
-  token 39 8:37 number "0.3" value=3.0000000000000004e-1
+  token 39 8:37 number "0.3" value=3e-1
   token 40 8:41 word "js1s"
   token 41 8:45 equals "="
   token 42 8:46 number "1e-12" value=1e-12
@@ -135,7 +135,7 @@ card 7 @netlists/m10_hfet1_ac.cir:9:1 lines=9-10 continuations=1
   token 27 9:74 number "50" value=5e1
   token 28 10:3 word "vt0"
   token 29 10:6 equals "="
-  token 30 10:7 number "0.3" value=3.0000000000000004e-1
+  token 30 10:7 number "0.3" value=3e-1
   token 31 10:11 word "js1s"
   token 32 10:15 equals "="
   token 33 10:16 number "1e-12" value=1e-12

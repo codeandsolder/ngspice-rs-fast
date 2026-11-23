@@ -88,7 +88,7 @@ card 11 @netlists/m10_ltra_ac.cir:18:1 lines=18-18 continuations=0
   token 3 18:15 word "ltra"
   token 4 18:20 word "l"
   token 5 18:21 equals "="
-  token 6 18:22 number "250n" value=2.5000000000000004e-7
+  token 6 18:22 number "250n" value=2.5e-7
   token 7 18:27 word "c"
   token 8 18:28 equals "="
   token 9 18:29 number "100p" value=1e-10
@@ -106,7 +106,7 @@ card 12 @netlists/m10_ltra_ac.cir:19:1 lines=19-19 continuations=0
   token 6 19:23 number "20" value=2e1
   token 7 19:26 word "l"
   token 8 19:27 equals "="
-  token 9 19:28 number "250n" value=2.5000000000000004e-7
+  token 9 19:28 number "250n" value=2.5e-7
   token 10 19:33 word "c"
   token 11 19:34 equals "="
   token 12 19:35 number "100p" value=1e-10

@@ -84,8 +84,8 @@ pub struct ResolvedSite {
     pub value: Real,
     /// The literal inserted into the card by numparam.
     pub formatted: String,
-    /// Reading that literal with C's `INPevaluate` arithmetic can differ
-    /// from the original evaluation in the last bit (or underflow).
+    /// Correctly rounded read-back of the formatted literal, which may
+    /// differ from the original evaluation because of decimal formatting.
     pub read_back: Real,
 }
 
@@ -175,8 +175,8 @@ fn resolved<'a>(entries: impl Iterator<Item = &'a NodeHint>) -> Vec<ResolvedNode
 /// Spell an evaluated value as numparam splices it back into the card
 /// (`double_to_string`, `xpressn.c`: `"% 23.15e"`, without the padding).
 /// Reading the text back with [`crate::primitives::parse_spice_number`]
-/// (`INPevaluate`) then gives C's value, which can differ from `value` in the
-/// last bit (`3` becomes `3.0000000000000004`); integer arguments use C's
+/// correctly rounds the resulting decimal to binary64, which may differ
+/// from `value` because of the formatting precision; integer arguments use C's
 /// `floor(0.5 + x)` ([`crate::primitives::c_integer`]).
 #[must_use]
 pub fn format_literal(value: Real) -> String {
@@ -359,7 +359,7 @@ fn literalize_hints(
                     ),
                     other => other,
                 })?;
-            // numparam's text, read back by INPevaluate as the card is.
+            // Numparam's text, read back with correct rounding as the card is.
             let text = format_literal(value);
             let read_back = if let Some(sites) = sites.as_deref_mut() {
                 let site = ResolvedSite::record(

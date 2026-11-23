@@ -1,7 +1,5 @@
 //! Shared classic-MOS sensitivity lifecycle. Each level supplies its own
 //! `mosX.c` tables, model fields and `mosXtemp.c` process stores.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -9,10 +7,6 @@
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use super::surface::{Surface, SurfaceCard};
@@ -522,20 +516,20 @@ impl<L: MosLevel> Device for ResetMosfet<L> {
             (d, d, gdr),
             (s, s, gsr),
             (b, b, gbd + gbs),
-            (dp, dp, gdr + gds + gbd + xrev * (gm + gmbs)),
-            (sp, sp, gsr + gds + gbs + xnrm * (gm + gmbs)),
+            (dp, dp, f64::mul_add(xrev, gm + gmbs, gdr + gds + gbd)),
+            (sp, sp, f64::mul_add(xnrm, gm + gmbs, gsr + gds + gbs)),
             (d, dp, -gdr),
             (s, sp, -gsr),
             (b, dp, -gbd),
             (b, sp, -gbs),
             (dp, d, -gdr),
             (dp, g, (xnrm - xrev) * gm),
-            (dp, b, -gbd + (xnrm - xrev) * gmbs),
-            (dp, sp, -(gds + xnrm * (gm + gmbs))),
+            (dp, b, f64::mul_add(xnrm - xrev, gmbs, -gbd)),
+            (dp, sp, -f64::mul_add(xnrm, gm + gmbs, gds)),
             (sp, g, -((xnrm - xrev) * gm)),
             (sp, s, -gsr),
-            (sp, b, -(gbs + (xnrm - xrev) * gmbs)),
-            (sp, dp, -(gds + xrev * (gm + gmbs))),
+            (sp, b, -f64::mul_add(xnrm - xrev, gmbs, gbs)),
+            (sp, dp, -f64::mul_add(xrev, gm + gmbs, gds)),
         ];
         let stamps = imaginary
             .into_iter()

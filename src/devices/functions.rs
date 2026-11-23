@@ -43,7 +43,10 @@
 //! `TD1`/`TD2`) are rejected, as for PULSE, rather than shifting the waveform
 //! earlier (C would then also need `CKTstep`/`CKTfinalTime` in a plain `.op`,
 //! where they are unset); SFFM's MDI limiting is silent (C prints a one-time
-//! warning); and every value is checked to be finite.
+//! warning); and every value is checked to be finite. Explicit periodic
+//! phases are reduced in degrees before conversion to radians, avoiding
+//! loss of the phase or overflow on large finite inputs. EXP uses stable
+//! exponential differences rather than subtracting rounded unit terms.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -396,14 +399,41 @@ pub struct Am {
     carrier_phase: Real,
 }
 
-/// The phase conversion in VSRC/ISRC temperature and load routines rounds the product
-/// before dividing by 180, rather than multiplying by a precomputed ratio.
+/// Affine interpolation with exact endpoints and no overflowing
+/// opposite-sign endpoint difference for weights in [0, 1].
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "ordinary C source and delay interpolation uses two separately rounded operations"
+)]
+#[expect(
+    clippy::float_cmp,
+    reason = "exact interpolation endpoint is a bit-preserving branch, not an approximate comparison"
+)]
+pub(super) fn affine_value(first: Real, second: Real, fraction: Real) -> Real {
+    if fraction == 0. {
+        return first;
+    }
+    if fraction == 1. {
+        return second;
+    }
+    let difference = second - first;
+    if difference.is_finite() {
+        first + fraction * difference
+    } else {
+        (1. - fraction) * first + fraction * second
+    }
+}
+
+/// Reduce the exact binary64 degree input by its integer period before
+/// converting. This preserves the physical phase even when conversion of
+/// unreduced degrees would overflow or lose many radians. For the ordinary
+/// interval the C multiplication/division order and signed zero are retained.
 #[expect(
     clippy::suboptimal_flops,
     reason = "retain C phase conversion multiplication and division order"
 )]
 pub(super) const fn phase_radians(degrees: Real) -> Real {
-    degrees * PI / 180.
+    (degrees % 360.) * PI / 180.
 }
 
 /// SIN before its delay and in DC share the same reference formula.
@@ -441,23 +471,36 @@ impl Sine {
 
 impl Exponential {
     #[expect(
-        clippy::suboptimal_flops,
-        reason = "C EXP adds the rise contribution before the separately rounded fall contribution"
+        clippy::float_cmp,
+        reason = "only exactly matching time constants permit the shared-exponent identity"
     )]
     fn value_at(self, time: Real) -> Real {
-        let rise = |time: Real| {
-            (self.pulsed - self.initial) * (1. - (-(time - self.rise_delay) / self.rise_tau).exp())
-        };
         if time <= self.rise_delay {
-            self.initial
-        } else if time <= self.fall_delay {
-            self.initial + rise(time)
-        } else {
-            self.initial
-                + rise(time)
-                + (self.initial - self.pulsed)
-                    * (1. - (-(time - self.fall_delay) / self.fall_tau).exp())
+            return self.initial;
         }
+        let rise = -(time - self.rise_delay) / self.rise_tau;
+        let weight = if time <= self.fall_delay {
+            -rise.exp_m1()
+        } else {
+            let fall = -(time - self.fall_delay) / self.fall_tau;
+            // After both edges, the two unit steps cancel analytically.
+            // Factoring the larger exponential avoids cancellation for
+            // nearby arguments and retains the late exponential tail.
+            let difference = if self.rise_tau == self.fall_tau {
+                // Equal time constants share the time term exactly.
+                (self.fall_delay - self.rise_delay) / self.rise_tau
+            } else {
+                fall - rise
+            };
+            if difference == 0. || (rise == Real::NEG_INFINITY && fall == Real::NEG_INFINITY) {
+                0.
+            } else if difference > 0. {
+                -fall.exp() * (-difference).exp_m1()
+            } else {
+                rise.exp() * difference.exp_m1()
+            }
+        };
+        affine_value(self.initial, self.pulsed, weight)
     }
 }
 
@@ -759,18 +802,25 @@ impl PwlSource {
 
     /// Linear interpolation at an in-range local time (C's segment search).
     #[expect(
-        clippy::suboptimal_flops,
-        reason = "C PWL interpolation rounds the scaled segment difference before adding its starting value"
+        clippy::float_cmp,
+        reason = "exact knot comparisons preserve stored ordinate bits including signed zero"
     )]
     fn interpolate(&self, time: Real) -> Real {
         // Strictly increasing finite knots are guaranteed by the constructor.
-        // Search right endpoints, choosing the preceding segment at an exact
-        // knot just as C's first t1 >= time does (including its rounding).
+        // Search right endpoints, returning stored ordinates at exact knots.
+        // Interior samples retain C's operation order when the endpoint
+        // difference is representable.
         let left = self.knots[1..].partition_point(|(t, _)| *t < time);
         let (t0, v0) = self.knots[left];
         self.knots.get(left + 1).map_or(v0, |&(t1, v1)| {
+            if time == t0 {
+                return v0;
+            }
+            if time == t1 {
+                return v1;
+            }
             let fraction = (time - t0) / (t1 - t0);
-            v0 + fraction * (v1 - v0)
+            affine_value(v0, v1, fraction)
         })
     }
 
@@ -1045,6 +1095,66 @@ mod tests {
     }
 
     #[test]
+    fn exp_preserves_tiny_edges_and_late_tails() {
+        let exp = Exponential {
+            initial: 0.,
+            pulsed: 1.,
+            rise_delay: 1.,
+            rise_tau: 1e20,
+            fall_delay: 2.,
+            fall_tau: 1e20,
+        };
+        let elapsed = 1_f64.next_up() - 1.;
+        let expected = elapsed / exp.rise_tau;
+        let got = exp.value_at(1_f64.next_up());
+        assert!((got / expected - 1.).abs() <= 2. * Real::EPSILON);
+        // With equal taus, the late-tail difference is independent of the
+        // (much larger) common elapsed time. Its exponent is not rounded away.
+        let got = exp.value_at(40. * exp.rise_tau);
+        let expected = (-40_f64).exp() / exp.rise_tau;
+        assert!((got / expected - 1.).abs() <= 4. * Real::EPSILON);
+        assert_eq!(exp.value_at(1.), 0.);
+    }
+
+    #[test]
+    fn stored_pwl_knots_and_opposite_sign_extreme_ordinates_survive() {
+        let source = PwlSource::plain(vec![(0., 1e16), (1., 1.), (2., -0.)]).unwrap();
+        assert_eq!(source.value_at(1., R).unwrap().to_bits(), 1_f64.to_bits());
+        assert_eq!(
+            source.value_at(2., L).unwrap().to_bits(),
+            (-0_f64).to_bits()
+        );
+        let source = PwlSource::plain(vec![(0., -Real::MAX), (2., Real::MAX)]).unwrap();
+        assert_eq!(source.value_at(1., R).unwrap(), 0.);
+        assert_eq!(source.value_at(2., R).unwrap(), Real::MAX);
+    }
+
+    #[test]
+    fn sine_uses_periodic_phase_even_at_maximum_finite_degrees() {
+        for (phase, reduced) in [
+            (123_456_789_012_345., 105.),
+            (Real::MAX, 128.),
+            (-Real::MAX, -128.),
+        ] {
+            let spec = |angle| sine([Some(10.), Some(0.1), Some(0.), Some(angle)]);
+            assert_eq!(
+                spec(phase).time_zero().unwrap().to_bits(),
+                spec(reduced).time_zero().unwrap().to_bits()
+            );
+            let a = spec(phase).resolve(&timing()).unwrap();
+            let b = spec(reduced).resolve(&timing()).unwrap();
+            for time in [0., 0.1, 0.1_f64.next_up(), 0.123] {
+                for limit in [L, R] {
+                    assert_eq!(
+                        a.value_at(time, limit).unwrap().to_bits(),
+                        b.value_at(time, limit).unwrap().to_bits()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sffm_defaults_limits_and_delay_jump() {
         let spec = |f: [Option<Real>; 6]| {
             FunctionSpec::Sffm(SffmSpec {
@@ -1270,8 +1380,14 @@ mod tests {
                     .find_map(|w| {
                         let ((a, x), (b, y)) = (w[0], w[1]);
                         (b >= t).then(|| {
-                            let fraction = (t - a) / (b - a);
-                            x + fraction * (y - x)
+                            if t == a {
+                                x
+                            } else if t == b {
+                                y
+                            } else {
+                                let fraction = (t - a) / (b - a);
+                                x + fraction * (y - x)
+                            }
                         })
                     })
                     .unwrap_or(knots.last().unwrap().1);
@@ -1371,8 +1487,8 @@ mod tests {
             2_f64.next_up(),
             7.,
         ] {
-            // The former plain Waveform::Pwl search, including the deliberately
-            // rounded result of interpolation at the exact right endpoint.
+            // Interior interpolation follows the original C expression;
+            // an exact knot returns its stored value without rounding it.
             let expected = if time <= knots[0].0 {
                 knots[0].1
             } else {
@@ -1381,9 +1497,15 @@ mod tests {
                     .find_map(|w| {
                         let ((t0, v0), (t1, v1)) = (w[0], w[1]);
                         (t1 >= time).then(|| {
-                            let fraction = (time - t0) / (t1 - t0);
-                            let increment = fraction * (v1 - v0);
-                            v0 + increment
+                            if time == t0 {
+                                v0
+                            } else if time == t1 {
+                                v1
+                            } else {
+                                let fraction = (time - t0) / (t1 - t0);
+                                let increment = fraction * (v1 - v0);
+                                v0 + increment
+                            }
                         })
                     })
                     .unwrap_or(knots[2].1)

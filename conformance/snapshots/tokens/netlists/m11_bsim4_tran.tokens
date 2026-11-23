@@ -7,7 +7,7 @@ card 1 @netlists/m11_bsim4_tran.cir:5:1 lines=5-5 continuations=0
   token 1 5:1 word "vdd"
   token 2 5:5 word "dd"
   token 3 5:8 number "0" value=0e0
-  token 4 5:10 number "1.2" value=1.2000000000000002e0
+  token 4 5:10 number "1.2" value=1.2e0
 card 2 @netlists/m11_bsim4_tran.cir:6:1 lines=6-6 continuations=0
   raw: "vin in 0 pulse(0 1.2 0.1n 20p 20p 0.4n 1n)"
   kind: device(v)
@@ -17,7 +17,7 @@ card 2 @netlists/m11_bsim4_tran.cir:6:1 lines=6-6 continuations=0
   token 4 6:10 word "pulse"
   token 5 6:15 lparen "("
   token 6 6:16 number "0" value=0e0
-  token 7 6:18 number "1.2" value=1.2000000000000002e0
+  token 7 6:18 number "1.2" value=1.2e0
   token 8 6:22 number "0.1n" value=1e-10
   token 9 6:27 number "20p" value=2e-11
   token 10 6:31 number "20p" value=2e-11
@@ -145,7 +145,7 @@ card 8 @netlists/m11_bsim4_tran.cir:12:1 lines=12-12 continuations=0
   token 1 12:1 word "c2"
   token 2 12:4 word "o2"
   token 3 12:7 number "0" value=0e0
-  token 4 12:9 number "5f" value=5.000000000000001e-15
+  token 4 12:9 number "5f" value=5e-15
 card 9 @netlists/m11_bsim4_tran.cir:13:1 lines=13-16 continuations=3
   raw: ".model nch nmos level=54 version=4.8.3 rgatemod=1 rbodymod=1 igcmod=1 igbmod=1 xrcrg1=12 xrcrg2=5 rshg=0.4 rbpb=5 rbpd=15 rbps=15 rbdb=15 rbsb=15 cgso=1.5e-10 cgdo=1.5e-10 cgbo=1e-11 jss=1e-4 cjs=1e-3 cjsws=2e-10 trnqsmod=1"
   kind: dot(.model)

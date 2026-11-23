@@ -65,8 +65,9 @@ impl TerminalValues {
     }
 
     fn interpolate(self, next: Self, fraction: Real) -> Self {
-        let interpolate =
-            |a: [Real; 2], b: [Real; 2]| std::array::from_fn(|k| a[k] + fraction * (b[k] - a[k]));
+        let interpolate = |a: [Real; 2], b: [Real; 2]| {
+            std::array::from_fn(|k| crate::devices::functions::affine_value(a[k], b[k], fraction))
+        };
         Self {
             voltage: interpolate(self.voltage, next.voltage),
             current: interpolate(self.current, next.current),
@@ -273,12 +274,14 @@ impl Convolution {
         let mut slopes: [Real; 2] =
             std::array::from_fn(|k| (new.voltage[k] - old.voltage[k]) / delta);
         for (term, state) in model.h1.iter().zip(&mut self.h1) {
-            let exp = (term.x * dt).exp();
+            let exponent = term.x * dt;
+            let exp = exponent.exp();
+            let increment = exponent.exp_m1();
             let factor = term.c / term.x;
             for k in 0..2 {
                 slopes[k] *= factor;
                 state[k] = (state[k] - slopes[k] * delta) * exp
-                    + (exp - 1.) * (new.voltage[k] * factor + 1e12 * slopes[k] / term.x);
+                    + increment * (new.voltage[k] * factor + 1e12 * slopes[k] / term.x);
             }
         }
         if ratio > 0. {

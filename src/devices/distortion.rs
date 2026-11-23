@@ -677,9 +677,8 @@ impl CircuitDistortion<'_> {
     /// | `2f1 - f2` | `(2 (X_i M_j + X_j M_i) + B_i X2_j + B_j X2_i) / 3` / `(X_i X_j B_k + X_i X_k B_j + X_j X_k B_i) / 3` |
     ///
     /// A charge's value is multiplied by `j omega`, `omega` being the response's
-    /// angular frequency (negative for `f1 - f2` below `f2`, as in C). The sums
-    /// are evaluated in C's operand order and grouping, so the right-hand side
-    /// rounds exactly as C's does.
+    /// angular frequency (negative for `f1 - f2` below `f2`, as in C). The complex monomial sums
+    /// are evaluated directly.
     ///
     /// # Errors
     /// Invalid kernel/RHS dimensions, nonfinite inputs, or nonfinite frequency.

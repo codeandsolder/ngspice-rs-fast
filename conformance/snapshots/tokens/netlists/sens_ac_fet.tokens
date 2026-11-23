@@ -78,7 +78,7 @@ card 5 @netlists/sens_ac_fet.cir:9:1 lines=9-10 continuations=1
   token 31 10:6 number "1e-14" value=1e-14
   token 32 10:12 word "n"
   token 33 10:13 equals "="
-  token 34 10:14 number "1.2" value=1.2000000000000002e0
+  token 34 10:14 number "1.2" value=1.2e0
   token 35 10:18 word "fc"
   token 36 10:20 equals "="
   token 37 10:21 number "0.4" value=4e-1
@@ -171,7 +171,7 @@ card 10 @netlists/sens_ac_fet.cir:16:1 lines=16-16 continuations=0
   token 8 16:15 number "1u" value=1e-6
   token 9 16:18 word "w"
   token 10 16:19 equals "="
-  token 11 16:20 number "10u" value=9.999999999999999e-6
+  token 11 16:20 number "10u" value=1e-5
 card 11 @netlists/sens_ac_fet.cir:17:1 lines=17-17 continuations=0
   raw: ".model zh nhfet(level=6 vt0=-0.5 rd=2 rs=3)"
   kind: dot(.model)

@@ -38,7 +38,7 @@ card 4 @netlists/m10_mesa_res_op.cir:5:1 lines=5-5 continuations=0
   token 8 5:19 number "1u" value=1e-6
   token 9 5:22 word "w"
   token 10 5:23 equals "="
-  token 11 5:24 number "20u" value=1.9999999999999998e-5
+  token 11 5:24 number "20u" value=2e-5
 card 5 @netlists/m10_mesa_res_op.cir:6:1 lines=6-6 continuations=0
   raw: "z2 2 3 0 mesmod2 l=2u w=40u"
   kind: device(z)
@@ -52,7 +52,7 @@ card 5 @netlists/m10_mesa_res_op.cir:6:1 lines=6-6 continuations=0
   token 8 6:20 number "2u" value=2e-6
   token 9 6:23 word "w"
   token 10 6:24 equals "="
-  token 11 6:25 number "40u" value=3.9999999999999996e-5
+  token 11 6:25 number "40u" value=4e-5
 card 6 @netlists/m10_mesa_res_op.cir:7:1 lines=7-7 continuations=0
   raw: "z3 2 3 0 mesmod3 l=1u w=20u"
   kind: device(z)
@@ -66,7 +66,7 @@ card 6 @netlists/m10_mesa_res_op.cir:7:1 lines=7-7 continuations=0
   token 8 7:20 number "1u" value=1e-6
   token 9 7:23 word "w"
   token 10 7:24 equals "="
-  token 11 7:25 number "20u" value=1.9999999999999998e-5
+  token 11 7:25 number "20u" value=2e-5
 card 7 @netlists/m10_mesa_res_op.cir:8:1 lines=8-8 continuations=0
   raw: ".model mesmod nmf(level=2 rd=31 rs=31 rg=10 ri=1e3 rf=2e3 rdi=300 rsi=200)"
   kind: dot(.model)
