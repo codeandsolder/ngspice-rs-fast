@@ -1687,16 +1687,19 @@ mod tests {
                 let initial = view.sample(0);
                 let now = history.last_time().unwrap() + 1e-11;
                 let times = view.times();
-                for (kind, coeff) in [
-                    (
-                        "RC",
-                        convolution::rc_coefficients(1e-12, 4e-8, now, times, 0.),
-                    ),
-                    (
-                        "RLC",
-                        convolution::rlc_coefficients(5e-9, 2e8, 2e8, now, times, 0.),
-                    ),
-                ] {
+                let mut coeff = convolution::Coefficients::new();
+                for kind in ["RC", "RLC"] {
+                    match kind {
+                        "RC" => {
+                            convolution::rc_coefficients(1e-12, 4e-8, now, times, 0., &mut coeff);
+                        }
+                        "RLC" => {
+                            convolution::rlc_coefficients(
+                                5e-9, 2e8, 2e8, now, times, 0., &mut coeff,
+                            );
+                        }
+                        _ => unreachable!("fixed workload cases"),
+                    }
                     let end = coeff.aux_index;
                     let seeds = [[0.; 2], [1e-3, -1e-3], [2e-3, -2e-3]];
                     let old = scalar_history_sums(view, &coeff.weights, initial, end, seeds);
