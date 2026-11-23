@@ -178,12 +178,13 @@ impl ExactSum {
     /// Round the full signed product sum once, including recoverable
     /// cancellation across otherwise overflowing or subnormal products.
     pub(crate) fn rounded_sum(&self) -> Real {
-        Self {
+        let normalized = Self {
             bins: self.bins,
             terms: self.terms,
         }
         .magnitude()
-        .rounded(1, MIN_EXP)
+        .scaled();
+        scale_power(normalized.mantissa, normalized.exponent)
     }
 
     /// The absolute quotient of two superaccumulators. The components are
@@ -605,6 +606,30 @@ mod tests {
             rounded_product_ratio([(Real::from_bits(3), 1., false)], [(2., false)]).to_bits(),
             Real::from_bits(2).to_bits()
         );
+    }
+
+    #[test]
+    fn exact_signed_sum_rounds_boundary_values_and_cancellation() {
+        let tiny = Real::from_bits(1);
+        for value in [0., tiny, -tiny, 1., -1., Real::MAX, -Real::MAX] {
+            let mut total = ExactSum::new();
+            total.add_product(value, 1.);
+            assert_eq!(total.rounded_sum().to_bits(), value.to_bits(), "{value:e}");
+        }
+        let mut total = ExactSum::new();
+        total.add_product(Real::MAX, 2.);
+        total.add_product(-Real::MAX, 1.);
+        assert_eq!(total.rounded_sum(), Real::MAX);
+        total.add_product(-Real::MAX, 1.);
+        assert_eq!(total.rounded_sum(), 0.);
+        total.add_product(-Real::MAX, 3.);
+        assert_eq!(total.rounded_sum(), Real::NEG_INFINITY);
+        let mut tie = ExactSum::new();
+        tie.add_product(1., 1.);
+        tie.add_product(2_f64.powi(-53), 1.);
+        assert_eq!(tie.rounded_sum(), 1.);
+        tie.add_product(2_f64.powi(-53), 1.);
+        assert_eq!(tie.rounded_sum(), 1. + f64::EPSILON);
     }
 
     #[test]

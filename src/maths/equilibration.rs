@@ -811,7 +811,7 @@ pub const MAX_REFINEMENT_STEPS: usize = 8;
 /// Explicit policy for an optional original-equation iterative refinement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RefinementPolicy {
-    /// Maximum attempted correction rounds, at most MAX_REFINEMENT_STEPS.
+    /// Maximum attempted correction rounds, at most `MAX_REFINEMENT_STEPS`.
     pub max_steps: usize,
     /// Desired maximum componentwise backward error, finite and in [0, 1].
     pub target_backward_error: f64,

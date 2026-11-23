@@ -416,3 +416,62 @@ fn refinement_reports_explicit_policy_and_exhaustion_status() {
         }
     );
 }
+
+/// Diagnostic overhead is measured against the same sparse factor solve
+/// with telemetry absent, not a different matrix/solver configuration.
+/// This manual benchmark is intentionally ignored by CI timing assertions.
+#[test]
+#[ignore = "manual, machine-dependent latency measurement"]
+fn original_backward_error_enabled_vs_disabled_cost() {
+    use ngspice_rs::maths::SparseLu;
+    use ngspice_rs::maths::equilibration::OriginalResidual;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    for order in [32, 128, 512] {
+        let mut matrix = SparseMatrix::new(order, order);
+        let mut entries = Vec::with_capacity(3 * order);
+        for row in 0..order {
+            for (col, coefficient) in [
+                (row, 4.),
+                (row.saturating_sub(1), -1.),
+                ((row + 1).min(order - 1), -1.),
+            ] {
+                if col == row && coefficient != 4. {
+                    continue;
+                }
+                matrix.add(row, col, coefficient).unwrap();
+                entries.push((row, col, coefficient));
+            }
+        }
+        let factors = SparseLu::new(&matrix, None).unwrap();
+        let rhs = Vector::from_slice(&vec![1.; order]);
+        let reference = OriginalResidual::real(order, &entries, false).unwrap();
+        let samples = 150;
+        let start = Instant::now();
+        for _ in 0..samples {
+            black_box(factors.solve(&rhs).unwrap());
+        }
+        let uninstrumented = start.elapsed();
+        let start = Instant::now();
+        let mut measured_max = 0_f64;
+        for _ in 0..samples {
+            let solution = factors.solve(&rhs).unwrap();
+            let quality = reference
+                .evaluate(rhs.as_slice(), solution.as_slice())
+                .unwrap();
+            measured_max = measured_max.max(quality.maximum);
+            black_box(quality);
+        }
+        let instrumented = start.elapsed();
+        eprintln!(
+            "original-error n={order} sample={samples} base_ns={} quality_ns={} incremental_ns={} max_error={measured_max:.3e}",
+            uninstrumented.as_nanos() / samples,
+            instrumented.as_nanos() / samples,
+            instrumented
+                .as_nanos()
+                .saturating_sub(uninstrumented.as_nanos())
+                / samples
+        );
+    }
+}
