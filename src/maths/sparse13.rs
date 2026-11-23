@@ -1772,14 +1772,27 @@ impl Sparse<Complex> {
             .lifecycle
             .plan()
             .expect("validated ordered traversal");
-        for (buffer, count) in [
-            (&mut work.values, baseline.values.len()),
-            (&mut work.scratch, baseline.size + 1),
-            (&mut work.inverses, baseline.size + 1),
-        ] {
-            buffer.clear();
-            sparse_reserve(buffer, count)?;
-            buffer.resize(count, LaneParts::ZERO);
+        // The original coefficient prefix is overwritten on every tile;
+        // only structural fill-ins must be zeroed again. The traversal
+        // writes its entire live scatter and inverse-pivot scratch before
+        // reading it, just like scalar spFactor.
+        let total = baseline.values.len();
+        let original = baseline.topology.original_entries;
+        if work.values.len() != total {
+            work.values.clear();
+            sparse_reserve(&mut work.values, total)?;
+            work.values.resize(total, LaneParts::ZERO);
+        } else {
+            work.values[original..].fill(LaneParts::ZERO);
+        }
+        for buffer in [&mut work.scratch, &mut work.inverses] {
+            let required = baseline.size + 1;
+            if buffer.len() < required {
+                sparse_reserve(buffer, required - buffer.len())?;
+                buffer.resize(required, LaneParts::ZERO);
+            } else {
+                buffer.truncate(required);
+            }
         }
         for (handle, packed) in work
             .values

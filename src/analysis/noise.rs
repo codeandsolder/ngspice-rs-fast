@@ -711,20 +711,8 @@ impl<'circuit> NoiseOutput<'_, 'circuit> {
             let mut work = ComplexFactorBatch::default();
             let mut previous = None;
             for (tile, group) in frequencies.chunks(RHS_BATCH_WIDTH).enumerate() {
-                let mut matrices = Vec::new();
-                matrices.try_reserve(group.len()).map_err(|error| {
-                    crate::maths::linear::numerical(
-                        "noise frequency batch",
-                        format!("cannot reserve frequency tile: {error}"),
-                    )
-                })?;
-                for &freq in group {
-                    matrices.push(crate::analysis::ac::ac_matrix(
-                        self.circuit,
-                        small.system(),
-                        2. * std::f64::consts::PI * freq,
-                    )?);
-                }
+                let (matrices, assembly_error) =
+                    crate::analysis::ac::ac_frequency_tile(self.circuit, small.system(), group)?;
                 let factors =
                     ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
                 for (lane, (&freq, result)) in group.iter().zip(factors).enumerate() {
@@ -732,6 +720,9 @@ impl<'circuit> NoiseOutput<'_, 'circuit> {
                     let gain_sq_inv = self.solve.evaluate(&factor)?;
                     self.observe(small, tile * RHS_BATCH_WIDTH + lane, freq, gain_sq_inv)?;
                     previous = Some(factor);
+                }
+                if let Some(error) = assembly_error {
+                    return Err(error);
                 }
             }
         } else {

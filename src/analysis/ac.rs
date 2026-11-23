@@ -11,7 +11,7 @@ use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
 use crate::maths::Vector;
 use crate::maths::complex::{ComplexFactorBatch, ComplexMatrix};
-use crate::primitives::{Complex, Real, SpiceResult};
+use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 pub(super) fn run(
     circuit: &mut Circuit,
@@ -50,20 +50,8 @@ pub(super) fn run(
         let mut work = ComplexFactorBatch::default();
         let mut previous = None;
         for frequencies in grid.chunks(crate::maths::linear::RHS_BATCH_WIDTH) {
-            let mut matrices = Vec::new();
-            matrices.try_reserve(frequencies.len()).map_err(|error| {
-                crate::maths::linear::numerical(
-                    "AC frequency batch",
-                    format!("cannot reserve frequency tile: {error}"),
-                )
-            })?;
-            for &f in frequencies {
-                matrices.push(ac_matrix(
-                    shared,
-                    small_signal.system(),
-                    2. * std::f64::consts::PI * f,
-                )?);
-            }
+            let (matrices, assembly_error) =
+                ac_frequency_tile(shared, small_signal.system(), frequencies)?;
             let factors = ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
             for (&f, result) in frequencies.iter().zip(factors) {
                 let factor = result?;
@@ -79,6 +67,9 @@ pub(super) fn run(
                 plot.check_point(&point)?;
                 sink.point(&point)?;
                 previous = Some(factor);
+            }
+            if let Some(error) = assembly_error {
+                return Err(error);
             }
         }
     } else {
@@ -208,6 +199,30 @@ pub(super) fn ac_matrix(
         return Ok(matrix);
     }
     ComplexMatrix::from_operators_grouped(&system.a, &system.e, &system.e_groups, omega)
+}
+
+/// Assemble the independent prefix of one frequency tile, deferring the
+/// first assembly failure until the successful prefix has been factored,
+/// solved and emitted. This retains the scalar loop's error precedence.
+pub(super) fn ac_frequency_tile(
+    circuit: &Circuit,
+    system: &LinearSystem,
+    frequencies: &[Real],
+) -> SpiceResult<(Vec<ComplexMatrix>, Option<SpiceError>)> {
+    let mut matrices = Vec::new();
+    matrices.try_reserve(frequencies.len()).map_err(|error| {
+        crate::maths::linear::numerical(
+            "AC frequency batch",
+            format!("cannot reserve frequency tile: {error}"),
+        )
+    })?;
+    for &f in frequencies {
+        match ac_matrix(circuit, system, 2. * std::f64::consts::PI * f) {
+            Ok(matrix) => matrices.push(matrix),
+            Err(error) => return Ok((matrices, Some(error))),
+        }
+    }
+    Ok((matrices, None))
 }
 
 /// The circuit linearized at its DC operating point, as `acan.c` and `span.c`
@@ -468,6 +483,52 @@ mod tests {
                 assert_eq!(actual, expected, "count={count} circuit={text}");
             }
         }
+    }
+
+    #[test]
+    fn a_later_matrix_assembly_error_keeps_earlier_emitted_points() {
+        #[derive(Default)]
+        struct CountSink {
+            starts: usize,
+            rows: usize,
+            ends: usize,
+        }
+        impl PointSink for CountSink {
+            fn begin(&mut self, _header: &Plot) -> SpiceResult<()> {
+                self.starts += 1;
+                Ok(())
+            }
+            fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
+                assert_eq!(values[0].re.to_bits(), 1000_f64.to_bits());
+                self.rows += 1;
+                Ok(())
+            }
+            fn end(&mut self) -> SpiceResult<()> {
+                self.ends += 1;
+                Ok(())
+            }
+        }
+        let source =
+            "AC assembly order\nv1 in 0 dc 1 ac 1\nr1 in out 1k\nc1 out 0 1n\nr2 out 0 2k\n.end\n";
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("ac-assembly.cir"), source))
+            .unwrap();
+        let mut circuit = Circuit::from_netlist(&deck).unwrap();
+        let request = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "2", "1000", "1001"])
+            .resolve()
+            .unwrap();
+        let mut sink = CountSink::default();
+        let error = run(
+            &mut circuit,
+            &request,
+            &AnalysisContext::default(),
+            &[1000., f64::MAX],
+            false,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert_eq!((sink.starts, sink.rows, sink.ends), (1, 1, 0));
     }
 
     #[test]

@@ -329,25 +329,16 @@ pub(super) fn run(
         let mut work = ComplexFactorBatch::default();
         let mut previous = None;
         for group in frequencies.chunks(RHS_BATCH_WIDTH) {
-            let mut matrices = Vec::new();
-            matrices.try_reserve(group.len()).map_err(|error| {
-                crate::maths::linear::numerical(
-                    "RF frequency batch",
-                    format!("cannot reserve frequency tile: {error}"),
-                )
-            })?;
-            for &f in group {
-                matrices.push(crate::analysis::ac::ac_matrix(
-                    circuit,
-                    small_signal.system(),
-                    2. * std::f64::consts::PI * f,
-                )?);
-            }
+            let (matrices, assembly_error) =
+                crate::analysis::ac::ac_frequency_tile(circuit, small_signal.system(), group)?;
             let factors = ComplexMatrix::factorize_batch(&matrices, previous.as_ref(), &mut work)?;
             for (&f, result) in group.iter().zip(factors) {
                 let factor = result?;
                 output.record(circuit, context, &small_signal, f, &factor)?;
                 previous = Some(factor);
+            }
+            if let Some(error) = assembly_error {
+                return Err(error);
             }
         }
     } else {
