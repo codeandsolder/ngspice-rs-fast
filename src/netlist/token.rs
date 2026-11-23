@@ -196,7 +196,7 @@ pub(super) struct Lexeme<'a> {
     pub(super) text: &'a str,
 }
 
-/// Scan the next token without allocating a LogicalLine or token vector.
+/// Scan the next token without allocating a `LogicalLine` or token vector.
 /// Textual tokens retain the same decoding and diagnostics as deck parsing.
 pub(super) fn scan_next<'a>(
     text: &'a str,
