@@ -390,6 +390,86 @@ mod tests {
         .unwrap()
     }
 
+    /// Independent implementation of the original C-ordered scalar sweep.
+    /// This intentionally never calls the new batch factor entry point.
+    fn scalar_ac_reference(
+        circuit: &mut Circuit,
+        request: &AnalysisPlan,
+        context: &AnalysisContext,
+        grid: &[Real],
+    ) -> Plot {
+        circuit.finalize().unwrap();
+        let mut small =
+            SmallSignal::prepare(circuit, request, context, request.dc_settings().clone()).unwrap();
+        let plot = plot(
+            circuit,
+            "ac1",
+            "AC Analysis",
+            Some(("frequency", "frequency")),
+            true,
+        )
+        .unwrap();
+        let mut expected = plot;
+        for &f in grid {
+            let result = small
+                .at_frequency(context, f, |system| {
+                    ac_matrix(circuit, system, 2. * std::f64::consts::PI * f)?
+                        .factorize()?
+                        .solve(&system.ac_rhs())
+                })
+                .unwrap();
+            let mut row = vec![Complex::real(f)];
+            row.extend(result);
+            row.extend(
+                small
+                    .prepared()
+                    .observe_parameters(&context.model_context().with_frequency(f))
+                    .unwrap(),
+            );
+            expected.push_point(&row).unwrap();
+        }
+        expected
+    }
+
+    #[test]
+    fn independent_ac_tiles_match_original_scalar_sweep_and_preserve_dependent_cases() {
+        let circuits = [
+            "ac RLC\nvin in 0 dc 1 ac 1\nr1 in mid 1k\nc1 mid 0 1n\nl1 mid out 1m\nr2 out 0 2k\n.end\n",
+            "ac diode\nvin in 0 dc 0.65 ac 1\nd1 in mid dm\nr1 mid 0 1k\n.model dm d (is=1e-14)\n.end\n",
+            "ac hertz rebias\nvin in 0 dc 0 ac 1\nb1 out 0 v=(1+hertz/1e5)*v(in)\nr1 out 0 1k\n.end\n",
+        ];
+        for text in circuits {
+            let netlist = Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("ac-tiles.cir"), text))
+                .unwrap();
+            for count in [1, 2, 3, 4, 5, 8, 11] {
+                let mut batched = Circuit::from_netlist(&netlist).unwrap();
+                let mut scalar = Circuit::from_netlist(&netlist).unwrap();
+                let context = AnalysisContext::default();
+                let request = AnalysisInput::with_arguments(
+                    AnalysisKind::Ac,
+                    ["lin", &count.to_string(), "1000", "11000"],
+                )
+                .resolve()
+                .unwrap();
+                let grid = frequency_grid(
+                    &[
+                        "lin".into(),
+                        count.to_string(),
+                        "1000".into(),
+                        "11000".into(),
+                    ],
+                    1e-3,
+                    GridKind::Ac,
+                )
+                .unwrap();
+                let actual = request.run(&mut batched, &context).unwrap();
+                let expected = scalar_ac_reference(&mut scalar, &request, &context, &grid);
+                assert_eq!(actual, expected, "count={count} circuit={text}");
+            }
+        }
+    }
+
     #[test]
     fn singleton_sweeps_keep_reference_exactness() {
         assert_eq!(grid("dec", "10", "42", "42", GridKind::Ac), [42.]);
