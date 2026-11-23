@@ -500,7 +500,7 @@ impl Writer<'_> {
         }
         let mut cursor = 0;
         let text = parts.text.as_str();
-        let mut next = || scan_next(text, &mut cursor, |_| location.clone());
+        let mut next = || scan_next(text, &mut cursor, |_| location.clone(), None);
         let _ = next()?;
         for expected in arguments() {
             if next()?.is_none_or(|token| token.text != expected) {
@@ -1044,7 +1044,7 @@ fn single_token<'a>(text: &'a str, location: &SourceLoc) -> Option<Lexeme<'a>> {
         return None;
     }
     let mut cursor = 0;
-    let token = scan_next(text, &mut cursor, |_| location.clone()).ok()??;
+    let token = scan_next(text, &mut cursor, |_| location.clone(), None).ok()??;
     (token.text == text && cursor == text.len()).then_some(token)
 }
 

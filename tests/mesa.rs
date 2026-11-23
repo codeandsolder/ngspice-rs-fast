@@ -878,3 +878,33 @@ fn the_channels_use_the_temperature_scaled_intrinsic_resistances() {
         close(value(&plot, "i(vids)", 0), expected, 1e-12, 1e-18);
     }
 }
+
+/// A model resistance that was zero at setup has no series edge to perturb.
+/// The sensitivity walk replays its setter on the prepared node graph; the
+/// gate/source/drain/prime aliases must not turn 1e6 S into a diagonal roundoff
+/// artifact. C's corresponding sensitivity columns are exactly zero.
+#[test]
+fn aliased_series_resistances_have_no_sensitivity_response() {
+    for (fixture, columns) in [
+        ("sens_mesa", &["v(z2:rg)"][..]),
+        ("sens_mesa3", &["v(z1:rf)", "v(z1:rg)"][..]),
+        ("sens_mesa4", &["v(z1:rf)", "v(z1:rg)"][..]),
+        ("sens_mesa4_ts", &["v(z1:rf)", "v(z1:rg)"][..]),
+    ] {
+        let path = Path::new("conformance/netlists")
+            .join(fixture)
+            .with_extension("cir");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed = Parser::new()
+            .parse_deck(&parse_deck_text(&path, &text))
+            .unwrap();
+        let config = RunConfig::from_netlist(&parsed).unwrap();
+        let request = config.plan_for(&parsed.analyses[0]).unwrap();
+        let mut c = config.circuit(&parsed).unwrap();
+        let plot = request.run(&mut c, &config.context()).unwrap();
+        for &column in columns {
+            let got = value(&plot, column, 0);
+            assert_eq!(got, 0., "{fixture} {column}");
+        }
+    }
+}

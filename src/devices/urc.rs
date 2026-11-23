@@ -46,9 +46,9 @@
 //! - section `i` uses `r = prop*r1`, `c = prop*c1` and diode `area = prop`,
 //!   with `prop = p^(i-1)` accumulated by repeated multiplication as C does.
 //!
-//! The arithmetic follows C operation by operation (including `pow`/`log`
-//! rather than integer powers), so element values match ngspice bit for bit
-//! on the same platform `libm`.
+//! Section normalization uses positive sums of the emitted geometric
+//! weights, avoiding cancellation at K near one. Automatic section-count
+//! selection and section ordering follow C.
 //!
 //! # Deliberate divergences
 //!
@@ -263,10 +263,33 @@ impl UrcSections {
             reason = "the number of URC sections is bounded by MAX_LUMPS and represented in the C real-valued formula"
         )]
         let n = lumps as Real;
-        let r1 = (r0 * (p - 1.)) / ((2. * p.powf(n)) - 2.);
-        let denominator = (p.powf(n - 1.)) * (p + 1.) - 2.;
-        let c1 = (c0 * (p - 1.)) / denominator;
-        let diode = i0.map(|i0| ((i0 * (p - 1.)) / denominator, length * n * rsperl));
+        // Scale by the largest emitted weight, then sum the positive
+        // weights. C/IS has one central section; R has two.
+        let largest = if p > 1. {
+            (1..lumps).fold(1., |prop, _| prop * p)
+        } else {
+            1.
+        };
+        if !largest.is_finite() {
+            return Err(invalid("nonfinite section propagation factor".into()));
+        }
+        let mut prop = 1.;
+        let mut sum = 0.;
+        let mut correction = 0.;
+        for _ in 1..lumps {
+            let weight = prop / largest;
+            let corrected = weight - correction;
+            let next = sum + corrected;
+            correction = (next - sum) - corrected;
+            sum = next;
+            prop *= p;
+        }
+        let center = prop / largest;
+        let rden = 2. * (sum + center);
+        let cden = 2. * sum + center;
+        let r1 = (r0 / largest) / rden;
+        let c1 = (c0 / largest) / cden;
+        let diode = i0.map(|i0| ((i0 / largest) / cden, length * n * rsperl));
         let sections = Self {
             length,
             lumps,
@@ -666,7 +689,8 @@ impl Device for UrcLine {
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Ok(crate::devices::noise::DeviceNoise::Noiseless)
     }
 
@@ -740,6 +764,44 @@ mod tests {
             assert!((i1 / s.capacitance - 1e-15 / 1e-12).abs() < 1e-12);
             assert_eq!(rd, 1e-3 * lumps as Real * 10.);
         }
+    }
+
+    #[test]
+    fn near_unity_ratios_conserve_geometric_totals() {
+        for ratio in [
+            1_f64.next_down(),
+            1_f64.next_up(),
+            1. + 1e-9,
+            1. - 1e-9,
+            0.5,
+            1.5,
+        ] {
+            for lumps in [1, 2, 3, 17, 128] {
+                let s =
+                    UrcSections::new(1., Some(lumps), ratio, 1e9, 1., 1., Some(1.), 0.).unwrap();
+                let mut prop = 1.;
+                let (mut resistance, mut capacitance, mut saturation) = (0., 0., 0.);
+                let (i1, _) = s.diode.unwrap();
+                for section in 1..=lumps {
+                    let multiplicity = if section == lumps { 1. } else { 2. };
+                    resistance += 2. * prop * s.resistance;
+                    capacitance += multiplicity * prop * s.capacitance;
+                    saturation += multiplicity * prop * i1;
+                    prop *= ratio;
+                }
+                let bound = 2. * Real::from(u32::try_from(lumps).unwrap()) * Real::EPSILON;
+                for total in [resistance, capacitance, saturation] {
+                    assert!((total - 1.).abs() <= bound, "K={ratio} n={lumps}: {total}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalization_does_not_overflow_on_a_finite_large_section_weight() {
+        let s = UrcSections::new(1., Some(2), 1e308, 1e9, 1., 1., None, 0.).unwrap();
+        assert!((2. * (s.resistance + 1e308 * s.resistance) - 1.).abs() <= 4. * Real::EPSILON);
+        assert!((2. * s.capacitance + 1e308 * s.capacitance - 1.).abs() <= 4. * Real::EPSILON);
     }
 
     #[test]

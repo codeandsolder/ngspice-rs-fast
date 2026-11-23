@@ -383,7 +383,8 @@ impl Device for Txl {
     fn noise(
         &self,
         _ctx: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Err(self.unsupported("noise"))
     }
     fn distortion(

@@ -1,6 +1,7 @@
 //! Classic-MOS `.sens` (#164), through the production analysis driver.
 //! The five C goldens pin the complete parameter walk, including restoration
 //! side effects that are deliberately not physical central derivatives.
+use ngspice_conformance::tolerance::SENSITIVITY_NONLINEAR;
 use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
@@ -20,16 +21,13 @@ fn value(plot: &Plot, name: &str) -> f64 {
     .re
 }
 fn fixture(level: u8, per_device: usize) {
-    let root = ngspice_conformance::fixtures::workspace_root().unwrap();
-    let deck =
-        std::fs::read_to_string(root.join(format!("conformance/netlists/sens_mos{level}.cir")))
-            .unwrap();
-    let golden = RawFile::parse(
-        &std::fs::read_to_string(root.join(format!("conformance/golden/sens_mos{level}.raw")))
-            .unwrap(),
-    )
-    .unwrap();
-    let plot = run(&deck).unwrap();
+    use ngspice_conformance::fixtures::{self, DeckInputs};
+
+    let root = fixtures::workspace_root().unwrap();
+    let name = format!("sens_mos{level}");
+    let inputs = DeckInputs::fixture_at(&root, &name).unwrap();
+    let golden = RawFile::load(fixtures::golden_path(&root, &name)).unwrap();
+    let plot = run(inputs.rust()).unwrap();
     let reference = &golden.plots[0].plot;
     assert_eq!(plot.plotname, reference.plotname);
     // The control `write` used to capture goldens sorts vectors after the
@@ -50,7 +48,7 @@ fn fixture(level: u8, per_device: usize) {
         let a = value(&plot, &variable.name);
         let b = value(reference, &variable.name);
         assert!(
-            (a - b).abs() <= 1e-9 + 1e-6 * b.abs(),
+            (a - b).abs() <= SENSITIVITY_NONLINEAR.bound(b),
             "level {level} {}: {a:e} vs {b:e}",
             variable.name
         );
@@ -131,7 +129,7 @@ fn mos1_channel_derivatives_match_the_square_law() {
     for (k, expected) in [("v(m1:kp)", -1.7914), ("v(m1:vto)", 1.378e-4)] {
         let actual = value(&plot, k);
         assert!(
-            (actual - expected).abs() <= 1e-9 + 1e-6 * expected.abs(),
+            (actual - expected).abs() <= 1e-6_f64.mul_add(expected.abs(), 1e-9),
             "{k}: {actual} vs {expected}"
         );
     }
@@ -177,11 +175,11 @@ fn filtering_the_doping_parameter_avoids_the_failed_temperature_callback() {
     let stage = ".options reltol=1e-10 vntol=1e-13 abstol=1e-16\n\
         vd d 0 3\nvg g 0 2\nvsense s 0 0\nm1 d g s 0 mm l=10u w=20u\n";
     for (level, filter, name, reference) in [
-        (2, "m1:kp", "v(m1:kp)", 4.000000001197),
-        (2, "m1:vto", "v(m1:vto)", -0.000414377152),
-        (2, "m1_l", "v(m1_l)", -41.437684159635),
-        (3, "m1:theta", "v(m1:theta)", -0.000828752854),
-        (3, "m1_w", "v(m1_w)", 20.718862798921),
+        (2, "m1:kp", "v(m1:kp)", 4.000_000_001_197),
+        (2, "m1:vto", "v(m1:vto)", -0.000_414_377_152),
+        (2, "m1_l", "v(m1_l)", -41.437_684_159_635),
+        (3, "m1:theta", "v(m1:theta)", -0.000_828_752_854),
+        (3, "m1_w", "v(m1_w)", 20.718_862_798_921),
     ] {
         let plot = run(&format!(
             "{stage}.model mm nmos level={level} tox=20n\n.sens i(vsense) {filter}\n.end\n"
@@ -189,7 +187,7 @@ fn filtering_the_doping_parameter_avoids_the_failed_temperature_callback() {
         .unwrap();
         let actual = value(&plot, name);
         assert!(
-            (actual - reference).abs() <= 1e-9 + 1e-6 * reference.abs(),
+            (actual - reference).abs() <= SENSITIVITY_NONLINEAR.bound(reference),
             "level {level} {name}: {actual} vs {reference}"
         );
     }

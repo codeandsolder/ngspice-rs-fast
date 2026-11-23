@@ -5,13 +5,13 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use ngspice_rs::analysis::{Plot, PlotFlags};
+use ngspice_rs::analysis::{Plot, PlotFlags, RawPlotRows};
+use ngspice_rs::primitives::Complex;
+use std::io::BufRead;
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Tolerance {
-    relative: f64,
-    absolute: f64,
-}
+pub(super) use ngspice_conformance::tolerance::{
+    SENSITIVITY, SENSITIVITY_CANCELLED, SENSITIVITY_NONLINEAR, Tolerance,
+};
 
 pub(super) const DC: Tolerance = Tolerance {
     relative: 1e-12,
@@ -47,46 +47,6 @@ pub(super) const NOISE: Tolerance = Tolerance {
 pub(super) const NOISE_NONLINEAR: Tolerance = Tolerance {
     relative: 1e-6,
     absolute: 1e-20,
-};
-
-/// `.sens` (#102), linear circuits. A sensitivity is a forward difference
-/// `dx/delta` with `delta = 1e-6 p` (C's `Sens_Delta`), so the rounding of the
-/// solution `x` reaches it amplified by `1/delta`: for a parameter with a
-/// strong effect that is about `1e-10` relative, which the 1e-8 bound covers
-/// with margin. Parameters C perturbs without effect read exactly 0 (or a
-/// rounding residue, e.g. about 4e-14 from the cosine of a 1e-6 degree AC
-/// phase), which the 1e-12 floor accepts.
-pub(super) const SENSITIVITY: Tolerance = Tolerance {
-    relative: 1e-8,
-    absolute: 1e-12,
-};
-
-/// `.sens` of nonlinear circuits: the nonlinear 1 ppm bias bound, with an
-/// absolute floor for weak parameters, whose numerator `dx` is only a few
-/// ulps of the node voltage: `ulp(x)/delta` is about `1e-16/2e-6 = 5e-11`
-/// for an O(1) parameter of an O(1) V output (C's own result for a diode's
-/// `nr` moves by 3e-10 between RELTOL 1e-6 and 1e-9 for that reason), which a
-/// 1e-9 floor covers.
-pub(super) const SENSITIVITY_NONLINEAR: Tolerance = Tolerance {
-    relative: 1e-6,
-    absolute: 1e-9,
-};
-
-/// `.sens` of MESA level 2 (#164): the nonlinear bound with a wider floor for
-/// three columns. `mesatemp.c` computes its derived quantities once per
-/// `DEVtemperature` and the load reuses them, while the port recomputes them
-/// from the records at every load; the two agree to ~1e-16, but a column whose
-/// answer is a difference of much larger terms amplifies that. Measured on
-/// `sens_mesa` against the reference binary: `z::level` 3.4e-6 relative (the
-/// perturbation disables the channel, so its answer is a difference of whole
-/// device currents) and `z::teta1`/`z::xtm0` 4.6e-8/6e-9 absolute (parameters
-/// level 2 does not read, where C reports its own rounding residue); every
-/// other column is inside [`SENSITIVITY_NONLINEAR`]. The bound still rejects a
-/// real model difference - it is 1e-5, and the MESA `tRsi` defect this fixture
-/// family exposed sat at 1e-2..2e-1.
-pub(super) const SENSITIVITY_CANCELLED: Tolerance = Tolerance {
-    relative: 1e-5,
-    absolute: 5e-8,
 };
 
 /// `.disto` (#104): the nonlinear 1 ppm operating-point bound (every Taylor
@@ -313,6 +273,14 @@ pub(super) fn validate(plot: &Plot, label: &str) -> Result<BTreeMap<String, usiz
     if plot.is_empty() {
         return Err(format!("{label}: empty plot"));
     }
+    let columns = column_indices(plot, label)?;
+    for (index, point) in plot.rows().enumerate() {
+        validate_row(plot, label, index, point, false)?;
+    }
+    Ok(columns)
+}
+
+fn column_indices(plot: &Plot, label: &str) -> Result<BTreeMap<String, usize>, String> {
     let mut columns = BTreeMap::new();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for (index, variable) in plot.variables().iter().enumerate() {
@@ -335,26 +303,37 @@ pub(super) fn validate(plot: &Plot, label: &str) -> Result<BTreeMap<String, usiz
             return Err(format!("{label}: ambiguous variable occurrence '{key}'"));
         }
     }
-    for (index, point) in plot.rows().enumerate() {
-        if point.len() != plot.variable_count() {
-            return Err(format!("{label}: point {index} has invalid row shape"));
+    Ok(columns)
+}
+
+// ASCII complex flags are provisional until the entire stream has been read.
+fn validate_row(
+    plot: &Plot,
+    label: &str,
+    index: usize,
+    point: &[Complex],
+    provisional: bool,
+) -> Result<(), String> {
+    if point.len() != plot.variable_count() {
+        return Err(format!("{label}: point {index} has invalid row shape"));
+    }
+    for (variable, value) in plot.variables().iter().zip(point) {
+        if !value.is_finite() {
+            return Err(format!(
+                "{label}: point {index}, {} has nonfinite value",
+                variable.name
+            ));
         }
-        for (variable, value) in plot.variables().iter().zip(point) {
-            if !value.is_finite() {
-                return Err(format!(
-                    "{label}: point {index}, {} has nonfinite value",
-                    variable.name
-                ));
-            }
-            if (plot.flags() == PlotFlags::Real || variable.is_real) && value.im != 0.0 {
-                return Err(format!(
-                    "{label}: point {index}, {} has imaginary data flagged real",
-                    variable.name
-                ));
-            }
+        if (plot.flags() == PlotFlags::Real || (!provisional && variable.is_real))
+            && value.im != 0.0
+        {
+            return Err(format!(
+                "{label}: point {index}, {} has imaginary data flagged real",
+                variable.name
+            ));
         }
     }
-    Ok(columns)
+    Ok(())
 }
 
 /// Plot name/flags, variable-name set, units and real-vector flags must match
@@ -374,6 +353,23 @@ pub(super) fn check_structure(
             want.flags().as_rawfile()
         ));
     }
+    check_column_sets(got_columns, want_columns)?;
+    for (name, &want_index) in want_columns {
+        let actual = &got.variables()[got_columns[name]];
+        let expected = &want.variables()[want_index];
+        if actual.unit != expected.unit || actual.is_real != expected.is_real {
+            return Err(format!(
+                "variable metadata mismatch for '{name}': Rust {actual:?}; C {expected:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_column_sets(
+    got_columns: &BTreeMap<String, usize>,
+    want_columns: &BTreeMap<String, usize>,
+) -> Result<(), String> {
     let missing: Vec<_> = want_columns
         .keys()
         .filter(|name| !got_columns.contains_key(*name))
@@ -387,107 +383,278 @@ pub(super) fn check_structure(
             "variable mismatch: missing {missing:?}; extra {extra:?}"
         ));
     }
-    for (name, &want_index) in want_columns {
-        let actual = &got.variables()[got_columns[name]];
-        let expected = &want.variables()[want_index];
-        if actual.unit != expected.unit || actual.is_real != expected.is_real {
-            return Err(format!(
-                "variable metadata mismatch for '{name}': Rust {actual:?}; C {expected:?}"
-            ));
-        }
+    Ok(())
+}
+
+fn validate_resolution(got: &Plot, resolution: Option<&Plot>) -> Result<(), String> {
+    if let Some(resolution) = resolution
+        && (resolution.point_count() != got.point_count()
+            || resolution.variables() != got.variables()
+            || resolution
+                .cells()
+                .iter()
+                .any(|value| !value.is_finite() || value.re < 0. || value.im != 0.))
+    {
+        return Err("invalid sensitivity resolution diagnostic".to_owned());
     }
     Ok(())
 }
 
-/// Compare one production plot with one committed C plot. Header dates,
-/// commands, titles and internal plot IDs are not numerical metadata.
-/// Axis identity is explicit in the fixture registry, not inferred from order.
-/// Complex components each satisfy `|got-want| <= relative*|want| + absolute`.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "retain the existing separately rounded component acceptance bounds; changing rounding can change golden classifications at the boundary"
-)]
+/// Bind once, compare in C row/column order, and defer exact metadata checking
+/// until an ASCII complex stream has finalized its per-column realness.
+struct PointComparison<'a> {
+    got: &'a Plot,
+    want: Plot,
+    got_columns: BTreeMap<String, usize>,
+    want_columns: BTreeMap<String, usize>,
+    order: Vec<usize>,
+    axis: Option<(&'a str, usize, usize)>,
+    previous: [Option<f64>; 2],
+    tolerance: Tolerance,
+    resolution: Option<&'a Plot>,
+    alternates: Vec<(&'a Plot, Vec<usize>)>,
+    first: Option<String>,
+    worst: Option<String>,
+    worst_ratio: f64,
+    mismatches: usize,
+}
+
+impl<'a> PointComparison<'a> {
+    fn new(
+        got: &'a Plot,
+        want: &Plot,
+        point_count: usize,
+        tolerance: Tolerance,
+        axis: Option<&'a str>,
+        resolution: Option<&'a Plot>,
+        alternates: &'a [Plot],
+    ) -> Result<Self, String> {
+        let got_columns = validate(got, "Rust")?;
+        if point_count == 0 {
+            return Err("C: empty plot".into());
+        }
+        let want_columns = column_indices(want, "C")?;
+        check_column_sets(&got_columns, &want_columns)?;
+        if got.point_count() != point_count {
+            return Err(format!(
+                "point count mismatch: Rust {}; C {point_count}",
+                got.point_count()
+            ));
+        }
+        let mut order = vec![0; want.variable_count()];
+        for (key, &column) in &want_columns {
+            order[column] = got_columns[key];
+        }
+        validate_resolution(got, resolution)?;
+        let alternates = alternates
+            .iter()
+            .map(|alternate| {
+                let columns = validate(alternate, "alternate C")?;
+                check_structure(got, alternate, &got_columns, &columns)?;
+                if alternate.point_count() != point_count {
+                    return Err("alternate C point count mismatch".to_owned());
+                }
+                let mut order = vec![0; want.variable_count()];
+                for (key, &column) in &want_columns {
+                    order[column] = columns[key];
+                }
+                Ok((alternate, order))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let axis = axis
+            .map(|name| {
+                let got = got_columns
+                    .get(name)
+                    .ok_or_else(|| format!("Rust: missing axis '{name}'"))?;
+                let want = want_columns
+                    .get(name)
+                    .ok_or_else(|| format!("C: missing axis '{name}'"))?;
+                Ok::<_, String>((name, *got, *want))
+            })
+            .transpose()?;
+        Ok(Self {
+            got,
+            want: want.header(),
+            got_columns,
+            want_columns,
+            order,
+            axis,
+            previous: [None; 2],
+            tolerance,
+            resolution,
+            alternates,
+            first: None,
+            worst: None,
+            worst_ratio: 0.0,
+            mismatches: 0,
+        })
+    }
+
+    fn observe(&mut self, point: usize, expected: &[Complex]) -> Result<(), String> {
+        validate_row(&self.want, "C", point, expected, true)?;
+        let actual = self.got.row(point).ok_or("missing Rust row")?;
+        let alternate_rows = self
+            .alternates
+            .iter()
+            .map(|(plot, columns)| {
+                plot.row(point)
+                    .map(|row| (row, columns))
+                    .ok_or("missing alternate C row")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some((axis, got, want)) = self.axis {
+            if alternate_rows
+                .iter()
+                .any(|(row, columns)| row[columns[want]] != expected[want])
+            {
+                return Err("independent C captures have different physical grids".to_owned());
+            }
+            for ((value, label), previous) in [(actual[got], "Rust"), (expected[want], "C")]
+                .into_iter()
+                .zip(&mut self.previous)
+            {
+                if value.im != 0.0 || value.re <= 0.0 || previous.is_some_and(|p| p >= value.re) {
+                    return Err(format!(
+                        "{label}: invalid positive increasing axis '{axis}' at point {point}"
+                    ));
+                }
+                *previous = Some(value.re);
+            }
+        }
+        for (column, &actual_column) in self.order.iter().enumerate() {
+            let variable = &self.want.variables()[column];
+            let got = actual[actual_column];
+            let want = expected[column];
+            // Physical sweep coordinates are exact inputs rather than
+            // finite-difference derivatives: do not apply the output budget.
+            let tolerance = if self.want.plotname == "Sensitivity Analysis"
+                && self.axis.is_some_and(|(_, _, index)| index == column)
+            {
+                SENSITIVITY
+            } else {
+                self.tolerance
+            };
+            for (component, got, reference) in [("re", got.re, want.re), ("im", got.im, want.im)] {
+                let want = if alternate_rows.is_empty() {
+                    reference
+                } else {
+                    let observations = alternate_rows.iter().map(|(row, columns)| {
+                        let sample = row[columns[column]];
+                        if component == "re" {
+                            sample.re
+                        } else {
+                            sample.im
+                        }
+                    });
+                    ngspice_conformance::fixtures::nearest_reference(
+                        got,
+                        std::iter::once(reference).chain(observations),
+                    )?
+                };
+                let resolution_floor = self
+                    .resolution
+                    .and_then(|plot| plot.row(point))
+                    .map_or(0., |row| row[actual_column].re);
+                let error = (got - want).abs();
+                let limit = tolerance
+                    .relative
+                    .mul_add(want.abs(), tolerance.absolute.max(resolution_floor));
+                if error > limit {
+                    self.mismatches += 1;
+                    let ratio = error / limit;
+                    if self.first.is_none() || ratio > self.worst_ratio {
+                        let report = format!(
+                            "point {point}, {}.{component}: Rust {got:.17e}, C {want:.17e}, |error| {error:.6e} > bound {limit:.6e}",
+                            variable.name
+                        );
+                        if self.first.is_none() {
+                            self.first = Some(report.clone());
+                        }
+                        if ratio > self.worst_ratio {
+                            self.worst_ratio = ratio;
+                            self.worst = Some(report);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, final_header: &Plot) -> Result<(), String> {
+        check_structure(
+            self.got,
+            final_header,
+            &self.got_columns,
+            &self.want_columns,
+        )?;
+        self.first.map_or(Ok(()), |first| {
+            Err(format!(
+                "{} component mismatch(es)\nfirst: {first}\nworst ({:.6e}x bound): {}",
+                self.mismatches,
+                self.worst_ratio,
+                self.worst.as_deref().unwrap_or(&first)
+            ))
+        })
+    }
+}
+
+/// Pointwise comparison of a retained Rust plot against one lending C row.
+pub(super) fn stream_points(
+    got: &Plot,
+    mut rows: RawPlotRows<'_, impl BufRead>,
+    tolerance: Tolerance,
+    axis: Option<&str>,
+    resolution: Option<&Plot>,
+    alternates: &[Plot],
+) -> Result<(), String> {
+    let mut comparison = PointComparison::new(
+        got,
+        &rows.header().plot,
+        rows.point_count(),
+        tolerance,
+        axis,
+        resolution,
+        alternates,
+    )?;
+    let mut point = 0;
+    while let Some(row) = rows.next_row().map_err(|error| error.to_string())? {
+        comparison.observe(point, row)?;
+        point += 1;
+    }
+    let final_header = rows.finish().map_err(|error| error.to_string())?;
+    comparison.finish(&final_header.plot)
+}
+
+#[cfg(test)]
 pub(super) fn plots(
     got: &Plot,
     want: &Plot,
+    alternates: &[Plot],
     tolerance: Tolerance,
     axis: Option<&str>,
+    resolution: Option<&Plot>,
 ) -> Result<(), String> {
-    let got_columns = validate(got, "Rust")?;
-    let want_columns = validate(want, "C")?;
-    check_structure(got, want, &got_columns, &want_columns)?;
-    if got.point_count() != want.point_count() {
-        return Err(format!(
-            "point count mismatch: Rust {}; C {}",
-            got.point_count(),
-            want.point_count()
-        ));
+    validate(want, "C")?;
+    let mut comparison = PointComparison::new(
+        got,
+        want,
+        want.point_count(),
+        tolerance,
+        axis,
+        resolution,
+        alternates,
+    )?;
+    for (point, row) in want.rows().enumerate() {
+        comparison.observe(point, row)?;
     }
-    if let Some(axis) = axis {
-        for (plot, columns, label) in [(got, &got_columns, "Rust"), (want, &want_columns, "C")] {
-            let &column = columns
-                .get(axis)
-                .ok_or_else(|| format!("{label}: missing axis '{axis}'"))?;
-            let mut previous = None;
-            for (index, row) in plot.rows().enumerate() {
-                let value = row[column];
-                if value.im != 0.0 || value.re <= 0.0 || previous.is_some_and(|p| p >= value.re) {
-                    return Err(format!(
-                        "{label}: invalid positive increasing axis '{axis}' at point {index}"
-                    ));
-                }
-                previous = Some(value.re);
-            }
-        }
-    }
-    let mut first = None;
-    let mut worst = None;
-    let mut worst_ratio = 0.0;
-    let mut mismatches = 0usize;
-    // C column order supplies stable, human-readable first-mismatch diagnostics.
-    // The key identifies a repeated name by occurrence (`validate`), so a
-    // device with two branch currents is compared position by position.
-    let mut order: Vec<(&String, &usize)> = want_columns.iter().collect();
-    order.sort_by_key(|(_, index)| **index);
-    for (point, (actual, expected)) in got.rows().zip(want.rows()).enumerate() {
-        for (key, column) in &order {
-            let variable = &want.variables()[**column];
-            let got = actual[got_columns[*key]];
-            let want = expected[**column];
-            for (component, got, want) in [("re", got.re, want.re), ("im", got.im, want.im)] {
-                let error = (got - want).abs();
-                let limit = tolerance.relative * want.abs() + tolerance.absolute;
-                if error > limit {
-                    mismatches += 1;
-                    let report = format!(
-                        "point {point}, {}.{component}: Rust {got:.17e}, C {want:.17e}, |error| {error:.6e} > bound {limit:.6e}",
-                        variable.name
-                    );
-                    if first.is_none() {
-                        first = Some(report.clone());
-                    }
-                    let ratio = error / limit;
-                    if ratio > worst_ratio {
-                        worst_ratio = ratio;
-                        worst = Some(report);
-                    }
-                }
-            }
-        }
-    }
-    first.map_or(Ok(()), |first| {
-        Err(format!(
-            "{mismatches} component mismatch(es)\nfirst: {first}\nworst ({worst_ratio:.6e}x bound): {}",
-            worst.as_deref().unwrap_or(&first)
-        ))
-    })
+    comparison.finish(want)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ngspice_rs::analysis::Variable;
-    use ngspice_rs::primitives::Complex;
 
     fn plot() -> Plot {
         Plot::new(
@@ -520,7 +687,41 @@ mod tests {
     }
 
     fn compare(got: &Plot, want: &Plot) -> Result<(), String> {
-        plots(got, want, AC, Some("frequency"))
+        plots(got, want, &[], AC, Some("frequency"), None)
+    }
+
+    #[test]
+    fn streamed_columns_finalize_realness_and_match_retained_diagnostics() {
+        use ngspice_rs::analysis::{RawFile, RawFileReader};
+        let want = edit(&plot(), |_, vars, _| vars[0].is_real = true);
+        let raw = RawFile::single(want.clone()).to_ascii().unwrap();
+        let check = |got: &Plot, raw: &str| {
+            let mut reader = RawFileReader::new(raw.as_bytes());
+            stream_points(
+                got,
+                reader.next_plot().unwrap().unwrap(),
+                AC,
+                Some("frequency"),
+                None,
+                &[],
+            )
+        };
+        check(&want, &raw).unwrap();
+        let wrong_flags = edit(&want, |_, vars, _| vars[0].is_real = false);
+        assert!(check(&wrong_flags, &raw).unwrap_err().contains("metadata"));
+        let mut got = want.clone();
+        got.point_mut(0).unwrap()[1].re += 0.01;
+        got.point_mut(1).unwrap()[1].im = 1.0;
+        assert_eq!(check(&got, &raw), compare(&got, &want));
+        let (truncated, _) = raw.trim_end().rsplit_once('\n').unwrap();
+        assert!(check(&want, truncated).is_err());
+        let unexpected = edit(&want, |_, vars, rows| {
+            vars.push(Variable::complex("v(unexpected)", "voltage"));
+            for row in rows {
+                row.push(Complex::ZERO);
+            }
+        });
+        assert!(check(&unexpected, &raw).unwrap_err().contains("extra"));
     }
 
     #[test]
@@ -642,7 +843,13 @@ mod tests {
 
     #[test]
     fn components_and_zero_use_relative_plus_absolute_bounds() {
-        for tolerance in [DC, AC] {
+        for tolerance in [
+            DC,
+            AC,
+            SENSITIVITY,
+            SENSITIVITY_NONLINEAR,
+            SENSITIVITY_CANCELLED,
+        ] {
             let want = plot();
             for (point, component) in [(0, "re"), (0, "im"), (1, "re"), (1, "im")] {
                 let mut got = want.clone();
@@ -651,19 +858,106 @@ mod tests {
                 } else {
                     &mut got.point_mut(point).unwrap()[1].im
                 };
-                let bound = tolerance.relative * value.abs() + tolerance.absolute;
+                let bound = tolerance.bound(*value);
                 *value += 0.5 * bound;
-                plots(&got, &want, tolerance, None).unwrap();
+                plots(&got, &want, &[], tolerance, None, None).unwrap();
                 *if component == "re" {
                     &mut got.point_mut(point).unwrap()[1].re
                 } else {
                     &mut got.point_mut(point).unwrap()[1].im
                 } += 2.0 * bound;
-                let error = plots(&got, &want, tolerance, None).unwrap_err();
+                let error = plots(&got, &want, &[], tolerance, None, None).unwrap_err();
                 assert!(error.contains(&format!("v(out).{component}")), "{error}");
                 assert!(error.contains("first:") && error.contains("worst"));
             }
         }
+    }
+
+    #[test]
+    fn sensitivity_resolution_applies_only_to_its_own_component_and_row() {
+        let want = plot();
+        let mut resolution = want.clone();
+        for row in resolution.rows_mut() {
+            row.fill(Complex::ZERO);
+        }
+        resolution.point_mut(0).unwrap()[1] = Complex::real(1e-5);
+        let mut got = want.clone();
+        got.point_mut(0).unwrap()[1].re += 3e-6;
+        assert!(compare(&got, &want).is_err());
+        plots(&got, &want, &[], AC, Some("frequency"), Some(&resolution)).unwrap();
+        got.point_mut(1).unwrap()[1].re += 3e-6;
+        assert!(plots(&got, &want, &[], AC, Some("frequency"), Some(&resolution)).is_err());
+        got = want.clone();
+        got.point_mut(0).unwrap()[1].re = 0.;
+        assert!(plots(&got, &want, &[], AC, Some("frequency"), Some(&resolution)).is_err());
+        resolution.point_mut(0).unwrap()[1].re = f64::INFINITY;
+        assert!(plots(&want, &want, &[], AC, Some("frequency"), Some(&resolution)).is_err());
+    }
+
+    #[test]
+    fn nonlinear_sensitivity_accepts_cancellation_not_wrong_sweep_coordinates() {
+        let mut want = plot();
+        want.plotname = "Sensitivity Analysis".into();
+        let mut got = want.clone();
+        got.point_mut(0).unwrap()[1].re *= 1.0005;
+        plots(
+            &got,
+            &want,
+            &[],
+            SENSITIVITY_NONLINEAR,
+            Some("frequency"),
+            None,
+        )
+        .unwrap();
+        assert!(plots(&got, &want, &[], SENSITIVITY, Some("frequency"), None).is_err());
+        got.point_mut(0).unwrap()[0].re *= 1.0005;
+        let error = plots(
+            &got,
+            &want,
+            &[],
+            SENSITIVITY_NONLINEAR,
+            Some("frequency"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("frequency.re"), "{error}");
+        got = want.clone();
+        got.point_mut(0).unwrap()[1].re *= 1.002;
+        assert!(
+            plots(
+                &got,
+                &want,
+                &[],
+                SENSITIVITY_NONLINEAR,
+                Some("frequency"),
+                None
+            )
+            .is_err()
+        );
+        got = want.clone();
+        got.point_mut(1).unwrap()[1].re = 2e-8;
+        assert!(
+            plots(
+                &got,
+                &want,
+                &[],
+                SENSITIVITY_NONLINEAR,
+                Some("frequency"),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            plots(
+                &got,
+                &want,
+                &[],
+                SENSITIVITY_CANCELLED,
+                Some("frequency"),
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -837,7 +1131,7 @@ mod tests {
     #[test]
     fn axis_identity_values_and_monotonicity_are_checked() {
         let want = plot();
-        assert!(plots(&want, &want, AC, Some("time")).is_err());
+        assert!(plots(&want, &want, &[], AC, Some("time"), None).is_err());
         for value in [Complex::ZERO, Complex::real(-1.0), Complex::new(100.0, 1.0)] {
             let mut got = want.clone();
             got.point_mut(0).unwrap()[0] = value;

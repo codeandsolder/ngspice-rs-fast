@@ -217,41 +217,149 @@ impl Matrix {
             shape: self.shape.transpose(),
             data: filled_vec(self.len(), 0.0, "dense matrix transpose")?,
         };
-        if self.is_empty() {
-            return Ok(result);
+        self.write_transposed(&mut result.data);
+        Ok(result)
+    }
+
+    /// Transpose into existing storage without allocating.
+    ///
+    /// # Errors
+    /// [`SpiceError::Numerical`] when output dimensions are not transposed.
+    /// Shape mismatch leaves the destination unchanged.
+    pub fn transpose_into(&self, output: &mut Self) -> SpiceResult<()> {
+        if output.shape != self.shape.transpose() {
+            return Err(SpiceError::Numerical {
+                context: "dense matrix transpose".to_owned(),
+                message: format!(
+                    "expected {}x{} destination, got {}x{}",
+                    self.cols(),
+                    self.rows(),
+                    output.rows(),
+                    output.cols(),
+                ),
+            });
         }
-        for row in 0..self.shape.rows {
-            for col in 0..self.shape.cols {
-                result.data[col * self.shape.rows + row] = self.data[row * self.shape.cols + col];
+        self.write_transposed(&mut output.data);
+        Ok(())
+    }
+
+    fn write_transposed(&self, output: &mut [Real]) {
+        const TILE: usize = 32;
+        if self.is_empty() {
+            return;
+        }
+        let rows = self.rows();
+        let cols = self.cols();
+        if rows == 1 || cols == 1 {
+            output.copy_from_slice(&self.data);
+            return;
+        }
+
+        // A tiny matrix fits in a fraction of a cache line tile; avoid
+        // setting up blocked destination traversal for a handful of stores.
+        if self.len() <= TILE {
+            for (row, source) in self.data.chunks_exact(cols).enumerate() {
+                for (col, value) in source.iter().enumerate() {
+                    output[col * rows + row] = *value;
+                }
+            }
+            return;
+        }
+
+        // With one row tile, whole destination columns are contiguous.
+        if rows <= TILE {
+            for (col, column) in output.chunks_exact_mut(rows).enumerate() {
+                for (destination, source) in column.iter_mut().zip(self.data.chunks_exact(cols)) {
+                    *destination = source[col];
+                }
+            }
+            return;
+        }
+
+        // Bound the working set of the source and destination tiles to
+        // 16 KiB of coefficients, with contiguous destination writes.
+        for col_start in (0..cols).step_by(TILE) {
+            let col_end = (col_start + TILE).min(cols);
+            let output_columns = &mut output[col_start * rows..col_end * rows];
+            for row_start in (0..rows).step_by(TILE) {
+                let row_end = (row_start + TILE).min(rows);
+                let input_rows = &self.data[row_start * cols..row_end * cols];
+                for (offset, column) in output_columns.chunks_exact_mut(rows).enumerate() {
+                    let col = col_start + offset;
+                    for (destination, source) in column[row_start..row_end]
+                        .iter_mut()
+                        .zip(input_rows.chunks_exact(cols))
+                    {
+                        *destination = source[col];
+                    }
+                }
             }
         }
-        Ok(result)
     }
 
     /// Matrix–vector product.
     ///
     /// # Errors
-    ///
     /// [`SpiceError::Numerical`] when the dimensions do not agree or output storage cannot be allocated.
     pub fn mul_vector(&self, vector: &Vector) -> SpiceResult<Vector> {
-        if vector.len() != self.shape.cols {
-            return Err(length_error(self.shape.cols, vector.len()));
+        if vector.len() != self.cols() {
+            return Err(length_error(self.cols(), vector.len()));
         }
-        let mut result = Vector::from(filled_vec(self.shape.rows, 0.0, "dense matrix product")?);
-        if self.shape.cols != 0 {
-            for (row, output) in self
-                .data
-                .chunks_exact(self.shape.cols)
-                .zip(result.as_mut_slice())
-            {
-                let mut sum = 0.0;
-                for (entry, value) in row.iter().zip(vector.as_slice()) {
-                    sum += entry * value;
-                }
-                *output = sum;
-            }
-        }
+        let mut result = Vector::from(filled_vec(self.rows(), 0.0, "dense matrix product")?);
+        self.write_product(vector.as_slice(), result.as_mut_slice());
         Ok(result)
+    }
+
+    /// Matrix–vector product into existing storage without allocating.
+    ///
+    /// # Errors
+    /// [`SpiceError::Numerical`] when either vector has the wrong length.
+    /// A dimension mismatch leaves the destination unchanged.
+    pub fn mul_vector_into(&self, vector: &Vector, output: &mut Vector) -> SpiceResult<()> {
+        if vector.len() != self.cols() {
+            return Err(length_error(self.cols(), vector.len()));
+        }
+        if output.len() != self.rows() {
+            return Err(length_error(self.rows(), output.len()));
+        }
+        self.write_product(vector.as_slice(), output.as_mut_slice());
+        Ok(())
+    }
+
+    fn write_product(&self, vector: &[Real], output: &mut [Real]) {
+        let cols = self.cols();
+        if cols == 0 {
+            output.fill(0.0);
+            return;
+        }
+        // Four independent row accumulators expose instruction-level
+        // parallelism and packed arithmetic to LLVM. Each output still adds
+        // the individually rounded products in the original column order.
+        let (groups, tail) = output.as_chunks_mut::<4>();
+        let mut data = self.data.as_slice();
+        for group in groups {
+            let (first, rest) = data.split_at(cols);
+            let (second, rest) = rest.split_at(cols);
+            let (third, rest) = rest.split_at(cols);
+            let (fourth, rest) = rest.split_at(cols);
+            data = rest;
+            let mut sums = [0.0; 4];
+            for ((((first, second), third), fourth), coefficient) in
+                first.iter().zip(second).zip(third).zip(fourth).zip(vector)
+            {
+                sums[0] += first * coefficient;
+                sums[1] += second * coefficient;
+                sums[2] += third * coefficient;
+                sums[3] += fourth * coefficient;
+            }
+            *group = sums;
+        }
+        for (row, destination) in data.chunks_exact(cols).zip(tail) {
+            *destination = row
+                .iter()
+                .zip(vector)
+                .fold(0.0, |sum, (entry, value)| sum + entry * value);
+        }
     }
 
     /// Factors a snapshot without changing row-major storage.
@@ -371,22 +479,27 @@ pub(crate) fn symmetric_eigenvalue_cost(order: usize) -> Option<(usize, usize)> 
 /// Cyclic Jacobi eigenvalues of the symmetric row-major `a` (n x n), sorted.
 /// `None` if the off-diagonal mass fails to vanish within the sweep budget.
 fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<Vec<Real>>> {
-    let off_diagonal_norm = |data: &[Real]| -> Real {
-        let mut sum = 0.0;
-        for row in 0..order {
-            for col in 0..order {
-                if row != col {
-                    let entry = data[row * order + col];
-                    let squared = entry * entry;
-                    sum += squared;
-                }
+    let initial_norm: Real = data.iter().map(|value| value * value).sum();
+    // The omitted symmetric off-diagonal is exactly the backward perturbation
+    // to the diagonal eigensystem: Weyl bounds every eigenvalue error by its
+    // Frobenius norm. Permit four roundoff units per coordinate direction.
+    // Since ||A||_F <= sqrt(n) ||A||_2, this leaves an eigenvalue bound
+    // <= 4*n*eps*||A||_2, sixteen times below mutual validation's
+    // 64*n*eps*||A||_2 negative-eigenvalue acceptance threshold.
+    let dimension = Real::from(u32::try_from(order).map_err(|_| {
+        SpiceError::circuit("dense symmetric eigenvalue order exceeds numerical range")
+    })?);
+    let backward_limit = 4. * dimension.sqrt() * Real::EPSILON;
+    let threshold = backward_limit * backward_limit * initial_norm;
+    for _sweep in 0..JACOBI_MAX_SWEEPS {
+        let mut off_diagonal = 0.;
+        for first in 0..order {
+            for second in first + 1..order {
+                let entry = data[first * order + second];
+                off_diagonal = (2. * entry).mul_add(entry, off_diagonal);
             }
         }
-        sum
-    };
-    let total: Real = data.iter().map(|value| value * value).sum();
-    for _sweep in 0..JACOBI_MAX_SWEEPS {
-        if off_diagonal_norm(&data) <= Real::EPSILON * Real::EPSILON * total {
+        if off_diagonal <= threshold {
             let mut values = collect_dense(
                 (0..order).map(|index| data[index * order + index]),
                 "dense symmetric eigenvalues",
@@ -397,44 +510,54 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<V
         for first in 0..order {
             for second in first + 1..order {
                 let coupling = data[first * order + second];
-                if coupling == 0.0 {
+                if coupling == 0. {
                     continue;
                 }
-                let theta = (data[second * order + second] - data[first * order + first])
-                    / (2.0 * coupling);
-                let theta_squared = theta * theta;
-                let tangent = theta.signum() / (theta.abs() + (theta_squared + 1.0).sqrt());
-                let tangent = if theta == 0.0 { 1.0 } else { tangent };
-                let tangent_squared = tangent * tangent;
-                let cosine = 1.0 / (tangent_squared + 1.0).sqrt();
+                let a = data[first * order + first];
+                let b = data[second * order + second];
+                // A bounded tangent avoids overflow in (b-a)/(2*coupling)
+                // and cancellation near equal diagonal entries. The matrix
+                // was power-of-two scaled when its dynamic range demanded it.
+                let gap = b - a;
+                let twice = 2. * coupling;
+                let tangent = if gap == 0. {
+                    1.
+                } else {
+                    let magnitude = twice.abs() / (gap.abs() + gap.hypot(twice));
+                    if gap.is_sign_negative() == coupling.is_sign_negative() {
+                        magnitude
+                    } else {
+                        -magnitude
+                    }
+                };
+                let cosine = 1. / tangent.hypot(1.);
                 let sine = tangent * cosine;
-                for index in 0..order {
-                    let first_slot = index * order + first;
-                    let second_slot = index * order + second;
-                    let (left, right) =
-                        rotate_pair(data[first_slot], data[second_slot], cosine, sine);
-                    data[first_slot] = left;
-                    data[second_slot] = right;
+                // Only visit off-pivot pairs. Update each mirror from the
+                // same rounded value instead of rotating rows and columns
+                // independently, which creates skew and a false residual
+                // convergence floor around one ulp of the matrix norm.
+                for row in 0..order {
+                    if row == first || row == second {
+                        continue;
+                    }
+                    let left = data[row * order + first];
+                    let right = data[row * order + second];
+                    let rotated_left = (-sine).mul_add(right, cosine * left);
+                    let rotated_right = sine.mul_add(left, cosine * right);
+                    data[row * order + first] = rotated_left;
+                    data[first * order + row] = rotated_left;
+                    data[row * order + second] = rotated_right;
+                    data[second * order + row] = rotated_right;
                 }
-                for index in 0..order {
-                    let first_slot = first * order + index;
-                    let second_slot = second * order + index;
-                    let (left, right) =
-                        rotate_pair(data[first_slot], data[second_slot], cosine, sine);
-                    data[first_slot] = left;
-                    data[second_slot] = right;
-                }
+                let change = tangent * coupling;
+                data[first * order + first] = a - change;
+                data[second * order + second] = b + change;
+                data[first * order + second] = 0.;
+                data[second * order + first] = 0.;
             }
         }
     }
     Ok(None)
-}
-
-// Round the products separately, preserving the original rotation arithmetic.
-const fn rotate_pair(first: Real, second: Real, cosine: Real, sine: Real) -> (Real, Real) {
-    let direct = (cosine * first, cosine * second);
-    let crossed = (sine * second, sine * first);
-    (direct.0 - crossed.0, crossed.1 + direct.1)
 }
 
 /// A dense real vector, used for the MNA right-hand side and the solution.

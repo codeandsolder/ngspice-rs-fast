@@ -32,6 +32,70 @@ use crate::maths::sparse13::{Scalar, Sparse, Status};
 use crate::maths::{FactorStorage, FactorWork, Matrix, Pattern, PatternWork, SparseMatrix, Vector};
 use crate::primitives::{Complex, SpiceError, SpiceResult};
 
+/// Number of independent right-hand sides in a sparse solve tile.
+pub const RHS_BATCH_WIDTH: usize = 4;
+
+/// Reusable, scalar-typed sparse multiple-RHS solve scratch.
+///
+/// Internal storage is tiled by matrix row, with one lane per RHS.
+/// Regardless of the total RHS count, scratch holds only one tile and one scalar tail.
+#[derive(Debug)]
+pub struct SolveBatchWorkspace<T> {
+    pub(super) real: Vec<std::simd::f64x4>,
+    pub(super) imag: Vec<std::simd::f64x4>,
+    pub(super) scalar: Vec<T>,
+}
+
+impl<T> Default for SolveBatchWorkspace<T> {
+    fn default() -> Self {
+        Self {
+            real: Vec::new(),
+            imag: Vec::new(),
+            scalar: Vec::new(),
+        }
+    }
+}
+
+/// A batched solve failure, retaining the first affected RHS for callers
+/// that attach independent circuit excitation or parameter identities.
+#[derive(Debug)]
+pub struct BatchSolveFailure {
+    /// Zero-based RHS index, or none for a shape, factor or resource error.
+    pub rhs_index: Option<usize>,
+    /// The underlying numerical/storage diagnostic.
+    pub cause: SpiceError,
+}
+
+impl From<SpiceError> for BatchSolveFailure {
+    fn from(cause: SpiceError) -> Self {
+        Self {
+            rhs_index: None,
+            cause,
+        }
+    }
+}
+
+impl From<BatchSolveFailure> for SpiceError {
+    fn from(error: BatchSolveFailure) -> Self {
+        error.cause
+    }
+}
+
+impl std::fmt::Display for BatchSolveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(index) = self.rhs_index {
+            write!(f, "RHS {index}: ")?;
+        }
+        self.cause.fmt(f)
+    }
+}
+
+impl std::error::Error for BatchSolveFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 /// Sparse pivot tolerances used when ordering a circuit matrix.
 ///
 /// SPARSE threshold-pivoting limits for ordering a circuit matrix: C's
@@ -383,6 +447,14 @@ impl SparseSymbolic {
 
     fn solve_with_workspace(&self, rhs: &Vector, workspace: &mut Vec<f64>) -> SpiceResult<Vector> {
         solve_real(&self.sparse, self.n, rhs, workspace, false)
+    }
+
+    fn solve_transposed_with_workspace(
+        &self,
+        rhs: &Vector,
+        workspace: &mut Vec<f64>,
+    ) -> SpiceResult<Vector> {
+        solve_real(&self.sparse, self.n, rhs, workspace, true)
     }
 
     /// Whether a matrix has exactly this assembled pattern.
@@ -792,13 +864,41 @@ fn ni_step(
 /// # Errors
 /// An invalid RHS or a non-finite solution.
 pub fn solve_last_factors(pattern: &Arc<Pattern>, rhs: &Vector) -> SpiceResult<Option<Vector>> {
+    solve_last_factors_direction(pattern, rhs, false)
+}
+
+/// Solve `A^T λ = g` from the circuit's retained primal factorization.
+///
+/// This is an ordinary *transpose*, not an inverse of the transposed input
+/// stamps and not a separately factorized Jacobian. Objective derivatives
+/// use one such solve for all parameter residuals at the same bias.
+///
+/// # Errors
+/// Invalid RHS or non-finite solution. Returns `None` if the circuit's
+/// previously factored matrix has been invalidated.
+pub(crate) fn solve_last_factors_transposed(
+    pattern: &Arc<Pattern>,
+    rhs: &Vector,
+) -> SpiceResult<Option<Vector>> {
+    solve_last_factors_direction(pattern, rhs, true)
+}
+
+fn solve_last_factors_direction(
+    pattern: &Arc<Pattern>,
+    rhs: &Vector,
+    transpose: bool,
+) -> SpiceResult<Option<Vector>> {
     pattern.with_ordering(|state| {
         match &state.frame {
             Some(CachedFrame::Real(symbolic))
                 if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
                     && symbolic.sparse.is_factored() =>
             {
-                let result = symbolic.solve_with_workspace(rhs, &mut state.solve_workspace);
+                let result = if transpose {
+                    symbolic.solve_transposed_with_workspace(rhs, &mut state.solve_workspace)
+                } else {
+                    symbolic.solve_with_workspace(rhs, &mut state.solve_workspace)
+                };
                 state.work.record_rhs(&result);
                 Some(result)
             }
@@ -979,10 +1079,30 @@ impl SparseLu {
         solve_real(&self.symbolic.sparse, self.symbolic.n, rhs, workspace, true)
     }
 
-    /// `spDeterminant`: `(mantissa, decimal exponent)`.
+    /// Solve consecutive RHS-major vectors using one factor traversal per tile.
+    ///
+    /// The output retains RHS order and external matrix ordering. A transpose
+    /// solve uses the same factors. Scratch and output capacities are reusable.
+    ///
+    /// # Errors
+    /// Invalid RHS length, non-finite input or solution, or insufficient storage.
+    pub fn solve_batch_into(
+        &self,
+        rhs: &[f64],
+        workspace: &mut SolveBatchWorkspace<f64>,
+        out: &mut Vec<f64>,
+        transposed: bool,
+    ) -> Result<(), BatchSolveFailure> {
+        self.symbolic
+            .sparse
+            .factors()?
+            .solve_batch_into(rhs, workspace, out, transposed)
+    }
+
+    /// Binary-scaled determinant: `(mantissa, base-2 exponent)`.
     /// # Errors
     /// Non-finite/invalid inverse factors or an out-of-range exponent.
-    pub fn determinant(&self) -> SpiceResult<(f64, i32)> {
+    pub fn determinant(&self) -> SpiceResult<(f64, i64)> {
         self.symbolic.sparse.factors()?.determinant()
     }
 }
@@ -1202,6 +1322,40 @@ mod tests {
         assert_ne!(read(), initial);
         assert_eq!(snapshot.solve(&[Complex::real(1.)]).unwrap(), x);
         assert_ne!(next.solve(&[Complex::real(1.)]).unwrap(), x);
+    }
+
+    #[test]
+    fn retained_sparse_transpose_projects_one_objective_without_refactoring() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
+        let mut matrix = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        for (r, c, value) in [(0, 0, 3.), (0, 1, 1.), (1, 0, 2.), (1, 1, 4.)] {
+            matrix.set(r, c, value).unwrap();
+        }
+        let source = Vector::from_slice(&[5., 7.]);
+        assert!(matches!(
+            solve_ni(&matrix, &source, &mut None, false, 0.).unwrap(),
+            NiStep::Solved(_)
+        ));
+        let output = Vector::from_slice(&[1., -1.]);
+        let adjoint = solve_last_factors_transposed(&pattern, &output)
+            .unwrap()
+            .unwrap();
+        let expected = [0.6, -0.4];
+        for (actual, want) in adjoint.as_slice().iter().zip(expected) {
+            assert!((*actual - want).abs() < 1e-14);
+        }
+        let primal = solve_last_factors(&pattern, &source).unwrap().unwrap();
+        let projected = adjoint.as_slice()[0] * source.as_slice()[0]
+            + adjoint.as_slice()[1] * source.as_slice()[1];
+        let directly = primal.as_slice()[0] - primal.as_slice()[1];
+        assert!((projected - directly).abs() < 1e-14);
+        matrix.set(0, 0, f64::from_bits(1)).unwrap();
+        assert!(solve_ni(&matrix, &source, &mut None, false, 0.).is_err());
+        assert!(
+            solve_last_factors_transposed(&pattern, &output)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

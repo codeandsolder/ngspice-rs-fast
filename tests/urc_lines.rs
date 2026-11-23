@@ -119,11 +119,21 @@ fn the_expansion_follows_urcsetup_names_and_order() {
     let (p, r0, c0): (Real, Real, Real) = (1.5, 1e-5 * 1000., 1e-5 * 1e-12);
     let r1 = (r0 * (p - 1.)) / ((2. * p.powf(3.)) - 2.);
     let c1 = (c0 * (p - 1.)) / (p.powf(2.) * (p + 1.) - 2.);
-    assert_eq!(parameter(&c, "u1#rlo1", "resistance"), r1);
-    assert_eq!(parameter(&c, "u1#rhi2", "resistance"), p * r1);
-    assert_eq!(parameter(&c, "u1#rlo3", "resistance"), p * p * r1);
-    assert_eq!(parameter(&c, "u1#clo1", "capacitance"), c1);
-    assert_eq!(parameter(&c, "u1#clo3", "capacitance"), p * p * c1);
+    // The ladder is normalized by actual positive geometric weights rather
+    // than subtracting nearly equal powers of K. That changes only the last
+    // bits of individual coefficients, without changing the physical model.
+    let same = |observed: Real, reference: Real| {
+        let tolerance = 4. * Real::EPSILON * reference.abs();
+        assert!(
+            (observed - reference).abs() <= tolerance,
+            "{observed:e} vs {reference:e} (tolerance {tolerance:e})"
+        );
+    };
+    same(parameter(&c, "u1#rlo1", "resistance"), r1);
+    same(parameter(&c, "u1#rhi2", "resistance"), p * r1);
+    same(parameter(&c, "u1#rlo3", "resistance"), p * p * r1);
+    same(parameter(&c, "u1#clo1", "capacitance"), c1);
+    same(parameter(&c, "u1#clo3", "capacitance"), p * p * c1);
 }
 
 #[test]

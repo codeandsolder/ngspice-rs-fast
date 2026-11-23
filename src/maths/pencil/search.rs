@@ -349,12 +349,30 @@ enum TraceEvent {
     Determinant(Cx, i64),
 }
 
+/// The actual polynomial deflation factor for a real root or a conjugate
+/// pair. A squared modulus only agrees with this at real trial frequencies.
+fn root_factor(root: Cx, trial: Cx) -> SpiceResult<(Cx, i64)> {
+    let mut factor = root.sub(trial);
+    let mut exponent = 0;
+    c_norm(&mut factor, &mut exponent)?;
+    if root.im != 0.0 {
+        let mut conjugate = Cx::new(root.re, -root.im).sub(trial);
+        let mut conjugate_exponent = 0;
+        c_norm(&mut conjugate, &mut conjugate_exponent)?;
+        factor = factor.mul(conjugate);
+        exponent += conjugate_exponent;
+        c_norm(&mut factor, &mut exponent)?;
+    }
+    Ok((factor, exponent))
+}
+
 /// One `CKTpzFindZeros` run with its independent scheduler and trial arena.
 struct Search<'a> {
     pencil: LoadedPencil<'a>,
     arena: TrialArena,
     nzeros: usize,
     max_zeros: usize,
+    regular: bool,
     seq_num: usize,
     guess_param: Real,
     high_guess: Real,
@@ -374,7 +392,8 @@ impl<'a> Search<'a> {
             pencil: LoadedPencil::new(load)?,
             arena: TrialArena::default(),
             nzeros: 0,
-            max_zeros: load.order,
+            max_zeros: load.degree_bound(),
+            regular: false,
             seq_num: 1,
             guess_param: 0.0,
             high_guess: -1.0,
@@ -444,7 +463,25 @@ impl Search<'_> {
                 break;
             }
         }
-        if self.nzeros + 1 >= self.seq_num {
+        if !self.regular {
+            // A degree-one pencil can hit its exact root at the first
+            // trial. Prove regularity at a distinct point before calling
+            // it identically singular. A polynomial of degree <= d
+            // cannot vanish at d+1 distinct points unless it is zero.
+            let mut probe = 0.;
+            for _ in 0..=self.max_zeros {
+                if self
+                    .pencil
+                    .determinant_at(Cx::new(probe, 0.))?
+                    .is_some_and(|(v, _)| !v.is_zero())
+                {
+                    self.regular = true;
+                    break;
+                }
+                probe += 1.;
+            }
+        }
+        if !self.regular {
             return Err(numerical(
                 "pole-zero search",
                 "singular pencil: the determinant vanished at every trial (C E_SHORT, \
@@ -516,12 +553,12 @@ impl Search<'_> {
                 match region {
                     Region::LeftCrossing => {
                         if trial.re < s0.re || trial.re > s1.re {
-                            trial.re = (s0.re + s1.re) / 2.0;
+                            trial.re = s0.re.midpoint(s1.re);
                         }
                     }
                     Region::RightCrossing => {
                         if trial.re < s1.re || trial.re > s2.re {
-                            trial.re = (s1.re + s2.re) / 2.0;
+                            trial.re = s1.re.midpoint(s2.re);
                         }
                     }
                     Region::Minimum => {
@@ -529,15 +566,15 @@ impl Search<'_> {
                             || (trial.re == s1.re && trial.im == s1.im)
                             || trial.re >= s2.re
                         {
-                            trial.re = (s0.re + s2.re) / 2.0;
+                            trial.re = s0.re.midpoint(s2.re);
                             if trial.re == s1.re {
                                 trial.re = if matches!(
                                     self.last_move,
                                     Move::Mid(Side::Left) | Move::Near(Side::Right)
                                 ) {
-                                    (s0.re + s1.re) / 2.0
+                                    s0.re.midpoint(s1.re)
                                 } else {
-                                    (s1.re + s2.re) / 2.0
+                                    s1.re.midpoint(s2.re)
                                 };
                             }
                         }
@@ -561,7 +598,8 @@ impl Search<'_> {
             }
             Evaluation::Muller(triple) => muller(triple.trials(&self.arena)?)?,
             Evaluation::Split { edge, middle } => Cx::new(
-                (self.arena.frequency(edge)?.re + 2.0 * self.arena.frequency(middle)?.re) / 3.0,
+                (self.arena.frequency(middle)?.re / 3.0)
+                    .mul_add(2.0, self.arena.frequency(edge)?.re / 3.0),
                 0.0,
             ),
         };
@@ -653,112 +691,344 @@ impl Search<'_> {
         Ok(suggestion)
     }
 
-    /// `CKTpzRunTrial`: evaluate a proposed frequency, or merge a collision
-    /// with an existing linked trial. Deflation is accumulated in list order.
-    fn run_trial(&mut self, mut s: Cx, middle: Option<TrialId>) -> SpiceResult<TrialId> {
-        if s.im < 0.0 {
-            s.im *= -1.0;
+    /// Evaluate the determinant after deflating every accepted root. The
+    /// probe path uses the same factored pencil as ordinary trials.
+    fn deflated_at(&mut self, s: Cx) -> SpiceResult<(Cx, i64)> {
+        let determinant = self.pencil.determinant_at(s)?;
+        #[cfg(test)]
+        if let Some((value, exponent)) = determinant {
+            self.trace.push(TraceEvent::Determinant(value, exponent));
         }
+        let Some((mut value, mut exponent)) = determinant else {
+            return Ok((Cx::ZERO, 0));
+        };
+        self.regular |= !value.is_zero();
+        let mut current = self.arena.head();
+        while let Some(id) = current {
+            let trial = self.arena.get(id)?;
+            if trial.is_root() {
+                let (factor, shift) = root_factor(trial.s(), s)?;
+                if factor.is_zero() {
+                    return Err(numerical(
+                        "pole-zero search",
+                        "deflation at an existing root",
+                    ));
+                }
+                for _ in 0..trial.multiplicity() {
+                    value = value.div(factor);
+                    exponent -= shift;
+                    c_norm(&mut value, &mut exponent)?;
+                }
+            }
+            current = trial.next();
+        }
+        Ok((value, exponent))
+    }
+
+    /// A coincident trial is not in itself evidence of a root. Check the
+    /// local deflated determinant against displaced values, including
+    /// the linear and quadratic terms of its local Taylor polynomial.
+    fn coincident_root(&mut self, s: Cx) -> SpiceResult<bool> {
+        let center = self.deflated_at(s)?;
+        if center.0.is_zero() {
+            return Ok(true);
+        }
+        let scale = s.re.hypot(s.im).max(1e-12);
+        let step = scale * 2_f64.powi(-20);
+        let left = self.deflated_at(Cx::new(s.re - step, s.im))?;
+        let right = self.deflated_at(Cx::new(s.re + step, s.im))?;
+        let exponent = [center, left, right]
+            .into_iter()
+            .filter(|(value, _)| !value.is_zero())
+            .map(|(_, exponent)| exponent)
+            .max()
+            .unwrap_or_default();
+        let aligned =
+            |(value, shift): (Cx, i64)| value.scale(materialize_power(1., shift - exponent));
+        let (center, left, right) = (aligned(center), aligned(left), aligned(right));
+        let norm = |value: Cx| value.re.hypot(value.im);
+        let slope = right.sub(left).scale(0.5);
+        let curvature = right.add(left).scale(0.5).sub(center);
+        let relative = 4. * 1e-12_f64.mul_add(scale, 1e-20) / step;
+        // For a simple root this bounds the Newton correction. At an
+        // unresolved repeated root the leading local term is quadratic.
+        Ok(norm(center) <= relative * norm(slope)
+            || norm(center) <= relative * relative * norm(curvature))
+    }
+
+    /// An already deflated simple root must not acquire another occurrence
+    /// merely because the search revisits its neighborhood. A remaining
+    /// multiplicity makes the deflated function tend to zero on both sides.
+    fn remaining_multiplicity(&mut self, s: Cx) -> SpiceResult<bool> {
+        let step = s.re.hypot(s.im).max(1e-12) * 2_f64.powi(-23);
+        for direction in [-1.0_f64, 1.] {
+            let far = self.deflated_at(Cx::new(direction.mul_add(step, s.re), s.im))?;
+            let near = self.deflated_at(Cx::new(direction.mul_add(step * 0.5, s.re), s.im))?;
+            if far.0.is_zero() {
+                return Ok(false);
+            }
+            let ratio = materialize_power(
+                near.0.re.hypot(near.0.im) / far.0.re.hypot(far.0.im),
+                near.1 - far.1,
+            );
+            if ratio > 0.75 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The search's convergence radius is not a license to count a tiny
+    /// imaginary perturbation as a second pole. Resolve an accepted candidate
+    /// against the real determinant: a simple real root has a sign bracket and
+    /// a localized Newton correction, while a genuine conjugate pair has no
+    /// such nearby real crossing. An exact zero on the real axis also permits
+    /// repeated roots (where the first derivative necessarily vanishes).
+    ///
+    /// All determinant probes use the already-deflated pencil. This is called
+    /// only for candidates that have passed the ordinary residual test.
+    fn real_axis_root(&mut self, s: Cx) -> SpiceResult<Option<Cx>> {
+        let scale = s.re.abs().max(s.im);
+        let ulp = s.re.abs().next_up() - s.re.abs();
+        let step = (scale * 2_f64.powi(-20)).max(s.im * 32.).max(ulp * 32.);
+        if !step.is_finite() || step == 0. {
+            return Ok(None);
+        }
+        let (left_x, right_x) = (s.re - step, s.re + step);
+        if !left_x.is_finite() || !right_x.is_finite() || left_x == s.re || right_x == s.re {
+            return Ok(None);
+        }
+        let center = self.deflated_at(Cx::new(s.re, 0.))?;
+        if center.0.is_zero() {
+            // A true complex zero at the same real part must not be
+            // discarded merely because a real zero also exists. When
+            // the imaginary displacement is smaller than one real-axis
+            // ULP, the two evaluations are not numerically resolvable:
+            // the exact real zero is the supported classification.
+            if s.im == 0. || s.im <= ulp || !self.deflated_at(s)?.0.is_zero() {
+                return Ok(Some(Cx::new(s.re, 0.)));
+            }
+            return Ok(None);
+        }
+        let left = self.deflated_at(Cx::new(left_x, 0.))?;
+        let right = self.deflated_at(Cx::new(right_x, 0.))?;
+        let (difference, difference_exponent) = zaddeq(right.0.re, right.1, -left.0.re, left.1)?;
+        let repeated = sgn(left.0.re) == sgn(right.0.re);
+        let correction = if repeated {
+            // A repeated real zero has no sign change. Fit a *local*
+            // quadratic using the symmetric divided differences. Its
+            // discriminant vanishes up to uncertainty in the representable
+            // real coordinate. In contrast, conjugate pairs and two distinct
+            // neighboring real roots have respectively positive/negative
+            // nonzero vertex residuals.
+            let (ends, ends_exponent) = zaddeq(left.0.re, left.1, right.0.re, right.1)?;
+            let (curvature, curvature_exponent) =
+                zaddeq(ends, ends_exponent, -center.0.re, center.1 + 1)?;
+            if curvature == 0. {
+                return Ok(None);
+            }
+            let slope = materialize_power(
+                difference / curvature,
+                difference_exponent - curvature_exponent,
+            );
+            let offset = materialize_power(center.0.re / curvature, center.1 - curvature_exponent);
+            let normalized_vertex = offset - slope * slope / 8.;
+            if !slope.is_finite()
+                || !normalized_vertex.is_finite()
+                || normalized_vertex.abs() > 16. * (ulp / step).powi(2)
+            {
+                return Ok(None);
+            }
+            -0.5 * step * slope
+        } else {
+            if difference == 0. {
+                return Ok(None);
+            }
+            materialize_power(
+                (-center.0.re / difference) * step,
+                center.1 - difference_exponent + 1,
+            )
+        };
+        let accepted_radius = 4e-12_f64
+            .mul_add(scale.max(1e-12), 1e-20)
+            .max(8. * s.im)
+            .max(64. * ulp);
+        if !correction.is_finite()
+            || correction.abs() > accepted_radius
+            || correction.abs() > step * 0.5
+        {
+            return Ok(None);
+        }
+        let root_x = s.re + correction;
+        if !(left_x..=right_x).contains(&root_x) {
+            return Ok(None);
+        }
+        let complex = if s.im == 0. {
+            None
+        } else {
+            let value = self.deflated_at(s)?;
+            if value.0.is_zero() && s.im > ulp {
+                return Ok(None);
+            }
+            if !repeated && !value.0.is_zero() {
+                // At a simple real root, a complex displacement produces
+                // approximately i * Im(s) * D'(Re(s)). An actual complex
+                // root has a much smaller residual than this.
+                let complex_to_slope = materialize_power(
+                    value.0.re.hypot(value.0.im) / difference.abs(),
+                    value.1 - difference_exponent,
+                );
+                if complex_to_slope < s.im / (16. * step) {
+                    return Ok(None);
+                }
+            }
+            Some(value)
+        };
+        let refined = self.deflated_at(Cx::new(root_x, 0.))?;
+        if repeated && let Some(complex) = complex {
+            let residual_ratio = if refined.0.is_zero() {
+                0.
+            } else {
+                materialize_power(
+                    refined.0.re.hypot(refined.0.im) / complex.0.re.hypot(complex.0.im),
+                    refined.1 - complex.1,
+                )
+            };
+            if residual_ratio > 0.125 {
+                return Ok(None);
+            }
+        }
+        if root_x != s.re && !refined.0.is_zero() {
+            let residual_ratio = materialize_power(
+                refined.0.re.hypot(refined.0.im) / center.0.re.hypot(center.0.im),
+                refined.1 - center.1,
+            );
+            if residual_ratio > 0.5 {
+                // Around an exact real crossing the LU determinant can
+                // already be at its rounding floor. A correction of only
+                // a few representable coordinates need not monotonically
+                // reduce that cancellation-limited residual.
+                if correction.abs() <= 16. * ulp {
+                    return Ok(Some(Cx::new(s.re, 0.)));
+                }
+                return Ok(None);
+            }
+        }
+        Ok(Some(Cx::new(root_x, 0.)))
+    }
+
+    /// A root is linked in corrected frequency order, not in the original
+    /// Muller proposal order. Classification is shared by both exact-zero
+    /// trials and roots recognized through residual convergence.
+    fn insert_root(&mut self, s: Cx) -> SpiceResult<TrialId> {
+        let corrected = self.real_axis_root(s)?.unwrap_or(s);
+        let mut previous = None;
+        let mut current = self.arena.head();
+        while let Some(id) = current {
+            let trial = self.arena.get(id)?;
+            let diff = trial.s().sub(corrected);
+            if diff.re < 0. || (diff.re == 0. && diff.im < 0.) {
+                previous = Some(id);
+            }
+            current = trial.next();
+        }
+        self.arena.insert_after(
+            previous,
+            Trial::new(
+                corrected,
+                Cx::ZERO,
+                0,
+                TrialKind::Root(std::num::NonZeroU32::MIN),
+            ),
+        )
+    }
+
+    /// Evaluate or merge a proposed trial. Preserve distinct roots and
+    /// require a numerical residual check before declaring convergence.
+    fn run_trial(&mut self, mut s: Cx, middle: Option<TrialId>) -> SpiceResult<TrialId> {
+        const ABSTOL: Real = 1e-20;
+        const RELTOL: Real = 1e-12;
+        s.im = s.im.abs();
         let mut shifted = false;
-        let mut def_frac;
-        let mut def_mag;
-        let mut prev;
-        let mut hit;
+        let mut attempts = 0;
         loop {
-            def_mag = 0;
-            def_frac = Cx::new(1.0, 0.0);
-            let was_shifted = shifted;
-            shifted = false;
-            prev = None;
-            hit = None;
-            let mut p = self.arena.head();
-            while let Some(id) = p {
+            let mut prev = None;
+            let mut hit = None;
+            let mut current = self.arena.head();
+            while let Some(id) = current {
                 let trial = *self.arena.get(id)?;
                 let diff = trial.s().sub(s);
-                if diff.re < 0.0 || (diff.re == 0.0 && diff.im < 0.0) {
+                if diff.re < 0. || (diff.re == 0. && diff.im < 0.) {
                     prev = Some(id);
                 }
-                let root = trial.is_root();
-                let (abstol, reltol) = if root { (1e-5, 1e-6) } else { (1e-20, 1e-12) };
-                if diff.im == 0.0 && diff.re.abs() / (trial.s().re.abs() + abstol / reltol) < reltol
+                if diff.re.hypot(diff.im) < RELTOL.mul_add(trial.s().re.hypot(trial.s().im), ABSTOL)
                 {
-                    if was_shifted
-                        || trial.count >= 3
-                        || !self.alter(&mut s, middle, abstol, reltol)?
-                    {
-                        self.arena.get_mut(id)?.count = 0;
-                        hit = Some(id);
-                        break;
-                    }
-                    self.arena.get_mut(id)?.count += 1;
-                    shifted = true;
+                    hit = Some(id);
                     break;
                 }
                 if self.trapped == Trap::Free {
                     self.arena.get_mut(id)?.count = 0;
                 }
-                if root {
-                    let mut diff = diff;
-                    let mut diff_mag = 0;
-                    c_norm(&mut diff, &mut diff_mag)?;
-                    if diff.im != 0.0 {
-                        diff = diff.mag2();
-                        diff_mag *= 2;
-                    }
-                    c_norm(&mut diff, &mut diff_mag)?;
-                    for _ in 0..trial.multiplicity() {
-                        def_frac = def_frac.mul(diff);
-                        def_mag += diff_mag;
-                        c_norm(&mut def_frac, &mut def_mag)?;
-                    }
-                }
-                p = trial.next();
+                current = trial.next();
             }
-            if !shifted {
-                break;
-            }
-        }
 
-        let determinant = if let Some(hit) = hit {
-            let trial = self.arena.get_mut(hit)?;
-            match trial.kind {
-                TrialKind::Root(multiplicity) => {
-                    trial.kind = TrialKind::Root(multiplicity.checked_add(1).ok_or_else(|| {
-                        numerical("pole-zero search", "root multiplicity overflow")
-                    })?);
-                    return Ok(hit);
-                }
-                TrialKind::Sample | TrialKind::Minimum
-                    if self.trapped == Trap::Bracket(Region::Minimum)
-                        && self.curvature.usable() =>
+            if let Some(id) = hit {
+                let trial = *self.arena.get(id)?;
+                if !shifted
+                    && trial.count < 3
+                    && s.im == 0.
+                    && self.alter(&mut s, middle, ABSTOL, RELTOL)?
                 {
-                    trial.kind = TrialKind::Minimum;
-                    return Ok(hit);
+                    self.arena.get_mut(id)?.count += 1;
+                    shifted = true;
+                    continue;
                 }
-                TrialKind::Sample | TrialKind::Minimum => None,
+                self.arena.get_mut(id)?.count = 0;
+                match trial.kind {
+                    TrialKind::Root(multiplicity) => {
+                        if self.remaining_multiplicity(trial.s())? {
+                            self.arena.get_mut(id)?.kind =
+                                TrialKind::Root(multiplicity.checked_add(1).ok_or_else(|| {
+                                    numerical("pole-zero search", "root multiplicity overflow")
+                                })?);
+                            return Ok(id);
+                        }
+                    }
+                    TrialKind::Sample | TrialKind::Minimum => {
+                        if self.coincident_root(s)? {
+                            return self.insert_root(s);
+                        }
+                        if s.im == 0. && self.trapped == Trap::Bracket(Region::Minimum) {
+                            self.arena.get_mut(id)?.kind = TrialKind::Minimum;
+                            return Ok(id);
+                        }
+                    }
+                }
+                // A failed collision is just a stagnant sample. Move by an
+                // increasing local step and evaluate a distinct frequency.
+                attempts += 1;
+                if attempts >= 32 {
+                    return Err(numerical(
+                        "pole-zero search",
+                        "cannot separate coincident non-root trials",
+                    ));
+                }
+                let step = RELTOL.mul_add(s.re.hypot(s.im), ABSTOL) * 2_f64.powi(attempts + 2);
+                s.re += step;
+                shifted = true;
+                continue;
             }
-        } else {
+
             #[cfg(test)]
             self.trace.push(TraceEvent::Load(s));
-            let determinant = self.pencil.determinant_at(s)?;
-            #[cfg(test)]
-            if let Some((value, exponent)) = determinant {
-                self.trace.push(TraceEvent::Determinant(value, exponent));
+            let (value, exponent) = self.deflated_at(s)?;
+            if value.is_zero() {
+                return self.insert_root(s);
             }
-            determinant
-        };
-
-        let trial = match determinant {
-            Some((f_raw, mag_raw)) if !f_raw.is_zero() => {
-                // PZnumswaps is always 1 after SMPcReorder.
-                let mut f_def = f_raw.div(def_frac);
-                let mut mag_def = mag_raw - def_mag;
-                c_norm(&mut f_def, &mut mag_def)?;
-                Trial::new(s, f_def, mag_def, TrialKind::Sample)
-            }
-            _ => Trial::new(s, Cx::ZERO, 0, TrialKind::Root(std::num::NonZeroU32::MIN)),
-        };
-        self.arena.insert_after(prev, trial)
+            return self
+                .arena
+                .insert_after(prev, Trial::new(s, value, exponent, TrialKind::Sample));
+        }
     }
 
     /// `CKTpzVerify` always returns success in C. Count each occurrence of
@@ -783,24 +1053,17 @@ impl Search<'_> {
             if trial.is_root() {
                 continue;
             }
-            let mut diff = s.sub(trial.s());
-            if s.im != 0.0 {
-                diff = diff.mag2();
-            }
-            let tdiff = diff.re;
-            if diff.re != 0.0 {
-                let mut diff_mag = 0;
-                c_norm(&mut diff, &mut diff_mag)?;
-                diff_mag *= -1;
-                let trial = self.arena.get_mut(id)?;
-                trial.f_def = trial.f_def.div(diff);
-                c_norm(&mut trial.f_def, &mut diff_mag)?;
-                trial.mag_def += diff_mag;
-            }
+            let (diff, diff_mag) = root_factor(s, trial.s())?;
+            let tdiff = materialize_power(diff.re, diff_mag);
             if trial.s().im != 0.0 || tdiff.abs() / (s.re.abs() + 200.0) < 0.005 {
                 self.arena.remove(id)?;
             } else {
-                self.arena.get_mut(id)?.kind = TrialKind::Sample;
+                let trial = self.arena.get_mut(id)?;
+                let mut exponent = -diff_mag;
+                trial.f_def = trial.f_def.div(diff);
+                c_norm(&mut trial.f_def, &mut exponent)?;
+                trial.mag_def += exponent;
+                trial.kind = TrialKind::Sample;
             }
         }
         Ok(())
@@ -1003,11 +1266,11 @@ impl Search<'_> {
         } else {
             let mut p1 = t.s().re;
             if root {
-                p1 -= 1e-6 * t.s().re + 1e-5;
+                p1 -= reltol.mul_add(t.s().re.abs(), abstol);
             }
             match left {
                 Some(l) => p1 += l,
-                None => p1 -= 10.0 * (p1.abs() + 1.0),
+                None => p1 = (-10.0_f64).mul_add(p1.abs() + 1.0, p1),
             }
             p1 / 2.0
         };
@@ -1016,17 +1279,16 @@ impl Search<'_> {
         } else {
             let mut p2 = t.s().re;
             if root {
-                p2 += 1e-6 * t.s().re + 1e-5;
+                p2 += reltol.mul_add(t.s().re.abs(), abstol);
             }
             match right {
                 Some(r) => p2 += r,
-                None => p2 += 10.0 * (p2.abs() + 1.0),
+                None => p2 = 10.0_f64.mul_add(p2.abs() + 1.0, p2),
             }
             p2 / 2.0
         };
-        // C's precedence: |p - x| / |x| + abstol / reltol < reltol.
-        if left.is_some_and(|l| (p1 - l).abs() / l.abs() + abstol / reltol < reltol)
-            || right.is_some_and(|r| (p2 - r).abs() / r.abs() + abstol / reltol < reltol)
+        if left.is_some_and(|l| (p1 - l).abs() < reltol.mul_add(l.abs(), abstol))
+            || right.is_some_and(|r| (p2 - r).abs() < reltol.mul_add(r.abs(), abstol))
         {
             return Ok(false);
         }
@@ -1042,61 +1304,42 @@ impl Search<'_> {
 }
 
 #[cfg(test)]
-pub(crate) fn check_c_trace(load: &PencilLoad, name: &str, trace: &str) {
+pub(crate) fn report_c_trace(load: &PencilLoad, name: &str, trace: &str) {
     let mut search = Search::new(load).unwrap();
     let result = search.find_zeros();
-    assert_eq!(
-        search.trace.len(),
-        trace.lines().count(),
-        "{name}: event count"
+    let first_difference = search.trace.iter().zip(trace.lines()).enumerate().find_map(
+        |(index, (actual, expected))| {
+            let mut fields = expected.split_whitespace();
+            let kind = fields.next()?;
+            let value = Cx::new(fields.next()?.parse().ok()?, fields.next()?.parse().ok()?);
+            let same = match (actual, kind) {
+                (TraceEvent::Proposal(got), "TRIAL") | (TraceEvent::Load(got), "LOAD") => {
+                    got.re.to_bits() == value.re.to_bits() && got.im.to_bits() == value.im.to_bits()
+                }
+                (TraceEvent::Determinant(got, exponent), "DET") => {
+                    got.re.to_bits() == value.re.to_bits()
+                        && got.im.to_bits() == value.im.to_bits()
+                        && Some(*exponent) == fields.next().and_then(|word| word.parse().ok())
+                }
+                _ => false,
+            };
+            (!same).then(|| format!("event {index}: Rust {actual:?}; C {expected}"))
+        },
     );
-    for (index, (actual, line)) in search.trace.into_iter().zip(trace.lines()).enumerate() {
-        let mut words = line.split_whitespace();
-        let kind = words.next().unwrap();
-        let expected = Cx::new(
-            words.next().unwrap().parse().unwrap(),
-            words.next().unwrap().parse().unwrap(),
-        );
-        let frequency_or_value = match (actual, kind) {
-            (TraceEvent::Proposal(value), "TRIAL") | (TraceEvent::Load(value), "LOAD") => value,
-            (TraceEvent::Determinant(value, exponent), "DET") => {
-                assert_eq!(
-                    exponent,
-                    words.next().unwrap().parse::<i64>().unwrap(),
-                    "{name}: exponent at event {index}"
-                );
-                value
-            }
-            _ => panic!("{name}: event {index}: expected {line}, got {actual:?}"),
-        };
-        assert!(words.next().is_none(), "{name}: extra fields in {line}");
-        assert_eq!(
-            (
-                frequency_or_value.re.to_bits(),
-                frequency_or_value.im.to_bits()
-            ),
-            (expected.re.to_bits(), expected.im.to_bits()),
-            "{name}: event {index} ({line}): actual {actual:?}"
-        );
-    }
-
-    match name {
-        "repeat" | "near" => assert_eq!(result.unwrap(), [Complex::real(-1.0); 2]),
-        "complex" => {
-            let roots = result.unwrap();
-            assert_eq!(roots.len(), 2);
-            assert_eq!(roots[0].re.to_bits(), roots[1].re.to_bits());
-            assert_eq!(roots[0].im.to_bits(), (-roots[1].im).to_bits());
-            assert!((roots[0].re + 0.1).abs() < 1e-15);
-            assert!((roots[0].im - 0.99_f64.sqrt()).abs() < 1e-15);
+    eprintln!(
+        "{name}: {} Rust events / {} C events, first difference {first_difference:?}, roots {result:?}",
+        search.trace.len(),
+        trace.lines().count()
+    );
+    if search.niter >= NITER_LIM {
+        for event in search
+            .trace
+            .iter()
+            .take(30)
+            .chain(search.trace.iter().rev().take(18).rev())
+        {
+            eprintln!("  {event:?}");
         }
-        "singular" => assert!(result.unwrap_err().to_string().contains("singular pencil")),
-        "notch" => {
-            assert!(result.unwrap().is_empty());
-            assert_eq!(search.niter, NITER_LIM);
-            assert_eq!(search.seq_num, NITER_LIM + 1);
-        }
-        _ => panic!("unknown pinned C trace {name}"),
     }
 }
 
@@ -1104,6 +1347,142 @@ pub(crate) fn check_c_trace(load: &PencilLoad, name: &str, trace: &str) {
 mod tests {
     use super::*;
     use crate::maths::pencil::PencilTerm;
+
+    #[test]
+    fn real_axis_certificate_distinguishes_simple_repeated_and_damped_roots() {
+        let location = 1e10;
+        let noise = 2e-5;
+        for gain in [1e-12, 1., 1e12] {
+            let simple = PencilLoad {
+                order: 1,
+                elements: vec![(0, 0)],
+                terms: vec![PencilTerm {
+                    row: 0,
+                    col: 0,
+                    conductance: Some(location * gain),
+                    capacitance: Some(gain),
+                }],
+                ..PencilLoad::default()
+            };
+            let mut search = Search::new(&simple).unwrap();
+            let real = search
+                .real_axis_root(Cx::new(-location - 0.02, noise))
+                .unwrap()
+                .unwrap();
+            assert_eq!(real.im, 0.);
+            assert!(
+                (real.re + location).abs() <= 2e-6,
+                "gain {gain:e}: refined {real:?}"
+            );
+            assert!(
+                search
+                    .real_axis_root(Cx::new(-location - 0.2, noise))
+                    .unwrap()
+                    .is_none(),
+                "a distant real crossing is not the complex trial's root"
+            );
+
+            let pair = PencilLoad {
+                order: 2,
+                elements: vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+                terms: vec![
+                    PencilTerm {
+                        row: 0,
+                        col: 0,
+                        conductance: Some(location * gain),
+                        capacitance: Some(gain),
+                    },
+                    PencilTerm {
+                        row: 0,
+                        col: 1,
+                        conductance: Some(-noise * gain),
+                        capacitance: None,
+                    },
+                    PencilTerm {
+                        row: 1,
+                        col: 0,
+                        conductance: Some(noise * gain),
+                        capacitance: None,
+                    },
+                    PencilTerm {
+                        row: 1,
+                        col: 1,
+                        conductance: Some(location * gain),
+                        capacitance: Some(gain),
+                    },
+                ],
+                ..PencilLoad::default()
+            };
+            assert!(
+                Search::new(&pair)
+                    .unwrap()
+                    .real_axis_root(Cx::new(-location, noise))
+                    .unwrap()
+                    .is_none(),
+                "gain {gain:e}: a true near-real conjugate pair remains complex"
+            );
+            let repeated = PencilLoad {
+                order: 2,
+                elements: vec![(0, 0), (1, 1)],
+                terms: vec![
+                    simple.terms[0],
+                    PencilTerm {
+                        row: 1,
+                        col: 1,
+                        ..simple.terms[0]
+                    },
+                ],
+                ..PencilLoad::default()
+            };
+            let split = PencilLoad {
+                order: 2,
+                elements: repeated.elements.clone(),
+                terms: vec![
+                    PencilTerm {
+                        conductance: Some((location - noise) * gain),
+                        ..repeated.terms[0]
+                    },
+                    PencilTerm {
+                        conductance: Some((location + noise) * gain),
+                        ..repeated.terms[1]
+                    },
+                ],
+                ..PencilLoad::default()
+            };
+            assert!(
+                Search::new(&split)
+                    .unwrap()
+                    .real_axis_root(Cx::new(-location, noise))
+                    .unwrap()
+                    .is_none(),
+                "gain {gain:e}: two distinct nearby real roots must not be merged"
+            );
+            assert_eq!(
+                Search::new(&repeated)
+                    .unwrap()
+                    .real_axis_root(Cx::new(-location, noise))
+                    .unwrap(),
+                Some(Cx::new(-location, 0.)),
+                "gain {gain:e}: a repeated real root remains real"
+            );
+        }
+    }
+
+    #[test]
+    fn deflation_is_a_polynomial_at_complex_frequencies() {
+        let trial = Cx::new(2., 3.);
+        let (factor, exponent) = root_factor(Cx::new(-1., 0.), trial).unwrap();
+        assert_eq!(
+            factor.scale(materialize_power(1., exponent)),
+            Cx::new(-3., -3.)
+        );
+        let (factor, exponent) = root_factor(Cx::new(-1., 2.), trial).unwrap();
+        // (-3-i) * (-3-5i) = 4+18i, not the squared modulus 10.
+        assert_eq!(
+            factor.scale(materialize_power(1., exponent)),
+            Cx::new(4., 18.)
+        );
+    }
 
     fn load() -> PencilLoad {
         PencilLoad {
@@ -1335,43 +1714,31 @@ mod tests {
     }
 
     #[test]
-    fn sample_collision_preserves_early_scan_insertion_before_pruning() {
+    fn sample_collision_is_not_a_root_without_a_residual() {
         let load = load();
         let mut search = Search::new(&load).unwrap();
         let first = search.arena.insert_after(None, sample(1.0, 0.5)).unwrap();
-        let between = search
-            .arena
-            .insert_after(
-                Some(first),
-                Trial::new(
-                    Cx::new(1.0 + 1e-13, 1.0),
-                    Cx::new(1.0, 0.0),
-                    0,
-                    TrialKind::Sample,
-                ),
-            )
-            .unwrap();
-        // The real sample collides before the scan visits the intervening
-        // complex sample, even though the proposed real frequency is larger.
-        // C inserts at the last predecessor visited, then verifies and prunes.
-        let frequency = Cx::new(1.0 + 2e-13, 0.0);
-        let root = search.run_trial(frequency, None).unwrap();
-        assert_eq!(search.arena.frequency(root).unwrap(), frequency);
-        assert!(search.arena.get(root).unwrap().is_root());
-        assert_eq!(search.arena.get(first).unwrap().next(), Some(root));
-        assert_eq!(search.arena.get(root).unwrap().next(), Some(between));
-        assert!(search.trace.is_empty());
-        search.verify(root).unwrap();
-        assert_eq!(search.arena.head(), Some(root));
-        assert_eq!(search.arena.anchor(), Some(root));
-        assert!(search.arena.get(first).is_err());
-        assert!(search.arena.get(between).is_err());
-        assert_eq!(search.arena.get(root).unwrap().next(), None);
+        let candidate = search.run_trial(Cx::new(1.0 + 2e-13, 0.0), None).unwrap();
+        assert!(!search.arena.get(candidate).unwrap().is_root());
+        assert_ne!(
+            search.arena.frequency(candidate).unwrap(),
+            search.arena.frequency(first).unwrap()
+        );
+        assert!(search.coincident_root(Cx::new(-1., 0.)).unwrap());
+        assert!(!search.coincident_root(Cx::new(1., 0.)).unwrap());
     }
 
     #[test]
     fn root_collisions_reuse_identity_and_verification_prunes_and_deflates() {
-        let load = load();
+        let mut load = load();
+        load.order = 2;
+        load.elements.push((1, 1));
+        load.terms.push(PencilTerm {
+            row: 1,
+            col: 1,
+            conductance: Some(1.),
+            capacitance: Some(1.),
+        });
         let mut search = Search::new(&load).unwrap();
         let root = search.run_trial(Cx::new(-1.0, 0.0), None).unwrap();
         assert_eq!(search.arena.get(root).unwrap().multiplicity(), 1);

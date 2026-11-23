@@ -6,8 +6,8 @@
 //! the port keeps the parse tree unsimplified, differentiates it symbolically
 //! once per quantity with C's rules and its `mkb`/`mkf` simplifications
 //! (constant folding, the 0/1 identities), and evaluates the value tree and
-//! each derivative with the same operation order as C. The temporary trees
-//! are lowered to a shared indexed DAG; successful finite results are
+//! each derivative with the same operation order as C. Sparse symbolic
+//! partials are built directly in an indexed DAG; successful finite results are
 //! reused only within one environment, with lazy branch traversal. That includes the deliberate non-derivatives
 //! (`floor`, comparisons, `u` and `pwl_derivative` are zero or piecewise) and
 //! the domain quirks of the value functions:
@@ -75,6 +75,13 @@ pub struct Evaluation {
     pub value: Real,
     /// `d value / d quantity[i]`.
     pub gradient: Vec<Real>,
+}
+
+/// Workspace-backed value and derivatives, borrowed until the next evaluation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct EvaluationView<'a> {
+    pub(super) value: Real,
+    pub(super) gradient: &'a [Real],
 }
 
 /// One-argument functions (`inpptree.c` `funcs[]`).
@@ -225,13 +232,16 @@ enum Node {
     /// `pwl(x, x0, y0, x1, y1, ...)`: shared immutable literal points.
     Pwl(Tree, Arc<PwlTable>),
     /// `PTF_PWL_DERIVATIVE`: the slope `PTdifferentiate` builds for `pwl()`.
+    #[cfg(test)]
     PwlDerivative(Tree, Arc<PwlTable>),
     /// The XSPICE `pwl` transfer of a lowered TABLE.
     Table(Tree, Arc<XspicePwl>),
     /// The slope of [`Node::Table`] (the code model's partial).
+    #[cfg(test)]
     TableSlope(Tree, Arc<XspicePwl>),
 }
 
+#[cfg(test)]
 impl Node {
     const fn constant(&self) -> Option<Real> {
         match self {
@@ -241,13 +251,10 @@ impl Node {
     }
 }
 
-// Bound recursive lowering/differentiation before constructing any trees.
-// The derivative rule for each source node performs a fixed amount of work,
-// with each child differentiated at most once per quantity. The separate
-// instruction cap also limits the size of the retained execution plan.
+// Bound recursive source lowering before constructing the value tree. Sparse
+// derivative work and intermediate instruction budgets are enforced during lowering.
 const MAX_SOURCE_DEPTH: usize = crate::netlist::expr::MAX_TREE_DEPTH;
 const MAX_SOURCE_NODES: usize = crate::netlist::expr::MAX_TREE_NODES;
-const MAX_DERIVATIVE_VISITS: usize = 131_072;
 
 fn check_source_limits(root: &BExpr) -> SpiceResult<()> {
     fn walk(expr: &BExpr, depth: usize, remaining: &mut usize) -> SpiceResult<()> {
@@ -294,19 +301,6 @@ fn check_source_limits(root: &BExpr) -> SpiceResult<()> {
     walk(root, 1, &mut remaining)
 }
 
-fn tree_size(node: &Node) -> usize {
-    1 + match node {
-        Node::Unary(_, arg)
-        | Node::Pwl(arg, _)
-        | Node::PwlDerivative(arg, _)
-        | Node::Table(arg, _)
-        | Node::TableSlope(arg, _) => tree_size(arg),
-        Node::Operator(_, a, b) | Node::Binary(_, a, b) => tree_size(a) + tree_size(b),
-        Node::Ternary(c, a, b) => tree_size(c) + tree_size(a) + tree_size(b),
-        _ => 0,
-    }
-}
-
 /// A compiled behavioural value and its symbolic partial derivatives,
 /// sharing one immutable, indexed execution plan.
 #[derive(Debug, Clone, PartialEq)]
@@ -330,8 +324,8 @@ fn parse_error(expr: &BExpr, message: impl Into<String>) -> SpiceError {
 }
 
 impl Program {
-    /// Compiles a front-end-resolved expression tree and builds its
-    /// derivative trees, then lowers them to the shared execution plan.
+    /// Compiles a front-end-resolved expression tree and lowers its sparse
+    /// symbolic derivatives directly to the shared execution plan.
     ///
     /// # Errors
     /// Names the front end should have resolved (`.param` values, `.func`
@@ -346,19 +340,12 @@ impl Program {
         check_source_limits(expr)?;
         let mut compiler = Compiler::default();
         let value_tree = Arc::new(compile(expr, &mut compiler)?);
-        if compiler.quantities.len() > MAX_DERIVATIVE_VISITS / tree_size(&value_tree) {
-            return Err(unsupported(
-                expr,
-                "behavioural derivative expansion limit exceeded",
-            ));
-        }
         let mut builder = PlanBuilder::default();
         let root = builder.lower_value(&value_tree)?;
-        let derivatives = (0..compiler.quantities.len())
-            .map(|variable| builder.lower_derivative(&differentiate(&value_tree, variable)))
-            .collect::<SpiceResult<_>>()?;
+        let derivatives = builder.sparse_derivatives(root, compiler.quantities.len(), expr)?;
+        let (plan, root, derivatives) = builder.finish_reachable(root, derivatives);
         Ok(Self {
-            plan: Arc::new(builder.finish()),
+            plan: Arc::new(plan),
             root,
             derivatives,
             quantities: compiler.quantities,
@@ -385,14 +372,21 @@ impl Program {
     /// [`SpiceError::Numerical`] when a function is evaluated outside its
     /// domain or any value/derivative is not finite.
     pub fn evaluate(&self, environment: &Environment<'_>) -> SpiceResult<Evaluation> {
-        self.evaluate_with_workspace(environment, &mut Workspace::default())
+        let mut workspace = Workspace::default();
+        let value = self
+            .evaluate_with_workspace(environment, &mut workspace)?
+            .value;
+        Ok(Evaluation {
+            value,
+            gradient: workspace.into_gradient(),
+        })
     }
 
-    pub(super) fn evaluate_with_workspace(
+    pub(super) fn evaluate_with_workspace<'w>(
         &self,
         environment: &Environment<'_>,
-        workspace: &mut Workspace,
-    ) -> SpiceResult<Evaluation> {
+        workspace: &'w mut Workspace,
+    ) -> SpiceResult<EvaluationView<'w>> {
         if environment.values.len() != self.quantities.len() {
             return Err(SpiceError::circuit(
                 "behavioural expression evaluated with the wrong number of values",
@@ -924,318 +918,10 @@ fn divide(a: Real, b: Real, fudge: Real) -> Real {
     if b == 0. { Real::INFINITY } else { a / b }
 }
 
-fn constant(value: Real) -> Tree {
-    Arc::new(Node::Constant(value))
-}
-
-/// `mkcon(0.0)` / `mkcon(1.0)` for a variable.
-fn zero() -> Tree {
-    constant(0.)
-}
-
-/// `mkb()` for the arithmetic operators: constant folding (plain C
-/// arithmetic and `pow`, not the `PT*` functions) and the 0/1 identities.
-fn mk_operator(op: Operator, left: Tree, right: Tree) -> Tree {
-    if let (Some(l), Some(r)) = (left.constant(), right.constant()) {
-        return constant(match op {
-            Operator::Times => l * r,
-            Operator::Divide => l / r,
-            Operator::Plus => l + r,
-            Operator::Minus => l - r,
-            Operator::Power => c_pow(l, r),
-        });
-    }
-    let (l, r) = (left.constant(), right.constant());
-    match op {
-        Operator::Times => {
-            // C's order: a zero factor (either side) wins, then a unit one.
-            if l == Some(0.) {
-                return left;
-            } else if r == Some(0.) || l == Some(1.) {
-                return right;
-            } else if r == Some(1.) {
-                return left;
-            }
-        }
-        Operator::Divide => {
-            if l == Some(0.) || r == Some(1.) {
-                return left;
-            }
-        }
-        Operator::Plus => {
-            if l == Some(0.) {
-                return right;
-            } else if r == Some(0.) {
-                return left;
-            }
-        }
-        Operator::Minus => {
-            if r == Some(0.) {
-                return left;
-            } else if l == Some(0.) {
-                return mk_unary(Unary::Uminus, right);
-            }
-        }
-        Operator::Power => {
-            if r == Some(0.) {
-                return constant(1.);
-            } else if r == Some(1.) {
-                return left;
-            }
-        }
-    }
-    Arc::new(Node::Operator(op, left, right))
-}
-
-/// `mkb(PT_TERN, condition, mkb(PT_COMMA, then, otherwise))`.
-fn mk_ternary(condition: Tree, then: Tree, otherwise: Tree) -> Tree {
-    if let Some(condition) = condition.constant() {
-        return if condition == 0. { otherwise } else { then };
-    }
-    if let (Some(a), Some(b)) = (then.constant(), otherwise.constant())
-        && a.partial_cmp(&b) == Some(std::cmp::Ordering::Equal)
-    {
-        return then;
-    }
-    Arc::new(Node::Ternary(condition, then, otherwise))
-}
-
-/// `mkf()` for a one-argument function: a constant argument is folded.
-fn mk_unary(function: Unary, argument: Tree) -> Tree {
-    argument.constant().map_or_else(
-        || Arc::new(Node::Unary(function, argument)),
-        |x| constant(unary_value(function, x)),
-    )
-}
-
-/// `mkf(PTF_POW/PTF_PWR, mkb(PT_COMMA, a, b))`: never folded (a comma node
-/// is not a constant).
-fn mk_binary(function: Binary, a: &Tree, b: Tree) -> Tree {
-    Arc::new(Node::Binary(function, a.clone(), b))
-}
-
-/// `mkb(PT_TIMES, ...)` shorthand.
-fn times(left: Tree, right: Tree) -> Tree {
-    mk_operator(Operator::Times, left, right)
-}
-
-/// `mkb(PT_DIVIDE, ...)` shorthand.
-fn over(left: Tree, right: Tree) -> Tree {
-    mk_operator(Operator::Divide, left, right)
-}
-
-/// `mkb(PT_POWER, u, mkcon(2.0))`.
-fn squared(u: &Tree) -> Tree {
-    mk_operator(Operator::Power, u.clone(), constant(2.))
-}
-
-/// `mkf(PTF_LOG, mkf(PTF_ABS, a))`.
-fn log_abs(a: &Tree) -> Tree {
-    mk_unary(Unary::Log, mk_unary(Unary::Abs, a.clone()))
-}
-
-/// The general power rule `f(a,b) * (b * (D(a) / a) + D(b) * log(abs(a)))`
-/// of `PTdifferentiate` (`^`, `pow()`, `pwr()`), with `outer = f(a,b)`.
-fn general_power(outer: Tree, a: &Tree, b: &Tree, variable: usize) -> Tree {
-    times(
-        outer,
-        mk_operator(
-            Operator::Plus,
-            times(b.clone(), over(differentiate(a, variable), a.clone())),
-            times(differentiate(b, variable), log_abs(a)),
-        ),
-    )
-}
-
-/// The derivative's two power modes, separate from general binary
-/// functions: `^` and `pow()` have the ordinary rule, `pwr()` the signed rule.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PowerRule {
-    Ordinary,
-    Signed,
-}
-
-impl PowerRule {
-    const fn value_kernel(self) -> Binary {
-        match self {
-            Self::Ordinary => Binary::Pow,
-            Self::Signed => Binary::Pwr,
-        }
-    }
-
-    const fn exponent_kernel(self) -> Binary {
-        match self {
-            Self::Ordinary => Binary::Pwr,
-            Self::Signed => Binary::Pow,
-        }
-    }
-}
-
-/// The three C power syntaxes share a derivative rule, but use different
-/// function kernels when the exponent is constant.  `^` and `pow()` use
-/// `pwr(a, b - 1)`; `pwr()` instead uses `pow(a, b - 1)`.
-///
-/// For variable exponents, only the `pow`/ `^` rule has C's special
-/// constant-base case.  Keep the original mkb/mkf tree construction order;
-/// it affects the values and the rounding of the evaluated Jacobian.
-fn differentiate_power(rule: PowerRule, a: &Tree, b: &Tree, variable: usize) -> Tree {
-    b.constant().map_or_else(
-        || {
-            if rule == PowerRule::Ordinary && a.constant().is_some() {
-                times(
-                    mk_binary(Binary::Pow, a, b.clone()),
-                    times(differentiate(b, variable), log_abs(a)),
-                )
-            } else {
-                general_power(mk_binary(rule.value_kernel(), a, b.clone()), a, b, variable)
-            }
-        },
-        |exponent| {
-            times(
-                times(
-                    constant(exponent),
-                    mk_binary(rule.exponent_kernel(), a, constant(exponent - 1.)),
-                ),
-                differentiate(a, variable),
-            )
-        },
-    )
-}
-
-/// The outer derivative of a unary function, constructed with C's tree
-/// helpers. The chain rule is applied once by the main differentiator.
-fn unary_slope(function: Unary, u: &Tree) -> Tree {
-    let one = || constant(1.);
-    match function {
-        Unary::Abs => mk_unary(Unary::Sgn, u.clone()),
-        Unary::Acos => over(
-            constant(-1.),
-            mk_unary(Unary::Sqrt, mk_operator(Operator::Minus, one(), squared(u))),
-        ),
-        Unary::Acosh => over(
-            one(),
-            mk_unary(Unary::Sqrt, mk_operator(Operator::Minus, squared(u), one())),
-        ),
-        Unary::Asin => over(
-            one(),
-            mk_unary(Unary::Sqrt, mk_operator(Operator::Minus, one(), squared(u))),
-        ),
-        Unary::Asinh => over(
-            one(),
-            mk_unary(Unary::Sqrt, mk_operator(Operator::Plus, squared(u), one())),
-        ),
-        Unary::Atan => over(one(), mk_operator(Operator::Plus, squared(u), one())),
-        Unary::Atanh => over(one(), mk_operator(Operator::Minus, one(), squared(u))),
-        Unary::Cos => mk_unary(Unary::Uminus, mk_unary(Unary::Sin, u.clone())),
-        Unary::Cosh => mk_unary(Unary::Sinh, u.clone()),
-        Unary::Exp => mk_unary(Unary::Exp, u.clone()),
-        Unary::Log => over(one(), u.clone()),
-        Unary::Log10 => over(constant(std::f64::consts::LOG10_E), u.clone()),
-        Unary::Sin => mk_unary(Unary::Cos, u.clone()),
-        Unary::Sinh => mk_unary(Unary::Cosh, u.clone()),
-        Unary::Sqrt => over(one(), times(constant(2.), mk_unary(Unary::Sqrt, u.clone()))),
-        Unary::Tan => mk_operator(
-            Operator::Plus,
-            one(),
-            squared(&mk_unary(Unary::Tan, u.clone())),
-        ),
-        Unary::Tanh => mk_operator(
-            Operator::Minus,
-            one(),
-            squared(&mk_unary(Unary::Tanh, u.clone())),
-        ),
-        Unary::Uramp => mk_unary(Unary::Ustep, u.clone()),
-        Unary::Ustep2 => mk_operator(
-            Operator::Minus,
-            mk_unary(Unary::Ustep, u.clone()),
-            mk_unary(Unary::Ustep, mk_operator(Operator::Minus, u.clone(), one())),
-        ),
-        Unary::Uminus => constant(-1.),
-        Unary::Sgn
-        | Unary::Ustep
-        | Unary::Eq0
-        | Unary::Ne0
-        | Unary::Gt0
-        | Unary::Lt0
-        | Unary::Ge0
-        | Unary::Le0
-        | Unary::Floor
-        | Unary::Ceil
-        | Unary::Nint => zero(),
-    }
-}
-
-/// `PTdifferentiate` (`inpptree.c`): the derivative tree of `p` with respect
-/// to quantity `variable`, built with C's `mkb`/`mkf` simplifications so its
-/// evaluation is C's operation for operation. The PSPICE/HSPICE/LTspice
-/// `newcompat` variants are not modelled.
-fn differentiate(p: &Tree, variable: usize) -> Tree {
-    match &**p {
-        Node::Constant(_) | Node::Time | Node::Temperature | Node::Frequency => zero(),
-        Node::Variable(index) => constant(if *index == variable { 1. } else { 0. }),
-        Node::Operator(op @ (Operator::Plus | Operator::Minus), a, b) => {
-            mk_operator(*op, differentiate(a, variable), differentiate(b, variable))
-        }
-        // d(a * b) = d(a) * b + a * d(b)
-        Node::Operator(Operator::Times, a, b) => mk_operator(
-            Operator::Plus,
-            times(differentiate(a, variable), b.clone()),
-            times(a.clone(), differentiate(b, variable)),
-        ),
-        // d(a / b) = (d(a) * b - a * d(b)) / b^2
-        Node::Operator(Operator::Divide, a, b) => over(
-            mk_operator(
-                Operator::Minus,
-                times(differentiate(a, variable), b.clone()),
-                times(a.clone(), differentiate(b, variable)),
-            ),
-            squared(b),
-        ),
-        Node::Operator(Operator::Power, a, b) | Node::Binary(Binary::Pow, a, b) => {
-            differentiate_power(PowerRule::Ordinary, a, b, variable)
-        }
-        Node::Ternary(condition, then, otherwise) => mk_ternary(
-            condition.clone(),
-            differentiate(then, variable),
-            differentiate(otherwise, variable),
-        ),
-        Node::Binary(function @ (Binary::Min | Binary::Max), a, b) => {
-            // min(a,b)' = lt0(a-b) ? a' : b'; max uses gt0.
-            let comparison = if *function == Binary::Min {
-                Unary::Lt0
-            } else {
-                Unary::Gt0
-            };
-            mk_ternary(
-                mk_unary(
-                    comparison,
-                    mk_operator(Operator::Minus, a.clone(), b.clone()),
-                ),
-                differentiate(a, variable),
-                differentiate(b, variable),
-            )
-        }
-        Node::Binary(Binary::Pwr, a, b) => differentiate_power(PowerRule::Signed, a, b, variable),
-        Node::Unary(function, u) => times(unary_slope(*function, u), differentiate(u, variable)),
-        Node::Pwl(u, table) => {
-            let slope = u.constant().map_or_else(
-                || Arc::new(Node::PwlDerivative(Arc::clone(u), Arc::clone(table))),
-                |x| constant(table.slope(x)),
-            );
-            times(slope, differentiate(u, variable))
-        }
-        Node::Table(u, map) => {
-            let slope = u.constant().map_or_else(
-                || Arc::new(Node::TableSlope(Arc::clone(u), Arc::clone(map))),
-                |x| constant(map.evaluate(x).1),
-            );
-            times(slope, differentiate(u, variable))
-        }
-        Node::PwlDerivative(u, _) | Node::TableSlope(u, _) => {
-            times(zero(), differentiate(u, variable))
-        }
-    }
-}
+#[cfg(test)]
+mod derivative_reference;
+#[cfg(test)]
+use derivative_reference::{constant, differentiate};
 
 #[cfg(test)]
 pub(super) fn power_h_for_tests(a: Real, b: Real) -> Real {

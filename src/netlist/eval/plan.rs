@@ -2,8 +2,8 @@
 
 use super::{
     Bindings, DefinitionState, DependencyReference, EvalBudget, Failure, FunctionScope,
-    ParamBinding, ParamScope, ParamState, ScopeDefinitions, canonical_lookup, collect_definitions,
-    evaluate_definition, evaluate_root,
+    ParamBinding, ParamScope, ParamState, RefScan, ScopeDefinitions, canonical_lookup,
+    collect_definitions, evaluate_definition, evaluate_root,
 };
 use crate::netlist::ast::ParamCard;
 use crate::netlist::expr::ParameterExpression;
@@ -41,6 +41,49 @@ pub struct ParameterInput {
     pub name: String,
     /// Value in the independently resolved baseline deck.
     pub default: Real,
+}
+
+/// Immutable input-dependency classification of one numeric expression.
+///
+/// A changed coordinate outside this set cannot affect its value, even
+/// through nested `.func` calls and any number of intermediate `.param` aliases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundExpression {
+    scope: ParameterScopeId,
+    direct: HashMap<String, usize>,
+    inputs: Vec<usize>,
+}
+
+impl BoundExpression {
+    /// The indexes in [`ParameterPlan::inputs`] that may affect this site.
+    #[must_use]
+    pub fn inputs(&self) -> &[usize] {
+        &self.inputs
+    }
+
+    /// Whether any directly referenced resolved slot differs between two
+    /// candidate sessions. Derived values that cancel remain clean.
+    #[must_use]
+    pub fn changed_between(
+        &self,
+        previous: &CandidateParameters<'_>,
+        next: &CandidateParameters<'_>,
+    ) -> bool {
+        self.direct.values().any(|&index| {
+            previous.values[index].map(Real::to_bits) != next.values[index].map(Real::to_bits)
+        })
+    }
+
+    /// Whether the candidate can change this site relative to the baseline.
+    /// The full candidate vector uses the plan's original input ordering.
+    #[must_use]
+    pub fn affected(&self, candidate: &[Real], inputs: &[ParameterInput]) -> bool {
+        self.inputs.iter().any(|&i| {
+            candidate
+                .get(i)
+                .is_none_or(|value| value.to_bits() != inputs[i].default.to_bits())
+        })
+    }
 }
 
 /// Structural inputs for one lexical scope. Parent scopes must be added first.
@@ -139,6 +182,71 @@ impl ParameterPlan {
         Some(ParameterSlot {
             scope: node.scope,
             local: node.local,
+        })
+    }
+
+    /// Bind the transitive independent inputs of one expression without
+    /// compiling another name-resolution or function-dependency registry.
+    /// The site's lexical functions and shadowing are precisely those of
+    /// the existing scope evaluation. No candidate is evaluated here.
+    ///
+    /// # Errors
+    /// Unknown scope, undefined name, or a bounded function scan failure.
+    pub fn bind_expression(
+        &self,
+        scope: ParameterScopeId,
+        expression: &ParameterExpression,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<BoundExpression> {
+        let baseline = self
+            .baseline(scope)
+            .ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))?;
+        let mut scan = RefScan {
+            use_site: baseline.functions.as_deref(),
+            budget,
+            memo: HashMap::new(),
+            stack: Vec::new(),
+            cuts: 0,
+        };
+        let mut direct = HashMap::new();
+        let mut undefined = None;
+        scan.refs(&expression.root, 0, &mut |name, location| {
+            if let Some(index) = self.lookup_slot(Some(scope), name) {
+                direct.insert(canonical_lookup(name).into_owned(), index);
+            } else if undefined.is_none() {
+                undefined = Some((name.to_owned(), location.clone()));
+            }
+        })
+        .map_err(Failure::into_error)?;
+        if let Some((name, location)) = undefined {
+            return Err(SpiceError::parse(
+                location,
+                format!("undefined parameter '{name}' in candidate expression"),
+            ));
+        }
+        let mut visited = vec![false; self.nodes.len()];
+        let mut pending: Vec<_> = direct.values().copied().collect();
+        while let Some(node) = pending.pop() {
+            if visited[node] {
+                continue;
+            }
+            visited[node] = true;
+            pending.extend(self.nodes[node].references.values().copied());
+        }
+        let inputs = self
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(position, input)| {
+                self.node_index(input.slot)
+                    .filter(|&node| visited[node])
+                    .map(|_| position)
+            })
+            .collect();
+        Ok(BoundExpression {
+            scope,
+            direct,
+            inputs,
         })
     }
 
@@ -337,6 +445,7 @@ fn select_tunables(
 
 /// Numeric state owned by one worker or lane. Candidate updates are atomic:
 /// errors retain the previous successful candidate and discard all staged values.
+#[derive(Clone)]
 pub struct CandidateParameters<'a> {
     plan: &'a ParameterPlan,
     values: Vec<Option<Real>>,
@@ -347,6 +456,47 @@ pub struct CandidateParameters<'a> {
 }
 
 impl CandidateParameters<'_> {
+    /// Materialize the current validated numeric values as ordinary lexical
+    /// scopes for consumers that require the complete existing scalar
+    /// elaboration rules. Does not re-evaluate any definition or parse a card.
+    /// Parent scope chains are constructed iteratively.
+    ///
+    /// # Errors
+    /// Unknown scope or inconsistent active resolved node.
+    pub fn resolved_scope(&self, scope: ParameterScopeId) -> SpiceResult<Arc<ParamScope>> {
+        let mut chain = Vec::new();
+        let mut at = Some(scope);
+        while let Some(id) = at {
+            let planned = self
+                .plan
+                .scopes
+                .get(id.0)
+                .ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))?;
+            chain.push(id);
+            at = planned.parent;
+        }
+        let mut parent = None;
+        for id in chain.into_iter().rev() {
+            let planned = &self.plan.scopes[id.0];
+            let mut entries = planned.baseline.entries.clone();
+            for (local, entry) in entries.iter_mut().enumerate() {
+                if matches!(entry.state, ParamState::Resolved(_)) {
+                    let value = self.values[planned.start + local].ok_or_else(|| {
+                        SpiceError::circuit("candidate resolved parameter has no numeric value")
+                    })?;
+                    entry.state = ParamState::Resolved(value);
+                }
+            }
+            parent = Some(Arc::new(ParamScope {
+                parent,
+                entries,
+                active: planned.baseline.active.clone(),
+                functions: planned.baseline.functions.clone(),
+            }));
+        }
+        parent.ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))
+    }
+
     /// Lookup with normal case-insensitive lexical shadowing.
     #[must_use]
     pub fn get(&self, scope: ParameterScopeId, name: &str) -> Option<Real> {
@@ -380,6 +530,35 @@ impl CandidateParameters<'_> {
         evaluate_root(
             expression,
             &|name| self.get(scope, name),
+            baseline.functions.as_deref(),
+            budget,
+        )
+        .map_err(Failure::into_error)
+    }
+
+    /// Evaluate an immutable site against its pre-bound lexical slots.
+    /// Uses the scalar evaluator with identical domain, budget and error rules.
+    ///
+    /// # Errors
+    /// Invalid scope or ordinary expression evaluation errors.
+    pub fn evaluate_bound(
+        &self,
+        expression: &ParameterExpression,
+        bound: &BoundExpression,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Real> {
+        let baseline = self
+            .plan
+            .baseline(bound.scope)
+            .ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))?;
+        evaluate_root(
+            expression,
+            &|name| {
+                bound
+                    .direct
+                    .get(canonical_lookup(name).as_ref())
+                    .and_then(|&index| self.values[index])
+            },
             baseline.functions.as_deref(),
             budget,
         )

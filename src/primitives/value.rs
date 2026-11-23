@@ -26,6 +26,7 @@
 //! `1kohm` is `1000`. Anything else after the literal — `1k2` — is rejected by
 //! [`parse_spice_number`]; see the RKM note on that function.
 
+use super::exact::{ScaledNumber, exact_product_sum};
 use super::numeric::{DecimalMultiplier, rounded_decimal, scale_power, split_power};
 use std::fmt;
 use std::ops::{Add, Div, Mul, Neg, Sub};
@@ -158,14 +159,23 @@ impl Sub for Complex {
 impl Mul for Complex {
     type Output = Self;
 
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "ordinary SPICE complex multiplication preserves separate product rounding"
-    )]
+    #[inline]
     fn mul(self, rhs: Self) -> Self {
+        let ac = self.re * rhs.re;
+        let bd = -self.im * rhs.im;
+        let ad = self.re * rhs.im;
+        let bc = self.im * rhs.re;
+        let real = ac + bd;
+        let imag = ad + bc;
+        // An axial operand has only one potentially nonzero product in
+        // each component: no two-product cancellation or range recovery
+        // is possible. Preserve the IEEE zero/nonfinite signs of the sum.
+        if self.re == 0. || self.im == 0. || rhs.re == 0. || rhs.im == 0. {
+            return Self::new(real, imag);
+        }
         Self::new(
-            self.re * rhs.re - self.im * rhs.im,
-            self.re * rhs.im + self.im * rhs.re,
+            refine_product(self.re, rhs.re, -self.im, rhs.im, ac, bd, real),
+            refine_product(self.re, rhs.im, self.im, rhs.re, ad, bc, imag),
         )
     }
 }
@@ -173,25 +183,30 @@ impl Mul for Complex {
 impl Div for Complex {
     type Output = Self;
 
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "the normal complex-division path uses the reference C squared denominator"
-    )]
+    #[inline]
     fn div(self, rhs: Self) -> Self {
-        let denominator = rhs.re * rhs.re + rhs.im * rhs.im;
+        let cc = rhs.re * rhs.re;
+        let dd = rhs.im * rhs.im;
+        let denominator = cc + dd;
         let ac = self.re * rhs.re;
         let bd = self.im * rhs.im;
         let bc = self.im * rhs.re;
-        let ad = self.re * rhs.im;
-        let result = Self::new((ac + bd) / denominator, (bc - ad) / denominator);
-        // Keep the C operation order on the ordinary path. Only use the
-        // scaled path when a product or sum loses its representable range.
+        let ad = -self.re * rhs.im;
+        let real = compensated_sum(self.re, rhs.re, self.im, rhs.im, ac, bd);
+        let imag = compensated_sum(self.im, rhs.re, -self.re, rhs.im, bc, ad);
+        let result = Self::new(real / denominator, imag / denominator);
+        // Keep numerator and denominator in exponent-scaled form whenever
+        // materializing either could erase a representable quotient component.
         if (!denominator.is_normal()
             || !result.is_finite()
-            || lost_product(ac, self.re, rhs.re)
-            || lost_product(bd, self.im, rhs.im)
-            || lost_product(bc, self.im, rhs.re)
-            || lost_product(ad, self.re, rhs.im))
+            || (!real.is_normal()
+                && (lost_product(ac, self.re, rhs.re)
+                    || lost_product(bd, self.im, rhs.im)
+                    || quotient_numerator_lost_range(real, ac, bd)))
+            || (!imag.is_normal()
+                && (lost_product(bc, self.im, rhs.re)
+                    || lost_product(ad, self.re, rhs.im)
+                    || quotient_numerator_lost_range(imag, bc, ad))))
             && self.is_finite()
             && rhs.is_finite()
             && rhs != Self::ZERO
@@ -202,21 +217,67 @@ impl Div for Complex {
     }
 }
 
+/// Recover the rounding residual in a cancellation-prone sum of two
+/// products. The IEEE sum is sufficient for well-conditioned sums; avoid
+/// software FMA calls on generic targets for these common cases.
+#[inline]
+fn compensated_sum(a: Real, b: Real, c: Real, d: Real, first: Real, second: Real) -> Real {
+    let sum = first + second;
+    if sum.abs() <= 0.5 * first.abs().max(second.abs()) && first.is_normal() && second.is_normal() {
+        a.mul_add(b, second) + c.mul_add(d, -second)
+    } else {
+        sum
+    }
+}
+
+#[inline]
+fn refine_product(
+    a: Real,
+    b: Real,
+    c: Real,
+    d: Real,
+    first: Real,
+    second: Real,
+    sum: Real,
+) -> Real {
+    if sum.is_normal() && sum.abs() > 0.5 * first.abs().max(second.abs()) {
+        return sum;
+    }
+    refine_product_sum(a, b, c, d, first, second, sum)
+}
+
+#[cold]
+fn refine_product_sum(
+    a: Real,
+    b: Real,
+    c: Real,
+    d: Real,
+    first: Real,
+    second: Real,
+    sum: Real,
+) -> Real {
+    if (!sum.is_finite() || lost_product(first, a, b) || lost_product(second, c, d))
+        && [a, b, c, d].into_iter().all(Real::is_finite)
+    {
+        let scaled = ScaledProduct::product(a, b).add(ScaledProduct::product(c, d));
+        scale_power(scaled.mantissa, scaled.exponent)
+    } else {
+        compensated_sum(a, b, c, d, first, second)
+    }
+}
+
+#[inline]
 fn lost_product(product: Real, a: Real, b: Real) -> bool {
     !product.is_normal() && a != 0.0 && b != 0.0
 }
 
-/// A number represented outside the native binary64 exponent range.
-#[derive(Clone, Copy)]
-struct ScaledNumber {
-    mantissa: Real,
-    exponent: i32,
-}
-
-impl ScaledNumber {
-    fn divide(self, rhs: Self) -> Real {
-        scale_power(self.mantissa / rhs.mantissa, self.exponent - rhs.exponent)
-    }
+/// A cancellation residual below the normal range must not be rounded
+/// before division by a potentially tiny denominator.
+fn quotient_numerator_lost_range(sum: Real, first: Real, second: Real) -> bool {
+    !sum.is_normal()
+        && first != 0.0
+        && second != 0.0
+        && first.abs().max(second.abs()) < Real::from_bits(54_u64 << 52)
 }
 
 /// An exponent-scaled product with its exact rounding residual. Keeping
@@ -295,6 +356,65 @@ fn scaled_complex_div(a: Complex, b: Complex) -> Complex {
     Complex::new(
         p(a.re, b.re).add(p(a.im, b.im)).divide(denominator),
         p(a.im, b.re).add(p(-a.re, b.im)).divide(denominator),
+    )
+}
+
+/// Accurate (value * pivot - upper * lower) / pivot. All four inputs
+/// are original, unnormalized coefficients of the current Schur step.
+#[cold]
+pub(crate) fn real_schur(value: Real, pivot: Real, upper: Real, lower: Real) -> Real {
+    let product = upper * lower;
+    let other = value * pivot;
+    // Normal products with enough exponent headroom have an exact FMA
+    // rounding residual. A two-product difference needs no wide accumulator.
+    if product.is_normal()
+        && other.is_normal()
+        && product.abs().min(other.abs()) >= Real::from_bits(55_u64 << 52)
+        && product.abs().max(other.abs()) < Real::MAX * 0.5
+    {
+        return (value.mul_add(pivot, -product) - upper.mul_add(lower, -product)) / pivot;
+    }
+    let numerator = exact_product_sum([(value, pivot), (-upper, lower)]);
+    let (mantissa, exponent) = split_power(pivot);
+    numerator.divide(ScaledNumber { mantissa, exponent })
+}
+
+/// Same Schur update for complex entries. Accumulate the cross products
+/// before rounding, then divide in scaled form, preserving independently
+/// scaled real and imaginary numerator components.
+#[cold]
+pub(crate) fn complex_schur(
+    value: Complex,
+    pivot: Complex,
+    upper: Complex,
+    lower: Complex,
+) -> Complex {
+    let real = exact_product_sum([
+        (value.re, pivot.re),
+        (-value.im, pivot.im),
+        (-upper.re, lower.re),
+        (upper.im, lower.im),
+    ]);
+    let imag = exact_product_sum([
+        (value.re, pivot.im),
+        (value.im, pivot.re),
+        (-upper.re, lower.im),
+        (-upper.im, lower.re),
+    ]);
+    let times = |x: ScaledNumber, v: Real| {
+        let mut product = ScaledProduct::product(x.mantissa, v);
+        product.value.exponent += x.exponent;
+        product
+    };
+    let p = ScaledProduct::product;
+    let denominator = p(pivot.re, pivot.re).add(p(pivot.im, pivot.im));
+    Complex::new(
+        times(real, pivot.re)
+            .add(times(imag, pivot.im))
+            .divide(denominator),
+        times(imag, pivot.re)
+            .add(times(real, -pivot.im))
+            .divide(denominator),
     )
 }
 
@@ -531,8 +651,9 @@ pub fn format_spice_number(value: Real) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Complex, almost_equal_ulps, approx_eq, format_spice_number, parse_numparam_number_prefix,
-        parse_spice_number, parse_spice_number_prefix,
+        Complex, Real, almost_equal_ulps, approx_eq, complex_schur, exact_product_sum,
+        format_spice_number, parse_numparam_number_prefix, parse_spice_number,
+        parse_spice_number_prefix, real_schur, scale_power,
     };
 
     #[test]
@@ -551,17 +672,15 @@ mod tests {
     }
 
     #[test]
-    fn complex_division_preserves_normal_rounding_and_extreme_components() {
+    fn complex_division_handles_normal_and_extreme_components() {
         let a = Complex::new(1.23456789, -9.87654321);
         let b = Complex::new(-0.371, 2.415);
-        let d = b.re * b.re + b.im * b.im;
-        let expected = Complex::new(
-            (a.re * b.re + a.im * b.im) / d,
-            (a.im * b.re - a.re * b.im) / d,
-        );
+        // Correct rounding of the exact rational quotient of the binary64
+        // input values (not the original cancellation-prone calculation).
+        let expected = Complex::new(-4.072_097_521_006_333_5, 0.114_360_368_651_490_67);
         let actual = a / b;
-        assert_eq!(actual.re.to_bits(), expected.re.to_bits());
-        assert_eq!(actual.im.to_bits(), expected.im.to_bits());
+        assert!(almost_equal_ulps(actual.re, expected.re, 2));
+        assert!(almost_equal_ulps(actual.im, expected.im, 2));
         for scale in [1e-300, 1e-200, 1e200, 1e300, f64::MAX] {
             let z = Complex::new(scale, scale);
             assert_eq!(z / z, Complex::real(1.));
@@ -586,16 +705,84 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_complex_arithmetic_does_not_recover_product_roundoff() {
+    fn ordinary_complex_arithmetic_recovers_product_roundoff() {
         let epsilon = f64::EPSILON;
         let a = Complex::new(1. + epsilon, 1.);
         let b = Complex::new(1. - epsilon, 1.);
-        // Fusing the two products would expose -epsilon^2, but the C path
-        // rounds two ordinary products independently before subtraction.
-        assert_eq!((a * b).re.to_bits(), 0_f64.to_bits());
+        let expected = -(epsilon * epsilon);
+        assert_eq!((a * b).re, expected);
         let q = Complex::new(a.re, -a.im) / b;
-        assert_eq!(q.re.to_bits(), 0_f64.to_bits());
-        assert!((1. + epsilon).mul_add(1. - epsilon, -1.) < 0.);
+        assert_eq!(q.re, expected / ((1. - epsilon).powi(2) + 1.));
+        assert_eq!((b * a).re, expected);
+    }
+
+    #[test]
+    fn exact_products_preserve_cancellation_across_the_full_exponent_range() {
+        let tiny = Real::from_bits(1);
+        let huge = Real::MAX;
+        let exact = exact_product_sum([(huge, huge), (-huge, huge), (tiny, tiny)]);
+        assert_eq!(exact.mantissa, 1.);
+        assert_eq!(exact.exponent, -2148);
+        let exact = exact_product_sum([(huge, huge), (-huge, huge), (-tiny, tiny)]);
+        assert_eq!(exact.mantissa, -1.);
+        assert_eq!(exact.exponent, -2148);
+        let power = scale_power(1., 1023);
+        let exact = exact_product_sum([(power, power); 4]);
+        assert_eq!(exact.mantissa, 1.);
+        assert_eq!(exact.exponent, 2048);
+        // The wide sum rounds halfway to even, but a sticky bit at the
+        // opposite end of the accumulator changes the rounded result.
+        let half = Real::EPSILON / 2.;
+        for (extra, expected) in [(0., 1.), (tiny, 1.0_f64.next_up())] {
+            let exact = exact_product_sum([(1., 1.), (half, 1.), (extra, 1.)]);
+            assert_eq!(scale_power(exact.mantissa, exact.exponent), expected);
+        }
+    }
+
+    #[test]
+    fn unnormalized_schur_recovers_tiny_nonzero_determinants() {
+        for (pivot_exp, lower_exp) in [(700, 700), (-500, -700), (500, -500)] {
+            let pivot = scale_power(1., pivot_exp);
+            let lower = scale_power(1., lower_exp);
+            let value = lower.next_up();
+            assert_eq!(real_schur(lower, pivot, pivot, lower), 0.);
+            assert_eq!(real_schur(value, pivot, pivot, lower), value - lower);
+        }
+        let pivot = Complex::new(scale_power(1., 500), scale_power(1., -500));
+        let lower = Complex::new(scale_power(1., 600), scale_power(1., -600));
+        let value = Complex::new(lower.re, lower.im.next_up());
+        assert_eq!(complex_schur(lower, pivot, pivot, lower), Complex::ZERO);
+        let result = complex_schur(value, pivot, pivot, lower);
+        let expected = value.im - lower.im;
+        assert!((result.im / expected - 1.).abs() < 1e-14);
+        assert!(result.re.abs() <= expected.abs() * 1e-14);
+    }
+
+    #[test]
+    fn quotient_retains_cancellation_before_subnormal_rounding() {
+        let e = f64::EPSILON;
+        let scale = 2_f64.powi(-500);
+        let a = Complex::new((1. + e) * scale, -scale);
+        let b = Complex::new((1. - e) * scale, scale);
+        let q = a / b;
+        let expected = -(e * e) / ((1. - e).powi(2) + 1.);
+        assert!((q.re / expected - 1.).abs() < 1e-14);
+        assert!((q.im + 1.).abs() < 1e-14);
+    }
+
+    #[test]
+    fn complex_product_recovers_finite_components_across_exponent_limits() {
+        let large = Complex::new(f64::MAX, f64::MAX);
+        let z = large * Complex::new(2., 2.);
+        assert_eq!(z.re, 0.);
+        assert!(z.im.is_infinite() && z.im.is_sign_positive());
+        let tiny = f64::from_bits(1);
+        let z = Complex::new(tiny, tiny) * Complex::new(0.5, -0.5);
+        assert_eq!(z.re, tiny);
+        assert_eq!(z.im, 0.);
+        let z = Complex::new(1e300, 1e-300) * Complex::real(1e-10);
+        assert!((z.re / 1e290 - 1.).abs() < 1e-14);
+        assert!((z.im / 1e-310 - 1.).abs() < 1e-13);
     }
 
     #[test]

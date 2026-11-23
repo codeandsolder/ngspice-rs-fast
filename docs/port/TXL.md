@@ -83,6 +83,35 @@ C's two pivot thresholds (`1e-16`, `1e-28`) and its partial-row swaps.
 `pade.rs` keeps C's operation order so the coefficients are bit-compatible,
 but returns `Numerical` errors where C calls `controlled_exit`.
 
+The lossless geometry now retains **finite final quantities** even when C's
+intermediate `C/L` underflows/overflows or `L*C` overflows/underflows (#152).
+For normal intermediate ratios and products it retains the original C
+operation order. In the extreme range it computes `sqrt(C)/sqrt(L)` and
+`sqrt(L)*sqrt(C)`, respectively. The seconds-to-picoseconds conversion is
+performed before multiplication when `tau*length` would be subnormal, so
+an otherwise representable delay is not erased or coarsely rounded. The
+existing finite/positive guards apply to the **final** admittance and delay.
+Thus `L=C=1e160, length=1e-150` has admittance 1 and delay 1e22 ps;
+`L=1e300, C=1e-100, length=1e-100` has admittance 1e-200 and delay
+1e12 ps. This changes only geometric coefficient construction, not history
+tick width, propagation interpolation, Padé coefficient formulas, or AC
+capabilities. The focused unit cases use independently computed 750-digit
+decimal square-root references on exact binary64 inputs, with 2-ULP bounds.
+A transient regression checks that an extreme but representable delay does
+not produce an early arrival. The ignored `tests/c_txl_reference.rs` runs
+three ordinary TXL fixtures through a pinned C batch binary and checks all
+captured numeric cells against the committed C ASCII golden by variable name
+and occurrence (not header metadata or capture sort order). The independent
+Rust-to-golden verification remains `xtask golden verify`.
+
+As a wider numerical audit, 4,000 deterministic randomized positive
+binary64 L/C/length combinations across the full exponent range (with the
+original 1e-12 H inductance floor) were checked against 420-digit Decimal
+square roots of exact binary64 inputs. Of 7,396 representable positive final
+admittance/delay results, no acceptance/range discrepancies occurred and the
+largest error was 2 ULP in either quantity. The independent high-precision
+unit cases pin the key boundaries so normal tests do not need Decimal.
+
 `m10_txl_op`/`m10_txl_dc` pin the DC answer and `m10_txl_tran`/
 `m10_txl_early_tran`/`m10_txl_tran_step`/`m10_txl3_tran` the transient.
 `m10_txl_lossless_tran` covers the lossless shortcut; `m10_txl_fb_tran`

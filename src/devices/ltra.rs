@@ -869,28 +869,6 @@ impl LossyLine {
         })
     }
 
-    /// Sum a pair of port components in reverse history order; initial
-    /// accumulators include the delayed contribution for RLC h2/h3'.
-    fn history_sum(
-        history: DelaySamples<'_, 4>,
-        weights: &[[Real; 3]],
-        kernel: usize,
-        components: [usize; 2],
-        initial: [Real; 4],
-        mut sum: [Real; 2],
-    ) -> [Real; 2] {
-        let [a, b] = components;
-        for (i, weight) in weights.iter().enumerate().skip(1).rev() {
-            let weight = weight[kernel];
-            if weight != 0.0 {
-                let sample = history.sample(i);
-                sum[0] += weight * (sample[a] - initial[a]);
-                sum[1] += weight * (sample[b] - initial[b]);
-            }
-        }
-        sum
-    }
-
     /// Apply the history sums in C's original reverse traversal and
     /// arithmetic order. No accepted or trial state is mutated.
     fn convolution_inputs(
@@ -909,8 +887,23 @@ impl LossyLine {
             LtraCase::Rlc => {
                 let c = coefficients;
                 // h1' with v1 and v2.
-                let [mut d1, mut d2] =
-                    Self::history_sum(history, &c.weights, 0, [0, 2], initial, [0.; 2]);
+                let seeds = if tdover {
+                    [
+                        [0.; 2],
+                        [(i2d - ii2) * c.first[1], (i1d - ii1) * c.first[1]],
+                        [(v2d - iv2) * c.first[2], (v1d - iv1) * c.first[2]],
+                    ]
+                } else {
+                    [[0.; 2]; 3]
+                };
+                let [h1, h2, h3] = reduce_history(
+                    history,
+                    &c.weights,
+                    initial,
+                    if tdover { c.aux_index } else { 0 },
+                    seeds,
+                );
+                let [mut d1, mut d2] = h1;
                 d1 += iv1 * m.int_h1dash;
                 d2 += iv2 * m.int_h1dash;
                 d1 -= iv1 * c.first[0];
@@ -918,37 +911,13 @@ impl LossyLine {
                 inputs[0] -= d1 * m.admit;
                 inputs[1] -= d2 * m.admit;
                 // h2 with i2 and i1.
-                let (mut d1, mut d2) = (0., 0.);
-                if tdover {
-                    d1 = (i2d - ii2) * c.first[1];
-                    d2 = (i1d - ii1) * c.first[1];
-                    [d1, d2] = Self::history_sum(
-                        history,
-                        &c.weights[..=c.aux_index],
-                        1,
-                        [3, 1],
-                        initial,
-                        [d1, d2],
-                    );
-                }
+                let [mut d1, mut d2] = h2;
                 d1 += ii2 * m.int_h2;
                 d2 += ii1 * m.int_h2;
                 inputs[0] += d1;
                 inputs[1] += d2;
                 // h3' with v2 and v1.
-                let (mut d1, mut d2) = (0., 0.);
-                if tdover {
-                    d1 = (v2d - iv2) * c.first[2];
-                    d2 = (v1d - iv1) * c.first[2];
-                    [d1, d2] = Self::history_sum(
-                        history,
-                        &c.weights[..=c.aux_index],
-                        2,
-                        [2, 0],
-                        initial,
-                        [d1, d2],
-                    );
-                }
+                let [mut d1, mut d2] = h3;
                 d1 += iv2 * m.int_h3dash;
                 d2 += iv1 * m.int_h3dash;
                 inputs[0] += m.admit * d1;
@@ -960,24 +929,23 @@ impl LossyLine {
             }
             LtraCase::Rc => {
                 let c = coefficients;
-                let [mut d1, mut d2] =
-                    Self::history_sum(history, &c.weights, 0, [0, 2], initial, [0.; 2]);
+                let [h1, h2, h3] =
+                    reduce_history(history, &c.weights, initial, c.aux_index, [[0.; 2]; 3]);
+                let [mut d1, mut d2] = h1;
                 d1 += iv1 * m.int_h1dash;
                 d2 += iv2 * m.int_h1dash;
                 d1 -= iv1 * c.first[0];
                 d2 -= iv2 * c.first[0];
                 inputs[0] -= d1;
                 inputs[1] -= d2;
-                let [mut d1, mut d2] =
-                    Self::history_sum(history, &c.weights, 1, [3, 1], initial, [0.; 2]);
+                let [mut d1, mut d2] = h2;
                 d1 += ii2 * m.int_h2;
                 d2 += ii1 * m.int_h2;
                 d1 -= ii2 * c.first[1];
                 d2 -= ii1 * c.first[1];
                 inputs[0] += d1;
                 inputs[1] += d2;
-                let [mut d1, mut d2] =
-                    Self::history_sum(history, &c.weights, 2, [2, 0], initial, [0.; 2]);
+                let [mut d1, mut d2] = h3;
                 d1 += iv2 * m.int_h3dash;
                 d2 += iv1 * m.int_h3dash;
                 d1 -= iv2 * c.first[2];
@@ -1215,7 +1183,8 @@ impl Device for LossyLine {
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Err(self.unsupported(".noise"))
     }
 
@@ -1371,6 +1340,49 @@ impl DelayLine for LossyLine {
     }
 }
 
+// Indexed traversal avoids constructing a split-ring iterator for short
+// histories. The same scalar implementation also serves as the numerical
+// reference for the vector kernel.
+fn scalar_history_sums(
+    history: DelaySamples<'_, 4>,
+    weights: &[[Real; 3]],
+    initial: [Real; 4],
+    coupled_end: usize,
+    mut sums: [[Real; 2]; 3],
+) -> [[Real; 2]; 3] {
+    for (k, components) in [[0, 2], [3, 1], [2, 0]].into_iter().enumerate() {
+        let end = if k == 0 {
+            weights.len() - 1
+        } else {
+            coupled_end
+        };
+        for i in (1..=end).rev() {
+            let weight = weights[i][k];
+            if weight != 0. {
+                let row = history.sample(i);
+                for (sum, component) in sums[k].iter_mut().zip(components) {
+                    *sum += weight * (row[component] - initial[component]);
+                }
+            }
+        }
+    }
+    sums
+}
+
+fn reduce_history(
+    history: DelaySamples<'_, 4>,
+    weights: &[[Real; 3]],
+    initial: [Real; 4],
+    coupled_end: usize,
+    sums: [[Real; 2]; 3],
+) -> [[Real; 2]; 3] {
+    if weights.len() < 32 {
+        scalar_history_sums(history, weights, initial, coupled_end, sums)
+    } else {
+        convolution::history_sums(history.rows(), weights, initial, coupled_end, sums)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1390,6 +1402,156 @@ mod tests {
                 LossyLine::instantiate(&deck.devices[0], nodes, &models, &ModelContext::default())
             })
             .unwrap()
+    }
+
+    fn waveform_history(count: i32, wrapped: bool) -> WaveformHistory {
+        let row = |i| {
+            let x = Real::from(i) * 1e-2;
+            (
+                Real::from(i) * 1e-11,
+                vec![
+                    x.sin(),
+                    0.02 * x.cos(),
+                    (0.7 * x).sin(),
+                    0.02 * (0.7 * x).cos(),
+                ],
+            )
+        };
+        let mut history = WaveformHistory::new(4);
+        history
+            .apply(&WaveformUpdate {
+                reset: Some((0..count).map(row).collect()),
+                ..WaveformUpdate::default()
+            })
+            .unwrap();
+        if wrapped {
+            for i in count..count + count.div_euclid(2) {
+                history
+                    .apply(&WaveformUpdate {
+                        drop_front: 1,
+                        append: Some(row(i)),
+                        ..WaveformUpdate::default()
+                    })
+                    .unwrap();
+            }
+        }
+        history
+    }
+
+    #[test]
+    fn batched_history_matches_scalar_order_and_delayed_cutoff() {
+        for count in [1, 2, 7, 8, 9, 17, 31, 32, 33, 257] {
+            for wrapped in [false, true] {
+                let history = waveform_history(count, wrapped);
+                let view = history.samples::<4>().unwrap();
+                let initial = view.sample(0);
+                let weights: Vec<_> = (0..count)
+                    .map(|i| {
+                        let value = if i % 4 == 0 {
+                            -0.
+                        } else {
+                            10_f64.powi(i % 400 - 200)
+                        };
+                        [value, if i % 3 == 0 { -value } else { 0. }, -value]
+                    })
+                    .collect();
+                let seeds = [[-0., 0.], [1., -2.], [3., -4.]];
+                for end in [0, weights.len() / 2, weights.len() - 1] {
+                    let expected = scalar_history_sums(view, &weights, initial, end, seeds);
+                    let got = convolution::history_sums(view.rows(), &weights, initial, end, seeds);
+                    assert_eq!(
+                        got.map(|p| p.map(Real::to_bits)),
+                        expected.map(|p| p.map(Real::to_bits))
+                    );
+                    assert_eq!(
+                        reduce_history(view, &weights, initial, end, seeds)
+                            .map(|p| p.map(Real::to_bits)),
+                        expected.map(|p| p.map(Real::to_bits))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_weights_do_not_propagate_overflow_or_change_signed_zero() {
+        let rows = [[-Real::MAX, 1., Real::MAX, -1.]; 12];
+        let initial = [Real::MAX, 0., -Real::MAX, 0.];
+        let mut weights = [[0.; 3]; 12];
+        weights[11] = [1., 2., -0.];
+        weights[10] = [0., 0., 1.]; // Outside the coupled cutoff.
+        let seeds = [[0., 0.], [0., 0.], [-0., -0.]];
+        let sums = convolution::history_sums(rows.into_iter(), &weights, initial, 0, seeds);
+        assert_eq!(sums[0], [Real::NEG_INFINITY, Real::INFINITY]);
+        assert_eq!(sums[1].map(Real::to_bits), [0.; 2].map(Real::to_bits));
+        assert_eq!(sums[2].map(Real::to_bits), seeds[2].map(Real::to_bits));
+        let sums = convolution::history_sums(rows.into_iter(), &weights, initial, 11, seeds);
+        assert_eq!(sums[1], [-2., 2.]);
+        assert_eq!(sums[2], [Real::INFINITY, Real::NEG_INFINITY]);
+    }
+
+    #[test]
+    #[ignore = "optimized history-only benchmark; run explicitly"]
+    fn history_reduction_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        for count in [8_i32, 128, 2048, 16384] {
+            for wrapped in [false, true] {
+                let history = waveform_history(count, wrapped);
+                let view = history.samples::<4>().unwrap();
+                let initial = view.sample(0);
+                let now = history.last_time().unwrap() + 1e-11;
+                let times = view.times();
+                for (kind, coeff) in [
+                    (
+                        "RC",
+                        convolution::rc_coefficients(1e-12, 4e-8, now, times, 0.),
+                    ),
+                    (
+                        "RLC",
+                        convolution::rlc_coefficients(5e-9, 2e8, 2e8, now, times, 0.),
+                    ),
+                ] {
+                    let end = coeff.aux_index;
+                    let seeds = [[0.; 2], [1e-3, -1e-3], [2e-3, -2e-3]];
+                    let old = scalar_history_sums(view, &coeff.weights, initial, end, seeds);
+                    let new = reduce_history(view, &coeff.weights, initial, end, seeds);
+                    assert_eq!(
+                        old.map(|p| p.map(Real::to_bits)),
+                        new.map(|p| p.map(Real::to_bits))
+                    );
+                    let iterations = (1_048_576 / count).max(4);
+                    for trial in 0..3 {
+                        // Alternate order to reduce shared-host frequency and scheduling bias.
+                        for vector in [trial % 2 == 0, trial % 2 != 0] {
+                            let start = Instant::now();
+                            for _ in 0..iterations {
+                                if vector {
+                                    black_box(reduce_history(
+                                        black_box(view),
+                                        black_box(&coeff.weights),
+                                        initial,
+                                        end,
+                                        seeds,
+                                    ));
+                                } else {
+                                    black_box(scalar_history_sums(
+                                        black_box(view),
+                                        black_box(&coeff.weights),
+                                        initial,
+                                        end,
+                                        seeds,
+                                    ));
+                                }
+                            }
+                            println!(
+                                "history_reduction,{kind},{count},{wrapped},{vector},{iterations},{}",
+                                start.elapsed().as_nanos()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

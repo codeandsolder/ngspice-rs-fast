@@ -670,7 +670,7 @@ impl Driver<'_> {
         let TransientPlan { stop, start, .. } = self.settings;
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
         let min_step = self.settings.min_step();
-        let mut breaks = BreakTable::new(stop, 10.0 * min_step);
+        let mut breaks = BreakTable::new(stop, 10.0 * min_step)?;
         let mut sources = SourceBreaks::new(self.system);
         let plot = plot(
             self.circuit,
@@ -688,7 +688,6 @@ impl Driver<'_> {
             // CKTaccept runs DEVaccept in dev.c type order: isrc, then tra
             // (the delay lines' requests), then vsrc.
             sources.accept(
-                self.system,
                 SourceKind::Current,
                 accepted.cursor.clock.time,
                 accepted.cursor.boundary.at_break(),
@@ -699,7 +698,6 @@ impl Driver<'_> {
                 breaks.set(accepted.cursor.clock.time, time)?;
             }
             sources.accept(
-                self.system,
                 SourceKind::Voltage,
                 accepted.cursor.clock.time,
                 accepted.cursor.boundary.at_break(),

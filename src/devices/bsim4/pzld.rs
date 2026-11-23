@@ -7,8 +7,9 @@
 //! grouping differs from C: the AC NQS charge-node term
 //! `m * s->real * ScalingFactor` is the coefficient `m * ScalingFactor`
 //! times `s`, which rounds differently from C's left-to-right product.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+// PZ conductance and charge-partition products use FMA where the physical
+// derivative requires cancellation-sensitive arithmetic. Branch thresholds
+// and the input model's dimensionless charge-partition limits remain distinct.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -16,10 +17,6 @@
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 #![expect(
     non_snake_case,
@@ -126,7 +123,7 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         }
         if h.rgateMod > 1 {
             gcrgd = h.gcrgd * T0;
-            gcrgg = h.gcrgg * T0 - h.gcrg;
+            gcrgg = h.gcrgg.mul_add(T0, -h.gcrg);
             gcrgs = h.gcrgs * T0;
             gcrgb = h.gcrgb * T0;
             gcrg = h.gcrg;
@@ -224,14 +221,14 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
                 dxpart = h.qdrn / qcheq;
                 let Cdd = h.cddb;
                 let Csd = -(h.cgdb + h.cddb + h.cbdb);
-                ddxpart_dVd = (Cdd - dxpart * (Cdd + Csd)) / qcheq;
+                ddxpart_dVd = f64::mul_add(dxpart, -(Cdd + Csd), Cdd) / qcheq;
                 let Cdg = h.cdgb;
                 let Csg = -(h.cggb + h.cdgb + h.cbgb);
-                ddxpart_dVg = (Cdg - dxpart * (Cdg + Csg)) / qcheq;
+                ddxpart_dVg = f64::mul_add(dxpart, -(Cdg + Csg), Cdg) / qcheq;
 
                 let Cds = h.cdsb;
                 let Css = -(h.cgsb + h.cdsb + h.cbsb);
-                ddxpart_dVs = (Cds - dxpart * (Cds + Css)) / qcheq;
+                ddxpart_dVs = f64::mul_add(dxpart, -(Cds + Css), Cds) / qcheq;
 
                 ddxpart_dVb = -(ddxpart_dVd + ddxpart_dVg + ddxpart_dVs);
             }
@@ -301,7 +298,7 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         if h.rgateMod > 1 {
             // C swaps the drain and source derivatives in reverse mode.
             gcrgd = h.gcrgs * T0;
-            gcrgg = h.gcrgg * T0 - h.gcrg;
+            gcrgg = h.gcrgg.mul_add(T0, -h.gcrg);
             gcrgs = h.gcrgd * T0;
             gcrgb = h.gcrgb * T0;
             gcrg = h.gcrg;
@@ -398,14 +395,14 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
                 sxpart = h.qdrn / qcheq;
                 let Css = h.cddb;
                 let Cds = -(h.cgdb + h.cddb + h.cbdb);
-                dsxpart_dVs = (Css - sxpart * (Css + Cds)) / qcheq;
+                dsxpart_dVs = f64::mul_add(sxpart, -(Css + Cds), Css) / qcheq;
                 let Csg = h.cdgb;
                 let Cdg = -(h.cggb + h.cdgb + h.cbgb);
-                dsxpart_dVg = (Csg - sxpart * (Csg + Cdg)) / qcheq;
+                dsxpart_dVg = f64::mul_add(sxpart, -(Csg + Cdg), Csg) / qcheq;
 
                 let Csd = h.cdsb;
                 let Cdd = -(h.cgsb + h.cdsb + h.cbsb);
-                dsxpart_dVd = (Csd - sxpart * (Csd + Cdd)) / qcheq;
+                dsxpart_dVd = f64::mul_add(sxpart, -(Csd + Cdd), Csd) / qcheq;
 
                 dsxpart_dVb = -(dsxpart_dVd + dsxpart_dVg + dsxpart_dVs);
             }
@@ -474,13 +471,13 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         ckt.real(ge, gp, -(mult_i * geltd));
 
         ckt.cap(gp, gp, mult_q * xcggb);
-        ckt.real(gp, gp, mult_i * (geltd + gIgtotg) - mult_q * xgtg);
+        ckt.real(gp, gp, mult_q.mul_add(-xgtg, mult_i * (geltd + gIgtotg)));
         ckt.cap(gp, dp, mult_q * xcgdb);
-        ckt.real(gp, dp, -(mult_q * xgtd - mult_i * gIgtotd));
+        ckt.real(gp, dp, -mult_i.mul_add(-gIgtotd, mult_q * xgtd));
         ckt.cap(gp, sp, mult_q * xcgsb);
-        ckt.real(gp, sp, -(mult_q * xgts - mult_i * gIgtots));
+        ckt.real(gp, sp, -mult_i.mul_add(-gIgtots, mult_q * xgts));
         ckt.cap(gp, bp, mult_q * xcgbb);
-        ckt.real(gp, bp, -(mult_q * xgtb - mult_i * gIgtotb));
+        ckt.real(gp, bp, -mult_i.mul_add(-gIgtotb, mult_q * xgtb));
     } else if h.rgateMod == 2 {
         ckt.real(ge, ge, mult_i * gcrg);
         ckt.real(ge, gp, mult_i * gcrgg);
@@ -490,13 +487,13 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
 
         ckt.real(gp, ge, -(mult_i * gcrg));
         ckt.cap(gp, gp, mult_q * xcggb);
-        ckt.real(gp, gp, -(mult_i * (gcrgg - gIgtotg) + mult_q * xgtg));
+        ckt.real(gp, gp, -mult_q.mul_add(xgtg, mult_i * (gcrgg - gIgtotg)));
         ckt.cap(gp, dp, mult_q * xcgdb);
-        ckt.real(gp, dp, -(mult_i * (gcrgd - gIgtotd) + mult_q * xgtd));
+        ckt.real(gp, dp, -mult_q.mul_add(xgtd, mult_i * (gcrgd - gIgtotd)));
         ckt.cap(gp, sp, mult_q * xcgsb);
-        ckt.real(gp, sp, -(mult_i * (gcrgs - gIgtots) + mult_q * xgts));
+        ckt.real(gp, sp, -mult_q.mul_add(xgts, mult_i * (gcrgs - gIgtots)));
         ckt.cap(gp, bp, mult_q * xcgbb);
-        ckt.real(gp, bp, -(mult_i * (gcrgb - gIgtotb) + mult_q * xgtb));
+        ckt.real(gp, bp, -mult_q.mul_add(xgtb, mult_i * (gcrgb - gIgtotb)));
     } else if h.rgateMod == 3 {
         ckt.real(ge, ge, mult_i * geltd);
         ckt.real(ge, gm, -(mult_i * geltd));
@@ -517,23 +514,23 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         ckt.cap(sp, gm, mult_q * xcsgmb);
         ckt.cap(bp, gm, mult_q * xcbgmb);
 
-        ckt.real(gp, gp, -(mult_i * (gcrgg - gIgtotg) + mult_q * xgtg));
+        ckt.real(gp, gp, -mult_q.mul_add(xgtg, mult_i * (gcrgg - gIgtotg)));
         ckt.cap(gp, gp, mult_q * xcggb);
-        ckt.real(gp, dp, -(mult_i * (gcrgd - gIgtotd) + mult_q * xgtd));
+        ckt.real(gp, dp, -mult_q.mul_add(xgtd, mult_i * (gcrgd - gIgtotd)));
         ckt.cap(gp, dp, mult_q * xcgdb);
-        ckt.real(gp, sp, -(mult_i * (gcrgs - gIgtots) + mult_q * xgts));
+        ckt.real(gp, sp, -mult_q.mul_add(xgts, mult_i * (gcrgs - gIgtots)));
         ckt.cap(gp, sp, mult_q * xcgsb);
-        ckt.real(gp, bp, -(mult_i * (gcrgb - gIgtotb) + mult_q * xgtb));
+        ckt.real(gp, bp, -mult_q.mul_add(xgtb, mult_i * (gcrgb - gIgtotb)));
         ckt.cap(gp, bp, mult_q * xcgbb);
     } else {
         ckt.cap(gp, dp, mult_q * xcgdb);
-        ckt.real(gp, dp, -(mult_q * xgtd - mult_i * gIgtotd));
+        ckt.real(gp, dp, -mult_i.mul_add(-gIgtotd, mult_q * xgtd));
         ckt.cap(gp, gp, mult_q * xcggb);
-        ckt.real(gp, gp, -(mult_q * xgtg - mult_i * gIgtotg));
+        ckt.real(gp, gp, -mult_i.mul_add(-gIgtotg, mult_q * xgtg));
         ckt.cap(gp, sp, mult_q * xcgsb);
-        ckt.real(gp, sp, -(mult_q * xgts - mult_i * gIgtots));
+        ckt.real(gp, sp, -mult_i.mul_add(-gIgtots, mult_q * xgts));
         ckt.cap(gp, bp, mult_q * xcgbb);
-        ckt.real(gp, bp, -(mult_q * xgtb - mult_i * gIgtotb));
+        ckt.real(gp, bp, -mult_i.mul_add(-gIgtotb, mult_q * xgtb));
     }
 
     if m.rdsMod != 0 {
@@ -549,29 +546,38 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
     ckt.real(
         dp,
         dp,
-        mult_i * (gdpr + gds + h.gbd - gdtotd + RevSum + gbdpdp - gIdtotd)
-            + mult_q * (dxpart * xgtd + T1 * ddxpart_dVd),
+        mult_q.mul_add(
+            T1.mul_add(ddxpart_dVd, dxpart * xgtd),
+            mult_i * (gdpr + gds + h.gbd - gdtotd + RevSum + gbdpdp - gIdtotd),
+        ),
     );
     ckt.real(dp, d, -(mult_i * (gdpr + gdtot)));
     ckt.cap(dp, gp, mult_q * xcdgb);
     ckt.real(
         dp,
         gp,
-        mult_i * (Gm - gdtotg + gbdpg - gIdtotg) + mult_q * (T1 * ddxpart_dVg + dxpart * xgtg),
+        mult_q.mul_add(
+            f64::mul_add(dxpart, xgtg, T1 * ddxpart_dVg),
+            mult_i * (Gm - gdtotg + gbdpg - gIdtotg),
+        ),
     );
     ckt.cap(dp, sp, mult_q * xcdsb);
     ckt.real(
         dp,
         sp,
-        -(mult_i * (gds + FwdSum + gdtots - gbdpsp + gIdtots)
-            - mult_q * (T1 * ddxpart_dVs + dxpart * xgts)),
+        -mult_q.mul_add(
+            -f64::mul_add(dxpart, xgts, T1 * ddxpart_dVs),
+            mult_i * (gds + FwdSum + gdtots - gbdpsp + gIdtots),
+        ),
     );
     ckt.cap(dp, bp, mult_q * xcdbb);
     ckt.real(
         dp,
         bp,
-        -(mult_i * (gjbd + gdtotb - Gmbs - gbdpb + gIdtotb)
-            - mult_q * T1 * (ddxpart_dVb + dxpart * xgtb)),
+        -(mult_q * T1).mul_add(
+            -f64::mul_add(dxpart, xgtb, ddxpart_dVb),
+            mult_i * (gjbd + gdtotb - Gmbs - gbdpb + gIdtotb),
+        ),
     );
 
     ckt.real(d, dp, -(mult_i * (gdpr - gdtotd)));
@@ -581,29 +587,38 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
     ckt.real(
         sp,
         dp,
-        -(mult_i * (gds + gstotd + RevSum - gbspdp + gIstotd)
-            - mult_q * (T1 * dsxpart_dVd + sxpart * xgtd)),
+        -mult_q.mul_add(
+            -f64::mul_add(sxpart, xgtd, T1 * dsxpart_dVd),
+            mult_i * (gds + gstotd + RevSum - gbspdp + gIstotd),
+        ),
     );
     ckt.cap(sp, gp, mult_q * xcsgb);
     ckt.real(
         sp,
         gp,
-        -(mult_i * (Gm + gstotg - gbspg + gIstotg) - mult_q * (T1 * dsxpart_dVg + sxpart * xgtg)),
+        -mult_q.mul_add(
+            -f64::mul_add(sxpart, xgtg, T1 * dsxpart_dVg),
+            mult_i * (Gm + gstotg - gbspg + gIstotg),
+        ),
     );
     ckt.cap(sp, sp, mult_q * xcssb);
     ckt.real(
         sp,
         sp,
-        mult_i * (gspr + gds + h.gbs - gIstots - gstots + FwdSum + gbspsp)
-            + mult_q * (sxpart * xgts + T1 * dsxpart_dVs),
+        mult_q.mul_add(
+            T1.mul_add(dsxpart_dVs, sxpart * xgts),
+            mult_i * (gspr + gds + h.gbs - gIstots - gstots + FwdSum + gbspsp),
+        ),
     );
     ckt.real(sp, s, -(mult_i * (gspr + gstot)));
     ckt.cap(sp, bp, mult_q * xcsbb);
     ckt.real(
         sp,
         bp,
-        -(mult_i * (gjbs + gstotb + Gmbs - gbspb + gIstotb)
-            - mult_q * (T1 * dsxpart_dVb + sxpart * xgtb)),
+        -mult_q.mul_add(
+            -f64::mul_add(sxpart, xgtb, T1 * dsxpart_dVb),
+            mult_i * (gjbs + gstotb + Gmbs - gbspb + gIstotb),
+        ),
     );
 
     ckt.real(s, sp, -(mult_i * (gspr - gstots)));
@@ -675,6 +690,41 @@ pub(super) fn pz_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
 mod tests {
     use super::super::acld::tests::check_shapes;
     use super::SizeParam;
+
+    /// The exact derivative is 2^-55: its separate product rounds to 1/2,
+    /// so the historical C-shaped subtraction returned zero. Check the
+    /// derivative through the actual PZ stamp and its source companion.
+    #[test]
+    fn pz_nqs_partition_derivative_retains_sub_ulp_cancellation() {
+        use super::super::acld::tests::{Recorder, shaped};
+        use super::super::host::state;
+        use super::{Instance, Model};
+        let mut h: Instance = shaped(0, 0, 1);
+        h.acnqsMod = 1;
+        h.qgate = -1.;
+        h.qdrn = 0.5 + 2_f64.powi(-28);
+        h.cddb = 0.5;
+        h.cgdb = -(1. - 2_f64.powi(-27));
+        h.gtau = 1.;
+        let mut ckt = Recorder {
+            state: vec![0.; state::COUNT],
+            ..Recorder::default()
+        };
+        ckt.state[state::QDEF] = 1.;
+        super::pz_load(&Model::default(), &h, &SizeParam::default(), &mut ckt);
+        let stamp = |row, col| {
+            ckt.real
+                .iter()
+                .filter(|&&(r, c, _)| r == row && c == col)
+                .map(|entry| entry.2)
+                .sum::<f64>()
+        };
+        let retained = stamp(h.dNodePrime, h.dNodePrime);
+        assert_eq!(retained, 2_f64.powi(-55));
+        let companion = stamp(h.sNodePrime, h.dNodePrime);
+        assert_eq!(companion, -retained);
+        assert!((retained + companion).abs() <= f64::MIN_POSITIVE);
+    }
 
     #[test]
     fn pz_stamps_land_on_allocated_elements() {

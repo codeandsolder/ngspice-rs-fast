@@ -14,7 +14,7 @@ pub struct FactorStorage {
     pub original_entries: usize,
     /// All allocated element slots in the valid factor, including fill-ins.
     pub factor_entries: usize,
-    /// Logical size of the numeric factor buffer, excluding spare capacity and metadata.
+    /// Logical size of the numeric factor and pivot-inverse buffers, excluding spare capacity and metadata.
     pub numeric_bytes: usize,
 }
 

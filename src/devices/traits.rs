@@ -817,6 +817,22 @@ pub trait Device: fmt::Debug + std::any::Any {
         None
     }
 
+    /// Validate bias-independent device inputs at a DC point, without an
+    /// AC load, Newton trial, or accepted-state mutation. Context-independent
+    /// devices need no extra checks beyond construction and replacement.
+    /// Context-dependent devices must check their thermal/effective parameters
+    /// here using the same derivation as their DC stamp. The recipe already
+    /// carries its own setters; the context contains common scalar inputs,
+    /// not per-device override tables. Cross-device mutual constraints are
+    /// validated by the circuit. Solution-dependent errors belong to the
+    /// actual solve, not to a fabricated zero bias.
+    ///
+    /// # Errors
+    /// Invalid contextual parameters or nonfinite derived device inputs.
+    fn validate_dc_inputs(&self, _context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        Ok(())
+    }
+
     /// Loads the device's contribution into the MNA system for one trial.
     ///
     /// Implementations may read accepted history and write their trial state
@@ -980,13 +996,17 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// routine return [`crate::devices::noise::DeviceNoise::Noiseless`]
     /// explicitly; the default is an error, so a device whose noise is not
     /// ported can never be silently omitted from the spectrum.
+    /// Append generators in reference order to the caller-provided empty
+    /// scratch buffer; a noiseless device leaves it empty. Model identity
+    /// borrows from the effective device.
     ///
     /// # Errors
     /// [`SpiceError::NotYetPorted`] by default; invalid bias physics.
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Err(SpiceError::not_yet_ported(
             format!(
                 "noise analysis of device {} (designator '{}')",

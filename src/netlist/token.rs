@@ -18,6 +18,7 @@ use std::fmt;
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
+use crate::netlist::source::budget::{SourceBudget, SourceLimits, copy_text};
 use crate::netlist::source::{LogicalLine, SourceMap, SourcePosition};
 
 /// What kind of token this is.
@@ -84,14 +85,15 @@ pub struct Token {
 impl Token {
     fn new(
         kind: TokenKind,
-        text: impl Into<String>,
+        text: String,
         line: &LogicalLine,
         raw_offset: usize,
+        location: SourceLoc,
     ) -> Self {
         Self {
             kind,
-            text: text.into(),
-            location: line.location_at(raw_offset),
+            text,
+            location,
             raw_offset,
             source_map: line.source_map.clone(),
         }
@@ -137,18 +139,48 @@ pub(super) struct Lexeme<'a> {
 }
 
 impl TokenKind<Cow<'_, str>> {
-    fn into_owned(self) -> TokenKind {
-        match self {
+    fn into_owned_budgeted(
+        self,
+        budget: &mut SourceBudget,
+        location: &SourceLoc,
+    ) -> SpiceResult<TokenKind> {
+        Ok(match self {
             Self::Word => TokenKind::Word,
             Self::Number(value) => TokenKind::Number(value),
-            Self::Expression(text) => TokenKind::Expression(text.into_owned()),
-            Self::Quoted(text) => TokenKind::Quoted(text.into_owned()),
+            Self::Expression(text) => TokenKind::Expression(match text {
+                Cow::Borrowed(text) => copy_text(text, budget, location)?,
+                Cow::Owned(text) => text,
+            }),
+            Self::Quoted(text) => TokenKind::Quoted(match text {
+                Cow::Borrowed(text) => copy_text(text, budget, location)?,
+                Cow::Owned(text) => text,
+            }),
             Self::LParen => TokenKind::LParen,
             Self::RParen => TokenKind::RParen,
             Self::Comma => TokenKind::Comma,
             Self::Equals => TokenKind::Equals,
+        })
+    }
+}
+
+fn reserve_decoded(
+    value: &mut String,
+    additional: usize,
+    budget: Option<&mut SourceBudget>,
+    location: impl FnOnce() -> SourceLoc,
+) -> SpiceResult<()> {
+    if let Err(error) = value.try_reserve(additional) {
+        let location = location();
+        if let Some(budget) = budget {
+            budget.allocation(Err(error), &location)?;
+        } else {
+            return Err(SpiceError::parse(
+                location,
+                format!("allocating lexical token: {error}"),
+            ));
         }
     }
+    Ok(())
 }
 
 /// Scan a single token using the production lexical rules, without
@@ -158,7 +190,8 @@ impl TokenKind<Cow<'_, str>> {
 pub(super) fn scan_next<'a>(
     text: &'a str,
     cursor: &mut usize,
-    location: impl FnOnce(usize) -> SourceLoc,
+    location: impl Fn(usize) -> SourceLoc,
+    mut budget: Option<&mut SourceBudget>,
 ) -> SpiceResult<Option<Lexeme<'a>>> {
     let bytes = text.as_bytes();
     while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
@@ -201,9 +234,24 @@ pub(super) fn scan_next<'a>(
                 if character == '\\'
                     && let Some((_, escaped)) = characters.next()
                 {
-                    decoded
-                        .get_or_insert_with(|| inner[..offset].to_owned())
-                        .push(escaped);
+                    if decoded.is_none() {
+                        let prefix = &inner[..offset];
+                        let mut value = String::new();
+                        reserve_decoded(
+                            &mut value,
+                            prefix.len() + escaped.len_utf8(),
+                            budget.as_deref_mut(),
+                            || location(start),
+                        )?;
+                        value.push_str(prefix);
+                        decoded = Some(value);
+                    }
+                    if let Some(value) = &mut decoded {
+                        reserve_decoded(value, escaped.len_utf8(), budget.as_deref_mut(), || {
+                            location(start)
+                        })?;
+                        value.push(escaped);
+                    }
                     continue;
                 }
                 if character == quote {
@@ -211,6 +259,9 @@ pub(super) fn scan_next<'a>(
                     break;
                 }
                 if let Some(value) = &mut decoded {
+                    reserve_decoded(value, character.len_utf8(), budget.as_deref_mut(), || {
+                        location(start)
+                    })?;
                     value.push(character);
                 }
             }
@@ -251,16 +302,35 @@ pub(super) fn scan_next<'a>(
 /// Returns [`SpiceError::Parse`] for an unterminated expression or quote,
 /// or an unmatched closing brace.
 pub fn tokenize(line: &LogicalLine) -> SpiceResult<Vec<Token>> {
+    tokenize_bounded(line, &mut SourceBudget::new(SourceLimits::default()))
+}
+
+/// Lex the same source grammar as the allocation-free writer scanner, but
+/// charge parser token work and use fallible owned storage for retained tokens.
+pub(super) fn tokenize_bounded(
+    line: &LogicalLine,
+    budget: &mut SourceBudget,
+) -> SpiceResult<Vec<Token>> {
+    budget.card_size(line.text.len(), &line.location)?;
+    let text = line.text.as_str();
+    let bytes = text.as_bytes();
     let mut tokens = Vec::new();
     let mut cursor = 0;
-    while let Some(lexeme) = scan_next(&line.text, &mut cursor, |offset| line.location_at(offset))?
-    {
-        tokens.push(Token::new(
-            lexeme.kind.into_owned(),
-            lexeme.text,
-            line,
-            lexeme.start,
-        ));
+    while cursor < bytes.len() {
+        if bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+            continue;
+        }
+        let location = line.location_at(cursor);
+        // Source work is charged before trying to scan an ill-formed token,
+        // matching the parser's original limit/exhaustion precedence.
+        budget.tokens(1, &location)?;
+        budget.allocation(tokens.try_reserve(1), &location)?;
+        let lexeme = scan_next(text, &mut cursor, |_| location.clone(), Some(budget))?
+            .ok_or_else(|| SpiceError::parse(location.clone(), "missing lexical token"))?;
+        let kind = lexeme.kind.into_owned_budgeted(budget, &location)?;
+        let spelling = copy_text(lexeme.text, budget, &location)?;
+        tokens.push(Token::new(kind, spelling, line, lexeme.start, location));
     }
     Ok(tokens)
 }

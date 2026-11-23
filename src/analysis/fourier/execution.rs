@@ -1,9 +1,11 @@
 //! Internal Fourier plans: validated sampling, bounded projection batches and normalization.
 
 use super::{FourierAnalysis, FourierSettings, FourierWindow, Harmonic};
+use crate::analysis::fourier_resample::PolynomialPlan;
 use crate::analysis::ordered_samples::{
     AxisError, Location, OrderedAxis, SampleError, column_names,
 };
+use crate::analysis::reduction::CompensatedSum;
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
 use crate::netlist::ast::{FourierCard, MAX_HARMONICS, VectorRequest};
@@ -14,14 +16,10 @@ use crate::primitives::{AnalysisKind, Real, SpiceError, SpiceResult};
 /// per requested harmonic, with the same maximum of 400 subintervals.
 const GRID_FLOOR: u32 = 50;
 
-/// How many ULPs of the quadrature's own sums a fundamental amplitude must
-/// exceed before a total harmonic distortion can be formed from it.
-///
-/// The sums accumulate at most `4 * MAX_HARMONICS + 1 = 401` terms, so a trace
-/// with no fundamental content leaves an amplitude of a few `f64::EPSILON`
-/// times the trace's own magnitude there; a THD formed from that residue would
-/// be pure noise (C prints whatever it computes). This is the arithmetic's
-/// resolution, not a physical tolerance.
+/// A fundamental amplitude must exceed the roundoff scale of the
+/// projection before THD is defined. Reduced phases and compensated sums
+/// prevent long grids or high DFT bins from accumulating large phase
+/// arguments or sequential summation error.
 const NOISE_ULPS: Real = 16.0;
 
 /// A positioned failure for a request this plot cannot answer.
@@ -269,8 +267,8 @@ fn check_grid_point(card: &FourierCard, previous: Option<Real>, x: Real) -> Spic
     Ok(())
 }
 
-/// Preserve the distinct phase expressions: rearranging multiplication or
-/// replacing the separate sin/cos calls changes reference rounding.
+/// Each grid uses its own integer bin index; reduce it modulo the grid
+/// length before converting to radians to avoid large-angle phase error.
 #[derive(Clone, Copy)]
 enum ProjectionGrid {
     Closed(u32),
@@ -286,17 +284,15 @@ impl ProjectionGrid {
     }
 
     fn coefficient(self, k: u32, i: u32) -> [Real; 2] {
-        let angle = match self {
-            Self::Closed(divisions) => {
-                let phase = Real::from(i) / Real::from(divisions);
-                std::f64::consts::TAU * Real::from(k) * phase
-            }
-            Self::HalfOpen { samples, periods } => {
-                std::f64::consts::TAU * Real::from(k) * Real::from(periods) * Real::from(i)
-                    / Real::from(samples)
-            }
+        let (length, periods) = match self {
+            Self::Closed(divisions) => (divisions, 1),
+            Self::HalfOpen { samples, periods } => (samples, periods),
         };
-        [angle.sin(), angle.cos()]
+        // Bounds: <=100 harmonics, <=100 periods and <=100000 grid points.
+        let residue = (k * periods * i) % length;
+        let phase = Real::from(residue) / Real::from(length);
+        let angle = std::f64::consts::TAU * phase;
+        angle.sin_cos().into()
     }
 }
 
@@ -330,8 +326,8 @@ impl ProjectionGrid {
                 *pair = self.coefficient(k, i);
             }
             for prepared in batch.iter_mut() {
-                let mut sine = 0.;
-                let mut cosine = 0.;
+                let mut sine = CompensatedSum::default();
+                let mut cosine = CompensatedSum::default();
                 for (i, (y, [sin, cos])) in prepared.values.iter().zip(&basis).enumerate() {
                     let weighted = match self {
                         Self::Closed(divisions) => {
@@ -346,10 +342,10 @@ impl ProjectionGrid {
                     };
                     let sine_term = weighted * sin;
                     let cosine_term = weighted * cos;
-                    sine += sine_term;
-                    cosine += cosine_term;
+                    sine.add(sine_term);
+                    cosine.add(cosine_term);
                 }
-                prepared.sums[k as usize] = [sine, cosine];
+                prepared.sums[k as usize] = [sine.total(), cosine.total()];
             }
         }
         Ok(())
@@ -450,8 +446,7 @@ fn sample(
 struct ConfiguredPlan {
     window: FourierWindow,
     harmonics: u32,
-    grid: Option<Vec<Real>>,
-    degree: usize,
+    polynomial: Option<PolynomialPlan>,
 }
 
 impl ConfiguredPlan {
@@ -502,7 +497,7 @@ impl ConfiguredPlan {
                 "Fourier grid undersamples requested harmonics".into(),
             ));
         }
-        let grid = if settings.polydegree == 0 {
+        let polynomial = if settings.polydegree == 0 {
             None
         } else {
             let step = (to - from) / Real::from(count);
@@ -519,13 +514,16 @@ impl ConfiguredPlan {
                 }
                 grid.push(x);
             }
-            Some(grid)
+            Some(PolynomialPlan::new(
+                axis,
+                &grid,
+                settings.polydegree as usize,
+            )?)
         };
         Ok(Self {
             window: FourierWindow { from, to },
             harmonics,
-            grid,
-            degree: settings.polydegree as usize,
+            polynomial,
         })
     }
 
@@ -533,10 +531,9 @@ impl ConfiguredPlan {
         &self,
         axis: &OrderedAxis<'_>,
         trace: &Trace<'_>,
-        stable: Option<&StablePlan>,
         input: &mut Vec<Real>,
     ) -> SpiceResult<Vec<Real>> {
-        let Some(grid) = &self.grid else {
+        let Some(polynomial) = &self.polynomial else {
             return (0..axis.len()).map(|i| trace.value(i)).collect();
         };
         input.clear();
@@ -549,10 +546,7 @@ impl ConfiguredPlan {
         for i in 0..axis.len() {
             input.push(trace.value(i)?);
         }
-        stable.map_or_else(
-            || crate::analysis::fourier_resample::resample(axis, input, grid, self.degree),
-            |plan| plan.sample(input, trace.name()),
-        )
+        polynomial.sample(input)
     }
 
     fn transform(
@@ -566,13 +560,17 @@ impl ConfiguredPlan {
         let n = u32::try_from(values.len())
             .map_err(|_| unsupported(card, "Fourier sample count exceeds u32".into()))?;
         let divisor = Real::from(n);
-        let dc = values.iter().sum::<Real>() / divisor;
+        let mut dc = CompensatedSum::default();
+        for &value in values {
+            dc.add(value / divisor);
+        }
+        let dc = dc.total();
         let mut tabulated = Vec::with_capacity(self.harmonics as usize);
         for (k, &[sine, cosine]) in (1..=self.harmonics).zip(sums.iter().skip(1)) {
             tabulated.push(Harmonic {
                 order: k,
                 frequency: Real::from(k) * card.fundamental,
-                amplitude: 2. * sine.hypot(cosine) / divisor,
+                amplitude: ((2. / divisor) * sine).hypot((2. / divisor) * cosine),
                 phase: cosine.atan2(sine),
             });
         }
@@ -609,76 +607,6 @@ impl ConfiguredPlan {
             divisions: n as usize,
             samples,
         })
-    }
-}
-
-/// Stable local polynomial geometry. Coefficients depend only on times,
-/// not the vector; keep the exact old multiplication and evaluation order.
-struct StablePlan {
-    starts: Vec<usize>,
-    weights: Vec<Real>,
-    order: usize,
-}
-impl StablePlan {
-    fn new(
-        axis: &OrderedAxis<'_>,
-        grid: &[Real],
-        degree: usize,
-        card: &FourierCard,
-    ) -> SpiceResult<Self> {
-        if axis.len() <= degree || axis.has_duplicates() {
-            return Err(unsupported(
-                card,
-                "stable polynomial interpolation needs distinct samples".into(),
-            ));
-        }
-        let order = degree + 1;
-        let mut starts = Vec::with_capacity(grid.len());
-        let mut weights =
-            crate::primitives::filled_vec(grid.len() * order, 1., "Fourier interpolation weights")?;
-        let times = axis.as_slice();
-        for (&x, row) in grid.iter().zip(weights.chunks_exact_mut(order)) {
-            let start = axis
-                .lower_bound(x)
-                .saturating_sub(degree.div_ceil(2))
-                .min(axis.len() - order);
-            starts.push(start);
-            for (k, weight) in row.iter_mut().enumerate() {
-                for j in 0..order {
-                    if j != k {
-                        *weight *= (x - times[start + j]) / (times[start + k] - times[start + j]);
-                    }
-                }
-            }
-        }
-        Ok(Self {
-            starts,
-            weights,
-            order,
-        })
-    }
-
-    fn sample(&self, samples: &[Real], name: &str) -> SpiceResult<Vec<Real>> {
-        let mut values = Vec::with_capacity(self.starts.len());
-        for (&start, row) in self
-            .starts
-            .iter()
-            .zip(self.weights.chunks_exact(self.order))
-        {
-            let mut value = 0.;
-            for (&weight, &sample) in row.iter().zip(&samples[start..start + self.order]) {
-                let term = weight * sample;
-                value += term;
-            }
-            if !value.is_finite() {
-                return Err(nonfinite(
-                    name,
-                    "nonfinite stable polynomial interpolation".into(),
-                ));
-            }
-            values.push(value);
-        }
-        Ok(values)
     }
 }
 
@@ -788,15 +716,7 @@ impl WorkBudget {
         }
     }
 
-    fn charge(
-        &mut self,
-        rows: usize,
-        count: usize,
-        harmonics: usize,
-        vectors: usize,
-        mode: Mode,
-        compatible: bool,
-    ) {
+    fn charge(&mut self, rows: usize, count: usize, harmonics: usize, vectors: usize, mode: Mode) {
         let projection = count.saturating_mul(harmonics + 1);
         let (sampling, setup, scratch) = match mode {
             // For distinct source coordinates, at most two reads per grid
@@ -809,35 +729,17 @@ impl WorkBudget {
             ),
             Mode::Configured { settings, .. } => {
                 let order = settings.polydegree as usize + 1;
-                // C can retry every polynomial degree for each moving fit.
-                // Successful forward fits advance at least one grid sample,
-                // except for at most order tail steps. The traversal itself
-                // costs rows * order.
-                let fits = rows.min(count + order);
-                let fit_cost = (1..=order).map(|n| 2 * n.pow(3) + 3 * n * n).sum::<usize>();
-                let (interpolation, setup) = if order == 1 {
+                let (setup, plan_bytes) = if order == 1 {
                     (0, 0)
-                } else if compatible {
-                    (
-                        rows.saturating_mul(order)
-                            .saturating_add(fits.saturating_mul(fit_cost)),
-                        count,
-                    )
                 } else {
-                    (
-                        count.saturating_mul(order),
-                        count.saturating_mul(order * order),
-                    )
+                    PolynomialPlan::budget(rows, count, order)
                 };
+                let sampling = rows.saturating_add(count.saturating_mul(order));
                 let scratch = rows
                     .saturating_mul(size_of::<Real>())
                     .saturating_add(count * size_of::<Real>())
-                    .saturating_add(if compatible || order == 1 {
-                        0
-                    } else {
-                        count * (size_of::<usize>() + order * size_of::<Real>())
-                    });
-                (rows.saturating_add(interpolation), setup, scratch)
+                    .saturating_add(plan_bytes);
+                (sampling, setup, scratch)
             }
         };
         self.work = self
@@ -899,7 +801,6 @@ fn preflight(
     kind: AnalysisKind,
     cards: &[FourierCard],
     settings: Option<FourierSettings>,
-    compatible: bool,
 ) -> SpiceResult<WorkBudget> {
     let mut budget = WorkBudget::new(rows);
     for card in cards {
@@ -925,7 +826,6 @@ fn preflight(
             harmonics as usize,
             card.vectors.len(),
             mode,
-            compatible,
         );
         budget.check(card)?;
     }
@@ -937,12 +837,11 @@ pub(super) fn resolve_plans(
     kind: AnalysisKind,
     cards: &[FourierCard],
     settings: Option<FourierSettings>,
-    compatible: bool,
 ) -> SpiceResult<Vec<FourierAnalysis>> {
     let Some(first) = cards.first() else {
         return Ok(Vec::new());
     };
-    let mut budget = preflight(plot.point_count(), kind, cards, settings, compatible)?;
+    let mut budget = preflight(plot.point_count(), kind, cards, settings)?;
     let axis = time_axis(plot, first)?;
     if axis.has_duplicates() {
         for card in cards {
@@ -965,7 +864,7 @@ pub(super) fn resolve_plans(
         if card.vectors.is_empty() {
             continue;
         }
-        let execution = CardPlan::new(&axis, card, mode, compatible)?;
+        let execution = CardPlan::new(&axis, card, mode)?;
         execution.run(
             plot,
             &axis,
@@ -979,33 +878,16 @@ pub(super) fn resolve_plans(
 
 enum CardPlan {
     Closed(ClosedPlan),
-    Configured {
-        plan: ConfiguredPlan,
-        stable: Option<StablePlan>,
-    },
+    Configured(ConfiguredPlan),
 }
 
 impl CardPlan {
-    fn new(
-        axis: &OrderedAxis<'_>,
-        card: &FourierCard,
-        mode: Mode,
-        compatible: bool,
-    ) -> SpiceResult<Self> {
+    fn new(axis: &OrderedAxis<'_>, card: &FourierCard, mode: Mode) -> SpiceResult<Self> {
         match mode {
             Mode::Closed => Ok(Self::Closed(ClosedPlan::new(axis, card)?)),
-            Mode::Configured { settings, count } => {
-                let plan = ConfiguredPlan::new(axis, card, settings, count)?;
-                let stable = if compatible {
-                    None
-                } else {
-                    plan.grid
-                        .as_ref()
-                        .map(|grid| StablePlan::new(axis, grid, plan.degree, card))
-                        .transpose()?
-                };
-                Ok(Self::Configured { plan, stable })
-            }
+            Mode::Configured { settings, count } => Ok(Self::Configured(ConfiguredPlan::new(
+                axis, card, settings, count,
+            )?)),
         }
     }
 
@@ -1021,9 +903,7 @@ impl CardPlan {
         let trace = Trace::resolve(plot, request)?;
         let values = match self {
             Self::Closed(plan) => plan.samples(card, &trace)?,
-            Self::Configured { plan, stable } => {
-                plan.samples(axis, &trace, stable.as_ref(), input)?
-            }
+            Self::Configured(plan) => plan.samples(axis, &trace, input)?,
         };
         Ok(PreparedTrace {
             trace,
@@ -1040,7 +920,7 @@ impl CardPlan {
     ) -> SpiceResult<FourierAnalysis> {
         match self {
             Self::Closed(plan) => plan.finish(card, prepared),
-            Self::Configured { plan, .. } => plan.transform(
+            Self::Configured(plan) => plan.transform(
                 card,
                 &prepared.trace,
                 &prepared.values,
@@ -1060,7 +940,7 @@ impl CardPlan {
     ) -> SpiceResult<()> {
         let harmonics = match self {
             Self::Closed(_) => card.harmonics,
-            Self::Configured { plan, .. } => plan.harmonics,
+            Self::Configured(plan) => plan.harmonics,
         };
         let batch_size = geometry.batch_size(harmonics);
         let mut batch = Vec::with_capacity(batch_size.min(card.vectors.len()));
@@ -1133,8 +1013,7 @@ mod tests {
                 1_000,
                 AnalysisKind::Transient,
                 std::slice::from_ref(&one),
-                Some(settings),
-                true
+                Some(settings)
             )
             .is_ok()
         );
@@ -1143,33 +1022,27 @@ mod tests {
                 1_000,
                 AnalysisKind::Transient,
                 &vec![one.clone(); 50],
-                Some(settings),
-                true
+                Some(settings)
             )
             .is_err_and(|error| error
                 .to_string()
                 .contains("aggregate work or memory budget"))
         );
         assert!(
-            preflight(
-                usize::MAX,
-                AnalysisKind::Transient,
-                &[one],
-                Some(settings),
-                true
+            preflight(usize::MAX, AnalysisKind::Transient, &[one], Some(settings)).is_err_and(
+                |error| error
+                    .to_string()
+                    .contains("aggregate work or memory budget")
             )
-            .is_err_and(|error| error
-                .to_string()
-                .contains("aggregate work or memory budget"))
         );
         // Saturation is a fail-closed arithmetic policy, rather than a wrapped count.
         let mut budget = WorkBudget::new(1);
-        budget.charge(1, 401, 100, usize::MAX, Mode::Closed, true);
+        budget.charge(1, 401, 100, usize::MAX, Mode::Closed);
         assert!(budget.check(&card(1, 1)).is_err());
     }
 
     #[test]
-    fn coefficient_rows_preserve_both_original_phase_expressions() {
+    fn reduced_coefficient_rows_agree_with_unreduced_phase_within_roundoff() {
         for geometry in [
             ProjectionGrid::Closed(204),
             ProjectionGrid::HalfOpen {
@@ -1192,13 +1065,10 @@ mod tests {
                                 / Real::from(samples)
                         }
                     };
-                    assert_eq!(
-                        geometry.coefficient(k, i).map(Real::to_bits),
-                        [
-                            expected_angle.sin().to_bits(),
-                            expected_angle.cos().to_bits()
-                        ],
-                    );
+                    let actual = geometry.coefficient(k, i);
+                    let bound = 8. * Real::EPSILON * expected_angle.abs().max(1.);
+                    assert!((actual[0] - expected_angle.sin()).abs() <= bound);
+                    assert!((actual[1] - expected_angle.cos()).abs() <= bound);
                 }
             }
         }
@@ -1206,16 +1076,7 @@ mod tests {
     #[test]
     fn large_distinct_axis_is_charged_once_and_coincident_reads_are_charged_per_vector() {
         use super::OrderedAxis;
-        assert!(
-            preflight(
-                1_000_000,
-                AnalysisKind::Transient,
-                &[card(1000, 9)],
-                None,
-                true
-            )
-            .is_ok()
-        );
+        assert!(preflight(1_000_000, AnalysisKind::Transient, &[card(1000, 9)], None).is_ok());
         let mut times = vec![0.; 1000];
         times.extend([0.5e-3, 1e-3]);
         let axis = OrderedAxis::borrowed(&times).unwrap();
@@ -1227,7 +1088,20 @@ mod tests {
     }
 
     #[test]
-    fn batched_projection_matches_original_scalar_summation_bit_for_bit() {
+    fn high_bin_phase_reduction_is_periodic_and_preserves_endpoints() {
+        let grid = ProjectionGrid::HalfOpen {
+            samples: 100_000,
+            periods: 100,
+        };
+        assert_eq!(grid.coefficient(100, 0), [0., 1.]);
+        assert_eq!(grid.coefficient(100, 99_990), [0., 1.]);
+        assert_eq!(grid.coefficient(100, 99_991), grid.coefficient(100, 1));
+        let closed = ProjectionGrid::Closed(400);
+        assert_eq!(closed.coefficient(100, 400), [0., 1.]);
+    }
+
+    #[test]
+    fn batched_projection_agrees_with_independent_scalar_quadrature() {
         use super::{PreparedTrace, Trace};
         use crate::analysis::results::{Plot, PlotFlags, Variable};
         let mut builder = Plot::builder("test", "Transient Analysis", PlotFlags::Real);
@@ -1295,8 +1169,16 @@ mod tests {
                         }
                     }
                 }
+                let magnitude = prepared.values.iter().map(|v| v.abs()).sum::<Real>();
+                // Naive summation has O(n*epsilon) relative-to-L1 error.
+                // The unreduced phase also has O(k*periods*TAU*epsilon) error.
+                let bound = (geometry.samples() as Real + 8. * 3. * std::f64::consts::TAU)
+                    * Real::EPSILON
+                    * magnitude;
                 for (obtained, expected) in prepared.sums.iter().zip(wanted) {
-                    assert_eq!(obtained.map(Real::to_bits), expected.map(Real::to_bits));
+                    for (&actual, reference) in obtained.iter().zip(expected) {
+                        assert!((actual - reference).abs() <= bound);
+                    }
                 }
             }
         }

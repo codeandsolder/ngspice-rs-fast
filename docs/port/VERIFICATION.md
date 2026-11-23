@@ -1,3 +1,14 @@
+## Current nonlinear sensitivity reference policy (#146)
+
+C finite-difference derivatives are compared at 0.1% relative plus the
+existing 1e-9 absolute budget; the MESA level-2 cancellation floor remains
+5e-8. Both the stored golden and live C suites use the shared policy in
+`conformance/support/src/tolerance.rs`. Linear sensitivity, sweep
+coordinates, structure, and independent analytic checks retain their
+original stricter budgets. The historical captures remain unchanged.
+See [SENSITIVITY.md](SENSITIVITY.md#reference-agreement-versus-physical-accuracy-146).
+Historical measurements below describe the policies at the time of capture.
+
 ## Bounded reference-process execution (#80)
 
 All live C reference invocations use the development-only
@@ -355,6 +366,39 @@ changed), all under `compare::NONLINEAR`, `compare::TRAN`,
 `outitf.c`'s own rule (internal nodes named `#internal`, `#source`, `#drain`,
 `#collector`, `#collCX`, `#emitter`, `#base` are not saved) instead of a
 per-device list of exceptions; the existing corpus verifies unchanged.
+
+### Bounded golden verification (#127)
+
+The selected C ASCII reference is decoded from a buffered reader in schedule
+order. Each pointwise gate binds occurrence-aware column indices once and
+compares a reusable C row with the corresponding Rust row; final complex
+realness is checked after decoding. Roots and transient interpolation retain
+only the current C plot under the explicit default rawfile collection budget.
+A missing, extra, malformed or truncated plot is an error, including data
+after the final registered stage. Internal-node projection compacts the owned
+Rust cell buffer in place while preserving every other column and occurrence.
+
+The `commands::verify::tests::memory_*` ignored tests exercise one and four
+65,536-point, 16-column pointwise plots and the committed
+`m7_ic_mos1_uic_tran` transient decoder. Run individual tests from the same
+compiled test executable under `/usr/bin/time -v` and an allocation profiler
+(e.g. Valgrind DHAT) to compare peak RSS and allocation volume. The synthetic
+tests write identical inputs in both modes; the retained baseline uses the
+former read-to-string/collect-all path and the same numerical comparator.
+
+Acer measurement (2026-11-22, identical test binary in both modes):
+
+| Input | Bytes | Peak RSS retained / streamed (KiB) | DHAT total allocated retained / streamed (bytes) | Read calls retained / streamed |
+| --- | ---: | ---: | ---: | ---: |
+| Pointwise | 24,565,292 | 63,124 / 22,376 | 75,482,690 / 17,368,116 | 21 / 3,019 |
+| Four stages | 98,261,168 | 183,464 / 20,304 | 249,587,808 / 17,401,768 | 21 / 12,015 |
+| Committed transient | 3,387,243 | 9,876 / 6,536 | 10,766,093 / 2,290,514 | 21 / 434 |
+
+Read calls measured by strace include process startup; buffering trades more
+small reads for bounded memory. Logical reference bytes are unchanged; write
+calls are identical for each pair. DHAT counts heap allocations including the
+shared input-generation harness, not physical I/O. Wall times varied with
+concurrent workers; these runs establish memory reduction, not speedup.
 
 ## BSIM3 B3-0 input foundation (#90)
 
@@ -2153,3 +2197,23 @@ All output columns, shape checks and numerical bounds are unchanged. The
 variant test verifies equivalent numeric token values and unchanged
 non-numeric tokens; missing selected captures are errors, not fallback
 opportunities.
+
+The live C comparison suites use the same selection through
+`ngspice_conformance::fixtures::DeckInputs::fixture` (#121).
+The explicit fixture ID resolves the original deck from the normal fixture
+directory and the C input through `reference_netlist_path`; both texts are
+read before invoking either simulator. There is no probing for alternate
+files and no fallback when an explicitly selected file is absent. For
+ordinary fixtures, both sides share the original text. Fixture-derived
+test decks transform each selected text independently. Ad-hoc or generated
+decks opt into identical input with `DeckInputs::same` and never consult the
+fixture registry based on a test label.
+
+The sensitivity, batch, companion transient, distortion, noise and
+S-parameter live suites follow this rule. MOS sensitivity checks against
+stored numerical goldens use `golden_path` as well. The M4/M7/M10
+parse/write/parse tests are not live fixture comparisons; historical rawfile
+schema and byte-format tests retain their historical captures. The live
+HFET2, MOS3 and MOS9 comparisons exercise the registered C-only variants
+with unchanged numerical bounds. Process isolation, scratch cleanup and
+oracle resource limits are unchanged.

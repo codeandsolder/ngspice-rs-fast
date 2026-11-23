@@ -42,9 +42,23 @@ behaviour only: `src/spicelib/analysis/noisean.c` (`NOISEan`), `cktnoise.c`
 
    The output noise density is the sum over every generator; the
    input-referred density divides it by `max(|H|^2, 1e-20)` (`N_MINGAIN`).
-4. Each generator is integrated over frequency separately with `Nintegrate`'s
-   piecewise power law (flat below a slope of `1e-10`, logarithmic at slope
-   `-1`) into the integrated output and input noise.
+4. Each generator is integrated over frequency separately using the piecewise
+   power law underlying C's `Nintegrate`. For positive endpoints, work in
+   log-frequency coordinates: the integral is the logarithmic mean of the
+   frequency-weighted endpoint densities times `ln(f1/f0)`. Evaluate the
+   log ratio with `ln_1p` near unity and the exponential-relative factor
+   with `exp_m1`, avoiding absolute powers and a dimensional prefactor.
+   Constant density uses an exact rectangular rule and a slope of -1 has the
+   continuous logarithmic limit. Positive frequencies and densities below
+   C's `1e-38` floor use their actual values. If either density is nonpositive,
+   use C's floored logarithm endpoints; equal floors retain C's signed
+   right-endpoint rectangular rule, including exact zero for an inactive
+   generator. The resulting signed density convention is unchanged.
+   Both input and output use the same endpoint fit; the integral's factors
+   are combined with the *current* input gain before rounding, preserving
+   C's input-referred gain convention without losing an otherwise
+   representable result. Nonfinite intermediate totals are explicit errors,
+   even between decimated summary points.
 
 The frequency loop is C's: `dec`/`oct` multiply by `exp(ln(10 or 2)/pts)` from
 `fstart`, `lin` adds `(fstop - fstart)/(pts - 1)`, and the loop continues while
@@ -96,18 +110,19 @@ Every analysis writes C's plots, in C's order:
 ## Device generators
 
 Devices describe their generators at the bias point through
-`Device::noise(&NoiseContext) -> SpiceResult<DeviceNoise>`:
+`Device::noise(&NoiseContext, &mut Vec<NoiseSource>) -> SpiceResult<DeviceNoise<'_>>`:
 
 ```rust
-pub enum DeviceNoise {
+pub enum DeviceNoise<'a> {
     Noiseless,
-    Sources { family: NoiseFamily, model: Option<String>, total: bool, sources: Vec<NoiseSource> },
+    Sources { family: NoiseFamily, model: Option<&'a str>, total: bool },
 }
 pub struct NoiseSource { pub suffix: &'static str, pub nodes: [NodeId; 2], pub kind: NoiseKind }
 pub enum NoiseKind {
     Thermal { conductance: Real, temperature: Real }, // kelvin
     Shot { current: Real },
-    Flicker { coefficient: Real, exponent: Real },
+    Flicker { numerator: Real, law: FlickerLaw },
+    // Frequency-local gain and correlated thermal laws also supported.
 }
 ```
 
@@ -141,6 +156,40 @@ kind and whether its card gave an `ac` value.
 `NLEV`/`GDSNOI` and the resistor instance `noisy` are accepted model/instance
 setters now (they were `NotYetPorted` before #100). MOS1 `NLEV` must round to
 0..=3 (C's switch has no other case).
+
+## Bound spectral workspace (#130)
+
+`NoisePlan` is shared by `.noise` and RF noise. It binds to a finalized
+circuit, assigns model ranks and sorts C visitation order once, then owns
+stable instance identities, generator suffixes and numeric slot ranges.
+Each device writes its generators into an analysis-owned reusable buffer
+and returns borrowed model identity; there is no per-device source-vector
+or model-name allocation on refresh. Primary and correlated transfer pairs
+are checked against the unknown layout; unchanged pairs reuse their row
+indices, and only ground maps to no row.
+
+Frequency-dependent bias or small-signal assembly refreshes numeric laws
+in a reusable staging buffer. Names, family, model, total flags and ordered
+suffixes must remain unchanged, including transitions to/from noiseless.
+Invalid transfers or laws fail before publishing the new numeric slots.
+The double buffer preserves the previous point on failure; integration
+history remains attached to immutable slots. RF consumes the same bound
+transfers, retaining its existing coherent-generator rejection policy.
+
+`.noise` binds its input excitation and differential output once, retaining
+two unit right-hand sides and a single reused forward/adjoint solve workspace.
+The forward gain is consumed before overwriting the solution with the
+adjoint. C visitation, arithmetic grouping and summary cadence are unchanged.
+
+The opt-in `noise_workspace_bench` compares rebuilding the layout at each
+frequency with refreshing it in place, through the same generator API.
+On Acer (512 modeled resistors, 32 models, 256 frequencies), DHAT reported
+155,432,113 versus 3,275,427 allocated bytes and 441,775 versus 41,903
+allocation blocks (including setup). Peak live heap was 1,509,206 versus
+1,225,721 bytes. The measured loop took 180.6 versus 48.6 ms on a loaded host;
+these are single measurements, not a whole-simulator speedup claim. Three
+user-space `perf stat` repetitions measured 362.1M versus 191.1M cycles and
+768.3M versus 451.4M instructions (including test setup).
 
 ## Verification
 

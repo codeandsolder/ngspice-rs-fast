@@ -148,7 +148,7 @@ pub struct FourierAnalysis {
 /// * [`crate::primitives::SpiceError::Unsupported`], positioned at the card, for a card that names
 ///   another analysis than `kind` (C selects the `tran` plot; a multi-analysis
 ///   deck routes `.four` to its last `.tran` plot through
-///   [`crate::analysis::batch::resolve_outputs`]), for every condition listed in the module's
+///   [`crate::analysis::batch::OutputRoutes`]), for every condition listed in the module's
 ///   failure policy, and for a harmonic count outside this port's work budget;
 /// * [`crate::primitives::SpiceError::Numerical`] for a non-finite axis, operand or result value,
 ///   or a zero fundamental amplitude;
@@ -159,7 +159,7 @@ pub fn resolve(
     kind: AnalysisKind,
     cards: &[FourierCard],
 ) -> SpiceResult<Vec<FourierAnalysis>> {
-    execution::resolve_plans(plot, kind, cards, None, true)
+    execution::resolve_plans(plot, kind, cards, None)
 }
 
 /// Evaluates Fourier fundamental expressions against the deck's parameter scope.
@@ -286,23 +286,7 @@ pub fn resolve_with_settings(
     cards: &[FourierCard],
     settings: FourierSettings,
 ) -> SpiceResult<Vec<FourierAnalysis>> {
-    execution::resolve_plans(plot, kind, cards, Some(settings), true)
-}
-
-/// Evaluate the configured DFT with well-conditioned local Lagrange interpolation.
-///
-/// This library alternative avoids C's absolute-coordinate fit fallback and its
-/// stale high-degree coefficient tail; it deliberately does not reproduce that error.
-///
-/// # Errors
-/// As [`resolve_with_settings`]; this alternative also rejects repeated timestamps.
-pub fn resolve_with_stable_settings(
-    plot: &Plot,
-    kind: AnalysisKind,
-    cards: &[FourierCard],
-    settings: FourierSettings,
-) -> SpiceResult<Vec<FourierAnalysis>> {
-    execution::resolve_plans(plot, kind, cards, Some(settings), false)
+    execution::resolve_plans(plot, kind, cards, Some(settings))
 }
 
 #[cfg(test)]
@@ -450,7 +434,7 @@ mod tests {
 
     #[test]
     fn configured_fourier_checks_actual_dft_bin_across_periods() {
-        use super::{FourierSettings, resolve_with_settings, resolve_with_stable_settings};
+        use super::{FourierSettings, resolve_with_settings};
         let plot = tran(&sweep(0., 2. * PERIOD, 800, sine(1., 1, 0.)));
         let cards = [card(vec![out()], 5)];
         let settings = FourierSettings {
@@ -459,14 +443,16 @@ mod tests {
             gridsize: 10,
             ..Default::default()
         };
-        for resolve in [resolve_with_settings, resolve_with_stable_settings] {
-            let error = resolve(&plot, AnalysisKind::Transient, &cards, settings).unwrap_err();
+        {
+            let error = resolve_with_settings(&plot, AnalysisKind::Transient, &cards, settings)
+                .unwrap_err();
             assert!(error.to_string().contains("undersamples"));
             let valid = FourierSettings {
                 gridsize: 11,
                 ..settings
             };
-            let result = resolve(&plot, AnalysisKind::Transient, &cards, valid).unwrap();
+            let result =
+                resolve_with_settings(&plot, AnalysisKind::Transient, &cards, valid).unwrap();
             assert_eq!(result[0].divisions, 22);
             assert_eq!(result[0].harmonics.len(), 5);
         }
@@ -938,7 +924,7 @@ mod tests {
 
     #[test]
     fn configured_projection_shares_every_harmonic_even_across_batch_boundaries() {
-        use super::{FourierSettings, resolve_with_settings, resolve_with_stable_settings};
+        use super::{FourierSettings, resolve_with_settings};
         let plot = tran(&sweep(0., PERIOD, 801, sine(1., 1, 0.37)));
         // At 100k output samples eight vectors cross the 4 MiB batch bound.
         let vectors: Vec<_> = (0..8)
@@ -961,7 +947,7 @@ mod tests {
                 },
             ),
             (
-                resolve_with_stable_settings,
+                resolve_with_settings,
                 FourierSettings {
                     nfreqs: 4,
                     gridsize: 100_000,
@@ -1053,7 +1039,7 @@ mod tests {
     #[test]
     #[ignore = "timing comparison; run explicitly with --ignored --nocapture"]
     fn shared_fourier_projection_benchmark() {
-        use super::{FourierSettings, resolve_with_stable_settings};
+        use super::{FourierSettings, resolve_with_settings};
         use std::time::Instant;
         let plot = tran(&sweep(0., 2. * PERIOD, 20_000, |t| {
             0.3 + sine(1., 1, 0.2)(t) + sine(0.11, 3, -0.7)(t)
@@ -1079,15 +1065,13 @@ mod tests {
                     vectors: vec![vector.clone()],
                     ..card.clone()
                 };
-                resolve_with_stable_settings(&plot, AnalysisKind::Transient, &[single], settings)
-                    .unwrap()
+                resolve_with_settings(&plot, AnalysisKind::Transient, &[single], settings).unwrap()
             })
             .collect();
         let scalar = start.elapsed();
         let start = Instant::now();
         let grouped =
-            resolve_with_stable_settings(&plot, AnalysisKind::Transient, &[card], settings)
-                .unwrap();
+            resolve_with_settings(&plot, AnalysisKind::Transient, &[card], settings).unwrap();
         let shared = start.elapsed();
         assert_identical(&grouped, &separate);
         eprintln!(

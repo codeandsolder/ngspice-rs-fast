@@ -1,9 +1,11 @@
 //! C-reference selection for conformance tests and xtask.
 //!
 //! Most fixtures use one golden; explicitly documented libm-sensitive
-//! fixtures may have an independently captured platform or input variant. Missing
-//! data is an error at the caller, not permission to fall back to another variant.
+//! fixtures may have independently captured platform or exact-input variants.
+//! Capture and drift checks select the applicable reference; comparisons use
+//! the observed envelope of documented captures. Missing data is an error.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -129,9 +131,86 @@ pub fn reference_netlist_path(root: &Path, original: &Path) -> Result<PathBuf, S
     })
 }
 
+/// Input texts for a numerical comparison.
+///
+/// The original Rust text is never replaced by a C-only variant. Ordinary
+/// fixtures and explicit ad-hoc inputs share a single text allocation.
+#[derive(Debug)]
+pub struct DeckInputs<'a> {
+    original: Cow<'a, str>,
+    reference: Option<String>,
+}
+
+impl<'a> DeckInputs<'a> {
+    /// Use the same explicit ad-hoc deck on both sides.
+    #[must_use]
+    pub const fn same(text: &'a str) -> Self {
+        Self {
+            original: Cow::Borrowed(text),
+            reference: None,
+        }
+    }
+
+    /// Text supplied to Rust.
+    #[must_use]
+    pub fn rust(&self) -> &str {
+        &self.original
+    }
+
+    /// Text supplied to the C executable.
+    #[must_use]
+    pub fn reference(&self) -> &str {
+        self.reference.as_deref().unwrap_or(&self.original)
+    }
+
+    /// Derive a test deck from each selected input, applying the same edits
+    /// without replacing the original fixture's decimal spellings.
+    #[must_use]
+    pub fn transformed(&self, edit: impl Fn(&str) -> String) -> DeckInputs<'static> {
+        DeckInputs {
+            original: Cow::Owned(edit(self.rust())),
+            reference: self.reference.as_deref().map(edit),
+        }
+    }
+}
+
+impl DeckInputs<'static> {
+    /// Select a committed fixture by its explicit ID in the current workspace.
+    ///
+    /// # Errors
+    /// Workspace discovery, fixture selection, or selected input reading fails.
+    pub fn fixture(name: &str) -> Result<Self, String> {
+        Self::fixture_at(&workspace_root()?, name)
+    }
+
+    /// Read both inputs for a committed fixture at an explicit workspace root.
+    ///
+    /// # Errors
+    /// Fixture discovery or either selected file cannot be read. In particular,
+    /// a missing C-only variant is an error, never a fallback to the original.
+    pub fn fixture_at(root: &Path, name: &str) -> Result<Self, String> {
+        let original = netlist_paths_at(root, Some(name))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no fixture named '{name}'"))?;
+        let reference = reference_netlist_path(root, &original)?;
+        let read = |path: &Path| {
+            fs::read_to_string(path).map_err(|error| format!("reading {}: {error}", path.display()))
+        };
+        let original_text = read(&original)?;
+        let reference_text = (original != reference)
+            .then(|| read(&reference))
+            .transpose()?;
+        Ok(Self {
+            original: Cow::Owned(original_text),
+            reference: reference_text,
+        })
+    }
+}
+
 /// The C golden for `name` on the verifier/capture target.
 ///
-/// Capture, drift checks and numerical verification must use the same path.
+/// Capture and byte-drift checks always use this specific path.
 #[must_use]
 pub fn golden_path(root: &Path, name: &str) -> PathBuf {
     path_for(
@@ -145,11 +224,58 @@ pub fn golden_path(root: &Path, name: &str) -> PathBuf {
     )
 }
 
+/// Every independently captured C reference used for numerical comparison.
+///
+/// The native platform's file comes first. All listed captures are required;
+/// none is a fallback for a missing or malformed native reference.
+#[must_use]
+pub fn numerical_golden_paths(root: &Path, name: &str) -> Vec<PathBuf> {
+    let native = golden_path(root, name);
+    let mut paths = vec![native];
+    for linux in [false, true] {
+        let candidate = path_for(root, name, linux);
+        if !paths.contains(&candidate) {
+            paths.push(candidate);
+        }
+    }
+    paths
+}
+
+/// Closest point in the envelope of independently observed reference values.
+///
+/// Identical captures reduce to the ordinary single-reference comparison.
+/// Nonfinite or absent references must never make a comparison pass.
+///
+/// # Errors
+/// Empty or nonfinite reference, or nonfinite candidate.
+pub fn nearest_reference(
+    actual: f64,
+    references: impl IntoIterator<Item = f64>,
+) -> Result<f64, String> {
+    if !actual.is_finite() {
+        return Err("nonfinite candidate".to_owned());
+    }
+    let mut references = references.into_iter();
+    let first = references.next().ok_or("empty reference envelope")?;
+    if !first.is_finite() {
+        return Err("nonfinite reference".to_owned());
+    }
+    let (mut lower, mut upper) = (first, first);
+    for reference in references {
+        if !reference.is_finite() {
+            return Err("nonfinite reference".to_owned());
+        }
+        lower = lower.min(reference);
+        upper = upper.max(reference);
+    }
+    Ok(actual.clamp(lower, upper))
+}
+
 fn path_for(root: &Path, name: &str, linux_x86_64_gnu: bool) -> PathBuf {
     let mut directory = root.join(GOLDEN_DIR);
     // bjtsetup.c scales ISE=1e-3 by IS=1e-16, so cktsens.c's ISE
     // perturbation is 1e-25. Platform libm rounding is amplified by that
-    // divisor: Linux C and Rust agree, but neither matches macOS C's residue.
+    // divisor: independent Linux and macOS C captures disagree on these residues.
     let name = name.to_ascii_lowercase();
     if exact_input(&name) {
         directory.push("exact-input");
@@ -228,6 +354,20 @@ mod tests {
     }
 
     #[test]
+    fn numerical_comparison_requires_every_documented_capture() {
+        let root = Path::new("workspace");
+        let paths = super::numerical_golden_paths(root, "SENS_BJT");
+        assert_eq!(paths[0], golden_path(root, "sens_bjt"));
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&path_for(root, "sens_bjt", false)));
+        assert!(paths.contains(&path_for(root, "sens_bjt", true)));
+        assert_eq!(
+            super::numerical_golden_paths(root, "rc_divider"),
+            [golden_path(root, "rc_divider")]
+        );
+    }
+
+    #[test]
     fn exact_input_reference_decks_and_captures_are_selected_together() {
         let root = Path::new("scratch");
         for name in ["sens_hfet2", "sens_mos3", "sens_mos9"] {
@@ -252,6 +392,71 @@ mod tests {
             super::reference_netlist_path(root, &original).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn comparison_inputs_are_selected_explicitly_and_never_fall_back() {
+        use super::{DeckInputs, NETLIST_DIR, REFERENCE_INPUT_DIR};
+        use std::fs;
+
+        let scratch = crate::ngspice::Scratch::new("comparison-inputs").unwrap();
+        let root = scratch.path();
+        let originals = root.join(NETLIST_DIR);
+        let alternates = root.join(REFERENCE_INPUT_DIR);
+        fs::create_dir_all(&originals).unwrap();
+        fs::create_dir_all(&alternates).unwrap();
+        fs::write(originals.join("rc_divider.cir"), "ordinary").unwrap();
+        // An unregistered alternate must not change an ordinary fixture.
+        fs::write(alternates.join("rc_divider.cir"), "unregistered").unwrap();
+        let inputs = DeckInputs::fixture_at(root, "RC_DIVIDER.CIR").unwrap();
+        assert_eq!(inputs.rust(), "ordinary");
+        assert_eq!(inputs.reference(), "ordinary");
+        for name in ["sens_mos3", "sens_mos9", "sens_hfet2"] {
+            let original = originals.join(format!("{name}.cir"));
+            let alternate = alternates.join(format!("{name}.cir"));
+            fs::write(&original, "r1 a b 20u").unwrap();
+            let error = DeckInputs::fixture_at(root, name).unwrap_err();
+            assert!(error.contains(alternate.to_str().unwrap()), "{error}");
+            fs::write(&alternate, "r1 a b 2000e-8").unwrap();
+            let inputs = DeckInputs::fixture_at(root, name).unwrap();
+            assert_eq!(inputs.rust(), "r1 a b 20u");
+            assert_eq!(inputs.reference(), "r1 a b 2000e-8");
+            let edited = inputs.transformed(|deck| format!("{deck}\n.end"));
+            assert_eq!(edited.rust(), "r1 a b 20u\n.end");
+            assert_eq!(edited.reference(), "r1 a b 2000e-8\n.end");
+            fs::remove_file(original).unwrap();
+            assert!(DeckInputs::fixture_at(root, name).is_err());
+        }
+        // The fixture name inside an arbitrary generated deck has no role in
+        // selection, and the two simulators receive exactly the supplied text.
+        let text = "sens_mos3\nr1 a b 20u";
+        let inputs = DeckInputs::same(text);
+        assert_eq!(inputs.rust(), text);
+        assert_eq!(inputs.reference(), text);
+    }
+
+    #[test]
+    fn envelope_is_the_observed_range_not_a_global_tolerance() {
+        use super::nearest_reference;
+        assert_eq!(
+            nearest_reference(0.2, [-1., 1.]).unwrap().to_bits(),
+            0.2_f64.to_bits()
+        );
+        assert_eq!(
+            nearest_reference(2., [-1., 1.]).unwrap().to_bits(),
+            1_f64.to_bits()
+        );
+        assert_eq!(
+            nearest_reference(-2., [-1., 1.]).unwrap().to_bits(),
+            (-1_f64).to_bits()
+        );
+        assert_eq!(
+            nearest_reference(0.2, [0.1, 0.1]).unwrap().to_bits(),
+            0.1_f64.to_bits()
+        );
+        assert!(nearest_reference(0., []).is_err());
+        assert!(nearest_reference(0., [f64::NAN, 0.]).is_err());
+        assert!(nearest_reference(f64::INFINITY, [0.]).is_err());
     }
 
     #[test]

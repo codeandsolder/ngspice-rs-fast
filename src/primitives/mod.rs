@@ -17,6 +17,8 @@
 //! that define it are named in each doc comment.
 
 pub mod error;
+mod exact;
+pub(crate) use exact::{positive_axis_span, rounded_product_ratio};
 pub mod node;
 pub mod numeric;
 pub mod value;
@@ -31,6 +33,13 @@ pub use value::{
     parse_numparam_number, parse_numparam_number_prefix, parse_spice_number,
     parse_spice_number_prefix,
 };
+
+/// Bounded, exact accumulator of finite binary64 weighted products.
+/// Arithmetic is implemented in the private exact module.
+pub(crate) struct ExactSum {
+    bins: [i128; exact::LIMBS],
+    terms: u32,
+}
 
 /// Allocate initialized storage without overflowing the allocation size.
 pub(crate) fn filled_vec<T: Clone>(len: usize, value: T, context: &str) -> SpiceResult<Vec<T>> {
