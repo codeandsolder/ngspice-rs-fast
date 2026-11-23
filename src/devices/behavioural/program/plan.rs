@@ -5,13 +5,15 @@
 //! finite successful results within a single evaluation environment.
 
 use super::{
-    Binary, Environment, Evaluation, EvaluationView, Node, Operator, PwlTable, Tree, Unary,
-    XspicePwl, divide, power, power_h, pwr, unary_value,
+    Binary, Environment, EvaluationView, Node, Operator, PwlTable, Tree, Unary, XspicePwl, divide,
+    power, power_h, pwr, unary_value,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::{collections::HashMap, sync::Arc};
 
 mod derivative;
+#[cfg(test)]
+use super::Evaluation;
 
 const MAX_INSTRUCTIONS: usize = 262_144;
 /// Index of an instruction and its corresponding scratch value.
