@@ -14,71 +14,239 @@ use crate::maths::sparse13::{Sparse, Status};
 use crate::maths::{FactorStorage, FactorWork, Pattern, SparseMatrix};
 use crate::primitives::{Complex, SpiceResult};
 
-/// Capacitive contributions grouped at a single matrix element.
+/// One ordered capacitive stamp group projected from a shared arena.
 ///
-/// Contributions of `E` (a range of its unfolded triplets, all at one
-/// position) that one device adds to an element as `scale * (x1 + x2 + ...)`,
-/// each `x` being `cap * CKTomega`: `mos1acld.c` adds `xgd + xgs + xgb`,
-/// `bjtacld.c` adds `m * (xcpi + xcmu + xcmcb)`.
+/// C accumulates these terms as scale * (x1 + x2 + ...) / divisor,
+/// with each x scaled by omega unless the group is prescaled.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DynamicGroup {
-    /// The contributions it replaces, as indices into `E`'s triplets (which
-    /// hold `scale * term`, zero terms dropped).
+pub struct DynamicGroup<'a> {
+    /// Positions in the unfolded dynamic operator E replaced by one term.
     pub range: std::ops::Range<usize>,
-    /// The unscaled terms (capacitances), in C's order.
-    pub terms: Vec<f64>,
-    /// The factor C applies to the sum (the instance multiplier `m`).
+    /// Unscaled stamp contributions, in the C device's original order.
+    pub terms: &'a [f64],
+    /// Multiplier applied to the complete rounded sum.
     pub scale: f64,
-    /// The divisor C applies after scaling (`indacld.c`'s
-    /// `CKTomega * INDinduct / m`); `1` for none.
+    /// Divisor applied after the multiplier.
     pub divisor: f64,
-    /// The terms are imaginary parts that already include `CKTomega`
-    /// (`jfet2acld.c`'s `PSacload` outputs), so they are summed unscaled.
-    /// Only a load reassembled at every frequency may use them
-    /// ([`crate::devices::Device::small_signal_depends_on_frequency`]).
+    /// True when the device has already included omega in each term.
     pub prescaled: bool,
 }
 
-/// `omega` times each of `e`'s contributions in stamp order, except that
-/// the contributions of one of `groups` are scaled one by one, summed and
-/// multiplied by the group's scale into a single value first
-/// ([`DynamicGroup`]). The ordinary reference stamping path retains the
-/// individual product rounding and contribution order; it is not a fused
-/// dot product.
+/// One compact descriptor without per-group term allocations.
+#[derive(Debug, Clone, PartialEq)]
+struct GroupSpan {
+    triplets: std::ops::Range<usize>,
+    terms: std::ops::Range<usize>,
+    scale: f64,
+    divisor: f64,
+    prescaled: bool,
+}
+
+/// Ordered group descriptors and one reusable contiguous term arena.
+///
+/// The owner ID is the E operator's logical stamp sequence. Clearing,
+/// overwriting or folding the E operator invalidates its groups.
+#[derive(Debug, Clone, Default)]
+pub struct DynamicGroups {
+    groups: Vec<GroupSpan>,
+    terms: Vec<f64>,
+    owner: u64,
+}
+
+impl PartialEq for DynamicGroups {
+    fn eq(&self, other: &Self) -> bool {
+        self.groups == other.groups && self.terms == other.terms
+    }
+}
+
+impl DynamicGroups {
+    /// Construct an empty group arena without allocation.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            groups: Vec::new(),
+            terms: Vec::new(),
+            owner: 0,
+        }
+    }
+
+    /// No groups means ordinary ungrouped stamp arithmetic applies.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// Number of groups, not individual capacitance terms.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Reserved term-arena capacity, retained across assembly resets.
+    #[must_use]
+    pub const fn term_capacity(&self) -> usize {
+        self.terms.capacity()
+    }
+
+    /// Reserved descriptor capacity, retained across resets.
+    #[must_use]
+    pub const fn group_capacity(&self) -> usize {
+        self.groups.capacity()
+    }
+
+    /// Drop all previous groups without releasing either allocation.
+    pub fn clear(&mut self) {
+        self.groups.clear();
+        self.terms.clear();
+        self.owner = 0;
+    }
+
+    /// Append one group from a validated, unfolded, append-only E operator.
+    ///
+    /// Ranges must be nonempty, ordered, nonoverlapping and on one matrix
+    /// coordinate. Dropped zero triplets do not remove source terms from
+    /// the arena; terms retain the original C summation sequence.
+    ///
+    /// # Errors
+    /// Invalid range, source ownership, coordinates, coefficients or capacity.
+    pub fn push(
+        &mut self,
+        e: &mut SparseMatrix,
+        range: std::ops::Range<usize>,
+        terms: &[f64],
+        scale: f64,
+        divisor: f64,
+        prescaled: bool,
+    ) -> SpiceResult<()> {
+        let stamps = e.triplets();
+        if e.overflow().is_some()
+            || range.is_empty()
+            || range.end > stamps.len()
+            || self
+                .groups
+                .last()
+                .is_some_and(|prior| range.start < prior.triplets.end)
+            || range.end - range.start > terms.len()
+            || !scale.is_finite()
+            || !divisor.is_finite()
+            || divisor == 0.
+            || stamps[range.clone()].iter().any(|stamp| {
+                (stamp.row, stamp.col) != (stamps[range.start].row, stamps[range.start].col)
+            })
+        {
+            return Err(crate::primitives::SpiceError::circuit(
+                "invalid ordered dynamic stamp group",
+            ));
+        }
+        // Prove the span exactly matches the emitted contributions, including
+        // source zeros omitted from E. A foreign/altered coefficient is an
+        // error rather than a silent replacement during AC assembly.
+        let mut recorded = stamps[range.clone()].iter();
+        let matched = terms.iter().all(|term| {
+            let value = scale * term / divisor;
+            value.is_finite()
+                && (value == 0.
+                    || recorded
+                        .next()
+                        .is_some_and(|stamp| stamp.value.to_bits() == value.to_bits()))
+        }) && recorded.next().is_none();
+        if !matched {
+            return Err(crate::primitives::SpiceError::circuit(
+                "dynamic source terms do not match E stamp sequence",
+            ));
+        }
+        if self.owner != 0 && e.dynamic_owner() != self.owner {
+            return Err(crate::primitives::SpiceError::circuit(
+                "dynamic stamp group operator identity changed",
+            ));
+        }
+        self.groups
+            .try_reserve(1)
+            .map_err(|_| crate::primitives::SpiceError::circuit("dynamic group limit"))?;
+        self.terms
+            .try_reserve(terms.len())
+            .map_err(|_| crate::primitives::SpiceError::circuit("dynamic term arena limit"))?;
+        let owner = e.bind_dynamic_owner()?;
+        if self.owner != 0 && self.owner != owner {
+            return Err(crate::primitives::SpiceError::circuit(
+                "dynamic group belongs to a different operator",
+            ));
+        }
+        self.owner = owner;
+        let term_start = self.terms.len();
+        self.terms.extend_from_slice(terms);
+        self.groups.push(GroupSpan {
+            triplets: range,
+            terms: term_start..self.terms.len(),
+            scale,
+            divisor,
+            prescaled,
+        });
+        Ok(())
+    }
+
+    /// Validate logical ownership before numeric iteration.
+    ///
+    /// # Errors
+    /// A group belongs to a cleared, reassembled or foreign E operator.
+    pub fn validate(&self, e: &SparseMatrix) -> SpiceResult<()> {
+        if !self.groups.is_empty() && (self.owner == 0 || e.dynamic_owner() != self.owner) {
+            return Err(crate::primitives::SpiceError::circuit(
+                "stale or foreign dynamic group operator",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ordered immutable views into the term arena without allocations.
+    pub fn iter(&self) -> impl Iterator<Item = DynamicGroup<'_>> {
+        self.groups.iter().map(|group| DynamicGroup {
+            range: group.triplets.clone(),
+            terms: &self.terms[group.terms.clone()],
+            scale: group.scale,
+            divisor: group.divisor,
+            prescaled: group.prescaled,
+        })
+    }
+}
+
+/// C-preserving imaginary dynamic contributions in original stamp order.
+///
+/// A validated group consumes one E span and sums arena terms in order.
+/// Missing groups are individual triplets; invalid owners are errors.
 pub(crate) fn iter_dynamic_terms<'a>(
-    e: &'a SparseMatrix,
-    groups: &'a [DynamicGroup],
+    operator: &'a SparseMatrix,
+    groups: &'a DynamicGroups,
     omega: f64,
-) -> impl Iterator<Item = (usize, usize, f64)> + 'a {
-    let triplets = e.triplets();
+) -> SpiceResult<impl Iterator<Item = (usize, usize, f64)> + 'a> {
+    groups.validate(operator)?;
+    let triplets = operator.triplets();
     let mut groups = groups.iter().peekable();
-    let mut i = 0;
-    std::iter::from_fn(move || {
-        let t = triplets.get(i)?;
-        while groups
-            .next_if(|g| g.range.end <= i || g.range.is_empty())
-            .is_some()
-        {}
+    let mut index = 0;
+    Ok(std::iter::from_fn(move || {
+        let stamp = triplets.get(index)?;
         let value = match groups.peek() {
-            Some(g) if g.range.start == i && g.range.end <= triplets.len() => {
-                let mut terms = g
+            Some(group) if group.range.start == index => {
+                let mut terms = group
                     .terms
                     .iter()
-                    .map(|term| if g.prescaled { *term } else { omega * term });
+                    .map(|term| if group.prescaled { *term } else { omega * term });
                 let mut sum = terms.next().unwrap_or(0.);
                 for term in terms {
                     sum += term;
                 }
-                i = g.range.end;
-                g.scale * sum / g.divisor
+                index = group.range.end;
+                let contribution = group.scale * sum / group.divisor;
+                groups.next();
+                contribution
             }
             _ => {
-                i += 1;
-                omega * t.value
+                index += 1;
+                omega * stamp.value
             }
         };
-        Some((t.row, t.col, value))
-    })
+        Some((stamp.row, stamp.col, value))
+    }))
 }
 
 /// An assembled circuit matrix stores only coefficients in element-ID
@@ -157,7 +325,7 @@ impl ComplexMatrix {
     /// # Errors
     /// Invalid dimensions, frequency or coefficients.
     pub fn from_operators(a: &SparseMatrix, e: &SparseMatrix, omega: f64) -> SpiceResult<Self> {
-        Self::from_operators_grouped(a, e, &[], omega)
+        Self::from_operators_grouped(a, e, &DynamicGroups::default(), omega)
     }
 
     /// [`Self::from_operators`] with `groups` of `e`'s stamp-order
@@ -167,7 +335,7 @@ impl ComplexMatrix {
     pub fn from_operators_grouped(
         a: &SparseMatrix,
         e: &SparseMatrix,
-        groups: &[DynamicGroup],
+        groups: &DynamicGroups,
         omega: f64,
     ) -> SpiceResult<Self> {
         square(a.rows(), a.cols())?;
@@ -181,7 +349,7 @@ impl ComplexMatrix {
             .triplets()
             .iter()
             .map(|t| (t.row, t.col, Complex::real(t.value)));
-        let imaginary = iter_dynamic_terms(e, groups, omega)
+        let imaginary = iter_dynamic_terms(e, groups, omega)?
             .map(|(row, col, v)| (row, col, Complex::imaginary(v)));
         let mut assembled =
             Vec::with_capacity(a.triplets().len().saturating_add(e.triplets().len()));
@@ -240,7 +408,7 @@ impl ComplexMatrix {
         e: &SparseMatrix,
         omega: f64,
     ) -> SpiceResult<Option<Self>> {
-        Self::from_operators_grouped_on(pattern, a, e, &[], omega)
+        Self::from_operators_grouped_on(pattern, a, e, &DynamicGroups::default(), omega)
     }
 
     /// [`Self::from_operators_on`] with `groups` of `e`'s stamp-order
@@ -251,7 +419,7 @@ impl ComplexMatrix {
         pattern: &Arc<crate::maths::Pattern>,
         a: &SparseMatrix,
         e: &SparseMatrix,
-        groups: &[DynamicGroup],
+        groups: &DynamicGroups,
         omega: f64,
     ) -> SpiceResult<Option<Self>> {
         let n = pattern.order();
@@ -319,7 +487,7 @@ impl ComplexMatrix {
                 }
             }
         } else {
-            for (row, col, v) in iter_dynamic_terms(e, groups, omega) {
+            for (row, col, v) in iter_dynamic_terms(e, groups, omega)? {
                 let Some(id) = pattern.find(row, col) else {
                     return Ok(None);
                 };
@@ -612,6 +780,10 @@ mod tests {
         let mut a = SparseMatrix::new(3, 3);
         let mut e = SparseMatrix::new(3, 3);
         let mut seed = 7_u64;
+        // Explicit first group, then mixed standalone coordinates.
+        for term in [1., -2., 0.25] {
+            e.add(0, 0, 3. * term / 2.).unwrap();
+        }
         // Mixed coordinates and magnitudes plus exact cancellations.
         for i in 0..300 {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -621,21 +793,19 @@ mod tests {
             a.add(row, col, v).unwrap();
             e.add(col, row, v * 0.5).unwrap();
         }
-        let groups = [DynamicGroup {
-            range: 0..1,
-            terms: vec![1., -2., 0.25],
-            scale: 3.,
-            divisor: 2.,
-            prescaled: false,
-        }];
+        let mut groups = DynamicGroups::new();
+        groups
+            .push(&mut e, 0..3, &[1., -2., 0.25], 3., 2., false)
+            .unwrap();
         let omega = 0.25;
         let mut expected = std::collections::BTreeMap::new();
         let real = a
             .triplets()
             .iter()
             .map(|t| (t.row, t.col, Complex::real(t.value)));
-        let imag =
-            iter_dynamic_terms(&e, &groups, omega).map(|(r, c, v)| (r, c, Complex::imaginary(v)));
+        let imag = iter_dynamic_terms(&e, &groups, omega)
+            .unwrap()
+            .map(|(r, c, v)| (r, c, Complex::imaginary(v)));
         for (r, c, v) in real.chain(imag) {
             let entry = expected.entry((r, c)).or_insert(Complex::ZERO);
             *entry = *entry + v;
@@ -753,25 +923,14 @@ mod tests {
         }
         let mut e = SparseMatrix::new(2, 2);
         for v in [1e16, -1e16, 1.] {
-            e.add(0, 1, v).unwrap();
+            e.add(0, 1, 3. * v / 2.).unwrap();
         }
         e.add(1, 1, 0.5).unwrap();
-        let groups = [
-            DynamicGroup {
-                range: 0..3,
-                terms: vec![1e16, -1e16, 1.],
-                scale: 3.,
-                divisor: 2.,
-                prescaled: true,
-            },
-            DynamicGroup {
-                range: 3..4,
-                terms: vec![0.5],
-                scale: 1.,
-                divisor: 1.,
-                prescaled: false,
-            },
-        ];
+        let mut groups = DynamicGroups::new();
+        groups
+            .push(&mut e, 0..3, &[1e16, -1e16, 1.], 3., 2., true)
+            .unwrap();
+        groups.push(&mut e, 3..4, &[0.5], 1., 1., false).unwrap();
         let values = |a: &SparseMatrix| {
             let matrix = ComplexMatrix::from_operators_grouped_on(&pattern, a, &e, &groups, -2.)
                 .unwrap()
