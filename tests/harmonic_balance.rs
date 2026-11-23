@@ -137,6 +137,14 @@ fn locked_rational_tones_collapse_to_one_physical_frequency_axis() {
     close(plan.axes()[0].frequency_hz, 150.);
     assert_eq!(plan.axes()[0].order, 2 * 2 + 3 + 2);
     assert_eq!(plan.tone_weight(0), Some((0, 2)));
+    assert_eq!(
+        plan.tone_harmonic_ordinal(0, 1),
+        plan.tone_harmonic_ordinal(2, 1)
+    );
+    assert_eq!(plan.tone_harmonic_ordinal(1, 2), plan.mode_ordinal(&[6]));
+    assert_eq!(plan.tone_harmonic_ordinal(1, 4), None);
+    assert_eq!(plan.mode_ordinal(&[0, 0]), None);
+    assert_eq!(plan.mode_ordinal(&[100]), None);
     assert_eq!(plan.tone_weight(1), Some((0, 3)));
     assert_eq!(plan.tone_weight(2), Some((0, 2)));
     for (actual, expected) in plan.tone_frequencies().iter().zip([300., 450., 300.]) {
@@ -253,10 +261,9 @@ impl NonlinearConstitutive for Linear {
 }
 
 fn mode_at(plan: &HarmonicPlan, wanted: &[i32]) -> usize {
-    plan.modes()
-        .iter()
-        .position(|mode| mode.index == wanted)
-        .unwrap()
+    let ordinal = plan.mode_ordinal(wanted).unwrap();
+    assert_eq!(plan.modes()[ordinal].index, wanted);
+    ordinal
 }
 
 #[test]
