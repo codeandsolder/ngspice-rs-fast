@@ -280,60 +280,135 @@ impl BreakTable {
     }
 }
 
-/// Per-source accept-time breakpoint state (`VSRCbreak_time`/`ISRCbreak_time`)
-/// of a [`LinearSystem`]'s independent sources, in system order.
+/// One active independent source's C accept-hook state. The index names an
+/// immutable source of the bound [`LinearSystem`] in original device order.
+/// Inert slots have no entry or per-source scalar state.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SourceBreaks {
-    break_time: Vec<Real>,
+struct EventSource {
+    ordinal: usize,
+    break_time: Real,
 }
 
-impl SourceBreaks {
-    /// The state at the start of a run: `vsrcset.c` sets `VSRCbreak_time =
-    /// -1`; `ISRCbreak_time` is never initialized and starts at zero
-    /// (`calloc`). Both request their first corner at `t = 0`.
+/// Per-source accept-time breakpoint state (`VSRCbreak_time`/`ISRCbreak_time`),
+/// bound to exactly one resolved [`LinearSystem`].
+///
+/// The immutable borrow prevents a waveform, source order, or transient
+/// default from changing while its scheduling state is live. An unrelated
+/// system requires `SourceBreaks::new(other_system)`; [`Self::reset`] starts
+/// another run on the **same** system without rebuilding eligibility.
+/// Only waveforms that may request events, or have unresolved timing that must
+/// fail explicitly, occupy an active slot. Each kind retains source order.
+#[derive(Debug, Clone)]
+pub struct SourceBreaks<'a> {
+    system: &'a LinearSystem,
+    current: Vec<EventSource>,
+    voltage: Vec<EventSource>,
+    #[cfg(test)]
+    visits: usize,
+}
+
+/// C's accept hooks perform no work for constant and already-resolved
+/// SIN/EXP/SFFM/AM sources. RF PORT tones themselves have no source events:
+/// only the baseline waveform does. Unresolved defaults must remain active
+/// to produce the original explicit error at first accept.
+fn accepts_events(waveform: &Waveform) -> bool {
+    match waveform {
+        Waveform::Constant(_) | Waveform::Function(_) => false,
+        Waveform::PortSeries { baseline, .. } => accepts_events(baseline),
+        Waveform::Step { .. }
+        | Waveform::Pwl(_)
+        | Waveform::Pulse(_)
+        | Waveform::PulseDefaults(_)
+        | Waveform::FunctionDefaults(_) => true,
+    }
+}
+
+impl<'a> SourceBreaks<'a> {
+    /// Bind the source accept hooks once per resolved system. Enumeration
+    /// happens only here (O(all sources)); subsequent accepts visit only
+    /// event-capable waveforms, preserving original ordinal order.
     #[must_use]
-    pub fn new(system: &LinearSystem) -> Self {
+    pub fn new(system: &'a LinearSystem) -> Self {
+        let mut current = Vec::new();
+        let mut voltage = Vec::new();
+        for (ordinal, source) in system.sources.iter().enumerate() {
+            if !accepts_events(&source.waveform) {
+                continue;
+            }
+            match source.kind {
+                SourceKind::Voltage => voltage.push(EventSource {
+                    ordinal,
+                    break_time: -1.,
+                }),
+                SourceKind::Current => current.push(EventSource {
+                    ordinal,
+                    break_time: 0.,
+                }),
+            }
+        }
         Self {
-            break_time: system
-                .sources
-                .iter()
-                .map(|source| match source.kind {
-                    SourceKind::Voltage => -1.,
-                    SourceKind::Current => 0.,
-                })
-                .collect(),
+            system,
+            current,
+            voltage,
+            #[cfg(test)]
+            visits: 0,
+        }
+    }
+
+    /// Restart source-state timing for another run over the *same* system.
+    /// Eligibility and ordering remain fixed by this binding.
+    pub fn reset(&mut self) {
+        #[cfg(test)]
+        {
+            self.visits = 0;
+        }
+        for source in &mut self.current {
+            source.break_time = 0.;
+        }
+        for source in &mut self.voltage {
+            source.break_time = -1.;
         }
     }
 
     /// The `DEVaccept` breakpoint requests of the sources of one `kind`
-    /// (`ISRCaccept` or `VSRCaccept`) at the accepted time `now` (`CKTtime`),
-    /// in system (load) order. `CKTaccept` calls the two types separately, in
-    /// `dev.c` order: current sources, the other accepting devices, then
-    /// voltage sources. `at_break` is C's `CKTbreak` (the accepted step was
-    /// cut to land on a breakpoint, or `now` is the initial point).
+    /// (`ISRCaccept` or `VSRCaccept`) at accepted `now` (`CKTtime`).
+    /// `CKTaccept` calls in three phases: current sources, other accepting
+    /// devices, then voltage sources. Within each source phase, visit the
+    /// event-capable sources in their original device load order so any
+    /// priority-sensitive `CKTsetBreak` merge is unchanged.
+    ///
+    /// `at_break` is C's `CKTbreak` (step landed on a breakpoint or time 0).
     ///
     /// # Errors
     /// A request in the past, or unresolved PULSE/function defaults.
     pub fn accept(
         &mut self,
-        system: &LinearSystem,
         kind: SourceKind,
         now: Real,
         at_break: bool,
         timing: &TransientTiming,
         table: &mut BreakTable,
     ) -> SpiceResult<()> {
-        for (source, break_time) in system.sources.iter().zip(&mut self.break_time) {
-            if source.kind != kind {
-                continue;
+        let active = match kind {
+            SourceKind::Current => &mut self.current,
+            SourceKind::Voltage => &mut self.voltage,
+        };
+        let request = Request {
+            now,
+            at_break,
+            timing,
+            kind,
+        };
+        for bound in active {
+            #[cfg(test)]
+            {
+                self.visits += 1;
             }
-            let request = Request {
-                now,
-                at_break,
-                timing,
-                kind: source.kind,
-            };
-            request.waveform(&source.waveform, break_time, table)?;
+            request.waveform(
+                &self.system.sources[bound.ordinal].waveform,
+                &mut bound.break_time,
+                table,
+            )?;
         }
         Ok(())
     }
@@ -790,5 +865,459 @@ mod tests {
         assert_eq!(table.times().collect::<Vec<_>>(), [5., 10.]);
         table.clear();
         assert_eq!(table.times().collect::<Vec<_>>(), [10., 10.]);
+    }
+
+    fn source(
+        name: impl Into<String>,
+        kind: SourceKind,
+        waveform: Waveform,
+    ) -> crate::devices::LinearSource {
+        crate::devices::LinearSource {
+            name: name.into(),
+            kind,
+            rows: Vec::new(),
+            dc: 0.,
+            ac: crate::primitives::Complex::ZERO,
+            waveform,
+        }
+    }
+
+    /// Original full source walk as an independent *enumeration* oracle.
+    /// Request arithmetic remains the same: scheduling, request order and
+    /// acceptance side effects are what the binding optimization changes.
+    fn naive_source_accept(
+        system: &LinearSystem,
+        break_times: &mut [Real],
+        kind: SourceKind,
+        now: Real,
+        at_break: bool,
+        timing: &TransientTiming,
+        table: &mut BreakTable,
+    ) -> SpiceResult<()> {
+        let request = Request {
+            kind,
+            now,
+            at_break,
+            timing,
+        };
+        for (source, time) in system.sources.iter().zip(break_times) {
+            if source.kind == kind {
+                request.waveform(&source.waveform, time, table)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn same_break_sequence(a: &BreakTable, b: &BreakTable) {
+        assert_eq!(a.len(), b.len());
+        let bitwise = |table: &BreakTable| table.times().map(Real::to_bits).collect::<Vec<_>>();
+        assert_eq!(bitwise(a), bitwise(b));
+    }
+
+    #[test]
+    fn bound_accept_preserves_full_scan_requests_with_ties_repeats_and_device_phases() {
+        use crate::devices::Pulse;
+        use crate::devices::functions::{FunctionSpec, PwlSource, SineSpec};
+
+        let mut system = LinearSystem::new(2);
+        for i in 0..64 {
+            let kind = if i % 2 == 0 {
+                SourceKind::Current
+            } else {
+                SourceKind::Voltage
+            };
+            system
+                .sources
+                .push(source(format!("inert{i}"), kind, Waveform::Constant(0.)));
+        }
+        let timing = TransientTiming::new(0.02, 20.).unwrap();
+        let sine = FunctionSpec::Sine(SineSpec {
+            offset: 0.,
+            amplitude: 1.,
+            frequency: Some(7.),
+            delay: None,
+            damping: None,
+            phase: None,
+        })
+        .resolve(&timing)
+        .unwrap();
+        system
+            .sources
+            .push(source("sin", SourceKind::Voltage, Waveform::Function(sine)));
+        system.sources.push(source(
+            "rf-constant",
+            SourceKind::Current,
+            Waveform::PortSeries {
+                baseline: Box::new(Waveform::Constant(0.)),
+                tones: vec![(2., 3.)],
+            },
+        ));
+        system.sources.push(source(
+            "vp",
+            SourceKind::Voltage,
+            Waveform::Pulse(Pulse::new(0., 1., 1., 0.2, 0.2, 0.4, 2.).unwrap()),
+        ));
+        system.sources.push(source(
+            "ip",
+            SourceKind::Current,
+            Waveform::Pulse(Pulse::new(0., 1., 1., 0.2, 0.2, 0.4, 2.).unwrap()),
+        ));
+        system.sources.push(source(
+            "repeating",
+            SourceKind::Voltage,
+            Waveform::Pwl(
+                PwlSource::new(vec![(0., 0.), (0.25, 1.), (0.75, -1.)], 0., Some(0.)).unwrap(),
+            ),
+        ));
+        system.sources.push(source(
+            "finite",
+            SourceKind::Current,
+            Waveform::Pwl(
+                PwlSource::new(vec![(0.1, 0.), (0.6, 1.), (1.1, 0.)], 0.2, None).unwrap(),
+            ),
+        ));
+        system.sources.push(source(
+            "step",
+            SourceKind::Voltage,
+            Waveform::Step {
+                time: 0.5,
+                before: 0.,
+                after: 1.,
+            },
+        ));
+        system.sources.push(source(
+            "step-i",
+            SourceKind::Current,
+            Waveform::Step {
+                time: 0.5,
+                before: 0.,
+                after: 1.,
+            },
+        ));
+        system.sources.push(source(
+            "rf-step",
+            SourceKind::Voltage,
+            Waveform::PortSeries {
+                baseline: Box::new(Waveform::Step {
+                    time: 0.7,
+                    before: 0.,
+                    after: 1.,
+                }),
+                tones: vec![(1., 7.)],
+            },
+        ));
+        system.sources.push(source(
+            "stopped",
+            SourceKind::Voltage,
+            Waveform::Pulse(
+                Pulse::new(0., 1., 0.1, 0., 0., 0., 0.5)
+                    .unwrap()
+                    .with_count(1.)
+                    .unwrap(),
+            ),
+        ));
+        let mut schedule = SourceBreaks::new(&system);
+        assert_eq!(schedule.current.len(), 3);
+        assert_eq!(schedule.voltage.len(), 5);
+        assert_eq!(
+            schedule
+                .current
+                .iter()
+                .map(|s| s.ordinal)
+                .collect::<Vec<_>>(),
+            [67, 69, 71]
+        );
+        assert_eq!(
+            schedule
+                .voltage
+                .iter()
+                .map(|s| s.ordinal)
+                .collect::<Vec<_>>(),
+            [66, 68, 70, 72, 73]
+        );
+        let mut times = system
+            .sources
+            .iter()
+            .map(|source| match source.kind {
+                SourceKind::Current => 0.,
+                SourceKind::Voltage => -1.,
+            })
+            .collect::<Vec<_>>();
+        let mut bound_table = BreakTable::new(20., 0.002).unwrap();
+        let mut naive_table = bound_table.clone();
+        let accepted = [
+            0., 0.05, 0.1, 0.125, 0.25, 0.3, 0.5, 0.6, 0.7, 0.75, 1., 1.1, 1.25, 1.5, 1.75, 2.,
+            2.5, 3., 3.25, 4., 5., 6., 8., 12., 15.,
+        ];
+        for (step, &now) in accepted.iter().enumerate() {
+            let at_break = step % 3 != 1;
+            for kind in [SourceKind::Current, SourceKind::Voltage] {
+                schedule
+                    .accept(kind, now, at_break, &timing, &mut bound_table)
+                    .unwrap();
+                naive_source_accept(
+                    &system,
+                    &mut times,
+                    kind,
+                    now,
+                    at_break,
+                    &timing,
+                    &mut naive_table,
+                )
+                .unwrap();
+                same_break_sequence(&bound_table, &naive_table);
+                if kind == SourceKind::Current && step % 4 == 0 {
+                    // CKTaccept's other-device hook is between source kinds.
+                    let device_time = now + 0.03125;
+                    bound_table.set(now, device_time).unwrap();
+                    naive_table.set(now, device_time).unwrap();
+                    same_break_sequence(&bound_table, &naive_table);
+                }
+            }
+            if now > bound_table.first() {
+                bound_table.clear();
+                naive_table.clear();
+            }
+            same_break_sequence(&bound_table, &naive_table);
+        }
+        assert_eq!(schedule.visits, accepted.len() * 8);
+    }
+
+    #[test]
+    fn source_binding_reset_and_rebind_do_not_retain_foreign_state() {
+        use crate::devices::Pulse;
+        let timing = TransientTiming::new(0.01, 10.).unwrap();
+        let mut first = LinearSystem::new(1);
+        first.sources.push(source(
+            "pulse",
+            SourceKind::Voltage,
+            Waveform::Pulse(Pulse::new(0., 1., 0.5, 0.1, 0.1, 0.2, 1.).unwrap()),
+        ));
+        let mut schedule = SourceBreaks::new(&first);
+        let mut table = BreakTable::new(10., 0.).unwrap();
+        schedule
+            .accept(SourceKind::Voltage, 0., true, &timing, &mut table)
+            .unwrap();
+        schedule
+            .accept(SourceKind::Voltage, 1., true, &timing, &mut table)
+            .unwrap();
+        assert!(schedule.visits > 0);
+        schedule.reset();
+        assert_eq!(schedule.visits, 0);
+        assert_eq!(schedule.voltage[0].break_time, -1.);
+        let mut restarted = BreakTable::new(10., 0.).unwrap();
+        let mut fresh = SourceBreaks::new(&first);
+        schedule
+            .accept(SourceKind::Voltage, 0., true, &timing, &mut restarted)
+            .unwrap();
+        let mut fresh_table = BreakTable::new(10., 0.).unwrap();
+        fresh
+            .accept(SourceKind::Voltage, 0., true, &timing, &mut fresh_table)
+            .unwrap();
+        same_break_sequence(&restarted, &fresh_table);
+
+        let mut second = LinearSystem::new(1);
+        second.sources.push(source(
+            "step",
+            SourceKind::Current,
+            Waveform::Step {
+                time: 3.,
+                before: 0.,
+                after: 1.,
+            },
+        ));
+        let mut rebound = SourceBreaks::new(&second);
+        assert!(rebound.voltage.is_empty());
+        assert_eq!(rebound.current[0].ordinal, 0);
+        let mut other_table = BreakTable::new(10., 0.).unwrap();
+        rebound
+            .accept(SourceKind::Current, 0., true, &timing, &mut other_table)
+            .unwrap();
+        assert_eq!(other_table.times().collect::<Vec<_>>(), [0., 3., 10.]);
+    }
+
+    #[test]
+    fn unresolved_function_and_pulse_defaults_still_fail_on_first_accept() {
+        use crate::devices::PulseSpec;
+        use crate::devices::functions::{FunctionSpec, SineSpec};
+        let timing = TransientTiming::new(0.1, 10.).unwrap();
+        for waveform in [
+            Waveform::PulseDefaults(PulseSpec {
+                initial: 0.,
+                pulsed: 1.,
+                delay: None,
+                rise: None,
+                fall: None,
+                width: None,
+                period: None,
+                count: None,
+            }),
+            Waveform::FunctionDefaults(FunctionSpec::Sine(SineSpec {
+                offset: 0.,
+                amplitude: 1.,
+                frequency: None,
+                delay: None,
+                damping: None,
+                phase: None,
+            })),
+        ] {
+            let mut system = LinearSystem::new(1);
+            system
+                .sources
+                .push(source("unresolved", SourceKind::Voltage, waveform));
+            let mut schedule = SourceBreaks::new(&system);
+            assert_eq!(schedule.voltage.len(), 1);
+            let mut table = BreakTable::new(10., 0.).unwrap();
+            let error = schedule
+                .accept(SourceKind::Voltage, 0., true, &timing, &mut table)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("defaults are unresolved"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_schedule_keeps_large_and_near_ulp_event_times_bitwise() {
+        use crate::devices::Pulse;
+        use crate::devices::functions::PwlSource;
+        let base = 2_f64.powi(45);
+        let ulp = base * f64::EPSILON;
+        let timing = TransientTiming::new(ulp, base + 10.);
+        let timing = timing.unwrap();
+        let mut system = LinearSystem::new(2);
+        system.sources.push(source(
+            "vp",
+            SourceKind::Voltage,
+            Waveform::Pulse(Pulse::new(0., 1., base, ulp, ulp, 2. * ulp, 1.).unwrap()),
+        ));
+        system.sources.push(source(
+            "pwl",
+            SourceKind::Voltage,
+            Waveform::Pwl(
+                PwlSource::plain(vec![(base, 0.), (base + ulp, 1.), (base + 4. * ulp, 0.)])
+                    .unwrap(),
+            ),
+        ));
+        system.sources.push(source(
+            "step",
+            SourceKind::Current,
+            Waveform::Step {
+                time: base + 2. * ulp,
+                before: 0.,
+                after: 1.,
+            },
+        ));
+        let mut bound = SourceBreaks::new(&system);
+        let mut times = vec![-1., -1., 0.];
+        let mut a = BreakTable::new(base + 10., ulp).unwrap();
+        let mut b = a.clone();
+        for (step, &now) in [
+            0.,
+            base - 1.,
+            base,
+            base + ulp,
+            base + 2. * ulp,
+            base + 4. * ulp,
+            base + 1.,
+            base + 2.,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let at_break = step % 2 == 0;
+            for kind in [SourceKind::Current, SourceKind::Voltage] {
+                let new = bound.accept(kind, now, at_break, &timing, &mut a);
+                let old =
+                    naive_source_accept(&system, &mut times, kind, now, at_break, &timing, &mut b);
+                assert_eq!(
+                    new.as_ref().err().map(ToString::to_string),
+                    old.as_ref().err().map(ToString::to_string)
+                );
+                same_break_sequence(&a, &b);
+                if new.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual 1k–100k source accept-schedule benchmark"]
+    fn sparse_active_source_benchmark() {
+        use std::time::Instant;
+        for n in [1_000_usize, 10_000, 100_000] {
+            let mut system = LinearSystem::new(1);
+            let stride = n / 10;
+            for i in 0..n {
+                let kind = if (i / stride) % 2 == 0 {
+                    SourceKind::Current
+                } else {
+                    SourceKind::Voltage
+                };
+                let waveform = if i % stride == 0 {
+                    Waveform::Step {
+                        time: 1. + (i / stride) as f64 * 0.1,
+                        before: 0.,
+                        after: 1.,
+                    }
+                } else {
+                    Waveform::Constant(0.)
+                };
+                system.sources.push(source(format!("s{i}"), kind, waveform));
+            }
+            let timing = TransientTiming::new(0.001, 100.).unwrap();
+            let mut bound = SourceBreaks::new(&system);
+            assert_eq!(bound.current.len() + bound.voltage.len(), 10);
+            let mut legacy = system
+                .sources
+                .iter()
+                .map(|s| {
+                    if s.kind == SourceKind::Current {
+                        0.
+                    } else {
+                        -1.
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut fast_table = BreakTable::new(100., 0.).unwrap();
+            let mut slow_table = fast_table.clone();
+            let start = Instant::now();
+            for step in 0..64 {
+                let now = f64::from(step) * 0.0001;
+                for kind in [SourceKind::Current, SourceKind::Voltage] {
+                    bound
+                        .accept(kind, now, step % 2 == 0, &timing, &mut fast_table)
+                        .unwrap();
+                }
+            }
+            let bound_ns = start.elapsed().as_nanos();
+            let start = Instant::now();
+            for step in 0..64 {
+                let now = f64::from(step) * 0.0001;
+                for kind in [SourceKind::Current, SourceKind::Voltage] {
+                    naive_source_accept(
+                        &system,
+                        &mut legacy,
+                        kind,
+                        now,
+                        step % 2 == 0,
+                        &timing,
+                        &mut slow_table,
+                    )
+                    .unwrap();
+                }
+            }
+            let old_ns = start.elapsed().as_nanos();
+            same_break_sequence(&fast_table, &slow_table);
+            assert_eq!(bound.visits, 64 * 10);
+            println!(
+                "source_slots={n},active_slots=10,visits_new={},visits_old={},new_ns={bound_ns},old_ns={old_ns},speedup={:.2}",
+                bound.visits,
+                64 * n * 2,
+                old_ns as f64 / bound_ns as f64
+            );
+        }
     }
 }
