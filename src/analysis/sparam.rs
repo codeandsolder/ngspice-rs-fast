@@ -726,7 +726,6 @@ impl NoiseWorkspace {
         generators: &[InstanceNoise],
         solve: &mut SolveBuffers,
     ) -> SpiceResult<()> {
-        let count = ports.len();
         let n = circuit.unknown_count();
         for (tile, adjoints) in ports
             .chunks(RHS_BATCH_WIDTH)
@@ -758,22 +757,26 @@ impl NoiseWorkspace {
                     let at = |row: Option<usize>| row.map_or(Complex::ZERO, |r| adjoint[r]);
                     *voltage = (at(rows[0]) - at(rows[1])) * Complex::real(amplitude);
                 }
-                for (i, current) in self.current.iter_mut().enumerate() {
+                // The Y schema already guarantees N×N shape. Traverse its
+                // actual row-major cells instead of rediscovering checked
+                // coordinates for every independent noise generator.
+                for (i, (current, y_row)) in self
+                    .current
+                    .iter_mut()
+                    .zip(y.data().chunks_exact(ports.len().max(1)))
+                    .enumerate()
+                {
                     *current = self.voltage[i] * ports[i].inverse_z0;
-                    for (j, v) in self.voltage.iter().enumerate() {
-                        *current = *current + y.get(i, j).unwrap_or(Complex::ZERO) * *v;
+                    for (&admittance, &v) in y_row.iter().zip(&self.voltage) {
+                        *current = *current + admittance * v;
                     }
                 }
-                for i in 0..count {
-                    for j in 0..count {
-                        self.cy.set(
-                            i,
-                            j,
-                            self.cy.get(i, j).unwrap_or(Complex::ZERO)
-                                + self.current[i] * self.current[j].conj(),
-                        )?;
-                    }
+                // The voltage workspace is dead after computing this source's
+                // port currents; reuse it for the conjugated covariance row.
+                for (conjugate, current) in self.voltage.iter_mut().zip(&self.current) {
+                    *conjugate = current.conj();
                 }
+                self.cy.add_outer(&self.current, &self.voltage)?;
             }
         }
         Ok(())
