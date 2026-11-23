@@ -116,6 +116,8 @@ pub struct TransientStats {
     pub min_step: Real,
     /// Largest accepted step.
     pub max_step: Real,
+    /// Observed transient-attempt and LTRA preparation work.
+    pub ltra: crate::devices::ltra::LtraWork,
 }
 
 /// Convergence and truncation tolerances. `vntol` applies to node voltages and
@@ -757,6 +759,7 @@ impl Driver<'_> {
         // at the final solution (the load can lag that solution by an iterate).
         // Publish only after the entire run and every sink write succeeded.
         self.circuit.record_final_transient_state(&self.history)?;
+        self.stats.ltra = self.prepared.ltra_work();
         Ok(self.stats)
     }
 
@@ -772,7 +775,17 @@ impl Driver<'_> {
                 )));
             }
             let attempt = ready.begin(&self.steps, &self.settings)?;
-            match self.solve_trial(&attempt, &iterate)? {
+            let mut prepared = self.prepared.transient_attempt(
+                &self.history,
+                &self.model_context,
+                attempt.clock.time,
+                &attempt.coefficients,
+                Forcing {
+                    limit: attempt.boundary.limit(),
+                    timing: self.timing,
+                },
+            )?;
+            match self.solve_trial(&attempt, &mut prepared, &iterate)? {
                 Trial::NotConverged { last } => {
                     iterate = last;
                     self.stats.rejected += 1;
@@ -780,6 +793,7 @@ impl Driver<'_> {
                         delta: attempt.clock.next.delta / 8.,
                         order: Order::One,
                     };
+                    drop(prepared);
                     ready = attempt.retry(next, min_step)?;
                 }
                 Trial::Converged { x, state } => {
@@ -791,10 +805,18 @@ impl Driver<'_> {
                         StepDecision::Retry(next) => {
                             iterate = x;
                             self.stats.rejected += 1;
+                            drop(prepared);
                             ready = attempt.retry(next, min_step)?;
                         }
                         StepDecision::Accept(next) => {
-                            let observed = self.observe_step(&attempt, &x, &state)?;
+                            let observed = if attempt.clock.time < self.settings.start {
+                                Vec::new()
+                            } else {
+                                prepared.observe(&x, &state)?
+                            };
+                            // Release the proposal's immutable history and exclusive scratch
+                            // before accepting, which changes the accepted history revision.
+                            drop(prepared);
                             let device_breaks =
                                 self.commit_point(Acceptance::Step(&attempt), &x, state)?;
                             return Ok(AcceptedPoint {
@@ -808,38 +830,6 @@ impl Driver<'_> {
                 }
             }
         }
-    }
-
-    fn observe_step(
-        &self,
-        attempt: &AttemptedStep,
-        x: &Vector,
-        state: &TrialState,
-    ) -> SpiceResult<Vec<Complex>> {
-        let time = attempt.clock.time;
-        if time < self.settings.start {
-            return Ok(Vec::new());
-        }
-        let forcing = Forcing {
-            limit: attempt.boundary.limit(),
-            timing: self.timing,
-        };
-        self.prepared.observe_real(
-            &LoadRequest {
-                mode: AnalysisMode::Transient {
-                    time,
-                    dt: attempt.coefficients.dt(),
-                },
-                solution: x,
-                model_context: &self.model_context,
-                integration: Some(&attempt.coefficients),
-                history: &self.history,
-                forcing: Some(forcing),
-            },
-            &[],
-            Some((time, forcing)),
-            Some(state),
-        )
     }
 
     /// The sole acceptance boundary: commit device/delay history, then advance
@@ -1044,7 +1034,12 @@ impl Driver<'_> {
     /// (`firsttime`) and `MODEINITPRED` after, for linear and nonlinear
     /// circuits alike. The trial is that of the last Newton load, one iterate
     /// behind the returned solution, as C's `CKTstate0`.
-    fn solve_trial(&self, attempt: &AttemptedStep, previous: &Vector) -> SpiceResult<Trial> {
+    fn solve_trial(
+        &self,
+        attempt: &AttemptedStep,
+        prepared: &mut crate::devices::circuit::PreparedTransient<'_>,
+        previous: &Vector,
+    ) -> SpiceResult<Trial> {
         let tolerance = &self.settings.tolerances;
         let options = crate::analysis::newton::NewtonOptions {
             max_iterations: self.settings.tran_max_iter,
@@ -1062,19 +1057,11 @@ impl Driver<'_> {
             crate::analysis::newton::PhasePolicy::Predicted
         };
         let solved = CircuitNewton {
-            prepared: &self.prepared,
-            context: &self.model_context,
-            history: &self.history,
             branch_rows: &self.branch_row,
             limited_rows: self.limited_rows.as_deref(),
             options: &options,
             load: CircuitLoad::Transient {
-                time: attempt.clock.time,
-                coefficients: &attempt.coefficients,
-                forcing: Forcing {
-                    limit: attempt.boundary.limit(),
-                    timing: self.timing,
-                },
+                attempt: prepared,
                 uic: self.uic,
             },
         }

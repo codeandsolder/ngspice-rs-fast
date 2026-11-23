@@ -578,6 +578,7 @@ impl StateHistory {
             offset: range.start,
             patches: Some(&mut scratch.patches),
             delay: self.delays.get(&device),
+            ltra: None,
         })
     }
 
@@ -619,6 +620,7 @@ impl StateHistory {
             offset: range.start,
             patches: Some(patches),
             delay,
+            ltra: None,
         })
     }
 }
@@ -857,9 +859,10 @@ pub struct DeviceState<'a> {
     offset: usize,
     patches: Option<&'a mut State1Patches>,
     delay: Option<&'a DelayHistory>,
+    ltra: Option<(&'a mut super::ltra::LtraWorkspace, &'a StateHistory, usize)>,
 }
 
-impl DeviceState<'_> {
+impl<'a> DeviceState<'a> {
     /// A window with no slots, for loads that track no state.
     #[must_use]
     pub const fn none() -> DeviceState<'static> {
@@ -874,6 +877,7 @@ impl DeviceState<'_> {
             offset: 0,
             patches: None,
             delay: None,
+            ltra: None,
         }
     }
 
@@ -896,8 +900,26 @@ impl DeviceState<'_> {
     /// The device's accepted delay history (read-only), when it has one and
     /// the window was opened with [`StateHistory::device_of`].
     #[must_use]
-    pub const fn delay_history(&self) -> Option<&DelayHistory> {
+    pub const fn delay_history(&self) -> Option<&'a DelayHistory> {
         self.delay
+    }
+
+    pub(super) fn with_ltra(
+        mut self,
+        workspace: Option<&'a mut super::ltra::LtraWorkspace>,
+        accepted: &'a StateHistory,
+        ordinal: usize,
+    ) -> Self {
+        self.ltra = workspace.map(|workspace| (workspace, accepted, ordinal));
+        self
+    }
+
+    pub(super) fn ltra_workspace(
+        &mut self,
+    ) -> Option<(&mut super::ltra::LtraWorkspace, &'a StateHistory, usize)> {
+        self.ltra
+            .as_mut()
+            .map(|(workspace, accepted, ordinal)| (&mut **workspace, *accepted, *ordinal))
     }
 
     /// The `(reltol, abstol)` of the Newton solve this load belongs to, when

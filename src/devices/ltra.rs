@@ -59,7 +59,9 @@
 //!   convolution of the history (minus the operating-point initial
 //!   conditions) and the delayed waves at `t - TD` (quadratic, linear or
 //!   mixed interpolation, `LTRAquadInterp`/`LTRAlinInterp`) into the
-//!   right-hand side.
+//!   right-hand side. Within a transient proposal, both Newton and observation
+//!   loads reuse these immutable history-dependent inputs. Rejected proposals
+//!   discard them before retry; acceptance drops them before mutating history.
 //! * **Breakpoints.** On acceptance the line requests a breakpoint at the
 //!   previous accepted time plus `TD` when either attenuated wave
 //!   `(v + Z0 i) exp(-beta TD)` changes slope by at least `rel max(|d1|,
@@ -445,7 +447,173 @@ fn invalid(location: &SourceLoc, message: impl Into<String>) -> SpiceError {
     }
 }
 
+/// Actual work performed during a transient run, not estimated cache hits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LtraWork {
+    /// Transient attempts, including rejected proposals.
+    pub attempts: usize,
+    /// Newton circuit loads within those attempts.
+    pub newton_loads: usize,
+    /// Non-RG transient LTRA stamps (Newton and isolated observations).
+    pub line_loads: usize,
+    /// RC/RLC coefficient preparations.
+    pub coefficient_preparations: usize,
+    /// Evaluations of the accepted waveform input (including LC interpolation).
+    pub convolution_evaluations: usize,
+}
+
+/// Exact identity of the mathematical inputs to coefficient preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoefficientKernel {
+    Rc { cbyr: u64, rclsqr: u64 },
+    Rlc { td: u64, alpha: u64, beta: u64 },
+}
+
+impl CoefficientKernel {
+    const fn for_model(model: &LtraModel) -> Option<Self> {
+        match model.case {
+            LtraCase::Rc => Some(Self::Rc {
+                cbyr: model.cbyr.to_bits(),
+                rclsqr: model.rclsqr.to_bits(),
+            }),
+            LtraCase::Rlc => Some(Self::Rlc {
+                td: model.td.to_bits(),
+                alpha: model.alpha.to_bits(),
+                beta: model.beta.to_bits(),
+            }),
+            LtraCase::Lc | LtraCase::Rg => None,
+        }
+    }
+
+    fn prepare(
+        self,
+        times: &std::collections::VecDeque<Real>,
+        time: Real,
+        out: &mut convolution::Coefficients,
+        work: &mut LtraWork,
+    ) {
+        work.coefficient_preparations += 1;
+        let chop = 0.; // C's LTRAchopReltol has no deck setter.
+        match self {
+            Self::Rc { cbyr, rclsqr } => convolution::rc_coefficients(
+                Real::from_bits(cbyr),
+                Real::from_bits(rclsqr),
+                time,
+                times,
+                chop,
+                out,
+            ),
+            Self::Rlc { td, alpha, beta } => convolution::rlc_coefficients(
+                Real::from_bits(td),
+                Real::from_bits(alpha),
+                Real::from_bits(beta),
+                time,
+                times,
+                chop,
+                out,
+            ),
+        }
+    }
+}
+
+fn same_time_grid(a: DelaySamples<'_, 4>, b: DelaySamples<'_, 4>) -> bool {
+    let (a, b) = (a.times(), b.times());
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+}
+
+/// Analysis-owned scratch. Only the coefficient allocation and per-device
+/// slot storage survive an attempt; no accepted data or prepared input does.
+#[derive(Debug)]
+pub(super) struct LtraWorkspace {
+    coefficients: convolution::Coefficients,
+    // A single coefficient family at a time: no model × history allocation.
+    coefficient_source: Option<(usize, CoefficientKernel)>,
+    coefficient_model: String,
+    loads: std::collections::BTreeMap<usize, Option<Load>>,
+    pub(super) work: LtraWork,
+}
+
+impl LtraWorkspace {
+    pub(super) const fn new() -> Self {
+        Self {
+            coefficients: convolution::Coefficients::new(),
+            coefficient_source: None,
+            coefficient_model: String::new(),
+            loads: std::collections::BTreeMap::new(),
+            work: LtraWork {
+                attempts: 0,
+                newton_loads: 0,
+                line_loads: 0,
+                coefficient_preparations: 0,
+                convolution_evaluations: 0,
+            },
+        }
+    }
+
+    pub(super) const fn begin(&mut self) {
+        self.work.attempts += 1;
+    }
+
+    pub(super) fn finish(&mut self) {
+        self.coefficient_source = None;
+        self.coefficient_model.clear();
+        // Discard logical inputs and the active coefficient range, not their
+        // allocations. A retry always starts from an empty preparation.
+        self.coefficients.reset(0);
+        for slot in self.loads.values_mut() {
+            *slot = None;
+        }
+    }
+
+    fn load(
+        &mut self,
+        ordinal: usize,
+        line: &LossyLine,
+        history: &WaveformHistory,
+        accepted: &crate::devices::StateHistory,
+        time: Real,
+    ) -> SpiceResult<Load> {
+        self.work.line_loads += 1;
+        if let Some(load) = self.loads.get(&ordinal).copied().flatten() {
+            return Ok(load);
+        }
+        let samples = history.samples::<4>()?;
+        if let Some(kernel) = CoefficientKernel::for_model(&line.model) {
+            // Only consider sharing on the first visit to a line. Name and
+            // exact coefficient arguments identify the same effective model
+            // family; compare the complete immutable accepted time grid.
+            let share = self.coefficient_model == line.model.name
+                && self.coefficient_source.is_some_and(|(source, previous)| {
+                    previous == kernel
+                        && accepted
+                            .delay(source)
+                            .and_then(|history| history.as_waveform().ok())
+                            .and_then(|history| history.samples::<4>().ok())
+                            .is_some_and(|prior| same_time_grid(prior, samples))
+                });
+            if !share {
+                kernel.prepare(
+                    samples.times(),
+                    time,
+                    &mut self.coefficients,
+                    &mut self.work,
+                );
+                self.coefficient_model.clone_from(&line.model.name);
+                self.coefficient_source = Some((ordinal, kernel));
+            }
+        } else {
+            self.coefficient_source = None;
+            self.coefficients.reset(0);
+        }
+        // RHS histories are never shared, even for identical time grids.
+        let load = line.evaluate_inputs(samples, time, &self.coefficients, &mut self.work)?;
+        self.loads.insert(ordinal, Some(load));
+        Ok(load)
+    }
+}
+
 /// The convolution and interpolation state of one transient load.
+#[derive(Debug, Clone, Copy)]
 struct Load {
     /// Matrix coefficients of the unknown sample (`h1'`, `h2`, `h3'`).
     first: [Real; 3],
@@ -827,26 +995,31 @@ impl LossyLine {
         Ok(delayed)
     }
 
-    /// Prepare the coefficients independently of the waveform history.
-    fn coefficients(&self, history: DelaySamples<'_, 4>, time: Real) -> convolution::Coefficients {
-        let m = &self.model;
-        let times = history.times();
-        let reltol_chop = 0.; // LTRAchopReltol: no deck setter.
-        match m.case {
-            LtraCase::Rlc => {
-                convolution::rlc_coefficients(m.td, m.alpha, m.beta, time, times, reltol_chop)
-            }
-            LtraCase::Rc => {
-                convolution::rc_coefficients(m.cbyr, m.rclsqr, time, times, reltol_chop)
-            }
-            LtraCase::Lc | LtraCase::Rg => convolution::Coefficients::default(),
+    /// Pure evaluation of `ltraload.c` for an isolated proposed load.
+    fn transient_load(
+        &self,
+        history: &WaveformHistory,
+        time: Real,
+        coefficients: &mut convolution::Coefficients,
+        work: &mut LtraWork,
+    ) -> SpiceResult<Load> {
+        let samples = history.samples::<4>()?;
+        if let Some(kernel) = CoefficientKernel::for_model(&self.model) {
+            kernel.prepare(samples.times(), time, coefficients, work);
+        } else {
+            coefficients.reset(0);
         }
+        self.evaluate_inputs(samples, time, coefficients, work)
     }
 
-    /// `ltraload.c` for a transient load at `time`.
-    fn transient_load(&self, history: &WaveformHistory, time: Real) -> SpiceResult<Load> {
-        let history = history.samples::<4>()?;
-        let coefficients = self.coefficients(history, time);
+    /// Apply independently prepared coefficients to this line's own history.
+    fn evaluate_inputs(
+        &self,
+        history: DelaySamples<'_, 4>,
+        time: Real,
+        coefficients: &convolution::Coefficients,
+        work: &mut LtraWork,
+    ) -> SpiceResult<Load> {
         let tdover =
             matches!(self.model.case, LtraCase::Lc | LtraCase::Rlc) && time > self.model.td;
         let delayed = if tdover {
@@ -854,7 +1027,8 @@ impl LossyLine {
         } else {
             [0.; 4]
         };
-        let inputs = self.convolution_inputs(history, &coefficients, tdover, delayed);
+        work.convolution_evaluations += 1;
+        let inputs = self.convolution_inputs(history, coefficients, tdover, delayed);
         if !(inputs.iter().all(|v| v.is_finite())
             && coefficients.first.iter().all(|v| v.is_finite()))
         {
@@ -1135,7 +1309,19 @@ impl Device for LossyLine {
                         self.name
                     ))
                 })?;
-                let load = self.transient_load(history.as_waveform()?, time)?;
+                let history = history.as_waveform()?;
+                let load =
+                    if let Some((workspace, accepted, ordinal)) = context.states.ltra_workspace() {
+                        workspace.load(ordinal, self, history, accepted, time)?
+                    } else {
+                        // Explicit isolated low-level loads own one disposable evaluation.
+                        self.transient_load(
+                            history,
+                            time,
+                            &mut convolution::Coefficients::new(),
+                            &mut LtraWork::default(),
+                        )?
+                    };
                 self.transient_entries(load.first, context.gmin)
                     .stamp(context)?;
                 context.stamp_rhs(self.ibr1(), load.inputs[0])?;
@@ -1605,9 +1791,30 @@ mod tests {
                     .unwrap();
             }
             let before = history.clone();
-            let first = line.transient_load(&history, 3.25).unwrap();
-            let _discarded = line.transient_load(&history, 3.75).unwrap();
-            let retry = line.transient_load(&history, 3.25).unwrap();
+            let first = line
+                .transient_load(
+                    &history,
+                    3.25,
+                    &mut convolution::Coefficients::new(),
+                    &mut LtraWork::default(),
+                )
+                .unwrap();
+            let _discarded = line
+                .transient_load(
+                    &history,
+                    3.75,
+                    &mut convolution::Coefficients::new(),
+                    &mut LtraWork::default(),
+                )
+                .unwrap();
+            let retry = line
+                .transient_load(
+                    &history,
+                    3.25,
+                    &mut convolution::Coefficients::new(),
+                    &mut LtraWork::default(),
+                )
+                .unwrap();
             assert_eq!(history, before);
             assert_eq!(
                 first.first.map(Real::to_bits),
