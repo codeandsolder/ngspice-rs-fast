@@ -93,3 +93,40 @@ errors were 4.1e-16 (source fraction), 4.9e-16 (drain fraction),
 5.3e-15 (source slope), and 2.2e-15 (drain slope), using the smallest
 normal binary64 value as the error denominator floor. No finite input
 in that sweep produced a nonfinite output.
+
+## Shared oxide tunneling and derivative reductions
+
+All five oxide-tunneling barrier paths (channel, source and drain
+overlap, bulk accumulation and inversion) evaluate the common
+polynomial as (a-bv)(1+cv), with fused evaluation of the linear
+factors and a conditioned product-rule derivative. The exponential
+clamps still have exactly zero derivative. Nonfinite inputs use the
+reference expanded arithmetic, including NaN propagation. The root
+regression uses (1+epsilon)(1-epsilon)=1-epsilon² to exercise each
+factor's cancellation independently; amplification by the scale
+factor makes the previously lost residual observable in the current.
+
+The reduction module is shared by leakage, its product-rule
+derivatives, and nonlinear stamps; there is no leakage-to-stamp
+dependency. The broad FMA suppression on the leakage evaluation
+stage is removed. Local exceptions describe the original
+nonfinite fallback, the native/generic Horner distinction, the
+exact unit-weight sum, and the prepared/clipped diode identities.
+
+An additional 8.192-million-evaluation barrier microbenchmark used
+ordinary positive coefficient tuples with negative oxide scale and
+a second distribution containing 10% near-root cancellations.
+Median user CPU time over three runs:
+
+| Target | Distribution | Expanded | Factored/conditioned |
+| --- | --- | ---: | ---: |
+| native | ordinary | 0.05 s | 0.12 s |
+| native | roots | 0.05 s | 0.11 s |
+| generic x86-64 | ordinary | 0.05 s | 0.14 s |
+| generic x86-64 | roots | 0.06 s | 0.14 s |
+
+These costs are for the optional barrier kernel, not a measured
+circuit slowdown. Moving input-finiteness checks and derivative
+evaluation after the clamp made little difference on native and
+only a modest improvement on generic in a second standalone run;
+the directly auditable finite/nonfinite branch was retained.
