@@ -139,10 +139,15 @@ half-section reconstructs initial voltages/currents and stores initial
 charges/fluxes with zero derivatives. This matches steady linear DC exactly
 for the lossless shunt case, and otherwise converges to the spatial DC model
 as sections increase. Ordinary `.op` without state history does not create
-or require spatial state slots. The time-domain Norton kernel currently
-requires nonsingular `R + a0*L` at the selected positive integration
-coefficient. Degenerate exactly zero series impedance needs dedicated ideal
-constraint equations, not arbitrary numerical regularization.
+or require spatial state slots. The ordinary time-domain Norton kernel requires nonsingular
+R + a0*L at the chosen positive integration coefficient. A line
+whose entire R and L matrices are **exactly zero** instead uses
+exact MNA voltage constraints with its full integrated G/C shunt
+between output conductors and output return. It preserves port KCL,
+accepted/trial charge history and section-count independence without
+fictitious series conductance. Other partially singular series
+matrices remain explicit numerical errors pending a validated
+modal descriptor formulation.
 
 This is a causal, stable approximation to the continuous distributed cable,
 not a bitwise port of C's CPL approximation. Spatial error, integration error,
@@ -174,4 +179,6 @@ finite-volume causal transient with trial/accept states and physical N-port
 KCL have implementation. The full strict lint and campaign validator are
 responsible for integration. Remaining checks include the upstream C
 four-conductor temporal coupling, transient grid convergence, variable-step
-Gear, performance, energy/passivity and exact degenerate-series handling.
+Gear, performance, energy/passivity and partially singular
+series-mode handling. Completely zero R/L lines have exact
+constrained MNA transient support.
