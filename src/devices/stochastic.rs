@@ -2,10 +2,10 @@
 //!
 //! Every random draw is indexed by an absolute physical-time knot or an RTS
 //! transition ordinal, never by the number of Newton or integration trials.
-//! Mutable RTS lookup data is a disposable, bounded optimization only.
+//! Mutable RTS lookup data is a disposable, bounded, synchronized optimization.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::sync::Mutex;
 
 use crate::devices::Limit;
 use crate::primitives::{Real, SpiceError, SpiceResult};
@@ -194,7 +194,7 @@ pub struct StochasticWaveform {
     candidate_identity: u64,
     dc: Real,
     flicker_bands: [Real; FLICKER_OCTAVES],
-    cache: RefCell<RtsCache>,
+    cache: Mutex<RtsCache>,
 }
 impl Clone for StochasticWaveform {
     fn clone(&self) -> Self {
@@ -205,7 +205,7 @@ impl Clone for StochasticWaveform {
             candidate_identity: self.candidate_identity,
             dc: self.dc,
             flicker_bands: self.flicker_bands,
-            cache: RefCell::default(),
+            cache: Mutex::default(),
         }
     }
 }
@@ -237,14 +237,14 @@ impl StochasticWaveform {
             candidate_identity: 0,
             dc: 0.,
             flicker_bands,
-            cache: RefCell::default(),
+            cache: Mutex::default(),
         })
     }
     /// Override source stream seed without changing physical parameters.
     #[must_use]
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = seed;
-        self.cache = RefCell::default();
+        self.cache = Mutex::default();
         self
     }
     /// Bind a distinct stable canonical source identity.
@@ -256,7 +256,7 @@ impl StochasticWaveform {
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }
         self.identity = hash;
-        self.cache = RefCell::default();
+        self.cache = Mutex::default();
         self
     }
     /// Bind one optimizer candidate's stable identity without consuming RNG.
@@ -264,7 +264,7 @@ impl StochasticWaveform {
     #[must_use]
     pub fn with_candidate_identity(mut self, candidate: u64) -> Self {
         self.candidate_identity = candidate;
-        self.cache = RefCell::default();
+        self.cache = Mutex::default();
         self
     }
     /// Explicit DC bias added only to transient source excitation.
@@ -315,7 +315,20 @@ impl StochasticWaveform {
         })
     }
     fn rts_state(&self, t: Real, limit: Limit) -> SpiceResult<(bool, Transition)> {
-        let mut current = self.cache.borrow().at_or_before(t, limit);
+        // This bounded cache is only an accelerator. It is shared through
+        // Arc-backed immutable waveforms across concurrent evaluations, so
+        // every lookup and advancement must be serialized. An interrupted
+        // calculation can never change the physical process: all random
+        // values are indexed by source identity and event ordinal.
+        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| {
+            // A poisoned cache cannot be trusted as a starting point.
+            // Rebuilding from the absolute-time origin is exact.
+            let mut cache = poisoned.into_inner();
+            cache.recent.clear();
+            self.cache.clear_poison();
+            cache
+        });
+        let mut current = cache.at_or_before(t, limit);
         loop {
             let next = self.next_transition(current)?;
             let passed = if limit == Limit::Left {
@@ -327,7 +340,7 @@ impl StochasticWaveform {
                 break;
             }
             current = next;
-            self.cache.borrow_mut().remember(current);
+            cache.remember(current);
         }
         Ok((current.index % 2 == 1, current))
     }
@@ -724,6 +737,65 @@ mod tests {
         assert!((z - (x + y) * 0.5).abs() < 1e-14);
         assert_eq!(a.value_at(0., Limit::Right).unwrap(), 0.);
     }
+    #[test]
+    fn shared_stochastic_waveforms_are_send_sync_and_replay_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StochasticWaveform>();
+        assert_send_sync::<crate::devices::Waveform>();
+
+        let shared = std::sync::Arc::new(
+            StochasticWaveform::new(StochasticSpec::Noise(TransientNoise {
+                white_rms: 0.25,
+                step: 0.001,
+                alpha: 0.,
+                flicker_drive_rms: 0.,
+                rts_amplitude: 2.,
+                capture_mean: 0.0009,
+                emission_mean: 0.0014,
+            }))
+            .unwrap()
+            .with_seed(0xabc1_2345)
+            .with_source_name("V_SHARED"),
+        );
+        let mut event_source = shared.events(0., 0.1).unwrap();
+        let events: Vec<_> = std::iter::from_fn(|| event_source.next_event())
+            .filter(|event| event.kind == StochasticEventKind::Telegraph)
+            .take(40)
+            .collect();
+        assert!(events.len() >= 4);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let shared = std::sync::Arc::clone(&shared);
+                let events = &events;
+                scope.spawn(move || {
+                    // An independent clone resets the cache but not the
+                    // absolute-time random stream. Each worker races on
+                    // the original source's one shared cache.
+                    let reference = shared.as_ref().clone();
+                    for step in 0..500 {
+                        let index = (step * 97 + worker * 43) % 500;
+                        let t = index as Real * 0.0002;
+                        let limit = if step % 2 == 0 {
+                            Limit::Left
+                        } else {
+                            Limit::Right
+                        };
+                        let got = shared.value_at(t, limit).unwrap();
+                        let expected = reference.value_at(t, limit).unwrap();
+                        assert_eq!(got.to_bits(), expected.to_bits());
+                    }
+                    for event in events {
+                        for limit in [Limit::Left, Limit::Right] {
+                            let got = shared.value_at(event.time, limit).unwrap();
+                            let expected = reference.value_at(event.time, limit).unwrap();
+                            assert_eq!(got.to_bits(), expected.to_bits());
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     #[test]
     fn accepted_and_rejected_queries_do_not_consume_telegraph_stream() {
         let spec = StochasticSpec::Noise(TransientNoise {
