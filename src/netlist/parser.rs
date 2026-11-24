@@ -189,7 +189,7 @@ impl Parser {
     }
 
     fn parse_admitted(self, deck: &Deck, budget: &mut SourceBudget) -> SpiceResult<ParsedDeck> {
-        scopes::assemble(deck, &prepare_cards(deck, budget)?, self.auto_gnd)
+        scopes::assemble(deck, &prepare_cards(deck, budget)?, self.auto_gnd, false)
     }
 
     /// Parses `text` (whose first byte is at `location`) as one complete
@@ -235,6 +235,22 @@ impl Parser {
         self.parse_file_with_limits_and_output(path, SourceLimits::default())
     }
 
+    /// Load a deck for explicit script execution, retaining executable control
+    /// cards in source order instead of interpreting them as batch directives.
+    /// Pre-run frontend settings still use the ordinary settings grammar.
+    ///
+    /// # Errors
+    /// Source, netlist or frontend-setting errors; the script consumer must
+    /// separately compile and validate every retained command.
+    pub fn parse_control_file(
+        self,
+        path: impl AsRef<Path>,
+        limits: SourceLimits,
+    ) -> SpiceResult<ParsedDeck> {
+        let (deck, cards) = resolution::resolve(path.as_ref(), limits)?;
+        scopes::assemble(&deck, &cards, self.auto_gnd, true)
+    }
+
     /// Resolves and parses a file with explicit source work limits.
     ///
     /// Paths are relative to the file containing each directive, not the process
@@ -265,7 +281,7 @@ impl Parser {
         limits: SourceLimits,
     ) -> SpiceResult<ParsedDeck> {
         let (deck, cards) = resolution::resolve(path.as_ref(), limits)?;
-        scopes::assemble(&deck, &cards, self.auto_gnd)
+        scopes::assemble(&deck, &cards, self.auto_gnd, false)
     }
 }
 
@@ -290,6 +306,14 @@ pub fn parse_parameter_expression(
         super::source::SourcePosition::physical(location),
         false,
     )
+}
+
+/// Parse a control-language expression with a distinct variable/function namespace.
+pub(crate) fn parse_control_expression(
+    text: &str,
+    location: &crate::primitives::SourceLoc,
+) -> SpiceResult<crate::netlist::expr::ParameterExpression> {
+    expression::parse_control_expression(text, super::source::SourcePosition::physical(location))
 }
 
 /// Cache lexical results for ordered replay; later errors do not mask earlier
@@ -375,6 +399,49 @@ pub fn load_classified_with_limits(
     let deck = load_bounded(path.as_ref(), &mut budget)?;
     let cards = classify_admitted(&deck, &mut budget)?;
     Ok((deck, cards))
+}
+
+/// Compile an analysis command using the same grammar as its deck directive.
+pub(crate) fn control_analysis(
+    card: &RawCard,
+    kind: crate::primitives::AnalysisKind,
+    auto_gnd: bool,
+) -> SpiceResult<crate::netlist::ast::AnalysisCard> {
+    match control_card(card, DotCommand::Analysis(kind), auto_gnd)? {
+        grammar::ParsedCard::Analysis(card) => Ok(card),
+        _ => Err(crate::primitives::SpiceError::parse(
+            card.location.clone(),
+            "expected an analysis command",
+        )),
+    }
+}
+
+/// Compile a control-language meas command using the same grammar as .measure.
+pub(crate) fn control_measure(card: &RawCard, auto_gnd: bool) -> SpiceResult<MeasureCard> {
+    match control_card(card, DotCommand::Measure, auto_gnd)? {
+        grammar::ParsedCard::Measure(card) => Ok(card),
+        _ => Err(crate::primitives::SpiceError::parse(
+            card.location.clone(),
+            "expected a measurement command",
+        )),
+    }
+}
+
+fn control_card(
+    card: &RawCard,
+    command: DotCommand,
+    auto_gnd: bool,
+) -> SpiceResult<grammar::ParsedCard> {
+    let mut converted = card.clone();
+    let Some(head) = converted.tokens.first_mut() else {
+        return Err(crate::primitives::SpiceError::parse(
+            card.location.clone(),
+            "empty control command",
+        ));
+    };
+    head.text = command.card_name();
+    converted.kind = crate::netlist::card::CardKind::DotCommand(command);
+    grammar::parse_card(&converted, auto_gnd, scopes::ModelVisibility::default())
 }
 
 /// Evaluates a measurement's numeric setters, retaining positioned diagnostics.

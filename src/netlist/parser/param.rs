@@ -81,6 +81,7 @@ fn assignments(card: &RawCard, start: usize) -> SpiceResult<Vec<ParamAssignment>
             depth: 0,
             remaining_nodes: crate::netlist::expr::MAX_TREE_NODES,
             shadowing: &[],
+            control_names: false,
         },
     };
     match list(&mut input) {

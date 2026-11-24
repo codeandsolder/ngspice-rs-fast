@@ -156,20 +156,12 @@ impl CircuitParameterPlan {
         }
         option_dependencies.sort_unstable();
         option_dependencies.dedup();
-        // Other consumers of root `.param` are resolved by full elaboration:
-        // options, nested formal scopes, behavioural expression rewriting,
-        // and output expressions can change independently of scalar sites.
+        // Options, nested formal scopes and behavioural expression rewriting
+        // can change independently of the compiled numeric device sites.
+        // Root report directives are downstream consumers of the candidate
+        // scope, not changes to elaborated circuit topology.
         let requires_rebuild = !source.subcircuits.is_empty()
             || !source.options.is_empty()
-            || source.cards.iter().any(|card| {
-                matches!(
-                    card.kind,
-                    crate::netlist::ast::ScopedCardKind::Measure(_)
-                        | crate::netlist::ast::ScopedCardKind::Fourier(_)
-                        | crate::netlist::ast::ScopedCardKind::Save(_)
-                        | crate::netlist::ast::ScopedCardKind::Print(_)
-                )
-            })
             || source.devices.iter().any(|device| {
                 device
                     .parameters
@@ -185,6 +177,10 @@ impl CircuitParameterPlan {
             option_dependencies,
             requires_rebuild,
         })
+    }
+
+    pub(crate) const fn source(&self) -> &Netlist {
+        &self.source
     }
 
     /// Coordinate schema in original caller order.
