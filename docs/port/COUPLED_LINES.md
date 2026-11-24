@@ -72,29 +72,79 @@ Default bounds are 32 conductors, 32 MiB dense workspace and at most
 128 exponential squarings. All dimensions and allocation products use
 checked arithmetic.
 
+## Causal time-domain finite-volume cable
+
+Native `.tran` does **not** use a sampled AC matrix. It discretizes the full
+symmetric coupled RLGC cable into `sections` passive pi cells. A section of
+width `dx = length / sections` has two half-shunts `(G + s C)*dx/2`
+and a coupled series impedance `(R + s L)*dx`. The default is 64 sections;
+`.model cable cpl ... sections=128` chooses an integer in `1..=256`.
+Accuracy improves as the spatial grid resolves the fastest coupled mode and
+the driving waveform's rise/fall; it is not the continuous line's exact
+delay/convolution, nor is it expected to have perfect front causality on a
+finite grid. The line's `state_count` is `6 * conductors * sections`: for
+each section and conductor, (left shunt charge/current), (series magnetic
+flux/voltage), (right shunt charge/current).
+
+For a time integration coefficient `a0`, each cell's physical companion
+admittances are `S = inverse(dx*(R + a0*L))` and
+`H = dx*(G + a0*C)/2`. Accepted charge/flux histories are integrated
+using the same `Coefficients` as all other SPICE capacitors and inductors;
+this constructs known historical affine current/voltage forcing terms.
+The symmetric cell Norton matrix in end-to-end *entering* currents is
+
+  [Ileft; Iright] = [[S+H,-S],[-S,S+H]] [Vleft;Vright] + [Jleft;Jright].
+
+The interface of two adjacent cells obeys a KCL equation whose coefficient
+is `K = Y22_left + Y11_right`. Eliminating its voltage produces a Schur
+complement. Right-to-left suffix composition eliminates all interior nodes
+without ever multiplying numerically explosive ABCD matrices. The global MNA
+receives N real branch-current rows (physical input currents during transient),
+plus output-port KCL from the final condensed Norton admittance and source.
+Only accepted charges and fluxes feed subsequent loads: Newton iterations
+write *trial* local charge, derivative and flux states, and the existing
+`StateHistory` transaction publishes them on acceptance. A rejected step
+cannot mutate accepted history. The same Schur factors reconstruct the local
+interface voltages and series currents to update all trial states.
+
+At a transient `t=0` DC seed, the continuous DC telegrapher transfer at each
+half-section reconstructs initial voltages/currents and stores initial
+charges/fluxes with zero derivatives. This matches steady linear DC exactly
+for the lossless shunt case, and otherwise converges to the spatial DC model
+as sections increase. Ordinary `.op` without state history does not create
+or require spatial state slots. The time-domain Norton kernel currently
+requires nonsingular `R + a0*L` at the selected positive integration
+coefficient. Degenerate exactly zero series impedance needs dedicated ideal
+constraint equations, not arbitrary numerical regularization.
+
+This is a causal, stable approximation to the continuous distributed cable,
+not a bitwise port of C's CPL approximation. Spatial error, integration error,
+and differences from C's own impulse-response approximation must be assessed
+separately; neither C's waveform nor an untested grid size should be treated
+as proof of mathematical accuracy.
+
 ## C reference and test contract
 
-Upstream C: src/spicelib/parser/inp2p.c,
-src/spicelib/devices/cpl/cplsetup.c and cplload.c. Example models:
-tests/transmission/cpl3_4_line.cir, cpl_ibm2.cir. Crucially the C
-CPL device's DEV acLoad hook is NULL: C's implementation is transient
-only. Rust AC/SP validation uses independent analytic eigenmode and
-transmission-matrix calculations rather than inventing a C reference.
+Upstream C: `src/spicelib/parser/inp2p.c` and
+`src/spicelib/devices/cpl/{cplsetup.c,cplload.c}`. Models:
+`tests/transmission/cpl3_4_line.cir`, `cpl_ibm2.cir` and
+`examples/TransmissionLines/cpl2_2_line.sp`. C CPL has no `DEVacLoad`
+hook, so the AC/SP reference is independent analytic cable theory, not C.
 
-The independent regressions in tests/cpl_lines.rs currently cover
-single-wire lossless cotangent/cosecant, 2-wire even/odd coupled
-orthonormal modes, nonsingular zero-frequency R-matrix inverse,
-uncoupled three-conductor limits, separate return-node KCL, and
-negative/singular/oversized matrices.
+`tests/cpl_lines.rs` checks lossless trigonometric AC, even/odd coupled
+modes, noncommuting R/L/G/C against independent RK4 integration, RC diffusion
+AC, DC matrix inverse, lossless branch constraint, physical return-node KCL,
+malformed materials, full `.op`/`.ac` and writer model-vector roundtrip, plus
+native transient initialized steady state and causal pulse propagation.
+The four-conductor transient corpus is also derived from the upstream
+`cpl3_4_line.cir` coefficients, run against local ngspice 47. Retain sampled
+comparisons and note both numerical method and grid resolution.
 
-## Integration boundary / follow-on
+## Integration and remaining verification
 
-The typed distributed DC/AC transfer matrices, exact branch-constraint MNA
-and Device interface are in place.
-Native P/CPL netlist parsing, including separately positioned real-vector
-coefficients and independent return terminals, and model binding are active.
-The complete passive rational transient propagation is a separate step. Arbitrary AC frequency responses cannot
-be sampled into transient forcing: correct transient must derive from the
-time-domain RLGC system, using an accepted/trial history or validated
-passive rational spatial approximation. No nonlinear transient dynamics
-are pretended to be handled by a frequency-only matrix.
+Complete native P/CPL parsing, model resolution, exact distributed DC/AC,
+finite-volume causal transient with trial/accept states and physical N-port
+KCL have implementation. The full strict lint and campaign validator are
+responsible for integration. Remaining checks include the upstream C
+four-conductor temporal coupling, transient grid convergence, variable-step
+Gear, performance, energy/passivity and exact degenerate-series handling.

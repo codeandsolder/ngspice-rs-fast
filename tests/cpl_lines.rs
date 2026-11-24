@@ -473,3 +473,223 @@ fn lossless_cpl_dc_short_is_exact_branch_constraint_while_ac_is_distributed() {
         }
     }
 }
+
+fn run_transient_cpl(body: &str) -> ngspice_rs::analysis::Plot {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+    let text = format!("CPL transient\n{body}\n.end\n");
+    let parsed = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("cpl_transient.cir"), &text))
+        .unwrap();
+    let config = RunConfig::from_netlist(&parsed).unwrap();
+    let plan = config.plan_for(&parsed.analyses[0]).unwrap();
+    let mut circuit = config.circuit(&parsed).unwrap();
+    plan.run(&mut circuit, &config.context()).unwrap()
+}
+
+fn transient_column(plot: &ngspice_rs::analysis::Plot, name: &str) -> Vec<f64> {
+    plot.column(name)
+        .unwrap()
+        .iter()
+        .map(|value| value.re)
+        .collect()
+}
+
+#[test]
+fn coupled_multiconductor_transient_preserves_initial_dc_steady_state() {
+    // With constant source, the accepted t=0 DC fluxes/charges initialize
+    // the entire spatial ladder, so the first transient step contains no
+    // unphysical impulse, and repeated transient integration remains steady.
+    let plot = run_transient_cpl(
+        "vin source 0 dc 1\n\
+        rsource source a 50\n\
+        pline a 0 b 0 cable\n\
+        rload b 0 50\n\
+        .model cable cpl r=10 l=250n c=100p g=0 length=1 sections=16\n\
+        .tran 1n 20n",
+    );
+    let voltages = transient_column(&plot, "v(b)");
+    assert!(voltages.len() >= 10);
+    let expected = 50. / 110.;
+    for (index, &voltage) in voltages.iter().enumerate() {
+        assert!(
+            (voltage - expected).abs() < 1e-8,
+            "steady DC voltage at point {index}: {voltage} vs {expected}"
+        );
+    }
+}
+
+#[test]
+fn coupled_multiconductor_transient_propagates_a_delayed_pulse_causally() {
+    // 50-ohm matched distributed line: delay=length*sqrt(LC)=1 ns,
+    // section count 64. The far end cannot respond before the pulse and
+    // should approach the half-amplitude matched limit after the delay.
+    let plot = run_transient_cpl(
+        "vin source 0 pulse(0 1 2n 0.5n 0.5n 3n 8n)\n\
+        rs source a 50\n\
+        p1 a 0 b 0 cable\n\
+        rl b 0 50\n\
+        .model cable cpl r=0 l=250n c=100p g=0 length=0.2 sections=32\n\
+        .tran 0.1n 6n",
+    );
+    let values = transient_column(&plot, "v(b)");
+    let times = transient_column(&plot, "time");
+    assert_eq!(values.len(), times.len());
+    assert!(values.len() > 25);
+    for (&time, &voltage) in times.iter().zip(&values) {
+        if time <= 2e-9 {
+            assert!(
+                voltage.abs() < 1e-7,
+                "noncausal response at {time}: {voltage}"
+            );
+        }
+    }
+    let reached = times
+        .iter()
+        .zip(&values)
+        .filter(|(time, _)| **time > 3.5e-9 && **time < 5.5e-9)
+        .map(|(_, value)| *value)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        (reached - 0.5).abs() < 0.06,
+        "matched pulse peak: {reached}"
+    );
+}
+
+#[test]
+fn four_conductor_lc_corpus_transient_against_c_reference() {
+    // Adapted only at the source/load boundary from ngspice's
+    // tests/transmission/cpl3_4_line.cir. The R/L/G/C per-length upper
+    // triangles and 6.3 length are exactly those of the C fixture.
+    // C ngspice 47 generated the comparison samples on 2026-11-24.
+    let plot = run_transient_cpl(
+        "vin in 0 pulse(0 1 1n 0.2n 0.2n 5n 12n)\n\
+        rs in a1 100\n\
+        r2 a2 0 100\n\
+        r3 a3 0 100\n\
+        r4 a4 0 100\n\
+        p1 a1 a2 a3 a4 0 b1 b2 b3 b4 0 coupled\n\
+        rl1 b1 0 100\n\
+        rl2 b2 0 100\n\
+        rl3 b3 0 100\n\
+        rl4 b4 0 100\n\
+        .model coupled cpl\n\
+        + r=0.3 0 0 0 0.3 0 0 0.3 0 0.3\n\
+        + l=9n 5.4n 0 0 9n 5.4n 0 9n 5.4n 9n\n\
+        + g=0 0 0 0 0 0 0 0 0 0\n\
+        + c=0.35p -0.03p 0 0 0.35p -0.03p 0 0.35p -0.03p 0.35p\n\
+        + length=6.3 sections=64\n\
+        .tran 0.05n 6n 0 0.05n",
+    );
+    let times = transient_column(&plot, "time");
+    assert!(times.len() > 60);
+    // Interpolated from the 134-row ngspice 47 run on the source/loads
+    // above. This tests the C waveform shape, while the separate physical
+    // DC/AC oracles remain authoritative for continuous-line accuracy.
+    const SAMPLES: [f64; 6] = [1.2e-9, 1.6e-9, 2e-9, 3e-9, 4e-9, 5e-9];
+    const C_WAVEFORMS: [(&str, [f64; 6]); 4] = [
+        (
+            "v(a1)",
+            [
+                0.572_275_5,
+                0.601_133_1,
+                0.529_333_3,
+                0.502_224_1,
+                0.500_068_1,
+                0.499_862_6,
+            ],
+        ),
+        (
+            "v(b1)",
+            [
+                0.031_441_0,
+                0.438_039_2,
+                0.469_346_5,
+                0.496_472_3,
+                0.499_911_6,
+                0.500_247_9,
+            ],
+        ),
+        (
+            "v(b2)",
+            [
+                -0.050_908_0,
+                -0.061_744_5,
+                -0.030_107_0,
+                -0.004_432_8,
+                -0.000_593_8,
+                -0.000_089_3,
+            ],
+        ),
+        (
+            "v(b4)",
+            [
+                -0.031_441_0,
+                -0.000_384_0,
+                0.005_661_5,
+                -0.000_270_8,
+                -0.000_275_8,
+                -0.000_018_2,
+            ],
+        ),
+    ];
+    for (name, reference) in C_WAVEFORMS {
+        let values = transient_column(&plot, name);
+        assert_eq!(values.len(), times.len());
+        assert!(values.iter().all(|v| v.is_finite()));
+        for (&sample, &expected) in SAMPLES.iter().zip(&reference) {
+            let k = times
+                .partition_point(|&time| time < sample)
+                .clamp(1, times.len() - 1);
+            let value = values[k - 1]
+                + (values[k] - values[k - 1]) * (sample - times[k - 1]) / (times[k] - times[k - 1]);
+            assert!(
+                (value - expected).abs() < 0.010,
+                "{name} at {sample:.5e}: Rust={value}, C={expected}"
+            );
+        }
+    }
+    // 6.3 * 0.3 ohm adds real cable resistance. In contrast to C's
+    // ~0.500 V asymptote, Rust's ~0.495 V is the independent physical
+    // DC divider: 100 / (100 + 6.3 * 0.3 + 100).
+    let physical_dc = 100. / (201.89);
+    let last = *transient_column(&plot, "v(b1)").last().unwrap();
+    assert!(
+        (last - physical_dc).abs() < 1e-3,
+        "physical DC limit: {last}"
+    );
+}
+
+#[test]
+fn coupled_transient_gear_history_is_causal_and_matches_trapezoidal_waveform() {
+    const BODY: &str = "vin source 0 pulse(0 1 2n 0.5n 0.5n 3n 8n)\n\
+        rs source a 50\n\
+        p1 a 0 b 0 cable\n\
+        rl b 0 50\n\
+        .model cable cpl r=0 l=250n c=100p g=0 length=0.2 sections=32\n\
+        .tran 0.05n 6n 0 0.05n";
+    let trap = run_transient_cpl(BODY);
+    let gear = run_transient_cpl(&BODY.replace(".tran", ".options method=gear maxord=2\n.tran"));
+    let trap_time = transient_column(&trap, "time");
+    let trap_out = transient_column(&trap, "v(b)");
+    let gear_time = transient_column(&gear, "time");
+    let gear_out = transient_column(&gear, "v(b)");
+    let interpolate = |time: f64, times: &[f64], values: &[f64]| {
+        let index = times
+            .partition_point(|&x| x < time)
+            .clamp(1, times.len() - 1);
+        values[index - 1]
+            + (values[index] - values[index - 1]) * (time - times[index - 1])
+                / (times[index] - times[index - 1])
+    };
+    for sample in [1e-9, 2e-9, 2.5e-9, 3e-9, 3.5e-9, 4e-9, 5e-9] {
+        let trap_v = interpolate(sample, &trap_time, &trap_out);
+        let gear_v = interpolate(sample, &gear_time, &gear_out);
+        let tolerance = if sample <= 2e-9 { 1e-7 } else { 0.05 };
+        assert!(
+            (trap_v - gear_v).abs() < tolerance,
+            "Gear/trap at {sample}: {gear_v} versus {trap_v}"
+        );
+    }
+}

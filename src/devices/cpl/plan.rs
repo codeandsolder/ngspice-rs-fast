@@ -258,6 +258,20 @@ impl CoupledLinePlan {
         Ok((generator, impedance_scale))
     }
 
+    /// Real DC propagator for a half spatial section; same physical
+    /// telegrapher generator as the exact DC/AC 2N-port.
+    pub(super) fn dc_half_section(&self, sections: usize) -> SpiceResult<(DenseComplex, Real)> {
+        let divisor = sections
+            .checked_mul(2)
+            .ok_or_else(|| invalid("half-section count overflow"))?;
+        let scale = f64::from(u32::try_from(divisor).map_err(|_| invalid("half-section scale"))?);
+        let (operator, impedance_scale) = self.operator(0.)?;
+        Ok((
+            expm_pade13(&scaled(&operator, 1. / scale)?, self.limits.max_squarings)?,
+            impedance_scale,
+        ))
+    }
+
     /// Exact coupled first-order telegrapher transfer up to numerical precision.
     ///
     /// States are input/output vectors [V, I'] with I' = Zref·I and I

@@ -5,6 +5,7 @@
 //! ends are defined entering the line. General noncommuting matrices are
 //! handled by one 2N-dimensional telegrapher state-space propagator.
 pub mod plan;
+mod transient;
 
 use std::sync::Arc;
 
@@ -37,6 +38,8 @@ pub struct CoupledLine {
     input_return: NodeId,
     output_return: NodeId,
     terminals: Vec<NodeId>,
+    /// Number of finite-volume spatial sections for the transient companion.
+    sections: usize,
 }
 type CplMaterialVectors = std::collections::BTreeMap<String, Vec<Real>>;
 
@@ -65,7 +68,7 @@ impl CoupledLine {
             .and_then(|v| v.checked_mul(conductors))
             .map(|v| v / 2)
             .ok_or_else(|| invalid("CPL matrix dimensions overflow"))?;
-        let (mut length, arrays) = Self::prepare_model(model, expected)?;
+        let (mut length, sections, arrays) = Self::prepare_model(model, expected)?;
         for parameter in &instance.parameters {
             if parameter.name != "length" {
                 return Err(SpiceError::parse(
@@ -100,26 +103,41 @@ impl CoupledLine {
                 .iter()
                 .map(|name| nodes.intern(name))
                 .collect::<SpiceResult<Vec<_>>>()?;
-            Self::new(
+            let mut device = Self::new(
                 instance.name.clone(),
                 Arc::clone(&plan),
                 terminals[..conductors].to_vec(),
                 terminals[conductors],
                 terminals[conductors + 1..conductors + 1 + conductors].to_vec(),
                 terminals[count - 1],
-            )
+            )?;
+            device.sections = sections;
+            Ok(device)
         })
     }
 
     fn prepare_model(
         model: &ResolvedModel<'_>,
         expected: usize,
-    ) -> SpiceResult<(Option<Real>, CplMaterialVectors)> {
+    ) -> SpiceResult<(Option<Real>, usize, CplMaterialVectors)> {
         let mut length = None;
+        let mut sections = 64;
         let mut arrays = std::collections::BTreeMap::<String, Vec<Real>>::new();
         for parameter in &model.card().parameters {
             if parameter.name == "length" {
                 length = Some(Self::scalar_parameter(parameter)?);
+            } else if parameter.name == "sections" {
+                let value = Self::scalar_parameter(parameter)?;
+                if value < 1. || value > 256. || value.fract() != 0. {
+                    return Err(SpiceError::parse(
+                        parameter.location.clone(),
+                        "CPL sections must be an integer from 1 through 256",
+                    ));
+                }
+                sections = value
+                    .to_string()
+                    .parse::<usize>()
+                    .map_err(|_| invalid("integer CPL section count"))?;
             } else if ["r", "l", "g", "c"].contains(&parameter.name.as_str()) {
                 let ParameterKind::NumericVector(entries) = &parameter.kind else {
                     return Err(SpiceError::parse(
@@ -167,7 +185,7 @@ impl CoupledLine {
                 ));
             }
         }
-        Ok((length, arrays))
+        Ok((length, sections, arrays))
     }
 
     fn scalar_parameter(parameter: &crate::netlist::ast::ParameterAssignment) -> SpiceResult<Real> {
@@ -224,6 +242,7 @@ impl CoupledLine {
             input_return,
             output_return,
             terminals,
+            sections: 64,
         })
     }
 
@@ -314,8 +333,18 @@ impl CoupledLine {
         unknowns: &MnaUnknowns,
         first_branch: usize,
     ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
-        let conductors = self.conductors();
         let (matrix, scale) = self.plan.transfer_at(hz)?;
+        self.transfer_stamps(&matrix, scale, unknowns, first_branch)
+    }
+
+    fn transfer_stamps(
+        &self,
+        matrix: &DenseComplex,
+        scale: Real,
+        unknowns: &MnaUnknowns,
+        first_branch: usize,
+    ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
+        let conductors = self.conductors();
         let inverse_scale = 1. / scale;
         if !inverse_scale.is_finite() {
             return Err(invalid("nonfinite cable current scaling"));
@@ -349,10 +378,10 @@ impl CoupledLine {
             .try_reserve(size)
             .map_err(|_| invalid("augmented stamp capacity"))?;
         let mut insert = |row: Option<usize>, col: Option<usize>, value: Complex| {
-            if let (Some(row), Some(col)) = (row, col) {
-                if value != Complex::ZERO {
-                    entries.push((row, col, value));
-                }
+            if let (Some(row), Some(col)) = (row, col)
+                && value != Complex::ZERO
+            {
+                entries.push((row, col, value));
             }
         };
         for i in 0..conductors {
@@ -365,11 +394,10 @@ impl CoupledLine {
             insert(input_return, Some(branch_i), Complex::real(-inverse_scale));
             insert(Some(branch_i), output_positive, Complex::real(1.));
             insert(Some(branch_i), output_return, Complex::real(-1.));
-            for j in 0..conductors {
+            for (j, &(source_positive, source_return)) in inputs.iter().enumerate() {
                 let branch_j = first_branch
                     .checked_add(j)
                     .ok_or_else(|| invalid("branch row overflow"))?;
-                let (source_positive, source_return) = inputs[j];
                 let a = matrix
                     .get(i, j)
                     .ok_or_else(|| invalid("missing transmission A"))?;
@@ -423,6 +451,10 @@ impl Device for CoupledLine {
         self.conductors()
     }
 
+    fn state_count(&self) -> usize {
+        self.spatial_state_count()
+    }
+
     fn setup_matrix(
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
@@ -432,7 +464,7 @@ impl Device for CoupledLine {
             let branch_i = setup.branch(i)?;
             let (input_positive, input_return) = self.physical_pair(i);
             let (output_positive, output_return) = self.physical_pair(conductors + i);
-            for row in [input_positive, input_return] {
+            for row in <[NodeId; 2]>::from((input_positive, input_return)) {
                 setup.element(setup.node(row), Some(branch_i));
             }
             for col in [output_positive, output_return] {
@@ -441,9 +473,10 @@ impl Device for CoupledLine {
             for j in 0..conductors {
                 let branch_j = setup.branch(j)?;
                 let (source_positive, source_return) = self.physical_pair(j);
+                let (other_output, other_return) = self.physical_pair(conductors + j);
                 for row in [output_positive, output_return] {
                     setup.element(setup.node(row), Some(branch_j));
-                    for col in [source_positive, source_return] {
+                    for col in [source_positive, source_return, other_output, other_return] {
                         setup.nodes(row, col);
                     }
                 }
@@ -460,6 +493,7 @@ impl Device for CoupledLine {
         match context.mode {
             AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
                 let first = context.branch(0)?;
+                self.dc_spatial_state(context)?;
                 for (row, col, value) in self.transfer_stamps_at(0., context.unknowns, first)? {
                     if value.im != 0. {
                         return Err(invalid("DC line constraint requires a real MNA stamp"));
@@ -469,9 +503,12 @@ impl Device for CoupledLine {
                 Ok(())
             }
             AnalysisMode::Ac { .. } => Err(invalid("AC transfer belongs to assemble_small_signal")),
-            AnalysisMode::Transient { .. } => Err(invalid(
-                "transient coupled convolution requires an accepted-history propagator",
-            )),
+            AnalysisMode::Transient { .. } => {
+                let coefficients = context.integration.ok_or_else(|| {
+                    invalid("transient cable requires companion integration coefficients")
+                })?;
+                self.stamp_stable_transient(context, coefficients)
+            }
         }
     }
 

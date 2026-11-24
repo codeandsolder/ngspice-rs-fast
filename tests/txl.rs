@@ -178,8 +178,9 @@ fn every_model_parameter_is_required() {
 /// cannot bind a P/CPL model, even though P/CPL is now implemented.
 #[test]
 fn coupled_line_models_are_refused() {
-    let error = deck("y1 a 0 b 0 cm\nv1 a 0 1\nrl b 0 50\n.model cm cpl r=1 l=1 c=1 g=0 length=1")
-        .unwrap_err();
+    let error =
+        circuit("y1 a 0 b 0 cm\nv1 a 0 1\nrl b 0 50\n.model cm cpl r=1 l=1 c=1 g=0 length=1")
+            .unwrap_err();
     assert!(error.to_string().contains("wrong model family"), "{error}");
 }
 

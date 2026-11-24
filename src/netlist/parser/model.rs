@@ -232,7 +232,7 @@ fn cpl_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> 
     while let Some(token) = input.input.first() {
         if token.kind == TokenKind::RParen
             || (token.kind == TokenKind::Word
-                && ["r", "l", "g", "c", "length"]
+                && ["r", "l", "g", "c", "length", "sections"]
                     .iter()
                     .any(|name| token.is_keyword(name)))
         {
