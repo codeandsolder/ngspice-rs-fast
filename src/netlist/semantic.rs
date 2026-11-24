@@ -18,10 +18,10 @@ use crate::netlist::ast::{
     AnalysisCard, ArgumentExpression, DeviceInstance, FourierCard, FuncCard, FuncParameter,
     FunctionWaveform, GlobalCard, GlobalNode, IncludeDirective, InitialCondition, LibrarySection,
     MeasureCard, MeasureEvent, MeasureRequest, MeasureStatistic, MeasureTransition, MeasureWindow,
-    ModelCard, Netlist, NodeHint, NodeHintCard, NodeHintValue, OptionCard, OptionSetting,
-    OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind, PositionedValue,
-    PrintCard, PulseWaveform, PwlPoint, RequestedVector, SaveCard, ScopedCard, ScopedCardKind,
-    SourceFunction, SourceWaveform, Subcircuit, VectorRequest,
+    ModelCard, Netlist, NodeHint, NodeHintCard, NodeHintValue, NumericVectorEntry, OptionCard,
+    OptionSetting, OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind,
+    PositionedValue, PrintCard, PulseWaveform, PwlPoint, RequestedVector, SaveCard, ScopedCard,
+    ScopedCardKind, SourceFunction, SourceWaveform, Subcircuit, VectorRequest,
 };
 use crate::netlist::bexpr::{
     BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression, TableTransfer,
@@ -230,6 +230,7 @@ semantic_struct!(GlobalNode { name } ignore { location });
 semantic_struct!(NodeHintCard { entries } ignore { location });
 semantic_struct!(NodeHint { node, value } ignore { node_location, value_location, location });
 semantic_struct!(PositionedValue { text } ignore { location });
+semantic_struct!(NumericVectorEntry { source, expression } ignore {});
 semantic_struct!(InitialCondition { name, value } ignore {});
 semantic_struct!(PulseWaveform { initial, pulsed, delay, rise, fall, width, period, count } ignore {});
 semantic_struct!(FunctionWaveform { function, values } ignore {});
@@ -338,7 +339,9 @@ impl Semantic for ParameterAssignment {
             .map_err(|diff| diff.field("kind"))?;
         // Only the structured components carry semantics for vectors.
         match kind {
-            ParameterKind::Waveform(_) | ParameterKind::InitialConditions(_) => Ok(()),
+            ParameterKind::Waveform(_)
+            | ParameterKind::InitialConditions(_)
+            | ParameterKind::NumericVector(_) => Ok(()),
             ParameterKind::Scalar
             | ParameterKind::Textual
             | ParameterKind::Flag
@@ -460,6 +463,7 @@ semantic_enum!(BExprKind {
 semantic_enum!(ParameterKind {
     Scalar,
     Textual,
+    NumericVector(entries: rentries),
     Flag,
     Instance,
     Expression(expression: rexpression),

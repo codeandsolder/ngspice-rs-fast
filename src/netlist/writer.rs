@@ -792,6 +792,8 @@ impl Writer<'_> {
                 | "urc"
                 | "ltra"
                 | "txl"
+                | "cpl"
+                | "cpllines"
                 | "nmf"
                 | "pmf"
                 // `inpdomod.c`'s HFET spellings of the same families.
@@ -815,6 +817,12 @@ impl Writer<'_> {
                 parts.push(' ')?;
             }
             match &parameter.kind {
+                ParameterKind::NumericVector(entries)
+                    if matches!(base, "cpl" | "cpllines")
+                        && ["r", "l", "g", "c"].contains(&parameter.name.as_str()) =>
+                {
+                    append_cpl_material(&mut parts, parameter, entries)?;
+                }
                 ParameterKind::Flag => {
                     let allowed = model_flags(base);
                     if !allowed.contains(&parameter.name.as_str()) || !parameter.value.is_empty() {
@@ -900,6 +908,22 @@ impl Writer<'_> {
             't' => tline_parameters(device, &mut parts)?,
             'o' => ltra_parameters(device, &mut parts)?,
             'u' => urc_parameters(device, &mut parts)?,
+            'p' => {
+                for parameter in &device.parameters {
+                    if parameter.name != "length"
+                        || !matches!(
+                            parameter.kind,
+                            ParameterKind::Scalar | ParameterKind::Expression(_)
+                        )
+                    {
+                        return Err(refuse(
+                            "P/CPL instance only accepts length=",
+                            Some(&parameter.location),
+                        ));
+                    }
+                    named_value(&mut parts, parameter, false)?;
+                }
+            }
             'y' => {
                 for p in &device.parameters {
                     if p.name != "len"
@@ -961,6 +985,7 @@ fn device_prefix<'a>(
         'm' | 'e' | 'g' | 's' | 't' | 'o' | 'y' => count == 4,
         'j' | 'u' | 'z' => count == 3,
         'x' => true,
+        'p' => count >= 4 && count % 2 == 0,
         'k' => count == 0,
         _ => {
             return Err(refuse(
@@ -1000,7 +1025,7 @@ fn device_prefix<'a>(
         ('v' | 'i' | 'e'..='h' | 'k' | 't', Some(_)) => {
             return Err(refuse("source with a model", Some(location)));
         }
-        ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y', None) => {
+        ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y' | 'p', None) => {
             return Err(refuse("device without a model/target", Some(location)));
         }
         (_, Some(model)) => {
@@ -1200,6 +1225,37 @@ fn value_text<'a>(
         _ => return Err(bad("value kind is not allowed here")),
     }
     Ok(&parameter.value)
+}
+
+/// Write the evaluated independent CPL vector coefficients as ordinary
+/// numeric tokens, retaining physical scale suffixes and rejecting injection.
+fn append_cpl_material(
+    parts: &mut Card<'_>,
+    parameter: &ParameterAssignment,
+    entries: &[crate::netlist::ast::NumericVectorEntry],
+) -> SpiceResult<()> {
+    parts.push_str(&parameter.name)?;
+    parts.push('=')?;
+    for (position, entry) in entries.iter().enumerate() {
+        if position != 0 {
+            parts.push(' ')?;
+        }
+        match single_token(&entry.source.text, &entry.source.location) {
+            Some(Lexeme {
+                kind: TokenKind::Number(value),
+                ..
+            }) if value.is_finite() => {
+                parts.push_str(&entry.source.text)?;
+            }
+            _ => {
+                return Err(refuse(
+                    "CPL vector coefficient must be a finite literal",
+                    Some(&entry.source.location),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn append_named_value(

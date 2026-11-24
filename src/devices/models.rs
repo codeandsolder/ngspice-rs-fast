@@ -76,6 +76,8 @@ pub enum ModelFamily {
     Ltra,
     /// Single lossy transmission line (TXL, `inp2y.c`).
     Txl,
+    /// Distributed multiconductor cable (`P`, C `cpl`).
+    Cpl,
     /// N-channel MESFET/HFET family (`nmf`; level 1 `mes/`, levels 2-4
     /// `mesa/`, 5 `hfet1/`, 6 `hfet2/`).
     Nmf,
@@ -103,6 +105,7 @@ impl ModelFamily {
             "urc" => Some(Self::Urc),
             "ltra" => Some(Self::Ltra),
             "txl" => Some(Self::Txl),
+            "cpl" | "cpllines" => Some(Self::Cpl),
             // `inpdomod.c` accepts the HFET spellings as the same families;
             // `level` then selects the device (5 is `hfet1/`, 6 `hfet2/`).
             "nmf" | "nhfet" => Some(Self::Nmf),
@@ -128,6 +131,7 @@ impl ModelFamily {
             Self::Urc => 'u',
             Self::Ltra => 'o',
             Self::Txl => 'y',
+            Self::Cpl => 'p',
             Self::Nmf | Self::Pmf => 'z',
         }
     }
@@ -183,6 +187,8 @@ pub enum ModelBackend {
     Ltra,
     /// TXL lossy line.
     Txl,
+    /// Multiconductor coupled transmission line.
+    Cpl,
 }
 
 /// Authoritative backend catalog entry. Selector aliases are the C levels
@@ -265,6 +271,7 @@ impl ModelBackend {
             'u' => const { &[BackendSpec::new(Self::Urc, "Uniform RC expansion", &[1])] },
             'o' => const { &[BackendSpec::new(Self::Ltra, "Lossy line", &[1])] },
             'y' => const { &[BackendSpec::new(Self::Txl, "TXL lossy line", &[1])] },
+            'p' => const { &[BackendSpec::new(Self::Cpl, "Coupled line", &[1])] },
             _ => &[],
         }
     }

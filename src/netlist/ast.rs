@@ -83,6 +83,10 @@ pub enum ParameterKind {
     /// syntax tree and spans. Scalar consumers must treat this like any other
     /// non-scalar kind until an evaluation pass resolves it.
     Expression(Box<crate::netlist::expr::ParameterExpression>),
+    /// A numeric vector setter such as a CPL upper-triangle R/L/G/C array.
+    /// Components have separate positions and optional expressions, all
+    /// resolved by elaboration before device material preparation.
+    NumericVector(Vec<NumericVectorEntry>),
     /// A bare `IF_FLAG` keyword: C's `INPgetValue` supplies integer 1 without
     /// consuming a value. Explicit `flag=0`/`flag=1` forms are not accepted.
     Flag,
@@ -104,6 +108,16 @@ pub enum ParameterKind {
     /// ([`crate::netlist::bexpr`]). Front-end elaboration substitutes `.param` names
     /// and expands `.func` calls but keeps this kind; the device evaluates it.
     Behavioural(Box<crate::netlist::bexpr::BehaviouralExpression>),
+}
+
+/// A separately positioned numeric vector entry, possibly containing an
+/// unevaluated formal/numparam expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NumericVectorEntry {
+    /// The physical source token and its location.
+    pub source: PositionedValue,
+    /// An optional expression to be evaluated by netlist elaboration.
+    pub expression: Option<Box<crate::netlist::expr::ParameterExpression>>,
 }
 
 /// One finite textual waveform/IC value and its byte-column position.
