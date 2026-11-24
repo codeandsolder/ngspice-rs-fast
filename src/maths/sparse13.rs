@@ -5336,7 +5336,9 @@ mod tests {
             assert_eq!(solve(&[5., 1.]), [0., 1. / 3.]);
             let perturbed = 5.0_f64.next_up();
             assert_eq!(solve(&[perturbed, 1.]), [(perturbed - 5.) / 2., 1. / 3.]);
-            let rhs = [5., 1., perturbed, 1., 7., 2., -0., 0., -5., -1.];
+            let rhs = [
+                5., 1., perturbed, 1., 7., 2., -0., 0., -5., -1., 10., 2., -7., -2., 1., 1., 5., 2.,
+            ];
             check_batch(&m, &rhs, |value| [value.to_bits(), 0]);
         }
         let pivot = Complex::new(3., 7.);
