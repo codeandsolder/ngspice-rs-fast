@@ -101,6 +101,29 @@ fn dexp(a: f64) -> f64 {
     }
 }
 
+/// BSIM4's repeated short-channel screening factors:
+/// `exp(x) / ((exp(x) - 1)^2 + 2 exp(x) MIN_EXP)`.
+///
+/// Subtracting one after rounding `exp(x)` loses the voltage-dependent term
+/// near equilibrium. Use `expm1` in that region, but retain the original
+/// EXP_THRESHOLD branch and the well-conditioned C evaluation elsewhere.
+/// The fallback also preserves C's NaN comparison behavior.
+fn short_channel_screening(x: f64) -> f64 {
+    if x < EXP_THRESHOLD {
+        let (exponential, delta) = if x.abs() < 0.5 {
+            let delta = x.exp_m1();
+            (1. + delta, delta)
+        } else {
+            let exponential = exp(x);
+            (exponential, exponential - 1.)
+        };
+        let square = delta * delta;
+        exponential / (square + 2. * exponential * MIN_EXP)
+    } else {
+        1. / (MAX_EXP - 2.)
+    }
+}
+
 /// `BSIM4DioIjthVjmEval`: the diode limiting voltage `Vjm`.
 fn dio_ijth_vjm_eval(Nvtm: f64, Ijth: f64, Isb: f64, XExpBV: f64) -> f64 {
     let Tc = XExpBV;
@@ -1180,51 +1203,19 @@ pub(super) fn temperature_instance(
             p.k1ox = p.k1 * toxe / m.toxm;
             tmp = sqrt(epssub / (epsrox * EPS0) * toxe * p.Xdep0);
             T0 = p.dsub * p.leff / tmp;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                p.theta0vb0 = T1 / T4;
-            } else {
-                p.theta0vb0 = 1.0 / (MAX_EXP - 2.0);
-            }
+            p.theta0vb0 = short_channel_screening(T0);
             T0 = p.drout * p.leff / tmp;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                T5 = T1 / T4;
-            } else {
-                T5 = 1.0 / (MAX_EXP - 2.0);
-            }
+            T5 = short_channel_screening(T0);
             p.thetaRout = p.pdibl1 * T5 + p.pdibl2;
             tmp = sqrt(p.Xdep0);
             tmp1 = p.vbi - p.phi;
             tmp2 = m.factor1 * tmp;
             T0 = p.dvt1w * p.weff * p.leff / tmp2;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                T8 = T1 / T4;
-            } else {
-                T8 = 1.0 / (MAX_EXP - 2.0);
-            }
+            T8 = short_channel_screening(T0);
             T0 = p.dvt0w * T8;
             T8 = T0 * tmp1;
             T0 = p.dvt1 * p.leff / tmp2;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                T9 = T1 / T4;
-            } else {
-                T9 = 1.0 / (MAX_EXP - 2.0);
-            }
+            T9 = short_channel_screening(T0);
             T9 = p.dvt0 * T9 * tmp1;
             T4 = toxe * p.phi / (p.weff + p.w0);
             T0 = sqrt(1.0 + p.lpe0 / p.leff);
@@ -1263,15 +1254,7 @@ pub(super) fn temperature_instance(
             if m.mobMod == 3 {
                 lt1 = m.factor1 * p.sqrtXdep0;
                 T0 = p.dvt1 * p.leff / lt1;
-                if T0 < EXP_THRESHOLD {
-                    T1 = exp(T0);
-                    T2 = T1 - 1.0;
-                    T3 = T2 * T2;
-                    T4 = T3 + 2.0 * T1 * MIN_EXP;
-                    Theta0 = T1 / T4;
-                } else {
-                    Theta0 = 1.0 / (MAX_EXP - 2.0);
-                }
+                Theta0 = short_channel_screening(T0);
                 tmp1 = epssub / p.Xdep0;
                 tmp2 = p.nfactor * tmp1;
                 tmp3 = (tmp2 + p.cdsc * Theta0 + p.cit) / m.coxe;
@@ -1861,26 +1844,10 @@ pub(super) fn temperature_instance(
             lt1 = m.factor1 * p.sqrtXdep0;
             ltw = lt1;
             T0 = p.dvt1 * m.leffeot / lt1;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                Theta0 = T1 / T4;
-            } else {
-                Theta0 = 1.0 / (MAX_EXP - 2.0);
-            }
+            Theta0 = short_channel_screening(T0);
             Delt_vth = p.dvt0 * Theta0 * V0;
             T0 = p.dvt1w * m.weffeot * m.leffeot / ltw;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                T5 = T1 / T4;
-            } else {
-                T5 = 1.0 / (MAX_EXP - 2.0);
-            }
+            T5 = short_channel_screening(T0);
             T2 = p.dvt0w * T5 * V0;
             TempRatioeot = m.tempeot / m.tnom - 1.0;
             T0 = sqrt(1.0 + p.lpe0 / m.leffeot);
@@ -2059,6 +2026,111 @@ impl super::ModelParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_channel_screening_matches_independent_decimal_oracle() {
+        // 90-digit decimal evaluations of exp(x)/[(exp(x)-1)^2+2 exp(x) MIN_EXP],
+        // with x first converted from the exact binary64 value. Independent
+        // of the port's exponential and branch implementation.
+        for (argument, expected) in [
+            (-33.0, 4.658_886_145_103_441e-15),
+            (-10.0, 4.540_405_235_047_541e-5),
+            (-1.0, 0.920_673_594_207_789_4),
+            (-0.5, 3.917_698_089_032_711),
+            (-0.001, 999_999.913_238_854_5),
+            (-1e-6, 9.965_838_929_273_431e11),
+            (-1e-7, 7.447_226_978_720_166e13),
+            (-1e-8, 2.834_614_264_622_220_6e14),
+            (-1e-10, 2.917_300_202_894_553e14),
+            (-1e-14, 2.917_308_713_559_77e14),
+            (0.0, 2.917_308_713_559_855e14),
+            (1e-14, 2.917_308_713_559_77e14),
+            (1e-10, 2.917_300_202_894_553e14),
+            (1e-8, 2.834_614_264_622_220_6e14),
+            (1e-7, 7.447_226_978_720_166e13),
+            (1e-6, 9.965_838_929_273_431e11),
+            (0.001, 999_999.913_238_854_5),
+            (0.5, 3.917_698_089_032_711),
+            (1.0, 0.920_673_594_207_789_4),
+            (10.0, 4.540_405_235_047_541e-5),
+            (33.0, 4.658_886_145_103_441e-15),
+            (33.999_999_999, 1.713_908_433_255_921_4e-15),
+        ] {
+            let actual = short_channel_screening(argument);
+            assert!(
+                (actual / expected - 1.).abs() <= 4. * f64::EPSILON,
+                "x={argument}: screening {actual:e} vs independent {expected:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn screening_preserves_reference_branch_boundaries_and_nonfinite_behavior() {
+        let c_limit = 1. / (MAX_EXP - 2.);
+        assert_eq!(short_channel_screening(34.), c_limit);
+        assert_eq!(short_channel_screening(34_f64.next_up()), c_limit);
+        assert_eq!(short_channel_screening(f64::INFINITY), c_limit);
+        assert_eq!(short_channel_screening(f64::NAN), c_limit);
+        assert_eq!(short_channel_screening(f64::NEG_INFINITY), 0.);
+        assert_eq!(
+            short_channel_screening(-0.).to_bits(),
+            short_channel_screening(0.).to_bits()
+        );
+        let below = short_channel_screening(34_f64.next_down());
+        assert!(below.is_finite() && below > 0.);
+    }
+
+    #[test]
+    #[ignore = "opt-in median direct math-kernel performance comparison"]
+    fn screening_kernel_performance_comparison() {
+        use std::{hint::black_box, time::Instant};
+
+        fn reference(x: f64) -> f64 {
+            if x < EXP_THRESHOLD {
+                let e = exp(x);
+                let difference = e - 1.;
+                e / (difference * difference + 2. * e * MIN_EXP)
+            } else {
+                1. / (MAX_EXP - 2.)
+            }
+        }
+        fn hyperbolic(x: f64) -> f64 {
+            if x < EXP_THRESHOLD {
+                let s = (x * 0.5).sinh();
+                1. / (4. * s * s + 2. * MIN_EXP)
+            } else {
+                1. / (MAX_EXP - 2.)
+            }
+        }
+        let inputs = [
+            -33., -10., -1., -0.1, -1e-6, -1e-8, 0., 1e-8, 1e-6, 0.1, 1., 10., 33.9, 34.,
+        ];
+        for (label, candidate) in [
+            ("C_legacy", reference as fn(f64) -> f64),
+            ("expm1", short_channel_screening as fn(f64) -> f64),
+            ("sinh", hyperbolic as fn(f64) -> f64),
+        ] {
+            let mut observations = Vec::new();
+            for pass in 0..7 {
+                let start = Instant::now();
+                let mut sum = 0.;
+                for _ in 0..80_000 {
+                    for &x in &inputs {
+                        sum += black_box(candidate(black_box(x)));
+                    }
+                }
+                black_box(sum);
+                if pass > 0 {
+                    observations.push(start.elapsed().as_nanos());
+                }
+            }
+            observations.sort_unstable();
+            println!(
+                "screening_{label}: ns_per_evaluation={:.3}",
+                observations[observations.len() / 2] as f64 / (80_000. * inputs.len() as f64)
+            );
+        }
+    }
 
     #[test]
     fn ijth_vjm_inverts_the_limited_diode_current() {
