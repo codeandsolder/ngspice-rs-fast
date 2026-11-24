@@ -43,7 +43,8 @@
 #![expect(unused_parens, reason = "preserve C expression grouping")]
 use super::{
     DELTA_1, DELTA_3, DELTA_4, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, Model,
-    SizeParam, exp, fabs, log, mode, smooth_drain, sqrt, state,
+    SizeParam, depletion_charge, exp, fabs, log, mode, positive_half_sum, smooth_drain, sqrt,
+    state,
 };
 use super::{
     bias::LoadBias,
@@ -112,7 +113,6 @@ pub(super) fn intrinsic(
     let mut dVfbeff_dVg: f64;
     let mut dVfbeff_dVb: f64;
     let mut V3: f64;
-    let mut V4: f64;
     let mut qgate: f64 = 0.0;
     let mut qbulk: f64 = 0.0;
     let mut qdrn: f64 = 0.0;
@@ -271,12 +271,11 @@ pub(super) fn intrinsic(
             here.cbdb = 0.0;
             here.cbsb = -here.cgsb;
         } else if Vgst <= 0.0 {
-            T1 = 0.5 * pParam.k1ox;
-            T2 = sqrt(T1 * T1 + Arg1);
-            qgate = CoxWL * pParam.k1ox * (T2 - T1);
+            let (charge, slope) = depletion_charge(pParam.k1ox, Arg1);
+            qgate = CoxWL * charge;
             qbulk = -qgate;
             qdrn = 0.0;
-            T0 = CoxWL * T1 / T2;
+            T0 = CoxWL * slope;
             here.cggb = T0 * dVgs_eff_dVg;
             here.cgdb = 0.0;
             here.cgsb = T0 * (dVbseffCV_dVb - dVgs_eff_dVg);
@@ -567,19 +566,10 @@ pub(super) fn intrinsic(
             Qac0 = CoxWL * (Vfbeff - Vfb);
             dQac0_dVg = CoxWL * dVfbeff_dVg;
             dQac0_dVb = CoxWL * dVfbeff_dVb;
-            T0 = 0.5 * pParam.k1ox;
             T3 = Vgs_eff - Vfbeff - VbseffCV - Vgsteff;
-            if pParam.k1ox == 0.0 {
-                T1 = 0.0;
-                T2 = 0.0;
-            } else if T3 < 0.0 {
-                T1 = T0 + T3 / pParam.k1ox;
-                T2 = CoxWL;
-            } else {
-                T1 = sqrt(T0 * T0 + T3);
-                T2 = CoxWL * T0 / T1;
-            }
-            Qsub0 = CoxWL * pParam.k1ox * (T1 - T0);
+            let (charge, slope) = depletion_charge(pParam.k1ox, T3);
+            Qsub0 = CoxWL * charge;
+            T2 = CoxWL * slope;
             dQsub0_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg);
             dQsub0_dVd = -T2 * dVgsteff_dVd;
             dQsub0_dVb = -T2 * (dVfbeff_dVb + dVbseffCV_dVb + dVgsteff_dVb);
@@ -697,10 +687,9 @@ pub(super) fn intrinsic(
                 dTcen_dVg = dTcen_dVb;
             }
             LINK = 1.0e-3 * here.toxp;
-            V3 = pParam.ldeb - Tcen - LINK;
-            V4 = sqrt(V3 * V3 + 4.0 * LINK * pParam.ldeb);
-            Tcen = pParam.ldeb - 0.5 * (V3 + V4);
-            T1 = 0.5 * (1.0 + V3 / V4);
+            let centroid = smooth_drain(pParam.ldeb, Tcen, LINK);
+            Tcen = centroid.effective;
+            T1 = centroid.drain_partial;
             dTcen_dVg *= T1;
             dTcen_dVb *= T1;
             Ccen = epssub / Tcen;
@@ -715,19 +704,10 @@ pub(super) fn intrinsic(
             QovCox = Qac0 / Coxeff;
             dQac0_dVg = CoxWLcen * dVfbeff_dVg + QovCox * dCoxeff_dVg;
             dQac0_dVb = CoxWLcen * dVfbeff_dVb + QovCox * dCoxeff_dVb;
-            T0 = 0.5 * pParam.k1ox;
             T3 = Vgs_eff - Vfbeff - VbseffCV - Vgsteff;
-            if pParam.k1ox == 0.0 {
-                T1 = 0.0;
-                T2 = 0.0;
-            } else if T3 < 0.0 {
-                T1 = T0 + T3 / pParam.k1ox;
-                T2 = CoxWLcen;
-            } else {
-                T1 = sqrt(T0 * T0 + T3);
-                T2 = CoxWLcen * T0 / T1;
-            }
-            Qsub0 = CoxWLcen * pParam.k1ox * (T1 - T0);
+            let (charge, slope) = depletion_charge(pParam.k1ox, T3);
+            Qsub0 = CoxWLcen * charge;
+            T2 = CoxWLcen * slope;
             QovCox = Qsub0 / Coxeff;
             dQsub0_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg) + QovCox * dCoxeff_dVg;
             dQsub0_dVd = -T2 * dVgsteff_dVd;
@@ -745,8 +725,8 @@ pub(super) fn intrinsic(
             T0 = Vgsteff - DeltaPhi - 0.001;
             dT0_dVg = 1.0 - dDeltaPhi_dVg;
             T1 = sqrt(T0 * T0 + Vgsteff * 0.004);
-            VgDP = 0.5 * (T0 + T1);
-            dVgDP_dVg = 0.5 * (dT0_dVg + (T0 * dT0_dVg + 0.002) / T1);
+            VgDP = positive_half_sum(T0, T1, 0.001 * Vgsteff);
+            dVgDP_dVg = dT0_dVg.mul_add(VgDP, 0.001) / T1;
             Tox += Tox;
             T0 = (Vgsteff + here.vtfbphi2) / Tox;
             tmp = exp(model.bdos * 0.7 * log(T0));

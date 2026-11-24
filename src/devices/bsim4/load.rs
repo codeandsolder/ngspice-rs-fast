@@ -7,16 +7,6 @@
 //! companions, and ordered stamping are distinct operations. C line1000
 //! (small-signal initialization) is represented by an absent companion.
 //! The port uses the reference NOBYPASS / NEWCONV configuration.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
-#![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 #![expect(
     non_snake_case,
     reason = "preserves upstream C identifiers for equation-by-equation comparison"
@@ -117,6 +107,47 @@ fn smooth_drain(saturation: f64, drain: f64, delta: f64) -> DrainSmoothing {
     }
 }
 
+/// Smaller physical saturation root of a*y²/2 - b*y + c = 0.
+struct SaturationRoot {
+    value: f64,
+    discriminant_root: f64,
+}
+
+impl SaturationRoot {
+    fn new(a: f64, b: f64, c: f64) -> Self {
+        let discriminant_root = (-2. * a).mul_add(c, b * b).sqrt();
+        Self {
+            value: 2. * c / (b + discriminant_root),
+            discriminant_root,
+        }
+    }
+
+    fn derivative(&self, da: f64, db: f64, dc: f64) -> f64 {
+        let y = self.value;
+        (0.5 * y * y).mul_add(da, (-y).mul_add(db, dc)) / self.discriminant_root
+    }
+}
+
+/// Normalized depletion charge and its differential capacitance.
+/// The negative-potential continuation is linear. Rationalization makes
+/// the positive branch continuous down to the representable zero limit.
+fn depletion_charge(k1: f64, increment: f64) -> (f64, f64) {
+    if k1 == 0. {
+        return (0., 0.);
+    }
+    if increment < 0. {
+        return (increment, 1.);
+    }
+    let base = 0.5 * k1;
+    let root = base.mul_add(base, increment).sqrt();
+    let difference = if base > 0. {
+        increment / (root + base)
+    } else {
+        root - base
+    };
+    (k1 * difference, base / root)
+}
+
 /// `BSIM4polyDepletion`: the poly-gate depletion effective gate voltage and
 /// its gate derivative, `(Vgs_eff, dVgs_eff_dVg)`.
 pub(super) fn BSIM4polyDepletion(
@@ -130,13 +161,16 @@ pub(super) fn BSIM4polyDepletion(
     if (ngate > 1.0e18) && (ngate < 1.0e25) && (Vgs > phi) && (epsgate != 0.0) {
         let T1 = 1.0e6 * CHARGE * epsgate * ngate / (coxe * coxe);
         let T8 = Vgs - phi;
-        let T4 = sqrt(1.0 + 2.0 * T8 / T1);
+        let T4 = (2.0_f64.mul_add(T8 / T1, 1.0)).sqrt();
         let T2 = 2.0 * T8 / (T4 + 1.0);
         let T3 = 0.5 * T2 * T2 / T1; // Vpoly
-        let T7 = 1.12 - T3 - 0.05;
-        let T6 = sqrt(T7 * T7 + 0.224);
-        let T5 = 1.12 - 0.5 * (T7 + T6);
-        (Vgs - T5, 1.0 - (0.5 - 0.5 / T4) * (1.0 + T7 / T6))
+        let T7 = 1.07 - T3;
+        let T6 = T7.mul_add(T7, 0.224).sqrt();
+        // Rationalized band-bending drop. The original difference
+        // 1.12 - (T7+T6)/2 loses the entire drop near the onset of depletion.
+        let T5 = 2.24 * T3 / (2.24 - T7 + T6);
+        let slope = (-(0.5 - 0.5 / T4)).mul_add(1.0 + T7 / T6, 1.0);
+        (Vgs - T5, slope)
     } else {
         (Vgs, 1.0)
     }
@@ -180,11 +214,11 @@ mod tests {
 
     #[test]
     fn poly_depletion_matches_hand_evaluation() {
-        // NGATE = 2e19 cm^-3 gives a 58 mV poly drop at Vgs - phi = 0.6 V;
-        // the values are b4ld.c's expressions evaluated in IEEE doubles.
+        // Independent 80-digit evaluation of the physical equations:
+        // a 55.80412553677218 mV drop, not a particular C rounding order.
         let (vgs_eff, d) = BSIM4polyDepletion(0.9, 2e19, 1.03594e-10, 0.0115, 1.5);
-        assert_eq!(vgs_eff, 1.444_195_874_463_227_7);
-        assert_eq!(d, 0.830_890_287_421_742_1);
+        assert!((vgs_eff - 1.444_195_874_463_227_8).abs() <= 2. * f64::EPSILON);
+        assert!((d - 0.830_890_287_421_742_1).abs() <= 2. * f64::EPSILON);
     }
 
     #[test]

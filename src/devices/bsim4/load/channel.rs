@@ -39,7 +39,7 @@
 use super::bias::LoadBias;
 use super::{
     BSIM4polyDepletion, Charge_q, DEXP, EPS0, EPSSI, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP,
-    MIN_EXP, MM, Model, SizeParam, exp, log, smooth_drain, sqrt,
+    MIN_EXP, MM, Model, SaturationRoot, SizeParam, exp, log, smooth_drain, sqrt,
 };
 
 /// Body potential, threshold, effective gate bias and their independent derivatives.
@@ -1001,10 +1001,11 @@ pub(super) fn transport(
         T8 = Abulk * T9;
         T7 = Vgst2Vtm * T9;
         T6 = Vgst2Vtm * WVCoxRds;
-        T0 = 2.0 * Abulk * (T9 - 1.0 + 1.0 / Lambda);
-        dT0_dVg = 2.0 * (T8 * tmp2 - Abulk * tmp1 + (2.0 * T9 + 1.0 / Lambda - 1.0) * dAbulk_dVg);
+        let inverse_lambda_delta = (1.0 - Lambda) / Lambda;
+        T0 = 2.0 * Abulk * (T9 + inverse_lambda_delta);
+        dT0_dVg = 2.0 * (T8 * tmp2 - Abulk * tmp1 + (2.0 * T9 + inverse_lambda_delta) * dAbulk_dVg);
         dT0_dVb =
-            2.0 * (T8 * (2.0 / Abulk * dAbulk_dVb + tmp3) + (1.0 / Lambda - 1.0) * dAbulk_dVb);
+            2.0 * (T8 * (2.0 / Abulk * dAbulk_dVb + tmp3) + inverse_lambda_delta * dAbulk_dVb);
         dT0_dVd = 0.0;
         T1 = Vgst2Vtm * (2.0 / Lambda - 1.0) + Abulk * EsatL + 3.0 * T7;
         dT1_dVg = (2.0 / Lambda - 1.0) - 2.0 * Vgst2Vtm * tmp1
@@ -1017,16 +1018,11 @@ pub(super) fn transport(
         dT2_dVg = EsatL + Vgst2Vtm * dEsatL_dVg + T6 * (4.0 + 2.0 * Vgst2Vtm * tmp2);
         dT2_dVb = Vgst2Vtm * (dEsatL_dVb + 2.0 * T6 * tmp3);
         dT2_dVd = Vgst2Vtm * dEsatL_dVd;
-        T3 = sqrt(T1 * T1 - 2.0 * T0 * T2);
-        Vdsat = (T1 - T3) / T0;
-        dT3_dVg = (T1 * dT1_dVg - 2.0 * (T0 * dT2_dVg + T2 * dT0_dVg)) / T3;
-        dT3_dVd = (T1 * dT1_dVd - 2.0 * (T0 * dT2_dVd + T2 * dT0_dVd)) / T3;
-        dT3_dVb = (T1 * dT1_dVb - 2.0 * (T0 * dT2_dVb + T2 * dT0_dVb)) / T3;
-        dVdsat_dVg =
-            (dT1_dVg - (T1 * dT1_dVg - dT0_dVg * T2 - T0 * dT2_dVg) / T3 - Vdsat * dT0_dVg) / T0;
-        dVdsat_dVb =
-            (dT1_dVb - (T1 * dT1_dVb - dT0_dVb * T2 - T0 * dT2_dVb) / T3 - Vdsat * dT0_dVb) / T0;
-        dVdsat_dVd = (dT1_dVd - (T1 * dT1_dVd - T0 * dT2_dVd) / T3) / T0;
+        let root = SaturationRoot::new(T0, T1, T2);
+        Vdsat = root.value;
+        dVdsat_dVg = root.derivative(dT0_dVg, dT1_dVg, dT2_dVg);
+        dVdsat_dVd = root.derivative(dT0_dVd, dT1_dVd, dT2_dVd);
+        dVdsat_dVb = root.derivative(dT0_dVb, dT1_dVb, dT2_dVb);
     }
     here.vdsat = Vdsat;
     let smoothing = smooth_drain(Vdsat, Vds, pParam.delta);

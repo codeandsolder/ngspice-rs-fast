@@ -506,3 +506,94 @@ fn smoothed_drain_preserves_small_signal_and_saturation_limits() {
         assert!((p.drain_partial - dd).abs() < 2e-8 * dd.abs() + ed * 0.1 + 2e-10);
     }
 }
+
+#[test]
+fn intrinsic_physics_preserves_orientation_common_mode_and_low_drain_limit() {
+    for polarity in [-1, 1] {
+        for cap in 0..=2 {
+            let fixture = PhysicalFixture::new(polarity, cap, 0, 0.5);
+            let pol = f64::from(polarity);
+            let forward = [0.9 * pol, 0.3 * pol, 0., -0.2 * pol];
+            let a = fixture.evaluate(forward);
+            let mut reversed = forward;
+            reversed.swap(1, 2);
+            let b = fixture.evaluate(reversed);
+            let common = fixture.evaluate(forward.map(|v| v + 0.125));
+            assert!((a.current + b.current).abs() < 1e-13 * a.current.abs() + 1e-18);
+            assert!((a.current - common.current).abs() < 1e-13 * a.current.abs() + 1e-18);
+            let swap = [0, 2, 1, 3];
+            for i in 0..4 {
+                let q = a.charge[i];
+                assert!((q - b.charge[swap[i]]).abs() < 1e-13 * q.abs() + 1e-28);
+                assert!((q - common.charge[i]).abs() < 1e-13 * q.abs() + 1e-28);
+                assert!(
+                    (a.current_gradient[i] + b.current_gradient[swap[i]]).abs()
+                        < 1e-12 * a.current_gradient[i].abs() + 1e-18
+                );
+                for j in 0..4 {
+                    let c = a.capacitance[i][j];
+                    assert!((c - b.capacitance[swap[i]][swap[j]]).abs() < 1e-12 * c.abs() + 1e-28);
+                    assert!((c - common.capacitance[i][j]).abs() < 1e-12 * c.abs() + 1e-28);
+                }
+            }
+            assert!(a.capacitance[0][0] > 0.);
+            let zero = fixture.evaluate([0.9 * pol, 0., 0., -0.2 * pol]);
+            assert_eq!(zero.current, 0.);
+            assert!(zero.current_gradient[1] > 0.);
+            assert_eq!(zero.current_gradient[0], 0.);
+            assert_eq!(zero.current_gradient[3], 0.);
+            for drain in [1e-8, 1e-12, 1e-16, 1e-18] {
+                let p = fixture.evaluate([0.9 * pol, drain * pol, 0., -0.2 * pol]);
+                let conductance = p.current / (drain * pol);
+                assert!(
+                    (conductance - zero.current_gradient[1]).abs()
+                        < 1e-5 * zero.current_gradient[1],
+                    "cap={cap} polarity={polarity} Vds={drain:e}: {conductance:e} vs {:e}",
+                    zero.current_gradient[1]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn saturation_quadratic_has_regular_linear_limit() {
+    for a in [0., 1e-20, 1e-12, 0.1, -0.1] {
+        let b = 1_f64;
+        let c = 0.125_f64;
+        let root = super::SaturationRoot::new(a, b, c);
+        let y = root.value;
+        assert!((0.5 * a * y * y - b * y + c).abs() < 4. * f64::EPSILON);
+        if a.abs() < 1e-15 {
+            assert!((y - c / b).abs() < 4. * f64::EPSILON);
+        }
+        let h = 1e-5;
+        let samples = [-h, h, -h * 0.5, h * 0.5];
+        for (da, db, dc) in [(1_f64, 0_f64, 0_f64), (0., 1., 0.), (0., 0., 1.)] {
+            let (expected, error) = richardson(
+                samples.map(|d| {
+                    super::SaturationRoot::new(da.mul_add(d, a), db.mul_add(d, b), dc.mul_add(d, c))
+                        .value
+                }),
+                h,
+            );
+            let derivative = root.derivative(da, db, dc);
+            assert!((derivative - expected).abs() < 1e-9 * expected.abs() + error * 0.1 + 1e-12);
+        }
+    }
+}
+
+#[test]
+fn depletion_charge_preserves_tiny_positive_charge_and_continuation() {
+    let k1 = 0.4;
+    for increment in [1e-3_f64, 1e-9, 1e-15, 1e-21, 1e-30] {
+        let (charge, slope) = super::depletion_charge(k1, increment);
+        assert!(charge > 0.);
+        let difference = charge / k1;
+        assert!((difference * (k1 + difference) - increment).abs() < 8. * f64::EPSILON * increment);
+        assert!(slope > 0. && slope <= 1.);
+    }
+    assert_eq!(super::depletion_charge(k1, 0.), (0., 1.));
+    assert_eq!(super::depletion_charge(k1, -1e-30), (-1e-30, 1.));
+    assert_eq!(super::depletion_charge(0., 1e-3), (0., 0.));
+}
