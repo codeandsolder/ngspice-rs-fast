@@ -45,6 +45,38 @@ cancellation or intermediate range loss.
   overlap-capacitance, oxide-thickness and body coefficient updates
   use fused operations where subtraction exposes rounding error.
 
+## Ordered source/drain junction preparation
+
+The source and drain junction limiter calculations share one pure
+side-input preparation kernel. Side-specific saturation-current densities,
+effective area/perimeter, gate-edge width, finger count, emission voltage,
+breakdown voltage/coefficient and forward/reverse limits are passed
+explicitly. A side with zero effective area **and** perimeter has zero
+saturation current, even when its gate-edge term alone would be nonzero.
+A side with nonpositive or nonfinite saturation does not overwrite any
+previous limiter fields.
+
+The C diode modes deliberately write different subsets of fields:
+mode 0 sets only the breakdown exponential; mode 1 sets only forward
+voltage/current; mode 2 sets breakdown, forward voltage/current/slope,
+and reverse voltage/current/slope. An unsupported mode emits its
+original warning only when saturation is positive. Mode 2 clamps a
+reverse threshold ratio strictly below 1 to 10 and produces the exact
+source or drain warning text. The model and instance are never
+mutated by the shared evaluator: its results are committed in C order,
+**source first, drain second**, including all warnings. Physical side
+asymmetry and prior conditioned diode-limit numerics are retained.
+Old C-style scratch assignments without subsequent reads are removed,
+not reintroduced as adapter state.
+
+Bitwise differential tests against the pre-extraction source/drain
+calculation exercise all diode modes, zero/negative/NaN geometry,
+one-ULP exponent thresholds, reverse threshold crossings, different
+finger counts and source/drain density asymmetry. The public
+prepared-model API tests warning order, side inactivity, polarities
+and temperature bins; existing C-reference setup and device suites
+continue to enforce the physical model outcomes.
+
 ## IEEE and C parity
 
 No change to cache keys, parameter-set ordering, version dispatch,
