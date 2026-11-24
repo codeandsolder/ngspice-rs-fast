@@ -549,21 +549,33 @@ impl ModelWeights {
     fn interpolate(self, coefficients: [f64; 4]) -> f64 {
         let [base, l, w, cross] = coefficients;
         let [_, inverse_l, inverse_w, inverse_lw] = self.0;
+        // Unset bin corrections are the overwhelmingly common case. When
+        // the inverse weights are finite, their zero products cannot alter
+        // any finite nonzero base, even with negative signed-zero inputs.
+        // Zero bases and nonfinite weights still use the full ordered IEEE
+        // path, preserving signed zero and 0 * infinity = NaN exactly.
+        if l == 0.
+            && w == 0.
+            && cross == 0.
+            && base != 0.
+            && base.is_finite()
+            && inverse_l.is_finite()
+            && inverse_w.is_finite()
+            && inverse_lw.is_finite()
+        {
+            return base;
+        }
         let lt = l * inverse_l;
         let wt = w * inverse_w;
         let lwt = cross * inverse_lw;
         let sum = base + lt + wt + lwt;
-        // A normal, well-conditioned sum is the same result whether or not
-        // all three bin corrections vanish. Let both cases share the fast
-        // path before testing zero corrections; the latter still handles
-        // exact signed-zero and nonfinite propagation without recovery.
-        if sum.is_normal() {
-            let magnitude = base.abs() + lt.abs() + wt.abs() + lwt.abs();
-            if sum.abs() > 0.125 * magnitude {
-                return sum;
-            }
-        }
+        // Most cards leave the length/width/cross terms unset. Returning the
+        // ordered sum also retains signed-zero and nonfinite propagation.
         if l == 0. && w == 0. && cross == 0. {
+            return sum;
+        }
+        let magnitude = base.abs() + lt.abs() + wt.abs() + lwt.abs();
+        if sum.is_normal() && sum.abs() > 0.125 * magnitude {
             sum
         } else {
             self.recover(coefficients, sum)
