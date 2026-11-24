@@ -40,6 +40,7 @@ fn input_for(kind: AnalysisKind) -> AnalysisInput {
         AnalysisKind::Sensitivity => "v ( out )",
         AnalysisKind::TransferFunction => "v ( out ) v1",
         AnalysisKind::Transient => "1u 10u",
+        AnalysisKind::PeriodicSteadyState => "1k 1m out",
         AnalysisKind::Fourier => unreachable!("not a driver"),
     };
     AnalysisInput::with_arguments(kind, text.split_whitespace())
@@ -635,6 +636,7 @@ fn every_analysis_with_an_operating_point_gets_the_deck_tolerances() {
         AnalysisKind::Sensitivity,
         AnalysisKind::TransferFunction,
         AnalysisKind::SParameter,
+        AnalysisKind::PeriodicSteadyState,
     ] {
         let request = c.plan(input_for(kind)).unwrap();
         let newton = &request.dc_settings().newton;

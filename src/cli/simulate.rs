@@ -477,6 +477,7 @@ fn prepare_observations(
                 | crate::primitives::AnalysisKind::DcSweep
                 | crate::primitives::AnalysisKind::Ac
                 | crate::primitives::AnalysisKind::Transient
+                | crate::primitives::AnalysisKind::PeriodicSteadyState
         )
     {
         return Err(SpiceError::not_yet_ported(

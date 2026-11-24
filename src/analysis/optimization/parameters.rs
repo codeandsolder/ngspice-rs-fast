@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use crate::analysis::RunConfig;
 use crate::analysis::sens::{PhysicalParameter, conditioned_derivative};
-use crate::devices::circuit::Circuit;
+use crate::devices::circuit::{CandidateNumericOverride, Circuit};
 use crate::devices::models::ModelContext;
-use crate::devices::sweep::{InstanceTarget, MAX_INSTANCE_OVERRIDES, MAX_RESISTOR_OVERRIDES};
+use crate::devices::sweep::InstanceTarget;
 use crate::netlist::ast::{Netlist, NodeHintValue, ParameterKind};
 use crate::netlist::elaborate::{self, SiteKind};
 use crate::netlist::eval::{
@@ -394,6 +394,55 @@ pub struct CircuitCandidate<'a> {
     prepared: Option<PreparedCandidate>,
 }
 
+/// Prefer the allocation-free two-slot context. On overflow, move
+/// already validated site identities into a sparse worker-local list.
+fn append_numeric_override(
+    fixed: &mut ModelContext,
+    sparse: &mut Option<Vec<CandidateNumericOverride>>,
+    baseline: ModelContext,
+    next: CandidateNumericOverride,
+    capacity: usize,
+) -> SpiceResult<()> {
+    if let Some(values) = sparse {
+        values.push(next);
+        return Ok(());
+    }
+    let updated = match next {
+        CandidateNumericOverride::Resistor(value) => fixed.with_resistor_override(value),
+        CandidateNumericOverride::Instance(value) => fixed.with_instance_override(value),
+    };
+    if let Ok(updated) = updated {
+        *fixed = updated;
+        return Ok(());
+    }
+    let mut values = Vec::new();
+    values.try_reserve(capacity).map_err(|error| {
+        SpiceError::circuit(format!(
+            "cannot allocate candidate numeric overlay: {error}"
+        ))
+    })?;
+    values.extend(
+        fixed
+            .resistor_overrides
+            .iter()
+            .flatten()
+            .copied()
+            .map(CandidateNumericOverride::Resistor),
+    );
+    values.extend(
+        fixed
+            .instance_overrides
+            .iter()
+            .flatten()
+            .copied()
+            .map(CandidateNumericOverride::Instance),
+    );
+    values.push(next);
+    *sparse = Some(values);
+    *fixed = baseline;
+    Ok(())
+}
+
 impl CircuitCandidate<'_> {
     /// The baseline circuit or the current candidate's own finalized circuit.
     #[must_use]
@@ -644,7 +693,7 @@ impl CircuitCandidate<'_> {
         }
         let mut numeric = self.parameters.clone();
         let evaluated = numeric.update(candidate, budget)?;
-        let (prepared, evaluations, roundings) = self.prepare(&numeric, budget)?;
+        let (prepared, overrides, evaluations, roundings) = self.prepare(&numeric, budget)?;
         for change in self.site_updates.drain(..) {
             self.site_raw[change.index] = change.raw;
             self.site_values[change.index] = change.value;
@@ -652,6 +701,7 @@ impl CircuitCandidate<'_> {
         self.last_site_evaluations = evaluations;
         self.last_site_roundings = roundings;
         self.parameters = numeric;
+        self.baseline.set_candidate_overrides(overrides);
         self.baseline.clear_candidate_analysis_state();
         self.prepared = Some(prepared);
         self.values.clear();
@@ -663,14 +713,22 @@ impl CircuitCandidate<'_> {
         &mut self,
         parameters: &CandidateParameters<'_>,
         budget: &mut EvalBudget,
-    ) -> SpiceResult<(PreparedCandidate, usize, usize)> {
+    ) -> SpiceResult<(
+        PreparedCandidate,
+        Vec<CandidateNumericOverride>,
+        usize,
+        usize,
+    )> {
         self.site_updates.clear();
         let mut evaluations = 0;
         let mut roundings = 0;
-        let mut context = self.plan.config.context().model_context();
+        let baseline_context = self.plan.config.context().model_context();
+        let mut fixed_context = baseline_context;
         let mut structural = self.plan.requires_rebuild;
-        let mut resistor_count = 0_usize;
-        let mut instance_count = 0_usize;
+        // Preserve the small fixed-context route with zero heap allocation
+        // when one or two ordinary sites change. Beyond its actual capacity,
+        // promote the exact accumulated sites to an unbounded worker overlay.
+        let mut extra: Option<Vec<CandidateNumericOverride>> = None;
         for (index, (site, &route)) in self.plan.sites.iter().zip(&self.routes).enumerate() {
             let value = if site.inputs.changed_between(&self.parameters, parameters) {
                 evaluations += 1;
@@ -695,43 +753,45 @@ impl CircuitCandidate<'_> {
             if value.to_bits() == site.baseline.to_bits() {
                 continue;
             }
-            match route {
-                NumericRoute::Resistor(target) => {
-                    resistor_count += 1;
-                    if resistor_count > MAX_RESISTOR_OVERRIDES {
-                        structural = true;
-                    } else if !structural {
-                        if let Ok(next) = target
-                            .at_resistance(value)
-                            .and_then(|replacement| context.with_resistor_override(replacement))
-                        {
-                            context = next;
-                        } else {
-                            structural = true;
-                        }
-                    }
-                }
+            if structural {
+                continue;
+            }
+            let selected = match route {
+                NumericRoute::Resistor(target) => target
+                    .at_resistance(value)
+                    .map(CandidateNumericOverride::Resistor),
                 NumericRoute::Instance(target) => {
-                    instance_count += 1;
-                    if instance_count > MAX_INSTANCE_OVERRIDES {
-                        structural = true;
-                    } else if !structural {
-                        if let Ok(next) = target
-                            .at(value)
-                            .and_then(|replacement| context.with_instance_override(replacement))
-                        {
-                            context = next;
-                        } else {
-                            structural = true;
-                        }
-                    }
+                    target.at(value).map(CandidateNumericOverride::Instance)
                 }
-                NumericRoute::Rebuild => structural = true,
+                NumericRoute::Rebuild => {
+                    structural = true;
+                    continue;
+                }
+            };
+            if let Ok(replacement) = selected {
+                append_numeric_override(
+                    &mut fixed_context,
+                    &mut extra,
+                    baseline_context,
+                    replacement,
+                    self.plan.sites.len(),
+                )?;
+            } else {
+                structural = true;
             }
         }
-        if !structural && self.baseline.validate_candidate_context(&context).is_ok() {
-            // The circuit/configuration shape is unchanged, but independent
-            // parameter values must still be visible to downstream objectives.
+        let (context, overrides) = extra.map_or_else(
+            || (fixed_context, Vec::new()),
+            |sparse| (baseline_context, sparse),
+        );
+        if !structural
+            && self
+                .baseline
+                .validate_candidate_overrides(&context, &overrides)
+                .is_ok()
+        {
+            // Keep the verified topology for both small fixed contexts and
+            // arbitrary numeric overlays without full re-elaboration.
             let scope = parameters.resolved_scope(self.plan.root)?;
             return Ok((
                 PreparedCandidate {
@@ -739,6 +799,7 @@ impl CircuitCandidate<'_> {
                     config: self.plan.config.clone().with_parameter_scope(scope),
                     circuit: None,
                 },
+                overrides,
                 evaluations,
                 roundings,
             ));
@@ -762,6 +823,7 @@ impl CircuitCandidate<'_> {
                 config,
                 circuit: Some(circuit),
             },
+            Vec::new(),
             evaluations,
             roundings,
         ))

@@ -48,7 +48,9 @@ pub mod noise;
 pub mod optimization;
 mod ordered_samples;
 mod output_probe;
+mod periodic_orbit;
 mod plan;
+mod pss;
 mod pz;
 pub mod rawfile;
 mod reduction;
@@ -71,6 +73,7 @@ pub use driver::{
 };
 pub use fourier::{FourierAnalysis, FourierWindow, Harmonic};
 pub use measure::{MeasureEvents, MeasureSpan, Measurement};
+pub use periodic_orbit::PeriodicOrbit;
 pub use plan::{AnalysisPlan, IntegrationFamily};
 pub use rawfile::{
     BinaryByteOrder, RawCollectPolicy, RawFile, RawFileReader, RawFileWriter, RawFormat, RawPlot,
