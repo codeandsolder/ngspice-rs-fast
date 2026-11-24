@@ -865,6 +865,45 @@ impl Device for Bsim3 {
         Ok(Some(value * m))
     }
 
+    fn assemble_nonlinear_charge(
+        &self,
+        context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        let model = context.model;
+        let cached = self.ensure(model.temperature, model.nominal_temperature)?;
+        let [d, g, s, b] = [0, 1, 2, 3].map(|k| self.terminals[k]);
+        let dp = self.primes[0].unwrap_or(d);
+        let sp = self.primes[1].unwrap_or(s);
+        let voltage = |node| context.voltage(node);
+        let pol = self.polarity;
+        let point = dc::Bias {
+            vbs: pol * (voltage(b) - voltage(sp)),
+            vgs: pol * (voltage(g) - voltage(sp)),
+            vds: pol * (voltage(dp) - voltage(sp)),
+        };
+        let e = Self::evaluate_at(&cached, point, model.gmin)?;
+        let c = charges::ChargeModel {
+            model: &cached.defaults,
+            temperature: &cached.temperature_model,
+            setup: &cached.setup,
+        }
+        .evaluate(&e, point)?;
+        let q = c.with_overlap(e.mode, point.vgs - point.vbs);
+        let m = cached.setup.multiplier;
+        for (node, charge) in [(g, q.qg), (dp, q.qd), (sp, -(q.qg + q.qb + q.qd))] {
+            context.branch([node, b], pol * m * charge, 0.)?;
+        }
+        for (row, col, value) in terminal_capacitances(&c, e.mode, [g, b, dp, sp]) {
+            if let (Some(r), Some(k)) = (
+                context.unknowns.node_row(row),
+                context.unknowns.node_row(col),
+            ) {
+                context.jacobian.add(r, k, m * value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// `b3acld.c`: the DC conductances in `A` and the `j omega` capacitance
     /// terms in `E`, both at the operating point's bias.
     fn assemble_small_signal(
@@ -900,9 +939,6 @@ impl Device for Bsim3 {
         let m = cached.setup.multiplier;
         let gdr = cached.setup.drain_conductance;
         let gsr = cached.setup.source_conductance;
-        let cap = mode_capacitances(&c, e.mode);
-        let (cgdo, cgso, cgbo) = (c.cgdo, c.cgso, c.cgbo);
-        let (capbd, capbs) = (c.capbd, c.capbs);
 
         // b3acld.c's real terms, identical to `b3ld.c`'s conductance load.
         let ConductanceParts {
@@ -951,38 +987,8 @@ impl Device for Bsim3 {
         // complex assembly applies the `omega` factor (see
         // `LinearContext::scaled_dynamic_sum`). The lone `gdsi`/`Gmbsi` terms
         // are zero without AC NQS, which is refused at evaluation.
-        let xcdgb = cap.cdgb - cgdo;
-        let xcddb = cap.cddb + capbd + cgdo;
-        let xcdsb = cap.cdsb;
-        let xcsgb = -(cap.cggb + cap.cbgb + cap.cdgb + cgso);
-        let xcsdb = -(cap.cgdb + cap.cbdb + cap.cddb);
-        let xcssb = capbs + cgso - (cap.cgsb + cap.cbsb + cap.cdsb);
-        let xcggb = cap.cggb + cgdo + cgso + cgbo;
-        let xcgdb = cap.cgdb - cgdo;
-        let xcgsb = cap.cgsb - cgso;
-        let xcbgb = cap.cbgb - cgbo;
-        let xcbdb = cap.cbdb - capbd;
-        let xcbsb = cap.cbsb - capbs;
-        let dynamic: [(NodeId, NodeId, &[Real]); 16] = [
-            (g, g, &[xcggb]),
-            (b, b, &[-(xcbgb + xcbdb + xcbsb)]),
-            (dp, dp, &[xcddb]),
-            (sp, sp, &[xcssb]),
-            (g, b, &[-(xcggb + xcgdb + xcgsb)]),
-            (g, dp, &[xcgdb]),
-            (g, sp, &[xcgsb]),
-            (b, g, &[xcbgb]),
-            (b, dp, &[xcbdb]),
-            (b, sp, &[xcbsb]),
-            (dp, g, &[xcdgb]),
-            (dp, b, &[-(xcdgb + xcddb + xcdsb)]),
-            (dp, sp, &[xcdsb]),
-            (sp, g, &[xcsgb]),
-            (sp, b, &[-(xcsgb + xcsdb + xcssb)]),
-            (sp, dp, &[xcsdb]),
-        ];
-        for (row, col, terms) in dynamic {
-            context.scaled_dynamic_sum(row, col, terms, m)?;
+        for (row, col, value) in terminal_capacitances(&c, e.mode, [g, b, dp, sp]) {
+            context.scaled_dynamic_sum(row, col, &[value], m)?;
         }
         Ok(())
     }
@@ -1111,6 +1117,48 @@ fn mode_capacitances(c: &charges::ChargeEvaluation, mode: i8) -> CapDerivatives 
             cbsb: c.cbdb,
         }
     }
+}
+
+/// Physical terminal charge derivatives shared by AC and harmonic balance.
+/// The 16 entries retain the original AC stamping order.
+fn terminal_capacitances(
+    c: &charges::ChargeEvaluation,
+    mode: i8,
+    [g, b, dp, sp]: [NodeId; 4],
+) -> [(NodeId, NodeId, Real); 16] {
+    let cap = mode_capacitances(c, mode);
+    let (cgdo, cgso, cgbo) = (c.cgdo, c.cgso, c.cgbo);
+    let (capbd, capbs) = (c.capbd, c.capbs);
+    let xcdgb = cap.cdgb - cgdo;
+    let xcddb = cap.cddb + capbd + cgdo;
+    let xcdsb = cap.cdsb;
+    let xcsgb = -(cap.cggb + cap.cbgb + cap.cdgb + cgso);
+    let xcsdb = -(cap.cgdb + cap.cbdb + cap.cddb);
+    let xcssb = capbs + cgso - (cap.cgsb + cap.cbsb + cap.cdsb);
+    let xcggb = cap.cggb + cgdo + cgso + cgbo;
+    let xcgdb = cap.cgdb - cgdo;
+    let xcgsb = cap.cgsb - cgso;
+    let xcbgb = cap.cbgb - cgbo;
+    let xcbdb = cap.cbdb - capbd;
+    let xcbsb = cap.cbsb - capbs;
+    [
+        (g, g, xcggb),
+        (b, b, -(xcbgb + xcbdb + xcbsb)),
+        (dp, dp, xcddb),
+        (sp, sp, xcssb),
+        (g, b, -(xcggb + xcgdb + xcgsb)),
+        (g, dp, xcgdb),
+        (g, sp, xcgsb),
+        (b, g, xcbgb),
+        (b, dp, xcbdb),
+        (b, sp, xcbsb),
+        (dp, g, xcdgb),
+        (dp, b, -(xcdgb + xcddb + xcdsb)),
+        (dp, sp, xcdsb),
+        (sp, g, xcsgb),
+        (sp, b, -(xcsgb + xcsdb + xcssb)),
+        (sp, dp, xcsdb),
+    ]
 }
 
 /// `b3ld.c` line900 / `b3acld.c`'s mode-selected conductances and substrate

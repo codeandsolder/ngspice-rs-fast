@@ -1536,6 +1536,27 @@ impl Device for Bjt {
             ],
         )
     }
+    fn assemble_nonlinear_charge(
+        &self,
+        context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        let thermal = self.thermal(context.model)?;
+        let bias = self.bias(|node| context.voltage(node));
+        let charges = c_point(&thermal, bias, context.model.gmin)?.charges;
+        let n = self.nodes;
+        let m = self.instance.multiplier;
+        let sign = self.pol * m;
+        context.branch([n.bp, n.ep], sign * charges.qbe, m * charges.capbe)?;
+        context.branch([n.bp, n.cp], sign * charges.qbc, m * charges.capbc)?;
+        context.branch([n.b, n.cp], sign * charges.qbx, m * charges.capbx)?;
+        context.branch(
+            [n.s, n.sc],
+            sign * self.subs * charges.qsub,
+            m * charges.capsub,
+        )?;
+        context.coupling([n.bp, n.ep], [n.bp, n.cp], m * charges.geqcb)
+    }
+
     /// `bjtacld.c` after C's `MODEINITSMSIG` load: the conductances of the
     /// last operating-point load (whose voltages are the solution's, the
     /// final load never limiting) and the capacitances at `vbe`, `vbc`, `vbx`,

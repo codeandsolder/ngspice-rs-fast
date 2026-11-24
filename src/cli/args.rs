@@ -592,6 +592,7 @@ pub(crate) const fn kind_name(kind: Kind) -> &'static str {
         Kind::Fourier => "Fourier",
         Kind::SParameter => "S-parameter",
         Kind::PeriodicSteadyState => "periodic steady state",
+        Kind::HarmonicBalance => "harmonic balance",
     }
 }
 

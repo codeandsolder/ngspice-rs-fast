@@ -41,6 +41,7 @@ pub mod disto;
 pub mod driver;
 pub mod fourier;
 mod frequency;
+pub mod harmonic_balance;
 mod initial;
 mod linear;
 pub mod measure;
