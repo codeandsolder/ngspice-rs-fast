@@ -640,8 +640,14 @@ impl WaveNetwork {
     }
 }
 
+mod static_pi;
+pub use static_pi::coupled_static_rg_pi;
+
 mod prepared;
-pub use prepared::{PreparedWaveStep, WaveBatch};
+pub use prepared::{
+    MnaRhs, MnaTriplet, ModalPortEquations, PhysicalPortEquations, PreparedWaveStep, WaveBatch,
+    WaveMnaStamp,
+};
 
 #[cfg(test)]
 mod tests;

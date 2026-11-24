@@ -6,6 +6,8 @@
 use super::{Trace, WaveNetwork, WaveTrial};
 
 mod events;
+mod terminal;
+pub use terminal::{MnaRhs, MnaTriplet, ModalPortEquations, PhysicalPortEquations, WaveMnaStamp};
 
 #[derive(Debug, Clone)]
 struct Affine {
