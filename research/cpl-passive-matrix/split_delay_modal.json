@@ -1,0 +1,317 @@
+{
+  "scalar_lossy": {
+    "conductors": 1,
+    "first_arrival_lower_bound_seconds": 1.0000000000000001e-07,
+    "elapsed_seconds": 0.1283182706683874,
+    "fits": {
+      "1": {
+        "max_relative_Y_error": 0.9796604844077742,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 0.2687809393564831,
+        "minimum_passivity_eigen": 0.004987537398943448,
+        "maximum_reciprocity_error": 5.244455331419556e-16
+      },
+      "2": {
+        "max_relative_Y_error": 0.48327376735813216,
+        "at_omega": 2075263132.1450553,
+        "p95_relative_Y_error": 0.32219702271537953,
+        "minimum_passivity_eigen": 0.004987537405084841,
+        "maximum_reciprocity_error": 1.2986735690353286e-15
+      },
+      "4": {
+        "max_relative_Y_error": 0.1542918501734492,
+        "at_omega": 132419279.18860427,
+        "p95_relative_Y_error": 0.05568329043907875,
+        "minimum_passivity_eigen": 0.004987537406631826,
+        "maximum_reciprocity_error": 3.203019303148599e-15
+      },
+      "8": {
+        "max_relative_Y_error": 0.030151314406559958,
+        "at_omega": 290679653.7132137,
+        "p95_relative_Y_error": 0.024634436730796707,
+        "minimum_passivity_eigen": 0.004987537407019238,
+        "maximum_reciprocity_error": 4.109217574530222e-15
+      },
+      "16": {
+        "max_relative_Y_error": 0.03962750790340832,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 0.016910984867804468,
+        "minimum_passivity_eigen": 0.004987537407116244,
+        "maximum_reciprocity_error": 1.267608223437983e-14
+      },
+      "32": {
+        "max_relative_Y_error": 0.01891442352258893,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.017050921945754322,
+        "minimum_passivity_eigen": 0.004987537407140419,
+        "maximum_reciprocity_error": 3.128365981761415e-14
+      },
+      "64": {
+        "max_relative_Y_error": 0.018912420024489097,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.0019019300332474144,
+        "minimum_passivity_eigen": 0.0049875374071464695,
+        "maximum_reciprocity_error": 5.4897024014513984e-14
+      },
+      "128": {
+        "max_relative_Y_error": 0.0025262080645644365,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 0.0008870039829234413,
+        "minimum_passivity_eigen": 0.004987537407147996,
+        "maximum_reciprocity_error": 6.250651506816516e-14
+      }
+    }
+  },
+  "scalar_zero_G": {
+    "conductors": 1,
+    "first_arrival_lower_bound_seconds": 1.0000000000000001e-07,
+    "elapsed_seconds": 0.07810071483254433,
+    "fits": {
+      "1": {
+        "max_relative_Y_error": 7.6294078521133715,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 0.4036348620770731,
+        "minimum_passivity_eigen": -5.551115123125783e-17,
+        "maximum_reciprocity_error": 6.488620801626959e-16
+      },
+      "2": {
+        "max_relative_Y_error": 0.828088294673812,
+        "at_omega": 2075263132.1450553,
+        "p95_relative_Y_error": 0.5106504803034634,
+        "minimum_passivity_eigen": 9.37505628684221e-12,
+        "maximum_reciprocity_error": 1.3383082024567487e-15
+      },
+      "4": {
+        "max_relative_Y_error": 0.2339281010520739,
+        "at_omega": 132419279.18860427,
+        "p95_relative_Y_error": 0.083838898711929,
+        "minimum_passivity_eigen": 1.1718737091825915e-11,
+        "maximum_reciprocity_error": 2.6105620222275827e-15
+      },
+      "8": {
+        "max_relative_Y_error": 0.04532730343204266,
+        "at_omega": 290679653.7132137,
+        "p95_relative_Y_error": 0.03032516114304073,
+        "minimum_passivity_eigen": 1.2304712804223072e-11,
+        "maximum_reciprocity_error": 3.869650359822019e-15
+      },
+      "16": {
+        "max_relative_Y_error": 0.07073852268811558,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 0.025167069010520342,
+        "minimum_passivity_eigen": 1.2451178976746746e-11,
+        "maximum_reciprocity_error": 9.203861012355865e-15
+      },
+      "32": {
+        "max_relative_Y_error": 0.02842519006245935,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.026559091212404632,
+        "minimum_passivity_eigen": 1.248773306983253e-11,
+        "maximum_reciprocity_error": 2.2414592334361133e-14
+      },
+      "64": {
+        "max_relative_Y_error": 0.028908912815963445,
+        "at_omega": 2075263132.1450553,
+        "p95_relative_Y_error": 0.002860095385053492,
+        "minimum_passivity_eigen": 1.2496947920936918e-11,
+        "maximum_reciprocity_error": 5.442197131787352e-14
+      },
+      "128": {
+        "max_relative_Y_error": 0.0043550165472492205,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 0.0013680661889896638,
+        "minimum_passivity_eigen": 1.24992238781374e-11,
+        "maximum_reciprocity_error": 7.760886092453952e-14
+      }
+    }
+  },
+  "scalar_lossless": {
+    "conductors": 1,
+    "first_arrival_lower_bound_seconds": 1.0000000000000001e-07,
+    "elapsed_seconds": 0.07253346731886268,
+    "fits": {
+      "1": {
+        "max_relative_Y_error": 4.553266193110135e-12,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 1.3754448493620004e-13,
+        "minimum_passivity_eigen": -1.1368683772161603e-13,
+        "maximum_reciprocity_error": 6.287194625045115e-16
+      },
+      "2": {
+        "max_relative_Y_error": 4.546468018003541e-12,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 1.3740421006696678e-13,
+        "minimum_passivity_eigen": -2.8421709430404007e-13,
+        "maximum_reciprocity_error": 1.3002693117811876e-15
+      },
+      "4": {
+        "max_relative_Y_error": 4.557668202618645e-12,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 1.372207478772568e-13,
+        "minimum_passivity_eigen": -1.1937117960769683e-12,
+        "maximum_reciprocity_error": 2.4129555617664005e-15
+      },
+      "8": {
+        "max_relative_Y_error": 4.611532036565879e-12,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 1.3696458111958034e-13,
+        "minimum_passivity_eigen": -1.1937117960769683e-12,
+        "maximum_reciprocity_error": 3.712382590943231e-15
+      },
+      "16": {
+        "max_relative_Y_error": 4.515143772273717e-12,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 1.3709878160123548e-13,
+        "minimum_passivity_eigen": -4.661160346586257e-12,
+        "maximum_reciprocity_error": 9.57328791307286e-15
+      },
+      "32": {
+        "max_relative_Y_error": 5.079109616663292e-12,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 1.3730550290219153e-13,
+        "minimum_passivity_eigen": -4.718003765447065e-12,
+        "maximum_reciprocity_error": 2.3807828209428546e-14
+      },
+      "64": {
+        "max_relative_Y_error": 4.652653823219651e-12,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 1.4192147147656863e-13,
+        "minimum_passivity_eigen": -8.72546479513403e-12,
+        "maximum_reciprocity_error": 5.0210399578012104e-14
+      },
+      "128": {
+        "max_relative_Y_error": 4.1906629887823504e-12,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 1.434521181199618e-13,
+        "minimum_passivity_eigen": -2.8194335754960775e-11,
+        "maximum_reciprocity_error": 7.956128438129024e-14
+      }
+    }
+  },
+  "noncommuting_three": {
+    "conductors": 3,
+    "first_arrival_lower_bound_seconds": 3.143649285468629e-09,
+    "elapsed_seconds": 0.1170048350468278,
+    "fits": {
+      "1": {
+        "max_relative_Y_error": 15.31862298511759,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 1.178894710121968,
+        "minimum_passivity_eigen": 9.320725451553655e-05,
+        "maximum_reciprocity_error": 3.719180895352624e-15
+      },
+      "2": {
+        "max_relative_Y_error": 0.8175332083406505,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 0.4148229354799057,
+        "minimum_passivity_eigen": 9.239100252370925e-05,
+        "maximum_reciprocity_error": 6.410837961392039e-15
+      },
+      "4": {
+        "max_relative_Y_error": 0.8148192616176088,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 0.15120296906398661,
+        "minimum_passivity_eigen": 0.0003305036594246151,
+        "maximum_reciprocity_error": 1.3888542025726727e-14
+      },
+      "8": {
+        "max_relative_Y_error": 0.38936151414534204,
+        "at_omega": 4555505605.468039,
+        "p95_relative_Y_error": 0.062414040762377054,
+        "minimum_passivity_eigen": 0.0002142259278048932,
+        "maximum_reciprocity_error": 2.716921909092647e-14
+      },
+      "16": {
+        "max_relative_Y_error": 0.021513800643303105,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.002347089835014132,
+        "minimum_passivity_eigen": 0.001160845649228579,
+        "maximum_reciprocity_error": 5.241719674759322e-14
+      },
+      "32": {
+        "max_relative_Y_error": 0.0014058893522099964,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.00047242178272542744,
+        "minimum_passivity_eigen": 0.0011619589603239769,
+        "maximum_reciprocity_error": 1.1393762713532587e-13
+      },
+      "64": {
+        "max_relative_Y_error": 0.0002928732611713561,
+        "at_omega": 6749448574.119251,
+        "p95_relative_Y_error": 0.00011271443147963245,
+        "minimum_passivity_eigen": 0.0011622366041713016,
+        "maximum_reciprocity_error": 2.4325073288104256e-13
+      },
+      "128": {
+        "max_relative_Y_error": 7.198276628196902e-05,
+        "at_omega": 6749448574.119251,
+        "p95_relative_Y_error": 2.7862296845583865e-05,
+        "minimum_passivity_eigen": 0.0011623059724822564,
+        "maximum_reciprocity_error": 4.403005608640131e-13
+      }
+    }
+  },
+  "noncommuting_eight": {
+    "conductors": 8,
+    "first_arrival_lower_bound_seconds": 1.1183281259984254e-09,
+    "elapsed_seconds": 0.711954521946609,
+    "fits": {
+      "1": {
+        "max_relative_Y_error": 1.2139962150069616,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.23441368047018699,
+        "minimum_passivity_eigen": 6.587318194397255e-05,
+        "maximum_reciprocity_error": 3.488490118526913e-15
+      },
+      "2": {
+        "max_relative_Y_error": 1.2126154950126562,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.09372615628102611,
+        "minimum_passivity_eigen": 0.00011064891970189238,
+        "maximum_reciprocity_error": 6.880528387284767e-15
+      },
+      "4": {
+        "max_relative_Y_error": 0.4243787893793751,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.00896359123369359,
+        "minimum_passivity_eigen": 7.369584659391046e-05,
+        "maximum_reciprocity_error": 1.3818412812144018e-14
+      },
+      "8": {
+        "max_relative_Y_error": 0.0037886921382920616,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.001853746560283676,
+        "minimum_passivity_eigen": 0.0008325922814263138,
+        "maximum_reciprocity_error": 2.6639285112095386e-14
+      },
+      "16": {
+        "max_relative_Y_error": 0.0007270065665104571,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.00044397617634487333,
+        "minimum_passivity_eigen": 0.0008383476573309852,
+        "maximum_reciprocity_error": 5.58874868531539e-14
+      },
+      "32": {
+        "max_relative_Y_error": 0.0001716150668194197,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 0.00010983696066199162,
+        "minimum_passivity_eigen": 0.0008397793107172695,
+        "maximum_reciprocity_error": 1.124991728815426e-13
+      },
+      "64": {
+        "max_relative_Y_error": 4.2312555538208186e-05,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 2.738780120234555e-05,
+        "minimum_passivity_eigen": 0.0008401367765304302,
+        "maximum_reciprocity_error": 2.1985446927653408e-13
+      },
+      "128": {
+        "max_relative_Y_error": 1.054180766377182e-05,
+        "at_omega": 10000000000.0,
+        "p95_relative_Y_error": 6.842498924598181e-06,
+        "minimum_passivity_eigen": 0.0008402261150420752,
+        "maximum_reciprocity_error": 4.5041586516573124e-13
+      }
+    }
+  }
+}

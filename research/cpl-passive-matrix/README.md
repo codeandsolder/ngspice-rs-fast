@@ -124,3 +124,82 @@ just increasingly fine pi cells.
 These results are in spatial_causality.json and spatial_rise_time.json.
 The corresponding scripts can be rerun without a SPICE solver or
 time integration assumptions.
+
+## Alternative complete-line substrate: exact LC delays plus passive R/G
+
+A more direct way to avoid both finite-pi-ladder pre-wavefront leakage and
+unstable full-length ABCD exponentials is a power-normalized two-port
+scattering cascade using physical operator splitting.
+
+Write the telegrapher first-order generator as A(s)=A_LC(s)+A_RG,
+where the LC part contains sL/sC and the R/G part contains physical
+static R/G. One symmetric Strang cell of width dx is
+
+    exp[A_LC(s) dx/2]  exp[A_RG dx]  exp[A_LC(s) dx/2].
+
+Its lossless factors are **exact per-mode pure delays**, computed by a
+single SPD modal eigensystem C=S S^T, eig(S^T L S)=Q diag(lambda).
+The voltage/current bases S^-T Q and S Q are power reciprocal, and
+each mode propagates with tau=dx sqrt(lambda). All conductors and
+mutual coefficients are retained, with no frequency-dependent mode
+tracking necessary for LC. The static middle stage is a passive,
+memoryless reciprocal R/G two-port (which can have zero R or G).
+
+A cascade of passive scattering blocks stays passive, while the
+earliest possible transmission must traverse the sum of the exact
+LC-stage mode delays: at least length*min(sqrt(lambda)).
+Thus the model has an **exact front lower bound at every finite cell
+count**, even though attenuation/dispersion are approximated by the
+Strang split. The error in the full generator is second order in dx
+for smooth finite-band excitations; adaptive refinement should be
+driven by frequency-domain and time-domain error checks.
+
+Using power-normalized modal waves makes the scattering matrices
+contractive in ordinary Euclidean norm. The static block is converted
+from its small physical transfer by solving a matrix equation that
+does not require inverses of singular series resistance R, then
+composed with exact cross-port modal delay scattering blocks through
+Redheffer star products. No exponentially growing full-length
+transfer is formed, and no artificial numerical regularization is
+needed for zero R or zero G.
+
+Validated in split_delay_modal.py / split_delay_modal.json over 42
+log-spaced angular frequencies 1e3..1e10 rad/s:
+
+| Cable | Cells | Max relative physical port Y error |
+| --- | ---: | ---: |
+| Lossless scalar | any | approximately 5e-12 near resonances |
+| Noncommuting coupled 3-wire | 32 | 0.141% |
+| Noncommuting coupled 3-wire | 64 | 0.0293% |
+| Noncommuting coupled 3-wire | 128 | 0.00720% |
+| Noncommuting coupled 8-wire | 16 | 0.0727% |
+| Noncommuting coupled 8-wire | 32 | 0.0172% |
+| Noncommuting coupled 8-wire | 64 | 0.00423% |
+
+The exact modal lossless transfer also matched an independent 2N
+matrix exponential for scalar, three-wire and eight-wire SPD LC
+cases to relative error below 1e-11.
+
+In scattering_split.py / scattering_split.json, 1/2/4/8/16-section
+Redheffer cascades matched the independently constructed split
+ABCD transfer to <2e-14 relative error for lossless, zero-G,
+three-wire and eight-wire cases. All checked reciprocal scattering
+matrices had largest eigenvalue of S^H S <=1+7e-16.
+A physically passive DC line with gamma*length=1000, whose full
+transfer would overflow float64, retained **finite scattering**:
+expected input reflection -9/11, computed -0.8181818181818182,
+transmission underflowing to zero as physically expected.
+
+The scripts are research-quality Python and the full exact-delay
+cascade is **not yet a Rust transient backend**: it still needs
+per-port accepted launch histories, mode-wise delay interpolation,
+timestep constraints, static scattering solves and internal-node
+elimination, with MNA rollback transactions. Positive-definite
+L/C is assumed for strictly positive modal delays; singular LC
+limits (pure RC/RL or ideal constraints) require separate treatment.
+Do not label this as complete P/CPL production support.
+
+Additional reproductions:
+
+    uv run --no-project --offline --with numpy --with scipy python split_delay_modal.py
+    uv run --no-project --offline --with numpy --with scipy python scattering_split.py
