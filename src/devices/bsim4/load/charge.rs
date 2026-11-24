@@ -59,6 +59,7 @@ pub(super) struct IntrinsicCharges {
 }
 
 /// Evaluate the intrinsic C-V model and charge-deficit equilibrium.
+#[inline(always)]
 pub(super) fn intrinsic(
     model: &Model,
     here: &mut Instance,
@@ -1021,6 +1022,7 @@ pub(super) struct Companion {
 }
 
 /// Assemble overlap, junction and NQS companions; small-signal initialization returns no stamp.
+#[inline(always)]
 pub(super) fn companion(
     model: &Model,
     here: &mut Instance,

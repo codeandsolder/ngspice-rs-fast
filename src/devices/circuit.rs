@@ -132,6 +132,7 @@ pub struct Circuit {
     /// Devices' verified fixed stamp batches, lent to each bound load
     /// ([`crate::maths::SparseMatrix::lend_fixed`]).
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
+    specialization: Option<(usize, bool)>,
 }
 
 /// Device-local state has meaning only under the layout that produced it.
@@ -1330,6 +1331,11 @@ impl Circuit {
     }
 
     /// Device ordinals in `CKTload` order (card order before `finalize`).
+    /// Report the concrete load order for the specialization experiment.
+    pub fn specialization_inventory(&self) -> Vec<(usize, &'static str, String)> {
+        self.load_order().map(|i| (i, self.devices[i].concrete_type(), self.devices[i].name().to_owned())).collect()
+    }
+
     pub(crate) fn load_order(&self) -> impl Iterator<Item = usize> + '_ {
         let finalized = self.order.len() == self.devices.len();
         let order = if finalized {
@@ -2090,16 +2096,35 @@ impl Circuit {
         mutual: &[Vec<MutualTerm>],
         voltage_source_value: &mut Real,
     ) -> SpiceResult<()> {
+        if replacements.is_empty() && let Some((case, bake)) = self.specialization {
+            if specialization::dispatch(case, bake, self, request, matrix, rhs, trial, mutual, voltage_source_value)? {
+                return Ok(());
+            }
+        }
         for (position, index) in self.load_order().enumerate() {
             let device: &dyn Device = match replacements.iter().find(|(i, _)| *i == index) {
                 Some((_, replacement)) => &**replacement,
                 None => &*self.devices[index],
             };
+            self.stamp_one(position, index, request, matrix, rhs, trial, mutual, voltage_source_value, |context| device.stamp(context))?;
+        }
+        Ok(())
+    }
+
+
+    #[inline(always)]
+    #[expect(clippy::too_many_arguments, reason = "experiment retains the exact load context")]
+    fn stamp_one(
+        &self, position: usize, index: usize, request: &LoadRequest<'_>,
+        matrix: &mut SparseMatrix, rhs: &mut Vector, trial: &mut TrialState,
+        mutual: &[Vec<MutualTerm>], voltage_source_value: &mut Real,
+        stamp: impl FnOnce(&mut StampContext<'_>) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
             let states = request
                 .history
                 .device_of(trial, self.state_rows[index].clone(), index)?;
             matrix.begin_device(position)?;
-            device.stamp(&mut StampContext {
+            stamp(&mut StampContext {
                 matrix: &mut *matrix,
                 rhs: &mut *rhs,
                 unknowns: &self.unknowns,
@@ -2118,9 +2143,22 @@ impl Circuit {
                 forcing: request.forcing,
                 source_factor: request.model_context.source_factor,
                 voltage_source_value: &mut *voltage_source_value,
-            })?;
+            })
+    }
+
+    /// Enable a generated schedule after verifying the circuit inventory.
+    /// This research API is for the embedded benchmark fixtures only.
+    pub fn enable_specialization(&mut self, case: usize, bake: bool, model: &ModelContext) -> SpiceResult<()> {
+        if !specialization::matches(case, self, model)? {
+            return Err(SpiceError::circuit("specialization does not match circuit/model"));
         }
+        self.specialization = Some((case, bake));
         Ok(())
+    }
+
+    /// Emit source from the actual elaborated circuit and prepared models.
+    pub fn emit_specialization(&self, case: usize, model: &ModelContext) -> SpiceResult<String> {
+        specialization::emit(self, case, model)
     }
 
     /// A zeroed MNA matrix for [`Circuit::load`]: bound to the learned element
@@ -3628,3 +3666,5 @@ mod tests {
         assert_eq!(circuit.devices()[1].name(), "a1");
     }
 }
+
+mod specialization;

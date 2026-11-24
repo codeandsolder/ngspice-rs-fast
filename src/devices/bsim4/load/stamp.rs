@@ -31,6 +31,7 @@ use super::{
 };
 
 /// Emit C line900 RHS and matrix contributions without coalescing or reordering.
+#[inline(always)]
 pub(super) fn apply(
     model: &Model,
     here: &Instance,

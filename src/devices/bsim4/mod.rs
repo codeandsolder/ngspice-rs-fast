@@ -37,6 +37,7 @@ mod asks;
 mod check;
 mod cvtest;
 mod device;
+pub(super) use device::Bsim4;
 mod elements;
 pub(super) mod fields;
 mod geo;

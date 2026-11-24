@@ -94,6 +94,7 @@ pub(super) struct Transport {
 }
 
 /// Threshold and effective gate-voltage equations, in the reference orientation.
+#[inline(always)]
 pub(super) fn electrostatics(
     model: &Model,
     here: &mut Instance,
@@ -485,6 +486,7 @@ pub(super) fn electrostatics(
 }
 
 /// Channel mobility, saturation, current, substrate current and series resistances.
+#[inline(always)]
 pub(super) fn transport(
     model: &Model,
     here: &mut Instance,

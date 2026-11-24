@@ -114,6 +114,7 @@ pub(super) fn BSIM4polyDepletion(
 ///
 /// # Errors
 /// `NIintegrate` failures (C returns its error).
+#[inline(always)]
 pub(super) fn load(
     model: &Model,
     here: &mut Instance,

@@ -47,6 +47,7 @@ pub(super) struct LoadBias {
 }
 
 /// Select C's prior state or trial voltage, then limit junctions where enabled.
+#[inline(always)]
 pub(super) fn select(model: &Model, here: &Instance, ckt: &mut dyn LoadCkt) -> LoadBias {
     let mut vses: f64 = 0.0;
     let mut vdes: f64 = 0.0;
@@ -342,6 +343,7 @@ pub(super) fn select(model: &Model, here: &Instance, ckt: &mut dyn LoadCkt) -> L
 }
 
 /// Store limited terminal voltages and report limiting in C order.
+#[inline(always)]
 pub(super) fn commit(here: &Instance, ckt: &mut dyn LoadCkt, bias: &LoadBias) {
     let &LoadBias {
         Check,

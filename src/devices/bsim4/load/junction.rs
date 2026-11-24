@@ -39,6 +39,7 @@ pub(super) struct JunctionBias {
 }
 
 /// Evaluate the four load-owned junction conduction members, in C order.
+#[inline(always)]
 pub(super) fn current(
     model: &Model,
     here: &mut Instance,
@@ -335,6 +336,7 @@ pub(super) fn current(
 }
 
 /// Evaluate depletion charge and capacitance (C's finished label).
+#[inline(always)]
 pub(super) fn charge(
     model: &Model,
     here: &mut Instance,

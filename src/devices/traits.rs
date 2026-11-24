@@ -504,7 +504,9 @@ impl StampContext<'_> {
 ///
 /// [`fmt::Debug`] is a supertrait so that a `Box<dyn Device>` can be printed in
 /// diagnostics and compared in tests.
-pub trait Device: fmt::Debug {
+pub trait Device: fmt::Debug + std::any::Any {
+    /// Concrete device type for circuit specialization experiments.
+    fn concrete_type(&self) -> &'static str { std::any::type_name::<Self>() }
     /// Scalar instance ask (`*ask.c`), evaluated at the point's model context.
     /// Unavailable keywords return `None`; callers report an explicit error.
     /// # Errors

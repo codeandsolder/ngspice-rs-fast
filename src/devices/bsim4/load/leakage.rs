@@ -47,6 +47,7 @@ use super::{
 };
 
 /// Gate-induced leakage, tunneling, finger scaling and thermal-noise auxiliaries.
+#[inline(always)]
 pub(super) fn evaluate(
     model: &Model,
     here: &mut Instance,
