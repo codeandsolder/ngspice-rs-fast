@@ -34,8 +34,7 @@ fn normalized_cholesky(c: &[Real], order: usize, scale: Real) -> SpiceResult<Vec
         for col in 0..=row {
             let mut value = c[row * order + col] / scale;
             for k in 0..col {
-                value = (-lower[row * order + k])
-                    .mul_add(lower[col * order + k], value);
+                value = (-lower[row * order + k]).mul_add(lower[col * order + k], value);
             }
             if row == col {
                 if !value.is_finite() || value <= 0. {
@@ -134,12 +133,12 @@ fn symmetric_eigenvectors(mut a: Vec<Real>, order: usize) -> SpiceResult<(Vec<Re
         }
     }
     if !converged {
-        return Err(super::invalid("LC modal Jacobi decomposition did not converge"));
+        return Err(super::invalid(
+            "LC modal Jacobi decomposition did not converge",
+        ));
     }
     let mut indices: Vec<_> = (0..order).collect();
-    indices.sort_by(|&a_idx, &b_idx| {
-        a[a_idx * order + a_idx].total_cmp(&a[b_idx * order + b_idx])
-    });
+    indices.sort_by(|&a_idx, &b_idx| a[a_idx * order + a_idx].total_cmp(&a[b_idx * order + b_idx]));
     let eigenvalues = indices
         .iter()
         .map(|&col| a[col * order + col] * max)
@@ -168,7 +167,9 @@ impl CoupledLinePlan {
         let cscale = c.iter().fold(0.0_f64, |largest, &v| largest.max(v.abs()));
         let lscale = l.iter().fold(0.0_f64, |largest, &v| largest.max(v.abs()));
         if cscale <= 0. || lscale <= 0. {
-            return Err(super::invalid("LC modal delay requires nonzero inductance and capacitance"));
+            return Err(super::invalid(
+                "LC modal delay requires nonzero inductance and capacitance",
+            ));
         }
         let lower = normalized_cholesky(c, n, cscale)?;
         let mut product = vec![0.0_f64; n * n];
@@ -177,8 +178,7 @@ impl CoupledLinePlan {
             for col in 0..n {
                 let mut value = 0.;
                 for k in 0..n {
-                    value = (l[row * n + k] / lscale)
-                        .mul_add(lower[k * n + col], value);
+                    value = (l[row * n + k] / lscale).mul_add(lower[k * n + col], value);
                 }
                 product[row * n + col] = value;
             }
@@ -217,21 +217,24 @@ impl CoupledLinePlan {
             let (c, ce) = split_power(cscale);
             let physical_lambda = scale_power(a * b * c, ae + be + ce);
             if !physical_lambda.is_finite() || physical_lambda <= 0. {
-                return Err(super::invalid("LC modal eigenvalue cannot produce positive delay"));
+                return Err(super::invalid(
+                    "LC modal eigenvalue cannot produce positive delay",
+                ));
             }
             let speed_inverse = physical_lambda.sqrt();
             let admittance = 1. / speed_inverse;
             let delay = self.length * speed_inverse;
             if !delay.is_finite() || delay <= 0. || !admittance.is_finite() {
-                return Err(super::invalid("LC modal delay/admittance not representable"));
+                return Err(super::invalid(
+                    "LC modal delay/admittance not representable",
+                ));
             }
             modes.characteristic_admittances.push(admittance);
             modes.total_delays.push(delay);
             for row in 0..n {
                 let mut current = 0.;
                 for col in 0..=row {
-                    current = lower[row * n + col]
-                        .mul_add(eigenvectors[col * n + mode], current);
+                    current = lower[row * n + col].mul_add(eigenvectors[col * n + mode], current);
                 }
                 modes.current_basis[row * n + mode] = current * root_cscale;
             }
@@ -343,11 +346,7 @@ mod tests {
                     li += line.l.data()[row * n + k] * modes.current_basis[k * n + mode];
                 }
                 close(cv, modes.current_basis[row * n + mode], 1e-17);
-                close(
-                    li,
-                    lambda * modes.voltage_basis[row * n + mode],
-                    1e-13,
-                );
+                close(li, lambda * modes.voltage_basis[row * n + mode], 1e-13);
             }
         }
         for first in 0..n {
@@ -359,6 +358,103 @@ mod tests {
                 }
                 close(overlap, f64::from(u8::from(first == second)), 5e-12);
             }
+        }
+    }
+
+    #[test]
+    fn large_noncommuting_cables_reconstruct_every_physical_modal_equation() {
+        use crate::maths::Matrix;
+        for order in [3, 8, 16, 32] {
+            let mut left = vec![0.0_f64; order * order];
+            let mut right = vec![0.0_f64; order * order];
+            for row in 0..order {
+                for col in 0..order {
+                    let signed = |x: usize| f64::from(u16::try_from(x % 11).unwrap()) - 5.;
+                    left[row * order + col] = if row == col {
+                        1.
+                    } else {
+                        0.012 * signed(row * 7 + col * 13 + 2)
+                    };
+                    right[row * order + col] = if row == col {
+                        1.3
+                    } else {
+                        0.009 * signed(row * 17 + col * 3 + 4)
+                    };
+                }
+            }
+            let mut inductance = Matrix::zeros(order, order).unwrap();
+            let mut capacitance = Matrix::zeros(order, order).unwrap();
+            for row in 0..order {
+                for col in 0..order {
+                    let mut l = 0.;
+                    let mut c = 0.;
+                    for k in 0..order {
+                        l += left[k * order + row] * left[k * order + col];
+                        c += right[k * order + row] * right[k * order + col];
+                    }
+                    inductance.set(row, col, l * 4e-9).unwrap();
+                    capacitance.set(row, col, c * 2e-12).unwrap();
+                }
+            }
+            let line = CoupledLinePlan::new(
+                0.83,
+                Matrix::zeros(order, order).unwrap(),
+                inductance,
+                Matrix::zeros(order, order).unwrap(),
+                capacitance,
+                CoupledLineLimits::default(),
+            )
+            .unwrap();
+            let modes = line.exact_lc_modes().unwrap();
+            assert_eq!(modes.conductors, order);
+            let mut summed_lambdas = 0.;
+            for (mode, &delay) in modes.total_delays.iter().enumerate() {
+                let lambda = (delay / line.length).powi(2);
+                assert!(lambda.is_finite() && lambda > 0.);
+                summed_lambdas += lambda;
+                for row in 0..order {
+                    let (mut cv, mut li) = (0.0_f64, 0.0_f64);
+                    for k in 0..order {
+                        cv +=
+                            line.c.data()[row * order + k] * modes.voltage_basis[k * order + mode];
+                        li +=
+                            line.l.data()[row * order + k] * modes.current_basis[k * order + mode];
+                    }
+                    let expected_i = modes.current_basis[row * order + mode];
+                    let expected_li = lambda * modes.voltage_basis[row * order + mode];
+                    assert!(
+                        (cv - expected_i).abs() <= 2e-11 * expected_i.abs().max(1e-14),
+                        "C V=I: {order} conductors mode={mode} row={row}, residual={:.17e}",
+                        cv - expected_i
+                    );
+                    assert!(
+                        (li - expected_li).abs() <= 2e-11 * expected_li.abs().max(1e-23),
+                        "L I=lambda V: {order} conductors mode={mode} row={row}, residual={:.17e}",
+                        li - expected_li
+                    );
+                }
+                for other in 0..order {
+                    let mut overlap = 0.;
+                    for row in 0..order {
+                        overlap += modes.voltage_basis[row * order + mode]
+                            * modes.current_basis[row * order + other];
+                    }
+                    assert!(
+                        (overlap - f64::from(u8::from(mode == other))).abs() < 3e-11,
+                        "modal reciprocity: order={order}, ({mode},{other}), overlap={overlap:.17e}"
+                    );
+                }
+            }
+            let mut trace_lc = 0.;
+            for row in 0..order {
+                for col in 0..order {
+                    trace_lc += line.l.data()[row * order + col] * line.c.data()[col * order + row];
+                }
+            }
+            assert!(
+                (trace_lc - summed_lambdas).abs() <= trace_lc.abs() * 5e-11,
+                "sum of modal eigenvalues differs from physical trace(LC): order={order}"
+            );
         }
     }
 
@@ -411,11 +507,7 @@ mod tests {
             .unwrap();
             let modes = line.exact_lc_modes().unwrap();
             close(modes.total_delays[0], 1., 4e-15);
-            close(
-                modes.voltage_basis[0] * modes.current_basis[0],
-                1.,
-                4e-15,
-            );
+            close(modes.voltage_basis[0] * modes.current_basis[0], 1., 4e-15);
         }
     }
 }
