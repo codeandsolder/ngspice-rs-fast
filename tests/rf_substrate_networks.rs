@@ -177,3 +177,170 @@ fn prepared_line_runs_through_real_sp_and_ac_ports() {
         }
     }
 }
+
+#[test]
+fn geometry_matches_independent_scikit_rf_reference() {
+    use ngspice_rs::analysis::rf_network::geometry::{
+        Coax, GroundedCpw, Microstrip, ModeLoss, Substrate,
+    };
+    // scikit-rf 2.2.0, 1 Hz, frequency-invariant dielectric, no dispersion
+    // or losses. CPW is conductor-backed and zero-thickness.
+    for (width, height, thickness, er, z, eps) in [
+        (
+            1e-3,
+            0.8e-3,
+            0.,
+            4.4,
+            63.503268067653146,
+            3.2186839143754926,
+        ),
+        (
+            1e-3,
+            0.8e-3,
+            35e-6,
+            4.4,
+            62.203031339095034,
+            3.1646935207408653,
+        ),
+        (0.2e-3, 1e-3, 0., 9.8, 90.02269432867917, 6.040594353278439),
+        (5e-3, 0.5e-3, 0., 2.2, 20.43921552095505, 2.015990046075876),
+    ] {
+        let cross = Microstrip { width, thickness }
+            .quasi_static(Substrate {
+                height,
+                relative_permittivity: er,
+            })
+            .unwrap();
+        assert!(
+            (cross.impedance / z - 1.).abs() < 2e-8,
+            "{cross:?} expected {z}"
+        );
+        assert!((cross.effective_permittivity / eps - 1.).abs() < 2e-8);
+        let p = cross.prepare(ModeLoss::default()).unwrap().parameters();
+        assert!(((p.inductance / p.capacitance).sqrt() / z - 1.).abs() < 2e-8);
+    }
+    for (width, gap, height, er, z, eps) in [
+        (
+            1e-3,
+            0.2e-3,
+            0.8e-3,
+            4.4,
+            48.93485254446609,
+            2.885529890899531,
+        ),
+        (
+            0.2e-3,
+            0.1e-3,
+            1e-3,
+            9.8,
+            51.33996037546831,
+            5.430740930684419,
+        ),
+        (
+            2e-3,
+            0.1e-3,
+            0.2e-3,
+            3.66,
+            15.401974675626064,
+            3.1183735732951217,
+        ),
+    ] {
+        let cross = GroundedCpw { width, gap }
+            .quasi_static(Substrate {
+                height,
+                relative_permittivity: er,
+            })
+            .unwrap();
+        // scikit-rf uses an approximate elliptic-integral ratio; the AGM
+        // implementation is more accurate, so use the approximation budget.
+        assert!(
+            (cross.impedance / z - 1.).abs() < 5e-6,
+            "{cross:?} expected {z}"
+        );
+        assert!((cross.effective_permittivity / eps - 1.).abs() < 5e-6);
+    }
+    let coax = Coax {
+        inner_radius: 1e-3,
+        shield_inner_radius: 3.5e-3,
+        shield_outer_radius: 4e-3,
+        relative_permittivity: 2.25,
+    };
+    let cross = coax.quasi_static().unwrap();
+    assert!(
+        (cross.impedance - 376.730313668 / std::f64::consts::TAU * 3.5_f64.ln() / 1.5).abs()
+            < 1e-12
+    );
+    assert!((cross.velocity() - 299792458. / 1.5).abs() < 1e-7);
+    let loss = coax.conductor_loss(5.8e7, 20., 0.0039).unwrap();
+    assert!(loss.dc_resistance > 0. && loss.skin > 0.);
+    let invalid = Coax {
+        inner_radius: 4e-3,
+        ..coax
+    };
+    assert!(invalid.quasi_static().is_err());
+}
+
+#[test]
+fn coupled_microstrip_matches_qucs_kirschning_jansen_reference() {
+    use ngspice_rs::analysis::rf_network::geometry::{CoupledMicrostrip, Substrate};
+    // Direct C++ extraction from Qucsator e995f9acc71a8c7319286944e4a1692318b9dd80.
+    for (width, height, gap, er, expected) in [
+        (
+            1e-3,
+            8e-4,
+            2e-4,
+            4.4,
+            [
+                79.975293549611635,
+                42.108690278121792,
+                3.4329014410086169,
+                2.8232237517350418,
+            ],
+        ),
+        (
+            2e-4,
+            1e-3,
+            1e-4,
+            9.8,
+            [
+                133.35851520986853,
+                42.258530582179446,
+                6.2700271220999886,
+                5.425856758714974,
+            ],
+        ),
+        (
+            3e-3,
+            1e-3,
+            1e-3,
+            2.2,
+            [
+                56.406170266792088,
+                44.635320755383042,
+                1.9603410543742061,
+                1.7670952865793828,
+            ],
+        ),
+    ] {
+        let [even, odd] = CoupledMicrostrip { width, gap }
+            .quasi_static(Substrate {
+                height,
+                relative_permittivity: er,
+            })
+            .unwrap();
+        for (actual, expected) in [
+            even.impedance,
+            odd.impedance,
+            even.effective_permittivity,
+            odd.effective_permittivity,
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            assert!(
+                (actual / expected - 1.).abs() < 2e-12,
+                "{actual} != {expected}"
+            );
+        }
+    }
+}

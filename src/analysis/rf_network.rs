@@ -4,6 +4,8 @@ use crate::maths::dense_complex::DenseComplex;
 use crate::primitives::{Complex, SpiceError, SpiceResult};
 use std::f64::consts::TAU;
 
+pub mod geometry;
+
 pub(crate) fn invalid(message: &str) -> SpiceError {
     SpiceError::circuit(format!("prepared RF network: {message}"))
 }
@@ -41,8 +43,9 @@ impl FrequencyBand {
 }
 
 /// SI-unit per-metre coefficients of an independently propagating mode.
-/// The skin term is the positive-real impedance k sqrt(s/(2 pi)); the
-/// dielectric relaxation is a passive Debye term s delta_c/(1+s tau).
+///
+/// The skin term is the positive-real impedance `k sqrt(s/pi)`; the
+/// dielectric relaxation is a passive Debye term `s delta_c/(1+s tau)`.
 #[derive(Debug, Clone, Copy)]
 pub struct ModeParameters {
     /// DC resistance, ohm/m at the reference temperature.
@@ -176,10 +179,10 @@ fn roots_product(z: Complex, y: Complex) -> Complex {
     } else if z.re == 0. && y.re == 0. {
         Complex::imaginary(magnitude)
     } else if z.re >= z.im && y.re >= y.im {
-        let (sin, cos) = (0.5 * (z.phase() + y.phase())).sin_cos();
+        let (sin, cos) = z.phase().midpoint(y.phase()).sin_cos();
         Complex::new(magnitude * cos, magnitude * sin)
     } else {
-        let (sin, cos) = (0.5 * (z.re.atan2(z.im) + y.re.atan2(y.im))).sin_cos();
+        let (sin, cos) = z.re.atan2(z.im).midpoint(y.re.atan2(y.im)).sin_cos();
         Complex::new(magnitude * sin, magnitude * cos)
     }
 }
@@ -226,9 +229,11 @@ fn normalize_pair(a: Complex, b: Complex) -> SpiceResult<(Complex, Complex)> {
     Ok((divide(a), divide(b)))
 }
 
-/// Bounded even/odd modal equations. With currents into both ends:
-/// common_current * (I1+I2) = common_voltage * (V1+V2);
-/// differential_voltage * (V1-V2) = differential_current * (I1-I2).
+/// Bounded even/odd modal equations.
+///
+/// With currents into both ends:
+/// `common_current * (I1+I2) = common_voltage * (V1+V2)`;
+/// `differential_voltage * (V1-V2) = differential_current * (I1-I2)`.
 #[derive(Debug, Clone, Copy)]
 pub struct ModalRelation {
     /// Common-mode current coefficient.
@@ -242,22 +247,23 @@ pub struct ModalRelation {
 }
 
 impl ModalRelation {
-    fn new(z: Complex, y: Complex, length: f64) -> SpiceResult<Self> {
-        let z = scaled(z, length);
-        let y = scaled(y, length);
-        let x = roots_product(z, y);
-        if !z.is_finite() || !y.is_finite() || !x.is_finite() {
+    fn new(series: Complex, shunt: Complex, length: f64) -> SpiceResult<Self> {
+        let series = scaled(series, length);
+        let shunt = scaled(shunt, length);
+        let propagation = roots_product(series, shunt);
+        if !series.is_finite() || !shunt.is_finite() || !propagation.is_finite() {
             return Err(invalid("unrepresentable total line coefficients"));
         }
-        let (c, difference) = exponential_sums(x);
-        let q = exponential_quotient(x, difference);
-        let common_voltage = scaled(y, 0.5) * q;
-        let differential_current = scaled(z, 0.5) * q;
+        let (sum, difference) = exponential_sums(propagation);
+        let quotient = exponential_quotient(propagation, difference);
+        let common_voltage = scaled(shunt, 0.5) * quotient;
+        let differential_current = scaled(series, 0.5) * quotient;
         if !common_voltage.is_finite() || !differential_current.is_finite() {
             return Err(invalid("unrepresentable line relation"));
         }
-        let (common_current, common_voltage) = normalize_pair(c, common_voltage)?;
-        let (differential_voltage, differential_current) = normalize_pair(c, differential_current)?;
+        let (common_current, common_voltage) = normalize_pair(sum, common_voltage)?;
+        let (differential_voltage, differential_current) =
+            normalize_pair(sum, differential_current)?;
         Ok(Self {
             common_current,
             common_voltage,
@@ -288,8 +294,10 @@ impl ModalRelation {
 }
 
 /// A line with independently propagating modes and an orthogonal real
-/// conductor-to-mode transform. Physical voltages and currents use the
-/// same transform, preserving power. General noncommuting RLGC matrices
+/// conductor-to-mode transform.
+///
+/// Physical voltages and currents use the same transform, preserving power.
+/// General noncommuting RLGC matrices
 /// require a different prepared kernel, not an invented modal fit.
 #[derive(Debug, Clone)]
 pub struct PreparedLine {
