@@ -333,7 +333,7 @@ fn independent_complex_mesh_crossover() {
 #[ignore = "opt-in real SPARSE substitution scalar/batch performance"]
 fn real_backward_substitution_crossover() {
     use std::hint::black_box;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use ngspice_rs::maths::linear::SolveBatchWorkspace;
     use ngspice_rs::maths::{SparseLu, SparseMatrix, Vector};
@@ -375,7 +375,7 @@ fn real_backward_substitution_crossover() {
                     .all(|(a, b)| (a - b).abs() < 1e-10)
             );
             for lanes in [1_usize, 4, 32] {
-                let samples = 16_u32;
+                let samples = 128_u32;
                 let mut workspace = Vec::new();
                 let mut batch_workspace = SolveBatchWorkspace::default();
                 let mut batch_out = Vec::new();
@@ -390,7 +390,7 @@ fn real_backward_substitution_crossover() {
                 }));
                 let mut scalar_ns = Vec::new();
                 let mut batch_ns = Vec::new();
-                for _ in 0..3 {
+                for _ in 0..7 {
                     let begin = Instant::now();
                     for _ in 0..samples {
                         for _ in 0..lanes {
@@ -428,9 +428,10 @@ fn real_backward_substitution_crossover() {
                 batch_ns.sort_unstable();
                 println!(
                     "bench=real_backward,shape={shape},n={size},transpose={transposed},rhs={lanes},scalar_ns={},batch_ns={},ratio={:.4}",
-                    scalar_ns[1],
-                    batch_ns[1],
-                    batch_ns[1] as f64 / scalar_ns[1] as f64
+                    scalar_ns[3],
+                    batch_ns[3],
+                    Duration::from_nanos(u64::try_from(batch_ns[3]).unwrap()).as_secs_f64()
+                        / Duration::from_nanos(u64::try_from(scalar_ns[3]).unwrap()).as_secs_f64()
                 );
             }
         }

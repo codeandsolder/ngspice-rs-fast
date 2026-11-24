@@ -401,12 +401,16 @@ impl<V: RealGatherLane> RealGatherRow<V> {
         Self {
             value,
             magnitude_sum,
-            // Each partial magnitude <= final magnitude. Precompute
-            // a conservative bound once per sparse row, not per entry.
+            // All positive magnitude prefixes are <= the final magnitude.
+            // 4n+6 EPS also covers the initial 2 EPS term and local
+            // rounding. The (1+2n EPS) factor bounds the original n rounded
+            // positive error additions even for the largest u32-sized row.
+            // Work is independent of sparse row length; all overflow and
+            // impossible-length cases take the existing raw recovery route.
             error_factor: u32::try_from(upper_count).map_or(f64::INFINITY, |count| {
-                // Two EPS of additional slack covers rounding of the positive
-                // bound itself, without weakening the normalized safety check.
-                f64::from(count).mul_add(4. * f64::EPSILON, 4. * f64::EPSILON)
+                let count_eps = f64::from(count) * f64::EPSILON;
+                let base = f64::from(count).mul_add(4. * f64::EPSILON, 6. * f64::EPSILON);
+                base * count_eps.mul_add(2., 1.)
             }),
             valid,
         }

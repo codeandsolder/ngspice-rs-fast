@@ -475,6 +475,54 @@ transpose solves at 1, 2, 4, 8, 32 and 64 RHS with warm reusable buffers:
 cargo +nightly test --release --lib sparse_rhs_batch_benchmark -- --ignored --nocapture
 ```
 
+### Guarded normalized real backward substitution (#154, #193)
+
+Real SPARSE follows C's normalized backward **row gather** where its
+coefficients and operations are representable. Every RHS retains the raw
+numerator until a complete guarded solve succeeds; unresolved cancellation,
+non-normal multipliers, range failures or non-finite values trigger a raw
+scatter replay of that RHS (independently for SIMD lanes). The guard cannot
+certify global condition number or justify changing physical model outputs.
+
+For each row, let `m[0]` be the magnitude of its initial normalized
+numerator and `m[j]` the cumulative nonnegative magnitude after subtracting
+term `j`. The original per-prefix local error estimate was
+`2*eps*m[0] + 4*eps*sum(m[1..n])`. Every prefix is bounded by the
+final accumulated magnitude, so the conservative
+`(4*n + 6)*eps*(1 + 2*n*eps)*m[n]` also bounds the rounding of
+positive prefix-error sums for every representable row length (through
+`u32::MAX`). The term count comes from the immutable packed row
+slice; zero numerical coefficients may overestimate it safely.
+`RealGatherRow` now computes this factor once per row, rather than
+multiplying and accumulating a separate error estimate for every term.
+The exact normalized coefficient, subtraction order and per-term
+normality masks are unchanged for scalar and four-lane solves.
+Unrepresentably large row lengths take the existing raw path instead
+of truncating their error count. Cancellation checks are deliberately
+conservative, not an attempt to force a C source-current bit pattern.
+
+The focused regression compares the new validity predicate to #154's
+original per-prefix predicate across 2,048 deterministic variable-length
+rows: every accepted new row must be accepted by the original, and the
+pre-fallback normalized numerical result must match bit-for-bit. The four
+strict BSIM4 #154 external-source C oracles (1e-9 relative), nine BSIM4
+device cases, sparse pivot/range/transposed/heterogeneous batch cases and
+committed goldens remain the required acceptance constraints.
+
+Reproduce retained-factor solve performance separately from factorization:
+
+```sh
+cargo +nightly test --release --locked --test solver_workloads_bench \
+  real_backward_substitution_crossover -- --ignored --exact --nocapture
+```
+
+This opt-in test uses a 512-node tridiagonal ladder and a 400-node mesh,
+checks manufactured solutions and 1/4/32-RHS batch equivalence for normal
+and transposed solves, then reports medians of three 16-iteration batches.
+Benchmark interpretation and paired historical data are maintained in
+[the #193 working log](https://app.notion.com/p/422f74be902081c38049d95a05e0f3f7),
+not in this current architecture reference.
+
 ### Symmetric Jacobi validation of coupled inductances (#148)
 
 The dense fallback checks the signed spectrum of a normalized mutual
