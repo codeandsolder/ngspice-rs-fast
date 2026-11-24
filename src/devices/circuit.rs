@@ -2078,6 +2078,73 @@ impl Circuit {
         Ok(())
     }
 
+    /// Append an already budgeted device graph without synthesizing a netlist.
+    /// Node ownership is assigned once, to the first device in the graph.
+    pub(super) fn add_prepared_devices(
+        &mut self,
+        size: ElaborationSize,
+        build: impl FnOnce(&mut crate::primitives::NodeAppend<'_>) -> SpiceResult<Vec<Box<dyn Device>>>,
+    ) -> SpiceResult<()> {
+        let existing = self.elaboration_size()?;
+        self.elaboration_limits
+            .check(existing.checked_add(size, None)?, None)?;
+        let mut seen: BTreeSet<_> = self
+            .devices
+            .iter()
+            .map(|d| d.name().to_lowercase())
+            .collect();
+        let devices = &mut self.devices;
+        let staged = self.nodes.transaction(|nodes| {
+            let mark = nodes.len();
+            let generated = build(nodes)?;
+            let mut staged = Vec::new();
+            reserve(&mut staged, generated.len(), None)?;
+            for device in generated {
+                if !seen.insert(device.name().to_lowercase()) {
+                    return Err(SpiceError::circuit(format!(
+                        "duplicate instance name '{}'",
+                        device.name()
+                    )));
+                }
+                if device
+                    .terminals()
+                    .iter()
+                    .any(|&id| nodes.node(id).is_none())
+                {
+                    return Err(SpiceError::circuit(
+                        "prepared device refers to an unknown node",
+                    ));
+                }
+                staged.push(ElaboratedDevice {
+                    device,
+                    origin: DeviceOrigin::default(),
+                });
+            }
+            let actual = ElaborationSize::new(
+                staged.len(),
+                nodes.len() - mark,
+                Self::declared_state_slots(&staged, None)?,
+            );
+            if actual != size {
+                return Err(SpiceError::circuit(
+                    "prepared graph differs from its elaboration budget",
+                ));
+            }
+            if let Some(first) = staged.first_mut() {
+                first.origin.internal_nodes = nodes.nodes()[mark..]
+                    .iter()
+                    .filter(|node| node.kind == NodeKind::Internal)
+                    .map(|node| node.id)
+                    .collect();
+            }
+            reserve(devices, staged.len(), None)?;
+            Ok(staged)
+        })?;
+        self.invalidate_topology();
+        self.devices.extend(staged);
+        Ok(())
+    }
+
     /// Branch rows by device ordinal, after finalization.
     pub fn branch_rows(&self, index: usize) -> Option<std::ops::Range<usize>> {
         self.bindings.identity.as_ref()?;
