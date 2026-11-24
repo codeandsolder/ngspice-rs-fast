@@ -632,6 +632,14 @@ impl Device for Behavioural {
         )
     }
 
+    // The retained ASRCprev_value is an algebraic observation, not a charge.
+    fn assemble_nonlinear_charge(
+        &self,
+        _context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+
     /// The bias-point Jacobian (`ASRCacLoad`): real, frequency independent.
     fn assemble_small_signal(
         &self,

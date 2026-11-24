@@ -288,3 +288,252 @@ fn nonlinear_solver_reports_budget_and_nonconvergence() {
         );
     }
 }
+
+use ngspice_rs::analysis::harmonic_balance::{BalanceSolution, solve_circuit};
+use ngspice_rs::analysis::{AnalysisInput, RunConfig};
+use ngspice_rs::devices::Circuit;
+use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+use ngspice_rs::primitives::{AnalysisKind, Complex};
+use std::path::Path;
+
+fn circuit(body: &str) -> (Circuit, RunConfig) {
+    let deck = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("hb.cir"),
+            &format!("HB circuit\n{body}\n.end\n"),
+        ))
+        .unwrap();
+    let config = RunConfig::from_netlist(&deck).unwrap();
+    (config.circuit(&deck).unwrap(), config)
+}
+
+fn physical_run(
+    circuit: &mut Circuit,
+    config: &RunConfig,
+    lattice: &HarmonicLattice,
+) -> BalanceSolution {
+    circuit.finalize().unwrap();
+    let tolerances = vec![1e-11; circuit.unknown_count()];
+    solve_circuit(
+        circuit,
+        config.context().model_context(),
+        lattice,
+        None,
+        &tolerances,
+        BalanceLimits::default(),
+    )
+    .unwrap()
+}
+
+fn node_phasors(
+    circuit: &Circuit,
+    lattice: &HarmonicLattice,
+    solution: &BalanceSolution,
+    node: &str,
+) -> Vec<Complex> {
+    let row = circuit
+        .unknowns()
+        .node_row(circuit.nodes().get(node).unwrap())
+        .unwrap();
+    let m = lattice.coordinates();
+    lattice
+        .phasors(&solution.coefficients.as_slice()[row * m..(row + 1) * m])
+        .unwrap()
+}
+
+#[test]
+fn prepared_linear_rc_and_rlc_solve_with_physical_source_and_flux() {
+    for (body, inductance) in [
+        ("v1 in 0 sin(0 1 100k)\nr1 in out 1k\nc1 out 0 1n", 0.),
+        (
+            "v1 in 0 sin(0 1 100k)\nr1 in mid 1k\nl1 mid out 1m\nc1 out 0 1n",
+            1e-3,
+        ),
+    ] {
+        let lattice = lattice(&[ToneAxis {
+            frequency: 100e3,
+            order: 3,
+        }]);
+        let (mut circuit, config) = circuit(body);
+        let solution = physical_run(&mut circuit, &config, &lattice);
+        let spectrum = node_phasors(&circuit, &lattice, &solution, "out");
+        let omega = std::f64::consts::TAU * 100e3;
+        let expected = Complex::new(0., -1.)
+            / Complex::new(1. - omega * omega * inductance * 1e-9, omega * 1e-6);
+        assert!((spectrum[1] - expected).magnitude() < 1e-9, "{spectrum:?}");
+        assert!(spectrum[0].magnitude() < 1e-9);
+        assert!(spectrum[2..].iter().all(|z| z.magnitude() < 1e-9));
+        assert_eq!(solution.stats.corrections, 1);
+    }
+}
+
+#[test]
+fn diode_rectifier_generates_dc_and_harmonics_with_physical_charge() {
+    let lattice = lattice(&[ToneAxis {
+        frequency: 100e3,
+        order: 7,
+    }]);
+    let (mut circuit, config) = circuit(
+        "v1 in 0 sin(0 0.8 100k)\nr1 in out 1k\nd1 out 0 d\n.model d d(is=1e-12 cjo=20p tt=5n)",
+    );
+    let solution = physical_run(&mut circuit, &config, &lattice);
+    let spectrum = node_phasors(&circuit, &lattice, &solution, "out");
+    assert!(spectrum[0].re < -0.02, "{spectrum:?}");
+    assert!(spectrum[2].magnitude() > 0.02, "{spectrum:?}");
+    assert!(solution.residual.max_abs() < 1e-11);
+    // Compare to the existing transient solver only as an independent
+    // verification path, never as an initialization/fallback of HB.
+    let plan = config
+        .plan(AnalysisInput::with_arguments(
+            AnalysisKind::Transient,
+            ["50n", "100u", "90u"],
+        ))
+        .unwrap();
+    let transient = plan.run(&mut circuit, &config.context()).unwrap();
+    let times: Vec<_> = transient
+        .column("time")
+        .unwrap()
+        .iter()
+        .map(|z| z.re)
+        .collect();
+    let values: Vec<_> = transient
+        .column("v(out)")
+        .unwrap()
+        .iter()
+        .map(|z| z.re)
+        .collect();
+    let samples = 2000u32;
+    let mut coeff = Complex::ZERO;
+    let mut mean = 0.;
+    let mut cursor = 0usize;
+    for index in 0..samples {
+        let t = 90e-6 + (f64::from(index) + 0.5) * 10e-6 / f64::from(samples);
+        while times[cursor + 1] < t {
+            cursor += 1;
+        }
+        let ratio = (t - times[cursor]) / (times[cursor + 1] - times[cursor]);
+        let x = (values[cursor + 1] - values[cursor]).mul_add(ratio, values[cursor]);
+        mean += x / f64::from(samples);
+        let (sin, cos) = (std::f64::consts::TAU * 100e3 * t).sin_cos();
+        coeff = coeff + Complex::new(cos, -sin) * Complex::real(2. * x / f64::from(samples));
+    }
+    assert!(
+        (spectrum[0].re - mean).abs() < 0.003,
+        "{} vs {mean}",
+        spectrum[0].re
+    );
+    assert!(
+        (spectrum[1] - coeff).magnitude() < 0.003,
+        "{:?} vs {coeff:?}",
+        spectrum[1]
+    );
+}
+
+#[test]
+fn nonlinear_two_tone_diode_has_mixing_products() {
+    let lattice = lattice(&[
+        ToneAxis {
+            frequency: 1e6,
+            order: 2,
+        },
+        ToneAxis {
+            frequency: 1.013e6,
+            order: 2,
+        },
+    ]);
+    let (mut circuit, config) = circuit(
+        "v1 in 0 sin(0.3 0.18 1meg)\nv2 drive in sin(0 0.15 1.013meg)\nr1 drive out 1k\nd1 out 0 d\n.model d d(is=1e-12 cjo=10p)",
+    );
+    let solution = physical_run(&mut circuit, &config, &lattice);
+    let spectrum = node_phasors(&circuit, &lattice, &solution, "out");
+    for frequency in [13e3, 2e6 - 1.013e6, 2. * 1.013e6 - 1e6] {
+        let index = lattice.locate(frequency).unwrap() + 1;
+        assert!(
+            spectrum[index].magnitude() > 1e-4,
+            "{frequency}: {:?}",
+            spectrum[index]
+        );
+    }
+    assert!(solution.residual.max_abs() < 1e-11);
+}
+
+#[test]
+fn physical_hb_refuses_unbound_or_nonperiodic_sources() {
+    for source in [
+        "sin(0 1 200k)",
+        "sin(0 1 100k 0 1k)",
+        "pulse(0 1 0 1n 1n 1u 2u)",
+    ] {
+        let lattice = lattice(&[ToneAxis {
+            frequency: 100e3,
+            order: 1,
+        }]);
+        let (mut circuit, config) = circuit(&format!("v1 in 0 {source}\nr1 in 0 1k"));
+        circuit.finalize().unwrap();
+        let tolerances = vec![1e-11; circuit.unknown_count()];
+        assert!(
+            solve_circuit(
+                &mut circuit,
+                config.context().model_context(),
+                &lattice,
+                None,
+                &tolerances,
+                BalanceLimits::default()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn deck_hb_plan_emits_frequency_indexed_complex_mna_rows() {
+    let deck = Parser::new().parse_deck(&parse_deck_text(
+        Path::new("hb-deck.cir"),
+        "HB deck\nv1 in 0 sin(0 1 100k)\nr1 in out 1k\nc1 out 0 1n\n.hb 100k 3 oversample=4 abstol=1e-11\n.end\n"
+    )).unwrap();
+    let config = RunConfig::from_netlist(&deck).unwrap();
+    let plans = config.plans_for(&deck.analyses).unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].kind(), AnalysisKind::HarmonicBalance);
+    let mut circuit = config.circuit(&deck).unwrap();
+    let plot = plans[0].run(&mut circuit, &config.context()).unwrap();
+    assert_eq!(plot.point_count(), 4);
+    assert!((plot.value("frequency", 1).unwrap().re - 100e3).abs() < 1e-10);
+    let expected = Complex::new(0., -1.) / Complex::new(1., std::f64::consts::TAU * 0.1);
+    assert!((plot.value("v(out)", 1).unwrap() - expected).magnitude() < 1e-9);
+}
+
+#[test]
+fn memoryless_behavioural_amplifier_compresses_and_generates_third_harmonic() {
+    let lattice = lattice(&[ToneAxis {
+        frequency: 100e3,
+        order: 5,
+    }]);
+    let (mut circuit, config) =
+        circuit("v1 in 0 sin(0 0.5 100k)\nb1 out 0 v=2*v(in)-v(in)^3\nr1 out 0 1k");
+    let solution = physical_run(&mut circuit, &config, &lattice);
+    let spectrum = node_phasors(&circuit, &lattice, &solution, "out");
+    assert!((spectrum[1].im + 0.90625).abs() < 1e-9, "{spectrum:?}");
+    assert!((spectrum[3].im + 0.03125).abs() < 1e-9, "{spectrum:?}");
+    assert!(spectrum[0].magnitude() < 1e-9);
+}
+
+#[test]
+fn bjt_and_jfet_use_signed_physical_charge_at_every_phase() {
+    for body in [
+        "vcc rail 0 5\nv1 in 0 sin(0.65 0.01 100k)\nr1 rail out 2k\nq1 out in 0 q\n.model q npn(is=1e-15 bf=100 cje=20p cjc=5p tf=1n)",
+        "vcc rail 0 5\nv1 in 0 sin(-0.5 0.05 100k)\nr1 rail out 1k\nj1 out in 0 j\n.model j njf(vto=-2 beta=1m cgs=20p cgd=5p)",
+    ] {
+        let lattice = lattice(&[ToneAxis {
+            frequency: 100e3,
+            order: 4,
+        }]);
+        let (mut circuit, config) = circuit(body);
+        let solution = physical_run(&mut circuit, &config, &lattice);
+        let spectrum = node_phasors(&circuit, &lattice, &solution, "out");
+        assert!(spectrum[0].re > 0. && spectrum[0].re < 5., "{spectrum:?}");
+        assert!(spectrum[1].magnitude() > 0.01);
+        assert!(spectrum[2].magnitude() > 1e-6);
+        assert!(solution.residual.max_abs() < 1e-11);
+    }
+}

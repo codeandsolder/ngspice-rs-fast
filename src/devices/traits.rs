@@ -33,6 +33,82 @@ use crate::primitives::{Node, NodeId, NodeTable, Real, SourceLoc, SpiceError, Sp
 use crate::devices::linear::Forcing;
 use crate::devices::state::DeviceState;
 
+/// Physical nonlinear charge and its exact Jacobian in MNA coordinates.
+/// This is independent of the time integration formula and AC's historical
+/// small-signal linearization conventions.
+pub struct ChargeContext<'a> {
+    /// Effective model parameters and temperatures.
+    pub model: &'a crate::devices::ModelContext,
+    /// Physical node and branch numbering.
+    pub unknowns: &'a MnaUnknowns,
+    /// State at which to evaluate the constitutive law.
+    pub state: &'a Vector,
+    /// Signed charge and flux residual by equation row.
+    pub charge: &'a mut Vector,
+    /// Exact derivative of that residual.
+    pub jacobian: &'a mut SparseMatrix,
+}
+
+impl ChargeContext<'_> {
+    /// Read the physical voltage of a node; ground is exactly zero.
+    #[must_use]
+    pub fn voltage(&self, node: NodeId) -> Real {
+        self.unknowns
+            .node_row(node)
+            .and_then(|row| self.state.get(row))
+            .unwrap_or(0.)
+    }
+
+    /// Add an off-diagonal derivative of a charge branch with respect to
+    /// a distinct control voltage. The signed four-terminal stamp preserves
+    /// both charge conservation and invariance under a common-mode shift.
+    ///
+    /// # Errors
+    /// Nonfinite derivative or invalid row/column.
+    pub fn coupling(
+        &mut self,
+        output: [NodeId; 2],
+        control: [NodeId; 2],
+        derivative: Real,
+    ) -> SpiceResult<()> {
+        if !derivative.is_finite() {
+            return Err(SpiceError::circuit("nonfinite nonlinear charge coupling"));
+        }
+        for (node, sign) in [(output[0], 1.), (output[1], -1.)] {
+            if let Some(row) = self.unknowns.node_row(node) {
+                for (node, weight) in [(control[0], 1.), (control[1], -1.)] {
+                    if let Some(col) = self.unknowns.node_row(node) {
+                        self.jacobian.add(row, col, sign * weight * derivative)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish a two-terminal charge law, positive from the first node to
+    /// the second, with its derivative with respect to their voltage.
+    ///
+    /// # Errors
+    /// Nonfinite constitutive law or invalid matrix dimensions.
+    pub fn branch(
+        &mut self,
+        terminals: [NodeId; 2],
+        charge: Real,
+        capacitance: Real,
+    ) -> SpiceResult<()> {
+        if !charge.is_finite() || !capacitance.is_finite() {
+            return Err(SpiceError::circuit("nonfinite nonlinear charge law"));
+        }
+        for (node, signed) in [(terminals[0], charge), (terminals[1], -charge)] {
+            if let Some(row) = self.unknowns.node_row(node) {
+                self.charge.add_to(row, signed)?;
+            }
+        }
+        crate::devices::linear::nodal_stamp(self.jacobian, self.unknowns, terminals, capacitance)
+    }
+}
+
 /// Which stored quantity a [`StorageElement`] integrates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageKind {
@@ -897,6 +973,18 @@ pub trait Device: fmt::Debug + std::any::Any {
     ) -> SpiceResult<()> {
         Err(crate::primitives::SpiceError::Unsupported {
             feature: format!("linear equation assembly for {}", self.name()),
+            location: None,
+        })
+    }
+
+    /// Evaluate a nonlinear physical charge law separately from the
+    /// integration companion and small-signal AC conventions.
+    ///
+    /// # Errors
+    /// Unsupported device charge physics or a failed model evaluation.
+    fn assemble_nonlinear_charge(&self, _context: &mut ChargeContext<'_>) -> SpiceResult<()> {
+        Err(SpiceError::Unsupported {
+            feature: format!("nonlinear frequency-domain charge for {}", self.name()),
             location: None,
         })
     }

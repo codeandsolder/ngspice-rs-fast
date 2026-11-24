@@ -1956,6 +1956,21 @@ impl Device for Diode {
         let evaluation = sample.evaluate(context.gmin)?;
         self.commit_load(context, &evaluation)
     }
+    fn assemble_nonlinear_charge(
+        &self,
+        context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        let voltage = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
+        let point = self
+            .thermal(context.model)?
+            .point(voltage, context.model.gmin)?;
+        context.branch(
+            self.junction,
+            point.junction.charge,
+            point.junction.capacitance,
+        )
+    }
+
     /// `dioacld.c`: series conductance, C's small-signal junction conductance
     /// and `j*omega` times its small-signal capacitance at the bias point.
     fn assemble_small_signal(

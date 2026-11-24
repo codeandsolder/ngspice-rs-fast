@@ -585,6 +585,60 @@ impl<'a> PreparedRun<'a> {
         self.circuit
             .bias_linearized_system(self, context, bias, state, 0, None)
     }
+
+    /// The constant linear operators and source bindings of a physical DAE.
+    /// Nonlinear devices are handled by the ordinary exact load and their
+    /// separate physical charge laws. Reject history-dependent equations
+    /// before any frequency-domain Newton iteration.
+    pub(crate) fn dae_linear_part(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<crate::devices::linear::LinearSystem> {
+        let point = self.point(context)?;
+        for index in self.circuit.load_order() {
+            let device = point.device(self.circuit, index);
+            if device.depends_on_time()
+                || device.depends_on_frequency()
+                || device.small_signal_depends_on_frequency()
+                || device.delay_line().is_some()
+                || device.has_discrete_state()
+                || device.rf_port().is_some()
+            {
+                return Err(SpiceError::Unsupported {
+                    feature: format!("frequency-domain physical DAE for {}", device.name()),
+                    location: None,
+                });
+            }
+        }
+        drop(point);
+        self.circuit.assemble_linear_devices(self, context, true)
+    }
+
+    /// Add exact nonlinear device charge and its derivative to a linear
+    /// charge assembly. The same effective recipes are used as in `load()`.
+    pub(crate) fn dae_nonlinear_charge(
+        &self,
+        context: &ModelContext,
+        state: &Vector,
+        charge: &mut Vector,
+        jacobian: &mut SparseMatrix,
+    ) -> SpiceResult<()> {
+        let point = self.point(context)?;
+        let mut input = crate::devices::traits::ChargeContext {
+            model: context,
+            unknowns: &self.circuit.bindings.unknowns,
+            state,
+            charge,
+            jacobian,
+        };
+        for index in self.circuit.load_order() {
+            let device = point.device(self.circuit, index);
+            if device.is_nonlinear() {
+                device.assemble_nonlinear_charge(&mut input)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 static MODEL_CONTEXT_LOCATION: std::sync::LazyLock<crate::primitives::SourceLoc> =
@@ -2051,6 +2105,15 @@ impl Circuit {
     /// # Errors
     /// The circuit has no validated topology.
     pub fn state_history(&self) -> SpiceResult<StateHistory> {
+        self.make_state_history(true)
+    }
+
+    /// A physical trial history without analysis-to-analysis carry state.
+    pub(crate) fn independent_state_history(&self) -> SpiceResult<StateHistory> {
+        self.make_state_history(false)
+    }
+
+    fn make_state_history(&self, carry: bool) -> SpiceResult<StateHistory> {
         Ok(StateHistory::bound(
             self.topology_id()?,
             Arc::clone(&self.bindings.state_rows),
@@ -2060,7 +2123,7 @@ impl Circuit {
                 .carried_state
                 .borrow()
                 .as_ref()
-                .filter(|snapshot| self.snapshot_matches(snapshot))
+                .filter(|snapshot| carry && self.snapshot_matches(snapshot))
                 .map(|snapshot| Arc::clone(&snapshot.values)),
             self.devices
                 .iter()
@@ -3352,6 +3415,15 @@ impl Circuit {
         context.validate(&MODEL_CONTEXT_LOCATION)?;
         self.finalize()?;
         let run = self.prepare_run();
+        self.assemble_linear_devices(&run, context, false)
+    }
+
+    fn assemble_linear_devices(
+        &self,
+        run: &PreparedRun<'_>,
+        context: &ModelContext,
+        skip_nonlinear: bool,
+    ) -> SpiceResult<crate::devices::linear::LinearSystem> {
         let point = run.point(context)?;
         let mutual = point.mutual(self)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
@@ -3369,6 +3441,9 @@ impl Circuit {
         system.a.set_unknown_names(Some(self.unknown_names()));
         for index in self.load_order() {
             let device = point.device(self, index);
+            if skip_nonlinear && device.is_nonlinear() {
+                continue;
+            }
             let range = &self.bindings.branch_rows[index];
             device.assemble_linear(&mut crate::devices::linear::LinearContext {
                 model_context: context,

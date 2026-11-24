@@ -46,22 +46,37 @@ basis entries, expanded unknowns, Jacobian entries, worst-case factor fill,
 cumulative assembly work, model evaluations, Newton iterations and line
 search trials. There is no transient fallback.
 
-## Device integration plan
+## Circuit integration
 
-Use the existing prepared circuit run and exact state-independent/nonlimited
-device load path. Source forcing must be expressed on the phase lattice,
-not by picking a single physical time for each tuple. Static residual and
-charge Jacobians must be evaluated at the same state. Reuse the actual
-device charge/flux laws rather than using C's AC capacitance as a surrogate
-for nonlinear charge. Start with linear MNA, diode physical charge and
-explicit periodic SIN forcing; extend nonlinear charge coverage through
-device-specific physical charge hooks. Discrete state, nonperiodic and
-explicit-time device equations need an explicit support policy.
+The circuit adapter uses prepared exact-state MNA loads without history
+carryover. The static residual includes independently synthesized source
+forcing; linear charge and signed flux use the existing descriptor matrix.
+Diodes, level-1 JFETs and BJTs expose physical nonlinear charge and its
+derivatives, including BJT cross-charge coupling, device polarity and
+multiplicity. Memoryless behavioural sources contribute static equations.
+History-dependent devices, switches with discrete state, explicit time or
+frequency-dependent behavioural expressions, unsupported charge models
+and nonperiodic forcing are rejected explicitly.
 
-## Development checkpoint
+## Netlist and API
 
-The multidimensional lattice, direct transforms and generic sparse AFT
-Newton kernel are implemented as library building blocks. Circuit binding,
-typed analysis-plan/CLI integration, device coverage and independent
-simulator comparisons remain in development. Do not interpret this document
-as claiming full HB support.
+```
+.hb 1meg 3 1.013meg 3 oversample=3 hbiter=40 abstol=1p vntol=1u
+```
+
+Specify one frequency/order pair per independent axis. For related tones
+use a single common fundamental with sufficient order. Independent sources
+may be constant or undamped SIN with an explicit retained frequency.
+The output is a complex frequency plot containing DC and peak phasors
+ordered by positive physical frequency. Library callers can construct
+a HarmonicLattice, solve a circuit with solve_circuit, and optionally
+supply a previous coefficient vector as a warm start. Explicit equation
+tolerances apply to the projected physical residual.
+
+## Validation
+
+Focused regressions exercise analytic RC and RLC response, Fourier and
+derivative conventions, two-axis projection, nonlinear manufactured
+solutions, diode rectification against long-run transient, two-tone diode
+mixing, behavioural amplifier compression, BJT/JFET charge integration,
+typed deck analysis, and invalid inputs and resource limits.

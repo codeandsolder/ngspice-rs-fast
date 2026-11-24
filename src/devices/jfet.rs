@@ -1004,6 +1004,20 @@ impl Device for Jfet {
         }
         .finish(context, start, &loaded)
     }
+    fn assemble_nonlinear_charge(
+        &self,
+        context: &mut crate::devices::traits::ChargeContext<'_>,
+    ) -> SpiceResult<()> {
+        let op = self.operating(context.model)?;
+        let [vgs, vgd] = self.normalized(self.inner.map(|node| context.voltage(node)));
+        let [gs, gd] = self.evaluate(&op, vgs, vgd, context.model.gmin)?.gates;
+        let [drain, gate, source] = self.inner;
+        let m = self.instance.m;
+        let sign = self.model.pol * m;
+        context.branch([gate, source], sign * gs.charge, m * gs.capacitance)?;
+        context.branch([gate, drain], sign * gd.charge, m * gd.capacitance)
+    }
+
     /// `jfetacld.c` after C's `MODEINITSMSIG` load: the conductances and
     /// gate capacitances at the bias, every stamp scaled by `m` and grouped
     /// as C groups it.

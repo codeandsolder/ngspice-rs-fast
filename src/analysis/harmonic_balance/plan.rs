@@ -88,7 +88,7 @@ fn frequency(indices: &[i32], axes: &[ToneAxis]) -> (Real, Real) {
     let mut magnitude = 0.;
     for (&index, axis) in indices.iter().zip(axes) {
         sum = Real::from(index).mul_add(axis.frequency, sum);
-        magnitude += Real::from(index).abs() * axis.frequency;
+        magnitude = Real::from(index).abs().mul_add(axis.frequency, magnitude);
     }
     (sum, magnitude)
 }
@@ -176,16 +176,19 @@ fn basis_rows(
     Ok(basis)
 }
 
-impl HarmonicLattice {
-    /// Construct a rectangular lattice with an explicit anti-aliasing grid.
-    ///
-    /// Each axis uses `oversampling * (2*order + 1)` phase points, with
-    /// oversampling at least two. Non-polynomial nonlinearities still require
-    /// convergence checks as the grid and retained harmonic order increase.
-    ///
-    /// # Errors
-    /// Invalid or dependent axes, invalid grid, or exceeded resource limits.
-    pub fn new(axes: &[ToneAxis], oversampling: u16, limits: LatticeLimits) -> SpiceResult<Self> {
+// Retain only checked shape metadata in analysis plans. The potentially
+// large Fourier basis is allocated when the analysis executes.
+#[derive(Debug, Clone, PartialEq)]
+struct LatticeShape {
+    axes: Vec<ToneAxis>,
+    harmonics: Vec<Harmonic>,
+    grid: Vec<u32>,
+    samples: usize,
+    entries: usize,
+}
+
+impl LatticeShape {
+    fn new(axes: &[ToneAxis], oversampling: u16, limits: LatticeLimits) -> SpiceResult<Self> {
         if axes.is_empty() || axes.len() > limits.dimensions || oversampling < 2 {
             return Err(failure(
                 "invalid harmonic lattice dimensions or oversampling",
@@ -208,13 +211,43 @@ impl HarmonicLattice {
         }
         let entries = checked_product(samples, count, limits.basis_entries, "Fourier basis")?;
         let harmonics = enumerate_modes(axes, count)?;
-        let basis = basis_rows(axes, &harmonics, &grid, samples, entries)?;
         Ok(Self {
             axes: axes.to_vec(),
             harmonics,
+            grid,
             samples,
+            entries,
+        })
+    }
+
+    fn materialize(&self) -> SpiceResult<HarmonicLattice> {
+        let basis = basis_rows(
+            &self.axes,
+            &self.harmonics,
+            &self.grid,
+            self.samples,
+            self.entries,
+        )?;
+        Ok(HarmonicLattice {
+            axes: self.axes.clone(),
+            harmonics: self.harmonics.clone(),
+            samples: self.samples,
             basis,
         })
+    }
+}
+
+impl HarmonicLattice {
+    /// Construct a rectangular lattice with an explicit anti-aliasing grid.
+    ///
+    /// Each axis uses `oversampling * (2*order + 1)` phase points, with
+    /// oversampling at least two. Non-polynomial nonlinearities still require
+    /// convergence checks as the grid and retained harmonic order increase.
+    ///
+    /// # Errors
+    /// Invalid or dependent axes, invalid grid, or exceeded resource limits.
+    pub fn new(axes: &[ToneAxis], oversampling: u16, limits: LatticeLimits) -> SpiceResult<Self> {
+        LatticeShape::new(axes, oversampling, limits)?.materialize()
     }
 
     /// Independent phase axes.
@@ -246,6 +279,12 @@ impl HarmonicLattice {
         self.basis.chunks_exact(self.coordinates())
     }
 
+    pub(crate) fn row(&self, phase: usize) -> Option<&[Real]> {
+        let width = self.coordinates();
+        let start = phase.checked_mul(width)?;
+        self.basis.get(start..start.checked_add(width)?)
+    }
+
     /// Find the positive harmonic matching a physical source frequency.
     /// Returns its index in the positive-frequency list, not a coordinate.
     #[must_use]
@@ -267,7 +306,9 @@ impl HarmonicLattice {
         let mut result = vec![Complex::real(coordinates[0])];
         result.extend(
             coordinates[1..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| Complex::new(pair[0], -pair[1])),
         );
         Ok(result)
@@ -340,8 +381,8 @@ impl HarmonicLattice {
         for ((harmonic, pair), output) in self
             .harmonics
             .iter()
-            .zip(coordinates[1..].chunks_exact(2))
-            .zip(result[1..].chunks_exact_mut(2))
+            .zip(coordinates[1..].as_chunks::<2>().0.iter())
+            .zip(result[1..].as_chunks_mut::<2>().0.iter_mut())
         {
             let omega = TAU * harmonic.frequency;
             output[0] = omega * pair[1];
@@ -349,5 +390,110 @@ impl HarmonicLattice {
         }
         self.check_coordinates(&result)?;
         Ok(result)
+    }
+}
+
+/// Typed, allocation-bounded analysis input. Unlike the executable lattice,
+/// this retains only the harmonic indices and grid shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HarmonicBalancePlan {
+    shape: LatticeShape,
+    limits: super::BalanceLimits,
+}
+
+impl HarmonicBalancePlan {
+    pub(crate) fn resolve(
+        arguments: &[String],
+        oversampling: u16,
+        iterations: usize,
+    ) -> SpiceResult<Self> {
+        if arguments.is_empty() || !arguments.as_chunks::<2>().1.is_empty() {
+            return Err(failure(".hb requires frequency order pairs"));
+        }
+        let axes = arguments
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let frequency = crate::primitives::parse_spice_number(&pair[0])
+                    .ok_or_else(|| failure(format!("invalid HB fundamental {}", pair[0])))?;
+                let order = crate::analysis::plan::count(&pair[1], "harmonic order", 1, 512)?;
+                let order = u16::try_from(order).map_err(|_| failure("harmonic order overflow"))?;
+                Ok(ToneAxis { frequency, order })
+            })
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let shape = LatticeShape::new(&axes, oversampling, LatticeLimits::default())?;
+        Ok(Self {
+            shape,
+            limits: super::BalanceLimits {
+                iterations,
+                ..super::BalanceLimits::default()
+            },
+        })
+    }
+
+    pub(crate) const fn grid_points(&self) -> usize {
+        self.shape.samples
+    }
+
+    pub(crate) fn run(
+        &self,
+        circuit: &mut crate::devices::Circuit,
+        context: &crate::analysis::AnalysisContext,
+        newton: &crate::analysis::newton::NewtonOptions,
+        sink: &mut dyn crate::analysis::PointSink,
+    ) -> SpiceResult<()> {
+        circuit.finalize()?;
+        if !circuit.observations().is_empty() {
+            return Err(failure(
+                "HB device observations beyond MNA nodes and branch currents are not implemented",
+            ));
+        }
+        let lattice = self.shape.materialize()?;
+        // Residual equations have the opposite units to their corresponding
+        // unknowns: KCL at a node (A), KVL/constitutive branch constraint (V).
+        let mut tolerances = vec![newton.abstol; circuit.unknown_count()];
+        for (index, _) in circuit.devices().iter().enumerate() {
+            let range = circuit
+                .branch_rows(index)
+                .ok_or_else(|| failure("missing HB branch rows"))?;
+            for tolerance in &mut tolerances[range] {
+                *tolerance = newton.vntol;
+            }
+        }
+        let result = super::solve_circuit(
+            circuit,
+            context.model_context(),
+            &lattice,
+            None,
+            &tolerances,
+            self.limits,
+        )?;
+        let header = crate::analysis::linear::plot(
+            circuit,
+            "hb",
+            "Harmonic Balance",
+            Some(("frequency", "frequency")),
+            true,
+        )?;
+        sink.begin(&header)?;
+        let m = lattice.coordinates();
+        let mut row = Vec::with_capacity(circuit.unknown_count() + 1);
+        for (index, frequency) in std::iter::once(0.)
+            .chain(lattice.harmonics().iter().map(Harmonic::frequency))
+            .enumerate()
+        {
+            row.clear();
+            row.push(Complex::real(frequency));
+            for coefficients in result.coefficients.as_slice().chunks_exact(m) {
+                row.push(if index == 0 {
+                    Complex::real(coefficients[0])
+                } else {
+                    Complex::new(coefficients[2 * index - 1], -coefficients[2 * index])
+                });
+            }
+            sink.point(&row)?;
+        }
+        sink.end()
     }
 }
