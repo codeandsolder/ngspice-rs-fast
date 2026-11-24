@@ -494,10 +494,10 @@ fn validation_grid(band: FrequencyBand, phase: f64) -> SpiceResult<Vec<f64>> {
             "electrical length exceeds ladder validation grid budget",
         ));
     }
-    let mut intervals = 256_u32;
-    while f64::from(intervals) < required {
-        intervals *= 2;
-    }
+    let intervals = (8..=14)
+        .map(|shift| 1_u32 << shift)
+        .find(|&count| f64::from(count) >= required)
+        .ok_or_else(|| invalid("electrical length exceeds ladder validation grid budget"))?;
     let mut grid = vec![0., low, high];
     for i in 1..intervals {
         grid.push((f64::from(i) / f64::from(intervals)).mul_add(high - low, low));

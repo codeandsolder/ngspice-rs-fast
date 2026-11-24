@@ -959,3 +959,82 @@ fn prepared_matched_feed_composes_with_measured_touchstone_load() {
         close(plot.value("S_1_1", 0).unwrap(), expected, 5e-12);
     }
 }
+
+#[test]
+fn prepared_tee_tracks_independent_distributed_qucs_reference() {
+    use ngspice_rs::analysis::rf_network::geometry::{MicrostripTee, Substrate};
+    use ngspice_rs::devices::rf_passive::bind_realization;
+
+    // Full Qucsator mstee propagation, turns-ratio and susceptance equations
+    // with independent scikit-rf Hammerstad-Jensen arm parameters. Converted
+    // to physical three-port scattering by eliminating the central node.
+    let reference = [
+        (
+            1e8,
+            [
+                (-0.333_331_041_265_156_67, 0.000_737_024_645_577_747),
+                (0.666_666_735_735_123_8, -0.001_371_528_056_427_988_5),
+                (0.666_665_558_451_843_7, -0.000_699_480_460_348_680_8),
+            ],
+            3e-6,
+        ),
+        (
+            1e9,
+            [
+                (-0.333_104_027_763_968_8, 0.007_363_250_941_169_894),
+                (0.666_673_389_598_630_3, -0.013_734_515_096_282_918),
+                (0.666_555_307_367_641_6, -0.007_033_216_843_691_893),
+            ],
+            3e-4,
+        ),
+    ];
+    let graph = Arc::new(
+        MicrostripTee {
+            widths: [2e-3, 2e-3, 8e-4],
+            extensions: [0.; 3],
+        }
+        .quasi_static(
+            Substrate {
+                height: 8e-4,
+                relative_permittivity: 4.4,
+            },
+            FrequencyBand::new(0., 1e9).unwrap(),
+        )
+        .unwrap(),
+    );
+    let deck = "prepared tee\nv1 a 0 portnum 1 z0 50\nv2 b 0 portnum 2 z0 50\nv3 c 0 portnum 3 z0 50\n.sp lin 2 100meg 1g\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("tee.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let ports = ["a", "b", "c"].map(|name| PortTerminals {
+        positive: circuit.add_node(name).unwrap(),
+        negative: NodeId::GROUND,
+    });
+    bind_realization(&mut circuit, "ntee", graph, ports.to_vec()).unwrap();
+    let plot = config
+        .plan_for(&netlist.analyses[0])
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    for (index, (hz, expected, tolerance)) in reference.into_iter().enumerate() {
+        assert_eq!(plot.value("frequency", index).unwrap().re, hz);
+        for (port, (re, im)) in expected.into_iter().enumerate() {
+            close(
+                plot.value(&format!("S_{}_1", port + 1), index).unwrap(),
+                Complex::new(re, im),
+                tolerance,
+            );
+        }
+        for row in 1..=3 {
+            for col in 1..=3 {
+                close(
+                    plot.value(&format!("S_{row}_{col}"), index).unwrap(),
+                    plot.value(&format!("S_{col}_{row}"), index).unwrap(),
+                    1e-12,
+                );
+            }
+        }
+    }
+}

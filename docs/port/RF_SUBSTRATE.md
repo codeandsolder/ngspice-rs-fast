@@ -114,8 +114,8 @@ checks additionally enforce the stated dimensionless domains.
 | Width step | Qucs impedance-step equivalent, thin strip; width ratio 1.5–3.5, relative permittivity <=10, f*h <=12 MHz*m; positive-element subset |
 | Tee | Leading-order Qucs reference-plane and susceptance model; thin strip, each W/h 0.1–10, relative permittivity <=18; each electrical arm length <=0.1 rad and f*h/(4e5*Zarm)<=0.05 |
 
-For planar models substrate relative permittivity is finite and >=1
-(subject to the individual limits). Other conductor/return geometries can
+For planar models substrate relative permittivity is in 1–128
+(subject to the narrower individual limits). Other conductor/return geometries can
 supply extracted per-metre coefficients. Surface roughness, radiation and
 higher-order mode physics must be supplied by extraction within the chosen
 band, rather than guessed from the quasi-static geometry.
@@ -192,6 +192,12 @@ analytic model has no separate RF thermal-noise implementation here.
   prepared feed. Three measured complex samples are from scikit-rf 2.2.0
   [ring slot measured.s1p](https://github.com/scikit-rf/scikit-rf/blob/v2.2.0/skrf/data/ring%20slot%20measured.s1p);
   the DC open is a separately declared synthetic bias condition.
+
+For the 2 mm / 2 mm / 0.8 mm tee on 0.8 mm, epsilon_r=4.4 substrate,
+an independent evaluation of the full Qucs tee equations using scikit-rf
+quasi-static arm parameters found maximum absolute complex scattering
+differences of 2.77e-6 at 100 MHz and 2.78e-4 at 1 GHz against the
+positive-element approximation. These are geometry-specific comparisons.
 
 The lossy ladder regression selected four spatial sections and 32 skin
 poles per section (284 elements), with worst sampled modal scattering
