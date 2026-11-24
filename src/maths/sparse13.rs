@@ -307,6 +307,131 @@ impl IndependentBatchUpdate {
     }
 }
 
+/// One real RHS or a SIMD tile of independent real RHS values. Both
+/// instantiations perform the same rounded operations and safety checks.
+trait RealGatherLane:
+    Copy + std::ops::Add<Output = Self> + std::ops::Sub<Output = Self> + std::ops::Mul<Output = Self>
+{
+    type Valid: Copy
+        + std::ops::BitAnd<Output = Self::Valid>
+        + std::ops::BitOr<Output = Self::Valid>;
+    fn broadcast(value: f64) -> Self;
+    fn mask(value: bool) -> Self::Valid;
+    fn zero(self) -> Self::Valid;
+    fn normal(self) -> Self::Valid;
+    fn finite(self) -> Self::Valid;
+    fn magnitude(self) -> Self;
+    fn greater(self, other: Self) -> Self::Valid;
+    fn choose(mask: Self::Valid, yes: Self, no: Self) -> Self;
+}
+
+impl RealGatherLane for f64 {
+    type Valid = bool;
+    fn broadcast(value: f64) -> Self {
+        value
+    }
+    fn mask(value: bool) -> bool {
+        value
+    }
+    fn zero(self) -> bool {
+        self == 0.
+    }
+    fn normal(self) -> bool {
+        self.is_normal()
+    }
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+    fn magnitude(self) -> Self {
+        self.abs()
+    }
+    fn greater(self, other: Self) -> bool {
+        self > other
+    }
+    fn choose(mask: bool, yes: Self, no: Self) -> Self {
+        if mask { yes } else { no }
+    }
+}
+
+impl RealGatherLane for f64x4 {
+    type Valid = LaneMask;
+    fn broadcast(value: f64) -> Self {
+        Self::splat(value)
+    }
+    fn mask(value: bool) -> LaneMask {
+        LaneMask::splat(value)
+    }
+    fn zero(self) -> LaneMask {
+        self.simd_eq(Self::splat(0.))
+    }
+    fn normal(self) -> LaneMask {
+        self.is_normal()
+    }
+    fn finite(self) -> LaneMask {
+        self.is_finite()
+    }
+    fn magnitude(self) -> Self {
+        self.abs()
+    }
+    fn greater(self, other: Self) -> LaneMask {
+        self.simd_gt(other)
+    }
+    fn choose(mask: LaneMask, yes: Self, no: Self) -> Self {
+        mask.select(yes, no)
+    }
+}
+
+/// Standard normalized backward row, with a local arithmetic error bound.
+/// Retain the raw scatter route if normalization/product loses exponent
+/// range or the sign/zero of the result is unresolved by rounded terms.
+/// This is not a global forward-error certificate for an ill-conditioned A.
+struct RealGatherRow<V: RealGatherLane> {
+    value: V,
+    magnitude_sum: V,
+    error: V,
+    valid: V::Valid,
+}
+
+impl<V: RealGatherLane> RealGatherRow<V> {
+    fn new(numerator: V, inverse: f64) -> Self {
+        let value = numerator * V::broadcast(inverse);
+        let valid = numerator.zero() | (V::mask(inverse.is_normal()) & value.normal());
+        let value = V::choose(numerator.zero(), numerator, value);
+        let magnitude_sum = value.magnitude();
+        Self {
+            value,
+            magnitude_sum,
+            error: magnitude_sum * V::broadcast(2. * f64::EPSILON),
+            valid,
+        }
+    }
+
+    fn subtract(&mut self, upper: f64, inverse: f64, solved: V) {
+        if upper == 0. {
+            return;
+        }
+        let coefficient = upper * inverse;
+        let term = V::broadcast(coefficient) * solved;
+        self.valid =
+            self.valid & (solved.zero() | (V::mask(coefficient.is_normal()) & term.normal()));
+        let term = V::choose(solved.zero(), V::broadcast(0.), term);
+        self.value = V::choose(solved.zero(), self.value, self.value - term);
+        self.magnitude_sum = self.magnitude_sum + term.magnitude();
+        // Reciprocal, coefficient, term and accumulation rounding, with
+        // slack for the positive error-bound accumulation itself.
+        self.error = self.error + self.magnitude_sum * V::broadcast(4. * f64::EPSILON);
+    }
+
+    fn finish(self) -> (V, V::Valid) {
+        let valid = self.valid
+            & self.magnitude_sum.finite()
+            & self.error.finite()
+            & (self.value.normal() | self.value.zero())
+            & (self.magnitude_sum.zero() | self.value.magnitude().greater(self.error));
+        (self.value, valid)
+    }
+}
+
 /// Matrix entry type: `f64` for real systems, [`Complex`] for AC.
 pub(super) trait Scalar:
     Copy + PartialEq + std::fmt::Debug + std::ops::Div<Output = Self>
@@ -843,7 +968,7 @@ impl<I: PlanIndex> FactorRuns<I> {
         }
     }
 
-    fn solve<T: Scalar>(
+    fn forward<T: Scalar>(
         &self,
         values: &[T],
         diag: &[usize],
@@ -874,6 +999,17 @@ impl<I: PlanIndex> FactorRuns<I> {
                 x[r] = x[r].schur(pivot, numerator, mult, values[handle], normal);
             }
         }
+    }
+
+    fn backward_raw<T: Scalar>(
+        &self,
+        values: &[T],
+        diag: &[usize],
+        inverses: &[T],
+        x: &mut [T],
+        transposed: bool,
+    ) {
+        let size = self.columns.runs.len();
         // Solve the other raw triangular factor in reverse. Scatter
         // immediately, while the unrounded numerator is still available.
         for i in (1..=size).rev() {
@@ -897,6 +1033,41 @@ impl<I: PlanIndex> FactorRuns<I> {
         }
     }
 
+    fn solve<T: Scalar>(
+        &self,
+        values: &[T],
+        diag: &[usize],
+        inverses: &[T],
+        x: &mut [T],
+        transposed: bool,
+        raw_only: bool,
+    ) -> bool {
+        self.forward(values, diag, inverses, x, transposed);
+        if !T::HAS_IMAGINARY && !raw_only {
+            let axis = if transposed {
+                &self.columns
+            } else {
+                &self.rows
+            };
+            for i in (1..=self.columns.runs.len()).rev() {
+                let inverse = inverses[i].real();
+                let mut row = RealGatherRow::new(x[i].real(), inverse);
+                for entry in axis.after_diagonal(i) {
+                    let (handle, col) = entry.indices();
+                    row.subtract(values[handle].real(), inverse, x[col].real());
+                }
+                let (value, valid) = row.finish();
+                if !valid {
+                    return false;
+                }
+                x[i] = T::from_parts(value, 0.);
+            }
+        } else {
+            self.backward_raw(values, diag, inverses, x, transposed);
+        }
+        true
+    }
+
     fn solve_batch<T: Scalar>(
         &self,
         values: &[T],
@@ -904,7 +1075,7 @@ impl<I: PlanIndex> FactorRuns<I> {
         inverses: &[T],
         work: &mut SolveBatchWorkspace<T>,
         transposed: bool,
-    ) {
+    ) -> LaneMask {
         let size = self.columns.runs.len();
         let axis = if transposed {
             &self.rows
@@ -923,6 +1094,26 @@ impl<I: PlanIndex> FactorRuns<I> {
                 }
             }
         }
+        if !T::HAS_IMAGINARY {
+            let gather = if transposed {
+                &self.columns
+            } else {
+                &self.rows
+            };
+            let mut valid = LaneMask::splat(true);
+            for i in (1..=size).rev() {
+                let inverse = inverses[i].real();
+                let mut row = RealGatherRow::new(work.real[i], inverse);
+                for entry in gather.after_diagonal(i) {
+                    let (handle, col) = entry.indices();
+                    row.subtract(values[handle].real(), inverse, work.real[col]);
+                }
+                let (value, row_valid) = row.finish();
+                work.real[i] = value;
+                valid &= row_valid;
+            }
+            return valid;
+        }
         for i in (1..=size).rev() {
             let pivot = values[diag[i]];
             let update = BatchUpdate::new(read_tile_row(work, i), pivot, inverses[i]);
@@ -936,6 +1127,7 @@ impl<I: PlanIndex> FactorRuns<I> {
                 write_tile_row(work, i, update.multiplier);
             }
         }
+        LaneMask::splat(true)
     }
 }
 
@@ -3211,6 +3403,19 @@ impl<T: Scalar> FactorView<'_, T> {
         transposed: bool,
     ) -> SpiceResult<()> {
         self.frame.gather_rhs(rhs, workspace, transposed)?;
+        if !self.solve_loaded_workspace(workspace, transposed, false) {
+            self.frame.gather_rhs(rhs, workspace, transposed)?;
+            self.solve_loaded_workspace(workspace, transposed, true);
+        }
+        Ok(())
+    }
+
+    fn solve_loaded_workspace(
+        &self,
+        workspace: &mut [T],
+        transposed: bool,
+        raw_only: bool,
+    ) -> bool {
         match self.plan {
             FactorPlan::Compact(runs) => runs.solve(
                 &self.frame.values,
@@ -3218,6 +3423,7 @@ impl<T: Scalar> FactorView<'_, T> {
                 &self.frame.inverses,
                 workspace,
                 transposed,
+                raw_only,
             ),
             FactorPlan::Wide(runs) => runs.solve(
                 &self.frame.values,
@@ -3225,9 +3431,9 @@ impl<T: Scalar> FactorView<'_, T> {
                 &self.frame.inverses,
                 workspace,
                 transposed,
+                raw_only,
             ),
         }
-        Ok(())
     }
 
     pub(super) fn solve_batch_into(
@@ -3293,7 +3499,7 @@ impl<T: Scalar> FactorView<'_, T> {
                 }));
                 write_tile_row(workspace, internal + 1, parts);
             }
-            match self.plan {
+            let valid = match self.plan {
                 FactorPlan::Compact(runs) => runs.solve_batch(
                     &frame.values,
                     &frame.topology.diag,
@@ -3308,12 +3514,24 @@ impl<T: Scalar> FactorView<'_, T> {
                     workspace,
                     transposed,
                 ),
-            }
+            };
             // Untranslated unknowns keep their original RHS, including signed zeros.
             for (lane, vector) in result.chunks_exact_mut(n).enumerate() {
+                if !valid.test(lane) {
+                    self.frame.gather_rhs(
+                        &tile[lane * n..(lane + 1) * n],
+                        &mut workspace.scalar,
+                        transposed,
+                    )?;
+                    self.solve_loaded_workspace(&mut workspace.scalar, transposed, true);
+                }
                 for (value, &internal) in vector.iter_mut().zip(&scatter[1..]) {
                     if internal != NONE {
-                        *value = read_tile_row(workspace, internal).get(lane);
+                        *value = if valid.test(lane) {
+                            read_tile_row(workspace, internal).get(lane)
+                        } else {
+                            workspace.scalar[internal]
+                        };
                     }
                 }
             }
@@ -5059,6 +5277,29 @@ mod tests {
     }
 
     #[test]
+    fn normalized_gather_guard_is_lane_local() {
+        let numerators = [6., 3., -0., f64::MIN_POSITIVE];
+        let solutions = [1., 1., 0., 0.];
+        let mut tile = RealGatherRow::new(f64x4::from_array(numerators), 0.5);
+        tile.subtract(3., 0.5, f64x4::from_array(solutions));
+        let (values, valid) = tile.finish();
+        assert_eq!(valid.to_array(), [true, false, true, false]);
+        for i in 0..4 {
+            let mut row = RealGatherRow::new(numerators[i], 0.5);
+            row.subtract(3., 0.5, solutions[i]);
+            let (value, scalar_valid) = row.finish();
+            assert_eq!(valid.test(i), scalar_valid);
+            assert_eq!(values[i].to_bits(), value.to_bits());
+        }
+        let mut row = RealGatherRow::new(1., 2.);
+        row.subtract(f64::MAX, 2., 0.5);
+        assert!(!row.finish().1);
+        let mut row = RealGatherRow::new(1., 0.5);
+        row.subtract(f64::MIN_POSITIVE, 0.5, 1.);
+        assert!(!row.finish().1);
+    }
+
+    #[test]
     fn substitution_uses_raw_rhs_ratios_in_both_triangular_directions() {
         // Exact solution is (1/3, 0), although 1/3 is not representable.
         // A more accurate subtraction of 5 - 15*rounded(1/3) would
@@ -5093,6 +5334,10 @@ mod tests {
                 }
             };
             assert_eq!(solve(&[5., 1.]), [0., 1. / 3.]);
+            let perturbed = 5.0_f64.next_up();
+            assert_eq!(solve(&[perturbed, 1.]), [(perturbed - 5.) / 2., 1. / 3.]);
+            let rhs = [5., 1., perturbed, 1., 7., 2., -0., 0., -5., -1.];
+            check_batch(&m, &rhs, |value| [value.to_bits(), 0]);
         }
         let pivot = Complex::new(3., 7.);
         let rhs = Complex::new(1., 2.);

@@ -370,3 +370,19 @@ Independent Python replay of the guard over all 125 captured Newton
 systems (4 amplifier, 10 width, 83 PMOS, 28 temperature) accepts
 every system and yields the same four C-compatible results. The
 script is `guarded-replay.py` in the scratch directory above.
+
+### Validation of guarded gather
+
+The production candidate passed all 9 BSIM4 device tests, 41
+existing SPARSE unit tests, 5 real and 7 complex linear solver
+tests, 36 sensitivity/transfer tests, and all 220 committed golden
+fixtures. There are no fixture edits or loosened numeric bounds.
+
+The solver robustness suite has one independently confirmed baseline
+failure: zero resistance clamping yields -0.000976562499999999 A
+instead of the exact historical C value -0.0009765625 A. A detached
+clean build of `00eb948` returns the identical value, and the
+debugger confirms the guarded solve rejects the ill-conditioned
+normalized row and reruns unchanged raw scatter. This is not a
+regression introduced by the guarded substitution. The existing
+exact assertion is retained.
