@@ -482,14 +482,14 @@ pub(super) fn intrinsic(
                 dVgsteff_dVd = -dVth_dVd;
                 dVgsteff_dVb = -dVth_dVb;
             } else if VgstNVt < -EXP_THRESHOLD {
-                Vgsteff = T0 * log(1.0 + MIN_EXP);
+                Vgsteff = T0 * MIN_EXP.ln_1p();
                 dVgsteff_dVg = 0.0;
                 dVgsteff_dVd = Vgsteff / noff;
                 dVgsteff_dVb = dVgsteff_dVd * dnoff_dVb;
                 dVgsteff_dVd *= dnoff_dVd;
             } else {
                 ExpVgst = exp(VgstNVt);
-                Vgsteff = T0 * log(1.0 + ExpVgst);
+                Vgsteff = T0 * ExpVgst.ln_1p();
                 dVgsteff_dVg = ExpVgst / (1.0 + ExpVgst);
                 dVgsteff_dVd = -dVgsteff_dVg * (dVth_dVd + (Vgst - voffcv) / noff * dnoff_dVd)
                     + Vgsteff / noff * dnoff_dVd;
@@ -507,14 +507,14 @@ pub(super) fn intrinsic(
                 dT10_dVd = -dVth_dVd * pParam.mstarcv;
                 dT10_dVb = -dVth_dVb * pParam.mstarcv;
             } else if T2 < -EXP_THRESHOLD {
-                T10 = Vtm * log(1.0 + MIN_EXP);
+                T10 = Vtm * MIN_EXP.ln_1p();
                 dT10_dVg = 0.0;
                 dT10_dVd = T10 * dn_dVd;
                 dT10_dVb = T10 * dn_dVb;
                 T10 *= n;
             } else {
                 ExpVgst = exp(T2);
-                T3 = Vtm * log(1.0 + ExpVgst);
+                T3 = Vtm * ExpVgst.ln_1p();
                 T10 = n * T3;
                 dT10_dVg = pParam.mstarcv * ExpVgst / (1.0 + ExpVgst);
                 dT10_dVb = T3 * dn_dVb - dT10_dVg * (dVth_dVb + Vgst * dn_dVb / n);
@@ -763,7 +763,7 @@ pub(super) fn intrinsic(
                 T0 = pParam.k1ox * pParam.sqrtPhi;
             }
             T1 = 2.0 * T0 + Vgsteff;
-            DeltaPhi = Vtm * log(1.0 + T1 * Vgsteff / Denomi);
+            DeltaPhi = Vtm * (T1 * Vgsteff / Denomi).ln_1p();
             dDeltaPhi_dVg = 2.0 * Vtm * (T1 - T0) / (Denomi + T1 * Vgsteff);
             T0 = Vgsteff - DeltaPhi - 0.001;
             dT0_dVg = 1.0 - dDeltaPhi_dVg;

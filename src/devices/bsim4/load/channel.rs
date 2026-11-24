@@ -403,14 +403,14 @@ pub(super) fn electrostatics(
         dT10_dVd = -dVth_dVd * pParam.mstar;
         dT10_dVb = -dVth_dVb * pParam.mstar;
     } else if T2 < -EXP_THRESHOLD {
-        T10 = Vtm * log(1.0 + MIN_EXP);
+        T10 = Vtm * MIN_EXP.ln_1p();
         dT10_dVg = 0.0;
         dT10_dVd = T10 * dn_dVd;
         dT10_dVb = T10 * dn_dVb;
         T10 *= n;
     } else {
         ExpVgst = exp(T2);
-        T3 = Vtm * log(1.0 + ExpVgst);
+        T3 = Vtm * ExpVgst.ln_1p();
         T10 = n * T3;
         dT10_dVg = pParam.mstar * ExpVgst / (1.0 + ExpVgst);
         dT10_dVb = T3 * dn_dVb - dT10_dVg * (dVth_dVb + Vgst * dn_dVb / n);
