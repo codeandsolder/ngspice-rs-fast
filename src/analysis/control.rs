@@ -32,6 +32,7 @@ pub struct ControlPlot {
 }
 
 /// Shared frontend cards to route for an explicitly requested run.
+#[derive(Clone, Copy)]
 pub(crate) struct ControlBatchCards<'a> {
     pub output: &'a OutputCards,
     pub measurements: &'a [MeasureCard],
@@ -45,6 +46,27 @@ pub(crate) struct ControlBatchBudget<'a> {
     pub plots: usize,
     pub cells: usize,
     pub grid: &'a mut usize,
+}
+
+impl ControlBatchBudget<'_> {
+    fn admit(&self, plans: &[AnalysisPlan]) -> SpiceResult<(usize, usize)> {
+        let grid = plans.iter().try_fold(0usize, |sum, plan| {
+            sum.checked_add(plan.requested_grid_points())
+                .ok_or_else(|| SpiceError::circuit("control analysis grid count overflow"))
+        })?;
+        let remaining = self
+            .grid
+            .checked_sub(grid)
+            .ok_or_else(|| SpiceError::circuit("control deterministic grid budget exceeded"))?;
+        let expected = plans.iter().try_fold(0usize, |sum, plan| {
+            sum.checked_add(plan.plot_count())
+                .ok_or_else(|| SpiceError::circuit("control plot count overflow"))
+        })?;
+        if expected > self.plots {
+            return Err(SpiceError::circuit("control plot count budget exceeded"));
+        }
+        Ok((expected, remaining))
+    }
 }
 
 pub(crate) struct ControlBatch {
@@ -354,24 +376,10 @@ impl<'a> ControlSession<'a> {
         &mut self,
         plans: &[AnalysisPlan],
         cards: ControlBatchCards<'_>,
-        budget: ControlBatchBudget<'_>,
+        budget: &mut ControlBatchBudget<'_>,
         mut emit: impl FnMut(&str) -> SpiceResult<()>,
     ) -> SpiceResult<ControlBatch> {
-        let grid = plans.iter().try_fold(0usize, |sum, plan| {
-            sum.checked_add(plan.requested_grid_points())
-                .ok_or_else(|| SpiceError::circuit("control analysis grid count overflow"))
-        })?;
-        let remaining = budget
-            .grid
-            .checked_sub(grid)
-            .ok_or_else(|| SpiceError::circuit("control deterministic grid budget exceeded"))?;
-        let expected = plans.iter().try_fold(0usize, |sum, plan| {
-            sum.checked_add(plan.plot_count())
-                .ok_or_else(|| SpiceError::circuit("control plot count overflow"))
-        })?;
-        if expected > budget.plots {
-            return Err(SpiceError::circuit("control plot count budget exceeded"));
-        }
+        let (expected, remaining) = budget.admit(plans)?;
         let schedule = super::batch::schedule(plans);
         let scope = self.scope()?.clone();
         let expanded = self.expand_frontend(&cards, &scope)?;

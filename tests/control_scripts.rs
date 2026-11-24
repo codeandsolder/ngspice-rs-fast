@@ -603,3 +603,79 @@ run
     assert!(output.contains("Fourier analysis for"));
     assert!(output.contains("v(in)"));
 }
+
+#[test]
+fn nested_control_flow_handles_transfers_and_counts() {
+    let deck = ScriptDeck::new(
+        "structured",
+        r#"
+set loops = 3
+let i = 0
+let total = 0
+repeat $loops
+  let i = i + 1
+  if (i = 2)
+    continue
+  else
+    let total = total + i
+  end
+end
+dowhile (i < 3)
+  let i = i + 1
+end
+repeat
+  repeat
+    let total = total + 10
+    break 2
+  end
+end
+echo "total=$&total" i=$i
+alter r1 2k
+op
+"#,
+    );
+    let (report, output) = deck.run(ScriptLimits::default()).unwrap();
+    assert_eq!(report.variables["i"], 4.);
+    assert_eq!(report.variables["total"], 14.);
+    assert!(output.contains("total=14 i=4"));
+    assert!((report.plots[0].plot.value("v(out)", 0).unwrap().re - 1.).abs() < 1e-12);
+}
+
+#[test]
+fn invalid_flow_is_rejected_and_unbounded_repeat_is_bounded() {
+    for script in [
+        "break",
+        "repeat 1\ncontinue 2\nend",
+        "if 1\nelse\nelse\nend",
+    ] {
+        let deck = ScriptDeck::new("bad-flow", script);
+        assert!(deck.run(ScriptLimits::default()).is_err());
+    }
+    let deck = ScriptDeck::new("repeat-bound", "repeat\nend");
+    let limits = ScriptLimits {
+        steps: 10,
+        ..ScriptLimits::default()
+    };
+    assert!(
+        deck.run(limits)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("instruction budget")
+    );
+}
+
+#[test]
+fn control_only_deck_executes_numeric_loops() {
+    let deck = ScriptDeck::from_text(
+        "control-only",
+        "example while loop\n.control\nlet loopindex = 0\nwhile loopindex < 5\n  echo index is $&loopindex\n  let loopindex = loopindex + 1\nend\n.endc\n.end\n",
+    );
+    let (report, output) = deck.run(ScriptLimits::default()).unwrap();
+    assert_eq!(report.variables["loopindex"], 5.);
+    assert!(report.plots.is_empty());
+    assert_eq!(
+        output,
+        "index is 0\nindex is 1\nindex is 2\nindex is 3\nindex is 4\n"
+    );
+}

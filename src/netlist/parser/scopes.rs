@@ -329,10 +329,10 @@ impl ControlScript {
         }
         if self.scripted {
             if card.tokens.first().is_some_and(|t| t.is_keyword("set"))
-                && !card
+                && card
                     .tokens
                     .get(1)
-                    .is_some_and(|t| t.is_keyword("specwindow"))
+                    .is_some_and(|t| super::options::frontend_setting_name(&t.text))
             {
                 if self.deck_ran {
                     return Err(SpiceError::parse(

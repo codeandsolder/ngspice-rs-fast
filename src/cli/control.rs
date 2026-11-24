@@ -92,10 +92,31 @@ enum Operation {
     Transform(Transform, Vec<String>),
     SetWindow(SpectrumWindow),
     SetPlot(String),
-    Foreach(String, Vec<Scalar>, Vec<Instruction>),
-    While(Condition, Vec<Instruction>),
+    Loop(LoopSpec, Vec<Instruction>),
+    If(Condition, Vec<Instruction>, Vec<Instruction>),
+    Transfer(Flow),
+    SetScalar(String, Scalar),
+    Echo(Vec<EchoPart>),
     Destroy(Vec<String>),
+}
+
+enum LoopSpec {
+    Foreach(String, Vec<Scalar>),
+    Conditional(Condition, bool),
+    Repeat(Option<Scalar>),
+}
+
+#[derive(Clone, Copy)]
+enum Flow {
+    Next,
+    Break(usize),
+    Continue(usize),
     Quit,
+}
+
+enum EchoPart {
+    Text(String),
+    Variable(String),
 }
 
 #[derive(Clone, Copy)]
@@ -200,6 +221,7 @@ fn assignment(text: &str, location: &SourceLoc) -> SpiceResult<(String, Scalar)>
 fn instance_assignment(text: &str, location: &SourceLoc) -> SpiceResult<Operation> {
     let (target, value) = text
         .split_once('=')
+        .or_else(|| text.split_once(char::is_whitespace))
         .ok_or_else(|| error(location, "expected instance [parameter] = expression"))?;
     let target = target.trim();
     let (name, parameter) = if let Some(target) = target.strip_prefix('@') {
@@ -233,11 +255,33 @@ fn instance_assignment(text: &str, location: &SourceLoc) -> SpiceResult<Operatio
 }
 
 fn condition(text: &str, location: &SourceLoc) -> SpiceResult<Condition> {
-    let Some(index) = text.find(['<', '>', '=', '!']) else {
-        return Ok(Condition::Nonzero(expression(text, location)?));
-    };
-    let (left, tail) = text.split_at(index);
-    let (comparison, right) = [
+    let mut text = text.trim();
+    // Remove only parentheses enclosing the entire condition, not arithmetic
+    // groups on either side of a comparison.
+    while text.starts_with('(') && text.ends_with(')') {
+        let mut depth = 0usize;
+        let mut end = None;
+        for (index, ch) in text.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| error(location, "unbalanced condition"))?;
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end != Some(text.len() - 1) {
+            break;
+        }
+        text = text[1..text.len() - 1].trim();
+    }
+    let operators = [
         ("<=", Comparison::LessEqual),
         (">=", Comparison::GreaterEqual),
         ("==", Comparison::Equal),
@@ -246,15 +290,77 @@ fn condition(text: &str, location: &SourceLoc) -> SpiceResult<Condition> {
         ("<", Comparison::Less),
         (">", Comparison::Greater),
         ("=", Comparison::Equal),
-    ]
-    .into_iter()
-    .find_map(|(prefix, comparison)| tail.strip_prefix(prefix).map(|right| (comparison, right)))
-    .ok_or_else(|| error(location, "invalid comparison"))?;
-    Ok(Condition::Compare(
-        expression(left, location)?,
-        comparison,
-        expression(right, location)?,
-    ))
+    ];
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| error(location, "unbalanced condition"))?;
+            }
+            '<' | '>' | '=' | '!' if depth == 0 => {
+                let (left, tail) = text.split_at(index);
+                let (comparison, right) = operators
+                    .into_iter()
+                    .find_map(|(prefix, comparison)| {
+                        tail.strip_prefix(prefix).map(|right| (comparison, right))
+                    })
+                    .ok_or_else(|| error(location, "invalid comparison"))?;
+                return Ok(Condition::Compare(
+                    expression(left, location)?,
+                    comparison,
+                    expression(right, location)?,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(Condition::Nonzero(expression(text, location)?))
+}
+
+fn echo_parts(text: &str, location: &SourceLoc) -> SpiceResult<Vec<EchoPart>> {
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut quote = None;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => literal.push(
+                chars
+                    .next()
+                    .ok_or_else(|| error(location, "unfinished echo escape"))?,
+            ),
+            '"' | '\'' if quote.is_none() => quote = Some(ch),
+            '"' | '\'' if quote == Some(ch) => quote = None,
+            '$' if quote != Some('\'') => {
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                }
+                let mut name = String::new();
+                while chars
+                    .peek()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                {
+                    if let Some(ch) = chars.next() {
+                        name.push(ch);
+                    }
+                }
+                if !literal.is_empty() {
+                    parts.push(EchoPart::Text(std::mem::take(&mut literal)));
+                }
+                parts.push(EchoPart::Variable(identifier(&name, location)?));
+            }
+            _ => literal.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return Err(error(location, "unterminated echo quote"));
+    }
+    literal.push('\n');
+    parts.push(EchoPart::Text(literal));
+    Ok(parts)
 }
 
 fn split_command(card: &RawCard) -> (&str, &str) {
@@ -292,17 +398,38 @@ fn linearize_command(rest: &str, location: &SourceLoc) -> SpiceResult<Operation>
     Ok(Operation::Transform(Transform::Linearize(points), vectors))
 }
 
-fn window_command(rest: &str, location: &SourceLoc) -> SpiceResult<Operation> {
-    let (name, value) = rest
-        .split_once('=')
-        .ok_or_else(|| error(location, "expected set specwindow = name"))?;
-    if !name.trim().eq_ignore_ascii_case("specwindow") {
-        return Err(unsupported(location, name.trim()));
+fn set_command(rest: &str, location: &SourceLoc) -> SpiceResult<Operation> {
+    if let Some((name, value)) = rest.split_once('=') {
+        if name.trim().eq_ignore_ascii_case("specwindow") {
+            let value = value.trim().trim_matches('"');
+            let window = SpectrumWindow::parse(value)
+                .ok_or_else(|| unsupported(location, &format!("specwindow={value}")))?;
+            return Ok(Operation::SetWindow(window));
+        }
+        return Ok(Operation::SetScalar(
+            identifier(name.trim(), location)?,
+            expression(value, location)?,
+        ));
     }
-    let value = value.trim().trim_matches('"');
-    let window = SpectrumWindow::parse(value)
-        .ok_or_else(|| unsupported(location, &format!("specwindow={value}")))?;
-    Ok(Operation::SetWindow(window))
+    Ok(Operation::SetScalar(
+        identifier(rest, location)?,
+        expression("1", location)?,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct Nesting {
+    depth: usize,
+    loops: usize,
+}
+
+impl Nesting {
+    fn child(self, loop_body: bool) -> Self {
+        Self {
+            depth: self.depth + 1,
+            loops: self.loops + usize::from(loop_body),
+        }
+    }
 }
 
 struct Compiler<'a> {
@@ -316,32 +443,77 @@ impl Compiler<'_> {
     fn block(
         &mut self,
         opening: Option<&SourceLoc>,
-        depth: usize,
-    ) -> SpiceResult<Vec<Instruction>> {
-        if depth > 32 {
+        nesting: Nesting,
+        allow_else: bool,
+    ) -> SpiceResult<(Vec<Instruction>, bool)> {
+        if nesting.depth > 32 {
             return Err(SpiceError::circuit("control nesting limit exceeded"));
         }
         let mut commands = Vec::new();
         while let Some(card) = self.cards.get(self.cursor).copied() {
             self.cursor += 1;
             let (name, rest) = split_command(card);
-            if name.eq_ignore_ascii_case("end") {
+            let is_else = name.eq_ignore_ascii_case("else");
+            if name.eq_ignore_ascii_case("end") || is_else {
                 empty_arguments(rest, &card.location)?;
-                if opening.is_none() {
-                    return Err(error(&card.location, "end without a loop"));
+                if opening.is_none() || (is_else && !allow_else) {
+                    return Err(error(&card.location, format!("unexpected {name}")));
                 }
-                return Ok(commands);
+                return Ok((commands, is_else));
             }
-            let operation = self.operation(card, name, rest, depth)?;
+            let operation = self.operation(card, name, rest, nesting)?;
             commands.push(Instruction {
                 location: card.location.clone(),
                 operation,
             });
         }
         if let Some(location) = opening {
-            return Err(error(location, "loop missing end"));
+            return Err(error(location, "control block missing end"));
         }
-        Ok(commands)
+        Ok((commands, false))
+    }
+
+    fn structured(
+        &mut self,
+        name: &str,
+        rest: &str,
+        location: &SourceLoc,
+        nesting: Nesting,
+    ) -> SpiceResult<Operation> {
+        if name == "if" {
+            let test = condition(rest, location)?;
+            let (yes, has_else) = self.block(Some(location), nesting.child(false), true)?;
+            let no = if has_else {
+                self.block(Some(location), nesting.child(false), false)?.0
+            } else {
+                Vec::new()
+            };
+            return Ok(Operation::If(test, yes, no));
+        }
+        let spec = match name {
+            "while" | "dowhile" => {
+                LoopSpec::Conditional(condition(rest, location)?, name == "dowhile")
+            }
+            "repeat" => LoopSpec::Repeat(
+                (!rest.is_empty())
+                    .then(|| expression(rest, location))
+                    .transpose()?,
+            ),
+            "foreach" => {
+                let mut words = rest.split_ascii_whitespace();
+                let name = identifier(words.next().unwrap_or_default(), location)?;
+                let values = words
+                    .map(|word| expression(word, location))
+                    .collect::<SpiceResult<Vec<_>>>()?;
+                if values.is_empty() {
+                    return Err(error(location, "foreach requires at least one value"));
+                }
+                LoopSpec::Foreach(name, values)
+            }
+            _ => return Err(error(location, "invalid structured command")),
+        };
+        let (body, _) = self.block(Some(location), nesting.child(true), false)?;
+        Ok(Operation::Loop(spec, body))
     }
 
     fn operation(
@@ -349,7 +521,7 @@ impl Compiler<'_> {
         card: &RawCard,
         name: &str,
         rest: &str,
-        depth: usize,
+        nesting: Nesting,
     ) -> SpiceResult<Operation> {
         let location = &card.location;
         match name.to_ascii_lowercase().as_str() {
@@ -363,25 +535,26 @@ impl Compiler<'_> {
                 self.tunables.insert(name.clone());
                 Ok(Operation::AlterParameter(name, value))
             }
-            "while" => Ok(Operation::While(
-                condition(rest, location)?,
-                self.block(Some(location), depth + 1)?,
-            )),
-            "foreach" => {
-                let mut words = rest.split_ascii_whitespace();
-                let name = identifier(words.next().unwrap_or_default(), location)?;
-                let values = words
-                    .map(|word| expression(word, location))
-                    .collect::<SpiceResult<Vec<_>>>()?;
-                if values.is_empty() {
-                    return Err(error(location, "foreach requires at least one value"));
-                }
-                Ok(Operation::Foreach(
-                    name,
-                    values,
-                    self.block(Some(location), depth + 1)?,
-                ))
+            "if" | "while" | "dowhile" | "repeat" | "foreach" => {
+                self.structured(&name.to_ascii_lowercase(), rest, location, nesting)
             }
+            "break" | "continue" => {
+                let levels = if rest.is_empty() {
+                    1
+                } else {
+                    rest.parse::<usize>()
+                        .map_err(|_| error(location, "invalid loop transfer level"))?
+                };
+                if levels == 0 || levels > nesting.loops {
+                    return Err(error(location, "loop transfer outside enclosing loop"));
+                }
+                Ok(Operation::Transfer(if name.eq_ignore_ascii_case("break") {
+                    Flow::Break(levels)
+                } else {
+                    Flow::Continue(levels)
+                }))
+            }
+            "echo" => Ok(Operation::Echo(echo_parts(rest, location)?)),
             "meas" | "measure" => Ok(Operation::Measure(Box::new(control_measure(
                 card,
                 self.auto_gnd,
@@ -403,7 +576,7 @@ impl Compiler<'_> {
                     .map(str::to_ascii_lowercase)
                     .collect(),
             )),
-            "set" => window_command(rest, location),
+            "set" => set_command(rest, location),
             "setplot" => {
                 if rest.is_empty() || rest.contains(char::is_whitespace) {
                     return Err(error(location, "setplot needs one retained plot name"));
@@ -425,7 +598,7 @@ impl Compiler<'_> {
                 Ok(match name.to_ascii_lowercase().as_str() {
                     "run" => Operation::Run,
                     "reset" => Operation::Reset,
-                    _ => Operation::Quit,
+                    _ => Operation::Transfer(Flow::Quit),
                 })
             }
             _ => match AnalysisKind::parse(name) {
@@ -468,7 +641,11 @@ impl Program {
                         auto_gnd,
                         tunables: &mut program.tunables,
                     };
-                    program.instructions.extend(compiler.block(None, 0)?);
+                    program.instructions.extend(
+                        compiler
+                            .block(None, Nesting { depth: 0, loops: 0 }, false)?
+                            .0,
+                    );
                     cards.clear();
                 }
                 _ => cards.push(card),
@@ -497,7 +674,7 @@ fn collect_observations(
         match &instruction.operation {
             Operation::Measure(card) => measures.push((**card).clone()),
             Operation::Let(_, expression) => {
-                observations.extend(vectors::current_probes(expression)?)
+                observations.extend(vectors::current_probes(expression)?);
             }
             Operation::Print(names) | Operation::Transform(_, names) => {
                 for name in names {
@@ -511,8 +688,12 @@ fn collect_observations(
                     }
                 }
             }
-            Operation::While(_, body) | Operation::Foreach(_, _, body) => {
+            Operation::Loop(_, body) => {
                 collect_observations(body, measures, observations)?;
+            }
+            Operation::If(_, yes, no) => {
+                collect_observations(yes, measures, observations)?;
+                collect_observations(no, measures, observations)?;
             }
             _ => {}
         }
@@ -643,7 +824,7 @@ impl State<'_, '_> {
                 script_observations: self.script_observations,
                 deck_run,
             },
-            ControlBatchBudget {
+            &mut ControlBatchBudget {
                 plots: self.limits.plots - self.plots.len(),
                 cells: self.limits.cells - self.cells,
                 grid: &mut self.remaining_grid,
@@ -920,47 +1101,110 @@ impl State<'_, '_> {
         Ok(())
     }
 
-    fn execute_block(
-        &mut self,
-        commands: &[Instruction],
-    ) -> SpiceResult<std::ops::ControlFlow<()>> {
-        use std::ops::ControlFlow;
+    fn execute_block(&mut self, commands: &[Instruction]) -> SpiceResult<Flow> {
         for instruction in commands {
             self.step(&instruction.location)?;
             let location = &instruction.location;
-            match &instruction.operation {
-                Operation::Foreach(name, values, body) => {
-                    let values = values
-                        .iter()
-                        .map(|value| self.evaluate(value))
-                        .collect::<SpiceResult<Vec<_>>>()?;
-                    for value in values {
-                        self.step(location)?;
-                        self.bind(name, value, location)?;
-                        if self.execute_block(body)?.is_break() {
-                            return Ok(ControlFlow::Break(()));
-                        }
-                    }
+            let flow = match &instruction.operation {
+                Operation::Loop(spec, body) => self.execute_loop(spec, body, location)?,
+                Operation::If(test, yes, no) => {
+                    let branch = if self.test(test)? { yes } else { no };
+                    self.execute_block(branch)?
                 }
-                Operation::While(condition, body) => loop {
-                    self.step(location)?;
-                    if !self.test(condition)? {
-                        break;
-                    }
-                    if self.execute_block(body)?.is_break() {
-                        return Ok(ControlFlow::Break(()));
-                    }
-                },
-                Operation::Quit => return Ok(ControlFlow::Break(())),
-                operation => self.execute_command(operation, location)?,
+                Operation::Transfer(flow) => *flow,
+                operation => {
+                    self.execute_command(operation, location)?;
+                    Flow::Next
+                }
+            };
+            if !matches!(flow, Flow::Next) {
+                return Ok(flow);
             }
         }
-        Ok(ControlFlow::Continue(()))
+        Ok(Flow::Next)
+    }
+
+    fn execute_loop(
+        &mut self,
+        spec: &LoopSpec,
+        body: &[Instruction],
+        location: &SourceLoc,
+    ) -> SpiceResult<Flow> {
+        let mut values = match spec {
+            LoopSpec::Foreach(_, values) => values
+                .iter()
+                .map(|value| self.evaluate(value))
+                .collect::<SpiceResult<Vec<_>>>()?
+                .into_iter(),
+            _ => Vec::new().into_iter(),
+        };
+        let mut repeat = if let LoopSpec::Repeat(Some(value)) = spec {
+            Some(
+                crate::primitives::exact_nonnegative_integer::<usize>(self.evaluate(value)?)
+                    .ok_or_else(|| error(location, "repeat needs a nonnegative integer count"))?,
+            )
+        } else {
+            None
+        };
+        let mut first = true;
+        loop {
+            self.step(location)?;
+            match spec {
+                LoopSpec::Foreach(name, _) => {
+                    let Some(value) = values.next() else {
+                        break;
+                    };
+                    self.bind(name, value, location)?;
+                }
+                LoopSpec::Conditional(test, post_check) => {
+                    if (!*post_check || !first) && !self.test(test)? {
+                        break;
+                    }
+                }
+                LoopSpec::Repeat(_) => {
+                    if let Some(count) = &mut repeat {
+                        if *count == 0 {
+                            break;
+                        }
+                        *count -= 1;
+                    }
+                }
+            }
+            first = false;
+            match self.execute_block(body)? {
+                Flow::Next | Flow::Continue(1) => {}
+                Flow::Break(1) => break,
+                Flow::Break(levels) => return Ok(Flow::Break(levels - 1)),
+                Flow::Continue(levels) => return Ok(Flow::Continue(levels - 1)),
+                Flow::Quit => return Ok(Flow::Quit),
+            }
+        }
+        Ok(Flow::Next)
     }
 
     fn execute_command(&mut self, operation: &Operation, location: &SourceLoc) -> SpiceResult<()> {
         match operation {
             Operation::Let(name, value) => self.assign(name, value, location)?,
+            Operation::SetScalar(name, value) => {
+                let value = self.evaluate(value)?;
+                self.bind(name, value, location)?;
+            }
+            Operation::Echo(parts) => {
+                for part in parts {
+                    match part {
+                        EchoPart::Text(text) => self.output.emit(text, location)?,
+                        EchoPart::Variable(name) => {
+                            let value = self
+                                .variables
+                                .get(name)
+                                .copied()
+                                .or_else(|| self.session.scope().ok()?.get(name))
+                                .ok_or_else(|| error(location, format!("unknown scalar {name}")))?;
+                            self.output.emit(&format!("{value}"), location)?;
+                        }
+                    }
+                }
+            }
             Operation::AlterParameter(name, value) => {
                 let value = self.evaluate(value)?;
                 self.pending.insert(name.clone(), value);
@@ -998,7 +1242,7 @@ impl State<'_, '_> {
             Operation::SetWindow(window) => self.window = *window,
             Operation::SetPlot(name) => self.select_plot(name, location)?,
             Operation::Destroy(names) => self.destroy(names, location)?,
-            Operation::Foreach(..) | Operation::While(..) | Operation::Quit => {
+            Operation::Loop(..) | Operation::If(..) | Operation::Transfer(..) => {
                 return Err(error(location, "unexpected control-flow instruction"));
             }
         }
