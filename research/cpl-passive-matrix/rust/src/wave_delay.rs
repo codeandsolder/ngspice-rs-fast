@@ -640,6 +640,11 @@ impl WaveNetwork {
     }
 }
 
+mod native_modal;
+pub use native_modal::{
+    NativeModalCoefficients, PhysicalModalLine, PreparedPhysicalModalLine, WaveDiscretization,
+};
+
 mod static_pi;
 pub use static_pi::coupled_static_rg_pi;
 

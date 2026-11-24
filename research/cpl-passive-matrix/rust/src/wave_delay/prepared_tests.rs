@@ -169,3 +169,83 @@ fn declared_future_source_front_is_not_leaked_by_macro_interpolation() -> Result
     assert!(later.transmitted_far()[0] > 0.);
     Ok(())
 }
+
+fn dense_passive_multimode(modes: usize, stages: usize) -> Result<WaveNetwork, &'static str> {
+    let width = 2 * modes;
+    let mut scattering = vec![0.; width * width];
+    for row in 0..width {
+        for col in 0..width {
+            let same = row % modes == col % modes;
+            let opposite = row / modes != col / modes;
+            scattering[row * width + col] = if same && opposite {
+                0.52
+            } else if same {
+                0.04
+            } else if opposite {
+                0.025
+            } else {
+                0.01
+            };
+        }
+    }
+    let delays = (0..modes)
+        .map(|mode| match mode {
+            0 => 1e-10,
+            1 => 1.414_213_562_373_095e-10,
+            _ => 1.732_050_807_568_877e-10,
+        })
+        .collect();
+    WaveNetwork::new(
+        delays,
+        stages,
+        scattering,
+        vec![0.; modes],
+        vec![f64::INFINITY; modes],
+        true,
+    )
+}
+
+#[test]
+fn dense_coupled_three_wire_macrostep_carries_cross_mode_newton_jacobian()
+-> Result<(), &'static str> {
+    let mut network = dense_passive_multimode(3, 8)?;
+    let response = network.prepare_step(7e-10)?;
+    assert!(response.internal_steps() >= 7);
+    let incident = [1., 0., 0.];
+    let empty = [0., 0., 0.];
+    let first = response.evaluate(&incident, &empty)?;
+    let jac = response.reflected_jacobian();
+    assert_eq!(jac.len(), 18);
+    let alternate = response.evaluate(&[0.5, 0., 0.], &empty)?;
+    for (mode, (&a, &b)) in first
+        .reflected_near()
+        .iter()
+        .zip(alternate.reflected_near())
+        .enumerate()
+    {
+        assert!(2.0_f64.mul_add(-b, a).abs() < 1e-11, "mode={mode}");
+    }
+    network.accept_prepared(first)?;
+    assert!(network.energies().1 <= network.energies().0 + 1e-12);
+    Ok(())
+}
+
+#[test]
+fn dense_three_wire_event_fanout_remains_bounded_in_one_long_macrostep() -> Result<(), &'static str>
+{
+    for end in [9e-10, 1.2e-9, 1.5e-9, 1.8e-9, 2.1e-9, 2.4e-9, 2.7e-9, 3e-9] {
+        let network = dense_passive_multimode(3, 8)?;
+        let started = std::time::Instant::now();
+        let prepared = network.prepare_step(end)?;
+        eprintln!(
+            "dense 3-wire stages=8 duration={end:.2e} steps={} elapsed={:?}",
+            prepared.internal_steps(),
+            started.elapsed()
+        );
+        assert!(
+            prepared.internal_steps() < 200_000,
+            "event scheduling has unacceptable combinatorial growth"
+        );
+    }
+    Ok(())
+}
