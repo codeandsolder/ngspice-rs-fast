@@ -596,7 +596,10 @@ mod tests {
             2.0 * 4.0 * BOLTZMANN * 300.15 * 1e-3
         );
         let white = NoiseKind::White { density: 2.0e-24 };
-        assert_eq!(white.scalar_output_density(3.0, 100.0).unwrap(), 6.0e-24);
+        assert_eq!(
+            white.scalar_output_density(3.0, 100.0).unwrap(),
+            3.0 * 2.0e-24
+        );
         assert_eq!(white.rf_amplitude().unwrap(), Some((2.0e-24_f64).sqrt()));
         assert!(NoiseKind::White { density: -1.0 }.rf_amplitude().is_err());
         let shot = NoiseKind::Shot { current: -1e-3 };
