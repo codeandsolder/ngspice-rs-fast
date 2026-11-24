@@ -425,21 +425,33 @@ mod tests {
                 summed_lambdas += lambda;
                 for row in 0..order {
                     let (mut cv, mut li) = (0.0_f64, 0.0_f64);
+                    let (mut cv_mass, mut li_mass) = (0.0_f64, 0.0_f64);
                     for k in 0..order {
-                        cv +=
+                        let current_term =
                             line.c.data()[row * order + k] * modes.voltage_basis[k * order + mode];
-                        li +=
+                        let voltage_term =
                             line.l.data()[row * order + k] * modes.current_basis[k * order + mode];
+                        cv += current_term;
+                        li += voltage_term;
+                        cv_mass += current_term.abs();
+                        li_mass += voltage_term.abs();
                     }
                     let expected_i = modes.current_basis[row * order + mode];
                     let expected_li = lambda * modes.voltage_basis[row * order + mode];
+                    // Backward error is measured against the absolute sum
+                    // of the dot-product terms, never a near-zero component.
+                    // Component-wise relative error is undefined for a
+                    // physically valid mode containing cancellations.
+                    let budget = 64. * f64::from(u32::try_from(order).unwrap()) * f64::EPSILON;
                     assert!(
-                        (cv - expected_i).abs() <= 2e-11 * expected_i.abs().max(1e-14),
+                        (cv - expected_i).abs()
+                            <= budget * (cv_mass + expected_i.abs()).max(f64::MIN_POSITIVE),
                         "C V=I: {order} conductors mode={mode} row={row}, residual={:.17e}",
                         cv - expected_i
                     );
                     assert!(
-                        (li - expected_li).abs() <= 2e-11 * expected_li.abs().max(1e-23),
+                        (li - expected_li).abs()
+                            <= budget * (li_mass + expected_li.abs()).max(f64::MIN_POSITIVE),
                         "L I=lambda V: {order} conductors mode={mode} row={row}, residual={:.17e}",
                         li - expected_li
                     );
