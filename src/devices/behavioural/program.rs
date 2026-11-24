@@ -288,6 +288,7 @@ pub struct Program {
     derivatives: Vec<Slot>,
     quantities: Vec<Quantity>,
     uses_frequency: bool,
+    uses_time: bool,
 }
 
 fn unsupported(expr: &BExpr, message: impl Into<String>) -> SpiceError {
@@ -328,6 +329,7 @@ impl Program {
             derivatives,
             quantities: compiler.quantities,
             uses_frequency: compiler.uses_frequency,
+            uses_time: compiler.uses_time,
         })
     }
 
@@ -335,6 +337,12 @@ impl Program {
     #[must_use]
     pub const fn uses_frequency(&self) -> bool {
         self.uses_frequency
+    }
+
+    /// True when the expression reads explicit transient time.
+    #[must_use]
+    pub const fn uses_time(&self) -> bool {
+        self.uses_time
     }
 
     /// The circuit quantities the expression reads, in variable order.
@@ -390,6 +398,7 @@ struct Compiler<'a> {
     indices: HashMap<QuantityKey<'a>, usize>,
     quantities: Vec<Quantity>,
     uses_frequency: bool,
+    uses_time: bool,
 }
 
 impl<'a> Compiler<'a> {
@@ -414,7 +423,10 @@ fn compile<'a>(expr: &'a BExpr, compiler: &mut Compiler<'a>) -> SpiceResult<Node
     Ok(match &expr.kind {
         BExprKind::Number { value, .. } => Node::Constant(*value),
         BExprKind::Name(name) => match name.as_str() {
-            "time" => Node::Time,
+            "time" => {
+                compiler.uses_time = true;
+                Node::Time
+            }
             "temper" => Node::Temperature,
             "pi" => Node::Constant(std::f64::consts::PI),
             "e" => Node::Constant(std::f64::consts::E),

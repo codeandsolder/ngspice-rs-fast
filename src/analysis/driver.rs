@@ -218,7 +218,7 @@ impl Default for AnalysisContext {
 
 /// Analyses with production drivers, for the devices and options documented
 /// under `docs/port/`.
-pub const DRIVERS: [AnalysisKind; 10] = [
+pub const DRIVERS: [AnalysisKind; 11] = [
     AnalysisKind::OperatingPoint,
     AnalysisKind::DcSweep,
     AnalysisKind::Ac,
@@ -229,6 +229,7 @@ pub const DRIVERS: [AnalysisKind; 10] = [
     AnalysisKind::Noise,
     AnalysisKind::Distortion,
     AnalysisKind::Sensitivity,
+    AnalysisKind::PeriodicSteadyState,
 ];
 
 /// Whether an analysis has a driver.

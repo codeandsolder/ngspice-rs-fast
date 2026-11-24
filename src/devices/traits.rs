@@ -737,6 +737,12 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
+    /// Whether a device's equations depend explicitly on transient time.
+    /// Independent source waveforms are checked separately at analysis binding.
+    fn depends_on_time(&self) -> bool {
+        false
+    }
+
     /// True when the device's small-signal (AC) stamp itself depends on the
     /// analysis frequency in a way the affine `A + j omega E` pencil cannot
     /// express, e.g. a transmission line's `exp(-j omega TD)` (`traacld.c`).

@@ -109,8 +109,9 @@ pub const fn job_order(kind: AnalysisKind) -> usize {
         AnalysisKind::Sensitivity => 9,
         // RFSPICE appends SPinfo after SENSinfo (and the PSS/SENSE2 entries,
         // which have no card here).
-        AnalysisKind::SParameter => 10,
-        AnalysisKind::Fourier => 11,
+        AnalysisKind::PeriodicSteadyState => 10,
+        AnalysisKind::SParameter => 11,
+        AnalysisKind::Fourier => 12,
     }
 }
 
@@ -131,6 +132,7 @@ pub const fn plot_abbreviation(kind: AnalysisKind) -> &'static str {
         AnalysisKind::Fourier => "four",
         // typesdef.c maps the "SP Analysis" plot name to "sp".
         AnalysisKind::SParameter => "sp",
+        AnalysisKind::PeriodicSteadyState => "pss",
     }
 }
 
@@ -1038,6 +1040,7 @@ mod tests {
                 AnalysisKind::Distortion,
                 AnalysisKind::Noise,
                 AnalysisKind::Sensitivity,
+                AnalysisKind::PeriodicSteadyState,
                 AnalysisKind::SParameter,
                 AnalysisKind::Fourier,
             ]

@@ -572,6 +572,7 @@ pub(crate) const fn kind_name(kind: Kind) -> &'static str {
         Kind::TransferFunction => "transfer function",
         Kind::Fourier => "Fourier",
         Kind::SParameter => "S-parameter",
+        Kind::PeriodicSteadyState => "periodic steady state",
     }
 }
 

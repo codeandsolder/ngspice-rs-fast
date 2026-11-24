@@ -521,6 +521,7 @@ mod tests {
             derivatives,
             quantities: compiler.quantities,
             uses_frequency: compiler.uses_frequency,
+            uses_time: compiler.uses_time,
         }
     }
 
