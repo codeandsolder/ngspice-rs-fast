@@ -1,0 +1,85 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+
+// A single invocation processes one independent, topology-identical sparse
+// system. Symbolic LU fill and every numerical elimination/update index come
+// from a CPU-prepared immutable plan; no GPU-side symbolic allocations.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Input { double packed[]; };
+layout(set = 0, binding = 1, std430) buffer Output { double solution[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Plan { uint plan[]; };
+layout(set = 0, binding = 3, std430) buffer Workspace { double work[]; };
+
+void main() {
+    uint n = plan[0];
+    uint nnz = plan[1];
+    uint op_count = plan[2];
+    uint stride = nnz + n;
+    uint out_stride = n + 1u;
+    uint lane = gl_GlobalInvocationID.x;
+    if (lane >= uint(solution.length()) / out_stride) { return; }
+    uint base = lane * stride;
+    uint output_base = lane * out_stride;
+
+    uint row_offset = 4u;
+    uint col_offset = row_offset + n + 1u;
+    uint diag_offset = col_offset + nnz;
+    uint op_offset = diag_offset + n;
+    uint update_offset = op_offset + 6u * op_count;
+
+    // Each dispatch starts from an identical pristine numeric input. This
+    // scratch copy, unlike the symbolic plan, is candidate-local.
+    for (uint i = 0u; i < stride; i++) {
+        work[base + i] = packed[base + i];
+    }
+
+    bool invalid = false;
+    for (uint step = 0u; step < op_count; step++) {
+        uint op = op_offset + 6u * step;
+        uint diag_index = plan[op];
+        uint lower_index = plan[op + 1u];
+        uint pivot_row = plan[op + 2u];
+        uint target_row = plan[op + 3u];
+        double pivot = work[base + diag_index];
+        if (isnan(pivot) || isinf(pivot) || abs(pivot) < 1.0e-12) {
+            invalid = true;
+            break;
+        }
+        double factor = work[base + lower_index] / pivot;
+        work[base + lower_index] = factor;
+        work[base + nnz + target_row] -= factor * work[base + nnz + pivot_row];
+        uint begin = plan[op + 4u];
+        uint end = plan[op + 5u];
+        for (uint edge = begin; edge < end; edge++) {
+            uint pair = update_offset + 2u * edge;
+            uint source = plan[pair];
+            uint target = plan[pair + 1u];
+            work[base + target] -= factor * work[base + source];
+        }
+    }
+
+    if (!invalid) {
+        for (int row = int(n) - 1; row >= 0; row--) {
+            uint i = uint(row);
+            double pivot = work[base + plan[diag_offset + i]];
+            if (isnan(pivot) || isinf(pivot) || abs(pivot) < 1.0e-12) {
+                invalid = true;
+                break;
+            }
+            double value = work[base + nnz + i];
+            for (uint idx = plan[row_offset + i]; idx < plan[row_offset + i + 1u]; idx++) {
+                uint column = plan[col_offset + idx];
+                if (column > i) {
+                    value -= work[base + idx] * solution[output_base + column];
+                }
+            }
+            solution[output_base + i] = value / pivot;
+        }
+    }
+    // Status is a separate f64 slot: 0 success; 1 requires robust CPU
+    // pivoting. Do not pass a partly solved vector off as a valid result.
+    solution[output_base + n] = invalid ? 1.0 : 0.0;
+    if (invalid) {
+        for (uint i = 0u; i < n; i++) { solution[output_base + i] = 0.0 / 0.0; }
+    }
+}

@@ -1,0 +1,35 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+
+// One invocation solves one independent system. Host matrix order:
+// [system][row][lower, diagonal, upper, rhs], all IEEE binary64.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Matrices { double matrix_data[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Results { double result[]; };
+
+const uint N = 32u;
+
+void main() {
+    uint lane = gl_GlobalInvocationID.x;
+    if (lane >= uint(result.length()) / N) { return; }
+    uint m = lane * N * 4u;
+    uint x = lane * N;
+    double cprime[32];
+    double dprime[32];
+    double inv = 1.0 / matrix_data[m + 1u];
+    cprime[0] = matrix_data[m + 2u] * inv;
+    dprime[0] = matrix_data[m + 3u] * inv;
+    for (uint i = 1u; i < N; i++) {
+        uint k = m + i * 4u;
+        double a = matrix_data[k];
+        double den = matrix_data[k + 1u] - a * cprime[i - 1u];
+        cprime[i] = i == N - 1u ? 0.0 : matrix_data[k + 2u] / den;
+        dprime[i] = (matrix_data[k + 3u] - a * dprime[i - 1u]) / den;
+    }
+    double solved = dprime[N - 1u];
+    result[x + N - 1u] = solved;
+    for (int i = int(N) - 2; i >= 0; i--) {
+        solved = dprime[uint(i)] - cprime[uint(i)] * solved;
+        result[x + uint(i)] = solved;
+    }
+}
