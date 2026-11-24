@@ -313,7 +313,7 @@ impl CoupledLinePlan {
         // Renormalize the *physical length* of a segment, never the
         // coefficients. The same validated model applies to every section.
         loop {
-            if !(bound > 4.) {
+            if bound <= 4. {
                 break;
             }
             if steps >= self.limits.max_squarings {
