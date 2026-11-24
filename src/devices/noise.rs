@@ -73,6 +73,8 @@ pub enum NoiseFamily {
     Resistor,
     /// `sw`, the S switch (`swnoise.c`).
     VoltageSwitch,
+    /// `vdmos` (`vdmosnoi.c`), last in C's noisy device table.
+    Vdmos,
 }
 
 /// The physical law of one noise generator, evaluated at the bias point.
@@ -90,6 +92,14 @@ pub enum NoiseKind {
     Shot {
         /// DC current in amperes.
         current: Real,
+    },
+    /// Prepared physical-model white-current noise in A²/Hz.
+    ///
+    /// The source kernel has already applied its temperature, geometry,
+    /// and conductance law; the solver only applies the AC transfer gain.
+    White {
+        /// Frequency-independent positive power spectral density, A²/Hz.
+        density: Real,
     },
     /// Flicker noise: `numerator` times the device's frequency law (C
     /// `N_GAIN` times the device's own 1/f expression).
@@ -202,6 +212,7 @@ impl NoiseKind {
                 temperature,
             } => gain * 4.0 * BOLTZMANN * temperature * conductance,
             Self::Shot { current } => gain * 2.0 * CHARGE * current.abs(),
+            Self::White { density } => gain * density,
             // C: `noizDens = gain; noizDens *= <numerator> / <denominator>`.
             Self::Flicker { numerator, law } => gain * law.apply(numerator, frequency),
             Self::Gain { factor } => gain * factor,
@@ -233,6 +244,7 @@ impl NoiseKind {
                 temperature,
             } => 4. * BOLTZMANN * temperature * conductance,
             Self::Shot { current } => 2. * CHARGE * current.abs(),
+            Self::White { density } => density,
             Self::Flicker { .. } | Self::Gain { .. } => return Ok(None),
             // Do not substitute the ordinary NevalSrc2 expression: the RF
             // branch builds complex port amplitudes and the C implementation
@@ -254,6 +266,7 @@ impl NoiseKind {
                 temperature,
             } => conductance.is_finite() && temperature.is_finite() && temperature > 0.0,
             Self::Shot { current } => current.is_finite(),
+            Self::White { density } => density.is_finite() && density >= 0.0,
             Self::Flicker { numerator, law } => numerator.is_finite() && law.validate(),
             Self::Gain { factor } => factor.is_finite(),
             Self::CorrelatedThermal {
@@ -582,6 +595,10 @@ mod tests {
             thermal.scalar_output_density(2.0, 10.0).unwrap(),
             2.0 * 4.0 * BOLTZMANN * 300.15 * 1e-3
         );
+        let white = NoiseKind::White { density: 2.0e-24 };
+        assert_eq!(white.scalar_output_density(3.0, 100.0).unwrap(), 6.0e-24);
+        assert_eq!(white.rf_amplitude().unwrap(), Some((2.0e-24_f64).sqrt()));
+        assert!(NoiseKind::White { density: -1.0 }.rf_amplitude().is_err());
         let shot = NoiseKind::Shot { current: -1e-3 };
         assert_eq!(
             shot.scalar_output_density(1.0, 1.0).unwrap(),

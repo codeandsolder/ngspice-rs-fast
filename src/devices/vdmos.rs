@@ -11,6 +11,9 @@ use model_kernel_vdmos::{Bias, Evaluation, Instance, Polarity, PreparedModel, co
 use crate::devices::limiting::{Limiter, Linearization, critical_voltage};
 use crate::devices::linear::LinearContext;
 use crate::devices::models::{ModelContext, PreparationKey, ResolvedModel};
+use crate::devices::noise::{
+    DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
+};
 use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::traits::{Device, StampContext};
 use crate::devices::{DeviceState, IterationPhase};
@@ -708,6 +711,63 @@ impl Device for Vdmos {
             slots.push(self.thermal_charge_slot());
         }
         slots
+    }
+
+    /// Source-owned white and flicker noise at the converged physical bias;
+    /// MNA noise transfer, ordering and frequency integration stay here.
+    fn noise(&self, context: &NoiseContext<'_>) -> SpiceResult<DeviceNoise> {
+        let evaluated = self.evaluation(
+            &|node| context.voltage(node),
+            context.model_context.temperature,
+        )?;
+        let prepared = self
+            .model
+            .bind(Instance {
+                multiplier: self.multiplier,
+                self_heating: self.thermal.is_some(),
+            })
+            .map_err(|error| invalid(&self.name, error))?;
+        let density = prepared
+            .noise_density(&evaluated, 1.0)
+            .map_err(|error| invalid(&self.name, error))?;
+        let [d, _, s] = self.inner;
+        let [de, _, se] = self.terminals;
+        Ok(DeviceNoise::Sources {
+            family: NoiseFamily::Vdmos,
+            model: Some(self.model_name.clone()),
+            total: true,
+            sources: vec![
+                NoiseSource::new(
+                    "_rd",
+                    [d, de],
+                    NoiseKind::White {
+                        density: density.drain,
+                    },
+                ),
+                NoiseSource::new(
+                    "_rs",
+                    [s, se],
+                    NoiseKind::White {
+                        density: density.source,
+                    },
+                ),
+                NoiseSource::new(
+                    "_id",
+                    [d, s],
+                    NoiseKind::White {
+                        density: density.channel,
+                    },
+                ),
+                NoiseSource::new(
+                    "_1overf",
+                    [d, s],
+                    NoiseKind::Flicker {
+                        numerator: density.flicker,
+                        law: FlickerLaw::PerHertz,
+                    },
+                ),
+            ],
+        })
     }
 
     fn observation_operating(
