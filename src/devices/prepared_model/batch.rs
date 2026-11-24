@@ -1,7 +1,7 @@
 //! Contiguous homogeneous model tiles with borrowed inputs and prepared data.
 //! Family kernels may override the default scalar traversal with portable SIMD.
 
-use crate::devices::prepared_model::{Capability, Kernel, Point, PointBuffer};
+use crate::devices::prepared_model::{Capability, Descriptor, Kernel, Point, PointBuffer};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// Persistent output buffers for one homogeneous model-family tile.
@@ -85,10 +85,12 @@ impl BatchOutput {
     ///
     /// # Errors
     /// Missing or nonconservative physical outputs.
-    pub fn validate(&mut self, charge: Capability) -> SpiceResult<()> {
+    pub fn validate(&mut self, descriptor: &Descriptor) -> SpiceResult<()> {
+        if self.width != descriptor.equations.len() {
+            return Err(SpiceError::circuit("prepared model tile schema mismatch"));
+        }
         for lane in 0..self.lanes {
-            let width = self.width;
-            self.point(lane)?.validate(width, charge)?;
+            self.point(lane)?.validate(descriptor)?;
         }
         Ok(())
     }
@@ -111,8 +113,8 @@ pub struct BatchInput<'a, K: Kernel> {
     pub prepared: &'a [K::Prepared],
     /// Terminal voltages in lane-major order.
     pub voltages: &'a [Real],
-    /// Validated physical channel capability.
-    pub charge: Capability,
+    /// Validated, immutable equation and channel schema.
+    pub descriptor: &'a Descriptor,
 }
 
 /// Complete a homogeneous tile without heap allocation in the hot path.
@@ -128,12 +130,17 @@ pub fn evaluate_tile<K: Kernel>(
     input: &BatchInput<'_, K>,
     output: &mut BatchOutput,
 ) -> SpiceResult<()> {
-    if input.prepared.len() != output.lanes || input.voltages.len() != output.width * output.lanes {
-        return Err(SpiceError::circuit("prepared tile input shape mismatch"));
+    if input.prepared.len() != output.lanes
+        || input.descriptor.equations.len() != output.width
+        || input.voltages.len() != output.width * output.lanes
+    {
+        return Err(SpiceError::circuit(
+            "prepared tile input/schema shape mismatch",
+        ));
     }
-    output.reset(input.charge);
+    output.reset(input.descriptor.charge);
     kernel.evaluate_batch(input.prepared, input.voltages, output)?;
-    output.validate(input.charge)
+    output.validate(input.descriptor)
 }
 
 /// Default scalar physical evaluation for a homogeneous prepared tile.
@@ -168,10 +175,15 @@ pub fn evaluate_one<K: Kernel>(
     kernel: &K,
     prepared: &K::Prepared,
     voltages: &[Real],
-    charge: Capability,
+    descriptor: &Descriptor,
     output: &mut PointBuffer,
 ) -> SpiceResult<()> {
-    output.reset(charge);
+    if voltages.len() != descriptor.equations.len() || output.current.len() != voltages.len() {
+        return Err(SpiceError::circuit(
+            "prepared scalar input/schema shape mismatch",
+        ));
+    }
+    output.reset(descriptor.charge);
     kernel.evaluate(prepared, voltages, &mut output.point())?;
-    output.point().validate(voltages.len(), charge)
+    output.point().validate(descriptor)
 }

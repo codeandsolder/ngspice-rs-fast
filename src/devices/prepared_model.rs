@@ -18,7 +18,7 @@ use crate::maths::Vector;
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
 
 /// The distinguished version of the native prepared-model contract.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Physical support must be explicit: unavailable is different from known-zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +42,27 @@ pub struct Parameter {
     pub changes_topology: bool,
 }
 
+/// Physical equation identity; not every MNA row carries electrical current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EquationKind {
+    /// Electrical KCL in amperes; dynamic storage is charge in coulombs.
+    Electrical,
+    /// A heat balance in watts; dynamic storage is energy in joules.
+    Thermal,
+    /// A generalized internal equation (e.g. a recovery-state relaxation).
+    Internal,
+}
+
+/// One engine-bound MNA coordinate and its equation's physical unit domain.
+/// All binding ordinals are frozen before any Newton evaluation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Equation {
+    /// Stable, lowercase unique name in this artifact.
+    pub name: String,
+    /// Whether the equation conserves electrical charge or evolves another state.
+    pub kind: EquationKind,
+}
+
 /// Self-describing native model artifact metadata. Values are not SPICE cards.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Descriptor {
@@ -51,8 +72,8 @@ pub struct Descriptor {
     pub fingerprint: [u8; 16],
     /// Native interface version.
     pub abi: u32,
-    /// Fixed external plus hidden terminal count.
-    pub terminals: usize,
+    /// Ordered electrical, thermal and hidden-state MNA coordinates.
+    pub equations: Vec<Equation>,
     /// Ordered input parameter slots, without textual lookups in Newton loads.
     pub parameters: Vec<Parameter>,
     /// Available stored charge/flux physics.
@@ -69,13 +90,36 @@ impl Descriptor {
     pub fn validate(&self) -> SpiceResult<()> {
         if self.abi != ABI_VERSION
             || self.family.is_empty()
-            || self.terminals < 2
+            || self.equations.len() < 2
             || self.fingerprint == [0; 16]
-            || self.terminals.checked_mul(self.terminals).is_none()
+            || self
+                .equations
+                .len()
+                .checked_mul(self.equations.len())
+                .is_none()
+            || self
+                .equations
+                .iter()
+                .filter(|slot| slot.kind == EquationKind::Electrical)
+                .count()
+                < 2
         {
             return Err(SpiceError::circuit(
-                "invalid prepared model ABI, family or terminals",
+                "invalid prepared model ABI, family or equation slots",
             ));
+        }
+        for (index, equation) in self.equations.iter().enumerate() {
+            if equation.name.is_empty()
+                || equation.name != equation.name.to_ascii_lowercase()
+                || self.equations[..index]
+                    .iter()
+                    .any(|previous| previous.name == equation.name)
+            {
+                return Err(SpiceError::circuit(format!(
+                    "{}: invalid or duplicate equation slot '{}'",
+                    self.family, equation.name
+                )));
+            }
         }
         for (index, slot) in self.parameters.iter().enumerate() {
             if slot.name.is_empty()
@@ -165,13 +209,13 @@ pub trait Kernel: Debug + Send + Sync + 'static {
 
 /// Mutable view of a single prepared-kernel result; all arrays are row-major.
 pub struct Point<'a> {
-    /// Terminal currents flowing *out* of the attached circuit nodes.
+    /// Static residual in the physical units of the corresponding equation row.
     pub current: &'a mut [Real],
-    /// Differential conductance dI[row]/dV[col].
+    /// Static residual Jacobian dF[row]/dx[col].
     pub conductance: &'a mut [Real],
-    /// Terminal charge. Only valid for computed or physically-zero storage.
+    /// Generalized dynamic storage: electrical charge, thermal energy or state quantity.
     pub charge: &'a mut [Real],
-    /// Differential charge dQ[row]/dV[col].
+    /// Dynamic storage Jacobian dQ[row]/dx[col].
     pub capacitance: &'a mut [Real],
 }
 
@@ -179,12 +223,17 @@ impl Point<'_> {
     /// Validate the physical output and its exact declared capability.
     ///
     /// # Errors
-    /// Nonfinite outputs or broken KCL / charge conservation.
-    pub fn validate(&self, width: usize, capability: Capability) -> SpiceResult<()> {
+    /// Nonfinite, incomplete, nonconservative electrical or gauge-variant outputs.
+    pub fn validate(&self, descriptor: &Descriptor) -> SpiceResult<()> {
+        let width = descriptor.equations.len();
+        let capability = descriptor.charge;
+        let size = width
+            .checked_mul(width)
+            .ok_or_else(|| SpiceError::circuit("prepared kernel Jacobian shape overflow"))?;
         if self.current.len() != width
-            || self.conductance.len() != width * width
+            || self.conductance.len() != size
             || self.charge.len() != width
-            || self.capacitance.len() != width * width
+            || self.capacitance.len() != size
         {
             return Err(SpiceError::circuit("prepared kernel output shape mismatch"));
         }
@@ -195,7 +244,7 @@ impl Point<'_> {
             .any(|v| !v.is_finite())
         {
             return Err(SpiceError::circuit(
-                "missing or nonfinite prepared current/Jacobian",
+                "missing or nonfinite prepared static residual/Jacobian",
             ));
         }
         if capability != Capability::Unavailable
@@ -206,7 +255,7 @@ impl Point<'_> {
                 .any(|v| !v.is_finite())
         {
             return Err(SpiceError::circuit(
-                "missing or nonfinite prepared charge/Jacobian",
+                "missing or nonfinite prepared dynamic storage/Jacobian",
             ));
         }
         if capability == Capability::Zero
@@ -217,27 +266,50 @@ impl Point<'_> {
                 .any(|v| *v != 0.)
         {
             return Err(SpiceError::circuit(
-                "known-zero charge model supplied nonzero storage",
+                "known-zero storage model supplied nonzero state",
             ));
         }
+        // A Kirchhoff group conserves only ELECTRICAL rows. A thermal
+        // balance or recovery state cannot be summed with amperes.
+        // Iterating the prevalidated schema must not allocate on Newton.
         let conservative = |values: &[Real], stride: usize, column: usize| {
             let mut sum = 0.;
             let mut scale = 0.;
-            for row in 0..width {
-                let value = values[row * stride + column];
-                sum += value;
-                scale += value.abs();
+            for (row, equation) in descriptor.equations.iter().enumerate() {
+                if equation.kind == EquationKind::Electrical {
+                    let value = values[row * stride + column];
+                    sum += value;
+                    scale += value.abs();
+                }
             }
-            sum.abs() <= 1e-12 * scale.max(1e-300)
+            sum.abs() <= 1e-12 * scale
+        };
+        // All equations, including thermal power and recovery, must be
+        // unchanged by a global shift of electrical reference potential.
+        let gauge_invariant = |jacobian: &[Real]| {
+            (0..width).all(|row| {
+                let mut sum = 0.;
+                let mut scale = 0.;
+                for (column, equation) in descriptor.equations.iter().enumerate() {
+                    if equation.kind == EquationKind::Electrical {
+                        let value = jacobian[row * width + column];
+                        sum += value;
+                        scale += value.abs();
+                    }
+                }
+                sum.abs() <= 1e-12 * scale
+            })
         };
         if !conservative(self.current, 1, 0)
             || (0..width).any(|column| !conservative(self.conductance, width, column))
+            || !gauge_invariant(self.conductance)
             || (capability != Capability::Unavailable
                 && (!conservative(self.charge, 1, 0)
-                    || (0..width).any(|column| !conservative(self.capacitance, width, column))))
+                    || (0..width).any(|column| !conservative(self.capacitance, width, column))
+                    || !gauge_invariant(self.capacitance)))
         {
             return Err(SpiceError::circuit(
-                "prepared kernel violates terminal conservation",
+                "prepared kernel violates electrical conservation or gauge invariance",
             ));
         }
         Ok(())
@@ -335,7 +407,7 @@ impl<K: Kernel> Artifact<K> {
         values: &[Real],
         temperature: Real,
     ) -> SpiceResult<PreparedDevice<K>> {
-        if terminals.len() != self.descriptor.terminals
+        if terminals.len() != self.descriptor.equations.len()
             || values.len() != self.descriptor.parameters.len()
             || !temperature.is_finite()
             || values.iter().any(|value| !value.is_finite())
@@ -380,9 +452,7 @@ impl<K: Kernel> PreparedDevice<K> {
         self.artifact
             .kernel
             .evaluate(&self.prepared, voltage, &mut output.point())?;
-        output
-            .point()
-            .validate(self.terminals.len(), self.artifact.descriptor.charge)
+        output.point().validate(&self.artifact.descriptor)
     }
 
     /// Make a new immutable prepared parameter context for a candidate.

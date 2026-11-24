@@ -12,10 +12,11 @@ accepted/rejected history, analysis orchestration and adjoint noise transfer.
 
 ## Model and instance preparation
 
-- `Descriptor`: ABI version (`ABI_VERSION`), family name, 128-bit content
-  fingerprint, terminal count (including explicitly modeled hidden nodes),
-  ordered named parameter slots with finite defaults and flags for
-  topology-changing setters, and separate charge and noise capabilities.
+- Descriptor: native ABI v2, family and 128-bit content fingerprint,
+  unique lowercase typed equation slots (electrical/thermal/internal),
+  resolved numeric candidate parameter slots, structural invalidation and
+  explicit dynamic-storage and noise capabilities. The compiler owns
+  source model semantics; the engine binds equation rows once before Newton.
 - `Capability::Computed` requires a complete physical equation implementation;
   `Capability::Zero` is a **declared physical zero**, never an implicit
   approximation; `Capability::Unavailable` means the corresponding analysis
@@ -34,39 +35,22 @@ accepted/rejected history, analysis orchestration and adjoint noise transfer.
 - There is no SPICE deck or protected-library parsing in this API and no
   special-case dispatch keyed by vendor model names.
 
-## Equation and state contract
+## Equation and state contract (ABI v2)
 
-For each terminal `i`, an evaluation returns the *outgoing* current
-`I[i]`, current Jacobian `G[i,j] = ∂I[i]/∂V[j]`, stored terminal charge
-`Q[i]`, and charge Jacobian `C[i,j] = ∂Q[i]/∂V[j]`, all in the declared
-terminal order. Multi-terminal and hidden-terminal models have the same
-shape. All values must be finite, arrays complete, and the sum of terminal
-currents, charges and every Jacobian column must vanish to a rounding-scale
-tolerance (KCL and charge conservation).
+The native kernel supplies a generalized DAE: F(x) + dQ(x)/dt = 0.
+Electrical equation rows represent current in amperes and stored charge
+in coulombs; thermal rows represent watts and joules; internal rows
+represent their declared relaxation or dynamic-state equation.
+Electrical Kirchhoff current, charge, and all their Jacobian column sums
+conserve across electrical rows only. Every physical equation is invariant
+under a common-mode shift of electrical node potentials. Both conditions
+are checked without heap allocation during Newton evaluation.
 
-A DC/Newton device stamp is:
-
-```text
-A[i,j] += G[i,j]
-b[i]   += -I[i] + sum_j G[i,j] * V[j]
-```
-
-Ground rows are suppressed by the engine. AC at a converged bias adds
-`G` to the static pencil `A` and `C` to the dynamic pencil `E`, giving
-`A + jωE`. For a transient trial the engine integrates each `Q[i]` with
-its chosen trapezoidal/Gear history and stamps the companion current and
-`ag0 * C[i,j]`; derivative and charge state slots belong to engine
-`DeviceState`, not to mutable model objects. Dropping a trial cannot
-commit model history; `accept_point` remains the only publication path.
-Unsupported charge equations reject AC/transient loads. Error propagation
-does not replace model equations with weak approximations.
-
-A computed-noise family supplies explicitly labeled `NoiseSource`
-generators through `Kernel::evaluate_noise` at the solved bias point.
-The existing analysis owns adjoint gains and frequency integration.
-Native models use `NoiseFamily::Prepared`, after C's registered families
-in noise traversal. A physically noiseless model may declare `Zero`;
-`Unavailable` does not silently masquerade as noiseless.
+DC stamps G=dF/dx and affine RHS -F+G*x; AC stamps G+jw*C
+where C=dQ/dx; transient uses the engine owned accepted/trial histories
+to integrate Q and stamp its companion derivatives. No thermal power is
+misinterpreted as electrical charge. The independently compiled VDMOS
+model uses thermal and recovery state equations and requires this layout.
 
 ## Homogeneous borrowed tiles
 
@@ -104,6 +88,13 @@ and the full noise-spectrum driver.
 ```sh
 cargo +nightly test --locked --test prepared_model_integration
 ```
+
+An additional analytic four-row electrothermal/recovery DAE exercises
+physical cross-derivatives, heat/relaxation balance, DC sparse stamping,
+AC storage, electrical-only conservation and gauge invariance, and invalid
+structural schemas. It proves representability, not actual VDMOS linkage.
+The independent VDMOS solver branch owns that model-specific integration:
+https://github.com/codeandsolder/ngspice-rs-fast/pull/191 .
 
 This fixture is an independently implemented **analytic stand-in**, not
 a compiled spice-redox artifact. The acceptance milestone for the linked

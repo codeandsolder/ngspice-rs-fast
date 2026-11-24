@@ -8,7 +8,7 @@ use ngspice_rs::analysis::{AnalysisContext, AnalysisInput};
 use ngspice_rs::devices::noise::{NoiseContext, NoiseKind, NoiseSource};
 use ngspice_rs::devices::prepared_model::batch::{BatchInput, BatchOutput, evaluate_tile};
 use ngspice_rs::devices::prepared_model::{
-    ABI_VERSION, Artifact, Capability, Descriptor, Kernel, Parameter, Point,
+    ABI_VERSION, Artifact, Capability, Descriptor, Equation, EquationKind, Kernel, Parameter, Point,
 };
 use ngspice_rs::devices::{
     AnalysisMode, Circuit, IndependentSource, LoadRequest, ModelContext, Resistor, Waveform,
@@ -113,7 +113,16 @@ fn descriptor(charge: Capability) -> Descriptor {
         family: "analytic-polynomial".into(),
         fingerprint: [0x35; 16],
         abi: ABI_VERSION,
-        terminals: 2,
+        equations: vec![
+            Equation {
+                name: "p".into(),
+                kind: EquationKind::Electrical,
+            },
+            Equation {
+                name: "n".into(),
+                kind: EquationKind::Electrical,
+            },
+        ],
         parameters: ["g", "cubic", "c", "charge_cubic"]
             .into_iter()
             .zip([1e-3, 2e-4, 1e-6, 2e-7])
@@ -195,7 +204,7 @@ fn homogeneous_tile_matches_scalar_equations_and_conserves_kcl_and_charge() {
         &BatchInput {
             prepared: &prepared,
             voltages: &voltage,
-            charge: Capability::Computed,
+            descriptor: &descriptor(Capability::Computed),
         },
         &mut out,
     )
@@ -727,5 +736,334 @@ fn declared_physical_zero_and_unavailable_channels_have_distinct_semantics() {
             &mut history.trial(),
         )
         .unwrap_err();
-    assert!(error.to_string().contains("known-zero charge"), "{error}");
+    assert!(error.to_string().contains("known-zero storage"), "{error}");
+}
+
+/// A genuine generalized DAE: two electrical KCL rows, a heat-balance
+/// equation and a recovery-state equation. It is not a transistor surrogate:
+/// it verifies the ABI's unit domains and circuit state ownership.
+#[derive(Debug, Default)]
+struct ElectrothermalKernel;
+
+#[derive(Debug)]
+struct ElectrothermalPrepared {
+    g: Real,
+    temperature_coefficient: Real,
+    c: Real,
+    coupling: Real,
+    heat_conductance: Real,
+    heat_capacitance: Real,
+    relaxation_conductance: Real,
+    recovery_time: Real,
+}
+
+impl Kernel for ElectrothermalKernel {
+    type Prepared = ElectrothermalPrepared;
+
+    fn prepare(&self, parameters: &[Real], _temperature: Real) -> SpiceResult<Self::Prepared> {
+        let [g, k, c, coupling, gth, cth, gq, tau] = parameters else {
+            return Err(SpiceError::circuit(
+                "electrothermal artifact requires eight parameter slots",
+            ));
+        };
+        if parameters.iter().any(|value| !value.is_finite())
+            || *g <= 0.
+            || *c < 0.
+            || *gth <= 0.
+            || *cth < 0.
+            || *gq <= 0.
+            || *tau <= 0.
+        {
+            return Err(SpiceError::circuit(
+                "electrothermal prepared model parameter domain",
+            ));
+        }
+        Ok(ElectrothermalPrepared {
+            g: *g,
+            temperature_coefficient: *k,
+            c: *c,
+            coupling: *coupling,
+            heat_conductance: *gth,
+            heat_capacitance: *cth,
+            relaxation_conductance: *gq,
+            recovery_time: *tau,
+        })
+    }
+
+    fn evaluate(
+        &self,
+        prepared: &Self::Prepared,
+        voltages: &[Real],
+        output: &mut Point<'_>,
+    ) -> SpiceResult<()> {
+        let [positive, negative, thermal, recovery] = voltages else {
+            return Err(SpiceError::circuit("electrothermal input shape"));
+        };
+        let v = positive - negative;
+        let g = prepared.g * (1. + prepared.temperature_coefficient * thermal);
+        if g <= 0. {
+            return Err(SpiceError::circuit(
+                "negative physical electrothermal conductivity",
+            ));
+        }
+        let dgdt = prepared.g * prepared.temperature_coefficient;
+        let i = g * v;
+        let flow = [
+            i,
+            -i,
+            prepared.heat_conductance * thermal - i * v,
+            prepared.relaxation_conductance * (recovery - v),
+        ];
+        output.current.copy_from_slice(&flow);
+        output.conductance.copy_from_slice(&[
+            g,
+            -g,
+            dgdt * v,
+            0.,
+            -g,
+            g,
+            -dgdt * v,
+            0.,
+            -2. * g * v,
+            2. * g * v,
+            prepared.heat_conductance - dgdt * v * v,
+            0.,
+            -prepared.relaxation_conductance,
+            prepared.relaxation_conductance,
+            0.,
+            prepared.relaxation_conductance,
+        ]);
+        let q = prepared.c * v + prepared.coupling * recovery;
+        output.charge.copy_from_slice(&[
+            q,
+            -q,
+            prepared.heat_capacitance * thermal,
+            prepared.recovery_time * prepared.relaxation_conductance * recovery,
+        ]);
+        output.capacitance.copy_from_slice(&[
+            prepared.c,
+            -prepared.c,
+            0.,
+            prepared.coupling,
+            -prepared.c,
+            prepared.c,
+            0.,
+            -prepared.coupling,
+            0.,
+            0.,
+            prepared.heat_capacitance,
+            0.,
+            0.,
+            0.,
+            0.,
+            prepared.recovery_time * prepared.relaxation_conductance,
+        ]);
+        Ok(())
+    }
+}
+
+const ELECTROTHERMAL_PARAMETERS: [Real; 8] = [1e-3, 0.02, 1e-6, 2e-7, 0.1, 1e-3, 5e-4, 1e-6];
+
+fn electrothermal_descriptor() -> Descriptor {
+    Descriptor {
+        family: "verified-electrothermal-dae".into(),
+        fingerprint: [0x57; 16],
+        abi: ABI_VERSION,
+        equations: [
+            ("p", EquationKind::Electrical),
+            ("n", EquationKind::Electrical),
+            ("temperature", EquationKind::Thermal),
+            ("recovery", EquationKind::Internal),
+        ]
+        .into_iter()
+        .map(|(name, kind)| Equation {
+            name: name.into(),
+            kind,
+        })
+        .collect(),
+        parameters: [
+            "conductance",
+            "tempco",
+            "capacitance",
+            "coupling",
+            "heat_conductance",
+            "heat_capacitance",
+            "recovery_conductance",
+            "recovery_time",
+        ]
+        .into_iter()
+        .zip(ELECTROTHERMAL_PARAMETERS)
+        .map(|(name, default)| Parameter {
+            name: name.into(),
+            default,
+            changes_topology: false,
+        })
+        .collect(),
+        charge: Capability::Computed,
+        noise: Capability::Zero,
+    }
+}
+
+#[test]
+fn prepared_kernel_supports_thermal_and_internal_dae_rows_without_electrical_unit_mixing() {
+    use ngspice_rs::devices::prepared_model::PointBuffer;
+    let descriptor = electrothermal_descriptor();
+    let kernel = ElectrothermalKernel;
+    let prepared = kernel.prepare(&ELECTROTHERMAL_PARAMETERS, 27.).unwrap();
+    let bias = [0.6, -0.2, 5., 0.1];
+    let mut output = PointBuffer::new(4).unwrap();
+    output.reset(Capability::Computed);
+    kernel
+        .evaluate(&prepared, &bias, &mut output.point())
+        .unwrap();
+    output.point().validate(&descriptor).unwrap();
+    let electrical = output.current[0] + output.current[1];
+    close(electrical, 0.);
+    assert!(
+        output.current[2] != 0.,
+        "heat balance is not an electrical KCL current"
+    );
+    assert!(
+        output.current[3] != 0.,
+        "recovery state must admit a generalized residual"
+    );
+    assert!(output.charge[2] > 0.);
+    assert!(output.charge[3] > 0.);
+
+    let previous = output.conductance[0];
+    let opposite = output.conductance[4];
+    output.conductance[0] = previous + 0.1;
+    output.conductance[4] = opposite - 0.1;
+    // Column KCL still holds, but the electrical common-mode voltage
+    // erroneously changes device current: the new row-gauge gate detects it.
+    assert!(output.point().validate(&descriptor).is_err());
+    output.conductance[0] = previous;
+    output.conductance[4] = opposite;
+
+    output.conductance[8] += 0.1;
+    assert!(
+        output.point().validate(&descriptor).is_err(),
+        "thermal power must depend on electrical voltage differences"
+    );
+}
+
+#[test]
+fn prepared_electrothermal_recovery_equations_stamp_into_real_mna_rows() {
+    let artifact = Artifact::new(electrothermal_descriptor(), ElectrothermalKernel).unwrap();
+    let mut circuit = Circuit::new();
+    let p = circuit.add_node("p").unwrap();
+    let temperature = circuit.add_node("temperature").unwrap();
+    let recovery = circuit.add_node("recovery").unwrap();
+    circuit
+        .add_device(Box::new(
+            artifact
+                .instance(
+                    "xthermal",
+                    vec![p, NodeId::GROUND, temperature, recovery],
+                    &ELECTROTHERMAL_PARAMETERS,
+                    27.,
+                )
+                .unwrap(),
+        ))
+        .unwrap();
+    circuit.finalize().unwrap();
+    let history = circuit.state_history().unwrap();
+    let solution = Vector::from_slice(&[0.5, 10., 0.2]);
+    let mut mna = SparseMatrix::new(3, 3);
+    let mut rhs = Vector::zeros(3);
+    let mut trial = history.trial();
+    circuit
+        .load(
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &solution,
+                model_context: &ModelContext::default(),
+                integration: None,
+                history: &history,
+                forcing: None,
+            },
+            &mut mna,
+            &mut rhs,
+            &mut trial,
+        )
+        .unwrap();
+    mna.fold_duplicates();
+    let g = ELECTROTHERMAL_PARAMETERS[0] * 1.2;
+    let dgdt = ELECTROTHERMAL_PARAMETERS[0] * 0.02;
+    let p_row = circuit.unknowns().node_row(p).unwrap();
+    let thermal_row = circuit.unknowns().node_row(temperature).unwrap();
+    let recovery_row = circuit.unknowns().node_row(recovery).unwrap();
+    close(mna.get(p_row, p_row), g);
+    close(mna.get(p_row, thermal_row), dgdt * 0.5);
+    close(mna.get(thermal_row, p_row), -2. * g * 0.5);
+    close(
+        mna.get(thermal_row, thermal_row),
+        0.1 - dgdt * 0.5_f64.powi(2),
+    );
+    close(mna.get(recovery_row, p_row), -5e-4);
+    close(mna.get(recovery_row, recovery_row), 5e-4);
+    let initial = trial.values();
+    assert_eq!(initial.len(), 8);
+    close(initial[4], 1e-3 * 10.);
+    close(initial[6], 1e-6 * 5e-4 * 0.2);
+
+    let ac = circuit
+        .small_signal_system_at(&ModelContext::default(), &solution, None)
+        .unwrap();
+    close(ac.e.get(thermal_row, thermal_row), 1e-3);
+    close(ac.e.get(recovery_row, recovery_row), 1e-6 * 5e-4);
+    close(ac.e.get(p_row, recovery_row), 2e-7);
+    close(ac.e.get(p_row, thermal_row), 0.);
+
+    // The generalized thermal energy and Qp recovery coordinates use the
+    // same accepted/rejected history lifecycle as ordinary junction charge.
+    let mut accepted = circuit.state_history().unwrap();
+    let dc_solution = Vector::from_slice(&[0.5, 10., 0.2]);
+    let (.., dc_trial) = load(&circuit, &accepted, dc_solution.as_slice(), None);
+    circuit
+        .accept_point(&dc_solution, None, &mut accepted, dc_trial)
+        .unwrap();
+    let stored = accepted.accepted(1).unwrap().to_vec();
+    let step = StepHistory::new();
+    let coeff = step
+        .trial(IntegrationMethod::Trapezoidal, 1, 1e-6, DEFAULT_XMU)
+        .unwrap();
+    let transient_solution = [0.75, 10., 0.3];
+    let (loaded, _, discarded) = load(&circuit, &accepted, &transient_solution, Some(&coeff));
+    close(loaded.get(p_row, recovery_row), coeff.ag()[0] * 2e-7);
+    close(
+        loaded.get(thermal_row, thermal_row),
+        0.1 - dgdt * 0.75_f64.powi(2) + coeff.ag()[0] * 1e-3,
+    );
+    close(
+        loaded.get(recovery_row, recovery_row),
+        5e-4 + coeff.ag()[0] * 1e-6 * 5e-4,
+    );
+    close(discarded.values()[4], 1e-3 * 10.);
+    close(discarded.values()[6], 1e-6 * 5e-4 * 0.3);
+    drop(discarded);
+    assert_eq!(accepted.accepted(1).unwrap(), &stored);
+    let (_, _, committed) = load(&circuit, &accepted, &transient_solution, Some(&coeff));
+    circuit
+        .accept_point(
+            &Vector::from_slice(&transient_solution),
+            Some(1e-6),
+            &mut accepted,
+            committed,
+        )
+        .unwrap();
+    assert_ne!(accepted.accepted(1).unwrap(), &stored);
+}
+
+#[test]
+fn prepared_equation_names_and_electrical_domain_are_structural_schema() {
+    let mut descriptor = electrothermal_descriptor();
+    descriptor.equations[2].name = "p".into();
+    assert!(Artifact::new(descriptor.clone(), ElectrothermalKernel).is_err());
+    descriptor.equations[2].name = "temperature".into();
+    descriptor.equations[1].kind = EquationKind::Internal;
+    assert!(
+        Artifact::new(descriptor, ElectrothermalKernel).is_err(),
+        "at least two electrical terminals required to close KCL"
+    );
 }
