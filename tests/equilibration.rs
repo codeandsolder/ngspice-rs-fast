@@ -352,7 +352,7 @@ fn curtis_reid_balancing_solves_the_behavioural_zero_start_cycle() {
     assert!((x.as_slice()[1] / (-1e99 + 1e32 * 2.0) - 1.0).abs() < 1e-15);
     assert!((x.as_slice()[2] + 2e-3).abs() < 1e-18);
     assert!((x.as_slice()[3] / 1e96 - 1.0).abs() < 1e-15);
-    balanced.check_residual(&rhs, &x).unwrap();
+    balanced.check_residual(&rhs, x).unwrap();
 }
 
 #[test]
