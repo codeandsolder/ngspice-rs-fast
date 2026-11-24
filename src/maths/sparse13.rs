@@ -388,12 +388,12 @@ impl RealGatherLane for f64x4 {
 struct RealGatherRow<V: RealGatherLane> {
     value: V,
     magnitude_sum: V,
-    error: V,
+    error_factor: f64,
     valid: V::Valid,
 }
 
 impl<V: RealGatherLane> RealGatherRow<V> {
-    fn new(numerator: V, inverse: f64) -> Self {
+    fn new(numerator: V, inverse: f64, upper_count: usize) -> Self {
         let value = numerator * V::broadcast(inverse);
         let valid = numerator.zero() | (V::mask(inverse.is_normal()) & value.normal());
         let value = V::choose(numerator.zero(), numerator, value);
@@ -401,7 +401,13 @@ impl<V: RealGatherLane> RealGatherRow<V> {
         Self {
             value,
             magnitude_sum,
-            error: magnitude_sum * V::broadcast(2. * f64::EPSILON),
+            // Each partial magnitude <= final magnitude. Precompute
+            // a conservative bound once per sparse row, not per entry.
+            error_factor: u32::try_from(upper_count).map_or(f64::INFINITY, |count| {
+                // Two EPS of additional slack covers rounding of the positive
+                // bound itself, without weakening the normalized safety check.
+                f64::from(count).mul_add(4. * f64::EPSILON, 4. * f64::EPSILON)
+            }),
             valid,
         }
     }
@@ -417,17 +423,15 @@ impl<V: RealGatherLane> RealGatherRow<V> {
         let term = V::choose(solved.zero(), V::broadcast(0.), term);
         self.value = V::choose(solved.zero(), self.value, self.value - term);
         self.magnitude_sum = self.magnitude_sum + term.magnitude();
-        // Reciprocal, coefficient, term and accumulation rounding, with
-        // slack for the positive error-bound accumulation itself.
-        self.error = self.error + self.magnitude_sum * V::broadcast(4. * f64::EPSILON);
     }
 
     fn finish(self) -> (V, V::Valid) {
+        let error = self.magnitude_sum * V::broadcast(self.error_factor);
         let valid = self.valid
             & self.magnitude_sum.finite()
-            & self.error.finite()
+            & error.finite()
             & (self.value.normal() | self.value.zero())
-            & (self.magnitude_sum.zero() | self.value.magnitude().greater(self.error));
+            & (self.magnitude_sum.zero() | self.value.magnitude().greater(error));
         (self.value, valid)
     }
 }
@@ -1051,8 +1055,9 @@ impl<I: PlanIndex> FactorRuns<I> {
             };
             for i in (1..=self.columns.runs.len()).rev() {
                 let inverse = inverses[i].real();
-                let mut row = RealGatherRow::new(x[i].real(), inverse);
-                for entry in axis.after_diagonal(i) {
+                let entries = axis.after_diagonal(i);
+                let mut row = RealGatherRow::new(x[i].real(), inverse, entries.len());
+                for entry in entries {
                     let (handle, col) = entry.indices();
                     row.subtract(values[handle].real(), inverse, x[col].real());
                 }
@@ -1103,8 +1108,9 @@ impl<I: PlanIndex> FactorRuns<I> {
             let mut valid = LaneMask::splat(true);
             for i in (1..=size).rev() {
                 let inverse = inverses[i].real();
-                let mut row = RealGatherRow::new(work.real[i], inverse);
-                for entry in gather.after_diagonal(i) {
+                let entries = gather.after_diagonal(i);
+                let mut row = RealGatherRow::new(work.real[i], inverse, entries.len());
+                for entry in entries {
                     let (handle, col) = entry.indices();
                     row.subtract(values[handle].real(), inverse, work.real[col]);
                 }
@@ -5280,23 +5286,88 @@ mod tests {
     fn normalized_gather_guard_is_lane_local() {
         let numerators = [6., 3., -0., f64::MIN_POSITIVE];
         let solutions = [1., 1., 0., 0.];
-        let mut tile = RealGatherRow::new(f64x4::from_array(numerators), 0.5);
+        let mut tile = RealGatherRow::new(f64x4::from_array(numerators), 0.5, 1);
         tile.subtract(3., 0.5, f64x4::from_array(solutions));
         let (values, valid) = tile.finish();
         assert_eq!(valid.to_array(), [true, false, true, false]);
         for i in 0..4 {
-            let mut row = RealGatherRow::new(numerators[i], 0.5);
+            let mut row = RealGatherRow::new(numerators[i], 0.5, 1);
             row.subtract(3., 0.5, solutions[i]);
             let (value, scalar_valid) = row.finish();
             assert_eq!(valid.test(i), scalar_valid);
             assert_eq!(values[i].to_bits(), value.to_bits());
         }
-        let mut row = RealGatherRow::new(1., 2.);
+        let mut row = RealGatherRow::new(1., 2., 1);
         row.subtract(f64::MAX, 2., 0.5);
         assert!(!row.finish().1);
-        let mut row = RealGatherRow::new(1., 0.5);
+        let mut row = RealGatherRow::new(1., 0.5, 1);
         row.subtract(f64::MIN_POSITIVE, 0.5, 1.);
         assert!(!row.finish().1);
+    }
+
+    #[test]
+    fn deferred_gather_bound_never_accepts_a_rejected_prefix_guard() {
+        // Independently reconstruct the #154 positive per-prefix error
+        // recurrence. The optimized bound can reject more uncertain rows,
+        // but must never misclassify an originally unsafe row as safe.
+        let mut seed = 0xc01d_5eed_1592_6535_u64;
+        let mut unit = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            f64::from(u32::try_from(seed >> 32).unwrap()) / f64::from(u32::MAX)
+        };
+        for trial in 0..2048_usize {
+            let inverse = [0.5, 1., -2., 4., 1e-200, 1e200][trial % 6];
+            let numerator = if trial % 11 == 0 {
+                -0.
+            } else {
+                unit() * 4. - 2.
+            };
+            let count = (trial * 17) % 97;
+            let mut optimized = RealGatherRow::new(numerator, inverse, count);
+            let product = numerator * inverse;
+            let mut value = if numerator == 0. { numerator } else { product };
+            let mut valid = numerator == 0. || (inverse.is_normal() && product.is_normal());
+            let mut magnitude = value.abs();
+            let mut error = magnitude * (2. * f64::EPSILON);
+            for index in 0..count {
+                let upper = if index % 13 == 0 {
+                    0.
+                } else {
+                    unit() * 4. - 2.
+                };
+                let solved = if (index + trial) % 17 == 0 {
+                    0.
+                } else {
+                    unit() * 4. - 2.
+                };
+                optimized.subtract(upper, inverse, solved);
+                if upper == 0. {
+                    continue;
+                }
+                let coefficient = upper * inverse;
+                let product = coefficient * solved;
+                valid &= solved == 0. || (coefficient.is_normal() && product.is_normal());
+                let term = if solved == 0. { 0. } else { product };
+                if solved != 0. {
+                    value -= term;
+                }
+                magnitude += term.abs();
+                error += magnitude * (4. * f64::EPSILON);
+            }
+            valid &= magnitude.is_finite()
+                && error.is_finite()
+                && (value.is_normal() || value == 0.)
+                && (magnitude == 0. || value.abs() > error);
+            let (new_value, new_valid) = optimized.finish();
+            assert_eq!(new_value.to_bits(), value.to_bits(), "trial {trial}");
+            assert!(!new_valid || valid, "unsafe row accepted at trial {trial}");
+        }
+
+        // The oversized bound is an explicit raw-fallback decision, not
+        // a silently rounded or truncated integer count.
+        if let Ok(oversized) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(!RealGatherRow::new(1., 0.5, oversized).finish().1);
+        }
     }
 
     #[test]
