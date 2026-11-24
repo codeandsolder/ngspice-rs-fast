@@ -35,6 +35,7 @@
 use super::check::check_model;
 use super::fields::{Instance, Model, SizeParam};
 use super::geo::{pa_eff_geo, parallel_resistance, rdseff_geo};
+use crate::primitives::numeric::{scale_power, split_power};
 use crate::primitives::{SpiceError, SpiceResult};
 
 const KboQ: f64 = 8.617_087e-5;
@@ -78,6 +79,10 @@ fn atan(x: f64) -> f64 {
     x.atan()
 }
 /// `ABS` from `ngspice.h`.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "C ABS retains negative zero and negates a NaN instead of clearing its sign bit"
+)]
 fn ABS(x: f64) -> f64 {
     if x >= 0.0 { x } else { -x }
 }
@@ -170,11 +175,10 @@ impl ExpScale {
         if value == 0. {
             return value;
         }
-        if let Some(quarter) = self.quarter {
-            ((value * quarter) * quarter) * quarter * quarter
-        } else {
-            value * self.factor
-        }
+        self.quarter.map_or_else(
+            || value * self.factor,
+            |quarter| ((value * quarter) * quarter) * quarter * quarter,
+        )
     }
 }
 
@@ -192,13 +196,14 @@ fn well_proximity_rational(distance: f64, width: f64, reference: f64) -> f64 {
     {
         return numerator / denominator;
     }
-    use crate::primitives::numeric::{scale_power, split_power};
     let largest = distance.max(width);
     let (r, re) = split_power(reference);
     let (d, de) = split_power(distance);
     let (m, me) = split_power(largest);
     let sum = m * (1. + distance.min(width) / largest);
-    scale_power((r * r) / (d * sum), 2 * re - de - me)
+    let numerator = r * r;
+    let denominator = d * sum;
+    scale_power(numerator / denominator, 2 * re - de - me)
 }
 
 /// Mean of x exp(-x) over a dimensionless interval, scaled by the WPE
@@ -311,7 +316,7 @@ fn physical_diode_limit(nvtm: f64, threshold: f64, saturation: f64, breakdown: f
         && nvtm.is_finite()
 }
 
-/// BSIM4DioIjthVjmEval: solve in z=exp(Vjm/Nvtm)-1.
+/// `BSIM4DioIjthVjmEval`: solve in z=exp(Vjm/Nvtm)-1.
 /// z²+(1+XExpBV-Ijth/Isb)z-Ijth/Isb=0. Rationalize the positive
 /// root and use hypot to avoid squaring a large coefficient.
 #[expect(
@@ -415,7 +420,6 @@ fn cross_bin_weight(unit: f64, length: f64, width: f64) -> f64 {
     {
         return unit / product;
     }
-    use crate::primitives::numeric::{scale_power, split_power};
     let (numerator, exponent) = split_power(unit);
     let (left, left_exp) = split_power(length);
     let (right, right_exp) = split_power(width);
