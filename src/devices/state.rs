@@ -597,7 +597,8 @@ impl StateHistory {
         scratch.values.resize(range.len(), Real::NAN);
         scratch.values.fill(Real::NAN);
         scratch.nonconvergent = false;
-        scratch.patches = previous.map_or_else(State1Patches::default, |trial| trial.patches.clone());
+        scratch.patches =
+            previous.map_or_else(State1Patches::default, |trial| trial.patches.clone());
         let mut mode = LoadMode::newton(IterationPhase::Float);
         mode.set(LoadFlag::DeviceLimiting, false);
         let mut accepted = [&[][..]; ACCEPTED_DEPTH];
