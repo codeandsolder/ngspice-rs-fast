@@ -2,7 +2,8 @@
 //! geometry or substrate-format syntax; it binds the resulting RLGC modes.
 
 use super::{
-    FrequencyBand, LineMode, ModeParameters, invalid, nonnegative, realization::PassiveRealization,
+    FrequencyBand, LineMode, ModeParameters, invalid, nonnegative,
+    realization::{Element, LumpedElement, PassiveRealization},
 };
 use crate::primitives::SpiceResult;
 use std::f64::consts::{E, PI, TAU};
@@ -522,4 +523,147 @@ fn coupled_impedance_correction(width: f64, gap: f64) -> [f64; 2] {
         even,
     );
     [even, odd]
+}
+
+/// Thin-strip tee with optional physical reference-plane extensions.
+///
+/// Arm order is main a, main b, side. Extensions are positive line lengths
+/// included in the resulting network, not hidden deembedding shifts.
+#[derive(Debug, Clone, Copy)]
+pub struct MicrostripTee {
+    /// Trace widths of the three arms in metres.
+    pub widths: [f64; 3],
+    /// Additional lengths from the empirical tee reference planes, in metres.
+    pub extensions: [f64; 3],
+}
+
+struct TeeStatic {
+    impedance: [f64; 3],
+    velocity: [f64; 3],
+    length: [f64; 3],
+    shunt_capacitance: f64,
+}
+
+impl MicrostripTee {
+    fn static_model(self, substrate: Substrate) -> SpiceResult<TeeStatic> {
+        substrate.validate()?;
+        if substrate.relative_permittivity > 18.
+            || self
+                .widths
+                .iter()
+                .any(|w| !(0.1..=10.).contains(&(w / substrate.height)))
+            || !self.extensions.into_iter().all(nonnegative)
+        {
+            return Err(invalid(
+                "microstrip tee outside quasi-static geometry domain",
+            ));
+        }
+        let mut impedance = [0.; 3];
+        let mut velocity = [0.; 3];
+        let mut plate = [0.; 3];
+        for (i, width) in self.widths.into_iter().enumerate() {
+            let cross = Microstrip {
+                width,
+                thickness: 0.,
+            }
+            .quasi_static(substrate)?;
+            impedance[i] = cross.impedance;
+            velocity[i] = cross.velocity();
+            plate[i] = VACUUM_IMPEDANCE / cross.impedance * substrate.height
+                / cross.effective_permittivity.sqrt();
+        }
+        let [za, zb, zside] = impedance;
+        let [da, db, dside] = plate;
+        let displacement_a = 0.055 * dside * (za / zside);
+        let displacement_b = 0.055 * dside * (zb / zside);
+        let ratio = za.sqrt() * zb.sqrt() / zside;
+        let side_displacement = da.sqrt()
+            * db.sqrt()
+            * (-ratio).mul_add(
+                0.7_f64.mul_add((-1.6 * ratio).exp(), (-0.17_f64).mul_add(ratio.ln(), 0.05)),
+                0.5,
+            );
+        let [wa, wb, wside] = self.widths;
+        let length = [
+            0.5_f64.mul_add(wside, self.extensions[0] - displacement_a),
+            0.5_f64.mul_add(wside, self.extensions[1] - displacement_b),
+            0.5_f64.mul_add(wa.max(wb), self.extensions[2] - side_displacement),
+        ];
+        let er = substrate.relative_permittivity;
+        let factor = (-20. * (zside / VACUUM_IMPEDANCE)).mul_add(
+            zside / VACUUM_IMPEDANCE,
+            (-4.4_f64).mul_add((-1.3 * ratio).exp(), 0.9_f64.mul_add(ratio.ln(), 1.)),
+        );
+        let shunt_capacitance =
+            5.5 / TAU * (da / velocity[0]).sqrt() * (db / velocity[1]).sqrt() * (er + 2.)
+                / er
+                / zside
+                * displacement_a.sqrt()
+                * displacement_b.sqrt()
+                / dside
+                * factor;
+        if !length.into_iter().all(nonnegative) || !shunt_capacitance.is_finite() {
+            return Err(invalid(
+                "tee reference plane has negative arm length; supply physical extensions",
+            ));
+        }
+        Ok(TeeStatic {
+            impedance,
+            velocity,
+            length,
+            shunt_capacitance,
+        })
+    }
+
+    /// Leading-order passive lumped tee from the Qucs reference-plane
+    /// and susceptance equations.
+    ///
+    /// The full model contains frequency-dependent transformers and
+    /// distributed lines. This low-electrical-length approximation retains
+    /// the first-order series inductance and shunt capacitance of each
+    /// arm. A negative deembedded tee capacitance may be combined with
+    /// the positive arm capacitances at the common node; a net negative
+    /// element is refused, never clamped.
+    /// # Errors
+    /// Outside the quasi-static frequency domain or nonpassive realization.
+    pub fn quasi_static(
+        self,
+        substrate: Substrate,
+        band: FrequencyBand,
+    ) -> SpiceResult<PassiveRealization> {
+        let model = self.static_model(substrate)?;
+        let high = band.limits()[1];
+        let mut center = model.shunt_capacitance;
+        let mut elements = Vec::with_capacity(7);
+        for i in 0..3 {
+            let delay = model.length[i] / model.velocity[i];
+            // Explicit small electrical-length and higher-mode bounds for
+            // this first-order approximation, not the full-wave tee.
+            if (TAU * high) * delay > 0.1
+                || high * substrate.height / (4e5 * model.impedance[i]) > 0.05
+            {
+                return Err(invalid(
+                    "microstrip tee exceeds lumped electrical-length domain",
+                ));
+            }
+            let inductance = model.impedance[i] * delay;
+            let cap = 0.5 * (delay / model.impedance[i]);
+            elements.push(LumpedElement {
+                nodes: [i + 1, 4],
+                element: Element::Inductance(inductance),
+            });
+            if cap > 0. {
+                elements.push(LumpedElement {
+                    nodes: [i + 1, 0],
+                    element: Element::Capacitance(cap),
+                });
+            }
+            center += cap;
+        }
+        elements.push(LumpedElement {
+            nodes: [4, 0],
+            element: Element::Capacitance(center),
+        });
+        PassiveRealization::lumped(3, 1, &elements, band)
+    }
 }

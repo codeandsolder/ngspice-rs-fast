@@ -212,6 +212,18 @@ impl PassiveRealization {
         self.edges.len()
     }
 
+    /// Borrow the graph-local elements for artifact serialization and inspection.
+    #[must_use]
+    pub fn elements(&self) -> &[LumpedElement] {
+        &self.edges
+    }
+
+    /// Number of internal nodes, excluding reference and port nodes.
+    #[must_use]
+    pub const fn internal_node_count(&self) -> usize {
+        self.nodes - self.ports - 1
+    }
+
     /// Validation result for distributed-line approximations.
     #[must_use]
     pub const fn report(&self) -> Option<LadderReport> {
@@ -222,6 +234,9 @@ impl PassiveRealization {
     /// # Errors
     /// A changed preparation temperature or an out-of-band frequency.
     pub fn validate_context(&self, hz: f64, temperature: f64) -> SpiceResult<()> {
+        if !temperature.is_finite() || temperature <= -273.15 {
+            return Err(invalid("invalid realization temperature"));
+        }
         if self
             .temperature
             .is_some_and(|t| t.to_bits() != temperature.to_bits())
