@@ -1,6 +1,8 @@
 //! Autonomous periodic steady-state analysis through the companion integrator.
 
-use crate::analysis::companion::{TransientEnd, TransientRun, run_transient};
+use crate::analysis::companion::{
+    OrbitOutput, PeriodicBoundary, TransientEnd, TransientRun, run_transient,
+};
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::newton::NewtonOptions;
 use crate::analysis::periodic_orbit::{PeriodicOrbit, Shooting, ShootingSolution, failure};
@@ -239,6 +241,7 @@ impl Runner<'_> {
         state: &Vector,
         period: Real,
         points: u16,
+        output: OrbitOutput<'_>,
         sink: &mut dyn PointSink,
     ) -> SpiceResult<TransientEnd> {
         self.integrate(
@@ -246,6 +249,7 @@ impl Runner<'_> {
             TransientRun::Shooting {
                 seed: state,
                 points,
+                output,
             },
             sink,
         )
@@ -443,13 +447,13 @@ pub(super) fn run(
         resolution: Real::from(plan.points.max(MIN_RESOLUTION)),
     };
     let (seed, shooting) = seed_orbit(&mut runner, topology, phase_row, &absolute, warm)?;
-    let (solution, charge_error) = refine_orbit(&mut runner, seed, shooting)?;
-    emit_orbit(&mut runner, &solution, sink)?;
+    let verified = refine_orbit(&mut runner, seed, shooting)?;
+    emit_orbit(&mut runner, &verified, sink)?;
     Ok(PeriodicOrbit {
-        solution,
+        solution: verified.solution,
         topology,
         phase_row,
-        charge_residual: charge_error,
+        charge_residual: verified.charge_error,
         accepted_steps: runner.accepted,
         rejected_steps: runner.rejected,
     })
@@ -477,7 +481,13 @@ fn seed_orbit(
         (runner.startup()?, plan.period)
     };
     let mut trace = PhaseTrace::new(runner.circuit.unknown_count());
-    runner.shoot(&start, guess, plan.points.max(MIN_RESOLUTION), &mut trace)?;
+    runner.shoot(
+        &start,
+        guess,
+        plan.points.max(MIN_RESOLUTION),
+        OrbitOutput::Probe,
+        &mut trace,
+    )?;
     let scales = trace.scales(absolute, plan.tolerance);
     let (index, phase_seed) =
         trace.phase_seed(phase_row, 8. * runner.request.dc_settings().newton.vntol)?;
@@ -499,11 +509,17 @@ fn seed_orbit(
     Ok((seed, shooting))
 }
 
+struct VerifiedOrbit {
+    solution: ShootingSolution,
+    charge_error: Real,
+    boundary: Box<PeriodicBoundary>,
+}
+
 fn refine_orbit(
     runner: &mut Runner<'_>,
     seed: Vector,
     mut shooting: Shooting,
-) -> SpiceResult<(ShootingSolution, Real)> {
+) -> SpiceResult<VerifiedOrbit> {
     let plan = runner.plan;
     let mut seed = seed;
     let mut evaluations = 1;
@@ -513,7 +529,7 @@ fn refine_orbit(
     for _ in 0..3 {
         let mut solution = shooting.solve(seed, &mut |state, period| {
             runner
-                .shoot(state, period, plan.points, &mut Discard)
+                .shoot(state, period, plan.points, OrbitOutput::Probe, &mut Discard)
                 .map(|end| end.solution)
         })?;
         evaluations += solution.map_evaluations;
@@ -523,6 +539,7 @@ fn refine_orbit(
             &solution.initial,
             solution.period,
             plan.points,
+            OrbitOutput::Verify,
             &mut verification,
         )?;
         evaluations += 1;
@@ -551,7 +568,14 @@ fn refine_orbit(
         }
         solution.residual = solution.residual.max(state_error);
         solution.map_evaluations = evaluations + 1;
-        return Ok((solution, charge_error));
+        let boundary = end
+            .boundary
+            .ok_or_else(|| failure("missing verified periodic boundary"))?;
+        return Ok(VerifiedOrbit {
+            solution,
+            charge_error,
+            boundary,
+        });
     }
 
     Err(failure(format!(
@@ -562,18 +586,27 @@ fn refine_orbit(
 
 fn emit_orbit(
     runner: &mut Runner<'_>,
-    solution: &ShootingSolution,
+    orbit: &VerifiedOrbit,
     sink: &mut dyn PointSink,
 ) -> SpiceResult<()> {
     let plan = runner.plan;
+    let solution = &orbit.solution;
+    let output = OrbitOutput::Emit(&orbit.boundary);
     let final_end = if plan.harmonics == 0 {
-        runner.shoot(&solution.initial, solution.period, plan.points, sink)?
+        runner.shoot(
+            &solution.initial,
+            solution.period,
+            plan.points,
+            output,
+            sink,
+        )?
     } else {
         let mut collector = super::results::PlotCollector::default();
         let end = runner.shoot(
             &solution.initial,
             solution.period,
             plan.points,
+            output,
             &mut collector,
         )?;
         let time = collector

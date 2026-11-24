@@ -551,11 +551,52 @@ impl AttemptedStep {
     }
 }
 
+/// A deterministic closed grid for shooting output. It constrains the
+/// next proposed step without introducing an artificial source breakpoint.
+struct SampleGrid {
+    index: u16,
+    intervals: u16,
+    stop: Real,
+}
+
+impl SampleGrid {
+    const fn new(intervals: u16, stop: Real) -> Self {
+        Self {
+            index: 0,
+            intervals,
+            stop,
+        }
+    }
+
+    fn time(&self) -> Real {
+        if self.index == self.intervals {
+            self.stop
+        } else {
+            self.stop * (Real::from(self.index) / Real::from(self.intervals))
+        }
+    }
+
+    fn at_sample(&self, time: Real) -> bool {
+        almost_equal_ulps(time, self.time(), 100)
+    }
+
+    fn advance(&mut self, on_sample: bool) -> SpiceResult<Real> {
+        if on_sample {
+            if self.index >= self.intervals {
+                return Err(failure("periodic output grid ended before the orbit"));
+            }
+            self.index += 1;
+        }
+        Ok(self.time())
+    }
+}
+
 struct AcceptedPoint {
     cursor: AcceptedCursor,
     solution: Vector,
-    observed: Vec<Complex>,
+    observed: Option<Vec<Complex>>,
     device_breaks: Vec<Real>,
+    periodic_boundary: Option<Box<PeriodicBoundary>>,
 }
 
 #[derive(Clone, Copy)]
@@ -660,7 +701,71 @@ pub fn companion_transient_into(
 pub(super) enum TransientRun<'a> {
     Ordinary,
     Seed,
-    Shooting { seed: &'a Vector, points: u16 },
+    Shooting {
+        seed: &'a Vector,
+        points: u16,
+        output: OrbitOutput<'a>,
+    },
+}
+
+/// The probes and verification see only physical state, never optional
+/// observations. The emission pass reuses the verified endpoint's transient
+/// proposal to ask exactly the selected device quantities at phase zero.
+#[derive(Clone, Copy)]
+pub(super) enum OrbitOutput<'a> {
+    Probe,
+    Verify,
+    Emit(&'a PeriodicBoundary),
+}
+
+/// A converged, pre-acceptance transient load at the periodic boundary.
+/// Its trial revision and accepted history belong together: reusing the
+/// post-acceptance history would double-count the last integration step.
+pub(super) struct PeriodicBoundary {
+    history: crate::devices::StateHistory,
+    coefficients: Coefficients,
+    trial: TrialState,
+    solution: Vector,
+    time: Real,
+    forcing: Forcing,
+}
+
+impl PeriodicBoundary {
+    fn capture(
+        history: &crate::devices::StateHistory,
+        attempt: &AttemptedStep,
+        trial: &TrialState,
+        solution: &Vector,
+        timing: TransientTiming,
+    ) -> Self {
+        Self {
+            history: history.clone(),
+            coefficients: attempt.coefficients.clone(),
+            trial: trial.clone(),
+            solution: solution.clone(),
+            time: attempt.clock.time,
+            forcing: Forcing {
+                limit: attempt.boundary.limit(),
+                timing,
+            },
+        }
+    }
+
+    fn observe(
+        &self,
+        prepared: &crate::devices::PreparedRun<'_>,
+        context: &crate::devices::ModelContext,
+        selected: Option<&[usize]>,
+    ) -> SpiceResult<Vec<Complex>> {
+        let mut attempt = prepared.transient_attempt(
+            &self.history,
+            context,
+            self.time,
+            &self.coefficients,
+            self.forcing,
+        )?;
+        attempt.observe_selected(&self.solution, &self.trial, selected)
+    }
 }
 
 pub(super) struct TransientEnd {
@@ -668,6 +773,7 @@ pub(super) struct TransientEnd {
     pub history: crate::devices::StateHistory,
     pub initial_state: Option<Vec<Real>>,
     pub charge_scales: Option<Vec<Real>>,
+    pub boundary: Option<Box<PeriodicBoundary>>,
     pub stats: TransientStats,
 }
 
@@ -828,7 +934,13 @@ impl Driver<'_> {
         )?;
         let mut point = Vec::with_capacity(plot.variable_count());
         let mut accepted = match purpose {
-            TransientRun::Shooting { seed, .. } => self.initialize_orbit(seed)?,
+            TransientRun::Shooting { seed, output, .. } => self.initialize_orbit(
+                seed,
+                output,
+                selected
+                    .as_ref()
+                    .map(crate::analysis::results::SelectedOutput::observations),
+            )?,
             TransientRun::Ordinary | TransientRun::Seed => self.initialize()?,
         };
         let initial_state = match purpose {
@@ -839,24 +951,21 @@ impl Driver<'_> {
             .as_ref()
             .map(|values| vec![0.0_f64; values.len()]);
         let mut sample = match purpose {
-            TransientRun::Shooting { points, .. } => Some((0, points)),
+            TransientRun::Shooting { points, .. } => Some(SampleGrid::new(points, stop)),
             _ => None,
         };
-        let sample_time = |index: u16, points: u16| -> Real {
-            if index == points {
-                stop
-            } else {
-                stop * (Real::from(index) / Real::from(points))
+        let capture_boundary = matches!(
+            purpose,
+            TransientRun::Shooting {
+                output: OrbitOutput::Verify,
+                ..
             }
-        };
+        );
         loop {
             self.accumulate_charge_scales(charge_scales.as_deref_mut())?;
-            let on_sample = sample.is_none_or(|(index, points)| {
-                almost_equal_ulps(accepted.cursor.clock.time, sample_time(index, points), 100)
-            });
-            let output_time = sample.map_or(accepted.cursor.clock.time, |(index, points)| {
-                sample_time(index, points)
-            });
+            let time = accepted.cursor.clock.time;
+            let on_sample = sample.as_ref().is_none_or(|grid| grid.at_sample(time));
+            let output_time = sample.as_ref().map_or(time, SampleGrid::time);
             self.accept_breaks(&mut accepted, &mut sources, &mut breaks)?;
             if on_sample && accepted.cursor.clock.time >= start {
                 self.emit_accepted(
@@ -874,13 +983,10 @@ impl Driver<'_> {
             let AcceptedPoint {
                 cursor, solution, ..
             } = accepted;
-            if on_sample && let Some((index, points)) = &mut sample {
-                if *index >= *points {
-                    return Err(failure("periodic output grid ended before the orbit"));
-                }
-                *index += 1;
-            }
-            let next_sample = sample.map(|(index, points)| sample_time(index, points));
+            let next_sample = sample
+                .as_mut()
+                .map(|grid| grid.advance(on_sample))
+                .transpose()?;
             let mut ready = cursor.prepare(&self.settings, &mut breaks, self.uic)?;
             if let Some(at) = next_sample {
                 ready.limit_to_sample(at);
@@ -889,6 +995,7 @@ impl Driver<'_> {
                 ready,
                 solution,
                 next_sample,
+                capture_boundary,
                 selected
                     .as_ref()
                     .map(crate::analysis::results::SelectedOutput::observations),
@@ -904,6 +1011,7 @@ impl Driver<'_> {
             history: self.history,
             initial_state,
             charge_scales,
+            boundary: accepted.periodic_boundary,
             stats: self.stats,
         })
     }
@@ -917,21 +1025,23 @@ impl Driver<'_> {
         selected: &mut Option<crate::analysis::results::SelectedOutput>,
         point: &mut Vec<Complex>,
     ) -> SpiceResult<()> {
+        // C (dctran.c) writes no t = 0 row under uic.
+        if accepted.cursor.clock.time == 0. && self.uic {
+            return Ok(());
+        }
         let initial;
-        let observations = if accepted.cursor.clock.time == 0. {
-            // C (dctran.c) writes no t = 0 row under uic.
-            if self.uic {
-                return Ok(());
+        let observations = match accepted.observed.as_deref() {
+            Some(values) => values,
+            None if accepted.cursor.clock.time == 0. => {
+                initial = self.observe_initial(
+                    &accepted.solution,
+                    selected
+                        .as_ref()
+                        .map(crate::analysis::results::SelectedOutput::observations),
+                )?;
+                &initial
             }
-            initial = self.observe_initial(
-                &accepted.solution,
-                selected
-                    .as_ref()
-                    .map(crate::analysis::results::SelectedOutput::observations),
-            )?;
-            &initial
-        } else {
-            &accepted.observed
+            None => return Err(failure("missing accepted output observations")),
         };
         push(
             plot,
@@ -996,17 +1106,29 @@ impl Driver<'_> {
     /// Rebuild device charge and flux at that point using an exact load;
     /// the ordinary first-step backward-Euler initialization then reconstructs
     /// derivatives without reusing a stale accepted integration history.
-    fn initialize_orbit(&mut self, seed: &Vector) -> SpiceResult<AcceptedPoint> {
+    fn initialize_orbit(
+        &mut self,
+        seed: &Vector,
+        output: OrbitOutput<'_>,
+        selected: Option<&[usize]>,
+    ) -> SpiceResult<AcceptedPoint> {
         if seed.len() != self.circuit.unknown_count() || !seed.is_finite() {
             return Err(failure("invalid periodic orbit restart vector"));
         }
         let trial = self.initial_state(seed, &[], false)?;
         let device_breaks = self.commit_point(Acceptance::Initial, seed, trial)?;
+        let observed = match output {
+            OrbitOutput::Probe | OrbitOutput::Verify => Vec::new(),
+            OrbitOutput::Emit(boundary) => {
+                boundary.observe(&self.prepared, &self.model_context, selected)?
+            }
+        };
         Ok(AcceptedPoint {
             cursor: AcceptedCursor::initial(&self.settings),
             solution: seed.clone(),
-            observed: Vec::new(),
+            observed: Some(observed),
             device_breaks,
+            periodic_boundary: None,
         })
     }
 
@@ -1017,6 +1139,7 @@ impl Driver<'_> {
         mut ready: ReadyStep,
         mut iterate: Vector,
         sample_at: Option<Real>,
+        capture_boundary: bool,
         selected: Option<&[usize]>,
     ) -> SpiceResult<AcceptedPoint> {
         let min_step = self.settings.min_step();
@@ -1072,12 +1195,26 @@ impl Driver<'_> {
                                 || sample_at.is_some_and(|at| {
                                     !almost_equal_ulps(attempt.clock.time, at, 100)
                                 }) {
-                                Vec::new()
-                            } else if let Some(selected) = selected {
-                                prepared.observe_selected(&x, &state, Some(selected))?
+                                None
                             } else {
-                                prepared.observe(&x, &state)?
+                                Some(match selected {
+                                    Some(indices) => {
+                                        prepared.observe_selected(&x, &state, Some(indices))?
+                                    }
+                                    None => prepared.observe(&x, &state)?,
+                                })
                             };
+                            let periodic_boundary = (capture_boundary
+                                && almost_equal_ulps(attempt.clock.time, self.settings.stop, 100))
+                            .then(|| {
+                                Box::new(PeriodicBoundary::capture(
+                                    &self.history,
+                                    &attempt,
+                                    &state,
+                                    &x,
+                                    self.timing,
+                                ))
+                            });
                             // Release the proposal's immutable history and exclusive scratch
                             // before accepting, which changes the accepted history revision.
                             drop(prepared);
@@ -1088,6 +1225,7 @@ impl Driver<'_> {
                                 solution: x,
                                 observed,
                                 device_breaks,
+                                periodic_boundary,
                             });
                         }
                     }
@@ -1254,8 +1392,9 @@ impl Driver<'_> {
         Ok(AcceptedPoint {
             cursor: AcceptedCursor::initial(&self.settings),
             solution: x,
-            observed: Vec::new(),
+            observed: None,
             device_breaks,
+            periodic_boundary: None,
         })
     }
 

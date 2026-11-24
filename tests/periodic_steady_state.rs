@@ -240,3 +240,76 @@ fn relaxation_and_rf_lc_match_c_transients() {
         );
     }
 }
+
+/// Unlike a DC initial bias, phase zero on a periodic orbit can have a
+/// nonzero capacitor current. Check both the complete plot and selected
+/// columns, including the endpoint and the harmonic transform.
+#[test]
+fn phase_zero_observations_replay_the_verified_transient_boundary() {
+    let (mut circuit, plans, context) = prepared(RADIAL, ".pss 150 5m x 128 4 30 1m uic");
+    circuit
+        .set_observations(&["@c1[i]".to_owned(), "@c2[i]".to_owned()])
+        .unwrap();
+    let mut output = Capture::default();
+    plans[0]
+        .run_periodic(&mut circuit, &context, None, &mut output)
+        .unwrap();
+    let time = &output.plots[0];
+    for index in 0..time.point_count() {
+        let x = time.value("v(x)", index).unwrap().re;
+        let y = time.value("v(y)", index).unwrap().re;
+        let ix = time.value("@c1[i]", index).unwrap().re;
+        let iy = time.value("@c2[i]", index).unwrap().re;
+        assert!(
+            (ix + 1e-3 * y).abs() < 5e-6,
+            "i(C1) at {index}: {ix}, y={y}"
+        );
+        assert!(
+            (iy - 1e-3 * x).abs() < 5e-6,
+            "i(C2) at {index}: {iy}, x={x}"
+        );
+    }
+    let last = time.point_count() - 1;
+    for key in ["@c1[i]", "@c2[i]"] {
+        let a = time.value(key, 0).unwrap().re;
+        let b = time.value(key, last).unwrap().re;
+        assert!((a - b).abs() < 1e-10, "{key}: phase boundary {a} vs {b}");
+        let fundamental = output.plots[1].value(key, 1).unwrap().re;
+        assert!((fundamental - 1e-3).abs() < 5e-6, "{key}: {fundamental}");
+    }
+
+    #[derive(Default)]
+    struct CurrentOnly {
+        columns: Vec<usize>,
+        current: Vec<f64>,
+    }
+    impl PointSink for CurrentOnly {
+        fn begin(&mut self, header: &Plot) -> SpiceResult<()> {
+            self.columns = vec![header.variable_index("@c1[i]").unwrap()];
+            Ok(())
+        }
+        fn selected_columns(&self) -> Option<&[usize]> {
+            Some(&self.columns)
+        }
+        fn point(&mut self, row: &[Complex]) -> SpiceResult<()> {
+            assert_eq!(row.len(), 1);
+            self.current.push(row[0].re);
+            Ok(())
+        }
+        fn end(&mut self) -> SpiceResult<()> {
+            Ok(())
+        }
+    }
+    let (mut circuit, plans, context) = prepared(RADIAL, ".pss 150 5m x 128 0 30 1m uic");
+    circuit
+        .set_observations(&["@c1[i]".to_owned(), "@c2[i]".to_owned()])
+        .unwrap();
+    let mut selected = CurrentOnly::default();
+    plans[0]
+        .run_periodic(&mut circuit, &context, None, &mut selected)
+        .unwrap();
+    assert_eq!(selected.current.len(), time.point_count());
+    for (index, actual) in selected.current.into_iter().enumerate() {
+        assert!((actual - time.value("@c1[i]", index).unwrap().re).abs() < 1e-10);
+    }
+}

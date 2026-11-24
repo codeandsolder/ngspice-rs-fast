@@ -58,6 +58,14 @@ are accepted integration points, not interpolation and not artificial source
 breakpoints. Earlier same-direction phase crossings are checked against the
 complete scaled state to avoid unnecessarily returning multiple periods.
 
+Phase-zero device observations are not DC-bias asks. The verified map retains
+the final pre-acceptance trial, accepted history, integration coefficients and
+forcing; the emission pass replays that exact transient observation at the
+periodic boundary. Only selected quantities are requested, and probes never
+evaluate optional observations. This preserves nonzero capacitor currents and
+other derivative-dependent quantities at both endpoints without changing the
+shooting residual or retaining an extra waveform.
+
 ## Scope and resource limits
 
 Explicit time dependence, delay-history devices, and hysteretic switches are
@@ -74,7 +82,9 @@ result streams; harmonic calculation bounds its retained grid and DFT work.
 
 `tests/periodic_steady_state.rs` checks a radial oscillator of known amplitude
 and frequency, a Van der Pol relaxation oscillator, a nonlinear RF LC oscillator,
-warm starts, multiple-cycle period guesses, and invalid forcing/absent cycles.
+warm starts, multiple-cycle period guesses, phase-zero capacitor currents and
+their harmonics, selective observation streaming, and invalid forcing/absent
+cycles.
 An opt-in external C reference compares the relaxation and LC results against
 long C transient runs using the same decks and physical tolerances:
 
