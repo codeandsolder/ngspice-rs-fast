@@ -75,6 +75,7 @@ pub mod mutual;
 pub mod noise;
 pub mod nonlinear;
 pub mod passive;
+pub mod prepared_model;
 pub mod pulse;
 pub use passive::PassiveParameters;
 pub mod schema;
