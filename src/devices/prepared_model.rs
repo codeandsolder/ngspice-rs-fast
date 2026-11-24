@@ -259,7 +259,9 @@ pub struct PointBuffer {
 
 impl PointBuffer {
     /// Allocate the exact output shape once per prepared instance/tile.
-    #[must_use]
+    ///
+    /// # Errors
+    /// The Jacobian shape overflows or allocation fails.
     pub fn new(width: usize) -> SpiceResult<Self> {
         let entries = width
             .checked_mul(width)
