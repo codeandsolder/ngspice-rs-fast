@@ -316,8 +316,11 @@ fn physical_diode_limit(nvtm: f64, threshold: f64, saturation: f64, breakdown: f
 /// root and use hypot to avoid squaring a large coefficient.
 #[expect(
     clippy::manual_midpoint,
+    reason = "the invalid diode input path preserves C intermediate overflow"
+)]
+#[expect(
     clippy::suboptimal_flops,
-    reason = "the invalid diode input path preserves C IEEE propagation and overflow"
+    reason = "the invalid diode input path preserves C IEEE propagation"
 )]
 fn dio_ijth_vjm_eval(nvtm: f64, threshold: f64, saturation: f64, breakdown: f64) -> f64 {
     let ratio = threshold / saturation;
