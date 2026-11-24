@@ -6,8 +6,13 @@ M10 slice 3 (#84) ports the **lossless transmission line `T`** (C
 `src/spicelib/parser/inp2o.c`, `src/spicelib/devices/ltra/`, see
 [below](#lossy-line-o-ltra-85)). The single lossy line `Y`/TXL now has
 Padé DC/transient and a three-pi fallback; see [TXL.md](TXL.md) for its
-AC-family refusals and compatibility limits. `P`/CPL remains `NotYetPorted`.
-Code: `src/netlist/parser/{tline,ltra}.rs` (grammars),
+AC-family refusals and compatibility limits. The **coupled multiconductor
+`P`/CPL line** has native P geometry and symmetric per-length R/L/G/C matrices,
+exact full-coupled DC/AC first-order propagation with MNA constraints, and
+causal finite-volume transient with trial/accepted charge/flux history; see
+[COUPLED_LINES.md](COUPLED_LINES.md) for its physical limits, integration
+method, resource caps and numerical verification.
+Code: `src/netlist/parser/{tline,ltra,cpl}.rs` (grammars),
 `src/devices/{tline,ltra}.rs` and `src/devices/ltra/convolution.rs`
 (devices), `src/devices/delay.rs` (delay history, device breakpoints and step
 bounds shared by T/O/Y). The transient-driver design is the ADR in
