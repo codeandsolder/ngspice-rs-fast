@@ -79,7 +79,7 @@ fn compare_gradient_to_resimulation(analysis: AnalysisKind, frequency: Option<f6
     candidate.update(&base, &mut EvalBudget::default()).unwrap();
     assert_eq!(candidate.topology(), CandidateTopology::Reused);
     let derivatives = evaluate(
-        &mut candidate,
+        &candidate,
         &requests(analysis, frequency),
         EvalLimits::default(),
     )
@@ -139,7 +139,7 @@ fn unsupported_transient_and_invalid_ac_frequency_return_typed_status() {
         requests(AnalysisKind::Ac, None),
         requests(AnalysisKind::Ac, Some(f64::NAN)),
     ] {
-        let derivatives = evaluate(&mut candidate, &request, EvalLimits::default()).unwrap();
+        let derivatives = evaluate(&candidate, &request, EvalLimits::default()).unwrap();
         assert_eq!(derivatives.len(), 3);
         assert!(
             derivatives
@@ -161,9 +161,9 @@ r2 out 0 2k",
         &["p"],
     )
     .unwrap();
-    let mut candidate = plan.session().unwrap();
+    let candidate = plan.session().unwrap();
     let result = evaluate(
-        &mut candidate,
+        &candidate,
         &requests(AnalysisKind::OperatingPoint, None),
         EvalLimits::default(),
     )
@@ -190,7 +190,7 @@ r2 out 0 2k
         .unwrap();
     assert_eq!(candidate.topology(), CandidateTopology::Rebuilt);
     let result = evaluate(
-        &mut candidate,
+        &candidate,
         &requests(AnalysisKind::OperatingPoint, None),
         EvalLimits::default(),
     )
@@ -219,7 +219,7 @@ d1 out 0 dm
         .update(&[1100.], &mut EvalBudget::default())
         .unwrap();
     let result = evaluate(
-        &mut candidate,
+        &candidate,
         &requests(AnalysisKind::Ac, Some(1000.)),
         EvalLimits::default(),
     )
@@ -244,7 +244,7 @@ fn shared_nonlinear_model_parameter_sums_all_instance_adjoint_partials() {
         .unwrap();
     assert_eq!(candidate.topology(), CandidateTopology::Rebuilt);
     let measured = evaluate(
-        &mut candidate,
+        &candidate,
         &requests(AnalysisKind::OperatingPoint, None),
         EvalLimits::default(),
     )
@@ -274,7 +274,7 @@ fn one_root_input_can_contribute_through_multiple_device_parameters() {
         .update(&[1500.], &mut EvalBudget::default())
         .unwrap();
     let derivative = evaluate(
-        &mut candidate,
+        &candidate,
         &requests(AnalysisKind::OperatingPoint, None),
         EvalLimits::default(),
     )
@@ -367,7 +367,7 @@ fn parameter_fit_gradient_benchmark() {
     let start = Instant::now();
     let derivatives = black_box(
         evaluate(
-            &mut candidate,
+            &candidate,
             &requests(AnalysisKind::OperatingPoint, None),
             EvalLimits::default(),
         )

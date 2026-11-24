@@ -1291,7 +1291,7 @@ fn signed_panel_range_survives_both_measurement_paths() {
 fn extreme_crossings_match_between_retained_and_objective_only_streaming() {
     let scope = ParamScope::root(&[]).unwrap();
     let tiny = Real::from_bits(1);
-    let fixtures: [(&str, Vec<(Real, Real, Real)>, Real); 7] = [
+    let fixtures = [
         (
             ".meas tran m WHEN v(out)=v(ref) RISE=1",
             vec![(0., -Real::MAX, Real::MAX), (4., Real::MAX, -Real::MAX)],
