@@ -190,21 +190,21 @@ fn artifact_schema_enforces_versions_slots_and_structural_mutation() {
 
 #[test]
 fn homogeneous_tile_matches_scalar_equations_and_conserves_kcl_and_charge() {
-    let model = PolynomialKernel;
+    let kernel = PolynomialKernel;
+    let model = artifact();
     let prepared = [
-        model.prepare(&[1e-3, 2e-4, 1e-6, 2e-7], 27.).unwrap(),
-        model.prepare(&[2e-3, 1e-4, 3e-6, 3e-7], 35.).unwrap(),
-        model.prepare(&[3e-3, 4e-4, 2e-6, 1e-7], -10.).unwrap(),
+        kernel.prepare(&[1e-3, 2e-4, 1e-6, 2e-7], 300.15).unwrap(),
+        kernel.prepare(&[2e-3, 1e-4, 3e-6, 3e-7], 308.15).unwrap(),
+        kernel.prepare(&[3e-3, 4e-4, 2e-6, 1e-7], 263.15).unwrap(),
     ];
 
     let mut out = BatchOutput::new(2, prepared.len()).unwrap();
     let voltage = [0.5, 0., 1.1, 0.3, -0.4, 0.2];
     evaluate_tile(
-        &model,
         &BatchInput {
+            artifact: &model,
             prepared: &prepared,
             voltages: &voltage,
-            descriptor: &descriptor(Capability::Computed),
         },
         &mut out,
     )
