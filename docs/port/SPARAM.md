@@ -200,3 +200,15 @@ names and retained bias, passive and nonlinear SP noise, and PORT waveforms
 against C and analytic values on each backend's physical sample times.
 `m8_additional_outputs` exercises SP measurements and print selection through
 the CLI; `c_measure_reference` checks measurements against C.
+
+## Measured N-port Touchstone import/export (#174)
+
+The independent Touchstone codec and measured-network model are documented
+in [`TOUCHSTONE.md`](TOUCHSTONE.md). The result of `.sp` may be extracted as
+a versioned `Touchstone` S/Y/Z model using `Touchstone::from_sp_plot`, with an
+explicit per-port reference list. Imported frequency-domain N-port matrices
+are transformed to physical admittance and stamped into existing AC MNA
+assembly; heterogeneous reference impedances and mixed-mode bases are
+handled explicitly. Singular ideal port constraints remain errors rather
+than disappearing from the matrix; arbitrary sampled frequency data are
+not a transient model.
