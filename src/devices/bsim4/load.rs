@@ -1,7 +1,8 @@
 //! `b4ld.c` (`BSIM4load`): the DC/transient load of one instance, and
 //! `BSIM4polyDepletion`.
 //!
-//! Physics stages retain the original C expression and host-call ordering.
+//! Physics stages retain the C model and host-call ordering. Numerically
+//! unstable forms use independently verified equivalent constitutive laws.
 //! Bias selection, junction currents, channel electrostatics and transport,
 //! leakage, intrinsic charges, junction charges, state commit, transient
 //! companions, and ordered stamping are distinct operations. C line1000
@@ -87,7 +88,7 @@ struct DrainSmoothing {
 
 fn positive_half_sum(x: f64, root: f64, product: f64) -> f64 {
     if x >= 0. {
-        0.5 * (root + x)
+        root.midpoint(x)
     } else {
         2. * product / (root - x)
     }

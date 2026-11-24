@@ -8,6 +8,7 @@ use super::super::{
 use crate::primitives::SpiceResult;
 
 struct Trace {
+    temperature: f64,
     mode: u32,
     limiting: bool,
     voltage: [f64; node::COUNT],
@@ -40,7 +41,7 @@ impl LoadCkt for Trace {
         1e-12
     }
     fn temp(&self) -> f64 {
-        300.15
+        self.temperature
     }
     fn ag(&self, i: usize) -> f64 {
         if self.mode & mode::MODETRAN != 0 {
@@ -158,6 +159,7 @@ fn load_event_sequence_and_field_values() {
         .unwrap();
         let seed = 0xcbf2_9ce4_8422_2325;
         let mut trace = Trace {
+            temperature: 300.15,
             mode: mode::MODEDCOP | mode::MODEINITFLOAT,
             limiting: false,
             voltage: [
@@ -227,6 +229,7 @@ fn load_event_sequence_and_field_values() {
 /// Independent constitutive-law test: no Newton solve, device limiting,
 /// companion integration, or external source-current subtraction.
 struct PhysicalFixture {
+    temperature: f64,
     model: Model,
     instance: Instance,
     size: super::SizeParam,
@@ -252,6 +255,10 @@ impl PhysicalFixture {
             xpartGiven: true,
             ..Model::default()
         };
+        Self::prepare(model, 300.15)
+    }
+
+    fn prepare(model: Model, temperature: f64) -> Self {
         let instance = Instance {
             l: 0.5e-6,
             lGiven: true,
@@ -264,17 +271,18 @@ impl PhysicalFixture {
             mut instance,
             mut warnings,
             ..
-        } = set::prepare_model(model, 300.15).prepare_instance(instance, false);
+        } = set::prepare_model(model, temperature).prepare_instance(instance, false);
         let size = temp::temperature(
             &mut model,
             &mut instance,
-            300.15,
+            temperature,
             "nch",
             "m1",
             &mut warnings,
         )
         .unwrap();
         Self {
+            temperature,
             model,
             instance,
             size,
@@ -285,6 +293,7 @@ impl PhysicalFixture {
     fn evaluate(&self, [g, d, s, b]: [f64; 4]) -> PhysicalPoint {
         let mut instance = self.instance.clone();
         let mut trace = Trace {
+            temperature: self.temperature,
             mode: mode::MODEDCTRANCURVE | mode::MODEINITFLOAT,
             limiting: false,
             voltage: [d, g, s, b, d, g, g, s, b, b, b, 0.],
@@ -596,4 +605,99 @@ fn depletion_charge_preserves_tiny_positive_charge_and_continuation() {
     assert_eq!(super::depletion_charge(k1, 0.), (0., 1.));
     assert_eq!(super::depletion_charge(k1, -1e-30), (-1e-30, 1.));
     assert_eq!(super::depletion_charge(0., 1e-3), (0., 0.));
+}
+
+#[test]
+fn channel_quadratic_is_regular_as_series_resistance_vanishes() {
+    for polarity in [-1, 1] {
+        let make = |resistance| {
+            PhysicalFixture::prepare(
+                Model {
+                    r#type: polarity,
+                    typeGiven: true,
+                    rdsw: resistance,
+                    rdswGiven: true,
+                    rdswmin: 0.,
+                    rdswminGiven: true,
+                    a1: 0.,
+                    a1Given: true,
+                    a2: 1.,
+                    a2Given: true,
+                    ..Model::default()
+                },
+                300.15,
+            )
+        };
+        let baseline = make(0.);
+        for r in [1e-20, 1e-15, 1e-9] {
+            let fixture = make(r);
+            for bias in [
+                [0.2, 0.1, 0., -0.1],
+                [0.8, 0.3, 0., -0.2],
+                [1.2, 1., 0., -0.4],
+            ] {
+                let v = bias.map(|x| x * f64::from(polarity));
+                let a = baseline.evaluate(v);
+                let b = fixture.evaluate(v);
+                assert!(
+                    (a.current - b.current).abs() < 1e-8 * a.current.abs() + 1e-25,
+                    "polarity {polarity}, resistance {r:e}, bias {bias:?}"
+                );
+                for (expected, actual) in a.current_gradient.into_iter().zip(b.current_gradient) {
+                    assert!((expected - actual).abs() < 1e-8 * expected.abs() + 1e-22);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn subthreshold_and_mobility_modes_have_independent_channel_derivatives() {
+    let mut errors = Vec::new();
+    for polarity in [-1, 1] {
+        for mobility in 0..=6 {
+            for temperature in [250., 400.] {
+                let fixture = PhysicalFixture::prepare(
+                    Model {
+                        r#type: polarity,
+                        typeGiven: true,
+                        mobMod: mobility,
+                        mobModGiven: true,
+                        ..Model::default()
+                    },
+                    temperature,
+                );
+                for gate in [-0.4, -0.1, 0.2, 0.6, 1.1] {
+                    let v = [gate, 0.1, 0., -0.2].map(|x| x * f64::from(polarity));
+                    let p = fixture.evaluate(v);
+                    for col in [0, 1, 3] {
+                        let h = 1e-4;
+                        let samples = [-h, h, -h * 0.5, h * 0.5].map(|delta| {
+                            let mut x = v;
+                            x[col] += delta;
+                            fixture.evaluate(x).current
+                        });
+                        let (expected, error) = richardson(samples, h);
+                        record_error(
+                            &mut errors,
+                            p.current_gradient[col],
+                            expected,
+                            1e-4 * expected.abs() + 0.2 * error + 1e-27,
+                            || {
+                                format!(
+                                    "polarity {polarity}, mobility {mobility}, temperature {temperature}, gate {gate}, col {col}"
+                                )
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "{} errors:\n{}",
+        errors.len(),
+        errors.join("\n")
+    );
 }
