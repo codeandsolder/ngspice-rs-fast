@@ -599,10 +599,13 @@ impl Jfet {
         voltage: &dyn Fn(NodeId) -> Real,
         transient: bool,
     ) -> SpiceResult<Option<Real>> {
-        if !matches!(key, "vgs" | "vgd" | "gm" | "gds" | "ggs" | "ggd" | "igd") {
+        if !matches!(
+            key,
+            "vgs" | "vgd" | "gm" | "gds" | "ggs" | "ggd" | "igd" | "id" | "ig" | "is"
+        ) {
             return Ok(None);
         }
-        if transient && matches!(key, "ggs" | "ggd" | "igd") {
+        if transient && matches!(key, "ggs" | "ggd" | "igd" | "id" | "ig" | "is") {
             return Err(SpiceError::not_yet_ported(
                 format!(
                     "{}: transient @{}[{key}] (C adds the charge companion)",
@@ -622,6 +625,12 @@ impl Jfet {
             "gds" => m * e.load.gds,
             "ggs" => m * e.load.ggs,
             "ggd" => m * e.load.ggd,
+            // JFETcd and JFETcg are stored before the type/polarity
+            // factor. Ask the actual C load fields, not the external
+            // resistor-/junction-inclusive port residual.
+            "id" => m * e.load.cd,
+            "ig" => m * e.load.cg,
+            "is" => m * (-e.load.cd - e.load.cg),
             _ => m * e.load.cgd,
         }))
     }
