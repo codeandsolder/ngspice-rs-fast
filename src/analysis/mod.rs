@@ -51,6 +51,7 @@ pub mod optimization;
 mod ordered_samples;
 mod output_probe;
 mod periodic_orbit;
+pub mod periodic_small_signal;
 mod plan;
 mod pss;
 mod pz;
