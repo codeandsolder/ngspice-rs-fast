@@ -9,6 +9,7 @@
 //! kernel; propagation between cable ends remains a separate problem.
 
 pub mod compact;
+pub mod wave_delay;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

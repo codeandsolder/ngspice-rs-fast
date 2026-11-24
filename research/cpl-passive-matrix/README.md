@@ -299,3 +299,76 @@ of interpolation brackets and physical-front metadata. The Rust h1
 prototype separately demonstrates accepted-state owner/revision
 transactions; the same semantics should be used when implementing
 the full network in Rust.
+
+## Independent Rust time-domain scattering state and differential reference
+
+The standalone Rust crate now also contains a full causal power-wave
+network engine at rust/src/wave_delay.rs, with a separately tested,
+bounded sample-history reader, **exact** mode-dependent LC delays
+between passive R/G scattering sections, and automatic earliest-front
+tracking using a Dijkstra shortest-path search over the full
+scattering graph (including mode conversion and reflected paths).
+Every static matrix is validated for reciprocity and full power
+contraction by checking the eigenvalues of its transpose-product;
+an arbitrary active or nonreciprocal model is rejected at construction.
+
+The engine applies full coupled scattering matrices in real time, not
+a diagonal conductor approximation, and the earliest transmitted
+front always traverses the full physical line. Crucially, the
+accepted wave interpolation reader **never interpolates across the
+first physically reachable front**. Wave launch histories are
+retained as logical VecDeque ring sequences, preserving the
+bracketing accepted sample at/before the longest required delay
+when pruning; no copy of the history is needed for binary search.
+
+A trial time step reads *only previously accepted* delayed waves
+and cannot exceed the shortest half-cell modal delay. All static
+outputs are computed without modifying accepted state. Accept
+preflights the entire trial (including all shapes, finite values,
+full energy, unique owner and accepted-state revision) and reserves
+capacity for every trace before any accepted samples or time are
+mutated. Foreign, malformed, stale, future or nonfinite trials
+are refused atomically. The mutable state deliberately cannot
+be cloned into two independent devices with the same identity.
+
+The Rust crate's **19 unit tests** pass, including lossless strict
+wavefronts for 1/4/16/32 sections, two-mode cross-coupling and energy
+contraction, zero-shunt-loss limits, full static passivity rejection,
+transaction isolation, and bounded-history equivalence. The full
+all-target Clippy ruleset with -Dwarnings, pedantic, nursery, and
+no unwrap/expect/panic/todo/unimplemented/debug debt is green
+under managed sccache. The independent Python pruning tests compare
+each transmitted/reflected sample for 801 accepted steps: exact
+equality with no pruning, while retaining 100× fewer scalar history
+samples and 62× fewer three-wire history samples.
+
+Physical source matrices are tested as **cross-language differential
+fixtures**, not just invented contractive matrices. The generator
+generate_rust_fixtures.py evaluates actual coupled scalar and
+noncommuting three-wire R/L/G/C materials using independent
+Python/SciPy matrix exponentials and accepted-wave histories,
+then emits small checked Rust source fixtures using exact IEEE-754
+bit patterns (with grouped hex digits) to avoid parser rounding.
+The Rust engine matches the Python reflected/transmitted wave
+arrays at seven sampled checkpoints per cable across 192 accepted
+steps, with component absolute discrepancy below 5e-10. Fixture
+JSON records original physical materials, scattering matrices,
+modal delays, expected outputs and energies. The generator is
+deterministic and can be rerun with uv.
+
+The independent time-to-frequency holdout compares the Python
+accepted-history wave response against the full coupled AC S21
+scattering at omega=2e9 rad/s and finds maximum relative errors
+5.91e-6 (scalar lossless), 5.91e-6 (scalar RLGC), and 2.92e-6
+(noncommuting three-wire). This is a check on complex transmission,
+not merely temporal wavefront support.
+
+The Rust code is a substantial complete **research stage network**
+but is not wired into the actual simulator's MNA or accepted
+StateHistory API. A timestep larger than the smallest half-cell
+modal delay currently returns a truncation request. Removing
+that restriction without violating exact wavefront causality
+would require an in-step propagation solution for trial
+input waveforms and its corresponding Newton Jacobian; it
+must not be worked around by extrapolating unaccepted histories.
+The research code does not claim full native P/CPL support.

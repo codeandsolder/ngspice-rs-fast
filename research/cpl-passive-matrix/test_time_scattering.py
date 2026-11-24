@@ -81,14 +81,47 @@ def test_stale_and_step_limit():
     half=np.min(net.half_delays)
     trial=net.trial(half*.5,arr([1.]),arr([0.]))
     other=net.trial(half*.5,arr([.5]),arr([0.]))
+    foreign=PassiveDelayCascade(model,.2,4)
+    try:
+        foreign.accept(trial)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted trial from a different line")
+    for bad_time in [0.,float("nan"),2.*half]:
+        try:
+            net.trial(bad_time,arr([1.]),arr([0.]))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("accepted invalid or future-reading trial step")
     net.accept(trial)
-    # A trial must not reuse history after acceptance.
-    # Present prototype still uses plain dicts; regression should expose it.
     try:
         net.accept(other)
     except ValueError:
-        return True
-    raise AssertionError("accepted stale trial from same old state")
+        pass
+    else:
+        raise AssertionError("accepted stale trial from same old state")
+    # A failure in the middle of a proposed model update must not
+    # append any of the valid preceding cells' samples.
+    next_time=1.5*half
+    corrupted=net.trial(next_time,arr([1.]),arr([0.]))
+    corrupted["static_out_far"][-1][0]=float("nan")
+    snapshot=(net.time,net.revision,net.history_sample_count(),
+              net.energy_in,net.energy_out)
+    try:
+        net.accept(corrupted)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted NaN static block as partial transaction")
+    assert (net.time,net.revision,net.history_sample_count(),
+            net.energy_in,net.energy_out)==snapshot
+    # A new valid trial with the same step is still accepted.
+    fixed=net.trial(next_time,arr([1.]),arr([0.]))
+    net.accept(fixed)
+    assert net.revision==2
+    return True
 
 if __name__=="__main__":
     print(json.dumps({

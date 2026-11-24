@@ -1,0 +1,26 @@
+{
+  "scalar_zero_losses": {
+    "accepted_steps": 801,
+    "unpruned_history_samples": 14454,
+    "pruned_history_samples": 144,
+    "sample_reduction": 100.375,
+    "max_waveform_delta": 0.0,
+    "strict_prearrival": true
+  },
+  "scalar_RG": {
+    "accepted_steps": 801,
+    "unpruned_history_samples": 14454,
+    "pruned_history_samples": 144,
+    "sample_reduction": 100.375,
+    "max_waveform_delta": 0.0,
+    "strict_prearrival": true
+  },
+  "coupled_three": {
+    "accepted_steps": 800,
+    "unpruned_history_samples": 14436,
+    "pruned_history_samples": 234,
+    "sample_reduction": 61.69230769230769,
+    "max_waveform_delta": 0.0,
+    "strict_prearrival": true
+  }
+}
