@@ -1,22 +1,13 @@
 //! `b4ld.c` (`BSIM4load`): the DC/transient load of one instance, and
 //! `BSIM4polyDepletion`.
 //!
-//! Physics stages retain the original C expression and host-call ordering.
+//! Physics stages retain the C model and host-call ordering. Numerically
+//! unstable forms use independently verified equivalent constitutive laws.
 //! Bias selection, junction currents, channel electrostatics and transport,
 //! leakage, intrinsic charges, junction charges, state commit, transient
 //! companions, and ordered stamping are distinct operations. C line1000
 //! (small-signal initialization) is represented by an absent companion.
 //! The port uses the reference NOBYPASS / NEWCONV configuration.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
-#![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 #![expect(
     non_snake_case,
     reason = "preserves upstream C identifiers for equation-by-equation comparison"
@@ -83,6 +74,91 @@ fn DEXP(A: f64) -> (f64, f64) {
     }
 }
 
+/// Smooth the transition from linear drain voltage to saturation using
+/// the smaller root of y² - (sat + drain + delta)y + sat*drain = 0.
+/// Keep the complementary gaps as independent values: reconstructing them
+/// by subtraction would lose precisely the low-field terms needed by the
+/// channel-length and capacitance derivatives.
+struct DrainSmoothing {
+    effective: f64,
+    drain_excess: f64,
+    saturation_partial: f64,
+    drain_partial: f64,
+}
+
+fn positive_half_sum(x: f64, root: f64, product: f64) -> f64 {
+    if x >= 0. {
+        root.midpoint(x)
+    } else {
+        2. * product / (root - x)
+    }
+}
+
+/// Smooth positive part and its slope, without losing the negative-tail
+/// value or evaluating its derivative as a difference of nearly equal terms.
+fn smooth_positive(x: f64, quarter_width_squared: f64) -> (f64, f64) {
+    let root = x.mul_add(x, 4. * quarter_width_squared).sqrt();
+    let value = positive_half_sum(x, root, quarter_width_squared);
+    // The symmetric limiting slope at the unsmoothed kink.
+    let slope = if root == 0. { 0.5 } else { value / root };
+    (value, slope)
+}
+
+fn smooth_drain(saturation: f64, drain: f64, delta: f64) -> DrainSmoothing {
+    let x = saturation - drain - delta;
+    let root = x.mul_add(x, 4. * delta * saturation).sqrt();
+    let effective = (2. * saturation / (saturation + drain + delta + root)) * drain;
+    let drain_excess = positive_half_sum(drain - saturation - delta, root, delta * drain);
+    let saturation_excess = positive_half_sum(x, root, delta * saturation);
+    DrainSmoothing {
+        effective,
+        drain_excess,
+        saturation_partial: drain_excess / root,
+        drain_partial: saturation_excess / root,
+    }
+}
+
+/// Smaller physical saturation root of a*y²/2 - b*y + c = 0.
+struct SaturationRoot {
+    value: f64,
+    discriminant_root: f64,
+}
+
+impl SaturationRoot {
+    fn new(a: f64, b: f64, c: f64) -> Self {
+        let discriminant_root = (-2. * a).mul_add(c, b * b).sqrt();
+        Self {
+            value: 2. * c / (b + discriminant_root),
+            discriminant_root,
+        }
+    }
+
+    fn derivative(&self, da: f64, db: f64, dc: f64) -> f64 {
+        let y = self.value;
+        (0.5 * y * y).mul_add(da, (-y).mul_add(db, dc)) / self.discriminant_root
+    }
+}
+
+/// Normalized depletion charge and its differential capacitance.
+/// The negative-potential continuation is linear. Rationalization makes
+/// the positive branch continuous down to the representable zero limit.
+fn depletion_charge(k1: f64, increment: f64) -> (f64, f64) {
+    if k1 == 0. {
+        return (0., 0.);
+    }
+    if increment < 0. {
+        return (increment, 1.);
+    }
+    let base = 0.5 * k1;
+    let root = base.mul_add(base, increment).sqrt();
+    let difference = if base > 0. {
+        increment / (root + base)
+    } else {
+        root - base
+    };
+    (k1 * difference, base / root)
+}
+
 /// `BSIM4polyDepletion`: the poly-gate depletion effective gate voltage and
 /// its gate derivative, `(Vgs_eff, dVgs_eff_dVg)`.
 pub(super) fn BSIM4polyDepletion(
@@ -96,13 +172,16 @@ pub(super) fn BSIM4polyDepletion(
     if (ngate > 1.0e18) && (ngate < 1.0e25) && (Vgs > phi) && (epsgate != 0.0) {
         let T1 = 1.0e6 * CHARGE * epsgate * ngate / (coxe * coxe);
         let T8 = Vgs - phi;
-        let T4 = sqrt(1.0 + 2.0 * T8 / T1);
+        let T4 = (2.0_f64.mul_add(T8 / T1, 1.0)).sqrt();
         let T2 = 2.0 * T8 / (T4 + 1.0);
         let T3 = 0.5 * T2 * T2 / T1; // Vpoly
-        let T7 = 1.12 - T3 - 0.05;
-        let T6 = sqrt(T7 * T7 + 0.224);
-        let T5 = 1.12 - 0.5 * (T7 + T6);
-        (Vgs - T5, 1.0 - (0.5 - 0.5 / T4) * (1.0 + T7 / T6))
+        let T7 = 1.07 - T3;
+        let T6 = T7.mul_add(T7, 0.224).sqrt();
+        // Rationalized band-bending drop. The original difference
+        // 1.12 - (T7+T6)/2 loses the entire drop near the onset of depletion.
+        let T5 = 2.24 * T3 / (2.24 - T7 + T6);
+        let slope = (-(0.5 - 0.5 / T4)).mul_add(1.0 + T7 / T6, 1.0);
+        (Vgs - T5, slope)
     } else {
         (Vgs, 1.0)
     }
@@ -146,11 +225,11 @@ mod tests {
 
     #[test]
     fn poly_depletion_matches_hand_evaluation() {
-        // NGATE = 2e19 cm^-3 gives a 58 mV poly drop at Vgs - phi = 0.6 V;
-        // the values are b4ld.c's expressions evaluated in IEEE doubles.
+        // Independent 80-digit evaluation of the physical equations:
+        // a 55.80412553677218 mV drop, not a particular C rounding order.
         let (vgs_eff, d) = BSIM4polyDepletion(0.9, 2e19, 1.03594e-10, 0.0115, 1.5);
-        assert_eq!(vgs_eff, 1.444_195_874_463_227_7);
-        assert_eq!(d, 0.830_890_287_421_742_1);
+        assert!((vgs_eff - 1.444_195_874_463_227_8).abs() <= 2. * f64::EPSILON);
+        assert!((d - 0.830_890_287_421_742_1).abs() <= 2. * f64::EPSILON);
     }
 
     #[test]
