@@ -50,6 +50,7 @@ pub mod bsim4;
 pub use breaks::{BreakTable, SourceBreaks};
 pub mod circuit;
 pub mod controlled;
+pub mod cpl;
 pub mod delay;
 pub mod distortion;
 mod elaboration;
