@@ -312,7 +312,10 @@ impl CoupledLinePlan {
         let mut bound = norm;
         // Renormalize the *physical length* of a segment, never the
         // coefficients. The same validated model applies to every section.
-        while bound > 4. {
+        loop {
+            if !(bound > 4.) {
+                break;
+            }
             if steps >= self.limits.max_squarings {
                 return Err(invalid(
                     "passive long-line admittance exceeds segment work budget",
