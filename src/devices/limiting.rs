@@ -111,6 +111,32 @@ pub fn pnjlim(vnew: Real, vold: Real, vt: Real, vcrit: Real) -> Limited {
     }
 }
 
+/// `DEVlimitlog` from `devsup.c`: logarithmically limits large steps in a
+/// self-heating device's junction temperature (expressed in °C).
+///
+/// This is a smooth continuation of the proposed Newton step, not a clamp of
+/// the physical temperature domain. The limited load must remain marked
+/// nonconvergent until its iterate reaches the unloaded temperature.
+#[must_use]
+pub fn limitlog(new: Real, old: Real, threshold: Real) -> Limited {
+    if new > old + threshold {
+        return Limited {
+            value: old + threshold + ((new - old) / threshold).log10(),
+            limited: true,
+        };
+    }
+    if new < old - threshold {
+        return Limited {
+            value: old - threshold - ((old - new) / threshold).log10(),
+            limited: true,
+        };
+    }
+    Limited {
+        value: new,
+        limited: false,
+    }
+}
+
 /// `DEVfetlim`: limits the per-iteration change of a FET gate voltage
 /// relative to the threshold `vto` (Gillespie's `vtstlo`).
 #[must_use]
@@ -366,6 +392,39 @@ impl Limiter {
         limited.value
     }
 
+    /// `DEVlimitlog` for a thermal node's Celsius voltage. Only a previous
+    /// finite value allows device limiting. A limited step requires another
+    /// Newton load, exactly like junction voltage limiting.
+    pub fn temperature(&mut self, raw: Real, previous: Option<Real>, threshold: Real) -> Real {
+        let Some(previous) = previous else {
+            return raw;
+        };
+        let limited = limitlog(raw, previous, threshold);
+        self.nonconvergent |= limited.limited;
+        limited.value
+    }
+
+    /// C `DEVfetlim`, with the same previous-load and nonconvergence
+    /// semantics as the diode and junction-temperature limiters.
+    pub fn fet_gate(&mut self, raw: Real, previous: Option<Real>, vto: Real) -> Real {
+        let Some(previous) = previous else {
+            return raw;
+        };
+        let value = fetlim(raw, previous, vto);
+        self.nonconvergent |= value != raw;
+        value
+    }
+
+    /// C `DEVlimvds`, with previous-load and nonconvergence bookkeeping.
+    pub fn drain_source(&mut self, raw: Real, previous: Option<Real>) -> Real {
+        let Some(previous) = previous else {
+            return raw;
+        };
+        let value = limvds(raw, previous);
+        self.nonconvergent |= value != raw;
+        value
+    }
+
     /// Whether the load is nonconvergent so far.
     #[must_use]
     pub const fn is_nonconvergent(self) -> bool {
@@ -394,6 +453,34 @@ mod tests {
     use crate::devices::StateHistory;
 
     const VT: Real = crate::devices::nonlinear::thermal::K_OVER_Q * 300.15;
+
+    #[test]
+    fn logarithmic_temperature_limiter_matches_devsup() {
+        assert_eq!(
+            limitlog(9., 0., 10.),
+            Limited {
+                value: 9.,
+                limited: false
+            }
+        );
+        assert_eq!(
+            limitlog(-10., 0., 10.),
+            Limited {
+                value: -10.,
+                limited: false
+            }
+        );
+        for (value, old, magnitude) in [(1000.0_f64, 0.0, 1000.0_f64), (-80.0, 15.0, 95.0)] {
+            let actual = limitlog(value, old, 10.);
+            let expected = if value > old {
+                old + 10. + (magnitude / 10.).log10()
+            } else {
+                old - 10. - (magnitude / 10.).log10()
+            };
+            assert!(actual.limited);
+            assert_eq!(actual.value.to_bits(), expected.to_bits());
+        }
+    }
 
     #[test]
     fn pnjlim_follows_devsup() {

@@ -55,7 +55,7 @@ const QDIO: usize = 4;
 const DIODE_VOLTAGE: usize = 6;
 const QP_CHARGE: usize = 7;
 const TEMPERATURE_AFTER_QP: usize = 9;
-const STATE_WITH_BOTH: usize = 11;
+const THERMAL_LOG_LIMIT: Real = 10.0; // C `vdmosload.c` -> `DEVlimitlog`
 
 fn charge_companion(
     branch: ChargeBranch,
@@ -383,6 +383,25 @@ impl Vdmos {
         }
     }
 
+    /// C `VDMOSdelTemp` is a distinct limiting-history state; it is not the
+    /// heat-storage charge/derivative slot that transient integration owns.
+    fn thermal_limit_slot(&self) -> usize {
+        self.thermal_charge_slot() + 2
+    }
+
+    /// VDMOS's C `VDMOSvgs`/`VDMOSvds` limiting histories follow all charge,
+    /// Qp and thermal slots; published charge/history offsets never change.
+    fn fet_limit_slots(&self) -> [usize; 2] {
+        let start = if self.thermal.is_some() {
+            self.thermal_limit_slot() + 1
+        } else if self.qp.is_some() {
+            TEMPERATURE_AFTER_QP
+        } else {
+            QP_CHARGE
+        };
+        [start, start + 1]
+    }
+
     /// The physically consistent derivative of the DC electrothermal MNA
     /// residual, including temperature-dependent electrical admittances.
     /// This is intentionally the derivative of `stamp_thermal`: ngspice 47
@@ -687,13 +706,7 @@ impl Device for Vdmos {
         true
     }
     fn state_count(&self) -> usize {
-        if self.thermal.is_some() && self.qp.is_some() {
-            STATE_WITH_BOTH
-        } else if self.thermal.is_some() || self.qp.is_some() {
-            TEMPERATURE_AFTER_QP
-        } else {
-            QP_CHARGE
-        }
+        self.fet_limit_slots()[1] + 1
     }
     fn truncation_slots(&self) -> Vec<usize> {
         let mut slots = vec![QGS, QGD, QDIO];
@@ -902,14 +915,30 @@ impl Device for Vdmos {
         let [d, g, s] = self.inner;
         let [de, ge, se] = self.terminals;
         let dp = self.diode_prime;
-        let kelvin = self.bias_temperature(&|node| context.node_voltage(node), context.temperature);
+        let mut limiter = Limiter::new(&context.states);
+        let temperature_limit = self.thermal.map(|[junction, _]| {
+            let raw = context.node_voltage(junction);
+            match limiter.mode() {
+                // C VDMOSload's MODEINITJCT starts delTemp at 0°C.
+                Linearization::Initial => 0.0,
+                Linearization::InitialTransient => context
+                    .states
+                    .accepted(1, self.thermal_limit_slot())
+                    .unwrap_or(raw),
+                _ => {
+                    let previous = limiter.previous(&context.states, self.thermal_limit_slot());
+                    limiter.temperature(raw, previous, THERMAL_LOG_LIMIT)
+                }
+            }
+        });
+        let kelvin =
+            temperature_limit.unwrap_or_else(|| self.ambient(context.temperature)) + 273.15;
         let raw_vdiode = context.node_voltage(dp) - context.node_voltage(de);
         let polarity = if self.model.parameters().polarity == Polarity::N {
             1.0
         } else {
             -1.0
         };
-        let mut limiter = Limiter::new(&context.states);
         let raw_normal = polarity * raw_vdiode;
         let normal = match limiter.mode() {
             Linearization::Initial => 0.0,
@@ -925,9 +954,58 @@ impl Device for Vdmos {
             ),
         };
         let vdiode = polarity * normal;
+        let raw_vgs = context.node_voltage(g) - context.node_voltage(s);
+        let raw_vds = context.node_voltage(d) - context.node_voltage(s);
+        let raw_normal_vgs = polarity * raw_vgs;
+        let raw_normal_vds = polarity * raw_vds;
+        let channel = self.model.parameters().channel;
+        let normalized_vto =
+            polarity * (channel.vth + channel.tcvth * (kelvin - self.model.parameters().tnom));
+        let [vgs_slot, vds_slot] = self.fet_limit_slots();
+        let (normal_vgs, normal_vds) = match limiter.mode() {
+            Linearization::Initial => (normalized_vto + 0.1, 0.0),
+            Linearization::InitialTransient => (
+                context
+                    .states
+                    .accepted(1, vgs_slot)
+                    .unwrap_or(raw_normal_vgs),
+                context
+                    .states
+                    .accepted(1, vds_slot)
+                    .unwrap_or(raw_normal_vds),
+            ),
+            _ => {
+                let previous_vgs = limiter.previous(&context.states, vgs_slot);
+                let previous_vds = limiter.previous(&context.states, vds_slot);
+                match (previous_vgs, previous_vds) {
+                    (Some(previous_vgs), Some(previous_vds)) if previous_vds >= 0.0 => {
+                        let limited_vgs =
+                            limiter.fet_gate(raw_normal_vgs, Some(previous_vgs), normalized_vto);
+                        let limited_vds = limiter.drain_source(
+                            limited_vgs - (raw_normal_vgs - raw_normal_vds),
+                            Some(previous_vds),
+                        );
+                        (limited_vgs, limited_vds)
+                    }
+                    (Some(previous_vgs), Some(previous_vds)) => {
+                        let limited_vgd = limiter.fet_gate(
+                            raw_normal_vgs - raw_normal_vds,
+                            Some(previous_vgs - previous_vds),
+                            normalized_vto,
+                        );
+                        let limited_vds = -limiter
+                            .drain_source(-(raw_normal_vgs - limited_vgd), Some(-previous_vds));
+                        (limited_vgd + limited_vds, limited_vds)
+                    }
+                    _ => (raw_normal_vgs, raw_normal_vds),
+                }
+            }
+        };
+        let vgs = polarity * normal_vgs;
+        let vds = polarity * normal_vds;
         let result = self.evaluate_bias(Bias {
-            vgs: context.node_voltage(g) - context.node_voltage(s),
-            vds: context.node_voltage(d) - context.node_voltage(s),
+            vgs,
+            vds,
             vds_external: context.node_voltage(de) - context.node_voltage(se),
             vdiode,
             recovery_node: self
@@ -1036,11 +1114,16 @@ impl Device for Vdmos {
                 ],
             )?;
         }
+        // C `cdreq` linearizes about the limited VGS/VDS, not the raw
+        // MNA values. Keep the correct equivalent-current RHS while the
+        // Newton device limiter walks toward its physical operating point.
+        let channel_equivalent =
+            channel.value + channel.d_vgs * (raw_vgs - vgs) + channel.d_vds * (raw_vds - vds);
         stamp_branch(
             context,
             d,
             s,
-            channel.value,
+            channel_equivalent,
             [
                 (g, channel.d_vgs),
                 (d, channel.d_vds),
@@ -1128,6 +1211,25 @@ impl Device for Vdmos {
         if let Some(thermal) = self.thermal {
             self.stamp_thermal(context, &result, thermal, vdiode)?;
         }
-        limiter.finish(&mut context.states, &[(DIODE_VOLTAGE, normal)])
+        if let Some(temperature) = temperature_limit {
+            limiter.finish(
+                &mut context.states,
+                &[
+                    (DIODE_VOLTAGE, normal),
+                    (vgs_slot, normal_vgs),
+                    (vds_slot, normal_vds),
+                    (self.thermal_limit_slot(), temperature),
+                ],
+            )
+        } else {
+            limiter.finish(
+                &mut context.states,
+                &[
+                    (DIODE_VOLTAGE, normal),
+                    (vgs_slot, normal_vgs),
+                    (vds_slot, normal_vds),
+                ],
+            )
+        }
     }
 }
