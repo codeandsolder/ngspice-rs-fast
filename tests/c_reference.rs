@@ -240,6 +240,7 @@ fn parsed_flags_and_ic_vectors_match_live_c_setter_order() {
                     }
                 }
                 ParameterKind::Waveform(_)
+                | ParameterKind::NumericVector(_)
                 | ParameterKind::Textual
                 | ParameterKind::Instance
                 | ParameterKind::Behavioural(_)
