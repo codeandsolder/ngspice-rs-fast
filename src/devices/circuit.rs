@@ -206,6 +206,7 @@ pub(super) struct CircuitRuntime {
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
     mutual_evaluation: std::cell::RefCell<Option<MutualEvaluation>>,
     candidate_overrides: Vec<CandidateNumericOverride>,
+    control_overrides: Vec<CandidateNumericOverride>,
 }
 
 /// A process-local, never recycled identity for a validated topology.
@@ -918,6 +919,32 @@ fn assemble_numeric_targets(
     );
     targets.extend_from_slice(overrides);
     Ok(targets)
+}
+
+// Script edits supersede candidate sites, and a DC point supersedes both.
+// Normalize resistance to its canonical instance setter, so a resistance
+// edit and a different parameter of the same resistor can coexist. Retain
+// setter order for independent sites and the last occurrence of each site.
+fn ordered_control_targets(
+    targets: impl IntoIterator<Item = CandidateNumericOverride>,
+) -> SpiceResult<Vec<CandidateNumericOverride>> {
+    let mut unique = BTreeMap::new();
+    for (order, target) in targets.into_iter().enumerate() {
+        let value = match target {
+            CandidateNumericOverride::Resistor(value) => {
+                InstanceTarget::new(value.topology(), value.device(), "resistance")
+                    .at(value.supplied())?
+            }
+            CandidateNumericOverride::Instance(value) => value,
+        };
+        unique.insert((value.device(), value.parameter()), (order, value));
+    }
+    let mut ordered: Vec<_> = unique.into_values().collect();
+    ordered.sort_unstable_by_key(|(order, _)| *order);
+    Ok(ordered
+        .into_iter()
+        .map(|(_, value)| CandidateNumericOverride::Instance(value))
+        .collect())
 }
 
 impl Circuit {
@@ -2598,10 +2625,69 @@ impl Circuit {
     /// circuit borrow rules out stale prepared analysis scopes during update.
     pub(crate) fn set_candidate_overrides(&mut self, overrides: Vec<CandidateNumericOverride>) {
         self.runtime.candidate_overrides = overrides;
+        self.runtime.control_overrides.clear();
+    }
+
+    /// Validate and publish persistent script edits over the current candidate.
+    /// A script edit does not consume the fixed DC sweep slots. The original
+    /// candidate and its immutable device recipes remain available for reset.
+    pub(crate) fn set_control_overrides(
+        &mut self,
+        context: &ModelContext,
+        edits: &[InstanceOverride],
+    ) -> SpiceResult<()> {
+        if edits.is_empty() {
+            self.runtime.control_overrides.clear();
+            self.clear_candidate_analysis_state();
+            return Ok(());
+        }
+        let base = assemble_numeric_targets(
+            context,
+            &self.runtime.candidate_overrides,
+            self.runtime.candidate_overrides.len()
+                + context.resistor_overrides.len()
+                + context.instance_overrides.len(),
+        )?;
+        let combined = ordered_control_targets(
+            base.into_iter().chain(
+                edits
+                    .iter()
+                    .copied()
+                    .map(CandidateNumericOverride::Instance),
+            ),
+        )?;
+        let mut context = *context;
+        context.resistor_overrides.fill(None);
+        context.instance_overrides.fill(None);
+        self.validate_candidate_overrides(&context, &combined)?;
+        self.runtime.control_overrides = combined;
+        self.clear_candidate_analysis_state();
+        Ok(())
     }
 
     fn replacements(&self, context: &ModelContext) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
-        self.replacements_with_overrides(context, &self.runtime.candidate_overrides)
+        if self.runtime.control_overrides.is_empty() {
+            return self.replacements_with_overrides(context, &self.runtime.candidate_overrides);
+        }
+        if context.resistor_overrides.iter().all(Option::is_none)
+            && context.instance_overrides.iter().all(Option::is_none)
+        {
+            return self.replacements_with_overrides(context, &self.runtime.control_overrides);
+        }
+        // The control list already contains the underlying candidate's
+        // sites. Context slots now belong only to the particular analysis
+        // point, not the candidate. Overlay them last.
+        let point = assemble_numeric_targets(
+            context,
+            &[],
+            context.resistor_overrides.len() + context.instance_overrides.len(),
+        )?;
+        let combined =
+            ordered_control_targets(self.runtime.control_overrides.iter().copied().chain(point))?;
+        let mut context = *context;
+        context.resistor_overrides.fill(None);
+        context.instance_overrides.fill(None);
+        self.replacements_with_overrides(&context, &combined)
     }
 
     fn single_candidate_replacement(

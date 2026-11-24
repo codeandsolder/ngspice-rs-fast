@@ -9,10 +9,14 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::analysis::control::vectors::{self, SpectrumWindow, TransformBudget};
-use crate::analysis::control::{ControlPlot, ControlSession};
+use crate::analysis::control::{
+    ControlBatchBudget, ControlBatchCards, ControlPlot, ControlSession,
+};
 use crate::analysis::optimization::parameters::CircuitParameterPlan;
 use crate::analysis::{Variable, measure};
-use crate::netlist::ast::{AnalysisCard, MeasureCard, Netlist, ScopedCardKind};
+use crate::netlist::ast::{
+    AnalysisCard, FourierCard, MeasureCard, Netlist, OutputCards, ScopedCardKind,
+};
 use crate::netlist::eval::{EvalBudget, EvalLimits, ParamBinding, ParamScope};
 use crate::netlist::parser::{control_analysis, control_measure};
 use crate::netlist::{
@@ -35,6 +39,8 @@ pub struct ScriptLimits {
     pub transform_work: usize,
     /// Number of distinct scalar variables.
     pub variables: usize,
+    /// Distinct retained instance parameter edits.
+    pub instance_edits: usize,
     /// Printed bytes.
     pub output_bytes: usize,
     /// Scalar expression evaluation budget.
@@ -50,6 +56,7 @@ impl Default for ScriptLimits {
             grid_points: 10_000_000,
             transform_work: 100_000_000,
             variables: 4096,
+            instance_edits: 4096,
             output_bytes: 16_000_000,
             expressions: EvalLimits::default(),
         }
@@ -76,6 +83,7 @@ struct Instruction {
 enum Operation {
     Let(String, Scalar),
     AlterParameter(String, Scalar),
+    AlterInstance(String, Option<String>, Scalar),
     Reset,
     Run,
     Analysis(Box<AnalysisCard>),
@@ -86,7 +94,7 @@ enum Operation {
     SetPlot(String),
     Foreach(String, Vec<Scalar>, Vec<Instruction>),
     While(Condition, Vec<Instruction>),
-    DestroyAll,
+    Destroy(Vec<String>),
     Quit,
 }
 
@@ -185,6 +193,41 @@ fn assignment(text: &str, location: &SourceLoc) -> SpiceResult<(String, Scalar)>
         .ok_or_else(|| error(location, "expected name = expression"))?;
     Ok((
         identifier(name.trim(), location)?,
+        expression(value, location)?,
+    ))
+}
+
+fn instance_assignment(text: &str, location: &SourceLoc) -> SpiceResult<Operation> {
+    let (target, value) = text
+        .split_once('=')
+        .ok_or_else(|| error(location, "expected instance [parameter] = expression"))?;
+    let target = target.trim();
+    let (name, parameter) = if let Some(target) = target.strip_prefix('@') {
+        let (name, parameter) = target
+            .split_once('[')
+            .and_then(|(name, parameter)| Some((name, parameter.strip_suffix(']')?)))
+            .ok_or_else(|| error(location, "expected @instance[parameter]"))?;
+        (name, Some(parameter))
+    } else {
+        let mut words = target.split_ascii_whitespace();
+        let name = words.next().unwrap_or_default();
+        let parameter = words.next();
+        if words.next().is_some() {
+            return Err(error(location, "too many instance target fields"));
+        }
+        (name, parameter)
+    };
+    if name.is_empty()
+        || name.contains(char::is_whitespace)
+        || parameter.is_some_and(|parameter| {
+            parameter.is_empty() || parameter.contains(char::is_whitespace)
+        })
+    {
+        return Err(error(location, "invalid instance target"));
+    }
+    Ok(Operation::AlterInstance(
+        name.to_ascii_lowercase(),
+        parameter.map(str::to_ascii_lowercase),
         expression(value, location)?,
     ))
 }
@@ -314,6 +357,7 @@ impl Compiler<'_> {
                 let (name, value) = assignment(rest, location)?;
                 Ok(Operation::Let(name, value))
             }
+            "alter" => instance_assignment(rest, location),
             "alterparam" => {
                 let (name, value) = assignment(rest, location)?;
                 self.tunables.insert(name.clone());
@@ -366,7 +410,16 @@ impl Compiler<'_> {
                 }
                 Ok(Operation::SetPlot(rest.to_ascii_lowercase()))
             }
-            "destroy" if rest.eq_ignore_ascii_case("all") => Ok(Operation::DestroyAll),
+            "destroy" => {
+                let names: Vec<_> = rest
+                    .split_ascii_whitespace()
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+                if names.len() > 1 && names.iter().any(|name| name == "all") {
+                    return Err(error(location, "destroy all must be the sole argument"));
+                }
+                Ok(Operation::Destroy(names))
+            }
             "run" | "reset" | "quit" => {
                 empty_arguments(rest, location)?;
                 Ok(match name.to_ascii_lowercase().as_str() {
@@ -388,6 +441,8 @@ impl Compiler<'_> {
 struct Program {
     instructions: Vec<Instruction>,
     tunables: BTreeSet<String>,
+    measurements: Vec<MeasureCard>,
+    observations: Vec<String>,
 }
 
 impl Program {
@@ -395,6 +450,8 @@ impl Program {
         let mut program = Self {
             instructions: Vec::new(),
             tunables: BTreeSet::new(),
+            measurements: Vec::new(),
+            observations: Vec::new(),
         };
         let mut cards = Vec::new();
         for scoped in &netlist.cards {
@@ -420,20 +477,64 @@ impl Program {
         if program.instructions.is_empty() {
             return Err(error(&netlist.location, "no executable .control commands"));
         }
+        let mut observations = BTreeSet::new();
+        collect_observations(
+            &program.instructions,
+            &mut program.measurements,
+            &mut observations,
+        )?;
+        program.observations = observations.into_iter().collect();
         Ok(program)
     }
+}
+
+fn collect_observations(
+    instructions: &[Instruction],
+    measures: &mut Vec<MeasureCard>,
+    observations: &mut BTreeSet<String>,
+) -> SpiceResult<()> {
+    for instruction in instructions {
+        match &instruction.operation {
+            Operation::Measure(card) => measures.push((**card).clone()),
+            Operation::Let(_, expression) => {
+                observations.extend(vectors::current_probes(expression)?)
+            }
+            Operation::Print(names) | Operation::Transform(_, names) => {
+                for name in names {
+                    // A qualified plot name is not part of the device identity.
+                    let name = name
+                        .split_once('.')
+                        .filter(|(_, suffix)| suffix.starts_with("i(") || suffix.starts_with('@'))
+                        .map_or(name.as_str(), |(_, suffix)| suffix);
+                    if name.starts_with("i(") || name.starts_with('@') {
+                        observations.insert(name.to_owned());
+                    }
+                }
+            }
+            Operation::While(_, body) | Operation::Foreach(_, _, body) => {
+                collect_observations(body, measures, observations)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 struct State<'a, 'w> {
     session: ControlSession<'a>,
     analyses: &'a [AnalysisCard],
+    deck_output: &'a OutputCards,
+    deck_measurements: &'a [MeasureCard],
+    deck_fourier: &'a [FourierCard],
+    script_measurements: &'a [MeasureCard],
+    script_observations: &'a [String],
     limits: ScriptLimits,
     variables: BTreeMap<String, Real>,
     pending: BTreeMap<String, Real>,
     plots: Vec<ControlPlot>,
     cells: usize,
     current: Option<usize>,
-    next_plot_id: usize,
+    plot_names: crate::analysis::batch::PlotNames,
     window: SpectrumWindow,
     remaining_transform_work: usize,
     remaining_steps: usize,
@@ -526,19 +627,38 @@ impl State<'_, '_> {
     fn run_plans(
         &mut self,
         plans: &[crate::analysis::AnalysisPlan],
+        deck_run: bool,
         location: &SourceLoc,
     ) -> SpiceResult<()> {
         if plans.is_empty() {
             return Err(error(location, "run requires deck analysis cards"));
         }
-        let plots = self.session.collect_batch(
+        let result = self.session.collect_batch(
             plans,
-            self.limits.plots - self.plots.len(),
-            self.limits.cells - self.cells,
-            &mut self.remaining_grid,
+            ControlBatchCards {
+                output: self.deck_output,
+                measurements: self.deck_measurements,
+                fourier: self.deck_fourier,
+                script_measurements: self.script_measurements,
+                script_observations: self.script_observations,
+                deck_run,
+            },
+            ControlBatchBudget {
+                plots: self.limits.plots - self.plots.len(),
+                cells: self.limits.cells - self.cells,
+                grid: &mut self.remaining_grid,
+            },
+            |text| self.output.emit(text, location),
         )?;
-        for plot in plots {
+        for plot in result.plots {
             self.retain(plot, location)?;
+        }
+        for measurement in result.measurements {
+            self.bind(
+                &measurement.name.to_ascii_lowercase(),
+                measurement.value,
+                location,
+            )?;
         }
         Ok(())
     }
@@ -557,11 +677,7 @@ impl State<'_, '_> {
         } else {
             crate::analysis::batch::plot_abbreviation(result.kind)
         };
-        result.plot.name = format!("{prefix}{}", self.next_plot_id);
-        self.next_plot_id = self
-            .next_plot_id
-            .checked_add(1)
-            .ok_or_else(|| error(location, "control plot identifier overflow"))?;
+        result.plot.name = self.plot_names.allocate(prefix);
         self.current = Some(self.plots.len());
         self.plots.push(result);
         self.cells = cells;
@@ -581,6 +697,45 @@ impl State<'_, '_> {
                 .position(|plot| plot.plot.name.eq_ignore_ascii_case(name))
                 .ok_or_else(|| error(location, format!("unknown plot {name}")))?,
         );
+        Ok(())
+    }
+
+    fn destroy(&mut self, names: &[String], location: &SourceLoc) -> SpiceResult<()> {
+        if names == ["all"] {
+            self.plots.clear();
+            self.current = None;
+            self.cells = 0;
+            self.plot_names = crate::analysis::batch::PlotNames::default();
+            return Ok(());
+        }
+        let mut targets = BTreeSet::new();
+        if names.is_empty() {
+            targets.insert(
+                self.current
+                    .ok_or_else(|| error(location, "no current plot"))?,
+            );
+        }
+        for name in names {
+            targets.insert(
+                self.plots
+                    .iter()
+                    .position(|plot| plot.plot.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| error(location, format!("unknown plot {name}")))?,
+            );
+        }
+        let previous = self.current;
+        let current_removed = previous.is_some_and(|index| targets.contains(&index));
+        let earlier = previous.map_or(0, |index| targets.range(..index).count());
+        for index in targets.into_iter().rev() {
+            let removed = self.plots.remove(index);
+            self.plot_names.remove(&removed.plot.name);
+            self.cells -= removed.plot.cells().len();
+        }
+        self.current = if current_removed {
+            self.plots.len().checked_sub(1)
+        } else {
+            previous.map(|index| index - earlier)
+        };
         Ok(())
     }
 
@@ -671,10 +826,15 @@ impl State<'_, '_> {
 
     fn measure(&mut self, card: &MeasureCard) -> SpiceResult<()> {
         let plot = self
-            .plots
-            .iter()
-            .rev()
-            .find(|plot| plot.kind == card.analysis)
+            .current
+            .and_then(|index| self.plots.get(index))
+            .filter(|plot| plot.kind == card.analysis)
+            .or_else(|| {
+                self.plots
+                    .iter()
+                    .rev()
+                    .find(|plot| plot.kind == card.analysis)
+            })
             .map(|plot| &plot.plot)
             .ok_or_else(|| {
                 error(
@@ -720,7 +880,7 @@ impl State<'_, '_> {
                 .variables
                 .get(scalar_name)
                 .copied()
-                .or_else(|| self.session.parameter(scalar_name))
+                .or_else(|| self.session.scope().ok()?.get(scalar_name))
             {
                 self.output
                     .emit(&format!("{name} = {value:.15e}\n"), location)?;
@@ -805,6 +965,15 @@ impl State<'_, '_> {
                 let value = self.evaluate(value)?;
                 self.pending.insert(name.clone(), value);
             }
+            Operation::AlterInstance(name, parameter, value) => {
+                let value = self.evaluate(value)?;
+                self.session.alter_instance(
+                    name,
+                    parameter.as_deref(),
+                    value,
+                    self.limits.instance_edits,
+                )?;
+            }
             Operation::Reset => {
                 self.session.alter_parameters(
                     self.pending
@@ -814,16 +983,12 @@ impl State<'_, '_> {
                 self.pending.clear();
             }
             Operation::Run => {
-                let plans = self
-                    .analyses
-                    .iter()
-                    .map(|card| self.session.plan(card))
-                    .collect::<SpiceResult<Vec<_>>>()?;
-                self.run_plans(&plans, location)?;
+                let plans = self.session.plans(self.analyses)?;
+                self.run_plans(&plans, true, location)?;
             }
             Operation::Analysis(card) => {
                 let plan = self.plan_script_card(card)?;
-                self.run_plans(std::slice::from_ref(&plan), location)?;
+                self.run_plans(std::slice::from_ref(&plan), false, location)?;
             }
             Operation::Measure(card) => self.measure(card)?,
             Operation::Print(values) => self.print(values, location)?,
@@ -832,11 +997,7 @@ impl State<'_, '_> {
             }
             Operation::SetWindow(window) => self.window = *window,
             Operation::SetPlot(name) => self.select_plot(name, location)?,
-            Operation::DestroyAll => {
-                self.plots.clear();
-                self.current = None;
-                self.cells = 0;
-            }
+            Operation::Destroy(names) => self.destroy(names, location)?,
             Operation::Foreach(..) | Operation::While(..) | Operation::Quit => {
                 return Err(error(location, "unexpected control-flow instruction"));
             }
@@ -861,12 +1022,6 @@ pub fn run_file(
 ) -> SpiceResult<ScriptReport> {
     let parsed =
         Parser::with_auto_gnd(auto_gnd).parse_control_file(path, SourceLimits::default())?;
-    if !parsed.output.is_empty() || !parsed.measurements.is_empty() || !parsed.fourier.is_empty() {
-        return Err(unsupported(
-            &parsed.netlist.location,
-            "mixed batch output cards in script mode",
-        ));
-    }
     let program = Program::compile(&parsed.netlist, auto_gnd)?;
     let tunables: Vec<_> = program.tunables.iter().map(String::as_str).collect();
     let analyses = parsed.netlist.analyses.clone();
@@ -875,13 +1030,18 @@ pub fn run_file(
     let mut state = State {
         session,
         analyses: &analyses,
+        deck_output: &parsed.output,
+        deck_measurements: &parsed.measurements,
+        deck_fourier: &parsed.fourier,
+        script_measurements: &program.measurements,
+        script_observations: &program.observations,
         limits,
         variables: BTreeMap::new(),
         pending: BTreeMap::new(),
         plots: Vec::new(),
         cells: 0,
         current: None,
-        next_plot_id: 1,
+        plot_names: crate::analysis::batch::PlotNames::default(),
         window: SpectrumWindow::default(),
         remaining_transform_work: limits.transform_work,
         remaining_steps: limits.steps,

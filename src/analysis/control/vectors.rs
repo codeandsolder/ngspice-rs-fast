@@ -561,16 +561,7 @@ impl<F: Fn(&str) -> Option<Real>> VectorCompiler<'_, F> {
     }
 
     fn probe(&mut self, argument: &Expr, voltage: bool) -> SpiceResult<()> {
-        let range = argument
-            .span
-            .relative_to(&self.root.span)
-            .ok_or_else(|| failure("invalid probe source span"))?;
-        let name = self
-            .root
-            .text
-            .get(range)
-            .ok_or_else(|| failure("invalid probe name"))?
-            .trim();
+        let name = probe_name(self.root, argument)?;
         let schema = self.plot.schema();
         let index = if voltage {
             schema.voltage(name)
@@ -658,6 +649,32 @@ impl<F: Fn(&str) -> Option<Real>> VectorCompiler<'_, F> {
         }
         Ok(())
     }
+}
+
+fn probe_name<'a>(root: &'a ParameterExpression, argument: &Expr) -> SpiceResult<&'a str> {
+    let range = argument
+        .span
+        .relative_to(&root.span)
+        .ok_or_else(|| failure("invalid probe source span"))?;
+    root.text
+        .get(range)
+        .map(str::trim)
+        .ok_or_else(|| failure("invalid probe name"))
+}
+
+pub(crate) fn current_probes(root: &ParameterExpression) -> SpiceResult<Vec<String>> {
+    root.root
+        .preorder()
+        .filter_map(|node| match &node.kind {
+            ExprKind::UserCall { name, arguments } if name == "i" => {
+                Some(match arguments.as_slice() {
+                    [argument] => probe_name(root, argument).map(|name| format!("i({name})")),
+                    _ => Err(failure("current probe needs one device")),
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn binary(operation: BinaryOp, left: Complex, right: Complex) -> SpiceResult<Complex> {

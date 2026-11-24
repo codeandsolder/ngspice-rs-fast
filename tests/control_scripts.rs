@@ -70,13 +70,19 @@ struct ScriptDeck(std::path::PathBuf);
 
 impl ScriptDeck {
     fn new(name: &str, script: &str) -> Self {
+        Self::from_text(
+            name,
+            &format!(
+                "divider\n.param r=1k\nv1 in 0 3\nr1 in out {{r}}\nr2 out 0 1k\n.dc v1 0 3 1\n.control\n{script}\n.endc\n.end\n"
+            ),
+        )
+    }
+
+    fn from_text(name: &str, text: &str) -> Self {
         let path =
             std::env::temp_dir().join(format!("spice-control-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(
-            path.join("deck.cir"),
-            format!("divider\n.param r=1k\nv1 in 0 3\nr1 in out {{r}}\nr2 out 0 1k\n.dc v1 0 3 1\n.control\n{script}\n.endc\n.end\n"),
-        ).unwrap();
+        std::fs::write(path.join("deck.cir"), text.trim_start()).unwrap();
         Self(path)
     }
 
@@ -403,4 +409,197 @@ print v(out)",
     let spectrum = &report.plots[2].plot;
     assert!((spectrum.value("amplitude", 0).unwrap().re - 1.5).abs() < 1e-12);
     assert!(output.contains("amplitude[0]"));
+}
+
+#[test]
+fn instance_edits_overlay_parameter_candidates_and_reset_transactionally() {
+    let plan = divider();
+    let mut session = ControlSession::new(&plan, EvalLimits::default()).unwrap();
+    assert_eq!(
+        session.alter_parameter("r", 2000.).unwrap(),
+        CandidateTopology::Reused
+    );
+    // The first edit overrides the same physical site as the optimizer
+    // coordinate. Three distinct sites exceed the two DC point slots.
+    session.alter_instance("r1", None, 3000., 3).unwrap();
+    session.alter_instance("r2", None, 2000., 3).unwrap();
+    session.alter_instance("v1", Some("dc"), 10., 3).unwrap();
+    session.alter_instance("r1", Some("r"), 4000., 3).unwrap();
+    assert!(session.alter_instance("r1", None, 0., 3).is_err());
+    assert!(session.alter_parameter("r", 500.).is_err());
+
+    let plot = session
+        .run(AnalysisInput::new(AnalysisKind::OperatingPoint), 1, 100)
+        .unwrap();
+    assert!((plot[0].value("v(out)", 0).unwrap().re - 10. / 3.).abs() < 1e-12);
+    let sweep = session
+        .run(
+            AnalysisInput::with_arguments(AnalysisKind::DcSweep, ["v1", "0", "6", "3"]),
+            1,
+            100,
+        )
+        .unwrap();
+    assert!((sweep[0].value("v(out)", 2).unwrap().re - 2.).abs() < 1e-12);
+    let plot = session
+        .run(AnalysisInput::new(AnalysisKind::OperatingPoint), 1, 100)
+        .unwrap();
+    assert!((plot[0].value("v(out)", 0).unwrap().re - 10. / 3.).abs() < 1e-12);
+    assert_eq!(
+        session
+            .alter_parameters(std::iter::empty::<(&str, f64)>())
+            .unwrap(),
+        CandidateTopology::Reused
+    );
+    let plot = session
+        .run(AnalysisInput::new(AnalysisKind::OperatingPoint), 1, 100)
+        .unwrap();
+    assert!((plot[0].value("v(out)", 0).unwrap().re - 1.).abs() < 1e-12);
+}
+
+#[test]
+fn scripted_alter_sweep_and_reset_restore_source_values() {
+    let deck = ScriptDeck::new(
+        "instance-edits",
+        "
+alterparam r=2k
+reset
+alter @r1[r]=3k
+alter r2 resistance=2k
+alter v1=10
+op
+dc v1 0 6 3
+op
+reset
+op",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    assert_eq!(report.plots.len(), 4);
+    for (index, point, expected) in [(0, 0, 4.), (1, 2, 2.4), (2, 0, 4.), (3, 0, 1.)] {
+        let value = report.plots[index].plot.value("v(out)", point).unwrap().re;
+        assert!((value - expected).abs() < 1e-12, "{index}: {value}");
+    }
+    assert!(
+        deck.run(ScriptLimits {
+            instance_edits: 2,
+            ..ScriptLimits::default()
+        })
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("instance edit budget")
+    );
+}
+
+#[test]
+fn mixed_output_cards_stream_hidden_measurements_and_retain_only_selection() {
+    let deck = ScriptDeck::from_text(
+        "batch-output",
+        "
+mixed reports
+v1 in 0 3
+r1 in out 1k
+r2 out 0 1k
+.dc v1 0 3 1
+.save v(out)
+.print dc v(out)
+.meas dc hidden max v(in)
+.meas dc half param='hidden/2'
+.control
+run
+print hidden half
+meas dc observed max v(out)
+.endc
+.end",
+    );
+    let (report, text) = deck
+        .run(ScriptLimits {
+            cells: 8,
+            ..ScriptLimits::default()
+        })
+        .unwrap();
+    assert_eq!(report.plots.len(), 1);
+    let plot = &report.plots[0].plot;
+    assert_eq!(plot.variable_count(), 2);
+    assert_eq!(plot.point_count(), 4);
+    assert!(plot.value("v(in)", 3).is_none());
+    assert!((report.variables["hidden"] - 3.).abs() < 1e-12);
+    assert!((report.variables["half"] - 1.5).abs() < 1e-12);
+    assert!((report.variables["observed"] - 1.5).abs() < 1e-12);
+    assert!(text.contains("hidden"));
+    assert!(text.contains("v(out)"));
+}
+
+#[test]
+fn script_measurements_and_vector_expressions_request_device_observations() {
+    let deck = ScriptDeck::new(
+        "device-observations",
+        "
+run
+let branch=2*i(r1)
+meas dc current find i(r2) at=2
+meas dc twice find branch at=2
+print @r1[resistance]",
+    );
+    let (report, output) = deck.run(ScriptLimits::default()).unwrap();
+    assert!((report.variables["current"] - 0.001).abs() < 1e-14);
+    assert!((report.variables["twice"] - 0.002).abs() < 1e-14);
+    assert!(output.contains("@r1[resistance]"));
+}
+
+#[test]
+fn control_crossing_derivative_extrema_and_selected_plot() {
+    let deck = ScriptDeck::new(
+        "measure-operators",
+        "
+run
+meas dc crossing when v(out)=.75
+meas dc slope deriv v(out) at=1
+meas dc range pp v(out)
+meas dc peak max_at v(out)
+alter r2=3k
+run
+setplot dc1
+meas dc earlier max v(out)
+destroy dc2
+op
+destroy
+destroy all
+run",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    for (name, expected) in [
+        ("crossing", 1.5),
+        ("slope", 0.5),
+        ("range", 1.5),
+        ("peak", 3.),
+        ("earlier", 1.5),
+    ] {
+        assert!((report.variables[name] - expected).abs() < 1e-12, "{name}");
+    }
+    assert_eq!(report.plots.len(), 1);
+    assert_eq!(report.plots[0].plot.name, "dc1");
+}
+
+#[test]
+fn mixed_fourier_card_uses_hidden_transient_signal() {
+    let deck = ScriptDeck::from_text(
+        "batch-fourier",
+        "
+Fourier report
+v1 in 0 sin(0 2 1k)
+r1 in out 1k
+r2 out 0 1k
+.tran 10u 2m
+.save v(out)
+.four 1k v(in)
+.control
+run
+.endc
+.end",
+    );
+    let (report, output) = deck.run(ScriptLimits::default()).unwrap();
+    assert_eq!(report.plots.len(), 1);
+    assert!(report.plots[0].plot.value("v(in)", 0).is_none());
+    assert!(output.contains("Fourier analysis for"));
+    assert!(output.contains("v(in)"));
 }
