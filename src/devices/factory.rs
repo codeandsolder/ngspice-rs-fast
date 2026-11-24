@@ -111,6 +111,8 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Switch | ModelBackend::CurrentSwitch => {
             crate::devices::switch::Switch::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::Cpl => crate::devices::cpl::CoupledLine::instantiate(instance, nodes, &model)
+            .map(|line| Box::new(line) as Box<dyn Device>),
         ModelBackend::Txl => Err(SpiceError::circuit(format!(
             "TXL {} is prepared by Circuit::add_instances",
             instance.name

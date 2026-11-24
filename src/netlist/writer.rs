@@ -815,6 +815,12 @@ impl Writer<'_> {
                 parts.push(' ')?;
             }
             match &parameter.kind {
+                ParameterKind::NumericVector(entries)
+                    if matches!(base, "cpl" | "cpllines")
+                        && ["r", "l", "g", "c"].contains(&parameter.name.as_str()) =>
+                {
+                    append_cpl_material(&mut parts, parameter, entries)?;
+                }
                 ParameterKind::Flag => {
                     let allowed = model_flags(base);
                     if !allowed.contains(&parameter.name.as_str()) || !parameter.value.is_empty() {
@@ -1200,6 +1206,37 @@ fn value_text<'a>(
         _ => return Err(bad("value kind is not allowed here")),
     }
     Ok(&parameter.value)
+}
+
+/// Write the evaluated independent CPL vector coefficients as ordinary
+/// numeric tokens, retaining physical scale suffixes and rejecting injection.
+fn append_cpl_material(
+    parts: &mut Card<'_>,
+    parameter: &ParameterAssignment,
+    entries: &[crate::netlist::ast::NumericVectorEntry],
+) -> SpiceResult<()> {
+    parts.push_str(&parameter.name)?;
+    parts.push('=')?;
+    for (position, entry) in entries.iter().enumerate() {
+        if position != 0 {
+            parts.push(' ')?;
+        }
+        match single_token(&entry.source.text, &entry.source.location) {
+            Some(Lexeme {
+                kind: TokenKind::Number(value),
+                ..
+            }) if value.is_finite() => {
+                parts.push_str(&entry.source.text)?;
+            }
+            _ => {
+                return Err(refuse(
+                    "CPL vector coefficient must be a finite literal",
+                    Some(&entry.source.location),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn append_named_value(

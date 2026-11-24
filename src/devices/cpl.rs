@@ -9,11 +9,15 @@ pub mod plan;
 use std::sync::Arc;
 
 use crate::devices::linear::LinearContext;
+use crate::devices::models::ResolvedModel;
 use crate::devices::traits::{AnalysisMode, StampContext};
 use crate::devices::{Device, MnaUnknowns};
 use crate::maths::{Vector, dense_complex::DenseComplex};
-use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
-use plan::CoupledLinePlan;
+use crate::netlist::ast::{DeviceInstance, ParameterKind};
+use crate::primitives::{
+    Complex, NodeAppend, NodeId, Real, SpiceError, SpiceResult, parse_spice_number,
+};
+use plan::{CoupledLineLimits, CoupledLinePlan};
 
 fn invalid(message: impl std::fmt::Display) -> SpiceError {
     SpiceError::circuit(format!("coupled transmission line: {message}"))
@@ -34,7 +38,150 @@ pub struct CoupledLine {
     output_return: NodeId,
     terminals: Vec<NodeId>,
 }
+type CplMaterialVectors = std::collections::BTreeMap<String, Vec<Real>>;
+
 impl CoupledLine {
+    /// Bind one P instance to an evaluated CPL model and physical node table.
+    ///
+    /// Model coefficients are prepared before any node insertion. The
+    /// caller owns a node-append transaction, so failures never publish a
+    /// partially elaborated cable. Length on the instance overrides model.
+    /// # Errors
+    /// Unknown model setters, malformed numeric vector, topology or physics.
+    pub fn instantiate(
+        instance: &DeviceInstance,
+        nodes: &mut NodeAppend<'_>,
+        model: &ResolvedModel<'_>,
+    ) -> SpiceResult<Self> {
+        let count = instance.nodes.len();
+        if count < 4 || count % 2 != 0 || model.family() != crate::devices::ModelFamily::Cpl {
+            return Err(invalid(
+                "P instance requires N input/output conductors and two returns",
+            ));
+        }
+        let conductors = (count - 2) / 2;
+        let expected = conductors
+            .checked_add(1)
+            .and_then(|v| v.checked_mul(conductors))
+            .map(|v| v / 2)
+            .ok_or_else(|| invalid("CPL matrix dimensions overflow"))?;
+        let (mut length, arrays) = Self::prepare_model(model, expected)?;
+        for parameter in &instance.parameters {
+            if parameter.name != "length" {
+                return Err(SpiceError::parse(
+                    parameter.location.clone(),
+                    format!("unsupported P instance parameter {}", parameter.name),
+                ));
+            }
+            length = Some(Self::scalar_parameter(parameter)?);
+        }
+        let len = length.ok_or_else(|| invalid("CPL needs a model or instance length"))?;
+        let zero = vec![0.; expected];
+        let inductance = arrays
+            .get("l")
+            .ok_or_else(|| invalid("CPL missing inductance matrix"))?;
+        let capacitance = arrays
+            .get("c")
+            .ok_or_else(|| invalid("CPL missing capacitance matrix"))?;
+        let resistance = arrays.get("r").unwrap_or(&zero);
+        let conductance = arrays.get("g").unwrap_or(&zero);
+        let plan = Arc::new(CoupledLinePlan::from_packed(
+            conductors,
+            len,
+            resistance,
+            inductance,
+            conductance,
+            capacitance,
+            CoupledLineLimits::default(),
+        )?);
+        nodes.transaction(|nodes| {
+            let terminals = instance
+                .nodes
+                .iter()
+                .map(|name| nodes.intern(name))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            Self::new(
+                instance.name.clone(),
+                Arc::clone(&plan),
+                terminals[..conductors].to_vec(),
+                terminals[conductors],
+                terminals[conductors + 1..conductors + 1 + conductors].to_vec(),
+                terminals[count - 1],
+            )
+        })
+    }
+
+    fn prepare_model(
+        model: &ResolvedModel<'_>,
+        expected: usize,
+    ) -> SpiceResult<(Option<Real>, CplMaterialVectors)> {
+        let mut length = None;
+        let mut arrays = std::collections::BTreeMap::<String, Vec<Real>>::new();
+        for parameter in &model.card().parameters {
+            if parameter.name == "length" {
+                length = Some(Self::scalar_parameter(parameter)?);
+            } else if ["r", "l", "g", "c"].contains(&parameter.name.as_str()) {
+                let ParameterKind::NumericVector(entries) = &parameter.kind else {
+                    return Err(SpiceError::parse(
+                        parameter.location.clone(),
+                        "CPL material must be a complete numeric upper-triangle vector",
+                    ));
+                };
+                if entries.len() != expected {
+                    return Err(SpiceError::parse(
+                        parameter.location.clone(),
+                        format!(
+                            "CPL {} requires {expected} upper-triangle coefficients, got {}",
+                            parameter.name,
+                            entries.len()
+                        ),
+                    ));
+                }
+                let mut values = Vec::new();
+                values
+                    .try_reserve(expected)
+                    .map_err(|_| invalid("CPL coefficient storage allocation"))?;
+                for entry in entries {
+                    if entry.expression.is_some() {
+                        return Err(SpiceError::parse(
+                            entry.source.location.clone(),
+                            "unresolved CPL vector expression",
+                        ));
+                    }
+                    values.push(
+                        parse_spice_number(&entry.source.text)
+                            .filter(|v| v.is_finite())
+                            .ok_or_else(|| {
+                                SpiceError::parse(
+                                    entry.source.location.clone(),
+                                    format!("nonfinite CPL coefficient {}", entry.source.text),
+                                )
+                            })?,
+                    );
+                }
+                arrays.insert(parameter.name.clone(), values);
+            } else {
+                return Err(SpiceError::parse(
+                    parameter.location.clone(),
+                    format!("unknown CPL material setter {}", parameter.name),
+                ));
+            }
+        }
+        Ok((length, arrays))
+    }
+
+    fn scalar_parameter(parameter: &crate::netlist::ast::ParameterAssignment) -> SpiceResult<Real> {
+        if parameter.kind != ParameterKind::Scalar {
+            return Err(SpiceError::parse(
+                parameter.location.clone(),
+                "CPL length requires a literal scalar",
+            ));
+        }
+        parse_spice_number(&parameter.value)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| SpiceError::parse(parameter.location.clone(), "nonfinite CPL length"))
+    }
+
     /// Construct one line with unambiguous conductor and return ordering.
     ///
     /// # Errors
@@ -51,8 +198,8 @@ impl CoupledLine {
         if name.is_empty()
             || input.len() != plan.conductors()
             || output.len() != plan.conductors()
-            || input.iter().any(|&node| node == input_return)
-            || output.iter().any(|&node| node == output_return)
+            || input.contains(&input_return)
+            || output.contains(&output_return)
         {
             return Err(invalid("invalid conductor/return terminal layout"));
         }
@@ -181,8 +328,8 @@ impl Device for CoupledLine {
             for input in 0..ports {
                 let (rp, rn) = self.physical_pair(output);
                 let (cp, cn) = self.physical_pair(input);
-                for row in [rp, rn] {
-                    for col in [cp, cn] {
+                for row in <[NodeId; 2]>::from((rp, rn)) {
+                    for col in <[NodeId; 2]>::from((cp, cn)) {
                         setup.nodes(row, col);
                     }
                 }

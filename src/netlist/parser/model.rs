@@ -13,11 +13,13 @@ use winnow::combinator::{alt, cut_err, opt, peek, repeat};
 use winnow::error::ErrMode;
 use winnow::token::any;
 
-use crate::netlist::ast::{ModelCard, ParameterAssignment, ParameterKind};
+use crate::netlist::ast::{
+    ModelCard, NumericVectorEntry, ParameterAssignment, ParameterKind, PositionedValue,
+};
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Failure, Input, ParsedCard, Result, gap, keyword};
-use super::syntax::{equals, malformed, name, named, punctuation, value};
+use super::syntax::{Value, equals, malformed, name, named, punctuation, value};
 
 pub(super) fn model_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     keyword(".model").parse_next(input)?;
@@ -72,17 +74,11 @@ fn model_base<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
             // JFET (`jfet/jfet.c`; level 2 is `jfet2/`).
             | "njf" | "pjf"
             // Lossy transmission line (`ltra/ltra.c`).
-            | "ltra" | "txl"
+            | "ltra" | "txl" | "cpl" | "cpllines"
             // MESFET (`mes/mes.c`) and its `inpdomod.c` HFET spellings; the
             // level selects `mesa/`, `hfet1/` or `hfet2/`.
             | "nmf" | "pmf" | "nhfet" | "phfet"
     ) {
-        if base.is_keyword("cpl") || base.is_keyword("cpllines") {
-            return Err(gap(
-                input,
-                "CPL coupled lines (src/spicelib/parser/inp2p.c; devices/cpl/)",
-            ));
-        }
         return Err(gap(
             input,
             "model family outside D/BJT/MOS/JFET/MESFET/R/C/L/SW/CSW/URC/TXL scalar syntax",
@@ -96,6 +92,7 @@ fn parameters(input: &mut Input<'_>, base: &str) -> Result<Vec<ParameterAssignme
         0..,
         alt((
             punctuation(TokenKind::Comma).value(None),
+            (|input: &mut Input<'_>| cpl_vector(input, base)).map(Some),
             (|input: &mut Input<'_>| super::flags::model(input, base)).map(Some),
             (|input: &mut Input<'_>| version_assignment(input, base)).map(Some),
             scalar_assignment.map(Some),
@@ -216,4 +213,69 @@ fn invalid_parameter(input: &mut Input<'_>) -> Result<Option<ParameterAssignment
         return Err(gap(input, "non-scalar model parameters"));
     }
     Err(malformed(input, "expected a scalar model assignment"))
+}
+
+/// Upper-triangular CPL numeric-vector setter in physical conductor order.
+/// Retains every source span and bracket expression for literalization.
+fn cpl_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
+    peek(any.verify(|token: &Token| {
+        matches!(base, "cpl" | "cpllines")
+            && token.kind == TokenKind::Word
+            && ["r", "l", "g", "c"]
+                .iter()
+                .any(|name| token.is_keyword(name))
+    }))
+    .parse_next(input)?;
+    let setter = any.parse_next(input)?;
+    opt(equals).parse_next(input)?;
+    let mut entries = Vec::new();
+    while let Some(token) = input.input.first() {
+        if token.kind == TokenKind::RParen
+            || (token.kind == TokenKind::Word
+                && ["r", "l", "g", "c", "length"]
+                    .iter()
+                    .any(|name| token.is_keyword(name)))
+        {
+            break;
+        }
+        if token.kind == TokenKind::Comma {
+            any.parse_next(input)?;
+            continue;
+        }
+        let component = cut_err(value).parse_next(input)?;
+        let (source, expression) = match component {
+            Value::Literal(token) => (token, None),
+            Value::Expression(token, expression) => (token, Some(expression)),
+        };
+        entries.push(NumericVectorEntry {
+            source: PositionedValue {
+                text: source.text.clone(),
+                location: source.location.clone(),
+            },
+            expression,
+        });
+        if entries.len() > 528 {
+            return Err(malformed(
+                input,
+                "CPL matrix vector exceeds 32-conductor bound",
+            ));
+        }
+    }
+    if entries.is_empty() {
+        return Err(malformed(
+            input,
+            "CPL R/L/G/C requires at least one numeric coefficient",
+        ));
+    }
+    let text = entries
+        .iter()
+        .map(|entry| entry.source.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(ParameterAssignment {
+        name: setter.text.to_ascii_lowercase(),
+        value: text,
+        kind: ParameterKind::NumericVector(entries),
+        location: setter.location.clone(),
+    })
 }

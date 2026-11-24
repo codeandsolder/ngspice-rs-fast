@@ -106,25 +106,27 @@ impl CoupledLinePlan {
     /// Invalid dimensions, active or singular material, allocation budget.
     pub fn new(
         length: Real,
-        r: Matrix,
-        l: Matrix,
-        g: Matrix,
-        c: Matrix,
+        resistance: Matrix,
+        inductance: Matrix,
+        conductance: Matrix,
+        capacitance: Matrix,
         limits: CoupledLineLimits,
     ) -> SpiceResult<Self> {
-        let n = r.rows();
-        limits.check(n)?;
+        let conductors = resistance.rows();
+        limits.check(conductors)?;
         if !length.is_finite() || length <= 0. {
             return Err(invalid("cable length must be finite and positive"));
         }
         for (name, matrix, definite) in [
-            ("R", &r, false),
-            ("L", &l, true),
-            ("G", &g, false),
-            ("C", &c, true),
+            ("R", &resistance, false),
+            ("L", &inductance, true),
+            ("G", &conductance, false),
+            ("C", &capacitance, true),
         ] {
-            if !matrix.is_square() || matrix.rows() != n {
-                return Err(invalid(format!("{name} must be {n} by {n}")));
+            if !matrix.is_square() || matrix.rows() != conductors {
+                return Err(invalid(format!(
+                    "{name} must be {conductors} by {conductors}"
+                )));
             }
             let max = matrix
                 .data()
@@ -133,7 +135,7 @@ impl CoupledLinePlan {
             if !max.is_finite() {
                 return Err(invalid(format!("{name} contains nonfinite coefficients")));
             }
-            for row in 0..n {
+            for row in 0..conductors {
                 for col in 0..row {
                     if matrix.get(row, col) != matrix.get(col, row) {
                         return Err(invalid(format!("{name} is nonsymmetric at ({row},{col})")));
@@ -145,8 +147,9 @@ impl CoupledLinePlan {
                 .first()
                 .copied()
                 .ok_or_else(|| invalid("empty eigenspectrum"))?;
-            let dimension =
-                f64::from(u32::try_from(n).map_err(|_| invalid("dimension conversion overflow"))?);
+            let dimension = f64::from(
+                u32::try_from(conductors).map_err(|_| invalid("dimension conversion overflow"))?,
+            );
             let uncertainty = 128. * Real::EPSILON * dimension * max;
             if smallest < -uncertainty || (definite && smallest <= uncertainty) {
                 return Err(invalid(format!(
@@ -156,10 +159,10 @@ impl CoupledLinePlan {
         }
         Ok(Self {
             length,
-            r,
-            l,
-            g,
-            c,
+            r: resistance,
+            l: inductance,
+            g: conductance,
+            c: capacitance,
             limits,
         })
     }
@@ -273,78 +276,80 @@ impl CoupledLinePlan {
     /// # Errors
     /// Singular transfer or nonfinite physical coupling.
     pub fn admittance_at(&self, hz: Real) -> SpiceResult<DenseComplex> {
-        let n = self.conductors();
+        let conductors = self.conductors();
         let (transfer, scale) = self.transfer_at(hz)?;
-        let mut a = DenseComplex::zeros(n)?;
-        let mut b = DenseComplex::zeros(n)?;
-        let mut c = DenseComplex::zeros(n)?;
-        let mut d = DenseComplex::zeros(n)?;
-        for row in 0..n {
-            for col in 0..n {
-                a.set(
+        let mut block_a = DenseComplex::zeros(conductors)?;
+        let mut block_b = DenseComplex::zeros(conductors)?;
+        let mut block_c = DenseComplex::zeros(conductors)?;
+        let mut block_d = DenseComplex::zeros(conductors)?;
+        for row in 0..conductors {
+            for col in 0..conductors {
+                block_a.set(
                     row,
                     col,
                     transfer
                         .get(row, col)
                         .ok_or_else(|| invalid("transfer block A"))?,
                 )?;
-                b.set(
+                block_b.set(
                     row,
                     col,
                     transfer
-                        .get(row, n + col)
+                        .get(row, conductors + col)
                         .ok_or_else(|| invalid("transfer block B"))?,
                 )?;
-                c.set(
+                block_c.set(
                     row,
                     col,
                     transfer
-                        .get(n + row, col)
+                        .get(conductors + row, col)
                         .ok_or_else(|| invalid("transfer block C"))?,
                 )?;
-                d.set(
+                block_d.set(
                     row,
                     col,
                     transfer
-                        .get(n + row, n + col)
+                        .get(conductors + row, conductors + col)
                         .ok_or_else(|| invalid("transfer block D"))?,
                 )?;
             }
         }
-        let inverse = b.inverse()?.ok_or_else(|| {
+        let inverse = block_b.inverse()?.ok_or_else(|| {
             invalid("singular voltage/current transfer: ideal or resonant line constraint")
         })?;
-        let inva = inverse.mul(&a)?;
-        let dinva = d.mul(&inva)?;
-        let dinv = d.mul(&inverse)?;
-        let mut result = DenseComplex::zeros(2 * n)?;
-        for row in 0..n {
-            for col in 0..n {
+        let inva = inverse.mul(&block_a)?;
+        let dinva = block_d.mul(&inva)?;
+        let dinv = block_d.mul(&inverse)?;
+        let mut result = DenseComplex::zeros(2 * conductors)?;
+        for row in 0..conductors {
+            for col in 0..conductors {
                 let entries = [
                     (row, col, -inva.get(row, col).ok_or_else(|| invalid("Y11"))?),
                     (
                         row,
-                        n + col,
+                        conductors + col,
                         inverse.get(row, col).ok_or_else(|| invalid("Y12"))?,
                     ),
                     (
-                        n + row,
+                        conductors + row,
                         col,
                         dinva.get(row, col).ok_or_else(|| invalid("Y21"))?
-                            - c.get(row, col).ok_or_else(|| invalid("Y21 correction"))?,
+                            - block_c
+                                .get(row, col)
+                                .ok_or_else(|| invalid("Y21 correction"))?,
                     ),
                     (
-                        n + row,
-                        n + col,
+                        conductors + row,
+                        conductors + col,
                         -dinv.get(row, col).ok_or_else(|| invalid("Y22"))?,
                     ),
                 ];
-                for (r, c, value) in entries {
+                for (r, block_c, value) in entries {
                     let physical = value / Complex::real(scale);
                     if !physical.is_finite() {
                         return Err(invalid("nonfinite coupled physical Y"));
                     }
-                    result.set(r, c, physical)?;
+                    result.set(r, block_c, physical)?;
                 }
             }
         }
@@ -358,6 +363,22 @@ impl CoupledLinePlan {
 /// theta-13 bound applies to any submultiplicative norm; here the infinity
 /// norm is used as a conservative, cheaply computable choice.
 fn expm_pade13(input: &DenseComplex, max_squarings: usize) -> SpiceResult<DenseComplex> {
+    const B: [Real; 14] = [
+        64_764_752_532_480_000.,
+        32_382_376_266_240_000.,
+        7_771_770_303_897_600.,
+        1_187_353_796_428_800.,
+        129_060_195_264_000.,
+        10_559_470_521_600.,
+        670_442_572_800.,
+        33_522_128_640.,
+        1_323_241_920.,
+        40_840_800.,
+        960_960.,
+        16380.,
+        182.,
+        1.,
+    ];
     let n = input.dim();
     let mut norm = 0.0_f64;
     for row in input.data().chunks_exact(n.max(1)) {
@@ -367,15 +388,19 @@ fn expm_pade13(input: &DenseComplex, max_squarings: usize) -> SpiceResult<DenseC
     if !norm.is_finite() {
         return Err(invalid("matrix exponential has nonfinite norm"));
     }
-    let steps = if norm > 5.371_920_351_148_152 {
-        (norm / 5.371_920_351_148_152).log2().ceil().max(0.) as usize
-    } else {
-        0
-    };
-    if steps > max_squarings {
-        return Err(invalid(
-            "propagation exponential exceeds squaring work budget",
-        ));
+    let mut scaled_norm = norm;
+    let mut steps = 0;
+    loop {
+        if scaled_norm <= 5.371_920_351_148_152 {
+            break;
+        }
+        if steps >= max_squarings {
+            return Err(invalid(
+                "propagation exponential exceeds squaring work budget",
+            ));
+        }
+        steps += 1;
+        scaled_norm *= 0.5;
     }
     let divisor =
         2.0_f64.powi(-i32::try_from(steps).map_err(|_| invalid("scaling exponent overflow"))?);
@@ -384,22 +409,6 @@ fn expm_pade13(input: &DenseComplex, max_squarings: usize) -> SpiceResult<DenseC
     let a4 = a2.mul(&a2)?;
     let a6 = a4.mul(&a2)?;
     let identity = DenseComplex::identity(n)?;
-    const B: [Real; 14] = [
-        64764752532480000.,
-        32382376266240000.,
-        7771770303897600.,
-        1187353796428800.,
-        129060195264000.,
-        10559470521600.,
-        670442572800.,
-        33522128640.,
-        1323241920.,
-        40840800.,
-        960960.,
-        16380.,
-        182.,
-        1.,
-    ];
     let combine = |terms: &[(&DenseComplex, Real)]| -> SpiceResult<DenseComplex> {
         let mut out = DenseComplex::zeros(n)?;
         for &(matrix, weight) in terms {

@@ -256,3 +256,155 @@ fn distinct_input_and_output_return_nodes_stamp_exact_kcl_signs() {
     near(Complex::real(dense[0][3]), Complex::real(-1. / 6.), 2e-12);
     near(Complex::real(dense[0][5]), Complex::real(1. / 6.), 2e-12);
 }
+
+#[test]
+fn native_cpl_parser_preserves_conductor_and_return_order() {
+    use ngspice_rs::netlist::ast::ParameterKind;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+    let deck = "native coupled pair\n\
+        p1 in1 in2 retin out1 out2 retout coupled len=0.3048\n\
+        .model coupled cpl R=0.5 0 0.5 L=247.3n 31.65n 247.3n\n\
+        + C=31.4p -2.45p 31.4p G=0 0 0 length=1\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("cpl.cir"), deck))
+        .unwrap();
+    assert_eq!(netlist.devices.len(), 1);
+    assert_eq!(
+        netlist.devices[0].nodes,
+        ["in1", "in2", "retin", "out1", "out2", "retout"]
+    );
+    assert_eq!(netlist.devices[0].model.as_deref(), Some("coupled"));
+    assert_eq!(netlist.models.len(), 1);
+    assert_eq!(netlist.models[0].base, "cpl");
+    for name in ["r", "l", "g", "c"] {
+        let parameter = netlist.models[0]
+            .parameters
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap();
+        let ParameterKind::NumericVector(entries) = &parameter.kind else {
+            panic!("{name} not vector")
+        };
+        assert_eq!(entries.len(), 3);
+    }
+    // Writer output is also a valid native CPL deck, with the complete
+    // positioned matrix coefficient vectors in the same conductor order.
+    let written = ngspice_rs::netlist::writer::write_netlist(&netlist).unwrap();
+    let reloaded = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("cpl_rewritten.cir"), &written))
+        .unwrap();
+    assert!(ngspice_rs::netlist::semantic_eq(&netlist, &reloaded));
+}
+
+#[test]
+fn native_p_device_solves_dc_and_ac_with_model_and_instance_length_override() {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+    let deck = "p device native\n\
+        v1 in 0 dc 1 ac 1\n\
+        rload out 0 100\n\
+        p1 in 0 out 0 coupled len 1\n\
+        .model coupled cpl R=10 L=8n C=3p G=0 length=0.5\n\
+        .op\n.ac lin 1 1e6 1e6\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("cpl_native.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let analytic = model(1, 1., &[10.], &[8e-9], &[0.], &[3e-12]);
+    let y = analytic.admittance_at(1e6).unwrap();
+    let y21 = y.get(1, 0).unwrap();
+    let y22 = y.get(1, 1).unwrap();
+    let expected = -y21 / (y22 + Complex::real(0.01));
+    for plan in config.plans_for(&netlist.analyses).unwrap() {
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let output = plan.run(&mut circuit, &config.context()).unwrap();
+        if plan.kind() == ngspice_rs::primitives::AnalysisKind::OperatingPoint {
+            near(
+                output.value("v(out)", 0).unwrap(),
+                Complex::real(100. / 110.),
+                1e-11,
+            );
+        } else {
+            near(output.value("v(out)", 0).unwrap(), expected, 5e-11);
+        }
+    }
+}
+
+#[test]
+fn arbitrary_noncommuting_rlgc_matches_independent_runge_kutta_propagation() {
+    // The real R/L/G/C matrices have distinct eigenvectors. Exact modal
+    // separation into scalar lines is impossible; independently integrate
+    // the full first-order physical telegrapher system with RK4.
+    let resistance = [[1.0, 0.3], [0.3, 2.0]];
+    let inductance = [[100e-9, 22e-9], [22e-9, 150e-9]];
+    let conductance = [[0.001, 0.00015], [0.00015, 0.003]];
+    let capacitance = [[5e-12, -0.7e-12], [-0.7e-12, 8e-12]];
+    let length = 0.2;
+    let line = model(
+        2,
+        length,
+        &[resistance[0][0], resistance[0][1], resistance[1][1]],
+        &[inductance[0][0], inductance[0][1], inductance[1][1]],
+        &[conductance[0][0], conductance[0][1], conductance[1][1]],
+        &[capacitance[0][0], capacitance[0][1], capacitance[1][1]],
+    );
+    for hz in [1e6, 250e6, 1e9] {
+        let omega = std::f64::consts::TAU * hz;
+        let mut operator = [[Complex::ZERO; 4]; 4];
+        for r in 0..2 {
+            for c in 0..2 {
+                operator[r][c + 2] = -Complex::new(resistance[r][c], omega * inductance[r][c]);
+                operator[r + 2][c] = -Complex::new(conductance[r][c], omega * capacitance[r][c]);
+            }
+        }
+        let derivative = |state: &[Complex; 4]| -> [Complex; 4] {
+            std::array::from_fn(|r| {
+                (0..4).fold(Complex::ZERO, |acc, c| acc + operator[r][c] * state[c])
+            })
+        };
+        let mut reference = [[Complex::ZERO; 4]; 4];
+        let steps = 4096usize;
+        let delta = length / f64::from(u16::try_from(steps).unwrap());
+        for input in 0..4 {
+            let mut state = [Complex::ZERO; 4];
+            state[input] = Complex::real(1.);
+            for _ in 0..steps {
+                let k1 = derivative(&state);
+                let stage = std::array::from_fn(|k| state[k] + k1[k] * Complex::real(delta * 0.5));
+                let k2 = derivative(&stage);
+                let stage = std::array::from_fn(|k| state[k] + k2[k] * Complex::real(delta * 0.5));
+                let k3 = derivative(&stage);
+                let stage = std::array::from_fn(|k| state[k] + k3[k] * Complex::real(delta));
+                let k4 = derivative(&stage);
+                for row in 0..4 {
+                    state[row] = state[row]
+                        + (k1[row]
+                            + k2[row] * Complex::real(2.)
+                            + k3[row] * Complex::real(2.)
+                            + k4[row])
+                            * Complex::real(delta / 6.);
+                }
+            }
+            for row in 0..4 {
+                reference[row][input] = state[row];
+            }
+        }
+        let (observed, scale) = line.transfer_at(hz).unwrap();
+        for row in 0..4 {
+            for col in 0..4 {
+                let conversion = match (row < 2, col < 2) {
+                    (true, false) => 1. / scale,
+                    (false, true) => scale,
+                    _ => 1.,
+                };
+                near(
+                    observed.get(row, col).unwrap(),
+                    reference[row][col] * Complex::real(conversion),
+                    2e-8,
+                );
+            }
+        }
+    }
+}

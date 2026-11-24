@@ -77,8 +77,9 @@ negative/singular/oversized matrices.
 ## Integration boundary / follow-on
 
 The typed distributed AC/DC matrices and Device interface are in place.
-Native P/CPL netlist model parsing and fully causal transient propagation
-are separate integration steps. Arbitrary AC frequency responses cannot
+Native P/CPL netlist parsing, including separately positioned real-vector
+coefficients and independent return terminals, and model binding are active.
+The complete passive rational transient propagation is a separate step. Arbitrary AC frequency responses cannot
 be sampled into transient forcing: correct transient must derive from the
 time-domain RLGC system, using an accepted/trial history or validated
 passive rational spatial approximation. No nonlinear transient dynamics

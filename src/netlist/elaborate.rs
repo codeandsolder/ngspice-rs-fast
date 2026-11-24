@@ -396,6 +396,32 @@ fn literalize_parameters(
     kind: impl Fn(usize) -> SiteKind,
 ) -> SpiceResult<()> {
     for (index, parameter) in parameters.iter_mut().enumerate() {
+        if let ParameterKind::NumericVector(entries) = &mut parameter.kind {
+            for entry in entries.iter_mut() {
+                if let Some(expression) = entry.expression.take() {
+                    let value =
+                        scope
+                            .evaluate(&expression, budget)
+                            .map_err(|error| match error {
+                                SpiceError::Parse { location, message } => SpiceError::parse(
+                                    location,
+                                    format!(
+                                        "{message} while resolving {} CPL coefficient at {}",
+                                        parameter.name, entry.source.location
+                                    ),
+                                ),
+                                other => other,
+                            })?;
+                    entry.source.text = format_literal(value);
+                }
+            }
+            parameter.value = entries
+                .iter()
+                .map(|entry| entry.source.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            continue;
+        }
         if let ParameterKind::Behavioural(expression) = &parameter.kind {
             // Behavioural expressions stay symbolic: only their `.param`
             // names, `.func` calls and numparam values are resolved here.
