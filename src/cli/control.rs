@@ -18,10 +18,8 @@ use crate::netlist::ast::{
     AnalysisCard, FourierCard, MeasureCard, Netlist, OutputCards, ScopedCardKind,
 };
 use crate::netlist::eval::{EvalBudget, EvalLimits, ParamBinding, ParamScope};
-use crate::netlist::parser::{control_analysis, control_measure};
-use crate::netlist::{
-    DotCommand, ParameterExpression, Parser, RawCard, SourceLimits, parse_parameter_expression,
-};
+use crate::netlist::parser::{control_analysis, control_measure, parse_control_expression};
+use crate::netlist::{DotCommand, ParameterExpression, Parser, RawCard, SourceLimits};
 use crate::primitives::{AnalysisKind, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// Independent work and storage bounds for one script invocation.
@@ -205,7 +203,7 @@ fn expression(text: &str, location: &SourceLoc) -> SpiceResult<Scalar> {
             return Err(error(location, "invalid numeric variable substitution"));
         }
     }
-    Ok(Box::new(parse_parameter_expression(&normalized, location)?))
+    Ok(Box::new(parse_control_expression(&normalized, location)?))
 }
 
 fn assignment(text: &str, location: &SourceLoc) -> SpiceResult<(String, Scalar)> {

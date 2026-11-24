@@ -308,6 +308,14 @@ pub fn parse_parameter_expression(
     )
 }
 
+/// Parse a control-language expression with a distinct variable/function namespace.
+pub(crate) fn parse_control_expression(
+    text: &str,
+    location: &crate::primitives::SourceLoc,
+) -> SpiceResult<crate::netlist::expr::ParameterExpression> {
+    expression::parse_control_expression(text, super::source::SourcePosition::physical(location))
+}
+
 /// Cache lexical results for ordered replay; later errors do not mask earlier
 /// semantic failures. Forward declaration lookup belongs to each scope.
 fn prepare_cards(

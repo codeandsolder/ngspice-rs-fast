@@ -629,6 +629,10 @@ repeat
     break 2
   end
 end
+let vec = 1
+if vec = 1
+  let total = total + vec
+end
 echo "total=$&total" i=$i
 alter r1 2k
 op
@@ -636,8 +640,8 @@ op
     );
     let (report, output) = deck.run(ScriptLimits::default()).unwrap();
     assert_eq!(report.variables["i"], 4.);
-    assert_eq!(report.variables["total"], 14.);
-    assert!(output.contains("total=14 i=4"));
+    assert_eq!(report.variables["total"], 15.);
+    assert!(output.contains("total=15 i=4"));
     assert!((report.plots[0].plot.value("v(out)", 0).unwrap().re - 1.).abs() < 1e-12);
 }
 
