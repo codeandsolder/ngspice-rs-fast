@@ -29,6 +29,7 @@ mod channel;
 mod charge;
 mod junction;
 mod leakage;
+mod reduction;
 mod stamp;
 
 const MAX_EXPL: f64 = 2.688_117_142e+43;
