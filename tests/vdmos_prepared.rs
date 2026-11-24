@@ -280,3 +280,211 @@ fn electrothermal_junction_case_dc_matches_ngspice47() {
         }
     }
 }
+
+#[test]
+fn electrothermal_junction_case_switching_transient_matches_ngspice47() {
+    let checkpoint_times = [50e-6, 110e-6, 500e-6, 1e-3, 1.1e-3, 1.8e-3];
+    for (name, deck, junctions, cases) in [
+        (
+            "N",
+            include_str!("fixtures/vdmos/thermal_switch_n.cir"),
+            [27.0, 27.1503, 31.4068, 33.9530, 32.8857, 28.8328],
+            [27.0, 27.1253, 30.6723, 32.7942, 31.9048, 28.5274],
+        ),
+        (
+            "P",
+            include_str!("fixtures/vdmos/thermal_switch_p.cir"),
+            [27.0, 27.0752, 29.2181, 30.5202, 29.9798, 27.9279],
+            [27.0, 27.0627, 28.8484, 29.9335, 29.4832, 27.7733],
+        ),
+    ] {
+        let plot = transient(deck, "1u 2m 0 1u")
+            .unwrap_or_else(|error| panic!("thermal transient {name}: {error}"));
+        assert!(
+            plot.point_count() > 1000,
+            "{name}: truncated thermal waveform"
+        );
+        for (variable, expected) in [("v(junction)", junctions), ("v(case)", cases)] {
+            for (time, reference) in checkpoint_times.into_iter().zip(expected) {
+                let actual = interpolation(&plot, variable, time);
+                let tolerance = 0.12;
+                assert!(
+                    (actual - reference).abs() < tolerance,
+                    "{name} thermal transient {variable} at {time:e}: Rust {actual:e}, ngspice47 {reference:e}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn electrothermal_small_signal_is_derivative_of_its_dc_residual() {
+    // ngspice 47's vdmosacld.c reverses the electrothermal power-Jacobian
+    // signs versus vdmosload.c: at f→0 its AC junction temperature has the
+    // opposite sign to its own DC finite-difference slope. Preserve the
+    // *physical* DC/AC consistency rather than reproduce that C defect.
+    for (name, dc_source, ac_source, base_gate, c_junction_slope) in [
+        (
+            "N",
+            include_str!("fixtures/vdmos/thermal_dc_n.cir"),
+            include_str!("fixtures/vdmos/thermal_ac_n.cir"),
+            4.0,
+            9.92,
+        ),
+        (
+            "P",
+            include_str!("fixtures/vdmos/thermal_dc_p.cir"),
+            include_str!("fixtures/vdmos/thermal_ac_p.cir"),
+            -4.0,
+            -5.165,
+        ),
+    ] {
+        let gate = format!("Vg g 0 {base_gate}");
+        let mut dc_points = Vec::new();
+        for step in [-0.001, 0.001] {
+            let source = dc_source.replace(&gate, &format!("Vg g 0 {}", base_gate + step));
+            let plot = run(&source).unwrap_or_else(|error| panic!("{name} derivative DC: {error}"));
+            dc_points.push(["v(junction)", "v(case)", "i(vd)"].map(|key| {
+                plot.value(key, 0)
+                    .unwrap_or_else(|| panic!("missing DC {key}"))
+                    .re
+            }));
+        }
+        let ac_low =
+            ac(ac_source, "1mHz").unwrap_or_else(|error| panic!("{name} thermal AC: {error}"));
+        let ac_100 =
+            ac(ac_source, "100").unwrap_or_else(|error| panic!("{name} thermal 100Hz: {error}"));
+        for (index, key) in ["v(junction)", "v(case)", "i(vd)"].into_iter().enumerate() {
+            let finite_difference = (dc_points[1][index] - dc_points[0][index]) / 0.002;
+            let low = ac_low
+                .value(key, 0)
+                .unwrap_or_else(|| panic!("missing AC {key}"));
+            let tol = 0.007_f64.mul_add(finite_difference.abs(), 0.005);
+            assert!(
+                (low.re - finite_difference).abs() < tol,
+                "{name} {key}: low-frequency AC {} vs DC derivative {} (tol {})",
+                low.re,
+                finite_difference,
+                tol
+            );
+            assert!(
+                low.im.abs() < 1e-3,
+                "{name} {key}: low-frequency imaginary component {}",
+                low.im
+            );
+            if index < 2 {
+                let finite_100 = ac_100.value(key, 0).unwrap();
+                assert!(
+                    finite_100.re * finite_difference > 0.0,
+                    "{name} {key}: thermal AC changes DC response sign"
+                );
+                assert!(
+                    finite_100.im * finite_difference < 0.0,
+                    "{name} {key}: thermal RC phase leads rather than lags"
+                );
+            }
+        }
+        let c_error = 0.008_f64.mul_add(f64::abs(c_junction_slope), 0.04);
+        let got = (dc_points[1][0] - dc_points[0][0]) / 0.002;
+        assert!(
+            (got - c_junction_slope).abs() < c_error,
+            "{name} DC slope {got} disagrees with native ngspice47 {c_junction_slope}"
+        );
+    }
+}
+
+#[test]
+fn simultaneous_electrothermal_and_soft_recovery_states_match_ngspice47() {
+    let times = [180e-6, 202e-6, 210e-6, 240e-6, 350e-6];
+    let junction = [27.1822, 27.1763, 27.1543, 27.0936, 27.0150];
+    let case = [27.1518, 27.1469, 27.1285, 27.0780, 27.0125];
+    let currents = [-0.0437920, -0.00592598, -3.27612e-6];
+    for (name, source, sign) in [
+        (
+            "N",
+            include_str!("fixtures/vdmos/thermal_recovery_n.cir"),
+            1.0,
+        ),
+        (
+            "P",
+            include_str!("fixtures/vdmos/thermal_recovery_p.cir"),
+            -1.0,
+        ),
+    ] {
+        let plot = transient(source, "100n 400u 0 100n maxsteps=10000")
+            .unwrap_or_else(|error| panic!("combined Qp/thermal {name}: {error}"));
+        assert!(
+            plot.point_count() > 2000,
+            "{name}: short combined transient"
+        );
+        for (variable, expected) in [("v(junction)", junction), ("v(case)", case)] {
+            for (time, reference) in times.into_iter().zip(expected) {
+                let actual = interpolation(&plot, variable, time);
+                assert!(
+                    (actual - reference).abs() < 0.035,
+                    "{name} combined {variable} at {time:e}: Rust {actual:e} C47 {reference:e}"
+                );
+            }
+        }
+        for (time, reference) in [202e-6, 210e-6, 240e-6].into_iter().zip(currents) {
+            let actual = interpolation(&plot, "i(vdrive)", time);
+            let target = sign * reference;
+            let tolerance = 0.06_f64.mul_add(f64::abs(target), 2e-5);
+            assert!(
+                (actual - target).abs() < tolerance,
+                "{name} combined I(vdrive) at {time:e}: Rust {actual:e} C47 {target:e} tol {tolerance:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn coupled_thermal_recovery_dc_initialization_matches_ngspice47() {
+    for (name, source, sign) in [
+        (
+            "N",
+            include_str!("fixtures/vdmos/thermal_recovery_n.cir"),
+            1.0,
+        ),
+        (
+            "P",
+            include_str!("fixtures/vdmos/thermal_recovery_p.cir"),
+            -1.0,
+        ),
+    ] {
+        let plot = run(source).unwrap_or_else(|error| panic!("{name} steady Qp/Tj: {error}"));
+        for (variable, reference) in [
+            ("v(junction)", 27.1822),
+            ("v(case)", 27.1518),
+            ("i(vdrive)", sign * 0.0477631),
+        ] {
+            let actual = plot
+                .value(variable, 0)
+                .unwrap_or_else(|| panic!("missing {variable}"))
+                .re;
+            let tol = 1e-3_f64.mul_add(f64::abs(reference), 0.00005);
+            assert!(
+                (actual - reference).abs() < tol,
+                "{name} Qp+thermal DC {variable}: Rust {actual:e} C47 {reference:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn long_transit_time_qp_without_thermal_stays_at_steady_state() {
+    let standalone = include_str!("fixtures/vdmos/thermal_recovery_n.cir")
+        .replace("M1 d g 0 junction case dut thermal", "M1 d g 0 dut");
+    let plot = transient(&standalone, "100n 10u 0 100n maxsteps=2000")
+        .unwrap_or_else(|error| panic!("long-TT Qp transient: {error}"));
+    let initial = plot.value("i(vdrive)", 0).unwrap().re;
+    let final_current = plot.value("i(vdrive)", plot.point_count() - 1).unwrap().re;
+    assert!(
+        plot.point_count() > 80,
+        "Qp transient did not cover steady bias"
+    );
+    assert!(
+        (final_current - initial).abs() < initial.abs() * 0.005 + 1e-6,
+        "Qp state drift at constant prescribed bias: initial {initial:e}, final {final_current:e}"
+    );
+}

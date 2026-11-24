@@ -36,14 +36,23 @@ pub struct Vdmos {
     dtemp: Real,
 }
 
+/// Electrical dissipated power, analytically differentiated with respect to
+/// the junction temperature and the bound physical electrical nodes.
+#[derive(Debug, Clone, Copy)]
+struct ThermalPower {
+    value: Real,
+    d_temperature: Real,
+    d_electrical: [(NodeId, Real); 12],
+}
+
 // Charge and derivative pairs are followed by one junction-limiting slot.
 const QGS: usize = 0;
 const QGD: usize = 2;
 const QDIO: usize = 4;
 const DIODE_VOLTAGE: usize = 6;
 const QP_CHARGE: usize = 7;
-const QTHERMAL: usize = 9;
-const STATE_COUNT: usize = 11;
+const TEMPERATURE_AFTER_QP: usize = 9;
+const STATE_WITH_BOTH: usize = 11;
 
 fn charge_companion(
     branch: ChargeBranch,
@@ -312,9 +321,199 @@ impl Vdmos {
         critical_voltage(d.n * vt, saturation)
     }
 
+    /// Native C `vdmosload.c` heat sources: channel and body diode, plus
+    /// source/drain/body ohmic losses. The gate resistor and RDS shunt do not
+    /// feed C's junction heat source. These derivatives are used by both the
+    /// DC/transient Newton residual and the physical small-signal Jacobian.
+    fn thermal_power(
+        &self,
+        evaluation: &Evaluation,
+        voltage: &impl Fn(NodeId) -> Real,
+    ) -> ThermalPower {
+        let [de, _, se] = self.terminals;
+        let [d, g, s] = self.inner;
+        let dp = self.diode_prime;
+        let heat = evaluation.heat;
+        let rd = evaluation
+            .series
+            .drain
+            .ohmic_power(voltage(de) - voltage(d));
+        let rs = evaluation
+            .series
+            .source
+            .ohmic_power(voltage(se) - voltage(s));
+        let rb = evaluation
+            .series
+            .body
+            .ohmic_power(voltage(se) - voltage(dp));
+        ThermalPower {
+            value: heat.intrinsic + rd.value + rs.value + rb.value,
+            d_temperature: heat.d_temperature
+                + rd.d_temperature
+                + rs.d_temperature
+                + rb.d_temperature,
+            d_electrical: [
+                (g, heat.d_vgs),
+                (d, heat.d_vds),
+                (s, -heat.d_vgs - heat.d_vds),
+                (dp, heat.d_vdiode),
+                (de, -heat.d_vdiode),
+                (de, rd.d_voltage_drop + rd.d_vds_external),
+                (d, -rd.d_voltage_drop),
+                (se, -rd.d_vds_external),
+                (se, rs.d_voltage_drop),
+                (s, -rs.d_voltage_drop),
+                (se, rb.d_voltage_drop),
+                (dp, -rb.d_voltage_drop),
+            ],
+        }
+    }
+
     /// Junction/case heat balance. The source kernel provides physical power
     /// and its derivatives; the circuit owns the temperature nodes and
     /// accepted/trial thermal-capacitor history.
+    fn thermal_charge_slot(&self) -> usize {
+        if self.qp.is_some() {
+            TEMPERATURE_AFTER_QP
+        } else {
+            QP_CHARGE
+        }
+    }
+
+    /// The physically consistent derivative of the DC electrothermal MNA
+    /// residual, including temperature-dependent electrical admittances.
+    /// This is intentionally the derivative of `stamp_thermal`: ngspice 47
+    /// `vdmosacld.c` reverses signs on its thermal heat-source derivatives
+    /// versus `vdmosload.c`, contradicting its own DC finite differences.
+    fn assemble_thermal_signal(
+        &self,
+        context: &mut LinearContext<'_>,
+        bias: &Vector,
+        evaluation: &Evaluation,
+        thermal: [NodeId; 2],
+    ) -> SpiceResult<()> {
+        let voltage = |node| {
+            context
+                .unknowns
+                .node_row(node)
+                .and_then(|row| bias.get(row))
+                .unwrap_or(0.0)
+        };
+        let [tj, tc] = thermal;
+        let [de, _, se] = self.terminals;
+        let [d, _, s] = self.inner;
+        let dp = self.diode_prime;
+        let power = self.thermal_power(evaluation, &voltage);
+        let rd_drop = voltage(de) - voltage(d);
+        let rs_drop = voltage(se) - voltage(s);
+        let rb_drop = voltage(se) - voltage(dp);
+        let jr = context
+            .unknowns
+            .node_row(tj)
+            .ok_or_else(|| invalid(&self.name, "missing junction MNA row"))?;
+        let cr = context
+            .unknowns
+            .node_row(tc)
+            .ok_or_else(|| invalid(&self.name, "missing case MNA row"))?;
+        let heat = evaluation.heat;
+        let series = evaluation.series;
+        stamp_ac_branch(
+            context,
+            d,
+            s,
+            [
+                (tj, evaluation.channel.d_temperature),
+                (NodeId::GROUND, 0.0),
+                (NodeId::GROUND, 0.0),
+            ],
+        )?;
+        stamp_ac_branch(
+            context,
+            dp,
+            de,
+            [
+                (tj, evaluation.diode.current.d_temperature),
+                (NodeId::GROUND, 0.0),
+                (NodeId::GROUND, 0.0),
+            ],
+        )?;
+        if de != d {
+            stamp_ac_branch(
+                context,
+                de,
+                d,
+                [
+                    (tj, series.drain.d_temperature * rd_drop),
+                    (NodeId::GROUND, 0.0),
+                    (NodeId::GROUND, 0.0),
+                ],
+            )?;
+        }
+        if se != s {
+            stamp_ac_branch(
+                context,
+                se,
+                s,
+                [
+                    (tj, series.source.d_temperature * rs_drop),
+                    (NodeId::GROUND, 0.0),
+                    (NodeId::GROUND, 0.0),
+                ],
+            )?;
+        }
+        if se != dp {
+            stamp_ac_branch(
+                context,
+                se,
+                dp,
+                [
+                    (tj, series.body.d_temperature * rb_drop),
+                    (NodeId::GROUND, 0.0),
+                    (NodeId::GROUND, 0.0),
+                ],
+            )?;
+        }
+        for (node, d_power) in power.d_electrical {
+            if let Some(column) = context.unknowns.node_row(node) {
+                context.system.a.add(jr, column, -d_power)?;
+            }
+        }
+        let gjc = heat.junction_to_case;
+        let gca = heat.case_to_ambient;
+        context.system.a.add(jr, jr, gjc - power.d_temperature)?;
+        context.system.a.add(jr, cr, -gjc)?;
+        context.system.a.add(cr, jr, -gjc)?;
+        context.system.a.add(cr, cr, gjc + gca)?;
+        context.system.e.add(jr, jr, heat.junction_capacitance)?;
+        let d_charge_dt =
+            evaluation.diode.depletion.d_temperature + evaluation.diode.diffusion.d_temperature;
+        for (node, sign) in [(dp, 1.0), (de, -1.0)] {
+            if let Some(row) = context.unknowns.node_row(node) {
+                context.system.e.add(row, jr, sign * d_charge_dt)?;
+            }
+        }
+        if let Some(qp) = self.qp {
+            let recovery = evaluation
+                .diode
+                .recovery
+                .ok_or_else(|| invalid(&self.name, "Qp without recovery law"))?;
+            let qr = context
+                .unknowns
+                .node_row(qp)
+                .ok_or_else(|| invalid(&self.name, "missing Qp row"))?;
+            let polarity = self.model.parameters().polarity.sign();
+            context
+                .system
+                .a
+                .add(qr, jr, polarity * recovery.d_temperature)?;
+            context
+                .system
+                .e
+                .add(qr, jr, polarity * recovery.stored_charge.d_temperature)?;
+        }
+        Ok(())
+    }
+
     fn stamp_thermal(
         &self,
         context: &mut StampContext<'_>,
@@ -323,75 +522,48 @@ impl Vdmos {
         physical_diode_bias: Real,
     ) -> SpiceResult<()> {
         let [tj, tc] = temperature_nodes;
-        let [de, _ge, se] = self.terminals;
-        let [d, g, s] = self.inner;
-        let dp = self.diode_prime;
-        let temp = context.node_voltage(tj);
+        let t = context.node_voltage(tj);
         let case = context.node_voltage(tc);
-        let ambient = self.ambient(context.temperature);
+        let power = self.thermal_power(evaluation, &|node| context.node_voltage(node));
         let heat = evaluation.heat;
-        let rd = evaluation
-            .series
-            .drain
-            .ohmic_power(context.node_voltage(de) - context.node_voltage(d));
-        let rs = evaluation
-            .series
-            .source
-            .ohmic_power(context.node_voltage(se) - context.node_voltage(s));
-        let rb = evaluation
-            .series
-            .body
-            .ohmic_power(context.node_voltage(se) - context.node_voltage(dp));
-        // Match ngspice's power injection: channel, intrinsic body diode,
-        // drain/source ohmic loss, and body-diode series loss. The gate
-        // resistor and drain shunt are not included in vdmosload.c's Ith.
-        let power = heat.intrinsic + rd.value + rs.value + rb.value;
-        let dpower_dtemp =
-            heat.d_temperature + rd.d_temperature + rs.d_temperature + rb.d_temperature;
-        let charge = ChargeBranch::new(
-            QTHERMAL,
-            heat.junction_capacitance * temp,
-            heat.junction_capacitance,
-        );
         let initial =
             context.states.phase() == IterationPhase::Predict && context.states.initial_transient();
-        let comp = charge_companion(charge, &mut context.states, context.integration, initial)?;
+        let comp = charge_companion(
+            ChargeBranch::new(
+                self.thermal_charge_slot(),
+                heat.junction_capacitance * t,
+                heat.junction_capacitance,
+            ),
+            &mut context.states,
+            context.integration,
+            initial,
+        )?;
         let gjc = heat.junction_to_case;
         let gca = heat.case_to_ambient;
-        let limiter_comp = heat.d_vdiode
-            * ((context.node_voltage(dp) - context.node_voltage(de)) - physical_diode_bias);
-        // The exact residual/Jacobian at the (possibly limited) diode bias;
-        // the linearly corrected value is the residual at the current node
-        // iterate, so convergence is never accepted at a held junction.
-        let rj = gjc * (temp - case) - power - limiter_comp
+        let diode_limiting_delta = context.node_voltage(self.diode_prime)
+            - context.node_voltage(self.terminals[0])
+            - physical_diode_bias;
+        let rj = gjc * (t - case) - power.value - heat.d_vdiode * diode_limiting_delta
             + comp.map_or(0.0, |charge| charge.derivative);
         stamp_row(
             context,
             tj,
             rj,
             [
-                (g, -heat.d_vgs),
-                (d, -heat.d_vds),
-                (s, heat.d_vgs + heat.d_vds),
-                (dp, -heat.d_vdiode),
-                (de, heat.d_vdiode),
-                (de, -rd.d_voltage_drop - rd.d_vds_external),
-                (d, rd.d_voltage_drop),
-                (se, rd.d_vds_external),
-                (se, -rs.d_voltage_drop),
-                (s, rs.d_voltage_drop),
-                (se, -rb.d_voltage_drop),
-                (dp, rb.d_voltage_drop),
                 (
                     tj,
-                    gjc - dpower_dtemp + comp.map_or(0.0, |charge| charge.conductance),
+                    gjc - power.d_temperature + comp.map_or(0.0, |charge| charge.conductance),
                 ),
                 (tc, -gjc),
             ],
         )?;
-        // The ambient voltage source used by ngspice's `cktTemp` node can
-        // be eliminated exactly because it is an ideal fixed voltage.
-        let rc = gjc * (case - temp) + gca * (case - ambient);
+        for (node, d_power) in power.d_electrical {
+            context.stamp(tj, node, -d_power)?;
+            context.stamp_rhs(tj, -d_power * context.node_voltage(node))?;
+        }
+        // The ideal C `cktTemp` ambient source is eliminated algebraically;
+        // temperature is represented in °C at both public circuit nodes.
+        let rc = gjc * (case - t) + gca * (case - self.ambient(context.temperature));
         stamp_row(context, tc, rc, [(tj, -gjc), (tc, gjc + gca)])
     }
 }
@@ -512,10 +684,10 @@ impl Device for Vdmos {
         true
     }
     fn state_count(&self) -> usize {
-        if self.thermal.is_some() {
-            STATE_COUNT
-        } else if self.qp.is_some() {
-            QTHERMAL
+        if self.thermal.is_some() && self.qp.is_some() {
+            STATE_WITH_BOTH
+        } else if self.thermal.is_some() || self.qp.is_some() {
+            TEMPERATURE_AFTER_QP
         } else {
             QP_CHARGE
         }
@@ -526,7 +698,7 @@ impl Device for Vdmos {
             slots.push(QP_CHARGE);
         }
         if self.thermal.is_some() {
-            slots.push(QTHERMAL);
+            slots.push(self.thermal_charge_slot());
         }
         slots
     }
@@ -650,6 +822,9 @@ impl Device for Vdmos {
             }
         }
         context.nodal([de, se], series.shunt, false)?;
+        if let Some(thermal) = self.thermal {
+            self.assemble_thermal_signal(context, bias, &result, thermal)?;
+        }
         Ok(())
     }
 
@@ -742,6 +917,15 @@ impl Device for Vdmos {
             context.stamp(qpnode, qpnode, diag)?;
             context.stamp(qpnode, dp, coupling)?;
             context.stamp(qpnode, de, -coupling)?;
+            if let Some([tj, _]) = self.thermal {
+                // Qp relaxation and stored-charge rate both depend on Tj;
+                // the same analytic kernel derivatives also feed AC.
+                let ag0 = context.integration.map_or(0.0, |coeff| coeff.ag()[0]);
+                let d_residual_dt = polarity
+                    * (recovery.d_temperature + ag0 * recovery.stored_charge.d_temperature);
+                context.stamp(qpnode, tj, d_residual_dt)?;
+                context.stamp_rhs(qpnode, d_residual_dt * context.node_voltage(tj))?;
+            }
             // Current from body diode's positive prime node to external drain.
             // The corrected kernel gain is normalized to physical direction.
             if let Some(charge) = qpcomp {
@@ -757,6 +941,13 @@ impl Device for Vdmos {
                         (NodeId::GROUND, 0.0),
                     ],
                 )?;
+                if let (Some([tj, _]), Some(coefficients)) = (self.thermal, context.integration) {
+                    let d_charge_dt = polarity * recovery.stored_charge.d_temperature;
+                    let d_gain_dt = polarity * recovery.d_gain_d_temperature;
+                    let cross =
+                        d_gain_dt * charge.derivative + gain * coefficients.ag()[0] * d_charge_dt;
+                    stamp_temperature_control(context, tj, dp, de, cross)?;
+                }
             }
         }
         if let Some(c) = gs {
@@ -816,7 +1007,17 @@ impl Device for Vdmos {
             [(dp, gd), (de, -gd), (NodeId::GROUND, 0.0)],
         )?;
         if let Some([tj, _]) = self.thermal {
-            stamp_temperature_control(context, tj, dp, de, result.diode.current.d_temperature)?;
+            let dcharge_dt = context.integration.map_or(0.0, |coefficients| {
+                coefficients.ag()[0]
+                    * (result.diode.depletion.d_temperature + result.diode.diffusion.d_temperature)
+            });
+            stamp_temperature_control(
+                context,
+                tj,
+                dp,
+                de,
+                result.diode.current.d_temperature + dcharge_dt,
+            )?;
         }
         let series = result.series;
         if de != d {
