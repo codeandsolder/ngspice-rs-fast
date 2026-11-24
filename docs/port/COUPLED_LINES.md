@@ -99,6 +99,37 @@ Default bounds are 32 conductors, 32 MiB dense workspace and at most
 128 exponential squarings. All dimensions and allocation products use
 checked arithmetic.
 
+## Exact LC modes and flight time (prepared for native modal propagation)
+
+The additional pure `CoupledLinePlan::exact_lc_modes()` prepares the full
+reciprocal LC eigenbasis for positive-definite L and C without assuming that
+they commute. Factor C = B B^T, diagonalize the *symmetric* metric
+H = B^T L B = Q diag(lambda) Q^T, then the physical voltage and current
+bases are V = B^(-T) Q and I = B Q. They satisfy C V = I, L I = V diag(lambda)
+and V^T I = identity. Each exact flight time is
+`length * sqrt(lambda)`, and the modal admittance scalar is
+`1/sqrt(lambda)` **in metric-normalized modal coordinates**. The passive
+research wave model power-normalizes each voltage basis column by
+`1/sqrt(y)` and each current basis column by `sqrt(y)`, giving reciprocal
+physical power-wave transforms. Extremely small/large material magnitudes
+are scaled during the Cholesky/Jacobi solve and the physical LC products are
+reconstructed using split binary exponents. Pure RC/RL and other singular
+material regimes remain in the general diffuse/descriptor solver, rather
+than inventing a positive phase delay for modes with no finite wave speed.
+
+**This eigensystem is a preparation component, not yet wired into native
+transient stamping.** The existing finite-volume transient implementation
+is passive and numerical-time causal but has nonzero response before the
+physical LC front. In a 50-ohm matched scalar cable with L=250 nH/unit,
+C=100 pF/unit and length 0.2, the exact flight time is 1 ns. A rising
+input beginning at 2 ns must produce exactly zero at the distant end until
+3 ns. The 32-cell finite-π model instead produces +1.09605704672942547e-8 V
+at 2.25 ns (snapshot-only physical wavefront regression). This is not an
+acceptable substitute for the true delayed line. Native end-to-end modal
+history, accepted/trial/rollback ownership, DC steady-state initialization,
+and physical MNA port rows must integrate the separately validated
+exact-delay research path before claiming exact physical front parity.
+
 ## Causal time-domain finite-volume cable
 
 Native `.tran` does **not** use a sampled AC matrix. It discretizes the full
