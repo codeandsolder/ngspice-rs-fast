@@ -760,7 +760,7 @@ impl CoupledLine {
         }
         let mut history = vec![0.; conductors];
         for section in 0..self.sections {
-            for i in 0..conductors {
+            for (i, accumulated_history) in history.iter_mut().enumerate() {
                 let mut charge = 0.;
                 for (j, &potential) in voltage.iter().enumerate() {
                     charge = (0.5 * section_width * self.plan.c.data()[i * conductors + j])
@@ -769,7 +769,7 @@ impl CoupledLine {
                 for kind in [LEFT, RIGHT] {
                     let offset = slot(section, i, kind, conductors);
                     let previous = history_term(&ctx.states, coeff, offset)?;
-                    history[i] += previous;
+                    *accumulated_history += previous;
                     write_energy(&mut ctx.states, offset, charge, previous, ag0)?;
                 }
                 let series = slot(section, i, SERIES, conductors);
@@ -780,7 +780,7 @@ impl CoupledLine {
         if history.iter().any(|value| !value.is_finite()) {
             return Err(invalid("ideal-line shunt history overflows"));
         }
-        for i in 0..conductors {
+        for (i, &historical) in history.iter().enumerate() {
             let (ip, ir) = self.physical_pair(i);
             let (op, or) = self.physical_pair(conductors + i);
             let branch = ctx.branch(i)?;
@@ -795,7 +795,7 @@ impl CoupledLine {
                 }
             }
             ctx.stamp_rhs(op, -history[i])?;
-            ctx.stamp_rhs(or, history[i])?;
+            ctx.stamp_rhs(or, historical)?;
             for j in 0..conductors {
                 let (qp, qr) = self.physical_pair(conductors + j);
                 let index = i * conductors + j;
