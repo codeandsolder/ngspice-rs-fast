@@ -836,6 +836,23 @@ impl ParamScope {
         }
     }
 
+    /// Evaluate against a transient scalar namespace over this scope.
+    /// Used by command interpreters whose variables outlive parameter updates.
+    pub(crate) fn evaluate_with(
+        &self,
+        expression: &ParameterExpression,
+        lookup: impl Fn(&str) -> Option<Real>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Real> {
+        evaluate_root(
+            expression,
+            &|name| lookup(name).or_else(|| self.get(name)),
+            self.functions.as_deref(),
+            budget,
+        )
+        .map_err(Failure::into_error)
+    }
+
     /// Evaluate a site expression against this scope, drawing on `budget`.
     ///
     /// # Errors

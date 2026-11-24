@@ -504,10 +504,13 @@ impl Mesfet {
                 "src/spicelib/devices/mes/mesask.c (MESqgs/MEScqgs read CKTstate0)",
             ));
         }
-        if !matches!(key, "vgs" | "vgd" | "gm" | "gds" | "ggs" | "ggd" | "cgd") {
+        if !matches!(
+            key,
+            "vgs" | "vgd" | "gm" | "gds" | "ggs" | "ggd" | "cgd" | "cd" | "cg" | "is"
+        ) {
             return Ok(None);
         }
-        if transient && matches!(key, "ggs" | "ggd" | "cgd") {
+        if transient && matches!(key, "ggs" | "ggd" | "cgd" | "cd" | "cg" | "is") {
             return Err(SpiceError::not_yet_ported(
                 format!(
                     "{}: transient @{}[{key}] (C adds the charge companion)",
@@ -520,6 +523,12 @@ impl Mesfet {
         let [vgs, vgd] = self.normalized(self.inner.map(voltage));
         let point = self.point(&op, vgs, vgd, context.gmin)?;
         let m = self.instance.m;
+        let loads = lifecycle::Loaded::from_currents(
+            [vgs, vgd],
+            (point.channel.current, point.channel.gm, point.channel.gds),
+            point.gs,
+            point.gd,
+        );
         Ok(Some(match key {
             "vgs" => vgs,
             "vgd" => vgd,
@@ -527,6 +536,11 @@ impl Mesfet {
             "gds" => m * point.channel.gds,
             "ggs" => m * point.gs.1,
             "ggd" => m * point.gd.1,
+            // MEScd/cg include the intrinsic gate junctions, but not
+            // external series-resistor terminal residuals.
+            "cd" => m * loads.cd,
+            "cg" => m * loads.cg,
+            "is" => m * (-loads.cd - loads.cg),
             _ => m * point.gd.0,
         }))
     }

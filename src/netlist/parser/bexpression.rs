@@ -60,6 +60,7 @@ pub(super) fn parse_prefix(
             depth: 0,
             remaining_nodes: MAX_TREE_NODES,
             shadowing: &[],
+            control_names: false,
         },
     };
     let options = Options { verbatim, auto_gnd };
