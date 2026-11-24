@@ -69,29 +69,7 @@ impl GatePartition {
         }
         let denominator = argument.mul_add(argument, 2. * REGULARIZATION);
         if argument.abs() <= 0.5 {
-            // exp(x)-1-x-x²/2 = x³*(1/3! + x/4! + ...).
-            // Terms through 15! bound the remainder below binary64
-            // rounding error for |x| <= 1/2.
-            let mut term = argument * argument * argument / 6.;
-            let mut third = term;
-            for order in 4..=15 {
-                term *= argument / f64::from(order);
-                let next = third + term;
-                if next == third {
-                    break;
-                }
-                third = next;
-            }
-            let second = 0.5 * argument * argument + third;
-            let source_residual = third / denominator;
-            let drain_residual = argument.mul_add(second, -third) / denominator;
-            Self {
-                source: 0.5 + source_residual,
-                drain: 0.5 + drain_residual,
-                source_slope: (-2. * argument).mul_add(source_residual, second) / denominator,
-                drain_slope: (-2. * argument).mul_add(drain_residual, argument * argument.exp_m1())
-                    / denominator,
-            }
+            small_gate_partition(argument, denominator)
         } else {
             let (exponential, derivative) = if argument > EXP_THRESHOLD {
                 (MAX_EXP, 0.)
@@ -115,6 +93,49 @@ impl GatePartition {
                 drain_slope,
             }
         }
+    }
+}
+
+/// Evaluate the third-order exponential remainder as x³ P(x), avoiding
+/// both expm1 and a loop-carried factorial division in the load hot path.
+/// For |x|<=1/2, the truncation after 15! is below binary64 roundoff.
+/// Factoring x²/denominator before multiplying by x also avoids premature
+/// underflow in the differential partition near equilibrium.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "well-conditioned Taylor polynomial and slope products; measured generic-target software FMA cost exceeds separate operations"
+)]
+fn small_gate_partition(argument: f64, denominator: f64) -> GatePartition {
+    const COEFFICIENTS: [f64; 13] = [
+        1. / 1_307_674_368_000.,
+        1. / 87_178_291_200.,
+        1. / 6_227_020_800.,
+        1. / 479_001_600.,
+        1. / 39_916_800.,
+        1. / 3_628_800.,
+        1. / 362_880.,
+        1. / 40_320.,
+        1. / 5_040.,
+        1. / 720.,
+        1. / 120.,
+        1. / 24.,
+        1. / 6.,
+    ];
+    let remainder = COEFFICIENTS.into_iter().fold(0_f64, |acc, coefficient| {
+        if cfg!(target_feature = "fma") {
+            acc.mul_add(argument, coefficient)
+        } else {
+            acc * argument + coefficient
+        }
+    });
+    let square = argument * (argument / denominator);
+    let second = 0.5 + argument * remainder;
+    let drain_remainder = 0.5 + (argument - 1.) * remainder;
+    GatePartition {
+        source: 0.5 + argument * square * remainder,
+        drain: 0.5 + argument * square * drain_remainder,
+        source_slope: square * (second - 2. * square * remainder),
+        drain_slope: square * (1. + argument * second - 2. * square * drain_remainder),
     }
 }
 
@@ -856,9 +877,20 @@ mod tests {
             let h = 1e-5;
             let lo = GatePartition::new(argument - h);
             let hi = GatePartition::new(argument + h);
+            let lo_half = GatePartition::new(argument - 0.5 * h);
+            let hi_half = GatePartition::new(argument + 0.5 * h);
+            let richardson = |lower: f64, upper: f64, half_lower: f64, half_upper: f64| {
+                (4. * (half_upper - half_lower) / h - (upper - lower) / (2. * h)) / 3.
+            };
             for (slope, difference) in [
-                (p.source_slope, (hi.source - lo.source) / (2. * h)),
-                (p.drain_slope, (hi.drain - lo.drain) / (2. * h)),
+                (
+                    p.source_slope,
+                    richardson(lo.source, hi.source, lo_half.source, hi_half.source),
+                ),
+                (
+                    p.drain_slope,
+                    richardson(lo.drain, hi.drain, lo_half.drain, hi_half.drain),
+                ),
             ] {
                 assert!(
                     (slope - difference).abs() < 1e-6 * slope.abs() + 1e-8,

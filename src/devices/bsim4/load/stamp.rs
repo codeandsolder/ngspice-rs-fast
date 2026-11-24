@@ -68,6 +68,29 @@ fn sum<const N: usize>(terms: [f64; N]) -> f64 {
     residual(terms.map(|term| (term, 1.)))
 }
 
+/// Mix two already-grouped current/charge contributions. In the common
+/// unit-multiplier case this is just a correctly rounded addition. If
+/// one multiplier is ±1, one FMA rounds the entire two-product sum;
+/// otherwise the adaptive residual kernel handles cancellation.
+#[inline]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "unit weights need only an exact sign change and correctly rounded addition; avoid generic software FMA"
+)]
+fn mixed(first: (f64, f64), second: (f64, f64)) -> f64 {
+    let (a, x) = first;
+    let (b, y) = second;
+    if a.abs() == 1. && b.abs() == 1. {
+        a * x + b * y
+    } else if a.abs() == 1. && a.is_finite() && x.is_finite() && b.is_finite() && y.is_finite() {
+        b.mul_add(y, a * x)
+    } else if b.abs() == 1. && a.is_finite() && x.is_finite() && b.is_finite() && y.is_finite() {
+        a.mul_add(x, b * y)
+    } else {
+        residual([first, second])
+    }
+}
+
 /// Emit C line900 RHS and matrix contributions without coalescing or reordering.
 #[expect(
     clippy::suboptimal_flops,
@@ -503,11 +526,11 @@ pub(super) fn apply(
         gdtot = gdtotd;
     }
     if model.r#type > 0 {
-        ceqjs = residual([(here.cbs, 1.), (-here.gbs, vbs_jct)]);
-        ceqjd = residual([(here.cbd, 1.), (-here.gbd, vbd_jct)]);
+        ceqjs = mixed((1., here.cbs), (-here.gbs, vbs_jct));
+        ceqjd = mixed((1., here.cbd), (-here.gbd, vbd_jct));
     } else {
-        ceqjs = -residual([(here.cbs, 1.), (-here.gbs, vbs_jct)]);
-        ceqjd = -residual([(here.cbd, 1.), (-here.gbd, vbd_jct)]);
+        ceqjs = -mixed((1., here.cbs), (-here.gbs, vbs_jct));
+        ceqjd = -mixed((1., here.cbd), (-here.gbd, vbd_jct));
         ceqqg = -ceqqg;
         ceqqd = -ceqqd;
         ceqqb = -ceqqb;
@@ -536,15 +559,12 @@ pub(super) fn apply(
     );
     ckt.rhs(
         here.gNodePrime,
-        residual([(-mult_q, ceqqg), (mult_i, sum([ceqgcrg, -Igtoteq]))]),
+        mixed((-mult_q, ceqqg), (mult_i, sum([ceqgcrg, -Igtoteq]))),
     );
     if here.rgateMod == 2 {
         ckt.rhs(here.gNodeExt, -(mult_i * ceqgcrg));
     } else if here.rgateMod == 3 {
-        ckt.rhs(
-            here.gNodeMid,
-            -residual([(mult_q, ceqqgmid), (mult_i, ceqgcrg)]),
-        );
+        ckt.rhs(here.gNodeMid, -mixed((mult_q, ceqqgmid), (mult_i, ceqgcrg)));
     }
     if here.rbodyMod == 0 {
         ckt.rhs(
@@ -562,12 +582,12 @@ pub(super) fn apply(
             ]),
         );
     } else {
-        ckt.rhs(here.dbNode, -residual([(mult_i, ceqjd), (mult_q, ceqqjd)]));
+        ckt.rhs(here.dbNode, -mixed((mult_i, ceqjd), (mult_q, ceqqjd)));
         ckt.rhs(
             here.bNodePrime,
             residual([(mult_i, sum([ceqbd, ceqbs, Ibtoteq])), (-mult_q, ceqqb)]),
         );
-        ckt.rhs(here.sbNode, -residual([(mult_i, ceqjs), (mult_q, ceqqjs)]));
+        ckt.rhs(here.sbNode, -mixed((mult_i, ceqjs), (mult_q, ceqqjs)));
         ckt.rhs(
             here.sNodePrime,
             residual([
@@ -606,22 +626,22 @@ pub(super) fn apply(
         ckt.matrix(
             here.gNodePrime,
             here.gNodePrime,
-            mult_q * (gcggb - ggtg) + mult_i * (geltd + gIgtotg),
+            mixed((mult_q, gcggb - ggtg), (mult_i, geltd + gIgtotg)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.dNodePrime,
-            mult_q * (gcgdb - ggtd) + mult_i * gIgtotd,
+            mixed((mult_q, gcgdb - ggtd), (mult_i, gIgtotd)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.sNodePrime,
-            mult_q * (gcgsb - ggts) + mult_i * gIgtots,
+            mixed((mult_q, gcgsb - ggts), (mult_i, gIgtots)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.bNodePrime,
-            mult_q * (gcgbb - ggtb) + mult_i * gIgtotb,
+            mixed((mult_q, gcgbb - ggtb), (mult_i, gIgtotb)),
         );
     } else if here.rgateMod == 2 {
         ckt.matrix(here.gNodeExt, here.gNodeExt, mult_i * gcrg);
@@ -633,22 +653,22 @@ pub(super) fn apply(
         ckt.matrix(
             here.gNodePrime,
             here.gNodePrime,
-            mult_q * (gcggb - ggtg) + mult_i * (gIgtotg - gcrgg),
+            mixed((mult_q, gcggb - ggtg), (mult_i, gIgtotg - gcrgg)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.dNodePrime,
-            mult_q * (gcgdb - ggtd) + mult_i * (gIgtotd - gcrgd),
+            mixed((mult_q, gcgdb - ggtd), (mult_i, gIgtotd - gcrgd)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.sNodePrime,
-            mult_q * (gcgsb - ggts) + mult_i * (gIgtots - gcrgs),
+            mixed((mult_q, gcgsb - ggts), (mult_i, gIgtots - gcrgs)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.bNodePrime,
-            mult_q * (gcgbb - ggtb) + mult_i * (gIgtotb - gcrgb),
+            mixed((mult_q, gcgbb - ggtb), (mult_i, gIgtotb - gcrgb)),
         );
     } else if here.rgateMod == 3 {
         ckt.matrix(here.gNodeExt, here.gNodeExt, mult_i * geltd);
@@ -657,23 +677,23 @@ pub(super) fn apply(
         ckt.matrix(
             here.gNodeMid,
             here.gNodeMid,
-            mult_i * (geltd + gcrg) + mult_q * gcgmgmb,
+            mixed((mult_i, geltd + gcrg), (mult_q, gcgmgmb)),
         );
         ckt.matrix(
             here.gNodeMid,
             here.dNodePrime,
-            mult_i * gcrgd + mult_q * gcgmdb,
+            mixed((mult_i, gcrgd), (mult_q, gcgmdb)),
         );
         ckt.matrix(here.gNodeMid, here.gNodePrime, mult_i * gcrgg);
         ckt.matrix(
             here.gNodeMid,
             here.sNodePrime,
-            mult_i * gcrgs + mult_q * gcgmsb,
+            mixed((mult_i, gcrgs), (mult_q, gcgmsb)),
         );
         ckt.matrix(
             here.gNodeMid,
             here.bNodePrime,
-            mult_i * gcrgb + mult_q * gcgmbb,
+            mixed((mult_i, gcrgb), (mult_q, gcgmbb)),
         );
         ckt.matrix(here.dNodePrime, here.gNodeMid, mult_q * gcdgmb);
         ckt.matrix(here.gNodePrime, here.gNodeMid, -(mult_i * gcrg));
@@ -682,43 +702,43 @@ pub(super) fn apply(
         ckt.matrix(
             here.gNodePrime,
             here.gNodePrime,
-            mult_q * (gcggb - ggtg) + mult_i * (gIgtotg - gcrgg),
+            mixed((mult_q, gcggb - ggtg), (mult_i, gIgtotg - gcrgg)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.dNodePrime,
-            mult_q * (gcgdb - ggtd) + mult_i * (gIgtotd - gcrgd),
+            mixed((mult_q, gcgdb - ggtd), (mult_i, gIgtotd - gcrgd)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.sNodePrime,
-            mult_q * (gcgsb - ggts) + mult_i * (gIgtots - gcrgs),
+            mixed((mult_q, gcgsb - ggts), (mult_i, gIgtots - gcrgs)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.bNodePrime,
-            mult_q * (gcgbb - ggtb) + mult_i * (gIgtotb - gcrgb),
+            mixed((mult_q, gcgbb - ggtb), (mult_i, gIgtotb - gcrgb)),
         );
     } else {
         ckt.matrix(
             here.gNodePrime,
             here.gNodePrime,
-            mult_q * (gcggb - ggtg) + mult_i * gIgtotg,
+            mixed((mult_q, gcggb - ggtg), (mult_i, gIgtotg)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.dNodePrime,
-            mult_q * (gcgdb - ggtd) + mult_i * gIgtotd,
+            mixed((mult_q, gcgdb - ggtd), (mult_i, gIgtotd)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.sNodePrime,
-            mult_q * (gcgsb - ggts) + mult_i * gIgtots,
+            mixed((mult_q, gcgsb - ggts), (mult_i, gIgtots)),
         );
         ckt.matrix(
             here.gNodePrime,
             here.bNodePrime,
-            mult_q * (gcgbb - ggtb) + mult_i * gIgtotb,
+            mixed((mult_q, gcgbb - ggtb), (mult_i, gIgtotb)),
         );
     }
     if model.rdsMod != 0 {
@@ -732,76 +752,125 @@ pub(super) fn apply(
     ckt.matrix(
         here.dNodePrime,
         here.dNodePrime,
-        mult_i * (gdpr + here.gds + here.gbd - gdtotd + RevSum + gbdpdp - gIdtotd)
-            + mult_q * (T1 * ddxpart_dVd + gcddb + dxpart * ggtd),
+        mixed(
+            (
+                mult_i,
+                sum([gdpr, here.gds, here.gbd, -gdtotd, RevSum, gbdpdp, -gIdtotd]),
+            ),
+            (
+                mult_q,
+                residual([(T1, ddxpart_dVd), (gcddb, 1.), (dxpart, ggtd)]),
+            ),
+        ),
     );
     ckt.matrix(here.dNodePrime, here.dNode, -(mult_i * (gdpr + gdtot)));
     ckt.matrix(
         here.dNodePrime,
         here.gNodePrime,
-        mult_i * (Gm - gdtotg + gbdpg - gIdtotg)
-            + mult_q * (dxpart * ggtg + T1 * ddxpart_dVg + gcdgb),
+        mixed(
+            (mult_i, sum([Gm, -gdtotg, gbdpg, -gIdtotg])),
+            (
+                mult_q,
+                residual([(dxpart, ggtg), (T1, ddxpart_dVg), (gcdgb, 1.)]),
+            ),
+        ),
     );
     ckt.matrix(
         here.dNodePrime,
         here.sNodePrime,
-        -(mult_i * (here.gds + gdtots + gIdtots + FwdSum - gbdpsp)
-            - mult_q * (dxpart * ggts + T1 * ddxpart_dVs + gcdsb)),
+        -(mixed(
+            (mult_i, sum([here.gds, gdtots, gIdtots, FwdSum, -gbdpsp])),
+            (
+                -mult_q,
+                residual([(dxpart, ggts), (T1, ddxpart_dVs), (gcdsb, 1.)]),
+            ),
+        )),
     );
     ckt.matrix(
         here.dNodePrime,
         here.bNodePrime,
-        -(mult_i * (gjbd + gdtotb - Gmbs - gbdpb + gIdtotb)
-            - mult_q * (dxpart * ggtb + gcdbb + T1 * ddxpart_dVb)),
+        -(mixed(
+            (mult_i, sum([gjbd, gdtotb, -Gmbs, -gbdpb, gIdtotb])),
+            (
+                -mult_q,
+                residual([(dxpart, ggtb), (gcdbb, 1.), (T1, ddxpart_dVb)]),
+            ),
+        )),
     );
     ckt.matrix(here.dNode, here.dNodePrime, -(mult_i * (gdpr - gdtotd)));
     ckt.matrix(here.dNode, here.dNode, mult_i * (gdpr + gdtot));
     ckt.matrix(
         here.sNodePrime,
         here.dNodePrime,
-        -(mult_i * (here.gds + gstotd + RevSum - gbspdp + gIstotd)
-            - mult_q * (T1 * dsxpart_dVd + sxpart * ggtd + gcsdb)),
+        -(mixed(
+            (mult_i, sum([here.gds, gstotd, RevSum, -gbspdp, gIstotd])),
+            (
+                -mult_q,
+                residual([(T1, dsxpart_dVd), (sxpart, ggtd), (gcsdb, 1.)]),
+            ),
+        )),
     );
     ckt.matrix(
         here.sNodePrime,
         here.gNodePrime,
-        mult_q * (gcsgb + sxpart * ggtg + T1 * dsxpart_dVg)
-            + mult_i * (gbspg - Gm - gstotg - gIstotg),
+        mixed(
+            (
+                mult_q,
+                residual([(gcsgb, 1.), (sxpart, ggtg), (T1, dsxpart_dVg)]),
+            ),
+            (mult_i, sum([gbspg, -Gm, -gstotg, -gIstotg])),
+        ),
     );
     ckt.matrix(
         here.sNodePrime,
         here.sNodePrime,
-        mult_i * (gspr + here.gds + here.gbs - gIstots - gstots + FwdSum + gbspsp)
-            + mult_q * (sxpart * ggts + T1 * dsxpart_dVs + gcssb),
+        mixed(
+            (
+                mult_i,
+                sum([gspr, here.gds, here.gbs, -gIstots, -gstots, FwdSum, gbspsp]),
+            ),
+            (
+                mult_q,
+                residual([(sxpart, ggts), (T1, dsxpart_dVs), (gcssb, 1.)]),
+            ),
+        ),
     );
     ckt.matrix(here.sNodePrime, here.sNode, -(mult_i * (gspr + gstot)));
     ckt.matrix(
         here.sNodePrime,
         here.bNodePrime,
-        -(mult_i * (gjbs + gstotb + Gmbs - gbspb + gIstotb)
-            - mult_q * (gcsbb + sxpart * ggtb + T1 * dsxpart_dVb)),
+        -(mixed(
+            (mult_i, sum([gjbs, gstotb, Gmbs, -gbspb, gIstotb])),
+            (
+                -mult_q,
+                residual([(gcsbb, 1.), (sxpart, ggtb), (T1, dsxpart_dVb)]),
+            ),
+        )),
     );
     ckt.matrix(here.sNode, here.sNodePrime, -(mult_i * (gspr - gstots)));
     ckt.matrix(here.sNode, here.sNode, mult_i * (gspr + gstot));
     ckt.matrix(
         here.bNodePrime,
         here.dNodePrime,
-        mult_q * gcbdb - mult_i * (gjbd - gbbdp + gIbtotd),
+        mixed((mult_q, gcbdb), (-mult_i, sum([gjbd, -gbbdp, gIbtotd]))),
     );
     ckt.matrix(
         here.bNodePrime,
         here.gNodePrime,
-        mult_q * gcbgb - mult_i * (here.gbgs + gIbtotg),
+        mixed((mult_q, gcbgb), (-mult_i, here.gbgs + gIbtotg)),
     );
     ckt.matrix(
         here.bNodePrime,
         here.sNodePrime,
-        mult_q * gcbsb - mult_i * (gjbs - gbbsp + gIbtots),
+        mixed((mult_q, gcbsb), (-mult_i, sum([gjbs, -gbbsp, gIbtots]))),
     );
     ckt.matrix(
         here.bNodePrime,
         here.bNodePrime,
-        mult_i * (gjbd + gjbs - here.gbbs - gIbtotb) + mult_q * gcbbb,
+        mixed(
+            (mult_i, sum([gjbd, gjbs, -here.gbbs, -gIbtotb])),
+            (mult_q, gcbbb),
+        ),
     );
     super::super::stamp_common::leakage(here, mult_i, |row, col, value| {
         ckt.matrix(row, col, value);
@@ -810,22 +879,25 @@ pub(super) fn apply(
         ckt.matrix(
             here.dNodePrime,
             here.dbNode,
-            mult_q * gcdbdb - mult_i * here.gbd,
+            mixed((mult_q, gcdbdb), (-mult_i, here.gbd)),
         );
         ckt.matrix(
             here.sNodePrime,
             here.sbNode,
-            -(mult_i * here.gbs - mult_q * gcsbsb),
+            -(mixed((mult_i, here.gbs), (-mult_q, gcsbsb))),
         );
         ckt.matrix(
             here.dbNode,
             here.dNodePrime,
-            mult_q * gcdbdb - mult_i * here.gbd,
+            mixed((mult_q, gcdbdb), (-mult_i, here.gbd)),
         );
         ckt.matrix(
             here.dbNode,
             here.dbNode,
-            mult_i * (here.gbd + here.grbpd + here.grbdb) - mult_q * gcdbdb,
+            mixed(
+                (mult_i, here.gbd + here.grbpd + here.grbdb),
+                (-mult_q, gcdbdb),
+            ),
         );
         ckt.matrix(here.dbNode, here.bNodePrime, -(mult_i * here.grbpd));
         ckt.matrix(here.dbNode, here.bNode, -(mult_i * here.grbdb));
@@ -840,14 +912,17 @@ pub(super) fn apply(
         ckt.matrix(
             here.sbNode,
             here.sNodePrime,
-            mult_q * gcsbsb - mult_i * here.gbs,
+            mixed((mult_q, gcsbsb), (-mult_i, here.gbs)),
         );
         ckt.matrix(here.sbNode, here.bNodePrime, -(mult_i * here.grbps));
         ckt.matrix(here.sbNode, here.bNode, -(mult_i * here.grbsb));
         ckt.matrix(
             here.sbNode,
             here.sbNode,
-            mult_i * (here.gbs + here.grbps + here.grbsb) - mult_q * gcsbsb,
+            mixed(
+                (mult_i, here.gbs + here.grbps + here.grbsb),
+                (-mult_q, gcsbsb),
+            ),
         );
         ckt.matrix(here.bNode, here.dbNode, -(mult_i * here.grbdb));
         ckt.matrix(here.bNode, here.bNodePrime, -(mult_i * here.grbpb));
