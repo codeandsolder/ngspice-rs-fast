@@ -265,6 +265,29 @@ impl Microstrip {
             effective * (homogeneous_impedance(air_width) / dielectric_impedance).powi(2);
         QuasiStatic::checked(impedance, corrected)
     }
+
+    /// Quasi-static fringing capacitance for an open microstrip end.
+    ///
+    /// Uses the common Hammerstad effective-length approximation. This
+    /// is a low-frequency capacitive correction, not a radiating open
+    /// or full-wave model.
+    /// # Errors
+    /// Outside the supported open-end geometry domain or numerical range.
+    pub fn open_end_capacitance(self, substrate: Substrate) -> SpiceResult<f64> {
+        let cross = self.quasi_static(substrate)?;
+        let width = self.width / substrate.height;
+        if !(0.1..=10.).contains(&width) {
+            return Err(invalid("open microstrip outside fringing formula domain"));
+        }
+        let er = cross.effective_permittivity;
+        let length =
+            0.412 * substrate.height * (er + 0.3) / (er - 0.258) * (width + 0.264) / (width + 0.8);
+        let capacitance = length / cross.impedance / cross.velocity();
+        if !positive(capacitance) {
+            return Err(invalid("unrepresentable open-end capacitance"));
+        }
+        Ok(capacitance)
+    }
 }
 
 fn agm(mut a: f64, mut b: f64) -> f64 {
@@ -406,8 +429,9 @@ fn coupled_impedance_correction(width: f64, gap: f64) -> [f64; 2] {
     let ratio = 190_f64.mul_add(gap * gap, 10.) / 82.3_f64.mul_add(gap.powi(3), 1.);
     let narrow = (-0.95_f64).mul_add(gap.ln(), -6.5) - (gap / 0.15).powi(5);
     let correction_exponent = ratio.ln() * (narrow.exp() + 1. / 16.5);
-    let odd = even
-        - odd_scale / gap_scale
-            * (width.ln() * odd_exponent * width.powf(-correction_exponent)).exp();
+    let odd = (odd_scale / gap_scale).mul_add(
+        -(width.ln() * odd_exponent * width.powf(-correction_exponent)).exp(),
+        even,
+    );
     [even, odd]
 }

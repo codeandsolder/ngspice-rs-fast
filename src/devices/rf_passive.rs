@@ -1,6 +1,8 @@
 //! Topology-bound prepared RF line. Stamps voltage/current relations
 //! directly, including exact ideal through constraints.
 use std::sync::Arc;
+mod realization;
+pub use realization::bind_realization;
 
 use crate::analysis::rf_network::{PreparedLine, invalid};
 use crate::devices::linear::LinearContext;
@@ -66,7 +68,13 @@ impl RfLine {
                 }
             }
         }
-        for (mode, (basis, r)) in self.line.basis().chunks_exact(n).zip(relations).enumerate() {
+        for (mode, (basis, r)) in self
+            .line
+            .basis()
+            .chunks_exact(n)
+            .zip(relations.iter().copied())
+            .enumerate()
+        {
             for (k, &weight) in basis.iter().enumerate() {
                 for (port, sign) in [(k, 1.), (k + n, -1.)] {
                     let p = self.ports[port];

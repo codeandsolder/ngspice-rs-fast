@@ -344,3 +344,155 @@ fn coupled_microstrip_matches_qucs_kirschning_jansen_reference() {
         }
     }
 }
+
+fn ports(input: NodeId, output: NodeId) -> Vec<PortTerminals> {
+    [input, output]
+        .into_iter()
+        .map(|positive| PortTerminals {
+            positive,
+            negative: NodeId::GROUND,
+        })
+        .collect()
+}
+
+#[test]
+fn causal_lossy_ladder_matches_exact_sp_and_enforces_preparation_context() {
+    use ngspice_rs::analysis::rf_network::realization::LadderSpec;
+    use ngspice_rs::devices::rf_passive::bind_realization;
+    let mut p = mode(50., 2e8);
+    p.resistance = 2.;
+    p.conductance = 1e-6;
+    p.skin = 2e-5;
+    p.relaxation_capacitance = 1e-11;
+    p.relaxation_time = 1e-9;
+    let line = PreparedLine::single(LineMode::new(p).unwrap(), 0.02, band()).unwrap();
+    let spec = LadderSpec {
+        band: FrequencyBand::new(0., 1e9).unwrap(),
+        reference_impedance: 50.,
+        max_error: 0.005,
+        max_sections: 64,
+        temperature: 27.,
+    };
+    let ladder = Arc::new(line.realize(spec).unwrap());
+    let report = ladder.report().unwrap();
+    assert!(report.samples >= 256 && report.worst_error <= spec.max_error);
+    assert!(ladder.validate_context(1e9, 28.).is_err());
+    assert!(ladder.validate_context(2e9, 27.).is_err());
+    assert!(
+        line.realize(LadderSpec {
+            max_sections: 1,
+            max_error: 1e-10,
+            ..spec
+        })
+        .is_err()
+    );
+    let deck = "causal RF ladder\nv1 in 0 portnum 1 z0 50\nv2 out 0 portnum 2 z0 50\n.sp lin 9 1meg 1g\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("ladder.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let input = circuit.add_node("in").unwrap();
+    let output = circuit.add_node("out").unwrap();
+    bind_realization(
+        &mut circuit,
+        "nladder",
+        Arc::clone(&ladder),
+        ports(input, output),
+    )
+    .unwrap();
+    let plot = config
+        .plan_for(&netlist.analyses[0])
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    for point in 0..plot.point_count() {
+        let hz = plot.value("frequency", point).unwrap().re;
+        let exact = line.scattering(hz, 27., 50.).unwrap();
+        close(
+            plot.value("S_1_1", point).unwrap(),
+            exact.get(0, 0).unwrap(),
+            spec.max_error,
+        );
+        close(
+            plot.value("S_2_1", point).unwrap(),
+            exact.get(1, 0).unwrap(),
+            spec.max_error,
+        );
+    }
+}
+
+#[test]
+fn native_ladder_transient_propagates_bandlimited_sine() {
+    use ngspice_rs::analysis::rf_network::realization::LadderSpec;
+    use ngspice_rs::devices::rf_passive::bind_realization;
+    let line = PreparedLine::single(LineMode::new(mode(50., 2e8)).unwrap(), 0.1, band()).unwrap();
+    let spec = LadderSpec {
+        band: FrequencyBand::new(0., 200e6).unwrap(),
+        reference_impedance: 50.,
+        max_error: 0.002,
+        max_sections: 64,
+        temperature: 27.,
+    };
+    let ladder = Arc::new(line.realize(spec).unwrap());
+    let deck = "RF transient\nv1 src 0 sin(0 1 100meg)\nr1 src in 50\nr2 out 0 50\n.tran 20p 40n 0 20p\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("ladder-tran.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let input = circuit.add_node("in").unwrap();
+    let output = circuit.add_node("out").unwrap();
+    bind_realization(&mut circuit, "nladder", ladder, ports(input, output)).unwrap();
+    let plot = config
+        .plan_for(&netlist.analyses[0])
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    let mut max_error: f64 = 0.;
+    let mut count = 0;
+    for point in 0..plot.point_count() {
+        let time = plot.value("time", point).unwrap().re;
+        if time > 30e-9 {
+            let expected = 0.5 * ((time - 0.5e-9) * 100e6 * TAU).sin();
+            max_error = max_error.max((plot.value("v(out)", point).unwrap().re - expected).abs());
+            count += 1;
+        }
+    }
+    assert!(
+        count > 100 && max_error < 0.01,
+        "samples {count}, error {max_error}"
+    );
+}
+
+#[test]
+fn passive_junction_binding_is_atomic_and_preserves_floating_ports() {
+    use ngspice_rs::analysis::rf_network::realization::PassiveRealization;
+    use ngspice_rs::devices::{circuit::Circuit, rf_passive::bind_realization};
+    let graph =
+        Arc::new(PassiveRealization::junction(&[1e-9, 2e-9, 3e-9], 0.2e-12, band()).unwrap());
+    let mut circuit = Circuit::default();
+    let a = circuit.add_node("a").unwrap();
+    let b = circuit.add_node("b").unwrap();
+    let c = circuit.add_node("c").unwrap();
+    let reference = circuit.add_node("ref").unwrap();
+    let ports = [a, b, c]
+        .map(|positive| PortTerminals {
+            positive,
+            negative: reference,
+        })
+        .to_vec();
+    let before = circuit.nodes().len();
+    let mut bad = ports.clone();
+    bad[1].negative = NodeId::from_index(9999).unwrap();
+    assert!(bind_realization(&mut circuit, "ntee", Arc::clone(&graph), bad).is_err());
+    assert_eq!(circuit.nodes().len(), before);
+    assert!(circuit.devices().is_empty());
+    bind_realization(&mut circuit, "ntee", Arc::clone(&graph), ports.clone()).unwrap();
+    let after = circuit.nodes().len();
+    let count = circuit.devices().len();
+    assert!(bind_realization(&mut circuit, "ntee", graph, ports).is_err());
+    assert_eq!(circuit.nodes().len(), after);
+    assert_eq!(circuit.devices().len(), count);
+    circuit.finalize().unwrap();
+}

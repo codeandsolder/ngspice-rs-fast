@@ -2,9 +2,13 @@
 //! separate from this SI-unit frequency-domain interface.
 use crate::maths::dense_complex::DenseComplex;
 use crate::primitives::{Complex, SpiceError, SpiceResult};
-use std::f64::consts::TAU;
+use std::{
+    f64::consts::TAU,
+    sync::{Arc, Mutex},
+};
 
 pub mod geometry;
+pub mod realization;
 
 pub(crate) fn invalid(message: &str) -> SpiceError {
     SpiceError::circuit(format!("prepared RF network: {message}"))
@@ -281,16 +285,29 @@ impl ModalRelation {
         if !reference.is_finite() || reference <= 0. {
             return Err(invalid("invalid wave reference"));
         }
-        let common = scaled(self.common_voltage, reference);
-        let differential = scaled(self.differential_voltage, reference);
-        let even = (self.common_current - common) / (self.common_current + common);
-        let odd =
-            (self.differential_current - differential) / (self.differential_current + differential);
+        let reflection = |current, voltage| -> SpiceResult<Complex> {
+            let (current, voltage) = if reference >= 1. {
+                (scaled(current, reference.recip()), voltage)
+            } else {
+                (current, scaled(voltage, reference))
+            };
+            let (current, voltage) = normalize_pair(current, voltage)?;
+            Ok((current - voltage) / (current + voltage))
+        };
+        let even = reflection(self.common_current, self.common_voltage)?;
+        let odd = reflection(self.differential_current, self.differential_voltage)?;
         if !even.is_finite() || !odd.is_finite() {
             return Err(invalid("singular wave relation"));
         }
         Ok([even, odd])
     }
+}
+
+#[derive(Debug)]
+struct Evaluation {
+    hz: u64,
+    temperature: u64,
+    relations: Arc<[ModalRelation]>,
 }
 
 /// A line with independently propagating modes and an orthogonal real
@@ -305,6 +322,9 @@ pub struct PreparedLine {
     basis: Box<[f64]>,
     length: f64,
     band: FrequencyBand,
+    // At most one analysis point is retained, shared by identical line
+    // instances. The immutable snapshot outlives cache replacement.
+    evaluation: Arc<Mutex<Option<Evaluation>>>,
 }
 
 impl PreparedLine {
@@ -347,6 +367,7 @@ impl PreparedLine {
             basis: basis.into_boxed_slice(),
             length,
             band,
+            evaluation: Arc::default(),
         })
     }
 
@@ -385,17 +406,35 @@ impl PreparedLine {
     /// microwave-only validity band, so the bias system is well defined.
     /// # Errors
     /// Invalid frequency or temperature, outside band, or numerical range.
-    pub fn relations(&self, hz: f64, temperature: f64) -> SpiceResult<Vec<ModalRelation>> {
+    pub fn relations(&self, hz: f64, temperature: f64) -> SpiceResult<Arc<[ModalRelation]>> {
         if hz != 0. && !self.band.contains(hz) {
             return Err(invalid("frequency outside prepared validity band"));
         }
-        self.modes
+        let mut cached = self
+            .evaluation
+            .lock()
+            .map_err(|_| invalid("RF evaluation cache poisoned"))?;
+        if let Some(previous) = &*cached
+            && previous.hz == hz.to_bits()
+            && previous.temperature == temperature.to_bits()
+        {
+            return Ok(Arc::clone(&previous.relations));
+        }
+        let relations: Arc<[ModalRelation]> = self
+            .modes
             .iter()
             .map(|m| {
                 let (z, y) = m.rlgc(hz, temperature)?;
                 ModalRelation::new(z, y, self.length)
             })
-            .collect()
+            .collect::<SpiceResult<Vec<_>>>()?
+            .into();
+        *cached = Some(Evaluation {
+            hz: hz.to_bits(),
+            temperature: temperature.to_bits(),
+            relations: Arc::clone(&relations),
+        });
+        Ok(relations)
     }
 
     /// Power-wave scattering matrix at equal real reference impedances.
@@ -410,7 +449,8 @@ impl PreparedLine {
         let n = self.conductors();
         let values = self
             .relations(hz, temperature)?
-            .into_iter()
+            .iter()
+            .copied()
             .map(|r| r.reflections(reference))
             .collect::<SpiceResult<Vec<_>>>()?;
         let mut matrix = DenseComplex::zeros(2 * n)?;
