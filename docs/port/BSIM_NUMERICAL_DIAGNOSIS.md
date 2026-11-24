@@ -271,3 +271,102 @@ numerical parity issues in #154.
 The temporary BSIM4 source trace is diagnostic-only and was removed
 after recording its results. Read-only opt-in fixture coverage remains
 in tests/bsim4_op_diagnostics.rs.
+
+## Exact solver replay on actual Newton inputs (2026-11-24)
+
+On integration base `00eb948bdfdf231a127ea4b04dae8ac2e4969b18`,
+all four original failing tests reproduce unchanged. The earlier
+"possible pivot order" diagnosis is now resolved for these specific
+failure points: the source-current discrepancies can be reproduced
+without any model reload, parameter change or new nonlinear iteration.
+
+Temporary diagnostics captured each real `ni_step`'s bound pattern
+in allocation order, binary64 coefficients and RHS, reorder flag,
+diagonal gmin, fresh-frame indicator, factor permutation, raw LU values
+and returned solution. The production sources are not the permanent
+diagnostic interface. The independent replay linked the existing
+pinned C build's original `spalloc.o`, `spbuild.o`, `spextra.o`,
+`spfactor.o`, `spoutput.o`, `spsolve.o`, `sputils.o` and
+`misc/alloc.o` (compiled with `-O2 -ffp-contract=off`).
+It created elements in recorded order, preserved the factor frame
+between steps, reset on fresh frames, ran `spMNA_Preorder` and
+`spOrderAndFactor` or `spFactor` as appropriate, then `spSolve`.
+No C device model or convergence loop was involved.
+
+| Case | Rust source current (A) | C SPARSE, same Rust inputs (A) | Fixed C fixture (A) |
+| --- | ---: | ---: | ---: |
+| Amplifier OP | 1.2042403532687725e-12 | 1.2042380981291956e-12 | 1.2042380981291956e-12 |
+| Width sweep point 0 | 1.2023949544350304e-12 | 1.2023958217977082e-12 | 1.2023958217977082e-12 |
+| PMOS sweep point 1 | -4.144328697065342e-12 | -4.14432854353719e-12 | -4.14432854353719e-12 |
+| Temperature sweep point 4 | -8.484372813372282e-8 | -8.484372809869356e-8 | -8.484372804318241e-8 |
+
+At the failing iterations the pivot permutations match exactly,
+and **every factor** matches C numerically exactly after converting
+the Rust raw factors to C's inverse-diagonal/normalized-upper
+representation (40/40 amplifier, width and temperature; 28/28 PMOS).
+The amplifier's four Newton passes also all match in factors.
+The temperature replay differs from the fixture by 5.551115e-17 A,
+inside the unmodified 8.484373e-17 A acceptance bound.
+Thus all four initial failures have a substitution-rounding component
+large enough to explain the failure, independently of model assembly.
+
+The numerical mechanism is the intentional raw-factor implementation:
+Rust uses raw numerators in both triangular scatter directions and
+recovers cross-product cancellation; C rounds the normalized factors,
+scatters the first substitution and gathers the second from the
+already rounded intermediate vector (`spsolve.c`).
+The two operations are algebraically identical but not bit-equivalent.
+
+An independent 100-decimal-digit solve of the exact *actual* input
+coefficients and RHS at each failing iteration (not a later linearization)
+gives the following comparison. Amplifier and width use the third
+iteration matching the failing current; PMOS uses iteration seven,
+temperature iteration twelve.
+
+| Case | Exact rounded-system solution (A) | Rust minus exact (A) | C replay minus exact (A) |
+| --- | ---: | ---: | ---: |
+| Amplifier | 1.20424640235956376733e-12 | -6.04909e-18 | -8.30423e-18 |
+| Width | 1.20240053220584279507e-12 | -5.57777e-18 | -4.71041e-18 |
+| PMOS | -4.14432879652489118225e-12 | 9.94595e-20 | 2.52988e-19 |
+| Temperature | -8.48437280998981750298e-8 | -3.38246e-17 | 1.20461e-18 |
+
+Neither arithmetic path always gives the more accurate solution of the
+rounded matrix. The original issue's strict fixture acceptance and the
+documented native solver's cancellation-recovery contract are distinct
+requirements, and should not be conflated with the exact nonlinear
+physical solution.
+
+Scratch reproduction on Acer:
+`/home/jan/build/ngspice-rs-fast/quality/issue-campaign-20261120/research/arch-1123-2317-k9d2-154/`
+contains `replay.c`, `compare.py` (run via uv), raw input/replay files
+for the four tests and `all-four-replay-report.txt`. Rust traces are
+in the sibling campaign build directory `arch-1123-2317-k9d2-154`.
+Temporary source instrumentation is preserved externally as
+`rust-trace.patch`; do not apply it to normal builds.
+
+### Substitution variants
+
+Separating the two triangular passes in the captured systems shows
+that the robust Rust forward scatter can remain intact: with either
+forward arithmetic, normalized backward gather reproduces the three
+exact C fixture values and places temperature within the original
+tolerance. Gathering the raw upper factors before division, or
+scattering normalized terms, is insufficient across all four cases.
+
+A temporary direct C-order real normal solve passed all nine BSIM4
+device tests, with no fixture changes. However, three existing
+SPARSE unit tests rejected the implementation: reciprocal range,
+unrepresentable normalized upper entries, and scalar/batched bit
+agreement. The raw factors and recovery kernels are therefore
+essential; restoring the entire old algorithm is not a valid fix.
+
+The guarded-gather experiment keeps those factors, preserves the
+robust forward pass, and tests normalization range and a local
+absolute roundoff bound for each backward row. It retries the whole
+RHS through raw scatter if a row's sign/zero cannot be resolved
+within that bound. This is a local arithmetic check, not a condition
+number estimate or a guarantee of physical forward accuracy.
+Independent Python replay of the guard over all 125 captured Newton
+systems (4 amplifier, 10 width, 83 PMOS, 28 temperature) accepts
+every system and yields the same four C-compatible results. The
+script is `guarded-replay.py` in the scratch directory above.
