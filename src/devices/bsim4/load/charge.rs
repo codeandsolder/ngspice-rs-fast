@@ -7,7 +7,6 @@
     clippy::similar_names,
     reason = "C equation names preserve the reference distinctions"
 )]
-#![expect(clippy::manual_midpoint, reason = "retain C midpoint rounding order")]
 #![expect(
     clippy::suboptimal_flops,
     reason = "Remaining translated product-rule sums and companion stamps have no demonstrated cancellation defect; preserve shared charge identities and avoid indiscriminate software FMA. See BSIM_CHANNEL_NUMERICS.md."
