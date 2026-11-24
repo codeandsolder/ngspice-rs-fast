@@ -22,7 +22,7 @@ fn max(a: f64, b: f64) -> f64 {
 /// the requested CPU target provides hardware FMA. Generic builds must
 /// not invoke the much slower software floating-point FMA implementation.
 /// Both alternatives accumulate the terms in their original C order.
-#[inline(always)]
+#[inline]
 fn predictor_term(gain: f64, delta: f64, sum: f64) -> f64 {
     if cfg!(target_feature = "fma") {
         gain.mul_add(delta, sum)
@@ -42,6 +42,279 @@ fn convergence_tolerance(predicted: f64, original: f64, reltol: f64, abstol: f64
     reltol * max(predicted.abs(), original.abs()) + abstol
 }
 
+/// Apply smooth predictor terms in exactly the reference accumulation order.
+#[inline]
+fn predictor<const N: usize>(original: f64, terms: [(f64, f64); N]) -> f64 {
+    terms.into_iter().fold(original, |sum, (gain, delta)| {
+        predictor_term(gain, delta, sum)
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Prediction {
+    original: f64,
+    estimated: f64,
+}
+
+impl Prediction {
+    const fn new(original: f64, estimated: f64) -> Self {
+        Self {
+            original,
+            estimated,
+        }
+    }
+
+    fn rejects(self, reltol: f64, abstol: f64, inclusive: bool) -> bool {
+        let tolerance = convergence_tolerance(self.estimated, self.original, reltol, abstol);
+        let error = (self.estimated - self.original).abs();
+        if inclusive {
+            error >= tolerance
+        } else {
+            error > tolerance
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BiasDelta {
+    delvbd: f64,
+    delvgd: f64,
+    delvds: f64,
+    delvgs: f64,
+    delvbs: f64,
+    delvses: f64,
+    delvded: f64,
+    delvbd_jct: f64,
+    delvbs_jct: f64,
+    vdedo: f64,
+}
+
+impl BiasDelta {
+    fn read(
+        m: &Model,
+        h: &Instance,
+        rhs_old: &dyn Fn(i32) -> f64,
+        state0: &dyn Fn(usize) -> f64,
+    ) -> Self {
+        let ty = f64::from(m.r#type);
+        let vds = ty * (rhs_old(h.dNodePrime) - rhs_old(h.sNodePrime));
+        let vgs = ty * (rhs_old(h.gNodePrime) - rhs_old(h.sNodePrime));
+        let vbs = ty * (rhs_old(h.bNodePrime) - rhs_old(h.sNodePrime));
+        let vdbs = ty * (rhs_old(h.dbNode) - rhs_old(h.sNodePrime));
+        let vsbs = ty * (rhs_old(h.sbNode) - rhs_old(h.sNodePrime));
+        let vses = ty * (rhs_old(h.sNode) - rhs_old(h.sNodePrime));
+        let vdes = ty * (rhs_old(h.dNode) - rhs_old(h.sNodePrime));
+
+        let vgdo = state0(state::VGS) - state0(state::VDS);
+        let vbd = vbs - vds;
+        let vdbd = vdbs - vds;
+        let vgd = vgs - vds;
+
+        let delvbd = vbd - state0(state::VBD);
+        let delvdbd = vdbd - state0(state::VDBD);
+        let delvgd = vgd - vgdo;
+
+        let delvds = vds - state0(state::VDS);
+        let delvgs = vgs - state0(state::VGS);
+        let delvbs = vbs - state0(state::VBS);
+        let delvsbs = vsbs - state0(state::VSBS);
+
+        let delvses = vses - (state0(state::VSES));
+        let vdedo = state0(state::VDES) - state0(state::VDS);
+        let delvded = vdes - vds - vdedo;
+
+        let delvbd_jct = if h.rbodyMod == 0 { delvbd } else { delvdbd };
+        let delvbs_jct = if h.rbodyMod == 0 { delvbs } else { delvsbs };
+
+        Self {
+            delvbd,
+            delvgd,
+            delvds,
+            delvgs,
+            delvbs,
+            delvses,
+            delvded,
+            delvbd_jct,
+            delvbs_jct,
+            vdedo,
+        }
+    }
+}
+
+/// Drain, gate-source, gate-drain and gate-bulk predictions in the
+/// reference forward/reverse orientation.
+fn drain_and_gate(h: &Instance, d: BiasDelta) -> [Prediction; 4] {
+    let BiasDelta {
+        delvbd,
+        delvgd,
+        delvds,
+        delvgs,
+        delvbs,
+        delvbd_jct,
+        ..
+    } = d;
+    let (Idtot, cdhat, Igstot, cgshat, Igdtot, cgdhat, cgbhat);
+    if h.mode >= 0 {
+        Idtot = h.cd + h.csub - h.cbd + h.Igidl;
+        cdhat = predictor(
+            Idtot,
+            [
+                (h.gbd, -delvbd_jct),
+                (h.gmbs + h.gbbs + h.ggidlb, delvbs),
+                (h.gm + h.gbgs + h.ggidlg, delvgs),
+                (h.gds + h.gbds + h.ggidld, delvds),
+            ],
+        );
+        Igstot = h.Igs + h.Igcs;
+        cgshat = predictor(
+            Igstot,
+            [
+                (h.gIgsg + h.gIgcsg, delvgs),
+                (h.gIgcsd, delvds),
+                (h.gIgcsb, delvbs),
+            ],
+        );
+        Igdtot = h.Igd + h.Igcd;
+        cgdhat = predictor(
+            Igdtot,
+            [
+                (h.gIgdg, delvgd),
+                (h.gIgcdg, delvgs),
+                (h.gIgcdd, delvds),
+                (h.gIgcdb, delvbs),
+            ],
+        );
+        cgbhat = predictor(
+            h.Igb,
+            [(h.gIgbg, delvgs), (h.gIgbd, delvds), (h.gIgbb, delvbs)],
+        );
+    } else {
+        // C's own "bugfix" spelling of the reverse-mode drain current.
+        Idtot = h.cd + h.cbd - h.Igidl;
+        cdhat = predictor(
+            Idtot,
+            [
+                (h.gbd, delvbd_jct),
+                (h.gmbs, delvbd),
+                (h.gm, delvgd),
+                (h.gds + h.ggidls, -delvds),
+                (h.ggidlg, -delvgs),
+                (h.ggidlb, -delvbs),
+            ],
+        );
+        Igstot = h.Igs + h.Igcd;
+        cgshat = predictor(
+            Igstot,
+            [
+                (h.gIgsg, delvgs),
+                (h.gIgcdg, delvgd),
+                (h.gIgcdd, -delvds),
+                (h.gIgcdb, delvbd),
+            ],
+        );
+        Igdtot = h.Igd + h.Igcs;
+        cgdhat = predictor(
+            Igdtot,
+            [
+                (h.gIgdg + h.gIgcsg, delvgd),
+                (h.gIgcsd, -delvds),
+                (h.gIgcsb, delvbd),
+            ],
+        );
+        cgbhat = predictor(
+            h.Igb,
+            [(h.gIgbg, delvgd), (h.gIgbd, -delvds), (h.gIgbb, delvbd)],
+        );
+    }
+
+    [
+        Prediction::new(Idtot, cdhat),
+        Prediction::new(Igstot, cgshat),
+        Prediction::new(Igdtot, cgdhat),
+        Prediction::new(h.Igb, cgbhat),
+    ]
+}
+
+fn resistance(h: &Instance, d: BiasDelta, state0: &dyn Fn(usize) -> f64) -> [Prediction; 2] {
+    let BiasDelta {
+        delvbs,
+        delvgs,
+        delvds,
+        delvses,
+        delvded,
+        vdedo,
+        ..
+    } = d;
+    let Isestot = h.gstot * (state0(state::VSES));
+    let cseshat = predictor(
+        Isestot,
+        [
+            (h.gstot, delvses),
+            (h.gstotd, delvds),
+            (h.gstotg, delvgs),
+            (h.gstotb, delvbs),
+        ],
+    );
+    let Idedtot = h.gdtot * vdedo;
+    let cdedhat = predictor(
+        Idedtot,
+        [
+            (h.gdtot, delvded),
+            (h.gdtotd, delvds),
+            (h.gdtotg, delvgs),
+            (h.gdtotb, delvbs),
+        ],
+    );
+
+    [
+        Prediction::new(Isestot, cseshat),
+        Prediction::new(Idedtot, cdedhat),
+    ]
+}
+
+fn bulk(h: &Instance, d: BiasDelta) -> Prediction {
+    let BiasDelta {
+        delvds,
+        delvbd,
+        delvgd,
+        delvgs,
+        delvbs,
+        delvbs_jct,
+        delvbd_jct,
+        ..
+    } = d;
+    let Ibtot = h.cbs + h.cbd - h.Igidl - h.Igisl - h.csub;
+    let cbhat = if h.mode >= 0 {
+        predictor(
+            Ibtot,
+            [
+                (h.gbd, delvbd_jct),
+                (h.gbs, delvbs_jct),
+                (h.gbbs + h.ggidlb, -delvbs),
+                (h.gbgs + h.ggidlg, -delvgs),
+                (h.gbds + h.ggidld, -delvds),
+                (h.ggislg, -delvgd),
+                (h.ggislb, -delvbd),
+                (h.ggisls, delvds),
+            ],
+        )
+    } else {
+        predictor(
+            Ibtot,
+            [
+                (h.gbs, delvbs_jct),
+                (h.gbd, delvbd_jct),
+                (h.gbbs + h.ggislb, -delvbd),
+                (h.gbgs + h.ggislg, -delvgd),
+                (h.gbds + h.ggisld - h.ggidls, delvds),
+                (h.ggidlg, -delvgs),
+                (h.ggidlb, -delvbs),
+            ],
+        )
+    };
+    Prediction::new(Ibtot, cbhat)
+}
+
 /// `BSIM4convTest` for one instance: `true` when C would increment
 /// `CKTnoncon`. `rhs_old` is the new iterate C reads as `CKTrhsOld`,
 /// `state0` the last load's state vector, `mode` C's `CKTmode`.
@@ -54,233 +327,25 @@ pub(super) fn conv_test(
     reltol: f64,
     abstol: f64,
 ) -> bool {
-    let ty = f64::from(m.r#type);
-    let vds = ty * (rhs_old(h.dNodePrime) - rhs_old(h.sNodePrime));
-    let vgs = ty * (rhs_old(h.gNodePrime) - rhs_old(h.sNodePrime));
-    let vbs = ty * (rhs_old(h.bNodePrime) - rhs_old(h.sNodePrime));
-    let vdbs = ty * (rhs_old(h.dbNode) - rhs_old(h.sNodePrime));
-    let vsbs = ty * (rhs_old(h.sbNode) - rhs_old(h.sNodePrime));
-    let vses = ty * (rhs_old(h.sNode) - rhs_old(h.sNodePrime));
-    let vdes = ty * (rhs_old(h.dNode) - rhs_old(h.sNodePrime));
-
-    let vgdo = state0(state::VGS) - state0(state::VDS);
-    let vbd = vbs - vds;
-    let vdbd = vdbs - vds;
-    let vgd = vgs - vds;
-
-    let delvbd = vbd - state0(state::VBD);
-    let delvdbd = vdbd - state0(state::VDBD);
-    let delvgd = vgd - vgdo;
-
-    let delvds = vds - state0(state::VDS);
-    let delvgs = vgs - state0(state::VGS);
-    let delvbs = vbs - state0(state::VBS);
-    let delvsbs = vsbs - state0(state::VSBS);
-
-    let delvses = vses - (state0(state::VSES));
-    let vdedo = state0(state::VDES) - state0(state::VDS);
-    let delvdes = vdes - state0(state::VDES);
-    let delvded = vdes - vds - vdedo;
-    let _ = delvdes;
-
-    let delvbd_jct = if h.rbodyMod == 0 { delvbd } else { delvdbd };
-    let delvbs_jct = if h.rbodyMod == 0 { delvbs } else { delvsbs };
-
-    let (Idtot, cdhat, Igstot, cgshat, Igdtot, cgdhat, Igbtot, cgbhat);
-    if h.mode >= 0 {
-        Idtot = h.cd + h.csub - h.cbd + h.Igidl;
-        cdhat = predictor_term(
-            h.gds + h.gbds + h.ggidld,
-            delvds,
-            predictor_term(
-                h.gm + h.gbgs + h.ggidlg,
-                delvgs,
-                predictor_term(
-                    h.gmbs + h.gbbs + h.ggidlb,
-                    delvbs,
-                    predictor_term(h.gbd, -delvbd_jct, Idtot),
-                ),
-            ),
-        );
-        Igstot = h.Igs + h.Igcs;
-        cgshat = predictor_term(
-            h.gIgcsb,
-            delvbs,
-            predictor_term(
-                h.gIgcsd,
-                delvds,
-                predictor_term(h.gIgsg + h.gIgcsg, delvgs, Igstot),
-            ),
-        );
-        Igdtot = h.Igd + h.Igcd;
-        cgdhat = predictor_term(
-            h.gIgcdb,
-            delvbs,
-            predictor_term(
-                h.gIgcdd,
-                delvds,
-                predictor_term(h.gIgcdg, delvgs, predictor_term(h.gIgdg, delvgd, Igdtot)),
-            ),
-        );
-        Igbtot = h.Igb;
-        cgbhat = predictor_term(
-            h.gIgbb,
-            delvbs,
-            predictor_term(h.gIgbd, delvds, predictor_term(h.gIgbg, delvgs, h.Igb)),
-        );
-    } else {
-        // C's own "bugfix" spelling of the reverse-mode drain current.
-        Idtot = h.cd + h.cbd - h.Igidl;
-        cdhat = predictor_term(
-            h.ggidlb,
-            -delvbs,
-            predictor_term(
-                h.ggidlg,
-                -delvgs,
-                predictor_term(
-                    h.gds + h.ggidls,
-                    -delvds,
-                    predictor_term(
-                        h.gm,
-                        delvgd,
-                        predictor_term(h.gmbs, delvbd, predictor_term(h.gbd, delvbd_jct, Idtot)),
-                    ),
-                ),
-            ),
-        );
-        Igstot = h.Igs + h.Igcd;
-        cgshat = predictor_term(
-            h.gIgcdb,
-            delvbd,
-            predictor_term(
-                h.gIgcdd,
-                -delvds,
-                predictor_term(h.gIgcdg, delvgd, predictor_term(h.gIgsg, delvgs, Igstot)),
-            ),
-        );
-        Igdtot = h.Igd + h.Igcs;
-        cgdhat = predictor_term(
-            h.gIgcsb,
-            delvbd,
-            predictor_term(
-                h.gIgcsd,
-                -delvds,
-                predictor_term(h.gIgdg + h.gIgcsg, delvgd, Igdtot),
-            ),
-        );
-        Igbtot = h.Igb;
-        cgbhat = predictor_term(
-            h.gIgbb,
-            delvbd,
-            predictor_term(h.gIgbd, -delvds, predictor_term(h.gIgbg, delvgd, h.Igb)),
-        );
+    let delta = BiasDelta::read(m, h, rhs_old, state0);
+    let [drain, gate_source, gate_drain, gate_bulk] = drain_and_gate(h, delta);
+    let [source_resistance, drain_resistance] = resistance(h, delta, state0);
+    if h.off != 0 && mode & mode::MODEINITFIX != 0 {
+        return false;
     }
-
-    let Isestot = h.gstot * (state0(state::VSES));
-    let cseshat = predictor_term(
-        h.gstotb,
-        delvbs,
-        predictor_term(
-            h.gstotg,
-            delvgs,
-            predictor_term(h.gstotd, delvds, predictor_term(h.gstot, delvses, Isestot)),
-        ),
-    );
-    let Idedtot = h.gdtot * vdedo;
-    let cdedhat = predictor_term(
-        h.gdtotb,
-        delvbs,
-        predictor_term(
-            h.gdtotg,
-            delvgs,
-            predictor_term(h.gdtotd, delvds, predictor_term(h.gdtot, delvded, Idedtot)),
-        ),
-    );
-
-    // Check convergence
-    if (h.off == 0) || ((mode & mode::MODEINITFIX) == 0) {
-        let tol0 = convergence_tolerance(cdhat, Idtot, reltol, abstol);
-        let tol1 = convergence_tolerance(cseshat, Isestot, reltol, abstol);
-        let tol2 = convergence_tolerance(cdedhat, Idedtot, reltol, abstol);
-        let tol3 = convergence_tolerance(cgshat, Igstot, reltol, abstol);
-        let tol4 = convergence_tolerance(cgdhat, Igdtot, reltol, abstol);
-        let tol5 = convergence_tolerance(cgbhat, Igbtot, reltol, abstol);
-        if ((cdhat - Idtot).abs() >= tol0)
-            || ((cseshat - Isestot).abs() >= tol1)
-            || ((cdedhat - Idedtot).abs() >= tol2)
-        {
-            return true;
-        }
-        if ((cgshat - Igstot).abs() >= tol3)
-            || ((cgdhat - Igdtot).abs() >= tol4)
-            || ((cgbhat - Igbtot).abs() >= tol5)
-        {
-            return true;
-        }
-        let Ibtot = h.cbs + h.cbd - h.Igidl - h.Igisl - h.csub;
-        let cbhat = if h.mode >= 0 {
-            predictor_term(
-                h.ggisls,
-                delvds,
-                predictor_term(
-                    h.ggislb,
-                    -delvbd,
-                    predictor_term(
-                        h.ggislg,
-                        -delvgd,
-                        predictor_term(
-                            h.gbds + h.ggidld,
-                            -delvds,
-                            predictor_term(
-                                h.gbgs + h.ggidlg,
-                                -delvgs,
-                                predictor_term(
-                                    h.gbbs + h.ggidlb,
-                                    -delvbs,
-                                    predictor_term(
-                                        h.gbs,
-                                        delvbs_jct,
-                                        predictor_term(h.gbd, delvbd_jct, Ibtot),
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-            )
-        } else {
-            predictor_term(
-                h.ggidlb,
-                -delvbs,
-                predictor_term(
-                    h.ggidlg,
-                    -delvgs,
-                    predictor_term(
-                        h.gbds + h.ggisld - h.ggidls,
-                        delvds,
-                        predictor_term(
-                            h.gbgs + h.ggislg,
-                            -delvgd,
-                            predictor_term(
-                                h.gbbs + h.ggislb,
-                                -delvbd,
-                                predictor_term(
-                                    h.gbd,
-                                    delvbd_jct,
-                                    predictor_term(h.gbs, delvbs_jct, Ibtot),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-            )
-        };
-        let tol6 = convergence_tolerance(cbhat, Ibtot, reltol, abstol);
-        if (cbhat - Ibtot).abs() > tol6 {
-            return true;
-        }
-    }
-    false
+    // The reference first checks drain and terminal resistance, then gate
+    // currents, and evaluates bulk only if all six inclusive checks pass.
+    [
+        drain,
+        source_resistance,
+        drain_resistance,
+        gate_source,
+        gate_drain,
+        gate_bulk,
+    ]
+    .into_iter()
+    .any(|prediction| prediction.rejects(reltol, abstol, true))
+        || bulk(h, delta).rejects(reltol, abstol, false)
 }
 
 #[cfg(test)]
