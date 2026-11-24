@@ -1002,7 +1002,7 @@ fn prepared_tee_tracks_independent_distributed_qucs_reference() {
         )
         .unwrap(),
     );
-    let deck = "prepared tee\nv1 a 0 portnum 1 z0 50\nv2 b 0 portnum 2 z0 50\nv3 c 0 portnum 3 z0 50\n.sp lin 2 100meg 1g\n.end\n";
+    let deck = "prepared tee\nv1 a 0 portnum 1 z0 50\nv2 b 0 portnum 2 z0 50\nv3 c 0 portnum 3 z0 50\n.sp lin 3 100meg 1g\n.end\n";
     let netlist = Parser::new()
         .parse_deck(&parse_deck_text(Path::new("tee.cir"), deck))
         .unwrap();
@@ -1018,7 +1018,7 @@ fn prepared_tee_tracks_independent_distributed_qucs_reference() {
         .unwrap()
         .run(&mut circuit, &config.context())
         .unwrap();
-    for (index, (hz, expected, tolerance)) in reference.into_iter().enumerate() {
+    for (index, (hz, expected, tolerance)) in [0, 2].into_iter().zip(reference) {
         assert_eq!(plot.value("frequency", index).unwrap().re, hz);
         for (port, (re, im)) in expected.into_iter().enumerate() {
             close(
