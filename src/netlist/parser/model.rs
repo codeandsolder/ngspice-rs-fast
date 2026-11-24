@@ -76,6 +76,7 @@ fn model_base<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
             // MESFET (`mes/mes.c`) and its `inpdomod.c` HFET spellings; the
             // level selects `mesa/`, `hfet1/` or `hfet2/`.
             | "nmf" | "pmf" | "nhfet" | "phfet"
+            | "vdmos" | "vdmosn" | "vdmosp"
     ) {
         if base.is_keyword("cpl") || base.is_keyword("cpllines") {
             return Err(gap(

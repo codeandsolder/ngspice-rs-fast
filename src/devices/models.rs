@@ -60,6 +60,8 @@ pub enum ModelFamily {
     Nmos,
     /// PMOS (classic, BSIM3 and BSIM4 backends).
     Pmos,
+    /// Three-terminal vertical power MOSFET with body diode and electrothermal model.
+    Vdmos,
     /// Voltage-controlled switch (`sw`, `sw/sw.c`).
     Switch,
     /// Current-controlled switch (`csw`, `csw/csw.c`).
@@ -96,6 +98,7 @@ impl ModelFamily {
             "pnp" => Some(Self::Pnp),
             "nmos" => Some(Self::Nmos),
             "pmos" => Some(Self::Pmos),
+            "vdmos" | "vdmosn" | "vdmosp" => Some(Self::Vdmos),
             "sw" => Some(Self::Switch),
             "csw" => Some(Self::CurrentSwitch),
             "njf" => Some(Self::Njf),
@@ -121,7 +124,7 @@ impl ModelFamily {
             Self::Inductor => 'l',
             Self::Diode => 'd',
             Self::Npn | Self::Pnp => 'q',
-            Self::Nmos | Self::Pmos => 'm',
+            Self::Nmos | Self::Pmos | Self::Vdmos => 'm',
             Self::Switch => 's',
             Self::CurrentSwitch => 'w',
             Self::Njf | Self::Pjf => 'j',
@@ -161,6 +164,8 @@ pub enum ModelBackend {
     Bsim3,
     /// BSIM4.8.
     Bsim4,
+    /// Native prepared VDMOS physics from spice-redox.
+    Vdmos,
     /// JFET.
     Jfet,
     /// JFET2.
@@ -270,6 +275,9 @@ impl ModelBackend {
     }
 
     fn select(family: ModelFamily, selector: u8) -> Option<Self> {
+        if family == ModelFamily::Vdmos {
+            return (selector == 1).then_some(Self::Vdmos);
+        }
         Self::catalog(family.designator())
             .iter()
             .find(|spec| spec.selectors.contains(&selector))
@@ -1021,6 +1029,7 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         | ModelFamily::Pnp
         | ModelFamily::Nmos
         | ModelFamily::Pmos
+        | ModelFamily::Vdmos
         | ModelFamily::Njf
         | ModelFamily::Pjf
         | ModelFamily::Nmf

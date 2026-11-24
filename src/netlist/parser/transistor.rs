@@ -134,13 +134,12 @@ fn mos_connections<'a>(input: &mut Input<'a>) -> Result<Connections<'a>> {
     )
         .parse_next(input)?;
     let candidate = peek(name("bulk terminal")).parse_next(input)?;
-    // C scans from the third port (for VDMOS), so a declared model at this slot
-    // cannot be silently treated as a bulk node for an ordinary MOS instance.
+    // C scans for a declared model immediately after the third port for
+    // VDMOS; do not manufacture a bulk terminal. Family validation happens
+    // after the entire model catalog is resolved, so an ordinary MOS with
+    // omitted bulk is still a loud elaboration error, not reinterpreted.
     if is_declared_model(input, candidate) {
-        return Err(malformed(
-            input,
-            "expected bulk terminal before the MOS model (three-terminal VDMOS is not supported)",
-        ));
+        return Ok((vec![drain, gate, source], declared_model(input)?));
     }
     let bulk = name("bulk terminal").parse_next(input)?;
     let candidate = peek(name("MOS model name")).parse_next(input)?;
