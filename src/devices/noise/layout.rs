@@ -79,6 +79,57 @@ impl BoundNoiseSource {
         )
     }
 
+    /// One independent stationary generator's coherent current-injection
+    /// column at a signed frequency and physical phase point.
+    ///
+    /// A real source uses conjugate correlated phase at negative frequency.
+    /// Negative scalar spectral densities are not physical covariance factors.
+    pub(crate) fn periodic_amplitudes(
+        self,
+        frequency: Real,
+    ) -> SpiceResult<[(Option<usize>, Complex); 4]> {
+        if !frequency.is_finite() || frequency == 0. || !self.kind.validate() {
+            return Err(SpiceError::circuit(
+                "invalid periodic noise generator context",
+            ));
+        }
+        let (first, second) = match self.kind {
+            NoiseKind::CorrelatedThermal {
+                conductance,
+                second_conductance,
+                temperature,
+                phase,
+                ..
+            } => {
+                let scale = (4. * super::BOLTZMANN * temperature).sqrt();
+                let angle = if frequency < 0. { -phase } else { phase };
+                let (sin, cos) = angle.sin_cos();
+                let amplitude = scale * second_conductance.sqrt();
+                (
+                    Complex::real(scale * conductance.sqrt()),
+                    Complex::new(amplitude * cos, amplitude * sin),
+                )
+            }
+            kind => {
+                let density = kind.scalar_output_density(1., frequency.abs())?;
+                if density < 0. {
+                    return Err(SpiceError::circuit(
+                        "negative periodic noise spectral density",
+                    ));
+                }
+                (Complex::real(density.sqrt()), Complex::ZERO)
+            }
+        };
+        if !first.is_finite() || !second.is_finite() {
+            return Err(SpiceError::circuit(
+                "unrepresentable periodic noise amplitude",
+            ));
+        }
+        let [a, b] = self.primary.rows();
+        let [c, d] = self.secondary.map_or([None, None], BoundTransfer::rows);
+        Ok([(a, first), (b, -first), (c, second), (d, -second)])
+    }
+
     pub(crate) fn rf_amplitude(self) -> SpiceResult<Option<Real>> {
         self.kind.rf_amplitude()
     }

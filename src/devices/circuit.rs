@@ -575,6 +575,20 @@ impl<'a> PreparedRun<'a> {
             .record_small_signal_state_prepared(self, context, bias)
     }
 
+    /// Build independent physical small-signal state at a sampled orbit
+    /// point, without publishing any carried analysis state.
+    pub(crate) fn independent_small_signal_snapshot(
+        &self,
+        context: &ModelContext,
+        bias: &Vector,
+        values: &[Real],
+    ) -> SpiceResult<StateSnapshot> {
+        let mut state = values.to_vec();
+        self.circuit
+            .small_signal_slots(self, context, bias, &mut state)?;
+        self.circuit.bind_state(state)
+    }
+
     /// Assemble the small-signal system with this run's effective devices.
     /// # Errors
     /// As [`Circuit::small_signal_system_at`].
@@ -604,7 +618,6 @@ impl<'a> PreparedRun<'a> {
                 || device.small_signal_depends_on_frequency()
                 || device.delay_line().is_some()
                 || device.has_discrete_state()
-                || device.rf_port().is_some()
             {
                 return Err(SpiceError::Unsupported {
                     feature: format!("frequency-domain physical DAE for {}", device.name()),
@@ -2288,6 +2301,20 @@ impl Circuit {
                 || vec![0.; self.bindings.state_len],
                 |snapshot| snapshot.values.to_vec(),
             );
+        self.small_signal_slots(run, context, bias, &mut state)?;
+        let snapshot = self.bind_state(state)?;
+        *self.runtime.carried_state.borrow_mut() = Some(snapshot);
+        self.runtime.initial_revision.replace(Arc::new(()));
+        Ok(())
+    }
+
+    fn small_signal_slots(
+        &self,
+        run: &PreparedRun<'_>,
+        context: &ModelContext,
+        bias: &Vector,
+        state: &mut [Real],
+    ) -> SpiceResult<()> {
         let operating = crate::devices::distortion::DistortionContext::new(
             context,
             &self.bindings.unknowns,
@@ -2302,9 +2329,6 @@ impl Circuit {
                     .small_signal_state(&operating, slots)?;
             }
         }
-        let snapshot = self.bind_state(state)?;
-        *self.runtime.carried_state.borrow_mut() = Some(snapshot);
-        self.runtime.initial_revision.replace(Arc::new(()));
         Ok(())
     }
 

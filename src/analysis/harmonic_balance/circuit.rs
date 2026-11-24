@@ -61,9 +61,22 @@ fn waveform(lattice: &HarmonicLattice, wave: &Waveform) -> SpiceResult<Vec<Real>
                 .map_err(|_| failure("invalid resolved SIN fields"))?;
             sine(lattice, &mut values, params)?;
         }
+        Waveform::PortSeries { baseline, tones } => {
+            // The C PORT source adds cosines to the previous voltage
+            // source's resolved waveform in load order. Its declared
+            // phase parameter is not applied by the C load.
+            values = waveform(lattice, baseline)?;
+            for &(amplitude, omega) in tones {
+                let frequency = omega / std::f64::consts::TAU;
+                let index = lattice
+                    .locate(frequency)
+                    .ok_or_else(|| failure("RF port tone outside retained harmonic lattice"))?;
+                values[1 + 2 * index] += amplitude;
+            }
+        }
         _ => {
             return Err(SpiceError::Unsupported {
-                feature: "HB forcing requires a constant or undamped periodic SIN source".into(),
+                feature: "HB forcing requires a constant, undamped periodic SIN or resolved periodic RF PORT source".into(),
                 location: None,
             });
         }
@@ -245,4 +258,16 @@ pub fn solve_circuit(
     let mut model = CircuitModel::new(circuit, context, lattice, limits)?;
     let seed = seed.unwrap_or_else(|| Vector::zeros(model.pattern.order() * lattice.coordinates()));
     solve(lattice, &mut model, seed, equation_tolerances, limits)
+}
+
+pub(in crate::analysis) fn linearize_circuit_orbit(
+    circuit: &Circuit,
+    context: ModelContext,
+    lattice: &HarmonicLattice,
+    solution: &BalanceSolution,
+    tolerance: &[Real],
+    limits: BalanceLimits,
+) -> SpiceResult<super::OrbitSpectrum> {
+    let mut model = CircuitModel::new(circuit, context, lattice, limits)?;
+    super::linearize_orbit(lattice, &mut model, solution, tolerance, limits)
 }

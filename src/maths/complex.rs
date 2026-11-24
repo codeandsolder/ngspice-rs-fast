@@ -321,6 +321,36 @@ impl ComplexMatrix {
         }
     }
 
+    /// Bind already assembled complex coefficients in stable element-ID order.
+    /// # Errors
+    /// Mismatched coefficient count or nonfinite values.
+    pub(crate) fn from_bound_values(
+        pattern: Arc<Pattern>,
+        values: Vec<Complex>,
+        pivot: PivotTolerances,
+    ) -> SpiceResult<Self> {
+        if values.len() != pattern.len() || values.iter().any(|v| !v.is_finite()) {
+            return Err(numerical(
+                "complex assembly",
+                "invalid bound complex values",
+            ));
+        }
+        Ok(Self {
+            n: pattern.order(),
+            assembly: Assembly::Bound { pattern, values },
+            pivot,
+            names: None,
+        })
+    }
+
+    /// Borrow bound original coefficients in their stable creation order.
+    pub(crate) fn bound_coefficients(&self) -> Option<(&Arc<Pattern>, &[Complex])> {
+        match &self.assembly {
+            Assembly::Bound { pattern, values } => Some((pattern, values)),
+            Assembly::Standalone(_) => None,
+        }
+    }
+
     /// Assembles `A + j omega E`, preserving cancellations and checking
     /// overflow. The pivot tolerances are `a`'s.
     /// # Errors

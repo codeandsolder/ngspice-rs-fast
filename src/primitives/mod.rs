@@ -37,6 +37,7 @@ pub use value::{
 
 /// Bounded, exact accumulator of finite binary64 weighted products.
 /// Arithmetic is implemented in the private exact module.
+#[derive(Clone)]
 pub(crate) struct ExactSum {
     bins: [i128; exact::LIMBS],
     terms: u32,
