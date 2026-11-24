@@ -246,3 +246,15 @@ pub fn solve_circuit(
     let seed = seed.unwrap_or_else(|| Vector::zeros(model.pattern.order() * lattice.coordinates()));
     solve(lattice, &mut model, seed, equation_tolerances, limits)
 }
+
+pub(crate) fn linearize_circuit_orbit(
+    circuit: &Circuit,
+    context: ModelContext,
+    lattice: &HarmonicLattice,
+    solution: &BalanceSolution,
+    tolerance: &[Real],
+    limits: BalanceLimits,
+) -> SpiceResult<super::OrbitSpectrum> {
+    let mut model = CircuitModel::new(circuit, context, lattice, limits)?;
+    super::linearize_orbit(lattice, &mut model, solution, tolerance, limits)
+}

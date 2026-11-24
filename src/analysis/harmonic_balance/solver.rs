@@ -334,9 +334,6 @@ impl<'a> Workspace<'a> {
         if !residual.is_finite() {
             return Err(failure("nonfinite spectral residual"));
         }
-        if jacobian {
-            self.publish_matrix()?;
-        }
         Ok(residual)
     }
 
@@ -411,6 +408,82 @@ impl<'a> Workspace<'a> {
     }
 }
 
+/// Physical derivative spectra on the complete difference lattice. The
+/// expanded pattern is shared by all shifted-frequency operators.
+pub(crate) struct OrbitSpectrum {
+    pub(crate) pattern: Arc<Pattern>,
+    pub(crate) unknowns: usize,
+    pub(crate) width: usize,
+    pub(crate) spectrum_size: usize,
+    pub(crate) differences: Vec<usize>,
+    pub(crate) conductance: Vec<Complex>,
+    pub(crate) capacitance: Vec<Complex>,
+    pub(crate) scaled_residual: Real,
+}
+
+/// Recheck the actual supplied orbit under the current model, and project
+/// its exact derivatives once. A caller-provided convergence flag alone
+/// cannot authorize a linearization.
+pub(crate) fn linearize_orbit(
+    lattice: &HarmonicLattice,
+    model: &mut impl HarmonicModel,
+    solution: &BalanceSolution,
+    tolerance: &[Real],
+    limits: BalanceLimits,
+) -> SpiceResult<OrbitSpectrum> {
+    let mut work = Workspace::new(lattice, model.pattern().clone(), tolerance, limits)?;
+    if solution.coefficients.len() != work.matrix.rows() || !solution.coefficients.is_finite() {
+        return Err(failure("invalid periodic reference shape or values"));
+    }
+    let residual = work.evaluate(model, &solution.coefficients, true)?;
+    let scaled_residual = work.scaled(&residual)?.max_abs();
+    if scaled_residual > 1. {
+        return Err(failure(format!(
+            "periodic reference does not satisfy the physical equations: {scaled_residual:.6e}"
+        )));
+    }
+    let size = work.projection.size();
+    let count = product(
+        work.local.len(),
+        size,
+        limits.sample_entries,
+        "periodic derivative spectrum budget exceeded",
+    )?;
+    let mut conductance = filled_vec(count, Complex::ZERO, "periodic conductance spectra")?;
+    let mut capacitance = filled_vec(count, Complex::ZERO, "periodic capacitance spectra")?;
+    let phases = lattice.samples();
+    for (site, (g, c)) in conductance
+        .chunks_exact_mut(size)
+        .zip(capacitance.chunks_exact_mut(size))
+        .enumerate()
+    {
+        let range = site * phases..(site + 1) * phases;
+        work.projection
+            .transform(&work.conductance[range.clone()], g);
+        work.projection.transform(&work.capacitance[range], c);
+        if g.iter().chain(c.iter()).any(|value| !value.is_finite()) {
+            return Err(failure("nonfinite periodic derivative spectrum"));
+        }
+    }
+    let differences = work.projection.signed_differences()?;
+    let pattern = work
+        .matrix
+        .bound_values()
+        .ok_or_else(|| failure("missing expanded harmonic pattern"))?
+        .0
+        .clone();
+    Ok(OrbitSpectrum {
+        pattern,
+        unknowns: work.local.order(),
+        width: lattice.coordinates(),
+        spectrum_size: size,
+        differences,
+        conductance,
+        capacitance,
+        scaled_residual,
+    })
+}
+
 /// Solve the coupled forced frequency-domain equations with analytic sparse
 /// Newton derivatives and a residual-decreasing line search.
 ///
@@ -461,6 +534,7 @@ pub fn solve(
         if corrections == limits.iterations {
             break;
         }
+        work.publish_matrix()?;
         let next = SparseLu::new(&work.matrix, factor.as_ref().map(SparseLu::symbolic))?;
         let rhs = Vector::from(
             scaled

@@ -159,6 +159,27 @@ impl Projection {
         self.size
     }
 
+    /// Flattened (output, input) difference indices in signed-frequency order.
+    pub(super) fn signed_differences(&self) -> SpiceResult<Vec<usize>> {
+        let mut modes: Vec<_> = self.modes[1..]
+            .iter()
+            .rev()
+            .map(|&mode| 2 * self.center - mode)
+            .collect();
+        modes.extend(&self.modes);
+        let count = modes
+            .len()
+            .checked_mul(modes.len())
+            .ok_or_else(|| failure("sideband difference count overflow"))?;
+        let mut differences = filled_vec(count, 0, "sideband difference indices")?;
+        for (row, &output) in differences.chunks_exact_mut(modes.len()).zip(&modes) {
+            for (value, &input) in row.iter_mut().zip(&modes) {
+                *value = output + self.center - input;
+            }
+        }
+        Ok(differences)
+    }
+
     pub(super) fn block(
         &self,
         lattice: &HarmonicLattice,

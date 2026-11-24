@@ -604,7 +604,6 @@ impl<'a> PreparedRun<'a> {
                 || device.small_signal_depends_on_frequency()
                 || device.delay_line().is_some()
                 || device.has_discrete_state()
-                || device.rf_port().is_some()
             {
                 return Err(SpiceError::Unsupported {
                     feature: format!("frequency-domain physical DAE for {}", device.name()),
