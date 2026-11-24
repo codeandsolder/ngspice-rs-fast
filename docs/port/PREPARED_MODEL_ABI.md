@@ -20,8 +20,8 @@ accepted/rejected history, analysis orchestration and adjoint noise transfer.
 - `Capability::Computed` requires a complete physical equation implementation;
   `Capability::Zero` is a **declared physical zero**, never an implicit
   approximation; `Capability::Unavailable` means the corresponding analysis
-  must fail explicitly. Every model supplies terminal current and analytic
-  conductance; these are never optional.
+  must fail explicitly. Every model supplies a complete generalized static residual and analytic
+  Jacobian; these are never optional.
 - `Artifact<K>` validates the description once. `Kernel::prepare` derives
   immutable effective constants from typed parameter values and temperature
   **outside** Newton. `PreparedDevice<K>` owns those constants and its reusable
@@ -29,9 +29,13 @@ accepted/rejected history, analysis orchestration and adjoint noise transfer.
   `with_parameter_named(name,value)` constructs a different prepared instance
   for numeric candidate perturbations; structural changes fail instead of
   silently reusing stale rows.
-- A different temperature also requires a new prepared instance. Current
-  preparation deliberately refuses stale thermal contexts rather than
-  pretending effective values are unchanged.
+- The engine passes ambient Celsius to the artifact instance binder (the
+  same convention as ModelContext). This boundary converts to absolute
+  Kelvin before Kernel::prepare; compiled model equations never receive
+  a silently unit-ambiguous temperature. A different ambient temperature
+  requires a new prepared instance; a physically modeled self-heating
+  coordinate remains an explicit dynamic equation and is not that ambient
+  preparation temperature. Stale context use is rejected before solving.
 - There is no SPICE deck or protected-library parsing in this API and no
   special-case dispatch keyed by vendor model names.
 
@@ -55,7 +59,7 @@ model uses thermal and recovery state equations and requires this layout.
 ## Homogeneous borrowed tiles
 
 `BatchInput` borrows a contiguous slice of already-prepared instances and
-the lane-major voltages. `BatchOutput` owns reusable row-major current,
+the lane-major generalized physical coordinates. `BatchOutput` owns reusable row-major current,
 conductance, charge and capacitance buffers. `Kernel::evaluate_batch`
 defaults to independent scalar lanes and may be overridden by compiled
 vectorized/SIMD family kernels without changing the output ABI. Every lane
@@ -91,8 +95,9 @@ cargo +nightly test --locked --test prepared_model_integration
 
 An additional analytic four-row electrothermal/recovery DAE exercises
 physical cross-derivatives, heat/relaxation balance, DC sparse stamping,
-AC storage, electrical-only conservation and gauge invariance, and invalid
-structural schemas. It proves representability, not actual VDMOS linkage.
+AC and transient integration of heat and recovery storage, atomic trial
+rollback/acceptance, electrical-only conservation and gauge invariance,
+and invalid structural schemas. It proves representability, not actual VDMOS linkage.
 The independent VDMOS solver branch owns that model-specific integration:
 https://github.com/codeandsolder/ngspice-rs-fast/pull/191 .
 

@@ -747,6 +747,7 @@ struct ElectrothermalKernel;
 
 #[derive(Debug)]
 struct ElectrothermalPrepared {
+    ambient_kelvin: Real,
     g: Real,
     temperature_coefficient: Real,
     c: Real,
@@ -760,13 +761,19 @@ struct ElectrothermalPrepared {
 impl Kernel for ElectrothermalKernel {
     type Prepared = ElectrothermalPrepared;
 
-    fn prepare(&self, parameters: &[Real], _temperature: Real) -> SpiceResult<Self::Prepared> {
+    fn prepare(
+        &self,
+        parameters: &[Real],
+        temperature_kelvin: Real,
+    ) -> SpiceResult<Self::Prepared> {
         let [g, k, c, coupling, gth, cth, gq, tau] = parameters else {
             return Err(SpiceError::circuit(
                 "electrothermal artifact requires eight parameter slots",
             ));
         };
-        if parameters.iter().any(|value| !value.is_finite())
+        if !temperature_kelvin.is_finite()
+            || temperature_kelvin <= 0.
+            || parameters.iter().any(|value| !value.is_finite())
             || *g <= 0.
             || *c < 0.
             || *gth <= 0.
@@ -779,6 +786,7 @@ impl Kernel for ElectrothermalKernel {
             ));
         }
         Ok(ElectrothermalPrepared {
+            ambient_kelvin: temperature_kelvin,
             g: *g,
             temperature_coefficient: *k,
             c: *c,
@@ -800,7 +808,9 @@ impl Kernel for ElectrothermalKernel {
             return Err(SpiceError::circuit("electrothermal input shape"));
         };
         let v = positive - negative;
-        let g = prepared.g * (1. + prepared.temperature_coefficient * thermal);
+        let g = prepared.g
+            * (1.
+                + prepared.temperature_coefficient * (prepared.ambient_kelvin - 300.15 + thermal));
         if g <= 0. {
             return Err(SpiceError::circuit(
                 "negative physical electrothermal conductivity",
@@ -909,7 +919,7 @@ fn prepared_kernel_supports_thermal_and_internal_dae_rows_without_electrical_uni
     use ngspice_rs::devices::prepared_model::PointBuffer;
     let descriptor = electrothermal_descriptor();
     let kernel = ElectrothermalKernel;
-    let prepared = kernel.prepare(&ELECTROTHERMAL_PARAMETERS, 27.).unwrap();
+    let prepared = kernel.prepare(&ELECTROTHERMAL_PARAMETERS, 300.15).unwrap();
     let bias = [0.6, -0.2, 5., 0.1];
     let mut output = PointBuffer::new(4).unwrap();
     output.reset(Capability::Computed);
@@ -1057,6 +1067,17 @@ fn prepared_electrothermal_recovery_equations_stamp_into_real_mna_rows() {
 
 #[test]
 fn prepared_equation_names_and_electrical_domain_are_structural_schema() {
+    let model = Artifact::new(electrothermal_descriptor(), ElectrothermalKernel).unwrap();
+    assert!(
+        model
+            .instance(
+                "bad",
+                vec![NodeId::GROUND; 4],
+                &ELECTROTHERMAL_PARAMETERS,
+                -273.15
+            )
+            .is_err()
+    );
     let mut descriptor = electrothermal_descriptor();
     descriptor.equations[2].name = "p".into();
     assert!(Artifact::new(descriptor.clone(), ElectrothermalKernel).is_err());

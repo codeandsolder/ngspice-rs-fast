@@ -20,6 +20,8 @@ use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
 /// The distinguished version of the native prepared-model contract.
 pub const ABI_VERSION: u32 = 2;
 
+const CELSIUS_TO_KELVIN: Real = 273.15;
+
 /// Physical support must be explicit: unavailable is different from known-zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability {
@@ -154,11 +156,11 @@ pub trait Kernel: Debug + Send + Sync + 'static {
     /// Immutable model/instance-specific derived data.
     type Prepared: Debug + Send + Sync + 'static;
 
-    /// Derive immutable temperature, geometry and model constants.
+    /// Derive immutable geometry and physical constants at absolute Kelvin.
     ///
     /// # Errors
     /// Invalid physical parameter domains or unsupported model features.
-    fn prepare(&self, values: &[Real], temperature: Real) -> SpiceResult<Self::Prepared>;
+    fn prepare(&self, values: &[Real], temperature_kelvin: Real) -> SpiceResult<Self::Prepared>;
 
     /// Evaluate a point using only borrowed buffers.
     ///
@@ -319,13 +321,13 @@ impl Point<'_> {
 /// Reusable point buffers, created at instance preparation, never per trial.
 #[derive(Debug)]
 pub struct PointBuffer {
-    /// Current for every terminal.
+    /// Static residual for every bound equation.
     pub current: Vec<Real>,
-    /// Terminal-by-terminal conductance matrix.
+    /// Static Jacobian dF/dx for every pair of equation and coordinate.
     pub conductance: Vec<Real>,
-    /// Charge for every terminal.
+    /// Generalized stored quantity per equation row.
     pub charge: Vec<Real>,
-    /// Terminal-by-terminal dynamic Jacobian.
+    /// Storage derivative matrix dQ/dx.
     pub capacitance: Vec<Real>,
 }
 
@@ -396,34 +398,40 @@ impl<K: Kernel> Artifact<K> {
         Ok(Arc::new(Self { descriptor, kernel }))
     }
 
-    /// Build a prepared, topology-stable native device.
+    /// Build a prepared, topology-stable native device using the engine's
+    /// Celsius temperature, converted to Kelvin for the physical kernel.
     ///
     /// # Errors
-    /// Invalid terminal count, instance parameters or derived constants.
+    /// Invalid equation shape, scalar parameters or absolute temperature.
     pub fn instance(
         self: &Arc<Self>,
         name: impl Into<String>,
         terminals: Vec<NodeId>,
         values: &[Real],
-        temperature: Real,
+        temperature_celsius: Real,
     ) -> SpiceResult<PreparedDevice<K>> {
         if terminals.len() != self.descriptor.equations.len()
             || values.len() != self.descriptor.parameters.len()
-            || !temperature.is_finite()
+            || !temperature_celsius.is_finite()
+            || temperature_celsius <= -CELSIUS_TO_KELVIN
             || values.iter().any(|value| !value.is_finite())
         {
             return Err(SpiceError::circuit(
                 "prepared model instance shape or values mismatch",
             ));
         }
-        let prepared = self.kernel.prepare(values, temperature)?;
+        let temperature_kelvin = temperature_celsius + CELSIUS_TO_KELVIN;
+        if !temperature_kelvin.is_finite() || temperature_kelvin <= 0. {
+            return Err(SpiceError::circuit("invalid absolute prepared temperature"));
+        }
+        let prepared = self.kernel.prepare(values, temperature_kelvin)?;
         let width = terminals.len();
         Ok(PreparedDevice {
             name: name.into(),
             terminals: terminals.into(),
             artifact: Arc::clone(self),
             values: values.into(),
-            temperature,
+            temperature: temperature_celsius,
             prepared,
             voltage: RefCell::new(vec![0.; width]),
             output: RefCell::new(PointBuffer::new(width)?),
