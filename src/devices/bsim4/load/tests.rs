@@ -223,3 +223,194 @@ fn load_event_sequence_and_field_values() {
         );
     }
 }
+
+/// Independent constitutive-law test: no Newton solve, device limiting,
+/// companion integration, or external source-current subtraction.
+struct PhysicalFixture {
+    model: Model,
+    instance: Instance,
+    size: super::SizeParam,
+}
+
+struct PhysicalPoint {
+    current: f64,
+    current_gradient: [f64; 4],
+    charge: [f64; 4],
+    capacitance: [[f64; 4]; 4],
+}
+
+impl PhysicalFixture {
+    fn new(polarity: i32, cap: i32, cv: i32, partition: f64) -> Self {
+        let model = Model {
+            r#type: polarity,
+            typeGiven: true,
+            capMod: cap,
+            capModGiven: true,
+            cvchargeMod: cv,
+            cvchargeModGiven: true,
+            xpart: partition,
+            xpartGiven: true,
+            ..Model::default()
+        };
+        let instance = Instance {
+            l: 0.5e-6,
+            lGiven: true,
+            w: 2e-6,
+            wGiven: true,
+            ..super::super::acld::tests::shaped(0, 0, 0)
+        };
+        let set::PreparedSetup {
+            mut model,
+            mut instance,
+            mut warnings,
+            ..
+        } = set::prepare_model(model, 300.15).prepare_instance(instance, false);
+        let size = temp::temperature(
+            &mut model,
+            &mut instance,
+            300.15,
+            "nch",
+            "m1",
+            &mut warnings,
+        )
+        .unwrap();
+        Self {
+            model,
+            instance,
+            size,
+        }
+    }
+
+    /// Physical terminal order: G, D, S, B.
+    fn evaluate(&self, [g, d, s, b]: [f64; 4]) -> PhysicalPoint {
+        let mut instance = self.instance.clone();
+        let mut trace = Trace {
+            mode: mode::MODEDCTRANCURVE | mode::MODEINITFLOAT,
+            limiting: false,
+            voltage: [d, g, s, b, d, g, g, s, b, b, b, 0.],
+            s0: [0.; state::COUNT],
+            s1: [0.; state::COUNT],
+            s2: [0.; state::COUNT],
+            order: 0,
+            values: 0,
+            events: 0,
+        };
+        let bias = super::bias::select(&self.model, &instance, &mut trace);
+        let electro =
+            super::channel::electrostatics(&self.model, &mut instance, &self.size, &trace, &bias);
+        let transport =
+            super::channel::transport(&self.model, &mut instance, &self.size, &bias, &electro);
+        let _ = super::charge::intrinsic(
+            &self.model,
+            &mut instance,
+            &self.size,
+            &mut trace,
+            &bias,
+            &electro,
+            &transport,
+        )
+        .unwrap();
+        let mode = f64::from(instance.mode);
+        let pol = f64::from(self.model.r#type);
+        let gm = instance.gm;
+        let gd = instance.gds;
+        let gb = instance.gmbs;
+        let mut gradient = [gm, gd, -(gm + gd + gb), gb];
+        let mut q = [instance.qgate, instance.qdrn, instance.qsrc, instance.qbulk];
+        let mut c = [
+            [instance.cggb, instance.cgdb, instance.cgsb, instance.cgbb],
+            [instance.cdgb, instance.cddb, instance.cdsb, instance.cdbb],
+            [instance.csgb, instance.csdb, instance.cssb, instance.csbb],
+            [instance.cbgb, instance.cbdb, instance.cbsb, instance.cbbb],
+        ];
+        if instance.mode < 0 {
+            gradient.swap(1, 2);
+            q.swap(1, 2);
+            c.swap(1, 2);
+            for row in &mut c {
+                row.swap(1, 2);
+            }
+        }
+        PhysicalPoint {
+            current: pol * mode * transport.unscaled_drain_current,
+            current_gradient: gradient.map(|x| mode * x),
+            charge: q.map(|x| pol * x),
+            capacitance: c,
+        }
+    }
+}
+
+fn richardson(mut f: impl FnMut(f64) -> f64, h: f64) -> (f64, f64) {
+    let coarse = (f(h) - f(-h)) / (2. * h);
+    let fine = (f(h * 0.5) - f(-h * 0.5)) / h;
+    ((4. * fine - coarse) / 3., (fine - coarse).abs())
+}
+
+#[test]
+fn physical_channel_and_charge_partials_against_richardson() {
+    for polarity in [-1, 1] {
+        for cap in 0..=2 {
+            for cv in 0..=1 {
+                for partition in [0., 0.5, 1.] {
+                    let fixture = PhysicalFixture::new(polarity, cap, cv, partition);
+                    for normalized in [
+                        [0.1, 0.05, 0., -0.1],
+                        [0.7, 0.02, 0., -0.2],
+                        [0.9, 0.4, 0., -0.1],
+                        [1.2, 1.0, 0., -0.4],
+                        [0.9, -0.2, 0., -0.5],
+                    ] {
+                        let v = normalized.map(|x| x * f64::from(polarity));
+                        let p = fixture.evaluate(v);
+                        let context = format!(
+                            "pol={polarity} cap={cap} cv={cv} xpart={partition} bias={normalized:?}"
+                        );
+                        let q_scale = p.charge.iter().map(|x| x.abs()).fold(0., f64::max);
+                        assert!(
+                            p.charge.iter().sum::<f64>().abs() <= q_scale * 8. * f64::EPSILON,
+                            "{context}: charge KCL"
+                        );
+                        for row in &p.capacitance {
+                            let scale = row.iter().map(|x| x.abs()).sum::<f64>();
+                            assert!(
+                                row.iter().sum::<f64>().abs() <= scale * 8. * f64::EPSILON,
+                                "{context}: common mode"
+                            );
+                        }
+                        for col in 0..4 {
+                            let column = p.capacitance.map(|row| row[col]);
+                            let scale = column.iter().map(|x| x.abs()).sum::<f64>();
+                            assert!(
+                                column.iter().sum::<f64>().abs() <= scale * 8. * f64::EPSILON,
+                                "{context}: charge Jacobian KCL"
+                            );
+                            let sample = |delta| {
+                                let mut shifted = v;
+                                shifted[col] += delta;
+                                fixture.evaluate(shifted)
+                            };
+                            let (reference, error) =
+                                richardson(|delta| sample(delta).current, 1e-4);
+                            let actual = p.current_gradient[col];
+                            assert!(
+                                (actual - reference).abs()
+                                    <= 3e-5 * reference.abs() + error * 0.1 + 1e-13,
+                                "{context}: current col {col}: {actual:e} vs {reference:e}, truncation {error:e}"
+                            );
+                            for row in 0..4 {
+                                let (reference, error) =
+                                    richardson(|delta| sample(delta).charge[row], 1e-4);
+                                let actual = p.capacitance[row][col];
+                                assert!(
+                                    (actual - reference).abs()
+                                        <= 3e-5 * reference.abs() + error * 0.1 + 1e-21,
+                                    "{context}: charge row {row} col {col}: {actual:e} vs {reference:e}, truncation {error:e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
