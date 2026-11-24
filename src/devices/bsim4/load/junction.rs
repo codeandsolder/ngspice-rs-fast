@@ -1,34 +1,8 @@
 //! Junction diode conduction/reverse tunneling and depletion charge stages.
 //! Ownership: BSIM4 load inventory fields cbs/cbd/gbs/gbd and capbs/capbd;
 //! charge also writes QBS/QBD (no integration here).
-#![expect(non_snake_case, reason = "use upstream C equation symbols")]
-#![expect(
-    clippy::similar_names,
-    reason = "source/drain terms retain reference naming"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "non-fused C floating-point operation order"
-)]
-#![expect(
-    clippy::too_many_lines,
-    reason = "preserve C diode branches and depletion equation sequence"
-)]
-#![expect(
-    clippy::cognitive_complexity,
-    reason = "preserve C diode and charge branch structure"
-)]
-#![expect(
-    clippy::float_cmp,
-    reason = "preserve exact C junction branch predicates"
-)]
-#![expect(
-    unused_assignments,
-    reason = "preserve C intermediate assignment order"
-)]
-use super::{
-    DEXP, EXP_THRESHOLD, Instance, LoadCkt, MIN_EXP, Model, SizeParam, exp, log, sqrt, state,
-};
+use super::{DEXP, EXP_THRESHOLD, Instance, LoadCkt, MIN_EXP, Model, SizeParam, state};
+use crate::devices::nonlinear::{exponential_junction_at_argument, reverse_depletion};
 
 /// Body-source and body-drain voltage, selecting bulk-resistance internal
 /// nodes when present. Both are already polarity-normalized and limited.
@@ -38,454 +12,435 @@ pub(super) struct JunctionBias {
     pub(super) drain: f64,
 }
 
-/// Evaluate the four load-owned junction conduction members, in C order.
+/// Temperature-prepared diode quantities for one physical junction.
+/// The drain/source selection occurs once, not inside the constitutive law.
+#[derive(Clone, Copy)]
+struct JunctionDiode {
+    saturation: f64,
+    thermal: f64,
+    breakdown_voltage: f64,
+    breakdown_coefficient: f64,
+    breakdown_at_zero: f64,
+    forward_voltage: f64,
+    forward_current: f64,
+    forward_slope: f64,
+    reverse_voltage: f64,
+    reverse_current: f64,
+    reverse_slope: f64,
+}
+
+impl JunctionDiode {
+    /// The change of the reverse breakdown exponential from equilibrium.
+    /// In the same unclipped branch, factor the zero-bias exponential
+    /// and use expm1; never cancel across an exponential clamp.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "subtract the same rounded breakdown product prepared at zero bias, so the clipped branch remains exactly zero at equilibrium"
+    )]
+    fn breakdown_difference(
+        self,
+        argument: f64,
+        reverse_argument: f64,
+        reverse_exp: f64,
+        clipped: bool,
+    ) -> f64 {
+        if argument.abs() < 0.5
+            && self.thermal > 0.
+            && self.thermal.is_finite()
+            && self.breakdown_coefficient.is_finite()
+            && self.breakdown_voltage / self.thermal <= EXP_THRESHOLD
+            && !clipped
+            && reverse_argument.is_finite()
+            && self.breakdown_at_zero.is_finite()
+        {
+            -self.breakdown_at_zero * (-argument).exp_m1()
+        } else {
+            self.breakdown_at_zero - self.breakdown_coefficient * reverse_exp
+        }
+    }
+
+    /// C diode modes select distinct forward and reverse continuations.
+    /// Return current/conductance without merging the leakage or gmin laws.
+    fn evaluate(self, selector: i32, voltage: f64, gmin: f64) -> Option<(f64, f64)> {
+        if self.saturation <= 0. {
+            return Some((gmin * voltage, gmin));
+        }
+        let argument = voltage / self.thermal;
+        let (current, slope) = match selector {
+            0 => {
+                let reverse_argument = (self.breakdown_voltage + voltage) / self.thermal;
+                let reverse = (-reverse_argument).exp();
+                let (forward, forward_slope) =
+                    exponential_junction_at_argument(argument, self.thermal, self.saturation);
+                let difference =
+                    self.breakdown_difference(argument, reverse_argument, reverse, false);
+                (
+                    self.saturation.mul_add(difference, forward),
+                    self.saturation.mul_add(
+                        self.breakdown_coefficient * reverse / self.thermal,
+                        forward_slope,
+                    ),
+                )
+            }
+            1 => {
+                if argument < -EXP_THRESHOLD {
+                    (self.saturation * (MIN_EXP - 1.), 0.)
+                } else if voltage <= self.forward_voltage {
+                    exponential_junction_at_argument(argument, self.thermal, self.saturation)
+                } else {
+                    let slope = self.forward_current / self.thermal;
+                    let edge_argument = self.forward_voltage / self.thermal;
+                    let edge = if edge_argument.abs() < 0.5 {
+                        self.saturation * edge_argument.exp_m1()
+                    } else {
+                        self.forward_current - self.saturation
+                    };
+                    (slope.mul_add(voltage - self.forward_voltage, edge), slope)
+                }
+            }
+            2 => {
+                if voltage < self.reverse_voltage {
+                    let (difference, derivative) = limited_forward(argument, self.thermal);
+                    let edge = self
+                        .reverse_slope
+                        .mul_add(voltage - self.reverse_voltage, self.reverse_current);
+                    (
+                        difference * edge,
+                        derivative.mul_add(edge, difference * self.reverse_slope),
+                    )
+                } else if voltage <= self.forward_voltage {
+                    let (difference, derivative) = limited_forward(argument, self.thermal);
+                    let reverse_argument = (self.breakdown_voltage + voltage) / self.thermal;
+                    let clipped = reverse_argument > EXP_THRESHOLD;
+                    let (reverse, reverse_slope) = if clipped {
+                        (MIN_EXP, 0.)
+                    } else {
+                        let exponential = (-reverse_argument).exp();
+                        (exponential, exponential / self.thermal)
+                    };
+                    let reverse_difference =
+                        self.breakdown_difference(argument, reverse_argument, reverse, clipped);
+                    (
+                        self.saturation * (difference + reverse_difference),
+                        self.saturation
+                            * self
+                                .breakdown_coefficient
+                                .mul_add(reverse_slope, derivative),
+                    )
+                } else {
+                    (
+                        self.forward_slope
+                            .mul_add(voltage - self.forward_voltage, self.forward_current),
+                        self.forward_slope,
+                    )
+                }
+            }
+            _ => return None,
+        };
+        Some((gmin.mul_add(voltage, current), slope + gmin))
+    }
+}
+
+fn limited_forward(argument: f64, thermal: f64) -> (f64, f64) {
+    if argument < -EXP_THRESHOLD {
+        (MIN_EXP - 1., 0.)
+    } else if argument.abs() < 0.5 {
+        let difference = argument.exp_m1();
+        (difference, (1. + difference) / thermal)
+    } else {
+        let exponential = argument.exp();
+        (exponential - 1., exponential / thermal)
+    }
+}
+
+/// One trap-assisted tunnelling law, shared by area, sidewall and
+/// gate-sidewall terms on both physical junctions. C stores the negative
+/// of its exponent derivative because the tunnelling current is subtracted.
+fn reverse_tunneling(voltage: f64, thermal: f64, threshold: f64) -> (f64, f64) {
+    let distance = threshold - voltage;
+    let (argument, derivative) = if distance < threshold * 1e-3 {
+        (-voltage / thermal * 1e3, 1e3 / thermal)
+    } else {
+        let reciprocal = 1. / distance;
+        let derivative = if threshold > 0.
+            && thermal > 0.
+            && threshold.is_finite()
+            && thermal.is_finite()
+            && voltage.is_finite()
+        {
+            let factor = threshold / distance;
+            factor * (factor / thermal)
+        } else {
+            // Keep the reference nonphysical argument propagation.
+            threshold / thermal * (voltage * reciprocal).mul_add(reciprocal, reciprocal)
+        };
+        (-voltage / thermal * threshold * reciprocal, derivative)
+    };
+    let (exponential, slope) = DEXP(argument);
+    let difference = if argument.abs() < 0.5 {
+        argument.exp_m1()
+    } else {
+        exponential - 1.
+    };
+    (difference, slope * derivative)
+}
+
+/// Evaluate the four load-owned junction conduction members.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "ordered saturation-current geometry products must match temperature preparation of the limiting continuations"
+)]
 pub(super) fn current(
     model: &Model,
     here: &mut Instance,
-    pParam: &SizeParam,
+    size: &SizeParam,
     ckt: &dyn LoadCkt,
     bias: JunctionBias,
 ) {
-    let JunctionBias {
-        source: vbs_jct,
-        drain: vbd_jct,
-    } = bias;
-    let mut SourceSatCurrent: f64 = 0.0;
-    let mut DrainSatCurrent: f64 = 0.0;
-    let mut evbd: f64 = 0.0;
-    let mut evbs: f64 = 0.0;
-    let mut Nvtms: f64 = 0.0;
-    let mut Nvtmd: f64 = 0.0;
-    let mut T0: f64 = 0.0;
-    let mut dT0_dVb: f64 = 0.0;
-    let mut T1: f64 = 0.0;
-    let mut dT1_dVb: f64 = 0.0;
-    let mut T2: f64 = 0.0;
-    let mut dT2_dVb: f64 = 0.0;
-    let mut T3: f64 = 0.0;
-    let mut dT3_dVb: f64 = 0.0;
-    let mut T4: f64 = 0.0;
-    let mut dT4_dVb: f64 = 0.0;
-    let mut T5: f64 = 0.0;
-    let mut dT5_dVb: f64 = 0.0;
-    let mut T6: f64 = 0.0;
-    let mut dT6_dVb: f64 = 0.0;
-    let mut T9: f64 = 0.0;
-    let mut T10: f64 = 0.0;
-    let mut devbs_dvb: f64 = 0.0;
-    let mut devbd_dvb: f64 = 0.0;
-    let mut Nvtmrss: f64 = 0.0;
-    let mut Nvtmrssws: f64 = 0.0;
-    let mut Nvtmrsswgs: f64 = 0.0;
-    let mut Nvtmrsd: f64 = 0.0;
-    let mut Nvtmrsswd: f64 = 0.0;
-    let mut Nvtmrsswgd: f64 = 0.0;
-    Nvtms = model.vtm * model.SjctEmissionCoeff;
-    if (here.Aseff <= 0.0) && (here.Pseff <= 0.0) {
-        SourceSatCurrent = 0.0;
+    let gate_perimeter = size.weffCJ * here.nf;
+    let source_saturation = if here.Aseff <= 0. && here.Pseff <= 0. {
+        0.
     } else {
-        SourceSatCurrent = here.Aseff * model.SjctTempSatCurDensity
+        here.Aseff * model.SjctTempSatCurDensity
             + here.Pseff * model.SjctSidewallTempSatCurDensity
-            + pParam.weffCJ * here.nf * model.SjctGateSidewallTempSatCurDensity;
-    }
-    if SourceSatCurrent <= 0.0 {
-        here.gbs = ckt.gmin();
-        here.cbs = here.gbs * vbs_jct;
+            + gate_perimeter * model.SjctGateSidewallTempSatCurDensity
+    };
+    let drain_saturation = if here.Adeff <= 0. && here.Pdeff <= 0. {
+        0.
     } else {
-        match model.dioMod {
-            0 => {
-                evbs = exp(vbs_jct / Nvtms);
-                T1 = model.xjbvs * exp(-(model.bvs + vbs_jct) / Nvtms);
-                here.gbs = SourceSatCurrent * (evbs + T1) / Nvtms + ckt.gmin();
-                here.cbs =
-                    SourceSatCurrent * (evbs + here.XExpBVS - T1 - 1.0) + ckt.gmin() * vbs_jct;
-            }
-            1 => {
-                T2 = vbs_jct / Nvtms;
-                if T2 < -EXP_THRESHOLD {
-                    here.gbs = ckt.gmin();
-                    here.cbs = SourceSatCurrent * (MIN_EXP - 1.0) + ckt.gmin() * vbs_jct;
-                } else if vbs_jct <= here.vjsmFwd {
-                    evbs = exp(T2);
-                    here.gbs = SourceSatCurrent * evbs / Nvtms + ckt.gmin();
-                    here.cbs = SourceSatCurrent * (evbs - 1.0) + ckt.gmin() * vbs_jct;
-                } else {
-                    T0 = here.IVjsmFwd / Nvtms;
-                    here.gbs = T0 + ckt.gmin();
-                    here.cbs = here.IVjsmFwd - SourceSatCurrent
-                        + T0 * (vbs_jct - here.vjsmFwd)
-                        + ckt.gmin() * vbs_jct;
-                }
-            }
-            2 => {
-                if vbs_jct < here.vjsmRev {
-                    T0 = vbs_jct / Nvtms;
-                    if T0 < -EXP_THRESHOLD {
-                        evbs = MIN_EXP;
-                        devbs_dvb = 0.0;
-                    } else {
-                        evbs = exp(T0);
-                        devbs_dvb = evbs / Nvtms;
-                    }
-                    T1 = evbs - 1.0;
-                    T2 = here.IVjsmRev + here.SslpRev * (vbs_jct - here.vjsmRev);
-                    here.gbs = devbs_dvb * T2 + T1 * here.SslpRev + ckt.gmin();
-                    here.cbs = T1 * T2 + ckt.gmin() * vbs_jct;
-                } else if vbs_jct <= here.vjsmFwd {
-                    T0 = vbs_jct / Nvtms;
-                    if T0 < -EXP_THRESHOLD {
-                        evbs = MIN_EXP;
-                        devbs_dvb = 0.0;
-                    } else {
-                        evbs = exp(T0);
-                        devbs_dvb = evbs / Nvtms;
-                    }
-                    T1 = (model.bvs + vbs_jct) / Nvtms;
-                    if T1 > EXP_THRESHOLD {
-                        T2 = MIN_EXP;
-                        T3 = 0.0;
-                    } else {
-                        T2 = exp(-T1);
-                        T3 = -T2 / Nvtms;
-                    }
-                    here.gbs = SourceSatCurrent * (devbs_dvb - model.xjbvs * T3) + ckt.gmin();
-                    here.cbs = SourceSatCurrent * (evbs + here.XExpBVS - 1.0 - model.xjbvs * T2)
-                        + ckt.gmin() * vbs_jct;
-                } else {
-                    here.gbs = here.SslpFwd + ckt.gmin();
-                    here.cbs = here.IVjsmFwd
-                        + here.SslpFwd * (vbs_jct - here.vjsmFwd)
-                        + ckt.gmin() * vbs_jct;
-                }
-            }
-            _ => {}
-        }
-    }
-    Nvtmd = model.vtm * model.DjctEmissionCoeff;
-    if (here.Adeff <= 0.0) && (here.Pdeff <= 0.0) {
-        DrainSatCurrent = 0.0;
-    } else {
-        DrainSatCurrent = here.Adeff * model.DjctTempSatCurDensity
+        here.Adeff * model.DjctTempSatCurDensity
             + here.Pdeff * model.DjctSidewallTempSatCurDensity
-            + pParam.weffCJ * here.nf * model.DjctGateSidewallTempSatCurDensity;
+            + gate_perimeter * model.DjctGateSidewallTempSatCurDensity
+    };
+    let source = JunctionDiode {
+        saturation: source_saturation,
+        thermal: model.vtm * model.SjctEmissionCoeff,
+        breakdown_voltage: model.bvs,
+        breakdown_coefficient: model.xjbvs,
+        breakdown_at_zero: here.XExpBVS,
+        forward_voltage: here.vjsmFwd,
+        forward_current: here.IVjsmFwd,
+        forward_slope: here.SslpFwd,
+        reverse_voltage: here.vjsmRev,
+        reverse_current: here.IVjsmRev,
+        reverse_slope: here.SslpRev,
+    };
+    let drain = JunctionDiode {
+        saturation: drain_saturation,
+        thermal: model.vtm * model.DjctEmissionCoeff,
+        breakdown_voltage: model.bvd,
+        breakdown_coefficient: model.xjbvd,
+        breakdown_at_zero: here.XExpBVD,
+        forward_voltage: here.vjdmFwd,
+        forward_current: here.IVjdmFwd,
+        forward_slope: here.DslpFwd,
+        reverse_voltage: here.vjdmRev,
+        reverse_current: here.IVjdmRev,
+        reverse_slope: here.DslpRev,
+    };
+    if let Some((current, slope)) = source.evaluate(model.dioMod, bias.source, ckt.gmin()) {
+        here.cbs = current;
+        here.gbs = slope;
     }
-    if DrainSatCurrent <= 0.0 {
-        here.gbd = ckt.gmin();
-        here.cbd = here.gbd * vbd_jct;
-    } else {
-        match model.dioMod {
-            0 => {
-                evbd = exp(vbd_jct / Nvtmd);
-                T1 = model.xjbvd * exp(-(model.bvd + vbd_jct) / Nvtmd);
-                here.gbd = DrainSatCurrent * (evbd + T1) / Nvtmd + ckt.gmin();
-                here.cbd =
-                    DrainSatCurrent * (evbd + here.XExpBVD - T1 - 1.0) + ckt.gmin() * vbd_jct;
-            }
-            1 => {
-                T2 = vbd_jct / Nvtmd;
-                if T2 < -EXP_THRESHOLD {
-                    here.gbd = ckt.gmin();
-                    here.cbd = DrainSatCurrent * (MIN_EXP - 1.0) + ckt.gmin() * vbd_jct;
-                } else if vbd_jct <= here.vjdmFwd {
-                    evbd = exp(T2);
-                    here.gbd = DrainSatCurrent * evbd / Nvtmd + ckt.gmin();
-                    here.cbd = DrainSatCurrent * (evbd - 1.0) + ckt.gmin() * vbd_jct;
+    if let Some((current, slope)) = drain.evaluate(model.dioMod, bias.drain, ckt.gmin()) {
+        here.cbd = current;
+        here.gbd = slope;
+    }
+    let source_tunnels = [
+        (here.SjctTempRevSatCur, model.njtsstemp, model.vtss),
+        (here.SswTempRevSatCur, model.njtsswstemp, model.vtssws),
+        (here.SswgTempRevSatCur, model.njtsswgstemp, model.vtsswgs),
+    ];
+    let drain_tunnels = [
+        (here.DjctTempRevSatCur, model.njtsdtemp, model.vtsd),
+        (here.DswTempRevSatCur, model.njtsswdtemp, model.vtsswd),
+        (here.DswgTempRevSatCur, model.njtsswgdtemp, model.vtsswgd),
+    ];
+    for (voltage, terms, current, slope) in [
+        (bias.source, source_tunnels, &mut here.cbs, &mut here.gbs),
+        (bias.drain, drain_tunnels, &mut here.cbd, &mut here.gbd),
+    ] {
+        let [
+            (area, area_slope),
+            (sidewall, sidewall_slope),
+            (gate, gate_slope),
+        ] = terms.map(|(density, emission, threshold)| {
+            let (difference, derivative) =
+                reverse_tunneling(voltage, model.vtm0 * emission, threshold);
+            (density * difference, density * derivative)
+        });
+        *current -= area + sidewall + gate;
+        *slope += area_slope + sidewall_slope + gate_slope;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct JunctionCapacitance {
+    zero: f64,
+    potential: f64,
+    grading: f64,
+}
+
+/// The reverse integral shares the diode/BJT depletion law. The forward
+/// BSIM4 continuation is its quadratic Taylor polynomial at zero bias.
+/// State writes remain in the reference bottom/sidewall/gate order.
+fn depletion(
+    voltage: f64,
+    parts: [JunctionCapacitance; 3],
+    slot: usize,
+    ckt: &mut dyn LoadCkt,
+) -> f64 {
+    let [bottom, side, gate] = parts;
+    if voltage == 0. {
+        ckt.set_state0(slot, 0.);
+        bottom.zero + side.zero + gate.zero
+    } else if voltage < 0. {
+        let mut capacitance = 0.;
+        for (index, part) in parts.into_iter().enumerate() {
+            if part.zero > 0. {
+                let (charge, cap) =
+                    reverse_depletion(voltage, part.zero, part.potential, part.grading);
+                if index == 0 {
+                    ckt.set_state0(slot, charge);
+                    capacitance = cap;
                 } else {
-                    T0 = here.IVjdmFwd / Nvtmd;
-                    here.gbd = T0 + ckt.gmin();
-                    here.cbd = here.IVjdmFwd - DrainSatCurrent
-                        + T0 * (vbd_jct - here.vjdmFwd)
-                        + ckt.gmin() * vbd_jct;
+                    ckt.set_state0(slot, ckt.state0(slot) + charge);
+                    capacitance += cap;
                 }
+            } else if index == 0 {
+                ckt.set_state0(slot, 0.);
             }
-            2 => {
-                if vbd_jct < here.vjdmRev {
-                    T0 = vbd_jct / Nvtmd;
-                    if T0 < -EXP_THRESHOLD {
-                        evbd = MIN_EXP;
-                        devbd_dvb = 0.0;
-                    } else {
-                        evbd = exp(T0);
-                        devbd_dvb = evbd / Nvtmd;
-                    }
-                    T1 = evbd - 1.0;
-                    T2 = here.IVjdmRev + here.DslpRev * (vbd_jct - here.vjdmRev);
-                    here.gbd = devbd_dvb * T2 + T1 * here.DslpRev + ckt.gmin();
-                    here.cbd = T1 * T2 + ckt.gmin() * vbd_jct;
-                } else if vbd_jct <= here.vjdmFwd {
-                    T0 = vbd_jct / Nvtmd;
-                    if T0 < -EXP_THRESHOLD {
-                        evbd = MIN_EXP;
-                        devbd_dvb = 0.0;
-                    } else {
-                        evbd = exp(T0);
-                        devbd_dvb = evbd / Nvtmd;
-                    }
-                    T1 = (model.bvd + vbd_jct) / Nvtmd;
-                    if T1 > EXP_THRESHOLD {
-                        T2 = MIN_EXP;
-                        T3 = 0.0;
-                    } else {
-                        T2 = exp(-T1);
-                        T3 = -T2 / Nvtmd;
-                    }
-                    here.gbd = DrainSatCurrent * (devbd_dvb - model.xjbvd * T3) + ckt.gmin();
-                    here.cbd = DrainSatCurrent * (evbd + here.XExpBVD - 1.0 - model.xjbvd * T2)
-                        + ckt.gmin() * vbd_jct;
-                } else {
-                    here.gbd = here.DslpFwd + ckt.gmin();
-                    here.cbd = here.IVjdmFwd
-                        + here.DslpFwd * (vbd_jct - here.vjdmFwd)
-                        + ckt.gmin() * vbd_jct;
-                }
-            }
-            _ => {}
         }
-    }
-    Nvtmrssws = model.vtm0 * model.njtsswstemp;
-    Nvtmrsswgs = model.vtm0 * model.njtsswgstemp;
-    Nvtmrss = model.vtm0 * model.njtsstemp;
-    Nvtmrsswd = model.vtm0 * model.njtsswdtemp;
-    Nvtmrsswgd = model.vtm0 * model.njtsswgdtemp;
-    Nvtmrsd = model.vtm0 * model.njtsdtemp;
-    if (model.vtss - vbs_jct) < (model.vtss * 1e-3) {
-        T9 = 1.0e3;
-        T0 = -vbs_jct / Nvtmrss * T9;
-        (T1, T10) = DEXP(T0);
-        dT1_dVb = T10 / Nvtmrss * T9;
+        capacitance
     } else {
-        T9 = 1.0 / (model.vtss - vbs_jct);
-        T0 = -vbs_jct / Nvtmrss * model.vtss * T9;
-        dT0_dVb = model.vtss / Nvtmrss * (T9 + vbs_jct * T9 * T9);
-        (T1, T10) = DEXP(T0);
-        dT1_dVb = T10 * dT0_dVb;
+        let cap0 = bottom.zero + side.zero + gate.zero;
+        let increment = voltage
+            * (bottom.zero * bottom.grading / bottom.potential
+                + side.zero * side.grading / side.potential
+                + gate.zero * gate.grading / gate.potential);
+        ckt.set_state0(slot, voltage * 0.5_f64.mul_add(increment, cap0));
+        cap0 + increment
     }
-    if (model.vtsd - vbd_jct) < (model.vtsd * 1e-3) {
-        T9 = 1.0e3;
-        T0 = -vbd_jct / Nvtmrsd * T9;
-        (T2, T10) = DEXP(T0);
-        dT2_dVb = T10 / Nvtmrsd * T9;
-    } else {
-        T9 = 1.0 / (model.vtsd - vbd_jct);
-        T0 = -vbd_jct / Nvtmrsd * model.vtsd * T9;
-        dT0_dVb = model.vtsd / Nvtmrsd * (T9 + vbd_jct * T9 * T9);
-        (T2, T10) = DEXP(T0);
-        dT2_dVb = T10 * dT0_dVb;
-    }
-    if (model.vtssws - vbs_jct) < (model.vtssws * 1e-3) {
-        T9 = 1.0e3;
-        T0 = -vbs_jct / Nvtmrssws * T9;
-        (T3, T10) = DEXP(T0);
-        dT3_dVb = T10 / Nvtmrssws * T9;
-    } else {
-        T9 = 1.0 / (model.vtssws - vbs_jct);
-        T0 = -vbs_jct / Nvtmrssws * model.vtssws * T9;
-        dT0_dVb = model.vtssws / Nvtmrssws * (T9 + vbs_jct * T9 * T9);
-        (T3, T10) = DEXP(T0);
-        dT3_dVb = T10 * dT0_dVb;
-    }
-    if (model.vtsswd - vbd_jct) < (model.vtsswd * 1e-3) {
-        T9 = 1.0e3;
-        T0 = -vbd_jct / Nvtmrsswd * T9;
-        (T4, T10) = DEXP(T0);
-        dT4_dVb = T10 / Nvtmrsswd * T9;
-    } else {
-        T9 = 1.0 / (model.vtsswd - vbd_jct);
-        T0 = -vbd_jct / Nvtmrsswd * model.vtsswd * T9;
-        dT0_dVb = model.vtsswd / Nvtmrsswd * (T9 + vbd_jct * T9 * T9);
-        (T4, T10) = DEXP(T0);
-        dT4_dVb = T10 * dT0_dVb;
-    }
-    if (model.vtsswgs - vbs_jct) < (model.vtsswgs * 1e-3) {
-        T9 = 1.0e3;
-        T0 = -vbs_jct / Nvtmrsswgs * T9;
-        (T5, T10) = DEXP(T0);
-        dT5_dVb = T10 / Nvtmrsswgs * T9;
-    } else {
-        T9 = 1.0 / (model.vtsswgs - vbs_jct);
-        T0 = -vbs_jct / Nvtmrsswgs * model.vtsswgs * T9;
-        dT0_dVb = model.vtsswgs / Nvtmrsswgs * (T9 + vbs_jct * T9 * T9);
-        (T5, T10) = DEXP(T0);
-        dT5_dVb = T10 * dT0_dVb;
-    }
-    if (model.vtsswgd - vbd_jct) < (model.vtsswgd * 1e-3) {
-        T9 = 1.0e3;
-        T0 = -vbd_jct / Nvtmrsswgd * T9;
-        (T6, T10) = DEXP(T0);
-        dT6_dVb = T10 / Nvtmrsswgd * T9;
-    } else {
-        T9 = 1.0 / (model.vtsswgd - vbd_jct);
-        T0 = -vbd_jct / Nvtmrsswgd * model.vtsswgd * T9;
-        dT0_dVb = model.vtsswgd / Nvtmrsswgd * (T9 + vbd_jct * T9 * T9);
-        (T6, T10) = DEXP(T0);
-        dT6_dVb = T10 * dT0_dVb;
-    }
-    here.gbs += here.SjctTempRevSatCur * dT1_dVb
-        + here.SswTempRevSatCur * dT3_dVb
-        + here.SswgTempRevSatCur * dT5_dVb;
-    here.cbs -= here.SjctTempRevSatCur * (T1 - 1.0)
-        + here.SswTempRevSatCur * (T3 - 1.0)
-        + here.SswgTempRevSatCur * (T5 - 1.0);
-    here.gbd += here.DjctTempRevSatCur * dT2_dVb
-        + here.DswTempRevSatCur * dT4_dVb
-        + here.DswgTempRevSatCur * dT6_dVb;
-    here.cbd -= here.DjctTempRevSatCur * (T2 - 1.0)
-        + here.DswTempRevSatCur * (T4 - 1.0)
-        + here.DswgTempRevSatCur * (T6 - 1.0);
 }
 
 /// Evaluate depletion charge and capacitance (C's finished label).
 pub(super) fn charge(
     model: &Model,
     here: &mut Instance,
-    pParam: &SizeParam,
+    size: &SizeParam,
     ckt: &mut dyn LoadCkt,
     bias: JunctionBias,
 ) {
-    let JunctionBias {
-        source: vbs_jct,
-        drain: vbd_jct,
-    } = bias;
-    let mut czbd: f64 = 0.0;
-    let mut czbdsw: f64 = 0.0;
-    let mut czbdswg: f64 = 0.0;
-    let mut czbs: f64 = 0.0;
-    let mut czbssw: f64 = 0.0;
-    let mut czbsswg: f64 = 0.0;
-    let mut arg: f64 = 0.0;
-    let mut sarg: f64 = 0.0;
-    let mut MJD: f64 = 0.0;
-    let mut MJSWD: f64 = 0.0;
-    let mut MJSWGD: f64 = 0.0;
-    let mut MJS: f64 = 0.0;
-    let mut MJSWS: f64 = 0.0;
-    let mut MJSWGS: f64 = 0.0;
-    let mut T0: f64 = 0.0;
-    let mut T1: f64 = 0.0;
-    czbd = model.DunitAreaTempJctCap * here.Adeff;
-    czbs = model.SunitAreaTempJctCap * here.Aseff;
-    czbdsw = model.DunitLengthSidewallTempJctCap * here.Pdeff;
-    czbdswg = model.DunitLengthGateSidewallTempJctCap * pParam.weffCJ * here.nf;
-    czbssw = model.SunitLengthSidewallTempJctCap * here.Pseff;
-    czbsswg = model.SunitLengthGateSidewallTempJctCap * pParam.weffCJ * here.nf;
-    MJS = model.SbulkJctBotGradingCoeff;
-    MJSWS = model.SbulkJctSideGradingCoeff;
-    MJSWGS = model.SbulkJctGateSideGradingCoeff;
-    MJD = model.DbulkJctBotGradingCoeff;
-    MJSWD = model.DbulkJctSideGradingCoeff;
-    MJSWGD = model.DbulkJctGateSideGradingCoeff;
-    if vbs_jct == 0.0 {
-        ckt.set_state0(state::QBS, 0.0);
-        here.capbs = czbs + czbssw + czbsswg;
-    } else if vbs_jct < 0.0 {
-        if czbs > 0.0 {
-            arg = 1.0 - vbs_jct / model.PhiBS;
-            if MJS == 0.5 {
-                sarg = 1.0 / sqrt(arg);
-            } else {
-                sarg = exp(-MJS * log(arg));
-            }
-            ckt.set_state0(
-                state::QBS,
-                model.PhiBS * czbs * (1.0 - arg * sarg) / (1.0 - MJS),
-            );
-            here.capbs = czbs * sarg;
-        } else {
-            ckt.set_state0(state::QBS, 0.0);
-            here.capbs = 0.0;
+    here.capbs = depletion(
+        bias.source,
+        [
+            JunctionCapacitance {
+                zero: model.SunitAreaTempJctCap * here.Aseff,
+                potential: model.PhiBS,
+                grading: model.SbulkJctBotGradingCoeff,
+            },
+            JunctionCapacitance {
+                zero: model.SunitLengthSidewallTempJctCap * here.Pseff,
+                potential: model.PhiBSWS,
+                grading: model.SbulkJctSideGradingCoeff,
+            },
+            JunctionCapacitance {
+                zero: model.SunitLengthGateSidewallTempJctCap * size.weffCJ * here.nf,
+                potential: model.PhiBSWGS,
+                grading: model.SbulkJctGateSideGradingCoeff,
+            },
+        ],
+        state::QBS,
+        ckt,
+    );
+    here.capbd = depletion(
+        bias.drain,
+        [
+            JunctionCapacitance {
+                zero: model.DunitAreaTempJctCap * here.Adeff,
+                potential: model.PhiBD,
+                grading: model.DbulkJctBotGradingCoeff,
+            },
+            JunctionCapacitance {
+                zero: model.DunitLengthSidewallTempJctCap * here.Pdeff,
+                potential: model.PhiBSWD,
+                grading: model.DbulkJctSideGradingCoeff,
+            },
+            JunctionCapacitance {
+                zero: model.DunitLengthGateSidewallTempJctCap * size.weffCJ * here.nf,
+                potential: model.PhiBSWGD,
+                grading: model.DbulkJctGateSideGradingCoeff,
+            },
+        ],
+        state::QBD,
+        ckt,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diode() -> JunctionDiode {
+        JunctionDiode {
+            saturation: 1e-12,
+            thermal: 0.026,
+            breakdown_voltage: 0.026 * 2_f64.ln(),
+            breakdown_coefficient: 1.,
+            breakdown_at_zero: 0.5,
+            forward_voltage: 0.1,
+            forward_current: 1e-12 * (0.1_f64 / 0.026).exp(),
+            forward_slope: 1e-12 * ((0.1_f64 / 0.026).exp() + 0.5 * (-0.1_f64 / 0.026).exp())
+                / 0.026,
+            reverse_voltage: -1.,
+            reverse_current: 1e-5,
+            reverse_slope: -1e-4,
         }
-        if czbssw > 0.0 {
-            arg = 1.0 - vbs_jct / model.PhiBSWS;
-            if MJSWS == 0.5 {
-                sarg = 1.0 / sqrt(arg);
-            } else {
-                sarg = exp(-MJSWS * log(arg));
-            }
-            ckt.set_state0(
-                state::QBS,
-                ckt.state0(state::QBS)
-                    + (model.PhiBSWS * czbssw * (1.0 - arg * sarg) / (1.0 - MJSWS)),
-            );
-            here.capbs += czbssw * sarg;
-        }
-        if czbsswg > 0.0 {
-            arg = 1.0 - vbs_jct / model.PhiBSWGS;
-            if MJSWGS == 0.5 {
-                sarg = 1.0 / sqrt(arg);
-            } else {
-                sarg = exp(-MJSWGS * log(arg));
-            }
-            ckt.set_state0(
-                state::QBS,
-                ckt.state0(state::QBS)
-                    + (model.PhiBSWGS * czbsswg * (1.0 - arg * sarg) / (1.0 - MJSWGS)),
-            );
-            here.capbs += czbsswg * sarg;
-        }
-    } else {
-        T0 = czbs + czbssw + czbsswg;
-        T1 = vbs_jct
-            * (czbs * MJS / model.PhiBS
-                + czbssw * MJSWS / model.PhiBSWS
-                + czbsswg * MJSWGS / model.PhiBSWGS);
-        ckt.set_state0(state::QBS, vbs_jct * (T0 + 0.5 * T1));
-        here.capbs = T0 + T1;
     }
-    if vbd_jct == 0.0 {
-        ckt.set_state0(state::QBD, 0.0);
-        here.capbd = czbd + czbdsw + czbdswg;
-    } else if vbd_jct < 0.0 {
-        if czbd > 0.0 {
-            arg = 1.0 - vbd_jct / model.PhiBD;
-            if MJD == 0.5 {
-                sarg = 1.0 / sqrt(arg);
-            } else {
-                sarg = exp(-MJD * log(arg));
+
+    #[test]
+    fn all_diode_modes_preserve_tiny_bias_and_differential_conductance() {
+        for selector in [0, 1, 2] {
+            let diode = diode();
+            let gain = if selector == 1 { 1. } else { 1.5 };
+            let expected = gain * diode.saturation / diode.thermal;
+            for voltage in [-1e-22, -1e-18, 1e-18, 1e-22] {
+                let (current, slope) = diode.evaluate(selector, voltage, 0.).unwrap();
+                assert!((current / (expected * voltage) - 1.).abs() < 8. * f64::EPSILON);
+                assert!((slope / expected - 1.).abs() < 8. * f64::EPSILON);
             }
-            ckt.set_state0(
-                state::QBD,
-                model.PhiBD * czbd * (1.0 - arg * sarg) / (1.0 - MJD),
-            );
-            here.capbd = czbd * sarg;
-        } else {
-            ckt.set_state0(state::QBD, 0.0);
-            here.capbd = 0.0;
         }
-        if czbdsw > 0.0 {
-            arg = 1.0 - vbd_jct / model.PhiBSWD;
-            if MJSWD == 0.5 {
-                sarg = 1.0 / sqrt(arg);
-            } else {
-                sarg = exp(-MJSWD * log(arg));
-            }
-            ckt.set_state0(
-                state::QBD,
-                ckt.state0(state::QBD)
-                    + (model.PhiBSWD * czbdsw * (1.0 - arg * sarg) / (1.0 - MJSWD)),
-            );
-            here.capbd += czbdsw * sarg;
-        }
-        if czbdswg > 0.0 {
-            arg = 1.0 - vbd_jct / model.PhiBSWGD;
-            if MJSWGD == 0.5 {
-                sarg = 1.0 / sqrt(arg);
-            } else {
-                sarg = exp(-MJSWGD * log(arg));
-            }
-            ckt.set_state0(
-                state::QBD,
-                ckt.state0(state::QBD)
-                    + (model.PhiBSWGD * czbdswg * (1.0 - arg * sarg) / (1.0 - MJSWGD)),
-            );
-            here.capbd += czbdswg * sarg;
-        }
-    } else {
-        T0 = czbd + czbdsw + czbdswg;
-        T1 = vbd_jct
-            * (czbd * MJD / model.PhiBD
-                + czbdsw * MJSWD / model.PhiBSWD
-                + czbdswg * MJSWGD / model.PhiBSWGD);
-        ckt.set_state0(state::QBD, vbd_jct * (T0 + 0.5 * T1));
-        here.capbd = T0 + T1;
+    }
+
+    #[test]
+    fn diode_clips_and_continuations_retain_their_defined_regions() {
+        let mut diode = diode();
+        diode.breakdown_voltage = 40. * diode.thermal;
+        diode.breakdown_at_zero = MIN_EXP;
+        let (current, slope) = diode.evaluate(2, 0., 0.).unwrap();
+        assert_eq!(current.to_bits(), 0_f64.to_bits());
+        assert!((slope / (diode.saturation / diode.thermal) - 1.).abs() < f64::EPSILON);
+        let (current, _) = diode.evaluate(0, 0., 0.).unwrap();
+        // Mode zero retains the C zero-bias floor but uses the unclipped
+        // reverse exponential, unlike mode two.
+        assert!(current > 0.);
+        let (current, slope) = diode.evaluate(1, -36. * diode.thermal, 0.).unwrap();
+        assert_eq!(current, diode.saturation * (MIN_EXP - 1.));
+        assert_eq!(slope, 0.);
+        diode.forward_voltage = 1e-18;
+        diode.forward_current = diode.saturation;
+        let (current, _) = diode.evaluate(1, 2e-18, 0.).unwrap();
+        assert!(
+            (current / (2e-18 * diode.saturation / diode.thermal) - 1.).abs() < 4. * f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn reverse_tunneling_retains_tiny_current_and_large_reverse_derivative() {
+        let (difference, derivative) = reverse_tunneling(-1e-18, 0.1, 10.);
+        assert!((difference / 1e-17 - 1.).abs() < 4. * f64::EPSILON);
+        assert!((derivative / 10. - 1.).abs() < 4. * f64::EPSILON);
+        let (_, derivative) = reverse_tunneling(-1e18, 0.1, 10.);
+        assert!((derivative / (super::super::MAX_EXP * 1e-33) - 1.).abs() < 4. * f64::EPSILON);
     }
 }

@@ -7,15 +7,6 @@
     clippy::similar_names,
     reason = "C equation names preserve the reference distinctions"
 )]
-#![expect(clippy::manual_midpoint, reason = "retain C midpoint rounding order")]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "preserve non-fused C floating-point arithmetic"
-)]
-#![expect(
-    unused_assignments,
-    reason = "reference intermediate assignments remain in their equation sequence"
-)]
 #![expect(
     unused_mut,
     reason = "reference scratch variables may be assigned on different branches"
@@ -39,12 +30,146 @@
 )]
 use super::{
     DELTA_3, DELTA_4, EXP_THRESHOLD, EXPL_THRESHOLD, Instance, MAX_EXP, MAX_EXPL, MIN_EXP,
-    MIN_EXPL, Model, SizeParam, exp, log, sqrt,
+    MIN_EXPL, Model, SizeParam, exp,
 };
 use super::{
     bias::LoadBias,
     channel::{Electrostatics, Transport},
+    reduction::{mixed, residual},
 };
+
+/// Source/drain channel-tunneling partition and derivative with respect
+/// to its exponential argument. These are the C regularized fractions,
+/// not renormalized weights: their sum need not be exactly one away from
+/// equilibrium. The terminal stamps conserve the two physical currents.
+struct GatePartition {
+    source: f64,
+    drain: f64,
+    source_slope: f64,
+    drain_slope: f64,
+}
+
+impl GatePartition {
+    fn new(argument: f64) -> Self {
+        const REGULARIZATION: f64 = 1e-4;
+        if argument.is_finite() && argument.abs() > EXP_THRESHOLD {
+            let exponential = if argument > 0. { MAX_EXP } else { MIN_EXP };
+            let difference = exponential - 1.;
+            let inverse = argument.recip();
+            let normalized = (2. * REGULARIZATION * inverse).mul_add(inverse, 1.);
+            let source_scaled = (difference + REGULARIZATION).mul_add(inverse, -1.) / normalized;
+            let drain_scaled =
+                (REGULARIZATION - difference).mul_add(inverse, exponential) / normalized;
+            return Self {
+                source: source_scaled * inverse,
+                drain: drain_scaled * inverse,
+                source_slope: (-2_f64).mul_add(source_scaled, -1.) * inverse * inverse / normalized,
+                drain_slope: (-2_f64).mul_add(drain_scaled, exponential) * inverse * inverse
+                    / normalized,
+            };
+        }
+        let denominator = argument.mul_add(argument, 2. * REGULARIZATION);
+        if argument.abs() <= 0.5 {
+            small_gate_partition(argument, denominator)
+        } else {
+            let (exponential, derivative) = if argument > EXP_THRESHOLD {
+                (MAX_EXP, 0.)
+            } else if argument < -EXP_THRESHOLD {
+                (MIN_EXP, 0.)
+            } else {
+                let exponential = argument.exp();
+                (exponential, exponential)
+            };
+            let difference = exponential - 1.;
+            let source = (difference - argument + REGULARIZATION) / denominator;
+            let drain = argument.mul_add(exponential, REGULARIZATION - difference) / denominator;
+            let source_slope = (-2. * argument).mul_add(source, derivative - 1.) / denominator;
+            let drain_slope = (-2. * argument)
+                .mul_add(drain, (argument - 1.).mul_add(derivative, exponential))
+                / denominator;
+            Self {
+                source,
+                drain,
+                source_slope,
+                drain_slope,
+            }
+        }
+    }
+}
+
+/// Evaluate the third-order exponential remainder as x³ P(x), avoiding
+/// both expm1 and a loop-carried factorial division in the load hot path.
+/// For |x|<=1/2, the truncation after 15! is below binary64 roundoff.
+/// Factoring x²/denominator before multiplying by x also avoids premature
+/// underflow in the differential partition near equilibrium.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "well-conditioned Taylor polynomial and slope products; measured generic-target software FMA cost exceeds separate operations"
+)]
+fn small_gate_partition(argument: f64, denominator: f64) -> GatePartition {
+    const COEFFICIENTS: [f64; 13] = [
+        1. / 1_307_674_368_000.,
+        1. / 87_178_291_200.,
+        1. / 6_227_020_800.,
+        1. / 479_001_600.,
+        1. / 39_916_800.,
+        1. / 3_628_800.,
+        1. / 362_880.,
+        1. / 40_320.,
+        1. / 5_040.,
+        1. / 720.,
+        1. / 120.,
+        1. / 24.,
+        1. / 6.,
+    ];
+    let remainder = COEFFICIENTS.into_iter().fold(0_f64, |acc, coefficient| {
+        if cfg!(target_feature = "fma") {
+            acc.mul_add(argument, coefficient)
+        } else {
+            acc * argument + coefficient
+        }
+    });
+    let square = argument * (argument / denominator);
+    let second = 0.5 + argument * remainder;
+    let drain_remainder = 0.5 + (argument - 1.) * remainder;
+    GatePartition {
+        source: 0.5 + argument * square * remainder,
+        drain: 0.5 + argument * square * drain_remainder,
+        source_slope: square * (second - 2. * square * remainder),
+        drain_slope: square * (1. + argument * second - 2. * square * drain_remainder),
+    }
+}
+
+/// The oxide tunneling exponent is scale * (a-b*v)*(1+c*v).
+/// Preserve the physical roots rather than forming the cancellation-prone
+/// expanded quadratic. Return the voltage derivative only on the
+/// differentiable exponential branch (clipped derivatives are exactly zero).
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the nonfinite fallback retains the reference expanded expression's IEEE propagation"
+)]
+fn tunneling_barrier(voltage: f64, scale: f64, a: f64, b: f64, c: f64) -> (f64, Option<f64>) {
+    let (argument, polynomial_slope) = if [voltage, scale, a, b, c].iter().all(|v| v.is_finite()) {
+        let left = (-b).mul_add(voltage, a);
+        let right = c.mul_add(voltage, 1.);
+        (scale * (left * right), residual([(c, left), (-b, right)]))
+    } else {
+        let linear = a * c - b;
+        let quadratic = b * c;
+        (
+            scale * (a + linear * voltage - quadratic * voltage * voltage),
+            linear - 2. * quadratic * voltage,
+        )
+    };
+    if argument > EXP_THRESHOLD {
+        (MAX_EXP, None)
+    } else if argument < -EXP_THRESHOLD {
+        (MIN_EXP, None)
+    } else {
+        let exponential = argument.exp();
+        (exponential, Some(exponential * scale * polynomial_slope))
+    }
+}
 
 /// Gate-induced leakage, tunneling, finger scaling and thermal-noise auxiliaries.
 pub(super) fn evaluate(
@@ -100,7 +225,6 @@ pub(super) fn evaluate(
     let mut vgd_eff: f64;
     let mut dvgs_eff_dvg: f64;
     let mut dvgd_eff_dvg: f64;
-    let mut Vfbeff: f64;
     let mut dVfbeff_dVg: f64;
     let mut dVfbeff_dVb: f64;
     let mut V3: f64;
@@ -172,17 +296,6 @@ pub(super) fn evaluate(
     let mut dT7_dVd: f64;
     let mut dT7_dVb: f64;
     let mut T8: f64;
-    let mut dT8_dVg: f64;
-    let mut dT8_dVd: f64;
-    let mut dT8_dVb: f64;
-    let mut T9: f64;
-    let mut dT9_dVg: f64;
-    let mut dT9_dVd: f64;
-    let mut dT9_dVb: f64;
-    let mut T10: f64;
-    let mut dT10_dVg: f64;
-    let mut dT10_dVb: f64;
-    let mut dT10_dVd: f64;
     let mut T11: f64;
     let mut T12: f64;
     let mut T13: f64;
@@ -238,7 +351,7 @@ pub(super) fn evaluate(
             T6 = pParam.cgidl + T5;
             T7 = T5 / T6;
             T8 = 3.0 * pParam.cgidl * T4 / T6 / T6;
-            Ggidld = Ggidld * T7 + Igidl * T8;
+            Ggidld = residual([(Ggidld, T7), (Igidl, T8)]);
             Ggidlg = Ggidlg * T7;
             Ggidlb = -Igidl * T8;
             Igidl *= T7;
@@ -282,7 +395,7 @@ pub(super) fn evaluate(
             T6 = pParam.cgisl + T5;
             T7 = T5 / T6;
             T8 = 3.0 * pParam.cgisl * T4 / T6 / T6;
-            Ggisls = Ggisls * T7 + Igisl * T8;
+            Ggisls = residual([(Ggisls, T7), (Igisl, T8)]);
             Ggislg = Ggislg * T7;
             Ggislb = -Igisl * T8;
             Igisl *= T7;
@@ -293,9 +406,14 @@ pub(super) fn evaluate(
         here.ggislb = Ggislb;
     } else {
         if model.mtrlMod == 0 {
-            T1 = (-vds - pParam.rgisl * vgd_eff - pParam.egisl) / T0;
+            T1 = residual([(-vds, 1.), (-pParam.rgisl, vgd_eff), (-pParam.egisl, 1.)]) / T0;
         } else {
-            T1 = (-vds - pParam.rgisl * vgd_eff - pParam.egisl + pParam.vfbsd) / T0;
+            T1 = residual([
+                (-vds, 1.),
+                (-pParam.rgisl, vgd_eff),
+                (-pParam.egisl, 1.),
+                (pParam.vfbsd, 1.),
+            ]) / T0;
         }
         if (pParam.agisl <= 0.0) || (pParam.bgisl <= 0.0) || (T1 <= 0.0) || (pParam.cgisl < 0.0) {
             Ggislb = 0.0;
@@ -340,9 +458,14 @@ pub(super) fn evaluate(
         here.ggislg = Ggislg;
         here.ggislb = Ggislb;
         if model.mtrlMod == 0 {
-            T1 = (vds - pParam.rgidl * vgs_eff - pParam.egidl) / T0;
+            T1 = residual([(vds, 1.), (-pParam.rgidl, vgs_eff), (-pParam.egidl, 1.)]) / T0;
         } else {
-            T1 = (vds - pParam.rgidl * vgs_eff - pParam.egidl + pParam.vfbsd) / T0;
+            T1 = residual([
+                (vds, 1.),
+                (-pParam.rgidl, vgs_eff),
+                (-pParam.egidl, 1.),
+                (pParam.vfbsd, 1.),
+            ]) / T0;
         }
         if (pParam.agidl <= 0.0) || (pParam.bgidl <= 0.0) || (T1 <= 0.0) || (pParam.cgidl < 0.0) {
             Ggidlb = 0.0;
@@ -390,16 +513,9 @@ pub(super) fn evaluate(
     if (model.igcMod != 0) || (model.igbMod != 0) {
         Vfb = here.vfbzb;
         V3 = Vfb - Vgs_eff + Vbseff - DELTA_3;
-        if Vfb <= 0.0 {
-            T0 = sqrt(V3 * V3 - 4.0 * DELTA_3 * Vfb);
-        } else {
-            T0 = sqrt(V3 * V3 + 4.0 * DELTA_3 * Vfb);
-        }
-        T1 = 0.5 * (1.0 + V3 / T0);
-        Vfbeff = Vfb - 0.5 * (V3 + T0);
+        (Voxacc, T1) = super::smooth_positive(V3, DELTA_3 * Vfb.abs());
         dVfbeff_dVg = T1 * dVgs_eff_dVg;
         dVfbeff_dVb = -T1;
-        Voxacc = Vfb - Vfbeff;
         dVoxacc_dVg = -dVfbeff_dVg;
         dVoxacc_dVb = -dVfbeff_dVb;
         if Voxacc < 0.0 {
@@ -407,8 +523,7 @@ pub(super) fn evaluate(
             dVoxacc_dVg = dVoxacc_dVb;
             Voxacc = dVoxacc_dVg;
         }
-        T0 = 0.5 * pParam.k1ox;
-        T3 = Vgs_eff - Vfbeff - Vbseff - Vgsteff;
+        T3 = (Vgs_eff - Vfb - Vbseff - Vgsteff) + Voxacc;
         if pParam.k1ox == 0.0 {
             dVoxdepinv_dVb = 0.0;
             dVoxdepinv_dVd = dVoxdepinv_dVb;
@@ -420,9 +535,7 @@ pub(super) fn evaluate(
             dVoxdepinv_dVd = dVgsteff_dVd;
             dVoxdepinv_dVb = dVfbeff_dVb + 1.0 + dVgsteff_dVb;
         } else {
-            T1 = sqrt(T0 * T0 + T3);
-            T2 = T0 / T1;
-            Voxdepinv = pParam.k1ox * (T1 - T0);
+            (Voxdepinv, T2) = super::depletion_charge(pParam.k1ox, T3);
             dVoxdepinv_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg);
             dVoxdepinv_dVd = -T2 * dVgsteff_dVd;
             dVoxdepinv_dVb = -T2 * (dVfbeff_dVb + 1.0 + dVgsteff_dVb);
@@ -440,9 +553,9 @@ pub(super) fn evaluate(
     if model.igcMod != 0 {
         T0 = tmp * pParam.nigc;
         if model.igcMod == 1 {
-            VxNVt = (Vgs_eff - f64::from(model.r#type) * here.vth0) / T0;
+            VxNVt = (mixed((1., Vgs_eff), (-f64::from(model.r#type), here.vth0))) / T0;
             if VxNVt > EXP_THRESHOLD {
-                Vaux = Vgs_eff - f64::from(model.r#type) * here.vth0;
+                Vaux = mixed((1., Vgs_eff), (-f64::from(model.r#type), here.vth0));
                 dVaux_dVg = dVgs_eff_dVg;
                 dVaux_dVd = 0.0;
                 dVaux_dVb = 0.0;
@@ -457,13 +570,13 @@ pub(super) fn evaluate(
             }
         }
         if VxNVt < -EXP_THRESHOLD {
-            Vaux = T0 * log(1.0 + MIN_EXP);
+            Vaux = T0 * MIN_EXP.ln_1p();
             dVaux_dVb = 0.0;
             dVaux_dVd = dVaux_dVb;
             dVaux_dVg = dVaux_dVd;
         } else if (VxNVt >= -EXP_THRESHOLD) && (VxNVt <= EXP_THRESHOLD) {
             ExpVxNVt = exp(VxNVt);
-            Vaux = T0 * log(1.0 + ExpVxNVt);
+            Vaux = T0 * ExpVxNVt.ln_1p();
             dVaux_dVg = ExpVxNVt / (1.0 + ExpVxNVt);
             if model.igcMod == 1 {
                 dVaux_dVd = 0.0;
@@ -475,35 +588,21 @@ pub(super) fn evaluate(
             dVaux_dVg *= dVgs_eff_dVg;
         }
         T2 = Vgs * Vaux;
-        dT2_dVg = Vaux + Vgs * dVaux_dVg;
+        dT2_dVg = mixed((1., Vaux), (Vgs, dVaux_dVg));
         dT2_dVd = Vgs * dVaux_dVd;
         dT2_dVb = Vgs * dVaux_dVb;
         T11 = pParam.Aechvb;
         T12 = pParam.Bechvb;
-        T3 = pParam.aigc * pParam.cigc - pParam.bigc;
-        T4 = pParam.bigc * pParam.cigc;
-        T5 = T12 * (pParam.aigc + T3 * Voxdepinv - T4 * Voxdepinv * Voxdepinv);
-        if T5 > EXP_THRESHOLD {
-            T6 = MAX_EXP;
-            dT6_dVb = 0.0;
-            dT6_dVd = dT6_dVb;
-            dT6_dVg = dT6_dVd;
-        } else if T5 < -EXP_THRESHOLD {
-            T6 = MIN_EXP;
-            dT6_dVb = 0.0;
-            dT6_dVd = dT6_dVb;
-            dT6_dVg = dT6_dVd;
-        } else {
-            T6 = exp(T5);
-            dT6_dVg = T6 * T12 * (T3 - 2.0 * T4 * Voxdepinv);
-            dT6_dVd = dT6_dVg * dVoxdepinv_dVd;
-            dT6_dVb = dT6_dVg * dVoxdepinv_dVb;
-            dT6_dVg *= dVoxdepinv_dVg;
-        }
+        let (barrier, barrier_slope) =
+            tunneling_barrier(Voxdepinv, T12, pParam.aigc, pParam.bigc, pParam.cigc);
+        T6 = barrier;
+        dT6_dVd = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVd);
+        dT6_dVb = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVb);
+        dT6_dVg = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVg);
         Igc = T11 * T2 * T6;
-        dIgc_dVg = T11 * (T2 * dT6_dVg + T6 * dT2_dVg);
-        dIgc_dVd = T11 * (T2 * dT6_dVd + T6 * dT2_dVd);
-        dIgc_dVb = T11 * (T2 * dT6_dVb + T6 * dT2_dVb);
+        dIgc_dVg = T11 * residual([(T2, dT6_dVg), (T6, dT2_dVg)]);
+        dIgc_dVd = T11 * residual([(T2, dT6_dVd), (T6, dT2_dVd)]);
+        dIgc_dVb = T11 * residual([(T2, dT6_dVb), (T6, dT2_dVb)]);
         if model.pigcdGiven {
             Pigcd = pParam.pigcd;
             dPigcd_dVb = 0.0;
@@ -515,55 +614,34 @@ pub(super) fn evaluate(
             T13 = T11 / T12 / T12;
             T14 = -T13 / T12;
             Pigcd = T13 * (1.0 - 0.5 * Vdseff / T12);
-            dPigcd_dVg = T14 * (2.0 + 0.5 * (dVdseff_dVg - 3.0 * Vdseff / T12));
+            dPigcd_dVg = T14 * (0.5_f64.mul_add(dVdseff_dVg - 3.0 * Vdseff / T12, 2.));
             dPigcd_dVd = 0.5 * T14 * dVdseff_dVd;
             dPigcd_dVb = 0.5 * T14 * dVdseff_dVb;
         }
         T7 = -Pigcd * Vdseff;
-        dT7_dVg = -Vdseff * dPigcd_dVg - Pigcd * dVdseff_dVg;
-        dT7_dVd = -Vdseff * dPigcd_dVd - Pigcd * dVdseff_dVd + dT7_dVg * dVgsteff_dVd;
-        dT7_dVb = -Vdseff * dPigcd_dVb - Pigcd * dVdseff_dVb + dT7_dVg * dVgsteff_dVb;
+        dT7_dVg = residual([(-Vdseff, dPigcd_dVg), (-Pigcd, dVdseff_dVg)]);
+        dT7_dVd = residual([
+            (-Vdseff, dPigcd_dVd),
+            (-Pigcd, dVdseff_dVd),
+            (dT7_dVg, dVgsteff_dVd),
+        ]);
+        dT7_dVb = residual([
+            (-Vdseff, dPigcd_dVb),
+            (-Pigcd, dVdseff_dVb),
+            (dT7_dVg, dVgsteff_dVb),
+        ]);
         dT7_dVg *= dVgsteff_dVg;
-        T8 = T7 * T7 + 2.0e-4;
-        dT8_dVg = 2.0 * T7;
-        dT8_dVd = dT8_dVg * dT7_dVd;
-        dT8_dVb = dT8_dVg * dT7_dVb;
-        dT8_dVg *= dT7_dVg;
-        if T7 > EXP_THRESHOLD {
-            T9 = MAX_EXP;
-            dT9_dVb = 0.0;
-            dT9_dVd = dT9_dVb;
-            dT9_dVg = dT9_dVd;
-        } else if T7 < -EXP_THRESHOLD {
-            T9 = MIN_EXP;
-            dT9_dVb = 0.0;
-            dT9_dVd = dT9_dVb;
-            dT9_dVg = dT9_dVd;
-        } else {
-            T9 = exp(T7);
-            dT9_dVg = T9 * dT7_dVg;
-            dT9_dVd = T9 * dT7_dVd;
-            dT9_dVb = T9 * dT7_dVb;
-        }
-        T0 = T8 * T8;
-        T1 = T9 - 1.0 + 1.0e-4;
-        T10 = (T1 - T7) / T8;
-        dT10_dVg = (dT9_dVg - dT7_dVg - T10 * dT8_dVg) / T8;
-        dT10_dVd = (dT9_dVd - dT7_dVd - T10 * dT8_dVd) / T8;
-        dT10_dVb = (dT9_dVb - dT7_dVb - T10 * dT8_dVb) / T8;
-        Igcs = Igc * T10;
-        dIgcs_dVg = dIgc_dVg * T10 + Igc * dT10_dVg;
-        dIgcs_dVd = dIgc_dVd * T10 + Igc * dT10_dVd;
-        dIgcs_dVb = dIgc_dVb * T10 + Igc * dT10_dVb;
-        T1 = T9 - 1.0 - 1.0e-4;
-        T10 = (T7 * T9 - T1) / T8;
-        dT10_dVg = (dT7_dVg * T9 + (T7 - 1.0) * dT9_dVg - T10 * dT8_dVg) / T8;
-        dT10_dVd = (dT7_dVd * T9 + (T7 - 1.0) * dT9_dVd - T10 * dT8_dVd) / T8;
-        dT10_dVb = (dT7_dVb * T9 + (T7 - 1.0) * dT9_dVb - T10 * dT8_dVb) / T8;
-        Igcd = Igc * T10;
-        dIgcd_dVg = dIgc_dVg * T10 + Igc * dT10_dVg;
-        dIgcd_dVd = dIgc_dVd * T10 + Igc * dT10_dVd;
-        dIgcd_dVb = dIgc_dVb * T10 + Igc * dT10_dVb;
+        let partition = GatePartition::new(T7);
+        let source_slope = partition.source_slope;
+        let drain_slope = partition.drain_slope;
+        Igcs = Igc * partition.source;
+        dIgcs_dVg = dIgc_dVg.mul_add(partition.source, Igc * source_slope * dT7_dVg);
+        dIgcs_dVd = dIgc_dVd.mul_add(partition.source, Igc * source_slope * dT7_dVd);
+        dIgcs_dVb = dIgc_dVb.mul_add(partition.source, Igc * source_slope * dT7_dVb);
+        Igcd = Igc * partition.drain;
+        dIgcd_dVg = dIgc_dVg.mul_add(partition.drain, Igc * drain_slope * dT7_dVg);
+        dIgcd_dVd = dIgc_dVd.mul_add(partition.drain, Igc * drain_slope * dT7_dVd);
+        dIgcd_dVb = dIgc_dVb.mul_add(partition.drain, Igc * drain_slope * dT7_dVb);
         here.Igcs = Igcs;
         here.gIgcsg = dIgcs_dVg;
         here.gIgcsd = dIgcs_dVd;
@@ -573,49 +651,31 @@ pub(super) fn evaluate(
         here.gIgcdd = dIgcd_dVd;
         here.gIgcdb = dIgcd_dVb * dVbseff_dVb;
         T0 = vgs - (pParam.vfbsd + pParam.vfbsdoff);
-        vgs_eff = sqrt(T0 * T0 + 1.0e-4);
+        vgs_eff = T0.hypot(0.01);
         dvgs_eff_dvg = T0 / vgs_eff;
         T2 = vgs * vgs_eff;
-        dT2_dVg = vgs * dvgs_eff_dvg + vgs_eff;
+        dT2_dVg = mixed((vgs, dvgs_eff_dvg), (1., vgs_eff));
         T11 = pParam.AechvbEdgeS;
         T12 = pParam.BechvbEdge;
-        T3 = pParam.aigs * pParam.cigs - pParam.bigs;
-        T4 = pParam.bigs * pParam.cigs;
-        T5 = T12 * (pParam.aigs + T3 * vgs_eff - T4 * vgs_eff * vgs_eff);
-        if T5 > EXP_THRESHOLD {
-            T6 = MAX_EXP;
-            dT6_dVg = 0.0;
-        } else if T5 < -EXP_THRESHOLD {
-            T6 = MIN_EXP;
-            dT6_dVg = 0.0;
-        } else {
-            T6 = exp(T5);
-            dT6_dVg = T6 * T12 * (T3 - 2.0 * T4 * vgs_eff) * dvgs_eff_dvg;
-        }
+        let (barrier, barrier_slope) =
+            tunneling_barrier(vgs_eff, T12, pParam.aigs, pParam.bigs, pParam.cigs);
+        T6 = barrier;
+        dT6_dVg = barrier_slope.map_or(0., |slope| slope * dvgs_eff_dvg);
         Igs = T11 * T2 * T6;
-        dIgs_dVg = T11 * (T2 * dT6_dVg + T6 * dT2_dVg);
+        dIgs_dVg = T11 * residual([(T2, dT6_dVg), (T6, dT2_dVg)]);
         dIgs_dVs = -dIgs_dVg;
         T0 = vgd - (pParam.vfbsd + pParam.vfbsdoff);
-        vgd_eff = sqrt(T0 * T0 + 1.0e-4);
+        vgd_eff = T0.hypot(0.01);
         dvgd_eff_dvg = T0 / vgd_eff;
         T2 = vgd * vgd_eff;
-        dT2_dVg = vgd * dvgd_eff_dvg + vgd_eff;
+        dT2_dVg = mixed((vgd, dvgd_eff_dvg), (1., vgd_eff));
         T11 = pParam.AechvbEdgeD;
-        T3 = pParam.aigd * pParam.cigd - pParam.bigd;
-        T4 = pParam.bigd * pParam.cigd;
-        T5 = T12 * (pParam.aigd + T3 * vgd_eff - T4 * vgd_eff * vgd_eff);
-        if T5 > EXP_THRESHOLD {
-            T6 = MAX_EXP;
-            dT6_dVg = 0.0;
-        } else if T5 < -EXP_THRESHOLD {
-            T6 = MIN_EXP;
-            dT6_dVg = 0.0;
-        } else {
-            T6 = exp(T5);
-            dT6_dVg = T6 * T12 * (T3 - 2.0 * T4 * vgd_eff) * dvgd_eff_dvg;
-        }
+        let (barrier, barrier_slope) =
+            tunneling_barrier(vgd_eff, T12, pParam.aigd, pParam.bigd, pParam.cigd);
+        T6 = barrier;
+        dT6_dVg = barrier_slope.map_or(0., |slope| slope * dvgd_eff_dvg);
         Igd = T11 * T2 * T6;
-        dIgd_dVg = T11 * (T2 * dT6_dVg + T6 * dT2_dVg);
+        dIgd_dVg = T11 * residual([(T2, dT6_dVg), (T6, dT2_dVg)]);
         dIgd_dVd = -dIgd_dVg;
         here.Igs = Igs;
         here.gIgsg = dIgs_dVg;
@@ -648,40 +708,28 @@ pub(super) fn evaluate(
             dVaux_dVg = -dVgs_eff_dVg;
             dVaux_dVb = 1.0;
         } else if VxNVt < -EXP_THRESHOLD {
-            Vaux = T0 * log(1.0 + MIN_EXP);
+            Vaux = T0 * MIN_EXP.ln_1p();
             dVaux_dVb = 0.0;
             dVaux_dVg = dVaux_dVb;
         } else {
             ExpVxNVt = exp(VxNVt);
-            Vaux = T0 * log(1.0 + ExpVxNVt);
+            Vaux = T0 * ExpVxNVt.ln_1p();
             dVaux_dVb = ExpVxNVt / (1.0 + ExpVxNVt);
             dVaux_dVg = -dVaux_dVb * dVgs_eff_dVg;
         }
         T2 = (Vgs - Vbs) * Vaux;
-        dT2_dVg = Vaux + (Vgs - Vbs) * dVaux_dVg;
-        dT2_dVb = -Vaux + (Vgs - Vbs) * dVaux_dVb;
+        dT2_dVg = mixed((1., Vaux), (Vgs - Vbs, dVaux_dVg));
+        dT2_dVb = mixed((-1., Vaux), (Vgs - Vbs, dVaux_dVb));
         T11 = 4.97232e-7 * pParam.weff * pParam.leff * pParam.ToxRatio;
         T12 = -7.45669e11 * toxe;
-        T3 = pParam.aigbacc * pParam.cigbacc - pParam.bigbacc;
-        T4 = pParam.bigbacc * pParam.cigbacc;
-        T5 = T12 * (pParam.aigbacc + T3 * Voxacc - T4 * Voxacc * Voxacc);
-        if T5 > EXP_THRESHOLD {
-            T6 = MAX_EXP;
-            dT6_dVb = 0.0;
-            dT6_dVg = dT6_dVb;
-        } else if T5 < -EXP_THRESHOLD {
-            T6 = MIN_EXP;
-            dT6_dVb = 0.0;
-            dT6_dVg = dT6_dVb;
-        } else {
-            T6 = exp(T5);
-            dT6_dVg = T6 * T12 * (T3 - 2.0 * T4 * Voxacc);
-            dT6_dVb = dT6_dVg * dVoxacc_dVb;
-            dT6_dVg *= dVoxacc_dVg;
-        }
+        let (barrier, barrier_slope) =
+            tunneling_barrier(Voxacc, T12, pParam.aigbacc, pParam.bigbacc, pParam.cigbacc);
+        T6 = barrier;
+        dT6_dVb = barrier_slope.map_or(0., |slope| slope * dVoxacc_dVb);
+        dT6_dVg = barrier_slope.map_or(0., |slope| slope * dVoxacc_dVg);
         Igbacc = T11 * T2 * T6;
-        dIgbacc_dVg = T11 * (T2 * dT6_dVg + T6 * dT2_dVg);
-        dIgbacc_dVb = T11 * (T2 * dT6_dVb + T6 * dT2_dVb);
+        dIgbacc_dVg = T11 * residual([(T2, dT6_dVg), (T6, dT2_dVg)]);
+        dIgbacc_dVb = T11 * residual([(T2, dT6_dVb), (T6, dT2_dVb)]);
         T0 = tmp * pParam.nigbinv;
         T1 = Voxdepinv - pParam.eigbinv;
         VxNVt = T1 / T0;
@@ -691,48 +739,39 @@ pub(super) fn evaluate(
             dVaux_dVd = dVoxdepinv_dVd;
             dVaux_dVb = dVoxdepinv_dVb;
         } else if VxNVt < -EXP_THRESHOLD {
-            Vaux = T0 * log(1.0 + MIN_EXP);
+            Vaux = T0 * MIN_EXP.ln_1p();
             dVaux_dVb = 0.0;
             dVaux_dVd = dVaux_dVb;
             dVaux_dVg = dVaux_dVd;
         } else {
             ExpVxNVt = exp(VxNVt);
-            Vaux = T0 * log(1.0 + ExpVxNVt);
+            Vaux = T0 * ExpVxNVt.ln_1p();
             dVaux_dVg = ExpVxNVt / (1.0 + ExpVxNVt);
             dVaux_dVd = dVaux_dVg * dVoxdepinv_dVd;
             dVaux_dVb = dVaux_dVg * dVoxdepinv_dVb;
             dVaux_dVg *= dVoxdepinv_dVg;
         }
         T2 = (Vgs - Vbs) * Vaux;
-        dT2_dVg = Vaux + (Vgs - Vbs) * dVaux_dVg;
+        dT2_dVg = mixed((1., Vaux), (Vgs - Vbs, dVaux_dVg));
         dT2_dVd = (Vgs - Vbs) * dVaux_dVd;
-        dT2_dVb = -Vaux + (Vgs - Vbs) * dVaux_dVb;
+        dT2_dVb = mixed((-1., Vaux), (Vgs - Vbs, dVaux_dVb));
         T11 *= 0.75610;
         T12 *= 1.31724;
-        T3 = pParam.aigbinv * pParam.cigbinv - pParam.bigbinv;
-        T4 = pParam.bigbinv * pParam.cigbinv;
-        T5 = T12 * (pParam.aigbinv + T3 * Voxdepinv - T4 * Voxdepinv * Voxdepinv);
-        if T5 > EXP_THRESHOLD {
-            T6 = MAX_EXP;
-            dT6_dVb = 0.0;
-            dT6_dVd = dT6_dVb;
-            dT6_dVg = dT6_dVd;
-        } else if T5 < -EXP_THRESHOLD {
-            T6 = MIN_EXP;
-            dT6_dVb = 0.0;
-            dT6_dVd = dT6_dVb;
-            dT6_dVg = dT6_dVd;
-        } else {
-            T6 = exp(T5);
-            dT6_dVg = T6 * T12 * (T3 - 2.0 * T4 * Voxdepinv);
-            dT6_dVd = dT6_dVg * dVoxdepinv_dVd;
-            dT6_dVb = dT6_dVg * dVoxdepinv_dVb;
-            dT6_dVg *= dVoxdepinv_dVg;
-        }
+        let (barrier, barrier_slope) = tunneling_barrier(
+            Voxdepinv,
+            T12,
+            pParam.aigbinv,
+            pParam.bigbinv,
+            pParam.cigbinv,
+        );
+        T6 = barrier;
+        dT6_dVd = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVd);
+        dT6_dVb = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVb);
+        dT6_dVg = barrier_slope.map_or(0., |slope| slope * dVoxdepinv_dVg);
         Igbinv = T11 * T2 * T6;
-        dIgbinv_dVg = T11 * (T2 * dT6_dVg + T6 * dT2_dVg);
-        dIgbinv_dVd = T11 * (T2 * dT6_dVd + T6 * dT2_dVd);
-        dIgbinv_dVb = T11 * (T2 * dT6_dVb + T6 * dT2_dVb);
+        dIgbinv_dVg = T11 * residual([(T2, dT6_dVg), (T6, dT2_dVg)]);
+        dIgbinv_dVd = T11 * residual([(T2, dT6_dVd), (T6, dT2_dVd)]);
+        dIgbinv_dVb = T11 * residual([(T2, dT6_dVb), (T6, dT2_dVb)]);
         here.Igb = Igbinv + Igbacc;
         here.gIgbg = dIgbinv_dVg + dIgbacc_dVg;
         here.gIgbd = dIgbinv_dVd;
@@ -790,28 +829,112 @@ pub(super) fn evaluate(
     if model.tnoiMod == 0 {
         Abulk = Abulk0_Q * pParam.abulkCVfactor;
         Vdsat = Vgsteff / Abulk;
-        T0 = Vdsat - Vds - DELTA_4;
-        T1 = sqrt(T0 * T0 + 4.0 * DELTA_4 * Vdsat);
-        if T0 >= 0.0 {
-            Vdseff = Vdsat - 0.5 * (T0 + T1);
+        Vdseff = if Vds == 0. {
+            0.
         } else {
-            let twice_delta = DELTA_4 + DELTA_4;
-            T3 = twice_delta / (T1 - T0);
-            T4 = 1.0 - T3;
-            T5 = Vdsat * T3 / (T1 - T0);
-            Vdseff = Vdsat * T4;
-        }
-        if Vds == 0.0 {
-            Vdseff = 0.0;
-        }
+            super::smooth_drain(Vdsat, Vds, DELTA_4).effective
+        };
         T0 = Abulk * Vdseff;
-        T1 = 12.0 * (Vgsteff - 0.5 * T0 + 1.0e-20);
+        T1 = 12.0 * ((-0.5_f64).mul_add(T0, Vgsteff) + 1.0e-20);
         T2 = Vdseff / T1;
         T3 = T0 * T2;
-        here.qinv =
-            Coxeff * pParam.weffCV * here.nf * pParam.leffCV * (Vgsteff - 0.5 * T0 + Abulk * T3);
+        here.qinv = Coxeff
+            * pParam.weffCV
+            * here.nf
+            * pParam.leffCV
+            * (residual([(Vgsteff, 1.), (-0.5, T0), (Abulk, T3)]));
     } else if model.tnoiMod == 2 {
-        here.noiGd0 = here.nf * beta * Vgsteff / (1.0 + gche * Rds);
+        here.noiGd0 = here.nf * beta * Vgsteff / (gche.mul_add(Rds, 1.));
     }
     cdrain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunneling_barrier_preserves_both_quadratic_roots_and_clamps() {
+        let epsilon = f64::EPSILON;
+        let voltage = 1. - epsilon;
+        let scale = 1e30;
+        // Exact (1+epsilon)*(1-epsilon) = 1-epsilon². The
+        // expanded quadratic rounds away the residual at either root.
+        let residual_factor = epsilon * epsilon;
+        for (a, b, c, other_factor, polynomial_slope) in [
+            (
+                1.,
+                1. + epsilon,
+                1.5,
+                1. + 1.5 * voltage,
+                1.5 * residual_factor - (1. + epsilon) * (1. + 1.5 * voltage),
+            ),
+            (
+                2.,
+                1.,
+                -(1. + epsilon),
+                2. - voltage,
+                -(1. + epsilon) * (2. - voltage) - residual_factor,
+            ),
+        ] {
+            let expected = (scale * residual_factor * other_factor).exp();
+            let (exponential, slope) = tunneling_barrier(voltage, scale, a, b, c);
+            assert!((exponential / expected - 1.).abs() < 8. * f64::EPSILON);
+            assert!(
+                (slope.unwrap() / (expected * scale * polynomial_slope) - 1.).abs()
+                    < 16. * f64::EPSILON
+            );
+        }
+        assert_eq!(tunneling_barrier(0., 100., 1., 1., 1.), (MAX_EXP, None));
+        assert_eq!(tunneling_barrier(0., -100., 1., 1., 1.), (MIN_EXP, None));
+        let (exponential, slope) = tunneling_barrier(f64::INFINITY, 1., 1., 0., 1.);
+        assert!(exponential.is_nan());
+        assert!(slope.unwrap().is_nan());
+    }
+
+    #[test]
+    fn partition_retains_the_tiny_derivative_at_half_partition() {
+        for argument in [-1e-18, 1e-18] {
+            let p = GatePartition::new(argument);
+            assert_eq!(p.source, 0.5);
+            assert_eq!(p.drain, 0.5);
+            assert!((p.source_slope / 2.5e-33 - 1.).abs() < 8. * f64::EPSILON);
+            assert!((p.drain_slope / 5e-33 - 1.).abs() < 8. * f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn partition_matches_independent_derivatives_across_clamp_regions() {
+        for argument in [
+            -100., -35., -33., -0.51, -0.49, -0.1, 0., 0.1, 0.49, 0.51, 33., 35., 100.,
+        ] {
+            let p = GatePartition::new(argument);
+            let h = 1e-5;
+            let lo = GatePartition::new(argument - h);
+            let hi = GatePartition::new(argument + h);
+            let lo_half = GatePartition::new(argument - 0.5 * h);
+            let hi_half = GatePartition::new(argument + 0.5 * h);
+            let richardson = |lower: f64, upper: f64, half_lower: f64, half_upper: f64| {
+                (4. * (half_upper - half_lower) / h - (upper - lower) / (2. * h)) / 3.
+            };
+            for (slope, difference) in [
+                (
+                    p.source_slope,
+                    richardson(lo.source, hi.source, lo_half.source, hi_half.source),
+                ),
+                (
+                    p.drain_slope,
+                    richardson(lo.drain, hi.drain, lo_half.drain, hi_half.drain),
+                ),
+            ] {
+                assert!(
+                    (slope - difference).abs() < 1e-6 * slope.abs() + 1e-8,
+                    "{argument}: {slope:e}, {difference:e}"
+                );
+            }
+        }
+        let extreme = GatePartition::new(1e200);
+        assert!(extreme.source.is_finite() && extreme.source < 0.);
+        assert!(extreme.drain.is_finite() && extreme.drain > 0.);
+    }
 }
