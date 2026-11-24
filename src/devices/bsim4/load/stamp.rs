@@ -74,6 +74,10 @@ fn sum<const N: usize>(terms: [f64; N]) -> f64 {
 /// otherwise the adaptive residual kernel handles cancellation.
 #[inline]
 #[expect(
+    clippy::float_cmp,
+    reason = "only exact unit multipliers admit an exact sign change"
+)]
+#[expect(
     clippy::suboptimal_flops,
     reason = "unit weights need only an exact sign change and correctly rounded addition; avoid generic software FMA"
 )]
@@ -92,10 +96,6 @@ fn mixed(first: (f64, f64), second: (f64, f64)) -> f64 {
 }
 
 /// Emit C line900 RHS and matrix contributions without coalescing or reordering.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "ordered ordinary matrix products retain C event and arithmetic grouping; cancellation-sensitive Newton residuals and RHS reductions use adaptive product sums"
-)]
 pub(super) fn apply(
     model: &Model,
     here: &Instance,

@@ -33,6 +33,10 @@ impl JunctionDiode {
     /// The change of the reverse breakdown exponential from equilibrium.
     /// In the same unclipped branch, factor the zero-bias exponential
     /// and use expm1; never cancel across an exponential clamp.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "subtract the same rounded breakdown product prepared at zero bias, so the clipped branch remains exactly zero at equilibrium"
+    )]
     fn breakdown_difference(
         self,
         argument: f64,
@@ -182,6 +186,10 @@ fn reverse_tunneling(voltage: f64, thermal: f64, threshold: f64) -> (f64, f64) {
 }
 
 /// Evaluate the four load-owned junction conduction members.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "ordered saturation-current geometry products must match temperature preparation of the limiting continuations"
+)]
 pub(super) fn current(
     model: &Model,
     here: &mut Instance,
@@ -252,14 +260,17 @@ pub(super) fn current(
         (bias.source, source_tunnels, &mut here.cbs, &mut here.gbs),
         (bias.drain, drain_tunnels, &mut here.cbd, &mut here.gbd),
     ] {
-        let [(area, area_slope), (side, side_slope), (gate, gate_slope)] =
-            terms.map(|(density, emission, threshold)| {
-                let (difference, derivative) =
-                    reverse_tunneling(voltage, model.vtm0 * emission, threshold);
-                (density * difference, density * derivative)
-            });
-        *current -= area + side + gate;
-        *slope += area_slope + side_slope + gate_slope;
+        let [
+            (area, area_slope),
+            (sidewall, sidewall_slope),
+            (gate, gate_slope),
+        ] = terms.map(|(density, emission, threshold)| {
+            let (difference, derivative) =
+                reverse_tunneling(voltage, model.vtm0 * emission, threshold);
+            (density * difference, density * derivative)
+        });
+        *current -= area + sidewall + gate;
+        *slope += area_slope + sidewall_slope + gate_slope;
     }
 }
 
