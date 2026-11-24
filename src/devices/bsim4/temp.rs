@@ -451,6 +451,10 @@ struct JunctionTemperaturePrepared {
 /// Follow the original source/drain C expressions in the same operation
 /// order, including the zero-Isat fast path and the mode-specific fields.
 /// Return only fields C actually writes: untouched members stay untouched.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "three-term C saturation and reverse-limit bounds require ordered binary64 rounding"
+)]
 fn prepare_junction_temperature(input: JunctionTemperatureInput) -> JunctionTemperaturePrepared {
     let JunctionTemperatureInput {
         area,
@@ -2192,7 +2196,8 @@ pub(super) fn temperature_instance(
         }
         match source.warning {
             Some(JunctionTemperatureWarning::ReverseThresholdTooSmall) => {
-                warnings.push("Warning: ijthsrev too small and set to 10 times IsbSat.".to_string())
+                warnings
+                    .push("Warning: ijthsrev too small and set to 10 times IsbSat.".to_string());
             }
             Some(JunctionTemperatureWarning::UnknownDiodeMode) => {
                 warnings.push(format!("Specified dioMod = {} not matched", m.dioMod));
@@ -2231,7 +2236,8 @@ pub(super) fn temperature_instance(
         }
         match drain.warning {
             Some(JunctionTemperatureWarning::ReverseThresholdTooSmall) => {
-                warnings.push("Warning: ijthdrev too small and set to 10 times IdbSat.".to_string())
+                warnings
+                    .push("Warning: ijthdrev too small and set to 10 times IdbSat.".to_string());
             }
             Some(JunctionTemperatureWarning::UnknownDiodeMode) => {
                 warnings.push(format!("Specified dioMod = {} not matched", m.dioMod));
