@@ -101,12 +101,229 @@ fn dexp(a: f64) -> f64 {
     }
 }
 
-/// `BSIM4DioIjthVjmEval`: the diode limiting voltage `Vjm`.
-fn dio_ijth_vjm_eval(Nvtm: f64, Ijth: f64, Isb: f64, XExpBV: f64) -> f64 {
-    let Tc = XExpBV;
-    let Tb = 1.0 + Ijth / Isb - Tc;
-    let EVjmovNv = 0.5 * (Tb + sqrt(Tb * Tb + 4.0 * Tc));
-    Nvtm * log(EVjmovNv)
+/// Difference Eg(Tnom)/(k*Tnom) - Eg(T)/(k*T), for
+/// Eg(T) = e0 - alpha*T²/(T+beta). Factor the temperature increment
+/// before rounding instead of subtracting two nearly equal ratios.
+fn thermal_bandgap_difference(
+    nominal: f64,
+    temperature: f64,
+    e0: f64,
+    alpha: f64,
+    beta: f64,
+) -> f64 {
+    let delta = temperature - nominal;
+    let inverse = delta / nominal.max(temperature) / nominal.min(temperature);
+    let material = (beta / (temperature + beta)) * (delta / (nominal + beta));
+    (e0 * inverse + alpha * material) / KboQ
+}
+
+fn relative_temperature_change(temperature: f64, nominal: f64) -> f64 {
+    if temperature > 0. && nominal > 0. && temperature.is_finite() && nominal.is_finite() {
+        (temperature - nominal) / nominal
+    } else {
+        temperature / nominal - 1.
+    }
+}
+
+fn log_temperature_ratio(temperature: f64, nominal: f64) -> f64 {
+    let relative = relative_temperature_change(temperature, nominal);
+    if relative.abs() < 0.5 {
+        relative.ln_1p()
+    } else {
+        let ratio = temperature / nominal;
+        if (ratio == 0. || ratio.is_infinite())
+            && temperature > 0.
+            && nominal > 0.
+            && temperature.is_finite()
+            && nominal.is_finite()
+        {
+            temperature.ln() - nominal.ln()
+        } else {
+            ratio.ln()
+        }
+    }
+}
+
+/// The expm1 form preserves the small argument of the short-channel
+/// factor; its large-argument clamp and nonfinite branch are unchanged.
+fn short_channel_factor(argument: f64) -> f64 {
+    if argument < EXP_THRESHOLD {
+        let (exponential, difference) = if argument.abs() < 0.5 {
+            let difference = argument.exp_m1();
+            (1. + difference, difference)
+        } else {
+            let exponential = argument.exp();
+            (exponential, exponential - 1.)
+        };
+        exponential / (difference * difference + 2. * exponential * MIN_EXP)
+    } else {
+        1. / (MAX_EXP - 2.)
+    }
+}
+
+/// The denominator is identically -(sqrt(phi-vbm)-sqrt(phi))².
+/// Rationalize both differences and retain the singular/invalid input path.
+fn body_coefficient(phi: f64, vbx: f64, vbm: f64, gamma_difference: f64) -> f64 {
+    let root = phi.sqrt();
+    if phi > 0. && phi.is_finite() && vbx.is_finite() && vbm.is_finite() && vbx <= 0. && vbm < 0. {
+        let numerator = -vbx / ((phi - vbx).sqrt() + root);
+        let denominator_root = -vbm / ((phi - vbm).sqrt() + root);
+        -(gamma_difference * (numerator / denominator_root)) / denominator_root
+    } else {
+        gamma_difference * ((phi - vbx).sqrt() - root)
+            / (2. * ((phi * (phi - vbm)).sqrt() - phi) + vbm)
+    }
+}
+
+fn sqrt_one_plus_difference(x: f64) -> f64 {
+    if x.abs() < 0.5 {
+        x / ((1. + x).sqrt() + 1.)
+    } else {
+        (1. + x).sqrt() - 1.
+    }
+}
+
+fn physical_diode_limit(nvtm: f64, threshold: f64, saturation: f64, breakdown: f64) -> bool {
+    threshold >= 0.
+        && threshold.is_finite()
+        && saturation > 0.
+        && saturation.is_finite()
+        && breakdown >= 0.
+        && breakdown.is_finite()
+        && nvtm > 0.
+        && nvtm.is_finite()
+}
+
+/// BSIM4DioIjthVjmEval: solve in z=exp(Vjm/Nvtm)-1.
+/// z²+(1+XExpBV-Ijth/Isb)z-Ijth/Isb=0. Rationalize the positive
+/// root and use hypot to avoid squaring a large coefficient.
+fn dio_ijth_vjm_eval(nvtm: f64, threshold: f64, saturation: f64, breakdown: f64) -> f64 {
+    let ratio = threshold / saturation;
+    if physical_diode_limit(nvtm, threshold, saturation, breakdown) {
+        if threshold == 0. {
+            return 0.;
+        }
+        if ratio.is_infinite() {
+            // Solve for z/(threshold/saturation). The FMA computes the
+            // scaled difference even if breakdown*saturation would overflow.
+            let reciprocal = saturation / threshold;
+            let x = breakdown.mul_add(saturation, -threshold) / threshold + reciprocal;
+            let root = x.hypot(2. * reciprocal.sqrt());
+            let scaled = if x >= 0. {
+                reciprocal / root.midpoint(x)
+            } else {
+                root.midpoint(-x)
+            };
+            return nvtm * (threshold.ln() - saturation.ln() + scaled.ln());
+        }
+        if breakdown == 0. {
+            return nvtm * ratio.ln_1p();
+        }
+        let x = 1. + (breakdown - ratio);
+        let root = x.hypot(2. * ratio.sqrt());
+        let z = if x >= 0. {
+            ratio / root.midpoint(x)
+        } else {
+            root.midpoint(-x)
+        };
+        return nvtm * z.ln_1p();
+    }
+    let tb = 1. + ratio - breakdown;
+    let exponential = 0.5 * (tb + (tb * tb + 4. * breakdown).sqrt());
+    nvtm * exponential.ln()
+}
+
+struct ForwardLimit {
+    voltage: f64,
+    current: f64,
+    slope: f64,
+}
+
+/// Mode 1 stores the exponential current, mode 2 the physical diode
+/// current and its slope. Evaluate the latter from the quadratic identity,
+/// rather than exponentiating the rounded voltage and subtracting one.
+fn forward_limit(
+    nvtm: f64,
+    threshold: f64,
+    saturation: f64,
+    breakdown: Option<f64>,
+) -> ForwardLimit {
+    let coefficient = breakdown.unwrap_or(0.);
+    let voltage = dio_ijth_vjm_eval(nvtm, threshold, saturation, coefficient);
+    if physical_diode_limit(nvtm, threshold, saturation, coefficient) {
+        let current = if breakdown.is_some() {
+            threshold
+        } else {
+            saturation + threshold
+        };
+        let difference = (-coefficient).mul_add(saturation, threshold) + saturation;
+        let cross = 2. * coefficient.sqrt() * saturation;
+        let slope = difference.hypot(cross) / nvtm;
+        ForwardLimit {
+            voltage,
+            current,
+            slope,
+        }
+    } else {
+        let exponential = (voltage / nvtm).exp();
+        let current = if breakdown.is_some() {
+            saturation * (exponential - coefficient / exponential + coefficient - 1.)
+        } else {
+            saturation * exponential
+        };
+        let slope = saturation * (exponential + coefficient / exponential) / nvtm;
+        ForwardLimit {
+            voltage,
+            current,
+            slope,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BinWeights([f64; 4]);
+
+impl BinWeights {
+    /// Retain the ordinary fast path; recover severe cancellation or
+    /// intermediate overflow using the existing exact finite-product sum.
+    #[inline]
+    fn interpolate(self, coefficients: [f64; 4]) -> f64 {
+        let [base, l, w, cross] = coefficients;
+        let [_, inverse_l, inverse_w, inverse_lw] = self.0;
+        let lt = l * inverse_l;
+        let wt = w * inverse_w;
+        let lwt = cross * inverse_lw;
+        let sum = base + lt + wt + lwt;
+        let magnitude = base.abs().max(lt.abs()).max(wt.abs()).max(lwt.abs());
+        if sum.is_normal() && sum.abs() > 0.5 * magnitude {
+            sum
+        } else if magnitude == 0. && coefficients.iter().all(|&value| value == 0.) {
+            sum
+        } else {
+            self.recover(coefficients, sum)
+        }
+    }
+
+    #[cold]
+    fn recover(self, coefficients: [f64; 4], ordinary: f64) -> f64 {
+        if !coefficients
+            .iter()
+            .chain(&self.0)
+            .all(|value| value.is_finite())
+        {
+            return ordinary;
+        }
+        let mut exact = crate::primitives::ExactSum::new();
+        for (coefficient, weight) in coefficients.into_iter().zip(self.0) {
+            exact.add_product(coefficient, weight);
+        }
+        let result = exact.rounded_sum();
+        if result == 0. && ordinary == 0. {
+            ordinary
+        } else {
+            result
+        }
+    }
 }
 
 /// A C `printf("%g")` spelling for the ported messages.
@@ -332,7 +549,7 @@ pub(super) fn temperature_model(
             epssub = EPSSI;
         }
         if !m.cfGiven {
-            m.cf = 2.0 * epsrox * EPS0 / PI * log(1.0 + 0.4e-6 / toxe);
+            m.cf = 2.0 * epsrox * EPS0 / PI * (0.4e-6 / toxe).ln_1p();
         }
         m.coxe = epsrox * EPS0 / toxe;
         if m.mtrlMod == 0 || m.mtrlCompatMod != 0 {
@@ -388,8 +605,26 @@ pub(super) fn temperature_model(
             m.DjctSidewallTempSatCurDensity = m.DjctSidewallSatCurDensity;
             m.DjctGateSidewallTempSatCurDensity = m.DjctGateSidewallSatCurDensity;
         } else {
-            T0 = Eg0 / Vtm0 - Eg / m.vtm;
-            T1 = log(Temp / Tnom);
+            let (e0, alpha, beta) = if m.mtrlMod == 0 {
+                (1.16, 7.02e-4, 1108.)
+            } else {
+                (m.bg0sub, m.tbgasub, m.tbgbsub)
+            };
+            T0 = if Temp > 0.
+                && Tnom > 0.
+                && Temp.is_finite()
+                && Tnom.is_finite()
+                && e0.is_finite()
+                && alpha.is_finite()
+                && beta.is_finite()
+                && Temp + beta > 0.
+                && Tnom + beta > 0.
+            {
+                thermal_bandgap_difference(Tnom, Temp, e0, alpha, beta)
+            } else {
+                Eg0 / Vtm0 - Eg / m.vtm
+            };
+            T1 = log_temperature_ratio(Temp, Tnom);
             T2 = T0 + m.SjctTempExponent * T1;
             T3 = exp(T2 / m.SjctEmissionCoeff);
             m.SjctTempSatCurDensity = m.SjctSatCurDensity * T3;
@@ -755,171 +990,170 @@ pub(super) fn temperature_instance(
                 Inv_W = 1.0 / p.weff;
                 Inv_LW = 1.0 / (p.leff * p.weff);
             }
-            p.cdsc = m.cdsc + m.lcdsc * Inv_L + m.wcdsc * Inv_W + m.pcdsc * Inv_LW;
-            p.cdscb = m.cdscb + m.lcdscb * Inv_L + m.wcdscb * Inv_W + m.pcdscb * Inv_LW;
-            p.cdscd = m.cdscd + m.lcdscd * Inv_L + m.wcdscd * Inv_W + m.pcdscd * Inv_LW;
-            p.cit = m.cit + m.lcit * Inv_L + m.wcit * Inv_W + m.pcit * Inv_LW;
-            p.nfactor = m.nfactor + m.lnfactor * Inv_L + m.wnfactor * Inv_W + m.pnfactor * Inv_LW;
-            p.tnfactor =
-                m.tnfactor + m.ltnfactor * Inv_L + m.wtnfactor * Inv_W + m.ptnfactor * Inv_LW;
-            p.xj = m.xj + m.lxj * Inv_L + m.wxj * Inv_W + m.pxj * Inv_LW;
-            p.vsat = m.vsat + m.lvsat * Inv_L + m.wvsat * Inv_W + m.pvsat * Inv_LW;
-            p.at = m.at + m.lat * Inv_L + m.wat * Inv_W + m.pat * Inv_LW;
-            p.a0 = m.a0 + m.la0 * Inv_L + m.wa0 * Inv_W + m.pa0 * Inv_LW;
-            p.ags = m.ags + m.lags * Inv_L + m.wags * Inv_W + m.pags * Inv_LW;
-            p.a1 = m.a1 + m.la1 * Inv_L + m.wa1 * Inv_W + m.pa1 * Inv_LW;
-            p.a2 = m.a2 + m.la2 * Inv_L + m.wa2 * Inv_W + m.pa2 * Inv_LW;
-            p.keta = m.keta + m.lketa * Inv_L + m.wketa * Inv_W + m.pketa * Inv_LW;
-            p.ketac = m.ketac + m.lketac * Inv_L + m.wketac * Inv_W + m.pketac * Inv_LW;
-            p.nsub = m.nsub + m.lnsub * Inv_L + m.wnsub * Inv_W + m.pnsub * Inv_LW;
-            p.ndep = m.ndep + m.lndep * Inv_L + m.wndep * Inv_W + m.pndep * Inv_LW;
-            p.nsd = m.nsd + m.lnsd * Inv_L + m.wnsd * Inv_W + m.pnsd * Inv_LW;
-            p.phin = m.phin + m.lphin * Inv_L + m.wphin * Inv_W + m.pphin * Inv_LW;
-            p.ngate = m.ngate + m.lngate * Inv_L + m.wngate * Inv_W + m.pngate * Inv_LW;
-            p.gamma1 = m.gamma1 + m.lgamma1 * Inv_L + m.wgamma1 * Inv_W + m.pgamma1 * Inv_LW;
-            p.gamma2 = m.gamma2 + m.lgamma2 * Inv_L + m.wgamma2 * Inv_W + m.pgamma2 * Inv_LW;
-            p.vbx = m.vbx + m.lvbx * Inv_L + m.wvbx * Inv_W + m.pvbx * Inv_LW;
-            p.vbm = m.vbm + m.lvbm * Inv_L + m.wvbm * Inv_W + m.pvbm * Inv_LW;
-            p.xt = m.xt + m.lxt * Inv_L + m.wxt * Inv_W + m.pxt * Inv_LW;
-            p.vfb = m.vfb + m.lvfb * Inv_L + m.wvfb * Inv_W + m.pvfb * Inv_LW;
-            p.k1 = m.k1 + m.lk1 * Inv_L + m.wk1 * Inv_W + m.pk1 * Inv_LW;
-            p.kt1 = m.kt1 + m.lkt1 * Inv_L + m.wkt1 * Inv_W + m.pkt1 * Inv_LW;
-            p.kt1l = m.kt1l + m.lkt1l * Inv_L + m.wkt1l * Inv_W + m.pkt1l * Inv_LW;
-            p.k2 = m.k2 + m.lk2 * Inv_L + m.wk2 * Inv_W + m.pk2 * Inv_LW;
-            p.kt2 = m.kt2 + m.lkt2 * Inv_L + m.wkt2 * Inv_W + m.pkt2 * Inv_LW;
-            p.k3 = m.k3 + m.lk3 * Inv_L + m.wk3 * Inv_W + m.pk3 * Inv_LW;
-            p.k3b = m.k3b + m.lk3b * Inv_L + m.wk3b * Inv_W + m.pk3b * Inv_LW;
-            p.w0 = m.w0 + m.lw0 * Inv_L + m.ww0 * Inv_W + m.pw0 * Inv_LW;
-            p.lpe0 = m.lpe0 + m.llpe0 * Inv_L + m.wlpe0 * Inv_W + m.plpe0 * Inv_LW;
-            p.lpeb = m.lpeb + m.llpeb * Inv_L + m.wlpeb * Inv_W + m.plpeb * Inv_LW;
-            p.dvtp0 = m.dvtp0 + m.ldvtp0 * Inv_L + m.wdvtp0 * Inv_W + m.pdvtp0 * Inv_LW;
-            p.dvtp1 = m.dvtp1 + m.ldvtp1 * Inv_L + m.wdvtp1 * Inv_W + m.pdvtp1 * Inv_LW;
-            p.dvtp2 = m.dvtp2 + m.ldvtp2 * Inv_L + m.wdvtp2 * Inv_W + m.pdvtp2 * Inv_LW;
-            p.dvtp3 = m.dvtp3 + m.ldvtp3 * Inv_L + m.wdvtp3 * Inv_W + m.pdvtp3 * Inv_LW;
-            p.dvtp4 = m.dvtp4 + m.ldvtp4 * Inv_L + m.wdvtp4 * Inv_W + m.pdvtp4 * Inv_LW;
-            p.dvtp5 = m.dvtp5 + m.ldvtp5 * Inv_L + m.wdvtp5 * Inv_W + m.pdvtp5 * Inv_LW;
-            p.dvt0 = m.dvt0 + m.ldvt0 * Inv_L + m.wdvt0 * Inv_W + m.pdvt0 * Inv_LW;
-            p.dvt1 = m.dvt1 + m.ldvt1 * Inv_L + m.wdvt1 * Inv_W + m.pdvt1 * Inv_LW;
-            p.dvt2 = m.dvt2 + m.ldvt2 * Inv_L + m.wdvt2 * Inv_W + m.pdvt2 * Inv_LW;
-            p.dvt0w = m.dvt0w + m.ldvt0w * Inv_L + m.wdvt0w * Inv_W + m.pdvt0w * Inv_LW;
-            p.dvt1w = m.dvt1w + m.ldvt1w * Inv_L + m.wdvt1w * Inv_W + m.pdvt1w * Inv_LW;
-            p.dvt2w = m.dvt2w + m.ldvt2w * Inv_L + m.wdvt2w * Inv_W + m.pdvt2w * Inv_LW;
-            p.drout = m.drout + m.ldrout * Inv_L + m.wdrout * Inv_W + m.pdrout * Inv_LW;
-            p.dsub = m.dsub + m.ldsub * Inv_L + m.wdsub * Inv_W + m.pdsub * Inv_LW;
-            p.vth0 = m.vth0 + m.lvth0 * Inv_L + m.wvth0 * Inv_W + m.pvth0 * Inv_LW;
-            p.ua = m.ua + m.lua * Inv_L + m.wua * Inv_W + m.pua * Inv_LW;
-            p.ua1 = m.ua1 + m.lua1 * Inv_L + m.wua1 * Inv_W + m.pua1 * Inv_LW;
-            p.ub = m.ub + m.lub * Inv_L + m.wub * Inv_W + m.r#pub * Inv_LW;
-            p.ub1 = m.ub1 + m.lub1 * Inv_L + m.wub1 * Inv_W + m.pub1 * Inv_LW;
-            p.uc = m.uc + m.luc * Inv_L + m.wuc * Inv_W + m.puc * Inv_LW;
-            p.uc1 = m.uc1 + m.luc1 * Inv_L + m.wuc1 * Inv_W + m.puc1 * Inv_LW;
-            p.ud = m.ud + m.lud * Inv_L + m.wud * Inv_W + m.pud * Inv_LW;
-            p.ud1 = m.ud1 + m.lud1 * Inv_L + m.wud1 * Inv_W + m.pud1 * Inv_LW;
-            p.up = m.up + m.lup * Inv_L + m.wup * Inv_W + m.pup * Inv_LW;
-            p.lp = m.lp + m.llp * Inv_L + m.wlp * Inv_W + m.plp * Inv_LW;
-            p.eu = m.eu + m.leu * Inv_L + m.weu * Inv_W + m.peu * Inv_LW;
-            p.u0 = m.u0 + m.lu0 * Inv_L + m.wu0 * Inv_W + m.pu0 * Inv_LW;
-            p.ute = m.ute + m.lute * Inv_L + m.wute * Inv_W + m.pute * Inv_LW;
-            p.ucs = m.ucs + m.lucs * Inv_L + m.wucs * Inv_W + m.pucs * Inv_LW;
-            p.ucste = m.ucste + m.lucste * Inv_L + m.wucste * Inv_W + m.pucste * Inv_LW;
-            p.voff = m.voff + m.lvoff * Inv_L + m.wvoff * Inv_W + m.pvoff * Inv_LW;
-            p.tvoff = m.tvoff + m.ltvoff * Inv_L + m.wtvoff * Inv_W + m.ptvoff * Inv_LW;
-            p.minv = m.minv + m.lminv * Inv_L + m.wminv * Inv_W + m.pminv * Inv_LW;
-            p.minvcv = m.minvcv + m.lminvcv * Inv_L + m.wminvcv * Inv_W + m.pminvcv * Inv_LW;
-            p.fprout = m.fprout + m.lfprout * Inv_L + m.wfprout * Inv_W + m.pfprout * Inv_LW;
-            p.pdits = m.pdits + m.lpdits * Inv_L + m.wpdits * Inv_W + m.ppdits * Inv_LW;
-            p.pditsd = m.pditsd + m.lpditsd * Inv_L + m.wpditsd * Inv_W + m.ppditsd * Inv_LW;
-            p.delta = m.delta + m.ldelta * Inv_L + m.wdelta * Inv_W + m.pdelta * Inv_LW;
-            p.rdsw = m.rdsw + m.lrdsw * Inv_L + m.wrdsw * Inv_W + m.prdsw * Inv_LW;
-            p.rdw = m.rdw + m.lrdw * Inv_L + m.wrdw * Inv_W + m.prdw * Inv_LW;
-            p.rsw = m.rsw + m.lrsw * Inv_L + m.wrsw * Inv_W + m.prsw * Inv_LW;
-            p.prwg = m.prwg + m.lprwg * Inv_L + m.wprwg * Inv_W + m.pprwg * Inv_LW;
-            p.prwb = m.prwb + m.lprwb * Inv_L + m.wprwb * Inv_W + m.pprwb * Inv_LW;
-            p.prt = m.prt + m.lprt * Inv_L + m.wprt * Inv_W + m.pprt * Inv_LW;
-            p.eta0 = m.eta0 + m.leta0 * Inv_L + m.weta0 * Inv_W + m.peta0 * Inv_LW;
-            p.teta0 = m.teta0 + m.lteta0 * Inv_L + m.wteta0 * Inv_W + m.pteta0 * Inv_LW;
-            p.tvoffcv = m.tvoffcv + m.ltvoffcv * Inv_L + m.wtvoffcv * Inv_W + m.ptvoffcv * Inv_LW;
-            p.etab = m.etab + m.letab * Inv_L + m.wetab * Inv_W + m.petab * Inv_LW;
-            p.pclm = m.pclm + m.lpclm * Inv_L + m.wpclm * Inv_W + m.ppclm * Inv_LW;
-            p.pdibl1 = m.pdibl1 + m.lpdibl1 * Inv_L + m.wpdibl1 * Inv_W + m.ppdibl1 * Inv_LW;
-            p.pdibl2 = m.pdibl2 + m.lpdibl2 * Inv_L + m.wpdibl2 * Inv_W + m.ppdibl2 * Inv_LW;
-            p.pdiblb = m.pdiblb + m.lpdiblb * Inv_L + m.wpdiblb * Inv_W + m.ppdiblb * Inv_LW;
-            p.pscbe1 = m.pscbe1 + m.lpscbe1 * Inv_L + m.wpscbe1 * Inv_W + m.ppscbe1 * Inv_LW;
-            p.pscbe2 = m.pscbe2 + m.lpscbe2 * Inv_L + m.wpscbe2 * Inv_W + m.ppscbe2 * Inv_LW;
-            p.pvag = m.pvag + m.lpvag * Inv_L + m.wpvag * Inv_W + m.ppvag * Inv_LW;
-            p.wr = m.wr + m.lwr * Inv_L + m.wwr * Inv_W + m.pwr * Inv_LW;
-            p.dwg = m.dwg + m.ldwg * Inv_L + m.wdwg * Inv_W + m.pdwg * Inv_LW;
-            p.dwb = m.dwb + m.ldwb * Inv_L + m.wdwb * Inv_W + m.pdwb * Inv_LW;
-            p.b0 = m.b0 + m.lb0 * Inv_L + m.wb0 * Inv_W + m.pb0 * Inv_LW;
-            p.b1 = m.b1 + m.lb1 * Inv_L + m.wb1 * Inv_W + m.pb1 * Inv_LW;
-            p.alpha0 = m.alpha0 + m.lalpha0 * Inv_L + m.walpha0 * Inv_W + m.palpha0 * Inv_LW;
-            p.alpha1 = m.alpha1 + m.lalpha1 * Inv_L + m.walpha1 * Inv_W + m.palpha1 * Inv_LW;
-            p.beta0 = m.beta0 + m.lbeta0 * Inv_L + m.wbeta0 * Inv_W + m.pbeta0 * Inv_LW;
-            p.agidl = m.agidl + m.lagidl * Inv_L + m.wagidl * Inv_W + m.pagidl * Inv_LW;
-            p.bgidl = m.bgidl + m.lbgidl * Inv_L + m.wbgidl * Inv_W + m.pbgidl * Inv_LW;
-            p.cgidl = m.cgidl + m.lcgidl * Inv_L + m.wcgidl * Inv_W + m.pcgidl * Inv_LW;
-            p.egidl = m.egidl + m.legidl * Inv_L + m.wegidl * Inv_W + m.pegidl * Inv_LW;
-            p.rgidl = m.rgidl + m.lrgidl * Inv_L + m.wrgidl * Inv_W + m.prgidl * Inv_LW;
-            p.kgidl = m.kgidl + m.lkgidl * Inv_L + m.wkgidl * Inv_W + m.pkgidl * Inv_LW;
-            p.fgidl = m.fgidl + m.lfgidl * Inv_L + m.wfgidl * Inv_W + m.pfgidl * Inv_LW;
-            p.agisl = m.agisl + m.lagisl * Inv_L + m.wagisl * Inv_W + m.pagisl * Inv_LW;
-            p.bgisl = m.bgisl + m.lbgisl * Inv_L + m.wbgisl * Inv_W + m.pbgisl * Inv_LW;
-            p.cgisl = m.cgisl + m.lcgisl * Inv_L + m.wcgisl * Inv_W + m.pcgisl * Inv_LW;
-            p.egisl = m.egisl + m.legisl * Inv_L + m.wegisl * Inv_W + m.pegisl * Inv_LW;
-            p.rgisl = m.rgisl + m.lrgisl * Inv_L + m.wrgisl * Inv_W + m.prgisl * Inv_LW;
-            p.kgisl = m.kgisl + m.lkgisl * Inv_L + m.wkgisl * Inv_W + m.pkgisl * Inv_LW;
-            p.fgisl = m.fgisl + m.lfgisl * Inv_L + m.wfgisl * Inv_W + m.pfgisl * Inv_LW;
-            p.aigc = m.aigc + m.laigc * Inv_L + m.waigc * Inv_W + m.paigc * Inv_LW;
-            p.bigc = m.bigc + m.lbigc * Inv_L + m.wbigc * Inv_W + m.pbigc * Inv_LW;
-            p.cigc = m.cigc + m.lcigc * Inv_L + m.wcigc * Inv_W + m.pcigc * Inv_LW;
-            p.aigsd = m.aigsd + m.laigsd * Inv_L + m.waigsd * Inv_W + m.paigsd * Inv_LW;
-            p.bigsd = m.bigsd + m.lbigsd * Inv_L + m.wbigsd * Inv_W + m.pbigsd * Inv_LW;
-            p.cigsd = m.cigsd + m.lcigsd * Inv_L + m.wcigsd * Inv_W + m.pcigsd * Inv_LW;
-            p.aigs = m.aigs + m.laigs * Inv_L + m.waigs * Inv_W + m.paigs * Inv_LW;
-            p.bigs = m.bigs + m.lbigs * Inv_L + m.wbigs * Inv_W + m.pbigs * Inv_LW;
-            p.cigs = m.cigs + m.lcigs * Inv_L + m.wcigs * Inv_W + m.pcigs * Inv_LW;
-            p.aigd = m.aigd + m.laigd * Inv_L + m.waigd * Inv_W + m.paigd * Inv_LW;
-            p.bigd = m.bigd + m.lbigd * Inv_L + m.wbigd * Inv_W + m.pbigd * Inv_LW;
-            p.cigd = m.cigd + m.lcigd * Inv_L + m.wcigd * Inv_W + m.pcigd * Inv_LW;
-            p.aigbacc = m.aigbacc + m.laigbacc * Inv_L + m.waigbacc * Inv_W + m.paigbacc * Inv_LW;
-            p.bigbacc = m.bigbacc + m.lbigbacc * Inv_L + m.wbigbacc * Inv_W + m.pbigbacc * Inv_LW;
-            p.cigbacc = m.cigbacc + m.lcigbacc * Inv_L + m.wcigbacc * Inv_W + m.pcigbacc * Inv_LW;
-            p.aigbinv = m.aigbinv + m.laigbinv * Inv_L + m.waigbinv * Inv_W + m.paigbinv * Inv_LW;
-            p.bigbinv = m.bigbinv + m.lbigbinv * Inv_L + m.wbigbinv * Inv_W + m.pbigbinv * Inv_LW;
-            p.cigbinv = m.cigbinv + m.lcigbinv * Inv_L + m.wcigbinv * Inv_W + m.pcigbinv * Inv_LW;
-            p.nigc = m.nigc + m.lnigc * Inv_L + m.wnigc * Inv_W + m.pnigc * Inv_LW;
-            p.nigbacc = m.nigbacc + m.lnigbacc * Inv_L + m.wnigbacc * Inv_W + m.pnigbacc * Inv_LW;
-            p.nigbinv = m.nigbinv + m.lnigbinv * Inv_L + m.wnigbinv * Inv_W + m.pnigbinv * Inv_LW;
-            p.ntox = m.ntox + m.lntox * Inv_L + m.wntox * Inv_W + m.pntox * Inv_LW;
-            p.eigbinv = m.eigbinv + m.leigbinv * Inv_L + m.weigbinv * Inv_W + m.peigbinv * Inv_LW;
-            p.pigcd = m.pigcd + m.lpigcd * Inv_L + m.wpigcd * Inv_W + m.ppigcd * Inv_LW;
-            p.poxedge = m.poxedge + m.lpoxedge * Inv_L + m.wpoxedge * Inv_W + m.ppoxedge * Inv_LW;
-            p.xrcrg1 = m.xrcrg1 + m.lxrcrg1 * Inv_L + m.wxrcrg1 * Inv_W + m.pxrcrg1 * Inv_LW;
-            p.xrcrg2 = m.xrcrg2 + m.lxrcrg2 * Inv_L + m.wxrcrg2 * Inv_W + m.pxrcrg2 * Inv_LW;
-            p.lambda = m.lambda + m.llambda * Inv_L + m.wlambda * Inv_W + m.plambda * Inv_LW;
-            p.vtl = m.vtl + m.lvtl * Inv_L + m.wvtl * Inv_W + m.pvtl * Inv_LW;
-            p.xn = m.xn + m.lxn * Inv_L + m.wxn * Inv_W + m.pxn * Inv_LW;
-            p.vfbsdoff =
-                m.vfbsdoff + m.lvfbsdoff * Inv_L + m.wvfbsdoff * Inv_W + m.pvfbsdoff * Inv_LW;
+            let weights = BinWeights([1., Inv_L, Inv_W, Inv_LW]);
+            p.cdsc = weights.interpolate([m.cdsc, m.lcdsc, m.wcdsc, m.pcdsc]);
+            p.cdscb = weights.interpolate([m.cdscb, m.lcdscb, m.wcdscb, m.pcdscb]);
+            p.cdscd = weights.interpolate([m.cdscd, m.lcdscd, m.wcdscd, m.pcdscd]);
+            p.cit = weights.interpolate([m.cit, m.lcit, m.wcit, m.pcit]);
+            p.nfactor = weights.interpolate([m.nfactor, m.lnfactor, m.wnfactor, m.pnfactor]);
+            p.tnfactor = weights.interpolate([m.tnfactor, m.ltnfactor, m.wtnfactor, m.ptnfactor]);
+            p.xj = weights.interpolate([m.xj, m.lxj, m.wxj, m.pxj]);
+            p.vsat = weights.interpolate([m.vsat, m.lvsat, m.wvsat, m.pvsat]);
+            p.at = weights.interpolate([m.at, m.lat, m.wat, m.pat]);
+            p.a0 = weights.interpolate([m.a0, m.la0, m.wa0, m.pa0]);
+            p.ags = weights.interpolate([m.ags, m.lags, m.wags, m.pags]);
+            p.a1 = weights.interpolate([m.a1, m.la1, m.wa1, m.pa1]);
+            p.a2 = weights.interpolate([m.a2, m.la2, m.wa2, m.pa2]);
+            p.keta = weights.interpolate([m.keta, m.lketa, m.wketa, m.pketa]);
+            p.ketac = weights.interpolate([m.ketac, m.lketac, m.wketac, m.pketac]);
+            p.nsub = weights.interpolate([m.nsub, m.lnsub, m.wnsub, m.pnsub]);
+            p.ndep = weights.interpolate([m.ndep, m.lndep, m.wndep, m.pndep]);
+            p.nsd = weights.interpolate([m.nsd, m.lnsd, m.wnsd, m.pnsd]);
+            p.phin = weights.interpolate([m.phin, m.lphin, m.wphin, m.pphin]);
+            p.ngate = weights.interpolate([m.ngate, m.lngate, m.wngate, m.pngate]);
+            p.gamma1 = weights.interpolate([m.gamma1, m.lgamma1, m.wgamma1, m.pgamma1]);
+            p.gamma2 = weights.interpolate([m.gamma2, m.lgamma2, m.wgamma2, m.pgamma2]);
+            p.vbx = weights.interpolate([m.vbx, m.lvbx, m.wvbx, m.pvbx]);
+            p.vbm = weights.interpolate([m.vbm, m.lvbm, m.wvbm, m.pvbm]);
+            p.xt = weights.interpolate([m.xt, m.lxt, m.wxt, m.pxt]);
+            p.vfb = weights.interpolate([m.vfb, m.lvfb, m.wvfb, m.pvfb]);
+            p.k1 = weights.interpolate([m.k1, m.lk1, m.wk1, m.pk1]);
+            p.kt1 = weights.interpolate([m.kt1, m.lkt1, m.wkt1, m.pkt1]);
+            p.kt1l = weights.interpolate([m.kt1l, m.lkt1l, m.wkt1l, m.pkt1l]);
+            p.k2 = weights.interpolate([m.k2, m.lk2, m.wk2, m.pk2]);
+            p.kt2 = weights.interpolate([m.kt2, m.lkt2, m.wkt2, m.pkt2]);
+            p.k3 = weights.interpolate([m.k3, m.lk3, m.wk3, m.pk3]);
+            p.k3b = weights.interpolate([m.k3b, m.lk3b, m.wk3b, m.pk3b]);
+            p.w0 = weights.interpolate([m.w0, m.lw0, m.ww0, m.pw0]);
+            p.lpe0 = weights.interpolate([m.lpe0, m.llpe0, m.wlpe0, m.plpe0]);
+            p.lpeb = weights.interpolate([m.lpeb, m.llpeb, m.wlpeb, m.plpeb]);
+            p.dvtp0 = weights.interpolate([m.dvtp0, m.ldvtp0, m.wdvtp0, m.pdvtp0]);
+            p.dvtp1 = weights.interpolate([m.dvtp1, m.ldvtp1, m.wdvtp1, m.pdvtp1]);
+            p.dvtp2 = weights.interpolate([m.dvtp2, m.ldvtp2, m.wdvtp2, m.pdvtp2]);
+            p.dvtp3 = weights.interpolate([m.dvtp3, m.ldvtp3, m.wdvtp3, m.pdvtp3]);
+            p.dvtp4 = weights.interpolate([m.dvtp4, m.ldvtp4, m.wdvtp4, m.pdvtp4]);
+            p.dvtp5 = weights.interpolate([m.dvtp5, m.ldvtp5, m.wdvtp5, m.pdvtp5]);
+            p.dvt0 = weights.interpolate([m.dvt0, m.ldvt0, m.wdvt0, m.pdvt0]);
+            p.dvt1 = weights.interpolate([m.dvt1, m.ldvt1, m.wdvt1, m.pdvt1]);
+            p.dvt2 = weights.interpolate([m.dvt2, m.ldvt2, m.wdvt2, m.pdvt2]);
+            p.dvt0w = weights.interpolate([m.dvt0w, m.ldvt0w, m.wdvt0w, m.pdvt0w]);
+            p.dvt1w = weights.interpolate([m.dvt1w, m.ldvt1w, m.wdvt1w, m.pdvt1w]);
+            p.dvt2w = weights.interpolate([m.dvt2w, m.ldvt2w, m.wdvt2w, m.pdvt2w]);
+            p.drout = weights.interpolate([m.drout, m.ldrout, m.wdrout, m.pdrout]);
+            p.dsub = weights.interpolate([m.dsub, m.ldsub, m.wdsub, m.pdsub]);
+            p.vth0 = weights.interpolate([m.vth0, m.lvth0, m.wvth0, m.pvth0]);
+            p.ua = weights.interpolate([m.ua, m.lua, m.wua, m.pua]);
+            p.ua1 = weights.interpolate([m.ua1, m.lua1, m.wua1, m.pua1]);
+            p.ub = weights.interpolate([m.ub, m.lub, m.wub, m.r#pub]);
+            p.ub1 = weights.interpolate([m.ub1, m.lub1, m.wub1, m.pub1]);
+            p.uc = weights.interpolate([m.uc, m.luc, m.wuc, m.puc]);
+            p.uc1 = weights.interpolate([m.uc1, m.luc1, m.wuc1, m.puc1]);
+            p.ud = weights.interpolate([m.ud, m.lud, m.wud, m.pud]);
+            p.ud1 = weights.interpolate([m.ud1, m.lud1, m.wud1, m.pud1]);
+            p.up = weights.interpolate([m.up, m.lup, m.wup, m.pup]);
+            p.lp = weights.interpolate([m.lp, m.llp, m.wlp, m.plp]);
+            p.eu = weights.interpolate([m.eu, m.leu, m.weu, m.peu]);
+            p.u0 = weights.interpolate([m.u0, m.lu0, m.wu0, m.pu0]);
+            p.ute = weights.interpolate([m.ute, m.lute, m.wute, m.pute]);
+            p.ucs = weights.interpolate([m.ucs, m.lucs, m.wucs, m.pucs]);
+            p.ucste = weights.interpolate([m.ucste, m.lucste, m.wucste, m.pucste]);
+            p.voff = weights.interpolate([m.voff, m.lvoff, m.wvoff, m.pvoff]);
+            p.tvoff = weights.interpolate([m.tvoff, m.ltvoff, m.wtvoff, m.ptvoff]);
+            p.minv = weights.interpolate([m.minv, m.lminv, m.wminv, m.pminv]);
+            p.minvcv = weights.interpolate([m.minvcv, m.lminvcv, m.wminvcv, m.pminvcv]);
+            p.fprout = weights.interpolate([m.fprout, m.lfprout, m.wfprout, m.pfprout]);
+            p.pdits = weights.interpolate([m.pdits, m.lpdits, m.wpdits, m.ppdits]);
+            p.pditsd = weights.interpolate([m.pditsd, m.lpditsd, m.wpditsd, m.ppditsd]);
+            p.delta = weights.interpolate([m.delta, m.ldelta, m.wdelta, m.pdelta]);
+            p.rdsw = weights.interpolate([m.rdsw, m.lrdsw, m.wrdsw, m.prdsw]);
+            p.rdw = weights.interpolate([m.rdw, m.lrdw, m.wrdw, m.prdw]);
+            p.rsw = weights.interpolate([m.rsw, m.lrsw, m.wrsw, m.prsw]);
+            p.prwg = weights.interpolate([m.prwg, m.lprwg, m.wprwg, m.pprwg]);
+            p.prwb = weights.interpolate([m.prwb, m.lprwb, m.wprwb, m.pprwb]);
+            p.prt = weights.interpolate([m.prt, m.lprt, m.wprt, m.pprt]);
+            p.eta0 = weights.interpolate([m.eta0, m.leta0, m.weta0, m.peta0]);
+            p.teta0 = weights.interpolate([m.teta0, m.lteta0, m.wteta0, m.pteta0]);
+            p.tvoffcv = weights.interpolate([m.tvoffcv, m.ltvoffcv, m.wtvoffcv, m.ptvoffcv]);
+            p.etab = weights.interpolate([m.etab, m.letab, m.wetab, m.petab]);
+            p.pclm = weights.interpolate([m.pclm, m.lpclm, m.wpclm, m.ppclm]);
+            p.pdibl1 = weights.interpolate([m.pdibl1, m.lpdibl1, m.wpdibl1, m.ppdibl1]);
+            p.pdibl2 = weights.interpolate([m.pdibl2, m.lpdibl2, m.wpdibl2, m.ppdibl2]);
+            p.pdiblb = weights.interpolate([m.pdiblb, m.lpdiblb, m.wpdiblb, m.ppdiblb]);
+            p.pscbe1 = weights.interpolate([m.pscbe1, m.lpscbe1, m.wpscbe1, m.ppscbe1]);
+            p.pscbe2 = weights.interpolate([m.pscbe2, m.lpscbe2, m.wpscbe2, m.ppscbe2]);
+            p.pvag = weights.interpolate([m.pvag, m.lpvag, m.wpvag, m.ppvag]);
+            p.wr = weights.interpolate([m.wr, m.lwr, m.wwr, m.pwr]);
+            p.dwg = weights.interpolate([m.dwg, m.ldwg, m.wdwg, m.pdwg]);
+            p.dwb = weights.interpolate([m.dwb, m.ldwb, m.wdwb, m.pdwb]);
+            p.b0 = weights.interpolate([m.b0, m.lb0, m.wb0, m.pb0]);
+            p.b1 = weights.interpolate([m.b1, m.lb1, m.wb1, m.pb1]);
+            p.alpha0 = weights.interpolate([m.alpha0, m.lalpha0, m.walpha0, m.palpha0]);
+            p.alpha1 = weights.interpolate([m.alpha1, m.lalpha1, m.walpha1, m.palpha1]);
+            p.beta0 = weights.interpolate([m.beta0, m.lbeta0, m.wbeta0, m.pbeta0]);
+            p.agidl = weights.interpolate([m.agidl, m.lagidl, m.wagidl, m.pagidl]);
+            p.bgidl = weights.interpolate([m.bgidl, m.lbgidl, m.wbgidl, m.pbgidl]);
+            p.cgidl = weights.interpolate([m.cgidl, m.lcgidl, m.wcgidl, m.pcgidl]);
+            p.egidl = weights.interpolate([m.egidl, m.legidl, m.wegidl, m.pegidl]);
+            p.rgidl = weights.interpolate([m.rgidl, m.lrgidl, m.wrgidl, m.prgidl]);
+            p.kgidl = weights.interpolate([m.kgidl, m.lkgidl, m.wkgidl, m.pkgidl]);
+            p.fgidl = weights.interpolate([m.fgidl, m.lfgidl, m.wfgidl, m.pfgidl]);
+            p.agisl = weights.interpolate([m.agisl, m.lagisl, m.wagisl, m.pagisl]);
+            p.bgisl = weights.interpolate([m.bgisl, m.lbgisl, m.wbgisl, m.pbgisl]);
+            p.cgisl = weights.interpolate([m.cgisl, m.lcgisl, m.wcgisl, m.pcgisl]);
+            p.egisl = weights.interpolate([m.egisl, m.legisl, m.wegisl, m.pegisl]);
+            p.rgisl = weights.interpolate([m.rgisl, m.lrgisl, m.wrgisl, m.prgisl]);
+            p.kgisl = weights.interpolate([m.kgisl, m.lkgisl, m.wkgisl, m.pkgisl]);
+            p.fgisl = weights.interpolate([m.fgisl, m.lfgisl, m.wfgisl, m.pfgisl]);
+            p.aigc = weights.interpolate([m.aigc, m.laigc, m.waigc, m.paigc]);
+            p.bigc = weights.interpolate([m.bigc, m.lbigc, m.wbigc, m.pbigc]);
+            p.cigc = weights.interpolate([m.cigc, m.lcigc, m.wcigc, m.pcigc]);
+            p.aigsd = weights.interpolate([m.aigsd, m.laigsd, m.waigsd, m.paigsd]);
+            p.bigsd = weights.interpolate([m.bigsd, m.lbigsd, m.wbigsd, m.pbigsd]);
+            p.cigsd = weights.interpolate([m.cigsd, m.lcigsd, m.wcigsd, m.pcigsd]);
+            p.aigs = weights.interpolate([m.aigs, m.laigs, m.waigs, m.paigs]);
+            p.bigs = weights.interpolate([m.bigs, m.lbigs, m.wbigs, m.pbigs]);
+            p.cigs = weights.interpolate([m.cigs, m.lcigs, m.wcigs, m.pcigs]);
+            p.aigd = weights.interpolate([m.aigd, m.laigd, m.waigd, m.paigd]);
+            p.bigd = weights.interpolate([m.bigd, m.lbigd, m.wbigd, m.pbigd]);
+            p.cigd = weights.interpolate([m.cigd, m.lcigd, m.wcigd, m.pcigd]);
+            p.aigbacc = weights.interpolate([m.aigbacc, m.laigbacc, m.waigbacc, m.paigbacc]);
+            p.bigbacc = weights.interpolate([m.bigbacc, m.lbigbacc, m.wbigbacc, m.pbigbacc]);
+            p.cigbacc = weights.interpolate([m.cigbacc, m.lcigbacc, m.wcigbacc, m.pcigbacc]);
+            p.aigbinv = weights.interpolate([m.aigbinv, m.laigbinv, m.waigbinv, m.paigbinv]);
+            p.bigbinv = weights.interpolate([m.bigbinv, m.lbigbinv, m.wbigbinv, m.pbigbinv]);
+            p.cigbinv = weights.interpolate([m.cigbinv, m.lcigbinv, m.wcigbinv, m.pcigbinv]);
+            p.nigc = weights.interpolate([m.nigc, m.lnigc, m.wnigc, m.pnigc]);
+            p.nigbacc = weights.interpolate([m.nigbacc, m.lnigbacc, m.wnigbacc, m.pnigbacc]);
+            p.nigbinv = weights.interpolate([m.nigbinv, m.lnigbinv, m.wnigbinv, m.pnigbinv]);
+            p.ntox = weights.interpolate([m.ntox, m.lntox, m.wntox, m.pntox]);
+            p.eigbinv = weights.interpolate([m.eigbinv, m.leigbinv, m.weigbinv, m.peigbinv]);
+            p.pigcd = weights.interpolate([m.pigcd, m.lpigcd, m.wpigcd, m.ppigcd]);
+            p.poxedge = weights.interpolate([m.poxedge, m.lpoxedge, m.wpoxedge, m.ppoxedge]);
+            p.xrcrg1 = weights.interpolate([m.xrcrg1, m.lxrcrg1, m.wxrcrg1, m.pxrcrg1]);
+            p.xrcrg2 = weights.interpolate([m.xrcrg2, m.lxrcrg2, m.wxrcrg2, m.pxrcrg2]);
+            p.lambda = weights.interpolate([m.lambda, m.llambda, m.wlambda, m.plambda]);
+            p.vtl = weights.interpolate([m.vtl, m.lvtl, m.wvtl, m.pvtl]);
+            p.xn = weights.interpolate([m.xn, m.lxn, m.wxn, m.pxn]);
+            p.vfbsdoff = weights.interpolate([m.vfbsdoff, m.lvfbsdoff, m.wvfbsdoff, m.pvfbsdoff]);
             p.tvfbsdoff =
-                m.tvfbsdoff + m.ltvfbsdoff * Inv_L + m.wtvfbsdoff * Inv_W + m.ptvfbsdoff * Inv_LW;
-            p.cgsl = m.cgsl + m.lcgsl * Inv_L + m.wcgsl * Inv_W + m.pcgsl * Inv_LW;
-            p.cgdl = m.cgdl + m.lcgdl * Inv_L + m.wcgdl * Inv_W + m.pcgdl * Inv_LW;
-            p.ckappas = m.ckappas + m.lckappas * Inv_L + m.wckappas * Inv_W + m.pckappas * Inv_LW;
-            p.ckappad = m.ckappad + m.lckappad * Inv_L + m.wckappad * Inv_W + m.pckappad * Inv_LW;
-            p.cf = m.cf + m.lcf * Inv_L + m.wcf * Inv_W + m.pcf * Inv_LW;
-            p.clc = m.clc + m.lclc * Inv_L + m.wclc * Inv_W + m.pclc * Inv_LW;
-            p.cle = m.cle + m.lcle * Inv_L + m.wcle * Inv_W + m.pcle * Inv_LW;
-            p.vfbcv = m.vfbcv + m.lvfbcv * Inv_L + m.wvfbcv * Inv_W + m.pvfbcv * Inv_LW;
-            p.acde = m.acde + m.lacde * Inv_L + m.wacde * Inv_W + m.pacde * Inv_LW;
-            p.moin = m.moin + m.lmoin * Inv_L + m.wmoin * Inv_W + m.pmoin * Inv_LW;
-            p.noff = m.noff + m.lnoff * Inv_L + m.wnoff * Inv_W + m.pnoff * Inv_LW;
-            p.voffcv = m.voffcv + m.lvoffcv * Inv_L + m.wvoffcv * Inv_W + m.pvoffcv * Inv_LW;
-            p.kvth0we = m.kvth0we + m.lkvth0we * Inv_L + m.wkvth0we * Inv_W + m.pkvth0we * Inv_LW;
-            p.k2we = m.k2we + m.lk2we * Inv_L + m.wk2we * Inv_W + m.pk2we * Inv_LW;
-            p.ku0we = m.ku0we + m.lku0we * Inv_L + m.wku0we * Inv_W + m.pku0we * Inv_LW;
+                weights.interpolate([m.tvfbsdoff, m.ltvfbsdoff, m.wtvfbsdoff, m.ptvfbsdoff]);
+            p.cgsl = weights.interpolate([m.cgsl, m.lcgsl, m.wcgsl, m.pcgsl]);
+            p.cgdl = weights.interpolate([m.cgdl, m.lcgdl, m.wcgdl, m.pcgdl]);
+            p.ckappas = weights.interpolate([m.ckappas, m.lckappas, m.wckappas, m.pckappas]);
+            p.ckappad = weights.interpolate([m.ckappad, m.lckappad, m.wckappad, m.pckappad]);
+            p.cf = weights.interpolate([m.cf, m.lcf, m.wcf, m.pcf]);
+            p.clc = weights.interpolate([m.clc, m.lclc, m.wclc, m.pclc]);
+            p.cle = weights.interpolate([m.cle, m.lcle, m.wcle, m.pcle]);
+            p.vfbcv = weights.interpolate([m.vfbcv, m.lvfbcv, m.wvfbcv, m.pvfbcv]);
+            p.acde = weights.interpolate([m.acde, m.lacde, m.wacde, m.pacde]);
+            p.moin = weights.interpolate([m.moin, m.lmoin, m.wmoin, m.pmoin]);
+            p.noff = weights.interpolate([m.noff, m.lnoff, m.wnoff, m.pnoff]);
+            p.voffcv = weights.interpolate([m.voffcv, m.lvoffcv, m.wvoffcv, m.pvoffcv]);
+            p.kvth0we = weights.interpolate([m.kvth0we, m.lkvth0we, m.wkvth0we, m.pkvth0we]);
+            p.k2we = weights.interpolate([m.k2we, m.lk2we, m.wk2we, m.pk2we]);
+            p.ku0we = weights.interpolate([m.ku0we, m.lku0we, m.wku0we, m.pku0we]);
             p.abulkCVfactor = 1.0 + pow((p.clc / p.leffCV), p.cle);
-            T0 = (TRatio - 1.0);
+            T0 = (relative_temperature_change(Temp, Tnom));
             PowWeffWr = pow(p.weffCJ * 1.0e6, p.wr) * h.nf;
             T4 = 0.0;
             T3 = T4;
@@ -993,7 +1227,12 @@ pub(super) fn temperature_instance(
             if p.u0 > 1.0 {
                 p.u0 = p.u0 / 1.0e4;
             }
-            T5 = 1.0 - p.up * exp(-p.leff / p.lp);
+            let mobility_argument = -p.leff / p.lp;
+            T5 = if mobility_argument.abs() < 0.5 {
+                (-p.up).mul_add(mobility_argument.exp_m1(), 1. - p.up)
+            } else {
+                1. - p.up * exp(mobility_argument)
+            };
             p.u0temp = p.u0 * T5 * pow(TRatio, p.ute);
             if p.eu < 0.0 {
                 p.eu = 0.0;
@@ -1152,9 +1391,7 @@ pub(super) fn temperature_instance(
                     p.gamma2 = 5.753e-12 * sqrt(p.nsub) / m.coxe;
                 }
                 T0 = p.gamma1 - p.gamma2;
-                T1 = sqrt(p.phi - p.vbx) - p.sqrtPhi;
-                T2 = sqrt(p.phi * (p.phi - p.vbm)) - p.phi;
-                p.k2 = T0 * T1 / (2.0 * T2 + p.vbm);
+                p.k2 = body_coefficient(p.phi, p.vbx, p.vbm, T0);
                 p.k1 = p.gamma2 - 2.0 * p.k2 * sqrt(p.phi - p.vbm);
             }
             if !m.vfbGiven {
@@ -1180,61 +1417,29 @@ pub(super) fn temperature_instance(
             p.k1ox = p.k1 * toxe / m.toxm;
             tmp = sqrt(epssub / (epsrox * EPS0) * toxe * p.Xdep0);
             T0 = p.dsub * p.leff / tmp;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                p.theta0vb0 = T1 / T4;
-            } else {
-                p.theta0vb0 = 1.0 / (MAX_EXP - 2.0);
-            }
+            p.theta0vb0 = short_channel_factor(T0);
             T0 = p.drout * p.leff / tmp;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                T5 = T1 / T4;
-            } else {
-                T5 = 1.0 / (MAX_EXP - 2.0);
-            }
+            T5 = short_channel_factor(T0);
             p.thetaRout = p.pdibl1 * T5 + p.pdibl2;
             tmp = sqrt(p.Xdep0);
             tmp1 = p.vbi - p.phi;
             tmp2 = m.factor1 * tmp;
             T0 = p.dvt1w * p.weff * p.leff / tmp2;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                T8 = T1 / T4;
-            } else {
-                T8 = 1.0 / (MAX_EXP - 2.0);
-            }
+            T8 = short_channel_factor(T0);
             T0 = p.dvt0w * T8;
             T8 = T0 * tmp1;
             T0 = p.dvt1 * p.leff / tmp2;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                T9 = T1 / T4;
-            } else {
-                T9 = 1.0 / (MAX_EXP - 2.0);
-            }
+            T9 = short_channel_factor(T0);
             T9 = p.dvt0 * T9 * tmp1;
             T4 = toxe * p.phi / (p.weff + p.w0);
-            T0 = sqrt(1.0 + p.lpe0 / p.leff);
+            T0 = sqrt_one_plus_difference(p.lpe0 / p.leff);
             if (m.tempMod == 1) || (m.tempMod == 0) {
-                T3 = (p.kt1 + p.kt1l / p.leff) * (TRatio - 1.0);
+                T3 = (p.kt1 + p.kt1l / p.leff) * (relative_temperature_change(Temp, Tnom));
             }
             if (m.tempMod == 2) || (m.tempMod == 3) {
-                T3 = -p.kt1 * (TRatio - 1.0);
+                T3 = -p.kt1 * (relative_temperature_change(Temp, Tnom));
             }
-            T5 = p.k1ox * (T0 - 1.0) * p.sqrtPhi + T3;
+            T5 = p.k1ox * T0 * p.sqrtPhi + T3;
             p.vfbzbfactor = -T8 - T9 + p.k3 * T4 + T5 - p.phi - p.k1 * p.sqrtPhi;
             wlod = m.wlod;
             if m.wlod < 0.0 {
@@ -1254,7 +1459,7 @@ pub(super) fn temperature_instance(
             tmp1 = m.lkvth0 / T0 + m.wkvth0 / T1 + m.pkvth0 / (T0 * T1);
             p.kvth0 = 1.0 + tmp1;
             p.kvth0 = sqrt(p.kvth0 * p.kvth0 + DELTA);
-            T0 = (TRatio - 1.0);
+            T0 = (relative_temperature_change(Temp, Tnom));
             p.ku0temp = p.ku0 * (1.0 + m.tku0 * T0) + DELTA;
             Inv_saref = 1.0 / (m.saref + 0.5 * Ldrn);
             Inv_sbref = 1.0 / (m.sbref + 0.5 * Ldrn);
@@ -1263,15 +1468,7 @@ pub(super) fn temperature_instance(
             if m.mobMod == 3 {
                 lt1 = m.factor1 * p.sqrtXdep0;
                 T0 = p.dvt1 * p.leff / lt1;
-                if T0 < EXP_THRESHOLD {
-                    T1 = exp(T0);
-                    T2 = T1 - 1.0;
-                    T3 = T2 * T2;
-                    T4 = T3 + 2.0 * T1 * MIN_EXP;
-                    Theta0 = T1 / T4;
-                } else {
-                    Theta0 = 1.0 / (MAX_EXP - 2.0);
-                }
+                Theta0 = short_channel_factor(T0);
                 tmp1 = epssub / p.Xdep0;
                 tmp2 = p.nfactor * tmp1;
                 tmp3 = (tmp2 + p.cdsc * Theta0 + p.cit) / m.coxe;
@@ -1710,8 +1907,9 @@ pub(super) fn temperature_instance(
                     }
                 }
                 1 => {
-                    h.vjsmFwd = dio_ijth_vjm_eval(Nvtms, m.ijthsfwd, SourceSatCurrent, 0.0);
-                    h.IVjsmFwd = SourceSatCurrent * exp(h.vjsmFwd / Nvtms);
+                    let limit = forward_limit(Nvtms, m.ijthsfwd, SourceSatCurrent, None);
+                    h.vjsmFwd = limit.voltage;
+                    h.IVjsmFwd = limit.current;
                 }
                 2 => {
                     if (m.bvs / Nvtms) > EXP_THRESHOLD {
@@ -1722,10 +1920,10 @@ pub(super) fn temperature_instance(
                         tmp = h.XExpBVS;
                         h.XExpBVS *= m.xjbvs;
                     }
-                    h.vjsmFwd = dio_ijth_vjm_eval(Nvtms, m.ijthsfwd, SourceSatCurrent, h.XExpBVS);
-                    T0 = exp(h.vjsmFwd / Nvtms);
-                    h.IVjsmFwd = SourceSatCurrent * (T0 - h.XExpBVS / T0 + h.XExpBVS - 1.0);
-                    h.SslpFwd = SourceSatCurrent * (T0 + h.XExpBVS / T0) / Nvtms;
+                    let limit = forward_limit(Nvtms, m.ijthsfwd, SourceSatCurrent, Some(h.XExpBVS));
+                    h.vjsmFwd = limit.voltage;
+                    h.IVjsmFwd = limit.current;
+                    h.SslpFwd = limit.slope;
                     T2 = m.ijthsrev / SourceSatCurrent;
                     if T2 < 1.0 {
                         T2 = 10.0;
@@ -1761,8 +1959,9 @@ pub(super) fn temperature_instance(
                     }
                 }
                 1 => {
-                    h.vjdmFwd = dio_ijth_vjm_eval(Nvtmd, m.ijthdfwd, DrainSatCurrent, 0.0);
-                    h.IVjdmFwd = DrainSatCurrent * exp(h.vjdmFwd / Nvtmd);
+                    let limit = forward_limit(Nvtmd, m.ijthdfwd, DrainSatCurrent, None);
+                    h.vjdmFwd = limit.voltage;
+                    h.IVjdmFwd = limit.current;
                 }
                 2 => {
                     if (m.bvd / Nvtmd) > EXP_THRESHOLD {
@@ -1773,10 +1972,10 @@ pub(super) fn temperature_instance(
                         tmp = h.XExpBVD;
                         h.XExpBVD *= m.xjbvd;
                     }
-                    h.vjdmFwd = dio_ijth_vjm_eval(Nvtmd, m.ijthdfwd, DrainSatCurrent, h.XExpBVD);
-                    T0 = exp(h.vjdmFwd / Nvtmd);
-                    h.IVjdmFwd = DrainSatCurrent * (T0 - h.XExpBVD / T0 + h.XExpBVD - 1.0);
-                    h.DslpFwd = DrainSatCurrent * (T0 + h.XExpBVD / T0) / Nvtmd;
+                    let limit = forward_limit(Nvtmd, m.ijthdfwd, DrainSatCurrent, Some(h.XExpBVD));
+                    h.vjdmFwd = limit.voltage;
+                    h.IVjdmFwd = limit.current;
+                    h.DslpFwd = limit.slope;
                     T2 = m.ijthdrev / DrainSatCurrent;
                     if T2 < 1.0 {
                         T2 = 10.0;
@@ -1794,7 +1993,7 @@ pub(super) fn temperature_instance(
                 }
             }
         }
-        T0 = (TRatio - 1.0);
+        T0 = (relative_temperature_change(Temp, Tnom));
         m.njtsstemp = m.njts * (1.0 + m.tnjts * T0);
         m.njtsswstemp = m.njtssw * (1.0 + m.tnjtssw * T0);
         m.njtsswgstemp = m.njtsswg * (1.0 + m.tnjtsswg * T0);
@@ -1861,30 +2060,14 @@ pub(super) fn temperature_instance(
             lt1 = m.factor1 * p.sqrtXdep0;
             ltw = lt1;
             T0 = p.dvt1 * m.leffeot / lt1;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                Theta0 = T1 / T4;
-            } else {
-                Theta0 = 1.0 / (MAX_EXP - 2.0);
-            }
+            Theta0 = short_channel_factor(T0);
             Delt_vth = p.dvt0 * Theta0 * V0;
             T0 = p.dvt1w * m.weffeot * m.leffeot / ltw;
-            if T0 < EXP_THRESHOLD {
-                T1 = exp(T0);
-                T2 = T1 - 1.0;
-                T3 = T2 * T2;
-                T4 = T3 + 2.0 * T1 * MIN_EXP;
-                T5 = T1 / T4;
-            } else {
-                T5 = 1.0 / (MAX_EXP - 2.0);
-            }
+            T5 = short_channel_factor(T0);
             T2 = p.dvt0w * T5 * V0;
-            TempRatioeot = m.tempeot / m.tnom - 1.0;
-            T0 = sqrt(1.0 + p.lpe0 / m.leffeot);
-            T1 = p.k1ox * (T0 - 1.0) * sqrt(phieot) + (p.kt1 + p.kt1l / m.leffeot) * TempRatioeot;
+            TempRatioeot = relative_temperature_change(m.tempeot, m.tnom);
+            T0 = sqrt_one_plus_difference(p.lpe0 / m.leffeot);
+            T1 = p.k1ox * T0 * sqrt(phieot) + (p.kt1 + p.kt1l / m.leffeot) * TempRatioeot;
             let width_with_offset = m.weffeot + p.w0;
             Vth_NarrowW = toxe * phieot / width_with_offset;
             Lpe_Vb = sqrt(1.0 + p.lpeb / m.leffeot);
@@ -1905,9 +2088,9 @@ pub(super) fn temperature_instance(
             if p.dvtp0 > 0.0 {
                 T3 = m.leffeot + p.dvtp0 * 2.0;
                 if m.tempMod < 2 {
-                    T4 = Vtmeot * log(m.leffeot / T3);
+                    T4 = -Vtmeot * (p.dvtp0 * 2.0 / m.leffeot).ln_1p();
                 } else {
-                    T4 = Vtm0eot * log(m.leffeot / T3);
+                    T4 = -Vtm0eot * (p.dvtp0 * 2.0 / m.leffeot).ln_1p();
                 }
                 Vth -= n * T4;
             }
@@ -2066,6 +2249,103 @@ mod tests {
         let v = dio_ijth_vjm_eval(0.025, 0.1, 1e-14, 0.0);
         let current = 1e-14 * ((v / 0.025).exp() - 1.0);
         assert!((current - 0.1).abs() < 1e-12, "{current}");
+    }
+
+    #[test]
+    fn thermal_exponent_preserves_adjacent_temperature() {
+        let nominal = 300.15_f64;
+        let temperature = nominal.next_up();
+        let relative = relative_temperature_change(temperature, nominal);
+        assert!((relative - (temperature - nominal) / nominal).abs() <= f64::EPSILON * relative);
+        // 80-digit Decimal evaluation of the exact binary64 inputs.
+        let expected = 8.752_540_934_682_474e-15;
+        let actual = thermal_bandgap_difference(nominal, temperature, 1.16, 7.02e-4, 1108.);
+        assert!((actual - expected).abs() < 4. * f64::EPSILON * expected);
+        for temperature in [100., 250., 300.15, 400., 1000.] {
+            let actual = thermal_bandgap_difference(nominal, temperature, 1.16, 7.02e-4, 1108.);
+            let reverse = thermal_bandgap_difference(temperature, nominal, 1.16, 7.02e-4, 1108.);
+            assert!((actual + reverse).abs() < 8. * f64::EPSILON * actual.abs() + 1e-30);
+        }
+        assert!(log_temperature_ratio(1e-300, 1e300).is_finite());
+        assert!(log_temperature_ratio(1e300, 1e-300).is_finite());
+    }
+
+    #[test]
+    fn body_effect_keeps_the_negative_denominator_at_small_bias() {
+        for (vbm, expected) in [
+            (-1e-3, -32_372.714_843_375_565),
+            (-1e-6, -32_349_635_207.732_25),
+            (-1e-9, -3.234_961_212_397_745e16),
+            (-1e-12, -3.234_961_210_089_369_6e22),
+        ] {
+            let actual = body_coefficient(0.7, -0.1, vbm, 0.2);
+            assert!((actual - expected).abs() < 8. * f64::EPSILON * expected.abs());
+        }
+        assert_eq!(sqrt_one_plus_difference(1e-20), 5e-21);
+    }
+
+    #[test]
+    fn short_channel_factor_matches_high_precision_near_zero_and_clamp() {
+        for (argument, expected) in [
+            (1e-12, 291_730_871_270_878.6),
+            (1e-8, 283_461_426_462_222.06),
+            (1e-7, 74_472_269_787_201.64),
+            (0.1, 99.916_708_316_770_5),
+        ] {
+            let actual = short_channel_factor(argument);
+            assert!((actual - expected).abs() < 8. * f64::EPSILON * expected);
+        }
+        assert_eq!(short_channel_factor(EXP_THRESHOLD), 1. / (MAX_EXP - 2.));
+        assert_eq!(short_channel_factor(f64::NAN), 1. / (MAX_EXP - 2.));
+    }
+
+    #[test]
+    fn diode_limit_inverts_current_even_when_exp_rounds_to_one() {
+        for (ratio, coefficient) in [
+            (1e-18, 0.),
+            (1e-18, 1.),
+            (1e-12, 1e8),
+            (1e-4, 1e12),
+            (1e-6, 0.01),
+            (1e100, 0.1),
+            (1e300, 1.),
+        ] {
+            let nvtm = 0.025;
+            let limit = forward_limit(nvtm, ratio, 1., Some(coefficient));
+            let z = (limit.voltage / nvtm).exp_m1();
+            let reconstructed = z + coefficient * (z / (1. + z));
+            assert!(
+                (reconstructed / ratio - 1.).abs() < 2e-13,
+                "ratio={ratio:e}, breakdown={coefficient:e}"
+            );
+            assert_eq!(limit.current, ratio);
+            let y = 1. + z;
+            let slope = (y + coefficient / y) / nvtm;
+            assert!((limit.slope / slope - 1.).abs() < 2e-13);
+        }
+        let limit = forward_limit(0.025, 1e100, 1e-300, Some(0.1));
+        assert!(limit.voltage.is_finite());
+        assert!((limit.voltage / 0.025 - (1e100_f64.ln() - 1e-300_f64.ln())).abs() < 1e-12);
+        assert_eq!(limit.current, 1e100);
+        assert!((limit.slope / 4e101 - 1.).abs() < 1e-14);
+        assert_eq!(forward_limit(0.025, 0., 1., Some(1e100)).voltage, 0.);
+    }
+
+    #[test]
+    fn model_bin_recovery_rounds_cancelled_products_once() {
+        let unit = BinWeights([1.; 4]);
+        assert_eq!(unit.interpolate([1e16, 1., -1e16, 0.]), 1.);
+        let eps = f64::EPSILON;
+        let product = BinWeights([1., 1. - eps, 1., 1.]);
+        assert_eq!(product.interpolate([-1., 1. + eps, 0., 0.]), -eps * eps);
+        let wide = BinWeights([1., 2., 2., 1.]);
+        assert_eq!(wide.interpolate([0., 1e308, -1e308, 1.]), 1.);
+        assert!(unit.interpolate([f64::INFINITY, 0., 0., 0.]).is_infinite());
+        assert!(
+            unit.interpolate([f64::INFINITY, f64::NEG_INFINITY, 0., 0.])
+                .is_nan()
+        );
+        assert_eq!(unit.interpolate([-0.; 4]).to_bits(), (-0_f64).to_bits());
     }
 
     #[test]
