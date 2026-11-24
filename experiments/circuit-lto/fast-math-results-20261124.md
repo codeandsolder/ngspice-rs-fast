@@ -74,3 +74,36 @@ case=4 mode=baked {"cells":404,"changed":199,"maxAbsolute":5.4001247917767614e-1
 Source: abe04e2; scripts build-fast-math-plugin.sh, build-fast-math.sh, fast-matrix.sh, summarize-fast-matrix.mjs and compare-dumps.mjs. Raw data in /home/jan/build/ngspice-rs-fast/circuit-lto/optimized; cold-storage logs under cold-storage. SHA256 of native matrix logs:
 75fef7274a8876fd73aed19f3ee7e4db59fd80f381c78fc320fca3a7a13713fa  /home/jan/build/ngspice-rs-fast/circuit-lto/optimized/cold-storage/znver2/native-fast/matrix.log
 7d408c8e88a3a33d7d7ca34a76253a5910ce60e8298faa838a5a0c38ed5154f9  /home/jan/build/ngspice-rs-fast/circuit-lto/optimized/cold-storage/znver5/native-fast/matrix.log
+
+## PGO matched strict and fast controls, cold-storage
+Same previous PGO profiles; two benchmark harness hash warnings on both sides, matched source and flags apart from plugin.
+
+### znver5
+| Case | Variant | Generic ms | Baked ms | Generic speedup vs strict | Baked speedup vs strict | Baked vs generic |
+|---|---|---:|---:|---:|---:|---:|
+| rc_transient | pgo-strict | 0.0663 | 0.0622 | 1.000x | 1.000x | 1.066x |
+| rc_transient | pgo-fast | 0.0650 | 0.0630 | 1.019x | 0.987x | 1.032x |
+| m4_diode_tran | pgo-strict | 0.9867 | 0.9992 | 1.000x | 1.000x | 0.988x |
+| m4_diode_tran | pgo-fast | 0.9403 | 0.9148 | 1.049x | 1.092x | 1.028x |
+| m11_bsim4_tran | pgo-strict | 2.6539 | 2.7664 | 1.000x | 1.000x | 0.959x |
+| m11_bsim4_tran | pgo-fast | 2.5861 | 2.6788 | 1.026x | 1.033x | 0.965x |
+| m11_bsim4_dc | pgo-strict | 0.2048 | 0.2030 | 1.000x | 1.000x | 1.009x |
+| m11_bsim4_dc | pgo-fast | 0.1915 | 0.1927 | 1.070x | 1.054x | 0.994x |
+| diode100_op | pgo-strict | 0.2034 | 0.2129 | 1.000x | 1.000x | 0.955x |
+| diode100_op | pgo-fast | 0.1998 | 0.2023 | 1.018x | 1.052x | 0.988x |
+
+### znver2
+| Case | Variant | Generic ms | Baked ms | Generic speedup vs strict | Baked speedup vs strict | Baked vs generic |
+|---|---|---:|---:|---:|---:|---:|
+| rc_transient | pgo-strict | 0.0637 | 0.0611 | 1.000x | 1.000x | 1.043x |
+| rc_transient | pgo-fast | 0.0614 | 0.0571 | 1.039x | 1.071x | 1.075x |
+| m4_diode_tran | pgo-strict | 1.0232 | 0.9772 | 1.000x | 1.000x | 1.047x |
+| m4_diode_tran | pgo-fast | 0.9120 | 0.8849 | 1.122x | 1.104x | 1.031x |
+| m11_bsim4_tran | pgo-strict | 2.9886 | 2.6501 | 1.000x | 1.000x | 1.128x |
+| m11_bsim4_tran | pgo-fast | 2.7717 | 2.5748 | 1.078x | 1.029x | 1.076x |
+| m11_bsim4_dc | pgo-strict | 0.2096 | 0.2110 | 1.000x | 1.000x | 0.993x |
+| m11_bsim4_dc | pgo-fast | 0.2034 | 0.2046 | 1.030x | 1.031x | 0.994x |
+| diode100_op | pgo-strict | 0.2088 | 0.2094 | 1.000x | 1.000x | 0.998x |
+| diode100_op | pgo-fast | 0.1907 | 0.2010 | 1.095x | 1.042x | 0.949x |
+
+PGO absorbs much of the benefit. Blanket fast improves native non-PGO results but adds only about 2–7% generic and -1–9% baked on Zen 5 PGO; Zen 2-targeted PGO on the same host gives 3–12% generic and 3–10% baked. Keep as an experiment, investigate flags individually only if worth the engineering cost. No production change.
