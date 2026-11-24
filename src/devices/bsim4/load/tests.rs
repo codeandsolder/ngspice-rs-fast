@@ -18,6 +18,8 @@ struct Trace {
     order: u64,
     values: u64,
     events: usize,
+    matrix: [[f64; node::COUNT]; node::COUNT],
+    rhs: [f64; node::COUNT],
 }
 
 impl Trace {
@@ -96,9 +98,15 @@ impl LoadCkt for Trace {
             u64::from(col.cast_unsigned()),
             value,
         );
+        if row >= 0 && col >= 0 {
+            self.matrix[row.cast_unsigned() as usize][col.cast_unsigned() as usize] += value;
+        }
     }
     fn rhs(&mut self, node: i32, value: f64) {
         self.event(5, u64::from(node.cast_unsigned()), 0, value);
+        if node >= 0 {
+            self.rhs[node.cast_unsigned() as usize] += value;
+        }
     }
 }
 
@@ -171,6 +179,8 @@ fn load_event_sequence_and_field_values() {
             order: seed,
             values: seed,
             events: 0,
+            matrix: [[0.; node::COUNT]; node::COUNT],
+            rhs: [0.; node::COUNT],
         };
         for (kind, limiting, reverse) in [
             (mode::MODEDCOP | mode::MODEINITJCT, true, false),
@@ -303,6 +313,8 @@ impl PhysicalFixture {
             order: 0,
             values: 0,
             events: 0,
+            matrix: [[0.; node::COUNT]; node::COUNT],
+            rhs: [0.; node::COUNT],
         };
         let bias = super::bias::select(&self.model, &instance, &mut trace);
         let electro =
@@ -719,5 +731,180 @@ fn smooth_positive_retains_small_tail_and_slope() {
         let (expected, error) = richardson(samples, h);
         assert!(value > 0.);
         assert!((slope - expected).abs() < 1e-8 * expected.abs() + error + 1e-12);
+    }
+}
+
+fn junction_trace(temperature: f64, kind: u32, voltage: [f64; node::COUNT]) -> Trace {
+    Trace {
+        temperature,
+        mode: kind | mode::MODEINITFLOAT,
+        limiting: false,
+        voltage,
+        s0: [0.; state::COUNT],
+        s1: [0.; state::COUNT],
+        s2: [0.; state::COUNT],
+        order: 0,
+        values: 0,
+        events: 0,
+        matrix: [[0.; node::COUNT]; node::COUNT],
+        rhs: [0.; node::COUNT],
+    }
+}
+
+#[test]
+fn junction_current_and_charge_keep_asymmetric_tiny_bias_terms() {
+    use super::junction::{JunctionBias, charge, current};
+    let mut fixture = PhysicalFixture::prepare(
+        Model {
+            dioMod: 1,
+            dioModGiven: true,
+            ..Model::default()
+        },
+        300.15,
+    );
+    let m = &mut fixture.model;
+    let h = &mut fixture.instance;
+    let p = &mut fixture.size;
+    h.Aseff = 1e-12;
+    h.Adeff = 2e-12;
+    h.vjsmFwd = 1.;
+    h.vjdmFwd = 1.;
+    h.Pseff = 1e-6;
+    h.Pdeff = 3e-6;
+    h.nf = 1.;
+    p.weffCJ = 2e-6;
+    m.SjctTempSatCurDensity = 1.;
+    m.DjctTempSatCurDensity = 3.;
+    m.SjctSidewallTempSatCurDensity = 0.;
+    m.DjctSidewallTempSatCurDensity = 0.;
+    m.SjctGateSidewallTempSatCurDensity = 0.;
+    m.DjctGateSidewallTempSatCurDensity = 0.;
+    m.SunitAreaTempJctCap = 1.;
+    m.DunitAreaTempJctCap = 2.;
+    m.SunitLengthSidewallTempJctCap = 1e-6;
+    m.DunitLengthSidewallTempJctCap = 2e-6;
+    m.SunitLengthGateSidewallTempJctCap = 3e-6;
+    m.DunitLengthGateSidewallTempJctCap = 4e-6;
+    let mut trace = junction_trace(300.15, mode::MODEDCOP, [0.; node::COUNT]);
+    let source_slope = 1e-12 / (m.vtm * m.SjctEmissionCoeff) + trace.gmin();
+    let drain_slope = 6e-12 / (m.vtm * m.DjctEmissionCoeff) + trace.gmin();
+    for sign in [-1., 1.] {
+        let voltage = sign * 1e-18;
+        let bias = JunctionBias {
+            source: voltage,
+            drain: -voltage,
+        };
+        current(m, h, p, &trace, bias);
+        charge(m, h, p, &mut trace, bias);
+        assert!((h.cbs / (source_slope * voltage) - 1.).abs() < 16. * f64::EPSILON);
+        assert!((h.cbd / (-drain_slope * voltage) - 1.).abs() < 16. * f64::EPSILON);
+        assert!((h.gbs / source_slope - 1.).abs() < 16. * f64::EPSILON);
+        assert!((h.gbd / drain_slope - 1.).abs() < 16. * f64::EPSILON);
+        let source_cap = 8e-12;
+        let drain_cap = 18e-12;
+        assert!(
+            (trace.state0(state::QBS) / (source_cap * voltage) - 1.).abs() < 16. * f64::EPSILON
+        );
+        assert!(
+            (trace.state0(state::QBD) / (-drain_cap * voltage) - 1.).abs() < 16. * f64::EPSILON
+        );
+        assert!((h.capbs / source_cap - 1.).abs() < 16. * f64::EPSILON);
+        assert!((h.capbd / drain_cap - 1.).abs() < 16. * f64::EPSILON);
+    }
+}
+
+fn assert_conserved(values: &[f64], label: &str) {
+    let total: f64 = values.iter().sum();
+    let magnitude: f64 = values.iter().map(|x| x.abs()).sum();
+    assert!(
+        total.abs() <= 256. * f64::EPSILON * magnitude + 1e-26,
+        "{label}: residual={total:e}, magnitude={magnitude:e}, values={values:?}"
+    );
+}
+
+#[test]
+fn full_nonlinear_stamps_conserve_physical_rows_and_common_mode_with_aliases() {
+    let q = usize::try_from(node::Q).unwrap();
+    for polarity in [-1, 1] {
+        for (gate, body, nqs, rds) in [(0, 0, 0, 0), (2, 1, 0, 1), (3, 2, 1, 1)] {
+            let model = Model {
+                r#type: polarity,
+                typeGiven: true,
+                igcMod: 1,
+                igcModGiven: true,
+                igbMod: 1,
+                igbModGiven: true,
+                rgateMod: gate,
+                rgateModGiven: true,
+                rbodyMod: body,
+                rbodyModGiven: true,
+                trnqsMod: nqs,
+                trnqsModGiven: true,
+                rdsMod: rds,
+                rdsModGiven: true,
+                agidl: 1e-8,
+                agidlGiven: true,
+                bgidl: 1e9,
+                bgidlGiven: true,
+                agisl: 2e-8,
+                agislGiven: true,
+                bgisl: 1e9,
+                bgislGiven: true,
+                ..Model::default()
+            };
+            let instance = Instance {
+                l: 0.5e-6,
+                lGiven: true,
+                w: 2e-6,
+                wGiven: true,
+                sourceArea: 1e-12,
+                sourceAreaGiven: true,
+                drainArea: 2e-12,
+                drainAreaGiven: true,
+                sourcePerimeter: 2e-6,
+                sourcePerimeterGiven: true,
+                drainPerimeter: 3e-6,
+                drainPerimeterGiven: true,
+                ..super::super::acld::tests::shaped(gate, body, nqs)
+            };
+            let set::PreparedSetup {
+                mut model,
+                mut instance,
+                mut warnings,
+                ..
+            } = set::prepare_model(model, 300.15).prepare_instance(instance, false);
+            let size = temp::temperature(
+                &mut model,
+                &mut instance,
+                300.15,
+                "nch",
+                "m1",
+                &mut warnings,
+            )
+            .unwrap();
+            for (drain, source) in [(0.6, 0.), (-0.2, 0.1), (1e-12, 0.)] {
+                for kind in [mode::MODEDCOP, mode::MODETRAN] {
+                    let p = f64::from(polarity);
+                    let voltage = [
+                        drain, 0.9, source, -0.2, drain, 0.89, 0.9, source, -0.2, -0.21, -0.19, 0.,
+                    ]
+                    .map(|x| p * x);
+                    let mut trace = junction_trace(300.15, kind, voltage);
+                    let mut instance = instance.clone();
+                    super::load(&model, &mut instance, &size, &mut trace).unwrap();
+                    let label = format!(
+                        "p={polarity} gate={gate} body={body} nqs={nqs} drain={drain} kind={kind}"
+                    );
+                    assert_conserved(&trace.rhs[..q], &format!("{label} RHS KCL"));
+                    for col in 0..node::COUNT {
+                        let column: Vec<_> = trace.matrix[..q].iter().map(|r| r[col]).collect();
+                        assert_conserved(&column, &format!("{label} column {col}"));
+                    }
+                    for (row, values) in trace.matrix.iter().enumerate() {
+                        assert_conserved(&values[..q], &format!("{label} common mode row {row}"));
+                    }
+                }
+            }
+        }
     }
 }

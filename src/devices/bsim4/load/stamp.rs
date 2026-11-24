@@ -8,10 +8,6 @@
     reason = "C equation names preserve the reference distinctions"
 )]
 #![expect(
-    clippy::suboptimal_flops,
-    reason = "preserve non-fused C floating-point arithmetic"
-)]
-#![expect(
     unused_mut,
     reason = "reference scratch variables may be assigned on different branches"
 )]
@@ -23,14 +19,60 @@
     clippy::cognitive_complexity,
     reason = "retain version-specific reference physics branches"
 )]
-#![expect(unused_parens, reason = "preserve C expression grouping")]
 use super::{Instance, LoadCkt, Model};
 use super::{
     bias::LoadBias,
     charge::{CapacitanceStamp, ChargeCurrents, Companion, NqsStamp},
 };
 
+/// Ordered finite product sum with recovery for severe cancellation or
+/// range loss. The Newton residual is the difference between a physical
+/// current and its linearization; losing the small remainder changes the
+/// RHS even when the individual branch current and slope are accurate.
+#[inline]
+fn residual<const N: usize>(terms: [(f64, f64); N]) -> f64 {
+    let mut products = terms.into_iter().map(|(a, b)| a * b);
+    let Some(first) = products.next() else {
+        return 0.;
+    };
+    let (ordinary, magnitude) = products.fold((first, first.abs()), |(sum, magnitude), term| {
+        (sum + term, magnitude + term.abs())
+    });
+    if ordinary.is_normal() && ordinary.abs() > 0.125 * magnitude {
+        return ordinary;
+    }
+    if magnitude == 0. && terms.iter().all(|&(a, b)| a == 0. || b == 0.) {
+        return ordinary;
+    }
+    recover_residual(terms, ordinary)
+}
+
+#[cold]
+fn recover_residual<const N: usize>(terms: [(f64, f64); N], ordinary: f64) -> f64 {
+    if !terms.iter().all(|&(a, b)| a.is_finite() && b.is_finite()) {
+        return ordinary;
+    }
+    let mut accumulator = crate::primitives::ExactSum::new();
+    for (a, b) in terms {
+        accumulator.add_product(a, b);
+    }
+    let result = accumulator.rounded_sum();
+    if result == 0. && ordinary == 0. {
+        ordinary
+    } else {
+        result
+    }
+}
+
+fn sum<const N: usize>(terms: [f64; N]) -> f64 {
+    residual(terms.map(|term| (term, 1.)))
+}
+
 /// Emit C line900 RHS and matrix contributions without coalescing or reordering.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "ordered ordinary matrix products retain C event and arithmetic grouping; cancellation-sensitive Newton residuals and RHS reductions use adaptive product sums"
+)]
 pub(super) fn apply(
     model: &Model,
     here: &Instance,
@@ -187,14 +229,23 @@ pub(super) fn apply(
         Gmbs = here.gmbs;
         FwdSum = Gm + Gmbs;
         RevSum = 0.0;
-        ceqdrn = f64::from(model.r#type) * (cdrain - here.gds * vds - Gm * vgs - Gmbs * vbs);
+        ceqdrn = f64::from(model.r#type)
+            * residual([(cdrain, 1.), (-here.gds, vds), (-Gm, vgs), (-Gmbs, vbs)]);
         ceqbd = f64::from(model.r#type)
-            * (here.csub + here.Igidl
-                - (here.gbds + here.ggidld) * vds
-                - (here.gbgs + here.ggidlg) * vgs
-                - (here.gbbs + here.ggidlb) * vbs);
+            * residual([
+                (here.csub, 1.),
+                (here.Igidl, 1.),
+                (-(here.gbds + here.ggidld), vds),
+                (-(here.gbgs + here.ggidlg), vgs),
+                (-(here.gbbs + here.ggidlb), vbs),
+            ]);
         ceqbs = f64::from(model.r#type)
-            * (here.Igisl + here.ggisls * vds - here.ggislg * vgd - here.ggislb * vbd);
+            * residual([
+                (here.Igisl, 1.),
+                (here.ggisls, vds),
+                (-here.ggislg, vgd),
+                (-here.ggislb, vbd),
+            ]);
         gbbdp = -(here.gbds);
         gbbsp = here.gbds + here.gbgs + here.gbbs;
         gbdpg = here.gbgs;
@@ -211,17 +262,26 @@ pub(super) fn apply(
             gIstots = here.gIgss + here.gIgcss;
             gIstotb = here.gIgcsb;
             Istoteq = f64::from(model.r#type)
-                * (here.Igs + here.Igcs - gIstotg * vgs - here.gIgcsd * vds - here.gIgcsb * vbs);
+                * residual([
+                    (here.Igs, 1.),
+                    (here.Igcs, 1.),
+                    (-gIstotg, vgs),
+                    (-here.gIgcsd, vds),
+                    (-here.gIgcsb, vbs),
+                ]);
             gIdtotg = here.gIgdg + here.gIgcdg;
             gIdtotd = here.gIgdd + here.gIgcdd;
             gIdtots = here.gIgcds;
             gIdtotb = here.gIgcdb;
             Idtoteq = f64::from(model.r#type)
-                * (here.Igd + here.Igcd
-                    - here.gIgdg * vgd
-                    - here.gIgcdg * vgs
-                    - here.gIgcdd * vds
-                    - here.gIgcdb * vbs);
+                * residual([
+                    (here.Igd, 1.),
+                    (here.Igcd, 1.),
+                    (-here.gIgdg, vgd),
+                    (-here.gIgcdg, vgs),
+                    (-here.gIgcdd, vds),
+                    (-here.gIgcdb, vbs),
+                ]);
         } else {
             Istoteq = 0.0;
             gIstotb = Istoteq;
@@ -240,7 +300,12 @@ pub(super) fn apply(
             gIbtots = here.gIgbs;
             gIbtotb = here.gIgbb;
             Ibtoteq = f64::from(model.r#type)
-                * (here.Igb - here.gIgbg * vgs - here.gIgbd * vds - here.gIgbb * vbs);
+                * residual([
+                    (here.Igb, 1.),
+                    (-here.gIgbg, vgs),
+                    (-here.gIgbd, vds),
+                    (-here.gIgbb, vbs),
+                ]);
         } else {
             Ibtoteq = 0.0;
             gIbtotb = Ibtoteq;
@@ -249,11 +314,11 @@ pub(super) fn apply(
             gIbtotg = gIbtotd;
         }
         if (model.igcMod != 0) || (model.igbMod != 0) {
-            gIgtotg = gIstotg + gIdtotg + gIbtotg;
-            gIgtotd = gIstotd + gIdtotd + gIbtotd;
-            gIgtots = gIstots + gIdtots + gIbtots;
-            gIgtotb = gIstotb + gIdtotb + gIbtotb;
-            Igtoteq = Istoteq + Idtoteq + Ibtoteq;
+            gIgtotg = sum([gIstotg, gIdtotg, gIbtotg]);
+            gIgtotd = sum([gIstotd, gIdtotd, gIbtotd]);
+            gIgtots = sum([gIstots, gIdtots, gIbtots]);
+            gIgtotb = sum([gIstotb, gIdtotb, gIbtotb]);
+            Igtoteq = sum([Istoteq, Idtoteq, Ibtoteq]);
         } else {
             Igtoteq = 0.0;
             gIgtotb = Igtoteq;
@@ -272,7 +337,7 @@ pub(super) fn apply(
             gcrgg = here.gcrgg * T0;
             gcrgs = here.gcrgs * T0;
             gcrgb = here.gcrgb * T0;
-            ceqgcrg = -(gcrgd * vds + gcrgg * vgs + gcrgb * vbs);
+            ceqgcrg = -residual([(gcrgd, vds), (gcrgg, vgs), (gcrgb, vbs)]);
             gcrgg -= here.gcrg;
             gcrg = here.gcrg;
         } else {
@@ -288,13 +353,23 @@ pub(super) fn apply(
         Gmbs = -here.gmbs;
         FwdSum = 0.0;
         RevSum = -(Gm + Gmbs);
-        ceqdrn = f64::from(-model.r#type) * (cdrain + here.gds * vds + Gm * vgd + Gmbs * vbd);
+        ceqdrn = f64::from(-model.r#type)
+            * residual([(cdrain, 1.), (here.gds, vds), (Gm, vgd), (Gmbs, vbd)]);
         ceqbs = f64::from(model.r#type)
-            * (here.csub + here.Igisl + (here.gbds + here.ggisls) * vds
-                - (here.gbgs + here.ggislg) * vgd
-                - (here.gbbs + here.ggislb) * vbd);
+            * residual([
+                (here.csub, 1.),
+                (here.Igisl, 1.),
+                ((here.gbds + here.ggisls), vds),
+                (-(here.gbgs + here.ggislg), vgd),
+                (-(here.gbbs + here.ggislb), vbd),
+            ]);
         ceqbd = f64::from(model.r#type)
-            * (here.Igidl - here.ggidld * vds - here.ggidlg * vgs - here.ggidlb * vbs);
+            * residual([
+                (here.Igidl, 1.),
+                (-here.ggidld, vds),
+                (-here.ggidlg, vgs),
+                (-here.ggidlb, vbs),
+            ]);
         gbbsp = -(here.gbds);
         gbbdp = here.gbds + here.gbgs + here.gbbs;
         gbdpg = 0.0;
@@ -311,15 +386,26 @@ pub(super) fn apply(
             gIstots = here.gIgss + here.gIgcdd;
             gIstotb = here.gIgcdb;
             Istoteq = f64::from(model.r#type)
-                * (here.Igs + here.Igcd - here.gIgsg * vgs - here.gIgcdg * vgd + here.gIgcdd * vds
-                    - here.gIgcdb * vbd);
+                * residual([
+                    (here.Igs, 1.),
+                    (here.Igcd, 1.),
+                    (-here.gIgsg, vgs),
+                    (-here.gIgcdg, vgd),
+                    (here.gIgcdd, vds),
+                    (-here.gIgcdb, vbd),
+                ]);
             gIdtotg = here.gIgdg + here.gIgcsg;
             gIdtotd = here.gIgdd + here.gIgcss;
             gIdtots = here.gIgcsd;
             gIdtotb = here.gIgcsb;
             Idtoteq = f64::from(model.r#type)
-                * (here.Igd + here.Igcs - (here.gIgdg + here.gIgcsg) * vgd + here.gIgcsd * vds
-                    - here.gIgcsb * vbd);
+                * residual([
+                    (here.Igd, 1.),
+                    (here.Igcs, 1.),
+                    (-(here.gIgdg + here.gIgcsg), vgd),
+                    (here.gIgcsd, vds),
+                    (-here.gIgcsb, vbd),
+                ]);
         } else {
             Istoteq = 0.0;
             gIstotb = Istoteq;
@@ -338,7 +424,12 @@ pub(super) fn apply(
             gIbtots = here.gIgbd;
             gIbtotb = here.gIgbb;
             Ibtoteq = f64::from(model.r#type)
-                * (here.Igb - here.gIgbg * vgd + here.gIgbd * vds - here.gIgbb * vbd);
+                * residual([
+                    (here.Igb, 1.),
+                    (-here.gIgbg, vgd),
+                    (here.gIgbd, vds),
+                    (-here.gIgbb, vbd),
+                ]);
         } else {
             Ibtoteq = 0.0;
             gIbtotb = Ibtoteq;
@@ -347,11 +438,11 @@ pub(super) fn apply(
             gIbtotg = gIbtotd;
         }
         if (model.igcMod != 0) || (model.igbMod != 0) {
-            gIgtotg = gIstotg + gIdtotg + gIbtotg;
-            gIgtotd = gIstotd + gIdtotd + gIbtotd;
-            gIgtots = gIstots + gIdtots + gIbtots;
-            gIgtotb = gIstotb + gIdtotb + gIbtotb;
-            Igtoteq = Istoteq + Idtoteq + Ibtoteq;
+            gIgtotg = sum([gIstotg, gIdtotg, gIbtotg]);
+            gIgtotd = sum([gIstotd, gIdtotd, gIbtotd]);
+            gIgtots = sum([gIstots, gIdtots, gIbtots]);
+            gIgtotb = sum([gIstotb, gIdtotb, gIbtotb]);
+            Igtoteq = sum([Istoteq, Idtoteq, Ibtoteq]);
         } else {
             Igtoteq = 0.0;
             gIgtotb = Igtoteq;
@@ -370,7 +461,7 @@ pub(super) fn apply(
             gcrgg = here.gcrgg * T0;
             gcrgs = here.gcrgd * T0;
             gcrgb = here.gcrgb * T0;
-            ceqgcrg = -(gcrgg * vgd - gcrgs * vds + gcrgb * vbd);
+            ceqgcrg = -residual([(gcrgg, vgd), (-gcrgs, vds), (gcrgb, vbd)]);
             gcrgg -= here.gcrg;
             gcrg = here.gcrg;
         } else {
@@ -383,15 +474,15 @@ pub(super) fn apply(
         }
     }
     if model.rdsMod == 1 {
-        ceqgstot =
-            f64::from(model.r#type) * (here.gstotd * vds + here.gstotg * vgs + here.gstotb * vbs);
+        ceqgstot = f64::from(model.r#type)
+            * residual([(here.gstotd, vds), (here.gstotg, vgs), (here.gstotb, vbs)]);
         gstot = here.gstot;
         gstotd = here.gstotd;
         gstotg = here.gstotg;
         gstots = here.gstots - gstot;
         gstotb = here.gstotb;
-        ceqgdtot =
-            f64::from(-model.r#type) * (here.gdtotd * vds + here.gdtotg * vgs + here.gdtotb * vbs);
+        ceqgdtot = f64::from(-model.r#type)
+            * residual([(here.gdtotd, vds), (here.gdtotg, vgs), (here.gdtotb, vbs)]);
         gdtot = here.gdtot;
         gdtotd = here.gdtotd - gdtot;
         gdtotg = here.gdtotg;
@@ -412,11 +503,11 @@ pub(super) fn apply(
         gdtot = gdtotd;
     }
     if model.r#type > 0 {
-        ceqjs = (here.cbs - here.gbs * vbs_jct);
-        ceqjd = (here.cbd - here.gbd * vbd_jct);
+        ceqjs = residual([(here.cbs, 1.), (-here.gbs, vbs_jct)]);
+        ceqjd = residual([(here.cbd, 1.), (-here.gbd, vbd_jct)]);
     } else {
-        ceqjs = -(here.cbs - here.gbs * vbs_jct);
-        ceqjd = -(here.cbd - here.gbd * vbd_jct);
+        ceqjs = -residual([(here.cbs, 1.), (-here.gbs, vbs_jct)]);
+        ceqjd = -residual([(here.cbd, 1.), (-here.gbd, vbd_jct)]);
         ceqqg = -ceqqg;
         ceqqd = -ceqqd;
         ceqqb = -ceqqb;
@@ -438,38 +529,51 @@ pub(super) fn apply(
     mult_q = here.mult_q * here.m;
     ckt.rhs(
         here.dNodePrime,
-        (mult_i * (ceqjd - ceqbd + ceqgdtot - ceqdrn + Idtoteq) - mult_q * ceqqd),
+        residual([
+            (mult_i, sum([ceqjd, -ceqbd, ceqgdtot, -ceqdrn, Idtoteq])),
+            (-mult_q, ceqqd),
+        ]),
     );
     ckt.rhs(
         here.gNodePrime,
-        -(mult_q * ceqqg - mult_i * (ceqgcrg - Igtoteq)),
+        residual([(-mult_q, ceqqg), (mult_i, sum([ceqgcrg, -Igtoteq]))]),
     );
     if here.rgateMod == 2 {
         ckt.rhs(here.gNodeExt, -(mult_i * ceqgcrg));
     } else if here.rgateMod == 3 {
-        ckt.rhs(here.gNodeMid, -(mult_q * ceqqgmid + mult_i * ceqgcrg));
+        ckt.rhs(
+            here.gNodeMid,
+            -residual([(mult_q, ceqqgmid), (mult_i, ceqgcrg)]),
+        );
     }
     if here.rbodyMod == 0 {
         ckt.rhs(
             here.bNodePrime,
-            (mult_i * (ceqbd + ceqbs - ceqjd - ceqjs + Ibtoteq) - mult_q * ceqqb),
+            residual([
+                (mult_i, sum([ceqbd, ceqbs, -ceqjd, -ceqjs, Ibtoteq])),
+                (-mult_q, ceqqb),
+            ]),
         );
         ckt.rhs(
             here.sNodePrime,
-            (mult_i * (ceqdrn - ceqbs + ceqjs - ceqgstot + Istoteq)
-                + mult_q * (ceqqg + ceqqb + ceqqd + ceqqgmid)),
+            residual([
+                (mult_i, sum([ceqdrn, -ceqbs, ceqjs, -ceqgstot, Istoteq])),
+                (mult_q, sum([ceqqg, ceqqb, ceqqd, ceqqgmid])),
+            ]),
         );
     } else {
-        ckt.rhs(here.dbNode, -(mult_i * (ceqjd) + mult_q * ceqqjd));
+        ckt.rhs(here.dbNode, -residual([(mult_i, ceqjd), (mult_q, ceqqjd)]));
         ckt.rhs(
             here.bNodePrime,
-            (mult_i * (ceqbd + ceqbs + Ibtoteq) - mult_q * ceqqb),
+            residual([(mult_i, sum([ceqbd, ceqbs, Ibtoteq])), (-mult_q, ceqqb)]),
         );
-        ckt.rhs(here.sbNode, -(mult_i * (ceqjs) + mult_q * ceqqjs));
+        ckt.rhs(here.sbNode, -residual([(mult_i, ceqjs), (mult_q, ceqqjs)]));
         ckt.rhs(
             here.sNodePrime,
-            (mult_i * (ceqdrn - ceqbs + ceqjs - ceqgstot + Istoteq)
-                + mult_q * (ceqqd + ceqqg + ceqqb + ceqqjd + ceqqjs + ceqqgmid)),
+            residual([
+                (mult_i, sum([ceqdrn, -ceqbs, ceqjs, -ceqgstot, Istoteq])),
+                (mult_q, sum([ceqqd, ceqqg, ceqqb, ceqqjd, ceqqjs, ceqqgmid])),
+            ]),
         );
     }
     if model.rdsMod != 0 {
@@ -763,5 +867,24 @@ pub(super) fn apply(
         ckt.matrix(here.dNodePrime, here.qNode, mult_q * (dxpart * here.gtau));
         ckt.matrix(here.sNodePrime, here.qNode, mult_q * (sxpart * here.gtau));
         ckt.matrix(here.gNodePrime, here.qNode, -(mult_q * (here.gtau)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonlinear_residual_recovers_cancellation_and_product_rounding() {
+        assert_eq!(sum([1e16, 1., -1e16]), 1.);
+        let epsilon = f64::EPSILON;
+        assert_eq!(
+            residual([(-1., 1.), (1. + epsilon, 1. - epsilon)]),
+            -epsilon * epsilon
+        );
+        assert_eq!(residual([(1e308, 2.), (-1e308, 2.), (1., 1.)]), 1.);
+        assert_eq!(sum([-0., -0.]).to_bits(), (-0_f64).to_bits());
+        assert!(residual([(f64::INFINITY, 0.), (1., 1.)]).is_nan());
+        assert_eq!(residual([(f64::INFINITY, 1.), (1., 1.)]), f64::INFINITY);
     }
 }
