@@ -59,3 +59,17 @@ classification, and stored members are intentional here.
 See [verification policy](VERIFICATION.md). The #158 Notion implementation
 log records detailed experiments and performance data separately from this
 permanent numerical contract.
+
+## Predictor decomposition
+
+Bias deltas and current predictions are represented separately from the
+discrete convergence decisions. Fixed-size ordered gain/delta reductions
+preserve the reference accumulation order and target-specific fusion policy.
+The bulk predictor is evaluated only after the first six checks pass.
+
+A comparison against the preceding nested predictor implementation covered
+200,000 randomized decisions on each of native and generic x86-64, including
+aliased nodes, both polarities, nonfinite values and signed zero, with no
+mismatches. Three-run median timings for 1,638,400 decisions were 234.72 to
+210.44 ms (native) and 167.50 to 164.81 ms (generic). These are isolated
+predictor measurements on a shared machine, not whole-solver speedups.
