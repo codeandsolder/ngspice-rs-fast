@@ -149,21 +149,21 @@ pub struct NoisePoint {
 /// Independent limits for bounded file import and export.
 pub struct TouchstoneLimits {
     /// Maximum ASCII input byte count.
-    pub max_source_bytes: usize,
+    pub source_bytes: usize,
     /// Maximum declared network port count.
-    pub max_ports: usize,
+    pub ports: usize,
     /// Maximum network or noise frequency samples.
-    pub max_frequencies: usize,
+    pub frequencies: usize,
     /// Maximum network matrix and numeric row storage.
-    pub max_numeric_bytes: usize,
+    pub numeric_bytes: usize,
 }
 impl Default for TouchstoneLimits {
     fn default() -> Self {
         Self {
-            max_source_bytes: 256 * 1024 * 1024,
-            max_ports: 256,
-            max_frequencies: 100_000,
-            max_numeric_bytes: 256 * 1024 * 1024,
+            source_bytes: 256 * 1024 * 1024,
+            ports: 256,
+            frequencies: 100_000,
+            numeric_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -445,7 +445,7 @@ impl Touchstone {
         reason = "single-pass grammar state machine retains ordered line-numbered keyword and record diagnostics"
     )]
     pub fn parse(source: &str, path: &str, limits: TouchstoneLimits) -> SpiceResult<Self> {
-        if source.len() > limits.max_source_bytes
+        if source.len() > limits.source_bytes
             || !source
                 .as_bytes()
                 .iter()
@@ -538,22 +538,21 @@ impl Touchstone {
                     "number of ports"
                         if result.version.modern() && option_seen && ports.is_none() =>
                     {
-                        ports = Some(count(path, line, argument, limits.max_ports)?);
+                        ports = Some(count(path, line, argument, limits.ports)?);
                     }
                     "number of frequencies"
                         if result.version.modern()
                             && ports.is_some()
                             && section == Section::Header =>
                     {
-                        expected_points =
-                            Some(count(path, line, argument, limits.max_frequencies)?);
+                        expected_points = Some(count(path, line, argument, limits.frequencies)?);
                     }
                     "number of noise frequencies"
                         if result.version.modern()
                             && ports == Some(2)
                             && section == Section::Header =>
                     {
-                        expected_noise = Some(count(path, line, argument, limits.max_frequencies)?);
+                        expected_noise = Some(count(path, line, argument, limits.frequencies)?);
                     }
                     "reference"
                         if result.version.modern()
@@ -728,7 +727,7 @@ impl Touchstone {
             }
             let n =
                 ports.ok_or_else(|| error(path, line, "cannot infer port count from filename"))?;
-            if n == 0 || n > limits.max_ports {
+            if n == 0 || n > limits.ports {
                 return Err(error(path, line, "port cap exceeded"));
             }
             if matches!(result.parameter, Parameter::H | Parameter::G) && n != 2 {
@@ -753,10 +752,10 @@ impl Touchstone {
                     .checked_mul(n)
                     .and_then(|v| v.checked_mul(std::mem::size_of::<Complex>()))
                     .ok_or_else(|| error(path, line, "network storage overflow"))?;
-                if matrix_bytes > limits.max_numeric_bytes
+                if matrix_bytes > limits.numeric_bytes
                     || record
                         .checked_mul(std::mem::size_of::<Real>())
-                        .is_none_or(|v| v > limits.max_numeric_bytes)
+                        .is_none_or(|v| v > limits.numeric_bytes)
                 {
                     return Err(error(
                         path,
@@ -791,13 +790,13 @@ impl Touchstone {
                     for word in words {
                         pending.push(numeric(path, line, word)?);
                         if pending.len() == record {
-                            if result.points.len() >= limits.max_frequencies
+                            if result.points.len() >= limits.frequencies
                                 || result
                                     .points
                                     .len()
                                     .checked_add(1)
                                     .and_then(|count| count.checked_mul(matrix_bytes))
-                                    .is_none_or(|bytes| bytes > limits.max_numeric_bytes)
+                                    .is_none_or(|bytes| bytes > limits.numeric_bytes)
                             {
                                 return Err(error(
                                     path,
@@ -874,7 +873,7 @@ impl Touchstone {
                     optimum_reflection: Complex::new(values[2] * rad.cos(), values[2] * rad.sin()),
                     resistance_ohms: values[4],
                 });
-                if result.noise.len() > limits.max_frequencies
+                if result.noise.len() > limits.frequencies
                     || expected_noise.is_some_and(|limit| result.noise.len() > limit)
                 {
                     return Err(error(path, line, "noise count budget exceeded"));
@@ -891,7 +890,7 @@ impl Touchstone {
             return Err(error(path, 0, "unfinished section or header list"));
         }
         let n = ports.unwrap_or_default();
-        if n == 0 || n > limits.max_ports {
+        if n == 0 || n > limits.ports {
             return Err(error(path, 0, "port count exceeds budget"));
         }
         if result.version.modern()
@@ -996,10 +995,10 @@ impl Touchstone {
     pub fn validate(&self, limits: TouchstoneLimits) -> SpiceResult<()> {
         let n = self.references.len();
         if n == 0
-            || n > limits.max_ports
+            || n > limits.ports
             || self.points.is_empty()
-            || self.points.len() > limits.max_frequencies
-            || self.noise.len() > limits.max_frequencies
+            || self.points.len() > limits.frequencies
+            || self.noise.len() > limits.frequencies
         {
             return Err(error("model", 0, "invalid port/point limits"));
         }
@@ -1007,7 +1006,7 @@ impl Touchstone {
             .checked_mul(n)
             .and_then(|v| v.checked_mul(self.points.len()))
             .and_then(|v| v.checked_mul(std::mem::size_of::<Complex>()));
-        if cells.is_none_or(|v| v > limits.max_numeric_bytes) {
+        if cells.is_none_or(|v| v > limits.numeric_bytes) {
             return Err(error("model", 0, "numeric storage limit exceeded"));
         }
         if self.references.iter().any(|&r| !r.is_finite() || r <= 0.)
@@ -1088,7 +1087,7 @@ impl Touchstone {
             ));
         }
         let n = references.len();
-        if n == 0 || n > limits.max_ports {
+        if n == 0 || n > limits.ports {
             return Err(error(".sp", 0, "invalid N-port count"));
         }
         let square = n
@@ -1099,8 +1098,8 @@ impl Touchstone {
             .and_then(|v| v.checked_mul(std::mem::size_of::<Complex>()))
             .ok_or_else(|| error(".sp", 0, "network output allocation overflow"))?;
         if plot.point_count() == 0
-            || plot.point_count() > limits.max_frequencies
-            || cells > limits.max_numeric_bytes
+            || plot.point_count() > limits.frequencies
+            || cells > limits.numeric_bytes
         {
             return Err(error(".sp", 0, "retained network output exceeds limits"));
         }
@@ -1327,7 +1326,7 @@ impl Touchstone {
             Encoding::Ma => "MA",
             Encoding::Db => "DB",
         };
-        let mut output = BoundedText::new(limits.max_source_bytes);
+        let mut output = BoundedText::new(limits.source_bytes);
         if version.modern() {
             writeln!(output, "[Version] {}", version.label())
                 .map_err(|_| error("output", 0, "format failure"))?;
@@ -1359,12 +1358,11 @@ impl Touchstone {
                 };
                 writeln!(
                     output,
-                    "{:.17e} {:.17e} {:.17e} {:.17e} {:.17e}",
+                    "{:.17e} {:.17e} {:.17e} {:.17e} {resistance:.17e}",
                     point.hz / self.unit.scale(),
                     point.min_figure_db,
                     point.optimum_reflection.magnitude(),
                     point.optimum_reflection.phase().to_degrees(),
-                    resistance
                 )
                 .map_err(|_| error("output", 0, "format failure"))?;
             }

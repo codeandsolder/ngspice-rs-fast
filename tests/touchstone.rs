@@ -6,10 +6,10 @@ use ngspice_rs::analysis::touchstone::{
 use ngspice_rs::primitives::Complex;
 
 const LIMITS: TouchstoneLimits = TouchstoneLimits {
-    max_source_bytes: 1024 * 1024,
-    max_ports: 16,
-    max_frequencies: 100,
-    max_numeric_bytes: 1024 * 1024,
+    source_bytes: 1024 * 1024,
+    ports: 16,
+    frequencies: 100,
+    numeric_bytes: 1024 * 1024,
 };
 
 #[test]
@@ -157,7 +157,7 @@ fn touchstone_bounds_and_malformed_data_are_rejected() {
             "# GHz S RI R 50\n1 0 0 0 0 0 0 0 0\n",
             "x.s2p",
             TouchstoneLimits {
-                max_source_bytes: 8,
+                source_bytes: 8,
                 ..LIMITS
             }
         )
@@ -168,7 +168,7 @@ fn touchstone_bounds_and_malformed_data_are_rejected() {
             "# GHz S RI R 50\n1 0 0 0 0 0 0 0 0\n",
             "x.s2p",
             TouchstoneLimits {
-                max_numeric_bytes: 16,
+                numeric_bytes: 16,
                 ..LIMITS
             }
         )
@@ -178,10 +178,7 @@ fn touchstone_bounds_and_malformed_data_are_rejected() {
         Touchstone::parse(
             "# GHz S RI R 50\n1 0 0 0 0 0 0 0 0\n",
             "x.s2p",
-            TouchstoneLimits {
-                max_ports: 1,
-                ..LIMITS
-            }
+            TouchstoneLimits { ports: 1, ..LIMITS }
         )
         .is_err()
     );
@@ -270,7 +267,7 @@ fn touchstone_writer_enforces_encoded_byte_budget_during_output() {
         Touchstone::parse("# Hz S RI R 50\n1 0.5 0\n2 0.25 0\n", "one.s1p", LIMITS).unwrap();
     for limit in [0, 1, 32, 96] {
         let cap = TouchstoneLimits {
-            max_source_bytes: limit,
+            source_bytes: limit,
             ..LIMITS
         };
         assert!(
@@ -283,7 +280,7 @@ fn touchstone_writer_enforces_encoded_byte_budget_during_output() {
         .write_with_limits(Version::V1_0, Encoding::Ri, LIMITS)
         .unwrap();
     let exact = TouchstoneLimits {
-        max_source_bytes: text.len(),
+        source_bytes: text.len(),
         ..LIMITS
     };
     assert_eq!(
@@ -293,7 +290,7 @@ fn touchstone_writer_enforces_encoded_byte_budget_during_output() {
         text
     );
     let too_small = TouchstoneLimits {
-        max_source_bytes: text.len() - 1,
+        source_bytes: text.len() - 1,
         ..LIMITS
     };
     assert!(
