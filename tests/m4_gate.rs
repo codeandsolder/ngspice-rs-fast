@@ -60,9 +60,21 @@ fn diode_dc_obeys_junction_law_kcl_and_matches_c() {
                 got.value(name, point).unwrap().re,
                 want.value(name, point).unwrap().re,
             );
-            // The golden is the stock (FMA) C build; the port reproduces the
-            // FMA-free build bit for bit, 1e-10 relative from it at worst.
-            close(rust, c, 1e-9, 1e-30);
+            // The zero-input point is physically zero. C and Rust may
+            // retain different subnormal-scale Newton residues there.
+            // Bound them by a handful of floating-point rounding steps on
+            // the circuit's 1 V and 1 V / 1 kohm scales; keep the original
+            // tight C-reference comparison at every nonzero bias.
+            if point == 0 {
+                let scale = if name == "i(v1)" { 1e-3 } else { 1. };
+                let bound = 8. * f64::EPSILON * scale;
+                assert!(
+                    rust.abs() <= bound && c.abs() <= bound,
+                    "{name} at zero input: Rust {rust:e}, C {c:e}, bound {bound:e}"
+                );
+            } else {
+                close(rust, c, 1e-9, 1e-30);
+            }
         }
     }
     // Tight requested tolerances solve the junction law and KCL themselves.

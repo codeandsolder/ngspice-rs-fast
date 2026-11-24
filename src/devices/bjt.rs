@@ -1246,6 +1246,31 @@ impl Device for Bjt {
             _ => None,
         })
     }
+    fn observation_operating(
+        &self,
+        key: &str,
+        context: &ModelContext,
+        voltage: &dyn Fn(NodeId) -> Real,
+        transient: bool,
+    ) -> SpiceResult<Option<Real>> {
+        // bjtask.c: the intrinsic collector/base currents are not external
+        // collector/base terminal residuals when series and substrate
+        // junctions are present. Replay the same bias/temperature physics
+        // as the ordinary BJT load, then apply BJTm exactly once.
+        // Transient asks require the history-dependent charge companions.
+        if !matches!(key, "ic" | "ib") || transient {
+            return Ok(None);
+        }
+        let p = c_point(&self.thermal(context)?, self.bias(voltage), context.gmin)?;
+        let current = if key == "ic" {
+            p.transport.cc
+        } else if self.subs < 0. {
+            p.transport.cb - p.substrate.current
+        } else {
+            p.transport.cb
+        };
+        Ok(Some(self.instance.multiplier * current))
+    }
     fn name(&self) -> &str {
         &self.name
     }

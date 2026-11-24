@@ -1808,6 +1808,35 @@ impl Device for Diode {
             _ => None,
         })
     }
+    fn observation_operating(
+        &self,
+        key: &str,
+        context: &ModelContext,
+        voltage: &dyn Fn(NodeId) -> Real,
+        transient: bool,
+    ) -> SpiceResult<Option<Real>> {
+        // dioask.c reads the stored DIOcurrent and DIOconduct of the
+        // completed load. In a real DC analysis, these are precisely the
+        // temperature-adjusted junction evaluation, including gmin.
+        // In transient they additionally contain the charge companion,
+        // which cannot be reconstructed from instantaneous voltage alone.
+        if !matches!(key, "id" | "c" | "vd" | "gd") {
+            return Ok(None);
+        }
+        let vd = voltage(self.junction[0]) - voltage(self.junction[1]);
+        if key == "vd" {
+            return Ok(Some(vd));
+        }
+        if transient {
+            return Ok(None);
+        }
+        let p = self.thermal(context)?.point(vd, context.gmin)?;
+        Ok(match key {
+            "id" | "c" => Some(p.junction.current),
+            "gd" => Some(p.junction.conductance),
+            _ => None,
+        })
+    }
     fn name(&self) -> &str {
         &self.name
     }
