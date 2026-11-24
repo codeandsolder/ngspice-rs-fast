@@ -549,22 +549,6 @@ impl ModelWeights {
     fn interpolate(self, coefficients: [f64; 4]) -> f64 {
         let [base, l, w, cross] = coefficients;
         let [_, inverse_l, inverse_w, inverse_lw] = self.0;
-        // Unset bin corrections are the overwhelmingly common case. When
-        // the inverse weights are finite, their zero products cannot alter
-        // any finite nonzero base, even with negative signed-zero inputs.
-        // Zero bases and nonfinite weights still use the full ordered IEEE
-        // path, preserving signed zero and 0 * infinity = NaN exactly.
-        if l == 0.
-            && w == 0.
-            && cross == 0.
-            && base != 0.
-            && base.is_finite()
-            && inverse_l.is_finite()
-            && inverse_w.is_finite()
-            && inverse_lw.is_finite()
-        {
-            return base;
-        }
         let lt = l * inverse_l;
         let wt = w * inverse_w;
         let lwt = cross * inverse_lw;
@@ -2584,109 +2568,6 @@ mod tests {
         assert_eq!(limit.current, 1e100);
         assert!((limit.slope / 4e101 - 1.).abs() < 1e-14);
         assert_eq!(forward_limit(0.025, 0., 1., Some(1e100)).voltage, 0.);
-    }
-
-    #[test]
-    #[ignore = "opt-in representative normal/cancellation BSIM4 model-bin throughput"]
-    fn model_bin_interpolation_benchmark() {
-        use std::{hint::black_box, time::Instant};
-        const ROWS: usize = 16_384;
-        const REPETITIONS: usize = 159;
-        let weights = ModelWeights([1., 1., 1., 1.]);
-        for mode in ["sparse", "dense", "severe"] {
-            let rows: Vec<_> = (0..ROWS)
-                .map(|index| {
-                    let sign = if index % 2 == 0 { 1. } else { -1. };
-                    let x = f64::from(u32::try_from(index % 173).unwrap()) / 173.;
-                    let coefficients = match mode {
-                        "sparse" if index % 10 != 0 => [1. + x, 0., 0., 0.],
-                        "sparse" => [1. + x, 0.01 * sign, 0.02 * x, -0.005 * sign],
-                        "dense" => [1. + x, 0.01 * sign, 0.02 * x, -0.005 * sign],
-                        "severe" if index % 10 == 0 => [1e16, 1., -1e16, 0.],
-                        "severe" => [1. + x, 0.01 * sign, 0.02 * x, -0.005 * sign],
-                        _ => unreachable!(),
-                    };
-                    (weights, coefficients)
-                })
-                .collect();
-            let mut times = Vec::new();
-            let mut expected = None;
-            for pass in 0..6 {
-                let start = Instant::now();
-                let mut checksum = 0_u64;
-                for _ in 0..REPETITIONS {
-                    for &(weights, coefficients) in black_box(&rows) {
-                        checksum = checksum.wrapping_add(
-                            black_box(weights.interpolate(black_box(coefficients)))
-                                .to_bits()
-                                .rotate_left(17),
-                        );
-                    }
-                }
-                let duration = start.elapsed();
-                if let Some(previous) = expected {
-                    assert_eq!(previous, checksum, "unstable {mode} checksum");
-                }
-                expected = Some(checksum);
-                if pass > 0 {
-                    times.push(duration.as_nanos());
-                }
-            }
-            times.sort_unstable();
-            println!(
-                "model_bin_{mode}: median_ns_per_field={:.3} samples={} checksum={:#x}",
-                times[times.len() / 2] as f64 / (ROWS * REPETITIONS) as f64,
-                ROWS * REPETITIONS,
-                expected.unwrap(),
-            );
-        }
-    }
-
-    #[test]
-    fn zero_correction_binning_preserves_all_ieee_cases_and_signed_zeros() {
-        let weights = [
-            [1.; 4],
-            [1., 1e308, 1e-300, 0.],
-            [1., -1., 1., 2.],
-            [1., -0., 0., 0.],
-            [1., f64::INFINITY, 1., 1.],
-            [1., f64::NAN, 1., 1.],
-            [1., f64::NEG_INFINITY, 1., 1.],
-        ];
-        let bases = [
-            0.,
-            -0.,
-            1.,
-            -1.,
-            f64::MIN_POSITIVE,
-            -f64::MIN_POSITIVE,
-            f64::MIN_POSITIVE.next_down(),
-            f64::MAX,
-            -f64::MAX,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NAN,
-        ];
-        for inputs in weights {
-            let weight = ModelWeights(inputs);
-            for base in bases {
-                for signs in 0..8_u8 {
-                    let correction = |bit: u32| if signs & (1_u8 << bit) == 0 { 0. } else { -0. };
-                    let (l, w, cross) = (correction(0), correction(1), correction(2));
-                    let direct = base + l * inputs[1] + w * inputs[2] + cross * inputs[3];
-                    let result = weight.interpolate([base, l, w, cross]);
-                    if direct.is_nan() {
-                        assert!(result.is_nan(), "{inputs:?}, {base:?}, signs={signs}");
-                    } else {
-                        assert_eq!(
-                            result.to_bits(),
-                            direct.to_bits(),
-                            "{inputs:?}, {base:?}, signs={signs}"
-                        );
-                    }
-                }
-            }
-        }
     }
 
     #[test]

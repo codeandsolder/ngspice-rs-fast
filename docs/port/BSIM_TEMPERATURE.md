@@ -124,3 +124,20 @@ recovering 983400 units lost by the ordered sum (1639 cases per
 repetition). This extra work occurs in model preparation, not Newton
 load iterations. The cold exact accumulator is intentionally reserved
 for poorly conditioned sums rather than used for every field.
+
+### Whole-preparation interpretation (#194)
+
+The extra conditioning is justified by recovered physical results, not by
+isolated scalar-tuple throughput. Two algebraically equivalent shortcuts
+for normal/zero bin corrections were tested in alternating A/B runs with
+hardware counters pinned to separate CPU cores. Neither produced a
+repeatable whole-model preparation improvement; the zero-coefficient
+shortcut actually increased standalone interpolation CPU cycles by about
+5.7% across both cores, while whole-preparation differences remained
+within shared-host variability. The accepted exact-product recovery and
+its sparse/dense fast paths are therefore retained unchanged.
+
+The [#194 investigation](https://app.notion.com/p/422f74be902081a796f9c809566b8905)
+contains the pinned binaries, physical-output checksums, counter traces and
+reproducible experimental benchmark branch. A future optimization should
+profile complete model preparation, not optimize only this tiny subkernel.
