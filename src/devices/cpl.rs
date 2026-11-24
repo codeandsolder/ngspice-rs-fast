@@ -4,6 +4,7 @@
 //! return, then N output conductors and one output return. Currents at both
 //! ends are defined entering the line. General noncommuting matrices are
 //! handled by one 2N-dimensional telegrapher state-space propagator.
+pub mod modes;
 pub mod plan;
 mod transient;
 
