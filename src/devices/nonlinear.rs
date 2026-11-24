@@ -21,6 +21,8 @@
 //! The diode limits its junction voltage as `dioload.c` does (`MODEINITJCT`
 //! start at `tVcrit`, `DEVpnjlim`, reflected about BV in breakdown) through
 //! [`crate::devices::limiting`]; C's predictor and bypass are not ported.
+use std::simd::f64x4;
+
 use crate::devices::limiting::{self, Limiter, Linearization};
 use crate::devices::noise::{
     DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
@@ -505,11 +507,30 @@ impl DiodeLoadSample {
     /// # Errors
     /// Nonfinite or unsupported junction physics.
     pub(crate) fn evaluate(self, gmin: Real) -> SpiceResult<DiodeLoadEvaluation> {
-        let mut point = if self.lenient {
-            self.thermal.point_unchecked(self.voltage, gmin)?
-        } else {
-            self.thermal.point(self.voltage, gmin)?
-        };
+        let currents = self.thermal.characteristic_currents(self.voltage);
+        self.evaluate_with_currents(currents, gmin)
+    }
+
+    /// The same full device physics and final finite-domain checks for
+    /// scalar and SIMD characteristic evaluations. Model-dependent tunnel,
+    /// recombination, knees, depletion and diffusion are never skipped.
+    fn evaluate_with_currents(
+        &self,
+        currents: SpiceResult<DiodeCurrents>,
+        gmin: Real,
+    ) -> SpiceResult<DiodeLoadEvaluation> {
+        let mut point = self
+            .thermal
+            .point_from_currents(self.voltage, gmin, currents?);
+        if !self.lenient {
+            point.junction.validate()?;
+            if !point.ac_conductance.is_finite() || !point.ac_capacitance.is_finite() {
+                return Err(SpiceError::Numerical {
+                    context: "junction".into(),
+                    message: "nonfinite small-signal junction values".into(),
+                });
+            }
+        }
         if self.c_jacobian {
             point.junction.conductance = point.ac_conductance;
         }
@@ -520,6 +541,25 @@ impl DiodeLoadSample {
             raw: self.raw,
             voltage: self.voltage,
         })
+    }
+
+    /// Four complete level-1 diode evaluations. Common bottom/sidewall
+    /// characteristic arithmetic runs as four portable SIMD lanes; exact
+    /// scalar libm exponential/expm1, threshold decisions and overflow
+    /// recovery stay per lane. The *same* scalar physical tail handles all
+    /// optional model variants without a separate simplified diode law.
+    pub(crate) fn evaluate_four(
+        samples: [&Self; 4],
+        gmin: Real,
+    ) -> [SpiceResult<DiodeLoadEvaluation>; 4] {
+        let currents = diode_currents_four(samples);
+        let [a, b, c, d] = currents;
+        [
+            samples[0].evaluate_with_currents(a, gmin),
+            samples[1].evaluate_with_currents(b, gmin),
+            samples[2].evaluate_with_currents(c, gmin),
+            samples[3].evaluate_with_currents(d, gmin),
+        ]
     }
 }
 
@@ -1285,6 +1325,215 @@ struct DiodePoint {
     ac_conductance: Real,
     ac_capacitance: Real,
 }
+/// A single reference characteristic in a four-lane bottom/sidewall pass.
+/// One tile may mix area/temperature/parameter override values, so the
+/// arguments are per instance rather than assumed uniform for a model.
+#[derive(Clone, Copy)]
+struct CharacteristicInput {
+    v: Real,
+    vte: Real,
+    sat: Real,
+    breakdown: Option<(Real, Real)>,
+}
+
+#[derive(Clone, Copy)]
+enum CharacteristicRegion {
+    Absent,
+    Zero,
+    Exponential,
+    NearZero,
+    Cubic,
+    Breakdown,
+    Scalar,
+}
+
+/// Exactly the reference's branch ordering and libm calls; arithmetic that
+/// can be vectorized is deferred until all four lane decisions are known.
+fn prepare_characteristic(
+    input: Option<CharacteristicInput>,
+) -> (CharacteristicRegion, Real, Real) {
+    use CharacteristicRegion as Region;
+    let Some(input) = input else {
+        return (Region::Absent, 0., 0.);
+    };
+    let CharacteristicInput {
+        v,
+        vte,
+        sat,
+        breakdown,
+    } = input;
+    if let Some((bv, vtebrk)) = breakdown
+        && v < -3. * vte
+        && v < -bv
+    {
+        return (Region::Breakdown, (-(bv + v) / vtebrk).exp(), 0.);
+    }
+    if sat == 0. {
+        return (Region::Zero, 0., 0.);
+    }
+    if v >= -3. * vte {
+        let argument = v / vte;
+        let exp = argument.exp();
+        if !exp.is_finite() {
+            return (Region::Scalar, 0., 0.);
+        }
+        if argument.abs() < 0.5 {
+            (Region::NearZero, exp, argument.exp_m1())
+        } else {
+            (Region::Exponential, exp, 0.)
+        }
+    } else {
+        (Region::Cubic, 0., 0.)
+    }
+}
+
+/// Evaluate all characteristic branches with independent per-lane flags,
+/// then commit the *reference* error for each device in original order.
+/// SIMD executes the pointwise algebra; exp/expm1 remain correctly rounded
+/// scalar libm calls, with exact scalar overflow recovery for hard lanes.
+fn characteristic_four(inputs: [Option<CharacteristicInput>; 4]) -> [SpiceResult<(Real, Real)>; 4] {
+    use CharacteristicRegion as Region;
+    let regions = inputs.map(prepare_characteristic);
+    let numbers = inputs.map(|input| {
+        input.unwrap_or(CharacteristicInput {
+            v: 0.,
+            vte: 1.,
+            sat: 0.,
+            breakdown: None,
+        })
+    });
+    let v = f64x4::from_array(numbers.map(|n| n.v));
+    let vte = f64x4::from_array(numbers.map(|n| n.vte));
+    let sat = f64x4::from_array(numbers.map(|n| n.sat));
+    let exp = f64x4::from_array(regions.map(|(_, value, _)| value));
+    let expm1 = f64x4::from_array(regions.map(|(_, _, value)| value));
+    let brk_vte = f64x4::from_array(numbers.map(|n| n.breakdown.map_or(1., |b| b.1)));
+    let one = f64x4::splat(1.);
+    let normal = (sat * (exp - one), sat * exp / vte);
+    // At |v/Vt| < 0.5 C's current uses expm1 but the conductance uses
+    // exp. Reconstructing exp as 1+expm1 changes low-order bits.
+    let near_zero = (sat * expm1, sat * exp / vte);
+    let arg = f64x4::splat(3.) * vte / (v * f64x4::splat(std::f64::consts::E));
+    let cubic = (
+        (-sat) * (one + arg * arg * arg),
+        sat * f64x4::splat(3.) * (arg * arg * arg) / v,
+    );
+    let breakdown = ((-sat) * exp, sat * exp / brk_vte);
+    std::array::from_fn(|lane| {
+        let (region, _, _) = regions[lane];
+        let (current, conductance) = match region {
+            Region::Absent | Region::Zero => return Ok((0., 0.)),
+            Region::Exponential => (normal.0[lane], normal.1[lane]),
+            Region::NearZero => (near_zero.0[lane], near_zero.1[lane]),
+            Region::Cubic => (cubic.0[lane], cubic.1[lane]),
+            Region::Breakdown => (breakdown.0[lane], breakdown.1[lane]),
+            Region::Scalar => {
+                return characteristic(
+                    numbers[lane].v,
+                    numbers[lane].vte,
+                    numbers[lane].sat,
+                    numbers[lane].breakdown,
+                );
+            }
+        };
+        if region_matches_breakdown(region) {
+            if !current.is_finite() || !conductance.is_finite() {
+                return Err(SpiceError::Numerical {
+                    context: "junction".into(),
+                    message: "reverse-breakdown exponential overflow".into(),
+                });
+            }
+        } else if [numbers[lane].sat, numbers[lane].vte, current, conductance]
+            .iter()
+            .any(|value| !value.is_finite())
+            || numbers[lane].vte <= 0.
+            || numbers[lane].sat <= 0.
+        {
+            return Err(SpiceError::Numerical {
+                context: "junction".into(),
+                message: "junction exponential/temperature overflow".into(),
+            });
+        }
+        Ok((current, conductance))
+    })
+}
+
+const fn region_matches_breakdown(region: CharacteristicRegion) -> bool {
+    matches!(region, CharacteristicRegion::Breakdown)
+}
+
+/// Run *both* bottom and sidewall characteristics as SIMD tiles. The order
+/// of errors remains sidewall-before-bottom for each original device.
+fn diode_currents_four(samples: [&DiodeLoadSample; 4]) -> [SpiceResult<DiodeCurrents>; 4] {
+    let forward = samples.map(|s| s.voltage >= -3. * (s.thermal.n * s.thermal.vt));
+    let bottom = samples.map(|s| CharacteristicInput {
+        v: s.voltage,
+        vte: s.thermal.n * s.thermal.vt,
+        sat: s.thermal.csat,
+        breakdown: s
+            .thermal
+            .breakdown
+            .map(|bv| (bv, s.thermal.nbv * s.thermal.vt)),
+    });
+    let sidewall = std::array::from_fn(|lane| {
+        let sample = samples[lane];
+        let thermal = &sample.thermal;
+        thermal.csatsw.and_then(|csatsw| match thermal.ns {
+            Some(ns) => Some(CharacteristicInput {
+                v: sample.voltage,
+                vte: ns * thermal.vt,
+                sat: csatsw,
+                breakdown: bottom[lane].breakdown,
+            }),
+            None if forward[lane]
+                || bottom[lane]
+                    .breakdown
+                    .is_none_or(|(bv, _)| sample.voltage >= -bv) =>
+            {
+                Some(CharacteristicInput {
+                    v: sample.voltage,
+                    vte: bottom[lane].vte,
+                    sat: csatsw,
+                    breakdown: None,
+                })
+            }
+            None => None,
+        })
+    });
+    let sidewall = characteristic_four(sidewall);
+    let bottom = characteristic_four(bottom.map(Some));
+    let mut sidewall = sidewall.into_iter();
+    let mut bottom = bottom.into_iter();
+    std::array::from_fn(|lane| {
+        let (cdsw, gdsw) = sidewall
+            .next()
+            .ok_or_else(|| SpiceError::circuit("missing sidewall SIMD lane"))??;
+        let (cdb, gdb) = bottom
+            .next()
+            .ok_or_else(|| SpiceError::circuit("missing bottom SIMD lane"))??;
+        Ok(DiodeCurrents {
+            cdb,
+            gdb,
+            cdsw,
+            gdsw,
+            forward: forward[lane],
+        })
+    })
+}
+
+/// The common bottom and optional sidewall characteristic before adding
+/// model-dependent recombination, tunnel, injection and charge terms.
+/// These are also the four SIMD lane inputs to the rest of the complete
+/// diode model: none of the optional branches are discarded.
+#[derive(Debug, Clone, Copy)]
+struct DiodeCurrents {
+    cdb: Real,
+    gdb: Real,
+    cdsw: Real,
+    gdsw: Real,
+    forward: bool,
+}
+
 impl Thermal {
     /// `dioload.c`'s junction voltage for this load: `tVcrit` in
     /// `MODEINITJCT`, otherwise `DEVpnjlim` against the previous value, in
@@ -1390,6 +1639,10 @@ impl Thermal {
     /// [`Self::point`] without the final finiteness checks, for a `.sens`
     /// stand-in that must carry C's NaN.
     fn point_unchecked(&self, vd: Real, gmin: Real) -> SpiceResult<DiodePoint> {
+        Ok(self.point_from_currents(vd, gmin, self.characteristic_currents(vd)?))
+    }
+
+    fn characteristic_currents(&self, vd: Real) -> SpiceResult<DiodeCurrents> {
         let vte = self.n * self.vt;
         let vtebrk = self.nbv * self.vt;
         let breakdown = self.breakdown.map(|bv| (bv, vtebrk));
@@ -1407,7 +1660,28 @@ impl Thermal {
                 None => (0., 0.),
             };
         }
-        let (mut cdb, mut gdb) = characteristic(vd, vte, self.csat, breakdown)?;
+        let (cdb, gdb) = characteristic(vd, vte, self.csat, breakdown)?;
+        Ok(DiodeCurrents {
+            cdb,
+            gdb,
+            cdsw,
+            gdsw,
+            forward,
+        })
+    }
+
+    /// Complete scalar device physics after the exact bottom and sidewall
+    /// characteristics. All supported optional model laws remain here; the
+    /// SIMD path calls this same function per lane, avoiding a second model.
+    fn point_from_currents(&self, vd: Real, gmin: Real, currents: DiodeCurrents) -> DiodePoint {
+        let DiodeCurrents {
+            mut cdb,
+            mut gdb,
+            mut cdsw,
+            mut gdsw,
+            forward,
+        } = currents;
+        let vte = self.n * self.vt;
         // The exact derivative (Newton) and C's conductance (small signal,
         // `.tf`/`.sens`) differ only with ISR.
         let mut ac_gdb = gdb;
@@ -1500,7 +1774,7 @@ impl Thermal {
             ac_conductance,
             ac_capacitance: ac_diffusion_capacitance + capacitance + capacitance_sw,
         };
-        Ok(point)
+        point
     }
 }
 
@@ -2222,6 +2496,234 @@ mod tests {
                 (c - p.capacitance).abs() <= 1e-5 * p.capacitance.abs() + 1e-9 * charge_scale,
                 "{v}: dQ/dV {c} vs {}",
                 p.capacitance
+            );
+        }
+    }
+
+    #[test]
+    fn diode_simd_characteristics_preserve_scalar_bits_in_all_regions() {
+        let widths = [1e-300, 1e-14, 1e-9, 1e-3, 1.];
+        let volts = [
+            -900., -12., -7., -5.1, -4., -0.15, -0.078, -0.0, 0., 1e-19, 1e-8, 0.013, 0.5, 0.72,
+            0.9, 100., 900.,
+        ];
+        let mut cases = Vec::new();
+        for &sat in &widths {
+            for &vte in &[0.018, 0.026, 0.04] {
+                for &v in &volts {
+                    let edge: f64 = -3. * vte;
+                    for voltage in [v, edge.next_down(), edge, edge.next_up()] {
+                        for breakdown in [None, Some((5.1, 0.041)), Some((0.07, 0.026))] {
+                            cases.push(Some(CharacteristicInput {
+                                v: voltage,
+                                vte,
+                                sat,
+                                breakdown,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        cases.extend(std::iter::repeat_n(None, 11));
+        for (chunk_index, chunk) in cases.chunks(4).enumerate() {
+            let samples = std::array::from_fn(|lane| chunk.get(lane).copied().flatten());
+            let actual = characteristic_four(samples);
+            for (lane, (candidate, result)) in samples.into_iter().zip(actual).enumerate() {
+                let expected = candidate.map_or(Ok((0., 0.)), |input| {
+                    characteristic(input.v, input.vte, input.sat, input.breakdown)
+                });
+                let marker = format!("case={chunk_index} lane={lane}");
+                match (result, expected) {
+                    (Ok((a, b)), Ok((c, d))) => {
+                        assert_eq!(a.to_bits(), c.to_bits(), "{marker}: current: {a} vs {c}");
+                        assert_eq!(
+                            b.to_bits(),
+                            d.to_bits(),
+                            "{marker}: conductance: {b} vs {d}"
+                        );
+                    }
+                    (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{marker}"),
+                    (a, b) => panic!("{marker}: SIMD {a:?} vs scalar {b:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diode_simd_complete_model_variants_match_scalar_physical_load_bits() {
+        let models = [
+            ("is=1e-14 cjo=2p tt=3n", ""),
+            (
+                "is=1e-14 jsw=1e-15 ns=1.3 cjsw=1p vjsw=0.9 mjsw=0.4",
+                "pj=3",
+            ),
+            ("is=5e-14 n=1.05 bv=5.1 ibv=5m nbv=1.3 cjo=2p", ""),
+            ("is=3e-14 isr=1e-11 nr=2 vj=0.8 m=0.4", "area=2"),
+            ("is=1e-14 ikf=1m ikr=0.2m ikp=1m cjo=2p tt=2n", ""),
+            ("is=1e-14 jtun=1e-12 jtunsw=1e-13 ntun=25 cjsw=1p", "pj=2"),
+            (
+                "is=3e-14 cjo=1p cjsw=1p vj=0.8 vjsw=0.9 m=0.2",
+                "area=2 pj=3",
+            ),
+        ];
+        let contexts = [-35., 27., 120.];
+        let gmins = [0., 1e-12, 1e-9];
+        let voltages = [
+            -5.5, -5.1, -4.8, -1., -0.15, -0.078, -1e-20, -0., 0., 1e-20, 0.013, 0.2, 0.5, 0.74,
+            0.9, 1.5,
+        ];
+        let history = crate::devices::StateHistory::new(3);
+        let mut trial = history.trial();
+        let state = history.device(&mut trial, 0..3).unwrap();
+        let limiter = Limiter::new(&state);
+        for &celsius in &contexts {
+            let thermals = models.map(|(model, instance)| thermal(model, instance, celsius));
+            for &gmin in &gmins {
+                for (group, voltages) in voltages.chunks(4).enumerate() {
+                    for model_offset in 0..models.len() {
+                        let samples: [DiodeLoadSample; 4] =
+                            std::array::from_fn(|lane| DiodeLoadSample {
+                                thermal: thermals[(model_offset + lane) % models.len()],
+                                limiter,
+                                raw: voltages.get(lane).copied().unwrap_or(0.),
+                                voltage: voltages.get(lane).copied().unwrap_or(0.),
+                                c_jacobian: group % 2 == 0,
+                                lenient: group % 3 == 0,
+                            });
+                        let vector = DiodeLoadSample::evaluate_four(
+                            [&samples[0], &samples[1], &samples[2], &samples[3]],
+                            gmin,
+                        );
+                        for (lane, (sample, actual)) in samples.into_iter().zip(vector).enumerate()
+                        {
+                            let expected = sample.evaluate(gmin);
+                            let marker = format!(
+                                "T={celsius} gmin={gmin:e} group={group} model={model_offset} lane={lane}"
+                            );
+                            let values = |p: DiodeLoadEvaluation| {
+                                [
+                                    p.point.junction.current,
+                                    p.point.junction.conductance,
+                                    p.point.junction.charge,
+                                    p.point.junction.capacitance,
+                                    p.point.ac_conductance,
+                                    p.point.ac_capacitance,
+                                    p.raw,
+                                    p.voltage,
+                                ]
+                            };
+                            match (actual, expected) {
+                                (Ok(a), Ok(b)) => {
+                                    for (slot, (a, b)) in
+                                        values(a).into_iter().zip(values(b)).enumerate()
+                                    {
+                                        assert_eq!(
+                                            a.to_bits(),
+                                            b.to_bits(),
+                                            "{marker} slot={slot}: {a} vs {b}"
+                                        );
+                                    }
+                                }
+                                (Err(a), Err(b)) => {
+                                    assert_eq!(a.to_string(), b.to_string(), "{marker}")
+                                }
+                                (a, b) => panic!("{marker}: SIMD {a:?} scalar {b:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in per-device full diode physical kernel SIMD vs scalar throughput"]
+    fn diode_simd_complete_physics_kernel_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        let history = crate::devices::StateHistory::new(3);
+        let mut trial = history.trial();
+        let state = history.device(&mut trial, 0..3).unwrap();
+        let limiter = Limiter::new(&state);
+        let cases = [
+            ("ordinary", "is=1e-14 cjo=2p tt=3n", ""),
+            (
+                "sidewall",
+                "is=1e-14 jsw=1e-15 ns=1.4 cjsw=1p vjsw=0.9",
+                "pj=3",
+            ),
+            (
+                "breakdown",
+                "is=5e-14 n=1.05 bv=5.1 ibv=5m nbv=1.3 cjo=2p",
+                "",
+            ),
+            ("recombination", "is=1e-14 isr=1e-11 nr=2 vj=0.8 m=0.4", ""),
+            ("knees", "is=1e-14 ikf=1m ikr=0.2m ikp=1m cjo=2p", ""),
+            (
+                "tunnel",
+                "is=1e-14 jtun=1e-12 jtunsw=1e-13 ntun=25 cjsw=1p",
+                "pj=2",
+            ),
+        ];
+        for (label, model, instance) in cases {
+            let physical = thermal(model, instance, 27.);
+            let samples = [0.2, -0.15, 0.6, 0.8].map(|v| DiodeLoadSample {
+                thermal: physical,
+                limiter,
+                raw: v,
+                voltage: v,
+                c_jacobian: false,
+                lenient: false,
+            });
+            let gmin = 1e-12;
+            let mut scalar = Vec::new();
+            let mut simd = Vec::new();
+            for pass in 0..6 {
+                let scalar_call = || {
+                    for _ in 0..8_192 {
+                        for &sample in &samples {
+                            black_box(sample.evaluate(black_box(gmin)).unwrap());
+                        }
+                    }
+                };
+                let simd_call = || {
+                    for _ in 0..8_192 {
+                        let results = DiodeLoadSample::evaluate_four(
+                            [&samples[0], &samples[1], &samples[2], &samples[3]],
+                            black_box(gmin),
+                        );
+                        for result in results {
+                            black_box(result.unwrap());
+                        }
+                    }
+                };
+                if pass % 2 == 0 {
+                    let start = Instant::now();
+                    scalar_call();
+                    let elapsed = start.elapsed();
+                    let start = Instant::now();
+                    simd_call();
+                    if pass != 0 {
+                        scalar.push(elapsed.as_nanos());
+                        simd.push(start.elapsed().as_nanos());
+                    }
+                } else {
+                    let start = Instant::now();
+                    simd_call();
+                    let elapsed = start.elapsed();
+                    let start = Instant::now();
+                    scalar_call();
+                    simd.push(elapsed.as_nanos());
+                    scalar.push(start.elapsed().as_nanos());
+                }
+            }
+            scalar.sort_unstable();
+            simd.sort_unstable();
+            println!(
+                "diode_physics_{label}: scalar_ns_per_lane={} simd_ns_per_lane={} ratio={:.3}",
+                scalar[scalar.len() / 2] / 32_768,
+                simd[simd.len() / 2] / 32_768,
+                simd[simd.len() / 2] as f64 / scalar[scalar.len() / 2] as f64
             );
         }
     }

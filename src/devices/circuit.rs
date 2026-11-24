@@ -2849,13 +2849,39 @@ impl Circuit {
                     })();
                     lanes.push(Lane::Gathered(sampled));
                 }
-                for lane in &mut lanes {
-                    let Lane::Gathered(sample) = std::mem::replace(lane, Lane::Consumed) else {
-                        return Err(SpiceError::circuit("invalid diode tile evaluation phase"));
-                    };
-                    *lane = Lane::Ready(
-                        sample.and_then(|sample| sample.evaluate(request.model_context.gmin)),
-                    );
+                // Four model-agnostic physical evaluation lanes at once. A
+                // gathering error or a short tail evaluates each member
+                // through the unchanged scalar path, preserving its first
+                // error position and every ordered matrix/state stamp.
+                for chunk in lanes.chunks_mut(4) {
+                    if let [
+                        Lane::Gathered(Ok(a)),
+                        Lane::Gathered(Ok(b)),
+                        Lane::Gathered(Ok(c)),
+                        Lane::Gathered(Ok(d)),
+                    ] = chunk
+                    {
+                        let results = DiodeLoadSample::evaluate_four(
+                            [&*a, &*b, &*c, &*d],
+                            request.model_context.gmin,
+                        );
+                        for (lane, result) in chunk.iter_mut().zip(results) {
+                            *lane = Lane::Ready(result);
+                        }
+                    } else {
+                        for lane in chunk {
+                            let Lane::Gathered(sample) = std::mem::replace(lane, Lane::Consumed)
+                            else {
+                                return Err(SpiceError::circuit(
+                                    "invalid diode tile evaluation phase",
+                                ));
+                            };
+                            *lane =
+                                Lane::Ready(sample.and_then(|sample| {
+                                    sample.evaluate(request.model_context.gmin)
+                                }));
+                        }
+                    }
                 }
             }
             let device = point.device(self, index);
