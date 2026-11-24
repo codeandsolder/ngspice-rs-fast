@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::devices::functions::{FunctionSpec, SourceFunction};
 use crate::devices::{
-    AnalysisMode, Circuit, LoadRequest, ModelContext, PreparedRun, StateHistory, Waveform,
+    AnalysisMode, Circuit, LoadRequest, ModelContext, PreparedRun, StateHistory, TrialState,
+    Waveform,
 };
 use crate::maths::{Pattern, SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceError, SpiceResult, filled_vec};
@@ -77,6 +78,7 @@ struct CircuitModel<'a> {
     run: PreparedRun<'a>,
     model: ModelContext,
     history: StateHistory,
+    trial: Option<TrialState>,
     pattern: Arc<Pattern>,
     linear_charge: SparseMatrix,
     rhs: Vector,
@@ -123,6 +125,7 @@ impl<'a> CircuitModel<'a> {
         let zero = Vector::zeros(n);
         let mut rhs = Vector::zeros(n);
         let mut matrix = circuit.new_matrix()?;
+        let mut trial = history.trial();
         run.load(
             &LoadRequest {
                 mode: AnalysisMode::OperatingPoint,
@@ -134,7 +137,7 @@ impl<'a> CircuitModel<'a> {
             },
             &mut matrix,
             &mut rhs,
-            &mut history.trial(),
+            &mut trial,
         )?;
         let mut charge = Vector::zeros(n);
         let mut dynamic = SparseMatrix::new(n, n);
@@ -157,6 +160,7 @@ impl<'a> CircuitModel<'a> {
             run,
             model,
             history,
+            trial: Some(trial),
             pattern,
             linear_charge,
             rhs,
@@ -174,7 +178,8 @@ impl HarmonicModel for CircuitModel<'_> {
 
     fn evaluate(&mut self, phase: usize, state: &Vector, sample: &mut Sample) -> SpiceResult<()> {
         self.rhs.clear();
-        self.run.load(
+        let mut trial = self.history.trial_reusing(self.trial.take());
+        let loaded = self.run.load(
             &LoadRequest {
                 mode: AnalysisMode::OperatingPoint,
                 solution: state,
@@ -185,9 +190,13 @@ impl HarmonicModel for CircuitModel<'_> {
             },
             &mut sample.conductance,
             &mut self.rhs,
-            &mut self.history.trial(),
-        )?;
-        let static_current = sample.conductance.mul_vector(state)?;
+            &mut trial,
+        );
+        self.trial = Some(trial);
+        loaded?;
+        sample
+            .conductance
+            .mul_vector_into(state, &mut sample.current)?;
         let m = self.lattice.coordinates();
         let basis = self
             .lattice
@@ -198,10 +207,11 @@ impl HarmonicModel for CircuitModel<'_> {
                 .iter()
                 .zip(basis)
                 .fold(0., |sum, (&a, &b)| a.mul_add(b, sum));
-            *output = (static_current.as_slice()[row] - self.rhs.as_slice()[row])
-                + (self.dc_rhs.as_slice()[row] - forcing);
+            *output =
+                (*output - self.rhs.as_slice()[row]) + (self.dc_rhs.as_slice()[row] - forcing);
         }
-        sample.charge = self.linear_charge.mul_vector(state)?;
+        self.linear_charge
+            .mul_vector_into(state, &mut sample.charge)?;
         for term in self.linear_charge.triplets() {
             sample.capacitance.add(term.row, term.col, term.value)?;
         }

@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use crate::maths::{Pattern, SparseLu, SparseMatrix, Vector};
-use crate::primitives::{Real, SpiceResult, filled_vec};
+use crate::primitives::{Complex, Real, SpiceError, SpiceResult, filled_vec};
+
+use super::projection::Projection;
 
 use super::{HarmonicLattice, failure};
 
@@ -63,6 +65,8 @@ pub struct BalanceLimits {
     pub jacobian_entries: usize,
     /// Maximum worst-case dense factor entries, bounding possible fill.
     pub factor_entries: usize,
+    /// Maximum retained phase samples per physical derivative field.
+    pub sample_entries: usize,
     /// Maximum cumulative scalar assembly work.
     pub assembly_work: usize,
     /// Maximum full nonlinear model evaluations (one per phase sample).
@@ -79,6 +83,7 @@ impl Default for BalanceLimits {
             unknowns: 4096,
             jacobian_entries: 2_000_000,
             factor_entries: 16_000_000,
+            sample_entries: 8_000_000,
             assembly_work: 250_000_000,
             model_evaluations: 100_000,
             iterations: 40,
@@ -92,6 +97,10 @@ impl Default for BalanceLimits {
 pub struct BalanceStats {
     /// Full physical-model evaluations.
     pub model_evaluations: usize,
+    /// Charged scalar assembly work.
+    pub assembly_work: usize,
+    /// Peak allocated sparse LU element slots.
+    pub peak_factor_entries: usize,
     /// Newton linear solves.
     pub corrections: usize,
     /// Rejected line-search candidates.
@@ -117,12 +126,20 @@ struct Workspace<'a> {
     state: Vector,
     matrix: SparseMatrix,
     blocks: Vec<(usize, usize)>,
+    projection: Projection,
+    conductance: Vec<Real>,
+    capacitance: Vec<Real>,
+    g_spectrum: Vec<Complex>,
+    c_spectrum: Vec<Complex>,
+    block: Vec<Real>,
     weights: Vec<Real>,
+    charge_offset: Vec<Real>,
     derivative_weights: Vec<Real>,
     tolerance: &'a [Real],
     remaining_work: usize,
     remaining_evaluations: usize,
     assembly_cost: usize,
+    residual_cost: usize,
 }
 
 fn product(a: usize, b: usize, limit: usize, message: &str) -> SpiceResult<usize> {
@@ -162,19 +179,36 @@ impl<'a> Workspace<'a> {
             limits.jacobian_entries,
             "harmonic Jacobian limit exceeded",
         )?;
-        let assembly_cost = entries
-            .checked_add(
-                dimension
-                    .checked_mul(3)
-                    .ok_or_else(|| failure("harmonic work overflow"))?,
-            )
-            .ok_or_else(|| failure("harmonic work overflow"))?;
-        product(
-            assembly_cost,
-            lattice.samples(),
-            limits.assembly_work,
-            "harmonic assembly work limit exceeded",
+        let samples = lattice.samples();
+        let sample_entries = product(
+            local.len(),
+            samples,
+            limits.sample_entries,
+            "physical derivative sample limit exceeded",
         )?;
+        let projection = Projection::new(lattice, limits.assembly_work, limits.sample_entries)?;
+        let residual_cost = product(
+            dimension,
+            3,
+            limits.assembly_work,
+            "harmonic residual work limit exceeded",
+        )?;
+        let residual_cost = product(
+            residual_cost,
+            samples,
+            limits.assembly_work,
+            "harmonic residual work limit exceeded",
+        )?;
+        let transform_cost = projection
+            .cost()
+            .checked_mul(2)
+            .and_then(|cost| cost.checked_mul(local.len()))
+            .ok_or_else(|| failure("harmonic projection work overflow"))?;
+        let assembly_cost = residual_cost
+            .checked_add(transform_cost)
+            .and_then(|cost| cost.checked_add(entries))
+            .filter(|&cost| cost <= limits.assembly_work)
+            .ok_or_else(|| failure("harmonic assembly work limit exceeded"))?;
         let coordinates = local.positions().flat_map(|(r, c)| {
             (0..m).flat_map(move |i| (0..m).map(move |j| (r * m + i, c * m + j)))
         });
@@ -186,6 +220,7 @@ impl<'a> Workspace<'a> {
         for (r, c) in local.positions() {
             blocks.push((r, c));
         }
+        let size = projection.size();
         Ok(Self {
             lattice,
             sample: Sample::new(&local)?,
@@ -193,12 +228,20 @@ impl<'a> Workspace<'a> {
             matrix: SparseMatrix::bound(expanded)?,
             local,
             blocks,
+            projection,
+            conductance: filled_vec(sample_entries, 0., "physical conductance samples")?,
+            capacitance: filled_vec(sample_entries, 0., "physical capacitance samples")?,
+            g_spectrum: filled_vec(size, Complex::ZERO, "conductance spectrum")?,
+            c_spectrum: filled_vec(size, Complex::ZERO, "capacitance spectrum")?,
+            block: filled_vec(block_size, 0., "harmonic Jacobian block")?,
             weights: vec![0.; m],
+            charge_offset: vec![0.; n],
             derivative_weights: vec![0.; m],
             tolerance,
             remaining_work: limits.assembly_work,
             remaining_evaluations: limits.model_evaluations,
             assembly_cost,
+            residual_cost,
         })
     }
 
@@ -213,27 +256,19 @@ impl<'a> Workspace<'a> {
         let cost = if jacobian {
             self.assembly_cost
         } else {
-            coefficients.len().saturating_mul(3)
+            self.residual_cost
         };
         self.remaining_work = self
             .remaining_work
-            .checked_sub(
-                cost.checked_mul(count)
-                    .ok_or_else(|| failure("harmonic work overflow"))?,
-            )
-            .ok_or_else(|| failure("cumulative harmonic assembly work exhausted"))?;
+            .checked_sub(cost)
+            .ok_or_else(|| SpiceError::circuit("cumulative harmonic assembly work exhausted"))?;
         self.remaining_evaluations = self
             .remaining_evaluations
             .checked_sub(count)
-            .ok_or_else(|| failure("harmonic model evaluation budget exhausted"))?;
+            .ok_or_else(|| SpiceError::circuit("harmonic model evaluation budget exhausted"))?;
         let normalization =
             1. / Real::from(u32::try_from(count).map_err(|_| failure("phase count overflow"))?);
         let mut residual = Vector::zeros(coefficients.len());
-        let mut entries = if jacobian {
-            filled_vec(self.blocks.len() * m * m, 0., "harmonic Jacobian blocks")?
-        } else {
-            Vec::new()
-        };
         for (phase, basis) in self.lattice.rows().enumerate() {
             for (value, row) in self
                 .state
@@ -258,6 +293,10 @@ impl<'a> Workspace<'a> {
             {
                 return Err(failure("invalid physical harmonic sample"));
             }
+            if phase == 0 {
+                self.charge_offset
+                    .copy_from_slice(self.sample.charge.as_slice());
+            }
             self.weights[0] = normalization;
             self.derivative_weights[0] = 0.;
             for (index, harmonic) in self.lattice.harmonics().iter().enumerate() {
@@ -268,36 +307,40 @@ impl<'a> Workspace<'a> {
                 self.derivative_weights[i] = omega * self.weights[i + 1];
                 self.derivative_weights[i + 1] = -omega * self.weights[i];
             }
-            for (row, (&current, &charge)) in residual.as_mut_slice().chunks_exact_mut(m).zip(
-                self.sample
-                    .current
-                    .as_slice()
-                    .iter()
-                    .zip(self.sample.charge.as_slice()),
-            ) {
+            for ((row, (&current, &charge)), &offset) in residual
+                .as_mut_slice()
+                .chunks_exact_mut(m)
+                .zip(
+                    self.sample
+                        .current
+                        .as_slice()
+                        .iter()
+                        .zip(self.sample.charge.as_slice()),
+                )
+                .zip(&self.charge_offset)
+            {
                 for ((value, &w), &dw) in row
                     .iter_mut()
                     .zip(&self.weights)
                     .zip(&self.derivative_weights)
                 {
-                    *value = charge.mul_add(dw, current.mul_add(w, *value));
+                    *value = (charge - offset).mul_add(dw, current.mul_add(w, *value));
                 }
             }
             if jacobian {
-                self.accumulate_blocks(basis, &mut entries)?;
+                self.record_derivatives(phase)?;
             }
         }
         if !residual.is_finite() {
             return Err(failure("nonfinite spectral residual"));
         }
         if jacobian {
-            self.publish_matrix(&entries)?;
+            self.publish_matrix()?;
         }
         Ok(residual)
     }
 
-    fn accumulate_blocks(&self, basis: &[Real], entries: &mut [Real]) -> SpiceResult<()> {
-        let m = basis.len();
+    fn record_derivatives(&mut self, phase: usize) -> SpiceResult<()> {
         let (g_pattern, g) = self
             .sample
             .conductance
@@ -311,32 +354,34 @@ impl<'a> Workspace<'a> {
         if !Arc::ptr_eq(g_pattern, &self.local) || !Arc::ptr_eq(c_pattern, &self.local) {
             return Err(failure("model replaced its declared Jacobian pattern"));
         }
-        for ((block, &g), &c) in entries.chunks_exact_mut(m * m).zip(g).zip(c) {
+        let count = self.lattice.samples();
+        for (site, (&g, &c)) in g.iter().zip(c).enumerate() {
             if !g.is_finite() || !c.is_finite() {
                 return Err(failure("nonfinite model Jacobian"));
             }
-            if g == 0. && c == 0. {
-                continue;
-            }
-            for ((row, &w), &dw) in block
-                .chunks_exact_mut(m)
-                .zip(&self.weights)
-                .zip(&self.derivative_weights)
-            {
-                let value = c.mul_add(dw, g * w);
-                for (entry, &b) in row.iter_mut().zip(basis) {
-                    *entry = value.mul_add(b, *entry);
-                }
-            }
+            self.conductance[site * count + phase] = g;
+            self.capacitance[site * count + phase] = c;
         }
         Ok(())
     }
 
-    fn publish_matrix(&mut self, entries: &[Real]) -> SpiceResult<()> {
+    fn publish_matrix(&mut self) -> SpiceResult<()> {
         self.matrix.clear();
         let m = self.lattice.coordinates();
-        for (&(row, col), block) in self.blocks.iter().zip(entries.chunks_exact(m * m)) {
-            for (i, values) in block.chunks_exact(m).enumerate() {
+        let count = self.lattice.samples();
+        for (site, &(row, col)) in self.blocks.iter().enumerate() {
+            let range = site * count..(site + 1) * count;
+            self.projection
+                .transform(&self.conductance[range.clone()], &mut self.g_spectrum);
+            self.projection
+                .transform(&self.capacitance[range], &mut self.c_spectrum);
+            self.projection.block(
+                self.lattice,
+                &self.g_spectrum,
+                &self.c_spectrum,
+                &mut self.block,
+            );
+            for (i, values) in self.block.chunks_exact(m).enumerate() {
                 for (j, &value) in values.iter().enumerate() {
                     let scaled = value / self.tolerance[row];
                     if !scaled.is_finite() {
@@ -393,6 +438,8 @@ pub fn solve(
     }
     let mut factor: Option<SparseLu> = None;
     let mut rejected = 0;
+    let mut factor_workspace = Vec::new();
+    let mut peak_factor_entries = 0;
     for corrections in 0..=limits.iterations {
         let residual = work.evaluate(model, &coefficients, true)?;
         let scaled = work.scaled(&residual)?;
@@ -403,6 +450,8 @@ pub fn solve(
                 residual,
                 stats: BalanceStats {
                     model_evaluations: limits.model_evaluations - work.remaining_evaluations,
+                    assembly_work: limits.assembly_work - work.remaining_work,
+                    peak_factor_entries,
                     corrections,
                     rejected,
                     scaled_residual: norm,
@@ -420,7 +469,8 @@ pub fn solve(
                 .map(|value| -value)
                 .collect::<Vec<_>>(),
         );
-        let delta = next.solve(&rhs)?;
+        let delta = next.solve_with_workspace(&rhs, &mut factor_workspace)?;
+        peak_factor_entries = peak_factor_entries.max(next.factor_storage().factor_entries);
         factor = Some(next);
         let mut accepted = false;
         let mut step: Real = 1.;

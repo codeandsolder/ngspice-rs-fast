@@ -537,3 +537,197 @@ fn bjt_and_jfet_use_signed_physical_charge_at_every_phase() {
         assert!(solution.residual.max_abs() < 1e-11);
     }
 }
+
+#[test]
+fn bsim3_quasistatic_charge_and_inverse_mode_match_small_signal_limit() {
+    for (polarity, family) in [(1., "nmos"), (-1., "pmos")] {
+        for inverse in [false, true] {
+            let terminals = if inverse { "0 in out 0" } else { "out in 0 0" };
+            let body = format!(
+                "vrail rail 0 {}\nv1 in 0 dc {} ac 1m sin({} 1m 100meg)\nr1 rail out 1k\nm1 {terminals} mm w=10u l=1u\n.model mm {family} level=8 capmod=3 vth0={} cgso=1n cgdo=1n",
+                polarity * 1.8,
+                polarity * 0.9,
+                polarity * 0.9,
+                polarity * 0.5
+            );
+            let lattice = lattice(&[ToneAxis {
+                frequency: 100e6,
+                order: 3,
+            }]);
+            let (mut circuit, config) = circuit(&body);
+            let solution = physical_run(&mut circuit, &config, &lattice);
+            let spectrum = node_phasors(&circuit, &lattice, &solution, "out");
+            let plan = config
+                .plan(AnalysisInput::with_arguments(
+                    AnalysisKind::Ac,
+                    ["lin", "1", "100meg", "100meg"],
+                ))
+                .unwrap();
+            let plot = plan.run(&mut circuit, &config.context()).unwrap();
+            let ac = plot.value("v(out)", 0).unwrap();
+            // AC's real 1 mV phasor must rotate by -90 degrees for SIN.
+            let expected = ac * Complex::imaginary(-1.);
+            assert!(
+                (spectrum[1] - expected).magnitude() < 1e-7_f64.max(expected.magnitude() * 0.005),
+                "{family} inverse={inverse}: {:?} vs {expected:?}",
+                spectrum[1]
+            );
+        }
+    }
+}
+
+#[test]
+fn higher_order_two_tone_solution_is_stable_and_reuses_a_converged_seed() {
+    let (mut circuit, config) = circuit(
+        "v1 in 0 sin(0.3 0.18 1meg)\nv2 drive in sin(0 0.15 1.013meg)\nr1 drive out 1k\nd1 out 0 d\n.model d d(is=1e-12 cjo=10p)",
+    );
+    let axes = [
+        ToneAxis {
+            frequency: 1e6,
+            order: 4,
+        },
+        ToneAxis {
+            frequency: 1.013e6,
+            order: 4,
+        },
+    ];
+    let small = lattice(&axes.map(|axis| ToneAxis { order: 3, ..axis }));
+    let low = physical_run(&mut circuit, &config, &small);
+    let high = lattice(&axes);
+    let start = std::time::Instant::now();
+    let result = physical_run(&mut circuit, &config, &high);
+    let elapsed = start.elapsed();
+    let high_spectrum = node_phasors(&circuit, &high, &result, "out");
+    let low_spectrum = node_phasors(&circuit, &small, &low, "out");
+    for frequency in [1e6, 1.013e6, 13e3, 987e3, 1.026e6] {
+        let a = low_spectrum[small.locate(frequency).unwrap() + 1];
+        let b = high_spectrum[high.locate(frequency).unwrap() + 1];
+        assert!((a - b).magnitude() < 5e-4, "{frequency}: {a:?} {b:?}");
+    }
+    let tolerances = vec![1e-11; circuit.unknown_count()];
+    let start = std::time::Instant::now();
+    let repeated = solve_circuit(
+        &mut circuit,
+        config.context().model_context(),
+        &high,
+        Some(result.coefficients),
+        &tolerances,
+        BalanceLimits::default(),
+    )
+    .unwrap();
+    eprintln!(
+        "81-coordinate two-tone solve: {elapsed:?}, {:?}; warm start: {:?}, {:?}",
+        result.stats,
+        start.elapsed(),
+        repeated.stats
+    );
+    assert_eq!(repeated.stats.corrections, 0);
+    assert!(repeated.stats.model_evaluations < result.stats.model_evaluations);
+    let override_resistance = circuit.resistor_override("r1", 1020.).unwrap();
+    let changed_context = config
+        .context()
+        .model_context()
+        .with_resistor_override(override_resistance)
+        .unwrap();
+    let start = std::time::Instant::now();
+    let cold = solve_circuit(
+        &mut circuit,
+        changed_context,
+        &high,
+        None,
+        &tolerances,
+        BalanceLimits::default(),
+    )
+    .unwrap();
+    let cold_elapsed = start.elapsed();
+    let start = std::time::Instant::now();
+    let warm = solve_circuit(
+        &mut circuit,
+        changed_context,
+        &high,
+        Some(repeated.coefficients),
+        &tolerances,
+        BalanceLimits::default(),
+    )
+    .unwrap();
+    eprintln!(
+        "resistance sweep: cold {cold_elapsed:?}, {:?}; warm {:?}, {:?}",
+        cold.stats,
+        start.elapsed(),
+        warm.stats
+    );
+    assert!(warm.stats.model_evaluations < cold.stats.model_evaluations);
+    for (&a, &b) in cold
+        .coefficients
+        .as_slice()
+        .iter()
+        .zip(warm.coefficients.as_slice())
+    {
+        assert!((a - b).abs() < 1e-7);
+    }
+}
+
+#[test]
+fn converged_diode_spectrum_matches_independent_qucsator_hb() {
+    // QucsatorRF 1.0.7, Qucs-S 26.1.1 portable release. 65 frequencies,
+    // convergence reported after 11 iterations. Qucs uses a cosine source
+    // and reverses its diode terminal ordering relative to SPICE.
+    let reference = [
+        Complex::real(-0.0594477961247413),
+        Complex::new(0.6918775968421407, -0.0083330897178689),
+        Complex::new(-0.0796899202417851, 0.0024747089337585),
+        Complex::new(-0.0448044643296278, 0.0019665426730398),
+        Complex::new(-0.0150255416861985, 0.0007072924002563),
+        Complex::new(0.0025148320465375, -0.0004129509216921),
+        Complex::new(0.0074792858699303, -0.0007828033738540),
+    ];
+    let (mut circuit, config) = circuit(
+        "v1 in 0 sin(0 0.8 100k 0 0 90)\nr1 in out 1k\nc1 out 0 20p\nd1 out 0 d\n.model d d(is=1e-12 cjo=0 tt=0 vj=0.7)\n.options temp=27 tnom=27",
+    );
+    let lattice = HarmonicLattice::new(
+        &[ToneAxis {
+            frequency: 100e3,
+            order: 31,
+        }],
+        4,
+        LatticeLimits::default(),
+    )
+    .unwrap();
+    let result = physical_run(&mut circuit, &config, &lattice);
+    let spectrum = node_phasors(&circuit, &lattice, &result, "out");
+    for (k, (&actual, expected)) in spectrum.iter().zip(reference).enumerate() {
+        assert!(
+            (actual - expected).magnitude() < 2e-6,
+            "harmonic {k}: {actual:?} vs {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn related_source_tones_on_common_axis_conserve_current_and_power() {
+    let (mut circuit, config) =
+        circuit("v1 in 0 sin(0 1 100k)\nv2 drive in sin(0 0.5 200k)\nr1 drive out 1k\nc1 out 0 1n");
+    let lattice = lattice(&[ToneAxis {
+        frequency: 100e3,
+        order: 4,
+    }]);
+    let solution = physical_run(&mut circuit, &config, &lattice);
+    let input = node_phasors(&circuit, &lattice, &solution, "drive");
+    let output = node_phasors(&circuit, &lattice, &solution, "out");
+    let drop: Vec<_> = input.iter().zip(&output).map(|(&x, &y)| x - y).collect();
+    let mut input_power = 0.;
+    let mut resistor_power = 0.;
+    for (k, (dv, v)) in drop.iter().zip(&input).enumerate() {
+        let current = *dv * Complex::real(1e-3);
+        let load_current = output[k]
+            * Complex::imaginary(
+                std::f64::consts::TAU * 100e3 * f64::from(u32::try_from(k).unwrap()) * 1e-9,
+            );
+        assert!((current - load_current).magnitude() < 1e-12);
+        let scale = if k == 0 { 1. } else { 0.5 };
+        input_power += scale * (*v * current.conj()).re;
+        resistor_power += scale * (*dv * current.conj()).re;
+    }
+    assert!((input_power - resistor_power).abs() < 1e-12);
+    assert!(input_power > 0.);
+}

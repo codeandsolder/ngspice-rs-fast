@@ -1371,6 +1371,20 @@ impl SparseMatrix {
     ///
     /// [`SpiceError::Numerical`] when the dimensions do not agree.
     pub fn mul_vector(&self, vector: &Vector) -> SpiceResult<Vector> {
+        let mut result = Vector::from(crate::primitives::filled_vec(
+            self.rows,
+            0.,
+            "sparse matrix-vector output",
+        )?);
+        self.mul_vector_into(vector, &mut result)?;
+        Ok(result)
+    }
+
+    /// Multiply into caller-owned storage, replacing every output row.
+    ///
+    /// # Errors
+    /// A mismatched input or output dimension.
+    pub fn mul_vector_into(&self, vector: &Vector, result: &mut Vector) -> SpiceResult<()> {
         if vector.len() != self.cols {
             return Err(SpiceError::Numerical {
                 context: "sparse matrix".to_owned(),
@@ -1381,11 +1395,17 @@ impl SparseMatrix {
                 ),
             });
         }
-        let mut result = Vector::from(crate::primitives::filled_vec(
-            self.rows,
-            0.,
-            "sparse matrix-vector output",
-        )?);
+        if result.len() != self.rows {
+            return Err(SpiceError::Numerical {
+                context: "sparse matrix".to_owned(),
+                message: format!(
+                    "output length {} does not match {} rows",
+                    result.len(),
+                    self.rows
+                ),
+            });
+        }
+        result.clear();
         let y = result.as_mut_slice();
         let x = vector.as_slice();
         if let Some(bound) = &self.bound
@@ -1406,7 +1426,7 @@ impl SparseMatrix {
                 y[triplet.row] += product;
             }
         }
-        Ok(result)
+        Ok(())
     }
 
     /// Factors a snapshot. Empty systems are explicitly rejected.

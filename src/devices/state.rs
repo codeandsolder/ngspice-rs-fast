@@ -349,15 +349,7 @@ impl StateHistory {
     /// to write one cannot have it committed.
     #[must_use]
     pub fn trial(&self) -> TrialState {
-        TrialState {
-            topology: self.binding.as_ref().map(|binding| binding.topology),
-            revision: Arc::clone(&self.revision),
-            values: std::iter::repeat_n(Real::NAN, self.len).collect(),
-            mode: LoadMode::EXACT,
-            previous: None,
-            nonconvergent: false,
-            patches: State1Patches::default(),
-        }
+        self.trial_reusing(None)
     }
 
     /// A fresh trial for a Newton load in `phase`, seeing `previous` (the
@@ -374,20 +366,7 @@ impl StateHistory {
         phase: IterationPhase,
         previous: Option<&TrialState>,
     ) -> SpiceResult<TrialState> {
-        if let Some(previous) = previous {
-            self.check_trial(previous)?;
-        }
-        Ok(TrialState {
-            topology: self.binding.as_ref().map(|binding| binding.topology),
-            revision: Arc::clone(&self.revision),
-            values: std::iter::repeat_n(Real::NAN, self.len).collect(),
-            mode: LoadMode::newton(phase),
-            previous: previous.map(|previous| Arc::clone(&previous.values)),
-            nonconvergent: false,
-            patches: previous
-                .map(|previous| previous.patches.clone())
-                .unwrap_or_default(),
-        })
+        self.trial_in_reusing(phase, previous, None)
     }
 
     /// Reset a discarded Newton trial without borrowing or modifying any
@@ -408,8 +387,32 @@ impl StateHistory {
         if let Some(previous) = previous {
             self.check_trial(previous)?;
         }
+        Ok(self.recycle_trial(spare, LoadMode::newton(phase), previous))
+    }
+
+    /// Recycle an exact, independent evaluation trial without device limiting.
+    pub(crate) fn trial_reusing(&self, spare: Option<TrialState>) -> TrialState {
+        self.recycle_trial(spare, LoadMode::EXACT, None)
+    }
+
+    fn recycle_trial(
+        &self,
+        spare: Option<TrialState>,
+        mode: LoadMode,
+        previous: Option<&TrialState>,
+    ) -> TrialState {
         let Some(mut reused) = spare.filter(|spare| spare.values.len() == self.len) else {
-            return self.trial_in(phase, previous);
+            return TrialState {
+                topology: self.binding.as_ref().map(|binding| binding.topology),
+                revision: Arc::clone(&self.revision),
+                values: std::iter::repeat_n(Real::NAN, self.len).collect(),
+                mode,
+                previous: previous.map(|previous| Arc::clone(&previous.values)),
+                nonconvergent: false,
+                patches: previous
+                    .map(|previous| previous.patches.clone())
+                    .unwrap_or_default(),
+            };
         };
         // The previous accepted revision invalidates *read access* to this
         // trial's old data, but not reuse of uniquely owned raw storage.
@@ -422,13 +425,13 @@ impl StateHistory {
         }
         reused.topology = self.binding.as_ref().map(|binding| binding.topology);
         reused.revision = Arc::clone(&self.revision);
-        reused.mode = LoadMode::newton(phase);
+        reused.mode = mode;
         reused.previous = previous.map(|previous| Arc::clone(&previous.values));
         reused.nonconvergent = false;
         reused.patches = previous
             .map(|previous| previous.patches.clone())
             .unwrap_or_default();
-        Ok(reused)
+        reused
     }
 
     /// Checks that `trial` could be committed.

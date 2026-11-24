@@ -74,6 +74,7 @@ pub struct HarmonicLattice {
     axes: Vec<ToneAxis>,
     harmonics: Vec<Harmonic>,
     samples: usize,
+    grid: Vec<u32>,
     basis: Vec<Real>,
 }
 
@@ -205,7 +206,12 @@ impl LatticeShape {
             }
             let width = usize::from(axis.order) * 2 + 1;
             count = checked_product(count, width, limits.coordinates, "harmonic coordinate")?;
-            let points = width * usize::from(oversampling);
+            let points = checked_product(
+                width,
+                usize::from(oversampling),
+                limits.samples,
+                "axis samples",
+            )?;
             samples = checked_product(samples, points, limits.samples, "collocation sample")?;
             grid.push(u32::try_from(points).map_err(|_| failure("phase grid overflow"))?);
         }
@@ -232,6 +238,7 @@ impl LatticeShape {
             axes: self.axes.clone(),
             harmonics: self.harmonics.clone(),
             samples: self.samples,
+            grid: self.grid.clone(),
             basis,
         })
     }
@@ -274,6 +281,10 @@ impl HarmonicLattice {
         self.samples
     }
 
+    pub(super) fn grid(&self) -> &[u32] {
+        &self.grid
+    }
+
     /// Synthesis weights for each sample, in coordinate order.
     pub(crate) fn rows(&self) -> impl ExactSizeIterator<Item = &[Real]> {
         self.basis.chunks_exact(self.coordinates())
@@ -289,6 +300,9 @@ impl HarmonicLattice {
     /// Returns its index in the positive-frequency list, not a coordinate.
     #[must_use]
     pub fn locate(&self, frequency: Real) -> Option<usize> {
+        if !frequency.is_finite() || frequency <= 0. {
+            return None;
+        }
         self.harmonics.iter().position(|harmonic| {
             (harmonic.frequency - frequency).abs()
                 <= 8. * Real::EPSILON * harmonic.frequency.max(frequency.abs())
@@ -396,7 +410,7 @@ impl HarmonicLattice {
 /// Typed, allocation-bounded analysis input. Unlike the executable lattice,
 /// this retains only the harmonic indices and grid shape.
 #[derive(Debug, Clone, PartialEq)]
-pub struct HarmonicBalancePlan {
+pub(in crate::analysis) struct HarmonicBalancePlan {
     shape: LatticeShape,
     limits: super::BalanceLimits,
 }
