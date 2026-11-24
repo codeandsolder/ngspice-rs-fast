@@ -175,10 +175,9 @@ impl ExpScale {
         if value == 0. {
             return value;
         }
-        self.quarter.map_or_else(
-            || value * self.factor,
-            |quarter| ((value * quarter) * quarter) * quarter * quarter,
-        )
+        self.quarter.map_or(value * self.factor, |quarter| {
+            ((value * quarter) * quarter) * quarter * quarter
+        })
     }
 }
 
