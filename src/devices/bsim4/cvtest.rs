@@ -1,14 +1,10 @@
 //! `b4cvtest.c` (`BSIM4convTest`): the device convergence test, followed
 //! statement by statement over C's struct members.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+// Source-ordered current predictors use fused arithmetic; C's two-round
+// convergence tolerances and strict comparison operators remain unchanged.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 #![expect(
     non_snake_case,
@@ -22,13 +18,19 @@ fn max(a: f64, b: f64) -> f64 {
     if a > b { a } else { b }
 }
 
+/// Preserve the two C rounding steps before the discontinuous convergence
+/// comparisons. Fusing the multiply-add can move a one-ULP boundary.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "BSIM4convTest compares separately rounded reltol*magnitude+abstol"
+)]
+fn convergence_tolerance(predicted: f64, original: f64, reltol: f64, abstol: f64) -> f64 {
+    reltol * max(predicted.abs(), original.abs()) + abstol
+}
+
 /// `BSIM4convTest` for one instance: `true` when C would increment
 /// `CKTnoncon`. `rhs_old` is the new iterate C reads as `CKTrhsOld`,
 /// `state0` the last load's state vector, `mode` C's `CKTmode`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps the reference numerical routine in the original statement and rounding order"
-)] // One C function, kept in C's shape.
 pub(super) fn conv_test(
     m: &Model,
     h: &Instance,
@@ -73,48 +75,94 @@ pub(super) fn conv_test(
     let (Idtot, cdhat, Igstot, cgshat, Igdtot, cgdhat, Igbtot, cgbhat);
     if h.mode >= 0 {
         Idtot = h.cd + h.csub - h.cbd + h.Igidl;
-        cdhat = Idtot - h.gbd * delvbd_jct
-            + (h.gmbs + h.gbbs + h.ggidlb) * delvbs
-            + (h.gm + h.gbgs + h.ggidlg) * delvgs
-            + (h.gds + h.gbds + h.ggidld) * delvds;
+        cdhat = (h.gds + h.gbds + h.ggidld).mul_add(
+            delvds,
+            (h.gm + h.gbgs + h.ggidlg).mul_add(
+                delvgs,
+                (h.gmbs + h.gbbs + h.ggidlb).mul_add(delvbs, h.gbd.mul_add(-delvbd_jct, Idtot)),
+            ),
+        );
         Igstot = h.Igs + h.Igcs;
-        cgshat = Igstot + (h.gIgsg + h.gIgcsg) * delvgs + h.gIgcsd * delvds + h.gIgcsb * delvbs;
+        cgshat = h.gIgcsb.mul_add(
+            delvbs,
+            h.gIgcsd
+                .mul_add(delvds, (h.gIgsg + h.gIgcsg).mul_add(delvgs, Igstot)),
+        );
         Igdtot = h.Igd + h.Igcd;
-        cgdhat =
-            Igdtot + h.gIgdg * delvgd + h.gIgcdg * delvgs + h.gIgcdd * delvds + h.gIgcdb * delvbs;
+        cgdhat = h.gIgcdb.mul_add(
+            delvbs,
+            h.gIgcdd.mul_add(
+                delvds,
+                h.gIgcdg.mul_add(delvgs, h.gIgdg.mul_add(delvgd, Igdtot)),
+            ),
+        );
         Igbtot = h.Igb;
-        cgbhat = h.Igb + h.gIgbg * delvgs + h.gIgbd * delvds + h.gIgbb * delvbs;
+        cgbhat = h.gIgbb.mul_add(
+            delvbs,
+            h.gIgbd.mul_add(delvds, h.gIgbg.mul_add(delvgs, h.Igb)),
+        );
     } else {
         // C's own "bugfix" spelling of the reverse-mode drain current.
         Idtot = h.cd + h.cbd - h.Igidl;
-        cdhat = Idtot + h.gbd * delvbd_jct + h.gmbs * delvbd + h.gm * delvgd
-            - (h.gds + h.ggidls) * delvds
-            - h.ggidlg * delvgs
-            - h.ggidlb * delvbs;
+        cdhat = h.ggidlb.mul_add(
+            -delvbs,
+            h.ggidlg.mul_add(
+                -delvgs,
+                (h.gds + h.ggidls).mul_add(
+                    -delvds,
+                    h.gm.mul_add(
+                        delvgd,
+                        h.gmbs.mul_add(delvbd, h.gbd.mul_add(delvbd_jct, Idtot)),
+                    ),
+                ),
+            ),
+        );
         Igstot = h.Igs + h.Igcd;
-        cgshat =
-            Igstot + h.gIgsg * delvgs + h.gIgcdg * delvgd - h.gIgcdd * delvds + h.gIgcdb * delvbd;
+        cgshat = h.gIgcdb.mul_add(
+            delvbd,
+            h.gIgcdd.mul_add(
+                -delvds,
+                h.gIgcdg.mul_add(delvgd, h.gIgsg.mul_add(delvgs, Igstot)),
+            ),
+        );
         Igdtot = h.Igd + h.Igcs;
-        cgdhat = Igdtot + (h.gIgdg + h.gIgcsg) * delvgd - h.gIgcsd * delvds + h.gIgcsb * delvbd;
+        cgdhat = h.gIgcsb.mul_add(
+            delvbd,
+            h.gIgcsd
+                .mul_add(-delvds, (h.gIgdg + h.gIgcsg).mul_add(delvgd, Igdtot)),
+        );
         Igbtot = h.Igb;
-        cgbhat = h.Igb + h.gIgbg * delvgd - h.gIgbd * delvds + h.gIgbb * delvbd;
+        cgbhat = h.gIgbb.mul_add(
+            delvbd,
+            h.gIgbd.mul_add(-delvds, h.gIgbg.mul_add(delvgd, h.Igb)),
+        );
     }
 
     let Isestot = h.gstot * (state0(state::VSES));
-    let cseshat =
-        Isestot + h.gstot * delvses + h.gstotd * delvds + h.gstotg * delvgs + h.gstotb * delvbs;
+    let cseshat = h.gstotb.mul_add(
+        delvbs,
+        h.gstotg.mul_add(
+            delvgs,
+            h.gstotd.mul_add(delvds, h.gstot.mul_add(delvses, Isestot)),
+        ),
+    );
     let Idedtot = h.gdtot * vdedo;
-    let cdedhat =
-        Idedtot + h.gdtot * delvded + h.gdtotd * delvds + h.gdtotg * delvgs + h.gdtotb * delvbs;
+    let cdedhat = h.gdtotb.mul_add(
+        delvbs,
+        h.gdtotg.mul_add(
+            delvgs,
+            h.gdtotd.mul_add(delvds, h.gdtot.mul_add(delvded, Idedtot)),
+        ),
+    );
 
     // Check convergence
     if (h.off == 0) || ((mode & mode::MODEINITFIX) == 0) {
-        let tol0 = reltol * max(cdhat.abs(), Idtot.abs()) + abstol;
-        let tol1 = reltol * max(cseshat.abs(), Isestot.abs()) + abstol;
-        let tol2 = reltol * max(cdedhat.abs(), Idedtot.abs()) + abstol;
-        let tol3 = reltol * max(cgshat.abs(), Igstot.abs()) + abstol;
-        let tol4 = reltol * max(cgdhat.abs(), Igdtot.abs()) + abstol;
-        let tol5 = reltol * max(cgbhat.abs(), Igbtot.abs()) + abstol;
+        let tol0 = convergence_tolerance(cdhat, Idtot, reltol, abstol);
+        let tol1 = convergence_tolerance(cseshat, Isestot, reltol, abstol);
+        let tol2 = convergence_tolerance(cdedhat, Idedtot, reltol, abstol);
+        let tol3 = convergence_tolerance(cgshat, Igstot, reltol, abstol);
+        let tol4 = convergence_tolerance(cgdhat, Igdtot, reltol, abstol);
+        let tol5 = convergence_tolerance(cgbhat, Igbtot, reltol, abstol);
         if ((cdhat - Idtot).abs() >= tol0)
             || ((cseshat - Isestot).abs() >= tol1)
             || ((cdedhat - Idedtot).abs() >= tol2)
@@ -129,22 +177,44 @@ pub(super) fn conv_test(
         }
         let Ibtot = h.cbs + h.cbd - h.Igidl - h.Igisl - h.csub;
         let cbhat = if h.mode >= 0 {
-            Ibtot + h.gbd * delvbd_jct + h.gbs * delvbs_jct
-                - (h.gbbs + h.ggidlb) * delvbs
-                - (h.gbgs + h.ggidlg) * delvgs
-                - (h.gbds + h.ggidld) * delvds
-                - h.ggislg * delvgd
-                - h.ggislb * delvbd
-                + h.ggisls * delvds
+            h.ggisls.mul_add(
+                delvds,
+                h.ggislb.mul_add(
+                    -delvbd,
+                    h.ggislg.mul_add(
+                        -delvgd,
+                        (h.gbds + h.ggidld).mul_add(
+                            -delvds,
+                            (h.gbgs + h.ggidlg).mul_add(
+                                -delvgs,
+                                (h.gbbs + h.ggidlb).mul_add(
+                                    -delvbs,
+                                    h.gbs.mul_add(delvbs_jct, h.gbd.mul_add(delvbd_jct, Ibtot)),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
         } else {
-            Ibtot + h.gbs * delvbs_jct + h.gbd * delvbd_jct
-                - (h.gbbs + h.ggislb) * delvbd
-                - (h.gbgs + h.ggislg) * delvgd
-                + (h.gbds + h.ggisld - h.ggidls) * delvds
-                - h.ggidlg * delvgs
-                - h.ggidlb * delvbs
+            h.ggidlb.mul_add(
+                -delvbs,
+                h.ggidlg.mul_add(
+                    -delvgs,
+                    (h.gbds + h.ggisld - h.ggidls).mul_add(
+                        delvds,
+                        (h.gbgs + h.ggislg).mul_add(
+                            -delvgd,
+                            (h.gbbs + h.ggislb).mul_add(
+                                -delvbd,
+                                h.gbd.mul_add(delvbd_jct, h.gbs.mul_add(delvbs_jct, Ibtot)),
+                            ),
+                        ),
+                    ),
+                ),
+            )
         };
-        let tol6 = reltol * max(cbhat.abs(), Ibtot.abs()) + abstol;
+        let tol6 = convergence_tolerance(cbhat, Ibtot, reltol, abstol);
         if (cbhat - Ibtot).abs() > tol6 {
             return true;
         }
@@ -156,7 +226,7 @@ pub(super) fn conv_test(
 mod tests {
     use super::super::acld::tests::shaped;
     use super::super::host::{mode, node, state};
-    use super::{Model, conv_test};
+    use super::{Model, conv_test, convergence_tolerance};
 
     fn run(h: &super::Instance, rhs: &[f64; node::COUNT], s0: &[f64; state::COUNT]) -> bool {
         let m = Model {
@@ -188,6 +258,141 @@ mod tests {
         // A large gate step predicts a current change well beyond reltol.
         rhs[node::G_EXT as usize] = 1.8;
         assert!(run(&h, &rhs, &s0));
+    }
+
+    #[test]
+    fn predictor_ge_and_bulk_gt_keep_one_ulp_threshold_boundaries() {
+        // C uses >= on the first six predictor checks, but > on bulk.
+        // A gate change of 1 V makes each chosen conductance exactly the
+        // corresponding predicted current increment, independent of
+        // source/device capacitance and Newton step history.
+        let mut h = shaped(0, 0, 0);
+        let mut rhs = [0.0; node::COUNT];
+        rhs[node::G_EXT as usize] = 1.0;
+        let s0 = [0.0; state::COUNT];
+        let m = Model {
+            r#type: 1,
+            ..Model::default()
+        };
+        let rhs_old = |node: i32| usize::try_from(node).map_or(0.0, |i| rhs[i]);
+        let state0 = |index: usize| s0[index];
+        let threshold = 0.25_f64;
+        let just_below = f64::from_bits(threshold.to_bits() - 1);
+        let just_above = f64::from_bits(threshold.to_bits() + 1);
+
+        for mode_sign in [1, -1] {
+            h.mode = mode_sign;
+            for (increment, nonconverged) in
+                [(just_below, false), (threshold, true), (just_above, true)]
+            {
+                h.gm = increment;
+                assert_eq!(
+                    conv_test(
+                        &m,
+                        &h,
+                        &rhs_old,
+                        &state0,
+                        mode::MODEINITFLOAT,
+                        0.0,
+                        threshold
+                    ),
+                    nonconverged,
+                    "drain predictor: mode={mode_sign} current={increment:.17e}"
+                );
+            }
+
+            h.gm = 0.0;
+            // ggislg contributes only to bulk prediction (not an earlier
+            // drain/gate/series predictor) when operating in forward mode.
+            // Reverse mode uses ggislb on delvbd; test forward only below.
+        }
+
+        h.mode = 1;
+        for (increment, nonconverged) in
+            [(just_below, false), (threshold, false), (just_above, true)]
+        {
+            h.ggislg = increment;
+            assert_eq!(
+                conv_test(
+                    &m,
+                    &h,
+                    &rhs_old,
+                    &state0,
+                    mode::MODEINITFLOAT,
+                    0.0,
+                    threshold
+                ),
+                nonconverged,
+                "bulk predictor: conductance={increment:.17e}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_round_threshold_prevents_false_fma_nonconvergence() {
+        // (1+e)(1-e) = 1-e², but C multiplication first rounds to 1,
+        // then adds 3*2^-54. The fused value rounds back to 1.
+        let e = 2_f64.powi(-27);
+        let reltol = 1. + e;
+        let abstol = 3. * 2_f64.powi(-54);
+        let predicted = 1. - e;
+        let old = -e;
+        assert_eq!((predicted - old).to_bits(), 1_f64.to_bits());
+        assert_eq!(
+            convergence_tolerance(predicted, old, reltol, abstol).to_bits(),
+            (1. + f64::EPSILON).to_bits()
+        );
+        assert_eq!(reltol.mul_add(predicted, abstol).to_bits(), 1_f64.to_bits());
+        let mut h = shaped(0, 0, 0);
+        h.cd = old;
+        h.gm = 1.;
+        let mut rhs = [0.0; node::COUNT];
+        rhs[node::G_EXT as usize] = 1.;
+        let state = [0.0; state::COUNT];
+        let model = Model {
+            r#type: 1,
+            ..Model::default()
+        };
+        let rhs_old = |node: i32| usize::try_from(node).map_or(0.0, |i| rhs[i]);
+        let state0 = |index: usize| state[index];
+        assert!(
+            !conv_test(
+                &model,
+                &h,
+                &rhs_old,
+                &state0,
+                mode::MODEINITFLOAT,
+                reltol,
+                abstol
+            ),
+            "two-round C convergence bound should accept this current change"
+        );
+    }
+
+    #[test]
+    fn c_nonfinite_and_signed_zero_comparisons_are_deliberate() {
+        let mut h = shaped(0, 0, 0);
+        let mut rhs = [0.0; node::COUNT];
+        rhs[node::G_EXT as usize] = 1.0;
+        let s0 = [0.0; state::COUNT];
+        let m = Model {
+            r#type: 1,
+            ..Model::default()
+        };
+        let rhs_old = |node: i32| usize::try_from(node).map_or(0.0, |i| rhs[i]);
+        let state0 = |index: usize| s0[index];
+        for current in [-0.0, 0.0, f64::NAN] {
+            h.gm = current;
+            assert!(!conv_test(
+                &m,
+                &h,
+                &rhs_old,
+                &state0,
+                mode::MODEINITFLOAT,
+                0.0,
+                1e-12
+            ));
+        }
     }
 
     #[test]
