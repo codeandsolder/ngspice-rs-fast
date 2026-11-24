@@ -575,3 +575,157 @@ fn noise_driver_consumes_prepared_model_generators_and_ac_charge() {
         );
     }
 }
+
+#[test]
+#[ignore = "opt-in release benchmark of real engine loads; never a timing assertion"]
+fn prepared_kernel_load_benchmark_against_in_tree_behavioural_model() {
+    use std::hint::black_box;
+    use std::path::Path;
+    use std::time::Instant;
+
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+
+    let native = source_driven_model(false);
+    let source = "analytic behavioural reference
+v1 in 0 dc 0 ac 1
+r1 in out 1k
+b1 out 0 i=0.001*v(out)+0.0002*v(out)^3
+.end
+";
+    let parsed = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("prepared-model-benchmark.cir"),
+            source,
+        ))
+        .unwrap();
+    let behavioural = Circuit::from_netlist(&parsed).unwrap();
+    let load_one = |circuit: &Circuit, iterations: usize| {
+        let history = circuit.state_history().unwrap();
+        let start = Instant::now();
+        let n = circuit.unknown_count();
+        let output = circuit
+            .unknowns()
+            .node_row(circuit.nodes().get("out").unwrap())
+            .unwrap();
+        let mut digest = 0.;
+        for index in 0..iterations {
+            let bias = 0.1 + 0.01 * (index % 50) as f64;
+            let mut solution = Vector::zeros(n);
+            solution.as_mut_slice()[output] = bias;
+            let mut matrix = SparseMatrix::new(n, n);
+            let mut rhs = Vector::zeros(n);
+            let mut trial = history.trial();
+            circuit
+                .load(
+                    &LoadRequest {
+                        mode: AnalysisMode::OperatingPoint,
+                        solution: &solution,
+                        model_context: &ModelContext::default(),
+                        integration: None,
+                        history: &history,
+                        forcing: None,
+                    },
+                    &mut matrix,
+                    &mut rhs,
+                    &mut trial,
+                )
+                .unwrap();
+            digest += black_box(matrix.get(output, output) + rhs.as_slice()[output]);
+        }
+        (start.elapsed(), digest)
+    };
+    const REPEATS: usize = 10_000;
+    let (a_time, a_digest) = load_one(&native, REPEATS);
+    let (b_time, b_digest) = load_one(&behavioural, REPEATS);
+    close(a_digest, b_digest);
+    println!(
+        "prepared_model_loads=10000 native_ns_per_load={:.1} behavioural_ns_per_load={:.1} digest={a_digest:.14e}",
+        a_time.as_nanos() as f64 / REPEATS as f64,
+        b_time.as_nanos() as f64 / REPEATS as f64,
+    );
+}
+
+#[test]
+fn declared_physical_zero_and_unavailable_channels_have_distinct_semantics() {
+    let mut unavailable = descriptor(Capability::Unavailable);
+    unavailable.noise = Capability::Zero;
+    let model = Artifact::new(unavailable, PolynomialKernel).unwrap();
+    let mut circuit = Circuit::new();
+    let a = circuit.add_node("a").unwrap();
+    circuit
+        .add_device(Box::new(
+            model
+                .instance(
+                    "x1",
+                    vec![a, NodeId::GROUND],
+                    &[1e-3, 2e-4, 1e-6, 2e-7],
+                    27.,
+                )
+                .unwrap(),
+        ))
+        .unwrap();
+    circuit.finalize().unwrap();
+    assert_eq!(circuit.state_len(), 0);
+    let history = circuit.state_history().unwrap();
+    let (_, _, _) = load(&circuit, &history, &[0.4], None);
+    let bias = Vector::from_slice(&[0.4]);
+    assert!(
+        circuit
+            .small_signal_system(&ModelContext::default(), &bias)
+            .is_err()
+    );
+    let model_context = ModelContext::default();
+    let context = NoiseContext {
+        model_context: &model_context,
+        unknowns: circuit.unknowns(),
+        bias: &bias,
+        states: None,
+        controls: &[],
+    };
+    let mut sources = Vec::new();
+    let result = circuit.devices()[0].noise(&context, &mut sources).unwrap();
+    assert!(matches!(
+        result,
+        ngspice_rs::devices::noise::DeviceNoise::Noiseless
+    ));
+    assert!(sources.is_empty());
+
+    // The fixture returns nonzero charge; falsely labeling it physically
+    // zero is detected as a model-contract violation.
+    let model = Artifact::new(descriptor(Capability::Zero), PolynomialKernel).unwrap();
+    let mut other = Circuit::new();
+    let a = other.add_node("a").unwrap();
+    other
+        .add_device(Box::new(
+            model
+                .instance(
+                    "x2",
+                    vec![a, NodeId::GROUND],
+                    &[1e-3, 2e-4, 1e-6, 2e-7],
+                    27.,
+                )
+                .unwrap(),
+        ))
+        .unwrap();
+    other.finalize().unwrap();
+    let n = other.unknown_count();
+    let history = other.state_history().unwrap();
+    let mut matrix = SparseMatrix::new(n, n);
+    let mut rhs = Vector::zeros(n);
+    let error = other
+        .load(
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &Vector::from_slice(&[0.4]),
+                model_context: &ModelContext::default(),
+                integration: None,
+                history: &history,
+                forcing: None,
+            },
+            &mut matrix,
+            &mut rhs,
+            &mut history.trial(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("known-zero charge"), "{error}");
+}
