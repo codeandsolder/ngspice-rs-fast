@@ -260,7 +260,7 @@ pub fn solve_circuit(
     solve(lattice, &mut model, seed, equation_tolerances, limits)
 }
 
-pub(crate) fn linearize_circuit_orbit(
+pub(in crate::analysis) fn linearize_circuit_orbit(
     circuit: &Circuit,
     context: ModelContext,
     lattice: &HarmonicLattice,

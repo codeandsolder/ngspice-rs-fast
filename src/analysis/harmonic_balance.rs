@@ -10,11 +10,11 @@ mod solver;
 
 pub use solver::{BalanceLimits, BalanceSolution, BalanceStats, HarmonicModel, Sample, solve};
 
-pub(crate) use circuit::linearize_circuit_orbit;
+pub(super) use circuit::linearize_circuit_orbit;
 pub use circuit::solve_circuit;
 pub(super) use plan::HarmonicBalancePlan;
 pub use plan::{Harmonic, HarmonicLattice, LatticeLimits, ToneAxis};
-pub(crate) use solver::{OrbitSpectrum, linearize_orbit};
+pub(super) use solver::{OrbitSpectrum, linearize_orbit};
 
 use crate::primitives::SpiceError;
 

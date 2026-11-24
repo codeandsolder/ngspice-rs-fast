@@ -62,7 +62,7 @@ impl Default for NoiseLimits {
     }
 }
 
-/// One covariance observation, E[y_left conj(y_right)] per hertz.
+/// One covariance observation, `E[y_left conj(y_right)]` per hertz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CovariancePair {
     /// Left output ordinal.
@@ -88,7 +88,7 @@ struct CovarianceSum {
 }
 
 impl CovarianceSum {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             real: ExactSum::new(),
             imaginary: ExactSum::new(),
@@ -119,6 +119,7 @@ pub struct NoiseAccumulator<'a, 'response> {
     terms: usize,
     work: usize,
     limits: NoiseLimits,
+    native_added: bool,
 }
 
 impl<'a, 'response> NoiseAccumulator<'a, 'response> {
@@ -170,6 +171,7 @@ impl<'a, 'response> NoiseAccumulator<'a, 'response> {
             terms,
             work: 0,
             limits,
+            native_added: false,
         })
     }
 
@@ -386,7 +388,7 @@ fn phase_points(
 fn phase_weights(basis: &[Real], weights: &mut [Complex]) {
     let center = weights.len() / 2;
     weights[center] = Complex::real(1.);
-    for (i, pair) in basis[1..].chunks_exact(2).enumerate() {
+    for (i, pair) in basis[1..].as_chunks::<2>().0.iter().enumerate() {
         let positive = Complex::new(pair[0], -pair[1]);
         weights[center + 1 + i] = positive;
         weights[center - 1 - i] = positive.conj();
@@ -553,11 +555,11 @@ fn add_native_band<'a>(
     run: &PreparedRun<'a>,
     points: &[PhasePoint],
     context: &ModelContext,
-    frequency: Real,
-    band: usize,
+    incoming: (usize, Real),
     phases: &NoisePhases,
     sums: &mut [CoherentSum],
 ) -> SpiceResult<()> {
+    let (band, frequency) = incoming;
     sums.fill(CoherentSum::ZERO);
     let context = context.with_frequency(frequency.abs());
     let normalizer = 1.
@@ -595,6 +597,9 @@ impl NoiseAccumulator<'_, '_> {
     /// No bound circuit, unsupported/changed generator layout, invalid
     /// spectral density, exceeded budgets or failed physical phase load.
     pub fn add_circuit_noise(&mut self) -> SpiceResult<()> {
+        if self.native_added {
+            return Err(failure("native circuit noise has already been accumulated"));
+        }
         let previous = self.sums.clone();
         let (factors, work) = (self.factors, self.work);
         if let Err(error) = self.add_native_noise() {
@@ -603,6 +608,7 @@ impl NoiseAccumulator<'_, '_> {
             self.work = work;
             return Err(error);
         }
+        self.native_added = true;
         Ok(())
     }
 
@@ -687,8 +693,7 @@ impl NoiseAccumulator<'_, '_> {
                 &run,
                 &points,
                 &orbit.context,
-                coordinate.frequency(),
-                band,
+                (band, coordinate.frequency()),
                 &phases,
                 &mut sums,
             )?;

@@ -429,20 +429,20 @@ impl<'a> Workspace<'a> {
 
 /// Physical derivative spectra on the complete difference lattice. The
 /// expanded pattern is shared by all shifted-frequency operators.
-pub(crate) struct OrbitSpectrum {
-    pub(crate) pattern: Arc<Pattern>,
-    pub(crate) unknowns: usize,
-    pub(crate) width: usize,
-    pub(crate) spectral_indices: Vec<usize>,
-    pub(crate) conductance: Vec<Complex>,
-    pub(crate) capacitance: Vec<Complex>,
-    pub(crate) scaled_residual: Real,
+pub(in crate::analysis) struct OrbitSpectrum {
+    pub(in crate::analysis) pattern: Arc<Pattern>,
+    pub(in crate::analysis) unknowns: usize,
+    pub(in crate::analysis) width: usize,
+    pub(in crate::analysis) spectral_indices: Vec<usize>,
+    pub(in crate::analysis) conductance: Vec<Complex>,
+    pub(in crate::analysis) capacitance: Vec<Complex>,
+    pub(in crate::analysis) scaled_residual: Real,
 }
 
 /// Recheck the actual supplied orbit under the current model, and project
 /// its exact derivatives once. A caller-provided convergence flag alone
 /// cannot authorize a linearization.
-pub(crate) fn linearize_orbit(
+pub(in crate::analysis) fn linearize_orbit(
     lattice: &HarmonicLattice,
     model: &mut impl HarmonicModel,
     solution: &BalanceSolution,

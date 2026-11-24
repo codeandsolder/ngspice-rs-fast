@@ -171,6 +171,49 @@ fn analytic_two_pump_conversion_uses_output_frequency_and_signed_phase() {
                 2e-14,
             );
         }
+        if !plan.conjugate_overlap() {
+            let observed = [
+                center,
+                plan.locate(&[1, 0]).unwrap(),
+                plan.locate(&[0, 1]).unwrap(),
+            ];
+            let observations = observed.map(|band| unit(1, band));
+            let pairs = [
+                CovariancePair { left: 0, right: 0 },
+                CovariancePair { left: 0, right: 1 },
+                CovariancePair { left: 1, right: 2 },
+            ];
+            let mut accumulator =
+                NoiseAccumulator::new(&response, &observations, &pairs, NoiseLimits::default())
+                    .unwrap();
+            let mut expected = [Complex::ZERO; 3];
+            for (incoming, source) in plan.bands().iter().enumerate() {
+                accumulator.add_factor(&unit(0, incoming)).unwrap();
+                let h = observed.map(|index| {
+                    let target = &plan.bands()[index];
+                    let delta = [
+                        target.indices()[0] - source.indices()[0],
+                        target.indices()[1] - source.indices()[1],
+                    ];
+                    let (g, c) = match delta {
+                        [0, 0] => (Complex::real(2.), Complex::ZERO),
+                        [1, 0] => (Complex::real(0.3), Complex::imaginary(-0.0015)),
+                        [-1, 0] => (Complex::real(0.3), Complex::imaginary(0.0015)),
+                        [0, 1] => (Complex::imaginary(-0.2), Complex::real(0.001)),
+                        [0, -1] => (Complex::imaginary(0.2), Complex::real(0.001)),
+                        _ => (Complex::ZERO, Complex::ZERO),
+                    };
+                    g + Complex::imaginary(TAU * target.frequency()) * c
+                });
+                for (sum, pair) in expected.iter_mut().zip(pairs) {
+                    *sum = *sum + h[pair.left] * h[pair.right].conj();
+                }
+            }
+            let result = accumulator.finish().unwrap();
+            for (actual, reference) in result.densities.into_iter().zip(expected) {
+                close(actual, reference, 1e-12);
+            }
+        }
         let tiny = ResponseLimits {
             tile_entries: 1,
             ..ResponseLimits::default()
@@ -260,6 +303,20 @@ fn zero_pump_native_ports_reduce_to_ordinary_sp() {
             );
         }
     }
+    // A unit incident thermal wave contributes kT times the selected
+    // conversion power gain, even with unequal reference impedances.
+    let observation = response.scattered_wave(outputs[1]).unwrap();
+    let mut thermal = NoiseAccumulator::new(
+        &response,
+        &[observation],
+        &[CovariancePair { left: 0, right: 0 }],
+        NoiseLimits::default(),
+    )
+    .unwrap();
+    thermal.add_thermal_input(inputs[0], 290.).unwrap();
+    let expected = BOLTZMANN * 290. * scattering[1].magnitude().powi(2);
+    let actual = thermal.finish().unwrap().densities[0];
+    close(actual, Complex::real(expected), expected * 1e-12);
     let other = PortChannel {
         port: 2,
         band: response.plan().locate(&[1]).unwrap(),
@@ -444,6 +501,7 @@ fn zero_pump_native_noise_and_ac_match_dc_bias_analyses() {
     )
     .unwrap();
     noise.add_circuit_noise().unwrap();
+    assert!(noise.add_circuit_noise().is_err());
     let result = noise.finish().unwrap();
     assert!(
         (result.densities[0].re / expected - 1.).abs() < 2e-12,
@@ -557,7 +615,7 @@ fn transient_phasor(
     let time = plot.column("time").unwrap();
     let data = plot.column(variable).unwrap();
     let mut cursor = 0;
-    let samples = 4096;
+    let samples = 16384;
     let mut sum = Complex::ZERO;
     for index in 0..samples {
         let t = (f64::from(index) + 0.5).mul_add((stop - start) / f64::from(samples), start);
@@ -642,12 +700,12 @@ fn smooth_switched_mixer_matches_independent_weak_signal_transient() {
     let plot = config
         .plan(AnalysisInput::with_arguments(
             AnalysisKind::Transient,
-            ["50n", "200u", "90u", "50n"],
+            ["10n", "200u", "90u", "10n"],
         ))
         .unwrap()
         .run(&mut transient, &config.context())
         .unwrap();
-    for frequency in [30e3, 70e3, 230e3, 430e3] {
+    for frequency in [30e3, 170e3, 230e3, 430e3] {
         let expected = response.plan().real_phasor(&converted, frequency).unwrap();
         let actual = transient_phasor(&plot, "v(out)", frequency, 100e-6, 200e-6);
         assert!(expected.magnitude() > 5e-5);

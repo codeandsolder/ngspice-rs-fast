@@ -36,6 +36,7 @@ impl Sideband {
 }
 
 /// A single complex Floquet sector in ascending signed physical frequency.
+///
 /// The complex envelope is not folded onto positive frequencies: a real
 /// perturbation also has the conjugate sector at the negative probe.
 #[derive(Debug, Clone, PartialEq)]
