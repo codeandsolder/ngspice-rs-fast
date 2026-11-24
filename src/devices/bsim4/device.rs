@@ -1550,6 +1550,20 @@ mod tests {
     }
 
     #[test]
+    fn zero_integration_retains_signed_zero_and_nonfinite_propagation() {
+        let (conductance, current, derivative) = zero_coefficient_integrate(-1., -0., -0.);
+        assert_eq!(conductance.to_bits(), (-0_f64).to_bits());
+        assert_eq!(current.to_bits(), 0_f64.to_bits());
+        assert_eq!(derivative.to_bits(), (-0_f64).to_bits());
+        let (conductance, current, derivative) = zero_coefficient_integrate(f64::INFINITY, 1., 2.);
+        assert!(conductance.is_nan());
+        assert_eq!(current.to_bits(), 0_f64.to_bits());
+        assert_eq!(derivative.to_bits(), 0_f64.to_bits());
+        let (_, current, derivative) = zero_coefficient_integrate(1., f64::INFINITY, 1.);
+        assert!(current.is_nan() && derivative.is_nan());
+    }
+
+    #[test]
     fn temperature_cache_uses_exact_numeric_equality() {
         let setup = prepared(1e-6);
         assert!(setup.matches_temperatures(27., 27.));
