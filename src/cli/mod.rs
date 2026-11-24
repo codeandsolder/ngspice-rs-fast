@@ -18,6 +18,7 @@
 //! [`NotYetPorted`]: crate::primitives::SpiceError::NotYetPorted
 
 pub mod args;
+pub mod control;
 pub mod simulate;
 
 pub use args::{Args, Command, exit_code, run, usage};

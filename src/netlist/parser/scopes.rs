@@ -120,10 +120,11 @@ pub(super) fn assemble(
     deck: &Deck,
     cards: &[SpiceResult<InputCard>],
     auto_gnd: bool,
+    scripted: bool,
 ) -> SpiceResult<ParsedDeck> {
     let models = ModelIndex::build(cards);
     let mut cursor = 0;
-    let scope = scope(cards, &mut cursor, auto_gnd, &models, None, 0)?;
+    let scope = scope(cards, &mut cursor, auto_gnd, &models, None, 0, scripted)?;
     Ok(ParsedDeck {
         netlist: Netlist {
             title: deck.title.clone(),
@@ -292,6 +293,7 @@ enum ControlPhase {
 struct ControlScript {
     phase: ControlPhase,
     deck_ran: bool,
+    scripted: bool,
 }
 
 impl ControlScript {
@@ -324,6 +326,25 @@ impl ControlScript {
         }
         if self.phase == ControlPhase::Outside {
             return grammar::parse_card(card, auto_gnd, declared).map(Some);
+        }
+        if self.scripted {
+            if card.tokens.first().is_some_and(|t| t.is_keyword("set"))
+                && card
+                    .tokens
+                    .get(1)
+                    .is_some_and(|t| super::options::frontend_setting_name(&t.text))
+            {
+                if self.deck_ran {
+                    return Err(SpiceError::parse(
+                        card.location.clone(),
+                        "frontend settings must precede executable control commands",
+                    ));
+                }
+                return grammar::parse_frontend_setting(card, auto_gnd, declared).map(Some);
+            }
+            self.deck_ran = true;
+            self.phase = ControlPhase::AfterRun;
+            return Ok(None);
         }
         if self.phase == ControlPhase::Quit {
             return Err(SpiceError::not_yet_ported(
@@ -402,11 +423,15 @@ fn scope(
     models: &ModelIndex<'_>,
     opening: Option<(&str, &SourceLoc)>,
     depth: usize,
+    scripted: bool,
 ) -> SpiceResult<Scope> {
     let declared = models.visibility(*cursor)?;
     let mut result = Scope::default();
     let mut definitions = BTreeSet::new();
-    let mut control = ControlScript::default();
+    let mut control = ControlScript {
+        scripted,
+        ..ControlScript::default()
+    };
     while let Some(entry) = cards.get(*cursor) {
         let entry = entry.as_ref().map_err(Clone::clone)?;
         *cursor += 1;
@@ -461,6 +486,7 @@ fn scope(
                     models,
                     Some((&s.name, &s.location)),
                     depth + 1,
+                    scripted,
                 )?;
                 let s = body.into_definition(s)?;
                 ScopedCardKind::Subcircuit(push_index(&mut result.subcircuits, s))

@@ -908,7 +908,18 @@ impl Jfet2 {
     ) -> SpiceResult<Option<Real>> {
         if !matches!(
             key,
-            "vgs" | "vgd" | "gm" | "gds" | "ggs" | "ggd" | "igd" | "vtrap" | "vpave"
+            "vgs"
+                | "vgd"
+                | "gm"
+                | "gds"
+                | "ggs"
+                | "ggd"
+                | "igd"
+                | "id"
+                | "ig"
+                | "is"
+                | "vtrap"
+                | "vpave"
         ) {
             return Ok(None);
         }
@@ -925,6 +936,7 @@ impl Jfet2 {
         let op = self.operating(context)?;
         let point = self.point(&op, vgs, vgd, context.gmin, None)?;
         let m = self.instance.m;
+        let loads = Loaded::from_currents([vgs, vgd], point.channel, point.gs, point.gd);
         Ok(Some(match key {
             "vgs" => vgs,
             "vgd" => vgd,
@@ -933,6 +945,10 @@ impl Jfet2 {
             "ggs" => m * point.gs.1,
             "ggd" => m * point.gd.1,
             "igd" => m * point.gd.0,
+            // JFET2cd/cg are intrinsic load fields in normalized polarity.
+            "id" => m * loads.cd,
+            "ig" => m * loads.cg,
+            "is" => m * (-loads.cd - loads.cg),
             "vtrap" => point.vgdtrap,
             _ => point.pave,
         }))

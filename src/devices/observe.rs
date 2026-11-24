@@ -7,9 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::devices::circuit::{PreparedMutualTerms, PreparedPoint, TopologyId};
 use crate::devices::state::IsolatedState;
 use crate::devices::traits::{IsolatedRhs, StampRhs};
-use crate::devices::{
-    Circuit, Device, Forcing, LoadRequest, ModelContext, PreparedRun, TrialState,
-};
+use crate::devices::{Circuit, Forcing, LoadRequest, ModelContext, PreparedRun, TrialState};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 
@@ -38,16 +36,14 @@ fn query(name: &str) -> SpiceResult<(&str, &str)> {
     Ok((device, parameter))
 }
 
-fn terminal(device: &dyn Device, key: &str) -> Option<usize> {
-    // JFET (jfetask.c) and MESFET (mesask.c) port labels use the same
-    // terminal numbering as their corresponding device load.
-    match (device.designator(), key) {
-        (_, "i" | "current") | ('d' | 'm' | 'j', "id") | ('q', "ic") | ('z', "cd") => Some(0),
-        ('q', "ib") | ('m' | 'j', "ig") | ('z', "cg") => Some(1),
-        ('q', "ie") | ('m' | 'j' | 'z', "is") => Some(2),
-        ('m', "ib") => Some(3),
-        _ => None,
-    }
+/// Only explicit terminal-current requests may trigger an isolated MNA load.
+///
+/// C instance asks (such as @m1[id], @q1[ic] and @z1[cd]) are intrinsic
+/// device quantities, not synonyms for the external currents leaving the
+/// first, second or third terminal. Junctions, leakage, internal series nodes
+/// and C polarity-normalized ask fields make the distinction observable.
+fn terminal(key: &str) -> Option<usize> {
+    matches!(key, "i" | "current").then_some(0)
 }
 
 fn unit(device: char, key: &str) -> &'static str {
@@ -98,7 +94,6 @@ enum Selector {
     Current {
         load: usize,
         slot: usize,
-        signed: bool,
     },
     Power {
         load: usize,
@@ -306,14 +301,7 @@ impl PointLoads<'_, '_> {
             |row: Option<usize>| row.map_or(0., |row| self.request.solution.as_slice()[row]);
         let context = self.request.model_context;
         match &query.selector {
-            Selector::Current { load, slot, signed } => {
-                let current = self.current(*load, *slot, name)?;
-                Ok(if *signed {
-                    current * device.observation_current_sign()
-                } else {
-                    current
-                })
-            }
+            Selector::Current { load, slot } => self.current(*load, *slot, name),
             Selector::Power { load, slot, rows } => {
                 let current = self.current(*load, *slot, name)? * device.observation_current_sign();
                 Ok(current * (row_value(rows[0]) - row_value(rows[1])))
@@ -364,8 +352,7 @@ impl ObservationPlan {
                 return Err(gap("more than 1024 requested quantities"));
             }
             let power = matches!(key, "p" | "power");
-            let selector = if let Some(port) = terminal(device, key).or_else(|| power.then_some(0))
-            {
+            let selector = if let Some(port) = terminal(key).or_else(|| power.then_some(0)) {
                 let terminals = device.terminals();
                 if power && terminals.len() != 2 {
                     return Err(gap(&name));
@@ -396,11 +383,7 @@ impl ObservationPlan {
                         ],
                     }
                 } else {
-                    Selector::Current {
-                        load,
-                        slot,
-                        signed: !matches!(key, "i" | "current"),
-                    }
+                    Selector::Current { load, slot }
                 }
             } else if key == "dc" && matches!(device.designator(), 'v' | 'i') {
                 Selector::SourceDc
@@ -705,8 +688,180 @@ impl PreparedRun<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devices::{AnalysisMode, StampContext};
+    use crate::devices::{AnalysisMode, Device, StampContext};
     use std::{cell::Cell, rc::Rc};
+
+    /// A deliberately C-ask-aware stand-in with a different intrinsic
+    /// quantity and external terminal residual. No physical device model
+    /// needs to be patched to validate the binding contract.
+    #[derive(Debug)]
+    struct IntrinsicAskProbe {
+        name: &'static str,
+        nodes: [NodeId; 2],
+        stamps: Rc<Cell<usize>>,
+        asks: Rc<Cell<usize>>,
+    }
+
+    impl Device for IntrinsicAskProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn designator(&self) -> char {
+            self.name.chars().next().unwrap()
+        }
+        fn terminals(&self) -> &[NodeId] {
+            &self.nodes
+        }
+        fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+            self.stamps.set(self.stamps.get() + 1);
+            let [a, b] = self.nodes;
+            for (row, col, value) in [(a, a, 2.), (a, b, -2.), (b, a, -2.), (b, b, 2.)] {
+                context.stamp(row, col, value)?;
+            }
+            Ok(())
+        }
+        fn observation_operating(
+            &self,
+            key: &str,
+            _context: &ModelContext,
+            _voltage: &dyn Fn(NodeId) -> Real,
+            _transient: bool,
+        ) -> SpiceResult<Option<Real>> {
+            self.asks.set(self.asks.get() + 1);
+            Ok(match (self.designator(), key) {
+                ('m', "id") => Some(101.),
+                ('j', "id") => Some(102.),
+                ('q', "ic") => Some(103.),
+                ('z', "cd") => Some(104.),
+                ('d', "id") => Some(105.),
+                _ => None,
+            })
+        }
+    }
+
+    #[test]
+    fn bound_intrinsic_c_asks_never_use_isolated_terminal_loads() {
+        let mut circuit = Circuit::new();
+        let a = circuit.add_node("a").unwrap();
+        let b = circuit.add_node("b").unwrap();
+        let mut stamps = Vec::new();
+        let mut asks = Vec::new();
+        for name in ["m1", "j1", "q1", "z1", "d1"] {
+            let stamped = Rc::new(Cell::new(0));
+            let asked = Rc::new(Cell::new(0));
+            circuit
+                .add_device(Box::new(IntrinsicAskProbe {
+                    name,
+                    nodes: [a, b],
+                    stamps: Rc::clone(&stamped),
+                    asks: Rc::clone(&asked),
+                }))
+                .unwrap();
+            stamps.push(stamped);
+            asks.push(asked);
+        }
+        circuit.finalize().unwrap();
+        circuit
+            .set_observations(
+                &["m1[id]", "j1[id]", "q1[ic]", "z1[cd]", "d1[id]"]
+                    .map(|key| format!("@{key}"))
+                    .into_iter()
+                    .chain(["i(m1)", "@m1[i]", "@m1[current]", "@m1[p]"].map(str::to_owned))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert_eq!(circuit.observations().len(), 9);
+        let history = circuit.state_history().unwrap();
+        let model = ModelContext::default();
+        let solution = Vector::from_slice(&[3., 1.]);
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context: &model,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        let baseline: Vec<_> = stamps.iter().map(|stamp| stamp.get()).collect();
+        let run = circuit.prepare_run();
+        let native = run
+            .observe_real_selected(&request, &[], None, None, &[0, 1, 2, 3, 4])
+            .unwrap();
+        assert_eq!(native, [101., 102., 103., 104., 105.].map(Complex::real));
+        assert!(
+            stamps
+                .iter()
+                .zip(&baseline)
+                .all(|(actual, &start)| actual.get() == start)
+        );
+        assert!(asks.iter().all(|counter| counter.get() == 1));
+        {
+            let cached = run.observation_work.borrow();
+            let workspace = cached.as_ref().unwrap();
+            assert_eq!(workspace.loaded.len(), 1);
+            assert!(workspace.loaded[0].currents.is_empty());
+        }
+        let selected = run
+            .observe_real_selected(&request, &[], None, None, &[5, 6, 7, 8])
+            .unwrap();
+        assert_eq!(selected, [4., 4., 4., 8.].map(Complex::real));
+        assert_eq!(stamps[0].get(), baseline[0] + 1);
+        assert!(
+            stamps
+                .iter()
+                .skip(1)
+                .zip(&baseline[1..])
+                .all(|(s, &start)| s.get() == start)
+        );
+        // A fresh accepted point invalidates the one warm load, but no
+        // intrinsic selector requires a fresh stamp or a current buffer.
+        assert_eq!(
+            run.observe_real_selected(&request, &[], None, None, &[4, 1])
+                .unwrap(),
+            [105., 102.].map(Complex::real),
+        );
+        assert_eq!(stamps[0].get(), baseline[0] + 1);
+        assert_eq!(asks[1].get(), 2);
+        assert_eq!(asks[4].get(), 2);
+    }
+
+    #[test]
+    fn absent_intrinsic_ask_fails_instead_of_substituting_terminal_current() {
+        let mut circuit = Circuit::new();
+        let a = circuit.add_node("a").unwrap();
+        let stamped = Rc::new(Cell::new(0));
+        let asked = Rc::new(Cell::new(0));
+        circuit
+            .add_device(Box::new(IntrinsicAskProbe {
+                name: "q1",
+                nodes: [a, NodeId::GROUND],
+                stamps: Rc::clone(&stamped),
+                asks: Rc::clone(&asked),
+            }))
+            .unwrap();
+        circuit.finalize().unwrap();
+        circuit.set_observations(&["@q1[ie]".into()]).unwrap();
+        let run = circuit.prepare_run();
+        let history = circuit.state_history().unwrap();
+        let solution = Vector::from_slice(&[2.]);
+        let context = ModelContext::default();
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context: &context,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        assert!(
+            run.observe_real(&request, &[], None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("device observation @q1[ie]")
+        );
+        assert_eq!(stamped.get(), 0);
+        assert_eq!(asked.get(), 1);
+    }
 
     #[derive(Debug)]
     struct Counted {

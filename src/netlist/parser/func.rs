@@ -76,6 +76,7 @@ pub(super) fn definition(
             depth: 0,
             remaining_nodes: crate::netlist::expr::MAX_TREE_NODES,
             shadowing: &[],
+            control_names: false,
         },
     };
     let card = match card(&mut input, spelling, &raw.location) {

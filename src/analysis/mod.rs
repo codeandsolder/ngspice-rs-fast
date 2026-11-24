@@ -36,6 +36,7 @@ pub mod batch;
 pub mod bias;
 mod companion;
 pub mod config;
+pub mod control;
 pub mod disto;
 pub mod driver;
 pub mod fourier;
@@ -60,6 +61,7 @@ mod sens;
 mod sparam;
 pub mod sweep;
 mod tf;
+pub mod touchstone;
 
 pub use companion::{TransientPlan, TransientStats, companion_transient, companion_transient_into};
 pub use config::{

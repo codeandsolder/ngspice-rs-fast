@@ -167,7 +167,7 @@ impl Expr {
     /// Visit a syntax tree in source order without recursive stack growth.
     /// A binary node visits its left subtree before the right; a call is
     /// visited before its arguments.
-    pub(super) fn preorder(&self) -> impl Iterator<Item = &Self> {
+    pub(crate) fn preorder(&self) -> impl Iterator<Item = &Self> {
         let mut pending = vec![self];
         std::iter::from_fn(move || {
             let node = pending.pop()?;

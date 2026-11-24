@@ -155,6 +155,19 @@ fn global(input: &mut Input<'_>) -> Result<ParsedCard> {
     .parse_next(input)
 }
 
+pub(super) fn frontend_setting_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sqrnoise"
+            | "ngbehavior"
+            | "filetype"
+            | "nfreqs"
+            | "nperiods"
+            | "polydegree"
+            | "fourgridsize"
+    )
+}
+
 /// Bounded front-end pre-run settings; no commands are silently skipped.
 pub(super) fn frontend_setting(input: &mut Input<'_>) -> Result<ParsedCard> {
     if !input.input.first().is_some_and(|t| t.is_keyword("set")) {
@@ -170,16 +183,7 @@ pub(super) fn frontend_setting(input: &mut Input<'_>) -> Result<ParsedCard> {
     cut_err(|input: &mut Input<'_>| {
         let settings: Vec<OptionSetting> = repeat(1.., setting).parse_next(input)?;
         for option in &settings {
-            if !matches!(
-                option.name.as_str(),
-                "sqrnoise"
-                    | "ngbehavior"
-                    | "filetype"
-                    | "nfreqs"
-                    | "nperiods"
-                    | "polydegree"
-                    | "fourgridsize"
-            ) {
+            if !frontend_setting_name(&option.name) {
                 return Err(ErrMode::Cut(Failure(SpiceError::not_yet_ported(
                     format!("front-end setting {}", option.name),
                     "src/frontend/variable.c",
