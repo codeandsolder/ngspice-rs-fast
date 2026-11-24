@@ -549,7 +549,9 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         let mut noncon = if flagged || iterno == 1 {
             true
         } else {
-            !converged(&next, &guess, branch_rows, options) || device_test(&next, &guess, &trial)?
+            !(converged(&next, &guess, branch_rows, options)
+                || converged_at_roundoff_floor(&next, &guess, branch_rows, options, &matrix, &rhs))
+                || device_test(&next, &guess, &trial)?
         };
         match phase {
             IterationPhase::Float => {
@@ -649,6 +651,91 @@ fn converged(new: &Vector, old: &Vector, branch: &[bool], options: &NewtonOption
             (new - old).abs() <= relative_tolerance + absolute_tolerance
         })
 }
+/// A strict Newton current tolerance can fall below the rounding floor of
+/// its own sparse MNA row. This is especially visible in high-frequency charge
+/// companions: C/dt may be enormous while the physically correct terminal
+/// current is zero, so a source branch's solved current oscillates by several
+/// last bits even though every nodal voltage and the constitutive residual
+/// have converged. Continuing Newton or shrinking dt *increases* C/dt and the
+/// precision loss. C avoids this through device bypass; the general solver
+/// instead accounts for the matrix's unavoidable floating-point error.
+///
+/// The conservative bound is an absolute forward-error estimate for each
+/// branch unknown, derived from the KCL rows it participates in:
+/// `gamma_k * (sum_j |A_ij| max(|x_j|,|x'_j|) + |b_i|) / |A_i,branch|`.
+/// `gamma_k = k eps / (1-k eps)` uses `k=4*(n + nnz_i)` to allow the
+/// assembly, factorization, triangular solves and residual evaluation to
+/// each incur rounding. We take the **minimum** over KCL rows containing
+/// the branch, and never relax nodal voltage tolerances or branch currents
+/// that lack such a concrete MNA row. This is a floating-point precision
+/// floor, not an arbitrary device/current-specific convergence threshold.
+fn converged_at_roundoff_floor(
+    new: &Vector,
+    old: &Vector,
+    branch: &[bool],
+    options: &NewtonOptions,
+    matrix: &SparseMatrix,
+    rhs: &Vector,
+) -> bool {
+    let n = branch.len();
+    // Collect only branch currents that exceed the requested tolerance.
+    // No heap allocation in ordinary (voltage-unconverged) Newton passes.
+    let mut unmet = Vec::new();
+    for (i, (&next, &previous)) in new.as_slice().iter().zip(old.as_slice()).enumerate() {
+        let relative = options.reltol * next.abs().max(previous.abs());
+        let floor = if branch[i] {
+            options.abstol
+        } else {
+            options.vntol
+        };
+        if (next - previous).abs() > relative + floor {
+            if !branch[i] {
+                return false;
+            }
+            unmet.push(i);
+        }
+    }
+    if unmet.is_empty() {
+        return false;
+    }
+    let mut scale = vec![0.0_f64; n];
+    let mut count = vec![0_usize; n];
+    let entries = matrix.triplets();
+    for entry in entries {
+        if !branch[entry.row] {
+            let magnitude = new.as_slice()[entry.col]
+                .abs()
+                .max(old.as_slice()[entry.col].abs());
+            scale[entry.row] += entry.value.abs() * magnitude;
+            count[entry.row] += 1;
+        }
+    }
+    let mut row_roundoff = vec![0.0_f64; n];
+    for (i, &is_branch) in branch.iter().enumerate() {
+        if !is_branch {
+            let k = 4.0 * ((n as Real) + (count[i] as Real));
+            let round = k * Real::EPSILON;
+            if !round.is_finite() || round >= 1.0 {
+                return false;
+            }
+            row_roundoff[i] = round / (1.0 - round) * (scale[i] + rhs.as_slice()[i].abs());
+        }
+    }
+    let mut uncertainty = vec![Real::INFINITY; n];
+    for entry in entries {
+        if !branch[entry.row] && unmet.binary_search(&entry.col).is_ok() && entry.value != 0.0 {
+            uncertainty[entry.col] =
+                uncertainty[entry.col].min(row_roundoff[entry.row] / entry.value.abs());
+        }
+    }
+    unmet.into_iter().all(|i| {
+        let bound = uncertainty[i];
+        let delta = (new.as_slice()[i] - old.as_slice()[i]).abs();
+        let relative = options.reltol * new.as_slice()[i].abs().max(old.as_slice()[i].abs());
+        bound.is_finite() && delta <= options.abstol + relative + bound
+    })
+}
+
 fn failure(message: impl Into<String>) -> SpiceError {
     SpiceError::Numerical {
         context: "Newton".into(),
@@ -659,6 +746,63 @@ fn failure(message: impl Into<String>) -> SpiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn branch_precision_floor_requires_an_actual_ill_scaled_kcl_coupling() {
+        // A stiff capacitor-like KCL row and an ideal voltage source branch.
+        // With V ~= 0.5 V and G=2000 S, an f64 solve cannot resolve branch
+        // currents much finer than ~1e-11 A even when the true current is 0.
+        let mut matrix = SparseMatrix::new(2, 2);
+        matrix.add(0, 0, 2e3).unwrap();
+        matrix.add(0, 1, 1.0).unwrap();
+        matrix.add(1, 0, 1.0).unwrap();
+        let mut rhs = Vector::zeros(2);
+        rhs.add_to(0, 1e3).unwrap();
+        rhs.add_to(1, 0.5).unwrap();
+        let options = NewtonOptions {
+            reltol: 1e-6,
+            abstol: 1e-14,
+            ..NewtonOptions::default()
+        };
+        let old = Vector::from(vec![0.5, 0.0]);
+        let negligible = Vector::from(vec![0.5, 1e-12]);
+        assert!(!converged(&negligible, &old, &[false, true], &options));
+        assert!(converged_at_roundoff_floor(
+            &negligible,
+            &old,
+            &[false, true],
+            &options,
+            &matrix,
+            &rhs
+        ));
+        let real_drift = Vector::from(vec![0.5, 1e-6]);
+        assert!(!converged_at_roundoff_floor(
+            &real_drift,
+            &old,
+            &[false, true],
+            &options,
+            &matrix,
+            &rhs
+        ));
+        let wrong_node = Vector::from(vec![0.51, 1e-12]);
+        assert!(!converged_at_roundoff_floor(
+            &wrong_node,
+            &old,
+            &[false, true],
+            &options,
+            &matrix,
+            &rhs
+        ));
+        let isolated = SparseMatrix::new(2, 2);
+        assert!(!converged_at_roundoff_floor(
+            &negligible,
+            &old,
+            &[false, true],
+            &options,
+            &isolated,
+            &rhs
+        ));
+    }
+
     #[test]
     fn solves_nonlinear_equation_and_returns_state_at_solution() {
         let initial = Vector::zeros(1);
