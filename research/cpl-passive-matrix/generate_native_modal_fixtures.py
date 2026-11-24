@@ -234,6 +234,85 @@ fn native_modal_rejects_nonphysical_scaled_admittance() {
         }).is_err());
 }
 
+
+#[test]
+fn physical_eight_wire_dense_modal_event_schedule_is_finite()
+ -> Result<(), &'static str>{
+    let fixture=CASES.iter().find(|f|f.modes==8)
+        .ok_or("missing physical eight-mode reference")?;
+    for fraction in [0.2,0.35,0.5]{
+        let line=PhysicalModalLine::from_native_modes(
+            NativeModalCoefficients{
+                voltage_basis:fixture.native_voltage,
+                current_basis:fixture.native_current,
+                characteristic_admittances:fixture.admittance,
+                total_delays:fixture.delays,
+                resistance:fixture.r,conductance:fixture.g,length:fixture.length,
+            },
+            WaveDiscretization{
+                sections:8,near_front:vec![0.;8],
+                far_front:vec![f64::INFINITY;8],prune_histories:true,
+            },
+        )?;
+        let start=std::time::Instant::now();
+        let response=line.prepare(fixture.delays[0]*fraction)?;
+        eprintln!("physical 8-mode, 8 stages, fraction={fraction:.2}: events={}, duration={:?}",
+            response.internal_steps(),start.elapsed());
+        assert!(response.internal_steps()<100_000,
+            "dense eight-mode exact event schedule needs compressed representation");
+    }
+    Ok(())
+}
+
+
+#[test]
+fn physical_eight_wire_exact_wavefront_crosstalk_and_accepted_energy()
+ -> Result<(), &'static str>{
+    let fixture=CASES.iter().find(|f|f.modes==8)
+        .ok_or("missing physical eight-mode reference")?;
+    let n=fixture.modes;
+    let mut line=PhysicalModalLine::from_native_modes(
+        NativeModalCoefficients{
+            voltage_basis:fixture.native_voltage,
+            current_basis:fixture.native_current,
+            characteristic_admittances:fixture.admittance,
+            total_delays:fixture.delays,
+            resistance:fixture.r,
+            conductance:fixture.g,
+            length:fixture.length,
+        },
+        WaveDiscretization{
+            sections:8,near_front:vec![0.;n],
+            far_front:vec![f64::INFINITY;n],
+            prune_histories:true,
+        },
+    )?;
+    let first_arrival=fixture.delays[0];
+    let duration=first_arrival*2.0;
+    let far_quiet=vec![0.;n];
+    let mut peak_crosstalk=0.0_f64;
+    let mut final_direct=0.;
+    for step in 1..=200_u32 {
+        let time=duration*(f64::from(step)/200.);
+        let mut near=vec![0.;n];
+        near[0]=(time/(0.2*first_arrival)).min(1.);
+        let trial=line.network.trial(time,&near,&far_quiet)?;
+        if time<first_arrival {
+            assert!(trial.transmitted_far().iter().all(|value|*value==0.),
+                "premature 8-wire wavefront at step {step}");
+        }
+        peak_crosstalk=peak_crosstalk.max(trial.transmitted_far()[1..]
+            .iter().map(|value|value.abs()).fold(0.0_f64,f64::max));
+        final_direct=trial.transmitted_far()[0];
+        line.network.accept(trial)?;
+    }
+    assert!(final_direct.abs()>0.5,"physical 8-wire transmission missing");
+    assert!(peak_crosstalk>1e-8,"physical mutual mode scattering missing");
+    let (input_energy,output_energy)=line.network.energies();
+    assert!(output_energy<=input_energy);
+    Ok(())
+}
+
 '''
 dst=BASE/'rust/src/wave_delay/native_modal'
 dst.mkdir(parents=True,exist_ok=True)

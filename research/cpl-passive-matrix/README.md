@@ -548,3 +548,78 @@ currently claimed by another campaign worker. This research branch
 has not modified those native files or claimed production P-device
 registration; the validated bridge is ready for deliberate native
 integration and harmonization with that worker's existing code.
+
+## Canonical multimodal breakpoint identities and allocation reduction
+
+Exact-delay passive networks generate distinct waveform corners from
+sums of positive per-mode propagation times. The old graph event
+scheduler identified them only by their accumulated floating-point
+arrival timestamp. Two paths using the *same multiset* of modal
+delays, but in a different order, could differ by rounding in the
+last bit and be propagated redundantly. This becomes especially
+expensive after repeated cross-mode conversion and reflection.
+
+The new event scheduler in rust/src/wave_delay/prepared/events.rs
+encodes each causal corner as:
+- an original accepted source timestamp (exact f64 bits);
+- the static-output graph node;
+- a checked integer count of per-mode half-delay traversals.
+
+Because addition of physical propagation lengths commutes, all
+reorderings of the same modal-delay multiset have an identical
+canonical identity and are expanded only once. This does **not**
+quantize or discard physically distinct arrival times. Event times
+are reconstructed deterministically from root timestamp and sorted
+per-mode integer counts; overflow is rejected instead of wrapping.
+A two-mode permutation-invariance test and checked count-overflow
+test protect this mathematical invariant.
+
+The 8-section 3-mode stress suite with irrational modal delay ratios
+reports the following individual global-step event count reduction
+relative to the previous floating-arrival scheduler:
+
+| Global interval | Previously | Canonical |
+| --- | ---: | ---: |
+| 0..0.9 ns | 101 | 83 |
+| 0..1.5 ns | 426 | 277 |
+| 0..2.1 ns | 1302 | 716 |
+| 0..3.0 ns | 5321 | 2081 |
+
+This is **fewer events**, not a claim of guaranteed proportional
+runtime reduction: the canonical hash keys are larger than a
+floating arrival timestamp, and the physical solver still
+recomputes nonlinear internal wave interactions at each event.
+
+The affine Newton propagation coefficients additionally use
+smallvec 1.15.1 (a long-established pinned version) for their
+typically 2N<=16 modal Jacobian variables. This avoids a
+separate heap allocation for each intermediate affine wave in
+the 1..8-conductor native domain, while preserving a heap-backed
+overflow path for wider research-only modal dimensions. No
+physically supported case is silently truncated.
+
+A physical, dense 8-conductor, 8-stage reference now has a stress
+test for macro-steps 20%, 35% and 50% of the minimum physical line
+delay: 85, 427 and 2529 physical event times respectively. After
+inline Jacobian storage, the largest debug-build preparation took
+8.36s versus 13.63s in the previous test run; an optimized
+release build took approximately 1.63s. The remaining physical
+event count is substantial, so eventual long-window optimization
+needs a cached future-event frontier or quantified approximation
+of low-amplitude reflected corners (while retaining strict
+first-arrival boundaries).
+
+A new complete **physical n=8 transient transmission test** also
+simulates 200 short accepted steps across twice the fastest
+continuous-line propagation delay. It checks exact zero far-end
+prearrival, real nonzero transmitted modal crosstalk after arrival,
+substantial direct transmission, and emitted energy no greater than
+incident energy. This test is against the fully coupled native
+modal/static-RG adapter, not an uncoupled synthetic line.
+
+Total standalone Rust suite: **42/42 tests passing**, strict
+all-target pedantic/nursery Clippy with no warnings and no
+unwrap/expect/panic/todo/unimplemented usage. Source, bit-exact
+fixture generators, Cargo.lock and the performance regression are
+version controlled in the research branch; all Cargo build output
+remains under the designated campaign build directory.

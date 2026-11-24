@@ -4,6 +4,7 @@
 //! trials and never mutates accepted history.
 
 use super::{Trace, WaveNetwork, WaveTrial};
+use smallvec::SmallVec;
 
 mod events;
 mod terminal;
@@ -12,14 +13,13 @@ pub use terminal::{MnaRhs, MnaTriplet, ModalPortEquations, PhysicalPortEquations
 #[derive(Debug, Clone)]
 struct Affine {
     base: f64,
-    jac: Vec<f64>,
+    jac: SmallVec<[f64; 16]>,
 }
 impl Affine {
     fn constant(base: f64, width: usize) -> Self {
-        Self {
-            base,
-            jac: vec![0.; width],
-        }
+        let mut jac = SmallVec::new();
+        jac.resize(width, 0.);
+        Self { base, jac }
     }
     fn terminal(column: usize, alpha: f64, offset: f64, width: usize) -> Self {
         let mut result = Self::constant(offset, width);
@@ -453,7 +453,7 @@ impl WaveNetwork {
             }
             times.push(time);
         }
-        let extra = events::propagated_breakpoints(self, final_time);
+        let extra = events::propagated_breakpoints(self, final_time)?;
         times
             .try_reserve(extra.len())
             .map_err(|_| "causal breakpoint scheduling allocation failed")?;
