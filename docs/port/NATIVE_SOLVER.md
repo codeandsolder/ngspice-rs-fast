@@ -368,9 +368,16 @@ singular systems).
   alone does not invalidate the factors. A nonrepresentable stored
   Schur coefficient does; an overflowing final solution is an RHS
   error and retains the valid factors. Packed row and column runs support
-  forward and backward scatter substitution in either orientation. Each
-  update uses the raw RHS numerator before storing the rounded quotient,
-  without a separate numerator buffer. Exact product accumulation distinguishes
+  either solve orientation. The forward pass retains raw numerators;
+  complex backward substitution also uses raw scatter. Real backward
+  substitution normally gathers normalized terms in row order. A local
+  roundoff bound rejects unresolved cancellation, and normalization or
+  product range failures also reject that route. Rejected RHS values
+  are replayed using raw scatter from the original RHS, independently
+  for each SIMD lane. The guard is not a global conditioning certificate.
+  See [BSIM_NUMERICAL_DIAGNOSIS.md](BSIM_NUMERICAL_DIAGNOSIS.md) for
+  the independent C replay motivating the change.
+  Exact product accumulation distinguishes
   proportional rows from genuine tiny nonzero determinants. Determinants
   multiply raw pivots directly, not their rounded inverse reconstructions.
   Determinants are accumulated with binary normalization, with no decimal
