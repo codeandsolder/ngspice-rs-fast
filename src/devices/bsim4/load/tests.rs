@@ -701,3 +701,23 @@ fn subthreshold_and_mobility_modes_have_independent_channel_derivatives() {
         errors.join("\n")
     );
 }
+
+#[test]
+fn smooth_positive_retains_small_tail_and_slope() {
+    // Rationalized result for x=-1e12, width²/4=0.0025.
+    let (value, slope) = super::smooth_positive(-1e12, 0.0025);
+    assert!((value / 2.5e-15 - 1.).abs() < 1e-14);
+    assert!((slope / 2.5e-27 - 1.).abs() < 1e-14);
+    assert_eq!(super::smooth_positive(0., 0.), (0., 0.5));
+    assert_eq!(super::smooth_positive(-2., 0.), (0., 0.));
+    assert_eq!(super::smooth_positive(2., 0.), (2., 1.));
+    for x in [-10., -0.2, 0., 0.2, 10.] {
+        let (value, slope) = super::smooth_positive(x, 0.0025);
+        let h = 1e-4;
+        let samples =
+            [-h, h, -h * 0.5, h * 0.5].map(|delta| super::smooth_positive(x + delta, 0.0025).0);
+        let (expected, error) = richardson(samples, h);
+        assert!(value > 0.);
+        assert!((slope - expected).abs() < 1e-8 * expected.abs() + error + 1e-12);
+    }
+}

@@ -10,7 +10,7 @@
 #![expect(clippy::manual_midpoint, reason = "retain C midpoint rounding order")]
 #![expect(
     clippy::suboptimal_flops,
-    reason = "preserve non-fused C floating-point arithmetic"
+    reason = "Remaining translated product-rule sums and companion stamps have no demonstrated cancellation defect; preserve shared charge identities and avoid indiscriminate software FMA. See BSIM_CHANNEL_NUMERICS.md."
 )]
 #![expect(
     unused_assignments,
@@ -43,8 +43,8 @@
 #![expect(unused_parens, reason = "preserve C expression grouping")]
 use super::{
     DELTA_1, DELTA_3, DELTA_4, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, Model,
-    SizeParam, depletion_charge, exp, fabs, log, mode, positive_half_sum, smooth_drain, sqrt,
-    state,
+    SizeParam, depletion_charge, exp, fabs, log, mode, positive_half_sum, smooth_drain,
+    smooth_positive, sqrt, state,
 };
 use super::{
     bias::LoadBias,
@@ -546,24 +546,19 @@ pub(super) fn intrinsic(
                 dT9_dVg *= dVgs_eff_dVg;
             }
             Vgsteff = T10 / T9;
-            T11 = T9 * T9;
-            dVgsteff_dVg = (T9 * dT10_dVg - T10 * dT9_dVg) / T11;
-            dVgsteff_dVd = (T9 * dT10_dVd - T10 * dT9_dVd) / T11;
-            dVgsteff_dVb = (T9 * dT10_dVb - T10 * dT9_dVb) / T11;
+            dVgsteff_dVg = (-Vgsteff).mul_add(dT9_dVg, dT10_dVg) / T9;
+            dVgsteff_dVd = (-Vgsteff).mul_add(dT9_dVd, dT10_dVd) / T9;
+            dVgsteff_dVb = (-Vgsteff).mul_add(dT9_dVb, dT10_dVb) / T9;
         }
         if model.capMod == 1 {
             Vfb = here.vfbzb;
             V3 = Vfb - Vgs_eff + VbseffCV - DELTA_3;
-            if Vfb <= 0.0 {
-                T0 = sqrt(V3 * V3 - 4.0 * DELTA_3 * Vfb);
-            } else {
-                T0 = sqrt(V3 * V3 + 4.0 * DELTA_3 * Vfb);
-            }
-            T1 = 0.5 * (1.0 + V3 / T0);
-            Vfbeff = Vfb - 0.5 * (V3 + T0);
+            let (flatband_shift, flatband_slope) = smooth_positive(V3, DELTA_3 * Vfb.abs());
+            T1 = flatband_slope;
+            Vfbeff = Vfb - flatband_shift;
             dVfbeff_dVg = T1 * dVgs_eff_dVg;
             dVfbeff_dVb = -T1 * dVbseffCV_dVb;
-            Qac0 = CoxWL * (Vfbeff - Vfb);
+            Qac0 = -CoxWL * flatband_shift;
             dQac0_dVg = CoxWL * dVfbeff_dVg;
             dQac0_dVb = CoxWL * dVfbeff_dVb;
             T3 = Vgs_eff - Vfbeff - VbseffCV - Vgsteff;
@@ -657,13 +652,9 @@ pub(super) fn intrinsic(
             here.cbdb = Cbd;
         } else if model.capMod == 2 {
             V3 = here.vfbzb - Vgs_eff + VbseffCV - DELTA_3;
-            if here.vfbzb <= 0.0 {
-                T0 = sqrt(V3 * V3 - 4.0 * DELTA_3 * here.vfbzb);
-            } else {
-                T0 = sqrt(V3 * V3 + 4.0 * DELTA_3 * here.vfbzb);
-            }
-            T1 = 0.5 * (1.0 + V3 / T0);
-            Vfbeff = here.vfbzb - 0.5 * (V3 + T0);
+            let (flatband_shift, flatband_slope) = smooth_positive(V3, DELTA_3 * here.vfbzb.abs());
+            T1 = flatband_slope;
+            Vfbeff = here.vfbzb - flatband_shift;
             dVfbeff_dVg = T1 * dVgs_eff_dVg;
             dVfbeff_dVb = -T1 * dVbseffCV_dVb;
             Cox = here.coxp;
@@ -700,7 +691,7 @@ pub(super) fn intrinsic(
             dCoxeff_dVb = dCoxeff_dVg * dTcen_dVb;
             dCoxeff_dVg *= dTcen_dVg;
             CoxWLcen = CoxWL * Coxeff / model.coxe;
-            Qac0 = CoxWLcen * (Vfbeff - here.vfbzb);
+            Qac0 = -CoxWLcen * flatband_shift;
             QovCox = Qac0 / Coxeff;
             dQac0_dVg = CoxWLcen * dVfbeff_dVg + QovCox * dCoxeff_dVg;
             dQac0_dVb = CoxWLcen * dVfbeff_dVb + QovCox * dCoxeff_dVb;
@@ -1220,13 +1211,13 @@ pub(super) fn companion(
                     dxpart = qdrn / qcheq;
                     Cdd = here.cddb;
                     Csd = -(here.cgdb + here.cddb + here.cbdb);
-                    ddxpart_dVd = (Cdd - dxpart * (Cdd + Csd)) / qcheq;
+                    ddxpart_dVd = dxpart.mul_add(-(Cdd + Csd), Cdd) / qcheq;
                     Cdg = here.cdgb;
                     Csg = -(here.cggb + here.cdgb + here.cbgb);
-                    ddxpart_dVg = (Cdg - dxpart * (Cdg + Csg)) / qcheq;
+                    ddxpart_dVg = dxpart.mul_add(-(Cdg + Csg), Cdg) / qcheq;
                     Cds = here.cdsb;
                     Css = -(here.cgsb + here.cdsb + here.cbsb);
-                    ddxpart_dVs = (Cds - dxpart * (Cds + Css)) / qcheq;
+                    ddxpart_dVs = dxpart.mul_add(-(Cds + Css), Cds) / qcheq;
                     ddxpart_dVb = -(ddxpart_dVd + ddxpart_dVg + ddxpart_dVs);
                 }
                 sxpart = 1.0 - dxpart;
@@ -1398,13 +1389,13 @@ pub(super) fn companion(
                     sxpart = qdrn / qcheq;
                     Css = here.cddb;
                     Cds = -(here.cgdb + here.cddb + here.cbdb);
-                    dsxpart_dVs = (Css - sxpart * (Css + Cds)) / qcheq;
+                    dsxpart_dVs = sxpart.mul_add(-(Css + Cds), Css) / qcheq;
                     Csg = here.cdgb;
                     Cdg = -(here.cggb + here.cdgb + here.cbgb);
-                    dsxpart_dVg = (Csg - sxpart * (Csg + Cdg)) / qcheq;
+                    dsxpart_dVg = sxpart.mul_add(-(Csg + Cdg), Csg) / qcheq;
                     Csd = here.cdsb;
                     Cdd = -(here.cgsb + here.cdsb + here.cbsb);
-                    dsxpart_dVd = (Csd - sxpart * (Csd + Cdd)) / qcheq;
+                    dsxpart_dVd = sxpart.mul_add(-(Csd + Cdd), Csd) / qcheq;
                     dsxpart_dVb = -(dsxpart_dVd + dsxpart_dVg + dsxpart_dVs);
                 }
                 dxpart = 1.0 - sxpart;

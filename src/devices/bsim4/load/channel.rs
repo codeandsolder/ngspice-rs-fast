@@ -10,7 +10,7 @@
 #![expect(clippy::manual_midpoint, reason = "retain C midpoint rounding order")]
 #![expect(
     clippy::suboptimal_flops,
-    reason = "preserve non-fused C floating-point arithmetic"
+    reason = "Remaining translated product-rule sums and branch expressions have no demonstrated cancellation defect; indiscriminate software FMA would add portable-target cost. See BSIM_CHANNEL_NUMERICS.md."
 )]
 #![expect(
     unused_assignments,
@@ -39,7 +39,7 @@
 use super::bias::LoadBias;
 use super::{
     BSIM4polyDepletion, Charge_q, DEXP, EPS0, EPSSI, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP,
-    MIN_EXP, MM, Model, SaturationRoot, SizeParam, exp, log, smooth_drain, sqrt,
+    MIN_EXP, MM, Model, SaturationRoot, SizeParam, exp, log, smooth_drain, smooth_positive, sqrt,
 };
 
 /// Body potential, threshold, effective gate bias and their independent derivatives.
@@ -350,10 +350,10 @@ pub(super) fn electrostatics(
         T3 = Leff + pParam.dvtp0 * (1.0 + T2);
         dT3_dVd = pParam.dvtp0 * dT2_dVd;
         if model.tempMod < 2 {
-            T4 = Vtm * log(Leff / T3);
+            T4 = -Vtm * (pParam.dvtp0 * (1.0 + T2) / Leff).ln_1p();
             dT4_dVd = -Vtm * dT3_dVd / T3;
         } else {
-            T4 = model.vtm0 * log(Leff / T3);
+            T4 = -model.vtm0 * (pParam.dvtp0 * (1.0 + T2) / Leff).ln_1p();
             dT4_dVd = -model.vtm0 * dT3_dVd / T3;
         }
         dDITS_Sft_dVd = dn_dVd * T4 + n * dT4_dVd;
@@ -444,10 +444,9 @@ pub(super) fn electrostatics(
     }
     Vgsteff = T10 / T9;
     here.Vgsteff = Vgsteff;
-    T11 = T9 * T9;
-    dVgsteff_dVg = (T9 * dT10_dVg - T10 * dT9_dVg) / T11;
-    dVgsteff_dVd = (T9 * dT10_dVd - T10 * dT9_dVd) / T11;
-    dVgsteff_dVb = (T9 * dT10_dVb - T10 * dT9_dVb) / T11;
+    dVgsteff_dVg = (-Vgsteff).mul_add(dT9_dVg, dT10_dVg) / T9;
+    dVgsteff_dVd = (-Vgsteff).mul_add(dT9_dVd, dT10_dVd) / T9;
+    dVgsteff_dVb = (-Vgsteff).mul_add(dT9_dVb, dT10_dVb) / T9;
     Electrostatics {
         Leff,
         Lpe_Vb,
@@ -738,8 +737,9 @@ pub(super) fn transport(
         T1 = pParam.prwb * T9;
         dT1_dVb = pParam.prwb * dsqrtPhis_dVb;
         T2 = 1.0 / T0 + T1;
-        T3 = T2 + sqrt(T2 * T2 + 0.01);
-        dT3_dVg = 1.0 + T2 / (T3 - T2);
+        let (positive, slope) = smooth_positive(T2, 0.0025);
+        T3 = 2.0 * positive;
+        dT3_dVg = 2.0 * slope;
         dT3_dVb = dT3_dVg * dT1_dVb;
         dT3_dVg *= dT0_dVg;
         T4 = pParam.rds0 * 0.5;
@@ -1132,7 +1132,7 @@ pub(super) fn transport(
     dgche_dVb = (beta * dfgche1_dVb + fgche1 * dbeta_dVb - gche * dfgche2_dVb) / fgche2;
     T0 = 1.0 + gche * Rds;
     Idl = gche / T0;
-    T1 = (1.0 - Idl * Rds) / T0;
+    T1 = (1.0 / T0) / T0;
     T2 = Idl * Idl;
     dIdl_dVg = T1 * dgche_dVg - T2 * dRds_dVg;
     dIdl_dVd = T1 * dgche_dVd;
@@ -1418,16 +1418,15 @@ pub(super) fn transport(
     }
     if model.rdsMod != 0 {
         T0 = vgs - pParam.vfbsd;
-        T1 = sqrt(T0 * T0 + 1.0e-4);
-        vgs_eff = 0.5 * (T0 + T1);
-        dvgs_eff_dvg = vgs_eff / T1;
+        (vgs_eff, dvgs_eff_dvg) = smooth_positive(T0, 2.5e-5);
         T0 = 1.0 + pParam.prwg * vgs_eff;
         dT0_dvg = -pParam.prwg / T0 / T0 * dvgs_eff_dvg;
         T1 = -pParam.prwb * vbs;
         dT1_dvb = -pParam.prwb;
         T2 = 1.0 / T0 + T1;
-        T3 = T2 + sqrt(T2 * T2 + 0.01);
-        dT3_dvg = T3 / (T3 - T2);
+        let (positive, slope) = smooth_positive(T2, 0.0025);
+        T3 = 2.0 * positive;
+        dT3_dvg = 2.0 * slope;
         dT3_dvb = dT3_dvg * dT1_dvb;
         dT3_dvg *= dT0_dvg;
         T4 = pParam.rs0 * 0.5;
@@ -1442,16 +1441,15 @@ pub(super) fn transport(
         dgstot_dvb = T0 * dRs_dvb;
         dgstot_dvs = -(dgstot_dvg + dgstot_dvb + dgstot_dvd);
         T0 = vgd - pParam.vfbsd;
-        T1 = sqrt(T0 * T0 + 1.0e-4);
-        vgd_eff = 0.5 * (T0 + T1);
-        dvgd_eff_dvg = vgd_eff / T1;
+        (vgd_eff, dvgd_eff_dvg) = smooth_positive(T0, 2.5e-5);
         T0 = 1.0 + pParam.prwg * vgd_eff;
         dT0_dvg = -pParam.prwg / T0 / T0 * dvgd_eff_dvg;
         T1 = -pParam.prwb * vbd;
         dT1_dvb = -pParam.prwb;
         T2 = 1.0 / T0 + T1;
-        T3 = T2 + sqrt(T2 * T2 + 0.01);
-        dT3_dvg = T3 / (T3 - T2);
+        let (positive, slope) = smooth_positive(T2, 0.0025);
+        T3 = 2.0 * positive;
+        dT3_dvg = 2.0 * slope;
         dT3_dvb = dT3_dvg * dT1_dvb;
         dT3_dvg *= dT0_dvg;
         T4 = pParam.rd0 * 0.5;

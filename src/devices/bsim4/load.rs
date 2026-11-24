@@ -94,6 +94,16 @@ fn positive_half_sum(x: f64, root: f64, product: f64) -> f64 {
     }
 }
 
+/// Smooth positive part and its slope, without losing the negative-tail
+/// value or evaluating its derivative as a difference of nearly equal terms.
+fn smooth_positive(x: f64, quarter_width_squared: f64) -> (f64, f64) {
+    let root = x.mul_add(x, 4. * quarter_width_squared).sqrt();
+    let value = positive_half_sum(x, root, quarter_width_squared);
+    // The symmetric limiting slope at the unsmoothed kink.
+    let slope = if root == 0. { 0.5 } else { value / root };
+    (value, slope)
+}
+
 fn smooth_drain(saturation: f64, drain: f64, delta: f64) -> DrainSmoothing {
     let x = saturation - drain - delta;
     let root = x.mul_add(x, 4. * delta * saturation).sqrt();
