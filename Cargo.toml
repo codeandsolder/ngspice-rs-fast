@@ -101,6 +101,9 @@ winnow = { version = "1.0.4", default-features = false, features = ["std", "pars
 # work.
 petgraph = "0.8.3"
 
+[features]
+experiment-relaxed = []
+
 [dependencies]
 winnow.workspace = true
 petgraph.workspace = true

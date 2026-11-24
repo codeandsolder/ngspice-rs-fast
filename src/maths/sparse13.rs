@@ -129,7 +129,10 @@ impl Scalar for f64 {
         self * other
     }
     fn mul_sub(self, a: Self, b: Self) -> Self {
-        self - a * b
+        #[cfg(feature = "experiment-relaxed")]
+        { self.algebraic_sub(a.algebraic_mul(b)) }
+        #[cfg(not(feature = "experiment-relaxed"))]
+        { self - a * b }
     }
     fn is_zero(self) -> bool {
         self == 0.0
@@ -178,10 +181,20 @@ impl Scalar for Complex {
         )
     }
     fn mul_sub(self, a: Self, b: Self) -> Self {
-        Self::new(
-            self.re - (a.re * b.re - a.im * b.im),
-            self.im - (a.re * b.im + a.im * b.re),
-        )
+        #[cfg(feature = "experiment-relaxed")]
+        {
+            Self::new(
+                self.re.algebraic_sub(a.re.algebraic_mul(b.re).algebraic_sub(a.im.algebraic_mul(b.im))),
+                self.im.algebraic_sub(a.re.algebraic_mul(b.im).algebraic_add(a.im.algebraic_mul(b.re))),
+            )
+        }
+        #[cfg(not(feature = "experiment-relaxed"))]
+        {
+            Self::new(
+                self.re - (a.re * b.re - a.im * b.im),
+                self.im - (a.re * b.im + a.im * b.re),
+            )
+        }
     }
     fn is_zero(self) -> bool {
         self.re == 0.0 && self.im == 0.0
