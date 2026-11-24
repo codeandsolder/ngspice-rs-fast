@@ -61,9 +61,22 @@ fn waveform(lattice: &HarmonicLattice, wave: &Waveform) -> SpiceResult<Vec<Real>
                 .map_err(|_| failure("invalid resolved SIN fields"))?;
             sine(lattice, &mut values, params)?;
         }
+        Waveform::PortSeries { baseline, tones } => {
+            // The C PORT source adds cosines to the previous voltage
+            // source's resolved waveform in load order. Its declared
+            // phase parameter is not applied by the C load.
+            values = waveform(lattice, baseline)?;
+            for &(amplitude, omega) in tones {
+                let frequency = omega / std::f64::consts::TAU;
+                let index = lattice
+                    .locate(frequency)
+                    .ok_or_else(|| failure("RF port tone outside retained harmonic lattice"))?;
+                values[1 + 2 * index] += amplitude;
+            }
+        }
         _ => {
             return Err(SpiceError::Unsupported {
-                feature: "HB forcing requires a constant or undamped periodic SIN source".into(),
+                feature: "HB forcing requires a constant, undamped periodic SIN or resolved periodic RF PORT source".into(),
                 location: None,
             });
         }

@@ -124,7 +124,7 @@ struct Workspace<'a> {
     local: Arc<Pattern>,
     sample: Sample,
     state: Vector,
-    matrix: SparseMatrix,
+    matrix: Option<SparseMatrix>,
     blocks: Vec<(usize, usize)>,
     projection: Projection,
     conductance: Vec<Real>,
@@ -154,6 +154,7 @@ impl<'a> Workspace<'a> {
         local: Arc<Pattern>,
         tolerance: &'a [Real],
         limits: BalanceLimits,
+        expand_newton: bool,
     ) -> SpiceResult<Self> {
         let n = local.order();
         let m = lattice.coordinates();
@@ -209,10 +210,17 @@ impl<'a> Workspace<'a> {
             .and_then(|cost| cost.checked_add(entries))
             .filter(|&cost| cost <= limits.assembly_work)
             .ok_or_else(|| failure("harmonic assembly work limit exceeded"))?;
-        let coordinates = local.positions().flat_map(|(r, c)| {
-            (0..m).flat_map(move |i| (0..m).map(move |j| (r * m + i, c * m + j)))
-        });
-        let expanded = Arc::new(Pattern::new(dimension, coordinates)?);
+        let matrix = if expand_newton {
+            let coordinates = local.positions().flat_map(|(r, c)| {
+                (0..m).flat_map(move |i| (0..m).map(move |j| (r * m + i, c * m + j)))
+            });
+            Some(SparseMatrix::bound(Arc::new(Pattern::new(
+                dimension,
+                coordinates,
+            )?))?)
+        } else {
+            None
+        };
         let mut blocks = Vec::new();
         blocks
             .try_reserve_exact(local.len())
@@ -225,7 +233,7 @@ impl<'a> Workspace<'a> {
             lattice,
             sample: Sample::new(&local)?,
             state: Vector::zeros(n),
-            matrix: SparseMatrix::bound(expanded)?,
+            matrix,
             local,
             blocks,
             projection,
@@ -233,7 +241,11 @@ impl<'a> Workspace<'a> {
             capacitance: filled_vec(sample_entries, 0., "physical capacitance samples")?,
             g_spectrum: filled_vec(size, Complex::ZERO, "conductance spectrum")?,
             c_spectrum: filled_vec(size, Complex::ZERO, "capacitance spectrum")?,
-            block: filled_vec(block_size, 0., "harmonic Jacobian block")?,
+            block: filled_vec(
+                if expand_newton { block_size } else { 0 },
+                0.,
+                "harmonic Jacobian block",
+            )?,
             weights: vec![0.; m],
             charge_offset: vec![0.; n],
             derivative_weights: vec![0.; m],
@@ -334,6 +346,9 @@ impl<'a> Workspace<'a> {
         if !residual.is_finite() {
             return Err(failure("nonfinite spectral residual"));
         }
+        if jacobian && self.matrix.is_some() {
+            self.publish_matrix()?;
+        }
         Ok(residual)
     }
 
@@ -363,7 +378,11 @@ impl<'a> Workspace<'a> {
     }
 
     fn publish_matrix(&mut self) -> SpiceResult<()> {
-        self.matrix.clear();
+        let matrix = self
+            .matrix
+            .as_mut()
+            .ok_or_else(|| failure("missing Newton Jacobian workspace"))?;
+        matrix.clear();
         let m = self.lattice.coordinates();
         let count = self.lattice.samples();
         for (site, &(row, col)) in self.blocks.iter().enumerate() {
@@ -384,7 +403,7 @@ impl<'a> Workspace<'a> {
                     if !scaled.is_finite() {
                         return Err(failure("nonfinite scaled harmonic Jacobian"));
                     }
-                    self.matrix.add(row * m + i, col * m + j, scaled)?;
+                    matrix.add(row * m + i, col * m + j, scaled)?;
                 }
             }
         }
@@ -414,8 +433,7 @@ pub(crate) struct OrbitSpectrum {
     pub(crate) pattern: Arc<Pattern>,
     pub(crate) unknowns: usize,
     pub(crate) width: usize,
-    pub(crate) spectrum_size: usize,
-    pub(crate) differences: Vec<usize>,
+    pub(crate) spectral_indices: Vec<usize>,
     pub(crate) conductance: Vec<Complex>,
     pub(crate) capacitance: Vec<Complex>,
     pub(crate) scaled_residual: Real,
@@ -431,8 +449,10 @@ pub(crate) fn linearize_orbit(
     tolerance: &[Real],
     limits: BalanceLimits,
 ) -> SpiceResult<OrbitSpectrum> {
-    let mut work = Workspace::new(lattice, model.pattern().clone(), tolerance, limits)?;
-    if solution.coefficients.len() != work.matrix.rows() || !solution.coefficients.is_finite() {
+    let mut work = Workspace::new(lattice, model.pattern().clone(), tolerance, limits, false)?;
+    if solution.coefficients.len() != work.local.order() * lattice.coordinates()
+        || !solution.coefficients.is_finite()
+    {
         return Err(failure("invalid periodic reference shape or values"));
     }
     let residual = work.evaluate(model, &solution.coefficients, true)?;
@@ -466,18 +486,38 @@ pub(crate) fn linearize_orbit(
         }
     }
     let differences = work.projection.signed_differences()?;
-    let pattern = work
-        .matrix
-        .bound_values()
-        .ok_or_else(|| failure("missing expanded harmonic pattern"))?
-        .0
-        .clone();
+    let width = lattice.coordinates();
+    let mut positions = Vec::new();
+    let mut spectral_indices = Vec::new();
+    for (site, (row, col)) in work.local.positions().enumerate() {
+        let offset = site * size;
+        let supports = |index: usize| {
+            conductance[offset + index] != Complex::ZERO
+                || capacitance[offset + index] != Complex::ZERO
+        };
+        let support_count = differences.iter().filter(|&&index| supports(index)).count();
+        positions
+            .try_reserve(support_count)
+            .map_err(|e| failure(e.to_string()))?;
+        spectral_indices
+            .try_reserve(support_count)
+            .map_err(|e| failure(e.to_string()))?;
+        for (ordinal, &index) in differences.iter().enumerate() {
+            // Exact structural zero only: no accuracy threshold on small
+            // mixing coefficients. Constant derivatives retain just the
+            // diagonal sideband blocks.
+            if supports(index) {
+                positions.push((row * width + ordinal / width, col * width + ordinal % width));
+                spectral_indices.push(offset + index);
+            }
+        }
+    }
+    let pattern = Arc::new(Pattern::new(work.local.order() * width, positions)?);
     Ok(OrbitSpectrum {
         pattern,
         unknowns: work.local.order(),
-        width: lattice.coordinates(),
-        spectrum_size: size,
-        differences,
+        width,
+        spectral_indices,
         conductance,
         capacitance,
         scaled_residual,
@@ -501,8 +541,8 @@ pub fn solve(
     tolerance: &[Real],
     limits: BalanceLimits,
 ) -> SpiceResult<BalanceSolution> {
-    let mut work = Workspace::new(lattice, model.pattern().clone(), tolerance, limits)?;
-    if coefficients.len() != work.matrix.rows()
+    let mut work = Workspace::new(lattice, model.pattern().clone(), tolerance, limits, true)?;
+    if coefficients.len() != work.local.order() * lattice.coordinates()
         || !coefficients.is_finite()
         || limits.iterations == 0
         || limits.line_search == 0
@@ -534,8 +574,11 @@ pub fn solve(
         if corrections == limits.iterations {
             break;
         }
-        work.publish_matrix()?;
-        let next = SparseLu::new(&work.matrix, factor.as_ref().map(SparseLu::symbolic))?;
+        let matrix = work
+            .matrix
+            .as_ref()
+            .ok_or_else(|| failure("missing Newton Jacobian workspace"))?;
+        let next = SparseLu::new(matrix, factor.as_ref().map(SparseLu::symbolic))?;
         let rhs = Vector::from(
             scaled
                 .as_slice()

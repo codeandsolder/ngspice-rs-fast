@@ -327,6 +327,7 @@ impl ComplexMatrix {
     pub(crate) fn from_bound_values(
         pattern: Arc<Pattern>,
         values: Vec<Complex>,
+        pivot: PivotTolerances,
     ) -> SpiceResult<Self> {
         if values.len() != pattern.len() || values.iter().any(|v| !v.is_finite()) {
             return Err(numerical(
@@ -337,7 +338,7 @@ impl ComplexMatrix {
         Ok(Self {
             n: pattern.order(),
             assembly: Assembly::Bound { pattern, values },
-            pivot: PivotTolerances::DEFAULT,
+            pivot,
             names: None,
         })
     }

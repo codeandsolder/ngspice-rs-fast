@@ -50,6 +50,7 @@ pub mod noise;
 pub mod optimization;
 mod ordered_samples;
 mod output_probe;
+pub mod periodic_noise;
 mod periodic_orbit;
 pub mod periodic_small_signal;
 mod plan;

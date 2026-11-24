@@ -258,6 +258,16 @@ pub struct PeriodicLinearization<'a> {
     spectrum: OrbitSpectrum,
     ports: Vec<PeriodicPort>,
     last_factor: Mutex<Option<Arc<FactorSnapshot>>>,
+    circuit_orbit: Option<CircuitOrbit<'a>>,
+    pivot: crate::maths::PivotTolerances,
+}
+
+/// The physical noise model is bound to the same immutable circuit,
+/// candidate context and revalidated orbit as the response operator.
+pub(super) struct CircuitOrbit<'a> {
+    pub(super) circuit: &'a Circuit,
+    pub(super) context: ModelContext,
+    pub(super) coefficients: crate::maths::Vector,
 }
 
 impl<'a> PeriodicLinearization<'a> {
@@ -277,6 +287,8 @@ impl<'a> PeriodicLinearization<'a> {
             spectrum: linearize_orbit(lattice, model, orbit, tolerance, limits)?,
             ports: Vec::new(),
             last_factor: Mutex::default(),
+            circuit_orbit: None,
+            pivot: crate::maths::PivotTolerances::DEFAULT,
         })
     }
 
@@ -286,7 +298,7 @@ impl<'a> PeriodicLinearization<'a> {
     /// Invalid model, unconverged reference, RF port numbering or resource limits.
     pub fn circuit(
         lattice: &'a HarmonicLattice,
-        circuit: &mut Circuit,
+        circuit: &'a mut Circuit,
         context: ModelContext,
         orbit: &BalanceSolution,
         tolerance: &[Real],
@@ -326,6 +338,12 @@ impl<'a> PeriodicLinearization<'a> {
             spectrum,
             ports,
             last_factor: Mutex::default(),
+            pivot: context.pivot,
+            circuit_orbit: Some(CircuitOrbit {
+                circuit,
+                context,
+                coefficients: orbit.coefficients.clone(),
+            }),
         })
     }
 
@@ -367,29 +385,22 @@ impl<'a> PeriodicLinearization<'a> {
             Complex::ZERO,
             "periodic complex operator",
         )?;
-        let width = spectrum.width;
-        let block = width * width;
         let frequencies: Vec<_> = plan
             .bands()
             .iter()
             .map(|band| TAU * band.frequency())
             .collect();
-        for ((out, g), c) in values
-            .chunks_exact_mut(block)
-            .zip(spectrum.conductance.chunks_exact(spectrum.spectrum_size))
-            .zip(spectrum.capacitance.chunks_exact(spectrum.spectrum_size))
+        for ((value, (row, _)), &index) in values
+            .iter_mut()
+            .zip(spectrum.pattern.positions())
+            .zip(&spectrum.spectral_indices)
         {
-            for (row, (&omega, indices)) in out.chunks_exact_mut(width).zip(
-                frequencies
-                    .iter()
-                    .zip(spectrum.differences.chunks_exact(width)),
-            ) {
-                for (value, &index) in row.iter_mut().zip(indices) {
-                    *value = g[index] + Complex::imaginary(omega) * c[index];
-                }
-            }
+            *value = spectrum.conductance[index]
+                + Complex::imaginary(frequencies[row % spectrum.width])
+                    * spectrum.capacitance[index];
         }
-        let matrix = ComplexMatrix::from_bound_values(spectrum.pattern.clone(), values)?;
+        let matrix =
+            ComplexMatrix::from_bound_values(spectrum.pattern.clone(), values, self.pivot)?;
         let factor = matrix.factorize()?;
         let snapshot = Arc::new(FactorSnapshot {
             plan,
@@ -427,6 +438,12 @@ impl PeriodicResponse<'_> {
         &self.snapshot.plan
     }
 
+    /// Actual sparse numeric factor storage, including any fill.
+    #[must_use]
+    pub fn factor_storage(&self) -> crate::maths::FactorStorage {
+        self.snapshot.factor.factor_storage()
+    }
+
     /// True when both responses share the same immutable numeric factors.
     #[must_use]
     pub fn shares_factor(&self, other: &Self) -> bool {
@@ -443,6 +460,17 @@ impl PeriodicResponse<'_> {
     #[must_use]
     pub const fn unknowns(&self) -> usize {
         self.linearization.spectrum.unknowns * self.linearization.spectrum.width
+    }
+
+    pub(super) const fn lattice(&self) -> &HarmonicLattice {
+        self.linearization.lattice
+    }
+
+    pub(super) fn circuit_orbit(&self) -> SpiceResult<&CircuitOrbit<'_>> {
+        self.linearization
+            .circuit_orbit
+            .as_ref()
+            .ok_or_else(|| failure("periodic response has no bound circuit noise model"))
     }
 
     fn index(&self, at: Coordinate) -> SpiceResult<usize> {
@@ -612,6 +640,29 @@ impl PeriodicResponse<'_> {
             .ok_or_else(|| failure("invalid RF channel port"))
     }
 
+    /// A native port's incident-wave excitation normalized to the given
+    /// complex amplitude in power-wave units.
+    /// # Errors
+    /// Invalid port, sideband or amplitude.
+    pub fn incident_wave(
+        &self,
+        channel: PortChannel,
+        amplitude: Complex,
+    ) -> SpiceResult<Vec<Term>> {
+        let port = self.channel(channel)?;
+        let value = amplitude * Complex::real(2. * port.reference.sqrt());
+        if !value.is_finite() {
+            return Err(failure("nonfinite incident wave"));
+        }
+        Ok(vec![Term {
+            at: Coordinate {
+                row: port.branch,
+                band: channel.band,
+            },
+            value,
+        }])
+    }
+
     /// Sparse observation of the outgoing wave on a native RF channel.
     /// # Errors
     /// Invalid port or sideband.
@@ -664,16 +715,7 @@ impl PeriodicResponse<'_> {
         }
         let excitation = inputs
             .iter()
-            .map(|&channel| {
-                let port = self.channel(channel)?;
-                Ok(vec![Term {
-                    at: Coordinate {
-                        row: port.branch,
-                        band: channel.band,
-                    },
-                    value: Complex::real(2. * port.reference.sqrt()),
-                }])
-            })
+            .map(|&channel| self.incident_wave(channel, Complex::real(1.)))
             .collect::<SpiceResult<Vec<_>>>()?;
         let observed = outputs
             .iter()
