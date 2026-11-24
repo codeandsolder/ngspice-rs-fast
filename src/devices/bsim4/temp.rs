@@ -409,6 +409,120 @@ fn forward_limit(
     }
 }
 
+/// One side of BSIM4's junction-temperature preparation. All side-dependent
+/// inputs are explicit so the shared physics never writes model/instance state.
+#[derive(Clone, Copy)]
+struct JunctionTemperatureInput {
+    area: f64,
+    perimeter: f64,
+    width: f64,
+    fingers: f64,
+    area_density: f64,
+    sidewall_density: f64,
+    gate_sidewall_density: f64,
+    emission_voltage: f64,
+    breakdown_voltage: f64,
+    breakdown_factor: f64,
+    forward_threshold: f64,
+    reverse_threshold: f64,
+    diode_mode: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JunctionTemperatureWarning {
+    ReverseThresholdTooSmall,
+    UnknownDiodeMode,
+}
+
+struct ReverseLimit {
+    voltage: f64,
+    current: f64,
+    slope: f64,
+}
+
+#[derive(Default)]
+struct JunctionTemperaturePrepared {
+    breakdown_exponential: Option<f64>,
+    forward: Option<ForwardLimit>,
+    reverse: Option<ReverseLimit>,
+    warning: Option<JunctionTemperatureWarning>,
+}
+
+/// Follow the original source/drain C expressions in the same operation
+/// order, including the zero-Isat fast path and the mode-specific fields.
+/// Return only fields C actually writes: untouched members stay untouched.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "three-term C saturation and reverse-limit bounds require ordered binary64 rounding"
+)]
+fn prepare_junction_temperature(input: JunctionTemperatureInput) -> JunctionTemperaturePrepared {
+    let JunctionTemperatureInput {
+        area,
+        perimeter,
+        width,
+        fingers,
+        area_density,
+        sidewall_density,
+        gate_sidewall_density,
+        emission_voltage: nvtm,
+        breakdown_voltage,
+        breakdown_factor,
+        forward_threshold,
+        reverse_threshold,
+        diode_mode,
+    } = input;
+    let saturation = if (area <= 0.0) && (perimeter <= 0.0) {
+        0.0
+    } else {
+        area * area_density + perimeter * sidewall_density + width * fingers * gate_sidewall_density
+    };
+    let mut result = JunctionTemperaturePrepared::default();
+    if saturation > 0.0 {
+        match diode_mode {
+            0 => {
+                result.breakdown_exponential = Some(if breakdown_voltage / nvtm > EXP_THRESHOLD {
+                    breakdown_factor * MIN_EXP
+                } else {
+                    breakdown_factor * exp(-breakdown_voltage / nvtm)
+                });
+            }
+            1 => {
+                result.forward = Some(forward_limit(nvtm, forward_threshold, saturation, None));
+            }
+            2 => {
+                let breakdown_exponential = if breakdown_voltage / nvtm > EXP_THRESHOLD {
+                    breakdown_factor * MIN_EXP
+                } else {
+                    let exponential = exp(-breakdown_voltage / nvtm);
+                    exponential * breakdown_factor
+                };
+                result.breakdown_exponential = Some(breakdown_exponential);
+                result.forward = Some(forward_limit(
+                    nvtm,
+                    forward_threshold,
+                    saturation,
+                    Some(breakdown_exponential),
+                ));
+                let mut reverse_ratio = reverse_threshold / saturation;
+                if reverse_ratio < 1.0 {
+                    reverse_ratio = 10.0;
+                    result.warning = Some(JunctionTemperatureWarning::ReverseThresholdTooSmall);
+                }
+                let voltage =
+                    -breakdown_voltage - nvtm * log((reverse_ratio - 1.0) / breakdown_factor);
+                let exponential = breakdown_factor * exp(-(breakdown_voltage + voltage) / nvtm);
+                result.reverse = Some(ReverseLimit {
+                    voltage,
+                    current: saturation * (1.0 + exponential),
+                    slope: -saturation * exponential / nvtm,
+                });
+            }
+            _ => result.warning = Some(JunctionTemperatureWarning::UnknownDiodeMode),
+        }
+    }
+    result
+}
+
 /// Product of effective dimensions can overflow or underflow even when
 /// the reciprocal binning weight is representable. Keep the normal path
 /// unchanged and only scale the dimensions for an exceptional product.
@@ -1040,8 +1154,6 @@ pub(super) fn temperature_instance(
     let (mut dumPs, mut dumPd, mut dumAs, mut dumAd, mut PowWeffWr) =
         (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
     let (mut DMCGeff, mut DMCIeff, mut DMDGeff) = (0.0_f64, 0.0_f64, 0.0_f64);
-    let (mut Nvtms, mut Nvtmd, mut SourceSatCurrent, mut DrainSatCurrent) =
-        (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
     let (mut T10, mut T11) = (0.0_f64, 0.0_f64);
     let (mut Inv_saref, mut Inv_sbref, mut Inv_sa, mut Inv_sb, mut rho, mut Ldrn, mut dvth0_lod) = (
         0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64,
@@ -2050,109 +2162,87 @@ pub(super) fn temperature_instance(
                 warnings.push("Warning: Drain conductance reset to 1.0e3 mho.".to_string());
             }
         }
-        Nvtms = m.vtm * m.SjctEmissionCoeff;
-        if (h.Aseff <= 0.0) && (h.Pseff <= 0.0) {
-            SourceSatCurrent = 0.0;
-        } else {
-            SourceSatCurrent = h.Aseff * m.SjctTempSatCurDensity
-                + h.Pseff * m.SjctSidewallTempSatCurDensity
-                + p.weffCJ * h.nf * m.SjctGateSidewallTempSatCurDensity;
+        // Preserve source-before-drain C field updates and warning order.
+        // The shared evaluator never mutates the instance or model.
+        let source = prepare_junction_temperature(JunctionTemperatureInput {
+            area: h.Aseff,
+            perimeter: h.Pseff,
+            width: p.weffCJ,
+            fingers: h.nf,
+            area_density: m.SjctTempSatCurDensity,
+            sidewall_density: m.SjctSidewallTempSatCurDensity,
+            gate_sidewall_density: m.SjctGateSidewallTempSatCurDensity,
+            emission_voltage: m.vtm * m.SjctEmissionCoeff,
+            breakdown_voltage: m.bvs,
+            breakdown_factor: m.xjbvs,
+            forward_threshold: m.ijthsfwd,
+            reverse_threshold: m.ijthsrev,
+            diode_mode: m.dioMod,
+        });
+        if let Some(value) = source.breakdown_exponential {
+            h.XExpBVS = value;
         }
-        if SourceSatCurrent > 0.0 {
-            match m.dioMod {
-                0 => {
-                    if (m.bvs / Nvtms) > EXP_THRESHOLD {
-                        h.XExpBVS = m.xjbvs * MIN_EXP;
-                    } else {
-                        h.XExpBVS = m.xjbvs * exp(-m.bvs / Nvtms);
-                    }
-                }
-                1 => {
-                    let limit = forward_limit(Nvtms, m.ijthsfwd, SourceSatCurrent, None);
-                    h.vjsmFwd = limit.voltage;
-                    h.IVjsmFwd = limit.current;
-                }
-                2 => {
-                    if (m.bvs / Nvtms) > EXP_THRESHOLD {
-                        h.XExpBVS = m.xjbvs * MIN_EXP;
-                        tmp = MIN_EXP;
-                    } else {
-                        h.XExpBVS = exp(-m.bvs / Nvtms);
-                        tmp = h.XExpBVS;
-                        h.XExpBVS *= m.xjbvs;
-                    }
-                    let limit = forward_limit(Nvtms, m.ijthsfwd, SourceSatCurrent, Some(h.XExpBVS));
-                    h.vjsmFwd = limit.voltage;
-                    h.IVjsmFwd = limit.current;
-                    h.SslpFwd = limit.slope;
-                    T2 = m.ijthsrev / SourceSatCurrent;
-                    if T2 < 1.0 {
-                        T2 = 10.0;
-                        warnings.push(
-                            "Warning: ijthsrev too small and set to 10 times IsbSat.".to_string(),
-                        );
-                    }
-                    h.vjsmRev = -m.bvs - Nvtms * log((T2 - 1.0) / m.xjbvs);
-                    T1 = m.xjbvs * exp(-(m.bvs + h.vjsmRev) / Nvtms);
-                    h.IVjsmRev = SourceSatCurrent * (1.0 + T1);
-                    h.SslpRev = -SourceSatCurrent * T1 / Nvtms;
-                }
-                _ => {
-                    warnings.push(format!("Specified dioMod = {} not matched", m.dioMod));
-                }
+        if let Some(limit) = source.forward {
+            h.vjsmFwd = limit.voltage;
+            h.IVjsmFwd = limit.current;
+            if m.dioMod == 2 {
+                h.SslpFwd = limit.slope;
             }
         }
-        Nvtmd = m.vtm * m.DjctEmissionCoeff;
-        if (h.Adeff <= 0.0) && (h.Pdeff <= 0.0) {
-            DrainSatCurrent = 0.0;
-        } else {
-            DrainSatCurrent = h.Adeff * m.DjctTempSatCurDensity
-                + h.Pdeff * m.DjctSidewallTempSatCurDensity
-                + p.weffCJ * h.nf * m.DjctGateSidewallTempSatCurDensity;
+        if let Some(limit) = source.reverse {
+            h.vjsmRev = limit.voltage;
+            h.IVjsmRev = limit.current;
+            h.SslpRev = limit.slope;
         }
-        if DrainSatCurrent > 0.0 {
-            match m.dioMod {
-                0 => {
-                    if (m.bvd / Nvtmd) > EXP_THRESHOLD {
-                        h.XExpBVD = m.xjbvd * MIN_EXP;
-                    } else {
-                        h.XExpBVD = m.xjbvd * exp(-m.bvd / Nvtmd);
-                    }
-                }
-                1 => {
-                    let limit = forward_limit(Nvtmd, m.ijthdfwd, DrainSatCurrent, None);
-                    h.vjdmFwd = limit.voltage;
-                    h.IVjdmFwd = limit.current;
-                }
-                2 => {
-                    if (m.bvd / Nvtmd) > EXP_THRESHOLD {
-                        h.XExpBVD = m.xjbvd * MIN_EXP;
-                        tmp = MIN_EXP;
-                    } else {
-                        h.XExpBVD = exp(-m.bvd / Nvtmd);
-                        tmp = h.XExpBVD;
-                        h.XExpBVD *= m.xjbvd;
-                    }
-                    let limit = forward_limit(Nvtmd, m.ijthdfwd, DrainSatCurrent, Some(h.XExpBVD));
-                    h.vjdmFwd = limit.voltage;
-                    h.IVjdmFwd = limit.current;
-                    h.DslpFwd = limit.slope;
-                    T2 = m.ijthdrev / DrainSatCurrent;
-                    if T2 < 1.0 {
-                        T2 = 10.0;
-                        warnings.push(
-                            "Warning: ijthdrev too small and set to 10 times IdbSat.".to_string(),
-                        );
-                    }
-                    h.vjdmRev = -m.bvd - Nvtmd * log((T2 - 1.0) / m.xjbvd);
-                    T1 = m.xjbvd * exp(-(m.bvd + h.vjdmRev) / Nvtmd);
-                    h.IVjdmRev = DrainSatCurrent * (1.0 + T1);
-                    h.DslpRev = -DrainSatCurrent * T1 / Nvtmd;
-                }
-                _ => {
-                    warnings.push(format!("Specified dioMod = {} not matched", m.dioMod));
-                }
+        match source.warning {
+            Some(JunctionTemperatureWarning::ReverseThresholdTooSmall) => {
+                warnings
+                    .push("Warning: ijthsrev too small and set to 10 times IsbSat.".to_string());
             }
+            Some(JunctionTemperatureWarning::UnknownDiodeMode) => {
+                warnings.push(format!("Specified dioMod = {} not matched", m.dioMod));
+            }
+            None => {}
+        }
+        let drain = prepare_junction_temperature(JunctionTemperatureInput {
+            area: h.Adeff,
+            perimeter: h.Pdeff,
+            width: p.weffCJ,
+            fingers: h.nf,
+            area_density: m.DjctTempSatCurDensity,
+            sidewall_density: m.DjctSidewallTempSatCurDensity,
+            gate_sidewall_density: m.DjctGateSidewallTempSatCurDensity,
+            emission_voltage: m.vtm * m.DjctEmissionCoeff,
+            breakdown_voltage: m.bvd,
+            breakdown_factor: m.xjbvd,
+            forward_threshold: m.ijthdfwd,
+            reverse_threshold: m.ijthdrev,
+            diode_mode: m.dioMod,
+        });
+        if let Some(value) = drain.breakdown_exponential {
+            h.XExpBVD = value;
+        }
+        if let Some(limit) = drain.forward {
+            h.vjdmFwd = limit.voltage;
+            h.IVjdmFwd = limit.current;
+            if m.dioMod == 2 {
+                h.DslpFwd = limit.slope;
+            }
+        }
+        if let Some(limit) = drain.reverse {
+            h.vjdmRev = limit.voltage;
+            h.IVjdmRev = limit.current;
+            h.DslpRev = limit.slope;
+        }
+        match drain.warning {
+            Some(JunctionTemperatureWarning::ReverseThresholdTooSmall) => {
+                warnings
+                    .push("Warning: ijthdrev too small and set to 10 times IdbSat.".to_string());
+            }
+            Some(JunctionTemperatureWarning::UnknownDiodeMode) => {
+                warnings.push(format!("Specified dioMod = {} not matched", m.dioMod));
+            }
+            None => {}
         }
         T0 = (relative_temperature_change(Temp, Tnom));
         m.njtsstemp = m.njts * (1.0 + m.tnjts * T0);
@@ -2633,5 +2723,200 @@ mod tests {
         assert_eq!(dexp(35.0), MAX_EXP * 2.0);
         assert_eq!(dexp(-35.0), MIN_EXP);
         assert_eq!(dexp(1.0), 1f64.exp());
+    }
+}
+
+#[cfg(test)]
+mod junction_preparation_tests {
+    use super::{
+        EXP_THRESHOLD, ForwardLimit, JunctionTemperatureInput as Input,
+        JunctionTemperaturePrepared as Prepared, JunctionTemperatureWarning as Warning, MIN_EXP,
+        ReverseLimit, exp, forward_limit, log, prepare_junction_temperature,
+    };
+
+    /// Independent spelling of the pre-extraction C source/drain blocks,
+    /// including their distinct diode-mode field-write sets.
+    fn original_c_reference(input: Input) -> Prepared {
+        let mut result = Prepared::default();
+        let nvtm = input.emission_voltage;
+        let saturation = if (input.area <= 0.0) && (input.perimeter <= 0.0) {
+            0.0
+        } else {
+            input.area * input.area_density
+                + input.perimeter * input.sidewall_density
+                + input.width * input.fingers * input.gate_sidewall_density
+        };
+        if saturation > 0.0 {
+            match input.diode_mode {
+                0 => {
+                    if (input.breakdown_voltage / nvtm) > EXP_THRESHOLD {
+                        result.breakdown_exponential = Some(input.breakdown_factor * MIN_EXP);
+                    } else {
+                        result.breakdown_exponential =
+                            Some(input.breakdown_factor * exp(-input.breakdown_voltage / nvtm));
+                    }
+                }
+                1 => {
+                    result.forward = Some(forward_limit(
+                        nvtm,
+                        input.forward_threshold,
+                        saturation,
+                        None,
+                    ));
+                }
+                2 => {
+                    let xexp = if (input.breakdown_voltage / nvtm) > EXP_THRESHOLD {
+                        input.breakdown_factor * MIN_EXP
+                    } else {
+                        let unweighted = exp(-input.breakdown_voltage / nvtm);
+                        unweighted * input.breakdown_factor
+                    };
+                    result.breakdown_exponential = Some(xexp);
+                    result.forward = Some(forward_limit(
+                        nvtm,
+                        input.forward_threshold,
+                        saturation,
+                        Some(xexp),
+                    ));
+                    let mut ratio = input.reverse_threshold / saturation;
+                    if ratio < 1.0 {
+                        ratio = 10.0;
+                        result.warning = Some(Warning::ReverseThresholdTooSmall);
+                    }
+                    let voltage = -input.breakdown_voltage
+                        - nvtm * log((ratio - 1.0) / input.breakdown_factor);
+                    let t1 =
+                        input.breakdown_factor * exp(-(input.breakdown_voltage + voltage) / nvtm);
+                    result.reverse = Some(ReverseLimit {
+                        voltage,
+                        current: saturation * (1.0 + t1),
+                        slope: -saturation * t1 / nvtm,
+                    });
+                }
+                _ => result.warning = Some(Warning::UnknownDiodeMode),
+            }
+        }
+        result
+    }
+
+    fn compare_float(actual: f64, original: f64, label: &str) {
+        assert_eq!(
+            actual.to_bits(),
+            original.to_bits(),
+            "{label}: actual {actual:.17e} != C {original:.17e}"
+        );
+    }
+
+    fn compare_opt(actual: Option<f64>, original: Option<f64>, label: &str) {
+        match (actual, original) {
+            (Some(a), Some(b)) => compare_float(a, b, label),
+            (None, None) => {}
+            _ => panic!("{label}: C and common kernel write different field sets"),
+        }
+    }
+
+    fn compare_prepared(actual: Prepared, original: Prepared) {
+        assert_eq!(actual.warning, original.warning);
+        compare_opt(
+            actual.breakdown_exponential,
+            original.breakdown_exponential,
+            "breakdown exponential",
+        );
+        let compare_forward =
+            |actual: Option<ForwardLimit>, original: Option<ForwardLimit>| match (actual, original)
+            {
+                (Some(a), Some(b)) => {
+                    compare_float(a.voltage, b.voltage, "forward voltage");
+                    compare_float(a.current, b.current, "forward current");
+                    compare_float(a.slope, b.slope, "forward slope");
+                }
+                (None, None) => {}
+                _ => panic!("different forward member write set"),
+            };
+        compare_forward(actual.forward, original.forward);
+        match (actual.reverse, original.reverse) {
+            (Some(a), Some(b)) => {
+                compare_float(a.voltage, b.voltage, "reverse voltage");
+                compare_float(a.current, b.current, "reverse current");
+                compare_float(a.slope, b.slope, "reverse slope");
+            }
+            (None, None) => {}
+            _ => panic!("different reverse member write set"),
+        }
+    }
+
+    #[test]
+    fn shared_kernel_matches_original_source_and_drain_across_boundaries() {
+        let mut compared = 0;
+        for mode in [0, 1, 2, 4] {
+            for area in [-0.0, 0.0, 1e-12, f64::NAN] {
+                for perimeter in [0.0, 2e-6] {
+                    for breakdown in [
+                        0.0,
+                        EXP_THRESHOLD,
+                        f64::from_bits(EXP_THRESHOLD.to_bits() + 1),
+                        f64::INFINITY,
+                    ] {
+                        for ratio in [0.5, 1.0, 10.0, f64::NAN] {
+                            for side in [0, 1] {
+                                let density = if side == 0 { 1e-4 } else { 3e-5 };
+                                let input = Input {
+                                    area,
+                                    perimeter,
+                                    width: if side == 0 { 1e-6 } else { 2e-6 },
+                                    fingers: if side == 0 { 1.0 } else { 4.0 },
+                                    area_density: density,
+                                    sidewall_density: 1e-10,
+                                    gate_sidewall_density: 1e-10,
+                                    emission_voltage: 1.0,
+                                    breakdown_voltage: breakdown,
+                                    breakdown_factor: if side == 0 { 1.5 } else { 0.5 },
+                                    forward_threshold: 2e-12,
+                                    reverse_threshold: ratio
+                                        * (area * density
+                                            + perimeter * 1e-10
+                                            + (if side == 0 { 1e-6 } else { 2e-6 })
+                                                * (if side == 0 { 1.0 } else { 4.0 })
+                                                * 1e-10),
+                                    diode_mode: mode,
+                                };
+                                compare_prepared(
+                                    prepare_junction_temperature(input),
+                                    original_c_reference(input),
+                                );
+                                compared += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 1024);
+    }
+
+    #[test]
+    fn no_saturation_never_writes_any_limiter_or_emits_warnings() {
+        let input = Input {
+            area: 0.,
+            perimeter: 0.,
+            width: 1e-6,
+            fingers: 3.,
+            area_density: 1e-4,
+            sidewall_density: 1e-10,
+            gate_sidewall_density: 1e-4,
+            emission_voltage: 0.025,
+            breakdown_voltage: 10.,
+            breakdown_factor: 2.,
+            forward_threshold: 1e-12,
+            reverse_threshold: 1e-13,
+            diode_mode: 2,
+        };
+        // Gate sidewall current is not admitted when both area/perimeter
+        // have no effective junction surface, even if width*fingers is set.
+        let result = prepare_junction_temperature(input);
+        assert!(result.breakdown_exponential.is_none());
+        assert!(result.forward.is_none());
+        assert!(result.reverse.is_none());
+        assert!(result.warning.is_none());
     }
 }
