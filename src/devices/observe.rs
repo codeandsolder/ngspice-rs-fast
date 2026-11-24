@@ -47,6 +47,14 @@ fn terminal(key: &str) -> Option<usize> {
 }
 
 fn unit(device: char, key: &str) -> &'static str {
+    if device == 'd' {
+        match key {
+            "c" => return "current",
+            "vd" => return "voltage",
+            "gd" => return "conductance",
+            _ => {}
+        }
+    }
     if key == "ic" && device == 'c' {
         return "voltage";
     }
@@ -690,6 +698,19 @@ mod tests {
     use super::*;
     use crate::devices::{AnalysisMode, Device, StampContext};
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn diode_ask_units_follow_the_c_instance_schema() {
+        for (key, expected) in [
+            ("id", "current"),
+            ("c", "current"),
+            ("vd", "voltage"),
+            ("gd", "conductance"),
+            ("cd", "capacitance"),
+        ] {
+            assert_eq!(unit('d', key), expected, "{key}");
+        }
+    }
 
     /// A deliberately C-ask-aware stand-in with a different intrinsic
     /// quantity and external terminal residual. No physical device model

@@ -136,21 +136,25 @@ fn jfet_and_mesfet_intrinsic_currents_match_independent_c_reference() {
 }
 
 #[test]
-fn unimplemented_bjt_c_collector_ask_is_not_replaced_with_a_port_residual() {
+fn bjt_intrinsic_collector_and_base_asks_match_c_not_terminal_residuals() {
     let deck = "BJT intrinsic ask\nvcc c 0 5\nvb b 0 0.7\nq1 c b 0 qn\n.model qn npn(is=1e-14 bf=100)\n.op\n.end\n";
-    let netlist = Parser::new()
-        .parse_deck(&parse_deck_text(Path::new("bjt-ask.cir"), deck))
-        .unwrap();
-    let config = RunConfig::from_netlist(&netlist).unwrap();
-    let request = config.plan_for(&netlist.analyses[0]).unwrap();
-    let mut circuit = config.circuit(&netlist).unwrap();
-    circuit.set_observations(&["@q1[ic]".to_owned()]).unwrap();
-    let error = request
-        .run_plots(&mut circuit, &config.context())
-        .unwrap_err();
+    let plot = plot_operating_point(deck, &["@q1[ic]", "@q1[ib]", "i(q1)", "@q1[current]"]);
+    // Independently captured from ngspice-47+ / bjt/bjtask.c on this
+    // exact deck. The collector's 5 V / 1e12 ohm gmin contribution is
+    // present in the terminal residual, but not in BJTcc.
+    let intrinsic = plot.value("@q1[ic]", 0).unwrap().re;
+    let base = plot.value("@q1[ib]", 0).unwrap().re;
+    let terminal = plot.value("i(q1)", 0).unwrap().re;
+    let alias = plot.value("@q1[current]", 0).unwrap().re;
+    let c_ic = 0.005_670_346_775_742_283_5;
+    let c_ib = 5.670_346_410_422_285e-5;
+    assert!((intrinsic - c_ic).abs() <= c_ic.abs() * 1e-10);
+    assert!((base - c_ib).abs() <= c_ib.abs() * 1e-10);
+    assert_eq!(terminal.to_bits(), alias.to_bits());
+    let gmin_current = terminal - intrinsic;
     assert!(
-        error.to_string().contains("device observation @q1[ic]"),
-        "unexpected BJT error: {error}"
+        (gmin_current - 5e-12).abs() < 1e-13,
+        "BJT collector terminal minus intrinsic {gmin_current:e}"
     );
 }
 
