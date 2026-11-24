@@ -84,3 +84,12 @@ costs approximately 0.01 s versus 0.03 s for adaptive reduction; with
 819500 units omitted by the ordered reduction. The fast path avoids
 the exact accumulator for well-conditioned products. Unit-weight
 matrix sums bypass that recovery entirely.
+
+An independent 600-digit decimal sweep of 3589 finite arguments covered
+both signs, the polynomial/clamp boundaries, log-spaced near-zero
+arguments down to 1e-150 and extreme arguments up to 1e308. For the
+actual final native and generic x86-64 kernels, the maximum relative
+errors were 4.1e-16 (source fraction), 4.9e-16 (drain fraction),
+5.3e-15 (source slope), and 2.2e-15 (drain slope), using the smallest
+normal binary64 value as the error denominator floor. No finite input
+in that sweep produced a nonfinite output.
