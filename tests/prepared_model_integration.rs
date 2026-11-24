@@ -729,3 +729,114 @@ fn declared_physical_zero_and_unavailable_channels_have_distinct_semantics() {
         .unwrap_err();
     assert!(error.to_string().contains("known-zero charge"), "{error}");
 }
+
+#[derive(Debug, Default)]
+struct ControlledKernel;
+
+impl Kernel for ControlledKernel {
+    type Prepared = [Real; 2];
+
+    fn prepare(&self, parameters: &[Real], _temperature: Real) -> SpiceResult<Self::Prepared> {
+        let [conductance, transconductance] = parameters else {
+            return Err(SpiceError::circuit(
+                "controlled kernel needs two parameters",
+            ));
+        };
+        if !conductance.is_finite() || !transconductance.is_finite() {
+            return Err(SpiceError::circuit("invalid controlled model parameters"));
+        }
+        Ok([*conductance, *transconductance])
+    }
+
+    fn evaluate(
+        &self,
+        prepared: &Self::Prepared,
+        voltage: &[Real],
+        point: &mut Point<'_>,
+    ) -> SpiceResult<()> {
+        let [drain, source, gate] = voltage else {
+            return Err(SpiceError::circuit(
+                "controlled kernel needs three terminals",
+            ));
+        };
+        let [g, gm] = *prepared;
+        let current = g * (drain - source) + gm * (gate - source);
+        point.current.copy_from_slice(&[current, -current, 0.]);
+        point
+            .conductance
+            .copy_from_slice(&[g, -g - gm, gm, -g, g + gm, -gm, 0., 0., 0.]);
+        point.charge.fill(0.);
+        point.capacitance.fill(0.);
+        Ok(())
+    }
+}
+
+#[test]
+fn three_terminal_controlled_native_kernel_binds_all_matrix_columns() {
+    let descriptor = Descriptor {
+        family: "analytic-controlled".into(),
+        fingerprint: [0x4d; 16],
+        abi: ABI_VERSION,
+        terminals: 3,
+        parameters: vec![
+            Parameter {
+                name: "g".into(),
+                default: 0.001,
+                changes_topology: false,
+            },
+            Parameter {
+                name: "gm".into(),
+                default: 0.002,
+                changes_topology: false,
+            },
+        ],
+        charge: Capability::Zero,
+        noise: Capability::Zero,
+    };
+    let artifact = Artifact::new(descriptor, ControlledKernel).unwrap();
+    let mut circuit = Circuit::new();
+    let d = circuit.add_node("d").unwrap();
+    let s = circuit.add_node("s").unwrap();
+    let g = circuit.add_node("g").unwrap();
+    circuit
+        .add_device(Box::new(
+            artifact
+                .instance("x1", vec![d, s, g], &[0.001, 0.002], 27.)
+                .unwrap(),
+        ))
+        .unwrap();
+    circuit.finalize().unwrap();
+    assert_eq!(circuit.unknown_count(), 3);
+    assert_eq!(circuit.state_len(), 0);
+    let history = circuit.state_history().unwrap();
+    let (matrix, rhs, _) = load(&circuit, &history, &[1., 0.2, 0.6], None);
+    let i = 0.001 * 0.8 + 0.002 * 0.4;
+    close(matrix.get(0, 0), 0.001);
+    close(matrix.get(0, 1), -0.003);
+    close(matrix.get(0, 2), 0.002);
+    close(matrix.get(1, 0), -0.001);
+    close(matrix.get(1, 1), 0.003);
+    close(matrix.get(1, 2), -0.002);
+    assert_eq!(matrix.get(2, 0), 0.);
+    // The model is affine, so the Newton equivalent RHS is zero apart
+    // from rounding of its separately accumulated current and Jacobian.
+    assert!(rhs.as_slice()[0].abs() < 1e-15);
+    assert!(rhs.as_slice()[1].abs() < 1e-15);
+
+    let kernel = ControlledKernel;
+    let prepared = [[0.001, 0.002], [0.003, 0.004]];
+    let mut output = BatchOutput::new(3, 2).unwrap();
+    evaluate_tile(
+        &kernel,
+        &BatchInput {
+            prepared: &prepared,
+            voltages: &[1., 0.2, 0.6, -0.7, 0.3, -0.2],
+            charge: Capability::Zero,
+        },
+        &mut output,
+    )
+    .unwrap();
+    close(output.current[0], i);
+    close(output.current[3], 0.003 * (-1.) + 0.004 * (-0.5));
+    assert_eq!(output.capacitance.iter().copied().sum::<Real>(), 0.);
+}
