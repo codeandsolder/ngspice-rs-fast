@@ -134,7 +134,14 @@ fn interpolation(plot: &ngspice_rs::analysis::Plot, variable: &str, at: f64) -> 
             return (at - t0).mul_add((y1 - y0) / (t1 - t0), y0);
         }
     }
-    panic!("requested time {at:e} not covered by transient result")
+    // Adaptive runs may represent the exact requested tstop one or two ULPs
+    // below the decimal literal used to request the final checkpoint.
+    let last = plot.point_count() - 1;
+    let time = plot.value("time", last).unwrap().re;
+    if (at - time).abs() <= 64.0 * f64::EPSILON * at.abs().max(time.abs()) {
+        return plot.value(variable, last).unwrap().re;
+    }
+    panic!("requested time {at:e} not covered by transient result (last {time:e})")
 }
 
 #[test]
@@ -487,4 +494,57 @@ fn long_transit_time_qp_without_thermal_stays_at_steady_state() {
         (final_current - initial).abs() < initial.abs() * 0.005 + 1e-6,
         "Qp state drift at constant prescribed bias: initial {initial:e}, final {final_current:e}"
     );
+}
+
+#[test]
+fn synchronous_buck_with_two_thermal_vdmos_matches_ngspice47() {
+    // A physically connected 100 kHz synchronous converter: driven P-channel
+    // high-side + N-channel low-side VDMOS, finite deadtime, both MOSFETs'
+    // electrothermal networks, 150 µH / 100 µF filter and 10-ohm load.
+    // ngspice47 (SPARSE 1.3, trap, reltol=1e-5) yields 24,008 adaptive
+    // points in 200 us. Check switching-level, filter, source and thermal
+    // behavior rather than an isolated prepared-model kernel.
+    let deck = include_str!("fixtures/vdmos/synchronous_buck.cir");
+    let plot = transient(deck, "50n 200u 0 50n maxsteps=100000")
+        .unwrap_or_else(|error| panic!("100 kHz synchronous buck: {error}"));
+    assert!(plot.point_count() >= 2500, "buck waveform truncated");
+    for (variable, reference) in [
+        (
+            "v(out)",
+            [
+                (20e-6, 0.0853037),
+                (50e-6, 0.447204),
+                (100e-6, 1.58197),
+                (150e-6, 3.17382),
+                (200e-6, 4.93615),
+            ]
+            .as_slice(),
+        ),
+        (
+            "v(sw)",
+            [
+                (40.1e-6, 11.8759),
+                (44.5e-6, -0.845986),
+                (49.5e-6, -0.845854),
+            ]
+            .as_slice(),
+        ),
+        (
+            "i(vdc)",
+            [(40.1e-6, -1.34205), (44.5e-6, -1.77360e-7)].as_slice(),
+        ),
+        ("v(hj)", [(200e-6, 27.0791)].as_slice()),
+        ("v(hc)", [(200e-6, 27.0675)].as_slice()),
+        ("v(lj)", [(200e-6, 27.0986)].as_slice()),
+        ("v(lc)", [(200e-6, 27.0857)].as_slice()),
+    ] {
+        for &(at, expected) in reference {
+            let observed = interpolation(&plot, variable, at);
+            let tolerance = 0.015_f64.mul_add(f64::abs(expected), 0.03);
+            assert!(
+                (observed - expected).abs() < tolerance,
+                "100 kHz buck {variable} t={at:e}: Rust {observed:e}, ngspice47 {expected:e}, tol {tolerance:e}"
+            );
+        }
+    }
 }
