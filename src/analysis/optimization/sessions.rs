@@ -129,6 +129,14 @@ pub struct EnsembleStatistics {
     pub rebuilt: usize,
     /// Candidates that failed preparation, planning, or execution.
     pub failed: usize,
+    /// Highest number of workers simultaneously evaluating candidates.
+    pub peak_active_workers: usize,
+    /// Highest number of dispatched candidates not yet emitted in stable order.
+    /// This also counts completed, buffered results behind stragglers.
+    pub peak_outstanding: usize,
+    /// Highest number of completed candidates held behind an earlier
+    /// unfinished ordinal, after draining every available ordered prefix.
+    pub peak_reorder_pending: usize,
 }
 
 impl EnsembleStatistics {
@@ -298,6 +306,8 @@ impl<'a> CandidateWorker<'a> {
                     "candidate batch exceeds declared limit",
                 ));
             }
+            stats.peak_active_workers = 1;
+            stats.peak_outstanding = 1;
             let result = self.evaluate(&job, scenarios);
             stats.record(&result);
             emit(result);
@@ -415,6 +425,8 @@ pub fn run_parallel(
                     .map_err(|_| SpiceError::circuit("candidate worker stopped unexpectedly"))?;
                 dispatched += 1;
                 running += 1;
+                stats.peak_active_workers = stats.peak_active_workers.max(running);
+                stats.peak_outstanding = stats.peak_outstanding.max(dispatched - next_result);
             }
             if running == 0 {
                 break;
@@ -430,6 +442,7 @@ pub fn run_parallel(
                 emit(result);
                 next_result += 1;
             }
+            stats.peak_reorder_pending = stats.peak_reorder_pending.max(results.len());
         }
         drop(senders);
         if exceeded {

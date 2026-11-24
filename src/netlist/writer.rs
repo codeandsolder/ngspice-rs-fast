@@ -468,8 +468,11 @@ impl Writer<'_> {
     fn analysis(&mut self, card: &AnalysisCard, depth: usize) -> SpiceResult<()> {
         let location = &card.location;
         let at = if card.uic {
-            if card.kind != AnalysisKind::Transient {
-                return Err(refuse("uic is only valid on .tran", Some(location)));
+            if !matches!(
+                card.kind,
+                AnalysisKind::Transient | AnalysisKind::PeriodicSteadyState
+            ) {
+                return Err(refuse("uic is only valid on .tran or .pss", Some(location)));
             }
             card.arguments
                 .windows(2)

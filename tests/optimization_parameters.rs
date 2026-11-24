@@ -141,7 +141,7 @@ fn compiled_numeric_setters_reuse_session_topology_and_match_scalar_aba() {
 }
 
 #[test]
-fn arbitrary_number_of_independent_resistors_uses_validated_reelaboration() {
+fn arbitrary_number_of_independent_resistors_uses_validated_sparse_overlay() {
     let source = deck(
         ".param a=1k b=2k c=3k d=4k\nv1 in 0 10\nr1 in 0 {a}\nr2 in 0 {b}\nr3 in 0 {c}\nr4 in 0 {d}",
     );
@@ -150,7 +150,7 @@ fn arbitrary_number_of_independent_resistors_uses_validated_reelaboration() {
     session
         .update(&[1500., 2500., 3500., 4500.], &mut EvalBudget::default())
         .unwrap();
-    assert_eq!(session.topology(), CandidateTopology::Rebuilt);
+    assert_eq!(session.topology(), CandidateTopology::Reused);
     same_linear(
         &mut session,
         &deck(
@@ -161,6 +161,99 @@ fn arbitrary_number_of_independent_resistors_uses_validated_reelaboration() {
         .update(&[1000., 2000., 3000., 4000.], &mut EvalBudget::default())
         .unwrap();
     assert_eq!(session.topology(), CandidateTopology::Reused);
+}
+
+#[test]
+fn one_hundred_twenty_eight_typed_resistor_sites_keep_numeric_fidelity_and_aba_state() {
+    const N: usize = 128;
+    let netlist = |values: &[f64]| {
+        let mut body = String::from("v1 in 0 dc 10\n");
+        for (index, value) in values.iter().enumerate() {
+            body.push_str(&format!(".param p{index}={value:.17e}\n"));
+            let (pos, neg) = if index == 0 {
+                ("in", "out")
+            } else {
+                ("out", "0")
+            };
+            body.push_str(&format!("r{index} {pos} {neg} {{p{index}}}\n"));
+        }
+        deck(&body)
+    };
+    let starting: Vec<_> = (0..N).map(|index| 1000. + index as f64 * 7.).collect();
+    let names: Vec<_> = (0..N).map(|index| format!("p{index}")).collect();
+    let inputs: Vec<_> = names.iter().map(String::as_str).collect();
+    let plan = CircuitParameterPlan::new(netlist(&starting), &inputs).unwrap();
+    let mut session = plan.session().unwrap();
+    let a: Vec<_> = starting
+        .iter()
+        .enumerate()
+        .map(|(index, value)| value * (1. + (index % 13) as f64 * 0.001))
+        .collect();
+    let b: Vec<_> = starting
+        .iter()
+        .enumerate()
+        .map(|(index, value)| value * (1. + (index % 11) as f64 * 0.002))
+        .collect();
+    for values in [&a, &b, &a, &starting] {
+        session.update(values, &mut EvalBudget::default()).unwrap();
+        assert_eq!(session.topology(), CandidateTopology::Reused);
+        same_linear(&mut session, &netlist(values));
+    }
+    let mut invalid = a.clone();
+    invalid[0] = f64::NAN;
+    assert!(
+        session
+            .update(&invalid, &mut EvalBudget::default())
+            .is_err()
+    );
+    assert_eq!(session.topology(), CandidateTopology::Reused);
+    same_linear(&mut session, &netlist(&starting));
+}
+
+#[test]
+fn multiple_instance_setters_on_one_device_preserve_order_and_atomicity() {
+    // One independent voltage source supports three independent typed
+    // numeric setters (DC bias, AC magnitude and AC phase) without a model
+    // selector or geometry change.
+    let netlist = |bias: f64, magnitude: f64, phase: f64| {
+        deck(&format!(
+            ".param bias={bias} mag={magnitude} phase={phase}\n\
+             v1 in 0 dc {{bias}} ac {{mag}} {{phase}}\n\
+             r1 in out 1k\n\
+             r2 out 0 2k"
+        ))
+    };
+    let plan = CircuitParameterPlan::new(netlist(10., 1., 0.), &["bias", "mag", "phase"]).unwrap();
+    let mut session = plan.session().unwrap();
+    let ac = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "1", "1k", "1k"])
+        .resolve()
+        .unwrap();
+    for &(bias, magnitude, phase) in &[(8., 2., 30.), (7., 1.5, 120.), (8., 2., 30.), (10., 1., 0.)]
+    {
+        session
+            .update(&[bias, magnitude, phase], &mut EvalBudget::default())
+            .unwrap();
+        assert_eq!(session.topology(), CandidateTopology::Reused);
+        let expected_netlist = netlist(bias, magnitude, phase);
+        same_linear(&mut session, &expected_netlist);
+        let actual_context = session.analysis_context();
+        let actual = ac.run(session.circuit_mut(), &actual_context).unwrap();
+        let mut fresh = Circuit::from_netlist(&expected_netlist).unwrap();
+        let expected = ac.run(&mut fresh, &AnalysisContext::default()).unwrap();
+        for variable in expected.variables() {
+            let a = actual.value(&variable.name, 0).unwrap();
+            let b = expected.value(&variable.name, 0).unwrap();
+            close(a.re, b.re);
+            close(a.im, b.im);
+        }
+    }
+    assert!(
+        session
+            .update(&[f64::NAN, 3., 45.], &mut EvalBudget::default())
+            .is_err()
+    );
+    assert_eq!(session.topology(), CandidateTopology::Reused);
+    same_linear(&mut session, &netlist(10., 1., 0.));
 }
 
 #[test]

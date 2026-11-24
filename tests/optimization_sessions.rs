@@ -124,6 +124,9 @@ fn serial_owned_worker_keeps_aba_and_repeated_candidates_independent() {
     assert_eq!(stats.succeeded, 4);
     assert_eq!(stats.failed, 0);
     assert_eq!(stats.rebuilt, 0);
+    assert_eq!(stats.peak_active_workers, 1);
+    assert_eq!(stats.peak_outstanding, 1);
+    assert_eq!(stats.peak_reorder_pending, 0);
     assert_eq!(
         received.iter().map(|result| result.id).collect::<Vec<_>>(),
         [20, 21, 20, 22]
@@ -256,6 +259,10 @@ fn parallel_stream_preserves_order_and_matches_serial_numeric_results() {
     .unwrap();
     assert_eq!(stats.candidates, 37);
     assert_eq!(stats.failed, 0);
+    assert!(stats.peak_active_workers >= 1 && stats.peak_active_workers <= 4);
+    assert!(stats.peak_outstanding >= stats.peak_active_workers);
+    assert!(stats.peak_outstanding <= 8);
+    assert!(stats.peak_reorder_pending <= stats.peak_outstanding);
     assert_eq!(parallel_values, serial_values);
 }
 
@@ -291,7 +298,10 @@ fn parallel_tail_resource_limit_and_rebuilt_topology_are_explicit() {
     assert_eq!(stats.candidates, 9);
     assert_eq!(results.len(), 9);
     assert_eq!(results[0].1, Some(CandidateTopology::Reused));
-    assert!(stats.rebuilt > 0);
+    assert_eq!(
+        stats.rebuilt, 0,
+        "four safe scalar setters must reuse topology"
+    );
     assert_eq!(stats.failed, 0);
     let mut called = false;
     let result = run_parallel(

@@ -109,8 +109,9 @@ pub const fn job_order(kind: AnalysisKind) -> usize {
         AnalysisKind::Sensitivity => 9,
         // RFSPICE appends SPinfo after SENSinfo (and the PSS/SENSE2 entries,
         // which have no card here).
-        AnalysisKind::SParameter => 10,
-        AnalysisKind::Fourier => 11,
+        AnalysisKind::PeriodicSteadyState => 10,
+        AnalysisKind::SParameter => 11,
+        AnalysisKind::Fourier => 12,
     }
 }
 
@@ -131,6 +132,38 @@ pub const fn plot_abbreviation(kind: AnalysisKind) -> &'static str {
         AnalysisKind::Fourier => "four",
         // typesdef.c maps the "SP Analysis" plot name to "sp".
         AnalysisKind::SParameter => "sp",
+        AnalysisKind::PeriodicSteadyState => "pss",
+    }
+}
+
+/// Session-wide plot allocation using C's collision-driven global counter.
+pub(crate) struct PlotNames {
+    names: std::collections::HashSet<String>,
+    number: usize,
+}
+
+impl Default for PlotNames {
+    fn default() -> Self {
+        Self {
+            names: std::collections::HashSet::new(),
+            number: 1,
+        }
+    }
+}
+
+impl PlotNames {
+    pub(crate) fn allocate(&mut self, prefix: &str) -> String {
+        loop {
+            let name = format!("{prefix}{}", self.number);
+            if self.names.insert(name.clone()) {
+                return name;
+            }
+            self.number += 1;
+        }
+    }
+
+    pub(crate) fn remove(&mut self, name: &str) {
+        self.names.remove(name);
     }
 }
 
@@ -148,8 +181,7 @@ pub fn schedule(plans: &[crate::analysis::AnalysisPlan]) -> Vec<ScheduledAnalysi
             .then(b.cmp(&a))
     });
     // Generated names are lowercase; membership need not scan all prior plots.
-    let mut names = std::collections::HashSet::with_capacity(order.len());
-    let mut plot_num = 1_usize;
+    let mut names = PlotNames::default();
     let mut scheduled: Vec<ScheduledAnalysis> = order
         .iter()
         .map(|&card_index| {
@@ -165,13 +197,7 @@ pub fn schedule(plans: &[crate::analysis::AnalysisPlan]) -> Vec<ScheduledAnalysi
                 } else {
                     abbreviation
                 };
-                let mut name = format!("{abbreviation}{plot_num}");
-                while names.contains(&name) {
-                    plot_num += 1;
-                    name = format!("{abbreviation}{plot_num}");
-                }
-                names.insert(name.clone());
-                own.push(name);
+                own.push(names.allocate(abbreviation));
             }
             let plot_name = own.remove(0);
             ScheduledAnalysis {
@@ -1038,6 +1064,7 @@ mod tests {
                 AnalysisKind::Distortion,
                 AnalysisKind::Noise,
                 AnalysisKind::Sensitivity,
+                AnalysisKind::PeriodicSteadyState,
                 AnalysisKind::SParameter,
                 AnalysisKind::Fourier,
             ]

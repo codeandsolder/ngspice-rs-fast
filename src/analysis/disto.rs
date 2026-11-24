@@ -308,12 +308,13 @@ mod tests {
         let [source] = system.sources.as_mut_slice() else {
             panic!("expected one source")
         };
-        source.rows.push((usize::MAX, 1.));
+        let original_rows = source.rows;
+        source.rows.push(usize::MAX, 1.).unwrap();
         assert!(super::Inputs::bind(&system, &distortion, false).is_err());
         let [source] = system.sources.as_mut_slice() else {
             panic!("expected one source")
         };
-        source.rows.pop();
+        source.rows = original_rows;
         source.rows[0].1 = f64::INFINITY;
         assert!(super::Inputs::bind(&system, &distortion, false).is_err());
     }
