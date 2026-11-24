@@ -24,6 +24,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("{}", circuit.emit_specialization(case, &config.context().model_context())?);
         return Ok(());
     }
+    if mode == "dump-generic" || mode == "dump-baked" {
+        let mut circuit = config.circuit(&netlist)?;
+        if mode == "dump-baked" {
+            circuit.enable_specialization(case, true, &config.context().model_context())?;
+        }
+        for plan in &plans {
+            for plot in plan.run_plots(&mut circuit, &config.context())? {
+                println!("plot	{}	{}", plot.point_count(), plot.variables().iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join("	"));
+                for row in plot.rows() {
+                    println!("{}", row.iter().map(|v| format!("{:.17e},{:.17e}",v.re,v.im)).collect::<Vec<_>>().join("	"));
+                }
+            }
+        }
+        return Ok(());
+    }
     if mode == "verify" {
         let run = |specialization: Option<bool>| -> Result<_, Box<dyn std::error::Error>> {
             let mut circuit = config.circuit(&netlist)?;
