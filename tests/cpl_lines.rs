@@ -154,9 +154,9 @@ fn model_rejects_nonphysical_singular_and_oversized_materials() {
     assert!(CoupledLinePlan::from_packed(1, 0., &[1.], &[1.], &[0.], &[1.], limit).is_err());
     assert!(CoupledLinePlan::from_packed(1, f64::NAN, &[1.], &[1.], &[0.], &[1.], limit).is_err());
     assert!(CoupledLinePlan::from_packed(1, 1., &[-1.], &[1.], &[0.], &[1.], limit).is_err());
-    assert!(CoupledLinePlan::from_packed(1, 1., &[1.], &[0.], &[0.], &[1.], limit).is_err());
+    assert!(CoupledLinePlan::from_packed(1, 1., &[1.], &[-1.], &[0.], &[1.], limit).is_err());
     assert!(CoupledLinePlan::from_packed(1, 1., &[1.], &[1.], &[-1.], &[1.], limit).is_err());
-    assert!(CoupledLinePlan::from_packed(1, 1., &[1.], &[1.], &[0.], &[0.], limit).is_err());
+    assert!(CoupledLinePlan::from_packed(1, 1., &[1.], &[1.], &[0.], &[-1.], limit).is_err());
     assert!(
         CoupledLinePlan::from_packed(
             1,
@@ -405,6 +405,71 @@ fn arbitrary_noncommuting_rlgc_matches_independent_runge_kutta_propagation() {
                     2e-8,
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn coupled_plan_accepts_the_physical_rc_diffusion_limit() {
+    // A purely RC distributed cable has a well-defined lossy transmission
+    // function despite L=0. The scalar analytical admittance follows
+    // gamma=sqrt(ZY), Y0=gamma/Z, Y11=Y0*coth(gamma*length),
+    // Y12=-Y0*csch(gamma*length).
+    let length = 0.2;
+    let resistance = 10.;
+    let capacitance = 1e-9;
+    let cable = model(1, length, &[resistance], &[0.], &[0.], &[capacitance]);
+    for hz in [1e3, 1e6, 10e6] {
+        let omega = std::f64::consts::TAU * hz;
+        let imaginary = omega * resistance * capacitance;
+        let root = (imaginary / 2.).sqrt();
+        let gamma = Complex::new(root, root);
+        let distance = gamma * Complex::real(length);
+        let sine = Complex::new(
+            distance.re.sinh() * distance.im.cos(),
+            distance.re.cosh() * distance.im.sin(),
+        );
+        let cosine = Complex::new(
+            distance.re.cosh() * distance.im.cos(),
+            distance.re.sinh() * distance.im.sin(),
+        );
+        let admittance = gamma / Complex::real(resistance);
+        let diag = admittance * cosine / sine;
+        let offdiag = -admittance / sine;
+        let result = cable.admittance_at(hz).unwrap();
+        near(result.get(0, 0).unwrap(), diag, 3e-11);
+        near(result.get(1, 1).unwrap(), diag, 3e-11);
+        near(result.get(0, 1).unwrap(), offdiag, 3e-11);
+        near(result.get(1, 0).unwrap(), offdiag, 3e-11);
+    }
+}
+
+#[test]
+fn lossless_cpl_dc_short_is_exact_branch_constraint_while_ac_is_distributed() {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+    let deck = "lossless cable with exact DC short\n\
+        v1 in 0 dc 1 ac 1\n\
+        rload out 0 100\n\
+        p1 in 0 out 0 cable\n\
+        .model cable cpl R=0 L=8n C=3p G=0 length=1\n\
+        .op\n.ac lin 1 250e6 250e6\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("lossless_p.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let analytic = model(1, 1., &[0.], &[8e-9], &[0.], &[3e-12]);
+    assert!(analytic.admittance_at(0.).is_err());
+    let y = analytic.admittance_at(250e6).unwrap();
+    let ac_expected = -y.get(1, 0).unwrap() / (y.get(1, 1).unwrap() + Complex::real(0.01));
+    for plan in config.plans_for(&netlist.analyses).unwrap() {
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let output = plan.run(&mut circuit, &config.context()).unwrap();
+        if plan.kind() == ngspice_rs::primitives::AnalysisKind::OperatingPoint {
+            near(output.value("v(out)", 0).unwrap(), Complex::real(1.), 1e-12);
+        } else {
+            near(output.value("v(out)", 0).unwrap(), ac_expected, 5e-10);
         }
     }
 }

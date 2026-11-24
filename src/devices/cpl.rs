@@ -303,6 +303,106 @@ impl CoupledLine {
         }
         Ok(entries)
     }
+    /// Augmented telegrapher constraints avoid ever inverting the B block.
+    /// Input current unknowns are the physical currents multiplied by the
+    /// positive wave-impedance balancing scalar. Their branch equations are
+    /// Vout - A Vin - B Iin'=0, and output KCL includes -C Vin - D Iin'.
+    /// This representation handles ideal shorts and lossless DC *exactly*.
+    fn transfer_stamps_at(
+        &self,
+        hz: Real,
+        unknowns: &MnaUnknowns,
+        first_branch: usize,
+    ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
+        let conductors = self.conductors();
+        let (matrix, scale) = self.plan.transfer_at(hz)?;
+        let inverse_scale = 1. / scale;
+        if !inverse_scale.is_finite() {
+            return Err(invalid("nonfinite cable current scaling"));
+        }
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        inputs
+            .try_reserve(conductors)
+            .map_err(|_| invalid("input MNA mapping capacity"))?;
+        outputs
+            .try_reserve(conductors)
+            .map_err(|_| invalid("output MNA mapping capacity"))?;
+        for i in 0..conductors {
+            let (ip, ir) = self.physical_pair(i);
+            let (op, or) = self.physical_pair(conductors + i);
+            inputs.push((
+                unknowns.checked_node_row(ip)?,
+                unknowns.checked_node_row(ir)?,
+            ));
+            outputs.push((
+                unknowns.checked_node_row(op)?,
+                unknowns.checked_node_row(or)?,
+            ));
+        }
+        let size = conductors
+            .checked_mul(conductors)
+            .and_then(|v| v.checked_mul(13))
+            .ok_or_else(|| invalid("augmented transmission-stamp count overflow"))?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve(size)
+            .map_err(|_| invalid("augmented stamp capacity"))?;
+        let mut insert = |row: Option<usize>, col: Option<usize>, value: Complex| {
+            if let (Some(row), Some(col)) = (row, col) {
+                if value != Complex::ZERO {
+                    entries.push((row, col, value));
+                }
+            }
+        };
+        for i in 0..conductors {
+            let branch_i = first_branch
+                .checked_add(i)
+                .ok_or_else(|| invalid("branch row overflow"))?;
+            let (input_positive, input_return) = inputs[i];
+            let (output_positive, output_return) = outputs[i];
+            insert(input_positive, Some(branch_i), Complex::real(inverse_scale));
+            insert(input_return, Some(branch_i), Complex::real(-inverse_scale));
+            insert(Some(branch_i), output_positive, Complex::real(1.));
+            insert(Some(branch_i), output_return, Complex::real(-1.));
+            for j in 0..conductors {
+                let branch_j = first_branch
+                    .checked_add(j)
+                    .ok_or_else(|| invalid("branch row overflow"))?;
+                let (source_positive, source_return) = inputs[j];
+                let a = matrix
+                    .get(i, j)
+                    .ok_or_else(|| invalid("missing transmission A"))?;
+                let b = matrix
+                    .get(i, conductors + j)
+                    .ok_or_else(|| invalid("missing transmission B"))?;
+                let c = matrix
+                    .get(conductors + i, j)
+                    .ok_or_else(|| invalid("missing transmission C"))?;
+                let d = matrix
+                    .get(conductors + i, conductors + j)
+                    .ok_or_else(|| invalid("missing transmission D"))?;
+                // Positive/negative output terminal KCL: -C Vsource / Zscale.
+                let out_current = -c * Complex::real(inverse_scale);
+                insert(output_positive, source_positive, out_current);
+                insert(output_positive, source_return, -out_current);
+                insert(output_return, source_positive, -out_current);
+                insert(output_return, source_return, out_current);
+                // The same KCL equation's -D I' coupling.
+                let out_branch = -d * Complex::real(inverse_scale);
+                insert(output_positive, Some(branch_j), out_branch);
+                insert(output_return, Some(branch_j), -out_branch);
+                // One voltage constraint row per conductor: Vout-A Vin-B I'=0.
+                insert(Some(branch_i), source_positive, -a);
+                insert(Some(branch_i), source_return, a);
+                insert(Some(branch_i), Some(branch_j), -b);
+            }
+        }
+        if entries.iter().any(|(_, _, value)| !value.is_finite()) {
+            return Err(invalid("nonfinite augmented transmission-line stamps"));
+        }
+        Ok(entries)
+    }
 }
 
 impl Device for CoupledLine {
@@ -319,20 +419,38 @@ impl Device for CoupledLine {
         true
     }
 
+    fn branch_currents(&self) -> usize {
+        self.conductors()
+    }
+
     fn setup_matrix(
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
-        let ports = self.conductors() * 2;
-        for output in 0..ports {
-            for input in 0..ports {
-                let (rp, rn) = self.physical_pair(output);
-                let (cp, cn) = self.physical_pair(input);
-                for row in <[NodeId; 2]>::from((rp, rn)) {
-                    for col in <[NodeId; 2]>::from((cp, cn)) {
+        let conductors = self.conductors();
+        for i in 0..conductors {
+            let branch_i = setup.branch(i)?;
+            let (input_positive, input_return) = self.physical_pair(i);
+            let (output_positive, output_return) = self.physical_pair(conductors + i);
+            for row in [input_positive, input_return] {
+                setup.element(setup.node(row), Some(branch_i));
+            }
+            for col in [output_positive, output_return] {
+                setup.element(Some(branch_i), setup.node(col));
+            }
+            for j in 0..conductors {
+                let branch_j = setup.branch(j)?;
+                let (source_positive, source_return) = self.physical_pair(j);
+                for row in [output_positive, output_return] {
+                    setup.element(setup.node(row), Some(branch_j));
+                    for col in [source_positive, source_return] {
                         setup.nodes(row, col);
                     }
                 }
+                for col in [source_positive, source_return] {
+                    setup.element(Some(branch_i), setup.node(col));
+                }
+                setup.element(Some(branch_i), Some(branch_j));
             }
         }
         Ok(true)
@@ -341,25 +459,27 @@ impl Device for CoupledLine {
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         match context.mode {
             AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
-                for (row, col, value) in self.nodal_stamps_at(0., context.unknowns)? {
+                let first = context.branch(0)?;
+                for (row, col, value) in self.transfer_stamps_at(0., context.unknowns, first)? {
                     if value.im != 0. {
-                        return Err(invalid("DC line admits no complex-valued real MNA stamp"));
+                        return Err(invalid("DC line constraint requires a real MNA stamp"));
                     }
                     context.matrix.add(row, col, value.re)?;
                 }
                 Ok(())
             }
-            AnalysisMode::Ac { .. } => Err(invalid(
-                "complex frequency load belongs to assemble_small_signal",
-            )),
+            AnalysisMode::Ac { .. } => Err(invalid("AC transfer belongs to assemble_small_signal")),
             AnalysisMode::Transient { .. } => Err(invalid(
-                "transient coupled convolution requires an accepted-history propagator, not an AC matrix",
+                "transient coupled convolution requires an accepted-history propagator",
             )),
         }
     }
 
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        for (row, col, value) in self.nodal_stamps_at(0., context.unknowns)? {
+        let first = context
+            .branch
+            .ok_or_else(|| invalid("missing line branch rows"))?;
+        for (row, col, value) in self.transfer_stamps_at(0., context.unknowns, first)? {
             if value.im != 0. {
                 return Err(invalid("nonreal DC line bias operator"));
             }
@@ -376,7 +496,10 @@ impl Device for CoupledLine {
         _bias: &Vector,
     ) -> SpiceResult<()> {
         let hz = context.model_context.frequency;
-        for (row, col, value) in self.nodal_stamps_at(hz, context.unknowns)? {
+        let first = context
+            .branch
+            .ok_or_else(|| invalid("missing line branch rows"))?;
+        for (row, col, value) in self.transfer_stamps_at(hz, context.unknowns, first)? {
             if value.re != 0. {
                 context.system.a.add(row, col, value.re)?;
             }

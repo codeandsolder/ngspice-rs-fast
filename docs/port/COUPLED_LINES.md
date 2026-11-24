@@ -41,15 +41,28 @@ the line; the 2N×2N physical nodal admittance is
 This handles DC R/G conduction and arbitrary-frequency AC/SP through the
 same coupled equations, including real losses and mutual inductance and
 capacitance. The input and output return terminals participate in signed
-KCL stamps for every 2N×2N matrix entry. A singular B block (ideal short
-or exact resonant constraint) has no finite physical nodal admittance;
-we refuse the matrix rather than replacing it with zero conductance.
-Future exact constraint handling can add MNA branch equations.
+KCL stamps for every 2N×2N matrix entry. A singular B block cannot produce an ordinary two-ended nodal admittance.
+The diagnostic `CoupledLinePlan::admittance_at` rejects this conversion, but
+**the native P Device does not need to invert B**. Instead it allocates N
+branch-current unknowns and stamps the exact transfer equations in MNA:
+
+  Vout - A Vin - B Iin' = 0
+  Iinput_entering = Iin' / Zscale
+  Ioutput_entering = -(C Vin + D Iin') / Zscale.
+
+At DC a lossless line has A=D=I, B=C=0, so the branch rows enforce
+Vout=Vin with KCL currents entering and leaving the cable. Exact shorts and
+resonant constraints are therefore preserved as actual branch equations,
+not replaced with zeros or an arbitrary large conductance. The same
+augmented formulation handles dissipative cable segments and complex AC.
+The full sparse MNA setup records the required node-to-branch and
+branch-to-node positions once; the frequency-dependent transfer coefficients
+are then stamped directly at each solve frequency.
 
 ## Model validity and resource ownership
 
 Material matrices must be finite and symmetric. R,G are checked positive
-semidefinite and L,C are checked positive definite via the existing
+semidefinite and L,C are checked positive semidefinite via the existing
 symmetric eigenvalue solver. This admits lossless and coupled passive
 materials while rejecting active or numerically degenerate material.
 Length is finite and strictly positive. The immutable CoupledLinePlan
@@ -76,7 +89,8 @@ negative/singular/oversized matrices.
 
 ## Integration boundary / follow-on
 
-The typed distributed AC/DC matrices and Device interface are in place.
+The typed distributed DC/AC transfer matrices, exact branch-constraint MNA
+and Device interface are in place.
 Native P/CPL netlist parsing, including separately positioned real-vector
 coefficients and independent return terminals, and model binding are active.
 The complete passive rational transient propagation is a separate step. Arbitrary AC frequency responses cannot

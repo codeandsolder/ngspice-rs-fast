@@ -792,6 +792,8 @@ impl Writer<'_> {
                 | "urc"
                 | "ltra"
                 | "txl"
+                | "cpl"
+                | "cpllines"
                 | "nmf"
                 | "pmf"
                 // `inpdomod.c`'s HFET spellings of the same families.
@@ -906,6 +908,22 @@ impl Writer<'_> {
             't' => tline_parameters(device, &mut parts)?,
             'o' => ltra_parameters(device, &mut parts)?,
             'u' => urc_parameters(device, &mut parts)?,
+            'p' => {
+                for parameter in &device.parameters {
+                    if parameter.name != "length"
+                        || !matches!(
+                            parameter.kind,
+                            ParameterKind::Scalar | ParameterKind::Expression(_)
+                        )
+                    {
+                        return Err(refuse(
+                            "P/CPL instance only accepts length=",
+                            Some(&parameter.location),
+                        ));
+                    }
+                    named_value(&mut parts, parameter, false)?;
+                }
+            }
             'y' => {
                 for p in &device.parameters {
                     if p.name != "len"
@@ -967,6 +985,7 @@ fn device_prefix<'a>(
         'm' | 'e' | 'g' | 's' | 't' | 'o' | 'y' => count == 4,
         'j' | 'u' | 'z' => count == 3,
         'x' => true,
+        'p' => count >= 4 && count % 2 == 0,
         'k' => count == 0,
         _ => {
             return Err(refuse(
@@ -1006,7 +1025,7 @@ fn device_prefix<'a>(
         ('v' | 'i' | 'e'..='h' | 'k' | 't', Some(_)) => {
             return Err(refuse("source with a model", Some(location)));
         }
-        ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y', None) => {
+        ('d' | 'q' | 'm' | 'x' | 's' | 'w' | 'j' | 'u' | 'o' | 'z' | 'y' | 'p', None) => {
             return Err(refuse("device without a model/target", Some(location)));
         }
         (_, Some(model)) => {

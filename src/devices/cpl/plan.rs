@@ -100,7 +100,9 @@ impl CoupledLinePlan {
     /// Validate a general symmetric R/L/G/C cable with explicit length.
     ///
     /// Loss matrices R and G must be positive semidefinite; dynamic matrices
-    /// L and C must be positive definite for distinct finite-speed modes.
+    /// L and C may be semidefinite: purely RC, RL and conductive cable
+    /// limits remain physically meaningful. Singular ideal constraints are
+    /// diagnosed when a finite port admittance is requested.
     /// This permits cross-coupling, arbitrary modal rotations and zero losses.
     /// # Errors
     /// Invalid dimensions, active or singular material, allocation budget.
@@ -117,11 +119,11 @@ impl CoupledLinePlan {
         if !length.is_finite() || length <= 0. {
             return Err(invalid("cable length must be finite and positive"));
         }
-        for (name, matrix, definite) in [
-            ("R", &resistance, false),
-            ("L", &inductance, true),
-            ("G", &conductance, false),
-            ("C", &capacitance, true),
+        for (name, matrix) in [
+            ("R", &resistance),
+            ("L", &inductance),
+            ("G", &conductance),
+            ("C", &capacitance),
         ] {
             if !matrix.is_square() || matrix.rows() != conductors {
                 return Err(invalid(format!(
@@ -151,9 +153,9 @@ impl CoupledLinePlan {
                 u32::try_from(conductors).map_err(|_| invalid("dimension conversion overflow"))?,
             );
             let uncertainty = 128. * Real::EPSILON * dimension * max;
-            if smallest < -uncertainty || (definite && smallest <= uncertainty) {
+            if smallest < -uncertainty {
                 return Err(invalid(format!(
-                    "{name} is active or singular (lowest eigenvalue = {smallest:.7e})"
+                    "{name} violates passive positive semidefiniteness (minimum eigenvalue {smallest:.7e})"
                 )));
             }
         }
