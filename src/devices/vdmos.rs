@@ -560,12 +560,8 @@ impl Vdmos {
                 (tc, -gjc),
             ],
         )?;
-        context.stamp_fixed(
-            power
-                .d_electrical
-                .map(|(node, d_power)| (tj, node, -d_power)),
-        )?;
         for (node, d_power) in power.d_electrical {
+            context.stamp(tj, node, -d_power)?;
             context.stamp_rhs(tj, -d_power * context.node_voltage(node))?;
         }
         // The ideal C `cktTemp` ambient source is eliminated algebraically;
@@ -590,15 +586,11 @@ fn stamp_branch(
     });
     context.stamp_rhs(positive, -offset)?;
     context.stamp_rhs(negative, offset)?;
-    let [(n0, d0), (n1, d1), (n2, d2)] = derivatives;
-    context.stamp_fixed([
-        (positive, n0, d0),
-        (negative, n0, -d0),
-        (positive, n1, d1),
-        (negative, n1, -d1),
-        (positive, n2, d2),
-        (negative, n2, -d2),
-    ])
+    for (node, derivative) in derivatives {
+        context.stamp(positive, node, derivative)?;
+        context.stamp(negative, node, -derivative)?;
+    }
+    Ok(())
 }
 
 /// A nonlinear MNA residual owned by one (possibly thermal) node.
@@ -614,7 +606,10 @@ fn stamp_row<const N: usize>(
             derivative.mul_add(-context.node_voltage(*node), sum)
         });
     context.stamp_rhs(row, -offset)?;
-    context.stamp_fixed(derivatives.map(|(column, derivative)| (row, column, derivative)))
+    for (column, derivative) in derivatives {
+        context.stamp(row, column, derivative)?;
+    }
+    Ok(())
 }
 
 /// Thermal voltage is Celsius; its derivative couples an electrical branch
@@ -627,10 +622,8 @@ fn stamp_temperature_control(
     derivative: Real,
 ) -> SpiceResult<()> {
     let eq_offset = derivative * context.node_voltage(thermal);
-    context.stamp_fixed([
-        (positive, thermal, derivative),
-        (negative, thermal, -derivative),
-    ])?;
+    context.stamp(positive, thermal, derivative)?;
+    context.stamp(negative, thermal, -derivative)?;
     context.stamp_rhs(positive, eq_offset)?;
     context.stamp_rhs(negative, -eq_offset)
 }
@@ -981,11 +974,9 @@ impl Device for Vdmos {
             let offset = qpcurrent - diag * qpvoltage - coupling * context.node_voltage(dp)
                 + coupling * context.node_voltage(de);
             context.stamp_rhs(qpnode, -offset)?;
-            context.stamp_fixed([
-                (qpnode, qpnode, diag),
-                (qpnode, dp, coupling),
-                (qpnode, de, -coupling),
-            ])?;
+            context.stamp(qpnode, qpnode, diag)?;
+            context.stamp(qpnode, dp, coupling)?;
+            context.stamp(qpnode, de, -coupling)?;
             if let Some([tj, _]) = self.thermal {
                 // Qp relaxation and stored-charge rate both depend on Tj;
                 // the same analytic kernel derivatives also feed AC.
