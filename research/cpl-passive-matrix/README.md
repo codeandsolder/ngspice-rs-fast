@@ -203,3 +203,36 @@ Additional reproductions:
 
     uv run --no-project --offline --with numpy --with scipy python split_delay_modal.py
     uv run --no-project --offline --with numpy --with scipy python scattering_split.py
+
+## Adaptive section count without violating passivity
+
+The exact-delay Strang splitting stage count must be chosen for the
+driving waveform's relevant frequency bandwidth and material losses,
+not fixed at 64 or any other unexplained number. An error-gated
+prototype in adaptive_split.py compares the physically passive
+power-normalized scattering of N and 2N stages at 21 log-spaced training
+frequencies. It selects the *2N-stage physical network itself* once
+their maximum relative difference falls below 0.1% (or returns a
+nonconverged result when reaching the configured cap); it never
+extrapolates admittance/scattering coefficients, which could break
+passivity. Tests on a separate 42-frequency holdout grid compare
+selected S against exact continuous RLGC S:
+
+| Validated model | Selected stages | Maximum relative holdout S error |
+| --- | ---: | ---: |
+| Pure lossless scalar | 1 (exact analytical) | <1e-12 |
+| R>0, G=0 high-Q scalar | 512 | 0.0141% |
+| R>0, G>0 scalar | 256 | 0.0566% |
+| Coupled noncommuting 3-wire | 64 | 0.0376% |
+| Coupled noncommuting 8-wire | 32 | 0.0169% |
+
+All converged with a 0.1% coarse-versus-fine training tolerance,
+and the final passive networks remained contractive on holdouts.
+The high-Q G=0 case required 512 sections, illustrating that error
+tolerance alone cannot justify a fixed low iteration cap. The
+coarse/fine criterion is *a heuristic finite-band error estimator*:
+it does not certify all frequencies or time waveforms. For production,
+derive checked frequency coverage from the actual transient source
+bandwidth, identify poles/breakpoints, and ensure absolute as well as
+relative tolerances are meaningful near resonances. Preserve the exact
+physical pure delay at all selected resolutions.

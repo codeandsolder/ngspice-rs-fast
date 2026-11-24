@@ -1,0 +1,190 @@
+{
+  "scalar_lossless": {
+    "selected_cells": 1,
+    "converged_on_training_grid": true,
+    "training_estimates": [
+      {
+        "analytic_lossless_exact": true
+      }
+    ],
+    "independent_max_scatter_error": 9.890615932195819e-14,
+    "max_scattering_passivity_eigen_excess": 4.440892098500626e-16,
+    "first_arrival_lower_bound_seconds": 1.0000000000000001e-07
+  },
+  "scalar_zero_G": {
+    "selected_cells": 512,
+    "converged_on_training_grid": true,
+    "training_estimates": [
+      {
+        "coarse": 1,
+        "fine": 2,
+        "max_scatter_difference": 0.29559589139616255
+      },
+      {
+        "coarse": 2,
+        "fine": 4,
+        "max_scatter_difference": 0.27845583348342395
+      },
+      {
+        "coarse": 4,
+        "fine": 8,
+        "max_scatter_difference": 0.1529357615939915
+      },
+      {
+        "coarse": 8,
+        "fine": 16,
+        "max_scatter_difference": 0.036095004348968306
+      },
+      {
+        "coarse": 16,
+        "fine": 32,
+        "max_scatter_difference": 0.021714996861327496
+      },
+      {
+        "coarse": 32,
+        "fine": 64,
+        "max_scatter_difference": 0.009976315059479973
+      },
+      {
+        "coarse": 64,
+        "fine": 128,
+        "max_scatter_difference": 0.0017268366087269716
+      },
+      {
+        "coarse": 128,
+        "fine": 256,
+        "max_scatter_difference": 0.001298882166055324
+      },
+      {
+        "coarse": 256,
+        "fine": 512,
+        "max_scatter_difference": 0.00046254111331460587
+      }
+    ],
+    "independent_max_scatter_error": 0.0001407634967397787,
+    "max_scattering_passivity_eigen_excess": -4.998973457404077e-10,
+    "first_arrival_lower_bound_seconds": 1.0000000000000001e-07
+  },
+  "scalar_lossy": {
+    "selected_cells": 256,
+    "converged_on_training_grid": true,
+    "training_estimates": [
+      {
+        "coarse": 1,
+        "fine": 2,
+        "max_scatter_difference": 0.19923548663141533
+      },
+      {
+        "coarse": 2,
+        "fine": 4,
+        "max_scatter_difference": 0.18759822222227046
+      },
+      {
+        "coarse": 4,
+        "fine": 8,
+        "max_scatter_difference": 0.1019018785731705
+      },
+      {
+        "coarse": 8,
+        "fine": 16,
+        "max_scatter_difference": 0.024393513874176986
+      },
+      {
+        "coarse": 16,
+        "fine": 32,
+        "max_scatter_difference": 0.015221182487012505
+      },
+      {
+        "coarse": 32,
+        "fine": 64,
+        "max_scatter_difference": 0.00690976025862083
+      },
+      {
+        "coarse": 64,
+        "fine": 128,
+        "max_scatter_difference": 0.0012068839920043406
+      },
+      {
+        "coarse": 128,
+        "fine": 256,
+        "max_scatter_difference": 0.000896123166083264
+      }
+    ],
+    "independent_max_scatter_error": 0.0005655162912026112,
+    "max_scattering_passivity_eigen_excess": -0.1809967006615566,
+    "first_arrival_lower_bound_seconds": 1.0000000000000001e-07
+  },
+  "noncommuting_three": {
+    "selected_cells": 64,
+    "converged_on_training_grid": true,
+    "training_estimates": [
+      {
+        "coarse": 1,
+        "fine": 2,
+        "max_scatter_difference": 0.5062030352484085
+      },
+      {
+        "coarse": 2,
+        "fine": 4,
+        "max_scatter_difference": 0.32669593865567154
+      },
+      {
+        "coarse": 4,
+        "fine": 8,
+        "max_scatter_difference": 0.17492489019151758
+      },
+      {
+        "coarse": 8,
+        "fine": 16,
+        "max_scatter_difference": 0.06543102697145264
+      },
+      {
+        "coarse": 16,
+        "fine": 32,
+        "max_scatter_difference": 0.005410330873324439
+      },
+      {
+        "coarse": 32,
+        "fine": 64,
+        "max_scatter_difference": 0.000891608159060215
+      }
+    ],
+    "independent_max_scatter_error": 0.00037596918896118446,
+    "max_scattering_passivity_eigen_excess": -0.023271309621846425,
+    "first_arrival_lower_bound_seconds": 3.143649285468629e-09
+  },
+  "noncommuting_eight": {
+    "selected_cells": 32,
+    "converged_on_training_grid": true,
+    "training_estimates": [
+      {
+        "coarse": 1,
+        "fine": 2,
+        "max_scatter_difference": 0.20303361849121015
+      },
+      {
+        "coarse": 2,
+        "fine": 4,
+        "max_scatter_difference": 0.112477554010323
+      },
+      {
+        "coarse": 4,
+        "fine": 8,
+        "max_scatter_difference": 0.014627373613814226
+      },
+      {
+        "coarse": 8,
+        "fine": 16,
+        "max_scatter_difference": 0.00209534161339352
+      },
+      {
+        "coarse": 16,
+        "fine": 32,
+        "max_scatter_difference": 0.00046732305995117327
+      }
+    ],
+    "independent_max_scatter_error": 0.00016854535036926797,
+    "max_scattering_passivity_eigen_excess": -0.013907657894376646,
+    "first_arrival_lower_bound_seconds": 1.1183281259984254e-09
+  }
+}
