@@ -11,8 +11,11 @@ use model_kernel_vdmos::{Bias, Evaluation, Instance, Polarity, PreparedModel, co
 use crate::devices::limiting::{Limiter, Linearization, critical_voltage};
 use crate::devices::linear::LinearContext;
 use crate::devices::models::{ModelContext, PreparationKey, ResolvedModel};
+use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::traits::{Device, StampContext};
+use crate::devices::{DeviceState, IterationPhase};
 use crate::maths::Vector;
+use crate::maths::integrator::{Coefficients, Companion};
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
@@ -25,10 +28,42 @@ pub struct Vdmos {
     terminals: [NodeId; 3],
     inner: [NodeId; 3],
     diode_prime: NodeId,
+    qp: Option<NodeId>,
     model: Arc<PreparedModel>,
     multiplier: Real,
     temperature: Option<Real>,
     dtemp: Real,
+}
+
+// Charge and derivative pairs are followed by one junction-limiting slot.
+const QGS: usize = 0;
+const QGD: usize = 2;
+const QDIO: usize = 4;
+const DIODE_VOLTAGE: usize = 6;
+const QP_CHARGE: usize = 7;
+const STATE_COUNT: usize = 9;
+
+fn charge_companion(
+    branch: ChargeBranch,
+    states: &mut DeviceState<'_>,
+    coefficients: Option<&Coefficients>,
+    initial: bool,
+) -> SpiceResult<Option<Companion>> {
+    let companion = if let Some(coefficients) = coefficients {
+        if initial {
+            branch.seed(states)?;
+        }
+        let integrated = branch.integrate(states, coefficients)?;
+        if initial {
+            branch.seed_derivative(states, integrated.derivative)?;
+        }
+        Some(integrated)
+    } else {
+        branch.zero_derivative(states)?;
+        None
+    };
+    branch.store(states)?;
+    Ok(companion)
 }
 
 fn invalid(source: impl std::fmt::Display, what: impl std::fmt::Display) -> SpiceError {
@@ -185,12 +220,19 @@ impl Vdmos {
                 node(terminals[2], "source", series.rs > 0.0)?,
             ];
             let diode_prime = node(terminals[2], "body_diode", series.rb > 0.0)?;
+            let diode = shared.parameters().diode;
+            let qp = if diode.vp > 0.0 && diode.tt > 0.0 {
+                Some(node(NodeId::GROUND, "qp", true)?)
+            } else {
+                None
+            };
             Ok(Self {
                 name: instance.name.clone(),
                 model_name: resolved.card().name.clone(),
                 terminals,
                 inner,
                 diode_prime,
+                qp,
                 model: shared,
                 multiplier,
                 temperature,
@@ -217,7 +259,10 @@ impl Vdmos {
             vds: d - s,
             vds_external: d_external - s_external,
             vdiode: diode,
-            recovery_node: 0.0,
+            recovery_node: self.qp.map_or(0.0, |qp| {
+                let polarity = self.model.parameters().polarity.sign();
+                polarity * voltage(qp)
+            }),
             temperature: self.kelvin(celsius),
         })
     }
@@ -330,7 +375,18 @@ impl Device for Vdmos {
         true
     }
     fn state_count(&self) -> usize {
-        1
+        if self.qp.is_some() {
+            STATE_COUNT
+        } else {
+            QP_CHARGE
+        }
+    }
+    fn truncation_slots(&self) -> Vec<usize> {
+        let mut slots = vec![QGS, QGD, QDIO];
+        if self.qp.is_some() {
+            slots.push(QP_CHARGE);
+        }
+        slots
     }
 
     fn observation_operating(
@@ -358,15 +414,6 @@ impl Device for Vdmos {
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        if self.model.parameters().diode.vp > 0.0 && self.model.parameters().diode.tt > 0.0 {
-            return Err(SpiceError::not_yet_ported(
-                format!(
-                    "{}: reverse-recovery Qp small-signal hidden state",
-                    self.name
-                ),
-                "src/spicelib/devices/vdmos/vdmosacld.c",
-            ));
-        }
         let voltage = |node: NodeId| {
             context
                 .unknowns
@@ -397,6 +444,37 @@ impl Device for Vdmos {
         )?;
         context.nodal([g, s], result.qgs.d_voltage, true)?;
         context.nodal([g, d], result.qgd.d_voltage, true)?;
+        if let Some(qpnode) = self.qp {
+            let recovery = result
+                .diode
+                .recovery
+                .ok_or_else(|| invalid(&self.name, "missing Qp kernel"))?;
+            let qp_row = context
+                .unknowns
+                .node_row(qpnode)
+                .ok_or_else(|| invalid(&self.name, "missing Qp MNA row"))?;
+            context.system.a.add(qp_row, qp_row, recovery.d_node)?;
+            context
+                .system
+                .e
+                .add(qp_row, qp_row, recovery.stored_charge.d_voltage)?;
+            let polarity = self.model.parameters().polarity.sign();
+            let coupling = polarity * recovery.d_voltage;
+            for (node, value) in [(dp, coupling), (de, -coupling)] {
+                if let Some(column) = context.unknowns.node_row(node) {
+                    context.system.a.add(qp_row, column, value)?;
+                }
+            }
+            // Source-to-drain body-diode charge-rate coupling; C VDMOSacLoad
+            // adds +(1-VP)*s at the physical diode-positive/Qp matrix entry.
+            let gain =
+                polarity * recovery.diode_charge_rate_gain * recovery.stored_charge.d_voltage;
+            for (node, sign) in [(dp, 1.0), (de, -1.0)] {
+                if let Some(row) = context.unknowns.node_row(node) {
+                    context.system.e.add(row, qp_row, sign * gain)?;
+                }
+            }
+        }
         let series = result.series;
         if de != d {
             let conductance = series
@@ -439,13 +517,9 @@ impl Device for Vdmos {
                 "VDMOS AC loads use small-signal assembly",
             ));
         }
-        if context.mode.is_transient() {
-            return Err(SpiceError::not_yet_ported(
-                format!(
-                    "{}: VDMOS charge and reverse-recovery companion integration",
-                    self.name
-                ),
-                "src/spicelib/devices/vdmos/vdmosload.c",
+        if context.mode.is_transient() && context.integration.is_none() {
+            return Err(SpiceError::circuit(
+                "VDMOS transient charge needs integration coefficients",
             ));
         }
         let [d, g, s] = self.inner;
@@ -462,9 +536,13 @@ impl Device for Vdmos {
         let raw_normal = polarity * raw_vdiode;
         let normal = match limiter.mode() {
             Linearization::Initial => 0.0,
+            Linearization::InitialTransient => context
+                .states
+                .accepted(1, DIODE_VOLTAGE)
+                .unwrap_or(raw_normal),
             _ => limiter.pn_junction(
                 raw_normal,
-                limiter.previous(&context.states, 0),
+                limiter.previous(&context.states, DIODE_VOLTAGE),
                 8.617_333_262_145e-5 * kelvin * self.model.parameters().diode.n,
                 self.diode_critical(kelvin),
             ),
@@ -475,11 +553,96 @@ impl Device for Vdmos {
             vds: context.node_voltage(d) - context.node_voltage(s),
             vds_external: context.node_voltage(de) - context.node_voltage(se),
             vdiode,
-            recovery_node: 0.0,
+            recovery_node: self
+                .qp
+                .map_or(0.0, |qp| polarity * context.node_voltage(qp)),
             temperature: kelvin,
         })?;
         let channel = result.channel;
         let drain_drop = context.node_voltage(de) - context.node_voltage(d);
+        let initial =
+            context.states.phase() == IterationPhase::Predict && context.states.initial_transient();
+        let qs = ChargeBranch::new(QGS, result.qgs.value, result.qgs.d_voltage);
+        let qd = ChargeBranch::new(QGD, result.qgd.value, result.qgd.d_voltage);
+        let qdio = ChargeBranch::new(
+            QDIO,
+            result.diode.depletion.value + result.diode.diffusion.value,
+            result.diode.depletion.d_voltage + result.diode.diffusion.d_voltage,
+        );
+        let gs = charge_companion(qs, &mut context.states, context.integration, initial)?;
+        let gd = charge_companion(qd, &mut context.states, context.integration, initial)?;
+        let diode_comp = charge_companion(qdio, &mut context.states, context.integration, initial)?;
+        if let Some(qpnode) = self.qp {
+            let recovery = result
+                .diode
+                .recovery
+                .ok_or_else(|| invalid(&self.name, "Qp node without recovery law"))?;
+            // C's internal Qp voltage is in physical polarity while the kernel
+            // exposes a polarity-normalized charge. Multiplying the stored
+            // charge and scalar residual by polarity gives one MNA voltage
+            // variable independent of N/P conventions.
+            let qpcharge = ChargeBranch::new(
+                QP_CHARGE,
+                polarity * recovery.stored_charge.value,
+                recovery.stored_charge.d_voltage,
+            );
+            let qpcomp =
+                charge_companion(qpcharge, &mut context.states, context.integration, initial)?;
+            let qpvoltage = context.node_voltage(qpnode);
+            let coupling = polarity * recovery.d_voltage;
+            let diag = recovery.d_node + qpcomp.map_or(0.0, |charge| charge.conductance);
+            let qpcurrent = polarity * recovery.residual
+                + qpcomp.map_or(0.0, |charge| charge.derivative)
+                + coupling * (raw_vdiode - vdiode);
+            let offset = qpcurrent - diag * qpvoltage - coupling * context.node_voltage(dp)
+                + coupling * context.node_voltage(de);
+            context.stamp_rhs(qpnode, -offset)?;
+            context.stamp(qpnode, qpnode, diag)?;
+            context.stamp(qpnode, dp, coupling)?;
+            context.stamp(qpnode, de, -coupling)?;
+            // Current from body diode's positive prime node to external drain.
+            // The corrected kernel gain is normalized to physical direction.
+            if let Some(charge) = qpcomp {
+                let gain = polarity * recovery.diode_charge_rate_gain;
+                stamp_branch(
+                    context,
+                    dp,
+                    de,
+                    gain * charge.derivative,
+                    [
+                        (qpnode, gain * charge.conductance),
+                        (NodeId::GROUND, 0.0),
+                        (NodeId::GROUND, 0.0),
+                    ],
+                )?;
+            }
+        }
+        if let Some(c) = gs {
+            stamp_branch(
+                context,
+                g,
+                s,
+                c.derivative,
+                [
+                    (g, c.conductance),
+                    (s, -c.conductance),
+                    (NodeId::GROUND, 0.0),
+                ],
+            )?;
+        }
+        if let Some(c) = gd {
+            stamp_branch(
+                context,
+                g,
+                d,
+                c.derivative,
+                [
+                    (g, c.conductance),
+                    (d, -c.conductance),
+                    (NodeId::GROUND, 0.0),
+                ],
+            )?;
+        }
         stamp_branch(
             context,
             d,
@@ -491,10 +654,15 @@ impl Device for Vdmos {
                 (s, -channel.d_vgs - channel.d_vds),
             ],
         )?;
-        let gd = result.diode.current.d_voltage + context.gmin;
+        let gd = result.diode.current.d_voltage
+            + context.gmin
+            + diode_comp.map_or(0.0, |charge| charge.conductance);
         // The equivalent current is linearized at the limited diode voltage,
-        // even though the matrix columns are the actual node coordinates.
-        let idio = result.diode.current.value + context.gmin * vdiode + gd * (raw_vdiode - vdiode);
+        // including its independent charge companion and actual MNA nodes.
+        let idio = result.diode.current.value
+            + context.gmin * vdiode
+            + diode_comp.map_or(0.0, |charge| charge.derivative)
+            + gd * (raw_vdiode - vdiode);
         stamp_branch(
             context,
             dp,
@@ -535,6 +703,6 @@ impl Device for Vdmos {
             }
         }
         resistor(context, de, se, series.shunt)?;
-        limiter.finish(&mut context.states, &[(0, normal)])
+        limiter.finish(&mut context.states, &[(DIODE_VOLTAGE, normal)])
     }
 }

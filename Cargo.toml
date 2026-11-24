@@ -104,7 +104,7 @@ petgraph = "0.8.3"
 [dependencies]
 winnow.workspace = true
 petgraph.workspace = true
-model-kernel-vdmos = { git = "https://github.com/codeandsolder/spice-redox", rev = "c59c964798789343cfab374ff7a28d1d24b2f538" }
+model-kernel-vdmos = { git = "https://github.com/codeandsolder/spice-redox", rev = "0b5219b52217535e873573a43709341e3bd8dcee" }
 
 [dev-dependencies]
 ngspice-conformance = { path = "conformance/support" }

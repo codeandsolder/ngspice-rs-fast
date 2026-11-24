@@ -54,7 +54,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "model-kernel-vdmos"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/spice-redox?rev=c59c964798789343cfab374ff7a28d1d24b2f538#c59c964798789343cfab374ff7a28d1d24b2f538"
+source = "git+https://github.com/codeandsolder/spice-redox?rev=0b5219b52217535e873573a43709341e3bd8dcee#0b5219b52217535e873573a43709341e3bd8dcee"
 
 [[package]]
 name = "ngspice-conformance"
