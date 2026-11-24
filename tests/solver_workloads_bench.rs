@@ -83,7 +83,7 @@ fn parameter_ensemble() {
 fn independent_complex_factor_crossover() {
     use std::hint::black_box;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use ngspice_rs::maths::complex::{ComplexMatrix, IndependentComplexBatch};
     use ngspice_rs::maths::{Pattern, SparseMatrix};
