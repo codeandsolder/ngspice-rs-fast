@@ -184,13 +184,13 @@ impl WaveformHistory {
 
     /// Number of samples.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.times.len()
     }
 
     /// True before the transient start initialized the history.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.times.is_empty()
     }
 

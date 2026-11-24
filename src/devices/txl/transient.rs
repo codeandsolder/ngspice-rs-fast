@@ -337,13 +337,13 @@ impl TxlUpdate {
 impl TxlHistory {
     /// Number of accepted waveform points.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.samples.len()
     }
 
     /// Whether transient initialization has supplied a waveform.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
 

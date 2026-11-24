@@ -317,13 +317,13 @@ impl Registry {
 
     /// Number of known designators.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True when no designators are known.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
