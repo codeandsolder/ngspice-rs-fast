@@ -14,8 +14,11 @@ bulk-current check rejects only when it is **strictly greater**. An off
 instance bypasses the check only under MODEINITFIX. Preserve all junction
 selection, model signs, and NaN-sensitive C-style MAX arguments.
 
-Predictor sums may use fused multiply-add to improve cancellation accuracy.
-The convergence tolerance is *not* fused: it first rounds the relative
+Predictor sums use hardware FMA for cancellation accuracy only when the
+requested compilation target enables the FMA target feature. On baseline
+x86-64/x86-64-v2, they use ordinary multiply/add rather than costly software
+FMA. This is a compile-time choice with no runtime dispatch or intermediate
+allocation. The convergence tolerance is *never* fused: it first rounds the relative
 product in binary64, then adds absolute tolerance in binary64. The local
 **convergence_tolerance** function preserves this behavior.
 

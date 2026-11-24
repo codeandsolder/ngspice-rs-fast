@@ -1,6 +1,6 @@
 //! `b4cvtest.c` (`BSIM4convTest`): the device convergence test, followed
 //! statement by statement over C's struct members.
-// Source-ordered current predictors use fused arithmetic; C's two-round
+// Current predictors select hardware FMA when available; C's two-round
 // convergence tolerances and strict comparison operators remain unchanged.
 #![expect(
     clippy::similar_names,
@@ -16,6 +16,20 @@ use super::host::{mode, state};
 /// C's `MAX` for the tolerance bases.
 fn max(a: f64, b: f64) -> f64 {
     if a > b { a } else { b }
+}
+
+/// Compile-time FMA selection: only request the fused instruction when
+/// the requested CPU target provides hardware FMA. Generic builds must
+/// not invoke the much slower software floating-point FMA implementation.
+/// Both alternatives accumulate the terms in their original C order.
+#[inline(always)]
+fn predictor_term(gain: f64, delta: f64, sum: f64) -> f64 {
+    if cfg!(target_feature = "fma") {
+        gain.mul_add(delta, sum)
+    } else {
+        let product = gain * delta;
+        sum + product
+    }
 }
 
 /// Preserve the two C rounding steps before the discontinuous convergence
@@ -75,83 +89,111 @@ pub(super) fn conv_test(
     let (Idtot, cdhat, Igstot, cgshat, Igdtot, cgdhat, Igbtot, cgbhat);
     if h.mode >= 0 {
         Idtot = h.cd + h.csub - h.cbd + h.Igidl;
-        cdhat = (h.gds + h.gbds + h.ggidld).mul_add(
+        cdhat = predictor_term(
+            h.gds + h.gbds + h.ggidld,
             delvds,
-            (h.gm + h.gbgs + h.ggidlg).mul_add(
+            predictor_term(
+                h.gm + h.gbgs + h.ggidlg,
                 delvgs,
-                (h.gmbs + h.gbbs + h.ggidlb).mul_add(delvbs, h.gbd.mul_add(-delvbd_jct, Idtot)),
+                predictor_term(
+                    h.gmbs + h.gbbs + h.ggidlb,
+                    delvbs,
+                    predictor_term(h.gbd, -delvbd_jct, Idtot),
+                ),
             ),
         );
         Igstot = h.Igs + h.Igcs;
-        cgshat = h.gIgcsb.mul_add(
+        cgshat = predictor_term(
+            h.gIgcsb,
             delvbs,
-            h.gIgcsd
-                .mul_add(delvds, (h.gIgsg + h.gIgcsg).mul_add(delvgs, Igstot)),
+            predictor_term(
+                h.gIgcsd,
+                delvds,
+                predictor_term(h.gIgsg + h.gIgcsg, delvgs, Igstot),
+            ),
         );
         Igdtot = h.Igd + h.Igcd;
-        cgdhat = h.gIgcdb.mul_add(
+        cgdhat = predictor_term(
+            h.gIgcdb,
             delvbs,
-            h.gIgcdd.mul_add(
+            predictor_term(
+                h.gIgcdd,
                 delvds,
-                h.gIgcdg.mul_add(delvgs, h.gIgdg.mul_add(delvgd, Igdtot)),
+                predictor_term(h.gIgcdg, delvgs, predictor_term(h.gIgdg, delvgd, Igdtot)),
             ),
         );
         Igbtot = h.Igb;
-        cgbhat = h.gIgbb.mul_add(
+        cgbhat = predictor_term(
+            h.gIgbb,
             delvbs,
-            h.gIgbd.mul_add(delvds, h.gIgbg.mul_add(delvgs, h.Igb)),
+            predictor_term(h.gIgbd, delvds, predictor_term(h.gIgbg, delvgs, h.Igb)),
         );
     } else {
         // C's own "bugfix" spelling of the reverse-mode drain current.
         Idtot = h.cd + h.cbd - h.Igidl;
-        cdhat = h.ggidlb.mul_add(
+        cdhat = predictor_term(
+            h.ggidlb,
             -delvbs,
-            h.ggidlg.mul_add(
+            predictor_term(
+                h.ggidlg,
                 -delvgs,
-                (h.gds + h.ggidls).mul_add(
+                predictor_term(
+                    h.gds + h.ggidls,
                     -delvds,
-                    h.gm.mul_add(
+                    predictor_term(
+                        h.gm,
                         delvgd,
-                        h.gmbs.mul_add(delvbd, h.gbd.mul_add(delvbd_jct, Idtot)),
+                        predictor_term(h.gmbs, delvbd, predictor_term(h.gbd, delvbd_jct, Idtot)),
                     ),
                 ),
             ),
         );
         Igstot = h.Igs + h.Igcd;
-        cgshat = h.gIgcdb.mul_add(
+        cgshat = predictor_term(
+            h.gIgcdb,
             delvbd,
-            h.gIgcdd.mul_add(
+            predictor_term(
+                h.gIgcdd,
                 -delvds,
-                h.gIgcdg.mul_add(delvgd, h.gIgsg.mul_add(delvgs, Igstot)),
+                predictor_term(h.gIgcdg, delvgd, predictor_term(h.gIgsg, delvgs, Igstot)),
             ),
         );
         Igdtot = h.Igd + h.Igcs;
-        cgdhat = h.gIgcsb.mul_add(
+        cgdhat = predictor_term(
+            h.gIgcsb,
             delvbd,
-            h.gIgcsd
-                .mul_add(-delvds, (h.gIgdg + h.gIgcsg).mul_add(delvgd, Igdtot)),
+            predictor_term(
+                h.gIgcsd,
+                -delvds,
+                predictor_term(h.gIgdg + h.gIgcsg, delvgd, Igdtot),
+            ),
         );
         Igbtot = h.Igb;
-        cgbhat = h.gIgbb.mul_add(
+        cgbhat = predictor_term(
+            h.gIgbb,
             delvbd,
-            h.gIgbd.mul_add(-delvds, h.gIgbg.mul_add(delvgd, h.Igb)),
+            predictor_term(h.gIgbd, -delvds, predictor_term(h.gIgbg, delvgd, h.Igb)),
         );
     }
 
     let Isestot = h.gstot * (state0(state::VSES));
-    let cseshat = h.gstotb.mul_add(
+    let cseshat = predictor_term(
+        h.gstotb,
         delvbs,
-        h.gstotg.mul_add(
+        predictor_term(
+            h.gstotg,
             delvgs,
-            h.gstotd.mul_add(delvds, h.gstot.mul_add(delvses, Isestot)),
+            predictor_term(h.gstotd, delvds, predictor_term(h.gstot, delvses, Isestot)),
         ),
     );
     let Idedtot = h.gdtot * vdedo;
-    let cdedhat = h.gdtotb.mul_add(
+    let cdedhat = predictor_term(
+        h.gdtotb,
         delvbs,
-        h.gdtotg.mul_add(
+        predictor_term(
+            h.gdtotg,
             delvgs,
-            h.gdtotd.mul_add(delvds, h.gdtot.mul_add(delvded, Idedtot)),
+            predictor_term(h.gdtotd, delvds, predictor_term(h.gdtot, delvded, Idedtot)),
         ),
     );
 
@@ -177,19 +219,29 @@ pub(super) fn conv_test(
         }
         let Ibtot = h.cbs + h.cbd - h.Igidl - h.Igisl - h.csub;
         let cbhat = if h.mode >= 0 {
-            h.ggisls.mul_add(
+            predictor_term(
+                h.ggisls,
                 delvds,
-                h.ggislb.mul_add(
+                predictor_term(
+                    h.ggislb,
                     -delvbd,
-                    h.ggislg.mul_add(
+                    predictor_term(
+                        h.ggislg,
                         -delvgd,
-                        (h.gbds + h.ggidld).mul_add(
+                        predictor_term(
+                            h.gbds + h.ggidld,
                             -delvds,
-                            (h.gbgs + h.ggidlg).mul_add(
+                            predictor_term(
+                                h.gbgs + h.ggidlg,
                                 -delvgs,
-                                (h.gbbs + h.ggidlb).mul_add(
+                                predictor_term(
+                                    h.gbbs + h.ggidlb,
                                     -delvbs,
-                                    h.gbs.mul_add(delvbs_jct, h.gbd.mul_add(delvbd_jct, Ibtot)),
+                                    predictor_term(
+                                        h.gbs,
+                                        delvbs_jct,
+                                        predictor_term(h.gbd, delvbd_jct, Ibtot),
+                                    ),
                                 ),
                             ),
                         ),
@@ -197,17 +249,26 @@ pub(super) fn conv_test(
                 ),
             )
         } else {
-            h.ggidlb.mul_add(
+            predictor_term(
+                h.ggidlb,
                 -delvbs,
-                h.ggidlg.mul_add(
+                predictor_term(
+                    h.ggidlg,
                     -delvgs,
-                    (h.gbds + h.ggisld - h.ggidls).mul_add(
+                    predictor_term(
+                        h.gbds + h.ggisld - h.ggidls,
                         delvds,
-                        (h.gbgs + h.ggislg).mul_add(
+                        predictor_term(
+                            h.gbgs + h.ggislg,
                             -delvgd,
-                            (h.gbbs + h.ggislb).mul_add(
+                            predictor_term(
+                                h.gbbs + h.ggislb,
                                 -delvbd,
-                                h.gbd.mul_add(delvbd_jct, h.gbs.mul_add(delvbs_jct, Ibtot)),
+                                predictor_term(
+                                    h.gbd,
+                                    delvbd_jct,
+                                    predictor_term(h.gbs, delvbs_jct, Ibtot),
+                                ),
                             ),
                         ),
                     ),
@@ -226,7 +287,7 @@ pub(super) fn conv_test(
 mod tests {
     use super::super::acld::tests::shaped;
     use super::super::host::{mode, node, state};
-    use super::{Model, conv_test, convergence_tolerance};
+    use super::{Model, conv_test, convergence_tolerance, predictor_term};
 
     fn run(h: &super::Instance, rhs: &[f64; node::COUNT], s0: &[f64; state::COUNT]) -> bool {
         let m = Model {
@@ -326,6 +387,22 @@ mod tests {
                 "bulk predictor: conductance={increment:.17e}"
             );
         }
+    }
+
+    #[test]
+    fn predictor_uses_hardware_fma_only_when_the_compilation_target_has_it() {
+        let e = 2_f64.powi(-27);
+        let result = predictor_term(1. + e, 1. - e, -1.);
+        let expected = if cfg!(target_feature = "fma") {
+            -2_f64.powi(-54)
+        } else {
+            0.
+        };
+        assert_eq!(
+            result.to_bits(),
+            expected.to_bits(),
+            "predictor result for compile-time target feature fma"
+        );
     }
 
     #[test]
