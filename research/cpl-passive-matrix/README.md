@@ -236,3 +236,66 @@ derive checked frequency coverage from the actual transient source
 bandwidth, identify poles/breakpoints, and ensure absolute as well as
 relative tolerances are meaningful near resonances. Preserve the exact
 physical pure delay at all selected resolutions.
+
+## Causal accepted-history time-domain modal scattering prototype
+
+The pure Python reference time_scattering.py now implements an actual
+time-domain network of static, passive full-coupling R/G scattering cells
+connected by exact per-mode LC delay lines (including half-length
+boundary stages). It does not need any complex frequency-domain
+fit to run a timestep: each static block has a constant real
+power-normalized scattering matrix, and each LC link reads the
+previously accepted mode wave at t minus its exact modal delay.
+A candidate step computes every cell's output from accepted history
+only, then commits the entire network's wave arrays on acceptance.
+A rejected/stale trial cannot change accepted state.
+
+**An important interpolation caveat was found experimentally**:
+ordinary linear interpolation between samples of a delayed
+signal can leak a positive sample backwards through the physical
+front. Even a network made exclusively of exact delay factors can
+exhibit a numerically premature wavefront if the history reader
+interpolates across an arrival discontinuity. We fixed the
+interpolation model, rather than clipping simulated output:
+compute the **first physically reachable arrival of each modal
+output** by shortest-path traversal of the passive scattering graph.
+Each edge is an exact mode-dependent propagation delay, and each
+static matrix coefficient is an instantaneous directed connection.
+WaveHistory sampling returns its physical zero prehistory for query
+times strictly before that reachable front; interpolation begins
+at or after the front. This automatically accommodates actual
+cross-mode scattering and reflection paths, arbitrary cell counts,
+zero shunt/series loss, and unequal modal delays.
+
+test_time_scattering.py verifies lossless matched step/ramp for
+1/4/16/32 cells (no reflection, **strict zero prearrival**, complete
+transmission after the physical delay), lossy scalar R-only/RG
+and three-wire noncommuting R/L/G/C (coupled crosstalk but strictly
+zero before earliest allowed far-end arrival), energy inequality
+and rejection of outdated candidate trials. Numerical results
+are captured in time_scattering.json.
+
+test_frequency_time.py provides an independent Fourier-domain
+consistency test: drive a matched cable with a sine wave in the
+time-domain accepted-history simulator, then recover its modal
+transmission phasor from the final four cycles via sine/cosine
+least squares. Compare with independently star-composed
+**complex AC scattering S21**. With 8 static cells and omega=2e9
+rad/s, the maximum relative phasor discrepancies are:
+
+- scalar lossless: 5.91e-6
+- scalar lossy RLGC: 5.91e-6
+- noncommuting three-wire, full modal coupling: 2.92e-6
+
+All have physical early-front bounds and input energy exceeding
+emitted energy for the sampled tests. Per-mode delay interpolation
+and finite timestep introduce those tiny remaining discrepancies;
+they are not unexplained complex transfer coefficients.
+
+This Python simulator is a verified standalone research reference,
+not yet linked into native Rust DeviceState/MNA. The retained wave
+arrays can be pruned to bounded delay horizons, with careful retention
+of interpolation brackets and physical-front metadata. The Rust h1
+prototype separately demonstrates accepted-state owner/revision
+transactions; the same semantics should be used when implementing
+the full network in Rust.

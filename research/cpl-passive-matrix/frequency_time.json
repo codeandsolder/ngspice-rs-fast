@@ -1,0 +1,57 @@
+{
+  "scalar_lossless": {
+    "n": 1,
+    "sections": 8,
+    "omega": 2000000000.0,
+    "dt": 1.5625000000000004e-11,
+    "steps": 4022,
+    "max_relative_phasor_error": 5.906231669976704e-06,
+    "phase_exact_rad": [
+      -2.0000000000000004
+    ],
+    "phase_transient_rad": [
+      -1.999999938664234
+    ],
+    "front_tau_min_seconds": 1.0000000000000003e-09,
+    "energy_input": 3.1415926535897964e-08,
+    "energy_output": 3.0827451256876536e-08
+  },
+  "scalar_RG": {
+    "n": 1,
+    "sections": 8,
+    "omega": 2000000000.0,
+    "dt": 1.5625000000000004e-11,
+    "steps": 4022,
+    "max_relative_phasor_error": 5.905293577683227e-06,
+    "phase_exact_rad": [
+      -2.000546205152393
+    ],
+    "phase_transient_rad": [
+      -2.000546141641556
+    ],
+    "front_tau_min_seconds": 1.0000000000000003e-09,
+    "energy_input": 3.1415926535897964e-08,
+    "energy_output": 2.7584542091342102e-08
+  },
+  "three_coupled": {
+    "n": 3,
+    "sections": 8,
+    "omega": 2000000000.0,
+    "dt": 1.964780803417893e-11,
+    "steps": 3198,
+    "max_relative_phasor_error": 2.914725924607654e-06,
+    "phase_exact_rad": [
+      -2.5222660139036885,
+      -2.9459068893207516,
+      2.843956964739075
+    ],
+    "phase_transient_rad": [
+      -2.522265988982408,
+      -2.9459054648776064,
+      2.8439967918180975
+    ],
+    "front_tau_min_seconds": 1.2574597141874516e-09,
+    "energy_input": 3.1415926535897845e-08,
+    "energy_output": 2.1099750199507666e-08
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "lossless": {
+    "1": {
+      "max_prearrival": 0.0,
+      "max_reflection": 0.0,
+      "transmission_at_2tau": 0.9999999999999999,
+      "energy_in": 2.0000000000000005e-09,
+      "energy_out": 8.750000000000002e-10,
+      "steps": 6,
+      "tau": 1.0000000000000003e-09
+    },
+    "4": {
+      "max_prearrival": 0.0,
+      "max_reflection": 0.0,
+      "transmission_at_2tau": 0.9999999999999994,
+      "energy_in": 1.9842223891810673e-09,
+      "energy_out": 9.285175026940897e-10,
+      "steps": 22,
+      "tau": 1.0000000000000003e-09
+    },
+    "16": {
+      "max_prearrival": 0.0,
+      "max_reflection": 0.0,
+      "transmission_at_2tau": 0.9999999999999996,
+      "energy_in": 1.9447092708818095e-09,
+      "energy_out": 9.288915414102399e-10,
+      "steps": 86,
+      "tau": 1.0000000000000003e-09
+    },
+    "32": {
+      "max_prearrival": 0.0,
+      "max_reflection": 0.0,
+      "transmission_at_2tau": 0.9999999999999967,
+      "energy_in": 1.9390713711881363e-09,
+      "energy_out": 9.3045407723646e-10,
+      "steps": 171,
+      "tau": 1.0000000000000003e-09
+    }
+  },
+  "lossy": {
+    "R_only": {
+      "exact_front_bound": 1.0000000000000003e-09,
+      "maximum_prearrival": 0.0,
+      "near_reflection_peak": 0.0059642090190245075,
+      "far_transmission_peak": 0.9940357852231247,
+      "near_crosstalk_peak": 0.0,
+      "far_crosstalk_peak": 0.0,
+      "energy_input": 2.881927490234376e-09,
+      "energy_out": 1.8595801877475817e-09
+    },
+    "RG": {
+      "exact_front_bound": 1.0000000000000003e-09,
+      "maximum_prearrival": 0.0,
+      "near_reflection_peak": 0.041648964996478514,
+      "far_transmission_peak": 0.9464217049877995,
+      "near_crosstalk_peak": 0.0,
+      "far_crosstalk_peak": 0.0,
+      "energy_input": 2.881927490234376e-09,
+      "energy_out": 1.687417324430287e-09
+    },
+    "3wire": {
+      "exact_front_bound": 1.2574597141874516e-09,
+      "maximum_prearrival": 0.0,
+      "near_reflection_peak": 0.1554783269641158,
+      "far_transmission_peak": 0.8396366302835283,
+      "near_crosstalk_peak": 0.009262345244389968,
+      "far_crosstalk_peak": 0.00988404866600587,
+      "energy_input": 3.623907718179077e-09,
+      "energy_out": 1.7026188398012523e-09
+    }
+  },
+  "rollback": true
+}
