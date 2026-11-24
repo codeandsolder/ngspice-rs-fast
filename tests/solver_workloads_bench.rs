@@ -83,7 +83,7 @@ fn parameter_ensemble() {
 fn independent_complex_factor_crossover() {
     use std::hint::black_box;
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use ngspice_rs::maths::complex::{ComplexMatrix, IndependentComplexBatch};
     use ngspice_rs::maths::{Pattern, SparseMatrix};
@@ -322,6 +322,117 @@ fn independent_complex_mesh_crossover() {
                 direct_elapsed.as_nanos(),
                 reference_elapsed.as_secs_f64() / direct_elapsed.as_secs_f64(),
             );
+        }
+    }
+}
+
+/// The #154 C-faithful real backward gather adds precision guards. Measure
+/// its retained-factor solve path independently of factorization, on both
+/// diagonal-dominant banded and fill-heavy mesh matrices. Opt-in only.
+#[test]
+#[ignore = "opt-in real SPARSE substitution scalar/batch performance"]
+fn real_backward_substitution_crossover() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use ngspice_rs::maths::linear::SolveBatchWorkspace;
+    use ngspice_rs::maths::{SparseLu, SparseMatrix, Vector};
+
+    for (shape, side, size) in [("ladder", 1_usize, 512_usize), ("mesh", 20, 400)] {
+        let mut matrix = SparseMatrix::new(size, size);
+        for index in 0..size {
+            matrix
+                .add(index, index, if side == 1 { 2. } else { 4. })
+                .unwrap();
+            let neighbors = [
+                (index + 1 < size && (side == 1 || (index + 1) % side != 0)).then_some(index + 1),
+                (side > 1 && index + side < size).then_some(index + side),
+            ];
+            for neighbor in neighbors.into_iter().flatten() {
+                matrix.add(index, neighbor, -0.375).unwrap();
+                matrix.add(neighbor, index, -0.375).unwrap();
+            }
+        }
+        matrix.fold_duplicates();
+        let factor = SparseLu::new(&matrix, None).unwrap();
+        let exact = Vector::from(
+            (0..size)
+                .map(|i| f64::from(u32::try_from(i % 23).unwrap()) / 13. - 0.75)
+                .collect::<Vec<_>>(),
+        );
+        let rhs = matrix.mul_vector(&exact).unwrap();
+        for transposed in [false, true] {
+            let reference = if transposed {
+                factor.solve_transposed(&rhs).unwrap()
+            } else {
+                factor.solve(&rhs).unwrap()
+            };
+            assert!(
+                reference
+                    .as_slice()
+                    .iter()
+                    .zip(exact.as_slice())
+                    .all(|(a, b)| (a - b).abs() < 1e-10)
+            );
+            for lanes in [1_usize, 4, 32] {
+                let samples = 16_u32;
+                let mut workspace = Vec::new();
+                let mut batch_workspace = SolveBatchWorkspace::default();
+                let mut batch_out = Vec::new();
+                let batch_rhs = rhs.as_slice().repeat(lanes);
+                factor
+                    .solve_batch_into(&batch_rhs, &mut batch_workspace, &mut batch_out, transposed)
+                    .unwrap();
+                assert!(batch_out.chunks_exact(size).all(|row| {
+                    row.iter()
+                        .zip(reference.as_slice())
+                        .all(|(a, b)| (a - b).abs() < 1e-10)
+                }));
+                let mut scalar_ns = Vec::new();
+                let mut batch_ns = Vec::new();
+                for _ in 0..3 {
+                    let begin = Instant::now();
+                    for _ in 0..samples {
+                        for _ in 0..lanes {
+                            let result = if transposed {
+                                factor
+                                    .solve_transposed_with_workspace(
+                                        black_box(&rhs),
+                                        &mut workspace,
+                                    )
+                                    .unwrap()
+                            } else {
+                                factor
+                                    .solve_with_workspace(black_box(&rhs), &mut workspace)
+                                    .unwrap()
+                            };
+                            black_box(result);
+                        }
+                    }
+                    scalar_ns.push(begin.elapsed().as_nanos() / u128::from(samples));
+                    let begin = Instant::now();
+                    for _ in 0..samples {
+                        factor
+                            .solve_batch_into(
+                                black_box(&batch_rhs),
+                                &mut batch_workspace,
+                                &mut batch_out,
+                                transposed,
+                            )
+                            .unwrap();
+                        black_box(batch_out.as_slice());
+                    }
+                    batch_ns.push(begin.elapsed().as_nanos() / u128::from(samples));
+                }
+                scalar_ns.sort_unstable();
+                batch_ns.sort_unstable();
+                println!(
+                    "bench=real_backward,shape={shape},n={size},transpose={transposed},rhs={lanes},scalar_ns={},batch_ns={},ratio={:.4}",
+                    scalar_ns[1],
+                    batch_ns[1],
+                    batch_ns[1] as f64 / scalar_ns[1] as f64
+                );
+            }
         }
     }
 }
