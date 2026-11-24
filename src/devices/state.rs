@@ -423,9 +423,8 @@ impl StateHistory {
         reused.mode = LoadMode::newton(phase);
         reused.previous = previous.map(|previous| Arc::clone(&previous.values));
         reused.nonconvergent = false;
-        reused.patches = previous
-            .map(|previous| previous.patches.clone())
-            .unwrap_or_default();
+        reused.patches =
+            previous.map_or_else(State1Patches::default, |previous| previous.patches.clone());
         Ok(reused)
     }
 
