@@ -97,6 +97,22 @@ sccache; opt-level=3. The original and rationalized paths return effective
 voltage, drain gap and both derivatives. Use black-boxed inputs and
 accumulate all four outputs to prevent elimination.
 
+A second run used the actual overflow-safe midpoint in the rationalized
+kernel, and compared otherwise identical fused and unfused discriminant
+expressions. Median user CPU seconds (three trials):
+
+| Target | Original | Rationalized + FMA | Rationalized, unfused |
+| --- | ---: | ---: | ---: |
+| native | 1.15 | 1.05 | 1.07 |
+| x86-64 | 1.21 | 1.41 | 1.16 |
+
+The portable fused path costs approximately 22% more than the same
+unfused path, while the native difference is about 2%. Concurrent
+campaign load changed CPU frequency between sessions, so compare
+within a session. FMA remains appropriate where it directly preserves
+a cancellation-sensitive derivative; these measurements do not
+justify globally substituting software FMA for ordinary additions.
+
 Focused reproduction:
 ```sh
 cargo +nightly test --locked --lib devices::bsim4
