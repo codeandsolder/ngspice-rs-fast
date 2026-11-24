@@ -12,6 +12,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::devices::linear::LinearContext;
+use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseFamily, NoiseSource};
 use crate::devices::traits::{AnalysisMode, Device, StampContext};
 use crate::maths::Vector;
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
@@ -66,7 +67,12 @@ impl Descriptor {
     /// # Errors
     /// Unsupported ABI, invalid or ambiguous schema and missing current laws.
     pub fn validate(&self) -> SpiceResult<()> {
-        if self.abi != ABI_VERSION || self.family.is_empty() || self.terminals < 2 {
+        if self.abi != ABI_VERSION
+            || self.family.is_empty()
+            || self.terminals < 2
+            || self.fingerprint == [0; 16]
+            || self.terminals.checked_mul(self.terminals).is_none()
+        {
             return Err(SpiceError::circuit(
                 "invalid prepared model ABI, family or terminals",
             ));
@@ -134,6 +140,26 @@ pub trait Kernel: Debug + Send + Sync + 'static {
         output: &mut batch::BatchOutput,
     ) -> SpiceResult<()> {
         batch::evaluate_scalar_tile(self, prepared, voltages, output)
+    }
+
+    /// Describe physical noise generators at a solved bias point. The engine
+    /// owns adjoint transfer gains and frequency integration; generators
+    /// belong to the external model family. Called outside Newton.
+    ///
+    /// # Errors
+    /// Missing family noise support or invalid model physics.
+    fn evaluate_noise(
+        &self,
+        _prepared: &Self::Prepared,
+        _voltages: &[Real],
+        _terminals: &[NodeId],
+        _context: &NoiseContext<'_>,
+        _sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<()> {
+        Err(SpiceError::Unsupported {
+            feature: "native model family has no noise kernel".into(),
+            location: None,
+        })
     }
 }
 
@@ -402,6 +428,17 @@ impl<K: Kernel> PreparedDevice<K> {
         self.with_parameter(slot, value)
     }
 
+    fn check_temperature(&self, context: Real) -> SpiceResult<()> {
+        if self.temperature.to_bits() == context.to_bits() {
+            Ok(())
+        } else {
+            Err(SpiceError::circuit(format!(
+                "{}: prepared model temperature changed; reprepare before solving",
+                self.name
+            )))
+        }
+    }
+
     fn check_charge(&self) -> SpiceResult<()> {
         if self.artifact.descriptor.charge == Capability::Unavailable {
             return Err(SpiceError::circuit(format!(
@@ -437,15 +474,12 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         }
     }
 
-    fn validate_dc_inputs(&self, _context: &crate::devices::ModelContext) -> SpiceResult<()> {
-        if self.temperature.is_finite() {
-            Ok(())
-        } else {
-            Err(SpiceError::circuit("invalid prepared-model temperature"))
-        }
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.check_temperature(context.temperature)
     }
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
+        self.check_temperature(context.temperature)?;
         if context.mode.is_ac() {
             return Err(SpiceError::circuit(
                 "prepared model AC requires small-signal assembly",
@@ -522,11 +556,51 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         Ok(())
     }
 
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
+        self.check_temperature(context.model_context.temperature)?;
+        match self.artifact.descriptor.noise {
+            Capability::Zero => Ok(DeviceNoise::Noiseless),
+            Capability::Unavailable => Err(SpiceError::Unsupported {
+                feature: format!("{}: missing prepared-model noise equations", self.name),
+                location: None,
+            }),
+            Capability::Computed => {
+                let mut voltage = self.voltage.borrow_mut();
+                for (value, &node) in voltage.iter_mut().zip(&self.terminals) {
+                    *value = context.voltage(node);
+                }
+                let start = sources.len();
+                self.artifact.kernel.evaluate_noise(
+                    &self.prepared,
+                    &voltage,
+                    &self.terminals,
+                    context,
+                    sources,
+                )?;
+                if sources.len() == start {
+                    return Err(SpiceError::circuit(
+                        "computed model noise has no generators",
+                    ));
+                }
+                Ok(DeviceNoise::Sources {
+                    family: NoiseFamily::Prepared,
+                    model: Some(&self.artifact.descriptor.family),
+                    total: sources.len() - start > 1,
+                })
+            }
+        }
+    }
+
     fn assemble_small_signal(
         &self,
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
+        self.check_temperature(context.model_context.temperature)?;
         self.check_charge()?;
         let width = self.terminals.len();
         let mut voltage = self.voltage.borrow_mut();

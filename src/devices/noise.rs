@@ -87,6 +87,8 @@ pub enum NoiseFamily {
     Resistor,
     /// `sw`, the S switch (`swnoise.c`).
     VoltageSwitch,
+    /// Native prepared model kernels, ordered after C's registered device types.
+    Prepared,
 }
 
 /// The physical law of one noise generator, evaluated at the bias point.

@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use ngspice_rs::analysis::{AnalysisContext, AnalysisInput};
+use ngspice_rs::devices::noise::{NoiseContext, NoiseKind, NoiseSource};
 use ngspice_rs::devices::prepared_model::batch::{BatchInput, BatchOutput, evaluate_tile};
 use ngspice_rs::devices::prepared_model::{
     ABI_VERSION, Artifact, Capability, Descriptor, Kernel, Parameter, Point,
@@ -81,6 +82,30 @@ impl Kernel for PolynomialKernel {
             .copy_from_slice(&[capacitance, -capacitance, -capacitance, capacitance]);
         Ok(())
     }
+
+    fn evaluate_noise(
+        &self,
+        prepared: &Polynomial,
+        voltages: &[Real],
+        terminals: &[NodeId],
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<()> {
+        let [positive, negative] = voltages else {
+            return Err(SpiceError::circuit("polynomial noise input shape mismatch"));
+        };
+        let voltage = positive - negative;
+        let conductance = prepared.g + 3. * prepared.cubic * voltage * voltage;
+        sources.push(NoiseSource {
+            suffix: "_thermal",
+            nodes: [terminals[0], terminals[1]],
+            kind: NoiseKind::Thermal {
+                conductance,
+                temperature: context.circuit_kelvin(),
+            },
+        });
+        Ok(())
+    }
 }
 
 fn descriptor(charge: Capability) -> Descriptor {
@@ -99,7 +124,7 @@ fn descriptor(charge: Capability) -> Descriptor {
             })
             .collect(),
         charge,
-        noise: Capability::Unavailable,
+        noise: Capability::Computed,
     }
 }
 
@@ -443,4 +468,110 @@ fn transient_driver_integrates_and_accepts_native_prepared_charge() {
         }
     }
     assert!(early && late);
+}
+
+#[test]
+fn prepared_model_noise_is_source_backed_not_assumed_zero() {
+    let c = circuit(&artifact(), 1e-3);
+    let device = &c.devices()[0];
+    let bias = Vector::from_slice(&[0.4, 0.]);
+    let model_context = ModelContext::default();
+    let context = NoiseContext {
+        model_context: &model_context,
+        unknowns: c.unknowns(),
+        bias: &bias,
+        states: None,
+        controls: &[],
+    };
+    let mut generators = Vec::new();
+    let identity = device.noise(&context, &mut generators).unwrap();
+    assert_eq!(generators.len(), 1);
+    assert!(matches!(
+        identity,
+        ngspice_rs::devices::noise::DeviceNoise::Sources {
+            family: ngspice_rs::devices::noise::NoiseFamily::Prepared,
+            ..
+        }
+    ));
+    match generators[0].kind {
+        NoiseKind::Thermal {
+            conductance,
+            temperature,
+        } => {
+            close(conductance, 1e-3 + 3. * 2e-4 * 0.4_f64.powi(2));
+            close(temperature, 300.15);
+        }
+        other => panic!("unexpected prepared noise {other:?}"),
+    }
+    let mut unavailable = descriptor(Capability::Computed);
+    unavailable.noise = Capability::Unavailable;
+    let factory = Artifact::new(unavailable, PolynomialKernel).unwrap();
+    let mut circuit = Circuit::new();
+    let a = circuit.add_node("a").unwrap();
+    circuit
+        .add_device(Box::new(
+            factory
+                .instance(
+                    "x1",
+                    vec![a, NodeId::GROUND],
+                    &[1e-3, 2e-4, 1e-6, 2e-7],
+                    27.,
+                )
+                .unwrap(),
+        ))
+        .unwrap();
+    circuit.finalize().unwrap();
+    let bias = Vector::from_slice(&[0.4]);
+    let context = NoiseContext {
+        model_context: &model_context,
+        unknowns: circuit.unknowns(),
+        bias: &bias,
+        states: None,
+        controls: &[],
+    };
+    assert!(
+        circuit.devices()[0]
+            .noise(&context, &mut generators)
+            .is_err()
+    );
+}
+
+#[test]
+fn model_temperature_changes_require_preparation_invalidation() {
+    let model = artifact();
+    let circuit = circuit(&model, 1e-3);
+    let context = ModelContext::new(37., 27.);
+    let error = circuit.devices()[0]
+        .validate_dc_inputs(&context)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("temperature changed"), "{error}");
+}
+
+#[test]
+fn noise_driver_consumes_prepared_model_generators_and_ac_charge() {
+    let mut circuit = source_driven_model(false);
+    let request = AnalysisInput::with_arguments(
+        AnalysisKind::Noise,
+        ["v(out)", "v1", "lin", "2", "1k", "2k"],
+    )
+    .resolve()
+    .unwrap();
+    let plots = request
+        .run_plots(&mut circuit, &AnalysisContext::default())
+        .unwrap();
+    assert_eq!(plots.len(), 2);
+    for index in 0..plots[0].point_count() {
+        let frequency = plots[0].value("frequency", index).unwrap().re;
+        let actual = plots[0].value("onoise_spectrum", index).unwrap().re;
+        let omega_c = 2. * std::f64::consts::PI * frequency * 1e-6;
+        let total_g = 2e-3_f64;
+        let density = 4. * ngspice_rs::devices::noise::BOLTZMANN * 300.15 * total_g
+            / (total_g * total_g + omega_c * omega_c);
+        assert!(
+            (actual - density.sqrt()).abs() < density.sqrt() * 1e-9,
+            "f={frequency:e}, observed={actual:e}, reference={:e}",
+            density.sqrt()
+        );
+    }
 }
