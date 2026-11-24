@@ -133,6 +133,7 @@ semantic_leaves!(
     PathBuf,
     AnalysisKind,
     SourceFunction,
+    crate::netlist::ast::StochasticFunction,
     ScopedCardKind,
     RequestedVector,
     MeasureStatistic,
@@ -471,6 +472,7 @@ semantic_enum!(SourceWaveform {
     Pulse(pulse: rpulse),
     Function(function: rfunction),
     Pwl(points: rpoints),
+    Stochastic { function: rfunction, values: rvalues },
 });
 
 semantic_enum!(NodeHintValue {

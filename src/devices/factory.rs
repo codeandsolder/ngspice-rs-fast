@@ -635,6 +635,50 @@ fn source_waveform(
     }
     match source {
         SourceWaveform::Function(f) => function_waveform(f, setter),
+        SourceWaveform::Stochastic { function, values } => {
+            use crate::devices::stochastic::{
+                RandomKind, StochasticSpec, StochasticWaveform, TransientNoise, TransientRandom,
+            };
+            let maximum = function.fields().len();
+            if !(2..=maximum).contains(&values.len()) {
+                return Err(SpiceError::parse(
+                    setter.clone(),
+                    format!("{} requires 2 to {maximum} fields", function.keyword()),
+                ));
+            }
+            let values = values
+                .iter()
+                .zip(function.fields())
+                .map(|(v, field_name)| field(v, field_name))
+                .collect::<SpiceResult<Vec<_>>>()?;
+            let get = |index: usize, default: f64| values.get(index).copied().unwrap_or(default);
+            let spec = match function {
+                crate::netlist::ast::StochasticFunction::Noise => {
+                    StochasticSpec::Noise(TransientNoise {
+                        white_rms: values[0],
+                        step: values[1],
+                        alpha: get(2, 0.),
+                        // VSRCparam/ISRCparam ignore supplied NAMP when
+                        // NALPHA is zero; keep the AST text but resolve the
+                        // physical law to an inactive colored generator.
+                        flicker_drive_rms: if get(2, 0.) > 0. { get(3, 0.) } else { 0. },
+                        rts_amplitude: get(4, 0.),
+                        capture_mean: get(5, 0.),
+                        emission_mean: get(6, 0.),
+                    })
+                }
+                crate::netlist::ast::StochasticFunction::Random => {
+                    StochasticSpec::Random(TransientRandom {
+                        kind: RandomKind::from_scalar(values[0])?,
+                        step: values[1],
+                        delay: get(2, 0.),
+                        scale: get(3, 1.),
+                        offset: get(4, 0.),
+                    })
+                }
+            };
+            Ok(Waveform::Stochastic(StochasticWaveform::new(spec)?))
+        }
         SourceWaveform::Pulse(p) => {
             let optional = |v: &Option<PositionedValue>, what| v.as_ref().map(|v| field(v, what));
             let spec = PulseSpec {

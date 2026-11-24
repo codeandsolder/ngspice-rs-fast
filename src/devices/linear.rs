@@ -75,6 +75,8 @@ pub enum Waveform {
     /// SIN/EXP/SFFM/AM as written, with C's analysis-dependent defaults
     /// pending; resolved like [`Waveform::PulseDefaults`].
     FunctionDefaults(FunctionSpec),
+    /// Deterministic time-domain noise or held random forcing.
+    Stochastic(crate::devices::stochastic::StochasticWaveform),
 }
 impl Waveform {
     /// Checks finite values and strictly increasing nonnegative knot times.
@@ -103,6 +105,7 @@ impl Waveform {
                 spec.validate()?;
                 true
             }
+            Self::Stochastic(process) => process.spec().validate().is_ok(),
         };
         if !valid {
             return Err(SpiceError::circuit("invalid source waveform"));
@@ -154,6 +157,7 @@ impl Waveform {
                 Ok(spec.initial)
             }
             Self::FunctionDefaults(spec) => spec.time_zero(),
+            Self::Stochastic(process) => Ok(process.time_zero()),
             other => other.value_at(0., Limit::Left),
         }
     }
@@ -189,6 +193,7 @@ impl Waveform {
             Self::Pwl(pwl) => return pwl.value_at(t, limit),
             Self::Pulse(pulse) => return pulse.value_at(t, limit),
             Self::Function(function) => return function.value_at(t, limit),
+            Self::Stochastic(process) => return process.value_at(t, limit),
             Self::PulseDefaults(_) => {
                 return Err(SpiceError::circuit(
                     "PULSE defaults (TR/TF/PW/PER) are unresolved; bind transient timing first",
@@ -263,6 +268,11 @@ impl Waveform {
             Self::Pwl(pwl) => {
                 return Ok(WaveformBreakpoints(Inner::Pwl(pwl.breakpoints_in(t0, t1)?)));
             }
+            Self::Stochastic(process) => {
+                return Ok(WaveformBreakpoints(Inner::Stochastic(
+                    process.events(t0, t1)?,
+                )));
+            }
             Self::Function(function) => (function.corners(), WaveformEventKind::FunctionCorner),
             Self::PulseDefaults(_) | Self::FunctionDefaults(_) => {
                 return Err(SpiceError::circuit(
@@ -304,6 +314,10 @@ pub enum WaveformEventKind {
     StepJump,
     /// SIN/EXP/SFFM/AM delay or slope corner; C does not request a breakpoint.
     FunctionCorner,
+    /// Physical white/colored noise knot or random-held sample.
+    StochasticSample,
+    /// Exact RTS transition time.
+    StochasticTelegraph,
 }
 
 impl WaveformEventKind {
@@ -320,6 +334,8 @@ impl WaveformEventKind {
                 | Self::PwlKnot
                 | Self::PwlRepeatBoundary
                 | Self::StepJump
+                | Self::StochasticSample
+                | Self::StochasticTelegraph
         )
     }
 }
@@ -356,6 +372,7 @@ enum Inner {
     Fixed(std::vec::IntoIter<WaveformEvent>),
     Pulse(crate::devices::pulse::PulseBreakpoints),
     Pwl(crate::devices::functions::PwlBreakpoints),
+    Stochastic(crate::devices::stochastic::StochasticEvents),
 }
 impl WaveformBreakpoints {
     /// Advance the same sequence as the time-only iterator, retaining event
@@ -365,6 +382,17 @@ impl WaveformBreakpoints {
             Inner::Fixed(it) => it.next(),
             Inner::Pulse(it) => it.next_event(),
             Inner::Pwl(it) => it.next_event(),
+            Inner::Stochastic(it) => it.next_event().map(|event| WaveformEvent {
+                time: event.time,
+                kind: match event.kind {
+                    crate::devices::stochastic::StochasticEventKind::Sample => {
+                        WaveformEventKind::StochasticSample
+                    }
+                    crate::devices::stochastic::StochasticEventKind::Telegraph => {
+                        WaveformEventKind::StochasticTelegraph
+                    }
+                },
+            }),
         }
     }
 }

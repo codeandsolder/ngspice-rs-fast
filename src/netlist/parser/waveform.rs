@@ -47,6 +47,14 @@ pub(super) fn parameters(input: &mut Input<'_>) -> Result<Vec<ParameterAssignmen
                         .collect(),
                 }))
             }
+            WaveformKind::Stochastic(function) => SourceWaveform::Stochastic {
+                function,
+                values: vector
+                    .values
+                    .iter()
+                    .map(|&token| positioned(token))
+                    .collect(),
+            },
             WaveformKind::Pulse => {
                 let value = |index: usize| vector.values.get(index).map(|&token| positioned(token));
                 SourceWaveform::Pulse(Box::new(PulseWaveform {

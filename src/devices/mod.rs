@@ -87,6 +87,7 @@ pub use models::{
 pub mod ltra;
 pub mod registry;
 pub mod sources;
+pub mod stochastic;
 pub mod subckt;
 pub mod sweep;
 pub mod switch;

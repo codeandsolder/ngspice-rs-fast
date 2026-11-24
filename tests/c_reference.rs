@@ -315,6 +315,13 @@ fn waveform_expectations(netlist: &Netlist) -> (BTreeMap<String, f64>, String) {
                 },
                 f.values.iter().map(|v| v.text.as_str()).collect(),
             ),
+            SourceWaveform::Stochastic { function, values } => (
+                match function {
+                    ngspice_rs::netlist::ast::StochasticFunction::Noise => 7.0,
+                    ngspice_rs::netlist::ast::StochasticFunction::Random => 8.0,
+                },
+                values.iter().map(|v| v.text.as_str()).collect(),
+            ),
         };
         expected.insert(format!("@{}[function]", device.name), function);
         let count = format!("oracle_{}_count", device.name);
