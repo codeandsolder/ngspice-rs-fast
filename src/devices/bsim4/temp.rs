@@ -5,8 +5,8 @@
 //! Ported statement by statement from BSIM4 4.8.3 (`b4temp.c`, Copyright
 //! (c) 2025 University of California, Educational Community License 2.0);
 //! C's member and local names are kept so the port can be read against it.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+// Preserve C model branches and ordered setup; cancellation-sensitive
+// physical equations use the conditioned laws documented in BSIM_TEMPERATURE.md.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -16,20 +16,12 @@
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
 #![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
-)]
-#![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
 )]
 #![expect(
     clippy::while_float,
     reason = "the C iterative floating-point loop must preserve its original termination and rounding order"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 #![expect(
     non_snake_case,
@@ -42,7 +34,7 @@
 
 use super::check::check_model;
 use super::fields::{Instance, Model, SizeParam};
-use super::geo::{pa_eff_geo, rdseff_geo};
+use super::geo::{pa_eff_geo, parallel_resistance, rdseff_geo};
 use crate::primitives::{SpiceError, SpiceResult};
 
 const KboQ: f64 = 8.617_087e-5;
@@ -114,7 +106,7 @@ fn thermal_bandgap_difference(
     let delta = temperature - nominal;
     let inverse = delta / nominal.max(temperature) / nominal.min(temperature);
     let material = (beta / (temperature + beta)) * (delta / (nominal + beta));
-    (e0 * inverse + alpha * material) / KboQ
+    e0.mul_add(inverse, alpha * material) / KboQ
 }
 
 fn relative_temperature_change(temperature: f64, nominal: f64) -> f64 {
@@ -144,6 +136,127 @@ fn log_temperature_ratio(temperature: f64, nominal: f64) -> f64 {
     }
 }
 
+/// Multiply by exp(exponent) without materializing an overflowing or
+/// subnormal exponential. Only the exceptional path uses four monotone
+/// products by exp(exponent/4); ordinary density scaling still shares one
+/// exponential per source/drain side.
+struct ExpScale {
+    factor: f64,
+    quarter: Option<f64>,
+    finite_exponent: bool,
+}
+
+impl ExpScale {
+    fn new(exponent: f64) -> Self {
+        let factor = exponent.exp();
+        let finite_exponent = exponent.is_finite();
+        let quarter = if finite_exponent && !factor.is_normal() {
+            let candidate = (0.25 * exponent).exp();
+            candidate.is_normal().then_some(candidate)
+        } else {
+            None
+        };
+        Self {
+            factor,
+            quarter,
+            finite_exponent,
+        }
+    }
+
+    fn apply(&self, value: f64) -> f64 {
+        if !value.is_finite() || !self.finite_exponent {
+            return value * self.factor;
+        }
+        if value == 0. {
+            return value;
+        }
+        if let Some(quarter) = self.quarter {
+            ((value * quarter) * quarter) * quarter * quarter
+        } else {
+            value * self.factor
+        }
+    }
+}
+
+/// Rational well-proximity term, scaled only if a product is out of range.
+fn well_proximity_rational(distance: f64, width: f64, reference: f64) -> f64 {
+    let numerator = reference * reference;
+    let denominator = distance * (distance + width);
+    if (numerator.is_normal() && denominator.is_normal())
+        || !(distance > 0.
+            && width > 0.
+            && reference > 0.
+            && distance.is_finite()
+            && width.is_finite()
+            && reference.is_finite())
+    {
+        return numerator / denominator;
+    }
+    use crate::primitives::numeric::{scale_power, split_power};
+    let largest = distance.max(width);
+    let (r, re) = split_power(reference);
+    let (d, de) = split_power(distance);
+    let (m, me) = split_power(largest);
+    let sum = m * (1. + distance.min(width) / largest);
+    scale_power((r * r) / (d * sum), 2 * re - de - me)
+}
+
+/// Mean of x exp(-x) over a dimensionless interval, scaled by the WPE
+/// coefficient. Integrate analytically, then use expm1 and a convergent
+/// small-width series for the second integral instead of subtracting
+/// nearly identical endpoint antiderivatives.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the nonphysical-input endpoint fallback preserves C IEEE arithmetic"
+)]
+fn well_proximity_exp(distance: f64, width: f64, reference: f64, rate: f64, scale: f64) -> f64 {
+    if !(distance > 0.
+        && width > 0.
+        && reference > 0.
+        && distance.is_finite()
+        && width.is_finite()
+        && reference.is_finite())
+    {
+        let far = distance + width;
+        let inverse = 1. / reference;
+        let intercept = scale / rate * reference;
+        return ((scale * distance + intercept) * (-rate * distance * inverse).exp()
+            - (scale * far + intercept) * (-rate * far * inverse).exp())
+            / width;
+    }
+    let x = rate * (distance / reference);
+    let z = rate * (width / reference);
+    if x.is_infinite() {
+        return 0.;
+    }
+    let (first, second) = if z == 0. {
+        (1., 0.)
+    } else if z.is_infinite() {
+        let reciprocal = reference / width / rate;
+        (reciprocal, reciprocal)
+    } else {
+        let one_minus = -(-z).exp_m1();
+        let second = if z <= 0.5 {
+            let mut term = 0.5 * z;
+            let mut total = term;
+            for order in 1..=16 {
+                let n = f64::from(order);
+                term *= -z * (n + 1.) / (n * (n + 2.));
+                let next = total + term;
+                if next == total {
+                    break;
+                }
+                total = next;
+            }
+            total
+        } else {
+            (-z).mul_add((-z).exp(), one_minus) / z
+        };
+        (one_minus / z, second)
+    };
+    ExpScale::new(-x).apply(scale * x.mul_add(first, second))
+}
+
 /// The expm1 form preserves the small argument of the short-channel
 /// factor; its large-argument clamp and nonfinite branch are unchanged.
 fn short_channel_factor(argument: f64) -> f64 {
@@ -155,7 +268,7 @@ fn short_channel_factor(argument: f64) -> f64 {
             let exponential = argument.exp();
             (exponential, exponential - 1.)
         };
-        exponential / (difference * difference + 2. * exponential * MIN_EXP)
+        exponential / difference.mul_add(difference, 2. * exponential * MIN_EXP)
     } else {
         1. / (MAX_EXP - 2.)
     }
@@ -163,6 +276,10 @@ fn short_channel_factor(argument: f64) -> f64 {
 
 /// The denominator is identically -(sqrt(phi-vbm)-sqrt(phi))².
 /// Rationalize both differences and retain the singular/invalid input path.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the invalid/singular body-effect fallback preserves C IEEE propagation"
+)]
 fn body_coefficient(phi: f64, vbx: f64, vbm: f64, gamma_difference: f64) -> f64 {
     let root = phi.sqrt();
     if phi > 0. && phi.is_finite() && vbx.is_finite() && vbm.is_finite() && vbx <= 0. && vbm < 0. {
@@ -197,6 +314,11 @@ fn physical_diode_limit(nvtm: f64, threshold: f64, saturation: f64, breakdown: f
 /// BSIM4DioIjthVjmEval: solve in z=exp(Vjm/Nvtm)-1.
 /// z²+(1+XExpBV-Ijth/Isb)z-Ijth/Isb=0. Rationalize the positive
 /// root and use hypot to avoid squaring a large coefficient.
+#[expect(
+    clippy::manual_midpoint,
+    clippy::suboptimal_flops,
+    reason = "the invalid diode input path preserves C IEEE propagation and overflow"
+)]
 fn dio_ijth_vjm_eval(nvtm: f64, threshold: f64, saturation: f64, breakdown: f64) -> f64 {
     let ratio = threshold / saturation;
     if physical_diode_limit(nvtm, threshold, saturation, breakdown) {
@@ -280,10 +402,27 @@ fn forward_limit(
     }
 }
 
-#[derive(Clone, Copy)]
-struct BinWeights([f64; 4]);
+/// Product of effective dimensions can overflow or underflow even when
+/// the reciprocal binning weight is representable. Keep the normal path
+/// unchanged and only scale the dimensions for an exceptional product.
+fn cross_bin_weight(unit: f64, length: f64, width: f64) -> f64 {
+    let product = length * width;
+    if product.is_normal()
+        || !(length > 0. && width > 0. && length.is_finite() && width.is_finite())
+    {
+        return unit / product;
+    }
+    use crate::primitives::numeric::{scale_power, split_power};
+    let (numerator, exponent) = split_power(unit);
+    let (left, left_exp) = split_power(length);
+    let (right, right_exp) = split_power(width);
+    scale_power(numerator / (left * right), exponent - left_exp - right_exp)
+}
 
-impl BinWeights {
+#[derive(Clone, Copy)]
+struct ModelWeights([f64; 4]);
+
+impl ModelWeights {
     /// Retain the ordinary fast path; recover severe cancellation or
     /// intermediate overflow using the existing exact finite-product sum.
     #[inline]
@@ -294,10 +433,13 @@ impl BinWeights {
         let wt = w * inverse_w;
         let lwt = cross * inverse_lw;
         let sum = base + lt + wt + lwt;
-        let magnitude = base.abs().max(lt.abs()).max(wt.abs()).max(lwt.abs());
-        if sum.is_normal() && sum.abs() > 0.5 * magnitude {
-            sum
-        } else if magnitude == 0. && coefficients.iter().all(|&value| value == 0.) {
+        // Most cards leave the length/width/cross terms unset. Returning the
+        // ordered sum also retains signed-zero and nonfinite propagation.
+        if l == 0. && w == 0. && cross == 0. {
+            return sum;
+        }
+        let magnitude = base.abs() + lt.abs() + wt.abs() + lwt.abs();
+        if sum.is_normal() && sum.abs() > 0.125 * magnitude {
             sum
         } else {
             self.recover(coefficients, sum)
@@ -427,6 +569,10 @@ pub(super) struct ModelTemp {
     clippy::assign_op_pattern,
     reason = "retains the reference calculation grouping and floating-point operation order"
 )]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "reference clamp/diagnostic comparisons and remaining ordinary product sums retain the ordered C model stage; sensitive exponent and overlap laws are conditioned"
+)]
 pub(super) fn temperature_model(
     m: &mut Model,
     temperature: f64,
@@ -531,7 +677,7 @@ pub(super) fn temperature_model(
             {
                 warnings.push("Warning: eot, toxp and dtox all given and eot * EPSROX / 3.9 != toxp + dtox; dtox ignored.".to_string());
             } else if (m.eotGiven) && (!m.toxpGiven) {
-                m.toxp = T0 * m.eot - m.dtox;
+                m.toxp = T0.mul_add(m.eot, -m.dtox);
             } else if (!m.eotGiven) && (m.toxpGiven) {
                 m.eot = (m.toxp + m.dtox) / T0;
                 if !m.toxmGiven {
@@ -557,14 +703,14 @@ pub(super) fn temperature_model(
         }
         if !m.cgdoGiven {
             if m.dlcGiven && (m.dlc > 0.0) {
-                m.cgdo = m.dlc * m.coxe - m.cgdl;
+                m.cgdo = m.dlc.mul_add(m.coxe, -m.cgdl);
             } else {
                 m.cgdo = 0.6 * m.xj * m.coxe;
             }
         }
         if !m.cgsoGiven {
             if m.dlcGiven && (m.dlc > 0.0) {
-                m.cgso = m.dlc * m.coxe - m.cgsl;
+                m.cgso = m.dlc.mul_add(m.coxe, -m.cgsl);
             } else {
                 m.cgso = 0.6 * m.xj * m.coxe;
             }
@@ -625,16 +771,14 @@ pub(super) fn temperature_model(
                 Eg0 / Vtm0 - Eg / m.vtm
             };
             T1 = log_temperature_ratio(Temp, Tnom);
-            T2 = T0 + m.SjctTempExponent * T1;
-            T3 = exp(T2 / m.SjctEmissionCoeff);
-            m.SjctTempSatCurDensity = m.SjctSatCurDensity * T3;
-            m.SjctSidewallTempSatCurDensity = m.SjctSidewallSatCurDensity * T3;
-            m.SjctGateSidewallTempSatCurDensity = m.SjctGateSidewallSatCurDensity * T3;
-            T2 = T0 + m.DjctTempExponent * T1;
-            T3 = exp(T2 / m.DjctEmissionCoeff);
-            m.DjctTempSatCurDensity = m.DjctSatCurDensity * T3;
-            m.DjctSidewallTempSatCurDensity = m.DjctSidewallSatCurDensity * T3;
-            m.DjctGateSidewallTempSatCurDensity = m.DjctGateSidewallSatCurDensity * T3;
+            let scale = ExpScale::new(m.SjctTempExponent.mul_add(T1, T0) / m.SjctEmissionCoeff);
+            m.SjctTempSatCurDensity = scale.apply(m.SjctSatCurDensity);
+            m.SjctSidewallTempSatCurDensity = scale.apply(m.SjctSidewallSatCurDensity);
+            m.SjctGateSidewallTempSatCurDensity = scale.apply(m.SjctGateSidewallSatCurDensity);
+            let scale = ExpScale::new(m.DjctTempExponent.mul_add(T1, T0) / m.DjctEmissionCoeff);
+            m.DjctTempSatCurDensity = scale.apply(m.DjctSatCurDensity);
+            m.DjctSidewallTempSatCurDensity = scale.apply(m.DjctSidewallSatCurDensity);
+            m.DjctGateSidewallTempSatCurDensity = scale.apply(m.DjctGateSidewallSatCurDensity);
         }
         if m.SjctTempSatCurDensity < 0.0 {
             m.SjctTempSatCurDensity = 0.0;
@@ -863,6 +1007,10 @@ pub(super) fn temperature_model(
     clippy::collapsible_else_if,
     reason = "keeps ngspice C temperature branch topology unchanged"
 )] // A statement-by-statement port of C.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "reference branch thresholds and ordinary prepared-instance products retain their order; sensitive bin, well-proximity, diode and thermal laws are conditioned; see BSIM_TEMPERATURE.md"
+)]
 pub(super) fn temperature_instance(
     m: &mut Model,
     h: &mut Instance,
@@ -984,13 +1132,13 @@ pub(super) fn temperature_instance(
             if m.binUnit == 1 {
                 Inv_L = 1.0e-6 / p.leff;
                 Inv_W = 1.0e-6 / p.weff;
-                Inv_LW = 1.0e-12 / (p.leff * p.weff);
+                Inv_LW = cross_bin_weight(1.0e-12, p.leff, p.weff);
             } else {
                 Inv_L = 1.0 / p.leff;
                 Inv_W = 1.0 / p.weff;
-                Inv_LW = 1.0 / (p.leff * p.weff);
+                Inv_LW = cross_bin_weight(1.0, p.leff, p.weff);
             }
-            let weights = BinWeights([1., Inv_L, Inv_W, Inv_LW]);
+            let weights = ModelWeights([1., Inv_L, Inv_W, Inv_LW]);
             p.cdsc = weights.interpolate([m.cdsc, m.lcdsc, m.wcdsc, m.pcdsc]);
             p.cdscb = weights.interpolate([m.cdscb, m.lcdscb, m.wcdscb, m.pcdscb]);
             p.cdscd = weights.interpolate([m.cdscd, m.lcdscd, m.wcdscd, m.pcdscd]);
@@ -1392,7 +1540,7 @@ pub(super) fn temperature_instance(
                 }
                 T0 = p.gamma1 - p.gamma2;
                 p.k2 = body_coefficient(p.phi, p.vbx, p.vbm, T0);
-                p.k1 = p.gamma2 - 2.0 * p.k2 * sqrt(p.phi - p.vbm);
+                p.k1 = (-2.0 * p.k2).mul_add(sqrt(p.phi - p.vbm), p.gamma2);
             }
             if !m.vfbGiven {
                 if m.vth0Given {
@@ -1544,15 +1692,9 @@ pub(super) fn temperature_instance(
         if m.wpemod != 0.0 {
             if (!h.scaGiven) && (!h.scbGiven) && (!h.sccGiven) {
                 if (h.scGiven) && (h.sc > 0.0) {
-                    T1 = h.sc + Wdrn;
-                    T2 = 1.0 / m.scref;
-                    h.sca = m.scref * m.scref / (h.sc * T1);
-                    h.scb = ((0.1 * h.sc + 0.01 * m.scref) * exp(-10.0 * h.sc * T2)
-                        - (0.1 * T1 + 0.01 * m.scref) * exp(-10.0 * T1 * T2))
-                        / Wdrn;
-                    h.scc = ((0.05 * h.sc + 0.0025 * m.scref) * exp(-20.0 * h.sc * T2)
-                        - (0.05 * T1 + 0.0025 * m.scref) * exp(-20.0 * T1 * T2))
-                        / Wdrn;
+                    h.sca = well_proximity_rational(h.sc, Wdrn, m.scref);
+                    h.scb = well_proximity_exp(h.sc, Wdrn, m.scref, 10., 0.1);
+                    h.scc = well_proximity_exp(h.sc, Wdrn, m.scref, 20., 0.05);
                 } else {
                     warnings.push("Warning: No WPE as none of SCA, SCB, SCC, SC is given and/or SC not positive.".to_string());
                 }
@@ -1640,21 +1782,34 @@ pub(super) fn temperature_instance(
             bodymode = 3.0;
         }
         if h.rbodyMod == 2 {
+            let body_weights = ModelWeights([1., lnl, lnw, lnnf]);
             if bodymode == 5.0 {
-                rbsbx = m.rbsbx0 * exp(m.rbsdbxl * lnl + m.rbsdbxw * lnw + m.rbsdbxnf * lnnf);
-                rbsby = m.rbsby0 * exp(m.rbsdbyl * lnl + m.rbsdbyw * lnw + m.rbsdbynf * lnnf);
-                h.rbsb = rbsbx * rbsby / (rbsbx + rbsby);
-                rbdbx = m.rbdbx0 * exp(m.rbsdbxl * lnl + m.rbsdbxw * lnw + m.rbsdbxnf * lnnf);
-                rbdby = m.rbdby0 * exp(m.rbsdbyl * lnl + m.rbsdbyw * lnw + m.rbsdbynf * lnnf);
-                h.rbdb = rbdbx * rbdby / (rbdbx + rbdby);
+                rbsbx =
+                    ExpScale::new(body_weights.interpolate([0., m.rbsdbxl, m.rbsdbxw, m.rbsdbxnf]))
+                        .apply(m.rbsbx0);
+                rbsby =
+                    ExpScale::new(body_weights.interpolate([0., m.rbsdbyl, m.rbsdbyw, m.rbsdbynf]))
+                        .apply(m.rbsby0);
+                h.rbsb = parallel_resistance(rbsbx, rbsby);
+                rbdbx =
+                    ExpScale::new(body_weights.interpolate([0., m.rbsdbxl, m.rbsdbxw, m.rbsdbxnf]))
+                        .apply(m.rbdbx0);
+                rbdby =
+                    ExpScale::new(body_weights.interpolate([0., m.rbsdbyl, m.rbsdbyw, m.rbsdbynf]))
+                        .apply(m.rbdby0);
+                h.rbdb = parallel_resistance(rbdbx, rbdby);
             }
             if (bodymode == 3.0) || (bodymode == 5.0) {
-                h.rbps = m.rbps0 * exp(m.rbpsl * lnl + m.rbpsw * lnw + m.rbpsnf * lnnf);
-                h.rbpd = m.rbpd0 * exp(m.rbpdl * lnl + m.rbpdw * lnw + m.rbpdnf * lnnf);
+                h.rbps = ExpScale::new(body_weights.interpolate([0., m.rbpsl, m.rbpsw, m.rbpsnf]))
+                    .apply(m.rbps0);
+                h.rbpd = ExpScale::new(body_weights.interpolate([0., m.rbpdl, m.rbpdw, m.rbpdnf]))
+                    .apply(m.rbpd0);
             }
-            rbpbx = m.rbpbx0 * exp(m.rbpbxl * lnl + m.rbpbxw * lnw + m.rbpbxnf * lnnf);
-            rbpby = m.rbpby0 * exp(m.rbpbyl * lnl + m.rbpbyw * lnw + m.rbpbynf * lnnf);
-            h.rbpb = rbpbx * rbpby / (rbpbx + rbpby);
+            rbpbx = ExpScale::new(body_weights.interpolate([0., m.rbpbxl, m.rbpbxw, m.rbpbxnf]))
+                .apply(m.rbpbx0);
+            rbpby = ExpScale::new(body_weights.interpolate([0., m.rbpbyl, m.rbpbyw, m.rbpbynf]))
+                .apply(m.rbpby0);
+            h.rbpb = parallel_resistance(rbpbx, rbpby);
         }
         if (h.rbodyMod == 1) || ((h.rbodyMod == 2) && (bodymode == 5.0)) {
             if h.rbdb < 1.0e-3 {
@@ -2043,19 +2198,7 @@ pub(super) fn temperature_instance(
             tmp2 = h.vfb + phieot;
             vddeot = f64::from(m.r#type) * m.vddeot;
             T0 = m.epsrgate * EPS0;
-            if (p.ngate > 1.0e18) && (p.ngate < 1.0e25) && (vddeot > tmp2) && (T0 != 0.0) {
-                T1 = 1.0e6 * CHARGE * T0 * p.ngate / (m.coxe * m.coxe);
-                T8 = vddeot - tmp2;
-                T4 = sqrt(1.0 + 2.0 * T8 / T1);
-                T2 = 2.0 * T8 / (T4 + 1.0);
-                T3 = 0.5 * T2 * T2 / T1;
-                T7 = 1.12 - T3 - 0.05;
-                T6 = sqrt(T7 * T7 + 0.224);
-                T5 = 1.12 - 0.5 * (T7 + T6);
-                Vgs_eff = vddeot - T5;
-            } else {
-                Vgs_eff = vddeot;
-            }
+            Vgs_eff = super::load::BSIM4polyDepletion(tmp2, p.ngate, T0, m.coxe, vddeot).0;
             V0 = vbieot - phieot;
             lt1 = m.factor1 * p.sqrtXdep0;
             ltw = lt1;
@@ -2333,12 +2476,12 @@ mod tests {
 
     #[test]
     fn model_bin_recovery_rounds_cancelled_products_once() {
-        let unit = BinWeights([1.; 4]);
+        let unit = ModelWeights([1.; 4]);
         assert_eq!(unit.interpolate([1e16, 1., -1e16, 0.]), 1.);
         let eps = f64::EPSILON;
-        let product = BinWeights([1., 1. - eps, 1., 1.]);
+        let product = ModelWeights([1., 1. - eps, 1., 1.]);
         assert_eq!(product.interpolate([-1., 1. + eps, 0., 0.]), -eps * eps);
-        let wide = BinWeights([1., 2., 2., 1.]);
+        let wide = ModelWeights([1., 2., 2., 1.]);
         assert_eq!(wide.interpolate([0., 1e308, -1e308, 1.]), 1.);
         assert!(unit.interpolate([f64::INFINITY, 0., 0., 0.]).is_infinite());
         assert!(
@@ -2346,6 +2489,114 @@ mod tests {
                 .is_nan()
         );
         assert_eq!(unit.interpolate([-0.; 4]).to_bits(), (-0_f64).to_bits());
+    }
+
+    #[test]
+    fn exponential_density_scaling_recovers_finite_products() {
+        // Independently evaluated with 100-digit Decimal arithmetic.
+        for (density, exponent, expected) in [
+            (1e-300, 1000., 1.970_071_114_017_047e134),
+            (1e300, -1000., 5.075_958_897_549_457e-135),
+            (1e308, -745., 2.822_350_730_471_937e-16),
+            (1e-308, 710., 2.233_994_766_161_711),
+        ] {
+            let actual = ExpScale::new(exponent).apply(density);
+            assert!((actual / expected - 1.).abs() < 8. * f64::EPSILON);
+        }
+        assert_eq!(
+            ExpScale::new(1000.).apply(-0.).to_bits(),
+            (-0_f64).to_bits()
+        );
+        assert!(ExpScale::new(f64::NAN).apply(0.).is_nan());
+        assert!(ExpScale::new(f64::INFINITY).apply(0.).is_nan());
+        assert_eq!(ExpScale::new(3000.).apply(1e-300), f64::INFINITY);
+        assert_eq!(ExpScale::new(-3000.).apply(1e300), 0.);
+    }
+
+    #[test]
+    fn well_proximity_integrals_retain_the_narrow_width_limit() {
+        // 100-digit Decimal evaluation of the original endpoint integrals.
+        for (distance, width, rate, scale, expected) in [
+            (1e-6, 1e-24, 10., 0.1, 4.539_992_976_248_485e-5),
+            (1e-30, 1e-30, 10., 0.1, 1.500_000_000_000_000_3e-24),
+            (1e-6, 1e-6, 10., 0.1, 4.993_559_431_612_621_5e-6),
+            (1e-6, 1e-6, 20., 0.05, 1.082_105_647_425_679_8e-10),
+            (1e-7, 5e-8, 10., 0.1, 0.035_586_696_394_362_016),
+            (
+                1e-7,
+                5.000_000_000_000_001e-8,
+                10.,
+                0.1,
+                0.035_586_696_394_362_016,
+            ),
+        ] {
+            let actual = well_proximity_exp(distance, width, 1e-6, rate, scale);
+            assert!(
+                (actual / expected - 1.).abs() < 16. * f64::EPSILON,
+                "{actual:e}"
+            );
+        }
+        assert_eq!(well_proximity_rational(1e200, 1e200, 1e200), 0.5);
+        assert_eq!(well_proximity_rational(1e-200, 1e-200, 1e-200), 0.5);
+        assert_eq!(parallel_resistance(1e308, 1e308), 5e307);
+        assert_eq!(parallel_resistance(1e-300, 1e-300), 5e-301);
+    }
+
+    #[test]
+    fn bin_weight_survives_intermediate_dimension_product_range() {
+        let small = cross_bin_weight(1e-12, 1e-160, 1e-160);
+        assert!((small / 1e308 - 1.).abs() < 4. * f64::EPSILON);
+        let large = cross_bin_weight(1., 1e160, 1e150);
+        assert!(large > 0.);
+        assert!((large / 1e-310 - 1.).abs() < 1e-12);
+    }
+
+    #[test]
+    fn prepared_instance_consumes_recovered_binned_threshold() {
+        use super::super::set;
+        let model = Model {
+            vth0: 1e16,
+            vth0Given: true,
+            lvth0: 0.5,
+            lvth0Given: true,
+            wvth0: -1e16,
+            wvth0Given: true,
+            k1: 0.4,
+            k1Given: true,
+            k2: 0.,
+            k2Given: true,
+            binUnit: 1,
+            binUnitGiven: true,
+            ..Model::default()
+        };
+        let instance = Instance {
+            l: 1e-6,
+            lGiven: true,
+            w: 1e-6,
+            wGiven: true,
+            ..Instance::default()
+        };
+        let set::PreparedSetup {
+            mut model,
+            mut instance,
+            mut warnings,
+            ..
+        } = set::prepare_model(model, 300.15).prepare_instance(instance, false);
+        let size = temperature(
+            &mut model,
+            &mut instance,
+            300.15,
+            "nch",
+            "m1",
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(size.leff, 1e-6);
+        assert_eq!(size.weff, 1e-6);
+        assert_eq!(size.vth0, 0.5);
+        assert_eq!(instance.vth0, 0.5);
+        assert!(model.vth0Given && model.lvth0Given && model.wvth0Given);
+        assert_eq!(model.vth0, 1e16);
     }
 
     #[test]
