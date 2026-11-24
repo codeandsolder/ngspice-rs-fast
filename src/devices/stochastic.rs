@@ -342,6 +342,7 @@ impl StochasticWaveform {
             current = next;
             cache.remember(current);
         }
+        drop(cache);
         Ok((current.index % 2 == 1, current))
     }
     /// Evaluate physical time independently of rejected or accepted trials.
