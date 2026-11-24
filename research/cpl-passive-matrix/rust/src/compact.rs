@@ -35,7 +35,7 @@ pub struct MatrixTrial {
     pub jacobian: Vec<f64>,
     new_voltage: Vec<f64>,
     updated_filters: Vec<Vec<f64>>,
-    from_revision: u64,
+    revision: u64,
     owner_id: u64,
 }
 
@@ -100,7 +100,7 @@ impl PreparedStep {
             jacobian: self.jacobian.clone(),
             new_voltage: voltage.to_vec(),
             updated_filters,
-            from_revision: self.revision,
+            revision: self.revision,
             owner_id: self.owner_id,
         })
     }
@@ -241,12 +241,14 @@ impl MatrixPassivePort {
     /// # Errors
     /// Malformed/stale trial or revision overflow.
     pub fn accept(&mut self, trial: MatrixTrial) -> Result<(), &'static str> {
-        if trial.from_revision != self.revision
-            || trial.owner_id != self.owner_id
-            || trial.updated_filters.len() != self.blocks.len()
-            || trial.new_voltage.len() != self.order
-        {
-            return Err("stale coupled-matrix filter trial");
+        if trial.revision != self.revision || trial.owner_id != self.owner_id {
+            return Err("stale or foreign coupled-matrix filter trial");
+        }
+        if trial.updated_filters.len() != self.blocks.len() {
+            return Err("wrong shared-pole block count");
+        }
+        if trial.new_voltage.len() != self.order {
+            return Err("wrong shared-pole voltage width");
         }
         let next_revision = self
             .revision

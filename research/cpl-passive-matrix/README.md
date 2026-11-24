@@ -63,8 +63,10 @@ rate*time products. Explicit revision checks prevent stale acceptance.
 
 The standalone Rust 2024 crate in rust/ demonstrates both independent
 rank-one and compact matrix-pole realizations and compares them across
-accepted/rejected Newton trials. Nine unit tests passed on stable Rust,
-managed sccache, and strict library Clippy with pedantic/nursery passed.
+accepted/rejected Newton trials. Eleven unit tests passed on stable Rust,
+managed sccache, with deterministic stale and cross-port transaction rejection.
+Strict library and integration-test Clippy pass with pedantic/nursery and no
+unwrap/expect/panic/todo/unimplemented allowances.
 
 ## Reproducing
 

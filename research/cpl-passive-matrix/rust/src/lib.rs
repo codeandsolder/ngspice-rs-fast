@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) fn next_port_id() -> Result<u64, &'static str> {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| "exhausted passive-port identities")
 }
 
@@ -52,7 +52,7 @@ pub struct Trial {
     pub jacobian: Vec<f64>,
     new_voltage: Vec<f64>,
     filters: Vec<f64>,
-    base_revision: u64,
+    revision: u64,
     owner_id: u64,
 }
 
@@ -196,7 +196,7 @@ impl PassivePort {
             jacobian,
             new_voltage: voltage.to_vec(),
             filters,
-            base_revision: self.revision,
+            revision: self.revision,
             owner_id: self.owner_id,
         })
     }
@@ -207,12 +207,14 @@ impl PassivePort {
     /// # Errors
     /// Stale accepted revision or wrong pole count.
     pub fn accept(&mut self, trial: Trial) -> Result<(), &'static str> {
-        if self.revision != trial.base_revision
-            || self.owner_id != trial.owner_id
-            || trial.filters.len() != self.poles.len()
-            || trial.new_voltage.len() != self.order
-        {
-            return Err("stale or malformed passive-port acceptance");
+        if self.revision != trial.revision || self.owner_id != trial.owner_id {
+            return Err("stale or foreign passive-port acceptance");
+        }
+        if trial.filters.len() != self.poles.len() {
+            return Err("wrong passive-port filter state count");
+        }
+        if trial.new_voltage.len() != self.order {
+            return Err("wrong passive-port voltage width");
         }
         let next_revision = self
             .revision
