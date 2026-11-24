@@ -548,3 +548,65 @@ fn synchronous_buck_with_two_thermal_vdmos_matches_ngspice47() {
         }
     }
 }
+
+#[test]
+fn gate_temperature_candidate_batch_matches_ngspice47() {
+    // Fifteen independently evaluated candidates share one prepared model
+    // but have different Vgate and circuit temperature. No mutable accepted
+    // state or temperature-dependent derived coefficients may leak between
+    // candidates. C47's nested DC sweep has gate as the fast axis.
+    let source = include_str!("fixtures/vdmos/parameter_sweep.cir")
+        .split(".control")
+        .next()
+        .unwrap();
+    let deck = parse_deck_text(
+        Path::new("vdmos-candidates.cir"),
+        &format!("{source}\n.dc Vgate 2 6 1 TEMP 0 100 50\n.end\n"),
+    );
+    let parsed = Parser::new().parse_deck(&deck).unwrap();
+    let config = RunConfig::from_netlist(&parsed).unwrap();
+    let plan = config.plan_for(&parsed.analyses[0]).unwrap();
+    let mut circuit = config.circuit(&parsed).unwrap();
+    let plot = plan
+        .run_plots(&mut circuit, &config.context())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(plot.point_count(), 15);
+    let expected_v = [
+        11.90083, 11.38415, 0.2920180, 0.2616401, 0.2525052, 11.90083, 11.49447, 0.3089050,
+        0.2692531, 0.2574616, 11.90083, 11.57031, 0.3274860, 0.2775041, 0.2628228,
+    ];
+    let expected_i = [
+        -0.00991736,
+        -0.0615850,
+        -1.17080,
+        -1.17384,
+        -1.17475,
+        -0.00991736,
+        -0.0505531,
+        -1.16911,
+        -1.17307,
+        -1.17425,
+        -0.00991736,
+        -0.0429691,
+        -1.16725,
+        -1.17225,
+        -1.17372,
+    ];
+    for (index, (v, i)) in expected_v.into_iter().zip(expected_i).enumerate() {
+        let observed_v = plot.value("v(drain)", index).unwrap().re;
+        let observed_i = plot.value("i(vdd)", index).unwrap().re;
+        let tolerance_v = 0.004_f64.mul_add(f64::abs(v), 0.008);
+        let tolerance_i = 0.004_f64.mul_add(f64::abs(i), 0.00015);
+        assert!(
+            (observed_v - v).abs() < tolerance_v,
+            "candidate {index} V(drain): Rust {observed_v:e} C47 {v:e}"
+        );
+        assert!(
+            (observed_i - i).abs() < tolerance_i,
+            "candidate {index} I(Vdd): Rust {observed_i:e} C47 {i:e}"
+        );
+    }
+}
