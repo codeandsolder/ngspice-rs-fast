@@ -362,7 +362,7 @@ fn causal_lossy_ladder_matches_exact_sp_and_enforces_preparation_context() {
     let mut p = mode(50., 2e8);
     p.resistance = 2.;
     p.conductance = 1e-6;
-    p.skin = 2e-5;
+    p.skin = 0.01;
     p.relaxation_capacitance = 1e-11;
     p.relaxation_time = 1e-9;
     let line = PreparedLine::single(LineMode::new(p).unwrap(), 0.02, band()).unwrap();
@@ -376,6 +376,11 @@ fn causal_lossy_ladder_matches_exact_sp_and_enforces_preparation_context() {
     let ladder = Arc::new(line.realize(spec).unwrap());
     let report = ladder.report().unwrap();
     assert!(report.samples >= 256 && report.worst_error <= spec.max_error);
+    assert!(report.skin_poles > 0);
+    println!(
+        "lossy ladder: {report:?}, {} elements",
+        ladder.element_count()
+    );
     assert!(ladder.validate_context(1e9, 28.).is_err());
     assert!(ladder.validate_context(2e9, 27.).is_err());
     assert!(
@@ -495,4 +500,199 @@ fn passive_junction_binding_is_atomic_and_preserves_floating_ports() {
     assert_eq!(circuit.nodes().len(), after);
     assert_eq!(circuit.devices().len(), count);
     circuit.finalize().unwrap();
+}
+
+#[test]
+fn cached_relation_and_material_queries_are_context_correct() {
+    let mut p = mode(50., 2e8);
+    p.resistance = 4.;
+    p.resistance_temperature_coefficient = 0.004;
+    let m = LineMode::new(p)
+        .unwrap()
+        .with_dielectric_loss(1e9, 0.02, 1. / (TAU * 1e9))
+        .unwrap();
+    let (_, y) = m.rlgc(1e9, 27.).unwrap();
+    assert!((y.re / y.im - 0.02).abs() < 1e-14);
+    let ideal = LineMode::new(mode(50., 2e8))
+        .unwrap()
+        .propagation(1e9, 27.)
+        .unwrap();
+    close(ideal.gamma, Complex::new(0., TAU * 1e9 / 2e8), 1e-13);
+    close(
+        ideal.characteristic_impedance.unwrap(),
+        Complex::new(50., 0.),
+        1e-13,
+    );
+    let n = PreparedLine::single(m, 1., band()).unwrap();
+    let a = n.relations(1e9, 27.).unwrap();
+    let b = n.relations(1e9, 27.).unwrap();
+    assert!(Arc::ptr_eq(&a, &b));
+    let hot = n.relations(1e9, 77.).unwrap();
+    assert!(!Arc::ptr_eq(&a, &hot));
+    assert_ne!(
+        a[0].reflections(50.).unwrap(),
+        hot[0].reflections(50.).unwrap()
+    );
+    let [even, odd] = a[0].reflections(f64::MAX).unwrap();
+    assert!(even.magnitude() <= 1. + 2e-15 && odd.magnitude() <= 1. + 2e-15);
+    let [even, odd] = a[0].reflections(f64::MIN_POSITIVE).unwrap();
+    assert!(even.magnitude() <= 1. + 2e-15 && odd.magnitude() <= 1. + 2e-15);
+    let q = LineMode::new(mode(70., 1.6e8)).unwrap();
+    let u = std::f64::consts::FRAC_1_SQRT_2;
+    let coupled = PreparedLine::modal(vec![m, q], vec![u, u, u, -u], 1., band()).unwrap();
+    let (series, shunt) = coupled.rlgc_matrices(1e9, 27.).unwrap();
+    let (z1, y1) = m.rlgc(1e9, 27.).unwrap();
+    let (z2, y2) = q.rlgc(1e9, 27.).unwrap();
+    close(
+        series.get(0, 1).unwrap(),
+        (z1 - z2) * Complex::real(0.5),
+        1e-12,
+    );
+    close(
+        shunt.get(0, 1).unwrap(),
+        (y1 - y2) * Complex::real(0.5),
+        1e-15,
+    );
+}
+
+#[test]
+fn coupled_native_realization_matches_all_physical_port_pairs() {
+    use ngspice_rs::analysis::rf_network::realization::LadderSpec;
+    use ngspice_rs::devices::rf_passive::bind_realization;
+    let a = LineMode::new(mode(40., 2e8)).unwrap();
+    let b = LineMode::new(mode(70., 1.7e8)).unwrap();
+    let u = std::f64::consts::FRAC_1_SQRT_2;
+    let line = PreparedLine::modal(vec![a, b], vec![u, u, u, -u], 0.04, band()).unwrap();
+    let spec = LadderSpec {
+        band: FrequencyBand::new(0., 1e9).unwrap(),
+        reference_impedance: 50.,
+        max_error: 0.003,
+        max_sections: 64,
+        temperature: 27.,
+    };
+    let graph = Arc::new(line.realize(spec).unwrap());
+    let deck = "coupled ladder\nv1 a 0 portnum 1 z0 50\nv2 b 0 portnum 2 z0 50\nv3 c 0 portnum 3 z0 50\nv4 d 0 portnum 4 z0 50\n.sp lin 3 100meg 1g\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("coupled.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let ports = ["a", "b", "c", "d"].map(|name| PortTerminals {
+        positive: circuit.add_node(name).unwrap(),
+        negative: NodeId::GROUND,
+    });
+    bind_realization(&mut circuit, "ncoupled", graph, ports.to_vec()).unwrap();
+    let plot = config
+        .plan_for(&netlist.analyses[0])
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    for point in 0..plot.point_count() {
+        let expected = line
+            .scattering(plot.value("frequency", point).unwrap().re, 27., 50.)
+            .unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                close(
+                    plot.value(&format!("S_{}_{}", i + 1, j + 1), point)
+                        .unwrap(),
+                    expected.get(i, j).unwrap(),
+                    spec.max_error,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn extracted_lumped_filter_and_open_stub_share_physical_port_interface() {
+    use ngspice_rs::analysis::rf_network::{
+        geometry::{Microstrip, Substrate},
+        realization::{Element, LumpedElement, PassiveRealization},
+    };
+    use ngspice_rs::devices::rf_passive::bind_realization;
+    let cap = Microstrip {
+        width: 1e-3,
+        thickness: 0.,
+    }
+    .open_end_capacitance(Substrate {
+        height: 0.8e-3,
+        relative_permittivity: 4.4,
+    })
+    .unwrap();
+    assert!((cap - 2.726_275_963_244_189_6e-14).abs() < 1e-21);
+    assert!(
+        PassiveRealization::lumped(
+            2,
+            1,
+            &[LumpedElement {
+                nodes: [1, 3],
+                element: Element::Capacitance(1e-12)
+            }],
+            band()
+        )
+        .is_err()
+    );
+    assert!(
+        PassiveRealization::lumped(
+            2,
+            0,
+            &[
+                LumpedElement {
+                    nodes: [1, 2],
+                    element: Element::Inductance(1e-9)
+                },
+                LumpedElement {
+                    nodes: [1, 2],
+                    element: Element::Inductance(1e-9)
+                }
+            ],
+            band()
+        )
+        .is_err()
+    );
+    let inductance = 10e-9;
+    let capacitance = 2e-12;
+    let graph = Arc::new(
+        PassiveRealization::lumped(
+            2,
+            0,
+            &[
+                LumpedElement {
+                    nodes: [1, 2],
+                    element: Element::Inductance(inductance),
+                },
+                LumpedElement {
+                    nodes: [2, 0],
+                    element: Element::Capacitance(capacitance),
+                },
+            ],
+            band(),
+        )
+        .unwrap(),
+    );
+    let deck = "prepared filter\nv1 in 0 portnum 1 z0 50\nv2 out 0 portnum 2 z0 50\n.sp lin 7 100meg 1g\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("filter.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let a = circuit.add_node("in").unwrap();
+    let b = circuit.add_node("out").unwrap();
+    bind_realization(&mut circuit, "nfilter", graph, ports(a, b)).unwrap();
+    let plot = config
+        .plan_for(&netlist.analyses[0])
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    for point in 0..plot.point_count() {
+        let omega = TAU * plot.value("frequency", point).unwrap().re;
+        let z = Complex::new(0., omega * inductance / 50.);
+        let y = Complex::new(0., omega * capacitance * 50.);
+        let denominator = Complex::real(2.) + z + y + z * y;
+        let transmission = Complex::real(2.) / denominator;
+        let reflection = (z - y + z * y) / denominator;
+        close(plot.value("S_2_1", point).unwrap(), transmission, 1e-12);
+        close(plot.value("S_1_1", point).unwrap(), reflection, 1e-12);
+    }
 }

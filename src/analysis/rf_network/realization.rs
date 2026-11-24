@@ -15,9 +15,13 @@ pub enum Element {
     Capacitance(f64),
 }
 
+/// A lumped element attached to graph-local node indices.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Edge {
+pub struct LumpedElement {
+    /// Zero is the common reference; indices 1 through the port count
+    /// are port nodes. Remaining indices refer to internal nodes.
     pub nodes: [usize; 2],
+    /// Physical R, L or C value in SI units.
     pub element: Element,
 }
 
@@ -30,7 +34,7 @@ pub(crate) struct Edge {
 pub struct PassiveRealization {
     pub(crate) ports: usize,
     pub(crate) nodes: usize,
-    pub(crate) edges: Vec<Edge>,
+    pub(crate) edges: Vec<LumpedElement>,
     pub(crate) basis: Vec<f64>,
     pub(crate) band: FrequencyBand,
     pub(crate) temperature: Option<f64>,
@@ -57,6 +61,9 @@ pub struct LadderSpec {
 pub struct LadderReport {
     /// Number of cascaded symmetric pi cells per mode.
     pub sections: usize,
+    /// Number of skin-effect Foster branches per spatial section, summed
+    /// across all modes. Zero means their omission met the error budget.
+    pub skin_poles: usize,
     /// Number of distinct validation frequencies, including DC.
     pub samples: usize,
     /// Maximum observed scattering eigenvalue error.
@@ -89,10 +96,85 @@ impl PassiveRealization {
             Element::Resistance(r) => r.is_finite() && r > 0. && r.recip().is_finite(),
             Element::Inductance(l) | Element::Capacitance(l) => nonnegative(l),
         };
-        if !valid || self.edges.len() >= 100_000 || self.nodes > 100_000 {
+        if !valid
+            || nodes[0] == nodes[1]
+            || nodes.iter().any(|&i| i >= self.nodes)
+            || self.edges.len() >= 100_000
+            || self.nodes > 100_000
+        {
             return Err(invalid("unrepresentable or oversized passive realization"));
         }
-        self.edges.push(Edge { nodes, element });
+        self.edges.push(LumpedElement { nodes, element });
+        Ok(())
+    }
+
+    /// Import a positive-element discontinuity or passive rational model
+    /// prepared outside the solver.
+    ///
+    /// Internal node indices must have a DC conductive path to a port or
+    /// reference. The simulator never invents a leakage path for an
+    /// otherwise undefined bias point.
+    /// # Errors
+    /// Invalid topology, values, DC connectivity or resource budget.
+    pub fn lumped(
+        ports: usize,
+        internal_nodes: usize,
+        elements: &[LumpedElement],
+        band: FrequencyBand,
+    ) -> SpiceResult<Self> {
+        if !(1..=32).contains(&ports)
+            || internal_nodes > 100_000 - ports - 1
+            || elements.len() > 100_000
+        {
+            return Err(invalid("invalid lumped network dimensions"));
+        }
+        let mut graph = Self::empty(ports, band, None);
+        graph.nodes += internal_nodes;
+        for &edge in elements {
+            graph.edge(edge.nodes, edge.element)?;
+        }
+        graph.validate_bias_connectivity()?;
+        Ok(graph)
+    }
+
+    fn validate_bias_connectivity(&self) -> SpiceResult<()> {
+        // Union-find over the DC conductive subgraph. Port and reference
+        // nodes are anchors; ideal inductive cycles would make DC branch
+        // currents indeterminate even with all terminal voltages fixed.
+        const fn root(parent: &mut [usize], mut node: usize) -> usize {
+            while parent[node] != node {
+                parent[node] = parent[parent[node]];
+                node = parent[node];
+            }
+            node
+        }
+        let mut parent: Vec<usize> = (0..self.nodes).collect();
+        for inductive_only in [true, false] {
+            for edge in &self.edges {
+                let include = if inductive_only {
+                    matches!(edge.element, Element::Inductance(_))
+                } else {
+                    matches!(edge.element, Element::Resistance(_))
+                };
+                if include {
+                    let a = root(&mut parent, edge.nodes[0]);
+                    let b = root(&mut parent, edge.nodes[1]);
+                    if a == b && inductive_only {
+                        return Err(invalid(
+                            "inductive loop makes the DC branch equations singular",
+                        ));
+                    }
+                    parent[a] = b;
+                }
+            }
+        }
+        let mut anchors = vec![false; self.nodes];
+        for i in 0..=self.ports {
+            anchors[root(&mut parent, i)] = true;
+        }
+        if (self.ports + 1..self.nodes).any(|i| !anchors[root(&mut parent, i)]) {
+            return Err(invalid("lumped internal node has no conductive DC path"));
+        }
         Ok(())
     }
 
@@ -170,26 +252,33 @@ struct Cell {
 }
 
 impl Cell {
-    fn new(mode: LineMode, length: f64, spec: LadderSpec) -> SpiceResult<Self> {
+    fn new(mode: LineMode, length: f64, spec: LadderSpec, poles: u32) -> SpiceResult<Self> {
         let p = mode.parameters();
         let (dc, _) = mode.rlgc(0., spec.temperature)?;
         let factor = p
             .resistance_temperature_coefficient
             .mul_add(spec.temperature - p.reference_temperature, 1.);
         let mut skin = Vec::new();
-        if p.skin != 0. && length != 0. {
+        if p.skin != 0. && length != 0. && poles != 0 {
             // sqrt(s) = (1/pi) integral s/(s+t) t^(-1/2) dt.
             // Logarithmic midpoint quadrature gives a Foster series of
             // parallel R-L branches with positive residues and rates.
             let [low, high] = spec.band.limits();
-            let log_min = low.max(high * 1e-9).ln() + (TAU * 1e-8).ln();
+            let log_min = low.max((high * 1e-9).max(f64::MIN_POSITIVE)).ln() + (TAU * 1e-8).ln();
             let log_max = high.ln() + (TAU * 1e8).ln();
-            let step = (log_max - log_min) / 64.;
-            for i in 0..64 {
+            let step = (log_max - log_min) / f64::from(poles);
+            for i in 0..poles {
                 let rate = (f64::from(i).mul_add(step, 0.5_f64.mul_add(step, log_min))).exp();
                 let resistance =
                     p.skin * factor.sqrt() * length * rate.sqrt() * step / (PI * PI.sqrt());
-                if !rate.is_finite() || rate <= 0. || !resistance.is_finite() || resistance <= 0. {
+                let inductance = resistance / rate;
+                if !rate.is_finite()
+                    || rate <= 0.
+                    || !resistance.is_finite()
+                    || resistance <= 0.
+                    || !inductance.is_finite()
+                    || inductance <= 0.
+                {
                     return Err(invalid("unrepresentable skin-effect quadrature"));
                 }
                 skin.push(SkinPole { resistance, rate });
@@ -214,6 +303,36 @@ impl Cell {
             return Err(invalid("lumped cell coefficient underflow"));
         }
         Ok(cell)
+    }
+
+    fn element_count(&self, sections: usize) -> usize {
+        let series = 1 + usize::from(self.resistance != 0.) + 2 * self.skin.len();
+        let shunt = usize::from(self.conductance != 0.)
+            + usize::from(self.capacitance != 0.)
+            + 2 * usize::from(self.delta_c != 0.);
+        sections * series + (sections + 1) * shunt
+    }
+
+    fn fit_error(
+        &self,
+        frequencies: &[f64],
+        exact: &[[Complex; 2]],
+        sections: usize,
+        spec: LadderSpec,
+    ) -> Option<f64> {
+        let mut worst: f64 = 0.;
+        for (&hz, &target) in frequencies.iter().zip(exact) {
+            let approximation = self
+                .waves(hz, spec.reference_impedance)
+                .ok()?
+                .repeat(sections)
+                .ok()?;
+            worst = worst.max(approximation.error(target));
+            if worst > spec.max_error {
+                return None;
+            }
+        }
+        Some(worst)
     }
 
     fn series_shunt(&self, hz: f64) -> (Complex, Complex) {
@@ -255,7 +374,11 @@ impl Cell {
             )?;
         }
         if self.capacitance != 0. {
-            graph.edge([at, 0], Element::Capacitance(self.capacitance * weight))?;
+            let capacitance = self.capacitance * weight;
+            if capacitance == 0. {
+                return Err(invalid("shunt capacitance underflow"));
+            }
+            graph.edge([at, 0], Element::Capacitance(capacitance))?;
         }
         if self.delta_c != 0. {
             let middle = graph.node();
@@ -343,13 +466,26 @@ impl Waves {
     }
 }
 
-fn validation_grid(band: FrequencyBand) -> Vec<f64> {
+fn validation_grid(band: FrequencyBand, phase: f64) -> SpiceResult<Vec<f64>> {
     let [low, high] = band.limits();
-    let log_min = low.max(high * 1e-9).ln();
+    let log_min = low.max((high * 1e-9).max(f64::MIN_POSITIVE)).ln();
     let log_max = high.ln();
+    // At least sixteen linear samples per full electrical wavelength,
+    // in addition to logarithmic sampling of material corner frequencies.
+    // Explicitly reject a line too long for the bounded validation work.
+    let required = 16. * phase / TAU;
+    if !required.is_finite() || required > 16_384. {
+        return Err(invalid(
+            "electrical length exceeds ladder validation grid budget",
+        ));
+    }
+    let mut intervals = 256_u32;
+    while f64::from(intervals) < required {
+        intervals *= 2;
+    }
     let mut grid = vec![0., low, high];
-    for i in 1..256 {
-        grid.push((f64::from(i) / 256.).mul_add(high - low, low));
+    for i in 1..intervals {
+        grid.push((f64::from(i) / f64::from(intervals)).mul_add(high - low, low));
     }
     for i in 1..128 {
         grid.push(
@@ -361,7 +497,36 @@ fn validation_grid(band: FrequencyBand) -> Vec<f64> {
     }
     grid.sort_by(f64::total_cmp);
     grid.dedup_by(|a, b| a.to_bits() == b.to_bits());
-    grid
+    Ok(grid)
+}
+
+fn fit_cell(
+    mode: LineMode,
+    length: f64,
+    spec: LadderSpec,
+    sections: usize,
+    grid: &[f64],
+    target: &[[Complex; 2]],
+) -> Option<(Cell, f64)> {
+    let poles: &[u32] = if mode.parameters().skin == 0. {
+        &[0]
+    } else {
+        &[0, 4, 8, 16, 32, 64]
+    };
+    for &count in poles {
+        if let Ok(cell) = Cell::new(mode, length, spec, count)
+            && let Some(error) = cell.fit_error(grid, target, sections, spec)
+        {
+            return Some((cell, error));
+        }
+    }
+    None
+}
+
+struct LadderCandidate {
+    cells: Vec<Cell>,
+    report: LadderReport,
+    elements: usize,
 }
 
 impl PreparedLine {
@@ -373,6 +538,11 @@ impl PreparedLine {
     /// # Errors
     /// Invalid bounds, unsupported range, or exhausted error/resource budget.
     pub fn realize(&self, spec: LadderSpec) -> SpiceResult<PassiveRealization> {
+        if self.dispersion.iter().any(Option::is_some) {
+            return Err(invalid(
+                "empirical dispersion requires an independently prepared causal realization",
+            ));
+        }
         let [low, high] = spec.band.limits();
         let [valid_low, valid_high] = self.band.limits();
         if !high.is_normal()
@@ -389,7 +559,11 @@ impl PreparedLine {
         {
             return Err(invalid("invalid ladder specification"));
         }
-        let grid = validation_grid(spec.band);
+        let phase = self.modes.iter().try_fold(0_f64, |max, mode| {
+            let gamma = mode.propagation(high, spec.temperature)?.gamma;
+            Ok::<_, crate::primitives::SpiceError>(max.max(gamma.im * self.length))
+        })?;
+        let grid = validation_grid(spec.band, phase)?;
         let targets = self
             .modes
             .iter()
@@ -403,38 +577,66 @@ impl PreparedLine {
             })
             .collect::<SpiceResult<Vec<_>>>()?;
         let mut sections = 1;
+        let mut best: Option<LadderCandidate> = None;
         while sections <= spec.max_sections {
-            let length = self.length
-                / f64::from(u32::try_from(sections).map_err(|_| invalid("section count"))?);
-            let cells = self
-                .modes
-                .iter()
-                .map(|&mode| Cell::new(mode, length, spec))
-                .collect::<SpiceResult<Vec<_>>>()?;
-            let mut worst_error: f64 = 0.;
-            for (cell, exact) in cells.iter().zip(&targets) {
-                for (&hz, &target) in grid.iter().zip(exact) {
-                    let approximation =
-                        cell.waves(hz, spec.reference_impedance)?.repeat(sections)?;
-                    worst_error = worst_error.max(approximation.error(target));
-                }
+            if best
+                .as_ref()
+                .is_some_and(|old| sections * self.conductors() >= old.elements)
+            {
+                break;
             }
-            if worst_error <= spec.max_error {
-                return self.build_realization(
-                    spec,
-                    &cells,
-                    LadderReport {
-                        sections,
-                        samples: grid.len(),
-                        worst_error,
-                    },
-                );
+            if let Some(candidate) = self.fit_sections(spec, sections, &grid, &targets)?
+                && best
+                    .as_ref()
+                    .is_none_or(|old| candidate.elements < old.elements)
+            {
+                best = Some(candidate);
             }
             sections *= 2;
         }
-        Err(invalid(
-            "ladder cannot meet scattering error within section budget",
-        ))
+        let best = best
+            .ok_or_else(|| invalid("ladder cannot meet scattering error within section budget"))?;
+        self.build_realization(spec, &best.cells, best.report)
+    }
+
+    fn fit_sections(
+        &self,
+        spec: LadderSpec,
+        sections: usize,
+        grid: &[f64],
+        targets: &[Vec<[Complex; 2]>],
+    ) -> SpiceResult<Option<LadderCandidate>> {
+        let length =
+            self.length / f64::from(u32::try_from(sections).map_err(|_| invalid("section count"))?);
+        if self.length > 0. && length == 0. {
+            return Ok(None);
+        }
+        let mut cells = Vec::new();
+        let mut worst_error: f64 = 0.;
+        let mut elements = 0;
+        let mut skin_poles = 0;
+        for (&mode, target) in self.modes.iter().zip(targets) {
+            let Some((cell, error)) = fit_cell(mode, length, spec, sections, grid, target) else {
+                return Ok(None);
+            };
+            worst_error = worst_error.max(error);
+            elements += cell.element_count(sections);
+            skin_poles += cell.skin.len();
+            cells.push(cell);
+        }
+        if elements > 100_000 {
+            return Ok(None);
+        }
+        Ok(Some(LadderCandidate {
+            cells,
+            elements,
+            report: LadderReport {
+                sections,
+                skin_poles,
+                samples: grid.len(),
+                worst_error,
+            },
+        }))
     }
 
     fn build_realization(

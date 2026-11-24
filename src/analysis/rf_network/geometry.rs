@@ -1,7 +1,9 @@
 //! Offline quasi-static reference preparation. The solver does not consume
 //! geometry or substrate-format syntax; it binds the resulting RLGC modes.
 
-use super::{LineMode, ModeParameters, invalid, nonnegative};
+use super::{
+    FrequencyBand, LineMode, ModeParameters, invalid, nonnegative, realization::PassiveRealization,
+};
 use crate::primitives::SpiceResult;
 use std::f64::consts::{E, PI, TAU};
 
@@ -287,6 +289,92 @@ impl Microstrip {
             return Err(invalid("unrepresentable open-end capacitance"));
         }
         Ok(capacitance)
+    }
+
+    /// Quasi-static uncompensated right-angle microstrip corner.
+    ///
+    /// Equivalent series inductive arms and shunt capacitance from the
+    /// Qucs corner model. Geometries with negative deembedded inductance
+    /// are not realizable with these positive lumped elements.
+    /// # Errors
+    /// Outside model validity, or nonpassive equivalent parameters.
+    pub fn right_angle_corner(
+        self,
+        substrate: Substrate,
+        band: FrequencyBand,
+    ) -> SpiceResult<PassiveRealization> {
+        substrate.validate()?;
+        let width_ratio = self.width / substrate.height;
+        let er = substrate.relative_permittivity;
+        if !(0.2..=6.).contains(&width_ratio)
+            || !(2.36..=10.4).contains(&er)
+            || band.limits()[1] * substrate.height > 12e6
+            || self.thickness != 0.
+        {
+            return Err(invalid(
+                "microstrip corner outside validated thin-strip domain",
+            ));
+        }
+        let capacitance = 1e-12
+            * self.width
+            * (10.35_f64
+                .mul_add(er, 2.5)
+                .mul_add(width_ratio, 2.6_f64.mul_add(er, 5.64)));
+        let inductance = 220e-9
+            * substrate.height
+            * (-1.35_f64).mul_add((-0.18 * width_ratio.powf(1.39)).exp(), 1.);
+        PassiveRealization::junction(&[inductance; 2], capacitance, band)
+    }
+
+    /// Quasi-static width step with separate inductive arms.
+    ///
+    /// Uses the Qucs impedance-step capacitance and inductance formulas,
+    /// with per-metre static inductance determining the arm split.
+    /// # Errors
+    /// Outside empirical validity or nonpassive equivalent parameters.
+    pub fn step_to(
+        self,
+        other: Self,
+        substrate: Substrate,
+        band: FrequencyBand,
+    ) -> SpiceResult<PassiveRealization> {
+        let a = self.quasi_static(substrate)?;
+        let b = other.quasi_static(substrate)?;
+        let wide = self.width.max(other.width);
+        let narrow = self.width.min(other.width);
+        let ratio = wide / narrow;
+        let er = substrate.relative_permittivity;
+        if !(1.5..=3.5).contains(&ratio)
+            || er > 10.
+            || band.limits()[1] * substrate.height > 12e6
+            || self.thickness != 0.
+            || other.thickness != 0.
+        {
+            return Err(invalid(
+                "microstrip width step outside validated thin-strip domain",
+            ));
+        }
+        let log_er = er.log10();
+        let capacitance = 1e-12
+            * wide.sqrt()
+            * narrow.sqrt()
+            * (10.1_f64
+                .mul_add(log_er, 2.33)
+                .mul_add(ratio, -12.6_f64.mul_add(log_er, 3.17)));
+        let delta = ratio - 1.;
+        let inductance = 1e-9
+            * substrate.height
+            * (0.2_f64
+                .mul_add(delta, 40.5)
+                .mul_add(delta, -75. * ratio.log10()));
+        let first = a.impedance / a.velocity();
+        let second = b.impedance / b.velocity();
+        let sum = first + second;
+        PassiveRealization::junction(
+            &[inductance * (first / sum), inductance * (second / sum)],
+            capacitance,
+            band,
+        )
     }
 }
 

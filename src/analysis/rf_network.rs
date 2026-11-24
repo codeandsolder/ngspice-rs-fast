@@ -72,6 +72,16 @@ pub struct ModeParameters {
     pub resistance_temperature_coefficient: f64,
 }
 
+/// Distributed modal propagation and impedance at one frequency.
+#[derive(Debug, Clone, Copy)]
+pub struct Propagation {
+    /// Complex propagation constant in inverse metres (attenuation + j phase).
+    pub gamma: Complex,
+    /// Characteristic impedance in ohms; absent for zero shunt admittance
+    /// or an unrepresentable impedance. Port relations remain available.
+    pub characteristic_impedance: Option<Complex>,
+}
+
 /// Validated constitutive coefficients, independent of circuit topology.
 #[derive(Debug, Clone, Copy)]
 pub struct LineMode(ModeParameters);
@@ -154,6 +164,70 @@ impl LineMode {
             return Err(invalid("unrepresentable per-metre RLGC"));
         }
         Ok((series, shunt))
+    }
+
+    /// Propagation and characteristic impedance of this mode.
+    /// # Errors
+    /// Invalid frequency or temperature, or unrepresentable propagation.
+    pub fn propagation(self, hz: f64, temperature: f64) -> SpiceResult<Propagation> {
+        let (series, shunt) = self.rlgc(hz, temperature)?;
+        let gamma = roots_product(series, shunt);
+        if !gamma.is_finite() {
+            return Err(invalid("unrepresentable propagation constant"));
+        }
+        let characteristic_impedance = if shunt == Complex::ZERO {
+            None
+        } else {
+            let magnitude = sqrt_magnitude(series) / sqrt_magnitude(shunt);
+            let (sin, cos) = (0.5 * (series.phase() - shunt.phase())).sin_cos();
+            let impedance = Complex::new(magnitude * cos, magnitude * sin);
+            impedance.is_finite().then_some(impedance)
+        };
+        Ok(Propagation {
+            gamma,
+            characteristic_impedance,
+        })
+    }
+
+    /// Replace the Debye relaxation with one matching the dielectric
+    /// loss tangent at a specified positive frequency and relaxation time.
+    ///
+    /// The stored nonrelaxing capacitance is held fixed. DC leakage is
+    /// excluded from the specified loss tangent. This is a causal single
+    /// pole material law, not a constant-tangent wideband approximation.
+    /// # Errors
+    /// Invalid target or a target outside the single-pole material domain.
+    pub fn with_dielectric_loss(self, frequency: f64, tangent: f64, tau: f64) -> SpiceResult<Self> {
+        if !frequency.is_finite()
+            || frequency <= 0.
+            || !nonnegative(tangent)
+            || !tau.is_finite()
+            || tau <= 0.
+        {
+            return Err(invalid("invalid dielectric loss reference"));
+        }
+        let x = (frequency * tau) * TAU;
+        if !x.is_finite() || x <= tangent {
+            return Err(invalid("loss tangent exceeds single-pole domain"));
+        }
+        let ratio = if x > 1. {
+            (x + x.recip()) / (1. - tangent / x)
+        } else {
+            x.mul_add(x, 1.) / (x - tangent)
+        };
+        let delta_c = if tangent == 0. {
+            0.
+        } else {
+            (self.0.capacitance * tangent) * ratio
+        };
+        if tangent > 0. && delta_c == 0. {
+            return Err(invalid("dielectric loss coefficient underflow"));
+        }
+        Self::new(ModeParameters {
+            relaxation_time: tau,
+            relaxation_capacitance: delta_c,
+            ..self.0
+        })
     }
 }
 
@@ -303,6 +377,69 @@ impl ModalRelation {
     }
 }
 
+/// An offline extracted geometric-dispersion sample.
+///
+/// Inductance and capacitance exclude the separate causal loss laws.
+/// These frequency-local coefficients establish passivity at each
+/// interpolated frequency, not a causal broadband time-domain law.
+#[derive(Debug, Clone, Copy)]
+pub struct DispersionSample {
+    /// Frequency in hertz.
+    pub frequency: f64,
+    /// External series inductance in H/m.
+    pub inductance: f64,
+    /// Nonrelaxing shunt capacitance in F/m.
+    pub capacitance: f64,
+}
+
+/// Ordered, bounded interpolation of independently extracted coefficients.
+#[derive(Debug, Clone)]
+pub struct ModeDispersion(Box<[DispersionSample]>);
+
+impl ModeDispersion {
+    /// # Errors
+    /// Nonpositive coefficients, unsorted/duplicate frequencies or excess samples.
+    pub fn new(samples: Vec<DispersionSample>) -> SpiceResult<Self> {
+        if !(2..=1_000_000).contains(&samples.len())
+            || samples.iter().any(|p| {
+                !nonnegative(p.frequency)
+                    || !p.inductance.is_finite()
+                    || p.inductance <= 0.
+                    || !p.capacitance.is_finite()
+                    || p.capacitance <= 0.
+            })
+            || samples.windows(2).any(|p| p[0].frequency >= p[1].frequency)
+        {
+            return Err(invalid("invalid prepared modal dispersion samples"));
+        }
+        Ok(Self(samples.into_boxed_slice()))
+    }
+
+    fn covers(&self, band: FrequencyBand) -> bool {
+        self.0[0].frequency <= band.low && self.0[self.0.len() - 1].frequency >= band.high
+    }
+
+    fn interpolate(&self, hz: f64) -> SpiceResult<(f64, f64)> {
+        match self.0.binary_search_by(|p| p.frequency.total_cmp(&hz)) {
+            Ok(i) => {
+                let p = self.0[i];
+                Ok((p.inductance, p.capacitance))
+            }
+            Err(i) if i > 0 && i < self.0.len() => {
+                let low = self.0[i - 1];
+                let high = self.0[i];
+                let t = (hz - low.frequency) / (high.frequency - low.frequency);
+                let blend = |a: f64, b: f64| a.mul_add(1. - t, b * t);
+                Ok((
+                    blend(low.inductance, high.inductance),
+                    blend(low.capacitance, high.capacitance),
+                ))
+            }
+            Err(_) => Err(invalid("dispersion interpolation outside samples")),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Evaluation {
     hz: u64,
@@ -322,6 +459,7 @@ pub struct PreparedLine {
     basis: Box<[f64]>,
     length: f64,
     band: FrequencyBand,
+    dispersion: Box<[Option<ModeDispersion>]>,
     // At most one analysis point is retained, shared by identical line
     // instances. The immutable snapshot outlives cache replacement.
     evaluation: Arc<Mutex<Option<Evaluation>>>,
@@ -367,8 +505,63 @@ impl PreparedLine {
             basis: basis.into_boxed_slice(),
             length,
             band,
+            dispersion: vec![None; n].into_boxed_slice(),
             evaluation: Arc::default(),
         })
+    }
+
+    /// Attach offline extracted dispersion curves to individual modes.
+    ///
+    /// Missing curves use the analytic causal coefficients. The frequency
+    /// band must be covered without extrapolation. DC still uses the
+    /// separately supplied DC resistance and leakage.
+    /// # Errors
+    /// Mode count or table coverage differs from the prepared line.
+    pub fn with_dispersion(mut self, curves: Vec<Option<ModeDispersion>>) -> SpiceResult<Self> {
+        if curves.len() != self.conductors()
+            || curves
+                .iter()
+                .flatten()
+                .any(|curve| !curve.covers(self.band))
+        {
+            return Err(invalid("modal dispersion does not cover prepared line"));
+        }
+        self.dispersion = curves.into_boxed_slice();
+        self.evaluation = Arc::default();
+        Ok(self)
+    }
+
+    fn check_frequency(&self, hz: f64) -> SpiceResult<()> {
+        if hz != 0. && !self.band.contains(hz) {
+            return Err(invalid("frequency outside prepared validity band"));
+        }
+        Ok(())
+    }
+
+    fn evaluated_mode(&self, i: usize, hz: f64) -> SpiceResult<LineMode> {
+        let mode = self.modes[i];
+        if hz != 0.
+            && let Some(curve) = &self.dispersion[i]
+        {
+            let (inductance, capacitance) = curve.interpolate(hz)?;
+            LineMode::new(ModeParameters {
+                inductance,
+                capacitance,
+                ..mode.0
+            })
+        } else {
+            Ok(mode)
+        }
+    }
+
+    /// Propagation and impedance of all prepared modes at an analysis point.
+    /// # Errors
+    /// Invalid context or unrepresentable propagation.
+    pub fn propagation(&self, hz: f64, temperature: f64) -> SpiceResult<Vec<Propagation>> {
+        self.check_frequency(hz)?;
+        (0..self.conductors())
+            .map(|i| self.evaluated_mode(i, hz)?.propagation(hz, temperature))
+            .collect()
     }
 
     /// Number of conductors (ports are ordered near end, then far end).
@@ -401,15 +594,46 @@ impl PreparedLine {
         &self.basis
     }
 
+    /// Per-metre series impedance and shunt admittance in physical conductor
+    /// coordinates. The modal basis may describe unequal coupled modes.
+    /// # Errors
+    /// Invalid frequency, temperature or unrepresentable matrix entries.
+    pub fn rlgc_matrices(
+        &self,
+        hz: f64,
+        temperature: f64,
+    ) -> SpiceResult<(DenseComplex, DenseComplex)> {
+        self.check_frequency(hz)?;
+        let n = self.conductors();
+        let mut series = DenseComplex::zeros(n)?;
+        let mut shunt = DenseComplex::zeros(n)?;
+        for (i, basis) in self.basis.chunks_exact(n).enumerate() {
+            let (z, y) = self.evaluated_mode(i, hz)?.rlgc(hz, temperature)?;
+            for (row, &a) in basis.iter().enumerate() {
+                for (col, &b) in basis.iter().enumerate() {
+                    for (matrix, value) in [(&mut series, z), (&mut shunt, y)] {
+                        let next = matrix
+                            .get(row, col)
+                            .ok_or_else(|| invalid("invalid RLGC index"))?
+                            + scaled(value, a * b);
+                        if !next.is_finite() {
+                            return Err(invalid("unrepresentable physical RLGC matrix"));
+                        }
+                        matrix.set(row, col, next)?;
+                    }
+                }
+            }
+        }
+        Ok((series, shunt))
+    }
+
     /// Evaluate all independent line relations at one analysis point.
     /// DC uses the explicitly supplied static coefficients even for a
     /// microwave-only validity band, so the bias system is well defined.
     /// # Errors
     /// Invalid frequency or temperature, outside band, or numerical range.
     pub fn relations(&self, hz: f64, temperature: f64) -> SpiceResult<Arc<[ModalRelation]>> {
-        if hz != 0. && !self.band.contains(hz) {
-            return Err(invalid("frequency outside prepared validity band"));
-        }
+        self.check_frequency(hz)?;
         let mut cached = self
             .evaluation
             .lock()
@@ -420,11 +644,9 @@ impl PreparedLine {
         {
             return Ok(Arc::clone(&previous.relations));
         }
-        let relations: Arc<[ModalRelation]> = self
-            .modes
-            .iter()
-            .map(|m| {
-                let (z, y) = m.rlgc(hz, temperature)?;
+        let relations: Arc<[ModalRelation]> = (0..self.conductors())
+            .map(|i| {
+                let (z, y) = self.evaluated_mode(i, hz)?.rlgc(hz, temperature)?;
                 ModalRelation::new(z, y, self.length)
             })
             .collect::<SpiceResult<Vec<_>>>()?
@@ -434,6 +656,7 @@ impl PreparedLine {
             temperature: temperature.to_bits(),
             relations: Arc::clone(&relations),
         });
+        drop(cached);
         Ok(relations)
     }
 
