@@ -83,6 +83,40 @@ fn DEXP(A: f64) -> (f64, f64) {
     }
 }
 
+/// Smooth the transition from linear drain voltage to saturation using
+/// the smaller root of y² - (sat + drain + delta)y + sat*drain = 0.
+/// Keep the complementary gaps as independent values: reconstructing them
+/// by subtraction would lose precisely the low-field terms needed by the
+/// channel-length and capacitance derivatives.
+struct DrainSmoothing {
+    effective: f64,
+    drain_excess: f64,
+    saturation_partial: f64,
+    drain_partial: f64,
+}
+
+fn positive_half_sum(x: f64, root: f64, product: f64) -> f64 {
+    if x >= 0. {
+        0.5 * (root + x)
+    } else {
+        2. * product / (root - x)
+    }
+}
+
+fn smooth_drain(saturation: f64, drain: f64, delta: f64) -> DrainSmoothing {
+    let x = saturation - drain - delta;
+    let root = x.mul_add(x, 4. * delta * saturation).sqrt();
+    let effective = (2. * saturation / (saturation + drain + delta + root)) * drain;
+    let drain_excess = positive_half_sum(drain - saturation - delta, root, delta * drain);
+    let saturation_excess = positive_half_sum(x, root, delta * saturation);
+    DrainSmoothing {
+        effective,
+        drain_excess,
+        saturation_partial: drain_excess / root,
+        drain_partial: saturation_excess / root,
+    }
+}
+
 /// `BSIM4polyDepletion`: the poly-gate depletion effective gate voltage and
 /// its gate derivative, `(Vgs_eff, dVgs_eff_dVg)`.
 pub(super) fn BSIM4polyDepletion(

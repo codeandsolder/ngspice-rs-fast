@@ -340,14 +340,95 @@ impl PhysicalFixture {
     }
 }
 
-fn richardson(mut f: impl FnMut(f64) -> f64, h: f64) -> (f64, f64) {
-    let coarse = (f(h) - f(-h)) / (2. * h);
-    let fine = (f(h * 0.5) - f(-h * 0.5)) / h;
+fn richardson([minus, plus, minus_half, plus_half]: [f64; 4], h: f64) -> (f64, f64) {
+    let coarse = (plus - minus) / (2. * h);
+    let fine = (plus_half - minus_half) / h;
     ((4. * fine - coarse) / 3., (fine - coarse).abs())
+}
+
+fn record_error(
+    errors: &mut Vec<String>,
+    actual: f64,
+    expected: f64,
+    bound: f64,
+    context: impl FnOnce() -> String,
+) {
+    if !actual.is_finite() || !expected.is_finite() || (actual - expected).abs() > bound {
+        errors.push(format!(
+            "{}: {actual:e} vs {expected:e}, bound {bound:e}",
+            context()
+        ));
+    }
+}
+
+fn check_physical_point(
+    fixture: &PhysicalFixture,
+    v: [f64; 4],
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    let p = fixture.evaluate(v);
+    let q_scale = p.charge.iter().map(|x| x.abs()).sum::<f64>();
+    record_error(
+        errors,
+        p.charge.iter().sum(),
+        0.,
+        q_scale * 8. * f64::EPSILON,
+        || format!("{context}: charge KCL"),
+    );
+    // The source row and bulk column are reconstructed from other entries.
+    // Their rounding budget therefore depends on the whole matrix norm,
+    // not the norm of a nearly cancelled row.
+    let c_scale = p.capacitance.iter().flatten().map(|x| x.abs()).sum::<f64>();
+    for (r, row) in p.capacitance.iter().enumerate() {
+        record_error(
+            errors,
+            row.iter().sum(),
+            0.,
+            c_scale * 8. * f64::EPSILON,
+            || format!("{context}: common mode row {r} {row:?}"),
+        );
+    }
+    for col in 0..4 {
+        let column = p.capacitance.map(|row| row[col]);
+        record_error(
+            errors,
+            column.iter().sum(),
+            0.,
+            c_scale * 8. * f64::EPSILON,
+            || format!("{context}: charge Jacobian KCL col {col}"),
+        );
+        let h = 1e-4;
+        let samples = [-h, h, -h * 0.5, h * 0.5].map(|delta| {
+            let mut shifted = v;
+            shifted[col] += delta;
+            fixture.evaluate(shifted)
+        });
+        let (reference, error) = richardson(samples.each_ref().map(|sample| sample.current), h);
+        record_error(
+            errors,
+            p.current_gradient[col],
+            reference,
+            3e-5 * reference.abs() + error * 0.1 + 1e-13,
+            || format!("{context}: current col {col}"),
+        );
+        for row in 0..4 {
+            let (reference, error) =
+                richardson(samples.each_ref().map(|sample| sample.charge[row]), h);
+            record_error(
+                errors,
+                p.capacitance[row][col],
+                reference,
+                3e-5 * reference.abs() + error * 0.1 + 1e-21,
+                || format!("{context}: charge row {row} col {col}"),
+            );
+        }
+    }
 }
 
 #[test]
 fn physical_channel_and_charge_partials_against_richardson() {
+    let mut errors = Vec::new();
     for polarity in [-1, 1] {
         for cap in 0..=2 {
             for cv in 0..=1 {
@@ -361,56 +442,67 @@ fn physical_channel_and_charge_partials_against_richardson() {
                         [0.9, -0.2, 0., -0.5],
                     ] {
                         let v = normalized.map(|x| x * f64::from(polarity));
-                        let p = fixture.evaluate(v);
                         let context = format!(
                             "pol={polarity} cap={cap} cv={cv} xpart={partition} bias={normalized:?}"
                         );
-                        let q_scale = p.charge.iter().map(|x| x.abs()).fold(0., f64::max);
-                        assert!(
-                            p.charge.iter().sum::<f64>().abs() <= q_scale * 8. * f64::EPSILON,
-                            "{context}: charge KCL"
-                        );
-                        for row in &p.capacitance {
-                            let scale = row.iter().map(|x| x.abs()).sum::<f64>();
-                            assert!(
-                                row.iter().sum::<f64>().abs() <= scale * 8. * f64::EPSILON,
-                                "{context}: common mode"
-                            );
-                        }
-                        for col in 0..4 {
-                            let column = p.capacitance.map(|row| row[col]);
-                            let scale = column.iter().map(|x| x.abs()).sum::<f64>();
-                            assert!(
-                                column.iter().sum::<f64>().abs() <= scale * 8. * f64::EPSILON,
-                                "{context}: charge Jacobian KCL"
-                            );
-                            let sample = |delta| {
-                                let mut shifted = v;
-                                shifted[col] += delta;
-                                fixture.evaluate(shifted)
-                            };
-                            let (reference, error) =
-                                richardson(|delta| sample(delta).current, 1e-4);
-                            let actual = p.current_gradient[col];
-                            assert!(
-                                (actual - reference).abs()
-                                    <= 3e-5 * reference.abs() + error * 0.1 + 1e-13,
-                                "{context}: current col {col}: {actual:e} vs {reference:e}, truncation {error:e}"
-                            );
-                            for row in 0..4 {
-                                let (reference, error) =
-                                    richardson(|delta| sample(delta).charge[row], 1e-4);
-                                let actual = p.capacitance[row][col];
-                                assert!(
-                                    (actual - reference).abs()
-                                        <= 3e-5 * reference.abs() + error * 0.1 + 1e-21,
-                                    "{context}: charge row {row} col {col}: {actual:e} vs {reference:e}, truncation {error:e}"
-                                );
-                            }
-                        }
+                        check_physical_point(&fixture, v, &context, &mut errors);
                     }
                 }
             }
         }
+    }
+    assert!(
+        errors.is_empty(),
+        "{} independent derivative/conservation failures:\n{}",
+        errors.len(),
+        errors.join("\n")
+    );
+}
+
+#[test]
+fn smoothed_drain_preserves_small_signal_and_saturation_limits() {
+    let sat = 0.5;
+    let delta = 0.01;
+    // Independently evaluated with 70-digit decimal arithmetic from the
+    // rationalized quadratic root (not the original subtractive formula).
+    for (drain, expected) in [
+        (1e-3, 9.803_543_928_288_431e-4),
+        (1e-6, 9.803_921_191_697_806e-7),
+        (1e-9, 9.803_921_568_250_522e-10),
+        (1e-12, 9.803_921_568_627_074e-13),
+        (1e-15, 9.803_921_568_627_451e-16),
+        (1e-18, 9.803_921_568_627_452e-19),
+    ] {
+        let p = super::smooth_drain(sat, drain, delta);
+        assert!((p.effective - expected).abs() <= 8. * f64::EPSILON * expected);
+        assert!((p.effective + p.drain_excess - drain).abs() <= 8. * f64::EPSILON * drain);
+        assert!(p.saturation_partial > 0. && p.drain_partial > 0.);
+    }
+    let zero = super::smooth_drain(sat, 0., delta);
+    assert_eq!(zero.effective, 0.);
+    assert_eq!(zero.drain_excess, 0.);
+    assert_eq!(zero.saturation_partial, 0.);
+    assert!((zero.drain_partial - sat / (sat + delta)).abs() < 4. * f64::EPSILON);
+    for (sat, drain) in [
+        (0.5, 0.1),
+        (0.5, 0.49),
+        (0.5, 0.5),
+        (0.5, 1.2),
+        (1e-8, 1.),
+        (1., 1e-8),
+    ] {
+        let p = super::smooth_drain(sat, drain, delta);
+        let h = 1e-5 * sat.min(drain);
+        let steps = [-h, h, -h * 0.5, h * 0.5];
+        let (ds, es) = richardson(
+            steps.map(|d| super::smooth_drain(sat + d, drain, delta).effective),
+            h,
+        );
+        let (dd, ed) = richardson(
+            steps.map(|d| super::smooth_drain(sat, drain + d, delta).effective),
+            h,
+        );
+        assert!((p.saturation_partial - ds).abs() < 2e-8 * ds.abs() + es * 0.1 + 2e-10);
+        assert!((p.drain_partial - dd).abs() < 2e-8 * dd.abs() + ed * 0.1 + 2e-10);
     }
 }

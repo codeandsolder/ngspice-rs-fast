@@ -39,7 +39,7 @@
 use super::bias::LoadBias;
 use super::{
     BSIM4polyDepletion, Charge_q, DEXP, EPS0, EPSSI, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP,
-    MIN_EXP, MM, Model, SizeParam, exp, log, sqrt,
+    MIN_EXP, MM, Model, SizeParam, exp, log, smooth_drain, sqrt,
 };
 
 /// Body potential, threshold, effective gate bias and their independent derivatives.
@@ -1029,40 +1029,14 @@ pub(super) fn transport(
         dVdsat_dVd = (dT1_dVd - (T1 * dT1_dVd - T0 * dT2_dVd) / T3) / T0;
     }
     here.vdsat = Vdsat;
-    T1 = Vdsat - Vds - pParam.delta;
-    dT1_dVg = dVdsat_dVg;
-    dT1_dVd = dVdsat_dVd - 1.0;
-    dT1_dVb = dVdsat_dVb;
-    T2 = sqrt(T1 * T1 + 4.0 * pParam.delta * Vdsat);
-    T0 = T1 / T2;
-    T9 = 2.0 * pParam.delta;
-    T3 = T9 / T2;
-    dT2_dVg = T0 * dT1_dVg + T3 * dVdsat_dVg;
-    dT2_dVd = T0 * dT1_dVd + T3 * dVdsat_dVd;
-    dT2_dVb = T0 * dT1_dVb + T3 * dVdsat_dVb;
-    if T1 >= 0.0 {
-        Vdseff = Vdsat - 0.5 * (T1 + T2);
-        dVdseff_dVg = dVdsat_dVg - 0.5 * (dT1_dVg + dT2_dVg);
-        dVdseff_dVd = dVdsat_dVd - 0.5 * (dT1_dVd + dT2_dVd);
-        dVdseff_dVb = dVdsat_dVb - 0.5 * (dT1_dVb + dT2_dVb);
-    } else {
-        T4 = T9 / (T2 - T1);
-        T5 = 1.0 - T4;
-        T6 = Vdsat * T4 / (T2 - T1);
-        Vdseff = Vdsat * T5;
-        dVdseff_dVg = dVdsat_dVg * T5 + T6 * (dT2_dVg - dT1_dVg);
-        dVdseff_dVd = dVdsat_dVd * T5 + T6 * (dT2_dVd - dT1_dVd);
-        dVdseff_dVb = dVdsat_dVb * T5 + T6 * (dT2_dVb - dT1_dVb);
-    }
-    if Vds == 0.0 {
-        Vdseff = 0.0;
-        dVdseff_dVg = 0.0;
-        dVdseff_dVb = 0.0;
-    }
-    if Vdseff > Vds {
-        Vdseff = Vds;
-    }
-    diffVds = Vds - Vdseff;
+    let smoothing = smooth_drain(Vdsat, Vds, pParam.delta);
+    Vdseff = smoothing.effective;
+    dVdseff_dVg = smoothing.saturation_partial * dVdsat_dVg;
+    dVdseff_dVd = smoothing
+        .saturation_partial
+        .mul_add(dVdsat_dVd, smoothing.drain_partial);
+    dVdseff_dVb = smoothing.saturation_partial * dVdsat_dVb;
+    diffVds = smoothing.drain_excess;
     here.Vdseff = Vdseff;
     if (model.lambdaGiven) && (model.lambda > 0.0) {
         T1 = Leff * ueff;

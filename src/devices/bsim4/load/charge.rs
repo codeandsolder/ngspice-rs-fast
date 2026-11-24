@@ -43,7 +43,7 @@
 #![expect(unused_parens, reason = "preserve C expression grouping")]
 use super::{
     DELTA_1, DELTA_3, DELTA_4, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, Model,
-    SizeParam, exp, fabs, log, mode, sqrt, state,
+    SizeParam, exp, fabs, log, mode, smooth_drain, sqrt, state,
 };
 use super::{
     bias::LoadBias,
@@ -586,34 +586,11 @@ pub(super) fn intrinsic(
             AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
             dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb;
             VdsatCV = Vgsteff / AbulkCV;
-            T0 = VdsatCV - Vds - DELTA_4;
-            dT0_dVg = 1.0 / AbulkCV;
-            dT0_dVb = -VdsatCV * dAbulkCV_dVb / AbulkCV;
-            T1 = sqrt(T0 * T0 + 4.0 * DELTA_4 * VdsatCV);
-            dT1_dVg = (T0 + DELTA_4 + DELTA_4) / T1;
-            dT1_dVd = -T0 / T1;
-            dT1_dVb = dT1_dVg * dT0_dVb;
-            dT1_dVg *= dT0_dVg;
-            if T0 >= 0.0 {
-                VdseffCV = VdsatCV - 0.5 * (T0 + T1);
-                dVdseffCV_dVg = 0.5 * (dT0_dVg - dT1_dVg);
-                dVdseffCV_dVd = 0.5 * (1.0 - dT1_dVd);
-                dVdseffCV_dVb = 0.5 * (dT0_dVb - dT1_dVb);
-            } else {
-                let twice_delta = DELTA_4 + DELTA_4;
-                T3 = twice_delta / (T1 - T0);
-                T4 = 1.0 - T3;
-                T5 = VdsatCV * T3 / (T1 - T0);
-                VdseffCV = VdsatCV * T4;
-                dVdseffCV_dVg = dT0_dVg * T4 + T5 * (dT1_dVg - dT0_dVg);
-                dVdseffCV_dVd = T5 * (dT1_dVd + 1.0);
-                dVdseffCV_dVb = dT0_dVb * (T4 - T5) + T5 * dT1_dVb;
-            }
-            if Vds == 0.0 {
-                VdseffCV = 0.0;
-                dVdseffCV_dVg = 0.0;
-                dVdseffCV_dVb = 0.0;
-            }
+            let smoothing = smooth_drain(VdsatCV, Vds, DELTA_4);
+            VdseffCV = smoothing.effective;
+            dVdseffCV_dVg = smoothing.saturation_partial * (1.0 / AbulkCV);
+            dVdseffCV_dVd = smoothing.drain_partial;
+            dVdseffCV_dVb = -smoothing.saturation_partial * VdsatCV * dAbulkCV_dVb / AbulkCV;
             T0 = AbulkCV * VdseffCV;
             T1 = 12.0 * (Vgsteff - 0.5 * T0 + 1.0e-20);
             T2 = VdseffCV / T1;
@@ -792,34 +769,11 @@ pub(super) fn intrinsic(
             AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
             dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb;
             VdsatCV = VgDP / AbulkCV;
-            T0 = VdsatCV - Vds - DELTA_4;
-            dT0_dVg = dVgDP_dVg / AbulkCV;
-            dT0_dVb = -VdsatCV * dAbulkCV_dVb / AbulkCV;
-            T1 = sqrt(T0 * T0 + 4.0 * DELTA_4 * VdsatCV);
-            dT1_dVg = (T0 + DELTA_4 + DELTA_4) / T1;
-            dT1_dVd = -T0 / T1;
-            dT1_dVb = dT1_dVg * dT0_dVb;
-            dT1_dVg *= dT0_dVg;
-            if T0 >= 0.0 {
-                VdseffCV = VdsatCV - 0.5 * (T0 + T1);
-                dVdseffCV_dVg = 0.5 * (dT0_dVg - dT1_dVg);
-                dVdseffCV_dVd = 0.5 * (1.0 - dT1_dVd);
-                dVdseffCV_dVb = 0.5 * (dT0_dVb - dT1_dVb);
-            } else {
-                let twice_delta = DELTA_4 + DELTA_4;
-                T3 = twice_delta / (T1 - T0);
-                T4 = 1.0 - T3;
-                T5 = VdsatCV * T3 / (T1 - T0);
-                VdseffCV = VdsatCV * T4;
-                dVdseffCV_dVg = dT0_dVg * T4 + T5 * (dT1_dVg - dT0_dVg);
-                dVdseffCV_dVd = T5 * (dT1_dVd + 1.0);
-                dVdseffCV_dVb = dT0_dVb * (T4 - T5) + T5 * dT1_dVb;
-            }
-            if Vds == 0.0 {
-                VdseffCV = 0.0;
-                dVdseffCV_dVg = 0.0;
-                dVdseffCV_dVb = 0.0;
-            }
+            let smoothing = smooth_drain(VdsatCV, Vds, DELTA_4);
+            VdseffCV = smoothing.effective;
+            dVdseffCV_dVg = smoothing.saturation_partial * (dVgDP_dVg / AbulkCV);
+            dVdseffCV_dVd = smoothing.drain_partial;
+            dVdseffCV_dVb = -smoothing.saturation_partial * VdsatCV * dAbulkCV_dVb / AbulkCV;
             T0 = AbulkCV * VdseffCV;
             T1 = VgDP;
             T2 = 12.0 * (T1 - 0.5 * T0 + 1.0e-20);
