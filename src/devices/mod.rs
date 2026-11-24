@@ -77,6 +77,7 @@ pub mod nonlinear;
 pub mod nport;
 pub mod passive;
 pub mod pulse;
+pub mod rf_passive;
 pub use passive::PassiveParameters;
 pub mod schema;
 pub mod sensitivity;

@@ -57,6 +57,7 @@ mod pz;
 pub mod rawfile;
 mod reduction;
 pub mod results;
+pub mod rf_network;
 pub mod selection;
 mod sens;
 mod sparam;
