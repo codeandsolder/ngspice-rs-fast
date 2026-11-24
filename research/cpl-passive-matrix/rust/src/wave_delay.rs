@@ -132,6 +132,15 @@ impl Trace {
         }
     }
 
+    fn reserve_more(&mut self, count: usize) -> Result<(), &'static str> {
+        self.times
+            .try_reserve(count)
+            .map_err(|_| "wave timestamp allocation failed")?;
+        self.samples
+            .try_reserve(count)
+            .map_err(|_| "wave sample allocation failed")
+    }
+
     fn reserve(&mut self) -> Result<(), &'static str> {
         self.times
             .try_reserve(1)
@@ -630,6 +639,9 @@ impl WaveNetwork {
         (self.input_energy, self.output_energy)
     }
 }
+
+mod prepared;
+pub use prepared::{PreparedWaveStep, WaveBatch};
 
 #[cfg(test)]
 mod tests;

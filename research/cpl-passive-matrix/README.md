@@ -372,3 +372,53 @@ would require an in-step propagation solution for trial
 input waveforms and its corresponding Newton Jacobian; it
 must not be worked around by extrapolating unaccepted histories.
 The research code does not claim full native P/CPL support.
+
+## Prepared large global timesteps: causal inner propagation with terminal Jacobians
+
+The Rust standalone research engine now has a reusable
+PreparedWaveStep from WaveNetwork::prepare_step(global_end_time).
+It eliminates the **global** timestep requirement that every
+circuit/Newton step be shorter than half of the shortest LC
+subsegment delay. Instead, it resolves as many internal causal
+substeps as the physical delay topology needs, while symbolically
+keeping all internal waves affine in the 2N unknown *final* terminal
+incident-wave amplitudes. A single prepared response may be
+re-evaluated for arbitrarily many proposed terminal voltages/currents
+without rerunning its O(internal-substeps*stages) propagation.
+
+The endpoint reflected/transmitted-wave Jacobians are explicit
+row-major matrices, including near-to-far and far-to-near
+cross-coupling. WaveNetwork::accept_prepared commits **all**
+interior delay samples in one atomic accepted-state operation; no
+internal knot is committed when an outer Newton trial is rejected.
+The unique owner/revision marker is still enforced, and all
+wave arrays, times, energy and history capacities are preflighted
+before any accepted state change. Histories retain all necessary
+within-step causal knots and then prune safely at the macro end.
+
+A newly found numerical detail matters: simply taking uniform
+internal substeps can smear sharp source corners when their delayed
+arrivals fall between the uniform knots. For example, a one-stage
+lossless cable with 1ns propagation, a linear input ramp 0..2ns,
+and then a held input must transmit exactly 1V at t=3ns, but an
+unaugmented 3-point substep grid gave 0.958333V due interpolation
+across the delayed corner. The event scheduler in
+wave_delay/prepared/events.rs propagates accepted trace timestamps
+and actual physical source front times through the exact modal
+delay / nonzero static scattering graph, inserting delayed corner
+times into the internal grid. It preserves *both* front causality
+and piecewise-linear corner timing without output clipping.
+
+Rust test coverage increased from 19 to **25 passing tests**.
+New tests include one global timestep traversing entire lossless
+1/4/16/32-cell cables, precise delayed input corners, reuse of
+the same affine response across different Newton incident waves,
+analytic vs finite-variation terminal Jacobians, future declared
+source front, and atomic stale/foreign/malformed prepared-batch
+rejection. All-target strict Clippy under managed sccache remains
+zero-warning. The local internal work and materialized history
+still scale with the number of necessary physical propagation
+events; an event-driven sparse implementation and native solver
+state integration are potential further performance optimizations.
+This is a **prepared response substrate**, not yet a native P
+device registered in the simulator.
