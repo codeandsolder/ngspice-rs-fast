@@ -10,10 +10,12 @@ use super::plan::CoupledLinePlan;
 use crate::primitives::numeric::{scale_power, split_power};
 use crate::primitives::{Real, SpiceResult};
 
-/// Eigenvectors are row-major physical conductor × mode. In every mode,
-/// C*V=I, L*I=λV and Vᵀ*I=Identity. The listed characteristic admittance
-/// is 1/sqrt(λ) in these metric-normalized coordinates, not the physical
-/// conductor admittance. See the power normalization of PhysicalModalLine.
+/// Reciprocal LC eigenbases in row-major physical conductor × mode order.
+///
+/// In every mode, C*V=I, L*I=λV and Vᵀ*I=Identity. The listed characteristic
+/// admittance is 1/sqrt(λ) in metric-normalized modal coordinates, not
+/// physical conductor admittance. The `PhysicalModalLine` converts the basis
+/// to passive power-normalized travelling waves.
 #[derive(Debug, Clone)]
 pub struct CoupledLineModes {
     /// Physical signal conductors, excluding the two return terminals.
@@ -109,8 +111,8 @@ fn symmetric_eigenvectors(mut a: Vec<Real>, order: usize) -> SpiceResult<(Vec<Re
                 let sine = tangent * cosine;
                 let ap = a[first * order + first];
                 let aq = a[second * order + second];
-                a[first * order + first] = ap - tangent * ab;
-                a[second * order + second] = aq + tangent * ab;
+                a[first * order + first] = tangent.mul_add(-ab, ap);
+                a[second * order + second] = tangent.mul_add(ab, aq);
                 a[first * order + second] = 0.;
                 a[second * order + first] = 0.;
                 for row in 0..order {
@@ -161,61 +163,69 @@ impl CoupledLinePlan {
     /// L or C is singular/nonpositive, numerical orthogonality cannot be
     /// represented, a delay overflows/underflows, or eigenwork fails.
     pub fn exact_lc_modes(&self) -> SpiceResult<CoupledLineModes> {
-        let n = self.conductors();
-        let c = self.c.data();
-        let l = self.l.data();
-        let cscale = c.iter().fold(0.0_f64, |largest, &v| largest.max(v.abs()));
-        let lscale = l.iter().fold(0.0_f64, |largest, &v| largest.max(v.abs()));
-        if cscale <= 0. || lscale <= 0. {
+        let order = self.conductors();
+        let capacitance = self.c.data();
+        let inductance = self.l.data();
+        let capacitance_scale = capacitance
+            .iter()
+            .fold(0.0_f64, |largest, &v| largest.max(v.abs()));
+        let inductance_scale = inductance
+            .iter()
+            .fold(0.0_f64, |largest, &v| largest.max(v.abs()));
+        if capacitance_scale <= 0. || inductance_scale <= 0. {
             return Err(super::invalid(
                 "LC modal delay requires nonzero inductance and capacitance",
             ));
         }
-        let lower = normalized_cholesky(c, n, cscale)?;
-        let mut product = vec![0.0_f64; n * n];
-        let mut symmetric = vec![0.0_f64; n * n];
-        for row in 0..n {
-            for col in 0..n {
+        let lower = normalized_cholesky(capacitance, order, capacitance_scale)?;
+        let mut product = vec![0.0_f64; order * order];
+        let mut symmetric = vec![0.0_f64; order * order];
+        for row in 0..order {
+            for col in 0..order {
                 let mut value = 0.;
-                for k in 0..n {
-                    value = (l[row * n + k] / lscale).mul_add(lower[k * n + col], value);
+                for k in 0..order {
+                    value = (inductance[row * order + k] / inductance_scale)
+                        .mul_add(lower[k * order + col], value);
                 }
-                product[row * n + col] = value;
+                product[row * order + col] = value;
             }
         }
-        for row in 0..n {
-            for col in 0..n {
+        for row in 0..order {
+            for col in 0..order {
                 let mut value = 0.;
-                for k in 0..n {
-                    value = lower[k * n + row].mul_add(product[k * n + col], value);
+                for k in 0..order {
+                    value = lower[k * order + row].mul_add(product[k * order + col], value);
                 }
-                symmetric[row * n + col] = value;
+                symmetric[row * order + col] = value;
             }
         }
-        for row in 0..n {
+        for row in 0..order {
             for col in 0..row {
-                let averaged = symmetric[row * n + col].midpoint(symmetric[col * n + row]);
-                symmetric[row * n + col] = averaged;
-                symmetric[col * n + row] = averaged;
+                let averaged = symmetric[row * order + col].midpoint(symmetric[col * order + row]);
+                symmetric[row * order + col] = averaged;
+                symmetric[col * order + row] = averaged;
             }
         }
-        let (normalized_eigenvalues, eigenvectors) = symmetric_eigenvectors(symmetric, n)?;
-        let root_cscale = cscale.sqrt();
+        let (normalized_eigenvalues, eigenvectors) = symmetric_eigenvectors(symmetric, order)?;
+        let root_cscale = capacitance_scale.sqrt();
         let mut modes = CoupledLineModes {
-            conductors: n,
-            voltage_basis: vec![0.; n * n],
-            current_basis: vec![0.; n * n],
-            characteristic_admittances: Vec::with_capacity(n),
-            total_delays: Vec::with_capacity(n),
+            conductors: order,
+            voltage_basis: vec![0.; order * order],
+            current_basis: vec![0.; order * order],
+            characteristic_admittances: Vec::with_capacity(order),
+            total_delays: Vec::with_capacity(order),
         };
         for (mode, &lambda) in normalized_eigenvalues.iter().enumerate() {
             // Multiplication order must not overflow just because the
             // normalized eigenvalue exceeds one: the physical L*C may be
-            // representable even when lambda*lscale is not.
-            let (a, ae) = split_power(lambda);
-            let (b, be) = split_power(lscale);
-            let (c, ce) = split_power(cscale);
-            let physical_lambda = scale_power(a * b * c, ae + be + ce);
+            // representable even when lambda*inductance_scale is not.
+            let (modal_significand, modal_exponent) = split_power(lambda);
+            let (inductance_significand, inductance_exponent) = split_power(inductance_scale);
+            let (capacitance_significand, capacitance_exponent) = split_power(capacitance_scale);
+            let physical_lambda = scale_power(
+                modal_significand * inductance_significand * capacitance_significand,
+                modal_exponent + inductance_exponent + capacitance_exponent,
+            );
             if !physical_lambda.is_finite() || physical_lambda <= 0. {
                 return Err(super::invalid(
                     "LC modal eigenvalue cannot produce positive delay",
@@ -231,21 +241,22 @@ impl CoupledLinePlan {
             }
             modes.characteristic_admittances.push(admittance);
             modes.total_delays.push(delay);
-            for row in 0..n {
+            for row in 0..order {
                 let mut current = 0.;
                 for col in 0..=row {
-                    current = lower[row * n + col].mul_add(eigenvectors[col * n + mode], current);
+                    current =
+                        lower[row * order + col].mul_add(eigenvectors[col * order + mode], current);
                 }
-                modes.current_basis[row * n + mode] = current * root_cscale;
+                modes.current_basis[row * order + mode] = current * root_cscale;
             }
-            for row in (0..n).rev() {
-                let mut voltage = eigenvectors[row * n + mode];
-                for k in row + 1..n {
-                    voltage = (-lower[k * n + row])
-                        .mul_add(modes.voltage_basis[k * n + mode] * root_cscale, voltage);
+            for row in (0..order).rev() {
+                let mut voltage = eigenvectors[row * order + mode];
+                for k in row + 1..order {
+                    voltage = (-lower[k * order + row])
+                        .mul_add(modes.voltage_basis[k * order + mode] * root_cscale, voltage);
                 }
-                modes.voltage_basis[row * n + mode] =
-                    (voltage / lower[row * n + row]) / root_cscale;
+                modes.voltage_basis[row * order + mode] =
+                    (voltage / lower[row * order + row]) / root_cscale;
             }
         }
         if modes
