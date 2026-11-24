@@ -113,15 +113,13 @@ struct Trace {
 /// Verified fixed-stamp batches for a circuit's sparse matrix.
 ///
 /// One circuit's verified fixed stamp batches ([`SparseMatrix::add_fixed`]):
-/// the exact trace they were verified against and the ordered batches within
-/// each device. A device may interleave several fixed-size stamp groups with
-/// ordinary stamps. No dynamic matrix lookup is needed for verified groups.
-/// The circuit keeps this metadata between loads, without changing device
-/// order, matrix-entry accumulation order, or trial-state transactions.
+/// the trace they were verified against and, per device load position, the
+/// batch length and which of its entries were stamped (0 until verified).
+/// The circuit keeps it between loads and lends it to each bound matrix.
 #[derive(Debug, Clone, Default)]
 pub struct FixedStamps {
     trace: Option<Arc<Trace>>,
-    batches: Vec<Vec<Option<VerifiedBatch>>>,
+    batches: Vec<Option<VerifiedBatch>>,
 }
 
 impl FixedStamps {
@@ -140,13 +138,10 @@ impl PartialEq for FixedStamps {
     }
 }
 
-/// One segment of the immutable per-device trace, with entries omitted at
-/// ground represented by zero mask bits. `start..end` may cover a strict
-/// subset of the device: preceding or following nonfixed stamps stay ordered.
+/// A verified fixed batch contains exactly the traced (non-ground)
+/// positions; its mask must not have any bits beyond the batch length.
 #[derive(Debug, Clone, Copy)]
 struct VerifiedBatch {
-    start: usize,
-    end: usize,
     mask: u32,
     len: u8,
 }
@@ -456,8 +451,6 @@ struct Bound {
     trace: Arc<Trace>,
     device: usize,
     active: bool,
-    /// The next fixed-group call within this device in stamping order.
-    batch_index: usize,
     /// Out-of-order device positions cannot form one contiguous trace.
     traceable: bool,
     /// Where the present device's segment of `trace` starts.
@@ -480,7 +473,6 @@ impl Clone for Bound {
             trace: Arc::clone(&self.trace),
             device: self.device,
             active: self.active,
-            batch_index: self.batch_index,
             traceable: self.traceable,
             start: self.start,
             cursor: self.cursor,
@@ -533,7 +525,6 @@ impl Bound {
             && let Some(&end) = self.trace.starts.get(index + 1)
         {
             self.device = index;
-            self.batch_index = 0;
             self.start = self.end;
             self.end = end;
             return Ok(());
@@ -565,7 +556,6 @@ impl Bound {
             self.recording = Some(Trace::default());
         }
         self.device = index;
-        self.batch_index = 0;
         self.active = true;
         if let Some(recording) = &mut self.recording {
             let additional = next.saturating_sub(recording.starts.len());
@@ -588,7 +578,6 @@ impl Bound {
         }
         self.trace = trace;
         self.device = 0;
-        self.batch_index = 0;
         self.active = false;
         self.traceable = true;
         self.start = 0;
@@ -766,7 +755,6 @@ impl SparseMatrix {
                 trace: pattern.trace(),
                 device: 0,
                 active: false,
-                batch_index: 0,
                 traceable: true,
                 start: 0,
                 cursor: 0,
@@ -862,7 +850,7 @@ impl SparseMatrix {
             fixed.trace = Some(Arc::clone(&bound.trace));
             fixed.batches.clear();
             reserve(&mut fixed.batches, devices)?;
-            fixed.batches.resize_with(devices, Vec::new);
+            fixed.batches.resize(devices, None);
         }
         bound.fixed = fixed;
         Ok(None)
@@ -888,31 +876,23 @@ impl SparseMatrix {
         let Some(bound) = &mut self.bound else {
             return false;
         };
-        let Some(batch) = bound
-            .fixed
-            .batches
-            .get(bound.device)
-            .and_then(|groups| groups.get(bound.batch_index))
-            .copied()
-            .flatten()
-        else {
+        let Some(batch) = bound.fixed.batches.get(bound.device).copied().flatten() else {
             return false;
         };
         if N != usize::from(batch.len)
             || !bound.traceable
             || !bound.active
             || bound.recording.is_some()
-            || bound.cursor != batch.start
-            || batch.start < bound.start
-            || batch.end > bound.end
+            || bound.cursor != bound.start
         {
             return false;
         }
-        let Some(traced) = bound.trace.entries.get(batch.start..batch.end) else {
+        let Some(traced) = bound.trace.entries.get(bound.start..bound.end) else {
             return false;
         };
-        // A verified group's mask is tied to the immutable trace. Other
-        // groups and ordinary stamps may be interleaved in one device load.
+        // A verified batch's mask is tied to this immutable trace; every
+        // set bit corresponds to one entry. Full batches are a straight
+        // zip, and partial batches visit just the set bits in stamp order.
         let mut mask = batch.mask;
         debug_assert_eq!(traced.len(), mask.count_ones() as usize);
         bound.view.take();
@@ -927,8 +907,7 @@ impl SparseMatrix {
                 mask &= mask - 1;
             }
         }
-        bound.cursor = batch.end;
-        bound.batch_index += 1;
+        bound.cursor = bound.end;
         true
     }
 
@@ -942,49 +921,27 @@ impl SparseMatrix {
             .map(|bound| bound.cursor)
     }
 
-    /// After a fixed group stamped entry by entry from `start`, verify only
-    /// that group's positions against the immutable trace. Other groups and
-    /// ordinary stamps may precede or follow it in the same device. Invalid
-    /// lengths, masks and changing traces can never become verified batches.
-    ///
-    /// # Errors
-    /// A batch ordinal cannot be stored within the bounded preparation cache.
-    pub fn verify_fixed(&mut self, start: Option<usize>, len: usize, mask: u64) -> SpiceResult<()> {
+    /// After a device stamped its fixed batch entry by entry from `start`
+    /// ([`Self::fixed_start`]), records it as verified when those stamps were
+    /// exactly the device's whole traced segment: the entries in `mask`, of
+    /// `len`, replayed in order with nothing recorded.
+    pub fn verify_fixed(&mut self, start: Option<usize>, len: usize, mask: u64) {
         let Some(bound) = &mut self.bound else {
-            return Ok(());
+            return;
         };
-        let batch_index = bound.batch_index;
-        bound.batch_index += 1;
-        let Some(groups) = bound.fixed.batches.get_mut(bound.device) else {
-            return Ok(());
-        };
-        let verified = if let Some(start) = start
-            && len <= FIXED_MAX
+        if len <= FIXED_MAX
             && mask >> len == 0
             && bound.traceable
             && bound.active
+            && start == Some(bound.start)
             && bound.recording.is_none()
-            && start >= bound.start
-            && bound.cursor <= bound.end
-            && bound.cursor.checked_sub(start) == Some(mask.count_ones() as usize)
+            && bound.cursor == bound.end
+            && bound.end - bound.start == mask.count_ones() as usize
             && let (Ok(len), Ok(mask)) = (u8::try_from(len), u32::try_from(mask))
+            && let Some(slot) = bound.fixed.batches.get_mut(bound.device)
         {
-            Some(VerifiedBatch {
-                start,
-                end: bound.cursor,
-                mask,
-                len,
-            })
-        } else {
-            None
-        };
-        if groups.len() == batch_index {
-            reserve(groups, 1)?;
-            groups.push(verified);
-        } else if let Some(slot) = groups.get_mut(batch_index) {
-            *slot = verified;
+            *slot = Some(VerifiedBatch { mask, len });
         }
-        Ok(())
     }
 
     /// Saves this load's stamp sequence on the pattern when it differed from
@@ -1764,7 +1721,7 @@ mod tests {
             for &(row, col, value) in stamps {
                 matrix.add(row, col, value).unwrap();
             }
-            matrix.verify_fixed(start, values.len(), mask).unwrap();
+            matrix.verify_fixed(start, values.len(), mask);
         }
         let fixed = matrix.return_fixed();
         matrix.record_trace().unwrap();
@@ -1882,7 +1839,7 @@ mod tests {
         a.begin_device(0).unwrap();
         let start = a.fixed_start();
         a.add(0, 0, 1.).unwrap();
-        a.verify_fixed(start, 2, 0b01).unwrap();
+        a.verify_fixed(start, 2, 0b01);
         a.record_trace().unwrap();
 
         // Another load changes the same-length trace: blindly keeping
@@ -1910,7 +1867,7 @@ mod tests {
         a.begin_device(0).unwrap();
         let start = a.fixed_start();
         a.add(0, 0, 1.).unwrap();
-        a.verify_fixed(start, 1, 0b10).unwrap();
+        a.verify_fixed(start, 1, 0b10);
         let fixed = a.return_fixed();
         a.record_trace().unwrap();
         a.clear();
@@ -1932,51 +1889,6 @@ mod tests {
         let clone = a.clone();
         assert!(clone.bound.as_ref().unwrap().view.get().is_none());
         assert_eq!(clone, a);
-    }
-
-    #[test]
-    fn interleaved_fixed_groups_replay_exactly_in_device_stamp_order() {
-        // Two independently verifiable groups separated by an ordinary
-        // stamp, each with positions omitted at ground. A device's one trace
-        // may contain any number of such groups; no group may bypass a
-        // neighboring stamp or fold its floating-point accumulation order.
-        let pattern = Arc::new(Pattern::new(3, [(0, 0), (1, 1), (2, 2), (2, 0), (0, 2)]).unwrap());
-        let mut matrix = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
-        let mut fixed = FixedStamps::default();
-        let mut used_fast = 0;
-        for cycle in 0..4 {
-            matrix.clear();
-            assert!(matrix.lend_fixed(fixed, 1).unwrap().is_none());
-            matrix.begin_device(0).unwrap();
-            let first = [1.0 + f64::from(cycle), 0.0, 2.0];
-            if matrix.add_fixed(&first) {
-                used_fast += 1;
-            } else {
-                let start = matrix.fixed_start();
-                matrix.add(0, 0, first[0]).unwrap();
-                matrix.add(1, 1, first[2]).unwrap();
-                matrix.verify_fixed(start, first.len(), 0b101).unwrap();
-            }
-            // The middle stamp cannot be moved across the fixed groups.
-            matrix.add(2, 2, 3.0).unwrap();
-            let second = [4.0, 5.0, 0.0];
-            if matrix.add_fixed(&second) {
-                used_fast += 1;
-            } else {
-                let start = matrix.fixed_start();
-                matrix.add(2, 0, second[0]).unwrap();
-                matrix.add(0, 2, second[1]).unwrap();
-                matrix.verify_fixed(start, second.len(), 0b011).unwrap();
-            }
-            fixed = matrix.return_fixed();
-            matrix.record_trace().unwrap();
-            assert_eq!(matrix.get(0, 0), first[0]);
-            assert_eq!(matrix.get(1, 1), 2.0);
-            assert_eq!(matrix.get(2, 2), 3.0);
-            assert_eq!(matrix.get(2, 0), 4.0);
-            assert_eq!(matrix.get(0, 2), 5.0);
-        }
-        assert_eq!(used_fast, 4, "both groups should replay on cycles 3 and 4");
     }
 
     #[test]
@@ -2028,7 +1940,7 @@ mod tests {
         partial.begin_device(0).unwrap();
         let start = partial.fixed_start();
         partial.add(0, 0, 5.0).unwrap();
-        partial.verify_fixed(start, 1, 0b1).unwrap();
+        partial.verify_fixed(start, 1, 0b1);
         let fixed = partial.return_fixed();
         let mut next = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
         assert!(next.lend_fixed(fixed, 1).unwrap().is_none());

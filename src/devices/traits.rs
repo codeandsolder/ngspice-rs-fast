@@ -461,7 +461,8 @@ impl StampContext<'_> {
                 self.matrix.add(row, col, value)?;
             }
         }
-        self.matrix.verify_fixed(start, N, mask)
+        self.matrix.verify_fixed(start, N, mask);
+        Ok(())
     }
 
     /// Adds `value` to `b[row]`, ignoring ground.
