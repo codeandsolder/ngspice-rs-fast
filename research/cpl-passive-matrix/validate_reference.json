@@ -1,0 +1,20 @@
+{
+  "scalar": {
+    "n": 1,
+    "max_riccati_relative_residual": 7.405373342598773e-16,
+    "max_reciprocal_symmetry_error": 0.0,
+    "min_hermitian_eig": 0.057735026919924826
+  },
+  "three": {
+    "n": 3,
+    "max_riccati_relative_residual": 3.681953273942922e-15,
+    "max_reciprocal_symmetry_error": 0.0,
+    "min_hermitian_eig": 0.015290906350565495
+  },
+  "eight": {
+    "n": 8,
+    "max_riccati_relative_residual": 5.353099515388747e-15,
+    "max_reciprocal_symmetry_error": 0.0,
+    "min_hermitian_eig": 0.01694154888868653
+  }
+}

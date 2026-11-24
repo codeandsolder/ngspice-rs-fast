@@ -1,0 +1,29 @@
+[
+  {
+    "name": "moderate_attn",
+    "positive_physical_R_G": true,
+    "generator_eigenvalue_magnitude": 2.0,
+    "direct_expm_all_finite": true,
+    "physical_admittance_y11": 1.0373147207275482,
+    "physical_admittance_y12": -0.27572056477178325,
+    "direct_transfer_B": -3.6268604078470195
+  },
+  {
+    "name": "long_lossy_valid",
+    "positive_physical_R_G": true,
+    "generator_eigenvalue_magnitude": 1000.0,
+    "direct_expm_all_finite": false,
+    "physical_admittance_y11": 1.0,
+    "physical_admittance_y12": -0.0,
+    "direct_transfer_B": null
+  },
+  {
+    "name": "lossless_dc",
+    "positive_physical_R_G": false,
+    "generator_eigenvalue_magnitude": 0.0,
+    "direct_expm_all_finite": true,
+    "physical_admittance_y11": null,
+    "physical_admittance_y12": null,
+    "direct_transfer_B": 0.0
+  }
+]
