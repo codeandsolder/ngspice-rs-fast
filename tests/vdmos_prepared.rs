@@ -1,18 +1,17 @@
 //! Circuit-coupled VDMOS DC goldens from ngspice 47.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisInput};
-use ngspice_rs::devices::Circuit;
+use ngspice_rs::analysis::RunConfig;
 use ngspice_rs::netlist::{Parser, source::parse_deck_text};
-use ngspice_rs::primitives::{AnalysisKind, SpiceResult};
+use ngspice_rs::primitives::SpiceResult;
 use std::path::Path;
 
 fn run(source: &str) -> SpiceResult<ngspice_rs::analysis::Plot> {
     let card = source.split(".control").next().unwrap_or(source);
     let deck = parse_deck_text(Path::new("vdmos.cir"), &format!("{card}\n.op\n.end\n"));
     let parsed = Parser::new().parse_deck(&deck)?;
-    let mut circuit = Circuit::from_netlist(&parsed)?;
-    AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, [""; 0])
-        .resolve()?
-        .run(&mut circuit, &AnalysisContext::default())
+    let config = RunConfig::from_netlist(&parsed)?;
+    let request = config.plan_for(&parsed.analyses[0])?;
+    let mut circuit = config.circuit(&parsed)?;
+    request.run(&mut circuit, &config.context())
 }
 fn close(name: &str, actual: f64, c: f64) {
     let tolerance = 2e-4_f64.mul_add(c.abs(), 1e-5);
@@ -245,6 +244,39 @@ fn dynamic_soft_recovery_small_signal_matches_ngspice47() {
                 "Qp AC {name} {frequency}: imag Rust {} C {imaginary_ref}",
                 voltage.im
             );
+        }
+    }
+}
+
+#[test]
+fn electrothermal_junction_case_dc_matches_ngspice47() {
+    for (name, source, junction, case, drain_supply_current) in [
+        (
+            "N",
+            include_str!("fixtures/vdmos/thermal_dc_n.cir"),
+            35.79102,
+            34.32585,
+            -4.883899,
+        ),
+        (
+            "P",
+            include_str!("fixtures/vdmos/thermal_dc_p.cir"),
+            31.48895,
+            30.74079,
+            2.493859,
+        ),
+    ] {
+        let plot = run(source).unwrap_or_else(|error| panic!("thermal DC {name}: {error}"));
+        for (label, reference) in [
+            ("v(junction)", junction),
+            ("v(case)", case),
+            ("i(vd)", drain_supply_current),
+        ] {
+            let actual = plot
+                .value(label, 0)
+                .unwrap_or_else(|| panic!("{name} thermal DC missing {label}"))
+                .re;
+            close(&format!("thermal {name} {label}"), actual, reference);
         }
     }
 }

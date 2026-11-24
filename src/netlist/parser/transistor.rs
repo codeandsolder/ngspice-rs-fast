@@ -144,7 +144,19 @@ fn mos_connections<'a>(input: &mut Input<'a>) -> Result<Connections<'a>> {
     let bulk = name("bulk terminal").parse_next(input)?;
     let candidate = peek(name("MOS model name")).parse_next(input)?;
     if !is_declared_model(input, candidate) {
-        // C's SOI/HiSIM/thermal variants can take 5–7 ports; retain a loud gap.
+        // The VDMOS self-heating syntax has two additional explicit thermal
+        // terminals after D/G/S, with no bulk node. It is resolved against
+        // the model family during elaboration, not guessed by token count.
+        if input
+            .input
+            .get(1)
+            .is_some_and(|next| is_declared_model(input, next))
+        {
+            let case = name("VDMOS case thermal terminal").parse_next(input)?;
+            let model = declared_model(input)?;
+            return Ok((vec![drain, gate, source, bulk, case], model));
+        }
+        // C's SOI/HiSIM/thermal variants can take 6–7 ports; retain a loud gap.
         if input
             .input
             .iter()
@@ -168,7 +180,7 @@ fn parameters(input: &mut Input<'_>, designator: char) -> Result<Vec<ParameterAs
     let mut parameters: Vec<ParameterAssignment> = repeat(
         0..,
         alt((
-            super::flags::instance,
+            super::flags::transistor_instance,
             super::ic::vector,
             |input: &mut Input<'_>| scalar_assignment(input, designator),
             invalid_parameter,

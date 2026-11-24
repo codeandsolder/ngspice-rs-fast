@@ -65,7 +65,12 @@ pub(super) fn instantiate_with_models(
     // silently bound to a bulk-MOS, nor may VDMOS ignore a fourth terminal.
     if instance.designator == 'm' {
         let vdmos = model.levels().backend == ModelBackend::Vdmos;
-        let expected = if vdmos { 3 } else { 4 };
+        let thermal = instance.parameters.iter().any(|p| p.name == "thermal");
+        let expected = if vdmos {
+            if thermal { 5 } else { 3 }
+        } else {
+            4
+        };
         if instance.nodes.len() != expected {
             return Err(SpiceError::Unsupported {
                 feature: format!(

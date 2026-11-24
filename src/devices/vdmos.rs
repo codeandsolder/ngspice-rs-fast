@@ -29,6 +29,7 @@ pub struct Vdmos {
     inner: [NodeId; 3],
     diode_prime: NodeId,
     qp: Option<NodeId>,
+    thermal: Option<[NodeId; 2]>,
     model: Arc<PreparedModel>,
     multiplier: Real,
     temperature: Option<Real>,
@@ -41,7 +42,8 @@ const QGD: usize = 2;
 const QDIO: usize = 4;
 const DIODE_VOLTAGE: usize = 6;
 const QP_CHARGE: usize = 7;
-const STATE_COUNT: usize = 9;
+const QTHERMAL: usize = 9;
+const STATE_COUNT: usize = 11;
 
 fn charge_companion(
     branch: ChargeBranch,
@@ -152,18 +154,14 @@ impl Vdmos {
         let mut multiplier = 1.0;
         let mut temperature = None;
         let mut dtemp = 0.0;
+        let mut thermal_enabled = false;
         for parameter in &instance.parameters {
             match parameter.name.as_str() {
                 "m" => multiplier = scalar(parameter)?,
                 "temp" => temperature = Some(scalar(parameter)?),
                 "dtemp" => dtemp = scalar(parameter)?,
-                // Self-heating needs a different topological network, never an
-                // unconnected thermal source or an ignored instance flag.
-                "thermal" => {
-                    return Err(SpiceError::not_yet_ported(
-                        format!("{}: electrothermal network", instance.name),
-                        "src/spicelib/devices/vdmos/vdmosset.c",
-                    ));
+                "thermal" if parameter.kind == ParameterKind::Flag => {
+                    thermal_enabled = true;
                 }
                 other => {
                     return Err(SpiceError::Unsupported {
@@ -178,6 +176,12 @@ impl Vdmos {
         }
         if !multiplier.is_finite() || multiplier <= 0.0 {
             return Err(invalid(&instance.name, "nonpositive VDMOS multiplier"));
+        }
+        if thermal_enabled && !resolved.card().parameters.iter().any(|p| p.name == "rthjc") {
+            return Err(invalid(
+                &instance.name,
+                "thermal operation needs explicitly given RTHJC",
+            ));
         }
         if temperature.is_some() && dtemp != 0.0 {
             return Err(invalid(
@@ -200,6 +204,14 @@ impl Vdmos {
             for (target, name) in terminals.iter_mut().zip(&instance.nodes) {
                 *target = nodes.intern(name)?;
             }
+            let thermal = if thermal_enabled {
+                Some([
+                    nodes.intern(&instance.nodes[3])?,
+                    nodes.intern(&instance.nodes[4])?,
+                ])
+            } else {
+                None
+            };
             let mut node = |external: NodeId, suffix: &str, used: bool| -> SpiceResult<NodeId> {
                 if !used {
                     return Ok(external);
@@ -233,6 +245,7 @@ impl Vdmos {
                 inner,
                 diode_prime,
                 qp,
+                thermal,
                 model: shared,
                 multiplier,
                 temperature,
@@ -242,8 +255,14 @@ impl Vdmos {
         Ok(Box::new(device))
     }
 
-    fn kelvin(&self, celsius: Real) -> Real {
-        self.temperature.unwrap_or(celsius + self.dtemp) + 273.15
+    fn ambient(&self, celsius: Real) -> Real {
+        self.temperature.unwrap_or(celsius + self.dtemp)
+    }
+
+    fn bias_temperature(&self, voltage: &impl Fn(NodeId) -> Real, celsius: Real) -> Real {
+        self.thermal
+            .map_or(self.ambient(celsius), |thermal| voltage(thermal[0]))
+            + 273.15
     }
 
     fn evaluation(
@@ -263,7 +282,7 @@ impl Vdmos {
                 let polarity = self.model.parameters().polarity.sign();
                 polarity * voltage(qp)
             }),
-            temperature: self.kelvin(celsius),
+            temperature: self.bias_temperature(voltage, celsius),
         })
     }
 
@@ -272,7 +291,7 @@ impl Vdmos {
             .model
             .bind(Instance {
                 multiplier: self.multiplier,
-                self_heating: false,
+                self_heating: self.thermal.is_some(),
             })
             .map_err(|error| invalid(&self.name, error))?;
         device
@@ -291,6 +310,89 @@ impl Vdmos {
             * d.is
             * (((ratio - 1.0) * d.eg / (d.n * vt) + (d.xti / d.n) * ratio.ln()).exp());
         critical_voltage(d.n * vt, saturation)
+    }
+
+    /// Junction/case heat balance. The source kernel provides physical power
+    /// and its derivatives; the circuit owns the temperature nodes and
+    /// accepted/trial thermal-capacitor history.
+    fn stamp_thermal(
+        &self,
+        context: &mut StampContext<'_>,
+        evaluation: &Evaluation,
+        temperature_nodes: [NodeId; 2],
+        physical_diode_bias: Real,
+    ) -> SpiceResult<()> {
+        let [tj, tc] = temperature_nodes;
+        let [de, _ge, se] = self.terminals;
+        let [d, g, s] = self.inner;
+        let dp = self.diode_prime;
+        let temp = context.node_voltage(tj);
+        let case = context.node_voltage(tc);
+        let ambient = self.ambient(context.temperature);
+        let heat = evaluation.heat;
+        let rd = evaluation
+            .series
+            .drain
+            .ohmic_power(context.node_voltage(de) - context.node_voltage(d));
+        let rs = evaluation
+            .series
+            .source
+            .ohmic_power(context.node_voltage(se) - context.node_voltage(s));
+        let rb = evaluation
+            .series
+            .body
+            .ohmic_power(context.node_voltage(se) - context.node_voltage(dp));
+        // Match ngspice's power injection: channel, intrinsic body diode,
+        // drain/source ohmic loss, and body-diode series loss. The gate
+        // resistor and drain shunt are not included in vdmosload.c's Ith.
+        let power = heat.intrinsic + rd.value + rs.value + rb.value;
+        let dpower_dtemp =
+            heat.d_temperature + rd.d_temperature + rs.d_temperature + rb.d_temperature;
+        let charge = ChargeBranch::new(
+            QTHERMAL,
+            heat.junction_capacitance * temp,
+            heat.junction_capacitance,
+        );
+        let initial =
+            context.states.phase() == IterationPhase::Predict && context.states.initial_transient();
+        let comp = charge_companion(charge, &mut context.states, context.integration, initial)?;
+        let gjc = heat.junction_to_case;
+        let gca = heat.case_to_ambient;
+        let limiter_comp = heat.d_vdiode
+            * ((context.node_voltage(dp) - context.node_voltage(de)) - physical_diode_bias);
+        // The exact residual/Jacobian at the (possibly limited) diode bias;
+        // the linearly corrected value is the residual at the current node
+        // iterate, so convergence is never accepted at a held junction.
+        let rj = gjc * (temp - case) - power - limiter_comp
+            + comp.map_or(0.0, |charge| charge.derivative);
+        stamp_row(
+            context,
+            tj,
+            rj,
+            [
+                (g, -heat.d_vgs),
+                (d, -heat.d_vds),
+                (s, heat.d_vgs + heat.d_vds),
+                (dp, -heat.d_vdiode),
+                (de, heat.d_vdiode),
+                (de, -rd.d_voltage_drop - rd.d_vds_external),
+                (d, rd.d_voltage_drop),
+                (se, rd.d_vds_external),
+                (se, -rs.d_voltage_drop),
+                (s, rs.d_voltage_drop),
+                (se, -rb.d_voltage_drop),
+                (dp, rb.d_voltage_drop),
+                (
+                    tj,
+                    gjc - dpower_dtemp + comp.map_or(0.0, |charge| charge.conductance),
+                ),
+                (tc, -gjc),
+            ],
+        )?;
+        // The ambient voltage source used by ngspice's `cktTemp` node can
+        // be eliminated exactly because it is an ideal fixed voltage.
+        let rc = gjc * (case - temp) + gca * (case - ambient);
+        stamp_row(context, tc, rc, [(tj, -gjc), (tc, gjc + gca)])
     }
 }
 
@@ -314,6 +416,41 @@ fn stamp_branch(
         context.stamp(negative, node, -derivative)?;
     }
     Ok(())
+}
+
+/// A nonlinear MNA residual owned by one (possibly thermal) node.
+fn stamp_row<const N: usize>(
+    context: &mut StampContext<'_>,
+    row: NodeId,
+    residual: Real,
+    derivatives: [(NodeId, Real); N],
+) -> SpiceResult<()> {
+    let offset = derivatives
+        .iter()
+        .fold(residual, |sum, (node, derivative)| {
+            derivative.mul_add(-context.node_voltage(*node), sum)
+        });
+    context.stamp_rhs(row, -offset)?;
+    for (column, derivative) in derivatives {
+        context.stamp(row, column, derivative)?;
+    }
+    Ok(())
+}
+
+/// Thermal voltage is Celsius; its derivative couples an electrical branch
+/// into the temperature node without creating a numerical thermal shunt.
+fn stamp_temperature_control(
+    context: &mut StampContext<'_>,
+    thermal: NodeId,
+    positive: NodeId,
+    negative: NodeId,
+    derivative: Real,
+) -> SpiceResult<()> {
+    let eq_offset = derivative * context.node_voltage(thermal);
+    context.stamp(positive, thermal, derivative)?;
+    context.stamp(negative, thermal, -derivative)?;
+    context.stamp_rhs(positive, eq_offset)?;
+    context.stamp_rhs(negative, -eq_offset)
 }
 
 fn resistor(
@@ -375,8 +512,10 @@ impl Device for Vdmos {
         true
     }
     fn state_count(&self) -> usize {
-        if self.qp.is_some() {
+        if self.thermal.is_some() {
             STATE_COUNT
+        } else if self.qp.is_some() {
+            QTHERMAL
         } else {
             QP_CHARGE
         }
@@ -385,6 +524,9 @@ impl Device for Vdmos {
         let mut slots = vec![QGS, QGD, QDIO];
         if self.qp.is_some() {
             slots.push(QP_CHARGE);
+        }
+        if self.thermal.is_some() {
+            slots.push(QTHERMAL);
         }
         slots
     }
@@ -525,7 +667,7 @@ impl Device for Vdmos {
         let [d, g, s] = self.inner;
         let [de, ge, se] = self.terminals;
         let dp = self.diode_prime;
-        let kelvin = self.kelvin(context.temperature);
+        let kelvin = self.bias_temperature(&|node| context.node_voltage(node), context.temperature);
         let raw_vdiode = context.node_voltage(dp) - context.node_voltage(de);
         let polarity = if self.model.parameters().polarity == Polarity::N {
             1.0
@@ -654,6 +796,9 @@ impl Device for Vdmos {
                 (s, -channel.d_vgs - channel.d_vds),
             ],
         )?;
+        if let Some([tj, _]) = self.thermal {
+            stamp_temperature_control(context, tj, d, s, channel.d_temperature)?;
+        }
         let gd = result.diode.current.d_voltage
             + context.gmin
             + diode_comp.map_or(0.0, |charge| charge.conductance);
@@ -670,6 +815,9 @@ impl Device for Vdmos {
             idio,
             [(dp, gd), (de, -gd), (NodeId::GROUND, 0.0)],
         )?;
+        if let Some([tj, _]) = self.thermal {
+            stamp_temperature_control(context, tj, dp, de, result.diode.current.d_temperature)?;
+        }
         let series = result.series;
         if de != d {
             let gd = series
@@ -684,15 +832,28 @@ impl Device for Vdmos {
                 gd * drain_drop,
                 [(de, gd + feedback), (d, -gd), (se, -feedback)],
             )?;
+            if let Some([tj, _]) = self.thermal {
+                stamp_temperature_control(
+                    context,
+                    tj,
+                    de,
+                    d,
+                    series.drain.d_temperature * drain_drop,
+                )?;
+            }
             // In a quasistatic voltage-dependent branch, the terminal-voltage
             // derivative is already included in the branch Jacobian above.
         }
-        for (external, internal, conductance) in [
-            (ge, g, series.gate.value),
-            (se, s, series.source.value),
-            (se, dp, series.body.value),
+        for (external, internal, conductance, dgt) in [
+            (ge, g, series.gate.value, 0.0),
+            (se, s, series.source.value, series.source.d_temperature),
+            (se, dp, series.body.value, series.body.d_temperature),
         ] {
             if external != internal {
+                if let Some([tj, _]) = self.thermal {
+                    let drop = context.node_voltage(external) - context.node_voltage(internal);
+                    stamp_temperature_control(context, tj, external, internal, dgt * drop)?;
+                }
                 resistor(
                     context,
                     external,
@@ -703,6 +864,9 @@ impl Device for Vdmos {
             }
         }
         resistor(context, de, se, series.shunt)?;
+        if let Some(thermal) = self.thermal {
+            self.stamp_thermal(context, &result, thermal, vdiode)?;
+        }
         limiter.finish(&mut context.states, &[(DIODE_VOLTAGE, normal)])
     }
 }
