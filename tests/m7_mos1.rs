@@ -2,7 +2,9 @@
 //! geometry, process extraction and temperature, checked against independent
 //! restatements of `mos1temp.c`/`mos1load.c`/`DEVqmeyer` and finite
 //! differences. C-golden comparisons live in `xtask golden verify`.
-use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
+#[path = "support/mos_jfet.rs"]
+mod mos_jfet;
+use mos_jfet::{bias, close, entry, op, residual, row};
 use ngspice_rs::devices::{
     AnalysisMode, Circuit, Forcing, Limit, LoadRequest, ModelContext, StateHistory, TransientTiming,
 };
@@ -10,7 +12,7 @@ use ngspice_rs::maths::integrator::{Coefficients, DEFAULT_XMU, IntegrationMethod
 use ngspice_rs::maths::{SparseMatrix, Vector};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-use ngspice_rs::primitives::{AnalysisKind, NodeKind};
+use ngspice_rs::primitives::NodeKind;
 use std::path::Path;
 
 const BOLTZMANN: f64 = 1.38064852e-23;
@@ -20,52 +22,15 @@ const REFTEMP: f64 = 300.15;
 const EPS0: f64 = 8.854214871e-12;
 const GMIN: f64 = 1e-12;
 
+const FIXTURE: mos_jfet::Fixture = mos_jfet::Fixture {
+    path: "m7.cir",
+    title: "M7",
+};
 fn deck(body: &str) -> ngspice_rs::netlist::ast::Netlist {
-    Parser::new()
-        .parse_deck(&parse_deck_text(
-            Path::new("m7.cir"),
-            &format!("M7\n{body}\n.end\n"),
-        ))
-        .unwrap()
+    FIXTURE.deck(body).unwrap()
 }
 fn circuit(body: &str) -> Circuit {
-    Circuit::from_netlist(&deck(body)).unwrap()
-}
-fn op(c: &mut Circuit) -> Plot {
-    AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, [""; 0])
-        .resolve()
-        .and_then(|plan| plan.run(c, &AnalysisContext::default()))
-        .unwrap()
-}
-fn close(a: f64, b: f64, relative: f64, absolute: f64) {
-    assert!(
-        (a - b).abs() <= relative * b.abs() + absolute,
-        "{a:e} != {b:e}"
-    );
-}
-fn bias(
-    c: &Circuit,
-) -> ngspice_rs::analysis::newton::NewtonSolution<ngspice_rs::devices::TrialState> {
-    ngspice_rs::analysis::bias::solve_dc(
-        c,
-        &ModelContext::default(),
-        &Default::default(),
-        &[],
-        None,
-        None,
-    )
-    .unwrap()
-}
-fn row(c: &Circuit, node: &str) -> usize {
-    c.unknowns().node_row(c.nodes().get(node).unwrap()).unwrap()
-}
-fn entry(matrix: &SparseMatrix, r: usize, col: usize) -> f64 {
-    matrix
-        .triplets()
-        .iter()
-        .filter(|t| t.row == r && t.col == col)
-        .map(|t| t.value)
-        .sum()
+    FIXTURE.circuit(body).unwrap()
 }
 fn band_gap(t: f64) -> f64 {
     1.16 - 7.02e-4 * t * t / (t + 1108.)
@@ -208,14 +173,6 @@ fn transient_meyer_charge_advances_with_the_averaged_half_capacitances() {
 }
 
 /// `r(x) = A(x) x - b(x)` of one load, for finite differences.
-fn residual(a: &SparseMatrix, b: &Vector, x: &Vector) -> Vec<f64> {
-    let mut r: Vec<f64> = b.as_slice().iter().map(|v| -v).collect();
-    for t in a.triplets() {
-        r[t.row] += t.value * x.as_slice()[t.col];
-    }
-    r
-}
-
 #[test]
 fn transient_companion_jacobian_is_exact_where_the_meyer_halves_are_constant() {
     // Saturation: the halves are Cox/3, 0, 0 regardless of a small
@@ -287,49 +244,14 @@ fn dc_jacobian_with_series_resistance_body_bias_geometry_and_temperature() {
         // matrix, not the exact Jacobian.
         let c_gmbs = case == 1;
         let c = circuit(body);
-        let context = ModelContext::default();
-        let history = c.state_history().unwrap();
-        let solved = bias(&c);
-        let system = c.small_signal_system(&context, &solved.values).unwrap();
-        let n = c.unknown_count();
-        let load = |x: &Vector| {
-            let mut a = SparseMatrix::new(n, n);
-            let mut b = Vector::zeros(n);
-            let mut trial = history.trial();
-            c.load(
-                &LoadRequest {
-                    mode: AnalysisMode::OperatingPoint,
-                    solution: x,
-                    model_context: &context,
-                    integration: None,
-                    history: &history,
-                    forcing: None,
-                },
-                &mut a,
-                &mut b,
-                &mut trial,
-            )
-            .unwrap();
-            residual(&a, &b, x)
-        };
-        for node in c.nodes().nodes() {
-            let Some(col) = c.unknowns().node_row(node.id) else {
-                continue;
-            };
-            if c_gmbs && (node.name == "bulk" || node.name == "m1#source") {
-                continue;
-            }
-            let h = 1e-6;
-            let mut low = solved.values.clone();
-            let mut high = solved.values.clone();
-            low.as_mut_slice()[col] -= h;
-            high.as_mut_slice()[col] += h;
-            let (rl, rh) = (load(&low), load(&high));
-            for r in 0..n {
-                let numerical = (rh[r] - rl[r]) / (2. * h);
-                close(numerical, entry(&system.a, r, col), 1e-6, 1e-10);
-            }
-        }
+        mos_jfet::check_dc_jacobian(
+            &c,
+            body,
+            1e-6,
+            1e-10,
+            mos_jfet::JacobianMatrices::SmallSignal,
+            |node| c_gmbs && matches!(node, "bulk" | "m1#source"),
+        );
     }
 }
 

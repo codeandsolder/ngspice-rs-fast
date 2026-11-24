@@ -180,17 +180,21 @@ impl TerminalLayout {
 }
 
 struct LoadedTerminals {
-    ready: bool,
+    /// Last point epoch with a successfully stamped, complete load.
+    epoch: u64,
+    /// Allocated on first use, then reused for every later selected point.
     currents: Vec<Real>,
 }
 
-/// Capacity is analysis-local; no previous point's currents or trial
-/// state are considered valid after the next call begins.
+/// Capacity and validity are local to one prepared run. An epoch change
+/// invalidates all prior point results without visiting the bound loads;
+/// epoch zero is permanently reserved for never-current entries.
 pub(super) struct ObservationWorkspace {
     matrix: SparseMatrix,
     rhs: IsolatedRhs,
     state: IsolatedState,
     loaded: Vec<LoadedTerminals>,
+    epoch: u64,
 }
 
 impl ObservationWorkspace {
@@ -203,17 +207,24 @@ impl ObservationWorkspace {
             loaded: plan
                 .loads
                 .iter()
-                .map(|layout| LoadedTerminals {
-                    ready: false,
-                    currents: vec![0.; layout.rows.len() + 1],
+                .map(|_| LoadedTerminals {
+                    epoch: 0,
+                    currents: Vec::new(),
                 })
                 .collect(),
+            epoch: 0,
         }
     }
 
     fn begin(&mut self) {
-        for load in &mut self.loaded {
-            load.ready = false;
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            // Very rare full sweep: discard all historical epoch tags before
+            // reusing epoch 1. Retain already initialized scratch buffers.
+            for load in &mut self.loaded {
+                load.epoch = 0;
+            }
+            self.epoch = 1;
         }
     }
 }
@@ -229,6 +240,7 @@ struct PointLoads<'a, 'b> {
     point: &'a PreparedPoint,
     mutual: Option<PreparedMutualTerms>,
     workspace: &'a mut ObservationWorkspace,
+    ltra: Option<&'a mut super::ltra::LtraWorkspace>,
 }
 
 impl PointLoads<'_, '_> {
@@ -236,7 +248,7 @@ impl PointLoads<'_, '_> {
         let layout = &self.circuit.runtime.observations.loads[load];
         let work = &mut *self.workspace;
         let loaded = &mut work.loaded[load];
-        if !loaded.ready {
+        if loaded.epoch != work.epoch {
             if self.mutual.is_none() {
                 self.mutual = Some(self.point.mutual(self.circuit)?);
             }
@@ -256,6 +268,7 @@ impl PointLoads<'_, '_> {
                 StampRhs::isolated(&mut work.rhs),
                 states,
                 self.mutual.as_deref().unwrap_or(&[]),
+                self.ltra.as_deref_mut(),
             );
             work.state.clear();
             stamped?;
@@ -274,13 +287,14 @@ impl PointLoads<'_, '_> {
                     }
                 }
             }
+            loaded.currents.resize(layout.rows.len() + 1, 0.);
             layout.residuals(
                 &work.matrix,
                 |row| work.rhs.get(row),
                 self.request.solution,
                 &mut loaded.currents,
             );
-            loaded.ready = true;
+            loaded.epoch = work.epoch;
         }
         loaded.currents.get(slot).copied().ok_or_else(|| gap(name))
     }
@@ -412,6 +426,17 @@ impl ObservationPlan {
     }
 }
 
+/// The physical observation inputs belonging to the same solved trial.
+/// Binds optional selection and transient/LTRA workspace together instead of
+/// adding loosely related positional parameters to the prepared loader.
+struct RealObservationInputs<'a> {
+    sources: &'a [(&'a str, Real)],
+    time: Option<(Real, Forcing)>,
+    previous: Option<&'a TrialState>,
+    ltra: Option<&'a mut super::ltra::LtraWorkspace>,
+    selected: Option<&'a [usize]>,
+}
+
 impl Circuit {
     /// Bind extra quantities to finalized devices and terminal roles.
     /// Existing branch-current columns are retained without duplication.
@@ -450,23 +475,28 @@ impl Circuit {
         &self,
         run: &PreparedRun<'_>,
         request: &LoadRequest<'_>,
-        sources: &[(&str, Real)],
-        time: Option<(Real, Forcing)>,
-        previous: Option<&TrialState>,
+        inputs: RealObservationInputs<'_>,
     ) -> SpiceResult<Vec<Complex>> {
+        let RealObservationInputs {
+            sources,
+            time,
+            previous,
+            ltra,
+            selected,
+        } = inputs;
         self.validate_history(request.history)?;
         if let Some(trial) = previous {
             request.history.check_trial(trial)?;
         }
         let plan = &self.runtime.observations;
         plan.validate(self)?;
-        if plan.queries.is_empty() {
-            return Ok(Vec::new());
-        }
         if request.solution.len() != self.unknown_count() {
             return Err(SpiceError::circuit(
                 "isolated observation load does not match the circuit numbering",
             ));
+        }
+        if plan.queries.is_empty() || selected.is_some_and(<[usize]>::is_empty) {
+            return Ok(Vec::new());
         }
         let point = run.point(request.model_context)?;
         let mut workspace = run.observation_work.borrow_mut();
@@ -481,20 +511,33 @@ impl Circuit {
             point: &point,
             mutual: None,
             workspace,
+            ltra,
         };
-        plan.queries
-            .iter()
-            .map(|query| {
-                let value = loads.observe(query)?;
-                if !value.is_finite() {
-                    return Err(SpiceError::Numerical {
-                        context: query.name.clone(),
-                        message: "nonfinite device observation".into(),
-                    });
-                }
-                Ok(Complex::real(value))
-            })
-            .collect()
+        let mut observe = |query: &Observation| {
+            let value = loads.observe(query)?;
+            if !value.is_finite() {
+                return Err(SpiceError::Numerical {
+                    context: query.name.clone(),
+                    message: "nonfinite device observation".into(),
+                });
+            }
+            Ok(Complex::real(value))
+        };
+        if let Some(indices) = selected {
+            indices
+                .iter()
+                .map(|&index| {
+                    plan.queries
+                        .get(index)
+                        .ok_or_else(|| {
+                            SpiceError::circuit("selected observation index is out of range")
+                        })
+                        .and_then(&mut observe)
+                })
+                .collect()
+        } else {
+            plan.queries.iter().map(observe).collect()
+        }
     }
 
     /// Observe scalar instance parameters for a spectral point. Device current
@@ -510,30 +553,82 @@ impl Circuit {
         &self,
         run: &PreparedRun<'_>,
         context: &ModelContext,
+        selected: Option<&[usize]>,
     ) -> SpiceResult<Vec<Complex>> {
         let plan = &self.runtime.observations;
         plan.validate(self)?;
+        if selected.is_some_and(<[usize]>::is_empty) {
+            return Ok(Vec::new());
+        }
         let point = run.point(context)?;
-        plan.queries
-            .iter()
-            .map(|query| {
-                let key = match &query.selector {
-                    Selector::SourceDc => "dc",
-                    Selector::Parameter(key) => key,
-                    Selector::Current { .. } | Selector::Power { .. } => {
-                        return Err(gap(&format!("{}: AC current/power ask", query.name())));
-                    }
-                };
-                let value = point
-                    .device(self, query.device)
-                    .observation_parameter(key, context)?
-                    .ok_or_else(|| gap(query.name()))?;
-                if !value.is_finite() {
-                    return Err(gap(query.name()));
+        let ask = |query: &Observation| {
+            let key = match &query.selector {
+                Selector::SourceDc => "dc",
+                Selector::Parameter(key) => key,
+                Selector::Current { .. } | Selector::Power { .. } => {
+                    return Err(gap(&format!("{}: AC current/power ask", query.name())));
                 }
-                Ok(Complex::real(value))
-            })
-            .collect()
+            };
+            let value = point
+                .device(self, query.device)
+                .observation_parameter(key, context)?
+                .ok_or_else(|| gap(query.name()))?;
+            if !value.is_finite() {
+                return Err(gap(query.name()));
+            }
+            Ok(Complex::real(value))
+        };
+        selected.map_or_else(
+            || plan.queries.iter().map(ask).collect(),
+            |indices| {
+                indices
+                    .iter()
+                    .map(|&index| {
+                        plan.queries
+                            .get(index)
+                            .ok_or_else(|| {
+                                SpiceError::circuit("selected observation index is out of range")
+                            })
+                            .and_then(ask)
+                    })
+                    .collect()
+            },
+        )
+    }
+}
+
+impl super::circuit::PreparedTransient<'_> {
+    /// Observe a converged transient point with every ordinary device ask,
+    /// retaining the original pre-acceptance trial-history semantics.
+    pub(crate) fn observe(
+        &mut self,
+        solution: &Vector,
+        previous: &TrialState,
+    ) -> SpiceResult<Vec<Complex>> {
+        self.observe_selected(solution, previous, None)
+    }
+
+    /// Converged transient observation asks against pre-acceptance trial
+    /// history; unrequested device loads are never invoked.
+    pub(crate) fn observe_selected(
+        &mut self,
+        solution: &Vector,
+        previous: &TrialState,
+        selected: Option<&[usize]>,
+    ) -> SpiceResult<Vec<Complex>> {
+        let request = self.request(solution);
+        let time = request.forcing.map(|forcing| (self.time(), forcing));
+        self.run.circuit().observe_real_prepared(
+            self.run,
+            &request,
+            RealObservationInputs {
+                sources: &[],
+                time,
+                previous: Some(previous),
+                ltra: Some(&mut self.workspace),
+                selected,
+            },
+        )
     }
 }
 
@@ -548,15 +643,62 @@ impl PreparedRun<'_> {
         time: Option<(Real, Forcing)>,
         previous: Option<&TrialState>,
     ) -> SpiceResult<Vec<Complex>> {
-        self.circuit()
-            .observe_real_prepared(self, request, sources, time, previous)
+        self.circuit().observe_real_prepared(
+            self,
+            request,
+            RealObservationInputs {
+                sources,
+                time,
+                previous,
+                ltra: None,
+                selected: None,
+            },
+        )
+    }
+
+    /// Observe only selected bound device quantities for a real output.
+    /// # Errors
+    /// As [`Self::observe_real`], plus an invalid selected ordinal.
+    pub(crate) fn observe_real_selected(
+        &self,
+        request: &LoadRequest<'_>,
+        sources: &[(&str, Real)],
+        time: Option<(Real, Forcing)>,
+        previous: Option<&TrialState>,
+        selected: &[usize],
+    ) -> SpiceResult<Vec<Complex>> {
+        self.circuit().observe_real_prepared(
+            self,
+            request,
+            RealObservationInputs {
+                sources,
+                time,
+                previous,
+                ltra: None,
+                selected: Some(selected),
+            },
+        )
     }
 
     /// Observe scalar device parameters in the prepared context.
     /// # Errors
     /// As [`Circuit::observe_parameters`].
     pub fn observe_parameters(&self, context: &ModelContext) -> SpiceResult<Vec<Complex>> {
-        self.circuit().observe_parameters_prepared(self, context)
+        self.circuit()
+            .observe_parameters_prepared(self, context, None)
+    }
+
+    /// Observe only selected bound scalar device quantities in spectral mode.
+    /// Unrequested current/power asks are not evaluated.
+    /// # Errors
+    /// As [`Self::observe_parameters`], plus an invalid selected ordinal.
+    pub(crate) fn observe_parameters_selected(
+        &self,
+        context: &ModelContext,
+        selected: &[usize],
+    ) -> SpiceResult<Vec<Complex>> {
+        self.circuit()
+            .observe_parameters_prepared(self, context, Some(selected))
     }
 }
 
@@ -671,6 +813,238 @@ mod tests {
         );
     }
 
+    /// Reuse one prepared circuit and bound selector set over 1,001 points;
+    /// this is not a test of repeated topology construction.
+    fn measure_selected_workspace(load_count: usize, points: usize) {
+        use crate::devices::Resistor;
+        let mut circuit = Circuit::new();
+        let a = circuit.add_node("a").unwrap();
+        let mut names = Vec::with_capacity(load_count);
+        for index in 0..load_count {
+            let name = format!("r{index}");
+            circuit
+                .add_device(Box::new(
+                    Resistor::new(name.clone(), [a, NodeId::GROUND], 1_000.).unwrap(),
+                ))
+                .unwrap();
+            names.push(format!("i({name})"));
+        }
+        circuit.finalize().unwrap();
+        circuit.set_observations(&names).unwrap();
+        let history = circuit.state_history().unwrap();
+        let model = ModelContext::default();
+        let solution = Vector::from_slice(&[2.]);
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context: &model,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        let run = circuit.prepare_run();
+        let started = std::time::Instant::now();
+        let mut sample = Vec::new();
+        for _ in 0..points {
+            sample = run
+                .observe_real_selected(&request, &[], None, None, &[0])
+                .unwrap();
+        }
+        let sparse_elapsed = started.elapsed();
+        {
+            let borrowed = run.observation_work.borrow();
+            let work = borrowed.as_ref().unwrap();
+            assert_eq!(work.loaded.len(), load_count);
+            assert_eq!(work.epoch, points as u64);
+            assert_eq!(work.loaded[0].epoch, work.epoch);
+            assert!(work.loaded.iter().skip(1).all(|loaded| loaded.epoch == 0));
+            assert_eq!(
+                work.loaded
+                    .iter()
+                    .filter(|loaded| !loaded.currents.is_empty())
+                    .count(),
+                1
+            );
+            let cold_bytes: usize = circuit
+                .runtime
+                .observations
+                .loads
+                .iter()
+                .map(|layout| (layout.rows.len() + 1) * size_of::<Real>())
+                .sum();
+            let allocated_bytes: usize = work
+                .loaded
+                .iter()
+                .map(|loaded| loaded.currents.capacity() * size_of::<Real>())
+                .sum();
+            let metadata_bytes = work.loaded.len() * size_of::<LoadedTerminals>();
+            println!(
+                "{load_count} registered loads, {points} points: selected={sparse_elapsed:?},                  scratch {allocated_bytes}/{cold_bytes} eager bytes,                  per-load metadata {metadata_bytes} bytes, initialized buffers 1",
+            );
+            assert!(allocated_bytes < cold_bytes);
+        }
+        let full_started = std::time::Instant::now();
+        let all = run.observe_real(&request, &[], None, None).unwrap();
+        let full_elapsed = full_started.elapsed();
+        assert_eq!(sample, all[..1]);
+        let borrowed = run.observation_work.borrow();
+        let work = borrowed.as_ref().unwrap();
+        assert_eq!(
+            work.loaded
+                .iter()
+                .filter(|loaded| !loaded.currents.is_empty())
+                .count(),
+            load_count
+        );
+        println!("{load_count} full-selection point: {full_elapsed:?}");
+    }
+
+    #[test]
+    fn selected_observations_keep_cold_loads_unallocated_over_many_points() {
+        measure_selected_workspace(24, 1_001);
+    }
+
+    #[test]
+    #[ignore = "run separately for the thousand-load throughput measurement"]
+    fn selected_observation_thousand_load_benchmark() {
+        measure_selected_workspace(1_000, 1_001);
+    }
+
+    #[test]
+    fn lazy_workspace_metadata_and_epoch_rollover_preserve_warmed_scratch() {
+        let circuit = Circuit::new();
+        let plan = ObservationPlan {
+            loads: (0..1_000)
+                .map(|i| TerminalLayout {
+                    device: i,
+                    rows: vec![0, 1],
+                    by_row: vec![(0, 0), (1, 1)],
+                    ports: vec![0, 1],
+                })
+                .collect(),
+            ..ObservationPlan::default()
+        };
+        let mut work = ObservationWorkspace::new(&circuit, &plan);
+        assert_eq!(work.loaded.len(), 1_000);
+        assert!(work.loaded.iter().all(|load| load.currents.capacity() == 0));
+        assert!(work.loaded.iter().all(|load| load.epoch == 0));
+
+        work.begin();
+        assert_eq!(work.epoch, 1);
+        let first = &mut work.loaded[42];
+        first.currents.resize(3, 0.);
+        first.epoch = work.epoch;
+        let pointer = first.currents.as_ptr();
+        let capacity = first.currents.capacity();
+        for _ in 0..1_001 {
+            work.begin();
+        }
+        assert_eq!(
+            work.loaded
+                .iter()
+                .filter(|load| load.currents.capacity() > 0)
+                .count(),
+            1
+        );
+        assert_ne!(work.loaded[42].epoch, work.epoch);
+        assert_eq!(work.loaded[42].currents.as_ptr(), pointer);
+        assert_eq!(work.loaded[42].currents.capacity(), capacity);
+
+        work.epoch = u64::MAX;
+        work.loaded[17].epoch = 1;
+        work.loaded[42].epoch = 1;
+        work.begin();
+        assert_eq!(work.epoch, 1);
+        assert!(work.loaded.iter().all(|load| load.epoch == 0));
+        assert_eq!(work.loaded[42].currents.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn selected_asks_only_isolate_selected_devices_once_per_point() {
+        let mut circuit = Circuit::new();
+        let a = circuit.add_node("a").unwrap();
+        let b = circuit.add_node("b").unwrap();
+        let first = Rc::new(Cell::new(0));
+        let second = Rc::new(Cell::new(0));
+        for (name, terminals, count) in [
+            ("r1", [a, b], Rc::clone(&first)),
+            ("r2", [NodeId::GROUND, a], Rc::clone(&second)),
+        ] {
+            circuit
+                .add_device(Box::new(Counted {
+                    name,
+                    nodes: terminals,
+                    count,
+                }))
+                .unwrap();
+        }
+        circuit.finalize().unwrap();
+        circuit
+            .set_observations(&[
+                "i(r1)".into(),
+                "@r2[i]".into(),
+                "@r1[p]".into(),
+                "@r2[power]".into(),
+                "@r1[current]".into(),
+            ])
+            .unwrap();
+        let baseline = [first.get(), second.get()];
+        let run = circuit.prepare_run();
+        let history = circuit.state_history().unwrap();
+        let model = ModelContext::default();
+        let solution = Vector::from_slice(&[3., 1.]);
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context: &model,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        assert_eq!(
+            run.observe_real_selected(&request, &[], None, None, &[0, 2, 4])
+                .unwrap(),
+            [4., 8., 4.].map(Complex::real)
+        );
+        assert_eq!([first.get(), second.get()], [baseline[0] + 1, baseline[1]]);
+        {
+            let stored = run.observation_work.borrow();
+            let work = stored.as_ref().unwrap();
+            assert_eq!(work.loaded[0].epoch, work.epoch);
+            assert!(!work.loaded[0].currents.is_empty());
+            assert!(work.loaded[1].currents.is_empty());
+            assert_eq!(work.loaded[1].epoch, 0);
+        }
+        assert_eq!(
+            run.observe_real_selected(&request, &[], None, None, &[])
+                .unwrap(),
+            []
+        );
+        assert_eq!([first.get(), second.get()], [baseline[0] + 1, baseline[1]]);
+        assert_eq!(
+            run.observe_real_selected(&request, &[], None, None, &[1, 3])
+                .unwrap(),
+            [-6., 18.].map(Complex::real)
+        );
+        assert_eq!(
+            [first.get(), second.get()],
+            [baseline[0] + 1, baseline[1] + 1]
+        );
+        {
+            let stored = run.observation_work.borrow();
+            let work = stored.as_ref().unwrap();
+            assert_ne!(work.loaded[0].epoch, work.epoch);
+            assert_eq!(work.loaded[1].epoch, work.epoch);
+            assert!(work.loaded.iter().all(|load| !load.currents.is_empty()));
+        }
+        assert!(
+            run.observe_parameters_selected(&model, &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(run.observe_parameters_selected(&model, &[2]).is_err());
+    }
+
     #[derive(Debug)]
     struct Stateful {
         name: &'static str,
@@ -777,7 +1151,7 @@ mod tests {
         );
         let work = run.observation_work.borrow();
         let work = work.as_ref().unwrap();
-        assert!(work.loaded.iter().all(|load| load.ready));
+        assert!(work.loaded.iter().all(|load| load.epoch == work.epoch));
     }
 
     #[test]

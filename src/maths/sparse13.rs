@@ -94,10 +94,19 @@ type LaneMask = Mask<i64, RHS_BATCH_WIDTH>;
 
 /// One SIMD tile, split by component so scatter updates never repack
 /// interleaved complex numbers. Real solves leave the imaginary plane empty.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct LaneParts {
     re: f64x4,
     im: f64x4,
+}
+
+/// Scratch for independent numeric factor tiles. Reuses the packed matrix,
+/// scatter rows and reciprocal storage across successive frequency tiles.
+#[derive(Debug, Default)]
+pub(super) struct IndependentFactorTileWorkspace {
+    values: Vec<LaneParts>,
+    scratch: Vec<LaneParts>,
+    inverses: Vec<LaneParts>,
 }
 
 impl LaneParts {
@@ -215,6 +224,86 @@ impl BatchUpdate {
             }
         }
         next
+    }
+}
+
+/// SIMD Schur update for distinct numeric matrices sharing one symbolic
+/// traversal. Unlike multiple-RHS updates, each lane owns its own pivot
+/// and reciprocal. Exceptional lanes use the ordinary scalar recovery.
+#[derive(Clone, Copy)]
+struct IndependentBatchUpdate {
+    numerator: LaneParts,
+    pivot: LaneParts,
+    multiplier: LaneParts,
+    normal: LaneMask,
+    active: LaneMask,
+}
+
+impl IndependentBatchUpdate {
+    fn new(numerator: LaneParts, pivot: LaneParts, inverse: LaneParts, enabled: LaneMask) -> Self {
+        let zero = f64x4::splat(0.);
+        let active = (numerator.re.simd_ne(zero) | numerator.im.simd_ne(zero)) & enabled;
+        let mut multiplier = LaneParts {
+            re: numerator.re * inverse.re - numerator.im * inverse.im,
+            im: numerator.re * inverse.im + numerator.im * inverse.re,
+        };
+        let normal = (multiplier.re.abs() + multiplier.im.abs()).is_normal();
+        let inverse_zero = inverse.re.simd_eq(zero) & inverse.im.simd_eq(zero);
+        let exceptional = active & (!normal | inverse_zero);
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    multiplier.set(
+                        lane,
+                        numerator
+                            .get::<Complex>(lane)
+                            .quotient(pivot.get::<Complex>(lane), inverse.get::<Complex>(lane)),
+                    );
+                }
+            }
+        }
+        Self {
+            numerator,
+            pivot,
+            multiplier,
+            normal: (multiplier.re.abs() + multiplier.im.abs()).is_normal(),
+            active,
+        }
+    }
+
+    fn apply(self, acc: LaneParts, lower: LaneParts) -> LaneParts {
+        let product = LaneParts {
+            re: self.multiplier.re * lower.re - self.multiplier.im * lower.im,
+            im: self.multiplier.re * lower.im + self.multiplier.im * lower.re,
+        };
+        let mut result = LaneParts {
+            re: acc.re - product.re,
+            im: acc.im - product.im,
+        };
+        let norm = result.re.abs() + result.im.abs();
+        let scale = (acc.re.abs() + acc.im.abs()) * f64x4::splat(0.0625);
+        let zero = f64x4::splat(0.);
+        let lower_zero = lower.re.simd_eq(zero) & lower.im.simd_eq(zero);
+        let finite = result.re.is_finite() & result.im.is_finite();
+        let fast = (self.normal & norm.is_normal() & norm.simd_gt(scale)) | (finite & lower_zero);
+        let exceptional = self.active & !fast;
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    result.set(
+                        lane,
+                        acc.get::<Complex>(lane).schur(
+                            self.pivot.get::<Complex>(lane),
+                            self.numerator.get::<Complex>(lane),
+                            self.multiplier.get::<Complex>(lane),
+                            lower.get::<Complex>(lane),
+                            self.normal.test(lane),
+                        ),
+                    );
+                }
+            }
+        }
+        LaneParts::select(self.active, result, acc)
     }
 }
 
@@ -656,6 +745,104 @@ impl<I: PlanIndex> FactorRuns<I> {
         Ok(())
     }
 
+    /// Refactor distinct numeric matrices with one immutable symbolic plan.
+    /// Coefficients and row scratch are packed by element/row into four SIMD
+    /// lanes. Pivots are independent; exceptional Schur updates use the
+    /// scalar range-preserving kernel for that lane.
+    fn refactor_independent_tile(
+        &self,
+        values: &mut [LaneParts],
+        diag: &[usize],
+        scratch: &mut [LaneParts],
+        inverses: &mut [LaneParts],
+        statuses: &mut [Status; RHS_BATCH_WIDTH],
+        count: usize,
+    ) {
+        for step in 2..=self.columns.runs.len() {
+            for entry in self.columns.all(step) {
+                let (handle, row) = entry.indices();
+                scratch[row] = values[handle];
+            }
+            for entry in self.columns.before_diagonal(step) {
+                let (handle, row) = entry.indices();
+                let upper = scratch[row];
+                values[handle] = upper;
+                let pivot = values[diag[row]];
+                let enabled = LaneMask::from_array(std::array::from_fn(|lane| {
+                    lane < count && statuses[lane] == Status::Okay
+                }));
+                let update = IndependentBatchUpdate::new(upper, pivot, inverses[row], enabled);
+                if update.active.any() {
+                    for entry in self.columns.after_diagonal(row) {
+                        let (handle, target) = entry.indices();
+                        scratch[target] = update.apply(scratch[target], values[handle]);
+                    }
+                }
+            }
+            for entry in self.columns.after_diagonal(step) {
+                let (handle, row) = entry.indices();
+                values[handle] = scratch[row];
+            }
+            for (lane, status) in statuses.iter_mut().enumerate().take(count) {
+                if *status != Status::Okay {
+                    continue;
+                }
+                let pivot = scratch[step].get::<Complex>(lane);
+                *status = if pivot.is_zero() {
+                    Status::ZeroDiag
+                } else if !pivot.is_finite() {
+                    Status::NonFinite
+                } else {
+                    Status::Okay
+                };
+                if *status == Status::Okay {
+                    values[diag[step]].set(lane, pivot);
+                    inverses[step].set(lane, pivot.cached_recip());
+                }
+            }
+        }
+    }
+
+    /// Solve independent, identically ordered complex factors in their
+    /// packed lanes. The same elimination traversal serves normal and
+    /// transposed solves without sharing numeric pivots.
+    fn solve_independent_tile(
+        &self,
+        values: &[LaneParts],
+        diag: &[usize],
+        inverses: &[LaneParts],
+        x: &mut [LaneParts],
+        enabled: LaneMask,
+        transposed: bool,
+    ) {
+        let axis = if transposed {
+            &self.rows
+        } else {
+            &self.columns
+        };
+        for step in 1..=self.columns.runs.len() {
+            let update =
+                IndependentBatchUpdate::new(x[step], values[diag[step]], inverses[step], enabled);
+            if update.active.any() {
+                for entry in axis.after_diagonal(step) {
+                    let (handle, row) = entry.indices();
+                    x[row] = update.apply(x[row], values[handle]);
+                }
+            }
+        }
+        for step in (1..=self.columns.runs.len()).rev() {
+            let update =
+                IndependentBatchUpdate::new(x[step], values[diag[step]], inverses[step], enabled);
+            if update.active.any() {
+                for entry in axis.before_diagonal(step) {
+                    let (handle, row) = entry.indices();
+                    x[row] = update.apply(x[row], values[handle]);
+                }
+                x[step] = LaneParts::select(update.active, update.multiplier, x[step]);
+            }
+        }
+    }
+
     fn solve<T: Scalar>(
         &self,
         values: &[T],
@@ -773,6 +960,96 @@ struct Topology {
     ext_to_int_col: Vec<usize>,
     int_to_ext_row: Vec<usize>,
     int_to_ext_col: Vec<usize>,
+}
+
+/// Statically selected direction of an ordered sparse linked list.
+///
+/// A row list is ordered by its element columns; a column list by its rows.
+/// Each orientation names its orthogonal list at the type level, so swapping
+/// one axis cannot accidentally relink that same axis instead.
+trait LinkedAxis {
+    type Orthogonal: LinkedAxis;
+
+    fn link(topology: &Topology, slot: Slot) -> usize;
+    fn set_link(topology: &mut Topology, slot: Slot, element: usize);
+    fn coordinate(element: &Element) -> usize;
+    fn set_coordinate(element: &mut Element, coordinate: usize);
+    fn successor(element: &Element) -> usize;
+    fn set_successor(element: &mut Element, successor: usize);
+    fn swap_maps(topology: &mut Topology, first: usize, second: usize);
+}
+
+struct AlongRows;
+struct AlongColumns;
+
+impl LinkedAxis for AlongRows {
+    type Orthogonal = AlongColumns;
+
+    fn link(topology: &Topology, slot: Slot) -> usize {
+        topology.row_get(slot)
+    }
+
+    fn set_link(topology: &mut Topology, slot: Slot, element: usize) {
+        topology.row_set(slot, element);
+    }
+
+    fn coordinate(element: &Element) -> usize {
+        element.col
+    }
+
+    fn set_coordinate(element: &mut Element, coordinate: usize) {
+        element.col = coordinate;
+    }
+
+    fn successor(element: &Element) -> usize {
+        element.next_in_row
+    }
+
+    fn set_successor(element: &mut Element, successor: usize) {
+        element.next_in_row = successor;
+    }
+
+    fn swap_maps(topology: &mut Topology, first: usize, second: usize) {
+        topology.first_in_row.swap(first, second);
+        topology.int_to_ext_row.swap(first, second);
+        topology.ext_to_int_row[topology.int_to_ext_row[first]] = first;
+        topology.ext_to_int_row[topology.int_to_ext_row[second]] = second;
+    }
+}
+
+impl LinkedAxis for AlongColumns {
+    type Orthogonal = AlongRows;
+
+    fn link(topology: &Topology, slot: Slot) -> usize {
+        topology.col_get(slot)
+    }
+
+    fn set_link(topology: &mut Topology, slot: Slot, element: usize) {
+        topology.col_set(slot, element);
+    }
+
+    fn coordinate(element: &Element) -> usize {
+        element.row
+    }
+
+    fn set_coordinate(element: &mut Element, coordinate: usize) {
+        element.row = coordinate;
+    }
+
+    fn successor(element: &Element) -> usize {
+        element.next_in_col
+    }
+
+    fn set_successor(element: &mut Element, successor: usize) {
+        element.next_in_col = successor;
+    }
+
+    fn swap_maps(topology: &mut Topology, first: usize, second: usize) {
+        topology.first_in_col.swap(first, second);
+        topology.int_to_ext_col.swap(first, second);
+        topology.ext_to_int_col[topology.int_to_ext_col[first]] = first;
+        topology.ext_to_int_col[topology.int_to_ext_col[second]] = second;
+    }
 }
 
 impl Topology {
@@ -932,230 +1209,144 @@ impl Topology {
         }
     }
 
-    /// Exchange elements in one column, preserving its row order.
-    fn exchange_col_elements(
+    /// Relink the two affected coordinates within an orthogonal linked list.
+    ///
+    /// Preserve the SPARSE case order exactly: missing first, missing second,
+    /// adjacent elements and non-adjacent elements. In particular, direct
+    /// coordinate updates and predecessor writes must remain in this order to
+    /// preserve stable element handles and the singly linked sort invariant.
+    fn exchange_list_elements<A: LinkedAxis>(
         &mut self,
-        row1: usize,
+        first: usize,
         e1: usize,
-        row2: usize,
+        second: usize,
         e2: usize,
-        column: usize,
+        list: usize,
     ) {
-        let mut above1 = Slot::Head(column);
-        let mut p = self.col_get(above1);
-        while self.elements[p].row < row1 {
-            above1 = Slot::After(p);
-            p = self.col_get(above1);
+        let mut preceding_first = Slot::Head(list);
+        let mut cursor = A::link(self, preceding_first);
+        while A::coordinate(&self.elements[cursor]) < first {
+            preceding_first = Slot::After(cursor);
+            cursor = A::link(self, preceding_first);
         }
         if e1 == NONE {
-            let below1 = p;
-            if self.elements[below1].row != row2 {
-                let mut above2;
+            let following_first = cursor;
+            if A::coordinate(&self.elements[following_first]) != second {
+                let preceding_second;
                 loop {
-                    above2 = Slot::After(p);
-                    p = self.col_get(above2);
-                    if self.elements[p].row >= row2 {
+                    let preceding = Slot::After(cursor);
+                    cursor = A::link(self, preceding);
+                    if A::coordinate(&self.elements[cursor]) >= second {
+                        preceding_second = preceding;
                         break;
                     }
                 }
-                let below2 = self.elements[e2].next_in_col;
-                self.col_set(above2, below2);
-                self.col_set(above1, e2);
-                self.elements[e2].next_in_col = below1;
+                let following_second = A::successor(&self.elements[e2]);
+                A::set_link(self, preceding_second, following_second);
+                A::set_link(self, preceding_first, e2);
+                A::set_successor(&mut self.elements[e2], following_first);
             }
-            self.elements[e2].row = row1;
+            A::set_coordinate(&mut self.elements[e2], first);
         } else {
-            let below1 = self.elements[e1].next_in_col;
+            let following_first = A::successor(&self.elements[e1]);
             if e2 == NONE {
-                if below1 != NONE && self.elements[below1].row < row2 {
-                    self.col_set(above1, below1);
-                    let mut p = below1;
-                    let mut above2;
+                if following_first != NONE
+                    && A::coordinate(&self.elements[following_first]) < second
+                {
+                    A::set_link(self, preceding_first, following_first);
+                    let mut cursor = following_first;
+                    let preceding_second;
                     loop {
-                        above2 = Slot::After(p);
-                        p = self.col_get(above2);
-                        if !(p != NONE && self.elements[p].row < row2) {
+                        let preceding = Slot::After(cursor);
+                        cursor = A::link(self, preceding);
+                        if cursor == NONE || A::coordinate(&self.elements[cursor]) >= second {
+                            preceding_second = preceding;
                             break;
                         }
                     }
-                    self.col_set(above2, e1);
-                    self.elements[e1].next_in_col = p;
-                    self.col_set(above1, below1);
+                    A::set_link(self, preceding_second, e1);
+                    A::set_successor(&mut self.elements[e1], cursor);
+                    A::set_link(self, preceding_first, following_first);
                 }
-                self.elements[e1].row = row2;
+                A::set_coordinate(&mut self.elements[e1], second);
             } else {
-                if self.elements[below1].row == row2 {
-                    self.elements[e1].next_in_col = self.elements[e2].next_in_col;
-                    self.elements[e2].next_in_col = e1;
-                    self.col_set(above1, e2);
+                if A::coordinate(&self.elements[following_first]) == second {
+                    let following_second = A::successor(&self.elements[e2]);
+                    A::set_successor(&mut self.elements[e1], following_second);
+                    A::set_successor(&mut self.elements[e2], e1);
+                    A::set_link(self, preceding_first, e2);
                 } else {
-                    let mut p = below1;
-                    let mut above2;
+                    let mut cursor = following_first;
+                    let preceding_second;
                     loop {
-                        above2 = Slot::After(p);
-                        p = self.col_get(above2);
-                        if self.elements[p].row >= row2 {
+                        let preceding = Slot::After(cursor);
+                        cursor = A::link(self, preceding);
+                        if A::coordinate(&self.elements[cursor]) >= second {
+                            preceding_second = preceding;
                             break;
                         }
                     }
-                    let below2 = self.elements[e2].next_in_col;
-                    self.col_set(above1, e2);
-                    self.elements[e2].next_in_col = below1;
-                    self.col_set(above2, e1);
-                    self.elements[e1].next_in_col = below2;
+                    let following_second = A::successor(&self.elements[e2]);
+                    A::set_link(self, preceding_first, e2);
+                    A::set_successor(&mut self.elements[e2], following_first);
+                    A::set_link(self, preceding_second, e1);
+                    A::set_successor(&mut self.elements[e1], following_second);
                 }
-                self.elements[e1].row = row2;
-                self.elements[e2].row = row1;
+                A::set_coordinate(&mut self.elements[e1], second);
+                A::set_coordinate(&mut self.elements[e2], first);
             }
         }
     }
 
-    /// Row-list counterpart of the column exchange.
-    fn exchange_row_elements(
-        &mut self,
-        col1: usize,
-        e1: usize,
-        col2: usize,
-        e2: usize,
-        row: usize,
-    ) {
-        let mut left1 = Slot::Head(row);
-        let mut p = self.row_get(left1);
-        while self.elements[p].col < col1 {
-            left1 = Slot::After(p);
-            p = self.row_get(left1);
+    /// Exchange the selected axis while relinking only orthogonal lists.
+    ///
+    /// One monomorphized walk implements SPARSE row and column exchange.
+    /// The linked ordering and the permutation-map mutation remain ordered
+    /// exactly as in the original two routines.
+    fn exchange_axis<A: LinkedAxis>(&mut self, mut first: usize, mut second: usize) {
+        if first == second {
+            return;
         }
-        if e1 == NONE {
-            let right1 = p;
-            if self.elements[right1].col != col2 {
-                let mut left2;
-                loop {
-                    left2 = Slot::After(p);
-                    p = self.row_get(left2);
-                    if self.elements[p].col >= col2 {
-                        break;
-                    }
-                }
-                let right2 = self.elements[e2].next_in_row;
-                self.row_set(left2, right2);
-                self.row_set(left1, e2);
-                self.elements[e2].next_in_row = right1;
-            }
-            self.elements[e2].col = col1;
-        } else {
-            let right1 = self.elements[e1].next_in_row;
-            if e2 == NONE {
-                if right1 != NONE && self.elements[right1].col < col2 {
-                    self.row_set(left1, right1);
-                    let mut p = right1;
-                    let mut left2;
-                    loop {
-                        left2 = Slot::After(p);
-                        p = self.row_get(left2);
-                        if !(p != NONE && self.elements[p].col < col2) {
-                            break;
-                        }
-                    }
-                    self.row_set(left2, e1);
-                    self.elements[e1].next_in_row = p;
-                    self.row_set(left1, right1);
-                }
-                self.elements[e1].col = col2;
-            } else {
-                if self.elements[right1].col == col2 {
-                    self.elements[e1].next_in_row = self.elements[e2].next_in_row;
-                    self.elements[e2].next_in_row = e1;
-                    self.row_set(left1, e2);
-                } else {
-                    let mut p = right1;
-                    let mut left2;
-                    loop {
-                        left2 = Slot::After(p);
-                        p = self.row_get(left2);
-                        if self.elements[p].col >= col2 {
-                            break;
-                        }
-                    }
-                    let right2 = self.elements[e2].next_in_row;
-                    self.row_set(left1, e2);
-                    self.elements[e2].next_in_row = right1;
-                    self.row_set(left2, e1);
-                    self.elements[e1].next_in_row = right2;
-                }
-                self.elements[e1].col = col2;
-                self.elements[e2].col = col1;
-            }
+        if first > second {
+            std::mem::swap(&mut first, &mut second);
         }
-    }
-
-    /// `spcRowExchange` (topology only).
-    fn row_exchange(&mut self, mut row1: usize, mut row2: usize) {
-        if row1 > row2 {
-            std::mem::swap(&mut row1, &mut row2);
-        }
-        let mut p1 = self.first_in_row[row1];
-        let mut p2 = self.first_in_row[row2];
+        let mut p1 = A::link(self, Slot::Head(first));
+        let mut p2 = A::link(self, Slot::Head(second));
         while p1 != NONE || p2 != NONE {
-            let (column, e1, e2);
+            let (orthogonal, e1, e2);
             if p1 == NONE {
-                column = self.elements[p2].col;
+                orthogonal = A::coordinate(&self.elements[p2]);
                 (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_row;
-            } else if p2 == NONE || self.elements[p1].col < self.elements[p2].col {
-                column = self.elements[p1].col;
+                p2 = A::successor(&self.elements[p2]);
+            } else if p2 == NONE
+                || A::coordinate(&self.elements[p1]) < A::coordinate(&self.elements[p2])
+            {
+                orthogonal = A::coordinate(&self.elements[p1]);
                 (e1, e2) = (p1, NONE);
-                p1 = self.elements[p1].next_in_row;
-            } else if self.elements[p1].col > self.elements[p2].col {
-                column = self.elements[p2].col;
+                p1 = A::successor(&self.elements[p1]);
+            } else if A::coordinate(&self.elements[p1]) > A::coordinate(&self.elements[p2]) {
+                orthogonal = A::coordinate(&self.elements[p2]);
                 (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_row;
+                p2 = A::successor(&self.elements[p2]);
             } else {
-                column = self.elements[p1].col;
+                orthogonal = A::coordinate(&self.elements[p1]);
                 (e1, e2) = (p1, p2);
-                p1 = self.elements[p1].next_in_row;
-                p2 = self.elements[p2].next_in_row;
+                p1 = A::successor(&self.elements[p1]);
+                p2 = A::successor(&self.elements[p2]);
             }
-            self.exchange_col_elements(row1, e1, row2, e2, column);
+            self.exchange_list_elements::<A::Orthogonal>(first, e1, second, e2, orthogonal);
         }
-        self.first_in_row.swap(row1, row2);
-        self.int_to_ext_row.swap(row1, row2);
-        self.ext_to_int_row[self.int_to_ext_row[row1]] = row1;
-        self.ext_to_int_row[self.int_to_ext_row[row2]] = row2;
+        A::swap_maps(self, first, second);
     }
 
-    /// `spcColExchange` (topology only).
-    fn col_exchange(&mut self, mut col1: usize, mut col2: usize) {
-        if col1 > col2 {
-            std::mem::swap(&mut col1, &mut col2);
-        }
-        let mut p1 = self.first_in_col[col1];
-        let mut p2 = self.first_in_col[col2];
-        while p1 != NONE || p2 != NONE {
-            let (row, e1, e2);
-            if p1 == NONE {
-                row = self.elements[p2].row;
-                (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_col;
-            } else if p2 == NONE || self.elements[p1].row < self.elements[p2].row {
-                row = self.elements[p1].row;
-                (e1, e2) = (p1, NONE);
-                p1 = self.elements[p1].next_in_col;
-            } else if self.elements[p1].row > self.elements[p2].row {
-                row = self.elements[p2].row;
-                (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_col;
-            } else {
-                row = self.elements[p1].row;
-                (e1, e2) = (p1, p2);
-                p1 = self.elements[p1].next_in_col;
-                p2 = self.elements[p2].next_in_col;
-            }
-            self.exchange_row_elements(col1, e1, col2, e2, row);
-        }
-        self.first_in_col.swap(col1, col2);
-        self.int_to_ext_col.swap(col1, col2);
-        self.ext_to_int_col[self.int_to_ext_col[col1]] = col1;
-        self.ext_to_int_col[self.int_to_ext_col[col2]] = col2;
+    /// SPARSE spcRowExchange, with statically bound row orientation.
+    fn row_exchange(&mut self, first: usize, second: usize) {
+        self.exchange_axis::<AlongRows>(first, second);
+    }
+
+    /// SPARSE spcColExchange, with statically bound column orientation.
+    fn col_exchange(&mut self, first: usize, second: usize) {
+        self.exchange_axis::<AlongColumns>(first, second);
     }
 }
 
@@ -3210,6 +3401,228 @@ impl DeterminantScale for Complex {
     }
 }
 
+/// Numeric per-lane factorization outcomes and ordered external solutions.
+type IndependentTileSolutions = ([Status; RHS_BATCH_WIDTH], Vec<Option<Vec<Complex>>>);
+
+impl Sparse<Complex> {
+    /// Factor independent original coefficient streams using one immutable
+    /// ordered symbolic topology. The reference's numeric factors are never
+    /// read or mutated. On allocation or layout mismatch callers use scalar
+    /// factorization, which has smaller peak scratch requirements.
+    fn factor_independent_packed(
+        reference: &Self,
+        inputs: &[&[Complex]],
+        workspace: &mut IndependentFactorTileWorkspace,
+    ) -> Option<[Status; RHS_BATCH_WIDTH]> {
+        if !(2..=RHS_BATCH_WIDTH).contains(&inputs.len()) {
+            return None;
+        }
+        let plan = reference.lifecycle.plan()?;
+        let topology = &reference.topology;
+        let original_entries = topology.original_entries;
+        if reference.size == 0 || inputs.iter().any(|values| values.len() != original_entries) {
+            return None;
+        }
+        let values_len = reference.values.len();
+        let size = reference.size;
+        let IndependentFactorTileWorkspace {
+            values,
+            scratch,
+            inverses,
+        } = workspace;
+        sparse_reserve(values, values_len.saturating_sub(values.len())).ok()?;
+        sparse_reserve(scratch, (size + 1).saturating_sub(scratch.len())).ok()?;
+        sparse_reserve(inverses, (size + 1).saturating_sub(inverses.len())).ok()?;
+        values.resize(values_len, LaneParts::ZERO);
+        scratch.resize(size + 1, LaneParts::ZERO);
+        inverses.resize(size + 1, LaneParts::ZERO);
+        for (index, packed) in values.iter_mut().enumerate() {
+            *packed = LaneParts::from_lanes(std::array::from_fn(|lane| {
+                if index < original_entries {
+                    inputs.get(lane).map_or(Complex::ZERO, |input| input[index])
+                } else {
+                    Complex::ZERO
+                }
+            }));
+        }
+        let count = inputs.len();
+        let mut status = [Status::Okay; RHS_BATCH_WIDTH];
+        let first_pivot = topology.diag[1];
+        for (lane, lane_status) in status.iter_mut().enumerate().take(count) {
+            let pivot = values[first_pivot].get::<Complex>(lane);
+            *lane_status = if pivot.is_zero() {
+                Status::ZeroDiag
+            } else if !pivot.is_finite() {
+                Status::NonFinite
+            } else {
+                inverses[1].set(lane, pivot.cached_recip());
+                Status::Okay
+            };
+        }
+        match plan.as_ref() {
+            FactorPlan::Compact(runs) => runs.refactor_independent_tile(
+                values,
+                &topology.diag,
+                scratch,
+                inverses,
+                &mut status,
+                count,
+            ),
+            FactorPlan::Wide(runs) => runs.refactor_independent_tile(
+                values,
+                &topology.diag,
+                scratch,
+                inverses,
+                &mut status,
+                count,
+            ),
+        }
+        for (lane, status) in status.iter_mut().enumerate().take(count) {
+            if *status == Status::Okay && values.iter().any(|v| !v.get::<Complex>(lane).is_finite())
+            {
+                *status = Status::NonFinite;
+            }
+        }
+        Some(status)
+    }
+
+    /// Materialize independent immutable numeric factors for callers that
+    /// must retain snapshots, perform multiple RHS or transposed solves.
+    pub(super) fn factor_independent_tile(
+        frames: &mut [Self],
+        workspace: &mut IndependentFactorTileWorkspace,
+    ) -> Option<[Status; RHS_BATCH_WIDTH]> {
+        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
+
+        let first = frames.first()?;
+        let plan = first.lifecycle.plan()?;
+        if frames.iter().any(|frame| {
+            !frame.coefficients_loaded()
+                || !matches!(frame.lifecycle.plan(), Some(other)
+                    if std::sync::Arc::ptr_eq(other, plan))
+                || !std::sync::Arc::ptr_eq(&frame.topology, &first.topology)
+        }) {
+            return None;
+        }
+        let original_entries = first.topology.original_entries;
+        let inputs: [&[Complex]; RHS_BATCH_WIDTH] = std::array::from_fn(|lane| {
+            frames
+                .get(lane)
+                .map_or(&[][..], |frame| &frame.values[..original_entries])
+        });
+        let mut status =
+            Self::factor_independent_packed(first, &inputs[..frames.len()], workspace)?;
+        for (lane, frame) in frames.iter_mut().enumerate() {
+            if status[lane] == Status::Okay {
+                if frame.prepare_inverses().is_err() {
+                    status[lane] = Status::Resource;
+                } else {
+                    for (dst, packed) in frame.values.iter_mut().zip(&workspace.values) {
+                        *dst = packed.get::<Complex>(lane);
+                    }
+                    for (dst, packed) in frame.inverses.iter_mut().zip(&workspace.inverses) {
+                        *dst = packed.get::<Complex>(lane);
+                    }
+                    status[lane] = frame.done();
+                }
+            }
+            frame.last_attempt = Some(FactorAttempt {
+                path: AttemptPath::Refactor,
+                status: status[lane],
+            });
+        }
+        Some(status)
+    }
+
+    /// Factor and solve independent numeric matrices without creating one
+    /// scalar LU snapshot per lane. Each input is the original-element
+    /// stream in the reference's order, and each RHS is in external order.
+    /// None indicates an unsupported packed shape or exhausted scratch,
+    /// in which case the caller can use independent scalar factors.
+    pub(super) fn factor_and_solve_independent_tile(
+        reference: &Self,
+        inputs: &[&[Complex]],
+        rhs: &[&[Complex]],
+        workspace: &mut IndependentFactorTileWorkspace,
+        transposed: bool,
+    ) -> Option<IndependentTileSolutions> {
+        if inputs.len() != rhs.len()
+            || rhs.iter().any(|source| {
+                source.len() != reference.ext_size || source.iter().any(|value| !value.is_finite())
+            })
+        {
+            return None;
+        }
+        let mut status = Self::factor_independent_packed(reference, inputs, workspace)?;
+        let count = inputs.len();
+        let active = LaneMask::from_array(std::array::from_fn(|lane| {
+            lane < count && status[lane] == Status::Okay
+        }));
+        let topology = &reference.topology;
+        if active.any() {
+            let gather = if transposed {
+                &topology.int_to_ext_col
+            } else {
+                &topology.int_to_ext_row
+            };
+            for (internal, &external) in gather[1..=reference.size].iter().enumerate() {
+                workspace.scratch[internal + 1] =
+                    LaneParts::from_lanes(std::array::from_fn(|lane| {
+                        rhs.get(lane)
+                            .map_or(Complex::ZERO, |source| source[external - 1])
+                    }));
+            }
+            match reference.lifecycle.plan()?.as_ref() {
+                FactorPlan::Compact(runs) => runs.solve_independent_tile(
+                    &workspace.values,
+                    &topology.diag,
+                    &workspace.inverses,
+                    &mut workspace.scratch,
+                    active,
+                    transposed,
+                ),
+                FactorPlan::Wide(runs) => runs.solve_independent_tile(
+                    &workspace.values,
+                    &topology.diag,
+                    &workspace.inverses,
+                    &mut workspace.scratch,
+                    active,
+                    transposed,
+                ),
+            }
+        }
+        let scatter = if transposed {
+            &topology.ext_to_int_row
+        } else {
+            &topology.ext_to_int_col
+        };
+        let mut output = Vec::new();
+        output.try_reserve(count).ok()?;
+        for lane in 0..count {
+            if status[lane] != Status::Okay {
+                output.push(None);
+                continue;
+            }
+            let mut solution = Vec::new();
+            solution.try_reserve(reference.ext_size).ok()?;
+            for (index, &internal) in scatter[1..].iter().enumerate() {
+                let value = if internal == NONE {
+                    rhs[lane][index]
+                } else {
+                    workspace.scratch[internal].get::<Complex>(lane)
+                };
+                if !value.is_finite() {
+                    status[lane] = Status::NonFinite;
+                    break;
+                }
+                solution.push(value);
+            }
+            output.push((status[lane] == Status::Okay).then_some(solution));
+        }
+        Some((status, output))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3255,6 +3668,166 @@ mod tests {
         assert_eq!(sparse.get_element(2, 1).unwrap(), first);
         assert_ne!(second, first);
         assert_eq!(sparse.value(first), 5.);
+    }
+
+    /// Structural oracle independent of the linked-list exchange algorithm:
+    /// every stable element handle has one expected matrix coordinate; the
+    /// explicit per-axis permutations define the only allowed coordinate moves.
+    fn assert_exchange_topology(
+        topology: &Topology,
+        n: usize,
+        expected: &[(usize, usize)],
+        row_permutation: &[usize],
+        col_permutation: &[usize],
+    ) {
+        assert_eq!(topology.elements.len(), expected.len());
+        let mut counted_rows = vec![0_usize; expected.len()];
+        let mut counted_cols = vec![0_usize; expected.len()];
+        for row in 1..=n {
+            let mut prev_col = 0;
+            let mut element = topology.first_in_row[row];
+            let mut visited = 0;
+            while element != NONE {
+                assert!(element < expected.len(), "dangling row-list link at {row}");
+                visited += 1;
+                assert!(visited <= expected.len(), "row-list cycle at {row}");
+                let node = &topology.elements[element];
+                assert_eq!(node.row, row);
+                assert!(node.col > prev_col, "row-list not ordered at {row}");
+                prev_col = node.col;
+                counted_rows[element] += 1;
+                element = node.next_in_row;
+            }
+        }
+        for col in 1..=n {
+            let mut prev_row = 0;
+            let mut element = topology.first_in_col[col];
+            let mut visited = 0;
+            while element != NONE {
+                assert!(
+                    element < expected.len(),
+                    "dangling column-list link at {col}"
+                );
+                visited += 1;
+                assert!(visited <= expected.len(), "column-list cycle at {col}");
+                let node = &topology.elements[element];
+                assert_eq!(node.col, col);
+                assert!(node.row > prev_row, "column-list not ordered at {col}");
+                prev_row = node.row;
+                counted_cols[element] += 1;
+                element = node.next_in_col;
+            }
+        }
+        assert!(counted_rows.iter().all(|count| *count == 1));
+        assert!(counted_cols.iter().all(|count| *count == 1));
+        for (element, position) in topology.elements.iter().zip(expected) {
+            assert_eq!((element.row, element.col), *position);
+        }
+        for i in 1..=n {
+            assert_eq!(topology.int_to_ext_row[i], row_permutation[i]);
+            assert_eq!(topology.int_to_ext_col[i], col_permutation[i]);
+            assert_eq!(topology.ext_to_int_row[row_permutation[i]], i);
+            assert_eq!(topology.ext_to_int_col[col_permutation[i]], i);
+        }
+    }
+
+    #[test]
+    fn row_and_column_exchange_match_reference_permutations_for_sparse_patterns() {
+        let mut seed = 0x22ac_b703_ef84_a911_u64;
+        let mut sample = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed >> 32
+        };
+        for n in [1, 2, 3, 5, 9, 16] {
+            for density in 0..5 {
+                let mut matrix = Sparse::<f64>::new(n).unwrap();
+                // Bind every coordinate to identity in the external/internal
+                // maps. The off-diagonal pattern is independently randomized.
+                for i in 1..=n {
+                    matrix.get_element(i, i).unwrap();
+                }
+                for row in 1..=n {
+                    for col in 1..=n {
+                        if row != col && sample() % 5 <= density {
+                            matrix.get_element(row, col).unwrap();
+                        }
+                    }
+                }
+                matrix.link_rows();
+                let mut positions: Vec<_> = matrix
+                    .topology
+                    .elements
+                    .iter()
+                    .map(|node| (node.row, node.col))
+                    .collect();
+                let mut row_permutation: Vec<_> = (0..=n).collect();
+                let mut col_permutation: Vec<_> = (0..=n).collect();
+                assert_exchange_topology(
+                    &matrix.topology,
+                    n,
+                    &positions,
+                    &row_permutation,
+                    &col_permutation,
+                );
+                for step in 0..(9 * n + 53) {
+                    let a = if step % 17 == 0 {
+                        1
+                    } else {
+                        sample() as usize % n + 1
+                    };
+                    let b = if step % 17 == 0 {
+                        n
+                    } else {
+                        sample() as usize % n + 1
+                    };
+                    if step % 2 == 0 {
+                        std::sync::Arc::make_mut(&mut matrix.topology).row_exchange(a, b);
+                        for (row, _) in &mut positions {
+                            if *row == a {
+                                *row = b;
+                            } else if *row == b {
+                                *row = a;
+                            }
+                        }
+                        row_permutation.swap(a, b);
+                    } else {
+                        std::sync::Arc::make_mut(&mut matrix.topology).col_exchange(a, b);
+                        for (_, col) in &mut positions {
+                            if *col == a {
+                                *col = b;
+                            } else if *col == b {
+                                *col = a;
+                            }
+                        }
+                        col_permutation.swap(a, b);
+                    }
+                    assert_exchange_topology(
+                        &matrix.topology,
+                        n,
+                        &positions,
+                        &row_permutation,
+                        &col_permutation,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_element_and_empty_orthogonal_lists_exchange_without_losing_links() {
+        let mut matrix = Sparse::<f64>::new(2).unwrap();
+        let handle = matrix.get_element(1, 2).unwrap().0;
+        matrix.link_rows();
+        assert_eq!(matrix.topology.first_in_row[2], NONE);
+        assert_eq!(matrix.topology.first_in_col[1], NONE);
+        let topology = std::sync::Arc::make_mut(&mut matrix.topology);
+        topology.row_exchange(1, 2);
+        topology.col_exchange(1, 2);
+        topology.row_exchange(2, 2);
+        topology.col_exchange(1, 1);
+        assert_exchange_topology(topology, 2, &[(2, 1)], &[0, 2, 1], &[0, 2, 1]);
+        assert_eq!(topology.elements[handle].row, 2);
+        assert_eq!(topology.elements[handle].col, 1);
     }
 
     #[test]

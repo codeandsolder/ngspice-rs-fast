@@ -388,6 +388,47 @@ impl StateHistory {
         })
     }
 
+    /// Reset a discarded Newton trial without borrowing or modifying any
+    /// accepted/retained snapshot. Only an exclusively owned storage slice
+    /// is recycled. Its old revision/topology is deliberately *not* trusted:
+    /// all slots are overwritten with NaNs and the binding/revision rebound
+    /// to this accepted history. The previous *active* trial still must
+    /// match exactly; stale trials themselves can never be accepted.
+    ///
+    /// # Errors
+    /// A previous trial from a foreign circuit or accepted revision.
+    pub(crate) fn trial_in_reusing(
+        &self,
+        phase: IterationPhase,
+        previous: Option<&TrialState>,
+        spare: Option<TrialState>,
+    ) -> SpiceResult<TrialState> {
+        if let Some(previous) = previous {
+            self.check_trial(previous)?;
+        }
+        let Some(mut reused) = spare.filter(|spare| spare.values.len() == self.len) else {
+            return self.trial_in(phase, previous);
+        };
+        // The previous accepted revision invalidates *read access* to this
+        // trial's old data, but not reuse of uniquely owned raw storage.
+        // Rebind only after every slot has been overwritten. Arc::make_mut
+        // would copy a retained snapshot unnecessarily merely to poison it.
+        if let Some(values) = Arc::get_mut(&mut reused.values) {
+            values.fill(Real::NAN);
+        } else {
+            reused.values = std::iter::repeat_n(Real::NAN, self.len).collect();
+        }
+        reused.topology = self.binding.as_ref().map(|binding| binding.topology);
+        reused.revision = Arc::clone(&self.revision);
+        reused.mode = LoadMode::newton(phase);
+        reused.previous = previous.map(|previous| Arc::clone(&previous.values));
+        reused.nonconvergent = false;
+        reused.patches = previous
+            .map(|previous| previous.patches.clone())
+            .unwrap_or_default();
+        Ok(reused)
+    }
+
     /// Checks that `trial` could be committed.
     ///
     /// # Errors
@@ -574,6 +615,7 @@ impl StateHistory {
             offset: range.start,
             patches: Some(&mut scratch.patches),
             delay: self.delays.get(&device),
+            ltra: None,
         })
     }
 
@@ -615,6 +657,7 @@ impl StateHistory {
             offset: range.start,
             patches: Some(patches),
             delay,
+            ltra: None,
         })
     }
 }
@@ -711,6 +754,15 @@ pub struct TrialState {
 }
 
 impl TrialState {
+    /// Once this trial's load and device convergence check have completed,
+    /// later Newton iterations need only its values and staged state1 patches.
+    /// Release its predecessor snapshot to make that older, discarded state
+    /// allocation uniquely reusable. Accepted/returned trials retain their
+    /// complete history because this is only called on continuing passes.
+    pub(crate) fn release_predecessor(&mut self) {
+        self.previous = None;
+    }
+
     /// Retain this load's values without copying its state slots.
     ///
     /// # Errors
@@ -853,9 +905,10 @@ pub struct DeviceState<'a> {
     offset: usize,
     patches: Option<&'a mut State1Patches>,
     delay: Option<&'a DelayHistory>,
+    ltra: Option<(&'a mut super::ltra::LtraWorkspace, &'a StateHistory, usize)>,
 }
 
-impl DeviceState<'_> {
+impl<'a> DeviceState<'a> {
     /// A window with no slots, for loads that track no state.
     #[must_use]
     pub const fn none() -> DeviceState<'static> {
@@ -870,6 +923,7 @@ impl DeviceState<'_> {
             offset: 0,
             patches: None,
             delay: None,
+            ltra: None,
         }
     }
 
@@ -892,8 +946,26 @@ impl DeviceState<'_> {
     /// The device's accepted delay history (read-only), when it has one and
     /// the window was opened with [`StateHistory::device_of`].
     #[must_use]
-    pub const fn delay_history(&self) -> Option<&DelayHistory> {
+    pub const fn delay_history(&self) -> Option<&'a DelayHistory> {
         self.delay
+    }
+
+    pub(super) fn with_ltra(
+        mut self,
+        workspace: Option<&'a mut super::ltra::LtraWorkspace>,
+        accepted: &'a StateHistory,
+        ordinal: usize,
+    ) -> Self {
+        self.ltra = workspace.map(|workspace| (workspace, accepted, ordinal));
+        self
+    }
+
+    pub(super) fn ltra_workspace(
+        &mut self,
+    ) -> Option<(&mut super::ltra::LtraWorkspace, &'a StateHistory, usize)> {
+        self.ltra
+            .as_mut()
+            .map(|(workspace, accepted, ordinal)| (&mut **workspace, *accepted, *ordinal))
     }
 
     /// The `(reltol, abstol)` of the Newton solve this load belongs to, when
@@ -1066,6 +1138,7 @@ impl DeviceState<'_> {
 #[cfg(test)]
 mod tests {
     use super::{ACCEPTED_DEPTH, DeviceState, IterationPhase, StateHistory};
+    use std::sync::Arc;
 
     #[test]
     fn load_mode_defaults_and_overrides_are_shared_by_every_window() {
@@ -1143,6 +1216,81 @@ mod tests {
         assert_eq!(history.accepted(8), None);
         history.clear();
         assert_eq!(history.depth(), 0);
+    }
+
+    #[test]
+    fn disposable_trial_reuse_poison_resets_every_unwritten_slot() {
+        let history = StateHistory::new(3);
+        let mut initial = history.trial_in(IterationPhase::Junction, None).unwrap();
+        for slot in 0..3 {
+            history
+                .device(&mut initial, slot..slot + 1)
+                .unwrap()
+                .set(0, f64::from(u32::try_from(slot + 1).unwrap()))
+                .unwrap();
+        }
+        let original_ptr = initial.values.as_ptr();
+        let mut reused = history
+            .trial_in_reusing(IterationPhase::Float, None, Some(initial))
+            .unwrap();
+        assert_eq!(original_ptr, reused.values.as_ptr());
+        assert!(reused.values().iter().all(|value| value.is_nan()));
+        assert_eq!(reused.phase(), IterationPhase::Float);
+        history
+            .device(&mut reused, 1..2)
+            .unwrap()
+            .set(0, 9.)
+            .unwrap();
+        let error = history.check(&reused).unwrap_err();
+        assert!(error.to_string().contains("slot 0 is unset"));
+        for slot in [0, 2] {
+            history
+                .device(&mut reused, slot..slot + 1)
+                .unwrap()
+                .set(0, 2.)
+                .unwrap();
+        }
+        history.check(&reused).unwrap();
+        let again = history
+            .trial_in_reusing(IterationPhase::Junction, None, Some(reused))
+            .unwrap();
+        assert_eq!(again.values.as_ptr(), original_ptr);
+        assert!(again.values().iter().all(|value| value.is_nan()));
+    }
+
+    #[test]
+    fn trial_pool_never_mutates_shared_snapshots_or_stale_revisions() {
+        let mut history = StateHistory::new(2);
+        let mut initial = history.trial();
+        history
+            .device(&mut initial, 0..1)
+            .unwrap()
+            .set(0, 17.)
+            .unwrap();
+        history
+            .device(&mut initial, 1..2)
+            .unwrap()
+            .set(0, 19.)
+            .unwrap();
+        let held = Arc::clone(&initial.values);
+        let trial = history
+            .trial_in_reusing(IterationPhase::Float, None, Some(initial))
+            .unwrap();
+        assert_eq!(&*held, &[17., 19.]);
+        assert_ne!(trial.values.as_ptr(), held.as_ptr());
+        let stale = trial;
+        let stale_ptr = stale.values.as_ptr();
+        history.clear();
+        assert!(history.check_trial(&stale).is_err());
+        let fresh = history
+            .trial_in_reusing(IterationPhase::Predict, None, Some(stale))
+            .unwrap();
+        assert_eq!(fresh.values.as_ptr(), stale_ptr);
+        assert_eq!(fresh.phase(), IterationPhase::Predict);
+        assert_eq!(fresh.values().len(), 2);
+        assert!(fresh.values().iter().all(|value| value.is_nan()));
+        assert!(history.check_trial(&fresh).is_ok());
+        assert_eq!(&*held, &[17., 19.]);
     }
 
     #[test]

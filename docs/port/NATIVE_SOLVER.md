@@ -74,6 +74,34 @@ configuration matches ngspice's `spconfig.h`: `TRANSLATE`, `EXPANDABLE`,
   whatever the deck's options, and `method=bdf` is an explicit error from the
   companion driver: ngspice has no BDF integrator.
 
+## Packed ordered dynamic stamps (#133)
+
+Frequency-dependent small-signal loads keep one reusable term arena per
+LinearSystem rather than allocating a vector for each capacitance group.
+DynamicGroups holds ordered, nonoverlapping ranges of E triplets and ranges
+into contiguous unscaled source terms. Each group still computes its
+omega-scaled products in source order and applies the multiplier/divisor to
+the accumulated result, matching the original C per-term rounding. Device
+stamps that already contain omega use the explicit prescaled flag; the
+unscaled and prescaled modes are never treated as interchangeable.
+
+Group range shape, source-coordinate coherence and order are verified once
+as the device stamps them. SparseMatrix attaches a lazily minted operator
+identity only when grouping is used; clearing, folding or overwriting the
+operator invalidates its old groups. All AC, distortion and sensitivity
+consumers validate this identity before numeric iteration, returning an
+error for stale/foreign group metadata rather than skipping it. The pole-zero
+loader traverses the same validated group sequence, but applies the real
+s-coefficient rule (including the divisor) and rejects a prescaled AC
+coefficient instead of misidentifying it as capacitance. Complete reassembly
+retains the capacity of both the group descriptors and the term arena.
+
+The focused tests are tests/dynamic_group_bench.rs and the existing
+complex_solver, pole_zero, MESFET/JFET/HFET and reference-conformance
+suites. The ignored benchmark contains both the packed construction and a
+test-only historical per-group Vec allocation baseline for DHAT comparison.
+These paths do not change solver order, pivot selection or C device physics.
+
 ## SPARSE frame lifecycle (#34)
 
 A frame has one explicit ordering/factor lifecycle. Original columns are
@@ -237,6 +265,56 @@ complete root sets and multiplicities, and the live C cases that converge.
 floating nodes, current-source cutsets, near-singular, badly scaled, zero
 R/C/L) against C's answer or C's class of error.
 
+## Opt-in original-operator residual telemetry (#104)
+
+Ordinary C-compatible DC/Newton/AC solves still perform no implicit
+equilibration, residual acceptance or conditioning-based rejection. The
+maths-library diagnostic, `OriginalResidual::<f64>::real` or
+`OriginalResidual::<Complex>::complex`, instead borrows the **unscaled**
+original assembled entries. The constructor indexes normal or transposed
+orientation once; `evaluate` and `evaluate_many` reuse that
+index for one or several original-unit right-hand sides. Disabled telemetry
+has no runtime overhead and no duplicate numeric operator storage.
+
+`ComponentwiseBackwardError` is a non-rejecting, dimensionless
+per-row measure. For real rows it is
+`|Σ a_rc x_c - b_r| / (Σ |a_rc| |x_c| + |b_r|)`.
+Complex residuals evaluate the real and imaginary products separately and
+take the larger normalized component; the denominator bounds both using all
+four absolute real/imaginary cross-products for each coefficient/solution
+pair, plus both RHS components. An empty zero row with zero RHS has error
+zero. The metric does not imply a forward-error/condition-number guarantee.
+
+Exact binary64 product accumulation reuses `primitives::ExactSum`
+to avoid cancellation loss, overflow and underflow in the numerator and
+denominator, including products individually beyond binary64 range. They
+retain separate power-of-two exponents until the final quotient. Reports
+contain per-row ratios and their maximum. Invalid dimensions, non-finite
+operators, RHS or solutions are errors; poor scaling or a large finite
+backward error is *reported*, not rejected as singular.
+
+The diagnostic is opt-in, with `O(nnz)` integer traversal indices
+and `O(n)` reported errors, no deep copy of the numeric operator
+and no per-RHS reindexing. Ordinary LU/C parity are unchanged.
+
+The optional `EquilibratedSparseLu::solve_refined` now uses the
+same exact original-unit quality and once-rounded correction RHSs. It takes
+an explicit `RefinementPolicy { max_steps, target_backward_error }`
+(maximum 8 rounds) and returns `RefinedSolution` with its best
+finite solution, final componentwise quality, count of accepted corrections,
+and a structured status: target met, rounds exhausted, no improvement,
+unrepresentable correction, or a correction-solve failure message. Every
+accepted correction must strictly improve the maximum original-unit error.
+The refined path may return a nonconverged physical solution with its
+quality/status for a caller to decide; it does not silently relax the target
+or reject a solution on a global-norm conditioning heuristic. This is an
+opt-in numerical experiment, not an automatic replacement for C's solver.
+
+Regression tests cover maximum-scale and minimum-subnormal real products,
+exact cancellation, complex phases and unrepresentable imaginary products,
+normal/transposed and multiple-RHS comparisons and invalid dimensions and
+finite inputs.
+
 ## Library API contracts
 
 Running a deck's analyses from Rust, as the CLI does (`RunConfig` applies the
@@ -389,3 +467,24 @@ transpose solves at 1, 2, 4, 8, 32 and 64 RHS with warm reusable buffers:
 ```sh
 cargo +nightly test --release --lib sparse_rhs_batch_benchmark -- --ignored --nocapture
 ```
+
+### Symmetric Jacobi validation of coupled inductances (#148)
+
+The dense fallback checks the signed spectrum of a normalized mutual
+inductance matrix only after inexpensive Gershgorin certificates fail. The
+matrix is symmetric by construction. Each cyclic Jacobi step now rotates an
+off-pivot pair once and copies the rounded result to both mirrored entries,
+while explicitly annihilating the pivot coupling and updating the two
+diagonals via its stable bounded tangent. Independent row and column rotations
+were producing false skew, preventing convergence for otherwise valid dense
+coupling (the exact 64×64 Hadamard example in `tests/mutual_jacobi.rs`).
+
+Stop only when the omitted symmetric off-diagonal Frobenius norm is at most
+`4*sqrt(n)*epsilon*||A||_F`. This is a backward perturbation: Weyl's bound
+then limits each eigenvalue change to that norm, in turn at most
+`4*n*epsilon*||A||_2`. The mutual validation acceptance budget is
+`64*n*epsilon*||A||_2`, so the solver residual is at least sixteenfold
+smaller than the physical decision margin. The 100-sweep numerical work
+budget, power-of-two scaling at extreme magnitudes, input symmetry checks
+and explicit failure behavior remain. This does not turn the eigensolver
+into an approximate general-purpose public API.

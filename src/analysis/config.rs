@@ -390,6 +390,25 @@ impl OptionInput<'_> {
     }
 }
 
+/// Independent admission limits for aggregate analysis-plan preparation.
+/// Each spectral/DC grid also retains its own reference-specific point cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanningLimits {
+    /// Number of analysis jobs, including point-free and adaptive ones.
+    pub max_jobs: usize,
+    /// Total deterministic frequency and DC Cartesian points.
+    pub max_grid_points: usize,
+}
+
+impl Default for PlanningLimits {
+    fn default() -> Self {
+        Self {
+            max_jobs: 10_000,
+            max_grid_points: 10_000_000,
+        }
+    }
+}
+
 /// Resolved, validated run configuration for one deck.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RunConfig {
@@ -420,14 +439,28 @@ impl RunConfig {
     /// Unknown, unimplemented, malformed, out-of-range or conflicting options,
     /// and option expressions that fail to evaluate.
     pub fn from_netlist(netlist: &Netlist) -> SpiceResult<Self> {
-        let scope = ParamScope::for_netlist(netlist)?;
+        let scope = std::sync::Arc::new(ParamScope::for_netlist(netlist)?);
+        Self::from_netlist_with_scope(netlist, scope)
+    }
+
+    /// Resolve a candidate's options and node hints against an already
+    /// evaluated immutable scope; no second dependency walk or parameter
+    /// evaluation. Caller controls when setup-shape changes invalidate plans.
+    pub(crate) fn from_netlist_with_scope(
+        netlist: &Netlist,
+        scope: std::sync::Arc<ParamScope>,
+    ) -> SpiceResult<Self> {
         // Body front-end cards follow expanded instance/card order, not definition order.
         let expanded = if netlist.subcircuits.iter().any(|sub| {
             !sub.options.is_empty()
                 || !sub.initial_conditions.is_empty()
                 || !sub.nodesets.is_empty()
         }) {
-            let literal = crate::netlist::elaborate::literalize(netlist)?;
+            let literal = crate::netlist::elaborate::literalize_with(
+                netlist,
+                std::sync::Arc::clone(&scope),
+                &mut EvalBudget::default(),
+            )?;
             Some(crate::devices::subckt::expand_subcircuits(
                 &literal.netlist,
                 &literal.scope,
@@ -468,8 +501,17 @@ impl RunConfig {
                 .as_ref()
                 .map_or(&nodesets, |expanded| &expanded.nodesets),
         );
-        config.params = Some(std::sync::Arc::new(scope));
+        config.params = Some(scope);
         Ok(config)
+    }
+
+    /// Replace only the already validated parameter environment. Numeric
+    /// candidates with unchanged options and topology retain the same run
+    /// settings but must expose their *current* parameter scope to objective
+    /// measurement and subsequent analysis binding.
+    pub(crate) fn with_parameter_scope(mut self, scope: std::sync::Arc<ParamScope>) -> Self {
+        self.params = Some(scope);
+        self
     }
 
     /// Explicit Fourier front-end settings.
@@ -1040,15 +1082,51 @@ impl RunConfig {
         self.plan(AnalysisInput::from(&literal))
     }
 
-    /// Resolve all analysis cards before scheduling or executing any of them.
+    /// Resolve all deck cards before executing any of them. Default limits
+    /// admit at most 10,000 jobs and 10 million deterministic grid points.
+    /// Adaptive transient stepping is governed separately by its own limits.
     ///
     /// # Errors
-    /// As [`Self::plan_for`], at the invalid card.
+    /// Invalid cards or aggregate work-budget overruns.
     pub fn plans_for(
         &self,
         cards: &[AnalysisCard],
     ) -> SpiceResult<Vec<crate::analysis::AnalysisPlan>> {
-        cards.iter().map(|card| self.plan_for(card)).collect()
+        self.plans_for_with_limits(cards, PlanningLimits::default())
+    }
+
+    /// Resolve a deck with independent limits on job count and deterministic
+    /// grid work. Checked addition rejects overflow before any execution.
+    /// This budgets preparation and intended solves, not streamed rows or
+    /// retained plots, which have their own independent resource policies.
+    ///
+    /// # Errors
+    /// As the ordinary plan resolver, plus either aggregate budget overrun.
+    pub fn plans_for_with_limits(
+        &self,
+        cards: &[AnalysisCard],
+        limits: PlanningLimits,
+    ) -> SpiceResult<Vec<crate::analysis::AnalysisPlan>> {
+        if cards.len() > limits.max_jobs {
+            return Err(crate::analysis::linear::unsupported(
+                "aggregate analysis job limit exceeded",
+            ));
+        }
+        let mut plans = Vec::with_capacity(cards.len());
+        let mut requested = 0usize;
+        for card in cards {
+            let plan = self.plan_for(card)?;
+            requested = requested
+                .checked_add(plan.requested_grid_points())
+                .filter(|count| *count <= limits.max_grid_points)
+                .ok_or_else(|| {
+                    crate::analysis::linear::unsupported(
+                        "aggregate deterministic analysis grid point limit exceeded",
+                    )
+                })?;
+            plans.push(plan);
+        }
+        Ok(plans)
     }
 
     /// Resolve explicit analysis input over this configuration's typed deck

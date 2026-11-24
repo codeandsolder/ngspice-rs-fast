@@ -4,8 +4,9 @@
 //! ([`SmallSignal`]) are shared with the `.sp` driver
 //! (`crate::analysis::sparam`), because `span.c` steps frequencies and
 //! prepares its operating point exactly as `acan.c` does.
-use crate::analysis::frequency::{Advance, FrequencyGrid};
+use crate::analysis::frequency::{Advance, FrequencyPlan};
 use crate::analysis::linear::{number, plot, unsupported};
+use crate::analysis::results::SelectedOutput;
 use crate::analysis::{AnalysisPlan, Plot, PointSink};
 use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
@@ -17,7 +18,7 @@ pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisPlan,
     context: &crate::analysis::AnalysisContext,
-    grid: &[Real],
+    grid: &FrequencyPlan,
     include_bias: bool,
     sink: &mut dyn PointSink,
 ) -> SpiceResult<()> {
@@ -35,28 +36,37 @@ pub(super) fn run(
         true,
     )?;
     sink.begin(&plot)?;
+    let mut selected = SelectedOutput::bind(sink, &plot, circuit.unknown_count(), true)?;
     // NIacIter on the circuit's own matrix: the first AC solve of the
     // circuit reorders (`SMPcReorder`, starting from the real pivot order),
     // later frequencies refactor (`SMPcLUfac`) and reorder only after a zero
     // pivot. See [`ac_matrix`].
     let shared: &Circuit = circuit;
     let mut point = Vec::with_capacity(plot.variable_count());
-    for &f in grid {
+    for f in grid.values() {
         let x = small_signal.at_frequency(context, f, |system| {
             ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
                 .factorize()?
                 .solve(&system.ac_rhs())
         })?;
-        point.clear();
-        point.push(Complex::real(f));
-        point.extend(x);
-        point.extend(
+        let model = context.model_context().with_frequency(f);
+        let observed = if let Some(output) = selected.as_ref() {
             small_signal
                 .prepared()
-                .observe_parameters(&context.model_context().with_frequency(f))?,
-        );
-        plot.check_point(&point)?;
-        sink.point(&point)?;
+                .observe_parameters_selected(&model, output.observations())?
+        } else {
+            small_signal.prepared().observe_parameters(&model)?
+        };
+        if let Some(output) = selected.as_mut() {
+            output.complex(sink, Some(f), &x, &observed)?;
+        } else {
+            point.clear();
+            point.push(Complex::real(f));
+            point.extend(x);
+            point.extend(observed);
+            plot.check_point(&point)?;
+            sink.point(&point)?;
+        }
     }
     sink.end()
 }
@@ -86,7 +96,7 @@ pub(super) fn frequency_grid(
     arguments: &[String],
     reltol: Real,
     kind: GridKind,
-) -> SpiceResult<Vec<Real>> {
+) -> SpiceResult<FrequencyPlan> {
     let argument = |index: usize| arguments.get(index).map(String::as_str);
     let mode = argument(0).unwrap_or_default().to_ascii_lowercase();
     // ACnumberSteps is IF_INTEGER: floor(0.5 + value).
@@ -139,7 +149,7 @@ pub(super) fn frequency_grid(
         GridKind::Ac => ".ac",
         GridKind::Sp => ".sp",
     };
-    FrequencyGrid::new(start, stop, tolerance, advance, analysis)?.collect()
+    FrequencyPlan::new(start, stop, tolerance, advance, analysis)
 }
 
 /// `CKTacLoad`: the small-signal system at `omega` loaded into the circuit's
@@ -346,6 +356,8 @@ mod tests {
             kind,
         )
         .unwrap()
+        .values()
+        .collect()
     }
 
     #[test]
@@ -370,6 +382,83 @@ mod tests {
             values.extend((0..state.len()).map(|slot| state.carried(slot)));
         }
         values
+    }
+
+    #[test]
+    fn independent_ac_frequency_tiles_preserve_point_order_and_physical_solution() {
+        // Keep the scalar AC driver as the throughput baseline. Exercise
+        // the explicit independent batch against the same circuit and plot.
+        let text = "RC ladder\nv1 in 0 dc 2 ac 1\nr1 in mid 1k\nc1 mid 0 220n\nr2 mid out 680\nc2 out 0 47n\nr3 out 0 2k\n.end\n";
+        let parse = || {
+            Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("ac-independent.cir"), text))
+                .unwrap()
+        };
+        let context = AnalysisContext::default();
+        let request = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "9", "100", "900"])
+            .resolve()
+            .unwrap();
+        let mut reference_circuit = Circuit::from_netlist(&parse()).unwrap();
+        reference_circuit
+            .set_observations(&["@r1[resistance]".to_owned()])
+            .unwrap();
+        let reference = request.run(&mut reference_circuit, &context).unwrap();
+        assert_eq!(reference.point_count(), 9);
+        let mut circuit = Circuit::from_netlist(&parse()).unwrap();
+        circuit
+            .set_observations(&["@r1[resistance]".to_owned()])
+            .unwrap();
+        circuit.finalize().unwrap();
+        let small =
+            SmallSignal::prepare(&circuit, &request, &context, request.dc_settings().clone())
+                .unwrap();
+        assert!(!small.varies() && !small.reassembles());
+        let rhs = small.system().ac_rhs();
+        let rhs_lanes = [rhs.as_slice(); 4];
+        let mut batch = crate::maths::complex::IndependentComplexBatch::default();
+        let frequencies: Vec<_> = (1..=9).map(|index| f64::from(index) * 100.).collect();
+        let mut row = 0;
+        for tile in frequencies.chunks(4) {
+            let matrices = tile
+                .iter()
+                .map(|&f| ac_matrix(&circuit, small.system(), 2. * std::f64::consts::PI * f))
+                .collect::<SpiceResult<Vec<_>>>()
+                .unwrap();
+            let solved = batch
+                .solve(&matrices, &rhs_lanes[..matrices.len()], false)
+                .unwrap();
+            for (&f, solution) in tile.iter().zip(solved) {
+                let mut point = vec![Complex::real(f)];
+                point.extend(solution.unwrap());
+                point.extend(
+                    small
+                        .prepared()
+                        .observe_parameters(&context.model_context().with_frequency(f))
+                        .unwrap(),
+                );
+                assert_eq!(point.len(), reference.variable_count());
+                for (var, &actual) in reference.variables().iter().zip(&point) {
+                    let expected = reference.value(&var.name, row).unwrap();
+                    let scale = expected.re.abs().max(expected.im.abs()).max(1.);
+                    assert!(
+                        (actual.re - expected.re).abs() <= 2e-12 * scale,
+                        "{} at row {row}: {:?} != {:?}",
+                        var.name,
+                        actual,
+                        expected
+                    );
+                    assert!(
+                        (actual.im - expected.im).abs() <= 2e-12 * scale,
+                        "{} at row {row}: {:?} != {:?}",
+                        var.name,
+                        actual,
+                        expected
+                    );
+                }
+                row += 1;
+            }
+        }
+        assert_eq!(row, reference.point_count());
     }
 
     #[test]

@@ -6,8 +6,9 @@
 //! variables and points, which is what a rawfile contains, and leaves plotting
 //! to whoever consumes the result.
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
+use crate::primitives::ascii::folded;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 /// Ordered output lifecycle for every plot produced by an analysis.
@@ -21,6 +22,17 @@ pub trait PointSink {
     /// # Errors
     /// Whatever the consumer reports; the analysis stops with that error.
     fn begin(&mut self, header: &Plot) -> SpiceResult<()>;
+
+    /// Optional sorted full-schema column ordinals selected by this sink.
+    ///
+    /// The producer may supply only these columns, in this order, after a
+    /// successful full-header begin. Normal sinks return None and still
+    /// receive complete rows. This is called once per output, never per point.
+    /// The source's physical state and convergence are never projected.
+    #[must_use]
+    fn selected_columns(&self) -> Option<&[usize]> {
+        None
+    }
 
     /// One borrowed row, with one value per variable of the active header.
     ///
@@ -45,6 +57,133 @@ pub trait PointSink {
             self.point(point)?;
         }
         self.end()
+    }
+}
+
+/// One checked objective-only projection of a driver's fixed output schema.
+///
+/// Selected column ordinals refer to the full header. The solved state and
+/// output ordering are untouched; only the delivered row and independently
+/// requested optional device quantities are compacted. Ordinary sinks return
+/// None and keep the original full-row production path.
+pub(crate) struct SelectedOutput {
+    columns: Vec<usize>,
+    observations: Vec<usize>,
+    first_unknown: usize,
+    first_observation: usize,
+    buffer: Vec<Complex>,
+}
+
+impl SelectedOutput {
+    /// Negotiate exactly once, after the full header has been validated by
+    /// the sink. The output is scale, unknowns, then observations.
+    pub(crate) fn bind(
+        sink: &dyn PointSink,
+        header: &Plot,
+        unknowns: usize,
+        has_scale: bool,
+    ) -> SpiceResult<Option<Self>> {
+        let Some(columns) = sink.selected_columns() else {
+            return Ok(None);
+        };
+        let first_unknown = usize::from(has_scale);
+        let first_observation = first_unknown
+            .checked_add(unknowns)
+            .filter(|&first| first <= header.variable_count())
+            .ok_or_else(|| lifecycle_error("selected output has invalid unknown layout"))?;
+        if columns
+            .iter()
+            .any(|&index| index >= header.variable_count())
+            || columns.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(lifecycle_error("invalid selected output column ordering"));
+        }
+        let observations = columns
+            .iter()
+            .copied()
+            .filter(|&index| index >= first_observation)
+            .map(|index| index - first_observation)
+            .collect();
+        Ok(Some(Self {
+            columns: columns.to_vec(),
+            observations,
+            first_unknown,
+            first_observation,
+            buffer: Vec::with_capacity(columns.len()),
+        }))
+    }
+
+    /// Device observation ordinals to request from the already bound Circuit.
+    /// Empty means no isolated device loads or spectral parameter asks.
+    pub(crate) fn observations(&self) -> &[usize] {
+        &self.observations
+    }
+
+    fn emit(
+        &mut self,
+        sink: &mut dyn PointSink,
+        scale: Option<Real>,
+        unknown_count: usize,
+        mut unknown: impl FnMut(usize) -> Complex,
+        observations: &[Complex],
+    ) -> SpiceResult<()> {
+        if observations.len() != self.observations.len() {
+            return Err(lifecycle_error(
+                "selected device observation width mismatch",
+            ));
+        }
+        if self.first_observation != unknown_count + self.first_unknown {
+            return Err(lifecycle_error("selected output unknown dimension changed"));
+        }
+        self.buffer.clear();
+        let mut observation = 0;
+        for &column in &self.columns {
+            let value = if column < self.first_unknown {
+                Complex::real(scale.ok_or_else(|| lifecycle_error("missing output scale"))?)
+            } else if column < self.first_observation {
+                unknown(column - self.first_unknown)
+            } else {
+                let value = observations[observation];
+                observation += 1;
+                value
+            };
+            self.buffer.push(value);
+        }
+        sink.point(&self.buffer)
+    }
+
+    /// Emit a compact real solution row in physical source-column order.
+    pub(crate) fn real(
+        &mut self,
+        sink: &mut dyn PointSink,
+        scale: Option<Real>,
+        unknowns: &[Real],
+        observations: &[Complex],
+    ) -> SpiceResult<()> {
+        self.emit(
+            sink,
+            scale,
+            unknowns.len(),
+            |index| Complex::real(unknowns[index]),
+            observations,
+        )
+    }
+
+    /// Emit a compact complex solution row in physical source-column order.
+    pub(crate) fn complex(
+        &mut self,
+        sink: &mut dyn PointSink,
+        scale: Option<Real>,
+        unknowns: &[Complex],
+        observations: &[Complex],
+    ) -> SpiceResult<()> {
+        self.emit(
+            sink,
+            scale,
+            unknowns.len(),
+            |index| unknowns[index],
+            observations,
+        )
     }
 }
 
@@ -198,14 +337,6 @@ pub struct PlotSchema {
     names: HashMap<String, usize>,
     voltages: HashMap<String, usize>,
     currents: HashMap<String, usize>,
-}
-
-fn folded(name: &str) -> Cow<'_, str> {
-    if name.bytes().any(|b| b.is_ascii_uppercase()) {
-        Cow::Owned(name.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(name)
-    }
 }
 
 impl PlotSchema {

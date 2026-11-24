@@ -20,24 +20,20 @@
 
 use crate::primitives::SpiceError;
 use winnow::Parser as _;
-use winnow::combinator::{alt, cut_err, opt, peek, repeat};
+use winnow::combinator::cut_err;
 use winnow::error::ErrMode;
-use winnow::token::any;
 
-use crate::netlist::ast::{DeviceInstance, InitialCondition, ParameterAssignment, ParameterKind};
-use crate::netlist::token::{Token, TokenKind};
+use crate::netlist::ast::DeviceInstance;
+use crate::netlist::token::Token;
 
-use super::grammar::{Failure, Input, ParsedCard, Result, keyword, location};
-use super::syntax::{canonical_node, equals, malformed, name, named, named_device, value};
-use super::vector::{numeric, positioned};
+use super::grammar::{Failure, Input, ParsedCard, Result, location};
+use super::line_grammar;
+use super::syntax::named_device;
 
-/// Scalar setters of `TRApTable` (`zo` is C's redundant alias of `z0`).
+/// Scalar setters allowed by this device's C parameter table.
 const SCALARS: [&str; 11] = [
     "z0", "zo", "td", "f", "nl", "v1", "v2", "i1", "i2", "rel", "abs",
 ];
-
-/// `ic=` components in `TRAparam`'s fallthrough order.
-const IC_COMPONENTS: [&str; 4] = ["v1", "i1", "v2", "i2"];
 
 pub(super) fn tline_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     let (instance, _) = named_device("t").parse_next(input)?;
@@ -45,17 +41,7 @@ pub(super) fn tline_card(input: &mut Input<'_>) -> Result<ParsedCard> {
 }
 
 fn body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
-    let auto_gnd = input.state.auto_gnd;
-    let mut nodes = Vec::with_capacity(4);
-    for what in [
-        "port 1 positive node",
-        "port 1 negative node",
-        "port 2 positive node",
-        "port 2 negative node",
-    ] {
-        let node = name(what).parse_next(input)?;
-        nodes.push(canonical_node(node, auto_gnd));
-    }
+    let nodes = line_grammar::four_terminals(input)?;
     if input
         .input
         .first()
@@ -67,8 +53,12 @@ fn body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
             location: Some(location(input)),
         })));
     }
-    let parameters: Vec<ParameterAssignment> =
-        repeat(0.., alt((initial_conditions, scalar, invalid))).parse_next(input)?;
+    let parameters = line_grammar::parameters(
+        input,
+        &SCALARS,
+        "transmission-line",
+        "z0, zo, td, f, nl, v1, i1, v2, i2, rel, abs or ic",
+    )?;
     Ok(ParsedCard::Device(DeviceInstance {
         name: instance.text.to_ascii_lowercase(),
         designator: 't',
@@ -77,54 +67,4 @@ fn body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
         parameters,
         location: input.state.card.location.clone(),
     }))
-}
-
-fn scalar(input: &mut Input<'_>) -> Result<ParameterAssignment> {
-    let token = any
-        .verify(|token: &Token| {
-            token.kind == TokenKind::Word && SCALARS.iter().any(|keyword| token.is_keyword(keyword))
-        })
-        .parse_next(input)?;
-    let (_, value) = cut_err((opt(equals), value)).parse_next(input)?;
-    Ok(named(
-        &token.text.to_ascii_lowercase(),
-        token.location.clone(),
-        value,
-    ))
-}
-
-fn initial_conditions(input: &mut Input<'_>) -> Result<ParameterAssignment> {
-    let token = keyword("ic").parse_next(input)?;
-    cut_err(|input: &mut Input<'_>| {
-        opt(equals).parse_next(input)?;
-        let vector = numeric(input, IC_COMPONENTS.len())?;
-        let values = vector
-            .values
-            .iter()
-            .zip(IC_COMPONENTS)
-            .map(|(value, name)| InitialCondition {
-                name: name.to_owned(),
-                value: positioned(value),
-            })
-            .collect();
-        Ok(ParameterAssignment {
-            name: "ic".to_owned(),
-            value: vector.text,
-            kind: ParameterKind::InitialConditions(values),
-            location: token.location.clone(),
-        })
-    })
-    .parse_next(input)
-}
-
-fn invalid(input: &mut Input<'_>) -> Result<ParameterAssignment> {
-    let token = peek(any).parse_next(input)?;
-    Err(malformed(
-        input,
-        &format!(
-            "unknown transmission-line parameter '{}' (expected z0, zo, td, f, nl, v1, i1, \
-             v2, i2, rel, abs or ic)",
-            token.text
-        ),
-    ))
 }

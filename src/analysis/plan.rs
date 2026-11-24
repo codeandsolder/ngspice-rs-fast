@@ -207,7 +207,7 @@ fn positive(text: &str, key: &str) -> SpiceResult<Real> {
     }
 }
 
-fn count(text: &str, key: &str, minimum: usize, maximum: usize) -> SpiceResult<usize> {
+pub(super) fn count(text: &str, key: &str, minimum: usize, maximum: usize) -> SpiceResult<usize> {
     exact_nonnegative_integer::<usize>(real(text, key)?)
         .filter(|n| (minimum..=maximum).contains(n))
         .ok_or_else(|| {
@@ -256,7 +256,13 @@ impl Overrides {
             "trcvmaxiter" if kind == AnalysisKind::DcSweep => {
                 self.point_iterations = Some(count(text, key, 1, MAX_ITERATIONS)?);
             }
-            _ if kind == AnalysisKind::Transient => self.tran.set(key, text)?,
+            _ if matches!(
+                kind,
+                AnalysisKind::Transient | AnalysisKind::PeriodicSteadyState
+            ) =>
+            {
+                self.tran.set(key, text)?;
+            }
             _ => return Err(unsupported(format!("convergence option {key}"))),
         }
         Ok(())
@@ -344,7 +350,9 @@ pub(super) fn resolve_options(
     }
     let dc = overrides.solver.resolve(config)?;
     let specific = match input.kind {
-        AnalysisKind::Transient => SpecificOptions::Transient(overrides.tran.resolve(config)?),
+        AnalysisKind::Transient | AnalysisKind::PeriodicSteadyState => {
+            SpecificOptions::Transient(overrides.tran.resolve(config)?)
+        }
         AnalysisKind::DcSweep => SpecificOptions::Dc {
             point_iterations: overrides.point_iterations.or_else(|| config.dc().itl2),
         },
@@ -367,11 +375,15 @@ pub(super) enum PlanKind {
         point_iterations: Option<usize>,
     },
     Ac {
-        frequencies: Vec<Real>,
+        frequencies: super::frequency::FrequencyPlan,
         retain_bias: bool,
     },
     Transient {
         settings: crate::analysis::TransientPlan,
+        uic: bool,
+    },
+    PeriodicSteadyState {
+        settings: super::pss::PssPlan,
         uic: bool,
     },
     PoleZero {
@@ -380,24 +392,24 @@ pub(super) enum PlanKind {
     },
     TransferFunction(crate::analysis::tf::TransferRequest),
     SParameter {
-        frequencies: Vec<Real>,
+        frequencies: super::frequency::FrequencyPlan,
         donoise: bool,
         retain_bias: bool,
     },
     Noise {
         card: crate::analysis::noise::NoiseCard,
-        frequencies: Vec<Real>,
+        frequencies: super::frequency::FrequencyPlan,
         options: crate::analysis::NoiseOptions,
         retain_bias: bool,
     },
     Distortion {
         card: crate::analysis::disto::DistoCard,
-        frequencies: Vec<Real>,
+        frequencies: super::frequency::FrequencyPlan,
         retain_bias: bool,
     },
     Sensitivity {
         card: crate::analysis::sens::SensCard,
-        frequencies: Option<Vec<Real>>,
+        frequencies: Option<super::frequency::FrequencyPlan>,
     },
 }
 
@@ -423,8 +435,13 @@ fn validate_input(input: &AnalysisInput) -> SpiceResult<()> {
             | AnalysisKind::Noise
             | AnalysisKind::Distortion
     );
-    if input.uic && input.kind != AnalysisKind::Transient {
-        return Err(unsupported("uic is valid only for .tran"));
+    if input.uic
+        && !matches!(
+            input.kind,
+            AnalysisKind::Transient | AnalysisKind::PeriodicSteadyState
+        )
+    {
+        return Err(unsupported("uic is valid only for .tran or .pss"));
     }
     if input.noise.is_some() && input.kind != AnalysisKind::Noise {
         return Err(unsupported("noise options are valid only for .noise"));
@@ -445,6 +462,29 @@ fn validate_input(input: &AnalysisInput) -> SpiceResult<()> {
     Ok(())
 }
 
+fn resolve_time_domain(
+    kind: AnalysisKind,
+    positional: &[String],
+    specific: SpecificOptions,
+    newton: &crate::analysis::newton::NewtonOptions,
+    uic: bool,
+) -> SpiceResult<PlanKind> {
+    let SpecificOptions::Transient(options) = specific else {
+        return Err(unsupported("missing transient options"));
+    };
+    if kind == AnalysisKind::Transient {
+        Ok(PlanKind::Transient {
+            settings: super::companion::TransientPlan::resolve(positional, options, newton)?,
+            uic,
+        })
+    } else {
+        Ok(PlanKind::PeriodicSteadyState {
+            settings: super::pss::PssPlan::resolve(positional, options, newton)?,
+            uic,
+        })
+    }
+}
+
 impl AnalysisPlan {
     pub(super) fn resolve(
         input: AnalysisInput,
@@ -452,9 +492,7 @@ impl AnalysisPlan {
         deck_noise: crate::analysis::NoiseOptions,
         deck_keep_op_info: bool,
     ) -> SpiceResult<Self> {
-        use crate::analysis::{
-            ac, companion::TransientPlan, disto, noise, pz, sens, sparam, sweep, tf,
-        };
+        use crate::analysis::{ac, disto, noise, pz, sens, sparam, sweep, tf};
         let kind = input.kind;
         validate_input(&input)?;
         let retain_bias = input.keep_op_info.unwrap_or(deck_keep_op_info);
@@ -489,14 +527,8 @@ impl AnalysisPlan {
                     retain_bias,
                 }
             }
-            AnalysisKind::Transient => {
-                let SpecificOptions::Transient(options) = specific else {
-                    return Err(unsupported("missing transient options"));
-                };
-                PlanKind::Transient {
-                    settings: TransientPlan::resolve(&positional, options, &dc.newton)?,
-                    uic: input.uic,
-                }
+            AnalysisKind::Transient | AnalysisKind::PeriodicSteadyState => {
+                resolve_time_domain(kind, &positional, specific, &dc.newton, input.uic)?
             }
             AnalysisKind::PoleZero => PlanKind::PoleZero {
                 card: pz::parse(&positional)?,
@@ -515,8 +547,7 @@ impl AnalysisPlan {
             }
             AnalysisKind::Noise => {
                 let card = noise::parse(&positional)?;
-                let frequencies =
-                    noise::frequency_grid(&card, reltol)?.collect::<SpiceResult<_>>()?;
+                let frequencies = noise::frequency_grid(&card, reltol)?;
                 PlanKind::Noise {
                     card,
                     frequencies,
@@ -553,6 +584,23 @@ impl AnalysisPlan {
         })
     }
 
+    /// Bounded deterministic coordinate work requested by this plan.
+    /// Adaptive transient stepping is separately governed by its own limits.
+    pub(super) fn requested_grid_points(&self) -> usize {
+        match &self.analysis {
+            PlanKind::Dc { axes, .. } => axes.point_count(),
+            PlanKind::PeriodicSteadyState { settings, .. } => settings.grid_points(),
+            PlanKind::Ac { frequencies, .. }
+            | PlanKind::SParameter { frequencies, .. }
+            | PlanKind::Noise { frequencies, .. }
+            | PlanKind::Distortion { frequencies, .. } => frequencies.len(),
+            PlanKind::Sensitivity { frequencies, .. } => frequencies
+                .as_ref()
+                .map_or(0, super::frequency::FrequencyPlan::len),
+            _ => 0,
+        }
+    }
+
     /// The kind encoded by the checked analysis payload.
     #[must_use]
     pub const fn kind(&self) -> AnalysisKind {
@@ -561,6 +609,7 @@ impl AnalysisPlan {
             PlanKind::Dc { .. } => AnalysisKind::DcSweep,
             PlanKind::Ac { .. } => AnalysisKind::Ac,
             PlanKind::Transient { .. } => AnalysisKind::Transient,
+            PlanKind::PeriodicSteadyState { .. } => AnalysisKind::PeriodicSteadyState,
             PlanKind::PoleZero { .. } => AnalysisKind::PoleZero,
             PlanKind::TransferFunction(_) => AnalysisKind::TransferFunction,
             PlanKind::SParameter { .. } => AnalysisKind::SParameter,
@@ -599,7 +648,10 @@ impl AnalysisPlan {
     /// Whether this transient starts from the user initial conditions.
     #[must_use]
     pub const fn uic(&self) -> bool {
-        matches!(self.analysis, PlanKind::Transient { uic: true, .. })
+        matches!(
+            self.analysis,
+            PlanKind::Transient { uic: true, .. } | PlanKind::PeriodicSteadyState { uic: true, .. }
+        )
     }
 
     /// Noise representation and model options, only for noise plans.
@@ -613,13 +665,15 @@ impl AnalysisPlan {
 
     /// Checked frequency points in the reference algorithm's order.
     #[must_use]
-    pub fn frequencies(&self) -> Option<&[Real]> {
+    pub fn frequencies(&self) -> Option<impl ExactSizeIterator<Item = Real> + Clone + '_> {
         match &self.analysis {
             PlanKind::Ac { frequencies, .. }
             | PlanKind::SParameter { frequencies, .. }
             | PlanKind::Noise { frequencies, .. }
-            | PlanKind::Distortion { frequencies, .. } => Some(frequencies),
-            PlanKind::Sensitivity { frequencies, .. } => frequencies.as_deref(),
+            | PlanKind::Distortion { frequencies, .. } => Some(frequencies.values()),
+            PlanKind::Sensitivity { frequencies, .. } => frequencies
+                .as_ref()
+                .map(super::frequency::FrequencyPlan::values),
             _ => None,
         }
     }
@@ -655,6 +709,7 @@ impl AnalysisPlan {
         let count = match &self.analysis {
             PlanKind::Noise { card, .. } => card.plot_count(),
             PlanKind::Distortion { card, .. } => card.plot_count(),
+            PlanKind::PeriodicSteadyState { settings, .. } => settings.plot_count(),
             _ => 1,
         };
         count + if self.retains_bias() { 1 } else { 0 }
@@ -715,7 +770,7 @@ impl AnalysisPlan {
             return Err(unsupported("sensitivity resolution requires a .sens plan"));
         };
         let (plot, resolution) =
-            super::sens::run(circuit, self, context, card, frequencies.as_deref(), true)?;
+            super::sens::run(circuit, self, context, card, frequencies.as_ref(), true)?;
         let resolution = resolution.ok_or_else(|| unsupported("missing sensitivity resolution"))?;
         Ok((plot, resolution))
     }
@@ -743,6 +798,9 @@ impl AnalysisPlan {
                 return crate::analysis::companion_transient_into(circuit, self, context, sink)
                     .map(|_| ());
             }
+            PlanKind::PeriodicSteadyState { settings, .. } => {
+                return super::pss::run(circuit, self, context, settings, None, sink).map(drop);
+            }
             PlanKind::PoleZero { card, .. } => pz::run(circuit, self, context, card, retain_bias)?,
             PlanKind::TransferFunction(card) => vec![tf::run(circuit, self, context, card)?],
             PlanKind::SParameter {
@@ -759,13 +817,31 @@ impl AnalysisPlan {
                 card, frequencies, ..
             } => disto::run(circuit, self, context, card, frequencies, retain_bias)?,
             PlanKind::Sensitivity { card, frequencies } => {
-                vec![sens::run(circuit, self, context, card, frequencies.as_deref(), false)?.0]
+                vec![sens::run(circuit, self, context, card, frequencies.as_ref(), false)?.0]
             }
         };
         for plot in plots {
             sink.complete(plot)?;
         }
         Ok(())
+    }
+
+    /// Solve a periodic orbit and emit the configured plots, optionally
+    /// starting from a previously converged orbit on the same topology.
+    ///
+    /// # Errors
+    /// Non-PSS request, inconsistent warm start, or numerical/physical failure.
+    pub fn run_periodic(
+        &self,
+        circuit: &mut crate::devices::Circuit,
+        context: &crate::analysis::AnalysisContext,
+        warm: Option<&super::PeriodicOrbit>,
+        sink: &mut dyn crate::analysis::PointSink,
+    ) -> SpiceResult<super::PeriodicOrbit> {
+        let PlanKind::PeriodicSteadyState { settings, .. } = &self.analysis else {
+            return Err(unsupported("periodic orbit requires a .pss plan"));
+        };
+        super::pss::run(circuit, self, context, settings, warm, sink)
     }
 
     /// Execute all planned outputs in order through a single sink lifecycle.
@@ -893,6 +969,7 @@ mod boundary_tests {
             (AnalysisKind::Noise, "v(out) v1 lin 3 1 3"),
             (AnalysisKind::Distortion, "dec 2 1k 10k"),
             (AnalysisKind::Sensitivity, "v ( out )"),
+            (AnalysisKind::PeriodicSteadyState, "1k 1m out"),
         ];
         assert_eq!(inputs.map(|(kind, _)| kind), DRIVERS);
         for (kind, arguments) in inputs {

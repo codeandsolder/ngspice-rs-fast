@@ -50,7 +50,7 @@ use crate::devices::linear::LinearContext;
 use crate::devices::traits::{
     AnalysisMode, ControlReference, Device, MnaUnknowns, StampContext, StampRhs,
 };
-use program::{Environment, Evaluation, Program, Quantity, Workspace};
+use program::{Environment, Evaluation, EvaluationView, Program, Quantity, Workspace};
 use std::cell::RefCell;
 
 /// C reference used in diagnostics.
@@ -130,19 +130,34 @@ enum Variable {
 
 /// Evaluation and the circuit bindings it was linearised around, in
 /// expression-variable order. Ground quantities have no matrix column.
-struct Linearization {
-    evaluation: Evaluation,
+struct Linearization<'a> {
+    evaluation: EvaluationView<'a>,
+    values: &'a [Real],
+    columns: &'a [Option<usize>],
+}
+
+impl Linearization<'_> {
+    fn equivalent(&self, factor: Real) -> Real {
+        let mut equivalent = self.evaluation.value;
+        for (gradient, value) in self.evaluation.gradient.iter().zip(self.values) {
+            equivalent -= value * gradient;
+        }
+        factor * equivalent
+    }
+}
+
+/// Per-instance mutable scratch, never shared when a device is cloned.
+/// The compiled plan and circuit bindings remain immutable and shareable.
+#[derive(Debug, Default)]
+struct Scratch {
+    program: Workspace,
     values: Vec<Real>,
     columns: Vec<Option<usize>>,
 }
 
-impl Linearization {
-    fn equivalent(&self, factor: Real) -> Real {
-        let mut equivalent = self.evaluation.value;
-        for (gradient, value) in self.evaluation.gradient.iter().zip(&self.values) {
-            equivalent -= value * gradient;
-        }
-        factor * equivalent
+impl Clone for Scratch {
+    fn clone(&self) -> Self {
+        Self::default()
     }
 }
 
@@ -157,7 +172,7 @@ pub struct Behavioural {
     variables: Vec<Variable>,
     controls: Vec<ControlReference>,
     program: Program,
-    workspace: RefCell<Workspace>,
+    workspace: RefCell<Scratch>,
     scale: BehaviouralScale,
 }
 
@@ -189,28 +204,79 @@ impl Behavioural {
         &self.program
     }
 
-    /// Evaluates the expression with the variables read from `solution`.
-    fn evaluate(
+    /// Evaluate in the reusable instance scratch, borrowing all input,
+    /// matrix-column and derivative buffers for the duration of the caller.
+    /// Resolving columns for each assembly is necessary: MNA numbering can
+    /// change after an analysis rebuild and no topology generation token is
+    /// currently exposed by `MnaUnknowns`. No column allocations occur after
+    /// the first load with a particular expression width.
+    fn with_linearization<T>(
         &self,
         solution: &Vector,
         unknowns: &MnaUnknowns,
         controls: &[usize],
         time: Real,
         context: &crate::devices::ModelContext,
-    ) -> SpiceResult<Linearization> {
-        let columns = self.columns(unknowns, controls)?;
-        let values: Vec<Real> = columns
-            .iter()
-            .map(|column| column.and_then(|row| solution.get(row)).unwrap_or(0.))
-            .collect();
-        let evaluation = self.evaluate_values(&values, time, context)?;
-        Ok(Linearization {
+        use_result: impl FnOnce(&Linearization<'_>) -> SpiceResult<T>,
+    ) -> SpiceResult<T> {
+        let mut scratch = self.workspace.borrow_mut();
+        scratch.columns.clear();
+        for variable in &self.variables {
+            let column = match *variable {
+                Variable::Node(node) => unknowns.node_row(node),
+                Variable::Branch(index) => Some(controls.get(index).copied().ok_or_else(|| {
+                    SpiceError::circuit(format!(
+                        "{}: controlling branch {} is not bound",
+                        self.name, self.controls[index].name
+                    ))
+                })?),
+            };
+            scratch.columns.push(column);
+        }
+
+        let Scratch {
+            program,
+            values,
+            columns,
+        } = &mut *scratch;
+        values.clear();
+        values.extend(
+            columns
+                .iter()
+                .map(|column| column.and_then(|row| solution.get(row)).unwrap_or(0.)),
+        );
+        let environment = Environment {
+            values,
+            time,
+            temperature: context.temperature,
+            gmin: context.gmin,
+            // ifeval.c PTeval: hertz is CKTomega / 2PI,
+            // with CKTomega = 2PI * frequency.
+            frequency: 2.0 * std::f64::consts::PI * context.frequency / 2. / std::f64::consts::PI,
+        };
+        let evaluation = self
+            .program
+            .evaluate_with_workspace(&environment, program)
+            .map_err(|error| self.evaluation_error(error))?;
+        use_result(&Linearization {
             evaluation,
             values,
             columns,
         })
     }
 
+    fn evaluation_error(&self, error: SpiceError) -> SpiceError {
+        match error {
+            SpiceError::Numerical { message, .. } => SpiceError::Numerical {
+                context: format!("behavioural source {}", self.name),
+                message,
+            },
+            other => other,
+        }
+    }
+
+    /// Cold validation helper; all hot circuit evaluation uses the borrowed
+    /// workspace, including convergence's derivative/domain checks.
     fn evaluate_values(
         &self,
         values: &[Real],
@@ -218,49 +284,16 @@ impl Behavioural {
         context: &crate::devices::ModelContext,
     ) -> SpiceResult<Evaluation> {
         self.program
-            .evaluate_with_workspace(
-                &Environment {
-                    values,
-                    time,
-                    temperature: context.temperature,
-                    gmin: context.gmin,
-                    // ifeval.c PTeval: `hertz` is `CKTomega / 2. / M_PI`, with
-                    // `CKTomega = 2.0 * M_PI * freq` (acan.c), not `freq` itself.
-                    frequency: 2.0 * std::f64::consts::PI * context.frequency
-                        / 2.
-                        / std::f64::consts::PI,
-                },
-                &mut self.workspace.borrow_mut(),
-            )
-            .map_err(|error| match error {
-                SpiceError::Numerical { message, .. } => SpiceError::Numerical {
-                    context: format!("behavioural source {}", self.name),
-                    message,
-                },
-                other => other,
+            .evaluate(&Environment {
+                values,
+                time,
+                temperature: context.temperature,
+                gmin: context.gmin,
+                frequency: 2.0 * std::f64::consts::PI * context.frequency
+                    / 2.
+                    / std::f64::consts::PI,
             })
-    }
-
-    /// The matrix column of every variable (`None` for ground).
-    fn columns(
-        &self,
-        unknowns: &MnaUnknowns,
-        controls: &[usize],
-    ) -> SpiceResult<Vec<Option<usize>>> {
-        self.variables
-            .iter()
-            .map(|variable| match variable {
-                Variable::Node(node) => Ok(unknowns.node_row(*node)),
-                Variable::Branch(index) => {
-                    controls.get(*index).copied().map(Some).ok_or_else(|| {
-                        SpiceError::circuit(format!(
-                            "{}: controlling branch {} is not bound",
-                            self.name, self.controls[*index].name
-                        ))
-                    })
-                }
-            })
-            .collect()
+            .map_err(|error| self.evaluation_error(error))
     }
 
     /// Stamps the linearised output. `rhs` is `None` for the AC Jacobian.
@@ -270,7 +303,7 @@ impl Behavioural {
         rhs: Option<&mut StampRhs<'_>>,
         unknowns: &MnaUnknowns,
         branch: Option<usize>,
-        linearization: &Linearization,
+        linearization: &Linearization<'_>,
         factor: Real,
     ) -> SpiceResult<()> {
         let row = |node: NodeId| unknowns.node_row(node);
@@ -293,7 +326,7 @@ impl Behavioural {
                     .evaluation
                     .gradient
                     .iter()
-                    .zip(&linearization.columns)
+                    .zip(linearization.columns)
                 {
                     add(k, *column, -gradient * factor)?;
                 }
@@ -306,7 +339,7 @@ impl Behavioural {
                     .evaluation
                     .gradient
                     .iter()
-                    .zip(&linearization.columns)
+                    .zip(linearization.columns)
                 {
                     add(p, *column, gradient * factor)?;
                     add(n, *column, -gradient * factor)?;
@@ -379,22 +412,24 @@ impl Device for Behavioural {
         &self,
         context: &crate::devices::ConvergenceContext<'_>,
     ) -> SpiceResult<bool> {
-        let linearization = self.evaluate(
+        self.with_linearization(
             context.solution,
             context.unknowns,
             context.controls,
             context.time,
             context.model_context,
-        )?;
-        let rhs = linearization.evaluation.value;
-        let prev = context.states.first().copied().unwrap_or(0.);
-        let absolute = match self.output {
-            BehaviouralOutput::Voltage => context.vntol,
-            BehaviouralOutput::Current => context.abstol,
-        };
-        let relative = context.reltol * rhs.abs().max(prev.abs());
-        let tol = relative + absolute;
-        Ok((prev - rhs).abs() > tol)
+            |linearization| {
+                let rhs = linearization.evaluation.value;
+                let prev = context.states.first().copied().unwrap_or(0.);
+                let absolute = match self.output {
+                    BehaviouralOutput::Voltage => context.vntol,
+                    BehaviouralOutput::Current => context.abstol,
+                };
+                let relative = context.reltol * rhs.abs().max(prev.abs());
+                let tol = relative + absolute;
+                Ok((prev - rhs).abs() > tol)
+            },
+        )
     }
 
     /// `asrcset.c`: a voltage source's branch elements, then one column per
@@ -493,7 +528,8 @@ impl Device for Behavioural {
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> crate::primitives::SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> crate::primitives::SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Ok(crate::devices::noise::DeviceNoise::Noiseless)
     }
 
@@ -558,6 +594,10 @@ impl Device for Behavioural {
         self.program.uses_frequency()
     }
 
+    fn depends_on_time(&self) -> bool {
+        self.program.uses_time()
+    }
+
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let time = match context.mode {
             AnalysisMode::Transient { time, .. } => time,
@@ -569,24 +609,26 @@ impl Device for Behavioural {
                 )));
             }
         };
-        let linearization = self.evaluate(
+        let factor = self.checked_factor(context.temperature)?;
+        self.with_linearization(
             context.solution,
             context.unknowns,
             context.controls,
             time,
             &context.model_context(),
-        )?;
-        let factor = self.checked_factor(context.temperature)?;
-        // asrcload.c: ASRCprev_value, the raw value ASRCconvTest compares.
-        context.states.set(0, linearization.evaluation.value)?;
-        let branch = (!context.branches.is_empty()).then_some(context.branches.start);
-        self.stamp_into(
-            context.matrix,
-            Some(&mut context.rhs),
-            context.unknowns,
-            branch,
-            &linearization,
-            factor,
+            |linearization| {
+                // ASRCprev_value remains the raw, unscaled expression value.
+                context.states.set(0, linearization.evaluation.value)?;
+                let branch = (!context.branches.is_empty()).then_some(context.branches.start);
+                self.stamp_into(
+                    context.matrix,
+                    Some(&mut context.rhs),
+                    context.unknowns,
+                    branch,
+                    linearization,
+                    factor,
+                )
+            },
         )
     }
 
@@ -597,21 +639,23 @@ impl Device for Behavioural {
         bias: &Vector,
     ) -> SpiceResult<()> {
         let temperature = context.model_context.temperature;
-        let linearization = self.evaluate(
+        let factor = self.checked_factor(temperature)?;
+        self.with_linearization(
             bias,
             context.unknowns,
             context.controls,
             0.,
             context.model_context,
-        )?;
-        let factor = self.checked_factor(temperature)?;
-        self.stamp_into(
-            &mut context.system.a,
-            None,
-            context.unknowns,
-            context.branch,
-            &linearization,
-            factor,
+            |linearization| {
+                self.stamp_into(
+                    &mut context.system.a,
+                    None,
+                    context.unknowns,
+                    context.branch,
+                    linearization,
+                    factor,
+                )
+            },
         )
     }
 

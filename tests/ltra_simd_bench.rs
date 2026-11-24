@@ -41,8 +41,9 @@ fn checksum(coefficients: &Coefficients) -> u64 {
         })
 }
 
-fn bench_coefficients(kind: &str, count: i32, wrapped: bool, compute: impl Fn() -> Coefficients) {
-    let coefficients = compute();
+fn bench_coefficients(kind: &str, count: i32, wrapped: bool, compute: impl Fn(&mut Coefficients)) {
+    let mut coefficients = Coefficients::default();
+    compute(&mut coefficients);
     println!(
         "coefficient_signature,{kind},{count},{wrapped},{:016x}",
         checksum(&coefficients)
@@ -51,7 +52,8 @@ fn bench_coefficients(kind: &str, count: i32, wrapped: bool, compute: impl Fn() 
     for _ in 0..3 {
         let start = Instant::now();
         for _ in 0..iterations {
-            black_box(compute());
+            compute(black_box(&mut coefficients));
+            black_box(&coefficients);
         }
         println!(
             "coefficient_time,{kind},{count},{wrapped},{iterations},{}",
@@ -67,11 +69,11 @@ fn coefficient_workloads() {
         for wrapped in [false, true] {
             let times = time_grid(count, wrapped);
             let now = times.back().unwrap() + 1e-11;
-            bench_coefficients("RC", count, wrapped, || {
-                rc_coefficients(1e-12, 4e-8, now, black_box(&times), 0.)
+            bench_coefficients("RC", count, wrapped, |out| {
+                rc_coefficients(1e-12, 4e-8, now, black_box(&times), 0., out);
             });
-            bench_coefficients("RLC", count, wrapped, || {
-                rlc_coefficients(5e-9, 2e8, 2e8, now, black_box(&times), 0.)
+            bench_coefficients("RLC", count, wrapped, |out| {
+                rlc_coefficients(5e-9, 2e8, 2e8, now, black_box(&times), 0., out);
             });
         }
     }
@@ -117,15 +119,22 @@ fn chopping_matches_the_full_history_in_reverse_order() {
     for count in [2, 4, 8, 9, 13, 128, 2048] {
         let times = time_grid(count, true);
         let now = times.back().unwrap() + 1e-11;
-        let rc = |tol| rc_coefficients(1e-12, 4e-8, now, &times, tol);
+        let rc = |tol, out: &mut Coefficients| {
+            rc_coefficients(1e-12, 4e-8, now, &times, tol, out);
+        };
         for delay in [0., 5e-9, now, now + 1e-9] {
-            let rlc = |tol| rlc_coefficients(delay, 2e8, 2e8, now, &times, tol);
-            for (inclusive, generate) in
-                [(false, &rc as &dyn Fn(f64) -> Coefficients), (true, &rlc)]
-            {
-                let full = generate(0.);
+            let rlc = |tol, out: &mut Coefficients| {
+                rlc_coefficients(delay, 2e8, 2e8, now, &times, tol, out);
+            };
+            for (inclusive, generate) in [
+                (false, &rc as &dyn Fn(f64, &mut Coefficients)),
+                (true, &rlc),
+            ] {
+                let mut full = Coefficients::default();
+                let mut chopped = Coefficients::default();
+                generate(0., &mut full);
                 for tol in [1e-6, 0.01, 1.] {
-                    let chopped = generate(tol);
+                    generate(tol, &mut chopped);
                     assert_eq!(
                         full.first.map(f64::to_bits),
                         chopped.first.map(f64::to_bits)

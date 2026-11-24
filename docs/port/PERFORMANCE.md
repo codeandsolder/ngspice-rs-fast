@@ -38,6 +38,32 @@ and check the loaded residual. Retained output is encoded and decoded
 losslessly; non-retaining output checks plot count, row count and row width.
 Existing live C conformance remains the detailed independent physics oracle.
 
+## Direct nonlinear diode loading (#99, #164)
+
+The finalized topology preserves the C device load order. Each diode samples
+its model and accepted-state inputs, evaluates its complete junction physics,
+and commits the MNA/RHS, charge and limiting state before the next device.
+There is **no diode tile plan, buffering or separate SIMD load path**.
+The explicit diode sampling/evaluation/commit decomposition remains useful
+for independent numerical verification without changing scalar execution.
+
+The previous homogeneous 64-lane load planner (#99) was retired after release
+measurements showed that scalar gather/queue/commit was consistently slower
+than direct scalar loading. An experimental four-lane portable-SIMD finish
+for complete diode physics (#164) preserved all tested numerical bits but
+also slowed complete device loading. On native Ryzen 7 4700U and generic
+x86-64, and independently on Intel Celeron N4100, the overhead remained
+material across 4–4,096-device networks; exact full-physics and simpler
+diode model variants were both measured. No approximate vector exponential
+or reduced model coverage was accepted.
+
+The experimental branch commits, all three host/compiler results, individual
+load/factor+solve medians and the reproduction harness are recorded in the
+[issue #164 engineering log](https://app.notion.com/p/421f74be9020817eaefcd4ac4e1fb933).
+Future vectorization must show **whole-load** gains with C-reference fidelity
+before reinstating a batch planner. The regular diode physics tests, full C
+golden verification and ordered scalar stamps remain the regression gates.
+
 ## Measurements
 
 Records contain workload, phase, operation count and elapsed nanoseconds.

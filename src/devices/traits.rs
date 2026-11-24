@@ -737,6 +737,12 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
+    /// Whether a device's equations depend explicitly on transient time.
+    /// Independent source waveforms are checked separately at analysis binding.
+    fn depends_on_time(&self) -> bool {
+        false
+    }
+
     /// True when the device's small-signal (AC) stamp itself depends on the
     /// analysis frequency in a way the affine `A + j omega E` pencil cannot
     /// express, e.g. a transmission line's `exp(-j omega TD)` (`traacld.c`).
@@ -996,13 +1002,17 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// routine return [`crate::devices::noise::DeviceNoise::Noiseless`]
     /// explicitly; the default is an error, so a device whose noise is not
     /// ported can never be silently omitted from the spectrum.
+    /// Append generators in reference order to the caller-provided empty
+    /// scratch buffer; a noiseless device leaves it empty. Model identity
+    /// borrows from the effective device.
     ///
     /// # Errors
     /// [`SpiceError::NotYetPorted`] by default; invalid bias physics.
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Err(SpiceError::not_yet_ported(
             format!(
                 "noise analysis of device {} (designator '{}')",

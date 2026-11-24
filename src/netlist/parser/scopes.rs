@@ -10,6 +10,7 @@ use crate::netlist::ast::{
 };
 use crate::netlist::card::{DotCommand, RawCard};
 use crate::netlist::source::Deck;
+use crate::primitives::ascii::folded;
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -159,16 +160,6 @@ struct LexicalModels<'a> {
     bins: BTreeSet<Cow<'a, str>>,
 }
 
-/// The token stream already owns the declaration spelling. Only names
-/// with ASCII uppercase letters need a separate canonical allocation.
-fn canonical_name(name: &str) -> Cow<'_, str> {
-    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        Cow::Owned(name.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(name)
-    }
-}
-
 impl<'a> LexicalModels<'a> {
     fn insert(&mut self, name: &'a str) {
         // Bin candidates are identified during indexing, not by scanning a
@@ -177,9 +168,9 @@ impl<'a> LexicalModels<'a> {
             && !suffix.is_empty()
             && suffix.bytes().all(|byte| byte.is_ascii_digit())
         {
-            self.bins.insert(canonical_name(base));
+            self.bins.insert(folded(base));
         }
-        self.names.insert(canonical_name(name));
+        self.names.insert(folded(name));
     }
 }
 
@@ -274,7 +265,7 @@ pub(super) struct ModelVisibility<'a> {
 
 impl ModelVisibility<'_> {
     pub(super) fn contains(self, name: &str, allow_bins: bool) -> bool {
-        let name = canonical_name(name);
+        let name = folded(name);
         let mut current = self.scopes.get(self.scope);
         while let Some(scope) = current {
             if scope.names.contains(name.as_ref())

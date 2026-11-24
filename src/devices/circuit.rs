@@ -27,6 +27,7 @@ use crate::devices::elaboration::{
     ElaborationLimits, ElaborationSize, ExpansionKind, PlannedBatch, reserve, resource_error,
 };
 use crate::devices::linear::Forcing;
+use crate::devices::ltra::{LtraWork, LtraWorkspace};
 use crate::devices::models::ModelContext;
 use crate::devices::mutual::validation::ValidationBudget;
 use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
@@ -174,6 +175,24 @@ struct TopologyBindings {
     identity: Option<TopologyId>,
 }
 
+/// Independently validated numeric candidate sites, in netlist setter order.
+/// A worker owns these values without changing the `Copy` `ModelContext` or the
+/// original immutable device recipes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CandidateNumericOverride {
+    Resistor(ResistorOverride),
+    Instance(InstanceOverride),
+}
+
+impl CandidateNumericOverride {
+    const fn device(self) -> usize {
+        match self {
+            Self::Resistor(target) => target.device(),
+            Self::Instance(target) => target.device(),
+        }
+    }
+}
+
 /// Analysis state and caches, never a source of topology truth.
 #[derive(Default)]
 pub(super) struct CircuitRuntime {
@@ -186,6 +205,7 @@ pub(super) struct CircuitRuntime {
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
     mutual_evaluation: std::cell::RefCell<Option<MutualEvaluation>>,
+    candidate_overrides: Vec<CandidateNumericOverride>,
 }
 
 /// A process-local, never recycled identity for a validated topology.
@@ -279,13 +299,91 @@ impl std::ops::Deref for PreparedMutualTerms {
 /// Analysis-owned effective device preparation.
 ///
 /// The circuit is borrowed immutably for the run, so no topology edit can invalidate a live view.
-/// Only the most recent exact context is retained. Isolated observation
-/// scratch retains capacity, never accepted or previous trial state.
+/// Only the most recent exact model context is retained. Observation scratch
+/// retains capacity, not accepted or previous trial state. Transient attempts
+/// borrow their accepted history and reuse this run's LTRA scratch allocation;
+/// the prepared inputs themselves remain local to a single attempt.
 pub struct PreparedRun<'a> {
     circuit: &'a Circuit,
     point: std::cell::RefCell<Option<PreparedPoint>>,
+    ltra: std::cell::RefCell<LtraWorkspace>,
     pub(super) observation_work:
         std::cell::RefCell<Option<crate::devices::observe::ObservationWorkspace>>,
+}
+
+/// One transient proposal, binding exact time, physical context and immutable
+/// accepted history for repeated Newton loads and isolated observations.
+/// Exclusive scratch ownership prevents another proposal from reusing it.
+pub(crate) struct PreparedTransient<'a> {
+    pub(super) run: &'a PreparedRun<'a>,
+    history: &'a StateHistory,
+    context: &'a ModelContext,
+    coefficients: &'a Coefficients,
+    time: Real,
+    forcing: Forcing,
+    pub(super) workspace: std::cell::RefMut<'a, LtraWorkspace>,
+}
+
+impl Drop for PreparedTransient<'_> {
+    fn drop(&mut self) {
+        self.workspace.finish();
+    }
+}
+
+impl<'a> PreparedTransient<'a> {
+    pub(crate) const fn time(&self) -> Real {
+        self.time
+    }
+
+    pub(crate) const fn run(&self) -> &'a PreparedRun<'a> {
+        self.run
+    }
+
+    pub(crate) const fn history(&self) -> &'a StateHistory {
+        self.history
+    }
+
+    pub(crate) const fn context(&self) -> &'a ModelContext {
+        self.context
+    }
+
+    /// A request can vary the Newton solution but never the accepted history
+    /// or model/time parameters that determine a prepared delay input.
+    pub(super) const fn request<'s>(&self, solution: &'s Vector) -> LoadRequest<'s>
+    where
+        'a: 's,
+    {
+        LoadRequest {
+            mode: AnalysisMode::Transient {
+                time: self.time,
+                dt: self.coefficients.dt(),
+            },
+            solution,
+            model_context: self.context,
+            integration: Some(self.coefficients),
+            history: self.history,
+            forcing: Some(self.forcing),
+        }
+    }
+
+    pub(crate) fn load(
+        &mut self,
+        solution: &Vector,
+        matrix: &mut SparseMatrix,
+        rhs: &mut Vector,
+        trial: &mut TrialState,
+    ) -> SpiceResult<()> {
+        let request = self.request(solution);
+        self.workspace.work.newton_loads += 1;
+        self.run.circuit.load_prepared(
+            self.run,
+            &request,
+            matrix,
+            rhs,
+            trial,
+            Some(&mut self.workspace),
+        )
+    }
 }
 
 pub(super) struct PreparedPoint {
@@ -352,6 +450,36 @@ impl<'a> PreparedRun<'a> {
         }));
         std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
             .map_err(|_| SpiceError::circuit("missing prepared model context"))
+    }
+
+    /// Begin a proposal without eagerly evaluating devices: preserve load-order
+    /// errors and avoid allocating convolution weights for non-LTRA devices.
+    pub(crate) fn transient_attempt<'s>(
+        &'s self,
+        history: &'s StateHistory,
+        context: &'s ModelContext,
+        time: Real,
+        coefficients: &'s Coefficients,
+        forcing: Forcing,
+    ) -> SpiceResult<PreparedTransient<'s>> {
+        let mut workspace = self
+            .ltra
+            .try_borrow_mut()
+            .map_err(|_| SpiceError::circuit("a transient proposal is already active"))?;
+        workspace.begin();
+        Ok(PreparedTransient {
+            run: self,
+            history,
+            context,
+            coefficients,
+            time,
+            forcing,
+            workspace,
+        })
+    }
+
+    pub(crate) fn ltra_work(&self) -> LtraWork {
+        self.ltra.borrow().work
     }
 
     /// Validate the ordered overrides at a physical point without stamping.
@@ -423,7 +551,7 @@ impl<'a> PreparedRun<'a> {
         trial: &mut TrialState,
     ) -> SpiceResult<()> {
         self.circuit
-            .load_prepared(self, request, matrix, rhs, trial)
+            .load_prepared(self, request, matrix, rhs, trial, None)
     }
 
     /// Check convergence using the same effective devices as the load.
@@ -763,6 +891,35 @@ impl fmt::Debug for Circuit {
     }
 }
 
+fn assemble_numeric_targets(
+    context: &ModelContext,
+    overrides: &[CandidateNumericOverride],
+    count: usize,
+) -> SpiceResult<Vec<CandidateNumericOverride>> {
+    let mut targets = Vec::new();
+    targets.try_reserve(count).map_err(|error| {
+        SpiceError::circuit(format!("cannot allocate candidate device sites: {error}"))
+    })?;
+    targets.extend(
+        context
+            .resistor_overrides
+            .iter()
+            .flatten()
+            .copied()
+            .map(CandidateNumericOverride::Resistor),
+    );
+    targets.extend(
+        context
+            .instance_overrides
+            .iter()
+            .flatten()
+            .copied()
+            .map(CandidateNumericOverride::Instance),
+    );
+    targets.extend_from_slice(overrides);
+    Ok(targets)
+}
+
 impl Circuit {
     /// An empty circuit holding only ground.
     #[must_use]
@@ -778,6 +935,7 @@ impl Circuit {
         PreparedRun {
             circuit: self,
             point: std::cell::RefCell::new(None),
+            ltra: std::cell::RefCell::new(LtraWorkspace::new()),
             observation_work: std::cell::RefCell::new(None),
         }
     }
@@ -2052,7 +2210,7 @@ impl Circuit {
             .map(|state| state.values.to_vec())
     }
 
-    pub(super) fn topology_id(&self) -> SpiceResult<TopologyId> {
+    pub(crate) fn topology_id(&self) -> SpiceResult<TopologyId> {
         self.bindings
             .identity
             .ok_or_else(|| SpiceError::circuit("circuit topology is stale or not finalized"))
@@ -2298,6 +2456,7 @@ impl Circuit {
             StampRhs::dense(rhs),
             request.history.device_of(trial, index)?,
             &mutual,
+            None,
         )
     }
 
@@ -2316,7 +2475,9 @@ impl Circuit {
         rhs: StampRhs<'_>,
         states: DeviceState<'_>,
         mutual: &[Vec<MutualTerm>],
+        ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
+        let states = states.with_ltra(ltra, request.history, index);
         device.stamp(&mut StampContext {
             matrix,
             rhs,
@@ -2399,84 +2560,201 @@ impl Circuit {
     /// are untouched; callers stamp the replacement instead of the original for
     /// that ordinal. Several instance overrides of one device are applied in
     /// slot order to the same replacement.
+    /// Clear analysis-scoped accepted/trial state when an optimizer session
+    /// changes its candidate. Preserve finalized bindings, sparse pattern and
+    /// prepared names; only independent simulation state is invalidated.
+    pub(crate) fn clear_candidate_analysis_state(&mut self) {
+        self.runtime.completed.clear();
+        self.runtime.carried_state.get_mut().take();
+        self.runtime.final_transient.get_mut().take();
+        self.runtime.fixed_stamps.get_mut().forget();
+        self.runtime.mutual_evaluation.get_mut().take();
+        *self.runtime.initial_revision.get_mut() = Arc::new(());
+    }
+
+    /// Validate an arbitrary sparse numeric candidate overlay transactionally.
+    /// This uses the same ordered replacement construction, physical setters
+    /// and mutual-coupling checks as an actual prepared simulation load, but
+    /// does not publish any value on failure. The caller owns the resulting
+    /// overlay and commits it to its exclusive circuit after validation.
+    pub(crate) fn validate_candidate_overrides(
+        &self,
+        context: &ModelContext,
+        overrides: &[CandidateNumericOverride],
+    ) -> SpiceResult<()> {
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.replacement_validations += 1);
+        context.validate(&MODEL_CONTEXT_LOCATION)?;
+        let replacements = self.replacements_with_overrides(context, overrides)?;
+        self.mutual_terms_with_replacements(context, &replacements)?;
+        let inputs = PreparedRun::dc_device_context(context);
+        for (_, device) in &replacements {
+            device.validate_dc_inputs(&inputs)?;
+        }
+        Ok(())
+    }
+
+    /// Commit already-validated worker-owned numeric candidates. An exclusive
+    /// circuit borrow rules out stale prepared analysis scopes during update.
+    pub(crate) fn set_candidate_overrides(&mut self, overrides: Vec<CandidateNumericOverride>) {
+        self.runtime.candidate_overrides = overrides;
+    }
+
     fn replacements(&self, context: &ModelContext) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
+        self.replacements_with_overrides(context, &self.runtime.candidate_overrides)
+    }
+
+    fn single_candidate_replacement(
+        &self,
+        context: &ModelContext,
+        overrides: &[CandidateNumericOverride],
+    ) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
+        // A single setter is the common DC/optimizer case: construct its
+        // validated device directly, without maps or staging allocations.
+        let target = context
+            .resistor_overrides
+            .iter()
+            .flatten()
+            .copied()
+            .map(CandidateNumericOverride::Resistor)
+            .chain(
+                context
+                    .instance_overrides
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .map(CandidateNumericOverride::Instance),
+            )
+            .chain(overrides.iter().copied())
+            .next()
+            .ok_or_else(|| SpiceError::circuit("missing candidate override"))?;
+        let topology = self.topology_id()?;
+        let ordinal = target.device();
+        let original = self
+            .devices
+            .get(ordinal)
+            .ok_or_else(|| SpiceError::circuit("stale candidate device override"))?;
+        let device = match target {
+            CandidateNumericOverride::Resistor(value) => {
+                if value.topology() != topology {
+                    return Err(SpiceError::circuit("foreign or stale resistor override"));
+                }
+                if original.terminals().len() != 2 || original.resistor_metadata().is_none() {
+                    return Err(SpiceError::circuit(format!(
+                        "resistor override targets {}, which is not a two-terminal resistor",
+                        original.name()
+                    )));
+                }
+                original.with_instance_parameter("resistance", value.supplied(), context)?
+            }
+            CandidateNumericOverride::Instance(value) => {
+                if value.topology() != topology {
+                    return Err(SpiceError::circuit("foreign or stale instance override"));
+                }
+                original.with_instance_parameter(value.parameter(), value.value(), context)?
+            }
+        };
+        #[cfg(test)]
+        preparation_metrics::record(|counts| counts.setters += 1);
+        let replacements = vec![(ordinal, device)];
+        self.validate_replacements(&replacements)?;
+        Ok(replacements)
+    }
+
+    fn replacements_with_overrides(
+        &self,
+        context: &ModelContext,
+        overrides: &[CandidateNumericOverride],
+    ) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
+        let count = context.resistor_overrides.iter().flatten().count()
+            + context.instance_overrides.iter().flatten().count()
+            + overrides.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count == 1 {
+            return self.single_candidate_replacement(context, overrides);
+        }
+
+        let targets = assemble_numeric_targets(context, overrides, count)?;
         let topology = self.topology_id()?;
         let mut replacements: Vec<(usize, Box<dyn Device>)> = Vec::new();
-        for target in context.resistor_overrides.iter().flatten() {
-            if target.topology() != topology {
-                return Err(SpiceError::circuit("foreign or stale resistor override"));
-            }
-            let device = self
-                .devices
-                .get(target.device())
-                .ok_or_else(|| SpiceError::circuit("stale resistor override"))?;
-            if device.terminals().len() != 2 || device.resistor_metadata().is_none() {
-                return Err(SpiceError::circuit(format!(
-                    "resistor override targets {}, which is not a two-terminal resistor",
-                    device.name()
-                )));
-            }
-            if replacements.iter().any(|(i, _)| *i == target.device()) {
-                return Err(SpiceError::circuit("duplicate resistor override"));
-            }
-            #[cfg(test)]
-            preparation_metrics::record(|counts| counts.setters += 1);
-            replacements.push((
-                target.device(),
-                device.with_instance_parameter("resistance", target.supplied(), context)?,
-            ));
-        }
-        let resistors = replacements.len();
-        for (slot, target) in context
-            .instance_overrides
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, target)| target.as_ref().map(|target| (slot, target)))
-        {
-            if context.instance_overrides[..slot]
-                .iter()
-                .flatten()
-                .any(|previous| {
-                    previous.device() == target.device()
-                        && previous.parameter() == target.parameter()
-                })
-            {
-                return Err(SpiceError::circuit("duplicate instance parameter override"));
-            }
-            if target.topology() != topology {
-                return Err(SpiceError::circuit("foreign or stale instance override"));
-            }
+        let mut device_slots = BTreeMap::<usize, usize>::new();
+        let mut resistor_sites = BTreeSet::new();
+        let mut instance_sites = BTreeSet::new();
+
+        for target in targets {
+            let ordinal = target.device();
             let original = self
                 .devices
-                .get(target.device())
-                .ok_or_else(|| SpiceError::circuit("stale instance parameter override"))?;
-            if replacements[..resistors]
-                .iter()
-                .any(|(i, _)| *i == target.device())
-            {
-                return Err(SpiceError::circuit(format!(
-                    "{} has both a resistor and an instance parameter override",
-                    original.name()
-                )));
-            }
-            #[cfg(test)]
-            preparation_metrics::record(|counts| counts.setters += 1);
-            match replacements.iter_mut().find(|(i, _)| *i == target.device()) {
-                Some((_, replacement)) => {
-                    *replacement = replacement.with_instance_parameter(
-                        target.parameter(),
-                        target.value(),
-                        context,
-                    )?;
+                .get(ordinal)
+                .ok_or_else(|| SpiceError::circuit("stale candidate device override"))?;
+            match target {
+                CandidateNumericOverride::Resistor(value) => {
+                    if value.topology() != topology {
+                        return Err(SpiceError::circuit("foreign or stale resistor override"));
+                    }
+                    if original.terminals().len() != 2 || original.resistor_metadata().is_none() {
+                        return Err(SpiceError::circuit(format!(
+                            "resistor override targets {}, which is not a two-terminal resistor",
+                            original.name()
+                        )));
+                    }
+                    if !resistor_sites.insert(ordinal) {
+                        return Err(SpiceError::circuit("duplicate resistor override"));
+                    }
+                    if device_slots.contains_key(&ordinal) {
+                        return Err(SpiceError::circuit(format!(
+                            "{} has both a resistor and an instance parameter override",
+                            original.name()
+                        )));
+                    }
+                    #[cfg(test)]
+                    preparation_metrics::record(|counts| counts.setters += 1);
+                    device_slots.insert(ordinal, replacements.len());
+                    replacements.push((
+                        ordinal,
+                        original.with_instance_parameter(
+                            "resistance",
+                            value.supplied(),
+                            context,
+                        )?,
+                    ));
                 }
-                None => replacements.push((
-                    target.device(),
-                    original.with_instance_parameter(
-                        target.parameter(),
-                        target.value(),
-                        context,
-                    )?,
-                )),
+                CandidateNumericOverride::Instance(value) => {
+                    if value.topology() != topology {
+                        return Err(SpiceError::circuit("foreign or stale instance override"));
+                    }
+                    if resistor_sites.contains(&ordinal) {
+                        return Err(SpiceError::circuit(format!(
+                            "{} has both a resistor and an instance parameter override",
+                            original.name()
+                        )));
+                    }
+                    if !instance_sites.insert((ordinal, value.parameter())) {
+                        return Err(SpiceError::circuit("duplicate instance parameter override"));
+                    }
+                    #[cfg(test)]
+                    preparation_metrics::record(|counts| counts.setters += 1);
+                    if let Some(index) = device_slots.get(&ordinal).copied() {
+                        let previous = replacements[index].1.as_ref();
+                        replacements[index].1 = previous.with_instance_parameter(
+                            value.parameter(),
+                            value.value(),
+                            context,
+                        )?;
+                    } else {
+                        device_slots.insert(ordinal, replacements.len());
+                        replacements.push((
+                            ordinal,
+                            original.with_instance_parameter(
+                                value.parameter(),
+                                value.value(),
+                                context,
+                            )?,
+                        ));
+                    }
+                }
             }
         }
         self.validate_replacements(&replacements)?;
@@ -2559,6 +2837,7 @@ impl Circuit {
         matrix: &mut SparseMatrix,
         rhs: &mut Vector,
         trial: &mut TrialState,
+        ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
         self.validate_history(request.history)?;
         request.history.check_trial(trial)?;
@@ -2590,6 +2869,7 @@ impl Circuit {
             &point,
             &mutual,
             &mut voltage_source_value,
+            ltra,
         );
         self.runtime
             .fixed_stamps
@@ -2614,12 +2894,17 @@ impl Circuit {
         point: &PreparedPoint,
         mutual: &[Vec<MutualTerm>],
         voltage_source_value: &mut Real,
+        mut ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
         for (position, index) in self.load_order().enumerate() {
             let device = point.device(self, index);
-            let states = request.history.device_of(trial, index)?;
+            let states = request.history.device_of(trial, index)?.with_ltra(
+                ltra.as_deref_mut(),
+                request.history,
+                index,
+            );
             matrix.begin_device(position)?;
-            device.stamp(&mut StampContext {
+            let mut context = StampContext {
                 matrix: &mut *matrix,
                 rhs: StampRhs::dense(rhs),
                 unknowns: &self.bindings.unknowns,
@@ -2639,7 +2924,8 @@ impl Circuit {
                 forcing: request.forcing,
                 source_factor: request.model_context.source_factor,
                 voltage_source_value: &mut *voltage_source_value,
-            })?;
+            };
+            device.stamp(&mut context)?;
         }
         Ok(())
     }
@@ -3069,6 +3355,16 @@ impl Circuit {
         let point = run.point(context)?;
         let mutual = point.mutual(self)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
+        // Source collection size comes from finalized source identities.
+        // Pre-size once per assembly, preserving the device load order.
+        let source_count = self
+            .devices
+            .iter()
+            .filter(|device| matches!(device.designator(), 'v' | 'i'))
+            .count();
+        system.sources.try_reserve(source_count).map_err(|error| {
+            SpiceError::circuit(format!("independent source collection allocation: {error}"))
+        })?;
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
         for index in self.load_order() {
@@ -3163,7 +3459,9 @@ impl Circuit {
             Some(&mut ranges),
         )?;
         let conductance_stamps = system.a.triplets();
+        system.e_groups.validate(&system.e)?;
         let capacitance_stamps = system.e.triplets();
+        let mut ordered_groups = system.e_groups.iter().peekable();
         let mut terms = Vec::new();
         for (conductance_range, capacitance_range, statements) in ranges {
             if !statements.is_empty() {
@@ -3198,25 +3496,42 @@ impl Circuit {
                 *conductance =
                     Some(conductance.map_or(stamp.value, |conductance| conductance + stamp.value));
             }
+            while ordered_groups
+                .peek()
+                .is_some_and(|group| group.range.end <= capacitance_range.start)
+            {
+                ordered_groups.next();
+            }
             let mut index = capacitance_range.start;
             while index < capacitance_range.end {
                 let stamp = &capacitance_stamps[index];
-                let (value, next) = system
-                    .e_groups
-                    .iter()
-                    .find(|group| {
-                        group.range.start == index && group.range.end <= capacitance_range.end
-                    })
-                    .map_or_else(
-                        || (stamp.value, index + 1),
-                        |group| {
-                            let mut sum = group.terms.first().copied().unwrap_or(0.);
-                            for term in group.terms.iter().skip(1) {
-                                sum += term;
-                            }
-                            (group.scale * sum, group.range.end.max(index + 1))
-                        },
-                    );
+                let (value, next) = match ordered_groups.peek() {
+                    Some(group) if group.range.start == index => {
+                        if group.range.end > capacitance_range.end {
+                            return Err(SpiceError::circuit(
+                                "dynamic group crosses pole-zero device boundary",
+                            ));
+                        }
+                        if group.prescaled {
+                            return Err(SpiceError::circuit(
+                                "prescaled AC dynamic group is not an s coefficient",
+                            ));
+                        }
+                        let mut sum = group.terms.first().copied().unwrap_or(0.);
+                        for term in group.terms.iter().skip(1) {
+                            sum += term;
+                        }
+                        let result = (group.scale * sum / group.divisor, group.range.end);
+                        ordered_groups.next();
+                        result
+                    }
+                    Some(group) if group.range.start < index => {
+                        return Err(SpiceError::circuit(
+                            "dynamic group crosses pole-zero stamp boundary",
+                        ));
+                    }
+                    _ => (stamp.value, index + 1),
+                };
                 let slot_index = slot(&mut terms, stamp.row, stamp.col);
                 let capacitance = &mut terms[slot_index].capacitance;
                 *capacitance = Some(capacitance.map_or(value, |capacitance| capacitance + value));
@@ -3247,6 +3562,16 @@ impl Circuit {
         let point = run.point(context)?;
         let mutual = point.mutual(self)?;
         let mut system = crate::devices::linear::LinearSystem::new(self.unknown_count());
+        // Source collection size comes from finalized source identities.
+        // Pre-size once per assembly, preserving the device load order.
+        let source_count = self
+            .devices
+            .iter()
+            .filter(|device| matches!(device.designator(), 'v' | 'i'))
+            .count();
+        system.sources.try_reserve(source_count).map_err(|error| {
+            SpiceError::circuit(format!("independent source collection allocation: {error}"))
+        })?;
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
         for index in self.load_order() {
@@ -3647,6 +3972,25 @@ impl Circuit {
         mutual_limits: MutualLimits,
         elaboration_limits: ElaborationLimits,
     ) -> SpiceResult<Self> {
+        Self::from_netlist_with_scoped_limits(
+            netlist,
+            context,
+            mutual_limits,
+            elaboration_limits,
+            None,
+        )
+    }
+
+    /// Instantiate candidate parameters from the existing evaluated scope.
+    /// The same validated lowering, expansion and factory path as ordinary
+    /// elaboration is used, including model-bin and topology-dependent logic.
+    pub(crate) fn from_netlist_with_scoped_limits(
+        netlist: &crate::netlist::ast::Netlist,
+        context: &ModelContext,
+        mutual_limits: MutualLimits,
+        elaboration_limits: ElaborationLimits,
+        scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
+    ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
         if !netlist.includes.is_empty() {
             return Err(SpiceError::Unsupported {
@@ -3660,7 +4004,15 @@ impl Circuit {
         let lowered = crate::netlist::behavioural::lower_nonlinear_sources(netlist)?;
         // Top-level `.param` values and `{expr}` sites are evaluated into a
         // literal copy before any factory sees them (#15).
-        let elaborated = crate::netlist::elaborate::literalize(&lowered)?;
+        let elaborated = if let Some(scope) = scope {
+            crate::netlist::elaborate::literalize_with(
+                &lowered,
+                scope,
+                &mut crate::netlist::eval::EvalBudget::default(),
+            )?
+        } else {
+            crate::netlist::elaborate::literalize(&lowered)?
+        };
         let netlist = &elaborated.netlist;
         // `X` instances are expanded into a fresh device/model list before any
         // device is built, so a deck that fails to elaborate never leaves a
@@ -3754,6 +4106,263 @@ mod tests {
     use petgraph::algo::{connected_components, has_path_connecting};
     use petgraph::graph::NodeIndex;
     use petgraph::visit::EdgeRef;
+
+    // Compare the actual production load and observation paths, not just a
+    // synthetic cache lookup. Synthetic accepted histories intentionally
+    // include equal-length timelines with different interior knots.
+    #[test]
+    fn ltra_attempts_preserve_stamps_and_separate_histories() {
+        use super::{LoadRequest, ModelContext};
+        use crate::devices::{
+            Forcing, Limit, StateHistory, TransientTiming,
+            delay::{DelayUpdate, WaveformUpdate},
+            state::HistoryPublication,
+        };
+        use crate::maths::{IntegrationMethod, SparseMatrix, StepHistory, Vector};
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use crate::primitives::Real;
+        use std::path::Path;
+
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("attempts.cir"),
+                "LTRA preparations
+o1 a 0 b 0 rc
+o2 c 0 d 0 rc
+o3 e 0 f 0 rc
+o4 g 0 h 0 rc2
+o5 i 0 j 0 rlc
+o6 k 0 l 0 lc
+o7 m 0 n 0 rg
+.model rc ltra r=1 c=1 len=1
+.model rc2 ltra r=1 c=1 len=1
+.model rlc ltra r=0.1 l=1 c=1 len=1
+.model lc ltra l=1 c=1 len=1
+.model rg ltra r=1 g=1 len=1
+.end
+",
+            ))
+            .unwrap();
+        let mut circuit = Circuit::from_netlist(&deck).unwrap();
+        circuit.finalize().unwrap();
+        circuit
+            .set_observations(&["i(o1)".into(), "i(o2)".into()])
+            .unwrap();
+        let initialize = |history: &mut StateHistory, scale: Real| {
+            let updates = circuit
+                .devices()
+                .iter()
+                .enumerate()
+                .map(|(ordinal, device)| {
+                    let middle = if device.name() == "o3" { 0.75 } else { 1. };
+                    let factor = scale * Real::from(u32::try_from(ordinal + 1).unwrap());
+                    (
+                        ordinal,
+                        DelayUpdate::Waveform(WaveformUpdate {
+                            reset: Some(
+                                [0., middle, 2.]
+                                    .into_iter()
+                                    .map(|time| {
+                                        (
+                                            time,
+                                            vec![
+                                                factor * time,
+                                                0.5 * factor * time,
+                                                -factor * time * time,
+                                                -0.25 * factor * time,
+                                            ],
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                            ..WaveformUpdate::default()
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let trial = history.trial();
+            history
+                .accept_transaction(
+                    trial,
+                    HistoryPublication::Initialize,
+                    |_, _| Ok(updates),
+                    |_| Ok(()),
+                )
+                .unwrap();
+        };
+        let mut history = circuit.state_history().unwrap();
+        initialize(&mut history, 1.);
+        let original = history.clone();
+        let run = circuit.prepare_run();
+        let n = circuit.unknown_count();
+        let forcing = Forcing {
+            limit: Limit::Right,
+            timing: TransientTiming::new(0.25, 4.).unwrap(),
+        };
+        let coefficients = StepHistory::with_fill(0.25)
+            .trial(IntegrationMethod::Trapezoidal, 1, 0.25, 0.5)
+            .unwrap();
+        let model = ModelContext::default();
+        let changed_gmin = model.with_gmin(1e-6);
+
+        let compare = |history: &StateHistory, time: Real, context: &ModelContext| {
+            let before = run.ltra_work();
+            let mut attempt = run
+                .transient_attempt(history, context, time, &coefficients, forcing)
+                .unwrap();
+            assert!(
+                run.transient_attempt(history, context, time, &coefficients, forcing)
+                    .is_err()
+            );
+            let mut result = Vec::new();
+            for iteration in 0..3_u32 {
+                let x = Vector::from_slice(
+                    &(0..n)
+                        .map(|row| {
+                            0.01 * Real::from(u32::try_from(row).unwrap()) + Real::from(iteration)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let request: LoadRequest<'_> = attempt.request(&x);
+                let mut expected = SparseMatrix::new(n, n);
+                let mut actual = SparseMatrix::new(n, n);
+                let mut rhs_expected = Vector::zeros(n);
+                let mut rhs_actual = Vector::zeros(n);
+                let mut trial_expected = history.trial();
+                let mut trial_actual = history.trial();
+                run.load(
+                    &request,
+                    &mut expected,
+                    &mut rhs_expected,
+                    &mut trial_expected,
+                )
+                .unwrap();
+                attempt
+                    .load(&x, &mut actual, &mut rhs_actual, &mut trial_actual)
+                    .unwrap();
+                let signatures = |matrix: &SparseMatrix| {
+                    matrix
+                        .triplets()
+                        .iter()
+                        .map(|t| (t.row, t.col, t.value.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(signatures(&actual), signatures(&expected));
+                let bits = |rhs: &Vector| {
+                    rhs.as_slice()
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&rhs_actual), bits(&rhs_expected));
+                assert_eq!(trial_actual, trial_expected);
+                let expected_obs = run
+                    .observe_real(&request, &[], Some((time, forcing)), Some(&trial_expected))
+                    .unwrap();
+                let actual_obs = attempt.observe(&x, &trial_actual).unwrap();
+                let obs_bits = |values: &[crate::primitives::Complex]| {
+                    values
+                        .iter()
+                        .map(|value| (value.re.to_bits(), value.im.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(obs_bits(&actual_obs), obs_bits(&expected_obs));
+                result = bits(&rhs_actual);
+            }
+            drop(attempt);
+            let after = run.ltra_work();
+            assert_eq!(after.attempts - before.attempts, 1);
+            assert_eq!(after.newton_loads - before.newton_loads, 3);
+            assert_eq!(after.line_loads - before.line_loads, 24); // 6 transient lines × 3, plus 2 isolated observations × 3
+            assert_eq!(
+                after.convolution_evaluations - before.convolution_evaluations,
+                6
+            );
+            assert_eq!(
+                after.coefficient_preparations - before.coefficient_preparations,
+                4
+            );
+            result
+        };
+
+        let a = compare(&history, 2.25, &model);
+        let b = compare(&history, 2.5, &model);
+        assert_ne!(a, b);
+        assert_eq!(a, compare(&history, 2.25, &model));
+        assert_eq!(history, original);
+        // Same times and same length, different accepted waveform contents.
+        // A failed/rejected trial has not modified the original/fork.
+        let mut fork = history.clone();
+        fork.clear();
+        initialize(&mut fork, 3.);
+        assert_ne!(a, compare(&fork, 2.25, &model));
+        assert_eq!(a, compare(&history, 2.25, &model));
+        // Context changes must not retain a stale numeric stamp. The LTRA
+        // inputs are unchanged by gmin, which is read by the stamp itself.
+        compare(&history, 2.25, &changed_gmin);
+        history.clear();
+        initialize(&mut history, 2.);
+        assert_ne!(a, compare(&history, 2.25, &model));
+        assert_eq!(a, compare(&original, 2.25, &model));
+
+        // A successful acceptance rotates the revision and extends the
+        // waveform; the next proposal must evaluate the extended history.
+        let mut advanced = original.clone();
+        let updates = circuit
+            .devices()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, _)| {
+                (
+                    ordinal,
+                    DelayUpdate::Waveform(WaveformUpdate {
+                        append: Some((2.125, vec![3.5, 1.5, -4.5, -2.5])),
+                        ..WaveformUpdate::default()
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let trial = advanced.trial();
+        advanced
+            .accept_transaction(
+                trial,
+                HistoryPublication::Rotate,
+                |_, _| Ok(updates),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_ne!(a, compare(&advanced, 2.25, &model));
+
+        // Merely opening an attempt performs no device work. Empty histories
+        // still fail when stamping, just as with a direct one-off load.
+        let empty = circuit.state_history().unwrap();
+        let before = run.ltra_work();
+        let mut proposal = run
+            .transient_attempt(&empty, &model, 2.25, &coefficients, forcing)
+            .unwrap();
+        let x = Vector::zeros(n);
+        let mut matrix = SparseMatrix::new(n, n);
+        let mut rhs = Vector::zeros(n);
+        let mut trial = empty.trial();
+        let expected = run
+            .load(&proposal.request(&x), &mut matrix, &mut rhs, &mut trial)
+            .unwrap_err();
+        let actual = proposal
+            .load(&x, &mut matrix, &mut rhs, &mut trial)
+            .unwrap_err();
+        assert_eq!(actual.to_string(), expected.to_string());
+        drop(proposal);
+        let after = run.ltra_work();
+        assert_eq!(
+            after.coefficient_preparations,
+            before.coefficient_preparations
+        );
+        assert_eq!(
+            after.convolution_evaluations,
+            before.convolution_evaluations
+        );
+        assert_eq!(a, compare(&original, 2.25, &model));
+    }
 
     #[test]
     fn mutual_pair_and_payload_arithmetic_are_checked() {

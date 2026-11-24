@@ -138,6 +138,40 @@ pub(crate) fn rounded_product_ratio<const N: usize, const D: usize>(
     numerator.round_ratio(&denominator)
 }
 
+/// If subtraction is exact, return its finite positive binary64 result.
+/// Knuth's error-free `TwoSum` of `to + (-from)` detects a nonzero residual
+/// without allocating an arbitrary-precision accumulator on ordinary grids.
+fn exact_difference(from: Real, to: Real) -> Option<Real> {
+    let rounded = to - from;
+    if !rounded.is_finite() || rounded <= 0. {
+        return None;
+    }
+    let negative_from = -from;
+    let right_virtual = rounded - to;
+    let residual = (to - (rounded - right_virtual)) + (negative_from - right_virtual);
+    (residual == 0.).then_some(rounded)
+}
+
+/// Positive axis interval as a normalized mantissa/exponent pair. An exact
+/// large-coordinate sum is used when the rounded difference loses bits or
+/// overflows. This geometry feeds RMS without squaring an enormous width.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "re-exported crate-wide from the private exact primitives module"
+)]
+pub(crate) fn positive_axis_span(from: Real, to: Real) -> (Real, i32) {
+    exact_difference(from, to).map_or_else(|| wide_axis_span(from, to), split_power)
+}
+
+#[cold]
+fn wide_axis_span(from: Real, to: Real) -> (Real, i32) {
+    let mut difference = ExactSum::new();
+    difference.add(ExactTerm::from_real(to));
+    difference.add(ExactTerm::from_real(-from));
+    let exact = difference.magnitude().scaled();
+    (exact.mantissa, exact.exponent)
+}
+
 // Product unit -2148, maximum product exponent <2048, panel weights
 // fit in u8, and at most 4 * usize::MAX terms. 68 limbs cover the entire
 // range and sign, including all intermediate partial sums.
@@ -166,6 +200,53 @@ impl ExactSum {
             self.bins[i] = i128::from(halves(self.bins[i].cast_unsigned()).0);
             self.bins[i + 1] += carry;
         }
+    }
+
+    /// Insert one exact signed finite binary64 product, without forming a
+    /// potentially overflowing binary64 intermediate. Used by explicitly
+    /// requested original-unit solver residual diagnostics.
+    pub(crate) fn add_product(&mut self, lhs: Real, rhs: Real) {
+        self.add(ExactTerm::from_real(lhs).product(ExactTerm::from_real(rhs)));
+    }
+
+    /// Round the full signed product sum once, including recoverable
+    /// cancellation across otherwise overflowing or subnormal products.
+    pub(crate) fn rounded_sum(&self) -> Real {
+        let normalized = Self {
+            bins: self.bins,
+            terms: self.terms,
+        }
+        .magnitude()
+        .scaled();
+        scale_power(normalized.mantissa, normalized.exponent)
+    }
+
+    /// The absolute quotient of two superaccumulators. The components are
+    /// rounded independently into binary mantissas and their physical
+    /// exponents remain separate until the final dimensionless division.
+    /// A tiny finite ratio is permitted to underflow; the opposite overflow
+    /// is meaningful (the requested error is genuinely unbounded).
+    pub(crate) fn magnitude_ratio(&self, denominator: &Self) -> Real {
+        let numerator = Self {
+            bins: self.bins,
+            terms: self.terms,
+        }
+        .magnitude()
+        .scaled();
+        let denominator = Self {
+            bins: denominator.bins,
+            terms: denominator.terms,
+        }
+        .magnitude()
+        .scaled();
+        if denominator.mantissa == 0. {
+            return if numerator.mantissa == 0. {
+                0.
+            } else {
+                Real::INFINITY
+            };
+        }
+        numerator.divide(denominator).abs()
     }
 
     fn add(&mut self, term: ExactTerm) {
@@ -254,6 +335,44 @@ impl ExactSum {
             }
         }
         Magnitude { words, negative }
+    }
+
+    /// Add one panel with the *exact* binary64 endpoint difference. Fast-path
+    /// subtraction only when its full rounding residual is zero; otherwise
+    /// insert the positive and negative endpoint products separately. This
+    /// prevents any mismatched sum of rounded panel widths and window width.
+    pub(crate) fn add_axis_panel<const N: usize>(
+        &mut self,
+        from: Real,
+        to: Real,
+        samples: [Real; N],
+        weights: [u8; N],
+    ) {
+        if let Some(exact) = exact_difference(from, to) {
+            self.add_weighted(exact, samples, weights);
+        } else {
+            self.add_weighted(to, samples, weights);
+            self.add_weighted(-from, samples, weights);
+        }
+    }
+
+    /// Correctly round the mean of the exact weighted panel numerators,
+    /// divided by 24 times the exact coordinate interval, even when the
+    /// physical width overflows binary64 or the panel widths round apart.
+    pub(crate) fn panel_ratio_axis(self, from: Real, to: Real) -> Real {
+        if !(from.is_finite() && to.is_finite() && to > from) {
+            return Real::NAN;
+        }
+        // Match rounded_product_ratio's unit convention: numerator product
+        // bins are 2^-2148; denominator finite-value bins are 2^-1074.
+        let mut denominator = Self::new();
+        for value in [to, -from] {
+            let mut term = ExactTerm::from_real(value);
+            term.significand *= 24;
+            term.exponent -= 1074;
+            denominator.add(term);
+        }
+        self.magnitude().round_ratio(&denominator.magnitude())
     }
 
     /// Final integral or normalized mean, rounded once after the exact
@@ -559,6 +678,30 @@ mod tests {
             rounded_product_ratio([(Real::from_bits(3), 1., false)], [(2., false)]).to_bits(),
             Real::from_bits(2).to_bits()
         );
+    }
+
+    #[test]
+    fn exact_signed_sum_rounds_boundary_values_and_cancellation() {
+        let tiny = Real::from_bits(1);
+        for value in [0., tiny, -tiny, 1., -1., Real::MAX, -Real::MAX] {
+            let mut total = ExactSum::new();
+            total.add_product(value, 1.);
+            assert_eq!(total.rounded_sum().to_bits(), value.to_bits(), "{value:e}");
+        }
+        let mut total = ExactSum::new();
+        total.add_product(Real::MAX, 2.);
+        total.add_product(-Real::MAX, 1.);
+        assert_eq!(total.rounded_sum(), Real::MAX);
+        total.add_product(-Real::MAX, 1.);
+        assert_eq!(total.rounded_sum(), 0.);
+        total.add_product(-Real::MAX, 3.);
+        assert_eq!(total.rounded_sum(), Real::NEG_INFINITY);
+        let mut tie = ExactSum::new();
+        tie.add_product(1., 1.);
+        tie.add_product(2_f64.powi(-53), 1.);
+        assert_eq!(tie.rounded_sum(), 1.);
+        tie.add_product(2_f64.powi(-53), 1.);
+        assert_eq!(tie.rounded_sum(), 1. + f64::EPSILON);
     }
 
     #[test]

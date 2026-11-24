@@ -32,12 +32,13 @@
 //! exactly singular matrix.
 
 use crate::analysis::ac::{GridKind, SmallSignal, frequency_grid};
+use crate::analysis::frequency::FrequencyPlan;
 use crate::analysis::linear::{plot, unsupported};
 use crate::analysis::results::Variable;
 use crate::analysis::{AnalysisPlan, Plot};
 use crate::devices::Circuit;
 use crate::devices::linear::SourceKind;
-use crate::devices::noise::InstanceNoise;
+use crate::devices::noise::NoisePlan;
 use crate::maths::complex::ComplexLu;
 use crate::maths::dense_complex::DenseComplex;
 use crate::maths::linear::{RHS_BATCH_WIDTH, SolveBatchWorkspace};
@@ -229,7 +230,7 @@ impl BoundPort {
     }
 }
 
-pub(super) fn parse(positional: &[String], reltol: Real) -> SpiceResult<(Vec<Real>, bool)> {
+pub(super) fn parse(positional: &[String], reltol: Real) -> SpiceResult<(FrequencyPlan, bool)> {
     if !matches!(positional.len(), 4 | 5) {
         return Err(unsupported(".sp lin|dec|oct points start stop [donoise]"));
     }
@@ -252,7 +253,7 @@ pub(super) fn parse(positional: &[String], reltol: Real) -> SpiceResult<(Vec<Rea
 /// circuit's row numbering for this sweep.
 struct RfPlan<'a> {
     ports: Vec<BoundPort>,
-    grid: &'a [Real],
+    grid: &'a FrequencyPlan,
     unknowns: usize,
     budget: RfBudget,
     noise: bool,
@@ -261,7 +262,7 @@ struct RfPlan<'a> {
 impl<'a> RfPlan<'a> {
     fn bind(
         circuit: &Circuit,
-        grid: &'a [Real],
+        grid: &'a FrequencyPlan,
         noise: bool,
         bias: bool,
         limits: RfLimits,
@@ -282,8 +283,8 @@ impl<'a> RfPlan<'a> {
             limits,
         )?;
         if grid
-            .iter()
-            .any(|&f| !(2. * std::f64::consts::PI * f).is_finite())
+            .values()
+            .any(|f| !(2. * std::f64::consts::PI * f).is_finite())
         {
             return Err(unsupported(".sp angular frequency is not finite"));
         }
@@ -302,7 +303,7 @@ pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisPlan,
     context: &crate::analysis::AnalysisContext,
-    grid: &[Real],
+    grid: &FrequencyPlan,
     donoise: bool,
     include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
@@ -316,7 +317,8 @@ pub(super) fn run(
     let mut plot = parameter_plot(circuit, plan.ports.len(), donoise, plan.budget.width)?;
     plot.reserve_points(plan.grid.len())?;
     let reference = plan.ports[0].z0;
-    for &f in plan.grid {
+    let mut noise_plan: Option<NoisePlan<'_>> = None;
+    for f in plan.grid.values() {
         let factor = small_signal.at_frequency(context, f, |system| {
             let factor =
                 crate::analysis::ac::ac_matrix(circuit, system, 2. * std::f64::consts::PI * f)?
@@ -350,22 +352,32 @@ pub(super) fn run(
         }
         workspace.point.push(reference);
         if let Some(noise) = &mut workspace.noise {
-            let generators = crate::devices::noise::prepared_noise(
-                small_signal.prepared(),
-                &context.model_context().with_frequency(f),
-                small_signal.bias(),
-                Some(small_signal.state()),
-            )?;
-            let sources = generators.iter().try_fold(0_usize, |total, instance| {
-                sum(&[total, instance.sources.len()])
-            })?;
-            plan.budget.charge_noise(plan.ports.len(), sources)?;
+            let model = context.model_context().with_frequency(f);
+            let generators = match &mut noise_plan {
+                Some(generators) => {
+                    generators.refresh(
+                        small_signal.prepared(),
+                        &model,
+                        small_signal.bias(),
+                        Some(small_signal.state()),
+                    )?;
+                    generators
+                }
+                None => noise_plan.insert(NoisePlan::bind(
+                    small_signal.prepared(),
+                    &model,
+                    small_signal.bias(),
+                    Some(small_signal.state()),
+                )?),
+            };
+            plan.budget
+                .charge_noise(plan.ports.len(), generators.source_count())?;
             noise.evaluate(
                 circuit,
                 &plan.ports,
                 &factor,
                 &workspace.algebra.y,
-                &generators,
+                generators,
                 &mut workspace.solve,
             )?;
             noise.append_results(
@@ -723,7 +735,7 @@ impl NoiseWorkspace {
         ports: &[BoundPort],
         factor: &ComplexLu,
         y: &DenseComplex,
-        generators: &[InstanceNoise],
+        generators: &NoisePlan<'_>,
         solve: &mut SolveBuffers,
     ) -> SpiceResult<()> {
         let n = circuit.unknown_count();
@@ -745,17 +757,14 @@ impl NoiseWorkspace {
             adjoints.copy_from_slice(&solve.solution);
         }
         self.cy.clear();
-        for instance in generators {
-            for source in &instance.sources {
-                let Some(amplitude) = source.kind.rf_amplitude()? else {
+        for (_, sources) in generators.instances() {
+            for source in sources {
+                let Some(amplitude) = source.rf_amplitude()? else {
                     continue;
                 };
-                // Bind the two node rows once per generator, not per port.
-                let rows = source.nodes.map(|node| circuit.unknowns().node_row(node));
                 for (voltage, adjoint) in self.voltage.iter_mut().zip(self.adjoints.chunks_exact(n))
                 {
-                    let at = |row: Option<usize>| row.map_or(Complex::ZERO, |r| adjoint[r]);
-                    *voltage = (at(rows[0]) - at(rows[1])) * Complex::real(amplitude);
+                    *voltage = source.transfer(adjoint) * Complex::real(amplitude);
                 }
                 // The Y schema already guarantees N×N shape. Traverse its
                 // actual row-major cells instead of rediscovering checked

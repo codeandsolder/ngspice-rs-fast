@@ -28,6 +28,7 @@ use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use super::{Inputs, ModelParameters, Value, charges, dc};
+use crate::devices::limiting::{fetlim, limvds, pnjlim};
 use crate::devices::models::{ModelContext, PreparationKey, ResolvedModel};
 use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::state::{DeviceState, IterationPhase};
@@ -417,99 +418,16 @@ fn limit(raw: [Real; 3], old: [Real; 3], von: Real, cached: &Cached) -> ([Real; 
         vgs = limited_vgd + limited_vds;
     }
     let vbs = if vds >= 0. {
-        let (limited, changed) = pnjlim(vbs_in, old_vbs, CONST_VT0, vcrit);
-        check |= changed;
-        limited
+        let result = pnjlim(vbs_in, old_vbs, CONST_VT0, vcrit);
+        check |= result.limited;
+        result.value
     } else {
         let vbd_in = vbs_in - vds_in;
-        let (limited, changed) = pnjlim(vbd_in, vbs_in - old_vds, CONST_VT0, vcrit);
-        check |= changed;
-        limited + vds
+        let result = pnjlim(vbd_in, vbs_in - old_vds, CONST_VT0, vcrit);
+        check |= result.limited;
+        result.value + vds
     };
     ([vbs, vgs, vds], check)
-}
-
-/// `devsup.c::DEVfetlim`.
-fn fetlim(vnew: Real, vold: Real, vto: Real) -> Real {
-    let vtsthi = (2. * (vold - vto)).abs() + 2.;
-    let vtstlo = (vold - vto).abs() + 1.;
-    let vtox = vto + 3.5;
-    let delv = vnew - vold;
-    if vold >= vto {
-        if vold >= vtox {
-            if delv <= 0. {
-                if vnew >= vtox {
-                    if -delv > vtstlo { vold - vtstlo } else { vnew }
-                } else {
-                    vnew.max(vto + 2.)
-                }
-            } else if delv >= vtsthi {
-                vold + vtsthi
-            } else {
-                vnew
-            }
-        } else if delv <= 0. {
-            vnew.max(vto - 0.5)
-        } else {
-            vnew.min(vto + 4.)
-        }
-    } else if delv <= 0. {
-        if -delv > vtsthi { vold - vtsthi } else { vnew }
-    } else {
-        let vtemp = vto + 0.5;
-        if vnew <= vtemp {
-            if delv > vtstlo { vold + vtstlo } else { vnew }
-        } else {
-            vtemp
-        }
-    }
-}
-
-/// `devsup.c::DEVlimvds`.
-fn limvds(vnew: Real, vold: Real) -> Real {
-    if vold >= 3.5 {
-        if vnew > vold {
-            vnew.min(3.0f64.mul_add(vold, 2.))
-        } else if vnew < 3.5 {
-            vnew.max(2.)
-        } else {
-            vnew
-        }
-    } else if vnew > vold {
-        vnew.min(4.)
-    } else {
-        vnew.max(-0.5)
-    }
-}
-
-/// `devsup.c::DEVpnjlim`, returning the limited voltage and C's `icheck`.
-fn pnjlim(vnew: Real, vold: Real, vt: Real, vcrit: Real) -> (Real, bool) {
-    if vnew > vcrit && (vnew - vold).abs() > vt + vt {
-        let value = if vold > 0. {
-            let arg = (vnew - vold) / vt;
-            if arg > 0. {
-                vt.mul_add(2. + (arg - 2.).ln(), vold)
-            } else {
-                vt.mul_add(-(2. + (2. - arg).ln()), vold)
-            }
-        } else {
-            vt * (vnew / vt).ln()
-        };
-        (value, true)
-    } else if vnew < 0. {
-        let arg = if vold > 0. {
-            -vold - 1.
-        } else {
-            2.0f64.mul_add(vold, -1.)
-        };
-        if vnew < arg {
-            (arg, true)
-        } else {
-            (vnew, false)
-        }
-    } else {
-        (vnew, false)
-    }
 }
 
 impl Device for Bsim3 {
@@ -1087,7 +1005,8 @@ impl Device for Bsim3 {
     fn noise(
         &self,
         context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         use crate::devices::noise::{DeviceNoise, FlickerLaw, NoiseFamily, NoiseKind, NoiseSource};
         let model = context.model_context;
         let cached = self.ensure(model.temperature, model.nominal_temperature)?;
@@ -1117,7 +1036,7 @@ impl Device for Bsim3 {
             conductance,
             temperature: context.circuit_kelvin(),
         };
-        let sources = vec![
+        sources.extend([
             NoiseSource::new(".rd", [dp, d], thermal(densities.drain_conductance)),
             NoiseSource::new(".rs", [sp, s], thermal(densities.source_conductance)),
             NoiseSource::new(".id", [dp, sp], thermal(densities.channel)),
@@ -1132,12 +1051,11 @@ impl Device for Bsim3 {
                     },
                 },
             ),
-        ];
+        ]);
         Ok(DeviceNoise::Sources {
             family: NoiseFamily::Bsim3,
-            model: Some(self.model_name.clone()),
+            model: Some(&self.model_name),
             total: true,
-            sources,
         })
     }
 }

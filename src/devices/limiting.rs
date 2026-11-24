@@ -491,6 +491,76 @@ mod tests {
     }
 
     #[test]
+    fn bsim3_shared_fet_limits_cover_each_branch_and_neighbour() {
+        let vto = 1.;
+        let above = (vto + 3.5_f64).next_up();
+        let below = (vto + 3.5_f64).next_down();
+        assert_eq!(fetlim(0., below, vto).to_bits(), 0.5_f64.to_bits());
+        assert_eq!(fetlim(0., vto + 3.5, vto).to_bits(), 3.0_f64.to_bits());
+        assert_eq!(fetlim(0., above, vto).to_bits(), 3.0_f64.to_bits());
+
+        assert_eq!(fetlim(-5., vto, vto), 0.5);
+        assert_eq!(
+            fetlim(-5., vto.next_down(), vto),
+            vto.next_down() - (2. * (vto.next_down() - vto).abs() + 2.)
+        );
+        for old in [vto - 2., vto, vto + 3.5, vto + 9.] {
+            assert_eq!(fetlim(old, old, vto).to_bits(), old.to_bits());
+            let hi = 2_f64.mul_add((old - vto).abs(), 2.);
+            if old >= vto + 3.5 {
+                let cap = old + hi;
+                assert_eq!(fetlim(cap.next_up(), old, vto).to_bits(), cap.to_bits());
+                // Crossing below vtox follows the fixed on-region
+                // lower bound rather than the descending-step cap.
+                let below_vtox = (vto + 3.5).next_down();
+                assert_eq!(
+                    fetlim(below_vtox, old, vto).to_bits(),
+                    below_vtox.max(vto + 2.).to_bits()
+                );
+            }
+        }
+
+        // Including finite high-magnitude inputs, where threshold arithmetic
+        // must not silently overflow an otherwise representable result.
+        assert!(fetlim(-1e150, 1e150, 0.).is_finite());
+        assert_eq!(limvds(-1., 3.5_f64.next_down()), -0.5);
+        assert_eq!(limvds(-1., 3.5), 2.);
+        assert_eq!(limvds(-1., 3.5_f64.next_up()), 2.);
+        assert_eq!(limvds(3.5, 3.5), 3.5);
+        assert_eq!(limvds(3.5_f64.next_up(), 3.5), 3.5_f64.next_up());
+    }
+
+    #[test]
+    fn bsim3_shared_junction_limit_has_exact_boundary_flags() {
+        let vcrit = critical_voltage(VT, 1e-14);
+        for boundary in [vcrit.next_down(), vcrit] {
+            let step = pnjlim(boundary, 0., VT, vcrit);
+            assert_eq!(step.value.to_bits(), boundary.to_bits());
+            assert!(!step.limited);
+        }
+        let step = pnjlim(vcrit.next_up(), 0., VT, vcrit);
+        assert!(step.limited);
+        assert!(step.value.is_finite());
+        assert!(step.value < vcrit);
+
+        for (old, floor) in [(0.5, -1.5), (-1., -3.)] {
+            let at = pnjlim(floor, old, VT, vcrit);
+            assert!(!at.limited);
+            assert_eq!(at.value.to_bits(), floor.to_bits());
+            let below = pnjlim(floor.next_down(), old, VT, vcrit);
+            assert!(below.limited);
+            assert_eq!(below.value.to_bits(), floor.to_bits());
+            let above = pnjlim(floor.next_up(), old, VT, vcrit);
+            assert!(!above.limited);
+            assert_eq!(above.value.to_bits(), floor.next_up().to_bits());
+        }
+        let downward = pnjlim(vcrit.next_up(), 2., VT, vcrit);
+        assert!(downward.limited);
+        assert!(downward.value.is_finite());
+        assert_eq!(pnjlim(-1e100, -1e100, VT, vcrit).value, -1e100);
+    }
+
+    #[test]
     fn off_holds_and_uic_loads_follow_c() {
         let history = StateHistory::new(1);
         // MODEINITJCT: an off device is held and stays nonconvergent.

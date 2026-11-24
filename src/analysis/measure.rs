@@ -42,7 +42,7 @@ use super::ordered_samples::{
 use super::reduction::ScaledSquares;
 use crate::analysis::results::Plot;
 use crate::analysis::selection::{self, Column};
-use crate::primitives::ExactSum;
+use crate::primitives::{ExactSum, positive_axis_span};
 
 /// One named measurement result.
 #[derive(Debug, Clone, PartialEq)]
@@ -672,9 +672,9 @@ fn evaluate_statistic(
             // Every one of these three is an integral over the covered
             // window; a window without width has no mean and is a
             // failure rather than a division by zero.
-            let width = span_width(span, card)?;
+            span_width(span, card)?;
             let points = window.clipped(axis, &operand, card)?;
-            let value = integrate(points, statistic, width, card)?;
+            let value = integrate(points, statistic, span, card)?;
             (value, None, Some(span))
         }
     };
@@ -829,6 +829,7 @@ struct Integral {
     area: ExactSum,
     rms: ScaledSquares,
     rms_maximum: Real,
+    rms_minimum: Real,
     statistic: MeasureStatistic,
 }
 
@@ -840,6 +841,7 @@ impl Integral {
             area: ExactSum::new(),
             rms: ScaledSquares::new(),
             rms_maximum: 0.,
+            rms_minimum: Real::INFINITY,
             statistic,
         }
     }
@@ -852,7 +854,13 @@ impl Integral {
     }
     fn consume(&mut self) {
         let width = |i: usize| self.panel[i + 1].0 - self.panel[i].0;
-        let same = |a: Real, b: Real| a > 0. && b > 0. && a.to_bits().abs_diff(b.to_bits()) <= 100;
+        let same = |a: Real, b: Real| {
+            a.is_finite()
+                && b.is_finite()
+                && a > 0.
+                && b > 0.
+                && a.to_bits().abs_diff(b.to_bits()) <= 100
+        };
         let h = width(0);
         let consumed = if self.statistic == MeasureStatistic::Avg {
             1
@@ -864,7 +872,8 @@ impl Integral {
             1
         };
         if h > 0. {
-            let span = self.panel[consumed].0 - self.panel[0].0;
+            let from = self.panel[0].0;
+            let to = self.panel[consumed].0;
             // Exact integer numerators for the normalized quadrature rules.
             let weights = match consumed {
                 3 => [3, 9, 9, 3],
@@ -873,25 +882,27 @@ impl Integral {
             };
             if self.statistic == MeasureStatistic::Rms {
                 let maximum = &mut self.rms_maximum;
-                self.rms.add_weighted(
-                    span,
+                let minimum = &mut self.rms_minimum;
+                self.rms.add_scaled(
+                    positive_axis_span(from, to),
                     self.panel.iter().zip(weights).take(consumed + 1).map(
                         |(&(_, value), weight)| {
                             let magnitude = value.abs();
                             *maximum = maximum.max(magnitude);
+                            *minimum = minimum.min(magnitude);
                             (magnitude, Real::from(weight) / 24.)
                         },
                     ),
                 );
             } else {
                 self.area
-                    .add_weighted(span, self.panel.map(|(_, value)| value), weights);
+                    .add_axis_panel(from, to, self.panel.map(|(_, value)| value), weights);
             }
         }
         self.panel.copy_within(consumed..self.count, 0);
         self.count -= consumed;
     }
-    fn finish(mut self, width: Real, card: &MeasureCard) -> SpiceResult<Real> {
+    fn finish(mut self, span: MeasureSpan, card: &MeasureCard) -> SpiceResult<Real> {
         while self.count >= 2 {
             self.consume();
         }
@@ -899,14 +910,13 @@ impl Integral {
             // Positive normalized quadrature cannot exceed the largest sample.
             // Rounding of the weights/norm can otherwise overflow a constant MAX trace.
             MeasureStatistic::Rms => {
-                let norm = self.rms.root_mean(width);
-                if norm > self.rms_maximum {
-                    self.rms_maximum
-                } else {
-                    norm
-                }
+                let norm = self
+                    .rms
+                    .root_mean_scaled(positive_axis_span(span.from, span.to));
+                norm.min(self.rms_maximum)
+                    .max(self.rms_minimum.min(self.rms_maximum))
             }
-            MeasureStatistic::Avg => self.area.panel_result(width),
+            MeasureStatistic::Avg => self.area.panel_ratio_axis(span.from, span.to),
             _ => self.area.panel_result(1.),
         };
         if !result.is_finite() {
@@ -923,14 +933,14 @@ impl Integral {
 fn integrate(
     points: impl Iterator<Item = SpiceResult<(Real, Real)>>,
     statistic: MeasureStatistic,
-    width: Real,
+    span: MeasureSpan,
     card: &MeasureCard,
 ) -> SpiceResult<Real> {
     let mut integral = Integral::new(statistic);
     for point in points {
         integral.push(point?);
     }
-    integral.finish(width, card)
+    integral.finish(span, card)
 }
 
 /// C `measure_margin`: unwrap phase, interpolate dB/degrees and log frequency.
@@ -1110,9 +1120,8 @@ fn derivative_value(
 }
 
 /// The width of a covered window, which a mean needs to be defined.
-fn span_width(span: MeasureSpan, card: &MeasureCard) -> SpiceResult<Real> {
-    let width = span.to - span.from;
-    if width <= 0.0 || !width.is_finite() {
+fn span_width(span: MeasureSpan, card: &MeasureCard) -> SpiceResult<()> {
+    if !(span.from.is_finite() && span.to.is_finite() && span.to > span.from) {
         return Err(unsupported(
             card,
             format!(
@@ -1123,7 +1132,7 @@ fn span_width(span: MeasureSpan, card: &MeasureCard) -> SpiceResult<Real> {
             ),
         ));
     }
-    Ok(width)
+    Ok(())
 }
 
 /// The axis position of one `TRIG`/`TARG` event.
@@ -1549,7 +1558,13 @@ mod tests {
         let card = card("m", request(MeasureStatistic::Avg, None, None));
         let values = [(0.0, Real::MAX), (0.5, Real::MAX)];
         assert_eq!(
-            super::integrate(values.into_iter().map(Ok), MeasureStatistic::Avg, 1., &card).unwrap(),
+            super::integrate(
+                values.into_iter().map(Ok),
+                MeasureStatistic::Avg,
+                super::MeasureSpan { from: 0., to: 1. },
+                &card
+            )
+            .unwrap(),
             Real::MAX / 2.
         );
     }
@@ -1583,15 +1598,19 @@ mod tests {
                 expected += h(i) * (y(i) + y(i + 1)) / 2.;
             }
             let got = if square {
-                let rms =
-                    super::integrate(points.into_iter().map(Ok), MeasureStatistic::Rms, 8., &card)
-                        .unwrap();
+                let rms = super::integrate(
+                    points.into_iter().map(Ok),
+                    MeasureStatistic::Rms,
+                    super::MeasureSpan { from: 0., to: 8. },
+                    &card,
+                )
+                .unwrap();
                 rms * rms * 8.
             } else {
                 super::integrate(
                     points.into_iter().map(Ok),
                     MeasureStatistic::Integ,
-                    1.,
+                    super::MeasureSpan { from: 0., to: 1. },
                     &card,
                 )
                 .unwrap()
@@ -1612,14 +1631,20 @@ mod tests {
             (3., -1e16),
         ];
         assert_eq!(
-            super::integrate(points.into_iter().map(Ok), MeasureStatistic::Avg, 1., &card).unwrap(),
+            super::integrate(
+                points.into_iter().map(Ok),
+                MeasureStatistic::Avg,
+                super::MeasureSpan { from: 0., to: 1. },
+                &card
+            )
+            .unwrap(),
             1.
         );
         assert_eq!(
             super::integrate(
                 points.into_iter().map(Ok),
                 MeasureStatistic::Integ,
-                1.,
+                super::MeasureSpan { from: 0., to: 1. },
                 &card
             )
             .unwrap(),
@@ -1629,7 +1654,13 @@ mod tests {
             let t = Real::from(i);
             Ok((t, t.powi(3)))
         });
-        let result = super::integrate(cubic, MeasureStatistic::Integ, 1., &card).unwrap();
+        let result = super::integrate(
+            cubic,
+            MeasureStatistic::Integ,
+            super::MeasureSpan { from: 0., to: 1. },
+            &card,
+        )
+        .unwrap();
         assert!((result - 81. / 4.).abs() <= 4. * Real::EPSILON * 81. / 4.);
     }
 
@@ -2195,7 +2226,10 @@ mod tests {
         let actual = super::integrate(
             points.into_iter().map(Ok),
             MeasureStatistic::Rms,
-            1e308,
+            super::MeasureSpan {
+                from: 0.,
+                to: 1e308,
+            },
             &card,
         )
         .unwrap();

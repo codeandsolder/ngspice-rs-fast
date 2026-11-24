@@ -96,6 +96,64 @@ the run with an error; no partial plot is returned.
   SIN/EXP/SFFM/AM request none. Devices add entries through the same
   `CKTsetBreak` rules when they accept a point (transmission lines, see
   [Device-driven breakpoints](#device-driven-breakpoints-and-delay-history-adr-84)).
+  The pending table uses an ordered index with logarithmic predecessor/
+  successor lookup and front removal (#126), rather than scanning and
+  shifting an entire vector. A successor within the merge distance takes
+  priority over a predecessor, including an equal predecessor; duplicate
+  entries retain insertion order and the original signed-zero bits. The
+  two-entry clear appends the final-time sentinel even when an already
+  queued event lies beyond it: two ascending runs preserve the resulting
+  sequence. Diagnostic iteration borrows this sequence without allocating
+  a snapshot. Construction rejects non-finite or negative final times
+  and merge distances. The accept-time source scheduler now binds only
+  event-capable sources once to the immutable, resolved LinearSystem (#136),
+  retaining their original indices and two C-compatible type phases.
+  Constants and continuous-function sources are excluded from every
+  accept-point traversal; voltage PULSE/PWL and current PWL are checked at
+  every accepted time, while a current PULSE is checked only when CKTbreak
+  is set. Unknown waveform defaults remain checked, preserving the original
+  error rather than being treated as inert. A new scheduler is required
+  for another effective system; resetting the same bound schedule only
+  restores its per-source C break-time state. Source corner arithmetic,
+  merge priority, delay-device interleaving and accepted event grids are
+  unchanged.
+
+  The opt-in Acer #136 source-enumeration benchmark uses 2,000 accepted
+  points, both current and voltage phases, and two active Step sources
+  among 1,000/10,000/100,000 inert constants. Its full-scan reference
+  uses the identical Request physics kernel and compares every
+  BreakTable bit:
+
+  | Total sources | Old scanned visits | Bound visits | Old scan | Bound |
+  | --- | ---: | ---: | ---: | ---: |
+  | 1,002 | 4,000,000 | 4,000 | 14.28 ms | 45.40 µs |
+  | 10,002 | 40,000,000 | 4,000 | 134.50 ms | 45.57 µs |
+  | 100,002 | 400,000,000 | 4,000 | 5,059.97 ms | 45.97 µs |
+
+  Source requests and breakpoint bits match the old full scan.
+  These are source-enumeration times in the debug test binary under
+  concurrent host load, not entire transient-solver times.
+  In the opt-in release breakpoint benchmark on Acer, three trials each
+  at 4096, 16384 and 65536 distinct events in ascending and shuffled order
+  used 9.09 s of CPU time with the former vector and 0.37 s with the index;
+  peak process RSS was 3640 and 9664 KiB respectively. Median elapsed
+  insertion/draining times (ms), under concurrent build load:
+
+  | Order | Events | Insert, vector → index | Drain, vector → index |
+  | --- | ---: | ---: | ---: |
+  | Ascending | 4096 | 8.451 → 1.545 | 0.811 → 2.434 |
+  | Ascending | 16384 | 193.370 → 52.555 | 32.557 → 10.674 |
+  | Ascending | 65536 | 2155.333 → 114.531 | 653.328 → 19.558 |
+  | Shuffled | 4096 | 3.573 → 2.697 | 0.870 → 0.410 |
+  | Shuffled | 16384 | 75.649 → 26.197 | 27.349 → 5.030 |
+  | Shuffled | 65536 | 1156.176 → 165.627 | 705.961 → 42.209 |
+
+  Test-only counters on the 65536-event shuffled sequence measured
+  1,074,070,895 vector lookup visits and 3,221,158,545 shifted entries
+  before indexing, versus 6,865,739 tree-key comparisons (node-local
+  movement is not counted). The bitwise sequence oracle passed all
+  75,000 randomized transitions.
+
   At each step the driver clears entries at or
   within `CKTminBreak` of the current time, cuts the step to `CKTbreaks[0] -
   CKTtime` when it would pass it (the landing time is `CKTtime + CKTdelta`,

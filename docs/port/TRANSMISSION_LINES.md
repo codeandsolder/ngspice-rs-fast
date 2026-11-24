@@ -184,17 +184,39 @@ frequency like the lossless line (`A += Re`, `E += Im / omega`).
 * **History** (`ltraacct.c`, `dctran.c` `CKTtimePoints`): the port voltages
   and currents of every accepted point, starting with the operating point at
   `t = 0`, kept in the device's `DelayHistory` (width 4) and never pruned:
-  every load convolves the whole past (`O(N)` per load, `O(N^2)` per run, as
-  in C). Trials only read it.
+  every trial attempt convolves the whole past (`O(N)` per attempt,
+  `O(N^2)` per run, as in C). Trials only read it.
 * **Load** (`ltraload.c`, `ltramisc.c`): at each trial time the line computes
   `LTRArlcCoeffsSetup`/`LTRArcCoeffsSetup` over the accepted times (C keeps
-  them per model for the time point; the port recomputes the same values per
-  load), stamps the coefficient of the unknown sample, and puts the
+  them per model for the time point), stamps the coefficient of the unknown
+  sample, and puts the
   convolution of the history minus the operating point, the operating-point
   integral terms (`LTRAintH*`) and the attenuated delayed waves into the
   right-hand side. The delayed values use C's interpolation choice and its
   operation order. C's `LTRAchopReltol` has no deck setter (0), so no
   coefficient is chopped unless it is exactly zero.
+  The transient driver opens one preparation scope with the exact proposed
+  time, effective model context and immutable accepted history. Each line
+  lazily computes its finite load inputs on its first stamp; further Newton
+  iterations and isolated observations reuse those inputs. Retry and acceptance
+  drop the scope before changing history. Only a single reusable coefficient
+  buffer and per-line slots survive between attempts; all logical contents
+  are cleared. Consecutive RC/RLC preparations share coefficients only when
+  the effective model name, coefficient arguments and full time grid agree
+  bit-for-bit. RHS histories remain independent. Direct one-off loads retain
+  the same scalar evaluator; DC and RG do not allocate convolution weights.
+  No timestep, interpolation, accumulation-order or breakpoint policy changes.
+
+  **Measured preparation work (#107):** the release `ltra_history` workload
+  on Acer produces the same 1,759 accepted steps, zero rejects and 74
+  breakpoints. The original evaluated coefficients and convolution 3,518
+  times per run (24,626 calls observed over seven runs); the prepared
+  transient reports 3,518 Newton/line loads but only 1,759 coefficient
+  preparations and convolution evaluations. DHAT across the same seven
+  retained/streamed/statistics runs reports 549,330,884 → 29,922,262 total
+  allocated bytes, 190,648 → 166,107 blocks and 623,870 → 623,838 peak live
+  bytes. The instrumented statistics run took 256.2 → 150.0 ms; wall clocks
+  are noisy under simultaneous builds, unlike the measured work counts.
 * **Breakpoints** (`ltraacct.c`): after recording a point, if either
   attenuated wave `(v + Z0 i) exp(-beta TD)` changes slope by at least
   `rel max(|d1|, |d2|) + abs` and is not steady (C's `CHECK`: range of the

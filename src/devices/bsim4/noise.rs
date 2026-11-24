@@ -5,8 +5,8 @@
 //! The analysis owns gains, `Nintegrate` and the output columns; this file
 //! reproduces what C passes to `NevalSrc`/`NevalSrc2` and the flicker factor
 //! it multiplies the `N_GAIN` gain by, in C's order and arithmetic.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
+// Compact-model noise reductions retain their physical ordering, but use
+// fused products and cancellation-free density differences where possible.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -14,10 +14,6 @@
 #![expect(
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 #![expect(
     non_snake_case,
@@ -82,7 +78,7 @@ pub(super) const NAMES: [&str; 14] = [
 /// `Eval1ovFNoise`: the unified flicker-noise density.
 fn eval_1ov_f_noise(Vds: f64, m: &Model, h: &Instance, p: &SizeParam, freq: f64, temp: f64) -> f64 {
     let cd = h.cd.abs();
-    let Leff = p.leff - 2.0 * m.lintnoi;
+    let Leff = 2.0f64.mul_add(-m.lintnoi, p.leff);
     let Leffsq = Leff * Leff;
     let esat = 2.0 * h.vsattemp / h.ueff;
     let DelClm = if m.em <= 0.0 {
@@ -98,17 +94,46 @@ fn eval_1ov_f_noise(Vds: f64, m: &Model, h: &Instance, p: &SizeParam, freq: f64,
     let T1 = CHARGE * CHARGE * BOLTZMANN * cd * temp * h.ueff;
     let T2 = 1.0e10 * EffFreq * h.Abulk * m.coxe * Leffsq;
     let N0 = m.coxe * h.Vgsteff / CHARGE;
-    let Nl = m.coxe * h.Vgsteff * (1.0 - h.AbovVgst2Vtm * h.Vdseff) / CHARGE;
-
-    let T3 = m.oxideTrapDensityA * max((N0 + h.nstar) / (Nl + h.nstar), N_MINLOG).ln();
-    let T4 = m.oxideTrapDensityB * (N0 - Nl);
-    let T5 = m.oxideTrapDensityC * 0.5 * (N0 * N0 - Nl * Nl);
+    let depletion = h.AbovVgst2Vtm * h.Vdseff;
+    let Nl = m.coxe * h.Vgsteff * h.AbovVgst2Vtm.mul_add(-h.Vdseff, 1.0) / CHARGE;
+    // N0-Nl rounds to zero when the channel depletion is below one ULP
+    // of 1-depletion. Recover the physical difference from its *factor*,
+    // while preserving the independent difference for large depletions.
+    let density_drop = if depletion.is_finite() && depletion.abs() <= 0.5 {
+        N0 * depletion
+    } else {
+        N0 - Nl
+    };
+    let numerator = N0 + h.nstar;
+    let denominator = Nl + h.nstar;
+    let ratio = numerator / denominator;
+    let log_trap_ratio = if numerator.is_finite()
+        && numerator > 0.
+        && denominator.is_finite()
+        && denominator > 0.
+        && ratio >= N_MINLOG
+    {
+        let relative_drop = density_drop / denominator;
+        if relative_drop.is_finite() && relative_drop > -1. {
+            relative_drop.ln_1p()
+        } else {
+            numerator.ln() - denominator.ln()
+        }
+    } else {
+        max(ratio, N_MINLOG).ln()
+    };
+    let T3 = m.oxideTrapDensityA * log_trap_ratio;
+    let T4 = m.oxideTrapDensityB * density_drop;
+    // Factored difference of squares prevents N0² and Nl² from
+    // independently rounding to the same large value (or overflowing).
+    let T5 = (m.oxideTrapDensityC * 0.5) * (density_drop * (N0 + Nl));
 
     let T6 = BOLTZMANN * temp * cd * cd;
     let T7 = 1.0e10 * EffFreq * Leffsq * p.weff * h.nf;
-    let T8 = m.oxideTrapDensityA + m.oxideTrapDensityB * Nl + m.oxideTrapDensityC * Nl * Nl;
+    let T8 = (m.oxideTrapDensityC * Nl)
+        .mul_add(Nl, m.oxideTrapDensityB.mul_add(Nl, m.oxideTrapDensityA));
     let T9 = (Nl + h.nstar) * (Nl + h.nstar);
-    T1 / T2 * (T3 + T4 + T5) + T6 / T7 * DelClm * T8 / T9
+    (T1 / T2).mul_add(T3 + T4 + T5, T6 / T7 * DelClm * T8 / T9)
 }
 
 /// `BSIM4noise`'s `N_DENS` evaluation for one instance at `freq` (Hz):
@@ -148,8 +173,8 @@ pub(super) fn generators(
     } else if m.tnoiMod == 1 {
         let mut T5 = h.Vgsteff / h.EsatL;
         T5 *= T5;
-        npart_beta = m.rnoia * (1.0 + T5 * m.tnoia * p.leff);
-        npart_theta = m.rnoib * (1.0 + T5 * m.tnoib * p.leff);
+        npart_beta = m.rnoia * (T5 * m.tnoia).mul_add(p.leff, 1.0);
+        npart_theta = m.rnoib * (T5 * m.tnoib).mul_add(p.leff, 1.0);
         if npart_theta > 0.9 {
             npart_theta = 0.9;
         }
@@ -225,24 +250,32 @@ pub(super) fn generators(
     let mut sigrat = 0.0;
     let mut ctnoi = 0.0;
     if m.tnoiMod == 2 {
-        let eta = 1.0 - h.Vdseff * h.AbovVgst2Vtm;
-        let T0 = 1.0 - eta;
+        let depletion = h.Vdseff * h.AbovVgst2Vtm;
+        let eta = h.Vdseff.mul_add(-h.AbovVgst2Vtm, 1.0);
+        // 1-(1-depletion) loses sub-ULP depletion and changes correlated
+        // channel noise. Preserve the direct physical product when finite.
+        let T0 = if depletion.is_finite() {
+            depletion
+        } else {
+            1.0 - eta
+        };
         let T1 = 1.0 + eta;
         let T2 = T1 + 2.0 * h.Abulk * m.vtm / h.Vgsteff;
         let Leff = p.leff;
         let Lvsat = Leff * (1.0 + h.Vdseff / h.EsatL);
         let T6 = Leff / Lvsat;
-        let mut gamma = T6 * (0.5 * T1 + T0 * T0 / (6.0 * T2));
+        let mut gamma = T6 * 0.5f64.mul_add(T1, T0 * T0 / (6.0 * T2));
         let T3 = T2 * T2;
         let T4 = T0 * T0;
         let T5 = T3 * T3;
-        let mut delta = (T1 / T3 - (5.0 * T1 + T2) * T4 / (15.0 * T5) + T4 * T4 / (9.0 * T5 * T2))
+        let mut delta = (T1 / T3 - 5.0f64.mul_add(T1, T2) * T4 / (15.0 * T5)
+            + T4 * T4 / (9.0 * T5 * T2))
             / (6.0 * T6 * T6 * T6);
         let T7 = T0 / T2;
         let epsilon = (T7 - T7 * T7 * T7 / 3.0) / (6.0 * T6);
         let mut T8 = h.Vgsteff / h.EsatL;
         T8 *= T8;
-        let npart_c = m.rnoic * (1.0 + T8 * m.tnoic * Leff);
+        let npart_c = m.rnoic * (T8 * m.tnoic).mul_add(Leff, 1.0);
         if m.v48intVersion <= 480 {
             ctnoi = epsilon / (gamma * delta).sqrt() * (2.5316 * npart_c);
         } else {
@@ -261,8 +294,8 @@ pub(super) fn generators(
             }
         }
 
-        npart_beta = m.rnoia * (1.0 + T8 * m.tnoia * Leff);
-        npart_theta = m.rnoib * (1.0 + T8 * m.tnoib * Leff);
+        npart_beta = m.rnoia * (T8 * m.tnoia).mul_add(Leff, 1.0);
+        npart_theta = m.rnoib * (T8 * m.tnoib).mul_add(Leff, 1.0);
         gamma = gamma * (3.0 * npart_beta * npart_beta);
         delta = delta * (3.75 * npart_theta * npart_theta);
 
@@ -284,14 +317,14 @@ pub(super) fn generators(
             // zero there.
             let T0 = h.ueff * h.qinv.abs();
             let leff_squared = p.leff * p.leff;
-            let T1 = T0 * tmp + leff_squared;
+            let T1 = T0.mul_add(tmp, leff_squared);
             out[8] = Source::Thermal(h.dNodePrime, h.sNodePrime, (T0 / T1) * m.ntnoi * mult_i);
         }
         1 => {
             let mut T0 = h.gm + h.gmbs + h.gds;
             T0 *= T0;
             let igsquare = npart_theta * npart_theta * T0 / h.IdovVds;
-            let T1 = npart_beta * (h.gm + h.gmbs) + h.gds;
+            let T1 = f64::mul_add(npart_beta, h.gm + h.gmbs, h.gds);
             let T2 = T1 * T1 / h.IdovVds;
             out[8] = Source::Thermal(h.dNodePrime, h.sNodePrime, (T2 - igsquare) * mult_i);
         }
@@ -365,4 +398,62 @@ pub(super) fn generators(
     }
     out[12] = Source::Shot(h.gNodePrime, h.bNodePrime, mult_i * h.Igb);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BOLTZMANN, CHARGE, Instance, Model, SizeParam, eval_1ov_f_noise};
+
+    /// In strong inversion, a representable sub-ULP depletion still changes
+    /// trap density. Both N0-Nl and N0²-Nl² in the old form round to zero,
+    /// incorrectly erasing both the B/C and logarithmic A flicker terms.
+    #[test]
+    fn flicker_trap_noise_retains_sub_ulp_charge_depletion() {
+        let nominal = 4e18;
+        let fraction = 2_f64.powi(-55);
+        let mut model = Model {
+            coxe: 1.,
+            em: 0.,
+            ef: 1.,
+            lintnoi: 0.,
+            oxideTrapDensityC: 1.,
+            ..Model::default()
+        };
+        let device = Instance {
+            Vgsteff: nominal * CHARGE,
+            Vdseff: 1.,
+            AbovVgst2Vtm: fraction,
+            cd: 1.,
+            ueff: 0.1,
+            Abulk: 1.,
+            nf: 1.,
+            nstar: 1.,
+            ..Instance::default()
+        };
+        let size = SizeParam {
+            leff: 1e-6,
+            weff: 1e-6,
+            ..SizeParam::default()
+        };
+        let n0 = model.coxe * device.Vgsteff / CHARGE;
+        let nl = model.coxe * device.Vgsteff * (1. - fraction) / CHARGE;
+        assert_eq!(n0.to_bits(), nl.to_bits());
+        let scaling = CHARGE * CHARGE * BOLTZMANN * device.cd * 300. * device.ueff
+            / (1e10 * device.Abulk * model.coxe * size.leff * size.leff);
+        let recovered = n0 * fraction;
+        let wants = [
+            0.5 * recovered * (n0 + nl),
+            (recovered / (nl + device.nstar)).ln_1p(),
+        ];
+        for (case, expected_trap) in wants.into_iter().enumerate() {
+            model.oxideTrapDensityA = if case == 1 { 1. } else { 0. };
+            model.oxideTrapDensityC = if case == 0 { 1. } else { 0. };
+            let expected = scaling * expected_trap;
+            let got = eval_1ov_f_noise(1., &model, &device, &size, 1., 300.);
+            assert!(
+                got.is_finite() && got > 0. && (got - expected).abs() <= expected * 3e-14,
+                "trap case {case}: expected {expected:.17e}, got {got:.17e}"
+            );
+        }
+    }
 }

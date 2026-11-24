@@ -19,10 +19,6 @@
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 
 /// `BSIM4NumFingerDiff`: the numbers of interior and end source/drain
 /// diffusions `(nuIntD, nuEndD, nuIntS, nuEndS)` for `nf` fingers.
@@ -84,22 +80,22 @@ pub(super) fn pa_eff_geo(
 
     match geo {
         0 => (
-            nu_end_s * ps_iso + nu_int_s * ps_sha,
-            nu_end_d * pd_iso + nu_int_d * pd_sha,
-            nu_end_s * as_iso + nu_int_s * as_sha,
-            nu_end_d * ad_iso + nu_int_d * ad_sha,
+            f64::mul_add(nu_int_s, ps_sha, nu_end_s * ps_iso),
+            f64::mul_add(nu_int_d, pd_sha, nu_end_d * pd_iso),
+            f64::mul_add(nu_int_s, as_sha, nu_end_s * as_iso),
+            f64::mul_add(nu_int_d, ad_sha, nu_end_d * ad_iso),
         ),
         1 => (
-            nu_end_s * ps_iso + nu_int_s * ps_sha,
+            f64::mul_add(nu_int_s, ps_sha, nu_end_s * ps_iso),
             (nu_end_d + nu_int_d) * pd_sha,
-            nu_end_s * as_iso + nu_int_s * as_sha,
+            f64::mul_add(nu_int_s, as_sha, nu_end_s * as_iso),
             (nu_end_d + nu_int_d) * ad_sha,
         ),
         2 => (
             (nu_end_s + nu_int_s) * ps_sha,
-            nu_end_d * pd_iso + nu_int_d * pd_sha,
+            f64::mul_add(nu_int_d, pd_sha, nu_end_d * pd_iso),
             (nu_end_s + nu_int_s) * as_sha,
-            nu_end_d * ad_iso + nu_int_d * ad_sha,
+            f64::mul_add(nu_int_d, ad_sha, nu_end_d * ad_iso),
         ),
         3 => (
             (nu_end_s + nu_int_s) * ps_sha,
@@ -108,47 +104,47 @@ pub(super) fn pa_eff_geo(
             (nu_end_d + nu_int_d) * ad_sha,
         ),
         4 => (
-            nu_end_s * ps_iso + nu_int_s * ps_sha,
-            nu_end_d * pd_mer + nu_int_d * pd_sha,
-            nu_end_s * as_iso + nu_int_s * as_sha,
-            nu_end_d * ad_mer + nu_int_d * ad_sha,
+            f64::mul_add(nu_int_s, ps_sha, nu_end_s * ps_iso),
+            f64::mul_add(nu_int_d, pd_sha, nu_end_d * pd_mer),
+            f64::mul_add(nu_int_s, as_sha, nu_end_s * as_iso),
+            f64::mul_add(nu_int_d, ad_sha, nu_end_d * ad_mer),
         ),
         5 => (
             (nu_end_s + nu_int_s) * ps_sha,
-            nu_end_d * pd_mer + nu_int_d * pd_sha,
+            f64::mul_add(nu_int_d, pd_sha, nu_end_d * pd_mer),
             (nu_end_s + nu_int_s) * as_sha,
-            nu_end_d * ad_mer + nu_int_d * ad_sha,
+            f64::mul_add(nu_int_d, ad_sha, nu_end_d * ad_mer),
         ),
         6 => (
-            nu_end_s * ps_mer + nu_int_s * ps_sha,
-            nu_end_d * pd_iso + nu_int_d * pd_sha,
-            nu_end_s * as_mer + nu_int_s * as_sha,
-            nu_end_d * ad_iso + nu_int_d * ad_sha,
+            f64::mul_add(nu_int_s, ps_sha, nu_end_s * ps_mer),
+            f64::mul_add(nu_int_d, pd_sha, nu_end_d * pd_iso),
+            f64::mul_add(nu_int_s, as_sha, nu_end_s * as_mer),
+            f64::mul_add(nu_int_d, ad_sha, nu_end_d * ad_iso),
         ),
         7 => (
-            nu_end_s * ps_mer + nu_int_s * ps_sha,
+            f64::mul_add(nu_int_s, ps_sha, nu_end_s * ps_mer),
             (nu_end_d + nu_int_d) * pd_sha,
-            nu_end_s * as_mer + nu_int_s * as_sha,
+            f64::mul_add(nu_int_s, as_sha, nu_end_s * as_mer),
             (nu_end_d + nu_int_d) * ad_sha,
         ),
         8 => (
-            nu_end_s * ps_mer + nu_int_s * ps_sha,
-            nu_end_d * pd_mer + nu_int_d * pd_sha,
-            nu_end_s * as_mer + nu_int_s * as_sha,
-            nu_end_d * ad_mer + nu_int_d * ad_sha,
+            f64::mul_add(nu_int_s, ps_sha, nu_end_s * ps_mer),
+            f64::mul_add(nu_int_d, pd_sha, nu_end_d * pd_mer),
+            f64::mul_add(nu_int_s, as_sha, nu_end_s * as_mer),
+            f64::mul_add(nu_int_d, ad_sha, nu_end_d * ad_mer),
         ),
         // geo = 9 and 10 happen only when nf is even.
         9 => (
-            ps_iso + (nf - 1.0) * ps_sha,
+            (nf - 1.0).mul_add(ps_sha, ps_iso),
             nf * pd_sha,
-            as_iso + (nf - 1.0) * as_sha,
+            (nf - 1.0).mul_add(as_sha, as_iso),
             nf * ad_sha,
         ),
         10 => (
             nf * ps_sha,
-            pd_iso + (nf - 1.0) * pd_sha,
+            (nf - 1.0).mul_add(pd_sha, pd_iso),
             nf * as_sha,
-            ad_iso + (nf - 1.0) * ad_sha,
+            (nf - 1.0).mul_add(ad_sha, ad_iso),
         ),
         _ => {
             warnings.push(format!("Warning: Specified GEO = {geo} not matched"));
@@ -298,7 +294,16 @@ pub(super) fn rdseff_geo(
         rend
     } else if rend <= 0.0 {
         rint
+    } else if rint.is_finite() && rend.is_finite() {
+        // The equivalent of two positive parallel sheet resistances is
+        // representable even when rint*rend overflows or underflows. Scale
+        // by the smaller leg, so the denominator stays in [1, 2].
+        let smaller = rint.min(rend);
+        let larger = rint.max(rend);
+        smaller / (1. + smaller / larger)
     } else {
+        // Preserve the original nonfinite-input diagnostics and IEEE
+        // propagation for invalid derived resistance values.
         rint * rend / (rint + rend)
     };
     if rtot == 0.0 {
@@ -406,6 +411,27 @@ mod tests {
         assert_eq!(num_finger_diff(4.5, 0), (4.5, 0.0, 2.5, 2.0));
         assert_eq!(num_finger_diff(f64::from(i32::MAX), 0).1, 1.0);
         assert_eq!(num_finger_diff(f64::from(i32::MAX) + 1.0, 0).1, 1.0);
+    }
+
+    #[test]
+    fn parallel_diffusion_resistance_is_scaled_without_intermediate_overflow() {
+        // Three fingers: one end source and two interior source diffusions.
+        // Geo=0, rgeo=1 gives Rend=Rsh and Rint=Rsh/2, so Rtotal=Rsh/3.
+        // The original product Rint*Rend loses the result at both extremes.
+        for rsh in [1e-200, 1., 1e200, f64::MAX / 2.] {
+            let mut warnings = Vec::new();
+            let actual = rdseff_geo(3., 0, 1, 0, 1., rsh, 1., 0., 0., 1, &mut warnings);
+            let expected = rsh / 3.;
+            assert!(
+                actual.is_finite() && (actual - expected).abs() <= expected * 8e-16,
+                "Rsh={rsh}, got={actual}, expected={expected}"
+            );
+            assert!(warnings.is_empty(), "Rsh={rsh}: {warnings:?}");
+        }
+        // Invalid nonfinite geometric inputs are still propagated, not
+        // interpreted as an ideal open circuit or a finite resistance.
+        let mut warnings = Vec::new();
+        assert!(rdseff_geo(3., 0, 1, 0, 1., f64::INFINITY, 1., 0., 0., 1, &mut warnings).is_nan());
     }
 
     #[test]

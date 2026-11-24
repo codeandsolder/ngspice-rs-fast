@@ -575,12 +575,21 @@ pub struct Coefficients {
 }
 
 impl Coefficients {
-    fn with_len(len: usize) -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             first: [0.; 3],
-            weights: vec![[0.; 3]; len],
+            weights: Vec::new(),
             aux_index: 0,
         }
+    }
+
+    /// Clear the full active range, including coefficients C chops away.
+    /// Shrinking a retry/model must not leave an active tail from an older grid.
+    pub(super) fn reset(&mut self, len: usize) {
+        self.first = [0.; 3];
+        self.aux_index = 0;
+        self.weights.clear();
+        self.weights.resize(len, [0.; 3]);
     }
 }
 
@@ -724,16 +733,16 @@ fn rc_erfc_batch(temp: std::simd::f64x4) -> std::simd::f64x4 {
 /// `LTRArcCoeffsSetup` (the `L = G = 0` line): coefficients at `curtime` over
 /// the accepted times `times[0..=index]`, with C's chopping tolerance
 /// `reltol` (C's `LTRAchopReltol`, always 0 from a deck).
-#[must_use]
 pub fn rc_coefficients(
     cbyr: Real,
     rclsqr: Real,
     curtime: Real,
     times: &VecDeque<Real>,
     reltol: Real,
-) -> Coefficients {
+    out: &mut Coefficients,
+) {
     let index = times.len() - 1;
-    let mut out = Coefficients::with_len(times.len());
+    out.reset(times.len());
     let kernel = RcKernel {
         cbyr,
         rclsqr,
@@ -783,7 +792,6 @@ pub fn rc_coefficients(
         }
     }
     out.aux_index = index;
-    out
 }
 
 /// Locate the newest accepted sample at least one delay back. Preserve C's
@@ -979,7 +987,6 @@ impl RlcKernels {
 /// C quirk kept: at the auxiliary index the `h2` correction term integrates
 /// the previous window `[lolimit2, hilimit2]` with the values at `TD` and at
 /// the auxiliary time (C's commented-out `lolimit2 = T` fix is not applied).
-#[must_use]
 #[expect(
     clippy::too_many_lines,
     reason = "keeps the reference numerical routine in the original statement and rounding order"
@@ -991,15 +998,16 @@ pub fn rlc_coefficients(
     curtime: Real,
     times: &VecDeque<Real>,
     reltol: Real,
-) -> Coefficients {
+    out: &mut Coefficients,
+) {
     let index = times.len() - 1;
-    let mut out = Coefficients::with_len(times.len());
+    out.reset(times.len());
     let (mut doh1, mut doh2, mut doh3) = (true, true, true);
 
     let aux = rlc_aux_index(t, curtime, times);
     if aux == 0 && index < 32 {
-        short_self_coefficients(beta, curtime, times, reltol, &mut out);
-        return out;
+        short_self_coefficients(beta, curtime, times, reltol, out);
+        return;
     }
 
     let kernels = RlcKernels {
@@ -1110,7 +1118,6 @@ pub fn rlc_coefficients(
         }
     }
     out.aux_index = aux;
-    out
 }
 
 #[cfg(test)]
@@ -1318,12 +1325,58 @@ mod tests {
         // telescope to (H(t) - H(t - t0)) / dt differences; check the
         // telescoping identity sum_i c_i = (first window) sum directly.
         let times = VecDeque::from([0., 1e-9, 2e-9, 3e-9]);
-        let c = rc_coefficients(1e-12 / 100., 100. * 1e-12, 4e-9, &times, 0.);
+        let mut c = Coefficients::default();
+        rc_coefficients(1e-12 / 100., 100. * 1e-12, 4e-9, &times, 0., &mut c);
         assert_eq!(c.weights.len(), 4);
         assert!(c.first.iter().all(|v| v.is_finite()));
         assert!(c.weights[1..].iter().all(|v| v[0].is_finite()));
         // Second differences of a concave sqrt are negative.
         assert!(c.weights[1..].iter().all(|v| v[0] < 0.));
+    }
+
+    #[test]
+    fn coefficient_scratch_clears_chopped_weights_and_inactive_tail() {
+        let long = VecDeque::from([0., 1., 2., 3., 4., 5., 6., 7.]);
+        let short = VecDeque::from([0., 1., 2.]);
+        let mut reused = Coefficients::default();
+        rc_coefficients(1., 1., 8., &long, 0., &mut reused);
+        let capacity = reused.weights.capacity();
+        assert!(
+            reused
+                .weights
+                .iter()
+                .skip(1)
+                .any(|weights| *weights != [0.; 3])
+        );
+        // A new proposal, shorter history, and a different coefficient
+        // family with aggressive chopping must see only its active weights.
+        let mut fresh = Coefficients::default();
+        rlc_coefficients(1., 0.1, 0.1, 2.25, &short, 10., &mut reused);
+        rlc_coefficients(1., 0.1, 0.1, 2.25, &short, 10., &mut fresh);
+        assert_eq!(
+            reused.first.map(Real::to_bits),
+            fresh.first.map(Real::to_bits)
+        );
+        assert_eq!(reused.aux_index, fresh.aux_index);
+        assert_eq!(
+            reused
+                .weights
+                .iter()
+                .map(|row| row.map(Real::to_bits))
+                .collect::<Vec<_>>(),
+            fresh
+                .weights
+                .iter()
+                .map(|row| row.map(Real::to_bits))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reused.weights.capacity(), capacity);
+        // Grow back after a short/LC attempt without allocating again.
+        reused.reset(0);
+        rc_coefficients(1., 1., 8., &long, 0., &mut reused);
+        rc_coefficients(1., 1., 8., &long, 0., &mut fresh);
+        assert_eq!(reused, fresh);
+        assert_eq!(reused.weights.capacity(), capacity);
     }
 
     #[test]

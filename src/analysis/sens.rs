@@ -38,6 +38,8 @@
 //! The device side, including C's side effects of the in-place perturbation,
 //! lives in [`crate::devices::sensitivity`]; see `docs/port/SENSITIVITY.md`.
 
+use super::frequency::FrequencyPlan;
+use super::output_probe::{self, Card, Output, Probe, parse_output};
 use super::reduction::CompensatedSum;
 use crate::analysis::linear::{number, unsupported};
 use crate::analysis::results::{PlotFlags, Variable};
@@ -49,13 +51,9 @@ use crate::devices::sensitivity::{
 };
 use crate::devices::{AnalysisMode, Circuit, Device, IterationPhase, LoadRequest, TrialState};
 use crate::maths::complex::ComplexMatrix;
-use crate::maths::linear::{
-    BatchSolveFailure, RHS_BATCH_WIDTH, SolveBatchWorkspace, solve_last_factors_batch_into,
-};
+use crate::maths::linear::solve_last_factors_transposed;
 use crate::maths::{SparseMatrix, Vector};
-use crate::primitives::{
-    Complex, NodeId, NodeKind, NodeTable, Real, SpiceError, SpiceResult, parse_spice_number,
-};
+use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
 
 /// `Sens_Delta` of `cktsens.c`: the relative perturbation.
 pub(super) const RELATIVE_DELTA: Real = 1e-6;
@@ -68,13 +66,115 @@ const LOG2E: Real = std::f64::consts::LOG2_E;
 /// The port's bound on the number of frequencies.
 const MAX_POINTS: u32 = 100_000;
 
-/// The `.sens` output variable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Output {
-    /// `v(pos)` or `v(pos,neg)`.
-    Voltage { pos: String, neg: Option<String> },
-    /// `i(source)`.
-    Current { source: String },
+/// A differential estimate for a smooth physical scalar parameter.
+///
+/// Sampling returns the device's *projected residual difference* relative
+/// to the unchanged baseline, not an independently Newton-converged output.
+/// The latter would mix solver error into every local derivative.
+#[derive(Debug, Clone, Copy)]
+struct PhysicalSlope {
+    derivative: Complex,
+    /// Actual representable perturbation span, including binary64 rounding.
+    span: Real,
+    symmetric: bool,
+    /// Separation of the two one-sided slopes, to distinguish a cusp.
+    asymmetry: Real,
+}
+
+fn physical_slope(
+    parameter: Real,
+    trial: Real,
+    sample: &mut impl FnMut(Real) -> SpiceResult<Option<Complex>>,
+) -> SpiceResult<Option<PhysicalSlope>> {
+    let at = |offset: Real,
+              sample: &mut dyn FnMut(Real) -> SpiceResult<Option<Complex>>|
+     -> SpiceResult<Option<(Real, Complex)>> {
+        let point = parameter + offset;
+        if !point.is_finite() || point.to_bits() == parameter.to_bits() {
+            return Ok(None);
+        }
+        Ok(sample(point)?.map(|residual| (point - parameter, residual)))
+    };
+    let plus = at(trial, sample)?;
+    let minus = at(-trial, sample)?;
+    let (derivative, span, symmetric, asymmetry) = match (plus, minus) {
+        (Some((h_plus, pos)), Some((h_minus, neg))) => (
+            Complex::new(
+                (pos.re - neg.re) / (h_plus - h_minus),
+                (pos.im - neg.im) / (h_plus - h_minus),
+            ),
+            h_plus - h_minus,
+            true,
+            (pos.re / h_plus - neg.re / h_minus)
+                .abs()
+                .max((pos.im / h_plus - neg.im / h_minus).abs()),
+        ),
+        (Some((h, value)), _) | (_, Some((h, value))) => {
+            (Complex::new(value.re / h, value.im / h), h.abs(), false, 0.)
+        }
+        _ => return Ok(None),
+    };
+    Ok(
+        (derivative.re.is_finite() && derivative.im.is_finite()).then_some(PhysicalSlope {
+            derivative,
+            span,
+            symmetric,
+            asymmetry,
+        }),
+    )
+}
+
+/// Choose a representable step from candidate scales and compare two
+/// independently sampled slopes. Symmetric second-order differences use
+/// Richardson factor 4, while valid one-sided first-order differences use 2.
+/// Return `None` when no physical neighborhood could be sampled, rather
+/// than manufacturing a derivative at a nonsmooth/undefined boundary.
+pub(in crate::analysis) fn conditioned_derivative(
+    parameter: Real,
+    mut sample: impl FnMut(Real) -> SpiceResult<Option<Complex>>,
+) -> SpiceResult<Option<(Complex, Real)>> {
+    let scale = if parameter == 0. { 1. } else { parameter.abs() };
+    let mut best: Option<(Complex, Real, Real)> = None;
+    for factor in [0.04, 0.02, 0.01, 0.005, 0.0025] {
+        let h = scale * factor;
+        if !h.is_finite() || h == 0. {
+            continue;
+        }
+        let (Some(coarse), Some(fine)) = (
+            physical_slope(parameter, h, &mut sample)?,
+            physical_slope(parameter, h / 2., &mut sample)?,
+        ) else {
+            continue;
+        };
+        if coarse.symmetric != fine.symmetric {
+            continue;
+        }
+        // Smooth curvature causes one-sided slopes to coalesce as h shrinks.
+        // A cusp keeps their separation; a parameter jump increases it.
+        if fine.symmetric && coarse.asymmetry > 0. && fine.asymmetry > coarse.asymmetry * 0.75 {
+            continue;
+        }
+        let factor = if fine.symmetric { 3. } else { 1. };
+        let value = Complex::new(
+            (fine.derivative.re - coarse.derivative.re).mul_add(1. / factor, fine.derivative.re),
+            (fine.derivative.im - coarse.derivative.im).mul_add(1. / factor, fine.derivative.im),
+        );
+        let difference = (fine.derivative.re - coarse.derivative.re)
+            .abs()
+            .max((fine.derivative.im - coarse.derivative.im).abs());
+        if !value.is_finite() {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(_, _, prev)| difference < *prev) {
+            best = Some((value, fine.span, difference));
+        }
+    }
+    Ok(best.and_then(|(value, step, discrepancy)| {
+        let magnitude = value.re.abs().max(value.im.abs());
+        // An inconsistent pair is ill-conditioned even when it is the best
+        // of the available samples. Do not silently report a false gradient.
+        (discrepancy <= 0.01 * magnitude).then_some((value, step))
+    }))
 }
 
 /// The AC stepping of `senssetp.c` (`SENS_DECADE`, `SENS_OCTAVE`,
@@ -103,10 +203,13 @@ pub(super) struct SensCard {
     filters: Vec<String>,
     /// `None` for DC.
     sweep: Option<Sweep>,
+    /// Opt-in physically conditioned local scalar partials, not the C record
+    /// replay. Historical C output and names remain unchanged by default.
+    physical: bool,
 }
 
 impl SensCard {
-    pub(super) fn grid(&self) -> SpiceResult<Option<Vec<Real>>> {
+    pub(super) fn grid(&self) -> SpiceResult<Option<FrequencyPlan>> {
         self.sweep.as_ref().map(frequencies).transpose()
     }
 }
@@ -132,54 +235,14 @@ fn integer(text: Option<&str>) -> SpiceResult<i32> {
 /// Parses the arguments of a `.sens` card (`dot_sens()`).
 pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
     let mut tokens = arguments.iter().map(String::as_str).peekable();
-    let expect = |wanted: &str, token: Option<&str>| match token {
-        Some(text) if text == wanted => Ok(()),
-        Some(text) => Err(syntax(format!("expected '{wanted}', found '{text}'"))),
-        None => Err(syntax(format!("is missing '{wanted}'"))),
-    };
-    let name = |token: Option<&str>, what: &str| -> SpiceResult<String> {
-        match token {
-            Some(text) if !matches!(text, "(" | ")" | ",") => Ok(text.to_ascii_lowercase()),
-            Some(text) => Err(syntax(format!("expected {what}, found '{text}'"))),
-            None => Err(syntax(format!("is missing {what}"))),
-        }
-    };
-    let kind = tokens
-        .next()
-        .ok_or_else(|| syntax("has no output variable"))?
-        .to_ascii_lowercase();
-    let output = match kind.as_str() {
-        "v" => {
-            expect("(", tokens.next())?;
-            let pos = name(tokens.next(), "an output node")?;
-            if tokens.peek().is_some_and(|token| *token == ",") {
-                tokens.next();
-            }
-            let neg = if tokens.peek().is_some_and(|token| *token == ")") {
-                None
-            } else {
-                Some(name(tokens.next(), "the negative output node")?)
-            };
-            expect(")", tokens.next())?;
-            Output::Voltage { pos, neg }
-        }
-        "i" => {
-            expect("(", tokens.next())?;
-            let source = name(tokens.next(), "an output source")?;
-            expect(")", tokens.next())?;
-            Output::Current { source }
-        }
-        other => {
-            return Err(syntax(format!(
-                "output '{other}' is neither a voltage v(...) nor a current i(...)"
-            )));
-        }
-    };
+    let output = parse_output(&mut tokens, syntax)?;
     let mut filters = Vec::new();
     let mut sweep = None;
+    let mut physical = false;
     while let Some(token) = tokens.next() {
         let lower = token.to_ascii_lowercase();
         match lower.as_str() {
+            "physical" => physical = true,
             "dc" => break,
             "ac" => {
                 let stepping = match tokens.next().map(str::to_ascii_lowercase).as_deref() {
@@ -224,7 +287,209 @@ pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
         output,
         filters,
         sweep,
+        physical,
     })
+}
+
+/// A direct differentiable observation; no plot-column name guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::analysis) enum PhysicalProbe {
+    /// Voltage between two explicit nodes (or a node and ground).
+    Voltage { pos: String, neg: Option<String> },
+    /// Current through a source with a findable matrix branch.
+    Current { source: String },
+}
+
+/// Exactly one instance parameter from the existing typed sensitivity walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::analysis) enum PhysicalParameter {
+    /// One instance-owned device parameter.
+    Instance { instance: String, keyword: String },
+    /// One model parameter shared by every matching instance; the adjoint
+    /// contributions from all model users are accumulated in C source order.
+    Model { model: String, keyword: String },
+}
+
+impl PhysicalParameter {
+    fn matches(
+        &self,
+        scope: ParameterScope,
+        instance: &str,
+        model: Option<&str>,
+        keyword: &str,
+    ) -> bool {
+        match self {
+            Self::Instance {
+                instance: wanted,
+                keyword: field,
+            } => {
+                scope == ParameterScope::Instance
+                    && wanted.eq_ignore_ascii_case(instance)
+                    && field.eq_ignore_ascii_case(keyword)
+            }
+            Self::Model {
+                model: wanted,
+                keyword: field,
+            } => {
+                scope == ParameterScope::Model
+                    && model.is_some_and(|model| wanted.eq_ignore_ascii_case(model))
+                    && field.eq_ignore_ascii_case(keyword)
+            }
+        }
+    }
+
+    /// Error provenance without guessing names from rawfile columns.
+    pub(in crate::analysis) fn describe(&self) -> String {
+        match self {
+            Self::Instance { instance, keyword } => format!("{instance}:{keyword}"),
+            Self::Model { model, keyword } => format!("model {model}:{keyword}"),
+        }
+    }
+}
+
+/// A partial from the existing adjoint sensitivity walk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::analysis) enum PhysicalPartial {
+    Valid(Complex),
+    NonSmooth,
+    Missing,
+}
+
+/// Evaluate selected physical device partials at one operating point or AC
+/// frequency. The existing driver reuses one primal factor and adjoint,
+/// without a circuit simulation for every parameter. Selection is typed.
+///
+/// Missing and non-smooth physical parameters retain separate typed statuses.
+/// Operational solver failures retain their original error.
+///
+/// # Errors
+/// Underlying operating-point, AC, sensitivity or allocation failures.
+pub(in crate::analysis) fn physical_partials(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &AnalysisContext,
+    probe: &PhysicalProbe,
+    frequency: Option<Real>,
+    selected: &[PhysicalParameter],
+) -> SpiceResult<Vec<PhysicalPartial>> {
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    if frequency.is_some_and(|value| !(value.is_finite() && value > 0.)) {
+        return Err(SpiceError::circuit(
+            "physical AC derivative requires a positive finite frequency",
+        ));
+    }
+    let model = context.model_context();
+    let (listed, _) = members(circuit, &model)?;
+    let catalogue = entries(&listed, frequency.is_some(), &[]);
+    let mut filters = Vec::new();
+    for entry in &catalogue {
+        let member = &listed[entry.member];
+        if selected.iter().any(|wanted| {
+            wanted.matches(
+                entry.scope,
+                &member.name,
+                member.sensitivity.model(),
+                entry.keyword,
+            )
+        }) {
+            let label = entry
+                .name
+                .as_ref()
+                .ok_or_else(|| SpiceError::circuit("missing typed sensitivity label"))?;
+            filters.push(label.clone());
+        }
+    }
+    let result = vec![PhysicalPartial::Missing; selected.len()];
+    if filters.is_empty() {
+        return Ok(result);
+    }
+    // The original sensitivity filter grammar supports glob characters.
+    // Build the actual filtered column order using the *same* typed entry
+    // iterator the driver uses; a wildcard-bearing device label must never
+    // shift the mapping of the selected derivatives.
+    let ordered: Vec<_> = entries(&listed, frequency.is_some(), &filters)
+        .into_iter()
+        .filter(|entry| entry.name.is_some())
+        .map(|entry| {
+            (
+                listed[entry.member].name.clone(),
+                listed[entry.member].sensitivity.model().map(str::to_owned),
+                entry.scope,
+                entry.keyword.to_owned(),
+            )
+        })
+        .collect();
+    drop(listed);
+    let card = SensCard {
+        output: match probe {
+            PhysicalProbe::Voltage { pos, neg } => Output::Voltage {
+                pos: pos.clone(),
+                neg: neg.clone(),
+            },
+            PhysicalProbe::Current { source } => Output::Current {
+                source: source.clone(),
+            },
+        },
+        filters,
+        sweep: None,
+        physical: true,
+    };
+    // Exactly one conditioned small-signal point, using the same admitted
+    // frequency plan as the ordinary spectral analyses. No second sweep API.
+    let point = frequency
+        .map(|value| crate::analysis::frequency::FrequencyPlan::counted(value, 1., 1))
+        .transpose()?;
+    let (plot, _) = run(circuit, request, context, &card, point.as_ref(), false)?;
+    let row = plot
+        .rows()
+        .next()
+        .ok_or_else(|| SpiceError::circuit("sensitivity produced no physical derivative row"))?;
+    let offset = usize::from(frequency.is_some());
+    sum_physical_columns(row, &ordered, selected, offset)
+}
+
+/// Accumulate typed model/instance contributions using the original column
+/// order and compensated sums, preserving non-smooth and missing statuses.
+fn sum_physical_columns(
+    row: &[Complex],
+    ordered: &[(String, Option<String>, ParameterScope, String)],
+    selected: &[PhysicalParameter],
+    offset: usize,
+) -> SpiceResult<Vec<PhysicalPartial>> {
+    let mut result = vec![PhysicalPartial::Missing; selected.len()];
+    let mut real = vec![CompensatedSum::default(); selected.len()];
+    let mut imaginary = vec![CompensatedSum::default(); selected.len()];
+    for (column, (instance, model, scope, keyword)) in ordered.iter().enumerate() {
+        let value = row.get(column + offset).copied().ok_or_else(|| {
+            SpiceError::circuit("typed sensitivity derivative column count changed")
+        })?;
+        for (slot, wanted) in selected.iter().enumerate() {
+            if wanted.matches(*scope, instance, model.as_deref(), keyword) {
+                if value.is_finite() {
+                    if result[slot] != PhysicalPartial::NonSmooth {
+                        real[slot].add(value.re);
+                        imaginary[slot].add(value.im);
+                        result[slot] = PhysicalPartial::Valid(Complex::ZERO);
+                    }
+                } else {
+                    result[slot] = PhysicalPartial::NonSmooth;
+                }
+            }
+        }
+    }
+    for (slot, partial) in result.iter_mut().enumerate() {
+        if matches!(partial, PhysicalPartial::Valid(_)) {
+            let value = Complex::new(real[slot].total(), imaginary[slot].total());
+            *partial = if value.is_finite() {
+                PhysicalPartial::Valid(value)
+            } else {
+                PhysicalPartial::NonSmooth
+            };
+        }
+    }
+    Ok(result)
 }
 
 /// The frequencies of an AC sweep, exactly as `count_steps()` counts them and
@@ -237,7 +502,7 @@ pub(super) fn parse(arguments: &[String]) -> SpiceResult<SensCard> {
     clippy::suboptimal_flops,
     reason = "count_steps truncates a discrete sweep length: 3 * log10(4.6060996915966586) + 1.01 is 3 separately rounded but 2.9999999999999996 fused"
 )]
-fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
+fn frequencies(sweep: &Sweep) -> SpiceResult<FrequencyPlan> {
     let steps = Real::from(sweep.steps.max(1));
     let (mut low, mut high) = (sweep.start, sweep.stop);
     let (count, factor) = match sweep.stepping {
@@ -281,19 +546,7 @@ fn frequencies(sweep: &Sweep) -> SpiceResult<Vec<Real>> {
         crate::primitives::exact_nonnegative_integer::<usize>(count)
             .ok_or_else(|| unsupported(".sens AC sweep point count is not a valid integer"))?
     };
-    let mut frequencies = Vec::with_capacity(count);
-    let mut frequency = sweep.start;
-    for _ in 0..count {
-        if !(frequency.is_finite() && frequency > 0.) {
-            return Err(unsupported(format!(
-                ".sens AC frequency {frequency} is not positive and finite (C would \
-                 silently use the DC operating-point matrix for a zero frequency)"
-            )));
-        }
-        frequencies.push(frequency);
-        frequency *= factor;
-    }
-    Ok(frequencies)
+    FrequencyPlan::counted(sweep.start, factor, count)
 }
 
 /// `scan()` of `cktsens.c`: `*` matches any run, `?` any one character.
@@ -319,18 +572,6 @@ fn scan(filter: &[u8], name: &[u8]) -> bool {
     n == name.len() && (f == filter.len() || (filter[f] == b'*' && f + 1 == filter.len()))
 }
 
-/// Where the output is read.
-#[derive(Debug, Clone, Copy)]
-enum Probe {
-    Voltage {
-        pos: Option<usize>,
-        neg: Option<usize>,
-    },
-    Current {
-        row: usize,
-    },
-}
-
 impl Probe {
     /// The unknowns the output reads.
     fn rows(&self) -> impl Iterator<Item = usize> {
@@ -340,6 +581,25 @@ impl Probe {
         }
         .into_iter()
         .flatten()
+    }
+
+    /// The exact linear functional `g` for the measured output `g^T x`.
+    /// This is *not* a complex conjugate: sensitivity is a derivative with
+    /// respect to a real parameter in an analytic complex linear system.
+    fn dual(self, n: usize) -> Vector {
+        let mut result = Vector::zeros(n);
+        match self {
+            Self::Voltage { pos, neg } => {
+                if let Some(row) = pos {
+                    result.as_mut_slice()[row] += 1.;
+                }
+                if let Some(row) = neg {
+                    result.as_mut_slice()[row] -= 1.;
+                }
+            }
+            Self::Current { row } => result.as_mut_slice()[row] = 1.,
+        }
+        result
     }
 
     /// Output-scale estimate before subtracting the two voltage terminals.
@@ -356,75 +616,6 @@ impl Probe {
         match self {
             Self::Voltage { .. } => options.vntol,
             Self::Current { .. } => options.abstol,
-        }
-    }
-
-    fn read<T: Copy + std::ops::Sub<Output = T>>(&self, x: &[T], zero: T) -> T {
-        let at = |row: Option<usize>| row.and_then(|row| x.get(row).copied()).unwrap_or(zero);
-        match *self {
-            Self::Voltage { pos, neg } => at(pos) - at(neg),
-            Self::Current { row } => at(Some(row)),
-        }
-    }
-}
-
-fn not_found(message: impl std::fmt::Display) -> SpiceError {
-    SpiceError::Circuit {
-        message: format!("{message} (C: sens_sens in cktsens.c)"),
-    }
-}
-
-fn node_row(circuit: &Circuit, name: &str) -> SpiceResult<Option<usize>> {
-    let canonical = NodeTable::canonical_name(name, circuit.nodes().auto_gnd());
-    let id = circuit.nodes().get(&canonical).ok_or_else(|| {
-        not_found(format_args!(
-            ".sens output node {name} is not in the circuit"
-        ))
-    })?;
-    let row = circuit.unknowns().node_row(id);
-    let ground = circuit
-        .nodes()
-        .node(id)
-        .is_some_and(|node| node.kind == NodeKind::Ground);
-    if row.is_none() && !ground {
-        return Err(not_found(format_args!(
-            ".sens output node {name} has no matrix row"
-        )));
-    }
-    Ok(row)
-}
-
-fn resolve_output(circuit: &Circuit, output: &Output) -> SpiceResult<Probe> {
-    match output {
-        Output::Voltage { pos, neg } => Ok(Probe::Voltage {
-            pos: node_row(circuit, pos)?,
-            neg: match neg {
-                Some(neg) => node_row(circuit, neg)?,
-                None => None,
-            },
-        }),
-        Output::Current { source } => {
-            let device = circuit
-                .devices()
-                .iter()
-                .position(|device| device.name().eq_ignore_ascii_case(source))
-                .ok_or_else(|| {
-                    not_found(format_args!(
-                        ".sens output source {source} is not in the circuit"
-                    ))
-                })?;
-            let branch = circuit.devices()[device].findable_branch().ok_or_else(|| {
-                unsupported(format!(
-                    ".sens i({source}): the device has no findable branch current (only \
-                     independent voltage sources, E/H sources and voltage B sources can be \
-                     sensed, as by CKTfndBranch; C would silently read ground)"
-                ))
-            })?;
-            let row = circuit
-                .branch_rows(device)
-                .and_then(|mut rows| rows.nth(branch))
-                .ok_or_else(|| not_found(format_args!("{source}: missing branch row")))?;
-            Ok(Probe::Current { row })
         }
     }
 }
@@ -1115,19 +1306,19 @@ fn poisoned_rows(
 ) -> SpiceResult<std::collections::BTreeSet<usize>> {
     let n = system.a.rows();
     let entries = || {
-        system
-            .a
-            .triplets()
-            .iter()
-            .map(|t| (t.row, t.col, t.value))
-            .chain(crate::maths::complex::iter_dynamic_terms(
-                &system.e,
-                &system.e_groups,
-                omega,
-            ))
+        let dynamic =
+            crate::maths::complex::iter_dynamic_terms(&system.e, &system.e_groups, omega)?;
+        Ok::<_, SpiceError>(
+            system
+                .a
+                .triplets()
+                .iter()
+                .map(|t| (t.row, t.col, t.value))
+                .chain(dynamic),
+        )
     };
     let mut bad = Vec::new();
-    for (row, col, value) in entries() {
+    for (row, col, value) in entries()? {
         if row >= n || col >= n {
             return Err(SpiceError::Numerical {
                 context: ".sens".into(),
@@ -1141,7 +1332,7 @@ fn poisoned_rows(
     if bad.is_empty() {
         return Ok(std::collections::BTreeSet::new());
     }
-    let blocks = blocks(n, entries().map(|(row, col, _)| (row, col)))?;
+    let blocks = blocks(n, entries()?.map(|(row, col, _)| (row, col)))?;
     let tainted: std::collections::BTreeSet<usize> = bad.iter().map(|&row| blocks[row]).collect();
     Ok((0..n)
         .filter(|&row| tainted.contains(&blocks[row]))
@@ -1174,87 +1365,13 @@ fn perturbation_error(label: &str, error: &SpiceError) -> SpiceError {
     }
 }
 
-/// Residuals are prepared in the original record-walk order, then solved
-/// together. A solve never mutates parameter records or the pivot order.
-struct SensitivityBatch<T> {
-    rhs: Vec<T>,
-    work: SolveBatchWorkspace<T>,
-    solution: Vec<T>,
-    labels: [String; RHS_BATCH_WIDTH],
-    deltas: [Real; RHS_BATCH_WIDTH],
-    count: usize,
-}
-
-impl<T: Copy> SensitivityBatch<T> {
-    fn new() -> Self {
-        Self {
-            rhs: Vec::new(),
-            work: SolveBatchWorkspace::default(),
-            solution: Vec::new(),
-            labels: std::array::from_fn(|_| String::new()),
-            deltas: [0.; RHS_BATCH_WIDTH],
-            count: 0,
-        }
-    }
-
-    fn push(&mut self, rhs: &[T], label: &str, delta: Real) -> SpiceResult<()> {
-        self.rhs.try_reserve(rhs.len()).map_err(|error| {
-            perturbation_error(
-                label,
-                &SpiceError::Numerical {
-                    context: ".sens batch".to_owned(),
-                    message: format!("cannot reserve RHS tile: {error}"),
-                },
-            )
-        })?;
-        self.rhs.extend_from_slice(rhs);
-        self.labels[self.count].clear();
-        self.labels[self.count].push_str(label);
-        self.deltas[self.count] = delta;
-        self.count += 1;
-        Ok(())
-    }
-
-    const fn full(&self) -> bool {
-        self.count == RHS_BATCH_WIDTH
-    }
-
-    fn flush(
-        &mut self,
-        solve: impl FnOnce(
-            &[T],
-            &mut SolveBatchWorkspace<T>,
-            &mut Vec<T>,
-        ) -> Result<(), BatchSolveFailure>,
-        mut emit: impl FnMut(usize, &mut [T], Real),
-    ) -> SpiceResult<()> {
-        let count = std::mem::take(&mut self.count);
-        if count == 0 {
-            return Ok(());
-        }
-        let n = self.rhs.len() / count;
-        let result = solve(&self.rhs, &mut self.work, &mut self.solution);
-        self.rhs.clear();
-        result.map_err(|error| {
-            perturbation_error(&self.labels[error.rhs_index.unwrap_or(0)], &error.cause)
-        })?;
-        for lane in 0..count {
-            emit(
-                lane,
-                &mut self.solution[lane * n..(lane + 1) * n],
-                self.deltas[lane],
-            );
-        }
-        Ok(())
-    }
-}
-
+/// Reusable residual work for one parameter at one fixed operating point.
+/// The objective's adjoint is solved once, rather than one primal system per
+/// parameter. Retain only block masks for nonfinite local physics.
 struct DcAssembly {
     matrix: SparseMatrix,
     rhs: Vector,
     tainted: Vec<bool>,
-    tainted_lanes: [Vec<bool>; RHS_BATCH_WIDTH],
-    batch: SensitivityBatch<Real>,
 }
 
 impl DcAssembly {
@@ -1263,10 +1380,31 @@ impl DcAssembly {
             matrix: SparseMatrix::new(n, n),
             rhs: Vector::zeros(n),
             tainted: Vec::new(),
-            tainted_lanes: std::array::from_fn(|_| Vec::new()),
-            batch: SensitivityBatch::new(),
         }
     }
+}
+
+/// Compensated scalar product, including the low part of every finite
+/// multiplication. The residual stays undivided until the final projection.
+fn projected_real(adjoint: &[Real], residual: &[Real]) -> Real {
+    let mut sum = CompensatedSum::default();
+    for (&weight, &value) in adjoint.iter().zip(residual) {
+        CompensatedSum::with_initial(weight).multiply_into(value, &mut sum);
+    }
+    sum.total()
+}
+
+/// Complex algebraic transpose projection, without conjugation.
+fn projected_complex(adjoint: &[Complex], residual: &[Complex]) -> Complex {
+    let mut real = CompensatedSum::default();
+    let mut imaginary = CompensatedSum::default();
+    for (&weight, &value) in adjoint.iter().zip(residual) {
+        CompensatedSum::with_initial(weight.re).multiply_into(value.re, &mut real);
+        CompensatedSum::with_initial(-weight.im).multiply_into(value.im, &mut real);
+        CompensatedSum::with_initial(weight.re).multiply_into(value.im, &mut imaginary);
+        CompensatedSum::with_initial(weight.im).multiply_into(value.re, &mut imaginary);
+    }
+    Complex::new(real.total(), imaginary.total())
 }
 
 /// Sanitizes the factored solve's RHS while retaining exactly the blocks that
@@ -1285,14 +1423,8 @@ fn mask_nonfinite(rhs: &mut Vector, blocks: &[usize], tainted: &mut Vec<bool>) {
     }
 }
 
-fn restore_nonfinite(solution: &mut [Real], blocks: &[usize], tainted: &[bool]) {
-    if !tainted.is_empty() {
-        for (row, value) in solution.iter_mut().enumerate() {
-            if tainted[blocks[row]] {
-                *value = Real::NAN;
-            }
-        }
-    }
+fn probe_tainted(probe: Probe, blocks: &[usize], tainted: &[bool]) -> bool {
+    !tainted.is_empty() && probe.rows().any(|row| tainted[blocks[row]])
 }
 
 impl DcState<'_> {
@@ -1358,29 +1490,11 @@ impl DcState<'_> {
         Ok(())
     }
 
-    fn flush(
-        &self,
-        scratch: &mut DcAssembly,
-        probe: Probe,
-        point: &mut Vec<Complex>,
-    ) -> SpiceResult<()> {
-        scratch.batch.flush(
-            |rhs, work, solution| {
-                if solve_last_factors_batch_into(&self.pattern, rhs, work, solution)? {
-                    Ok(())
-                } else {
-                    Err(SpiceError::Numerical {
-                        context: ".sens".to_owned(),
-                        message: "the operating point left no factored circuit matrix".to_owned(),
-                    }
-                    .into())
-                }
-            },
-            |lane, solved, delta| {
-                restore_nonfinite(solved, &self.blocks, &scratch.tainted_lanes[lane]);
-                point.push(Complex::real(probe.read(solved, 0.) / delta));
-            },
-        )
+    fn project(&self, scratch: &DcAssembly, probe: Probe, adjoint: &[Real]) -> Real {
+        if probe_tainted(probe, &self.blocks, &scratch.tainted) {
+            return Real::NAN;
+        }
+        projected_real(adjoint, scratch.rhs.as_slice())
     }
 }
 
@@ -1399,16 +1513,14 @@ struct AcAssembly {
     system: LinearSystem,
     rhs: Vec<Complex>,
     perturbed_rhs: Vec<Complex>,
-    batch: SensitivityBatch<Complex>,
 }
 
 impl AcAssembly {
-    fn new(n: usize) -> Self {
+    const fn new(n: usize) -> Self {
         Self {
             system: LinearSystem::new(n),
             rhs: Vec::new(),
             perturbed_rhs: Vec::new(),
-            batch: SensitivityBatch::new(),
         }
     }
 }
@@ -1433,16 +1545,18 @@ impl AcState<'_> {
 
     /// Real contributions, then frequency-scaled dynamic contributions,
     /// with each group's original arithmetic and stamp order.
-    fn stamps<'s>(&self, system: &'s LinearSystem) -> impl Iterator<Item = Stamp> + use<'s> {
-        real_stamps(&system.a).chain(
-            crate::maths::complex::iter_dynamic_terms(&system.e, &system.e_groups, self.omega).map(
-                |(row, col, value)| Stamp {
+    fn stamps<'s>(
+        &self,
+        system: &'s LinearSystem,
+    ) -> SpiceResult<impl Iterator<Item = Stamp> + use<'s>> {
+        Ok(real_stamps(&system.a).chain(
+            crate::maths::complex::iter_dynamic_terms(&system.e, &system.e_groups, self.omega)?
+                .map(|(row, col, value)| Stamp {
                     row,
                     col,
                     value: Complex::new(0., value),
-                },
-            ),
-        )
+                }),
+        ))
     }
 
     fn residual(
@@ -1455,7 +1569,7 @@ impl AcState<'_> {
     ) -> SpiceResult<()> {
         self.assemble(index, base, &mut scratch.system)?;
         scratch.system.ac_rhs_into(&mut scratch.rhs);
-        assembly.add(self.stamps(&scratch.system))?;
+        assembly.add(self.stamps(&scratch.system)?)?;
         let mut assembly = assembly.negate();
         self.assemble(index, perturbed, &mut scratch.system)?;
         scratch.system.ac_rhs_into(&mut scratch.perturbed_rhs);
@@ -1463,7 +1577,7 @@ impl AcState<'_> {
         for (base, perturbed) in scratch.rhs.iter_mut().zip(&scratch.perturbed_rhs) {
             *base = Complex::new(-base.re + perturbed.re, -base.im + perturbed.im);
         }
-        assembly.add(self.stamps(&scratch.system))?;
+        assembly.add(self.stamps(&scratch.system)?)?;
         assembly.visit_products(&self.solution, |row, [mut real, mut imaginary]| {
             let value = &mut scratch.rhs[row];
             real.negate();
@@ -1481,19 +1595,8 @@ impl AcState<'_> {
         Ok(())
     }
 
-    fn flush(
-        &self,
-        scratch: &mut AcAssembly,
-        probe: Probe,
-        point: &mut Vec<Complex>,
-    ) -> SpiceResult<()> {
-        scratch.batch.flush(
-            |rhs, work, solution| self.factors.solve_batch_into(rhs, work, solution, false),
-            |_, solved, delta| {
-                let value = probe.read(solved, Complex::ZERO);
-                point.push(Complex::new(value.re / delta, value.im / delta));
-            },
-        )
+    fn project(scratch: &AcAssembly, adjoint: &[Complex]) -> Complex {
+        projected_complex(adjoint, &scratch.rhs)
     }
 }
 
@@ -1527,17 +1630,17 @@ pub(super) fn run(
     request: &AnalysisPlan,
     context: &AnalysisContext,
     card: &SensCard,
-    grid: Option<&[Real]>,
+    grid: Option<&FrequencyPlan>,
     estimate_resolution: bool,
 ) -> SpiceResult<(Plot, Option<Plot>)> {
     let settings = request.dc_settings();
     let ac = grid.is_some();
     circuit.finalize()?;
     let circuit: &Circuit = circuit;
-    let probe = resolve_output(circuit, &card.output)?;
+    let probe = output_probe::bind(circuit, &card.output, Card::Sens)?.probe;
     let model = context.model_context();
 
-    let mut workspace = ParameterWalk::new(circuit, &model, ac, &card.filters)?;
+    let mut workspace = ParameterWalk::new(circuit, &model, ac, &card.filters, card.physical)?;
     let earlier = if ac {
         earlier_ac_state(circuit, &workspace.members)?
     } else {
@@ -1569,7 +1672,7 @@ pub(super) fn run(
             &solved.values,
             model,
             probe,
-            grid.iter().copied(),
+            grid.values(),
             &mut plot,
         )?;
     } else {
@@ -1596,6 +1699,7 @@ struct ParameterWalk<'a> {
     couplings: Vec<Option<Coupling>>,
     delta: DeltaMatrix,
     resolution: Option<Resolution>,
+    physical: bool,
 }
 
 impl<'a> ParameterWalk<'a> {
@@ -1604,6 +1708,7 @@ impl<'a> ParameterWalk<'a> {
         model: &crate::devices::ModelContext,
         ac: bool,
         filters: &[String],
+        physical: bool,
     ) -> SpiceResult<Self> {
         let (members, records) = members(circuit, model)?;
         let couplings = couplings(circuit, &members, ac)?;
@@ -1621,6 +1726,7 @@ impl<'a> ParameterWalk<'a> {
             couplings,
             delta: DeltaMatrix::new(circuit.unknown_count()),
             resolution: None,
+            physical,
         })
     }
 
@@ -1719,6 +1825,100 @@ impl AcSweep<'_> {
     }
 }
 
+/// One AC frequency's already factored physical and historical parameter
+/// projections. The frequency loop only owns setup and plot lifecycle.
+struct AcRow<'a, 's, 'c> {
+    sweep: &'a AcSweep<'s>,
+    reset: &'a Records,
+    at: Option<&'a AcState<'c>>,
+    adjoint: Option<&'a [Complex]>,
+    omega: Real,
+}
+
+impl AcRow<'_, '_, '_> {
+    fn evaluate(
+        &self,
+        walk: &mut ParameterWalk<'_>,
+        scratch: &mut AcAssembly,
+        point: &mut Vec<Complex>,
+        resolution: &mut Option<(Real, Vec<Complex>)>,
+    ) -> SpiceResult<()> {
+        let Self {
+            sweep,
+            reset,
+            at,
+            adjoint,
+            omega,
+        } = *self;
+        let circuit = walk.circuit;
+        if walk.physical {
+            let responses = walk.sweep_physical(
+                |slot, member, setup, current| {
+                    sweep.load(
+                        circuit,
+                        member,
+                        reset.view(member, slot),
+                        setup,
+                        current,
+                        omega,
+                    )
+                },
+                |assembly, index, base, perturbed, _, label| {
+                    let Some(at) = &at else {
+                        return Ok(Complex::new(Real::NAN, Real::NAN));
+                    };
+                    at.residual(assembly, scratch, index, base, perturbed)
+                        .map_err(|error| perturbation_error(label, &error))?;
+                    Ok(AcState::project(
+                        scratch,
+                        adjoint
+                            .ok_or_else(|| SpiceError::circuit("missing AC sensitivity adjoint"))?,
+                    ))
+                },
+            )?;
+            for (derivative, span) in responses {
+                point.push(derivative);
+                if let Some((floor, row)) = resolution.as_mut() {
+                    row.push(Complex::real(*floor / span.abs()));
+                }
+            }
+        } else {
+            let walked = walk.sweep(
+                |slot, member, setup, current| {
+                    sweep.load(
+                        circuit,
+                        member,
+                        reset.view(member, slot),
+                        setup,
+                        current,
+                        omega,
+                    )
+                },
+                |assembly, index, base, perturbed, delta, label| {
+                    if let Some((floor, row)) = resolution.as_mut() {
+                        row.push(Complex::real(*floor / delta.abs()));
+                    }
+                    let Some(at) = &at else {
+                        point.push(Complex::new(Real::NAN, Real::NAN));
+                        return Ok(());
+                    };
+                    at.residual(assembly, scratch, index, base, perturbed)
+                        .map_err(|error| perturbation_error(label, &error))?;
+                    let value = AcState::project(
+                        scratch,
+                        adjoint
+                            .ok_or_else(|| SpiceError::circuit("missing AC sensitivity adjoint"))?,
+                    );
+                    point.push(Complex::new(value.re / delta, value.im / delta));
+                    Ok(())
+                },
+            );
+            walked?;
+        }
+        Ok(())
+    }
+}
+
 fn run_ac(
     walk: &mut ParameterWalk<'_>,
     earlier: &EarlierAcState,
@@ -1772,6 +1972,18 @@ fn run_ac(
                 &sweep.state,
             )?)
         };
+        let adjoint = at
+            .as_ref()
+            .map(|at| {
+                let rhs: Vec<_> = probe
+                    .dual(circuit.unknown_count())
+                    .as_slice()
+                    .iter()
+                    .map(|&value| Complex::real(value))
+                    .collect();
+                at.factors.solve_transposed(&rhs)
+            })
+            .transpose()?;
         let mut point = Vec::with_capacity(plot.variables().len());
         point.push(Complex::real(frequency));
         let mut resolution = walk.resolution.as_ref().map(|resolution| {
@@ -1783,40 +1995,14 @@ fn run_ac(
             row.push(Complex::ZERO); // frequency is not a derivative
             (floor, row)
         });
-        let walked = walk.sweep(
-            |slot, member, setup, current| {
-                sweep.load(
-                    circuit,
-                    member,
-                    reset.view(member, slot),
-                    setup,
-                    current,
-                    omega,
-                )
-            },
-            |assembly, index, base, perturbed, delta, label| {
-                if let Some((floor, row)) = &mut resolution {
-                    row.push(Complex::real(*floor / delta.abs()));
-                }
-                let Some(at) = &at else {
-                    point.push(Complex::new(Real::NAN, Real::NAN));
-                    return Ok(());
-                };
-                at.residual(assembly, &mut scratch, index, base, perturbed)
-                    .map_err(|error| perturbation_error(label, &error))?;
-                scratch.batch.push(&scratch.rhs, label, delta)?;
-                if scratch.batch.full() {
-                    at.flush(&mut scratch, probe, &mut point)?;
-                }
-                Ok(())
-            },
-        );
-        // A pending earlier solve must report its own failure before a
-        // later parameter load/restoration error can escape the walk.
-        if let Some(at) = &at {
-            at.flush(&mut scratch, probe, &mut point)?;
+        AcRow {
+            sweep: &sweep,
+            reset: &reset,
+            at: at.as_ref(),
+            adjoint: adjoint.as_deref(),
+            omega,
         }
-        walked?;
+        .evaluate(walk, &mut scratch, &mut point, &mut resolution)?;
         plot.push_point(&point)?;
         if let (Some(resolution), Some((_, row))) = (&mut walk.resolution, resolution) {
             resolution.plot.push_point(&row)?;
@@ -1878,30 +2064,58 @@ fn run_dc(
         trial,
         circuit,
     };
+    let adjoint = solve_last_factors_transposed(&at.pattern, &probe.dual(n))?.ok_or_else(|| {
+        SpiceError::Numerical {
+            context: ".sens".to_owned(),
+            message: "the operating point left no factored circuit matrix".to_owned(),
+        }
+    })?;
     let mut point = Vec::with_capacity(plot.variables().len());
     let mut scratch = DcAssembly::new(n);
     let mut resolution = walk
         .resolution
         .as_ref()
         .map(|resolution| resolution.row(probe, &at.solution));
-    let walked = walk.sweep(
-        |_, member, setup, current| member.sensitivity.load(setup, current, SensitivityMode::Dc),
-        |assembly, index, base, perturbed, delta, label| {
+    if walk.physical {
+        let responses = walk.sweep_physical(
+            |_, member, setup, current| {
+                member.sensitivity.load(setup, current, SensitivityMode::Dc)
+            },
+            |assembly, index, base, perturbed, _, label| {
+                at.residual(assembly, &mut scratch, index, base, perturbed)
+                    .map_err(|error| perturbation_error(label, &error))?;
+                Ok(Complex::real(at.project(
+                    &scratch,
+                    probe,
+                    adjoint.as_slice(),
+                )))
+            },
+        )?;
+        for (derivative, span) in responses {
+            point.push(derivative);
             if let Some((floor, row)) = &mut resolution {
-                row.push(Complex::real(*floor / delta.abs()));
+                row.push(Complex::real(*floor / span.abs()));
             }
-            at.residual(assembly, &mut scratch, index, base, perturbed)
-                .map_err(|error| perturbation_error(label, &error))?;
-            scratch.tainted_lanes[scratch.batch.count].clone_from(&scratch.tainted);
-            scratch.batch.push(scratch.rhs.as_slice(), label, delta)?;
-            if scratch.batch.full() {
-                at.flush(&mut scratch, probe, &mut point)?;
-            }
-            Ok(())
-        },
-    );
-    at.flush(&mut scratch, probe, &mut point)?;
-    walked?;
+        }
+    } else {
+        let walked = walk.sweep(
+            |_, member, setup, current| {
+                member.sensitivity.load(setup, current, SensitivityMode::Dc)
+            },
+            |assembly, index, base, perturbed, delta, label| {
+                if let Some((floor, row)) = &mut resolution {
+                    row.push(Complex::real(*floor / delta.abs()));
+                }
+                at.residual(assembly, &mut scratch, index, base, perturbed)
+                    .map_err(|error| perturbation_error(label, &error))?;
+                point.push(Complex::real(
+                    at.project(&scratch, probe, adjoint.as_slice()) / delta,
+                ));
+                Ok(())
+            },
+        );
+        walked?;
+    }
     plot.push_point(&point)?;
     if let (Some(resolution), Some((_, row))) = (&mut walk.resolution, resolution) {
         resolution.plot.push_point(&row)?;
@@ -1941,6 +2155,106 @@ fn setup_elements(
             Ok(mapped)
         },
     )
+}
+
+impl ParameterWalk<'_> {
+    /// Physical smooth-parameter partials at one fixed operating point.
+    ///
+    /// Each trial has independent record storage, so the model's C-style
+    /// `given` transitions and previous perturbations cannot leak into a
+    /// physical derivative. The same physical load, residual assembler and
+    /// adjoint projection are used as the historical walk; only the numeric
+    /// parameter policy changes. Unrepresentable/nonsmooth local variations
+    /// emit NaN without silently switching to C's finite record transition.
+    fn sweep_physical(
+        &mut self,
+        load: impl Fn(
+            usize,
+            &Member<'_>,
+            RecordPair<'_>,
+            RecordPair<'_>,
+        ) -> SpiceResult<SensitivityLoad>,
+        mut measure: impl FnMut(
+            BaseAssembly<'_>,
+            usize,
+            &SensitivityLoad,
+            &SensitivityLoad,
+            Real,
+            &str,
+        ) -> SpiceResult<Complex>,
+    ) -> SpiceResult<Vec<(Complex, Real)>> {
+        let mut response = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let Some(label) = entry.name.as_deref() else {
+                continue;
+            };
+            let member = &self.members[entry.member];
+            let device = &member.sensitivity;
+            mirror(&self.couplings, &mut self.records, entry.member)?;
+            let (model, instance) = self.records.pair(member, entry.member);
+            let parameter =
+                device.ask(entry.scope, entry.keyword, RecordPair { model, instance })?;
+            // The candidate is isolated from the historical mutable record
+            // sequence. A new candidate never inherits a previous setter.
+            let (mut model, mut instance) = (model.clone(), instance.clone());
+            device.setup(&mut model, &mut instance)?;
+            device.temperature(&mut model, &mut instance)?;
+            let setup = RecordPair {
+                model: &model,
+                instance: &instance,
+            };
+            let base_elements = device.setup_elements(setup)?;
+            let elements = setup_elements(self.circuit, member.index, base_elements.clone())?;
+            let base = load(entry.member, member, setup, setup)?;
+            let result = conditioned_derivative(parameter, |point| {
+                let (mut candidate_model, mut candidate_instance) =
+                    (model.clone(), instance.clone());
+                if device
+                    .set(
+                        entry.scope,
+                        entry.keyword,
+                        point,
+                        &mut candidate_model,
+                        &mut candidate_instance,
+                    )
+                    .is_err()
+                {
+                    return Ok(None);
+                }
+                if device
+                    .setup(&mut candidate_model, &mut candidate_instance)
+                    .is_err()
+                    || device
+                        .temperature(&mut candidate_model, &mut candidate_instance)
+                        .is_err()
+                {
+                    return Ok(None);
+                }
+                let candidate = RecordPair {
+                    model: &candidate_model,
+                    instance: &candidate_instance,
+                };
+                // A changed setup element pattern is a topology transition,
+                // not a differentiable scalar device contribution.
+                if device.setup_elements(candidate)? != base_elements {
+                    return Ok(None);
+                }
+                let perturbed = load(entry.member, member, setup, candidate)?;
+                let assembly = self.delta.begin(elements.iter().copied())?;
+                measure(
+                    assembly,
+                    member.index,
+                    &base,
+                    &perturbed,
+                    point - parameter,
+                    label,
+                )
+                .map(Some)
+            })?;
+            response.push(result.unwrap_or((Complex::new(Real::NAN, Real::NAN), Real::NAN)));
+        }
+        Ok(response)
+    }
 }
 
 impl ParameterWalk<'_> {
@@ -2038,6 +2352,44 @@ mod tests {
 
     const fn stamp(row: usize, col: usize, value: crate::primitives::Complex) -> super::Stamp {
         super::Stamp { row, col, value }
+    }
+
+    #[test]
+    fn conditioned_steps_are_representable_and_refine_smooth_limits() {
+        use super::{Complex, conditioned_derivative};
+        let reference = |x: f64| x.mul_add(x, 2. * x);
+        let p = 0.;
+        let (value, span) = conditioned_derivative(p, |point| {
+            Ok(Some(Complex::real(reference(point) - reference(p))))
+        })
+        .unwrap()
+        .unwrap();
+        assert!((value.re - 2.).abs() < 1e-11);
+        assert!(span > 0. && span.is_finite());
+
+        // Negative values are outside the domain; extrapolate actual
+        // representable one-sided slopes instead of stepping across zero.
+        let (value, _) = conditioned_derivative(p, |point| {
+            Ok((point >= 0.).then(|| Complex::real(reference(point) - reference(p))))
+        })
+        .unwrap()
+        .unwrap();
+        assert!((value.re - 2.).abs() < 1e-11);
+
+        // A large, non-power-of-two coordinate gets actual binary64 spans,
+        // not its rounded nominal perturbation as the denominator.
+        let p = 1_000_000_000_000.125;
+        let (value, _) =
+            conditioned_derivative(p, |point| Ok(Some(Complex::real(3. * (point - p)))))
+                .unwrap()
+                .unwrap();
+        assert!((value.re - 3.).abs() < 1e-12);
+        // A central secant across a cusp would be a fake zero derivative.
+        assert!(
+            conditioned_derivative(0., |point| { Ok(Some(Complex::real(point.abs()))) })
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2243,7 +2595,7 @@ mod tests {
 
     #[test]
     fn dc_nonfinite_mask_is_block_local_and_reset_between_parameters() {
-        use super::{blocks, mask_nonfinite, restore_nonfinite};
+        use super::{Probe, blocks, mask_nonfinite, probe_tainted};
         use crate::maths::Vector;
 
         let blocks = blocks(5, [(0, 2), (2, 1), (3, 4)]).unwrap();
@@ -2252,15 +2604,21 @@ mod tests {
         mask_nonfinite(&mut rhs, &blocks, &mut tainted);
         assert_eq!(rhs.as_slice(), &[1., 0., -0., 3., 4.]);
         assert_eq!(rhs.as_slice()[2].to_bits(), (-0_f64).to_bits());
-        let mut solved = Vector::from_slice(&[1., 2., 3., 4., 5.]);
-        restore_nonfinite(solved.as_mut_slice(), &blocks, &tainted);
-        assert!(solved.as_slice()[..3].iter().all(|x| x.is_nan()));
-        assert_eq!(solved.as_slice()[3..], [4., 5.]);
+        assert!(probe_tainted(Probe::Current { row: 0 }, &blocks, &tainted));
+        assert!(!probe_tainted(Probe::Current { row: 3 }, &blocks, &tainted));
+        assert!(probe_tainted(
+            Probe::Voltage {
+                pos: Some(4),
+                neg: Some(2)
+            },
+            &blocks,
+            &tainted
+        ));
         let capacity = tainted.capacity();
         mask_nonfinite(&mut rhs, &blocks, &mut tainted);
         assert!(tainted.is_empty());
         assert_eq!(tainted.capacity(), capacity);
-        restore_nonfinite(rhs.as_mut_slice(), &blocks, &tainted);
+        assert!(!probe_tainted(Probe::Current { row: 0 }, &blocks, &tainted));
         assert!(rhs.is_finite());
     }
 
@@ -2363,12 +2721,21 @@ mod tests {
                 .sweep
                 .unwrap()
         };
-        let f = frequencies(&sweep("dec 1 1k 100k")).unwrap();
+        let f: Vec<_> = frequencies(&sweep("dec 1 1k 100k"))
+            .unwrap()
+            .values()
+            .collect();
         assert_eq!(f.len(), 3);
         assert_eq!(f[0], 1e3);
         assert!((f[2] / 1e5 - 1.).abs() < 1e-12);
         // `lin` multiplies by (fstop - fstart)/pts (C's inc_freq defect).
-        assert_eq!(frequencies(&sweep("lin 2 1k 2k")).unwrap(), [1e3, 5e5]);
+        assert_eq!(
+            frequencies(&sweep("lin 2 1k 2k"))
+                .unwrap()
+                .values()
+                .collect::<Vec<_>>(),
+            [1e3, 5e5]
+        );
         // `oct` divides by M_LOG2E: 1 per octave over 1..16 gives 2 points.
         assert_eq!(frequencies(&sweep("oct 1 1 16")).unwrap().len(), 2);
         assert!(frequencies(&sweep("lin 2 1k 1k")).is_err());
