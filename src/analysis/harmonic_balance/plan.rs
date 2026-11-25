@@ -49,13 +49,13 @@ pub struct Harmonic {
 
 impl Harmonic {
     /// Integer coefficients of the independent fundamentals.
-    #[must_use]
+    #[must_use = "the integer coefficients identify this harmonic in the independent phase lattice"]
     pub fn indices(&self) -> &[i32] {
         &self.indices
     }
 
     /// Positive physical frequency in hertz.
-    #[must_use]
+    #[must_use = "the physical frequency is needed for derivative scaling and spectral output"]
     pub const fn frequency(&self) -> Real {
         self.frequency
     }
@@ -258,25 +258,25 @@ impl HarmonicLattice {
     }
 
     /// Independent phase axes.
-    #[must_use]
+    #[must_use = "the returned axes define the independent fundamental frequencies"]
     pub fn axes(&self) -> &[ToneAxis] {
         &self.axes
     }
 
     /// Positive-frequency harmonics in increasing physical-frequency order.
-    #[must_use]
+    #[must_use = "the returned ordered harmonics define the positive-frequency portion of the Fourier basis"]
     pub fn harmonics(&self) -> &[Harmonic] {
         &self.harmonics
     }
 
     /// Number of real Fourier coordinates per MNA row.
-    #[must_use]
+    #[must_use = "the coordinate count determines the Fourier storage required per MNA unknown"]
     pub const fn coordinates(&self) -> usize {
         1 + self.harmonics.len() * 2
     }
 
     /// Number of phase collocation samples.
-    #[must_use]
+    #[must_use = "the sample count determines the size of the collocation grid"]
     pub const fn samples(&self) -> usize {
         self.samples
     }
@@ -298,7 +298,7 @@ impl HarmonicLattice {
 
     /// Find the positive harmonic matching a physical source frequency.
     /// Returns its index in the positive-frequency list, not a coordinate.
-    #[must_use]
+    #[must_use = "the returned option determines whether a source frequency belongs to this harmonic lattice"]
     pub fn locate(&self, frequency: Real) -> Option<usize> {
         if !frequency.is_finite() || frequency <= 0. {
             return None;

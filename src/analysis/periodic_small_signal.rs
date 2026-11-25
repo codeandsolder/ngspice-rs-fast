@@ -23,13 +23,13 @@ pub struct Sideband {
 
 impl Sideband {
     /// Integer offsets along the pump axes in lattice order.
-    #[must_use]
+    #[must_use = "the returned integer offsets identify a sideband in the pump lattice"]
     pub fn indices(&self) -> &[i32] {
         &self.indices
     }
 
     /// Signed physical frequency, in hertz.
-    #[must_use]
+    #[must_use = "the signed physical frequency determines the complex derivative contribution of this sideband"]
     pub const fn frequency(&self) -> Real {
         self.frequency
     }
@@ -114,13 +114,13 @@ impl SidebandPlan {
     }
 
     /// Signed probe frequency, before pump offsets.
-    #[must_use]
+    #[must_use = "the returned signed probe is the reference frequency before pump offsets"]
     pub const fn probe(&self) -> Real {
         self.probe
     }
 
     /// Ascending signed sideband coordinates.
-    #[must_use]
+    #[must_use = "the returned ordering defines the response's sideband coordinates"]
     pub fn bands(&self) -> &[Sideband] {
         &self.bands
     }
@@ -128,7 +128,7 @@ impl SidebandPlan {
     /// Whether the opposite-probe sector contains an overlapping frequency.
     /// Real-signal power or noise cannot be counted as independent sectors
     /// in this case; their coherent amplitudes must first be combined.
-    #[must_use]
+    #[must_use = "discarding this result can lead to independent power counting of coherent overlapping sectors"]
     pub const fn conjugate_overlap(&self) -> bool {
         self.conjugate_overlap
     }
@@ -168,7 +168,7 @@ impl SidebandPlan {
     }
 
     /// Locate the exact integer pump offset (not an approximate Hz key).
-    #[must_use]
+    #[must_use = "the returned option distinguishes an exact pump offset from a sideband outside the plan"]
     pub fn locate(&self, indices: &[i32]) -> Option<usize> {
         self.bands.iter().position(|band| band.indices == indices)
     }
@@ -349,13 +349,13 @@ impl<'a> PeriodicLinearization<'a> {
     }
 
     /// Rechecked maximum normalized physical HB residual.
-    #[must_use]
+    #[must_use = "the returned normalized residual is needed to assess the physical HB linearization point"]
     pub const fn scaled_residual(&self) -> Real {
         self.spectrum.scaled_residual
     }
 
     /// Immutable native RF port bindings.
-    #[must_use]
+    #[must_use = "the returned bindings identify the physical RF terminals used for excitation and observation"]
     pub fn ports(&self) -> &[PeriodicPort] {
         &self.ports
     }
@@ -434,31 +434,31 @@ pub struct PeriodicResponse<'a> {
 
 impl PeriodicResponse<'_> {
     /// Signed frequencies and integer offsets of this response.
-    #[must_use]
+    #[must_use = "the returned plan maps response coordinates to signed frequencies and integer offsets"]
     pub fn plan(&self) -> &SidebandPlan {
         &self.snapshot.plan
     }
 
     /// Actual sparse numeric factor storage, including any fill.
-    #[must_use]
+    #[must_use = "the returned counts measure numeric factor memory including structural fill"]
     pub fn factor_storage(&self) -> crate::maths::FactorStorage {
         self.snapshot.factor.factor_storage()
     }
 
     /// True when both responses share the same immutable numeric factors.
-    #[must_use]
+    #[must_use = "the result establishes whether two responses actually reuse the same immutable factor snapshot"]
     pub fn shares_factor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.snapshot, &other.snapshot)
     }
 
     /// Physical matrix order before expanding sidebands.
-    #[must_use]
+    #[must_use = "the returned count identifies the original MNA dimension before spectral expansion"]
     pub const fn physical_unknowns(&self) -> usize {
         self.linearization.spectrum.unknowns
     }
 
     /// Expanded complex matrix order.
-    #[must_use]
+    #[must_use = "the returned count determines the expanded complex response dimension"]
     pub const fn unknowns(&self) -> usize {
         self.linearization.spectrum.unknowns * self.linearization.spectrum.width
     }
