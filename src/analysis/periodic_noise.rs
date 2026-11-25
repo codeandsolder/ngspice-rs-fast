@@ -574,11 +574,9 @@ fn add_native_band<'a>(
         for (source, outputs) in generators.zip(sums.chunks_exact_mut(phases.outputs)) {
             let terms = source.periodic_amplitudes(frequency)?;
             for (sum, adjoint) in outputs.iter_mut().zip(adjoints.chunks_exact(phases.rows)) {
-                let value = terms
-                    .into_iter()
-                    .fold(Complex::ZERO, |sum, (row, amplitude)| {
-                        row.map_or(sum, |row| sum + adjoint[row] * amplitude)
-                    });
+                let value = terms.clone().fold(Complex::ZERO, |sum, (row, amplitude)| {
+                    row.map_or(sum, |row| sum + adjoint[row] * amplitude)
+                });
                 sum.add(value * weight);
             }
         }

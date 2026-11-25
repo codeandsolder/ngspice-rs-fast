@@ -417,10 +417,17 @@ fn instance_overrides_are_bounded_per_context() {
     let area = c.instance_override("d1", "area", 2., &base).unwrap();
     assert_eq!(
         (area.device(), area.parameter(), area.value()),
-        (1, "area", 2.)
+        (
+            1,
+            ngspice_rs::devices::sweep::ParameterKey::Native("area"),
+            2.
+        )
     );
     let pj = c.instance_override("D1", "PERIM", 1., &base).unwrap();
-    assert_eq!(pj.parameter(), "pj");
+    assert_eq!(
+        pj.parameter(),
+        ngspice_rs::devices::sweep::ParameterKey::Native("pj")
+    );
     let context = base
         .with_instance_override(area)
         .unwrap()

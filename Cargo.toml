@@ -80,7 +80,7 @@ members = ["xtask", "conformance/support"]
 [workspace.package]
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.99"
 license = "BSD-3-Clause"
 repository = "https://github.com/codeandsolder/ngspice-rs-fast"
 
@@ -106,9 +106,11 @@ petgraph = "0.8.3"
 [dependencies]
 winnow.workspace = true
 petgraph.workspace = true
+model-kernel-api = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8463b7197d404fdee7b024cd1ce83130e362d683" }
 
 [dev-dependencies]
 ngspice-conformance = { path = "conformance/support" }
+model-kernel-vdmos = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8463b7197d404fdee7b024cd1ce83130e362d683" }
 
 [workspace.lints.rust]
 missing_docs = "warn"

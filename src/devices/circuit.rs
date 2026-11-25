@@ -34,7 +34,9 @@ use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
 use crate::devices::state::{
     DeviceState, HistoryPublication, StateHistory, StateSnapshot, TrialState,
 };
-use crate::devices::sweep::{InstanceOverride, InstanceTarget, ResistorMetadata, ResistorOverride};
+use crate::devices::sweep::{
+    InstanceOverride, InstanceTarget, ParameterKey, ResistorMetadata, ResistorOverride,
+};
 use crate::devices::traits::{
     AcceptContext, AnalysisMode, Device, InductanceValue, MnaUnknowns, MutualTerm, StampContext,
     StampRhs,
@@ -172,6 +174,7 @@ struct TopologyBindings {
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
     stochastic_sources: Vec<usize>,
+    prepared_devices: Vec<usize>,
     mutual: MutualBinding,
     identity: Option<TopologyId>,
 }
@@ -392,6 +395,8 @@ pub(super) struct PreparedPoint {
     context: ModelContext,
     replacements: Vec<(usize, Box<dyn Device>)>,
     mutual: std::cell::OnceCell<PreparedMutualTerms>,
+    prepared_batches:
+        std::cell::OnceCell<std::cell::RefCell<crate::devices::prepared_model::batch::Plan>>,
 }
 
 fn effective_device<'a>(
@@ -410,6 +415,29 @@ fn effective_device<'a>(
 impl PreparedPoint {
     pub(super) fn device<'a>(&'a self, circuit: &'a Circuit, ordinal: usize) -> &'a dyn Device {
         effective_device(circuit, &self.replacements, ordinal)
+    }
+
+    fn batches(
+        &self,
+        circuit: &Circuit,
+    ) -> SpiceResult<std::cell::RefMut<'_, crate::devices::prepared_model::batch::Plan>> {
+        if self.prepared_batches.get().is_none() {
+            let plan = crate::devices::prepared_model::batch::Plan::new(
+                circuit.devices.len(),
+                circuit
+                    .bindings
+                    .prepared_devices
+                    .iter()
+                    .copied()
+                    .map(|index| (index, self.device(circuit, index))),
+            )?;
+            let _ = self.prepared_batches.set(std::cell::RefCell::new(plan));
+        }
+        self.prepared_batches
+            .get()
+            .ok_or_else(|| SpiceError::circuit("missing prepared batch plan"))?
+            .try_borrow_mut()
+            .map_err(|_| SpiceError::circuit("prepared batch plan already active"))
     }
 
     pub(super) fn mutual(&self, circuit: &Circuit) -> SpiceResult<PreparedMutualTerms> {
@@ -444,11 +472,26 @@ impl<'a> PreparedRun<'a> {
         #[cfg(test)]
         preparation_metrics::record(|counts| counts.contexts += 1);
         context.validate(&MODEL_CONTEXT_LOCATION)?;
-        let replacements = self.circuit.replacements(context)?;
+        let mut replacements = self.circuit.replacements(context)?;
+        for &index in &self.circuit.bindings.prepared_devices {
+            match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
+                Ok(slot) => {
+                    if let Some(device) = replacements[slot].1.reprepare_context(context)? {
+                        replacements[slot].1 = device;
+                    }
+                }
+                Err(slot) => {
+                    if let Some(device) = self.circuit.devices[index].reprepare_context(context)? {
+                        replacements.insert(slot, (index, device));
+                    }
+                }
+            }
+        }
         self.point.replace(Some(PreparedPoint {
             context: *context,
             replacements,
             mutual: std::cell::OnceCell::new(),
+            prepared_batches: std::cell::OnceCell::new(),
         }));
         std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
             .map_err(|_| SpiceError::circuit("missing prepared model context"))
@@ -999,10 +1042,12 @@ fn ordered_control_targets(
     let mut unique = BTreeMap::new();
     for (order, target) in targets.into_iter().enumerate() {
         let value = match target {
-            CandidateNumericOverride::Resistor(value) => {
-                InstanceTarget::new(value.topology(), value.device(), "resistance")
-                    .at(value.supplied())?
-            }
+            CandidateNumericOverride::Resistor(value) => InstanceTarget::new(
+                value.topology(),
+                value.device(),
+                ParameterKey::Native("resistance"),
+            )
+            .at(value.supplied())?,
             CandidateNumericOverride::Instance(value) => value,
         };
         unique.insert((value.device(), value.parameter()), (order, value));
@@ -1739,6 +1784,13 @@ impl Circuit {
             .enumerate()
             .filter_map(|(ordinal, device)| device.has_stochastic_source().then_some(ordinal))
             .collect();
+        self.bindings.prepared_devices = self
+            .bindings
+            .order
+            .iter()
+            .copied()
+            .filter(|&index| self.devices[index].prepared_batch_key().is_some())
+            .collect();
         self.bindings.names = names;
         self.bindings.identity = Some(TopologyId::allocate()?);
         Ok(())
@@ -2470,7 +2522,7 @@ impl Circuit {
         &self,
         name: &str,
         keyword: &str,
-    ) -> SpiceResult<(usize, &'static str)> {
+    ) -> SpiceResult<(usize, ParameterKey)> {
         let Some(index) = self.device_index(name) else {
             return Err(SpiceError::Unsupported {
                 feature: format!("DC sweep parameter target: no instance named {name}"),
@@ -2478,7 +2530,7 @@ impl Circuit {
             });
         };
         let device = &self.devices[index];
-        if let Some(parameter) = device.instance_parameter(keyword) {
+        if let Some(parameter) = device.bind_numeric_parameter(keyword) {
             return Ok((index, parameter));
         }
         if crate::devices::sweep::c_instance_parameter_known(device.designator(), keyword) {
@@ -2515,11 +2567,7 @@ impl Circuit {
         context: &ModelContext,
     ) -> SpiceResult<InstanceOverride> {
         let target = self.bind_instance_override(name, keyword, value)?;
-        self.devices[target.device()].with_instance_parameter(
-            target.parameter(),
-            value,
-            context,
-        )?;
+        self.devices[target.device()].with_bound_parameter(target.parameter(), value, context)?;
         Ok(target)
     }
 
@@ -2548,7 +2596,7 @@ impl Circuit {
         Ok(InstanceTarget::new(
             self.topology_id()?,
             index,
-            "resistance",
+            ParameterKey::Native("resistance"),
         ))
     }
 
@@ -2589,7 +2637,11 @@ impl Circuit {
             .ok_or_else(|| SpiceError::circuit("invalid or unknown DC source override"))?;
         #[cfg(test)]
         preparation_metrics::record(|counts| counts.bindings += 1);
-        Ok(InstanceTarget::new(self.topology_id()?, index, "dc"))
+        Ok(InstanceTarget::new(
+            self.topology_id()?,
+            index,
+            ParameterKey::Native("dc"),
+        ))
     }
 
     pub(crate) fn bind_source_override(
@@ -2911,7 +2963,7 @@ impl Circuit {
                 if value.topology() != topology {
                     return Err(SpiceError::circuit("foreign or stale instance override"));
                 }
-                original.with_instance_parameter(value.parameter(), value.value(), context)?
+                original.with_bound_parameter(value.parameter(), value.value(), context)?
             }
         };
         #[cfg(test)]
@@ -2998,7 +3050,7 @@ impl Circuit {
                     preparation_metrics::record(|counts| counts.setters += 1);
                     if let Some(index) = device_slots.get(&ordinal).copied() {
                         let previous = replacements[index].1.as_ref();
-                        replacements[index].1 = previous.with_instance_parameter(
+                        replacements[index].1 = previous.with_bound_parameter(
                             value.parameter(),
                             value.value(),
                             context,
@@ -3007,7 +3059,7 @@ impl Circuit {
                         device_slots.insert(ordinal, replacements.len());
                         replacements.push((
                             ordinal,
-                            original.with_instance_parameter(
+                            original.with_bound_parameter(
                                 value.parameter(),
                                 value.value(),
                                 context,
@@ -3156,6 +3208,8 @@ impl Circuit {
         voltage_source_value: &mut Real,
         mut ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
+        let mut batches = point.batches(self)?;
+        batches.begin();
         for (position, index) in self.load_order().enumerate() {
             let device = point.device(self, index);
             let states = request.history.device_of(trial, index)?.with_ltra(
@@ -3185,7 +3239,11 @@ impl Circuit {
                 source_factor: request.model_context.source_factor,
                 voltage_source_value: &mut *voltage_source_value,
             };
-            device.stamp(&mut context)?;
+            if let Some(output) = batches.point(index, &self.bindings.unknowns, request.solution)? {
+                device.stamp_prepared(&mut context, &output)?;
+            } else {
+                device.stamp(&mut context)?;
+            }
         }
         Ok(())
     }
@@ -3846,6 +3904,8 @@ impl Circuit {
         })?;
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
+        let mut batches = point.batches(self)?;
+        batches.begin();
         for index in self.load_order() {
             let device = point.device(self, index);
             let range = &self.bindings.branch_rows[index];
@@ -3873,7 +3933,9 @@ impl Circuit {
                 linear.system.a.triplets().len(),
                 linear.system.e.triplets().len(),
             );
-            if pole_zero_setups > 0 {
+            if let Some(output) = batches.point(index, &self.bindings.unknowns, bias)? {
+                device.assemble_prepared(&mut linear, &output)?;
+            } else if pole_zero_setups > 0 {
                 device.assemble_pole_zero(&mut linear, bias)?;
             } else {
                 device.assemble_small_signal(&mut linear, bias)?;

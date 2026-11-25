@@ -53,6 +53,10 @@ pub(in crate::devices) struct Coefficients {
 }
 
 impl Coefficients {
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "preserve C passive model arithmetic and separate rounding"
+    )]
     const fn resistor(self, difference: Real) -> Real {
         ((self.quadratic * difference) + self.linear) * difference + 1.
     }
@@ -68,6 +72,10 @@ impl Coefficients {
         )
     }
 
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "preserve C passive model arithmetic and separate rounding"
+    )]
     pub(in crate::devices) const fn reactive(self, difference: Real) -> Real {
         1. + self.linear * difference + self.quadratic * difference * difference
     }
@@ -94,6 +102,10 @@ pub(in crate::devices) struct SheetGeometry {
 }
 
 impl SheetGeometry {
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "preserve C passive model arithmetic and separate rounding"
+    )]
     pub(in crate::devices) const fn dimensions(self) -> (Real, Real) {
         (self.length - 2. * self.short, self.width - 2. * self.narrow)
     }
@@ -152,6 +164,10 @@ impl CapacitorGeometry {
         (length - self.short, width - self.narrow)
     }
 
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "preserve C passive model arithmetic and separate rounding"
+    )]
     pub(in crate::devices) const fn capacitance(self, length: Real, width: Real) -> Real {
         let (length, width) = self.dimensions(length, width);
         self.cj * width * length + self.cjsw * 2. * (length + width)

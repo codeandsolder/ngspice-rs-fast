@@ -102,6 +102,16 @@ impl ResistorOverride {
 /// can override at once (a two-axis `.dc` can sweep two `@inst[param]` targets).
 pub const MAX_INSTANCE_OVERRIDES: usize = 2;
 
+/// A bound instance setter. Native families have compile-time canonical
+/// names; prepared families bind a descriptor ordinal, never a runtime string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ParameterKey {
+    /// Canonical setter of an in-tree device.
+    Native(&'static str),
+    /// Stable parameter ordinal of an immutable prepared artifact.
+    Prepared(usize),
+}
+
 /// A value-independent instance parameter binding in a finalized topology.
 ///
 /// The canonical keyword comes from the device's existing setter registry.
@@ -110,11 +120,11 @@ pub const MAX_INSTANCE_OVERRIDES: usize = 2;
 pub struct InstanceTarget {
     topology: TopologyId,
     device: usize,
-    parameter: &'static str,
+    parameter: ParameterKey,
 }
 
 impl InstanceTarget {
-    pub(crate) const fn new(topology: TopologyId, device: usize, parameter: &'static str) -> Self {
+    pub(crate) const fn new(topology: TopologyId, device: usize, parameter: ParameterKey) -> Self {
         Self {
             topology,
             device,
@@ -134,7 +144,7 @@ impl InstanceTarget {
 
     /// Canonical alias-folded keyword.
     #[must_use]
-    pub const fn parameter(self) -> &'static str {
+    pub const fn parameter(self) -> ParameterKey {
         self.parameter
     }
 
@@ -161,7 +171,7 @@ impl InstanceTarget {
         self,
         supplied: Real,
     ) -> crate::primitives::SpiceResult<ResistorOverride> {
-        if self.parameter != "resistance"
+        if self.parameter != ParameterKey::Native("resistance")
             || !supplied.is_finite()
             || supplied == 0.
             || !(1. / supplied).is_finite()
@@ -202,7 +212,7 @@ impl InstanceOverride {
 
     /// The canonical (lowercase, alias-folded) parameter keyword.
     #[must_use]
-    pub const fn parameter(&self) -> &'static str {
+    pub const fn parameter(&self) -> ParameterKey {
         self.target.parameter()
     }
 

@@ -843,6 +843,52 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
+    /// Identity of a homogeneous prepared artifact, if this device supports
+    /// tile evaluation. Only exact artifact identity may share a tile.
+    fn prepared_batch_key(&self) -> Option<crate::devices::prepared_model::batch::Key> {
+        None
+    }
+
+    /// Prepare a bounded homogeneous tile at a candidate-context boundary.
+    /// # Errors
+    /// Incompatible instances, invalid parameters or unsupported tile.
+    fn prepare_batch(
+        &self,
+        _instances: &[&dyn Device],
+    ) -> SpiceResult<Box<dyn crate::devices::prepared_model::batch::Tile>> {
+        Err(SpiceError::circuit(
+            "device has no prepared batch implementation",
+        ))
+    }
+
+    /// Stamp a previously evaluated tile lane into a trial.
+    /// # Errors
+    /// Invalid numerical or history state.
+    fn stamp_prepared(
+        &self,
+        _context: &mut StampContext<'_>,
+        _point: &model_kernel_api::Point<'_>,
+    ) -> SpiceResult<()> {
+        Err(SpiceError::circuit("device has no prepared batch stamp"))
+    }
+
+    /// Assemble an already evaluated tile lane into the affine AC pencil.
+    /// # Errors
+    /// Missing charge equations or invalid row binding.
+    fn assemble_prepared(
+        &self,
+        _context: &mut crate::devices::linear::LinearContext<'_>,
+        _point: &model_kernel_api::Point<'_>,
+    ) -> SpiceResult<()> {
+        Err(SpiceError::circuit("device has no prepared batch AC stamp"))
+    }
+
+    /// Whether the noise generator densities or injection weights depend
+    /// on the requested spectral frequency, independently of the AC pencil.
+    fn noise_depends_on_frequency(&self) -> bool {
+        false
+    }
+
     /// The device's accepted-waveform delay history behaviour (transmission
     /// lines), or `None` (the default). See [`crate::devices::delay`]: such a
     /// device reads its history while stamping
@@ -1178,6 +1224,50 @@ pub trait Device: fmt::Debug + std::any::Any {
             "src/spicelib/devices/<dev>/<dev>disto.c (DEVdisto)",
         ))
     }
+    /// Bind a numeric parameter to the device's immutable setter table.
+    fn bind_numeric_parameter(&self, name: &str) -> Option<crate::devices::sweep::ParameterKey> {
+        self.instance_parameter(name)
+            .map(crate::devices::sweep::ParameterKey::Native)
+    }
+
+    /// Name of a bound numeric setter for diagnostics and output labels.
+    fn numeric_parameter_name(&self, key: crate::devices::sweep::ParameterKey) -> Option<&str> {
+        match key {
+            crate::devices::sweep::ParameterKey::Native(name) => Some(name),
+            crate::devices::sweep::ParameterKey::Prepared(_) => None,
+        }
+    }
+
+    /// Create an independent effective device with a previously bound setter.
+    /// # Errors
+    /// Foreign parameter or invalid physical input.
+    fn with_bound_parameter(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+        value: Real,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Box<dyn Device>> {
+        match key {
+            crate::devices::sweep::ParameterKey::Native(name) => {
+                self.with_instance_parameter(name, value, context)
+            }
+            crate::devices::sweep::ParameterKey::Prepared(_) => {
+                Err(SpiceError::circuit("foreign prepared parameter"))
+            }
+        }
+    }
+
+    /// Reprepare immutable context-dependent data at a context transition.
+    /// Ordinary native devices need no replacement.
+    /// # Errors
+    /// Invalid effective physical parameters.
+    fn reprepare_context(
+        &self,
+        _context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Option<Box<dyn Device>>> {
+        Ok(None)
+    }
+
     /// The canonical (lowercase, alias-folded) keyword of a settable real
     /// instance parameter that a `.dc @inst[param]` sweep may replace on this
     /// device (C `dctrcurv.c` `DCTfindInstParam`), or `None` (the default)

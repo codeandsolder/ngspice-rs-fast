@@ -41,39 +41,49 @@ impl BoundTransfer {
 }
 
 /// Frequency-local law and bound transfer(s) of one generator.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundNoiseSource {
     kind: NoiseKind,
     primary: BoundTransfer,
     secondary: Option<BoundTransfer>,
+    general: Vec<(Option<usize>, Complex)>,
 }
 
 impl BoundNoiseSource {
     pub(crate) fn bind(
-        source: NoiseSource,
+        source: &NoiseSource,
         unknowns: &MnaUnknowns,
-        previous: Option<Self>,
+        previous: Option<&Self>,
     ) -> SpiceResult<Self> {
         let primary =
             BoundTransfer::refresh(previous.map(|old| old.primary), unknowns, source.nodes)?;
-        let secondary = match source.kind {
+        let secondary = match &source.kind {
             NoiseKind::CorrelatedThermal { second, .. } => Some(BoundTransfer::refresh(
                 previous.and_then(|old| old.secondary),
                 unknowns,
-                second,
+                *second,
             )?),
             _ => None,
         };
+        let general = if let NoiseKind::Prepared { injections, .. } = &source.kind {
+            injections
+                .iter()
+                .map(|&(node, weight)| Ok((unknowns.checked_node_row(node)?, weight)))
+                .collect::<SpiceResult<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
-            kind: source.kind,
+            kind: source.kind.clone(),
+            general,
             primary,
             secondary,
         })
     }
 
-    pub(crate) fn output_density(self, adjoint: &[Complex], frequency: Real) -> SpiceResult<Real> {
+    pub(crate) fn output_density(&self, adjoint: &[Complex], frequency: Real) -> SpiceResult<Real> {
         self.kind.output_density(
-            self.primary.difference(adjoint),
+            self.transfer(adjoint),
             self.secondary.map(|pair| pair.difference(adjoint)),
             frequency,
         )
@@ -85,15 +95,15 @@ impl BoundNoiseSource {
     /// A real source uses conjugate correlated phase at negative frequency.
     /// Negative scalar spectral densities are not physical covariance factors.
     pub(crate) fn periodic_amplitudes(
-        self,
+        &self,
         frequency: Real,
-    ) -> SpiceResult<[(Option<usize>, Complex); 4]> {
+    ) -> SpiceResult<impl Iterator<Item = (Option<usize>, Complex)> + Clone + '_> {
         if !frequency.is_finite() || frequency == 0. || !self.kind.validate() {
             return Err(SpiceError::circuit(
                 "invalid periodic noise generator context",
             ));
         }
-        let (first, second) = match self.kind {
+        let (first, second) = match &self.kind {
             NoiseKind::CorrelatedThermal {
                 conductance,
                 second_conductance,
@@ -101,8 +111,8 @@ impl BoundNoiseSource {
                 phase,
                 ..
             } => {
-                let scale = (4. * super::BOLTZMANN * temperature).sqrt();
-                let angle = if frequency < 0. { -phase } else { phase };
+                let scale = (4. * super::BOLTZMANN * *temperature).sqrt();
+                let angle = if frequency < 0. { -*phase } else { *phase };
                 let (sin, cos) = angle.sin_cos();
                 let amplitude = scale * second_conductance.sqrt();
                 (
@@ -110,6 +120,7 @@ impl BoundNoiseSource {
                     Complex::new(amplitude * cos, amplitude * sin),
                 )
             }
+            NoiseKind::Prepared { .. } => (Complex::ZERO, Complex::ZERO),
             kind => {
                 let density = kind.scalar_output_density(1., frequency.abs())?;
                 if density < 0. {
@@ -127,15 +138,50 @@ impl BoundNoiseSource {
         }
         let [a, b] = self.primary.rows();
         let [c, d] = self.secondary.map_or([None, None], BoundTransfer::rows);
-        Ok([(a, first), (b, -first), (c, second), (d, -second)])
+        let scale = match self.kind {
+            NoiseKind::Prepared { density, .. } => density.sqrt(),
+            _ => 0.,
+        };
+        let signed = move |weight: Complex| {
+            (if frequency < 0. {
+                weight.conj()
+            } else {
+                weight
+            }) * Complex::real(scale)
+        };
+        if self
+            .general
+            .iter()
+            .any(|&(_, weight)| !signed(weight).is_finite())
+        {
+            return Err(SpiceError::circuit(
+                "unrepresentable generalized noise amplitude",
+            ));
+        }
+        Ok([(a, first), (b, -first), (c, second), (d, -second)]
+            .into_iter()
+            .take(if self.general.is_empty() { 4 } else { 0 })
+            .chain(
+                self.general
+                    .iter()
+                    .map(move |&(row, weight)| (row, signed(weight))),
+            ))
     }
 
-    pub(crate) fn rf_amplitude(self) -> SpiceResult<Option<Real>> {
+    pub(crate) fn rf_amplitude(&self) -> SpiceResult<Option<Real>> {
         self.kind.rf_amplitude()
     }
 
-    pub(crate) fn transfer(self, adjoint: &[Complex]) -> Complex {
-        self.primary.difference(adjoint)
+    pub(crate) fn transfer(&self, adjoint: &[Complex]) -> Complex {
+        if self.general.is_empty() {
+            self.primary.difference(adjoint)
+        } else {
+            self.general
+                .iter()
+                .fold(Complex::ZERO, |sum, &(row, weight)| {
+                    row.map_or(sum, |row| sum + adjoint[row] * weight)
+                })
+        }
     }
 }
 
@@ -151,7 +197,7 @@ pub struct NoiseInstance {
     /// Model identity; None for the default model.
     pub model: Option<String>,
     /// Generator suffixes, in the device's output order.
-    pub suffixes: Vec<&'static str>,
+    pub suffixes: Vec<std::borrow::Cow<'static, str>>,
     /// Whether C reports the instance total after the generators.
     pub total: bool,
     range: Range<usize>,
@@ -277,7 +323,7 @@ impl<'a> NoisePlan<'a> {
             let next_rank = models.len();
             let rank = *models.entry((family, model)).or_insert(next_rank);
             let start = sources.len();
-            for &source in &scratch {
+            for source in &scratch {
                 sources.push(BoundNoiseSource::bind(source, circuit.unknowns(), None)?);
             }
             entries.push((
@@ -287,7 +333,7 @@ impl<'a> NoisePlan<'a> {
                     name: name.to_owned(),
                     family,
                     model: model.map(str::to_owned),
-                    suffixes: scratch.iter().map(|source| source.suffix).collect(),
+                    suffixes: scratch.iter().map(|source| source.suffix.clone()).collect(),
                     total,
                     range: start..sources.len(),
                 },
@@ -371,16 +417,16 @@ impl<'a> NoisePlan<'a> {
                             .suffixes
                             .iter()
                             .zip(&self.scratch)
-                            .any(|(&suffix, source)| suffix != source.suffix)
+                            .any(|(suffix, source)| *suffix != source.suffix)
                     {
                         return Err(changed_layout(name));
                     }
-                    for (offset, &source) in self.scratch.iter().enumerate() {
+                    for (offset, source) in self.scratch.iter().enumerate() {
                         let slot = instance.range.start + offset;
                         self.staging[slot] = BoundNoiseSource::bind(
                             source,
                             self.circuit.unknowns(),
-                            Some(self.sources[slot]),
+                            Some(&self.sources[slot]),
                         )?;
                     }
                 }

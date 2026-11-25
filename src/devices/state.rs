@@ -409,9 +409,7 @@ impl StateHistory {
                 mode,
                 previous: previous.map(|previous| Arc::clone(&previous.values)),
                 nonconvergent: false,
-                patches: previous
-                    .map(|previous| previous.patches.clone())
-                    .unwrap_or_default(),
+                patches: previous.map_or_default(|previous| previous.patches.clone()),
             };
         };
         // The previous accepted revision invalidates *read access* to this
@@ -428,9 +426,7 @@ impl StateHistory {
         reused.mode = mode;
         reused.previous = previous.map(|previous| Arc::clone(&previous.values));
         reused.nonconvergent = false;
-        reused.patches = previous
-            .map(|previous| previous.patches.clone())
-            .unwrap_or_default();
+        reused.patches = previous.map_or_default(|previous| previous.patches.clone());
         reused
     }
 
@@ -602,9 +598,7 @@ impl StateHistory {
         scratch.values.resize(range.len(), Real::NAN);
         scratch.values.fill(Real::NAN);
         scratch.nonconvergent = false;
-        scratch.patches = previous
-            .map(|trial| trial.patches.clone())
-            .unwrap_or_default();
+        scratch.patches = previous.map_or_default(|trial| trial.patches.clone());
         let mut mode = LoadMode::newton(IterationPhase::Float);
         mode.set(LoadFlag::DeviceLimiting, false);
         let mut accepted = [&[][..]; ACCEPTED_DEPTH];

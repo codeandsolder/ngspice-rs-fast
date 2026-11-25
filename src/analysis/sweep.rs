@@ -456,13 +456,13 @@ enum Written<'a> {
     /// `@instance[r|resistance]` of a resistor.
     Resistance(&'a str, InstanceTarget),
     /// `@instance[parameter]` that the device replaces itself.
-    Device(&'a str, InstanceTarget),
+    Device(&'a str, InstanceTarget, &'a str),
     /// `@instance[parameter]` left for the source table (`dc`, current `c`)
     /// or for an explicit rejection.
     Other(&'a str, &'a str),
 }
 impl<'a> Written<'a> {
-    fn classify(circuit: &Circuit, target: &'a AxisTarget) -> Self {
+    fn classify(circuit: &'a Circuit, target: &'a AxisTarget) -> Self {
         let (instance, parameter) = match target {
             AxisTarget::Temperature => return Self::Temperature,
             AxisTarget::Name(name) => return Self::Name(name),
@@ -477,7 +477,10 @@ impl<'a> Written<'a> {
             return Self::Resistance(instance, target);
         }
         if let Ok(target) = circuit.bind_instance_target(instance, parameter) {
-            return Self::Device(instance, target);
+            let name = circuit.devices()[target.device()]
+                .numeric_parameter_name(target.parameter())
+                .unwrap_or(parameter);
+            return Self::Device(instance, target, name);
         }
         Self::Other(instance, parameter)
     }
@@ -486,8 +489,8 @@ impl<'a> Written<'a> {
         match self {
             Self::Temperature => "temp".into(),
             Self::Name(name) | Self::Resistance(name, _) => name.to_ascii_lowercase(),
-            Self::Device(name, target) => {
-                format!("@{}[{}]", name.to_ascii_lowercase(), target.parameter())
+            Self::Device(name, _, parameter) => {
+                format!("@{}[{parameter}]", name.to_ascii_lowercase())
             }
             Self::Other(name, parameter) => match parameter.to_ascii_lowercase().as_str() {
                 "dc" | "c" => name.to_ascii_lowercase(),
@@ -551,10 +554,10 @@ fn resolve_target(
             ),
             AxisBinding::Resistor(target),
         ),
-        Written::Device(_, target) => (
+        Written::Device(_, target, keyword) => (
             parameter(
                 instance_name(target.device()),
-                target.parameter(),
+                keyword,
                 ParameterRoute::Device,
             ),
             AxisBinding::Device(target),

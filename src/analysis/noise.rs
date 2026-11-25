@@ -523,7 +523,7 @@ fn plot_names(
         let suffixes = instance
             .suffixes
             .iter()
-            .copied()
+            .map(std::borrow::Cow::as_ref)
             .chain(instance.total.then_some(""));
         for suffix in suffixes {
             let name = format!("{}{suffix}", instance.name);
@@ -651,7 +651,11 @@ pub(super) fn run(
     model.spice3_noise = options.spice3;
     // Generators that depend on the frequency are described at the first
     // frequency; they are re-described at every frequency below.
-    let first = if small.reassembles() {
+    let noise_varies = circuit
+        .devices()
+        .iter()
+        .any(|device| device.noise_depends_on_frequency());
+    let first = if small.reassembles() || noise_varies {
         model.with_frequency(card.start)
     } else {
         model
@@ -682,7 +686,7 @@ pub(super) fn run(
         })?;
         // The laws can change with bias/frequency but the named history
         // slots cannot. Refresh transactionally before consuming the point.
-        if small.varies() || small.reassembles() {
+        if small.varies() || small.reassembles() || noise_varies {
             noise_plan.refresh(
                 small.prepared(),
                 &model.with_frequency(freq),
@@ -757,7 +761,7 @@ mod tests {
         let mut unknowns = MnaUnknowns::new();
         unknowns.rebuild(&nodes);
         BoundNoiseSource::bind(
-            NoiseSource::new(
+            &NoiseSource::new(
                 suffix,
                 [NodeId::new(node), NodeId::GROUND],
                 NoiseKind::Gain { factor },

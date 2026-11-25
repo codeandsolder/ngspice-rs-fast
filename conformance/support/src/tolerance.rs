@@ -12,7 +12,7 @@ pub struct Tolerance {
 impl Tolerance {
     /// Absolute error allowed for the given reference magnitude.
     #[must_use]
-    pub fn bound(self, reference: f64) -> f64 {
+    pub const fn bound(self, reference: f64) -> f64 {
         self.relative.mul_add(reference.abs(), self.absolute)
     }
 }

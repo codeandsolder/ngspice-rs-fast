@@ -299,7 +299,7 @@ fn given(values: &ScalarValues, name: &str) -> Option<Real> {
 /// A quadratic temperature coefficient pair `(c1, c2)` (`1 + c1 dt + c2 dt^2`).
 type TempCo = [Real; 2];
 
-fn poly(c: TempCo, dt: Real) -> Real {
+const fn poly(c: TempCo, dt: Real) -> Real {
     c[1].mul_add(dt, c[0]).mul_add(dt, 1.)
 }
 
