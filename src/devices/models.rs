@@ -83,7 +83,7 @@ pub enum ModelFamily {
     Nmf,
     /// P-channel MESFET/HFET family (`pmf`; levels as for [`Self::Nmf`]).
     Pmf,
-    /// XSPICE rational transfer function (s_xfer).
+    /// XSPICE rational transfer function (`s_xfer`).
     RationalTransfer,
 }
 

@@ -47,9 +47,8 @@ impl Law {
 
     const fn branches(self) -> usize {
         match self {
-            Self::Derivative => 1,
+            Self::Derivative | Self::Resistance => 1,
             Self::Capacitance | Self::Inductance | Self::Charge => 2,
-            _ => 1,
         }
     }
 
@@ -162,6 +161,7 @@ struct Equation {
     storage: Option<Stored>,
 }
 
+#[derive(Clone, Copy)]
 struct BoundInput<'a> {
     solution: &'a Vector,
     unknowns: &'a MnaUnknowns,
@@ -524,7 +524,11 @@ impl Device for Passive {
                     Law::Charge | Law::Derivative => {
                         let mut scale = coefficient.abs().max(rate.abs());
                         for (_, value, derivative) in bound.derivatives(
-                            equations[0].expect("explicit storage relation").static_part,
+                            equations[0]
+                                .ok_or_else(|| {
+                                    SpiceError::circuit("missing explicit storage relation")
+                                })?
+                                .static_part,
                         ) {
                             scale += (value * derivative).abs();
                         }
@@ -612,8 +616,7 @@ impl Device for Passive {
         // An instance IC is a local terminal voltage at which to evaluate
         // the arbitrary charge law. Other controls retain their seeded
         // values. Only the disposable UIC history load uses this override.
-        let mut seed = None;
-        if self.law == Law::Charge
+        let seed = if self.law == Law::Charge
             && context.states.initial_conditions()
             && let Some(voltage) = self.initial
         {
@@ -623,8 +626,10 @@ impl Device for Passive {
                 [self.expression.terminals[0], self.expression.terminals[1]],
                 voltage,
             )?;
-            seed = Some(state);
-        }
+            Some(state)
+        } else {
+            None
+        };
         self.with_bound(
             BoundInput {
                 solution: seed.as_ref().unwrap_or(context.solution),
@@ -685,7 +690,7 @@ impl Device for Passive {
                             storage.direct,
                             multiplier * scale,
                         )?;
-                        rhs -= history * scale;
+                        rhs = history.mul_add(-scale, rhs);
                     } else {
                         rhs = bound.affine(context.matrix, row, equation.static_part, 1.)?;
                     }
@@ -875,7 +880,9 @@ pub(in crate::devices) fn instantiate(
                     "tc2" => scale.tc2 = value,
                     "temp" => scale.temperature = Some(value),
                     "dtemp" => scale.dtemp = value,
-                    "noisy" if value == 0. || value == 1. => noisy = value == 1.,
+                    "noisy" if value == 0. || value.to_bits() == 1_f64.to_bits() => {
+                        noisy = value != 0.;
+                    }
                     "ic" => initial = Some(value),
                     _ => {
                         return Err(unsupported(

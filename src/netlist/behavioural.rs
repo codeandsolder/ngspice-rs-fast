@@ -647,10 +647,9 @@ fn statistical_argument(expr: &BExpr) -> SpiceResult<Real> {
             "statistical function requires static arguments, not a circuit-dependent value".into(),
         ));
     }
-    use crate::devices::behavioural::program::{Environment, Program};
-    let program = Program::compile(expr)?;
+    let program = crate::devices::behavioural::program::Program::compile(expr)?;
     Ok(program
-        .evaluate(&Environment {
+        .evaluate(&crate::devices::behavioural::program::Environment {
             values: &[],
             time: 0.,
             temperature: 0.,

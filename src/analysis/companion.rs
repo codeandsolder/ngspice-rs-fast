@@ -641,6 +641,16 @@ enum Acceptance<'a> {
     Step(&'a AttemptedStep),
 }
 
+struct TruncationDevice {
+    rows: std::ops::Range<usize>,
+    slots: Vec<TruncationSlot>,
+}
+
+struct TruncationSlot {
+    base: usize,
+    explicit_derivative: bool,
+}
+
 struct Driver<'a> {
     circuit: &'a Circuit,
     prepared: crate::devices::PreparedRun<'a>,
@@ -660,7 +670,7 @@ struct Driver<'a> {
     limited_rows: Option<Vec<bool>>,
     /// Each device's state rows and the absolute state index of every
     /// charge it hands `CKTterr` (`truncation_slots`), fixed for the run.
-    truncation: Vec<(std::ops::Range<usize>, Vec<(usize, bool)>)>,
+    truncation: Vec<TruncationDevice>,
     stats: TransientStats,
     /// Reuse the ordinary Newton MNA/RHS/trial storage across timepoint
     /// acceptance and rejected smaller-step retries.
@@ -960,16 +970,14 @@ fn run_transient_inner(
             let bases = device
                 .truncation_slots()
                 .into_iter()
-                .map(|slot| {
-                    (
-                        rows.start + slot,
-                        device
-                            .initial_expression_storage()
-                            .is_some_and(|storage| storage.slot == slot),
-                    )
+                .map(|slot| TruncationSlot {
+                    base: rows.start + slot,
+                    explicit_derivative: device
+                        .initial_expression_storage()
+                        .is_some_and(|storage| storage.slot == slot),
                 })
                 .collect();
-            Ok((rows, bases))
+            Ok(TruncationDevice { rows, slots: bases })
         })
         .collect::<SpiceResult<_>>()?;
     let driver = Driver {
@@ -1175,8 +1183,9 @@ impl Driver<'_> {
                 .history
                 .accepted(1)
                 .ok_or_else(|| failure("periodic charge history is empty"))?;
-            for (_, slots) in &self.truncation {
-                for &(slot, _) in slots {
+            for TruncationDevice { slots, .. } in &self.truncation {
+                for TruncationSlot { base: slot, .. } in slots {
+                    let slot = *slot;
                     scales[slot] = scales[slot].max(state[slot].abs());
                 }
             }
@@ -1777,8 +1786,14 @@ impl Driver<'_> {
         };
         let order = usize::from(coefficients.order());
         let mut limit = Real::INFINITY;
-        for (device, (rows, bases)) in self.circuit.devices().iter().zip(&self.truncation) {
-            for &(base, explicit_derivative) in bases {
+        for (device, TruncationDevice { rows, slots: bases }) in
+            self.circuit.devices().iter().zip(&self.truncation)
+        {
+            for &TruncationSlot {
+                base,
+                explicit_derivative,
+            } in bases
+            {
                 let accepted = |age: usize, offset: usize| {
                     self.history
                         .accepted(age)

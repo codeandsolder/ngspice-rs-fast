@@ -189,8 +189,9 @@ pub struct StorageElement {
     pub initial: Option<Real>,
 }
 
-/// A prescribed internal state coordinate for UIC. The coordinate and the
-/// equation that normally evolves it are distinct: e.g. an implicit
+/// A prescribed internal state coordinate for UIC.
+///
+/// The coordinate and the equation that normally evolves it are distinct: e.g. an implicit
 /// differential inductor stores its current in branch 0 and evolves it
 /// through branch equation 1. Indices are device-local branch indices.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -963,7 +964,7 @@ pub trait Device: fmt::Debug + std::any::Any {
     }
 
     /// Convergence classification of a device-local branch coordinate.
-    /// A constitutive coordinate must be checked by convergence_test.
+    /// A constitutive coordinate must be checked by `convergence_test`.
     fn branch_convergence(&self, _branch: usize) -> ConvergenceKind {
         ConvergenceKind::Current
     }

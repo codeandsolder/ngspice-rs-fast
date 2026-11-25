@@ -137,14 +137,7 @@ pub(in crate::devices) fn expand<'a, 'n>(
     existing_names: impl Iterator<Item = &'n str>,
     capacity: usize,
 ) -> SpiceResult<Cow<'a, [DeviceInstance]>> {
-    let mut count = 0usize;
-    for expression in instances.iter().flat_map(expressions) {
-        expression.root.visit(&mut |expr| {
-            if is_derivative(expr) {
-                count = count.saturating_add(1);
-            }
-        });
-    }
+    let count = derivative_count(instances);
     let measured = measured_targets(instances, models)?;
     if count == 0 && measured.is_empty() {
         return Ok(Cow::Borrowed(instances));
@@ -240,6 +233,18 @@ pub(in crate::devices) fn expand<'a, 'n>(
         expansion.output.push(instance);
     }
     Ok(Cow::Owned(expansion.output))
+}
+
+fn derivative_count(instances: &[DeviceInstance]) -> usize {
+    let mut count = 0usize;
+    for expression in instances.iter().flat_map(expressions) {
+        expression.root.visit(&mut |expr| {
+            if is_derivative(expr) {
+                count = count.saturating_add(1);
+            }
+        });
+    }
+    count
 }
 
 struct Expansion {

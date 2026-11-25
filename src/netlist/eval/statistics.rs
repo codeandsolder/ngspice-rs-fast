@@ -21,7 +21,7 @@ impl Realization {
         Self { seed, scope: 0 }
     }
 
-    pub(super) fn child(self, index: u64) -> Self {
+    pub(super) const fn child(self, index: u64) -> Self {
         Self {
             seed: self.seed,
             scope: mix(self.scope ^ mix(index)),
@@ -42,6 +42,10 @@ impl Realization {
 /// distinguishes expanded calls at identical source spans. Each candidate
 /// starts the same site stream, so nominal/variation changes preserve the
 /// normalized random draw even if unrelated definitions are not evaluated.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
 pub(crate) struct Sampler<'a> {
     realization: Realization,
     location: &'a SourceLoc,
@@ -166,6 +170,10 @@ fn affine_draw(nominal: Real, factors: &[Real], divisor: Real) -> Real {
 /// The seed is a deck-loading input: it cannot depend on the parameters
 /// whose realization it controls. Both spellings use the same last-wins
 /// policy. Entropy-based seeds are deliberately not implicit.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
 pub(crate) fn seed(cards: &[OptionCard]) -> SpiceResult<u64> {
     let mut seed = DEFAULT_SEED;
     for setting in cards.iter().flat_map(|card| &card.settings) {
@@ -176,6 +184,10 @@ pub(crate) fn seed(cards: &[OptionCard]) -> SpiceResult<u64> {
     Ok(seed)
 }
 
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
 pub(crate) fn parse_seed(setting: &crate::netlist::ast::OptionSetting) -> SpiceResult<u64> {
     if setting.expression.is_some() {
         return Err(SpiceError::parse(

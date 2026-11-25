@@ -839,7 +839,7 @@ impl ParamScope {
         })
     }
 
-    pub(crate) fn sampler<'a>(&self, location: &'a SourceLoc) -> Sampler<'a> {
+    pub(crate) const fn sampler<'a>(&self, location: &'a SourceLoc) -> Sampler<'a> {
         self.realization.sampler(location)
     }
 

@@ -191,13 +191,14 @@ fn behavioural_passive_value(
 }
 
 fn passive_leading(input: &mut Input<'_>, name: &str) -> Result<ParameterAssignment> {
-    if let Some(parameter) = behavioural_passive_value(input, name, false)? {
-        Ok(parameter)
-    } else {
-        leading_value
-            .map(|value| assignment(name, value))
-            .parse_next(input)
-    }
+    behavioural_passive_value(input, name, false)?.map_or_else(
+        || {
+            leading_value
+                .map(|value| assignment(name, value))
+                .parse_next(input)
+        },
+        Ok,
+    )
 }
 
 fn passive_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {

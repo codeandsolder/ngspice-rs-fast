@@ -1473,45 +1473,7 @@ impl Circuit {
     /// pairs, then resolve its names in original card order.
     fn resolve_mutual(&self, names: &DeviceNames) -> SpiceResult<MutualBinding> {
         let limits = self.mutual_limits;
-        let mut total_pairs = 0_usize;
-        let mut references = 0_usize;
-        let mut card_count = 0_usize;
-        for device in &self.devices {
-            let Some(description) = device.mutual_coupling() else {
-                continue;
-            };
-            let site = CouplingSite::of(device.as_ref());
-            let count = description.inductors.len();
-            if count < 2 {
-                return Err(site.resource("a K card couples at least two inductors"));
-            }
-            let pairs =
-                pair_count(count).ok_or_else(|| site.resource("mutual pair count overflows"))?;
-            total_pairs = total_pairs
-                .checked_add(pairs)
-                .ok_or_else(|| site.resource("aggregate mutual pair count overflows"))?;
-            if total_pairs > limits.pairs {
-                return Err(site.resource(format_args!(
-                    "mutual pair limit exceeded (aggregate {total_pairs} pairs, limit {})",
-                    limits.pairs
-                )));
-            }
-            references = references
-                .checked_add(count)
-                .ok_or_else(|| site.resource("mutual reference count overflows"))?;
-            card_count = card_count
-                .checked_add(1)
-                .ok_or_else(|| site.resource("mutual card count overflows"))?;
-            let bytes =
-                mutual_storage_bytes(total_pairs, references, card_count, self.devices.len())
-                    .ok_or_else(|| site.resource("mutual storage byte count overflows"))?;
-            if bytes > limits.storage_bytes {
-                return Err(site.resource(format_args!(
-                    "mutual storage limit exceeded (planned {bytes} bytes, limit {})",
-                    limits.storage_bytes
-                )));
-            }
-        }
+        let (total_pairs, card_count) = self.preflight_mutual(limits)?;
         if card_count == 0 {
             return Ok(MutualBinding::default());
         }
@@ -1584,6 +1546,49 @@ impl Circuit {
             &self.devices,
             limits,
         )
+    }
+
+    fn preflight_mutual(&self, limits: MutualLimits) -> SpiceResult<(usize, usize)> {
+        let mut total_pairs = 0_usize;
+        let mut references = 0_usize;
+        let mut card_count = 0_usize;
+        for device in &self.devices {
+            let Some(description) = device.mutual_coupling() else {
+                continue;
+            };
+            let site = CouplingSite::of(device.as_ref());
+            let count = description.inductors.len();
+            if count < 2 {
+                return Err(site.resource("a K card couples at least two inductors"));
+            }
+            let pairs =
+                pair_count(count).ok_or_else(|| site.resource("mutual pair count overflows"))?;
+            total_pairs = total_pairs
+                .checked_add(pairs)
+                .ok_or_else(|| site.resource("aggregate mutual pair count overflows"))?;
+            if total_pairs > limits.pairs {
+                return Err(site.resource(format_args!(
+                    "mutual pair limit exceeded (aggregate {total_pairs} pairs, limit {})",
+                    limits.pairs
+                )));
+            }
+            references = references
+                .checked_add(count)
+                .ok_or_else(|| site.resource("mutual reference count overflows"))?;
+            card_count = card_count
+                .checked_add(1)
+                .ok_or_else(|| site.resource("mutual card count overflows"))?;
+            let bytes =
+                mutual_storage_bytes(total_pairs, references, card_count, self.devices.len())
+                    .ok_or_else(|| site.resource("mutual storage byte count overflows"))?;
+            if bytes > limits.storage_bytes {
+                return Err(site.resource(format_args!(
+                    "mutual storage limit exceeded (planned {bytes} bytes, limit {})",
+                    limits.storage_bytes
+                )));
+            }
+        }
+        Ok((total_pairs, card_count))
     }
 
     /// The mutual-inductance terms of every device's branch equation under
