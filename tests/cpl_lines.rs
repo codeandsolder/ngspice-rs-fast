@@ -1449,3 +1449,133 @@ fn matched_full_order_cable_preserves_all_wavefronts_without_event_explosion() {
         }
     }
 }
+
+#[test]
+fn long_rank_deficient_cable_preserves_ideal_ac_mode_and_attenuated_mode() {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+
+    // Common mode Z=1+jw*1u, Y=1+jw*1n: a matched order-one
+    // impedance line with >1000 nepers of attenuation. Differential
+    // mode Z=0, Y=1+jw*1n is an exact equipotential shunt line.
+    // A source at a1 excites both modes equally. The ideal mode is a
+    // single voltage shared across the cable, with shunt 1000*Y and
+    // two one-ohm end terminations. No finite nodal Y exists.
+    let deck = "long rank-one coupled line\n\
+         v1 src 0 dc 1 ac 1\nrs1 src a1 1\nrs2 a2 0 1\n\
+         p1 a1 a2 0 b1 b2 0 cable\nrl1 b1 0 1\nrl2 b2 0 1\n\
+         .model cable cpl r=0.5 0.5 0.5 l=0.5u 0.5u 0.5u g=1 0 1 c=1n 0 1n length=1000 sections=8\n\
+         .ac lin 5 100 100meg\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("rank_one_ac.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let plot = config.plans_for(&netlist.analyses).unwrap()[0]
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    for point in 0..5 {
+        let hz = 100. + f64::from(u32::try_from(point).unwrap()) * (100e6 - 100.) / 4.;
+        let omega = std::f64::consts::TAU * hz;
+        let shunt = Complex::new(1., omega * 1e-9);
+        let ideal = Complex::real(0.5) / (Complex::real(2.) + Complex::real(1000.) * shunt);
+        let a1 = plot.value("v(a1)", point).unwrap();
+        let a2 = plot.value("v(a2)", point).unwrap();
+        near((a1 - a2) * Complex::real(0.5), ideal, 2e-10);
+        near(plot.value("v(b1)", point).unwrap(), ideal, 2e-10);
+        near(plot.value("v(b2)", point).unwrap(), -ideal, 2e-10);
+    }
+}
+
+#[test]
+fn ac_scattering_of_nilpotent_series_and_shunt_is_exact() {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+    for (material, shunt) in [
+        ("r=1000 l=1m g=0 c=0", false),
+        ("r=0 l=0 g=1000 c=1m", true),
+    ] {
+        let deck = format!(
+            "nilpotent cable\nv1 src 0 dc 1 ac 1\nrs src a 1\n\
+             p1 a 0 b 0 cable\nrl b 0 1\n\
+             .model cable cpl {material} length=1000 sections=8\n\
+             .ac lin 3 100 100meg\n.end\n"
+        );
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("nilpotent_ac.cir"), &deck))
+            .unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let plot = config.plans_for(&netlist.analyses).unwrap()[0]
+            .run(&mut circuit, &config.context())
+            .unwrap();
+        for point in 0..3 {
+            let hz = 100. + f64::from(u32::try_from(point).unwrap()) * (100e6 - 100.) / 2.;
+            let immittance = Complex::new(1e6, std::f64::consts::TAU * hz);
+            let far = Complex::real(1.) / (Complex::real(2.) + immittance);
+            near(plot.value("v(b)", point).unwrap(), far, 2e-10);
+            let expected_near = if shunt { far } else { Complex::real(1.) - far };
+            near(plot.value("v(a)", point).unwrap(), expected_near, 2e-10);
+        }
+    }
+}
+
+#[test]
+fn noncommuting_singular_ac_cable_retains_exact_voltage_constraint() {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+
+    // Z is rank one in the physical basis; the shunt matrix does not
+    // commute with it. V2 is spatially constant. Shift W = V1 + q V2,
+    // q = Y12/Y11, to obtain an independent scalar telegrapher equation
+    // for W and I1. Integrating the I2 equation then gives a lumped
+    // shunt L*(Y22-Y12²/Y11) plus q times the net I1 entering the cable.
+    // The scalar mode has >1000 nepers of loss throughout this sweep.
+    let deck = "noncommuting ideal/attenuating line\n\
+        v1 src 0 dc 1 ac 1\nrs1 src a1 1\nrs2 a2 0 1\n\
+        p1 a1 a2 0 b1 b2 0 cable\nrl1 b1 0 1\nrl2 b2 0 1\n\
+        .model cable cpl r=1 0 0 l=1u 0 0 g=2 0.5 1 c=2n -0.25n 1n length=1000 sections=8\n\
+        .ac lin 5 100 100meg\n.end\n";
+    let parsed = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("singular_noncommuting.cir"),
+            deck,
+        ))
+        .unwrap();
+    let config = RunConfig::from_netlist(&parsed).unwrap();
+    let mut circuit = config.circuit(&parsed).unwrap();
+    let plot = config.plans_for(&parsed.analyses).unwrap()[0]
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    let one = Complex::real(1.);
+    let two = Complex::real(2.);
+    for point in 0..5 {
+        let omega = std::f64::consts::TAU * plot.value("frequency", point).unwrap().re;
+        let z = Complex::new(1., omega * 1e-6);
+        let y11 = Complex::new(2., omega * 2e-9);
+        let y12 = Complex::new(0.5, -omega * 0.25e-9);
+        let y22 = Complex::new(1., omega * 1e-9);
+        let q = y12 / y11;
+        let effective = y22 - y12 * q;
+        let ratio = y11 / z;
+        let real = (0.5 * (ratio.magnitude() + ratio.re)).sqrt();
+        let characteristic = Complex::new(real, ratio.im / (2. * real));
+        let current = characteristic / (one + characteristic);
+        let ideal = -q * current / (two + Complex::real(1000.) * effective + two * q * q * current);
+        near(plot.value("v(a2)", point).unwrap(), ideal, 2e-10);
+        near(plot.value("v(b2)", point).unwrap(), ideal, 2e-10);
+        near(
+            plot.value("v(b1)", point).unwrap(),
+            -q * ideal * current,
+            2e-10,
+        );
+        near(
+            plot.value("v(a1)", point).unwrap(),
+            (one + q * ideal) / (one + characteristic) - q * ideal,
+            2e-10,
+        );
+    }
+}

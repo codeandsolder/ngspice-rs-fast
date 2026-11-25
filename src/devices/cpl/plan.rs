@@ -236,6 +236,12 @@ impl CoupledLinePlan {
         // Crucial for physical L~nH and C~pF, not a change to the line model.
         let impedance_scale = if zmax > 0. && ymax > 0. {
             zmax.sqrt() / ymax.sqrt()
+        } else if zmax > 0. {
+            (zmax * self.length).clamp(Real::MIN_POSITIVE, Real::MAX)
+        } else if ymax > 0. {
+            (ymax * self.length)
+                .recip()
+                .clamp(Real::MIN_POSITIVE, Real::MAX)
         } else {
             1.
         };
@@ -258,35 +264,46 @@ impl CoupledLinePlan {
         Ok((generator, impedance_scale))
     }
 
-    /// Bounded short-segment DC transfer and the number of binary doublings
+    /// Bounded short-segment generator and the number of binary doublings
     /// needed to recover the requested physical length. The caller composes
-    /// passive hybrid operators rather than exponentially growing transfers.
-    pub(super) fn dc_hybrid_seed(&self, length: Real) -> SpiceResult<(DenseComplex, Real, usize)> {
+    /// passive terminal relations rather than exponentially growing transfers.
+    pub(super) fn bounded_operator(
+        &self,
+        hz: Real,
+        length: Real,
+        max_norm: Real,
+    ) -> SpiceResult<(DenseComplex, Real, usize)> {
         let mut segment = self.clone();
         segment.length = length;
-        let (operator, scale) = segment.operator(0.)?;
+        let (operator, scale) = segment.operator(hz)?;
         let mut norm = operator_norm(&operator)?;
         let mut factor = 1.;
         let mut steps = 0;
         loop {
-            if norm <= 4. {
+            if norm <= max_norm {
                 break;
             }
             if steps >= self.limits.squarings {
-                return Err(invalid("DC hybrid composition exceeds work budget"));
+                return Err(invalid("passive line composition exceeds work budget"));
             }
             norm *= 0.5;
             factor *= 0.5;
             steps += 1;
         }
         if factor == 0. {
-            return Err(invalid("DC hybrid segment length underflow"));
+            return Err(invalid("passive line segment length underflow"));
         }
-        Ok((
-            expm_pade13(&scaled(&operator, factor)?, self.limits.squarings)?,
-            scale,
-            steps,
-        ))
+        Ok((scaled(&operator, factor)?, scale, steps))
+    }
+
+    pub(super) fn bounded_transfer(
+        &self,
+        hz: Real,
+        length: Real,
+        max_norm: Real,
+    ) -> SpiceResult<(DenseComplex, Real, usize)> {
+        let (operator, scale, steps) = self.bounded_operator(hz, length, max_norm)?;
+        Ok((expm_pade13(&operator, self.limits.squarings)?, scale, steps))
     }
 
     /// Exact coupled first-order telegrapher transfer up to numerical precision.
@@ -298,29 +315,6 @@ impl CoupledLinePlan {
     pub fn transfer_at(&self, hz: Real) -> SpiceResult<(DenseComplex, Real)> {
         let (operator, scale) = self.operator(hz)?;
         Ok((expm_pade13(&operator, self.limits.squarings)?, scale))
-    }
-
-    /// A loss-bearing line with a large telegrapher generator is represented
-    /// as a Norton two-port instead of the exponentially ill-conditioned
-    /// full ABCD transfer. Lossless ideal constraints remain on the exact
-    /// augmented transfer path, where a finite Y may not exist.
-    /// # Errors
-    /// Nonfinite frequency or RLGC matrix.
-    pub(super) fn requires_norton(&self, hz: Real) -> SpiceResult<bool> {
-        // If every conductor has zero series Z at this frequency, the
-        // physical line imposes an exact voltage constraint. It has *no*
-        // finite two-ended Y, so keep the augmented branch equations even
-        // for arbitrarily large shunt attenuation/current.
-        if self.r.data().iter().all(|&value| value == 0.)
-            && (hz == 0. || self.l.data().iter().all(|&value| value == 0.))
-        {
-            return Ok(false);
-        }
-        if !self.r.data().iter().chain(self.g.data()).any(|&v| v != 0.) {
-            return Ok(false);
-        }
-        let (operator, _) = self.operator(hz)?;
-        Ok(operator_norm(&operator)? > 4.)
     }
 
     fn stable_admittance(&self, hz: Real, norm: Real) -> SpiceResult<DenseComplex> {

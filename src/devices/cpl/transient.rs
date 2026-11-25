@@ -404,28 +404,21 @@ impl Hybrid {
         scale: Real,
     ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
         let count = self.a.dimension;
-        let mut entries = Vec::new();
-        let mut insert = |row: Option<usize>, col: Option<usize>, value: Real| {
-            if let (Some(row), Some(col)) = (row, col)
+        let mut entries = line.terminal_kcl(unknowns, first)?;
+        let mut insert = |row: usize, col: Option<usize>, value: Real| {
+            if let Some(col) = col
                 && value != 0.
             {
                 entries.push((row, col, Complex::real(value)));
             }
         };
         for i in 0..count {
-            let branch = Some(first + i);
+            let branch = first + i;
+            let output = first + count + i;
             let (ip, ir) = line.physical_pair(i);
-            let (op, or) = line.physical_pair(count + i);
-            let (ip, ir, op, or) = (
-                unknowns.checked_node_row(ip)?,
-                unknowns.checked_node_row(ir)?,
-                unknowns.checked_node_row(op)?,
-                unknowns.checked_node_row(or)?,
-            );
-            insert(ip, branch, 1.);
-            insert(ir, branch, -1.);
-            insert(branch, ip, 1.);
-            insert(branch, ir, -1.);
+            insert(branch, unknowns.checked_node_row(ip)?, 1.);
+            insert(branch, unknowns.checked_node_row(ir)?, -1.);
+            insert(output, Some(output), 1.);
             for j in 0..count {
                 let (positive, negative) = line.physical_pair(count + j);
                 let (positive, negative) = (
@@ -436,13 +429,10 @@ impl Hybrid {
                 insert(branch, input_branch, -scale * self.a.at(i, j));
                 insert(branch, positive, -self.b.at(i, j));
                 insert(branch, negative, self.b.at(i, j));
-                insert(op, input_branch, -self.b.at(j, i));
-                insert(or, input_branch, self.b.at(j, i));
+                insert(output, input_branch, self.b.at(j, i));
                 let d = self.d.at(i, j) / scale;
-                insert(op, positive, d);
-                insert(op, negative, -d);
-                insert(or, positive, -d);
-                insert(or, negative, d);
+                insert(output, positive, -d);
+                insert(output, negative, d);
             }
         }
         if entries.iter().any(|(_, _, value)| !value.is_finite()) {
@@ -519,7 +509,7 @@ impl CoupledLine {
             ))
     }
     fn dc_hybrid(&self, length: Real) -> SpiceResult<(Hybrid, Real)> {
-        let (transfer, scale, steps) = self.plan.dc_hybrid_seed(length)?;
+        let (transfer, scale, steps) = self.plan.bounded_transfer(0., length, 4.)?;
         let mut network = Hybrid::from_dc(&transfer, self.conductors())?;
         for _ in 0..steps {
             network = network.cascade(&network)?;
@@ -656,10 +646,9 @@ impl CoupledLine {
             ctx.matrix.add(row, col, value.re)?;
         }
         for i in 0..self.conductors() {
-            let (positive, negative) = self.physical_pair(self.conductors() + i);
             ctx.rhs.add_to(first + i, network.f[i])?;
-            ctx.stamp_rhs(positive, -network.g[i] / cell.scale)?;
-            ctx.stamp_rhs(negative, network.g[i] / cell.scale)?;
+            ctx.rhs
+                .add_to(first + self.conductors() + i, network.g[i] / cell.scale)?;
         }
         self.reconstruct_hybrid_states(ctx, coeff, &cell, &cells, &interfaces)
     }

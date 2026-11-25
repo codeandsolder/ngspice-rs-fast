@@ -25,7 +25,8 @@ with all I oriented along increasing x. The transfer for cable length ell is
 A similarity transform I' = Zscale*I balances impedance and admittance
 without changing electrical physics, where the positive real scalar
 Zscale = sqrt(max_row_abs_sum(Z)/max_row_abs_sum(Y)) when both blocks are
-nonzero. An order-13 Padé matrix exponential and power-of-two
+nonzero; pure series or shunt material instead uses the scale of its
+length-integrated immittance. An order-13 Padé matrix exponential and power-of-two
 scaling/squaring handle all noncommuting matrices (no assumption of one
 independent scalar transmission line per conductor). The Padé
 denominator is inverted by the existing checked dense complex solver;
@@ -43,48 +44,52 @@ same coupled equations, including real losses and mutual inductance and
 capacitance. The input and output return terminals participate in signed
 KCL stamps for every 2N×2N matrix entry. A singular B block cannot produce an ordinary two-ended nodal admittance.
 The diagnostic `CoupledLinePlan::admittance_at` rejects this conversion, but
-**the native P Device does not need to invert B**. For nonmodal AC it allocates N
-physical input-current unknowns and stamps the exact transfer equations in MNA:
+**the native P device does not need to invert B**. All analyses use 2N
+physical inward-current unknowns, one for every conductor at each end.
+The MNA sparsity pattern binds each branch to its own signed port KCL
+and allows all terminal currents and voltages in the 2N constitutive rows.
 
-  Vout - A Vin - B Iin' = 0
-  Iinput_entering = Iin' / Zscale
-  Ioutput_entering = -(C Vin + D Iin') / Zscale.
+### Stable passive very-long-line AC
 
-At zero frequency a lossless line has A=D=I, B=C=0, so the branch rows enforce
-Vout=Vin with KCL currents entering and leaving the cable. Exact shorts and
-resonant constraints are therefore preserved as actual branch equations,
-not replaced with zeros or an arbitrary large conductance. The same
-augmented formulation handles dissipative cable segments and complex AC.
-The full sparse MNA setup records the required node-to-branch and
-branch-to-node positions once; the frequency-dependent transfer coefficients
-are then stamped directly at each solve frequency.
+A passive cable may have a nonrepresentable full-length transfer: for
+R=G=1 and length=1000 the growing eigenvalue is exp(1000), even though
+the terminal behavior is finite. More generally, partially singular
+series matrices can impose exact voltage constraints in parallel with
+heavily attenuating modes; a finite nodal admittance does not then exist.
 
-### Stable passive very-long-line DC/AC
+For nonmodal AC, balance the telegrapher generator and divide physical
+length by powers of two until the generator infinity norm is at most 0.5.
+Compute its bounded short-segment exponential by the even/odd series
+of ZY, retaining both floating-point words through the material products.
+Convert the transfer to reciprocal scattering in waves a=V+Zref I,
+b=V-Zref I, with both currents entering. For a uniform symmetric cable
+the two-ended scattering has reflection R_s and transmission T_s:
 
-Even a physically passive line may have a **nonrepresentable ABCD transfer**:
-for scalar R=G=1 (per metre), 1000 metres creates eigenvalues ±1000 in
-the transfer exponent, but the physical terminal admittance remains
-approximately `[[1,0],[0,1]]` siemens. It is incorrect to refuse this
-physical circuit because an intermediate `exp(1000)` overflows.
+  S = [[R_s, T_s], [T_s, R_s]].
 
-For a lossy cable whose balanced telegrapher operator has infinity norm
-above 4, the frequency solver divides *physical length* by successive
-powers of two until a short segment can be exponentiated and its physical
-2N-port Norton admittance obtained. Each doubling combines identical
-segments by eliminating the internal interface with the complex Schur
-complement `K = Y22_left + Y11_right`. This keeps the terminal admittance
-finite and reciprocal as end-to-end coupling tends to zero, without
-building the full-line ABCD. The native Device stamps the resulting full
-N-conductor Norton model with the same N branch-current unknowns, and
-separate input/output return KCL. Small lines and lossless ideal/resonant
-constraints retain their direct augmented branch equations.
+Doubling the segment eliminates its internal incident waves through the
+Redheffer star product:
 
-The bounded number of doublings is governed by the plan's explicit
-`squarings`; nonfinite material, singular interface and resource
-limits remain errors, never zero admittances. Independent long-line tests
-cover scalar unit characteristic admittance at exp(1000), and a reciprocal
-noncommuting two-conductor Riccati identity `Yc R Yc = G` at DC, alongside
-native `.op` and `.ac` solves.
+  X = solve(I - R_s R_s, T_s)
+  T_double = T_s X
+  R_double = R_s + T_s R_s X.
+
+This composes bounded terminal relations rather than exponentially
+growing ABCD transfers or a potentially nonexistent Norton matrix.
+All operations in the short-segment and cascade preparation retain
+two-word precision, shared with the LC eigenbasis calculation.
+Form the small complementary coefficients I±S before narrowing to
+binary64, then stamp (I-S)V - Zref(I+S)I=0, with ordinary physical
+branch KCL. No inverse of B or I+S is required in native AC. DC uses
+the real passive hybrid elimination described below.
+
+The diagnostic finite-admittance query still uses the separate bounded
+Norton elimination when it needs a finite Y. It is not the native device
+representation and rejects ideal constraints. Both paths have explicit
+work and memory budgets. Tests cover exp(1000) attenuation, a
+noncommuting reciprocal characteristic Riccati identity, complex
+rank-deficient lines (including noncommuting series/shunt material),
+and the analytic pure-series and pure-shunt limits.
 
 ## Model validity and resource ownership
 
@@ -195,8 +200,8 @@ voltage `Vm` satisfying
 
 Composition eliminates the interface with this equation without inverting
 series impedance or multiplying growing ABCD transfers. The condensed MNA
-has N physical input-current unknowns, and the output KCL is stamped from
-the hybrid operator. The homogeneous cell coefficients are computed once
+has 2N physical terminal-current unknowns, with the output-current
+constitutive rows stamped directly from the hybrid operator. The homogeneous cell coefficients are computed once
 per load. Retained affine interface operators reconstruct each cell's
 voltages and series currents using the same elimination as the terminal
 stamp. Accepted energy histories are written only through the existing

@@ -6,7 +6,7 @@
 //! voltage/current bases are B⁻ᵀQ and BQ. Power-normalizing those bases
 //! yields passive modal travelling waves and exact delays length*sqrt(λ).
 //! Degenerate RC/RL diffusion remains in the general nonmodal plan.
-use super::plan::CoupledLinePlan;
+use super::{plan::CoupledLinePlan, wide::Wide};
 use crate::primitives::numeric::{scale_power, split_power};
 use crate::primitives::{Real, SpiceResult};
 
@@ -28,100 +28,6 @@ pub struct CoupledLineModes {
     pub characteristic_admittances: Vec<Real>,
     /// Exact individual LC propagation times across the entire cable.
     pub total_delays: Vec<Real>,
-}
-
-// Extended precision is confined to immutable modal preparation. Closely
-// spaced eigenvalues can amplify roundoff in the ordinary-precision
-// similarity transform into spurious modal components. Keep both words of
-// every operation through the Cholesky, Jacobi and basis reconstruction;
-// only the final physical basis and eigenvalues enter the f64 solver.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Wide {
-    hi: Real,
-    lo: Real,
-}
-
-impl Wide {
-    const ZERO: Self = Self { hi: 0., lo: 0. };
-    const ONE: Self = Self { hi: 1., lo: 0. };
-
-    const fn from_real(hi: Real) -> Self {
-        Self { hi, lo: 0. }
-    }
-
-    fn two_sum(a: Real, b: Real) -> Self {
-        let hi = a + b;
-        let v = hi - a;
-        let lo = (a - (hi - v)) + (b - v);
-        Self { hi, lo }
-    }
-
-    fn abs(self) -> Self {
-        if self.hi.is_sign_negative() {
-            -self
-        } else {
-            self
-        }
-    }
-
-    fn sqrt(self) -> Self {
-        if self == Self::ZERO {
-            return self;
-        }
-        let root = Self::from_real(self.hi.sqrt());
-        root + (self - root * root) / (root + root)
-    }
-}
-
-impl std::ops::Neg for Wide {
-    type Output = Self;
-
-    fn neg(self) -> Self {
-        Self {
-            hi: -self.hi,
-            lo: -self.lo,
-        }
-    }
-}
-
-impl std::ops::Add for Wide {
-    type Output = Self;
-
-    fn add(self, other: Self) -> Self {
-        let sum = Self::two_sum(self.hi, other.hi);
-        Self::two_sum(sum.hi, sum.lo + self.lo + other.lo)
-    }
-}
-
-impl std::ops::Sub for Wide {
-    type Output = Self;
-
-    fn sub(self, other: Self) -> Self {
-        self + (-other)
-    }
-}
-
-impl std::ops::Mul for Wide {
-    type Output = Self;
-
-    fn mul(self, other: Self) -> Self {
-        let hi = self.hi * other.hi;
-        let error = self.hi.mul_add(other.hi, -hi);
-        Self::two_sum(
-            hi,
-            self.hi.mul_add(other.lo, self.lo.mul_add(other.hi, error)),
-        )
-    }
-}
-
-impl std::ops::Div for Wide {
-    type Output = Self;
-
-    fn div(self, other: Self) -> Self {
-        let quotient = self.hi / other.hi;
-        let remainder = self - Self::from_real(quotient) * other;
-        Self::two_sum(quotient, remainder.hi / other.hi)
-    }
 }
 
 fn normalized_cholesky(c: &[Real], order: usize, scale: Real) -> SpiceResult<Vec<Wide>> {

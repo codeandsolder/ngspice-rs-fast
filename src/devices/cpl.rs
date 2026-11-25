@@ -7,7 +7,9 @@
 mod lossless;
 pub mod modes;
 pub mod plan;
+mod scattering;
 mod transient;
+mod wide;
 
 use std::sync::Arc;
 
@@ -327,11 +329,24 @@ impl CoupledLine {
         }
         Ok(entries)
     }
-    /// Augmented telegrapher constraints avoid ever inverting the B block.
-    /// Input current unknowns are physical; the transfer uses Iin'=scale*Iin.
-    /// Branch equations are Vout - A Vin - B Iin'=0, and output KCL
-    /// includes -(C Vin + D Iin')/scale.
-    /// This representation handles ideal shorts and lossless DC *exactly*.
+    /// Reserve a physical inward current for every terminal port.
+    fn terminal_kcl(
+        &self,
+        unknowns: &MnaUnknowns,
+        first: usize,
+    ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
+        let mut entries = Vec::new();
+        for port in 0..2 * self.conductors() {
+            let (positive, negative) = self.physical_pair(port);
+            for (node, sign) in [(positive, 1.), (negative, -1.)] {
+                if let Some(row) = unknowns.checked_node_row(node)? {
+                    entries.push((row, first + port, Complex::real(sign)));
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     fn transfer_stamps_at(
         &self,
         hz: Real,
@@ -344,178 +359,8 @@ impl CoupledLine {
         if hz == 0. {
             return self.dc_hybrid_stamps(unknowns, first_branch);
         }
-        // A passive, heavily attenuating cable has finite terminal Y even
-        // when its full length ABCD expm would overflow or lose reciprocity
-        // through cancellation. Stamp the stable Norton two-port then.
-        if self.plan.requires_norton(hz)? {
-            return self.norton_stamps_at(&self.plan.admittance_at(hz)?, unknowns, first_branch);
-        }
-        let (matrix, scale) = self.plan.transfer_at(hz)?;
-        self.transfer_stamps(&matrix, scale, unknowns, first_branch)
-    }
-
-    /// Augmented MNA for a physical long-line Norton Y without imposing an
-    /// artificial short or reserving different branch counts by analysis.
-    fn norton_stamps_at(
-        &self,
-        admittance: &DenseComplex,
-        unknowns: &MnaUnknowns,
-        first_branch: usize,
-    ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
-        let conductors = self.conductors();
-        if admittance.dim() != 2 * conductors {
-            return Err(invalid("long-line physical admittance has wrong order"));
-        }
-        let capacity = conductors
-            .checked_mul(conductors)
-            .and_then(|value| value.checked_mul(16))
-            .and_then(|value| value.checked_add(3 * conductors))
-            .ok_or_else(|| invalid("long-line Norton stamp size overflow"))?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve(capacity)
-            .map_err(|_| invalid("Norton stamp allocation"))?;
-        let mut write = |row: Option<usize>, col: Option<usize>, value: Complex| {
-            if let (Some(row), Some(col)) = (row, col)
-                && value != Complex::ZERO
-            {
-                entries.push((row, col, value));
-            }
-        };
-        for output in 0..conductors {
-            let branch = first_branch
-                .checked_add(output)
-                .ok_or_else(|| invalid("Norton branch row overflow"))?;
-            let (input_node, input_return) = self.physical_pair(output);
-            let (output_node, output_return) = self.physical_pair(conductors + output);
-            write(
-                unknowns.checked_node_row(input_node)?,
-                Some(branch),
-                Complex::real(1.),
-            );
-            write(
-                unknowns.checked_node_row(input_return)?,
-                Some(branch),
-                Complex::real(-1.),
-            );
-            write(Some(branch), Some(branch), Complex::real(1.));
-            for column in 0..2 * conductors {
-                let (positive, negative) = self.physical_pair(column);
-                let positive_row = unknowns.checked_node_row(positive)?;
-                let negative_row = unknowns.checked_node_row(negative)?;
-                let input_y = admittance
-                    .get(output, column)
-                    .ok_or_else(|| invalid("Norton input admittance index"))?;
-                let output_y = admittance
-                    .get(conductors + output, column)
-                    .ok_or_else(|| invalid("Norton output admittance index"))?;
-                // Branch constraint I_in - Y11 Vin - Y12 Vout = 0.
-                write(Some(branch), positive_row, -input_y);
-                write(Some(branch), negative_row, input_y);
-                // Output port KCL I_out = Y21 Vin + Y22 Vout.
-                for (node, sign) in [(output_node, 1.), (output_return, -1.)] {
-                    let row = unknowns.checked_node_row(node)?;
-                    write(row, positive_row, output_y * Complex::real(sign));
-                    write(row, negative_row, -output_y * Complex::real(sign));
-                }
-            }
-        }
-        Ok(entries)
-    }
-
-    fn transfer_stamps(
-        &self,
-        matrix: &DenseComplex,
-        scale: Real,
-        unknowns: &MnaUnknowns,
-        first_branch: usize,
-    ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
-        let conductors = self.conductors();
-        let inverse_scale = 1. / scale;
-        if !inverse_scale.is_finite() {
-            return Err(invalid("nonfinite cable current scaling"));
-        }
-        let mut inputs = Vec::new();
-        let mut outputs = Vec::new();
-        inputs
-            .try_reserve(conductors)
-            .map_err(|_| invalid("input MNA mapping capacity"))?;
-        outputs
-            .try_reserve(conductors)
-            .map_err(|_| invalid("output MNA mapping capacity"))?;
-        for i in 0..conductors {
-            let (ip, ir) = self.physical_pair(i);
-            let (op, or) = self.physical_pair(conductors + i);
-            inputs.push((
-                unknowns.checked_node_row(ip)?,
-                unknowns.checked_node_row(ir)?,
-            ));
-            outputs.push((
-                unknowns.checked_node_row(op)?,
-                unknowns.checked_node_row(or)?,
-            ));
-        }
-        let size = conductors
-            .checked_mul(conductors)
-            .and_then(|v| v.checked_mul(13))
-            .ok_or_else(|| invalid("augmented transmission-stamp count overflow"))?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve(size)
-            .map_err(|_| invalid("augmented stamp capacity"))?;
-        let mut insert = |row: Option<usize>, col: Option<usize>, value: Complex| {
-            if let (Some(row), Some(col)) = (row, col)
-                && value != Complex::ZERO
-            {
-                entries.push((row, col, value));
-            }
-        };
-        for i in 0..conductors {
-            let branch_i = first_branch
-                .checked_add(i)
-                .ok_or_else(|| invalid("branch row overflow"))?;
-            let (input_positive, input_return) = inputs[i];
-            let (output_positive, output_return) = outputs[i];
-            insert(input_positive, Some(branch_i), Complex::real(1.));
-            insert(input_return, Some(branch_i), Complex::real(-1.));
-            insert(Some(branch_i), output_positive, Complex::real(1.));
-            insert(Some(branch_i), output_return, Complex::real(-1.));
-            for (j, &(source_positive, source_return)) in inputs.iter().enumerate() {
-                let branch_j = first_branch
-                    .checked_add(j)
-                    .ok_or_else(|| invalid("branch row overflow"))?;
-                let a = matrix
-                    .get(i, j)
-                    .ok_or_else(|| invalid("missing transmission A"))?;
-                let b = matrix
-                    .get(i, conductors + j)
-                    .ok_or_else(|| invalid("missing transmission B"))?;
-                let c = matrix
-                    .get(conductors + i, j)
-                    .ok_or_else(|| invalid("missing transmission C"))?;
-                let d = matrix
-                    .get(conductors + i, conductors + j)
-                    .ok_or_else(|| invalid("missing transmission D"))?;
-                // Positive/negative output terminal KCL: -C Vsource / Zscale.
-                let out_current = -c * Complex::real(inverse_scale);
-                insert(output_positive, source_positive, out_current);
-                insert(output_positive, source_return, -out_current);
-                insert(output_return, source_positive, -out_current);
-                insert(output_return, source_return, out_current);
-                // The same KCL equation's -D I' coupling.
-                let out_branch = -d;
-                insert(output_positive, Some(branch_j), out_branch);
-                insert(output_return, Some(branch_j), -out_branch);
-                // One voltage constraint row per conductor: Vout-A Vin-B I'=0.
-                insert(Some(branch_i), source_positive, -a);
-                insert(Some(branch_i), source_return, a);
-                insert(Some(branch_i), Some(branch_j), -b * Complex::real(scale));
-            }
-        }
-        if entries.iter().any(|(_, _, value)| !value.is_finite()) {
-            return Err(invalid("nonfinite augmented transmission-line stamps"));
-        }
-        Ok(entries)
+        self.plan
+            .scattering_stamps(self, hz, unknowns, first_branch)
     }
 }
 
@@ -534,7 +379,7 @@ impl Device for CoupledLine {
     }
 
     fn branch_currents(&self) -> usize {
-        self.conductors() * if self.lossless.is_some() { 2 } else { 1 }
+        2 * self.conductors()
     }
 
     fn delay_line(&self) -> Option<&dyn crate::devices::delay::DelayLine> {
@@ -555,35 +400,17 @@ impl Device for CoupledLine {
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
-        if let Some(modes) = &self.lossless {
-            modes.setup(self, setup)?;
-            return Ok(true);
-        }
-        let conductors = self.conductors();
-        for i in 0..conductors {
-            let branch_i = setup.branch(i)?;
-            let (input_positive, input_return) = self.physical_pair(i);
-            let (output_positive, output_return) = self.physical_pair(conductors + i);
-            for row in <[NodeId; 2]>::from((input_positive, input_return)) {
-                setup.element(setup.node(row), Some(branch_i));
-            }
-            for col in [output_positive, output_return] {
-                setup.element(Some(branch_i), setup.node(col));
-            }
-            for j in 0..conductors {
-                let branch_j = setup.branch(j)?;
-                let (source_positive, source_return) = self.physical_pair(j);
-                let (other_output, other_return) = self.physical_pair(conductors + j);
-                for row in [output_positive, output_return] {
-                    setup.element(setup.node(row), Some(branch_j));
-                    for col in [source_positive, source_return, other_output, other_return] {
-                        setup.nodes(row, col);
-                    }
-                }
-                for col in [source_positive, source_return, other_output, other_return] {
-                    setup.element(Some(branch_i), setup.node(col));
-                }
-                setup.element(Some(branch_i), Some(branch_j));
+        let ports = 2 * self.conductors();
+        for i in 0..ports {
+            let branch = setup.branch(i)?;
+            let (node, ret) = self.physical_pair(i);
+            setup.element(setup.node(node), Some(branch));
+            setup.element(setup.node(ret), Some(branch));
+            for j in 0..ports {
+                let (node, ret) = self.physical_pair(j);
+                setup.element(Some(branch), setup.node(node));
+                setup.element(Some(branch), setup.node(ret));
+                setup.element(Some(branch), Some(setup.branch(j)?));
             }
         }
         Ok(true)

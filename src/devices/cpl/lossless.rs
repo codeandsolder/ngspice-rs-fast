@@ -8,7 +8,6 @@ use super::{CoupledLine, invalid, plan::CoupledLinePlan};
 use crate::devices::delay::{
     DelayContext, DelayHistory, DelayLine, DelayUpdate, WaveformHistory, WaveformUpdate,
 };
-use crate::devices::setup::MatrixSetup;
 use crate::devices::traits::{MnaUnknowns, StampContext};
 use crate::primitives::{Complex, Real, SpiceResult};
 
@@ -105,7 +104,7 @@ impl LosslessModes {
         first: usize,
     ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
         let n = self.delays.len();
-        let mut entries = Vec::new();
+        let mut entries = line.terminal_kcl(unknowns, first)?;
         let mut add = |row: Option<usize>, col: Option<usize>, value: Complex| {
             if let (Some(row), Some(col)) = (row, col)
                 && value != Complex::ZERO
@@ -113,19 +112,6 @@ impl LosslessModes {
                 entries.push((row, col, value));
             }
         };
-        for port in 0..2 * n {
-            let (node, ret) = line.physical_pair(port);
-            add(
-                unknowns.checked_node_row(node)?,
-                Some(first + port),
-                Complex::real(1.),
-            );
-            add(
-                unknowns.checked_node_row(ret)?,
-                Some(first + port),
-                Complex::real(-1.),
-            );
-        }
         for end in 0..2 {
             for (mode, &factor) in factors.iter().enumerate() {
                 let row = Some(first + end * n + mode);
@@ -149,23 +135,6 @@ impl LosslessModes {
             return Err(invalid("nonfinite modal line stamp"));
         }
         Ok(entries)
-    }
-
-    pub(super) fn setup(&self, line: &CoupledLine, setup: &mut MatrixSetup<'_>) -> SpiceResult<()> {
-        let ports = 2 * self.delays.len();
-        for i in 0..ports {
-            let branch = setup.branch(i)?;
-            let (node, ret) = line.physical_pair(i);
-            setup.element(setup.node(node), Some(branch));
-            setup.element(setup.node(ret), Some(branch));
-            for j in 0..ports {
-                let (node, ret) = line.physical_pair(j);
-                setup.element(Some(branch), setup.node(node));
-                setup.element(Some(branch), setup.node(ret));
-                setup.element(Some(branch), Some(setup.branch(j)?));
-            }
-        }
-        Ok(())
     }
 
     fn incident(&self, line: &CoupledLine, context: &DelayContext<'_>) -> SpiceResult<Vec<Real>> {
