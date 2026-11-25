@@ -118,7 +118,7 @@ pub enum SwitchState {
 
 impl SwitchState {
     /// The C code stored in the state vector.
-    #[must_use]
+    #[must_use = "the returned numeric code represents the switch state in device history"]
     pub const fn code(self) -> Real {
         match self {
             Self::ReallyOff => 0.,
@@ -129,7 +129,7 @@ impl SwitchState {
     }
 
     /// The state for a stored code.
-    #[must_use]
+    #[must_use = "the result decodes a valid stored switch state or rejects it"]
     pub fn from_code(code: Real) -> Option<Self> {
         match code {
             0. => Some(Self::ReallyOff),
@@ -141,7 +141,7 @@ impl SwitchState {
     }
 
     /// True when the on conductance is stamped (`REALLY_ON` or `HYST_ON`).
-    #[must_use]
+    #[must_use = "the result determines which branch conductance is stamped"]
     pub const fn is_closed(self) -> bool {
         matches!(self, Self::ReallyOn | Self::HysteresisOn)
     }
@@ -449,13 +449,13 @@ impl Switch {
     }
 
     /// Which switch this is.
-    #[must_use]
+    #[must_use = "the returned kind identifies the switch control domain"]
     pub const fn kind(&self) -> SwitchKind {
         self.kind
     }
 
     /// The model card's name.
-    #[must_use]
+    #[must_use = "the returned name identifies the referenced switch model"]
     pub fn model_name(&self) -> &str {
         &self.model_name
     }

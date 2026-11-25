@@ -65,7 +65,7 @@ pub struct AnalogCodeModel {
 
 impl AnalogCodeModel {
     /// One differential voltage input and one differential voltage output.
-    #[must_use]
+    #[must_use = "the returned schema declares the analog input and output voltage ports"]
     pub const fn schema() -> super::ModelSchema {
         super::ModelSchema {
             analog_voltage: super::PortCount {

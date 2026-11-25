@@ -334,19 +334,19 @@ impl Program {
     }
 
     /// True when the expression reads `hertz`.
-    #[must_use]
+    #[must_use = "the result identifies expressions that depend on analysis frequency"]
     pub const fn uses_frequency(&self) -> bool {
         self.uses_frequency
     }
 
     /// True when the expression reads explicit transient time.
-    #[must_use]
+    #[must_use = "the result identifies expressions that must be reevaluated as time advances"]
     pub const fn uses_time(&self) -> bool {
         self.uses_time
     }
 
     /// The circuit quantities the expression reads, in variable order.
-    #[must_use]
+    #[must_use = "the returned order binds expression variables to circuit quantities"]
     pub fn quantities(&self) -> &[Quantity] {
         &self.quantities
     }
