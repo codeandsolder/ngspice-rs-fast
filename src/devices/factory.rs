@@ -143,6 +143,14 @@ pub(super) fn instantiate(
     }
     // `a` instances only come from the front end's TABLE/POLY lowering
     // (crate::netlist::behavioural); user XSPICE cards are not parsed.
+    if matches!(instance.designator, 'r' | 'c' | 'l')
+        && instance
+            .parameters
+            .iter()
+            .any(|parameter| matches!(parameter.kind, ParameterKind::Behavioural(_)))
+    {
+        return crate::devices::behavioural::rlc::instantiate(instance, nodes);
+    }
     if matches!(instance.designator, 'b' | 'a') {
         return crate::devices::behavioural::instantiate(instance, nodes);
     }

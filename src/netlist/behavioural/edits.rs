@@ -88,7 +88,14 @@ impl ScopeEdits {
         let mut targets = HashMap::<&str, MeasurementTargets>::new();
         for (index, device) in devices.iter().enumerate() {
             let target = targets.entry(&device.name).or_default();
-            if matches!(device.designator, 'e' | 'h') && NonlinearForm::validate(device)?.is_none()
+            let native_passive = matches!(device.designator, 'r' | 'c' | 'l')
+                && device
+                    .parameters
+                    .iter()
+                    .any(|parameter| matches!(parameter.kind, ParameterKind::Behavioural(_)));
+            if native_passive
+                || (matches!(device.designator, 'e' | 'h')
+                    && NonlinearForm::validate(device)?.is_none())
             {
                 target.simple = true;
             } else if !device.nodes.is_empty() {
