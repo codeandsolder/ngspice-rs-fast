@@ -32,7 +32,10 @@ Resistance uses the implicit law rather than dividing by a possibly
 zero resistance. Multiplicity and temperature factors follow the
 corresponding C behavioural passive transformation. In particular C
 and Q apply reciprocal temperature scaling, R and L reciprocal
-multiplicity. Explicit noise and unsupported instance setters are rejected.
+multiplicity. Signed finite coefficients are preserved, including active
+negative resistance and differential capacitance or inductance. This is
+not a passivity guarantee. Singular constitutive systems and nonfinite
+values produce solver diagnostics. Unsupported instance setters are rejected.
 
 ## Verification
 
@@ -96,7 +99,10 @@ the normalized coordinate x_i is D_leading*physical_i/w^i. Missing native
 initial values default to zero, matching the C implementation. The typed
 engine API also allows equilibrium initialization for non-origin poles
 with zero unconstrained origin-pole coordinates. Gain acts on input forcing,
-not the free response from explicit initial conditions. UIC fixes all
+not the free response from explicit initial conditions. Physical-coordinate
+normalization uses extended binary exponents when an intermediate
+frequency power or quotient is unrepresentable. Only the final
+normalized nonzero coordinate must fit binary64. UIC fixes all
 internal coordinates to their specified values (zero for unspecified
 coordinates) before seeding accepted history.
 
@@ -209,10 +215,41 @@ For a self-current-controlled resistance of 2 kohm at the bias point,
 ngspice 47 output spectral amplitudes both equal
 1.439447175 nV/sqrt(Hz) at the default bias tolerance.
 
+## Coupling and candidate preparation
+
+A K card naming an expression-controlled L has no defined native constant
+coupling inductance. ngspice 47 independently rejects such a card because
+its behavioural transformation removes the named inductor. The native
+diagnostic requires an explicit coupled flux law instead of inventing
+a constant mutual coefficient from a voltage- or current-controlled
+expression. Ordinary constant-inductance K models retain their existing
+coupled-flux implementation.
+
+Numeric model-vector entries are recorded as individual literalization
+sites, with their original expressions and locations. Candidate updates
+therefore invalidate the prepared realization when a coefficient or
+integrator initial value changes. The A/B/A regression includes failed
+zero-denominator candidates and verifies independent DC and AC responses.
+
+## External charge-network verification
+
+An extracted EPC23101 power-FET gate-source, gate-drain and source-drain
+charge network from the publicly available GeecPE2526 simulation deck
+was tested with simultaneous terminal ramps (0.5 to 3.5 V gate and
+10 to 2 V drain over 1 us). The six original capacitance/charge laws
+were retained; the LTspice Q=(...) spelling was normalized to Q={...}.
+With a 1 ns maximum step and tightened reltol=1e-8, abstol=1e-12,
+vntol=1e-9, the native and C47 runs both produced 1008 points.
+Over the interior 10 to 990 ns, the maximum terminal current
+difference between engines was 7.36e-13 A, the native error versus
+analytically differentiated charge was 1.45e-7 A, and terminal KCL
+closed within 5.34e-15 A. This is a charge-network reference, not a
+claim that the full vendor switching model has been ported.
+
 ## Remaining work
 
 Source-dialect E/G LAPLACE normalization is tracked in the preprocessing
-repository (#44), using the native rational transfer model. General high-index right-tangent initialization,
-mutual coupling, broader reference coverage, and nonlinear candidate testing
+repository (#44), using the native rational transfer model. General high-index right-tangent initialization, broader reference
+coverage and further nonlinear candidate preparation improvements
 remain within issue #184. Static statistical realization is documented in
 [PARAM_EXPRESSIONS.md](PARAM_EXPRESSIONS.md).

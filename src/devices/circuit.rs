@@ -1500,6 +1500,15 @@ impl Circuit {
                     )));
                 };
                 let target = &self.devices[index];
+                if target.designator() == 'l'
+                    && target.inductance(&ModelContext::default()).is_none()
+                {
+                    return Err(failure(format!(
+                        "{}: {} has no constant coupling inductance; K with expression-controlled inductors requires an explicit coupled flux law",
+                        device.name(),
+                        target.name()
+                    )));
+                }
                 if target.inductance(&ModelContext::default()).is_none()
                     || self.bindings.branch_rows[index].len() != 1
                 {

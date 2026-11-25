@@ -251,6 +251,22 @@ fn expression_at(source: &Netlist, kind: SiteKind) -> Option<&ParameterExpressio
                 _ => None,
             }
         }
+        SiteKind::DeviceVectorEntry {
+            device,
+            parameter,
+            entry,
+        } => match &source.devices.get(device)?.parameters.get(parameter)?.kind {
+            ParameterKind::NumericVector(entries) => entries.get(entry)?.expression.as_deref(),
+            _ => None,
+        },
+        SiteKind::ModelVectorEntry {
+            model,
+            parameter,
+            entry,
+        } => match &source.models.get(model)?.parameters.get(parameter)?.kind {
+            ParameterKind::NumericVector(entries) => entries.get(entry)?.expression.as_deref(),
+            _ => None,
+        },
         SiteKind::AnalysisArgument { analysis, argument } => source
             .analyses
             .get(analysis)?

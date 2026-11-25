@@ -501,3 +501,77 @@ fn transfer_observations_distinguish_input_output_and_state_coordinates() -> Spi
     );
     Ok(())
 }
+
+#[test]
+fn physical_integrator_initial_values_survive_extreme_frequency_normalization() -> SpiceResult<()> {
+    // At order two the frequency power itself is outside binary64, but
+    // D_leading * physical / frequency^2 is exactly order unity.
+    for (frequency, leading, physical) in
+        [("1e200", "1e100", "1e300"), ("1e-200", "1e-100", "1e-300")]
+    {
+        let deck = parsed(&format!(
+            "v1 in 0 0\na1 in out mdl\nr1 out 0 1k\n.model mdl s_xfer(num_coeff=[{leading} 0 0] den_coeff=[{leading} {leading} {leading} {leading}] denormalized_freq={frequency} int_ic=[{physical} 0 0])"
+        ))?;
+        let mut c = Circuit::from_netlist(&deck)?;
+        let plot = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
+        close(
+            plot.value("state(a1,2)", 0).unwrap(),
+            Complex::real(1.),
+            1e-12,
+        );
+        close(plot.value("v(out)", 0).unwrap(), Complex::real(1.), 1e-12);
+    }
+    Ok(())
+}
+
+#[test]
+fn model_vector_candidates_invalidate_transfer_realization_transactionally() -> SpiceResult<()> {
+    use ngspice_rs::analysis::optimization::parameters::{CandidateTopology, CircuitParameterPlan};
+    use ngspice_rs::netlist::eval::EvalBudget;
+
+    let source = parsed(
+        ".param g=2 p=1 initial=0.4\nv1 in 0 dc 1 ac 1\na1 in out mdl\nr1 out 0 1k\n.model mdl s_xfer(num_coeff=[{g}] den_coeff=[{p} {p}] denormalized_freq=1000 int_ic=[{initial}])",
+    )?;
+    let plan = CircuitParameterPlan::new(source, &["g", "p", "initial"])?;
+    assert_eq!(plan.sites().len(), 4);
+    let mut session = plan.session()?;
+    for (gain, pole, initial) in [(2., 1., 0.4), (3., 2., 0.6), (2., 1., 0.4)] {
+        session.update(&[gain, pole, initial], &mut EvalBudget::default())?;
+        assert_eq!(
+            session.topology(),
+            if gain == 2. {
+                CandidateTopology::Reused
+            } else {
+                CandidateTopology::Rebuilt
+            },
+        );
+        let context = session.analysis_context();
+        let op = AnalysisInput::new(AnalysisKind::OperatingPoint)
+            .resolve()?
+            .run(session.circuit_mut(), &context)?;
+        close(
+            op.value("v(out)", 0).unwrap(),
+            Complex::real(gain * initial),
+            1e-12,
+        );
+        let ac = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "1", "100", "100"])
+            .resolve()?
+            .run(session.circuit_mut(), &context)?;
+        close(
+            ac.value("v(out)", 0).unwrap(),
+            Complex::real(gain / pole) / Complex::new(1., std::f64::consts::TAU * 0.1),
+            1e-12,
+        );
+    }
+    assert!(
+        session
+            .update(&[2., 0., 0.4], &mut EvalBudget::default())
+            .is_err()
+    );
+    let context = session.analysis_context();
+    let op = AnalysisInput::new(AnalysisKind::OperatingPoint)
+        .resolve()?
+        .run(session.circuit_mut(), &context)?;
+    close(op.value("v(out)", 0).unwrap(), Complex::real(0.8), 1e-12);
+    Ok(())
+}

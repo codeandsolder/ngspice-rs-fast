@@ -48,6 +48,24 @@ pub enum SiteKind {
         /// Parameter index.
         parameter: usize,
     },
+    /// One entry of a device numeric vector.
+    DeviceVectorEntry {
+        /// Device index.
+        device: usize,
+        /// Parameter index.
+        parameter: usize,
+        /// Vector entry index.
+        entry: usize,
+    },
+    /// One entry of a model numeric vector.
+    ModelVectorEntry {
+        /// Model index.
+        model: usize,
+        /// Parameter index.
+        parameter: usize,
+        /// Vector entry index.
+        entry: usize,
+    },
     /// `Netlist::analyses[analysis].arguments[argument]`.
     AnalysisArgument {
         /// Analysis index.
@@ -243,6 +261,31 @@ pub fn literalize_with(
     })
 }
 
+#[derive(Clone, Copy)]
+enum ParameterOwner {
+    Device(usize),
+    Model(usize),
+}
+
+impl ParameterOwner {
+    const fn site(self, parameter: usize, entry: Option<usize>) -> SiteKind {
+        match (self, entry) {
+            (Self::Device(device), None) => SiteKind::DeviceParameter { device, parameter },
+            (Self::Model(model), None) => SiteKind::ModelParameter { model, parameter },
+            (Self::Device(device), Some(entry)) => SiteKind::DeviceVectorEntry {
+                device,
+                parameter,
+                entry,
+            },
+            (Self::Model(model), Some(entry)) => SiteKind::ModelVectorEntry {
+                model,
+                parameter,
+                entry,
+            },
+        }
+    }
+}
+
 fn literalize_device_models(
     devices: &mut [DeviceInstance],
     models: &mut [ModelCard],
@@ -264,10 +307,7 @@ fn literalize_device_models(
             scope,
             budget,
             sites.as_deref_mut(),
-            |p| SiteKind::DeviceParameter {
-                device: di,
-                parameter: p,
-            },
+            ParameterOwner::Device(di),
         )?;
     }
     for (mi, model) in models.iter_mut().enumerate() {
@@ -276,10 +316,7 @@ fn literalize_device_models(
             scope,
             budget,
             sites.as_deref_mut(),
-            |p| SiteKind::ModelParameter {
-                model: mi,
-                parameter: p,
-            },
+            ParameterOwner::Model(mi),
         )?;
     }
     Ok(())
@@ -401,11 +438,11 @@ fn literalize_parameters(
     scope: &ParamScope,
     budget: &mut EvalBudget,
     mut sites: Option<&mut Vec<ResolvedSite>>,
-    kind: impl Fn(usize) -> SiteKind,
+    owner: ParameterOwner,
 ) -> SpiceResult<()> {
     for (index, parameter) in parameters.iter_mut().enumerate() {
         if let ParameterKind::NumericVector(entries) = &mut parameter.kind {
-            for entry in entries.iter_mut() {
+            for (entry_index, entry) in entries.iter_mut().enumerate() {
                 if let Some(expression) = entry.expression.take() {
                     let value =
                         scope
@@ -420,7 +457,17 @@ fn literalize_parameters(
                                 ),
                                 other => other,
                             })?;
-                    entry.source.text = format_literal(value);
+                    let text = format_literal(value);
+                    if let Some(sites) = sites.as_deref_mut() {
+                        sites.push(ResolvedSite::record(
+                            owner.site(index, Some(entry_index)),
+                            entry.source.text.clone(),
+                            expression.span.start.clone(),
+                            value,
+                            &text,
+                        )?);
+                    }
+                    entry.source.text = text;
                 }
             }
             parameter.value = entries
@@ -467,7 +514,7 @@ fn literalize_parameters(
         let text = format_literal(value);
         if let Some(sites) = sites.as_deref_mut() {
             sites.push(ResolvedSite::record(
-                kind(index),
+                owner.site(index, None),
                 parameter.value.clone(),
                 expression.span.start.clone(),
                 value,
