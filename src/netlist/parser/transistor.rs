@@ -120,18 +120,32 @@ fn mos_connections<'a>(input: &mut Input<'a>) -> Result<Connections<'a>> {
     )
         .parse_next(input)?;
     let candidate = peek(name("bulk terminal")).parse_next(input)?;
-    // C scans from the third port (for VDMOS), so a declared model at this slot
-    // cannot be silently treated as a bulk node for an ordinary MOS instance.
+    // C scans for a declared model immediately after the third port for
+    // VDMOS; do not manufacture a bulk terminal. Family validation happens
+    // after the entire model catalog is resolved, so an ordinary MOS with
+    // omitted bulk is still a loud elaboration error, not reinterpreted.
     if is_declared_model(input, candidate) {
-        return Err(malformed(
-            input,
-            "expected bulk terminal before the MOS model (three-terminal VDMOS is not supported)",
-        ));
+        if !input.state.declared_models.is_vdmos(&candidate.text) {
+            return Err(malformed(input, "MOS instance requires a bulk terminal"));
+        }
+        return Ok((vec![drain, gate, source], declared_model(input)?));
     }
     let bulk = name("bulk terminal").parse_next(input)?;
     let candidate = peek(name("MOS model name")).parse_next(input)?;
     if !is_declared_model(input, candidate) {
-        // C's SOI/HiSIM/thermal variants can take 5–7 ports; retain a loud gap.
+        // The VDMOS self-heating syntax has two additional explicit thermal
+        // terminals after D/G/S, with no bulk node. It is resolved against
+        // the model family during elaboration, not guessed by token count.
+        if input
+            .input
+            .get(1)
+            .is_some_and(|next| input.state.declared_models.is_vdmos(&next.text))
+        {
+            let case = name("VDMOS case thermal terminal").parse_next(input)?;
+            let model = declared_model(input)?;
+            return Ok((vec![drain, gate, source, bulk, case], model));
+        }
+        // C's SOI/HiSIM/thermal variants can take 6–7 ports; retain a loud gap.
         if input
             .input
             .iter()
@@ -155,7 +169,7 @@ fn parameters(input: &mut Input<'_>, designator: char) -> Result<Vec<ParameterAs
     let mut parameters: Vec<ParameterAssignment> = repeat(
         0..,
         alt((
-            super::flags::instance,
+            super::flags::transistor_instance,
             super::ic::vector,
             |input: &mut Input<'_>| scalar_assignment(input, designator),
             invalid_parameter,

@@ -172,6 +172,7 @@ struct TopologyBindings {
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
     stochastic_sources: Vec<usize>,
+    contextual_devices: Vec<usize>,
     mutual: MutualBinding,
     identity: Option<TopologyId>,
 }
@@ -1739,6 +1740,12 @@ impl Circuit {
             .enumerate()
             .filter_map(|(ordinal, device)| device.has_stochastic_source().then_some(ordinal))
             .collect();
+        self.bindings.contextual_devices = self
+            .devices
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, device)| device.has_context_preparation().then_some(ordinal))
+            .collect();
         self.bindings.names = names;
         self.bindings.identity = Some(TopologyId::allocate()?);
         Ok(())
@@ -2922,6 +2929,30 @@ impl Circuit {
     }
 
     fn replacements_with_overrides(
+        &self,
+        context: &ModelContext,
+        overrides: &[CandidateNumericOverride],
+    ) -> SpiceResult<Vec<(usize, Box<dyn Device>)>> {
+        let mut replacements = self.numeric_replacements(context, overrides)?;
+        for &ordinal in &self.bindings.contextual_devices {
+            match replacements.binary_search_by_key(&ordinal, |(index, _)| *index) {
+                Ok(index) => {
+                    if let Some(device) = replacements[index].1.prepare_context(context)? {
+                        replacements[index].1 = device;
+                    }
+                }
+                Err(index) => {
+                    if let Some(device) = self.devices[ordinal].prepare_context(context)? {
+                        replacements.insert(index, (ordinal, device));
+                    }
+                }
+            }
+        }
+        self.validate_replacements(&replacements)?;
+        Ok(replacements)
+    }
+
+    fn numeric_replacements(
         &self,
         context: &ModelContext,
         overrides: &[CandidateNumericOverride],

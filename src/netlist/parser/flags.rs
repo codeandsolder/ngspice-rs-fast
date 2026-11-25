@@ -3,8 +3,8 @@
 //! Base model type tokens are not assignments; tail type flags are setters.
 //! See `docs/port/FRONTEND_VALUES.md` for the exhaustive supported/gap table.
 
-use winnow::Parser as _;
 use winnow::token::any;
+use winnow::{Parser as _, combinator::alt};
 
 use crate::netlist::ast::{ParameterAssignment, ParameterKind};
 use crate::netlist::token::{Token, TokenKind};
@@ -17,6 +17,14 @@ pub(super) fn instance(input: &mut Input<'_>) -> Result<ParameterAssignment> {
     flag(input, token)
 }
 
+/// MOS/VDMOS and BJT instance flags. The VDMOS model backend validates
+/// `thermal` together with its two explicit thermal terminals; no flag is
+/// silently used to invent missing circuit nodes.
+pub(super) fn transistor_instance(input: &mut Input<'_>) -> Result<ParameterAssignment> {
+    let token = alt((keyword("off"), keyword("thermal"))).parse_next(input)?;
+    flag(input, token)
+}
+
 pub(super) fn model(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
     let token = any
         .verify(|token: &Token| {
@@ -25,6 +33,7 @@ pub(super) fn model(input: &mut Input<'_>, base: &str) -> Result<ParameterAssign
                 "d" => key == "d",
                 "npn" | "pnp" => matches!(key.as_str(), "npn" | "pnp"),
                 "nmos" | "pmos" => matches!(key.as_str(), "nmos" | "pmos"),
+                "vdmos" | "vdmosn" | "vdmosp" => matches!(key.as_str(), "pchan" | "nchan"),
                 // SW_MOD_SW / CSW_CSW: "just says that this is a switch".
                 "sw" => key == "sw",
                 "csw" => key == "csw",

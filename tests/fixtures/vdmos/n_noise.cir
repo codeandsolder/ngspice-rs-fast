@@ -1,0 +1,14 @@
+Ngspice47 VDMOS thermal and flicker noise source reference
+vdd supply 0 DC 12 AC 1
+vgate gate 0 4
+rload supply drain 10
+m1 drain gate 0 dut
+.model dut vdmos(vto=3 kp=20 rd=0.12 rs=0.08 rg=0.9 rb=0.025 is=1e-14 kf=1e-26 af=1.2)
+.control
+noise v(drain) vdd dec 4 1k 1Meg 1
+setplot noise1
+print frequency onoise_spectrum inoise_spectrum
+print onoise_m1_rd onoise_m1_rs onoise_m1_id onoise_m1_1overf onoise_m1
+quit
+.endc
+.end

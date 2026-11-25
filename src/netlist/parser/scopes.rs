@@ -159,6 +159,7 @@ struct LexicalModels<'a> {
     parent: Option<usize>,
     names: BTreeSet<Cow<'a, str>>,
     bins: BTreeSet<Cow<'a, str>>,
+    vdmos: BTreeSet<Cow<'a, str>>,
 }
 
 impl<'a> LexicalModels<'a> {
@@ -232,6 +233,13 @@ impl<'a> ModelIndex<'a> {
                 Some(DotCommand::Model) if !in_control && depth <= MAX_SCOPE_DEPTH => {
                     if let Some(name) = entry.source.tokens.get(1).filter(|t| t.is_name_like()) {
                         scopes[active].insert(&name.text);
+                        if entry.source.tokens.get(2).is_some_and(|t| {
+                            ["vdmos", "vdmosn", "vdmosp"]
+                                .iter()
+                                .any(|kind| t.is_keyword(kind))
+                        }) {
+                            scopes[active].vdmos.insert(folded(&name.text));
+                        }
                     }
                 }
                 _ => {}
@@ -265,6 +273,18 @@ pub(super) struct ModelVisibility<'a> {
 }
 
 impl ModelVisibility<'_> {
+    pub(super) fn is_vdmos(self, name: &str) -> bool {
+        let name = folded(name);
+        let mut current = self.scopes.get(self.scope);
+        while let Some(scope) = current {
+            if scope.names.contains(name.as_ref()) {
+                return scope.vdmos.contains(name.as_ref());
+            }
+            current = scope.parent.map(|index| &self.scopes[index]);
+        }
+        false
+    }
+
     pub(super) fn contains(self, name: &str, allow_bins: bool) -> bool {
         let name = folded(name);
         let mut current = self.scopes.get(self.scope);

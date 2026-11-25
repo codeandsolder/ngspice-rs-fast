@@ -843,6 +843,12 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
+    /// Whether a compiled noise density or injection depends on frequency.
+    /// The noise driver refreshes generators without rebuilding the AC pencil.
+    fn noise_depends_on_frequency(&self) -> bool {
+        false
+    }
+
     /// The device's accepted-waveform delay history behaviour (transmission
     /// lines), or `None` (the default). See [`crate::devices::delay`]: such a
     /// device reads its history while stamping
@@ -926,6 +932,22 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// Invalid contextual parameters or nonfinite derived device inputs.
     fn validate_dc_inputs(&self, _context: &crate::devices::ModelContext) -> SpiceResult<()> {
         Ok(())
+    }
+
+    /// Whether immutable instance preparation depends on the load context.
+    fn has_context_preparation(&self) -> bool {
+        false
+    }
+
+    /// Prepare a topology-preserving replacement at a context boundary.
+    ///
+    /// # Errors
+    /// Invalid physical context.
+    fn prepare_context(
+        &self,
+        _context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Option<Box<dyn Device>>> {
+        Ok(None)
     }
 
     /// Loads the device's contribution into the MNA system for one trial.

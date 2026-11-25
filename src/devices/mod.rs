@@ -76,6 +76,7 @@ pub mod noise;
 pub mod nonlinear;
 pub mod nport;
 pub mod passive;
+pub mod prepared_model;
 pub mod pulse;
 pub mod rf_passive;
 pub use passive::PassiveParameters;
@@ -95,6 +96,7 @@ pub mod switch;
 pub mod tline;
 pub mod txl;
 pub mod urc;
+pub mod vdmos;
 pub use functions::{
     AmSpec, ExpSpec, FunctionSpec, PwlBreakpoints, PwlSource, SffmSpec, SineSpec, SourceFunction,
 };

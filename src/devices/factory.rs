@@ -61,6 +61,29 @@ pub(super) fn instantiate_with_models(
     let Some(model) = models.resolve(instance)? else {
         return instantiate(instance, nodes);
     };
+    // Port counts are backend-specific. A three-terminal MOS cannot be
+    // silently bound to a bulk-MOS, nor may VDMOS ignore a fourth terminal.
+    if instance.designator == 'm' {
+        let vdmos = model.levels().backend == ModelBackend::Vdmos;
+        let thermal = instance.parameters.iter().any(|p| p.name == "thermal");
+        let expected = if vdmos {
+            if thermal { 5 } else { 3 }
+        } else {
+            4
+        };
+        if instance.nodes.len() != expected {
+            return Err(SpiceError::Unsupported {
+                feature: format!(
+                    "{}: {}-terminal {} connection required, got {}",
+                    instance.name,
+                    expected,
+                    if vdmos { "VDMOS" } else { "bulk MOS" },
+                    instance.nodes.len()
+                ),
+                location: Some(instance.location.clone()),
+            });
+        }
+    }
     // The resolver has already selected a concrete backend. Exhaustive
     // dispatch means a new catalog backend cannot silently choose another.
     match model.levels().backend {
@@ -90,6 +113,7 @@ pub(super) fn instantiate_with_models(
         }
         ModelBackend::Bsim3 => crate::devices::bsim3::instantiate(instance, nodes, &model, context),
         ModelBackend::Bsim4 => crate::devices::bsim4::instantiate(instance, nodes, &model, context),
+        ModelBackend::Vdmos => crate::devices::vdmos::instantiate(instance, nodes, &model, context),
         ModelBackend::Jfet => {
             crate::devices::jfet::Jfet::instantiate(instance, nodes, &model, context)
         }

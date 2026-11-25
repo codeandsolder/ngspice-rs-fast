@@ -87,6 +87,10 @@ pub enum NoiseFamily {
     Resistor,
     /// `sw`, the S switch (`swnoise.c`).
     VoltageSwitch,
+    /// Native VDMOS, last in the reference C device table.
+    Vdmos,
+    /// Native compiled physical model.
+    Prepared,
 }
 
 /// The physical law of one noise generator, evaluated at the bias point.
@@ -289,17 +293,57 @@ impl NoiseKind {
     }
 }
 
-/// One noise generator: a current source between `nodes` (C's `node1`,
-/// `node2` of `NevalSrc`), named by `suffix` after the instance name
-/// (`onoise_<instance><suffix>`, e.g. `_thermal`, `_rb`, `_1overf`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct NoiseSource {
-    /// C's generator name suffix, including the leading underscore.
-    pub suffix: &'static str,
-    /// The first node pair, in reference order (sign matters for coherent noise).
-    pub nodes: [NodeId; 2],
-    /// The generator's law at the bias point.
-    pub kind: NoiseKind,
+/// One independent physical generator. Generalized injections are coherent
+/// within a source, and different sources are statistically independent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NoiseSource {
+    /// Reference branch noise law.
+    Branch {
+        /// Output name suffix.
+        suffix: &'static str,
+        /// Ordered branch endpoints.
+        nodes: [NodeId; 2],
+        /// Physical noise law.
+        kind: NoiseKind,
+    },
+    /// A compiled generator with a frequency-local density and arbitrary
+    /// complex injection coefficients (including nonelectrical equations).
+    Generalized {
+        /// Output name suffix.
+        suffix: String,
+        /// Nonnegative source spectral density.
+        density: Real,
+        /// Ordered circuit row injections before ground elimination.
+        injections: Vec<(NodeId, Complex)>,
+    },
+}
+
+impl NoiseSource {
+    /// Generator output name suffix.
+    #[must_use]
+    pub fn suffix(&self) -> &str {
+        match self {
+            Self::Branch { suffix, .. } => suffix,
+            Self::Generalized { suffix, .. } => suffix,
+        }
+    }
+
+    fn validate(&self) -> bool {
+        match self {
+            Self::Branch { kind, .. } => kind.validate(),
+            Self::Generalized {
+                suffix,
+                density,
+                injections,
+            } => {
+                !suffix.is_empty()
+                    && density.is_finite()
+                    && *density >= 0.
+                    && !injections.is_empty()
+                    && injections.iter().all(|(_, gain)| gain.is_finite())
+            }
+        }
+    }
 }
 
 const fn valid_frequency(frequency: Real) -> bool {
@@ -351,7 +395,7 @@ impl NoiseSource {
     /// A generator.
     #[must_use]
     pub const fn new(suffix: &'static str, nodes: [NodeId; 2], kind: NoiseKind) -> Self {
-        Self {
+        Self::Branch {
             suffix,
             nodes,
             kind,
@@ -457,9 +501,7 @@ pub struct InputSource {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BOLTZMANN, CHARGE, FlickerLaw, NoiseKind, NoiseSource, correlated_gain, squared_gain,
-    };
+    use super::{BOLTZMANN, CHARGE, FlickerLaw, NoiseKind, correlated_gain, squared_gain};
     use crate::primitives::{Complex, NodeId, SpiceError};
 
     #[test]
@@ -558,17 +600,13 @@ mod tests {
     fn coherent_source_evaluation_observes_both_ordered_transfers() {
         let first = [NodeId::new(1), NodeId::GROUND];
         let second = [NodeId::new(2), NodeId::GROUND];
-        let source = NoiseSource::new(
-            ".corl",
-            first,
-            NoiseKind::CorrelatedThermal {
-                conductance: 4.,
-                second,
-                second_conductance: 4.,
-                phase: 0.,
-                temperature: 300.,
-            },
-        );
+        let source = NoiseKind::CorrelatedThermal {
+            conductance: 4.,
+            second,
+            second_conductance: 4.,
+            phase: 0.,
+            temperature: 300.,
+        };
         let cancellation = |nodes| {
             if nodes == first {
                 Complex::new(2., -3.)
@@ -579,7 +617,6 @@ mod tests {
         };
         assert_eq!(
             source
-                .kind
                 .output_density(cancellation(first), Some(cancellation(second)), 100.)
                 .unwrap()
                 .to_bits(),
@@ -587,7 +624,6 @@ mod tests {
         );
         assert_eq!(
             source
-                .kind
                 .output_density(Complex::new(2., -3.), Some(Complex::new(2., -3.)), 100.)
                 .unwrap()
                 .to_bits(),
@@ -595,32 +631,24 @@ mod tests {
         );
         assert!(
             source
-                .kind
                 .output_density(Complex::real(f64::MAX), Some(Complex::real(f64::MAX)), 100.)
                 .is_err()
         );
         assert!(
             source
-                .kind
                 .output_density(cancellation(first), Some(cancellation(second)), 0.)
                 .is_err()
         );
 
-        let invalid = NoiseSource::new(
-            ".corl",
-            first,
-            NoiseKind::CorrelatedThermal {
-                conductance: -1.,
-                second,
-                second_conductance: 4.,
-                phase: 0.,
-                temperature: 300.,
-            },
-        );
+        let invalid = NoiseKind::CorrelatedThermal {
+            conductance: -1.,
+            second,
+            second_conductance: 4.,
+            phase: 0.,
+            temperature: 300.,
+        };
         assert!(matches!(
-            invalid
-                .kind
-                .output_density(cancellation(first), Some(cancellation(second)), 100.),
+            invalid.output_density(cancellation(first), Some(cancellation(second)), 100.),
             Err(SpiceError::Numerical { .. })
         ));
     }
