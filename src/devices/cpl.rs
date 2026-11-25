@@ -4,6 +4,7 @@
 //! return, then N output conductors and one output return. Currents at both
 //! ends are defined entering the line. General noncommuting matrices are
 //! handled by one 2N-dimensional telegrapher state-space propagator.
+mod lossless;
 pub mod modes;
 pub mod plan;
 mod transient;
@@ -33,7 +34,7 @@ fn invalid(message: impl std::fmt::Display) -> SpiceError {
 pub struct CoupledLine {
     name: String,
     /// Shared, validated R/L/G/C and length.
-    pub plan: Arc<CoupledLinePlan>,
+    plan: Arc<CoupledLinePlan>,
     input: Vec<NodeId>,
     output: Vec<NodeId>,
     input_return: NodeId,
@@ -41,6 +42,7 @@ pub struct CoupledLine {
     terminals: Vec<NodeId>,
     /// Number of finite-volume spatial sections for the transient companion.
     sections: usize,
+    lossless: Option<lossless::LosslessModes>,
 }
 type CplMaterialVectors = std::collections::BTreeMap<String, Vec<Real>>;
 
@@ -235,6 +237,7 @@ impl CoupledLine {
         terminals.push(input_return);
         terminals.extend_from_slice(&output);
         terminals.push(output_return);
+        let lossless = lossless::LosslessModes::prepare(&plan)?;
         Ok(Self {
             name,
             plan,
@@ -244,6 +247,7 @@ impl CoupledLine {
             output_return,
             terminals,
             sections: 64,
+            lossless,
         })
     }
 
@@ -334,6 +338,9 @@ impl CoupledLine {
         unknowns: &MnaUnknowns,
         first_branch: usize,
     ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
+        if let Some(modes) = &self.lossless {
+            return modes.frequency_stamps(self, hz, unknowns, first_branch);
+        }
         // A passive, heavily attenuating cable has finite terminal Y even
         // when its full length ABCD expm would overflow or lose reciprocity
         // through cancellation. Stamp the stable Norton two-port then.
@@ -524,17 +531,31 @@ impl Device for CoupledLine {
     }
 
     fn branch_currents(&self) -> usize {
-        self.conductors()
+        self.conductors() * if self.lossless.is_some() { 2 } else { 1 }
+    }
+
+    fn delay_line(&self) -> Option<&dyn crate::devices::delay::DelayLine> {
+        self.lossless
+            .as_ref()
+            .map(|_| self as &dyn crate::devices::delay::DelayLine)
     }
 
     fn state_count(&self) -> usize {
-        self.spatial_state_count()
+        if self.lossless.is_some() {
+            0
+        } else {
+            self.spatial_state_count()
+        }
     }
 
     fn setup_matrix(
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
+        if let Some(modes) = &self.lossless {
+            modes.setup(self, setup)?;
+            return Ok(true);
+        }
         let conductors = self.conductors();
         for i in 0..conductors {
             let branch_i = setup.branch(i)?;
@@ -569,7 +590,9 @@ impl Device for CoupledLine {
         match context.mode {
             AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
                 let first = context.branch(0)?;
-                self.dc_spatial_state(context)?;
+                if self.lossless.is_none() {
+                    self.dc_spatial_state(context)?;
+                }
                 for (row, col, value) in self.transfer_stamps_at(0., context.unknowns, first)? {
                     if value.im != 0. {
                         return Err(invalid("DC line constraint requires a real MNA stamp"));
@@ -579,7 +602,10 @@ impl Device for CoupledLine {
                 Ok(())
             }
             AnalysisMode::Ac { .. } => Err(invalid("AC transfer belongs to assemble_small_signal")),
-            AnalysisMode::Transient { .. } => {
+            AnalysisMode::Transient { time, .. } => {
+                if let Some(modes) = &self.lossless {
+                    return modes.stamp_transient(self, context, time);
+                }
                 let coefficients = context.integration.ok_or_else(|| {
                     invalid("transient cable requires companion integration coefficients")
                 })?;

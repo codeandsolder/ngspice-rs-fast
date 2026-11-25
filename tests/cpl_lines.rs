@@ -166,7 +166,7 @@ fn model_rejects_nonphysical_singular_and_oversized_materials() {
             &[0.],
             &[1.],
             CoupledLineLimits {
-                max_conductors: 0,
+                conductors: 0,
                 ..limit
             }
         )
@@ -181,7 +181,7 @@ fn model_rejects_nonphysical_singular_and_oversized_materials() {
             &[0.],
             &[1.],
             CoupledLineLimits {
-                max_workspace_bytes: 0,
+                workspace_bytes: 0,
                 ..limit
             }
         )
@@ -523,7 +523,7 @@ fn coupled_multiconductor_transient_preserves_initial_dc_steady_state() {
 #[test]
 fn coupled_multiconductor_transient_propagates_a_delayed_pulse_causally() {
     // 50-ohm matched distributed line: delay=length*sqrt(LC)=1 ns,
-    // section count 64. The far end cannot respond before the pulse and
+    // independent of the section setting. The far end cannot respond before the pulse and
     // should approach the half-amplitude matched limit after the delay.
     let plot = run_transient_cpl(
         "vin source 0 pulse(0 1 2n 0.5n 0.5n 3n 8n)\n\
@@ -538,9 +538,9 @@ fn coupled_multiconductor_transient_propagates_a_delayed_pulse_causally() {
     assert_eq!(values.len(), times.len());
     assert!(values.len() > 25);
     for (&time, &voltage) in times.iter().zip(&values) {
-        if time <= 2e-9 {
+        if time <= 3e-9 {
             assert!(
-                voltage.abs() < 1e-7,
+                voltage.abs() < 1e-10,
                 "noncausal response at {time}: {voltage}"
             );
         }
@@ -932,6 +932,135 @@ fn ideal_zero_series_transient_matches_exact_lumped_shunt() {
             (actual - expected).abs() < 2e-5,
             "zero-Z distributed cable and exactly equivalent lumped shunt at {sample}: \
              {actual} vs {expected}"
+        );
+    }
+}
+
+#[test]
+fn reciprocal_lossless_modes_have_distinct_exact_wavefronts_and_matched_amplitudes() {
+    // L=50² C, hence both independently known even/odd impedances are 50 Ω.
+    // C_even=60 pF/m, C_odd=140 pF/m, length=0.2 m: 0.6/1.4 ns delays.
+    // Exciting only conductor 1 launches equal even and odd waves; their
+    // sum/difference at the far end is not a decoupled-line approximation.
+    let plot = run_transient_cpl(
+        "vin source 0 pulse(0 1 2n 0.4n 0.4n 3n 10n)\n\
+         rs source a1 50\n\
+         rz a2 0 50\n\
+         p1 a1 a2 0 b1 b2 0 cable\n\
+         rl1 b1 0 50\n\
+         rl2 b2 0 50\n\
+         .model cable cpl r=0 0 0 g=0 0 0 l=250n -100n 250n c=100p -40p 100p length=0.2\n\
+         .tran 0.025n 6n 0 0.025n",
+    );
+    let times = transient_column(&plot, "time");
+    let b1 = transient_column(&plot, "v(b1)");
+    let b2 = transient_column(&plot, "v(b2)");
+    let pulse =
+        |t: f64| ((t - 2e-9) / 0.4e-9).clamp(0., 1.) - ((t - 5.4e-9) / 0.4e-9).clamp(0., 1.);
+    assert!(times.len() > 100);
+    for ((&time, &first), &second) in times.iter().zip(&b1).zip(&b2) {
+        let even = pulse(time - 0.6e-9);
+        let odd = pulse(time - 1.4e-9);
+        let first_expected = 0.25 * (even + odd);
+        let second_expected = 0.25 * (even - odd);
+        assert!(
+            (first - first_expected).abs() < 2e-8,
+            "b1 at {time:.17e}: {first:.17e} vs {first_expected:.17e}"
+        );
+        assert!(
+            (second - second_expected).abs() < 2e-8,
+            "b2 at {time:.17e}: {second:.17e} vs {second_expected:.17e}"
+        );
+    }
+}
+
+#[test]
+fn lossless_modal_history_starts_at_dc_bias_without_an_artificial_wavefront() {
+    let plot = run_transient_cpl(
+        "vin source 0 dc 1\n\
+         rs source a 50\n\
+         p1 a 0 b 0 cable\n\
+         rl b 0 75\n\
+         .model cable cpl r=0 g=0 l=250n c=100p length=0.2\n\
+         .tran 0.05n 5n",
+    );
+    let voltages = transient_column(&plot, "v(b)");
+    assert!(voltages.len() > 10);
+    for voltage in voltages {
+        assert!(
+            (voltage - 0.6).abs() < 1e-10,
+            "DC initialized wave: {voltage:.17e}"
+        );
+    }
+}
+
+#[test]
+fn noncommuting_three_conductor_modal_transport_matches_independent_reciprocal_basis() {
+    // Construct independent power-normalized modal bases V = 8 B and
+    // I = B^(-T)/8, B lower triangular with B21=B32=0.2, B31=0.04.
+    // L = V diag(1,2,3) V^T nH, C = I diag(1,2,3) I^T nF.
+    // The 1 m cable has three known unequal delays and noncommuting L,C.
+    // Both ends are terminated in Y=I I^T using physical resistors, and
+    // a 20 mA Norton source on conductor 3 excites all three modes.
+    let plot = run_transient_cpl(
+        "iin 0 a3 pulse(0 0.02 1n 0.4n 0.4n 4n 20n)\n\
+         ra12 a1 a2 320\nra23 a2 a3 320\n\
+         ra1 a1 0 76.19047619047619\nra2 a2 0 100\nra3 a3 0 80\n\
+         rb12 b1 b2 320\nrb23 b2 b3 320\n\
+         rb1 b1 0 76.19047619047619\nrb2 b2 0 100\nrb3 b3 0 80\n\
+         p1 a1 a2 a3 0 b1 b2 b3 0 cable\n\
+         .model cable cpl r=0 0 0 0 0 0 g=0 0 0 0 0 0\n\
+         + l=64n 12.8n 2.56n 130.56n 26.112n 197.2224n\n\
+         + c=16.875p -6.25p 0 33.125p -9.375p 46.875p length=1\n\
+         .tran 0.025n 8n 0 0.025n",
+    );
+    let times = transient_column(&plot, "time");
+    let outputs = ["v(b1)", "v(b2)", "v(b3)"].map(|name| transient_column(&plot, name));
+    let pulse =
+        |t: f64| ((t - 1e-9) / 0.4e-9).clamp(0., 1.) - ((t - 5.4e-9) / 0.4e-9).clamp(0., 1.);
+    assert!(times.len() > 200);
+    for (index, &time) in times.iter().enumerate() {
+        let [a, b, c] = [1e-9, 2e-9, 3e-9].map(|delay| pulse(time - delay));
+        let expected = [
+            0.0256 * a,
+            0.00512 * a + 0.128 * b,
+            0.001024 * a + 0.0256 * b + 0.64 * c,
+        ];
+        for (output, target) in outputs.iter().zip(expected) {
+            let actual = output[index];
+            assert!(
+                (actual - target).abs() < 2e-8,
+                "noncommuting three-mode transport at {time:.17e}: {actual:.17e} vs {target:.17e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mismatched_modal_line_preserves_bidirectional_reflection_series() {
+    // For 50 ohms, source 25 ohms and load 100 ohms, the source/load
+    // reflection coefficients are -1/3 and +1/3, respectively. The
+    // first far-end amplitude is 8/9; each round trip multiplies by -1/9.
+    let plot = run_transient_cpl(
+        "vin source 0 pulse(0 1 1n 0.4n 0.4n 20n 40n)\n\
+         rs source a 25\n\
+         p1 a 0 b 0 cable\n\
+         rl b 0 100\n\
+         .model cable cpl r=0 g=0 l=250n c=100p length=0.2\n\
+         .tran 0.025n 12n 0 0.025n",
+    );
+    let times = transient_column(&plot, "time");
+    let values = transient_column(&plot, "v(b)");
+    assert!(times.len() > 300);
+    for (&time, &actual) in times.iter().zip(&values) {
+        let expected = (0_i32..6).fold(0., |sum, round_trip| {
+            let delay = (1. + 2. * f64::from(round_trip)) * 1e-9;
+            let pulse = ((time - delay - 1e-9) / 0.4e-9).clamp(0., 1.);
+            ((8. / 9.) * (-1.0_f64 / 9.).powi(round_trip)).mul_add(pulse, sum)
+        });
+        assert!(
+            (actual - expected).abs() < 2e-8,
+            "multiple reflection at {time:.17e}: {actual:.17e} vs {expected:.17e}"
         );
     }
 }

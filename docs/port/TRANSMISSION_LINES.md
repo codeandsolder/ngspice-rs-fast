@@ -9,7 +9,8 @@ Padé DC/transient and a three-pi fallback; see [TXL.md](TXL.md) for its
 AC-family refusals and compatibility limits. The **coupled multiconductor
 `P`/CPL line** has native P geometry and symmetric per-length R/L/G/C matrices,
 exact full-coupled DC/AC first-order propagation with MNA constraints, and
-causal finite-volume transient with trial/accepted charge/flux history; see
+exact lossless modal transient and approximate finite-volume lossy/singular
+transient with trial/accepted charge/flux history; see
 [COUPLED_LINES.md](COUPLED_LINES.md) for its physical limits, integration
 method, resource caps and numerical verification.
 Code: `src/netlist/parser/{tline,ltra,cpl}.rs` (grammars),

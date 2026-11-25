@@ -80,7 +80,7 @@ separate input/output return KCL. Small lines and lossless ideal/resonant
 constraints retain their direct augmented branch equations.
 
 The bounded number of doublings is governed by the plan's explicit
-`max_squarings`; nonfinite material, singular interface and resource
+`squarings`; nonfinite material, singular interface and resource
 limits remain errors, never zero admittances. Independent long-line tests
 cover scalar unit characteristic admittance at exp(1000), and a reciprocal
 noncommuting two-conductor Riccati identity `Yc R Yc = G` at DC, alongside
@@ -99,7 +99,7 @@ Default bounds are 32 conductors, 32 MiB dense workspace and at most
 128 exponential squarings. All dimensions and allocation products use
 checked arithmetic.
 
-## Exact LC modes and flight time (prepared for native modal propagation)
+## Exact LC modes and flight time
 
 The additional pure `CoupledLinePlan::exact_lc_modes()` prepares the full
 reciprocal LC eigenbasis for positive-definite L and C without assuming that
@@ -108,8 +108,7 @@ H = B^T L B = Q diag(lambda) Q^T, then the physical voltage and current
 bases are V = B^(-T) Q and I = B Q. They satisfy C V = I, L I = V diag(lambda)
 and V^T I = identity. Each exact flight time is
 `length * sqrt(lambda)`, and the modal admittance scalar is
-`1/sqrt(lambda)` **in metric-normalized modal coordinates**. The passive
-research wave model power-normalizes each voltage basis column by
+`1/sqrt(lambda)` **in metric-normalized modal coordinates**. The native travelling-wave model power-normalizes each voltage basis column by
 `1/sqrt(y)` and each current basis column by `sqrt(y)`, giving reciprocal
 physical power-wave transforms. Extremely small/large material magnitudes
 are scaled during the Cholesky/Jacobi solve and the physical LC products are
@@ -117,22 +116,39 @@ reconstructed using split binary exponents. Pure RC/RL and other singular
 material regimes remain in the general diffuse/descriptor solver, rather
 than inventing a positive phase delay for modes with no finite wave speed.
 
-**This eigensystem is a preparation component, not yet wired into native
-transient stamping.** The existing finite-volume transient implementation
-is passive and numerical-time causal but has nonzero response before the
-physical LC front. In a 50-ohm matched scalar cable with L=250 nH/unit,
-C=100 pF/unit and length 0.2, the exact flight time is 1 ns. A rising
-input beginning at 2 ns must produce exactly zero at the distant end until
-3 ns. The 32-cell finite-π model instead produces +1.09605704672942547e-8 V
-at 2.25 ns (snapshot-only physical wavefront regression). This is not an
-acceptable substitute for the true delayed line. Native end-to-end modal
-history, accepted/trial/rollback ownership, DC steady-state initialization,
-and physical MNA port rows must integrate the separately validated
-exact-delay research path before claiming exact physical front parity.
+For zero R and G with positive-definite L and C, the native device uses
+these modes directly in DC, AC and transient. There are 2N physical
+inward-current branch unknowns, and for each mode the receiving wave
+`v_m - i_m` equals the opposite launching wave `v_m + i_m` delayed by
+its physical flight time. The DC factor is unity and the AC factor is
+`exp(-j omega tau_m)`, preserving exact short and resonant constraints.
+
+Transient stores power-normalized incident waves in the existing accepted
+waveform history, seeded by the DC operating point. Retarded values are
+linearly interpolated between accepted samples; within a trial interval
+the interpolation coefficient of the new incident wave is stamped into
+MNA, rather than extrapolating past the accepted solution. The shortest
+modal flight time bounds the step and slope changes schedule arrival
+breakpoints. Pruning retains the bracket at the longest delay. Rejected
+trials do not mutate the accepted history. No spatial charge/flux slots
+or finite-volume approximation are needed for this lossless regime.
+
+The scalar 50-ohm matched regression (1 ns flight time) now checks the
+entire pre-arrival window to 1e-10 V, including the former finite-volume
+pre-arrival artifact at 2.25 ns. A matched two-conductor regression checks
+both physical voltages against independent even/odd waves with 0.6 ns
+and 1.4 ns delays, and a mismatched DC-biased line checks steady-state
+initialization.
+
+General lossy lines with positive-definite L/C still require the passive
+coupled delayed-scattering transient implementation. The finite-volume
+approximation below does not guarantee an exact physical front and must
+not be presented as complete distributed transient parity.
 
 ## Causal time-domain finite-volume cable
 
-Native `.tran` does **not** use a sampled AC matrix. It discretizes the full
+For lossy or singular LC material the current `.tran` approximation does
+**not** use a sampled AC matrix. It discretizes the full
 symmetric coupled RLGC cable into `sections` passive pi cells. A section of
 width `dx = length / sections` has two half-shunts `(G + s C)*dx/2`
 and a coupled series impedance `(R + s L)*dx`. The default is 64 sections;
@@ -206,10 +222,9 @@ comparisons and note both numerical method and grid resolution.
 ## Integration and remaining verification
 
 Complete native P/CPL parsing, model resolution, exact distributed DC/AC,
-finite-volume causal transient with trial/accept states and physical N-port
-KCL have implementation. The full strict lint and campaign validator are
-responsible for integration. Remaining checks include the upstream C
-four-conductor temporal coupling, transient grid convergence, variable-step
-Gear, performance, energy/passivity and partially singular
-series-mode handling. Completely zero R/L lines have exact
+exact lossless modal transient and approximate lossy/singular finite-volume
+transient with trial/accept states and physical N-port KCL have implementation. The full strict lint and campaign validator are
+responsible for integration. Remaining work includes general lossy exact-front transient,
+partially singular series-mode handling, and broad performance, energy/passivity
+and variable-step verification. Completely zero R/L lines have exact
 constrained MNA transient support.

@@ -154,6 +154,39 @@ fn symmetric_eigenvectors(mut a: Vec<Real>, order: usize) -> SpiceResult<(Vec<Re
     Ok((eigenvalues, reordered))
 }
 
+// Form B^T (L / scale) B and symmetrize its roundoff before diagonalization.
+fn inductance_metric(inductance: &[Real], scale: Real, lower: &[Real], order: usize) -> Vec<Real> {
+    let mut product = vec![0.0_f64; order * order];
+    let mut symmetric = vec![0.0_f64; order * order];
+    for row in 0..order {
+        for col in 0..order {
+            let mut value = 0.;
+            for k in 0..order {
+                value =
+                    (inductance[row * order + k] / scale).mul_add(lower[k * order + col], value);
+            }
+            product[row * order + col] = value;
+        }
+    }
+    for row in 0..order {
+        for col in 0..order {
+            let mut value = 0.;
+            for k in 0..order {
+                value = lower[k * order + row].mul_add(product[k * order + col], value);
+            }
+            symmetric[row * order + col] = value;
+        }
+    }
+    for row in 0..order {
+        for col in 0..row {
+            let averaged = symmetric[row * order + col].midpoint(symmetric[col * order + row]);
+            symmetric[row * order + col] = averaged;
+            symmetric[col * order + row] = averaged;
+        }
+    }
+    symmetric
+}
+
 impl CoupledLinePlan {
     /// Exact LC modal basis and physical flight times, including all
     /// cross-conductor mixing. This is the input for the separate physically
@@ -178,34 +211,7 @@ impl CoupledLinePlan {
             ));
         }
         let lower = normalized_cholesky(capacitance, order, capacitance_scale)?;
-        let mut product = vec![0.0_f64; order * order];
-        let mut symmetric = vec![0.0_f64; order * order];
-        for row in 0..order {
-            for col in 0..order {
-                let mut value = 0.;
-                for k in 0..order {
-                    value = (inductance[row * order + k] / inductance_scale)
-                        .mul_add(lower[k * order + col], value);
-                }
-                product[row * order + col] = value;
-            }
-        }
-        for row in 0..order {
-            for col in 0..order {
-                let mut value = 0.;
-                for k in 0..order {
-                    value = lower[k * order + row].mul_add(product[k * order + col], value);
-                }
-                symmetric[row * order + col] = value;
-            }
-        }
-        for row in 0..order {
-            for col in 0..row {
-                let averaged = symmetric[row * order + col].midpoint(symmetric[col * order + row]);
-                symmetric[row * order + col] = averaged;
-                symmetric[col * order + row] = averaged;
-            }
-        }
+        let symmetric = inductance_metric(inductance, inductance_scale, &lower, order);
         let (normalized_eigenvalues, eigenvectors) = symmetric_eigenvectors(symmetric, order)?;
         let root_cscale = capacitance_scale.sqrt();
         let mut modes = CoupledLineModes {
