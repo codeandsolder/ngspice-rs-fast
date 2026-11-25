@@ -57,7 +57,7 @@ jobs:
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.TAG != '' && format('refs/tags/{0}', env.TAG) || github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.TAG != '' && format('refs/tags/{0}', env.TAG) || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
