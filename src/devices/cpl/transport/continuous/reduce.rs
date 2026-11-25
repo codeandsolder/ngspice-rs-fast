@@ -132,6 +132,7 @@ struct Reduction<'a, Value> {
     error_weights: Vec<Real>,
     positions: Vec<Real>,
     split: Real,
+    peak_time: Real,
     normalized: Vec<Real>,
     tolerance: Real,
 }
@@ -164,7 +165,19 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
         let first = knots[0].time;
         let last = knots[knots.len() - 1].time;
         let duration = last - first;
-        let split = (first.midpoint(last) - first) / duration;
+        // A replacement peak at an existing physical knot avoids
+        // introducing a new time that every downstream delay can copy.
+        let middle = first.midpoint(last);
+        let upper = knots
+            .partition_point(|knot| knot.time < middle)
+            .clamp(1, knots.len() - 2);
+        let lower = upper.saturating_sub(1).max(1);
+        let peak_time = if (knots[lower].time - middle).abs() < (knots[upper].time - middle).abs() {
+            knots[lower].time
+        } else {
+            knots[upper].time
+        };
+        let split = (peak_time - first) / duration;
         let positions = knots
             .iter()
             .map(|knot| (knot.time - first) / duration)
@@ -186,6 +199,7 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
             error_weights,
             positions,
             split,
+            peak_time,
             normalized,
             tolerance,
         }
@@ -594,7 +608,7 @@ pub(super) fn reduce<Value: WaveValue>(
         match candidate.choose() {
             Choice::Chord => output.push(knots[last].clone()),
             Choice::Tent(wave) => {
-                let time = knots[first].time.midpoint(knots[last].time);
+                let time = candidate.peak_time;
                 if time > knots[first].time && time < knots[last].time {
                     output.push(Knot { time, wave });
                     output.push(knots[last].clone());
