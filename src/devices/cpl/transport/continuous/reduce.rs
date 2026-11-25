@@ -125,6 +125,91 @@ fn scalar_bernstein([a, b, c, d]: [Real; 4], depth: u8) -> bool {
         && scalar_bernstein([middle, bcd, cd, d], depth - 1)
 }
 
+// Cubic Bernstein coefficients of the integrated scalar energy
+// difference on one linear segment. The input mass is the certified
+// prefix energy at the beginning of the segment.
+fn scalar_prefix(
+    mass: Real,
+    duration: Real,
+    exact: [Real; 2],
+    reduced: [Real; 2],
+    factor: Real,
+) -> [Real; 4] {
+    let [first, last] = exact;
+    let [approx_first, approx_last] = reduced;
+    let duration = duration / 3.;
+    let c1 = duration.mul_add(
+        first.mul_add(first, -factor * approx_first * approx_first),
+        mass,
+    );
+    let c2 = duration.mul_add(
+        first.mul_add(last, -factor * approx_first * approx_last),
+        c1,
+    );
+    let c3 = duration.mul_add(last.mul_add(last, -factor * approx_last * approx_last), c2);
+    [mass, c1, c2, c3]
+}
+
+// The common scalar chord requires neither normalized column storage
+// nor a candidate tent/Gram allocation. Check the same local error
+// and every prefix directly on the original PWL knots. A small
+// rounding guard on interpolation leaves borderline decisions to the
+// full generic reducer.
+fn scalar_chord<Value: WaveValue>(
+    knots: &[Knot<Value>],
+    tolerance: Real,
+    known_scale: Real,
+    factor: Real,
+) -> bool {
+    if factor >= 1. || knots.iter().any(|knot| knot.wave.width() != 1) {
+        return false;
+    }
+    let scale = knots
+        .iter()
+        .map(|knot| knot.wave.known().abs())
+        .fold(0., Real::max);
+    if scale == 0. {
+        return true;
+    }
+    let weight = scale / scale.max(known_scale);
+    let first = &knots[0];
+    let last = &knots[knots.len() - 1];
+    let duration = last.time - first.time;
+    let begin = first.wave.known() / scale;
+    let finish = last.wave.known() / scale;
+    let guard = 64.0_f64.mul_add(-Real::EPSILON, tolerance);
+    if guard <= 0. {
+        return false;
+    }
+    let mut position = 0.;
+    let mut exact = begin;
+    let mut approx = begin;
+    let mut mass = 0.;
+    for knot in &knots[1..] {
+        let next_position = (knot.time - first.time) / duration;
+        let next_exact = knot.wave.known() / scale;
+        let next_approx = chord(begin, finish, next_position);
+        if (next_approx - next_exact).abs() * weight > guard {
+            return false;
+        }
+        let coefficients = scalar_prefix(
+            mass,
+            next_position - position,
+            [exact, next_exact],
+            [approx, next_approx],
+            factor,
+        );
+        if !scalar_bernstein(coefficients, 8) {
+            return false;
+        }
+        mass = coefficients[3];
+        position = next_position;
+        exact = next_exact;
+        approx = next_approx;
+    }
+    true
+}
+
 struct Reduction<'a, Value> {
     knots: &'a [Knot<Value>],
     width: usize,
@@ -353,21 +438,15 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
                     correction[0].mul_add(tent(left, self.split), chord(begin[0], finish[0], left));
                 let approx_last = correction[0]
                     .mul_add(tent(right, self.split), chord(begin[0], finish[0], right));
-                let c0 = mass[0];
-                let c1 = duration.mul_add(
-                    first[0].mul_add(first[0], -self.energy_factor * approx_first * approx_first),
-                    c0,
+                let coefficients = scalar_prefix(
+                    mass[0],
+                    right - left,
+                    [first[0], last[0]],
+                    [approx_first, approx_last],
+                    self.energy_factor,
                 );
-                let c2 = duration.mul_add(
-                    first[0].mul_add(last[0], -self.energy_factor * approx_first * approx_last),
-                    c1,
-                );
-                let c3 = duration.mul_add(
-                    last[0].mul_add(last[0], -self.energy_factor * approx_last * approx_last),
-                    c2,
-                );
-                mass[0] = c3;
-                return scalar_bernstein([c0, c1, c2, c3], 8);
+                mass[0] = coefficients[3];
+                return scalar_bernstein(coefficients, 8);
             }
             let approximated = |time: Real| -> Vec<Real> {
                 (0..order)
@@ -627,6 +706,10 @@ pub(super) fn reduce<Value: WaveValue>(
             output.push(knots[last].clone());
             continue;
         }
+        if scalar_chord(&knots[first..=last], tolerance, known_scale, energy_factor) {
+            output.push(knots[last].clone());
+            continue;
+        }
         let candidate = Reduction::new(
             &knots[first..=last],
             width,
@@ -704,6 +787,26 @@ mod tests {
         let correction = [0.];
         assert!(reduction.contractive(&reduction.gram(), &correction));
         assert!(!reduction.prefix_contracts(&correction, &reduction.midpoint()));
+    }
+
+    #[test]
+    fn scalar_chord_checks_original_waveform_error_and_energy() {
+        for sign in [-1., 1.] {
+            for amplitude in [1e-100, 1., 1e100] {
+                let knots: Vec<_> = (0..=64)
+                    .map(|i| {
+                        let time = Real::from(i) / 64.;
+                        let wave = sign * amplitude * (0.2 + time + 0.001 * time * (1. - time));
+                        Knot { time, wave }
+                    })
+                    .collect();
+                assert!(scalar_chord(&knots, 1e-3, 0., 0.99));
+                assert!(!scalar_chord(&knots, 1e-5, 0., 0.99));
+                let reference = Reduction::new(&knots, 1, 1e-3, 0., 0.99);
+                assert!(reference.prefix_contracts(&[0.], &reference.midpoint()));
+                assert!(reference.error(&[0.], &reference.midpoint()).0 <= 1e-3);
+            }
+        }
     }
 
     #[test]

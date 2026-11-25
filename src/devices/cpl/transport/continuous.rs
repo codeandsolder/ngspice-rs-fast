@@ -317,6 +317,47 @@ impl<'a, Value: WaveValue> WaveCursor<'a, Value> {
     }
 }
 
+// Both the scattered curve and its protected times are already sorted.
+// Insert only missing points; leave the curve borrowed if every protected
+// time already exists. The interpolation is identical to random access.
+fn augment_curve<'a, Value: WaveValue>(
+    curve: &'a [Knot<Value>],
+    times: &[Real],
+    origin: Real,
+) -> SpiceResult<std::borrow::Cow<'a, [Knot<Value>]>> {
+    if times.iter().all(|time| {
+        curve
+            .binary_search_by(|knot| knot.time.total_cmp(time))
+            .is_ok()
+    }) {
+        return Ok(std::borrow::Cow::Borrowed(curve));
+    }
+    let mut output = Vec::with_capacity(curve.len().saturating_add(times.len()));
+    let mut cursor = WaveCursor::new(curve, curve[0].time, origin);
+    let mut index = 0;
+    for &time in times {
+        let first = index;
+        while curve.get(index).is_some_and(|knot| knot.time < time) {
+            index += 1;
+        }
+        output.extend_from_slice(&curve[first..index]);
+        if curve
+            .get(index)
+            .is_some_and(|knot| knot.time.total_cmp(&time).is_eq())
+        {
+            output.push(curve[index].clone());
+            index += 1;
+        } else {
+            output.push(Knot {
+                time,
+                wave: cursor.sample(time)?,
+            });
+        }
+    }
+    output.extend_from_slice(&curve[index..]);
+    Ok(std::borrow::Cow::Owned(output))
+}
+
 fn shifted_times<Value>(
     wave: &[Point<Value>],
     delay: Real,
@@ -542,19 +583,7 @@ impl ContinuousPlan {
             times.push(time);
         }
         sort_times(&mut times);
-        let mut augmented = curve.to_vec();
-        for &time in &times {
-            if curve
-                .binary_search_by(|knot| knot.time.total_cmp(&time))
-                .is_err()
-            {
-                augmented.push(Knot {
-                    time,
-                    wave: sample(curve, time, history.origin)?,
-                });
-            }
-        }
-        augmented.sort_unstable_by(|a, b| a.time.total_cmp(&b.time));
+        let augmented = augment_curve(curve, &times, history.origin)?;
         let tolerance = (history.reltol / self.tolerance_divisor).max(128. * Real::EPSILON);
         let known_scale = history.outgoing[node]
             .iter()
@@ -964,11 +993,22 @@ struct RetainedWindow {
 
 impl RetainedWindow {
     fn new<Value>(old: &[Point<Real>], new: &[Knot<Value>], start: Real, cutoff: Real) -> Self {
-        Self {
-            first: old
-                .partition_point(|knot| knot.time <= cutoff)
-                .saturating_sub(1),
-            incoming: new.partition_point(|knot| knot.time <= start),
+        let incoming = new.partition_point(|knot| knot.time <= start);
+        let expired = new.partition_point(|knot| knot.time <= cutoff);
+        if expired > incoming {
+            // The new curve already supplies the interpolation predecessor.
+            // No part of the previous history is needed in this window.
+            Self {
+                first: old.len(),
+                incoming: expired - 1,
+            }
+        } else {
+            Self {
+                first: old
+                    .partition_point(|knot| knot.time <= cutoff)
+                    .saturating_sub(1),
+                incoming,
+            }
         }
     }
 
@@ -999,6 +1039,9 @@ impl RetainedWindow {
             );
         }
         prune(&mut wave, cutoff);
+        // The accepted successor is immutable, and this vector will never
+        // grow in place. Spare capacity from coalesced flat runs has no use.
+        wave.shrink_to_fit();
         Ok(wave)
     }
 }
@@ -1239,6 +1282,25 @@ mod tests {
     };
 
     #[test]
+    fn protected_curve_merge_retains_exact_knots_and_interpolation() {
+        let curve = [(0., 0.), (0.2, 1.), (0.4, -0.5), (0.9, 0.4), (1., 0.)]
+            .map(|(time, wave)| Knot { time, wave });
+        assert!(matches!(
+            augment_curve(&curve, &[0.2, 0.4], 0.).unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let times = [0.1, 0.2, 0.3, 0.4, 0.41, 0.6, 0.9, 0.99];
+        let result = augment_curve(&curve, &times, 0.).unwrap();
+        let mut expected: Vec<_> = curve.iter().map(|knot| knot.time).chain(times).collect();
+        sort_times(&mut expected);
+        assert_eq!(result.len(), expected.len());
+        for (knot, time) in result.iter().zip(expected) {
+            assert_eq!(knot.time, time);
+            assert_eq!(knot.wave, sample(&curve, time, 0.).unwrap());
+        }
+    }
+
+    #[test]
     fn monotonic_cursor_matches_random_access_for_scalar_and_affine_waves() {
         let knots = [(0., 0.), (0.1, 1.), (0.15, -0.25), (0.8, 0.5), (1., 0.)]
             .map(|(time, wave)| Knot { time, wave });
@@ -1269,6 +1331,30 @@ mod tests {
         }
         assert!(scalar_cursor.sample(1.1).is_err());
         assert!(WaveCursor::new(&knots[2..], 0.05, 0.).sample(0.05).is_err());
+    }
+
+    #[test]
+    fn retained_window_discards_old_history_when_trial_contains_predecessor() {
+        let old = vec![Point { time: 0., wave: 0. }, Point { time: 1., wave: 1. }];
+        let new = vec![
+            Point { time: 1., wave: 1. },
+            Point { time: 2., wave: 2. },
+            Point { time: 3., wave: 3. },
+            Point { time: 4., wave: 4. },
+        ];
+        for cutoff in [0.5, 1., 1.5, 2., 2.5, 4.] {
+            let mut reference = old.clone();
+            for point in new.iter().skip(1) {
+                append(&mut reference, point.clone());
+            }
+            prune(&mut reference, cutoff);
+            let window = RetainedWindow::new(&old, &new, 1., cutoff);
+            let count = window.count(old.len(), new.len());
+            let merged = window.merge(&old, new.clone(), cutoff, &[]).unwrap();
+            assert_eq!(merged, reference);
+            assert_eq!(merged.capacity(), merged.len());
+            assert_eq!(count, reference.len());
+        }
     }
 
     fn dense_plan(sections: usize) -> LossyPlan {

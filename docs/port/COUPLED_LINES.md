@@ -178,8 +178,11 @@ Sorted scattering times are sampled by monotonic cursors, using the same
 interpolation and error checks as random access. Ordinary acceptance
 constructs each next delay window directly from the old history and one
 stage's newly scattered waveforms. It keeps the old history immutable
-and does not retain a full duplicate trial. Oversized trials use waveforms affine in all new boundary endpoint
-increments, so the terminal relation includes arrivals and internal
+and does not retain a full duplicate trial. If the newly scattered curve
+already contains the delay-window predecessor, the expired history is
+not copied. Immutable successor windows discard unused allocation
+capacity. Oversized trials use waveforms affine in all new boundary
+endpoint increments, so the terminal relation includes arrivals and internal
 feedback during the trial. Rejected trials cannot advance the accepted
 wave histories.
 
@@ -201,7 +204,12 @@ positive pivots. Half of any certified strict dissipation is reserved;
 when no margin is proven, q=1 retains the original per-wave contraction.
 A cubic Bernstein certificate enforces every prefix for arbitrary
 combinations of endpoint increments; inconclusive certificates trigger
-subdivision rather than unverified reduction. The waveform-error
+subdivision rather than unverified reduction. Scalar chords with a
+certified strictly dissipative scattering bound can pass the same error
+and prefix tests directly over the original knots without allocating
+normalized affine columns. Other candidates use the general reducer.
+Protected arrival times are merged into the sorted curve, borrowing the
+original knots when no interpolation is needed. The waveform-error
 tolerance is unchanged. As with other numerical
 integration tolerances, local waveform error is not a global pointwise
 error bound. Reduce `reltol` to refine the history approximation.
