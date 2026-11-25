@@ -707,6 +707,10 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         self.stamp_point(context, &output, &voltage)
     }
 
+    fn model_candidate_setters_are_stable(&self) -> bool {
+        self.source.is_some()
+    }
+
     fn bind_numeric_parameter(&self, name: &str) -> Option<crate::devices::sweep::ParameterKey> {
         if self.source.is_some() {
             return self

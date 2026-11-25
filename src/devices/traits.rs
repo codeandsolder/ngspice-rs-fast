@@ -1582,6 +1582,14 @@ pub trait Device: fmt::Debug + std::any::Any {
         }
     }
 
+    /// Whether typed instance setters preserve the selected model declaration.
+    /// Model-backed devices opt in only when no setter can change model
+    /// selection (including binning). The candidate validator still checks
+    /// each replacement's physical validity, topology and state layout.
+    fn model_candidate_setters_are_stable(&self) -> bool {
+        false
+    }
+
     /// Reprepare immutable context-dependent data at a context transition.
     /// Ordinary native devices need no replacement.
     /// # Errors
