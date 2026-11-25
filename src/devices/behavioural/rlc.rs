@@ -332,6 +332,10 @@ impl Device for Passive {
     fn terminals(&self) -> &[NodeId] {
         self.expression.terminals()
     }
+    fn control_branch(&self, target: &dyn Device) -> Option<usize> {
+        target.expression_current_branch()
+    }
+
     fn controlling_sources(&self) -> &[ControlReference] {
         self.expression.controlling_sources()
     }

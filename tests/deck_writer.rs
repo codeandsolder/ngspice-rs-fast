@@ -711,7 +711,7 @@ fn generated_device_cards_retain_source_order_and_provenance() {
         }
     }
     assert_eq!(indices, (0..lowered.devices.len()).collect::<Vec<_>>());
-    assert_eq!(option_at, Some(3)); // r1, generated current probe, b1
+    assert_eq!(option_at, Some(2)); // r1, b1; probes bind after elaboration
     assert!(lowered.devices.len() > input.devices.len());
     for card in &lowered.cards {
         if let ScopedCardKind::Device(index) = card.kind {
@@ -737,12 +737,7 @@ fn nested_included_expansions_have_distinct_ordinals_and_shared_source_provenanc
     let input = Parser::new().parse_file(&main).unwrap();
     let lowered = lower_nonlinear_sources(&input).unwrap();
 
-    for (serial, (before, after)) in input
-        .subcircuits
-        .iter()
-        .zip(&lowered.subcircuits)
-        .enumerate()
-    {
+    for (before, after) in input.subcircuits.iter().zip(&lowered.subcircuits) {
         let original_cards: Vec<_> = before
             .cards
             .iter()
@@ -754,13 +749,12 @@ fn nested_included_expansions_have_distinct_ordinals_and_shared_source_provenanc
             .filter(|card| matches!(card.kind, ScopedCardKind::Device(_)))
             .collect();
         assert_eq!(original_cards.len(), 2);
-        assert_eq!(generated_cards.len(), 4);
-        assert_eq!(after.devices[0].nodes[0], format!("a_vmeas_{serial}"));
-        assert_eq!(after.devices[1].name, "v_r1");
-        assert_eq!(after.devices[2].name, "e1");
-        assert_eq!(after.devices[3].name, "be1");
+        assert_eq!(generated_cards.len(), 3);
+        assert_eq!(after.devices[0].nodes[0], "a");
+        assert_eq!(after.devices[1].name, "e1");
+        assert_eq!(after.devices[2].name, "be1");
         for (index, card) in generated_cards.iter().enumerate() {
-            let original = original_cards[index / 2];
+            let original = original_cards[usize::from(index != 0)];
             assert_eq!(card.kind, ScopedCardKind::Device(index));
             assert_eq!(card.source, original.source);
             assert_eq!(card.include_chain, original.include_chain);

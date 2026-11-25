@@ -15,11 +15,11 @@
 //!    | `g1 ... table ... [m=k]` | the same with gain `k` (node names with `[`, `]`, `%` replaced by `_`) |
 //!    | `e1 n+ n- nc+ nc- table=(...)` | `e1 n+ n- e1_int1 0 1` and `ae1` from `v(nc+,nc-)` (domain 0.001) |
 //!    | one TABLE pair `(x0, y0)` | `v<name> <name>_int1 0 y0` instead of the B/A pair |
-//!    | `e1 n+ n- poly(n) ...` (also F/G/H and the implicit `POLY(1)`) | the XSPICE `spice2poly` instance `a$poly$e1` |
+//!    | `e1 n+ n- poly(n) ...` (also F/G/H and the implicit `POLY(1)`) | native polynomial behavioural law retaining the original instance identity |
 //!
-//!    The generated XSPICE instances (`ae1`, `a$poly$e1`) are designator-`a`
-//!    devices carrying a behavioural `v=`/`i=` expression; they are internal
-//!    to this port (user `a` cards remain unported). The rewrite runs before
+//!    Generated TABLE instances (`ae1`) are designator-`a` devices carrying
+//!    a behavioural voltage expression; POLY retains the source instance's
+//!    identity and uses the same compiled expression kernel. The rewrite runs before
 //!    subcircuit expansion, as in C, so generated names and nodes are renamed
 //!    like any other (`x1.e1_int1`, `b.x1.be1`).
 //!
@@ -65,9 +65,9 @@ pub const LTSPICE_TABLE_DOMAIN: Real = 0.001;
 /// A malformed nonlinear form (no expression, an odd TABLE point list, a
 /// POLY without its controls), positioned at the card.
 pub fn lower_nonlinear_sources(netlist: &Netlist) -> SpiceResult<Netlist> {
-    let plan = edits::ScopeEdits::build(ScopeView::from(netlist), &mut 0)?;
+    edits::validate(ScopeView::from(netlist))?;
     let mut out = netlist.clone();
-    plan.apply(&mut out)?;
+    edits::lower(&mut out)?;
     Ok(out)
 }
 
@@ -439,8 +439,8 @@ fn lower_poly(device: &DeviceInstance, form: &PolyForm<'_>) -> SpiceResult<Devic
     }];
     parameters.extend_from_slice(form.setters);
     Ok(instance(
-        format!("a$poly${}", device.name),
-        'a',
+        device.name.clone(),
+        device.designator,
         device.nodes[..2].to_vec(),
         parameters,
         location,

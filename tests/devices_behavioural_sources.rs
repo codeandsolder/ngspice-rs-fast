@@ -514,12 +514,6 @@ fn invalid_instances_are_explicit_errors() {
     for (body, message) in [
         ("b1 a a v=1\nr1 a 0 1", "shorted ASRC"),
         ("b1 a 0 v=i(vx)\nr1 a 0 1", "unknown controlling source vx"),
-        // After a comma inp_meas_current() leaves i() alone, and a current
-        // B source has no branch to sense.
-        (
-            "b1 b 0 v=max(0,i(b2))\nb2 c 0 i=1m\nr2 b 0 1\nr3 c 0 1",
-            "no findable branch",
-        ),
         (
             "b1 a 0 v=1 temp=30 dtemp=2\nr1 a 0 1",
             "both temp= and dtemp=",

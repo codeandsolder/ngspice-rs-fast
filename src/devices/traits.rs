@@ -903,6 +903,18 @@ pub trait Device: fmt::Debug + std::any::Any {
         None
     }
 
+    /// Physical branch for a resolved expression's current probe.
+    /// Unlike voltage-source-only controls, this can read a storage current.
+    fn expression_current_branch(&self) -> Option<usize> {
+        self.findable_branch()
+    }
+
+    /// Which current coordinate this device reads from a control target.
+    /// Traditional F/H/W cards retain their defined voltage-source semantics.
+    fn control_branch(&self, target: &dyn Device) -> Option<usize> {
+        target.findable_branch()
+    }
+
     /// Binds the previous voltage-source value in C `VSRCload`'s reverse-deck
     /// traversal. Non-voltage devices return None; PORT adds to that value.
     /// # Errors

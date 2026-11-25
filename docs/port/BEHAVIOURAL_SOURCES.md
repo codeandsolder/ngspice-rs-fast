@@ -214,26 +214,37 @@ names are renamed per instance (`x1.e1_int1`, `b.x1.be1`, `i(v.x1.v_b1)`):
 | `g1 ... table ... m=k` | the same with gain `k`; `[`, `]`, `%` in G names become `_` |
 | `e1 n+ n- nc+ nc- table=(...)` | `e1 n+ n- e1_int1 0 1`, `ae1` reading `v(nc+, nc-)` |
 | one TABLE pair `(x0, y0)` | `v<name> <name>_int1 0 y0` instead of the B/XSPICE pair |
-| `POLY(n)` on E/G/F/H (and the implicit `POLY(1)`) | the `spice2poly` instance `a$poly$<name>` with output `v=` (E/H, branch `i(a$poly$e1)`) or `i=` (G/F) |
+| `POLY(n)` on E/G/F/H (and the implicit `POLY(1)`) | native behavioural polynomial retaining the original instance name, with output `v=` (E/H) or `i=` (G/F) |
 
-The XSPICE instances are internal designator-`a` behavioural devices (user
-`a` cards stay unported): `ae1` evaluates the `pwl` code model's static map
+The TABLE instances are internal designator-`a` behavioural devices:
+`ae1` evaluates the `pwl` code model's static map
 (`input_domain` 0.1, or 0.001 for the LTspice form, `fraction=TRUE`,
 `limit=TRUE`: flat outside the table, parabolic corners over 10 % of the
 shorter adjacent segment); the model's iteration-to-iteration input limiting is
-a Newton aid and is not reproduced. `a$poly$...` is the SPICE2 polynomial
+a Newton aid and is not reproduced. POLY is the SPICE2 polynomial
 `c0 + c1 x1 + ... + cn xn + c(n+1) x1^2 + c(n+2) x1 x2 + ...`, terms in
 `nxtpwr()` order (total degree, then lexicographically descending exponents),
 `m=` multiplying G/F outputs; `m=` on an E/H POLY is rejected (C drops it with
 a warning).
 
-`inp_meas_current()` is reproduced too: an `i(name)` in a behavioural
-expression whose `name` does not start with `v` and is not a simple linear
-E/H senses the current through an inserted zero-volt source `v_name`; `name`'s
-first node becomes `<node>_vmeas_<n>` (`n` counting references in deck order)
-and the reference becomes `i(v_name)`. The device is searched in the same
-scope only. As in C, an `i(` preceded by a comma (`max(0,i(b2))`) is not
-rewritten and must name a findable branch (V, E, H or voltage B).
+Current references are bound after lexical expansion, parameter evaluation,
+controlled-source lowering and hierarchy expansion. Voltage-output sources,
+linear inductors, behavioural passive laws, and native rational transfers
+supply their existing physical branch coordinates. A remaining analog
+device with no readable branch receives one series zero-voltage measurement
+source at its first terminal, shared by all resolved expressions that sense
+it. Generated names cannot collide with any declared or referenced name.
+This replaces the C text heuristic in `inp_meas_current()`: references after
+commas, nested in function bodies, or in passive laws are handled uniformly.
+A lexically shadowed probe or an unused macro argument does not allocate a
+measurement branch. Ordinary F/H/W controls retain their voltage-source
+semantics.
+
+Internal measurement node and source names are not a source-level API.
+The C conformance fixtures compare every physical quantity including
+redundant C measurement columns and renamed polynomial source branches,
+which are explicitly equated to their native branch and terminal coordinates
+in the reference verifier.
 
 ## Errors
 
@@ -289,10 +300,7 @@ rewritten and must name a findable branch (V, E, H or voltage B).
   initialization, and PSPICE/HSPICE/LTspice compatibility variants of
   `^`, `exp` and `pwr` remain separate work. The native XSPICE `s_xfer`
   rational realization is implemented.
-- `.func` bodies are expanded after the lowering passes, so an `i()` that only
-  appears inside a `.func` body is not rewritten by `inp_meas_current()`;
-  numparam-only constructs inside `.func` bodies (`?:`, comparisons) remain
-  unsupported by the numparam grammar.
-- An E/H written with a named `gain=` counts as a simple linear source here;
-  C inserts a measurement source for it (`=` on the card), which changes only
-  vector names.
+- Numparam-only constructs inside `.func` bodies (`?:`, comparisons) remain
+  unsupported by the numparam grammar. Adding a later batch to an existing
+  circuit cannot retroactively insert a series probe into a previously
+  instantiated device; native branch probes still bind normally.
