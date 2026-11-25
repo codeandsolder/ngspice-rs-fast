@@ -280,7 +280,8 @@ pub(super) fn instantiate(
             &values,
             InstanceTemperature::circuit(context.temperature),
         )?
-        .with_source(source)?;
+        .with_source(source)
+        .map_err(|error| SpiceError::parse(instance.location.clone(), error.to_string()))?;
         Ok(Box::new(device) as Box<dyn Device>)
     })
 }
