@@ -40,7 +40,7 @@ fn deck(designator: char) -> &'static str {
         'u' => "u1 a b 0 um l=1m\n.model um urc\nv1 a 0 1\nr1 b 0 1k",
         'n' => "n1 a 0 nm\n.model nm nport\nv1 a 0 1",
         'p' => "p1 a 0 b 0 pm\n.model pm cpl r=10 l=10n g=0 c=10p length=1\nv1 a 0 1\nr1 b 0 50",
-        'a' => "a1 a b am\n.model am gain\nv1 a 0 1\nr1 b 0 1k",
+        'a' => "a1 a b am\n.model am s_xfer (num_coeff=[1] den_coeff=[1 1])\nv1 a 0 1\nr1 b 0 1k",
         other => panic!("no representative deck for designator '{other}'"),
     }
 }

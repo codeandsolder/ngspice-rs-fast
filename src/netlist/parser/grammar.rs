@@ -141,6 +141,7 @@ pub(super) fn parse_card(
                 super::txl::txl_card,
                 super::cpl::cpl_card,
                 super::mesfet::mesfet_card,
+                super::code_model::code_model_card,
             )),
         )),
         unported_card,
