@@ -1093,6 +1093,18 @@ pub trait Device: fmt::Debug + std::any::Any {
         ))
     }
 
+    /// Apply solver-owned trial linearization to one prepared lane before
+    /// constitutive evaluation. Exact loads retain the original coordinates.
+    /// # Errors
+    /// Invalid coordinate or history state.
+    fn linearize_prepared(
+        &self,
+        _states: &mut DeviceState<'_>,
+        _coordinates: &mut [Real],
+    ) -> SpiceResult<()> {
+        Ok(())
+    }
+
     /// Stamp a previously evaluated tile lane into a trial.
     /// # Errors
     /// Invalid numerical or history state.
@@ -1100,6 +1112,7 @@ pub trait Device: fmt::Debug + std::any::Any {
         &self,
         _context: &mut StampContext<'_>,
         _point: &model_kernel_api::Point<'_>,
+        _coordinates: &[Real],
     ) -> SpiceResult<()> {
         Err(SpiceError::circuit("device has no prepared batch stamp"))
     }

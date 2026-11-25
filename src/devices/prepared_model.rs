@@ -8,10 +8,11 @@ use model_kernel_api::{
     Artifact, Binding, Capability, EquationKind, Kernel, Point, PointBuffer, Prepared,
 };
 
+use crate::devices::limiting::{Limiter, Linearization};
 use crate::devices::linear::LinearContext;
 use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseCoordinate, NoiseFamily, NoiseSource};
 use crate::devices::traits::{AnalysisMode, ChargeContext, Device, StampContext};
-use crate::devices::{Circuit, elaboration::ElaborationSize};
+use crate::devices::{Circuit, DeviceState, elaboration::ElaborationSize};
 
 pub mod batch;
 use crate::maths::Vector;
@@ -125,12 +126,70 @@ pub(super) struct SourceParameter {
     pub offset: Real,
 }
 
+/// Solver-side junction linearization recipe for a source family.
+pub(super) trait JunctionPolicy: std::fmt::Debug + Send + Sync {
+    fn prepare(
+        &self,
+        values: &[Real],
+        temperature: InstanceTemperature,
+    ) -> SpiceResult<JunctionLimit>;
+}
+
+/// Intrinsic junction coordinates and directional exponential scales.
+/// The physical kernel remains unaware of Newton iteration and history.
+#[derive(Debug)]
+pub(super) struct JunctionLimit {
+    pub positive: usize,
+    pub negative: usize,
+    pub forward: Option<(Real, Real)>,
+    pub reverse: Option<(Real, Real)>,
+}
+
+impl JunctionLimit {
+    fn linearize(
+        &self,
+        states: &mut DeviceState<'_>,
+        slot: usize,
+        coordinates: &mut [Real],
+    ) -> SpiceResult<()> {
+        let raw = coordinates[self.positive] - coordinates[self.negative];
+        let mut limiter = Limiter::new(states);
+        let previous = limiter.previous(states, slot).unwrap_or(0.);
+        let voltage = match limiter.mode() {
+            Linearization::Initial if self.forward.is_some() || self.reverse.is_some() => 0.,
+            Linearization::InitialTransient => states.accepted(1, slot).unwrap_or(raw),
+            Linearization::Limited => {
+                if let Some((scale, critical)) = self.forward.filter(|_| raw > 0.) {
+                    limiter.pn_junction(raw, Some(previous.max(0.)), scale, critical)
+                } else if let Some((scale, breakdown)) =
+                    self.reverse.filter(|&(_, breakdown)| raw < -breakdown)
+                {
+                    -breakdown
+                        - limiter.pn_junction(
+                            -raw - breakdown,
+                            Some((-previous - breakdown).max(0.)),
+                            scale,
+                            0.,
+                        )
+                } else {
+                    raw
+                }
+            }
+            _ => raw,
+        };
+        if voltage.to_bits() != raw.to_bits() {
+            coordinates[self.positive] = coordinates[self.negative] + voltage;
+        }
+        limiter.finish(states, &[(slot, voltage)])
+    }
+}
+
 /// Source identity and contextual bindings, independent of equation stamping.
 #[derive(Debug)]
 pub(super) struct SourceBinding {
     pub model_name: String,
     pub designator: char,
-    pub voltage_step_limiting: bool,
+    pub junction_policy: Box<dyn JunctionPolicy>,
     pub parameters: &'static [SourceParameter],
     pub gmin_slot: Option<usize>,
     pub model_ambient: AmbientTemperature,
@@ -149,6 +208,7 @@ pub struct PreparedDevice<K: Kernel> {
     temperature: InstanceTemperature,
     prepared: Prepared<K>,
     source: Option<Arc<SourceBinding>>,
+    junction_limit: Option<JunctionLimit>,
     voltage: RefCell<Vec<Real>>,
     output: RefCell<PointBuffer>,
     dynamic: RefCell<Vec<Real>>,
@@ -223,6 +283,7 @@ impl<K: Kernel> PreparedDevice<K> {
             temperature,
             prepared,
             source: None,
+            junction_limit: None,
             voltage: RefCell::new(vec![0.; width]),
             output: RefCell::new(PointBuffer::new(width).map_err(kernel_error)?),
             dynamic: RefCell::new(vec![0.; width]),
@@ -317,9 +378,22 @@ impl<K: Kernel> PreparedDevice<K> {
         })
     }
 
-    pub(super) fn with_source(mut self, source: SourceBinding) -> Self {
+    pub(super) fn with_source(mut self, source: SourceBinding) -> SpiceResult<Self> {
+        self.junction_limit = Some(
+            source
+                .junction_policy
+                .prepare(&self.values, self.temperature)?,
+        );
         self.source = Some(Arc::new(source));
-        self
+        Ok(self)
+    }
+
+    fn charge_state_count(&self) -> usize {
+        if self.artifact.descriptor().charge == Capability::Computed {
+            self.terminals.len() * 2
+        } else {
+            0
+        }
     }
 
     fn rebound(&self, values: &[Real], temperature: InstanceTemperature) -> SpiceResult<Self> {
@@ -330,7 +404,10 @@ impl<K: Kernel> PreparedDevice<K> {
             values,
             temperature,
         )?;
-        device.source = self.source.clone();
+        if let Some(source) = &self.source {
+            device.junction_limit = Some(source.junction_policy.prepare(values, temperature)?);
+            device.source = Some(Arc::clone(source));
+        }
         Ok(device)
     }
 
@@ -433,7 +510,12 @@ impl<K: Kernel> PreparedDevice<K> {
         Ok(())
     }
 
-    fn stamp_point(&self, context: &mut StampContext<'_>, output: &Point<'_>) -> SpiceResult<()> {
+    fn stamp_point(
+        &self,
+        context: &mut StampContext<'_>,
+        output: &Point<'_>,
+        coordinates: &[Real],
+    ) -> SpiceResult<()> {
         let width = self.terminals.len();
         if context.mode.is_transient() {
             self.check_charge()?;
@@ -493,7 +575,13 @@ impl<K: Kernel> PreparedDevice<K> {
                 // Matrix is the Jacobian of total current (including
                 // integrated charge), and RHS is its affine Newton source.
                 context.stamp(row, col, derivative)?;
-                linearized = derivative.mul_add(context.node_voltage(col), linearized);
+                let coordinate =
+                    if self.artifact.descriptor().equations[j].kind == EquationKind::Thermal {
+                        context.node_voltage(col)
+                    } else {
+                        coordinates[j]
+                    };
+                linearized = derivative.mul_add(coordinate, linearized);
             }
             context.stamp_rhs(row, linearized)?;
         }
@@ -557,9 +645,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         self.artifact.descriptor().noise == Capability::Computed
     }
     fn limits_voltage_steps(&self) -> bool {
-        self.source
-            .as_ref()
-            .is_some_and(|source| source.voltage_step_limiting)
+        self.junction_limit.is_some()
     }
     fn setup_matrix(
         &self,
@@ -573,11 +659,18 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         Ok(true)
     }
     fn state_count(&self) -> usize {
-        if self.artifact.descriptor().charge == Capability::Computed {
-            self.terminals.len() * 2
-        } else {
-            0
+        self.charge_state_count() + usize::from(self.junction_limit.is_some())
+    }
+
+    fn linearize_prepared(
+        &self,
+        states: &mut DeviceState<'_>,
+        coordinates: &mut [Real],
+    ) -> SpiceResult<()> {
+        if let Some(limit) = &self.junction_limit {
+            limit.linearize(states, self.charge_state_count(), coordinates)?;
         }
+        Ok(())
     }
 
     fn truncation_slots(&self) -> Vec<usize> {
@@ -601,12 +694,13 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         }
         let mut voltage = self.voltage.borrow_mut();
         self.read_coordinates(&mut voltage, |node| context.node_voltage(node));
+        self.linearize_prepared(&mut context.states, &mut voltage)?;
         let mut buffer = self.output.borrow_mut();
         let mut output = buffer.point();
         self.artifact
             .evaluate(&self.prepared, &voltage, &mut output)
             .map_err(evaluation_error)?;
-        self.stamp_point(context, &output)
+        self.stamp_point(context, &output, &voltage)
     }
 
     fn bind_numeric_parameter(&self, name: &str) -> Option<crate::devices::sweep::ParameterKey> {
@@ -629,7 +723,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
                 return self.source_parameter(name).map(|parameter| parameter.name);
             }
             crate::devices::sweep::ParameterKey::Prepared(slot) if self.source.is_none() => slot,
-            _ => return None,
+            crate::devices::sweep::ParameterKey::Prepared(_) => return None,
         };
         self.artifact
             .descriptor()
@@ -685,7 +779,9 @@ impl<K: Kernel> Device for PreparedDevice<K> {
             crate::devices::sweep::ParameterKey::Prepared(slot) if self.source.is_none() => {
                 (slot, value)
             }
-            _ => return Err(SpiceError::circuit("foreign prepared setter")),
+            crate::devices::sweep::ParameterKey::Prepared(_) => {
+                return Err(SpiceError::circuit("foreign prepared setter"));
+            }
         };
         let parameter = self
             .artifact
@@ -749,9 +845,14 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         )?))
     }
 
-    fn stamp_prepared(&self, context: &mut StampContext<'_>, point: &Point<'_>) -> SpiceResult<()> {
+    fn stamp_prepared(
+        &self,
+        context: &mut StampContext<'_>,
+        point: &Point<'_>,
+        coordinates: &[Real],
+    ) -> SpiceResult<()> {
         self.check_context(context.temperature, context.gmin)?;
-        self.stamp_point(context, point)
+        self.stamp_point(context, point, coordinates)
     }
 
     fn assemble_prepared(

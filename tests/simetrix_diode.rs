@@ -416,3 +416,82 @@ fn series_device_observations_and_noise_transfer_use_external_terminals() {
         );
     }
 }
+
+#[test]
+fn direct_newton_limits_forward_and_avalanche_junctions_in_scalar_and_tiles() {
+    use ngspice_rs::analysis::bias::{DcOutcome, DcSettings, DcStrategy, solve_dc_with};
+    let model = ".model dm simetrix_diode_level1(IS=1p N=1 BV=5 IBV=1m NBV=1 RS=1k)";
+    let context = ModelContext::default().with_gmin(1e-15);
+    let settings = DcSettings {
+        newton: NewtonOptions {
+            reltol: 1e-10,
+            abstol: 1e-14,
+            vntol: 1e-10,
+            ..NewtonOptions::default()
+        },
+        continuation: Default::default(),
+    };
+    let solve = |deck: &str| {
+        let circuit = Circuit::from_netlist_with_context(&parse(deck), &context).unwrap();
+        let result = solve_dc_with(&circuit, &context, &settings, &[], None, None).unwrap();
+        assert_eq!(
+            result.report.outcome,
+            DcOutcome::Converged(DcStrategy::Direct)
+        );
+        circuit
+            .devices()
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| device.designator() == 'v')
+            .map(|(index, _)| {
+                -result
+                    .solution
+                    .values
+                    .get(circuit.branch_rows(index).unwrap().start)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let forward = solve(&format!(
+        "* forward\nv1 a 0 100\nd1 a 0 dm\n{model}\n.end\n"
+    ))[0];
+    let reverse = solve(&format!(
+        "* reverse\nv2 b 0 -100\nd2 b 0 dm\n{model}\n.end\n"
+    ))[0];
+    let tiled = solve(&format!(
+        "* tile\nv1 a 0 100\nv2 b 0 -100\nd1 a 0 dm\nd2 b 0 dm\n{model}\n.end\n"
+    ));
+    close(tiled[0], forward, 1e-10, 1e-14);
+    close(tiled[1], reverse, 1e-10, 1e-14);
+    // Independent load-line residual, with an analytic exponential junction.
+    let vt = model_kernel_diode::K_OVER_Q * 300.15;
+    for (source, current) in [(100., forward), (-100., reverse)] {
+        let voltage = (-1000_f64).mul_add(current, source);
+        let expected =
+            1e-12 * (voltage / vt).exp_m1() - 1e-3 * ((-voltage - 5.) / vt).exp() + 1e-15 * voltage;
+        close(current, expected, 1e-7, 1e-12);
+    }
+}
+
+#[test]
+fn measured_temperature_precedence_survives_native_binding() {
+    // Independent producer fixture temperature-policy.tsv at 0.4 V.
+    let netlist = parse(
+        "* thermal\nv1 a 0 .4\nv2 b 0 .4\nv3 c 0 .4\nv4 d 0 .4\nd1 a 0 base dtemp=7\nd2 b 0 relative dtemp=7\nd3 c 0 absolute dtemp=7\nd4 d 0 absolute temp=50 dtemp=7\n.model base simetrix_diode_level1(IS=1p N=1 TNOM=27)\n.model relative simetrix_diode_level1(IS=1p N=1 TNOM=27 T_REL_GLOBAL=10)\n.model absolute simetrix_diode_level1(IS=1p N=1 TNOM=27 T_ABS=45 T_REL_GLOBAL=10)\n.end\n",
+    );
+    let context = ModelContext::new(65., 27.).with_gmin(1e-15);
+    let circuit = Circuit::from_netlist_with_context(&netlist, &context).unwrap();
+    for (source, expected) in [
+        ("v1", 0.0002837231788),
+        ("v2", 0.0006053763324),
+        ("v3", 0.00005462818211),
+        ("v4", 0.00004584224507),
+    ] {
+        close(
+            dc_current(&circuit, &context, source),
+            expected,
+            2e-8,
+            1e-14,
+        );
+    }
+}
