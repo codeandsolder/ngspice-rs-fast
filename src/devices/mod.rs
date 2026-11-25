@@ -47,6 +47,7 @@ pub mod bjt;
 pub mod breaks;
 pub mod bsim3;
 pub mod bsim4;
+mod bsim_model_inputs;
 pub use breaks::{BreakTable, SourceBreaks};
 pub mod circuit;
 pub mod controlled;
