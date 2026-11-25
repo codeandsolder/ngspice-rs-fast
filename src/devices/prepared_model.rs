@@ -9,7 +9,7 @@ use model_kernel_api::{
 };
 
 use crate::devices::linear::LinearContext;
-use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseFamily, NoiseSource};
+use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseCoordinate, NoiseFamily, NoiseSource};
 use crate::devices::traits::{AnalysisMode, ChargeContext, Device, StampContext};
 use crate::devices::{Circuit, elaboration::ElaborationSize};
 
@@ -48,9 +48,14 @@ impl Sink for CircuitNoiseSink<'_> {
         let injections = source
             .injections
             .iter()
-            .map(|term| (self.terminals[term.row], Complex::new(term.re, term.im)))
+            .map(|term| {
+                (
+                    NoiseCoordinate::Node(self.terminals[term.row]),
+                    Complex::new(term.re, term.im),
+                )
+            })
             .collect();
-        self.sources.push(NoiseSource::prepared(
+        self.sources.push(NoiseSource::generalized(
             source.name,
             source.density,
             injections,

@@ -66,9 +66,45 @@ impl<'a> Equation<'a> {
 /// MNA voltage lookup after eliminating fixed coordinates and empty columns.
 pub(super) struct InstantaneousSolution {
     original: Vec<Option<Real>>,
+    /// Coordinates in the un-compacted reduced system, including appended
+    /// capacitor currents. Unused columns can be set to zero because no
+    /// retained equation depends on them at this linearization.
+    reduced: Vec<Real>,
 }
 
 impl InstantaneousSolution {
+    pub(super) fn update(&self, initial: &Vector, scale: Real) -> Vector {
+        Vector::from_slice(
+            &initial
+                .as_slice()
+                .iter()
+                .zip(&self.original)
+                .map(|(&previous, value)| {
+                    value.map_or(previous, |value| {
+                        if scale == 1. {
+                            value
+                        } else {
+                            scale.mul_add(value - previous, previous)
+                        }
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub(super) fn step_scale(&self, initial: &Vector, limit: Real, limited: &[bool]) -> Real {
+        let step = initial
+            .as_slice()
+            .iter()
+            .zip(&self.original)
+            .zip(limited)
+            .filter_map(|((&previous, value), &limited)| {
+                limited.then_some(value.map_or(0., |value| (value - previous).abs()))
+            })
+            .fold(0., Real::max);
+        if step > limit { limit / step } else { 1. }
+    }
+
     pub(super) fn potential(&self, vertex: VoltageVertex) -> Option<Real> {
         match vertex {
             VoltageVertex::Ground => Some(0.),
@@ -306,6 +342,49 @@ impl<'a> InstantaneousSystem<'a> {
         Ok(())
     }
 
+    /// Check the true residual at the point that was just reloaded, not
+    /// the residual of the preceding Newton linearization. The appended
+    /// capacitor currents are retained in the reduced coordinate vector.
+    pub(super) fn residual_ratio(
+        &self,
+        solution: &InstantaneousSolution,
+        tolerance: Tolerances,
+    ) -> (Real, bool) {
+        if solution.reduced.len() != self.equations.len() {
+            return (Real::INFINITY, false);
+        }
+        let mut values: Vec<_> = self
+            .equations
+            .iter()
+            .map(|eq| (-eq.rhs, eq.rhs.abs(), 1_usize))
+            .collect();
+        for triplet in self.matrix.triplets() {
+            let contribution = triplet.value * solution.reduced[triplet.col];
+            let (residual, scale, count) = &mut values[triplet.row];
+            *residual += contribution;
+            *scale += contribution.abs();
+            *count += 1;
+        }
+        let mut ratio: Real = 0.;
+        let mut roundoff = true;
+        for (eq, (residual, scale, count)) in self.equations.iter().zip(values) {
+            let absolute = match eq.origin {
+                EquationOrigin::Node(_) => tolerance.abstol,
+                EquationOrigin::Branch(_) | EquationOrigin::Capacitor(_) => tolerance.vntol,
+            };
+            if !residual.is_finite() || !scale.is_finite() {
+                return (Real::INFINITY, false);
+            }
+            ratio = ratio.max(residual.abs() / tolerance.reltol.mul_add(scale, absolute));
+            // Dot-product accumulation error, plus the rounded affine
+            // residual and right-hand side from the device's local load.
+            let count = u32::try_from(count).unwrap_or(u32::MAX);
+            let rounding = (f64::from(count) + 4.) * Real::EPSILON * scale;
+            roundoff &= residual.abs() <= rounding;
+        }
+        (ratio, roundoff)
+    }
+
     /// Fold before identifying empty equations and variables. In particular,
     /// exactly cancelling stamps do not make a row/column nonempty.
     pub(super) fn solve(
@@ -390,6 +469,10 @@ impl<'a> InstantaneousSystem<'a> {
                  contradictory): {error}"
             ))
         })?;
+        let reduced = column_index
+            .iter()
+            .map(|column| column.map_or(0., |column| solution.as_slice()[column.0]))
+            .collect();
         let original = self
             .bindings
             .iter()
@@ -400,7 +483,7 @@ impl<'a> InstantaneousSystem<'a> {
                 }
             })
             .collect();
-        Ok(Some(InstantaneousSolution { original }))
+        Ok(Some(InstantaneousSolution { original, reduced }))
     }
 }
 

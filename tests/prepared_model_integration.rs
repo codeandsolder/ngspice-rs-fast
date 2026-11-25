@@ -528,7 +528,7 @@ fn prepared_model_noise_is_source_backed_not_assumed_zero() {
         }
     ));
     match &generators[0].kind {
-        NoiseKind::Prepared {
+        NoiseKind::Generalized {
             density,
             injections,
         } => {

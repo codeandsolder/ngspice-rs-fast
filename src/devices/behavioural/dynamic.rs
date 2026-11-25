@@ -5,7 +5,7 @@ use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::traits::{AnalysisMode, StampContext};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
-/// Integrated storage residual and its derivative multiplier for the current
+/// History-only source and present-quantity coefficient for the current
 /// trial. A rejected trial leaves accepted history unchanged.
 pub(super) fn integrate(
     context: &mut StampContext<'_>,
@@ -20,7 +20,7 @@ pub(super) fn integrate(
             return Err(SpiceError::circuit("dynamic residual timestep mismatch"));
         }
         let companion = storage.integrate(&mut context.states, coefficients)?;
-        (companion.derivative, coefficients.ag()[0])
+        (companion.current, companion.conductance)
     } else {
         storage.zero_derivative(&mut context.states)?;
         (0., 0.)
