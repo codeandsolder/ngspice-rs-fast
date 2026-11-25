@@ -115,7 +115,7 @@ impl Kernel {
 
     // Account for the actual trace allocation and a conservative per-entry
     // estimate of the B-tree node and separately allocated incident vector.
-    fn workspace(&self, ports: usize) -> usize {
+    const fn workspace(&self, ports: usize) -> usize {
         self.trace_capacity
             .saturating_mul(std::mem::size_of::<Knot>())
             .saturating_add(
