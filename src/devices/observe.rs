@@ -357,7 +357,7 @@ impl ObservationPlan {
             }
             let power = matches!(key, "p" | "power");
             let selector = if let Some(port) = terminal(key).or_else(|| power.then_some(0)) {
-                let terminals = device.terminals();
+                let terminals = device.external_terminals();
                 if power && terminals.len() != 2 {
                     return Err(gap(&name));
                 }

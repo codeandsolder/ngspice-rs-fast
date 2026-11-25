@@ -10,7 +10,7 @@ use ngspice_rs::{
         noise::{NoiseContext, NoiseKind},
         nonlinear::Diode,
     },
-    netlist::{Parser, ast::Netlist, source::parse_deck_text},
+    netlist::{Parser, ast::Netlist, semantic_diff, source::parse_deck_text, write_netlist},
     primitives::{AnalysisKind, Real},
 };
 use ngspice_rs_preprocess::{Cancellation, InputFormat, Options, Request, SourceInput, prepare};
@@ -174,6 +174,7 @@ fn source_geometry_temperature_and_context_rebinding_preserve_artifact_sharing()
         diode("d3").prepared_batch_key()
     );
     assert_eq!(diode("d1").terminals().len(), 3);
+    assert_eq!(diode("d1").external_terminals().len(), 2);
     assert_eq!(
         diode("d1").observation_parameter("temp", &initial).unwrap(),
         Some(40.)
@@ -229,7 +230,7 @@ fn source_geometry_temperature_and_context_rebinding_preserve_artifact_sharing()
 #[test]
 fn lexical_model_shadowing_and_actuals_select_distinct_physical_declarations() {
     let netlist = parse(
-        "lexical diode\nV1 a 0 1\nV2 b 0 1\nX1 a 0 cell params: r=100\nX2 b 0 cell params: r=200\n.model DM simetrix_diode_level1(IS=0 RS=999)\n.subckt cell p n params: r=300\n.model DM simetrix_diode_level1(IS=0 RS={r})\nD1 p n DM\n.ends cell\n.end\n",
+        "lexical diode\nV1 a 0 1\nV2 b 0 1\nV3 c 0 1\nD3 c 0 DM\nX1 a 0 cell params: r=100\nX2 b 0 cell params: r=200\n.model DM simetrix_diode_level1(IS=0 RS=999)\n.subckt cell p n params: r=300\n.model DM simetrix_diode_level1(IS=0 RS={r})\nD1 p n DM\n.ends cell\n.end\n",
     );
     let context = ModelContext::default().with_gmin(1e-3);
     let circuit = Circuit::from_netlist_with_context(&netlist, &context).unwrap();
@@ -245,6 +246,15 @@ fn lexical_model_shadowing_and_actuals_select_distinct_physical_declarations() {
         1e-10,
         1e-14,
     );
+    close(
+        dc_current(&circuit, &context, "v3"),
+        1. / 1999.,
+        1e-10,
+        1e-14,
+    );
+    let serialized = write_netlist(&netlist).unwrap();
+    let roundtrip = parse(&serialized);
+    assert!(semantic_diff(&netlist, &roundtrip).is_none());
 }
 
 #[test]
@@ -336,8 +346,9 @@ fn invalid_source_models_and_topology_changes_are_explicit() {
             "{body}"
         );
     }
-    let circuit = Circuit::from_netlist(&parse("topology\nV1 a 0 0.2\nD1 a 0 DM\n.model DM simetrix_diode_level1(IS=0 RS=100 TRS1=-0.01 TNOM=27)\n.end\n")).unwrap();
-    let hot = ModelContext::new(127., 27.);
+    let circuit = Circuit::from_netlist(&parse("topology\nV1 a 0 0.2\nD1 a 0 DM\n.model DM simetrix_diode_level1(IS=0 RS=100 TRS1=-0.015625 TNOM=27)\n.end\n")).unwrap();
+    // 64 K times -1/64 is exactly -1 even with fused multiply-add.
+    let hot = ModelContext::new(91., 27.);
     let result = solve_dc(&circuit, &hot, &NewtonOptions::default(), &[], None, None);
     assert!(
         result.is_err(),

@@ -947,8 +947,14 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// The designator letter, lowercased.
     fn designator(&self) -> char;
 
-    /// The nodes this device is connected to, in terminal order.
+    /// The nodes this device is connected to, in numerical binding order.
     fn terminals(&self) -> &[NodeId];
+
+    /// Public electrical ports in source order, excluding setup-private
+    /// coordinates. Used for external current and power observations.
+    fn external_terminals(&self) -> &[NodeId] {
+        self.terminals()
+    }
 
     /// How many device-local coordinates the device adds to the MNA
     /// system, including branch currents and auxiliary constitutive states.
