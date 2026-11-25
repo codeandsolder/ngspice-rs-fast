@@ -1556,10 +1556,12 @@ impl Driver<'_> {
                         timing: self.timing,
                     }),
                 },
+                &trial,
                 initial::Tolerances {
                     reltol: tolerances.reltol,
                     vntol: tolerances.vntol,
                     abstol: tolerances.abstol,
+                    chgtol: tolerances.chgtol,
                 },
                 &self.bias.newton,
             )?;

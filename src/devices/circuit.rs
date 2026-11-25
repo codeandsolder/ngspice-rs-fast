@@ -714,6 +714,20 @@ impl<'a> PreparedRun<'a> {
         charge: &mut Vector,
         jacobian: &mut SparseMatrix,
     ) -> SpiceResult<()> {
+        self.assemble_charge_for(context, state, charge, jacobian, self.circuit.load_order())
+    }
+
+    /// Assemble only selected physical charge equations for a constrained
+    /// instantaneous load. Uses the same prepared model and physical kernel
+    /// as the frequency-domain DAE; does not evaluate unrelated devices.
+    pub(crate) fn assemble_charge_for(
+        &self,
+        context: &ModelContext,
+        state: &Vector,
+        charge: &mut Vector,
+        jacobian: &mut SparseMatrix,
+        indices: impl Iterator<Item = usize>,
+    ) -> SpiceResult<()> {
         let point = self.point(context)?;
         let mut input = crate::devices::traits::ChargeContext {
             model: context,
@@ -724,7 +738,7 @@ impl<'a> PreparedRun<'a> {
             charge,
             jacobian,
         };
-        for index in self.circuit.load_order() {
+        for index in indices {
             let device = point.device(self.circuit, index);
             if device.is_nonlinear() {
                 input.branch = self.circuit.bindings.branch_rows[index].clone().next();

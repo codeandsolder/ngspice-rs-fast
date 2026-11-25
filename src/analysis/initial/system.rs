@@ -1,4 +1,5 @@
 //! Ordered elimination of fixed storage coordinates and compact instantaneous MNA.
+mod rank;
 use super::constraints::{AbsoluteRow, VoltageVertex};
 use super::{CapacitorInitial, ImpulseStorage, Tolerances, failure};
 use crate::devices::Circuit;
@@ -43,6 +44,7 @@ enum EquationOrigin<'a> {
     Node(AbsoluteRow),
     Branch(AbsoluteRow),
     Capacitor(&'a str),
+    Charge(&'a str),
 }
 
 struct Equation<'a> {
@@ -126,7 +128,7 @@ impl<'a> InstantaneousSystem<'a> {
         circuit: &Circuit,
         matrix: &SparseMatrix,
         rhs: &Vector,
-        storage: &ImpulseStorage,
+        storage: &'a ImpulseStorage,
         kept: &[&'a CapacitorInitial],
     ) -> SpiceResult<Self> {
         let unknowns = circuit.unknown_count();
@@ -182,7 +184,9 @@ impl<'a> InstantaneousSystem<'a> {
                 None
             } else {
                 let equation = EquationId(equations.len());
-                let origin = if kind {
+                let origin = if let Some(charge) = storage.charges.get(&absolute) {
+                    EquationOrigin::Charge(&charge.name)
+                } else if kind {
                     EquationOrigin::Branch(absolute)
                 } else {
                     EquationOrigin::Node(absolute)
@@ -297,12 +301,13 @@ impl<'a> InstantaneousSystem<'a> {
         tolerance: Tolerances,
     ) -> SpiceResult<()> {
         for (equation, &used) in self.equations.iter().zip(rows) {
-            if used {
+            if used || matches!(equation.origin, EquationOrigin::Charge(_)) {
                 continue;
             }
             let absolute = match equation.origin {
                 EquationOrigin::Node(_) => tolerance.abstol,
                 EquationOrigin::Branch(_) | EquationOrigin::Capacitor(_) => tolerance.vntol,
+                EquationOrigin::Charge(_) => tolerance.chgtol,
             };
             let relative_limit = tolerance.reltol * equation.scale;
             if equation.rhs.abs() > absolute + relative_limit {
@@ -313,6 +318,7 @@ impl<'a> InstantaneousSystem<'a> {
                     EquationOrigin::Capacitor(name) => {
                         format!("voltage relation of capacitor {name}")
                     }
+                    EquationOrigin::Charge(name) => format!("charge relation of {name}"),
                 };
                 let mut fixed = equation.fixed.clone();
                 fixed.sort_unstable();
@@ -348,10 +354,21 @@ impl<'a> InstantaneousSystem<'a> {
     pub(super) fn residual_ratio(
         &self,
         solution: &InstantaneousSolution,
+        state: &Vector,
         tolerance: Tolerances,
     ) -> (Real, bool) {
         if solution.reduced.len() != self.equations.len() {
             return (Real::INFINITY, false);
+        }
+        // An original coordinate can be inactive in one linearization
+        // and active in the next. Verify the vector that was actually
+        // reloaded; only appended free currents come from the reduced
+        // solve's separate coordinates.
+        let mut reduced = solution.reduced.clone();
+        for (binding, &value) in self.bindings.iter().zip(state.as_slice()) {
+            if let VariableBinding::Unknown(variable) = binding.variable {
+                reduced[variable.0] = value;
+            }
         }
         let mut values: Vec<_> = self
             .equations
@@ -359,7 +376,7 @@ impl<'a> InstantaneousSystem<'a> {
             .map(|eq| (-eq.rhs, eq.rhs.abs(), 1_usize))
             .collect();
         for triplet in self.matrix.triplets() {
-            let contribution = triplet.value * solution.reduced[triplet.col];
+            let contribution = triplet.value * reduced[triplet.col];
             let (residual, scale, count) = &mut values[triplet.row];
             *residual += contribution;
             *scale += contribution.abs();
@@ -368,9 +385,13 @@ impl<'a> InstantaneousSystem<'a> {
         let mut ratio: Real = 0.;
         let mut roundoff = true;
         for (eq, (residual, scale, count)) in self.equations.iter().zip(values) {
+            if matches!(eq.origin, EquationOrigin::Charge(_)) {
+                continue;
+            }
             let absolute = match eq.origin {
                 EquationOrigin::Node(_) => tolerance.abstol,
                 EquationOrigin::Branch(_) | EquationOrigin::Capacitor(_) => tolerance.vntol,
+                EquationOrigin::Charge(_) => tolerance.chgtol,
             };
             if !residual.is_finite() || !scale.is_finite() {
                 return (Real::INFINITY, false);
@@ -413,6 +434,19 @@ impl<'a> InstantaneousSystem<'a> {
             row_used[triplet.row] = true;
             column_used[triplet.col] = true;
         }
+        // Even a structurally empty storage-current column can be fixed
+        // as a gauge, e.g. a constant charge law between identical nodes.
+        let gauge_variables: Vec<_> = storage
+            .charges
+            .values()
+            .filter_map(|charge| match self.bindings[charge.current.0].variable {
+                VariableBinding::Unknown(variable) => Some(variable.0),
+                VariableBinding::Fixed(_) => None,
+            })
+            .collect();
+        for &variable in &gauge_variables {
+            column_used[variable] = true;
+        }
         self.check_empty_rows(circuit, &row_used, storage, tolerance)?;
 
         let mut rhs = Vec::new();
@@ -439,7 +473,7 @@ impl<'a> InstantaneousSystem<'a> {
                 })
             })
             .collect();
-        if rhs.len() != columns {
+        if rhs.len() != columns && storage.charges.is_empty() {
             return Err(failure(format!(
                 "uic initial conditions cannot be shown consistent: the instantaneous system has \
                  {} equations for {columns} unknowns (over- or under-determined by ideal sources, \
@@ -447,7 +481,7 @@ impl<'a> InstantaneousSystem<'a> {
                 rhs.len()
             )));
         }
-        if rhs.is_empty() {
+        if rhs.is_empty() && columns == 0 {
             return Ok(None);
         }
 
@@ -462,13 +496,38 @@ impl<'a> InstantaneousSystem<'a> {
             matrix.add(row.0, col.0, triplet.value)?;
         }
         matrix.fold_duplicates();
-        let solution = matrix.solve(&Vector::from_slice(&rhs)).map_err(|error| {
-            failure(format!(
-                "uic initial conditions cannot be shown consistent at t = 0+ (the \
-                 instantaneous constraint system is singular, possibly underdetermined or \
-                 contradictory): {error}"
-            ))
-        })?;
+        let solve = matrix.solve(&Vector::from_slice(&rhs));
+        let solution = match solve {
+            Ok(solution) => solution,
+            Err(error) if storage.charges.is_empty() => {
+                return Err(failure(format!(
+                    "uic initial conditions cannot be shown consistent at t = 0+ (the instantaneous constraint system is singular, possibly underdetermined or contradictory): {error}"
+                )));
+            }
+            Err(_) => {
+                // Rank completion is only available through explicitly
+                // declared storage-current coordinates, not arbitrary nodes.
+                let gauges: Vec<_> = gauge_variables
+                    .iter()
+                    .filter_map(|&variable| column_index[variable].map(|column| column.0))
+                    .collect();
+                // Enforce the algebraic equations before choosing a basis
+                // from dependent storage tangents. Every omitted charge
+                // row must still pass its independent nonlinear check.
+                let charge_rows: Vec<_> = self
+                    .equations
+                    .iter()
+                    .zip(&rows)
+                    .filter_map(|(equation, row)| {
+                        matches!(equation.origin, EquationOrigin::Charge(_))
+                            .then_some(*row)
+                            .flatten()
+                            .map(|row| row.0)
+                    })
+                    .collect();
+                rank::complete(&matrix, &rhs, &gauges, &charge_rows)?
+            }
+        };
         let reduced = column_index
             .iter()
             .map(|column| column.map_or(0., |column| solution.as_slice()[column.0]))
@@ -508,6 +567,7 @@ mod tests {
         ImpulseStorage {
             fixed_coordinates: BTreeMap::new(),
             capacitors: Vec::new(),
+            charges: BTreeMap::new(),
         }
     }
 
@@ -515,6 +575,7 @@ mod tests {
         reltol: 1e-3,
         vntol: 1e-6,
         abstol: 1e-12,
+        chgtol: 1e-14,
     };
 
     #[test]
