@@ -241,14 +241,14 @@ impl StochasticWaveform {
         })
     }
     /// Override source stream seed without changing physical parameters.
-    #[must_use]
+    #[must_use = "the returned source uses the replacement seed without altering its physical law"]
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = seed;
         self.cache = Mutex::default();
         self
     }
     /// Bind a distinct stable canonical source identity.
-    #[must_use]
+    #[must_use = "the returned source carries the stable named stream identity"]
     pub fn with_source_name(mut self, name: &str) -> Self {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
         for byte in name.bytes() {
@@ -261,7 +261,7 @@ impl StochasticWaveform {
     }
     /// Bind one optimizer candidate's stable identity without consuming RNG.
     /// Rebinding A/B/A replays A bitwise, independent of worker scheduling.
-    #[must_use]
+    #[must_use = "the returned source selects the reproducible candidate stream"]
     pub fn with_candidate_identity(mut self, candidate: u64) -> Self {
         self.candidate_identity = candidate;
         self.cache = Mutex::default();
@@ -278,12 +278,12 @@ impl StochasticWaveform {
         Ok(self)
     }
     /// Immutable physical law.
-    #[must_use]
+    #[must_use = "the returned specification determines the stochastic waveform law"]
     pub const fn spec(&self) -> StochasticSpec {
         self.spec
     }
     /// Source value in an operating point.
-    #[must_use]
+    #[must_use = "the returned value is the source contribution at bias"]
     pub const fn time_zero(&self) -> Real {
         self.dc
             + if let StochasticSpec::Random(plan) = self.spec {
@@ -664,7 +664,7 @@ pub struct StochasticEvents {
 }
 impl StochasticEvents {
     /// Fetch the next event in ascending physical time.
-    #[must_use]
+    #[must_use = "the returned event carries the next transition; fetching advances the stream"]
     pub fn next_event(&mut self) -> Option<StochasticEvent> {
         loop {
             let grid = self.grid.as_ref().and_then(GridEvents::next_time);

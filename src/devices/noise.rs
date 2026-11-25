@@ -181,7 +181,7 @@ pub enum FlickerLaw {
 
 impl FlickerLaw {
     /// `numerator` over this law's denominator at `frequency`, grouped as C.
-    #[must_use]
+    #[must_use = "the result is the frequency-dependent spectral density for this noise law"]
     pub fn apply(&self, numerator: Real, frequency: Real) -> Real {
         match *self {
             Self::Area { area, exponent } => numerator / (area * frequency.powf(exponent)),
@@ -374,7 +374,7 @@ fn correlated_gain(
 impl NoiseSource {
     /// Construct a generalized source without reducing coherent injections
     /// to an artificial terminal pair.
-    #[must_use]
+    #[must_use = "the returned generator retains the supplied coherent node injections and spectral density"]
     pub fn prepared(name: &str, density: Real, injections: Vec<(NodeId, Complex)>) -> Self {
         Self {
             suffix: std::borrow::Cow::Owned(format!("_{name}")),
@@ -387,7 +387,7 @@ impl NoiseSource {
     }
 
     /// A generator.
-    #[must_use]
+    #[must_use = "the returned generator carries the specified physical terminals and noise law"]
     pub const fn new(suffix: &'static str, nodes: [NodeId; 2], kind: NoiseKind) -> Self {
         Self {
             suffix: std::borrow::Cow::Borrowed(suffix),
@@ -468,7 +468,7 @@ pub struct NoiseContext<'a> {
 
 impl NoiseContext<'_> {
     /// The operating-point voltage of `node`, zero at ground.
-    #[must_use]
+    #[must_use = "the returned bias voltage is used to evaluate operating-point noise"]
     pub fn voltage(&self, node: NodeId) -> Real {
         self.unknowns
             .node_row(node)
@@ -477,7 +477,7 @@ impl NoiseContext<'_> {
     }
 
     /// The circuit temperature in kelvin (C `CKTtemp`).
-    #[must_use]
+    #[must_use = "the returned absolute temperature determines thermal noise"]
     pub fn circuit_kelvin(&self) -> Real {
         self.model_context.temperature + CELSIUS_TO_KELVIN
     }

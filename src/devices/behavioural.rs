@@ -102,7 +102,7 @@ impl Default for BehaviouralScale {
 impl BehaviouralScale {
     /// The output factor at circuit temperature `circuit` (degrees Celsius),
     /// as `ASRCload` computes it.
-    #[must_use]
+    #[must_use = "the returned temperature factor scales the behavioral output"]
     pub fn factor(&self, circuit: Real) -> Real {
         let kelvin = self.temperature.unwrap_or(circuit) + 273.15;
         let difference = kelvin + self.dtemp - 300.15;
@@ -178,19 +178,19 @@ pub struct Behavioural {
 
 impl Behavioural {
     /// Which output this source has.
-    #[must_use]
+    #[must_use = "the result identifies the physical quantity driven by this source"]
     pub const fn output(&self) -> BehaviouralOutput {
         self.output
     }
 
     /// The output scaling setters.
-    #[must_use]
+    #[must_use = "the returned setters determine output scaling and sensitivity"]
     pub const fn scale(&self) -> &BehaviouralScale {
         &self.scale
     }
 
     /// A copy with other output scaling setters, for a `.sens` load.
-    #[must_use]
+    #[must_use = "the returned copy carries the replacement scale; the original is unchanged"]
     pub(crate) fn with_scale(&self, scale: BehaviouralScale) -> Self {
         Self {
             scale,
@@ -199,7 +199,7 @@ impl Behavioural {
     }
 
     /// The compiled expression.
-    #[must_use]
+    #[must_use = "the returned program contains the bound expression evaluated by the source"]
     pub const fn program(&self) -> &Program {
         &self.program
     }

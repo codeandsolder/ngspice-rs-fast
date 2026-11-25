@@ -6,13 +6,13 @@ use crate::primitives::Real;
 
 /// Sampled white-noise linear reconstruction at fixed phase u in [0,1].
 /// Two independent knot amplitudes each have variance sigma².
-#[must_use]
+#[must_use = "the returned variance depends on the reconstruction phase"]
 pub fn interpolated_white_variance(knot_sigma: Real, phase: Real) -> Real {
     knot_sigma * knot_sigma * ((1. - phase).mul_add(1. - phase, phase * phase))
 }
 
 /// Average white power over all phases of one sample interval.
-#[must_use]
+#[must_use = "the returned power accounts for interpolation over the sample interval"]
 pub fn mean_white_power(knot_sigma: Real) -> Real {
     (2. / 3.) * knot_sigma * knot_sigma
 }
@@ -21,7 +21,7 @@ pub fn mean_white_power(knot_sigma: Real) -> Real {
 ///
 /// The zero-frequency limit is sigma² times spacing; fourth-order sinc
 /// attenuation makes the integrated two-sided variance 2/3 sigma².
-#[must_use]
+#[must_use = "the returned spectral density accounts for the interpolation frequency response"]
 pub fn white_psd(knot_sigma: Real, spacing: Real, frequency: Real) -> Real {
     let x = std::f64::consts::PI * frequency * spacing;
     let sinc = if x == 0. { 1. } else { x.sin() / x };
@@ -29,14 +29,14 @@ pub fn white_psd(knot_sigma: Real, spacing: Real, frequency: Real) -> Real {
 }
 
 /// Mean occupation probability of the high RTS state.
-#[must_use]
+#[must_use = "the returned probability determines the stationary high-state occupation"]
 pub fn telegraph_occupation(capture_mean: Real, emission_mean: Real) -> Real {
     emission_mean / (capture_mean + emission_mean)
 }
 
 /// Stationary two-state telegraph covariance at a physical lag, with exact
 /// exponential capture and emission waiting times.
-#[must_use]
+#[must_use = "the returned covariance determines the stationary lag-dependent noise correlation"]
 pub fn telegraph_covariance(
     amplitude: Real,
     capture_mean: Real,

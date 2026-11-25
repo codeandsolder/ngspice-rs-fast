@@ -39,7 +39,7 @@ impl Bit {
     }
 
     /// Convert a resolved SPICE drive to an HDL bit.
-    #[must_use]
+    #[must_use = "the returned four-state bit represents the resolved electrical drive"]
     pub const fn from_drive(drive: Drive) -> Self {
         if matches!(drive.strength, Strength::HighImpedance) {
             Self::Z
@@ -53,7 +53,7 @@ impl Bit {
     }
 
     /// Convert a four-state output to a SPICE drive.
-    #[must_use]
+    #[must_use = "the returned drive preserves the HDL output state for net resolution"]
     pub const fn drive(self) -> Drive {
         match self {
             Self::Zero => Drive::strong(Logic::Zero),

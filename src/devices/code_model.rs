@@ -18,7 +18,7 @@ pub enum Logic {
 
 impl Logic {
     /// Three-valued inversion.
-    #[must_use]
+    #[must_use = "the returned logic value is inverted without changing the original"]
     pub const fn invert(self) -> Self {
         match self {
             Self::Zero => Self::One,
@@ -51,7 +51,7 @@ pub struct Drive {
 
 impl Drive {
     /// Strong output.
-    #[must_use]
+    #[must_use = "the returned drive participates in strength-aware net resolution"]
     pub const fn strong(logic: Logic) -> Self {
         Self {
             logic,
@@ -60,7 +60,7 @@ impl Drive {
     }
 
     /// Resolve concurrent drives, ignoring disconnected outputs.
-    #[must_use]
+    #[must_use = "the returned drive is the resolved result of all concurrent outputs"]
     pub fn resolve(drives: impl IntoIterator<Item = Self>) -> Self {
         drives
             .into_iter()
@@ -108,7 +108,7 @@ impl Delays {
 
     /// Select delay by target state, with unknown transitions using the
     /// previous state (upstream `d_and/cfunc.mod`).
-    #[must_use]
+    #[must_use = "the returned delay determines the scheduled transition time"]
     pub const fn transition(self, previous: Logic, next: Logic) -> Real {
         match next {
             Logic::One => self.rise,
@@ -162,7 +162,7 @@ pub struct ModelSchema {
 
 impl ModelSchema {
     /// A model with digital ports only.
-    #[must_use]
+    #[must_use = "the returned schema defines the digital port counts"]
     pub const fn digital(inputs: usize, outputs: usize) -> Self {
         Self {
             analog_voltage: PortCount {
@@ -417,7 +417,7 @@ pub struct Adc {
 
 impl Adc {
     /// One differential voltage input and one digital output.
-    #[must_use]
+    #[must_use = "the returned schema declares the ADC voltage input and digital output"]
     pub const fn schema() -> ModelSchema {
         ModelSchema {
             analog_voltage: PortCount {
@@ -547,7 +547,7 @@ pub struct Dac {
 
 impl Dac {
     /// One digital input and one differential voltage output.
-    #[must_use]
+    #[must_use = "the returned schema declares the DAC digital input and voltage output"]
     pub const fn schema() -> ModelSchema {
         ModelSchema {
             analog_voltage: PortCount {
