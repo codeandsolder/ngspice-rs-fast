@@ -75,7 +75,7 @@ impl LosslessModes {
         self.delays
             .iter()
             .map(|&delay| {
-                let angle = -(std::f64::consts::TAU * hz) * delay;
+                let angle = -std::f64::consts::TAU * (hz * delay);
                 if !angle.is_finite() {
                     return Err(invalid("modal phase overflow"));
                 }
