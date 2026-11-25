@@ -43,14 +43,14 @@ same coupled equations, including real losses and mutual inductance and
 capacitance. The input and output return terminals participate in signed
 KCL stamps for every 2N×2N matrix entry. A singular B block cannot produce an ordinary two-ended nodal admittance.
 The diagnostic `CoupledLinePlan::admittance_at` rejects this conversion, but
-**the native P Device does not need to invert B**. Instead it allocates N
-branch-current unknowns and stamps the exact transfer equations in MNA:
+**the native P Device does not need to invert B**. For nonmodal AC it allocates N
+physical input-current unknowns and stamps the exact transfer equations in MNA:
 
   Vout - A Vin - B Iin' = 0
   Iinput_entering = Iin' / Zscale
   Ioutput_entering = -(C Vin + D Iin') / Zscale.
 
-At DC a lossless line has A=D=I, B=C=0, so the branch rows enforce
+At zero frequency a lossless line has A=D=I, B=C=0, so the branch rows enforce
 Vout=Vin with KCL currents entering and leaving the cable. Exact shorts and
 resonant constraints are therefore preserved as actual branch equations,
 not replaced with zeros or an arbitrary large conductance. The same
@@ -145,7 +145,7 @@ coupled delayed-scattering transient implementation. The finite-volume
 approximation below does not guarantee an exact physical front and must
 not be presented as complete distributed transient parity.
 
-## Causal time-domain finite-volume cable
+## Passive finite-volume cable
 
 For lossy or singular LC material the current `.tran` approximation does
 **not** use a sampled AC matrix. It discretizes the full
@@ -160,47 +160,45 @@ finite grid. The line's `state_count` is `6 * conductors * sections`: for
 each section and conductor, (left shunt charge/current), (series magnetic
 flux/voltage), (right shunt charge/current).
 
-For a time integration coefficient `a0`, each cell's physical companion
-admittances are `S = inverse(dx*(R + a0*L))` and
-`H = dx*(G + a0*C)/2`. Accepted charge/flux histories are integrated
-using the same `Coefficients` as all other SPICE capacitors and inductors;
-this constructs known historical affine current/voltage forcing terms.
-The symmetric cell Norton matrix in end-to-end *entering* currents is
+For integration coefficient `a0`, a section has series impedance
+`Z = dx*(R + a0*L)` and half-shunt admittance `H = dx*(G + a0*C)/2`.
+Accepted energy histories supply a series voltage `hseries` and half-shunt
+currents `hleft`, `hright`. Instead of inverting Z, use the hybrid port
+operator (both port currents enter the section):
 
-  [Ileft; Iright] = [[S+H,-S],[-S,S+H]] [Vleft;Vright] + [Jleft;Jright].
+  Vleft = A Ileft + B Vright + f
+  Iright = -B^T Ileft + D Vright + g
 
-The interface of two adjacent cells obeys a KCL equation whose coefficient
-is `K = Y22_left + Y11_right`. Eliminating its voltage produces a Schur
-complement. Right-to-left suffix composition eliminates all interior nodes
-without ever multiplying numerically explosive ABCD matrices. The global MNA
-receives N real branch-current rows (physical input currents during transient),
-plus output-port KCL from the final condensed Norton admittance and source.
-Only accepted charges and fluxes feed subsequent loads: Newton iterations
-write *trial* local charge, derivative and flux states, and the existing
-`StateHistory` transaction publishes them on acceptance. A rejected step
-cannot mutate accepted history. The same Schur factors reconstruct the local
-interface voltages and series currents to update all trial states.
+where in common balanced current units
 
-At a transient `t=0` DC seed, the continuous DC telegrapher transfer at each
-half-section reconstructs initial voltages/currents and stores initial
-charges/fluxes with zero derivatives. This matches steady linear DC exactly
-for the lossless shunt case, and otherwise converges to the spatial DC model
-as sections increase. Ordinary `.op` without state history does not create
-or require spatial state slots. The ordinary time-domain Norton kernel requires nonsingular
-R + a0*L at the chosen positive integration coefficient. A line
-whose entire R and L matrices are **exactly zero** instead uses
-exact MNA voltage constraints with its full integrated G/C shunt
-between output conductors and output return. It preserves port KCL,
-accepted/trial charge history and section-count independence without
-fictitious series conductance. Other partially singular series
-matrices remain explicit numerical errors pending a validated
-modal descriptor formulation.
+  B = inverse(I + Z H), A = B Z, D = H + H B
+  f = B (hseries - Z hleft), g = hleft + hright + H f.
 
-This is a causal, stable approximation to the continuous distributed cable,
-not a bitwise port of C's CPL approximation. Spatial error, integration error,
-and differences from C's own impulse-response approximation must be assessed
-separately; neither C's waveform nor an untested grid size should be treated
-as proof of mathematical accuracy.
+A and D are positive semidefinite. The identity term in the solve
+preserves exact zero-impedance modes, even with partially singular,
+noncommuting material matrices. The two adjacent sections share interface
+voltage `Vm` satisfying
+
+  (I + A_right D_left) Vm = A_right B_left^T Ileft
+      + B_right Vright + f_right - A_right g_left.
+
+Composition eliminates the interface with this equation without inverting
+series impedance or multiplying growing ABCD transfers. The condensed MNA
+has N physical input-current unknowns, and the output KCL is stamped from
+the hybrid operator. The homogeneous cell coefficients are computed once
+per load. Retained affine interface operators reconstruct each cell's
+voltages and series currents using the same elimination as the terminal
+stamp. Accepted energy histories are written only through the existing
+trial/accept transaction.
+
+For exact continuous DC, convert a bounded short-segment transfer to a
+hybrid operator by solving its A block, then repeatedly double with the
+same positive-real interface elimination. This avoids both exp(+gamma L)
+overflow and inversion of a singular series B block. DC seed states are
+reconstructed from hybrid half-sections with zero derivatives. The spatial
+transient model still approximates the continuous lossy line; it does not
+satisfy the exact finite-speed front. Ideal zero-series modes remain exact
+constraints for any section count, including partial-rank R and L.
 
 ## C reference and test contract
 
@@ -224,7 +222,6 @@ comparisons and note both numerical method and grid resolution.
 Complete native P/CPL parsing, model resolution, exact distributed DC/AC,
 exact lossless modal transient and approximate lossy/singular finite-volume
 transient with trial/accept states and physical N-port KCL have implementation. The full strict lint and campaign validator are
-responsible for integration. Remaining work includes general lossy exact-front transient,
-partially singular series-mode handling, and broad performance, energy/passivity
-and variable-step verification. Completely zero R/L lines have exact
-constrained MNA transient support.
+responsible for integration. Remaining work includes general lossy exact-front transient, singular
+long-line AC constraints, and broad performance, energy/passivity and
+variable-step verification.

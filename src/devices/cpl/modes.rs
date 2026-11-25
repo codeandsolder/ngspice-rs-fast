@@ -72,11 +72,11 @@ fn symmetric_eigenvectors(mut a: Vec<Real>, order: usize) -> SpiceResult<(Vec<Re
     for value in &mut a {
         *value /= max;
     }
-    // Treat only roundoff-level offdiagonal residuals as diagonal.
-    let dimension = f64::from(
-        u32::try_from(order).map_err(|_| super::invalid("LC mode dimension out of range"))?,
-    );
-    let tolerance = 8. * dimension * Real::EPSILON;
+    // Continue cyclic rotations until the off-diagonal is below one unit
+    // roundoff of the scaled operator. A dimension-scaled cutoff can leave
+    // a significant residual for individual modal equations after transforming
+    // back to physical coordinates, even when the global norm is small.
+    let tolerance = 0.5 * Real::EPSILON;
     let mut converged = false;
     for _sweep in 0..100 {
         let mut maximum = 0.0_f64;

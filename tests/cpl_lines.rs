@@ -1064,3 +1064,88 @@ fn mismatched_modal_line_preserves_bidirectional_reflection_series() {
         );
     }
 }
+
+#[test]
+fn partially_singular_series_matches_independent_modal_pi_and_ideal_shunt() {
+    // Rank-one coupled R and L: the common mode sees 20 ohms and 100 nH,
+    // while the differential mode is an ideal series constraint. Both
+    // modes have 100 pF and 2 mS shunt loading over the entire cable.
+    // Compare against separately elaborated ordinary R/L/C primitives;
+    // the reference shares neither the hybrid nor CPL stamping kernel.
+    let cable = run_transient_cpl(
+        "v1 src 0 pulse(0 1 2n 0.25n 0.25n 3n 8n)\n\
+         rs1 src a1 100\nrs2 a2 0 100\n\
+         p1 a1 a2 0 b1 b2 0 cable\n\
+         rl1 b1 0 100\nrl2 b2 0 100\n\
+         .model cable cpl r=10 10 10 l=50n 50n 50n c=100p 0 100p g=0.002 0 0.002 length=1 sections=4\n\
+         .tran 0.02n 16n 0 0.02n",
+    );
+    let reference = run_transient_cpl(
+        "ve es 0 pulse(0 0.5 2n 0.25n 0.25n 3n 8n)\n\
+         vo os 0 pulse(0 0.5 2n 0.25n 0.25n 3n 8n)\n\
+         rse es e0 100\nrso os o 100\n\
+         r0 e0 m0 5\nl0 m0 e1 25n\n\
+         r1 e1 m1 5\nl1 m1 e2 25n\n\
+         r2 e2 m2 5\nl2 m2 e3 25n\n\
+         r3 e3 m3 5\nl3 m3 e4 25n\n\
+         c0 e0 0 12.5p\nrg0 e0 0 4000\n\
+         c1 e1 0 25p\nrg1 e1 0 2000\n\
+         c2 e2 0 25p\nrg2 e2 0 2000\n\
+         c3 e3 0 25p\nrg3 e3 0 2000\n\
+         c4 e4 0 12.5p\nrg4 e4 0 4000\n\
+         co o 0 100p\nro o 0 500\n\
+         rle e4 0 100\nrlo o 0 100\n\
+         .tran 0.02n 16n 0 0.02n",
+    );
+    let times = transient_column(&reference, "time");
+    let even = transient_column(&reference, "v(e4)");
+    let odd = transient_column(&reference, "v(o)");
+    let actual_times = transient_column(&cable, "time");
+    let first = transient_column(&cable, "v(b1)");
+    let second = transient_column(&cable, "v(b2)");
+    let interpolate = |time: f64, values: &[f64]| {
+        let j = times
+            .partition_point(|&candidate| candidate < time)
+            .clamp(1, times.len() - 1);
+        let weight = (time - times[j - 1]) / (times[j] - times[j - 1]);
+        (values[j] - values[j - 1]).mul_add(weight, values[j - 1])
+    };
+    for ((&time, &a), &b) in actual_times.iter().zip(&first).zip(&second) {
+        let e = interpolate(time, &even);
+        let o = interpolate(time, &odd);
+        assert!(
+            (a - e - o).abs() < 2e-5 && (b - e + o).abs() < 2e-5,
+            "partially singular coupled cable at {time:.17e}: ({a:.17e},{b:.17e}) vs ({:.17e},{:.17e})",
+            e + o,
+            e - o
+        );
+    }
+}
+
+#[test]
+fn long_rank_one_dc_series_has_exact_ideal_mode_without_transfer_overflow() {
+    // Even mode exp(-1000) attenuation, odd mode an ideal wire shunted
+    // by 1000 S. Native DC initialization must preserve both at once.
+    let plot = run_transient_cpl(
+        "v1 src 0 1\nrs1 src a1 1\nrs2 a2 0 1\n\
+         p1 a1 a2 0 b1 b2 0 cable\n\
+         rl1 b1 0 1\nrl2 b2 0 1\n\
+         .model cable cpl r=0.5 0.5 0.5 l=0 0 0 c=0 0 0 g=1 0 1 length=1000 sections=8\n\
+         .tran 0.1n 1n 0 0.1n",
+    );
+    let a = transient_column(&plot, "v(b1)");
+    let b = transient_column(&plot, "v(b2)");
+    let expected = 0.5 / 1002.;
+    assert!(
+        (a[0] - expected).abs() < 1e-12 && (b[0] + expected).abs() < 1e-12,
+        "DC mixed ideal/attenuating modes: {}, {}",
+        a[0],
+        b[0]
+    );
+    for (&a, &b) in a.iter().zip(&b) {
+        assert!(
+            (a - b - 2. * expected).abs() < 1e-12,
+            "exact ideal mode changed: {a}, {b}"
+        );
+    }
+}
