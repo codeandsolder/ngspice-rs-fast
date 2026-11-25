@@ -39,7 +39,7 @@ fn deck(designator: char) -> &'static str {
         'y' => "y1 a 0 b 0 ym\n.model ym txl r=1 l=1n c=1p g=0 length=1\nv1 a 0 1\nr1 b 0 50",
         'u' => "u1 a b 0 um l=1m\n.model um urc\nv1 a 0 1\nr1 b 0 1k",
         'n' => "n1 a 0 nm\n.model nm nport\nv1 a 0 1",
-        'p' => "p1 a 0 b 0 0 0 pm\n.model pm cpl\nv1 a 0 1",
+        'p' => "p1 a 0 b 0 pm\n.model pm cpl r=10 l=10n g=0 c=10p length=1\nv1 a 0 1\nr1 b 0 50",
         'a' => "a1 a b am\n.model am gain\nv1 a 0 1\nr1 b 0 1k",
         other => panic!("no representative deck for designator '{other}'"),
     }

@@ -52,6 +52,7 @@ pub use breaks::{BreakTable, SourceBreaks};
 pub mod circuit;
 pub mod code_model;
 pub mod controlled;
+pub mod cpl;
 pub mod delay;
 pub mod distortion;
 mod elaboration;
