@@ -36,6 +36,7 @@
 //! the `ri`/`rf`/`rdi`/`rsi` resistance paths (issues #155-#157); each
 //! refuses with its C reference rather than dropping terms.
 
+mod channel;
 pub(crate) mod hfet1;
 pub(crate) mod hfet2;
 mod lifecycle;
@@ -335,6 +336,25 @@ impl HfetInstance {
             temp: given_celsius(record, "temp")?,
             dtemp: record.value("dtemp")?,
         })
+    }
+
+    /// Common HFET1/HFET2 instance asks; width includes the multiplier.
+    fn observation_parameter(
+        &self,
+        key: &str,
+        initial: &InstanceInitial,
+        circuit_celsius: Real,
+    ) -> Option<Real> {
+        match key {
+            "l" => Some(self.l),
+            "w" => Some(self.w * self.m),
+            "m" => Some(self.m),
+            "icvds" => initial.values[0],
+            "icvgs" => initial.values[1],
+            "temp" => Some(self.temperature(circuit_celsius) - CELSIUS_TO_KELVIN),
+            "dtemp" => Some(self.dtemp),
+            _ => None,
+        }
     }
 
     /// C instance temperature in kelvin: an explicit TEMP overrides DTEMP.

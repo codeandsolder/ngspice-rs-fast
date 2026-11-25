@@ -331,6 +331,24 @@ agree with it bit for bit over 1 kHz-10 GHz while the two-device fixture
 differs only by round-off (about 1e-16 relative). `.sp` builds on the same
 assembly and runs for levels 2 and 3.
 
+## Shared HFET intrinsic channel (#203)
+
+HFET1 and HFET2 use the same typed intrinsic channel evaluation in
+`devices/hfet/channel.rs`, including carrier density, saturation current,
+conductances and intrinsic gate capacitances. Both models store the common
+model parameters directly and cache the prepared temperature parameters;
+channel evaluation borrows them without rebuilding parameter aggregates.
+HFET1 supplies its model maximum density and temperature-derived fringe
+capacitance; HFET2 supplies its temperature-scaled density and model fringe
+capacitance. The active-channel result exposes the intermediates needed for
+HFET1's additional gate/drain corrections. Each family retains its own
+limiting, gate-current equations, temperature preparation and state layout.
+MESA's different channel physics and temperature observations stay separate.
+
+The extracted before/after equations agreed bit-for-bit on 6,816 intrinsic
+bias, density-branch and temperature combinations. Interleaved release
+microbenchmarks of the cached-parameter implementation showed no regression.
+
 ## HFET2 (level 6, `Z`, M10 H4, #169)
 
 The smallest of the three lineage copies: `hfet2/` has 33 model setters (`cf`,

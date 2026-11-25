@@ -50,6 +50,7 @@
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
 )]
 
+use super::channel::{ChannelModel, ChannelTemperature};
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step, prime_prime};
 use super::{CELSIUS_TO_KELVIN, HfetInstance as Instance};
 use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
@@ -74,8 +75,6 @@ use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 const EPSILON_GAAS: Real = 12.244 * 8.854_18e-12;
 /// C `CONSTKoverQ`.
 const K_OVER_Q: Real = BOLTZMANN / CHARGE;
-/// `hfeta`'s carrier-density cutoff (`nsm < 1.0e-38` turns the channel off).
-const N_MIN: Real = 1e-38;
 
 /// The state slots of `HFETAload`'s `CKTstate0`, in the port's own order. Each
 /// charge is followed by its derivative, as `CKTterr`/`NIintegrate` require.
@@ -184,6 +183,7 @@ const MODEL: &[P] = &[
 /// The validated model card.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Model {
+    channel: ChannelModel,
     /// `+1` for N, `-1` for P (`nhfet`/`phfet`, which C also applies to
     /// `HFETAthreshold` in its temperature routine).
     pol: Real,
@@ -192,23 +192,13 @@ pub(super) struct Model {
     rd: Real,
     rs: Real,
     rg: Real,
-    rdi: Real,
-    rsi: Real,
     rgs: Real,
     rgd: Real,
     ri: Real,
     rf: Real,
-    eta: Real,
-    m: Real,
-    mc: Real,
-    gamma: Real,
-    sigma0: Real,
-    vsigmat: Real,
-    vsigma: Real,
     mu: Real,
     di: Real,
     delta: Real,
-    vs: Real,
     nmax: Real,
     deltad: Real,
     js1d: Real,
@@ -219,8 +209,6 @@ pub(super) struct Model {
     m2d: Real,
     m1s: Real,
     m2s: Real,
-    epsi: Real,
-    pm: Real,
     cm3: Real,
     a1: Real,
     a2: Real,
@@ -244,10 +232,7 @@ pub(super) struct Model {
     cm1: Real,
     cm2: Real,
     astar: Real,
-    eta1: Real,
-    d1: Real,
     vt1: Option<Real>,
-    eta2: Real,
     d2: Real,
     vt2: Option<Real>,
     ggr: Real,
@@ -285,6 +270,23 @@ impl Model {
             explicit.unwrap_or(if pol > 0. { n } else { p })
         };
         let model = Self {
+            channel: ChannelModel {
+                eta: typed(values.get("eta").map(|v| v.value), 1.28, 1.4),
+                vs: typed(values.get("vs").map(|v| v.value), 1.5e5, 0.8e5),
+                rsi: r("rsi")?,
+                rdi: r("rdi")?,
+                vsigmat: r("vsigmat")?,
+                vsigma: r("vsigma")?,
+                sigma0: r("sigma0")?,
+                eta2: r("eta2")?,
+                gamma: r("gamma")?,
+                m: r("m")?,
+                eta1: r("eta1")?,
+                d1: r("d1")?,
+                epsi: r("epsi")?,
+                mc: r("mc")?,
+                pm: r("p")?,
+            },
             pol,
             // `hfettemp.c` stores `HFETAthreshold` already multiplied by the
             // type (`threshold *= type` on every call), so the first
@@ -296,23 +298,13 @@ impl Model {
             rd: r("rd")?,
             rs: r("rs")?,
             rg: r("rg")?,
-            rdi: r("rdi")?,
-            rsi: r("rsi")?,
             rgs: r("rgs")?,
             rgd: r("rgd")?,
             ri: r("ri")?,
             rf: r("rf")?,
-            eta: typed(values.get("eta").map(|v| v.value), 1.28, 1.4),
-            m: r("m")?,
-            mc: r("mc")?,
-            gamma: r("gamma")?,
-            sigma0: r("sigma0")?,
-            vsigmat: r("vsigmat")?,
-            vsigma: r("vsigma")?,
             mu: typed(values.get("mu").map(|v| v.value), 0.4, 0.03),
             di: r("di")?,
             delta: r("delta")?,
-            vs: typed(values.get("vs").map(|v| v.value), 1.5e5, 0.8e5),
             nmax: r("nmax")?,
             deltad: r("deltad")?,
             js1d: r("js1d")?,
@@ -323,8 +315,6 @@ impl Model {
             m2d: r("m2d")?,
             m1s: r("m1s")?,
             m2s: r("m2s")?,
-            epsi: r("epsi")?,
-            pm: r("p")?,
             cm3: r("cm3")?,
             a1: r("a1")?,
             a2: r("a2")?,
@@ -343,10 +333,7 @@ impl Model {
             cm1: r("cm1")?,
             cm2: r("cm2")?,
             astar: r("astar")?,
-            eta1: r("eta1")?,
-            d1: r("d1")?,
             vt1: values.get("vt1").map(|v| v.value),
-            eta2: r("eta2")?,
             d2: r("d2")?,
             vt2: values.get("vt2").map(|v| v.value),
             // C's `*Given` flags: a schema default is not a given setter.
@@ -359,7 +346,7 @@ impl Model {
             kmu: r("kmu")?,
             kvto: r("kvto")?,
         };
-        if model.vsigma == 0. || model.di == 0. {
+        if model.channel.vsigma == 0. || model.di == 0. {
             return Err(SpiceError::circuit(format!(
                 "{}: HFET1 model '{}' needs VSIGMA and DI nonzero (hfeta divides by them)",
                 resolved.card().location,
@@ -373,21 +360,8 @@ impl Model {
 /// `hfettemp.c`'s per-instance quantities.
 #[derive(Debug, Clone, Copy)]
 struct Derived {
+    channel: ChannelTemperature,
     temp: Real,
-    vt: Real,
-    tlambda: Real,
-    tmu: Real,
-    tvto: Real,
-    vt1: Real,
-    vt2: Real,
-    n0: Real,
-    n02: Real,
-    /// Whether `hfeta` may use the `n02` branch: C requires both `eta2` and
-    /// `d2` to be given.
-    two_exponentials: bool,
-    gchi0: Real,
-    cf: Real,
-    imax: Real,
     is1d: Real,
     is2d: Real,
     is1s: Real,
@@ -396,7 +370,6 @@ struct Derived {
     ggrwl: Real,
     fgds: Real,
     delf: Real,
-    delta_sqr: Real,
     gdpr: Real,
     gspr: Real,
     ggate: Real,
@@ -540,35 +513,40 @@ impl Hfet1 {
         let tlambda = model.klambda.mul_add(delta, model.lambda);
         let tmu = model.kmu.mul_add(-delta, model.mu);
         let tvto = model.kvto.mul_add(-delta, vto);
-        let n0 = model.epsi * model.eta * vt / 2. / CHARGE / (model.di + model.deltad);
-        let n01 = model.epsi * model.eta1 * vt / 2. / CHARGE / model.d1;
+        let n0 =
+            model.channel.epsi * model.channel.eta * vt / 2. / CHARGE / (model.di + model.deltad);
+        let n01 = model.channel.epsi * model.channel.eta1 * vt / 2. / CHARGE / model.channel.d1;
         let n02 = if model.eta2_given {
-            model.epsi * model.eta2 * vt / 2. / CHARGE / model.d2
+            model.channel.epsi * model.channel.eta2 * vt / 2. / CHARGE / model.d2
         } else {
             0.
         };
         let _ = n01;
         let gchi0 = CHARGE * instance.w * tmu / instance.l;
-        let cf = 0.5 * model.epsi * instance.w;
-        let imax = CHARGE * model.nmax * model.vs * instance.w;
+        let cf = 0.5 * model.channel.epsi * instance.w;
+        let imax = CHARGE * model.nmax * model.channel.vs * instance.w;
         let area = instance.w * instance.l;
         let exp_tf = (temp / model.tf.unwrap_or(temperature + CELSIUS_TO_KELVIN)).exp();
         let derived = Derived {
+            channel: ChannelTemperature {
+                vt,
+                tmu,
+                tvto,
+                delta_sqr: model.delta * model.delta,
+                n0,
+                two_exponentials: model.eta2_given && model.d2_given,
+                n02,
+                vt2: model.vt2.unwrap_or(vto),
+                gchi0,
+                imax,
+                tlambda,
+                vt1: model
+                    .vt1
+                    .unwrap_or(vto + CHARGE * model.nmax * model.di / model.channel.epsi),
+                cf,
+                nmax: model.nmax,
+            },
             temp,
-            vt,
-            tlambda,
-            tmu,
-            tvto,
-            vt1: model
-                .vt1
-                .unwrap_or(vto + CHARGE * model.nmax * model.di / model.epsi),
-            vt2: model.vt2.unwrap_or(vto),
-            n0,
-            n02,
-            two_exponentials: model.eta2_given && model.d2_given,
-            gchi0,
-            cf,
-            imax,
             is1d: model.js1d * area / 2.,
             is2d: model.js2d * area / 2.,
             is1s: model.js1s * area / 2.,
@@ -579,7 +557,6 @@ impl Hfet1 {
             delf: model.delf * exp_tf,
             // `hfettemp.c` also derives `HFETAvcrit`, which only feeds
             // `DEVpnjlim`; HFET1's load never calls it, so it is not carried.
-            delta_sqr: model.delta * model.delta,
             gdpr: if model.rd == 0. { 0. } else { 1. / model.rd },
             gspr: if model.rs == 0. { 0. } else { 1. / model.rs },
             ggate: if model.rg == 0. { 0. } else { 1. / model.rg },
@@ -588,23 +565,23 @@ impl Hfet1 {
         };
         if [
             derived.temp,
-            derived.vt,
-            derived.tlambda,
-            derived.tmu,
-            derived.tvto,
-            derived.vt1,
-            derived.vt2,
-            derived.n0,
-            derived.gchi0,
-            derived.cf,
-            derived.imax,
+            derived.channel.vt,
+            derived.channel.tlambda,
+            derived.channel.tmu,
+            derived.channel.tvto,
+            derived.channel.vt1,
+            derived.channel.vt2,
+            derived.channel.n0,
+            derived.channel.gchi0,
+            derived.channel.cf,
+            derived.channel.imax,
             derived.iso,
             derived.ggrwl,
-            derived.imax,
+            derived.channel.imax,
         ]
         .iter()
         .any(|v| !v.is_finite())
-            || derived.vt == 0.
+            || derived.channel.vt == 0.
         {
             return Err(SpiceError::circuit(format!(
                 "{}: HFET1 temperature derivation is out of range (check TF, DI, DELTAD, \
@@ -697,97 +674,39 @@ impl Hfet1 {
         gmin: Real,
     ) -> SpiceResult<Channel> {
         let model = &self.model;
-        let vt = derived.vt;
-        let etavth = model.eta * vt;
-        let vl = model.vs / derived.tmu * self.instance.l;
-        let rt = model.rsi + model.rdi;
-        let vgt0 = vgs - derived.tvto;
-        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
-        let sigma = model.sigma0 * rolloff;
-        let vgt = sigma.mul_add(vds, vgt0);
-        let u = 0.5 * vgt / vt - 1.;
-        let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
-        let vgte = (2. * vt) * (1. + smoothed.high);
-        let (nsn, slope) = super::soft_density(derived.n0, vgt, etavth);
-        let (nsm, delnsmvgt) = if derived.two_exponentials {
-            let thermal = model.eta2 * vt;
-            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / thermal).exp();
-            super::series_density(nsn, slope, nsc, thermal)
-        } else {
-            (nsn, slope)
-        };
-        if nsm < N_MIN {
+        let channel =
+            super::channel::evaluate(&model.channel, &derived.channel, &self.instance, vgs, vds);
+        let Some(super::channel::Saturation {
+            vsate,
+            delvsatevgt,
+            delvgtvgs,
+            sigma,
+            vgte,
+            delvgtevgt,
+        }) = channel.saturation
+        else {
             let terms = self.gatemod_terms(derived, vgs, vds, 0., 0., 0., gmin, (cgd, cgs, ggs));
             return Ok(Channel {
-                cdrain: 0.,
-                gm: 0.,
-                gds: 0.,
-                capgs: derived.cf,
-                capgd: derived.cf,
+                cdrain: channel.cdrain,
+                gm: channel.gm,
+                gds: channel.gds,
+                capgs: channel.capgs,
+                capgd: channel.capgd,
                 cgd: terms.cgd,
                 cgs: terms.cgs,
                 ggs: terms.ggs,
                 gmg: terms.gmg,
                 gmd: terms.gmd,
             });
-        }
-        let c = (nsm / model.nmax).powf(model.gamma);
-        let q = (1. + c).powf(1. / model.gamma);
-        let ns = nsm / q;
-        let gchi = derived.gchi0 * ns;
-        let gch = gchi / gchi.mul_add(rt, 1.);
-        let gchim = derived.gchi0 * nsm;
-        let h = ((2. * gchim).mul_add(model.rsi, 1.) + vgte * vgte / (vl * vl)).sqrt();
-        let p = gchim.mul_add(model.rsi, 1.) + h;
-        let isatm = gchim * vgte / p;
-        let g = (isatm / derived.imax).powf(model.gamma);
-        let isat = isatm / (1. + g).powf(1. / model.gamma);
-        let vsate = isat / gch;
-        let d = (vds / vsate).powf(model.m);
-        let e = (1. + d).powf(1. / model.m);
-        let delidgch = vds * derived.tlambda.mul_add(vds, 1.) / e;
-        let cdrain = gch * delidgch;
-        let delidvsate = cdrain * d / vsate / (1. + d);
-        let delidvds = gch / e
-            * derived
-                .tlambda
-                .mul_add(vds, derived.tlambda.mul_add(vds, 1.) / (1. + d));
-        let a = gchi.mul_add(rt, 1.);
-        let delgchgchi = 1. / (a * a);
-        let delgchins = derived.gchi0;
-        let delnsnsm = ns / nsm / (1. + c);
-        let delvgtevgt = smoothed.high_weights[0];
-        let delvsateisat = 1. / gch;
-        let delisatisatm = isat / isatm / (1. + g);
-        let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
-        let delvsategch = -vsate / gch;
-        let delisatmgchim = vgte * (gchim * model.rsi).mul_add(-(1. + 1. / h), p) / (p * p);
-        let delvgtvgs = (vds * model.sigma0 / model.vsigma).mul_add(-rolloff_slope, 1.);
-        let p = delgchgchi * delgchins * delnsnsm * delnsmvgt;
-        let delvsatevgt = delvsategch.mul_add(
-            p,
-            delvsateisat
-                * delisatisatm
-                * (delisatmgchim * derived.gchi0).mul_add(delnsmvgt, delisatmvgte * delvgtevgt),
-        );
-        let g = delidvsate.mul_add(delvsatevgt, delidgch * p);
-        let gm = g * delvgtvgs;
-        let gds = g.mul_add(sigma, delidvds);
-        // Capacitances.
-        let temp = model.eta1 * vt;
-        let cg1 = 1. / temp.mul_add((-(vgs - derived.vt1) / temp).exp(), model.d1 / model.epsi);
-        let cgc = self.instance.w
-            * self.instance.l
-            * (CHARGE * delnsnsm * delnsmvgt).mul_add(delvgtvgs, cg1);
-        let vdse = vds * (1. + (vds / vsate).powf(model.mc)).powf(-1. / model.mc);
-        let a = (vsate - vdse) / 2.0f64.mul_add(vsate, -vdse);
-        let a = a * a;
-        let third = 2.0 / 3.0;
-        let p = (1. - model.pm).mul_add((-vds / vsate).exp(), model.pm);
-        let capgs = derived.cf + 2. * third * cgc * (1. - a) / (1. + p);
-        let a = vsate / 2.0f64.mul_add(vsate, -vdse);
-        let a = a * a;
-        let capgd = derived.cf + 2. * p * third * cgc * (1. - a) / (1. + p);
+        };
+        let super::channel::IntrinsicChannel {
+            cdrain,
+            gm,
+            gds,
+            capgs,
+            capgd,
+            ..
+        } = channel;
         // `cgd_calc`: the gatemod'd gate currents and the cross terms.
         let terms = self.gatemod_terms(
             derived,
@@ -885,11 +804,11 @@ impl Hfet1 {
                 gmd: 0.,
             };
         }
-        let vt = derived.vt;
+        let vt = derived.channel.vt;
         let sigma = {
-            let vgt0 = vgs - derived.tvto;
-            let s = ((vgt0 - model.vsigmat) / model.vsigma).exp();
-            model.sigma0 / (1. + s)
+            let vgt0 = vgs - derived.channel.tvto;
+            let s = ((vgt0 - model.channel.vsigmat) / model.channel.vsigma).exp();
+            model.channel.sigma0 / (1. + s)
         };
         let temp = derived.temp;
         let vkneet = model.ck1.mul_add(vsate, model.ck2);
@@ -1051,8 +970,8 @@ impl Hfet1 {
                     f64::mul_add(gds0, delvds, f64::mul_add(gm0, delvgs, cd0)),
                 ) - f64::mul_add(gmd0, -delvds, gmg0 * delvgs);
                 // `HFETAload` limits only through `DEVfetlim`.
-                let vgs = limiting::fetlim(vgs, vgs0, derived.tvto);
-                let vgd = limiting::fetlim(vgd, vgd0, derived.tvto);
+                let vgs = limiting::fetlim(vgs, vgs0, derived.channel.tvto);
+                let vgd = limiting::fetlim(vgd, vgd0, derived.channel.tvto);
                 (
                     [vgs, vgd],
                     Start::Limited {
@@ -1068,7 +987,7 @@ impl Hfet1 {
     /// channel and the inverse-mode normalization.
     fn point(&self, derived: &Derived, vgs: Real, vgd: Real, gmin: Real) -> SpiceResult<Point> {
         let model = &self.model;
-        let vt = derived.vt;
+        let vt = derived.channel.vt;
         let (mut cgs, mut ggs, mut cgd, mut ggd);
         if model.gatemod == 0. {
             let (current, conductance) = if derived.is1s == 0. || derived.is2s == 0. {
@@ -1211,17 +1130,9 @@ impl Device for Hfet1 {
         key: &str,
         context: &ModelContext,
     ) -> SpiceResult<Option<Real>> {
-        Ok(match key {
-            "l" => Some(self.instance.l),
-            // C scales WIDTH by M and leaves LENGTH alone.
-            "w" => Some(self.instance.w * self.instance.m),
-            "m" => Some(self.instance.m),
-            "icvds" => self.initial.values[0],
-            "icvgs" => self.initial.values[1],
-            "temp" => Some(self.instance.temperature(context.temperature) - CELSIUS_TO_KELVIN),
-            "dtemp" => Some(self.instance.dtemp),
-            _ => None,
-        })
+        Ok(self
+            .instance
+            .observation_parameter(key, &self.initial, context.temperature))
     }
     /// `hfetask.c`'s bias quantities, `m`-scaled as C stores them.
     fn observation_operating(
@@ -1772,23 +1683,23 @@ impl SensitivityKernel for Hfet1Sensitivity<'_> {
             ("rd", m.rd, true),
             ("rs", m.rs, true),
             ("rg", m.rg, true),
-            ("rdi", m.rdi, true),
-            ("rsi", m.rsi, true),
+            ("rdi", m.channel.rdi, true),
+            ("rsi", m.channel.rsi, true),
             ("rgs", m.rgs, true),
             ("rgd", m.rgd, true),
             ("ri", m.ri, true),
             ("rf", m.rf, true),
-            ("eta", m.eta, true),
-            ("m", m.m, true),
-            ("mc", m.mc, true),
-            ("gamma", m.gamma, true),
-            ("sigma0", m.sigma0, true),
-            ("vsigmat", m.vsigmat, true),
-            ("vsigma", m.vsigma, true),
+            ("eta", m.channel.eta, true),
+            ("m", m.channel.m, true),
+            ("mc", m.channel.mc, true),
+            ("gamma", m.channel.gamma, true),
+            ("sigma0", m.channel.sigma0, true),
+            ("vsigmat", m.channel.vsigmat, true),
+            ("vsigma", m.channel.vsigma, true),
             ("mu", m.mu, true),
             ("di", m.di, true),
             ("delta", m.delta, true),
-            ("vs", m.vs, true),
+            ("vs", m.channel.vs, true),
             ("nmax", m.nmax, true),
             ("deltad", m.deltad, true),
             ("js1d", m.js1d, true),
@@ -1799,8 +1710,8 @@ impl SensitivityKernel for Hfet1Sensitivity<'_> {
             ("m2d", m.m2d, true),
             ("m1s", m.m1s, true),
             ("m2s", m.m2s, true),
-            ("epsi", m.epsi, true),
-            ("p", m.pm, true),
+            ("epsi", m.channel.epsi, true),
+            ("p", m.channel.pm, true),
             ("cm3", m.cm3, true),
             ("a1", m.a1, true),
             ("a2", m.a2, true),
@@ -1819,15 +1730,15 @@ impl SensitivityKernel for Hfet1Sensitivity<'_> {
             ("cm1", m.cm1, true),
             ("cm2", m.cm2, true),
             ("astar", m.astar, true),
-            ("eta1", m.eta1, true),
-            ("d1", m.d1, true),
+            ("eta1", m.channel.eta1, true),
+            ("d1", m.channel.d1, true),
             (
                 "vt1",
                 m.vt1
-                    .unwrap_or(m.threshold + CHARGE * m.nmax * m.di / m.epsi),
+                    .unwrap_or(m.threshold + CHARGE * m.nmax * m.di / m.channel.epsi),
                 m.vt1.is_some(),
             ),
-            ("eta2", m.eta2, m.eta2_given),
+            ("eta2", m.channel.eta2, m.eta2_given),
             ("d2", m.d2, m.d2_given),
             ("vt2", m.vt2.unwrap_or(m.threshold), m.vt2.is_some()),
             ("ggr", m.ggr, true),
@@ -1957,29 +1868,36 @@ impl Hfet1Sensitivity<'_> {
         let (m, i) = (current.model, current.instance);
         let r = |keyword: &str| m.value(keyword);
         let model = Model {
+            channel: ChannelModel {
+                eta: r("eta")?,
+                vs: r("vs")?,
+                rsi: r("rsi")?,
+                rdi: r("rdi")?,
+                vsigmat: r("vsigmat")?,
+                vsigma: r("vsigma")?,
+                sigma0: r("sigma0")?,
+                eta2: r("eta2")?,
+                gamma: r("gamma")?,
+                m: r("m")?,
+                eta1: r("eta1")?,
+                d1: r("d1")?,
+                epsi: r("epsi")?,
+                mc: r("mc")?,
+                pm: r("p")?,
+            },
             pol: self.device.model.pol,
             threshold: r("vt0")?,
             lambda: r("lambda")?,
             rd: r("rd")?,
             rs: r("rs")?,
             rg: r("rg")?,
-            rdi: r("rdi")?,
-            rsi: r("rsi")?,
             rgs: r("rgs")?,
             rgd: r("rgd")?,
             ri: r("ri")?,
             rf: r("rf")?,
-            eta: r("eta")?,
-            m: r("m")?,
-            mc: r("mc")?,
-            gamma: r("gamma")?,
-            sigma0: r("sigma0")?,
-            vsigmat: r("vsigmat")?,
-            vsigma: r("vsigma")?,
             mu: r("mu")?,
             di: r("di")?,
             delta: r("delta")?,
-            vs: r("vs")?,
             nmax: r("nmax")?,
             deltad: r("deltad")?,
             js1d: r("js1d")?,
@@ -1990,8 +1908,6 @@ impl Hfet1Sensitivity<'_> {
             m2d: r("m2d")?,
             m1s: r("m1s")?,
             m2s: r("m2s")?,
-            epsi: r("epsi")?,
-            pm: r("p")?,
             cm3: r("cm3")?,
             a1: r("a1")?,
             a2: r("a2")?,
@@ -2012,10 +1928,7 @@ impl Hfet1Sensitivity<'_> {
             cm1: r("cm1")?,
             cm2: r("cm2")?,
             astar: r("astar")?,
-            eta1: r("eta1")?,
-            d1: r("d1")?,
             vt1: Some(r("vt1")?),
-            eta2: r("eta2")?,
             d2: r("d2")?,
             vt2: Some(r("vt2")?),
             ggr: r("ggr")?,

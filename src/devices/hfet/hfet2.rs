@@ -49,11 +49,12 @@
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
 )]
 
+use super::channel::{ChannelModel, ChannelTemperature};
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step};
 use super::{CELSIUS_TO_KELVIN, HfetInstance as Instance};
 use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
 use crate::devices::initial::InstanceInitial;
-use crate::devices::jfet::{self, BOLTZMANN, CHARGE, p};
+use crate::devices::jfet::{BOLTZMANN, CHARGE, p};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
@@ -70,8 +71,6 @@ use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 /// C `CONSTKoverQ`.
 const K_OVER_Q: Real = BOLTZMANN / CHARGE;
-/// `hfeta2`'s carrier-density cutoff.
-const N_MIN: Real = 1e-38;
 /// `hfet2temp.c`'s fixed critical-current constant for `vcrit`.
 const VCRIT_CURRENT: Real = 1e-11;
 
@@ -146,21 +145,16 @@ const MODEL: &[P] = &[
 /// The validated model card.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Model {
+    channel: ChannelModel,
     /// `+1` for N, `-1` for P; `hfet2temp.c` stores `TYPE*VTO` in `TVTO`.
     pol: Real,
     threshold: Real,
     cf: Real,
-    d1: Real,
     d2: Real,
     del: Real,
     delta: Real,
     deltad: Real,
     di: Real,
-    epsi: Real,
-    eta: Real,
-    eta1: Real,
-    eta2: Real,
-    gamma: Real,
     ggr: Real,
     js: Real,
     klambda: Real,
@@ -168,20 +162,11 @@ pub(super) struct Model {
     knmax: Real,
     kvto: Real,
     lambda: Real,
-    m: Real,
-    mc: Real,
     mu: Real,
     n: Real,
     nmax: Real,
-    pm: Real,
     rd: Real,
     rs: Real,
-    rdi: Real,
-    rsi: Real,
-    sigma0: Real,
-    vs: Real,
-    vsigma: Real,
-    vsigmat: Real,
     vt1: Option<Real>,
     vt2: Option<Real>,
     /// `hfet2setup.c`'s `Given` flags that `hfeta2` reads.
@@ -215,20 +200,31 @@ impl Model {
             explicit.unwrap_or(if pol > 0. { n } else { p })
         };
         let model = Self {
+            channel: ChannelModel {
+                eta: typed(values.get("eta").map(|v| v.value), 1.28, 1.4),
+                vs: typed(values.get("vs").map(|v| v.value), 1.5e5, 0.8e5),
+                rsi: r("rsi")?,
+                rdi: r("rdi")?,
+                vsigmat: r("vsigmat")?,
+                vsigma: r("vsigma")?,
+                sigma0: r("sigma0")?,
+                eta2: r("eta2")?,
+                gamma: r("gamma")?,
+                m: r("m")?,
+                eta1: r("eta1")?,
+                d1: r("d1")?,
+                epsi: r("epsi")?,
+                mc: r("mc")?,
+                pm: r("p")?,
+            },
             pol,
             threshold: typed(alias(&["vt0", "vto"]), 0.15, -0.15),
             cf: r("cf")?,
-            d1: r("d1")?,
             d2: r("d2")?,
             del: r("del")?,
             delta: r("delta")?,
             deltad: r("deltad")?,
             di: r("di")?,
-            epsi: r("epsi")?,
-            eta: typed(values.get("eta").map(|v| v.value), 1.28, 1.4),
-            eta1: r("eta1")?,
-            eta2: r("eta2")?,
-            gamma: r("gamma")?,
             ggr: r("ggr")?,
             js: r("js")?,
             klambda: r("klambda")?,
@@ -236,26 +232,17 @@ impl Model {
             knmax: r("knmax")?,
             kvto: r("kvto")?,
             lambda: r("lambda")?,
-            m: r("m")?,
-            mc: r("mc")?,
             mu: typed(values.get("mu").map(|v| v.value), 0.4, 0.03),
             n: r("n")?,
             nmax: r("nmax")?,
-            pm: r("p")?,
             rd: r("rd")?,
             rs: r("rs")?,
-            rdi: r("rdi")?,
-            rsi: r("rsi")?,
-            sigma0: r("sigma0")?,
-            vs: typed(values.get("vs").map(|v| v.value), 1.5e5, 0.8e5),
-            vsigma: r("vsigma")?,
-            vsigmat: r("vsigmat")?,
             vt1: values.get("vt1").map(|v| v.value),
             vt2: values.get("vt2").map(|v| v.value),
             eta2_given: values.get("eta2").is_some_and(|v| v.location.is_some()),
             d2_given: values.get("d2").is_some_and(|v| v.location.is_some()),
         };
-        if model.vsigma == 0. || model.di + model.deltad == 0. {
+        if model.channel.vsigma == 0. || model.di + model.deltad == 0. {
             return Err(SpiceError::circuit(format!(
                 "{}: HFET2 model '{}' needs VSIGMA and DI nonzero (hfeta2 divides by them)",
                 resolved.card().location,
@@ -269,37 +256,13 @@ impl Model {
 /// `hfet2temp.c`'s per-instance quantities.
 #[derive(Debug, Clone, Copy)]
 struct Derived {
+    channel: ChannelTemperature,
     temp: Real,
-    vt: Real,
-    tlambda: Real,
-    tmu: Real,
-    tnmax: Real,
-    tvto: Real,
-    /// `HFET2_VT1`: the *raw* threshold plus the channel charge term.
-    vt1: Real,
-    /// `VT2`: the raw threshold.
-    vt2: Real,
-    n0: Real,
-    n02: Real,
-    two_exponentials: bool,
     jslw: Real,
     ggrlw: Real,
-    gchi0: Real,
-    imax: Real,
     vcrit: Real,
-    delta_sqr: Real,
     gdpr: Real,
     gspr: Real,
-}
-
-/// `hfeta2`'s evaluation: the channel and the two gate capacitances.
-#[derive(Debug, Clone, Copy)]
-struct Channel {
-    cdrain: Real,
-    gm: Real,
-    gds: Real,
-    capgs: Real,
-    capgd: Real,
 }
 
 /// `hfet2setup.c`'s internal nodes.
@@ -395,51 +358,60 @@ impl Hfet2 {
         let vt = K_OVER_Q * temp;
         let area = instance.w * instance.l;
         let derived = Derived {
-            temp,
-            vt,
-            tlambda: model.klambda.mul_add(delta, model.lambda),
-            tmu: model.kmu.mul_add(-delta, model.mu),
-            tnmax: model.knmax.mul_add(-delta, model.nmax),
-            tvto: model.kvto.mul_add(-delta, model.pol * model.threshold),
-            // C leaves `HFET2_VT1`/`VT2` on the raw threshold, unlike `TVTO`.
-            vt1: model
-                .vt1
-                .unwrap_or(model.threshold + CHARGE * model.nmax * model.di / model.epsi),
-            vt2: model.vt2.unwrap_or(model.threshold),
-            n0: model.epsi * model.eta * vt / 2. / CHARGE / (model.di + model.deltad),
-            n02: if model.eta2_given {
-                model.epsi * model.eta2 * vt / 2. / CHARGE / model.d2
-            } else {
-                0.
+            channel: ChannelTemperature {
+                vt,
+                tmu: model.kmu.mul_add(-delta, model.mu),
+                tvto: model.kvto.mul_add(-delta, model.pol * model.threshold),
+                delta_sqr: model.delta * model.delta,
+                n0: model.channel.epsi * model.channel.eta * vt
+                    / 2.
+                    / CHARGE
+                    / (model.di + model.deltad),
+                two_exponentials: model.eta2_given && model.d2_given,
+                n02: if model.eta2_given {
+                    model.channel.epsi * model.channel.eta2 * vt / 2. / CHARGE / model.d2
+                } else {
+                    0.
+                },
+                vt2: model.vt2.unwrap_or(model.threshold),
+                nmax: model.knmax.mul_add(-delta, model.nmax),
+                gchi0: CHARGE * instance.w * model.kmu.mul_add(-delta, model.mu) / instance.l,
+                imax: CHARGE
+                    * model.knmax.mul_add(-delta, model.nmax)
+                    * model.channel.vs
+                    * instance.w,
+                tlambda: model.klambda.mul_add(delta, model.lambda),
+                // C leaves VT1/VT2 on the raw threshold, unlike TVTO.
+                vt1: model.vt1.unwrap_or(
+                    model.threshold + CHARGE * model.nmax * model.di / model.channel.epsi,
+                ),
+                cf: model.cf,
             },
-            two_exponentials: model.eta2_given && model.d2_given,
+            temp,
             jslw: model.js * instance.l * instance.w / 2.,
             ggrlw: model.ggr * instance.l * instance.w / 2.,
-            gchi0: CHARGE * instance.w * model.kmu.mul_add(-delta, model.mu) / instance.l,
-            imax: CHARGE * model.knmax.mul_add(-delta, model.nmax) * model.vs * instance.w,
             vcrit: vt * (vt / (std::f64::consts::SQRT_2 * VCRIT_CURRENT)).ln(),
-            delta_sqr: model.delta * model.delta,
             gdpr: if model.rd == 0. { 0. } else { 1. / model.rd },
             gspr: if model.rs == 0. { 0. } else { 1. / model.rs },
         };
         let _ = area;
         if [
             derived.temp,
-            derived.vt,
-            derived.tlambda,
-            derived.tmu,
-            derived.tnmax,
-            derived.tvto,
-            derived.vt1,
-            derived.vt2,
-            derived.n0,
-            derived.gchi0,
-            derived.imax,
+            derived.channel.vt,
+            derived.channel.tlambda,
+            derived.channel.tmu,
+            derived.channel.nmax,
+            derived.channel.tvto,
+            derived.channel.vt1,
+            derived.channel.vt2,
+            derived.channel.n0,
+            derived.channel.gchi0,
+            derived.channel.imax,
             derived.vcrit,
         ]
         .iter()
         .any(|v| !v.is_finite())
-            || derived.vt == 0.
+            || derived.channel.vt == 0.
         {
             return Err(SpiceError::circuit(format!(
                 "{}: HFET2 temperature derivation is out of range (check DI, DELTAD, N, \
@@ -453,107 +425,22 @@ impl Hfet2 {
     /// `hfeta2()`: the channel, its derivatives and the two gate
     /// capacitances. `vgs` is C's `vds > 0 ? vgs : vgd` argument; `vds` is the
     /// normalized (nonnegative) drain-source voltage.
-    fn hfeta2(&self, derived: &Derived, vgs: Real, vds: Real) -> SpiceResult<Channel> {
+    fn hfeta2(
+        &self,
+        derived: &Derived,
+        vgs: Real,
+        vds: Real,
+    ) -> SpiceResult<super::channel::IntrinsicChannel> {
         let model = &self.model;
-        let vt = derived.vt;
-        let etavth = model.eta * vt;
-        let vl = model.vs / derived.tmu * self.instance.l;
-        let rt = model.rsi + model.rdi;
-        let vgt0 = vgs - derived.tvto;
-        let (rolloff, rolloff_slope) = super::rolloff((vgt0 - model.vsigmat) / model.vsigma);
-        let sigma = model.sigma0 * rolloff;
-        let vgt = sigma.mul_add(vds, vgt0);
-        let u = 0.5 * vgt / vt - 1.;
-        let smoothed = jfet::smoothed_extrema(u, 0., derived.delta_sqr.sqrt());
-        let vgte = (2. * vt) * (1. + smoothed.high);
-        let (nsn, slope) = super::soft_density(derived.n0, vgt, etavth);
-        let (nsm, delnsmvgt) = if derived.two_exponentials {
-            let thermal = model.eta2 * vt;
-            let nsc = derived.n02 * ((vgt + derived.tvto - derived.vt2) / thermal).exp();
-            super::series_density(nsn, slope, nsc, thermal)
-        } else {
-            (nsn, slope)
-        };
-        if nsm < N_MIN {
-            return Ok(Channel {
-                cdrain: 0.,
-                gm: 0.,
-                gds: 0.,
-                capgs: model.cf,
-                capgd: model.cf,
-            });
-        }
-        let c = (nsm / derived.tnmax).powf(model.gamma);
-        let q = (1. + c).powf(1. / model.gamma);
-        let ns = nsm / q;
-        let gchi = derived.gchi0 * ns;
-        let gch = gchi / gchi.mul_add(rt, 1.);
-        let gchim = derived.gchi0 * nsm;
-        let h = ((2. * gchim).mul_add(model.rsi, 1.) + vgte * vgte / (vl * vl)).sqrt();
-        let p = gchim.mul_add(model.rsi, 1.) + h;
-        let isatm = gchim * vgte / p;
-        let g = (isatm / derived.imax).powf(model.gamma);
-        let isat = isatm / (1. + g).powf(1. / model.gamma);
-        let vsate = isat / gch;
-        let d = (vds / vsate).powf(model.m);
-        let e = (1. + d).powf(1. / model.m);
-        let delidgch = vds * derived.tlambda.mul_add(vds, 1.) / e;
-        let cdrain = gch * delidgch;
-        let delidvsate = cdrain * d / vsate / (1. + d);
-        let delidvds = gch / e
-            * derived
-                .tlambda
-                .mul_add(vds, derived.tlambda.mul_add(vds, 1.) / (1. + d));
-        let a = gchi.mul_add(rt, 1.);
-        let delgchgchi = 1. / (a * a);
-        let delgchins = derived.gchi0;
-        let delnsnsm = ns / nsm / (1. + c);
-        let delvgtevgt = smoothed.high_weights[0];
-        let delvsateisat = 1. / gch;
-        let delisatisatm = isat / isatm / (1. + g);
-        let delisatmvgte = gchim * (p - vgte * vgte / (vl * vl * h)) / (p * p);
-        let delvsategch = -vsate / gch;
-        let delisatmgchim = vgte * (gchim * model.rsi).mul_add(-(1. + 1. / h), p) / (p * p);
-        let delvgtvgs = (vds * model.sigma0 / model.vsigma).mul_add(-rolloff_slope, 1.);
-        let p = delgchgchi * delgchins * delnsnsm * delnsmvgt;
-        let delvsatevgt = delvsategch.mul_add(
-            p,
-            delvsateisat
-                * delisatisatm
-                * (delisatmgchim * derived.gchi0).mul_add(delnsmvgt, delisatmvgte * delvgtevgt),
-        );
-        let g = delidvsate.mul_add(delvsatevgt, delidgch * p);
-        let gm = g * delvgtvgs;
-        let gds = g.mul_add(sigma, delidvds);
-        // Capacitances.
-        let temp = model.eta1 * vt;
-        let cg1 = 1. / temp.mul_add((-(vgs - derived.vt1) / temp).exp(), model.d1 / model.epsi);
-        let cgc = self.instance.w
-            * self.instance.l
-            * (CHARGE * delnsnsm * delnsmvgt).mul_add(delvgtvgs, cg1);
-        let vdse = vds * (1. + (vds / vsate).powf(model.mc)).powf(-1. / model.mc);
-        let a = (vsate - vdse) / 2.0f64.mul_add(vsate, -vdse);
-        let a = a * a;
-        let third = 2.0 / 3.0;
-        let p = (1. - model.pm).mul_add((-vds / vsate).exp(), model.pm);
-        let capgs = model.cf + 2. * third * cgc * (1. - a) / (1. + p);
-        let a = vsate / 2.0f64.mul_add(vsate, -vdse);
-        let a = a * a;
-        let capgd = model.cf + 2. * p * third * cgc * (1. - a) / (1. + p);
-        let values = [cdrain, gm, gds, capgs, capgd];
-        if values.iter().any(|v| !v.is_finite()) {
+        let channel =
+            super::channel::evaluate(&model.channel, &derived.channel, &self.instance, vgs, vds);
+        if channel.saturation.is_some() && !channel.is_finite() {
             return Err(SpiceError::circuit(format!(
                 "{}: nonfinite hfeta2 channel equations",
                 self.name
             )));
         }
-        Ok(Channel {
-            cdrain,
-            gm,
-            gds,
-            capgs,
-            capgd,
-        })
+        Ok(channel)
     }
 }
 
@@ -605,7 +492,7 @@ impl Hfet2 {
                     history,
                     [K_OVER_Q * derived.temp; 2],
                     [derived.vcrit; 2],
-                    derived.tvto,
+                    derived.channel.tvto,
                 )
             },
         )
@@ -615,7 +502,7 @@ impl Hfet2 {
     /// and the `hfeta2` channel.
     fn point(&self, derived: &Derived, vgs: Real, vgd: Real) -> SpiceResult<Point> {
         let model = &self.model;
-        let vt = derived.vt;
+        let vt = derived.channel.vt;
         let vtn = model.n * vt;
         let arg = -vgs * model.del / vt;
         let earg = arg.exp();
@@ -706,16 +593,9 @@ impl Device for Hfet2 {
         key: &str,
         context: &ModelContext,
     ) -> SpiceResult<Option<Real>> {
-        Ok(match key {
-            "l" => Some(self.instance.l),
-            "w" => Some(self.instance.w * self.instance.m),
-            "m" => Some(self.instance.m),
-            "icvds" => self.initial.values[0],
-            "icvgs" => self.initial.values[1],
-            "temp" => Some(self.instance.temperature(context.temperature) - CELSIUS_TO_KELVIN),
-            "dtemp" => Some(self.instance.dtemp),
-            _ => None,
-        })
+        Ok(self
+            .instance
+            .observation_parameter(key, &self.initial, context.temperature))
     }
     /// `hfet2ask.c`'s bias quantities, `m`-scaled as C stores them.
     fn observation_operating(
@@ -1107,17 +987,17 @@ impl SensitivityKernel for Hfet2Sensitivity<'_> {
         let mut model = SensitivityRecord::new(self.family(), ParameterScope::Model);
         for (keyword, value, given) in [
             ("cf", m.cf, true),
-            ("d1", m.d1, true),
+            ("d1", m.channel.d1, true),
             ("d2", m.d2, m.d2_given),
             ("del", m.del, true),
             ("delta", m.delta, true),
             ("deltad", m.deltad, true),
             ("di", m.di, true),
-            ("epsi", m.epsi, true),
-            ("eta", m.eta, true),
-            ("eta1", m.eta1, true),
-            ("eta2", m.eta2, m.eta2_given),
-            ("gamma", m.gamma, true),
+            ("epsi", m.channel.epsi, true),
+            ("eta", m.channel.eta, true),
+            ("eta1", m.channel.eta1, true),
+            ("eta2", m.channel.eta2, m.eta2_given),
+            ("gamma", m.channel.gamma, true),
             ("ggr", m.ggr, true),
             ("js", m.js, true),
             ("klambda", m.klambda, true),
@@ -1125,20 +1005,20 @@ impl SensitivityKernel for Hfet2Sensitivity<'_> {
             ("knmax", m.knmax, true),
             ("kvto", m.kvto, true),
             ("lambda", m.lambda, true),
-            ("m", m.m, true),
-            ("mc", m.mc, true),
+            ("m", m.channel.m, true),
+            ("mc", m.channel.mc, true),
             ("mu", m.mu, true),
             ("n", m.n, true),
             ("nmax", m.nmax, true),
-            ("p", m.pm, true),
+            ("p", m.channel.pm, true),
             ("rd", m.rd, true),
-            ("rdi", m.rdi, true),
+            ("rdi", m.channel.rdi, true),
             ("rs", m.rs, true),
-            ("rsi", m.rsi, true),
-            ("sigma0", m.sigma0, true),
-            ("vs", m.vs, true),
-            ("vsigma", m.vsigma, true),
-            ("vsigmat", m.vsigmat, true),
+            ("rsi", m.channel.rsi, true),
+            ("sigma0", m.channel.sigma0, true),
+            ("vs", m.channel.vs, true),
+            ("vsigma", m.channel.vsigma, true),
+            ("vsigmat", m.channel.vsigmat, true),
             // `vt0` is C's `VTO`: raw, never scaled by the type in place
             // (`hfet2temp.c` writes `TVTO` instead). `vt1`/`vt2` are the model
             // fields `hfet2setup.c` zeroes when not given, and `temperature`
@@ -1252,20 +1132,31 @@ impl Hfet2Sensitivity<'_> {
         let r = |keyword: &str| m.value(keyword);
         // The record's given flags retain the C sensitivity walk's topology switches.
         let model = Model {
+            channel: ChannelModel {
+                eta: r("eta")?,
+                vs: r("vs")?,
+                rsi: r("rsi")?,
+                rdi: r("rdi")?,
+                vsigmat: r("vsigmat")?,
+                vsigma: r("vsigma")?,
+                sigma0: r("sigma0")?,
+                eta2: r("eta2")?,
+                gamma: r("gamma")?,
+                m: r("m")?,
+                eta1: r("eta1")?,
+                d1: r("d1")?,
+                epsi: r("epsi")?,
+                mc: r("mc")?,
+                pm: r("p")?,
+            },
             pol: self.device.model.pol,
             threshold: r("vt0")?,
             cf: r("cf")?,
-            d1: r("d1")?,
             d2: r("d2")?,
             del: r("del")?,
             delta: r("delta")?,
             deltad: r("deltad")?,
             di: r("di")?,
-            epsi: r("epsi")?,
-            eta: r("eta")?,
-            eta1: r("eta1")?,
-            eta2: r("eta2")?,
-            gamma: r("gamma")?,
             ggr: r("ggr")?,
             js: r("js")?,
             klambda: r("klambda")?,
@@ -1273,20 +1164,11 @@ impl Hfet2Sensitivity<'_> {
             knmax: r("knmax")?,
             kvto: r("kvto")?,
             lambda: r("lambda")?,
-            m: r("m")?,
-            mc: r("mc")?,
             mu: r("mu")?,
             n: r("n")?,
             nmax: r("nmax")?,
-            pm: r("p")?,
             rd: r("rd")?,
             rs: r("rs")?,
-            rdi: r("rdi")?,
-            rsi: r("rsi")?,
-            sigma0: r("sigma0")?,
-            vs: r("vs")?,
-            vsigma: r("vsigma")?,
-            vsigmat: r("vsigmat")?,
             vt1: Some(r("vt1")?),
             vt2: Some(r("vt2")?),
             eta2_given: m.given("eta2"),
