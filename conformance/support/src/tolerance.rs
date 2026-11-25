@@ -11,7 +11,7 @@ pub struct Tolerance {
 
 impl Tolerance {
     /// Absolute error allowed for the given reference magnitude.
-    #[must_use]
+    #[must_use = "the returned bound determines whether the numerical error is acceptable"]
     pub const fn bound(self, reference: f64) -> f64 {
         self.relative.mul_add(reference.abs(), self.absolute)
     }
