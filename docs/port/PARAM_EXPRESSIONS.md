@@ -63,15 +63,13 @@ tanh sgn ceil floor asin acos atan asinh acosh atanh tan nint` (`Function::ALL`)
 wrong counts are errors. Function names cannot be used as parameter names. The
 call parentheses may follow optional whitespace.
 
-A call to any other name (`f(1, 2)`, `f()`, and the numparam built-ins outside
-the allowlist such as `agauss`/`limit`) parses as `ExprKind::UserCall` and is
-resolved during evaluation against the `.func` definitions in scope (see
-"`.func` and quoted values" below). Without a definition it is an evaluation
-error (`undefined function`), or `NotYetPorted` for an excluded numparam
-built-in and for the behavioural probe functions `v(...)`/`i(...)` (C accepts
-them in a device value such as `r1 1 0 {1/i(v1)}` by rewriting the device into
-a behavioural one, `inpcom.c` `b_transformation_wanted()`; that rewrite is not
-ported).
+A call to any other name (`f(1, 2)`, `f()`, and the statistical built-ins
+`agauss`, `gauss`, `aunif`, `unif`, `limit`) parses as `ExprKind::UserCall`.
+Lexical `.func` definitions take precedence, followed by the statistical
+built-ins (see statistical realization below). Unknown functions are evaluation
+errors; excluded numparam built-ins report `NotYetPorted`. Circuit probes
+`v(...)` and `i(...)` are not static parameters; behavioral device values
+are resolved as circuit expressions instead.
 
 ## `.param` cards
 
