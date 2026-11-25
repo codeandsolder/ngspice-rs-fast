@@ -16,24 +16,24 @@ fn invalid(message: impl std::fmt::Display) -> SpiceError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoupledLineLimits {
     /// Highest allowed physical conductor count, excluding the returns.
-    pub max_conductors: usize,
+    pub conductors: usize,
     /// Cap on the total dense complex exponential workspace in bytes.
-    pub max_workspace_bytes: usize,
+    pub workspace_bytes: usize,
     /// Cap on exponent squaring iterations.
-    pub max_squarings: usize,
+    pub squarings: usize,
 }
 impl Default for CoupledLineLimits {
     fn default() -> Self {
         Self {
-            max_conductors: 32,
-            max_workspace_bytes: 32 * 1024 * 1024,
-            max_squarings: 128,
+            conductors: 32,
+            workspace_bytes: 32 * 1024 * 1024,
+            squarings: 128,
         }
     }
 }
 impl CoupledLineLimits {
     fn check(self, conductors: usize) -> SpiceResult<()> {
-        if conductors == 0 || conductors > self.max_conductors {
+        if conductors == 0 || conductors > self.conductors {
             return Err(invalid("conductor count exceeds configured bounds"));
         }
         let bytes = conductors
@@ -42,7 +42,7 @@ impl CoupledLineLimits {
             .and_then(|v| v.checked_mul(std::mem::size_of::<Complex>()))
             .and_then(|v| v.checked_mul(16))
             .ok_or_else(|| invalid("matrix workspace allocation overflow"))?;
-        if bytes > self.max_workspace_bytes {
+        if bytes > self.workspace_bytes {
             return Err(invalid("dense matrix workspace budget exceeded"));
         }
         Ok(())
@@ -267,7 +267,7 @@ impl CoupledLinePlan {
         let scale = f64::from(u32::try_from(divisor).map_err(|_| invalid("half-section scale"))?);
         let (operator, impedance_scale) = self.operator(0.)?;
         Ok((
-            expm_pade13(&scaled(&operator, 1. / scale)?, self.limits.max_squarings)?,
+            expm_pade13(&scaled(&operator, 1. / scale)?, self.limits.squarings)?,
             impedance_scale,
         ))
     }
@@ -280,7 +280,7 @@ impl CoupledLinePlan {
     /// Invalid frequency, exponential range, ill-conditioned Padé solve.
     pub fn transfer_at(&self, hz: Real) -> SpiceResult<(DenseComplex, Real)> {
         let (operator, scale) = self.operator(hz)?;
-        Ok((expm_pade13(&operator, self.limits.max_squarings)?, scale))
+        Ok((expm_pade13(&operator, self.limits.squarings)?, scale))
     }
 
     /// A loss-bearing line with a large telegrapher generator is represented
@@ -316,7 +316,7 @@ impl CoupledLinePlan {
             if bound <= 4. {
                 break;
             }
-            if steps >= self.limits.max_squarings {
+            if steps >= self.limits.squarings {
                 return Err(invalid(
                     "passive long-line admittance exceeds segment work budget",
                 ));
@@ -525,7 +525,7 @@ fn double_norton(admittance: &DenseComplex) -> SpiceResult<DenseComplex> {
 /// The full noncommuting 2N×2N system is treated directly. The certified
 /// theta-13 bound applies to any submultiplicative norm; here the infinity
 /// norm is used as a conservative, cheaply computable choice.
-fn expm_pade13(input: &DenseComplex, max_squarings: usize) -> SpiceResult<DenseComplex> {
+fn expm_pade13(input: &DenseComplex, squarings: usize) -> SpiceResult<DenseComplex> {
     const B: [Real; 14] = [
         64_764_752_532_480_000.,
         32_382_376_266_240_000.,
@@ -557,7 +557,7 @@ fn expm_pade13(input: &DenseComplex, max_squarings: usize) -> SpiceResult<DenseC
         if scaled_norm <= 5.371_920_351_148_152 {
             break;
         }
-        if steps >= max_squarings {
+        if steps >= squarings {
             return Err(invalid(
                 "propagation exponential exceeds squaring work budget",
             ));
