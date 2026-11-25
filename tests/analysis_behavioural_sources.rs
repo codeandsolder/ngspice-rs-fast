@@ -434,3 +434,78 @@ fn polynomial_sources_retain_probe_identity_inside_and_outside_hierarchy() -> Sp
     close(value(&plot, "v(g)", 0), 2., 1e-12);
     Ok(())
 }
+
+#[test]
+fn scaled_nonlinear_current_converges_with_or_without_a_series_probe() {
+    // KCL has the unique root 10 uV: I = V/100 + 1e9 V^3.
+    // At that point the current source delivers 1 uA, regardless of
+    // whether a zero-volt series source makes its branch current observable.
+    for (connection, expression) in [
+        ("b1 out 0 i=", "v(out)^3 m=1e9"),
+        ("vprobe out sense 0\nb1 sense 0 i=", "v(out)^3 m=1e9"),
+        ("b1 out 0 i=", "1e9*v(out)^3"),
+    ] {
+        let body = format!("i1 0 out 1.1u\nr1 out 0 100\n{connection}{expression}");
+        let plot = run(&body, AnalysisKind::OperatingPoint, &[]).unwrap();
+        let v = value(&plot, "v(out)", 0);
+        let i = 1e9 * v.powi(3);
+        let residual = v / 100. + i - 1.1e-6;
+        assert!(
+            residual.abs() <= 1.1e-9 + 1e-12,
+            "{body}: V={v:e}, residual={residual:e}"
+        );
+        if connection.starts_with("vprobe") {
+            close(value(&plot, "i(vprobe)", 0), i, 1e-3);
+        }
+    }
+}
+
+#[test]
+fn nonlinear_current_probe_preserves_the_manufactured_transient_solution() {
+    // Manufactured solution V(t) = 10 uV + 10 uV (t / 1 ms)^2.
+    // The forcing is G V + 1e9 V^3 + C dV/dt, with G=0.01 S, C=10 uF.
+    // Its initial derivative is zero, so the DC operating point is exact.
+    let forcing = "bdrive 0 out i=(10u+10u*(time/1m)^2)/100+1e9*(10u+10u*(time/1m)^2)^3+200u*time";
+    for (connection, probed) in [
+        ("b1 out 0 i=v(out)^3 m=1e9", false),
+        ("vprobe out sense 0\nb1 sense 0 i=v(out)^3 m=1e9", true),
+    ] {
+        let body = format!("{forcing}\nr1 out 0 100\nc1 out 0 10u\n{connection}");
+        let plot = run(&body, AnalysisKind::Transient, &["10u", "1m", "0", "10u"]).unwrap();
+        assert!(plot.point_count() >= 100);
+        let mut last = None;
+        for point in 0..plot.point_count() {
+            let t = value(&plot, "time", point);
+            let v = value(&plot, "v(out)", point);
+            let exact = 1e-5 * (1. + (t / 1e-3).powi(2));
+            assert!(
+                (v - exact).abs() <= 5e-3 * exact,
+                "t={t:e}, {connection}: {v:e} != {exact:e}"
+            );
+            if let Some(previous) = last {
+                assert!(t > previous && t - previous <= 1e-5 * (1. + 1e-9));
+            }
+            if probed {
+                close(value(&plot, "i(vprobe)", point), 1e9 * v.powi(3), 1e-3);
+            }
+            last = Some(t);
+        }
+        close(last.unwrap(), 1e-3, 1e-12);
+    }
+}
+
+#[test]
+fn nonlinear_current_probe_does_not_regularize_a_singular_circuit() {
+    // The two opposing current sources leave the common-mode voltage
+    // unconstrained. Inserting a zero-voltage source cannot ground it.
+    for connection in [
+        "b1 a b i=1m*v(a,b)^3",
+        "vprobe a sense 0\nb1 sense b i=1m*v(a,b)^3",
+    ] {
+        let body = format!("r1 a b 1k\n{connection}");
+        assert!(
+            run(&body, AnalysisKind::OperatingPoint, &[]).is_err(),
+            "{body}"
+        );
+    }
+}

@@ -146,6 +146,24 @@ impl Linearization<'_> {
         }
         factor * equivalent
     }
+
+    /// Predict the physical output at the new iterate using the tangent
+    /// at the loaded iterate. Differences avoid subtracting the absolute
+    /// affine intercept from large, nearly equal coordinate terms.
+    fn predict(&self, solution: &Vector, factor: Real) -> Real {
+        self.evaluation
+            .gradient
+            .iter()
+            .zip(self.values)
+            .zip(self.columns)
+            .fold(
+                factor * self.evaluation.value,
+                |output, ((gradient, old), column)| {
+                    let new = column.and_then(|row| solution.get(row)).unwrap_or(0.);
+                    (factor * gradient).mul_add(new - old, output)
+                },
+            )
+    }
 }
 
 /// Per-instance mutable scratch, never shared when a device is cloned.
@@ -414,37 +432,79 @@ impl Device for Behavioural {
         crate::devices::setup::CDeviceType::Asrc
     }
 
-    /// One trial slot: the expression value of the last load (C
-    /// `ASRCprev_value`).
+    /// One trial slot: the physical output at the last load.
     fn state_count(&self) -> usize {
         1
     }
 
-    /// `ASRCconvTest` (`asrcconv.c`): the expression at the new iterate
-    /// against its value at the last load, within `reltol` and `vntol` (a
-    /// voltage source) or `abstol` (a current source).
+    /// Check the physical output change and Newton linearisation defect.
+    /// Unlike the raw expression comparison in C's ASRCconvTest, this
+    /// uses amperes or volts independently of the expression's scale or
+    /// whether an external current probe allocates a branch unknown.
     fn convergence_test(
         &self,
         context: &crate::devices::ConvergenceContext<'_>,
     ) -> SpiceResult<bool> {
-        self.with_linearization(
+        let factor = self.checked_factor(context.model_context.temperature)?;
+        let output = self.with_linearization(
             context.solution,
             context.unknowns,
             context.controls,
             context.time,
             context.model_context,
-            |linearization| {
-                let rhs = linearization.evaluation.value;
-                let prev = context.states.first().copied().unwrap_or(0.);
-                let absolute = match self.output {
-                    BehaviouralOutput::Voltage => context.vntol,
-                    BehaviouralOutput::Current => context.abstol,
+            |linearization| Ok(factor * linearization.evaluation.value),
+        )?;
+        let previous = context
+            .states
+            .first()
+            .copied()
+            .ok_or_else(|| SpiceError::circuit("missing behavioural trial output"))?;
+        let absolute = match self.output {
+            BehaviouralOutput::Voltage => context.vntol,
+            BehaviouralOutput::Current => context.abstol,
+        };
+        let differs = |a: Real, b: Real| {
+            !a.is_finite()
+                || !b.is_finite()
+                || (a - b).abs() > context.reltol.mul_add(a.abs().max(b.abs()), absolute)
+        };
+        if differs(output, previous) {
+            return Ok(true);
+        }
+
+        // Equal endpoint function values do not imply a correct tangent.
+        // Re-evaluate only once the physical output-change test has passed.
+        let predicted = self.with_linearization(
+            context.previous,
+            context.unknowns,
+            context.controls,
+            context.time,
+            context.model_context,
+            |linearization| Ok(linearization.predict(context.solution, factor)),
+        )?;
+        if differs(output, predicted) {
+            return Ok(true);
+        }
+        if self.output == BehaviouralOutput::Voltage {
+            let terminal_voltage = |solution: &Vector| {
+                let voltage = |node| {
+                    context
+                        .unknowns
+                        .node_row(node)
+                        .and_then(|row| solution.get(row))
+                        .unwrap_or(0.)
                 };
-                let relative = context.reltol * rhs.abs().max(prev.abs());
-                let tol = relative + absolute;
-                Ok((prev - rhs).abs() > tol)
-            },
-        )
+                voltage(self.terminals[0]) - voltage(self.terminals[1])
+            };
+            // The returned Newton point is the loaded iterate, not just
+            // the newly calculated one. Both must satisfy the source law.
+            if differs(previous, terminal_voltage(context.previous))
+                || differs(output, terminal_voltage(context.solution))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// `asrcset.c`: a voltage source's branch elements, then one column per
@@ -636,8 +696,9 @@ impl Device for Behavioural {
             time,
             &context.model_context(),
             |linearization| {
-                // ASRCprev_value remains the raw, unscaled expression value.
-                context.states.set(0, linearization.evaluation.value)?;
+                context
+                    .states
+                    .set(0, factor * linearization.evaluation.value)?;
                 let branch = (!context.branches.is_empty()).then_some(context.branches.start);
                 self.stamp_into(
                     context.matrix,
@@ -651,7 +712,7 @@ impl Device for Behavioural {
         )
     }
 
-    // The retained ASRCprev_value is an algebraic observation, not a charge.
+    // The retained physical output is an algebraic observation, not a charge.
     fn assemble_nonlinear_charge(
         &self,
         _context: &mut crate::devices::traits::ChargeContext<'_>,

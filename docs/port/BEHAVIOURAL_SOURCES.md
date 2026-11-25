@@ -203,10 +203,19 @@ global 0.2 V voltage-step damping, behavioural devices opt out
 watches only the nodes of the junction devices, so a 1000x B gain on 5 V
 converges in one step instead of thousands.
 
+The nonlinear convergence test compares the scaled physical source output
+at consecutive iterates, using current or voltage absolute tolerance as
+appropriate, and checks the error of the loaded tangent at the new iterate.
+Voltage sources additionally check the actual terminal voltage against
+their law at both iterates. The trial stores the physical output of the
+last load; this algebraic observation is not a charge state.
+C's raw-expression comparison in `ASRCconvTest` does not account for output
+multipliers; that can make inserting a zero-volt series current probe change
+whether the physical current passes convergence. The physical test is
+independent of that extra branch unknown.
+
 Not modelled: C scales B outputs by the source-stepping factor only in the
-transient operating point (`MODETRANOP`), and `ASRCconvTest` adds a
-function-value convergence test; both change the iteration path, not the
-converged solution.
+transient operating point (`MODETRANOP`).
 
 ## Front-end lowering (`inpcom.c`)
 

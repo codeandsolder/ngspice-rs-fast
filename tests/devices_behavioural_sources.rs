@@ -606,3 +606,153 @@ fn derivative_trees_evaluate_like_cs_ptdifferentiate() {
         assert!(ulps <= 4., "{} vs C {c:e}", evaluation.gradient[0]);
     }
 }
+
+#[test]
+fn behavioural_convergence_uses_physical_output_and_newton_defect() {
+    use ngspice_rs::devices::ConvergenceRequest;
+
+    // The same physical current expressed through different multipliers.
+    // Also test a small multiplier: raw expression changes alone are not
+    // a reason to reject an otherwise converged physical output.
+    for (expression, multiplier, from, to, reject) in [
+        ("v(a)^2", "1e9", 1e-6, 1.1e-6, true),
+        ("1e9*v(a)^2", "1", 1e-6, 1.1e-6, true),
+        ("v(a)^2", "1e-12", 1., 1.1, false),
+        // Equal endpoint values do not imply a valid linearisation:
+        // the tangent at -1 uV predicts a different current at +1 uV.
+        ("v(a)^2", "1e9", -1e-6, 1e-6, true),
+    ] {
+        let c = circuit(&format!("r1 a 0 1k\nb1 a 0 i={expression} m={multiplier}")).unwrap();
+        let n = c.unknown_count();
+        let mut previous = Vector::zeros(n);
+        previous.as_mut_slice()[row(&c, "a")] = from;
+        let mut solution = previous.clone();
+        solution.as_mut_slice()[row(&c, "a")] = to;
+        let history = c.state_history().unwrap();
+        let mut trial = history.trial();
+        let model_context = ModelContext::default();
+        c.load(
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &previous,
+                model_context: &model_context,
+                integration: None,
+                history: &history,
+                forcing: None,
+            },
+            &mut SparseMatrix::new(n, n),
+            &mut Vector::zeros(n),
+            &mut trial,
+        )
+        .unwrap();
+        let result = c
+            .convergence_test(&ConvergenceRequest {
+                solution: &solution,
+                previous: &previous,
+                history: &history,
+                trial: &trial,
+                model_context: &model_context,
+                time: 0.,
+                integration: None,
+                reltol: 1e-3,
+                abstol: 1e-12,
+                vntol: 1e-6,
+            })
+            .unwrap();
+        assert_eq!(
+            result, reject,
+            "{expression} m={multiplier}: {from} -> {to}"
+        );
+    }
+}
+
+#[test]
+fn behavioural_output_trials_do_not_replace_the_accepted_observation() {
+    let c = circuit("r1 a 0 1k\nb1 a 0 i=v(a)^2 m=1e9").unwrap();
+    let n = c.unknown_count();
+    let index = c.devices().iter().position(|d| d.name() == "b1").unwrap();
+    let slot = c.state_rows(index).unwrap().start;
+    let mut history = c.state_history().unwrap();
+    let context = ModelContext::default();
+    let load_at = |v: Real, history: &ngspice_rs::devices::StateHistory| {
+        let mut x = Vector::zeros(n);
+        x.as_mut_slice()[row(&c, "a")] = v;
+        let mut trial = history.trial();
+        c.load(
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &x,
+                model_context: &context,
+                integration: None,
+                history,
+                forcing: None,
+            },
+            &mut SparseMatrix::new(n, n),
+            &mut Vector::zeros(n),
+            &mut trial,
+        )
+        .unwrap();
+        (x, trial)
+    };
+    let (x, trial) = load_at(1e-6, &history);
+    assert!((trial.values()[slot] - 1e-3).abs() < 1e-18);
+    c.accept_point(&x, None, &mut history, trial).unwrap();
+    let accepted = history.clone();
+    for v in [2e-6, 3e-6, -4e-6] {
+        let (_, rejected) = load_at(v, &history);
+        assert!((rejected.values()[slot] - 1e9 * v.powi(2)).abs() < 1e-17);
+        drop(rejected);
+        assert_eq!(history, accepted);
+    }
+    let (x, trial) = load_at(5e-6, &history);
+    c.accept_point(&x, None, &mut history, trial).unwrap();
+    assert!((history.accepted(1).unwrap()[slot] - 0.025).abs() < 1e-17);
+}
+
+#[test]
+fn series_probe_elimination_preserves_the_physical_residual_and_jacobian() {
+    let direct = circuit("i1 0 out 1.1u\nr1 out 0 100\nb1 out 0 i=v(out)^3 m=1e9").unwrap();
+    let probed =
+        circuit("i1 0 out 1.1u\nr1 out 0 100\nvprobe out sense 0\nb1 sense 0 i=v(out)^3 m=1e9")
+            .unwrap();
+    let reduced = |c: &Circuit, v: Real| {
+        let out = row(c, "out");
+        let mut x = Vector::zeros(c.unknown_count());
+        x.as_mut_slice()[out] = v;
+        let sense = c
+            .nodes()
+            .get("sense")
+            .map(|node| c.unknowns().node_row(node).unwrap());
+        if let Some(sense) = sense {
+            x.as_mut_slice()[sense] = v;
+            x.as_mut_slice()[branch(c, "vprobe")] = 1e9 * v.powi(3);
+        }
+        let (a, _) = load(c, &x, &ModelContext::default());
+        let r = residual(c, &x);
+        let mut kcl = r[out];
+        let mut derivative = a.get(out, out);
+        if let Some(sense) = sense {
+            let probe = branch(c, "vprobe");
+            assert!(r[sense].abs() < 1e-18 && r[probe].abs() < 1e-18);
+            assert_eq!(a.get(out, probe) + a.get(sense, probe), 0.);
+            kcl += r[sense];
+            derivative += a.get(sense, out) + a.get(out, sense) + a.get(sense, sense);
+        }
+        (kcl, derivative)
+    };
+    for v in [-7e-6_f64, 0., 1e-5, 2e-5] {
+        let expected = v / 100. + 1e9 * v.powi(3) - 1.1e-6;
+        let slope = 0.01 + 3e9 * v.powi(2);
+        for c in [&direct, &probed] {
+            let (r, j) = reduced(c, v);
+            assert!((r - expected).abs() < 1e-18, "v={v:e}, r={r:e}");
+            assert!((j - slope).abs() < 1e-12, "v={v:e}, j={j:e}");
+            let h = 1e-10;
+            let numerical = (reduced(c, v + h).0 - reduced(c, v - h).0) / (2. * h);
+            assert!(
+                (j - numerical).abs() < 1e-9,
+                "v={v:e}, j={j:e}, fd={numerical:e}"
+            );
+        }
+    }
+}
