@@ -151,6 +151,9 @@ pub(super) fn instantiate(
     {
         return crate::devices::behavioural::rlc::instantiate(instance, nodes);
     }
+    if crate::devices::behavioural::dynamic::is_generated(instance) {
+        return crate::devices::behavioural::rlc::instantiate(instance, nodes);
+    }
     if matches!(instance.designator, 'b' | 'a') {
         return crate::devices::behavioural::instantiate(instance, nodes);
     }

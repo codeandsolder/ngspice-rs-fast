@@ -251,6 +251,14 @@ fn literalize_device_models(
     mut sites: Option<&mut Vec<ResolvedSite>>,
 ) -> SpiceResult<()> {
     for (di, device) in devices.iter_mut().enumerate() {
+        for parameter in &mut device.parameters {
+            if matches!(
+                (device.designator, parameter.name.as_str()),
+                ('r', "resistance") | ('c', "capacitance" | "charge") | ('l', "inductance")
+            ) {
+                crate::netlist::behavioural::classify_passive(parameter, scope, budget)?;
+            }
+        }
         literalize_parameters(
             &mut device.parameters,
             scope,

@@ -36,7 +36,7 @@
 //! `ASRCfindBr`). C would also invent an unstamped branch for a current B
 //! source; the port reports that reference as not findable instead.
 
-mod dynamic;
+pub(super) mod dynamic;
 pub mod program;
 pub mod rlc;
 pub mod xspice;

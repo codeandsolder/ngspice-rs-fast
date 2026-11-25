@@ -4019,6 +4019,13 @@ impl Circuit {
     ) -> SpiceResult<()> {
         let existing = self.elaboration_size()?;
         let limits = self.elaboration_limits;
+        let instances = crate::devices::behavioural::dynamic::expand(
+            instances,
+            &self.nodes,
+            self.devices.iter().map(|device| device.name()),
+            limits.devices.saturating_sub(existing.devices),
+        )?;
+        let instances = instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
         let plan =

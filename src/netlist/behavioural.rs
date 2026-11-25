@@ -470,6 +470,7 @@ pub fn resolve_expression(
         functions: scope.functions().cloned(),
         budget,
         verbatim: expression.verbatim,
+        syntax_only: false,
         nodes: 0,
         expansion_budget: TreeBudget::new(MAX_TREE_NODES),
     };
@@ -482,11 +483,107 @@ pub fn resolve_expression(
     })
 }
 
+/// Classify a passive's primary expression after lexical macro expansion.
+/// Numeric-only expressions remain in the numparam evaluator; runtime laws
+/// use the behavioural evaluator. No static function is numerically evaluated
+/// or rounded by the classification pass.
+pub(crate) fn classify_passive(
+    parameter: &mut ParameterAssignment,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<()> {
+    if parameter.name == "charge" {
+        return Ok(());
+    }
+    let functions = scope.functions().map(Arc::as_ref);
+    let numeric;
+    let expression = match &parameter.kind {
+        ParameterKind::Expression(value) => {
+            // A simple arithmetic parameter value cannot hide a runtime law.
+            let potentially_runtime = value.root.preorder().any(|node| match &node.kind {
+                ExprKind::Identifier(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
+                ExprKind::UserCall { .. } => true,
+                ExprKind::Call { function, .. } => {
+                    functions.is_some_and(|scope| scope.get(function.name()).is_some())
+                }
+                _ => false,
+            });
+            if !potentially_runtime {
+                return Ok(());
+            }
+            numeric = BehaviouralExpression {
+                text: value.spelling(),
+                span: value.span.clone(),
+                verbatim: false,
+                root: from_numparam(
+                    &value.root,
+                    &[],
+                    &[],
+                    1,
+                    &mut TreeBudget::new(MAX_TREE_NODES),
+                    functions,
+                )?,
+            };
+            &numeric
+        }
+        ParameterKind::Behavioural(expression) => expression,
+        _ => return Ok(()),
+    };
+    let mut resolver = Resolver {
+        scope,
+        functions: scope.functions().cloned(),
+        budget,
+        verbatim: expression.verbatim,
+        syntax_only: true,
+        nodes: 0,
+        expansion_budget: TreeBudget::new(MAX_TREE_NODES),
+    };
+    let root = resolver.resolve(&expression.root, 1)?;
+    let mut runtime = false;
+    root.visit(&mut |expr| {
+        runtime |= match &expr.kind {
+            BExprKind::Voltage { .. } | BExprKind::Current(_) => true,
+            BExprKind::Name(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
+            BExprKind::Call { name, .. } => name == "ddt",
+            _ => false,
+        };
+    });
+    if runtime {
+        parameter.kind = ParameterKind::Behavioural(Box::new(BehaviouralExpression {
+            root,
+            ..expression.clone()
+        }));
+    } else if matches!(parameter.kind, ParameterKind::Behavioural(_)) {
+        // A locally shadowed probe call or an erased macro argument may
+        // make the syntactically behavioural candidate an ordinary scalar.
+        // Preserve the original numeric evaluation and its site metadata.
+        let text = &expression.text;
+        let inner = text.get(1..text.len().saturating_sub(1)).ok_or_else(|| {
+            parse_error(
+                &expression.span,
+                "missing passive expression delimiters".into(),
+            )
+        })?;
+        let mut value = crate::netlist::parse_parameter_expression(
+            inner,
+            &expression
+                .span
+                .start
+                .at_column(expression.span.start.column + 1),
+        )?;
+        value.braced = true;
+        value.quoted = text.starts_with('\'');
+        parameter.kind = ParameterKind::Expression(Box::new(value));
+    }
+    Ok(())
+}
+
 struct Resolver<'a> {
     scope: &'a ParamScope,
     functions: Option<Arc<FunctionScope>>,
     budget: &'a mut EvalBudget,
     verbatim: bool,
+    syntax_only: bool,
     nodes: usize,
     expansion_budget: TreeBudget,
 }
@@ -510,7 +607,7 @@ impl Resolver<'_> {
         let boxed = |this: &mut Self, expr: &BExpr| this.resolve(expr, depth + 1).map(Box::new);
         let kind = match &expr.kind {
             BExprKind::Number { value, spelling } => BExprKind::Number {
-                value: if self.verbatim {
+                value: if self.verbatim || self.syntax_only {
                     *value
                 } else {
                     round_like_c_literal(*value)
@@ -518,7 +615,31 @@ impl Resolver<'_> {
                 spelling: spelling.clone(),
             },
             BExprKind::Name(name) => return self.name(expr, name),
-            BExprKind::Voltage { .. } | BExprKind::Current(_) => expr.kind.clone(),
+            BExprKind::Voltage { positive, negative } => {
+                if self
+                    .functions
+                    .as_deref()
+                    .is_some_and(|scope| scope.get("v").is_some())
+                {
+                    return self.shadowed_probe(
+                        expr,
+                        "v",
+                        std::iter::once(positive.as_str()).chain(negative.as_deref()),
+                        depth,
+                    );
+                }
+                expr.kind.clone()
+            }
+            BExprKind::Current(name) => {
+                if self
+                    .functions
+                    .as_deref()
+                    .is_some_and(|scope| scope.get("i").is_some())
+                {
+                    return self.shadowed_probe(expr, "i", std::iter::once(name.as_str()), depth);
+                }
+                expr.kind.clone()
+            }
             BExprKind::Unary { op, operand } => BExprKind::Unary {
                 op: *op,
                 operand: boxed(self, operand)?,
@@ -541,7 +662,10 @@ impl Resolver<'_> {
             BExprKind::Call { name, arguments } => {
                 return self.call(expr, name, arguments, depth);
             }
-            BExprKind::Value(value) => spliced(self.scope.evaluate(value, self.budget)?),
+            BExprKind::Value(value) if !self.syntax_only => {
+                spliced(self.scope.evaluate(value, self.budget)?)
+            }
+            BExprKind::Value(_) => expr.kind.clone(),
             BExprKind::Table(table) => {
                 let input = self.resolve(&table.input, depth + 1)?;
                 let mut points = Vec::with_capacity(table.points.len());
@@ -562,7 +686,7 @@ impl Resolver<'_> {
     }
 
     fn name(&self, expr: &BExpr, name: &str) -> SpiceResult<BExpr> {
-        if SPECIAL_NAMES.contains(&name) {
+        if self.syntax_only || SPECIAL_NAMES.contains(&name) {
             return Ok(expr.clone());
         }
         if self.verbatim {
@@ -584,6 +708,23 @@ impl Resolver<'_> {
             kind: spliced(value),
             span: expr.span.clone(),
         })
+    }
+
+    fn shadowed_probe<'a>(
+        &mut self,
+        expr: &BExpr,
+        name: &str,
+        operands: impl Iterator<Item = &'a str>,
+        depth: usize,
+    ) -> SpiceResult<BExpr> {
+        let arguments = operands
+            .map(|operand| {
+                crate::netlist::Parser::new()
+                    .parse_behavioural_expression(operand, &expr.span.start, false)
+                    .map(|expression| expression.root)
+            })
+            .collect::<SpiceResult<Vec<_>>>()?;
+        self.call(expr, name, &arguments, depth)
     }
 
     fn call(
@@ -618,6 +759,7 @@ impl Resolver<'_> {
                 arguments,
                 depth + 1,
                 &mut self.expansion_budget,
+                functions.as_deref(),
             )?;
             let expanded = self.resolve(&body, depth + 1)?;
             return Ok(BExpr {
@@ -625,7 +767,7 @@ impl Resolver<'_> {
                 span: expr.span.clone(),
             });
         }
-        if STATISTICAL_FUNCTIONS.contains(&name) {
+        if !self.syntax_only && STATISTICAL_FUNCTIONS.contains(&name) {
             // inp.c's eval_agauss() replaces each call on a B line by one
             // value drawn before parsing (inpcom.c applies the same set to
             // .param lines in inp_fix_agauss_in_param()).
@@ -639,7 +781,7 @@ impl Resolver<'_> {
                  (inp_fix_agauss_in_param)",
             ));
         }
-        if !is_builtin_function(name) {
+        if !self.syntax_only && !is_builtin_function(name) {
             return Err(SpiceError::parse(
                 expr.span.start.clone(),
                 format!(
@@ -671,10 +813,12 @@ fn from_numparam(
     arguments: &[BExpr],
     depth: usize,
     budget: &mut TreeBudget,
+    functions: Option<&FunctionScope>,
 ) -> SpiceResult<BExpr> {
     budget.charge(depth, 1, &expr.span.start)?;
-    let mut convert =
-        |expr: &Expr| from_numparam(expr, formals, arguments, depth + 1, budget).map(Box::new);
+    let mut convert = |expr: &Expr| {
+        from_numparam(expr, formals, arguments, depth + 1, budget, functions).map(Box::new)
+    };
     let kind = match &expr.kind {
         ExprKind::Number { value, spelling } => BExprKind::Number {
             value: *value,
@@ -716,7 +860,9 @@ fn from_numparam(
             name: function.name().to_owned(),
             arguments: operands
                 .iter()
-                .map(|operand| from_numparam(operand, formals, arguments, depth + 1, budget))
+                .map(|operand| {
+                    from_numparam(operand, formals, arguments, depth + 1, budget, functions)
+                })
                 .collect::<SpiceResult<_>>()?,
         },
         ExprKind::Group(inner) => BExprKind::Group(convert(inner)?),
@@ -724,7 +870,9 @@ fn from_numparam(
             name,
             arguments: operands,
         } => {
-            if let Some(kind) = circuit_quantity(name, operands) {
+            if functions.is_none_or(|scope| scope.get(name).is_none())
+                && let Some(kind) = circuit_quantity(name, operands)
+            {
                 kind
             } else {
                 BExprKind::Call {
@@ -732,7 +880,7 @@ fn from_numparam(
                     arguments: operands
                         .iter()
                         .map(|operand| {
-                            from_numparam(operand, formals, arguments, depth + 1, budget)
+                            from_numparam(operand, formals, arguments, depth + 1, budget, functions)
                         })
                         .collect::<SpiceResult<_>>()?,
                 }

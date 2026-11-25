@@ -88,14 +88,7 @@ impl ScopeEdits {
         let mut targets = HashMap::<&str, MeasurementTargets>::new();
         for (index, device) in devices.iter().enumerate() {
             let target = targets.entry(&device.name).or_default();
-            let native_passive = matches!(device.designator, 'r' | 'c' | 'l')
-                && device
-                    .parameters
-                    .iter()
-                    .any(|parameter| matches!(parameter.kind, ParameterKind::Behavioural(_)));
-            if native_passive
-                || (matches!(device.designator, 'e' | 'h')
-                    && NonlinearForm::validate(device)?.is_none())
+            if matches!(device.designator, 'e' | 'h') && NonlinearForm::validate(device)?.is_none()
             {
                 target.simple = true;
             } else if !device.nodes.is_empty() {
@@ -112,6 +105,11 @@ impl ScopeEdits {
         targets: &mut Option<HashMap<&'a str, MeasurementTargets>>,
         serial: &mut usize,
     ) -> SpiceResult<()> {
+        // Passive probe names can be shadowed by lexical functions. Their
+        // resolved current dependencies are bound after hierarchy expansion.
+        if matches!(devices[device.0].designator, 'r' | 'c' | 'l') {
+            return Ok(());
+        }
         let mut occurrence = 0;
         for parameter in &devices[device.0].parameters {
             let ParameterKind::Behavioural(expression) = &parameter.kind else {
