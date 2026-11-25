@@ -524,3 +524,20 @@ fn nonlinear_current_probe_does_not_regularize_a_singular_circuit() {
         );
     }
 }
+
+#[test]
+fn discontinuous_current_without_a_root_is_rejected_in_every_probe_topology() {
+    // For V < 0, KCL requires V = +30 nV; for V > 0, it
+    // requires V = -70 nV. At V = 0, u(0) = 0.5 also fails KCL.
+    // Both voltage updates are below VNTOL, and the unscaled expression
+    // changes by only 1 pA, but the actual branch current changes by 1 mA.
+    for connection in [
+        "b1 out 0 i=1p*u(v(out)) m=1e9",
+        "vprobe out sense 0\nb1 sense 0 i=1p*u(v(out)) m=1e9",
+        "b1 out 0 i=1p*u(v(out)) m=1e9\nbobserve observed 0 v=i(b1)\nr2 observed 0 1k",
+    ] {
+        let body = format!("i1 0 out 0.3m\nr1 out 0 100u\n{connection}");
+        let error = run(&body, AnalysisKind::OperatingPoint, &[]).expect_err(&body);
+        assert!(error.to_string().contains("Newton"), "{body}: {error}");
+    }
+}
