@@ -8,7 +8,7 @@ const MAX_COEFFICIENTS: usize = 17;
 ///
 /// Uses partial-pivot Gaussian elimination; returns `None` on zero pivots,
 /// nonfinite arithmetic, mismatched inputs or more than 17 coefficients.
-#[must_use]
+#[must_use = "the returned coefficients or failure are needed to distinguish a valid fit from an invalid system"]
 pub fn fit_power_basis(abscissas: &[Real], ordinates: &[Real]) -> Option<Vec<Real>> {
     let count = abscissas.len();
     if !(2..=MAX_COEFFICIENTS).contains(&count)
@@ -83,7 +83,7 @@ fn eliminate(row: &mut [Real], pivot: &[Real], col: usize, rhs: &mut Real, pivot
 ///
 /// Retain the existing separately rounded multiplication and addition in
 /// evaluation; elimination above deliberately uses fused operations.
-#[must_use]
+#[must_use = "the returned polynomial value is the only output of this evaluation"]
 pub fn evaluate(coefficients: &[Real], x: Real) -> Real {
     coefficients.iter().rev().fold(0., |sum, c| sum * x + c)
 }

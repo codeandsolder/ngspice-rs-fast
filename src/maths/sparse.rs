@@ -47,7 +47,7 @@ pub struct ElementId(u32);
 
 impl ElementId {
     /// Position of the element in its pattern's creation order.
-    #[must_use]
+    #[must_use = "the returned creation-order index identifies the pattern element"]
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -286,7 +286,7 @@ impl Pattern {
 
     /// Read actual work and current valid factor storage in one cache transaction.
     /// Independent factor snapshots do not update these counters.
-    #[must_use]
+    #[must_use = "the returned snapshot measures cached factor work and valid storage together"]
     pub fn factor_telemetry(&self) -> crate::maths::PatternTelemetry {
         self.with_ordering(|state| crate::maths::PatternTelemetry {
             work: state.work,
@@ -327,25 +327,25 @@ impl Pattern {
     }
 
     /// Order of the matrix.
-    #[must_use]
+    #[must_use = "the matrix order determines the dimension of compatible numeric assemblies"]
     pub const fn order(&self) -> usize {
         self.index.n
     }
 
     /// Number of elements.
-    #[must_use]
+    #[must_use = "the returned count determines how many pattern elements need numeric storage"]
     pub const fn len(&self) -> usize {
         self.index.positions.len()
     }
 
     /// True when the pattern has no elements.
-    #[must_use]
+    #[must_use = "the result distinguishes a pattern with no elements from one with stored positions"]
     pub const fn is_empty(&self) -> bool {
         self.index.positions.is_empty()
     }
 
     /// `(row, col)` of an element.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a valid element ID from one outside this pattern"]
     pub fn position(&self, id: ElementId) -> Option<(usize, usize)> {
         self.index
             .positions
@@ -354,7 +354,7 @@ impl Pattern {
     }
 
     /// The element at `(row, col)`, if the pattern has one.
-    #[must_use]
+    #[must_use = "the returned option determines whether the coordinate already has a pattern element"]
     pub fn find(&self, row: usize, col: usize) -> Option<ElementId> {
         if row >= self.index.n {
             return None;
@@ -785,7 +785,7 @@ impl SparseMatrix {
     }
 
     /// An empty `rows` by `cols` matrix.
-    #[must_use]
+    #[must_use = "the new sparse assembly must be retained before stamp contributions can be recorded"]
     pub const fn new(rows: usize, cols: usize) -> Self {
         Self {
             rows,
@@ -851,7 +851,7 @@ impl SparseMatrix {
 
     /// Pivot thresholds used when this matrix is ordered for factorization
     /// (default [`crate::maths::PivotTolerances::DEFAULT`]).
-    #[must_use]
+    #[must_use = "the returned thresholds identify the pivot policy used for ordering"]
     pub const fn pivot_tolerances(&self) -> crate::maths::PivotTolerances {
         self.pivot
     }
@@ -865,7 +865,7 @@ impl SparseMatrix {
     /// The circuit unknowns' names by row, when set: solver warnings and
     /// singular-matrix errors name nodes as ngspice's `NIiter` does
     /// (`singular matrix:  check node ...`) instead of row numbers.
-    #[must_use]
+    #[must_use = "the returned mapping is needed to identify circuit unknowns in diagnostics"]
     pub const fn unknown_names(&self) -> Option<&crate::maths::UnknownNames> {
         self.names.as_ref()
     }
@@ -877,7 +877,7 @@ impl SparseMatrix {
 
     /// The pattern and per-element values when bound with no overflow: the
     /// fast path for factorization.
-    #[must_use]
+    #[must_use = "the returned pattern and values identify when the bound fast path is usable"]
     pub fn bound_values(&self) -> Option<(&Arc<Pattern>, &[Real])> {
         match &self.bound {
             Some(bound) if self.triplets.is_empty() => Some((&bound.pattern, &bound.values)),
@@ -886,7 +886,7 @@ impl SparseMatrix {
     }
 
     /// The bound pattern and, in stamp order, the positions outside it.
-    #[must_use]
+    #[must_use = "the returned positions identify contributions outside the bound pattern"]
     pub fn overflow(&self) -> Option<(&Arc<Pattern>, impl Iterator<Item = (usize, usize)> + '_)> {
         self.bound
             .as_ref()
@@ -993,7 +993,7 @@ impl SparseMatrix {
 
     /// The trace position a fixed batch starts at, for
     /// [`Self::verify_fixed`].
-    #[must_use]
+    #[must_use = "the returned trace offset is needed to verify fixed stamp batches"]
     pub fn fixed_start(&self) -> Option<usize> {
         self.bound
             .as_ref()
@@ -1131,19 +1131,19 @@ impl SparseMatrix {
     }
 
     /// Number of rows.
-    #[must_use]
+    #[must_use = "the row dimension is required to size or validate sparse operations"]
     pub const fn rows(&self) -> usize {
         self.rows
     }
 
     /// Number of columns.
-    #[must_use]
+    #[must_use = "the column dimension is required to size or validate sparse operations"]
     pub const fn cols(&self) -> usize {
         self.cols
     }
 
     /// Number of stored contributions, including duplicates.
-    #[must_use]
+    #[must_use = "the returned contribution count includes duplicates and determines storage usage"]
     pub fn nnz(&self) -> usize {
         match &self.bound {
             Some(bound) if self.triplets.is_empty() => {
@@ -1155,7 +1155,7 @@ impl SparseMatrix {
     }
 
     /// True when nothing has been stamped.
-    #[must_use]
+    #[must_use = "the result distinguishes an unstamped matrix from one with stored contributions"]
     pub fn is_empty(&self) -> bool {
         match &self.bound {
             Some(bound) if self.triplets.is_empty() => {
@@ -1167,7 +1167,7 @@ impl SparseMatrix {
     }
 
     /// True when duplicate positions have been folded away.
-    #[must_use]
+    #[must_use = "the result identifies whether duplicate positions have already been folded"]
     pub const fn is_folded(&self) -> bool {
         self.folded || self.bound.is_some()
     }
@@ -1224,7 +1224,7 @@ impl SparseMatrix {
     /// The contribution at a position, summed over duplicates.
     ///
     /// Binary search after folding, otherwise a scan in stamp order.
-    #[must_use]
+    #[must_use = "the returned value is the accumulated contribution at the requested matrix coordinate"]
     pub fn get(&self, row: usize, col: usize) -> Real {
         let bound = self.bound.as_ref().and_then(|bound| {
             bound
@@ -1271,7 +1271,7 @@ impl SparseMatrix {
 
     /// The stored contributions. For a bound matrix: the folded nonzero
     /// elements in row-major order, merged with any overflow.
-    #[must_use]
+    #[must_use = "the returned slice supplies the stored contributions for sparse traversal"]
     pub fn triplets(&self) -> &[Triplet] {
         let Some(bound) = &self.bound else {
             return &self.triplets;

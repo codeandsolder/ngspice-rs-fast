@@ -87,13 +87,13 @@ pub struct Equilibration {
 
 impl Equilibration {
     /// Row factors multiplying the matrix and RHS.
-    #[must_use]
+    #[must_use = "the factors are needed to scale matrix rows and the right-hand side consistently"]
     pub fn row_factors(&self) -> &[f64] {
         &self.rows
     }
 
     /// Column factors multiplying the matrix and the scaled solution.
-    #[must_use]
+    #[must_use = "the factors are needed to scale matrix columns and recover the original solution"]
     pub fn column_factors(&self) -> &[f64] {
         &self.columns
     }
@@ -775,7 +775,7 @@ impl EquilibratedDenseLu {
     }
 
     /// Immutable scaling metadata belonging to this factor snapshot.
-    #[must_use]
+    #[must_use = "the scaling metadata belongs to this real factor snapshot and must match its solves"]
     pub const fn scaling(&self) -> &Equilibration {
         &self.scaling
     }
@@ -898,7 +898,7 @@ impl EquilibratedSparseLu {
     }
 
     /// Immutable scaling metadata belonging to this factor snapshot.
-    #[must_use]
+    #[must_use = "the scaling metadata belongs to this factor snapshot and must match its solves"]
     pub const fn scaling(&self) -> &Equilibration {
         &self.scaling
     }
@@ -982,7 +982,7 @@ impl EquilibratedSparseLu {
     }
 
     /// Reusable symbolic factors for an identical assembled sparse pattern.
-    #[must_use]
+    #[must_use = "retaining the symbolic factors enables reuse only for an identical sparse pattern"]
     pub const fn symbolic(&self) -> &SparseSymbolic {
         self.factor.symbolic()
     }
@@ -1055,7 +1055,7 @@ impl EquilibratedComplexLu {
     }
 
     /// Immutable scaling metadata belonging to this factor snapshot.
-    #[must_use]
+    #[must_use = "the scaling metadata belongs to this factor snapshot and must match its solves"]
     pub const fn scaling(&self) -> &Equilibration {
         &self.scaling
     }
