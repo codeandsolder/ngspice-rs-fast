@@ -1,10 +1,9 @@
 name: Shared workflow policy
 on:
   pull_request:
-    paths: [".github/workflows/**"]
   push:
-    branches: [main]
-    paths: [".github/workflows/**"]
+    branches: [main, refactor/architecture-campaign]
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -16,4 +15,4 @@ permissions:
 
 jobs:
   validate:
-    uses: codeandsolder/ci-workflows/.github/workflows/workflow-concurrency.yml@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/workflow-concurrency.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main

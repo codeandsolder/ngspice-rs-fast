@@ -2,43 +2,55 @@ name: Rust CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, refactor/architecture-campaign]
     tags: ["v*"]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
   rust:
-    name: Stable Rust build, tests, lint, docs and goldens
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+    name: Nightly Rust build, tests, docs and goldens
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
     with:
-      rust-toolchain: "1.100.0"
-      rust-components: "clippy rustfmt"
       command: |
-        cargo fmt --all -- --check
-        cargo clippy --workspace --all-targets --locked -- -D warnings
         cargo test --workspace --locked
         cargo xtask golden verify
         cargo doc --workspace --no-deps --locked
         cargo build --workspace --locked --release
 
-  msrv:
-    name: MSRV on release tags
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
-    with:
-      validation-tier: release
-      rust-toolchain: "1.89.0"
-      command: cargo test --workspace --locked
-
   strict-rust:
     name: Strict Rust and workflow policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@3119e52afb16c956bd072363d1f64f0fd916afbb # main
-    with:
-      allow-test-panics: true
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
+
+  source-quality:
+    uses: codeandsolder/ci-workflows/.github/workflows/source-quality.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+
+  clone-regression:
+    uses: codeandsolder/ci-workflows/.github/workflows/clone-regression.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+
+  # The shared strict gate already enforces the quarantine on pull requests.
+  # Also enforce it for direct campaign-branch pushes and merge queues.
+  cargo-release-age:
+    if: >-
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.ref_type == 'branch' &&
+      github.event.before != '0000000000000000000000000000000000000000')
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","Linux","X64","local-ci"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+        with:
+          base-ref: ${{ github.event.merge_group.base_sha || github.event.before }}
+          hours: "72"
+          lockfile: auto

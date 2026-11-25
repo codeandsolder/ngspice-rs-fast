@@ -24,7 +24,6 @@ name = "ngspice-rs"
 description = "A from-scratch Rust implementation of the ngspice circuit simulator: deck parsing, MNA assembly and DC/AC/transient analysis"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
@@ -80,9 +79,12 @@ members = ["xtask", "conformance/support"]
 [workspace.package]
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.99"
 license = "BSD-3-Clause"
 repository = "https://github.com/codeandsolder/ngspice-rs-fast"
+
+[workspace.metadata.rust-skills2]
+allow-test-panics = true
+allow-test-panics-reason = "Existing assertion-based numerical and conformance tests; production and examples remain strict"
 
 [workspace.dependencies]
 # Token-stream combinators replace the manual semantic-parser cursor. No FFI,
@@ -118,14 +120,13 @@ unsafe_code = "forbid"
 unreachable_pub = "warn"
 
 [workspace.lints.clippy]
-all = "warn"
+all = { level = "warn", priority = -1 }
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
 # Google Rust style guide: no glob imports beyond `use super::*` in tests,
-# `# Panics` docs on public fns, `#[must_use]` on pure results. `unwrap_used`
-# is enabled at the library crate root (`src/lib.rs`) rather than here, so the
-# integration-test helpers under `tests/` may keep unwrapping.
+# `# Panics` docs on public fns and reasoned `#[must_use]` on pure results.
+# The shared gate owns strict production and test-specific lint policy.
 wildcard_imports = "warn"
 enum_glob_use = "warn"
 missing_panics_doc = "warn"
