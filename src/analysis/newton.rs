@@ -653,6 +653,29 @@ fn iterate<T, F: Fn(&T) -> bool>(
     })
 }
 
+/// Validate dimensions and numerical options before any disposable load.
+fn validate_iteration_input(
+    initial: &Vector,
+    branch_rows: &[bool],
+    limited_rows: Option<&[bool]>,
+    coordinate_kinds: Option<&[crate::devices::ConvergenceKind]>,
+    options: &NewtonOptions,
+) -> SpiceResult<()> {
+    options.validate()?;
+    let n = initial.len();
+    if n == 0
+        || n != branch_rows.len()
+        || limited_rows.is_some_and(|rows| rows.len() != n)
+        || coordinate_kinds.is_some_and(|rows| rows.len() != n)
+        || !initial.is_finite()
+    {
+        return Err(failure(
+            "Newton requires a nonempty square system, finite solution and matching row kinds",
+        ));
+    }
+    Ok(())
+}
+
 /// C `NIiter` (`niiter.c`, the SPARSE path) over disposable loads.
 ///
 /// Each pass loads at the present iterate, factors the matrix of the
@@ -687,18 +710,14 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     release_previous: impl Fn(&mut T),
     progress: &mut Progress,
 ) -> SpiceResult<NewtonSolution<T>> {
-    options.validate()?;
+    validate_iteration_input(
+        initial,
+        branch_rows,
+        limited_rows,
+        phases.coordinate_kinds,
+        options,
+    )?;
     let n = initial.len();
-    if n == 0
-        || n != branch_rows.len()
-        || limited_rows.is_some_and(|rows| rows.len() != n)
-        || phases.coordinate_kinds.is_some_and(|rows| rows.len() != n)
-        || !initial.is_finite()
-    {
-        return Err(failure(
-            "Newton requires a nonempty square system, finite solution and matching row kinds",
-        ));
-    }
     let mut guess = initial.clone();
     let mut phase = phases.first;
     let mut previous = phases.previous;

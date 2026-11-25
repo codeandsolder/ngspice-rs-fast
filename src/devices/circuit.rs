@@ -2355,7 +2355,7 @@ impl Circuit {
         &self.bindings.convergence_kinds
     }
 
-    pub(crate) fn continuation_diagonal(&self) -> Real {
+    pub(crate) const fn continuation_diagonal(&self) -> Real {
         self.runtime.continuation_diagonal.get()
     }
 
@@ -4586,8 +4586,8 @@ impl Circuit {
         Ok(circuit)
     }
 
-    /// C INPpas4 adds capacitors to parsed voltage nodes before device
-    /// setup; CKTsetup's rshunt adds noiseless conductance to all voltage
+    /// C `INPpas4` adds capacitors to parsed voltage nodes before device
+    /// setup; `CKTsetup`'s rshunt adds noiseless conductance to all voltage
     /// nodes after setup. Branch-current and private storage coordinates
     /// are never physical shunt targets. Materialize real device equations
     /// so all analysis paths see the same topology and charge states.
@@ -4596,7 +4596,7 @@ impl Circuit {
         shunts: crate::devices::models::TopologyShunts,
     ) -> SpiceResult<()> {
         use crate::devices::{Capacitor, Resistor, ResistorNoise};
-        if shunts == Default::default() {
+        if shunts == crate::devices::models::TopologyShunts::default() {
             return Ok(());
         }
         let mut names: BTreeSet<_> = self

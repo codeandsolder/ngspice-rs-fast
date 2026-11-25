@@ -208,7 +208,7 @@ pub struct RunOverrides {
     pub nominal_temperature: Option<Real>,
 }
 
-/// Optional voltage-predictor truncation controls (CKTtrunc).
+/// Optional voltage-predictor truncation controls (`CKTtrunc`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct VoltageLteOptions {
     /// Whether voltage-controlled truncation is enabled.

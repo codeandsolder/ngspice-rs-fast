@@ -354,7 +354,7 @@ pub struct ContinuationPolicy {
     /// Skip the direct Newton attempt and start with continuation (C
     /// `CKTnoOpIter`, deck `.options noopiter`).
     pub skip_direct: bool,
-    /// C CKTgshunt: persistent diagonal value after a nodal gmin fallback.
+    /// C `CKTgshunt`: persistent diagonal value after a nodal gmin fallback.
     pub gshunt: Real,
 }
 
@@ -1374,15 +1374,8 @@ impl Engine<'_> {
         })
     }
 
-    /// One disposable Newton solve of the typed stage; charges the budget.
-    /// `continued` is the preceding stage's converged trial, if any.
-    fn stage(
-        &mut self,
-        report: &mut DcReport,
-        stage: Stage,
-        guess: &Vector,
-        continued: Option<TrialState>,
-    ) -> Result<NewtonSolution<TrialState>, Halt> {
+    /// Apply the continuation-diagonal state and junction floor to the stage.
+    fn resolve_stage_point(&mut self, stage: Stage) -> Point {
         let Point {
             scale,
             mut gmin,
@@ -1406,6 +1399,27 @@ impl Engine<'_> {
             Stage::Source { .. } if gmin > 0. => {}
             _ => gmin = self.persistent_gmin,
         }
+        Point {
+            scale,
+            gmin,
+            junction,
+        }
+    }
+
+    /// One disposable Newton solve of the typed stage; charges the budget.
+    /// `continued` is the preceding stage's converged trial, if any.
+    fn stage(
+        &mut self,
+        report: &mut DcReport,
+        stage: Stage,
+        guess: &Vector,
+        continued: Option<TrialState>,
+    ) -> Result<NewtonSolution<TrialState>, Halt> {
+        let Point {
+            scale,
+            gmin,
+            junction,
+        } = self.resolve_stage_point(stage);
         let strategy = stage.strategy();
         let describe = || {
             junction.map_or_else(

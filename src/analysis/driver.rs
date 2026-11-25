@@ -211,7 +211,7 @@ impl Default for AnalysisContext {
             temperature: 27.0,
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
-            shunts: Default::default(),
+            shunts: crate::devices::models::TopologyShunts::default(),
             reltol: crate::devices::DEFAULT_RELTOL,
             pivot: crate::maths::PivotTolerances::DEFAULT,
             rf_limits: crate::analysis::RfLimits::default(),

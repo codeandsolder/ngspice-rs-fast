@@ -375,9 +375,11 @@ impl CachedFrame {
     }
 }
 
-/// SPARSE internal-diagonal regularization, with original MNA coordinates
-/// that must retain their exact constitutive equations. A diagonal touching
-/// a protected row or column is left unchanged even after permutations.
+/// SPARSE internal-diagonal regularization.
+///
+/// Original MNA coordinates must retain their exact constitutive equations.
+/// A diagonal touching a protected row or column is left unchanged even
+/// after permutations.
 #[derive(Debug, Clone, Copy)]
 pub struct DiagonalGmin<'a> {
     /// Conductance added to an unprotected internal diagonal.
