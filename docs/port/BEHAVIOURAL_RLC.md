@@ -133,8 +133,30 @@ the physical residual after reloading, refines the consistent point
 toward roundoff, and uses that point as the transient starting guess.
 Redundant voltage constraints within the IC tolerance are canonicalized
 to the solved voltage before committing history. The ordinary device UIC
-load still owns semiconductor initial charge semantics. The rank
-reduction is not a general nonlinear rank-revealing constraint solver.
+load still owns semiconductor initial charge semantics.
+
+Arbitrary charge laws declare their own signed storage constraints.
+During UIC, the physical kernel evaluates Q at the seeded point;
+an instance ic= supplies the local terminal voltage (taking precedence
+over the corresponding node hint), while other voltage and current
+controls retain their seeded values. The resulting signed charge, not
+the terminal voltage, is fixed during the instantaneous solve. The
+physical charge Jacobian replaces the evolution row and every converged
+candidate must satisfy the original charge equality in charge units
+(reltol and chgtol). The history is canonicalized to the verified
+solution within these tolerances. For example, if Q=1u*(v(out)+2*v(ctrl)),
+ic=1 and the control is unhinted but its right-limit source is 1 V,
+the initial charge is 1 uC and the consistent output is -1 V.
+
+Redundant charge constraints can leave the instantaneous current
+distribution undetermined. The normal sparse solve remains the fast
+path; a singular or rectangular reduced system uses a sparse rank basis
+with power-of-two row/column scaling. Only declared storage-current
+coordinates can complete the basis as zero-current gauges. The
+original algebraic equations and actual nonlinear charge values are
+all checked on reload; no constraint is relaxed by dropping it from
+the basis. This does not establish full derivative consistency of a
+general high-index DAE or resolve unrelated floating coordinates.
 
 Nonlinear C/L `ic=` is intentionally retained under UIC, rather than
 discarded by the frontend as observed in ngspice 47 (instance and node
@@ -175,7 +197,7 @@ ngspice 47 output spectral amplitudes both equal
 
 Source-dialect E/G LAPLACE normalization is tracked in the preprocessing
 repository (#44), using the native rational transfer model. Statistical
-functions, arbitrary charge-law initial-condition constraints, rank-aware
-constraint reduction, mutual coupling, broader reference coverage, and
+functions, more general rank-aware constraint reduction and high-index
+initialization, mutual coupling, broader reference coverage, and
 nonlinear candidate testing
 remain within issue #184.

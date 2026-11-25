@@ -297,6 +297,7 @@ pub(super) struct Tolerances {
     pub reltol: Real,
     pub vntol: Real,
     pub abstol: Real,
+    pub chgtol: Real,
 }
 
 /// Bind both sides of the local coordinate/evolution-equation relation.
@@ -391,6 +392,7 @@ fn bound_initial_voltage(
 struct ImpulseStorage {
     fixed_coordinates: BTreeMap<AbsoluteRow, FixedCoordinate>,
     capacitors: Vec<CapacitorInitial>,
+    charges: BTreeMap<AbsoluteRow, ChargeInitial>,
 }
 
 struct FixedCoordinate {
@@ -409,14 +411,29 @@ struct CapacitorInitial {
     scale: Real,
 }
 
+struct ChargeInitial {
+    name: String,
+    device: usize,
+    slot: usize,
+    current: AbsoluteRow,
+    target: Real,
+    voltage: Option<Real>,
+}
+
 impl ImpulseStorage {
-    fn collect(circuit: &Circuit, initial: &Vector, context: &ModelContext) -> SpiceResult<Self> {
+    fn collect(
+        circuit: &Circuit,
+        initial: &Vector,
+        context: &ModelContext,
+        trial: &crate::devices::TrialState,
+    ) -> SpiceResult<Self> {
         if initial.len() != circuit.unknown_count() {
             return Err(failure("initial vector does not match finalized circuit"));
         }
         let mut storage = Self {
             fixed_coordinates: BTreeMap::new(),
             capacitors: Vec::new(),
+            charges: BTreeMap::new(),
         };
         for index in 0..circuit.device_count() {
             for (row, coordinate) in bound_initial_coordinates(circuit, index, context)? {
@@ -426,6 +443,47 @@ impl ImpulseStorage {
             }
             if let Some(voltage) = bound_initial_voltage(circuit, index, initial, context)? {
                 storage.capacitors.push(voltage);
+            }
+            let device = &circuit.devices()[index];
+            if let Some(charge) = device.initial_charge_storage() {
+                let rows = circuit
+                    .branch_rows(index)
+                    .ok_or_else(|| failure("missing initial charge branch binding"))?;
+                let states = circuit
+                    .state_rows(index)
+                    .ok_or_else(|| failure("missing initial charge state binding"))?;
+                if charge.equation >= rows.len()
+                    || charge.current >= rows.len()
+                    || charge.slot >= states.len()
+                {
+                    return Err(failure(format!(
+                        "{}: invalid initial charge binding",
+                        device.name()
+                    )));
+                }
+                let slot = states.start + charge.slot;
+                let target = trial.values()[slot];
+                if !target.is_finite() {
+                    return Err(failure(format!(
+                        "{}: nonfinite initial charge",
+                        device.name()
+                    )));
+                }
+                let item = ChargeInitial {
+                    name: device.name().to_owned(),
+                    device: index,
+                    slot,
+                    current: AbsoluteRow(rows.start + charge.current),
+                    target,
+                    voltage: charge.voltage,
+                };
+                if storage
+                    .charges
+                    .insert(AbsoluteRow(rows.start + charge.equation), item)
+                    .is_some()
+                {
+                    return Err(failure("duplicate initial charge equation"));
+                }
             }
         }
         Ok(storage)
@@ -537,6 +595,91 @@ impl<'a> CapacitorRelations<'a> {
     }
 }
 
+/// Replaces only the selected charge evolution rows with their actual
+/// signed physical storage constraint; no extra integration timepoint or
+/// artificial capacitor is introduced.
+struct ChargeConstraints {
+    value: Vector,
+    jacobian: SparseMatrix,
+}
+
+impl ChargeConstraints {
+    fn new(size: usize) -> Self {
+        Self {
+            value: Vector::zeros(size),
+            jacobian: SparseMatrix::new(size, size),
+        }
+    }
+
+    fn load(
+        &mut self,
+        prepared: &PreparedRun<'_>,
+        request: &LoadRequest<'_>,
+        storage: &ImpulseStorage,
+        matrix: &mut SparseMatrix,
+        rhs: &mut Vector,
+    ) -> SpiceResult<()> {
+        self.value.clear();
+        self.jacobian.clear();
+        prepared.assemble_charge_for(
+            request.model_context,
+            request.solution,
+            &mut self.value,
+            &mut self.jacobian,
+            storage.charges.values().map(|charge| charge.device),
+        )?;
+        for (&AbsoluteRow(row), charge) in &storage.charges {
+            matrix.zero_row(row, |_| false);
+            rhs.set(row, charge.target - self.value.as_slice()[row])?;
+        }
+        // The replacement RHS is J_Q*x - Q(x) + Q0. Preserve the
+        // physical signed quantity separately for the acceptance residual.
+        for term in self.jacobian.triplets() {
+            if !storage.charges.contains_key(&AbsoluteRow(term.row)) {
+                return Err(failure(
+                    "initial charge kernel wrote an undeclared equation",
+                ));
+            }
+            matrix.add(term.row, term.col, term.value)?;
+            let value = term.value.mul_add(
+                request.solution.as_slice()[term.col],
+                rhs.as_slice()[term.row],
+            );
+            rhs.set(term.row, value)?;
+        }
+        Ok(())
+    }
+
+    fn residual(&self, storage: &ImpulseStorage, tolerance: Tolerances) -> (Real, bool) {
+        let mut ratio: Real = 0.;
+        let mut roundoff = true;
+        for (&AbsoluteRow(row), charge) in &storage.charges {
+            let actual = self.value.as_slice()[row];
+            if !actual.is_finite() {
+                return (Real::INFINITY, false);
+            }
+            let scale = actual.abs().max(charge.target.abs());
+            let residual = (actual - charge.target).abs();
+            ratio = ratio.max(residual / tolerance.reltol.mul_add(scale, tolerance.chgtol));
+            roundoff &= residual <= 4. * Real::EPSILON * scale;
+        }
+        (ratio, roundoff)
+    }
+
+    fn canonical(&self, storage: &ImpulseStorage) -> Vec<(usize, Real)> {
+        storage
+            .charges
+            .iter()
+            .map(|(&AbsoluteRow(row), charge)| (charge.slot, self.value.as_slice()[row]))
+            .collect()
+    }
+}
+
+struct NonlinearInitial {
+    solution: InstantaneousSolution,
+    canonical: Vec<(usize, Real)>,
+}
+
 /// Disposable exact static Newton loads for the reduced instantaneous
 /// circuit. The initial history remains untouched; the ordinary UIC
 /// device-flagged load still owns semiconductor initial charge semantics.
@@ -547,9 +690,23 @@ fn solve_nonlinear_instantaneous(
     kept: &[&CapacitorInitial],
     tolerances: Tolerances,
     options: &crate::analysis::newton::NewtonOptions,
-) -> SpiceResult<Option<InstantaneousSolution>> {
+) -> SpiceResult<Option<NonlinearInitial>> {
     let circuit = prepared.circuit();
     let mut x = request.solution.clone();
+    // Explicit instance voltage is only a Newton seed here. Its physical
+    // effect is the signed charge value fixed by the original UIC load.
+    for charge in storage.charges.values() {
+        if let Some(voltage) = charge.voltage {
+            let [positive, negative, ..] = circuit.devices()[charge.device].terminals() else {
+                return Err(failure("initial charge requires two terminals"));
+            };
+            circuit
+                .unknowns()
+                .seed_terminal_voltage(&mut x, [*positive, *negative], voltage)?;
+        }
+    }
+    let mut charge_constraints =
+        (!storage.charges.is_empty()).then(|| ChargeConstraints::new(x.len()));
     let mut matrix = circuit.new_matrix()?;
     let mut rhs = Vector::zeros(x.len());
     let limited = crate::analysis::bias::limited_rows(circuit).unwrap_or_else(|| {
@@ -559,7 +716,7 @@ fn solve_nonlinear_instantaneous(
             .collect()
     });
     let mut previous = None;
-    let mut best: Option<(Real, InstantaneousSolution)> = None;
+    let mut best: Option<(Real, NonlinearInitial)> = None;
     let mut trial = None;
     for _ in 0..options.max_iterations {
         matrix.clear();
@@ -575,23 +732,33 @@ fn solve_nonlinear_instantaneous(
                 trial.as_ref(),
             )?
             .with_device_limiting(false);
-        prepared.load(
-            &LoadRequest {
-                solution: &x,
-                ..*request
-            },
-            &mut matrix,
-            &mut rhs,
-            &mut next_trial,
-        )?;
+        let point = LoadRequest {
+            solution: &x,
+            ..*request
+        };
+        prepared.load(&point, &mut matrix, &mut rhs, &mut next_trial)?;
         let nonconvergent = next_trial.is_nonconvergent();
         trial = Some(next_trial);
+        if let Some(constraints) = &mut charge_constraints {
+            constraints.load(prepared, &point, storage, &mut matrix, &mut rhs)?;
+        }
         let system = InstantaneousSystem::assemble(circuit, &matrix, &rhs, storage, kept)?;
         if let Some(solution) = previous.take()
             && !nonconvergent
         {
-            let (ratio, roundoff) = system.residual_ratio(&solution, tolerances);
+            let (mut ratio, mut roundoff) = system.residual_ratio(&solution, &x, tolerances);
+            if let Some(constraints) = &charge_constraints {
+                let (physical, exact) = constraints.residual(storage, tolerances);
+                ratio = ratio.max(physical);
+                roundoff &= exact;
+            }
             if ratio <= 1. {
+                let solution = NonlinearInitial {
+                    solution,
+                    canonical: charge_constraints
+                        .as_ref()
+                        .map_or_else(Vec::new, |constraints| constraints.canonical(storage)),
+                };
                 // Refine a consistent algebraic point to rounding accuracy
                 // when possible. Otherwise retain the best verified iterate
                 // once the residual stops improving. A tiny voltage error
@@ -606,14 +773,28 @@ fn solve_nonlinear_instantaneous(
             }
         }
         let Some(solution) = system.solve(circuit, storage, tolerances)? else {
+            if charge_constraints.is_some() {
+                return Err(failure(
+                    "uic initial charge constraints leave no instantaneous solution",
+                ));
+            }
             return Ok(None);
         };
         let scale = solution.step_scale(&x, options.voltage_step, &limited);
         x = solution.update(&x, scale);
         previous = (scale == 1.).then_some(solution);
     }
-    best.map(|(_, solution)| Some(solution))
-        .ok_or_else(|| failure("uic nonlinear instantaneous constraints did not converge"))
+    best.map(|(_, solution)| Some(solution)).ok_or_else(|| {
+        let names = storage
+            .charges
+            .values()
+            .map(|charge| charge.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        failure(format!(
+            "uic nonlinear instantaneous constraints did not converge (charge storage: {names})"
+        ))
+    })
 }
 
 /// Consistent algebraic guess plus canonical storage values for redundant
@@ -650,12 +831,21 @@ pub(super) fn check_impulse_free(
     a: &SparseMatrix,
     rhs: &Vector,
     request: &LoadRequest<'_>,
+    initial_trial: &crate::devices::TrialState,
     tolerances: Tolerances,
     options: &crate::analysis::newton::NewtonOptions,
 ) -> SpiceResult<CheckedInitial> {
     let circuit = prepared.circuit();
-    let storage = ImpulseStorage::collect(circuit, request.solution, request.model_context)?;
-    if storage.capacitors.is_empty() && storage.fixed_coordinates.is_empty() {
+    let storage = ImpulseStorage::collect(
+        circuit,
+        request.solution,
+        request.model_context,
+        initial_trial,
+    )?;
+    if storage.capacitors.is_empty()
+        && storage.fixed_coordinates.is_empty()
+        && storage.charges.is_empty()
+    {
         return Ok(CheckedInitial {
             solution: None,
             canonical: Vec::new(),
@@ -680,10 +870,18 @@ pub(super) fn check_impulse_free(
     } else {
         InstantaneousSystem::assemble(circuit, a, rhs, &storage, &relations.kept)?
             .solve(circuit, &storage, tolerances)?
+            .map(|solution| NonlinearInitial {
+                solution,
+                canonical: Vec::new(),
+            })
     };
     match solution {
-        Some(solution) => {
+        Some(NonlinearInitial {
+            solution,
+            canonical,
+        }) => {
             relations.check_implied(&solution, voltage_tolerance)?;
+            relations.canonical.extend(canonical);
             Ok(CheckedInitial {
                 solution: nonlinear.then(|| solution.update(request.solution, 1.)),
                 canonical: relations.canonical,

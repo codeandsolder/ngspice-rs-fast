@@ -283,3 +283,91 @@ fn nonlinear_lc_uic_conserves_charge_balance_and_energy() -> SpiceResult<()> {
     assert!(largest_current > 0.02);
     Ok(())
 }
+
+#[test]
+fn arbitrary_charge_uic_obeys_nonlinear_charge_decay() -> SpiceResult<()> {
+    let plot = run(
+        "r1 out 0 1k\nc1 out 0 q={1u*(v(out)+v(out)^2)} ic=2",
+        AnalysisKind::Transient,
+        &["1u", "2m", "0", "1u", "uic"],
+    )?;
+    for index in 0..plot.point_count() {
+        let t = plot.value("time", index).unwrap().re;
+        let v = plot.value("v(out)", index).unwrap().re;
+        assert!(v > 0.);
+        // dQ/dt = -v/R: ln(v)+2v = ln(v0)+2v0-t/(R*C).
+        close(v.ln() + 2. * v, 2_f64.ln() + 4. - t / 1e-3, 3e-3);
+    }
+    Ok(())
+}
+
+#[test]
+fn arbitrary_charge_uic_enforces_physical_charge_not_a_voltage_surrogate() -> SpiceResult<()> {
+    // Local IC is evaluated with the supplied control hints (zero here).
+    // The right-limit control is 1 V, so retaining Q0=1 uC means -1 V
+    // across the capacitor, not the 1 V at which the local IC was given.
+    let plot = run(
+        "vctrl ctrl 0 1\nr1 out 0 1k\nc1 out 0 q={1u*(v(out)+2*v(ctrl))} ic=1",
+        AnalysisKind::Transient,
+        &["1u", "2m", "0", "1u", "uic"],
+    )?;
+    for index in 0..plot.point_count() {
+        let t = plot.value("time", index).unwrap().re;
+        close(
+            plot.value("v(out)", index).unwrap().re,
+            -(-t / 1e-3).exp(),
+            1e-3,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn redundant_charge_constraints_preserve_algebraic_relations_and_reject_conflicts()
+-> SpiceResult<()> {
+    let deck =
+        |initial: f64| format!("v1 out 0 2\nc1 out 0 q={{1u*v(out)^2}} ic={initial}\nr1 out 0 1k");
+    let args = ["1u", "100u", "0", "1u", "uic"];
+    let plot = run(&deck(2.), AnalysisKind::Transient, &args)?;
+    for index in 0..plot.point_count() {
+        close(plot.value("v(out)", index).unwrap().re, 2., 1e-10);
+        close(plot.value("i(v1)", index).unwrap().re, -2e-3, 1e-10);
+    }
+    let error = run(&deck(1.), AnalysisKind::Transient, &args)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("initial") && error.contains("c1"), "{error}");
+    // Two independent charge histories share a voltage, so their initial
+    // currents cannot be independently determined by the instantaneous
+    // system. The actual transient equations determine both derivatives.
+    let plot = run(
+        "r1 out 0 1k\nc1 out 0 q={1u*v(out)^2} ic=1\nc2 out 0 q={2u*v(out)^2} ic=1",
+        AnalysisKind::Transient,
+        &["1u", "1m", "0", "1u", "uic"],
+    )?;
+    for index in 0..plot.point_count() {
+        let t = plot.value("time", index).unwrap().re;
+        close(plot.value("v(out)", index).unwrap().re, 1. - t / 6e-3, 1e-3);
+    }
+    Ok(())
+}
+
+#[test]
+fn arbitrary_charge_uic_resolves_its_own_current_dependency() -> SpiceResult<()> {
+    let plot = run(
+        "r1 out 0 1k\nc1 out 0 q={1u*(v(out)-500*i(c1))} ic=1",
+        AnalysisKind::Transient,
+        &["1u", "2m", "0", "1u", "uic"],
+    )?;
+    // At t=0 the seeded current is zero and the local voltage is 1 V,
+    // hence Q0=1 uC. With KCL i=-v/1k the actual charge is 1.5 uF*v.
+    for index in 0..plot.point_count() {
+        let t = plot.value("time", index).unwrap().re;
+        close(
+            plot.value("v(out)", index).unwrap().re,
+            (2. / 3.) * (-t / 1.5e-3).exp(),
+            1e-3,
+        );
+    }
+    Ok(())
+}

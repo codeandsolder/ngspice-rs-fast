@@ -586,3 +586,21 @@ fn nonlinear_uic_checker_resolves_feedback_and_differential_storage_together() {
         "{error}"
     );
 }
+
+#[test]
+fn charge_law_initial_node_hints_and_instance_voltage_use_same_physical_constraint() {
+    let deck = |instance: &str, hints: &str| {
+        format!(
+            "t\nr1 out 0 1k\nc1 out 0 q={{1u*(v(out)+v(out)^2)}} {instance}\n{hints}\n.tran 1u 1m 0 1u uic\n.end\n"
+        )
+    };
+    let node = run(&deck("", ".ic v(out)=2")).unwrap();
+    let instance = run(&deck("ic=2", ".ic v(out)=0.5")).unwrap();
+    assert_eq!(node.point_count(), instance.point_count());
+    for (a, b) in column(&node, "v(out)")
+        .iter()
+        .zip(column(&instance, "v(out)"))
+    {
+        assert!((*a - b).abs() < 1e-10, "{a} {b}");
+    }
+}
