@@ -210,6 +210,19 @@ impl Device for AnalogCodeModel {
         self.dynamic().then_some(0)
     }
 
+    fn initial_voltage_relations(
+        &self,
+        _inductors_short: bool,
+    ) -> Vec<crate::devices::InitialVoltageRelation> {
+        use crate::devices::{InitialVoltageLaw, InitialVoltageRelation};
+        vec![InitialVoltageRelation {
+            terminals: [self.terminals[0], self.terminals[1]],
+            law: self
+                .initial_constraint()
+                .map_or(InitialVoltageLaw::Controlled, InitialVoltageLaw::Fixed),
+        }]
+    }
+
     fn setup_matrix(&self, setup: &mut MatrixSetup<'_>) -> SpiceResult<bool> {
         let branch = setup.branch(0)?;
         let [op, on, ip, inn] = self.terminals;

@@ -362,6 +362,40 @@ impl Device for RationalTransfer {
         (0..self.state_count()).step_by(2).collect()
     }
 
+    fn initial_voltage_relations(
+        &self,
+        _inductors_short: bool,
+    ) -> Vec<crate::devices::InitialVoltageRelation> {
+        use crate::devices::{InitialVoltageLaw, InitialVoltageRelation};
+        let mut relations = Vec::new();
+        if self.output == PortLaw::Voltage {
+            relations.push(InitialVoltageRelation {
+                terminals: [self.terminals[0], self.terminals[1]],
+                law: InitialVoltageLaw::Controlled,
+            });
+        }
+        if self.input == PortLaw::Current {
+            relations.push(InitialVoltageRelation {
+                terminals: [self.terminals[2], self.terminals[3]],
+                law: InitialVoltageLaw::Fixed(0.),
+            });
+        }
+        relations
+    }
+
+    fn initial_coordinates(
+        &self,
+        _context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Vec<crate::devices::InitialCoordinate>> {
+        Ok((0..self.order())
+            .map(|index| crate::devices::InitialCoordinate {
+                coordinate: index + 1,
+                equation: index + 1,
+                value: self.model.initial.get(index).copied().unwrap_or(0.),
+            })
+            .collect())
+    }
+
     fn setup_matrix(&self, setup: &mut MatrixSetup<'_>) -> SpiceResult<bool> {
         let branch = setup.branch(0)?;
         let nodes = self.terminals.map(|node| setup.node(node));
@@ -375,11 +409,6 @@ impl Device for RationalTransfer {
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         if context.mode.is_ac() {
             return Err(invalid("AC requires the complex pencil"));
-        }
-        if self.order() > 0 && context.states.initial_conditions() {
-            return Err(invalid(
-                "UIC needs an explicit transfer-coordinate initialization solve",
-            ));
         }
         let branch = context.branch(0)?;
         let nodes = self.terminals.map(|node| context.unknowns.node_row(node));

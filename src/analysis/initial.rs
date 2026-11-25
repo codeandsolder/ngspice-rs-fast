@@ -42,7 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::devices::{Circuit, ModelContext, StorageKind};
+use crate::devices::{Circuit, ModelContext};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
@@ -258,9 +258,9 @@ pub(super) fn forced_nodesets(nodesets: &[RowHint]) -> Vec<(usize, Real)> {
 #[derive(Debug)]
 pub(super) struct UicStart {
     /// Node rows from `.nodeset` then `.ic` (zero elsewhere); inductor branch
-    /// rows hold their initial current.
+    /// rows hold their initial current or another prescribed storage coordinate.
     pub x: Vector,
-    /// `(absolute state slot, charge)` for capacitors with an instance `ic=`.
+    /// `(absolute state slot, signed storage coordinate)` for voltage storage.
     pub charges: Vec<(usize, Real)>,
 }
 
@@ -278,33 +278,14 @@ pub(super) fn uic_start(
         x.as_mut_slice()[hint.row] = hint.value;
     }
     let mut charges = Vec::new();
-    for (index, device) in circuit.devices().iter().enumerate() {
-        let (Some(element), Some(slot)) =
-            (device.storage_element(context), device.truncation_slot())
-        else {
-            continue;
-        };
-        let element = element?;
-        match element.kind {
-            StorageKind::Capacitor => {
-                if let Some(voltage) = element.initial {
-                    let base = circuit
-                        .state_rows(index)
-                        .ok_or_else(|| failure("missing state range"))?
-                        .start;
-                    charges.push((base + slot, element.value * voltage));
-                }
-            }
-            StorageKind::Inductor => {
-                let row = circuit
-                    .branch_rows(index)
-                    .filter(|rows| rows.len() == 1)
-                    .ok_or_else(|| {
-                        failure(format!("inductor {} has no branch row", device.name()))
-                    })?
-                    .start;
-                x.as_mut_slice()[row] = element.initial.unwrap_or(0.);
-            }
+    for (index, _) in circuit.devices().iter().enumerate() {
+        for (row, coordinate) in bound_initial_coordinates(circuit, index, context)? {
+            x.as_mut_slice()[row.0] = coordinate.value;
+        }
+    }
+    for index in 0..circuit.device_count() {
+        if let Some(voltage) = bound_initial_voltage(circuit, index, &x, context)? {
+            charges.push((voltage.slot, voltage.scale * voltage.constraint.voltage));
         }
     }
     Ok(UicStart { x, charges })
@@ -318,15 +299,112 @@ pub(super) struct Tolerances {
     pub abstol: Real,
 }
 
+/// Bind both sides of the local coordinate/evolution-equation relation.
+fn bound_initial_coordinates(
+    circuit: &Circuit,
+    index: usize,
+    context: &ModelContext,
+) -> SpiceResult<Vec<(AbsoluteRow, FixedCoordinate)>> {
+    let device = &circuit.devices()[index];
+    let coordinates = device.initial_coordinates(context)?;
+    if coordinates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = circuit
+        .branch_rows(index)
+        .ok_or_else(|| failure("missing initial coordinate rows"))?;
+    let mut bound = Vec::with_capacity(coordinates.len());
+    for coordinate in coordinates {
+        if coordinate.coordinate >= rows.len()
+            || coordinate.equation >= rows.len()
+            || !coordinate.value.is_finite()
+        {
+            return Err(failure(format!(
+                "{}: invalid initial coordinate binding",
+                device.name()
+            )));
+        }
+        bound.push((
+            AbsoluteRow(rows.start + coordinate.coordinate),
+            FixedCoordinate {
+                name: device.name().to_owned(),
+                value: coordinate.value,
+                equation: AbsoluteRow(rows.start + coordinate.equation),
+            },
+        ));
+    }
+    Ok(bound)
+}
+
+struct BoundVoltage {
+    slot: usize,
+    scale: Real,
+    constraint: CapacitorInitial,
+}
+
+fn bound_initial_voltage(
+    circuit: &Circuit,
+    index: usize,
+    initial: &Vector,
+    context: &ModelContext,
+) -> SpiceResult<Option<BoundVoltage>> {
+    let device = &circuit.devices()[index];
+    let Some(storage) = device.initial_voltage_storage(context)? else {
+        return Ok(None);
+    };
+    let [positive, negative, ..] = device.terminals() else {
+        return Err(failure("voltage storage needs two terminals"));
+    };
+    let positive = VoltageVertex::bind(circuit, *positive)?;
+    let negative = VoltageVertex::bind(circuit, *negative)?;
+    let at = |vertex| match vertex {
+        VoltageVertex::Ground => 0.,
+        VoltageVertex::Node(AbsoluteRow(row)) => initial.as_slice()[row],
+    };
+    let voltage = storage
+        .voltage
+        .unwrap_or_else(|| at(positive) - at(negative));
+    let states = circuit
+        .state_rows(index)
+        .ok_or_else(|| failure("missing voltage storage range"))?;
+    if storage.slot >= states.len() || !storage.scale.is_finite() || !voltage.is_finite() {
+        return Err(failure("invalid initial voltage storage binding"));
+    }
+    let equation = storage
+        .equation
+        .map(|equation| {
+            let rows = circuit
+                .branch_rows(index)
+                .ok_or_else(|| failure("missing voltage evolution row"))?;
+            if equation >= rows.len() {
+                return Err(failure("voltage evolution row outside device"));
+            }
+            Ok(AbsoluteRow(rows.start + equation))
+        })
+        .transpose()?;
+    Ok(Some(BoundVoltage {
+        slot: states.start + storage.slot,
+        scale: storage.scale,
+        constraint: CapacitorInitial {
+            name: device.name().to_owned(),
+            positive,
+            negative,
+            voltage,
+            equation,
+        },
+    }))
+}
+
 /// Storage constraints for the instantaneous circuit, in device order.
 struct ImpulseStorage {
-    fixed_currents: BTreeMap<AbsoluteRow, FixedCurrent>,
+    fixed_coordinates: BTreeMap<AbsoluteRow, FixedCoordinate>,
     capacitors: Vec<CapacitorInitial>,
 }
 
-struct FixedCurrent {
+struct FixedCoordinate {
     name: String,
     value: Real,
+    equation: AbsoluteRow,
 }
 
 struct CapacitorInitial {
@@ -334,6 +412,7 @@ struct CapacitorInitial {
     positive: VoltageVertex,
     negative: VoltageVertex,
     voltage: Real,
+    equation: Option<AbsoluteRow>,
 }
 
 impl ImpulseStorage {
@@ -342,54 +421,17 @@ impl ImpulseStorage {
             return Err(failure("initial vector does not match finalized circuit"));
         }
         let mut storage = Self {
-            fixed_currents: BTreeMap::new(),
+            fixed_coordinates: BTreeMap::new(),
             capacitors: Vec::new(),
         };
-        for (index, device) in circuit.devices().iter().enumerate() {
-            let Some(element) = device.storage_element(context).transpose()? else {
-                continue;
-            };
-            let [positive, negative] = device.terminals() else {
-                continue;
-            };
-            match element.kind {
-                StorageKind::Inductor => {
-                    let row = circuit
-                        .branch_rows(index)
-                        .filter(|rows| rows.len() == 1)
-                        .ok_or_else(|| {
-                            failure(format!("inductor {} has no branch row", device.name()))
-                        })?
-                        .start;
-                    let value = *initial
-                        .as_slice()
-                        .get(row)
-                        .ok_or_else(|| failure("inductor branch row outside finalized circuit"))?;
-                    storage.fixed_currents.insert(
-                        AbsoluteRow(row),
-                        FixedCurrent {
-                            name: device.name().to_owned(),
-                            value,
-                        },
-                    );
+        for index in 0..circuit.device_count() {
+            for (row, coordinate) in bound_initial_coordinates(circuit, index, context)? {
+                if storage.fixed_coordinates.insert(row, coordinate).is_some() {
+                    return Err(failure("duplicate fixed initial coordinate"));
                 }
-                StorageKind::Capacitor => {
-                    let positive = VoltageVertex::bind(circuit, *positive)?;
-                    let negative = VoltageVertex::bind(circuit, *negative)?;
-                    let at = |vertex| match vertex {
-                        VoltageVertex::Ground => 0.,
-                        VoltageVertex::Node(AbsoluteRow(row)) => initial.as_slice()[row],
-                    };
-                    let voltage = element
-                        .initial
-                        .unwrap_or_else(|| at(positive) - at(negative));
-                    storage.capacitors.push(CapacitorInitial {
-                        name: device.name().to_owned(),
-                        positive,
-                        negative,
-                        voltage,
-                    });
-                }
+            }
+            if let Some(voltage) = bound_initial_voltage(circuit, index, initial, context)? {
+                storage.capacitors.push(voltage.constraint);
             }
         }
         Ok(storage)
@@ -425,6 +467,7 @@ impl<'a> CapacitorRelations<'a> {
                 positive,
                 negative,
                 voltage,
+                ..
             } = capacitor;
             if graph.controlled_implies(*positive, *negative) {
                 relations.implied.push(ImpliedCapacitor {
@@ -465,6 +508,7 @@ impl<'a> CapacitorRelations<'a> {
                 positive,
                 negative,
                 voltage,
+                ..
             } = capacitor;
             let (Some(vp), Some(vq)) =
                 (solution.potential(*positive), solution.potential(*negative))
@@ -496,8 +540,12 @@ impl<'a> CapacitorRelations<'a> {
 /// just produces a huge first-step current. Here the instantaneous (`h -> 0`)
 /// problem is formed exactly: every capacitor becomes a voltage constraint with
 /// a free current, every inductor a fixed current (its voltage is free), every
-/// other element and the sources at their `t = 0` right limit (`rhs`) stay as
-/// they are. A state is impulse-free exactly when that system has a solution.
+/// other linear element and the sources at their `t = 0` right limit (`rhs`)
+/// stay as they are. Native differential devices replace their evolution
+/// equations, preserving their constitutive rows. Fixed internal transfer
+/// coordinates eliminate their own differential equations. For nonlinear
+/// devices the check uses the supplied static linearization; a complete
+/// nonlinear instantaneous consistency solve requires further work.
 ///
 /// Redundant-but-consistent relations (a capacitor whose `ic` equals the
 /// voltage that ideal sources already force, an inductor in series with a
@@ -516,7 +564,7 @@ pub(super) fn check_impulse_free(
     context: &ModelContext,
 ) -> SpiceResult<()> {
     let storage = ImpulseStorage::collect(circuit, x, context)?;
-    if storage.capacitors.is_empty() && storage.fixed_currents.is_empty() {
+    if storage.capacitors.is_empty() && storage.fixed_coordinates.is_empty() {
         return Ok(());
     }
     let voltage_tolerance = VoltageTolerance {

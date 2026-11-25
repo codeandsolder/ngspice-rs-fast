@@ -133,6 +133,7 @@ pub use sweep::{
 pub use switch::{Switch, SwitchKind, SwitchState};
 pub use traits::{
     AcceptContext, AnalysisMode, ControlReference, ConvergenceContext, Device, InductanceValue,
+    InitialCoordinate, InitialVoltageLaw, InitialVoltageRelation, InitialVoltageStorage,
     MnaUnknowns, MutualCoupling, MutualTerm, StampContext, StorageElement, StorageKind,
     TruncationContext,
 };
