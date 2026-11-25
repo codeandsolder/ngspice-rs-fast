@@ -256,14 +256,17 @@ fn bind_numeric_site(
         ('v' | 'i', "dc") if circuit.bind_source_target(&card.name).is_ok() => {
             RouteSpec::Instance { device, parameter }
         }
-        _ if card.model.is_none()
+        _ if (card.model.is_none()
+            || circuit
+                .device(&card.name)
+                .is_some_and(|device| device.model_candidate_setters_are_stable()))
             && circuit
                 .bind_instance_target(&card.name, &setter.name)
                 .is_ok() =>
         {
             RouteSpec::Instance { device, parameter }
         }
-        // Model parameter binning and geometry are resolved by the factory.
+        // Uncertified model selection and geometry are resolved by the factory.
         _ => RouteSpec::Rebuild,
     }
 }

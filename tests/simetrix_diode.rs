@@ -540,3 +540,155 @@ fn candidate_session_reuses_geometry_but_rebuilds_series_topology() {
     session.update(&[2., 100.], &mut budget).unwrap();
     check(&session, 2., 100., CandidateTopology::Reused);
 }
+
+#[test]
+fn source_selected_temperature_sweep_matches_measured_precedence() {
+    let netlist = projected(
+        "* thermal sweep\n*#SIMETRIX\nv1 a 0 .4\nv2 b 0 .4\nd1 a 0 dm\nd2 b 0 dm temp=50 dtemp=7\n.model dm D(IS=1p N=1 TNOM=27)\n.dc temp 65 72 7\n.end\n",
+    );
+    let context = AnalysisContext {
+        gmin: 1e-15,
+        ..AnalysisContext::default()
+    };
+    let mut circuit =
+        Circuit::from_netlist_with_context(&netlist, &context.model_context()).unwrap();
+    let plots = AnalysisInput::with_arguments(
+        AnalysisKind::DcSweep,
+        ["temp", "65", "72", "7", "rtol=1e-10", "vntol=1e-12"],
+    )
+    .resolve()
+    .unwrap()
+    .run_plots(&mut circuit, &context)
+    .unwrap();
+    for (row, (temperature, current)) in [(65., 0.0001627732692), (72., 0.0002837231788)]
+        .into_iter()
+        .enumerate()
+    {
+        close(
+            plots[0].value("temp-sweep", row).unwrap().re,
+            temperature,
+            0.,
+            0.,
+        );
+        close(
+            -plots[0].value("i(v1)", row).unwrap().re,
+            current,
+            2e-8,
+            1e-14,
+        );
+        close(
+            -plots[0].value("i(v2)", row).unwrap().re,
+            0.00004584224507,
+            2e-8,
+            1e-14,
+        );
+    }
+}
+
+#[test]
+fn measured_nonlinear_transient_currents_survive_companion_integration() {
+    // Public fixture ramp-27-1-knee-rec: nonlinear depletion, diffusion,
+    // recombination and high injection during both ramp directions.
+    let netlist = projected(
+        "* nonlinear transient\n*#SIMETRIX\nv1 a 0 PWL(0 -.7 100n -.7 300n .65 400n .65 600n -.7 700n -.7)\nd1 a 0 dm m=2\n.model dm D(IS=1p N=1.2 ISR=50n NR=1.8 VJ=.7 M=.4 IKF=10u CJO=80p FC=.5 TT=35n TNOM=27)\n.tran .25n 700n\n.end\n",
+    );
+    let context = AnalysisContext {
+        gmin: 1e-15,
+        ..AnalysisContext::default()
+    };
+    let mut circuit =
+        Circuit::from_netlist_with_context(&netlist, &context.model_context()).unwrap();
+    let plots =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, [".25n", "700n", "0", ".25n"])
+            .resolve()
+            .unwrap()
+            .run_plots(&mut circuit, &context)
+            .unwrap();
+    let plot = &plots[0];
+    let times = (0..plot.point_count())
+        .map(|row| plot.value("time", row).unwrap().re)
+        .collect::<Vec<_>>();
+    for (sample, current) in [
+        (200e-9, 0.0010652108),
+        (250e-9, 0.0017486154),
+        (350e-9, 0.0463989921),
+        (450e-9, -0.001618402),
+        (500e-9, -0.001065295),
+        (550e-9, -0.000914098),
+        (650e-9, -1.31986e-7),
+    ] {
+        let high = times.partition_point(|time| *time < sample);
+        assert!(high > 0 && high < times.len());
+        let low = high - 1;
+        let fraction = (sample - times[low]) / (times[high] - times[low]);
+        let before = -plot.value("i(v1)", low).unwrap().re;
+        let after = -plot.value("i(v1)", high).unwrap().re;
+        close(
+            fraction.mul_add(after - before, before),
+            current,
+            2e-3,
+            2e-9,
+        );
+    }
+}
+
+#[test]
+fn measured_recombination_noise_matches_generalized_sources() {
+    // Public fixture noise-27-1-recombination. The fixture amplitudes
+    // measure physical local shot and total current noise, not a circuit
+    // output transfer function (covered separately by the series test).
+    let netlist = projected(
+        "* measured noise\n*#SIMETRIX\nv1 a 0 .45\nd1 a 0 dm area=2 m=3\n.model dm D(IS=1p N=1.2 ISR=100n NR=2.3 VJ=.7 M=.4 CJO=100p TT=20n TNOM=27 KF=1p AF=1.3)\n.end\n",
+    );
+    let context = ModelContext::default().with_gmin(1e-15);
+    let circuit = Circuit::from_netlist_with_context(&netlist, &context).unwrap();
+    let solved = solve_dc(
+        &circuit,
+        &context,
+        &NewtonOptions::default(),
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let diode = circuit
+        .devices()
+        .iter()
+        .find(|device| device.designator() == 'd')
+        .unwrap();
+    close(
+        dc_current(&circuit, &context, "v1"),
+        0.0007839686942,
+        2e-8,
+        1e-14,
+    );
+    for (frequency, expected) in [(1., 8.123194e-9), (1e3, 2.57366e-10), (1e6, 1.78101e-11)] {
+        let mut sources = Vec::new();
+        diode
+            .noise(
+                &NoiseContext {
+                    model_context: &context.with_frequency(frequency),
+                    unknowns: circuit.unknowns(),
+                    bias: &solved.values,
+                    states: None,
+                    controls: &[],
+                },
+                &mut sources,
+            )
+            .unwrap();
+        let densities = sources
+            .iter()
+            .map(|source| match source.kind {
+                NoiseKind::Generalized { density, .. } => density,
+                _ => panic!("expected generalized source"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(densities.len(), 2);
+        let shot = sources
+            .iter()
+            .position(|source| source.suffix == "_shot")
+            .unwrap();
+        close(densities[shot].sqrt(), 1.584972e-11, 2e-6, 1e-18);
+        close(densities.iter().sum::<Real>().sqrt(), expected, 2e-6, 1e-18);
+    }
+}
