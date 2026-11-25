@@ -182,7 +182,7 @@ pub enum BBinaryOp {
 
 impl BBinaryOp {
     /// The operator's canonical spelling.
-    #[must_use]
+    #[must_use = "the symbol preserves the operator spelling in expression rendering"]
     pub const fn symbol(self) -> &'static str {
         match self {
             Self::Add => "+",
@@ -274,7 +274,7 @@ pub const BUILTIN_FUNCTIONS: &[&str] = &[
 pub const STATISTICAL_FUNCTIONS: &[&str] = &["agauss", "gauss", "aunif", "unif", "limit"];
 
 /// True for a name the B-source parser knows as a function.
-#[must_use]
+#[must_use = "the predicate determines whether the name is a recognized behavioral function"]
 pub fn is_builtin_function(name: &str) -> bool {
     BUILTIN_FUNCTIONS.contains(&name)
 }
@@ -414,7 +414,7 @@ impl BExpr {
 
     /// Every node name referenced by `v(...)`, in source order with
     /// duplicates kept.
-    #[must_use]
+    #[must_use = "the collected names identify the nodal voltage dependencies"]
     pub fn node_references(&self) -> Vec<&str> {
         let mut names = Vec::new();
         self.visit(&mut |node| {
@@ -429,7 +429,7 @@ impl BExpr {
     }
 
     /// Every source named by `i(...)`, in source order with duplicates kept.
-    #[must_use]
+    #[must_use = "the collected names identify the branch current dependencies"]
     pub fn current_references(&self) -> Vec<&str> {
         let mut names = Vec::new();
         self.visit(&mut |node| {
@@ -447,7 +447,7 @@ impl BExpr {
 /// (`src/frontend/inpcom.c`) keeps when it re-prints a B-source literal with
 /// `%18.10e`, then correctly rounds the resulting decimal to binary64.
 /// Non-finite input is returned unchanged.
-#[must_use]
+#[must_use = "the returned value preserves the reference literal rounding convention"]
 pub fn round_like_c_literal(value: Real) -> Real {
     if !value.is_finite() {
         return value;
