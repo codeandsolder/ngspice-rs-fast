@@ -208,6 +208,7 @@ pub(crate) struct BackendSpec {
     pub(crate) backend: ModelBackend,
     pub(crate) name: &'static str,
     pub(crate) selectors: &'static [u8],
+    family: Option<ModelFamily>,
 }
 
 impl BackendSpec {
@@ -216,7 +217,13 @@ impl BackendSpec {
             backend,
             name,
             selectors,
+            family: None,
         }
+    }
+
+    const fn for_family(mut self, family: ModelFamily) -> Self {
+        self.family = Some(family);
+        self
     }
 }
 
@@ -228,7 +235,19 @@ impl ModelBackend {
             'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
             'c' => const { &[BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1])] },
             'l' => const { &[BackendSpec::new(Self::Inductor, "Scalar inductor", &[1])] },
-            'd' => const { &[BackendSpec::new(Self::Diode, "Junction diode", &[1])] },
+            'd' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Diode, "Junction diode", &[1]),
+                        BackendSpec::new(
+                            Self::SimetrixDiodeLevel1,
+                            "SIMetrix diode (explicit simetrix_diode_level1 family)",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::SimetrixDiodeLevel1),
+                    ]
+                }
+            }
             'q' => const { &[BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2])] },
             'm' => {
                 const {
@@ -297,12 +316,15 @@ impl ModelBackend {
     }
 
     fn select(family: ModelFamily, selector: u8) -> Option<Self> {
-        if family == ModelFamily::SimetrixDiodeLevel1 {
-            return (selector == 1).then_some(Self::SimetrixDiodeLevel1);
-        }
-        Self::catalog(family.designator())
+        let catalog = Self::catalog(family.designator());
+        // An explicitly selected family owns its selectors: it must never
+        // fall back to a native backend when its requested level is absent.
+        let explicit = catalog.iter().any(|spec| spec.family == Some(family));
+        catalog
             .iter()
-            .find(|spec| spec.selectors.contains(&selector))
+            .find(|spec| {
+                spec.family == explicit.then_some(family) && spec.selectors.contains(&selector)
+            })
             .map(|spec| spec.backend)
     }
 
