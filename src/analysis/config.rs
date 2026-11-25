@@ -65,9 +65,13 @@
 //!
 //! Every other name from `cktsopt.c` (`gshunt`, `oldlimit`, `minbreak`, ...)
 //! and the front-end variables with an effect (`filetype`, `numdgt`,
-//! `savecurrents`, `scale`, `seed`, ...) is [`SpiceError::NotYetPorted`]; names
+//! `savecurrents`, `scale`, ...) is [`SpiceError::NotYetPorted`]; names
 //! absent from both are parse errors. `no_auto_gnd` is a front-end variable in
 //! C, not an `.option`: use `Parser::with_auto_gnd`.
+//!
+//! Static statistical realization accepts top-level literal `seed` and
+//! `rndseed` at deck load. See `netlist::eval`; the run config validates
+//! these frontend inputs without changing a prepared circuit's realization.
 //!
 //! # Expression values
 //!
@@ -154,9 +158,7 @@ const FRONTEND_UNIMPLEMENTED: &[&str] = &[
     "savecurrents",
     "scale",
     "scalm",
-    "seed",
     "seedinfo",
-    "rndseed",
     "interp",
     "warn",
     "measureprec",
@@ -791,6 +793,17 @@ impl RunConfig {
         let name = setting.name.as_str();
         let location = &setting.location;
         match name {
+            "seed" | "rndseed" => {
+                crate::netlist::eval::statistics::parse_seed(setting)?;
+                self.applied.push(AppliedOption {
+                    name: setting.name.clone(),
+                    value: setting
+                        .value
+                        .as_ref()
+                        .map_or_else(String::new, |value| value.text.clone()),
+                    location: location.clone(),
+                });
+            }
             "nfreqs" | "nperiods" | "polydegree" | "fourgridsize" => {
                 let value = input.whole(
                     u32::from(name != "polydegree"),

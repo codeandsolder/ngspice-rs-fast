@@ -22,6 +22,7 @@ mod exact;
 pub(crate) use exact::{positive_axis_span, rounded_product_ratio};
 pub mod node;
 pub mod numeric;
+pub(crate) mod random;
 pub mod value;
 
 pub use error::{SourceLoc, SpiceError, SpiceResult};

@@ -12,7 +12,7 @@ use crate::primitives::{Real, SpiceError, SpiceResult};
 
 const MAX_INDEX: Real = 9_007_199_254_740_991.;
 const MAX_INDEX_INTEGER: u64 = 9_007_199_254_740_991;
-const INV_53: Real = 1. / 9_007_199_254_740_992.;
+use crate::primitives::random::{gaussian, mix, real_u64, uniform};
 const FLICKER_OCTAVES: usize = 16;
 const RTS_CACHE: usize = 32;
 
@@ -426,24 +426,6 @@ impl StochasticWaveform {
     }
 }
 
-const fn mix(mut value: u64) -> u64 {
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-const fn draw(key: u64, stream: u64, index: u64, ordinal: u64) -> u64 {
-    mix(key
-        ^ mix(stream)
-        ^ mix(index.wrapping_add(0x243f_6a88_85a3_08d3))
-        ^ mix(ordinal.wrapping_add(0x1319_8a2e_0370_7344)))
-}
-/// Convert integer through 32-bit limbs; all binary64 grid integers
-/// are exactly represented without relying on a narrowing cast.
-fn real_u64(value: u64) -> Real {
-    let hi = u32::try_from(value >> 32).unwrap_or_default();
-    let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or_default();
-    4_294_967_296_f64.mul_add(Real::from(hi), Real::from(lo))
-}
 /// Integer floor of bounded nonnegative IEEE754 binary64, without casting.
 const fn floor_nonnegative(value: Real) -> u64 {
     let bits = value.to_bits();
@@ -457,14 +439,6 @@ const fn floor_nonnegative(value: Real) -> u64 {
     } else {
         significand >> (1075 - exponent)
     }
-}
-fn uniform(key: u64, stream: u64, index: u64, ordinal: u64) -> Real {
-    (real_u64(draw(key, stream, index, ordinal) >> 11) + 0.5) * INV_53
-}
-fn gaussian(key: u64, stream: u64, index: u64) -> Real {
-    let unit = uniform(key, stream, index, 0);
-    let theta = std::f64::consts::TAU * uniform(key, stream, index, 1);
-    (-2. * unit.ln()).sqrt() * theta.cos()
 }
 fn grid_index(value: Real) -> SpiceResult<(u64, Real)> {
     if !value.is_finite() || !(0. ..=MAX_INDEX).contains(&value) {

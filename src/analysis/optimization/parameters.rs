@@ -95,7 +95,7 @@ impl CircuitParameterPlan {
     /// Ordinary netlist, parameter, option, model or circuit validation; an
     /// unknown/duplicate independent coordinate or dependency scan failure.
     pub fn new(source: Netlist, tunables: &[&str]) -> SpiceResult<Self> {
-        let mut budget = EvalBudget::default();
+        let mut budget = EvalBudget::for_netlist(&source)?;
         let functions = FunctionScope::for_netlist(&source, &budget)?;
         let mut parameters = ParameterPlan::new();
         let root = parameters.add_scope(

@@ -3,9 +3,10 @@
 **Implemented: B arbitrary sources (`v=`/`i=` expressions) and the nonlinear
 E/G/F/H forms `VALUE=`/`VOL=`/`CUR=`, `TABLE`, `POLY(n)` and the implicit
 spice2g6 `POLY(1)`, for `.op`, `.dc`, `.ac` and the companion `.tran`
-(trapezoidal/Gear-2).** `LAPLACE`, `ddt()` and the statistical functions
-(`agauss`, `gauss`, `aunif`, `unif`, `limit`) are explicit `NotYetPorted`
-errors.
+(trapezoidal/Gear-2).** Native stateful `ddt()`, rational transfer
+models and nonlinear passive laws are described in [BEHAVIOURAL_RLC.md](BEHAVIOURAL_RLC.md).
+Static statistical functions (`agauss`, `gauss`, `aunif`, `unif`, `limit`)
+are realized during elaboration.
 
 C references (read-only behaviour): `src/spicelib/parser/inp2b.c`,
 `inpptree.c`, `inpptree-parser.y`, `ptfuncs.c`, `ifeval.c`;
@@ -82,11 +83,13 @@ literally (C does not substitute formals there; verified).
 The complete `inpptree.c` table: `abs acos acosh asin asinh atan atanh cos
 cosh exp ln log log10 sgn sin sinh sqrt tan tanh u uramp ceil floor nint u2
 pwl eq0 ne0 gt0 lt0 ge0 le0 pow pwr min max ternary_fcn`. Unknown names are a
-parse error ("no such function"); `ddt` is `NotYetPorted`, and so are
-`agauss`, `gauss`, `aunif`, `unif` and `limit`, which C replaces by one drawn
-value before parsing a B line (`src/frontend/inp.c` `eval_agauss()`, the
+parse error ("no such function"). `ddt` becomes a solver-owned dynamic
+equation. `agauss`, `gauss`, `aunif`, `unif` and `limit` become static
+samples before compilation (`src/frontend/inp.c` `eval_agauss()`, the
 `inp_fix_agauss_in_param()` set of `inpcom.c`; a user `.func` of the same name
-is expanded first, as in C);
+takes precedence). See [PARAM_EXPRESSIONS.md](PARAM_EXPRESSIONS.md) for the
+realization policy; static arithmetic in these arguments is supported,
+but circuit-dependent arguments are rejected.
 `pwl_derivative` (internal to `pwl`, C would dereference a missing table) is
 `Unsupported`.
 
@@ -238,8 +241,8 @@ rewritten and must name a findable branch (V, E, H or voltage B).
 | --- | --- |
 | malformed expression, trailing text, two `v=`/`i=`, missing `v=`/`i=` | positioned `Parse` error |
 | undefined `.param`, unknown function, wrong argument count, non-literal or non-monotonic `pwl()` points | `Parse` error at the name |
-| `ddt()`, `LAPLACE` | `NotYetPorted` |
-| `agauss()`, `gauss()`, `aunif()`, `unif()`, `limit()` | `NotYetPorted` at the call (`src/frontend/inp.c` `eval_agauss`; `inpcom.c` `inp_fix_agauss_in_param`) |
+| E/G `LAPLACE` | requires rational transfer normalization |
+| statistical function with wrong arity or dynamic argument | positioned error at elaboration, never resampling during load |
 | `v=` with coinciding nodes | `Unsupported` ("shorted ASRC") |
 | `temp=` and `dtemp=` together | `Unsupported` (C ignores `dtemp` with a message) |
 | domain error or non-finite value/derivative during a load | `Numerical`, naming the function and the offending value or derivative |
@@ -282,10 +285,10 @@ rewritten and must name a findable branch (V, E, H or voltage B).
   constant `b < 1` (`v(in)^0.5`, `v(in)^-1`, `v(in)**-2`) or `pow(0, -1)`
   whose controlling node starts at 0 V. This is a C-parity gap for common
   decks; write `sqrt(v(x))` or `1/v(x)` (finite `1e32` slopes) instead.
-- `ddt()`, the statistical functions (`agauss`, `gauss`, `aunif`, `unif`,
-  `limit`), `LAPLACE` (XSPICE `s_xfer`), the PSPICE/HSPICE/
-  LTspice compatibility variants of `^`, `exp` and `pwr`, and user XSPICE `a`
-  cards are not ported.
+- E/G `LAPLACE` source-dialect normalization, general high-index derivative
+  initialization, and PSPICE/HSPICE/LTspice compatibility variants of
+  `^`, `exp` and `pwr` remain separate work. The native XSPICE `s_xfer`
+  rational realization is implemented.
 - `.func` bodies are expanded after the lowering passes, so an `i()` that only
   appears inside a `.func` body is not rewritten by `inp_meas_current()`;
   numparam-only constructs inside `.func` bodies (`?:`, comparisons) remain
