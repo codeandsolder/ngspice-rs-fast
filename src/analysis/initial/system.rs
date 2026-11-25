@@ -1,4 +1,4 @@
-//! Ordered elimination of fixed storage currents and compact instantaneous MNA.
+//! Ordered elimination of fixed storage coordinates and compact instantaneous MNA.
 use super::constraints::{AbsoluteRow, VoltageVertex};
 use super::{CapacitorInitial, ImpulseStorage, Tolerances, failure};
 use crate::devices::Circuit;
@@ -18,20 +18,22 @@ struct CompactRow(usize);
 struct CompactColumn(usize);
 
 #[derive(Clone, Copy)]
-enum Binding {
-    FixedCurrent(Real),
-    Unknown {
-        equation: EquationId,
-        variable: VariableId,
-    },
+enum VariableBinding {
+    Fixed(Real),
+    Unknown(VariableId),
+}
+
+#[derive(Clone, Copy)]
+struct Binding {
+    equation: Option<EquationId>,
+    variable: VariableBinding,
 }
 
 impl Binding {
     fn free(&self) -> SpiceResult<(EquationId, VariableId)> {
-        if let Self::Unknown { equation, variable } = *self {
-            Ok((equation, variable))
-        } else {
-            Err(failure("voltage constraint names an eliminated current"))
+        match (self.equation, self.variable) {
+            (Some(equation), VariableBinding::Unknown(variable)) => Ok((equation, variable)),
+            _ => Err(failure("voltage constraint names an eliminated coordinate")),
         }
     }
 }
@@ -61,7 +63,7 @@ impl<'a> Equation<'a> {
     }
 }
 
-/// MNA voltage lookup after removing fixed currents and empty columns.
+/// MNA voltage lookup after eliminating fixed coordinates and empty columns.
 pub(super) struct InstantaneousSolution {
     original: Vec<Option<Real>>,
 }
@@ -97,8 +99,14 @@ impl<'a> InstantaneousSystem<'a> {
                 "instantaneous matrix/vector size does not match finalized circuit",
             ));
         }
-        if storage.fixed_currents.keys().any(|row| row.0 >= unknowns) {
-            return Err(failure("fixed current row outside finalized circuit"));
+        if storage
+            .fixed_coordinates
+            .iter()
+            .any(|(row, value)| row.0 >= unknowns || value.equation.0 >= unknowns)
+        {
+            return Err(failure(
+                "fixed coordinate or evolution equation outside finalized circuit",
+            ));
         }
         let mut is_branch = vec![false; unknowns];
         for index in 0..circuit.device_count() {
@@ -112,31 +120,67 @@ impl<'a> InstantaneousSystem<'a> {
                 *row = true;
             }
         }
+        let mut removed = vec![false; unknowns];
+        for (row, fixed) in &storage.fixed_coordinates {
+            if !fixed.value.is_finite()
+                || !is_branch[row.0]
+                || !is_branch[fixed.equation.0]
+                || std::mem::replace(&mut removed[fixed.equation.0], true)
+            {
+                return Err(failure("invalid or duplicate eliminated state equation"));
+            }
+        }
         let mut equations = Vec::new();
         let mut bindings = Vec::with_capacity(unknowns);
+        let mut variables = 0;
         for (row, &kind) in is_branch.iter().enumerate() {
             let absolute = AbsoluteRow(row);
-            if let Some(fixed) = storage.fixed_currents.get(&absolute) {
-                if !fixed.value.is_finite() || !kind {
-                    return Err(failure("invalid eliminated inductor current binding"));
-                }
-                bindings.push(Binding::FixedCurrent(fixed.value));
-                continue;
-            }
-            bindings.push(Binding::Unknown {
-                equation: EquationId(equations.len()),
-                variable: VariableId(equations.len()),
-            });
-            let origin = if kind {
-                EquationOrigin::Branch(absolute)
+            let variable = if let Some(fixed) = storage.fixed_coordinates.get(&absolute) {
+                VariableBinding::Fixed(fixed.value)
             } else {
-                EquationOrigin::Node(absolute)
+                let binding = VariableBinding::Unknown(VariableId(variables));
+                variables += 1;
+                binding
             };
-            equations.push(Equation::new(origin, rhs.as_slice()[row]));
+            let equation = if removed[row] {
+                None
+            } else {
+                let equation = EquationId(equations.len());
+                let origin = if kind {
+                    EquationOrigin::Branch(absolute)
+                } else {
+                    EquationOrigin::Node(absolute)
+                };
+                equations.push(Equation::new(origin, rhs.as_slice()[row]));
+                Some(equation)
+            };
+            bindings.push(Binding { equation, variable });
+        }
+        if equations.len() != variables {
+            return Err(failure(
+                "unbalanced fixed coordinates and released equations",
+            ));
+        }
+        let mut replacements = vec![None; unknowns];
+        for capacitor in kept {
+            if let Some(row) = capacitor.equation
+                && (row.0 >= unknowns
+                    || removed[row.0]
+                    || !is_branch[row.0]
+                    || replacements[row.0].replace(*capacitor).is_some())
+            {
+                return Err(failure(
+                    "invalid or duplicate voltage evolution replacement",
+                ));
+            }
         }
         let size = equations
             .len()
-            .checked_add(kept.len())
+            .checked_add(
+                kept.iter()
+                    .filter(|capacitor| capacitor.equation.is_none())
+                    .count(),
+            )
             .ok_or_else(|| failure("instantaneous system size overflow"))?;
         let mut system = Self {
             bindings,
@@ -147,29 +191,44 @@ impl<'a> InstantaneousSystem<'a> {
         // Retain the original contribution order for eliminated-column RHS
         // arithmetic. Remaining matrix duplicates are folded stably below.
         for triplet in matrix.triplets() {
-            let Binding::Unknown { equation, .. } = system.bindings[triplet.row] else {
+            if replacements[triplet.row].is_some() {
+                continue;
+            }
+            let Some(equation) = system.bindings[triplet.row].equation else {
                 continue;
             };
-            match system.bindings[triplet.col] {
-                Binding::FixedCurrent(current) => {
+            match system.bindings[triplet.col].variable {
+                VariableBinding::Fixed(current) => {
                     let contribution = triplet.value * current;
                     let row = &mut system.equations[equation.0];
                     row.rhs -= contribution;
                     row.scale += contribution.abs();
                     row.fixed.push(AbsoluteRow(triplet.col));
                 }
-                Binding::Unknown { variable, .. } => {
+                VariableBinding::Unknown(variable) => {
                     system.add(equation, variable, triplet.value)?;
                 }
             }
         }
         for capacitor in kept {
-            let equation = EquationId(system.equations.len());
-            let variable = VariableId(system.equations.len());
-            system.equations.push(Equation::new(
-                EquationOrigin::Capacitor(&capacitor.name),
-                capacitor.voltage,
-            ));
+            let (equation, current) = if let Some(row) = capacitor.equation {
+                let equation = system.bindings[row.0]
+                    .equation
+                    .ok_or_else(|| failure("missing voltage evolution equation"))?;
+                system.equations[equation.0] = Equation::new(
+                    EquationOrigin::Capacitor(&capacitor.name),
+                    capacitor.voltage,
+                );
+                (equation, None)
+            } else {
+                let equation = EquationId(system.equations.len());
+                let variable = VariableId(system.equations.len());
+                system.equations.push(Equation::new(
+                    EquationOrigin::Capacitor(&capacitor.name),
+                    capacitor.voltage,
+                ));
+                (equation, Some(variable))
+            };
             for (vertex, sign) in [(capacitor.positive, 1.), (capacitor.negative, -1.)] {
                 if let VoltageVertex::Node(row) = vertex {
                     let (node_equation, node_variable) = system
@@ -177,7 +236,9 @@ impl<'a> InstantaneousSystem<'a> {
                         .get(row.0)
                         .ok_or_else(|| failure("capacitor voltage row outside finalized circuit"))?
                         .free()?;
-                    system.add(node_equation, variable, sign)?;
+                    if let Some(current) = current {
+                        system.add(node_equation, current, sign)?;
+                    }
                     system.add(equation, node_variable, sign)?;
                 }
             }
@@ -224,7 +285,7 @@ impl<'a> InstantaneousSystem<'a> {
                     .iter()
                     .filter_map(|row| {
                         storage
-                            .fixed_currents
+                            .fixed_coordinates
                             .get(row)
                             .map(|current| current.name.as_str())
                     })
@@ -232,11 +293,11 @@ impl<'a> InstantaneousSystem<'a> {
                 let who = if who.is_empty() {
                     String::new()
                 } else {
-                    format!(" (inductors: {})", who.join(", "))
+                    format!(" (storage devices: {})", who.join(", "))
                 };
                 return Err(failure(format!(
                     "uic initial conditions are inconsistent with the circuit at t = 0+: {what} \
-                     left over by fixed inductor currents and sources is {:e} instead of 0, an \
+                     left over by fixed storage coordinates and sources is {:e} instead of 0, an \
                      impulse{who}",
                     equation.rhs
                 )));
@@ -332,9 +393,9 @@ impl<'a> InstantaneousSystem<'a> {
         let original = self
             .bindings
             .iter()
-            .map(|binding| match *binding {
-                Binding::FixedCurrent(_) => None,
-                Binding::Unknown { variable, .. } => {
+            .map(|binding| match binding.variable {
+                VariableBinding::Fixed(value) => Some(value),
+                VariableBinding::Unknown(variable) => {
                     column_index[variable.0].map(|col| solution.as_slice()[col.0])
                 }
             })
@@ -362,7 +423,7 @@ mod tests {
 
     fn storage() -> ImpulseStorage {
         ImpulseStorage {
-            fixed_currents: BTreeMap::new(),
+            fixed_coordinates: BTreeMap::new(),
             capacitors: Vec::new(),
         }
     }

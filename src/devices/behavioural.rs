@@ -373,6 +373,19 @@ impl Behavioural {
 }
 
 impl Device for Behavioural {
+    fn initial_voltage_relations(
+        &self,
+        _inductors_short: bool,
+    ) -> Vec<crate::devices::InitialVoltageRelation> {
+        (self.output == BehaviouralOutput::Voltage)
+            .then(|| crate::devices::InitialVoltageRelation {
+                terminals: [self.terminals[0], self.terminals[1]],
+                law: crate::devices::InitialVoltageLaw::Controlled,
+            })
+            .into_iter()
+            .collect()
+    }
+
     fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
         let factor = self.checked_factor(context.temperature)?;
         // An expression depending only on the environment and ground has a
