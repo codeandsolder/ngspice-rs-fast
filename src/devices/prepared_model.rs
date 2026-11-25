@@ -662,6 +662,10 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         self.charge_state_count() + usize::from(self.junction_limit.is_some())
     }
 
+    fn needs_prepared_linearization(&self) -> bool {
+        self.junction_limit.is_some()
+    }
+
     fn linearize_prepared(
         &self,
         states: &mut DeviceState<'_>,

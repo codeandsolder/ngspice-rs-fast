@@ -950,7 +950,7 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// The nodes this device is connected to, in numerical binding order.
     fn terminals(&self) -> &[NodeId];
 
-    /// Public electrical ports in source order, excluding setup-private
+    /// Public ports in source order, excluding setup-private
     /// coordinates. Used for external current and power observations.
     fn external_terminals(&self) -> &[NodeId] {
         self.terminals()
@@ -1091,6 +1091,11 @@ pub trait Device: fmt::Debug + std::any::Any {
         Err(SpiceError::circuit(
             "device has no prepared batch implementation",
         ))
+    }
+
+    /// Whether a prepared lane uses solver-owned trial linearization state.
+    fn needs_prepared_linearization(&self) -> bool {
+        false
     }
 
     /// Apply solver-owned trial linearization to one prepared lane before

@@ -25,6 +25,28 @@ contract first; the current Git dependency is suitable for repository builds.
   order remains the original circuit load order. Singletons use the scalar
   kernel. Workspaces are local to a prepared circuit run.
 
+## Source-selected models
+
+The native grammar and writer share the model-family registry. Explicit
+`simetrix_diode_level1` declarations use the producer's ordered scalar model
+compiler and the existing lexical model resolver. A plain native `D` model
+still selects the native diode. Source expressions are resolved before
+compilation; immutable declaration artifacts are cached by series-node and
+instance temperature-policy shape. Numeric instance geometry, multiplicity,
+temperature and gmin are prepared at a context boundary, never during a
+Newton evaluation. A candidate that changes the descriptor's topology must
+re-elaborate instead of reusing numerical rows or accepted state.
+
+Public terminal observations exclude hidden equations, while numerical
+coordinate bindings include them. The diode's intrinsic junction voltage
+has a solver-owned trial slot separate from the conservative charge pairs.
+Forward and avalanche limiting use the effective model/instance thermal
+scales and existing Newton history. Scalar and tile evaluation receive the
+same limited coordinates; the affine Newton source uses those coordinates,
+not the original iterate. Linear or electrothermal kernels that do not
+request a limiter keep their exact evaluation. Small-signal assembly always
+uses the exact converged bias, and no limited load is accepted as converged.
+
 ## Verification
 
 Integration tests exercise the analytic nonlinear and electrothermal
@@ -55,5 +77,6 @@ The public producer follow-ups for selective lane replacement and optional
 family-specific trial limiting are
 [preprocess#38](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/38)
 and [preprocess#39](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/39).
-Until the latter is implemented, the engine uses its generic Newton
-policy for prepared kernels, not family-specific limiters.
+The source-selected diode now supplies an engine-side junction policy. Other
+prepared model families continue to use generic Newton policy until a
+family-specific policy is available.

@@ -429,7 +429,7 @@ fn direct_newton_limits_forward_and_avalanche_junctions_in_scalar_and_tiles() {
             vntol: 1e-10,
             ..NewtonOptions::default()
         },
-        continuation: Default::default(),
+        continuation: ngspice_rs::analysis::bias::ContinuationPolicy::default(),
     };
     let solve = |deck: &str| {
         let circuit = Circuit::from_netlist_with_context(&parse(deck), &context).unwrap();
@@ -494,4 +494,49 @@ fn measured_temperature_precedence_survives_native_binding() {
             1e-14,
         );
     }
+}
+
+#[test]
+fn candidate_session_reuses_geometry_but_rebuilds_series_topology() {
+    use ngspice_rs::analysis::optimization::parameters::{CandidateTopology, CircuitParameterPlan};
+    use ngspice_rs::netlist::eval::EvalBudget;
+    let source = parse(
+        "* candidate\n.param area=2 resistance=100\nv1 a 0 1\nd1 a 0 dm area={area}\n.model dm simetrix_diode_level1(IS=0 RS={resistance})\n.options gmin=1m\n.end\n",
+    );
+    let plan = CircuitParameterPlan::new(source, &["area", "resistance"]).unwrap();
+    let mut session = plan.session().unwrap();
+    let mut budget = EvalBudget::default();
+    let check =
+        |candidate: &ngspice_rs::analysis::optimization::parameters::CircuitCandidate<'_>,
+         area: f64,
+         resistance: f64,
+         topology| {
+            assert_eq!(candidate.topology(), topology);
+            let circuit = candidate.circuit();
+            let context = candidate.model_context();
+            let diode = circuit
+                .devices()
+                .iter()
+                .find(|device| device.designator() == 'd')
+                .unwrap();
+            assert_eq!(
+                diode.terminals().len(),
+                if resistance == 0. { 2 } else { 3 }
+            );
+            close(
+                dc_current(circuit, &context, "v1"),
+                (1000. + resistance / area).recip(),
+                1e-10,
+                1e-14,
+            );
+        };
+    check(&session, 2., 100., CandidateTopology::Reused);
+    session.update(&[4., 100.], &mut budget).unwrap();
+    check(&session, 4., 100., CandidateTopology::Reused);
+    assert!(session.update(&[-1., 100.], &mut budget).is_err());
+    check(&session, 4., 100., CandidateTopology::Reused);
+    session.update(&[4., 0.], &mut budget).unwrap();
+    check(&session, 4., 0., CandidateTopology::Rebuilt);
+    session.update(&[2., 100.], &mut budget).unwrap();
+    check(&session, 2., 100., CandidateTopology::Reused);
 }

@@ -143,6 +143,7 @@ struct Lane {
     values: Vec<u64>,
     ambient: u64,
     circuit_temperature: u64,
+    needs_linearization: bool,
 }
 
 impl Lane {
@@ -156,12 +157,14 @@ impl Lane {
             values: recipe.values.iter().map(|value| value.to_bits()).collect(),
             ambient: recipe.ambient.to_bits(),
             circuit_temperature: recipe.circuit_temperature.to_bits(),
+            needs_linearization: device.needs_prepared_linearization(),
         })
     }
 
     fn matches(&self, device: &dyn Device) -> bool {
         device.prepared_recipe().is_some_and(|recipe| {
-            self.key == recipe.key
+            self.needs_linearization == device.needs_prepared_linearization()
+                && self.key == recipe.key
                 && self.ambient == recipe.ambient.to_bits()
                 && self.circuit_temperature == recipe.circuit_temperature.to_bits()
                 && self
@@ -286,7 +289,11 @@ impl Plan {
         let group = &mut self.groups[group];
         if !group.evaluated {
             group.tile.evaluate(solution, &mut |lane, coordinates| {
-                linearize(group.lanes[lane].index, coordinates)
+                let lane = &group.lanes[lane];
+                if lane.needs_linearization {
+                    linearize(lane.index, coordinates)?;
+                }
+                Ok(())
             })?;
             group.evaluated = true;
         }
