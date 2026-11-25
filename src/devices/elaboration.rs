@@ -228,6 +228,7 @@ impl<'a> PlannedBatch<'a> {
         }
         let deck_nodes = instances
             .iter()
+            .filter(|instance| !super::behavioural::dynamic::is_generated(instance))
             .flat_map(|i| &i.nodes)
             .map(|name| NodeTable::canonical_name(name, nodes.auto_gnd()))
             .collect();

@@ -179,6 +179,7 @@ fn behavioural_passive_value(
         runtime |= match &node.kind {
             BExprKind::Voltage { .. } | BExprKind::Current(_) => true,
             BExprKind::Name(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
+            BExprKind::Call { name, .. } => name == "ddt",
             _ => false,
         };
     });
