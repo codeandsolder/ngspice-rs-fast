@@ -328,6 +328,10 @@ impl Evaluator<'_, '_> {
                 let value = match function {
                     Binary::Pow => power(a, b),
                     Binary::Pwr => pwr(a, b),
+                    Binary::PowBaseSlope => super::power_base_slope(a, b, false),
+                    Binary::PwrBaseSlope => super::power_base_slope(a, b, true),
+                    Binary::PowExponentSlope => super::power_exponent_slope(a, b, false),
+                    Binary::PwrExponentSlope => super::power_exponent_slope(a, b, true),
                     Binary::Min => {
                         if a > b {
                             b
@@ -397,6 +401,10 @@ fn describe(node: &Instruction) -> String {
             match function {
                 Binary::Pow => "pow",
                 Binary::Pwr => "pwr",
+                Binary::PowBaseSlope => "pow_base_slope",
+                Binary::PwrBaseSlope => "pwr_base_slope",
+                Binary::PowExponentSlope => "pow_exponent_slope",
+                Binary::PwrExponentSlope => "pwr_exponent_slope",
                 Binary::Min => "min",
                 Binary::Max => "max",
             }

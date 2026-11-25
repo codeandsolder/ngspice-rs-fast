@@ -175,7 +175,7 @@ fn every_function_has_a_derivative_matching_finite_differences() {
     }
 }
 
-/// The `^` operator and `pow()` produce the same C derivative tree, even
+/// The `^` operator and `pow()` use the same branch-local partials, even
 /// though their value functions diverge at a zero base. This covers constant
 /// exponents, variable exponents and the special constant-base rule.
 #[test]
@@ -264,26 +264,46 @@ fn descending_pwl_keeps_cs_ascending_derivative_search() {
 }
 
 #[test]
-fn pwr_of_a_negative_base_keeps_cs_zero_derivative() {
-    // PTdifferentiate writes d pwr(a, 2.5) as 2.5 pow(a, 1.5) a', and PTpower
-    // of a negative base with a non-integer exponent is 0: C's Newton sees a
-    // flat function there although pwr(-3.3, 2.5) = -19.78.
+fn negative_signed_power_has_its_physical_nonzero_slope() {
     let program = program("pwr(v(a) - 3, 2.5)");
     let evaluation = program.evaluate(&environment(&[-0.3])).unwrap();
     assert!((evaluation.value + 3.3_f64.powf(2.5)).abs() < 1e-12);
-    assert_eq!(evaluation.gradient[0], 0.);
+    assert!((evaluation.gradient[0] - 2.5 * 3.3_f64.powf(1.5)).abs() < 1e-12);
 }
 
 #[test]
-fn odd_powers_of_a_negative_base_keep_cs_derivative_sign() {
-    // PTdifferentiate assumes a^b = |a|^b and writes b pwr(a, b-1) a', but
-    // PTpowerH evaluates (-0.45)^3 as pow(-0.45, 3) < 0: the derivative has
-    // the wrong sign. The C binary's AC analysis of `v(in)**3` at -0.45 V
-    // reports -0.6075, and so does the port.
-    let program = program("v(a)**3");
-    let evaluation = program.evaluate(&environment(&[-0.45])).unwrap();
-    assert!((evaluation.value + 0.091_125).abs() < 1e-15);
-    assert!((evaluation.gradient[0] + 0.6075).abs() < 1e-15);
+fn power_partials_follow_actual_value_branches() {
+    for (expression, expected) in [
+        ("v(a)**3", 0.6075),
+        ("pow(v(a),3)", 0.6075),
+        ("v(a)^2", -0.9),
+        ("pow(v(a),2.5)", 0.),
+        ("pwr(v(a),2)", 0.9),
+        ("pwr(v(a),2.5)", 2.5 * 0.45_f64.powf(1.5)),
+        ("pow(v(a),v(b))", 0.6075),
+        ("pwr(v(a),v(b))", 0.6075),
+    ] {
+        let p = program(expression);
+        let point = BTreeMap::from([("a", -0.45), ("b", 3.)]);
+        let x = values(&p, &point);
+        let evaluation = p.evaluate(&environment(&x)).unwrap();
+        assert!(
+            (evaluation.gradient[0] - expected).abs() < 1e-14,
+            "{expression}: {:?}",
+            evaluation.gradient
+        );
+        if evaluation.gradient.len() == 2 {
+            let expected = if expression.starts_with("pwr") {
+                evaluation.value * 0.45_f64.ln()
+            } else {
+                0.
+            };
+            assert!(
+                (evaluation.gradient[1] - expected).abs() < 1e-14,
+                "{expression}"
+            );
+        }
+    }
 }
 
 #[test]

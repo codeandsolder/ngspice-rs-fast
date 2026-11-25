@@ -297,13 +297,9 @@ impl PlanBuilder {
         self.intern(Instruction::Ternary(condition, a, b))
     }
 
-    fn log_abs(&mut self, a: Slot) -> SpiceResult<Slot> {
-        let abs = self.unary(Unary::Abs, a)?;
-        self.unary(Unary::Log, abs)
-    }
-
-    // Ordinary/signed powers use opposite kernels for a constant exponent.
-    // Binary function construction (C mkf over a comma) never folds pairs.
+    // Differentiate the value kernel, not the historically mismatched
+    // C power/pwr symbolic derivative. The two partials also support
+    // arbitrary expressions for the base and exponent.
     fn power_derivative(
         &mut self,
         kernel: Binary,
@@ -312,32 +308,19 @@ impl PlanBuilder {
         da: Slot,
         db: Slot,
     ) -> SpiceResult<Slot> {
-        if let Some(exponent) = self.literal(b) {
-            let shifted = self.constant(exponent - 1.)?;
-            let inner = self.intern(Instruction::Binary(
-                if kernel == Binary::Pow {
-                    Binary::Pwr
-                } else {
-                    Binary::Pow
-                },
-                a,
-                shifted,
-            ))?;
-            let outer = self.times(b, inner)?;
-            return self.times(outer, da);
+        let (base, exponent) = if kernel == Binary::Pow {
+            (Binary::PowBaseSlope, Binary::PowExponentSlope)
+        } else {
+            (Binary::PwrBaseSlope, Binary::PwrExponentSlope)
+        };
+        let slope = self.intern(Instruction::Binary(base, a, b))?;
+        let left = self.times(slope, da)?;
+        if self.literal(db) == Some(0.) {
+            return Ok(left);
         }
-        let outer = self.intern(Instruction::Binary(kernel, a, b))?;
-        if kernel == Binary::Pow && self.literal(a).is_some() {
-            let log = self.log_abs(a)?;
-            let inner = self.times(db, log)?;
-            return self.times(outer, inner);
-        }
-        let div = self.over(da, a)?;
-        let left = self.times(b, div)?;
-        let log = self.log_abs(a)?;
-        let right = self.times(db, log)?;
-        let inner = self.operator(Operator::Plus, left, right)?;
-        self.times(outer, inner)
+        let slope = self.intern(Instruction::Binary(exponent, a, b))?;
+        let right = self.times(slope, db)?;
+        self.operator(Operator::Plus, left, right)
     }
 
     fn unary_slope(&mut self, op: Unary, u: Slot, zero: Slot) -> SpiceResult<Slot> {
@@ -455,6 +438,15 @@ impl PlanBuilder {
             Instruction::Binary(Binary::Pwr, a, b) => {
                 self.power_derivative(Binary::Pwr, a, b, da, db)
             }
+            Instruction::Binary(
+                Binary::PowBaseSlope
+                | Binary::PwrBaseSlope
+                | Binary::PowExponentSlope
+                | Binary::PwrExponentSlope,
+                ..,
+            ) => Err(crate::primitives::SpiceError::circuit(
+                "internal power derivative instruction in source plan",
+            )),
             Instruction::Ternary(c, ..) => self.ternary(c, da, db),
             Instruction::Binary(function @ (Binary::Min | Binary::Max), a, b) => {
                 let difference = self.operator(Operator::Minus, a, b)?;
