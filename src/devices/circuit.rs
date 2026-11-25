@@ -172,7 +172,7 @@ struct TopologyBindings {
     branch_rows: Vec<std::ops::Range<usize>>,
     convergence_kinds: Vec<crate::devices::ConvergenceKind>,
     private_storage_rows: Vec<(usize, usize)>,
-    regularization_exclusions: Vec<usize>,
+    regularization_nodes: Option<Vec<usize>>,
     control_rows: Vec<Vec<usize>>,
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
@@ -1427,20 +1427,31 @@ impl Circuit {
             .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect::<SpiceResult<_>>()?;
         self.bindings.private_storage_rows = self.bind_private_storage()?;
-        self.bindings.regularization_exclusions = self
+        self.bindings.regularization_nodes = self.bind_regularization_nodes();
+        self.bindings.mutual = self.resolve_mutual(names)?;
+        Ok(())
+    }
+
+    /// Mixed-unit constitutive systems require a physical nodal regularization.
+    ///
+    /// Unlike the legacy SPARSE internal diagonal, a conductance in an
+    /// original electrical KCL row cannot perturb a charge, flux or
+    /// derivative equation, regardless of numerical pivot permutations.
+    fn bind_regularization_nodes(&self) -> Option<Vec<usize>> {
+        use crate::devices::BranchQuantity;
+        let mixed = self
             .devices
             .iter()
             .zip(&self.bindings.branch_rows)
-            .flat_map(|(device, rows)| {
-                rows.clone().enumerate().filter_map(|(local, row)| {
-                    (device.branch_quantity(local) != crate::devices::BranchQuantity::Current)
-                        .then_some(row)
-                })
-            })
-            .collect();
-        self.bindings.regularization_exclusions.sort_unstable();
-        self.bindings.mutual = self.resolve_mutual(names)?;
-        Ok(())
+            .any(|(device, rows)| {
+                (0..rows.len())
+                    .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
+            });
+        mixed.then(|| {
+            self.physical_voltage_nodes()
+                .filter_map(|node| self.bindings.unknowns.node_row(node.id))
+                .collect()
+        })
     }
 
     /// Bind each private expression storage coordinate and its derivative
@@ -1990,7 +2001,10 @@ impl Circuit {
     /// same elements is kept, so its pivot order survives re-finalization
     /// (C sets a circuit up once).
     fn allocate_matrix(&mut self, order: Vec<usize>) -> SpiceResult<()> {
-        let elements = self.ordered_elements(&order, 0)?;
+        let mut elements = self.ordered_elements(&order, 0)?;
+        if let Some(rows) = &self.bindings.regularization_nodes {
+            elements.extend(rows.iter().map(|&row| (row, row)));
+        }
         self.bindings.order = order;
         let n = self.unknown_count();
         let mut slot = self.runtime.pattern.borrow_mut();
@@ -2363,8 +2377,8 @@ impl Circuit {
         self.runtime.continuation_diagonal.set(value);
     }
 
-    pub(crate) fn regularization_exclusions(&self) -> &[usize] {
-        &self.bindings.regularization_exclusions
+    pub(crate) fn regularization_nodes(&self) -> Option<&[usize]> {
+        self.bindings.regularization_nodes.as_deref()
     }
 
     pub(crate) fn private_storage_rows(&self) -> &[(usize, usize)] {
@@ -3444,7 +3458,7 @@ impl Circuit {
                 && a.branch_rows == b.branch_rows
                 && a.control_rows == b.control_rows
                 && a.private_storage_rows == b.private_storage_rows
-                && a.regularization_exclusions == b.regularization_exclusions
+                && a.regularization_nodes == b.regularization_nodes
                 && a.state_rows == b.state_rows
                 && self.nodes.nodes() == previous.nodes.nodes()
                 && self.devices.len() == previous.devices.len()
@@ -4586,6 +4600,28 @@ impl Circuit {
         Ok(circuit)
     }
 
+    /// Electrical voltage nodes, excluding solver-owned expression signals.
+    ///
+    /// A generated differentiator signal is a matrix coordinate, but its
+    /// row contains a constitutive equation rather than a physical KCL.
+    /// Its values also need not have voltage units.
+    pub(crate) fn physical_voltage_nodes(&self) -> impl Iterator<Item = &crate::primitives::Node> {
+        use crate::devices::InitialStorageRow;
+        let signals: BTreeSet<_> = self
+            .devices
+            .iter()
+            .filter_map(|device| device.initial_expression_storage())
+            .filter_map(|storage| match storage.gauge {
+                InitialStorageRow::Signal(node) => Some(node),
+                InitialStorageRow::Branch(_) => None,
+            })
+            .collect();
+        self.nodes.nodes().iter().filter(move |node| {
+            matches!(node.kind, NodeKind::Terminal | NodeKind::Internal)
+                && !signals.contains(&node.id)
+        })
+    }
+
     /// C `INPpas4` adds capacitors to parsed voltage nodes before device
     /// setup; `CKTsetup`'s rshunt adds noiseless conductance to all voltage
     /// nodes after setup. Branch-current and private storage coordinates
@@ -4604,12 +4640,9 @@ impl Circuit {
             .iter()
             .map(|device| device.name().to_ascii_lowercase())
             .collect();
-        let nodes = self.nodes.nodes();
+        let nodes: Vec<_> = self.physical_voltage_nodes().collect();
         let resistors = if shunts.resistance.is_some() {
-            nodes
-                .iter()
-                .filter(|node| matches!(node.kind, NodeKind::Terminal | NodeKind::Internal))
-                .count()
+            nodes.len()
         } else {
             0
         };
@@ -4646,9 +4679,7 @@ impl Circuit {
         };
         for node in nodes {
             let terminals = [node.id, NodeId::GROUND];
-            if let Some(resistance) = shunts.resistance
-                && matches!(node.kind, NodeKind::Terminal | NodeKind::Internal)
-            {
+            if let Some(resistance) = shunts.resistance {
                 devices.push(Box::new(
                     Resistor::new(
                         unique(format!("r__rshunt_{}", node.id.index())),

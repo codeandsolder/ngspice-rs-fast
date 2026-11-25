@@ -32,15 +32,7 @@ fn rhs() -> Vector {
 }
 
 fn solve(pattern: &Arc<Pattern>, values: &[f64; 7], reorder: bool, gmin: f64) -> Vec<f64> {
-    match solve_ni(
-        &bound(pattern, values),
-        &rhs(),
-        &mut None,
-        reorder,
-        ngspice_rs::maths::DiagonalGmin::unrestricted(gmin),
-    )
-    .unwrap()
-    {
+    match solve_ni(&bound(pattern, values), &rhs(), &mut None, reorder, gmin).unwrap() {
         NiStep::Solved(x) => x.as_slice().to_vec(),
         NiStep::ZeroPivot => panic!("zero pivot"),
     }
@@ -100,63 +92,6 @@ fn a_changed_diagonal_gmin_refactors() {
     let x = solve(&p, &A, false, 0.25);
     assert!(residual(&A, 0.25, &x) < 1e-15, "{x:?}");
     assert!(residual(&A, 0.0, &x) > 1e-3);
-}
-
-#[test]
-fn protected_diagonal_coordinates_invalidate_factors_and_survive_mna_permutation() {
-    use ngspice_rs::maths::DiagonalGmin;
-    let p = pattern();
-    let run = |protected: &[usize]| {
-        let NiStep::Solved(x) = solve_ni(
-            &bound(&p, &A),
-            &rhs(),
-            &mut None,
-            false,
-            DiagonalGmin {
-                conductance: 0.25,
-                protected,
-            },
-        )
-        .unwrap() else {
-            panic!("unexpected zero pivot")
-        };
-        x
-    };
-    let _ = run(&[]);
-    let unrestricted = run(&[]);
-    let protected = run(&[1]);
-    assert_ne!(unrestricted, protected);
-    let x = protected.as_slice();
-    let mut rows = rhs().as_slice().iter().map(|v| -*v).collect::<Vec<_>>();
-    for (&(r, c), &v) in POSITIONS.iter().zip(&A) {
-        rows[r] += v * x[c];
-    }
-    for r in [0, 2] {
-        rows[r] += 0.25 * x[r];
-    }
-    assert!(rows.iter().all(|r| r.abs() < 1e-14), "{rows:?}");
-    assert_eq!(run(&[1]), protected);
-
-    // MNA preorder swaps the columns of this off-diagonal constraint.
-    // Protecting original coordinate 1 must protect both diagonal entries.
-    let mut matrix = SparseMatrix::new(2, 2);
-    matrix.add(0, 1, 1.).unwrap();
-    matrix.add(1, 0, 1.).unwrap();
-    let b = Vector::from_slice(&[3., 7.]);
-    let NiStep::Solved(x) = solve_ni(
-        &matrix,
-        &b,
-        &mut None,
-        true,
-        DiagonalGmin {
-            conductance: 0.5,
-            protected: &[1],
-        },
-    )
-    .unwrap() else {
-        panic!("unexpected zero pivot")
-    };
-    assert_eq!(x.as_slice(), &[7., 3.]);
 }
 
 #[test]
@@ -272,25 +207,11 @@ fn zero_pivot_search_and_failed_factors_are_measured_not_counted_as_success() {
     let changed = two_by_two(&p, [0., 2., 1., 0.]);
     let mut old = None;
     assert!(matches!(
-        solve_ni(
-            &initial,
-            &rhs,
-            &mut old,
-            true,
-            ngspice_rs::maths::DiagonalGmin::unrestricted(0.)
-        )
-        .unwrap(),
+        solve_ni(&initial, &rhs, &mut old, true, 0.).unwrap(),
         NiStep::Solved(_)
     ));
     assert!(matches!(
-        solve_ni(
-            &changed,
-            &rhs,
-            &mut old,
-            false,
-            ngspice_rs::maths::DiagonalGmin::unrestricted(0.)
-        )
-        .unwrap(),
+        solve_ni(&changed, &rhs, &mut old, false, 0.).unwrap(),
         NiStep::ZeroPivot
     ));
     let failed = p.factor_telemetry();
@@ -300,14 +221,7 @@ fn zero_pivot_search_and_failed_factors_are_measured_not_counted_as_success() {
     assert_eq!(failed.work.rhs_solves, 1);
     assert!(failed.storage.is_none());
 
-    let NiStep::Solved(x) = solve_ni(
-        &changed,
-        &rhs,
-        &mut old,
-        true,
-        ngspice_rs::maths::DiagonalGmin::unrestricted(0.),
-    )
-    .unwrap() else {
+    let NiStep::Solved(x) = solve_ni(&changed, &rhs, &mut old, true, 0.).unwrap() else {
         panic!("threshold reorder did not recover the nonsingular matrix");
     };
     assert_eq!(x.as_slice(), [1., 1.]);
@@ -319,32 +233,14 @@ fn zero_pivot_search_and_failed_factors_are_measured_not_counted_as_success() {
     assert_eq!(changed.nnz(), 2);
 
     let singular = two_by_two(&p, [0.; 4]);
-    assert!(
-        solve_ni(
-            &singular,
-            &rhs,
-            &mut old,
-            true,
-            ngspice_rs::maths::DiagonalGmin::unrestricted(0.)
-        )
-        .is_err()
-    );
+    assert!(solve_ni(&singular, &rhs, &mut old, true, 0.).is_err());
     let failed = p.factor_telemetry();
     assert_eq!(failed.work.factor.successful_factors, 2);
     assert_eq!(failed.work.factor.singular_failures, 1);
     assert!(failed.storage.is_none());
 
     let nonfinite = two_by_two(&p, [f64::NAN, 1., 1., 1.]);
-    assert!(
-        solve_ni(
-            &nonfinite,
-            &rhs,
-            &mut old,
-            true,
-            ngspice_rs::maths::DiagonalGmin::unrestricted(0.)
-        )
-        .is_err()
-    );
+    assert!(solve_ni(&nonfinite, &rhs, &mut old, true, 0.).is_err());
     let rejected = p.factor_telemetry();
     assert_eq!(rejected.work.factor.assembly_rejections, 1);
     assert_eq!(rejected.work.factor.successful_factors, 2);
@@ -354,46 +250,21 @@ fn zero_pivot_search_and_failed_factors_are_measured_not_counted_as_success() {
     // A tiny raw pivot alone is not: it may only make a particular
     // RHS solution unrepresentable.
     let overflow = two_by_two(&p, [f64::MAX, f64::MAX, f64::MAX, -f64::MAX]);
-    assert!(
-        solve_ni(
-            &overflow,
-            &rhs,
-            &mut old,
-            true,
-            ngspice_rs::maths::DiagonalGmin::unrestricted(0.)
-        )
-        .is_err()
-    );
+    assert!(solve_ni(&overflow, &rhs, &mut old, true, 0.).is_err());
     let nonfinite = p.factor_telemetry();
     assert_eq!(nonfinite.work.factor.nonfinite_failures, 1);
     assert_eq!(nonfinite.work.factor.successful_factors, 2);
     assert!(nonfinite.storage.is_none());
 
     let tiny = two_by_two(&p, [f64::from_bits(1), 0., 0., 1.]);
-    assert!(
-        solve_ni(
-            &tiny,
-            &rhs,
-            &mut old,
-            true,
-            ngspice_rs::maths::DiagonalGmin::unrestricted(0.)
-        )
-        .is_err()
-    );
+    assert!(solve_ni(&tiny, &rhs, &mut old, true, 0.).is_err());
     let valid_factors = p.factor_telemetry();
     assert_eq!(valid_factors.work.factor.nonfinite_failures, 1);
     assert_eq!(valid_factors.work.factor.successful_factors, 3);
     assert_eq!(valid_factors.work.rhs_failures, 1);
     assert!(valid_factors.storage.is_some());
     let representable = Vector::from_slice(&[f64::from_bits(1), 1.]);
-    let NiStep::Solved(x) = solve_ni(
-        &tiny,
-        &representable,
-        &mut old,
-        false,
-        ngspice_rs::maths::DiagonalGmin::unrestricted(0.),
-    )
-    .unwrap() else {
+    let NiStep::Solved(x) = solve_ni(&tiny, &representable, &mut old, false, 0.).unwrap() else {
         panic!("valid small-pivot factors failed to solve a representable RHS");
     };
     assert_eq!(x.as_slice(), &[1., 1.]);
@@ -464,14 +335,7 @@ fn missing_translated_unknown_never_publishes_partial_factor_storage() {
     for _ in 0..2 {
         let error = SparseLu::new(&matrix, None).unwrap_err();
         assert!(error.to_string().contains("no matrix entries"));
-        let error = solve_ni(
-            &matrix,
-            &rhs,
-            &mut None,
-            false,
-            ngspice_rs::maths::DiagonalGmin::unrestricted(0.),
-        )
-        .unwrap_err();
+        let error = solve_ni(&matrix, &rhs, &mut None, false, 0.).unwrap_err();
         assert!(error.to_string().contains("no matrix entries"));
         let telemetry = pattern.factor_telemetry();
         assert_eq!(telemetry.storage, None);

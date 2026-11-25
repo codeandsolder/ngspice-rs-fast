@@ -201,7 +201,6 @@ pub fn solve_counted_limited<T>(
         Phases {
             coordinate_kinds: None,
             private_storage: &[],
-            regularization_exclusions: &[],
             first: IterationPhase::Junction,
             previous: None,
             nonconvergent: |_: &T| false,
@@ -279,7 +278,6 @@ pub fn solve_phased(
         branch_rows,
         None,
         &[],
-        &[],
         limited_rows,
         options,
         policy,
@@ -305,7 +303,6 @@ fn solve_phased_into(
     branch_rows: &[bool],
     coordinate_kinds: Option<&[crate::devices::ConvergenceKind]>,
     private_storage: &[(usize, usize)],
-    regularization_exclusions: &[usize],
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
     policy: PhasePolicy,
@@ -332,7 +329,6 @@ fn solve_phased_into(
         Phases {
             coordinate_kinds,
             private_storage,
-            regularization_exclusions,
             first,
             previous: continued,
             nonconvergent: TrialState::is_nonconvergent,
@@ -417,8 +413,17 @@ impl CircuitNewton<'_, '_> {
                     Some(&mut **attempt),
                 ),
             };
-        let options = self.options;
         let circuit = prepared.circuit();
+        let nodal_regularization = circuit.regularization_nodes();
+        let gmin = self.options.diag_gmin;
+        let options = NewtonOptions {
+            diag_gmin: if nodal_regularization.is_some() && gmin.is_finite() && gmin >= 0. {
+                0.
+            } else {
+                gmin
+            },
+            ..*self.options
+        };
         solve_phased_into(
             initial,
             self.branch_rows,
@@ -428,9 +433,8 @@ impl CircuitNewton<'_, '_> {
             } else {
                 &[]
             },
-            circuit.regularization_exclusions(),
             self.limited_rows,
-            options,
+            &options,
             policy,
             continued,
             &mut self.workspace.load,
@@ -465,6 +469,13 @@ impl CircuitNewton<'_, '_> {
                         rhs,
                         &mut trial,
                     )?;
+                }
+                if let Some(rows) = nodal_regularization
+                    && gmin > 0.
+                {
+                    for &row in rows {
+                        matrix.add(row, row, gmin)?;
+                    }
                 }
                 after_load(phase, matrix, rhs)?;
                 Ok(trial)
@@ -578,7 +589,6 @@ impl LoadStorage<TrialState> {
 struct Phases<'a, T, F> {
     coordinate_kinds: Option<&'a [crate::devices::ConvergenceKind]>,
     private_storage: &'a [(usize, usize)],
-    regularization_exclusions: &'a [usize],
     first: IterationPhase,
     previous: Option<T>,
     nonconvergent: F,
@@ -749,16 +759,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         if phase == IterationPhase::Junction {
             reorder = true;
         }
-        let mut next = match linearised_solve(
-            matrix,
-            rhs,
-            &mut ordering,
-            reorder,
-            crate::maths::DiagonalGmin {
-                conductance: options.diag_gmin,
-                protected: phases.regularization_exclusions,
-            },
-        )? {
+        let mut next = match linearised_solve(matrix, rhs, &mut ordering, reorder, options)? {
             crate::maths::NiStep::Solved(next) => {
                 reorder = false;
                 next
@@ -902,9 +903,9 @@ fn linearised_solve(
     rhs: &Vector,
     ordering: &mut Option<crate::maths::SparseSymbolic>,
     reorder: bool,
-    regularization: crate::maths::DiagonalGmin<'_>,
+    options: &NewtonOptions,
 ) -> SpiceResult<crate::maths::NiStep> {
-    crate::maths::solve_ni(matrix, rhs, ordering, reorder, regularization)
+    crate::maths::solve_ni(matrix, rhs, ordering, reorder, options.diag_gmin)
 }
 
 fn check(matrix: &SparseMatrix, rhs: &Vector, n: usize) -> SpiceResult<()> {

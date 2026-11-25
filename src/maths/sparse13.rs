@@ -2316,21 +2316,14 @@ impl<T: Scalar> Sparse<T> {
     /// `LoadGmin` (`spsmp.c`): adds `gmin` to the real part of every
     /// internal diagonal element (after the MNA preorder's column swaps, so a
     /// voltage source's twin can be one), from the last row to the first.
-    pub(crate) fn load_gmin(&mut self, gmin: f64, protected: &[usize]) {
+    pub(crate) fn load_gmin(&mut self, gmin: f64) {
         if gmin == 0.0 {
             return;
         }
         self.note_numeric_write();
         for i in (1..=self.size).rev() {
             let diag = self.topology.diag[i];
-            if diag != NONE
-                && protected
-                    .binary_search(&(self.topology.int_to_ext_row[i] - 1))
-                    .is_err()
-                && protected
-                    .binary_search(&(self.topology.int_to_ext_col[i] - 1))
-                    .is_err()
-            {
+            if diag != NONE {
                 self.values[diag] = self.values[diag].add_real(gmin);
             }
         }
@@ -4143,7 +4136,7 @@ mod tests {
         let edits: [fn(&mut Sparse<f64>, SolverElement); 6] = [
             |frame: &mut Sparse<f64>, h| frame.set(h, 1.),
             |frame: &mut Sparse<f64>, h| frame.add(h, 1.),
-            |frame: &mut Sparse<f64>, _| frame.load_gmin(1., &[]),
+            |frame: &mut Sparse<f64>, _| frame.load_gmin(1.),
             |frame: &mut Sparse<f64>, _| frame.zero_col(1).unwrap(),
             |frame: &mut Sparse<f64>, _| frame.add_col(1, 2).unwrap(),
             |frame: &mut Sparse<f64>, _| frame.clear(),

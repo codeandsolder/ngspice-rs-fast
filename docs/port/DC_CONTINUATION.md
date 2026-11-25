@@ -208,8 +208,9 @@ which `dynamic_gmin`/`new_gmin` approach and `spice3_gmin` starts from.
   it as its seed when nonzero; adaptive recovery targets `max(gmin,gshunt)`.
   The completed real solve retains the diagonal on the same circuit/task
   (candidate resets and independent decks clear it); AC complex factorization
-  does not apply it. Auxiliary constitutive coordinates are protected even
-  after row/column permutations, unlike ordinary SPICE MNA coordinates.
+  does not apply it. Mixed-unit constitutive systems instead use stable original electrical
+  KCL diagonals, never auxiliary equations or solver-owned signal nodes.
+  Numeric reordering cannot change the physical regularization in those systems.
 - **Not ported**: `.options oldlimit` (`CKTfixLimit`), the front-end
   `dyngmin` variable (skip `new_gmin`), BJT quasi-saturation limiting (the
   quasi-saturation model itself is rejected), `OFF`/`IC` instance start values

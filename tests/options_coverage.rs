@@ -245,6 +245,107 @@ fn gshunt_is_continuation_regularization_not_a_physical_resistor() {
 }
 
 #[test]
+fn persistent_gshunt_preserves_the_entire_charge_constitutive_block() {
+    // The first branch coordinate is a current, but its equation is
+    // Q=f(V). A diagonal perturbation of that equation changes a physical
+    // charge and causes the derivative consistency check to reject steps.
+    for law in ["1u*v(out)", "1u*(v(out)+v(out)^2)"] {
+        for method in ["trap", "gear"] {
+            for steps in [1, 2] {
+                let plot = simulate(&format!(
+                    "v1 in 0 sin(1 0.1 1k)\nr1 in out 1k\nc1 out 0 q={{{law}}}\n.options gshunt=1u noopiter gminsteps={steps} method={method} reltol=1e-6 vntol=1n\n.tran 5u 50u 0 5u"
+                ))
+                .unwrap();
+                assert!(plot.point_count() >= 10);
+                close(
+                    plot.value("time", plot.point_count() - 1).unwrap().re,
+                    50e-6,
+                    1e-12,
+                    0.,
+                );
+                for point in 0..plot.point_count() {
+                    let v = plot.value("v(out)", point).unwrap().re;
+                    let expected = if law.contains("^2") {
+                        1e-6 * (v + v * v)
+                    } else {
+                        1e-6 * v
+                    };
+                    close(
+                        plot.value("q(c1)", point).unwrap().re,
+                        expected,
+                        1e-6,
+                        1e-14,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_unit_regularization_keeps_differentiator_laws_and_source_voltage() {
+    for method in ["trap", "gear"] {
+        for source in ["dc 2.1", "sin(2 0.1 1k 0 0 90)"] {
+            let plot = simulate(&format!(
+                "v1 in 0 {source}\nb1 y 0 v=1m*ddt(v(in)^2)\nr1 y 0 1k\n.options gshunt=1u noopiter gminsteps=1 method={method} reltol=1e-6 vntol=1n\n.tran 5u 50u 0 5u"
+            )).unwrap();
+            for point in 0..plot.point_count() {
+                let t = plot.value("time", point).unwrap().re;
+                let v = plot.value("v(in)", point).unwrap().re;
+                let expected = if source.starts_with("dc") {
+                    2.1
+                } else {
+                    2. + 0.1 * (std::f64::consts::TAU * 1000. * t).cos()
+                };
+                close(v, expected, 1e-10, 1e-10);
+                close(
+                    plot.value("i(v1)", point).unwrap().re,
+                    -1e-6 * v,
+                    1e-6,
+                    1e-12,
+                );
+                close(
+                    plot.value("state(b__dynamic_0,0)", point).unwrap().re,
+                    v * v,
+                    1e-6,
+                    1e-12,
+                );
+            }
+            let last = plot.point_count() - 1;
+            close(plot.value("time", last).unwrap().re, 50e-6, 1e-12, 0.);
+        }
+    }
+}
+
+#[test]
+fn physical_shunts_never_load_solver_owned_derivative_signals() {
+    let circuit = "v1 in 0 sin(2 0.1 1k 0 0 90)\nb1 y 0 v=1m*ddt(v(in)^2)\nr1 y 0 1k";
+    for method in ["trap", "gear"] {
+        let analysis =
+            format!(".options method={method} reltol=1e-6 vntol=1n newtrunc\n.tran 5u 50u 0 5u");
+        let generated = simulate(&format!(
+            "{circuit}\n.options rshunt=1k cshunt=1n\n{analysis}"
+        ))
+        .unwrap();
+        let explicit = simulate(&format!(
+            "{circuit}\nrsh1 in 0 1k\nrsh2 y 0 1k\ncsh1 in 0 1n\ncsh2 y 0 1n\n{analysis}"
+        ))
+        .unwrap();
+        assert_eq!(generated.point_count(), explicit.point_count());
+        for point in 0..generated.point_count() {
+            for variable in ["time", "v(in)", "v(y)", "i(v1)", "state(b__dynamic_0,0)"] {
+                close(
+                    generated.value(variable, point).unwrap().re,
+                    explicit.value(variable, point).unwrap().re,
+                    1e-8,
+                    1e-12,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn voltage_lte_controls_add_a_predictor_bound_without_removing_charge_control() {
     let circuit = "v1 in 0 sin(0 1 1k)\nr1 in out 1k\nc1 out 0 1u";
     let analysis = ".tran 20u 2m 0 20u";

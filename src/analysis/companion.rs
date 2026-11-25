@@ -677,15 +677,7 @@ struct VoltageHistory {
 impl VoltageHistory {
     fn new(circuit: &Circuit, options: crate::analysis::plan::VoltageLte) -> Self {
         let rows = circuit
-            .nodes()
-            .nodes()
-            .iter()
-            .filter(|node| {
-                matches!(
-                    node.kind,
-                    crate::primitives::NodeKind::Terminal | crate::primitives::NodeKind::Internal
-                )
-            })
+            .physical_voltage_nodes()
             .filter_map(|node| circuit.unknowns().node_row(node.id))
             .collect();
         Self {
