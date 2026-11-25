@@ -9,7 +9,7 @@ use std::borrow::Cow;
 ///
 /// This preserves all non-ASCII bytes and performs no allocation on the
 /// already-canonical fast path.
-#[must_use]
+#[must_use = "the returned folded spelling is the case-insensitive lookup key"]
 pub fn folded(name: &str) -> Cow<'_, str> {
     if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
         Cow::Owned(name.to_ascii_lowercase())

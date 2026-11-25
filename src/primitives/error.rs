@@ -30,7 +30,7 @@ pub struct SourceLoc {
 
 impl SourceLoc {
     /// Builds a location.
-    #[must_use]
+    #[must_use = "the constructed location associates diagnostics with the source coordinate"]
     pub fn new(file: impl Into<Arc<PathBuf>>, line: u32, column: usize) -> Self {
         Self {
             file: file.into(),
@@ -40,13 +40,13 @@ impl SourceLoc {
     }
 
     /// The file this location points into.
-    #[must_use]
+    #[must_use = "the path identifies the diagnostic source file"]
     pub fn path(&self) -> &Path {
         self.file.as_path()
     }
 
     /// The same location, moved to a different column.
-    #[must_use]
+    #[must_use = "the returned location carries the new diagnostic column"]
     pub fn at_column(&self, column: usize) -> Self {
         Self {
             file: Arc::clone(&self.file),
@@ -126,7 +126,7 @@ pub enum SpiceError {
 
 impl SpiceError {
     /// Wraps an I/O error with the path it happened on.
-    #[must_use]
+    #[must_use = "the constructed error preserves the failing path and operating system diagnostic"]
     pub fn io(path: impl AsRef<Path>, error: &std::io::Error) -> Self {
         Self::Io {
             path: path.as_ref().to_path_buf(),
@@ -135,7 +135,7 @@ impl SpiceError {
     }
 
     /// Builds a parse error.
-    #[must_use]
+    #[must_use = "the constructed error preserves the parse location and message"]
     pub fn parse(location: SourceLoc, message: impl Into<String>) -> Self {
         Self::Parse {
             location,
@@ -144,7 +144,7 @@ impl SpiceError {
     }
 
     /// Builds a [`SpiceError::NotYetPorted`].
-    #[must_use]
+    #[must_use = "the constructed error records the unsupported operation and reference"]
     pub fn not_yet_ported(what: impl Into<String>, c_reference: impl Into<String>) -> Self {
         Self::NotYetPorted {
             what: what.into(),
@@ -153,13 +153,13 @@ impl SpiceError {
     }
 
     /// True when this error only means "not implemented yet".
-    #[must_use]
+    #[must_use = "the predicate distinguishes an unimplemented capability from other failures"]
     pub const fn is_not_yet_ported(&self) -> bool {
         matches!(self, Self::NotYetPorted { .. })
     }
 
     /// Builds a [`SpiceError::Circuit`].
-    #[must_use]
+    #[must_use = "the constructed error carries the circuit failure diagnostic"]
     pub fn circuit(message: impl Into<String>) -> Self {
         Self::Circuit {
             message: message.into(),

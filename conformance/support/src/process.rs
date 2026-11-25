@@ -52,7 +52,7 @@ fn transcript(stdout: &[u8], stderr: &[u8]) -> String {
 
 impl ProcessOutput {
     /// Lossy text view for diagnostics, retaining separate streams.
-    #[must_use]
+    #[must_use = "the combined transcript contains the subprocess diagnostic evidence"]
     pub fn transcript(&self) -> String {
         transcript(&self.stdout, &self.stderr)
     }

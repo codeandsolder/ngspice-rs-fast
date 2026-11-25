@@ -35,7 +35,7 @@ impl Analysis {
     }
 
     /// Recognizes the corresponding netlist analysis keyword.
-    #[must_use]
+    #[must_use = "the parsed analysis selects the measurement evaluation domain"]
     pub fn keyword(text: &str) -> Option<Self> {
         match text {
             "dc" => Some(Self::Dc),

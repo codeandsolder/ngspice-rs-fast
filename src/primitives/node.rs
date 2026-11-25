@@ -33,7 +33,7 @@ impl NodeId {
     pub const GROUND: Self = Self(0);
 
     /// Builds an id from a raw index.
-    #[must_use]
+    #[must_use = "the returned compact identity identifies the selected node"]
     pub const fn new(index: u32) -> Self {
         Self(index)
     }
@@ -49,7 +49,7 @@ impl NodeId {
     }
 
     /// The raw index, for use as a row/column in the MNA matrix.
-    #[must_use]
+    #[must_use = "the returned index addresses the node table"]
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -78,7 +78,7 @@ pub enum NodeKind {
 
 impl NodeKind {
     /// Whether this node contributes a row/column to the MNA matrix.
-    #[must_use]
+    #[must_use = "the predicate determines whether the node needs an MNA unknown"]
     pub const fn is_unknown(self) -> bool {
         !matches!(self, Self::Ground)
     }
@@ -110,7 +110,7 @@ pub struct NodeTable {
 
 impl NodeTable {
     /// Creates a table containing only ground, with `gnd` aliasing enabled.
-    #[must_use]
+    #[must_use = "the returned table establishes the initial ground identity"]
     pub fn new() -> Self {
         Self::with_auto_gnd(true)
     }
@@ -119,7 +119,7 @@ impl NodeTable {
     ///
     /// With `auto_gnd` disabled, `gnd` is an ordinary node name, matching
     /// ngspice when `no_auto_gnd` is set.
-    #[must_use]
+    #[must_use = "the returned table establishes the requested ground-alias policy"]
     pub fn with_auto_gnd(auto_gnd: bool) -> Self {
         let ground = Node {
             id: NodeId::GROUND,
@@ -136,14 +136,14 @@ impl NodeTable {
     }
 
     /// Whether `gnd` is aliased to ground.
-    #[must_use]
+    #[must_use = "the predicate determines whether the ground alias is enabled"]
     pub const fn auto_gnd(&self) -> bool {
         self.auto_gnd
     }
 
     /// The canonical spelling of a node name: lowercased, with `gnd` folded into
     /// `0` when aliasing is on.
-    #[must_use]
+    #[must_use = "the returned canonical spelling is the electrical node lookup key"]
     pub fn canonical_name(name: &str, auto_gnd: bool) -> String {
         Self::canonical(name, auto_gnd).into_owned()
     }
@@ -256,26 +256,26 @@ impl NodeTable {
     }
 
     /// Looks up a node without creating it.
-    #[must_use]
+    #[must_use = "the lookup result identifies an existing node without interning it"]
     pub fn get(&self, name: &str) -> Option<NodeId> {
         let canonical = Self::canonical(name, self.auto_gnd);
         self.index.get(canonical.as_ref()).copied()
     }
 
     /// The node with this id.
-    #[must_use]
+    #[must_use = "the lookup result contains the node metadata for the given identity"]
     pub fn node(&self, id: NodeId) -> Option<&Node> {
         self.nodes.get(id.index())
     }
 
     /// Every node, ground first.
-    #[must_use]
+    #[must_use = "the returned slice enumerates the circuit nodes in identity order"]
     pub fn nodes(&self) -> &[Node] {
         &self.nodes
     }
 
     /// Number of nodes, including ground.
-    #[must_use]
+    #[must_use = "the count bounds node table indexing and rollback"]
     pub const fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -289,13 +289,13 @@ impl NodeTable {
     }
 
     /// True when the table holds nothing but ground.
-    #[must_use]
+    #[must_use = "the predicate indicates whether the table contains any non-ground nodes"]
     pub const fn is_empty(&self) -> bool {
         self.nodes.len() <= 1
     }
 
     /// Number of unknowns the MNA matrix needs for these nodes.
-    #[must_use]
+    #[must_use = "the count determines the number of nodal MNA unknowns"]
     pub fn unknown_count(&self) -> usize {
         self.nodes
             .iter()

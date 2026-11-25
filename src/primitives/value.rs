@@ -39,7 +39,7 @@ pub type Real = f64;
 
 /// Compares two reals with a relative tolerance, falling back to an absolute one
 /// near zero.
-#[must_use]
+#[must_use = "the predicate determines whether values agree within relative tolerance"]
 pub fn approx_eq(a: Real, b: Real, relative_tolerance: Real) -> bool {
     if a == b {
         return true;
@@ -54,7 +54,7 @@ pub fn approx_eq(a: Real, b: Real, relative_tolerance: Real) -> bool {
 /// ngspice's `AlmostEqualUlps(a, b, max_ulps)` (`src/maths/misc/equality.c`):
 /// `a == b`, or the two's-complement-ordered bit patterns of `a` and `b` are at
 /// most `max_ulps` apart.
-#[must_use]
+#[must_use = "the predicate determines whether values agree within the ULP budget"]
 pub fn almost_equal_ulps(a: Real, b: Real, max_ulps: i64) -> bool {
     // The ordered mapping already makes equal values, including both signed
     // zeros, zero ULPs apart.
@@ -83,37 +83,37 @@ impl Complex {
     pub const ZERO: Self = Self { re: 0.0, im: 0.0 };
 
     /// Builds a complex number.
-    #[must_use]
+    #[must_use = "the constructed value contains the supplied real and imaginary components"]
     pub const fn new(re: Real, im: Real) -> Self {
         Self { re, im }
     }
 
     /// A purely real value.
-    #[must_use]
+    #[must_use = "the constructed value represents a real scalar in complex arithmetic"]
     pub const fn real(re: Real) -> Self {
         Self { re, im: 0.0 }
     }
 
     /// A purely imaginary value.
-    #[must_use]
+    #[must_use = "the constructed value represents an imaginary scalar in complex arithmetic"]
     pub const fn imaginary(im: Real) -> Self {
         Self { re: 0.0, im }
     }
 
     /// `sqrt(re^2 + im^2)`.
-    #[must_use]
+    #[must_use = "the magnitude is the computed amplitude of the complex value"]
     pub fn magnitude(self) -> Real {
         self.re.hypot(self.im)
     }
 
     /// The argument in radians.
-    #[must_use]
+    #[must_use = "the phase is the computed complex argument in radians"]
     pub fn phase(self) -> Real {
         self.im.atan2(self.re)
     }
 
     /// The complex conjugate.
-    #[must_use]
+    #[must_use = "the returned conjugate reverses the imaginary component"]
     pub const fn conj(self) -> Self {
         Self {
             re: self.re,
@@ -122,13 +122,13 @@ impl Complex {
     }
 
     /// True when both parts are finite.
-    #[must_use]
+    #[must_use = "the predicate detects nonfinite complex components"]
     pub const fn is_finite(self) -> bool {
         self.re.is_finite() && self.im.is_finite()
     }
 
     /// True when the imaginary part is zero.
-    #[must_use]
+    #[must_use = "the predicate determines whether the imaginary component vanishes"]
     pub fn is_real(self) -> bool {
         self.im == 0.0
     }
@@ -576,7 +576,7 @@ fn decimal_prefix(input: &str, dialect: LiteralDialect) -> Option<ParsedNumber> 
 ///
 /// The full MEG/MIL suffix is consumed, unlike C's internal rest pointer.
 /// A marker without exponent digits is left for the caller.
-#[must_use]
+#[must_use = "the parsed prefix contains the scaled value and consumed source length"]
 pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
     decimal_prefix(input, LiteralDialect::Spice)
 }
@@ -587,14 +587,14 @@ pub fn parse_spice_number_prefix(input: &str) -> Option<ParsedNumber> {
 /// and MIL means milli, not thousandths of an inch. The scale is applied
 /// before correct rounding, but consumed counts just the numeric part;
 /// the expression parser swallows trailing unit letters separately.
-#[must_use]
+#[must_use = "the parsed prefix contains the numparam value and consumed source length"]
 pub fn parse_numparam_number_prefix(input: &str) -> Option<ParsedNumber> {
     decimal_prefix(input, LiteralDialect::Numparam)
 }
 
 /// A complete numparam number ([`parse_numparam_number_prefix`]) followed by
 /// nothing but unit letters, which `fetchnumber()` swallows.
-#[must_use]
+#[must_use = "the parsed value preserves numparam literal validation"]
 pub fn parse_numparam_number(input: &str) -> Option<Real> {
     let trimmed = input.trim();
     let parsed = parse_numparam_number_prefix(trimmed)?;
@@ -614,7 +614,7 @@ pub fn parse_numparam_number(input: &str) -> Option<Real> {
 /// The RKM-style literals accepted by `inp2r.c`, `inp2c.c` and `inp2l.c` — `4k7`
 /// for `4.7k`, `2M2` for `2.2M` — are **not** handled, and this function returns
 /// `None` for them. See `docs/port/ARCHITECTURE.md` for the divergence record.
-#[must_use]
+#[must_use = "the parsed value preserves SPICE literal and suffix validation"]
 pub fn parse_spice_number(input: &str) -> Option<Real> {
     let trimmed = input.trim_start();
     let parsed = parse_spice_number_prefix(trimmed)?;
@@ -631,7 +631,7 @@ pub fn parse_spice_number(input: &str) -> Option<Real> {
 ///
 /// `5.0` becomes `5.000000000000000e+00` and `-2.5e-3` becomes
 /// `-2.500000000000000e-03`, matching `src/frontend/rawfile.c`.
-#[must_use]
+#[must_use = "the returned representation preserves the numerical value for SPICE output"]
 pub fn format_spice_number(value: Real) -> String {
     let text = format!("{value:.15e}");
     let Some((mantissa, exponent)) = text.split_once('e') else {

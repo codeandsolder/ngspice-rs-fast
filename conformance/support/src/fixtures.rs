@@ -20,7 +20,7 @@ pub const REFERENCE_INPUT_DIR: &str = "conformance/reference-inputs";
 pub const GOLDEN_DIR: &str = "conformance/golden";
 
 /// Find the conformance workspace above a runtime directory.
-#[must_use]
+#[must_use = "locating fixtures requires the discovered workspace root"]
 pub fn workspace_root_from(directory: &Path) -> Option<PathBuf> {
     directory
         .ancestors()
@@ -51,7 +51,7 @@ pub fn workspace_root() -> Result<PathBuf, String> {
 /// Resolve the capture scratch root beneath the configured Cargo target directory.
 ///
 /// Relative target directories are interpreted relative to the workspace.
-#[must_use]
+#[must_use = "golden scratch output must use the returned directory"]
 pub fn scratch_directory(root: &Path, target: Option<&Path>) -> PathBuf {
     root.join(target.unwrap_or_else(|| Path::new("target")))
         .join("xtask/golden")
@@ -143,7 +143,7 @@ pub struct DeckInputs<'a> {
 
 impl<'a> DeckInputs<'a> {
     /// Use the same explicit ad-hoc deck on both sides.
-    #[must_use]
+    #[must_use = "the paired inputs determine which deck each engine receives"]
     pub const fn same(text: &'a str) -> Self {
         Self {
             original: Cow::Borrowed(text),
@@ -152,20 +152,20 @@ impl<'a> DeckInputs<'a> {
     }
 
     /// Text supplied to Rust.
-    #[must_use]
+    #[must_use = "the returned text is the Rust engine input"]
     pub fn rust(&self) -> &str {
         &self.original
     }
 
     /// Text supplied to the C executable.
-    #[must_use]
+    #[must_use = "the returned text is the reference engine input"]
     pub fn reference(&self) -> &str {
         self.reference.as_deref().unwrap_or(&self.original)
     }
 
     /// Derive a test deck from each selected input, applying the same edits
     /// without replacing the original fixture's decimal spellings.
-    #[must_use]
+    #[must_use = "the derived inputs contain the edits for both engines"]
     pub fn transformed(&self, edit: impl Fn(&str) -> String) -> DeckInputs<'static> {
         DeckInputs {
             original: Cow::Owned(edit(self.rust())),
@@ -211,7 +211,7 @@ impl DeckInputs<'static> {
 /// The C golden for `name` on the verifier/capture target.
 ///
 /// Capture and byte-drift checks always use this specific path.
-#[must_use]
+#[must_use = "the returned path identifies the platform-specific golden fixture"]
 pub fn golden_path(root: &Path, name: &str) -> PathBuf {
     path_for(
         root,
@@ -228,7 +228,7 @@ pub fn golden_path(root: &Path, name: &str) -> PathBuf {
 ///
 /// The native platform's file comes first. All listed captures are required;
 /// none is a fallback for a missing or malformed native reference.
-#[must_use]
+#[must_use = "the returned candidates determine which numerical baselines can be compared"]
 pub fn numerical_golden_paths(root: &Path, name: &str) -> Vec<PathBuf> {
     let native = golden_path(root, name);
     let mut paths = vec![native];
