@@ -122,76 +122,31 @@ fn squared(u: &Tree) -> Tree {
 }
 
 /// `mkf(PTF_LOG, mkf(PTF_ABS, a))`.
-fn log_abs(a: &Tree) -> Tree {
-    mk_unary(Unary::Log, mk_unary(Unary::Abs, a.clone()))
-}
-
-/// The general power rule `f(a,b) * (b * (D(a) / a) + D(b) * log(abs(a)))`
-/// of `PTdifferentiate` (`^`, `pow()`, `pwr()`), with `outer = f(a,b)`.
-fn general_power(outer: Tree, a: &Tree, b: &Tree, variable: usize) -> Tree {
-    times(
-        outer,
-        mk_operator(
-            Operator::Plus,
-            times(b.clone(), over(differentiate(a, variable), a.clone())),
-            times(differentiate(b, variable), log_abs(a)),
-        ),
-    )
-}
-
-/// The derivative's two power modes, separate from general binary
-/// functions: `^` and `pow()` have the ordinary rule, `pwr()` the signed rule.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PowerRule {
     Ordinary,
     Signed,
 }
 
-impl PowerRule {
-    const fn value_kernel(self) -> Binary {
-        match self {
-            Self::Ordinary => Binary::Pow,
-            Self::Signed => Binary::Pwr,
-        }
-    }
-
-    const fn exponent_kernel(self) -> Binary {
-        match self {
-            Self::Ordinary => Binary::Pwr,
-            Self::Signed => Binary::Pow,
-        }
-    }
-}
-
-/// The three C power syntaxes share a derivative rule, but use different
-/// function kernels when the exponent is constant.  `^` and `pow()` use
-/// `pwr(a, b - 1)`; `pwr()` instead uses `pow(a, b - 1)`.
-///
-/// For variable exponents, only the `pow`/ `^` rule has C's special
-/// constant-base case.  Keep the original mkb/mkf tree construction order;
-/// it affects the values and the rounding of the evaluated Jacobian.
 fn differentiate_power(rule: PowerRule, a: &Tree, b: &Tree, variable: usize) -> Tree {
-    b.constant().map_or_else(
-        || {
-            if rule == PowerRule::Ordinary && a.constant().is_some() {
-                times(
-                    mk_binary(Binary::Pow, a, b.clone()),
-                    times(differentiate(b, variable), log_abs(a)),
-                )
-            } else {
-                general_power(mk_binary(rule.value_kernel(), a, b.clone()), a, b, variable)
-            }
-        },
-        |exponent| {
-            times(
-                times(
-                    constant(exponent),
-                    mk_binary(rule.exponent_kernel(), a, constant(exponent - 1.)),
-                ),
-                differentiate(a, variable),
-            )
-        },
-    )
+    let (base, exponent) = match rule {
+        PowerRule::Ordinary => (Binary::PowBaseSlope, Binary::PowExponentSlope),
+        PowerRule::Signed => (Binary::PwrBaseSlope, Binary::PwrExponentSlope),
+    };
+    let left = times(
+        mk_binary(base, a.clone(), b.clone()),
+        differentiate(a, variable),
+    );
+    let db = differentiate(b, variable);
+    if db.constant() == Some(0.) {
+        left
+    } else {
+        mk_operator(
+            Operator::Plus,
+            left,
+            times(mk_binary(exponent, a.clone(), b.clone()), db),
+        )
+    }
 }
 
 /// The outer derivative of a unary function, constructed with C's tree
@@ -308,6 +263,13 @@ pub(super) fn differentiate(p: &Tree, variable: usize) -> Tree {
             )
         }
         Node::Binary(Binary::Pwr, a, b) => differentiate_power(PowerRule::Signed, a, b, variable),
+        Node::Binary(
+            Binary::PowBaseSlope
+            | Binary::PwrBaseSlope
+            | Binary::PowExponentSlope
+            | Binary::PwrExponentSlope,
+            ..,
+        ) => panic!("derivative instruction is not a source expression"),
         Node::Unary(function, u) => times(unary_slope(*function, u), differentiate(u, variable)),
         Node::Pwl(u, table) => {
             let slope = u.constant().map_or_else(

@@ -114,18 +114,27 @@ Value rules (`ptfuncs.c`, no compatibility mode, as the reference binary runs):
 Newton and AC need `d f / d x` for every quantity `x` the expression reads.
 ngspice differentiates the tree symbolically once (`PTdifferentiate`) and
 evaluates the derivative trees with the same C functions. The port evaluates
-value and gradient together (forward mode) and applies **C's derivative rule
-at every node**, so the Jacobian is C's Jacobian, including its deliberate and
-accidental quirks (all verified against the C binary's AC analysis):
+value and gradient together using a sparse symbolic instruction DAG.
+Value kernels retain the SPICE branch and domain conventions. The
+Jacobian follows the actual value law where the C symbolic derivative
+is inconsistent with it:
 
 - `u`, `sgn`, `floor`, `ceil`, `nint` and the comparisons have derivative 0;
   `min`/`max` take the derivative of the selected operand (`lt0(a-b) ? a' : b'`);
   the ternary differentiates the selected branch;
-- `a^b` with a constant `b` differentiates as `b pwr(a, b-1) a'`, i.e. as
-  `|a|^b`: for an odd integer `b` and `a < 0` the derivative has the wrong
-  sign (`v(in)**3` at -0.45 V gives -0.6075 in C and in the port);
-- `pwr(a, b)` with a constant `b` uses `b pow(a, b-1) a'`, which is 0 for a
-  negative `a` and a non-integer `b`;
+- Ordinary powers `a^b` and `pow(a,b)` use the true base slope
+  `b*a^(b-1)` on positive bases and on the negative quasi-integer branch
+  (with the same rounded exponent as the value). On the negative
+  noninteger branch the value and its local slope are zero. The
+  exponent partial on a negative base is zero within the selected
+  rounded-integer or zero branch; the branch boundaries themselves
+  are discontinuous.
+- Signed `pwr(a,b)` uses the even base slope `b*abs(a)^(b-1)` and
+  exponent partial `pwr(a,b)*ln(abs(a))` away from zero. Ngspice 47
+  swaps the ordinary and signed derivative kernels for constant
+  exponents: for example `(-0.45)^3` has slope -0.6075 in C,
+  whereas its physical slope is +0.6075. The corrected Jacobian
+  deliberately differs from C at these points.
 - `pwl` on a descending table takes the slope C's ascending-only search
   finds (`PTpwl_derivative`);
 - divisions in derivative trees include the `gmin * 1e-20` fudge.
@@ -135,10 +144,9 @@ and operator (`tests/devices_behavioural_sources.rs`). Where C would
 continue with a NaN or an infinity (`acos(2)`, `cosh(1000)`), the port stops
 with a numerical error naming the function and the non-finite value or
 derivative. This includes infinite *slopes* at an intermediate Newton iterate:
-`v(in)^0.5` or `v(in)^-1` at the 0 V start has derivative `b pwr(0, b-1) =
-inf`; C loads it, carries a NaN iterate for the unknowns that depend on that
-row and converges on the next iteration, while the port stops ("non-finite
-derivative inf (value 0) in '^'"). See Limits.
+`v(in)^0.5` has an infinite positive-side slope at the 0 V start.
+C may load an infinity and recover on a later iteration; the port
+stops with a diagnostic naming the power base slope and its inputs. See Limits.
 
 ### Singular slopes at the zero start
 
@@ -286,7 +294,7 @@ in the reference verifier.
   refinement on the zero-start linearisation; singular systems stay rejected.
 - Opt-in: `NGSPICE_BIN=/abs/ngspice cargo test -p ngspice-rs --test
   c_behavioural_reference -- --ignored` compares 47 expressions' values (OP)
-  and derivatives (one-point AC) with the C binary at four bias points to
+  and valid derivatives (one-point AC) with the C binary at four bias points to
   `1e-12` relative.
 
 ## Limits

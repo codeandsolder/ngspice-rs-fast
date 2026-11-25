@@ -209,6 +209,10 @@ enum Operator {
 enum Binary {
     Pow,
     Pwr,
+    PowBaseSlope,
+    PwrBaseSlope,
+    PowExponentSlope,
+    PwrExponentSlope,
     Min,
     Max,
 }
@@ -777,6 +781,52 @@ fn power(a: Real, b: Real) -> Real {
 /// `PTpwr` without a compatibility mode.
 fn pwr(a: Real, b: Real) -> Real {
     if a < 0. { -c_pow(-a, b) } else { c_pow(a, b) }
+}
+
+/// Branch-local base derivative of the actual power value kernel.
+/// Ordinary negative bases use the same quasi-integer exponent rule
+/// as the value; signed powers instead differentiate |a|^b with an
+/// even base slope. No absolute-value derivative is substituted for an
+/// ordinary integer power.
+fn power_base_slope(a: Real, b: Real, signed: bool) -> Real {
+    if b == 0. {
+        return 0.;
+    }
+    if a == 0. {
+        return if b > 1. {
+            0.
+        } else if b.to_bits() == 1_f64.to_bits() {
+            1.
+        } else {
+            Real::INFINITY
+        };
+    }
+    if signed {
+        return b * c_pow(a.abs(), b - 1.);
+    }
+    if a > 0. {
+        return b * c_pow(a, b - 1.);
+    }
+    if almost_equal_ulps(b.round_ties_even(), b, 10) {
+        let exponent = b.round();
+        exponent * c_pow(a, exponent - 1.)
+    } else {
+        0.
+    }
+}
+
+/// Partial with respect to the exponent. For ordinary negative bases
+/// the value kernel is locally constant in each exponent branch
+/// (rounded integer or zero); its branch-local partial is zero.
+/// At a branch boundary no unique derivative exists.
+fn power_exponent_slope(a: Real, b: Real, signed: bool) -> Real {
+    if a == 0. || (!signed && a < 0.) {
+        0.
+    } else if signed {
+        pwr(a, b) * a.abs().ln()
+    } else {
+        power(a, b) * a.ln()
+    }
 }
 
 /// C's `MODULUS(x, limit)`: `x - (int)(x / limit) * limit` (the `int`
