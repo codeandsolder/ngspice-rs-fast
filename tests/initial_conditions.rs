@@ -541,3 +541,48 @@ fn coupled_fixed_inductor_currents_have_row_local_provenance() {
     );
     assert!(!error.contains("l1"), "{error}");
 }
+
+#[test]
+fn nonlinear_controlled_voltage_uic_checks_actual_right_limit_not_zero_bias_jacobian() {
+    for source in ["v1 in 0 2", "v1 in 0 PWL(0 2 1m 2)"] {
+        let deck = |ic: f64| {
+            format!(
+                "t\n{source}\nb1 out 0 v=1+v(in)^2\nr1 out 0 1k\nc1 out 0 1u ic={ic}\n.tran 1u 1m uic\n.end\n"
+            )
+        };
+        let plot = run(&deck(5.)).unwrap();
+        assert!(
+            column(&plot, "v(out)")
+                .iter()
+                .all(|v| (*v - 5.).abs() < 1e-9)
+        );
+        for bad in [0., 1., 4.] {
+            let error = error_of(&deck(bad));
+            assert!(
+                error.contains("impulse") && error.contains("b1") && error.contains("c1"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nonlinear_uic_checker_resolves_feedback_and_differential_storage_together() {
+    let deck = |ic: f64| {
+        format!(
+            "t\nv1 in 0 3\nr1 in ctrl 1k\nb1 ctrl 0 i=1m*v(ctrl)^2\nb2 out 0 v=1+v(ctrl)^2\nc1 out 0 c={{1u*(1+v(out))}} ic={ic}\nr2 out 0 1k\n.tran 1u 1m uic\n.end\n"
+        )
+    };
+    // x^2+x=3. Unlike a tangent about zero, the real nonlinear circuit
+    // determines x and its squared output before accepting history.
+    let x = (13_f64.sqrt() - 1.) / 2.;
+    let voltage = 1. + x * x;
+    let plot = run(&deck(voltage)).unwrap();
+    let last = plot.point_count() - 1;
+    assert!((plot.value("v(out)", last).unwrap().re - voltage).abs() < 1e-5);
+    let error = error_of(&deck(1.));
+    assert!(
+        error.contains("impulse") && error.contains("b2") && error.contains("c1"),
+        "{error}"
+    );
+}

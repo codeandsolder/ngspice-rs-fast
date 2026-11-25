@@ -230,6 +230,7 @@ fn scalar_name(designator: char, text: &str) -> Option<String> {
     let name = text.to_ascii_lowercase();
     let canonical = match (designator, name.as_str()) {
         ('c', "q" | "charge") => "charge",
+        ('r', "noise") => "noisy",
         ('r', "r" | "resistance")
         | ('c', "c" | "cap" | "capacitance")
         | ('l', "l" | "inductance") => primary_name(designator),

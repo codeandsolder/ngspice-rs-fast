@@ -199,6 +199,7 @@ pub fn solve_counted_limited<T>(
         limited_rows,
         options,
         Phases {
+            coordinate_kinds: None,
             first: IterationPhase::Junction,
             previous: None,
             nonconvergent: |_: &T| false,
@@ -274,6 +275,7 @@ pub fn solve_phased(
     solve_phased_into(
         initial,
         branch_rows,
+        None,
         limited_rows,
         options,
         policy,
@@ -297,6 +299,7 @@ pub fn solve_phased(
 fn solve_phased_into(
     initial: &Vector,
     branch_rows: &[bool],
+    coordinate_kinds: Option<&[crate::devices::ConvergenceKind]>,
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
     policy: PhasePolicy,
@@ -321,6 +324,7 @@ fn solve_phased_into(
         limited_rows,
         options,
         Phases {
+            coordinate_kinds,
             first,
             previous: continued,
             nonconvergent: TrialState::is_nonconvergent,
@@ -384,28 +388,33 @@ impl CircuitNewton<'_, '_> {
     ) -> Result<NewtonSolution<TrialState>, NewtonFailure> {
         // Both stamping and convergence read the same attempt-bound model
         // and accepted history, with no second caller-supplied identity.
-        let (prepared, context, history, forcing, time, uic, mut attempt) = match &mut self.load {
-            CircuitLoad::Bias {
-                prepared,
-                context,
-                history,
-                forcing,
-            } => (*prepared, *context, *history, *forcing, 0., None, None),
-            CircuitLoad::Transient { attempt, uic } => (
-                attempt.run(),
-                attempt.context(),
-                attempt.history(),
-                None,
-                attempt.time(),
-                Some(*uic),
-                Some(&mut **attempt),
-            ),
-        };
+        let (prepared, context, history, forcing, time, integration, uic, mut attempt) =
+            match &mut self.load {
+                CircuitLoad::Bias {
+                    prepared,
+                    context,
+                    history,
+                    forcing,
+                } => (
+                    *prepared, *context, *history, *forcing, 0., None, None, None,
+                ),
+                CircuitLoad::Transient { attempt, uic } => (
+                    attempt.run(),
+                    attempt.context(),
+                    attempt.history(),
+                    None,
+                    attempt.time(),
+                    Some(attempt.coefficients()),
+                    Some(*uic),
+                    Some(&mut **attempt),
+                ),
+            };
         let options = self.options;
         let circuit = prepared.circuit();
         solve_phased_into(
             initial,
             self.branch_rows,
+            Some(circuit.convergence_kinds()),
             self.limited_rows,
             options,
             policy,
@@ -454,6 +463,7 @@ impl CircuitNewton<'_, '_> {
                     history,
                     model_context: context,
                     time,
+                    integration,
                     reltol: options.reltol,
                     abstol: options.abstol,
                     vntol: options.vntol,
@@ -536,7 +546,8 @@ impl LoadStorage<TrialState> {
     }
 }
 
-struct Phases<T, F> {
+struct Phases<'a, T, F> {
+    coordinate_kinds: Option<&'a [crate::devices::ConvergenceKind]>,
     first: IterationPhase,
     previous: Option<T>,
     nonconvergent: F,
@@ -550,7 +561,7 @@ struct Phases<T, F> {
     nodesets: bool,
 }
 
-impl<T, F> Phases<T, F> {
+impl<T, F> Phases<'_, T, F> {
     /// C's MODEINITF transition after a nonconverged/initializing load.
     /// `MODEINITFLOAT` leaves the mode unchanged; its convergence decision
     /// and special nodeset `ipass` still belong to the main iteration loop.
@@ -600,7 +611,7 @@ fn iterate<T, F: Fn(&T) -> bool>(
     branch_rows: &[bool],
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
-    phases: Phases<T, F>,
+    phases: Phases<'_, T, F>,
     storage: &mut LoadStorage<T>,
     load: impl FnMut(&Vector, IterationPhase, Option<&T>, &mut LoadStorage<T>) -> SpiceResult<T>,
     device_test: impl FnMut(&Vector, &Vector, &T) -> SpiceResult<bool>,
@@ -653,7 +664,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     branch_rows: &[bool],
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
-    phases: Phases<T, F>,
+    phases: Phases<'_, T, F>,
     storage: &mut LoadStorage<T>,
     mut load: impl FnMut(&Vector, IterationPhase, Option<&T>, &mut LoadStorage<T>) -> SpiceResult<T>,
     mut device_test: impl FnMut(&Vector, &Vector, &T) -> SpiceResult<bool>,
@@ -665,6 +676,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     if n == 0
         || n != branch_rows.len()
         || limited_rows.is_some_and(|rows| rows.len() != n)
+        || phases.coordinate_kinds.is_some_and(|rows| rows.len() != n)
         || !initial.is_finite()
     {
         return Err(failure(
@@ -732,7 +744,8 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         let mut noncon = if flagged || iterno == 1 {
             true
         } else {
-            !converged(&next, &guess, branch_rows, options) || device_test(&next, &guess, &trial)?
+            !converged(&next, &guess, branch_rows, phases.coordinate_kinds, options)
+                || device_test(&next, &guess, &trial)?
         };
         if phase == IterationPhase::Float {
             if phases.nodesets {
@@ -815,21 +828,38 @@ fn check(matrix: &SparseMatrix, rhs: &Vector, n: usize) -> SpiceResult<()> {
     }
     Ok(())
 }
-fn converged(new: &Vector, old: &Vector, branch: &[bool], options: &NewtonOptions) -> bool {
+fn converged(
+    new: &Vector,
+    old: &Vector,
+    branch: &[bool],
+    kinds: Option<&[crate::devices::ConvergenceKind]>,
+    options: &NewtonOptions,
+) -> bool {
+    use crate::devices::ConvergenceKind;
     new.as_slice()
         .iter()
         .zip(old.as_slice())
         .zip(branch)
-        .all(|((new, old), branch)| {
-            let relative_tolerance = options.reltol * new.abs().max(old.abs());
-            let absolute_tolerance = if *branch {
-                options.abstol
-            } else {
-                options.vntol
+        .enumerate()
+        .all(|(row, ((new, old), branch))| {
+            let kind = kinds.map_or(
+                if *branch {
+                    ConvergenceKind::Current
+                } else {
+                    ConvergenceKind::Voltage
+                },
+                |kinds| kinds[row],
+            );
+            let absolute = match kind {
+                ConvergenceKind::Current => options.abstol,
+                ConvergenceKind::Voltage => options.vntol,
+                ConvergenceKind::Constitutive => return true,
             };
-            (new - old).abs() <= relative_tolerance + absolute_tolerance
+            let relative = options.reltol * new.abs().max(old.abs());
+            (new - old).abs() <= relative + absolute
         })
 }
+
 fn failure(message: impl Into<String>) -> SpiceError {
     SpiceError::Numerical {
         context: "Newton".into(),
