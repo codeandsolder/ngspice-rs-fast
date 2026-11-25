@@ -5312,6 +5312,11 @@ mod tests {
         assert_eq!(m.untranslated().collect::<Vec<_>>(), [2]);
         m.mna_preorder();
         assert_eq!(m.order_and_factor(1e-3, 1e-13), Status::Okay);
+        // The raw SPARSE port retains this distinction; the public circuit
+        // factorization boundary rejects the unconstrained unknown.
+        let stats = m.storage();
+        assert_eq!((stats.external_order, stats.translated_order), (3, 2));
+        assert_eq!((stats.original_entries, stats.factor_entries), (4, 4));
         let x = m.solve(&[3.0, 7.5, 5.0]);
         assert_eq!(x[1], 7.5);
         assert!((2.0 * x[0] + x[2] - 3.0).abs() < 1e-15 && (x[0] + 4.0 * x[2] - 5.0).abs() < 1e-15);

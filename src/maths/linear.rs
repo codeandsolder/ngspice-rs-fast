@@ -14,12 +14,10 @@
 //! circuit matrix names its unknowns as `NIiter`'s warning does
 //! (`singular matrix:  check node X`).
 //!
-//! A circuit unknown that no element references (a node joined only to
-//! current sources) has no row in SPARSE (`Translate` never numbers it); C
-//! then solves the rest and leaves the right-hand side in that unknown's
-//! solution entry, and so does the port for circuit solves ([`solve_ni`],
-//! AC), with a warning. Standalone matrices ([`SparseLu::new`],
-//! [`DenseLu`]) reject such a system instead.
+//! An unknown with no allocated matrix entry is structurally singular.
+//! SPARSE leaves such indices untranslated and copies their RHS to the
+//! solution, but the circuit/linear factorization boundary rejects that
+//! behavior: an injected current is not a node voltage.
 //!
 //! Elements are created in the folded triplet order (row-major), which sets
 //! SPARSE's internal numbering. ngspice instead creates them in device setup
@@ -198,25 +196,30 @@ pub(crate) fn solver_warning(message: String) {
     printed.push(message);
 }
 
-/// Warns about circuit unknowns with no matrix entries (see the module
-/// documentation): C keeps their right-hand side as their solution.
-pub(in crate::maths) fn warn_untranslated<T: Scalar>(
+/// Reject unknowns omitted by SPARSE's translation before any factor is
+/// published. This does not inspect numeric values or prune circuit nodes:
+/// an allocated zero coefficient may become nonzero in another analysis.
+pub(in crate::maths) fn require_translated<T: Scalar>(
+    context: &str,
     sparse: &Sparse<T>,
     names: Option<&UnknownNames>,
-) {
+) -> SpiceResult<()> {
     if sparse.fully_translated() {
-        return;
+        return Ok(());
     }
-    let labels: Vec<String> = sparse
+    let labels: Vec<_> = sparse
         .untranslated()
         .map(|ext| unknown_label(names, ext))
         .collect();
-    solver_warning(format!(
-        "no matrix entries for {}: nothing constrains {}, so as in ngspice the \
-         solution holds the right-hand side there",
-        labels.join(", "),
-        if labels.len() == 1 { "it" } else { "them" }
-    ));
+    let unknowns = if labels.len() == 1 {
+        format!("node {}", labels[0])
+    } else {
+        format!("nodes {}", labels.join(", "))
+    };
+    Err(numerical(
+        context,
+        format!("singular matrix:  check {unknowns}; no matrix entries constrain these unknowns"),
+    ))
 }
 
 fn rhs_valid(rhs: &Vector, n: usize) -> SpiceResult<()> {
@@ -291,26 +294,13 @@ pub(in crate::maths) fn check_status<T: Scalar>(
 }
 
 /// Orders and factors a freshly built matrix (`SMPpreOrder` + `SMPreorder`).
-///
-/// A circuit matrix (`circuit`: a bound matrix, or one carrying unknown
-/// `names`) may leave unknowns without entries, as C does; a standalone one
-/// may not.
 pub(in crate::maths) fn order_fresh<T: Scalar>(
     context: &str,
     sparse: &mut Sparse<T>,
     pivot: PivotTolerances,
     names: Option<&UnknownNames>,
-    circuit: bool,
 ) -> SpiceResult<()> {
-    if !sparse.fully_translated() {
-        if !circuit {
-            return Err(numerical(
-                context,
-                "singular matrix: an unknown has no matrix entries",
-            ));
-        }
-        warn_untranslated(sparse, names);
-    }
+    require_translated(context, sparse, names)?;
     sparse.mna_preorder();
     let status = sparse.order_and_factor(pivot.relative, pivot.absolute);
     check_status(context, status, sparse, names)
@@ -582,10 +572,12 @@ pub(in crate::maths) fn factor_shared_complex(
             }
         };
         let numeric = Arc::make_mut(&mut sparse);
+        // A failed fresh factor must never be cached as a reusable frame.
+        require_translated("complex sparse LU", numeric, names)?;
         let mut work = FactorWork::default();
         let result = if fresh {
             state.ac_reorder = false;
-            let result = order_fresh("complex sparse LU", numeric, pivot, names, true);
+            let result = order_fresh("complex sparse LU", numeric, pivot, names);
             work += numeric.last_attempt();
             result
         } else {
@@ -800,19 +792,7 @@ fn ni_step(
         (frame, false)
     } else {
         let mut frame = work.factor.assembly(fresh_frame(&matrix))?;
-        if !frame.sparse.fully_translated() {
-            // A circuit's matrix (bound, or carrying unknown names)
-            // follows C: an unknown without entries stays untranslated
-            // and its solution entry holds the RHS. A standalone one
-            // is rejected.
-            if matrix.unknown_names().is_none() && matrix.bound_values().is_none() {
-                return Err(numerical(
-                    "sparse LU",
-                    "singular matrix: an unknown has no matrix entries",
-                ));
-            }
-            warn_untranslated(&frame.sparse, matrix.unknown_names());
-        }
+        require_translated("sparse LU", &frame.sparse, matrix.unknown_names())?;
         Arc::make_mut(&mut frame.sparse).mna_preorder();
         (frame, true)
     };
@@ -984,7 +964,6 @@ impl SparseLu {
             numeric,
             matrix.pivot_tolerances(),
             matrix.unknown_names(),
-            matrix.bound_values().is_some() || matrix.unknown_names().is_some(),
         );
         let work = numeric.last_attempt();
         *total += work;
@@ -1139,13 +1118,7 @@ impl DenseLu {
                     .map(move |(col, &v)| (row + 1, col + 1, v))
             });
         let mut sparse = Sparse::from_originals(n, entries)?;
-        order_fresh(
-            "dense LU",
-            &mut sparse,
-            PivotTolerances::DEFAULT,
-            None,
-            false,
-        )?;
+        order_fresh("dense LU", &mut sparse, PivotTolerances::DEFAULT, None)?;
         Ok(Self { sparse, n })
     }
 

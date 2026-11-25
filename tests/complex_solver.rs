@@ -262,3 +262,54 @@ fn complex_raw_factors_cover_both_binary64_exponent_limits() {
         }
     }
 }
+
+/// Missing matrix rows must never become a valid cached factor, including
+/// repeated AC attempts and transitions from complex to real NI.
+#[test]
+fn unreferenced_named_unknowns_fail_all_factorization_paths() {
+    use ngspice_rs::maths::complex::IndependentComplexBatch;
+    use ngspice_rs::maths::{Pattern, SparseLu, Vector, solve_ni};
+    use std::sync::Arc;
+    let p = Arc::new(Pattern::new(3, [(0, 0)]).unwrap());
+    let names: ngspice_rs::maths::UnknownNames = Arc::from([
+        "anchored".to_owned(),
+        "floating".to_owned(),
+        "orphan#branch".to_owned(),
+    ]);
+    let mut bound = SparseMatrix::bound(Arc::clone(&p)).unwrap();
+    bound.set(0, 0, 2.).unwrap();
+    bound.set_unknown_names(Some(Arc::clone(&names)));
+    let mut triplets = SparseMatrix::new(3, 3);
+    triplets.add(0, 0, 2.).unwrap();
+    triplets.set_unknown_names(Some(names));
+    let empty = SparseMatrix::new(3, 3);
+    let diagnostic = |error: ngspice_rs::primitives::SpiceError| {
+        let message = error.to_string();
+        assert!(
+            message.contains("singular matrix")
+                && message.contains("floating")
+                && message.contains("orphan#branch"),
+            "{message}"
+        );
+    };
+    for g in [&bound, &triplets] {
+        let matrix = if g.bound_values().is_some() {
+            ComplexMatrix::from_operators_on(&p, g, &empty, 1.)
+                .unwrap()
+                .unwrap()
+        } else {
+            ComplexMatrix::from_operators(g, &empty, 1.).unwrap()
+        };
+        for _ in 0..3 {
+            diagnostic(matrix.factorize().unwrap_err());
+            diagnostic(matrix.factorize_new_matrix().unwrap_err());
+            diagnostic(SparseLu::new(g, None).unwrap_err());
+            diagnostic(solve_ni(g, &Vector::zeros(3), &mut None, false, 0.).unwrap_err());
+        }
+        let mut batch = IndependentComplexBatch::default();
+        for result in batch.factorize(&[matrix.clone(), matrix.clone(), matrix]) {
+            diagnostic(result.unwrap_err());
+        }
+    }
+    assert_eq!(p.factor_telemetry().work.factor.successful_factors, 0);
+}
