@@ -3,7 +3,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::devices::code_model::{CodeModel, DelayMode, Drive, EventContext, Output};
+use crate::devices::code_model::{
+    AutonomousAdvance, CodeModel, DelayMode, Drive, EventContext, Output,
+};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// Digital net identifier, distinct from an analog MNA node.
@@ -52,10 +54,13 @@ fn external_identity() -> SpiceResult<u64> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Event {
-    driver: usize,
-    drive: Drive,
-    external: Option<u64>,
+enum Event {
+    Drive {
+        driver: usize,
+        drive: Drive,
+        external: Option<u64>,
+    },
+    Wake(usize),
 }
 
 #[derive(Debug, Default)]
@@ -82,6 +87,13 @@ impl Clone for Box<dyn ModelState> {
 
 trait ErasedModel: std::fmt::Debug {
     fn initial_state(&self) -> Box<dyn ModelState>;
+    fn next_wakeup(&self, state: &dyn ModelState) -> SpiceResult<Option<Real>>;
+    fn advance_autonomous(
+        &self,
+        now: Real,
+        horizon: Real,
+        state: &mut dyn ModelState,
+    ) -> SpiceResult<AutonomousAdvance>;
     fn evaluate(
         &self,
         context: EventContext,
@@ -93,6 +105,25 @@ trait ErasedModel: std::fmt::Debug {
 impl<M: CodeModel> ErasedModel for M {
     fn initial_state(&self) -> Box<dyn ModelState> {
         Box::new(CodeModel::initial_state(self))
+    }
+
+    fn next_wakeup(&self, state: &dyn ModelState) -> SpiceResult<Option<Real>> {
+        let state = (state as &dyn std::any::Any)
+            .downcast_ref::<M::State>()
+            .ok_or_else(|| SpiceError::circuit("digital model state identity mismatch"))?;
+        Ok(CodeModel::next_wakeup(self, state))
+    }
+
+    fn advance_autonomous(
+        &self,
+        now: Real,
+        horizon: Real,
+        state: &mut dyn ModelState,
+    ) -> SpiceResult<AutonomousAdvance> {
+        let state = (state as &mut dyn std::any::Any)
+            .downcast_mut::<M::State>()
+            .ok_or_else(|| SpiceError::circuit("digital model state identity mismatch"))?;
+        CodeModel::advance_autonomous(self, now, horizon, state)
     }
 
     fn evaluate(
@@ -122,6 +153,7 @@ pub struct Network {
     drivers: Vec<NetId>,
     sources: Vec<usize>,
     models: Vec<Model>,
+    lookahead: Vec<usize>,
 }
 
 impl Network {
@@ -178,6 +210,9 @@ impl Network {
             self.check_net(net)?;
         }
         let index = self.models.len();
+        if model.requires_lookahead() {
+            self.lookahead.push(index);
+        }
         for &net in inputs {
             self.nets[net.0].subscribers.push(index);
         }
@@ -218,6 +253,8 @@ pub struct Stats {
     pub evaluations: usize,
     /// Net-resolution rounds.
     pub rounds: usize,
+    /// Autonomous horizon probes of external simulators.
+    pub probes: usize,
 }
 
 /// Resolved net change after all output events at a time/delta are applied.
@@ -234,6 +271,18 @@ pub struct Change {
 }
 
 #[derive(Clone, Debug)]
+struct Prediction {
+    time: Time,
+    state: Box<dyn ModelState>,
+    outputs: Option<Vec<Output>>,
+}
+
+struct Group {
+    time: Time,
+    delta: usize,
+}
+
+#[derive(Clone, Debug)]
 struct State {
     time: Time,
     delta: usize,
@@ -243,8 +292,10 @@ struct State {
     drivers: Vec<Drive>,
     desired: Vec<Option<Drive>>,
     pending: Vec<BTreeSet<Key>>,
+    wakeups: Vec<Option<Key>>,
     nets: Vec<Drive>,
     models: Vec<Box<dyn ModelState>>,
+    predictions: Vec<Option<Prediction>>,
     stats: Stats,
 }
 
@@ -259,12 +310,14 @@ impl State {
             drivers: vec![Drive::default(); network.drivers.len()],
             desired: vec![None; network.drivers.len()],
             pending: vec![BTreeSet::new(); network.drivers.len()],
+            wakeups: vec![None; network.models.len()],
             nets: vec![Drive::default(); network.nets.len()],
             models: network
                 .models
                 .iter()
                 .map(|m| m.kernel.initial_state())
                 .collect(),
+            predictions: vec![None; network.models.len()],
             stats: Stats::default(),
         }
     }
@@ -276,6 +329,17 @@ impl State {
         drive: Drive,
         external: Option<u64>,
     ) -> SpiceResult<Key> {
+        self.schedule_event(
+            time,
+            Event::Drive {
+                driver,
+                drive,
+                external,
+            },
+        )
+    }
+
+    fn schedule_event(&mut self, time: Time, event: Event) -> SpiceResult<Key> {
         if time < self.time {
             return Err(SpiceError::circuit(
                 "cannot schedule event before current time",
@@ -297,14 +361,7 @@ impl State {
             .sequence
             .checked_add(1)
             .ok_or_else(|| SpiceError::circuit("digital event sequence overflow"))?;
-        self.queue.insert(
-            key,
-            Event {
-                driver,
-                drive,
-                external,
-            },
-        );
+        self.queue.insert(key, event);
         Ok(key)
     }
 
@@ -354,7 +411,8 @@ impl State {
     fn charge_work(&self, before: Stats, limit: usize) -> SpiceResult<()> {
         let events = self.stats.events - before.events;
         let evaluations = self.stats.evaluations - before.evaluations;
-        if events.saturating_add(evaluations) > limit {
+        let probes = self.stats.probes - before.probes;
+        if events.saturating_add(evaluations).saturating_add(probes) > limit {
             return Err(SpiceError::circuit("digital event work limit exceeded"));
         }
         Ok(())
@@ -381,13 +439,146 @@ impl State {
                 &inputs,
                 self.models[index].as_mut(),
             )?;
-            if outputs.len() != instance.outputs.len() {
-                return Err(SpiceError::circuit(
-                    "digital model returned incorrect output count",
-                ));
+            self.accept_model_outputs(network, index, outputs)?;
+        }
+        Ok(())
+    }
+
+    fn accept_model_outputs(
+        &mut self,
+        network: &Network,
+        index: usize,
+        outputs: Vec<Output>,
+    ) -> SpiceResult<()> {
+        let instance = &network.models[index];
+        if outputs.len() != instance.outputs.len() {
+            return Err(SpiceError::circuit(
+                "digital model returned incorrect output count",
+            ));
+        }
+        for (&driver, output) in instance.outputs.iter().zip(outputs) {
+            self.model_output(driver, output)?;
+        }
+        if let Some(key) = self.wakeups[index].take() {
+            self.queue.remove(&key);
+        }
+        if let Some(time) = instance.kernel.next_wakeup(self.models[index].as_ref())? {
+            let key = self.schedule_event(Time::new(time)?, Event::Wake(index))?;
+            self.wakeups[index] = Some(key);
+        }
+        Ok(())
+    }
+
+    // A prediction is valid until the model's input changes. Retaining
+    // predictions past unrelated events avoids rewinding independent HDL
+    // simulators simply because another device has an earlier event.
+    fn predict(
+        &mut self,
+        network: &Network,
+        index: usize,
+        horizon: Time,
+        before: Stats,
+        limit: usize,
+    ) -> SpiceResult<Option<Time>> {
+        if let Some(prediction) = &self.predictions[index]
+            && (prediction.outputs.is_some() || prediction.time >= horizon)
+        {
+            return Ok(prediction.outputs.as_ref().map(|_| prediction.time));
+        }
+        self.stats.probes += 1;
+        self.charge_work(before, limit)?;
+        let mut state = self.predictions[index]
+            .take()
+            .map_or_else(|| self.models[index].clone(), |prediction| prediction.state);
+        let result = network.models[index].kernel.advance_autonomous(
+            self.time.value(),
+            horizon.value(),
+            state.as_mut(),
+        )?;
+        let (time, outputs) = match result {
+            AutonomousAdvance::Quiet => (horizon, None),
+            AutonomousAdvance::Event { time, outputs } => {
+                let time = Time::new(time)?;
+                if time <= self.time || time > horizon {
+                    return Err(SpiceError::circuit(
+                        "autonomous simulator returned a noncausal event",
+                    ));
+                }
+                (time, Some(outputs))
             }
-            for (&driver, output) in instance.outputs.iter().zip(outputs) {
-                self.model_output(driver, output)?;
+        };
+        let event = outputs.as_ref().map(|_| time);
+        self.predictions[index] = Some(Prediction {
+            time,
+            state,
+            outputs,
+        });
+        Ok(event)
+    }
+
+    fn next_group(
+        &mut self,
+        network: &Network,
+        end: Time,
+        before: Stats,
+        limit: usize,
+    ) -> SpiceResult<Option<Group>> {
+        if !self.initialized {
+            return Ok(Some(Group {
+                time: Time(0),
+                delta: 0,
+            }));
+        }
+        let next = self
+            .queue
+            .first_key_value()
+            .map(|(key, _)| *key)
+            .filter(|key| key.time <= end);
+        let horizon = next.map_or(end, |key| key.time);
+        let mut boundary = next.map(|key| (key.time, key.delta));
+        if horizon > self.time {
+            for &index in &network.lookahead {
+                if let Some(time) = self.predict(network, index, horizon, before, limit)?
+                    && time <= horizon
+                    && boundary.is_none_or(|(old, _)| time < old)
+                {
+                    boundary = Some((time, 0));
+                }
+            }
+        }
+        if let Some((time, delta)) = boundary {
+            Ok(Some(Group { time, delta }))
+        } else {
+            self.accept_predictions(network, horizon, &BTreeSet::new())?;
+            Ok(None)
+        }
+    }
+
+    fn accept_predictions(
+        &mut self,
+        network: &Network,
+        time: Time,
+        dirty: &BTreeSet<usize>,
+    ) -> SpiceResult<()> {
+        for &index in &network.lookahead {
+            if dirty.contains(&index) {
+                // An incoming drive at the same physical time takes
+                // precedence over autonomous evolution with old inputs.
+                self.predictions[index] = None;
+                continue;
+            }
+            if self.predictions[index]
+                .as_ref()
+                .is_some_and(|prediction| prediction.time <= time)
+                && let Some(prediction) = self.predictions[index].take()
+            {
+                self.models[index] = prediction.state;
+                if let Some(outputs) = prediction.outputs {
+                    if prediction.time != time || time != self.time {
+                        return Err(SpiceError::circuit("missed autonomous event"));
+                    }
+                    self.accept_model_outputs(network, index, outputs)?;
+                }
             }
         }
         Ok(())
@@ -418,22 +609,13 @@ impl State {
             return Err(SpiceError::circuit("digital time cannot run backwards"));
         }
         let before = self.stats;
-        loop {
-            let next = self.queue.first_key_value().map(|(key, _)| *key);
-            let group = if self.initialized {
-                let Some(key) = next.filter(|key| key.time <= end) else {
-                    break;
-                };
-                (key.time, key.delta)
-            } else {
-                (Time(0), 0)
-            };
-            if group.1 >= limits.delta_cycles {
+        while let Some(group) = self.next_group(network, end, before, limits.work)? {
+            if group.delta >= limits.delta_cycles {
                 return Err(SpiceError::circuit(
                     "digital delta-cycle limit exceeded (zero-delay feedback)",
                 ));
             }
-            (self.time, self.delta) = group;
+            (self.time, self.delta) = (group.time, group.delta);
             let mut dirty = BTreeSet::new();
             if !self.initialized {
                 dirty.extend(0..network.models.len());
@@ -441,7 +623,7 @@ impl State {
             }
             let mut affected = BTreeSet::new();
             while let Some((&key, _)) = self.queue.first_key_value() {
-                if (key.time, key.delta) != group {
+                if (key.time, key.delta) != (group.time, group.delta) {
                     break;
                 }
                 let Some((_, event)) = self.queue.pop_first() else {
@@ -449,10 +631,18 @@ impl State {
                 };
                 self.stats.events += 1;
                 self.charge_work(before, limits.work)?;
-                self.pending[event.driver].remove(&key);
-                if self.drivers[event.driver] != event.drive {
-                    self.drivers[event.driver] = event.drive;
-                    affected.insert(network.drivers[event.driver]);
+                match event {
+                    Event::Drive { driver, drive, .. } => {
+                        self.pending[driver].remove(&key);
+                        if self.drivers[driver] != drive {
+                            self.drivers[driver] = drive;
+                            affected.insert(network.drivers[driver]);
+                        }
+                    }
+                    Event::Wake(index) => {
+                        self.wakeups[index] = None;
+                        dirty.insert(index);
+                    }
                 }
             }
             for net in affected {
@@ -470,6 +660,7 @@ impl State {
                 }
             }
             self.stats.rounds += 1;
+            self.accept_predictions(network, group.time, &dirty)?;
             self.evaluate_models(network, dirty, before, limits.work)?;
             if self
                 .queue
@@ -520,7 +711,8 @@ impl Engine {
         self.accepted.time.value()
     }
 
-    /// Next pending physical event time, including initial model evaluation.
+    /// Next known queued physical event time, including initialization.
+    /// Lookahead-driven models may discover earlier autonomous events.
     #[must_use]
     pub fn next_event_time(&self) -> Option<Real> {
         if self.accepted.initialized {
@@ -531,6 +723,12 @@ impl Engine {
         } else {
             Some(0.)
         }
+    }
+
+    /// True if a model can discover events only by advancing through a horizon.
+    #[must_use]
+    pub fn has_lookahead(&self) -> bool {
+        !self.network.lookahead.is_empty()
     }
 
     /// Accepted net value.
@@ -591,7 +789,7 @@ impl Trial<'_> {
             .state
             .queue
             .get(&event.key)
-            .is_some_and(|queued| queued.external == Some(event.identity))
+            .is_some_and(|queued| matches!(queued, Event::Drive { external: Some(id), .. } if *id == event.identity))
         {
             self.state.queue.remove(&event.key);
             true
@@ -634,7 +832,8 @@ impl Trial<'_> {
         &self.changes
     }
 
-    /// Next pending event in the trial.
+    /// Next known queued event in the trial; autonomous horizon probes may
+    /// discover earlier events.
     #[must_use]
     pub fn next_event_time(&self) -> Option<Real> {
         if self.state.initialized {
@@ -770,7 +969,7 @@ impl MixedSignal {
                 .accepted
                 .queue
                 .values()
-                .any(|event| event.driver == driver)
+                .any(|event| matches!(event, Event::Drive { driver: id, .. } if *id == driver))
             || self.engine.accepted.drivers[driver] != Drive::default()
         {
             return Err(SpiceError::circuit("ADC source must be exclusively owned"));
@@ -941,10 +1140,11 @@ impl MixedSignal {
     /// Reuse this state on acceptance if the analog endpoint is unchanged.
     pub(super) fn preview(&self, horizon: Real) -> SpiceResult<Option<EventPreview>> {
         if self.dacs.is_empty()
-            || self
-                .engine
-                .next_event_time()
-                .is_none_or(|next| next > horizon)
+            || (!self.engine.has_lookahead()
+                && self
+                    .engine
+                    .next_event_time()
+                    .is_none_or(|next| next > horizon))
         {
             return Ok(None);
         }
@@ -1010,10 +1210,11 @@ impl MixedSignal {
                 ));
             }
         }
-        let events_due = self
-            .engine
-            .next_event_time()
-            .is_some_and(|next| next <= time);
+        let events_due = (self.engine.has_lookahead() && end > self.engine.accepted.time)
+            || self
+                .engine
+                .next_event_time()
+                .is_some_and(|next| next <= time);
         let ramp_boundary = self.dacs.iter().try_fold(false, |found, dac| {
             let ramp = dac.port.ramp()?;
             let previous = self.engine.time();

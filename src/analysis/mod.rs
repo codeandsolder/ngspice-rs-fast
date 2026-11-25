@@ -37,6 +37,7 @@ pub mod bias;
 mod companion;
 pub mod config;
 pub mod control;
+pub mod cosim;
 pub mod digital;
 pub mod disto;
 pub mod driver;
