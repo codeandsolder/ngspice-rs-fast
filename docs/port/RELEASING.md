@@ -10,6 +10,8 @@
    rust-skills2 workflow against the repository's dated, quarantined nightly.
 2. **Release gate** (`verify` job, no credentials):
    - checks that the pushed tag equals `v` + `version` in `Cargo.toml`;
+   - checks new registry dependency versions against the default branch with
+     the shared 72-hour release quarantine;
    - verifies all five archive layouts and negative tag/target checks;
    - `cargo test --workspace --locked`;
    - `cargo xtask golden verify`;
@@ -89,10 +91,13 @@ builds. binstall reads that metadata from the version published on crates.io,
 so the names in the workflow and the manifest must change together. The
 binaries job is independent of the crates.io publish job and needs no approval.
 
-To rebuild binaries for a tag containing the current release scripts and dated
-nightly pin, run *Release binaries* by hand with that tag; existing assets
-are replaced. Old tags without those contracts are not supported by the
-current workflow.
+Manual *Release binaries* runs default to dry-run: build and package every
+native target, upload workflow artifacts only, and do not modify a GitHub
+release. Leave the tag empty to validate the selected ref. To replace assets
+on an existing tag containing the current release scripts and dated nightly
+pin, specify that tag and explicitly disable dry-run. Old tags without those
+contracts are not supported by the current workflow. Both modes check the
+release-age quarantine against the default branch.
 
 ## Cutting a release
 
