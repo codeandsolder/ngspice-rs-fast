@@ -484,6 +484,66 @@ pub fn resolve_expression(
     })
 }
 
+/// Use the same lexical classification for actual elaboration and for
+/// inspecting a candidate's compiled constitutive dependencies.
+pub(crate) fn classify_device_passives(
+    device: &mut DeviceInstance,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<()> {
+    for parameter in &mut device.parameters {
+        if matches!(
+            (device.designator, parameter.name.as_str()),
+            ('r', "resistance") | ('c', "capacitance" | "charge") | ('l', "inductance")
+        ) {
+            classify_passive(parameter, scope, budget)?;
+        }
+    }
+    Ok(())
+}
+
+/// Expand the exact macro language of a runtime law without substituting
+/// numerical parameters. Discarded macro arguments are not dependencies;
+/// names captured inside the body, including nested calls, are.
+fn expand_symbolic(
+    expression: &BehaviouralExpression,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<BExpr> {
+    let mut resolver = Resolver {
+        scope,
+        functions: scope.functions().cloned(),
+        budget,
+        sampler: scope.sampler(&expression.span.start),
+        verbatim: expression.verbatim,
+        syntax_only: true,
+        nodes: 0,
+        expansion_budget: TreeBudget::new(MAX_TREE_NODES),
+    };
+    resolver.resolve(&expression.root, 1)
+}
+
+/// Inspect the top-level laws *after* the same controlled-source lowering
+/// and passive classification used by the circuit factory. This work is
+/// performed once per parameter plan, never in a Newton iteration.
+pub(crate) fn candidate_laws(
+    netlist: &Netlist,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+) -> SpiceResult<Vec<BExpr>> {
+    let mut lowered = lower_nonlinear_sources(netlist)?;
+    let mut roots = Vec::new();
+    for device in &mut lowered.devices {
+        classify_device_passives(device, scope, budget)?;
+        for parameter in &device.parameters {
+            if let ParameterKind::Behavioural(expression) = &parameter.kind {
+                roots.push(expand_symbolic(expression, scope, budget)?);
+            }
+        }
+    }
+    Ok(roots)
+}
+
 /// Classify a passive's primary expression after lexical macro expansion.
 /// Numeric-only expressions remain in the numparam evaluator; runtime laws
 /// use the behavioural evaluator. No static function is numerically evaluated
@@ -530,17 +590,7 @@ pub(crate) fn classify_passive(
         ParameterKind::Behavioural(expression) => expression,
         _ => return Ok(()),
     };
-    let mut resolver = Resolver {
-        scope,
-        functions: scope.functions().cloned(),
-        budget,
-        sampler: scope.sampler(&expression.span.start),
-        verbatim: expression.verbatim,
-        syntax_only: true,
-        nodes: 0,
-        expansion_budget: TreeBudget::new(MAX_TREE_NODES),
-    };
-    let root = resolver.resolve(&expression.root, 1)?;
+    let root = expand_symbolic(expression, scope, budget)?;
     let mut runtime = false;
     root.visit(&mut |expr| {
         runtime |= match &expr.kind {

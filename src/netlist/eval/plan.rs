@@ -6,9 +6,10 @@ use super::{
     evaluate_definition, evaluate_root,
 };
 use crate::netlist::ast::ParamCard;
-use crate::netlist::expr::ParameterExpression;
+use crate::netlist::bexpr::{BExpr, BExprKind, SPECIAL_NAMES};
+use crate::netlist::expr::{Expr, ParameterExpression};
 use crate::primitives::ascii::folded;
-use crate::primitives::{Real, SpiceError, SpiceResult};
+use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -72,6 +73,16 @@ impl BoundExpression {
     ) -> bool {
         self.direct.values().any(|&index| {
             previous.values[index].map(Real::to_bits) != next.values[index].map(Real::to_bits)
+        })
+    }
+
+    /// Compare the actual resolved slots with their baseline values. An
+    /// independent coordinate whose change cancels in a derived parameter
+    /// does not invalidate a compiled law.
+    pub(crate) fn changed_from_baseline(&self, candidate: &CandidateParameters<'_>) -> bool {
+        self.direct.values().any(|&index| {
+            candidate.values[index].map(Real::to_bits)
+                != candidate.plan.nodes[index].baseline.map(Real::to_bits)
         })
     }
 
@@ -199,6 +210,54 @@ impl ParameterPlan {
         expression: &ParameterExpression,
         budget: &mut EvalBudget,
     ) -> SpiceResult<BoundExpression> {
+        self.bind_references(scope, std::iter::empty(), [&expression.root], budget)
+    }
+
+    /// Bind a group of numeric expressions as a single dependency set.
+    pub(crate) fn bind_expressions<'a>(
+        &self,
+        scope: ParameterScopeId,
+        expressions: impl IntoIterator<Item = &'a ParameterExpression>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<BoundExpression> {
+        self.bind_references(
+            scope,
+            std::iter::empty(),
+            expressions.into_iter().map(|expression| &expression.root),
+            budget,
+        )
+    }
+
+    /// Bind the union of the static reads in already macro-expanded runtime
+    /// laws. Circuit quantities are not parameter reads. Embedded numparam
+    /// values keep their own lexical function semantics.
+    pub(crate) fn bind_behavioural(
+        &self,
+        scope: ParameterScopeId,
+        laws: &[BExpr],
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<BoundExpression> {
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+        for law in laws {
+            law.visit(&mut |node| match &node.kind {
+                BExprKind::Name(name) if !SPECIAL_NAMES.contains(&name.as_str()) => {
+                    names.push((name.as_str(), &node.span.start));
+                }
+                BExprKind::Value(value) => values.push(&value.root),
+                _ => {}
+            });
+        }
+        self.bind_references(scope, names, values, budget)
+    }
+
+    fn bind_references<'a>(
+        &self,
+        scope: ParameterScopeId,
+        names: impl IntoIterator<Item = (&'a str, &'a SourceLoc)>,
+        expressions: impl IntoIterator<Item = &'a Expr>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<BoundExpression> {
         let baseline = self
             .baseline(scope)
             .ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))?;
@@ -211,14 +270,20 @@ impl ParameterPlan {
         };
         let mut direct = HashMap::new();
         let mut undefined = None;
-        scan.refs(&expression.root, 0, &mut |name, location| {
+        let mut record = |name: &str, location: &SourceLoc| {
             if let Some(index) = self.lookup_slot(Some(scope), name) {
                 direct.insert(folded(name).into_owned(), index);
             } else if undefined.is_none() {
                 undefined = Some((name.to_owned(), location.clone()));
             }
-        })
-        .map_err(Failure::into_error)?;
+        };
+        for (name, location) in names {
+            record(name, location);
+        }
+        for expression in expressions {
+            scan.refs(expression, 0, &mut record)
+                .map_err(Failure::into_error)?;
+        }
         if let Some((name, location)) = undefined {
             return Err(SpiceError::parse(
                 location,

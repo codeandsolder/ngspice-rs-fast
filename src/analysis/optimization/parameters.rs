@@ -14,7 +14,7 @@ use crate::analysis::sens::{PhysicalParameter, conditioned_derivative};
 use crate::devices::circuit::{CandidateNumericOverride, Circuit};
 use crate::devices::models::ModelContext;
 use crate::devices::sweep::InstanceTarget;
-use crate::netlist::ast::{Netlist, NodeHintValue, ParameterKind};
+use crate::netlist::ast::Netlist;
 use crate::netlist::elaborate::{self, SiteKind};
 use crate::netlist::eval::{
     BoundExpression, CandidateParameters, EvalBudget, EvalLimits, FunctionScope, ParameterPlan,
@@ -83,7 +83,8 @@ pub struct CircuitParameterPlan {
     config: RunConfig,
     sites: Vec<CandidateSite>,
     /// Input coordinates affecting numeric options rather than device stamps.
-    option_dependencies: Vec<usize>,
+    option_dependencies: BoundExpression,
+    behavioural_dependencies: BoundExpression,
     requires_rebuild: bool,
 }
 
@@ -115,14 +116,12 @@ impl CircuitParameterPlan {
                 .ok_or_else(|| SpiceError::circuit("missing parameter plan root"))?
                 .clone(),
         );
-        let elaborated = elaborate::literalize_with(&source, scope, &mut budget)?;
+        let elaborated = elaborate::literalize_with(&source, Arc::clone(&scope), &mut budget)?;
         let config = RunConfig::from_netlist(&source)?;
         let baseline = config.circuit(&source)?;
         let mut sites = Vec::new();
         for site in &elaborated.sites {
-            let expression = expression_at(&source, site.kind).ok_or_else(|| {
-                SpiceError::circuit("literalization site lost its original expression")
-            })?;
+            let expression = &site.expression;
             let inputs = parameters.bind_expression(root, expression, &mut budget)?;
             if inputs.inputs().is_empty() {
                 continue;
@@ -142,32 +141,24 @@ impl CircuitParameterPlan {
                 route,
             });
         }
-        let mut option_dependencies = Vec::new();
-        for card in &source.options {
-            for setting in &card.settings {
-                if let Some(expression) = &setting.expression {
-                    option_dependencies.extend(
-                        parameters
-                            .bind_expression(root, expression, &mut budget)?
-                            .inputs(),
-                    );
-                }
-            }
-        }
-        option_dependencies.sort_unstable();
-        option_dependencies.dedup();
-        // Options, nested formal scopes and behavioural expression rewriting
-        // can change independently of the compiled numeric device sites.
-        // Root report directives are downstream consumers of the candidate
-        // scope, not changes to elaborated circuit topology.
-        let requires_rebuild = !source.subcircuits.is_empty()
-            || !source.options.is_empty()
-            || source.devices.iter().any(|device| {
-                device
-                    .parameters
+        let option_dependencies = parameters.bind_expressions(
+            root,
+            source.options.iter().flat_map(|card| {
+                card.settings
                     .iter()
-                    .any(|parameter| matches!(parameter.kind, ParameterKind::Behavioural(_)))
-            });
+                    .filter_map(|setting| setting.expression.as_deref())
+            }),
+            &mut budget,
+        )?;
+        // The original AST does not reveal runtime laws hidden in lexical
+        // functions, or coefficients inserted by controlled-source lowering.
+        // Inspect the actual macro-expanded laws rather than the card syntax.
+        let laws = crate::netlist::behavioural::candidate_laws(&source, &scope, &mut budget)?;
+        let behavioural_dependencies = parameters.bind_behavioural(root, &laws, &mut budget)?;
+        // Nested formal scopes still require independent validation through
+        // the full elaborator. Root options need revalidation only when their
+        // actual parameter reads differ from the validated baseline.
+        let requires_rebuild = !source.subcircuits.is_empty();
         Ok(Self {
             source,
             parameters,
@@ -175,6 +166,7 @@ impl CircuitParameterPlan {
             config,
             sites,
             option_dependencies,
+            behavioural_dependencies,
             requires_rebuild,
         })
     }
@@ -234,64 +226,6 @@ impl CircuitParameterPlan {
             last_site_roundings: 0,
             prepared: None,
         })
-    }
-}
-
-fn expression_at(source: &Netlist, kind: SiteKind) -> Option<&ParameterExpression> {
-    match kind {
-        SiteKind::DeviceParameter { device, parameter } => {
-            match &source.devices.get(device)?.parameters.get(parameter)?.kind {
-                ParameterKind::Expression(expression) => Some(expression),
-                _ => None,
-            }
-        }
-        SiteKind::ModelParameter { model, parameter } => {
-            match &source.models.get(model)?.parameters.get(parameter)?.kind {
-                ParameterKind::Expression(expression) => Some(expression),
-                _ => None,
-            }
-        }
-        SiteKind::DeviceVectorEntry {
-            device,
-            parameter,
-            entry,
-        } => match &source.devices.get(device)?.parameters.get(parameter)?.kind {
-            ParameterKind::NumericVector(entries) => entries.get(entry)?.expression.as_deref(),
-            _ => None,
-        },
-        SiteKind::ModelVectorEntry {
-            model,
-            parameter,
-            entry,
-        } => match &source.models.get(model)?.parameters.get(parameter)?.kind {
-            ParameterKind::NumericVector(entries) => entries.get(entry)?.expression.as_deref(),
-            _ => None,
-        },
-        SiteKind::AnalysisArgument { analysis, argument } => source
-            .analyses
-            .get(analysis)?
-            .expressions
-            .iter()
-            .find(|expression| expression.index == argument)
-            .map(|value| &value.expression),
-        SiteKind::InitialCondition { card, entry } => {
-            match &source
-                .initial_conditions
-                .get(card)?
-                .entries
-                .get(entry)?
-                .value
-            {
-                NodeHintValue::Expression(expression) => Some(expression),
-                NodeHintValue::Literal { .. } => None,
-            }
-        }
-        SiteKind::Nodeset { card, entry } => {
-            match &source.nodesets.get(card)?.entries.get(entry)?.value {
-                NodeHintValue::Expression(expression) => Some(expression),
-                NodeHintValue::Literal { .. } => None,
-            }
-        }
     }
 }
 
@@ -624,26 +558,24 @@ impl CircuitCandidate<'_> {
     ) -> Vec<Result<Vec<GradientSite>, GradientSiteFailure>> {
         let mut output: Vec<Result<Vec<GradientSite>, GradientSiteFailure>> =
             (0..self.values.len()).map(|_| Ok(Vec::new())).collect();
-        // Numeric options can change the solver's convergence regime.
-        // Unknown nested or behavioural expressions have no validated
-        // differentiable-site binding, though black-box evaluation still works.
-        if !self.plan.source.subcircuits.is_empty()
-            || self.plan.source.devices.iter().any(|device| {
-                device
-                    .parameters
-                    .iter()
-                    .any(|parameter| matches!(parameter.kind, ParameterKind::Behavioural(_)))
-            })
-        {
+        // Nested scopes do not yet have a validated physical derivative
+        // binding. Runtime law coefficients invalidate only the inputs
+        // that actually affect their compiled numerical values.
+        if !self.plan.source.subcircuits.is_empty() {
             for result in &mut output {
                 *result = Err(GradientSiteFailure::Unsupported(
-                    "subcircuit or behavioural parameter dependency lacks a validated derivative binding"
+                    "subcircuit parameter dependency lacks a validated derivative binding"
                         .to_owned(),
                 ));
             }
             return output;
         }
-        for &input in &self.plan.option_dependencies {
+        for &input in self.plan.behavioural_dependencies.inputs() {
+            output[input] = Err(GradientSiteFailure::Unsupported(
+                "behavioural parameter dependency lacks a validated derivative binding".to_owned(),
+            ));
+        }
+        for &input in self.plan.option_dependencies.inputs() {
             output[input] = Err(GradientSiteFailure::Unsupported(
                 "input affects numerical analysis options".to_owned(),
             ));
@@ -736,7 +668,15 @@ impl CircuitCandidate<'_> {
         let mut roundings = 0;
         let baseline_context = self.plan.config.context().model_context();
         let mut fixed_context = baseline_context;
-        let mut structural = self.plan.requires_rebuild;
+        let mut structural = self.plan.requires_rebuild
+            || self
+                .plan
+                .option_dependencies
+                .changed_from_baseline(parameters)
+            || self
+                .plan
+                .behavioural_dependencies
+                .changed_from_baseline(parameters);
         // Preserve the small fixed-context route with zero heap allocation
         // when one or two ordinary sites change. Beyond its actual capacity,
         // promote the exact accumulated sites to an unbounded worker overlay.

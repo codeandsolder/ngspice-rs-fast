@@ -98,6 +98,8 @@ pub struct ResolvedSite {
     pub original: String,
     /// Location of the expression text.
     pub location: SourceLoc,
+    /// The actual numeric expression after lexical passive classification.
+    pub expression: crate::netlist::expr::ParameterExpression,
     /// The evaluated finite value before numparam formatting.
     pub value: Real,
     /// The literal inserted into the card by numparam.
@@ -111,10 +113,11 @@ impl ResolvedSite {
     fn record(
         kind: SiteKind,
         original: String,
-        location: SourceLoc,
+        expression: &crate::netlist::expr::ParameterExpression,
         value: Real,
         formatted: &str,
     ) -> SpiceResult<Self> {
+        let location = expression.span.start.clone();
         let read_back = crate::primitives::parse_spice_number(formatted).ok_or_else(|| {
             SpiceError::parse(
                 location.clone(),
@@ -125,6 +128,7 @@ impl ResolvedSite {
             kind,
             original,
             location,
+            expression: expression.clone(),
             value,
             formatted: formatted.to_owned(),
             read_back,
@@ -294,14 +298,7 @@ fn literalize_device_models(
     mut sites: Option<&mut Vec<ResolvedSite>>,
 ) -> SpiceResult<()> {
     for (di, device) in devices.iter_mut().enumerate() {
-        for parameter in &mut device.parameters {
-            if matches!(
-                (device.designator, parameter.name.as_str()),
-                ('r', "resistance") | ('c', "capacitance" | "charge") | ('l', "inductance")
-            ) {
-                crate::netlist::behavioural::classify_passive(parameter, scope, budget)?;
-            }
-        }
+        crate::netlist::behavioural::classify_device_passives(device, scope, budget)?;
         literalize_parameters(
             &mut device.parameters,
             scope,
@@ -414,7 +411,7 @@ fn literalize_hints(
                     } else {
                         expression.text.clone()
                     },
-                    expression.span.start.clone(),
+                    expression,
                     value,
                     &text,
                 )?;
@@ -462,7 +459,7 @@ fn literalize_parameters(
                         sites.push(ResolvedSite::record(
                             owner.site(index, Some(entry_index)),
                             entry.source.text.clone(),
-                            expression.span.start.clone(),
+                            &expression,
                             value,
                             &text,
                         )?);
@@ -516,7 +513,7 @@ fn literalize_parameters(
             sites.push(ResolvedSite::record(
                 owner.site(index, None),
                 parameter.value.clone(),
-                expression.span.start.clone(),
+                expression,
                 value,
                 &text,
             )?);
@@ -596,7 +593,7 @@ fn literalize_analysis_into(
                     argument: e.index,
                 },
                 argument.clone(),
-                e.expression.span.start.clone(),
+                &e.expression,
                 value,
                 &formatted,
             )?);
