@@ -61,7 +61,7 @@ impl Shape {
         self.length == self.convolution
     }
 
-    fn work(self, transforms: usize) -> usize {
+    const fn work(self, transforms: usize) -> usize {
         let radix = self
             .convolution
             .saturating_mul(self.convolution.ilog2() as usize + 1);
