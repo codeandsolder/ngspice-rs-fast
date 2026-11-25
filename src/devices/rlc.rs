@@ -1040,6 +1040,10 @@ impl Device for Inductor {
         1
     }
 
+    fn expression_current_branch(&self) -> Option<usize> {
+        Some(0)
+    }
+
     /// Flux `L i` and voltage `dflux/dt` (C `INDflux`/`INDvolt`).
     fn state_count(&self) -> usize {
         REACTIVE_STATE_COUNT

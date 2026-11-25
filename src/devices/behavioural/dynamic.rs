@@ -62,53 +62,68 @@ fn is_derivative(expr: &BExpr) -> bool {
     matches!(&expr.kind, BExprKind::Call { name, .. } if name == "ddt")
 }
 
-fn is_passive(instance: &DeviceInstance) -> bool {
-    matches!(instance.designator, 'r' | 'c' | 'l')
-}
-
-fn has_native_current(instance: &DeviceInstance) -> bool {
-    matches!(instance.designator, 'v' | 'e' | 'h')
-        || (is_passive(instance) && expressions(instance).next().is_some())
-        || (matches!(instance.designator, 'b' | 'a')
-            && instance
+/// A physical output current coordinate supplied by the selected factory.
+fn has_native_current(
+    instance: &DeviceInstance,
+    models: &crate::devices::models::ModelResolver<'_>,
+) -> SpiceResult<bool> {
+    Ok(match instance.designator {
+        'v' | 'e' | 'h' | 'l' => true,
+        'r' | 'c' => expressions(instance).next().is_some(),
+        'b' => instance
+            .parameters
+            .iter()
+            .any(|parameter| parameter.name == "v"),
+        'a' => {
+            models.resolve(instance)?.is_some_and(|model| {
+                model.levels().backend == crate::devices::models::ModelBackend::RationalTransfer
+            }) || instance
                 .parameters
                 .iter()
-                .any(|parameter| parameter.name == "v"))
+                .any(|parameter| parameter.name == "v")
+        }
+        _ => false,
+    })
 }
 
-/// Only resolved passive expressions use this path. Other behavioural cards
-/// retain the established source-level measurement rewrite.
-fn measured_targets(instances: &[DeviceInstance]) -> BTreeSet<usize> {
-    if !instances
-        .iter()
-        .filter(|instance| is_passive(instance))
-        .flat_map(expressions)
-        .any(|expression| !expression.root.current_references().is_empty())
-    {
-        return BTreeSet::new();
-    }
-    let index: BTreeMap<_, _> = instances
-        .iter()
-        .enumerate()
-        .map(|(index, instance)| (instance.name.as_str(), index))
-        .collect();
-    let mut targets = BTreeSet::new();
-    for expression in instances
-        .iter()
-        .filter(|instance| is_passive(instance))
-        .flat_map(expressions)
-    {
+fn measured_targets(
+    instances: &[DeviceInstance],
+    models: &crate::devices::models::ModelResolver<'_>,
+) -> SpiceResult<BTreeSet<usize>> {
+    let mut referenced = BTreeMap::new();
+    for expression in instances.iter().flat_map(expressions) {
         expression.root.visit(&mut |node| {
-            if let BExprKind::Current(name) = &node.kind
-                && let Some(&index) = index.get(name.as_str())
-                && !has_native_current(&instances[index])
-                && !instances[index].nodes.is_empty()
-            {
-                targets.insert(index);
+            if let BExprKind::Current(name) = &node.kind {
+                referenced
+                    .entry(name.to_ascii_lowercase())
+                    .or_insert_with(|| node.span.start.clone());
             }
         });
     }
-    targets
+    if referenced.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut targets = BTreeSet::new();
+    for (index, instance) in instances.iter().enumerate() {
+        if let Some(location) = referenced.get(&instance.name.to_ascii_lowercase())
+            && !has_native_current(instance, models)?
+        {
+            // A series probe reads the first physical terminal. A terminal-less
+            // object or a collapsed/unknown port cannot be sensed this way.
+            if instance.nodes.is_empty() || (instance.designator == 'a' && instance.model.is_some())
+            {
+                return Err(SpiceError::parse(
+                    location.clone(),
+                    format!(
+                        "{} has no analog current measurement terminal",
+                        instance.name
+                    ),
+                ));
+            }
+            targets.insert(index);
+        }
+    }
+    Ok(targets)
 }
 
 /// Extract dynamic operators once, after lexical resolution and hierarchy
@@ -118,6 +133,7 @@ fn measured_targets(instances: &[DeviceInstance]) -> BTreeSet<usize> {
 pub(in crate::devices) fn expand<'a, 'n>(
     instances: &'a [DeviceInstance],
     nodes: &NodeTable,
+    models: &crate::devices::models::ModelResolver<'_>,
     existing_names: impl Iterator<Item = &'n str>,
     capacity: usize,
 ) -> SpiceResult<Cow<'a, [DeviceInstance]>> {
@@ -129,7 +145,7 @@ pub(in crate::devices) fn expand<'a, 'n>(
             }
         });
     }
-    let measured = measured_targets(instances);
+    let measured = measured_targets(instances, models)?;
     if count == 0 && measured.is_empty() {
         return Ok(Cow::Borrowed(instances));
     }
@@ -185,7 +201,7 @@ pub(in crate::devices) fn expand<'a, 'n>(
     for index in measured {
         let (node, source) = expansion.names("sense", 'v')?;
         let original = &instances[index];
-        renames.insert(original.name.clone(), source.clone());
+        renames.insert(original.name.to_ascii_lowercase(), source.clone());
         senses.insert(
             index,
             DeviceInstance {
@@ -209,7 +225,7 @@ pub(in crate::devices) fn expand<'a, 'n>(
             if let ParameterKind::Behavioural(expression) = &mut parameter.kind {
                 expression.root.visit_mut(&mut |expr| {
                     if let BExprKind::Current(name) = &mut expr.kind
-                        && let Some(source) = renames.get(name)
+                        && let Some(source) = renames.get(&name.to_ascii_lowercase())
                     {
                         name.clone_from(source);
                     }
