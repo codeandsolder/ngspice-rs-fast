@@ -29,7 +29,7 @@ use crate::netlist::ast::{
     AnalysisCard, DeviceInstance, ModelCard, Netlist, NodeHint, NodeHintCard, NodeHintValue,
     ParameterAssignment, ParameterKind, Subcircuit,
 };
-use crate::netlist::eval::{EvalBudget, EvalLimits, FunctionScope, ParamScope};
+use crate::netlist::eval::{EvalBudget, FunctionScope, ParamScope};
 
 /// Which site was literalized (indexes into the *input* netlist).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +189,7 @@ pub fn format_literal(value: Real) -> String {
 /// Any parameter or site evaluation failure (undefined, cyclic, domain,
 /// non-finite, over budget), with source locations.
 pub fn literalize(netlist: &Netlist) -> SpiceResult<ElaboratedNetlist> {
-    let mut budget = EvalBudget::new(EvalLimits::default());
+    let mut budget = EvalBudget::for_netlist(netlist)?;
     let functions = FunctionScope::for_netlist(netlist, &budget)?;
     let scope = Arc::new(ParamScope::resolve_scoped(
         None,

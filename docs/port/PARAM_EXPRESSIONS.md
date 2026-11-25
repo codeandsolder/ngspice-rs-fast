@@ -126,7 +126,7 @@ remain possible within the node budget. Valid numparam outside the subset is `Sp
 ## Explicit exclusions
 
 Not accepted: comparison/logical/ternary operators (`< > <= >= == != <> && || ! ? :`), `%`
-and `\`; `ternary_fcn`, randomised `agauss gauss unif aunif limit`, string
+and `\`; `ternary_fcn`, string
 `vec`/`var` (unless a `.func` defines the name); double-quoted string
 parameters and quotes *inside* an expression; `.param` with `&`, `.if` blocks; expressions inside waveform
 (`PULSE`/`PWL`), `ic=` vector, flag and `level=` model-selector sites (explicit
@@ -193,7 +193,7 @@ undefined.
 `RunConfig::from_netlist` evaluates them against the top-level scope (see
 [FRONTEND_STRUCTURE.md](FRONTEND_STRUCTURE.md#expression-option-values-107-option-part)).
 
-Remaining limits: no comparison/ternary operators or random functions.
+Remaining limits: no comparison/ternary operators in the numparam grammar.
 
 ## Public API for an evaluator
 
@@ -296,3 +296,44 @@ Known pre-existing divergence (not changed here, #18): C evaluates an `X`
 instance's parameter expression inside the callee's numparam scope, so
 `x1 n s w={k*5}` sees a body `.param k`; the port evaluates it in the caller's
 scope.
+
+
+## Statistical realization
+
+The static functions follow the distributions in
+`src/frontend/numparam/xpressn.c` and `src/frontend/inp.c`:
+`agauss(n,a,s)` adds a zero-mean normal perturbation with standard
+deviation a/s; `gauss(n,r,s)` uses n*r/s. Nonpositive variation or sigma
+returns the nominal value. `aunif(n,a)` adds a uniform draw in [-a,a],
+`unif(n,r)` uses n*r, and `limit(n,a)` selects n-a or n+a with equal
+probability. User functions shadow these names. Statistical calls inside
+a scalar function evaluate by value, as for all numparam functions;
+behavioural macro expansion realizes each resulting call occurrence.
+Both static parameter and behavioural elaboration use the shared
+counter-based random kernel, not C's process-global RNG.
+
+A deck's realization is fixed by a positive integer literal
+`.options seed=N` (or `rndseed=N`, last setting wins), default 1.
+This option is a top-level deck-loading input; expression-dependent
+seeds, subcircuit-local seeds and entropy-based `seed=random` are
+explicit errors. Each independent expression site uses its source
+file/line/column and expanded scope identity. A call ordinal distinguishes
+multiple calls in a macro expansion. Identical source and seed reproduce
+the same draws; moving/reordering source sites is a new realization.
+A named parameter samples once, so every reference shares its value.
+Separate subcircuit instances have independent streams; references to
+an enclosing sampled parameter remain correlated.
+
+Candidate updates preserve the normalized draws for the same sites,
+including partial dependency updates and fresh circuit rebuilds. An
+ordinary expression pays no source-path hashing cost unless a statistical
+function actually occurs. No runtime expression program contains an
+unrealized statistical call. Behavioural arguments must be static after
+lexical resolution, including static arithmetic; time, voltage, current,
+temperature or frequency dependent arguments are rejected. Transient
+noise sources retain their separate explicit physical-time stream policy.
+
+Native realizations are deterministic and distribution-equivalent,
+not bitwise matches for C's global RNG sequence or its six-significant-
+digit B-card text substitution. The native sampler retains full
+binary64 precision before ordinary numparam serialization.

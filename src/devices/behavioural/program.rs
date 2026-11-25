@@ -312,7 +312,7 @@ impl Program {
     /// errors), non-literal or non-monotonic `pwl()` points (C:
     /// `prepare_PTF_PWL`), and [`SpiceError::NotYetPorted`] for `ddt()` and
     /// the statistical functions (`agauss`, `gauss`, `aunif`, `unif`,
-    /// `limit`; normally already rejected by the front end). Expressions
+    /// `limit`; must be realized by the front end). Expressions
     /// exceeding the source depth, size or symbolic expansion limits are
     /// explicitly rejected before unbounded work can occur.
     pub fn compile(expr: &BExpr) -> SpiceResult<Self> {

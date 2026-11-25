@@ -196,8 +196,7 @@ ngspice 47 output spectral amplitudes both equal
 ## Remaining work
 
 Source-dialect E/G LAPLACE normalization is tracked in the preprocessing
-repository (#44), using the native rational transfer model. Statistical
-functions, more general rank-aware constraint reduction and high-index
-initialization, mutual coupling, broader reference coverage, and
-nonlinear candidate testing
-remain within issue #184.
+repository (#44), using the native rational transfer model. Derivative-operator UIC, more general rank-aware and high-index initialization,
+mutual coupling, broader reference coverage, and nonlinear candidate testing
+remain within issue #184. Static statistical realization is documented in
+[PARAM_EXPRESSIONS.md](PARAM_EXPRESSIONS.md).

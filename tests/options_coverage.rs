@@ -838,6 +838,16 @@ fn pivot_thresholds_reach_every_circuit_factorization() {
 
 #[test]
 fn unknown_and_unported_options_still_fail() {
+    assert!(config(".options seed=5").is_ok());
+    assert!(config(".options rndseed=5").is_ok());
+    for invalid in [
+        ".options seed=0",
+        ".options seed=1.5",
+        ".options seed=random",
+        ".options seed={x}",
+    ] {
+        assert!(config(invalid).is_err(), "{invalid}");
+    }
     for unknown in [".options bogus=1", ".options postt", ".options itl7=1"] {
         assert!(
             matches!(config(unknown), Err(SpiceError::Parse { .. })),
@@ -851,7 +861,6 @@ fn unknown_and_unported_options_still_fail() {
         ".options numdgt=8",
         ".options savecurrents",
         ".options scale=1u",
-        ".options seed=5",
         ".options klu",
     ] {
         assert!(

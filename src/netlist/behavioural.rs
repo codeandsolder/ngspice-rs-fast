@@ -469,6 +469,7 @@ pub fn resolve_expression(
         scope,
         functions: scope.functions().cloned(),
         budget,
+        sampler: scope.sampler(&expression.span.start),
         verbatim: expression.verbatim,
         syntax_only: false,
         nodes: 0,
@@ -533,6 +534,7 @@ pub(crate) fn classify_passive(
         scope,
         functions: scope.functions().cloned(),
         budget,
+        sampler: scope.sampler(&expression.span.start),
         verbatim: expression.verbatim,
         syntax_only: true,
         nodes: 0,
@@ -578,10 +580,41 @@ pub(crate) fn classify_passive(
     Ok(())
 }
 
+/// Static argument arithmetic follows the same compiled expression semantics
+/// as the surrounding behavioural law, but cannot read any circuit quantity.
+fn statistical_argument(expr: &BExpr) -> SpiceResult<Real> {
+    let mut dynamic = false;
+    expr.visit(&mut |node| {
+        dynamic |= matches!(
+            &node.kind,
+            BExprKind::Voltage { .. } | BExprKind::Current(_)
+        ) || matches!(&node.kind, BExprKind::Name(name) if !matches!(name.as_str(),"pi"|"e"))
+            || matches!(&node.kind, BExprKind::Call { name,.. } if name == "ddt");
+    });
+    if dynamic {
+        return Err(parse_error(
+            &expr.span,
+            "statistical function requires static arguments, not a circuit-dependent value".into(),
+        ));
+    }
+    use crate::devices::behavioural::program::{Environment, Program};
+    let program = Program::compile(expr)?;
+    Ok(program
+        .evaluate(&Environment {
+            values: &[],
+            time: 0.,
+            temperature: 0.,
+            gmin: 0.,
+            frequency: 0.,
+        })?
+        .value)
+}
+
 struct Resolver<'a> {
     scope: &'a ParamScope,
     functions: Option<Arc<FunctionScope>>,
     budget: &'a mut EvalBudget,
+    sampler: crate::netlist::eval::statistics::Sampler<'a>,
     verbatim: bool,
     syntax_only: bool,
     nodes: usize,
@@ -662,9 +695,11 @@ impl Resolver<'_> {
             BExprKind::Call { name, arguments } => {
                 return self.call(expr, name, arguments, depth);
             }
-            BExprKind::Value(value) if !self.syntax_only => {
-                spliced(self.scope.evaluate(value, self.budget)?)
-            }
+            BExprKind::Value(value) if !self.syntax_only => spliced(self.scope.evaluate_sampled(
+                value,
+                self.budget,
+                &self.sampler,
+            )?),
             BExprKind::Value(_) => expr.kind.clone(),
             BExprKind::Table(table) => {
                 let input = self.resolve(&table.input, depth + 1)?;
@@ -768,18 +803,16 @@ impl Resolver<'_> {
             });
         }
         if !self.syntax_only && STATISTICAL_FUNCTIONS.contains(&name) {
-            // inp.c's eval_agauss() replaces each call on a B line by one
-            // value drawn before parsing (inpcom.c applies the same set to
-            // .param lines in inp_fix_agauss_in_param()).
-            return Err(SpiceError::not_yet_ported(
-                format!(
-                    "{}: {name}() in a behavioural expression (a random value drawn \
-                     once before the expression is parsed)",
-                    expr.span.start
-                ),
-                "src/frontend/inp.c (eval_agauss); src/frontend/inpcom.c \
-                 (inp_fix_agauss_in_param)",
-            ));
+            let mut values = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                let resolved = self.resolve(argument, depth + 1)?;
+                values.push(statistical_argument(&resolved)?);
+            }
+            let value = self.sampler.sample(name, &values, &expr.span.start)?;
+            return Ok(BExpr {
+                kind: spliced(value),
+                span: expr.span.clone(),
+            });
         }
         if !self.syntax_only && !is_builtin_function(name) {
             return Err(SpiceError::parse(
