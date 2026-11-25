@@ -269,6 +269,40 @@ analytically differentiated charge was 1.45e-7 A, and terminal KCL
 closed within 5.34e-15 A. This is a charge-network reference, not a
 claim that the full vendor switching model has been ported.
 
+## Stiff controlled-charge numerical limit
+
+An analytical stress case uses a 1 kOhm shunt and
+Q=1 uF * (u+0.5*u^3), where u=v(out)-v(ctrl). The control ramps
+from 0 to 1 V in 1 ns after 0.5 ms, while the nominal discharge
+time constant is 1 ms. At reltol=1e-8, abstol=1e-12 A and
+vntol=1e-9 V, the native transient currently fails at the end
+of the ramp. The independent ngspice 47 run also fails its
+tight-tolerance transient, later in the discharge.
+
+The native truncation estimate reduces the post-ramp step to
+3.27 fs. At this step the separately evaluated physical
+constitutive residual differs by approximately 3.16 nA despite
+stationary Newton iterates. Further reductions amplify the
+rounding error; at the minimum step the residual is about
+7.38 uA. This is not a failure of the analytical charge law.
+The existing derivative-form matrix multiplies nearly cancelling
+terminal/control voltages by the large integration coefficient.
+A numerical floor on the constitutive residual alone would not
+guarantee terminal KCL.
+
+A structural remedy to investigate is an independent storage
+coordinate z with separate equations z=Q(x) and
+i-dz/dt=0 (and the analogous signal equation for ddt).
+This separates the charge-scale constitutive solve from the
+current-scale integration constraint. It must preserve the
+initialization, small-signal, Jacobian and accepted-history
+contracts, and be verified against the stiff case before
+changing the implementation. For the post-ramp discharge,
+the exact invariant is
+2.5*ln(v)-3*v+0.75*v^2 + (t-t_end)/1 ms = constant.
+Both terminal KCL and the time integral of current provide
+independent conservation checks.
+
 ## Remaining work
 
 Source-dialect E/G LAPLACE normalization is tracked in the preprocessing
