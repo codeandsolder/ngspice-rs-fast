@@ -182,6 +182,7 @@ pub(super) fn instantiate(
     let source = SourceBinding {
         model_name: model.card().name.clone(),
         designator: 'd',
+        voltage_step_limiting: true,
         parameters: if absolute {
             ABSOLUTE_PARAMETERS
         } else {

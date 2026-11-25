@@ -344,3 +344,64 @@ fn invalid_source_models_and_topology_changes_are_explicit() {
         "temperature-induced zero series resistance changes topology"
     );
 }
+
+#[test]
+fn series_device_observations_and_noise_transfer_use_external_terminals() {
+    let context = AnalysisContext {
+        gmin: 1e-3,
+        ..AnalysisContext::default()
+    };
+    let mut circuit = Circuit::from_netlist_with_context(
+        &parse("terminal observation\nV1 a 0 1\nD1 a 0 DM\n.model DM simetrix_diode_level1(IS=0 RS=100)\n.end\n"),
+        &context.model_context(),
+    ).unwrap();
+    circuit
+        .set_observations(&["@d1[i]".into(), "@d1[temp]".into(), "@d1[p]".into()])
+        .unwrap();
+    let plots =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()
+            .unwrap()
+            .run_plots(&mut circuit, &context)
+            .unwrap();
+    for column in ["@d1[i]", "@d1[p]"] {
+        close(
+            plots[0].value(column, 0).unwrap().re,
+            1. / 1100.,
+            1e-10,
+            1e-14,
+        );
+    }
+    close(plots[0].value("@d1[temp]", 0).unwrap().re, 27., 1e-12, 0.);
+
+    // At zero bias only the physical series resistor and the external
+    // resistor generate noise. GMIN is a numerical conductance, not a
+    // thermal noise generator. Check the transfer from the hidden node.
+    let mut circuit = Circuit::from_netlist_with_context(
+        &parse("series noise\nV1 in 0 DC 0 AC 1\nR1 in out 1k\nD1 out 0 DM\n.model DM simetrix_diode_level1(IS=0 RS=100)\n.end\n"),
+        &context.model_context(),
+    ).unwrap();
+    let plots = AnalysisInput::with_arguments(
+        AnalysisKind::Noise,
+        ["v(out)", "v1", "lin", "2", "1k", "2k"],
+    )
+    .resolve()
+    .unwrap()
+    .run_plots(&mut circuit, &context)
+    .unwrap();
+    let temperature = 300.15;
+    let external_gain = 1100. / 2100_f64;
+    let series_gain = 1000. / 2100_f64;
+    let density = 4.
+        * temperature
+        * (ngspice_rs::devices::noise::BOLTZMANN * 1000. * external_gain.powi(2)
+            + model_kernel_diode::BOLTZMANN * 100. * series_gain.powi(2));
+    for row in 0..plots[0].point_count() {
+        close(
+            plots[0].value("onoise_spectrum", row).unwrap().re,
+            density.sqrt(),
+            1e-9,
+            1e-18,
+        );
+    }
+}
