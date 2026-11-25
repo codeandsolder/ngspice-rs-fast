@@ -1374,7 +1374,7 @@ fn reference_aliases(
             .variable_index(original)
             .ok_or_else(|| format!("missing physical coordinate {original} for {alias}"))?;
         let mut variable = plot.variables()[index].clone();
-        variable.name = alias.to_owned();
+        alias.clone_into(&mut variable.name);
         variables.push(variable);
         columns.push(index);
     }
