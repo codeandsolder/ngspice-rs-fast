@@ -6,9 +6,11 @@
 //! boundary endpoint, and reduction preserves endpoints, causal fronts
 //! and the wave-energy inequality for every affine combination.
 mod energy;
+mod history;
 mod reduce;
 
 use energy::scattering_energy_factor;
+use history::{KnownWave, RetainedWindow, WaveRead};
 
 use super::{LossyPlan, Real, SpiceResult, invalid};
 
@@ -101,7 +103,6 @@ pub(super) struct Point<Value> {
 
 type Knot<Value = Affine> = Point<Value>;
 type Wave<Value = Affine> = Vec<Knot<Value>>;
-type KnownWave = Wave<Real>;
 
 /// A PWL value is either a realized scalar or an affine function of all
 /// trial endpoints. Ordinary causal accepts need no per-knot coefficient
@@ -244,21 +245,22 @@ fn histories_bytes<Value: WaveValue>(waves: &[Vec<Point<Value>>]) -> usize {
         .saturating_add(waves.iter().map(wave_bytes).sum::<usize>())
 }
 
-fn sample<Value: WaveValue>(wave: &[Point<Value>], time: Real, origin: Real) -> SpiceResult<Value> {
+fn sample<W: WaveRead + ?Sized>(wave: &W, time: Real, origin: Real) -> SpiceResult<W::Value> {
     if time < origin {
-        return Ok(Value::scalar(0.));
+        return Ok(W::Value::scalar(0.));
     }
     let upper = wave.partition_point(|knot| knot.time <= time);
-    sample_at(wave, time, upper)
+    sample_at(wave, time, upper, &mut 0)
 }
 
-fn sample_at<Value: WaveValue>(
-    wave: &[Point<Value>],
+fn sample_at<W: WaveRead + ?Sized>(
+    wave: &W,
     time: Real,
     upper: usize,
-) -> SpiceResult<Value> {
+    hint: &mut usize,
+) -> SpiceResult<W::Value> {
     let first = wave
-        .get(upper.saturating_sub(1))
+        .get_hint(upper.saturating_sub(1), hint)
         .ok_or_else(|| invalid("empty CPL wave history"))?;
     if upper == 0 {
         let roundoff = 8. * Real::EPSILON * first.time.abs().max(time.abs());
@@ -270,7 +272,7 @@ fn sample_at<Value: WaveValue>(
         }
         return Ok(first.wave.clone());
     }
-    let Some(last) = wave.get(upper) else {
+    let Some(last) = wave.get_hint(upper, hint) else {
         let roundoff = 8. * Real::EPSILON * first.time.abs().max(time.abs());
         if time - first.time > roundoff {
             return Err(invalid(format!(
@@ -281,39 +283,40 @@ fn sample_at<Value: WaveValue>(
         return Ok(first.wave.clone());
     };
     let fraction = (time - first.time) / (last.time - first.time);
-    Ok(Value::interpolate(&first.wave, &last.wave, fraction))
+    Ok(W::Value::interpolate(&first.wave, &last.wave, fraction))
 }
 
 // A cursor consumes a monotonically increasing time sequence without
-// searching the same immutable history at every scattering knot. The
-// interpolation and endpoint/error handling are shared with random access.
-struct WaveCursor<'a, Value> {
-    wave: &'a [Point<Value>],
+// searching the same immutable history at every scattering knot.
+struct WaveCursor<'a, W: WaveRead + ?Sized> {
+    wave: &'a W,
     upper: usize,
+    hint: usize,
     origin: Real,
 }
 
-impl<'a, Value: WaveValue> WaveCursor<'a, Value> {
-    fn new(wave: &'a [Point<Value>], time: Real, origin: Real) -> Self {
+impl<'a, W: WaveRead + ?Sized> WaveCursor<'a, W> {
+    fn new(wave: &'a W, time: Real, origin: Real) -> Self {
         Self {
             wave,
             upper: wave.partition_point(|knot| knot.time <= time),
+            hint: 0,
             origin,
         }
     }
 
-    fn sample(&mut self, time: Real) -> SpiceResult<Value> {
+    fn sample(&mut self, time: Real) -> SpiceResult<W::Value> {
         if time < self.origin {
-            return Ok(Value::scalar(0.));
+            return Ok(W::Value::scalar(0.));
         }
         while self
             .wave
-            .get(self.upper)
+            .get_hint(self.upper, &mut self.hint)
             .is_some_and(|knot| knot.time <= time)
         {
             self.upper += 1;
         }
-        sample_at(self.wave, time, self.upper)
+        sample_at(self.wave, time, self.upper, &mut self.hint)
     }
 }
 
@@ -358,15 +361,19 @@ fn augment_curve<'a, Value: WaveValue>(
     Ok(std::borrow::Cow::Owned(output))
 }
 
-fn shifted_times<Value>(
-    wave: &[Point<Value>],
+fn shifted_times<W: WaveRead + ?Sized>(
+    wave: &W,
     delay: Real,
     start: Real,
     end: Real,
     times: &mut Vec<Real>,
 ) {
     let first = wave.partition_point(|knot| knot.time + delay <= start);
-    for knot in &wave[first..] {
+    let mut hint = 0;
+    for index in first..wave.len() {
+        let Some(knot) = wave.get_hint(index, &mut hint) else {
+            break;
+        };
         let time = knot.time + delay;
         if time >= end {
             break;
@@ -534,8 +541,8 @@ impl ContinuousPlan {
             origin: 0.,
             reltol: 0.,
             initial_input: vec![0.; ports],
-            boundary: vec![Vec::new(); ports],
-            outgoing: vec![Vec::new(); self.delays.len()],
+            boundary: vec![KnownWave::default(); ports],
+            outgoing: vec![KnownWave::default(); self.delays.len()],
         }
     }
 
@@ -545,7 +552,7 @@ impl ContinuousPlan {
         history.reltol = reltol;
         history.initial_input.copy_from_slice(input);
         for wave in history.boundary.iter_mut().chain(&mut history.outgoing) {
-            wave.push(Point { time, wave: 0. });
+            *wave = KnownWave::single(Point { time, wave: 0. });
         }
         history
     }
@@ -686,7 +693,14 @@ impl ContinuousPlan {
             self.advance_scalar(plan, history, start, end, boundary_bytes, boundary)
         } else {
             let trial = self.trial(plan, history, start, end, boundary_bytes)?;
-            self.accept(history, trial, start, end, input, delta)
+            self.accept(
+                history,
+                trial,
+                start,
+                end,
+                (input, delta),
+                (boundary_bytes, plan.limit.saturating_mul(2)),
+            )
         }
     }
 
@@ -719,18 +733,18 @@ impl ContinuousPlan {
             next: end,
             realized: Some(delta),
         };
-        let mut next = self.successor(history, end, input)?;
-        // The accepted-state limit is half the total configured workspace
-        // so two accepted versions may coexist during atomic publication.
-        // Here the old state is immutable and the new state grows directly;
-        // use the total limit for both states plus this one stage's scratch.
+        // The old state and new state share complete immutable blocks.
+        // Charge each shared allocation only once against the original
+        // total workspace, along with the current stage scratch.
         let limit = plan.limit.saturating_mul(2);
-        let stage_headers = ports * std::mem::size_of::<KnownWave>();
-        let mut bytes = boundary_bytes
-            .saturating_add(boundary_bytes.saturating_sub(history.workspace()))
-            .saturating_add(next.workspace())
-            .saturating_add(next.outgoing.capacity() * std::mem::size_of::<KnownWave>())
-            .saturating_add(trial.workspace());
+        let stage_headers = ports * std::mem::size_of::<Wave<Real>>();
+        let (mut next, mut bytes) = self.successor(
+            history,
+            start,
+            end,
+            input,
+            (boundary_bytes, limit, trial.workspace()),
+        )?;
         for stage in 0..plan.sections {
             bytes = bytes.saturating_add(stage_headers);
             let curves = self.compress_stage(&step, stage, &mut bytes, limit)?;
@@ -740,9 +754,7 @@ impl ContinuousPlan {
                 let old = &history.outgoing[node];
                 let curve_bytes = wave_bytes(&curve);
                 let window = RetainedWindow::new(old, &curve, start, cutoff);
-                let allocation = window
-                    .count(old.len(), curve.len())
-                    .saturating_mul(std::mem::size_of::<Point<Real>>());
+                let allocation = window.allocation_bound(old, curve.len());
                 if bytes.saturating_add(allocation) > limit {
                     return Err(invalid(
                         "CPL accepted window construction workspace exceeded",
@@ -751,7 +763,7 @@ impl ContinuousPlan {
                 let wave = window.merge(old, curve, cutoff, delta)?;
                 bytes = bytes
                     .saturating_sub(curve_bytes)
-                    .saturating_add(wave_bytes(&wave));
+                    .saturating_add(wave.unique_workspace(old));
                 next.outgoing.push(wave);
             }
             bytes = bytes.saturating_sub(stage_headers);
@@ -811,7 +823,12 @@ impl ContinuousPlan {
                 .saturating_add(trial.workspace())
                 .saturating_add(plan.terminal * std::mem::size_of::<Wave<Value>>());
             for stage in 0..plan.sections {
-                curves.extend(self.compress_stage(&context, stage, &mut bytes, plan.limit)?);
+                curves.extend(self.compress_stage(
+                    &context,
+                    stage,
+                    &mut bytes,
+                    plan.limit.saturating_mul(2),
+                )?);
             }
             for (node, (wave, curve)) in trial.outgoing.iter_mut().zip(curves).enumerate() {
                 let skip = usize::from(!wave.is_empty());
@@ -940,14 +957,33 @@ impl ContinuousPlan {
         trial: Trial<Value>,
         start: Real,
         end: Real,
-        input: &[Real],
-        delta: &[Real],
+        boundary: (&[Real], &[Real]),
+        budget: (usize, usize),
     ) -> SpiceResult<ContinuousHistory> {
-        let mut next = self.successor(history, end, input)?;
+        let (input, delta) = boundary;
+        let (boundary_bytes, limit) = budget;
+        let (mut next, mut bytes) = self.successor(
+            history,
+            start,
+            end,
+            input,
+            (boundary_bytes, limit, trial.workspace()),
+        )?;
         for (node, (old, new)) in history.outgoing.iter().zip(trial.outgoing).enumerate() {
             let cutoff = end - self.delays[node];
             let window = RetainedWindow::new(old, &new, start, cutoff);
-            next.outgoing.push(window.merge(old, new, cutoff, delta)?);
+            let allocation = window.allocation_bound(old, new.len());
+            if bytes.saturating_add(allocation) > limit {
+                return Err(invalid(
+                    "CPL accepted window construction workspace exceeded",
+                ));
+            }
+            let previous = wave_bytes(&new);
+            let wave = window.merge(old, new, cutoff, delta)?;
+            bytes = bytes
+                .saturating_sub(previous)
+                .saturating_add(wave.unique_workspace(old));
+            next.outgoing.push(wave);
         }
         Ok(next)
     }
@@ -955,94 +991,44 @@ impl ContinuousPlan {
     fn successor(
         &self,
         history: &ContinuousHistory,
+        start: Real,
         end: Real,
         input: &[Real],
-    ) -> SpiceResult<ContinuousHistory> {
+        budget: (usize, usize, usize),
+    ) -> SpiceResult<(ContinuousHistory, usize)> {
+        let (boundary_bytes, limit, trial_bytes) = budget;
         let mut next = ContinuousHistory {
             origin: history.origin,
             reltol: history.reltol,
             initial_input: history.initial_input.clone(),
-            boundary: history.boundary.clone(),
+            boundary: Vec::with_capacity(history.boundary.len()),
             outgoing: Vec::with_capacity(history.outgoing.len()),
         };
-        for (port, wave) in next.boundary.iter_mut().enumerate() {
+        let mut bytes = boundary_bytes
+            .saturating_add(boundary_bytes.saturating_sub(history.workspace()))
+            .saturating_add(next.headers())
+            .saturating_add(trial_bytes);
+        for (port, old) in history.boundary.iter().enumerate() {
             let value = input[port] - next.initial_input[port];
             if !value.is_finite() {
                 return Err(invalid("nonfinite accepted CPL boundary wave"));
             }
-            append(
-                wave,
-                Point {
-                    time: end,
-                    wave: value,
-                },
-            );
-            prune(wave, end - self.boundary_retention[port]);
-        }
-        Ok(next)
-    }
-}
-
-// Retain only the live predecessor and accepted samples in the new
-// delay window. The same merge is used for scalar direct publication
-// and oversized affine trials.
-struct RetainedWindow {
-    first: usize,
-    incoming: usize,
-}
-
-impl RetainedWindow {
-    fn new<Value>(old: &[Point<Real>], new: &[Knot<Value>], start: Real, cutoff: Real) -> Self {
-        let incoming = new.partition_point(|knot| knot.time <= start);
-        let expired = new.partition_point(|knot| knot.time <= cutoff);
-        if expired > incoming {
-            // The new curve already supplies the interpolation predecessor.
-            // No part of the previous history is needed in this window.
-            Self {
-                first: old.len(),
-                incoming: expired - 1,
+            let new = vec![Point {
+                time: end,
+                wave: value,
+            }];
+            let cutoff = end - self.boundary_retention[port];
+            let window = RetainedWindow::new(old, &new, start, cutoff);
+            if bytes.saturating_add(window.allocation_bound(old, new.len())) > limit {
+                return Err(invalid(
+                    "CPL accepted boundary construction workspace exceeded",
+                ));
             }
-        } else {
-            Self {
-                first: old
-                    .partition_point(|knot| knot.time <= cutoff)
-                    .saturating_sub(1),
-                incoming,
-            }
+            let wave = window.merge(old, new, cutoff, &[])?;
+            bytes = bytes.saturating_add(wave.unique_workspace(old));
+            next.boundary.push(wave);
         }
-    }
-
-    const fn count(&self, old: usize, new: usize) -> usize {
-        old - self.first + new - self.incoming
-    }
-
-    fn merge<Value: WaveValue>(
-        &self,
-        old: &[Point<Real>],
-        new: Wave<Value>,
-        cutoff: Real,
-        delta: &[Real],
-    ) -> SpiceResult<KnownWave> {
-        let mut wave = Vec::with_capacity(self.count(old.len(), new.len()));
-        wave.extend_from_slice(&old[self.first..]);
-        for knot in new.into_iter().skip(self.incoming) {
-            let value = knot.wave.evaluate(delta);
-            if !value.is_finite() {
-                return Err(invalid("nonfinite accepted CPL internal wave"));
-            }
-            append(
-                &mut wave,
-                Point {
-                    time: knot.time,
-                    wave: value,
-                },
-            );
-        }
-        prune(&mut wave, cutoff);
-        // The accepted successor is immutable, and this vector will never
-        // grow in place. Spare capacity from coalesced flat runs has no use.
-        wave.shrink_to_fit();
-        Ok(wave)
+        Ok((next, bytes))
     }
 }
 
@@ -1057,16 +1043,36 @@ pub(super) struct ContinuousHistory {
 
 impl ContinuousHistory {
     pub(super) fn workspace(&self) -> usize {
-        histories_bytes(&self.boundary)
-            .saturating_add(histories_bytes(&self.outgoing))
-            .saturating_add(self.initial_input.capacity() * std::mem::size_of::<Real>())
+        self.headers().saturating_add(
+            self.boundary
+                .iter()
+                .chain(&self.outgoing)
+                .map(KnownWave::workspace)
+                .sum::<usize>(),
+        )
+    }
+
+    const fn headers(&self) -> usize {
+        (self.boundary.capacity() + self.outgoing.capacity()) * std::mem::size_of::<KnownWave>()
+            + self.initial_input.capacity() * std::mem::size_of::<Real>()
+    }
+
+    pub(super) fn unique_workspace(&self, old: &Self) -> usize {
+        self.headers().saturating_add(
+            self.boundary
+                .iter()
+                .zip(&old.boundary)
+                .chain(self.outgoing.iter().zip(&old.outgoing))
+                .map(|(wave, previous)| wave.unique_workspace(previous))
+                .sum::<usize>(),
+        )
     }
 
     pub(super) fn len(&self) -> usize {
         self.boundary
             .iter()
             .chain(&self.outgoing)
-            .map(Vec::len)
+            .map(KnownWave::len)
             .sum()
     }
 
@@ -1088,6 +1094,13 @@ struct Trial<Value = Affine> {
 impl<Value: WaveValue> Trial<Value> {
     fn workspace(&self) -> usize {
         histories_bytes(&self.outgoing)
+            .saturating_add(self.output.capacity() * std::mem::size_of::<Value>())
+            .saturating_add(
+                self.output
+                    .iter()
+                    .map(WaveValue::allocated_bytes)
+                    .sum::<usize>(),
+            )
     }
 
     fn sample(
@@ -1181,11 +1194,11 @@ impl<Value: WaveValue> Step<'_, Value> {
     }
 }
 
-struct IncidentCursor<'a, Value> {
+struct IncidentCursor<'a, Value: WaveValue> {
     port: usize,
     delay: Real,
-    accepted: WaveCursor<'a, Real>,
-    trial: Option<WaveCursor<'a, Value>>,
+    accepted: WaveCursor<'a, KnownWave>,
+    trial: Option<WaveCursor<'a, Wave<Value>>>,
 }
 
 impl<'a, Value: WaveValue> IncidentCursor<'a, Value> {
@@ -1333,30 +1346,6 @@ mod tests {
         assert!(WaveCursor::new(&knots[2..], 0.05, 0.).sample(0.05).is_err());
     }
 
-    #[test]
-    fn retained_window_discards_old_history_when_trial_contains_predecessor() {
-        let old = vec![Point { time: 0., wave: 0. }, Point { time: 1., wave: 1. }];
-        let new = vec![
-            Point { time: 1., wave: 1. },
-            Point { time: 2., wave: 2. },
-            Point { time: 3., wave: 3. },
-            Point { time: 4., wave: 4. },
-        ];
-        for cutoff in [0.5, 1., 1.5, 2., 2.5, 4.] {
-            let mut reference = old.clone();
-            for point in new.iter().skip(1) {
-                append(&mut reference, point.clone());
-            }
-            prune(&mut reference, cutoff);
-            let window = RetainedWindow::new(&old, &new, 1., cutoff);
-            let count = window.count(old.len(), new.len());
-            let merged = window.merge(&old, new.clone(), cutoff, &[]).unwrap();
-            assert_eq!(merged, reference);
-            assert_eq!(merged.capacity(), merged.len());
-            assert_eq!(count, reference.len());
-        }
-    }
-
     fn dense_plan(sections: usize) -> LossyPlan {
         let material = CoupledLinePlan::from_packed(
             3,
@@ -1490,12 +1479,19 @@ mod tests {
                 .trial(&plan, &history, start, end, history.workspace())
                 .unwrap();
             history = continuous
-                .accept(&history, trial, start, end, &input, &delta)
+                .accept(
+                    &history,
+                    trial,
+                    start,
+                    end,
+                    (&input, &delta),
+                    (history.workspace(), plan.limit.saturating_mul(2)),
+                )
                 .unwrap();
             let cycle = usize::try_from((step - 1) / 120).unwrap();
             peaks[cycle] = peaks[cycle].max(history.len());
             for (wave, delay) in history.outgoing.iter().zip(&continuous.delays) {
-                assert!(wave.len() < 2 || wave[1].time >= end - delay);
+                assert!(wave.len() < 2 || wave.get_hint(1, &mut 0).unwrap().time >= end - delay);
             }
             previous = input;
             start = end;
@@ -1534,7 +1530,14 @@ mod tests {
             assert!((wave.evaluate(&input) - expected).abs() < 2e-5);
         }
         let accepted = continuous
-            .accept(&history, trial, 0., end, &input, &input)
+            .accept(
+                &history,
+                trial,
+                0.,
+                end,
+                (&input, &input),
+                (history.workspace(), plan.limit.saturating_mul(2)),
+            )
             .unwrap();
         assert_eq!(history, continuous.start(0., 1e-5, &zero));
         let next = continuous

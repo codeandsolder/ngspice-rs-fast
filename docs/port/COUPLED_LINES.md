@@ -180,8 +180,10 @@ constructs each next delay window directly from the old history and one
 stage's newly scattered waveforms. It keeps the old history immutable
 and does not retain a full duplicate trial. If the newly scattered curve
 already contains the delay-window predecessor, the expired history is
-not copied. Immutable successor windows discard unused allocation
-capacity. Oversized trials use waveforms affine in all new boundary
+not copied. Accepted waveforms are stored in immutable blocks of
+binary64 knots; complete live blocks are shared by the old and successor
+versions. Only partially retained blocks and the appendable suffix are
+copied. Oversized trials use waveforms affine in all new boundary
 endpoint increments, so the terminal relation includes arrivals and internal
 feedback during the trial. Rejected trials cannot advance the accepted
 wave histories.
@@ -229,8 +231,12 @@ limits account for retained scalar histories and affine trial scratch.
 Output-row batches and overlapping time chunks bound temporary scattering
 curves without changing their exact endpoint relations. The ordinary
 acceptance workspace accounts for both accepted versions and one stage's
-scratch under the total configured limit; the per-version accepted
-history limit remains half that budget. Exhaustion
+scratch under the total configured limit. A shared immutable block is
+charged once, including its reference-count allocation, while each
+version's block descriptors and all newly allocated blocks are charged
+separately. Thus the continuous solver need not reserve half the budget
+for a duplicate of the unchanged history. The exact impulse solver
+retains its separate half-budget policy. Exhaustion
 is reported rather than silently discarding significant arrivals.
 
 ## Passive finite-volume cable

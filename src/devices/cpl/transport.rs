@@ -285,13 +285,26 @@ impl CplHistory {
                 self.time
             )));
         }
-        let bytes = next
-            .boundary_bytes()
-            .saturating_add(next.kernel.workspace(width));
-        if next.limit != self.limit || bytes > self.limit {
-            return Err(invalid(format!(
-                "CPL accepted history budget: {bytes} estimated bytes, limit {} bytes, {} boundary segments, {} response knots, {} arrivals at {time:e}",
+        let (bytes, limit) = if let (Some(old), Some(new)) = (&self.continuous, &next.continuous) {
+            // The transactional update shares unchanged immutable wave blocks.
+            // Count the simultaneous versions, not two independent copies.
+            let bytes = self
+                .boundary_bytes()
+                .saturating_add(next.boundary_bytes().saturating_sub(new.workspace()))
+                .saturating_add(new.unique_workspace(old))
+                .saturating_add(self.kernel.workspace(width))
+                .saturating_add(next.kernel.workspace(width));
+            (bytes, self.limit.saturating_mul(2))
+        } else {
+            (
+                next.boundary_bytes()
+                    .saturating_add(next.kernel.workspace(width)),
                 self.limit,
+            )
+        };
+        if next.limit != self.limit || bytes > limit {
+            return Err(invalid(format!(
+                "CPL accepted history budget: {bytes} estimated bytes, limit {limit} bytes, {} boundary segments, {} response knots, {} arrivals at {time:e}",
                 next.segments.len(),
                 next.kernel.records,
                 next.kernel.pending.len()
@@ -888,7 +901,15 @@ impl LossyPlan {
         let ports = self.launch.len();
         let (known, coefficients) =
             if let (Some(plan), Some(state)) = (&self.continuous, &history.continuous) {
-                let output = plan.outputs(self, state, start, time, history.boundary_bytes())?;
+                let output = plan.outputs(
+                    self,
+                    state,
+                    start,
+                    time,
+                    history
+                        .boundary_bytes()
+                        .saturating_add(history.kernel.workspace(ports)),
+                )?;
                 let known = history
                     .initial_output
                     .iter()
@@ -1063,14 +1084,18 @@ impl LossyPlan {
         next.previous_time = Some(start);
         next.time = Some(context.time);
         if let Some((plan, state)) = direct {
-            next.continuous = Some(Arc::new(plan.advance(
-                self,
-                state,
-                start,
-                context.time,
-                history.boundary_bytes(),
-                (&incident[..ports], &segment.delta),
-            )?));
+            next.continuous = Some(Arc::new(
+                plan.advance(
+                    self,
+                    state,
+                    start,
+                    context.time,
+                    history
+                        .boundary_bytes()
+                        .saturating_add(history.kernel.workspace(ports)),
+                    (&incident[..ports], &segment.delta),
+                )?,
+            ));
             return Ok(CplUpdate {
                 reset: false,
                 next,
