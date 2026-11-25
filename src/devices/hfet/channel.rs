@@ -79,6 +79,9 @@ impl IntrinsicChannel {
 #[inline]
 #[expect(
     clippy::similar_names,
+    reason = "C equation symbols retained for numerical audit"
+)]
+#[expect(
     clippy::many_single_char_names,
     reason = "C equation symbols retained for numerical audit"
 )]

@@ -44,10 +44,6 @@
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
-#![expect(
-    clippy::many_single_char_names,
-    reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
-)]
 
 use super::channel::{ChannelModel, ChannelTemperature};
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step};

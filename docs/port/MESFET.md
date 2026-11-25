@@ -348,6 +348,14 @@ MESA's different channel physics and temperature observations stay separate.
 The extracted before/after equations agreed bit-for-bit on 6,816 intrinsic
 bias, density-branch and temperature combinations. Interleaved release
 microbenchmarks of the cached-parameter implementation showed no regression.
+A mixed-orientation grid (48 decks) also produces identical pre- and
+post-refactor results. Independent single-instance C comparisons cover
+both polarities, three temperatures, two density branches and both drain
+orientations. C HFETAload initializes its inverse flag before the
+instance loop and does not reset it for subsequent forward-biased
+instances; mixed-orientation C decks can therefore differ from isolated
+devices. The Rust port retains instance-local orientation, tested in
+both instance orders.
 
 ## HFET2 (level 6, `Z`, M10 H4, #169)
 
