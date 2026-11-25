@@ -655,7 +655,7 @@ impl SourceFunction {
 
     /// The corners the port lands on, ascending and unique: SIN/SFFM/AM
     /// delay, EXP `TD1` and `TD2`. See the module notes on C parity.
-    #[must_use]
+    #[must_use = "the returned times locate waveform transitions that the timestep scheduler must account for"]
     pub fn corners(&self) -> Vec<Real> {
         let mut corners = match *self {
             Self::Sine(s) => vec![s.delay],
@@ -781,13 +781,13 @@ impl PwlSource {
     }
 
     /// The knots as given (before the delay).
-    #[must_use]
+    #[must_use = "the returned unshifted knots define the PWL interpolation geometry"]
     pub fn knots(&self) -> &[(Real, Real)] {
         &self.knots
     }
 
     /// The `td=` delay.
-    #[must_use]
+    #[must_use = "the returned delay maps PWL local time to simulation time"]
     pub const fn delay(&self) -> Real {
         match self.timing {
             PwlTiming::Plain => 0.,
@@ -796,7 +796,7 @@ impl PwlSource {
     }
 
     /// The knot index repetition restarts from, if repeating.
-    #[must_use]
+    #[must_use = "the returned option determines whether and where PWL evaluation restarts"]
     pub const fn repeat(&self) -> Option<usize> {
         match self.timing {
             PwlTiming::Plain => None,

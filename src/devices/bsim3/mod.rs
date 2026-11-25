@@ -30,7 +30,7 @@ pub(in crate::devices) static DEVICE: Device = Device {
 };
 
 /// C's `IF_UNINTERESTING` rows, as `TABLE:keyword` pairs.
-#[must_use]
+#[must_use = "the returned table identifies reference interface rows excluded from ordinary parameter reporting"]
 pub const fn uninteresting() -> &'static [&'static str] {
     DEVICE.uninteresting
 }
