@@ -204,7 +204,7 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
         self.positions
             .windows(2)
             .zip(self.rows().zip(self.rows().skip(1)))
-            .map(|(x, (a, b))| (x, [a, b]))
+            .map(|(x, pair)| (x, pair.into()))
     }
 
     fn endpoints(&self) -> (&[Real], &[Real]) {

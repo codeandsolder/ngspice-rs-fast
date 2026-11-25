@@ -794,22 +794,39 @@ impl ContinuousPlan {
         input: &[Real],
         delta: &[Real],
     ) -> SpiceResult<ContinuousHistory> {
-        let mut next = history.clone();
-        for (node, (wave, new)) in next.outgoing.iter_mut().zip(trial.outgoing).enumerate() {
-            for knot in new.into_iter().filter(|knot| knot.time > start) {
+        // Build only the live portion of each accepted delay window.
+        // Cloning the full old window and then appending before pruning
+        // doubles capacity on ordinary steps even when most of it expires.
+        let mut next = ContinuousHistory {
+            origin: history.origin,
+            reltol: history.reltol,
+            initial_input: history.initial_input.clone(),
+            boundary: history.boundary.clone(),
+            outgoing: Vec::with_capacity(history.outgoing.len()),
+        };
+        for (node, (old, new)) in history.outgoing.iter().zip(trial.outgoing).enumerate() {
+            let cutoff = end - self.delays[node];
+            let first = old
+                .partition_point(|knot| knot.time <= cutoff)
+                .saturating_sub(1);
+            let incoming = new.partition_point(|knot| knot.time <= start);
+            let mut wave = Vec::with_capacity(old.len() - first + new.len() - incoming);
+            wave.extend_from_slice(&old[first..]);
+            for knot in new.into_iter().skip(incoming) {
                 let value = knot.wave.evaluate(delta);
                 if !value.is_finite() {
                     return Err(invalid("nonfinite accepted CPL internal wave"));
                 }
                 append(
-                    wave,
+                    &mut wave,
                     Point {
                         time: knot.time,
                         wave: value,
                     },
                 );
             }
-            prune(wave, end - self.delays[node]);
+            prune(&mut wave, cutoff);
+            next.outgoing.push(wave);
         }
         for (port, wave) in next.boundary.iter_mut().enumerate() {
             let value = input[port] - next.initial_input[port];
