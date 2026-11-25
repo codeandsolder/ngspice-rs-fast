@@ -197,6 +197,14 @@ impl CoupledLinePlan {
         self.r.rows()
     }
 
+    pub(super) const fn workspace_limit(&self) -> usize {
+        self.limits.workspace_bytes
+    }
+
+    pub(super) const fn squaring_limit(&self) -> usize {
+        self.limits.squarings
+    }
+
     fn operator(&self, hz: Real) -> SpiceResult<(DenseComplex, Real)> {
         if !hz.is_finite() || hz < 0. {
             return Err(invalid("frequency must be positive or zero"));

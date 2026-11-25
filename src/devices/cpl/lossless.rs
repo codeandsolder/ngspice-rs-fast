@@ -12,21 +12,18 @@ use crate::devices::traits::{MnaUnknowns, StampContext};
 use crate::primitives::{Complex, Real, SpiceResult};
 
 #[derive(Debug, Clone)]
-pub(super) struct LosslessModes {
-    delays: Vec<Real>,
+pub(super) struct ModalBasis {
+    pub(super) delays: Vec<Real>,
     // Physical conductor × mode; modal voltage = current_basis^T V,
     // modal current = voltage_basis^T I.
-    voltage_basis: Vec<Real>,
-    current_basis: Vec<Real>,
-    longest: Real,
-    shortest: Real,
+    pub(super) voltage_basis: Vec<Real>,
+    pub(super) current_basis: Vec<Real>,
+    pub(super) longest: Real,
+    pub(super) shortest: Real,
 }
 
-impl LosslessModes {
+impl ModalBasis {
     pub(super) fn prepare(plan: &CoupledLinePlan) -> SpiceResult<Option<Self>> {
-        if plan.r.data().iter().chain(plan.g.data()).any(|&v| v != 0.) {
-            return Ok(None);
-        }
         // A semidefinite L or C has ideal instantaneous constraints and does
         // not possess this complete positive-speed travelling-wave basis.
         for material in [&plan.l, &plan.c] {
@@ -137,7 +134,12 @@ impl LosslessModes {
         Ok(entries)
     }
 
-    fn incident(&self, line: &CoupledLine, context: &DelayContext<'_>) -> SpiceResult<Vec<Real>> {
+    pub(super) fn physical_waves(
+        &self,
+        line: &CoupledLine,
+        context: &DelayContext<'_>,
+        current_sign: Real,
+    ) -> SpiceResult<Vec<Real>> {
         let n = self.delays.len();
         // Retain the modal value and an absolute evaluation-error bound for
         // each direction. Incident waves are differences of large physical
@@ -165,7 +167,7 @@ impl LosslessModes {
                 let sample = (port / n) * n + mode;
                 values[sample] = self.current_basis[index].mul_add(
                     voltage,
-                    self.voltage_basis[index].mul_add(current, values[sample]),
+                    self.voltage_basis[index].mul_add(current_sign * current, values[sample]),
                 );
                 let error_index = 2 * n + sample;
                 values[error_index] = self.current_basis[index].abs().mul_add(
@@ -276,18 +278,24 @@ fn interpolation(
 
 impl DelayLine for CoupledLine {
     fn new_history(&self) -> DelayHistory {
-        DelayHistory::waveform(4 * self.conductors())
+        match &self.propagation {
+            super::Propagation::Lossy(plan) => DelayHistory::Cpl(Box::new(plan.new_history())),
+            _ => DelayHistory::waveform(4 * self.conductors()),
+        }
     }
 
     fn start(&self, context: &DelayContext<'_>) -> SpiceResult<DelayUpdate> {
-        let modes = self
-            .lossless
-            .as_ref()
-            .ok_or_else(|| invalid("missing lossless modal plan"))?;
+        let modes = match &self.propagation {
+            super::Propagation::Lossless(modes) => modes,
+            super::Propagation::Lossy(plan) => {
+                return plan.start(self, context).map(DelayUpdate::Cpl);
+            }
+            super::Propagation::Spatial => return Err(invalid("missing modal transport plan")),
+        };
         let values = if context.initial_conditions {
             vec![0.; 4 * self.conductors()]
         } else {
-            modes.incident(self, context)?
+            modes.physical_waves(self, context, 1.)?
         };
         Ok(DelayUpdate::Waveform(WaveformUpdate {
             reset: Some(vec![(-modes.longest, values.clone()), (0., values)]),
@@ -300,15 +308,20 @@ impl DelayLine for CoupledLine {
         history: &DelayHistory,
         context: &DelayContext<'_>,
     ) -> SpiceResult<DelayUpdate> {
-        let modes = self
-            .lossless
-            .as_ref()
-            .ok_or_else(|| invalid("missing lossless modal plan"))?;
+        let modes = match &self.propagation {
+            super::Propagation::Lossless(modes) => modes,
+            super::Propagation::Lossy(plan) => {
+                return plan
+                    .accept(self, history.as_cpl()?, context)
+                    .map(DelayUpdate::Cpl);
+            }
+            super::Propagation::Spatial => return Err(invalid("missing modal transport plan")),
+        };
         let history = history.as_waveform()?;
         let last = history
             .last_time()
             .ok_or_else(|| invalid("empty modal delay history"))?;
-        let values = modes.incident(self, context)?;
+        let values = modes.physical_waves(self, context, 1.)?;
         let mut update = WaveformUpdate::default();
         // Retain the last sample before the oldest required retarded time.
         while update.drop_front + 1 < history.len()
@@ -372,10 +385,10 @@ impl DelayLine for CoupledLine {
         _history: &DelayHistory,
         _context: &DelayContext<'_>,
     ) -> SpiceResult<Option<Real>> {
-        let modes = self
-            .lossless
-            .as_ref()
-            .ok_or_else(|| invalid("missing lossless modal plan"))?;
-        Ok(Some(modes.shortest))
+        match &self.propagation {
+            super::Propagation::Lossless(modes) => Ok(Some(modes.shortest)),
+            super::Propagation::Lossy(plan) => Ok(Some(plan.shortest())),
+            super::Propagation::Spatial => Err(invalid("missing modal transport plan")),
+        }
     }
 }

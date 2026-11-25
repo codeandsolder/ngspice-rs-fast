@@ -9,6 +9,8 @@ pub mod modes;
 pub mod plan;
 mod scattering;
 mod transient;
+mod transport;
+pub use transport::{CplHistory, CplUpdate};
 mod wide;
 
 use std::sync::Arc;
@@ -44,8 +46,15 @@ pub struct CoupledLine {
     terminals: Vec<NodeId>,
     /// Number of finite-volume spatial sections for the transient companion.
     sections: usize,
-    lossless: Option<lossless::LosslessModes>,
+    propagation: Propagation,
 }
+#[derive(Debug, Clone)]
+enum Propagation {
+    Lossless(lossless::ModalBasis),
+    Lossy(transport::LossyPlan),
+    Spatial,
+}
+
 type CplMaterialVectors = std::collections::BTreeMap<String, Vec<Real>>;
 
 impl CoupledLine {
@@ -108,16 +117,15 @@ impl CoupledLine {
                 .iter()
                 .map(|name| nodes.intern(name))
                 .collect::<SpiceResult<Vec<_>>>()?;
-            let mut device = Self::new(
+            Self::new(
                 instance.name.clone(),
                 Arc::clone(&plan),
                 terminals[..conductors].to_vec(),
                 terminals[conductors],
                 terminals[conductors + 1..conductors + 1 + conductors].to_vec(),
                 terminals[count - 1],
-            )?;
-            device.sections = sections;
-            Ok(device)
+                sections,
+            )
         })
     }
 
@@ -216,9 +224,11 @@ impl CoupledLine {
         input_return: NodeId,
         output: Vec<NodeId>,
         output_return: NodeId,
+        sections: usize,
     ) -> SpiceResult<Self> {
         let name = name.into();
         if name.is_empty()
+            || !(1..=256).contains(&sections)
             || input.len() != plan.conductors()
             || output.len() != plan.conductors()
             || input.contains(&input_return)
@@ -239,7 +249,22 @@ impl CoupledLine {
         terminals.push(input_return);
         terminals.extend_from_slice(&output);
         terminals.push(output_return);
-        let lossless = lossless::LosslessModes::prepare(&plan)?;
+        let propagation = match lossless::ModalBasis::prepare(&plan)? {
+            Some(basis)
+                if plan
+                    .r
+                    .data()
+                    .iter()
+                    .chain(plan.g.data())
+                    .all(|&value| value == 0.) =>
+            {
+                Propagation::Lossless(basis)
+            }
+            Some(basis) => {
+                Propagation::Lossy(transport::LossyPlan::prepare(basis, &plan, sections)?)
+            }
+            None => Propagation::Spatial,
+        };
         Ok(Self {
             name,
             plan,
@@ -248,8 +273,8 @@ impl CoupledLine {
             input_return,
             output_return,
             terminals,
-            sections: 64,
-            lossless,
+            sections,
+            propagation,
         })
     }
 
@@ -353,7 +378,7 @@ impl CoupledLine {
         unknowns: &MnaUnknowns,
         first_branch: usize,
     ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
-        if let Some(modes) = &self.lossless {
+        if let Propagation::Lossless(modes) = &self.propagation {
             return modes.frequency_stamps(self, hz, unknowns, first_branch);
         }
         if hz == 0. {
@@ -383,16 +408,16 @@ impl Device for CoupledLine {
     }
 
     fn delay_line(&self) -> Option<&dyn crate::devices::delay::DelayLine> {
-        self.lossless
-            .as_ref()
-            .map(|_| self as &dyn crate::devices::delay::DelayLine)
+        match self.propagation {
+            Propagation::Spatial => None,
+            _ => Some(self as &dyn crate::devices::delay::DelayLine),
+        }
     }
 
     fn state_count(&self) -> usize {
-        if self.lossless.is_some() {
-            0
-        } else {
-            self.spatial_state_count()
+        match self.propagation {
+            Propagation::Spatial => self.spatial_state_count(),
+            _ => 0,
         }
     }
 
@@ -420,7 +445,7 @@ impl Device for CoupledLine {
         match context.mode {
             AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
                 let first = context.branch(0)?;
-                if self.lossless.is_none() {
+                if matches!(self.propagation, Propagation::Spatial) {
                     self.dc_spatial_state(context)?;
                 }
                 for (row, col, value) in self.transfer_stamps_at(0., context.unknowns, first)? {
@@ -433,8 +458,12 @@ impl Device for CoupledLine {
             }
             AnalysisMode::Ac { .. } => Err(invalid("AC transfer belongs to assemble_small_signal")),
             AnalysisMode::Transient { time, .. } => {
-                if let Some(modes) = &self.lossless {
-                    return modes.stamp_transient(self, context, time);
+                match &self.propagation {
+                    Propagation::Lossless(modes) => {
+                        return modes.stamp_transient(self, context, time);
+                    }
+                    Propagation::Lossy(plan) => return plan.stamp(self, context, time),
+                    Propagation::Spatial => {}
                 }
                 let coefficients = context.integration.ok_or_else(|| {
                     invalid("transient cable requires companion integration coefficients")

@@ -322,6 +322,13 @@ impl WideMatrix {
 
     // Solve a bounded complex multiple-right-hand-side relation with
     // row pivoting. No inverse of a physical impedance/admittance is used.
+    pub(super) fn infinity_norm(&self) -> Real {
+        self.data
+            .chunks_exact(self.n)
+            .map(|row| row.iter().map(|value| value.magnitude()).sum::<Real>())
+            .fold(0., Real::max)
+    }
+
     pub(super) fn solve(&self, rhs: &Self) -> SpiceResult<Self> {
         let mut a = self.clone();
         let mut b = rhs.clone();

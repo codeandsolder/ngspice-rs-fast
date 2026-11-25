@@ -24,7 +24,7 @@ impl Scattering {
     /// at least as fast as the scalar series with argument 1/4.
     /// The remainder after 16 terms is below two-word roundoff.
     fn from_material(series: &WideMatrix, shunt: &WideMatrix) -> SpiceResult<Self> {
-        let order = series.order;
+        let order = series.n;
         let product = series.mul(shunt);
         let mut forward_v = WideMatrix::identity(order);
         let mut odd = forward_v.clone();
@@ -45,7 +45,7 @@ impl Scattering {
         // [b_R, a_R] = W [a_L, b_L].
         // W22 = (A+D-B-C)/2, -W21 = (C+D-A-B)/2.
         // W22 is nonsingular for positive reference impedance and
-        // forward_v passive short segment, even with forward_v singular series block.
+        // a passive short segment, even with a singular series block.
         let half = Wide::from_real(0.5);
         let denominator = forward_v
             .add(&forward_i)
@@ -181,4 +181,97 @@ impl CoupledLinePlan {
         }
         Ok(entries)
     }
+}
+
+// Project dissipative material into the same reciprocal wave coordinates
+// used by the exact LC propagator. A static stage represents the exact
+// distributed R/G exponential over one section, not a lumped pi network.
+pub(super) fn modal_static_scattering(
+    plan: &CoupledLinePlan,
+    basis: &super::lossless::ModalBasis,
+    sections: usize,
+) -> SpiceResult<Vec<Real>> {
+    let n = plan.conductors();
+    let count = Real::from(u32::try_from(sections).map_err(|_| invalid("section count"))?);
+    let project = |material: &[Real], transform: &[Real]| {
+        let mut left = WideMatrix::zero(n);
+        let mut left_abs = WideMatrix::zero(n);
+        let mut right = WideMatrix::zero(n);
+        let mut right_abs = WideMatrix::zero(n);
+        for row in 0..n {
+            for col in 0..n {
+                let value = WideComplex::real(Wide::from_real(transform[row * n + col]));
+                right.set(row, col, value);
+                right_abs.set(
+                    row,
+                    col,
+                    WideComplex::real(Wide::from_real(transform[row * n + col].abs())),
+                );
+                let value = Wide::product_ratio(&[material[row * n + col], plan.length], count, 0);
+                left.set(row, col, WideComplex::real(value));
+                left_abs.set(row, col, WideComplex::real(value.abs()));
+            }
+        }
+        let projected = right.transpose().mul(&left).mul(&right).symmetric();
+        let absolute = right_abs.transpose().mul(&left_abs).mul(&right_abs);
+        (projected, absolute)
+    };
+    let (mut series, series_absolute) = project(plan.r.data(), &basis.current_basis);
+    let (mut shunt, shunt_absolute) = project(plan.g.data(), &basis.voltage_basis);
+    // Discard only inter-block numerical cancellation. Keeping principal
+    // blocks intact preserves the PSD loss form; selectively zeroing
+    // individual entries within a connected block could make it indefinite.
+    let bound = 64. * Real::EPSILON * Real::from(u32::try_from(n).unwrap_or(u32::MAX));
+    let significant = |matrix: &WideMatrix, absolute: &WideMatrix, row, col| {
+        matrix.at(row, col).narrow().re.abs() > bound * absolute.at(row, col).narrow().re
+    };
+    let mut component: Vec<_> = (0..n).collect();
+    for row in 0..n {
+        for col in 0..row {
+            if significant(&series, &series_absolute, row, col)
+                || significant(&shunt, &shunt_absolute, row, col)
+            {
+                let from = component[col];
+                let to = component[row];
+                for label in &mut component {
+                    if *label == from {
+                        *label = to;
+                    }
+                }
+            }
+        }
+    }
+    for row in 0..n {
+        for col in 0..row {
+            if component[row] != component[col] {
+                for matrix in [&mut series, &mut shunt] {
+                    matrix.set(row, col, WideComplex::ZERO);
+                    matrix.set(col, row, WideComplex::ZERO);
+                }
+            }
+        }
+    }
+    series.check_finite()?;
+    shunt.check_finite()?;
+    let mut steps = 0;
+    while series.infinity_norm().max(shunt.infinity_norm()) > 0.5 {
+        if steps >= plan.squaring_limit() {
+            return Err(invalid("modal loss scattering exceeds squaring budget"));
+        }
+        series = series.scale(Wide::from_real(0.5));
+        shunt = shunt.scale(Wide::from_real(0.5));
+        steps += 1;
+    }
+    let mut network = Scattering::from_material(&series, &shunt)?;
+    for _ in 0..steps {
+        network = network.double()?;
+    }
+    let ports = 2 * n;
+    let mut coefficients = Vec::with_capacity(ports * ports);
+    for row in 0..ports {
+        for col in 0..ports {
+            coefficients.push(network.entry(row, col).narrow().re);
+        }
+    }
+    Ok(coefficients)
 }

@@ -156,14 +156,37 @@ both physical voltages against independent even/odd waves with 0.6 ns
 and 1.4 ns delays, and a mismatched DC-biased line checks steady-state
 initialization.
 
-General lossy lines with positive-definite L/C still require the passive
-coupled delayed-scattering transient implementation. The finite-volume
-approximation below does not guarantee an exact physical front and must
-not be presented as complete distributed transient parity.
+## Passive delayed scattering for lossy positive-definite L/C
+
+In the same power-normalized modal basis, split each spatial section into
+a half-length exact lossless modal flight, an exact static distributed R/G
+scattering relation, and a second half-flight. This symmetric Strang
+splitting approximates the continuous noncommuting RLGC generator while
+preserving reciprocity, passivity and physical arrival times. It is exact
+when the loss and propagation generators commute. Every mode conversion
+and internal reflection follows the sum of its actual modal path delays.
+
+The time-domain solver incrementally compiles a shared impulse response
+by increasing relative arrival time; identical representable arrival
+times at the same graph node are combined. Integrating its cumulative
+response over finite accepted piecewise-linear boundary segments avoids
+unbounded slope cancellation. The current trial interval contributes an
+affine terminal relation, including arrivals inside an oversized step.
+DC initializes the boundary waves consistently with the static scattering
+network. Rejected trials cannot advance the accepted response or inputs.
+Breakpoint tolerances affect only scheduling, never physical convolution.
+When the impulse response has finite support, expired segments are folded
+into the steady baseline.
+
+The spatial splitting is an approximation for noncommuting R/G and L/C;
+refine `sections` for accuracy. Dense incommensurate modal delays may
+produce many distinct paths, and the graph and retained history have
+explicit workspace/work caps. Exhaustion is reported rather than silently
+discarding arrivals.
 
 ## Passive finite-volume cable
 
-For lossy or singular LC material the current `.tran` approximation does
+For singular LC material the current `.tran` approximation does
 **not** use a sampled AC matrix. It discretizes the full
 symmetric coupled RLGC cable into `sections` passive pi cells. A section of
 width `dx = length / sections` has two half-shunts `(G + s C)*dx/2`
@@ -236,8 +259,8 @@ comparisons and note both numerical method and grid resolution.
 ## Integration and remaining verification
 
 Complete native P/CPL parsing, model resolution, exact distributed DC/AC,
-exact lossless modal transient and approximate lossy/singular finite-volume
-transient with trial/accept states and physical N-port KCL have implementation. The full strict lint and campaign validator are
-responsible for integration. Remaining work includes general lossy exact-front transient, singular
-long-line AC constraints, and broad performance, energy/passivity and
-variable-step verification.
+exact lossless modal transient, passive split-generator lossy modal transient,
+and singular-LC finite-volume transient with trial/accept states and physical
+N-port KCL have implementation. The full strict lint and campaign validator
+are responsible for integration. The lossy spatial split and dense modal
+path scaling require ongoing numerical and performance verification.

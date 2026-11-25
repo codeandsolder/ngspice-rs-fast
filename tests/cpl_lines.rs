@@ -228,6 +228,7 @@ fn distinct_input_and_output_return_nodes_stamp_exact_kcl_signs() {
         NodeId::new(3),
         vec![NodeId::new(4), NodeId::new(5)],
         NodeId::new(6),
+        64,
     )
     .unwrap();
     let mut nodes = NodeTable::new();
@@ -1191,6 +1192,7 @@ fn modal_trials_are_repeatable_across_rejection_and_history_pruning() {
                 NodeId::GROUND,
                 output.to_vec(),
                 NodeId::GROUND,
+                64,
             )
             .unwrap(),
         ))
@@ -1577,5 +1579,295 @@ fn noncommuting_singular_ac_cable_retains_exact_voltage_constraint() {
             (one + q * ideal) / (one + characteristic) - q * ideal,
             2e-10,
         );
+    }
+}
+
+#[test]
+fn distortionless_lossy_line_has_exact_attenuated_front() {
+    // R/L = G/C makes the LC and RG generators commute. With
+    // Z0=50 ohm, length=1 and R=10 ohm/m the voltage gain is exp(-0.2).
+    // This tests the actual wavefront and attenuation, not a finite-volume
+    // approximation or an interpolation against a sampled AC matrix.
+    for sections in [1, 4, 64] {
+        let plot = run_transient_cpl(&format!(
+            "vin source 0 pulse(0 1 2n 0.5n 0.5n 9n 30n)\n\
+             rs source a 50\n\
+             p1 a 0 b 0 cable\n\
+             rl b 0 50\n\
+             .model cable cpl r=10 l=250n c=100p g=0.004 length=1 sections={sections}\n\
+             .tran 0.1n 11n 0 0.1n"
+        ));
+        let times = transient_column(&plot, "time");
+        let voltages = transient_column(&plot, "v(b)");
+        for (&time, &voltage) in times.iter().zip(&voltages) {
+            let expected = 0.5 * (-0.2_f64).exp() * ((time - 7e-9) / 0.5e-9).clamp(0., 1.);
+            assert!(
+                (voltage - expected).abs() < 1e-9,
+                "sections={sections}, t={time:e}: {voltage:e} != {expected:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lossy_split_line_reflection_arrives_at_physical_half_stage_roundtrip() {
+    // One exact R/G stage at the center of a matched scalar LC line.
+    // With G=0, the static series resistance is 20 ohms, so the
+    // reflection coefficient is 20/(2*50+20), transmission 100/120.
+    // Both waves must appear after the full 5 ns roundtrip/flight.
+    let plot = run_transient_cpl(
+        "vin source 0 pulse(0 1 2n 0.5n 0.5n 9n 30n)\n\
+         rs source a 50\n\
+         p1 a 0 b 0 cable\n\
+         rl b 0 50\n\
+         .model cable cpl r=20 l=250n c=100p g=0 length=1 sections=1\n\
+         .tran 0.1n 11n 0 0.1n",
+    );
+    let times = transient_column(&plot, "time");
+    let near = transient_column(&plot, "v(a)");
+    let far = transient_column(&plot, "v(b)");
+    for ((&time, &near), &far) in times.iter().zip(&near).zip(&far) {
+        let incident = 0.5 * ((time - 2e-9) / 0.5e-9).clamp(0., 1.);
+        let delayed = 0.5 * ((time - 7e-9) / 0.5e-9).clamp(0., 1.);
+        assert!(
+            (near - incident - delayed / 6.).abs() < 1e-9,
+            "t={time:e} near={near:e}"
+        );
+        assert!(
+            (far - delayed * 5. / 6.).abs() < 1e-9,
+            "t={time:e} far={far:e}"
+        );
+    }
+}
+
+#[test]
+fn coupled_loss_stage_converts_modes_at_sum_of_half_flight_times() {
+    // Equal characteristic impedances, distinct propagation times, and a
+    // series resistance matrix that does not commute with the LC generator.
+    // With one centered loss stage and matched terminations:
+    // T=100*(100I+R)^-1, reflection=I-T. Each output mode travels its own
+    // half-delay on leaving the stage; there is no common-delay assumption.
+    let plot = run_transient_cpl(
+        "vin source 0 pulse(0 1 2n 0.5n 0.5n 12n 40n)\n\
+         rs source a1 50\n\
+         rz a2 0 50\n\
+         p1 a1 a2 0 b1 b2 0 cable\n\
+         rl1 b1 0 50\n\
+         rl2 b2 0 50\n\
+         .model cable cpl r=20 5 30 l=250n 0 400n g=0 0 0 c=100p 0 160p length=1 sections=1\n\
+         .tran 0.1n 12n 0 0.1n",
+    );
+    let times = transient_column(&plot, "time");
+    let launch = |time: f64, delay: f64| 0.5 * ((time - 2e-9 - delay) / 0.5e-9).clamp(0., 1.);
+    let t11 = 13_000. / 15_575.;
+    let t21 = -500. / 15_575.;
+    for (node, delay, gain, direct) in [
+        ("v(a1)", 5e-9, 1. - t11, true),
+        ("v(a2)", 6.5e-9, -t21, false),
+        ("v(b1)", 5e-9, t11, false),
+        ("v(b2)", 6.5e-9, t21, false),
+    ] {
+        let values = transient_column(&plot, node);
+        for (&time, &actual) in times.iter().zip(&values) {
+            let expected = gain * launch(time, delay) + if direct { launch(time, 0.) } else { 0. };
+            assert!(
+                (actual - expected).abs() < 1e-9,
+                "{node}, t={time:e}: {actual:e} != {expected:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lossy_oversized_trials_use_affine_endpoint_and_commit_only_accepted_response() {
+    use ngspice_rs::devices::{
+        AnalysisMode, Circuit, DelayAcceptance, LoadRequest, ModelContext, StateHistory,
+    };
+    use ngspice_rs::maths::{SparseMatrix, Vector};
+
+    let plan = Arc::new(model(1, 1., &[10.], &[250e-9], &[0.004], &[100e-12]));
+    let mut circuit = Circuit::new();
+    let input = circuit.add_node("a").unwrap();
+    let output = circuit.add_node("b").unwrap();
+    circuit
+        .add_device(Box::new(
+            CoupledLine::new(
+                "p1",
+                plan,
+                vec![input],
+                NodeId::GROUND,
+                vec![output],
+                NodeId::GROUND,
+                4,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    circuit.finalize().unwrap();
+    let dimension = circuit.unknown_count();
+    assert_eq!(dimension, 4);
+    assert_eq!(circuit.state_len(), 0);
+    let dt = 10e-9;
+    let load = |history: &StateHistory, mode, solution: &Vector| {
+        let mut trial = history.trial();
+        let mut matrix = SparseMatrix::new(dimension, dimension);
+        let mut rhs = Vector::zeros(dimension);
+        circuit
+            .load(
+                &LoadRequest {
+                    mode,
+                    solution,
+                    model_context: &ModelContext::default(),
+                    integration: None,
+                    history,
+                    forcing: None,
+                },
+                &mut matrix,
+                &mut rhs,
+                &mut trial,
+            )
+            .unwrap();
+        (trial, matrix, rhs)
+    };
+    let acceptance = |start| DelayAcceptance {
+        steps: [dt; 3],
+        min_break: dt * 1e-6,
+        start,
+        reltol: 1e-3,
+        abstol: 1e-12,
+    };
+    let mut history = circuit.state_history().unwrap();
+    let initial = Vector::zeros(dimension);
+    let (trial, _, _) = load(&history, AnalysisMode::OperatingPoint, &initial);
+    circuit
+        .accept_transient_point(&initial, 0., &mut history, trial, &acceptance(true))
+        .unwrap();
+    let attenuation = (-0.2_f64).exp();
+    let first = Vector::from_slice(&[1., 0.5 * attenuation, 0.02, -0.01 * attenuation]);
+    let mode = AnalysisMode::Transient { time: dt, dt };
+    let (_, matrix, rhs) = load(&history, mode, &first);
+    let previous = history.clone();
+    let (_, _, _) = load(
+        &history,
+        AnalysisMode::Transient {
+            time: 3. * dt,
+            dt: 3. * dt,
+        },
+        &first,
+    );
+    assert_eq!(history, previous);
+    let (trial, repeated_matrix, repeated_rhs) = load(&history, mode, &first);
+    assert_eq!(matrix, repeated_matrix);
+    assert_eq!(rhs, repeated_rhs);
+    let residual = matrix.mul_vector(&first).unwrap();
+    for row in 2..4 {
+        assert!((residual.get(row).unwrap() - rhs.get(row).unwrap()).abs() < 1e-11);
+    }
+    circuit
+        .accept_transient_point(&first, dt, &mut history, trial, &acceptance(false))
+        .unwrap();
+    assert_ne!(history, previous);
+    let second = Vector::from_slice(&[1., attenuation, 0.02, -0.02 * attenuation]);
+    let (_, matrix, rhs) = load(
+        &history,
+        AnalysisMode::Transient {
+            time: 1.5 * dt,
+            dt: 0.5 * dt,
+        },
+        &second,
+    );
+    let residual = matrix.mul_vector(&second).unwrap();
+    for row in 2..4 {
+        assert!((residual.get(row).unwrap() - rhs.get(row).unwrap()).abs() < 1e-11);
+    }
+}
+
+// Independent integer-delay lattice for the explicit 4-section resistor/T
+// network. All eight half-section delays are integer multiples of 125 ps.
+// Voltage waves see R/(2 Z0 + R) and 2 Z0/(2 Z0 + R), including mutual R;
+// the loads reflect (RL-Z0)/(RL+Z0). No production modal eigensolver,
+// scattering exponential, impulse compiler, or delay interpolation is used.
+fn resistor_delay_reference() -> Vec<[f64; 4]> {
+    const STAGES: usize = 4;
+    const TICKS: usize = 145;
+    const DELAYS: [usize; 2] = [5, 8];
+    const GAMMA: [f64; 2] = [1. / 6., -3. / 17.];
+    let det = 105. * 107.5 - 1.25 * 1.25;
+    let transmission = [
+        [100. * 107.5 / det, -125. / det],
+        [-125. / det, 100. * 105. / det],
+    ];
+    let mut incident = vec![[[[0.; 2]; 2]; STAGES]; TICKS];
+    let mut result = vec![[0.; 4]; TICKS];
+    result[0][0] = 0.5;
+    incident[DELAYS[0]][0][0][0] = 0.5;
+    for tick in 0..TICKS {
+        for stage in 0..STAGES {
+            for side in 0..2 {
+                for mode in 0..2 {
+                    let mut outgoing = 0.;
+                    for (source, &gain) in transmission[mode].iter().enumerate() {
+                        outgoing += gain * incident[tick][stage][1 - side][source]
+                            + (f64::from(u8::from(mode == source)) - gain)
+                                * incident[tick][stage][side][source];
+                    }
+                    let edge = (side == 0 && stage == 0) || (side == 1 && stage + 1 == STAGES);
+                    if edge {
+                        let arrival = tick + DELAYS[mode];
+                        if arrival < TICKS {
+                            if side == 0 {
+                                result[arrival][mode] += outgoing;
+                            } else {
+                                result[arrival][2 + mode] += (1. + GAMMA[mode]) * outgoing;
+                                let reflected = arrival + DELAYS[mode];
+                                if reflected < TICKS {
+                                    incident[reflected][stage][side][mode] +=
+                                        GAMMA[mode] * outgoing;
+                                }
+                            }
+                        }
+                    } else {
+                        let arrival = tick + 2 * DELAYS[mode];
+                        if arrival < TICKS {
+                            let neighbor = if side == 0 { stage - 1 } else { stage + 1 };
+                            incident[arrival][neighbor][1 - side][mode] += outgoing;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+#[test]
+fn noncommuting_lossy_sections_match_independent_resistor_delay_recurrence() {
+    let native = run_transient_cpl(
+        "vin source 0 pulse(0 1 1n 0.6n 0.6n 8n 30n)\n\
+         rs source a1 50\nrz a2 0 50\nrl1 b1 0 70\nrl2 b2 0 35\n\
+         p1 a1 a2 0 b1 b2 0 cable\n\
+         .model cable cpl r=20 5 30 l=250n 0 400n g=0 0 0 c=100p 0 160p length=1 sections=4\n\
+         .tran 0.02n 18n 0 0.02n",
+    );
+    let reference = resistor_delay_reference();
+    let times = transient_column(&native, "time");
+    for (port, node) in ["v(a1)", "v(a2)", "v(b1)", "v(b2)"].into_iter().enumerate() {
+        let actual = transient_column(&native, node);
+        for (&time, &value) in times.iter().zip(&actual) {
+            let comparison = reference
+                .iter()
+                .enumerate()
+                .map(|(tick, impulse)| {
+                    let lag = time - f64::from(u32::try_from(tick).unwrap()) * 0.125e-9;
+                    let pulse = ((lag - 1e-9) / 0.6e-9).clamp(0., 1.)
+                        - ((lag - 9.6e-9) / 0.6e-9).clamp(0., 1.);
+                    impulse[port] * pulse
+                })
+                .sum::<f64>();
+            assert!(
+                (value - comparison).abs() < 2e-4,
+                "{node}, t={time:e}: {value:e} != {comparison:e}"
+            );
+        }
     }
 }
