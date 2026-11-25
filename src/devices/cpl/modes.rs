@@ -222,22 +222,21 @@ impl CoupledLinePlan {
             total_delays: Vec::with_capacity(order),
         };
         for (mode, &lambda) in normalized_eigenvalues.iter().enumerate() {
-            // Multiplication order must not overflow just because the
-            // normalized eigenvalue exceeds one: the physical L*C may be
-            // representable even when lambda*inductance_scale is not.
+            // Take the square root before reconstructing the binary exponent:
+            // a representable flight time and modal admittance need not have
+            // a representable squared inverse velocity.
+            if !lambda.is_finite() || lambda <= 0. {
+                return Err(super::invalid("LC modal eigenvalue is not positive"));
+            }
             let (modal_significand, modal_exponent) = split_power(lambda);
             let (inductance_significand, inductance_exponent) = split_power(inductance_scale);
             let (capacitance_significand, capacitance_exponent) = split_power(capacitance_scale);
-            let physical_lambda = scale_power(
-                modal_significand * inductance_significand * capacitance_significand,
-                modal_exponent + inductance_exponent + capacitance_exponent,
+            let exponent = modal_exponent + inductance_exponent + capacitance_exponent;
+            let significand = modal_significand * inductance_significand * capacitance_significand;
+            let speed_inverse = scale_power(
+                scale_power(significand, exponent.rem_euclid(2)).sqrt(),
+                exponent.div_euclid(2),
             );
-            if !physical_lambda.is_finite() || physical_lambda <= 0. {
-                return Err(super::invalid(
-                    "LC modal eigenvalue cannot produce positive delay",
-                ));
-            }
-            let speed_inverse = physical_lambda.sqrt();
             let admittance = 1. / speed_inverse;
             let delay = self.length * speed_inverse;
             if !delay.is_finite() || delay <= 0. || !admittance.is_finite() {
@@ -523,10 +522,15 @@ mod tests {
 
     #[test]
     fn extreme_reciprocal_lc_scales_keep_finite_modal_basis_and_delay() {
-        for (l, c) in [(1e200, 1e-200), (1e-200, 1e200)] {
+        for (l, c, length) in [
+            (1e200, 1e-200, 1.),
+            (1e-200, 1e200, 1.),
+            (1e200, 1e200, 1e-200),
+            (1e-200, 1e-200, 1e200),
+        ] {
             let line = CoupledLinePlan::from_packed(
                 1,
-                1.,
+                length,
                 &[0.],
                 &[l],
                 &[0.],
@@ -537,6 +541,11 @@ mod tests {
             let modes = line.exact_lc_modes().unwrap();
             close(modes.total_delays[0], 1., 4e-15);
             close(modes.voltage_basis[0] * modes.current_basis[0], 1., 4e-15);
+            let root_y = modes.characteristic_admittances[0].sqrt();
+            let v = modes.voltage_basis[0] / root_y;
+            let i = modes.current_basis[0] * root_y;
+            close(v * i, 1., 4e-15);
+            assert!(v.is_finite() && i.is_finite());
         }
     }
 }
