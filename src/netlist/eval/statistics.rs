@@ -252,7 +252,7 @@ mod tests {
             }
             let n = f64::from(n);
             let mean = sum / n;
-            let variance_actual = square / n - mean * mean;
+            let variance_actual = (-mean).mul_add(mean, square / n);
             assert!(mean.abs() < variance.sqrt() * 0.025, "{name}: {mean}");
             assert!(
                 (variance_actual / variance - 1.).abs() < 0.035,
