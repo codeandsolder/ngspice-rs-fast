@@ -1,6 +1,7 @@
 //! Degenerate circuits through every analysis: each either fails as C
 //! ngspice does (same class of error, naming the same unknown) or gives C's
-//! answer. Expected values come from the live C binary with `.options sparse`
+//! answer, except where C reports unconstrained RHS currents as voltages.
+//! Expected values come from the live C binary with `.options sparse`
 //! (`set numdgt=17`, `print all`); C's error classes from its batch output.
 //!
 //! Where C recovers from a failed operating point with its transient
@@ -14,6 +15,10 @@ use ngspice_rs::primitives::SpiceError;
 use std::path::Path;
 
 fn simulate(body: &str) -> Result<Plot, SpiceError> {
+    simulate_observed(body, &[])
+}
+
+fn simulate_observed(body: &str, observations: &[&str]) -> Result<Plot, SpiceError> {
     let n = Parser::new()
         .parse_deck(&parse_deck_text(
             Path::new("robust.cir"),
@@ -23,6 +28,12 @@ fn simulate(body: &str) -> Result<Plot, SpiceError> {
     let c = RunConfig::from_netlist(&n)?;
     let request = c.plan_for(&n.analyses[0])?;
     let mut circuit = c.circuit(&n)?;
+    circuit.set_observations(
+        &observations
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>(),
+    )?;
     request.run(&mut circuit, &c.context())
 }
 
@@ -94,20 +105,87 @@ fn floating_capacitor_nodes_simulate_with_uic() {
     assert!((v - 1e-2).abs() < 1e-9, "{v}");
 }
 
-/// A node joined only to current sources has no matrix element, so SPARSE
-/// never numbers it and C solves the rest, leaving the node's right-hand
-/// side (the net injected current, here 2 mA - 1 mA) as its "voltage":
-/// C prints `a = 1.00000000000000002e-03`, `b = 1.0`. The port matches it
-/// (with a warning) in every analysis.
+/// Current-source cutsets cannot determine the voltage of a node with no
+/// matrix entries, even when the net current happens to be zero.
 #[test]
-fn current_source_cutset_keeps_the_right_hand_side_as_c_does() {
-    let body = "i1 0 a 2m\ni2 a b 1m\nr1 b 0 1k";
-    let plot = simulate(&format!("{body}\n.op")).unwrap();
-    assert_eq!(value(&plot, "v(a)"), 1e-3);
-    assert_eq!(value(&plot, "v(b)"), 1.0);
-    let plot = simulate(&format!("{body}\n.tran 1u 10u")).unwrap();
-    assert_eq!(value(&plot, "v(b)"), 1.0);
-    simulate("i1 0 a 0 ac 2m\ni2 a b 0 ac 1m\nr1 b 0 1k\n.ac lin 1 1k 1k").unwrap();
+fn current_source_cutsets_report_unconstrained_nodes() {
+    for current in ["0", "1m", "2m"] {
+        let body = format!("i1 0 a {current} ac 2m\ni2 a b 1m ac 1m\nr1 b 0 1k");
+        for analysis in [
+            ".op",
+            ".dc i1 0 2m 1m",
+            ".tran 1u 10u",
+            ".tran 1u 10u uic",
+            ".ac lin 1 1k 1k",
+        ] {
+            singular_at(&format!("{body}\n{analysis}"), "a");
+        }
+    }
+    for analysis in [".op", ".tran 1u 10u uic"] {
+        let err = simulate(&format!("i1 a b 1m\ni2 b c 1m\ni3 c a 1m\n{analysis}")).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("singular matrix") && message.contains("no matrix entries"),
+            "{message}"
+        );
+        let names = message
+            .split_once("check nodes ")
+            .unwrap()
+            .1
+            .split_once(';')
+            .unwrap()
+            .0;
+        let actual = names.split(", ").collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, ["a", "b", "c"].into_iter().collect(), "{message}");
+    }
+}
+
+/// A sensed degree-one node is not a dangling leaf, and a true dangling
+/// resistor still has an observable zero current rather than being removed.
+#[test]
+fn sensed_and_unsensed_passive_leaves_retain_their_equations() {
+    for branch in ["b1 out 0 v=2*v(sense)", "e1 out 0 sense 0 2"] {
+        let plot = simulate_observed(
+            &format!(
+                "v1 in 0 1.25 ac 1\nr1 in sense 1k\nr2 in leaf 2k\n{branch}\nr3 out 0 1k\n.op"
+            ),
+            &["@r1[i]", "@r2[i]"],
+        )
+        .unwrap();
+        for (name, expected) in [
+            ("v(sense)", 1.25),
+            ("v(leaf)", 1.25),
+            ("v(out)", 2.5),
+            ("i(v1)", 0.),
+            ("@r1[i]", 0.),
+            ("@r2[i]", 0.),
+        ] {
+            assert!(
+                (value(&plot, name) - expected).abs() < 1e-12,
+                "{branch} {name}"
+            );
+        }
+    }
+}
+
+/// Adding a reference path makes an otherwise unconstrained source cutset
+/// well posed; zero-valued current sources and open capacitors are not grounds
+/// for pruning the rest of the circuit.
+#[test]
+fn regularized_source_cutset_retains_branch_currents() {
+    let plot = simulate_observed(
+        "i1 0 a 2m\ni2 a b 1m\nr1 a 0 1k\nr2 b 0 2k\nc1 a b 0\n.op",
+        &["@r1[i]", "@r2[i]"],
+    )
+    .unwrap();
+    for (name, expected) in [
+        ("v(a)", 1.),
+        ("v(b)", 2.),
+        ("@r1[i]", 1e-3),
+        ("@r2[i]", 1e-3),
+    ] {
+        assert!((value(&plot, name) - expected).abs() < 1e-12, "{name}");
+    }
 }
 
 /// A conductance below `pivtol` (1e-14 < 1e-13) is a small pivot: SPARSE
@@ -277,4 +355,54 @@ fn original_backward_error_inspects_complex_phases_and_transpose() {
     let transposed = OriginalResidual::complex(2, &a, true).unwrap();
     assert_eq!(transposed.evaluate(&bt, &x).unwrap().maximum, 0.);
     assert_eq!(transposed.evaluate_many(&[(&bt, &x)]).unwrap().len(), 1);
+}
+
+/// Upstream #850's sensed-node topology is well posed. Both the reference
+/// (with its optional topology pruning disabled) and Rust must retain the
+/// voltage and the current through each passive leaf, for either source type.
+#[test]
+#[ignore = "requires NGSPICE_BIN; independent valid topology reference"]
+fn sensed_passive_leaves_match_c() {
+    use ngspice_conformance::ngspice::{Ngspice, Scratch, batch_reference_sample};
+    use ngspice_rs::analysis::RawFile;
+    use std::fs;
+    let binary = Ngspice::pinned().unwrap();
+    let scratch = Scratch::new("topology-leaves").unwrap();
+    for dependent in ["b1 out 0 v=2*v(sense)", "e1 out 0 sense 0 2"] {
+        for analysis in [".op", ".dc v1 0 2 0.25", ".ac lin 3 1k 1meg"] {
+            let body = format!(
+                "v1 in 0 1.25 ac 1\nr1 in sense 1k\nr2 in leaf 2k\n{dependent}\nr3 out 0 1k\n{analysis}\n.save v(in) v(sense) v(leaf) v(out) i(v1)"
+            );
+            let actual = simulate(&body).unwrap();
+            // The control command disables ngspice's optional degree-based
+            // reduction before setup; the port does not implement that pass.
+            let deck = format!(
+                "Sensed passive leaves\n{body}\n.options sparse\n.control\nset no_topo_reduce\nset filetype=ascii\nrun\nwrite result.raw all\nquit\n.endc\n.end\n"
+            );
+            fs::write(scratch.path().join("reference.cir"), deck).unwrap();
+            let output = binary
+                .run(scratch.path(), &["-b", "reference.cir"])
+                .unwrap();
+            output.require_success(dependent).unwrap();
+            let raw = RawFile::load(scratch.path().join("result.raw")).unwrap();
+            let reference = &raw.plots[0].plot;
+            assert_eq!(actual.point_count(), reference.point_count());
+            for (index, variable) in reference.variables().iter().enumerate() {
+                let name = &variable.name;
+                let want = reference.column_at(index).unwrap();
+                let got = actual
+                    .column(name)
+                    .unwrap_or_else(|| panic!("missing {name}"));
+                for (a, b) in got.iter().zip(want) {
+                    let [re, im] = batch_reference_sample(index, name, [b.re, b.im]);
+                    let expected = ngspice_rs::primitives::Complex::new(re, im);
+                    assert!(
+                        (*a - expected).magnitude() <= expected.magnitude() * 1e-9 + 1e-12,
+                        "{dependent} {analysis} {name}: {a:?} != {expected:?}"
+                    );
+                }
+            }
+            fs::remove_file(scratch.path().join("result.raw")).unwrap();
+        }
+    }
 }

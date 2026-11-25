@@ -554,16 +554,11 @@ impl ComplexMatrix {
     /// Structurally or numerically singular matrix.
     pub fn factorize_new_matrix(&self) -> SpiceResult<ComplexLu> {
         let mut sparse = self.fresh_frame()?;
-        if !sparse.fully_translated() {
-            // A circuit's matrix follows C (see `maths::linear`).
-            if self.names.is_none() && matches!(self.assembly, Assembly::Standalone(_)) {
-                return Err(numerical(
-                    "complex sparse LU",
-                    "singular matrix: an unknown has no matrix entries",
-                ));
-            }
-            crate::maths::linear::warn_untranslated(&sparse, self.names.as_ref());
-        }
+        crate::maths::linear::require_translated(
+            "complex sparse LU",
+            &sparse,
+            self.names.as_ref(),
+        )?;
         let status = sparse.order_and_factor(self.pivot.relative, self.pivot.absolute);
         check_status("complex sparse LU", status, &sparse, self.names.as_ref())?;
         Ok(ComplexLu {
@@ -599,7 +594,6 @@ impl ComplexMatrix {
             &mut sparse,
             self.pivot,
             self.names.as_ref(),
-            self.names.is_some(),
         )?;
         Ok(ComplexLu {
             n: self.n,
