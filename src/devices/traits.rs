@@ -41,6 +41,10 @@ pub struct ChargeContext<'a> {
     pub model: &'a crate::devices::ModelContext,
     /// Physical node and branch numbering.
     pub unknowns: &'a MnaUnknowns,
+    /// This device's first branch row, when allocated.
+    pub branch: Option<usize>,
+    /// Bound rows of branch-current controls, in expression order.
+    pub controls: &'a [usize],
     /// State at which to evaluate the constitutive law.
     pub state: &'a Vector,
     /// Signed charge and flux residual by equation row.

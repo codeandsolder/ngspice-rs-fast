@@ -703,6 +703,8 @@ impl<'a> PreparedRun<'a> {
         let mut input = crate::devices::traits::ChargeContext {
             model: context,
             unknowns: &self.circuit.bindings.unknowns,
+            branch: None,
+            controls: &[],
             state,
             charge,
             jacobian,
@@ -710,6 +712,8 @@ impl<'a> PreparedRun<'a> {
         for index in self.circuit.load_order() {
             let device = point.device(self.circuit, index);
             if device.is_nonlinear() {
+                input.branch = self.circuit.bindings.branch_rows[index].clone().next();
+                input.controls = self.circuit.controls(index)?;
                 device.assemble_nonlinear_charge(&mut input)?;
             }
         }
