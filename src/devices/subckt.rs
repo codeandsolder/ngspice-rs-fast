@@ -865,6 +865,14 @@ impl<'a> Expander<'a> {
         instance: &DeviceInstance,
         parent: &Arc<ParamScope>,
     ) -> SpiceResult<(Arc<ParamScope>, Arc<DefinitionPlan<'a>>)> {
+        for setting in definition.options.iter().flat_map(|card| &card.settings) {
+            if matches!(setting.name.as_str(), "seed" | "rndseed") {
+                return Err(SpiceError::parse(
+                    setting.location.clone(),
+                    "statistical seed belongs to the top-level deck, not a subcircuit",
+                ));
+            }
+        }
         let mut bindings = Vec::with_capacity(instance.parameters.len());
         for parameter in &instance.parameters {
             bindings.push(ParamBinding {

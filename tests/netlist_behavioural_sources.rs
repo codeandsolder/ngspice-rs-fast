@@ -287,26 +287,30 @@ fn resolution_errors_name_their_cause() {
 }
 
 #[test]
-fn statistical_functions_are_not_yet_ported_at_their_call() {
-    // C's inp.c eval_agauss() replaces these by a drawn value before parsing
-    // a B line (and E/G VALUE lines become B lines first).
-    for (body, column) in [
-        ("b1 o 0 v=agauss(1,0.1,3)*v(1)", 10),
-        ("b1 o 0 v=2*gauss(1,0.1,3)", 12),
-        ("b1 o 0 i=aunif(1,0.1)*1m", 10),
-        ("e1 o 0 value={unif(1,0.1)*v(1)}", 15),
-        ("g1 o 0 value={limit(1,0.1)*v(1)}", 15),
+fn statistical_functions_are_realized_before_compiling_the_behavioural_law() {
+    for body in [
+        "b1 o 0 v=agauss(1,0.1,3)*v(1)",
+        "b1 o 0 v=2*gauss(1,0.1,3)",
+        "b1 o 0 i=aunif(1,0.1)*1m",
+        "e1 o 0 value={unif(1,0.1)*v(1)}",
+        "g1 o 0 value={limit(1,0.1)*v(1)}",
     ] {
-        let netlist = lower_nonlinear_sources(&parse(body)).unwrap();
-        let error = literalize(&netlist).unwrap_err();
-        assert!(error.is_not_yet_ported(), "{body}: {error}");
-        let text = error.to_string();
-        assert!(
-            text.contains(&format!("in.cir:2:{column}:")),
-            "{body}: {text}"
-        );
-        assert!(text.contains("src/frontend/inp.c (eval_agauss)"), "{text}");
+        let source = lower_nonlinear_sources(&parse(body)).unwrap();
+        let netlist = literalize(&source).unwrap().netlist;
+        for instance in &netlist.devices {
+            for parameter in &instance.parameters {
+                if let ParameterKind::Behavioural(expression) = &parameter.kind {
+                    expression.root.visit(&mut |node| {
+                        assert!(!matches!(&node.kind,BExprKind::Call{name,..} if ngspice_rs::netlist::bexpr::STATISTICAL_FUNCTIONS.contains(&name.as_str())));
+                    });
+                }
+            }
+        }
     }
+    let error = literalize(&parse("b1 o 0 v=agauss(v(1),0.1,3)"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("static arguments"), "{error}");
     // A user .func of the same name is expanded first, as in C.
     let netlist = resolved(".func agauss(a,b,c) {a*2}\nb1 o 0 v=agauss(1,0.1,3)*v(x)");
     assert_eq!(

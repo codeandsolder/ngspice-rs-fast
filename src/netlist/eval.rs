@@ -53,10 +53,12 @@
 //! evaluating anything against a deck's top-level parameters and functions.
 
 mod plan;
+pub(crate) mod statistics;
 pub use plan::{
     BoundExpression, CandidateParameters, ParameterInput, ParameterPlan, ParameterScopeId,
     ParameterScopeSpec, ParameterSlot,
 };
+use statistics::{Realization, Sampler};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -104,13 +106,42 @@ impl Default for EvalLimits {
 pub struct EvalBudget {
     limits: EvalLimits,
     nodes: usize,
+    seed: u64,
+    scope_sequence: u64,
 }
 
 impl EvalBudget {
     /// A fresh budget.
     #[must_use = "the new budget tracks expression evaluation against the supplied limits"]
     pub const fn new(limits: EvalLimits) -> Self {
-        Self { limits, nodes: 0 }
+        Self {
+            limits,
+            nodes: 0,
+            seed: statistics::DEFAULT_SEED,
+            scope_sequence: 0,
+        }
+    }
+
+    /// A fresh deck-loading budget with the explicitly selected realization seed.
+    /// # Errors
+    /// Invalid seed options, which must be resolved before parameters.
+    pub fn for_netlist(netlist: &Netlist) -> SpiceResult<Self> {
+        Ok(Self {
+            seed: statistics::seed(&netlist.options)?,
+            ..Self::default()
+        })
+    }
+
+    fn realization(&mut self, parent: Option<&ParamScope>) -> SpiceResult<Realization> {
+        if let Some(parent) = parent {
+            self.scope_sequence = self
+                .scope_sequence
+                .checked_add(1)
+                .ok_or_else(|| SpiceError::circuit("statistical scope sequence overflow"))?;
+            Ok(parent.realization.child(self.scope_sequence))
+        } else {
+            Ok(Realization::root(self.seed))
+        }
     }
 
     /// Expression nodes evaluated so far.
@@ -178,6 +209,7 @@ pub struct ParamScope {
     entries: Vec<ParamEntry>,
     active: HashMap<String, usize>,
     functions: Option<Arc<FunctionScope>>,
+    realization: Realization,
 }
 
 /// Already evaluated values published in sequence over an immutable parameter
@@ -252,6 +284,7 @@ impl<'a> SequentialBindings<'a> {
             expression,
             &|name| self.get(name),
             self.base.functions.as_deref(),
+            self.base.realization,
             budget,
         )
         .map_err(Failure::into_error)
@@ -656,7 +689,7 @@ impl ParamScope {
     /// As [`Self::root`], plus invalid `.func` definitions
     /// ([`FunctionScope::new`]).
     pub fn for_netlist(netlist: &Netlist) -> SpiceResult<Self> {
-        let mut budget = EvalBudget::default();
+        let mut budget = EvalBudget::for_netlist(netlist)?;
         let functions = FunctionScope::for_netlist(netlist, &budget)?;
         Self::resolve_scoped(None, Some(functions), &[], &netlist.params, &mut budget)
     }
@@ -758,6 +791,7 @@ impl ParamScope {
         sequence: Vec<usize>,
         budget: &mut EvalBudget,
     ) -> SpiceResult<Self> {
+        let realization = budget.realization(parent.as_deref())?;
         let scope_parent = parent.as_deref();
         let scope_functions = functions.as_deref();
         let ScopeDefinitions {
@@ -785,6 +819,7 @@ impl ParamScope {
                 expr,
                 &lookup,
                 scope_functions,
+                realization,
                 budget,
                 name,
                 &entries[i].location,
@@ -800,7 +835,28 @@ impl ParamScope {
             entries,
             active,
             functions,
+            realization,
         })
+    }
+
+    pub(crate) fn sampler<'a>(&self, location: &'a SourceLoc) -> Sampler<'a> {
+        self.realization.sampler(location)
+    }
+
+    pub(crate) fn evaluate_sampled(
+        &self,
+        expression: &ParameterExpression,
+        budget: &mut EvalBudget,
+        sampler: &Sampler<'_>,
+    ) -> SpiceResult<Real> {
+        evaluate_sampled_root(
+            expression,
+            &|name| self.get(name),
+            self.functions.as_deref(),
+            sampler,
+            budget,
+        )
+        .map_err(Failure::into_error)
     }
 
     /// The `.func` definitions visible in this scope, if any.
@@ -848,6 +904,7 @@ impl ParamScope {
             expression,
             &|name| lookup(name).or_else(|| self.get(name)),
             self.functions.as_deref(),
+            self.realization,
             budget,
         )
         .map_err(Failure::into_error)
@@ -866,6 +923,7 @@ impl ParamScope {
             expression,
             &|n| self.get(n),
             self.functions.as_deref(),
+            self.realization,
             budget,
         )
         .map_err(Failure::into_error)
@@ -1326,6 +1384,7 @@ struct Env<'a> {
     lookup: Lookup<'a>,
     functions: Option<&'a FunctionScope>,
     frame: Option<&'a Frame<'a>>,
+    sampler: &'a Sampler<'a>,
 }
 
 impl<'a> Env<'a> {
@@ -1359,12 +1418,25 @@ fn evaluate_root(
     root: &ParameterExpression,
     lookup: Lookup<'_>,
     functions: Option<&FunctionScope>,
+    realization: Realization,
+    budget: &mut EvalBudget,
+) -> Result<Real, Failure> {
+    let sampler = realization.sampler(&root.span.start);
+    evaluate_sampled_root(root, lookup, functions, &sampler, budget)
+}
+
+fn evaluate_sampled_root(
+    root: &ParameterExpression,
+    lookup: Lookup<'_>,
+    functions: Option<&FunctionScope>,
+    sampler: &Sampler<'_>,
     budget: &mut EvalBudget,
 ) -> Result<Real, Failure> {
     let env = Env {
         lookup,
         functions,
         frame: None,
+        sampler,
     };
     eval(&root.root, root, env, budget, 0)
 }
@@ -1373,11 +1445,12 @@ fn evaluate_definition(
     expression: &ParameterExpression,
     lookup: Lookup<'_>,
     functions: Option<&FunctionScope>,
+    realization: Realization,
     budget: &mut EvalBudget,
     name: &str,
     location: &SourceLoc,
 ) -> SpiceResult<Real> {
-    evaluate_root(expression, lookup, functions, budget).map_err(|failure| {
+    evaluate_root(expression, lookup, functions, realization, budget).map_err(|failure| {
         failure
             .context(|| format!("while evaluating parameter '{name}' defined at {location}"))
             .into_error()
@@ -1579,6 +1652,16 @@ fn user_call(
     arguments: &[Expr],
 ) -> Result<Real, Failure> {
     let Some((def, scope)) = env.function(name) else {
+        if crate::netlist::bexpr::STATISTICAL_FUNCTIONS.contains(&name) {
+            let mut args = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                args.push(eval(argument, root, env, budget, depth + 1)?);
+            }
+            return env
+                .sampler
+                .sample(name, &args, &node.span.start)
+                .map_err(|error| fail(node, root, error));
+        }
         if EXCLUDED_FUNCTIONS.contains(&name) {
             return Err(Failure {
                 location: node.span.start.clone(),
@@ -1675,6 +1758,7 @@ fn call(
         lookup: env.lookup,
         functions: env.functions,
         frame: Some(&frame),
+        sampler: env.sampler,
     };
     let value =
         eval(&def.body.root, &def.body, inner, budget, depth + CALL_DEPTH).map_err(|f| {

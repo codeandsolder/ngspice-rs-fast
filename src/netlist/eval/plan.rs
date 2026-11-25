@@ -493,6 +493,7 @@ impl CandidateParameters<'_> {
                 entries,
                 active: planned.baseline.active.clone(),
                 functions: planned.baseline.functions.clone(),
+                realization: planned.baseline.realization,
             }));
         }
         parent.ok_or_else(|| SpiceError::circuit("unknown parameter plan scope"))
@@ -532,6 +533,7 @@ impl CandidateParameters<'_> {
             expression,
             &|name| self.get(scope, name),
             baseline.functions.as_deref(),
+            baseline.realization,
             budget,
         )
         .map_err(Failure::into_error)
@@ -561,6 +563,7 @@ impl CandidateParameters<'_> {
                     .and_then(|&index| self.values[index])
             },
             baseline.functions.as_deref(),
+            baseline.realization,
             budget,
         )
         .map_err(Failure::into_error)
@@ -631,6 +634,7 @@ impl CandidateParameters<'_> {
                 expression,
                 &lookup,
                 scope.baseline.functions.as_deref(),
+                scope.baseline.realization,
                 budget,
                 &entry.name,
                 &entry.location,
