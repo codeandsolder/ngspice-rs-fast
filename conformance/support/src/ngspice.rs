@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// uninitialized imaginary component. Only the first column named frequency
 /// has this known real-valued domain. Use its normalized sample both for
 /// the absolute error and the relative tolerance.
-#[must_use]
+#[must_use = "the returned sample removes the known undefined imaginary frequency component"]
 pub fn batch_reference_sample(column: usize, name: &str, mut sample: [f64; 2]) -> [f64; 2] {
     if column == 0 && name == "frequency" {
         sample[1] = 0.0;
@@ -217,7 +217,7 @@ impl Scratch {
     }
 
     /// Absolute directory path, valid for this scratch owner's lifetime.
-    #[must_use]
+    #[must_use = "the returned directory identifies this scratch owner's temporary files"]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -501,7 +501,7 @@ fn tail(text: &str, lines: usize) -> String {
 /// which carries the ngspice version — is compared. Numeric layout ignores
 /// trailing whitespace, but `Title:` preserves it: it is deck data and must
 /// agree with the title checked by `tests/golden_rawfiles.rs`.
-#[must_use]
+#[must_use = "the result determines whether the reference capture has drifted"]
 pub fn rawfiles_match(left: &str, right: &str) -> bool {
     comparable(left) == comparable(right)
 }
@@ -520,7 +520,7 @@ fn comparable(text: &str) -> Vec<&str> {
 }
 
 /// The first differing line, for a drift report.
-#[must_use]
+#[must_use = "the returned line identifies the first capture discrepancy"]
 pub fn first_difference(left: &str, right: &str) -> Option<String> {
     let left = comparable(left);
     let right = comparable(right);
