@@ -136,6 +136,55 @@ pub struct StorageElement {
     pub initial: Option<Real>,
 }
 
+/// A prescribed internal state coordinate for UIC. The coordinate and the
+/// equation that normally evolves it are distinct: e.g. an implicit
+/// differential inductor stores its current in branch 0 and evolves it
+/// through branch equation 1. Indices are device-local branch indices.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitialCoordinate {
+    /// Fixed unknown.
+    pub coordinate: usize,
+    /// Differential equation removed in the instantaneous constraint solve.
+    pub equation: usize,
+    /// Value of the coordinate at the initial point.
+    pub value: Real,
+}
+
+/// A voltage-controlled storage coordinate at UIC. Scalar capacitors
+/// need a new free-current equation; implicit capacitors already have
+/// that current and specify the local evolution equation to replace.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitialVoltageStorage {
+    /// Optional instance voltage, otherwise read the seeded terminal voltages.
+    pub voltage: Option<Real>,
+    /// Local history slot containing the signed integrated quantity.
+    pub slot: usize,
+    /// Storage coordinate per volt (not necessarily a physical capacitance).
+    pub scale: Real,
+    /// Existing evolution row, or None to append a free-current constraint.
+    pub equation: Option<usize>,
+}
+
+/// An ideal voltage relation used by the initial-condition constraint graph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitialVoltageRelation {
+    /// Positive and negative terminals.
+    pub terminals: [NodeId; 2],
+    /// How the differential voltage is determined.
+    pub law: InitialVoltageLaw,
+}
+
+/// Ideal voltage relation in the initial instantaneous system.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InitialVoltageLaw {
+    /// Voltage determined by the other equations of the circuit.
+    Controlled,
+    /// Fixed voltage, including a zero-voltage sensing branch.
+    Fixed(Real),
+    /// Voltage from the forcing vector at a device-local branch row.
+    Source(usize),
+}
+
 /// A device whose branch current another device senses, named as in the deck
 /// (after subcircuit renaming): the controlling voltage source of an F/H card.
 ///
@@ -966,6 +1015,74 @@ pub trait Device: fmt::Debug + std::any::Any {
         _context: &crate::devices::models::ModelContext,
     ) -> Option<SpiceResult<StorageElement>> {
         None
+    }
+
+    /// Ideal voltage relations visible to initial-condition consistency
+    /// checking. A multiport device may publish more than one relation.
+    /// Only DC bias regards inductors as shorts; under UIC their stored
+    /// current is constrained instead.
+    fn initial_voltage_relations(&self, inductors_short: bool) -> Vec<InitialVoltageRelation> {
+        let law = match self.designator() {
+            'e' | 'h' => InitialVoltageLaw::Controlled,
+            'v' if self.branch_currents() == 1 => InitialVoltageLaw::Source(0),
+            'l' if inductors_short => InitialVoltageLaw::Fixed(0.),
+            _ => return Vec::new(),
+        };
+        let terminals = match (self.terminals(), self.rf_port()) {
+            ([_, negative, _], Some(port)) => [port.internal, *negative],
+            ([positive, negative, ..], None) => [*positive, *negative],
+            _ => return Vec::new(),
+        };
+        vec![InitialVoltageRelation { terminals, law }]
+    }
+
+    /// Explicit internal storage coordinates for UIC, independent of
+    /// the physical current/voltage storage representation of scalar RLC.
+    /// The device seeds its history from these coordinates during the
+    /// initial load; the analysis binds and checks the instantaneous system.
+    /// # Errors
+    /// Invalid effective storage inputs.
+    fn initial_coordinates(
+        &self,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Vec<InitialCoordinate>> {
+        Ok(self
+            .storage_element(context)
+            .transpose()?
+            .filter(|storage| storage.kind == StorageKind::Inductor)
+            .map(|storage| InitialCoordinate {
+                coordinate: 0,
+                equation: 0,
+                value: storage.initial.unwrap_or(0.),
+            })
+            .into_iter()
+            .collect())
+    }
+
+    /// Initial differential-voltage storage and the corresponding equation
+    /// binding, independent of the physical charge scale.
+    /// # Errors
+    /// Invalid effective storage inputs or missing state slot.
+    fn initial_voltage_storage(
+        &self,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Option<InitialVoltageStorage>> {
+        let Some(storage) = self
+            .storage_element(context)
+            .transpose()?
+            .filter(|storage| storage.kind == StorageKind::Capacitor)
+        else {
+            return Ok(None);
+        };
+        let slot = self
+            .truncation_slot()
+            .ok_or_else(|| SpiceError::circuit("missing capacitor storage slot"))?;
+        Ok(Some(InitialVoltageStorage {
+            voltage: storage.initial,
+            slot,
+            scale: storage.value,
+            equation: None,
+        }))
     }
 
     /// Validate bias-independent device inputs at a DC point, without an

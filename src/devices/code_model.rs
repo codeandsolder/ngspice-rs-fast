@@ -730,6 +730,16 @@ impl crate::devices::Device for DacSource {
         true
     }
 
+    fn initial_voltage_relations(
+        &self,
+        _inductors_short: bool,
+    ) -> Vec<crate::devices::InitialVoltageRelation> {
+        vec![crate::devices::InitialVoltageRelation {
+            terminals: self.terminals,
+            law: crate::devices::InitialVoltageLaw::Source(0),
+        }]
+    }
+
     fn setup_matrix(
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,

@@ -35,9 +35,10 @@ fn circuit(source: &str, spec: RationalSpec<'_>, law: PortLaw) -> SpiceResult<Ci
 }
 
 fn run(circuit: &mut Circuit, kind: AnalysisKind, args: &[&str]) -> SpiceResult<Plot> {
-    AnalysisInput::with_arguments(kind, args.iter().copied())
-        .resolve()?
-        .run(circuit, &AnalysisContext::default())
+    let mut request =
+        AnalysisInput::with_arguments(kind, args.iter().copied().filter(|arg| *arg != "uic"));
+    request.uic = args.contains(&"uic");
+    request.resolve()?.run(circuit, &AnalysisContext::default())
 }
 
 fn polynomial(coefficients: &[f64], z: Complex) -> Complex {
@@ -391,5 +392,82 @@ fn native_s_xfer_matches_independent_c_ac_and_transient() -> SpiceResult<()> {
     println!(
         "native C AC max error {ac_error:e}; max ramp analytic errors [Rust, C coarse, C fine] {errors:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn uic_transfer_coordinates_preserve_free_response_and_input_forcing() -> SpiceResult<()> {
+    let mut c = Circuit::from_netlist(&parsed(
+        "v1 in 0 dc 3\na1 in out mdl\nr1 out 0 1k\n.model mdl s_xfer(num_coeff=[1] den_coeff=[1 1] denormalized_freq=1000 int_ic=[2])",
+    )?)?;
+    let plot = run(
+        &mut c,
+        AnalysisKind::Transient,
+        &["1u", "2m", "0", "1u", "uic"],
+    )?;
+    for index in 0..plot.point_count() {
+        let t = plot.value("time", index).unwrap().re;
+        close(
+            plot.value("v(out)", index).unwrap(),
+            Complex::real(3. - (-1000. * t).exp()),
+            2e-5,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn uic_transfer_output_constraints_detect_capacitor_conflicts() -> SpiceResult<()> {
+    for initial in [2., 1.] {
+        let deck = parsed(&format!(
+            "v1 in 0 dc 3\na1 in out mdl\nr1 out 0 1k\nc1 out 0 1u ic={initial}\n.model mdl s_xfer(num_coeff=[1] den_coeff=[1 1] denormalized_freq=1000 int_ic=[2])"
+        ))?;
+        let mut c = Circuit::from_netlist(&deck)?;
+        let result = run(
+            &mut c,
+            AnalysisKind::Transient,
+            &["1u", "1m", "0", "1u", "uic"],
+        );
+        if initial == 2. {
+            let plot = result?;
+            assert!(plot.point_count() > 100);
+        } else {
+            let error = result.expect_err("inconsistent ideal output").to_string();
+            assert!(error.contains("impulse") && error.contains("a1"), "{error}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn uic_transfer_multiple_coordinates_and_current_sensor_constraints() -> SpiceResult<()> {
+    let deck = parsed(
+        "v1 in 0 dc 0\na1 in out mdl\nr1 out 0 1k\n.model mdl s_xfer(num_coeff=[1] den_coeff=[1 2 1] denormalized_freq=1000 gain=0 int_ic=[0 1])",
+    )?;
+    let mut c = Circuit::from_netlist(&deck)?;
+    let plot = run(
+        &mut c,
+        AnalysisKind::Transient,
+        &["1u", "2m", "0", "1u", "uic"],
+    )?;
+    for index in 0..plot.point_count() {
+        let t = 1000. * plot.value("time", index).unwrap().re;
+        close(
+            plot.value("v(out)", index).unwrap(),
+            Complex::real((1. + t) * (-t).exp()),
+            2e-5,
+        );
+    }
+    let mut c = Circuit::from_netlist(&parsed(
+        "i1 0 a dc 1\na1 %i(a) out mdl\nr1 out 0 1k\nc1 a 0 1u ic=0.1\n.model mdl s_xfer(num_coeff=[1] den_coeff=[1 1])",
+    )?)?;
+    let error = run(
+        &mut c,
+        AnalysisKind::Transient,
+        &["1u", "1m", "0", "1u", "uic"],
+    )
+    .expect_err("current sensor fixes input voltage")
+    .to_string();
+    assert!(error.contains("impulse") && error.contains("a1"), "{error}");
     Ok(())
 }
