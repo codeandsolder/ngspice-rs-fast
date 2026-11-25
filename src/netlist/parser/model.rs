@@ -68,20 +68,10 @@ fn model_body(input: &mut Input<'_>) -> Result<ParsedCard> {
 
 fn model_base<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
     let base = peek(name("model type")).parse_next(input)?;
-    if !matches!(
-        base.text.to_ascii_lowercase().as_str(),
-        "d" | "npn" | "pnp" | "nmos" | "pmos" | "r" | "res" | "c" | "l" | "sw" | "csw" | "urc"
-            // JFET (`jfet/jfet.c`; level 2 is `jfet2/`).
-            | "njf" | "pjf"
-            // Lossy transmission line (`ltra/ltra.c`).
-            | "ltra" | "txl" | "cpl" | "cpllines" | "s_xfer"
-            // MESFET (`mes/mes.c`) and its `inpdomod.c` HFET spellings; the
-            // level selects `mesa/`, `hfet1/` or `hfet2/`.
-            | "nmf" | "pmf" | "nhfet" | "phfet"
-    ) {
+    if crate::devices::ModelFamily::from_base(&base.text).is_none() {
         return Err(gap(
             input,
-            "model family outside D/BJT/MOS/JFET/MESFET/R/C/L/SW/CSW/URC/TXL scalar syntax",
+            "model family outside registered scalar and vector model syntax",
         ));
     }
     any.parse_next(input)

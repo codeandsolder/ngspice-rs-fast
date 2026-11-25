@@ -775,32 +775,7 @@ impl Writer<'_> {
     fn model(&mut self, model: &ModelCard, depth: usize) -> SpiceResult<()> {
         let location = &model.location;
         let base = model.base.as_str();
-        if !matches!(
-            base,
-            "d" | "npn"
-                | "pnp"
-                | "nmos"
-                | "pmos"
-                | "r"
-                | "res"
-                | "c"
-                | "l"
-                | "sw"
-                | "csw"
-                | "njf"
-                | "pjf"
-                | "urc"
-                | "ltra"
-                | "txl"
-                | "cpl"
-                | "cpllines"
-                | "s_xfer"
-                | "nmf"
-                | "pmf"
-                // `inpdomod.c`'s HFET spellings of the same families.
-                | "nhfet"
-                | "phfet"
-        ) {
+        if crate::devices::ModelFamily::from_base(base).is_none() {
             return Err(refuse(
                 format!("model type {base:?} is outside the supported syntax"),
                 Some(location),
