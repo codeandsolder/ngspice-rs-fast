@@ -112,7 +112,12 @@ and V^T I = identity. Each exact flight time is
 `1/sqrt(y)` and each current basis column by `sqrt(y)`, giving reciprocal
 physical power-wave transforms. Extremely small/large material magnitudes
 are scaled during the Cholesky/Jacobi solve and the physical LC products are
-reconstructed using split binary exponents. Pure RC/RL and other singular
+reconstructed using split binary exponents. The immutable Cholesky,
+symmetric Jacobi and basis reconstruction use two-word floating-point
+arithmetic before rounding the finished modal basis to binary64. This
+prevents nearly coincident eigenvalues from degrading componentwise
+physical reciprocity without increasing runtime stamp precision. Pure
+RC/RL and other singular
 material regimes remain in the general diffuse/descriptor solver, rather
 than inventing a positive phase delay for modes with no finite wave speed.
 
@@ -129,7 +134,13 @@ linearly interpolated between accepted samples; within a trial interval
 the interpolation coefficient of the new incident wave is stamped into
 MNA, rather than extrapolating past the accepted solution. The shortest
 modal flight time bounds the step and slope changes schedule arrival
-breakpoints. Pruning retains the bracket at the longest delay. Rejected
+breakpoints. Each accepted knot stores the two directions' modal waves
+and their absolute evaluation-error bounds (4N binary64 values in total).
+The slope-change detector propagates these bounds through extrapolation:
+a matched port's almost-cancelled reflected wave is not treated as a real
+corner merely because its relative roundoff is large. This preserves weak
+physical reflections without scheduling exponential numbers of numerical
+noise events. Pruning retains the bracket at the longest delay. Rejected
 trials do not mutate the accepted history. No spatial charge/flux slots
 or finite-volume approximation are needed for this lossless regime.
 

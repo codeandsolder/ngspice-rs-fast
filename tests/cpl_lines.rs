@@ -1266,3 +1266,39 @@ fn modal_trials_are_repeatable_across_rejection_and_history_pruning() {
         assert!(wave.len() <= 2 + (longest / dt).ceil() as usize);
     }
 }
+
+#[test]
+fn matched_noncommuting_modal_cable_does_not_propagate_roundoff_as_breakpoints() {
+    // Independent reciprocal bases with unequal delays 0.7 ns and 1.1 ns.
+    // Both ends have the matched physical admittance I I^T. The far-end
+    // incident waves therefore cancel, even though their individual
+    // physical voltage/current summands are not zero.
+    let plot = run_transient_cpl(
+        "i0 0 a0 pwl(0 0 .5n 0 .7n -4.02490707249183229e-03 2.1n -4.02490707249183229e-03 2.4n 0 5n 0)\n\
+         i1 0 a1 pwl(0 0 .5n 0 .7n 1.85040525873951187e-03 2.1n 1.85040525873951187e-03 2.4n 0 5n 0)\n\
+         rag0 a0 0 2.98673262776638602e+01\nra0x1 a0 a1 2.64995705127014446e+02\nrag1 a1 0 3.19199052608936995e+01\n\
+         rbg0 b0 0 2.98673262776638602e+01\nrb0x1 b0 b1 2.64995705127014446e+02\nrbg1 b1 0 3.19199052608936995e+01\n\
+         p1 a0 a1 0 b0 b1 0 cable\n\
+         .model cable cpl r=0 0 0 g=0 0 0 l=9.55723104263021698e-08 1.60457956954219321e-08 1.58410964411988147e-07\n\
+         + c=1.30392673177890839e-10 -1.32077612288939703e-11 1.92296847325850063e-10 length=0.2\n\
+         .tran 0.05n 5n",
+    );
+    let times = transient_column(&plot, "time");
+    let first = transient_column(&plot, "v(b0)");
+    let second = transient_column(&plot, "v(b1)");
+    assert!(
+        times.len() < 1000,
+        "roundoff caused {} accepted transient points",
+        times.len()
+    );
+    let pulse =
+        |t: f64| ((t - 0.5e-9) / 0.2e-9).clamp(0., 1.) - ((t - 2.1e-9) / 0.3e-9).clamp(0., 1.);
+    for ((&t, &a), &b) in times.iter().zip(&first).zip(&second) {
+        let p = pulse(t - 0.7e-9);
+        let q = pulse(t - 1.1e-9);
+        assert!(
+            (a - (-0.054018275760412925_f64).mul_add(p, 0.002104498808104603 * q)).abs() < 5e-9
+        );
+        assert!((b - 0.0207765131828798 * q).abs() < 5e-9);
+    }
+}

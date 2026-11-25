@@ -170,22 +170,41 @@ impl LosslessModes {
 
     fn incident(&self, line: &CoupledLine, context: &DelayContext<'_>) -> SpiceResult<Vec<Real>> {
         let n = self.delays.len();
-        let mut values = vec![0.; 2 * n];
+        // Retain the modal value and an absolute evaluation-error bound for
+        // each direction. Incident waves are differences of large physical
+        // voltage/current terms at a matched port, so |wave| alone cannot
+        // bound their numerical uncertainty.
+        let mut values = vec![0.; 4 * n];
+        let roundoff = 64.
+            * Real::EPSILON
+            * Real::from(u32::try_from(n).map_err(|_| invalid("modal order overflow"))?);
         if context.branches.len() != 2 * n {
             return Err(invalid("modal line branch count mismatch"));
         }
         for port in 0..2 * n {
             let (node, ret) = line.physical_pair(port);
-            let voltage = context.node_voltage(node) - context.node_voltage(ret);
+            let positive = context.node_voltage(node);
+            let negative = context.node_voltage(ret);
+            let voltage = positive - negative;
+            let voltage_uncertainty = roundoff.mul_add(positive.abs(), roundoff * negative.abs());
             let current = context
                 .solution
                 .get(context.branches.start + port)
                 .ok_or_else(|| invalid("missing modal branch current"))?;
             for mode in 0..n {
                 let index = (port % n) * n + mode;
-                let output = &mut values[(port / n) * n + mode];
-                *output = self.current_basis[index]
-                    .mul_add(voltage, self.voltage_basis[index].mul_add(current, *output));
+                let sample = (port / n) * n + mode;
+                values[sample] = self.current_basis[index].mul_add(
+                    voltage,
+                    self.voltage_basis[index].mul_add(current, values[sample]),
+                );
+                let error_index = 2 * n + sample;
+                values[error_index] = self.current_basis[index].abs().mul_add(
+                    voltage_uncertainty,
+                    self.voltage_basis[index]
+                        .abs()
+                        .mul_add(roundoff * current.abs(), values[error_index]),
+                );
             }
         }
         if values.iter().any(|v| !v.is_finite()) {
@@ -288,7 +307,7 @@ fn interpolation(
 
 impl DelayLine for CoupledLine {
     fn new_history(&self) -> DelayHistory {
-        DelayHistory::waveform(2 * self.conductors())
+        DelayHistory::waveform(4 * self.conductors())
     }
 
     fn start(&self, context: &DelayContext<'_>) -> SpiceResult<DelayUpdate> {
@@ -297,7 +316,7 @@ impl DelayLine for CoupledLine {
             .as_ref()
             .ok_or_else(|| invalid("missing lossless modal plan"))?;
         let values = if context.initial_conditions {
-            vec![0.; 2 * self.conductors()]
+            vec![0.; 4 * self.conductors()]
         } else {
             modes.incident(self, context)?
         };
@@ -337,7 +356,8 @@ impl DelayLine for CoupledLine {
             let prev = history
                 .time(history.len() - 2)
                 .ok_or_else(|| invalid("missing previous modal knot"))?;
-            for (port, &value) in values.iter().enumerate() {
+            let width = 2 * self.conductors();
+            for (port, &value) in values[..width].iter().enumerate() {
                 let a = history
                     .value(history.len() - 2, port)
                     .ok_or_else(|| invalid("missing previous modal wave"))?;
@@ -352,8 +372,20 @@ impl DelayLine for CoupledLine {
                 // the next wavefront across the preceding interval. Only
                 // ignore the floating-point uncertainty of this collinearity
                 // check, including amplification by unequal time steps.
-                let scale = a.abs().max(b.abs()).max(value.abs());
-                let roundoff = 64. * Real::EPSILON * scale * (1. + ratio.abs());
+                let error_a = history
+                    .value(history.len() - 2, width + port)
+                    .ok_or_else(|| invalid("missing previous modal error bound"))?;
+                let error_b = history
+                    .value(history.len() - 1, width + port)
+                    .ok_or_else(|| invalid("missing latest modal error bound"))?;
+                // Propagate the two accepted sample uncertainties through
+                // linear extrapolation, then include the current sample.
+                // The bounds come from the physical summands rather than
+                // their potentially almost-cancelled modal result.
+                let roundoff = error_a.mul_add(
+                    ratio.abs(),
+                    error_b.mul_add(1. + ratio.abs(), values[width + port]),
+                );
                 if (value - expected).abs() > roundoff {
                     let when = last + modes.delays[port % self.conductors()];
                     if when > context.time {
