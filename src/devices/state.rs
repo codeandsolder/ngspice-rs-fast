@@ -137,7 +137,7 @@ pub struct StateSnapshot {
 
 impl StateSnapshot {
     /// The values in finalized state-row order.
-    #[must_use]
+    #[must_use = "the returned slice supplies the state values in finalized row order"]
     pub fn values(&self) -> &[Real] {
         &self.values
     }
@@ -175,7 +175,7 @@ struct StateBinding {
 
 impl StateHistory {
     /// An empty history for `len` state slots.
-    #[must_use]
+    #[must_use = "the returned history owns the requested state-slot layout"]
     pub fn new(len: usize) -> Self {
         Self {
             len,
@@ -251,7 +251,7 @@ impl StateHistory {
     }
 
     /// The delay history of the device with ordinal `device`, if it has one.
-    #[must_use]
+    #[must_use = "the result supplies the accepted delay history for the given device"]
     pub fn delay(&self, device: usize) -> Option<&DelayHistory> {
         self.delays.get(&device)
     }
@@ -318,25 +318,25 @@ impl StateHistory {
     }
 
     /// Number of state slots per vector.
-    #[must_use]
+    #[must_use = "the count determines the number of slots per state vector"]
     pub const fn len(&self) -> usize {
         self.len
     }
 
     /// True when the circuit has no state slots.
-    #[must_use]
+    #[must_use = "the result identifies a circuit without state slots"]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// How many accepted vectors are available (at most [`ACCEPTED_DEPTH`]).
-    #[must_use]
+    #[must_use = "the returned count bounds available accepted history ages"]
     pub const fn depth(&self) -> usize {
         self.accepted.len()
     }
 
     /// The accepted vector `age` points back: 1 is the latest (`CKTstate1`).
-    #[must_use]
+    #[must_use = "the result retrieves the accepted history vector at the specified age"]
     pub fn accepted(&self, age: usize) -> Option<&[Real]> {
         age.checked_sub(1)
             .and_then(|index| self.accepted.get(index))
@@ -347,7 +347,7 @@ impl StateHistory {
     /// iterate and no device limiting: every device is evaluated exactly at
     /// the supplied solution. Its slots start as NaN, so a device that forgets
     /// to write one cannot have it committed.
-    #[must_use]
+    #[must_use = "the returned trial owns unset disposable slots that must be filled before acceptance"]
     pub fn trial(&self) -> TrialState {
         self.trial_reusing(None)
     }
@@ -786,7 +786,7 @@ impl TrialState {
     /// The same trial carrying the Newton solve's `reltol` and current
     /// `abstol`, which C's device convergence tests (`DEVconvTest`, run by
     /// `NIconvTest`) use; see [`DeviceState::convergence_tolerances`].
-    #[must_use]
+    #[must_use = "the returned trial carries the selected device convergence tolerances"]
     pub const fn with_convergence_tolerances(mut self, reltol: Real, abstol: Real) -> Self {
         self.mode.tolerances = Some((reltol, abstol));
         self
@@ -794,7 +794,7 @@ impl TrialState {
 
     /// The same trial marked as part of a `uic` transient (C `MODEUIC`),
     /// see [`DeviceState::uic`].
-    #[must_use]
+    #[must_use = "the returned trial carries the chosen UIC mode"]
     pub const fn with_uic(mut self, enabled: bool) -> Self {
         self.mode.set(LoadFlag::Uic, enabled);
         self
@@ -803,7 +803,7 @@ impl TrialState {
     /// The same trial marked as the first transient timepoint's loads
     /// (`MODEINITTRAN` rather than `MODEINITPRED` in
     /// [`IterationPhase::Predict`]); see [`DeviceState::initial_transient`].
-    #[must_use]
+    #[must_use = "the returned trial carries the first transient load phase flag"]
     pub const fn with_initial_transient(mut self, enabled: bool) -> Self {
         self.mode.set(LoadFlag::InitialTransient, enabled);
         self
@@ -811,14 +811,14 @@ impl TrialState {
 
     /// The same trial marked (or unmarked) as C's `uic` initial load; see
     /// the module documentation and [`DeviceState::initial_conditions`].
-    #[must_use]
+    #[must_use = "the returned trial carries the chosen initial-condition load flag"]
     pub const fn with_initial_conditions(mut self, enabled: bool) -> Self {
         self.mode.set(LoadFlag::InitialConditions, enabled);
         self
     }
 
     /// Whether this is the `uic` initial load.
-    #[must_use]
+    #[must_use = "the result determines whether instance initial conditions participate in this load"]
     pub const fn initial_conditions(&self) -> bool {
         self.mode.enabled(LoadFlag::InitialConditions)
     }
@@ -828,7 +828,7 @@ impl TrialState {
     /// [`DeviceState::c_jacobian`]). Newton solves leave it off; `.tf`
     /// (`tfanal.c`), which solves with the matrix C's last `CKTop` load left,
     /// turns it on.
-    #[must_use]
+    #[must_use = "the returned trial selects the reference small-signal Jacobian policy"]
     pub const fn with_c_jacobian(mut self, enabled: bool) -> Self {
         self.mode.set(LoadFlag::ReferenceJacobian, enabled);
         self
@@ -837,20 +837,20 @@ impl TrialState {
     /// The same trial with device limiting allowed or forbidden (see
     /// [`DeviceState::device_limiting`]). Newton drivers using the legacy
     /// global voltage-step damping forbid it so devices load exactly.
-    #[must_use]
+    #[must_use = "the returned trial controls whether device voltage limiting is permitted"]
     pub const fn with_device_limiting(mut self, enabled: bool) -> Self {
         self.mode.set(LoadFlag::DeviceLimiting, enabled);
         self
     }
 
     /// Whether devices may limit their junction voltages in this load.
-    #[must_use]
+    #[must_use = "the result determines whether devices may limit junction voltages"]
     pub const fn device_limiting(&self) -> bool {
         self.mode.enabled(LoadFlag::DeviceLimiting)
     }
 
     /// The Newton phase this trial was loaded in.
-    #[must_use]
+    #[must_use = "the returned phase determines applicable Newton loading rules"]
     pub const fn phase(&self) -> IterationPhase {
         self.mode.phase
     }
@@ -858,19 +858,19 @@ impl TrialState {
     /// True when a device reported that this load changed a discrete state
     /// relative to the previous iterate (C `CKTnoncon++`), so the solve must
     /// not be declared converged on it.
-    #[must_use]
+    #[must_use = "the result requires another Newton iteration when a device rejected convergence"]
     pub const fn is_nonconvergent(&self) -> bool {
         self.nonconvergent
     }
 
     /// The trial values; unset slots are NaN.
-    #[must_use]
+    #[must_use = "the returned slice contains trial values including unset slots"]
     pub fn values(&self) -> &[Real] {
         &self.values
     }
 
     /// The slots of one device, e.g. for an accept hook.
-    #[must_use]
+    #[must_use = "the result bounds a device-owned range of the trial state"]
     pub fn slice(&self, range: Range<usize>) -> Option<&[Real]> {
         self.values.get(range)
     }
@@ -911,7 +911,7 @@ pub struct DeviceState<'a> {
 
 impl<'a> DeviceState<'a> {
     /// A window with no slots, for loads that track no state.
-    #[must_use]
+    #[must_use = "the returned state window represents a load without tracked device history"]
     pub const fn none() -> DeviceState<'static> {
         DeviceState {
             trial: &mut [],
@@ -946,7 +946,7 @@ impl<'a> DeviceState<'a> {
 
     /// The device's accepted delay history (read-only), when it has one and
     /// the window was opened with [`StateHistory::device_of`].
-    #[must_use]
+    #[must_use = "the result supplies the device accepted delay samples when available"]
     pub const fn delay_history(&self) -> Option<&'a DelayHistory> {
         self.delay
     }
@@ -972,13 +972,13 @@ impl<'a> DeviceState<'a> {
     /// The `(reltol, abstol)` of the Newton solve this load belongs to, when
     /// the driver supplied them
     /// ([`TrialState::with_convergence_tolerances`]).
-    #[must_use]
+    #[must_use = "the result supplies relative and absolute device convergence thresholds when configured"]
     pub const fn convergence_tolerances(&self) -> Option<(Real, Real)> {
         self.mode.tolerances
     }
 
     /// The Newton phase of this load.
-    #[must_use]
+    #[must_use = "the returned Newton phase selects the device load behavior"]
     pub const fn phase(&self) -> IterationPhase {
         self.mode.phase
     }
@@ -987,7 +987,7 @@ impl<'a> DeviceState<'a> {
     /// nonlinear device may then evaluate C's limited junction voltages
     /// instead of the supplied solution (and must report the load as
     /// nonconvergent when it does). `false` for exact loads.
-    #[must_use]
+    #[must_use = "the result determines whether a device may substitute limited junction voltages"]
     pub const fn device_limiting(&self) -> bool {
         self.mode.enabled(LoadFlag::DeviceLimiting)
     }
@@ -995,7 +995,7 @@ impl<'a> DeviceState<'a> {
     /// Whether a [`IterationPhase::Predict`] load is `MODEINITTRAN` (the first
     /// transient timepoint, junction voltages from `CKTstate1` unlimited)
     /// rather than `MODEINITPRED` (`DEVpred` extrapolation, limited).
-    #[must_use]
+    #[must_use = "the result distinguishes the first transient load from later prediction"]
     pub const fn initial_transient(&self) -> bool {
         self.mode.enabled(LoadFlag::InitialTransient)
     }
@@ -1003,7 +1003,7 @@ impl<'a> DeviceState<'a> {
     /// Whether the transient runs with `uic` (C `MODEUIC`): in the first
     /// step's `MODEINITTRAN` load capacitors and inductors start from their
     /// `ic=` values.
-    #[must_use]
+    #[must_use = "the result determines whether initial storage conditions must be used for this transient"]
     pub const fn uic(&self) -> bool {
         self.mode.enabled(LoadFlag::Uic)
     }
@@ -1012,7 +1012,7 @@ impl<'a> DeviceState<'a> {
     /// `r = CKTdelta / CKTdeltaOld[1]`; `state2` is `state1` when only one
     /// accepted vector exists (dctran.c copies state1 into state2 after the
     /// first step).
-    #[must_use]
+    #[must_use = "the result supplies an extrapolated state only when the required history exists"]
     #[inline]
     pub fn predicted(&self, slot: usize, ratio: Real) -> Option<Real> {
         let s1 = self.accepted(1, slot)?;
@@ -1025,7 +1025,7 @@ impl<'a> DeviceState<'a> {
     /// Whether this is C's `uic` initial load
     /// ([`TrialState::with_initial_conditions`]): nonlinear devices evaluate
     /// at their instance initial-condition voltages.
-    #[must_use]
+    #[must_use = "the result determines whether nonlinear devices evaluate explicit initial voltages"]
     pub const fn initial_conditions(&self) -> bool {
         self.mode.enabled(LoadFlag::InitialConditions)
     }
@@ -1036,14 +1036,14 @@ impl<'a> DeviceState<'a> {
     /// point are unchanged; only the matrix differs. Today only the BJT reads
     /// it (`bjtload.c` stamps the bias-dependent base resistance as the
     /// conductance `gx` alone).
-    #[must_use]
+    #[must_use = "the result determines whether the reference-specific Jacobian convention is requested"]
     pub const fn c_jacobian(&self) -> bool {
         self.mode.enabled(LoadFlag::ReferenceJacobian)
     }
 
     /// The value of `slot` written by the previous load of the same Newton
     /// solve (C `CKTstate0` before this load), or `None` for the first load.
-    #[must_use]
+    #[must_use = "the result supplies the prior Newton load state when available"]
     pub fn iterate(&self, slot: usize) -> Option<Real> {
         self.previous
             .and_then(|previous| previous.get(slot))
@@ -1053,7 +1053,7 @@ impl<'a> DeviceState<'a> {
     /// The value of `slot` in the state vector an earlier analysis of the
     /// deck left behind (C's `CKTstate0` at the start of this analysis, which
     /// C does not reset between analyses), if any.
-    #[must_use]
+    #[must_use = "the result supplies a state value inherited from an earlier analysis"]
     pub fn carried(&self, slot: usize) -> Option<Real> {
         self.carried.and_then(|carried| carried.get(slot)).copied()
     }
@@ -1074,26 +1074,26 @@ impl<'a> DeviceState<'a> {
     }
 
     /// Number of slots this device owns.
-    #[must_use]
+    #[must_use = "the returned count bounds the slots owned by this device"]
     pub const fn len(&self) -> usize {
         self.trial.len()
     }
 
     /// True when the device owns no slots.
-    #[must_use]
+    #[must_use = "the result identifies a device with no tracked slots"]
     pub const fn is_empty(&self) -> bool {
         self.trial.is_empty()
     }
 
     /// How many accepted points are available (0 before the first accepted
     /// point, or when the load tracks no history).
-    #[must_use]
+    #[must_use = "the returned count bounds the accepted history available to this device"]
     pub const fn depth(&self) -> usize {
         self.depth
     }
 
     /// The trial value of `slot`, NaN when not yet written in this load.
-    #[must_use]
+    #[must_use = "the result retrieves the current trial slot without committing it"]
     pub fn trial(&self, slot: usize) -> Option<Real> {
         self.trial.get(slot).copied()
     }
@@ -1115,7 +1115,7 @@ impl<'a> DeviceState<'a> {
     }
 
     /// The accepted value of `slot`, `age` points back (1 is the latest).
-    #[must_use]
+    #[must_use = "the result retrieves a device slot at the specified accepted history age"]
     #[inline]
     pub fn accepted(&self, age: usize, slot: usize) -> Option<Real> {
         // Validate the local index before translating it into an absolute

@@ -51,7 +51,7 @@ pub struct ChargeContext<'a> {
 
 impl ChargeContext<'_> {
     /// Read the physical voltage of a node; ground is exactly zero.
-    #[must_use]
+    #[must_use = "the returned physical node voltage is the operating-point value used by the device"]
     pub fn voltage(&self, node: NodeId) -> Real {
         self.unknowns
             .node_row(node)
@@ -222,20 +222,20 @@ pub enum AnalysisMode {
 impl AnalysisMode {
     /// True for the AC and noise analyses, where everything is complex and the
     /// system is loaded at `omega = 2 pi f`.
-    #[must_use]
+    #[must_use = "the result selects complex frequency-domain loading"]
     pub const fn is_ac(self) -> bool {
         matches!(self, Self::Ac { .. })
     }
 
     /// True for transient analysis.
-    #[must_use]
+    #[must_use = "the result selects time-dependent loading"]
     pub const fn is_transient(self) -> bool {
         matches!(self, Self::Transient { .. })
     }
 
     /// True for the DC analyses, where capacitors are open and inductors are
     /// shorts.
-    #[must_use]
+    #[must_use = "the result selects static bias loading of storage devices"]
     pub const fn is_dc(self) -> bool {
         matches!(self, Self::OperatingPoint | Self::DcSweep)
     }
@@ -255,7 +255,7 @@ pub struct MnaUnknowns {
 
 impl MnaUnknowns {
     /// An empty mapping.
-    #[must_use]
+    #[must_use = "the returned mapping owns the initial empty MNA coordinate layout"]
     pub const fn new() -> Self {
         Self {
             node_rows: Vec::new(),
@@ -326,7 +326,7 @@ impl MnaUnknowns {
     }
 
     /// The matrix row for a node, or `None` for ground.
-    #[must_use]
+    #[must_use = "the result selects the matrix coordinate or identifies ground"]
     #[inline]
     pub fn node_row(&self, node: NodeId) -> Option<usize> {
         self.node_rows.get(node.index()).copied().flatten()
@@ -364,13 +364,13 @@ impl MnaUnknowns {
     }
 
     /// Number of unknowns, i.e. the size of the MNA system.
-    #[must_use]
+    #[must_use = "the returned dimension bounds the allocated matrix and vectors"]
     pub const fn len(&self) -> usize {
         self.next_row
     }
 
     /// True when the system has no unknowns, which means the circuit is empty.
-    #[must_use]
+    #[must_use = "the result determines whether the circuit has any matrix unknowns"]
     pub const fn is_empty(&self) -> bool {
         self.next_row == 0
     }
@@ -413,7 +413,7 @@ pub struct ConvergenceContext<'a> {
 
 impl ConvergenceContext<'_> {
     /// The new iterate's value at a node, zero at ground.
-    #[must_use]
+    #[must_use = "the returned node voltage is from the current Newton iterate"]
     pub fn voltage(&self, node: NodeId) -> Real {
         self.unknowns
             .node_row(node)
@@ -435,7 +435,7 @@ enum RhsTarget<'a> {
 
 impl<'a> StampRhs<'a> {
     /// Stamp into the complete solver RHS.
-    #[must_use]
+    #[must_use = "the returned writer routes device RHS contributions into the complete solver vector"]
     pub const fn dense(rhs: &'a mut Vector) -> Self {
         Self(RhsTarget::Dense(rhs))
     }
@@ -554,7 +554,7 @@ impl StampContext<'_> {
     /// The temperatures and junction `gmin` of this load as a [`crate::devices::ModelContext`]
     /// (without resistor or instance-parameter overrides, which
     /// [`crate::devices::Circuit`] has already applied).
-    #[must_use]
+    #[must_use = "the returned context preserves temperatures and junction conductance for the load"]
     pub const fn model_context(&self) -> crate::devices::ModelContext {
         crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
             .with_gmin(self.gmin)
@@ -651,7 +651,7 @@ impl StampContext<'_> {
     }
 
     /// The present solution value at a node, or zero at ground.
-    #[must_use]
+    #[must_use = "the returned voltage is the present solution value at the node"]
     #[inline]
     pub fn node_voltage(&self, node: NodeId) -> Real {
         self.unknowns
@@ -661,7 +661,7 @@ impl StampContext<'_> {
     }
 
     /// The name of a node, for diagnostics.
-    #[must_use]
+    #[must_use = "the returned name identifies the node in diagnostics"]
     pub fn node_name(&self, node: NodeId) -> &str {
         self.nodes
             .node(node)

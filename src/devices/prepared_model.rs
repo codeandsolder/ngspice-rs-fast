@@ -84,7 +84,7 @@ pub struct InstanceTemperature {
 
 impl InstanceTemperature {
     /// Prepare at the circuit temperature without instance overrides.
-    #[must_use]
+    #[must_use = "the returned temperature selection uses circuit ambient without instance overrides"]
     pub const fn circuit(celsius: Real) -> Self {
         Self {
             circuit_celsius: celsius,
@@ -93,7 +93,7 @@ impl InstanceTemperature {
     }
 
     /// Effective instance ambient in absolute kelvin.
-    #[must_use]
+    #[must_use = "the returned absolute temperature supplies model preparation"]
     pub fn ambient_kelvin(self) -> Real {
         match self.ambient {
             AmbientTemperature::Circuit => self.circuit_celsius + CELSIUS_TO_KELVIN,

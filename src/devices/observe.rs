@@ -77,13 +77,13 @@ pub struct Observation {
 
 impl Observation {
     /// Original (canonical lower-case) plot column name.
-    #[must_use]
+    #[must_use = "the returned canonical name identifies the output column"]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Rawfile unit derived once from the resolved device and quantity.
-    #[must_use]
+    #[must_use = "the returned unit identifies the resolved physical output quantity"]
     pub const fn unit(&self) -> &'static str {
         self.unit
     }
@@ -433,7 +433,7 @@ impl Circuit {
     }
 
     /// Extra bound columns requested through [`Self::set_observations`].
-    #[must_use]
+    #[must_use = "the returned bound columns determine extra simulation outputs"]
     pub fn observations(&self) -> &[Observation] {
         &self.runtime.observations.queries
     }

@@ -64,7 +64,7 @@ pub enum DeviceSupport {
 
 impl DeviceSupport {
     /// `ported`, `bounded` or `pending`.
-    #[must_use]
+    #[must_use = "the returned label communicates this designator support status"]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Ported => "ported",
@@ -74,13 +74,13 @@ impl DeviceSupport {
     }
 
     /// Whether the port builds the device at all (ported or bounded).
-    #[must_use]
+    #[must_use = "the result distinguishes buildable devices from pending ones"]
     pub const fn is_implemented(self) -> bool {
         !matches!(self, Self::Pending)
     }
 
     /// The support the factory module gives `designator`.
-    #[must_use]
+    #[must_use = "the returned status determines the factory support for the designator"]
     pub fn of(designator: char) -> Self {
         let designator = designator.to_ascii_lowercase();
         if crate::devices::factory::CARD_FACTORY.contains(&designator) {
@@ -270,14 +270,14 @@ pub struct Registry {
 
 impl Registry {
     /// An empty registry.
-    #[must_use]
+    #[must_use = "the returned registry owns an empty device catalog"]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Built-in registry: every known designator with the support the
     /// factory module gives it ([`DeviceSupport::of`]).
-    #[must_use]
+    #[must_use = "the returned registry contains the built-in device catalog"]
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         for (designator, description, c_reference) in BUILTINS {
@@ -304,37 +304,37 @@ impl Registry {
     }
 
     /// The entry for a designator letter, case-insensitively.
-    #[must_use]
+    #[must_use = "the result resolves a device designator to its registry entry"]
     pub fn get(&self, designator: char) -> Option<&DeviceEntry> {
         self.entries.get(&designator.to_ascii_lowercase())
     }
 
     /// Whether a designator is known.
-    #[must_use]
+    #[must_use = "the result establishes whether the designator is recognized"]
     pub fn contains(&self, designator: char) -> bool {
         self.get(designator).is_some()
     }
 
     /// Number of known designators.
-    #[must_use]
+    #[must_use = "the returned count bounds the registered designator inventory"]
     pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True when no designators are known.
-    #[must_use]
+    #[must_use = "the result distinguishes an unpopulated catalog from one with entries"]
     pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// How many known designators the entry's factory builds from the card.
-    #[must_use]
+    #[must_use = "the count describes the designators directly buildable from cards"]
     pub fn ported_count(&self) -> usize {
         self.count(|support| support == DeviceSupport::Ported)
     }
 
     /// How many known designators are built only during deck elaboration.
-    #[must_use]
+    #[must_use = "the count describes the designators requiring deck elaboration"]
     pub fn bounded_count(&self) -> usize {
         self.count(|support| matches!(support, DeviceSupport::Bounded))
     }

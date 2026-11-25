@@ -107,7 +107,7 @@ impl CDeviceType {
     /// The type of a built-in device letter with a single C type, as `INP2*`
     /// files map them; `None` for letters whose type depends on the model
     /// (M, J, Z, Q's VBIC) or that the port has no type for.
-    #[must_use]
+    #[must_use = "the result identifies a fixed setup family or requires model-dependent selection"]
     pub const fn of_designator(designator: char) -> Option<Self> {
         Some(match designator.to_ascii_lowercase() {
             'b' => Self::Asrc,
@@ -220,7 +220,7 @@ pub struct MatrixSetup<'a> {
 
 impl MatrixSetup<'_> {
     /// The matrix row of a node, `None` for ground.
-    #[must_use]
+    #[must_use = "the result binds a physical node to a matrix row or identifies ground"]
     pub fn node(&self, node: NodeId) -> Option<usize> {
         self.unknowns.node_row(node)
     }

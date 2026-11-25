@@ -86,13 +86,13 @@ impl ResistorOverride {
     }
 
     /// The overridden device's ordinal in [`crate::devices::Circuit::devices`].
-    #[must_use]
+    #[must_use = "the returned ordinal identifies the resistor receiving this override"]
     pub const fn device(&self) -> usize {
         self.device
     }
 
     /// The supplied scalar (ohms) used instead of the device's own.
-    #[must_use]
+    #[must_use = "the returned resistance is the requested replacement in ohms"]
     pub const fn supplied(&self) -> Real {
         self.supplied
     }
@@ -137,13 +137,13 @@ impl InstanceTarget {
     }
 
     /// Device ordinal in the finalized circuit.
-    #[must_use]
+    #[must_use = "the returned ordinal identifies the bound parameter target device"]
     pub const fn device(self) -> usize {
         self.device
     }
 
     /// Canonical alias-folded keyword.
-    #[must_use]
+    #[must_use = "the returned key identifies the canonical bound setter"]
     pub const fn parameter(self) -> ParameterKey {
         self.parameter
     }
@@ -199,25 +199,25 @@ impl InstanceOverride {
     }
 
     /// The value-independent typed target.
-    #[must_use]
+    #[must_use = "the returned typed target identifies the setter independently of its replacement value"]
     pub const fn target(self) -> InstanceTarget {
         self.target
     }
 
     /// The overridden device's ordinal.
-    #[must_use]
+    #[must_use = "the returned ordinal identifies the overridden instance"]
     pub const fn device(&self) -> usize {
         self.target.device()
     }
 
     /// The canonical (lowercase, alias-folded) parameter keyword.
-    #[must_use]
+    #[must_use = "the returned key identifies the overridden canonical parameter"]
     pub const fn parameter(&self) -> ParameterKey {
         self.target.parameter()
     }
 
     /// Value in the setter's own unit (Celsius for temperature).
-    #[must_use]
+    #[must_use = "the returned scalar supplies the override in the original setter unit"]
     pub const fn value(&self) -> Real {
         self.value
     }
@@ -234,7 +234,7 @@ impl InstanceOverride {
 ///
 /// Only used to tell a parameter C would sweep but this port does not yet
 /// (`NotYetPorted`) from one C rejects as well (`Unsupported`).
-#[must_use]
+#[must_use = "the result distinguishes a known reference parameter from an unsupported name"]
 pub fn c_instance_parameter_known(designator: char, keyword: &str) -> bool {
     let keywords: &[&str] = match designator.to_ascii_lowercase() {
         'r' => &[

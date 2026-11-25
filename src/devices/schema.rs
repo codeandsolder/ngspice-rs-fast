@@ -142,7 +142,7 @@ struct CompiledScalar {
 impl<'a> ScalarSchema<'a> {
     /// Construct a reusable schema. Static device definitions retain their
     /// compiled metadata; local definitions never outlive this schema.
-    #[must_use]
+    #[must_use = "the returned schema binds the reusable ordered parameter definitions"]
     pub const fn new(parameters: &'a [ScalarParameter]) -> Self {
         Self {
             parameters,
@@ -151,7 +151,7 @@ impl<'a> ScalarSchema<'a> {
     }
 
     /// Original ordered definitions.
-    #[must_use]
+    #[must_use = "the returned definitions determine parameter validation"]
     pub const fn parameters(&self) -> &'a [ScalarParameter] {
         self.parameters
     }
@@ -258,7 +258,7 @@ impl ScalarValues {
 
     /// Lookup by canonical name, case-insensitively. Absent optional values
     /// return `None`, rather than inventing a zero.
-    #[must_use]
+    #[must_use = "the result retrieves the validated scalar or identifies an absent optional value"]
     pub fn get(&self, name: &str) -> Option<&ScalarValue> {
         self.values[*self.indices.get(ascii_key(name).as_ref())?].as_ref()
     }
