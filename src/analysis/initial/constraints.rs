@@ -234,7 +234,10 @@ impl<'a> ConstraintGraph<'a> {
             ));
         }
         for device in circuit.devices() {
-            if matches!(device.designator(), 'e' | 'h')
+            let analog = (device.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<crate::devices::code_model::analog::AnalogCodeModel>();
+            if (matches!(device.designator(), 'e' | 'h')
+                || analog.is_some_and(|model| model.initial_constraint().is_none()))
                 && let [positive, negative, ..] = device.terminals()
             {
                 graph.add_controlled(
@@ -253,12 +256,30 @@ impl<'a> ConstraintGraph<'a> {
             let value = match device.designator() {
                 'v' => rhs.as_slice()[rows.start],
                 'l' if inductors_short => 0.,
+                'a' => {
+                    let instance = device.as_ref() as &dyn std::any::Any;
+                    if instance.is::<crate::devices::code_model::DacSource>() {
+                        rhs.as_slice()[rows.start]
+                    } else if let Some(value) = instance
+                        .downcast_ref::<crate::devices::code_model::analog::AnalogCodeModel>()
+                        .and_then(
+                            crate::devices::code_model::analog::AnalogCodeModel::initial_constraint,
+                        )
+                    {
+                        value
+                    } else {
+                        continue;
+                    }
+                }
                 _ => continue,
             };
             // An RF port source is on the internal #res node.
             let (positive, negative) = match (device.terminals(), device.rf_port()) {
                 ([_, negative, _], Some(port)) => (port.internal, *negative),
                 ([positive, negative], None) => (*positive, *negative),
+                ([positive, negative, ..], None) if device.designator() == 'a' => {
+                    (*positive, *negative)
+                }
                 _ => continue,
             };
             graph.join(
