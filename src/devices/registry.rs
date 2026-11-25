@@ -85,7 +85,9 @@ impl DeviceSupport {
         let designator = designator.to_ascii_lowercase();
         if crate::devices::factory::CARD_FACTORY.contains(&designator) {
             Self::Ported
-        } else if designator == 'x' || crate::devices::ModelBackend::requires_model(designator) {
+        } else if matches!(designator, 'x' | 'a')
+            || crate::devices::ModelBackend::requires_model(designator)
+        {
             Self::Bounded
         } else {
             Self::Pending
@@ -416,7 +418,7 @@ mod tests {
             assert!(registry.contains(*designator), "missing {designator}");
         }
         assert_eq!(registry.ported_count(), 12);
-        assert_eq!(registry.bounded_count(), 12);
+        assert_eq!(registry.bounded_count(), 13);
         assert_eq!(registry.len(), super::BUILTINS.len());
         for entry in registry.entries() {
             assert!(!entry.description.is_empty(), "{entry:?}");

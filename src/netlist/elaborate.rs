@@ -414,7 +414,7 @@ fn literalize_parameters(
                                 SpiceError::Parse { location, message } => SpiceError::parse(
                                     location,
                                     format!(
-                                        "{message} while resolving {} CPL coefficient at {}",
+                                        "{message} while resolving {} vector coefficient at {}",
                                         parameter.name, entry.source.location
                                     ),
                                 ),

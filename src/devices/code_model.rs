@@ -3,6 +3,7 @@
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
+pub mod rational;
 
 /// Three-valued digital logic.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
