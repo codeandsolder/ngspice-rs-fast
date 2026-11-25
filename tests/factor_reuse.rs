@@ -325,22 +325,22 @@ fn retained_factors_report_their_own_work_and_known_fill() {
 }
 
 #[test]
-fn factor_storage_distinguishes_external_and_translated_order() {
+fn missing_translated_unknown_never_publishes_partial_factor_storage() {
     use ngspice_rs::maths::SparseLu;
     let pattern = Arc::new(Pattern::new(3, [(0, 0), (2, 2)]).unwrap());
-    let mut matrix = SparseMatrix::bound(pattern).unwrap();
+    let mut matrix = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
     matrix.set(0, 0, 2.).unwrap();
     matrix.set(2, 2, 4.).unwrap();
-    let lu = SparseLu::new(&matrix, None).unwrap();
-    let stats = lu.factor_storage();
-    assert_eq!((stats.external_order, stats.translated_order), (3, 2));
-    assert_eq!((stats.original_entries, stats.factor_entries), (2, 2));
-    assert_eq!(
-        lu.solve(&Vector::from_slice(&[2., 7.5, 4.]))
-            .unwrap()
-            .as_slice(),
-        [1., 7.5, 1.]
-    );
+    let rhs = Vector::from_slice(&[2., 7.5, 4.]);
+    for _ in 0..2 {
+        let error = SparseLu::new(&matrix, None).unwrap_err();
+        assert!(error.to_string().contains("no matrix entries"));
+        let error = solve_ni(&matrix, &rhs, &mut None, false, 0.).unwrap_err();
+        assert!(error.to_string().contains("no matrix entries"));
+        let telemetry = pattern.factor_telemetry();
+        assert_eq!(telemetry.storage, None);
+        assert_eq!(telemetry.work.factor.successful_factors, 0);
+    }
 }
 
 #[test]
