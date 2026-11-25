@@ -235,7 +235,7 @@ impl CoupledLinePlan {
         // Similarity transform state I' = Zref I, balancing Z and Y blocks.
         // Crucial for physical L~nH and C~pF, not a change to the line model.
         let impedance_scale = if zmax > 0. && ymax > 0. {
-            (zmax / ymax).sqrt()
+            zmax.sqrt() / ymax.sqrt()
         } else {
             1.
         };
@@ -258,17 +258,31 @@ impl CoupledLinePlan {
         Ok((generator, impedance_scale))
     }
 
-    /// Real DC propagator for a half spatial section; same physical
-    /// telegrapher generator as the exact DC/AC 2N-port.
-    pub(super) fn dc_half_section(&self, sections: usize) -> SpiceResult<(DenseComplex, Real)> {
-        let divisor = sections
-            .checked_mul(2)
-            .ok_or_else(|| invalid("half-section count overflow"))?;
-        let scale = f64::from(u32::try_from(divisor).map_err(|_| invalid("half-section scale"))?);
-        let (operator, impedance_scale) = self.operator(0.)?;
+    /// Bounded short-segment DC transfer and the number of binary doublings
+    /// needed to recover the requested physical length. The caller composes
+    /// passive hybrid operators rather than exponentially growing transfers.
+    pub(super) fn dc_hybrid_seed(&self, length: Real) -> SpiceResult<(DenseComplex, Real, usize)> {
+        let mut segment = self.clone();
+        segment.length = length;
+        let (operator, scale) = segment.operator(0.)?;
+        let mut norm = operator_norm(&operator)?;
+        let mut factor = 1.;
+        let mut steps = 0;
+        while norm > 4. {
+            if steps >= self.limits.squarings {
+                return Err(invalid("DC hybrid composition exceeds work budget"));
+            }
+            norm *= 0.5;
+            factor *= 0.5;
+            steps += 1;
+        }
+        if factor == 0. {
+            return Err(invalid("DC hybrid segment length underflow"));
+        }
         Ok((
-            expm_pade13(&scaled(&operator, 1. / scale)?, self.limits.squarings)?,
-            impedance_scale,
+            expm_pade13(&scaled(&operator, factor)?, self.limits.squarings)?,
+            scale,
+            steps,
         ))
     }
 

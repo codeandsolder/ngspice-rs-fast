@@ -328,9 +328,9 @@ impl CoupledLine {
         Ok(entries)
     }
     /// Augmented telegrapher constraints avoid ever inverting the B block.
-    /// Input current unknowns are the physical currents multiplied by the
-    /// positive wave-impedance balancing scalar. Their branch equations are
-    /// Vout - A Vin - B Iin'=0, and output KCL includes -C Vin - D Iin'.
+    /// Input current unknowns are physical; the transfer uses Iin'=scale*Iin.
+    /// Branch equations are Vout - A Vin - B Iin'=0, and output KCL
+    /// includes -(C Vin + D Iin')/scale.
     /// This representation handles ideal shorts and lossless DC *exactly*.
     fn transfer_stamps_at(
         &self,
@@ -340,6 +340,9 @@ impl CoupledLine {
     ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
         if let Some(modes) = &self.lossless {
             return modes.frequency_stamps(self, hz, unknowns, first_branch);
+        }
+        if hz == 0. {
+            return self.dc_hybrid_stamps(unknowns, first_branch);
         }
         // A passive, heavily attenuating cable has finite terminal Y even
         // when its full length ABCD expm would overflow or lose reciprocity
@@ -473,8 +476,8 @@ impl CoupledLine {
                 .ok_or_else(|| invalid("branch row overflow"))?;
             let (input_positive, input_return) = inputs[i];
             let (output_positive, output_return) = outputs[i];
-            insert(input_positive, Some(branch_i), Complex::real(inverse_scale));
-            insert(input_return, Some(branch_i), Complex::real(-inverse_scale));
+            insert(input_positive, Some(branch_i), Complex::real(1.));
+            insert(input_return, Some(branch_i), Complex::real(-1.));
             insert(Some(branch_i), output_positive, Complex::real(1.));
             insert(Some(branch_i), output_return, Complex::real(-1.));
             for (j, &(source_positive, source_return)) in inputs.iter().enumerate() {
@@ -500,13 +503,13 @@ impl CoupledLine {
                 insert(output_return, source_positive, -out_current);
                 insert(output_return, source_return, out_current);
                 // The same KCL equation's -D I' coupling.
-                let out_branch = -d * Complex::real(inverse_scale);
+                let out_branch = -d;
                 insert(output_positive, Some(branch_j), out_branch);
                 insert(output_return, Some(branch_j), -out_branch);
                 // One voltage constraint row per conductor: Vout-A Vin-B I'=0.
                 insert(Some(branch_i), source_positive, -a);
                 insert(Some(branch_i), source_return, a);
-                insert(Some(branch_i), Some(branch_j), -b);
+                insert(Some(branch_i), Some(branch_j), -b * Complex::real(scale));
             }
         }
         if entries.iter().any(|(_, _, value)| !value.is_finite()) {
@@ -577,7 +580,7 @@ impl Device for CoupledLine {
                         setup.nodes(row, col);
                     }
                 }
-                for col in [source_positive, source_return] {
+                for col in [source_positive, source_return, other_output, other_return] {
                     setup.element(Some(branch_i), setup.node(col));
                 }
                 setup.element(Some(branch_i), Some(branch_j));

@@ -12,9 +12,9 @@
 //! per signal conductor; no additional circuit node or dense global block
 //! is introduced by the spatial discretization.
 use super::{CoupledLine, invalid};
-use crate::devices::traits::{AnalysisMode, StampContext};
+use crate::devices::traits::{AnalysisMode, MnaUnknowns, StampContext};
 use crate::maths::{Coefficients, dense_complex::DenseComplex, integrator::ChargeHistory};
-use crate::primitives::{Real, SpiceResult};
+use crate::primitives::{Complex, Real, SpiceResult};
 
 /// Six slots per section/conductor: q and dq of the left half-shunt C,
 /// flux and dflux of the coupled series L, and q and dq of the right C.
@@ -134,7 +134,7 @@ impl Cell {
         // The same similarity change of current units used by frequency
         // stamping, here evaluated at the real integration coefficient ag0.
         let scale = if series_norm > 0. && shunt_norm > 0. {
-            (series_norm / shunt_norm).sqrt()
+            series_norm.sqrt() / shunt_norm.sqrt()
         } else {
             1.
         };
@@ -154,35 +154,6 @@ impl Cell {
             half_shunt,
         })
     }
-}
-
-/// Apply a numerically real DC complex transfer to a real voltage/current
-/// state. Any material imaginary leakage above roundoff is rejected.
-fn apply_complex_real(matrix: &DenseComplex, state: &[Real]) -> SpiceResult<Vec<Real>> {
-    if matrix.dim() != state.len() {
-        return Err(invalid("DC section transfer size mismatch"));
-    }
-    let mut result = Vec::new();
-    result
-        .try_reserve_exact(state.len())
-        .map_err(|_| invalid("DC transfer scratch"))?;
-    for row in 0..state.len() {
-        let mut value = 0.;
-        for (col, &input) in state.iter().enumerate() {
-            let factor = matrix
-                .get(row, col)
-                .ok_or_else(|| invalid("DC transfer index"))?;
-            if factor.im.abs() > 1e-12 * factor.re.abs().max(1e-200) {
-                return Err(invalid("DC line material yields imaginary propagation"));
-            }
-            value = factor.re.mul_add(input, value);
-        }
-        if !value.is_finite() {
-            return Err(invalid("DC internal section state overflow"));
-        }
-        result.push(value);
-    }
-    Ok(result)
 }
 
 const fn slot(section: usize, conductor: usize, kind: usize, conductors: usize) -> usize {
@@ -221,77 +192,10 @@ fn write_energy(
     states.set(slot + 1, ag0.mul_add(value, history))
 }
 
-impl CoupledLine {
-    /// Total charge/flux state slots for all spatial sections.
-    #[must_use]
-    pub(super) fn spatial_state_count(&self) -> usize {
-        self.sections * self.conductors() * SLOTS_PER_SECTION_CONDUCTOR
-    }
-
-    /// Initialize steady state from the exact continuous DC transfer.
-    /// Both section half-shunt charges and series fluxes are populated,
-    /// including the correct mutually coupled per-unit-length matrices.
-    pub(super) fn dc_spatial_state(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        // Ordinary DC analyses may load without companion history, just as
-        // capacitors and inductors do. A transient seed has bound slots.
-        if context.states.is_empty() {
-            return Ok(());
-        }
-        let count = self.conductors();
-        if context.states.len() != self.spatial_state_count() {
-            return Err(invalid("DC spatial-line state layout mismatch"));
-        }
-        if self.plan.requires_norton(0.)? {
-            return self.dc_stable_state(context);
-        }
-        let (half, scale) = self.plan.dc_half_section(self.sections)?;
-        let mut state = Vec::new();
-        state
-            .try_reserve_exact(2 * count)
-            .map_err(|_| invalid("DC spatial input state"))?;
-        for conductor in 0..count {
-            let (positive, negative) = self.physical_pair(conductor);
-            state.push(context.node_voltage(positive) - context.node_voltage(negative));
-        }
-        for conductor in 0..count {
-            state.push(context.row_value(context.branch(conductor)?)?);
-        }
-        let width = self.plan.length
-            / f64::from(u32::try_from(self.sections).map_err(|_| invalid("section count"))?);
-        for section in 0..self.sections {
-            let midpoint = apply_complex_real(&half, &state)?;
-            let right = apply_complex_real(&half, &midpoint)?;
-            for conductor in 0..count {
-                let mut left_q = 0.;
-                let mut series_flux = 0.;
-                let mut right_q = 0.;
-                for col in 0..count {
-                    let index = conductor * count + col;
-                    let capacitance = self.plan.c.data()[index] * width * 0.5;
-                    let inductance = self.plan.l.data()[index] * width;
-                    left_q = capacitance.mul_add(state[col], left_q);
-                    right_q = capacitance.mul_add(right[col], right_q);
-                    series_flux = inductance.mul_add(midpoint[count + col] / scale, series_flux);
-                }
-                for (kind, value) in [(LEFT, left_q), (SERIES, series_flux), (RIGHT, right_q)] {
-                    let index = slot(section, conductor, kind, count);
-                    context.states.set(index, value)?;
-                    context.states.set(index + 1, 0.)?;
-                }
-            }
-            state = right;
-        }
-        Ok(())
-    }
-}
-
-// A positive-real Schur complement of adjacent passive spatial cells.
-// This representation never constructs the exponentially growing long-line
-// ABCD transfer; interior voltages are eliminated locally and stably.
 impl Square {
     fn add(&self, other: &Self) -> SpiceResult<Self> {
         if self.dimension != other.dimension {
-            return Err(invalid("Norton dimension mismatch"));
+            return Err(invalid("hybrid dimension mismatch"));
         }
         let mut result = Self::zeros(self.dimension)?;
         for ((target, &a), &b) in result
@@ -303,25 +207,7 @@ impl Square {
             *target = a + b;
         }
         if result.entries.iter().any(|v| !v.is_finite()) {
-            return Err(invalid("nonfinite Norton matrix sum"));
-        }
-        Ok(result)
-    }
-    fn sub(&self, other: &Self) -> SpiceResult<Self> {
-        if self.dimension != other.dimension {
-            return Err(invalid("Norton dimension mismatch"));
-        }
-        let mut result = Self::zeros(self.dimension)?;
-        for ((target, &a), &b) in result
-            .entries
-            .iter_mut()
-            .zip(&self.entries)
-            .zip(&other.entries)
-        {
-            *target = a - b;
-        }
-        if result.entries.iter().any(|v| !v.is_finite()) {
-            return Err(invalid("nonfinite Norton matrix difference"));
+            return Err(invalid("nonfinite hybrid matrix sum"));
         }
         Ok(result)
     }
@@ -346,469 +232,467 @@ impl Square {
             }
         }
         if inverse.entries.iter().any(|v| !v.is_finite()) {
-            return Err(invalid("nonfinite Norton inverse"));
+            return Err(invalid("nonfinite hybrid inverse"));
         }
         Ok(inverse)
     }
-    fn solve(&self, rhs: &[Real]) -> SpiceResult<Vec<Real>> {
-        let mut dense = crate::maths::Matrix::zeros(self.dimension, self.dimension)?;
-        dense.data_mut().copy_from_slice(&self.entries);
-        Ok(dense
-            .solve(&crate::maths::Vector::from(rhs.to_vec()))?
-            .as_slice()
-            .to_vec())
+    fn identity(dimension: usize) -> SpiceResult<Self> {
+        let mut result = Self::zeros(dimension)?;
+        for i in 0..dimension {
+            result.set(i, i, 1.);
+        }
+        Ok(result)
+    }
+    fn transpose(&self) -> SpiceResult<Self> {
+        let mut result = Self::zeros(self.dimension)?;
+        for row in 0..self.dimension {
+            for col in 0..self.dimension {
+                result.set(col, row, self.at(row, col));
+            }
+        }
+        Ok(result)
     }
 }
 fn sum_vectors(a: &[Real], b: &[Real]) -> SpiceResult<Vec<Real>> {
     if a.len() != b.len() {
-        return Err(invalid("Norton vector size mismatch"));
+        return Err(invalid("hybrid vector size mismatch"));
     }
     let output = a.iter().zip(b).map(|(&x, &y)| x + y).collect::<Vec<_>>();
     if output.iter().any(|v| !v.is_finite()) {
-        return Err(invalid("nonfinite Norton source sum"));
+        return Err(invalid("nonfinite hybrid source sum"));
     }
     Ok(output)
 }
 fn diff_vectors(a: &[Real], b: &[Real]) -> SpiceResult<Vec<Real>> {
     if a.len() != b.len() {
-        return Err(invalid("Norton vector size mismatch"));
+        return Err(invalid("hybrid vector size mismatch"));
     }
     let output = a.iter().zip(b).map(|(&x, &y)| x - y).collect::<Vec<_>>();
     if output.iter().any(|v| !v.is_finite()) {
-        return Err(invalid("nonfinite Norton source difference"));
+        return Err(invalid("nonfinite hybrid source difference"));
     }
     Ok(output)
 }
 
+/// Passive hybrid port equations, using balanced current units I'=scale*I:
+/// Vleft = A Ileft' + B Vright + f,
+/// Iright' = -B^T Ileft' + D Vright + g.
+/// Both A and D are positive semidefinite at real nonnegative integration
+/// frequency. In particular A may be zero or singular: ideal series
+/// constraints require no inverse impedance, nor any artificial resistance.
 #[derive(Debug, Clone)]
-struct Norton {
-    y11: Square,
-    y12: Square,
-    y21: Square,
-    y22: Square,
-    j1: Vec<Real>,
-    j2: Vec<Real>,
+struct Hybrid {
+    a: Square,
+    b: Square,
+    d: Square,
+    f: Vec<Real>,
+    g: Vec<Real>,
 }
-impl Norton {
-    fn cascade(&self, other: &Self) -> SpiceResult<Self> {
-        // Shared interface K=Y22_left+Y11_right is SPD for a passive
-        // well-posed spatial network under positive integration ag0.
-        let inverse = self.y22.add(&other.y11)?.inverse()?;
-        let left = self.y12.mul(&inverse)?;
-        let right = other.y21.mul(&inverse)?;
-        let forcing = sum_vectors(&self.j2, &other.j1)?;
-        Ok(Self {
-            y11: self.y11.sub(&left.mul(&self.y21)?)?,
-            y12: left.mul(&other.y12)?.negative(),
-            y21: right.mul(&self.y21)?.negative(),
-            y22: other.y22.sub(&right.mul(&other.y12)?)?,
-            j1: diff_vectors(&self.j1, &left.times(&forcing)?)?,
-            j2: diff_vectors(&other.j2, &right.times(&forcing)?)?,
+
+/// The shared port voltage is P Ileft' + Q Vright + h.
+struct Interface {
+    p: Square,
+    q: Square,
+    h: Vec<Real>,
+}
+impl Interface {
+    fn voltage(&self, current: &[Real], right: &[Real]) -> SpiceResult<Vec<Real>> {
+        sum_vectors(
+            &sum_vectors(&self.p.times(current)?, &self.q.times(right)?)?,
+            &self.h,
+        )
+    }
+}
+impl Hybrid {
+    fn junction(&self, other: &Self) -> SpiceResult<Interface> {
+        // I_mid_right = B_left^T I_left - D_left V_mid - g_left.
+        // The positive-real interconnection is I + A_right D_left, even
+        // when either constitutive matrix has an exact nullspace.
+        let inverse = Square::identity(self.a.dimension)?
+            .add(&other.a.mul(&self.d)?)?
+            .inverse()?;
+        let product = inverse.mul(&other.a)?;
+        Ok(Interface {
+            p: product.mul(&self.b.transpose()?)?,
+            q: inverse.mul(&other.b)?,
+            h: inverse.times(&diff_vectors(&other.f, &other.a.times(&self.g)?)?)?,
         })
     }
-    fn interface(&self, tail: &Self, left: &[Real], right: &[Real]) -> SpiceResult<Vec<Real>> {
-        let node = self.y22.add(&tail.y11)?;
-        let source = sum_vectors(
-            &sum_vectors(&self.y21.times(left)?, &tail.y12.times(right)?)?,
-            &sum_vectors(&self.j2, &tail.j1)?,
-        )?;
-        node.solve(&source.iter().map(|v| -v).collect::<Vec<_>>())
+    fn cascade(&self, other: &Self) -> SpiceResult<Self> {
+        self.cascade_at(other, &self.junction(other)?)
+    }
+    fn cascade_at(&self, other: &Self, interface: &Interface) -> SpiceResult<Self> {
+        let right_b = other.b.transpose()?;
+        Ok(Self {
+            a: self.a.add(&self.b.mul(&interface.p)?)?,
+            b: self.b.mul(&interface.q)?,
+            d: other.d.add(&right_b.mul(&self.d)?.mul(&interface.q)?)?,
+            f: sum_vectors(&self.f, &self.b.times(&interface.h)?)?,
+            g: sum_vectors(
+                &other.g,
+                &right_b.times(&sum_vectors(&self.g, &self.d.times(&interface.h)?)?)?,
+            )?,
+        })
+    }
+    fn left_voltage(&self, current: &[Real], right: &[Real]) -> SpiceResult<Vec<Real>> {
+        sum_vectors(
+            &sum_vectors(&self.a.times(current)?, &self.b.times(right)?)?,
+            &self.f,
+        )
+    }
+    fn next_current(&self, current: &[Real], right: &[Real]) -> SpiceResult<Vec<Real>> {
+        diff_vectors(
+            &self.b.transpose()?.times(current)?,
+            &sum_vectors(&self.d.times(right)?, &self.g)?,
+        )
+    }
+    fn from_dc(transfer: &DenseComplex, conductors: usize) -> SpiceResult<Self> {
+        let mut blocks = [
+            Square::zeros(conductors)?,
+            Square::zeros(conductors)?,
+            Square::zeros(conductors)?,
+        ];
+        for row in 0..conductors {
+            for col in 0..conductors {
+                for (block, (r, c)) in blocks.iter_mut().zip([
+                    (row, col),
+                    (row, col + conductors),
+                    (row + conductors, col),
+                ]) {
+                    let value = transfer
+                        .get(r, c)
+                        .ok_or_else(|| invalid("DC hybrid transfer index"))?;
+                    if !value.is_finite() || value.im != 0. {
+                        return Err(invalid("nonreal DC hybrid transfer"));
+                    }
+                    block.set(row, col, value.re);
+                }
+            }
+        }
+        let [voltage, series, shunt] = blocks;
+        let inverse = voltage.inverse()?;
+        Ok(Self {
+            a: inverse.mul(&series)?.negative(),
+            d: shunt.mul(&inverse)?.negative(),
+            b: inverse,
+            f: vec![0.; conductors],
+            g: vec![0.; conductors],
+        })
+    }
+    fn condense(cells: &[Self]) -> SpiceResult<(Self, Vec<Interface>)> {
+        let (last, rest) = cells
+            .split_last()
+            .ok_or_else(|| invalid("empty spatial hybrid"))?;
+        let mut network = last.clone();
+        let mut interfaces = Vec::new();
+        interfaces
+            .try_reserve_exact(rest.len())
+            .map_err(|_| invalid("hybrid interface allocation"))?;
+        for cell in rest.iter().rev() {
+            let interface = cell.junction(&network)?;
+            network = cell.cascade_at(&network, &interface)?;
+            interfaces.push(interface);
+        }
+        interfaces.reverse();
+        Ok((network, interfaces))
+    }
+    fn stamps(
+        &self,
+        line: &CoupledLine,
+        unknowns: &MnaUnknowns,
+        first: usize,
+        scale: Real,
+    ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
+        let count = self.a.dimension;
+        let mut entries = Vec::new();
+        let mut insert = |row: Option<usize>, col: Option<usize>, value: Real| {
+            if let (Some(row), Some(col)) = (row, col)
+                && value != 0.
+            {
+                entries.push((row, col, Complex::real(value)));
+            }
+        };
+        for i in 0..count {
+            let branch = Some(first + i);
+            let (ip, ir) = line.physical_pair(i);
+            let (op, or) = line.physical_pair(count + i);
+            let (ip, ir, op, or) = (
+                unknowns.checked_node_row(ip)?,
+                unknowns.checked_node_row(ir)?,
+                unknowns.checked_node_row(op)?,
+                unknowns.checked_node_row(or)?,
+            );
+            insert(ip, branch, 1.);
+            insert(ir, branch, -1.);
+            insert(branch, ip, 1.);
+            insert(branch, ir, -1.);
+            for j in 0..count {
+                let (positive, negative) = line.physical_pair(count + j);
+                let (positive, negative) = (
+                    unknowns.checked_node_row(positive)?,
+                    unknowns.checked_node_row(negative)?,
+                );
+                let input_branch = Some(first + j);
+                insert(branch, input_branch, -scale * self.a.at(i, j));
+                insert(branch, positive, -self.b.at(i, j));
+                insert(branch, negative, self.b.at(i, j));
+                insert(op, input_branch, -self.b.at(j, i));
+                insert(or, input_branch, self.b.at(j, i));
+                let d = self.d.at(i, j) / scale;
+                insert(op, positive, d);
+                insert(op, negative, -d);
+                insert(or, positive, -d);
+                insert(or, negative, d);
+            }
+        }
+        if entries.iter().any(|(_, _, value)| !value.is_finite()) {
+            return Err(invalid("nonfinite hybrid MNA coefficient"));
+        }
+        Ok(entries)
     }
 }
+
 impl Cell {
-    // A symmetric passive pi cell: Ileft=(S+H)Vleft-S Vright+Hleft-S Hseries
-    // and Iright=-S Vleft+(S+H)Vright+Hright+S Hseries.
-    // The physical series impedance is Zscaled * Zscale; Yhalf is Yscaled/Zscale.
-    fn physical_norton(
+    fn coefficients(&self) -> SpiceResult<Hybrid> {
+        let b = Square::identity(self.conductors)?
+            .add(&self.series.mul(&self.half_shunt)?)?
+            .inverse()?;
+        let a = b.mul(&self.series)?;
+        let d = self.half_shunt.add(&self.half_shunt.mul(&b)?)?;
+        Ok(Hybrid {
+            a,
+            b,
+            d,
+            f: vec![0.; self.conductors],
+            g: vec![0.; self.conductors],
+        })
+    }
+    fn hybrid(
         &self,
-        series_inverse: &Square,
+        coefficients: &Hybrid,
         hleft: &[Real],
         hseries: &[Real],
         hright: &[Real],
-    ) -> SpiceResult<Norton> {
-        let mut half = Square::zeros(self.conductors)?;
-        for row in 0..self.conductors {
-            for col in 0..self.conductors {
-                half.set(row, col, self.half_shunt.at(row, col) / self.scale);
-            }
-        }
-        let series_source = series_inverse.times(hseries)?;
-        let diagonal = series_inverse.add(&half)?;
-        Ok(Norton {
-            y11: diagonal.clone(),
-            y12: series_inverse.negative(),
-            y21: series_inverse.negative(),
-            y22: diagonal,
-            j1: diff_vectors(hleft, &series_source)?,
-            j2: sum_vectors(hright, &series_source)?,
+    ) -> SpiceResult<Hybrid> {
+        let hleft = hleft
+            .iter()
+            .map(|value| value * self.scale)
+            .collect::<Vec<_>>();
+        let hright = hright
+            .iter()
+            .map(|value| value * self.scale)
+            .collect::<Vec<_>>();
+        // (I+Z H)Vleft = Vright + Z Ileft' + hseries - Z hleft'.
+        let f = coefficients
+            .b
+            .times(&diff_vectors(hseries, &self.series.times(&hleft)?)?)?;
+        let g = sum_vectors(&sum_vectors(&hleft, &hright)?, &self.half_shunt.times(&f)?)?;
+        Ok(Hybrid {
+            f,
+            g,
+            ..coefficients.clone()
         })
     }
-    fn physical_series_inverse(&self) -> SpiceResult<Square> {
-        let mut impedance = Square::zeros(self.conductors)?;
-        for row in 0..self.conductors {
-            for col in 0..self.conductors {
-                impedance.set(row, col, self.series.at(row, col) * self.scale);
-            }
-        }
-        impedance.inverse()
+    fn middle_current(
+        &self,
+        current: &[Real],
+        voltage: &[Real],
+        hleft: &[Real],
+    ) -> SpiceResult<Vec<Real>> {
+        Ok(diff_vectors(current, &self.half_shunt.times(voltage)?)?
+            .iter()
+            .zip(hleft)
+            .map(|(i, h)| i / self.scale - h)
+            .collect())
     }
 }
 
 impl CoupledLine {
-    /// Passive, causal transient Norton load and all spatial trial states.
-    /// No exponentially growing transfer-matrix product is formed.
+    #[must_use]
+    pub(super) fn spatial_state_count(&self) -> usize {
+        self.sections * self.conductors() * SLOTS_PER_SECTION_CONDUCTOR
+    }
+    fn section_width(&self) -> SpiceResult<Real> {
+        Ok(self.plan.length
+            / f64::from(
+                u32::try_from(self.sections).map_err(|_| invalid("section count overflow"))?,
+            ))
+    }
+    fn dc_hybrid(&self, length: Real) -> SpiceResult<(Hybrid, Real)> {
+        let (transfer, scale, steps) = self.plan.dc_hybrid_seed(length)?;
+        let mut network = Hybrid::from_dc(&transfer, self.conductors())?;
+        for _ in 0..steps {
+            network = network.cascade(&network)?;
+        }
+        Ok((network, scale))
+    }
+    pub(super) fn dc_hybrid_stamps(
+        &self,
+        unknowns: &MnaUnknowns,
+        first: usize,
+    ) -> SpiceResult<Vec<(usize, usize, Complex)>> {
+        let (network, scale) = self.dc_hybrid(self.plan.length)?;
+        network.stamps(self, unknowns, first, scale)
+    }
+    fn boundary(&self, ctx: &StampContext<'_>, scale: Real) -> SpiceResult<(Vec<Real>, Vec<Real>)> {
+        let count = self.conductors();
+        let mut current = Vec::with_capacity(count);
+        let mut voltage = Vec::with_capacity(count);
+        for i in 0..count {
+            let (positive, negative) = self.physical_pair(count + i);
+            voltage.push(ctx.node_voltage(positive) - ctx.node_voltage(negative));
+            current.push(scale * ctx.row_value(ctx.branch(i)?)?);
+        }
+        Ok((current, voltage))
+    }
+    fn section_energies(
+        &self,
+        width: Real,
+        left: &[Real],
+        current: &[Real],
+        right: &[Real],
+    ) -> impl Iterator<Item = (usize, [Real; 3])> {
+        let count = self.conductors();
+        (0..count).map(move |i| {
+            let (mut qleft, mut flux, mut qright) = (0., 0., 0.);
+            for j in 0..count {
+                let index = i * count + j;
+                let cap = 0.5 * width * self.plan.c.data()[index];
+                qleft = cap.mul_add(left[j], qleft);
+                qright = cap.mul_add(right[j], qright);
+                flux = (width * self.plan.l.data()[index]).mul_add(current[j], flux);
+            }
+            (i, [qleft, flux, qright])
+        })
+    }
+    /// Continuous DC bias, reconstructed by passive half-section elimination
+    /// from physical input currents and far-end voltages, including singular
+    /// series impedances. No exponentially growing forward state is used.
+    pub(super) fn dc_spatial_state(&self, ctx: &mut StampContext<'_>) -> SpiceResult<()> {
+        if ctx.states.is_empty() {
+            return Ok(());
+        }
+        if ctx.states.len() != self.spatial_state_count() {
+            return Err(invalid("DC spatial state layout mismatch"));
+        }
+        let width = self.section_width()?;
+        let (half, scale) = self.dc_hybrid(0.5 * width)?;
+        let cell = half.cascade(&half)?;
+        let cells = vec![cell; self.sections];
+        let (_, interfaces) = Hybrid::condense(&cells)?;
+        let midpoint = half.junction(&half)?;
+        let (mut current, endpoint) = self.boundary(ctx, scale)?;
+        for (section, cell) in cells.iter().enumerate() {
+            let right = if let Some(interface) = interfaces.get(section) {
+                interface.voltage(&current, &endpoint)?
+            } else {
+                endpoint.clone()
+            };
+            let left = cell.left_voltage(&current, &right)?;
+            let middle = midpoint.voltage(&current, &right)?;
+            let mid_current = half
+                .next_current(&current, &middle)?
+                .iter()
+                .map(|i| i / scale)
+                .collect::<Vec<_>>();
+            for (i, values) in self.section_energies(width, &left, &mid_current, &right) {
+                for (kind, value) in [LEFT, SERIES, RIGHT].into_iter().zip(values) {
+                    let offset = slot(section, i, kind, self.conductors());
+                    ctx.states.set(offset, value)?;
+                    ctx.states.set(offset + 1, 0.)?;
+                }
+            }
+            current = cell.next_current(&current, &right)?;
+        }
+        Ok(())
+    }
+    fn section_history(
+        &self,
+        ctx: &StampContext<'_>,
+        coeff: &Coefficients,
+        section: usize,
+        kind: usize,
+    ) -> SpiceResult<Vec<Real>> {
+        (0..self.conductors())
+            .map(|i| {
+                history_term(
+                    &ctx.states,
+                    coeff,
+                    slot(section, i, kind, self.conductors()),
+                )
+            })
+            .collect()
+    }
     pub(super) fn stamp_stable_transient(
         &self,
         ctx: &mut StampContext<'_>,
         coeff: &Coefficients,
     ) -> SpiceResult<()> {
         let AnalysisMode::Transient { dt, .. } = ctx.mode else {
-            return Err(invalid("spatial Norton load outside transient"));
+            return Err(invalid("spatial hybrid outside transient"));
         };
         if coeff.dt().total_cmp(&dt) != std::cmp::Ordering::Equal
             || ctx.states.len() != self.spatial_state_count()
         {
-            return Err(invalid("spatial Norton timestep or history mismatch"));
+            return Err(invalid("spatial hybrid timestep/history mismatch"));
         }
-        if self.plan.r.data().iter().all(|&entry| entry == 0.)
-            && self.plan.l.data().iter().all(|&entry| entry == 0.)
-        {
-            return self.stamp_ideal_series_transient(ctx, coeff);
-        }
-        let conductors = self.conductors();
         let cell = Cell::new(self, coeff.ag()[0])?;
-        let inverse = cell.physical_series_inverse()?;
+        let coefficients = cell.coefficients()?;
         let mut cells = Vec::new();
         cells
             .try_reserve_exact(self.sections)
-            .map_err(|_| invalid("spatial Norton cell storage"))?;
+            .map_err(|_| invalid("spatial hybrid cell allocation"))?;
         for section in 0..self.sections {
-            let history = |kind: usize| -> SpiceResult<Vec<Real>> {
-                (0..conductors)
-                    .map(|i| history_term(&ctx.states, coeff, slot(section, i, kind, conductors)))
-                    .collect()
-            };
-            cells.push(cell.physical_norton(
-                &inverse,
-                &history(LEFT)?,
-                &history(SERIES)?,
-                &history(RIGHT)?,
+            cells.push(cell.hybrid(
+                &coefficients,
+                &self.section_history(ctx, coeff, section, LEFT)?,
+                &self.section_history(ctx, coeff, section, SERIES)?,
+                &self.section_history(ctx, coeff, section, RIGHT)?,
             )?);
         }
-        let mut suffix = Vec::new();
-        suffix
-            .try_reserve_exact(self.sections)
-            .map_err(|_| invalid("spatial Norton suffix storage"))?;
-        suffix.push(
-            cells
-                .last()
-                .ok_or_else(|| invalid("no spatial cells"))?
-                .clone(),
-        );
-        for index in (0..self.sections - 1).rev() {
-            let previous = suffix
-                .last()
-                .ok_or_else(|| invalid("empty Norton suffix"))?;
-            suffix.push(cells[index].cascade(previous)?);
+        let (network, interfaces) = Hybrid::condense(&cells)?;
+        let first = ctx.branch(0)?;
+        for (row, col, value) in network.stamps(self, ctx.unknowns, first, cell.scale)? {
+            ctx.matrix.add(row, col, value.re)?;
         }
-        suffix.reverse();
-        let equivalent = suffix
-            .first()
-            .ok_or_else(|| invalid("empty complete Norton line"))?;
-        self.stamp_norton_ports(ctx, equivalent)?;
-        self.reconstruct_norton_states(ctx, coeff, &inverse, &cells, &suffix)
-    }
-
-    fn stamp_norton_ports(&self, ctx: &mut StampContext<'_>, line: &Norton) -> SpiceResult<()> {
-        let conductors = self.conductors();
-        for i in 0..conductors {
-            let branch = ctx.branch(i)?;
-            let (ip, ir) = self.physical_pair(i);
-            let (op, or) = self.physical_pair(conductors + i);
-            let (input_positive_row, input_return_row) = (
-                ctx.unknowns.checked_node_row(ip)?,
-                ctx.unknowns.checked_node_row(ir)?,
-            );
-            if let Some(row) = input_positive_row {
-                ctx.matrix.add(row, branch, 1.)?;
-            }
-            if let Some(row) = input_return_row {
-                ctx.matrix.add(row, branch, -1.)?;
-            }
-            ctx.matrix.add(branch, branch, 1.)?;
-            ctx.rhs.add_to(branch, line.j1[i])?;
-            ctx.stamp_rhs(op, -line.j2[i])?;
-            ctx.stamp_rhs(or, line.j2[i])?;
-            for j in 0..conductors {
-                let (left, lr) = self.physical_pair(j);
-                let (right, rr) = self.physical_pair(conductors + j);
-                // Iin - Y11 Vin - Y12 Vout = Jleft.
-                for (positive, negative, coefficient) in [
-                    (left, lr, -line.y11.at(i, j)),
-                    (right, rr, -line.y12.at(i, j)),
-                ] {
-                    if let Some(col) = ctx.unknowns.checked_node_row(positive)? {
-                        ctx.matrix.add(branch, col, coefficient)?;
-                    }
-                    if let Some(col) = ctx.unknowns.checked_node_row(negative)? {
-                        ctx.matrix.add(branch, col, -coefficient)?;
-                    }
-                }
-                // Iout=Y21 Vin+Y22 Vout+Jright, both terminal KCL signs.
-                for (positive, negative, coefficient) in [
-                    (left, lr, line.y21.at(i, j)),
-                    (right, rr, line.y22.at(i, j)),
-                ] {
-                    ctx.stamp(op, positive, coefficient)?;
-                    ctx.stamp(op, negative, -coefficient)?;
-                    ctx.stamp(or, positive, -coefficient)?;
-                    ctx.stamp(or, negative, coefficient)?;
-                }
-            }
+        for i in 0..self.conductors() {
+            let (positive, negative) = self.physical_pair(self.conductors() + i);
+            ctx.rhs.add_to(first + i, network.f[i])?;
+            ctx.stamp_rhs(positive, -network.g[i] / cell.scale)?;
+            ctx.stamp_rhs(negative, network.g[i] / cell.scale)?;
         }
-        Ok(())
+        self.reconstruct_hybrid_states(ctx, coeff, &cell, &cells, &interfaces)
     }
-
-    fn reconstruct_norton_states(
+    fn reconstruct_hybrid_states(
         &self,
         ctx: &mut StampContext<'_>,
         coeff: &Coefficients,
-        inverse: &Square,
-        cells: &[Norton],
-        suffix: &[Norton],
+        cell: &Cell,
+        cells: &[Hybrid],
+        interfaces: &[Interface],
     ) -> SpiceResult<()> {
-        let count = self.conductors();
-        let mut left = Vec::new();
-        let mut terminal_right = Vec::new();
-        left.try_reserve_exact(count)
-            .map_err(|_| invalid("input spatial voltages"))?;
-        terminal_right
-            .try_reserve_exact(count)
-            .map_err(|_| invalid("output spatial voltages"))?;
-        for i in 0..count {
-            let (ip, ir) = self.physical_pair(i);
-            let (op, or) = self.physical_pair(count + i);
-            left.push(ctx.node_voltage(ip) - ctx.node_voltage(ir));
-            terminal_right.push(ctx.node_voltage(op) - ctx.node_voltage(or));
-        }
-        let width = self.plan.length
-            / f64::from(u32::try_from(self.sections).map_err(|_| invalid("spatial width"))?);
-        for section in 0..self.sections {
-            let right = if section + 1 < self.sections {
-                cells[section].interface(&suffix[section + 1], &left, &terminal_right)?
+        let width = self.section_width()?;
+        let (mut current, endpoint) = self.boundary(ctx, cell.scale)?;
+        for (section, network) in cells.iter().enumerate() {
+            let right = if let Some(interface) = interfaces.get(section) {
+                interface.voltage(&current, &endpoint)?
             } else {
-                terminal_right.clone()
+                endpoint.clone()
             };
-            let source = (0..count)
-                .map(|i| history_term(&ctx.states, coeff, slot(section, i, SERIES, count)))
-                .collect::<SpiceResult<Vec<_>>>()?;
-            let mut potential_difference = Vec::new();
-            for (i, &voltage) in left.iter().enumerate() {
-                potential_difference.push(voltage - right[i] - source[i]);
-            }
-            let middle_current = inverse.times(&potential_difference)?;
-            for i in 0..count {
-                let (mut charge_left, mut flux, mut charge_right) = (0., 0., 0.);
-                for j in 0..count {
-                    let index = i * count + j;
-                    let charge = self.plan.c.data()[index] * width * 0.5;
-                    let inductance = self.plan.l.data()[index] * width;
-                    charge_left = charge.mul_add(left[j], charge_left);
-                    charge_right = charge.mul_add(right[j], charge_right);
-                    flux = inductance.mul_add(middle_current[j], flux);
-                }
-                for (kind, value) in [(LEFT, charge_left), (SERIES, flux), (RIGHT, charge_right)] {
-                    let index = slot(section, i, kind, count);
-                    let historical = history_term(&ctx.states, coeff, index)?;
-                    write_energy(&mut ctx.states, index, value, historical, coeff.ag()[0])?;
+            let left = network.left_voltage(&current, &right)?;
+            let middle = cell.middle_current(
+                &current,
+                &left,
+                &self.section_history(ctx, coeff, section, LEFT)?,
+            )?;
+            for (i, values) in self.section_energies(width, &left, &middle, &right) {
+                for (kind, value) in [LEFT, SERIES, RIGHT].into_iter().zip(values) {
+                    let offset = slot(section, i, kind, self.conductors());
+                    let history = history_term(&ctx.states, coeff, offset)?;
+                    write_energy(&mut ctx.states, offset, value, history, coeff.ag()[0])?;
                 }
             }
-            left = right;
-        }
-        Ok(())
-    }
-}
-
-/// Direct real DC Norton coefficients for one segment of the continuous
-/// distributed cable, not its transient finite-volume approximation.
-fn dc_segment(plan: &super::plan::CoupledLinePlan, length: Real) -> SpiceResult<Norton> {
-    let mut segment = plan.clone();
-    segment.length = length;
-    let admittance = segment.admittance_at(0.)?;
-    let conductors = plan.conductors();
-    let mut blocks = [
-        Square::zeros(conductors)?,
-        Square::zeros(conductors)?,
-        Square::zeros(conductors)?,
-        Square::zeros(conductors)?,
-    ];
-    for row in 0..2 * conductors {
-        for col in 0..2 * conductors {
-            let entry = admittance
-                .get(row, col)
-                .ok_or_else(|| invalid("DC Norton coefficient missing"))?;
-            if entry.im.abs() > 1e-12 * entry.re.abs().max(1e-200) {
-                return Err(invalid("DC Norton coefficient has nonreal component"));
-            }
-            let position = 2 * usize::from(row >= conductors) + usize::from(col >= conductors);
-            blocks[position].set(row % conductors, col % conductors, entry.re);
-        }
-    }
-    let [y11, y12, y21, y22] = blocks;
-    Ok(Norton {
-        y11,
-        y12,
-        y21,
-        y22,
-        j1: vec![0.; conductors],
-        j2: vec![0.; conductors],
-    })
-}
-
-impl CoupledLine {
-    /// Reconstruct physically damped DC spatial charge/flux from the two
-    /// solved boundary potentials. A growing forward ABCD eigenmode is never
-    /// propagated from a rounded input current into an exp(1000) overflow.
-    fn dc_stable_state(&self, ctx: &mut StampContext<'_>) -> SpiceResult<()> {
-        let conductors = self.conductors();
-        let width = self.plan.length
-            / f64::from(u32::try_from(self.sections).map_err(|_| invalid("DC section count"))?);
-        let cell = dc_segment(&self.plan, width)?;
-        let half = dc_segment(&self.plan, width * 0.5)?;
-        let mut suffix = Vec::new();
-        suffix
-            .try_reserve_exact(self.sections)
-            .map_err(|_| invalid("DC Norton suffix allocation"))?;
-        suffix.push(cell.clone());
-        for _ in 1..self.sections {
-            let previous = suffix
-                .last()
-                .ok_or_else(|| invalid("DC Norton suffix empty"))?;
-            suffix.push(cell.cascade(previous)?);
-        }
-        suffix.reverse();
-        let mut left = Vec::new();
-        let mut right_endpoint = Vec::new();
-        left.try_reserve_exact(conductors)
-            .map_err(|_| invalid("DC Norton left voltages"))?;
-        right_endpoint
-            .try_reserve_exact(conductors)
-            .map_err(|_| invalid("DC Norton right voltages"))?;
-        for i in 0..conductors {
-            let (ip, ir) = self.physical_pair(i);
-            let (op, or) = self.physical_pair(conductors + i);
-            left.push(ctx.node_voltage(ip) - ctx.node_voltage(ir));
-            right_endpoint.push(ctx.node_voltage(op) - ctx.node_voltage(or));
-        }
-        for section in 0..self.sections {
-            let right = if section + 1 < self.sections {
-                cell.interface(&suffix[section + 1], &left, &right_endpoint)?
-            } else {
-                right_endpoint.clone()
-            };
-            let midpoint = half.interface(&half, &left, &right)?;
-            let mid_current = half
-                .y21
-                .times(&left)?
-                .iter()
-                .zip(half.y22.times(&midpoint)?)
-                .map(|(&from_left, to_mid)| -from_left - to_mid)
-                .collect::<Vec<_>>();
-            for i in 0..conductors {
-                let (mut qleft, mut flux, mut qright) = (0., 0., 0.);
-                for j in 0..conductors {
-                    let index = i * conductors + j;
-                    let charge = width * 0.5 * self.plan.c.data()[index];
-                    qleft = charge.mul_add(left[j], qleft);
-                    qright = charge.mul_add(right[j], qright);
-                    flux = (width * self.plan.l.data()[index]).mul_add(mid_current[j], flux);
-                }
-                for (kind, quantity) in [(LEFT, qleft), (SERIES, flux), (RIGHT, qright)] {
-                    let at = slot(section, i, kind, conductors);
-                    ctx.states.set(at, quantity)?;
-                    ctx.states.set(at + 1, 0.)?;
-                }
-            }
-            left = right;
-        }
-        Ok(())
-    }
-}
-
-impl CoupledLine {
-    /// A zero R/L series-impedance matrix imposes an ideal conductor
-    /// constraint *for every mode*. Its distributed shunt G/C is exactly a
-    /// lumped N-conductor shunt, for any spatial division and time method.
-    /// Unlike a Norton inverse, this descriptor representation remains
-    /// well-defined with singular Z and exact voltage equations.
-    fn stamp_ideal_series_transient(
-        &self,
-        ctx: &mut StampContext<'_>,
-        coeff: &Coefficients,
-    ) -> SpiceResult<()> {
-        let conductors = self.conductors();
-        let ag0 = coeff.ag()[0];
-        let section_width = self.plan.length
-            / f64::from(u32::try_from(self.sections).map_err(|_| invalid("ideal section count"))?);
-        let mut voltage = Vec::new();
-        voltage
-            .try_reserve_exact(conductors)
-            .map_err(|_| invalid("ideal line shunt voltage allocation"))?;
-        for i in 0..conductors {
-            let (positive, negative) = self.physical_pair(conductors + i);
-            voltage.push(ctx.node_voltage(positive) - ctx.node_voltage(negative));
-        }
-        let mut history = vec![0.; conductors];
-        for section in 0..self.sections {
-            for (i, accumulated_history) in history.iter_mut().enumerate() {
-                let mut charge = 0.;
-                for (j, &potential) in voltage.iter().enumerate() {
-                    charge = (0.5 * section_width * self.plan.c.data()[i * conductors + j])
-                        .mul_add(potential, charge);
-                }
-                for kind in [LEFT, RIGHT] {
-                    let offset = slot(section, i, kind, conductors);
-                    let previous = history_term(&ctx.states, coeff, offset)?;
-                    *accumulated_history += previous;
-                    write_energy(&mut ctx.states, offset, charge, previous, ag0)?;
-                }
-                let series = slot(section, i, SERIES, conductors);
-                let previous = history_term(&ctx.states, coeff, series)?;
-                write_energy(&mut ctx.states, series, 0., previous, ag0)?;
-            }
-        }
-        if history.iter().any(|value| !value.is_finite()) {
-            return Err(invalid("ideal-line shunt history overflows"));
-        }
-        for (i, &historical) in history.iter().enumerate() {
-            let (ip, ir) = self.physical_pair(i);
-            let (op, or) = self.physical_pair(conductors + i);
-            let branch = ctx.branch(i)?;
-            for (node, coefficient) in [(ip, 1.), (ir, -1.), (op, -1.), (or, 1.)] {
-                if let Some(row) = ctx.unknowns.checked_node_row(node)? {
-                    ctx.matrix.add(row, branch, coefficient)?;
-                }
-            }
-            for (node, coefficient) in [(op, 1.), (or, -1.), (ip, -1.), (ir, 1.)] {
-                if let Some(col) = ctx.unknowns.checked_node_row(node)? {
-                    ctx.matrix.add(branch, col, coefficient)?;
-                }
-            }
-            ctx.stamp_rhs(op, -history[i])?;
-            ctx.stamp_rhs(or, historical)?;
-            for j in 0..conductors {
-                let (qp, qr) = self.physical_pair(conductors + j);
-                let index = i * conductors + j;
-                let shunt = self.plan.length
-                    * ag0.mul_add(self.plan.c.data()[index], self.plan.g.data()[index]);
-                if !shunt.is_finite() {
-                    return Err(invalid("ideal-line distributed shunt overflows"));
-                }
-                ctx.stamp(op, qp, shunt)?;
-                ctx.stamp(op, qr, -shunt)?;
-                ctx.stamp(or, qp, -shunt)?;
-                ctx.stamp(or, qr, shunt)?;
-            }
+            current = network.next_current(&current, &right)?;
         }
         Ok(())
     }
