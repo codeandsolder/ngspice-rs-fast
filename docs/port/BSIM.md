@@ -120,6 +120,12 @@ BSIM4 repeat the same shape.
   or setup defaults. Model-level instance defaults are prepended in C's reverse
   order; model-level `m` is discarded. Physical units are provided only for an
   explicitly reviewed subset; `input_unit() == None` means unaudited.
+- BSIM3 and BSIM4 share the ordered input dispatcher in
+  `devices::bsim_model_inputs`. Family/version admission and typed parameter
+  descriptors remain separate. Model setters retain textual order and source
+  locations, while instance defaults are validated, reversed, then applied
+  ahead of explicit instance setters with the instance geometry scale.
+  Model-level multiplicity is validated but never inherited.
 - `b3mpar.c` TNOM-to-kelvin and the distinct NPEAK/NGATE conversion thresholds
   are reproduced, as are checked `floor(x + 0.5)` integer setters. `b3par.c`
   scales lengths once and areas left-to-right twice (avoiding a spurious
