@@ -656,7 +656,7 @@ impl AnalysisPlan {
     }
 
     /// The kind encoded by the checked analysis payload.
-    #[must_use]
+    #[must_use = "the returned kind identifies the driver for the checked analysis payload"]
     pub const fn kind(&self) -> AnalysisKind {
         match self.analysis {
             PlanKind::OperatingPoint => AnalysisKind::OperatingPoint,
@@ -675,13 +675,13 @@ impl AnalysisPlan {
     }
 
     /// The resolved Newton and continuation settings shared by bias solves.
-    #[must_use]
+    #[must_use = "the returned settings define the Newton and continuation policy for bias solves"]
     pub const fn dc_settings(&self) -> &DcSettings {
         &self.dc
     }
 
     /// Explicit or deck-supplied DC point iteration limit, if present.
-    #[must_use]
+    #[must_use = "the returned option determines whether a DC sweep point has an explicit iteration limit"]
     pub const fn point_iterations(&self) -> Option<usize> {
         match self.analysis {
             PlanKind::Dc {
@@ -692,7 +692,7 @@ impl AnalysisPlan {
     }
 
     /// The transient settings, if this is a transient plan.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a checked transient payload from another analysis kind"]
     pub const fn transient(&self) -> Option<&crate::analysis::TransientPlan> {
         match &self.analysis {
             PlanKind::Transient { settings, .. } => Some(settings),
@@ -701,7 +701,7 @@ impl AnalysisPlan {
     }
 
     /// Whether this transient starts from the user initial conditions.
-    #[must_use]
+    #[must_use = "the result determines whether user initial conditions replace the ordinary startup bias solve"]
     pub const fn uic(&self) -> bool {
         matches!(
             self.analysis,
@@ -710,7 +710,7 @@ impl AnalysisPlan {
     }
 
     /// Noise representation and model options, only for noise plans.
-    #[must_use]
+    #[must_use = "the returned option supplies noise representation and model settings only for noise analyses"]
     pub const fn noise_options(&self) -> Option<crate::analysis::NoiseOptions> {
         match self.analysis {
             PlanKind::Noise { options, .. } => Some(options),
@@ -719,7 +719,7 @@ impl AnalysisPlan {
     }
 
     /// Checked frequency points in the reference algorithm's order.
-    #[must_use]
+    #[must_use = "the returned iterator supplies the validated sweep frequencies in reference order"]
     pub fn frequencies(&self) -> Option<impl ExactSizeIterator<Item = Real> + Clone + '_> {
         match &self.analysis {
             PlanKind::Ac { frequencies, .. }
@@ -734,19 +734,19 @@ impl AnalysisPlan {
     }
 
     /// Evaluated initial-condition assignments, in deck order.
-    #[must_use]
+    #[must_use = "the returned ordered assignments define the requested circuit initial conditions"]
     pub fn initial_conditions(&self) -> &[crate::analysis::NodeCondition] {
         &self.initial_conditions
     }
 
     /// Evaluated nodeset assignments, in deck order.
-    #[must_use]
+    #[must_use = "the returned ordered assignments define the requested bias-solve hints"]
     pub fn nodesets(&self) -> &[crate::analysis::NodeCondition] {
         &self.nodesets
     }
 
     /// Whether this plan retains its small-signal bias in multi-plot output.
-    #[must_use]
+    #[must_use = "the result determines whether the output sequence includes a small-signal bias plot"]
     pub const fn retains_bias(&self) -> bool {
         match self.analysis {
             PlanKind::Ac { retain_bias, .. }
@@ -759,7 +759,7 @@ impl AnalysisPlan {
     }
 
     /// Exact number of plots emitted by this resolved multi-plot analysis.
-    #[must_use]
+    #[must_use = "the returned count determines how many plots the consumer must expect from this analysis"]
     pub const fn plot_count(&self) -> usize {
         let count = match &self.analysis {
             PlanKind::Noise { card, .. } => card.plot_count(),

@@ -206,7 +206,7 @@ impl<'a> ControlSession<'a> {
     }
 
     /// The current value of a bound independent parameter.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a currently bound independent parameter from an unknown name"]
     pub fn parameter(&self, name: &str) -> Option<Real> {
         self.plan
             .inputs()

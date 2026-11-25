@@ -71,7 +71,7 @@ impl<const MIN: usize, const MAX: usize> BoundedCount<MIN, MAX> {
     }
 
     /// The validated count.
-    #[must_use]
+    #[must_use = "the returned validated count bounds the number of continuation steps"]
     pub const fn get(self) -> usize {
         self.0
     }
@@ -124,7 +124,7 @@ impl GminSchedule {
     }
 
     /// The temporary nodal-gmin values, in execution order.
-    #[must_use]
+    #[must_use = "the returned sequence determines the order and magnitude of temporary nodal conductances"]
     pub const fn as_slice(&self) -> &[Real] {
         self.0.as_slice()
     }
@@ -185,13 +185,13 @@ impl SourceStepping {
     }
 
     /// The validated source scales.
-    #[must_use]
+    #[must_use = "the returned sequence determines the staged source amplitudes"]
     pub const fn scales(&self) -> &[Real] {
         self.scales.as_slice()
     }
 
     /// The temporary nodal gmin.
-    #[must_use]
+    #[must_use = "the returned temporary nodal conductance accompanies the source-stepping schedule"]
     pub const fn gmin(&self) -> Real {
         self.gmin
     }
@@ -264,13 +264,13 @@ impl NgspiceStepping {
     }
 
     /// C's written adaptation base, independent of the effective stage limit.
-    #[must_use]
+    #[must_use = "the returned reference iteration count determines continuation step-size adaptation"]
     pub const fn adapt_iterations(&self) -> usize {
         self.adapt_iterations.get()
     }
 
     /// Ratio used for artificial or junction gmin stepping.
-    #[must_use]
+    #[must_use = "the returned ratio determines successive artificial or junction conductance levels"]
     pub const fn gmin_factor(&self) -> Real {
         self.gmin_factor
     }
@@ -367,7 +367,7 @@ impl Default for ContinuationPolicy {
 
 impl ContinuationPolicy {
     /// ngspice's strategies with the given parameters.
-    #[must_use]
+    #[must_use = "the constructed policy must be installed to use the specified reference stepping strategies"]
     pub fn ngspice(stepping: NgspiceStepping) -> Self {
         Self {
             schedule: ContinuationSchedule::Ngspice(stepping),
@@ -377,7 +377,7 @@ impl ContinuationPolicy {
 
     /// The port's original fixed ladders: nodal gmin 1e-3 down to 1e-12 S one
     /// decade per stage, then twenty equal source increments at 1e-8 S.
-    #[must_use]
+    #[must_use = "the constructed policy must be installed to use the fixed nodal and source stepping ladders"]
     pub fn ladder() -> Self {
         Self {
             schedule: ContinuationSchedule::Ladder {
@@ -392,7 +392,7 @@ impl ContinuationPolicy {
     }
 
     /// No continuation: a failed direct Newton solve is final.
-    #[must_use]
+    #[must_use = "the constructed policy must be installed to make direct Newton failure final"]
     pub const fn disabled() -> Self {
         Self {
             schedule: ContinuationSchedule::Ladder {
@@ -554,7 +554,7 @@ pub enum DcStrategy {
 
 impl DcStrategy {
     /// Name used in diagnostics.
-    #[must_use]
+    #[must_use = "the returned name identifies the bias strategy in diagnostics"]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Direct => "direct Newton",
@@ -586,7 +586,7 @@ pub struct DcStage {
 
 impl DcStage {
     /// Whether the stage converged.
-    #[must_use]
+    #[must_use = "the result determines whether this continuation stage succeeded"]
     pub const fn converged(&self) -> bool {
         self.error.is_none()
     }
@@ -594,7 +594,7 @@ impl DcStage {
     /// Whether this stage solved the *original* equations: full sources, zero
     /// artificial gmin and the configured junction gmin. Only such a stage's
     /// solution is ever returned.
-    #[must_use]
+    #[must_use = "the result identifies stages that solve the original equations and may supply the final solution"]
     pub fn is_unregularized(&self) -> bool {
         self.source_scale.to_bits() == 1.0_f64.to_bits()
             && self.gmin == 0.
@@ -657,7 +657,7 @@ pub struct DcReport {
 
 impl DcReport {
     /// One-line, human-readable account of the attempts and the work spent.
-    #[must_use]
+    #[must_use = "the returned diagnostic summarizes the attempted stages and work spent"]
     pub fn summary(&self) -> String {
         let mut parts: Vec<String> = self
             .attempts
@@ -780,7 +780,7 @@ pub struct NodeForcing {
 
 impl NodeForcing {
     /// No forced rows.
-    #[must_use]
+    #[must_use = "the result determines whether initial conditions or nodesets impose any forced rows"]
     pub const fn is_empty(&self) -> bool {
         self.initial.is_empty() && self.nodesets.is_empty()
     }
