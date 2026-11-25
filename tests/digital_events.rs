@@ -293,8 +293,7 @@ fn analog_ramp_drives_delayed_inverter_and_slewing_dac() -> SpiceResult<()> {
             Delays::new(60e-6, 60e-6)?,
         )?,
     )?;
-    let plan = AnalysisInput::with_arguments(AnalysisKind::Transient, ["40u", "2m"].into_iter())
-        .resolve()?;
+    let plan = AnalysisInput::with_arguments(AnalysisKind::Transient, ["40u", "2m"]).resolve()?;
     let (plot, stats) =
         mixed_signal_transient(&mut circuit, &plan, &AnalysisContext::default(), &mut mixed)?;
     let changes: Vec<_> = mixed
