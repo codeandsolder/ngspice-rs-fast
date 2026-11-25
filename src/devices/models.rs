@@ -738,6 +738,32 @@ impl<'a> ResolvedModel<'a> {
     }
 }
 
+/// Physical topology augmentation requested by the deck.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TopologyShunts {
+    /// Noiseless resistance from every analog voltage node to ground (ohms).
+    pub resistance: Option<Real>,
+    /// Capacitance from every parsed voltage node to ground (farads).
+    pub capacitance: Real,
+}
+
+impl TopologyShunts {
+    pub(crate) fn validate(self) -> SpiceResult<()> {
+        if self
+            .resistance
+            .is_some_and(|r| !r.is_finite() || r <= 0. || !r.recip().is_finite())
+        {
+            return Err(SpiceError::circuit(
+                "rshunt must be positive and finite with finite conductance",
+            ));
+        }
+        if !self.capacitance.is_finite() || self.capacitance < 0. {
+            return Err(SpiceError::circuit("cshunt must be finite and nonnegative"));
+        }
+        Ok(())
+    }
+}
+
 /// Device-owned context, intentionally independent of analysis. Analysis
 /// consumers can pass their temperature settings explicitly when factories land.
 ///
@@ -763,6 +789,8 @@ pub struct ModelContext {
     /// artificial nodal continuation conductance of DC gmin stepping. Default
     /// [`DEFAULT_GMIN`]; must be finite and nonnegative.
     pub gmin: Real,
+    /// Physical shunts used at topology elaboration.
+    pub shunts: TopologyShunts,
     /// Resolved circuit relative tolerance (C `CKTreltol`), used by device preparation.
     /// Independent of analysis-local Newton tolerance overrides.
     pub reltol: Real,
@@ -804,6 +832,10 @@ impl ModelContext {
             resistor_overrides: [None; MAX_RESISTOR_OVERRIDES],
             instance_overrides: [None; MAX_INSTANCE_OVERRIDES],
             gmin: DEFAULT_GMIN,
+            shunts: TopologyShunts {
+                resistance: None,
+                capacitance: 0.,
+            },
             reltol: DEFAULT_RELTOL,
             frequency: 0.,
             spice3_noise: false,
@@ -942,6 +974,9 @@ impl ModelContext {
     }
 
     pub(crate) fn validate(&self, location: &SourceLoc) -> SpiceResult<()> {
+        self.shunts
+            .validate()
+            .map_err(|error| SpiceError::parse(location.clone(), error.to_string()))?;
         temperature_kelvin(self.temperature, location)?;
         temperature_kelvin(self.nominal_temperature, location)?;
         if !(self.frequency.is_finite() && self.frequency >= 0.) {

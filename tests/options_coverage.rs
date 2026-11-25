@@ -78,6 +78,95 @@ fn close(a: f64, b: f64, rel: f64, abs: f64) {
 // ---- options with an effect -------------------------------------------------
 
 #[test]
+fn physical_shunts_match_independent_nodal_equations() {
+    let circuit = "v1 in 0 dc 1 ac 1\nr1 in out 1k";
+    let plot = simulate(&format!("{circuit}\n.options rshunt=1k\n.op")).unwrap();
+    close(plot.value("v(out)", 0).unwrap().re, 0.5, 1e-12, 0.);
+    close(plot.value("i(v1)", 0).unwrap().re, -1.5e-3, 1e-12, 0.);
+    // An extreme finite resistance must retain its real reciprocal.
+    let large = simulate(&format!("{circuit}\n.options rshunt=1e15\n.op")).unwrap();
+    close(large.value("i(v1)", 0).unwrap().re, -2e-15, 0., 5e-19);
+    let frequency = 1000.;
+    let omega_c = std::f64::consts::TAU * frequency * 1e-6;
+    let denominator = 1. + (omega_c * 1000.).powi(2);
+    let ac = simulate(&format!("{circuit}\n.options cshunt=1u\n.ac lin 1 1k 1k")).unwrap();
+    let output = ac.value("v(out)", 0).unwrap();
+    close(output.re, denominator.recip(), 1e-12, 0.);
+    close(output.im, -omega_c * 1000. / denominator, 1e-12, 0.);
+    let current = ac.value("i(v1)", 0).unwrap();
+    close(current.re, (output.re - 1.) / 1000., 1e-12, 0.);
+    close(current.im, output.im / 1000. - omega_c, 1e-12, 0.);
+    let unshunted = simulate(&format!("{circuit}\n.op")).unwrap();
+    close(unshunted.value("v(out)", 0).unwrap().re, 1., 1e-12, 0.);
+}
+
+#[test]
+fn topology_shunts_agree_with_explicit_reactive_storage() {
+    let circuit = "v1 in 0 pulse(0 1 1u 1u 1u 1m 2m)\nr1 in out 1k";
+    let analysis = ".tran 1u 50u";
+    for method in ["trap", "gear"] {
+        let generated = simulate(&format!(
+            "{circuit}\n.options rshunt=1k cshunt=1n method={method}\n{analysis}"
+        ))
+        .unwrap();
+        let explicit = simulate(&format!(
+            "{circuit}\nrsi in 0 1k\nrso out 0 1k\ncsi in 0 1n\ncso out 0 1n\n.options method={method}\n{analysis}"
+        )).unwrap();
+        assert_eq!(generated.point_count(), explicit.point_count());
+        for point in 0..generated.point_count() {
+            for variable in ["time", "v(out)", "i(v1)"] {
+                close(
+                    generated.value(variable, point).unwrap().re,
+                    explicit.value(variable, point).unwrap().re,
+                    1e-8,
+                    1e-12,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn topology_shunts_validate_and_preserve_branch_coordinates() {
+    for invalid in [
+        ".options rshunt=0",
+        ".options rshunt=-1",
+        ".options rshunt=1e-320",
+        ".options cshunt=-1",
+        ".options cshunt=abc",
+    ] {
+        assert!(config(invalid).is_err(), "{invalid}");
+    }
+    let n = deck(
+        "v1 a 0 1\nr1 a b 1k\nd1 b 0 dm\n.model dm d(is=1e-14 rs=10)\n.options rshunt=1e15 cshunt=1p",
+    );
+    let c = RunConfig::from_netlist(&n).unwrap();
+    let circuit = c.circuit(&n).unwrap();
+    let nodes = circuit.nodes().nodes();
+    let terminals = nodes
+        .iter()
+        .filter(|node| node.kind == ngspice_rs::primitives::NodeKind::Terminal)
+        .count();
+    let internal = nodes
+        .iter()
+        .filter(|node| node.kind == ngspice_rs::primitives::NodeKind::Internal)
+        .count();
+    assert!(internal > 0);
+    let resistors = circuit
+        .devices()
+        .iter()
+        .filter(|d| d.name().starts_with("r__rshunt_"))
+        .count();
+    let capacitors = circuit
+        .devices()
+        .iter()
+        .filter(|d| d.name().starts_with("capac") && d.name().ends_with("shunt"))
+        .count();
+    assert_eq!(resistors, terminals + internal);
+    assert_eq!(capacitors, terminals);
+}
+
+#[test]
 fn gmin_is_the_junction_gmin_of_every_analysis() {
     let c = config(".options gmin=1u").unwrap();
     assert_eq!(c.context().gmin, 1e-6);
@@ -856,8 +945,6 @@ fn unknown_and_unported_options_still_fail() {
     }
     for pending in [
         ".options gshunt=1e-12",
-        ".options cshunt=1p",
-        ".options minbreak=1n",
         ".options numdgt=8",
         ".options savecurrents",
         ".options scale=1u",

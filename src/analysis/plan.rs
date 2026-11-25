@@ -128,6 +128,7 @@ struct TransientOverrides {
     max_order: Option<u8>,
     chgtol: Option<Real>,
     trtol: Option<Real>,
+    minbreak: Option<Real>,
     max_steps: Option<usize>,
     tran_max_iter: Option<usize>,
     xmu: Option<Real>,
@@ -140,6 +141,7 @@ pub(super) struct TransientOptions {
     pub max_order: u8,
     pub chgtol: Real,
     pub trtol: Real,
+    pub minbreak: Real,
     pub max_steps: usize,
     pub tran_max_iter: usize,
     pub xmu: Real,
@@ -160,6 +162,7 @@ impl TransientOverrides {
             max_order,
             chgtol: self.chgtol.or(deck.chgtol).unwrap_or(1e-14),
             trtol: self.trtol.or(deck.trtol).unwrap_or(7.),
+            minbreak: self.minbreak.or(deck.minbreak).unwrap_or(0.),
             max_steps: self.max_steps.unwrap_or(DEFAULT_MAX_STEPS),
             tran_max_iter: self.tran_max_iter.or(deck.itl4).unwrap_or(100),
             xmu: self.xmu.or(deck.xmu).unwrap_or(DEFAULT_XMU),
@@ -326,6 +329,13 @@ impl TransientOverrides {
             }
             "chgtol" => self.chgtol = Some(positive(text, key)?),
             "trtol" => self.trtol = Some(positive(text, key)?),
+            "minbreak" => {
+                let value = real(text, key)?;
+                if value < 0. {
+                    return Err(unsupported("option minbreak must be nonnegative"));
+                }
+                self.minbreak = Some(value);
+            }
             "maxsteps" => {
                 self.max_steps = Some(
                     text.parse::<usize>()

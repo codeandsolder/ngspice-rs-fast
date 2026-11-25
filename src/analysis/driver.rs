@@ -154,6 +154,8 @@ pub struct AnalysisContext {
     /// default [`crate::devices::DEFAULT_GMIN`]. See
     /// [`crate::devices::ModelContext::gmin`].
     pub gmin: Real,
+    /// Physical nodal shunts used during circuit elaboration.
+    pub shunts: crate::devices::models::TopologyShunts,
     /// Resolved circuit relative tolerance (C `CKTreltol`). Device preparation
     /// uses this value even when the analysis has a local Newton override.
     pub reltol: Real,
@@ -181,6 +183,7 @@ impl AnalysisContext {
                 .with_gmin(self.gmin)
                 .with_reltol(self.reltol)
                 .with_pivot_tolerances(self.pivot);
+        context.shunts = self.shunts;
         if let Some(overrides) = self.candidate_model_overrides {
             context.resistor_overrides = overrides.resistor_overrides;
             context.instance_overrides = overrides.instance_overrides;
@@ -208,6 +211,7 @@ impl Default for AnalysisContext {
             temperature: 27.0,
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
+            shunts: Default::default(),
             reltol: crate::devices::DEFAULT_RELTOL,
             pivot: crate::maths::PivotTolerances::DEFAULT,
             rf_limits: crate::analysis::RfLimits::default(),
