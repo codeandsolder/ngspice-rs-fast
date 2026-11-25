@@ -374,7 +374,15 @@ singular systems).
   roundoff bound rejects unresolved cancellation, and normalization or
   product range failures also reject that route. Rejected RHS values
   are replayed using raw scatter from the original RHS, independently
-  for each SIMD lane. The guard is not a global conditioning certificate.
+  for each SIMD lane. For longer real rows, a sufficient row-level
+  certificate bounds the original running error by eight machine epsilons
+  times the number of row terms plus one times the rounded magnitude sum.
+  The bound exploits monotone nonnegative magnitude prefixes and includes
+  slack for rounded subnormal products and the positive sum itself. Short
+  rows retain the original running guard. If the sufficient certificate
+  cannot accept every lane, the original guard is replayed in the same
+  subtraction order; no RHS changes its raw-recovery decision. The guard
+  is not a global conditioning certificate.
   See [BSIM_NUMERICAL_DIAGNOSIS.md](BSIM_NUMERICAL_DIAGNOSIS.md) for
   the independent C replay motivating the change.
   Exact product accumulation distinguishes
