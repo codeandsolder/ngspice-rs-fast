@@ -36,7 +36,7 @@ impl FrequencyBand {
     }
 
     /// Lower and upper frequency, in Hz.
-    #[must_use]
+    #[must_use = "the returned frequency limits bound the qualified approximation"]
     pub const fn limits(self) -> [f64; 2] {
         [self.low, self.high]
     }
@@ -114,7 +114,7 @@ impl LineMode {
     }
 
     /// The immutable validated coefficients.
-    #[must_use]
+    #[must_use = "the returned parameters describe the prepared physical mode"]
     pub const fn parameters(self) -> ModeParameters {
         self.0
     }
@@ -565,31 +565,31 @@ impl PreparedLine {
     }
 
     /// Number of conductors (ports are ordered near end, then far end).
-    #[must_use]
+    #[must_use = "the conductor count determines the modal network dimensions"]
     pub fn conductors(&self) -> usize {
         self.modes.len()
     }
 
     /// Physical length in metres.
-    #[must_use]
+    #[must_use = "the length determines the propagation distance"]
     pub const fn length(&self) -> f64 {
         self.length
     }
 
     /// Validity range of the prepared model.
-    #[must_use]
+    #[must_use = "the frequency band bounds the prepared network validity"]
     pub const fn band(&self) -> FrequencyBand {
         self.band
     }
 
     /// Borrow the immutable mode coefficients.
-    #[must_use]
+    #[must_use = "the modes determine the modal propagation parameters"]
     pub fn modes(&self) -> &[LineMode] {
         &self.modes
     }
 
     /// Row-major, orthogonal conductor-to-mode transform.
-    #[must_use]
+    #[must_use = "the basis maps physical conductor quantities to modal coordinates"]
     pub fn basis(&self) -> &[f64] {
         &self.basis
     }

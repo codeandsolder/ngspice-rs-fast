@@ -49,7 +49,7 @@ pub enum SpectrumWindow {
 
 impl SpectrumWindow {
     /// Parse window names and common ngspice aliases.
-    #[must_use]
+    #[must_use = "the parsed window determines the spectral weighting"]
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "none" | "rectangular" => Some(Self::Rectangular),
@@ -245,13 +245,13 @@ impl SpectrumPlan {
     }
 
     /// Discrete coherent gain and equivalent noise bandwidth.
-    #[must_use]
+    #[must_use = "the window metrics determine amplitude and bandwidth normalization"]
     pub const fn metrics(&self) -> WindowMetrics {
         self.metrics
     }
 
     /// Number of retained frequency bins.
-    #[must_use]
+    #[must_use = "the bin count determines the size of the resulting spectrum"]
     pub const fn bins(&self) -> usize {
         match self.layout {
             SpectrumLayout::Real => self.fft.length() / 2 + 1,
