@@ -108,11 +108,15 @@ petgraph = "0.8.3"
 [dependencies]
 winnow.workspace = true
 petgraph.workspace = true
-model-kernel-api = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8463b7197d404fdee7b024cd1ce83130e362d683" }
+model-kernel-api = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "46cb5924387c5ed92cb03376453bd6140103f282" }
+model-kernel-diode = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "46cb5924387c5ed92cb03376453bd6140103f282" }
+sha2 = "0.11"
 
 [dev-dependencies]
 ngspice-conformance = { path = "conformance/support" }
-model-kernel-vdmos = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "8463b7197d404fdee7b024cd1ce83130e362d683" }
+model-kernel-vdmos = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "46cb5924387c5ed92cb03376453bd6140103f282" }
+ngspice-rs-preprocess = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "46cb5924387c5ed92cb03376453bd6140103f282" }
+tempfile = "3"
 
 [workspace.lints.rust]
 missing_docs = "warn"

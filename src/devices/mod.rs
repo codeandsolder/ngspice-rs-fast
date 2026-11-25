@@ -83,6 +83,7 @@ pub mod passive;
 pub mod prepared_model;
 pub mod pulse;
 pub mod rf_passive;
+mod simetrix_diode;
 pub use passive::PassiveParameters;
 pub mod schema;
 pub mod sensitivity;

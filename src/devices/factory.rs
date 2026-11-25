@@ -70,6 +70,9 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Diode => {
             crate::devices::nonlinear::Diode::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::SimetrixDiodeLevel1 => {
+            crate::devices::simetrix_diode::instantiate(instance, nodes, &model, context)
+        }
         ModelBackend::Bjt => {
             crate::devices::bjt::Bjt::instantiate(instance, nodes, &model, context)
         }
