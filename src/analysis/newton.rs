@@ -512,6 +512,21 @@ impl<T> LoadStorage<T> {
         self.matrix = Some(matrix);
         self.rhs = Some(rhs);
     }
+
+    /// Check the assembled system and fold duplicates before factorization.
+    fn checked_system(&mut self, n: usize) -> SpiceResult<(&mut SparseMatrix, &Vector)> {
+        let matrix = self
+            .matrix
+            .as_mut()
+            .ok_or_else(|| failure("Newton load returned no matrix"))?;
+        let rhs = self
+            .rhs
+            .as_ref()
+            .ok_or_else(|| failure("Newton load returned no RHS"))?;
+        check(matrix, rhs, n)?;
+        matrix.fold_duplicates();
+        Ok((matrix, rhs))
+    }
 }
 
 /// Persistent numerical scratch for a single circuit/analysis driver. A
@@ -729,17 +744,8 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         progress.iterations += 1;
         let iterno = progress.iterations;
         let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
-        let matrix = storage
-            .matrix
-            .as_mut()
-            .ok_or_else(|| failure("Newton load returned no matrix"))?;
-        let rhs = storage
-            .rhs
-            .as_ref()
-            .ok_or_else(|| failure("Newton load returned no RHS"))?;
         let flagged = (phases.nonconvergent)(&trial);
-        check(matrix, rhs, n)?;
-        matrix.fold_duplicates();
+        let (matrix, rhs) = storage.checked_system(n)?;
         if phase == IterationPhase::Junction {
             reorder = true;
         }
