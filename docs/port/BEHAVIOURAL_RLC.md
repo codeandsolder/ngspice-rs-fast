@@ -231,6 +231,29 @@ therefore invalidate the prepared realization when a coefficient or
 integrator initial value changes. The A/B/A regression includes failed
 zero-denominator candidates and verifies independent DC and AC responses.
 
+Candidate plans also bind the actual macro-expanded runtime law's static
+reads, including captured names, embedded numparam expressions and
+coefficients introduced by controlled-source lowering. The scalar
+literalization record retains the actual expression when a syntactically
+behavioral passive resolves to a numeric value. Unchanged effective
+parameter reads preserve the validated program and circuit topology,
+including when independent input changes cancel in a derived parameter.
+Root option expressions use the same dependency comparison; literal
+options and seeds do not invalidate otherwise reusable candidates.
+Changing a compiled coefficient triggers validated structural
+re-elaboration; unsupported physical coefficient gradients are reported
+as such rather than returning a synthetic zero.
+
+An opt-in preparation benchmark
+(`benchmark_behavioural_candidate_preparation` in
+`tests/optimization_parameters.rs`) exercised 256 source-amplitude
+candidates for 64 expression-controlled resistors and one independent
+source, with a fixed lexical law and literal convergence/seed options.
+All candidates reused the original topology. On the development host,
+prepared updates took 1.42 ms total, versus 250.6 ms for independently
+parsed and elaborated decks, after a one-time 2.1 ms plan preparation.
+This measures preparation, not nonlinear analysis runtime.
+
 ## External charge-network verification
 
 An extracted EPC23101 power-FET gate-source, gate-drain and source-drain
