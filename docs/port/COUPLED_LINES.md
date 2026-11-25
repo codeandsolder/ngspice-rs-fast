@@ -174,7 +174,11 @@ interstage and exit delays are continuous, not rounded to an integer
 lattice. Ordinary steps cannot traverse a complete interstage flight: terminal
 loads sample only the accepted history and the necessary terminal
 scattering rows, while acceptance propagates the realized scalar waveform.
-Oversized trials use waveforms affine in all new boundary endpoint
+Sorted scattering times are sampled by monotonic cursors, using the same
+interpolation and error checks as random access. Ordinary acceptance
+constructs each next delay window directly from the old history and one
+stage's newly scattered waveforms. It keeps the old history immutable
+and does not retain a full duplicate trial. Oversized trials use waveforms affine in all new boundary endpoint
 increments, so the terminal relation includes arrivals and internal
 feedback during the trial. Rejected trials cannot advance the accepted
 wave histories.
@@ -215,7 +219,10 @@ network. The spatial splitting approximates noncommuting R/G and L/C;
 refine `sections` for spatial accuracy. Explicit workspace and work
 limits account for retained scalar histories and affine trial scratch.
 Output-row batches and overlapping time chunks bound temporary scattering
-curves without changing their exact endpoint relations. Exhaustion
+curves without changing their exact endpoint relations. The ordinary
+acceptance workspace accounts for both accepted versions and one stage's
+scratch under the total configured limit; the per-version accepted
+history limit remains half that budget. Exhaustion
 is reported rather than silently discarding significant arrivals.
 
 ## Passive finite-volume cable
