@@ -268,7 +268,10 @@ impl CoupledLinePlan {
         let mut norm = operator_norm(&operator)?;
         let mut factor = 1.;
         let mut steps = 0;
-        while norm > 4. {
+        loop {
+            if norm <= 4. {
+                break;
+            }
             if steps >= self.limits.squarings {
                 return Err(invalid("DC hybrid composition exceeds work budget"));
             }

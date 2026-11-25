@@ -1149,3 +1149,120 @@ fn long_rank_one_dc_series_has_exact_ideal_mode_without_transfer_overflow() {
         );
     }
 }
+
+#[test]
+fn modal_trials_are_repeatable_across_rejection_and_history_pruning() {
+    use ngspice_rs::devices::{
+        AnalysisMode, Circuit, DelayAcceptance, LoadRequest, ModelContext, StateHistory,
+    };
+    use ngspice_rs::maths::{SparseMatrix, Vector};
+
+    let plan = Arc::new(model(
+        2,
+        0.2,
+        &[0.; 3],
+        &[250e-9, 30e-9, 300e-9],
+        &[0.; 3],
+        &[100e-12, -15e-12, 80e-12],
+    ));
+    let modes = plan.exact_lc_modes().unwrap();
+    let shortest = modes
+        .total_delays
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let longest = modes.total_delays.iter().copied().fold(0., f64::max);
+    let dt = shortest * 0.25;
+    let mut circuit = Circuit::new();
+    let input = [
+        circuit.add_node("a1").unwrap(),
+        circuit.add_node("a2").unwrap(),
+    ];
+    let output = [
+        circuit.add_node("b1").unwrap(),
+        circuit.add_node("b2").unwrap(),
+    ];
+    circuit
+        .add_device(Box::new(
+            CoupledLine::new(
+                "p1",
+                plan,
+                input.to_vec(),
+                NodeId::GROUND,
+                output.to_vec(),
+                NodeId::GROUND,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    circuit.finalize().unwrap();
+    let dimension = circuit.unknown_count();
+    assert_eq!(dimension, 8);
+    assert_eq!(circuit.state_len(), 0);
+
+    let load = |history: &StateHistory, mode, solution: &Vector| {
+        let mut trial = history.trial();
+        let mut matrix = SparseMatrix::new(dimension, dimension);
+        let mut rhs = Vector::zeros(dimension);
+        circuit
+            .load(
+                &LoadRequest {
+                    mode,
+                    solution,
+                    model_context: &ModelContext::default(),
+                    integration: None,
+                    history,
+                    forcing: None,
+                },
+                &mut matrix,
+                &mut rhs,
+                &mut trial,
+            )
+            .unwrap();
+        (trial, matrix, rhs)
+    };
+    let acceptance = |start| DelayAcceptance {
+        steps: [dt; 3],
+        min_break: dt * 1e-6,
+        start,
+        reltol: 1e-3,
+        abstol: 1e-12,
+    };
+    let mut history = circuit.state_history().unwrap();
+    let initial = Vector::from_slice(&[0.1, 0.2, 0.3, 0.4, 0.01, -0.02, 0.03, -0.04]);
+    let (trial, _, _) = load(&history, AnalysisMode::OperatingPoint, &initial);
+    circuit
+        .accept_transient_point(&initial, 0., &mut history, trial, &acceptance(true))
+        .unwrap();
+
+    for step in 1..=100 {
+        let time = f64::from(step) * dt;
+        let solution = Vector::from_slice(&[time / dt, 0.2, 0.3, 0.4, 0.01, -0.02, 0.03, -0.04]);
+        let previous = history.clone();
+        let mode = AnalysisMode::Transient { time, dt };
+        let (_, before_matrix, before_rhs) = load(&history, mode, &solution);
+        // Oversized, discarded trial exercises the affine implicit modal
+        // stamp rather than only the accepted-sample interpolation path.
+        let rejected_dt = 2. * longest;
+        let rejected_time = time - dt + rejected_dt;
+        let (_, _, _) = load(
+            &history,
+            AnalysisMode::Transient {
+                time: rejected_time,
+                dt: rejected_dt,
+            },
+            &initial,
+        );
+        assert_eq!(history, previous);
+        let (trial, after_matrix, after_rhs) = load(&history, mode, &solution);
+        assert_eq!(after_matrix, before_matrix);
+        assert_eq!(after_rhs, before_rhs);
+        circuit
+            .accept_transient_point(&solution, time, &mut history, trial, &acceptance(false))
+            .unwrap();
+        let wave = history.delay(0).unwrap().as_waveform().unwrap();
+        assert_eq!(wave.last_time(), Some(time));
+        assert!(wave.time(0).unwrap() <= time - longest);
+        assert!(wave.len() <= 2 + (longest / dt).ceil() as usize);
+    }
+}
