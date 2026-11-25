@@ -1302,3 +1302,150 @@ fn matched_noncommuting_modal_cable_does_not_propagate_roundoff_as_breakpoints()
         assert!((b - 0.0207765131828798 * q).abs() < 5e-9);
     }
 }
+
+#[test]
+fn matched_full_order_cable_preserves_all_wavefronts_without_event_explosion() {
+    use std::fmt::Write as _;
+
+    // Generate independent reciprocal bases. I is lower bidiagonal, so
+    // the matched physical port admittance I I^T is tridiagonal and can
+    // be assembled using only ordinary resistors. V=I^(-T) is dense
+    // upper triangular; the resulting L and C do not commute.
+    for n in [8_usize, 16, 32] {
+        let index = |i: usize| f64::from(u32::try_from(i).unwrap());
+        let diagonal: Vec<_> = (0..n)
+            .map(|i| 0.13 + 0.006 * index((5 * i + 3) % 11))
+            .collect();
+        let sub: Vec<_> = (0..n)
+            .map(|i| {
+                if i == 0 {
+                    0.
+                } else {
+                    -0.015 - 0.002 * index((7 * i + 2) % 13)
+                }
+            })
+            .collect();
+        let slowness: Vec<_> = (0..n)
+            .map(|i| (3. + 4. * (index((7 * i) % n) + 0.25) / index(n)) * 1e-9)
+            .collect();
+        let source: Vec<_> = (0..n)
+            .map(|i| 0.001 * (index((11 * i + 5) % 19) - 9.))
+            .collect();
+        let mut current = vec![vec![0.; n]; n];
+        let mut voltage = vec![vec![0.; n]; n];
+        for (i, row) in current.iter_mut().enumerate() {
+            row[i] = diagonal[i];
+            if i > 0 {
+                row[i - 1] = sub[i];
+            }
+        }
+        for j in 0..n {
+            for i in (0..=j).rev() {
+                let next = if i + 1 < n {
+                    sub[i + 1] * voltage[i + 1][j]
+                } else {
+                    0.
+                };
+                voltage[i][j] = (f64::from(u8::from(i == j)) - next) / diagonal[i];
+            }
+        }
+        let packed_material = |basis: &[Vec<f64>]| {
+            let mut entries = Vec::new();
+            for (i, left) in basis.iter().enumerate() {
+                for right in &basis[i..] {
+                    let element = left
+                        .iter()
+                        .zip(right)
+                        .zip(&slowness)
+                        .map(|((&a, &b), &s)| a * b * s)
+                        .sum::<f64>();
+                    entries.push(format!("{element:.17e}"));
+                }
+            }
+            entries.join(" ")
+        };
+        let mut deck = String::new();
+        for (i, &amplitude) in source.iter().enumerate() {
+            writeln!(
+                deck,
+                "i{i} 0 a{i} pwl(0 0 .5n 0 .7n {amplitude:.17e} 2.1n {amplitude:.17e} 2.4n 0 5n 0)"
+            )
+            .unwrap();
+        }
+        for end in ['a', 'b'] {
+            for i in 0..n {
+                let shunt = diagonal[i] * diagonal[i]
+                    + sub[i] * sub[i]
+                    + if i > 0 { sub[i] * diagonal[i - 1] } else { 0. }
+                    + if i + 1 < n {
+                        sub[i + 1] * diagonal[i]
+                    } else {
+                        0.
+                    };
+                assert!(shunt > 0.);
+                writeln!(deck, "r{end}g{i} {end}{i} 0 {:.17e}", 1. / shunt).unwrap();
+                if i > 0 {
+                    writeln!(
+                        deck,
+                        "r{end}x{i} {end}{} {end}{i} {:.17e}",
+                        i - 1,
+                        -1. / (sub[i] * diagonal[i - 1])
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let terminals = |end: char| {
+            (0..n)
+                .map(|i| format!("{end}{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let zero = vec!["0"; n * (n + 1) / 2].join(" ");
+        writeln!(
+            deck,
+            "p1 {} 0 {} 0 cable\n.model cable cpl r={zero} g={zero} l={} c={} length=0.2\n.tran 0.05n 5n",
+            terminals('a'),
+            terminals('b'),
+            packed_material(&voltage),
+            packed_material(&current),
+        )
+        .unwrap();
+
+        let plot = run_transient_cpl(&deck);
+        let times = transient_column(&plot, "time");
+        assert!(
+            (100..1500).contains(&times.len()),
+            "{n} conductors produced {} accepted points",
+            times.len()
+        );
+        let launch: Vec<_> = (0..n)
+            .map(|mode| {
+                0.5 * voltage
+                    .iter()
+                    .zip(&source)
+                    .map(|(row, &drive)| row[mode] * drive)
+                    .sum::<f64>()
+            })
+            .collect();
+        let pulse =
+            |t: f64| ((t - 0.5e-9) / 0.2e-9).clamp(0., 1.) - ((t - 2.1e-9) / 0.3e-9).clamp(0., 1.);
+        for (conductor, row) in voltage.iter().enumerate() {
+            let actual = transient_column(&plot, &format!("v(b{conductor})"));
+            for (&time, &observed) in times.iter().zip(&actual) {
+                let expected = row
+                    .iter()
+                    .zip(&launch)
+                    .zip(&slowness)
+                    .map(|((&basis, &amplitude), &delay)| {
+                        basis * amplitude * pulse(time - 0.2 * delay)
+                    })
+                    .sum::<f64>();
+                assert!(
+                    (observed - expected).abs() < 5e-9,
+                    "{n} conductors, output {conductor} at {time:.17e}: {observed:.17e} vs {expected:.17e}"
+                );
+            }
+        }
+    }
+}
