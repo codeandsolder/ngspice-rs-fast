@@ -63,6 +63,7 @@ pub mod rf_network;
 pub mod selection;
 mod sens;
 mod sparam;
+pub mod spectrum;
 pub mod sweep;
 mod tf;
 pub mod touchstone;

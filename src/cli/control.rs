@@ -8,11 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
-use crate::analysis::control::vectors::{self, SpectrumWindow, TransformBudget};
+use crate::analysis::control::vectors::{self, TransformBudget};
 use crate::analysis::control::{
     ControlBatchBudget, ControlBatchCards, ControlPlot, ControlSession,
 };
 use crate::analysis::optimization::parameters::CircuitParameterPlan;
+use crate::analysis::spectrum::{
+    SpectrumLength, SpectrumNormalization, SpectrumSettings, SpectrumWindow,
+};
 use crate::analysis::{Variable, measure};
 use crate::netlist::ast::{
     AnalysisCard, FourierCard, MeasureCard, Netlist, OutputCards, ScopedCardKind,
@@ -120,7 +123,7 @@ enum EchoPart {
 #[derive(Clone, Copy)]
 enum Transform {
     Linearize(Option<u32>),
-    Spectrum,
+    Spectrum(SpectrumLength, SpectrumNormalization),
 }
 
 enum Condition {
@@ -396,6 +399,48 @@ fn linearize_command(rest: &str, location: &SourceLoc) -> SpiceResult<Operation>
     Ok(Operation::Transform(Transform::Linearize(points), vectors))
 }
 
+fn spectrum_command(rest: &str, location: &SourceLoc) -> SpiceResult<Operation> {
+    let mut length = None;
+    let mut normalization = None;
+    let mut names = Vec::new();
+    for arg in rest.split_ascii_whitespace().map(str::to_ascii_lowercase) {
+        if let Some((key, value)) = arg.split_once('=') {
+            match key {
+                "length" if length.is_none() => {
+                    length = Some(match value {
+                        "exact" => SpectrumLength::Exact,
+                        "padded" => SpectrumLength::Padded,
+                        _ => return Err(error(location, "FFT length must be exact or padded")),
+                    });
+                }
+                "mode" if normalization.is_none() => {
+                    normalization = Some(match value {
+                        "amplitude" => SpectrumNormalization::Amplitude,
+                        "power" => SpectrumNormalization::Power,
+                        "psd" => SpectrumNormalization::Density,
+                        _ => {
+                            return Err(error(
+                                location,
+                                "FFT mode must be amplitude, power or psd",
+                            ));
+                        }
+                    });
+                }
+                _ => return Err(error(location, "unknown or repeated FFT option")),
+            }
+        } else {
+            names.push(arg);
+        }
+    }
+    Ok(Operation::Transform(
+        Transform::Spectrum(
+            length.unwrap_or_default(),
+            normalization.unwrap_or_default(),
+        ),
+        names,
+    ))
+}
+
 fn set_command(rest: &str, location: &SourceLoc) -> SpiceResult<Operation> {
     if let Some((name, value)) = rest.split_once('=') {
         if name.trim().eq_ignore_ascii_case("specwindow") {
@@ -568,12 +613,7 @@ impl Compiler<'_> {
                 Ok(Operation::Print(values))
             }
             "linearize" => linearize_command(rest, location),
-            "fft" => Ok(Operation::Transform(
-                Transform::Spectrum,
-                rest.split_ascii_whitespace()
-                    .map(str::to_ascii_lowercase)
-                    .collect(),
-            )),
+            "fft" => spectrum_command(rest, location),
             "set" => set_command(rest, location),
             "setplot" => {
                 if rest.is_empty() || rest.contains(char::is_whitespace) {
@@ -932,22 +972,30 @@ impl State<'_, '_> {
             cells: self.limits.cells - self.cells,
             work: self.remaining_transform_work,
         };
-        let result = if let Transform::Linearize(points) = transform {
-            let grid = current
-                .grid
-                .ok_or_else(|| error(location, "linearize needs a transient plot"))?;
-            let plot = vectors::linearize(&current.plot, grid, points, names, &mut budget)?;
-            ControlPlot {
-                kind: AnalysisKind::Transient,
-                grid: Some(grid),
-                plot,
+        let result = match transform {
+            Transform::Linearize(points) => {
+                let grid = current
+                    .grid
+                    .ok_or_else(|| error(location, "linearize needs a transient plot"))?;
+                let plot = vectors::linearize(&current.plot, grid, points, names, &mut budget)?;
+                ControlPlot {
+                    kind: AnalysisKind::Transient,
+                    grid: Some(grid),
+                    plot,
+                }
             }
-        } else {
-            let plot = vectors::fft(&current.plot, names, self.window, &mut budget)?;
-            ControlPlot {
-                kind: AnalysisKind::Fourier,
-                grid: None,
-                plot,
+            Transform::Spectrum(length, normalization) => {
+                let settings = SpectrumSettings {
+                    window: self.window,
+                    length,
+                    normalization,
+                };
+                let plot = vectors::fft(&current.plot, names, settings, &mut budget)?;
+                ControlPlot {
+                    kind: AnalysisKind::Fourier,
+                    grid: None,
+                    plot,
+                }
             }
         };
         self.remaining_transform_work = budget.work;

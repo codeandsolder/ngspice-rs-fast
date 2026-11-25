@@ -254,9 +254,8 @@ fn control_work_retention_and_output_budgets_are_independent() {
 }
 
 use ngspice_rs::Complex;
-use ngspice_rs::analysis::control::vectors::{
-    SpectrumWindow, TimeGrid, TransformBudget, fft, linearize,
-};
+use ngspice_rs::analysis::control::vectors::{TimeGrid, TransformBudget, fft, linearize};
+use ngspice_rs::analysis::spectrum::{SpectrumLength, SpectrumSettings, SpectrumWindow};
 use ngspice_rs::analysis::{Plot, PlotFlags, Variable};
 
 fn waveform(times: impl IntoIterator<Item = f64>, signal: impl Fn(f64) -> f64) -> Plot {
@@ -306,7 +305,10 @@ fn linearize_resamples_nonuniform_accepted_points() {
         fft(
             &plot,
             &[],
-            SpectrumWindow::Rectangular,
+            SpectrumSettings {
+                window: SpectrumWindow::Rectangular,
+                ..SpectrumSettings::default()
+            },
             &mut transform_budget()
         )
         .is_err()
@@ -340,7 +342,10 @@ fn spectrum_matches_analytic_sinusoid_dc_and_nyquist() {
     let spectrum = fft(
         &plot,
         &[],
-        SpectrumWindow::Rectangular,
+        SpectrumSettings {
+            window: SpectrumWindow::Rectangular,
+            ..SpectrumSettings::default()
+        },
         &mut transform_budget(),
     )
     .unwrap();
@@ -359,14 +364,28 @@ fn zero_padding_preserves_actual_sample_count_normalization() {
     let spectrum = fft(
         &plot,
         &[],
-        SpectrumWindow::Rectangular,
+        SpectrumSettings {
+            window: SpectrumWindow::Rectangular,
+            length: SpectrumLength::Padded,
+            ..SpectrumSettings::default()
+        },
         &mut transform_budget(),
     )
     .unwrap();
     assert_eq!(spectrum.point_count(), 17);
     assert!((spectrum.value("v(out)", 0).unwrap().re - 2.5).abs() < 1e-13);
     assert!((spectrum.value("frequency", 1).unwrap().re - 1. / 32.).abs() < 1e-15);
-    let hann = fft(&plot, &[], SpectrumWindow::Hann, &mut transform_budget()).unwrap();
+    let hann = fft(
+        &plot,
+        &[],
+        SpectrumSettings {
+            window: SpectrumWindow::Hann,
+            length: SpectrumLength::Padded,
+            ..SpectrumSettings::default()
+        },
+        &mut transform_budget(),
+    )
+    .unwrap();
     assert!((hann.value("v(out)", 0).unwrap().re - 2.5).abs() < 1e-13);
 }
 
@@ -682,4 +701,81 @@ fn control_only_deck_executes_numeric_loops() {
         output,
         "index is 0\nindex is 1\nindex is 2\nindex is 3\nindex is 4\n"
     );
+}
+
+#[test]
+fn control_spectrum_explicit_mode_and_length() {
+    let deck = ScriptDeck::new(
+        "spectrum-modes",
+        "\ntran 1m 8m\nlinearize v(out) np=7\nset specwindow=none\nfft mode=power length=exact v(out)\nsetplot tran2\nfft mode=psd length=padded v(out)\n",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    let power = &report.plots[2].plot;
+    let density = &report.plots[3].plot;
+    assert_eq!(power.point_count(), 4);
+    assert_eq!(density.point_count(), 5);
+    assert_eq!(power.flags(), PlotFlags::Real);
+    assert_eq!(density.flags(), PlotFlags::Real);
+    let power_sum = power
+        .column("v(out)")
+        .unwrap()
+        .iter()
+        .map(|v| v.re)
+        .sum::<f64>();
+    let density_sum = density
+        .column("v(out)")
+        .unwrap()
+        .iter()
+        .map(|v| v.re)
+        .sum::<f64>();
+    let df = density.value("frequency", 1).unwrap().re;
+    assert!((power_sum - 2.25).abs() < 1e-12);
+    assert!((density_sum * df - power_sum).abs() < 1e-12);
+}
+
+#[test]
+fn complex_linearization_preserves_both_components() {
+    let mut plot = Plot::new(
+        "tran",
+        "Transient Analysis",
+        PlotFlags::Complex,
+        vec![
+            Variable::new("time", "time"),
+            Variable::complex("v(out)", "voltage"),
+        ],
+    );
+    for time in [0., 0.1, 0.3, 0.6, 1.] {
+        plot.push_point(&[Complex::real(time), Complex::new(2. * time + 3., 1. - time)])
+            .unwrap();
+    }
+    let uniform = linearize(
+        &plot,
+        TimeGrid {
+            start: 0.,
+            stop: 1.,
+            step: 0.125,
+        },
+        None,
+        &[],
+        &mut transform_budget(),
+    )
+    .unwrap();
+    assert_eq!(uniform.flags(), PlotFlags::Complex);
+    for row in uniform.rows() {
+        assert!((row[1].re - (2. * row[0].re + 3.)).abs() < 1e-14);
+        assert!((row[1].im - (1. - row[0].re)).abs() < 1e-14);
+    }
+    let spectrum = fft(
+        &uniform,
+        &[],
+        SpectrumSettings {
+            window: SpectrumWindow::Rectangular,
+            ..SpectrumSettings::default()
+        },
+        &mut transform_budget(),
+    )
+    .unwrap();
+    assert_eq!(spectrum.point_count(), 9);
+    assert!((spectrum.value("v(out)", 0).unwrap() - Complex::new(4., 0.5)).magnitude() < 1e-12);
+    assert!(spectrum.value("frequency", 8).unwrap().re < 0.);
 }

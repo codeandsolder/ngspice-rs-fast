@@ -46,12 +46,19 @@ retained typed plots and scalar variables.
   scalar variables. Plot numbering follows the batch naming rules.
 - `linearize [np=N] [vector ...]` interpolates a transient plot onto its
   requested output grid. N optionally limits the number of grid samples.
-  `fft [vector ...]` requires uniform real time samples. Omitting names
-  selects all eligible vectors. The forward spectrum is single-sided and
-  uses radix-2 zero padding where needed, normalization by actual input
-  sample count, and undoubled DC and Nyquist bins.
+  `fft [length=exact|padded] [mode=amplitude|power|psd] [vector ...]`
+  requires a uniform real time axis. Omitting names selects all eligible
+  vectors. Exact length is the default, including odd and prime lengths.
+  Explicit padding interpolates the frequency grid to the next power of two.
+  Real signals produce a single-sided spectrum with undoubled DC and even
+  Nyquist bins; complex signals use the full DFT frequency order.
 - `set specwindow=none|hann|hamming|triangle|blackman|blackmanharris|flattop`
-  selects the FFT window (default Hann).
+  selects the FFT window (default Hann). Amplitude normalization divides
+  by the actual discrete window sum; power and PSD divide by window energy.
+  Power bins sum to the window-weighted mean square, and integrating PSD
+  across the frequency bins gives the same quantity. Neither correction
+  depends on padding. The reusable spectrum plan exposes coherent gain and
+  equivalent noise bandwidth in bins and Hz.
 - `quit` terminates script execution.
 
 Derived vectors support named columns, voltage/current probes, arithmetic,
@@ -59,8 +66,8 @@ and selected real/complex functions (including magnitude, phase, real and
 imaginary components). The immutable schema is bound once per expression;
 the packed plot representation is shared with measurements. Linearization
 uses the existing ordered-axis interpolation geometry and refuses
-extrapolation or invalid/nonadvancing grids. FFT follows the normalization
-conventions of ngspice frontend/com_fft.c and maths/fft/fftext.c.
+extrapolation or invalid/nonadvancing grids. FFT uses the ngspice window conventions, with discrete normalization and
+explicit odd-length and complex-spectrum semantics.
 
 ## Example
 

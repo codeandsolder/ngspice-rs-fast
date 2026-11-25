@@ -21,6 +21,7 @@ pub use complex::{DynamicGroup, DynamicGroups};
 pub mod dense;
 pub mod dense_complex;
 pub mod equilibration;
+pub mod fft;
 pub mod integrator;
 pub mod linear;
 pub use linear::{
