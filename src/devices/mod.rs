@@ -51,6 +51,7 @@ mod bsim_model_inputs;
 pub use breaks::{BreakTable, SourceBreaks};
 pub mod circuit;
 pub mod controlled;
+pub mod cpl;
 pub mod delay;
 pub mod distortion;
 mod elaboration;
