@@ -1072,7 +1072,7 @@ impl DcEvaluation {
     /// These are C's `IFparm` keywords; `cbs`/`cbd` are capacitances in C and are
     /// therefore absent, while `ibs`/`ibd` are the junction currents. Charge,
     /// NQS, noise and gate-current asks are not part of this core.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a supported operating-point observation from an unknown keyword"]
     pub fn ask(&self, keyword: &str) -> Option<Real> {
         match keyword.to_ascii_lowercase().as_str() {
             "id" => Some(self.ids),

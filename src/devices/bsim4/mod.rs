@@ -59,7 +59,7 @@ mod temp;
 /// Generated from `b4set.c`'s given-guarded literal assignments. Independent
 /// defaults execute as typed generated assignments; selector fallbacks and
 /// conditional defaults remain in the ordered setup stages.
-#[must_use]
+#[must_use = "the returned table identifies literal setup defaults separately from conditional and selector-dependent defaults"]
 pub const fn literal_defaults() -> &'static [(&'static str, f64)] {
     defaults_data::LITERALS
 }
@@ -96,7 +96,7 @@ fn bsim4_model_real(p: &Parameter, value: Real, location: &SourceLoc) -> SpiceRe
 }
 
 /// C's `IF_UNINTERESTING` rows, as `TABLE:keyword` pairs.
-#[must_use]
+#[must_use = "the returned table identifies reference interface rows excluded from ordinary parameter reporting"]
 pub const fn uninteresting() -> &'static [&'static str] {
     DEVICE.uninteresting
 }
