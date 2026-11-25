@@ -138,7 +138,15 @@ fn error(matrix: &SparseMatrix, rhs: &Vector, x: &Vector, exact: &Vector) -> (f6
 }
 
 fn ni(matrix: &SparseMatrix, rhs: &Vector, reorder: bool) -> Vector {
-    match solve_ni(matrix, rhs, &mut None, reorder, 0.).unwrap() {
+    match solve_ni(
+        matrix,
+        rhs,
+        &mut None,
+        reorder,
+        ngspice_rs::maths::DiagonalGmin::unrestricted(0.),
+    )
+    .unwrap()
+    {
         NiStep::Solved(x) => x,
         NiStep::ZeroPivot => panic!("grounded positive-definite workload returned zero pivot"),
     }

@@ -19,6 +19,7 @@
 //! | `abstol` | branch-current absolute tolerance (companion truncation/Newton test; DC/AC Newton) |
 //! | `chgtol`, `trtol` | companion local-truncation-error charge floor and overestimation factor |
 //! | `minbreak` | minimum analog breakpoint spacing (seconds; zero selects the default) |
+//! | `newtrunc`, `ltereltol`, `lteabstol`, `ltetrtol` | optional voltage predictor LTE bound |
 //! | `method`, `maxord` | retained as [`RunConfig::method`]/[`RunConfig::maxord`] and forwarded to the companion driver (`trap`/`trapezoidal`/`gear`, `maxord` 1 to 6; `dctran.c` never runs above order 2, so 2 to 6 behave alike) |
 //! | `xmu` | companion trapezoidal weighting (`nicomcof.c`, default 0.5, `0..=0.5`) |
 //! | `itl1` | Newton iteration limit of the direct DC solve and of the gmin strategies' closing solve (`maxiter`) for `.op`/`.dc`/`.ac` and the companion `.tran` initial bias (C `CKTdcMaxIter`; `dcop.c`, `acan.c`, `dctran.c` call `CKTop`); default 100 |
@@ -116,7 +117,6 @@ const FRONTEND_REFERENCE: &str =
 
 /// Names in `cktsopt.c`'s `OPTtbl` that this port does not implement yet.
 const KNOWN_UNIMPLEMENTED: &[&str] = &[
-    "gshunt",
     "oldlimit",
     "numdgt",
     "defm",
@@ -136,10 +136,6 @@ const KNOWN_UNIMPLEMENTED: &[&str] = &[
     "sparse",
     "klu",
     "klu_memgrow_factor",
-    "lteabstol",
-    "ltereltol",
-    "ltetrtol",
-    "newtrunc",
     "maxopalter",
     "maxevtiter",
     "noopalter",
@@ -212,6 +208,19 @@ pub struct RunOverrides {
     pub nominal_temperature: Option<Real>,
 }
 
+/// Optional voltage-predictor truncation controls (CKTtrunc).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VoltageLteOptions {
+    /// Whether voltage-controlled truncation is enabled.
+    pub enabled: Option<bool>,
+    /// Relative tolerance for voltage predictor error.
+    pub relative: Option<Real>,
+    /// Absolute tolerance in volts.
+    pub absolute: Option<Real>,
+    /// Predictor-error overestimation factor.
+    pub factor: Option<Real>,
+}
+
 /// Deck-supplied transient settings. `None` leaves the driver default, so the
 /// BDF defaults are unchanged unless a deck sets them.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -226,6 +235,8 @@ pub struct TransientSettings {
     pub trtol: Option<Real>,
     /// Minimum spacing between analog breakpoints in seconds; zero selects the default.
     pub minbreak: Option<Real>,
+    /// Voltage-based LTE controls, independent of charge tolerances.
+    pub voltage_lte: VoltageLteOptions,
     /// `itl4` → companion Newton iterations per timepoint (`tranmaxiter`),
     /// stored as C's effective `max(itl4, 100)` (see [`NIITER_MIN_ITERATIONS`]).
     pub itl4: Option<usize>,
@@ -239,13 +250,14 @@ pub const NIITER_MIN_ITERATIONS: usize = 100;
 
 /// Option names that configure the DC Newton/continuation solve, in no
 /// particular order (`itl6` is stored as `srcsteps`).
-const DC_OPTIONS: [&str; 7] = [
+const DC_OPTIONS: [&str; 8] = [
     "itl1",
     "itl2",
     "srcsteps",
     "itl6",
     "gminsteps",
     "gminfactor",
+    "gshunt",
     "noopiter",
 ];
 
@@ -277,6 +289,8 @@ pub struct DcOptions {
     pub gminsteps: Option<usize>,
     /// `gminfactor` → ratio between consecutive gmin stages.
     pub gminfactor: Option<Real>,
+    /// SPARSE continuation diagonal after nodal gmin stepping (siemens).
+    pub gshunt: Option<Real>,
 }
 
 impl DcOptions {
@@ -292,6 +306,7 @@ impl DcOptions {
             self.itl2_written,
         )?;
         policy.skip_direct = self.noopiter;
+        policy.gshunt = self.gshunt.unwrap_or(0.);
         Ok(policy)
     }
 }
@@ -612,9 +627,9 @@ impl RunConfig {
         // The last-set counts and factor must form one valid schedule together
         // (with the deck's junction gmin, which seeds C's `spice3_gmin` ladder).
         if let Err(error) = config.dc.policy().and_then(|policy| match policy.schedule {
-            crate::analysis::bias::ContinuationSchedule::Ngspice(stepping) => {
-                stepping.fixed_gmin_ladder(config.context.gmin).map(|_| ())
-            }
+            crate::analysis::bias::ContinuationSchedule::Ngspice(stepping) => stepping
+                .fixed_gmin_ladder(policy.gmin_seed(config.context.gmin))
+                .map(|_| ()),
             crate::analysis::bias::ContinuationSchedule::Ladder { .. } => Ok(()),
         }) {
             let location = config
@@ -662,6 +677,7 @@ impl RunConfig {
             "temp"
                 | "tnom"
                 | "gmin"
+                | "gshunt"
                 | "rshunt"
                 | "cshunt"
                 | "pivtol"
@@ -672,6 +688,9 @@ impl RunConfig {
                 | "chgtol"
                 | "trtol"
                 | "minbreak"
+                | "lteabstol"
+                | "ltereltol"
+                | "ltetrtol"
                 | "method"
                 | "maxord"
                 | "xmu"
@@ -860,6 +879,20 @@ impl RunConfig {
             "keepopinfo" => {
                 self.keep_op_info = setting.value.is_none() || input.number("0 or 1")? != 0.;
             }
+            "newtrunc" => {
+                if setting.value.is_some() {
+                    return Err(SpiceError::parse(
+                        location.clone(),
+                        "option 'newtrunc' is a flag and takes no value",
+                    ));
+                }
+                self.transient.voltage_lte.enabled = Some(true);
+                self.applied.push(AppliedOption {
+                    name: setting.name.clone(),
+                    value: String::new(),
+                    location: location.clone(),
+                });
+            }
             "noopiter" => {
                 if setting.value.is_some() {
                     return Err(SpiceError::parse(
@@ -992,6 +1025,16 @@ impl RunConfig {
                 }
                 self.transient.minbreak = Some(number);
             }
+            "gshunt" => {
+                let number = input.number("a finite number")?;
+                if number < 0. {
+                    return Err(SpiceError::parse(
+                        value.location.clone(),
+                        "option 'gshunt' must be nonnegative",
+                    ));
+                }
+                self.dc.gshunt = Some(number);
+            }
             "gmin" => {
                 let gmin = input.number("a finite number")?;
                 if gmin < 0. {
@@ -1037,6 +1080,9 @@ impl RunConfig {
                     "vntol" => self.transient.vntol = Some(number),
                     "abstol" => self.transient.abstol = Some(number),
                     "chgtol" => self.transient.chgtol = Some(number),
+                    "lteabstol" => self.transient.voltage_lte.absolute = Some(number),
+                    "ltereltol" => self.transient.voltage_lte.relative = Some(number),
+                    "ltetrtol" => self.transient.voltage_lte.factor = Some(number),
                     _ => self.transient.trtol = Some(number),
                 }
             }
@@ -1226,6 +1272,7 @@ fn accepted(name: &str) -> bool {
                 | "temp"
                 | "tnom"
                 | "gmin"
+                | "gshunt"
                 | "rshunt"
                 | "cshunt"
                 | "pivtol"
@@ -1236,6 +1283,9 @@ fn accepted(name: &str) -> bool {
                 | "chgtol"
                 | "trtol"
                 | "minbreak"
+                | "lteabstol"
+                | "ltereltol"
+                | "ltetrtol"
                 | "method"
                 | "maxord"
                 | "xmu"

@@ -140,6 +140,7 @@ pub struct TransientPlan {
     start: Real,
     max_step: Real,
     minbreak: Real,
+    voltage_lte: Option<crate::analysis::plan::VoltageLte>,
     method: IntegrationMethod,
     max_order: u8,
     tolerances: Tolerances,
@@ -200,6 +201,7 @@ impl TransientPlan {
             start: start_time,
             max_step,
             minbreak: options.minbreak,
+            voltage_lte: options.voltage_lte,
             method: options.method,
             max_order: options.max_order,
             tolerances: Tolerances {
@@ -663,6 +665,90 @@ struct TruncationSlot {
     explicit_derivative: bool,
 }
 
+/// Accepted voltage history used only when newtrunc is requested. Rejected
+/// trials never enter this history. Breakpoint landings start a new predictor
+/// epoch; an algebraic jump must not force an arbitrarily small next step.
+struct VoltageHistory {
+    options: crate::analysis::plan::VoltageLte,
+    rows: Vec<usize>,
+    accepted: std::collections::VecDeque<Vector>,
+}
+
+impl VoltageHistory {
+    fn new(circuit: &Circuit, options: crate::analysis::plan::VoltageLte) -> Self {
+        let rows = circuit
+            .nodes()
+            .nodes()
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    crate::primitives::NodeKind::Terminal | crate::primitives::NodeKind::Internal
+                )
+            })
+            .filter_map(|node| circuit.unknowns().node_row(node.id))
+            .collect();
+        Self {
+            options,
+            rows,
+            accepted: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn accept(&mut self, solution: &Vector, acceptance: Acceptance<'_>) {
+        if matches!(acceptance, Acceptance::Step(attempt) if attempt.boundary == Boundary::Forced) {
+            self.accepted.clear();
+            return;
+        }
+        self.accepted.push_front(solution.clone());
+        self.accepted
+            .truncate(usize::from(IntegrationMethod::MAX_GEAR_ORDER) + 1);
+    }
+
+    fn limit(&self, coefficients: &Coefficients, solution: &Vector) -> SpiceResult<Real> {
+        let order = usize::from(coefficients.order());
+        if self.accepted.len() <= order {
+            return Ok(Real::INFINITY);
+        }
+        let dt = coefficients.dt();
+        let (multiplier, exponent) = match coefficients.method() {
+            IntegrationMethod::Trapezoidal => (2., 1. / Real::from(coefficients.order())),
+            IntegrationMethod::Gear { .. } => {
+                let mut ratio = 0.;
+                for age in 0..=order {
+                    ratio += coefficients
+                        .delta_old(age)
+                        .ok_or_else(|| failure("voltage predictor step history is too short"))?
+                        / dt;
+                }
+                (ratio, 1. / (Real::from(coefficients.order()) + 1.))
+            }
+        };
+        let mut bound = Real::INFINITY;
+        for &row in &self.rows {
+            let mut past = [0.; IntegrationMethod::MAX_GEAR_ORDER as usize + 1];
+            for (value, accepted) in past.iter_mut().zip(&self.accepted) {
+                *value = accepted.as_slice()[row];
+            }
+            let predicted = coefficients.predict(&past[..=order])?;
+            let corrected = solution.as_slice()[row];
+            let error = (corrected - predicted).abs();
+            if error > 0. {
+                let tolerance = self
+                    .options
+                    .relative
+                    .mul_add(corrected.abs().max(predicted.abs()), self.options.absolute);
+                // C CKTtrunc's predictor/corrector voltage bound. Evaluate
+                // the ratio before multiplying by dt; an unbounded proposal
+                // is harmless because the driver already caps growth.
+                let ratio = (tolerance / error) * self.options.factor * multiplier;
+                bound = bound.min(dt * ratio.powf(exponent));
+            }
+        }
+        Ok(bound)
+    }
+}
+
 struct Driver<'a> {
     circuit: &'a Circuit,
     prepared: crate::devices::PreparedRun<'a>,
@@ -683,6 +769,7 @@ struct Driver<'a> {
     /// Each device's state rows and the absolute state index of every
     /// charge it hands `CKTterr` (`truncation_slots`), fixed for the run.
     truncation: Vec<TruncationDevice>,
+    voltage_history: Option<VoltageHistory>,
     stats: TransientStats,
     /// Reuse the ordinary Newton MNA/RHS/trial storage across timepoint
     /// acceptance and rejected smaller-step retries.
@@ -1007,6 +1094,9 @@ fn run_transient_inner(
         branch_row,
         limited_rows,
         truncation,
+        voltage_history: settings
+            .voltage_lte
+            .map(|options| VoltageHistory::new(circuit, options)),
         stats: TransientStats::default(),
         workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
         mixed,
@@ -1478,6 +1568,9 @@ impl Driver<'_> {
             trial,
             &delay,
         )?;
+        if let Some(history) = &mut self.voltage_history {
+            history.accept(solution, acceptance);
+        }
         match acceptance {
             Acceptance::Initial => {}
             Acceptance::Step(attempt) => {
@@ -1726,6 +1819,7 @@ impl Driver<'_> {
             vntol: tolerance.vntol,
             abstol: tolerance.abstol,
             limiting: self.bias.newton.limiting,
+            diag_gmin: self.circuit.continuation_diagonal(),
             ..crate::analysis::newton::NewtonOptions::default()
         };
         // dctran.c: MODEINITTRAN (first step) or MODEINITPRED for the first
@@ -1859,6 +1953,9 @@ impl Driver<'_> {
                 }
             }
         }
+        if let Some(history) = &self.voltage_history {
+            limit = limit.min(history.limit(coefficients, solution)?);
+        }
         if let Some(bound) = self.circuit.delay_timestep_limit(
             &self.history,
             solution,
@@ -1903,6 +2000,7 @@ mod step_control_tests {
             start: 0.,
             max_step: 1.,
             minbreak: 0.,
+            voltage_lte: None,
             max_order: 2,
             method: IntegrationMethod::Trapezoidal,
             xmu: 0.5,

@@ -210,7 +210,7 @@ fn unknown_and_unimplemented_options_fail_with_distinct_exits() {
     let unknown = run_text("unknown", "t\nr1 a 0 1k\n.options bogus=1\n.end\n");
     assert_eq!(unknown.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown option 'bogus'"));
-    let pending = run_text("pending", "t\nr1 a 0 1k\n.options gshunt=1e-12\n.end\n");
+    let pending = run_text("pending", "t\nr1 a 0 1k\n.options oldlimit\n.end\n");
     assert_eq!(pending.status.code(), Some(3));
 }
 
