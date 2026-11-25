@@ -35,48 +35,49 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  strict-rust:
+    name: Shared strict Rust release gate
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
+
   verify:
     name: Release gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - name: Resolve quarantined repository compiler
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+
+      - name: Install pinned nightly Rust
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: ${{ steps.compiler.outputs.channel }}
           components: clippy, rustfmt
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+        with:
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
 
-      - name: Read crate version
+      - name: Read and validate crate version
         id: version
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 --locked \
-            | jq -r '.packages[] | select(.name == "ngspice-rs") | .version')
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Cargo.toml version: $version"
-
-      - name: Check tag matches Cargo.toml
-        if: github.ref_type == 'tag'
+        shell: bash
         env:
-          TAG: ${{ github.ref_name }}
-          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
-          if [ "$TAG" != "v$VERSION" ]; then
-            echo "::error::Tag $TAG does not match Cargo.toml version $VERSION"
-            exit 1
-          fi
+          version=$(bash .github/scripts/release-version.sh "$TAG")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Verify release archive contracts
+        shell: bash
+        run: bash .github/scripts/test-release-package.sh
 
       - name: Run workspace tests and doctests
         run: cargo test --workspace --locked
@@ -92,13 +93,13 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
 
   publish:
     name: Publish to crates.io
-    needs: verify
-    if: github.ref_type == 'tag' || inputs.dry-run == false
-    runs-on: ubuntu-latest
+    needs: [strict-rust, verify]
+    if: (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && inputs.dry-run == false)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment:
       name: crates-io
@@ -108,17 +109,27 @@ jobs:
       id-token: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Resolve quarantined repository compiler
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+
+      - name: Install pinned nightly Rust
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: ${{ steps.compiler.outputs.channel }}
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+        with:
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
 
       - name: Authenticate with crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
 
       - name: Publish ngspice-rs
         run: cargo publish --locked --package ngspice-rs
@@ -127,4 +138,4 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main

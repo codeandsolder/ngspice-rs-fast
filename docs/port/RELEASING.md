@@ -6,16 +6,21 @@
 
 ## What the workflow does
 
-1. **Release gate** (`verify` job, no credentials):
+1. **Shared strict gate** (`strict-rust` job): runs the immutable
+   rust-skills2 workflow against the repository's dated, quarantined nightly.
+2. **Release gate** (`verify` job, no credentials):
    - checks that the pushed tag equals `v` + `version` in `Cargo.toml`;
-   - `cargo fmt --all -- --check`;
-   - `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+   - verifies all five archive layouts and negative tag/target checks;
    - `cargo test --workspace --locked`;
    - `cargo xtask golden verify`;
    - `cargo publish --dry-run --locked`, which builds the packaged crate in
      isolation, then lists the packaged files in the log.
-2. **Publish** (`publish` job): runs only after the gate passes, in the
+3. **Publish** (`publish` job): runs only after both gates pass, in the
    `crates-io` GitHub environment, and uploads with `cargo publish --locked`.
+
+Every compiling job resolves the same repository-pinned nightly through the
+shared 72-hour compiler-age resolver and uses canonical sccache setup and
+finalization.
 
 The opt-in `NGSPICE_BIN` live-C checks are not part of the workflow: CI has no
 C reference build. Run them locally before tagging (see
@@ -35,30 +40,31 @@ attribution files (`COPYING`, `NOTICE`, `AUTHORS`). `conformance/`, `tests/`,
 | Actions → Publish → Run workflow, `dry-run` checked (default) | gate only |
 | Actions → Publish → Run workflow, `dry-run` unchecked | gate, then publish the ref's `Cargo.toml` version |
 
+## Registry dependency prerequisite
+
+The solver consumes the versioned model kernel contract from the preprocessing
+workspace. A Git-only dependency is valid for development and binary release
+builds but is not valid for publishing to crates.io. Before a crate release,
+publish the intended public kernel API package, add its exact compatible
+registry version requirement to the solver dependency, and confirm a locked
+`cargo publish --dry-run --package ngspice-rs` passes. Keep the existing
+independent kernel reference tests and do not bypass Cargo's package check.
+The current Git-only dependency therefore blocks crates.io publication, not
+binary archive packaging.
+
 ## Authentication: crates.io Trusted Publishing
 
 The publish job exchanges a GitHub OIDC token for a short-lived crates.io token
 via `rust-lang/crates-io-auth-action`. No API token is stored in the
 repository.
 
-Trusted Publishing can only be configured for a crate that already exists, so
-the first release is a one-off. `0.1.0` was bootstrapped this way, published
-by hand from the commit that added this workflow; steps 3–5 below still apply
-until they are done.
-
-1. Bump `version` in `Cargo.toml` and run the full local gate.
-2. From a clean checkout of that commit, publish once by hand:
-   `cargo login` with a scoped API token, then `cargo publish --locked`.
-   Tag the commit `vX.Y.Z` afterwards; the tag-triggered run will then fail at
-   upload because the version already exists, which is expected for this
-   release only.
-3. On crates.io → `ngspice-rs` → Settings → Trusted Publishing, add a GitHub
-   publisher: owner `michaelnavazhylau`, repository `ngspice-rs`, workflow
-   `publish.yml`, environment `crates-io`.
-4. Optionally revoke the API token used in step 2.
-5. In GitHub → Settings → Environments, create `crates-io` (the first workflow
-   run also creates it) and add required reviewers if publishes should need
-   approval.
+Before publishing, verify the crate's authorized owner has configured this
+repository's actual publisher identity on crates.io: owner `codeandsolder`,
+repository `ngspice-rs-fast`, workflow `publish.yml`, environment
+`crates-io`. Existing upstream crate ownership does not automatically grant
+a fork permission to publish. Configure the GitHub environment with the
+required reviewers; no persistent registry token is needed for routine
+publication. Do not attempt to republish an existing crate version.
 
 ## Prebuilt binaries and cargo-binstall
 
@@ -66,14 +72,15 @@ The same tag also triggers
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml). It
 builds `spice-rs` in release mode for `x86_64-unknown-linux-musl`,
 `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`
-and `x86_64-pc-windows-msvc`. It then creates the GitHub release for the tag
+and `x86_64-pc-windows-msvc`. Each binary is smoke-tested on its native
+architecture with the pinned compiler and canonical cache. It then creates the GitHub release for the tag
 (with generated notes) and attaches the archives and a `SHA256SUMS` file:
 
 ```
 ngspice-rs-<target>-v<version>.tar.gz      (.zip for Windows)
 └── ngspice-rs-<target>-v<version>/
     ├── spice-rs                            (spice-rs.exe on Windows)
-    └── README.md, COPYING, NOTICE, AUTHORS
+    └── README.md, COPYING, NOTICE, AUTHORS, LICENSE-ECL-2.0
 ```
 
 `[package.metadata.binstall]` in `Cargo.toml` points `cargo binstall
@@ -82,12 +89,15 @@ builds. binstall reads that metadata from the version published on crates.io,
 so the names in the workflow and the manifest must change together. The
 binaries job is independent of the crates.io publish job and needs no approval.
 
-To rebuild or backfill the binaries for an existing tag, run *Release
-binaries* by hand with that tag; existing assets are replaced.
+To rebuild binaries for a tag containing the current release scripts and dated
+nightly pin, run *Release binaries* by hand with that tag; existing assets
+are replaced. Old tags without those contracts are not supported by the
+current workflow.
 
 ## Cutting a release
 
-1. Bump `version` in `Cargo.toml`, run `cargo update --workspace` so
+1. Resolve the registry dependency prerequisite, then bump `version` in
+   `Cargo.toml`, run `cargo update --workspace` so
    `Cargo.lock` records it, and run the local gate, including the
    `NGSPICE_BIN` live-C checks.
 2. Merge the bump to `main`.

@@ -43,34 +43,38 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
-            runner: macos-latest
+            runner: macos-15-intel
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: macos-15
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            runner: windows-2025
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - name: Check out tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.TAG }}
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Resolve quarantined repository compiler
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+
+      - name: Install pinned nightly Rust
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: ${{ steps.compiler.outputs.channel }}
           targets: ${{ matrix.target }}
 
-      - name: Add target to the pinned toolchain
-        shell: bash
-        run: rustup target add ${{ matrix.target }}
-
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+        with:
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
 
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
@@ -78,45 +82,31 @@ jobs:
 
       - name: Check tag matches Cargo.toml
         shell: bash
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 --locked \
-            | jq -r '.packages[] | select(.name == "ngspice-rs") | .version')
-          if [ "$TAG" != "v$version" ]; then
-            echo "::error::Tag $TAG does not match Cargo.toml version $version"
-            exit 1
-          fi
+        run: bash .github/scripts/release-version.sh "$TAG"
 
       - name: Build spice-rs
         run: cargo build --release --locked --package ngspice-rs --bin spice-rs --target ${{ matrix.target }}
 
+      - name: Smoke-test the native binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          ext=""
+          if [[ "$TARGET" == *windows* ]]; then ext=".exe"; fi
+          "target/$TARGET/release/spice-rs$ext" devices
+
       - name: Package archive
         id: package
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          name="ngspice-rs-${{ matrix.target }}-${TAG}"
-          mkdir "$name"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cp "target/${{ matrix.target }}/release/spice-rs.exe" "$name/"
-            cp README.md COPYING NOTICE AUTHORS "$name/"
-            7z a -tzip "$name.zip" "$name" > /dev/null
-            archive="$name.zip"
-          else
-            cp "target/${{ matrix.target }}/release/spice-rs" "$name/"
-            cp README.md COPYING NOTICE AUTHORS "$name/"
-            tar -czf "$name.tar.gz" "$name"
-            archive="$name.tar.gz"
-          fi
+          archive=$(bash .github/scripts/package-release.sh "$TARGET" "$TAG" target dist)
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
-      - name: Smoke-test the binary
-        if: matrix.target != 'x86_64-apple-darwin'
-        shell: bash
-        run: |
-          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
-          "target/${{ matrix.target }}/release/spice-rs$ext" devices
-
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.target }}
           path: ${{ steps.package.outputs.archive }}
@@ -124,18 +114,18 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@fc863c02d1980c382a0d253a52f4d0cce6b50514 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
 
   release:
     name: Attach to GitHub release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
       - name: Download archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
