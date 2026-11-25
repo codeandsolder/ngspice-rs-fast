@@ -20,7 +20,7 @@ pub struct FactorStorage {
 
 impl FactorStorage {
     /// Slots initially created by elimination rather than assembly.
-    #[must_use]
+    #[must_use = "the returned count quantifies structural fill created during elimination"]
     pub const fn fill_entries(self) -> usize {
         self.factor_entries - self.original_entries
     }

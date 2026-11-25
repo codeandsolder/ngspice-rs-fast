@@ -43,7 +43,7 @@ pub struct ChargeHistory {
 
 impl ChargeHistory {
     /// A history holding only the present charge.
-    #[must_use]
+    #[must_use = "the new charge history must be retained to integrate from the present charge"]
     pub const fn new(present: Real) -> Self {
         let mut values = [0.0; IntegrationMethod::MAX_GEAR_ORDER as usize + 1];
         values[0] = present;
@@ -97,7 +97,7 @@ impl IntegrationMethod {
     /// True when this method/order is representable, not proof that its
     /// coefficient/history operations are implemented. See
     /// [`Self::validate_runtime`].
-    #[must_use]
+    #[must_use = "discarding the result leaves unsupported integration orders undetected"]
     pub const fn is_valid(self) -> bool {
         match self {
             Self::Trapezoidal => true,
@@ -107,7 +107,7 @@ impl IntegrationMethod {
 
     /// The highest order this method may run at: 2 for trapezoidal, the
     /// configured order for Gear.
-    #[must_use]
+    #[must_use = "the returned order bounds the integration rule's supported trials"]
     pub const fn max_order(self) -> u8 {
         match self {
             Self::Trapezoidal => 2,
@@ -139,7 +139,7 @@ impl IntegrationMethod {
     }
 
     /// The name used by `.option method=`.
-    #[must_use]
+    #[must_use = "the returned name identifies the integration rule in option syntax"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Trapezoidal => "trap",
@@ -148,7 +148,7 @@ impl IntegrationMethod {
     }
 
     /// Parses `.option method=trap|gear` together with `maxord`.
-    #[must_use]
+    #[must_use = "the result identifies the requested integration method or an unsupported name"]
     pub const fn parse(name: &str, gear_order: u8) -> Option<Self> {
         if name.eq_ignore_ascii_case("trap") || name.eq_ignore_ascii_case("trapezoidal") {
             Some(Self::Trapezoidal)
@@ -223,7 +223,7 @@ pub struct StepHistory {
 
 impl StepHistory {
     /// A history with no accepted steps.
-    #[must_use]
+    #[must_use = "the new step history must be retained to accumulate accepted step sizes"]
     pub const fn new() -> Self {
         Self {
             accepted: [0.0; HISTORY_LEN],
@@ -239,7 +239,7 @@ impl StepHistory {
     /// may then run at an order above the number of accepted steps, exactly as
     /// `dctran.c` probes order 2 on its second step); coefficients and
     /// prediction still require real accepted steps.
-    #[must_use]
+    #[must_use = "the returned history carries the requested initial placeholder for order selection"]
     pub const fn with_fill(fill: Real) -> Self {
         Self {
             accepted: [0.0; HISTORY_LEN],
@@ -249,19 +249,19 @@ impl StepHistory {
     }
 
     /// Accepted step sizes, most recent first.
-    #[must_use]
+    #[must_use = "the returned accepted-step sequence supplies the actual integration history"]
     pub fn accepted(&self) -> &[Real] {
         &self.accepted[..self.len]
     }
 
     /// The number of retained accepted steps.
-    #[must_use]
+    #[must_use = "the number of accepted steps determines how much real history is available"]
     pub const fn len(&self) -> usize {
         self.len
     }
 
     /// True before any step was accepted.
-    #[must_use]
+    #[must_use = "the result distinguishes initialization from a history with accepted steps"]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -269,7 +269,7 @@ impl StepHistory {
     /// The highest order `method` can use for a trial right now. Gear order
     /// `k` needs `k - 1` previous steps; trapezoidal order 2 needs a previous
     /// derivative, which exists once one step was accepted.
-    #[must_use]
+    #[must_use = "the returned order bounds trials by the actual accepted history"]
     pub fn available_order(&self, method: IntegrationMethod) -> u8 {
         let by_history = u8::try_from(self.len + 1).unwrap_or(u8::MAX);
         method
@@ -681,19 +681,19 @@ impl ScaledReal {
 
 impl Coefficients {
     /// The integration rule.
-    #[must_use]
+    #[must_use = "the returned rule determines how these integration coefficients must be interpreted"]
     pub const fn method(&self) -> IntegrationMethod {
         self.method
     }
 
     /// The order of this trial.
-    #[must_use]
+    #[must_use = "the returned trial order determines the number of active integration coefficients"]
     pub const fn order(&self) -> u8 {
         self.order
     }
 
     /// The trial step size.
-    #[must_use]
+    #[must_use = "the returned trial step size is needed to interpret the integration coefficients"]
     pub const fn dt(&self) -> Real {
         self.deltas[0]
     }
@@ -701,13 +701,13 @@ impl Coefficients {
     /// C `CKTdeltaOld[index]`: index 0 is the trial step (`CKTdelta`), 1 the
     /// last accepted step, and so on. Unfilled older slots hold zero,
     /// or the configured placeholder; `None` beyond the retained capacity.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a retained step slot from an unavailable index"]
     pub fn delta_old(&self, index: usize) -> Option<Real> {
         self.deltas.get(index).copied()
     }
 
     /// The corrector coefficients `ag[0..=order]` (C `CKTag`).
-    #[must_use]
+    #[must_use = "the returned corrector coefficients are needed for the derivative and companion stamp"]
     pub fn ag(&self) -> &[Real] {
         &self.ag[..=usize::from(self.order)]
     }
@@ -715,7 +715,7 @@ impl Coefficients {
     /// Number of accepted charge values [`Self::integrate`] reads after the
     /// trial one: the order for Gear and trapezoidal order 1, one for
     /// trapezoidal order 2.
-    #[must_use]
+    #[must_use = "the returned length determines how many past charges the trial requires"]
     #[inline]
     pub fn charge_history_len(&self) -> usize {
         if self.needs_previous_derivative() {
@@ -726,7 +726,7 @@ impl Coefficients {
     }
 
     /// True when [`Self::integrate`] needs the previous accepted derivative.
-    #[must_use]
+    #[must_use = "the result determines whether the previous accepted derivative is required"]
     #[inline]
     pub const fn needs_previous_derivative(&self) -> bool {
         matches!(self.method, IntegrationMethod::Trapezoidal) && self.order == 2
@@ -855,7 +855,7 @@ impl Coefficients {
     }
 
     /// `CKTdelta / CKTdeltaOld[1]`, the ratio `DEVpred` extrapolates with.
-    #[must_use]
+    #[must_use = "the returned ratio controls extrapolation from the previous accepted step"]
     pub fn predictor_ratio(&self) -> Real {
         self.deltas[0] / self.deltas[1]
     }

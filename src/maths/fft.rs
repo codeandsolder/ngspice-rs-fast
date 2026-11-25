@@ -228,13 +228,13 @@ impl FftPlan {
     }
 
     /// Exact number of input/output samples.
-    #[must_use]
+    #[must_use = "the exact transform length is needed to size the input and output"]
     pub const fn length(&self) -> usize {
         self.shape.length
     }
 
     /// Number of complex scratch cells required for every execution.
-    #[must_use]
+    #[must_use = "the returned length is required to allocate sufficient execution scratch space"]
     pub const fn scratch_length(&self) -> usize {
         if self.shape.is_direct() {
             0

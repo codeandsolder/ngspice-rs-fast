@@ -1004,19 +1004,19 @@ impl SparseLu {
     }
 
     /// Actual structural and numeric storage in this immutable factor snapshot.
-    #[must_use]
+    #[must_use = "the returned storage counts quantify the immutable real factor snapshot"]
     pub fn factor_storage(&self) -> FactorStorage {
         self.symbolic.sparse.storage()
     }
 
     /// Actual factor work that produced this snapshot, including any immediate retry.
-    #[must_use]
+    #[must_use = "the returned work includes the factorization and any immediate retry"]
     pub const fn factor_work(&self) -> FactorWork {
         self.work
     }
 
     /// Pivot order for subsequent identical-pattern assemblies.
-    #[must_use]
+    #[must_use = "retaining the pivot order enables reuse for subsequent identical-pattern assemblies"]
     pub const fn symbolic(&self) -> &SparseSymbolic {
         &self.symbolic
     }

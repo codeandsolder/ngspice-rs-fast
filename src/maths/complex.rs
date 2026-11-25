@@ -62,7 +62,7 @@ impl PartialEq for DynamicGroups {
 
 impl DynamicGroups {
     /// Construct an empty group arena without allocation.
-    #[must_use]
+    #[must_use = "the new group arena must be retained to record dynamic stamp terms"]
     pub const fn new() -> Self {
         Self {
             groups: Vec::new(),
@@ -72,25 +72,25 @@ impl DynamicGroups {
     }
 
     /// No groups means ordinary ungrouped stamp arithmetic applies.
-    #[must_use]
+    #[must_use = "the result selects whether grouped stamp arithmetic is required"]
     pub const fn is_empty(&self) -> bool {
         self.groups.is_empty()
     }
 
     /// Number of groups, not individual capacitance terms.
-    #[must_use]
+    #[must_use = "the count measures groups rather than individual stamp terms"]
     pub const fn len(&self) -> usize {
         self.groups.len()
     }
 
     /// Reserved term-arena capacity, retained across assembly resets.
-    #[must_use]
+    #[must_use = "the capacity measures reusable term storage across assemblies"]
     pub const fn term_capacity(&self) -> usize {
         self.terms.capacity()
     }
 
     /// Reserved descriptor capacity, retained across resets.
-    #[must_use]
+    #[must_use = "the capacity measures reusable group storage across assemblies"]
     pub const fn group_capacity(&self) -> usize {
         self.groups.capacity()
     }
@@ -932,13 +932,13 @@ pub struct ComplexLu {
 }
 impl ComplexLu {
     /// Actual structural and numeric storage in this immutable factor snapshot.
-    #[must_use]
+    #[must_use = "the returned storage counts quantify this factor snapshot's memory footprint"]
     pub fn factor_storage(&self) -> FactorStorage {
         self.factors.sparse.storage()
     }
 
     /// Actual work of the operation producing this snapshot.
-    #[must_use]
+    #[must_use = "the returned counters describe the work that produced this factor snapshot"]
     pub const fn factor_work(&self) -> FactorWork {
         self.factors.work
     }
