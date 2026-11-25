@@ -84,3 +84,26 @@ require checked CPU fallback rather than silent approximate results.
 A full comparison needs matrix assembly, device physics, factor/solve,
 objective extraction, pipeline amortization and transfer cost in its
 end-to-end accounting. The default analysis remains scalar.
+
+## Physically assembled CPU measurements (2026-11-25)
+
+Pinned nightly, release profile, native Renoir host CPU, seven-trial
+medians under concurrent build load. The values compare API-level
+factor/solve only, not necessarily SIMD execution of every lane.
+
+| Circuit unknowns | Frequencies | Scalar (ms) | Independent batch (ms) |
+| ---: | ---: | ---: | ---: |
+| 24 | 64 | 0.665 | 0.268 |
+| 24 | 256 | 1.261 | 1.108 |
+| 24 | 1024 | 5.029 | 7.611 |
+| 24 | 4096 | 22.929 | 23.338 |
+| 178 | 64 | 2.836 | 2.964 |
+| 178 | 256 | 18.370 | 14.235 |
+| 178 | 1024 | 50.138 | 101.338 |
+| 178 | 4096 | 310.394 | 289.691 |
+
+Both APIs produced identical coordinates in these runs, with worst
+componentwise physical-stamp backward error 6.057e-12. The separate
+closed-form series-RL/parallel-RC transfer test passed as well. No
+consistent CPU batch crossover was established; this is an appropriate
+reference for future physical GPU experiments, not a GPU measurement.
