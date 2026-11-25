@@ -99,7 +99,7 @@ pub enum DotCommand {
 
 impl DotCommand {
     /// Classifies a `.` command, with or without its dot, case-insensitively.
-    #[must_use]
+    #[must_use = "the classification determines how the directive is interpreted"]
     pub fn parse(name: &str) -> Self {
         let name = name.strip_prefix('.').unwrap_or(name);
         if let Some(kind) = AnalysisKind::parse(name) {
@@ -142,13 +142,13 @@ impl DotCommand {
     }
 
     /// True for the analysis cards.
-    #[must_use]
+    #[must_use = "the predicate distinguishes analysis requests from other directives"]
     pub const fn is_analysis(&self) -> bool {
         matches!(self, Self::Analysis(_))
     }
 
     /// The analysis this card requests, if any.
-    #[must_use]
+    #[must_use = "the returned kind selects the requested analysis"]
     pub const fn analysis(&self) -> Option<AnalysisKind> {
         match self {
             Self::Analysis(kind) => Some(*kind),
@@ -157,7 +157,7 @@ impl DotCommand {
     }
 
     /// The card name including its leading dot, e.g. `".tran"`.
-    #[must_use]
+    #[must_use = "the returned spelling identifies the directive in diagnostics"]
     pub fn card_name(&self) -> String {
         match self {
             Self::Analysis(kind) => format!(".{}", kind.as_str()),
@@ -225,7 +225,7 @@ pub enum CardKind {
 
 impl CardKind {
     /// Classifies a first token.
-    #[must_use]
+    #[must_use = "the classification determines whether the card is a directive or device"]
     pub fn classify(first: &Token) -> Self {
         if first.text.starts_with('.') {
             return Self::DotCommand(DotCommand::parse(&first.text));
@@ -245,13 +245,13 @@ impl CardKind {
     }
 
     /// True for a `.` command.
-    #[must_use]
+    #[must_use = "the predicate determines whether directive handling is required"]
     pub const fn is_dot_command(&self) -> bool {
         matches!(self, Self::DotCommand(_))
     }
 
     /// True for a device instance.
-    #[must_use]
+    #[must_use = "the predicate determines whether device parsing is required"]
     pub const fn is_device(&self) -> bool {
         matches!(self, Self::Device { .. })
     }
@@ -301,19 +301,19 @@ impl RawCard {
     }
 
     /// The card's first token.
-    #[must_use]
+    #[must_use = "the first token identifies the card designator or directive"]
     pub fn first_token(&self) -> Option<&Token> {
         self.tokens.first()
     }
 
     /// Every token except the first.
-    #[must_use]
+    #[must_use = "the slice contains the arguments following the card name"]
     pub fn arguments(&self) -> &[Token] {
         self.tokens.get(1..).unwrap_or_default()
     }
 
     /// The designator letter, for a device card.
-    #[must_use]
+    #[must_use = "the returned letter selects the device parser"]
     pub const fn designator(&self) -> Option<char> {
         match self.kind {
             CardKind::Device { designator } => Some(designator),
@@ -322,7 +322,7 @@ impl RawCard {
     }
 
     /// The `.` command, for a directive card.
-    #[must_use]
+    #[must_use = "the returned command identifies the directive semantics"]
     pub const fn dot_command(&self) -> Option<&DotCommand> {
         match &self.kind {
             CardKind::DotCommand(command) => Some(command),
@@ -331,7 +331,7 @@ impl RawCard {
     }
 
     /// The analysis this card requests, if any.
-    #[must_use]
+    #[must_use = "the returned analysis kind determines the requested simulation"]
     pub fn analysis(&self) -> Option<AnalysisKind> {
         self.dot_command().and_then(DotCommand::analysis)
     }

@@ -99,7 +99,7 @@ pub struct ParsedDeck {
 
 impl Parser {
     /// A parser with ngspice's default behaviour, where `gnd` means ground.
-    #[must_use]
+    #[must_use = "the returned parser establishes the default ground-alias policy"]
     pub const fn new() -> Self {
         Self { auto_gnd: true }
     }
@@ -108,13 +108,13 @@ impl Parser {
     ///
     /// `auto_gnd == false` matches ngspice with `no_auto_gnd` set, where `gnd`
     /// is an ordinary node.
-    #[must_use]
+    #[must_use = "the returned parser establishes the requested ground-alias policy"]
     pub const fn with_auto_gnd(auto_gnd: bool) -> Self {
         Self { auto_gnd }
     }
 
     /// Whether `gnd` is aliased to node `0`.
-    #[must_use]
+    #[must_use = "the predicate determines whether gnd is interpreted as node zero"]
     pub const fn auto_gnd(self) -> bool {
         self.auto_gnd
     }

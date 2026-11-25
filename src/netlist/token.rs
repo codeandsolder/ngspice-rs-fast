@@ -47,7 +47,7 @@ pub enum TokenKind<S = String> {
 
 impl<S> TokenKind<S> {
     /// A short human-readable name, for diagnostics and the CLI's token dump.
-    #[must_use]
+    #[must_use = "the returned name identifies the token category in diagnostics"]
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Word => "word",
@@ -128,7 +128,7 @@ impl Token {
     }
 
     /// The value, when this token is a number.
-    #[must_use]
+    #[must_use = "the optional value distinguishes parsed numeric tokens from other kinds"]
     pub const fn number(&self) -> Option<Real> {
         match self.kind {
             TokenKind::Number(value) => Some(value),
@@ -137,14 +137,14 @@ impl Token {
     }
 
     /// Compares the token's spelling to a keyword, case-insensitively.
-    #[must_use]
+    #[must_use = "the predicate determines whether the token matches the requested keyword"]
     pub fn is_keyword(&self, keyword: &str) -> bool {
         self.text.eq_ignore_ascii_case(keyword)
     }
 
     /// True when the token is a word or a number, i.e. something that can be
     /// used as a name.
-    #[must_use]
+    #[must_use = "the predicate determines whether the token can serve as a name"]
     pub const fn is_name_like(&self) -> bool {
         matches!(self.kind, TokenKind::Word | TokenKind::Number(_))
     }

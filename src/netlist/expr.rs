@@ -59,7 +59,7 @@ impl SourceSpan {
     }
 
     /// The byte range relative to the containing span, for slicing its text.
-    #[must_use]
+    #[must_use = "the returned range locates the expression within its containing text"]
     pub fn relative_to(&self, container: &Self) -> Option<std::ops::Range<usize>> {
         let start = self.logical.start.checked_sub(container.logical.start)?;
         let end = self.logical.end.checked_sub(container.logical.start)?;
@@ -67,13 +67,13 @@ impl SourceSpan {
     }
 
     /// Span length in bytes.
-    #[must_use]
+    #[must_use = "the length bounds the source span in bytes"]
     pub const fn len(&self) -> usize {
         self.logical.end - self.logical.start
     }
 
     /// True when the span covers no bytes.
-    #[must_use]
+    #[must_use = "the predicate determines whether the span covers any source bytes"]
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -103,7 +103,7 @@ pub struct ParameterExpression {
 impl ParameterExpression {
     /// The expression as written, delimiters included: `{text}`, `'text'` or
     /// the bare text.
-    #[must_use]
+    #[must_use = "the returned spelling preserves the original expression delimiters"]
     pub fn spelling(&self) -> String {
         if self.quoted {
             format!("'{}'", self.text)
@@ -116,7 +116,7 @@ impl ParameterExpression {
 
     /// Names referenced by the expression, lowercased, in source order with
     /// duplicates kept. Function names are not references.
-    #[must_use]
+    #[must_use = "the list identifies parameter dependencies in source order"]
     pub fn references(&self) -> Vec<&str> {
         self.root
             .preorder()
@@ -336,7 +336,7 @@ macro_rules! functions {
             pub const ALL: &'static [Function] = &[$(Self::$variant,)*];
 
             /// Looks a function up by (case-insensitive) name.
-            #[must_use]
+            #[must_use = "the lookup result identifies the supported intrinsic function"]
             pub fn from_name(name: &str) -> Option<Self> {
                 match name.to_ascii_lowercase().as_str() {
                     $($name => Some(Self::$variant),)*
@@ -345,7 +345,7 @@ macro_rules! functions {
             }
 
             /// Canonical lowercase name.
-            #[must_use]
+            #[must_use = "the name is the canonical intrinsic function spelling"]
             pub const fn name(self) -> &'static str {
                 match self {
                     $(Self::$variant => $name,)*
@@ -353,7 +353,7 @@ macro_rules! functions {
             }
 
             /// Required argument count: 2 for `pow`/`pwr`/`max`/`min`, else 1.
-            #[must_use]
+            #[must_use = "the returned arity determines the required argument count"]
             pub const fn arity(self) -> usize {
                 match self {
                     $(Self::$variant => $arity,)*

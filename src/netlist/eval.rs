@@ -108,19 +108,19 @@ pub struct EvalBudget {
 
 impl EvalBudget {
     /// A fresh budget.
-    #[must_use]
+    #[must_use = "the new budget tracks expression evaluation against the supplied limits"]
     pub const fn new(limits: EvalLimits) -> Self {
         Self { limits, nodes: 0 }
     }
 
     /// Expression nodes evaluated so far.
-    #[must_use]
+    #[must_use = "the count records work consumed by expression evaluation"]
     pub const fn nodes_used(&self) -> usize {
         self.nodes
     }
 
     /// The limits in force.
-    #[must_use]
+    #[must_use = "the returned limits govern evaluation resource bounds"]
     pub const fn limits(&self) -> EvalLimits {
         self.limits
     }
@@ -804,25 +804,25 @@ impl ParamScope {
     }
 
     /// The `.func` definitions visible in this scope, if any.
-    #[must_use]
+    #[must_use = "the returned function environment determines visible function definitions"]
     pub const fn functions(&self) -> Option<&Arc<FunctionScope>> {
         self.functions.as_ref()
     }
 
     /// Every definition and binding in order, duplicates included.
-    #[must_use]
+    #[must_use = "the entries preserve ordered bindings including superseded declarations"]
     pub fn entries(&self) -> &[ParamEntry] {
         &self.entries
     }
 
     /// The enclosing scope, if any.
-    #[must_use]
+    #[must_use = "the parent identifies the enclosing parameter scope"]
     pub const fn parent(&self) -> Option<&Arc<Self>> {
         self.parent.as_ref()
     }
 
     /// The value of `name` (case-insensitive), searching enclosing scopes.
-    #[must_use]
+    #[must_use = "the lookup result supplies the resolved parameter value"]
     pub fn get(&self, name: &str) -> Option<Real> {
         let key = folded(name);
         let mut scope = self;
@@ -1025,20 +1025,20 @@ impl FunctionScope {
     }
 
     /// Every definition of this scope in deck order, superseded ones included.
-    #[must_use]
+    #[must_use = "the definitions preserve source order including superseded functions"]
     pub fn definitions(&self) -> &[FunctionDef] {
         &self.definitions
     }
 
     /// The enclosing scope, if any.
-    #[must_use]
+    #[must_use = "the parent identifies the enclosing function scope"]
     pub const fn parent(&self) -> Option<&Arc<Self>> {
         self.parent.as_ref()
     }
 
     /// The definition `name` (case-insensitive) resolves to, searching
     /// enclosing scopes, with the scope it was defined in.
-    #[must_use]
+    #[must_use = "the lookup result supplies the function and its defining lexical scope"]
     pub fn get(&self, name: &str) -> Option<(&FunctionDef, &Self)> {
         let key = folded(name);
         let mut scope = self;
