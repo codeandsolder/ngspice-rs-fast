@@ -46,6 +46,7 @@ enum EquationOrigin<'a> {
     Branch(AbsoluteRow),
     Capacitor(&'a str),
     Charge(&'a str),
+    ChargeLaw(&'a str),
     Derived(AbsoluteRow),
 }
 
@@ -178,6 +179,12 @@ impl<'a> InstantaneousSystem<'a> {
         let mut equations = Vec::new();
         let mut bindings = Vec::with_capacity(unknowns);
         let mut variables = 0;
+        let charge_laws: std::collections::BTreeMap<_, _> = storage
+            .charges
+            .values()
+            .filter(|charge| charge.policy == InitialStoragePolicy::Physical)
+            .map(|charge| (charge.gauge, charge.name.as_str()))
+            .collect();
         for (row, &kind) in is_branch.iter().enumerate() {
             let absolute = AbsoluteRow(row);
             let variable = if let Some(fixed) = storage.fixed_coordinates.get(&absolute) {
@@ -196,6 +203,8 @@ impl<'a> InstantaneousSystem<'a> {
                         InitialStoragePolicy::Physical => EquationOrigin::Charge(&charge.name),
                         InitialStoragePolicy::Derived => EquationOrigin::Derived(absolute),
                     }
+                } else if let Some(&name) = charge_laws.get(&absolute) {
+                    EquationOrigin::ChargeLaw(name)
                 } else if kind {
                     EquationOrigin::Branch(absolute)
                 } else {
@@ -322,7 +331,7 @@ impl<'a> InstantaneousSystem<'a> {
             let absolute = match equation.origin {
                 EquationOrigin::Node(_) => tolerance.abstol,
                 EquationOrigin::Branch(_) | EquationOrigin::Capacitor(_) => tolerance.vntol,
-                EquationOrigin::Charge(_) => tolerance.chgtol,
+                EquationOrigin::Charge(_) | EquationOrigin::ChargeLaw(_) => tolerance.chgtol,
                 EquationOrigin::Derived(_) => tolerance.vntol,
             };
             let relative_limit = tolerance.reltol * equation.scale;
@@ -334,7 +343,9 @@ impl<'a> InstantaneousSystem<'a> {
                     EquationOrigin::Capacitor(name) => {
                         format!("voltage relation of capacitor {name}")
                     }
-                    EquationOrigin::Charge(name) => format!("charge relation of {name}"),
+                    EquationOrigin::Charge(name) | EquationOrigin::ChargeLaw(name) => {
+                        format!("charge relation of {name}")
+                    }
                     EquationOrigin::Derived(row) => format!("derived storage of {}", names[row.0]),
                 };
                 let mut fixed = equation.fixed.clone();
@@ -411,7 +422,7 @@ impl<'a> InstantaneousSystem<'a> {
             let absolute = match eq.origin {
                 EquationOrigin::Node(_) => tolerance.abstol,
                 EquationOrigin::Branch(_) | EquationOrigin::Capacitor(_) => tolerance.vntol,
-                EquationOrigin::Charge(_) => tolerance.chgtol,
+                EquationOrigin::Charge(_) | EquationOrigin::ChargeLaw(_) => tolerance.chgtol,
                 EquationOrigin::Derived(_) => tolerance.vntol,
             };
             if !residual.is_finite() || !scale.is_finite() {

@@ -503,3 +503,91 @@ fn signed_differential_coefficients_are_not_clamped() -> SpiceResult<()> {
     close(plot.value("i(vl)", 0).unwrap().im, expected, 1e-12);
     Ok(())
 }
+
+#[test]
+fn controlled_nonlinear_charge_preserves_history_through_stiff_transition() -> SpiceResult<()> {
+    let deck = ".options reltol=1e-8 abstol=1e-12 vntol=1e-9\n\
+        vctrl ctrl 0 PWL(0 0 0.5m 0 0.500001m 1 2m 1)\n\
+        r1 out 0 1k\n\
+        c1 out 0 q={1u*(v(out)-v(ctrl)+0.5*(v(out)-v(ctrl))^3)}";
+    let start = 0.5e-3;
+    let end = 0.500_001e-3;
+    // After the ramp, dq/dv = 1 uF * (1 + 1.5*(v-1)^2).
+    // Integrate dq/dt = -v/R analytically.
+    let primitive = |v: f64| 2.5 * v.ln() - 3. * v + 0.75 * v * v;
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            deck,
+            AnalysisKind::Transient,
+            &["1u", "2m", "0", "1u", method],
+        )?;
+        let mut start_seen = false;
+        let mut edge = None;
+        let mut previous = (0., 0.);
+        let mut integral = 0.;
+        let mut max_balance: f64 = 0.;
+        let mut max_kcl: f64 = 0.;
+        let mut max_decay: f64 = 0.;
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            let v = plot.value("v(out)", index).unwrap().re;
+            let control = plot.value("v(ctrl)", index).unwrap().re;
+            let current = plot.value("i(c1)", index).unwrap().re;
+            let u = v - control;
+            let charge = 1e-6 * (u + 0.5 * u.powi(3));
+            integral += 0.5e-3 * (v + previous.1) * (t - previous.0);
+            previous = (t, v);
+            max_balance = max_balance.max((charge + integral).abs());
+            max_kcl = max_kcl.max((current + v / 1000.).abs());
+            start_seen |= (t - start).abs() < 1e-15;
+            if (t - end).abs() < 1e-15 {
+                close(v, 1., 1.1e-6);
+                edge = Some(primitive(v));
+            }
+            if t > end + 1e-15 {
+                let initial = edge.expect("accepted control ramp endpoint");
+                max_decay = max_decay.max((primitive(v) - initial + (t - end) / 1e-3).abs());
+            }
+        }
+        assert!(start_seen && edge.is_some());
+        eprintln!(
+            "{method}: {} points, KCL {max_kcl:e} A, charge balance {max_balance:e} C, decay {max_decay:e}",
+            plot.point_count()
+        );
+        assert!(max_kcl < 2e-11);
+        assert!(max_balance < 5e-10);
+        assert!(max_decay < 2e-5);
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_charge_coordinate_is_physical_in_dc_and_ac() -> SpiceResult<()> {
+    let body = "vdrive a 0 dc 2 ac 1\nvref b 0 dc 1\nc1 a b q={1u*(v(a,b)+v(a,b)^2)}";
+    let op = run(body, AnalysisKind::OperatingPoint, &[])?;
+    close(op.value("q(c1)", 0).unwrap().re, 2e-6, 1e-15);
+    let ac = run(body, AnalysisKind::Ac, &["lin", "1", "1000", "1000"])?;
+    let charge = ac.value("q(c1)", 0).unwrap();
+    let current = ac.value("i(c1)", 0).unwrap();
+    close(charge.re, 3e-6, 1e-15);
+    close(charge.im, 0., 1e-15);
+    close(
+        current.re,
+        -std::f64::consts::TAU * 1000. * charge.im,
+        1e-12,
+    );
+    close(current.im, std::f64::consts::TAU * 1000. * charge.re, 1e-12);
+    Ok(())
+}
+
+#[test]
+fn initial_charge_law_uses_charge_not_voltage_tolerance() {
+    let error = run(
+        "v1 a 0 2\nc1 a 0 q={1p*v(a)^2} ic=1",
+        AnalysisKind::Transient,
+        &["1u", "2u", "0", "1u", "uic"],
+    )
+    .expect_err("picocoulomb inconsistency exceeds the charge tolerance")
+    .to_string();
+    assert!(error.contains("c1") && error.contains("initial"), "{error}");
+}

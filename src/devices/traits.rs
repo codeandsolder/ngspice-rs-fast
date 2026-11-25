@@ -137,6 +137,10 @@ pub enum BranchQuantity {
     VoltageRate,
     /// Differential inductor current rate.
     CurrentRate,
+    /// Explicit physical charge coordinate.
+    Charge,
+    /// Stored input of a differentiator (arbitrary expression units).
+    ExpressionState,
     /// Normalized transfer state driven by a voltage input.
     VoltageState(usize),
     /// Normalized transfer state driven by a current input.
@@ -153,6 +157,8 @@ impl BranchQuantity {
             Self::Current => (format!("i({name})"), "current"),
             Self::VoltageRate => (format!("dvdt({name})"), "voltage/s"),
             Self::CurrentRate => (format!("didt({name})"), "current/s"),
+            Self::Charge => (format!("q({name})"), "charge"),
+            Self::ExpressionState => (format!("state({name},0)"), "unknown"),
             Self::VoltageState(index) => (format!("state({name},{index})"), "voltage"),
             Self::CurrentState(index) => (format!("state({name},{index})"), "current"),
             Self::InputCurrent => (format!("i({name}:input)"), "current"),
@@ -237,10 +243,12 @@ pub enum InitialStoragePolicy {
 pub struct InitialExpressionStorage {
     /// Local history slot containing the signed stored expression.
     pub slot: usize,
-    /// Equation normally evolving the stored expression.
+    /// Private storage coordinate and its two-term linear evolution row.
+    /// The only other coordinate in that row is the derivative output.
     pub equation: InitialStorageRow,
-    /// Free current or derivative-output coordinate. A rank completion
-    /// may select zero only when the retained constraints do not determine it.
+    /// Free current or derivative-output coordinate, whose own row holds
+    /// the constitutive storage law. A rank completion may select zero
+    /// only when the retained constraints do not determine it.
     pub gauge: InitialStorageRow,
     /// Optional initial terminal voltage used to evaluate physical charge.
     pub voltage: Option<Real>,
@@ -569,6 +577,10 @@ pub struct ConvergenceContext<'a> {
     pub integration: Option<&'a Coefficients>,
     /// This device's slots of the last load's trial (C `CKTstate0`).
     pub states: &'a [Real],
+    /// Accepted state revision corresponding to the trial.
+    pub history: &'a crate::devices::StateHistory,
+    /// Range of this device's state in an accepted vector.
+    pub state_range: Range<usize>,
     /// The Newton phase of the last load (C's `MODEINITF` bits when
     /// `NIconvTest` runs, which `NIiter` does in `MODEINITFIX` as well as
     /// `MODEINITFLOAT`).
@@ -586,6 +598,16 @@ pub struct ConvergenceContext<'a> {
 }
 
 impl ConvergenceContext<'_> {
+    /// A device-local accepted state value, age one being the latest.
+    #[must_use]
+    pub fn accepted(&self, age: usize, slot: usize) -> Option<Real> {
+        self.history
+            .accepted(age)?
+            .get(self.state_range.clone())?
+            .get(slot)
+            .copied()
+    }
+
     /// The new iterate's value at a node, zero at ground.
     #[must_use = "the solved node potential is needed to evaluate the requested device quantity"]
     pub fn voltage(&self, node: NodeId) -> Real {

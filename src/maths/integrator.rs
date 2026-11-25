@@ -368,6 +368,7 @@ impl StepHistory {
             history_anchor,
             scaled_weights,
             truncation: TruncationSpans::new(&deltas, usize::from(order)),
+            derivative_truncation: TruncationSpans::new(&deltas, usize::from(order) - 1),
         })
     }
 
@@ -550,6 +551,7 @@ pub struct Coefficients {
     history_anchor: usize,
     scaled_weights: bool,
     truncation: TruncationSpans,
+    derivative_truncation: TruncationSpans,
 }
 
 /// One integrated charge-storage element in companion form, as
@@ -938,7 +940,51 @@ impl Coefficients {
         tolerances: &TruncationTolerances,
     ) -> SpiceResult<Real> {
         let order = usize::from(self.order);
-        let tol = tolerances;
+        if charge.len() < order + 2 {
+            return Err(numerical(format!(
+                "order {order} truncation estimate needs {} charges",
+                order + 2
+            )));
+        }
+        let tolerance = self.truncation_tolerance(charge, &derivative, tolerances)?;
+        let difference = self.truncation.divided_difference(charge, order)?;
+        self.truncation_bound(tolerance, difference, tolerances)
+    }
+
+    /// Estimate the same leading local error from independently solved
+    /// derivatives instead of differentiating rounded absolute storage.
+    /// For a polynomial of degree k+1, the charge's (k+1)th divided
+    /// difference equals the kth divided difference of its derivative
+    /// divided by k+1. For smooth general functions both approximate
+    /// the same leading error. The current sample and k accepted
+    /// derivative samples are required, including on nonuniform grids.
+    ///
+    /// # Errors
+    /// Invalid tolerances, insufficient history, or nonfinite arithmetic.
+    pub fn truncation_timestep_from_derivatives(
+        &self,
+        charge: [Real; 2],
+        derivatives: &[Real],
+        tolerances: &TruncationTolerances,
+    ) -> SpiceResult<Real> {
+        let order = usize::from(self.order);
+        if derivatives.len() < order + 1 {
+            return Err(numerical("insufficient derivative truncation history"));
+        }
+        let tolerance = self.truncation_tolerance(&charge, derivatives, tolerances)?;
+        let difference = self
+            .derivative_truncation
+            .divided_difference(derivatives, order - 1)?
+            / Real::from(self.order + 1);
+        self.truncation_bound(tolerance, difference, tolerances)
+    }
+
+    fn truncation_tolerance(
+        &self,
+        charge: &[Real],
+        derivatives: &[Real],
+        tol: &TruncationTolerances,
+    ) -> SpiceResult<Real> {
         if [tol.reltol, tol.abstol, tol.chgtol, tol.trtol]
             .iter()
             .any(|v| !(v.is_finite() && *v > 0.0))
@@ -947,22 +993,29 @@ impl Coefficients {
                 "truncation tolerances must be positive and finite",
             ));
         }
-        if (self.history < order && !self.filled) || charge.len() < order + 2 {
-            return Err(numerical(format!(
-                "order {order} truncation estimate needs {order} accepted steps and {} charges",
-                order + 2
-            )));
+        if self.history < usize::from(self.order) && !self.filled {
+            return Err(numerical(
+                "insufficient accepted steps for truncation estimate",
+            ));
         }
-        if charge.iter().chain(&derivative).any(|v| !v.is_finite()) {
+        if charge.iter().chain(derivatives).any(|v| !v.is_finite()) {
             return Err(numerical("nonfinite truncation-error history"));
         }
         let volttol = tol
             .reltol
-            .mul_add(derivative[0].abs().max(derivative[1].abs()), tol.abstol);
+            .mul_add(derivatives[0].abs().max(derivatives[1].abs()), tol.abstol);
         let chargetol =
             tol.reltol * charge[0].abs().max(charge[1].abs()).max(tol.chgtol) / self.dt();
-        let tolerance = finite(volttol.max(chargetol), "truncation tolerance")?;
-        let difference = self.truncation.divided_difference(charge, order)?;
+        finite(volttol.max(chargetol), "truncation tolerance")
+    }
+
+    fn truncation_bound(
+        &self,
+        tolerance: Real,
+        difference: Real,
+        tol: &TruncationTolerances,
+    ) -> SpiceResult<Real> {
+        let order = usize::from(self.order);
         // cktterr.c gearCoeff/trapCoeff (trial() guarantees the index).
         let factor = match self.method {
             IntegrationMethod::Trapezoidal => TRAP_ERROR_CONSTANTS[order - 1],
