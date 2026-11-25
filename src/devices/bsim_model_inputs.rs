@@ -1,8 +1,8 @@
 //! Ordered BSIM model setter dispatch shared by the family-specific schemas.
 //!
-//! C's INPdomodel/INPgetMod admit the family/version before invoking setters.
-//! create_model prepends model-level instance defaults; INPdevParse applies those
-//! defaults before the instance's own parameters. The typed IFparm descriptor
+//! C's `INPdomodel`/`INPgetMod` admit the family/version before invoking setters.
+//! `create_model` prepends model-level instance defaults; `INPdevParse` applies those
+//! defaults before the instance's own parameters. The typed `IFparm` descriptor
 //! controls all validation, conversions, aliases and given-bit provenance.
 
 use std::sync::Arc;
