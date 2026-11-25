@@ -52,6 +52,8 @@ pub enum ModelFamily {
     Inductor,
     /// Junction diode.
     Diode,
+    /// Explicit source-selected SIMetrix level-1 diode.
+    SimetrixDiodeLevel1,
     /// NPN classic BJT.
     Npn,
     /// PNP classic BJT.
@@ -96,6 +98,7 @@ impl ModelFamily {
             "c" => Some(Self::Capacitor),
             "l" => Some(Self::Inductor),
             "d" => Some(Self::Diode),
+            model_kernel_diode::MODEL_FAMILY => Some(Self::SimetrixDiodeLevel1),
             "npn" => Some(Self::Npn),
             "pnp" => Some(Self::Pnp),
             "nmos" => Some(Self::Nmos),
@@ -125,7 +128,7 @@ impl ModelFamily {
             Self::Resistor => 'r',
             Self::Capacitor => 'c',
             Self::Inductor => 'l',
-            Self::Diode => 'd',
+            Self::Diode | Self::SimetrixDiodeLevel1 => 'd',
             Self::Npn | Self::Pnp => 'q',
             Self::Nmos | Self::Pmos => 'm',
             Self::Switch => 's',
@@ -153,6 +156,8 @@ pub enum ModelBackend {
     Inductor,
     /// Junction diode.
     Diode,
+    /// Explicit source-selected SIMetrix level-1 diode.
+    SimetrixDiodeLevel1,
     /// Gummel-Poon.
     Bjt,
     /// MOS1.
@@ -292,6 +297,9 @@ impl ModelBackend {
     }
 
     fn select(family: ModelFamily, selector: u8) -> Option<Self> {
+        if family == ModelFamily::SimetrixDiodeLevel1 {
+            return (selector == 1).then_some(Self::SimetrixDiodeLevel1);
+        }
         Self::catalog(family.designator())
             .iter()
             .find(|spec| spec.selectors.contains(&selector))
@@ -331,6 +339,10 @@ pub(super) enum PreparationKey {
     Inputs,
     Scalar(usize),
     Nominal(u64),
+    PreparedTopology {
+        series: bool,
+        absolute_temperature: bool,
+    },
 }
 
 type PreparationCell<T> = OnceLock<SpiceResult<Arc<T>>>;
@@ -1090,6 +1102,12 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
     for p in &card.parameters {
         if p.name.eq_ignore_ascii_case("level") {
             let raw = finite_literal(p)?;
+            if family == ModelFamily::SimetrixDiodeLevel1 && raw.to_bits() != 1_f64.to_bits() {
+                return Err(SpiceError::parse(
+                    p.location.clone(),
+                    format!("SIMetrix diode requires LEVEL=1, got {raw}"),
+                ));
+            }
             let integer = rounded_level(raw, &p.location)?;
             first.get_or_insert((raw, integer, &p.location));
             last = Some(integer);
