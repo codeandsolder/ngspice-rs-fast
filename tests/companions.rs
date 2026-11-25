@@ -376,3 +376,78 @@ fn companion_rc_and_rl_decays_converge_at_second_order() {
         }
     }
 }
+
+#[test]
+fn derivative_truncation_matches_polynomial_leading_error_on_nonuniform_grid() {
+    use ngspice_rs::maths::TruncationTolerances;
+    let tol = TruncationTolerances::default();
+    let steps = [0.25, 0.125, 0.0625, 0.25, 0.125, 0.0625];
+    let mut warm = StepHistory::new();
+    for dt in steps {
+        let c = warm.trial(TRAP, 1, dt, DEFAULT_XMU).unwrap();
+        warm.accept(&c);
+    }
+    for (method, maximum) in [(TRAP, 2), (IntegrationMethod::Gear { order: 6 }, 6)] {
+        for order in 1..=maximum {
+            let c = warm.trial(method, order, 0.125, DEFAULT_XMU).unwrap();
+            let mut charge = [0.; 8];
+            let mut derivative = [0.; 7];
+            let mut time: f64 = 1.;
+            let mut intervals = std::iter::once(c.dt()).chain(steps.into_iter().rev());
+            for (age, value) in charge.iter_mut().take(usize::from(order) + 2).enumerate() {
+                *value = time.powi(i32::from(order) + 1);
+                if let Some(rate) = derivative.get_mut(age) {
+                    *rate = f64::from(order + 1) * time.powi(i32::from(order));
+                }
+                time -= intervals.next().unwrap_or(0.);
+            }
+            let ordinary = c
+                .truncation_timestep(
+                    &charge[..usize::from(order) + 2],
+                    [derivative[0], derivative[1]],
+                    &tol,
+                )
+                .unwrap();
+            let direct = c
+                .truncation_timestep_from_derivatives(
+                    [charge[0], charge[1]],
+                    &derivative[..=usize::from(order)],
+                    &tol,
+                )
+                .unwrap();
+            assert!(
+                (direct / ordinary - 1.).abs() < 1e-11,
+                "{method:?} {order}: {direct} vs {ordinary}"
+            );
+        }
+    }
+}
+
+#[test]
+fn derivative_truncation_resolves_motion_below_one_charge_ulp() {
+    use ngspice_rs::maths::TruncationTolerances;
+    let tol = TruncationTolerances::default();
+    let mut warm = StepHistory::new();
+    for _ in 0..2 {
+        let c = warm.trial(TRAP, 1, 0.125, DEFAULT_XMU).unwrap();
+        warm.accept(&c);
+    }
+    let c = warm.trial(TRAP, 2, 0.125, DEFAULT_XMU).unwrap();
+    let charge = [1e20; 4];
+    let derivative = [3., 0., 3.];
+    let ordinary = c
+        .truncation_timestep(&charge, [derivative[0], derivative[1]], &tol)
+        .unwrap();
+    let direct = c
+        .truncation_timestep_from_derivatives([charge[0], charge[1]], &derivative, &tol)
+        .unwrap();
+    assert!(direct < ordinary * 1e-4, "{direct} vs {ordinary}");
+    assert!(
+        c.truncation_timestep_from_derivatives([1., 1.], &[0., 1.], &tol)
+            .is_err()
+    );
+    assert!(
+        c.truncation_timestep_from_derivatives([1., 1.], &[0., 1., f64::NAN], &tol)
+            .is_err()
+    );
+}
