@@ -306,13 +306,13 @@ impl TransmissionLine {
     }
 
     /// Characteristic impedance in ohms.
-    #[must_use]
+    #[must_use = "the returned characteristic impedance determines voltage-current scaling for traveling waves"]
     pub const fn z0(&self) -> Real {
         self.z0
     }
 
     /// Propagation delay in seconds (`td`, or `nl / f`).
-    #[must_use]
+    #[must_use = "the returned delay determines the retarded boundary time and arrival scheduling"]
     pub const fn td(&self) -> Real {
         self.td
     }

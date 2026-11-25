@@ -192,7 +192,7 @@ impl CoupledLinePlan {
     }
 
     /// Count of physical coupled signal conductors.
-    #[must_use]
+    #[must_use = "the physical conductor count determines the compatible RLGC matrix and boundary dimensions"]
     pub const fn conductors(&self) -> usize {
         self.r.rows()
     }

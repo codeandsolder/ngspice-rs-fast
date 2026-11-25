@@ -630,13 +630,13 @@ pub struct UrcLine {
 
 impl UrcLine {
     /// The line length `l` in metres.
-    #[must_use]
+    #[must_use = "the returned physical length determines the distributed resistance and capacitance scaling"]
     pub const fn length(&self) -> Real {
         self.length
     }
 
     /// The number of sections the line was expanded into.
-    #[must_use]
+    #[must_use = "the returned count identifies the number of sections in the expanded circuit"]
     pub const fn lumps(&self) -> usize {
         self.lumps
     }

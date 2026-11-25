@@ -498,7 +498,7 @@ impl Cell {
 }
 
 impl CoupledLine {
-    #[must_use]
+    #[must_use = "the count determines the state allocation for every section and conductor"]
     pub(super) fn spatial_state_count(&self) -> usize {
         self.sections * self.conductors() * SLOTS_PER_SECTION_CONDUCTOR
     }

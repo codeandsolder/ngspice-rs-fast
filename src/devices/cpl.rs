@@ -279,13 +279,13 @@ impl CoupledLine {
     }
 
     /// Total physical conductor count, excluding the two return terminals.
-    #[must_use]
+    #[must_use = "the conductor count determines the width of the coupled-line boundary vectors"]
     pub fn conductors(&self) -> usize {
         self.plan.conductors()
     }
 
     /// Borrow the model without copying its per-length matrices.
-    #[must_use]
+    #[must_use = "the returned shared plan contains the per-length matrices used for this line's propagation"]
     pub fn plan(&self) -> &CoupledLinePlan {
         &self.plan
     }

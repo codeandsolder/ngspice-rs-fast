@@ -219,7 +219,7 @@ impl CplUpdate {
 
 impl CplHistory {
     /// Number of retained boundary and response records.
-    #[must_use]
+    #[must_use = "the count measures retained graph records including boundary, segment and response history"]
     pub fn len(&self) -> usize {
         usize::from(self.time.is_some())
             + self.segments.len()
@@ -230,7 +230,7 @@ impl CplHistory {
     }
 
     /// Whether the accepted graph has been initialized.
-    #[must_use]
+    #[must_use = "the result distinguishes an uninitialized transport graph from accepted history"]
     pub const fn is_empty(&self) -> bool {
         self.time.is_none()
     }
