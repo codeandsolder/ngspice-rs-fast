@@ -203,8 +203,14 @@ which `dynamic_gmin`/`new_gmin` approach and `spice3_gmin` starts from.
   failed iterate; the port does not retain failed iterates and ends the
   strategy. `spice3_gmin` starts from the seed, not from the failed direct
   attempt's last iterate.
-- **Not ported**: `gshunt` (C's `dynamic_gmin` target `max(gmin, gshunt)` and
-  gshunt diagonal), `.options oldlimit` (`CKTfixLimit`), the front-end
+- **Gshunt** is a finite nonnegative SPARSE diagonal conductance after a
+  nodal gmin fallback, not a physical nodal resistor. The fixed ladder uses
+  it as its seed when nonzero; adaptive recovery targets `max(gmin,gshunt)`.
+  The completed real solve retains the diagonal on the same circuit/task
+  (candidate resets and independent decks clear it); AC complex factorization
+  does not apply it. Auxiliary constitutive coordinates are protected even
+  after row/column permutations, unlike ordinary SPICE MNA coordinates.
+- **Not ported**: `.options oldlimit` (`CKTfixLimit`), the front-end
   `dyngmin` variable (skip `new_gmin`), BJT quasi-saturation limiting (the
   quasi-saturation model itself is rejected), `OFF`/`IC` instance start values
   (rejected per device). These are `NotYetPorted` where they are inputs.

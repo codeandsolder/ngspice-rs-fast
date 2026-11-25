@@ -172,6 +172,7 @@ struct TopologyBindings {
     branch_rows: Vec<std::ops::Range<usize>>,
     convergence_kinds: Vec<crate::devices::ConvergenceKind>,
     private_storage_rows: Vec<(usize, usize)>,
+    regularization_exclusions: Vec<usize>,
     control_rows: Vec<Vec<usize>>,
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
@@ -206,6 +207,7 @@ pub(super) struct CircuitRuntime {
     initial_revision: std::cell::RefCell<Arc<()>>,
     pattern: std::cell::RefCell<Option<Arc<crate::maths::Pattern>>>,
     carried_state: std::cell::RefCell<Option<StateSnapshot>>,
+    continuation_diagonal: std::cell::Cell<Real>,
     completed: Vec<crate::primitives::AnalysisKind>,
     final_transient: std::cell::RefCell<Option<StateSnapshot>>,
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
@@ -1425,6 +1427,18 @@ impl Circuit {
             .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect::<SpiceResult<_>>()?;
         self.bindings.private_storage_rows = self.bind_private_storage()?;
+        self.bindings.regularization_exclusions = self
+            .devices
+            .iter()
+            .zip(&self.bindings.branch_rows)
+            .flat_map(|(device, rows)| {
+                rows.clone().enumerate().filter_map(|(local, row)| {
+                    (device.branch_quantity(local) != crate::devices::BranchQuantity::Current)
+                        .then_some(row)
+                })
+            })
+            .collect();
+        self.bindings.regularization_exclusions.sort_unstable();
         self.bindings.mutual = self.resolve_mutual(names)?;
         Ok(())
     }
@@ -2341,6 +2355,18 @@ impl Circuit {
         &self.bindings.convergence_kinds
     }
 
+    pub(crate) fn continuation_diagonal(&self) -> Real {
+        self.runtime.continuation_diagonal.get()
+    }
+
+    pub(crate) fn set_continuation_diagonal(&self, value: Real) {
+        self.runtime.continuation_diagonal.set(value);
+    }
+
+    pub(crate) fn regularization_exclusions(&self) -> &[usize] {
+        &self.bindings.regularization_exclusions
+    }
+
     pub(crate) fn private_storage_rows(&self) -> &[(usize, usize)] {
         &self.bindings.private_storage_rows
     }
@@ -2946,6 +2972,7 @@ impl Circuit {
     /// changes its candidate. Preserve finalized bindings, sparse pattern and
     /// prepared names; only independent simulation state is invalidated.
     pub(crate) fn clear_candidate_analysis_state(&mut self) {
+        self.runtime.continuation_diagonal.set(0.);
         self.runtime.completed.clear();
         self.runtime.carried_state.get_mut().take();
         self.runtime.final_transient.get_mut().take();
@@ -3417,6 +3444,7 @@ impl Circuit {
                 && a.branch_rows == b.branch_rows
                 && a.control_rows == b.control_rows
                 && a.private_storage_rows == b.private_storage_rows
+                && a.regularization_exclusions == b.regularization_exclusions
                 && a.state_rows == b.state_rows
                 && self.nodes.nodes() == previous.nodes.nodes()
                 && self.devices.len() == previous.devices.len()
@@ -3452,6 +3480,7 @@ impl Circuit {
     /// this circuit has allocated (the rule `finalize` applies on
     /// re-finalization); otherwise this circuit keeps its own.
     pub fn inherit_from(&mut self, previous: &Self) {
+        self.runtime.continuation_diagonal.set(0.);
         self.runtime.fixed_stamps.get_mut().forget();
         self.runtime.completed.clear();
         self.runtime.final_transient.get_mut().take();
@@ -3463,6 +3492,9 @@ impl Circuit {
         if !self.compatible_topology(previous) {
             return;
         }
+        self.runtime
+            .continuation_diagonal
+            .set(previous.continuation_diagonal());
         self.runtime
             .completed
             .clone_from(&previous.runtime.completed);

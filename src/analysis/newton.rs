@@ -201,6 +201,7 @@ pub fn solve_counted_limited<T>(
         Phases {
             coordinate_kinds: None,
             private_storage: &[],
+            regularization_exclusions: &[],
             first: IterationPhase::Junction,
             previous: None,
             nonconvergent: |_: &T| false,
@@ -278,6 +279,7 @@ pub fn solve_phased(
         branch_rows,
         None,
         &[],
+        &[],
         limited_rows,
         options,
         policy,
@@ -303,6 +305,7 @@ fn solve_phased_into(
     branch_rows: &[bool],
     coordinate_kinds: Option<&[crate::devices::ConvergenceKind]>,
     private_storage: &[(usize, usize)],
+    regularization_exclusions: &[usize],
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
     policy: PhasePolicy,
@@ -329,6 +332,7 @@ fn solve_phased_into(
         Phases {
             coordinate_kinds,
             private_storage,
+            regularization_exclusions,
             first,
             previous: continued,
             nonconvergent: TrialState::is_nonconvergent,
@@ -419,11 +423,12 @@ impl CircuitNewton<'_, '_> {
             initial,
             self.branch_rows,
             Some(circuit.convergence_kinds()),
-            if integration.is_some() && options.diag_gmin == 0. {
+            if integration.is_some() {
                 circuit.private_storage_rows()
             } else {
                 &[]
             },
+            circuit.regularization_exclusions(),
             self.limited_rows,
             options,
             policy,
@@ -558,6 +563,7 @@ impl LoadStorage<TrialState> {
 struct Phases<'a, T, F> {
     coordinate_kinds: Option<&'a [crate::devices::ConvergenceKind]>,
     private_storage: &'a [(usize, usize)],
+    regularization_exclusions: &'a [usize],
     first: IterationPhase,
     previous: Option<T>,
     nonconvergent: F,
@@ -718,7 +724,16 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         if phase == IterationPhase::Junction {
             reorder = true;
         }
-        let mut next = match linearised_solve(matrix, rhs, &mut ordering, reorder, options)? {
+        let mut next = match linearised_solve(
+            matrix,
+            rhs,
+            &mut ordering,
+            reorder,
+            crate::maths::DiagonalGmin {
+                conductance: options.diag_gmin,
+                protected: phases.regularization_exclusions,
+            },
+        )? {
             crate::maths::NiStep::Solved(next) => {
                 reorder = false;
                 next
@@ -862,9 +877,9 @@ fn linearised_solve(
     rhs: &Vector,
     ordering: &mut Option<crate::maths::SparseSymbolic>,
     reorder: bool,
-    options: &NewtonOptions,
+    regularization: crate::maths::DiagonalGmin<'_>,
 ) -> SpiceResult<crate::maths::NiStep> {
-    crate::maths::solve_ni(matrix, rhs, ordering, reorder, options.diag_gmin)
+    crate::maths::solve_ni(matrix, rhs, ordering, reorder, regularization)
 }
 
 fn check(matrix: &SparseMatrix, rhs: &Vector, n: usize) -> SpiceResult<()> {

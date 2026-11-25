@@ -75,6 +75,13 @@ the run with an error; no partial plot is returned.
   with `reltol`, `abstol` (on the charge/flux derivative), `chgtol`, `trtol`.
   The next step is `min(2 dt, bound)`. A trial with a bound of at most `0.9 dt`
   is rejected and retried with the bound; the first step is never checked.
+  Optional `newtrunc` adds a voltage predictor/corrector bound with
+  `ltereltol`, `lteabstol`, `ltetrtol` (defaults 1e-3, 1e-6 V, 500).
+  Unlike C's optional predictor build it retains the charge/flux and event
+  bounds, and resets predictor history at physical breakpoints. Only real
+  voltage coordinates participate; current and private constitutive
+  coordinates do not. These options resolve per transient, and request
+  `newtrunc=0` disables the deck flag. No predictor state is kept when off.
   Devices without charge storage add their own bound through
   `Device::timestep_limit` (S switches: `swtrunc.c`, see
   [SWITCHES.md](SWITCHES.md#timestep-control)).

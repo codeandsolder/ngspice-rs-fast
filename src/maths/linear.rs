@@ -375,6 +375,28 @@ impl CachedFrame {
     }
 }
 
+/// SPARSE internal-diagonal regularization, with original MNA coordinates
+/// that must retain their exact constitutive equations. A diagonal touching
+/// a protected row or column is left unchanged even after permutations.
+#[derive(Debug, Clone, Copy)]
+pub struct DiagonalGmin<'a> {
+    /// Conductance added to an unprotected internal diagonal.
+    pub conductance: f64,
+    /// Strictly increasing zero-based original row/column identities.
+    pub protected: &'a [usize],
+}
+
+impl DiagonalGmin<'_> {
+    /// Regularize every internal diagonal (ordinary SPICE MNA).
+    #[must_use = "the returned policy defines which diagonal elements may be regularized"]
+    pub const fn unrestricted(conductance: f64) -> Self {
+        Self {
+            conductance,
+            protected: &[],
+        }
+    }
+}
+
 /// The inputs of one clean `spFactor` in [`solve_ni`]: the loaded element
 /// values (as bits, in handle order), `LoadGmin`'s `diag_gmin` and the pivot
 /// thresholds. Refactoring identical inputs with the same pivot order
@@ -383,20 +405,23 @@ impl CachedFrame {
 struct FactoredInputs {
     values: Vec<u64>,
     diag_gmin: u64,
+    protected: Vec<usize>,
     pivot: (u64, u64),
 }
 
 impl FactoredInputs {
-    fn new(values: &[f64], diag_gmin: f64, pivot: PivotTolerances) -> Self {
+    fn new(values: &[f64], diag_gmin: DiagonalGmin<'_>, pivot: PivotTolerances) -> Self {
         Self {
             values: values.iter().map(|v| v.to_bits()).collect(),
-            diag_gmin: diag_gmin.to_bits(),
+            diag_gmin: diag_gmin.conductance.to_bits(),
+            protected: diag_gmin.protected.to_vec(),
             pivot: (pivot.relative.to_bits(), pivot.absolute.to_bits()),
         }
     }
 
-    fn matches(&self, values: &[f64], diag_gmin: f64, pivot: PivotTolerances) -> bool {
-        self.diag_gmin == diag_gmin.to_bits()
+    fn matches(&self, values: &[f64], diag_gmin: DiagonalGmin<'_>, pivot: PivotTolerances) -> bool {
+        self.diag_gmin == diag_gmin.conductance.to_bits()
+            && self.protected == diag_gmin.protected
             && self.pivot == (pivot.relative.to_bits(), pivot.absolute.to_bits())
             && self.values.len() == values.len()
             && self
@@ -646,7 +671,7 @@ impl LoadedFrame {
     fn capture_inputs(
         &mut self,
         values: &[f64],
-        diag_gmin: f64,
+        diag_gmin: DiagonalGmin<'_>,
         pivot: PivotTolerances,
     ) -> Arc<FactoredInputs> {
         if let Some(mut previous) = self.previous_inputs.take()
@@ -654,7 +679,9 @@ impl LoadedFrame {
         {
             inputs.values.clear();
             inputs.values.extend(values.iter().map(|v| v.to_bits()));
-            inputs.diag_gmin = diag_gmin.to_bits();
+            inputs.diag_gmin = diag_gmin.conductance.to_bits();
+            inputs.protected.clear();
+            inputs.protected.extend_from_slice(diag_gmin.protected);
             inputs.pivot = (pivot.relative.to_bits(), pivot.absolute.to_bits());
             return previous;
         }
@@ -716,8 +743,28 @@ pub fn solve_ni(
     rhs: &Vector,
     ordering: &mut Option<SparseSymbolic>,
     reorder: bool,
-    diag_gmin: f64,
+    diag_gmin: DiagonalGmin<'_>,
 ) -> SpiceResult<NiStep> {
+    if !diag_gmin.conductance.is_finite()
+        || diag_gmin.conductance < 0.
+        || diag_gmin
+            .protected
+            .last()
+            .is_some_and(|&row| row >= matrix.rows())
+        || diag_gmin
+            .protected
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(SpiceError::circuit(
+            "invalid diagonal regularization policy",
+        ));
+    }
+    let diag_gmin = if diag_gmin.conductance == 0. {
+        DiagonalGmin::unrestricted(0.)
+    } else {
+        diag_gmin
+    };
     if let Some((pattern, _)) = matrix.bound_values() {
         return pattern.with_ordering(|state| {
             let mut cached = state
@@ -753,7 +800,7 @@ fn ni_step(
     rhs: &Vector,
     ordering: &mut Option<SparseSymbolic>,
     reorder: bool,
-    diag_gmin: f64,
+    diag_gmin: DiagonalGmin<'_>,
     workspace: &mut Vec<f64>,
     work: &mut PatternWork,
 ) -> SpiceResult<NiStep> {
@@ -797,7 +844,7 @@ fn ni_step(
         (frame, true)
     };
     let sparse = Arc::make_mut(&mut frame.sparse);
-    sparse.load_gmin(diag_gmin);
+    sparse.load_gmin(diag_gmin.conductance, diag_gmin.protected);
     let clean_refactor = !fresh && !reorder && sparse.can_refactor();
     let status = if fresh || reorder {
         sparse.order_and_factor(pivot.relative, pivot.absolute)
@@ -1242,11 +1289,11 @@ mod tests {
             })
         };
         for _ in 0..2 {
-            solve_ni(&a, &rhs, &mut None, false, 0.).unwrap();
+            solve_ni(&a, &rhs, &mut None, false, DiagonalGmin::unrestricted(0.)).unwrap();
         }
         let before = read();
         a.set(0, 0, 4.).unwrap();
-        solve_ni(&a, &rhs, &mut None, false, 0.).unwrap();
+        solve_ni(&a, &rhs, &mut None, false, DiagonalGmin::unrestricted(0.)).unwrap();
         assert_eq!(before, read());
         let snapshot = pattern.with_ordering(|state| {
             let Some(CachedFrame::Real(symbolic)) = &state.frame else {
@@ -1256,7 +1303,7 @@ mod tests {
         });
         let x = snapshot.solve(&rhs).unwrap();
         a.set(0, 0, 5.).unwrap();
-        solve_ni(&a, &rhs, &mut None, false, 0.).unwrap();
+        solve_ni(&a, &rhs, &mut None, false, DiagonalGmin::unrestricted(0.)).unwrap();
         assert_eq!(snapshot.solve(&rhs).unwrap(), x);
         assert_ne!(before.0, read().0);
         assert_ne!(before.1, read().1);
@@ -1306,7 +1353,14 @@ mod tests {
         }
         let source = Vector::from_slice(&[5., 7.]);
         assert!(matches!(
-            solve_ni(&matrix, &source, &mut None, false, 0.).unwrap(),
+            solve_ni(
+                &matrix,
+                &source,
+                &mut None,
+                false,
+                DiagonalGmin::unrestricted(0.)
+            )
+            .unwrap(),
             NiStep::Solved(_)
         ));
         let output = Vector::from_slice(&[1., -1.]);
@@ -1323,7 +1377,16 @@ mod tests {
         let directly = primal.as_slice()[0] - primal.as_slice()[1];
         assert!((projected - directly).abs() < 1e-14);
         matrix.set(0, 0, f64::from_bits(1)).unwrap();
-        assert!(solve_ni(&matrix, &source, &mut None, false, 0.).is_err());
+        assert!(
+            solve_ni(
+                &matrix,
+                &source,
+                &mut None,
+                false,
+                DiagonalGmin::unrestricted(0.)
+            )
+            .is_err()
+        );
         assert!(
             solve_last_factors_transposed(&pattern, &output)
                 .unwrap()
@@ -1341,16 +1404,18 @@ mod tests {
         let rhs = Vector::from_slice(&[3., 3.]);
         for _ in 0..2 {
             assert!(matches!(
-                solve_ni(&a, &rhs, &mut None, false, 0.).unwrap(),
+                solve_ni(&a, &rhs, &mut None, false, DiagonalGmin::unrestricted(0.)).unwrap(),
                 NiStep::Solved(_)
             ));
         }
         assert!(solve_last_factors(&pattern, &rhs).unwrap().is_some());
         a.set(0, 0, f64::from_bits(1)).unwrap();
-        assert!(solve_ni(&a, &rhs, &mut None, false, 0.).is_err());
+        assert!(solve_ni(&a, &rhs, &mut None, false, DiagonalGmin::unrestricted(0.)).is_err());
         assert!(solve_last_factors(&pattern, &rhs).unwrap().is_none());
         a.set(0, 0, 2.).unwrap();
-        let NiStep::Solved(x) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+        let NiStep::Solved(x) =
+            solve_ni(&a, &rhs, &mut None, false, DiagonalGmin::unrestricted(0.)).unwrap()
+        else {
             panic!("factor recovery failed")
         };
         assert_eq!(x.as_slice(), &[1., 1.]);
@@ -1406,7 +1471,9 @@ mod tests {
             a.add(r, c, value).unwrap();
         }
         let rhs = Vector::from_slice(&[5., 10.]);
-        let NiStep::Solved(real) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+        let NiStep::Solved(real) =
+            solve_ni(&a, &rhs, &mut None, false, DiagonalGmin::unrestricted(0.)).unwrap()
+        else {
             panic!("initial real solve failed");
         };
         let mut e = SparseMatrix::new(2, 2);
@@ -1440,7 +1507,9 @@ mod tests {
         assert_eq!(Arc::strong_count(sparse), 1);
         pattern.with_ordering(|state| state.frame = Some(frame));
         assert_eq!(solve_last_factors(&pattern, &rhs).unwrap(), None);
-        let NiStep::Solved(after) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+        let NiStep::Solved(after) =
+            solve_ni(&a, &rhs, &mut None, false, DiagonalGmin::unrestricted(0.)).unwrap()
+        else {
             panic!("real refactor failed");
         };
         assert_eq!(real, after);
@@ -1474,13 +1543,29 @@ mod tests {
                 .as_slice(),
             &[1., 2.]
         );
-        let NiStep::Solved(x) = solve_ni(&a, &rhs, &mut ordering, false, 0.).unwrap() else {
+        let NiStep::Solved(x) = solve_ni(
+            &a,
+            &rhs,
+            &mut ordering,
+            false,
+            DiagonalGmin::unrestricted(0.),
+        )
+        .unwrap() else {
             panic!("unexpected zero pivot");
         };
         assert_eq!(x.as_slice(), &[1., 2.]);
         a.add(0, 0, f64::MAX).unwrap();
         a.add(0, 0, f64::MAX).unwrap();
-        assert!(solve_ni(&a, &rhs, &mut ordering, false, 0.).is_err());
+        assert!(
+            solve_ni(
+                &a,
+                &rhs,
+                &mut ordering,
+                false,
+                DiagonalGmin::unrestricted(0.)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1491,7 +1576,9 @@ mod tests {
         a.add(1, 0, 3.).unwrap();
         a.add(1, 1, 4.).unwrap();
         let rhs = Vector::from_slice(&[4., 11.]);
-        let NiStep::Solved(before) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+        let NiStep::Solved(before) =
+            solve_ni(&a, &rhs, &mut None, false, DiagonalGmin::unrestricted(0.)).unwrap()
+        else {
             panic!("first factorization failed");
         };
         assert_eq!(
@@ -1515,7 +1602,9 @@ mod tests {
         // The retained frame is retyped with zero coefficients. Its order
         // can be reused, but it cannot answer a real solve until reloaded.
         assert_eq!(solve_last_factors(&pattern, &rhs).unwrap(), None);
-        let NiStep::Solved(after) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+        let NiStep::Solved(after) =
+            solve_ni(&a, &rhs, &mut None, false, DiagonalGmin::unrestricted(0.)).unwrap()
+        else {
             panic!("refactorization failed");
         };
         assert_eq!(before, after);

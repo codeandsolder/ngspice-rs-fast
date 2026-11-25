@@ -167,6 +167,67 @@ fn topology_shunts_validate_and_preserve_branch_coordinates() {
 }
 
 #[test]
+fn gshunt_is_continuation_regularization_not_a_physical_resistor() {
+    let circuit = "v1 in 0 dc 1 ac 1\nr1 in out 1k";
+    let direct = simulate(&format!("{circuit}\n.options gshunt=1m\n.op")).unwrap();
+    close(direct.value("v(out)", 0).unwrap().re, 1., 1e-12, 0.);
+    close(direct.value("i(v1)", 0).unwrap().re, 0., 0., 1e-15);
+    // ngspice 47, cktop.c + SPARSE LoadGmin: after MNA preorder the
+    // diagonal contains the source incidence entries as well as the
+    // output voltage diagonal. The regularized equations are
+    // (1+g)*Vin=1 and (G+g)*Vout=G*Vin.
+    for steps in [1, 2] {
+        let forced = simulate(&format!(
+            "{circuit}\n.options gshunt=1m noopiter gminsteps={steps}\n.op"
+        ))
+        .unwrap();
+        let vin = 1. / 1.001;
+        let vout = vin / 2.;
+        close(forced.value("v(out)", 0).unwrap().re, vout, 1e-9, 0.);
+        close(
+            forced.value("i(v1)", 0).unwrap().re,
+            (vout - vin) * 1e-3 / 1.001,
+            1e-9,
+            0.,
+        );
+    }
+    let source_only = simulate(&format!(
+        "{circuit}\n.options gshunt=1m noopiter gminsteps=0 srcsteps=1\n.op"
+    ))
+    .unwrap();
+    close(source_only.value("v(out)", 0).unwrap().re, 1., 1e-12, 0.);
+}
+
+#[test]
+fn voltage_lte_controls_add_a_predictor_bound_without_removing_charge_control() {
+    let circuit = "v1 in 0 sin(0 1 1k)\nr1 in out 1k\nc1 out 0 1u";
+    let analysis = ".tran 20u 2m 0 20u";
+    let base = simulate(&format!("{circuit}\n{analysis}")).unwrap();
+    let inactive = simulate(&format!(
+        "{circuit}\n.options ltereltol=1e-6 lteabstol=1e-8 ltetrtol=1\n{analysis}"
+    ))
+    .unwrap();
+    assert_eq!(base.point_count(), inactive.point_count());
+    for method in ["trap", "gear"] {
+        let tight = simulate(&format!(
+            "{circuit}\n.options method={method} newtrunc ltereltol=1e-6 lteabstol=1e-8 ltetrtol=1\n{analysis}"
+        )).unwrap();
+        let ordinary =
+            simulate(&format!("{circuit}\n.options method={method}\n{analysis}")).unwrap();
+        assert!(tight.point_count() > ordinary.point_count(), "{method}");
+        // Analytic zero-initial-state driven RC solution.
+        let omega_tau = std::f64::consts::TAU;
+        let divisor = 1. + omega_tau.powi(2);
+        for index in 0..tight.point_count() {
+            let time = tight.value("time", index).unwrap().re;
+            let (sin, cos) = (omega_tau * 1000. * time).sin_cos();
+            let expected = (sin - omega_tau * cos + omega_tau * (-1000. * time).exp()) / divisor;
+            close(tight.value("v(out)", index).unwrap().re, expected, 0., 2e-5);
+        }
+    }
+}
+
+#[test]
 fn gmin_is_the_junction_gmin_of_every_analysis() {
     let c = config(".options gmin=1u").unwrap();
     assert_eq!(c.context().gmin, 1e-6);
@@ -944,7 +1005,6 @@ fn unknown_and_unported_options_still_fail() {
         );
     }
     for pending in [
-        ".options gshunt=1e-12",
         ".options numdgt=8",
         ".options savecurrents",
         ".options scale=1u",
@@ -1001,7 +1061,7 @@ fn option_expression_failures_are_explicit() {
         Err(SpiceError::Parse { message, .. }) if message.contains("unknown option")
     ));
     assert!(
-        config(".options gshunt={nope}")
+        config(".options oldlimit={nope}")
             .unwrap_err()
             .is_not_yet_ported()
     );

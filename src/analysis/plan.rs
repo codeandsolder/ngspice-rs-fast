@@ -73,6 +73,7 @@ struct SolverOverrides {
     source: Option<usize>,
     gmin_steps: Option<usize>,
     gmin_factor: Option<Real>,
+    gshunt: Option<Real>,
     skip: Option<bool>,
     schedule: Schedule,
     limiting: Option<StepLimiting>,
@@ -115,6 +116,7 @@ impl SolverOverrides {
         };
         continuation.stage_max_iterations = stage.map(IterationLimit::new).transpose()?;
         continuation.skip_direct = self.skip.unwrap_or(dc.noopiter);
+        continuation.gshunt = self.gshunt.or(dc.gshunt).unwrap_or(0.);
         Ok(DcSettings {
             newton,
             continuation,
@@ -129,9 +131,35 @@ struct TransientOverrides {
     chgtol: Option<Real>,
     trtol: Option<Real>,
     minbreak: Option<Real>,
+    voltage_lte: crate::analysis::config::VoltageLteOptions,
     max_steps: Option<usize>,
     tran_max_iter: Option<usize>,
     xmu: Option<Real>,
+}
+
+/// Resolved voltage predictor tolerances, independent of charge tolerances.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct VoltageLte {
+    pub relative: Real,
+    pub absolute: Real,
+    pub factor: Real,
+}
+
+impl VoltageLte {
+    fn resolve(
+        local: crate::analysis::config::VoltageLteOptions,
+        deck: crate::analysis::config::VoltageLteOptions,
+    ) -> Option<Self> {
+        local
+            .enabled
+            .or(deck.enabled)
+            .unwrap_or(false)
+            .then(|| Self {
+                relative: local.relative.or(deck.relative).unwrap_or(1e-3),
+                absolute: local.absolute.or(deck.absolute).unwrap_or(1e-6),
+                factor: local.factor.or(deck.factor).unwrap_or(500.),
+            })
+    }
 }
 
 /// The transient-only part of a resolved plan, independent of time bounds.
@@ -142,6 +170,7 @@ pub(super) struct TransientOptions {
     pub chgtol: Real,
     pub trtol: Real,
     pub minbreak: Real,
+    pub voltage_lte: Option<VoltageLte>,
     pub max_steps: usize,
     pub tran_max_iter: usize,
     pub xmu: Real,
@@ -163,6 +192,7 @@ impl TransientOverrides {
             chgtol: self.chgtol.or(deck.chgtol).unwrap_or(1e-14),
             trtol: self.trtol.or(deck.trtol).unwrap_or(7.),
             minbreak: self.minbreak.or(deck.minbreak).unwrap_or(0.),
+            voltage_lte: VoltageLte::resolve(self.voltage_lte, deck.voltage_lte),
             max_steps: self.max_steps.unwrap_or(DEFAULT_MAX_STEPS),
             tran_max_iter: self.tran_max_iter.or(deck.itl4).unwrap_or(100),
             xmu: self.xmu.or(deck.xmu).unwrap_or(DEFAULT_XMU),
@@ -258,6 +288,13 @@ impl Overrides {
             "srcsteps" => solver.source = Some(count(text, key, 0, MAX_SOURCE_STEPS)?),
             "gminsteps" => solver.gmin_steps = Some(count(text, key, 0, MAX_GMIN_STAGES)?),
             "gminfactor" => solver.gmin_factor = Some(real(text, key)?),
+            "gshunt" => {
+                let value = real(text, key)?;
+                if value < 0. {
+                    return Err(unsupported("option gshunt must be nonnegative"));
+                }
+                solver.gshunt = Some(value);
+            }
             "noopiter" => solver.skip = Some(count(text, key, 0, 1)? == 1),
             "continuation" => {
                 solver.schedule = match text.to_ascii_lowercase().as_str() {
@@ -329,6 +366,10 @@ impl TransientOverrides {
             }
             "chgtol" => self.chgtol = Some(positive(text, key)?),
             "trtol" => self.trtol = Some(positive(text, key)?),
+            "newtrunc" => self.voltage_lte.enabled = Some(count(text, key, 0, 1)? == 1),
+            "ltereltol" => self.voltage_lte.relative = Some(positive(text, key)?),
+            "lteabstol" => self.voltage_lte.absolute = Some(positive(text, key)?),
+            "ltetrtol" => self.voltage_lte.factor = Some(positive(text, key)?),
             "minbreak" => {
                 let value = real(text, key)?;
                 if value < 0. {
