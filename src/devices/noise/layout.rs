@@ -443,3 +443,50 @@ fn changed_layout(name: &str) -> SpiceError {
         "noise generator layout changed between frequencies for {name}"
     ))
 }
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::*;
+
+    #[test]
+    fn generalized_sources_propagate_coherent_complex_rows_and_signed_frequencies() {
+        let mut circuit = Circuit::new();
+        let nodes: Vec<_> = (0..5)
+            .map(|i| circuit.add_node(&format!("n{i}")).unwrap())
+            .collect();
+        circuit.finalize().unwrap();
+        let injections: Vec<_> = nodes
+            .iter()
+            .copied()
+            .zip([
+                Complex::new(1., 2.),
+                Complex::new(-2., 1.),
+                Complex::new(1., -1.),
+                Complex::new(-1., -2.),
+                Complex::new(1., 0.),
+            ])
+            .collect();
+        let source = NoiseSource::prepared("coherent", 4., injections);
+        let bound = BoundNoiseSource::bind(&source, circuit.unknowns(), None).unwrap();
+        let mut adjoint = vec![Complex::ZERO; circuit.unknown_count()];
+        for (&node, value) in nodes.iter().zip([
+            Complex::new(2., 1.),
+            Complex::new(1., 2.),
+            Complex::new(3., -1.),
+            Complex::new(-1., 1.),
+            Complex::new(2., -2.),
+        ]) {
+            adjoint[circuit.unknowns().node_row(node).unwrap()] = value;
+        }
+        // Dot product of the declared injections and the complex adjoint.
+        assert_eq!(bound.transfer(&adjoint), Complex::new(3., -3.));
+        assert_eq!(bound.output_density(&adjoint, 1000.).unwrap(), 72.);
+        let positive: Vec<_> = bound.periodic_amplitudes(1000.).unwrap().collect();
+        let negative: Vec<_> = bound.periodic_amplitudes(-1000.).unwrap().collect();
+        assert_eq!(positive.len(), 5);
+        for ((row, weight), (negative_row, conjugate)) in positive.into_iter().zip(negative) {
+            assert_eq!(row, negative_row);
+            assert_eq!(weight.conj(), conjugate);
+        }
+    }
+}

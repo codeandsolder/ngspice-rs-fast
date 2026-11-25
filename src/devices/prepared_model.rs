@@ -28,6 +28,16 @@ fn kernel_error(error: model_kernel_api::Error) -> SpiceError {
     }
 }
 
+fn evaluation_error(error: model_kernel_api::Error) -> SpiceError {
+    match error {
+        model_kernel_api::Error::Domain(message) => SpiceError::Numerical {
+            context: "prepared model evaluation".into(),
+            message,
+        },
+        other => kernel_error(other),
+    }
+}
+
 struct CircuitNoiseSink<'a> {
     terminals: &'a [NodeId],
     sources: &'a mut Vec<NoiseSource>,
@@ -468,7 +478,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         let mut output = buffer.point();
         self.artifact
             .evaluate(&self.prepared, &voltage, &mut output)
-            .map_err(kernel_error)?;
+            .map_err(evaluation_error)?;
         self.stamp_point(context, &output)
     }
 
@@ -559,8 +569,25 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         Some(batch::Key::new(&self.artifact))
     }
 
-    fn prepare_batch(&self, instances: &[&dyn Device]) -> SpiceResult<Box<dyn batch::Tile>> {
-        Ok(Box::new(batch::BoundTile::new(&self.artifact, instances)?))
+    fn prepared_recipe(&self) -> Option<batch::Recipe<'_>> {
+        Some(batch::Recipe {
+            key: batch::Key::new(&self.artifact),
+            values: &self.values,
+            ambient: self.temperature.ambient_kelvin(),
+            circuit_temperature: self.temperature.circuit_celsius,
+        })
+    }
+
+    fn prepare_batch(
+        &self,
+        instances: &[&dyn Device],
+        unknowns: &crate::devices::MnaUnknowns,
+    ) -> SpiceResult<Box<dyn batch::Tile>> {
+        Ok(Box::new(batch::BoundTile::new(
+            &self.artifact,
+            instances,
+            unknowns,
+        )?))
     }
 
     fn stamp_prepared(&self, context: &mut StampContext<'_>, point: &Point<'_>) -> SpiceResult<()> {
@@ -604,7 +631,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
                         context.model_context.frequency,
                         &mut sink,
                     )
-                    .map_err(kernel_error)?;
+                    .map_err(evaluation_error)?;
                 if sources.len() == start {
                     return Err(SpiceError::circuit(
                         "computed model noise has no generators",
@@ -638,7 +665,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         let mut output = buffer.point();
         self.artifact
             .evaluate(&self.prepared, &voltage, &mut output)
-            .map_err(kernel_error)?;
+            .map_err(evaluation_error)?;
         self.stamp_small_signal(context, &output)
     }
 
@@ -659,7 +686,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         let mut point = buffer.point();
         self.artifact
             .evaluate(&self.prepared, &coordinates, &mut point)
-            .map_err(kernel_error)?;
+            .map_err(evaluation_error)?;
         let width = self.terminals.len();
         for (i, &node) in self.terminals.iter().enumerate() {
             if let Some(row) = context.unknowns.node_row(node) {

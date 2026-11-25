@@ -424,6 +424,7 @@ impl PreparedPoint {
         if self.prepared_batches.get().is_none() {
             let plan = crate::devices::prepared_model::batch::Plan::new(
                 circuit.devices.len(),
+                &circuit.bindings.unknowns,
                 circuit
                     .bindings
                     .prepared_devices
@@ -487,11 +488,28 @@ impl<'a> PreparedRun<'a> {
                 }
             }
         }
+        let prepared_batches = std::cell::OnceCell::new();
+        {
+            let previous = self.point.borrow();
+            if let Some(plan) = previous
+                .as_ref()
+                .and_then(|point| point.prepared_batches.get())
+            {
+                let mut plan = plan
+                    .try_borrow_mut()
+                    .map_err(|_| SpiceError::circuit("prepared batch plan already active"))?;
+                plan.rebind(
+                    |index| effective_device(self.circuit, &replacements, index),
+                    &self.circuit.bindings.unknowns,
+                )?;
+                let _ = prepared_batches.set(std::cell::RefCell::new(std::mem::take(&mut *plan)));
+            }
+        }
         self.point.replace(Some(PreparedPoint {
             context: *context,
             replacements,
             mutual: std::cell::OnceCell::new(),
-            prepared_batches: std::cell::OnceCell::new(),
+            prepared_batches,
         }));
         std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
             .map_err(|_| SpiceError::circuit("missing prepared model context"))
@@ -3239,7 +3257,7 @@ impl Circuit {
                 source_factor: request.model_context.source_factor,
                 voltage_source_value: &mut *voltage_source_value,
             };
-            if let Some(output) = batches.point(index, &self.bindings.unknowns, request.solution)? {
+            if let Some(output) = batches.point(index, request.solution)? {
                 device.stamp_prepared(&mut context, &output)?;
             } else {
                 device.stamp(&mut context)?;
@@ -3933,7 +3951,7 @@ impl Circuit {
                 linear.system.a.triplets().len(),
                 linear.system.e.triplets().len(),
             );
-            if let Some(output) = batches.point(index, &self.bindings.unknowns, bias)? {
+            if let Some(output) = batches.point(index, bias)? {
                 device.assemble_prepared(&mut linear, &output)?;
             } else if pole_zero_setups > 0 {
                 device.assemble_pole_zero(&mut linear, bias)?;

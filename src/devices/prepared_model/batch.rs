@@ -8,10 +8,10 @@ use model_kernel_api::{
     batch::{BatchOutput, PreparedTile},
 };
 
-use super::{PreparedDevice, kernel_error};
+use super::{PreparedDevice, evaluation_error, kernel_error};
 use crate::devices::traits::{Device, MnaUnknowns};
 use crate::maths::Vector;
-use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
+use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// Exact identity of an alive immutable artifact. It is neither a persisted
 /// fingerprint nor a substitute for the producer's identity checks.
@@ -29,7 +29,7 @@ pub trait Tile {
     /// Evaluate every lane at the same circuit Newton/bias point.
     /// # Errors
     /// Invalid coordinates or family evaluation.
-    fn evaluate(&mut self, unknowns: &MnaUnknowns, solution: &Vector) -> SpiceResult<()>;
+    fn evaluate(&mut self, solution: &Vector) -> SpiceResult<()>;
 
     /// Borrow one validated output lane without allocating.
     /// # Errors
@@ -39,13 +39,17 @@ pub trait Tile {
 
 pub(super) struct BoundTile<K: Kernel> {
     prepared: PreparedTile<K>,
-    rows: Vec<(NodeId, Real)>,
+    rows: Vec<(Option<usize>, Option<Real>)>,
     coordinates: Vec<Real>,
     output: BatchOutput,
 }
 
 impl<K: Kernel> BoundTile<K> {
-    pub(super) fn new(artifact: &Arc<Artifact<K>>, instances: &[&dyn Device]) -> SpiceResult<Self> {
+    pub(super) fn new(
+        artifact: &Arc<Artifact<K>>,
+        instances: &[&dyn Device],
+        unknowns: &MnaUnknowns,
+    ) -> SpiceResult<Self> {
         let width = artifact.descriptor().equations.len();
         let mut candidates = Vec::with_capacity(instances.len());
         let mut rows = Vec::new();
@@ -57,20 +61,15 @@ impl<K: Kernel> BoundTile<K> {
                 return Err(SpiceError::circuit("foreign prepared batch artifact"));
             }
             candidates.push((device.values.as_ref(), device.temperature.ambient_kelvin()));
-            rows.extend(
-                device
-                    .terminals
-                    .iter()
-                    .zip(&artifact.descriptor().equations)
-                    .map(|(&node, equation)| {
-                        let offset = if equation.kind == model_kernel_api::EquationKind::Thermal {
-                            device.temperature.circuit_celsius + super::CELSIUS_TO_KELVIN
-                        } else {
-                            0.
-                        };
-                        (node, offset)
-                    }),
-            );
+            for (&node, equation) in device
+                .terminals
+                .iter()
+                .zip(&artifact.descriptor().equations)
+            {
+                let offset = (equation.kind == model_kernel_api::EquationKind::Thermal)
+                    .then_some(device.temperature.circuit_celsius + super::CELSIUS_TO_KELVIN);
+                rows.push((unknowns.checked_node_row(node)?, offset));
+            }
         }
         let prepared = PreparedTile::new(artifact, &candidates).map_err(kernel_error)?;
         let output = BatchOutput::new(width, instances.len()).map_err(kernel_error)?;
@@ -85,17 +84,19 @@ impl<K: Kernel> BoundTile<K> {
 }
 
 impl<K: Kernel> Tile for BoundTile<K> {
-    fn evaluate(&mut self, unknowns: &MnaUnknowns, solution: &Vector) -> SpiceResult<()> {
-        for (value, &(node, offset)) in self.coordinates.iter_mut().zip(&self.rows) {
-            *value = unknowns
-                .node_row(node)
-                .and_then(|row| solution.get(row))
-                .unwrap_or(0.)
-                + offset;
+    fn evaluate(&mut self, solution: &Vector) -> SpiceResult<()> {
+        for (value, &(row, offset)) in self.coordinates.iter_mut().zip(&self.rows) {
+            let coordinate = match row {
+                Some(row) => solution.get(row).ok_or_else(|| {
+                    SpiceError::circuit("prepared tile solution dimension mismatch")
+                })?,
+                None => 0.,
+            };
+            *value = offset.map_or(coordinate, |offset| coordinate + offset);
         }
         self.prepared
             .evaluate(&self.coordinates, &mut self.output)
-            .map_err(kernel_error)
+            .map_err(evaluation_error)
     }
 
     fn point(&mut self, lane: usize) -> SpiceResult<Point<'_>> {
@@ -103,7 +104,52 @@ impl<K: Kernel> Tile for BoundTile<K> {
     }
 }
 
+/// Inputs that determine a lane's preparation and thermal row offset.
+pub struct Recipe<'a> {
+    pub(super) key: Key,
+    pub(super) values: &'a [Real],
+    pub(super) ambient: Real,
+    pub(super) circuit_temperature: Real,
+}
+
+struct Lane {
+    index: usize,
+    key: Key,
+    values: Vec<u64>,
+    ambient: u64,
+    circuit_temperature: u64,
+}
+
+impl Lane {
+    fn new(index: usize, device: &dyn Device) -> SpiceResult<Self> {
+        let recipe = device
+            .prepared_recipe()
+            .ok_or_else(|| SpiceError::circuit("missing prepared lane recipe"))?;
+        Ok(Self {
+            index,
+            key: recipe.key,
+            values: recipe.values.iter().map(|value| value.to_bits()).collect(),
+            ambient: recipe.ambient.to_bits(),
+            circuit_temperature: recipe.circuit_temperature.to_bits(),
+        })
+    }
+
+    fn matches(&self, device: &dyn Device) -> bool {
+        device.prepared_recipe().is_some_and(|recipe| {
+            self.key == recipe.key
+                && self.ambient == recipe.ambient.to_bits()
+                && self.circuit_temperature == recipe.circuit_temperature.to_bits()
+                && self
+                    .values
+                    .iter()
+                    .copied()
+                    .eq(recipe.values.iter().map(|value| value.to_bits()))
+        })
+    }
+}
+
 struct Group {
+    lanes: Vec<Lane>,
     tile: Box<dyn Tile>,
     evaluated: bool,
 }
@@ -121,6 +167,7 @@ pub(crate) struct Plan {
 impl Plan {
     pub(crate) fn new<'a>(
         device_count: usize,
+        unknowns: &MnaUnknowns,
         devices: impl Iterator<Item = (usize, &'a dyn Device)>,
     ) -> SpiceResult<Self> {
         let mut families: BTreeMap<Key, Vec<(usize, &dyn Device)>> = BTreeMap::new();
@@ -137,17 +184,63 @@ impl Plan {
                 }
                 let instances: Vec<_> = tile.iter().map(|&(_, device)| device).collect();
                 let group = plan.groups.len();
-                let prepared = instances[0].prepare_batch(&instances)?;
+                let prepared = instances[0].prepare_batch(&instances, unknowns)?;
                 for (lane, &(index, _)) in tile.iter().enumerate() {
                     plan.bindings[index] = Some((group, lane));
                 }
+                let lanes = tile
+                    .iter()
+                    .map(|&(index, device)| Lane::new(index, device))
+                    .collect::<SpiceResult<_>>()?;
                 plan.groups.push(Group {
+                    lanes,
                     tile: prepared,
                     evaluated: false,
                 });
             }
         }
         Ok(plan)
+    }
+
+    /// Reuse unchanged groups across context transitions. Construct every
+    /// affected tile before committing any replacement, so a failed
+    /// preparation leaves the previous plan usable.
+    pub(crate) fn rebind<'a>(
+        &mut self,
+        device: impl Fn(usize) -> &'a dyn Device,
+        unknowns: &MnaUnknowns,
+    ) -> SpiceResult<()> {
+        let mut replacements = Vec::new();
+        for (index, group) in self.groups.iter().enumerate() {
+            if group
+                .lanes
+                .iter()
+                .all(|lane| lane.matches(device(lane.index)))
+            {
+                continue;
+            }
+            let instances: Vec<_> = group.lanes.iter().map(|lane| device(lane.index)).collect();
+            let lanes = group
+                .lanes
+                .iter()
+                .zip(&instances)
+                .map(|(lane, &instance)| Lane::new(lane.index, instance))
+                .collect::<SpiceResult<_>>()?;
+            let tile = instances[0].prepare_batch(&instances, unknowns)?;
+            replacements.push((
+                index,
+                Group {
+                    lanes,
+                    tile,
+                    evaluated: false,
+                },
+            ));
+        }
+        for (index, group) in replacements {
+            self.groups[index] = group;
+        }
+        self.begin();
+        Ok(())
     }
 
     pub(crate) fn begin(&mut self) {
@@ -159,7 +252,6 @@ impl Plan {
     pub(crate) fn point(
         &mut self,
         device: usize,
-        unknowns: &MnaUnknowns,
         solution: &Vector,
     ) -> SpiceResult<Option<Point<'_>>> {
         let Some((group, lane)) = self.bindings.get(device).copied().flatten() else {
@@ -167,7 +259,7 @@ impl Plan {
         };
         let group = &mut self.groups[group];
         if !group.evaluated {
-            group.tile.evaluate(unknowns, solution)?;
+            group.tile.evaluate(solution)?;
             group.evaluated = true;
         }
         group.tile.point(lane).map(Some)

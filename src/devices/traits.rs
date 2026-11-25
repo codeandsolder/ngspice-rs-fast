@@ -849,12 +849,18 @@ pub trait Device: fmt::Debug + std::any::Any {
         None
     }
 
+    /// Exact preparation inputs for detecting unchanged tile lanes.
+    fn prepared_recipe(&self) -> Option<crate::devices::prepared_model::batch::Recipe<'_>> {
+        None
+    }
+
     /// Prepare a bounded homogeneous tile at a candidate-context boundary.
     /// # Errors
     /// Incompatible instances, invalid parameters or unsupported tile.
     fn prepare_batch(
         &self,
         _instances: &[&dyn Device],
+        _unknowns: &MnaUnknowns,
     ) -> SpiceResult<Box<dyn crate::devices::prepared_model::batch::Tile>> {
         Err(SpiceError::circuit(
             "device has no prepared batch implementation",

@@ -1149,6 +1149,15 @@ fn vdmos_circuit(
     model: &Arc<Artifact<model_kernel_vdmos::artifact::VdmosKernel>>,
     lanes: usize,
 ) -> Circuit {
+    vdmos_circuit_with(model, lanes, false, false)
+}
+
+fn vdmos_circuit_with(
+    model: &Arc<Artifact<model_kernel_vdmos::artifact::VdmosKernel>>,
+    lanes: usize,
+    step: bool,
+    scalar: bool,
+) -> Circuit {
     let mut circuit = Circuit::new();
     for lane in 0..lanes {
         let drain = circuit.add_node(&format!("d{lane}")).unwrap();
@@ -1165,15 +1174,28 @@ fn vdmos_circuit(
                         true,
                         dc,
                         Complex::real(ac),
-                        Waveform::Constant(dc),
+                        if step && dc == 4. {
+                            Waveform::Step {
+                                before: 4.,
+                                after: 4.5,
+                                time: 3e-6,
+                            }
+                        } else {
+                            Waveform::Constant(dc)
+                        },
                     )
                     .unwrap(),
                 ))
                 .unwrap();
         }
+        let instance_model = if scalar {
+            vdmos_fixture()
+        } else {
+            Arc::clone(model)
+        };
         PreparedDevice::bind(
             &mut circuit,
-            model,
+            &instance_model,
             &format!("m{lane}"),
             &[drain, gate, NodeId::GROUND],
             &[1. + lane as f64],
@@ -1402,4 +1424,225 @@ fn actual_vdmos_operating_point_matches_c_reference() {
             "{name}: {actual:e} vs {reference:e}"
         );
     }
+}
+
+#[test]
+fn vdmos_tiled_transient_matches_independent_scalar_instances() {
+    let model = vdmos_fixture();
+    let mut tiled = vdmos_circuit_with(&model, 3, true, false);
+    let mut scalar = vdmos_circuit_with(&model, 3, true, true);
+    let request =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["100n", "6u", "0", "50n"])
+            .resolve()
+            .unwrap();
+    let a = request
+        .run(&mut tiled, &AnalysisContext::default())
+        .unwrap();
+    let b = request
+        .run(&mut scalar, &AnalysisContext::default())
+        .unwrap();
+    assert_eq!(a.point_count(), b.point_count());
+    assert!(a.point_count() > 5);
+    let mut first = None;
+    let mut last = None;
+    for row in 0..a.point_count() {
+        for name in [
+            "time", "i(vd0)", "i(vd1)", "i(vd2)", "i(vg0)", "i(vg1)", "i(vg2)",
+        ] {
+            let x = a.value(name, row).unwrap().re;
+            let y = b.value(name, row).unwrap().re;
+            assert!(x.is_finite() && y.is_finite());
+            assert_eq!(x.to_bits(), y.to_bits(), "{name} at {row}");
+        }
+        let time = a.value("time", row).unwrap().re;
+        let drain = a.value("i(vd0)", row).unwrap().re;
+        if time < 2e-6 {
+            first = Some(drain);
+        }
+        if time > 5e-6 {
+            last = Some(drain);
+        }
+    }
+    assert!(last.unwrap().abs() > first.unwrap().abs());
+}
+
+#[test]
+#[ignore = "opt-in real engine load benchmark"]
+fn vdmos_tile_engine_benchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let model = vdmos_fixture();
+    let lanes = 128;
+    let tiled = vdmos_circuit_with(&model, lanes, false, false);
+    let scalar = vdmos_circuit_with(&model, lanes, false, true);
+    let measurement = |circuit: &Circuit| {
+        let run = circuit.prepare_run();
+        let history = circuit.state_history().unwrap();
+        let n = circuit.unknown_count();
+        let context = ModelContext::default();
+        let mut solution = Vector::zeros(n);
+        for lane in 0..lanes {
+            for (node, value) in [(format!("d{lane}"), 0.25), (format!("g{lane}"), 4.)] {
+                let row = circuit
+                    .unknowns()
+                    .node_row(circuit.nodes().get(&node).unwrap())
+                    .unwrap();
+                solution.as_mut_slice()[row] = value;
+            }
+        }
+        let mut matrix = circuit.new_matrix().unwrap();
+        let mut rhs = Vector::zeros(n);
+        let mut trial = history.trial();
+        // Warm the fixed-stamp and prepared tile caches before timing.
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context: &context,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        run.load(&request, &mut matrix, &mut rhs, &mut trial)
+            .unwrap();
+        let start = Instant::now();
+        for _ in 0..300 {
+            matrix.clear();
+            rhs.clear();
+            run.load(&request, &mut matrix, &mut rhs, &mut trial)
+                .unwrap();
+            black_box((&matrix, &rhs));
+        }
+        let elapsed = start.elapsed().as_nanos() as f64 / 300.;
+        let snapshot: Vec<_> = matrix
+            .bound_values()
+            .unwrap()
+            .1
+            .iter()
+            .chain(rhs.as_slice())
+            .map(|v| v.to_bits())
+            .collect();
+        (elapsed, snapshot)
+    };
+    let mut tiles = Vec::new();
+    let mut scalars = Vec::new();
+    for round in 0..12 {
+        let ((t, a), (s, b)) = if round % 2 == 0 {
+            (measurement(&tiled), measurement(&scalar))
+        } else {
+            let b = measurement(&scalar);
+            (measurement(&tiled), b)
+        };
+        assert_eq!(a, b);
+        if round > 0 {
+            tiles.push(t);
+            scalars.push(s);
+        }
+    }
+    tiles.sort_by(f64::total_cmp);
+    scalars.sort_by(f64::total_cmp);
+    let (tile, scalar) = (tiles[5], scalars[5]);
+    println!(
+        "VDMOS {lanes} lanes: tiled {tile:.0} ns/load, scalar {scalar:.0} ns/load, ratio {:.4}",
+        tile / scalar
+    );
+}
+
+#[derive(Debug)]
+struct CountingKernel {
+    preparations: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Kernel for CountingKernel {
+    type Prepared = Polynomial;
+
+    fn prepare(&self, values: &[Real], ambient: Real) -> model_kernel_api::Result<Polynomial> {
+        self.preparations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        PolynomialKernel.prepare(values, ambient)
+    }
+
+    fn evaluate(
+        &self,
+        prepared: &Polynomial,
+        coordinates: &[Real],
+        out: &mut Point<'_>,
+    ) -> model_kernel_api::Result<()> {
+        PolynomialKernel.evaluate(prepared, coordinates, out)
+    }
+}
+
+#[test]
+fn prepared_run_reuses_unaffected_tiles_across_context_changes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let preparations = Arc::new(AtomicUsize::new(0));
+    let model = Artifact::new(
+        descriptor(Capability::Computed),
+        CountingKernel {
+            preparations: Arc::clone(&preparations),
+        },
+    )
+    .unwrap();
+    let mut circuit = Circuit::new();
+    let node = circuit.add_node("n").unwrap();
+    for lane in 0..129 {
+        circuit
+            .add_device(Box::new(
+                PreparedDevice::new(
+                    &model,
+                    format!("m{lane}"),
+                    vec![node, NodeId::GROUND],
+                    &[1e-3, 2e-4, 1e-6, 2e-7],
+                    InstanceTemperature::circuit(27.),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+    }
+    circuit.finalize().unwrap();
+    let run = circuit.prepare_run();
+    let history = circuit.state_history().unwrap();
+    let n = circuit.unknown_count();
+    let load = |context: &ModelContext| {
+        let mut matrix = SparseMatrix::new(n, n);
+        let mut rhs = Vector::zeros(n);
+        let mut trial = history.trial();
+        run.load(
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &Vector::from_slice(&[0.25]),
+                model_context: context,
+                integration: None,
+                history: &history,
+                forcing: None,
+            },
+            &mut matrix,
+            &mut rhs,
+            &mut trial,
+        )
+        .unwrap();
+        matrix.get(0, 0)
+    };
+    let count = || preparations.load(Ordering::Relaxed);
+    assert_eq!(count(), 129);
+    let context = ModelContext::default();
+    let original = load(&context);
+    assert_eq!(count(), 129 + 128);
+    assert_eq!(load(&context).to_bits(), original.to_bits());
+    assert_eq!(
+        load(&context.with_frequency(1000.)).to_bits(),
+        original.to_bits()
+    );
+    assert_eq!(count(), 129 + 128);
+    let name = &model.descriptor().parameters[0].name;
+    let target = circuit.bind_instance_target("m3", name).unwrap();
+    let changed = context
+        .with_instance_override(target.at(2e-3).unwrap())
+        .unwrap();
+    assert!(load(&changed) > original);
+    assert_eq!(count(), 129 + 128 + 1 + 64);
+    let after = count();
+    load(&changed);
+    assert_eq!(count(), after);
+    assert_eq!(load(&context).to_bits(), original.to_bits());
+    assert_eq!(count(), after + 64);
 }

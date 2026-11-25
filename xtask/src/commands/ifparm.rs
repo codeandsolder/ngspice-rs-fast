@@ -376,9 +376,7 @@ fn grouped_literal(value: f64) -> String {
         .split_once('.')
         .map_or((digits, None), |(w, d)| (w, Some(d)));
     let whole = group_digits(whole, true);
-    let fraction = decimal
-        .map(|d| format!(".{}", group_digits(d, false)))
-        .unwrap_or_default();
+    let fraction = decimal.map_or_default(|d| format!(".{}", group_digits(d, false)));
     format!("{sign}{whole}{fraction}{exponent}")
 }
 

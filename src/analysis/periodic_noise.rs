@@ -557,8 +557,9 @@ fn add_native_band<'a>(
     context: &ModelContext,
     incoming: (usize, Real),
     phases: &NoisePhases,
-    sums: &mut [CoherentSum],
+    workspace: (&mut [CoherentSum], &mut usize),
 ) -> SpiceResult<()> {
+    let (sums, remaining) = workspace;
     let (band, frequency) = incoming;
     sums.fill(CoherentSum::ZERO);
     let context = context.with_frequency(frequency.abs());
@@ -573,6 +574,17 @@ fn add_native_band<'a>(
         let generators = plan.instances().flat_map(|(_, sources)| sources);
         for (source, outputs) in generators.zip(sums.chunks_exact_mut(phases.outputs)) {
             let terms = source.periodic_amplitudes(frequency)?;
+            // The baseline work budget reserves four terms per generator.
+            // Charge additional coherent injections before propagating them.
+            let extra = terms
+                .clone()
+                .count()
+                .saturating_sub(4)
+                .checked_mul(phases.outputs)
+                .ok_or_else(|| failure("periodic generalized noise work overflow"))?;
+            *remaining = remaining
+                .checked_sub(extra)
+                .ok_or_else(|| failure("periodic generalized noise work exceeded"))?;
             for (sum, adjoint) in outputs.iter_mut().zip(adjoints.chunks_exact(phases.rows)) {
                 let value = terms.clone().fold(Complex::ZERO, |sum, (row, amplitude)| {
                     row.map_or(sum, |row| sum + adjoint[row] * amplitude)
@@ -659,6 +671,7 @@ impl NoiseAccumulator<'_, '_> {
             return Err(failure("aggregate periodic native noise work exceeded"));
         }
         self.charge_work(work)?;
+        let mut remaining = self.limits.work - self.work - covariance_work;
         let entries = product(
             count,
             self.output_count,
@@ -686,6 +699,7 @@ impl NoiseAccumulator<'_, '_> {
             "periodic generator output amplitudes",
         )?;
         for (band, coordinate) in self.response.plan().bands().iter().enumerate() {
+            let before = remaining;
             add_native_band(
                 &mut plan,
                 &run,
@@ -693,8 +707,9 @@ impl NoiseAccumulator<'_, '_> {
                 &orbit.context,
                 (band, coordinate.frequency()),
                 &phases,
-                &mut sums,
+                (&mut sums, &mut remaining),
             )?;
+            self.charge_work(before - remaining)?;
             for source in sums.chunks_exact(self.output_count) {
                 for (amplitude, sum) in amplitudes.iter_mut().zip(source) {
                     *amplitude = sum.sum;
