@@ -42,7 +42,7 @@ pub struct TransferPorts {
 }
 
 /// Cold transfer specification. Polynomial coefficients are in descending
-/// powers, following the XSPICE s_xfer convention.
+/// powers, following the XSPICE `s_xfer` convention.
 #[derive(Debug, Clone, Copy)]
 pub struct RationalSpec<'a> {
     /// Numerator coefficients, highest degree first.
@@ -277,6 +277,7 @@ impl Realization {
 
 /// Native rational transfer element with voltage/current ports. One physical branch
 /// current followed by normalized state coordinates is allocated in MNA.
+///
 /// Stable, unstable, and marginal causal systems use the same equations;
 /// no coefficient or pole is silently clamped.
 #[derive(Debug, Clone)]
@@ -714,7 +715,7 @@ impl Model {
     }
 }
 
-/// Bind a parsed XSPICE s_xfer model. Its immutable realization is shared
+/// Bind a parsed XSPICE `s_xfer` model. Its immutable realization is shared
 /// across instances; accepted histories remain entirely device-local.
 pub(in crate::devices) fn instantiate(
     instance: &DeviceInstance,

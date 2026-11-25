@@ -756,6 +756,14 @@ impl CircuitCandidate<'_> {
                 roundings,
             ));
         }
+        let prepared = self.prepare_structural(parameters)?;
+        Ok((prepared, Vec::new(), evaluations, roundings))
+    }
+
+    fn prepare_structural(
+        &self,
+        parameters: &CandidateParameters<'_>,
+    ) -> SpiceResult<PreparedCandidate> {
         // Every dimension, including non-instance model and topology-changing
         // coordinates, is handled by this general scalar-equivalent path.
         // Failed structural validation cannot escape through the cached matrix.
@@ -769,15 +777,10 @@ impl CircuitCandidate<'_> {
             crate::devices::ElaborationLimits::default(),
             Some(scope),
         )?;
-        Ok((
-            PreparedCandidate {
-                context,
-                config,
-                circuit: Some(circuit),
-            },
-            Vec::new(),
-            evaluations,
-            roundings,
-        ))
+        Ok(PreparedCandidate {
+            context,
+            config,
+            circuit: Some(circuit),
+        })
     }
 }

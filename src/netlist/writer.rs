@@ -829,29 +829,7 @@ impl Writer<'_> {
                         && ["num_coeff", "den_coeff", "int_ic"]
                             .contains(&parameter.name.as_str()) =>
                 {
-                    parts.push_str(&parameter.name)?;
-                    parts.push_str("=[")?;
-                    for (index, entry) in entries.iter().enumerate() {
-                        if index != 0 {
-                            parts.push(' ')?;
-                        }
-                        if let Some(expression) = &entry.expression {
-                            check_value_expression(
-                                &parts,
-                                &entry.source.text,
-                                expression,
-                                &entry.source.location,
-                            )?;
-                            parts.push_str(&entry.source.text)?;
-                        } else {
-                            parts.push_str(positioned_number(
-                                &parts,
-                                &entry.source,
-                                &entry.source.location,
-                            )?)?;
-                        }
-                    }
-                    parts.push(']')?;
+                    append_transfer_vector(&mut parts, parameter, entries)?;
                 }
                 ParameterKind::Flag => {
                     let allowed = model_flags(base);
@@ -1303,6 +1281,39 @@ fn value_text<'a>(
         _ => return Err(bad("value kind is not allowed here")),
     }
     Ok(&parameter.value)
+}
+
+/// Write a transfer coefficient or initial-condition vector without
+/// losing numeric expressions or source spelling.
+fn append_transfer_vector(
+    parts: &mut Card<'_>,
+    parameter: &ParameterAssignment,
+    entries: &[crate::netlist::ast::NumericVectorEntry],
+) -> SpiceResult<()> {
+    parts.push_str(&parameter.name)?;
+    parts.push_str("=[")?;
+    for (index, entry) in entries.iter().enumerate() {
+        if index != 0 {
+            parts.push(' ')?;
+        }
+        if let Some(expression) = &entry.expression {
+            check_value_expression(
+                parts,
+                &entry.source.text,
+                expression,
+                &entry.source.location,
+            )?;
+            parts.push_str(&entry.source.text)?;
+        } else {
+            parts.push_str(positioned_number(
+                parts,
+                &entry.source,
+                &entry.source.location,
+            )?)?;
+        }
+    }
+    parts.push(']')?;
+    Ok(())
 }
 
 /// Write the evaluated independent CPL vector coefficients as ordinary

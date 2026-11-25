@@ -745,13 +745,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         if !next.is_finite() {
             return Err(failure("nonfinite Newton iterate"));
         }
-        if iterno > options.max_iterations {
-            progress.last_iterate = Some(guess);
-            return Err(failure(format!(
-                "Newton iteration limit ({}) reached",
-                options.max_iterations
-            )));
-        }
+        check_iteration_budget(progress, &guess, options)?;
         let mut noncon = if flagged || iterno == 1 {
             true
         } else {
@@ -821,6 +815,21 @@ fn damp(
         }
     }
 }
+fn check_iteration_budget(
+    progress: &mut Progress,
+    guess: &Vector,
+    options: &NewtonOptions,
+) -> SpiceResult<()> {
+    if progress.iterations > options.max_iterations {
+        progress.last_iterate = Some(guess.clone());
+        return Err(failure(format!(
+            "Newton iteration limit ({}) reached",
+            options.max_iterations
+        )));
+    }
+    Ok(())
+}
+
 /// The explicit storage formulation has a private coordinate with a
 /// two-term linear evolution equation. Reconstruct that coordinate from
 /// the solved physical derivative, not from cancellation in the nonlinear

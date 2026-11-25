@@ -2,6 +2,10 @@
 use super::Real;
 const INV_53: Real = 1. / 9_007_199_254_740_992.;
 
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
 pub(crate) const fn mix(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -15,14 +19,26 @@ const fn draw(key: u64, stream: u64, index: u64, ordinal: u64) -> u64 {
 }
 /// Convert integer through 32-bit limbs; all binary64 grid integers
 /// are exactly represented without relying on a narrowing cast.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
 pub(crate) fn real_u64(value: u64) -> Real {
     let hi = u32::try_from(value >> 32).unwrap_or_default();
     let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or_default();
     4_294_967_296_f64.mul_add(Real::from(hi), Real::from(lo))
 }
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
 pub(crate) fn uniform(key: u64, stream: u64, index: u64, ordinal: u64) -> Real {
     (real_u64(draw(key, stream, index, ordinal) >> 11) + 0.5) * INV_53
 }
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
 pub(crate) fn gaussian(key: u64, stream: u64, index: u64) -> Real {
     let unit = uniform(key, stream, index, 0);
     let theta = std::f64::consts::TAU * uniform(key, stream, index, 1);

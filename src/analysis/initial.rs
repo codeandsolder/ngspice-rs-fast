@@ -472,7 +472,7 @@ fn bound_expression_storage(
     let rows = circuit
         .branch_rows(index)
         .ok_or_else(|| failure("missing initial expression branch binding"))?;
-    let states = circuit
+    let mut states = circuit
         .state_rows(index)
         .ok_or_else(|| failure("missing initial expression state binding"))?;
     let bind = |row| {
@@ -491,7 +491,7 @@ fn bound_expression_storage(
         .map(AbsoluteRow)
         .ok_or_else(|| failure(format!("{}: invalid initial expression row", device.name())))
     };
-    let slot = states.clone().nth(storage.slot).ok_or_else(|| {
+    let slot = states.nth(storage.slot).ok_or_else(|| {
         failure(format!(
             "{}: invalid initial expression slot",
             device.name()
@@ -824,7 +824,7 @@ fn solve_nonlinear_instantaneous(
         };
         let scale = solution.step_scale(&x, options.voltage_step, &limited);
         x = solution.update(&x, scale);
-        previous = (scale == 1.).then_some(solution);
+        previous = (scale >= 1.).then_some(solution);
     }
     best.map(|(_, solution)| Some(solution)).ok_or_else(|| {
         let names = storage

@@ -91,7 +91,7 @@ impl InstantaneousSolution {
                 .zip(&self.original)
                 .map(|(&previous, value)| {
                     value.map_or(previous, |value| {
-                        if scale == 1. {
+                        if scale >= 1. {
                             value
                         } else {
                             scale.mul_add(value - previous, previous)
@@ -131,16 +131,17 @@ pub(super) struct InstantaneousSystem<'a> {
     matrix: SparseMatrix,
 }
 
-impl<'a> InstantaneousSystem<'a> {
-    pub(super) fn assemble(
-        circuit: &Circuit,
-        matrix: &SparseMatrix,
-        rhs: &Vector,
-        storage: &'a ImpulseStorage,
-        kept: &[&'a CapacitorInitial],
-    ) -> SpiceResult<Self> {
+struct InitialLayout<'a> {
+    bindings: Vec<Binding>,
+    equations: Vec<Equation<'a>>,
+    is_branch: Vec<bool>,
+    removed: Vec<bool>,
+}
+
+impl<'a> InitialLayout<'a> {
+    fn bind(circuit: &Circuit, rhs: &Vector, storage: &'a ImpulseStorage) -> SpiceResult<Self> {
         let unknowns = circuit.unknown_count();
-        if matrix.rows() != unknowns || matrix.cols() != unknowns || rhs.len() != unknowns {
+        if rhs.len() != unknowns {
             return Err(failure(
                 "instantaneous matrix/vector size does not match finalized circuit",
             ));
@@ -187,29 +188,33 @@ impl<'a> InstantaneousSystem<'a> {
             .collect();
         for (row, &kind) in is_branch.iter().enumerate() {
             let absolute = AbsoluteRow(row);
-            let variable = if let Some(fixed) = storage.fixed_coordinates.get(&absolute) {
-                VariableBinding::Fixed(fixed.value)
-            } else {
-                let binding = VariableBinding::Unknown(VariableId(variables));
-                variables += 1;
-                binding
-            };
+            let variable = storage.fixed_coordinates.get(&absolute).map_or_else(
+                || {
+                    let binding = VariableBinding::Unknown(VariableId(variables));
+                    variables += 1;
+                    binding
+                },
+                |fixed| VariableBinding::Fixed(fixed.value),
+            );
             let equation = if removed[row] {
                 None
             } else {
                 let equation = EquationId(equations.len());
-                let origin = if let Some(charge) = storage.charges.get(&absolute) {
-                    match charge.policy {
+                let origin = storage.charges.get(&absolute).map_or_else(
+                    || {
+                        if let Some(&name) = charge_laws.get(&absolute) {
+                            EquationOrigin::ChargeLaw(name)
+                        } else if kind {
+                            EquationOrigin::Branch(absolute)
+                        } else {
+                            EquationOrigin::Node(absolute)
+                        }
+                    },
+                    |charge| match charge.policy {
                         InitialStoragePolicy::Physical => EquationOrigin::Charge(&charge.name),
                         InitialStoragePolicy::Derived => EquationOrigin::Derived(absolute),
-                    }
-                } else if let Some(&name) = charge_laws.get(&absolute) {
-                    EquationOrigin::ChargeLaw(name)
-                } else if kind {
-                    EquationOrigin::Branch(absolute)
-                } else {
-                    EquationOrigin::Node(absolute)
-                };
+                    },
+                );
                 equations.push(Equation::new(origin, rhs.as_slice()[row]));
                 Some(equation)
             };
@@ -220,6 +225,35 @@ impl<'a> InstantaneousSystem<'a> {
                 "unbalanced fixed coordinates and released equations",
             ));
         }
+        Ok(Self {
+            bindings,
+            equations,
+            is_branch,
+            removed,
+        })
+    }
+}
+
+impl<'a> InstantaneousSystem<'a> {
+    pub(super) fn assemble(
+        circuit: &Circuit,
+        matrix: &SparseMatrix,
+        rhs: &Vector,
+        storage: &'a ImpulseStorage,
+        kept: &[&'a CapacitorInitial],
+    ) -> SpiceResult<Self> {
+        let unknowns = circuit.unknown_count();
+        if matrix.rows() != unknowns || matrix.cols() != unknowns {
+            return Err(failure(
+                "instantaneous matrix size does not match finalized circuit",
+            ));
+        }
+        let InitialLayout {
+            bindings,
+            equations,
+            is_branch,
+            removed,
+        } = InitialLayout::bind(circuit, rhs, storage)?;
         let mut replacements = vec![None; unknowns];
         for capacitor in kept {
             if let Some(row) = capacitor.equation
@@ -330,9 +364,10 @@ impl<'a> InstantaneousSystem<'a> {
             }
             let absolute = match equation.origin {
                 EquationOrigin::Node(_) => tolerance.abstol,
-                EquationOrigin::Branch(_) | EquationOrigin::Capacitor(_) => tolerance.vntol,
+                EquationOrigin::Branch(_)
+                | EquationOrigin::Capacitor(_)
+                | EquationOrigin::Derived(_) => tolerance.vntol,
                 EquationOrigin::Charge(_) | EquationOrigin::ChargeLaw(_) => tolerance.chgtol,
-                EquationOrigin::Derived(_) => tolerance.vntol,
             };
             let relative_limit = tolerance.reltol * equation.scale;
             if equation.rhs.abs() > absolute + relative_limit {
@@ -421,9 +456,10 @@ impl<'a> InstantaneousSystem<'a> {
             }
             let absolute = match eq.origin {
                 EquationOrigin::Node(_) => tolerance.abstol,
-                EquationOrigin::Branch(_) | EquationOrigin::Capacitor(_) => tolerance.vntol,
+                EquationOrigin::Branch(_)
+                | EquationOrigin::Capacitor(_)
+                | EquationOrigin::Derived(_) => tolerance.vntol,
                 EquationOrigin::Charge(_) | EquationOrigin::ChargeLaw(_) => tolerance.chgtol,
-                EquationOrigin::Derived(_) => tolerance.vntol,
             };
             if !residual.is_finite() || !scale.is_finite() {
                 return (Real::INFINITY, false);
@@ -517,17 +553,7 @@ impl<'a> InstantaneousSystem<'a> {
             return Ok(None);
         }
 
-        let mut matrix = SparseMatrix::new(rhs.len(), columns);
-        for triplet in self.matrix.triplets() {
-            let Some(row) = rows[triplet.row] else {
-                return Err(failure("nonempty row was not bound"));
-            };
-            let Some(col) = column_index[triplet.col] else {
-                return Err(failure("nonempty column was not bound"));
-            };
-            matrix.add(row.0, col.0, triplet.value)?;
-        }
-        matrix.fold_duplicates();
+        let matrix = self.compact_matrix(rhs.len(), columns, &rows, &column_index)?;
         let (solution, independent_derived) = self.solve_compact(
             &matrix,
             &rhs,
@@ -555,6 +581,27 @@ impl<'a> InstantaneousSystem<'a> {
             reduced,
             independent_derived,
         }))
+    }
+
+    fn compact_matrix(
+        &self,
+        row_count: usize,
+        columns: usize,
+        rows: &[Option<CompactRow>],
+        column_index: &[Option<CompactColumn>],
+    ) -> SpiceResult<SparseMatrix> {
+        let mut matrix = SparseMatrix::new(row_count, columns);
+        for triplet in self.matrix.triplets() {
+            let Some(row) = rows[triplet.row] else {
+                return Err(failure("nonempty row was not bound"));
+            };
+            let Some(col) = column_index[triplet.col] else {
+                return Err(failure("nonempty column was not bound"));
+            };
+            matrix.add(row.0, col.0, triplet.value)?;
+        }
+        matrix.fold_duplicates();
+        Ok(matrix)
     }
 
     fn solve_compact(

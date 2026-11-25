@@ -227,13 +227,13 @@ impl<'a> ConstraintGraph<'a> {
         rhs: &Vector,
         inductors_short: bool,
     ) -> SpiceResult<Self> {
+        use crate::devices::InitialVoltageLaw;
         let mut graph = Self::new(circuit.unknown_count())?;
         if rhs.as_slice().len() != circuit.unknown_count() {
             return Err(failure(
                 "constraint source vector does not match finalized circuit",
             ));
         }
-        use crate::devices::InitialVoltageLaw;
         let mut fixed = Vec::new();
         for (index, device) in circuit.devices().iter().enumerate() {
             for relation in device.initial_voltage_relations(inductors_short) {
@@ -243,10 +243,10 @@ impl<'a> ConstraintGraph<'a> {
                 let origin = Origin::Device(device.name());
                 match relation.law {
                     InitialVoltageLaw::Controlled => {
-                        graph.add_controlled(positive, negative, origin)
+                        graph.add_controlled(positive, negative, origin);
                     }
                     InitialVoltageLaw::Fixed(value) => {
-                        fixed.push((positive, negative, value, origin))
+                        fixed.push((positive, negative, value, origin));
                     }
                     InitialVoltageLaw::Source(branch) => {
                         let rows = circuit

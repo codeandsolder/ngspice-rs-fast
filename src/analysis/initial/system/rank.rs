@@ -23,23 +23,28 @@ impl Coefficient {
         Self { value, error: 0. }
     }
 
-    fn finite(self) -> bool {
+    const fn finite(self) -> bool {
         self.value.is_finite() && self.error.is_finite()
     }
 
     fn eliminate(self, factor: Self, pivot: Self) -> Self {
         let value = (-factor.value).mul_add(pivot.value, self.value);
-        let error = self.error
-            + factor.value.abs() * pivot.error
-            + factor.error * (pivot.value.abs() + pivot.error)
-            + Real::EPSILON * value.abs();
+        let error = Real::EPSILON.mul_add(
+            value.abs(),
+            factor.error.mul_add(
+                pivot.value.abs() + pivot.error,
+                factor.value.abs().mul_add(pivot.error, self.error),
+            ),
+        );
         Self { value, error }
     }
 
     fn normalized(self, pivot: Self) -> Self {
         let value = self.value / pivot.value;
-        let error = (self.error + value.abs() * pivot.error) / (pivot.value.abs() - pivot.error)
-            + Real::EPSILON * value.abs();
+        let error = Real::EPSILON.mul_add(
+            value.abs(),
+            value.abs().mul_add(pivot.error, self.error) / (pivot.value.abs() - pivot.error),
+        );
         Self { value, error }
     }
 
