@@ -174,6 +174,23 @@ impl ModelSchema {
     }
 }
 
+/// Result of advancing an externally clocked simulator with unchanged inputs.
+///
+/// An output event stops the advance at its physical time; otherwise the
+/// simulator has reached the requested horizon without changing its outputs.
+#[derive(Debug)]
+pub enum AutonomousAdvance {
+    /// No externally visible event through the horizon.
+    Quiet,
+    /// First settled output change.
+    Event {
+        /// Physical time of the output event.
+        time: Real,
+        /// Complete output values at this time.
+        outputs: Vec<Output>,
+    },
+}
+
 /// Immutable native digital model with typed, cloneable state. State must
 /// not share mutable data between clones; the scheduler owns trial copies.
 pub trait CodeModel: std::fmt::Debug + Send + Sync + 'static {
@@ -183,6 +200,35 @@ pub trait CodeModel: std::fmt::Debug + Send + Sync + 'static {
     fn schema(&self) -> ModelSchema;
     /// Initial model-defined state.
     fn initial_state(&self) -> Self::State;
+    /// Absolute time of the next autonomous evaluation, if any. A time equal
+    /// to the current time schedules the next delta cycle. The scheduler
+    /// replaces the previous wakeup after each evaluation.
+    fn next_wakeup(&self, _state: &Self::State) -> Option<Real> {
+        None
+    }
+    /// Whether this model must be probed through a time horizon because its
+    /// simulator cannot directly query the next autonomous event.
+    fn requires_lookahead(&self) -> bool {
+        false
+    }
+
+    /// Advance a disposable model state with its inputs held constant.
+    /// A returned event must be strictly after `now` and at or before
+    /// `horizon`. A quiet result must reach the horizon.
+    ///
+    /// # Errors
+    /// Simulator failure, or unsupported autonomous lookahead.
+    fn advance_autonomous(
+        &self,
+        _now: Real,
+        _horizon: Real,
+        _state: &mut Self::State,
+    ) -> SpiceResult<AutonomousAdvance> {
+        Err(SpiceError::circuit(
+            "model does not support autonomous lookahead",
+        ))
+    }
+
     /// Evaluate the model against resolved inputs.
     ///
     /// # Errors

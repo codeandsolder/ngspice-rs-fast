@@ -54,6 +54,7 @@ pub mod code_model;
 pub mod controlled;
 pub mod cpl;
 pub mod delay;
+pub mod digital_bridge;
 pub mod distortion;
 mod elaboration;
 mod factory;
