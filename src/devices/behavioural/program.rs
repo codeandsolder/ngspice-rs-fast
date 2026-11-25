@@ -4,9 +4,9 @@
 //! (`PT_mkfnode`, `PTdifferentiate`, `prepare_PTF_PWL`), `ptfuncs.c` (the
 //! function values and domain rules) and `ifeval.c` (`PTeval`). Like ngspice,
 //! the port keeps the parse tree unsimplified, differentiates it symbolically
-//! once per quantity with C's rules and its `mkb`/`mkf` simplifications
-//! (constant folding, the 0/1 identities), and evaluates the value tree and
-//! each derivative with the same operation order as C. Sparse symbolic
+//! once per quantity with analytic rules for the actual value kernels and
+//! constant folding/zero-one identities. The evaluation retains SPICE
+//! value semantics, but does not reproduce inconsistent Jacobians. Sparse symbolic
 //! partials are built directly in an indexed DAG; successful finite results are
 //! reused only within one environment, with lazy branch traversal. That includes the deliberate non-derivatives
 //! (`floor`, comparisons, `u` and `pwl_derivative` are zero or piecewise) and
@@ -23,8 +23,8 @@
 //!   compatibility); `pow()` is the same except `pow(0, b) = 0` (`PTpower`);
 //!   `pwr(a, b) = sign(a) |a|^b`;
 //! - `u(0) = 0.5`; `nint` rounds half to even; `pwl()` extrapolates the end
-//!   segments linearly, and its derivative uses C's ascending-only search
-//!   (`PTpwl_derivative`) even for descending tables.
+//!   segments linearly, and its derivative uses the same selected segment as
+//!   the value, including descending tables.
 //!
 //! Where C silently continues with a NaN (for example `acos(2)`) or an
 //! infinity, the port stops with an explicit numerical error naming the
@@ -747,9 +747,9 @@ impl PwlTable {
         y0 + (y1 - y0) * (arg - x0) / (x1 - x0)
     }
 
-    /// `PTpwl_derivative`: intentionally ignores the table's actual order.
+    /// Derivative of the selected interpolation/extrapolation segment.
     fn slope(&self, arg: Real) -> Real {
-        let [(x0, y0), (x1, y1)] = self.segment(arg, PwlOrder::Ascending);
+        let [(x0, y0), (x1, y1)] = self.segment(arg, self.order);
         (y1 - y0) / (x1 - x0)
     }
 }
@@ -1083,7 +1083,7 @@ mod tests {
         let descending = PwlTable::new(vec![(3., 5.), (1., 1.), (0., 0.)]).unwrap();
         assert_eq!(descending.value(2.), 3.);
         assert_eq!(ascending.slope(2.), 2.);
-        assert_eq!(descending.slope(2.), 1.);
+        assert_eq!(descending.slope(2.), 2.);
 
         let duplicate = PwlTable::new(vec![(0., 0.), (1., 1.), (1., 2.), (2., 5.)]).unwrap();
         assert_eq!(duplicate.value(1.), 2.);

@@ -133,10 +133,7 @@ fn differentiate_power(rule: PowerRule, a: &Tree, b: &Tree, variable: usize) -> 
         PowerRule::Ordinary => (Binary::PowBaseSlope, Binary::PowExponentSlope),
         PowerRule::Signed => (Binary::PwrBaseSlope, Binary::PwrExponentSlope),
     };
-    let left = times(
-        mk_binary(base, a, b.clone()),
-        differentiate(a, variable),
-    );
+    let left = times(mk_binary(base, a, b.clone()), differentiate(a, variable));
     let db = differentiate(b, variable);
     if db.constant() == Some(0.) {
         left

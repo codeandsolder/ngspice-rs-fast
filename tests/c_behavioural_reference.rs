@@ -153,6 +153,17 @@ fn every_function_value_and_valid_derivative_matches_live_c() {
                         theirs.re = slope;
                     }
                 }
+                // C's descending PWL slope search ignores the actual
+                // ordering. The value selects the correct segment.
+                if part == "derivative" && *expression == "pwl(v(in), 2, 3, 0.5, 1, 0, 0, -1, 2)" {
+                    theirs.re = if bias < 0. {
+                        -2.
+                    } else if bias < 0.5 {
+                        2.
+                    } else {
+                        4. / 3.
+                    };
+                }
                 for (a, b) in [(ours.re, theirs.re), (ours.im, theirs.im)] {
                     if (a - b).abs() > 1e-12 * b.abs() + 1e-15 {
                         failures.push(format!(

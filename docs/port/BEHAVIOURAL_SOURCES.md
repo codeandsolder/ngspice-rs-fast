@@ -135,8 +135,8 @@ is inconsistent with it:
   exponents: for example `(-0.45)^3` has slope -0.6075 in C,
   whereas its physical slope is +0.6075. The corrected Jacobian
   deliberately differs from C at these points.
-- `pwl` on a descending table takes the slope C's ascending-only search
-  finds (`PTpwl_derivative`);
+- `pwl` takes the slope of the same segment as the value. This fixes
+  ngspice's ascending-only derivative search for descending tables;
 - divisions in derivative trees include the `gmin * 1e-20` fudge.
 
 Elsewhere the analytic gradient matches finite differences for every function
@@ -305,7 +305,7 @@ in the reference verifier.
   whose controlling node starts at 0 V. This is a C-parity gap for common
   decks; write `sqrt(v(x))` or `1/v(x)` (finite `1e32` slopes) instead.
 - E/G `LAPLACE` source-dialect normalization, general high-index derivative
-  initialization, and PSPICE/HSPICE/LTspice compatibility variants of
+  initialization (#230), and PSPICE/HSPICE/LTspice compatibility variants of
   `^`, `exp` and `pwr` remain separate work. The native XSPICE `s_xfer`
   rational realization is implemented.
 - Numparam-only constructs inside `.func` bodies (`?:`, comparisons) remain

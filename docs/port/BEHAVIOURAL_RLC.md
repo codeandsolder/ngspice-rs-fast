@@ -309,7 +309,10 @@ is used.
 ## Remaining work
 
 Source-dialect E/G LAPLACE normalization is tracked in the preprocessing
-repository (#44), using the native rational transfer model. General high-index right-tangent initialization, broader reference
-coverage and further nonlinear candidate preparation improvements
-remain within issue #184. Static statistical realization is documented in
+repository (#44), using the native rational transfer model. General
+high-index right-tangent initialization is tracked in [#230](https://github.com/codeandsolder/ngspice-rs-fast/issues/230):
+a nested derivative of a linear PWL ramp under UIC currently aborts
+at the first trial instead of initializing the inner derivative to
+the right-hand slope. Broader reference coverage and numerical
+golden validation remain ongoing. Static statistical realization is documented in
 [PARAM_EXPRESSIONS.md](PARAM_EXPRESSIONS.md).

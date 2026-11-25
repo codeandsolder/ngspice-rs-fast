@@ -253,14 +253,33 @@ fn values_follow_the_c_functions() {
 }
 
 #[test]
-fn descending_pwl_keeps_cs_ascending_derivative_search() {
-    // PTpwl interpolates a descending table correctly, but PTpwl_derivative
-    // always searches as if the abscissas ascended, so at 0.3 it returns the
-    // slope of the first segment (2,3)-(0.5,1), not of (0.5,1)-(0,0).
-    let program = program("pwl(v(a), 2, 3, 0.5, 1, 0, 0, -1, 2)");
-    let evaluation = program.evaluate(&environment(&[0.3])).unwrap();
-    assert!((evaluation.value - 0.6).abs() < 1e-15);
-    assert!((evaluation.gradient[0] - 4. / 3.).abs() < 1e-15);
+fn pwl_value_and_slope_select_the_same_segment_in_either_order() {
+    for text in [
+        "pwl(v(a), 2, 3, 0.5, 1, 0, 0, -1, 2)",
+        "pwl(v(a), -1, 2, 0, 0, 0.5, 1, 2, 3)",
+    ] {
+        let p = program(text);
+        for (x, expected) in [
+            (-2., -2.),
+            (-0.3, -2.),
+            (0.3, 2.),
+            (0.8, 4. / 3.),
+            (3., 4. / 3.),
+        ] {
+            let evaluation = p.evaluate(&environment(&[x])).unwrap();
+            assert!(
+                (evaluation.gradient[0] - expected).abs() < 1e-15,
+                "{text} at {x}"
+            );
+            let h = 1e-6;
+            let upper = p.evaluate(&environment(&[x + h])).unwrap().value;
+            let lower = p.evaluate(&environment(&[x - h])).unwrap().value;
+            assert!(
+                ((upper - lower) / (2. * h) - expected).abs() < 1e-9,
+                "{text} at {x}"
+            );
+        }
+    }
 }
 
 #[test]
