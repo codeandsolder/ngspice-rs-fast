@@ -1,13 +1,15 @@
 //! Passive split-generator transport for positive-definite L and C.
 //!
 //! Every static R/G stage is a reciprocal dissipative scattering relation.
-//! Exact modal half-delays surround the stages (Strang splitting). Linear
-//! scattering commutes with convolution, so compile the boundary impulse
-//! response once, incrementally, rather than propagating every input knot
-//! through the same internal paths. Its integral is a continuous piecewise
-//! linear ramp response. Convolution uses finite accepted PWL segments,
-//! not extrapolated slopes or cancellation of unbounded ramps. Only
-//! accepted solutions commit the response frontier and new segments.
+//! Exact modal half-delays surround the stages (Strang splitting). For
+//! mutually converting modes, stream continuous delayed PWL waveforms
+//! through the stages with energy-contractive history reduction. For
+//! separable modes or one stage, compile the inexpensive exact impulse
+//! response and integrate it over finite boundary ramps. Both methods
+//! produce an affine trial relation and commit only accepted histories.
+mod continuous;
+
+use continuous::{ContinuousHistory, ContinuousPlan};
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeMap, BinaryHeap},
@@ -188,6 +190,7 @@ pub struct CplHistory {
     segments: Vec<Segment>,
     corners: Vec<Corner>,
     kernel: Arc<Kernel>,
+    continuous: Option<Arc<ContinuousHistory>>,
     limit: usize,
 }
 
@@ -217,6 +220,7 @@ impl CplHistory {
             + self.corners.len()
             + self.kernel.records
             + self.kernel.pending.len()
+            + self.continuous.as_deref().map_or(0, ContinuousHistory::len)
     }
 
     /// Whether the accepted graph has been initialized.
@@ -231,6 +235,9 @@ impl CplHistory {
         self.segments.clear();
         self.corners.clear();
         self.kernel = Arc::new(Kernel::empty(self.input.len()));
+        if let Some(history) = &mut self.continuous {
+            Arc::make_mut(history).clear();
+        }
         self.initial_output.fill(Wide::ZERO);
         for values in [
             &mut self.input,
@@ -242,7 +249,7 @@ impl CplHistory {
         }
     }
 
-    const fn boundary_bytes(&self) -> usize {
+    fn boundary_bytes(&self) -> usize {
         let ports = self.input.len();
         let segment_bytes =
             std::mem::size_of::<Segment>() + 16 + ports * std::mem::size_of::<Real>();
@@ -259,6 +266,11 @@ impl CplHistory {
                     .saturating_mul(corner_bytes),
             )
             .saturating_add(ports * (4 * std::mem::size_of::<Real>() + std::mem::size_of::<Wide>()))
+            .saturating_add(
+                self.continuous
+                    .as_deref()
+                    .map_or(0, ContinuousHistory::workspace),
+            )
     }
 
     pub(crate) fn check(&self, update: &CplUpdate) -> SpiceResult<()> {
@@ -348,6 +360,7 @@ pub(super) struct LossyPlan {
     // A certified absolute terminal path mass bound, if one exists.
     path_bound: Option<Vec<Real>>,
     roundoff_budget: Vec<Real>,
+    continuous: Option<ContinuousPlan>,
     sections: usize,
     terminal: usize,
     limit: usize,
@@ -406,6 +419,7 @@ impl LossyPlan {
             first_at_node: Vec::new(),
             path_bound: None,
             roundoff_budget: Vec::new(),
+            continuous: None,
             sections,
             terminal,
             limit,
@@ -427,20 +441,34 @@ impl LossyPlan {
                     .collect()
             })
             .collect();
-        result.path_bound = result.absolute_path_bound();
-        result.roundoff_budget = if result.path_bound.is_some() {
-            (0..ports)
-                .map(|port| result.source_roundoff_budget(port))
-                .collect()
+        result.continuous = ContinuousPlan::prepare(&result)?;
+        if result.continuous.is_none() {
+            result.prepare_path_budget();
         } else {
             result.first_at_node.clear();
-            vec![0.; ports]
-        };
+            result.roundoff_budget = vec![0.; ports];
+        }
         Ok(result)
     }
 
+    fn prepare_path_budget(&mut self) {
+        self.path_bound = self.absolute_path_bound();
+        let ports = self.launch.len();
+        self.roundoff_budget = if self.path_bound.is_some() {
+            (0..ports)
+                .map(|port| self.source_roundoff_budget(port))
+                .collect()
+        } else {
+            self.first_at_node.clear();
+            vec![0.; ports]
+        };
+    }
+
     pub(super) const fn shortest(&self) -> Real {
-        self.basis.shortest
+        match &self.continuous {
+            Some(plan) => plan.step(),
+            None => self.basis.shortest,
+        }
     }
 
     // Every section shares the same matrix. Store it once and derive the
@@ -648,6 +676,10 @@ impl LossyPlan {
             segments: Vec::new(),
             corners: Vec::new(),
             kernel: Arc::new(Kernel::empty(self.launch.len())),
+            continuous: self
+                .continuous
+                .as_ref()
+                .map(|plan| Arc::new(plan.empty(self.launch.len()))),
             limit: self.limit,
         }
     }
@@ -668,6 +700,13 @@ impl LossyPlan {
             for (output, value) in next.initial_output.iter_mut().zip(&reflected[..ports]) {
                 *output = Wide::from_real(*value);
             }
+        }
+        if let Some(plan) = &self.continuous {
+            next.continuous = Some(Arc::new(plan.start(
+                context.time,
+                context.reltol,
+                &next.input,
+            )));
         }
         // All delays are unity at DC, so the static distributed R/G
         // solution also initializes the exact split network's boundary.
@@ -846,24 +885,51 @@ impl LossyPlan {
         let start = history
             .time
             .ok_or_else(|| invalid("missing CPL boundary"))?;
-        let kernel = self.kernel_at(history, time)?;
-        let known = self.known_output(history, &kernel, time);
+        let ports = self.launch.len();
+        let (known, coefficients) =
+            if let (Some(plan), Some(state)) = (&self.continuous, &history.continuous) {
+                let trial = plan.trial(self, state, start, time, history.boundary_bytes())?;
+                let known = history
+                    .initial_output
+                    .iter()
+                    .zip(&trial.output)
+                    .map(|(&baseline, wave)| baseline + Wide::from_real(wave.known))
+                    .collect::<Vec<_>>();
+                let coefficients = trial
+                    .output
+                    .iter()
+                    .map(|wave| {
+                        (0..ports)
+                            .map(|source| Wide::from_real(wave.component(source + 1)))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                (known, coefficients)
+            } else {
+                let kernel = self.kernel_at(history, time)?;
+                let known = self.known_output(history, &kernel, time);
+                let coefficients = kernel
+                    .traces
+                    .chunks_exact(ports)
+                    .map(|row| {
+                        row.iter()
+                            .map(|trace| segment_response(trace, time, start, time))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                (known, coefficients)
+            };
         let first = context.branch(0)?;
         for (row, col, value) in line.terminal_kcl(context.unknowns, first)? {
             context.matrix.add(row, col, value.re)?;
         }
         let n = self.basis.delays.len();
-        let ports = self.launch.len();
-        for (row, &constant) in known.iter().enumerate() {
+        for (row, (&constant, coefficients)) in known.iter().zip(&coefficients).enumerate() {
             let mut rhs = constant;
-            let mut coefficients = Vec::with_capacity(ports);
-            for source in 0..ports {
-                let gain =
-                    segment_response(&kernel.traces[row * ports + source], time, start, time);
-                rhs = rhs - gain * Wide::from_real(history.input[source]);
-                coefficients.push(gain.hi);
+            for (&gain, &input) in coefficients.iter().zip(&history.input) {
+                rhs = rhs - gain * Wide::from_real(input);
             }
-            if !rhs.hi.is_finite() || coefficients.iter().any(|value| !value.is_finite()) {
+            if !rhs.hi.is_finite() || coefficients.iter().any(|value| !value.hi.is_finite()) {
                 return Err(invalid("nonfinite CPL endpoint relation"));
             }
             context.rhs.add_to(first + row, rhs.hi)?;
@@ -875,7 +941,7 @@ impl LossyPlan {
                     let port = (physical / n) * n + mode;
                     let index = (physical % n) * n + mode;
                     let delta = if row == port { 1. } else { 0. };
-                    let gain = coefficients[port];
+                    let gain = coefficients[port].hi;
                     voltage = self.basis.current_basis[index].mul_add(delta - gain, voltage);
                     current = self.basis.voltage_basis[index].mul_add(-delta - gain, current);
                 }
@@ -942,7 +1008,16 @@ impl LossyPlan {
         let reflected = self.basis.physical_waves(line, context, -1.)?;
         let ports = self.launch.len();
         let mut next = history.clone();
-        next.kernel = self.kernel_at(history, context.time)?;
+        let direct = if let (Some(plan), Some(state)) = (&self.continuous, &history.continuous) {
+            Some((
+                plan,
+                state,
+                plan.trial(self, state, start, context.time, history.boundary_bytes())?,
+            ))
+        } else {
+            next.kernel = self.kernel_at(history, context.time)?;
+            None
+        };
         let mut segment = Segment {
             start,
             end: context.time,
@@ -969,11 +1044,16 @@ impl LossyPlan {
             // always retains the actual accepted endpoint, even for small
             // waves, so uncertainty cannot accumulate into extrapolation.
             if change.abs() > uncertainty
-                && (history.segments.is_empty()
+                && ((direct.is_none() && history.segments.is_empty())
+                    || history.previous_time.is_none()
                     || change.abs() > context.reltol.mul_add(incident[port].abs(), context.abstol))
             {
                 corners.push((port, change));
-                for &delay in &self.fronts[port] {
+                for delay in self.fronts[port].iter().copied().chain(
+                    direct
+                        .as_ref()
+                        .map(|_| self.basis.delays[port % self.half.len()]),
+                ) {
                     let point = start + delay;
                     if point.is_finite() && point > context.time {
                         breakpoints.push(point);
@@ -985,6 +1065,23 @@ impl LossyPlan {
             next.input[port] = incident[port];
             next.input_error[port] = incident[ports + port];
         }
+        next.previous_time = Some(start);
+        next.time = Some(context.time);
+        if let Some((plan, state, trial)) = direct {
+            next.continuous = Some(Arc::new(plan.accept(
+                state,
+                trial,
+                start,
+                context.time,
+                &incident[..ports],
+                &segment.delta,
+            )?));
+            return Ok(CplUpdate {
+                reset: false,
+                next,
+                breakpoints,
+            });
+        }
         if segment.delta.iter().any(|value| *value != 0.) {
             next.segments.push(segment);
         }
@@ -995,8 +1092,6 @@ impl LossyPlan {
                 changes: corners,
             });
         }
-        next.previous_time = Some(start);
-        next.time = Some(context.time);
         Self::prune_finished_response(&mut next, context.time);
         // Schedule the next resolvable secondary corner for each output,
         // not every tiny reflection. All arrivals remain in the response.
@@ -1052,7 +1147,11 @@ mod tests {
         )
         .unwrap();
         let basis = ModalBasis::prepare(&material).unwrap().unwrap();
-        let plan = LossyPlan::prepare(basis, &material, 4).unwrap();
+        let mut plan = LossyPlan::prepare(basis, &material, 4).unwrap();
+        // Exercise the exact path compiler independently of the selected
+        // continuous production representation.
+        plan.first_at_node = (0..4).map(|source| plan.first_arrivals(source)).collect();
+        plan.prepare_path_budget();
         let bound = plan.path_bound.as_ref().unwrap();
         for node in 0..plan.terminal {
             let sum = plan

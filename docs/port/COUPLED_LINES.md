@@ -166,30 +166,41 @@ preserving reciprocity, passivity and physical arrival times. It is exact
 when the loss and propagation generators commute. Every mode conversion
 and internal reflection follows the sum of its actual modal path delays.
 
-The time-domain solver incrementally compiles a shared impulse response
-by increasing relative arrival time; identical representable arrival
-times at the same graph node are combined. Integrating its cumulative
-response over finite accepted piecewise-linear boundary segments avoids
-unbounded slope cancellation. The current trial interval contributes an
-affine terminal relation, including arrivals inside an oversized step.
-DC initializes the boundary waves consistently with the static scattering
-network. Rejected trials cannot advance the accepted response or inputs.
-Breakpoint tolerances affect only scheduling, never physical convolution.
-When a verified nonnegative absolute-path majorant exists, contributions
-at the numerical roundoff scale may be discarded with a single accumulated
-allowance per input column. That allowance is scaled against the weakest
-reachable output's strongest path; first arrivals at all graph nodes are
-retained. Networks without a finite certified majorant keep all paths.
-When the impulse response has finite support, expired segments are folded
-into the steady baseline.
+For mutually converting modes, the time-domain solver uses a continuous
+method of steps. Each stage merges the knots of its physically delayed
+incident piecewise-linear waves and applies its static scattering matrix.
+The internal substep is at most the shortest interstage flight. Launch,
+interstage and exit delays are continuous, not rounded to an integer
+lattice. Trial waveforms are affine in all new boundary endpoint increments;
+the terminal relation therefore also includes arrivals inside an oversized
+trial. Rejected trials cannot advance the accepted wave histories.
 
-The spatial splitting is an approximation for noncommuting R/G and L/C;
-refine `sections` for accuracy. Dense incommensurate modal delays may
-produce many distinct paths, and the graph and retained history have
-explicit workspace/work caps. Workspace accounting distinguishes allocated
-trace capacity, pending-arrival storage and boundary histories, with room
-for accepted and trial copies. Exhaustion is reported rather than silently
-discarding significant arrivals.
+Histories retain only the delay window needed by the next stage or
+terminal and the boundary knots needed for front protection. To prevent
+combinatorial growth of secondary reflection knots, the solver may replace
+a curve by an endpoint-preserving chord or two-segment tent. It protects
+first physical arrivals and straight modal flights, bounds the normalized
+interpolation error independently in every affine component, and checks
+the wave-energy Gram inequality over every prefix of the replaced
+interval. A cubic Bernstein certificate proves the latter for arbitrary
+combinations of endpoint increments; inconclusive certificates trigger
+subdivision rather than unverified reduction. As with other numerical
+integration tolerances, local waveform error is not a global pointwise
+error bound. Reduce `reltol` to refine the history approximation.
+
+For separable modes and a single scattering stage, the solver instead
+compiles the inexpensive exact impulse response. Finite boundary ramps
+are integrated against its cumulative response. When a verified
+nonnegative absolute-path majorant exists, numerical roundoff-scale
+contributions may be discarded using a single accumulated allowance per
+input column; first arrivals are retained. Finite-support response
+histories fold expired segments into the steady baseline.
+
+DC initializes both representations consistently with the static scattering
+network. The spatial splitting approximates noncommuting R/G and L/C;
+refine `sections` for spatial accuracy. Explicit workspace and work
+limits account for retained histories and affine trial scratch. Exhaustion
+is reported rather than silently discarding significant arrivals.
 
 ## Passive finite-volume cable
 
