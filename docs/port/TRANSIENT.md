@@ -88,7 +88,7 @@ the run with an error; no partial plot is returned.
   step by eight and returns to order 1.
 * **Breakpoints.** C's table `CKTbreaks` (`devices::BreakTable`, starting as
   `{0, tstop}`, `CKTsetBreak`/`CKTclrBreak` merge rules with `CKTminBreak =
-  10 delmin`, the XSPICE default) is filled at every accepted point by the
+  10 delmin` by default in XSPICE builds; `minbreak=` overrides this distance in seconds, not the minimum timestep, and zero restores the default) is filled at every accepted point by the
   sources' accept hooks (`devices::SourceBreaks`, `VSRCaccept`/`ISRCaccept`):
   a voltage PULSE or any PWL requests its *next* corner after
   `time + CKTminBreak`, computed from the accepted time in C's operation

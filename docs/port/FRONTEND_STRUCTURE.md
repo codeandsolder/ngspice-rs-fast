@@ -170,9 +170,11 @@ C references: `cktsopt.c` (`OPTtbl`, `CKTsetOpt`), `inpdoopt.c`,
 | --- | --- | --- | --- |
 | `temp`, `tnom` | effect | circuit / nominal temperature (C) | `TSKtemp`/`TSKnomTemp` |
 | `gmin` | effect | `AnalysisContext::gmin` = `ModelContext::gmin`: parallel junction conductance of diode, BJT (B-E, B-C and the default substrate junction: collector for NPN/vertical, base for PNP/lateral; scaled by the instance `m`, not by `area`) and MOS1 (B-D, B-S) in every analysis; finite, `>= 0`, default 1e-12. It does **not** move the artificial DC gmin-stepping ladder (C's `spice3_gmin` starts at `gmin * gminfactor^gminsteps` and `dynamic_gmin` stops at `max(gmin, gshunt)`; this port's ladder starts at 1e-3 S and ends with a zero-artificial-gmin solve, see DC_CONTINUATION.md) | `CKTgmin` in `dioload.c`, `bjtload.c` (`m *` every conductance), `mos1load.c` |
+| `rshunt`, `cshunt` | effect | noiseless resistive shunt to every analog voltage node, capacitive shunt to parsed voltage nodes; ground and branch-current coordinates excluded. Real-valued ohms/farads; topology generated per deck | `cktsetup.c`, `cktload.c`, `acan.c`, `inppas4.c` |
 | `reltol` | effect | Resolved circuit tolerance, diode breakdown preparation, and the default analysis-local relative tolerance | `TSKreltol` |
 | `vntol`, `abstol` | effect | Voltage/current absolute tolerances for Newton and transient analyses | `TSKvoltTol`/`TSKabstol` |
 | `chgtol`, `trtol` | effect | companion truncation control | `CKTterr` |
+| `minbreak` | effect | analog breakpoint coalescing interval in seconds (zero selects the default); per-transient request override | `dctran.c`, `cktsetbk.c` |
 | `method`, `maxord` | effect | companion trap/Gear-2, `maxord` 1..6 (as in `dctran.c`, 2..6 all run orders 1–2, #98) | `TSKintegrateMethod`/`TSKmaxOrder` |
 | `xmu` | effect | companion trapezoidal weighting `0..=0.5` (`xmu`) | `CKTxmu` in `nicomcof.c` (C accepts any value; > 0.5 is an explicit error here) |
 | `itl1` | effect | Newton limit of the direct DC solve (`maxiter` = `max(itl1, 100)`) for `.op`/`.dc`/`.ac` and the companion `.tran` initial bias | `CKTdcMaxIter` in `cktop.c` (`dcop.c`, `acan.c`, `dctrcurv.c`, `dctran.c` call `CKTop`); `NIiter()` raises any limit below 100 to 100 (`niiter.c`). Unset, 100 as in C (#106), see DC_CONTINUATION.md |
@@ -187,7 +189,7 @@ C references: `cktsopt.c` (`OPTtbl`, `CKTsetOpt`), `inpdoopt.c`,
 | `post`, `ingold` | no-op | none | plain front-end variables that nothing in ngspice reads |
 | `indverbosity` | no-op (non-negative integer validated) | none | selects only which stderr diagnostics `muttemp.c` prints for an inductive system (`CKTindverbosity`); the port prints none and always rejects a coupled inductance matrix that is not positive semidefinite (MUTUAL_INDUCTANCE.md) |
 | `bypass=0` | no-op | none | C default (`TSKbypass = 0`); this port never bypasses device evaluation. Other values `NotYetPorted` |
-| `gshunt`, `cshunt`, `rshunt`, `oldlimit`, `numdgt`, `minbreak`, `defm`/`defl`/`defw`/`defad`/`defas`, `badmos3`, `trytocompact`, `copynodesets`, `nodedamping`, `linesearch`, `absdv`, `reldv`, `noopac`, `epsmin`, `sparse`, `klu`, `klu_memgrow_factor`, `lte*`, `newtrunc`, XSPICE options | `NotYetPorted` | | |
+| `gshunt`, `oldlimit`, `numdgt`, `defm`/`defl`/`defw`/`defad`/`defas`, `badmos3`, `trytocompact`, `copynodesets`, `nodedamping`, `linesearch`, `absdv`, `reldv`, `noopac`, `epsmin`, `sparse`, `klu`, `klu_memgrow_factor`, `lte*`, `newtrunc`, XSPICE options | `NotYetPorted` | | |
 | `filetype`, `savecurrents`, `scale`, `scalm`, `seed`, `seedinfo`, `rndseed`, `interp`, `warn`, `measureprec`, `rawfileprec`, `strict_errorhandling` | `NotYetPorted` | | front-end variables with an output/setup effect |
 | anything else | parse error | | C would store an unread variable or warn |
 

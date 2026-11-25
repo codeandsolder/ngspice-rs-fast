@@ -139,6 +139,7 @@ pub struct TransientPlan {
     stop: Real,
     start: Real,
     max_step: Real,
+    minbreak: Real,
     method: IntegrationMethod,
     max_order: u8,
     tolerances: Tolerances,
@@ -198,6 +199,7 @@ impl TransientPlan {
             stop: end_time,
             start: start_time,
             max_step,
+            minbreak: options.minbreak,
             method: options.method,
             max_order: options.max_order,
             tolerances: Tolerances {
@@ -283,6 +285,16 @@ impl TransientPlan {
         self.step = period / resolution;
         self.max_step = self.step;
         self.over_duration(period)
+    }
+
+    /// Resolved analog breakpoint merge distance (C `CKTminBreak`).
+    #[must_use = "the returned interval determines analog breakpoint coalescing"]
+    pub fn min_break(&self) -> Real {
+        if self.minbreak == 0. {
+            10. * self.min_step()
+        } else {
+            self.minbreak
+        }
     }
 
     /// C `CKTdelmin`.
@@ -1039,8 +1051,7 @@ impl Driver<'_> {
     ) -> SpiceResult<TransientEnd> {
         let TransientPlan { stop, start, .. } = self.settings;
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
-        let min_step = self.settings.min_step();
-        let mut breaks = BreakTable::new(stop, 10.0 * min_step)?;
+        let mut breaks = BreakTable::new(stop, self.settings.min_break())?;
         let mut sources = SourceBreaks::new(self.system);
         let (name, title) = match purpose {
             TransientRun::Ordinary | TransientRun::Seed => ("tran1", "Transient Analysis"),
@@ -1753,13 +1764,13 @@ impl Driver<'_> {
     /// accepted steps; steps not taken yet read as the maximum step, as
     /// `dctran.c` initializes `CKTdeltaOld`) and the `CKTminBreak` that
     /// `TRAaccept` compares sample spacing with: the XSPICE build's
-    /// `10 CKTdelmin`, the same merge distance as the [`BreakTable`].
+    /// configured merge distance (default `10 CKTdelmin`), shared with the [`BreakTable`].
     fn delay_acceptance(&self, dt: Real, start: bool) -> crate::devices::DelayAcceptance {
         let accepted = self.steps.accepted();
         let older = |age: usize| accepted.get(age).copied().unwrap_or(self.settings.max_step);
         crate::devices::DelayAcceptance {
             steps: [dt, older(0), older(1)],
-            min_break: 10. * self.settings.min_step(),
+            min_break: self.settings.min_break(),
             start,
             reltol: self.settings.tolerances.reltol,
             abstol: self.settings.tolerances.abstol,
@@ -1891,6 +1902,7 @@ mod step_control_tests {
             stop: 10.,
             start: 0.,
             max_step: 1.,
+            minbreak: 0.,
             max_order: 2,
             method: IntegrationMethod::Trapezoidal,
             xmu: 0.5,

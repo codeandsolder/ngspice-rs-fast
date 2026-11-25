@@ -18,6 +18,7 @@
 //! | `vntol` | voltage absolute tolerance (companion Newton test; DC/AC Newton) |
 //! | `abstol` | branch-current absolute tolerance (companion truncation/Newton test; DC/AC Newton) |
 //! | `chgtol`, `trtol` | companion local-truncation-error charge floor and overestimation factor |
+//! | `minbreak` | minimum analog breakpoint spacing (seconds; zero selects the default) |
 //! | `method`, `maxord` | retained as [`RunConfig::method`]/[`RunConfig::maxord`] and forwarded to the companion driver (`trap`/`trapezoidal`/`gear`, `maxord` 1 to 6; `dctran.c` never runs above order 2, so 2 to 6 behave alike) |
 //! | `xmu` | companion trapezoidal weighting (`nicomcof.c`, default 0.5, `0..=0.5`) |
 //! | `itl1` | Newton iteration limit of the direct DC solve and of the gmin strategies' closing solve (`maxiter`) for `.op`/`.dc`/`.ac` and the companion `.tran` initial bias (C `CKTdcMaxIter`; `dcop.c`, `acan.c`, `dctran.c` call `CKTop`); default 100 |
@@ -63,7 +64,7 @@
 //! * `bypass=0`: C's default (`cktntask.c`); this port never bypasses device
 //!   evaluation. Any other `bypass` is `NotYetPorted`.
 //!
-//! Every other name from `cktsopt.c` (`gshunt`, `oldlimit`, `minbreak`, ...)
+//! Every other name from `cktsopt.c` (`gshunt`, `oldlimit`, ...)
 //! and the front-end variables with an effect (`filetype`, `numdgt`,
 //! `savecurrents`, `scale`, ...) is [`SpiceError::NotYetPorted`]; names
 //! absent from both are parse errors. `no_auto_gnd` is a front-end variable in
@@ -115,15 +116,12 @@ const FRONTEND_REFERENCE: &str =
 
 /// Names in `cktsopt.c`'s `OPTtbl` that this port does not implement yet.
 const KNOWN_UNIMPLEMENTED: &[&str] = &[
-    "cshunt",
-    "rshunt",
     "gshunt",
     "oldlimit",
     "numdgt",
     "defm",
     "defl",
     "defw",
-    "minbreak",
     "defad",
     "defas",
     "badmos3",
@@ -226,6 +224,8 @@ pub struct TransientSettings {
     pub chgtol: Option<Real>,
     /// `trtol` → companion truncation-error overestimation factor.
     pub trtol: Option<Real>,
+    /// Minimum spacing between analog breakpoints in seconds; zero selects the default.
+    pub minbreak: Option<Real>,
     /// `itl4` → companion Newton iterations per timepoint (`tranmaxiter`),
     /// stored as C's effective `max(itl4, 100)` (see [`NIITER_MIN_ITERATIONS`]).
     pub itl4: Option<usize>,
@@ -662,6 +662,8 @@ impl RunConfig {
             "temp"
                 | "tnom"
                 | "gmin"
+                | "rshunt"
+                | "cshunt"
                 | "pivtol"
                 | "pivrel"
                 | "reltol"
@@ -669,6 +671,7 @@ impl RunConfig {
                 | "abstol"
                 | "chgtol"
                 | "trtol"
+                | "minbreak"
                 | "method"
                 | "maxord"
                 | "xmu"
@@ -966,6 +969,29 @@ impl RunConfig {
                 }
                 self.transient.xmu = Some(xmu);
             }
+            "rshunt" | "cshunt" => {
+                let number = input.number("a finite number")?;
+                let mut shunts = self.context.shunts;
+                if name == "rshunt" {
+                    shunts.resistance = Some(number);
+                } else {
+                    shunts.capacitance = number;
+                }
+                shunts.validate().map_err(|error| {
+                    SpiceError::parse(value.location.clone(), error.to_string())
+                })?;
+                self.context.shunts = shunts;
+            }
+            "minbreak" => {
+                let number = input.number("a finite number")?;
+                if number < 0. {
+                    return Err(SpiceError::parse(
+                        value.location.clone(),
+                        "option 'minbreak' must be nonnegative",
+                    ));
+                }
+                self.transient.minbreak = Some(number);
+            }
             "gmin" => {
                 let gmin = input.number("a finite number")?;
                 if gmin < 0. {
@@ -1200,6 +1226,8 @@ fn accepted(name: &str) -> bool {
                 | "temp"
                 | "tnom"
                 | "gmin"
+                | "rshunt"
+                | "cshunt"
                 | "pivtol"
                 | "pivrel"
                 | "reltol"
@@ -1207,6 +1235,7 @@ fn accepted(name: &str) -> bool {
                 | "abstol"
                 | "chgtol"
                 | "trtol"
+                | "minbreak"
                 | "method"
                 | "maxord"
                 | "xmu"

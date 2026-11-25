@@ -98,6 +98,8 @@ fn invalid_values_are_errors() {
         ".options temp=-300",
         ".options temp=hot",
         ".options reltol=0",
+        ".options minbreak=-1n",
+        ".options minbreak=abc",
         ".options reltol=-1e-3",
         ".options vntol=abc",
         ".options abstol=0",
@@ -134,7 +136,6 @@ fn unknown_unimplemented_and_conflicting_options_are_errors() {
         // noopiter in tests/convergence.rs.
         ".options gshunt=1e-12",
         ".options bypass=1",
-        ".options reltol=1m minbreak=1n",
     ] {
         assert!(
             config(options).unwrap_err().is_not_yet_ported(),
@@ -226,6 +227,28 @@ fn method_and_maxord_reach_the_companion_driver() {
         (3., c.transient().chgtol.unwrap())
     );
     assert!(config(".options trtol=0").is_err());
+}
+
+#[test]
+fn minbreak_is_real_valued_and_resolved_per_transient() {
+    let c = config(".param spacing=2n\n.options minbreak={spacing}").unwrap();
+    let input = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m"]);
+    let plan = c.plan(input.clone()).unwrap();
+    assert_eq!(
+        plan.transient().unwrap().min_break(),
+        c.transient().minbreak.unwrap()
+    );
+    let explicit =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "minbreak=5n"]);
+    assert_eq!(
+        c.plan(explicit.clone()).unwrap(),
+        explicit.resolve().unwrap()
+    );
+    let reset = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "minbreak=0"]);
+    assert_eq!(c.plan(reset).unwrap(), input.resolve().unwrap());
+    let invalid =
+        AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "minbreak=-1"]);
+    assert!(c.plan(invalid).is_err());
 }
 
 #[test]

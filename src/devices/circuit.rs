@@ -4524,6 +4524,7 @@ impl Circuit {
             .iter()
             .any(|card| card.kind == crate::primitives::AnalysisKind::Noise);
         circuit.add_instances(&expanded.devices, &models, &setup)?;
+        circuit.add_topology_shunts(setup.shunts)?;
         let referenced: BTreeSet<_> = expanded
             .devices
             .iter()
@@ -4551,6 +4552,93 @@ impl Circuit {
         // Reject an invalid inductive system (K coupling) before any analysis.
         circuit.prepared_mutual_terms(context)?;
         Ok(circuit)
+    }
+
+    /// C INPpas4 adds capacitors to parsed voltage nodes before device
+    /// setup; CKTsetup's rshunt adds noiseless conductance to all voltage
+    /// nodes after setup. Branch-current and private storage coordinates
+    /// are never physical shunt targets. Materialize real device equations
+    /// so all analysis paths see the same topology and charge states.
+    fn add_topology_shunts(
+        &mut self,
+        shunts: crate::devices::models::TopologyShunts,
+    ) -> SpiceResult<()> {
+        use crate::devices::{Capacitor, Resistor, ResistorNoise};
+        if shunts == Default::default() {
+            return Ok(());
+        }
+        let mut names: BTreeSet<_> = self
+            .devices
+            .iter()
+            .map(|device| device.name().to_ascii_lowercase())
+            .collect();
+        let nodes = self.nodes.nodes();
+        let resistors = if shunts.resistance.is_some() {
+            nodes
+                .iter()
+                .filter(|node| matches!(node.kind, NodeKind::Terminal | NodeKind::Internal))
+                .count()
+        } else {
+            0
+        };
+        let capacitors = if shunts.capacitance > 0. {
+            nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::Terminal)
+                .count()
+        } else {
+            0
+        };
+        let size = ElaborationSize::new(resistors, 0, 0).checked_add(
+            ElaborationSize::new(
+                capacitors,
+                0,
+                capacitors
+                    .checked_mul(crate::devices::rlc::REACTIVE_STATE_COUNT)
+                    .ok_or_else(|| resource_error(None, "shunt charge state count overflows"))?,
+            ),
+            None,
+        )?;
+        self.elaboration_limits
+            .check(self.elaboration_size()?.checked_add(size, None)?, None)?;
+        let mut devices: Vec<Box<dyn Device>> = Vec::new();
+        reserve(&mut devices, size.devices, None)?;
+        let mut unique = |base: String| {
+            let mut name = base.clone();
+            let mut suffix = 0_usize;
+            while !names.insert(name.to_ascii_lowercase()) {
+                suffix += 1;
+                name = format!("{base}_{suffix}");
+            }
+            name
+        };
+        for node in nodes {
+            let terminals = [node.id, NodeId::GROUND];
+            if let Some(resistance) = shunts.resistance
+                && matches!(node.kind, NodeKind::Terminal | NodeKind::Internal)
+            {
+                devices.push(Box::new(
+                    Resistor::new(
+                        unique(format!("r__rshunt_{}", node.id.index())),
+                        terminals,
+                        resistance,
+                    )?
+                    .with_noise(ResistorNoise {
+                        noisy: false,
+                        ..Default::default()
+                    }),
+                ));
+            }
+            if shunts.capacitance > 0. && node.kind == NodeKind::Terminal {
+                devices.push(Box::new(Capacitor::new(
+                    unique(format!("capac{}shunt", node.id.index())),
+                    terminals,
+                    shunts.capacitance,
+                    None,
+                )?));
+            }
+        }
+        self.add_prepared_devices(size, |_| Ok(devices))
     }
 
     /// Looks up a device by instance name, case-insensitively.
