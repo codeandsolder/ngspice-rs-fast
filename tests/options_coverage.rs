@@ -127,6 +127,52 @@ fn topology_shunts_agree_with_explicit_reactive_storage() {
 }
 
 #[test]
+fn generated_shunts_preserve_nonlinear_charge_lte_and_physical_decay() {
+    // The combined charge is Q = 1 uF * (1.5 V + V^2), and the two
+    // 1 kOhm resistors give G = 2 mS. Thus, integrating dQ/dt = -G V:
+    // 1.5 ln(V) + 2 V = 1.5 ln(2) + 4 - t/(500 us).
+    let circuit = "r1 out 0 1k\nc1 out 0 q={1u*(v(out)+v(out)^2)} ic=2\n.ic v(out)=2";
+    let primitive = |v: f64| 1.5 * v.ln() + 2. * v;
+    for method in ["trap", "gear"] {
+        for truncation in ["", "newtrunc ltereltol=1e-5 lteabstol=1n ltetrtol=1"] {
+            let settings = format!(
+                ".options method={method} reltol=1e-6 vntol=1n {truncation}\n.tran 5u 2m 0 5u uic"
+            );
+            let generated = simulate(&format!(
+                "{circuit}\n.options rshunt=1k cshunt=0.5u\n{settings}"
+            ))
+            .unwrap();
+            let explicit = simulate(&format!(
+                "{circuit}\nrsh out 0 1k\ncsh out 0 0.5u\n{settings}"
+            ))
+            .unwrap();
+            for plot in [&generated, &explicit] {
+                for point in 0..plot.point_count() {
+                    let t = plot.value("time", point).unwrap().re;
+                    let v = plot.value("v(out)", point).unwrap().re;
+                    assert!(v > 0.);
+                    close(primitive(v), primitive(2.) - t / 5e-4, 0., 5e-4);
+                    let q = plot.value("q(c1)", point).unwrap().re;
+                    close(q, 1e-6 * (v + v * v), 1e-6, 1e-14);
+                }
+            }
+            close(
+                generated
+                    .value("v(out)", generated.point_count() - 1)
+                    .unwrap()
+                    .re,
+                explicit
+                    .value("v(out)", explicit.point_count() - 1)
+                    .unwrap()
+                    .re,
+                1e-5,
+                1e-8,
+            );
+        }
+    }
+}
+
+#[test]
 fn topology_shunts_validate_and_preserve_branch_coordinates() {
     for invalid in [
         ".options rshunt=0",
