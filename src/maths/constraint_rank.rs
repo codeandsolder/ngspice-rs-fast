@@ -1,4 +1,4 @@
-//! Rank-aware completion of the instantaneous constraint system.
+//! Rank-aware sparse constraint reduction.
 //! Only declared storage currents and derivative signals may be gauges.
 //! Mandatory original equations are retained for physical verification.
 //! Derived storage constraints are considered only after mandatory rows.
@@ -8,7 +8,12 @@ use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::numeric::{binary_exponent, scale_power};
 use crate::primitives::{Real, SpiceResult};
 
-use super::failure;
+fn failure(message: impl Into<String>) -> crate::primitives::SpiceError {
+    crate::primitives::SpiceError::Numerical {
+        context: "initial conditions".to_owned(),
+        message: message.into(),
+    }
+}
 
 /// A coefficient carries its own propagated rounding uncertainty. Errors
 /// in unrelated columns must not suppress a small but independent pivot.
@@ -74,7 +79,12 @@ impl Basis {
         }
     }
 
-    fn insert(&mut self, mut terms: Row, mut rhs: Real) -> SpiceResult<bool> {
+    fn reduce(
+        &self,
+        mut terms: Row,
+        mut rhs: Real,
+        budget: &mut usize,
+    ) -> SpiceResult<(Row, Real)> {
         let mut pending: BTreeSet<_> = terms
             .keys()
             .filter_map(|&column| self.by_column[column])
@@ -84,6 +94,9 @@ impl Basis {
             let Some(factor) = terms.remove(&pivot.column) else {
                 continue;
             };
+            *budget = budget
+                .checked_sub(pivot.terms.len() + 1)
+                .ok_or_else(|| failure("derivative-array rank work limit exceeded"))?;
             for (&column, &value) in &pivot.terms {
                 let old = terms.get(&column).copied().unwrap_or_default();
                 let next = old.eliminate(factor, value);
@@ -103,6 +116,11 @@ impl Basis {
                 "nonfinite rank reduction of instantaneous constraints",
             ));
         }
+        Ok((terms, rhs))
+    }
+
+    fn insert_bounded(&mut self, terms: Row, rhs: Real, budget: &mut usize) -> SpiceResult<bool> {
+        let (mut terms, mut rhs) = self.reduce(terms, rhs, budget)?;
         let Some((&column, &pivot)) = terms
             .iter()
             .filter(|(_, coefficient)| coefficient.significant())
@@ -123,12 +141,21 @@ impl Basis {
         Ok(true)
     }
 
+    fn insert(&mut self, terms: Row, rhs: Real) -> SpiceResult<bool> {
+        let mut unlimited = usize::MAX;
+        self.insert_bounded(terms, rhs, &mut unlimited)
+    }
+
     fn solution(&self, column_exponents: &[i32]) -> SpiceResult<Vector> {
         if self.pivots.len() != self.by_column.len() {
             return Err(failure(
                 "uic initial conditions cannot be shown consistent: singular instantaneous system has freedoms not resolved by storage-coordinate gauges",
             ));
         }
+        self.representative(column_exponents)
+    }
+
+    fn representative(&self, column_exponents: &[i32]) -> SpiceResult<Vector> {
         let mut solution = Vector::zeros(self.by_column.len());
         for pivot in self.pivots.iter().rev() {
             let value = pivot
@@ -152,7 +179,7 @@ impl Basis {
 /// Result of rank selection. Independent original rows are identified
 /// separately from synthetic gauge rows so optional initial expressions
 /// can be checked against the actual selected physical state.
-pub(super) struct Completed {
+pub(crate) struct Completed {
     pub values: Vector,
     pub independent: Vec<bool>,
 }
@@ -162,19 +189,43 @@ pub(super) struct Completed {
 /// zero-current gauge equations. Scaling by exact powers of two keeps charge,
 /// voltage and current rows on comparable numerical scales. No least-squares
 /// relaxation of the original constraints is performed.
-pub(super) fn complete(
+pub(crate) fn complete(
     matrix: &SparseMatrix,
     rhs: &[Real],
     gauges: &[usize],
     late_rows: &[usize],
     optional_rows: &[usize],
 ) -> SpiceResult<Completed> {
+    if gauges.iter().any(|&column| column >= matrix.cols()) {
+        return Err(failure("invalid rank gauge"));
+    }
+    let mut unlimited = usize::MAX;
+    let (mut basis, column_exponents, independent) =
+        reduce_rows(matrix, rhs, late_rows, optional_rows, &mut unlimited)?;
+    for &column in gauges {
+        if basis.pivots.len() == matrix.cols() {
+            break;
+        }
+        basis.insert(Row::from([(column, Coefficient::exact(1.))]), 0.)?;
+    }
+    Ok(Completed {
+        values: basis.solution(&column_exponents)?,
+        independent,
+    })
+}
+
+fn reduce_rows(
+    matrix: &SparseMatrix,
+    rhs: &[Real],
+    late_rows: &[usize],
+    optional_rows: &[usize],
+    budget: &mut usize,
+) -> SpiceResult<(Basis, Vec<i32>, Vec<bool>)> {
     if rhs.len() != matrix.rows()
         || late_rows
             .iter()
             .chain(optional_rows)
             .any(|&row| row >= matrix.rows())
-        || gauges.iter().any(|&column| column >= matrix.cols())
         || rhs.iter().any(|value| !value.is_finite())
         || matrix
             .triplets()
@@ -241,16 +292,53 @@ pub(super) fn complete(
                 terms.insert(entry.col, Coefficient::exact(value));
             }
         }
-        independent[row] = basis.insert(terms, scale_power(rhs[row], -exponent))?;
+        *budget = budget
+            .checked_sub(terms.len() + 1)
+            .ok_or_else(|| failure("derivative-array rank work limit exceeded"))?;
+        independent[row] = basis.insert_bounded(terms, scale_power(rhs[row], -exponent), budget)?;
     }
-    for &column in gauges {
-        if basis.pivots.len() == matrix.cols() {
-            break;
-        }
-        basis.insert(Row::from([(column, Coefficient::exact(1.))]), 0.)?;
+    Ok((basis, column_exponents, independent))
+}
+
+/// A particular point, the row-space determination of requested columns,
+/// and the selection of independent rows. Unresolved free coefficients
+/// are zero only in the representative; they are not physical conditions.
+pub(super) struct Projection {
+    pub(super) representative: Vector,
+    pub(super) determined: Vec<bool>,
+    pub(super) independent: Vec<bool>,
+}
+
+/// Project a rectangular constraint system onto the requested coordinates.
+/// Row-space membership is checked independently of any arbitrary gauge.
+pub(super) fn project(
+    matrix: &SparseMatrix,
+    rhs: &[Real],
+    optional_rows: &[usize],
+    requested: usize,
+    mut budget: usize,
+) -> SpiceResult<Projection> {
+    if requested > matrix.cols() || !matrix.is_folded() {
+        return Err(failure("invalid derivative-array projection shape"));
     }
-    Ok(Completed {
-        values: basis.solution(&column_exponents)?,
+    let (basis, exponents, independent) =
+        reduce_rows(matrix, rhs, &[], optional_rows, &mut budget)?;
+    let representative = basis.representative(&exponents)?;
+    let mut determined = Vec::with_capacity(requested);
+    for column in 0..requested {
+        // A coordinate is unique exactly when its unit row is in the row
+        // span. Eliminate that row with the very same numerical rank basis.
+        // No arbitrary zero of a free higher derivative can make it unique.
+        let (free, _) = basis.reduce(
+            Row::from([(column, Coefficient::exact(1.))]),
+            0.,
+            &mut budget,
+        )?;
+        determined.push(!free.values().any(|value| value.significant()));
+    }
+    Ok(Projection {
+        representative,
+        determined,
         independent,
     })
 }

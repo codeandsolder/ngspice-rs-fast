@@ -207,6 +207,43 @@ impl Waveform {
         })
     }
 
+    /// Analytic right-limit forcing in dimensionless time u=t/scale.
+    /// Defaults must be bound before use. Held or random sources without
+    /// an established differentiable continuation are explicitly rejected.
+    /// # Errors
+    /// Invalid scale/order, unresolved timing, stochastic forcing or
+    /// nonrepresentable coefficients.
+    pub fn initial_jet(&self, order: usize, scale: Real) -> SpiceResult<crate::maths::taylor::Jet> {
+        use crate::maths::taylor::Jet;
+        if !scale.is_finite() || scale <= 0. {
+            return Err(SpiceError::circuit("invalid source Taylor time scale"));
+        }
+        match self {
+            Self::Constant(_) | Self::Step { .. } => {
+                Jet::affine(order, self.value_at(0., Limit::Right)?, 0.)
+            }
+            Self::Pwl(pwl) => pwl.initial_jet(order, scale),
+            Self::Pulse(pulse) => pulse.initial_jet(order, scale),
+            Self::Function(function) => function.initial_jet(order, scale),
+            Self::PortSeries { baseline, tones } => {
+                let mut result = baseline.initial_jet(order, scale)?;
+                for &(amplitude, angular_frequency) in tones {
+                    let cosine = Jet::affine(order, 0., angular_frequency * scale)?
+                        .sin_cos()?
+                        .1;
+                    result = result.sum(&cosine.scaled(amplitude)?)?;
+                }
+                Ok(result)
+            }
+            Self::PulseDefaults(_) | Self::FunctionDefaults(_) => Err(SpiceError::circuit(
+                "bind transient timing before differentiating a source",
+            )),
+            Self::Stochastic(_) => Err(SpiceError::circuit(
+                "stochastic forcing has no qualified analytic Taylor continuation",
+            )),
+        }
+    }
+
     /// Like [`Self::value_at`], but resolves a [`Waveform::PulseDefaults`]
     /// against `timing` first, so unbound source devices can be loaded.
     ///
@@ -650,6 +687,30 @@ impl LinearSystem {
         }
         Ok(rhs)
     }
+    /// Independent-source Taylor RHS, ordered by normalized derivative
+    /// degree. Every contribution uses its original physical MNA row.
+    /// # Errors
+    /// Invalid scale/order, source domain error or nonfinite RHS coefficient.
+    pub fn initial_rhs_jet(&self, order: usize, scale: Real) -> SpiceResult<Vec<Vector>> {
+        use crate::maths::taylor::MAX_ORDER;
+        if order > MAX_ORDER || !scale.is_finite() || scale <= 0. {
+            return Err(SpiceError::circuit("invalid initial RHS Taylor expansion"));
+        }
+        let mut rhs = vec![Vector::zeros(self.a.rows()); order + 1];
+        for source in &self.sources {
+            let jet = source.waveform.initial_jet(order, scale)?;
+            for (degree, &value) in jet.coefficients().iter().enumerate() {
+                for &(row, sign) in &source.rows {
+                    rhs[degree].add_to(row, sign * value)?;
+                }
+            }
+        }
+        if rhs.iter().any(|v| !v.is_finite()) {
+            return Err(SpiceError::circuit("nonfinite initial Taylor RHS"));
+        }
+        Ok(rhs)
+    }
+
     /// Clear the assembled operators and forcing, retaining outer storage.
     pub(crate) fn clear(&mut self) {
         self.a.clear();

@@ -52,6 +52,7 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use crate::devices::{Limit, TransientTiming};
+use crate::maths::taylor::Jet;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 use super::pulse::{MAX_CYCLE, cycle_position, seek_cycle};
@@ -653,6 +654,56 @@ impl SourceFunction {
         finite(kind, value)
     }
 
+    /// Analytic right-hand Taylor coefficients at the transient origin.
+    /// The dimensionless argument u represents physical time scale*u.
+    /// # Errors
+    /// Nonpositive scale, excessive order or nonrepresentable coefficients.
+    pub fn initial_jet(&self, order: usize, scale: Real) -> SpiceResult<Jet> {
+        if !scale.is_finite() || scale <= 0. {
+            return Err(invalid(self.kind(), "invalid Taylor time scale"));
+        }
+        let constant = |v| Jet::affine(order, v, 0.);
+        let phase = |degrees, frequency| {
+            Jet::affine(order, phase_radians(degrees), 2. * PI * (frequency * scale))
+        };
+        match *self {
+            Self::Sine(s) if s.delay == 0. => {
+                let (sin, _) = phase(s.phase, s.frequency)?.sin_cos()?;
+                let envelope = Jet::affine(order, 0., -s.damping * scale)?.exp()?;
+                sin.product(&envelope)?
+                    .scaled(s.amplitude)?
+                    .shifted(s.offset)
+            }
+            Self::Sffm(s) if s.delay == 0. => {
+                let (signal, _) = phase(s.signal_phase, s.signal)?.sin_cos()?;
+                let angle = phase(s.carrier_phase, s.carrier)?.sum(&signal.scaled(s.index)?)?;
+                angle.sin_cos()?.0.scaled(s.amplitude)?.shifted(s.offset)
+            }
+            Self::Am(a) if a.delay == 0. => {
+                let (signal, _) = phase(a.modulation_phase, a.modulation_frequency)?.sin_cos()?;
+                let envelope = signal
+                    .scaled(a.modulation_amplitude)?
+                    .shifted(a.carrier_amplitude)?;
+                let (carrier, _) = phase(a.carrier_phase, a.carrier_frequency)?.sin_cos()?;
+                envelope.product(&carrier)?.shifted(a.offset)
+            }
+            Self::Exp(e) if e.rise_delay == 0. => {
+                // At a coincident rise/fall delay the two exponentials both
+                // contribute. Keep the constant term in the original units.
+                let rise = Jet::affine(order, 0., -scale / e.rise_tau)?.exp()?;
+                let weight = if e.fall_delay == 0. {
+                    Jet::affine(order, 0., -scale / e.fall_tau)?
+                        .exp()?
+                        .sum(&rise.scaled(-1.)?)?
+                } else {
+                    rise.scaled(-1.)?.shifted(1.)?
+                };
+                weight.scaled(e.pulsed - e.initial)?.shifted(e.initial)
+            }
+            _ => constant(self.value_at(0., Limit::Right)?),
+        }
+    }
+
     /// The corners the port lands on, ascending and unique: SIN/SFFM/AM
     /// delay, EXP `TD1` and `TD2`. See the module notes on C parity.
     #[must_use = "the returned times locate waveform transitions that the timestep scheduler must account for"]
@@ -874,6 +925,47 @@ impl PwlSource {
             }
         }
         Ok(self.interpolate(time))
+    }
+
+    /// Analytic right-hand Taylor coefficients at time zero. A repeated
+    /// segment starts at its repeat knot at the exact cycle boundary.
+    /// # Errors
+    /// Invalid scale, unresolvable cycle or nonrepresentable coefficients.
+    pub fn initial_jet(&self, order: usize, scale: Real) -> SpiceResult<Jet> {
+        if !scale.is_finite() || scale <= 0. {
+            return Err(invalid("PWL", "invalid Taylor time scale"));
+        }
+        let mut time = -self.delay();
+        let (first, last) = (self.knots[0], self.knots[self.knots.len() - 1]);
+        if time < first.0 {
+            return Jet::affine(order, first.1, 0.);
+        }
+        if time >= last.0 {
+            let Some(index) = self.repeat() else {
+                return Jet::affine(order, last.1, 0.);
+            };
+            let start = self.knots[index].0;
+            let cycle = cycle_position(time - start, last.0 - start);
+            if !cycle.resolvable() {
+                return Err(invalid("PWL", "unresolvable initial cycle"));
+            }
+            time = cycle.phase + start;
+        }
+        let end = self.knots.partition_point(|(t, _)| *t <= time);
+        let Some(&(t1, v1)) = self.knots.get(end) else {
+            return Jet::affine(order, last.1, 0.);
+        };
+        let (t0, v0) = self.knots[end - 1];
+        let slope = if order == 0 {
+            0.
+        } else {
+            // Avoid overflowing v1-v0 when the scaled slope is finite.
+            crate::primitives::rounded_product_ratio(
+                [(v1, scale, false), (v0, scale, true)],
+                [(t1, false), (t0, true)],
+            )
+        };
+        Jet::affine(order, self.interpolate(time), slope)
     }
 
     /// Lazily enumerates the delayed knot times in `[t0, t1]`, continuing

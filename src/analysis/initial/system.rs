@@ -1,8 +1,8 @@
 //! Ordered elimination of fixed storage coordinates and compact instantaneous MNA.
-mod rank;
 use super::constraints::{AbsoluteRow, VoltageVertex};
 use super::{CapacitorInitial, ImpulseStorage, Tolerances, failure};
 use crate::devices::{Circuit, InitialStoragePolicy};
+use crate::maths::constraint_rank as rank;
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceResult};
 use std::collections::BTreeSet;

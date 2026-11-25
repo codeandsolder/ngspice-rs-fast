@@ -371,6 +371,41 @@ impl Pulse {
         })
     }
 
+    /// Analytic right-hand Taylor coefficients at the transient origin.
+    /// # Errors
+    /// Invalid scale or nonrepresentable coefficients.
+    pub fn initial_jet(&self, order: usize, scale: Real) -> SpiceResult<crate::maths::taylor::Jet> {
+        use crate::maths::taylor::Jet;
+        if !scale.is_finite() || scale <= 0. {
+            return Err(invalid("invalid Taylor time scale"));
+        }
+        if self.delay > 0. {
+            return Jet::affine(order, self.initial, 0.);
+        }
+        let (value, slope) = if self.rise > 0. {
+            (
+                self.initial,
+                crate::primitives::rounded_product_ratio(
+                    [(self.pulsed, scale, false), (self.initial, scale, true)],
+                    [(self.rise, false)],
+                ),
+            )
+        } else if self.width > 0. {
+            (self.pulsed, 0.)
+        } else if self.fall > 0. {
+            (
+                self.pulsed,
+                crate::primitives::rounded_product_ratio(
+                    [(self.initial, scale, false), (self.pulsed, scale, true)],
+                    [(self.fall, false)],
+                ),
+            )
+        } else {
+            (self.initial, 0.)
+        };
+        Jet::affine(order, value, if order == 0 { 0. } else { slope })
+    }
+
     /// Lazily enumerates the corner and jump times in the closed window
     /// `[t0, t1]`, ascending and strictly increasing, one cycle at a time.
     ///
