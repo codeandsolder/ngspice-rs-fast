@@ -13,7 +13,10 @@ fn run(body: &str, kind: AnalysisKind, args: &[&str]) -> SpiceResult<Plot> {
     );
     let netlist = Parser::new().parse_deck(&deck)?;
     let mut circuit = Circuit::from_netlist(&netlist)?;
-    AnalysisInput::with_arguments(kind, args.iter().copied())
+    let mut request =
+        AnalysisInput::with_arguments(kind, args.iter().copied().filter(|arg| *arg != "uic"));
+    request.uic = args.contains(&"uic");
+    request
         .resolve()?
         .run(&mut circuit, &AnalysisContext::default())
 }
@@ -194,5 +197,89 @@ fn lexical_passive_macros_and_current_probes_are_instance_local() -> SpiceResult
     )?;
     close(plot.value("i(va)", 0).unwrap().re, -1e-3, 1e-10);
     close(plot.value("i(vb)", 0).unwrap().re, -2. / 6000., 1e-10);
+    Ok(())
+}
+
+#[test]
+fn differential_capacitor_uic_preserves_initial_voltage_and_nonlinear_decay() -> SpiceResult<()> {
+    for (cards, expected) in [
+        ("c1 a 0 c={1u*(1+v(a))} ic=2", 2.),
+        ("c1 a 0 c={1u*(1+v(a))}\n.ic v(a)=2", 2.),
+        ("c1 a 0 c={1u*(1+v(a))} ic=1.5\n.ic v(a)=2", 1.5),
+    ] {
+        let body = format!("r1 a 0 1k\n{cards}\n.tran 1u 2m 0 1u uic");
+        let deck = Parser::new().parse_deck(&parse_deck_text(
+            Path::new("cap-ic.cir"),
+            &format!("test\n{body}\n.end\n"),
+        ))?;
+        let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
+        let plan = config.plan_for(&deck.analyses[0])?;
+        let mut circuit = config.circuit(&deck)?;
+        let plot = plan.run(&mut circuit, &config.context())?;
+        assert!(plot.point_count() > 100);
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            let v = plot.value("v(a)", index).unwrap().re;
+            close(v + v.ln(), expected + f64::ln(expected) - t * 1000., 2e-4);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn differential_inductor_uic_releases_rate_equation_not_current_constitutive_law() -> SpiceResult<()>
+{
+    let plot = run(
+        "r1 a 0 10\nl1 a 0 l={10m*(1+i(l1))} ic=0.5",
+        AnalysisKind::Transient,
+        &["1u", "2m", "0", "1u", "uic"],
+    )?;
+    assert!(plot.point_count() > 100);
+    for index in 0..plot.point_count() {
+        let t = plot.value("time", index).unwrap().re;
+        let i = -plot.value("v(a)", index).unwrap().re / 10.;
+        close(i + i.ln(), 0.5 + 0.5_f64.ln() - t * 1000., 2e-4);
+    }
+    Ok(())
+}
+
+#[test]
+fn differential_storage_uic_detects_conflicting_ideal_sources() {
+    for body in [
+        "v1 a 0 1\nc1 a 0 c={1u*(1+v(a))} ic=2",
+        "i1 0 a 1\nl1 a 0 l={1m*(1+i(l1))} ic=0.5",
+    ] {
+        let error = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "1m", "0", "1u", "uic"],
+        )
+        .expect_err("incompatible initial storage")
+        .to_string();
+        assert!(error.contains("impulse"), "{body}: {error}");
+    }
+}
+
+#[test]
+fn nonlinear_lc_uic_conserves_charge_balance_and_energy() -> SpiceResult<()> {
+    let body = "c1 a 0 c={1u*(1+v(a)^2)} ic=1\nl1 a 0 l={1m*(1+1000*i(l1)^2)} ic=0\nbimon il 0 v=i(l1)\nbcmon ic 0 v=i(c1)";
+    let plot = run(
+        body,
+        AnalysisKind::Transient,
+        &["100n", "1m", "0", "100n", "uic"],
+    )?;
+    assert!(plot.point_count() > 1000);
+    let initial_energy = 0.75e-6;
+    let mut largest_current: f64 = 0.;
+    for index in 0..plot.point_count() {
+        let v = plot.value("v(a)", index).unwrap().re;
+        let i = plot.value("v(il)", index).unwrap().re;
+        let ic = plot.value("v(ic)", index).unwrap().re;
+        close(i + ic, 0., 1e-9);
+        largest_current = largest_current.max(i.abs());
+        let e = 1e-6 * (0.5 * v * v + 0.25 * v.powi(4)) + 1e-3 * (0.5 * i * i + 250. * i.powi(4));
+        close(e, initial_energy, 1e-3 * initial_energy);
+    }
+    assert!(largest_current > 0.02);
     Ok(())
 }

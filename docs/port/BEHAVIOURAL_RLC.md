@@ -92,8 +92,9 @@ the normalized coordinate x_i is D_leading*physical_i/w^i. Missing native
 initial values default to zero, matching the C implementation. The typed
 engine API also allows equilibrium initialization for non-origin poles
 with zero unconstrained origin-pole coordinates. Gain acts on input forcing,
-not the free response from explicit initial conditions. UIC is currently
-rejected pending fixed-coordinate initialization support.
+not the free response from explicit initial conditions. UIC fixes all
+internal coordinates to their specified values (zero for unspecified
+coordinates) before seeding accepted history.
 
 Eight native tests cover orders zero through five, nonzero feedthrough,
 multiple integrators, explicit initial states, all four analog port laws,
@@ -106,10 +107,45 @@ analytical accuracy and this convergence rather than requiring agreement
 with the coarser sampled C realization. The Rust zero-order gain also
 works where the tested C47 zero-order model crashed.
 
+## Initial-condition constraints
+
+The UIC initializer binds prescribed storage coordinates independently
+of their evolution equations. For a differential inductor, the fixed
+current is local branch 0 and its released equation is branch 1;
+the voltage/rate constitutive equation remains intact. For a differential
+capacitor, the signed stored coordinate is -v, with explicit instance
+`ic=` taking precedence over node hints. Its existing rate equation is
+replaced by the initial voltage relation; an additional current unknown
+is not required. Scalar capacitors use the same voltage-constraint
+interface with an appended current, and scalar inductors publish their
+ordinary fixed current. Rational transfer coordinates use the same
+initialization contract for arbitrary order.
+
+Multiport devices publish ideal voltage relations through a device-owned
+interface: transfer voltage outputs are controlled, current inputs
+impose zero differential voltage, and analog/DAC and ordinary sources
+declare their corresponding relations. The consistency checker keeps
+the established independent/controlled constraint graph and rejects
+inconsistent constraints before history acceptance. Its nonlinear
+instantaneous check still uses the static linearization supplied by the
+transient driver, not a general nonlinear constrained solve.
+
+Nonlinear C/L `ic=` is intentionally retained under UIC, rather than
+discarded by the frontend as observed in ngspice 47 (instance and node
+IC cases both remained at zero in independent discharge tests).
+Analytical nonlinear RC/RL discharges and a lossless nonlinear LC
+oscillator pass; the LC verifies KCL at every point and energy drift
+below 0.1%. Independent C47 s_xfer UIC test (2011 points, 1 us maximum
+step) agrees with the initial free-response law, with maximum analytic
+error 1.84e-4 V. Native transfer tests check the same law against a
+2e-5 V tolerance, second-order free response with zero gain, and
+conflicts at voltage outputs and current-sensing inputs.
+
 ## Remaining work
 
 Source-dialect E/G LAPLACE normalization is tracked in the preprocessing
 repository (#44), using the native rational transfer model. Statistical
-functions, UIC and explicit nonlinear initial-condition setters, noise,
-mutual coupling, broader reference coverage, and nonlinear
-convergence/candidate testing remain within issue #184.
+functions, arbitrary charge-law initial-condition constraints, a
+fully nonlinear instantaneous consistency solve, noise, mutual coupling,
+broader reference coverage, and nonlinear convergence/candidate testing
+remain within issue #184.

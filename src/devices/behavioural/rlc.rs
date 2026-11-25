@@ -214,6 +214,7 @@ impl Bound<'_, '_> {
 struct Passive {
     expression: Behavioural,
     law: Law,
+    initial: Option<Real>,
 }
 
 impl Passive {
@@ -326,6 +327,38 @@ impl Device for Passive {
     }
     fn truncation_slot(&self) -> Option<usize> {
         self.law.storage().then_some(0)
+    }
+
+    fn initial_coordinates(
+        &self,
+        _context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Vec<crate::devices::InitialCoordinate>> {
+        Ok((self.law == Law::Inductance)
+            .then(|| crate::devices::InitialCoordinate {
+                coordinate: 0,
+                equation: 1,
+                value: self.initial.unwrap_or(0.),
+            })
+            .into_iter()
+            .collect())
+    }
+
+    fn initial_voltage_storage(
+        &self,
+        _context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Option<crate::devices::InitialVoltageStorage>> {
+        Ok(
+            (self.law == Law::Capacitance).then_some(crate::devices::InitialVoltageStorage {
+                voltage: self.initial,
+                slot: 0,
+                scale: -1.,
+                equation: Some(1),
+            }),
+        )
+    }
+
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.expression.validate_dc_inputs(context)
     }
 
     fn setup_matrix(&self, setup: &mut MatrixSetup<'_>) -> SpiceResult<bool> {
@@ -502,6 +535,7 @@ pub(in crate::devices) fn instantiate(
     }
     let mut expression = None;
     let mut scale = BehaviouralScale::default();
+    let mut initial = None;
     for parameter in &instance.parameters {
         match &parameter.kind {
             ParameterKind::Behavioural(tree) => {
@@ -534,6 +568,7 @@ pub(in crate::devices) fn instantiate(
                     "temp" => scale.temperature = Some(value),
                     "dtemp" => scale.dtemp = value,
                     "noisy" if value.abs() == 0. => {}
+                    "ic" => initial = Some(value),
                     _ => {
                         return Err(unsupported(
                             &parameter.location,
@@ -552,6 +587,12 @@ pub(in crate::devices) fn instantiate(
     }
     let (law, tree) =
         expression.ok_or_else(|| SpiceError::circuit("missing behavioural passive law"))?;
+    if initial.is_some() && !law.differential() {
+        return Err(unsupported(
+            &instance.location,
+            "ic= applies to differential C/L, not an arbitrary charge law",
+        ));
+    }
     scale.reciprocal_tc = matches!(law, Law::Capacitance | Law::Charge);
     scale.reciprocal_m = matches!(law, Law::Resistance | Law::Inductance);
     let expression = bind_expression(instance, nodes, BehaviouralOutput::Current, tree, scale)?;
@@ -561,5 +602,9 @@ pub(in crate::devices) fn instantiate(
             crate::primitives::NodeKind::Internal,
         )?;
     }
-    Ok(Box::new(Passive { expression, law }))
+    Ok(Box::new(Passive {
+        expression,
+        law,
+        initial,
+    }))
 }
