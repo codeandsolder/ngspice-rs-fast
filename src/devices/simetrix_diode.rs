@@ -15,7 +15,8 @@ use super::{
     Device, ModelContext, ResolvedModel,
     models::PreparationKey,
     prepared_model::{
-        AmbientTemperature, InstanceTemperature, PreparedDevice, SourceBinding, SourceParameter,
+        AmbientTemperature, InstanceTemperature, JunctionLimit, JunctionPolicy, PreparedDevice,
+        SourceBinding, SourceParameter,
     },
     schema::finite_literal,
 };
@@ -155,6 +156,75 @@ fn prepared_artifact(
     Ok(Arc::clone(cached.as_ref()))
 }
 
+/// Numerical scales come from the already compiled model and effective
+/// instance; only the solver applies them. No physical equations are replaced.
+#[derive(Debug)]
+struct DiodeJunction {
+    model: PreparedModel,
+    positive: usize,
+}
+
+impl JunctionPolicy for DiodeJunction {
+    fn prepare(
+        &self,
+        values: &[f64],
+        temperature: InstanceTemperature,
+    ) -> SpiceResult<JunctionLimit> {
+        let input = Instance {
+            analysis_temperature: temperature.ambient_kelvin(),
+            area: values[AREA],
+            multiplier: values[MULTIPLIER],
+            gmin: 0.,
+            relative_temperature: values[RELATIVE_TEMPERATURE],
+            absolute_temperature: values.get(ABSOLUTE_TEMPERATURE).copied(),
+        };
+        let bound = self
+            .model
+            .bind(input)
+            .map_err(|error| SpiceError::circuit(error.to_string()))?;
+        let model = self.model.parameters();
+        let vt = model_kernel_diode::K_OVER_Q * bound.temperature();
+        let emission = [model.transport, model.recombination]
+            .into_iter()
+            .filter(|junction| junction.saturation_current > 0.)
+            .map(|junction| junction.emission)
+            .reduce(f64::min);
+        let forward = if let Some(emission) = emission {
+            let scale = vt * emission;
+            let slope = bound
+                .evaluate(0.)
+                .map_err(|error| SpiceError::circuit(error.to_string()))?
+                .conductance
+                .abs();
+            let critical =
+                (-slope.ln() - std::f64::consts::SQRT_2.ln()).clamp(0., f64::MAX.ln()) * scale;
+            Some((scale, critical))
+        } else {
+            None
+        };
+        let reverse = model.breakdown.and_then(|breakdown| {
+            let emission = [breakdown.primary, breakdown.low_current]
+                .into_iter()
+                .filter(|term| term.current > 0.)
+                .map(|term| term.emission)
+                .reduce(f64::min)?;
+            let delta = bound.temperature() - model.temperature.nominal;
+            let voltage = breakdown.voltage
+                * breakdown
+                    .quadratic_temperature
+                    .mul_add(delta, breakdown.linear_temperature)
+                    .mul_add(delta, 1.);
+            Some((vt * emission, voltage))
+        });
+        Ok(JunctionLimit {
+            positive: self.positive,
+            negative: 1,
+            forward,
+            reverse,
+        })
+    }
+}
+
 pub(super) fn instantiate(
     instance: &DeviceInstance,
     nodes: &mut NodeAppend<'_>,
@@ -182,7 +252,14 @@ pub(super) fn instantiate(
     let source = SourceBinding {
         model_name: model.card().name.clone(),
         designator: 'd',
-        voltage_step_limiting: true,
+        junction_policy: Box::new(DiodeJunction {
+            model: compiled.model,
+            positive: if artifact.descriptor().equations.len() == 3 {
+                2
+            } else {
+                0
+            },
+        }),
         parameters: if absolute {
             ABSOLUTE_PARAMETERS
         } else {
@@ -203,7 +280,7 @@ pub(super) fn instantiate(
             &values,
             InstanceTemperature::circuit(context.temperature),
         )?
-        .with_source(source);
+        .with_source(source)?;
         Ok(Box::new(device) as Box<dyn Device>)
     })
 }

@@ -3393,6 +3393,12 @@ impl Circuit {
         batches.begin();
         for (position, index) in self.load_order().enumerate() {
             let device = point.device(self, index);
+            let output = batches.point(index, request.solution, |ordinal, coordinates| {
+                let mut states = request.history.device_of(trial, ordinal)?;
+                point
+                    .device(self, ordinal)
+                    .linearize_prepared(&mut states, coordinates)
+            })?;
             let states = request.history.device_of(trial, index)?.with_ltra(
                 ltra.as_deref_mut(),
                 request.history,
@@ -3420,8 +3426,8 @@ impl Circuit {
                 source_factor: request.model_context.source_factor,
                 voltage_source_value: &mut *voltage_source_value,
             };
-            if let Some(output) = batches.point(index, request.solution)? {
-                device.stamp_prepared(&mut context, &output)?;
+            if let Some(output) = output {
+                device.stamp_prepared(&mut context, &output.point, output.coordinates)?;
             } else {
                 device.stamp(&mut context)?;
             }
@@ -4123,8 +4129,8 @@ impl Circuit {
                 linear.system.a.triplets().len(),
                 linear.system.e.triplets().len(),
             );
-            if let Some(output) = batches.point(index, bias)? {
-                device.assemble_prepared(&mut linear, &output)?;
+            if let Some(output) = batches.point(index, bias, |_, _| Ok(()))? {
+                device.assemble_prepared(&mut linear, &output.point)?;
             } else if pole_zero_setups > 0 {
                 device.assemble_pole_zero(&mut linear, bias)?;
             } else {

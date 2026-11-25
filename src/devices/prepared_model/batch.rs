@@ -24,21 +24,34 @@ impl Key {
     }
 }
 
+/// A constitutive lane paired with its actual evaluation coordinates.
+pub struct EvaluatedLane<'a> {
+    /// Current, charge, and derivatives at the evaluation point.
+    pub point: Point<'a>,
+    /// Coordinates used to construct the affine Newton source.
+    pub coordinates: &'a [Real],
+}
+
 /// Type-erased numerical workspace, built once from effective instances.
 pub trait Tile {
     /// Evaluate every lane at the same circuit Newton/bias point.
     /// # Errors
     /// Invalid coordinates or family evaluation.
-    fn evaluate(&mut self, solution: &Vector) -> SpiceResult<()>;
+    fn evaluate(
+        &mut self,
+        solution: &Vector,
+        linearize: &mut dyn FnMut(usize, &mut [Real]) -> SpiceResult<()>,
+    ) -> SpiceResult<()>;
 
     /// Borrow one validated output lane without allocating.
     /// # Errors
     /// Lane ordinal out of range.
-    fn point(&mut self, lane: usize) -> SpiceResult<Point<'_>>;
+    fn point(&mut self, lane: usize) -> SpiceResult<EvaluatedLane<'_>>;
 }
 
 pub(super) struct BoundTile<K: Kernel> {
     prepared: PreparedTile<K>,
+    width: usize,
     rows: Vec<(Option<usize>, Option<Real>)>,
     coordinates: Vec<Real>,
     output: BatchOutput,
@@ -76,6 +89,7 @@ impl<K: Kernel> BoundTile<K> {
         let coordinates = vec![0.; rows.len()];
         Ok(Self {
             prepared,
+            width,
             rows,
             coordinates,
             output,
@@ -84,7 +98,11 @@ impl<K: Kernel> BoundTile<K> {
 }
 
 impl<K: Kernel> Tile for BoundTile<K> {
-    fn evaluate(&mut self, solution: &Vector) -> SpiceResult<()> {
+    fn evaluate(
+        &mut self,
+        solution: &Vector,
+        linearize: &mut dyn FnMut(usize, &mut [Real]) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
         for (value, &(row, offset)) in self.coordinates.iter_mut().zip(&self.rows) {
             let coordinate = match row {
                 Some(row) => solution.get(row).ok_or_else(|| {
@@ -94,13 +112,20 @@ impl<K: Kernel> Tile for BoundTile<K> {
             };
             *value = offset.map_or(coordinate, |offset| coordinate + offset);
         }
+        for (lane, coordinates) in self.coordinates.chunks_exact_mut(self.width).enumerate() {
+            linearize(lane, coordinates)?;
+        }
         self.prepared
             .evaluate(&self.coordinates, &mut self.output)
             .map_err(evaluation_error)
     }
 
-    fn point(&mut self, lane: usize) -> SpiceResult<Point<'_>> {
-        self.output.point(lane).map_err(kernel_error)
+    fn point(&mut self, lane: usize) -> SpiceResult<EvaluatedLane<'_>> {
+        let point = self.output.point(lane).map_err(kernel_error)?;
+        Ok(EvaluatedLane {
+            point,
+            coordinates: &self.coordinates[lane * self.width..(lane + 1) * self.width],
+        })
     }
 }
 
@@ -253,13 +278,16 @@ impl Plan {
         &mut self,
         device: usize,
         solution: &Vector,
-    ) -> SpiceResult<Option<Point<'_>>> {
+        mut linearize: impl FnMut(usize, &mut [Real]) -> SpiceResult<()>,
+    ) -> SpiceResult<Option<EvaluatedLane<'_>>> {
         let Some((group, lane)) = self.bindings.get(device).copied().flatten() else {
             return Ok(None);
         };
         let group = &mut self.groups[group];
         if !group.evaluated {
-            group.tile.evaluate(solution)?;
+            group.tile.evaluate(solution, &mut |lane, coordinates| {
+                linearize(group.lanes[lane].index, coordinates)
+            })?;
             group.evaluated = true;
         }
         group.tile.point(lane).map(Some)

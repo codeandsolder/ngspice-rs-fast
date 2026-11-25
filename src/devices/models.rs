@@ -52,7 +52,7 @@ pub enum ModelFamily {
     Inductor,
     /// Junction diode.
     Diode,
-    /// Explicit source-selected SIMetrix level-1 diode.
+    /// Explicit source-selected `SIMetrix` level-1 diode.
     SimetrixDiodeLevel1,
     /// NPN classic BJT.
     Npn,
@@ -156,7 +156,7 @@ pub enum ModelBackend {
     Inductor,
     /// Junction diode.
     Diode,
-    /// Explicit source-selected SIMetrix level-1 diode.
+    /// Explicit source-selected `SIMetrix` level-1 diode.
     SimetrixDiodeLevel1,
     /// Gummel-Poon.
     Bjt,
