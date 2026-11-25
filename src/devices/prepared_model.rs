@@ -15,7 +15,7 @@ use crate::devices::{Circuit, elaboration::ElaborationSize};
 
 pub mod batch;
 use crate::maths::Vector;
-use crate::primitives::{Complex, NodeId, NodeKind, Real, SpiceError, SpiceResult};
+use crate::primitives::{Complex, NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 const CELSIUS_TO_KELVIN: Real = 273.15;
 
@@ -117,6 +117,26 @@ impl InstanceTemperature {
     }
 }
 
+/// Source-side scalar name and unit conversion for one prepared slot.
+#[derive(Debug)]
+pub(super) struct SourceParameter {
+    pub name: &'static str,
+    pub slot: usize,
+    pub offset: Real,
+}
+
+/// Source identity and contextual bindings, independent of equation stamping.
+#[derive(Debug)]
+pub(super) struct SourceBinding {
+    pub model_name: String,
+    pub designator: char,
+    pub parameters: &'static [SourceParameter],
+    pub gmin_slot: Option<usize>,
+    pub model_ambient: AmbientTemperature,
+    pub relative_temperature_slot: usize,
+    pub absolute_temperature_slot: Option<usize>,
+}
+
 /// Native prepared model integrated through the normal device trial lifecycle.
 #[derive(Debug)]
 pub struct PreparedDevice<K: Kernel> {
@@ -126,6 +146,7 @@ pub struct PreparedDevice<K: Kernel> {
     values: Box<[Real]>,
     temperature: InstanceTemperature,
     prepared: Prepared<K>,
+    source: Option<Arc<SourceBinding>>,
     voltage: RefCell<Vec<Real>>,
     output: RefCell<PointBuffer>,
     dynamic: RefCell<Vec<Real>>,
@@ -182,6 +203,7 @@ impl<K: Kernel> PreparedDevice<K> {
             values: values.into(),
             temperature,
             prepared,
+            source: None,
             voltage: RefCell::new(vec![0.; width]),
             output: RefCell::new(PointBuffer::new(width).map_err(kernel_error)?),
             dynamic: RefCell::new(vec![0.; width]),
@@ -218,6 +240,39 @@ impl<K: Kernel> PreparedDevice<K> {
             0
         };
         circuit.add_prepared_devices(ElaborationSize::new(1, hidden, states), |nodes| {
+            Ok(vec![Box::new(Self::bind_nodes(
+                nodes,
+                artifact,
+                name,
+                terminals,
+                values,
+                temperature,
+            )?)])
+        })
+    }
+
+    // Shared staged binding for directly added artifacts and ordinary netlist
+    // factories. Node allocation is transactional, including preparation errors.
+    pub(super) fn bind_nodes(
+        nodes: &mut NodeAppend<'_>,
+        artifact: &Arc<Artifact<K>>,
+        name: &str,
+        terminals: &[NodeId],
+        values: &[Real],
+        temperature: InstanceTemperature,
+    ) -> SpiceResult<Self> {
+        let descriptor = artifact.descriptor();
+        let public_count = descriptor
+            .equations
+            .iter()
+            .filter(|equation| equation.binding == Binding::Terminal)
+            .count();
+        if terminals.len() != public_count {
+            return Err(SpiceError::circuit(
+                "prepared public terminal count mismatch",
+            ));
+        }
+        nodes.transaction(|nodes| {
             let mut public = terminals.iter().copied();
             let mut rows = Vec::with_capacity(descriptor.equations.len());
             for equation in &descriptor.equations {
@@ -239,14 +294,41 @@ impl<K: Kernel> PreparedDevice<K> {
                 };
                 rows.push(node);
             }
-            Ok(vec![Box::new(Self::from_rows(
-                artifact,
-                name.to_owned(),
-                rows,
-                values,
-                temperature,
-            )?)])
+            Self::from_rows(artifact, name.to_owned(), rows, values, temperature)
         })
+    }
+
+    pub(super) fn with_source(mut self, source: SourceBinding) -> Self {
+        self.source = Some(Arc::new(source));
+        self
+    }
+
+    fn rebound(&self, values: &[Real], temperature: InstanceTemperature) -> SpiceResult<Self> {
+        let mut device = Self::from_rows(
+            &self.artifact,
+            self.name.clone(),
+            self.terminals.to_vec(),
+            values,
+            temperature,
+        )?;
+        device.source = self.source.clone();
+        Ok(device)
+    }
+
+    fn source_parameter(&self, name: &str) -> Option<&SourceParameter> {
+        self.source
+            .as_ref()?
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
+    }
+
+    fn context_values(&self, context: &crate::devices::ModelContext) -> Vec<Real> {
+        let mut values = self.values.to_vec();
+        if let Some(slot) = self.source.as_ref().and_then(|source| source.gmin_slot) {
+            values[slot] = context.gmin;
+        }
+        values
     }
 
     /// Make a new immutable prepared parameter context for a candidate.
@@ -268,13 +350,7 @@ impl<K: Kernel> PreparedDevice<K> {
         }
         let mut values = self.values.to_vec();
         values[slot] = value;
-        Self::from_rows(
-            &self.artifact,
-            self.name.clone(),
-            self.terminals.to_vec(),
-            &values,
-            self.temperature,
-        )
+        self.rebound(&values, self.temperature)
     }
 
     /// Reprepare a named scalar slot at a candidate boundary, never in Newton.
@@ -297,15 +373,22 @@ impl<K: Kernel> PreparedDevice<K> {
         self.with_parameter(slot, value)
     }
 
-    fn check_temperature(&self, context: Real) -> SpiceResult<()> {
-        if self.temperature.circuit_celsius.to_bits() == context.to_bits() {
-            Ok(())
-        } else {
-            Err(SpiceError::circuit(format!(
+    fn check_context(&self, temperature: Real, gmin: Real) -> SpiceResult<()> {
+        if self.temperature.circuit_celsius.to_bits() != temperature.to_bits() {
+            return Err(SpiceError::circuit(format!(
                 "{}: prepared model temperature changed; reprepare before solving",
                 self.name
-            )))
+            )));
         }
+        if let Some(slot) = self.source.as_ref().and_then(|source| source.gmin_slot)
+            && self.values[slot].to_bits() != gmin.to_bits()
+        {
+            return Err(SpiceError::circuit(format!(
+                "{}: prepared model gmin changed; reprepare before solving",
+                self.name
+            )));
+        }
+        Ok(())
     }
 
     fn read_coordinates(&self, output: &mut [Real], voltage: impl Fn(NodeId) -> Real) {
@@ -433,7 +516,12 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         &self.name
     }
     fn designator(&self) -> char {
-        'x'
+        self.source.as_ref().map_or('x', |source| source.designator)
+    }
+    fn model_name(&self) -> Option<&str> {
+        self.source
+            .as_ref()
+            .map(|source| source.model_name.as_str())
     }
     fn terminals(&self) -> &[NodeId] {
         &self.terminals
@@ -466,12 +554,20 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         }
     }
 
+    fn truncation_slots(&self) -> Vec<usize> {
+        if self.artifact.descriptor().charge == Capability::Computed {
+            (0..self.terminals.len()).map(|index| 2 * index).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
-        self.check_temperature(context.temperature)
+        self.check_context(context.temperature, context.gmin)
     }
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        self.check_temperature(context.temperature)?;
+        self.check_context(context.temperature, context.gmin)?;
         if context.mode.is_ac() {
             return Err(SpiceError::circuit(
                 "prepared model AC requires small-signal assembly",
@@ -488,6 +584,11 @@ impl<K: Kernel> Device for PreparedDevice<K> {
     }
 
     fn bind_numeric_parameter(&self, name: &str) -> Option<crate::devices::sweep::ParameterKey> {
+        if self.source.is_some() {
+            return self
+                .source_parameter(name)
+                .map(|parameter| crate::devices::sweep::ParameterKey::Native(parameter.name));
+        }
         self.artifact
             .descriptor()
             .parameters
@@ -497,8 +598,11 @@ impl<K: Kernel> Device for PreparedDevice<K> {
     }
 
     fn numeric_parameter_name(&self, key: crate::devices::sweep::ParameterKey) -> Option<&str> {
-        let crate::devices::sweep::ParameterKey::Prepared(slot) = key else {
-            return None;
+        let slot = match key {
+            crate::devices::sweep::ParameterKey::Native(name) => {
+                return self.source_parameter(name).map(|parameter| parameter.name);
+            }
+            crate::devices::sweep::ParameterKey::Prepared(slot) => slot,
         };
         self.artifact
             .descriptor()
@@ -512,6 +616,23 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         name: &str,
         _context: &crate::devices::ModelContext,
     ) -> SpiceResult<Option<Real>> {
+        if let Some(source) = &self.source {
+            if name.eq_ignore_ascii_case("temp") {
+                let base = InstanceTemperature {
+                    circuit_celsius: self.temperature.circuit_celsius,
+                    ambient: source.model_ambient,
+                }
+                .ambient_kelvin();
+                let effective = source.absolute_temperature_slot.map_or_else(
+                    || base + self.values[source.relative_temperature_slot],
+                    |slot| self.values[slot],
+                );
+                return Ok(Some(effective - CELSIUS_TO_KELVIN));
+            }
+            return Ok(self
+                .source_parameter(name)
+                .map(|parameter| self.values[parameter.slot] - parameter.offset));
+        }
         Ok(self
             .artifact
             .descriptor()
@@ -527,8 +648,17 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         value: Real,
         context: &crate::devices::ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        let crate::devices::sweep::ParameterKey::Prepared(slot) = key else {
-            return Err(SpiceError::circuit("foreign prepared setter"));
+        let (slot, value) = match key {
+            crate::devices::sweep::ParameterKey::Native(name) => {
+                let parameter = self
+                    .source_parameter(name)
+                    .ok_or_else(|| SpiceError::circuit("foreign source prepared setter"))?;
+                (parameter.slot, value + parameter.offset)
+            }
+            crate::devices::sweep::ParameterKey::Prepared(slot) if self.source.is_none() => {
+                (slot, value)
+            }
+            _ => return Err(SpiceError::circuit("foreign prepared setter")),
         };
         let parameter = self
             .artifact
@@ -541,14 +671,11 @@ impl<K: Kernel> Device for PreparedDevice<K> {
                 "structural or nonfinite model perturbation",
             ));
         }
-        let mut values = self.values.to_vec();
+        let mut values = self.context_values(context);
         *values
             .get_mut(slot)
             .ok_or_else(|| SpiceError::circuit("invalid prepared parameter slot"))? = value;
-        Ok(Box::new(Self::from_rows(
-            &self.artifact,
-            self.name.clone(),
-            self.terminals.to_vec(),
+        Ok(Box::new(self.rebound(
             &values,
             self.temperature.at(context.temperature),
         )?))
@@ -558,14 +685,14 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         &self,
         context: &crate::devices::ModelContext,
     ) -> SpiceResult<Option<Box<dyn Device>>> {
-        if context.temperature.to_bits() == self.temperature.circuit_celsius.to_bits() {
+        if self
+            .check_context(context.temperature, context.gmin)
+            .is_ok()
+        {
             return Ok(None);
         }
-        Ok(Some(Box::new(Self::from_rows(
-            &self.artifact,
-            self.name.clone(),
-            self.terminals.to_vec(),
-            &self.values,
+        Ok(Some(Box::new(self.rebound(
+            &self.context_values(context),
             self.temperature.at(context.temperature),
         )?)))
     }
@@ -596,7 +723,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
     }
 
     fn stamp_prepared(&self, context: &mut StampContext<'_>, point: &Point<'_>) -> SpiceResult<()> {
-        self.check_temperature(context.temperature)?;
+        self.check_context(context.temperature, context.gmin)?;
         self.stamp_point(context, point)
     }
 
@@ -605,7 +732,10 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         context: &mut LinearContext<'_>,
         point: &Point<'_>,
     ) -> SpiceResult<()> {
-        self.check_temperature(context.model_context.temperature)?;
+        self.check_context(
+            context.model_context.temperature,
+            context.model_context.gmin,
+        )?;
         self.stamp_small_signal(context, point)
     }
 
@@ -614,7 +744,10 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         context: &NoiseContext<'_>,
         sources: &mut Vec<NoiseSource>,
     ) -> SpiceResult<DeviceNoise<'_>> {
-        self.check_temperature(context.model_context.temperature)?;
+        self.check_context(
+            context.model_context.temperature,
+            context.model_context.gmin,
+        )?;
         match self.artifact.descriptor().noise {
             Capability::Zero => Ok(DeviceNoise::Noiseless),
             Capability::Unavailable => Err(SpiceError::Unsupported {
@@ -656,7 +789,10 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        self.check_temperature(context.model_context.temperature)?;
+        self.check_context(
+            context.model_context.temperature,
+            context.model_context.gmin,
+        )?;
         self.check_charge()?;
         let mut voltage = self.voltage.borrow_mut();
         self.read_coordinates(&mut voltage, |node| {
@@ -683,7 +819,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
     }
 
     fn assemble_nonlinear_charge(&self, context: &mut ChargeContext<'_>) -> SpiceResult<()> {
-        self.check_temperature(context.model.temperature)?;
+        self.check_context(context.model.temperature, context.model.gmin)?;
         self.check_charge()?;
         let mut coordinates = self.voltage.borrow_mut();
         self.read_coordinates(&mut coordinates, |node| context.voltage(node));
