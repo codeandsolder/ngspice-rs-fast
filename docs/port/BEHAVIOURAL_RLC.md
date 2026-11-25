@@ -10,7 +10,7 @@ The current orientation is from the first terminal to the second.
 | --- | --- | --- |
 | R | v - R(x)i | 0 |
 | C (differential) | i - C(x)u; u | 0; -v |
-| C (explicit charge) | i | -Q(x) |
+| C (explicit charge) | z - Q(x); i | 0; -z |
 | L (differential) | v - L(x)u; u | 0; -i |
 
 The system is F(x) + dQ(x)/dt = 0. The second equation on differential
@@ -19,9 +19,11 @@ voltage-dependent capacitance and voltage as physical charge. All direct
 and expression derivatives contribute to the same Jacobian, including
 when control variables and terminal or branch variables coincide.
 
-The first branch represents physical current; the second, when present,
-represents the derivative. Plot coordinates are named i(device) and
-dvdt(device) or didt(device), respectively, with their physical units. KCL uses the physical current only. Explicit
+The first branch represents physical current. A differential C/L has a
+second branch for the derivative, while an explicit charge law has a
+private charge coordinate z. Plot coordinates are i(device), dvdt(device),
+didt(device) and q(device), with the respective physical units. KCL uses
+only the physical current. Explicit
 charge and differential storage use the solver's existing trial/accepted
 state integration. DC initializes the stored quantity and sets its
 derivative to zero; small-signal assembly separates the algebraic and
@@ -55,9 +57,10 @@ Resolved current references use existing branch rows where possible; other
 targets share one series voltage measurement with collision-checked names.
 Model-backed inductors expose their existing physical current coordinate.
 
-`ddt(f)` is expanded once into a solver-owned coordinate y, with residual
-F=y and storage Q=-f. It consumes one internal node and two accepted-state
-slots, not a voltage-source branch or an artificial electrical load. The
+`ddt(f)` is expanded once into a solver-owned signal y and private input
+storage z. The algebraic equation is z=f; the evolution equation has
+F=y and Q=-z. It consumes one internal signal node, one private storage
+branch, and two accepted-state slots, not an artificial electrical load. The
 same integration and Jacobian assembly serve transient, small-signal and
 physical DAE analyses. Nested operators get independent state and share
 ordinary expression bindings. In DC y=0; the AC response is j omega times
@@ -197,10 +200,14 @@ Newton distinguishes physical voltage/current coordinates from internal
 constitutive rates. The latter are checked through the corresponding
 physical residual, including the companion derivative at the new
 iterate, rather than comparing a V/s or A/s coordinate against an
-absolute current tolerance. The storage affine offset is formed before
-multiplication by the integration coefficient; linear differential
-storage has exactly zero offset. This avoids unnecessary cancellation
-in the history source at small timesteps.
+absolute current tolerance. The storage evolution row is linear, with exactly zero affine offset.
+For explicit storage it is power-of-two normalized when the integration
+coefficient dominates. After the sparse solve the private coordinate is
+reconstructed from that row, without changing electrical unknowns.
+The physical derivative is independently recorded in accepted history.
+Its divided differences estimate the leading truncation error without
+differencing nearly equal absolute charges. This uses the same error
+constants and tolerance policy as the ordinary charge estimator.
 
 Behavioural resistors are noiseless by default. Explicit noisy=1 (also
 noise=1) injects a series thermal-voltage PSD 4 k T R into the native
@@ -269,39 +276,35 @@ analytically differentiated charge was 1.45e-7 A, and terminal KCL
 closed within 5.34e-15 A. This is a charge-network reference, not a
 claim that the full vendor switching model has been ported.
 
-## Stiff controlled-charge numerical limit
+## Stiff controlled-charge validation
 
-An analytical stress case uses a 1 kOhm shunt and
+The analytical stress case uses a 1 kOhm shunt and
 Q=1 uF * (u+0.5*u^3), where u=v(out)-v(ctrl). The control ramps
 from 0 to 1 V in 1 ns after 0.5 ms, while the nominal discharge
-time constant is 1 ms. At reltol=1e-8, abstol=1e-12 A and
-vntol=1e-9 V, the native transient currently fails at the end
-of the ramp. The independent ngspice 47 run also fails its
-tight-tolerance transient, later in the discharge.
+time constant is 1 ms. The tolerances are reltol=1e-8,
+abstol=1e-12 A and vntol=1e-9 V.
 
-The native truncation estimate reduces the post-ramp step to
-3.27 fs. At this step the separately evaluated physical
-constitutive residual differs by approximately 3.16 nA despite
-stationary Newton iterates. Further reductions amplify the
-rounding error; at the minimum step the residual is about
-7.38 uA. This is not a failure of the analytical charge law.
-The existing derivative-form matrix multiplies nearly cancelling
-terminal/control voltages by the large integration coefficient.
-A numerical floor on the constitutive residual alone would not
-guarantee terminal KCL.
+Two numerical issues were identified: cancellation in the original
+combined constitutive/integration row near the ramp endpoint, and
+ngspice's erroneous symbolic derivative for odd powers of negative
+bases. The latter incorrectly computes 1-1.5*u^2 rather than
+1+1.5*u^2 for the dimensionless slope in this circuit. The corrected
+power Jacobian follows the actual value law. Ngspice 47 still aborts
+during discharge with both trapezoidal and Gear integration.
 
-A structural remedy to investigate is an independent storage
-coordinate z with separate equations z=Q(x) and
-i-dz/dt=0 (and the analogous signal equation for ddt).
-This separates the charge-scale constitutive solve from the
-current-scale integration constraint. It must preserve the
-initialization, small-signal, Jacobian and accepted-history
-contracts, and be verified against the stiff case before
-changing the implementation. For the post-ramp discharge,
-the exact invariant is
-2.5*ln(v)-3*v+0.75*v^2 + (t-t_end)/1 ms = constant.
-Both terminal KCL and the time integral of current provide
-independent conservation checks.
+The native regression completes under both methods. The post-ramp
+analytical invariant is
+
+    2.5*ln(v)-3*v+0.75*v^2 + (t-t_end)/1 ms = constant.
+
+| Method | Points | Max KCL residual (A) | Charge balance (C) | Decay error (V) |
+| --- | ---: | ---: | ---: | ---: |
+| Trapezoidal | 2052 | 1.08e-19 | 1.01e-14 | 1.10e-7 |
+| Gear | 2053 | 1.08e-19 | 2.03e-13 | 4.39e-7 |
+
+The reference numbers are measured with the split-storage formulation.
+No increase in the timestep work limit or constitutive tolerance floor
+is used.
 
 ## Remaining work
 
