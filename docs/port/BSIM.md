@@ -301,6 +301,27 @@ the other BSIM families are unchanged.
 
 ## BSIM4
 
+### Shared AC and pole-zero stamp construction
+
+`stamp_common.rs` owns the orientation-dependent channel and substrate
+conductances, gate leakage and resistance derivatives, external series
+resistance, middle-gate overlap, bulk row, and distributed body network.
+AC and PZ select their charge projection statically: AC supplies the
+already frequency-scaled quadrature terms, while PZ supplies the
+coefficient of `s`. The load routines retain their distinct NQS physics
+and the original FMA/product/sum grouping, including the source diagonal
+order and the PZ gate-row ordering. No additional roundoff or
+reordering is introduced when local nodes alias.
+
+The selector regression compares quasi-static AC against the evaluated
+PZ pencil and exercises both drain/source orientations. An independent
+before/after ordered stamp replay covered 2,304 combinations (four
+gate modes, three body modes, series resistance, gate-current selectors,
+both NQS selectors independently, two orientations and three numerical
+fixtures); every complete AC and PZ stamp-stream fingerprint matched.
+This includes signed zeros and non-binary-exact derivatives, and retains
+the distinction between the AC relaxation kernel and PZ charge state.
+
 ### AC/NQS numerical accuracy (#89)
 
 The AC kernel does not inherit all rounding choices of the C translation as

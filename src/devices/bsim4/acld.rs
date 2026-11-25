@@ -15,7 +15,11 @@
     reason = "preserves upstream C identifiers for equation-by-equation comparison"
 )]
 use super::fields::{Instance, Model, SizeParam};
-use super::host::{SmallSignalCkt, state};
+use super::host::SmallSignalCkt;
+use super::stamp_common::{
+    self, Ac, ChannelCurrent, ChannelGain, GateCurrent, GateResistance, GateStamp, MidGateCharge,
+    SeriesResistance, SubstrateCurrent,
+};
 
 /// Real and quadrature gains of the AC charge-relaxation kernel
 /// `1 / (1 + j omega tau)`.
@@ -57,7 +61,6 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
     let Csg = -(h.cdgb + h.cggb + h.cbgb);
     let Css = -(h.cdsb + h.cgsb + h.cbsb);
 
-    let mut T0 = 0.0;
     let (gmr, gmbsr, gdsr, gmi, gmbsi, gdsi);
     let (Cddr, Cdgr, Cdsr, Cdbr, Cddi, Cdgi, Cdsi, Cdbi);
     let (Csdr, Csgr, Cssr, Csbr, Csdi, Csgi, Cssi, Csbi);
@@ -142,100 +145,44 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
     }
     let _ = Csbr;
 
-    let (Gmr, Gmbsr, FwdSumr, RevSumr, Gmi, Gmbsi, FwdSumi, RevSumi);
-    let (gbbdp, gbbsp, gbdpg, gbdpdp, gbdpb, gbdpsp, gbspdp, gbspg, gbspb, gbspsp);
-    let (gIstotg, gIstotd, gIstots, gIstotb, gIdtotg, gIdtotd, gIdtots, gIdtotb);
-    let (gIbtotg, gIbtotd, gIbtots, gIbtotb, gIgtotg, gIgtotd, gIgtots, gIgtotb);
-    let (gcrg, gcrgd, gcrgg, gcrgs, gcrgb);
-    let mut xcgmgmb = 0.0;
-    let mut xcgmdb = 0.0;
-    let mut xcgmsb = 0.0;
-    let mut xcgmbb = 0.0;
+    let real_gain = ChannelGain::new(h.mode, gmr, gmbsr);
+    let ChannelGain {
+        gm: Gmi,
+        gmbs: Gmbsi,
+        forward: FwdSumi,
+        reverse: RevSumi,
+    } = ChannelGain::new(h.mode, gmi, gmbsi);
+    let substrate = SubstrateCurrent::new(h);
+    let gate_current = GateCurrent::new(m, h);
+    let GateCurrent {
+        gIgtotg,
+        gIgtotd,
+        gIgtots,
+        gIgtotb,
+        ..
+    } = gate_current;
+    let resistance = GateResistance::new(h, ckt);
+    let GateResistance {
+        gcrgd,
+        gcrgg,
+        gcrgs,
+        gcrgb,
+        ..
+    } = resistance;
+    let mid = MidGateCharge::new::<Ac>(h, p, omega);
+    let MidGateCharge {
+        drain: xcdgmb,
+        source: xcsgmb,
+        bulk: xcbgmb,
+        ..
+    } = mid;
     let mut xcsbsb = 0.0;
-    let (xcdgmb, xcsgmb, xcbgmb, xcggbr, xcgdbr, xcgsbr, xcgbbr, xcdgbr, xcsgbr, xcbgb);
+    let (xcggbr, xcgdbr, xcgsbr, xcgbbr, xcdgbr, xcsgbr, xcbgb);
     let (xcddbr, xcdsbr, xcsdbr, xcssbr, xcdbbr, xcsbbr, xcbdb, xcbsb, xcdbdb, xcbbb);
     let (xcdgbi, xcsgbi, xcddbi, xcdsbi, xcsdbi, xcssbi, xcdbbi, xcsbbi);
     let (xcggbi, xcgdbi, xcgsbi);
     if h.mode >= 0 {
-        Gmr = gmr;
-        Gmbsr = gmbsr;
-        FwdSumr = Gmr + Gmbsr;
-        RevSumr = 0.0;
-        Gmi = gmi;
-        Gmbsi = gmbsi;
-        FwdSumi = Gmi + Gmbsi;
-        RevSumi = 0.0;
-
-        gbbdp = -(h.gbds);
-        gbbsp = h.gbds + h.gbgs + h.gbbs;
-        gbdpg = h.gbgs;
-        gbdpdp = h.gbds;
-        gbdpb = h.gbbs;
-        gbdpsp = -(gbdpg + gbdpdp + gbdpb);
-
-        gbspdp = 0.0;
-        gbspg = 0.0;
-        gbspb = 0.0;
-        gbspsp = 0.0;
-
-        if m.igcMod != 0 {
-            gIstotg = h.gIgsg + h.gIgcsg;
-            gIstotd = h.gIgcsd;
-            gIstots = h.gIgss + h.gIgcss;
-            gIstotb = h.gIgcsb;
-
-            gIdtotg = h.gIgdg + h.gIgcdg;
-            gIdtotd = h.gIgdd + h.gIgcdd;
-            gIdtots = h.gIgcds;
-            gIdtotb = h.gIgcdb;
-        } else {
-            (gIstotg, gIstotd, gIstots, gIstotb) = (0.0, 0.0, 0.0, 0.0);
-            (gIdtotg, gIdtotd, gIdtots, gIdtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if m.igbMod != 0 {
-            gIbtotg = h.gIgbg;
-            gIbtotd = h.gIgbd;
-            gIbtots = h.gIgbs;
-            gIbtotb = h.gIgbb;
-        } else {
-            (gIbtotg, gIbtotd, gIbtots, gIbtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if (m.igcMod != 0) || (m.igbMod != 0) {
-            gIgtotg = gIstotg + gIdtotg + gIbtotg;
-            gIgtotd = gIstotd + gIdtotd + gIbtotd;
-            gIgtots = gIstots + gIdtots + gIbtots;
-            gIgtotb = gIstotb + gIdtotb + gIbtotb;
-        } else {
-            (gIgtotg, gIgtotd, gIgtots, gIgtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if h.rgateMod == 2 {
-            T0 = ckt.state0(state::VGES) - ckt.state0(state::VGS);
-        } else if h.rgateMod == 3 {
-            T0 = ckt.state0(state::VGMS) - ckt.state0(state::VGS);
-        }
-        if h.rgateMod > 1 {
-            gcrgd = h.gcrgd * T0;
-            gcrgg = h.gcrgg.mul_add(T0, -h.gcrg);
-            gcrgs = h.gcrgs * T0;
-            gcrgb = h.gcrgb * T0;
-            gcrg = h.gcrg;
-        } else {
-            (gcrg, gcrgd, gcrgg, gcrgs, gcrgb) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-
         if h.rgateMod == 3 {
-            xcgmgmb = (cgdo + cgso + p.cgbo) * omega;
-            xcgmdb = -cgdo * omega;
-            xcgmsb = -cgso * omega;
-            xcgmbb = -p.cgbo * omega;
-
-            xcdgmb = xcgmdb;
-            xcsgmb = xcgmsb;
-            xcbgmb = xcgmbb;
-
             xcggbr = Cggr * omega;
             xcgdbr = Cgdr * omega;
             xcgsbr = Cgsr * omega;
@@ -253,8 +200,6 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
             xcdgbr = (Cdgr - cgdo) * omega;
             xcsgbr = (Csgr - cgso) * omega;
             xcbgb = (h.cbgb - p.cgbo) * omega;
-
-            (xcdgmb, xcsgmb, xcbgmb) = (0.0, 0.0, 0.0);
         }
         xcddbr = (Cddr + h.capbd + cgdo) * omega;
         xcdsbr = Cdsr * omega;
@@ -293,87 +238,7 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
         xcgsbi = Cgsi;
     } else {
         // Reverse mode
-        Gmr = -gmr;
-        Gmbsr = -gmbsr;
-        FwdSumr = 0.0;
-        RevSumr = -(Gmr + Gmbsr);
-        Gmi = -gmi;
-        Gmbsi = -gmbsi;
-        FwdSumi = 0.0;
-        RevSumi = -(Gmi + Gmbsi);
-
-        gbbsp = -(h.gbds);
-        gbbdp = h.gbds + h.gbgs + h.gbbs;
-
-        gbdpg = 0.0;
-        gbdpsp = 0.0;
-        gbdpb = 0.0;
-        gbdpdp = 0.0;
-
-        gbspg = h.gbgs;
-        gbspsp = h.gbds;
-        gbspb = h.gbbs;
-        gbspdp = -(gbspg + gbspsp + gbspb);
-
-        if m.igcMod != 0 {
-            gIstotg = h.gIgsg + h.gIgcdg;
-            gIstotd = h.gIgcds;
-            gIstots = h.gIgss + h.gIgcdd;
-            gIstotb = h.gIgcdb;
-
-            gIdtotg = h.gIgdg + h.gIgcsg;
-            gIdtotd = h.gIgdd + h.gIgcss;
-            gIdtots = h.gIgcsd;
-            gIdtotb = h.gIgcsb;
-        } else {
-            (gIstotg, gIstotd, gIstots, gIstotb) = (0.0, 0.0, 0.0, 0.0);
-            (gIdtotg, gIdtotd, gIdtots, gIdtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if m.igbMod != 0 {
-            gIbtotg = h.gIgbg;
-            gIbtotd = h.gIgbs;
-            gIbtots = h.gIgbd;
-            gIbtotb = h.gIgbb;
-        } else {
-            (gIbtotg, gIbtotd, gIbtots, gIbtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if (m.igcMod != 0) || (m.igbMod != 0) {
-            gIgtotg = gIstotg + gIdtotg + gIbtotg;
-            gIgtotd = gIstotd + gIdtotd + gIbtotd;
-            gIgtots = gIstots + gIdtots + gIbtots;
-            gIgtotb = gIstotb + gIdtotb + gIbtotb;
-        } else {
-            (gIgtotg, gIgtotd, gIgtots, gIgtotb) = (0.0, 0.0, 0.0, 0.0);
-        }
-
-        if h.rgateMod == 2 {
-            T0 = ckt.state0(state::VGES) - ckt.state0(state::VGS);
-        } else if h.rgateMod == 3 {
-            T0 = ckt.state0(state::VGMS) - ckt.state0(state::VGS);
-        }
-        if h.rgateMod > 1 {
-            // C swaps the drain and source derivatives in reverse mode.
-            gcrgd = h.gcrgs * T0;
-            gcrgg = h.gcrgg.mul_add(T0, -h.gcrg);
-            gcrgs = h.gcrgd * T0;
-            gcrgb = h.gcrgb * T0;
-            gcrg = h.gcrg;
-        } else {
-            (gcrg, gcrgd, gcrgg, gcrgs, gcrgb) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-
         if h.rgateMod == 3 {
-            xcgmgmb = (cgdo + cgso + p.cgbo) * omega;
-            xcgmdb = -cgdo * omega;
-            xcgmsb = -cgso * omega;
-            xcgmbb = -p.cgbo * omega;
-
-            xcdgmb = xcgmdb;
-            xcsgmb = xcgmsb;
-            xcbgmb = xcgmbb;
-
             xcggbr = Cggr * omega;
             xcgdbr = Cgsr * omega;
             xcgsbr = Cgdr * omega;
@@ -391,8 +256,6 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
             xcdgbr = (Csgr - cgdo) * omega;
             xcsgbr = (Cdgr - cgso) * omega;
             xcbgb = (h.cbgb - p.cgbo) * omega;
-
-            (xcdgmb, xcsgmb, xcbgmb) = (0.0, 0.0, 0.0);
         }
         xcddbr = (h.capbd + cgdo + Cssr) * omega;
         xcdsbr = Csdr * omega;
@@ -432,243 +295,91 @@ pub(super) fn ac_load(m: &Model, h: &Instance, p: &SizeParam, ckt: &mut dyn Smal
 
     let xcgbbi = Cgbi;
 
-    let (gstot, gstotd, gstotg, gstots, gstotb);
-    let (gdtot, gdtotd, gdtotg, gdtots, gdtotb);
-    if m.rdsMod == 1 {
-        gstot = h.gstot;
-        gstotd = h.gstotd;
-        gstotg = h.gstotg;
-        gstots = h.gstots - gstot;
-        gstotb = h.gstotb;
-
-        gdtot = h.gdtot;
-        gdtotd = h.gdtotd - gdtot;
-        gdtotg = h.gdtotg;
-        gdtots = h.gdtots;
-        gdtotb = h.gdtotb;
-    } else {
-        (gstot, gstotd, gstotg, gstots, gstotb) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        (gdtot, gdtotd, gdtotg, gdtots, gdtotb) = (0.0, 0.0, 0.0, 0.0, 0.0);
-    }
+    let series = SeriesResistance::new(m, h);
+    let SeriesResistance {
+        gstot,
+        gstots,
+        gdtot,
+        gdtotd,
+        gdpr,
+        gspr,
+        ..
+    } = series;
 
     // Loading AC matrix
     let mm = h.m;
     let mult_i = h.mult_i * h.m;
     let mult_q = h.mult_q * h.m;
 
-    let (gdpr, gspr) = if m.rdsMod == 0 {
-        (h.drainConductance, h.sourceConductance)
-    } else {
-        (0.0, 0.0)
-    };
-
-    let (gjbd, gjbs) = if h.rbodyMod == 0 {
-        (h.gbd, h.gbs)
-    } else {
-        (0.0, 0.0)
-    };
-
     let geltd = h.grgeltd;
 
-    let (dp, gp, gm, sp, bp) = (
-        h.dNodePrime,
-        h.gNodePrime,
-        h.gNodeMid,
-        h.sNodePrime,
-        h.bNodePrime,
-    );
-    let (d, ge, s, b) = (h.dNode, h.gNodeExt, h.sNode, h.bNode);
-    let (db, sb, q) = (h.dbNode, h.sbNode, h.qNode);
+    let (dp, gp, sp, bp) = (h.dNodePrime, h.gNodePrime, h.sNodePrime, h.bNodePrime);
+    let (d, s, q) = (h.dNode, h.sNode, h.qNode);
 
-    if h.rgateMod == 1 {
-        ckt.real(ge, ge, mult_i * geltd);
-        ckt.real(gp, ge, -(mult_i * geltd));
-        ckt.real(ge, gp, -(mult_i * geltd));
-
-        ckt.imag(gp, gp, mult_q * xcggbr);
-        ckt.real(gp, gp, mult_q.mul_add(xcggbi, mult_i * (geltd + gIgtotg)));
-        ckt.imag(gp, dp, mult_q * xcgdbr);
-        ckt.real(gp, dp, mult_i.mul_add(gIgtotd, mult_q * xcgdbi));
-        ckt.imag(gp, sp, mult_q * xcgsbr);
-        ckt.real(gp, sp, mult_i.mul_add(gIgtots, mult_q * xcgsbi));
-        ckt.imag(gp, bp, mult_q * xcgbbr);
-        ckt.real(gp, bp, mult_i.mul_add(gIgtotb, mult_q * xcgbbi));
-    } else if h.rgateMod == 2 {
-        // WDLiu: gcrg already subtracted from all gcrgg below
-        ckt.real(ge, ge, mult_i * gcrg);
-        ckt.real(ge, gp, mult_i * gcrgg);
-        ckt.real(ge, dp, mult_i * gcrgd);
-        ckt.real(ge, sp, mult_i * gcrgs);
-        ckt.real(ge, bp, mult_i * gcrgb);
-
-        ckt.real(gp, ge, -(mult_i * gcrg));
-        ckt.imag(gp, gp, mult_q * xcggbr);
-        ckt.real(gp, gp, -mult_q.mul_add(-xcggbi, mult_i * (gcrgg - gIgtotg)));
-        ckt.imag(gp, dp, mult_q * xcgdbr);
-        ckt.real(gp, dp, -mult_q.mul_add(-xcgdbi, mult_i * (gcrgd - gIgtotd)));
-        ckt.imag(gp, sp, mult_q * xcgsbr);
-        ckt.real(gp, sp, -mult_q.mul_add(-xcgsbi, mult_i * (gcrgs - gIgtots)));
-        ckt.imag(gp, bp, mult_q * xcgbbr);
-        ckt.real(gp, bp, -mult_q.mul_add(-xcgbbi, mult_i * (gcrgb - gIgtotb)));
-    } else if h.rgateMod == 3 {
-        ckt.real(ge, ge, mult_i * geltd);
-        ckt.real(ge, gm, -(mult_i * geltd));
-        ckt.real(gm, ge, -(mult_i * geltd));
-        ckt.real(gm, gm, mult_i * (geltd + gcrg));
-        ckt.imag(gm, gm, mult_q * xcgmgmb);
-
-        ckt.real(gm, dp, mult_i * gcrgd);
-        ckt.imag(gm, dp, mult_q * xcgmdb);
-        ckt.real(gm, gp, mult_i * gcrgg);
-        ckt.real(gm, sp, mult_i * gcrgs);
-        ckt.imag(gm, sp, mult_q * xcgmsb);
-        ckt.real(gm, bp, mult_i * gcrgb);
-        ckt.imag(gm, bp, mult_q * xcgmbb);
-
-        ckt.imag(dp, gm, mult_q * xcdgmb);
-        ckt.real(gp, gm, -(mult_i * gcrg));
-        ckt.imag(sp, gm, mult_q * xcsgmb);
-        ckt.imag(bp, gm, mult_q * xcbgmb);
-
-        ckt.real(gp, gp, -mult_q.mul_add(-xcggbi, mult_i * (gcrgg - gIgtotg)));
-        ckt.imag(gp, gp, mult_q * xcggbr);
-        ckt.real(gp, dp, -mult_q.mul_add(-xcgdbi, mult_i * (gcrgd - gIgtotd)));
-        ckt.imag(gp, dp, mult_q * xcgdbr);
-        ckt.real(gp, sp, -mult_q.mul_add(-xcgsbi, mult_i * (gcrgs - gIgtots)));
-        ckt.imag(gp, sp, mult_q * xcgsbr);
-        ckt.real(gp, bp, -mult_q.mul_add(-xcgbbi, mult_i * (gcrgb - gIgtotb)));
-        ckt.imag(gp, bp, mult_q * xcgbbr);
-    } else {
-        ckt.imag(gp, gp, mult_q * xcggbr);
-        ckt.real(gp, gp, mult_i.mul_add(gIgtotg, mult_q * xcggbi));
-        ckt.imag(gp, dp, mult_q * xcgdbr);
-        ckt.real(gp, dp, mult_i.mul_add(gIgtotd, mult_q * xcgdbi));
-        ckt.imag(gp, sp, mult_q * xcgsbr);
-        ckt.real(gp, sp, mult_i.mul_add(gIgtots, mult_q * xcgsbi));
-        ckt.imag(gp, bp, mult_q * xcgbbr);
-        ckt.real(gp, bp, mult_i.mul_add(gIgtotb, mult_q * xcgbbi));
+    let prime_real = match h.rgateMod {
+        1 => [
+            mult_q.mul_add(xcggbi, mult_i * (geltd + gIgtotg)),
+            mult_i.mul_add(gIgtotd, mult_q * xcgdbi),
+            mult_i.mul_add(gIgtots, mult_q * xcgsbi),
+            mult_i.mul_add(gIgtotb, mult_q * xcgbbi),
+        ],
+        2 | 3 => [
+            -mult_q.mul_add(-xcggbi, mult_i * (gcrgg - gIgtotg)),
+            -mult_q.mul_add(-xcgdbi, mult_i * (gcrgd - gIgtotd)),
+            -mult_q.mul_add(-xcgsbi, mult_i * (gcrgs - gIgtots)),
+            -mult_q.mul_add(-xcgbbi, mult_i * (gcrgb - gIgtotb)),
+        ],
+        _ => [
+            mult_i.mul_add(gIgtotg, mult_q * xcggbi),
+            mult_i.mul_add(gIgtotd, mult_q * xcgdbi),
+            mult_i.mul_add(gIgtots, mult_q * xcgsbi),
+            mult_i.mul_add(gIgtotb, mult_q * xcgbbi),
+        ],
+    };
+    GateStamp {
+        real: prime_real,
+        charge: [xcggbr, xcgdbr, xcgsbr, xcgbbr],
+        mid,
     }
+    .emit::<Ac>(h, &resistance, ckt);
 
-    if m.rdsMod != 0 {
-        ckt.real(d, gp, mult_i * gdtotg);
-        ckt.real(d, sp, mult_i * gdtots);
-        ckt.real(d, bp, mult_i * gdtotb);
-        ckt.real(s, dp, mult_i * gstotd);
-        ckt.real(s, gp, mult_i * gstotg);
-        ckt.real(s, bp, mult_i * gstotb);
-    }
+    series.emit_external(m, h, ckt);
+    let current = ChannelCurrent::new::<Ac>(h, real_gain, gdsr, &substrate, &gate_current, &series);
 
     ckt.imag(dp, dp, mult_i.mul_add(gdsi + RevSumi, mult_q * xcddbr));
-    ckt.real(
-        dp,
-        dp,
-        mult_q.mul_add(
-            xcddbi,
-            mult_i * (gdpr + gdsr + h.gbd - gdtotd + RevSumr + gbdpdp - gIdtotd),
-        ),
-    );
+    ckt.real(dp, dp, mult_q.mul_add(xcddbi, mult_i * current.drain[0]));
     ckt.real(dp, d, -(mult_i * (gdpr + gdtot)));
     ckt.imag(dp, gp, mult_i.mul_add(Gmi, mult_q * xcdgbr));
-    ckt.real(
-        dp,
-        gp,
-        mult_q.mul_add(xcdgbi, mult_i * (Gmr - gdtotg + gbdpg - gIdtotg)),
-    );
+    ckt.real(dp, gp, mult_q.mul_add(xcdgbi, mult_i * current.drain[1]));
     ckt.imag(dp, sp, mult_i.mul_add(-(gdsi + FwdSumi), mult_q * xcdsbr));
-    ckt.real(
-        dp,
-        sp,
-        -mult_q.mul_add(
-            -xcdsbi,
-            mult_i * (gdsr + FwdSumr + gdtots - gbdpsp + gIdtots),
-        ),
-    );
+    ckt.real(dp, sp, -mult_q.mul_add(-xcdsbi, mult_i * current.drain[2]));
     ckt.imag(dp, bp, mult_i.mul_add(Gmbsi, mult_q * xcdbbr));
-    ckt.real(
-        dp,
-        bp,
-        -mult_q.mul_add(-xcdbbi, mult_i * (gjbd + gdtotb - Gmbsr - gbdpb + gIdtotb)),
-    );
+    ckt.real(dp, bp, -mult_q.mul_add(-xcdbbi, mult_i * current.drain[3]));
 
     ckt.real(d, dp, -(mult_i * (gdpr - gdtotd)));
     ckt.real(d, d, mult_i * (gdpr + gdtot));
 
     ckt.imag(sp, dp, mult_i.mul_add(-(gdsi + RevSumi), mult_q * xcsdbr));
-    ckt.real(
-        sp,
-        dp,
-        -mult_q.mul_add(
-            -xcsdbi,
-            mult_i * (gdsr + gstotd + RevSumr - gbspdp + gIstotd),
-        ),
-    );
+    ckt.real(sp, dp, -mult_q.mul_add(-xcsdbi, mult_i * current.source[0]));
     ckt.imag(sp, gp, mult_i.mul_add(-Gmi, mult_q * xcsgbr));
-    ckt.real(
-        sp,
-        gp,
-        -mult_q.mul_add(-xcsgbi, mult_i * (Gmr + gstotg - gbspg + gIstotg)),
-    );
+    ckt.real(sp, gp, -mult_q.mul_add(-xcsgbi, mult_i * current.source[1]));
     ckt.imag(sp, sp, mult_i.mul_add(gdsi + FwdSumi, mult_q * xcssbr));
-    ckt.real(
-        sp,
-        sp,
-        mult_q.mul_add(
-            xcssbi,
-            mult_i * (gspr + gdsr + h.gbs - gstots + FwdSumr + gbspsp - gIstots),
-        ),
-    );
+    ckt.real(sp, sp, mult_q.mul_add(xcssbi, mult_i * current.source[2]));
     ckt.real(sp, s, -(mult_i * (gspr + gstot)));
     ckt.imag(sp, bp, mult_i.mul_add(-Gmbsi, mult_q * xcsbbr));
-    ckt.real(
-        sp,
-        bp,
-        -mult_q.mul_add(-xcsbbi, mult_i * (gjbs + gstotb + Gmbsr - gbspb + gIstotb)),
-    );
+    ckt.real(sp, bp, -mult_q.mul_add(-xcsbbi, mult_i * current.source[3]));
 
     ckt.real(s, sp, -(mult_i * (gspr - gstots)));
     ckt.real(s, s, mult_i * (gspr + gstot));
 
-    ckt.imag(bp, dp, mult_q * xcbdb);
-    ckt.real(bp, dp, -(mult_i * (gjbd - gbbdp + gIbtotd)));
-    ckt.imag(bp, gp, mult_q * xcbgb);
-    ckt.real(bp, gp, -(mult_i * (h.gbgs + gIbtotg)));
-    ckt.imag(bp, sp, mult_q * xcbsb);
-    ckt.real(bp, sp, -(mult_i * (gjbs - gbbsp + gIbtots)));
-    ckt.imag(bp, bp, mult_q * xcbbb);
-    ckt.real(bp, bp, mult_i * (gjbd + gjbs - h.gbbs - gIbtotb));
-    super::stamp_common::leakage(h, mult_i, |row, col, value| ckt.real(row, col, value));
-
-    if h.rbodyMod != 0 {
-        ckt.imag(dp, db, mult_q * xcdbdb);
-        ckt.real(dp, db, -(mult_i * h.gbd));
-        ckt.imag(sp, sb, mult_q * xcsbsb);
-        ckt.real(sp, sb, -(mult_i * h.gbs));
-
-        ckt.imag(db, dp, mult_q * xcdbdb);
-        ckt.real(db, dp, -(mult_i * h.gbd));
-        ckt.imag(db, db, -(mult_q * xcdbdb));
-        ckt.real(db, db, mult_i * (h.gbd + h.grbpd + h.grbdb));
-        ckt.real(db, bp, -(mult_i * h.grbpd));
-        ckt.real(db, b, -(mult_i * h.grbdb));
-
-        ckt.real(bp, db, -(mult_i * h.grbpd));
-        ckt.real(bp, b, -(mult_i * h.grbpb));
-        ckt.real(bp, sb, -(mult_i * h.grbps));
-        ckt.real(bp, bp, mult_i * (h.grbpd + h.grbps + h.grbpb));
-        // WDLiu: (-here->BSIM4gbbs) already added to BPbpPtr
-
-        ckt.imag(sb, sp, mult_q * xcsbsb);
-        ckt.real(sb, sp, -(mult_i * h.gbs));
-        ckt.real(sb, bp, -(mult_i * h.grbps));
-        ckt.real(sb, b, -(mult_i * h.grbsb));
-        ckt.imag(sb, sb, -(mult_q * xcsbsb));
-        ckt.real(sb, sb, mult_i * (h.gbs + h.grbps + h.grbsb));
-
-        ckt.real(b, db, -(mult_i * h.grbdb));
-        ckt.real(b, bp, -(mult_i * h.grbpb));
-        ckt.real(b, sb, -(mult_i * h.grbsb));
-        ckt.real(b, b, mult_i * (h.grbsb + h.grbdb + h.grbpb));
-    }
+    stamp_common::bulk::<Ac>(
+        h,
+        &substrate,
+        &gate_current,
+        [xcbdb, xcbgb, xcbsb, xcbbb],
+        ckt,
+    );
+    stamp_common::body_network::<Ac>(h, [xcdbdb, xcsbsb], ckt);
 
     // WDLiu: The internal charge node generated for transient NQS is not
     // needed for AC NQS. The following is not doing a real job, but we have
@@ -889,5 +600,192 @@ pub(super) mod tests {
             .unwrap()
             .2;
         assert_eq!(gg, (2e-15 + 1e-16 + 0.0 + 0.0) * 1e6);
+    }
+    fn nonzero_small_signal_instance(rgate: i32, rbody: i32, trnqs: i32) -> Instance {
+        let mut h = shaped(rgate, rbody, trnqs);
+        h.gm = -0.3125;
+        h.gmbs = -0.015625;
+        h.gds = 0.28125;
+        h.gbds = -0.0625;
+        h.gbgs = 0.234375;
+        h.gbbs = -0.109375;
+        h.gIgsg = 0.1875;
+        h.gIgcsg = -0.15625;
+        h.gIgcsd = 0.140625;
+        h.gIgss = -0.203125;
+        h.gIgcss = 0.09375;
+        h.gIgcsb = -0.25;
+        h.gIgdg = 0.046875;
+        h.gIgcdg = -0.296875;
+        h.gIgdd = 0.0;
+        h.gIgcdd = 0.296875;
+        h.gIgcds = -0.046875;
+        h.gIgcdb = 0.25;
+        h.gIgbg = -0.09375;
+        h.gIgbd = 0.203125;
+        h.gIgbs = -0.140625;
+        h.gIgbb = 0.15625;
+        h.gcrg = -0.1875;
+        h.gcrgd = 0.109375;
+        h.gcrgg = -0.234375;
+        h.gcrgs = 0.0625;
+        h.gcrgb = -0.28125;
+        h.gstot = 0.015625;
+        h.gstotd = 0.3125;
+        h.gstotg = -0.03125;
+        h.gstots = 0.265625;
+        h.gstotb = -0.078125;
+        h.gdtot = 0.21875;
+        h.gdtotd = -0.125;
+        h.gdtotg = 0.171875;
+        h.gdtots = -0.171875;
+        h.gdtotb = 0.125;
+        h.drainConductance = -0.21875;
+        h.sourceConductance = 0.078125;
+        h.gbd = -0.265625;
+        h.gbs = 0.03125;
+        h.grgeltd = -0.3125;
+        h.grbpd = -0.015625;
+        h.grbdb = 0.28125;
+        h.grbpb = -0.0625;
+        h.grbps = 0.234375;
+        h.grbsb = -0.109375;
+        h.ggidld = 0.1875;
+        h.ggidlg = -0.15625;
+        h.ggidlb = 0.140625;
+        h.ggislg = -0.203125;
+        h.ggisls = 0.09375;
+        h.ggislb = -0.25;
+        h.cddb = 0.046875;
+        h.cdgb = -0.296875;
+        h.cdsb = 0.0;
+        h.cgdb = 0.296875;
+        h.cggb = -0.046875;
+        h.cgsb = 0.25;
+        h.cbdb = -0.09375;
+        h.cbgb = 0.203125;
+        h.cbsb = -0.140625;
+        h.cgdo = 0.15625;
+        h.cgso = -0.1875;
+        h.capbd = 0.109375;
+        h.capbs = -0.234375;
+        h.gtg = 0.0625;
+        h.gtd = -0.28125;
+        h.gts = 0.015625;
+        h.gtb = 0.3125;
+        h.cqgb = -0.03125;
+        h.cqdb = 0.265625;
+        h.cqsb = -0.078125;
+        h.cqbb = 0.21875;
+        h.gtau = -0.125;
+        h.taunet = 0.03125;
+        h.qgate = -0.75;
+        h.qbulk = -0.125;
+        h.qdrn = 0.375;
+        h.m = 1.125;
+        h.mult_i = 0.8125;
+        h.mult_q = 1.375;
+        h
+    }
+
+    #[test]
+    fn small_signal_selector_matrix() {
+        use super::super::host::state;
+        use super::super::pzld::pz_load;
+        use std::collections::BTreeMap;
+        let p = SizeParam {
+            cgbo: 0.0078125,
+            weffCV: 1.,
+            leffCV: 1.,
+            ..SizeParam::default()
+        };
+        for rgate in 0..=3 {
+            for rbody in 0..=2 {
+                for rds in 0..=1 {
+                    for igc in 0..=1 {
+                        for igb in 0..=1 {
+                            for nqs in 0..=1 {
+                                for mode in [-1, 1] {
+                                    let mut h = nonzero_small_signal_instance(rgate, rbody, nqs);
+                                    h.mode = mode;
+                                    h.acnqsMod = nqs;
+                                    let m = Model {
+                                        rdsMod: rds,
+                                        igcMod: igc,
+                                        igbMod: igb,
+                                        coxe: 1.,
+                                        xpart: 0.4,
+                                        ..Model::default()
+                                    };
+                                    let mut ac = Recorder {
+                                        omega: 13.25,
+                                        state: vec![0.; state::COUNT],
+                                        ..Recorder::default()
+                                    };
+                                    ac.state[state::VGES] = 0.3125;
+                                    ac.state[state::VGMS] = 0.21875;
+                                    ac.state[state::VGS] = 0.125;
+                                    ac.state[state::QDEF] = 0.03125;
+                                    let mut pz = Recorder {
+                                        state: ac.state.clone(),
+                                        ..Recorder::default()
+                                    };
+                                    super::ac_load(&m, &h, &p, &mut ac);
+                                    pz_load(&m, &h, &p, &mut pz);
+                                    // QS AC and the PZ pencil describe the same physical matrix.
+                                    // Their reference arithmetic groups some terms differently.
+                                    if nqs == 0 {
+                                        let aggregate = |stamps: &[(i32, i32, f64)], scale: f64| {
+                                            let mut result = BTreeMap::new();
+                                            for &(r, c, v) in stamps {
+                                                *result.entry((r, c)).or_insert(0.) += v * scale;
+                                            }
+                                            result
+                                        };
+                                        for (left, right) in [
+                                            (aggregate(&ac.real, 1.), aggregate(&pz.real, 1.)),
+                                            (aggregate(&ac.imag, 1.), aggregate(&pz.cap, ac.omega)),
+                                        ] {
+                                            for key in left.keys().chain(right.keys()) {
+                                                let a = left.get(key).copied().unwrap_or(0.);
+                                                let b = right.get(key).copied().unwrap_or(0.);
+                                                assert!(
+                                                    (a - b).abs()
+                                                        <= 128.
+                                                            * f64::EPSILON
+                                                            * (1. + a.abs().max(b.abs())),
+                                                    "gate {rgate} body {rbody} rds {rds} igc {igc} igb {igb} mode {mode} {key:?}: {a} {b}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    // Ordered per-component fingerprints for the before/after comparison.
+                                    for (kind, stamps) in [
+                                        ("ac-real", &ac.real),
+                                        ("ac-imag", &ac.imag),
+                                        ("pz-real", &pz.real),
+                                        ("pz-cap", &pz.cap),
+                                    ] {
+                                        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+                                        for &(row, col, value) in stamps {
+                                            for word in [
+                                                u64::from(u32::try_from(row).unwrap()),
+                                                u64::from(u32::try_from(col).unwrap()),
+                                                value.to_bits(),
+                                            ] {
+                                                hash = (hash ^ word).wrapping_mul(0x100_0000_01b3);
+                                            }
+                                        }
+                                        println!(
+                                            "stamp-matrix {rgate} {rbody} {rds} {igc} {igb} {nqs} {mode} {kind} {hash:016x}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
