@@ -794,6 +794,7 @@ impl Writer<'_> {
                 | "txl"
                 | "cpl"
                 | "cpllines"
+                | "s_xfer"
                 | "nmf"
                 | "pmf"
                 // `inpdomod.c`'s HFET spellings of the same families.
@@ -822,6 +823,35 @@ impl Writer<'_> {
                         && ["r", "l", "g", "c"].contains(&parameter.name.as_str()) =>
                 {
                     append_cpl_material(&mut parts, parameter, entries)?;
+                }
+                ParameterKind::NumericVector(entries)
+                    if base == "s_xfer"
+                        && ["num_coeff", "den_coeff", "int_ic"]
+                            .contains(&parameter.name.as_str()) =>
+                {
+                    parts.push_str(&parameter.name)?;
+                    parts.push_str("=[")?;
+                    for (index, entry) in entries.iter().enumerate() {
+                        if index != 0 {
+                            parts.push(' ')?;
+                        }
+                        if let Some(expression) = &entry.expression {
+                            check_value_expression(
+                                &parts,
+                                &entry.source.text,
+                                expression,
+                                &entry.source.location,
+                            )?;
+                            parts.push_str(&entry.source.text)?;
+                        } else {
+                            parts.push_str(positioned_number(
+                                &parts,
+                                &entry.source,
+                                &entry.source.location,
+                            )?)?;
+                        }
+                    }
+                    parts.push(']')?;
                 }
                 ParameterKind::Flag => {
                     let allowed = model_flags(base);
@@ -898,6 +928,10 @@ impl Writer<'_> {
             return self.finish_card(depth, location);
         }
         parts.word(node(&parts, &device.name, location)?)?;
+        if designator == 'a' {
+            code_model_ports(device, &mut parts)?;
+            return self.finish_card(depth, location);
+        }
         let setters = device_prefix(device, &mut parts)?;
         match designator {
             'r' | 'c' | 'l' => passive_parameters(device, &mut parts)?,
@@ -972,6 +1006,50 @@ fn model_flags(base: &str) -> &'static [&'static str] {
 }
 
 // Write and validate the common positional device fields before its setters.
+/// Write the two explicitly typed differential analog ports in XSPICE
+/// input/output order. Internal lowered A cards remain unrepresentable.
+fn code_model_ports(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
+    let [op, on, ip, inn] = device.nodes.as_slice() else {
+        return Err(refuse("expected two analog ports", Some(&device.location)));
+    };
+    let [input, output] = device.parameters.as_slice() else {
+        return Err(refuse(
+            "expected two typed analog ports",
+            Some(&device.location),
+        ));
+    };
+    for (direction, parameter, positive, negative) in
+        [("input", input, ip, inn), ("output", output, op, on)]
+    {
+        if parameter.name != direction || parameter.kind != ParameterKind::Textual {
+            return Err(refuse(
+                "invalid analog port parameter",
+                Some(&parameter.location),
+            ));
+        }
+        let kind = match parameter.value.as_str() {
+            "voltage" => "%vd",
+            "current" => "%id",
+            _ => {
+                return Err(refuse(
+                    "unsupported analog port type",
+                    Some(&parameter.location),
+                ));
+            }
+        };
+        parts.word(kind)?;
+        parts.push('(')?;
+        parts.push_str(node(parts, positive, &device.location)?)?;
+        parts.word(node(parts, negative, &device.location)?)?;
+        parts.push(')')?;
+    }
+    let model = device
+        .model
+        .as_deref()
+        .ok_or_else(|| refuse("A instance needs a declared model", Some(&device.location)))?;
+    parts.word(node(parts, model, &device.location)?)
+}
+
 fn device_prefix<'a>(
     device: &'a DeviceInstance,
     parts: &mut Card<'_>,

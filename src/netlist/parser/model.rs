@@ -74,7 +74,7 @@ fn model_base<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
             // JFET (`jfet/jfet.c`; level 2 is `jfet2/`).
             | "njf" | "pjf"
             // Lossy transmission line (`ltra/ltra.c`).
-            | "ltra" | "txl" | "cpl" | "cpllines"
+            | "ltra" | "txl" | "cpl" | "cpllines" | "s_xfer"
             // MESFET (`mes/mes.c`) and its `inpdomod.c` HFET spellings; the
             // level selects `mesa/`, `hfet1/` or `hfet2/`.
             | "nmf" | "pmf" | "nhfet" | "phfet"
@@ -93,6 +93,7 @@ fn parameters(input: &mut Input<'_>, base: &str) -> Result<Vec<ParameterAssignme
         alt((
             punctuation(TokenKind::Comma).value(None),
             (|input: &mut Input<'_>| cpl_vector(input, base)).map(Some),
+            (|input: &mut Input<'_>| transfer_vector(input, base)).map(Some),
             (|input: &mut Input<'_>| super::flags::model(input, base)).map(Some),
             (|input: &mut Input<'_>| version_assignment(input, base)).map(Some),
             scalar_assignment.map(Some),
@@ -278,4 +279,111 @@ fn cpl_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> 
         kind: ParameterKind::NumericVector(entries),
         location: setter.location.clone(),
     })
+}
+
+/// XSPICE uses square brackets, which are otherwise valid parts of node
+/// names. Parse delimiters only at the model-vector site; no global token
+/// splitting changes bus node names. Numeric and expression entries retain
+/// exact physical spans.
+fn transfer_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
+    peek(any.verify(|token: &Token| {
+        base.eq_ignore_ascii_case("s_xfer")
+            && ["num_coeff", "den_coeff", "int_ic"]
+                .iter()
+                .any(|name| token.is_keyword(name))
+    }))
+    .parse_next(input)?;
+    let setter = any.parse_next(input)?;
+    opt(equals).parse_next(input)?;
+    cut_err(|input: &mut Input<'_>| {
+        let mut entries = Vec::new();
+        let mut first = true;
+        let mut comma = false;
+        loop {
+            let token = input
+                .input
+                .first()
+                .ok_or_else(|| malformed(input, "unterminated s_xfer coefficient vector"))?;
+            let text = if first {
+                token
+                    .text
+                    .strip_prefix('[')
+                    .ok_or_else(|| malformed(input, "expected '[' at start of s_xfer vector"))?
+            } else {
+                token.text.as_str()
+            };
+            let prefix = usize::from(first);
+            first = false;
+            let (text, closed) = text
+                .strip_suffix(']')
+                .map_or((text, false), |text| (text, true));
+            if text.is_empty() {
+                any.parse_next(input)?;
+                if closed {
+                    if comma {
+                        return Err(malformed(input, "missing coefficient after comma"));
+                    }
+                    break;
+                }
+                if prefix == 1 {
+                    continue;
+                }
+                return Err(malformed(input, "empty s_xfer vector token"));
+            }
+            if token.kind == TokenKind::Comma {
+                if comma || entries.is_empty() {
+                    return Err(malformed(input, "misplaced coefficient comma"));
+                }
+                any.parse_next(input)?;
+                comma = true;
+                continue;
+            }
+            if prefix == 0
+                && !closed
+                && matches!(token.kind, TokenKind::Expression(_) | TokenKind::Quoted(_))
+            {
+                let Value::Expression(source, expression) = value(input)? else {
+                    return Err(malformed(input, "invalid transfer coefficient expression"));
+                };
+                entries.push(NumericVectorEntry {
+                    source: PositionedValue {
+                        text: source.text.clone(),
+                        location: source.location.clone(),
+                    },
+                    expression: Some(expression),
+                });
+            } else {
+                if text.contains(['[', ']'])
+                    || !crate::primitives::parse_spice_number(text).is_some_and(f64::is_finite)
+                {
+                    return Err(malformed(input, "expected finite s_xfer coefficient"));
+                }
+                let position = token.position().advance(prefix).location();
+                entries.push(NumericVectorEntry {
+                    source: PositionedValue {
+                        text: text.to_owned(),
+                        location: position,
+                    },
+                    expression: None,
+                });
+                any.parse_next(input)?;
+            }
+            comma = false;
+            if closed {
+                break;
+            }
+        }
+        let value = entries
+            .iter()
+            .map(|entry| entry.source.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(ParameterAssignment {
+            name: setter.text.to_ascii_lowercase(),
+            value,
+            kind: ParameterKind::NumericVector(entries),
+            location: setter.location.clone(),
+        })
+    })
+    .parse_next(input)
 }

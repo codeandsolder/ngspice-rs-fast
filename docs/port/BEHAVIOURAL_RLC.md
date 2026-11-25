@@ -65,12 +65,51 @@ both trapezoidal and Gear integration. Generated dynamic coordinates
 evolve continuously even when the surrounding expression does not select
 their output; their inputs must therefore be defined throughout the run.
 
-The C47 reference does not accept an idt() expression; integral and rational
-transfer blocks need explicit realization and initial-state semantics.
+The C47 reference does not accept an idt() expression. Integrators are
+instead representable as rational transfer blocks.
+
+## Rational transfer models
+
+The native XSPICE `s_xfer` model realizes H(s)=g N(s/w)/D(s/w), with
+coefficients supplied in descending polynomial order and w in rad/s.
+The normalized denominator is monic. For n storage coordinates, with
+tau=1/w, the residuals implement tau*x_i'=x_(i+1), and
+tau*x_(n-1)'=g*(u+offset)-sum(a_i*x_i). The output is the sum of
+the numerator-derived coordinate terms and direct feedthrough.
+The same residuals supply DC, AC, transient and pole-zero assembly.
+There is no sampling interval, per-step polynomial parsing, or separate
+AC approximation. Improper rational functions are rejected explicitly;
+origin poles and unstable proper rational systems are not clamped.
+
+The four analog port forms support differential voltage inputs, zero-voltage
+current-sensing inputs, differential voltage outputs and oriented current
+outputs. The compiled realization is shared by instances of a model;
+every instance owns its accepted/trial integration state. The native
+model grammar accepts scoped expressions within coefficient vectors.
+
+Native `int_ic` values are listed in descending physical integrator order;
+the normalized coordinate x_i is D_leading*physical_i/w^i. Missing native
+initial values default to zero, matching the C implementation. The typed
+engine API also allows equilibrium initialization for non-origin poles
+with zero unconstrained origin-pole coordinates. Gain acts on input forcing,
+not the free response from explicit initial conditions. UIC is currently
+rejected pending fixed-coordinate initialization support.
+
+Eight native tests cover orders zero through five, nonzero feedthrough,
+multiple integrators, explicit initial states, all four analog port laws,
+transient integration and netlist round trips. The live ngspice 47 test
+has maximum AC absolute error 2.24e-16. For a ramp with a 1 us rise time,
+the maximum absolute errors against the independent analytical solution
+were 1.86e-7 V (Rust, 100 ns), 4.39e-4 V (C, 100 ns), and 4.88e-5 V
+(C, 10 ns). The C error decreases on timestep refinement; the test checks
+analytical accuracy and this convergence rather than requiring agreement
+with the coarser sampled C realization. The Rust zero-order gain also
+works where the tested C47 zero-order model crashed.
 
 ## Remaining work
 
-Laplace/transfer blocks, statistical functions, explicit nonlinear
-initial-condition setters, noise, mutual coupling, broader reference
-coverage, and nonlinear convergence/candidate testing remain within
-issue #184.
+Source-dialect E/G LAPLACE normalization is tracked in the preprocessing
+repository (#44), using the native rational transfer model. Statistical
+functions, UIC and explicit nonlinear initial-condition setters, noise,
+mutual coupling, broader reference coverage, and nonlinear
+convergence/candidate testing remain within issue #184.

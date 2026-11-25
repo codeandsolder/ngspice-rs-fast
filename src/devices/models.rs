@@ -83,6 +83,8 @@ pub enum ModelFamily {
     Nmf,
     /// P-channel MESFET/HFET family (`pmf`; levels as for [`Self::Nmf`]).
     Pmf,
+    /// XSPICE rational transfer function (s_xfer).
+    RationalTransfer,
 }
 
 impl ModelFamily {
@@ -106,6 +108,7 @@ impl ModelFamily {
             "ltra" => Some(Self::Ltra),
             "txl" => Some(Self::Txl),
             "cpl" | "cpllines" => Some(Self::Cpl),
+            "s_xfer" => Some(Self::RationalTransfer),
             // `inpdomod.c` accepts the HFET spellings as the same families;
             // `level` then selects the device (5 is `hfet1/`, 6 `hfet2/`).
             "nmf" | "nhfet" => Some(Self::Nmf),
@@ -132,6 +135,7 @@ impl ModelFamily {
             Self::Ltra => 'o',
             Self::Txl => 'y',
             Self::Cpl => 'p',
+            Self::RationalTransfer => 'a',
             Self::Nmf | Self::Pmf => 'z',
         }
     }
@@ -189,6 +193,8 @@ pub enum ModelBackend {
     Txl,
     /// Multiconductor coupled transmission line.
     Cpl,
+    /// Native rational transfer model.
+    RationalTransfer,
 }
 
 /// Authoritative backend catalog entry. Selector aliases are the C levels
@@ -272,6 +278,15 @@ impl ModelBackend {
             'o' => const { &[BackendSpec::new(Self::Ltra, "Lossy line", &[1])] },
             'y' => const { &[BackendSpec::new(Self::Txl, "TXL lossy line", &[1])] },
             'p' => const { &[BackendSpec::new(Self::Cpl, "Coupled line", &[1])] },
+            'a' => {
+                const {
+                    &[BackendSpec::new(
+                        Self::RationalTransfer,
+                        "Rational transfer",
+                        &[1],
+                    )]
+                }
+            }
             _ => &[],
         }
     }
@@ -284,7 +299,7 @@ impl ModelBackend {
     }
 
     pub(super) const fn requires_model(designator: char) -> bool {
-        !matches!(designator.to_ascii_lowercase(), 'r' | 'c' | 'l')
+        !matches!(designator.to_ascii_lowercase(), 'r' | 'c' | 'l' | 'a')
             && !Self::catalog(designator).is_empty()
     }
 }
