@@ -143,6 +143,7 @@ pub(super) struct SourceBinding {
 pub struct PreparedDevice<K: Kernel> {
     name: String,
     terminals: Box<[NodeId]>,
+    external_terminals: Option<Box<[NodeId]>>,
     artifact: Arc<Artifact<K>>,
     values: Box<[Real]>,
     temperature: InstanceTemperature,
@@ -197,9 +198,26 @@ impl<K: Kernel> PreparedDevice<K> {
             .prepare(values, temperature.ambient_kelvin())
             .map_err(kernel_error)?;
         let width = terminals.len();
+        let external_terminals = artifact
+            .descriptor()
+            .equations
+            .iter()
+            .any(|equation| equation.binding == Binding::Hidden)
+            .then(|| {
+                artifact
+                    .descriptor()
+                    .equations
+                    .iter()
+                    .zip(&terminals)
+                    .filter_map(|(equation, &node)| {
+                        (equation.binding == Binding::Terminal).then_some(node)
+                    })
+                    .collect()
+            });
         Ok(Self {
             name,
             terminals: terminals.into(),
+            external_terminals,
             artifact: Arc::clone(artifact),
             values: values.into(),
             temperature,
@@ -526,6 +544,11 @@ impl<K: Kernel> Device for PreparedDevice<K> {
     }
     fn terminals(&self) -> &[NodeId] {
         &self.terminals
+    }
+    fn external_terminals(&self) -> &[NodeId] {
+        self.external_terminals
+            .as_deref()
+            .unwrap_or(&self.terminals)
     }
     fn is_nonlinear(&self) -> bool {
         true
