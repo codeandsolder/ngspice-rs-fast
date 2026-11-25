@@ -30,16 +30,110 @@ pub struct CoupledLineModes {
     pub total_delays: Vec<Real>,
 }
 
-fn normalized_cholesky(c: &[Real], order: usize, scale: Real) -> SpiceResult<Vec<Real>> {
-    let mut lower = vec![0.0_f64; order * order];
+// Extended precision is confined to immutable modal preparation. Closely
+// spaced eigenvalues can amplify roundoff in the ordinary-precision
+// similarity transform into spurious modal components. Keep both words of
+// every operation through the Cholesky, Jacobi and basis reconstruction;
+// only the final physical basis and eigenvalues enter the f64 solver.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Wide {
+    hi: Real,
+    lo: Real,
+}
+
+impl Wide {
+    const ZERO: Self = Self { hi: 0., lo: 0. };
+    const ONE: Self = Self { hi: 1., lo: 0. };
+
+    const fn from_real(hi: Real) -> Self {
+        Self { hi, lo: 0. }
+    }
+
+    fn two_sum(a: Real, b: Real) -> Self {
+        let hi = a + b;
+        let v = hi - a;
+        let lo = (a - (hi - v)) + (b - v);
+        Self { hi, lo }
+    }
+
+    fn abs(self) -> Self {
+        if self.hi.is_sign_negative() {
+            -self
+        } else {
+            self
+        }
+    }
+
+    fn sqrt(self) -> Self {
+        if self == Self::ZERO {
+            return self;
+        }
+        let root = Self::from_real(self.hi.sqrt());
+        root + (self - root * root) / (root + root)
+    }
+}
+
+impl std::ops::Neg for Wide {
+    type Output = Self;
+
+    fn neg(self) -> Self {
+        Self {
+            hi: -self.hi,
+            lo: -self.lo,
+        }
+    }
+}
+
+impl std::ops::Add for Wide {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        let sum = Self::two_sum(self.hi, other.hi);
+        Self::two_sum(sum.hi, sum.lo + self.lo + other.lo)
+    }
+}
+
+impl std::ops::Sub for Wide {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        self + (-other)
+    }
+}
+
+impl std::ops::Mul for Wide {
+    type Output = Self;
+
+    fn mul(self, other: Self) -> Self {
+        let hi = self.hi * other.hi;
+        let error = self.hi.mul_add(other.hi, -hi);
+        Self::two_sum(
+            hi,
+            self.hi.mul_add(other.lo, self.lo.mul_add(other.hi, error)),
+        )
+    }
+}
+
+impl std::ops::Div for Wide {
+    type Output = Self;
+
+    fn div(self, other: Self) -> Self {
+        let quotient = self.hi / other.hi;
+        let remainder = self - Self::from_real(quotient) * other;
+        Self::two_sum(quotient, remainder.hi / other.hi)
+    }
+}
+
+fn normalized_cholesky(c: &[Real], order: usize, scale: Real) -> SpiceResult<Vec<Wide>> {
+    let mut lower = vec![Wide::ZERO; order * order];
     for row in 0..order {
         for col in 0..=row {
-            let mut value = c[row * order + col] / scale;
+            let mut value = Wide::from_real(c[row * order + col]) / Wide::from_real(scale);
             for k in 0..col {
-                value = (-lower[row * order + k]).mul_add(lower[col * order + k], value);
+                value = value - lower[row * order + k] * lower[col * order + k];
             }
             if row == col {
-                if !value.is_finite() || value <= 0. {
+                if !value.hi.is_finite() || value.hi <= 0. {
                     return Err(super::invalid(
                         "LC modal propagation requires positive definite capacitance",
                     ));
@@ -47,7 +141,7 @@ fn normalized_cholesky(c: &[Real], order: usize, scale: Real) -> SpiceResult<Vec
                 lower[row * order + col] = value.sqrt();
             } else {
                 let entry = value / lower[col * order + col];
-                if !entry.is_finite() {
+                if !entry.hi.is_finite() {
                     return Err(super::invalid("nonfinite normalized C Cholesky factor"));
                 }
                 lower[row * order + col] = entry;
@@ -60,29 +154,31 @@ fn normalized_cholesky(c: &[Real], order: usize, scale: Real) -> SpiceResult<Vec
 /// Eigenvalues and eigenvectors of a small real symmetric matrix.
 /// The scaled cyclic Jacobi updates preserve the columns of the eigenbasis;
 /// a budget and residual check avoid silent acceptance of degenerate work.
-fn symmetric_eigenvectors(mut a: Vec<Real>, order: usize) -> SpiceResult<(Vec<Real>, Vec<Real>)> {
-    let mut vectors = vec![0.0_f64; order * order];
+fn symmetric_eigenvectors(mut a: Vec<Wide>, order: usize) -> SpiceResult<(Vec<Wide>, Vec<Wide>)> {
+    let mut vectors = vec![Wide::ZERO; order * order];
     for row in 0..order {
-        vectors[row * order + row] = 1.;
+        vectors[row * order + row] = Wide::ONE;
     }
-    let max = a.iter().fold(0.0_f64, |largest, &v| largest.max(v.abs()));
+    let max = a
+        .iter()
+        .fold(0.0_f64, |largest, &v| largest.max(v.hi.abs()));
     if !max.is_finite() || max <= 0. {
         return Err(super::invalid("LC modal material has no positive spectrum"));
     }
     for value in &mut a {
-        *value /= max;
+        *value = *value / Wide::from_real(max);
     }
     // Continue cyclic rotations until the off-diagonal is below one unit
     // roundoff of the scaled operator. A dimension-scaled cutoff can leave
     // a significant residual for individual modal equations after transforming
     // back to physical coordinates, even when the global norm is small.
-    let tolerance = 0.5 * Real::EPSILON;
+    let tolerance = Real::EPSILON * Real::EPSILON;
     let mut converged = false;
     for _sweep in 0..100 {
         let mut maximum = 0.0_f64;
         for row in 0..order {
             for col in row + 1..order {
-                maximum = maximum.max(a[row * order + col].abs());
+                maximum = maximum.max(a[row * order + col].hi.abs());
             }
         }
         if maximum <= tolerance {
@@ -92,35 +188,35 @@ fn symmetric_eigenvectors(mut a: Vec<Real>, order: usize) -> SpiceResult<(Vec<Re
         for first in 0..order {
             for second in first + 1..order {
                 let ab = a[first * order + second];
-                if ab == 0. {
+                if ab.hi.abs() <= tolerance {
                     continue;
                 }
                 let gap = a[second * order + second] - a[first * order + first];
-                let twice = 2. * ab;
-                let tangent = if gap == 0. {
-                    1.
+                let twice = ab + ab;
+                let tangent = if gap == Wide::ZERO {
+                    Wide::ONE
                 } else {
-                    let magnitude = twice.abs() / (gap.abs() + gap.hypot(twice));
-                    if gap.is_sign_negative() == ab.is_sign_negative() {
+                    let magnitude = twice.abs() / (gap.abs() + (gap * gap + twice * twice).sqrt());
+                    if gap.hi.is_sign_negative() == ab.hi.is_sign_negative() {
                         magnitude
                     } else {
                         -magnitude
                     }
                 };
-                let cosine = 1. / tangent.hypot(1.);
+                let cosine = Wide::ONE / (Wide::ONE + tangent * tangent).sqrt();
                 let sine = tangent * cosine;
                 let ap = a[first * order + first];
                 let aq = a[second * order + second];
-                a[first * order + first] = tangent.mul_add(-ab, ap);
-                a[second * order + second] = tangent.mul_add(ab, aq);
-                a[first * order + second] = 0.;
-                a[second * order + first] = 0.;
+                a[first * order + first] = ap - tangent * ab;
+                a[second * order + second] = aq + tangent * ab;
+                a[first * order + second] = Wide::ZERO;
+                a[second * order + first] = Wide::ZERO;
                 for row in 0..order {
                     if row != first && row != second {
                         let x = a[row * order + first];
                         let y = a[row * order + second];
-                        let new_x = cosine.mul_add(x, -sine * y);
-                        let new_y = sine.mul_add(x, cosine * y);
+                        let new_x = cosine * x - sine * y;
+                        let new_y = sine * x + cosine * y;
                         a[row * order + first] = new_x;
                         a[first * order + row] = new_x;
                         a[row * order + second] = new_y;
@@ -128,8 +224,8 @@ fn symmetric_eigenvectors(mut a: Vec<Real>, order: usize) -> SpiceResult<(Vec<Re
                     }
                     let x = vectors[row * order + first];
                     let y = vectors[row * order + second];
-                    vectors[row * order + first] = cosine.mul_add(x, -sine * y);
-                    vectors[row * order + second] = sine.mul_add(x, cosine * y);
+                    vectors[row * order + first] = cosine * x - sine * y;
+                    vectors[row * order + second] = sine * x + cosine * y;
                 }
             }
         }
@@ -140,12 +236,16 @@ fn symmetric_eigenvectors(mut a: Vec<Real>, order: usize) -> SpiceResult<(Vec<Re
         ));
     }
     let mut indices: Vec<_> = (0..order).collect();
-    indices.sort_by(|&a_idx, &b_idx| a[a_idx * order + a_idx].total_cmp(&a[b_idx * order + b_idx]));
+    indices.sort_by(|&a_idx, &b_idx| {
+        a[a_idx * order + a_idx]
+            .hi
+            .total_cmp(&a[b_idx * order + b_idx].hi)
+    });
     let eigenvalues = indices
         .iter()
-        .map(|&col| a[col * order + col] * max)
+        .map(|&col| a[col * order + col] * Wide::from_real(max))
         .collect::<Vec<_>>();
-    let mut reordered = vec![0.0_f64; order * order];
+    let mut reordered = vec![Wide::ZERO; order * order];
     for row in 0..order {
         for (mode, &col) in indices.iter().enumerate() {
             reordered[row * order + mode] = vectors[row * order + col];
@@ -155,31 +255,33 @@ fn symmetric_eigenvectors(mut a: Vec<Real>, order: usize) -> SpiceResult<(Vec<Re
 }
 
 // Form B^T (L / scale) B and symmetrize its roundoff before diagonalization.
-fn inductance_metric(inductance: &[Real], scale: Real, lower: &[Real], order: usize) -> Vec<Real> {
-    let mut product = vec![0.0_f64; order * order];
-    let mut symmetric = vec![0.0_f64; order * order];
+fn inductance_metric(inductance: &[Real], scale: Real, lower: &[Wide], order: usize) -> Vec<Wide> {
+    let mut product = vec![Wide::ZERO; order * order];
+    let mut symmetric = vec![Wide::ZERO; order * order];
     for row in 0..order {
         for col in 0..order {
-            let mut value = 0.;
+            let mut value = Wide::ZERO;
             for k in 0..order {
-                value =
-                    (inductance[row * order + k] / scale).mul_add(lower[k * order + col], value);
+                value = value
+                    + (Wide::from_real(inductance[row * order + k]) / Wide::from_real(scale))
+                        * lower[k * order + col];
             }
             product[row * order + col] = value;
         }
     }
     for row in 0..order {
         for col in 0..order {
-            let mut value = 0.;
+            let mut value = Wide::ZERO;
             for k in 0..order {
-                value = lower[k * order + row].mul_add(product[k * order + col], value);
+                value = value + lower[k * order + row] * product[k * order + col];
             }
             symmetric[row * order + col] = value;
         }
     }
     for row in 0..order {
         for col in 0..row {
-            let averaged = symmetric[row * order + col].midpoint(symmetric[col * order + row]);
+            let averaged = (symmetric[row * order + col] + symmetric[col * order + row])
+                * Wide::from_real(0.5);
             symmetric[row * order + col] = averaged;
             symmetric[col * order + row] = averaged;
         }
@@ -221,7 +323,8 @@ impl CoupledLinePlan {
             characteristic_admittances: Vec::with_capacity(order),
             total_delays: Vec::with_capacity(order),
         };
-        for (mode, &lambda) in normalized_eigenvalues.iter().enumerate() {
+        for (mode, eigenvalue) in normalized_eigenvalues.iter().enumerate() {
+            let lambda = eigenvalue.hi;
             // Take the square root before reconstructing the binary exponent:
             // a representable flight time and modal admittance need not have
             // a representable squared inverse velocity.
@@ -246,22 +349,21 @@ impl CoupledLinePlan {
             }
             modes.characteristic_admittances.push(admittance);
             modes.total_delays.push(delay);
+            let mut normalized_voltage = vec![Wide::ZERO; order];
             for row in 0..order {
-                let mut current = 0.;
+                let mut current = Wide::ZERO;
                 for col in 0..=row {
-                    current =
-                        lower[row * order + col].mul_add(eigenvectors[col * order + mode], current);
+                    current = current + lower[row * order + col] * eigenvectors[col * order + mode];
                 }
-                modes.current_basis[row * order + mode] = current * root_cscale;
+                modes.current_basis[row * order + mode] = current.hi * root_cscale;
             }
             for row in (0..order).rev() {
                 let mut voltage = eigenvectors[row * order + mode];
                 for k in row + 1..order {
-                    voltage = (-lower[k * order + row])
-                        .mul_add(modes.voltage_basis[k * order + mode] * root_cscale, voltage);
+                    voltage = voltage - lower[k * order + row] * normalized_voltage[k];
                 }
-                modes.voltage_basis[row * order + mode] =
-                    (voltage / lower[row * order + row]) / root_cscale;
+                normalized_voltage[row] = voltage / lower[row * order + row];
+                modes.voltage_basis[row * order + mode] = normalized_voltage[row].hi / root_cscale;
             }
         }
         if modes
