@@ -175,14 +175,21 @@ affine terminal relation, including arrivals inside an oversized step.
 DC initializes the boundary waves consistently with the static scattering
 network. Rejected trials cannot advance the accepted response or inputs.
 Breakpoint tolerances affect only scheduling, never physical convolution.
+When a verified nonnegative absolute-path majorant exists, contributions
+at the numerical roundoff scale may be discarded with a single accumulated
+allowance per input column. That allowance is scaled against the weakest
+reachable output's strongest path; first arrivals at all graph nodes are
+retained. Networks without a finite certified majorant keep all paths.
 When the impulse response has finite support, expired segments are folded
 into the steady baseline.
 
 The spatial splitting is an approximation for noncommuting R/G and L/C;
 refine `sections` for accuracy. Dense incommensurate modal delays may
 produce many distinct paths, and the graph and retained history have
-explicit workspace/work caps. Exhaustion is reported rather than silently
-discarding arrivals.
+explicit workspace/work caps. Workspace accounting distinguishes allocated
+trace capacity, pending-arrival storage and boundary histories, with room
+for accepted and trial copies. Exhaustion is reported rather than silently
+discarding significant arrivals.
 
 ## Passive finite-volume cable
 

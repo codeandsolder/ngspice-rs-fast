@@ -254,7 +254,10 @@ pub(super) fn modal_static_scattering(
     series.check_finite()?;
     shunt.check_finite()?;
     let mut steps = 0;
-    while series.infinity_norm().max(shunt.infinity_norm()) > 0.5 {
+    loop {
+        if series.infinity_norm().max(shunt.infinity_norm()) <= 0.5 {
+            break;
+        }
         if steps >= plan.squaring_limit() {
             return Err(invalid("modal loss scattering exceeds squaring budget"));
         }

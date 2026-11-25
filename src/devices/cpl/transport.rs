@@ -94,6 +94,9 @@ struct Kernel {
     pending: Queue,
     traces: Vec<Trace>,
     records: usize,
+    // Sum of the allocated trace capacities, not just live records.
+    trace_capacity: usize,
+    remaining_roundoff: Vec<Real>,
 }
 
 impl Kernel {
@@ -103,7 +106,32 @@ impl Kernel {
             pending: BTreeMap::new(),
             traces: vec![Vec::new(); ports * ports],
             records: 0,
+            trace_capacity: 0,
+            remaining_roundoff: vec![0.; ports],
         }
+    }
+
+    // Account for the actual trace allocation and a conservative per-entry
+    // estimate of the B-tree node and separately allocated incident vector.
+    fn workspace(&self, ports: usize) -> usize {
+        self.trace_capacity
+            .saturating_mul(std::mem::size_of::<Knot>())
+            .saturating_add(
+                self.traces
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Trace>()),
+            )
+            .saturating_add(
+                self.pending
+                    .len()
+                    .saturating_mul(Self::arrival_bytes(ports)),
+            )
+    }
+
+    const fn arrival_bytes(ports: usize) -> usize {
+        3 * (std::mem::size_of::<Arrival>() + std::mem::size_of::<Increment>())
+            + 32
+            + ports * std::mem::size_of::<Real>()
     }
 
     fn push(&mut self, row: usize, time: Wide, values: &[Real]) -> SpiceResult<()> {
@@ -120,12 +148,14 @@ impl Kernel {
             if !cumulative.hi.is_finite() {
                 return Err(invalid("nonfinite CPL ramp response"));
             }
+            let capacity = trace.capacity();
             trace.push(Knot {
                 time,
                 cumulative,
                 impulse,
             });
             self.records += 1;
+            self.trace_capacity += trace.capacity() - capacity;
         }
         Ok(())
     }
@@ -212,6 +242,25 @@ impl CplHistory {
         }
     }
 
+    const fn boundary_bytes(&self) -> usize {
+        let ports = self.input.len();
+        let segment_bytes =
+            std::mem::size_of::<Segment>() + 16 + ports * std::mem::size_of::<Real>();
+        let corner_bytes =
+            std::mem::size_of::<Corner>() + 16 + ports * std::mem::size_of::<(usize, Real)>();
+        self.segments
+            .capacity()
+            .saturating_add(1)
+            .saturating_mul(segment_bytes)
+            .saturating_add(
+                self.corners
+                    .capacity()
+                    .saturating_add(1)
+                    .saturating_mul(corner_bytes),
+            )
+            .saturating_add(ports * (4 * std::mem::size_of::<Real>() + std::mem::size_of::<Wide>()))
+    }
+
     pub(crate) fn check(&self, update: &CplUpdate) -> SpiceResult<()> {
         let next = &update.next;
         let time = next
@@ -224,10 +273,12 @@ impl CplHistory {
                 self.time
             )));
         }
-        if next.limit != self.limit || next.len() > self.limit {
+        let bytes = next
+            .boundary_bytes()
+            .saturating_add(next.kernel.workspace(width));
+        if next.limit != self.limit || bytes > self.limit {
             return Err(invalid(format!(
-                "CPL accepted history budget: {} records, limit {}, {} boundary segments, {} response knots, {} arrivals at {time:e}",
-                next.len(),
+                "CPL accepted history budget: {bytes} estimated bytes, limit {} bytes, {} boundary segments, {} response knots, {} arrivals at {time:e}",
                 self.limit,
                 next.segments.len(),
                 next.kernel.records,
@@ -293,6 +344,10 @@ pub(super) struct LossyPlan {
     launch: Vec<Edge>,
     fronts: Vec<Vec<Real>>,
     reachable: Vec<Vec<usize>>,
+    first_at_node: Vec<Vec<Real>>,
+    // A certified absolute terminal path mass bound, if one exists.
+    path_bound: Option<Vec<Real>>,
+    roundoff_budget: Vec<Real>,
     sections: usize,
     terminal: usize,
     limit: usize,
@@ -329,7 +384,7 @@ impl LossyPlan {
             .collect();
         // Both the trial and accepted response can coexist. Account for
         // the queue entry, vector, ordered-map overhead and prefix knots.
-        let limit = plan.workspace_limit() / (2 * (128 + ports * std::mem::size_of::<Real>()));
+        let limit = plan.workspace_limit() / 2;
         let launch = (0..ports)
             .map(|port| Edge {
                 target: if port < n {
@@ -348,11 +403,19 @@ impl LossyPlan {
             launch,
             fronts: Vec::new(),
             reachable: Vec::new(),
+            first_at_node: Vec::new(),
+            path_bound: None,
+            roundoff_budget: Vec::new(),
             sections,
             terminal,
             limit,
         };
-        result.fronts = (0..ports).map(|port| result.first_arrivals(port)).collect();
+        result.first_at_node = (0..ports).map(|port| result.first_arrivals(port)).collect();
+        result.fronts = result
+            .first_at_node
+            .iter()
+            .map(|distances| distances[result.terminal..].to_vec())
+            .collect();
         result.reachable = result
             .fronts
             .iter()
@@ -364,6 +427,15 @@ impl LossyPlan {
                     .collect()
             })
             .collect();
+        result.path_bound = result.absolute_path_bound();
+        result.roundoff_budget = if result.path_bound.is_some() {
+            (0..ports)
+                .map(|port| result.source_roundoff_budget(port))
+                .collect()
+        } else {
+            result.first_at_node.clear();
+            vec![0.; ports]
+        };
         Ok(result)
     }
 
@@ -427,7 +499,140 @@ impl LossyPlan {
                 }
             }
         }
-        distances.split_off(self.terminal)
+        distances
+    }
+
+    // Upper bound on the sum of absolute path gains from each internal
+    // incident port to *all* external terminals. Use two scalar directional
+    // envelopes per stage, independent of the number of modes. All
+    // products/sums round upwards when verifying the supersolution.
+    // Some passive networks rely on signed cancellation and have no
+    // finite absolute-path envelope; those retain the exact graph.
+    fn absolute_path_bound(&self) -> Option<Vec<Real>> {
+        let n = self.half.len();
+        let ports = self.launch.len();
+        let mut reflection: Real = 0.;
+        let mut transmission: Real = 0.;
+        for (input, column) in self.scattering.iter().enumerate() {
+            let mut reflected: Real = 0.;
+            let mut transmitted: Real = 0.;
+            for &(output, gain) in column {
+                let total = if input / n == output / n {
+                    &mut reflected
+                } else {
+                    &mut transmitted
+                };
+                *total = (*total + gain.abs()).next_up();
+            }
+            reflection = reflection.max(reflected);
+            transmission = transmission.max(transmitted);
+        }
+        let mut weights = vec![1.; 2 * self.sections];
+        let mut sums = weights.clone();
+        for _ in 0..(8 * self.sections + 64) {
+            for stage in 0..self.sections {
+                let left = if stage == 0 {
+                    1.
+                } else {
+                    weights[2 * (stage - 1) + 1]
+                };
+                let right = if stage + 1 == self.sections {
+                    1.
+                } else {
+                    weights[2 * (stage + 1)]
+                };
+                sums[2 * stage] =
+                    ((reflection * left).next_up() + (transmission * right).next_up()).next_up();
+                sums[2 * stage + 1] =
+                    ((transmission * left).next_up() + (reflection * right).next_up()).next_up();
+            }
+            if sums.iter().zip(&weights).all(|(sum, weight)| sum <= weight) {
+                return Some(
+                    (0..self.terminal + ports)
+                        .map(|node| {
+                            if node >= self.terminal {
+                                1.
+                            } else {
+                                weights[2 * (node / ports) + (node % ports) / n]
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            if sums.iter().any(|sum| !sum.is_finite()) {
+                return None;
+            }
+            for (weight, sum) in weights.iter_mut().zip(&sums) {
+                // Slack is used only to find a tight supersolution; the
+                // explicit outward-rounded inequality above certifies it.
+                *weight = weight.max(1.000_001_f64.mul_add(*sum, 1e-6).next_up());
+            }
+        }
+        None
+    }
+
+    // Scale the aggregate rounding allowance against the weakest reachable
+    // terminal's strongest path, not the largest through coefficient.
+    // This protects weak but real crosstalk between strongly disparate modes.
+    fn source_roundoff_budget(&self, source: usize) -> Real {
+        let ports = self.launch.len();
+        let mut best = vec![0.; self.terminal + ports];
+        let mut queue = BinaryHeap::new();
+        let launch = self.launch[source];
+        best[launch.target] = 1.;
+        queue.push(Arrival {
+            time: 1.,
+            node: launch.target,
+        });
+        while let Some(event) = queue.pop() {
+            if event.time < best[event.node] || event.node >= self.terminal {
+                continue;
+            }
+            for edge in self.outgoing(event.node) {
+                let gain = (event.time * edge.gain.abs().min(1.)).next_down().max(0.);
+                if gain > best[edge.target] {
+                    best[edge.target] = gain;
+                    queue.push(Arrival {
+                        time: gain,
+                        node: edge.target,
+                    });
+                }
+            }
+        }
+        let minimum = self.reachable[source]
+            .iter()
+            .map(|&row| best[self.terminal + row])
+            .fold(1., Real::min);
+        (minimum * (64. * Real::EPSILON)).next_down().max(0.)
+    }
+
+    fn prune_roundoff(&self, budget: &mut [Real], key: Arrival, values: &mut [Real]) {
+        let Some(weights) = &self.path_bound else {
+            return;
+        };
+        let weight = weights[key.node];
+        for (source, value) in values.iter_mut().enumerate() {
+            if *value == 0. {
+                continue;
+            }
+            // Retain the earliest arrival at every node (hence every
+            // shortest terminal path), allowing only arithmetic roundoff
+            // in the sum of its positive physical delays.
+            let first = self.first_at_node[source][key.node];
+            let path_roundoff = (8. * Real::EPSILON).mul_add(
+                Real::from(u32::try_from(self.terminal + self.launch.len()).unwrap_or(u32::MAX)),
+                1.,
+            );
+            if key.time <= first * path_roundoff {
+                continue;
+            }
+            let cost = (value.abs() * weight).next_up();
+            let remaining = &mut budget[source];
+            if cost <= *remaining {
+                *remaining = (*remaining - cost).next_down().max(0.);
+                *value = 0.;
+            }
+        }
     }
 
     pub(super) fn new_history(&self) -> CplHistory {
@@ -473,7 +678,13 @@ impl LossyPlan {
         })
     }
 
-    fn send(&self, queue: &mut Queue, time: Wide, edge: Edge, values: &[Real]) -> SpiceResult<()> {
+    fn send(
+        &self,
+        kernel: &mut Kernel,
+        time: Wide,
+        edge: Edge,
+        values: &[Real],
+    ) -> SpiceResult<()> {
         let arrival = time + Wide::from_real(edge.delay);
         if !arrival.hi.is_finite() || arrival.hi <= time.hi {
             return Err(invalid(
@@ -484,16 +695,27 @@ impl LossyPlan {
             time: arrival.hi,
             node: edge.target,
         };
-        if queue.len() >= self.limit && !queue.contains_key(&key) {
+        if let Some(event) = kernel.pending.get_mut(&key) {
+            for (target, value) in event.values.iter_mut().zip(values) {
+                *target = edge.gain.mul_add(*value, *target);
+            }
+            return Ok(());
+        }
+        let mut incoming: Vec<_> = values.iter().map(|value| edge.gain * value).collect();
+        self.prune_roundoff(&mut kernel.remaining_roundoff, key, &mut incoming);
+        if incoming.iter().all(|value| *value == 0.) {
+            return Ok(());
+        }
+        if kernel.pending.len() >= self.limit / Kernel::arrival_bytes(values.len()) {
             return Err(invalid("CPL arrival workspace exceeded"));
         }
-        let event = queue.entry(key).or_insert_with(|| Increment {
-            time: arrival,
-            values: vec![0.; values.len()],
-        });
-        for (target, value) in event.values.iter_mut().zip(values) {
-            *target = edge.gain.mul_add(*value, *target);
-        }
+        kernel.pending.insert(
+            key,
+            Increment {
+                time: arrival,
+                values: incoming,
+            },
+        );
         Ok(())
     }
 
@@ -501,43 +723,58 @@ impl LossyPlan {
         &self,
         kernel: &mut Kernel,
         horizon: Real,
-        boundary_records: usize,
+        boundary_bytes: usize,
     ) -> SpiceResult<()> {
         let ports = self.launch.len();
         if kernel.horizon == 0. {
+            kernel
+                .remaining_roundoff
+                .copy_from_slice(&self.roundoff_budget);
             for (port, edge) in self.launch.iter().enumerate() {
                 let mut unit = vec![0.; ports];
                 unit[port] = 1.;
-                self.send(&mut kernel.pending, Wide::ZERO, *edge, &unit)?;
+                self.send(kernel, Wide::ZERO, *edge, &unit)?;
             }
         }
         let mut work = 0_usize;
+        kernel.trace_capacity = kernel.traces.iter().map(Vec::capacity).sum();
         while kernel
             .pending
             .first_key_value()
             .is_some_and(|(key, _)| key.time <= horizon)
         {
-            let (key, event) = kernel
+            let (key, mut event) = kernel
                 .pending
                 .pop_first()
                 .ok_or_else(|| invalid("missing CPL arrival"))?;
+            self.prune_roundoff(&mut kernel.remaining_roundoff, key, &mut event.values);
             if event.values.iter().all(|value| *value == 0.) {
                 continue;
             }
             work += 1;
-            if work > self.limit.saturating_mul(8) {
+            if work > (self.limit / std::mem::size_of::<Knot>()).saturating_mul(8) {
                 return Err(invalid("CPL arrival work budget exceeded"));
             }
             if key.node >= self.terminal {
                 kernel.push(key.node - self.terminal, event.time, &event.values)?;
             } else {
                 for edge in self.outgoing(key.node) {
-                    self.send(&mut kernel.pending, event.time, edge, &event.values)?;
+                    self.send(kernel, event.time, edge, &event.values)?;
                 }
             }
-            if kernel.records + kernel.pending.len() + boundary_records > self.limit {
-                return Err(invalid("CPL response workspace exceeded"));
+            let bytes = kernel.workspace(ports).saturating_add(boundary_bytes);
+            if bytes > self.limit {
+                return Err(invalid(format!(
+                    "CPL response workspace exceeded: {bytes} estimated bytes, {} knots, {} pending, {boundary_bytes} boundary bytes, {work} work at relative time {:e}, limit {} bytes",
+                    kernel.records,
+                    kernel.pending.len(),
+                    key.time,
+                    self.limit
+                )));
             }
+        }
+        if kernel.workspace(ports).saturating_add(boundary_bytes) > self.limit {
+            return Err(invalid("CPL initial response workspace exceeded"));
         }
         kernel.horizon = horizon;
         Ok(())
@@ -556,11 +793,17 @@ impl LossyPlan {
             return Err(invalid("nonpositive CPL trial duration"));
         }
         let mut kernel = Arc::clone(&history.kernel);
-        if horizon > kernel.horizon && (kernel.horizon == 0. || !kernel.pending.is_empty()) {
+        if horizon > kernel.horizon
+            && (kernel.horizon == 0.
+                || kernel
+                    .pending
+                    .first_key_value()
+                    .is_some_and(|(key, _)| key.time <= horizon))
+        {
             self.extend_kernel(
                 Arc::make_mut(&mut kernel),
                 horizon,
-                history.segments.len() + history.corners.len() + 3,
+                history.boundary_bytes(),
             )?;
         }
         Ok(kernel)
@@ -727,7 +970,7 @@ impl LossyPlan {
             // waves, so uncertainty cannot accumulate into extrapolation.
             if change.abs() > uncertainty
                 && (history.segments.is_empty()
-                    || change.abs() > context.abstol + context.reltol * incident[port].abs())
+                    || change.abs() > context.reltol.mul_add(incident[port].abs(), context.abstol))
             {
                 corners.push((port, change));
                 for &delay in &self.fronts[port] {
@@ -759,7 +1002,7 @@ impl LossyPlan {
         // not every tiny reflection. All arrivals remain in the response.
         for (row, &amplitude) in reflected[..ports].iter().enumerate() {
             let mut earliest = Real::INFINITY;
-            let tolerance = context.abstol + context.reltol * amplitude.abs();
+            let tolerance = context.reltol.mul_add(amplitude.abs(), context.abstol);
             for corner in &next.corners {
                 let ratio = dt / corner.duration;
                 let lag = context.time - corner.time;
@@ -788,5 +1031,82 @@ impl LossyPlan {
             next,
             breakpoints,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::cpl::CoupledLineLimits;
+
+    #[test]
+    fn bounded_path_roundoff_preserves_first_arrivals_and_small_transfer_coefficients() {
+        let material = CoupledLinePlan::from_packed(
+            2,
+            1.,
+            &[0.05, 0.001, 0.08],
+            &[250e-9, 0., 400e-9],
+            &[0.000001, 0., 0.000002],
+            &[100e-12, 0., 160e-12],
+            CoupledLineLimits::default(),
+        )
+        .unwrap();
+        let basis = ModalBasis::prepare(&material).unwrap().unwrap();
+        let plan = LossyPlan::prepare(basis, &material, 4).unwrap();
+        let bound = plan.path_bound.as_ref().unwrap();
+        for node in 0..plan.terminal {
+            let sum = plan
+                .outgoing(node)
+                .map(|edge| edge.gain.abs() * bound[edge.target])
+                .sum::<Real>();
+            assert!(sum <= bound[node], "absolute path bound at node {node}");
+        }
+        let mut exact = plan.clone();
+        exact.path_bound = None;
+        let mut reference = Kernel::empty(4);
+        exact.extend_kernel(&mut reference, 30e-9, 0).unwrap();
+        let mut bounded = Kernel::empty(4);
+        plan.extend_kernel(&mut bounded, 30e-9, 0).unwrap();
+        assert!(bounded.records < reference.records);
+        for (index, (full, reduced)) in reference.traces.iter().zip(&bounded.traces).enumerate() {
+            let source = index % 4;
+            assert_eq!(full.first(), reduced.first());
+            let mut i = 0;
+            let mut j = 0;
+            let mut omitted = 0.;
+            while i < full.len() || j < reduced.len() {
+                let a = full.get(i);
+                let b = reduced.get(j);
+                match (a, b) {
+                    (Some(a), Some(b)) if a.time.hi == b.time.hi => {
+                        omitted += (a.impulse - b.impulse).abs();
+                        i += 1;
+                        j += 1;
+                    }
+                    (Some(a), Some(b)) if a.time.hi < b.time.hi => {
+                        omitted += a.impulse.abs();
+                        i += 1;
+                    }
+                    (Some(a), None) => {
+                        omitted += a.impulse.abs();
+                        i += 1;
+                    }
+                    (_, Some(b)) => {
+                        omitted += b.impulse.abs();
+                        j += 1;
+                    }
+                    (None, None) => break,
+                }
+            }
+            let used = plan.roundoff_budget[source] - bounded.remaining_roundoff[source];
+            // Distinguish the certified discarded-path mass from floating
+            // arithmetic in the two independently accumulated kernels.
+            let arithmetic =
+                full.iter().map(|knot| knot.impulse.abs()).sum::<Real>() * 64. * Real::EPSILON;
+            assert!(
+                omitted <= used + arithmetic,
+                "trace {index}: {omitted:e} > {used:e} + {arithmetic:e}"
+            );
+        }
     }
 }

@@ -51,7 +51,7 @@ pub struct CoupledLine {
 #[derive(Debug, Clone)]
 enum Propagation {
     Lossless(lossless::ModalBasis),
-    Lossy(transport::LossyPlan),
+    Lossy(Box<transport::LossyPlan>),
     Spatial,
 }
 
@@ -260,9 +260,9 @@ impl CoupledLine {
             {
                 Propagation::Lossless(basis)
             }
-            Some(basis) => {
-                Propagation::Lossy(transport::LossyPlan::prepare(basis, &plan, sections)?)
-            }
+            Some(basis) => Propagation::Lossy(Box::new(transport::LossyPlan::prepare(
+                basis, &plan, sections,
+            )?)),
             None => Propagation::Spatial,
         };
         Ok(Self {
