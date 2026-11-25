@@ -8,7 +8,7 @@ use crate::netlist::ast::{
 use crate::primitives::AnalysisKind;
 
 /// Device observations needed by output and post-processing cards for one analysis.
-#[must_use]
+#[must_use = "the requested observation names determine which device quantities are collected"]
 pub fn requests(
     kind: AnalysisKind,
     output: &OutputCards,

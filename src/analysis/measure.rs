@@ -236,7 +236,7 @@ pub(super) fn resolve_ordered<'a>(
 /// operation's own fields), with the port's 15-fractional-digit spelling. The
 /// `unit` of a [`Measurement`] is part of the API, not of this block, exactly
 /// as in C.
-#[must_use]
+#[must_use = "the returned measurement report must be written to the chosen output"]
 pub fn to_text(results: &[Measurement]) -> String {
     use std::fmt::Write as _;
 

@@ -201,31 +201,31 @@ impl PassiveRealization {
     }
 
     /// Number of differential physical ports.
-    #[must_use]
+    #[must_use = "the port count determines the external terminal topology"]
     pub const fn ports(&self) -> usize {
         self.ports
     }
 
     /// Number of lumped circuit elements.
-    #[must_use]
+    #[must_use = "the element count measures the size of the lumped realization"]
     pub const fn element_count(&self) -> usize {
         self.edges.len()
     }
 
     /// Borrow the graph-local elements for artifact serialization and inspection.
-    #[must_use]
+    #[must_use = "the elements describe the graph used for serialization or inspection"]
     pub fn elements(&self) -> &[LumpedElement] {
         &self.edges
     }
 
     /// Number of internal nodes, excluding reference and port nodes.
-    #[must_use]
+    #[must_use = "the internal node count determines additional solver rows"]
     pub const fn internal_node_count(&self) -> usize {
         self.nodes - self.ports - 1
     }
 
     /// Validation result for distributed-line approximations.
-    #[must_use]
+    #[must_use = "the report records the distributed approximation validation result"]
     pub const fn report(&self) -> Option<LadderReport> {
         self.report
     }

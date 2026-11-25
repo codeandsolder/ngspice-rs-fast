@@ -55,7 +55,7 @@ impl QuasiStatic {
     }
 
     /// Phase velocity in metres per second.
-    #[must_use]
+    #[must_use = "the phase velocity determines the extracted line inductance and capacitance"]
     pub fn velocity(self) -> f64 {
         LIGHT_SPEED / self.effective_permittivity.sqrt()
     }

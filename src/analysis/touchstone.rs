@@ -19,7 +19,7 @@ pub enum Version {
 }
 impl Version {
     /// Whether bracketed v2 section headers are mandatory.
-    #[must_use]
+    #[must_use = "the result distinguishes modern Touchstone syntax from legacy syntax"]
     pub const fn modern(self) -> bool {
         matches!(self, Self::V2_0 | Self::V2_1)
     }
@@ -70,7 +70,7 @@ pub enum Unit {
 }
 impl Unit {
     /// Multiplier converting this unit to hertz.
-    #[must_use]
+    #[must_use = "the scale converts the declared frequency unit to hertz"]
     pub const fn scale(self) -> Real {
         match self {
             Self::Hz => 1.,
