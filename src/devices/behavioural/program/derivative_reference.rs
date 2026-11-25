@@ -134,7 +134,7 @@ fn differentiate_power(rule: PowerRule, a: &Tree, b: &Tree, variable: usize) -> 
         PowerRule::Signed => (Binary::PwrBaseSlope, Binary::PwrExponentSlope),
     };
     let left = times(
-        mk_binary(base, a.clone(), b.clone()),
+        mk_binary(base, a, b.clone()),
         differentiate(a, variable),
     );
     let db = differentiate(b, variable);
@@ -144,7 +144,7 @@ fn differentiate_power(rule: PowerRule, a: &Tree, b: &Tree, variable: usize) -> 
         mk_operator(
             Operator::Plus,
             left,
-            times(mk_binary(exponent, a.clone(), b.clone()), db),
+            times(mk_binary(exponent, a, b.clone()), db),
         )
     }
 }
