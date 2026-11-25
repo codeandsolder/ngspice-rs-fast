@@ -20,7 +20,8 @@ and expression derivatives contribute to the same Jacobian, including
 when control variables and terminal or branch variables coincide.
 
 The first branch represents physical current; the second, when present,
-represents the derivative. KCL uses the physical current only. Explicit
+represents the derivative. Plot coordinates are named i(device) and
+dvdt(device) or didt(device), respectively, with their physical units. KCL uses the physical current only. Explicit
 charge and differential storage use the solver's existing trial/accepted
 state integration. DC initializes the stored quantity and sets its
 derivative to zero; small-signal assembly separates the algebraic and
@@ -49,6 +50,7 @@ Scalar expressions retain the numeric parameter evaluator and its precision.
 Runtime expressions are resolved in the instance's scope and compiled once.
 Resolved current references use existing branch rows where possible; other
 targets share one series voltage measurement with collision-checked names.
+Model-backed inductors expose their existing physical current coordinate.
 
 `ddt(f)` is expanded once into a solver-owned coordinate y, with residual
 F=y and storage Q=-f. It consumes one internal node and two accepted-state
@@ -84,7 +86,9 @@ origin poles and unstable proper rational systems are not clamped.
 The four analog port forms support differential voltage inputs, zero-voltage
 current-sensing inputs, differential voltage outputs and oriented current
 outputs. The compiled realization is shared by instances of a model;
-every instance owns its accepted/trial integration state. The native
+every instance owns its accepted/trial integration state. Transfer plots
+identify the output current as i(device), the sensing input current as
+i(device:input), and the normalized states as state(device,index). The native
 model grammar accepts scoped expressions within coefficient vectors.
 
 Native `int_ic` values are listed in descending physical integrator order;
@@ -151,12 +155,24 @@ the initial charge is 1 uC and the consistent output is -1 V.
 Redundant charge constraints can leave the instantaneous current
 distribution undetermined. The normal sparse solve remains the fast
 path; a singular or rectangular reduced system uses a sparse rank basis
-with power-of-two row/column scaling. Only declared storage-current
-coordinates can complete the basis as zero-current gauges. The
+with power-of-two row/column scaling and coefficient-local rounding
+uncertainty. Only declared storage-current and derivative-signal
+coordinates can complete the basis as zero gauges. The
 original algebraic equations and actual nonlinear charge values are
 all checked on reload; no constraint is relaxed by dropping it from
 the basis. This does not establish full derivative consistency of a
 general high-index DAE or resolve unrelated floating coordinates.
+
+The stored input of ddt is not automatically an independent initial
+condition. The rank basis considers its seeded value only after the
+algebraic equations and mandatory physical storage constraints. If those
+already determine the input, the history is initialized at the actual
+consistent input rather than an arbitrary zero seed. If the derivative
+defines an independent state (for example v=1-tau*ddt(v)), its seed is
+retained, including a supplied .ic. Undetermined derivative outputs use
+a zero prehistory convention; this is not a general high-index
+right-tangent initialization algorithm. In particular, cascaded
+derivatives across startup discontinuities require additional treatment.
 
 Nonlinear C/L `ic=` is intentionally retained under UIC, rather than
 discarded by the frontend as observed in ngspice 47 (instance and node
@@ -196,7 +212,7 @@ ngspice 47 output spectral amplitudes both equal
 ## Remaining work
 
 Source-dialect E/G LAPLACE normalization is tracked in the preprocessing
-repository (#44), using the native rational transfer model. Derivative-operator UIC, more general rank-aware and high-index initialization,
+repository (#44), using the native rational transfer model. General high-index right-tangent initialization,
 mutual coupling, broader reference coverage, and nonlinear candidate testing
 remain within issue #184. Static statistical realization is documented in
 [PARAM_EXPRESSIONS.md](PARAM_EXPRESSIONS.md).

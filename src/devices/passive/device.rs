@@ -152,6 +152,9 @@ impl Device for ModelPassive {
     fn branch_currents(&self) -> usize {
         usize::from(self.parameters.kind == PassiveKind::Inductor)
     }
+    fn expression_current_branch(&self) -> Option<usize> {
+        (self.parameters.kind == PassiveKind::Inductor).then_some(0)
+    }
     fn state_count(&self) -> usize {
         match self.parameters.kind {
             PassiveKind::Capacitor | PassiveKind::Inductor => REACTIVE_STATE_COUNT,

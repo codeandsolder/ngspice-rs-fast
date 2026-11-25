@@ -352,6 +352,18 @@ impl Device for RationalTransfer {
     fn branch_currents(&self) -> usize {
         1 + self.order() + usize::from(self.input == PortLaw::Current)
     }
+    fn branch_quantity(&self, branch: usize) -> crate::devices::BranchQuantity {
+        use crate::devices::BranchQuantity;
+        if branch == 0 {
+            BranchQuantity::Current
+        } else if branch > self.order() {
+            BranchQuantity::InputCurrent
+        } else if self.input == PortLaw::Voltage {
+            BranchQuantity::VoltageState(branch - 1)
+        } else {
+            BranchQuantity::CurrentState(branch - 1)
+        }
+    }
     fn branch_convergence(&self, branch: usize) -> crate::devices::ConvergenceKind {
         if (1..=self.order()).contains(&branch) && self.input == PortLaw::Voltage {
             crate::devices::ConvergenceKind::Voltage

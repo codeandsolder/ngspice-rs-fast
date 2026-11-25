@@ -342,6 +342,14 @@ impl Device for Passive {
     fn branch_currents(&self) -> usize {
         self.law.branches()
     }
+    fn branch_quantity(&self, branch: usize) -> crate::devices::BranchQuantity {
+        use crate::devices::BranchQuantity;
+        match (self.law, branch) {
+            (Law::Capacitance, 1) => BranchQuantity::VoltageRate,
+            (Law::Inductance, 1) => BranchQuantity::CurrentRate,
+            _ => BranchQuantity::Current,
+        }
+    }
     fn branch_convergence(&self, branch: usize) -> crate::devices::ConvergenceKind {
         if self.law.differential() && branch == 1 {
             crate::devices::ConvergenceKind::Constitutive
@@ -399,12 +407,22 @@ impl Device for Passive {
         )
     }
 
-    fn initial_charge_storage(&self) -> Option<crate::devices::InitialChargeStorage> {
-        (self.law == Law::Charge).then_some(crate::devices::InitialChargeStorage {
+    fn initial_expression_storage(&self) -> Option<crate::devices::InitialExpressionStorage> {
+        use crate::devices::{InitialExpressionStorage, InitialStoragePolicy, InitialStorageRow};
+        let (row, policy) = match self.law {
+            Law::Charge => (InitialStorageRow::Branch(0), InitialStoragePolicy::Physical),
+            Law::Derivative => (
+                InitialStorageRow::Signal(self.terminals()[0]),
+                InitialStoragePolicy::Derived,
+            ),
+            _ => return None,
+        };
+        Some(InitialExpressionStorage {
             slot: 0,
-            equation: 0,
-            current: 0,
+            equation: row,
+            gauge: row,
             voltage: self.initial,
+            policy,
         })
     }
 

@@ -1,8 +1,7 @@
 //! Native passive expression laws through the real parser and solver.
 use std::path::Path;
 
-use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, Plot};
-use ngspice_rs::devices::Circuit;
+use ngspice_rs::analysis::{AnalysisInput, Plot, RunConfig};
 use ngspice_rs::netlist::{Parser, semantic_diff, source::parse_deck_text, write_netlist};
 use ngspice_rs::primitives::{AnalysisKind, SpiceResult};
 
@@ -12,13 +11,12 @@ fn run(body: &str, kind: AnalysisKind, args: &[&str]) -> SpiceResult<Plot> {
         &format!("passive\n{body}\n.end\n"),
     );
     let netlist = Parser::new().parse_deck(&deck)?;
-    let mut circuit = Circuit::from_netlist(&netlist)?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let mut circuit = config.circuit(&netlist)?;
     let mut request =
         AnalysisInput::with_arguments(kind, args.iter().copied().filter(|arg| *arg != "uic"));
     request.uic = args.contains(&"uic");
-    request
-        .resolve()?
-        .run(&mut circuit, &AnalysisContext::default())
+    config.plan(request)?.run(&mut circuit, &config.context())
 }
 
 fn close(actual: f64, expected: f64, tolerance: f64) {
@@ -368,6 +366,114 @@ fn arbitrary_charge_uic_resolves_its_own_current_dependency() -> SpiceResult<()>
             (2. / 3.) * (-t / 1.5e-3).exp(),
             1e-3,
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn physical_current_and_constitutive_rate_have_distinct_plot_coordinates() -> SpiceResult<()> {
+    let body = "v1 a 0 dc 1 ac 1\nc1 a 0 c={1u*(1+v(a))}\nv2 b 0 dc 0 ac 1\nl1 b c l={1m*(1+i(l1))}\nr1 c 0 1k";
+    let plot = run(body, AnalysisKind::Ac, &["lin", "1", "1000", "1000"])?;
+    for (name, unit) in [
+        ("i(c1)", "current"),
+        ("dvdt(c1)", "voltage/s"),
+        ("i(l1)", "current"),
+        ("didt(l1)", "current/s"),
+    ] {
+        let matches: Vec<_> = plot.variables().iter().filter(|v| v.name == name).collect();
+        assert_eq!(matches.len(), 1, "{name}");
+        assert_eq!(matches[0].unit, unit);
+    }
+    let omega = std::f64::consts::TAU * 1000.;
+    close(plot.value("dvdt(c1)", 0).unwrap().im, omega, 1e-8);
+    close(plot.value("i(c1)", 0).unwrap().im, omega * 2e-6, 1e-12);
+    let i = plot.value("i(l1)", 0).unwrap();
+    let derivative = plot.value("didt(l1)", 0).unwrap();
+    close(derivative.re, -omega * i.im, 1e-8);
+    close(derivative.im, omega * i.re, 1e-8);
+    Ok(())
+}
+
+#[test]
+fn native_current_probe_reads_model_backed_inductors() -> SpiceResult<()> {
+    let body =
+        "v1 in 0 dc 2 ac 1\nr1 in a 1k\nl1 a 0 mdl\n.model mdl l(ind=1m)\nb1 mon 0 v=1000*i(l1)";
+    let plot = run(body, AnalysisKind::OperatingPoint, &[])?;
+    close(plot.value("v(mon)", 0).unwrap().re, 2., 1e-12);
+    let plot = run(body, AnalysisKind::Ac, &["lin", "1", "1000", "1000"])?;
+    let current = plot.value("i(l1)", 0).unwrap();
+    let mon = plot.value("v(mon)", 0).unwrap();
+    close(mon.re, 1000. * current.re, 1e-12);
+    close(mon.im, 1000. * current.im, 1e-12);
+    Ok(())
+}
+
+#[test]
+fn uic_derivative_uses_actual_initial_input_instead_of_uninitialized_nodes() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let constant = run(
+            "v1 in 0 2\nb1 out 0 v=ddt(v(in)^2)\nr1 out 0 1k",
+            AnalysisKind::Transient,
+            &["1u", "20u", "0", "1u", "uic", method],
+        )?;
+        for point in 0..constant.point_count() {
+            close(constant.value("v(out)", point).unwrap().re, 0., 1e-9);
+        }
+        let ramp = run(
+            "v1 in 0 PWL(0 2 1m 3)\nb1 out 0 v=ddt(v(in)^2)\nr1 out 0 1k",
+            AnalysisKind::Transient,
+            &["250n", "50u", "0", "250n", "uic", method],
+        )?;
+        assert!(ramp.point_count() > 20);
+        for point in 0..ramp.point_count() {
+            let t = ramp.value("time", point).unwrap().re;
+            close(
+                ramp.value("v(out)", point).unwrap().re,
+                2000. * (2. + 1000. * t),
+                1.,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn uic_derivative_can_define_an_independent_feedback_state() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        // v = 1 - tau dv/dt, with independent initial v=0.3.
+        let plot = run(
+            "b1 out 0 v=1-1m*ddt(v(out))\nr1 out 0 1k\n.ic v(out)=0.3",
+            AnalysisKind::Transient,
+            &["1u", "2m", "0", "1u", "uic", method],
+        )?;
+        assert!(plot.point_count() > 100);
+        for point in 0..plot.point_count() {
+            let t = plot.value("time", point).unwrap().re;
+            close(
+                plot.value("v(out)", point).unwrap().re,
+                1. - 0.7 * (-1000. * t).exp(),
+                2e-5,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn uic_derivative_respects_physical_storage_and_redundant_inputs() -> SpiceResult<()> {
+    // The capacitor is the independent stored voltage; both differentiators
+    // observe it. The exact constitutive current determines its decay rate.
+    let plot = run(
+        "c1 a 0 c={1u*(1+v(a))} ic=1\nr1 a 0 1k\nb1 y 0 v=ddt(v(a))\nb2 z 0 v=ddt(2*v(a))",
+        AnalysisKind::Transient,
+        &["250n", "200u", "0", "250n", "uic", "method=gear"],
+    )?;
+    for point in 0..plot.point_count() {
+        let v = plot.value("v(a)", point).unwrap().re;
+        let y = plot.value("v(y)", point).unwrap().re;
+        let z = plot.value("v(z)", point).unwrap().re;
+        close(y, -1000. * v / (1. + v), 0.2);
+        close(z, 2. * y, 1e-7);
     }
     Ok(())
 }

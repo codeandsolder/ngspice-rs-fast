@@ -42,7 +42,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::devices::{Circuit, IterationPhase, LoadRequest, ModelContext, PreparedRun};
+use crate::devices::{
+    Circuit, InitialStoragePolicy, InitialStorageRow, IterationPhase, LoadRequest, ModelContext,
+    PreparedRun,
+};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
@@ -415,9 +418,10 @@ struct ChargeInitial {
     name: String,
     device: usize,
     slot: usize,
-    current: AbsoluteRow,
+    gauge: AbsoluteRow,
     target: Real,
     voltage: Option<Real>,
+    policy: InitialStoragePolicy,
 }
 
 impl ImpulseStorage {
@@ -444,50 +448,74 @@ impl ImpulseStorage {
             if let Some(voltage) = bound_initial_voltage(circuit, index, initial, context)? {
                 storage.capacitors.push(voltage);
             }
-            let device = &circuit.devices()[index];
-            if let Some(charge) = device.initial_charge_storage() {
-                let rows = circuit
-                    .branch_rows(index)
-                    .ok_or_else(|| failure("missing initial charge branch binding"))?;
-                let states = circuit
-                    .state_rows(index)
-                    .ok_or_else(|| failure("missing initial charge state binding"))?;
-                if charge.equation >= rows.len()
-                    || charge.current >= rows.len()
-                    || charge.slot >= states.len()
-                {
-                    return Err(failure(format!(
-                        "{}: invalid initial charge binding",
-                        device.name()
-                    )));
-                }
-                let slot = states.start + charge.slot;
-                let target = trial.values()[slot];
-                if !target.is_finite() {
-                    return Err(failure(format!(
-                        "{}: nonfinite initial charge",
-                        device.name()
-                    )));
-                }
-                let item = ChargeInitial {
-                    name: device.name().to_owned(),
-                    device: index,
-                    slot,
-                    current: AbsoluteRow(rows.start + charge.current),
-                    target,
-                    voltage: charge.voltage,
-                };
-                if storage
-                    .charges
-                    .insert(AbsoluteRow(rows.start + charge.equation), item)
-                    .is_some()
-                {
-                    return Err(failure("duplicate initial charge equation"));
-                }
+            if let Some((row, item)) = bound_expression_storage(circuit, index, trial)?
+                && storage.charges.insert(row, item).is_some()
+            {
+                return Err(failure("duplicate initial expression equation"));
             }
         }
         Ok(storage)
     }
+}
+
+/// Bind local storage coordinates to the finalized MNA layout. Signal
+/// rows are exclusively declared by generated differentiator devices.
+fn bound_expression_storage(
+    circuit: &Circuit,
+    index: usize,
+    trial: &crate::devices::TrialState,
+) -> SpiceResult<Option<(AbsoluteRow, ChargeInitial)>> {
+    let device = &circuit.devices()[index];
+    let Some(storage) = device.initial_expression_storage() else {
+        return Ok(None);
+    };
+    let rows = circuit
+        .branch_rows(index)
+        .ok_or_else(|| failure("missing initial expression branch binding"))?;
+    let states = circuit
+        .state_rows(index)
+        .ok_or_else(|| failure("missing initial expression state binding"))?;
+    let bind = |row| {
+        match row {
+            InitialStorageRow::Branch(local) => rows.clone().nth(local),
+            InitialStorageRow::Signal(node) => {
+                if storage.policy == InitialStoragePolicy::Derived
+                    && device.terminals().first() == Some(&node)
+                {
+                    circuit.unknowns().node_row(node)
+                } else {
+                    None
+                }
+            }
+        }
+        .map(AbsoluteRow)
+        .ok_or_else(|| failure(format!("{}: invalid initial expression row", device.name())))
+    };
+    let slot = states.clone().nth(storage.slot).ok_or_else(|| {
+        failure(format!(
+            "{}: invalid initial expression slot",
+            device.name()
+        ))
+    })?;
+    let target = trial.values()[slot];
+    if !target.is_finite() {
+        return Err(failure(format!(
+            "{}: nonfinite initial stored expression",
+            device.name()
+        )));
+    }
+    Ok(Some((
+        bind(storage.equation)?,
+        ChargeInitial {
+            name: device.name().to_owned(),
+            device: index,
+            slot,
+            gauge: bind(storage.gauge)?,
+            target,
+            voltage: storage.voltage,
+            policy: storage.policy,
+        },
+    )))
 }
 
 /// Independent capacitor voltage relations and relations implied by E/H outputs.
@@ -650,7 +678,12 @@ impl ChargeConstraints {
         Ok(())
     }
 
-    fn residual(&self, storage: &ImpulseStorage, tolerance: Tolerances) -> (Real, bool) {
+    fn residual(
+        &self,
+        storage: &ImpulseStorage,
+        solution: &InstantaneousSolution,
+        tolerance: Tolerances,
+    ) -> (Real, bool) {
         let mut ratio: Real = 0.;
         let mut roundoff = true;
         for (&AbsoluteRow(row), charge) in &storage.charges {
@@ -658,9 +691,18 @@ impl ChargeConstraints {
             if !actual.is_finite() {
                 return (Real::INFINITY, false);
             }
+            if charge.policy == InitialStoragePolicy::Derived
+                && !solution.retained_derived(AbsoluteRow(row))
+            {
+                continue;
+            }
+            let absolute = match charge.policy {
+                InitialStoragePolicy::Physical => tolerance.chgtol,
+                InitialStoragePolicy::Derived => tolerance.vntol,
+            };
             let scale = actual.abs().max(charge.target.abs());
             let residual = (actual - charge.target).abs();
-            ratio = ratio.max(residual / tolerance.reltol.mul_add(scale, tolerance.chgtol));
+            ratio = ratio.max(residual / tolerance.reltol.mul_add(scale, absolute));
             roundoff &= residual <= 4. * Real::EPSILON * scale;
         }
         (ratio, roundoff)
@@ -748,7 +790,7 @@ fn solve_nonlinear_instantaneous(
         {
             let (mut ratio, mut roundoff) = system.residual_ratio(&solution, &x, tolerances);
             if let Some(constraints) = &charge_constraints {
-                let (physical, exact) = constraints.residual(storage, tolerances);
+                let (physical, exact) = constraints.residual(storage, &solution, tolerances);
                 ratio = ratio.max(physical);
                 roundoff &= exact;
             }
