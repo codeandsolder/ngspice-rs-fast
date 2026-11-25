@@ -12,7 +12,7 @@ use std::ops::RangeInclusive;
 ///
 /// The signed C range is asymmetric: `i32::MIN` is a valid result, while
 /// `-i32::MIN` is not. Check the actual bounds before the narrowing cast.
-#[must_use]
+#[must_use = "the result carries the C-rounded value or rejects an out-of-range conversion"]
 pub fn c_integer(value: Real) -> Option<i64> {
     exact_signed_integer::<i32>((0.5 + value).floor()).map(i64::from)
 }
@@ -25,7 +25,7 @@ pub fn c_integer(value: Real) -> Option<i64> {
 /// actual target integer type. This works for both `usize` and the full
 /// `u32` range, even on targets whose `usize` is narrower than 32 bits.
 /// It validates the supplied `f64`, not digits already lost during parsing.
-#[must_use]
+#[must_use = "the result validates integrality and the destination unsigned range"]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the value is checked for integrality and bounded below 2^128 before conversion"
@@ -44,7 +44,7 @@ pub fn exact_nonnegative_integer<T: TryFrom<u128>>(value: Real) -> Option<T> {
 
 /// Convert an integral finite value through the full signed i128 domain.
 /// The lower bound is inclusive, but 2^127 is not representable as i128.
-#[must_use]
+#[must_use = "the result validates integrality and the destination signed range"]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the value is integral and within the asymmetric i128 range"
@@ -59,14 +59,14 @@ pub fn exact_signed_integer<T: TryFrom<i128>>(value: Real) -> Option<T> {
 
 /// Truncate toward zero before checking the full signed target range (C casts
 /// on representable values, not the `IF_INTEGER` parser's half-up rounding).
-#[must_use]
+#[must_use = "the result carries the truncated value or rejects an invalid signed conversion"]
 pub fn truncating_signed_integer<T: TryFrom<i128>>(value: Real) -> Option<T> {
     exact_signed_integer(value.trunc())
 }
 
 /// Quantize a finite exponent, ties away from zero, saturating at the given
 /// integer limits. Invalid exponents or reversed bounds are rejected.
-#[must_use]
+#[must_use = "the result carries the saturated exponent or rejects invalid input"]
 pub(crate) fn bounded_rounded_exponent(value: Real, bounds: RangeInclusive<i32>) -> Option<i32> {
     if !value.is_finite() || bounds.is_empty() {
         return None;
