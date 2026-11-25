@@ -566,7 +566,14 @@ fn solve_nonlinear_instantaneous(
         rhs.clear();
         let mut next_trial = request
             .history
-            .trial_in(IterationPhase::Float, trial.as_ref())?
+            .trial_in(
+                if trial.is_some() {
+                    IterationPhase::Float
+                } else {
+                    IterationPhase::Junction
+                },
+                trial.as_ref(),
+            )?
             .with_device_limiting(false);
         prepared.load(
             &LoadRequest {
