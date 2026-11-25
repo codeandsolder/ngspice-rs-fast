@@ -706,14 +706,14 @@ impl Engine {
     }
 
     /// Accepted simulation time.
-    #[must_use]
+    #[must_use = "the returned accepted time identifies the committed digital simulation horizon"]
     pub const fn time(&self) -> Real {
         self.accepted.time.value()
     }
 
     /// Next known queued physical event time, including initialization.
     /// Lookahead-driven models may discover earlier autonomous events.
-    #[must_use]
+    #[must_use = "the returned option identifies the next queued physical event for analog timestep scheduling"]
     pub fn next_event_time(&self) -> Option<Real> {
         if self.accepted.initialized {
             self.accepted
@@ -726,19 +726,19 @@ impl Engine {
     }
 
     /// True if a model can discover events only by advancing through a horizon.
-    #[must_use]
+    #[must_use = "the result determines whether advancement can reveal unqueued autonomous events"]
     pub const fn has_lookahead(&self) -> bool {
         !self.network.lookahead.is_empty()
     }
 
     /// Accepted net value.
-    #[must_use]
+    #[must_use = "the returned option distinguishes the accepted drive of a valid net from an invalid net ID"]
     pub fn value(&self, net: NetId) -> Option<Drive> {
         self.accepted.nets.get(net.0).copied()
     }
 
     /// Accepted counters.
-    #[must_use]
+    #[must_use = "the returned counters quantify committed digital engine work"]
     pub const fn stats(&self) -> Stats {
         self.accepted.stats
     }
@@ -821,20 +821,20 @@ impl Trial<'_> {
     }
 
     /// Current trial net value.
-    #[must_use]
+    #[must_use = "the returned option identifies the provisional net drive without committing trial state"]
     pub fn value(&self, net: NetId) -> Option<Drive> {
         self.state.nets.get(net.0).copied()
     }
 
     /// Resolved net transitions in this trial, in deterministic order.
-    #[must_use]
+    #[must_use = "the returned ordered transitions supply the trial changes for mixed-signal synchronization"]
     pub fn changes(&self) -> &[Change] {
         &self.changes
     }
 
     /// Next known queued event in the trial; autonomous horizon probes may
     /// discover earlier events.
-    #[must_use]
+    #[must_use = "the returned option identifies the next queued event of the provisional trial state"]
     pub fn next_event_time(&self) -> Option<Real> {
         if self.state.initialized {
             self.state
@@ -927,7 +927,7 @@ pub(super) struct MixedPoint {
 impl MixedSignal {
     /// Couple a digital engine to an analog transient. External stimuli may
     /// already be queued, but physical time must not have advanced.
-    #[must_use]
+    #[must_use = "the constructed coupling must be retained to synchronize analog advancement with the digital engine"]
     pub const fn new(engine: Engine) -> Self {
         Self {
             engine,
@@ -941,13 +941,13 @@ impl MixedSignal {
     }
 
     /// Accepted event engine, including work counters.
-    #[must_use]
+    #[must_use = "the returned engine exposes accepted digital state and work counters"]
     pub const fn engine(&self) -> &Engine {
         &self.engine
     }
 
     /// Digital transitions accepted by the coupled run.
-    #[must_use]
+    #[must_use = "the returned transitions are the committed digital events of the coupled run"]
     pub fn changes(&self) -> &[Change] {
         &self.changes
     }

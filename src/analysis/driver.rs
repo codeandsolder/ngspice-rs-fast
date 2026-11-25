@@ -76,7 +76,7 @@ pub struct AnalysisInput {
 
 impl AnalysisInput {
     /// A request with no arguments.
-    #[must_use]
+    #[must_use = "the constructed request must be retained to execute the specified argument-free analysis"]
     pub const fn new(kind: AnalysisKind) -> Self {
         Self {
             kind,
@@ -91,7 +91,7 @@ impl AnalysisInput {
     }
 
     /// A request with arguments.
-    #[must_use]
+    #[must_use = "the constructed request carries the arguments needed to resolve the analysis plan"]
     pub fn with_arguments(
         kind: AnalysisKind,
         arguments: impl IntoIterator<Item = impl Into<String>>,
@@ -174,7 +174,7 @@ impl AnalysisContext {
     /// Copy temperature, junction-gmin and pivot settings into the lower-level
     /// device context. Validation occurs at circuit elaboration/equation assembly; no
     /// global state is used.
-    #[must_use]
+    #[must_use = "the returned context transfers the analysis temperature, gmin and pivot policy to device preparation"]
     pub const fn model_context(&self) -> crate::devices::ModelContext {
         let mut context =
             crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
@@ -192,7 +192,7 @@ impl AnalysisContext {
     /// drivers, including nonlinear Newton loads and output observations.
     /// Changing frequency, temperature or tolerances on the analysis still
     /// takes precedence over scalar settings in the supplied model context.
-    #[must_use]
+    #[must_use = "the returned analysis context carries typed candidate replacements that the original context lacks"]
     pub const fn with_candidate_model_overrides(
         mut self,
         overrides: crate::devices::ModelContext,
@@ -234,7 +234,7 @@ pub const DRIVERS: [AnalysisKind; 12] = [
 ];
 
 /// Whether an analysis has a driver.
-#[must_use]
+#[must_use = "the result determines whether an analysis kind can be dispatched to a native driver"]
 pub fn has_driver(kind: AnalysisKind) -> bool {
     DRIVERS.contains(&kind)
 }
@@ -255,7 +255,7 @@ pub enum AnalysisSupport {
 }
 
 /// The port's support for an analysis kind.
-#[must_use]
+#[must_use = "the returned classification distinguishes native execution, postprocessing and unsupported analysis kinds"]
 pub fn support(kind: AnalysisKind) -> AnalysisSupport {
     if has_driver(kind) {
         AnalysisSupport::Driver
