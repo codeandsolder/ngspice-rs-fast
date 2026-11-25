@@ -110,7 +110,7 @@ impl<M: CodeModel> ErasedModel for M {
 
 #[derive(Debug)]
 struct Model {
-    model: Box<dyn ErasedModel>,
+    kernel: Box<dyn ErasedModel>,
     inputs: Vec<NetId>,
     outputs: Vec<usize>,
 }
@@ -181,7 +181,7 @@ impl Network {
         }
         let drivers = outputs.iter().map(|&net| self.add_driver(net)).collect();
         self.models.push(Model {
-            model: Box::new(model),
+            kernel: Box::new(model),
             inputs: inputs.to_vec(),
             outputs: drivers,
         });
@@ -261,7 +261,7 @@ impl State {
             models: network
                 .models
                 .iter()
-                .map(|m| m.model.initial_state())
+                .map(|m| m.kernel.initial_state())
                 .collect(),
             stats: Stats::default(),
         }
@@ -370,7 +370,7 @@ impl State {
             self.charge_work(before, limit)?;
             let instance = &network.models[index];
             let inputs: Vec<_> = instance.inputs.iter().map(|id| self.nets[id.0]).collect();
-            let outputs = instance.model.evaluate(
+            let outputs = instance.kernel.evaluate(
                 EventContext {
                     time: self.time.value(),
                     delta: self.delta,
@@ -499,13 +499,13 @@ impl Engine {
     /// Next pending physical event time, including initial model evaluation.
     #[must_use]
     pub fn next_event_time(&self) -> Option<Real> {
-        if !self.accepted.initialized {
-            Some(0.)
-        } else {
+        if self.accepted.initialized {
             self.accepted
                 .queue
                 .first_key_value()
                 .map(|(key, _)| key.time.value())
+        } else {
+            Some(0.)
         }
     }
 
@@ -613,13 +613,13 @@ impl Trial<'_> {
     /// Next pending event in the trial.
     #[must_use]
     pub fn next_event_time(&self) -> Option<Real> {
-        if !self.state.initialized {
-            Some(0.)
-        } else {
+        if self.state.initialized {
             self.state
                 .queue
                 .first_key_value()
                 .map(|(key, _)| key.time.value())
+        } else {
+            Some(0.)
         }
     }
 

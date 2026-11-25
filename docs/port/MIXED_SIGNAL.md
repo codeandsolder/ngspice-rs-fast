@@ -32,9 +32,14 @@ loader. Behavioral references: upstream XSPICE `evt/evtiter.c`,
 `evt/evtqueue.c`, `evt/evtbackup.c`, and the code models
 `d_and`, `d_dff`, `adc_bridge`, and `dac_bridge`. The API currently
 provides combinational gates, a rising-edge D flip-flop, comparator/Schmitt
-ADC sampling and voltage DAC ramps. Arbitrary analog code model kernels,
-A-instance parsing, additional sequential models, mixed-signal UIC,
-periodic shooting, AC and noise analysis are not implemented by this interface.
+ADC sampling and voltage DAC ramps. Native analog voltage equations provide
+gain, one-pole low-pass and unsaturated integrator kernels. They reuse the
+companion charge-history and truncation machinery, expose the affine AC pencil,
+and explicitly declare no intrinsic noise. Integrators initialize their
+output at the supplied bias value; their AC pencil uses the dynamic equation.
+Arbitrary nonlinear analog model kernels, A-instance parsing, additional
+sequential models, mixed-signal UIC, periodic shooting, and mixed-signal AC and
+noise are not implemented by this interface.
 ADC crossing detection is based on accepted and trial endpoint samples;
 nonmonotone crossings wholly within one analog step require a suitable analog
 maximum timestep.

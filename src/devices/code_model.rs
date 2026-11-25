@@ -1,7 +1,8 @@
 //! Native digital code-model semantics, independent of the event scheduler.
-//! Truth tables follow upstream XSPICE d_and, d_or, d_xor and related gates.
+//! Truth tables follow upstream XSPICE `d_and`, `d_or`, `d_xor` and related gates.
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
+pub mod analog;
 
 /// Three-valued digital logic.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -80,7 +81,7 @@ impl Drive {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DelayMode {
     /// Preserve transitions in delivery order; an earlier newly posted
-    /// output supersedes later pending transitions (upstream EVTqueue_output).
+    /// output supersedes later pending transitions (upstream `EVTqueue_output`).
     Transport,
     /// Replace an outstanding transition when the desired value changes.
     Inertial,
@@ -106,14 +107,13 @@ impl Delays {
     }
 
     /// Select delay by target state, with unknown transitions using the
-    /// previous state (upstream d_and/cfunc.mod).
+    /// previous state (upstream `d_and/cfunc.mod`).
     #[must_use]
     pub const fn transition(self, previous: Logic, next: Logic) -> Real {
         match next {
             Logic::One => self.rise,
-            Logic::Zero => self.fall,
             Logic::Unknown if matches!(previous, Logic::Zero) => self.rise,
-            Logic::Unknown => self.fall,
+            Logic::Zero | Logic::Unknown => self.fall,
         }
     }
 }
@@ -342,7 +342,7 @@ impl CodeModel for DFlipFlop {
 }
 
 /// Single-channel ADC thresholds; low > high selects Schmitt hysteresis
-/// (upstream adc_bridge/cfunc.mod).
+/// (upstream `adc_bridge/cfunc.mod`).
 #[derive(Clone, Copy, Debug)]
 pub struct Adc {
     low: Real,
@@ -469,7 +469,7 @@ impl Dac {
 }
 
 /// Voltage DAC configuration. Rise and fall are full-scale transition times
-/// (dac_bridge/cfunc.mod); a partially completed transition slews from the
+/// (`dac_bridge/cfunc.mod`); a partially completed transition slews from the
 /// present output, not from the previous target.
 #[derive(Clone, Copy, Debug)]
 pub struct DacConfig {
@@ -556,12 +556,16 @@ impl DacRamp {
         }
     }
 
-    pub(crate) fn same_target(self, other: Self) -> bool {
+    pub(crate) const fn same_target(self, other: Self) -> bool {
         self.target.to_bits() == other.target.to_bits()
     }
 
-    pub(crate) fn next_break(self, time: Real) -> Option<Real> {
-        (self.end > time).then_some(self.end)
+    pub(crate) const fn next_break(self, time: Real) -> Option<Real> {
+        if self.end > time {
+            Some(self.end)
+        } else {
+            None
+        }
     }
 }
 

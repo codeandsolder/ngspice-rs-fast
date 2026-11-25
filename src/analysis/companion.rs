@@ -478,7 +478,7 @@ impl ReadyStep {
 
     /// A digital or DAC-ramp boundary is not merged into the analog source
     /// breakpoint table: distinct physical event times must not be lost to
-    /// its CKTminBreak coalescing policy.
+    /// its `CKTminBreak` coalescing policy.
     fn limit_to_event(&mut self, at: Real) {
         let distance = at - self.clock.time;
         if self.clock.next.delta >= distance {
@@ -736,10 +736,10 @@ pub fn mixed_signal_transient(
     Ok((plot, stats))
 }
 
-/// Streaming form of [mixed_signal_transient].
+/// Streaming form of [`mixed_signal_transient`].
 ///
 /// # Errors
-/// As [mixed_signal_transient], and any sink failure.
+/// As [`mixed_signal_transient`], and any sink failure.
 pub fn mixed_signal_transient_into(
     circuit: &mut Circuit,
     request: &AnalysisPlan,
@@ -1078,16 +1078,7 @@ impl Driver<'_> {
             if let Some(at) = next_sample {
                 ready.limit_to_sample(at);
             }
-            if let Some(mixed) = self.mixed.as_deref() {
-                if mixed.boundary() && time > 0. {
-                    ready.clock.next.order = Order::One;
-                    ready.clock.next.delta =
-                        ready.clock.next.delta.min(0.1 * ready.clock.save_delta);
-                }
-                if let Some(at) = mixed.next_boundary(time)? {
-                    ready.limit_to_event(at);
-                }
-            }
+            self.limit_mixed_step(&mut ready, time)?;
             accepted = self.advance(
                 ready,
                 solution,
@@ -1229,6 +1220,54 @@ impl Driver<'_> {
         })
     }
 
+    fn limit_mixed_step(&self, ready: &mut ReadyStep, time: Real) -> SpiceResult<()> {
+        if let Some(mixed) = self.mixed.as_deref() {
+            if mixed.boundary() && time > 0. {
+                ready.clock.next.order = Order::One;
+                ready.clock.next.delta = ready.clock.next.delta.min(0.1 * ready.clock.save_delta);
+            }
+            if let Some(at) = mixed.next_boundary(time)? {
+                ready.limit_to_event(at);
+            }
+        }
+        Ok(())
+    }
+
+    fn mixed_retry(
+        &self,
+        attempt: &AttemptedStep,
+        solution: &Vector,
+    ) -> SpiceResult<Option<NextStep>> {
+        let Some(mixed) = self.mixed.as_deref() else {
+            return Ok(None);
+        };
+        let time = attempt.clock.time;
+        let min_step = self.settings.min_step();
+        if let Some(at) = mixed.first_crossing(self.circuit, solution, time)?
+            && time - at > min_step
+        {
+            let delta = at - (time - attempt.clock.next.delta);
+            if delta > min_step {
+                return Ok(Some(NextStep {
+                    delta,
+                    order: Order::One,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn prepare_mixed_point(
+        &self,
+        solution: &Vector,
+        time: Real,
+    ) -> SpiceResult<Option<super::digital::MixedPoint>> {
+        self.mixed
+            .as_deref()
+            .map(|mixed| mixed.prepare_point(self.circuit, solution, time))
+            .transpose()
+    }
+
     /// Advance through rejected trials. Only Newton's starting iterate moves
     /// between attempts; device and integration histories remain accepted-only.
     fn advance(
@@ -1276,27 +1315,13 @@ impl Driver<'_> {
                     ready = attempt.retry(next, min_step)?;
                 }
                 Trial::Converged { x, state } => {
-                    // Locate a newly discovered ADC threshold before accepting
-                    // the analog candidate. The rejected candidate has never
-                    // changed event state or DAC forcing.
-                    if let Some(mixed) = self.mixed.as_deref()
-                        && let Some(at) =
-                            mixed.first_crossing(self.circuit, &x, attempt.clock.time)?
-                        && attempt.clock.time - at > min_step
-                    {
-                        let base = attempt.clock.time - attempt.clock.next.delta;
-                        let next = NextStep {
-                            delta: at - base,
-                            order: Order::One,
-                        };
-                        if next.delta > min_step {
-                            iterate = x;
-                            self.stats.rejected += 1;
-                            drop(prepared);
-                            ready = attempt.retry(next, min_step)?;
-                            ready.boundary = Boundary::Forced;
-                            continue;
-                        }
+                    if let Some(next) = self.mixed_retry(&attempt, &x)? {
+                        iterate = x;
+                        self.stats.rejected += 1;
+                        drop(prepared);
+                        ready = attempt.retry(next, min_step)?;
+                        ready.boundary = Boundary::Forced;
+                        continue;
                     }
                     let decision =
                         attempt.decision(&self.settings, &self.steps, |coefficients| {
@@ -1310,13 +1335,7 @@ impl Driver<'_> {
                             ready = attempt.retry(next, min_step)?;
                         }
                         StepDecision::Accept(next) => {
-                            let mixed_point = self
-                                .mixed
-                                .as_deref()
-                                .map(|mixed| {
-                                    mixed.prepare_point(self.circuit, &x, attempt.clock.time)
-                                })
-                                .transpose()?;
+                            let mixed_point = self.prepare_mixed_point(&x, attempt.clock.time)?;
                             let observed = if attempt.clock.time < self.settings.start
                                 || sample_at.is_some_and(|at| {
                                     !almost_equal_ulps(attempt.clock.time, at, 100)

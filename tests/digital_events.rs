@@ -320,3 +320,88 @@ fn analog_ramp_drives_delayed_inverter_and_slewing_dac() -> SpiceResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn analog_code_models_share_companion_history_and_ac_pencil() -> SpiceResult<()> {
+    use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, companion_transient};
+    use ngspice_rs::devices::code_model::analog::{AnalogCodeModel, Dynamics};
+    use ngspice_rs::devices::{Circuit, ModelContext};
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use ngspice_rs::primitives::{AnalysisKind, NodeId};
+    use std::path::Path;
+
+    let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("analog.cir"),
+        "native analog models\nv1 in 0 dc 0 pwl(0 0 1u 1 2m 1) ac 1\nr1 amp 0 1k\nr2 filt 0 1k\nr3 integ 0 1k\n.end\n"))?;
+    let mut circuit = Circuit::from_netlist(&netlist)?;
+    let input = circuit.nodes().get("in").unwrap();
+    for (name, node, dynamics, gain, offset) in [
+        ("again", "amp", Dynamics::Gain, -2., 0.5),
+        (
+            "afilter",
+            "filt",
+            Dynamics::LowPass {
+                time_constant: 100e-6,
+            },
+            2.,
+            0.,
+        ),
+        (
+            "aint",
+            "integ",
+            Dynamics::Integrator {
+                initial_output: 0.1,
+            },
+            1000.,
+            0.,
+        ),
+    ] {
+        let output = circuit.nodes().get(node).unwrap();
+        circuit.add_device(Box::new(AnalogCodeModel::new(
+            name,
+            [output, NodeId::GROUND],
+            [input, NodeId::GROUND],
+            dynamics,
+            gain,
+            offset,
+        )?))?;
+    }
+    circuit.finalize()?;
+    let plan = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "1m", "0", "1u"])
+        .resolve()?;
+    let (plot, _) = companion_transient(&mut circuit, &plan, &AnalysisContext::default())?;
+    let last = plot.point_count() - 1;
+    let t = plot.value("time", last).unwrap().re;
+    let v = |node| plot.value(node, last).unwrap().re;
+    assert!((v("v(amp)") + 1.5).abs() < 1e-10);
+    // For a linear ramp of length r followed by a unit step hold, the
+    // first-order response is 2 - 2*tau/r*(1-exp(-r/tau))*exp(-(t-r)/tau).
+    let tau: f64 = 100e-6;
+    let r: f64 = 1e-6;
+    let filtered = 2. + 2. * tau / r * (-r / tau).exp_m1() * (-(t - r) / tau).exp();
+    assert!((v("v(filt)") - filtered).abs() < 2e-4);
+    assert!(
+        (v("v(integ)") - (0.1 + 1000. * (t - r / 2.))).abs() < 2e-5,
+        "actual integrator voltage {}",
+        v("v(integ)")
+    );
+    let ac = circuit.linear_system_with_context(&ModelContext::default())?;
+    for (name, node, a, e) in [
+        ("again", "amp", 1., 0.),
+        ("afilter", "filt", 1., tau),
+        ("aint", "integ", 0., 1.),
+    ] {
+        let index = circuit
+            .devices()
+            .iter()
+            .position(|dev| dev.name() == name)
+            .unwrap();
+        let branch = circuit.branch_rows(index).unwrap().start;
+        let row = circuit
+            .unknowns()
+            .node_row(circuit.nodes().get(node).unwrap())
+            .unwrap();
+        assert_eq!(ac.a.get(branch, row), a);
+        assert_eq!(ac.e.get(branch, row), e);
+    }
+    Ok(())
+}
