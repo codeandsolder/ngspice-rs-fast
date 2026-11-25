@@ -182,14 +182,23 @@ wave histories.
 Histories retain only the delay window needed by the next stage or
 terminal and the boundary knots needed for front protection. To prevent
 combinatorial growth of secondary reflection knots, the solver may replace
-a curve by an endpoint-preserving chord or two-segment tent. It protects
+a curve by an endpoint-preserving chord or two-segment tent whose peak
+is at an existing knot, avoiding synthetic arrival times. It protects
 first physical arrivals and straight modal flights, bounds the normalized
 interpolation error independently in every affine component (the known
 wave uses its current causal history-window amplitude as a scale), and checks
 the wave-energy Gram inequality over every prefix of the replaced
-interval. A cubic Bernstein certificate proves the latter for arbitrary
+interval. For a scattering matrix S, a certified upper bound q on its
+squared operator norm allows the inequality q E_reduced <= E_exact:
+summing this bound over the output channels yields total outgoing
+energy no greater than the incident energy. The bound is prepared with
+outward-rounded Gram entries and either Gershgorin or interval LDL
+positive pivots. Half of any certified strict dissipation is reserved;
+when no margin is proven, q=1 retains the original per-wave contraction.
+A cubic Bernstein certificate enforces every prefix for arbitrary
 combinations of endpoint increments; inconclusive certificates trigger
-subdivision rather than unverified reduction. As with other numerical
+subdivision rather than unverified reduction. The waveform-error
+tolerance is unchanged. As with other numerical
 integration tolerances, local waveform error is not a global pointwise
 error bound. Reduce `reltol` to refine the history approximation.
 

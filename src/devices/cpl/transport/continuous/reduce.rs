@@ -2,7 +2,8 @@
 //!
 //! Keep the endpoints of each protected interval exactly. A chord or a
 //! two-segment tent replaces its interior only if it satisfies both a
-//! componentwise interpolation error bound and the L2 Gram inequality.
+//! componentwise interpolation error bound and the L2 Gram inequality
+//! with the certified static scattering norm as its energy factor.
 //! The latter holds for every linear combination of affine trial columns,
 //! not merely the currently estimated Newton endpoint.
 use super::{Knot, Real, WaveValue};
@@ -135,10 +136,17 @@ struct Reduction<'a, Value> {
     peak_time: Real,
     normalized: Vec<Real>,
     tolerance: Real,
+    energy_factor: Real,
 }
 
 impl<'a, Value: WaveValue> Reduction<'a, Value> {
-    fn new(knots: &'a [Knot<Value>], width: usize, tolerance: Real, known_scale: Real) -> Self {
+    fn new(
+        knots: &'a [Knot<Value>],
+        width: usize,
+        tolerance: Real,
+        known_scale: Real,
+        energy_factor: Real,
+    ) -> Self {
         let mut indices = Vec::new();
         let mut scales = Vec::new();
         let mut error_weights = Vec::new();
@@ -202,6 +210,7 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
             peak_time,
             normalized,
             tolerance,
+            energy_factor,
         }
     }
 
@@ -321,7 +330,7 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
                     chord_tent(a[i], b[i], self.split) * correction[j],
                 );
                 let energy = base + cross + correction[i] * correction[j] / 3.;
-                let value = difference[i * order + j] - energy;
+                let value = (-self.energy_factor).mul_add(energy, difference[i * order + j]);
                 difference[i * order + j] = value;
                 difference[j * order + i] = value;
             }
@@ -345,11 +354,18 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
                 let approx_last = correction[0]
                     .mul_add(tent(right, self.split), chord(begin[0], finish[0], right));
                 let c0 = mass[0];
-                let c1 =
-                    duration.mul_add(first[0].mul_add(first[0], -approx_first * approx_first), c0);
-                let c2 =
-                    duration.mul_add(first[0].mul_add(last[0], -approx_first * approx_last), c1);
-                let c3 = duration.mul_add(last[0].mul_add(last[0], -approx_last * approx_last), c2);
+                let c1 = duration.mul_add(
+                    first[0].mul_add(first[0], -self.energy_factor * approx_first * approx_first),
+                    c0,
+                );
+                let c2 = duration.mul_add(
+                    first[0].mul_add(last[0], -self.energy_factor * approx_first * approx_last),
+                    c1,
+                );
+                let c3 = duration.mul_add(
+                    last[0].mul_add(last[0], -self.energy_factor * approx_last * approx_last),
+                    c2,
+                );
                 mass[0] = c3;
                 return scalar_bernstein([c0, c1, c2, c3], 8);
             }
@@ -368,16 +384,22 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
                 for j in i..order {
                     let entry = i * order + j;
                     let transpose = j * order + i;
-                    let q0 = first[i].mul_add(first[j], -approx_first[i] * approx_first[j]);
+                    let q0 = first[i].mul_add(
+                        first[j],
+                        -self.energy_factor * approx_first[i] * approx_first[j],
+                    );
                     let q1 = 0.5
                         * approx_last[i].mul_add(
-                            -approx_first[j],
+                            -self.energy_factor * approx_first[j],
                             approx_first[i].mul_add(
-                                -approx_last[j],
+                                -self.energy_factor * approx_last[j],
                                 last[i].mul_add(first[j], first[i] * last[j]),
                             ),
                         );
-                    let q2 = last[i].mul_add(last[j], -approx_last[i] * approx_last[j]);
+                    let q2 = last[i].mul_add(
+                        last[j],
+                        -self.energy_factor * approx_last[i] * approx_last[j],
+                    );
                     let c1 = duration.mul_add(q0, mass[entry]);
                     let c2 = duration.mul_add(q1, c1);
                     let c3 = duration.mul_add(q2, c2);
@@ -466,7 +488,7 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
             let (a, b) = self.endpoints();
             let q = chord_tent(a[0], b[0], self.split);
             let base = product_integral(a[0], b[0], a[0], b[0]);
-            let discriminant = q.mul_add(q, (gram[0] - base) / 3.);
+            let discriminant = q.mul_add(q, (gram[0] / self.energy_factor - base) / 3.);
             if discriminant >= 0. {
                 let radius = 3. * discriminant.sqrt();
                 Some(vec![
@@ -593,6 +615,7 @@ pub(super) fn reduce<Value: WaveValue>(
     width: usize,
     tolerance: Real,
     known_scale: Real,
+    energy_factor: Real,
     output: &mut Vec<Knot<Value>>,
 ) {
     if knots.len() < 2 {
@@ -604,7 +627,13 @@ pub(super) fn reduce<Value: WaveValue>(
             output.push(knots[last].clone());
             continue;
         }
-        let candidate = Reduction::new(&knots[first..=last], width, tolerance, known_scale);
+        let candidate = Reduction::new(
+            &knots[first..=last],
+            width,
+            tolerance,
+            known_scale,
+            energy_factor,
+        );
         match candidate.choose() {
             Choice::Chord => output.push(knots[last].clone()),
             Choice::Tent(wave) => {
@@ -647,7 +676,7 @@ mod tests {
                 }
             })
             .collect();
-        let candidate = Reduction::new(&knots, 1, 1., 0.);
+        let candidate = Reduction::new(&knots, 1, 1., 0., 1.);
         assert_ne!(candidate.split, 0.5);
         let peak = candidate.split;
         let correction = [0.2];
@@ -671,10 +700,23 @@ mod tests {
                 time,
                 wave: Affine::scalar(value),
             });
-        let reduction = Reduction::new(&knots, 1, 1., 0.);
+        let reduction = Reduction::new(&knots, 1, 1., 0., 1.);
         let correction = [0.];
         assert!(reduction.contractive(&reduction.gram(), &correction));
         assert!(!reduction.prefix_contracts(&correction, &reduction.midpoint()));
+    }
+
+    #[test]
+    fn certified_dissipation_allows_chord_without_changing_error_tolerance() {
+        let knots = [(0., 1.), (0.5, 0.999), (1., 1.)].map(|(time, wave)| Knot { time, wave });
+        let strict = Reduction::new(&knots, 1, 0.002, 0., 1.);
+        let margin = Reduction::new(&knots, 1, 0.002, 0., 0.99);
+        assert!(!strict.prefix_contracts(&[0.], &strict.midpoint()));
+        assert!(margin.prefix_contracts(&[0.], &margin.midpoint()));
+        assert!(matches!(margin.choose(), Choice::Chord));
+        let mut output = vec![knots[0].clone()];
+        reduce(&knots, 1, 0.0001, 0., 0.99, &mut output);
+        assert_eq!(output, knots);
     }
 
     #[test]
@@ -692,7 +734,8 @@ mod tests {
                 Knot { time, wave }
             })
             .collect();
-        check_affine_reduction(&knots, false);
+        check_affine_reduction(&knots, false, 1.);
+        check_affine_reduction(&knots, false, 0.99);
         let proportional: Vec<_> = knots
             .iter()
             .map(|knot| {
@@ -705,12 +748,13 @@ mod tests {
                 }
             })
             .collect();
-        check_affine_reduction(&proportional, true);
+        check_affine_reduction(&proportional, true, 1.);
+        check_affine_reduction(&proportional, true, 0.99);
     }
 
-    fn check_affine_reduction(knots: &[Knot], must_reduce: bool) {
+    fn check_affine_reduction(knots: &[Knot], must_reduce: bool, energy_factor: Real) {
         let mut reduced = vec![knots[0].clone()];
-        reduce(knots, 3, 1e-3, 0., &mut reduced);
+        reduce(knots, 3, 1e-3, 0., energy_factor, &mut reduced);
         if must_reduce {
             assert!(reduced.len() < knots.len());
         }
@@ -730,7 +774,7 @@ mod tests {
                 let v = sample(&reduced, b, 0.).unwrap().evaluate(&delta);
                 exact_energy += (b - a) * product_integral(x, y, x, y);
                 reduced_energy += (b - a) * product_integral(u, v, u, v);
-                assert!(reduced_energy <= exact_energy + 1e-12);
+                assert!(energy_factor * reduced_energy <= exact_energy + 1e-12);
                 assert!((u - x).abs() <= 1e-3 * (1. + delta[0].abs() + delta[1].abs()));
             }
         }

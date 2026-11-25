@@ -5,7 +5,10 @@
 //! neighboring stage or terminal. Trial waveforms are affine in the new
 //! boundary endpoint, and reduction preserves endpoints, causal fronts
 //! and the wave-energy inequality for every affine combination.
+mod energy;
 mod reduce;
+
+use energy::scattering_energy_factor;
 
 use super::{LossyPlan, Real, SpiceResult, invalid};
 
@@ -334,6 +337,7 @@ pub(super) struct ContinuousPlan {
     scattering_rows: Vec<Vec<(usize, Real)>>,
     boundary_retention: Vec<Real>,
     tolerance_divisor: Real,
+    energy_factor: Real,
 }
 
 impl ContinuousPlan {
@@ -426,6 +430,7 @@ impl ContinuousPlan {
                 scattering_rows[output].push((input, gain));
             }
         }
+        let energy_factor = scattering_energy_factor(&scattering_rows);
         Ok(Some(Self {
             step,
             delays,
@@ -434,6 +439,7 @@ impl ContinuousPlan {
             scattering_rows,
             boundary_retention,
             tolerance_divisor,
+            energy_factor,
         }))
     }
 
@@ -523,6 +529,7 @@ impl ContinuousPlan {
                 width,
                 tolerance,
                 known_scale,
+                self.energy_factor,
                 &mut output,
             );
             first = last;
