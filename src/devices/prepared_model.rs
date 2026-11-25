@@ -130,6 +130,7 @@ pub(super) struct SourceParameter {
 pub(super) struct SourceBinding {
     pub model_name: String,
     pub designator: char,
+    pub voltage_step_limiting: bool,
     pub parameters: &'static [SourceParameter],
     pub gmin_slot: Option<usize>,
     pub model_ambient: AmbientTemperature,
@@ -533,7 +534,9 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         self.artifact.descriptor().noise == Capability::Computed
     }
     fn limits_voltage_steps(&self) -> bool {
-        false
+        self.source
+            .as_ref()
+            .is_some_and(|source| source.voltage_step_limiting)
     }
     fn setup_matrix(
         &self,
@@ -602,7 +605,8 @@ impl<K: Kernel> Device for PreparedDevice<K> {
             crate::devices::sweep::ParameterKey::Native(name) => {
                 return self.source_parameter(name).map(|parameter| parameter.name);
             }
-            crate::devices::sweep::ParameterKey::Prepared(slot) => slot,
+            crate::devices::sweep::ParameterKey::Prepared(slot) if self.source.is_none() => slot,
+            _ => return None,
         };
         self.artifact
             .descriptor()
