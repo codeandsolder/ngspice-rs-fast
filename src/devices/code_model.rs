@@ -141,15 +141,46 @@ pub struct EventContext {
     pub initial: bool,
 }
 
+/// Number of ordered input and output ports in one signal domain.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PortCount {
+    /// Input ports.
+    pub inputs: usize,
+    /// Output ports.
+    pub outputs: usize,
+}
+
+/// Native code-model terminal schema. Each analog voltage port is a
+/// differential terminal pair; each digital port is one resolved event net.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModelSchema {
+    /// Analog voltage ports.
+    pub analog_voltage: PortCount,
+    /// Digital event ports.
+    pub digital: PortCount,
+}
+
+impl ModelSchema {
+    /// A model with digital ports only.
+    #[must_use]
+    pub const fn digital(inputs: usize, outputs: usize) -> Self {
+        Self {
+            analog_voltage: PortCount {
+                inputs: 0,
+                outputs: 0,
+            },
+            digital: PortCount { inputs, outputs },
+        }
+    }
+}
+
 /// Immutable native digital model with typed, cloneable state. State must
 /// not share mutable data between clones; the scheduler owns trial copies.
 pub trait CodeModel: std::fmt::Debug + Send + Sync + 'static {
     /// Model-defined state, including arbitrary counters and numerical data.
     type State: Clone + std::fmt::Debug + Send + Sync + 'static;
-    /// Digital input count.
-    fn input_count(&self) -> usize;
-    /// Digital output count.
-    fn output_count(&self) -> usize;
+    /// Ordered ports and their signal domains.
+    fn schema(&self) -> ModelSchema;
     /// Initial model-defined state.
     fn initial_state(&self) -> Self::State;
     /// Evaluate the model against resolved inputs.
@@ -262,11 +293,8 @@ impl Gate {
 
 impl CodeModel for Gate {
     type State = ();
-    fn input_count(&self) -> usize {
-        self.inputs
-    }
-    fn output_count(&self) -> usize {
-        1
+    fn schema(&self) -> ModelSchema {
+        ModelSchema::digital(self.inputs, 1)
     }
     fn initial_state(&self) -> Self::State {}
     fn evaluate(
@@ -287,7 +315,8 @@ impl CodeModel for Gate {
 }
 
 /// Positive-edge D flip-flop, with D and clock inputs and Q/complement outputs.
-/// Ambiguous clock edges merge the possible stored results.
+/// As in upstream `d_dff`, a change to ONE captures D; changes to ZERO
+/// or UNKNOWN retain the previous state.
 #[derive(Debug)]
 pub struct DFlipFlop {
     /// Initial Q.
@@ -300,11 +329,8 @@ pub struct DFlipFlop {
 
 impl CodeModel for DFlipFlop {
     type State = [Logic; 2];
-    fn input_count(&self) -> usize {
-        2
-    }
-    fn output_count(&self) -> usize {
-        2
+    fn schema(&self) -> ModelSchema {
+        ModelSchema::digital(2, 2)
     }
     fn initial_state(&self) -> Self::State {
         [Logic::Unknown, self.initial]
@@ -321,14 +347,8 @@ impl CodeModel for DFlipFlop {
         let [previous_clock, q] = state;
         if context.initial {
             *q = self.initial;
-        } else if *previous_clock == Logic::Zero && clock.logic == Logic::One {
+        } else if *previous_clock != Logic::One && clock.logic == Logic::One {
             *q = data.logic;
-        } else if *previous_clock != Logic::One
-            && clock.logic != Logic::Zero
-            && *previous_clock != clock.logic
-            && *q != data.logic
-        {
-            *q = Logic::Unknown;
         }
         *previous_clock = clock.logic;
         Ok([*q, q.invert()]
@@ -350,6 +370,21 @@ pub struct Adc {
 }
 
 impl Adc {
+    /// One differential voltage input and one digital output.
+    #[must_use]
+    pub const fn schema() -> ModelSchema {
+        ModelSchema {
+            analog_voltage: PortCount {
+                inputs: 1,
+                outputs: 0,
+            },
+            digital: PortCount {
+                inputs: 0,
+                outputs: 1,
+            },
+        }
+    }
+
     /// Construct finite thresholds.
     ///
     /// # Errors
@@ -397,6 +432,20 @@ impl Adc {
         if ![t0, v0, t1, v1].into_iter().all(Real::is_finite) || t0 < 0. || t1 <= t0 {
             return Err(SpiceError::circuit("invalid ADC crossing interval"));
         }
+        // A transition into an open voltage interval may start at its
+        // threshold (e.g. zero to unknown on a rising ordinary ADC input).
+        // In that case the driver must solve again just beyond the accepted
+        // point, rather than delay the transition until the next large step.
+        let adjacent = if v1 > v0 {
+            v0.next_up().min(v1)
+        } else if v1 < v0 {
+            v0.next_down().max(v1)
+        } else {
+            return Ok(None);
+        };
+        if self.sample(v0, previous)? == previous && self.sample(adjacent, previous)? != previous {
+            return Ok(Some(t0));
+        }
         let thresholds = if self.low > self.high {
             if v1 > v0 {
                 if previous == Logic::One {
@@ -434,7 +483,7 @@ impl Adc {
                 (v / scale - v0 / scale) / (v1 / scale - v0 / scale)
             };
             let time = fraction.mul_add(t1 - t0, t0);
-            (time > t0 && time < t1).then_some(time)
+            (time >= t0 && time < t1).then_some(time)
         }))
     }
 }
@@ -451,6 +500,21 @@ pub struct Dac {
 }
 
 impl Dac {
+    /// One digital input and one differential voltage output.
+    #[must_use]
+    pub const fn schema() -> ModelSchema {
+        ModelSchema {
+            analog_voltage: PortCount {
+                inputs: 0,
+                outputs: 1,
+            },
+            digital: PortCount {
+                inputs: 1,
+                outputs: 0,
+            },
+        }
+    }
+
     /// Convert a digital state to an analog target.
     ///
     /// # Errors

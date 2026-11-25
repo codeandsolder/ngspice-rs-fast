@@ -381,12 +381,14 @@ struct AcceptedCursor {
 struct ReadyStep {
     clock: StepClock,
     boundary: Boundary,
+    event_landing: Option<Real>,
 }
 
 struct AttemptedStep {
     clock: StepClock,
     boundary: Boundary,
     coefficients: Coefficients,
+    event_start: Option<Real>,
 }
 
 #[derive(PartialEq, Debug)]
@@ -456,7 +458,11 @@ impl AcceptedCursor {
             clock.save_delta = clock.next.delta;
             clock.next.delta = (breaks.first() - clock.time) / 2.0;
         }
-        Ok(ReadyStep { clock, boundary })
+        Ok(ReadyStep {
+            clock,
+            boundary,
+            event_landing: None,
+        })
     }
 }
 
@@ -481,16 +487,26 @@ impl ReadyStep {
     /// its `CKTminBreak` coalescing policy.
     fn limit_to_event(&mut self, at: Real) {
         let distance = at - self.clock.time;
-        if self.clock.next.delta >= distance {
-            self.clock.save_delta = self.clock.next.delta;
+        if distance > 0. && self.end_time() >= at {
+            if self.clock.next.delta > distance {
+                self.clock.save_delta = self.clock.next.delta;
+            }
             self.clock.next.delta = distance;
             self.boundary = Boundary::Forced;
+            self.event_landing = Some(at);
         }
     }
 
+    fn end_time(&self) -> Real {
+        self.event_landing
+            .unwrap_or(self.clock.time + self.clock.next.delta)
+    }
+
     fn begin(self, steps: &StepHistory, settings: &TransientPlan) -> SpiceResult<AttemptedStep> {
+        let end = self.end_time();
         let mut clock = self.clock;
-        clock.time += clock.next.delta;
+        let event_start = self.event_landing.map(|_| clock.time);
+        clock.time = end;
         let coefficients = steps.trial(
             settings.method,
             clock.next.order.number(),
@@ -501,6 +517,7 @@ impl ReadyStep {
             clock,
             boundary: self.boundary,
             coefficients,
+            event_start,
         })
     }
 }
@@ -510,7 +527,7 @@ impl AttemptedStep {
         let mut clock = self.clock;
         // C adds then subtracts; restoring the previous accepted time would
         // change rounding. Only this retry cursor, never the history, moves.
-        clock.time -= clock.next.delta;
+        clock.time = self.event_start.unwrap_or(clock.time - clock.next.delta);
         if next.delta <= min_step {
             if clock.next.delta > min_step {
                 next.delta = min_step;
@@ -525,6 +542,7 @@ impl AttemptedStep {
         Ok(ReadyStep {
             clock,
             boundary: self.boundary.retry(),
+            event_landing: None,
         })
     }
 
@@ -891,10 +909,10 @@ fn run_transient_inner(
             reference,
         ));
     }
-    // Unknown/ground nodes in .ic/.nodeset fail before anything is assembled.
+    // Resolve row-indexed hints only after topology changes have been finalized.
+    circuit.finalize()?;
     let hints = initial::resolve(circuit, request)?;
     let model_context = context.model_context();
-    circuit.finalize()?;
     let nonlinear = circuit.devices().iter().any(|d| d.is_nonlinear());
     let mut system = if nonlinear {
         circuit.small_signal_system(&model_context, &Vector::zeros(circuit.unknown_count()))?
@@ -1226,7 +1244,7 @@ impl Driver<'_> {
                 ready.clock.next.order = Order::One;
                 ready.clock.next.delta = ready.clock.next.delta.min(0.1 * ready.clock.save_delta);
             }
-            if let Some(at) = mixed.next_boundary(time)? {
+            if let Some(at) = mixed.next_ramp_boundary(time)? {
                 ready.limit_to_event(at);
             }
         }
@@ -1246,8 +1264,11 @@ impl Driver<'_> {
         if let Some(at) = mixed.first_crossing(self.circuit, solution, time)?
             && time - at > min_step
         {
-            let delta = at - (time - attempt.clock.next.delta);
-            if delta > min_step {
+            let start = attempt
+                .event_start
+                .unwrap_or(time - attempt.clock.next.delta);
+            let delta = (at - start).max(min_step).max(start.next_up() - start);
+            if delta < attempt.clock.next.delta {
                 return Ok(Some(NextStep {
                     delta,
                     order: Order::One,
@@ -1261,11 +1282,37 @@ impl Driver<'_> {
         &self,
         solution: &Vector,
         time: Real,
+        preview: Option<super::digital::EventPreview>,
     ) -> SpiceResult<Option<super::digital::MixedPoint>> {
         self.mixed
             .as_deref()
-            .map(|mixed| mixed.prepare_point(self.circuit, solution, time))
+            .map(|mixed| mixed.prepare_point(self.circuit, solution, time, preview))
             .transpose()
+    }
+
+    fn commit_mixed_point(&mut self, point: Option<super::digital::MixedPoint>) {
+        if let (Some(mixed), Some(point)) = (self.mixed.as_deref_mut(), point) {
+            mixed.commit_point(point);
+        }
+    }
+
+    fn preview_events(
+        &self,
+        ready: &mut ReadyStep,
+    ) -> SpiceResult<Option<super::digital::EventPreview>> {
+        let preview = self
+            .mixed
+            .as_deref()
+            .map(|mixed| mixed.preview(ready.end_time()))
+            .transpose()?
+            .flatten();
+        if let Some(time) = preview
+            .as_ref()
+            .and_then(super::digital::EventPreview::boundary)
+        {
+            ready.limit_to_event(time);
+        }
+        Ok(preview)
     }
 
     /// Advance through rejected trials. Only Newton's starting iterate moves
@@ -1286,6 +1333,7 @@ impl Driver<'_> {
                     self.settings.max_steps, ready.clock.time
                 )));
             }
+            let preview = self.preview_events(&mut ready)?;
             let attempt = ready.begin(&self.steps, &self.settings)?;
             let mut prepared = self.prepared.transient_attempt(
                 &self.history,
@@ -1335,7 +1383,8 @@ impl Driver<'_> {
                             ready = attempt.retry(next, min_step)?;
                         }
                         StepDecision::Accept(next) => {
-                            let mixed_point = self.prepare_mixed_point(&x, attempt.clock.time)?;
+                            let mixed_point =
+                                self.prepare_mixed_point(&x, attempt.clock.time, preview)?;
                             let observed = if attempt.clock.time < self.settings.start
                                 || sample_at.is_some_and(|at| {
                                     !almost_equal_ulps(attempt.clock.time, at, 100)
@@ -1365,11 +1414,7 @@ impl Driver<'_> {
                             drop(prepared);
                             let device_breaks =
                                 self.commit_point(Acceptance::Step(&attempt), &x, state)?;
-                            if let (Some(mixed), Some(point)) =
-                                (self.mixed.as_deref_mut(), mixed_point)
-                            {
-                                mixed.commit_point(point);
-                            }
+                            self.commit_mixed_point(mixed_point);
                             return Ok(AcceptedPoint {
                                 cursor: attempt.accept(next),
                                 solution: x,
@@ -1453,7 +1498,7 @@ impl Driver<'_> {
             let mixed_point = self
                 .mixed
                 .as_deref()
-                .map(|mixed| mixed.prepare_point(self.circuit, &x, 0.))
+                .map(|mixed| mixed.prepare_point(self.circuit, &x, 0., None))
                 .transpose()?;
             if let (Some(mixed), Some(point)) = (self.mixed.as_deref_mut(), mixed_point) {
                 let changed = mixed.initial_changed(&point)?;
@@ -1816,6 +1861,7 @@ mod step_control_tests {
                 phase: Phase::Continuing,
             },
             boundary: Boundary::Forced,
+            event_landing: None,
         }
     }
 

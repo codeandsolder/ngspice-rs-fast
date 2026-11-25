@@ -169,7 +169,9 @@ impl Network {
         inputs: &[NetId],
         outputs: &[NetId],
     ) -> SpiceResult<()> {
-        if model.input_count() != inputs.len() || model.output_count() != outputs.len() {
+        if model.schema()
+            != crate::devices::code_model::ModelSchema::digital(inputs.len(), outputs.len())
+        {
             return Err(SpiceError::circuit("digital model port count mismatch"));
         }
         for &net in inputs.iter().chain(outputs) {
@@ -398,6 +400,20 @@ impl State {
         limits: Limits,
         changes: &mut Vec<Change>,
     ) -> SpiceResult<()> {
+        self.advance_until(network, end, limits, changes, |_| Ok(false))?;
+        Ok(())
+    }
+
+    // Stop only after all delta cycles at a physical time settle. This
+    // allows a mixed run to preview digital work independently of MNA.
+    fn advance_until(
+        &mut self,
+        network: &Network,
+        end: Time,
+        limits: Limits,
+        changes: &mut Vec<Change>,
+        mut stop: impl FnMut(&Self) -> SpiceResult<bool>,
+    ) -> SpiceResult<bool> {
         if end < self.time {
             return Err(SpiceError::circuit("digital time cannot run backwards"));
         }
@@ -455,12 +471,20 @@ impl State {
             }
             self.stats.rounds += 1;
             self.evaluate_models(network, dirty, before, limits.work)?;
+            if self
+                .queue
+                .first_key_value()
+                .is_none_or(|(key, _)| key.time != self.time)
+                && stop(self)?
+            {
+                return Ok(true);
+            }
         }
         if self.time < end {
             self.time = end;
             self.delta = 0;
         }
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -677,6 +701,20 @@ pub struct MixedSignal {
     boundary: bool,
 }
 
+/// Disposable event work up to the requested analog horizon, or the first
+/// settled digital transition that changes a DAC target. Nothing is accepted.
+pub(super) struct EventPreview {
+    state: State,
+    changes: Vec<Change>,
+    boundary: Option<Real>,
+}
+
+impl EventPreview {
+    pub(super) const fn boundary(&self) -> Option<Real> {
+        self.boundary
+    }
+}
+
 /// Disposable mixed-signal result at one converged analog candidate.
 pub(super) struct MixedPoint {
     time: Time,
@@ -887,19 +925,56 @@ impl MixedSignal {
         Ok(earliest)
     }
 
-    /// Earliest known physical boundary affecting the analog output.
-    pub(super) fn next_boundary(&self, now: Real) -> SpiceResult<Option<Real>> {
-        let mut next = if self.dacs.is_empty() {
-            None
-        } else {
-            self.engine.next_event_time()
-        };
+    /// Earliest end of an accepted DAC ramp.
+    pub(super) fn next_ramp_boundary(&self, now: Real) -> SpiceResult<Option<Real>> {
+        let mut next: Option<Real> = None;
         for dac in &self.dacs {
             if let Some(end) = dac.port.ramp()?.next_break(now) {
                 next = Some(next.map_or(end, |old| old.min(end)));
             }
         }
         Ok(next.filter(|time| *time > now))
+    }
+
+    /// Process queued events only as far as the first actual DAC target
+    /// change, rather than forcing an analog solve for every digital event.
+    /// Reuse this state on acceptance if the analog endpoint is unchanged.
+    pub(super) fn preview(&self, horizon: Real) -> SpiceResult<Option<EventPreview>> {
+        if self.dacs.is_empty()
+            || self
+                .engine
+                .next_event_time()
+                .is_none_or(|next| next > horizon)
+        {
+            return Ok(None);
+        }
+        let end = Time::new(horizon)?;
+        let mut state = self.engine.accepted.clone();
+        let mut changes = Vec::new();
+        let landed = state.advance_until(
+            &self.engine.network,
+            end,
+            self.engine.limits,
+            &mut changes,
+            |trial| {
+                for dac in &self.dacs {
+                    let old = dac
+                        .config
+                        .target(self.engine.accepted.nets[dac.net.0].logic)?;
+                    let new = dac.config.target(trial.nets[dac.net.0].logic)?;
+                    if old.to_bits() != new.to_bits() {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            },
+        )?;
+        let boundary = landed.then_some(state.time.value());
+        Ok(Some(EventPreview {
+            state,
+            changes,
+            boundary,
+        }))
     }
 
     pub(super) const fn boundary(&self) -> bool {
@@ -911,6 +986,7 @@ impl MixedSignal {
         circuit: &Circuit,
         solution: &Vector,
         time: Real,
+        preview: Option<EventPreview>,
     ) -> SpiceResult<MixedPoint> {
         let end = Time::new(time)?;
         if end < self.engine.accepted.time {
@@ -954,17 +1030,23 @@ impl MixedSignal {
         if !events_due && updates.is_empty() {
             return Ok(point);
         }
-        let mut state = self.engine.accepted.clone();
-        // Before the first event round, seed all ADC drivers at t=0. During
-        // transient, queued events precede the hybrid callback at this point.
-        if state.initialized {
-            state.advance(
-                &self.engine.network,
-                end,
-                self.engine.limits,
-                &mut point.changes,
-            )?;
-        }
+        let mut state = if let Some(preview) = preview.filter(|p| p.state.time == end) {
+            point.changes = preview.changes;
+            preview.state
+        } else {
+            let mut state = self.engine.accepted.clone();
+            // Before the first event round, seed ADC drivers at t=0. During
+            // transient, queued events precede the hybrid callback.
+            if state.initialized {
+                state.advance(
+                    &self.engine.network,
+                    end,
+                    self.engine.limits,
+                    &mut point.changes,
+                )?;
+            }
+            state
+        };
         for (driver, output) in updates {
             state.model_output(driver, output)?;
         }

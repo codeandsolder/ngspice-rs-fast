@@ -64,6 +64,21 @@ pub struct AnalogCodeModel {
 }
 
 impl AnalogCodeModel {
+    /// One differential voltage input and one differential voltage output.
+    #[must_use]
+    pub const fn schema() -> super::ModelSchema {
+        super::ModelSchema {
+            analog_voltage: super::PortCount {
+                inputs: 1,
+                outputs: 1,
+            },
+            digital: super::PortCount {
+                inputs: 0,
+                outputs: 0,
+            },
+        }
+    }
+
     /// Construct a gain, low-pass, or unsaturated integrator kernel.
     ///
     /// `offset` is the additive right-hand-side term, in volts for gain and

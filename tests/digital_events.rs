@@ -177,7 +177,11 @@ fn adc_thresholds_and_dac_targets() -> SpiceResult<()> {
     let adc = Adc::new(0.8, 2.)?;
     assert_eq!(adc.sample(1.2, Logic::One)?, Logic::Unknown);
     assert_eq!(adc.crossing((0., 0.), (3., 3.), Logic::Zero)?, Some(0.8));
+    assert_eq!(adc.crossing((0., 0.8), (1., 1.2), Logic::Zero)?, Some(0.));
+    assert_eq!(adc.crossing((0., 2.), (1., 1.2), Logic::One)?, Some(0.));
+    assert_eq!(adc.crossing((0., 0.8), (1., 0.8), Logic::Zero)?, None);
     let schmitt = Adc::new(2., 0.8)?;
+    assert_eq!(schmitt.crossing((0., 0.8), (1., 1.2), Logic::Zero)?, None);
     assert_eq!(schmitt.sample(1.2, Logic::One)?, Logic::One);
     assert_eq!(schmitt.sample(1.2, Logic::Zero)?, Logic::Zero);
     assert_eq!(schmitt.sample(2., Logic::Zero)?, Logic::One);
@@ -402,6 +406,458 @@ fn analog_code_models_share_companion_history_and_ac_pencil() -> SpiceResult<()>
             .unwrap();
         assert_eq!(ac.a.get(branch, row), a);
         assert_eq!(ac.e.get(branch, row), e);
+    }
+    let ac_plan =
+        AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "3", "100", "10000"]).resolve()?;
+    let response = ac_plan.run(&mut circuit, &AnalysisContext::default())?;
+    for row in 0..response.point_count() {
+        let w = std::f64::consts::TAU * response.value("frequency", row).unwrap().re;
+        let x = w * tau;
+        let gain = response.value("v(amp)", row).unwrap();
+        let filter = response.value("v(filt)", row).unwrap();
+        let integral = response.value("v(integ)", row).unwrap();
+        assert!((gain.re + 2.).abs() < 1e-10 && gain.im.abs() < 1e-10);
+        assert!((filter.re - 2. / (1. + x * x)).abs() < 1e-10);
+        assert!((filter.im + 2. * x / (1. + x * x)).abs() < 1e-10);
+        assert!(integral.re.abs() < 1e-10 && (integral.im + 1000. / w).abs() < 1e-10);
+    }
+    Ok(())
+}
+
+fn run_feedback() -> SpiceResult<(ngspice_rs::analysis::Plot, Vec<f64>)> {
+    use ngspice_rs::analysis::digital::{AdcBinding, MixedSignal};
+    use ngspice_rs::analysis::{AnalysisContext, RunConfig, mixed_signal_transient};
+    use ngspice_rs::devices::code_model::DacConfig;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use ngspice_rs::primitives::NodeId;
+    use std::path::Path;
+
+    let deck = parse_deck_text(
+        Path::new("feedback.cir"),
+        "mixed RC feedback\nr1 out cap 1k\nc1 cap 0 100n\n.ic v(cap)=0\n.tran 5u 600u 0 500n\n.end\n",
+    );
+    let netlist = Parser::new().parse_deck(&deck)?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let mut circuit = config.circuit(&netlist)?;
+    let plan = config.plan_for(&netlist.analyses[0])?;
+    let cap = circuit.nodes().get("cap").unwrap();
+    let out = circuit.nodes().get("out").unwrap();
+    let mut network = Network::default();
+    let din = network.add_net();
+    let dout = network.add_net();
+    let source = network.add_source(din)?;
+    let delay = Delays::new(500e-9, 500e-9)?;
+    network.add_model(
+        Gate::new(GateKind::Inverter, 1, delay, DelayMode::Transport)?,
+        &[din],
+        &[dout],
+    )?;
+    let mut mixed = MixedSignal::new(Engine::new(network, Limits::default())?);
+    mixed.add_adc(AdcBinding {
+        terminals: [cap, NodeId::GROUND],
+        source,
+        thresholds: Adc::new(2., 1.)?,
+        delays: delay,
+        mode: DelayMode::Transport,
+    })?;
+    mixed.add_dac(
+        &mut circuit,
+        "adac",
+        [out, NodeId::GROUND],
+        dout,
+        DacConfig::new(
+            Dac {
+                low: 0.,
+                high: 3.,
+                unknown: 1.5,
+            },
+            Delays::new(1e-6, 1e-6)?,
+        )?,
+    )?;
+    let (plot, _) =
+        mixed_signal_transient(&mut circuit, &plan, &AnalysisContext::default(), &mut mixed)?;
+    let transitions = mixed
+        .changes()
+        .iter()
+        .filter(|change| change.net == dout && change.time > 0.)
+        .map(|change| change.time + 500e-9)
+        .collect();
+    Ok((plot, transitions))
+}
+
+#[test]
+fn mixed_schmitt_feedback_oscillates_with_physical_delays() -> SpiceResult<()> {
+    let (plot, transitions) = run_feedback()?;
+    assert_eq!(plot.value("v(cap)", 0).unwrap().re, 0.);
+    assert_eq!(plot.value("v(out)", 0).unwrap().re, 3.);
+    assert_eq!(transitions.len(), 7, "{transitions:?}");
+    // RC rises from zero to 2 V with a 3 V asymptote. Later half-cycles
+    // traverse the Schmitt band with finite bridge propagation and slew.
+    assert!(
+        (transitions[0] - (100e-6 * 3_f64.ln() + 1.5e-6)).abs() < 100e-9,
+        "{transitions:?}"
+    );
+    for pair in transitions.windows(2) {
+        assert!(
+            (pair[1] - pair[0] - 71.575e-6).abs() < 200e-9,
+            "{transitions:?}"
+        );
+    }
+    for point in 0..plot.point_count() {
+        let cap = plot.value("v(cap)", point).unwrap().re;
+        let out = plot.value("v(out)", point).unwrap().re;
+        assert!((-1e-8..=3. + 1e-8).contains(&cap));
+        assert!((-1e-8..=3. + 1e-8).contains(&out));
+    }
+    Ok(())
+}
+
+#[test]
+fn unrelated_digital_events_do_not_force_analog_steps() -> SpiceResult<()> {
+    use ngspice_rs::analysis::digital::MixedSignal;
+    use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, mixed_signal_transient};
+    use ngspice_rs::devices::{Circuit, code_model::DacConfig};
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use ngspice_rs::primitives::{AnalysisKind, NodeId};
+    use std::path::Path;
+
+    let run = |event_count: u32| -> SpiceResult<_> {
+        let deck = parse_deck_text(
+            Path::new("density.cir"),
+            "event density\nr1 out 0 1k\n.end\n",
+        );
+        let netlist = Parser::new().parse_deck(&deck)?;
+        let mut circuit = Circuit::from_netlist(&netlist)?;
+        let out = circuit.nodes().get("out").unwrap();
+        let mut network = Network::default();
+        let dac = network.add_net();
+        let unrelated = network.add_net();
+        let a = network.add_source(dac)?;
+        let b = network.add_source(unrelated)?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let mut init = engine.trial();
+        init.schedule(a, 0., Drive::strong(Logic::One))?;
+        for i in 0..event_count {
+            init.schedule(
+                b,
+                1e-3 * f64::from(i + 1) / f64::from(event_count + 1),
+                Drive::strong(if i % 2 == 0 { Logic::Zero } else { Logic::One }),
+            )?;
+        }
+        init.commit()?;
+        let mut mixed = MixedSignal::new(engine);
+        mixed.add_dac(
+            &mut circuit,
+            "adac",
+            [out, NodeId::GROUND],
+            dac,
+            DacConfig::new(
+                Dac {
+                    low: 0.,
+                    high: 3.,
+                    unknown: 1.5,
+                },
+                Delays::new(1e-6, 1e-6)?,
+            )?,
+        )?;
+        let plan =
+            AnalysisInput::with_arguments(AnalysisKind::Transient, ["20u", "1m"]).resolve()?;
+        let (plot, stats) =
+            mixed_signal_transient(&mut circuit, &plan, &AnalysisContext::default(), &mut mixed)?;
+        assert_eq!(mixed.engine().stats().events, event_count as usize + 1);
+        assert!(
+            plot.column("v(out)")
+                .unwrap()
+                .iter()
+                .all(|v| (v.re - 3.).abs() < 1e-10)
+        );
+        Ok((
+            plot.column("time")
+                .unwrap()
+                .iter()
+                .map(|v| v.re)
+                .collect::<Vec<_>>(),
+            stats,
+        ))
+    };
+    let quiet = run(0)?;
+    let dense = run(10_000)?;
+    assert_eq!(
+        quiet, dense,
+        "unrelated digital events changed the analog schedule"
+    );
+    Ok(())
+}
+
+fn run_xspice(deck: &str) -> ngspice_rs::analysis::Plot {
+    use ngspice_conformance::ngspice::Scratch;
+    use ngspice_conformance::process::{ProcessLimits, run};
+    use ngspice_rs::analysis::RawFile;
+    use std::fs;
+
+    let scratch = Scratch::new("mixed-signal-reference").unwrap();
+    let dir = scratch.path();
+    fs::write(dir.join("reference.cir"), deck).unwrap();
+    let binary = std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN");
+    let result = run(binary, dir, &["-b", "reference.cir"], ProcessLimits::ORACLE).unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let raw = RawFile::parse(&fs::read_to_string(dir.join("result.raw")).unwrap()).unwrap();
+    raw.plots[0].plot.clone()
+}
+
+/// The C reference uses the same RC feedback circuit, thresholds and bridge
+/// delays, but a ten-times-finer maximum analog step.
+#[test]
+#[ignore = "requires NGSPICE_BIN pointing to XSPICE-enabled ngspice"]
+fn schmitt_feedback_matches_xspice() -> SpiceResult<()> {
+    let (_, ours) = run_feedback()?;
+    let plot = run_xspice(
+        "Mixed RC feedback Schmitt oscillator\n\
+         a1 [cap] [din] adc\n\
+         a2 din dout inv\n\
+         a3 [dout] [out] dac\n\
+         r1 out cap 1k\n\
+         c1 cap 0 100n\n\
+         .ic v(cap)=0\n\
+         .model adc adc_bridge(in_low=2 in_high=1 rise_delay=500n fall_delay=500n)\n\
+         .model inv d_inverter(rise_delay=500n fall_delay=500n)\n\
+         .model dac dac_bridge(out_low=0 out_high=3 out_undef=1.5 t_rise=1u t_fall=1u)\n\
+         .control\nset filetype=ascii\ntran 5u 600u 0 50n\nwrite result.raw\nquit\n.endc\n.end\n",
+    );
+    let time = plot.column("time").unwrap();
+    let output = plot.column("v(out)").unwrap();
+    let mut reference = Vec::new();
+    for i in 1..time.len() {
+        let a = output[i - 1].re;
+        let b = output[i].re;
+        if (a < 1.5 && b >= 1.5) || (a > 1.5 && b <= 1.5) {
+            let fraction = (1.5 - a) / (b - a);
+            reference.push(fraction.mul_add(time[i].re - time[i - 1].re, time[i - 1].re));
+        }
+    }
+    assert_eq!(reference.len(), ours.len(), "{reference:?} vs {ours:?}");
+    for (a, b) in ours.iter().zip(&reference) {
+        assert!((a - b).abs() < 200e-9, "{ours:?} vs {reference:?}");
+    }
+    println!("Rust transition midpoints: {ours:?}; XSPICE: {reference:?}");
+    Ok(())
+}
+
+#[test]
+fn dff_retains_on_unknown_clock_and_captures_on_transition_to_one() -> SpiceResult<()> {
+    let mut network = Network::default();
+    let d = network.add_net();
+    let clock = network.add_net();
+    let q = network.add_net();
+    let nq = network.add_net();
+    let data = network.add_source(d)?;
+    let clk = network.add_source(clock)?;
+    network.add_model(
+        DFlipFlop {
+            initial: Logic::Zero,
+            delays: Delays::new(3e-6, 3e-6)?,
+            mode: DelayMode::Transport,
+        },
+        &[d, clock],
+        &[q, nq],
+    )?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let mut trial = engine.trial();
+    for (time, logic) in [
+        (0., Logic::One),
+        (30e-6, Logic::Unknown),
+        (60e-6, Logic::Zero),
+    ] {
+        trial.schedule(data, time, Drive::strong(logic))?;
+    }
+    for (time, logic) in [
+        (0., Logic::Zero),
+        (5e-6, Logic::Unknown),
+        (10e-6, Logic::One),
+        (20e-6, Logic::Zero),
+        (40e-6, Logic::One),
+        (50e-6, Logic::Zero),
+        (70e-6, Logic::One),
+    ] {
+        trial.schedule(clk, time, Drive::strong(logic))?;
+    }
+    trial.advance_to(80e-6)?;
+    let actual: Vec<_> = trial
+        .changes()
+        .iter()
+        .filter(|change| change.net == q)
+        .map(|change| (change.time, change.drive.logic))
+        .collect();
+    let expected = [
+        (0., Logic::Zero),
+        (13e-6, Logic::One),
+        (43e-6, Logic::Unknown),
+        (73e-6, Logic::Zero),
+    ];
+    assert_eq!(actual.len(), expected.len());
+    for ((t, state), (et, es)) in actual.into_iter().zip(expected) {
+        assert!((t - et).abs() < 1e-15);
+        assert_eq!(state, es);
+    }
+    assert_eq!(trial.value(nq), Some(Drive::strong(Logic::One)));
+    trial.commit()
+}
+
+const DFF_INPUTS: &str = "vdata data 0 pwl(0 1 29.99u 1 30u 0.5 59.99u 0.5 60u 0 80u 0)\n\
+    vclk clk 0 pwl(0 0 4.99u 0 5u 0.5 9.99u 0.5 10u 1 19.99u 1 20u 0 39.99u 0 40u 1 49.99u 1 50u 0 69.99u 0 70u 1 80u 1)\n\
+    r1 q 0 1k\nr2 nq 0 1k\n";
+
+fn run_mixed_dff() -> SpiceResult<ngspice_rs::analysis::Plot> {
+    use ngspice_rs::analysis::digital::{AdcBinding, MixedSignal};
+    use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, mixed_signal_transient};
+    use ngspice_rs::devices::{Circuit, code_model::DacConfig};
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use ngspice_rs::primitives::{AnalysisKind, NodeId};
+    use std::path::Path;
+
+    let deck = format!("mixed sequential logic\n{DFF_INPUTS}.end\n");
+    let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("dff.cir"), &deck))?;
+    let mut circuit = Circuit::from_netlist(&netlist)?;
+    let mut network = Network::default();
+    let [data, clock, q, nq] = std::array::from_fn(|_| network.add_net());
+    let d = network.add_source(data)?;
+    let c = network.add_source(clock)?;
+    network.add_model(
+        DFlipFlop {
+            initial: Logic::Zero,
+            delays: Delays::new(3e-6, 3e-6)?,
+            mode: DelayMode::Transport,
+        },
+        &[data, clock],
+        &[q, nq],
+    )?;
+    let mut mixed = MixedSignal::new(Engine::new(network, Limits::default())?);
+    for (node, source) in [("data", d), ("clk", c)] {
+        mixed.add_adc(AdcBinding {
+            terminals: [circuit.nodes().get(node).unwrap(), NodeId::GROUND],
+            source,
+            thresholds: Adc::new(0.25, 0.75)?,
+            delays: Delays::new(1e-9, 1e-9)?,
+            mode: DelayMode::Transport,
+        })?;
+    }
+    let config = DacConfig::new(
+        Dac {
+            low: 0.,
+            high: 1.,
+            unknown: 0.5,
+        },
+        Delays::new(10e-9, 10e-9)?,
+    )?;
+    for (name, net) in [("q", q), ("nq", nq)] {
+        let terminal = circuit.nodes().get(name).unwrap();
+        mixed.add_dac(
+            &mut circuit,
+            format!("a{name}"),
+            [terminal, NodeId::GROUND],
+            net,
+            config,
+        )?;
+    }
+    let plan = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1u", "80u"]).resolve()?;
+    let (plot, _) =
+        mixed_signal_transient(&mut circuit, &plan, &AnalysisContext::default(), &mut mixed)?;
+    let events: Vec<_> = mixed
+        .changes()
+        .iter()
+        .filter(|change| change.net == q)
+        .map(|change| (change.time, change.drive.logic))
+        .collect();
+    assert_eq!(events.len(), 4, "{events:?}");
+    // Linear ramp crossing times + 1 ns ADC delay + 3 us clock-to-Q delay.
+    let expected = [
+        (0., Logic::Zero),
+        (12.996e-6, Logic::One),
+        (42.9985e-6, Logic::Unknown),
+        (72.9985e-6, Logic::Zero),
+    ];
+    for ((t, state), (expected_t, expected_state)) in events.into_iter().zip(expected) {
+        assert_eq!(state, expected_state);
+        assert!((t - expected_t).abs() < 1e-10, "{t:e} vs {expected_t:e}");
+    }
+    Ok(plot)
+}
+
+fn output_at(plot: &ngspice_rs::analysis::Plot, node: &str, t: f64) -> f64 {
+    let time = plot.column("time").unwrap();
+    let output = plot.column(node).unwrap();
+    let upper = time.partition_point(|v| v.re < t).min(time.len() - 1);
+    let lower = upper.saturating_sub(1);
+    if upper == lower {
+        return output[upper].re;
+    }
+    let fraction = (t - time[lower].re) / (time[upper].re - time[lower].re);
+    fraction.mul_add(output[upper].re - output[lower].re, output[lower].re)
+}
+
+fn check_dff_levels(plot: &ngspice_rs::analysis::Plot) {
+    for (time, q) in [
+        (0., 0.),
+        (7e-6, 0.),
+        (15e-6, 1.),
+        (35e-6, 1.),
+        (45e-6, 0.5),
+        (65e-6, 0.5),
+        (75e-6, 0.),
+    ] {
+        assert!((output_at(plot, "v(q)", time) - q).abs() < 1e-8);
+        assert!((output_at(plot, "v(nq)", time) - (1. - q)).abs() < 1e-8);
+    }
+}
+
+#[test]
+fn ordinary_adc_unknown_intervals_and_sequential_dac_outputs() -> SpiceResult<()> {
+    check_dff_levels(&run_mixed_dff()?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NGSPICE_BIN pointing to XSPICE-enabled ngspice"]
+fn sequential_logic_matches_xspice() -> SpiceResult<()> {
+    let ours = run_mixed_dff()?;
+    let reference = run_xspice(&format!(
+        "XSPICE D flip flop\n{DFF_INPUTS}\
+        aadc [data clk] [dd cc] adc\n\
+        aff dd cc null null dq dnq ff\n\
+        adac [dq dnq] [q nq] dac\n\
+        .model adc adc_bridge(in_low=0.25 in_high=0.75 rise_delay=1n fall_delay=1n)\n\
+        .model ff d_dff(ic=0 clk_delay=1u rise_delay=2u fall_delay=2u)\n\
+        .model dac dac_bridge(out_low=0 out_high=1 out_undef=0.5 t_rise=10n t_fall=10n)\n\
+        .control\nset filetype=ascii\ntran 1u 80u 0 5n\nwrite result.raw\nquit\n.endc\n.end\n"
+    ));
+    check_dff_levels(&reference);
+    for (midpoint, lo, hi) in [
+        (0.5, 10e-6, 20e-6),
+        (0.75, 40e-6, 50e-6),
+        (0.25, 70e-6, 80e-6),
+    ] {
+        let crossing = |plot: &ngspice_rs::analysis::Plot| -> f64 {
+            let time = plot.column("time").unwrap();
+            let output = plot.column("v(q)").unwrap();
+            for i in 1..time.len() {
+                if time[i].re < lo || time[i].re > hi {
+                    continue;
+                }
+                let (a, b) = (output[i - 1].re, output[i].re);
+                if (a < midpoint && b >= midpoint) || (a > midpoint && b <= midpoint) {
+                    let f = (midpoint - a) / (b - a);
+                    return f.mul_add(time[i].re - time[i - 1].re, time[i - 1].re);
+                }
+            }
+            panic!("no Q transition in {lo:e}..{hi:e}");
+        };
+        let (a, b) = (crossing(&ours), crossing(&reference));
+        assert!((a - b).abs() < 15e-9, "{a:e} vs {b:e}");
     }
     Ok(())
 }
