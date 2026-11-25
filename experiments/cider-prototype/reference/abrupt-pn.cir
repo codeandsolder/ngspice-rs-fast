@@ -1,0 +1,32 @@
+1D abrupt PN, constant mobility, SRH
+Vbias p 0 0
+D1 p 0 PN area=1
+.model PN numd level=1
++ options defa=1e-6
++ x.mesh loc=0 n=1
++ x.mesh loc=1 n=101
++ x.mesh loc=2 n=201
++ domain num=1 material=1
++ material num=1 silicon tn=1us tp=1us nc=2.8e19 nv=1.04e19 eg=1.12
++ mobility material=1 electron mumax=1000 mumin=1000
++ mobility material=1 hole mumax=400 mumin=400
++ mobility material=1 electron minority mumax=1000 mumin=1000
++ mobility material=1 hole minority mumax=400 mumin=400
++ doping unif p.type conc=1e16 x.l=0 x.h=0.995
++ doping unif n.type conc=1e16 x.l=1.005 x.h=2
++ models srh ^bgn ^concmob ^fieldmob ^conctau ^auger ^aval
++ method ac=direct
++ output material globals mesh
+.option acct bypass=0 abstol=1e-17 reltol=1e-7 itl1=200 itl2=200
+.temp 26.85
+.option tnom=26.85
+.dc Vbias -0.3 0.65 0.025
+.control
+set numdgt=17
+set wr_vecnames
+set wr_singlescale
+run
+wrdata dc-highprec.dat i(vbias)
+quit
+.endc
+.end
