@@ -211,7 +211,7 @@ fn uninstantiated_subcircuit_functions_are_not_checked() {
 
 #[test]
 #[ignore = "requires NGSPICE_BIN; run cargo test -p ngspice-rs --test c_func_eval -- --ignored"]
-fn behavioural_probe_calls_c_accepts_are_not_yet_ported() {
+fn behavioural_probe_calls_c_accepts_are_admitted() {
     // C rewrites a device value reading v() or i() into a behavioural device.
     for (index, cards) in [
         "v2 2 0 dc 1\nr2 2 0 {1/i(v2)}",
@@ -226,7 +226,10 @@ fn behavioural_probe_calls_c_accepts_are_not_yet_ported() {
         let netlist = Parser::new()
             .parse_deck(&parse_deck_text(Path::new("probe.cir"), &text))
             .expect(cards);
-        let error = ngspice_rs::netlist::elaborate::literalize(&netlist).expect_err(cards);
-        assert!(error.is_not_yet_ported(), "{cards}: {error}");
+        let evaluated = ngspice_rs::netlist::elaborate::literalize(&netlist).expect(cards);
+        assert!(matches!(
+            evaluated.netlist.devices.last().unwrap().parameters[0].kind,
+            ngspice_rs::netlist::ast::ParameterKind::Behavioural(_)
+        ));
     }
 }

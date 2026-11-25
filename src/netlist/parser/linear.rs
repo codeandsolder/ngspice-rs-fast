@@ -68,7 +68,7 @@ fn passive_parameters(
     designator: char,
 ) -> Result<(Option<String>, Vec<ParameterAssignment>)> {
     let primary = primary_name(designator);
-    let leading = opt(leading_value).parse_next(input)?;
+    let leading = opt(|input: &mut Input<'_>| passive_leading(input, primary)).parse_next(input)?;
     let model = opt(passive_model).parse_next(input)?;
     let after_model = if model.is_some() {
         opt(leading_value).parse_next(input)?
@@ -78,14 +78,18 @@ fn passive_parameters(
     let remaining: Vec<ParameterAssignment> =
         repeat(0.., alt((passive_assignment, invalid_passive))).parse_next(input)?;
     let mut parameters = Vec::new();
-    if let Some(value) = leading {
-        parameters.push(assignment(primary, value));
+    if let Some(parameter) = leading {
+        parameters.push(parameter);
     }
     parameters.extend(remaining);
     if let Some(value) = after_model {
         parameters.push(assignment(primary, value));
     }
-    if model.is_none() && !parameters.iter().any(|parameter| parameter.name == primary) {
+    if model.is_none()
+        && !parameters.iter().any(|parameter| {
+            parameter.name == primary || (designator == 'c' && parameter.name == "charge")
+        })
+    {
         return Err(ErrMode::Cut(Failure(SpiceError::parse(
             location(input),
             format!("expected {primary} or a declared passive model"),
@@ -137,6 +141,64 @@ fn passive_model<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
     .parse_next(input)
 }
 
+// Runtime quantities are identified in the parsed tree, not by matching
+// substrings (e.g. a parameter called "time_constant" is still static).
+fn behavioural_passive_value(
+    input: &mut Input<'_>,
+    name: &str,
+    force: bool,
+) -> Result<Option<ParameterAssignment>> {
+    let Some(token) = input
+        .input
+        .first()
+        .filter(|token| super::expression::is_expression_token(token))
+    else {
+        return if force {
+            Err(malformed(
+                input,
+                "charge law requires a braced or quoted expression",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let expression = super::bexpression::parse_complete(
+        &token.text,
+        token.position(),
+        false,
+        input.state.auto_gnd,
+    );
+    let tree = match expression {
+        Ok(tree) => tree,
+        Err(error) if force => return Err(ErrMode::Cut(Failure(error))),
+        Err(_) => return Ok(None),
+    };
+    let mut runtime = force;
+    tree.root.visit(&mut |node| {
+        use crate::netlist::bexpr::BExprKind;
+        runtime |= match &node.kind {
+            BExprKind::Voltage { .. } | BExprKind::Current(_) => true,
+            BExprKind::Name(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
+            _ => false,
+        };
+    });
+    if !runtime {
+        return Ok(None);
+    }
+    let at = any.parse_next(input)?;
+    Ok(Some(super::behavioural::behavioural(name, at, tree)))
+}
+
+fn passive_leading(input: &mut Input<'_>, name: &str) -> Result<ParameterAssignment> {
+    if let Some(parameter) = behavioural_passive_value(input, name, false)? {
+        Ok(parameter)
+    } else {
+        leading_value
+            .map(|value| assignment(name, value))
+            .parse_next(input)
+    }
+}
+
 fn passive_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
     let designator = input
         .state
@@ -149,13 +211,24 @@ fn passive_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
         })
         .parse_next(input)?;
     // INPgetTok() gobbles '=': both tc1=0.01 and tc1 0.01 are legal.
-    let (_, value) = cut_err((opt(equals), value)).parse_next(input)?;
-    Ok(named(&name, token.location.clone(), value))
+    cut_err(|input: &mut Input<'_>| {
+        opt(equals).parse_next(input)?;
+        if (name == primary_name(designator) || name == "charge")
+            && let Some(mut parameter) = behavioural_passive_value(input, &name, name == "charge")?
+        {
+            parameter.location = token.location.clone();
+            return Ok(parameter);
+        }
+        let value = value(input)?;
+        Ok(named(&name, token.location.clone(), value))
+    })
+    .parse_next(input)
 }
 
 fn scalar_name(designator: char, text: &str) -> Option<String> {
     let name = text.to_ascii_lowercase();
     let canonical = match (designator, name.as_str()) {
+        ('c', "q" | "charge") => "charge",
         ('r', "r" | "resistance")
         | ('c', "c" | "cap" | "capacitance")
         | ('l', "l" | "inductance") => primary_name(designator),

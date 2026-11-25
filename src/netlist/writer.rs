@@ -1341,6 +1341,7 @@ fn passive_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceRes
         (_, "temp" | "dtemp" | "m" | "tc1" | "tc2" | "scale")
         | ('r' | 'c', "w" | "l" | "bv_max")
         | ('r', "ac" | "tc" | "tce" | "noisy")
+        | ('c', "charge")
         | ('c' | 'l', "ic")
         | ('l', "nt") => true,
         (_, name) => name == primary,
@@ -1353,7 +1354,12 @@ fn passive_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceRes
             ));
         }
     }
-    if device.model.is_none() && !device.parameters.iter().any(|p| p.name == primary) {
+    if device.model.is_none()
+        && !device
+            .parameters
+            .iter()
+            .any(|p| p.name == primary || (designator == 'c' && p.name == "charge"))
+    {
         return Err(refuse(
             format!("model-less '{designator}' instance without {primary}"),
             Some(&device.location),
@@ -1365,7 +1371,23 @@ fn passive_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceRes
             .first()
             .is_some_and(|parameter| parameter.name == primary);
     for (index, parameter) in device.parameters.iter().enumerate() {
-        if positional && index == 0 {
+        if matches!(parameter.kind, ParameterKind::Behavioural(_)) {
+            if parameter.name != primary && !(designator == 'c' && parameter.name == "charge") {
+                return Err(refuse(
+                    "invalid behavioural passive setter",
+                    Some(&parameter.location),
+                ));
+            }
+            let text = behavioural_text(parts, parameter)?;
+            parts.push(' ')?;
+            parts.push_str(if parameter.name == "charge" {
+                "q"
+            } else {
+                primary
+            })?;
+            parts.push('=')?;
+            parts.push_str(text)?;
+        } else if positional && index == 0 {
             parts.word(value_text(parts, parameter, false)?)?;
         } else {
             named_value(parts, parameter, false)?;
