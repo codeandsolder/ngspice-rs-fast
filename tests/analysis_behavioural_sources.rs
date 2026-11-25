@@ -293,5 +293,143 @@ fn table_and_poly_forms_simulate_through_the_lowered_devices() {
     );
     close(value(&plot, "v(e1_int2)", 0), 0.25, 1e-12);
     assert!(plot.variable_index("i(ae1)").is_some());
-    assert!(plot.variable_index("i(a$poly$e2)").is_some());
+    assert!(plot.variable_index("i(e2)").is_some());
+}
+
+#[test]
+fn resolved_current_probes_share_one_physical_measurement_across_laws() -> SpiceResult<()> {
+    let body = ".func sense(x) {i(r1)*x}\nvin in 0 dc 2 ac 1\nr1 in 0 1k\nb1 out 0 v=max(0,sense(1000))\nb2 other 0 v=1000*i(r1)\nr2 in 0 r={1000*(1+sense(1000))}\nb3 mon 0 v=1000*i(r2)";
+    let mut circuit = circuit(body)?;
+    let generated = circuit
+        .devices()
+        .iter()
+        .filter(|d| d.name().starts_with("v__sense_"))
+        .count();
+    assert_eq!(generated, 1);
+    let plot =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut circuit, &AnalysisContext::default())?;
+    close(value(&plot, "v(out)", 0), 2., 1e-12);
+    close(value(&plot, "v(other)", 0), 2., 1e-12);
+    close(value(&plot, "v(mon)", 0), 2. / 3., 1e-9);
+    let ac = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "1", "1000", "1000"])
+        .resolve()?
+        .run(&mut circuit, &AnalysisContext::default())?;
+    close(value(&ac, "v(out)", 0), 1., 1e-12);
+    close(value(&ac, "v(other)", 0), 1., 1e-12);
+    close(value(&ac, "v(mon)", 0), 1. / 9., 1e-9);
+    Ok(())
+}
+
+#[test]
+fn lexical_shadowing_and_erased_macro_arguments_do_not_create_probes() -> SpiceResult<()> {
+    let body = ".func i(x) {x*2}\n.func ignore(x) {3}\nv1 a 0 1\nr1 a 0 1k\nb1 out 0 v=i(4)\nb2 b 0 v=ignore(i(missing))";
+    let mut circuit = circuit(body)?;
+    assert_eq!(circuit.devices().len(), 4);
+    let plot =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut circuit, &AnalysisContext::default())?;
+    close(value(&plot, "v(out)", 0), 8., 1e-12);
+    close(value(&plot, "v(b)", 0), 3., 1e-12);
+    Ok(())
+}
+
+#[test]
+fn native_branch_probes_do_not_split_storage_or_voltage_source_terminals() -> SpiceResult<()> {
+    let body = "v1 in 0 dc 1\nr1 in a 1k\nl1 a 0 1m\nb1 b 0 v=1000*i(l1)\nr2 b 0 1k\nb2 out 0 v=1000*i(b1)\ne1 c 0 value={2*v(b)}\nr3 c 0 1k\nb3 other 0 v=1000*i(e1)";
+    let mut circuit = circuit(body)?;
+    assert!(
+        !circuit
+            .devices()
+            .iter()
+            .any(|d| d.name().starts_with("v__sense_"))
+    );
+    let plot =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut circuit, &AnalysisContext::default())?;
+    close(value(&plot, "v(b)", 0), 1., 1e-12);
+    close(value(&plot, "v(out)", 0), -1., 1e-12);
+    close(value(&plot, "v(other)", 0), -2., 1e-12);
+    Ok(())
+}
+
+#[test]
+fn measurement_names_are_collision_safe_and_comma_probes_are_not_special() -> SpiceResult<()> {
+    let body = "v1 a 0 2\nr1 a 0 1k\nv__sense_0 __sense_0 0 5\nv_r1 r1probe 0 4\nb1 out 0 v=max(0,i(r1)*1000)";
+    let plot = run(body, AnalysisKind::OperatingPoint, &[])?;
+    close(value(&plot, "v(out)", 0), 2., 1e-12);
+    close(value(&plot, "v(__sense_0)", 0), 5., 1e-12);
+    close(value(&plot, "v(r1probe)", 0), 4., 1e-12);
+    let plot = run(
+        "b1 b 0 v=max(0,i(b2))\nb2 c 0 i=1m\nr2 b 0 1\nr3 c 0 1",
+        AnalysisKind::OperatingPoint,
+        &[],
+    )?;
+    close(value(&plot, "v(b)", 0), 1e-3, 1e-12);
+    Ok(())
+}
+
+#[test]
+fn local_probe_bindings_follow_expanded_hierarchy() -> SpiceResult<()> {
+    let body = ".subckt cell a b params: r=1k\n.func read(x) {i(r1)*x}\nr1 a 0 {r}\nb1 b 0 v=read(1000)\n.ends\nv1 a 0 2\nx1 a b cell r=1k\nx2 a c cell r=2k";
+    let mut circuit = circuit(body)?;
+    assert_eq!(
+        circuit
+            .devices()
+            .iter()
+            .filter(|d| d.name().starts_with("v__sense_"))
+            .count(),
+        2
+    );
+    let plot =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut circuit, &AnalysisContext::default())?;
+    close(value(&plot, "v(b)", 0), 2., 1e-12);
+    close(value(&plot, "v(c)", 0), 1., 1e-12);
+    Ok(())
+}
+
+#[test]
+fn many_independent_current_probes_have_linear_measurement_count() -> SpiceResult<()> {
+    use std::fmt::Write as _;
+    let mut deck = String::from("v1 in 0 1\n");
+    for index in 0..512 {
+        writeln!(deck, "r{index} in 0 1k").unwrap();
+        writeln!(
+            deck,
+            "b{index} out{index} 0 v=1000*(i(r{index})+i(r{index}))"
+        )
+        .unwrap();
+    }
+    let mut circuit = circuit(&deck)?;
+    assert_eq!(
+        circuit
+            .devices()
+            .iter()
+            .filter(|d| d.name().starts_with("v__sense_"))
+            .count(),
+        512
+    );
+    let plot =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut circuit, &AnalysisContext::default())?;
+    for index in 0..512 {
+        close(value(&plot, &format!("v(out{index})"), 0), 2., 1e-12);
+    }
+    Ok(())
+}
+
+#[test]
+fn polynomial_sources_retain_probe_identity_inside_and_outside_hierarchy() -> SpiceResult<()> {
+    let body = ".subckt cell a b c\ne1 b 0 poly(1) a 0 1 2\nr1 b 0 1k\nb1 c 0 v=1000*i(e1)\n.ends\nv1 a 0 2\nx1 a b c cell\ne2 d 0 poly(1) a 0 1 2\nr2 d 0 1k\nb2 e 0 v=1000*i(e2)\ng1 f 0 poly(1) a 0 0 1m\nr3 f 0 1k\nb3 g 0 v=max(0,1000*i(g1))";
+    let plot = run(body, AnalysisKind::OperatingPoint, &[])?;
+    close(value(&plot, "v(c)", 0), -5., 1e-12);
+    close(value(&plot, "v(e)", 0), -5., 1e-12);
+    close(value(&plot, "v(g)", 0), 2., 1e-12);
+    Ok(())
 }

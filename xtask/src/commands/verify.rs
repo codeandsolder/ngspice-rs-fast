@@ -27,6 +27,10 @@ enum Gate {
     Points {
         axis: Option<&'static str>,
         tolerance: compare::Tolerance,
+        // Explicit equal physical coordinates introduced only by C's
+        // redundant zero-voltage current-sense devices. Every reference
+        // column is still compared; production circuits need no aliases.
+        aliases: &'static [(&'static str, &'static str)],
     },
     /// Event-aware comparison on a shared physical time grid (`tran.rs`).
     Transient(compare::TranTolerance),
@@ -293,13 +297,39 @@ const SUPPORTED: &[Supported] = &[
     // transfer and E/G/F/H POLY onto spice2poly (captured with those code
     // models, `* xtask-codemodels:`). Newton-solved, so the nonlinear 1 ppm
     // bound; the transient keeps `compare::TRAN`.
-    fixture("bsource_op", Stage::op(compare::NONLINEAR)),
+    fixture(
+        "bsource_op",
+        Stage::points_aliases(
+            AnalysisKind::OperatingPoint,
+            compare::NONLINEAR,
+            &[("v(o1_vmeas_0)", "v(o1)"), ("i(v_b1)", "i(b1)")],
+        ),
+    ),
     fixture("bsource_dc", Stage::dc(compare::NONLINEAR)),
     fixture("bsource_ac", Stage::ac(compare::NONLINEAR)),
     tran("bsource_tran"),
-    fixture("evalue_op", Stage::op(compare::NONLINEAR)),
+    fixture(
+        "evalue_op",
+        Stage::points_aliases(
+            AnalysisKind::OperatingPoint,
+            compare::NONLINEAR,
+            &[("v(o2_vmeas_0)", "v(o2)"), ("i(v_e2)", "i(e2)")],
+        ),
+    ),
     fixture("gtable_dc", Stage::dc(compare::NONLINEAR)),
-    fixture("epoly_dc", Stage::dc(compare::NONLINEAR)),
+    fixture(
+        "epoly_dc",
+        Stage::points_aliases(
+            AnalysisKind::DcSweep,
+            compare::NONLINEAR,
+            &[
+                ("i(a$poly$e1)", "i(e1)"),
+                ("i(a$poly$e2)", "i(e2)"),
+                ("i(a$poly$e3)", "i(e3)"),
+                ("i(a$poly$h1)", "i(h1)"),
+            ],
+        ),
+    ),
     // B sources whose sqrt/log/reciprocal/division slopes are ~1e32 (or whose
     // log() is -1e99) at the 0 V Newton start, in OP, a DC sweep and a
     // transient's initial point (#79); the Newton solve's balanced fallback.
@@ -634,12 +664,31 @@ impl Stage {
     ) -> Self {
         Self {
             kind,
-            gate: Gate::Points { axis, tolerance },
+            gate: Gate::Points {
+                axis,
+                tolerance,
+                aliases: &[],
+            },
         }
     }
 
     const fn op(tolerance: compare::Tolerance) -> Self {
         Self::points(AnalysisKind::OperatingPoint, None, tolerance)
+    }
+
+    const fn points_aliases(
+        kind: AnalysisKind,
+        tolerance: compare::Tolerance,
+        aliases: &'static [(&'static str, &'static str)],
+    ) -> Self {
+        Self {
+            kind,
+            gate: Gate::Points {
+                axis: None,
+                tolerance,
+                aliases,
+            },
+        }
     }
 
     const fn dc(tolerance: compare::Tolerance) -> Self {
@@ -1293,6 +1342,53 @@ fn complete_pole_reference(
     Ok(completed)
 }
 
+/// Expand only explicitly declared reference-equivalent coordinates.
+fn reference_aliases(
+    plot: &ngspice_rs::analysis::Plot,
+    reference: &ngspice_rs::analysis::Plot,
+    aliases: &[(&str, &str)],
+) -> Result<ngspice_rs::analysis::Plot, String> {
+    let mut variables = Vec::with_capacity(plot.variables().len() + aliases.len());
+    let mut columns = Vec::with_capacity(variables.capacity());
+    // A native coordinate may have a differently named reference equivalent
+    // or multiple redundant reference coordinates. Retain every native
+    // column that is not explicitly represented under another name.
+    for (index, variable) in plot.variables().iter().enumerate() {
+        if !aliases
+            .iter()
+            .any(|&(_, original)| original == variable.name)
+            || reference.variable_index(&variable.name).is_some()
+        {
+            variables.push(variable.clone());
+            columns.push(index);
+        }
+    }
+    for &(alias, original) in aliases {
+        if variables.iter().any(|v| v.name == alias)
+            || plot.variable_index(alias).is_some()
+            || reference.variable_index(alias).is_none()
+        {
+            return Err(format!("invalid reference alias {alias}"));
+        }
+        let index = plot
+            .variable_index(original)
+            .ok_or_else(|| format!("missing physical coordinate {original} for {alias}"))?;
+        let mut variable = plot.variables()[index].clone();
+        variable.name = alias.to_owned();
+        variables.push(variable);
+        columns.push(index);
+    }
+    let mut expanded =
+        ngspice_rs::analysis::Plot::new(&plot.name, &plot.plotname, plot.flags(), variables);
+    for row in plot.rows() {
+        let data: Vec<_> = columns.iter().map(|&index| row[index]).collect();
+        expanded
+            .push_point(&data)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(expanded)
+}
+
 /// Compares one Rust plot with one C plot under `gate`.
 fn compare_plot(
     gate: &Gate,
@@ -1318,7 +1414,17 @@ fn compare_plot(
         gate
     };
     match *gate {
-        Gate::Points { axis, tolerance } => {
+        Gate::Points {
+            axis,
+            tolerance,
+            aliases,
+        } => {
+            let expanded = if aliases.is_empty() {
+                None
+            } else {
+                Some(reference_aliases(got, &rows.header().plot, aliases)?)
+            };
+            let got = expanded.as_ref().unwrap_or(got);
             compare::stream_points(got, rows, tolerance, axis, resolution, alternates)
                 .map(|()| format!("{} point(s)", got.point_count()))
         }

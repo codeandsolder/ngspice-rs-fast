@@ -136,6 +136,10 @@ pub(super) fn instantiate(
     nodes: &mut NodeAppend<'_>,
 ) -> SpiceResult<Box<dyn Device>> {
     if matches!(instance.designator, 'e'..='h') {
+        if matches!(instance.parameters.first(), Some(parameter) if matches!(parameter.kind, ParameterKind::Behavioural(_)) && matches!(parameter.name.as_str(),"v"|"i"))
+        {
+            return crate::devices::behavioural::instantiate(instance, nodes);
+        }
         return crate::devices::controlled::instantiate(instance, nodes);
     }
     if instance.designator == 'k' {

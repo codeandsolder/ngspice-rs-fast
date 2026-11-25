@@ -1386,7 +1386,9 @@ impl Circuit {
             // CKTfndBranch for each controlling source, in order.
             for control in self.devices[index].controlling_sources() {
                 if let Some(target) = names.get(&control.name)
-                    && self.devices[target].findable_branch().is_some()
+                    && self.devices[index]
+                        .control_branch(self.devices[target].as_ref())
+                        .is_some()
                 {
                     allocate_branch(&mut self.bindings.unknowns, target)?;
                 }
@@ -1731,8 +1733,9 @@ impl Circuit {
     /// Branch rows of the devices `device` senses (C `CKTfndBranch`, called
     /// from `CCCSsetup`/`CCVSsetup`): looked up by instance name after every
     /// device is known, so a controlling source may follow its user in the
-    /// deck. Only devices with a [`Device::findable_branch`] qualify: C finds
-    /// V, E, H (and B) branches, but not inductor currents.
+    /// deck. The consumer selects the physical branch through
+    /// [`Device::control_branch`]; expression probes can also use native
+    /// storage currents.
     fn resolve_controls(
         &self,
         device: &dyn Device,
@@ -1754,11 +1757,9 @@ impl Circuit {
                     )));
                 };
                 let target = &self.devices[index];
-                let Some(branch) = target.findable_branch() else {
+                let Some(branch) = device.control_branch(target.as_ref()) else {
                     return Err(failure(format!(
-                        "{}: controlling source {} has no findable branch current (only \
-                         independent voltage sources and E/H sources can be sensed, as by \
-                         CKTfndBranch)",
+                        "{}: controlling source {} has no findable branch current for this control",
                         device.name(),
                         target.name()
                     )));
@@ -3153,6 +3154,7 @@ impl Circuit {
                 })
                 || original.state_count() != replacement.state_count()
                 || original.findable_branch() != replacement.findable_branch()
+                || original.expression_current_branch() != replacement.expression_current_branch()
                 || !original
                     .controlling_sources()
                     .iter()
@@ -4069,6 +4071,7 @@ impl Circuit {
         let instances = crate::devices::behavioural::dynamic::expand(
             instances,
             &self.nodes,
+            models,
             self.devices.iter().map(|device| device.name()),
             limits.devices.saturating_sub(existing.devices),
         )?;
