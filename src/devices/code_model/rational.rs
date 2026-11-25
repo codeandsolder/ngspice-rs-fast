@@ -14,6 +14,7 @@ use crate::devices::{
     setup::MatrixSetup,
 };
 use crate::maths::Vector;
+use crate::primitives::numeric::{scale_power, split_power};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 use std::sync::Arc;
 
@@ -93,14 +94,102 @@ fn coefficients(values: &[Real]) -> SpiceResult<&[Real]> {
     Ok(&values[first..])
 }
 
-fn normalized(value: Real, leading: Real, gain: Real) -> SpiceResult<Real> {
-    let result = (value / leading) * gain;
-    if !result.is_finite() || (value != 0. && gain != 0. && result == 0.) {
+fn normalized(value: Real, leading: Real) -> SpiceResult<Real> {
+    let result = value / leading;
+    if !result.is_finite() || (value != 0. && result == 0.) {
         return Err(invalid(
             "coefficient normalization is outside finite nonzero range",
         ));
     }
     Ok(result)
+}
+
+/// A nonzero finite significand with an exponent wide enough to represent
+/// a physical frequency raised to any realizable integrator order.
+#[derive(Clone, Copy)]
+struct ExtendedPower {
+    significand: Real,
+    exponent: i128,
+}
+
+impl ExtendedPower {
+    fn from_nonzero(value: Real) -> Self {
+        let (significand, exponent) = split_power(value);
+        Self {
+            significand,
+            exponent: i128::from(exponent),
+        }
+    }
+
+    fn multiply(self, rhs: Self) -> Self {
+        let (significand, shift) = split_power(self.significand * rhs.significand);
+        Self {
+            significand,
+            exponent: self.exponent + rhs.exponent + i128::from(shift),
+        }
+    }
+
+    fn divide(self, rhs: Self) -> Self {
+        let (significand, shift) = split_power(self.significand / rhs.significand);
+        Self {
+            significand,
+            exponent: self.exponent - rhs.exponent + i128::from(shift),
+        }
+    }
+
+    fn pow(mut self, mut order: usize) -> Self {
+        let mut result = Self::from_nonzero(1.);
+        while order != 0 {
+            if order & 1 != 0 {
+                result = result.multiply(self);
+            }
+            order >>= 1;
+            if order != 0 {
+                self = self.multiply(self);
+            }
+        }
+        result
+    }
+
+    fn finish(self) -> SpiceResult<Real> {
+        // Reject only if the final normalized coordinate is unrepresentable.
+        // Check the extended exponent before invoking the binary64 kernel.
+        if !(-1075..=1023).contains(&self.exponent) {
+            return Err(invalid(
+                "initial coordinate is outside finite nonzero range",
+            ));
+        }
+        let exponent = i32::try_from(self.exponent)
+            .map_err(|_| invalid("initial coordinate exponent overflow"))?;
+        let result = scale_power(self.significand, exponent);
+        if result == 0. || !result.is_finite() {
+            return Err(invalid(
+                "initial coordinate is outside finite nonzero range",
+            ));
+        }
+        Ok(result)
+    }
+}
+
+fn initial_coordinate(value: Real, leading: Real, scale: Real, order: usize) -> SpiceResult<Real> {
+    if value == 0. {
+        return Ok(value);
+    }
+    // Preserve ordinary division/multiplication order where intermediates
+    // are normal. Extreme frequencies, including a subnormal intermediate
+    // power or quotient, use the extended-exponent representation.
+    if let Ok(order) = i32::try_from(order) {
+        let power = scale.powi(order);
+        let quotient = value / power;
+        let result = quotient * leading;
+        if power.is_normal() && quotient.is_normal() && result.is_normal() {
+            return Ok(result);
+        }
+    }
+    ExtendedPower::from_nonzero(value)
+        .multiply(ExtendedPower::from_nonzero(leading))
+        .divide(ExtendedPower::from_nonzero(scale).pow(order))
+        .finish()
 }
 
 impl Realization {
@@ -130,21 +219,21 @@ impl Realization {
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| invalid("state dimension overflow"))?;
         let feedthrough = if numerator.len() == denominator.len() {
-            normalized(numerator[0], leading, 1.)?
+            normalized(numerator[0], leading)?
         } else {
             0.
         };
         let denominator = denominator[1..]
             .iter()
             .rev()
-            .map(|&value| normalized(value, leading, 1.))
+            .map(|&value| normalized(value, leading))
             .collect::<SpiceResult<Vec<_>>>()?;
         let output = denominator
             .iter()
             .enumerate()
             .map(|(index, &a)| {
                 let b = numerator.iter().rev().nth(index).copied().unwrap_or(0.);
-                let b = normalized(b, leading, 1.)?;
+                let b = normalized(b, leading)?;
                 let value = (-feedthrough).mul_add(a, b);
                 if !value.is_finite() {
                     return Err(invalid("nonfinite output realization coefficient"));
@@ -593,6 +682,9 @@ impl Model {
         let numerator = numerator.ok_or_else(|| invalid("s_xfer needs num_coeff"))?;
         let denominator = denominator.ok_or_else(|| invalid("s_xfer needs den_coeff"))?;
         let effective = coefficients(&denominator)?;
+        if effective[0] == 0. || !scale.is_finite() || scale <= 0. {
+            return Err(invalid("zero denominator or invalid frequency scale"));
+        }
         let order = effective.len() - 1;
         let mut coordinates = initial.unwrap_or_else(|| vec![0.; order]);
         if coordinates.len() != order {
@@ -605,13 +697,7 @@ impl Model {
         // changing the free response, including gain=0.
         coordinates.reverse();
         for (index, coordinate) in coordinates.iter_mut().enumerate() {
-            if *coordinate != 0. {
-                let power = scale.powi(
-                    i32::try_from(index)
-                        .map_err(|_| invalid("initial coordinate order overflow"))?,
-                );
-                *coordinate = normalized(*coordinate, power, effective[0])?;
-            }
+            *coordinate = initial_coordinate(*coordinate, effective[0], scale, index)?;
         }
         let realization = Realization::compile(RationalSpec {
             numerator: &numerator,

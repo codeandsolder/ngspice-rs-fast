@@ -477,3 +477,29 @@ fn uic_derivative_respects_physical_storage_and_redundant_inputs() -> SpiceResul
     }
     Ok(())
 }
+
+#[test]
+fn expression_controlled_inductors_require_an_explicit_coupled_flux_law() {
+    let error = run(
+        "v1 in 0 dc 0 ac 1\nr1 in p 1\nl1 p 0 l={1m*(1+i(v1)^2)}\nl2 out 0 1m\nr2 out 0 1\nk1 l1 l2 0.5",
+        AnalysisKind::Ac,
+        &["lin", "1", "1000", "1000"],
+    ).expect_err("no constant mutual coupling law is defined").to_string();
+    assert!(error.contains("explicit coupled flux law"), "{error}");
+}
+
+#[test]
+fn signed_differential_coefficients_are_not_clamped() -> SpiceResult<()> {
+    let plot = run(
+        "vr r 0 dc 1 ac 1\nr1 r 0 r={-1000*(1+v(r))}\nvc c 0 dc 1 ac 1\nc1 c 0 c={-1u*(1+v(c))}\nvl li 0 dc 0 ac 1\nrl li l 1\nl1 l 0 l={-1m*(1+v(r))}",
+        AnalysisKind::Ac,
+        &["lin", "1", "1000", "1000"],
+    )?;
+    let omega = std::f64::consts::TAU * 1000.;
+    // The R differential slope includes its own voltage-control term.
+    close(plot.value("i(vr)", 0).unwrap().re, 0.00025, 1e-12);
+    close(plot.value("i(vc)", 0).unwrap().im, omega * 2e-6, 1e-12);
+    let expected = -omega * 2e-3 / (1. + (omega * 2e-3).powi(2));
+    close(plot.value("i(vl)", 0).unwrap().im, expected, 1e-12);
+    Ok(())
+}
