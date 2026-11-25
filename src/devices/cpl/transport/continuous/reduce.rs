@@ -376,31 +376,35 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
         gram
     }
 
-    fn tent_projection(&self, middle: &[Real]) -> Vec<Real> {
+    fn tent_projection(&self) -> Vec<Real> {
         let (a, b) = self.endpoints();
-        let mut dot = vec![0.; a.len()];
-        for (x, y) in self.segments() {
-            let mut integrate = |left: Real, right: Real, first: &[Real], last: &[Real]| {
-                for i in 0..a.len() {
-                    let r1 = first[i] - chord(a[i], b[i], left);
-                    let r2 = last[i] - chord(a[i], b[i], right);
-                    dot[i] = (right - left).mul_add(
-                        product_integral(r1, r2, tent(left, self.split), tent(right, self.split)),
-                        dot[i],
+        // The peak is an existing knot, so no segment crosses the split.
+        // Carry each residual and tent weight into the next integral
+        // instead of recomputing both endpoints for every segment.
+        // Each component retains the original ordered fused sum.
+        a.iter()
+            .zip(b)
+            .enumerate()
+            .map(|(column, (&first, &last))| {
+                let mut dot: Real = 0.;
+                let mut previous_position = self.positions[0];
+                let mut previous_weight = tent(previous_position, self.split);
+                let mut previous_residual =
+                    self.row(0)[column] - chord(first, last, previous_position);
+                for (&position, row) in self.positions.iter().zip(self.rows()).skip(1) {
+                    let weight = tent(position, self.split);
+                    let residual = row[column] - chord(first, last, position);
+                    dot = (position - previous_position).mul_add(
+                        product_integral(previous_residual, residual, previous_weight, weight),
+                        dot,
                     );
+                    previous_position = position;
+                    previous_weight = weight;
+                    previous_residual = residual;
                 }
-            };
-            if x[0] < self.split && x[1] > self.split {
-                integrate(x[0], self.split, y[0], middle);
-                integrate(self.split, x[1], middle, y[1]);
-            } else {
-                integrate(x[0], x[1], y[0], y[1]);
-            }
-        }
-        for value in &mut dot {
-            *value *= 3.;
-        }
-        dot
+                dot * 3.
+            })
+            .collect()
     }
 
     fn contractive(&self, gram: &[Real], correction: &[Real]) -> bool {
@@ -615,6 +619,9 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
         let zero = vec![0.; self.indices.len()];
         let middle = self.midpoint();
         let (error, mut split) = self.error(&zero, &middle);
+        if self.knots.len() == 3 && error > self.tolerance {
+            return Choice::Split(1);
+        }
         let gram = self.gram();
         if error <= self.tolerance
             && self.contractive(&gram, &zero)
@@ -622,11 +629,16 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
         {
             return Choice::Chord;
         }
+        // A three-knot tent cannot reduce the point count. If its chord
+        // failed, keep its original interior point without a projection.
+        if self.knots.len() == 3 {
+            return Choice::Split(1);
+        }
         // A tent retains both endpoints. Its least-squares correction is
         // linear in the affine components. If that correction is not
         // contractive, move towards the minimum-energy tent (also linear)
         // until the Gram inequality is satisfied.
-        let optimum = self.tent_projection(&middle);
+        let optimum = self.tent_projection();
         let (a, b) = self.endpoints();
         let minimum: Vec<_> = a
             .iter()
@@ -637,7 +649,7 @@ impl<'a, Value: WaveValue> Reduction<'a, Value> {
         if let Some(mut correction) = correction {
             let (error, at) = self.error(&correction, &middle);
             split = at;
-            if error <= self.tolerance && self.knots.len() > 3 {
+            if error <= self.tolerance {
                 if self.prefix_contracts(&correction, &middle) {
                     return Choice::Tent(self.wave(&correction));
                 }
@@ -787,6 +799,45 @@ mod tests {
         let correction = [0.];
         assert!(reduction.contractive(&reduction.gram(), &correction));
         assert!(!reduction.prefix_contracts(&correction, &reduction.midpoint()));
+    }
+
+    #[test]
+    fn streaming_tent_projection_preserves_ordered_component_integrals() {
+        for count in [3, 4, 17, 64, 129] {
+            let knots: Vec<_> = (0..count)
+                .map(|index| {
+                    let x = Real::from(index) / Real::from(count - 1);
+                    let time = x * x + 1e-8 * x;
+                    let mut wave = super::super::Affine::scalar((x * 13.).sin());
+                    wave.set(1, (x * 7.).cos(), 4);
+                    wave.set(3, x * x, 4);
+                    Knot { time, wave }
+                })
+                .collect();
+            let candidate = Reduction::new(&knots, 4, 1e-3, 0., 0.99);
+            let (a, b) = candidate.endpoints();
+            let mut reference = vec![0.; a.len()];
+            for (x, y) in candidate.segments() {
+                assert!(!(x[0] < candidate.split && x[1] > candidate.split));
+                for i in 0..a.len() {
+                    let r1 = y[0][i] - chord(a[i], b[i], x[0]);
+                    let r2 = y[1][i] - chord(a[i], b[i], x[1]);
+                    reference[i] = (x[1] - x[0]).mul_add(
+                        product_integral(
+                            r1,
+                            r2,
+                            tent(x[0], candidate.split),
+                            tent(x[1], candidate.split),
+                        ),
+                        reference[i],
+                    );
+                }
+            }
+            for value in &mut reference {
+                *value *= 3.;
+            }
+            assert_eq!(candidate.tent_projection(), reference);
+        }
     }
 
     #[test]
