@@ -91,15 +91,25 @@ pub enum NoiseFamily {
     Prepared,
 }
 
+/// A generalized source injects into native MNA equation coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoiseCoordinate {
+    /// Current injection into a node's KCL equation.
+    Node(NodeId),
+    /// Injection into a device-local branch equation (e.g. series voltage
+    /// noise of an implicit nonlinear resistance).
+    Branch(usize),
+}
+
 /// The physical law of one noise generator, evaluated at the bias point.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NoiseKind {
     /// A physical PSD and its coherent generalized equation injections.
-    Prepared {
+    Generalized {
         /// Spectral density of the independent generator.
         density: Real,
-        /// Coordinate weights in native circuit-node identity.
-        injections: std::sync::Arc<[(NodeId, Complex)]>,
+        /// Coordinate weights in native node and device-local branch identity.
+        injections: std::sync::Arc<[(NoiseCoordinate, Complex)]>,
     },
     /// Thermal noise of a conductance: `4 k T g` (C `THERMNOISE`).
     Thermal {
@@ -228,7 +238,7 @@ impl NoiseKind {
             // C: `noizDens = gain; noizDens *= <numerator> / <denominator>`.
             Self::Flicker { numerator, law } => gain * law.apply(numerator, frequency),
             Self::Gain { factor } => gain * factor,
-            Self::Prepared { density, .. } => gain * density,
+            Self::Generalized { density, .. } => gain * density,
             Self::CorrelatedThermal { .. } => {
                 return Err(SpiceError::circuit(
                     "coherent thermal noise requires two complex transfers",
@@ -258,7 +268,7 @@ impl NoiseKind {
             } => 4. * BOLTZMANN * temperature * conductance,
             Self::Shot { current } => 2. * CHARGE * current.abs(),
             Self::Flicker { .. } | Self::Gain { .. } => return Ok(None),
-            Self::Prepared { density, .. } => density,
+            Self::Generalized { density, .. } => density,
             // Do not substitute the ordinary NevalSrc2 expression: the RF
             // branch builds complex port amplitudes and the C implementation
             // even uses param1 for both amplitude scales.
@@ -281,7 +291,7 @@ impl NoiseKind {
             Self::Shot { current } => current.is_finite(),
             Self::Flicker { numerator, law } => numerator.is_finite() && law.validate(),
             Self::Gain { factor } => factor.is_finite(),
-            Self::Prepared {
+            Self::Generalized {
                 density,
                 ref injections,
             } => {
@@ -375,11 +385,15 @@ impl NoiseSource {
     /// Construct a generalized source without reducing coherent injections
     /// to an artificial terminal pair.
     #[must_use]
-    pub fn prepared(name: &str, density: Real, injections: Vec<(NodeId, Complex)>) -> Self {
+    pub fn generalized(
+        name: &str,
+        density: Real,
+        injections: Vec<(NoiseCoordinate, Complex)>,
+    ) -> Self {
         Self {
             suffix: std::borrow::Cow::Owned(format!("_{name}")),
             nodes: [NodeId::GROUND; 2],
-            kind: NoiseKind::Prepared {
+            kind: NoiseKind::Generalized {
                 density,
                 injections: injections.into(),
             },

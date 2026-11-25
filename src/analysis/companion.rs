@@ -915,7 +915,9 @@ fn run_transient_inner(
     let model_context = context.model_context();
     let nonlinear = circuit.devices().iter().any(|d| d.is_nonlinear());
     let mut system = if nonlinear {
-        circuit.small_signal_system(&model_context, &Vector::zeros(circuit.unknown_count()))?
+        circuit
+            .prepare_run()
+            .transient_forcing_system(&model_context)?
     } else {
         circuit.linear_system_with_context(&model_context)?
     };
@@ -1531,23 +1533,43 @@ impl Driver<'_> {
             let start = initial::uic_start(self.circuit, &self.hints, &self.model_context)?;
             // C's single MODETRANOP|MODEUIC|MODEINITJCT load: nonlinear
             // devices evaluate at their instance initial conditions.
-            let trial = self.initial_state(&start.x, &start.charges, true)?;
+            let mut trial = self.initial_state(&start.x, &start.charges, true)?;
             let tolerances = &self.settings.tolerances;
-            initial::check_impulse_free(
-                self.circuit,
+            let mut right_rhs = self
+                .system
+                .transient_rhs(0., crate::devices::Limit::Right)?;
+            if let Some(mixed) = self.mixed.as_deref() {
+                mixed.initial_rhs(self.circuit, &mut right_rhs)?;
+            }
+            let consistent = initial::check_impulse_free(
+                &self.prepared,
                 &self.system.a,
-                &self
-                    .system
-                    .transient_rhs(0., crate::devices::Limit::Right)?,
-                &start.x,
+                &right_rhs,
+                &LoadRequest {
+                    mode: AnalysisMode::OperatingPoint,
+                    solution: &start.x,
+                    model_context: &self.model_context,
+                    integration: None,
+                    history: &self.history,
+                    forcing: Some(Forcing {
+                        limit: crate::devices::Limit::Right,
+                        timing: self.timing,
+                    }),
+                },
                 initial::Tolerances {
                     reltol: tolerances.reltol,
                     vntol: tolerances.vntol,
                     abstol: tolerances.abstol,
                 },
-                &self.model_context,
+                &self.bias.newton,
             )?;
-            (start.x, trial)
+            // Keep the device-flagged UIC history, but start nonlinear
+            // Newton iteration at the solved algebraic point rather than
+            // guessing every unspecified node/branch at zero.
+            for (slot, value) in consistent.canonical {
+                self.history.set_initial_slot(&mut trial, slot, value)?;
+            }
+            (consistent.solution.unwrap_or(start.x), trial)
         } else {
             let tolerances = &self.settings.tolerances;
             let constraints = initial::irredundant_constraints(

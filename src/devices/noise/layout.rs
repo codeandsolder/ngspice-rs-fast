@@ -2,7 +2,9 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use super::{BoundTransfer, DeviceNoise, NoiseContext, NoiseFamily, NoiseKind, NoiseSource};
+use super::{
+    BoundTransfer, DeviceNoise, NoiseContext, NoiseCoordinate, NoiseFamily, NoiseKind, NoiseSource,
+};
 use crate::devices::circuit::PreparedPoint;
 use crate::devices::{Circuit, MnaUnknowns, ModelContext, PreparedRun, StateSnapshot};
 use crate::maths::Vector;
@@ -53,6 +55,7 @@ impl BoundNoiseSource {
     pub(crate) fn bind(
         source: &NoiseSource,
         unknowns: &MnaUnknowns,
+        branches: Range<usize>,
         previous: Option<&Self>,
     ) -> SpiceResult<Self> {
         let primary =
@@ -65,10 +68,25 @@ impl BoundNoiseSource {
             )?),
             _ => None,
         };
-        let general = if let NoiseKind::Prepared { injections, .. } = &source.kind {
+        let general = if let NoiseKind::Generalized { injections, .. } = &source.kind {
             injections
                 .iter()
-                .map(|&(node, weight)| Ok((unknowns.checked_node_row(node)?, weight)))
+                .map(|&(coordinate, weight)| {
+                    let row = match coordinate {
+                        NoiseCoordinate::Node(node) => unknowns.checked_node_row(node)?,
+                        NoiseCoordinate::Branch(index)
+                            if index < branches.len() && branches.end <= unknowns.len() =>
+                        {
+                            Some(branches.start + index)
+                        }
+                        NoiseCoordinate::Branch(_) => {
+                            return Err(SpiceError::circuit(
+                                "noise injection branch outside device",
+                            ));
+                        }
+                    };
+                    Ok((row, weight))
+                })
                 .collect::<SpiceResult<Vec<_>>>()?
         } else {
             Vec::new()
@@ -120,7 +138,7 @@ impl BoundNoiseSource {
                     Complex::new(amplitude * cos, amplitude * sin),
                 )
             }
-            NoiseKind::Prepared { .. } => (Complex::ZERO, Complex::ZERO),
+            NoiseKind::Generalized { .. } => (Complex::ZERO, Complex::ZERO),
             kind => {
                 let density = kind.scalar_output_density(1., frequency.abs())?;
                 if density < 0. {
@@ -139,7 +157,7 @@ impl BoundNoiseSource {
         let [a, b] = self.primary.rows();
         let [c, d] = self.secondary.map_or([None, None], BoundTransfer::rows);
         let scale = match self.kind {
-            NoiseKind::Prepared { density, .. } => density.sqrt(),
+            NoiseKind::Generalized { density, .. } => density.sqrt(),
             _ => 0.,
         };
         let signed = move |weight: Complex| {
@@ -324,7 +342,14 @@ impl<'a> NoisePlan<'a> {
             let rank = *models.entry((family, model)).or_insert(next_rank);
             let start = sources.len();
             for source in &scratch {
-                sources.push(BoundNoiseSource::bind(source, circuit.unknowns(), None)?);
+                sources.push(BoundNoiseSource::bind(
+                    source,
+                    circuit.unknowns(),
+                    circuit
+                        .branch_rows(index)
+                        .ok_or_else(|| SpiceError::circuit("missing noise branch binding"))?,
+                    None,
+                )?);
             }
             entries.push((
                 rank,
@@ -426,6 +451,9 @@ impl<'a> NoisePlan<'a> {
                         self.staging[slot] = BoundNoiseSource::bind(
                             source,
                             self.circuit.unknowns(),
+                            self.circuit.branch_rows(index).ok_or_else(|| {
+                                SpiceError::circuit("missing noise branch binding")
+                            })?,
                             Some(&self.sources[slot]),
                         )?;
                     }
@@ -458,6 +486,7 @@ mod prepared_tests {
         let injections: Vec<_> = nodes
             .iter()
             .copied()
+            .map(NoiseCoordinate::Node)
             .zip([
                 Complex::new(1., 2.),
                 Complex::new(-2., 1.),
@@ -466,8 +495,8 @@ mod prepared_tests {
                 Complex::new(1., 0.),
             ])
             .collect();
-        let source = NoiseSource::prepared("coherent", 4., injections);
-        let bound = BoundNoiseSource::bind(&source, circuit.unknowns(), None).unwrap();
+        let source = NoiseSource::generalized("coherent", 4., injections);
+        let bound = BoundNoiseSource::bind(&source, circuit.unknowns(), 0..0, None).unwrap();
         let mut adjoint = vec![Complex::ZERO; circuit.unknown_count()];
         for (&node, value) in nodes.iter().zip([
             Complex::new(2., 1.),

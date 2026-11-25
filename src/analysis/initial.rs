@@ -42,7 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::devices::{Circuit, ModelContext};
+use crate::devices::{Circuit, IterationPhase, LoadRequest, ModelContext, PreparedRun};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
@@ -285,7 +285,7 @@ pub(super) fn uic_start(
     }
     for index in 0..circuit.device_count() {
         if let Some(voltage) = bound_initial_voltage(circuit, index, &x, context)? {
-            charges.push((voltage.slot, voltage.scale * voltage.constraint.voltage));
+            charges.push((voltage.slot, voltage.scale * voltage.voltage));
         }
     }
     Ok(UicStart { x, charges })
@@ -336,18 +336,12 @@ fn bound_initial_coordinates(
     Ok(bound)
 }
 
-struct BoundVoltage {
-    slot: usize,
-    scale: Real,
-    constraint: CapacitorInitial,
-}
-
 fn bound_initial_voltage(
     circuit: &Circuit,
     index: usize,
     initial: &Vector,
     context: &ModelContext,
-) -> SpiceResult<Option<BoundVoltage>> {
+) -> SpiceResult<Option<CapacitorInitial>> {
     let device = &circuit.devices()[index];
     let Some(storage) = device.initial_voltage_storage(context)? else {
         return Ok(None);
@@ -382,16 +376,14 @@ fn bound_initial_voltage(
             Ok(AbsoluteRow(rows.start + equation))
         })
         .transpose()?;
-    Ok(Some(BoundVoltage {
+    Ok(Some(CapacitorInitial {
         slot: states.start + storage.slot,
         scale: storage.scale,
-        constraint: CapacitorInitial {
-            name: device.name().to_owned(),
-            positive,
-            negative,
-            voltage,
-            equation,
-        },
+        name: device.name().to_owned(),
+        positive,
+        negative,
+        voltage,
+        equation,
     }))
 }
 
@@ -413,6 +405,8 @@ struct CapacitorInitial {
     negative: VoltageVertex,
     voltage: Real,
     equation: Option<AbsoluteRow>,
+    slot: usize,
+    scale: Real,
 }
 
 impl ImpulseStorage {
@@ -431,7 +425,7 @@ impl ImpulseStorage {
                 }
             }
             if let Some(voltage) = bound_initial_voltage(circuit, index, initial, context)? {
-                storage.capacitors.push(voltage.constraint);
+                storage.capacitors.push(voltage);
             }
         }
         Ok(storage)
@@ -442,6 +436,9 @@ impl ImpulseStorage {
 struct CapacitorRelations<'a> {
     kept: Vec<&'a CapacitorInitial>,
     implied: Vec<ImpliedCapacitor<'a>>,
+    // Known redundant voltage relations; snap their accepted storage
+    // to the actual constrained voltage, within the user's IC tolerance.
+    canonical: Vec<(usize, Real)>,
 }
 
 struct ImpliedCapacitor<'a> {
@@ -460,6 +457,7 @@ impl<'a> CapacitorRelations<'a> {
         let mut relations = Self {
             kept: Vec::new(),
             implied: Vec::new(),
+            canonical: Vec::new(),
         };
         for capacitor in capacitors {
             let CapacitorInitial {
@@ -478,7 +476,11 @@ impl<'a> CapacitorRelations<'a> {
             }
             match graph.join(*positive, *negative, *voltage, Origin::Device(name))? {
                 Join::Tree => relations.kept.push(capacitor),
-                Join::Cycle { expected } if tolerance.agree(expected, *voltage) => {}
+                Join::Cycle { expected } if tolerance.agree(expected, *voltage) => {
+                    relations
+                        .canonical
+                        .push((capacitor.slot, capacitor.scale * expected));
+                }
                 Join::Cycle { expected } => {
                     return Err(failure(format!(
                         "uic initial conditions are inconsistent with the circuit at t = 0+: \
@@ -494,7 +496,7 @@ impl<'a> CapacitorRelations<'a> {
     }
 
     fn check_implied(
-        &self,
+        &mut self,
         solution: &InstantaneousSolution,
         tolerance: VoltageTolerance,
     ) -> SpiceResult<()> {
@@ -528,9 +530,90 @@ impl<'a> CapacitorRelations<'a> {
                      or add series impedance"
                 )));
             }
+            self.canonical
+                .push((capacitor.slot, capacitor.scale * expected));
         }
         Ok(())
     }
+}
+
+/// Disposable exact static Newton loads for the reduced instantaneous
+/// circuit. The initial history remains untouched; the ordinary UIC
+/// device-flagged load still owns semiconductor initial charge semantics.
+fn solve_nonlinear_instantaneous(
+    prepared: &PreparedRun<'_>,
+    request: &LoadRequest<'_>,
+    storage: &ImpulseStorage,
+    kept: &[&CapacitorInitial],
+    tolerances: Tolerances,
+    options: &crate::analysis::newton::NewtonOptions,
+) -> SpiceResult<Option<InstantaneousSolution>> {
+    let circuit = prepared.circuit();
+    let mut x = request.solution.clone();
+    let mut matrix = circuit.new_matrix()?;
+    let mut rhs = Vector::zeros(x.len());
+    let limited = crate::analysis::bias::limited_rows(circuit).unwrap_or_else(|| {
+        crate::analysis::bias::branch_rows(circuit)
+            .into_iter()
+            .map(|branch| !branch)
+            .collect()
+    });
+    let mut previous = None;
+    let mut best: Option<(Real, InstantaneousSolution)> = None;
+    let mut trial = None;
+    for _ in 0..options.max_iterations {
+        matrix.clear();
+        rhs.clear();
+        let mut next_trial = request
+            .history
+            .trial_in(IterationPhase::Float, trial.as_ref())?
+            .with_device_limiting(false);
+        prepared.load(
+            &LoadRequest {
+                solution: &x,
+                ..*request
+            },
+            &mut matrix,
+            &mut rhs,
+            &mut next_trial,
+        )?;
+        let nonconvergent = next_trial.is_nonconvergent();
+        trial = Some(next_trial);
+        let system = InstantaneousSystem::assemble(circuit, &matrix, &rhs, storage, kept)?;
+        if let Some(solution) = previous.take()
+            && !nonconvergent
+        {
+            let (ratio, roundoff) = system.residual_ratio(&solution, tolerances);
+            if ratio <= 1. {
+                // Refine a consistent algebraic point to rounding accuracy
+                // when possible. Otherwise retain the best verified iterate
+                // once the residual stops improving. A tiny voltage error
+                // can become a large artificial derivative on the first step.
+                if roundoff {
+                    return Ok(Some(solution));
+                }
+                if best.as_ref().is_some_and(|(score, _)| ratio >= *score) {
+                    return Ok(best.map(|(_, solution)| solution));
+                }
+                best = Some((ratio, solution));
+            }
+        }
+        let Some(solution) = system.solve(circuit, storage, tolerances)? else {
+            return Ok(None);
+        };
+        let scale = solution.step_scale(&x, options.voltage_step, &limited);
+        x = solution.update(&x, scale);
+        previous = (scale == 1.).then_some(solution);
+    }
+    best.map(|(_, solution)| Some(solution))
+        .ok_or_else(|| failure("uic nonlinear instantaneous constraints did not converge"))
+}
+
+/// Consistent algebraic guess plus canonical storage values for redundant
+/// initial voltage constraints.
+pub(super) struct CheckedInitial {
+    pub solution: Option<Vector>,
+    pub canonical: Vec<(usize, Real)>,
 }
 
 /// Checks that the `uic` state can start without an impulse at `t = 0+`.
@@ -544,8 +627,8 @@ impl<'a> CapacitorRelations<'a> {
 /// stay as they are. Native differential devices replace their evolution
 /// equations, preserving their constitutive rows. Fixed internal transfer
 /// coordinates eliminate their own differential equations. For nonlinear
-/// devices the check uses the supplied static linearization; a complete
-/// nonlinear instantaneous consistency solve requires further work.
+/// devices the reduced system is reloaded at each Newton iterate and
+/// checked against the true residual before accepting consistency.
 ///
 /// Redundant-but-consistent relations (a capacitor whose `ic` equals the
 /// voltage that ideal sources already force, an inductor in series with a
@@ -556,27 +639,53 @@ impl<'a> CapacitorRelations<'a> {
 /// # Errors
 /// An inconsistent (impulsive) or ill-posed initial state.
 pub(super) fn check_impulse_free(
-    circuit: &Circuit,
+    prepared: &PreparedRun<'_>,
     a: &SparseMatrix,
     rhs: &Vector,
-    x: &Vector,
+    request: &LoadRequest<'_>,
     tolerances: Tolerances,
-    context: &ModelContext,
-) -> SpiceResult<()> {
-    let storage = ImpulseStorage::collect(circuit, x, context)?;
+    options: &crate::analysis::newton::NewtonOptions,
+) -> SpiceResult<CheckedInitial> {
+    let circuit = prepared.circuit();
+    let storage = ImpulseStorage::collect(circuit, request.solution, request.model_context)?;
     if storage.capacitors.is_empty() && storage.fixed_coordinates.is_empty() {
-        return Ok(());
+        return Ok(CheckedInitial {
+            solution: None,
+            canonical: Vec::new(),
+        });
     }
     let voltage_tolerance = VoltageTolerance {
         reltol: tolerances.reltol,
         vntol: tolerances.vntol,
     };
-    let relations =
+    let mut relations =
         CapacitorRelations::classify(circuit, rhs, &storage.capacitors, voltage_tolerance)?;
-    let system = InstantaneousSystem::assemble(circuit, a, rhs, &storage, &relations.kept)?;
-    match system.solve(circuit, &storage, tolerances)? {
-        Some(solution) => relations.check_implied(&solution, voltage_tolerance),
-        None if relations.implied.is_empty() => Ok(()),
+    let nonlinear = circuit.devices().iter().any(|device| device.is_nonlinear());
+    let solution = if nonlinear {
+        solve_nonlinear_instantaneous(
+            prepared,
+            request,
+            &storage,
+            &relations.kept,
+            tolerances,
+            options,
+        )?
+    } else {
+        InstantaneousSystem::assemble(circuit, a, rhs, &storage, &relations.kept)?
+            .solve(circuit, &storage, tolerances)?
+    };
+    match solution {
+        Some(solution) => {
+            relations.check_implied(&solution, voltage_tolerance)?;
+            Ok(CheckedInitial {
+                solution: nonlinear.then(|| solution.update(request.solution, 1.)),
+                canonical: relations.canonical,
+            })
+        }
+        None if relations.implied.is_empty() => Ok(CheckedInitial {
+            solution: None,
+            canonical: relations.canonical,
+        }),
         None => Err(failure(format!(
             "uic initial conditions cannot be shown consistent: capacitors across the \
              output of controlled sources {} are left without an instantaneous system",

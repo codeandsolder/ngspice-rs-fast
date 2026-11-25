@@ -767,6 +767,7 @@ mod tests {
                 NoiseKind::Gain { factor },
             ),
             &unknowns,
+            0..0,
             None,
         )
         .unwrap()

@@ -113,6 +113,19 @@ impl ChargeContext<'_> {
     }
 }
 
+/// Physical convergence tolerance of an MNA coordinate. Auxiliary
+/// constitutive coordinates are checked through their device's physical
+/// residual, not an arbitrary tolerance in amperes or volts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergenceKind {
+    /// Voltage-like coordinate.
+    Voltage,
+    /// Current-like coordinate.
+    Current,
+    /// Auxiliary coordinate governed by the device convergence test.
+    Constitutive,
+}
+
 /// Which stored quantity a [`StorageElement`] integrates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageKind {
@@ -446,6 +459,10 @@ pub struct ConvergenceContext<'a> {
     pub previous: &'a Vector,
     /// Branch rows of [`Device::controlling_sources`], in order.
     pub controls: &'a [usize],
+    /// This device's first allocated branch, if any.
+    pub branch: Option<usize>,
+    /// Time-integration formula of the load, absent in DC.
+    pub integration: Option<&'a Coefficients>,
     /// This device's slots of the last load's trial (C `CKTstate0`).
     pub states: &'a [Real],
     /// The Newton phase of the last load (C's `MODEINITF` bits when
@@ -812,6 +829,12 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// current row; zero for everything else.
     fn branch_currents(&self) -> usize {
         0
+    }
+
+    /// Convergence classification of a device-local branch coordinate.
+    /// A constitutive coordinate must be checked by convergence_test.
+    fn branch_convergence(&self, _branch: usize) -> ConvergenceKind {
+        ConvergenceKind::Current
     }
 
     /// Devices whose branch current this device senses (F/H controlling

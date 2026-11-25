@@ -521,6 +521,7 @@ fn prepared_point_reuses_ordered_setters_for_load_convergence_and_observation() 
                     trial: &trial,
                     model_context: &model,
                     time: 0.,
+                    integration: None,
                     reltol: 1e-3,
                     abstol: 1e-12,
                     vntol: 1e-6,

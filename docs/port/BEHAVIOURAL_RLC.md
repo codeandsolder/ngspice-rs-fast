@@ -126,9 +126,15 @@ interface: transfer voltage outputs are controlled, current inputs
 impose zero differential voltage, and analog/DAC and ordinary sources
 declare their corresponding relations. The consistency checker keeps
 the established independent/controlled constraint graph and rejects
-inconsistent constraints before history acceptance. Its nonlinear
-instantaneous check still uses the static linearization supplied by the
-transient driver, not a general nonlinear constrained solve.
+inconsistent constraints before history acceptance. The nonlinear
+instantaneous check reloads the actual static device residual and
+Jacobian at each iterate of the reduced constrained system. It verifies
+the physical residual after reloading, refines the consistent point
+toward roundoff, and uses that point as the transient starting guess.
+Redundant voltage constraints within the IC tolerance are canonicalized
+to the solved voltage before committing history. The ordinary device UIC
+load still owns semiconductor initial charge semantics. The rank
+reduction is not a general nonlinear rank-revealing constraint solver.
 
 Nonlinear C/L `ic=` is intentionally retained under UIC, rather than
 discarded by the frontend as observed in ngspice 47 (instance and node
@@ -141,11 +147,35 @@ error 1.84e-4 V. Native transfer tests check the same law against a
 2e-5 V tolerance, second-order free response with zero gain, and
 conflicts at voltage outputs and current-sensing inputs.
 
+## Convergence and noise
+
+Newton distinguishes physical voltage/current coordinates from internal
+constitutive rates. The latter are checked through the corresponding
+physical residual, including the companion derivative at the new
+iterate, rather than comparing a V/s or A/s coordinate against an
+absolute current tolerance. The storage affine offset is formed before
+multiplication by the integration coefficient; linear differential
+storage has exactly zero offset. This avoids unnecessary cancellation
+in the history source at small timesteps.
+
+Behavioural resistors are noiseless by default. Explicit noisy=1 (also
+noise=1) injects a series thermal-voltage PSD 4 k T R into the native
+constitutive branch equation, using the effective operating resistance
+and instance temperature. This preserves current-controlled feedback,
+unlike adding a parallel Norton source outside the expression's current
+measurement. Negative or nonfinite thermal resistance and invalid
+absolute temperature are rejected. Generalized noise sources use
+device-local branch or node coordinates, resolved during noise layout.
+For a self-current-controlled resistance of 2 kohm at the bias point,
+3 kohm differential resistance and 1 kohm load, the native and live
+ngspice 47 output spectral amplitudes both equal
+1.439447175 nV/sqrt(Hz) at the default bias tolerance.
+
 ## Remaining work
 
 Source-dialect E/G LAPLACE normalization is tracked in the preprocessing
 repository (#44), using the native rational transfer model. Statistical
-functions, arbitrary charge-law initial-condition constraints, a
-fully nonlinear instantaneous consistency solve, noise, mutual coupling,
-broader reference coverage, and nonlinear convergence/candidate testing
+functions, arbitrary charge-law initial-condition constraints, rank-aware
+constraint reduction, mutual coupling, broader reference coverage, and
+nonlinear candidate testing
 remain within issue #184.

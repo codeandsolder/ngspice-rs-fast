@@ -170,6 +170,7 @@ struct TopologyBindings {
     names: DeviceNames,
     order: Vec<usize>,
     branch_rows: Vec<std::ops::Range<usize>>,
+    convergence_kinds: Vec<crate::devices::ConvergenceKind>,
     control_rows: Vec<Vec<usize>>,
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
@@ -342,6 +343,10 @@ impl<'a> PreparedTransient<'a> {
 
     pub(crate) const fn run(&self) -> &'a PreparedRun<'a> {
         self.run
+    }
+
+    pub(crate) const fn coefficients(&self) -> &'a Coefficients {
+        self.coefficients
     }
 
     pub(crate) const fn history(&self) -> &'a StateHistory {
@@ -663,6 +668,16 @@ impl<'a> PreparedRun<'a> {
             .bias_linearized_system(self, context, bias, state, 0, None)
     }
 
+    /// Transient source timing and fixed linear equations, without
+    /// evaluating nonlinear devices at an artificial zero bias. The actual
+    /// nonlinear static and transient equations are loaded by Newton.
+    pub(crate) fn transient_forcing_system(
+        &self,
+        context: &ModelContext,
+    ) -> SpiceResult<crate::devices::linear::LinearSystem> {
+        self.circuit.assemble_linear_devices(self, context, true)
+    }
+
     /// The constant linear operators and source bindings of a physical DAE.
     /// Nonlinear devices are handled by the ordinary exact load and their
     /// separate physical charge laws. Reject history-dependent equations
@@ -965,6 +980,8 @@ pub struct ConvergenceRequest<'a> {
     pub model_context: &'a ModelContext,
     /// Transient time, zero otherwise.
     pub time: Real,
+    /// Companion formula for the current transient step.
+    pub integration: Option<&'a Coefficients>,
     /// C `CKTreltol`.
     pub reltol: Real,
     /// C `CKTabstol`.
@@ -1364,6 +1381,13 @@ impl Circuit {
                 self.bindings.unknowns.assign_deferred(node);
             }
             allocate_branch(&mut self.bindings.unknowns, index)?;
+        }
+        self.bindings.convergence_kinds =
+            vec![crate::devices::ConvergenceKind::Voltage; self.bindings.unknowns.len()];
+        for (device, rows) in self.devices.iter().zip(&self.bindings.branch_rows) {
+            for (local, row) in rows.clone().enumerate() {
+                self.bindings.convergence_kinds[row] = device.branch_convergence(local);
+            }
         }
         let mut state_rows = Vec::with_capacity(self.devices.len());
         self.bindings.state_len = 0;
@@ -1997,6 +2021,8 @@ impl Circuit {
                 solution: request.solution,
                 previous: request.previous,
                 controls: self.controls(index)?,
+                branch: self.bindings.branch_rows[index].clone().next(),
+                integration: request.integration,
                 states: &request.trial.values()[self.bindings.state_rows[index].clone()],
                 phase: request.trial.phase(),
                 model_context: request.model_context,
@@ -2236,6 +2262,10 @@ impl Circuit {
     pub fn branch_rows(&self, index: usize) -> Option<std::ops::Range<usize>> {
         self.bindings.identity.as_ref()?;
         self.bindings.branch_rows.get(index).cloned()
+    }
+
+    pub(crate) fn convergence_kinds(&self) -> &[crate::devices::ConvergenceKind] {
+        &self.bindings.convergence_kinds
     }
 
     /// The name of every unknown by matrix row, as ngspice names them
@@ -3104,6 +3134,9 @@ impl Circuit {
                 || original.designator() != replacement.designator()
                 || original.terminals() != replacement.terminals()
                 || original.branch_currents() != replacement.branch_currents()
+                || (0..original.branch_currents()).any(|row| {
+                    original.branch_convergence(row) != replacement.branch_convergence(row)
+                })
                 || original.state_count() != replacement.state_count()
                 || original.findable_branch() != replacement.findable_branch()
                 || !original

@@ -12,14 +12,17 @@ use super::{
     literal, unsupported,
 };
 use crate::devices::linear::LinearContext;
-use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseSource};
+use crate::devices::noise::{
+    BOLTZMANN, CELSIUS_TO_KELVIN, DeviceNoise, NoiseContext, NoiseCoordinate, NoiseFamily,
+    NoiseSource,
+};
 use crate::devices::setup::MatrixSetup;
 use crate::devices::traits::{
     AnalysisMode, ChargeContext, ControlReference, Device, MnaUnknowns, StampContext,
 };
 use crate::maths::{SparseMatrix, Vector};
 use crate::netlist::ast::{DeviceInstance, ParameterKind};
-use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
+use crate::primitives::{Complex, NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 /// Physical interpretation of the compiled scalar expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +209,33 @@ impl Bound<'_, '_> {
             Ok(())
         })
     }
+    fn storage_affine(
+        &self,
+        matrix: &mut SparseMatrix,
+        row: usize,
+        scalar: Scalar,
+        multiplier: Real,
+        history: Real,
+        rhs: &mut Real,
+    ) -> SpiceResult<()> {
+        // Form the affine equivalent in storage units, before multiplying
+        // by 1/dt. For linear differential voltage/current storage the
+        // offset is identically zero; do not subtract two large O(1/dt)
+        // values just to reconstruct the history source.
+        let mut equivalent = -scalar.value;
+        self.derivatives(scalar, |column, value, derivative| {
+            matrix.add(row, column, multiplier * derivative)?;
+            if scalar.expression != 0. {
+                equivalent = derivative.mul_add(value, equivalent);
+            }
+            Ok(())
+        })?;
+        if scalar.expression == 0. {
+            equivalent = 0.;
+        }
+        *rhs = multiplier.mul_add(equivalent, *rhs - history);
+        Ok(())
+    }
 }
 
 /// A compiled native behavioural passive. Reuses the ordinary behavioural
@@ -215,6 +245,7 @@ struct Passive {
     expression: Behavioural,
     law: Law,
     initial: Option<Real>,
+    noisy: bool,
 }
 
 impl Passive {
@@ -307,6 +338,13 @@ impl Device for Passive {
     fn branch_currents(&self) -> usize {
         self.law.branches()
     }
+    fn branch_convergence(&self, branch: usize) -> crate::devices::ConvergenceKind {
+        if self.law.differential() && branch == 1 {
+            crate::devices::ConvergenceKind::Constitutive
+        } else {
+            crate::devices::ConvergenceKind::Current
+        }
+    }
     fn findable_branch(&self) -> Option<usize> {
         (self.law != Law::Derivative).then_some(0)
     }
@@ -359,6 +397,71 @@ impl Device for Passive {
 
     fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
         self.expression.validate_dc_inputs(context)
+    }
+
+    fn convergence_test(
+        &self,
+        context: &crate::devices::ConvergenceContext<'_>,
+    ) -> SpiceResult<bool> {
+        let branch = self.equation_row(context.unknowns, context.branch)?;
+        self.with_bound(
+            BoundInput {
+                solution: context.solution,
+                unknowns: context.unknowns,
+                controls: context.controls,
+                branch,
+                time: context.time,
+                model: context.model_context,
+            },
+            |bound, equations| {
+                let [p, n, current, rate] = bound.values;
+                let voltage = p - n;
+                let coefficient = bound.factor * bound.expression.evaluation.value;
+                let disagree = |actual: Real, expected: Real, absolute: Real| {
+                    !actual.is_finite()
+                        || !expected.is_finite()
+                        || (actual - expected).abs()
+                            > context
+                                .reltol
+                                .mul_add(actual.abs().max(expected.abs()), absolute)
+                };
+                let derivative = |quantity: Real| -> SpiceResult<Real> {
+                    if let Some(integration) = context.integration {
+                        let [previous, previous_derivative, ..] = context.states else {
+                            return Err(SpiceError::circuit(
+                                "missing constitutive convergence history",
+                            ));
+                        };
+                        // The last load's derivative plus the exact present
+                        // storage change gives the derivative at the new iterate.
+                        Ok(integration.ag()[0].mul_add(quantity - previous, *previous_derivative))
+                    } else {
+                        Ok(0.)
+                    }
+                };
+                let dynamic = || -> SpiceResult<Real> {
+                    let storage = equations
+                        .into_iter()
+                        .flatten()
+                        .find_map(|equation| equation.storage)
+                        .ok_or_else(|| SpiceError::circuit("missing constitutive storage"))?;
+                    derivative(storage.value)
+                };
+                Ok(match self.law {
+                    Law::Resistance => disagree(voltage, coefficient * current, context.vntol),
+                    Law::Charge => disagree(current, -dynamic()?, context.abstol),
+                    Law::Derivative => disagree(voltage, -dynamic()?, context.vntol),
+                    Law::Capacitance => {
+                        disagree(current, coefficient * rate, context.abstol)
+                            || disagree(current, -coefficient * dynamic()?, context.abstol)
+                    }
+                    Law::Inductance => {
+                        disagree(voltage, coefficient * rate, context.vntol)
+                            || disagree(voltage, -coefficient * dynamic()?, context.vntol)
+                    }
+                })
+            },
+        )
     }
 
     fn setup_matrix(&self, setup: &mut MatrixSetup<'_>) -> SpiceResult<bool> {
@@ -432,9 +535,15 @@ impl Device for Passive {
                     let mut rhs = -equation.static_part.value;
                     bound.affine(context.matrix, row, equation.static_part, 1., &mut rhs)?;
                     if let Some(storage) = equation.storage {
-                        let (derivative, multiplier) = dynamic::integrate(context, storage.value)?;
-                        rhs -= derivative;
-                        bound.affine(context.matrix, row, storage, multiplier, &mut rhs)?;
+                        let (history, multiplier) = dynamic::integrate(context, storage.value)?;
+                        bound.storage_affine(
+                            context.matrix,
+                            row,
+                            storage,
+                            multiplier,
+                            history,
+                            &mut rhs,
+                        )?;
                     }
                     context.rhs.add_to(row, rhs)?;
                 }
@@ -513,12 +622,51 @@ impl Device for Passive {
 
     fn noise(
         &self,
-        _context: &NoiseContext<'_>,
-        _sources: &mut Vec<NoiseSource>,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
     ) -> SpiceResult<DeviceNoise<'_>> {
-        // Native behavioural passive expressions are noiseless unless an
-        // explicit noise law is requested. Such requests are rejected at bind.
-        Ok(DeviceNoise::Noiseless)
+        if !self.noisy {
+            return Ok(DeviceNoise::Noiseless);
+        }
+        let factor = self
+            .expression
+            .checked_factor(context.model_context.temperature)?;
+        let resistance = self.expression.with_linearization(
+            context.bias,
+            context.unknowns,
+            context.controls,
+            0.,
+            context.model_context,
+            |linearization| Ok(factor * linearization.evaluation.value),
+        )?;
+        let scale = &self.expression.scale;
+        let temperature = scale
+            .temperature
+            .unwrap_or(context.model_context.temperature)
+            + scale.dtemp
+            + CELSIUS_TO_KELVIN;
+        if !resistance.is_finite()
+            || resistance < 0.
+            || !temperature.is_finite()
+            || temperature <= 0.
+        {
+            return Err(SpiceError::Numerical {
+                context: format!("thermal noise of {}", self.name()),
+                message: "thermal resistance must be nonnegative and temperature positive".into(),
+            });
+        }
+        // Noise is the series EMF of the physical resistance, not a
+        // parallel current source that bypasses self-current feedback.
+        sources.push(NoiseSource::generalized(
+            "thermal",
+            4. * BOLTZMANN * temperature * resistance,
+            vec![(NoiseCoordinate::Branch(0), Complex::real(1.))],
+        ));
+        Ok(DeviceNoise::Sources {
+            family: NoiseFamily::Resistor,
+            model: None,
+            total: true,
+        })
     }
 }
 
@@ -536,6 +684,7 @@ pub(in crate::devices) fn instantiate(
     let mut expression = None;
     let mut scale = BehaviouralScale::default();
     let mut initial = None;
+    let mut noisy = false;
     for parameter in &instance.parameters {
         match &parameter.kind {
             ParameterKind::Behavioural(tree) => {
@@ -567,7 +716,7 @@ pub(in crate::devices) fn instantiate(
                     "tc2" => scale.tc2 = value,
                     "temp" => scale.temperature = Some(value),
                     "dtemp" => scale.dtemp = value,
-                    "noisy" if value.abs() == 0. => {}
+                    "noisy" if value == 0. || value == 1. => noisy = value == 1.,
                     "ic" => initial = Some(value),
                     _ => {
                         return Err(unsupported(
@@ -587,6 +736,12 @@ pub(in crate::devices) fn instantiate(
     }
     let (law, tree) =
         expression.ok_or_else(|| SpiceError::circuit("missing behavioural passive law"))?;
+    if noisy && law != Law::Resistance {
+        return Err(unsupported(
+            &instance.location,
+            "thermal noise is only defined for a resistive law",
+        ));
+    }
     if initial.is_some() && !law.differential() {
         return Err(unsupported(
             &instance.location,
@@ -606,5 +761,6 @@ pub(in crate::devices) fn instantiate(
         expression,
         law,
         initial,
+        noisy,
     }))
 }
