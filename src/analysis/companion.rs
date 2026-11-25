@@ -660,7 +660,7 @@ struct Driver<'a> {
     limited_rows: Option<Vec<bool>>,
     /// Each device's state rows and the absolute state index of every
     /// charge it hands `CKTterr` (`truncation_slots`), fixed for the run.
-    truncation: Vec<(std::ops::Range<usize>, Vec<usize>)>,
+    truncation: Vec<(std::ops::Range<usize>, Vec<(usize, bool)>)>,
     stats: TransientStats,
     /// Reuse the ordinary Newton MNA/RHS/trial storage across timepoint
     /// acceptance and rejected smaller-step retries.
@@ -960,7 +960,14 @@ fn run_transient_inner(
             let bases = device
                 .truncation_slots()
                 .into_iter()
-                .map(|slot| rows.start + slot)
+                .map(|slot| {
+                    (
+                        rows.start + slot,
+                        device
+                            .initial_expression_storage()
+                            .is_some_and(|storage| storage.slot == slot),
+                    )
+                })
                 .collect();
             Ok((rows, bases))
         })
@@ -1169,7 +1176,7 @@ impl Driver<'_> {
                 .accepted(1)
                 .ok_or_else(|| failure("periodic charge history is empty"))?;
             for (_, slots) in &self.truncation {
-                for &slot in slots {
+                for &(slot, _) in slots {
                     scales[slot] = scales[slot].max(state[slot].abs());
                 }
             }
@@ -1771,7 +1778,7 @@ impl Driver<'_> {
         let order = usize::from(coefficients.order());
         let mut limit = Real::INFINITY;
         for (device, (rows, bases)) in self.circuit.devices().iter().zip(&self.truncation) {
-            for &base in bases {
+            for &(base, explicit_derivative) in bases {
                 let accepted = |age: usize, offset: usize| {
                     self.history
                         .accepted(age)
@@ -1779,18 +1786,29 @@ impl Driver<'_> {
                         .copied()
                         .ok_or_else(|| failure("accepted state history is too short"))
                 };
-                // The trial charge, then `order + 1` accepted ones.
                 let mut storage = [0.0; IntegrationMethod::MAX_GEAR_ORDER as usize + 2];
-                let charge = storage
-                    .get_mut(..order + 2)
-                    .ok_or_else(|| failure("integration order out of range"))?;
-                charge[0] = trial.values()[base];
-                for (age, value) in charge.iter_mut().enumerate().skip(1) {
-                    *value = accepted(age, 0)?;
-                }
-                let derivative = [trial.values()[base + 1], accepted(1, 1)?];
-                limit =
-                    limit.min(coefficients.truncation_timestep(charge, derivative, &tolerances)?);
+                let bound = if explicit_derivative {
+                    let derivative = &mut storage[..=order];
+                    derivative[0] = trial.values()[base + 1];
+                    for (age, value) in derivative.iter_mut().enumerate().skip(1) {
+                        *value = accepted(age, 1)?;
+                    }
+                    coefficients.truncation_timestep_from_derivatives(
+                        [trial.values()[base], accepted(1, 0)?],
+                        derivative,
+                        &tolerances,
+                    )?
+                } else {
+                    // The trial charge, then order + 1 accepted ones.
+                    let charge = &mut storage[..order + 2];
+                    charge[0] = trial.values()[base];
+                    for (age, value) in charge.iter_mut().enumerate().skip(1) {
+                        *value = accepted(age, 0)?;
+                    }
+                    let derivative = [trial.values()[base + 1], accepted(1, 1)?];
+                    coefficients.truncation_timestep(charge, derivative, &tolerances)?
+                };
+                limit = limit.min(bound);
             }
             // Discrete-state bounds (`swtrunc.c`), from the same trial.
             if !rows.is_empty() {

@@ -171,6 +171,7 @@ struct TopologyBindings {
     order: Vec<usize>,
     branch_rows: Vec<std::ops::Range<usize>>,
     convergence_kinds: Vec<crate::devices::ConvergenceKind>,
+    private_storage_rows: Vec<(usize, usize)>,
     control_rows: Vec<Vec<usize>>,
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
@@ -1423,8 +1424,49 @@ impl Circuit {
             .iter()
             .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect::<SpiceResult<_>>()?;
+        self.bindings.private_storage_rows = self.bind_private_storage()?;
         self.bindings.mutual = self.resolve_mutual(names)?;
         Ok(())
+    }
+
+    /// Bind each private expression storage coordinate and its derivative
+    /// output. The linear evolution equation belongs to the private
+    /// coordinate's own row; other devices cannot address that coordinate.
+    fn bind_private_storage(&self) -> SpiceResult<Vec<(usize, usize)>> {
+        use crate::devices::InitialStorageRow;
+        let controlled: std::collections::BTreeSet<_> = self
+            .bindings
+            .control_rows
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let mut bindings = Vec::new();
+        for (index, device) in self.devices.iter().enumerate() {
+            let Some(storage) = device.initial_expression_storage() else {
+                continue;
+            };
+            let rows = &self.bindings.branch_rows[index];
+            let bind = |local| match local {
+                InitialStorageRow::Branch(index) => rows.clone().nth(index),
+                InitialStorageRow::Signal(node) => self.bindings.unknowns.node_row(node),
+            };
+            let (Some(coordinate), Some(derivative)) =
+                (bind(storage.equation), bind(storage.gauge))
+            else {
+                return Err(SpiceError::circuit("invalid private storage coordinate"));
+            };
+            if !matches!(storage.equation, InitialStorageRow::Branch(_))
+                || coordinate == derivative
+                || controlled.contains(&coordinate)
+            {
+                return Err(SpiceError::circuit(
+                    "expression storage coordinate is not private",
+                ));
+            }
+            bindings.push((coordinate, derivative));
+        }
+        Ok(bindings)
     }
 
     /// Preflight every K card in linear input work before expanding any
@@ -2048,6 +2090,8 @@ impl Circuit {
                 branch: self.bindings.branch_rows[index].clone().next(),
                 integration: request.integration,
                 states: &request.trial.values()[self.bindings.state_rows[index].clone()],
+                history: request.history,
+                state_range: self.bindings.state_rows[index].clone(),
                 phase: request.trial.phase(),
                 model_context: request.model_context,
                 time: request.time,
@@ -2290,6 +2334,10 @@ impl Circuit {
 
     pub(crate) fn convergence_kinds(&self) -> &[crate::devices::ConvergenceKind] {
         &self.bindings.convergence_kinds
+    }
+
+    pub(crate) fn private_storage_rows(&self) -> &[(usize, usize)] {
+        &self.bindings.private_storage_rows
     }
 
     /// The name of every unknown by matrix row, as ngspice names them
@@ -3165,6 +3213,12 @@ impl Circuit {
                 || original.state_count() != replacement.state_count()
                 || original.findable_branch() != replacement.findable_branch()
                 || original.expression_current_branch() != replacement.expression_current_branch()
+                || original
+                    .initial_expression_storage()
+                    .map(|s| (s.equation, s.gauge, s.policy))
+                    != replacement
+                        .initial_expression_storage()
+                        .map(|s| (s.equation, s.gauge, s.policy))
                 || !original
                     .controlling_sources()
                     .iter()
@@ -3357,6 +3411,7 @@ impl Circuit {
                 && a.order == b.order
                 && a.branch_rows == b.branch_rows
                 && a.control_rows == b.control_rows
+                && a.private_storage_rows == b.private_storage_rows
                 && a.state_rows == b.state_rows
                 && self.nodes.nodes() == previous.nodes.nodes()
                 && self.devices.len() == previous.devices.len()

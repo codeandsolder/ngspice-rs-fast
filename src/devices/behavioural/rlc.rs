@@ -2,7 +2,9 @@
 //!
 //! For a physical passive the first branch unknown is current from positive
 //! to negative. Generated derivative operators use their internal node row
-//! directly, with no branch or dummy KCL equation.
+//! directly, with a separate input storage coordinate but no dummy KCL
+//! equation. Explicit charge and derivative laws separate the nonlinear
+//! constitutive relation from the linear integration equation.
 //! Differential C and L have a second algebraic unknown for the derivative
 //! of terminal voltage or current. This retains an exact F+dQ/dt formulation
 //! even when the coefficient depends on arbitrary controls.
@@ -45,104 +47,119 @@ impl Law {
 
     const fn branches(self) -> usize {
         match self {
-            Self::Derivative => 0,
-            Self::Capacitance | Self::Inductance => 2,
+            Self::Derivative => 1,
+            Self::Capacitance | Self::Inductance | Self::Charge => 2,
             _ => 1,
         }
     }
 
+    const fn explicit_storage(self) -> bool {
+        matches!(self, Self::Charge | Self::Derivative)
+    }
+
     fn equations(self, values: [Real; 4], coefficient: Real) -> [Option<Equation>; 2] {
-        let [positive, negative, current, rate] = values;
+        let [positive, negative, current, auxiliary] = values;
         let voltage = positive - negative;
-        let (algebraic, storage) = match self {
+        let voltage_row = [1., -1., 0., 0.];
+        let current_row = [0., 0., 1., 0.];
+        let auxiliary_row = [0., 0., 0., 1.];
+        let (constitutive, evolution) = match self {
             Self::Resistance => (
-                Scalar {
-                    value: voltage - coefficient * current,
+                Algebraic {
                     direct: [1., -1., -coefficient, 0.],
                     expression: -current,
+                    offset: 0.,
                 },
                 None,
             ),
             Self::Charge | Self::Derivative => (
-                if self == Self::Charge {
-                    Scalar {
-                        value: current,
-                        direct: [0., 0., 1., 0.],
-                        expression: 0.,
-                    }
-                } else {
-                    Scalar {
-                        value: voltage,
-                        direct: [1., -1., 0., 0.],
-                        expression: 0.,
-                    }
-                },
-                Some(Scalar {
-                    value: -coefficient,
-                    direct: [0.; 4],
+                Algebraic {
+                    direct: auxiliary_row,
                     expression: -1.,
+                    offset: coefficient,
+                },
+                Some(Equation {
+                    static_part: Algebraic::linear(if self == Self::Charge {
+                        current_row
+                    } else {
+                        voltage_row
+                    }),
+                    storage: Some(Stored {
+                        value: -auxiliary,
+                        direct: [0., 0., 0., -1.],
+                    }),
                 }),
             ),
             Self::Capacitance => (
-                Scalar {
-                    value: current - coefficient * rate,
+                Algebraic {
                     direct: [0., 0., 1., -coefficient],
-                    expression: -rate,
+                    expression: -auxiliary,
+                    offset: 0.,
                 },
-                None,
+                Some(Equation {
+                    static_part: Algebraic::linear(auxiliary_row),
+                    storage: Some(Stored {
+                        value: -voltage,
+                        direct: [-1., 1., 0., 0.],
+                    }),
+                }),
             ),
             Self::Inductance => (
-                Scalar {
-                    value: voltage - coefficient * rate,
+                Algebraic {
                     direct: [1., -1., 0., -coefficient],
-                    expression: -rate,
+                    expression: -auxiliary,
+                    offset: 0.,
                 },
-                None,
+                Some(Equation {
+                    static_part: Algebraic::linear(auxiliary_row),
+                    storage: Some(Stored {
+                        value: -current,
+                        direct: [0., 0., -1., 0.],
+                    }),
+                }),
             ),
-        };
-        let derivative = match self {
-            Self::Capacitance => Some(Scalar {
-                value: -voltage,
-                direct: [-1., 1., 0., 0.],
-                expression: 0.,
-            }),
-            Self::Inductance => Some(Scalar {
-                value: -current,
-                direct: [0., 0., -1., 0.],
-                expression: 0.,
-            }),
-            _ => None,
         };
         [
             Some(Equation {
-                static_part: algebraic,
-                storage,
+                static_part: constitutive,
+                storage: None,
             }),
-            derivative.map(|storage| Equation {
-                static_part: Scalar {
-                    value: rate,
-                    direct: [0., 0., 0., 1.],
-                    expression: 0.,
-                },
-                storage: Some(storage),
-            }),
+            evolution,
         ]
     }
 }
 
-/// A scalar residual: direct derivatives plus the chain rule through the
-/// compiled expression. Coincident rows are summed by the matrix writer.
+/// Direct coefficients, expression chain rule and analytical affine offset.
+/// Linear terms cancel symbolically in J*x-F(x), not numerically.
 #[derive(Debug, Clone, Copy)]
-struct Scalar {
-    value: Real,
+struct Algebraic {
     direct: [Real; 4],
     expression: Real,
+    offset: Real,
+}
+
+impl Algebraic {
+    const fn linear(direct: [Real; 4]) -> Self {
+        Self {
+            direct,
+            expression: 0.,
+            offset: 0.,
+        }
+    }
+}
+
+/// The evolved quantity is a homogeneous linear function of MNA
+/// coordinates. Nonlinear storage is represented by a separate coordinate.
+#[derive(Debug, Clone, Copy)]
+struct Stored {
+    value: Real,
+    direct: [Real; 4],
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Equation {
-    static_part: Scalar,
-    storage: Option<Scalar>,
+    static_part: Algebraic,
+    storage: Option<Stored>,
 }
 
 struct BoundInput<'a> {
@@ -162,79 +179,71 @@ struct Bound<'a, 'b> {
 }
 
 impl Bound<'_, '_> {
-    fn derivatives(
-        &self,
-        scalar: Scalar,
-        mut emit: impl FnMut(usize, Real, Real) -> SpiceResult<()>,
-    ) -> SpiceResult<()> {
-        for ((column, value), derivative) in
-            self.columns.into_iter().zip(self.values).zip(scalar.direct)
-        {
-            if let Some(column) = column {
-                emit(column, value, derivative)?;
-            }
-        }
-        for ((&column, &value), &gradient) in self
-            .expression
+    fn direct_terms(&self, direct: [Real; 4]) -> impl Iterator<Item = (usize, Real, Real)> {
+        self.columns
+            .into_iter()
+            .zip(self.values)
+            .zip(direct)
+            .filter_map(|((column, value), derivative)| {
+                column
+                    .filter(|_| derivative != 0.)
+                    .map(|column| (column, value, derivative))
+            })
+    }
+
+    fn expression_terms(&self, multiplier: Real) -> impl Iterator<Item = (usize, Real, Real)> {
+        self.expression
             .columns
             .iter()
             .zip(self.expression.values)
             .zip(self.expression.evaluation.gradient)
-        {
-            if let Some(column) = column {
-                emit(column, value, scalar.expression * self.factor * gradient)?;
-            }
+            .filter_map(move |((&column, &value), &gradient)| {
+                let derivative = multiplier * self.factor * gradient;
+                column
+                    .filter(|_| derivative != 0.)
+                    .map(|column| (column, value, derivative))
+            })
+    }
+
+    fn derivatives(&self, scalar: Algebraic) -> impl Iterator<Item = (usize, Real, Real)> {
+        self.direct_terms(scalar.direct)
+            .chain(self.expression_terms(scalar.expression))
+    }
+
+    fn matrix(&self, matrix: &mut SparseMatrix, row: usize, scalar: Algebraic) -> SpiceResult<()> {
+        for (column, _, derivative) in self.derivatives(scalar) {
+            matrix.add(row, column, derivative)?;
         }
         Ok(())
     }
 
-    fn matrix(&self, matrix: &mut SparseMatrix, row: usize, scalar: Scalar) -> SpiceResult<()> {
-        self.derivatives(scalar, |column, _, derivative| {
-            matrix.add(row, column, derivative)
-        })
+    fn linear_matrix(
+        &self,
+        matrix: &mut SparseMatrix,
+        row: usize,
+        direct: [Real; 4],
+        scale: Real,
+    ) -> SpiceResult<()> {
+        for (column, _, derivative) in self.direct_terms(direct) {
+            matrix.add(row, column, derivative * scale)?;
+        }
+        Ok(())
     }
 
     fn affine(
         &self,
         matrix: &mut SparseMatrix,
         row: usize,
-        scalar: Scalar,
+        scalar: Algebraic,
         multiplier: Real,
-        rhs: &mut Real,
-    ) -> SpiceResult<()> {
-        self.derivatives(scalar, |column, value, derivative| {
-            let derivative = multiplier * derivative;
-            matrix.add(row, column, derivative)?;
-            *rhs = derivative.mul_add(value, *rhs);
-            Ok(())
-        })
-    }
-    fn storage_affine(
-        &self,
-        matrix: &mut SparseMatrix,
-        row: usize,
-        scalar: Scalar,
-        multiplier: Real,
-        history: Real,
-        rhs: &mut Real,
-    ) -> SpiceResult<()> {
-        // Form the affine equivalent in storage units, before multiplying
-        // by 1/dt. For linear differential voltage/current storage the
-        // offset is identically zero; do not subtract two large O(1/dt)
-        // values just to reconstruct the history source.
-        let mut equivalent = -scalar.value;
-        self.derivatives(scalar, |column, value, derivative| {
+    ) -> SpiceResult<Real> {
+        self.linear_matrix(matrix, row, scalar.direct, multiplier)?;
+        let mut rhs = scalar.offset;
+        for (column, value, derivative) in self.expression_terms(scalar.expression) {
             matrix.add(row, column, multiplier * derivative)?;
-            if scalar.expression != 0. {
-                equivalent = derivative.mul_add(value, equivalent);
-            }
-            Ok(())
-        })?;
-        if scalar.expression == 0. {
-            equivalent = 0.;
+            rhs = derivative.mul_add(value, rhs);
         }
-        *rhs = multiplier.mul_add(equivalent, *rhs - history);
-        Ok(())
+        Ok(rhs * multiplier)
     }
 }
 
@@ -267,7 +276,11 @@ impl Passive {
             unknowns.node_row(self.expression.terminals[0]),
             unknowns.node_row(self.expression.terminals[1]),
             (self.law != Law::Derivative).then_some(branch),
-            self.law.differential().then_some(branch + 1),
+            match self.law {
+                Law::Derivative => Some(branch),
+                Law::Resistance => None,
+                _ => Some(branch + 1),
+            },
         ];
         let values = columns.map(|column| column.and_then(|row| solution.get(row)).unwrap_or(0.));
         self.expression.with_linearization(
@@ -295,13 +308,23 @@ impl Passive {
         )
     }
 
-    fn equation_row(&self, unknowns: &MnaUnknowns, branch: Option<usize>) -> SpiceResult<usize> {
-        let row = if self.law == Law::Derivative {
-            unknowns.node_row(self.terminals()[0])
+    fn rows(&self, unknowns: &MnaUnknowns, branch: Option<usize>) -> SpiceResult<[usize; 2]> {
+        let branch = branch.ok_or_else(|| {
+            SpiceError::circuit(format!("{}: missing constitutive branch", self.name()))
+        })?;
+        let primary = if self.law == Law::Derivative {
+            unknowns
+                .node_row(self.terminals()[0])
+                .ok_or_else(|| SpiceError::circuit("missing derivative output row"))?
         } else {
             branch
         };
-        row.ok_or_else(|| SpiceError::circuit(format!("{}: missing constitutive row", self.name())))
+        let auxiliary = if self.law == Law::Derivative {
+            branch
+        } else {
+            branch + 1
+        };
+        Ok([primary, auxiliary])
     }
 
     fn kcl(
@@ -347,11 +370,13 @@ impl Device for Passive {
         match (self.law, branch) {
             (Law::Capacitance, 1) => BranchQuantity::VoltageRate,
             (Law::Inductance, 1) => BranchQuantity::CurrentRate,
+            (Law::Charge, 1) => BranchQuantity::Charge,
+            (Law::Derivative, _) => BranchQuantity::ExpressionState,
             _ => BranchQuantity::Current,
         }
     }
     fn branch_convergence(&self, branch: usize) -> crate::devices::ConvergenceKind {
-        if self.law.differential() && branch == 1 {
+        if self.law == Law::Derivative || (self.law.branches() == 2 && branch == 1) {
             crate::devices::ConvergenceKind::Constitutive
         } else {
             crate::devices::ConvergenceKind::Current
@@ -409,9 +434,14 @@ impl Device for Passive {
 
     fn initial_expression_storage(&self) -> Option<crate::devices::InitialExpressionStorage> {
         use crate::devices::{InitialExpressionStorage, InitialStoragePolicy, InitialStorageRow};
-        let (row, policy) = match self.law {
-            Law::Charge => (InitialStorageRow::Branch(0), InitialStoragePolicy::Physical),
+        let (equation, gauge, policy) = match self.law {
+            Law::Charge => (
+                InitialStorageRow::Branch(1),
+                InitialStorageRow::Branch(0),
+                InitialStoragePolicy::Physical,
+            ),
             Law::Derivative => (
+                InitialStorageRow::Branch(0),
                 InitialStorageRow::Signal(self.terminals()[0]),
                 InitialStoragePolicy::Derived,
             ),
@@ -419,8 +449,8 @@ impl Device for Passive {
         };
         Some(InitialExpressionStorage {
             slot: 0,
-            equation: row,
-            gauge: row,
+            equation,
+            gauge,
             voltage: self.initial,
             policy,
         })
@@ -434,7 +464,12 @@ impl Device for Passive {
         &self,
         context: &crate::devices::ConvergenceContext<'_>,
     ) -> SpiceResult<bool> {
-        let branch = self.equation_row(context.unknowns, context.branch)?;
+        let rows = self.rows(context.unknowns, context.branch)?;
+        let branch = if self.law == Law::Derivative {
+            rows[1]
+        } else {
+            rows[0]
+        };
         self.with_bound(
             BoundInput {
                 solution: context.solution,
@@ -458,14 +493,20 @@ impl Device for Passive {
                 };
                 let derivative = |quantity: Real| -> SpiceResult<Real> {
                     if let Some(integration) = context.integration {
-                        let [previous, previous_derivative, ..] = context.states else {
-                            return Err(SpiceError::circuit(
-                                "missing constitutive convergence history",
-                            ));
+                        let accepted = |age, slot| {
+                            context.accepted(age, slot).ok_or_else(|| {
+                                SpiceError::circuit("missing constitutive convergence history")
+                            })
                         };
-                        // The last load's derivative plus the exact present
-                        // storage change gives the derivative at the new iterate.
-                        Ok(integration.ag()[0].mul_add(quantity - previous, *previous_derivative))
+                        let mut history = crate::maths::integrator::ChargeHistory::new(quantity);
+                        for age in 1..=integration.charge_history_len() {
+                            history.push(accepted(age, 0)?)?;
+                        }
+                        let previous = integration
+                            .needs_previous_derivative()
+                            .then(|| accepted(1, 1))
+                            .transpose()?;
+                        Ok(integration.integrate(&history, previous, 1.)?.derivative)
                     } else {
                         Ok(0.)
                     }
@@ -480,8 +521,22 @@ impl Device for Passive {
                 };
                 Ok(match self.law {
                     Law::Resistance => disagree(voltage, coefficient * current, context.vntol),
-                    Law::Charge => disagree(current, -dynamic()?, context.abstol),
-                    Law::Derivative => disagree(voltage, -dynamic()?, context.vntol),
+                    Law::Charge | Law::Derivative => {
+                        let mut scale = coefficient.abs().max(rate.abs());
+                        for (_, value, derivative) in bound.derivatives(
+                            equations[0].expect("explicit storage relation").static_part,
+                        ) {
+                            scale += (value * derivative).abs();
+                        }
+                        let rounding = 4. * Real::EPSILON * scale;
+                        let (actual, absolute) = if self.law == Law::Charge {
+                            (current, context.abstol)
+                        } else {
+                            (voltage, context.vntol)
+                        };
+                        disagree(rate, coefficient, rounding)
+                            || disagree(actual, -dynamic()?, absolute)
+                    }
                     Law::Capacitance => {
                         disagree(current, coefficient * rate, context.abstol)
                             || disagree(current, -coefficient * dynamic()?, context.abstol)
@@ -506,18 +561,20 @@ impl Device for Passive {
             setup.element(neg, current);
             current
         };
-        for index in 0..self.law.branches().max(1) {
-            let row = if self.law == Law::Derivative {
-                pos
-            } else {
-                Some(setup.branch(index)?)
-            };
-            for column in [pos, neg, current] {
+        let auxiliary = match self.law {
+            Law::Resistance => None,
+            Law::Derivative => Some(setup.branch(0)?),
+            _ => Some(setup.branch(1)?),
+        };
+        let primary = if self.law == Law::Derivative {
+            pos
+        } else {
+            current
+        };
+        for row in [primary, auxiliary].into_iter().flatten() {
+            let row = Some(row);
+            for column in [pos, neg, current, auxiliary] {
                 setup.element(row, column);
-            }
-            if self.law.differential() {
-                let rate = Some(setup.branch(1)?);
-                setup.element(row, rate);
             }
             for variable in &self.expression.variables {
                 let column = match *variable {
@@ -545,7 +602,12 @@ impl Device for Passive {
                 ));
             }
         };
-        let branch = self.equation_row(context.unknowns, context.branches.clone().next())?;
+        let rows = self.rows(context.unknowns, context.branches.clone().next())?;
+        let branch = if self.law == Law::Derivative {
+            rows[1]
+        } else {
+            rows[0]
+        };
         let model = context.model_context();
         // An instance IC is a local terminal voltage at which to evaluate
         // the arbitrary charge law. Other controls retain their seeded
@@ -578,19 +640,54 @@ impl Device for Passive {
                     let Some(equation) = equation else {
                         continue;
                     };
-                    let row = branch + index;
-                    let mut rhs = -equation.static_part.value;
-                    bound.affine(context.matrix, row, equation.static_part, 1., &mut rhs)?;
+                    let row = rows[index];
+                    let mut rhs;
                     if let Some(storage) = equation.storage {
-                        let (history, multiplier) = dynamic::integrate(context, storage.value)?;
-                        bound.storage_affine(
+                        let quantity =
+                            if self.law.explicit_storage() && context.states.initial_conditions() {
+                                -bound.factor * bound.expression.evaluation.value
+                            } else {
+                                storage.value
+                            };
+                        let (history, multiplier) = dynamic::integrate(context, quantity)?;
+                        if self.law.explicit_storage()
+                            && matches!(context.mode, AnalysisMode::Transient { .. })
+                        {
+                            let [p, n, current, _] = bound.values;
+                            // Store the independently solved physical rate,
+                            // not a noisy difference of absolute charges.
+                            let derivative = if self.law == Law::Charge {
+                                -current
+                            } else {
+                                n - p
+                            };
+                            context.states.set(1, derivative)?;
+                        }
+                        // Keep the integration row in storage units when its
+                        // derivative coefficient dominates. Multiplying the
+                        // whole row by the same nonzero scalar preserves the
+                        // DAE while avoiding large elimination multipliers.
+                        let scale = if self.law.explicit_storage() {
+                            crate::primitives::numeric::scale_power(
+                                1.,
+                                -crate::primitives::numeric::binary_exponent(
+                                    multiplier.abs().max(1.),
+                                )
+                                .unwrap_or(0),
+                            )
+                        } else {
+                            1.
+                        };
+                        rhs = bound.affine(context.matrix, row, equation.static_part, scale)?;
+                        bound.linear_matrix(
                             context.matrix,
                             row,
-                            storage,
-                            multiplier,
-                            history,
-                            &mut rhs,
+                            storage.direct,
+                            multiplier * scale,
                         )?;
+                        rhs -= history * scale;
+                    } else {
+                        rhs = bound.affine(context.matrix, row, equation.static_part, 1.)?;
                     }
                     context.rhs.add_to(row, rhs)?;
                 }
@@ -604,7 +701,12 @@ impl Device for Passive {
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        let branch = self.equation_row(context.unknowns, context.branch)?;
+        let rows = self.rows(context.unknowns, context.branch)?;
+        let branch = if self.law == Law::Derivative {
+            rows[1]
+        } else {
+            rows[0]
+        };
         self.with_bound(
             BoundInput {
                 solution: bias,
@@ -620,9 +722,14 @@ impl Device for Passive {
                     let Some(equation) = equation else {
                         continue;
                     };
-                    bound.matrix(&mut context.system.a, branch + index, equation.static_part)?;
+                    bound.matrix(&mut context.system.a, rows[index], equation.static_part)?;
                     if let Some(storage) = equation.storage {
-                        bound.matrix(&mut context.system.e, branch + index, storage)?;
+                        bound.linear_matrix(
+                            &mut context.system.e,
+                            rows[index],
+                            storage.direct,
+                            1.,
+                        )?;
                     }
                 }
                 Ok(())
@@ -644,7 +751,12 @@ impl Device for Passive {
     }
 
     fn assemble_nonlinear_charge(&self, context: &mut ChargeContext<'_>) -> SpiceResult<()> {
-        let branch = self.equation_row(context.unknowns, context.branch)?;
+        let rows = self.rows(context.unknowns, context.branch)?;
+        let branch = if self.law == Law::Derivative {
+            rows[1]
+        } else {
+            rows[0]
+        };
         self.with_bound(
             BoundInput {
                 solution: context.state,
@@ -657,9 +769,9 @@ impl Device for Passive {
             |bound, equations| {
                 for (index, equation) in equations.into_iter().enumerate() {
                     if let Some(storage) = equation.and_then(|equation| equation.storage) {
-                        let row = branch + index;
+                        let row = rows[index];
                         context.charge.add_to(row, storage.value)?;
-                        bound.matrix(context.jacobian, row, storage)?;
+                        bound.linear_matrix(context.jacobian, row, storage.direct, 1.)?;
                     }
                 }
                 Ok(())

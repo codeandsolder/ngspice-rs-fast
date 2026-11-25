@@ -200,6 +200,7 @@ pub fn solve_counted_limited<T>(
         options,
         Phases {
             coordinate_kinds: None,
+            private_storage: &[],
             first: IterationPhase::Junction,
             previous: None,
             nonconvergent: |_: &T| false,
@@ -276,6 +277,7 @@ pub fn solve_phased(
         initial,
         branch_rows,
         None,
+        &[],
         limited_rows,
         options,
         policy,
@@ -300,6 +302,7 @@ fn solve_phased_into(
     initial: &Vector,
     branch_rows: &[bool],
     coordinate_kinds: Option<&[crate::devices::ConvergenceKind]>,
+    private_storage: &[(usize, usize)],
     limited_rows: Option<&[bool]>,
     options: &NewtonOptions,
     policy: PhasePolicy,
@@ -325,6 +328,7 @@ fn solve_phased_into(
         options,
         Phases {
             coordinate_kinds,
+            private_storage,
             first,
             previous: continued,
             nonconvergent: TrialState::is_nonconvergent,
@@ -415,6 +419,11 @@ impl CircuitNewton<'_, '_> {
             initial,
             self.branch_rows,
             Some(circuit.convergence_kinds()),
+            if integration.is_some() && options.diag_gmin == 0. {
+                circuit.private_storage_rows()
+            } else {
+                &[]
+            },
             self.limited_rows,
             options,
             policy,
@@ -548,6 +557,7 @@ impl LoadStorage<TrialState> {
 
 struct Phases<'a, T, F> {
     coordinate_kinds: Option<&'a [crate::devices::ConvergenceKind]>,
+    private_storage: &'a [(usize, usize)],
     first: IterationPhase,
     previous: Option<T>,
     nonconvergent: F,
@@ -731,6 +741,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
                 options.voltage_step,
             );
         }
+        reconstruct_storage(matrix, rhs, &mut next, phases.private_storage)?;
         if !next.is_finite() {
             return Err(failure("nonfinite Newton iterate"));
         }
@@ -810,6 +821,31 @@ fn damp(
         }
     }
 }
+/// The explicit storage formulation has a private coordinate with a
+/// two-term linear evolution equation. Reconstruct that coordinate from
+/// the solved physical derivative, not from cancellation in the nonlinear
+/// constitutive row. This is a local back-substitution in the same system;
+/// neither the electrical solution nor its KCL rows are changed. The
+/// ordinary nonlinear convergence check still verifies the storage law.
+fn reconstruct_storage(
+    matrix: &SparseMatrix,
+    rhs: &Vector,
+    next: &mut Vector,
+    coordinates: &[(usize, usize)],
+) -> SpiceResult<()> {
+    for &(coordinate, derivative) in coordinates {
+        let pivot = matrix.get(coordinate, coordinate);
+        if pivot == 0. {
+            return Err(failure("missing private storage evolution pivot"));
+        }
+        let coefficient = matrix.get(coordinate, derivative);
+        let value =
+            (-coefficient).mul_add(next.as_slice()[derivative], rhs.as_slice()[coordinate]) / pivot;
+        next.set(coordinate, value)?;
+    }
+    Ok(())
+}
+
 /// One `NIiter` factor-and-solve on the raw matrix ([`crate::maths::solve_ni`]):
 /// there is no row equilibration or conditioning guard; ngspice has neither.
 fn linearised_solve(
