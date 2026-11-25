@@ -132,10 +132,11 @@ pub use sweep::{
 };
 pub use switch::{Switch, SwitchKind, SwitchState};
 pub use traits::{
-    AcceptContext, AnalysisMode, ControlReference, ConvergenceContext, ConvergenceKind, Device,
-    InductanceValue, InitialChargeStorage, InitialCoordinate, InitialVoltageLaw,
-    InitialVoltageRelation, InitialVoltageStorage, MnaUnknowns, MutualCoupling, MutualTerm,
-    StampContext, StorageElement, StorageKind, TruncationContext,
+    AcceptContext, AnalysisMode, BranchQuantity, ControlReference, ConvergenceContext,
+    ConvergenceKind, Device, InductanceValue, InitialCoordinate, InitialExpressionStorage,
+    InitialStoragePolicy, InitialStorageRow, InitialVoltageLaw, InitialVoltageRelation,
+    InitialVoltageStorage, MnaUnknowns, MutualCoupling, MutualTerm, StampContext, StorageElement,
+    StorageKind, TruncationContext,
 };
 
 /// The C reference for the device framework, used in `NotYetPorted` errors.

@@ -471,3 +471,33 @@ fn uic_transfer_multiple_coordinates_and_current_sensor_constraints() -> SpiceRe
     assert!(error.contains("impulse") && error.contains("a1"), "{error}");
     Ok(())
 }
+
+#[test]
+fn transfer_observations_distinguish_input_output_and_state_coordinates() -> SpiceResult<()> {
+    let deck = parsed(
+        "i1 0 in dc 2 ac 1\na1 %i(in) out mdl\nr1 out 0 1\n.model mdl s_xfer(num_coeff=[1] den_coeff=[1 2 1] denormalized_freq=1000)",
+    )?;
+    let mut c = Circuit::from_netlist(&deck)?;
+    let plot = run(&mut c, AnalysisKind::Ac, &["lin", "1", "100", "100"])?;
+    for name in ["i(a1)", "i(a1:input)", "state(a1,0)", "state(a1,1)"] {
+        let matches: Vec<_> = plot.variables().iter().filter(|v| v.name == name).collect();
+        assert_eq!(matches.len(), 1, "{name}");
+        assert_eq!(matches[0].unit, "current");
+    }
+    close(
+        plot.value("i(a1:input)", 0).unwrap(),
+        Complex::real(1.),
+        1e-12,
+    );
+    close(
+        plot.value("state(a1,0)", 0).unwrap(),
+        plot.value("v(out)", 0).unwrap(),
+        1e-12,
+    );
+    close(
+        plot.value("i(a1)", 0).unwrap(),
+        -plot.value("v(out)", 0).unwrap(),
+        1e-12,
+    );
+    Ok(())
+}

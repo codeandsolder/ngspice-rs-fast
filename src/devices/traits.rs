@@ -126,6 +126,40 @@ pub enum ConvergenceKind {
     Constitutive,
 }
 
+/// Observable physical meaning of a device-local MNA coordinate.
+/// Auxiliary states are not terminal currents merely because their rows
+/// are allocated in the branch part of the MNA layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchQuantity {
+    /// Oriented terminal current.
+    Current,
+    /// Differential capacitor voltage rate.
+    VoltageRate,
+    /// Differential inductor current rate.
+    CurrentRate,
+    /// Normalized transfer state driven by a voltage input.
+    VoltageState(usize),
+    /// Normalized transfer state driven by a current input.
+    CurrentState(usize),
+    /// Oriented current at the transfer's sensing input.
+    InputCurrent,
+}
+
+impl BranchQuantity {
+    /// Plot vector identity and unit for this coordinate.
+    #[must_use]
+    pub fn observation(self, name: &str) -> (String, &'static str) {
+        match self {
+            Self::Current => (format!("i({name})"), "current"),
+            Self::VoltageRate => (format!("dvdt({name})"), "voltage/s"),
+            Self::CurrentRate => (format!("didt({name})"), "current/s"),
+            Self::VoltageState(index) => (format!("state({name},{index})"), "voltage"),
+            Self::CurrentState(index) => (format!("state({name},{index})"), "current"),
+            Self::InputCurrent => (format!("i({name}:input)"), "current"),
+        }
+    }
+}
+
 /// Which stored quantity a [`StorageElement`] integrates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageKind {
@@ -178,21 +212,40 @@ pub struct InitialVoltageStorage {
     pub equation: Option<usize>,
 }
 
-/// Initial signed charge constraint for a device whose charge is an
-/// arbitrary nonlinear function of the finalized circuit coordinates.
-/// The current remains free while its evolution equation is replaced by
-/// Q(x) = Q(initial). The physical charge assembly supplies the Jacobian.
+/// A device-local coordinate or a generated internal signal node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialStorageRow {
+    /// Device-local branch row.
+    Branch(usize),
+    /// Generated internal signal coordinate (not an arbitrary external node).
+    Signal(NodeId),
+}
+
+/// Initial signed storage expression constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialStoragePolicy {
+    /// Physical stored charge: its initial value is mandatory.
+    Physical,
+    /// Derivative input: the seeded value is an initial condition only
+    /// when independent of the circuit's mandatory constraints.
+    Derived,
+}
+
+/// Binding of a nonlinear stored expression for instantaneous initialization.
+/// The physical charge assembly supplies its value and Jacobian.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct InitialChargeStorage {
-    /// Local storage slot containing the signed charge.
+pub struct InitialExpressionStorage {
+    /// Local history slot containing the signed stored expression.
     pub slot: usize,
-    /// Local branch equation that normally evolves the charge.
-    pub equation: usize,
-    /// Local physical current coordinate, available as a gauge only when
-    /// the instantaneous constraints leave that current indeterminate.
-    pub current: usize,
-    /// Optional initial terminal voltage used to evaluate the charge law.
+    /// Equation normally evolving the stored expression.
+    pub equation: InitialStorageRow,
+    /// Free current or derivative-output coordinate. A rank completion
+    /// may select zero only when the retained constraints do not determine it.
+    pub gauge: InitialStorageRow,
+    /// Optional initial terminal voltage used to evaluate physical charge.
     pub voltage: Option<Real>,
+    /// Whether the seeded value is a mandatory or a derived constraint.
+    pub policy: InitialStoragePolicy,
 }
 
 /// An ideal voltage relation used by the initial-condition constraint graph.
@@ -874,12 +927,17 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// The nodes this device is connected to, in terminal order.
     fn terminals(&self) -> &[NodeId];
 
-    /// How many extra current unknowns the device adds to the MNA system.
-    ///
-    /// Non-zero for voltage sources and inductors, which contribute a branch
-    /// current row; zero for everything else.
+    /// How many device-local coordinates the device adds to the MNA
+    /// system, including branch currents and auxiliary constitutive states.
     fn branch_currents(&self) -> usize {
         0
+    }
+
+    /// Observable meaning of a local coordinate. Ordinary branch-current
+    /// devices keep their reference representation; stateful native devices
+    /// identify their additional coordinates explicitly.
+    fn branch_quantity(&self, _branch: usize) -> BranchQuantity {
+        BranchQuantity::Current
     }
 
     /// Convergence classification of a device-local branch coordinate.
@@ -1171,10 +1229,10 @@ pub trait Device: fmt::Debug + std::any::Any {
         }))
     }
 
-    /// Explicit nonlinear charge constraints used during UIC. Devices that
-    /// already expose differential voltage/flux or internal coordinates
-    /// need not also declare a charge constraint.
-    fn initial_charge_storage(&self) -> Option<InitialChargeStorage> {
+    /// Nonlinear storage expression constraints used during UIC. Devices
+    /// with explicit differential voltage/current or transfer coordinates
+    /// need not also declare an expression constraint.
+    fn initial_expression_storage(&self) -> Option<InitialExpressionStorage> {
         None
     }
 

@@ -2,9 +2,10 @@
 mod rank;
 use super::constraints::{AbsoluteRow, VoltageVertex};
 use super::{CapacitorInitial, ImpulseStorage, Tolerances, failure};
-use crate::devices::Circuit;
+use crate::devices::{Circuit, InitialStoragePolicy};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceResult};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]
 struct EquationId(usize);
@@ -45,6 +46,7 @@ enum EquationOrigin<'a> {
     Branch(AbsoluteRow),
     Capacitor(&'a str),
     Charge(&'a str),
+    Derived(AbsoluteRow),
 }
 
 struct Equation<'a> {
@@ -72,9 +74,14 @@ pub(super) struct InstantaneousSolution {
     /// capacitor currents. Unused columns can be set to zero because no
     /// retained equation depends on them at this linearization.
     reduced: Vec<Real>,
+    independent_derived: BTreeSet<AbsoluteRow>,
 }
 
 impl InstantaneousSolution {
+    pub(super) fn retained_derived(&self, row: AbsoluteRow) -> bool {
+        self.independent_derived.contains(&row)
+    }
+
     pub(super) fn update(&self, initial: &Vector, scale: Real) -> Vector {
         Vector::from_slice(
             &initial
@@ -185,7 +192,10 @@ impl<'a> InstantaneousSystem<'a> {
             } else {
                 let equation = EquationId(equations.len());
                 let origin = if let Some(charge) = storage.charges.get(&absolute) {
-                    EquationOrigin::Charge(&charge.name)
+                    match charge.policy {
+                        InitialStoragePolicy::Physical => EquationOrigin::Charge(&charge.name),
+                        InitialStoragePolicy::Derived => EquationOrigin::Derived(absolute),
+                    }
                 } else if kind {
                     EquationOrigin::Branch(absolute)
                 } else {
@@ -301,13 +311,19 @@ impl<'a> InstantaneousSystem<'a> {
         tolerance: Tolerances,
     ) -> SpiceResult<()> {
         for (equation, &used) in self.equations.iter().zip(rows) {
-            if used || matches!(equation.origin, EquationOrigin::Charge(_)) {
+            if used
+                || matches!(
+                    equation.origin,
+                    EquationOrigin::Charge(_) | EquationOrigin::Derived(_)
+                )
+            {
                 continue;
             }
             let absolute = match equation.origin {
                 EquationOrigin::Node(_) => tolerance.abstol,
                 EquationOrigin::Branch(_) | EquationOrigin::Capacitor(_) => tolerance.vntol,
                 EquationOrigin::Charge(_) => tolerance.chgtol,
+                EquationOrigin::Derived(_) => tolerance.vntol,
             };
             let relative_limit = tolerance.reltol * equation.scale;
             if equation.rhs.abs() > absolute + relative_limit {
@@ -319,6 +335,7 @@ impl<'a> InstantaneousSystem<'a> {
                         format!("voltage relation of capacitor {name}")
                     }
                     EquationOrigin::Charge(name) => format!("charge relation of {name}"),
+                    EquationOrigin::Derived(row) => format!("derived storage of {}", names[row.0]),
                 };
                 let mut fixed = equation.fixed.clone();
                 fixed.sort_unstable();
@@ -385,13 +402,17 @@ impl<'a> InstantaneousSystem<'a> {
         let mut ratio: Real = 0.;
         let mut roundoff = true;
         for (eq, (residual, scale, count)) in self.equations.iter().zip(values) {
-            if matches!(eq.origin, EquationOrigin::Charge(_)) {
+            if matches!(
+                eq.origin,
+                EquationOrigin::Charge(_) | EquationOrigin::Derived(_)
+            ) {
                 continue;
             }
             let absolute = match eq.origin {
                 EquationOrigin::Node(_) => tolerance.abstol,
                 EquationOrigin::Branch(_) | EquationOrigin::Capacitor(_) => tolerance.vntol,
                 EquationOrigin::Charge(_) => tolerance.chgtol,
+                EquationOrigin::Derived(_) => tolerance.vntol,
             };
             if !residual.is_finite() || !scale.is_finite() {
                 return (Real::INFINITY, false);
@@ -439,7 +460,7 @@ impl<'a> InstantaneousSystem<'a> {
         let gauge_variables: Vec<_> = storage
             .charges
             .values()
-            .filter_map(|charge| match self.bindings[charge.current.0].variable {
+            .filter_map(|charge| match self.bindings[charge.gauge.0].variable {
                 VariableBinding::Unknown(variable) => Some(variable.0),
                 VariableBinding::Fixed(_) => None,
             })
@@ -496,38 +517,14 @@ impl<'a> InstantaneousSystem<'a> {
             matrix.add(row.0, col.0, triplet.value)?;
         }
         matrix.fold_duplicates();
-        let solve = matrix.solve(&Vector::from_slice(&rhs));
-        let solution = match solve {
-            Ok(solution) => solution,
-            Err(error) if storage.charges.is_empty() => {
-                return Err(failure(format!(
-                    "uic initial conditions cannot be shown consistent at t = 0+ (the instantaneous constraint system is singular, possibly underdetermined or contradictory): {error}"
-                )));
-            }
-            Err(_) => {
-                // Rank completion is only available through explicitly
-                // declared storage-current coordinates, not arbitrary nodes.
-                let gauges: Vec<_> = gauge_variables
-                    .iter()
-                    .filter_map(|&variable| column_index[variable].map(|column| column.0))
-                    .collect();
-                // Enforce the algebraic equations before choosing a basis
-                // from dependent storage tangents. Every omitted charge
-                // row must still pass its independent nonlinear check.
-                let charge_rows: Vec<_> = self
-                    .equations
-                    .iter()
-                    .zip(&rows)
-                    .filter_map(|(equation, row)| {
-                        matches!(equation.origin, EquationOrigin::Charge(_))
-                            .then_some(*row)
-                            .flatten()
-                            .map(|row| row.0)
-                    })
-                    .collect();
-                rank::complete(&matrix, &rhs, &gauges, &charge_rows)?
-            }
-        };
+        let (solution, independent_derived) = self.solve_compact(
+            &matrix,
+            &rhs,
+            storage,
+            &gauge_variables,
+            &column_index,
+            &rows,
+        )?;
         let reduced = column_index
             .iter()
             .map(|column| column.map_or(0., |column| solution.as_slice()[column.0]))
@@ -542,7 +539,75 @@ impl<'a> InstantaneousSystem<'a> {
                 }
             })
             .collect();
-        Ok(Some(InstantaneousSolution { original, reduced }))
+        Ok(Some(InstantaneousSolution {
+            original,
+            reduced,
+            independent_derived,
+        }))
+    }
+
+    fn solve_compact(
+        &self,
+        matrix: &SparseMatrix,
+        rhs: &[Real],
+        storage: &ImpulseStorage,
+        gauge_variables: &[usize],
+        column_index: &[Option<CompactColumn>],
+        rows: &[Option<CompactRow>],
+    ) -> SpiceResult<(Vector, BTreeSet<AbsoluteRow>)> {
+        let derived: Vec<_> = self
+            .equations
+            .iter()
+            .zip(rows)
+            .filter_map(|(equation, row)| {
+                if let (EquationOrigin::Derived(absolute), Some(row)) = (equation.origin, row) {
+                    Some((absolute, row.0))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !storage
+            .charges
+            .values()
+            .any(|charge| charge.policy == InitialStoragePolicy::Derived)
+        {
+            match matrix.solve(&Vector::from_slice(rhs)) {
+                Ok(solution) => return Ok((solution, BTreeSet::new())),
+                Err(error) if storage.charges.is_empty() => {
+                    return Err(failure(format!(
+                        "uic initial conditions cannot be shown consistent at t = 0+ (the instantaneous constraint system is singular, possibly underdetermined or contradictory): {error}"
+                    )));
+                }
+                Err(_) => {}
+            }
+        }
+        // Mandatory algebraic and physical storage constraints win over
+        // optional differentiator input values. A derived seed is retained
+        // only if it provides an independent condition. Gauge coordinates
+        // are introduced after all independent constraints.
+        let gauges: Vec<_> = gauge_variables
+            .iter()
+            .filter_map(|&variable| column_index[variable].map(|column| column.0))
+            .collect();
+        let charges: Vec<_> = self
+            .equations
+            .iter()
+            .zip(rows)
+            .filter_map(|(equation, row)| {
+                matches!(equation.origin, EquationOrigin::Charge(_))
+                    .then_some(*row)
+                    .flatten()
+                    .map(|row| row.0)
+            })
+            .collect();
+        let optional: Vec<_> = derived.iter().map(|(_, row)| *row).collect();
+        let result = rank::complete(matrix, rhs, &gauges, &charges, &optional)?;
+        let retained = derived
+            .into_iter()
+            .filter_map(|(absolute, row)| result.independent[row].then_some(absolute))
+            .collect();
+        Ok((result.values, retained))
     }
 }
 

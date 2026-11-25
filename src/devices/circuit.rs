@@ -3151,6 +3151,7 @@ impl Circuit {
                 || original.branch_currents() != replacement.branch_currents()
                 || (0..original.branch_currents()).any(|row| {
                     original.branch_convergence(row) != replacement.branch_convergence(row)
+                        || original.branch_quantity(row) != replacement.branch_quantity(row)
                 })
                 || original.state_count() != replacement.state_count()
                 || original.findable_branch() != replacement.findable_branch()
@@ -3362,6 +3363,9 @@ impl Circuit {
                             && left.designator() == right.designator()
                             && left.terminals() == right.terminals()
                             && left.findable_branch() == right.findable_branch()
+                            && left.expression_current_branch() == right.expression_current_branch()
+                            && (0..left.branch_currents())
+                                .all(|row| left.branch_quantity(row) == right.branch_quantity(row))
                             && left.rf_port().map(|port| (port.number, port.internal))
                                 == right.rf_port().map(|port| (port.number, port.internal))
                             && left.mutual_coupling().map(|coupling| coupling.inductors)

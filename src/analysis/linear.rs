@@ -57,25 +57,23 @@ pub(super) fn plot(
         }
     }
     for (index, device) in circuit.devices().iter().enumerate() {
-        // Every branch row of one device is named `i(<device>)`, as C's
-        // rawfile does: a two-branch device such as TXL writes that name
-        // twice, in branch order (`raw_write` strips CKTmkCur's `#branchN`
-        // suffix). The MNA rows keep `#branch1`/`#branch2`
-        // (`Circuit::unknown_names`), which is what solver diagnostics use.
+        // Only physical branch currents use i(device). Native storage-rate
+        // and normalized transfer coordinates carry their own quantities.
+        // Legacy multiport reference models retain their C port labels.
         let rows = circuit.branch_rows(index).ok_or_else(|| {
             SpiceError::circuit(format!(
                 "device {} is missing its MNA branch rows",
                 device.name()
             ))
         })?;
-        for row in rows {
+        for (local, row) in rows.enumerate() {
             let entry = names.get_mut(row).ok_or_else(|| {
                 SpiceError::circuit(format!(
                     "device {} references nonexistent MNA branch row {row}",
                     device.name()
                 ))
             })?;
-            *entry = Some((format!("i({})", device.name()), "current"));
+            *entry = Some(device.branch_quantity(local).observation(device.name()));
         }
     }
     for (name, unit) in names.into_iter().flatten() {
