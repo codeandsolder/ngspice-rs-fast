@@ -189,11 +189,23 @@ feedback during the trial. Rejected trials cannot advance the accepted
 wave histories.
 
 Histories retain only the delay window needed by the next stage or
-terminal and the boundary knots needed for front protection. To prevent
-combinatorial growth of secondary reflection knots, the solver may replace
-a curve by an endpoint-preserving chord or two-segment tent whose peak
-is at an existing knot, avoiding synthetic arrival times. It protects
-first physical arrivals and straight modal flights, bounds the normalized
+terminal and the source-corner times needed for front protection.
+All accepted boundary samples remain in the input PWL waveform and
+participate in scattering. Source-corner markers, however, are independent
+of solver sampling density: resolved slope changes use the existing
+breakpoint significance and roundoff criterion, and exact transitions
+into or out of flat source segments are marked even below that threshold.
+The physically delayed first and straight modal arrivals of these markers
+are protected; a pending affine endpoint is conservatively treated as a
+potential corner in each input column. In the scattered waveform, each
+affine component's exact zero-support boundaries and terminal load
+samples are also protected. Other PWL knots, including unmarked sampled
+slope changes and secondary arrivals, remain subject to the same numerical
+error and energy tests, rather than being forced to propagate as exact
+corner times. To prevent combinatorial growth of reflection knots, the
+solver may replace a curve by an endpoint-preserving chord or two-segment
+tent whose peak is at an existing knot, avoiding synthetic arrival times.
+It bounds the normalized
 interpolation error independently in every affine component (the known
 wave uses its current causal history-window amplitude as a scale), and checks
 the wave-energy Gram inequality over every prefix of the replaced

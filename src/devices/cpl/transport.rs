@@ -177,6 +177,12 @@ struct Corner {
     changes: Vec<(usize, Real)>,
 }
 
+struct BoundaryChange {
+    delta: Real,
+    corner: Option<Real>,
+    front: bool,
+}
+
 /// Accepted boundary waveform and shared, incrementally compiled response.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CplHistory {
@@ -246,6 +252,45 @@ impl CplHistory {
             &mut self.previous_error,
         ] {
             values.fill(0.);
+        }
+    }
+
+    // Classify an actual boundary slope change independently of the
+    // accepted waveform. All endpoints are retained for propagation;
+    // only resolved corners and exact flat transitions need dedicated
+    // physical-arrival protection.
+    fn boundary_change(
+        &self,
+        context: &DelayContext<'_>,
+        start: Real,
+        incident: &[Real],
+        port: usize,
+    ) -> BoundaryChange {
+        let ports = self.input.len();
+        let delta = incident[port] - self.input[port];
+        let previous = self
+            .previous_time
+            .map(|_| self.input[port] - self.previous_input[port]);
+        let (change, uncertainty) = self.previous_time.map_or(
+            (delta, self.input_error[port] + incident[ports + port]),
+            |previous_time| {
+                let ratio = (context.time - start) / (start - previous_time);
+                let predicted = ratio * (self.input[port] - self.previous_input[port]);
+                let error = ratio.mul_add(
+                    self.previous_error[port] + self.input_error[port],
+                    self.input_error[port] + incident[ports + port],
+                );
+                (delta - predicted, error)
+            },
+        );
+        let resolved = change.abs() > uncertainty
+            && ((self.continuous.is_none() && self.segments.is_empty())
+                || self.previous_time.is_none()
+                || change.abs() > context.reltol.mul_add(incident[port].abs(), context.abstol));
+        BoundaryChange {
+            delta,
+            corner: resolved.then_some(change),
+            front: continuous::boundary_front(previous, delta, resolved),
         }
     }
 
@@ -1041,29 +1086,12 @@ impl LossyPlan {
         };
         let mut breakpoints = Vec::new();
         let mut corners = Vec::new();
+        let mut fronts = Vec::with_capacity(ports);
         for port in 0..ports {
-            let delta = incident[port] - history.input[port];
-            segment.delta[port] = delta;
-            let (change, uncertainty) = history.previous_time.map_or(
-                (delta, history.input_error[port] + incident[ports + port]),
-                |previous_time| {
-                    let ratio = dt / (start - previous_time);
-                    let predicted = ratio * (history.input[port] - history.previous_input[port]);
-                    let error = ratio.mul_add(
-                        history.previous_error[port] + history.input_error[port],
-                        history.input_error[port] + incident[ports + port],
-                    );
-                    (delta - predicted, error)
-                },
-            );
-            // Roundoff/tolerance affects only scheduling. The convolution
-            // always retains the actual accepted endpoint, even for small
-            // waves, so uncertainty cannot accumulate into extrapolation.
-            if change.abs() > uncertainty
-                && ((direct.is_none() && history.segments.is_empty())
-                    || history.previous_time.is_none()
-                    || change.abs() > context.reltol.mul_add(incident[port].abs(), context.abstol))
-            {
+            let change = history.boundary_change(context, start, &incident, port);
+            segment.delta[port] = change.delta;
+            fronts.push(change.front);
+            if let Some(change) = change.corner {
                 corners.push((port, change));
                 for delay in self.fronts[port].iter().copied().chain(
                     direct
@@ -1093,7 +1121,11 @@ impl LossyPlan {
                     history
                         .boundary_bytes()
                         .saturating_add(history.kernel.workspace(ports)),
-                    (&incident[..ports], &segment.delta),
+                    continuous::BoundaryStep {
+                        input: &incident[..ports],
+                        delta: &segment.delta,
+                        fronts: &fronts,
+                    },
                 )?,
             ));
             return Ok(CplUpdate {

@@ -415,6 +415,68 @@ fn prune<Value>(wave: &mut Vec<Point<Value>>, oldest: Real) {
     }
 }
 
+/// Boundary data for an accepted interval. Front markers describe the
+/// start of the new ramp, not its end.
+#[derive(Clone, Copy)]
+pub(super) struct BoundaryStep<'a> {
+    pub(super) input: &'a [Real],
+    pub(super) delta: &'a [Real],
+    pub(super) fronts: &'a [bool],
+}
+
+// Preserve transitions into or out of exact constant intervals, even
+// below the solver's significance threshold. A resolved slope corner
+// also retains its physically delayed first and ballistic arrivals.
+pub(super) fn boundary_front(previous: Option<Real>, delta: Real, resolved: bool) -> bool {
+    resolved || previous.map_or(delta != 0., |old| (old == 0.) != (delta == 0.))
+}
+
+fn shifted_fronts(
+    fronts: &[Real],
+    pending: Option<Real>,
+    delay: Real,
+    start: Real,
+    end: Real,
+    times: &mut Vec<Real>,
+) {
+    let first = fronts.partition_point(|&time| time + delay <= start);
+    for &corner in &fronts[first..] {
+        let time = corner + delay;
+        if time >= end {
+            break;
+        }
+        if time > start {
+            times.push(time);
+        }
+    }
+    if let Some(corner) = pending {
+        let time = corner + delay;
+        if time > start && time < end {
+            times.push(time);
+        }
+    }
+}
+
+// Preserve exact zero support of each affine component independently.
+// Equal-valued nonzero samples can merely be floating-point plateaus
+// and do not independently denote a source wavefront.
+fn zero_fronts<Value: WaveValue>(curve: &[Knot<Value>], times: &mut Vec<Real>) {
+    for triple in curve.windows(3) {
+        let width = triple
+            .iter()
+            .map(|knot| knot.wave.width())
+            .max()
+            .unwrap_or(1);
+        if (0..width).any(|column| {
+            triple[1].wave.component(column) == 0.
+                && (triple[0].wave.component(column) == 0.)
+                    != (triple[2].wave.component(column) == 0.)
+        }) {
+            times.push(triple[1].time);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ContinuousPlan {
     step: Real,
@@ -542,6 +604,7 @@ impl ContinuousPlan {
             reltol: 0.,
             initial_input: vec![0.; ports],
             boundary: vec![KnownWave::default(); ports],
+            fronts: vec![Vec::new(); ports],
             outgoing: vec![KnownWave::default(); self.delays.len()],
         }
     }
@@ -559,12 +622,12 @@ impl ContinuousPlan {
 
     fn compress<Value: WaveValue>(
         &self,
-        history: &ContinuousHistory,
+        step: &Step<'_, Value>,
         node: usize,
         curve: &[Knot<Value>],
-        width: usize,
         terminal_sample: Option<Real>,
     ) -> SpiceResult<Wave<Value>> {
+        let history = step.history;
         let start = curve[0].time;
         let end = curve[curve.len() - 1].time;
         if curve.iter().all(|knot| knot.wave == curve[0].wave) {
@@ -574,15 +637,28 @@ impl ContinuousPlan {
         let ports = history.boundary.len();
         let n = ports / 2;
         let first = &self.first_outgoing[node * ports..(node + 1) * ports];
-        for (wave, &delay) in history.boundary.iter().zip(first) {
+        let pending = |port: usize| {
+            step.fronts
+                .is_none_or(|fronts| fronts[port])
+                .then_some(step.start)
+        };
+        for (source, (&delay, fronts)) in first.iter().zip(&history.fronts).enumerate() {
             if delay.is_finite() {
-                shifted_times(wave, delay, start, end, &mut times);
+                shifted_fronts(fronts, pending(source), delay, start, end, &mut times);
             }
         }
         for (side, &delay) in self.ballistic[node].iter().enumerate() {
             let source = side * n + node % n;
-            shifted_times(&history.boundary[source], delay, start, end, &mut times);
+            shifted_fronts(
+                &history.fronts[source],
+                pending(source),
+                delay,
+                start,
+                end,
+                &mut times,
+            );
         }
+        zero_fronts(curve, &mut times);
         if let Some(time) = terminal_sample
             && time > start
             && time < end
@@ -603,7 +679,7 @@ impl ContinuousPlan {
             let last = augmented.partition_point(|knot| knot.time < time);
             reduce::reduce(
                 &augmented[first..=last],
-                width,
+                ports + 1,
                 tolerance,
                 known_scale,
                 self.energy_factor,
@@ -686,9 +762,8 @@ impl ContinuousPlan {
         start: Real,
         end: Real,
         boundary_bytes: usize,
-        boundary: (&[Real], &[Real]),
+        boundary: BoundaryStep<'_>,
     ) -> SpiceResult<ContinuousHistory> {
-        let (input, delta) = boundary;
         if end - self.step <= start && end <= start + self.step {
             self.advance_scalar(plan, history, start, end, boundary_bytes, boundary)
         } else {
@@ -698,7 +773,7 @@ impl ContinuousPlan {
                 trial,
                 start,
                 end,
-                (input, delta),
+                boundary,
                 (boundary_bytes, plan.limit.saturating_mul(2)),
             )
         }
@@ -715,9 +790,8 @@ impl ContinuousPlan {
         start: Real,
         end: Real,
         boundary_bytes: usize,
-        boundary: (&[Real], &[Real]),
+        boundary: BoundaryStep<'_>,
     ) -> SpiceResult<ContinuousHistory> {
-        let (input, delta) = boundary;
         let ports = plan.launch.len();
         let trial = Trial::<Real> {
             outgoing: vec![Vec::new(); plan.terminal],
@@ -731,7 +805,8 @@ impl ContinuousPlan {
             end,
             at: start,
             next: end,
-            realized: Some(delta),
+            realized: Some(boundary.delta),
+            fronts: Some(boundary.fronts),
         };
         // The old state and new state share complete immutable blocks.
         // Charge each shared allocation only once against the original
@@ -742,7 +817,7 @@ impl ContinuousPlan {
             history,
             start,
             end,
-            input,
+            boundary,
             (boundary_bytes, limit, trial.workspace()),
         )?;
         for stage in 0..plan.sections {
@@ -760,7 +835,7 @@ impl ContinuousPlan {
                         "CPL accepted window construction workspace exceeded",
                     ));
                 }
-                let wave = window.merge(old, curve, cutoff, delta)?;
+                let wave = window.merge(old, curve, cutoff, boundary.delta)?;
                 bytes = bytes
                     .saturating_sub(curve_bytes)
                     .saturating_add(wave.unique_workspace(old));
@@ -817,6 +892,7 @@ impl ContinuousPlan {
                 at,
                 next,
                 realized,
+                fronts: None,
             };
             let mut curves = Vec::with_capacity(plan.terminal);
             let mut bytes = boundary_bytes
@@ -920,13 +996,8 @@ impl ContinuousPlan {
                     let terminal =
                         (row < n && stage == 0) || (row >= n && stage + 1 == plan.sections);
                     let terminal_sample = terminal.then(|| step.end - plan.half[row % n]);
-                    let compressed = self.compress(
-                        step.history,
-                        stage * ports + row,
-                        curve,
-                        ports + 1,
-                        terminal_sample,
-                    )?;
+                    let compressed =
+                        self.compress(step, stage * ports + row, curve, terminal_sample)?;
                     let previous = wave_bytes(&output[row]);
                     let skip = usize::from(!output[row].is_empty());
                     for knot in compressed.into_iter().skip(skip) {
@@ -957,16 +1028,15 @@ impl ContinuousPlan {
         trial: Trial<Value>,
         start: Real,
         end: Real,
-        boundary: (&[Real], &[Real]),
+        boundary: BoundaryStep<'_>,
         budget: (usize, usize),
     ) -> SpiceResult<ContinuousHistory> {
-        let (input, delta) = boundary;
         let (boundary_bytes, limit) = budget;
         let (mut next, mut bytes) = self.successor(
             history,
             start,
             end,
-            input,
+            boundary,
             (boundary_bytes, limit, trial.workspace()),
         )?;
         for (node, (old, new)) in history.outgoing.iter().zip(trial.outgoing).enumerate() {
@@ -979,7 +1049,7 @@ impl ContinuousPlan {
                 ));
             }
             let previous = wave_bytes(&new);
-            let wave = window.merge(old, new, cutoff, delta)?;
+            let wave = window.merge(old, new, cutoff, boundary.delta)?;
             bytes = bytes
                 .saturating_sub(previous)
                 .saturating_add(wave.unique_workspace(old));
@@ -993,7 +1063,7 @@ impl ContinuousPlan {
         history: &ContinuousHistory,
         start: Real,
         end: Real,
-        input: &[Real],
+        boundary: BoundaryStep<'_>,
         budget: (usize, usize, usize),
     ) -> SpiceResult<(ContinuousHistory, usize)> {
         let (boundary_bytes, limit, trial_bytes) = budget;
@@ -1002,6 +1072,7 @@ impl ContinuousPlan {
             reltol: history.reltol,
             initial_input: history.initial_input.clone(),
             boundary: Vec::with_capacity(history.boundary.len()),
+            fronts: Vec::with_capacity(history.fronts.len()),
             outgoing: Vec::with_capacity(history.outgoing.len()),
         };
         let mut bytes = boundary_bytes
@@ -1009,7 +1080,7 @@ impl ContinuousPlan {
             .saturating_add(next.headers())
             .saturating_add(trial_bytes);
         for (port, old) in history.boundary.iter().enumerate() {
-            let value = input[port] - next.initial_input[port];
+            let value = boundary.input[port] - next.initial_input[port];
             if !value.is_finite() {
                 return Err(invalid("nonfinite accepted CPL boundary wave"));
             }
@@ -1018,6 +1089,21 @@ impl ContinuousPlan {
                 wave: value,
             }];
             let cutoff = end - self.boundary_retention[port];
+            let markers = &history.fronts[port];
+            let first = markers.partition_point(|&time| time <= cutoff);
+            let record = boundary.fronts[port] && start > cutoff;
+            let count = markers.len() - first + usize::from(record);
+            let marker_bytes = count.saturating_mul(std::mem::size_of::<Real>());
+            if bytes.saturating_add(marker_bytes) > limit {
+                return Err(invalid("CPL protected front workspace exceeded"));
+            }
+            let mut fronts = Vec::with_capacity(count);
+            fronts.extend_from_slice(&markers[first..]);
+            if record {
+                fronts.push(start);
+            }
+            bytes = bytes.saturating_add(fronts.capacity() * std::mem::size_of::<Real>());
+            next.fronts.push(fronts);
             let window = RetainedWindow::new(old, &new, start, cutoff);
             if bytes.saturating_add(window.allocation_bound(old, new.len())) > limit {
                 return Err(invalid(
@@ -1038,34 +1124,47 @@ pub(super) struct ContinuousHistory {
     reltol: Real,
     initial_input: Vec<Real>,
     boundary: Vec<KnownWave>,
+    fronts: Vec<Vec<Real>>,
     outgoing: Vec<KnownWave>,
 }
 
 impl ContinuousHistory {
     pub(super) fn workspace(&self) -> usize {
-        self.headers().saturating_add(
-            self.boundary
-                .iter()
-                .chain(&self.outgoing)
-                .map(KnownWave::workspace)
-                .sum::<usize>(),
-        )
+        self.headers()
+            .saturating_add(self.front_bytes())
+            .saturating_add(
+                self.boundary
+                    .iter()
+                    .chain(&self.outgoing)
+                    .map(KnownWave::workspace)
+                    .sum::<usize>(),
+            )
     }
 
     const fn headers(&self) -> usize {
         (self.boundary.capacity() + self.outgoing.capacity()) * std::mem::size_of::<KnownWave>()
             + self.initial_input.capacity() * std::mem::size_of::<Real>()
+            + self.fronts.capacity() * std::mem::size_of::<Vec<Real>>()
+    }
+
+    fn front_bytes(&self) -> usize {
+        self.fronts
+            .iter()
+            .map(|times| times.capacity() * std::mem::size_of::<Real>())
+            .sum()
     }
 
     pub(super) fn unique_workspace(&self, old: &Self) -> usize {
-        self.headers().saturating_add(
-            self.boundary
-                .iter()
-                .zip(&old.boundary)
-                .chain(self.outgoing.iter().zip(&old.outgoing))
-                .map(|(wave, previous)| wave.unique_workspace(previous))
-                .sum::<usize>(),
-        )
+        self.headers()
+            .saturating_add(self.front_bytes())
+            .saturating_add(
+                self.boundary
+                    .iter()
+                    .zip(&old.boundary)
+                    .chain(self.outgoing.iter().zip(&old.outgoing))
+                    .map(|(wave, previous)| wave.unique_workspace(previous))
+                    .sum::<usize>(),
+            )
     }
 
     pub(super) fn len(&self) -> usize {
@@ -1081,6 +1180,9 @@ impl ContinuousHistory {
             wave.clear();
         }
         self.initial_input.fill(0.);
+        for fronts in &mut self.fronts {
+            fronts.clear();
+        }
         self.origin = 0.;
         self.reltol = 0.;
     }
@@ -1131,6 +1233,7 @@ struct Step<'a, Value> {
     at: Real,
     next: Real,
     realized: Option<&'a [Real]>,
+    fronts: Option<&'a [bool]>,
 }
 
 fn source(plan: &LossyPlan, stage: usize, port: usize) -> (Option<usize>, Real) {
@@ -1361,10 +1464,61 @@ mod tests {
         LossyPlan::prepare(basis, &material, sections).unwrap()
     }
 
+    fn test_fronts(
+        input: &[Real],
+        delta: &[Real],
+        previous: Option<&[Real]>,
+        reltol: Real,
+    ) -> Vec<bool> {
+        input
+            .iter()
+            .zip(delta)
+            .enumerate()
+            .map(|(port, (&value, &change))| {
+                let old = previous.map(|previous| previous[port]);
+                let resolved = old.is_none_or(|old| (change - old).abs() > reltol * value.abs());
+                boundary_front(old, change, resolved && change != 0.)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn protected_fronts_distinguish_flat_transitions_and_resolved_corners() {
+        assert!(boundary_front(None, 1., false));
+        assert!(!boundary_front(None, 0., false));
+        assert!(boundary_front(Some(0.), 1e-30, false));
+        assert!(boundary_front(Some(1e-30), 0., false));
+        assert!(!boundary_front(Some(1.), 1., false));
+        assert!(boundary_front(Some(1.), -1., true));
+        let mut times = Vec::new();
+        shifted_fronts(&[0., 1., 2., 3.], Some(4.), 0.5, 1.5, 4.6, &mut times);
+        assert_eq!(times, [2.5, 3.5, 4.5]);
+        let curve = [(0., 0.), (1., 0.), (2., 1.), (3., 1.), (4., 0.), (5., 0.)]
+            .map(|(time, wave)| Knot { time, wave });
+        times.clear();
+        zero_fronts(&curve, &mut times);
+        assert_eq!(times, [1., 4.]);
+        let affine: Vec<_> = curve
+            .iter()
+            .map(|point| {
+                let mut wave = Affine::scalar(1.);
+                wave.set(1, point.wave, 2);
+                Knot {
+                    time: point.time,
+                    wave,
+                }
+            })
+            .collect();
+        times.clear();
+        zero_fronts(&affine, &mut times);
+        assert_eq!(times, [1., 4.]);
+    }
+
     fn ramp_response(plan: &LossyPlan, source: usize, reltol: Real) -> (Vec<Vec<Real>>, usize) {
         let continuous = plan.continuous.as_ref().unwrap();
         let ports = plan.launch.len();
         let mut previous = vec![0.; ports];
+        let mut previous_delta = None;
         let mut history = continuous.start(0., reltol, &previous);
         let mut records = history.len();
         let mut result = Vec::new();
@@ -1374,6 +1528,7 @@ mod tests {
             let mut input = vec![0.; ports];
             input[source] = (end / 0.6e-9).min(1.);
             let delta: Vec<_> = input.iter().zip(&previous).map(|(a, b)| a - b).collect();
+            let fronts = test_fronts(&input, &delta, previous_delta.as_deref(), reltol);
             let loaded = continuous
                 .outputs(plan, &history, start, end, history.workspace())
                 .unwrap();
@@ -1384,7 +1539,11 @@ mod tests {
                     start,
                     end,
                     history.workspace(),
-                    (&input, &delta),
+                    BoundaryStep {
+                        input: &input,
+                        delta: &delta,
+                        fronts: &fronts,
+                    },
                 )
                 .unwrap();
             let mut actual = Vec::with_capacity(ports);
@@ -1404,6 +1563,7 @@ mod tests {
             history = accepted;
             records = records.max(history.len());
             previous = input;
+            previous_delta = Some(delta);
             start = end;
         }
         (result, records)
@@ -1440,6 +1600,104 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_sources_retain_resolved_fronts_without_protecting_ramp_samples() {
+        let mut plan = dense_plan(8);
+        plan.path_bound = None;
+        let mut reference = Kernel::empty(6);
+        plan.extend_kernel(&mut reference, 12e-9, 0).unwrap();
+        let continuous = plan.continuous.as_ref().unwrap();
+        let mut previous = [0.; 6];
+        let mut previous_delta = None;
+        let mut history = continuous.start(0., 1e-4, &previous);
+        let mut segments = Vec::new();
+        let mut start = 0.;
+        let mut saw_marker = false;
+        let arrival = 17. * 0.1e-9 + continuous.first_outgoing[1];
+        for step in 1..=120 {
+            let end = Real::from(step) * 0.1e-9;
+            let pulse = |first: i32, rise: i32, last: i32, fall: i32| {
+                (Real::from(step - first) / Real::from(rise)).clamp(0., 1.)
+                    - (Real::from(step - last) / Real::from(fall)).clamp(0., 1.)
+            };
+            let input = [
+                pulse(2, 6, 43, 6),
+                0.01 * pulse(17, 5, 61, 7),
+                0.,
+                0.,
+                -0.2 * pulse(21, 11, 70, 8),
+                0.,
+            ];
+            let delta: Vec<_> = input.iter().zip(&previous).map(|(a, b)| a - b).collect();
+            let fronts = test_fronts(&input, &delta, previous_delta.as_deref(), history.reltol);
+            if step == 18 {
+                assert!(fronts[1]);
+            }
+            if (19..=22).contains(&step) {
+                assert!(!fronts[1], "interior point of linear ramp");
+            }
+            if delta.iter().any(|&value| value != 0.) {
+                segments.push((start, end, delta.clone()));
+            }
+            let loaded = continuous
+                .outputs(&plan, &history, start, end, history.workspace())
+                .unwrap();
+            let accepted = continuous
+                .advance(
+                    &plan,
+                    &history,
+                    start,
+                    end,
+                    history.workspace(),
+                    BoundaryStep {
+                        input: &input,
+                        delta: &delta,
+                        fronts: &fronts,
+                    },
+                )
+                .unwrap();
+            if start < arrival && end > arrival {
+                saw_marker = accepted.outgoing[0]
+                    .iter()
+                    .any(|point| point.time.to_bits() == arrival.to_bits());
+            }
+            for (row, wave) in loaded.iter().enumerate() {
+                let actual = wave.evaluate(&delta);
+                let expected: Real = segments
+                    .iter()
+                    .map(|(from, to, changes)| {
+                        changes
+                            .iter()
+                            .enumerate()
+                            .map(|(source, &change)| {
+                                change
+                                    * segment_response(
+                                        &reference.traces[row * 6 + source],
+                                        end,
+                                        *from,
+                                        *to,
+                                    )
+                                    .hi
+                            })
+                            .sum::<Real>()
+                    })
+                    .sum();
+                assert!(
+                    (actual - expected).abs() < 2e-5,
+                    "row {row} at {end:e}: {actual:e} != {expected:e}"
+                );
+            }
+            history = accepted;
+            previous = input;
+            previous_delta = Some(delta);
+            start = end;
+        }
+        assert!(
+            saw_marker,
+            "overlapping source front was not retained exactly"
+        );
+    }
+
+    #[test]
     fn dense_sixty_four_stage_transport_refines_without_path_explosion() {
         let plan = dense_plan(64);
         for source in [0, 1, 2] {
@@ -1464,6 +1722,7 @@ mod tests {
         let plan = dense_plan(8);
         let continuous = plan.continuous.as_ref().unwrap();
         let mut previous = [0.; 6];
+        let mut previous_delta = None;
         let mut history = continuous.start(0., 1e-3, &previous);
         let mut peaks = [0; 4];
         let mut start = 0.;
@@ -1475,6 +1734,7 @@ mod tests {
             input[4] =
                 0.3 * ((phase - 40.) / 4.).clamp(0., 1.) * ((80. - phase) / 4.).clamp(0., 1.);
             let delta: Vec<_> = input.iter().zip(&previous).map(|(a, b)| a - b).collect();
+            let fronts = test_fronts(&input, &delta, previous_delta.as_deref(), history.reltol);
             let trial = continuous
                 .trial(&plan, &history, start, end, history.workspace())
                 .unwrap();
@@ -1484,7 +1744,11 @@ mod tests {
                     trial,
                     start,
                     end,
-                    (&input, &delta),
+                    BoundaryStep {
+                        input: &input,
+                        delta: &delta,
+                        fronts: &fronts,
+                    },
                     (history.workspace(), plan.limit.saturating_mul(2)),
                 )
                 .unwrap();
@@ -1494,6 +1758,7 @@ mod tests {
                 assert!(wave.len() < 2 || wave.get_hint(1, &mut 0).unwrap().time >= end - delay);
             }
             previous = input;
+            previous_delta = Some(delta);
             start = end;
         }
         eprintln!("periodic retained knot peaks: {peaks:?}");
@@ -1535,7 +1800,11 @@ mod tests {
                 trial,
                 0.,
                 end,
-                (&input, &input),
+                BoundaryStep {
+                    input: &input,
+                    delta: &input,
+                    fronts: &[true; 6],
+                },
                 (history.workspace(), plan.limit.saturating_mul(2)),
             )
             .unwrap();

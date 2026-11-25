@@ -497,6 +497,76 @@ fn transient_column(plot: &ngspice_rs::analysis::Plot, name: &str) -> Vec<f64> {
         .collect()
 }
 
+// The fixed synthetic noncommuting dense cable previously exhausted its
+// 32 MiB configured workspace. The reference solves the split-network
+// transfer independently using complex matrix exponentials, exact modal
+// phases, and inverse Fourier integration with analytically restored
+// ballistic paths. No native waveform reducer is used.
+#[test]
+fn dense_lossy_thirty_two_conductor_cable_completes_with_physical_fronts() {
+    let deck = include_str!("fixtures/cpl/dense-32.cir");
+    let body = deck
+        .split_once('\n')
+        .unwrap()
+        .1
+        .strip_suffix(".end\n")
+        .unwrap();
+    let plot = run_transient_cpl(body);
+    let times = transient_column(&plot, "time");
+    assert!((times.last().unwrap() - 12e-9).abs() < 1e-20);
+    let columns: Vec<_> = ['a', 'b']
+        .into_iter()
+        .flat_map(|side| (1..=32).map(move |port| format!("v({side}{port})")))
+        .map(|name| transient_column(&plot, &name))
+        .collect();
+    let references = include_str!("fixtures/cpl/dense-32-reference.tsv");
+    let mut checked = 0;
+    for line in references.lines().filter(|line| !line.starts_with('#')) {
+        let mut fields = line.split_whitespace();
+        let label = fields.next().unwrap();
+        let values: Vec<f64> = fields.map(|field| field.parse().unwrap()).collect();
+        assert_eq!(values.len(), columns.len());
+        if label == "fronts" {
+            for (port, (&front, waveform)) in values.iter().zip(&columns).enumerate() {
+                for (&time, &voltage) in times.iter().zip(waveform) {
+                    if time >= front - 1e-18 {
+                        break;
+                    }
+                    let incident = if port == 31 {
+                        0.5 * ((time - 1e-9) / 0.6e-9).clamp(0., 1.)
+                    } else {
+                        0.
+                    };
+                    assert!(
+                        (voltage - incident).abs() < 1e-11,
+                        "premature wave at port {port}, t={time:e}, v={voltage:e}"
+                    );
+                }
+            }
+        } else {
+            let time: f64 = label.parse().unwrap();
+            let upper = times
+                .partition_point(|&sample| sample < time)
+                .min(times.len() - 1);
+            let lower = upper.saturating_sub(1);
+            let fraction = if upper == lower {
+                0.
+            } else {
+                ((time - times[lower]) / (times[upper] - times[lower])).clamp(0., 1.)
+            };
+            for (port, (&expected, waveform)) in values.iter().zip(&columns).enumerate() {
+                let actual = (waveform[upper] - waveform[lower]).mul_add(fraction, waveform[lower]);
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "dense cable port {port} at {time:e}: {actual:e} != {expected:e}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 7 * 64);
+}
+
 #[test]
 fn coupled_multiconductor_transient_preserves_initial_dc_steady_state() {
     // With constant source, the accepted t=0 DC fluxes/charges initialize
