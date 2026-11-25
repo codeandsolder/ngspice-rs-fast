@@ -115,3 +115,27 @@ wall time was 445 ms versus 836 ms. Timings vary with concurrent build load.
 Live GHDL tests also exercise a 65-bit four-state bus (including X and Z)
 and deterministic rejected-trial recovery. The native competing-clock
 regression checks prediction reuse and coincident input cancellation.
+
+The closed-loop RC oscillator example (feedback_inverter in both HDLs)
+uses a 1 kohm/100 nF RC network, hysteretic ADC (1 V/2 V), 500 ns ADC
+delay, 500 ns HDL inverter delay and 1 us DAC slew. Both compiled models
+produced seven transitions over 600 us, with a 71.555 us half-period
+and maximum cross-language midpoint difference 3.48 ns.
+
+Independent reference observations using unchanged upstream ngspice
+examples: Verilator delay.v (five-bit autonomous ring, 100 ns precision)
+matched all 12 states of the live ngspice-47 d_cosim eprint trace from
+0 to 11 us; the maximum C event timestamp offset was 28.2 ns. GHDL
+pwm.vhd matched all 21 settled transitions through 10 ms against a
+standalone GHDL testbench, including exact integer-femtosecond times.
+The upstream shared-library VHDL integration was not runnable on the
+test host: its portable LLVM compiler required libLLVM.so.18.1 and
+libgnat-13.so, while the mcode adapter needed neither.
+
+The larger Verilog benchmark adds a 64-stage native D-flip-flop
+circulating register driven by the compiled clock. The same 50 us interval
+delivered 660135 events and 970131 model evaluations in both runs.
+Every register made 5001 transitions including initialization and
+returned to its expected initial state after 5000 rising edges.
+Adaptive: 137 accepted analog steps, 1.226 s; fixed 5 ns: 10080 steps,
+2.938 s (2.40x wall-time improvement on this run).

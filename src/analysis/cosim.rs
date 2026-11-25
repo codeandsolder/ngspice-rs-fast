@@ -565,3 +565,86 @@ impl Simulator for ReplaySimulator {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_SCHEMA: Schema = Schema {
+        inputs: 2,
+        outputs: 2,
+        snapshot_bytes: 32,
+    };
+
+    fn response(outputs: &[u8], snapshot: &[u8]) -> Vec<u8> {
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend(0_u32.to_le_bytes());
+        bytes.extend(10_u64.to_le_bytes());
+        bytes.extend(20_u64.to_le_bytes());
+        bytes.extend(u32::try_from(outputs.len()).unwrap().to_le_bytes());
+        bytes.extend(u32::try_from(snapshot.len()).unwrap().to_le_bytes());
+        bytes.extend(outputs);
+        bytes.extend(snapshot);
+        bytes
+    }
+
+    #[test]
+    fn snapshot_protocol_checks_every_field_and_preserves_four_state_bits() -> SpiceResult<()> {
+        let request = Request {
+            tick: 10,
+            precision: -9,
+            operation: Operation::ApplyInputs,
+            delta: 3,
+            inputs: &[Bit::X, Bit::Z],
+            snapshot: Some(&[7, 8][..]),
+        };
+        let encoded = encode(MAGIC, TEST_SCHEMA, &request)?;
+        assert_eq!(encoded.len(), REQUEST_HEADER + 4);
+        assert_eq!(&encoded[32..36], &2_u32.to_le_bytes());
+        assert_eq!(&encoded[36..], &[2, 3, 7, 8]);
+        let payload = response(&[2, 3], &[7, 8]);
+        let reply = decode(MAGIC, TEST_SCHEMA, &payload)?;
+        assert_eq!(reply.reached_tick, 10);
+        assert_eq!(reply.next_tick, Some(20));
+        assert_eq!(reply.outputs, [Bit::X, Bit::Z]);
+        assert_eq!(reply.snapshot.as_ref(), &[7, 8]);
+        for length in 0..payload.len() {
+            assert!(decode(MAGIC, TEST_SCHEMA, &payload[..length]).is_err());
+        }
+        assert!(decode(REPLAY_MAGIC, TEST_SCHEMA, &payload).is_err());
+        assert!(decode(MAGIC, TEST_SCHEMA, &response(&[2, 4], &[])).is_err());
+        assert!(decode(MAGIC, TEST_SCHEMA, &response(&[0], &[])).is_err());
+        assert!(decode(MAGIC, TEST_SCHEMA, &response(&[0, 1], &[0; 33])).is_err());
+        let mut trailing = payload;
+        trailing.push(0);
+        assert!(decode(MAGIC, TEST_SCHEMA, &trailing).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn wire_rejects_oversized_and_truncated_frames_before_reading_body() {
+        let (tx, _) = mpsc::sync_channel(1);
+        let request = Exchange {
+            payload: vec![1, 2, 3],
+            response_limit: 16,
+            result: tx,
+        };
+        let mut input = Vec::new();
+        let mut oversized = io::Cursor::new(u32::MAX.to_le_bytes());
+        assert_eq!(
+            exchange_io(&mut input, &mut oversized, &request)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(oversized.position(), 4);
+        assert_eq!(input, [3, 0, 0, 0, 1, 2, 3]);
+        let mut truncated = io::Cursor::new([3, 0, 0, 0, 1, 2]);
+        assert_eq!(
+            exchange_io(&mut Vec::new(), &mut truncated, &request)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+}

@@ -118,8 +118,11 @@ impl TimeScale {
     /// Negative, nonfinite or out-of-range time.
     #[expect(
         clippy::cast_possible_truncation,
+        reason = "finite quotient is explicitly bounded before truncation"
+    )]
+    #[expect(
         clippy::cast_sign_loss,
-        reason = "finite nonnegative quotient is explicitly bounded before truncation"
+        reason = "physical time and quotient are nonnegative"
     )]
     pub fn tick(self, physical: Real) -> SpiceResult<u64> {
         if !physical.is_finite() || physical < 0. || physical > self.physical(Self::MAX_TICK)? {

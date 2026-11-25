@@ -197,7 +197,7 @@ fn find_program(name: &str) -> PathBuf {
         .unwrap()
 }
 
-fn compile_filter(directory: &Path) -> PathBuf {
+fn compile_verilator(directory: &Path, model: &str) -> PathBuf {
     use ngspice_conformance::process::{ProcessLimits, run};
     let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/cosim");
     let args = [
@@ -206,15 +206,15 @@ fn compile_filter(directory: &Path) -> PathBuf {
         "--build".into(),
         "--timing".into(),
         "--top-module".into(),
-        "clocked_filter".into(),
+        model.into(),
         "--Mdir".into(),
         directory.as_os_str().to_owned(),
         "-j".into(),
         "2".into(),
         "-CFLAGS".into(),
         "-std=c++20".into(),
-        sources.join("clocked_filter.sv").into_os_string(),
-        sources.join("clocked_filter.cpp").into_os_string(),
+        sources.join(format!("{model}.sv")).into_os_string(),
+        sources.join(format!("{model}.cpp")).into_os_string(),
     ];
     let result = run(
         find_program("verilator"),
@@ -228,7 +228,7 @@ fn compile_filter(directory: &Path) -> PathBuf {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    directory.join("Vclocked_filter")
+    directory.join(format!("V{model}"))
 }
 
 fn replay(program: &Path, directory: &Path) -> SpiceResult<ReplaySimulator> {
@@ -343,7 +343,7 @@ fn run_clocked_filter(simulator: ReplaySimulator, precision: i32, per_ns: u64) -
 #[ignore = "requires Verilator 5.x with timing support and a C++20 compiler"]
 fn compiled_verilog_runs_internal_clock_and_recovers_rejected_trials() -> SpiceResult<()> {
     let scratch = ngspice_conformance::ngspice::Scratch::new("verilator-cosim").unwrap();
-    let program = compile_filter(scratch.path());
+    let program = compile_verilator(scratch.path(), "clocked_filter");
     run_clocked_filter(replay(&program, scratch.path())?, -9, 1)
 }
 
@@ -424,11 +424,12 @@ fn run_mixed_filter(
     simulator: impl Fn() -> SpiceResult<ReplaySimulator>,
     precision: i32,
     per_ns: u64,
+    register_count: usize,
 ) -> SpiceResult<()> {
     use ngspice_rs::analysis::digital::{AdcBinding, MixedSignal};
     use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, mixed_signal_transient};
     use ngspice_rs::devices::Circuit;
-    use ngspice_rs::devices::code_model::{Adc, Dac, DacConfig, DelayMode, Delays};
+    use ngspice_rs::devices::code_model::{Adc, DFlipFlop, Dac, DacConfig, DelayMode, Delays};
     use ngspice_rs::netlist::{Parser, source::parse_deck_text};
     use ngspice_rs::primitives::{AnalysisKind, NodeId};
 
@@ -452,6 +453,24 @@ fn run_mixed_filter(
             &[input],
             &[filtered, clock],
         )?;
+        let registers: Vec<_> = (0..register_count).map(|_| network.add_net()).collect();
+        for (i, &output) in registers.iter().enumerate() {
+            let complement = network.add_net();
+            let predecessor = registers[(i + register_count - 1) % register_count];
+            network.add_model(
+                DFlipFlop {
+                    initial: if i.is_multiple_of(2) {
+                        Logic::One
+                    } else {
+                        Logic::Zero
+                    },
+                    delays: Delays::new(0., 0.)?,
+                    mode: DelayMode::Transport,
+                },
+                &[predecessor, clock],
+                &[output, complement],
+            )?;
+        }
         let mut mixed = MixedSignal::new(Engine::new(network, Limits::default())?);
         mixed.add_adc(AdcBinding {
             terminals: [input_node, NodeId::GROUND],
@@ -492,6 +511,21 @@ fn run_mixed_filter(
             [(0, Logic::Zero), (35, Logic::One), (45, Logic::Zero)]
         );
         assert_eq!(plot.column("v(out)").unwrap().last().unwrap().re, 0.);
+        // Every rising clock edge rotates the alternating pattern by one bit.
+        for (i, &net) in registers.iter().enumerate() {
+            let changes = mixed
+                .changes()
+                .iter()
+                .filter(|change| change.net == net)
+                .count();
+            assert_eq!(changes, 5001, "register {i}");
+            let expected = if i.is_multiple_of(2) {
+                Bit::One
+            } else {
+                Bit::Zero
+            };
+            assert_eq!(mixed.engine().value(net), Some(expected.drive()));
+        }
         Ok((stats.accepted, mixed.engine().stats(), duration))
     };
     let adaptive = run("1u")?;
@@ -509,8 +543,8 @@ fn run_mixed_filter(
 #[ignore = "requires Verilator 5.x with timing support and a C++20 compiler"]
 fn compiled_verilog_adc_filter_dac_and_event_density() -> SpiceResult<()> {
     let scratch = ngspice_conformance::ngspice::Scratch::new("verilator-mixed").unwrap();
-    let program = compile_filter(scratch.path());
-    run_mixed_filter(|| replay(&program, scratch.path()), -9, 1)
+    let program = compile_verilator(scratch.path(), "clocked_filter");
+    run_mixed_filter(|| replay(&program, scratch.path()), -9, 1, 64)
 }
 
 #[test]
@@ -532,6 +566,7 @@ fn compiled_vhdl_adc_filter_dac_and_event_density() -> SpiceResult<()> {
         },
         -15,
         1_000_000,
+        0,
     )
 }
 
@@ -675,5 +710,104 @@ fn independent_predictions_survive_other_models_and_invalidate_on_input_changes(
     assert_eq!(changes, [(0, Logic::Zero), (166, Logic::One)]);
     trial.commit()?;
     assert!(engine.stats().probes < 110, "{:?}", engine.stats());
+    Ok(())
+}
+
+fn run_hdl_feedback(simulator: ReplaySimulator, precision: i32) -> SpiceResult<Vec<f64>> {
+    use ngspice_rs::analysis::digital::{AdcBinding, MixedSignal};
+    use ngspice_rs::analysis::{AnalysisContext, RunConfig, mixed_signal_transient};
+    use ngspice_rs::devices::code_model::{Adc, Dac, DacConfig, DelayMode, Delays};
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use ngspice_rs::primitives::NodeId;
+
+    let deck = parse_deck_text(
+        Path::new("feedback.cir"),
+        "mixed RC feedback\nr1 out cap 1k\nc1 cap 0 100n\n.ic v(cap)=0\n.tran 5u 600u 0 500n\n.end\n",
+    );
+    let netlist = Parser::new().parse_deck(&deck)?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let mut circuit = config.circuit(&netlist)?;
+    let plan = config.plan_for(&netlist.analyses[0])?;
+    let cap = circuit.nodes().get("cap").unwrap();
+    let out = circuit.nodes().get("out").unwrap();
+    let mut network = Network::default();
+    let sense = network.add_net();
+    let control = network.add_net();
+    let source = network.add_source(sense)?;
+    network.add_model(
+        Bridge::new(simulator, SCHEMA, TimeScale::new(precision)?)?,
+        &[sense],
+        &[control],
+    )?;
+    let mut mixed = MixedSignal::new(Engine::new(network, Limits::default())?);
+    mixed.add_adc(AdcBinding {
+        terminals: [cap, NodeId::GROUND],
+        source,
+        thresholds: Adc::new(2., 1.)?,
+        delays: Delays::new(500e-9, 500e-9)?,
+        mode: DelayMode::Transport,
+    })?;
+    mixed.add_dac(
+        &mut circuit,
+        "adac",
+        [out, NodeId::GROUND],
+        control,
+        DacConfig::new(
+            Dac {
+                low: 0.,
+                high: 3.,
+                unknown: 1.5,
+            },
+            Delays::new(1e-6, 1e-6)?,
+        )?,
+    )?;
+    let (plot, _) =
+        mixed_signal_transient(&mut circuit, &plan, &AnalysisContext::default(), &mut mixed)?;
+    assert_eq!(plot.value("v(cap)", 0).unwrap().re, 0.);
+    assert_eq!(plot.value("v(out)", 0).unwrap().re, 3.);
+    let transitions: Vec<_> = mixed
+        .changes()
+        .iter()
+        .filter(|change| change.net == control && change.time > 0.)
+        .map(|change| change.time + 500e-9)
+        .collect();
+    assert_eq!(transitions.len(), 7, "{transitions:?}");
+    assert!(
+        (transitions[0] - (100e-6 * 3_f64.ln() + 1.5e-6)).abs() < 100e-9,
+        "{transitions:?}"
+    );
+    for pair in transitions.windows(2) {
+        assert!(
+            (pair[1] - pair[0] - 71.575e-6).abs() < 200e-9,
+            "{transitions:?}"
+        );
+    }
+    Ok(transitions)
+}
+
+#[test]
+#[ignore = "requires Verilator 5.x, GHDL 6.x and a C++20 compiler"]
+fn compiled_hdl_closed_loop_rc_feedback_matches_analytic_period() -> SpiceResult<()> {
+    let verilog = ngspice_conformance::ngspice::Scratch::new("verilog-feedback").unwrap();
+    let program = compile_verilator(verilog.path(), "feedback_inverter");
+    let verilog_edges = run_hdl_feedback(replay(&program, verilog.path())?, -9)?;
+    let vhdl = ngspice_conformance::ngspice::Scratch::new("vhdl-feedback").unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/cosim/feedback_inverter.vhd");
+    let (program, args) = compile_ghdl(vhdl.path(), "feedback_inverter", &source);
+    let vhdl_edges = run_hdl_feedback(
+        ReplaySimulator::new(
+            program,
+            args,
+            vhdl.path().into(),
+            Duration::from_secs(5),
+            100_000,
+            ReplayMode::Lookahead,
+        )?,
+        -15,
+    )?;
+    println!("Verilog: {verilog_edges:?}; VHDL: {vhdl_edges:?}");
+    for (a, b) in verilog_edges.iter().zip(&vhdl_edges) {
+        assert!((a - b).abs() < 10e-9);
+    }
     Ok(())
 }
