@@ -36,7 +36,9 @@
 //! `ASRCfindBr`). C would also invent an unstamped branch for a current B
 //! source; the port reports that reference as not findable instead.
 
+mod dynamic;
 pub mod program;
+pub mod rlc;
 pub mod xspice;
 
 use crate::maths::{SparseMatrix, Vector};
@@ -818,6 +820,19 @@ pub(crate) fn instantiate(
         ));
     }
     let (output, tree, scale) = parse_parameters(instance)?;
+    Ok(Box::new(bind_expression(
+        instance, nodes, output, tree, scale,
+    )?))
+}
+
+fn bind_expression(
+    instance: &DeviceInstance,
+    nodes: &mut NodeAppend<'_>,
+    output: BehaviouralOutput,
+    tree: &BehaviouralExpression,
+    scale: BehaviouralScale,
+) -> SpiceResult<Behavioural> {
+    let location = &instance.location;
     let program = Program::compile(&tree.root)?;
     nodes.transaction(|nodes| {
         let positive = nodes.intern(&instance.nodes[0])?;
@@ -850,7 +865,7 @@ pub(crate) fn instantiate(
                 }
             }
         }
-        Ok(Box::new(Behavioural {
+        Ok(Behavioural {
             name: instance.name.clone(),
             designator: instance.designator,
             output,
@@ -860,7 +875,7 @@ pub(crate) fn instantiate(
             program,
             workspace: RefCell::default(),
             scale,
-        }) as Box<dyn Device>)
+        })
     })
 }
 
