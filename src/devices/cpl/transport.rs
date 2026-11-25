@@ -888,15 +888,14 @@ impl LossyPlan {
         let ports = self.launch.len();
         let (known, coefficients) =
             if let (Some(plan), Some(state)) = (&self.continuous, &history.continuous) {
-                let trial = plan.trial(self, state, start, time, history.boundary_bytes())?;
+                let output = plan.outputs(self, state, start, time, history.boundary_bytes())?;
                 let known = history
                     .initial_output
                     .iter()
-                    .zip(&trial.output)
+                    .zip(&output)
                     .map(|(&baseline, wave)| baseline + Wide::from_real(wave.known))
                     .collect::<Vec<_>>();
-                let coefficients = trial
-                    .output
+                let coefficients = output
                     .iter()
                     .map(|wave| {
                         (0..ports)
@@ -1009,11 +1008,7 @@ impl LossyPlan {
         let ports = self.launch.len();
         let mut next = history.clone();
         let direct = if let (Some(plan), Some(state)) = (&self.continuous, &history.continuous) {
-            Some((
-                plan,
-                state,
-                plan.trial(self, state, start, context.time, history.boundary_bytes())?,
-            ))
+            Some((plan, state))
         } else {
             next.kernel = self.kernel_at(history, context.time)?;
             None
@@ -1067,7 +1062,15 @@ impl LossyPlan {
         }
         next.previous_time = Some(start);
         next.time = Some(context.time);
-        if let Some((plan, state, trial)) = direct {
+        if let Some((plan, state)) = direct {
+            let trial = plan.accepted_trial(
+                self,
+                state,
+                start,
+                context.time,
+                history.boundary_bytes(),
+                &segment.delta,
+            )?;
             next.continuous = Some(Arc::new(plan.accept(
                 state,
                 trial,
@@ -1093,16 +1096,32 @@ impl LossyPlan {
             });
         }
         Self::prune_finished_response(&mut next, context.time);
+        self.secondary_breakpoints(&next, &reflected[..ports], context, dt, &mut breakpoints);
+        Ok(CplUpdate {
+            reset: false,
+            next,
+            breakpoints,
+        })
+    }
+    fn secondary_breakpoints(
+        &self,
+        history: &CplHistory,
+        reflected: &[Real],
+        context: &DelayContext<'_>,
+        dt: Real,
+        breakpoints: &mut Vec<Real>,
+    ) {
+        let ports = self.launch.len();
         // Schedule the next resolvable secondary corner for each output,
         // not every tiny reflection. All arrivals remain in the response.
-        for (row, &amplitude) in reflected[..ports].iter().enumerate() {
+        for (row, &amplitude) in reflected.iter().enumerate() {
             let mut earliest = Real::INFINITY;
             let tolerance = context.reltol.mul_add(amplitude.abs(), context.abstol);
-            for corner in &next.corners {
+            for corner in &history.corners {
                 let ratio = dt / corner.duration;
                 let lag = context.time - corner.time;
                 for &(source, change) in &corner.changes {
-                    let trace = &next.kernel.traces[row * ports + source];
+                    let trace = &history.kernel.traces[row * ports + source];
                     let index = trace.partition_point(|knot| knot.time.hi <= lag);
                     for knot in &trace[index..] {
                         let point = corner.time + knot.time.hi;
@@ -1121,11 +1140,6 @@ impl LossyPlan {
                 breakpoints.push(earliest);
             }
         }
-        Ok(CplUpdate {
-            reset: false,
-            next,
-            breakpoints,
-        })
     }
 }
 

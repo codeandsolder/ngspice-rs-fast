@@ -171,16 +171,21 @@ method of steps. Each stage merges the knots of its physically delayed
 incident piecewise-linear waves and applies its static scattering matrix.
 The internal substep is at most the shortest interstage flight. Launch,
 interstage and exit delays are continuous, not rounded to an integer
-lattice. Trial waveforms are affine in all new boundary endpoint increments;
-the terminal relation therefore also includes arrivals inside an oversized
-trial. Rejected trials cannot advance the accepted wave histories.
+lattice. Ordinary steps cannot traverse a complete interstage flight: terminal
+loads sample only the accepted history and the necessary terminal
+scattering rows, while acceptance propagates the realized scalar waveform.
+Oversized trials use waveforms affine in all new boundary endpoint
+increments, so the terminal relation includes arrivals and internal
+feedback during the trial. Rejected trials cannot advance the accepted
+wave histories.
 
 Histories retain only the delay window needed by the next stage or
 terminal and the boundary knots needed for front protection. To prevent
 combinatorial growth of secondary reflection knots, the solver may replace
 a curve by an endpoint-preserving chord or two-segment tent. It protects
 first physical arrivals and straight modal flights, bounds the normalized
-interpolation error independently in every affine component, and checks
+interpolation error independently in every affine component (the known
+wave uses its current causal history-window amplitude as a scale), and checks
 the wave-energy Gram inequality over every prefix of the replaced
 interval. A cubic Bernstein certificate proves the latter for arbitrary
 combinations of endpoint increments; inconclusive certificates trigger
@@ -199,7 +204,9 @@ histories fold expired segments into the steady baseline.
 DC initializes both representations consistently with the static scattering
 network. The spatial splitting approximates noncommuting R/G and L/C;
 refine `sections` for spatial accuracy. Explicit workspace and work
-limits account for retained histories and affine trial scratch. Exhaustion
+limits account for retained scalar histories and affine trial scratch.
+Output-row batches and overlapping time chunks bound temporary scattering
+curves without changing their exact endpoint relations. Exhaustion
 is reported rather than silently discarding significant arrivals.
 
 ## Passive finite-volume cable
