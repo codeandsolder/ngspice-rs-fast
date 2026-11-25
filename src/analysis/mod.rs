@@ -37,6 +37,7 @@ pub mod bias;
 mod companion;
 pub mod config;
 pub mod control;
+pub mod digital;
 pub mod disto;
 pub mod driver;
 pub mod fourier;
@@ -68,7 +69,10 @@ pub mod sweep;
 mod tf;
 pub mod touchstone;
 
-pub use companion::{TransientPlan, TransientStats, companion_transient, companion_transient_into};
+pub use companion::{
+    TransientPlan, TransientStats, companion_transient, companion_transient_into,
+    mixed_signal_transient, mixed_signal_transient_into,
+};
 pub use config::{
     AppliedOption, DcOptions, IgnoredOption, PlanningLimits, RunConfig, RunOverrides,
     TransientSettings,

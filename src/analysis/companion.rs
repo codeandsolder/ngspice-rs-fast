@@ -476,6 +476,18 @@ impl ReadyStep {
         }
     }
 
+    /// A digital or DAC-ramp boundary is not merged into the analog source
+    /// breakpoint table: distinct physical event times must not be lost to
+    /// its CKTminBreak coalescing policy.
+    fn limit_to_event(&mut self, at: Real) {
+        let distance = at - self.clock.time;
+        if self.clock.next.delta >= distance {
+            self.clock.save_delta = self.clock.next.delta;
+            self.clock.next.delta = distance;
+            self.boundary = Boundary::Forced;
+        }
+    }
+
     fn begin(self, steps: &StepHistory, settings: &TransientPlan) -> SpiceResult<AttemptedStep> {
         let mut clock = self.clock;
         clock.time += clock.next.delta;
@@ -635,6 +647,7 @@ struct Driver<'a> {
     /// Reuse the ordinary Newton MNA/RHS/trial storage across timepoint
     /// acceptance and rejected smaller-step retries.
     workspace: crate::analysis::newton::CircuitNewtonWorkspace,
+    mixed: Option<&'a mut super::digital::MixedSignal>,
 }
 
 /// Runs an ordinary `.tran` with the companion backend, returning the plot and
@@ -697,6 +710,61 @@ pub fn companion_transient_into(
         TransientRun::Ordinary,
         sink,
     )?;
+    circuit.record_final_transient_state(&result.history)?;
+    Ok(result.stats)
+}
+
+/// Run a typed mixed-signal transient using the ordinary companion solver.
+/// Digital model state is settled outside Newton iterations, and DAC output
+/// ramps are read-only during each analog attempt.
+///
+/// # Errors
+/// The ordinary transient errors, invalid mixed-signal bindings, unsupported
+/// UIC initialization, or an exceeded digital event/initialization budget.
+pub fn mixed_signal_transient(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &AnalysisContext,
+    mixed: &mut super::digital::MixedSignal,
+) -> SpiceResult<(Plot, TransientStats)> {
+    let mut collector = super::results::PlotCollector::default();
+    let stats = mixed_signal_transient_into(circuit, request, context, mixed, &mut collector)?;
+    let plot = collector
+        .finish(1)?
+        .pop()
+        .ok_or_else(|| super::results::lifecycle_error("mixed transient returned no plot"))?;
+    Ok((plot, stats))
+}
+
+/// Streaming form of [mixed_signal_transient].
+///
+/// # Errors
+/// As [mixed_signal_transient], and any sink failure.
+pub fn mixed_signal_transient_into(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &AnalysisContext,
+    mixed: &mut super::digital::MixedSignal,
+    sink: &mut dyn PointSink,
+) -> SpiceResult<TransientStats> {
+    let settings = *request
+        .transient()
+        .ok_or_else(|| unsupported("mixed signal requires a transient plan"))?;
+    if request.uic() {
+        return Err(unsupported("mixed-signal UIC initialization"));
+    }
+    mixed.activate(circuit)?;
+    let result = run_transient_inner(
+        circuit,
+        request,
+        context,
+        settings,
+        TransientRun::Ordinary,
+        sink,
+        Some(mixed),
+    );
+    mixed.deactivate();
+    let result = result?;
     circuit.record_final_transient_state(&result.history)?;
     Ok(result.stats)
 }
@@ -791,6 +859,18 @@ pub(super) fn run_transient(
     purpose: TransientRun<'_>,
     sink: &mut dyn PointSink,
 ) -> SpiceResult<TransientEnd> {
+    run_transient_inner(circuit, request, context, settings, purpose, sink, None)
+}
+
+fn run_transient_inner(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &AnalysisContext,
+    settings: TransientPlan,
+    purpose: TransientRun<'_>,
+    sink: &mut dyn PointSink,
+    mixed: Option<&mut super::digital::MixedSignal>,
+) -> SpiceResult<TransientEnd> {
     let bias = request.dc_settings().clone();
     let uic = request.uic() && !matches!(purpose, TransientRun::Shooting { .. });
     if uic && let Some(line) = circuit.devices().iter().find(|d| d.delay_line().is_some()) {
@@ -882,6 +962,7 @@ pub(super) fn run_transient(
         truncation,
         stats: TransientStats::default(),
         workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
+        mixed,
     };
     driver.run(purpose, sink)
 }
@@ -996,6 +1077,16 @@ impl Driver<'_> {
             let mut ready = cursor.prepare(&self.settings, &mut breaks, self.uic)?;
             if let Some(at) = next_sample {
                 ready.limit_to_sample(at);
+            }
+            if let Some(mixed) = self.mixed.as_deref() {
+                if mixed.boundary() && time > 0. {
+                    ready.clock.next.order = Order::One;
+                    ready.clock.next.delta =
+                        ready.clock.next.delta.min(0.1 * ready.clock.save_delta);
+                }
+                if let Some(at) = mixed.next_boundary(time)? {
+                    ready.limit_to_event(at);
+                }
             }
             accepted = self.advance(
                 ready,
@@ -1185,6 +1276,28 @@ impl Driver<'_> {
                     ready = attempt.retry(next, min_step)?;
                 }
                 Trial::Converged { x, state } => {
+                    // Locate a newly discovered ADC threshold before accepting
+                    // the analog candidate. The rejected candidate has never
+                    // changed event state or DAC forcing.
+                    if let Some(mixed) = self.mixed.as_deref()
+                        && let Some(at) =
+                            mixed.first_crossing(self.circuit, &x, attempt.clock.time)?
+                        && attempt.clock.time - at > min_step
+                    {
+                        let base = attempt.clock.time - attempt.clock.next.delta;
+                        let next = NextStep {
+                            delta: at - base,
+                            order: Order::One,
+                        };
+                        if next.delta > min_step {
+                            iterate = x;
+                            self.stats.rejected += 1;
+                            drop(prepared);
+                            ready = attempt.retry(next, min_step)?;
+                            ready.boundary = Boundary::Forced;
+                            continue;
+                        }
+                    }
                     let decision =
                         attempt.decision(&self.settings, &self.steps, |coefficients| {
                             self.truncation_limit(coefficients, &state, &x, attempt.clock.time)
@@ -1197,6 +1310,13 @@ impl Driver<'_> {
                             ready = attempt.retry(next, min_step)?;
                         }
                         StepDecision::Accept(next) => {
+                            let mixed_point = self
+                                .mixed
+                                .as_deref()
+                                .map(|mixed| {
+                                    mixed.prepare_point(self.circuit, &x, attempt.clock.time)
+                                })
+                                .transpose()?;
                             let observed = if attempt.clock.time < self.settings.start
                                 || sample_at.is_some_and(|at| {
                                     !almost_equal_ulps(attempt.clock.time, at, 100)
@@ -1226,6 +1346,11 @@ impl Driver<'_> {
                             drop(prepared);
                             let device_breaks =
                                 self.commit_point(Acceptance::Step(&attempt), &x, state)?;
+                            if let (Some(mixed), Some(point)) =
+                                (self.mixed.as_deref_mut(), mixed_point)
+                            {
+                                mixed.commit_point(point);
+                            }
                             return Ok(AcceptedPoint {
                                 cursor: attempt.accept(next),
                                 solution: x,
@@ -1301,7 +1426,43 @@ impl Driver<'_> {
     /// Nothing is committed (no accept hook, no history) until every check has
     /// passed, so a failed initialization leaves no partial state.
     fn initialize(&mut self) -> SpiceResult<AcceptedPoint> {
-        let rhs = self.system.transient_rhs(0., crate::devices::Limit::Left)?;
+        // Solve the analog and event operating point to a common fixed point.
+        // The provisional digital state is rolled back if initialization
+        // fails; analog integration history is committed exactly once.
+        for _ in 0..self.bias.newton.max_iterations {
+            let (x, trial) = self.initial_candidate()?;
+            let mixed_point = self
+                .mixed
+                .as_deref()
+                .map(|mixed| mixed.prepare_point(self.circuit, &x, 0.))
+                .transpose()?;
+            if let (Some(mixed), Some(point)) = (self.mixed.as_deref_mut(), mixed_point) {
+                let changed = mixed.initial_changed(&point)?;
+                mixed.commit_point(point);
+                if changed {
+                    continue;
+                }
+            }
+            let device_breaks = self.commit_point(Acceptance::Initial, &x, trial)?;
+            if let Some(mixed) = self.mixed.as_deref_mut() {
+                mixed.accept_initial();
+            }
+            return Ok(AcceptedPoint {
+                cursor: AcceptedCursor::initial(&self.settings),
+                solution: x,
+                observed: None,
+                device_breaks,
+                periodic_boundary: None,
+            });
+        }
+        Err(failure("mixed-signal operating point did not settle"))
+    }
+
+    fn initial_candidate(&self) -> SpiceResult<(Vector, TrialState)> {
+        let mut rhs = self.system.transient_rhs(0., crate::devices::Limit::Left)?;
+        if let Some(mixed) = self.mixed.as_deref() {
+            mixed.initial_rhs(self.circuit, &mut rhs)?;
+        }
         let (x, trial) = if self.uic {
             let start = initial::uic_start(self.circuit, &self.hints, &self.model_context)?;
             // C's single MODETRANOP|MODEUIC|MODEINITJCT load: nonlinear
@@ -1394,14 +1555,7 @@ impl Driver<'_> {
         // order 6); dctran.c's orders 1-2 never read beyond CKTstate3.
         // The t = 0 point also starts every transmission line's delay
         // history (traload.c, MODEINITTRAN); it requests no breakpoints.
-        let device_breaks = self.commit_point(Acceptance::Initial, &x, trial)?;
-        Ok(AcceptedPoint {
-            cursor: AcceptedCursor::initial(&self.settings),
-            solution: x,
-            observed: None,
-            device_breaks,
-            periodic_boundary: None,
-        })
+        Ok((x, trial))
     }
 
     /// The charge/flux state of the initial point: a DC-mode load at `x`
