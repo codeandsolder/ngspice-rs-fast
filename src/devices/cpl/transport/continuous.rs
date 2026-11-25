@@ -96,30 +96,129 @@ pub(super) struct Point<Value> {
     wave: Value,
 }
 
-type Knot = Point<Affine>;
-type Wave = Vec<Knot>;
-type KnownWave = Vec<Point<Real>>;
+type Knot<Value = Affine> = Point<Value>;
+type Wave<Value = Affine> = Vec<Knot<Value>>;
+type KnownWave = Wave<Real>;
 
+/// A PWL value is either a realized scalar or an affine function of all
+/// trial endpoints. Ordinary causal accepts need no per-knot coefficient
+/// vector or affine storage overhead. Both representations use the same
+/// propagation and energy-certified reduction.
 trait WaveValue: Clone + PartialEq {
-    fn affine(&self) -> Affine;
+    fn scalar(known: Real) -> Self;
+    fn known(&self) -> Real;
+    fn width(&self) -> usize;
+    fn component(&self, index: usize) -> Real;
+    fn set(&mut self, index: usize, value: Real, width: usize);
+    fn add_scaled(&mut self, wave: &Self, gain: Real);
+    fn interpolate(first: &Self, last: &Self, fraction: Real) -> Self;
+    fn boundary(
+        known: Real,
+        port: usize,
+        fraction: Real,
+        width: usize,
+        delta: Option<&[Real]>,
+    ) -> SpiceResult<Self>;
+    fn evaluate(&self, delta: &[Real]) -> Real;
+    fn finite(&self) -> bool;
     fn allocated_bytes(&self) -> usize;
 }
 
 impl WaveValue for Real {
-    fn affine(&self) -> Affine {
-        Affine::scalar(*self)
+    fn scalar(known: Real) -> Self {
+        known
     }
-
+    fn known(&self) -> Real {
+        *self
+    }
+    fn width(&self) -> usize {
+        1
+    }
+    fn component(&self, index: usize) -> Real {
+        if index == 0 { *self } else { 0. }
+    }
+    fn set(&mut self, index: usize, value: Real, _width: usize) {
+        debug_assert_eq!(index, 0);
+        *self = value;
+    }
+    fn add_scaled(&mut self, wave: &Self, gain: Real) {
+        *self = gain.mul_add(*wave, *self);
+    }
+    fn interpolate(first: &Self, last: &Self, fraction: Real) -> Self {
+        if fraction <= 0. {
+            *first
+        } else if fraction >= 1. {
+            *last
+        } else {
+            (*last - *first).mul_add(fraction, *first)
+        }
+    }
+    fn boundary(
+        known: Real,
+        port: usize,
+        fraction: Real,
+        _width: usize,
+        delta: Option<&[Real]>,
+    ) -> SpiceResult<Self> {
+        let delta = delta
+            .and_then(|values| values.get(port))
+            .ok_or_else(|| invalid("missing realized CPL endpoint"))?;
+        Ok(fraction.mul_add(*delta, known))
+    }
+    fn evaluate(&self, _delta: &[Real]) -> Real {
+        *self
+    }
+    fn finite(&self) -> bool {
+        self.is_finite()
+    }
     fn allocated_bytes(&self) -> usize {
         0
     }
 }
 
 impl WaveValue for Affine {
-    fn affine(&self) -> Affine {
-        self.clone()
+    fn scalar(known: Real) -> Self {
+        Self::scalar(known)
     }
-
+    fn known(&self) -> Real {
+        self.known
+    }
+    fn width(&self) -> usize {
+        self.gains.len() + 1
+    }
+    fn component(&self, index: usize) -> Real {
+        self.component(index)
+    }
+    fn set(&mut self, index: usize, value: Real, width: usize) {
+        self.set(index, value, width);
+    }
+    fn add_scaled(&mut self, wave: &Self, gain: Real) {
+        self.add_scaled(wave, gain);
+    }
+    fn interpolate(first: &Self, last: &Self, fraction: Real) -> Self {
+        Self::interpolate(first, last, fraction)
+    }
+    fn boundary(
+        known: Real,
+        port: usize,
+        fraction: Real,
+        width: usize,
+        delta: Option<&[Real]>,
+    ) -> SpiceResult<Self> {
+        let mut result = Self::scalar(known);
+        if let Some(delta) = delta {
+            result.known = fraction.mul_add(delta[port], known);
+        } else {
+            result.set(port + 1, fraction, width);
+        }
+        Ok(result)
+    }
+    fn evaluate(&self, delta: &[Real]) -> Real {
+        self.evaluate(delta)
+    }
+    fn finite(&self) -> bool {
+        self.finite()
+    }
     fn allocated_bytes(&self) -> usize {
         self.gains.capacity() * std::mem::size_of::<Real>()
     }
@@ -142,13 +241,9 @@ fn histories_bytes<Value: WaveValue>(waves: &[Vec<Point<Value>>]) -> usize {
         .saturating_add(waves.iter().map(wave_bytes).sum::<usize>())
 }
 
-fn sample<Value: WaveValue>(
-    wave: &[Point<Value>],
-    time: Real,
-    origin: Real,
-) -> SpiceResult<Affine> {
+fn sample<Value: WaveValue>(wave: &[Point<Value>], time: Real, origin: Real) -> SpiceResult<Value> {
     if time < origin {
-        return Ok(Affine::zero());
+        return Ok(Value::scalar(0.));
     }
     let upper = wave.partition_point(|knot| knot.time <= time);
     let first = wave
@@ -162,7 +257,7 @@ fn sample<Value: WaveValue>(
                 first.time
             )));
         }
-        return Ok(first.wave.affine());
+        return Ok(first.wave.clone());
     }
     let Some(last) = wave.get(upper) else {
         let roundoff = 8. * Real::EPSILON * first.time.abs().max(time.abs());
@@ -172,14 +267,10 @@ fn sample<Value: WaveValue>(
                 first.time
             )));
         }
-        return Ok(first.wave.affine());
+        return Ok(first.wave.clone());
     };
     let fraction = (time - first.time) / (last.time - first.time);
-    Ok(Affine::interpolate(
-        &first.wave.affine(),
-        &last.wave.affine(),
-        fraction,
-    ))
+    Ok(Value::interpolate(&first.wave, &last.wave, fraction))
 }
 
 fn shifted_times<Value>(
@@ -371,14 +462,14 @@ impl ContinuousPlan {
         history
     }
 
-    fn compress(
+    fn compress<Value: WaveValue>(
         &self,
         history: &ContinuousHistory,
         node: usize,
-        curve: &[Knot],
+        curve: &[Knot<Value>],
         width: usize,
         terminal_sample: Option<Real>,
-    ) -> SpiceResult<Wave> {
+    ) -> SpiceResult<Wave<Value>> {
         let start = curve[0].time;
         let end = curve[curve.len() - 1].time;
         if curve.iter().all(|knot| knot.wave == curve[0].wave) {
@@ -421,7 +512,7 @@ impl ContinuousPlan {
         let known_scale = history.outgoing[node]
             .iter()
             .map(|knot| knot.wave.abs())
-            .chain(curve.iter().map(|knot| knot.wave.known.abs()))
+            .chain(curve.iter().map(|knot| knot.wave.known().abs()))
             .fold(0., Real::max);
         let mut output = vec![augmented[0].clone()];
         let mut first = 0;
@@ -465,7 +556,11 @@ impl ContinuousPlan {
             let stage = if row < n { 0 } else { plan.sections - 1 };
             let time = end - plan.half[row % n];
             let wave = if time <= start {
-                sample(&history.outgoing[stage * ports + row], time, history.origin)?
+                Affine::scalar(sample(
+                    &history.outgoing[stage * ports + row],
+                    time,
+                    history.origin,
+                )?)
             } else {
                 let mut value = Affine::zero();
                 for &(port, gain) in &self.scattering_rows[row] {
@@ -473,7 +568,7 @@ impl ContinuousPlan {
                     let incident =
                         node.map_or(&history.boundary[port], |index| &history.outgoing[index]);
                     let incident = sample(incident, (time - delay).min(start), history.origin)?;
-                    value.add_scaled(&incident, gain);
+                    value.add_scaled(&Affine::scalar(incident), gain);
                 }
                 value
             };
@@ -485,7 +580,7 @@ impl ContinuousPlan {
         Ok(result)
     }
 
-    pub(super) fn trial(
+    fn trial(
         &self,
         plan: &LossyPlan,
         history: &ContinuousHistory,
@@ -496,24 +591,31 @@ impl ContinuousPlan {
         self.propagate(plan, history, start, end, boundary_bytes, None)
     }
 
-    pub(super) fn accepted_trial(
+    // Ordinary loads depend only on accepted history. Their accepted
+    // wave propagation can therefore store native scalars, not affine
+    // coefficient vectors. Oversized trials retain the exact affine
+    // construction used by their implicit endpoint load.
+    pub(super) fn advance(
         &self,
         plan: &LossyPlan,
         history: &ContinuousHistory,
         start: Real,
         end: Real,
         boundary_bytes: usize,
-        delta: &[Real],
-    ) -> SpiceResult<Trial> {
-        // No terminal can depend on the new boundary endpoint during
-        // an ordinary step. Propagate the realized scalar waveform on
-        // acceptance; for an oversized trial preserve the exact affine
-        // construction used by its implicit terminal load.
-        let realized = (end - self.step <= start).then_some(delta);
-        self.propagate(plan, history, start, end, boundary_bytes, realized)
+        boundary: (&[Real], &[Real]),
+    ) -> SpiceResult<ContinuousHistory> {
+        let (input, delta) = boundary;
+        if end - self.step <= start {
+            let trial =
+                self.propagate::<Real>(plan, history, start, end, boundary_bytes, Some(delta))?;
+            self.accept(history, trial, start, end, input, delta)
+        } else {
+            let trial = self.trial(plan, history, start, end, boundary_bytes)?;
+            self.accept(history, trial, start, end, input, delta)
+        }
     }
 
-    fn propagate(
+    fn propagate<Value: WaveValue>(
         &self,
         plan: &LossyPlan,
         history: &ContinuousHistory,
@@ -521,10 +623,10 @@ impl ContinuousPlan {
         end: Real,
         boundary_bytes: usize,
         realized: Option<&[Real]>,
-    ) -> SpiceResult<Trial> {
+    ) -> SpiceResult<Trial<Value>> {
         let ports = plan.launch.len();
         let n = plan.half.len();
-        let mut trial = Trial {
+        let mut trial: Trial<Value> = Trial {
             outgoing: vec![Vec::new(); plan.terminal],
             output: Vec::new(),
         };
@@ -547,7 +649,7 @@ impl ContinuousPlan {
                 ));
             }
             substeps += 1;
-            if substeps > plan.limit / std::mem::size_of::<Knot>() {
+            if substeps > plan.limit / std::mem::size_of::<Knot<Value>>() {
                 return Err(invalid("CPL method-of-steps work budget exceeded"));
             }
             let context = Step {
@@ -563,7 +665,7 @@ impl ContinuousPlan {
             let mut curves = Vec::with_capacity(plan.terminal);
             let mut bytes = boundary_bytes
                 .saturating_add(trial.workspace())
-                .saturating_add(plan.terminal * std::mem::size_of::<Wave>());
+                .saturating_add(plan.terminal * std::mem::size_of::<Wave<Value>>());
             for stage in 0..plan.sections {
                 curves.extend(self.compress_stage(&context, stage, &mut bytes)?);
             }
@@ -596,12 +698,12 @@ impl ContinuousPlan {
     // When that matrix of samples would be too large, reduce batches of
     // rows and, if necessary, overlapping time chunks. Chunk boundaries
     // are exact retained endpoints, so the energy certificates compose.
-    fn compress_stage(
+    fn compress_stage<Value: WaveValue>(
         &self,
-        step: &Step<'_>,
+        step: &Step<'_, Value>,
         stage: usize,
         bytes: &mut usize,
-    ) -> SpiceResult<Vec<Wave>> {
+    ) -> SpiceResult<Vec<Wave<Value>>> {
         let plan = step.plan;
         let ports = plan.launch.len();
         let n = plan.half.len();
@@ -612,8 +714,8 @@ impl ContinuousPlan {
                 .sources
                 .iter()
                 .any(|&(_, delay)| step.next - delay > step.start);
-        let per_knot =
-            std::mem::size_of::<Knot>() + usize::from(affine) * ports * std::mem::size_of::<Real>();
+        let per_knot = std::mem::size_of::<Knot<Value>>()
+            + usize::from(affine) * ports * std::mem::size_of::<Real>();
         let metadata = input.times.capacity() * std::mem::size_of::<Real>()
             + input.sources.capacity() * std::mem::size_of::<(Option<usize>, Real)>();
         let available = plan.limit.saturating_sub(bytes.saturating_add(metadata));
@@ -633,7 +735,12 @@ impl ContinuousPlan {
                 let available = plan.limit.saturating_sub(bytes.saturating_add(metadata));
                 let count = available / (per_knot * (last_row - first_row) * 4);
                 if count < 2 {
-                    return Err(invalid("CPL stage waveform workspace exceeded"));
+                    return Err(invalid(format!(
+                        "CPL stage waveform workspace exceeded at {:e}: stage {stage}, row {first_row}, retained {boundary} bytes, trial {bytes} bytes, metadata {metadata}, available {available}, {} times",
+                        step.next,
+                        input.times.len(),
+                        boundary = step.history.workspace()
+                    )));
                 }
                 let last_time = first_time
                     .saturating_add(count - 1)
@@ -663,7 +770,12 @@ impl ContinuousPlan {
                         .saturating_sub(previous)
                         .saturating_add(wave_bytes(&output[row]));
                     if bytes.saturating_add(metadata).saturating_add(scratch) > plan.limit {
-                        return Err(invalid("CPL trial waveform workspace exceeded"));
+                        return Err(invalid(format!(
+                            "CPL trial waveform workspace exceeded at {:e}: stage {stage}, row {row}, retained {boundary} bytes, trial {bytes} bytes, metadata {metadata}, scratch {scratch}, {} times",
+                            step.next,
+                            input.times.len(),
+                            boundary = step.history.workspace()
+                        )));
                     }
                 }
                 first_time = last_time;
@@ -673,10 +785,10 @@ impl ContinuousPlan {
         Ok(output)
     }
 
-    pub(super) fn accept(
+    fn accept<Value: WaveValue>(
         &self,
         history: &ContinuousHistory,
-        trial: Trial,
+        trial: Trial<Value>,
         start: Real,
         end: Real,
         input: &[Real],
@@ -751,12 +863,12 @@ impl ContinuousHistory {
     }
 }
 
-pub(super) struct Trial {
-    outgoing: Vec<Wave>,
-    pub(super) output: Vec<Affine>,
+struct Trial<Value = Affine> {
+    outgoing: Vec<Wave<Value>>,
+    output: Vec<Value>,
 }
 
-impl Trial {
+impl<Value: WaveValue> Trial<Value> {
     fn workspace(&self) -> usize {
         histories_bytes(&self.outgoing)
     }
@@ -767,19 +879,23 @@ impl Trial {
         node: usize,
         start: Real,
         time: Real,
-    ) -> SpiceResult<Affine> {
+    ) -> SpiceResult<Value> {
         if time <= start {
-            sample(&history.outgoing[node], time, history.origin)
+            Ok(Value::scalar(sample(
+                &history.outgoing[node],
+                time,
+                history.origin,
+            )?))
         } else {
             sample(&self.outgoing[node], time, history.origin)
         }
     }
 }
 
-struct Step<'a> {
+struct Step<'a, Value> {
     plan: &'a LossyPlan,
     history: &'a ContinuousHistory,
-    trial: &'a Trial,
+    trial: &'a Trial<Value>,
     start: Real,
     end: Real,
     at: Real,
@@ -806,29 +922,30 @@ fn source(plan: &LossyPlan, stage: usize, port: usize) -> (Option<usize>, Real) 
     (node, delay)
 }
 
-impl Step<'_> {
-    fn input(&self, port: usize, node: Option<usize>, time: Real) -> SpiceResult<Affine> {
+impl<Value: WaveValue> Step<'_, Value> {
+    fn input(&self, port: usize, node: Option<usize>, time: Real) -> SpiceResult<Value> {
         if let Some(node) = node {
             return self.trial.sample(self.history, node, self.start, time);
         }
-        if time <= self.start {
-            return sample(&self.history.boundary[port], time, self.history.origin);
-        }
-        let mut wave = sample(
+        let known = sample(
             &self.history.boundary[port],
-            self.start,
+            time.min(self.start),
             self.history.origin,
         )?;
-        let fraction = ((time - self.start) / (self.end - self.start)).clamp(0., 1.);
-        if let Some(delta) = self.realized {
-            wave.known = fraction.mul_add(delta[port], wave.known);
-        } else {
-            wave.set(port + 1, fraction, self.plan.launch.len() + 1);
+        if time <= self.start {
+            return Ok(Value::scalar(known));
         }
-        Ok(wave)
+        let fraction = ((time - self.start) / (self.end - self.start)).clamp(0., 1.);
+        Value::boundary(
+            known,
+            port,
+            fraction,
+            self.plan.launch.len() + 1,
+            self.realized,
+        )
     }
 
-    fn stage(&self, stage: usize) -> Stage<'_, '_> {
+    fn stage(&self, stage: usize) -> Stage<'_, '_, Value> {
         let ports = self.plan.launch.len();
         let sources: Vec<_> = (0..ports)
             .map(|port| source(self.plan, stage, port))
@@ -869,15 +986,15 @@ impl Step<'_> {
     }
 }
 
-struct Stage<'a, 'b> {
-    step: &'a Step<'b>,
+struct Stage<'a, 'b, Value> {
+    step: &'a Step<'b, Value>,
     sources: Vec<(Option<usize>, Real)>,
     times: Vec<Real>,
 }
 
-impl Stage<'_, '_> {
-    fn curves(&self, rows: &[Vec<(usize, Real)>], times: &[Real]) -> SpiceResult<Vec<Wave>> {
-        let mut curves: Vec<Wave> = (0..rows.len())
+impl<Value: WaveValue> Stage<'_, '_, Value> {
+    fn curves(&self, rows: &[Vec<(usize, Real)>], times: &[Real]) -> SpiceResult<Vec<Wave<Value>>> {
+        let mut curves: Vec<Wave<Value>> = (0..rows.len())
             .map(|_| Vec::with_capacity(times.len()))
             .collect();
         let mut incident = Vec::with_capacity(self.sources.len());
@@ -887,7 +1004,7 @@ impl Stage<'_, '_> {
                 incident.push(self.step.input(port, node, time - delay)?);
             }
             for (curve, row) in curves.iter_mut().zip(rows) {
-                let mut wave = Affine::zero();
+                let mut wave = Value::scalar(0.);
                 for &(port, gain) in row {
                     wave.add_scaled(&incident[port], gain);
                 }
@@ -939,25 +1056,45 @@ mod tests {
             let mut input = vec![0.; ports];
             input[source] = (end / 0.6e-9).min(1.);
             let delta: Vec<_> = input.iter().zip(&previous).map(|(a, b)| a - b).collect();
-            let trial = continuous
-                .accepted_trial(plan, &history, start, end, history.workspace(), &delta)
-                .unwrap();
             let loaded = continuous
                 .outputs(plan, &history, start, end, history.workspace())
                 .unwrap();
-            for (load, accepted) in loaded.iter().zip(&trial.output) {
-                assert!((load.evaluate(&delta) - accepted.evaluate(&delta)).abs() < 1e-12);
+            if end - continuous.step() <= start {
+                let trial = continuous
+                    .propagate::<Real>(
+                        plan,
+                        &history,
+                        start,
+                        end,
+                        history.workspace(),
+                        Some(&delta),
+                    )
+                    .unwrap();
+                for (load, &accepted) in loaded.iter().zip(&trial.output) {
+                    assert!((load.evaluate(&delta) - accepted).abs() < 1e-12);
+                }
+                result.push(trial.output.clone());
+                history = continuous
+                    .accept(&history, trial, start, end, &input, &delta)
+                    .unwrap();
+            } else {
+                let trial = continuous
+                    .trial(plan, &history, start, end, history.workspace())
+                    .unwrap();
+                for (load, accepted) in loaded.iter().zip(&trial.output) {
+                    assert!((load.evaluate(&delta) - accepted.evaluate(&delta)).abs() < 1e-12);
+                }
+                result.push(
+                    trial
+                        .output
+                        .iter()
+                        .map(|wave| wave.evaluate(&delta))
+                        .collect(),
+                );
+                history = continuous
+                    .accept(&history, trial, start, end, &input, &delta)
+                    .unwrap();
             }
-            result.push(
-                trial
-                    .output
-                    .iter()
-                    .map(|wave| wave.evaluate(&delta))
-                    .collect(),
-            );
-            history = continuous
-                .accept(&history, trial, start, end, &input, &delta)
-                .unwrap();
             records = records.max(history.len());
             previous = input;
             start = end;

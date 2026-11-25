@@ -1063,21 +1063,13 @@ impl LossyPlan {
         next.previous_time = Some(start);
         next.time = Some(context.time);
         if let Some((plan, state)) = direct {
-            let trial = plan.accepted_trial(
+            next.continuous = Some(Arc::new(plan.advance(
                 self,
                 state,
                 start,
                 context.time,
                 history.boundary_bytes(),
-                &segment.delta,
-            )?;
-            next.continuous = Some(Arc::new(plan.accept(
-                state,
-                trial,
-                start,
-                context.time,
-                &incident[..ports],
-                &segment.delta,
+                (&incident[..ports], &segment.delta),
             )?));
             return Ok(CplUpdate {
                 reset: false,

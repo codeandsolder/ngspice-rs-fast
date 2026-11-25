@@ -5,7 +5,7 @@
 //! componentwise interpolation error bound and the L2 Gram inequality.
 //! The latter holds for every linear combination of affine trial columns,
 //! not merely the currently estimated Newton endpoint.
-use super::{Affine, Knot, Real};
+use super::{Knot, Real, WaveValue};
 
 fn product_integral(a: Real, b: Real, c: Real, d: Real) -> Real {
     // Integral of two linear functions over the unit interval.
@@ -124,26 +124,26 @@ fn scalar_bernstein([a, b, c, d]: [Real; 4], depth: u8) -> bool {
         && scalar_bernstein([middle, bcd, cd, d], depth - 1)
 }
 
-struct Reduction<'a> {
-    knots: &'a [Knot],
+struct Reduction<'a, Value> {
+    knots: &'a [Knot<Value>],
     width: usize,
     indices: Vec<usize>,
     scales: Vec<Real>,
     error_weights: Vec<Real>,
     positions: Vec<Real>,
     split: Real,
-    normalized: Vec<Vec<Real>>,
+    normalized: Vec<Real>,
     tolerance: Real,
 }
 
-impl<'a> Reduction<'a> {
-    fn new(knots: &'a [Knot], width: usize, tolerance: Real, known_scale: Real) -> Self {
+impl<'a, Value: WaveValue> Reduction<'a, Value> {
+    fn new(knots: &'a [Knot<Value>], width: usize, tolerance: Real, known_scale: Real) -> Self {
         let mut indices = Vec::new();
         let mut scales = Vec::new();
         let mut error_weights = Vec::new();
         let active_width = knots
             .iter()
-            .map(|knot| knot.wave.gains.len() + 1)
+            .map(|knot| knot.wave.width())
             .max()
             .unwrap_or(1);
         for index in 0..active_width {
@@ -171,12 +171,11 @@ impl<'a> Reduction<'a> {
             .collect();
         let normalized = knots
             .iter()
-            .map(|knot| {
+            .flat_map(|knot| {
                 indices
                     .iter()
                     .zip(&scales)
                     .map(|(&index, &scale)| knot.wave.component(index) / scale)
-                    .collect()
             })
             .collect();
         Self {
@@ -192,11 +191,24 @@ impl<'a> Reduction<'a> {
         }
     }
 
+    fn row(&self, index: usize) -> &[Real] {
+        let order = self.indices.len();
+        &self.normalized[index * order..(index + 1) * order]
+    }
+
+    fn rows(&self) -> impl Iterator<Item = &[Real]> + Clone {
+        self.normalized.chunks_exact(self.indices.len().max(1))
+    }
+
+    fn segments(&self) -> impl Iterator<Item = (&[Real], [&[Real]; 2])> {
+        self.positions
+            .windows(2)
+            .zip(self.rows().zip(self.rows().skip(1)))
+            .map(|(x, (a, b))| (x, [a, b]))
+    }
+
     fn endpoints(&self) -> (&[Real], &[Real]) {
-        (
-            &self.normalized[0],
-            &self.normalized[self.normalized.len() - 1],
-        )
+        (self.row(0), self.row(self.knots.len() - 1))
     }
 
     fn midpoint(&self) -> Vec<Real> {
@@ -204,9 +216,9 @@ impl<'a> Reduction<'a> {
         let lower = upper - 1;
         let fraction =
             (self.split - self.positions[lower]) / (self.positions[upper] - self.positions[lower]);
-        self.normalized[lower]
+        self.row(lower)
             .iter()
-            .zip(&self.normalized[upper])
+            .zip(self.row(upper))
             .map(|(&a, &b)| chord(a, b, fraction))
             .collect()
     }
@@ -218,7 +230,7 @@ impl<'a> Reduction<'a> {
         for (k, (&x, values)) in self
             .positions
             .iter()
-            .zip(&self.normalized)
+            .zip(self.rows())
             .enumerate()
             .skip(1)
             .take(self.knots.len() - 2)
@@ -243,7 +255,7 @@ impl<'a> Reduction<'a> {
     fn gram(&self) -> Vec<Real> {
         let order = self.indices.len();
         let mut gram = vec![0.; order * order];
-        for (x, y) in self.positions.windows(2).zip(self.normalized.windows(2)) {
+        for (x, y) in self.segments() {
             let duration = x[1] - x[0];
             for i in 0..order {
                 for j in i..order {
@@ -259,7 +271,7 @@ impl<'a> Reduction<'a> {
     fn tent_projection(&self, middle: &[Real]) -> Vec<Real> {
         let (a, b) = self.endpoints();
         let mut dot = vec![0.; a.len()];
-        for (x, y) in self.positions.windows(2).zip(self.normalized.windows(2)) {
+        for (x, y) in self.segments() {
             let mut integrate = |left: Real, right: Real, first: &[Real], last: &[Real]| {
                 for i in 0..a.len() {
                     let r1 = first[i] - chord(a[i], b[i], left);
@@ -271,10 +283,10 @@ impl<'a> Reduction<'a> {
                 }
             };
             if x[0] < self.split && x[1] > self.split {
-                integrate(x[0], self.split, &y[0], middle);
-                integrate(self.split, x[1], middle, &y[1]);
+                integrate(x[0], self.split, y[0], middle);
+                integrate(self.split, x[1], middle, y[1]);
             } else {
-                integrate(x[0], x[1], &y[0], &y[1]);
+                integrate(x[0], x[1], y[0], y[1]);
             }
         }
         for value in &mut dot {
@@ -365,19 +377,18 @@ impl<'a> Reduction<'a> {
             mass.clone_from(&coefficients[3]);
             valid
         };
-        for (approx_first, approx_last) in self.positions.windows(2).zip(self.normalized.windows(2))
-        {
+        for (approx_first, approx_last) in self.segments() {
             if approx_first[0] < self.split && approx_first[1] > self.split {
-                if !integrate(approx_first[0], self.split, &approx_last[0], middle)
-                    || !integrate(self.split, approx_first[1], middle, &approx_last[1])
+                if !integrate(approx_first[0], self.split, approx_last[0], middle)
+                    || !integrate(self.split, approx_first[1], middle, approx_last[1])
                 {
                     return false;
                 }
             } else if !integrate(
                 approx_first[0],
                 approx_first[1],
-                &approx_last[0],
-                &approx_last[1],
+                approx_last[0],
+                approx_last[1],
             ) {
                 return false;
             }
@@ -390,9 +401,9 @@ impl<'a> Reduction<'a> {
         // the exact waveform's pointwise magnitude envelope. This is
         // stronger than prefix contraction and avoids repeated Gram
         // searches for the overwhelmingly common accepted-wave case.
-        let sign = if self.normalized.iter().all(|value| value[0] >= 0.) {
+        let sign = if self.rows().all(|value| value[0] >= 0.) {
             1.
-        } else if self.normalized.iter().all(|value| value[0] <= 0.) {
+        } else if self.rows().all(|value| value[0] <= 0.) {
             -1.
         } else {
             return None;
@@ -404,7 +415,7 @@ impl<'a> Reduction<'a> {
             .positions
             .iter()
             .copied()
-            .zip(self.normalized.iter().map(Vec::as_slice))
+            .zip(self.rows())
             .chain(std::iter::once((self.split, middle)))
         {
             if x <= 0. || x >= 1. {
@@ -418,9 +429,9 @@ impl<'a> Reduction<'a> {
         (lower <= upper).then(|| sign * (sign * correction).clamp(lower, upper))
     }
 
-    fn wave(&self, correction: &[Real]) -> Affine {
+    fn wave(&self, correction: &[Real]) -> Value {
         let (a, b) = self.endpoints();
-        let mut wave = Affine::zero();
+        let mut wave = Value::scalar(0.);
         for (i, (&index, &scale)) in self.indices.iter().zip(&self.scales).enumerate() {
             wave.set(
                 index,
@@ -431,7 +442,55 @@ impl<'a> Reduction<'a> {
         wave
     }
 
-    fn choose(&self) -> Choice {
+    fn energy_correction(
+        &self,
+        gram: &[Real],
+        minimum: &[Real],
+        optimum: Vec<Real>,
+    ) -> Option<Vec<Real>> {
+        if self.indices.len() == 1 {
+            let (a, b) = self.endpoints();
+            let q = chord_tent(a[0], b[0], self.split);
+            let base = product_integral(a[0], b[0], a[0], b[0]);
+            let discriminant = q.mul_add(q, (gram[0] - base) / 3.);
+            if discriminant >= 0. {
+                let radius = 3. * discriminant.sqrt();
+                Some(vec![
+                    optimum[0].clamp(minimum[0] - radius, minimum[0] + radius),
+                ])
+            } else {
+                None
+            }
+        } else if self.contractive(gram, &optimum) {
+            Some(optimum)
+        } else if self.contractive(gram, minimum) {
+            let mut low = 0.;
+            let mut high = 1.;
+            let mut candidate = minimum.to_vec();
+            for _ in 0..24 {
+                let alpha = Real::midpoint(low, high);
+                for ((value, &a), &b) in candidate.iter_mut().zip(minimum).zip(&optimum) {
+                    *value = chord(a, b, alpha);
+                }
+                if self.contractive(gram, &candidate) {
+                    low = alpha;
+                } else {
+                    high = alpha;
+                }
+            }
+            Some(
+                minimum
+                    .iter()
+                    .zip(optimum)
+                    .map(|(&a, b)| chord(a, b, low))
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn choose(&self) -> Choice<Value> {
         if self.indices.is_empty() {
             return Choice::Chord;
         }
@@ -459,45 +518,7 @@ impl<'a> Reduction<'a> {
             .zip(b)
             .map(|(&a, &b)| -3. * chord_tent(a, b, self.split))
             .collect();
-        let correction = if self.indices.len() == 1 {
-            let q = chord_tent(a[0], b[0], self.split);
-            let base = product_integral(a[0], b[0], a[0], b[0]);
-            let discriminant = q.mul_add(q, (gram[0] - base) / 3.);
-            if discriminant >= 0. {
-                let radius = 3. * discriminant.sqrt();
-                Some(vec![
-                    optimum[0].clamp(minimum[0] - radius, minimum[0] + radius),
-                ])
-            } else {
-                None
-            }
-        } else if self.contractive(&gram, &optimum) {
-            Some(optimum)
-        } else if self.contractive(&gram, &minimum) {
-            let mut low = 0.;
-            let mut high = 1.;
-            let mut candidate = minimum.clone();
-            for _ in 0..24 {
-                let alpha = Real::midpoint(low, high);
-                for ((value, &a), &b) in candidate.iter_mut().zip(&minimum).zip(&optimum) {
-                    *value = chord(a, b, alpha);
-                }
-                if self.contractive(&gram, &candidate) {
-                    low = alpha;
-                } else {
-                    high = alpha;
-                }
-            }
-            Some(
-                minimum
-                    .iter()
-                    .zip(optimum)
-                    .map(|(&a, b)| chord(a, b, low))
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let correction = self.energy_correction(&gram, &minimum, optimum);
         if let Some(mut correction) = correction {
             let (error, at) = self.error(&correction, &middle);
             split = at;
@@ -545,20 +566,20 @@ impl<'a> Reduction<'a> {
     }
 }
 
-enum Choice {
+enum Choice<Value> {
     Chord,
-    Tent(Affine),
+    Tent(Value),
     Split(usize),
 }
 
 // Iterative subdivision rather than unbounded recursion. Every split
 // removes at least one interior knot from the next candidate interval.
-pub(super) fn reduce(
-    knots: &[Knot],
+pub(super) fn reduce<Value: WaveValue>(
+    knots: &[Knot<Value>],
     width: usize,
     tolerance: Real,
     known_scale: Real,
-    output: &mut Vec<Knot>,
+    output: &mut Vec<Knot<Value>>,
 ) {
     if knots.len() < 2 {
         return;
@@ -592,7 +613,7 @@ pub(super) fn reduce(
 
 #[cfg(test)]
 mod tests {
-    use super::super::sample;
+    use super::super::{Affine, sample};
     use super::*;
 
     #[test]
@@ -616,8 +637,8 @@ mod tests {
         assert_ne!(candidate.split, 0.5);
         let peak = candidate.split;
         let correction = [0.2];
-        let a = candidate.normalized[0][0];
-        let b = candidate.normalized[knots.len() - 1][0];
+        let a = candidate.row(0)[0];
+        let b = candidate.row(knots.len() - 1)[0];
         let height = chord(a, b, peak) + correction[0];
         let integrated = peak.mul_add(
             product_integral(a, height, a, height),
