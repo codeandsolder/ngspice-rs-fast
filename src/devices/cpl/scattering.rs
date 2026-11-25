@@ -23,33 +23,39 @@ impl Scattering {
     /// Z,Y have infinity norm <= 1/2; (ZY)^k/(2k)! therefore converges
     /// at least as fast as the scalar series with argument 1/4.
     /// The remainder after 16 terms is below two-word roundoff.
-    fn from_material(z: &WideMatrix, y: &WideMatrix) -> SpiceResult<Self> {
-        let n = z.n;
-        let product = z.mul(y);
-        let mut a = WideMatrix::identity(n);
-        let mut odd = a.clone();
-        let mut term = a.clone();
+    fn from_material(series: &WideMatrix, shunt: &WideMatrix) -> SpiceResult<Self> {
+        let order = series.order;
+        let product = series.mul(shunt);
+        let mut forward_v = WideMatrix::identity(order);
+        let mut odd = forward_v.clone();
+        let mut term = forward_v.clone();
         for k in 1..=16_u32 {
             let two_k = 2 * k;
             let denominator = Wide::from_real(Real::from(two_k * (two_k - 1)));
             term = term.mul(&product).scale(Wide::ONE / denominator);
-            a = a.add(&term);
+            forward_v = forward_v.add(&term);
             odd = odd.add(&term.scale(Wide::ONE / Wide::from_real(Real::from(two_k + 1))));
             if term.magnitude() <= Real::EPSILON * Real::EPSILON {
                 break;
             }
         }
-        let d = a.transpose();
-        let b = odd.mul(z).scale(-Wide::ONE).symmetric();
-        let c = y.mul(&odd).scale(-Wide::ONE).symmetric();
+        let forward_i = forward_v.transpose();
+        let series_block = odd.mul(series).scale(-Wide::ONE).symmetric();
+        let shunt_block = shunt.mul(&odd).scale(-Wide::ONE).symmetric();
         // [b_R, a_R] = W [a_L, b_L].
         // W22 = (A+D-B-C)/2, -W21 = (C+D-A-B)/2.
         // W22 is nonsingular for positive reference impedance and
-        // a passive short segment, even with a singular series block.
+        // forward_v passive short segment, even with forward_v singular series block.
         let half = Wide::from_real(0.5);
-        let denominator = a.add(&d).sub(&b.add(&c)).scale(half);
-        let numerator = c.add(&d).sub(&a.add(&b)).scale(half);
-        let transmission = denominator.solve(&WideMatrix::identity(n))?;
+        let denominator = forward_v
+            .add(&forward_i)
+            .sub(&series_block.add(&shunt_block))
+            .scale(half);
+        let numerator = shunt_block
+            .add(&forward_i)
+            .sub(&forward_v.add(&series_block))
+            .scale(half);
+        let transmission = denominator.solve(&WideMatrix::identity(order))?;
         let reflection = transmission.mul(&numerator);
         Self::checked(reflection, transmission)
     }

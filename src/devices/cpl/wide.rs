@@ -145,7 +145,7 @@ impl WideComplex {
         self.re.hi.hypot(self.im.hi)
     }
 
-    fn finite(self) -> bool {
+    const fn finite(self) -> bool {
         self.re.hi.is_finite()
             && self.re.lo.is_finite()
             && self.im.hi.is_finite()
