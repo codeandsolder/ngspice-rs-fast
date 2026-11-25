@@ -107,3 +107,11 @@ accepted analog steps versus 10080 forced 5 ns steps, with 10003 HDL
 evaluations in either case (intermediate implementation: 143 ms vs 181 ms).
 The analog output transitions at 35 ns and 45 ns; the internal HDL clock does
 not force an analog solve at each edge.
+
+The GHDL backend achieved the same 137 versus 10080 accepted analog steps,
+with 10007 delivered native events and the same output transitions.
+The adaptive run used 10134 horizon probes versus 20077 for fixed stepping;
+wall time was 445 ms versus 836 ms. Timings vary with concurrent build load.
+Live GHDL tests also exercise a 65-bit four-state bus (including X and Z)
+and deterministic rejected-trial recovery. The native competing-clock
+regression checks prediction reuse and coincident input cancellation.

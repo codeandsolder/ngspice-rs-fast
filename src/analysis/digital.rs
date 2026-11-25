@@ -727,7 +727,7 @@ impl Engine {
 
     /// True if a model can discover events only by advancing through a horizon.
     #[must_use]
-    pub fn has_lookahead(&self) -> bool {
+    pub const fn has_lookahead(&self) -> bool {
         !self.network.lookahead.is_empty()
     }
 

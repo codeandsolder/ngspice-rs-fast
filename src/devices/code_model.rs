@@ -175,6 +175,7 @@ impl ModelSchema {
 }
 
 /// Result of advancing an externally clocked simulator with unchanged inputs.
+///
 /// An output event stops the advance at its physical time; otherwise the
 /// simulator has reached the requested horizon without changing its outputs.
 #[derive(Debug)]

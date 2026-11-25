@@ -31,7 +31,7 @@ fn width(value: usize) -> SpiceResult<u32> {
     u32::try_from(value).map_err(failure)
 }
 
-fn encode(magic: [u8; 4], schema: Schema, request: Request<'_, [u8]>) -> SpiceResult<Vec<u8>> {
+fn encode(magic: [u8; 4], schema: Schema, request: &Request<'_, [u8]>) -> SpiceResult<Vec<u8>> {
     if request.inputs.len() != schema.inputs
         || request
             .snapshot
@@ -213,7 +213,9 @@ impl Drop for Session {
     }
 }
 
-/// A direct, persistent simulator process. Every request carries a complete
+/// A direct, persistent simulator process.
+///
+/// Every request carries a complete
 /// checkpoint, including on retry; the process is never authoritative state.
 /// A malformed response or timeout kills the session, allowing a later trial
 /// to restart the executable from its accepted snapshot.
@@ -270,7 +272,7 @@ impl Simulator for ProcessSimulator {
         let payload = encode(
             MAGIC,
             schema,
-            Request {
+            &Request {
                 tick: request.tick,
                 precision: request.precision,
                 operation: request.operation,
@@ -373,6 +375,7 @@ pub enum ReplayMode {
 
 /// Persistent process with deterministic replay checkpoints for simulators
 /// that cannot serialize their event scheduler (e.g. timed Verilator).
+///
 /// Forward evaluations append an immutable record in constant work; rollback
 /// restarts the process and replays only the requested checkpoint history.
 #[derive(Debug)]
@@ -421,7 +424,7 @@ impl ReplaySimulator {
         &self,
         process: &Session,
         schema: Schema,
-        request: Request<'_, [u8]>,
+        request: &Request<'_, [u8]>,
     ) -> SpiceResult<Reply<Arc<[u8]>>> {
         let payload = encode(REPLAY_MAGIC, schema, request)?;
         let bytes = process.exchange(
@@ -457,7 +460,7 @@ impl ReplaySimulator {
             let result = self.step(
                 &process,
                 schema,
-                Request {
+                &Request {
                     tick: record.tick,
                     precision: record.precision,
                     operation: record.operation,
@@ -484,7 +487,7 @@ impl ReplaySimulator {
         &self,
         slot: &mut ReplaySession,
         schema: Schema,
-        request: Request<'_, ReplayState>,
+        request: &Request<'_, ReplayState>,
     ) -> SpiceResult<Reply<ReplayState>> {
         let previous = request.snapshot.map(|state| &state.0);
         let steps = previous.map_or(0, |node| node.steps).saturating_add(1);
@@ -504,7 +507,7 @@ impl ReplaySimulator {
         let result = self.step(
             process,
             schema,
-            Request {
+            &Request {
                 tick: request.tick,
                 precision: request.precision,
                 operation: request.operation,
@@ -555,7 +558,7 @@ impl Simulator for ReplaySimulator {
             return Err(failure("simulator does not support horizon lookahead"));
         }
         let mut slot = self.session.lock().map_err(failure)?;
-        let result = self.evaluate_locked(&mut slot, schema, request);
+        let result = self.evaluate_locked(&mut slot, schema, &request);
         if result.is_err() {
             slot.reset();
         }

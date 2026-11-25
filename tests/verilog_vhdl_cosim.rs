@@ -420,9 +420,11 @@ architecture rtl of logic_bus is begin b <= a; end;").unwrap();
     Ok(())
 }
 
-#[test]
-#[ignore = "requires Verilator 5.x with timing support and a C++20 compiler"]
-fn compiled_verilog_adc_filter_dac_and_event_density() -> SpiceResult<()> {
+fn run_mixed_filter(
+    simulator: impl Fn() -> SpiceResult<ReplaySimulator>,
+    precision: i32,
+    per_ns: u64,
+) -> SpiceResult<()> {
     use ngspice_rs::analysis::digital::{AdcBinding, MixedSignal};
     use ngspice_rs::analysis::{AnalysisContext, AnalysisInput, mixed_signal_transient};
     use ngspice_rs::devices::Circuit;
@@ -430,9 +432,7 @@ fn compiled_verilog_adc_filter_dac_and_event_density() -> SpiceResult<()> {
     use ngspice_rs::netlist::{Parser, source::parse_deck_text};
     use ngspice_rs::primitives::{AnalysisKind, NodeId};
 
-    let scratch = ngspice_conformance::ngspice::Scratch::new("verilator-mixed").unwrap();
-    let program = compile_filter(scratch.path());
-    let scale = TimeScale::new(-9)?;
+    let scale = TimeScale::new(precision)?;
     let run = |maxstep: &str| -> SpiceResult<_> {
         let deck = parse_deck_text(
             Path::new("filter.cir"),
@@ -448,7 +448,7 @@ fn compiled_verilog_adc_filter_dac_and_event_density() -> SpiceResult<()> {
         let clock = network.add_net();
         let source = network.add_source(input)?;
         network.add_model(
-            Bridge::new(replay(&program, scratch.path())?, FILTER, scale)?,
+            Bridge::new(simulator()?, FILTER, scale)?,
             &[input],
             &[filtered, clock],
         )?;
@@ -485,7 +485,7 @@ fn compiled_verilog_adc_filter_dac_and_event_density() -> SpiceResult<()> {
             .changes()
             .iter()
             .filter(|c| c.net == filtered)
-            .map(|c| (scale.tick(c.time).unwrap(), c.drive.logic))
+            .map(|c| (scale.tick(c.time).unwrap() / per_ns, c.drive.logic))
             .collect();
         assert_eq!(
             transitions,
@@ -498,8 +498,41 @@ fn compiled_verilog_adc_filter_dac_and_event_density() -> SpiceResult<()> {
     let brute = run("5n")?;
     println!("adaptive: {adaptive:?}; forced 5 ns analog stepping: {brute:?}");
     assert!(adaptive.0 * 20 < brute.0);
-    assert_eq!(adaptive.1, brute.1);
+    assert_eq!(adaptive.1.events, brute.1.events);
+    if precision == -9 {
+        assert_eq!(adaptive.1, brute.1);
+    }
     Ok(())
+}
+
+#[test]
+#[ignore = "requires Verilator 5.x with timing support and a C++20 compiler"]
+fn compiled_verilog_adc_filter_dac_and_event_density() -> SpiceResult<()> {
+    let scratch = ngspice_conformance::ngspice::Scratch::new("verilator-mixed").unwrap();
+    let program = compile_filter(scratch.path());
+    run_mixed_filter(|| replay(&program, scratch.path()), -9, 1)
+}
+
+#[test]
+#[ignore = "requires GHDL 6.x and a C++20 compiler"]
+fn compiled_vhdl_adc_filter_dac_and_event_density() -> SpiceResult<()> {
+    let scratch = ngspice_conformance::ngspice::Scratch::new("ghdl-mixed").unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/cosim/clocked_filter.vhd");
+    let (program, args) = compile_ghdl(scratch.path(), "clocked_filter", &source);
+    run_mixed_filter(
+        || {
+            ReplaySimulator::new(
+                program.clone(),
+                args.clone(),
+                scratch.path().into(),
+                Duration::from_secs(5),
+                100_000,
+                ReplayMode::Lookahead,
+            )
+        },
+        -15,
+        1_000_000,
+    )
 }
 
 #[test]
@@ -535,4 +568,112 @@ fn invalid_process_configuration_fails_explicitly() {
         )
         .is_err()
     );
+}
+
+#[derive(Clone, Debug)]
+struct HorizonState {
+    output: Bit,
+    next: Option<u64>,
+}
+
+#[derive(Debug)]
+struct HorizonClock(u64);
+
+impl Simulator for HorizonClock {
+    type State = HorizonState;
+
+    fn requires_lookahead(&self) -> bool {
+        true
+    }
+
+    fn evaluate(
+        &self,
+        _schema: Schema,
+        request: Request<'_, Self::State>,
+    ) -> SpiceResult<Reply<Self::State>> {
+        use ngspice_rs::devices::digital_bridge::Operation;
+        let mut state = request.snapshot.cloned().unwrap_or(HorizonState {
+            output: Bit::Zero,
+            next: None,
+        });
+        let mut reached = request.tick;
+        if request.operation == Operation::ApplyInputs {
+            if request.inputs == [Bit::One] {
+                state.next.get_or_insert(request.tick + self.0);
+            } else {
+                state.next = None;
+                state.output = Bit::Zero;
+            }
+        }
+        if let Some(next) = state.next
+            && next <= request.tick
+        {
+            if request.operation == Operation::ApplyInputs && next != request.tick {
+                return Err(SpiceError::circuit(
+                    "input application skipped autonomous event",
+                ));
+            }
+            reached = next;
+            state.output = if state.output == Bit::Zero {
+                Bit::One
+            } else {
+                Bit::Zero
+            };
+            state.next = Some(next + self.0);
+        }
+        Ok(Reply {
+            reached_tick: reached,
+            outputs: vec![state.output],
+            next_tick: None,
+            snapshot: state,
+        })
+    }
+}
+
+#[test]
+fn independent_predictions_survive_other_models_and_invalidate_on_input_changes() -> SpiceResult<()>
+{
+    let scale = TimeScale::new(-9)?;
+    let mut network = Network::default();
+    let fast_enable = network.add_net();
+    let slow_enable = network.add_net();
+    let fast = network.add_net();
+    let slow = network.add_net();
+    let fast_source = network.add_source(fast_enable)?;
+    let slow_source = network.add_source(slow_enable)?;
+    network.add_model(
+        Bridge::new(HorizonClock(2), SCHEMA, scale)?,
+        &[fast_enable],
+        &[fast],
+    )?;
+    network.add_model(
+        Bridge::new(HorizonClock(50), SCHEMA, scale)?,
+        &[slow_enable],
+        &[slow],
+    )?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let mut trial = engine.trial();
+    trial.schedule(fast_source, 0., Bit::One.drive())?;
+    trial.schedule(slow_source, 0., Bit::One.drive())?;
+    // Cancel an already-predicted event, then cancel a second event exactly
+    // at its physical time. An input change takes precedence over lookahead.
+    for (tick, bit) in [
+        (49, Bit::Zero),
+        (65, Bit::One),
+        (115, Bit::Zero),
+        (116, Bit::One),
+    ] {
+        trial.schedule(slow_source, scale.physical(tick)?, bit.drive())?;
+    }
+    trial.advance_to(scale.physical(180)?)?;
+    let changes: Vec<_> = trial
+        .changes()
+        .iter()
+        .filter(|c| c.net == slow)
+        .map(|c| (scale.tick(c.time).unwrap(), c.drive.logic))
+        .collect();
+    assert_eq!(changes, [(0, Logic::Zero), (166, Logic::One)]);
+    trial.commit()?;
+    assert!(engine.stats().probes < 110, "{:?}", engine.stats());
+    Ok(())
 }
