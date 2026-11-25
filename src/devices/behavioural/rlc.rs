@@ -395,6 +395,15 @@ impl Device for Passive {
         )
     }
 
+    fn initial_charge_storage(&self) -> Option<crate::devices::InitialChargeStorage> {
+        (self.law == Law::Charge).then_some(crate::devices::InitialChargeStorage {
+            slot: 0,
+            equation: 0,
+            current: 0,
+            voltage: self.initial,
+        })
+    }
+
     fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
         self.expression.validate_dc_inputs(context)
     }
@@ -516,9 +525,25 @@ impl Device for Passive {
         };
         let branch = self.equation_row(context.unknowns, context.branches.clone().next())?;
         let model = context.model_context();
+        // An instance IC is a local terminal voltage at which to evaluate
+        // the arbitrary charge law. Other controls retain their seeded
+        // values. Only the disposable UIC history load uses this override.
+        let mut seed = None;
+        if self.law == Law::Charge
+            && context.states.initial_conditions()
+            && let Some(voltage) = self.initial
+        {
+            let mut state = context.solution.clone();
+            context.unknowns.seed_terminal_voltage(
+                &mut state,
+                [self.expression.terminals[0], self.expression.terminals[1]],
+                voltage,
+            )?;
+            seed = Some(state);
+        }
         self.with_bound(
             BoundInput {
-                solution: context.solution,
+                solution: seed.as_ref().unwrap_or(context.solution),
                 unknowns: context.unknowns,
                 controls: context.controls,
                 branch,
@@ -742,10 +767,10 @@ pub(in crate::devices) fn instantiate(
             "thermal noise is only defined for a resistive law",
         ));
     }
-    if initial.is_some() && !law.differential() {
+    if initial.is_some() && !(law.differential() || law == Law::Charge) {
         return Err(unsupported(
             &instance.location,
-            "ic= applies to differential C/L, not an arbitrary charge law",
+            "ic= applies to C/L storage laws",
         ));
     }
     scale.reciprocal_tc = matches!(law, Law::Capacitance | Law::Charge);

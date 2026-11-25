@@ -178,6 +178,23 @@ pub struct InitialVoltageStorage {
     pub equation: Option<usize>,
 }
 
+/// Initial signed charge constraint for a device whose charge is an
+/// arbitrary nonlinear function of the finalized circuit coordinates.
+/// The current remains free while its evolution equation is replaced by
+/// Q(x) = Q(initial). The physical charge assembly supplies the Jacobian.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitialChargeStorage {
+    /// Local storage slot containing the signed charge.
+    pub slot: usize,
+    /// Local branch equation that normally evolves the charge.
+    pub equation: usize,
+    /// Local physical current coordinate, available as a gauge only when
+    /// the instantaneous constraints leave that current indeterminate.
+    pub current: usize,
+    /// Optional initial terminal voltage used to evaluate the charge law.
+    pub voltage: Option<Real>,
+}
+
 /// An ideal voltage relation used by the initial-condition constraint graph.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InitialVoltageRelation {
@@ -410,6 +427,40 @@ impl MnaUnknowns {
         self.node_row(node)
             .map(Some)
             .ok_or_else(|| SpiceError::circuit(format!("unmapped MNA node {node}")))
+    }
+
+    /// Seed a two-terminal voltage while retaining the negative terminal's
+    /// common-mode potential when both terminals are non-ground. This is
+    /// a guess or a local instance-IC evaluation, not a voltage source.
+    pub(crate) fn seed_terminal_voltage(
+        &self,
+        state: &mut Vector,
+        terminals: [NodeId; 2],
+        voltage: Real,
+    ) -> SpiceResult<()> {
+        let [positive, negative] = terminals;
+        let p = self.checked_node_row(positive)?;
+        let n = self.checked_node_row(negative)?;
+        if !voltage.is_finite() || state.len() != self.len() {
+            return Err(SpiceError::circuit("invalid initial voltage seed"));
+        }
+        if p == n {
+            if voltage != 0. {
+                return Err(SpiceError::circuit(
+                    "nonzero initial voltage across identical terminals",
+                ));
+            }
+        } else if let Some(p) = p {
+            let common = n.map_or(0., |n| state.as_slice()[n]);
+            let value = common + voltage;
+            if !value.is_finite() {
+                return Err(SpiceError::circuit("nonfinite initial voltage seed"));
+            }
+            state.set(p, value)?;
+        } else if let Some(n) = n {
+            state.set(n, -voltage)?;
+        }
+        Ok(())
     }
 
     /// Reserves `count` rows after every node row, for branch currents.
@@ -1106,6 +1157,13 @@ pub trait Device: fmt::Debug + std::any::Any {
             scale: storage.value,
             equation: None,
         }))
+    }
+
+    /// Explicit nonlinear charge constraints used during UIC. Devices that
+    /// already expose differential voltage/flux or internal coordinates
+    /// need not also declare a charge constraint.
+    fn initial_charge_storage(&self) -> Option<InitialChargeStorage> {
+        None
     }
 
     /// Validate bias-independent device inputs at a DC point, without an
