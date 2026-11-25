@@ -438,7 +438,7 @@ impl Device for Behavioural {
     }
 
     /// Check the physical output change and Newton linearisation defect.
-    /// Unlike the raw expression comparison in C's ASRCconvTest, this
+    /// Unlike the raw expression comparison in C's `ASRCconvTest`, this
     /// uses amperes or volts independently of the expression's scale or
     /// whether an external current probe allocates a branch unknown.
     fn convergence_test(

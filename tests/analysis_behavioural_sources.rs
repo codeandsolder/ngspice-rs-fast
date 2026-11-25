@@ -440,22 +440,37 @@ fn scaled_nonlinear_current_converges_with_or_without_a_series_probe() {
     // KCL has the unique root 10 uV: I = V/100 + 1e9 V^3.
     // At that point the current source delivers 1 uA, regardless of
     // whether a zero-volt series source makes its branch current observable.
-    for (connection, expression) in [
-        ("b1 out 0 i=", "v(out)^3 m=1e9"),
-        ("vprobe out sense 0\nb1 sense 0 i=", "v(out)^3 m=1e9"),
-        ("b1 out 0 i=", "1e9*v(out)^3"),
+    for expression in [
+        "v(out)^3 m=1e9",
+        "1e9*v(out)^3",
+        "v(out)^3 m=1e-9 reciprocm=1",
+        "v(out)^3 m=5e8 temp=37 tc1=0.1",
+        "-v(out)^3 m=-1e9",
     ] {
-        let body = format!("i1 0 out 1.1u\nr1 out 0 100\n{connection}{expression}");
-        let plot = run(&body, AnalysisKind::OperatingPoint, &[]).unwrap();
-        let v = value(&plot, "v(out)", 0);
-        let i = 1e9 * v.powi(3);
-        let residual = v / 100. + i - 1.1e-6;
-        assert!(
-            residual.abs() <= 1.1e-9 + 1e-12,
-            "{body}: V={v:e}, residual={residual:e}"
-        );
-        if connection.starts_with("vprobe") {
-            close(value(&plot, "i(vprobe)", 0), i, 1e-3);
+        for (connection, observation) in [
+            ("b1 out 0 i=", ""),
+            ("vprobe out sense 0\nb1 sense 0 i=", ""),
+            (
+                "b1 out 0 i=",
+                "\nbobserve observed 0 v=1e6*i(b1)\nr2 observed 0 1k",
+            ),
+        ] {
+            let body =
+                format!("i1 0 out 1.1u\nr1 out 0 100\n{connection}{expression}{observation}");
+            let plot = run(&body, AnalysisKind::OperatingPoint, &[]).unwrap();
+            let v = value(&plot, "v(out)", 0);
+            let current = 1e9 * v.powi(3);
+            let residual = v / 100. + current - 1.1e-6;
+            assert!(
+                residual.abs() <= 1.1e-9 + 1e-12,
+                "{body}: V={v:e}, residual={residual:e}"
+            );
+            if connection.starts_with("vprobe") {
+                close(value(&plot, "i(vprobe)", 0), current, 1e-3);
+            }
+            if !observation.is_empty() {
+                close(value(&plot, "v(observed)", 0), current * 1e6, 1e-3);
+            }
         }
     }
 }
@@ -496,7 +511,7 @@ fn nonlinear_current_probe_preserves_the_manufactured_transient_solution() {
 
 #[test]
 fn nonlinear_current_probe_does_not_regularize_a_singular_circuit() {
-    // The two opposing current sources leave the common-mode voltage
+    // The floating nonlinear conductance leaves the common-mode voltage
     // unconstrained. Inserting a zero-voltage source cannot ground it.
     for connection in [
         "b1 a b i=1m*v(a,b)^3",
