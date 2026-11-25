@@ -1,6 +1,8 @@
 //! Behavioural passive constitutive equations with explicit storage semantics.
 //!
-//! The first branch unknown is always current from positive to negative.
+//! For a physical passive the first branch unknown is current from positive
+//! to negative. Generated derivative operators use their internal node row
+//! directly, with no branch or dummy KCL equation.
 //! Differential C and L have a second algebraic unknown for the derivative
 //! of terminal voltage or current. This retains an exact F+dQ/dt formulation
 //! even when the coefficient depends on arbitrary controls.
@@ -26,6 +28,7 @@ enum Law {
     Capacitance,
     Charge,
     Inductance,
+    Derivative,
 }
 
 impl Law {
@@ -38,7 +41,11 @@ impl Law {
     }
 
     const fn branches(self) -> usize {
-        if self.differential() { 2 } else { 1 }
+        match self {
+            Self::Derivative => 0,
+            Self::Capacitance | Self::Inductance => 2,
+            _ => 1,
+        }
     }
 
     fn equations(self, values: [Real; 4], coefficient: Real) -> [Option<Equation>; 2] {
@@ -53,11 +60,19 @@ impl Law {
                 },
                 None,
             ),
-            Self::Charge => (
-                Scalar {
-                    value: current,
-                    direct: [0., 0., 1., 0.],
-                    expression: 0.,
+            Self::Charge | Self::Derivative => (
+                if self == Self::Charge {
+                    Scalar {
+                        value: current,
+                        direct: [0., 0., 1., 0.],
+                        expression: 0.,
+                    }
+                } else {
+                    Scalar {
+                        value: voltage,
+                        direct: [1., -1., 0., 0.],
+                        expression: 0.,
+                    }
                 },
                 Some(Scalar {
                     value: -coefficient,
@@ -219,7 +234,7 @@ impl Passive {
         let columns = [
             unknowns.node_row(self.expression.terminals[0]),
             unknowns.node_row(self.expression.terminals[1]),
-            Some(branch),
+            (self.law != Law::Derivative).then_some(branch),
             self.law.differential().then_some(branch + 1),
         ];
         let values = columns.map(|column| column.and_then(|row| solution.get(row)).unwrap_or(0.));
@@ -248,11 +263,24 @@ impl Passive {
         )
     }
 
+    fn equation_row(&self, unknowns: &MnaUnknowns, branch: Option<usize>) -> SpiceResult<usize> {
+        let row = if self.law == Law::Derivative {
+            unknowns.node_row(self.terminals()[0])
+        } else {
+            branch
+        };
+        row.ok_or_else(|| SpiceError::circuit(format!("{}: missing constitutive row", self.name())))
+    }
+
     fn kcl(
+        &self,
         matrix: &mut SparseMatrix,
         columns: [Option<usize>; 4],
         branch: usize,
     ) -> SpiceResult<()> {
+        if self.law == Law::Derivative {
+            return Ok(());
+        }
         for (column, sign) in [(columns[0], 1.), (columns[1], -1.)] {
             if let Some(row) = column {
                 matrix.add(row, branch, sign)?;
@@ -279,7 +307,7 @@ impl Device for Passive {
         self.law.branches()
     }
     fn findable_branch(&self) -> Option<usize> {
-        Some(0)
+        (self.law != Law::Derivative).then_some(0)
     }
     fn is_nonlinear(&self) -> bool {
         true
@@ -303,11 +331,20 @@ impl Device for Passive {
     fn setup_matrix(&self, setup: &mut MatrixSetup<'_>) -> SpiceResult<bool> {
         let pos = setup.node(self.terminals()[0]);
         let neg = setup.node(self.terminals()[1]);
-        let current = Some(setup.branch(0)?);
-        setup.element(pos, current);
-        setup.element(neg, current);
-        for index in 0..self.law.branches() {
-            let row = Some(setup.branch(index)?);
+        let current = if self.law == Law::Derivative {
+            None
+        } else {
+            let current = Some(setup.branch(0)?);
+            setup.element(pos, current);
+            setup.element(neg, current);
+            current
+        };
+        for index in 0..self.law.branches().max(1) {
+            let row = if self.law == Law::Derivative {
+                pos
+            } else {
+                Some(setup.branch(index)?)
+            };
             for column in [pos, neg, current] {
                 setup.element(row, column);
             }
@@ -341,7 +378,7 @@ impl Device for Passive {
                 ));
             }
         };
-        let branch = context.branch(0)?;
+        let branch = self.equation_row(context.unknowns, context.branches.clone().next())?;
         let model = context.model_context();
         self.with_bound(
             BoundInput {
@@ -353,7 +390,7 @@ impl Device for Passive {
                 model: &model,
             },
             |bound, equations| {
-                Self::kcl(context.matrix, bound.columns, branch)?;
+                self.kcl(context.matrix, bound.columns, branch)?;
                 for (index, equation) in equations.into_iter().enumerate() {
                     let Some(equation) = equation else {
                         continue;
@@ -378,9 +415,7 @@ impl Device for Passive {
         context: &mut LinearContext<'_>,
         bias: &Vector,
     ) -> SpiceResult<()> {
-        let branch = context
-            .branch
-            .ok_or_else(|| SpiceError::circuit("missing passive branch"))?;
+        let branch = self.equation_row(context.unknowns, context.branch)?;
         self.with_bound(
             BoundInput {
                 solution: bias,
@@ -391,7 +426,7 @@ impl Device for Passive {
                 model: context.model_context,
             },
             |bound, equations| {
-                Self::kcl(&mut context.system.a, bound.columns, branch)?;
+                self.kcl(&mut context.system.a, bound.columns, branch)?;
                 for (index, equation) in equations.into_iter().enumerate() {
                     let Some(equation) = equation else {
                         continue;
@@ -420,9 +455,7 @@ impl Device for Passive {
     }
 
     fn assemble_nonlinear_charge(&self, context: &mut ChargeContext<'_>) -> SpiceResult<()> {
-        let branch = context
-            .branch
-            .ok_or_else(|| SpiceError::circuit("missing passive charge branch"))?;
+        let branch = self.equation_row(context.unknowns, context.branch)?;
         self.with_bound(
             BoundInput {
                 solution: context.state,
@@ -477,6 +510,7 @@ pub(in crate::devices) fn instantiate(
                     ('c', "capacitance") => Law::Capacitance,
                     ('c', "charge") => Law::Charge,
                     ('l', "inductance") => Law::Inductance,
+                    ('b', "__dynamic_derivative") => Law::Derivative,
                     _ => {
                         return Err(unsupported(
                             &parameter.location,
@@ -520,8 +554,12 @@ pub(in crate::devices) fn instantiate(
         expression.ok_or_else(|| SpiceError::circuit("missing behavioural passive law"))?;
     scale.reciprocal_tc = matches!(law, Law::Capacitance | Law::Charge);
     scale.reciprocal_m = matches!(law, Law::Resistance | Law::Inductance);
-    Ok(Box::new(Passive {
-        expression: bind_expression(instance, nodes, BehaviouralOutput::Current, tree, scale)?,
-        law,
-    }))
+    let expression = bind_expression(instance, nodes, BehaviouralOutput::Current, tree, scale)?;
+    if law == Law::Derivative {
+        nodes.set_kind(
+            expression.terminals[0],
+            crate::primitives::NodeKind::Internal,
+        )?;
+    }
+    Ok(Box::new(Passive { expression, law }))
 }

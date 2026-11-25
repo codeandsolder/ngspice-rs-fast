@@ -105,3 +105,94 @@ fn round_trip_preserves_static_and_runtime_value_categories() -> SpiceResult<()>
     assert!(semantic_diff(&original, &restored).is_none());
     Ok(())
 }
+
+#[test]
+fn ddt_uses_accepted_history_and_exact_ac_derivative() -> SpiceResult<()> {
+    let body = "vin x 0 dc 2 ac 1 PWL(0 2 1m 3)\nb1 y 0 v=ddt(v(x)^2)\nr1 y 0 1k";
+    let op = run(body, AnalysisKind::OperatingPoint, &[])?;
+    close(op.value("v(y)", 0).unwrap().re, 0., 1e-12);
+    let ac = run(body, AnalysisKind::Ac, &["lin", "1", "1000", "1000"])?;
+    let y = ac.value("v(y)", 0).unwrap();
+    close(y.re, 0., 1e-10);
+    close(y.im, 4. * std::f64::consts::TAU * 1000., 1e-7);
+    for method in ["method=trap", "method=gear"] {
+        let mut errors = [0_f64; 2];
+        for (index, step) in ["1u", "250n"].into_iter().enumerate() {
+            let tran = run(
+                body,
+                AnalysisKind::Transient,
+                &[step, "1m", "0", step, method],
+            )?;
+            let mut checked = 0;
+            for point in 0..tran.point_count() {
+                let t = tran.value("time", point).unwrap().re;
+                if (20e-6..=980e-6).contains(&t) {
+                    let actual = tran.value("v(y)", point).unwrap().re;
+                    let expected = 2000. * (2. + 1000. * t);
+                    errors[index] = errors[index].max((actual - expected).abs());
+                    checked += 1;
+                }
+            }
+            assert!(checked > 100);
+        }
+        // The initial ramp has a derivative discontinuity at t=0. Startup
+        // error is proportional to the step for trapezoid; Gear damps it.
+        // Assert both convergence on refinement and a curvature-scaled
+        // absolute error, rather than hiding the transient startup effect.
+        assert!(
+            errors[0] <= 4. && errors[1] <= 1.,
+            "{method}: derivative error {errors:?}"
+        );
+        assert!(
+            errors[1] <= 0.5 * errors[0] + 1e-6,
+            "{method}: refinement {errors:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn nested_ddt_is_independent_and_composable() -> SpiceResult<()> {
+    let body = "vin x 0 dc 1 ac 1\nb1 y 0 v=ddt(ddt(v(x)))+2*ddt(v(x))\nr1 y 0 1k";
+    let ac = run(body, AnalysisKind::Ac, &["lin", "1", "10", "10"])?;
+    let y = ac.value("v(y)", 0).unwrap();
+    let omega = std::f64::consts::TAU * 10.;
+    close(y.re, -omega * omega, 1e-8);
+    close(y.im, 2. * omega, 1e-9);
+    Ok(())
+}
+
+#[test]
+fn ddt_generated_coordinates_do_not_alias_user_names() -> SpiceResult<()> {
+    let body = "vin x 0 dc 1 ac 1\nvother __dynamic_0 0 dc 5\nb__dynamic_1 a 0 v=2\nb1 y 0 v=ddt(v(x))+v(__dynamic_0)+v(a)";
+    let op = run(body, AnalysisKind::OperatingPoint, &[])?;
+    close(op.value("v(y)", 0).unwrap().re, 7., 1e-12);
+    Ok(())
+}
+
+#[test]
+fn lexical_macros_classify_runtime_and_static_passives() -> SpiceResult<()> {
+    for body in [
+        ".func v(x) {x*1000}\nvin a 0 2\nr1 a 0 {v(2)}",
+        ".func i(x) {x*1000}\nvin a 0 2\nr1 a 0 {i(2)}",
+        ".func f(x) {x*(1+v(ctrl))}\n.func g(x) {f(x)}\nvin a 0 2\nvctrl ctrl 0 1\nr1 a 0 {g(1000)}",
+        ".func v(x) {x*1000}\nvin a 0 2\nr1 a 0 {v(2)+time}",
+        ".func f(x) {x*(1+i(rctrl))}\nvin a 0 2\nvctrl ctrl 0 1\nrctrl ctrl 0 1\nr1 a 0 {f(1000)}",
+    ] {
+        let plot = run(body, AnalysisKind::OperatingPoint, &[])?;
+        close(plot.value("i(vin)", 0).unwrap().re, -1e-3, 1e-10);
+    }
+    Ok(())
+}
+
+#[test]
+fn lexical_passive_macros_and_current_probes_are_instance_local() -> SpiceResult<()> {
+    let plot = run(
+        ".subckt cell a ctrl params: gain=1000\n.func resistance(x) {gain*(1+i(rctrl))}\nrctrl ctrl 0 1\nr1 a 0 {resistance(0)}\n.ends cell\nva a 0 2\nvb b 0 2\nvctrl1 ctrl1 0 1\nvctrl2 ctrl2 0 2\nxa a ctrl1 cell gain=1000\nxb b ctrl2 cell gain=2000",
+        AnalysisKind::OperatingPoint,
+        &[],
+    )?;
+    close(plot.value("i(va)", 0).unwrap().re, -1e-3, 1e-10);
+    close(plot.value("i(vb)", 0).unwrap().re, -2. / 6000., 1e-10);
+    Ok(())
+}
