@@ -58,18 +58,15 @@ struct Search<'a, 'run, 'circuit> {
     tol: Tolerances,
     iterations: usize,
     baseline_rank: usize,
+    targets: Vec<(usize, Real)>,
     found: Option<RightLimit>,
 }
 
 impl Search<'_, '_, '_> {
-    fn probe(&mut self, direction: &Vector, radius: Real) -> SpiceResult<()> {
+    fn seed_at(&self, direction: &Vector, radius: Real) -> Vec<Vector> {
         let width = self.seed[0].len();
         let mut state = self.seed.clone();
         let prefix = &direction.as_slice()[..2 * width];
-        let magnitude = prefix.iter().fold(0_f64, |value, v| value.max(v.abs()));
-        if magnitude == 0. {
-            return Ok(());
-        }
         // Relative scaling uses only coordinates moved by this direction.
         // The free direction is a seed, not a stamp or retained history.
         let reference = self
@@ -80,7 +77,7 @@ impl Search<'_, '_, '_> {
             .zip(prefix)
             .filter(|(_, delta)| **delta != 0.)
             .fold(1_f64, |value, (x, _)| value.max(x.abs()));
-        let factor = radius * reference / magnitude;
+        let factor = radius * reference;
         for (jet, delta) in state
             .iter_mut()
             .zip(direction.as_slice().chunks_exact(width))
@@ -89,6 +86,94 @@ impl Search<'_, '_, '_> {
                 *x = factor.mul_add(d, *x);
             }
         }
+        state
+    }
+
+    // Measure the response of previously unrepresented physical equations,
+    // relative to their own nonzero residuals. A tiny high-order residual
+    // can determine a large physical derivative; user tolerances must not
+    // determine the seed-search scale.
+    fn response(&self, direction: &Vector, radius: Real) -> SpiceResult<Real> {
+        let state = self.seed_at(direction, radius);
+        if state.iter().any(|jet| !jet.is_finite()) {
+            return Ok(Real::INFINITY);
+        }
+        let point = match self.local.evaluate(self.dae, &state) {
+            Ok(point) => point,
+            Err(error @ (SpiceError::Circuit { .. } | SpiceError::Numerical { .. })) => {
+                if self.local.recovery.is_some_and(Budget::exhausted) {
+                    return Err(error);
+                }
+                return Ok(Real::INFINITY);
+            }
+            Err(error) => return Err(error),
+        };
+        let width = self.seed[0].len();
+        let mut response: Real = 0.;
+        for &(row, base) in &self.targets {
+            let (degree, coordinate) = (row / width, row % width);
+            let multiplier = Real::from(
+                u32::try_from(degree + 1).map_err(|_| failure("invalid recovery degree"))?,
+            ) / self.local.scale;
+            let residual = multiplier.mul_add(
+                point.charge[degree + 1].as_slice()[coordinate],
+                point.residual[degree].as_slice()[coordinate],
+            );
+            response = response.max((residual / base - 1.).abs());
+        }
+        Ok(response)
+    }
+
+    /// Locate a response comparable with the outstanding residual by
+    /// bracketing in binary exponent space. This handles microscopic
+    /// high-order coefficients and large physical roots using the same
+    /// criterion, without assuming a voltage or derivative magnitude.
+    fn radius(&self, direction: &Vector, sign: Real) -> SpiceResult<Option<Real>> {
+        const LIMIT: i32 = 512;
+        const LOW: Real = 0.25;
+        const HIGH: Real = 4.;
+        let evaluate = |exponent: i32| self.response(direction, sign * Real::from(exponent).exp2());
+        let first = evaluate(0)?;
+        if (LOW..=HIGH).contains(&first) {
+            return Ok(Some(sign));
+        }
+        let orientation = if first < LOW { 1 } else { -1 };
+        let mut previous = 0;
+        let mut distance = 1;
+        let mut bracket = loop {
+            let exponent = orientation * distance;
+            let response = evaluate(exponent)?;
+            if (LOW..=HIGH).contains(&response) {
+                return Ok(Some(sign * Real::from(exponent).exp2()));
+            }
+            if (response < LOW) != (first < LOW) {
+                break (previous.min(exponent), previous.max(exponent));
+            }
+            if distance == LIMIT {
+                return Ok(None);
+            }
+            previous = exponent;
+            distance = (2 * distance).min(LIMIT);
+        };
+        while bracket.1 - bracket.0 > 1 {
+            let middle = i32::midpoint(bracket.0, bracket.1);
+            let response = evaluate(middle)?;
+            if (LOW..=HIGH).contains(&response) {
+                return Ok(Some(sign * Real::from(middle).exp2()));
+            }
+            if response < LOW {
+                bracket.0 = middle;
+            } else {
+                bracket.1 = middle;
+            }
+        }
+        // A steep response can cross the target band within one exponent.
+        // Use the lower-radius end, where the residual is still finite.
+        Ok(Some(sign * Real::from(bracket.0).exp2()))
+    }
+
+    fn probe(&mut self, direction: &Vector, radius: Real) -> SpiceResult<()> {
+        let state = self.seed_at(direction, radius);
         if state.iter().any(|jet| !jet.is_finite()) {
             return Ok(());
         }
@@ -209,6 +294,15 @@ pub(super) fn recover(
         tol,
         iterations,
         baseline_rank: space.rank,
+        targets: array.residual[..array.physical_rows]
+            .iter()
+            .zip(&array.scale)
+            .zip(&space.independent)
+            .enumerate()
+            .filter_map(|(row, ((&residual, scale), &independent))| {
+                (!independent && residual.abs() > scale.roundoff()).then_some((row, residual))
+            })
+            .collect(),
         found: None,
     };
     let mut directions = space.directions;
@@ -235,10 +329,13 @@ pub(super) fn recover(
             directions.push(combined);
         }
     }
-    for radius in [1., 0.125, 8.] {
-        for direction in &directions {
-            search.probe(direction, radius)?;
-            search.probe(direction, -radius)?;
+    for direction in &directions {
+        for sign in [1., -1.] {
+            if let Some(radius) = search.radius(direction, sign)? {
+                search.probe(direction, radius)?;
+                search.probe(direction, radius * 0.5)?;
+                search.probe(direction, radius * 2.)?;
+            }
         }
     }
     search.found.ok_or_else(|| failure("nonlinear DAE germ recovery could not resolve a singular tangent within its bounded search; required coordinates may be underdetermined or noncausal"))

@@ -307,6 +307,7 @@ pub(super) fn projected_rank(matrix: &SparseMatrix, required_prefix: usize) -> S
 pub(super) struct ProbeSpace {
     pub rank: usize,
     pub directions: Vec<Vector>,
+    pub independent: Vec<bool>,
 }
 
 pub(super) fn probe_space(
@@ -347,7 +348,11 @@ pub(super) fn probe_space(
                 .direction(&reduction.column_exponents, column)
         })
         .collect::<SpiceResult<Vec<_>>>()?;
-    Ok(ProbeSpace { rank, directions })
+    Ok(ProbeSpace {
+        rank,
+        directions,
+        independent: reduction.independent,
+    })
 }
 
 struct Reduction {

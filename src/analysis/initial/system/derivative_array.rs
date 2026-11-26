@@ -7,7 +7,7 @@
 use super::rank;
 mod recovery;
 use crate::analysis::initial::{
-    CapacitorInitial, ChargeInitial, FixedCoordinate, ImpulseStorage, Tolerances,
+    CapacitorInitial, ChargeInitial, DerivativeGuess, FixedCoordinate, ImpulseStorage, Tolerances,
     constraints::{AbsoluteRow, VoltageVertex},
     failure,
 };
@@ -519,6 +519,7 @@ struct LocalPoint<'a> {
     limit: Limit,
     order_hint: usize,
     recovery: Option<&'a recovery::Budget>,
+    rate_seed: Option<&'a Vector>,
 }
 
 impl LocalPoint<'_> {
@@ -700,6 +701,7 @@ pub(in crate::analysis::initial) fn solve_right_limit(
             limit: Limit::Right,
             order_hint: 2,
             recovery: None,
+            rate_seed: None,
         },
         tol,
         iterations,
@@ -713,7 +715,7 @@ pub(in crate::analysis::initial) fn solve_event(
     storage: &ImpulseStorage,
     tol: Tolerances,
     iterations: usize,
-    order_hint: usize,
+    guess: DerivativeGuess<'_>,
 ) -> SpiceResult<RightLimit> {
     let forcing = request
         .forcing
@@ -729,8 +731,9 @@ pub(in crate::analysis::initial) fn solve_event(
             time,
             scale: forcing.timing.step(),
             limit: Limit::Right,
-            order_hint,
+            order_hint: guess.order_hint,
             recovery: None,
+            rate_seed: guess.rate,
         },
         tol,
         iterations,
@@ -745,7 +748,7 @@ pub(in crate::analysis::initial) fn solve_step(
     storage: &ImpulseStorage,
     tol: Tolerances,
     iterations: usize,
-    order_hint: usize,
+    guess: DerivativeGuess<'_>,
 ) -> SpiceResult<SolveOutcome> {
     let forcing = request
         .forcing
@@ -764,8 +767,9 @@ pub(in crate::analysis::initial) fn solve_step(
             time,
             scale: forcing.timing.step(),
             limit: forcing.limit,
-            order_hint,
+            order_hint: guess.order_hint,
             recovery: None,
+            rate_seed: guess.rate,
         },
         tol,
         iterations,
@@ -795,6 +799,17 @@ fn solve(
     for _ in 0..local.order_hint.max(2) {
         if !extend(&mut state) {
             return Err(order_limit());
+        }
+    }
+    if let Some(rate) = local.rate_seed {
+        let normalized = Vector::from(
+            rate.as_slice()
+                .iter()
+                .map(|value| value * local.scale)
+                .collect::<Vec<_>>(),
+        );
+        if normalized.len() == seed.len() && normalized.is_finite() {
+            state[1] = normalized;
         }
     }
     match solve_core(dae, state, initial, local, tol, iterations)? {

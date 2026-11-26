@@ -759,6 +759,29 @@ impl VoltageHistory {
     }
 }
 
+/// Most recent verified physical point, retained solely as a Newton seed.
+/// Rejected trials cannot alter accepted charge or flux history.
+struct DerivativePredictor {
+    time: Real,
+    state: Vector,
+    rate: Vector,
+}
+
+impl DerivativePredictor {
+    fn at(&self, time: Real) -> Option<Vector> {
+        let delta = time - self.time;
+        let guess = Vector::from(
+            self.state
+                .as_slice()
+                .iter()
+                .zip(self.rate.as_slice())
+                .map(|(&x, &rate)| rate.mul_add(delta, x))
+                .collect::<Vec<_>>(),
+        );
+        guess.is_finite().then_some(guess)
+    }
+}
+
 struct Driver<'a> {
     circuit: &'a Circuit,
     prepared: crate::devices::PreparedRun<'a>,
@@ -787,6 +810,7 @@ struct Driver<'a> {
     mixed: Option<&'a mut super::digital::MixedSignal>,
     index_aware: bool,
     derivative_order: std::cell::Cell<usize>,
+    derivative_predictor: std::cell::RefCell<Option<DerivativePredictor>>,
     physical_events: Option<std::iter::Peekable<crate::devices::SystemBreakpoints>>,
 }
 
@@ -1119,6 +1143,7 @@ fn run_transient_inner(
         mixed,
         index_aware: false,
         derivative_order: std::cell::Cell::new(2),
+        derivative_predictor: std::cell::RefCell::new(None),
         physical_events: None,
     };
     driver.run(purpose, sink)
@@ -2007,6 +2032,13 @@ impl Driver<'_> {
             self.history.set_candidate_slot(&mut trial, slot, value)?;
         }
         self.derivative_order.set(consistent.order_hint);
+        if let AnalysisMode::Instantaneous { time } = request.mode {
+            self.derivative_predictor.replace(Some(DerivativePredictor {
+                time,
+                state: x.clone(),
+                rate: consistent.rate,
+            }));
+        }
         Ok((x, trial))
     }
 
@@ -2039,24 +2071,33 @@ impl Driver<'_> {
                 timing: self.timing,
             }),
         };
+        let predictor = self.derivative_predictor.borrow();
         let consistent = initial::consistent_derivative_event(
             &self.prepared,
             &request,
             left,
             self.physical_tolerances(),
             self.settings.tran_max_iter,
-            self.derivative_order.get(),
+            initial::DerivativeGuess {
+                order_hint: self.derivative_order.get(),
+                rate: predictor.as_ref().map(|point| &point.rate),
+            },
         )?;
+        drop(predictor);
         self.physical_candidate(&request, consistent)
     }
 
     fn derivative_trial(&self, attempt: &AttemptedStep, previous: &Vector) -> SpiceResult<Trial> {
+        let predictor = self.derivative_predictor.borrow();
+        let prediction = predictor
+            .as_ref()
+            .and_then(|point| point.at(attempt.clock.time));
         let request = LoadRequest {
             mode: AnalysisMode::Transient {
                 time: attempt.clock.time,
                 dt: attempt.coefficients.dt(),
             },
-            solution: previous,
+            solution: prediction.as_ref().unwrap_or(previous),
             model_context: &self.model_context,
             integration: Some(&attempt.coefficients),
             history: &self.history,
@@ -2074,8 +2115,12 @@ impl Driver<'_> {
             &request,
             self.physical_tolerances(),
             self.settings.tran_max_iter,
-            self.derivative_order.get(),
+            initial::DerivativeGuess {
+                order_hint: self.derivative_order.get(),
+                rate: predictor.as_ref().map(|point| &point.rate),
+            },
         )?;
+        drop(predictor);
         let consistent = match outcome {
             initial::DerivativeTrial::Converged(point) => point,
             initial::DerivativeTrial::NotConverged(last) => {
