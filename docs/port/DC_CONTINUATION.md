@@ -209,11 +209,14 @@ iterative corrections against the original physical operator. This prevents
 changes in Newton pivot history from degrading small-signal results. Every
 ordinary factor/load transaction invalidates those stamps, including an exact
 rounded-input cache hit: equal rounded coefficients do not establish equality
-of unfolded operators. No new factorization is required for corrections.
-The recovery stops on small relative coordinate updates, lack of progress, or
-a finite work bound; a stalled or exhausted correction budget emits a numerical
-warning and returns the candidate with the smallest observed relative update.
-This is a recovery criterion, not a general forward-error certificate.
+of unfolded operators. No new factorization is required for successful
+binary64 corrections. If these corrections stagnate, diverge, or exhaust their
+budget, the solver assembles and factors the original stamps in portable
+two-word arithmetic, retaining those factors for further RHSs of the same
+numeric frame. Corrections are checked before narrowing the solution to
+binary64; a failed promoted solve returns a numerical error instead of an
+unreliable finite iterate. This recovery criterion is not a general
+forward-error certificate.
 
 Independent validation on the 5 V series diode-chain benchmark (C ngspice
 47 SPARSE on Linux; voltage-profile error against a 70-digit scalar root):
