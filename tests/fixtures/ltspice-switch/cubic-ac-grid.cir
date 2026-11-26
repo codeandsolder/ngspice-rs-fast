@@ -1,0 +1,329 @@
+Control AC sweep
+.options reltol=1e-10 abstol=1e-15 gmin=1e-9
+Vd d 0 dc -.3 ac 0
+Vc1 c1 0 dc -9 ac 1
+Vb1 p1 d 0
+S1 p1 0 c1 0 m1
+.model m1 SW(ron=1 roff=1e+06 vh=-10)
+Vc2 c2 0 dc 9.9000000000000004 ac 1
+Vb2 p2 d 0
+S2 p2 0 c2 0 m2
+.model m2 SW(ron=1 roff=1e+06 vh=-10)
+Vc3 c3 0 dc 5 ac 1
+Vb3 p3 d 0
+S3 p3 0 c3 0 m3
+.model m3 SW(ron=1 roff=1e+06 vh=-10)
+Vc4 c4 0 dc 0 ac 1
+Vb4 p4 d 0
+S4 p4 0 c4 0 m4
+.model m4 SW(ron=1 roff=1e+06 vh=-10)
+Vc5 c5 0 dc -9.9000000000000004 ac 1
+Vb5 p5 d 0
+S5 p5 0 c5 0 m5
+.model m5 SW(ron=1 roff=1e+06 vh=-10)
+Vc6 c6 0 dc -10 ac 1
+Vb6 p6 d 0
+S6 p6 0 c6 0 m6
+.model m6 SW(ron=1 roff=1e+06 vh=-10)
+Vc7 c7 0 dc -5 ac 1
+Vb7 p7 d 0
+S7 p7 0 c7 0 m7
+.model m7 SW(ron=1 roff=1e+06 vh=-10)
+Vc8 c8 0 dc 10 ac 1
+Vb8 p8 d 0
+S8 p8 0 c8 0 m8
+.model m8 SW(ron=1 roff=1e+06 vh=-10)
+Vc9 c9 0 dc 9 ac 1
+Vb9 p9 d 0
+S9 p9 0 c9 0 m9
+.model m9 SW(ron=1 roff=1e+06 vh=-10)
+Vc10 c10 0 dc -0.90000000000000002 ac 1
+Vb10 p10 d 0
+S10 p10 0 c10 0 m10
+.model m10 SW(ron=1 roff=1e+06 vh=-1)
+Vc11 c11 0 dc 0.98999999999999999 ac 1
+Vb11 p11 d 0
+S11 p11 0 c11 0 m11
+.model m11 SW(ron=1 roff=1e+06 vh=-1)
+Vc12 c12 0 dc 0.5 ac 1
+Vb12 p12 d 0
+S12 p12 0 c12 0 m12
+.model m12 SW(ron=1 roff=1e+06 vh=-1)
+Vc13 c13 0 dc 0 ac 1
+Vb13 p13 d 0
+S13 p13 0 c13 0 m13
+.model m13 SW(ron=1 roff=1e+06 vh=-1)
+Vc14 c14 0 dc -0.98999999999999999 ac 1
+Vb14 p14 d 0
+S14 p14 0 c14 0 m14
+.model m14 SW(ron=1 roff=1e+06 vh=-1)
+Vc15 c15 0 dc -1 ac 1
+Vb15 p15 d 0
+S15 p15 0 c15 0 m15
+.model m15 SW(ron=1 roff=1e+06 vh=-1)
+Vc16 c16 0 dc -0.5 ac 1
+Vb16 p16 d 0
+S16 p16 0 c16 0 m16
+.model m16 SW(ron=1 roff=1e+06 vh=-1)
+Vc17 c17 0 dc 1 ac 1
+Vb17 p17 d 0
+S17 p17 0 c17 0 m17
+.model m17 SW(ron=1 roff=1e+06 vh=-1)
+Vc18 c18 0 dc 0.90000000000000002 ac 1
+Vb18 p18 d 0
+S18 p18 0 c18 0 m18
+.model m18 SW(ron=1 roff=1e+06 vh=-1)
+Vc19 c19 0 dc -0.090000000000000011 ac 1
+Vb19 p19 d 0
+S19 p19 0 c19 0 m19
+.model m19 SW(ron=1 roff=1e+06 vh=-0.1)
+Vc20 c20 0 dc 0.099000000000000005 ac 1
+Vb20 p20 d 0
+S20 p20 0 c20 0 m20
+.model m20 SW(ron=1 roff=1e+06 vh=-0.1)
+Vc21 c21 0 dc 0.050000000000000003 ac 1
+Vb21 p21 d 0
+S21 p21 0 c21 0 m21
+.model m21 SW(ron=1 roff=1e+06 vh=-0.1)
+Vc22 c22 0 dc 0 ac 1
+Vb22 p22 d 0
+S22 p22 0 c22 0 m22
+.model m22 SW(ron=1 roff=1e+06 vh=-0.1)
+Vc23 c23 0 dc -0.099000000000000005 ac 1
+Vb23 p23 d 0
+S23 p23 0 c23 0 m23
+.model m23 SW(ron=1 roff=1e+06 vh=-0.1)
+Vc24 c24 0 dc -0.10000000000000001 ac 1
+Vb24 p24 d 0
+S24 p24 0 c24 0 m24
+.model m24 SW(ron=1 roff=1e+06 vh=-0.1)
+Vc25 c25 0 dc -0.050000000000000003 ac 1
+Vb25 p25 d 0
+S25 p25 0 c25 0 m25
+.model m25 SW(ron=1 roff=1e+06 vh=-0.1)
+Vc26 c26 0 dc 0.10000000000000001 ac 1
+Vb26 p26 d 0
+S26 p26 0 c26 0 m26
+.model m26 SW(ron=1 roff=1e+06 vh=-0.1)
+Vc27 c27 0 dc 0.090000000000000011 ac 1
+Vb27 p27 d 0
+S27 p27 0 c27 0 m27
+.model m27 SW(ron=1 roff=1e+06 vh=-0.1)
+Vc28 c28 0 dc -9 ac 1
+Vb28 p28 d 0
+S28 p28 0 c28 0 m28
+.model m28 SW(ron=1 roff=1000 vh=-10)
+Vc29 c29 0 dc 9.9000000000000004 ac 1
+Vb29 p29 d 0
+S29 p29 0 c29 0 m29
+.model m29 SW(ron=1 roff=1000 vh=-10)
+Vc30 c30 0 dc 5 ac 1
+Vb30 p30 d 0
+S30 p30 0 c30 0 m30
+.model m30 SW(ron=1 roff=1000 vh=-10)
+Vc31 c31 0 dc 0 ac 1
+Vb31 p31 d 0
+S31 p31 0 c31 0 m31
+.model m31 SW(ron=1 roff=1000 vh=-10)
+Vc32 c32 0 dc -9.9000000000000004 ac 1
+Vb32 p32 d 0
+S32 p32 0 c32 0 m32
+.model m32 SW(ron=1 roff=1000 vh=-10)
+Vc33 c33 0 dc -10 ac 1
+Vb33 p33 d 0
+S33 p33 0 c33 0 m33
+.model m33 SW(ron=1 roff=1000 vh=-10)
+Vc34 c34 0 dc -5 ac 1
+Vb34 p34 d 0
+S34 p34 0 c34 0 m34
+.model m34 SW(ron=1 roff=1000 vh=-10)
+Vc35 c35 0 dc 10 ac 1
+Vb35 p35 d 0
+S35 p35 0 c35 0 m35
+.model m35 SW(ron=1 roff=1000 vh=-10)
+Vc36 c36 0 dc 9 ac 1
+Vb36 p36 d 0
+S36 p36 0 c36 0 m36
+.model m36 SW(ron=1 roff=1000 vh=-10)
+Vc37 c37 0 dc -0.90000000000000002 ac 1
+Vb37 p37 d 0
+S37 p37 0 c37 0 m37
+.model m37 SW(ron=1 roff=1000 vh=-1)
+Vc38 c38 0 dc 0.98999999999999999 ac 1
+Vb38 p38 d 0
+S38 p38 0 c38 0 m38
+.model m38 SW(ron=1 roff=1000 vh=-1)
+Vc39 c39 0 dc 0.5 ac 1
+Vb39 p39 d 0
+S39 p39 0 c39 0 m39
+.model m39 SW(ron=1 roff=1000 vh=-1)
+Vc40 c40 0 dc 0 ac 1
+Vb40 p40 d 0
+S40 p40 0 c40 0 m40
+.model m40 SW(ron=1 roff=1000 vh=-1)
+Vc41 c41 0 dc -0.98999999999999999 ac 1
+Vb41 p41 d 0
+S41 p41 0 c41 0 m41
+.model m41 SW(ron=1 roff=1000 vh=-1)
+Vc42 c42 0 dc -1 ac 1
+Vb42 p42 d 0
+S42 p42 0 c42 0 m42
+.model m42 SW(ron=1 roff=1000 vh=-1)
+Vc43 c43 0 dc -0.5 ac 1
+Vb43 p43 d 0
+S43 p43 0 c43 0 m43
+.model m43 SW(ron=1 roff=1000 vh=-1)
+Vc44 c44 0 dc 1 ac 1
+Vb44 p44 d 0
+S44 p44 0 c44 0 m44
+.model m44 SW(ron=1 roff=1000 vh=-1)
+Vc45 c45 0 dc 0.90000000000000002 ac 1
+Vb45 p45 d 0
+S45 p45 0 c45 0 m45
+.model m45 SW(ron=1 roff=1000 vh=-1)
+Vc46 c46 0 dc -0.090000000000000011 ac 1
+Vb46 p46 d 0
+S46 p46 0 c46 0 m46
+.model m46 SW(ron=1 roff=1000 vh=-0.1)
+Vc47 c47 0 dc 0.099000000000000005 ac 1
+Vb47 p47 d 0
+S47 p47 0 c47 0 m47
+.model m47 SW(ron=1 roff=1000 vh=-0.1)
+Vc48 c48 0 dc 0.050000000000000003 ac 1
+Vb48 p48 d 0
+S48 p48 0 c48 0 m48
+.model m48 SW(ron=1 roff=1000 vh=-0.1)
+Vc49 c49 0 dc 0 ac 1
+Vb49 p49 d 0
+S49 p49 0 c49 0 m49
+.model m49 SW(ron=1 roff=1000 vh=-0.1)
+Vc50 c50 0 dc -0.099000000000000005 ac 1
+Vb50 p50 d 0
+S50 p50 0 c50 0 m50
+.model m50 SW(ron=1 roff=1000 vh=-0.1)
+Vc51 c51 0 dc -0.10000000000000001 ac 1
+Vb51 p51 d 0
+S51 p51 0 c51 0 m51
+.model m51 SW(ron=1 roff=1000 vh=-0.1)
+Vc52 c52 0 dc -0.050000000000000003 ac 1
+Vb52 p52 d 0
+S52 p52 0 c52 0 m52
+.model m52 SW(ron=1 roff=1000 vh=-0.1)
+Vc53 c53 0 dc 0.10000000000000001 ac 1
+Vb53 p53 d 0
+S53 p53 0 c53 0 m53
+.model m53 SW(ron=1 roff=1000 vh=-0.1)
+Vc54 c54 0 dc 0.090000000000000011 ac 1
+Vb54 p54 d 0
+S54 p54 0 c54 0 m54
+.model m54 SW(ron=1 roff=1000 vh=-0.1)
+Vc55 c55 0 dc -9 ac 1
+Vb55 p55 d 0
+S55 p55 0 c55 0 m55
+.model m55 SW(ron=1 roff=10 vh=-10)
+Vc56 c56 0 dc 9.9000000000000004 ac 1
+Vb56 p56 d 0
+S56 p56 0 c56 0 m56
+.model m56 SW(ron=1 roff=10 vh=-10)
+Vc57 c57 0 dc 5 ac 1
+Vb57 p57 d 0
+S57 p57 0 c57 0 m57
+.model m57 SW(ron=1 roff=10 vh=-10)
+Vc58 c58 0 dc 0 ac 1
+Vb58 p58 d 0
+S58 p58 0 c58 0 m58
+.model m58 SW(ron=1 roff=10 vh=-10)
+Vc59 c59 0 dc -9.9000000000000004 ac 1
+Vb59 p59 d 0
+S59 p59 0 c59 0 m59
+.model m59 SW(ron=1 roff=10 vh=-10)
+Vc60 c60 0 dc -10 ac 1
+Vb60 p60 d 0
+S60 p60 0 c60 0 m60
+.model m60 SW(ron=1 roff=10 vh=-10)
+Vc61 c61 0 dc -5 ac 1
+Vb61 p61 d 0
+S61 p61 0 c61 0 m61
+.model m61 SW(ron=1 roff=10 vh=-10)
+Vc62 c62 0 dc 10 ac 1
+Vb62 p62 d 0
+S62 p62 0 c62 0 m62
+.model m62 SW(ron=1 roff=10 vh=-10)
+Vc63 c63 0 dc 9 ac 1
+Vb63 p63 d 0
+S63 p63 0 c63 0 m63
+.model m63 SW(ron=1 roff=10 vh=-10)
+Vc64 c64 0 dc -0.90000000000000002 ac 1
+Vb64 p64 d 0
+S64 p64 0 c64 0 m64
+.model m64 SW(ron=1 roff=10 vh=-1)
+Vc65 c65 0 dc 0.98999999999999999 ac 1
+Vb65 p65 d 0
+S65 p65 0 c65 0 m65
+.model m65 SW(ron=1 roff=10 vh=-1)
+Vc66 c66 0 dc 0.5 ac 1
+Vb66 p66 d 0
+S66 p66 0 c66 0 m66
+.model m66 SW(ron=1 roff=10 vh=-1)
+Vc67 c67 0 dc 0 ac 1
+Vb67 p67 d 0
+S67 p67 0 c67 0 m67
+.model m67 SW(ron=1 roff=10 vh=-1)
+Vc68 c68 0 dc -0.98999999999999999 ac 1
+Vb68 p68 d 0
+S68 p68 0 c68 0 m68
+.model m68 SW(ron=1 roff=10 vh=-1)
+Vc69 c69 0 dc -1 ac 1
+Vb69 p69 d 0
+S69 p69 0 c69 0 m69
+.model m69 SW(ron=1 roff=10 vh=-1)
+Vc70 c70 0 dc -0.5 ac 1
+Vb70 p70 d 0
+S70 p70 0 c70 0 m70
+.model m70 SW(ron=1 roff=10 vh=-1)
+Vc71 c71 0 dc 1 ac 1
+Vb71 p71 d 0
+S71 p71 0 c71 0 m71
+.model m71 SW(ron=1 roff=10 vh=-1)
+Vc72 c72 0 dc 0.90000000000000002 ac 1
+Vb72 p72 d 0
+S72 p72 0 c72 0 m72
+.model m72 SW(ron=1 roff=10 vh=-1)
+Vc73 c73 0 dc -0.090000000000000011 ac 1
+Vb73 p73 d 0
+S73 p73 0 c73 0 m73
+.model m73 SW(ron=1 roff=10 vh=-0.1)
+Vc74 c74 0 dc 0.099000000000000005 ac 1
+Vb74 p74 d 0
+S74 p74 0 c74 0 m74
+.model m74 SW(ron=1 roff=10 vh=-0.1)
+Vc75 c75 0 dc 0.050000000000000003 ac 1
+Vb75 p75 d 0
+S75 p75 0 c75 0 m75
+.model m75 SW(ron=1 roff=10 vh=-0.1)
+Vc76 c76 0 dc 0 ac 1
+Vb76 p76 d 0
+S76 p76 0 c76 0 m76
+.model m76 SW(ron=1 roff=10 vh=-0.1)
+Vc77 c77 0 dc -0.099000000000000005 ac 1
+Vb77 p77 d 0
+S77 p77 0 c77 0 m77
+.model m77 SW(ron=1 roff=10 vh=-0.1)
+Vc78 c78 0 dc -0.10000000000000001 ac 1
+Vb78 p78 d 0
+S78 p78 0 c78 0 m78
+.model m78 SW(ron=1 roff=10 vh=-0.1)
+Vc79 c79 0 dc -0.050000000000000003 ac 1
+Vb79 p79 d 0
+S79 p79 0 c79 0 m79
+.model m79 SW(ron=1 roff=10 vh=-0.1)
+Vc80 c80 0 dc 0.10000000000000001 ac 1
+Vb80 p80 d 0
+S80 p80 0 c80 0 m80
+.model m80 SW(ron=1 roff=10 vh=-0.1)
+Vc81 c81 0 dc 0.090000000000000011 ac 1
+Vb81 p81 d 0
+S81 p81 0 c81 0 m81
+.model m81 SW(ron=1 roff=10 vh=-0.1)
+.ac lin 1 1k 1k
+.end

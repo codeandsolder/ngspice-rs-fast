@@ -188,6 +188,12 @@ impl Law {
             }
             _ => Point::exact(g * voltage, g, g_control * voltage),
         };
+        // Independent AC sweeps show a constant 0.99 factor on the
+        // cubic control derivative. Preserve the exact physical Newton
+        // derivative; only the reference small-signal load is scaled.
+        if self.transfer == Transfer::Cubic {
+            point.small_signal.control *= 0.99;
+        }
         // Level 1 applies gmin to the shifted voltage; level 2 applies it to
         // the physical branch voltage, even when reverse conduction is blocked.
         // Independent noise measurements show that both levels include gmin
@@ -365,6 +371,43 @@ mod tests {
                     point.current
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cubic_ac_control_derivative_matches_measured_grid() -> SpiceResult<()> {
+        let law = Law::new(1, -1., None, Direction::Bidirectional);
+        for line in include_str!("../../../tests/fixtures/ltspice-switch/cubic-ac-grid.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let values = line
+                .split_whitespace()
+                .map(str::parse::<Real>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| SpiceError::circuit("invalid AC fixture"))?;
+            let [roff, width, normalized, expected]: [Real; 4] = values
+                .try_into()
+                .map_err(|_| SpiceError::circuit("invalid AC fixture width"))?;
+            let p = Conductance {
+                on: 1.,
+                off: roff.recip(),
+                threshold: 0.,
+                width,
+                gmin: 1e-9,
+            };
+            let point = law.evaluate(
+                p,
+                Bias {
+                    voltage: -0.3,
+                    control: normalized * width,
+                },
+                false,
+            )?;
+            assert!(
+                (-point.small_signal.control - expected).abs() < 1e-14 + 1e-10 * expected.abs()
+            );
         }
         Ok(())
     }

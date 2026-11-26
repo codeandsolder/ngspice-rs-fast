@@ -216,6 +216,10 @@ retains this measured current law and its exact derivative for Newton.
 The AC load follows independent reference measurements rather than
 using the physical DC tangent indiscriminately:
 
+- Level 1 cubic control gain is 0.99 times its physical derivative
+  (verified over 81 independent AC biases spanning three resistance ratios,
+  three transition widths and both endpoints). The DC/transient Newton
+  derivative remains exact.
 - Level 1 hard current limiting uses the chord conductance
   `Ilimit/abs(V_shifted)`, not the zero differential conductance.
 - Level 2 uses the differential voltage slope. For epsilon, the
