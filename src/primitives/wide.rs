@@ -1,7 +1,7 @@
 //! Portable two-word real arithmetic for cancellation-sensitive calculations.
 //! Both words remain binary64; this extends precision, not exponent range.
 use super::{
-    Real,
+    ExactSum, Real,
     numeric::{scale_power, split_power},
 };
 
@@ -52,6 +52,23 @@ impl Wide {
         } else {
             self
         }
+    }
+
+    /// Round an exact sum into two words without losing the low word
+    /// during cancellation of widely separated physical stamps.
+    pub(crate) fn from_sum(mut sum: ExactSum) -> Self {
+        let hi = sum.rounded_sum();
+        if !hi.is_finite() {
+            return Self::from_real(hi);
+        }
+        sum.add_product(-hi, 1.);
+        Self::two_sum(hi, sum.rounded_sum())
+    }
+
+    /// Both binary64 words contribute independently to the exact product.
+    pub(crate) fn add_product(self, factor: Real, sum: &mut ExactSum) {
+        sum.add_product(self.hi, factor);
+        sum.add_product(self.lo, factor);
     }
 
     pub(crate) const fn finite(self) -> bool {

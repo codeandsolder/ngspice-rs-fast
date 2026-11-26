@@ -9,10 +9,11 @@ use super::{OriginalStamp, OriginalStamps, PivotTolerances, numerical, order_fre
 use crate::{
     maths::{
         Vector,
+        equilibration::OriginalResidual,
         sparse13::{Scalar, Sparse},
         telemetry::PatternWork,
     },
-    primitives::{SpiceResult, wide::Wide},
+    primitives::{ExactSum, SpiceResult, wide::Wide},
 };
 
 impl Scalar for Wide {
@@ -93,11 +94,7 @@ impl RetainedOriginal {
         work: &mut PatternWork,
     ) -> SpiceResult<Vector> {
         if self.wide.is_none() {
-            let mut sparse = Sparse::<Wide>::new(order)?;
-            for &(row, col, value) in self.stamps.iter() {
-                let handle = sparse.get_element(row + 1, col + 1)?;
-                sparse.add(handle, Wide::from_real(value));
-            }
+            let mut sparse = assemble_wide(order, &self.stamps)?;
             let factor = order_fresh("retained two-word sparse LU", &mut sparse, self.pivot, None);
             work.factor += sparse.last_attempt();
             factor?;
@@ -127,18 +124,29 @@ fn relative_update(current: &mut [Wide], delta: &[Wide]) -> f64 {
     relative
 }
 
-fn correction(
-    stamps: &[OriginalStamp],
-    rhs: &[Wide],
-    current: &[Wide],
-    transpose: bool,
-    out: &mut [Wide],
-) {
-    out.copy_from_slice(rhs);
-    for &(row, col, value) in stamps {
-        let (row, col) = if transpose { (col, row) } else { (row, col) };
-        out[row] = out[row] - Wide::from_real(value) * current[col];
+fn assemble_wide(order: usize, stamps: &[OriginalStamp]) -> SpiceResult<Sparse<Wide>> {
+    // Sorting indices rather than copying the physical stamps avoids one
+    // superaccumulator per entry and preserves all duplicate contributions.
+    let mut indices: Vec<_> = (0..stamps.len()).collect();
+    indices.sort_unstable_by_key(|&index| {
+        let (row, col, _) = stamps[index];
+        (row, col)
+    });
+    let mut sparse = Sparse::new(order)?;
+    for group in indices.chunk_by(|&a, &b| {
+        let (r1, c1, _) = stamps[a];
+        let (r2, c2, _) = stamps[b];
+        (r1, c1) == (r2, c2)
+    }) {
+        let (row, col, _) = stamps[group[0]];
+        let mut sum = ExactSum::new();
+        for &index in group {
+            sum.add_product(stamps[index].2, 1.);
+        }
+        let handle = sparse.get_element(row + 1, col + 1)?;
+        sparse.set(handle, Wide::from_sum(sum));
     }
+    Ok(sparse)
 }
 
 /// Check the correction in the promoted precision before narrowing the
@@ -151,7 +159,8 @@ fn solve_checked(
     work: &mut PatternWork,
 ) -> SpiceResult<Vector> {
     let factors = sparse.factors()?;
-    let rhs: Vec<_> = rhs
+    let original = OriginalResidual::real(rhs.len(), stamps, transpose)?;
+    let wide_rhs: Vec<_> = rhs
         .as_slice()
         .iter()
         .copied()
@@ -167,10 +176,10 @@ fn solve_checked(
         work.record_rhs(&result);
         result
     };
-    let mut current = solve(&rhs)?;
+    let mut current = solve(&wide_rhs)?;
     let mut residual = vec![Wide::ZERO; rhs.len()];
     for _ in 0..8 {
-        correction(stamps, &rhs, &current, transpose, &mut residual);
+        original.wide_correction(rhs.as_slice(), &current, &mut residual)?;
         let delta = solve(&residual)?;
         if relative_update(&mut current, &delta) <= f64::EPSILON.sqrt() {
             return Ok(Vector::from(
