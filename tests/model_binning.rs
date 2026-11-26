@@ -528,7 +528,7 @@ fn sweep_deck(length: f64, width: f64, scale: f64, temperature: f64) -> Netlist 
         "m1 d g 0 0 nch l={length:.17e} w={width:.17e} m=2 nrd=2 nrs=3\n\
          .model nch.1 nmos level=8 lmin=0.5u lmax=1.1u wmin=0.5u wmax=5u vth0=0.3\n\
          .model nch.2 nmos level=8 lmin=1u lmax=3u wmin=0.5u wmax=5u vth0=0.5 rsh=10\n\
-         .options scale={scale} temp={temperature}\n"
+         .options scale={scale} temp={temperature} reltol=1e-10 vntol=1e-12\n"
     ))
 }
 
@@ -556,7 +556,7 @@ fn geometry_sweep_rebinds_overlapping_bins_and_structural_nodes() {
     let before = op.run(&mut circuit, &context).unwrap();
     let plan = AnalysisInput::with_arguments(
         AnalysisKind::DcSweep,
-        "@M1[L] 1.5u 5u 0.5u temp 27 67 40".split_whitespace(),
+        "@M1[L] 1.5u 5u 0.5u temp 27 67 40 rtol=1e-10 vntol=1e-12".split_whitespace(),
     )
     .resolve()
     .unwrap();

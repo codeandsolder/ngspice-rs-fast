@@ -1,5 +1,9 @@
 //! Transactional sweep setup for geometry-dependent model declarations.
-use super::*;
+use super::{
+    AnalysisContext, AnalysisPlan, AxisBinding, BoundAxis, Circuit, Complex, DcSweepPlan, GridPair,
+    ModelContext, ParameterRoute, Real, SpiceResult, SweepSolver, SweepTarget, Vector, plot,
+    point_context, unsupported, warm_start_settings,
+};
 use crate::analysis::results::{Plot, PlotFlags, Variable};
 use crate::devices::circuit::GeometryEdit;
 use crate::devices::models::ModelResolver;
@@ -17,15 +21,8 @@ struct Candidate {
     key: [Option<u64>; 2],
 }
 
-fn candidate(
-    baseline: &Circuit,
-    resolver: &ModelResolver<'_>,
-    axes: &[BoundAxis],
-    values: [Real; 2],
-    base: ModelContext,
-) -> SpiceResult<Candidate> {
-    let edits: Vec<_> = axes
-        .iter()
+fn geometry_edits(axes: &[BoundAxis], values: [Real; 2]) -> Vec<GeometryEdit<'_>> {
+    axes.iter()
         .zip(values)
         .filter_map(|(axis, value)| {
             if let SweepTarget::InstanceParameter {
@@ -44,7 +41,17 @@ fn candidate(
                 None
             }
         })
-        .collect();
+        .collect()
+}
+
+fn candidate(
+    baseline: &Circuit,
+    resolver: &ModelResolver<'_>,
+    axes: &[BoundAxis],
+    values: [Real; 2],
+    base: ModelContext,
+) -> SpiceResult<Candidate> {
+    let edits = geometry_edits(axes, values);
     let deck = baseline
         .binned_deck()
         .ok_or_else(|| unsupported("missing binned source graph"))?;
@@ -83,6 +90,37 @@ fn key(axes: &[BoundAxis], values: [Real; 2]) -> [Option<u64>; 2] {
             .filter(|axis| matches!(axis.binding, AxisBinding::Geometry))
             .map(|_| values[i].to_bits())
     })
+}
+
+fn advance(
+    current: &mut Option<Candidate>,
+    baseline: &Circuit,
+    resolver: &ModelResolver<'_>,
+    axes: &[BoundAxis],
+    values: [Real; 2],
+    base: ModelContext,
+) -> SpiceResult<bool> {
+    let next = key(axes, values);
+    if let Some(previous) = current {
+        if previous.key == next {
+            return Ok(false);
+        }
+        let deck = baseline
+            .binned_deck()
+            .ok_or_else(|| unsupported("missing binned source graph"))?;
+        if deck.try_update(
+            baseline,
+            &mut previous.circuit,
+            resolver,
+            &geometry_edits(axes, values),
+            &base,
+        )? {
+            previous.key = next;
+            return Ok(false);
+        }
+    }
+    *current = Some(candidate(baseline, resolver, axes, values, base)?);
+    Ok(true)
 }
 
 pub(super) fn validate_start(
@@ -175,11 +213,12 @@ pub(super) fn run(
         .physical_contexts(source_axes)
         .points()
     {
-        if current.as_ref().is_none_or(|c| c.key != key(axes, values)) {
-            let c = candidate(baseline, &resolver, axes, values, base)?;
+        if advance(&mut current, baseline, &resolver, axes, values, base)? {
+            let c = current
+                .as_ref()
+                .ok_or_else(|| unsupported("missing geometry candidate"))?;
             columns.map(&header(&c.circuit, axes)?);
             crate::analysis::initial::resolve(&c.circuit, request)?;
-            current = Some(c);
         }
         let c = current
             .as_ref()
@@ -195,6 +234,14 @@ pub(super) fn run(
     );
     sink.begin(&result)?;
     let selected = sink.selected_columns().map(<[usize]>::to_vec);
+    if selected.as_ref().is_some_and(|indices| {
+        indices
+            .iter()
+            .any(|&index| index >= result.variable_count())
+            || indices.windows(2).any(|pair| pair[0] >= pair[1])
+    }) {
+        return Err(unsupported("invalid geometry sweep projection"));
+    }
     let settings = request.dc_settings();
     let warm = warm_start_settings(point_iterations, settings);
     let mut current = None;
@@ -212,11 +259,10 @@ pub(super) fn run(
         let mut first = true;
         for inner_value in inner.clone() {
             let values = [inner_value, outer_value];
-            if current
-                .as_ref()
-                .is_none_or(|c: &Candidate| c.key != key(axes, values))
-            {
-                let c = candidate(baseline, &resolver, axes, values, base)?;
+            if advance(&mut current, baseline, &resolver, axes, values, base)? {
+                let c = current
+                    .as_ref()
+                    .ok_or_else(|| unsupported("missing geometry candidate"))?;
                 let hints = crate::analysis::initial::resolve(&c.circuit, request)?;
                 nodes.nodesets = crate::analysis::initial::forced_nodesets(&hints.nodesets);
                 previous = Vector::zeros(c.circuit.unknown_count());
@@ -225,7 +271,6 @@ pub(super) fn run(
                 }
                 history = Some(c.circuit.state_history()?);
                 mapping = columns.map(&header(&c.circuit, axes)?);
-                current = Some(c);
                 first = true;
             }
             let c = current
