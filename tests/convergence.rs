@@ -445,6 +445,9 @@ fn assert_chain_physics(plot: &Plot, stages: u32, drop_bound: f64, tail_relative
 /// scalar solution, and controlled cancellation-recovery ablation.
 #[test]
 fn long_diode_chains_converge_on_original_equations() {
+    use AttemptOutcome::{Converged, Failed};
+    use DcStrategy::{Direct, GminStepping, JunctionGminStepping};
+
     let body = diode_chain(100);
     let (solution, report) = solve(&body, &[]);
     solution.unwrap();
@@ -461,8 +464,6 @@ fn long_diode_chains_converge_on_original_equations() {
     let body = diode_chain(1000);
     let (solution, report) = solve(&body, &[]);
     solution.unwrap();
-    use AttemptOutcome::{Converged, Failed};
-    use DcStrategy::{Direct, GminStepping, JunctionGminStepping};
     let path = attempts(&report);
     assert!(
         matches!(
