@@ -71,6 +71,9 @@ pub enum NodeKind {
     Terminal,
     /// A node introduced by the simulator, for instance inside a device.
     Internal,
+    /// A voltage alias introduced by an automatic zero-volt current probe.
+    /// It has a KCL row but must not create another physical shunt.
+    ProbeAlias,
     /// The branch-current unknown of a voltage source or inductor, named
     /// `<instance>#branch`.
     BranchCurrent,

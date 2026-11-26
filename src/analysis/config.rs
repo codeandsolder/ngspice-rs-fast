@@ -13,6 +13,8 @@
 //! | --- | --- |
 //! | `temp`, `tnom` | [`AnalysisContext`] circuit/nominal temperature (Celsius, finite, above absolute zero) |
 //! | `gmin` | [`AnalysisContext::gmin`]: junction minimum conductance of every diode/BJT/MOS1 junction in all analyses (C `CKTgmin`, default 1e-12 S; finite, `>= 0`) |
+//! | `rshunt`, `cshunt` | noiseless resistive and capacitive shunts on physical voltage nodes |
+//! | `gshunt` | retained regularization conductance after nodal gmin recovery |
 //! | `pivtol`, `pivrel` | [`AnalysisContext::pivot`]: SPARSE threshold-pivoting limits used whenever a circuit matrix is (re)ordered in any analysis (C `CKTpivotAbsTol`/`CKTpivotRelTol`, `SMPreorder`/`SMPcReorder`; defaults 1e-13 and 1e-3). `pivtol` must be finite and `>= 0`, `pivrel` in `(0, 1]`; C's `spOrderAndFactor` would silently use its default for other values |
 //! | `reltol` | circuit relative tolerance, including diode temperature matching; default for Newton and transient truncation/convergence |
 //! | `vntol` | voltage absolute tolerance (companion Newton test; DC/AC Newton) |
@@ -42,7 +44,7 @@
 //! The DC options reach `.op`, `.dc`, `.ac` and the companion `.tran` initial
 //! bias. They follow C's `CKTop` strategies (#106); the port-only request keys
 //! `continuation=ladder` and `limiting=global` select the port's earlier fixed
-//! ladders and global damping instead. C's `OPtran` fallback, `gshunt`,
+//! ladders and global damping instead. C's `OPtran` fallback,
 //! `oldlimit`, predictor and bypass are not ported; see
 //! `docs/port/DC_CONTINUATION.md`.
 //!
@@ -65,7 +67,7 @@
 //! * `bypass=0`: C's default (`cktntask.c`); this port never bypasses device
 //!   evaluation. Any other `bypass` is `NotYetPorted`.
 //!
-//! Every other name from `cktsopt.c` (`gshunt`, `oldlimit`, ...)
+//! Every other name from `cktsopt.c` (`oldlimit`, ...)
 //! and the front-end variables with an effect (`filetype`, `numdgt`,
 //! `savecurrents`, `scale`, ...) is [`SpiceError::NotYetPorted`]; names
 //! absent from both are parse errors. `no_auto_gnd` is a front-end variable in

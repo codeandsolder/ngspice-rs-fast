@@ -4194,7 +4194,8 @@ impl Circuit {
             self.devices.iter().map(|device| device.name()),
             limits.devices.saturating_sub(existing.devices),
         )?;
-        let instances = instances.as_ref();
+        let aliases = instances.probe_aliases;
+        let instances = instances.instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
         let plan =
@@ -4208,6 +4209,12 @@ impl Circuit {
         let staged = self.nodes.transaction(|nodes| {
             let staged =
                 Self::elaborate_batch(plan, models, context, nodes, existing, limits, seen)?;
+            for alias in &aliases {
+                let id = nodes.get(alias).ok_or_else(|| {
+                    SpiceError::circuit(format!("missing generated probe alias {alias}"))
+                })?;
+                nodes.set_kind(id, NodeKind::ProbeAlias)?;
+            }
             // The node transaction commits only after the final device and
             // provenance vector can hold the entire staged suffix.
             devices.try_reserve(staged.len()).map_err(|error| {
@@ -4600,7 +4607,7 @@ impl Circuit {
         Ok(circuit)
     }
 
-    /// Electrical voltage nodes, excluding solver-owned expression signals.
+    /// Electrical voltage nodes, excluding probe aliases and solver-owned signals.
     ///
     /// A generated differentiator signal is a matrix coordinate, but its
     /// row contains a constitutive equation rather than a physical KCL.
@@ -4624,7 +4631,7 @@ impl Circuit {
 
     /// C `INPpas4` adds capacitors to parsed voltage nodes before device
     /// setup; `CKTsetup`'s rshunt adds noiseless conductance to all voltage
-    /// nodes after setup. Branch-current and private storage coordinates
+    /// nodes after setup. Branch-current, automatic probe aliases and private storage coordinates
     /// are never physical shunt targets. Materialize real device equations
     /// so all analysis paths see the same topology and charge states.
     fn add_topology_shunts(

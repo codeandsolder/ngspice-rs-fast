@@ -346,6 +346,40 @@ fn physical_shunts_never_load_solver_owned_derivative_signals() {
 }
 
 #[test]
+fn automatic_current_probes_do_not_duplicate_physical_shunts() {
+    // A user-specified node with a generated-looking name is still physical.
+    let circuit = "v1 in 0 dc 1 ac 1\nr1 in out 1k\nr2 out 0 1k\nv2 __sense_0 0 1";
+    let measured = format!("{circuit}\nb1 measured 0 v=i(r2)");
+    let op = simulate(&format!("{measured}\n.options rshunt=1k\n.op")).unwrap();
+    close(op.value("v(out)", 0).unwrap().re, 1. / 3., 1e-12, 0.);
+    close(op.value("v(measured)", 0).unwrap().re, 1e-3 / 3., 1e-12, 0.);
+    close(op.value("i(v2)", 0).unwrap().re, -1e-3, 1e-12, 0.);
+    for analysis in [".ac lin 1 1k 1k", ".tran 1u 20u"] {
+        let direct = simulate(&format!(
+            "{circuit}\n.options rshunt=1k cshunt=1n\n{analysis}"
+        ))
+        .unwrap();
+        let observed = simulate(&format!(
+            "{measured}\n.options rshunt=1k cshunt=1n\n{analysis}"
+        ))
+        .unwrap();
+        assert_eq!(direct.point_count(), observed.point_count());
+        for point in 0..direct.point_count() {
+            for variable in ["v(out)", "i(v1)", "i(v2)"] {
+                let a = direct.value(variable, point).unwrap();
+                let b = observed.value(variable, point).unwrap();
+                close(a.re, b.re, 1e-10, 1e-12);
+                close(a.im, b.im, 1e-10, 1e-12);
+            }
+            let out = observed.value("v(out)", point).unwrap();
+            let sense = observed.value("v(measured)", point).unwrap();
+            close(sense.re, 1e-3 * out.re, 1e-10, 1e-12);
+            close(sense.im, 1e-3 * out.im, 1e-10, 1e-12);
+        }
+    }
+}
+
+#[test]
 fn voltage_lte_controls_add_a_predictor_bound_without_removing_charge_control() {
     let circuit = "v1 in 0 sin(0 1 1k)\nr1 in out 1k\nc1 out 0 1u";
     let analysis = ".tran 20u 2m 0 20u";
