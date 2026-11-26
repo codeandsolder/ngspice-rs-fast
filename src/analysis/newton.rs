@@ -424,6 +424,7 @@ impl CircuitNewton<'_, '_> {
             },
             ..*self.options
         };
+        self.workspace.load.correction.enabled = integration.is_none() && options.diag_gmin == 0.;
         solve_phased_into(
             initial,
             self.branch_rows,
@@ -472,6 +473,9 @@ impl CircuitNewton<'_, '_> {
                 }
                 stamp_nodal_regularization(matrix, nodal_regularization, gmin)?;
                 after_load(phase, matrix, rhs)?;
+                if storage.correction.active {
+                    storage.finish_incremental_load(circuit, guess)?;
+                }
                 Ok(trial)
             },
             |new, old, trial| {
@@ -516,6 +520,7 @@ struct LoadStorage<T> {
     matrix: Option<SparseMatrix>,
     rhs: Option<Vector>,
     spare_trial: Option<T>,
+    correction: CorrectionWorkspace,
 }
 
 impl<T> Default for LoadStorage<T> {
@@ -524,6 +529,7 @@ impl<T> Default for LoadStorage<T> {
             matrix: None,
             rhs: None,
             spare_trial: None,
+            correction: CorrectionWorkspace::default(),
         }
     }
 }
@@ -540,10 +546,12 @@ impl<T> LoadStorage<T> {
             .matrix
             .as_mut()
             .ok_or_else(|| failure("Newton load returned no matrix"))?;
-        let rhs = self
-            .rhs
-            .as_ref()
-            .ok_or_else(|| failure("Newton load returned no RHS"))?;
+        let rhs = if self.correction.active {
+            self.correction.rhs.as_ref()
+        } else {
+            self.rhs.as_ref()
+        }
+        .ok_or_else(|| failure("Newton load returned no RHS"))?;
         check(matrix, rhs, n)?;
         matrix.fold_duplicates();
         Ok((matrix, rhs))
@@ -558,41 +566,149 @@ pub(super) struct CircuitNewtonWorkspace {
     load: LoadStorage<TrialState>,
 }
 
+/// Ordinary absolute-coordinate Newton solves are cheap and retain the
+/// reference iteration path. If a bias solve has not converged after this
+/// warmup, switch to accurate correction coordinates for the remaining
+/// iterations. This changes neither the device load nor its tolerances.
+const CORRECTION_WARMUP_PASSES: usize = 8;
+
+#[derive(Default)]
+struct CorrectionWorkspace {
+    enabled: bool,
+    active: bool,
+    unfolded: Option<SparseMatrix>,
+    entries: Vec<(usize, usize, Real)>,
+    rhs: Option<Vector>,
+}
+
+impl CorrectionWorkspace {
+    const fn begin_iteration(&mut self, iteration: usize) -> bool {
+        self.active = self.enabled && iteration > CORRECTION_WARMUP_PASSES;
+        self.active
+    }
+
+    fn prepare(&mut self, circuit: &crate::devices::Circuit) -> SpiceResult<&mut SparseMatrix> {
+        let n = circuit.unknown_count();
+        let raw = self.unfolded.get_or_insert_with(|| SparseMatrix::new(n, n));
+        if raw.rows() != n || raw.cols() != n {
+            *raw = SparseMatrix::new(n, n);
+        }
+        raw.clear();
+        if let Some(pattern) = circuit.matrix_pattern() {
+            raw.seed_unfolded_structure(&pattern)?;
+        }
+        Ok(raw)
+    }
+
+    /// Evaluate the update RHS against the original coefficient stamps.
+    /// The ordinary binary64 RHS is the authoritative load output, including
+    /// any forced row replacements. Do not subtract rounded absolute products
+    /// or pre-fold coefficients that may contain a tiny physical conductance.
+    fn update_rhs(&mut self, rhs: &Vector, guess: &Vector) -> SpiceResult<()> {
+        let raw = self
+            .unfolded
+            .as_ref()
+            .ok_or_else(|| failure("missing unfolded Newton matrix"))?;
+        self.entries.clear();
+        self.entries
+            .try_reserve(raw.triplets().len())
+            .map_err(|error| {
+                failure(format!("cannot reserve Newton correction stamps: {error}"))
+            })?;
+        self.entries
+            .extend(raw.triplets().iter().map(|t| (t.row, t.col, t.value)));
+        let original =
+            crate::maths::equilibration::OriginalResidual::real(raw.rows(), &self.entries, false)?;
+        let correction = self.rhs.get_or_insert_with(|| Vector::zeros(guess.len()));
+        if correction.len() != guess.len() {
+            *correction = Vector::zeros(guess.len());
+        }
+        let _quality = original.evaluate_with_correction(
+            rhs.as_slice(),
+            guess.as_slice(),
+            correction.as_mut_slice(),
+        )?;
+        Ok(())
+    }
+}
+
+/// Prepare the normal bound factorization matrix, retaining its storage and
+/// symbolic identity when the circuit's learned pattern has not changed.
+fn reset_bound_matrix<'a>(
+    slot: &'a mut Option<SparseMatrix>,
+    circuit: &crate::devices::Circuit,
+) -> SpiceResult<&'a mut SparseMatrix> {
+    let n = circuit.unknown_count();
+    let pattern = circuit.matrix_pattern();
+    let reusable = slot.as_ref().is_some_and(|matrix| {
+        matrix.rows() == n
+            && matrix.cols() == n
+            && match (pattern.as_ref(), matrix.bound_values()) {
+                (Some(pattern), Some((existing, _))) => std::sync::Arc::ptr_eq(pattern, existing),
+                (None, None) => true,
+                _ => false,
+            }
+    });
+    if !reusable {
+        *slot = Some(circuit.new_matrix()?);
+    }
+    let matrix = slot
+        .as_mut()
+        .ok_or_else(|| failure("missing Newton matrix"))?;
+    matrix.clear();
+    Ok(matrix)
+}
+
 impl LoadStorage<TrialState> {
     fn prepare_load(
         &mut self,
         circuit: &crate::devices::Circuit,
     ) -> SpiceResult<(&mut SparseMatrix, &mut Vector)> {
         let n = circuit.unknown_count();
-        let pattern = circuit.matrix_pattern();
-        let reusable = self.matrix.as_ref().is_some_and(|matrix| {
-            matrix.rows() == n
-                && matrix.cols() == n
-                && match (pattern.as_ref(), matrix.bound_values()) {
-                    (Some(pattern), Some((existing, _))) => {
-                        std::sync::Arc::ptr_eq(pattern, existing)
-                    }
-                    (None, None) => true,
-                    _ => false,
-                }
-        });
-        if !reusable {
-            self.matrix = Some(circuit.new_matrix()?);
-        }
         if self.rhs.as_ref().is_none_or(|rhs| rhs.len() != n) {
             self.rhs = Some(Vector::zeros(n));
         }
-        let matrix = self
-            .matrix
-            .as_mut()
-            .ok_or_else(|| failure("missing Newton matrix"))?;
         let rhs = self
             .rhs
             .as_mut()
             .ok_or_else(|| failure("missing Newton RHS"))?;
-        matrix.clear();
         rhs.clear();
+        let matrix = if self.correction.active {
+            self.correction.prepare(circuit)?
+        } else {
+            reset_bound_matrix(&mut self.matrix, circuit)?
+        };
         Ok((matrix, rhs))
+    }
+
+    /// Rebind the unfolded linearization to the circuit's normal factor
+    /// pattern. The rounded Jacobian supplies the correction solve; the
+    /// accurate residual retains all individual physical coefficient stamps.
+    /// The final factors still belong to this circuit and physical trial.
+    fn finish_incremental_load(
+        &mut self,
+        circuit: &crate::devices::Circuit,
+        guess: &Vector,
+    ) -> SpiceResult<()> {
+        let rhs = self
+            .rhs
+            .as_ref()
+            .ok_or_else(|| failure("missing Newton RHS"))?;
+        self.correction.update_rhs(rhs, guess)?;
+        let raw = self
+            .correction
+            .unfolded
+            .as_ref()
+            .ok_or_else(|| failure("missing unfolded Newton matrix"))?;
+        let matrix = reset_bound_matrix(&mut self.matrix, circuit)?;
+        matrix.set_pivot_tolerances(raw.pivot_tolerances());
+        matrix.set_unknown_names(raw.unknown_names().cloned());
+        for t in raw.triplets() {
+            if t.value != 0. {
+                matrix.add(t.row, t.col, t.value)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -763,6 +879,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         // NIiter increments before checking the CKTload return code.
         progress.iterations += 1;
         let iterno = progress.iterations;
+        let incremental = storage.correction.begin_iteration(iterno);
         let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
         let flagged = (phases.nonconvergent)(&trial);
         let (matrix, rhs) = storage.checked_system(n)?;
@@ -783,6 +900,11 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
                 continue;
             }
         };
+        if incremental {
+            for (delta, value) in next.as_mut_slice().iter_mut().zip(guess.as_slice()) {
+                *delta += value;
+            }
+        }
         if phases.damped {
             damp(
                 &mut next,
@@ -966,6 +1088,37 @@ fn failure(message: impl Into<String>) -> SpiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn correction_residual_preserves_unfolded_small_conductance() {
+        let large = 0.01;
+        let small = 1e-12;
+        let mut raw = SparseMatrix::new(2, 2);
+        for (row, other) in [(0, 1), (1, 0)] {
+            raw.add(row, row, large).unwrap();
+            raw.add(row, other, -large).unwrap();
+            raw.add(row, row, small).unwrap();
+        }
+        let rhs = Vector::from(vec![small, small]);
+        let guess = Vector::from(vec![1., 1.]);
+        let mut correction = CorrectionWorkspace {
+            unfolded: Some(raw),
+            ..CorrectionWorkspace::default()
+        };
+        correction.update_rhs(&rhs, &guess).unwrap();
+        assert_eq!(correction.rhs.as_ref().unwrap().as_slice(), &[0., 0.]);
+        correction.unfolded.as_mut().unwrap().fold_duplicates();
+        correction.update_rhs(&rhs, &guess).unwrap();
+        assert!(
+            correction
+                .rhs
+                .as_ref()
+                .unwrap()
+                .as_slice()
+                .iter()
+                .all(|value| *value != 0.)
+        );
+    }
+
     #[test]
     fn reusable_workspace_resets_values_and_rebinds_foreign_topology() {
         use crate::netlist::{Parser, source::parse_deck_text};

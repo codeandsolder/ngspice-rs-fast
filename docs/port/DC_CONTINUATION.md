@@ -187,6 +187,39 @@ numerical failure; under `continuation=ladder` without `itl2` each point runs
 the full solve as before. `gmin` is the junction gmin (`AnalysisContext::gmin`),
 which `dynamic_gmin`/`new_gmin` approach and `spice3_gmin` starts from.
 
+## Accurate Newton corrections
+
+For bias solves that have not converged after eight load passes, when no
+hidden SPARSE diagonal gmin is in use, subsequent passes solve in update
+coordinates. Instead of solving the absolute system J x_new = b, form the
+correction residual b - J x from the individual coefficient stamps using
+exact product-sum accumulation, solve J delta = residual with the ordinary
+rounded sparse factorization, and update x_new = x + delta. This avoids
+losing the residual of tiny conductances combined with much larger stamps.
+The original binary64 RHS, including forced rows, remains authoritative.
+Structural zero entries, learned matrix identity, factorization reuse, device
+limiting, trial ownership, convergence tests and iteration budgets are
+preserved. Transient integration and hidden permuted SPARSE diagonal
+regularization retain the original absolute-coordinate path.
+
+Independent validation on the 5 V series diode-chain benchmark (C ngspice
+47 SPARSE on Linux; voltage-profile error against a 70-digit scalar root):
+
+| 1000-stage operating point | Newton passes | Maximum voltage error |
+| --- | ---: | ---: |
+| C default | 229 | 13.85 mV |
+| Conditioned junction arithmetic, absolute coordinates | 491 | 3.96 mV |
+| Accurate corrections, default | 11 | 0.496 µV |
+| Accurate corrections, forced nodal gmin | 89 | 84.3 µV |
+
+The direct solve's maximum terminal-current relative error is 3.24e-7
+and its maximum electrical KCL residual is 1.74e-17 A. The 100-stage case
+still follows the seven-pass reference path. Independent 2000- and
+5000-stage cases, and changes to drive voltage, series resistance and
+junction gmin, also converge without transient fallback. These are
+physical accuracy tests, not requirements for bitwise parity with C's
+ill-conditioned absolute solve.
+
 ## Remaining differences from C
 
 - **No `OPtran` fallback.** When every `CKTop` strategy fails, ngspice (whose

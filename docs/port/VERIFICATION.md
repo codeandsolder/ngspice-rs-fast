@@ -50,12 +50,13 @@ code or blocking reader-thread joins.
   `compare::NONLINEAR`, and the port matches the no-FMA build bit for bit. The
   5 V benchmark chain (`scripts/bench`) is not a golden: its current (about
   1e-13 A) is below ABSTOL, so the two C builds differ by up to 14 times the
-  NONLINEAR bound. `tests/convergence.rs` instead pins it at 100 stages (direct
-  Newton, 7 iterations) and 1000 stages (direct Newton fails, dynamic gmin, 216
-  iterations), with values bitwise equal to the no-FMA C build. Where every
-  `CKTop` strategy fails in C too (for example 1 ohm stages at 5 V), C goes on
-  to `OPtran`. The port's solves are identical to C's up to that point, and it
-  stops with the explicit "OPtran not ported" error.
+  NONLINEAR bound. The original regression pinned C's iteration path and
+  floating-point values. Conditioned junction arithmetic and accurate Newton
+  corrections now allow direct convergence of the 1000-stage chain. The
+  regression instead checks the independent scalar series-circuit root,
+  complete voltage profile, terminal currents and local electrical KCL.
+  It separately forces nodal gmin recovery using NOOPITER. See
+  [DC_CONTINUATION.md](DC_CONTINUATION.md#accurate-newton-corrections).
 - The source card budget (`SourceLimits::max_cards`) default is now 1,000,000
   (it was 100,000). It still stops runaway repeated includes; see
   `tests/sources.rs` and [FRONTEND_STRUCTURE.md](FRONTEND_STRUCTURE.md).
