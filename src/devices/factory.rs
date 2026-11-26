@@ -114,8 +114,14 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Switch | ModelBackend::LtspiceSwitch | ModelBackend::CurrentSwitch => {
             crate::devices::switch::Switch::instantiate(instance, nodes, &model, context)
         }
-        ModelBackend::RationalTransfer => {
-            crate::devices::code_model::rational::instantiate(instance, nodes, &model)
+        ModelBackend::RationalTransfer
+        | ModelBackend::LogicEvent
+        | ModelBackend::LogicVoltage
+        | ModelBackend::TimedSwitch => {
+            let schema =
+                crate::devices::code_model::source::SourceModel::from_base(&model.card().base)
+                    .ok_or_else(|| SpiceError::circuit("missing registered code-model schema"))?;
+            crate::devices::code_model::source::instantiate(schema, instance, nodes, &model)
         }
         ModelBackend::Cpl => crate::devices::cpl::CoupledLine::instantiate(instance, nodes, &model)
             .map(|line| Box::new(line) as Box<dyn Device>),

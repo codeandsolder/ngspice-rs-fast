@@ -213,7 +213,7 @@ macro_rules! semantic_struct {
 
 // Scope order is compared first, including structural terminators and
 // indexes, then the typed payload vectors in stable diagnostic order.
-semantic_struct!(Netlist { title, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets, prepared_initialization } ignore { path, location });
+semantic_struct!(Netlist { auto_gnd, title, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets, prepared_initialization } ignore { path, location });
 semantic_struct!(Subcircuit { name, terminals, parameters, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets, output, measurements, fourier } ignore { end_location, location });
 semantic_leaves!(crate::netlist::ast::CodePort);
 semantic_struct!(DeviceInstance { name, designator, nodes, code_ports, model, parameters } ignore { location });

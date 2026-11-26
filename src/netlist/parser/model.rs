@@ -13,6 +13,7 @@ use winnow::combinator::{alt, cut_err, opt, peek, repeat};
 use winnow::error::ErrMode;
 use winnow::token::any;
 
+use crate::devices::code_model::source::SourceModel;
 use crate::netlist::ast::{
     ModelCard, NumericVectorEntry, ParameterAssignment, ParameterKind, PositionedValue,
 };
@@ -83,7 +84,8 @@ fn parameters(input: &mut Input<'_>, base: &str) -> Result<Vec<ParameterAssignme
         alt((
             punctuation(TokenKind::Comma).value(None),
             (|input: &mut Input<'_>| cpl_vector(input, base)).map(Some),
-            (|input: &mut Input<'_>| transfer_vector(input, base)).map(Some),
+            (|input: &mut Input<'_>| code_vector(input, base)).map(Some),
+            (|input: &mut Input<'_>| code_boolean(input, base)).map(Some),
             (|input: &mut Input<'_>| super::flags::model(input, base)).map(Some),
             (|input: &mut Input<'_>| version_assignment(input, base)).map(Some),
             scalar_assignment.map(Some),
@@ -275,15 +277,63 @@ fn cpl_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> 
 /// names. Parse delimiters only at the model-vector site; no global token
 /// splitting changes bus node names. Numeric and expression entries retain
 /// exact physical spans.
-fn transfer_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
+fn boolean_literal(text: &str) -> Option<&'static str> {
+    if text.eq_ignore_ascii_case("true") {
+        Some("1")
+    } else if text.eq_ignore_ascii_case("false") {
+        Some("0")
+    } else {
+        None
+    }
+}
+
+fn code_boolean(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
+    let Some(setter) = input.input.first() else {
+        return Err(winnow::error::ErrMode::Backtrack(Failure(
+            crate::primitives::SpiceError::circuit("expected boolean setter"),
+        )));
+    };
+    let shape = SourceModel::from_base(base)
+        .and_then(|schema| schema.parameter(&setter.text.to_ascii_lowercase()));
+    let value_index = 1 + usize::from(
+        input
+            .input
+            .get(1)
+            .is_some_and(|token| token.kind == TokenKind::Equals),
+    );
+    let literal = input
+        .input
+        .get(value_index)
+        .and_then(|token| boolean_literal(&token.text));
+    if shape != Some(crate::devices::code_model::source::ParameterShape::Boolean)
+        || literal.is_none()
+    {
+        return Err(winnow::error::ErrMode::Backtrack(Failure(
+            crate::primitives::SpiceError::circuit("not a boolean literal setter"),
+        )));
+    }
+    let setter = any.parse_next(input)?;
+    opt(equals).parse_next(input)?;
+    any.parse_next(input)?;
+    Ok(ParameterAssignment {
+        name: setter.text.to_ascii_lowercase(),
+        value: literal.unwrap_or_default().into(),
+        kind: ParameterKind::Scalar,
+        location: setter.location.clone(),
+    })
+}
+
+fn code_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
     peek(any.verify(|token: &Token| {
-        base.eq_ignore_ascii_case("s_xfer")
-            && ["num_coeff", "den_coeff", "int_ic"]
-                .iter()
-                .any(|name| token.is_keyword(name))
+        SourceModel::from_base(base)
+            .and_then(|schema| schema.parameter(&token.text.to_ascii_lowercase()))
+            .is_some_and(crate::devices::code_model::source::ParameterShape::vector)
     }))
     .parse_next(input)?;
     let setter = any.parse_next(input)?;
+    let boolean = SourceModel::from_base(base)
+        .and_then(|schema| schema.parameter(&setter.text.to_ascii_lowercase()))
+        .is_some_and(crate::devices::code_model::source::ParameterShape::boolean);
     opt(equals).parse_next(input)?;
     cut_err(|input: &mut Input<'_>| {
         let mut entries = Vec::new();
@@ -293,12 +343,12 @@ fn transfer_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignm
             let token = input
                 .input
                 .first()
-                .ok_or_else(|| malformed(input, "unterminated s_xfer coefficient vector"))?;
+                .ok_or_else(|| malformed(input, "unterminated code-model coefficient vector"))?;
             let text = if first {
                 token
                     .text
                     .strip_prefix('[')
-                    .ok_or_else(|| malformed(input, "expected '[' at start of s_xfer vector"))?
+                    .ok_or_else(|| malformed(input, "expected '[' at start of code-model vector"))?
             } else {
                 token.text.as_str()
             };
@@ -318,7 +368,7 @@ fn transfer_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignm
                 if prefix == 1 {
                     continue;
                 }
-                return Err(malformed(input, "empty s_xfer vector token"));
+                return Err(malformed(input, "empty code-model vector token"));
             }
             if token.kind == TokenKind::Comma {
                 if comma || entries.is_empty() {
@@ -343,10 +393,15 @@ fn transfer_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignm
                     expression: Some(expression),
                 });
             } else {
+                let text = if boolean {
+                    boolean_literal(text).unwrap_or(text)
+                } else {
+                    text
+                };
                 if text.contains(['[', ']'])
                     || !crate::primitives::parse_spice_number(text).is_some_and(f64::is_finite)
                 {
-                    return Err(malformed(input, "expected finite s_xfer coefficient"));
+                    return Err(malformed(input, "expected finite code-model coefficient"));
                 }
                 let position = token.position().advance(prefix).location();
                 entries.push(NumericVectorEntry {

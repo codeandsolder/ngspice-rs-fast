@@ -1308,6 +1308,8 @@ pub struct Netlist {
     /// Typed source-prepared initialization, separate from native .ic cards.
     pub prepared_initialization:
         Option<crate::netlist::prepared_initialization::PreparedInitialConditions>,
+    /// Whether analog ground aliases are enabled for this deck.
+    pub auto_gnd: bool,
     /// The deck's title line.
     pub title: String,
     /// The file the deck came from.
