@@ -120,7 +120,12 @@ impl Sampler<'_> {
                 "prepared statistical call has no bound declaration occurrence",
             )
         })?;
-        let expression = expression.unwrap_or(site.expression);
+        let expression = expression.ok_or_else(|| {
+            SpiceError::parse(
+                location.clone(),
+                "prepared statistical call has no static expression identity",
+            )
+        })?;
         let (invocation, law) = Invocation::decode(name, args)
             .map_err(|error| SpiceError::parse(location.clone(), error.to_string()))?;
         invocation
