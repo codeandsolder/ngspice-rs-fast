@@ -207,14 +207,77 @@ enum Operator {
 /// Two-argument functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Binary {
-    Pow,
-    Pwr,
-    PowBaseSlope,
-    PwrBaseSlope,
-    PowExponentSlope,
-    PwrExponentSlope,
+    Power(PowerLaw, PowerPart),
     Min,
     Max,
+}
+
+/// Separate numerical laws selected explicitly by the prepared expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PowerLaw {
+    NativePow,
+    NativePwr,
+    SimetrixAbsolute,
+    SimetrixCaret,
+    SimetrixRealPart,
+}
+
+/// Value and the two analytic partials share one typed numerical law.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PowerPart {
+    Value,
+    Base,
+    Exponent,
+}
+
+impl PowerPart {
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Value => "",
+            Self::Base => "_base_slope",
+            Self::Exponent => "_exponent_slope",
+        }
+    }
+}
+
+impl PowerLaw {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "pow" => Some(Self::NativePow),
+            "pwr" => Some(Self::NativePwr),
+            "simetrix_abs_pow" => Some(Self::SimetrixAbsolute),
+            "simetrix_caret_pow" => Some(Self::SimetrixCaret),
+            "simetrix_pow" => Some(Self::SimetrixRealPart),
+            _ => None,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NativePow => "pow",
+            Self::NativePwr => "pwr",
+            Self::SimetrixAbsolute => "simetrix_abs_pow",
+            Self::SimetrixCaret => "simetrix_caret_pow",
+            Self::SimetrixRealPart => "simetrix_pow",
+        }
+    }
+
+    fn evaluate(self, part: PowerPart, a: Real, b: Real) -> Real {
+        match self {
+            Self::NativePow | Self::NativePwr => {
+                let signed = self == Self::NativePwr;
+                match part {
+                    PowerPart::Value if signed => pwr(a, b),
+                    PowerPart::Value => power(a, b),
+                    PowerPart::Base => power_base_slope(a, b, signed),
+                    PowerPart::Exponent => power_exponent_slope(a, b, signed),
+                }
+            }
+            Self::SimetrixAbsolute => absolute_power(part, a, b),
+            Self::SimetrixCaret => caret_power(part, a, b),
+            Self::SimetrixRealPart => real_part_power(part, a, b),
+        }
+    }
 }
 
 /// A shared subtree: C shares subtrees between the function and its
@@ -621,9 +684,17 @@ fn call<'a>(
             boxed(&arguments[1], compiler)?,
         ))
     };
+    if let Some(law) = PowerLaw::from_name(name) {
+        return two(Binary::Power(law, PowerPart::Value), compiler);
+    }
     match name {
-        "pow" => two(Binary::Pow, compiler),
-        "pwr" => two(Binary::Pwr, compiler),
+        "simetrix_abs_pow_product" => {
+            arity(3)?;
+            let factor = boxed(&arguments[0], compiler)?;
+            let base = boxed(&arguments[1], compiler)?;
+            let exponent = boxed(&arguments[2], compiler)?;
+            Ok(absolute_power_product(factor, base, exponent))
+        }
         "min" => two(Binary::Min, compiler),
         "max" => two(Binary::Max, compiler),
         "ternary_fcn" => {
@@ -662,6 +733,29 @@ fn call<'a>(
             format!("no such function '{name}' (src/spicelib/parser/inpptree.c PT_mkfnode)"),
         )),
     }
+}
+
+/// An explicit ordered product of a factor and an absolute-base power.
+/// The source's zero-factor convention only masks a zero-base negative
+/// power; finite products retain the ordinary product-rule Jacobian.
+fn absolute_power_product(factor: Tree, base: Tree, exponent: Tree) -> Node {
+    let zero = Arc::new(Node::Constant(0.));
+    let factor_zero = Arc::new(Node::Unary(Unary::Eq0, Arc::clone(&factor)));
+    let base_zero = Arc::new(Node::Unary(Unary::Eq0, Arc::clone(&base)));
+    let exponent_negative = Arc::new(Node::Unary(Unary::Lt0, Arc::clone(&exponent)));
+    let singular = Arc::new(Node::Ternary(
+        base_zero,
+        exponent_negative,
+        Arc::clone(&zero),
+    ));
+    let masked = Arc::new(Node::Ternary(factor_zero, singular, Arc::clone(&zero)));
+    let power = Arc::new(Node::Binary(
+        Binary::Power(PowerLaw::SimetrixAbsolute, PowerPart::Value),
+        base,
+        exponent,
+    ));
+    let product = Arc::new(Node::Operator(Operator::Times, factor, power));
+    Node::Ternary(masked, zero, product)
 }
 
 fn pwl<'a>(expr: &BExpr, arguments: &'a [BExpr], compiler: &mut Compiler<'a>) -> SpiceResult<Node> {
@@ -845,6 +939,84 @@ fn power_exponent_slope(a: Real, b: Real, signed: bool) -> Real {
         pwr(a, b) * a.abs().ln()
     } else {
         power(a, b) * a.ln()
+    }
+}
+
+/// Source absolute-base law: both PWR and **, with the measured zero-base
+/// Jacobian. Singular negative powers remain errors outside an explicit
+/// ordered zero-factor product.
+fn absolute_power(part: PowerPart, a: Real, b: Real) -> Real {
+    if a == 0. {
+        if b < 0. {
+            return Real::INFINITY;
+        }
+        return if part == PowerPart::Value && b == 0. {
+            1.
+        } else {
+            0.
+        };
+    }
+    let magnitude = a.abs();
+    match part {
+        PowerPart::Value => c_pow(magnitude, b),
+        PowerPart::Base if b == 0. => 0.,
+        PowerPart::Base => a.signum() * b * c_pow(magnitude, b - 1.),
+        PowerPart::Exponent => c_pow(magnitude, b) * magnitude.ln(),
+    }
+}
+
+/// Source caret law. Negative fractional bases are outside its real domain.
+/// The separately measured primal, base-slope and log floors at zero are
+/// intentionally not shared with the absolute-base or complex-real laws.
+fn caret_power(part: PowerPart, a: Real, b: Real) -> Real {
+    let integral = b.fract() == 0.;
+    if a < 0. && !integral {
+        return Real::NAN;
+    }
+    let value = || {
+        if a == 0. && !integral && b > 0. {
+            c_pow(1e-308, b)
+        } else {
+            c_pow(a, b)
+        }
+    };
+    match part {
+        PowerPart::Value => value(),
+        PowerPart::Base if b == 0. => 0.,
+        PowerPart::Base if a == 0. && b > 1. => 0.,
+        PowerPart::Base if a == 0. => b * c_pow(1e-200, b - 1.),
+        PowerPart::Base => b * c_pow(a, b - 1.),
+        PowerPart::Exponent => value() * a.max(1e-100).ln(),
+    }
+}
+
+/// The real component of a principal complex power. The exact integer
+/// branches preserve signs without trigonometric roundoff.
+fn real_part_power(part: PowerPart, a: Real, b: Real) -> Real {
+    if a == 0. {
+        return match part {
+            PowerPart::Value => c_pow(a, b),
+            PowerPart::Base if b == 0. || b > 1. => 0.,
+            PowerPart::Base => b * c_pow(1e-200, b - 1.),
+            PowerPart::Exponent if b > 0. => 0.,
+            PowerPart::Exponent => c_pow(a, b) * 1e-100_f64.ln(),
+        };
+    }
+    let magnitude = a.abs();
+    let (sin, cos) = if a > 0. {
+        (0., 1.)
+    } else if b.fract() == 0. {
+        (0., if b.rem_euclid(2.) == 0. { 1. } else { -1. })
+    } else {
+        (core::f64::consts::PI * b.rem_euclid(2.)).sin_cos()
+    };
+    match part {
+        PowerPart::Value => c_pow(magnitude, b) * cos,
+        PowerPart::Base if b == 0. => 0.,
+        PowerPart::Base => a.signum() * b * c_pow(magnitude, b - 1.) * cos,
+        PowerPart::Exponent => {
+            c_pow(magnitude, b) * magnitude.ln().mul_add(cos, -core::f64::consts::PI * sin)
+        }
     }
 }
 

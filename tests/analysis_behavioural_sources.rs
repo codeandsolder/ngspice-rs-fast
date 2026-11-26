@@ -541,3 +541,27 @@ fn discontinuous_current_without_a_root_is_rejected_in_every_probe_topology() {
         assert!(error.to_string().contains("Newton"), "{body}: {error}");
     }
 }
+
+#[test]
+fn prepared_power_laws_reach_operating_point_and_complex_ac_stamps() {
+    let deck = "vx x 0 dc 0 ac 1\nvp p 0 dc .5 ac 0\nbabs a 0 v=simetrix_abs_pow(v(x),v(p))\nbproduct b 0 v=simetrix_abs_pow_product(sgn(v(x)),v(x),-.5)\nvneg n 0 dc -2 ac 0\nvexp e 0 dc 3 ac 1\nbcaret c 0 v=simetrix_caret_pow(v(n),v(e))\nbpow d 0 v=simetrix_pow(v(n),v(e))";
+    let op = run(deck, AnalysisKind::OperatingPoint, &[]).unwrap();
+    for (node, expected) in [("v(a)", 0.), ("v(b)", 0.), ("v(c)", -8.), ("v(d)", -8.)] {
+        close(value(&op, node, 0), expected, 1e-12);
+    }
+    let ac = run(deck, AnalysisKind::Ac, &["lin", "2", "1k", "2k"]).unwrap();
+    for i in 0..ac.point_count() {
+        for (node, expected) in [
+            ("v(a)", 0.),
+            ("v(b)", 0.),
+            ("v(c)", 1842.068_074_4),
+            ("v(d)", -5.545_177_444_5),
+        ] {
+            let sample = ac.value(node, i).unwrap();
+            close(sample.re, expected, 1e-10);
+            assert_eq!(sample.im, 0.);
+        }
+    }
+    let singular = "vx x 0 0\nb1 out 0 v=simetrix_abs_pow(v(x),-.5)";
+    assert!(run(singular, AnalysisKind::OperatingPoint, &[]).is_err());
+}
