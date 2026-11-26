@@ -85,12 +85,12 @@ fn all_four_control_modes_match_independent_ltspice_24_measurements() -> TestRes
 /// residual and the two derivatives with central finite differences.
 fn reference(level: u8, control: f64, voltage: f64, limit: Option<f64>) -> f64 {
     let t = if level == 1 {
-        let u = (0.5 * (control + 1.)).clamp(0., 1.);
-        u * u * (3. - 2. * u)
+        let u = f64::midpoint(control, 1.).clamp(0., 1.);
+        u * u * 2_f64.mul_add(-u, 3.)
     } else {
         control.atan() / std::f64::consts::PI + 0.5
     };
-    let g = 10_f64.powf(6. * t - 6.);
+    let g = 10_f64.powf(6_f64.mul_add(t, -6.));
     let current = g * voltage;
     let current = if level == 2 {
         let limit = limit.unwrap_or(10.);
@@ -116,7 +116,6 @@ fn row(c: &Circuit, name: &str) -> TestResult<usize> {
 
 #[test]
 fn smooth_devices_have_no_history_and_stamp_consistent_kcl_and_jacobians() -> TestResult {
-    let step = 1e-5;
     for level in [1, 2] {
         for limit in [None, Some(0.03)] {
             let c = circuit(&format!(
@@ -126,109 +125,122 @@ fn smooth_devices_have_no_history_and_stamp_consistent_kcl_and_jacobians() -> Te
             let device = c.device("s1").ok_or("missing switch")?;
             assert_eq!(device.state_count(), 0);
             assert!(!device.has_discrete_state());
-            let [p, n, cp, cn] = [row(&c, "p")?, row(&c, "n")?, row(&c, "cp")?, row(&c, "cn")?];
-            let history = c.state_history()?;
-            let width = c.unknown_count();
             for control in [-2., -0.8, -0.13, 0.29, 0.76, 2.] {
                 for voltage in [-2., -0.7, 0., 0.19, 2.] {
-                    let mut x = Vector::zeros(width);
-                    x.as_mut_slice()[p] = voltage + 0.3;
-                    x.as_mut_slice()[n] = 0.3;
-                    x.as_mut_slice()[cp] = control - 0.41;
-                    x.as_mut_slice()[cn] = -0.41;
-                    let mut matrix = SparseMatrix::new(width, width);
-                    let mut rhs = Vector::zeros(width);
-                    let mut trial = history.trial_in(IterationPhase::Predict, None)?;
-                    c.load(
-                        &LoadRequest {
-                            mode: AnalysisMode::OperatingPoint,
-                            solution: &x,
-                            model_context: &ModelContext::default(),
-                            integration: None,
-                            history: &history,
-                            forcing: None,
-                        },
-                        &mut matrix,
-                        &mut rhs,
-                        &mut trial,
-                    )?;
-                    matrix.fold_duplicates();
-                    let actual = |r: usize| -> TestResult<f64> {
-                        let residual = (0..width)
-                            .map(|col| matrix.get(r, col) * x.as_slice()[col])
-                            .sum::<f64>()
-                            - rhs.get(r).ok_or("missing RHS row")?;
-                        Ok(residual)
-                    };
-                    let expected = reference(level, control, voltage, limit);
-                    close(
-                        "positive terminal residual",
-                        actual(p)?,
-                        expected,
-                        5e-11,
-                        1e-14,
-                    );
-                    close(
-                        "negative terminal residual",
-                        actual(n)?,
-                        -expected,
-                        5e-11,
-                        1e-14,
-                    );
-                    let dv = (reference(level, control, voltage + step, limit)
-                        - reference(level, control, voltage - step, limit))
-                        / (2. * step);
-                    let dc = (reference(level, control + step, voltage, limit)
-                        - reference(level, control - step, voltage, limit))
-                        / (2. * step);
-                    for (r, sign) in [(p, 1.), (n, -1.)] {
-                        for (col, derivative) in [(p, dv), (n, -dv), (cp, dc), (cn, -dc)] {
-                            close(
-                                "nodal derivative",
-                                matrix.get(r, col),
-                                sign * derivative,
-                                2e-7,
-                                1e-11,
-                            );
-                        }
-                    }
-                    let linear = c.small_signal_system(&ModelContext::default(), &x)?;
-                    let pencil = c.pole_zero_system_at(&ModelContext::default(), &x, None)?;
-                    for r in [p, n] {
-                        for col in [p, n, cp, cn] {
-                            let physical = matrix.get(r, col);
-                            let expected_ac = if level == 1
-                                && limit.is_some_and(|limit| {
-                                    (reference(level, control, voltage, None) - voltage * 1e-12)
-                                        .abs()
-                                        > limit
-                                })
-                                && [p, n].contains(&col)
-                            {
-                                let chord = expected / voltage;
-                                if r == col { chord } else { -chord }
-                            } else {
-                                physical
-                            };
-                            close(
-                                "AC derivative",
-                                linear.a.get(r, col),
-                                expected_ac,
-                                1e-13,
-                                1e-18,
-                            );
-                            close(
-                                "PZ derivative",
-                                pencil.a.get(r, col),
-                                expected_ac,
-                                1e-13,
-                                1e-18,
-                            );
-                            assert_eq!(pencil.e.get(r, col).to_bits(), 0_f64.to_bits());
-                        }
-                    }
+                    check_smooth_point(&c, level, limit, control, voltage)?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn check_smooth_point(
+    c: &Circuit,
+    level: u8,
+    limit: Option<f64>,
+    control: f64,
+    voltage: f64,
+) -> TestResult {
+    let step = 1e-5;
+    let [p, n, cp, cn] = [row(c, "p")?, row(c, "n")?, row(c, "cp")?, row(c, "cn")?];
+    let history = c.state_history()?;
+    let width = c.unknown_count();
+    let mut x = Vector::zeros(width);
+    x.as_mut_slice()[p] = voltage + 0.3;
+    x.as_mut_slice()[n] = 0.3;
+    x.as_mut_slice()[cp] = control - 0.41;
+    x.as_mut_slice()[cn] = -0.41;
+    let mut matrix = SparseMatrix::new(width, width);
+    let mut rhs = Vector::zeros(width);
+    let mut trial = history.trial_in(IterationPhase::Predict, None)?;
+    c.load(
+        &LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &x,
+            model_context: &ModelContext::default(),
+            integration: None,
+            history: &history,
+            forcing: None,
+        },
+        &mut matrix,
+        &mut rhs,
+        &mut trial,
+    )?;
+    matrix.fold_duplicates();
+    let actual = |r: usize| -> TestResult<f64> {
+        let residual = (0..width)
+            .map(|col| matrix.get(r, col) * x.as_slice()[col])
+            .sum::<f64>()
+            - rhs.get(r).ok_or("missing RHS row")?;
+        Ok(residual)
+    };
+    let expected = reference(level, control, voltage, limit);
+    close(
+        "positive terminal residual",
+        actual(p)?,
+        expected,
+        5e-11,
+        1e-14,
+    );
+    close(
+        "negative terminal residual",
+        actual(n)?,
+        -expected,
+        5e-11,
+        1e-14,
+    );
+    let dv = (reference(level, control, voltage + step, limit)
+        - reference(level, control, voltage - step, limit))
+        / (2. * step);
+    let dc = (reference(level, control + step, voltage, limit)
+        - reference(level, control - step, voltage, limit))
+        / (2. * step);
+    for (r, sign) in [(p, 1.), (n, -1.)] {
+        for (col, derivative) in [(p, dv), (n, -dv), (cp, dc), (cn, -dc)] {
+            close(
+                "nodal derivative",
+                matrix.get(r, col),
+                sign * derivative,
+                2e-7,
+                1e-11,
+            );
+        }
+    }
+    let linear = c.small_signal_system(&ModelContext::default(), &x)?;
+    let pencil = c.pole_zero_system_at(&ModelContext::default(), &x, None)?;
+    for r in [p, n] {
+        for col in [p, n, cp, cn] {
+            let physical = matrix.get(r, col);
+            let expected_ac = if level == 1
+                && limit.is_some_and(|limit| {
+                    voltage
+                        .mul_add(-1e-12, reference(level, control, voltage, None))
+                        .abs()
+                        > limit
+                })
+                && [p, n].contains(&col)
+            {
+                let chord = expected / voltage;
+                if r == col { chord } else { -chord }
+            } else {
+                physical
+            };
+            close(
+                "AC derivative",
+                linear.a.get(r, col),
+                expected_ac,
+                1e-13,
+                1e-18,
+            );
+            close(
+                "PZ derivative",
+                pencil.a.get(r, col),
+                expected_ac,
+                1e-13,
+                1e-18,
+            );
+            assert_eq!(pencil.e.get(r, col).to_bits(), 0_f64.to_bits());
         }
     }
     Ok(())
@@ -514,6 +526,72 @@ fn thermal_noise_matches_independent_measurements_including_gmin_and_hard_limit(
             // operating-point tolerances; compare the measured density.
             close(parameters, value.re, expected, 2e-6, 1e-18);
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn descending_hysteresis_and_zero_width_threshold_match_reference() -> TestResult {
+    let original = include_str!("fixtures/ltspice-switch/hysteresis-down.cir");
+    let normalized = original.replace(" SW(", " ltspice_switch(");
+    let netlist =
+        Parser::new().parse_deck(&parse_deck_text(Path::new("descending.cir"), &normalized))?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let plot = config
+        .plan_for(&netlist.analyses[0])?
+        .run(&mut config.circuit(&netlist)?, &config.context())?;
+    assert_eq!(plot.point_count(), 17);
+    for (index, line) in include_str!("fixtures/ltspice-switch/hysteresis-down.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .enumerate()
+    {
+        let values = line
+            .split_whitespace()
+            .map(str::parse::<f64>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let [control, v1, v2, v3, v4]: [f64; 5] =
+            values.try_into().map_err(|_| "reference row width")?;
+        close(
+            "control",
+            plot.value("v(c)", index).ok_or("missing control")?.re,
+            control,
+            0.,
+            1e-14,
+        );
+        for (name, expected) in [("i(v1)", v1), ("i(v2)", v2), ("i(v3)", v3), ("i(v4)", v4)] {
+            close(
+                name,
+                plot.value(name, index).ok_or("missing supply current")?.re,
+                expected,
+                5e-10,
+                5e-15,
+            );
+        }
+    }
+    let normalized = include_str!("fixtures/ltspice-switch/threshold-op.cir")
+        .replace(" SW(", " ltspice_switch(");
+    let netlist =
+        Parser::new().parse_deck(&parse_deck_text(Path::new("threshold.cir"), &normalized))?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let plot = config
+        .plan_for(&netlist.analyses[0])?
+        .run(&mut config.circuit(&netlist)?, &config.context())?;
+    for (name, expected) in [
+        ("i(v1)", -1.000001e-6),
+        ("i(v2)", -1.000000000001),
+        ("i(v3)", -1.000001e-6),
+        ("i(v4)", -1.000001e-6),
+        ("i(v5)", -1.000000000001),
+        ("i(v6)", -1.000001e-6),
+    ] {
+        close(
+            name,
+            plot.value(name, 0).ok_or("missing supply current")?.re,
+            expected,
+            5e-10,
+            5e-15,
+        );
     }
     Ok(())
 }

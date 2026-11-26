@@ -690,16 +690,9 @@ impl Switch {
         accepted: SwitchState,
         iterate: Option<SwitchState>,
     ) -> SpiceResult<SwitchState> {
-        if self.model.ltspice.is_some() && self.model.hysteresis == 0. {
-            return Ok(if control > self.model.threshold {
-                SwitchState::ReallyOn
-            } else {
-                SwitchState::ReallyOff
-            });
-        }
         // Select the state retained *inside* the band according to the
         // solver phase, independently of the physical control thresholds.
-        let positive = self.model.hysteresis > 0.;
+        let positive = self.model.hysteresis > 0. || self.model.ltspice.is_some();
         let inside = match phase {
             IterationPhase::Junction | IterationPhase::Fix => {
                 return Ok(self.flag_state(control));
@@ -861,7 +854,6 @@ impl Switch {
         match self.model.region(control) {
             BandRegion::Above => return Ok(true),
             BandRegion::Below => return Ok(false),
-            BandRegion::Inside if self.model.hysteresis == 0. => return Ok(false),
             BandRegion::Inside => {}
         }
         if let Some(states) = states {

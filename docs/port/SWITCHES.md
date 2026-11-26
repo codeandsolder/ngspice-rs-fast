@@ -178,12 +178,12 @@ signed-hysteresis state machine remains intact.
 
 | Parameter | Level 1 | Level 2 |
 | --- | --- | --- |
-| VT, VH | zero defaults; positive band retains accepted state, zero is on strictly above VT, negative is smooth | VT defaults zero, nonzero absolute VH required |
+| VT, VH | zero defaults; positive band retains accepted state, zero retains state at VT, on above and off below, negative is smooth | VT defaults zero, nonzero absolute VH required |
 | RON | 1 Ω | 1 Ω |
 | ROFF | 1/gmin | 10 MΩ |
 | ILIMIT | absent or zero means unlimited; symmetric hard clamp of absolute limit | absent or nonpositive means 10 A; tanh limiter |
 | VSER | signed series voltage, opposite direction uses off conductance | positive value enables one-way conduction, negative value alone has no effect |
-| ONEWAY, EPSILON | unsupported | direction towards first terminal; positive smoothing width (negative ignored) |
+| ONEWAY, EPSILON | unsupported | conduction from second terminal to first; positive smoothing width (negative ignored) |
 | LSER | nonnegative transient series inductance | unsupported |
 
 Resistances must be finite and positive; signed current limits follow the measured rules above.
