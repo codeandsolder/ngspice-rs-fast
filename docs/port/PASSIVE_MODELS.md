@@ -211,7 +211,9 @@ After the electrical artifacts have been materialized, parse the primary
 artifact with `Parser::parse_file_with_output`, then call
 `PreparedInitialConditions::attach(&mut parsed.netlist, bundle_directory,
 initial_conditions)`. The artifact directory is the emitted bundle root,
-not the original source directory. Do not discard the typed sidecar or
+not the original source directory. When the producer supplies a separate
+typed analysis plan, use `attach_for_analyses` with the selected native
+job kinds and UIC flags before elaborating the circuit. Do not discard the typed sidecar or
 serialize it into native IC syntax. The native writer refuses to serialize
 a deck with attached prepared initialization metadata.
 
