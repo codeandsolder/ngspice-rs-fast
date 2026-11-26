@@ -148,6 +148,25 @@ impl EvalBudget {
         }
     }
 
+    /// Charge a prepared scalar expression against the same aggregate
+    /// expansion budget, using source bytes as an upper bound on syntax nodes.
+    pub(crate) fn charge_prepared(
+        &mut self,
+        bytes: usize,
+        location: &SourceLoc,
+    ) -> SpiceResult<()> {
+        self.nodes = self.nodes.checked_add(bytes).ok_or_else(|| {
+            SpiceError::parse(location.clone(), "prepared expression work budget overflow")
+        })?;
+        if self.nodes > self.limits.nodes {
+            return Err(SpiceError::parse(
+                location.clone(),
+                "prepared expression work budget exceeded",
+            ));
+        }
+        Ok(())
+    }
+
     /// Expression nodes evaluated so far.
     #[must_use = "the count records work consumed by expression evaluation"]
     pub const fn nodes_used(&self) -> usize {
@@ -996,6 +1015,49 @@ impl ParamScope {
             budget,
         )
         .map_err(Failure::into_error)
+    }
+
+    /// Evaluate a source-defined function with arguments already resolved by
+    /// the prepared expression evaluator. Reuse native lexical function
+    /// lookup, recursion checks and call-site bindings without re-parsing or
+    /// rounding the supplied numeric arguments.
+    pub(crate) fn evaluate_prepared_call(
+        &self,
+        name: &str,
+        values: &[Real],
+        location: &SourceLoc,
+        lookup: impl Fn(&str) -> Option<Real>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Real> {
+        let span = crate::netlist::expr::SourceSpan {
+            start: location.clone(),
+            end: location.clone(),
+            logical: 0..0,
+        };
+        let arguments = values
+            .iter()
+            .map(|&value| Expr {
+                kind: ExprKind::Number {
+                    value,
+                    spelling: value.to_string(),
+                },
+                span: span.clone(),
+            })
+            .collect();
+        let expression = ParameterExpression {
+            text: name.to_owned(),
+            braced: false,
+            quoted: false,
+            span: span.clone(),
+            root: Expr {
+                kind: ExprKind::UserCall {
+                    name: name.to_ascii_lowercase(),
+                    arguments,
+                },
+                span,
+            },
+        };
+        self.evaluate_with(&expression, lookup, budget)
     }
 
     /// Evaluate a site expression against this scope, drawing on `budget`.

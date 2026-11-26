@@ -795,6 +795,7 @@ impl Switch {
         self.terminals
             .get(4)
             .map(|&internal| crate::devices::rlc::ReactiveLoad {
+                bias: None,
                 name: &self.name,
                 terminals: [self.terminals[0], internal],
                 value: self.model.series_inductance,

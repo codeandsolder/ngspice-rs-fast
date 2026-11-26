@@ -174,6 +174,12 @@ pub fn write_netlist_to(
     sink: &mut dyn Write,
     limits: WriteLimits,
 ) -> SpiceResult<()> {
+    if netlist.prepared_initialization.is_some() {
+        return Err(refuse(
+            "prepared initial conditions require their typed metadata, not native deck serialization",
+            Some(&netlist.location),
+        ));
+    }
     if netlist.title.contains(['\n', '\r']) || netlist.title != netlist.title.trim_end() {
         return Err(refuse(
             "the title must be one line without trailing whitespace",

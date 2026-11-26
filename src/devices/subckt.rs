@@ -86,6 +86,8 @@ impl Default for SubcircuitLimits {
 /// A deck with every `X` instance replaced by its definition's body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpandedNetlist {
+    /// Source-prepared, occurrence-bound passive initialization equations.
+    pub prepared_initialization: crate::netlist::prepared_initialization::BoundInitializations,
     /// Top-level devices in deck order, `X` instances expanded in place.
     pub devices: Vec<DeviceInstance>,
     /// Explicit prepared forcing resolved in each flattened instance scope.
@@ -206,11 +208,14 @@ fn expand_with_prepared_output(
     if netlist.cards.is_empty() {
         hoisted_fourier.extend_from_slice(fourier);
     }
+    let mut budget = EvalBudget::default();
+    let binder = crate::netlist::prepared_initialization::Binder::new(netlist, root, &mut budget)?;
     let mut expander = Expander {
+        binder,
         netlist,
         definitions,
         limits,
-        budget: EvalBudget::default(),
+        budget,
         devices: Vec::new(),
         waveforms,
         prepared_waveforms: Vec::new(),
@@ -234,6 +239,7 @@ fn expand_with_prepared_output(
     };
     let mut locals = vec![expander.root_models(root)];
     let directives = Directives {
+        lexical_scope: &[],
         devices: &netlist.devices,
         definition: "",
         sequence: &sequence,
@@ -248,6 +254,9 @@ fn expand_with_prepared_output(
         &expander.binned_bases,
     )?;
     Ok(ExpandedNetlist {
+        prepared_initialization: expander
+            .binder
+            .map_or_else(Default::default, |binder| binder.bound),
         devices: expander.devices,
         prepared_waveforms: expander.prepared_waveforms,
         models: expander.models,
@@ -375,6 +384,9 @@ struct Frontend {
 }
 
 struct Directives<'a> {
+    /// Declaration identity, not the chain of invoking X instances. The
+    /// current native definition index contains root lexical definitions.
+    lexical_scope: &'a [String],
     devices: &'a [DeviceInstance],
     definition: &'a str,
     sequence: &'a [ExpansionItem<'a>],
@@ -484,6 +496,7 @@ struct DefinitionPlan<'a> {
 }
 
 struct Expander<'a> {
+    binder: Option<crate::netlist::prepared_initialization::Binder<'a>>,
     netlist: &'a Netlist,
     definitions: BTreeMap<String, &'a Subcircuit>,
     limits: SubcircuitLimits,
@@ -854,6 +867,14 @@ impl<'a> Expander<'a> {
         locals: &mut Vec<DeclarationIndex<LocalModel>>,
         directives: &Directives<'_>,
     ) -> SpiceResult<()> {
+        if let Some(binder) = &mut self.binder {
+            binder.nodes(
+                directives.lexical_scope,
+                scope,
+                |node| rewrite_node(&self.global_nodes, node, terminals, path),
+                &mut self.budget,
+            )?;
+        }
         let devices = directives.devices;
         for &item in directives.sequence {
             let index = match item {
@@ -902,48 +923,67 @@ impl<'a> Expander<'a> {
                 ));
             }
             self.rewrite_model(&mut instance, scope, locals)?;
-            // F/H controlling sources are translated like instance names
-            // (`translate()` calls `translate_inst_name` for them), so they
-            // always name a device of the same instance.
-            for parameter in &mut instance.parameters {
-                if let ParameterKind::Behavioural(expression) = &mut parameter.kind {
-                    // Node and source names inside a behavioural expression are
-                    // translated like the card's own (C expands the B line
-                    // text, `translate()` renaming v(...)/i(...) operands).
-                    expression.root.visit_mut(&mut |node| match &mut node.kind {
-                        BExprKind::Voltage { positive, negative } => {
-                            *positive = self.rewrite_node(positive, terminals, path);
-                            if let Some(negative) = negative {
-                                *negative = self.rewrite_node(negative, terminals, path);
-                            }
-                        }
-                        BExprKind::Current(source) => {
-                            let designator = source
-                                .chars()
-                                .next()
-                                .unwrap_or_default()
-                                .to_ascii_lowercase();
-                            *source = device_name(source, designator, path);
-                        }
-                        _ => {}
-                    });
-                    continue;
-                }
-                if parameter.kind == ParameterKind::Instance {
-                    let designator = parameter
-                        .value
-                        .chars()
-                        .next()
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    parameter.value = device_name(&parameter.value, designator, path);
-                }
-            }
+            self.rewrite_parameter_references(&mut instance, terminals, path);
             instance.name = device_name(&instance.name, instance.designator, path);
             self.bind_prepared_waveform(original, directives.definition, &instance, scope)?;
+            if let Some(binder) = &mut self.binder {
+                binder.device(
+                    original,
+                    &instance.name,
+                    directives.lexical_scope,
+                    scope,
+                    &mut self.budget,
+                )?;
+            }
             self.devices.push(instance);
         }
         Ok(())
+    }
+
+    /// Rewrite instance-local device and node references in parameters.
+    fn rewrite_parameter_references(
+        &self,
+        instance: &mut DeviceInstance,
+        terminals: &BTreeMap<String, String>,
+        path: &str,
+    ) {
+        // F/H controlling sources are translated like instance names
+        // (`translate()` calls `translate_inst_name` for them), so they
+        // always name a device of the same instance.
+        for parameter in &mut instance.parameters {
+            if let ParameterKind::Behavioural(expression) = &mut parameter.kind {
+                // Node and source names inside a behavioural expression are
+                // translated like the card's own (C expands the B line
+                // text, `translate()` renaming v(...)/i(...) operands).
+                expression.root.visit_mut(&mut |node| match &mut node.kind {
+                    BExprKind::Voltage { positive, negative } => {
+                        *positive = self.rewrite_node(positive, terminals, path);
+                        if let Some(negative) = negative {
+                            *negative = self.rewrite_node(negative, terminals, path);
+                        }
+                    }
+                    BExprKind::Current(source) => {
+                        let designator = source
+                            .chars()
+                            .next()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        *source = device_name(source, designator, path);
+                    }
+                    _ => {}
+                });
+                continue;
+            }
+            if parameter.kind == ParameterKind::Instance {
+                let designator = parameter
+                    .value
+                    .chars()
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                parameter.value = device_name(&parameter.value, designator, path);
+            }
+        }
     }
 
     /// Bind a resolved waveform to the flattened source occurrence.
@@ -1056,6 +1096,7 @@ impl<'a> Expander<'a> {
             &scope,
             locals,
             &Directives {
+                lexical_scope: std::slice::from_ref(&definition.name),
                 devices: &body.devices,
                 definition: &definition.name,
                 sequence: &plan.sequence,
@@ -1173,16 +1214,7 @@ impl<'a> Expander<'a> {
     /// terminal is replaced by the actual node it was bound to; anything else is
     /// prefixed with the instance path.
     fn rewrite_node(&self, name: &str, terminals: &BTreeMap<String, String>, path: &str) -> String {
-        if self.global_nodes.contains(&name.to_ascii_lowercase()) {
-            return name.to_owned();
-        }
-        if let Some(actual) = terminals.get(name) {
-            return actual.clone();
-        }
-        if path.is_empty() {
-            return name.to_owned();
-        }
-        format!("{path}.{name}")
+        rewrite_node(&self.global_nodes, name, terminals, path)
     }
 
     /// Rewrite one model reference to the flattened name of the declaration it
@@ -1323,6 +1355,24 @@ fn occurrence_suffix(site: crate::netlist::eval::statistics::PreparedSite) -> St
         suffix.push(char::from(HEX[usize::from(byte & 15)]));
     }
     suffix
+}
+
+fn rewrite_node(
+    global_nodes: &BTreeSet<String>,
+    name: &str,
+    terminals: &BTreeMap<String, String>,
+    path: &str,
+) -> String {
+    if global_nodes.contains(&name.to_ascii_lowercase()) {
+        return name.to_owned();
+    }
+    if let Some(actual) = terminals.get(name) {
+        return actual.clone();
+    }
+    if path.is_empty() {
+        return name.to_owned();
+    }
+    format!("{path}.{name}")
 }
 
 /// `translate_inst_name`: the designator prefix is not repeated for an `X`.

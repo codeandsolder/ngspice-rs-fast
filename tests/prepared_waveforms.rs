@@ -282,7 +282,7 @@ fn explicit_root_candidate_rebinds_without_changing_source_rows_or_ac() {
             "candidate witness\n.param height=1\nV1 a 0 DC 0 AC 2 90\nR1 a 0 1k\n.end\n",
         ))
         .unwrap();
-    let declarations = [PreparedWaveform {
+    let mut declarations = [PreparedWaveform {
         artifact: "deck.cir".into(),
         scope: Vec::new(),
         source: "v1".into(),
@@ -297,7 +297,8 @@ fn explicit_root_candidate_rebinds_without_changing_source_rows_or_ac() {
         dc_override: None,
         idle_in_pop: "0".into(),
     }];
-    for height in [1., 3., -2.] {
+    for (height, dc_override) in [(1., None), (3., Some(7.)), (-2., Some(0.))] {
+        declarations[0].dc_override = dc_override.map(|value: f64| value.to_string());
         let scope = ParamScope::resolve_instance(
             None,
             &[ParamBinding {
@@ -323,7 +324,7 @@ fn explicit_root_candidate_rebinds_without_changing_source_rows_or_ac() {
             panic!("one independent source expected")
         };
         assert_eq!(source.name.as_str(), "v1");
-        close(source.dc, height, 0.);
+        close(source.dc, dc_override.unwrap_or(height), 0.);
         close(source.waveform.value_at(0., Limit::Left).unwrap(), 0., 0.);
         close(
             source.waveform.value_at(0., Limit::Right).unwrap(),
@@ -332,6 +333,17 @@ fn explicit_root_candidate_rebinds_without_changing_source_rows_or_ac() {
         );
         close(source.ac.re, 0., 1e-14);
         close(source.ac.im, 2., 1e-14);
+        let op =
+            AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+                .resolve()
+                .unwrap()
+                .run(&mut circuit, &Default::default())
+                .unwrap();
+        close(
+            op.value("v(a)", 0).unwrap().re,
+            dc_override.unwrap_or(height),
+            1e-12,
+        );
         let plan = AnalysisInput::with_arguments(AnalysisKind::Transient, ["10u", "100u"])
             .resolve()
             .unwrap();

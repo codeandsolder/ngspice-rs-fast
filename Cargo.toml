@@ -114,6 +114,7 @@ model-kernel-diode = { git = "https://github.com/codeandsolder/ngspice-rs-prepro
 model-preprocess-command = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "fd55b8255bf2a49f3f2fe784b718e512c66340fa" }
 model-statistics = { git = "https://github.com/codeandsolder/ngspice-rs-preprocess.git", rev = "fd55b8255bf2a49f3f2fe784b718e512c66340fa" }
 sha2 = "0.11"
+anyhow = "1"
 
 [dev-dependencies]
 ngspice-conformance = { path = "conformance/support" }
