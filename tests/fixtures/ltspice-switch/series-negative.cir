@@ -1,0 +1,10 @@
+Series inductance step response
+.options reltol=1e-9 abstol=1e-14 plotwinsize=0
+Vin p 0 pulse(0 1 10u 1n 1n 1m 2m)
+Vc c 0 2
+S1 p 0 c 0 m1
+S2 p 0 c 0 m2
+.model m1 SW(ron=10 roff=1k vt=0 vh=0 lser=-1m)
+.model m2 SW(ron=10 roff=1k vt=0 vh=0)
+.tran 0 500u 0 1u
+.end
