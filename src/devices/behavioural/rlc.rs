@@ -394,6 +394,14 @@ impl Device for Passive {
     fn depends_on_frequency(&self) -> bool {
         self.expression.depends_on_frequency()
     }
+    fn physical_terminal_current(&self, _states: &[Real], branches: &[Real]) -> Option<Real> {
+        if self.law == Law::Derivative {
+            None
+        } else {
+            branches.first().copied()
+        }
+    }
+
     fn state_count(&self) -> usize {
         if self.law.storage() { 2 } else { 0 }
     }

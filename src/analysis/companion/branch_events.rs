@@ -89,6 +89,26 @@ impl Driver<'_> {
         }
     }
 
+    /// If the endpoint's backward germ predicts a hidden interior root,
+    /// inspect that time before accepting two identical region signatures.
+    pub(super) fn backward_branch_probe(
+        &self,
+        start: StepClock,
+        attempt: &AttemptedStep,
+        point: &TrialPoint,
+    ) -> Option<Real> {
+        let end = attempt.clock.time;
+        let offset = point.guards.predicted_backward_offset(
+            end - start.time,
+            self.timing.step(),
+            attempt.event_start.is_some(),
+        )?;
+        let at = end - offset;
+        // Adjacent floating-point endpoint roots are already covered by
+        // the endpoint germ comparison. Avoid an endless probe loop.
+        (at > start.time.next_up() && at < end.next_down()).then_some(at)
+    }
+
     pub(super) fn branch_probe_step(
         start: StepClock,
         original: &AttemptedStep,

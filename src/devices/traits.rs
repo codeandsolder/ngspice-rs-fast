@@ -945,6 +945,13 @@ pub trait Device: fmt::Debug + std::any::Any {
     ) -> SpiceResult<Option<Real>> {
         Ok(None)
     }
+    /// Physical two-terminal current retained by a converged derivative
+    /// array. Returning a value avoids scalar evaluation at a branch event.
+    /// The default leaves the existing isolated observation load in use.
+    fn physical_terminal_current(&self, _states: &[Real], _branches: &[Real]) -> Option<Real> {
+        None
+    }
+
     /// Factor applied to this device's observed terminal currents: `-1` for
     /// devices whose C ask reports polarity-normalized currents for the
     /// p-type variant (`jfetask.c`), `1` (the default) otherwise.

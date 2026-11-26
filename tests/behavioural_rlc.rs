@@ -1126,3 +1126,128 @@ fn wide_parallel_derivative_constraints_do_not_lose_physical_rank() -> SpiceResu
     }
     Ok(())
 }
+
+#[test]
+fn behavioural_step_inside_derivative_requires_impulse() {
+    for method in ["method=trap", "method=gear"] {
+        for input in [
+            "u(time-10u)",
+            "floor(time/10u)",
+            "sgn(time-10u)",
+            "(time<10u ? 0 : 1)",
+            "u((time-10.2u)*(time-10.25u))",
+            "1u*ddt(abs(time/1u-10))",
+        ] {
+            let body =
+                format!("b1 out 0 v=1u*ddt({input})\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n");
+            let error = run(
+                &body,
+                AnalysisKind::Transient,
+                &["1u", "25u", "0", "1u", "uic", method],
+            )
+            .expect_err("a jump in a derived storage coordinate requires an impulse")
+            .to_string();
+            assert!(
+                error.contains("derivative input jumps"),
+                "{input} ({method}): {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compiled_behavioural_corner_uses_right_germ_and_preserves_storage() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let body = "bdrive x 0 v=time/1u\nrdrive x 0 1k\nbv out 0 v=1u*ddt(abs(v(x)-10))\nbi other 0 v=1u*ddt(abs(1000*i(bdrive)+10))\nrout out 0 1k\nrother other 0 1k\nrcap cap 0 1k\nccap cap 0 1n ic=1\n.options reltol=1e-8 vntol=1n";
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "15u", "0", "1u", "uic", method],
+        )?;
+        let mut seen = false;
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            let at_corner = (t - 10e-6).abs() <= 1e-18;
+            seen |= at_corner;
+            let expected = if t < 10e-6 && !at_corner { -1. } else { 1. };
+            for name in ["v(out)", "v(other)"] {
+                close(plot.value(name, index).unwrap().re, expected, 1e-7);
+            }
+            close(
+                plot.value("v(cap)", index).unwrap().re,
+                (-t / 1e-6).exp(),
+                2e-6,
+            );
+        }
+        assert!(seen, "missing localized behavioural event");
+    }
+    Ok(())
+}
+
+#[test]
+fn behavioural_lazy_branch_and_boundary_observation_use_physical_value() -> SpiceResult<()> {
+    // The isolated scalar equality branch is not part of either
+    // one-sided physical germ. Evaluating it would take sqrt(-1).
+    let body = "bguard x 0 i=(time==10u ? sqrt(-1) : abs(time/1u-10))\nrguard x 0 1\nb1 out 0 v=1u*ddt(-v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "15u", "0", "1u", "uic", method],
+            &["@bguard[i]"],
+        )?;
+        let mut seen = false;
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            let at_corner = (t - 10e-6).abs() <= 1e-18;
+            seen |= at_corner;
+            close(
+                plot.value("@bguard[i]", index).unwrap().re,
+                (t / 1e-6 - 10.).abs(),
+                1e-7,
+            );
+            close(
+                plot.value("v(out)", index).unwrap().re,
+                if t < 10e-6 && !at_corner { -1. } else { 1. },
+                1e-7,
+            );
+        }
+        assert!(seen);
+    }
+    Ok(())
+}
+
+#[test]
+fn behavioural_two_corners_within_one_requested_step() -> SpiceResult<()> {
+    let body = "b1 out 0 v=1u*ddt(max(0,min((time-10.2u)/1u,(10.3u-time)/1u)))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "15u", "0", "1u", "uic", method],
+        )?;
+        let mut seen = [false; 3];
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            let boundaries = [10.2e-6, 10.25e-6, 10.3e-6];
+            for (at, flag) in boundaries.into_iter().zip(&mut seen) {
+                *flag |= (t - at).abs() <= 1e-18;
+            }
+            // Ignore a few ulps around knots in this slope comparison;
+            // the preceding assertion still demands all three landings.
+            if boundaries.into_iter().any(|at| (t - at).abs() <= 1e-18) {
+                continue;
+            }
+            let expected = if (boundaries[0]..boundaries[1]).contains(&t) {
+                1.
+            } else if (boundaries[1]..boundaries[2]).contains(&t) {
+                -1.
+            } else {
+                0.
+            };
+            close(plot.value("v(out)", index).unwrap().re, expected, 1e-7);
+        }
+        assert_eq!(seen, [true; 3]);
+    }
+    Ok(())
+}

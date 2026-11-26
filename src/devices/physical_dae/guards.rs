@@ -55,13 +55,18 @@ impl LocalGuard {
         }
     }
 
-    fn predicted_root(&self, horizon: Real) -> Option<Real> {
+    fn predicted_root(&self, horizon: Real, reverse: bool) -> Option<Real> {
         self.boundaries
             .iter()
             .flatten()
             .filter_map(|&boundary| {
                 let mut coefficients = self.argument.coefficients().to_vec();
                 coefficients[0] -= boundary;
+                if reverse {
+                    for coefficient in coefficients.iter_mut().skip(1).step_by(2) {
+                        *coefficient = -*coefficient;
+                    }
+                }
                 first_root(&coefficients, horizon)
             })
             .min_by(Real::total_cmp)
@@ -136,11 +141,24 @@ impl BranchTrace {
     /// Earliest possible root of the local Taylor approximations, in seconds.
     /// The time scale is the one used to normalize the derivative array.
     pub(crate) fn predicted_offset(&self, duration: Real, scale: Real) -> Option<Real> {
+        self.root_offset(duration, scale, false)
+    }
+
+    pub(crate) fn predicted_backward_offset(
+        &self,
+        duration: Real,
+        scale: Real,
+        already_left: bool,
+    ) -> Option<Real> {
+        self.root_offset(duration, scale, !already_left)
+    }
+
+    fn root_offset(&self, duration: Real, scale: Real, reverse: bool) -> Option<Real> {
         let horizon = duration / scale;
         self.guards
             .iter()
             .filter_map(|guard| {
-                let offset = guard.local.predicted_root(horizon)? * scale;
+                let offset = guard.local.predicted_root(horizon, reverse)? * scale;
                 (offset.is_finite() && offset > 0. && offset <= duration).then_some(offset)
             })
             .min_by(Real::total_cmp)

@@ -474,6 +474,13 @@ impl Device for Behavioural {
         crate::devices::setup::CDeviceType::Asrc
     }
 
+    fn physical_terminal_current(&self, states: &[Real], branches: &[Real]) -> Option<Real> {
+        match self.output {
+            BehaviouralOutput::Voltage => branches.first().copied(),
+            BehaviouralOutput::Current => states.first().copied(),
+        }
+    }
+
     /// One trial slot: the physical output at the last load.
     fn state_count(&self) -> usize {
         1

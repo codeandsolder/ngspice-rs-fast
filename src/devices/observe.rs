@@ -246,6 +246,32 @@ impl PointLoads<'_, '_> {
             crate::devices::AnalysisMode::Instantaneous { .. }
         ) {
             let device = self.point.device(self.circuit, layout.device);
+            let states = self
+                .circuit
+                .state_rows(layout.device)
+                .ok_or_else(|| gap(name))?;
+            let branches = self
+                .circuit
+                .branch_rows(layout.device)
+                .ok_or_else(|| gap(name))?;
+            let values = self
+                .previous
+                .map(TrialState::values)
+                .or_else(|| self.request.history.accepted(1))
+                .and_then(|values| values.get(states))
+                .ok_or_else(|| gap(name))?;
+            let branches = self
+                .request
+                .solution
+                .as_slice()
+                .get(branches)
+                .ok_or_else(|| gap(name))?;
+            if let [pos, neg] = layout.ports.as_slice()
+                && let Some(current) = device.physical_terminal_current(values, branches)
+            {
+                return Ok(if *pos == slot { current } else { 0. }
+                    - if *neg == slot { current } else { 0. });
+            }
             if let Some(storage) = device
                 .storage_element(self.request.model_context)
                 .transpose()?

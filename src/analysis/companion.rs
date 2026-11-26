@@ -1657,6 +1657,17 @@ impl Driver<'_> {
                             iterate = seed.clone();
                             self.stats.rejected += 1;
                             continue;
+                        } else if let Some(at) =
+                            self.backward_branch_probe(accepted_clock, &attempt, &point)
+                        {
+                            drop(prepared);
+                            ready = Self::branch_probe_step(accepted_clock, &attempt, at);
+                            iterate = accepted_seed
+                                .as_ref()
+                                .ok_or_else(|| failure("missing accepted branch seed"))?
+                                .clone();
+                            self.stats.rejected += 1;
+                            continue;
                         }
                     }
                     let TrialPoint { x, state, guards } = point;
