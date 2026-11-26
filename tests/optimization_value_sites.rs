@@ -306,3 +306,23 @@ fn waveform_candidate_sites_rebuild_and_restore_immutable_forcing() {
         2.
     );
 }
+
+#[test]
+fn conditional_macro_parameter_sites_restore_after_branch_switch() {
+    let source = deck(
+        ".param x=1 y=3 z=5\n.func pick(c,a,b) {ternary_fcn(c,a,b)}\n\
+         v1 in 0 1\nr1 in 0 {1000+pick(x,y,z)}",
+    );
+    let plan = CircuitParameterPlan::new(source, &["x", "y", "z"]).unwrap();
+    let mut session = plan.session().unwrap();
+    assert_eq!(plan.sites().len(), 1);
+    assert_eq!(plan.sites()[0].inputs(), &[0, 1, 2]);
+    for (values, expected) in [
+        ([1., 3., 5.], 1003.),
+        ([0., 7., 11.], 1011.),
+        ([1., 3., 5.], 1003.),
+    ] {
+        session.update(&values, &mut EvalBudget::default()).unwrap();
+        assert_eq!(session.site_value(0), Some(expected));
+    }
+}

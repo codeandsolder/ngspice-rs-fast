@@ -176,3 +176,60 @@ fn every_function_value_and_valid_derivative_matches_live_c() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+const PHASE_MACROS: &str = "Native phase-aware macros\n\
+    .func choose(c,a,b) {ternary_fcn(c>0.5,a,b)}\n\
+    .func shape(x) {choose(x,2*x+3,-x+1)}\n\
+    .func compare(a,b,c) {a==b<c}\n\
+    .func clip(x) {ternary_fcn(x<-1,-1,ternary_fcn(x>1,1,x))}\n\
+    .param scalar={compare(2,3,1)}\n\
+    b1 y 0 v=shape(v(x))\n\
+    b2 z 0 v=compare(2,3,1)\n\
+    b3 q 0 v=clip(v(x))\n\
+    v2 ref 0 {scalar}\n\
+    r1 y 0 1k\nr2 z 0 1k\nr3 q 0 1k\n";
+
+#[test]
+#[ignore = "requires NGSPICE_BIN; run with -- --ignored"]
+fn phase_correct_nested_macros_match_native_op_dc_ac_and_transient() {
+    let deck = format!("{PHASE_MACROS}v1 x 0 dc 0.75 ac 1\n");
+    for analysis in ["op", "dc v1 -1.375 1.375 0.25", "ac lin 1 1k 1k"] {
+        let c = run_c(analysis, &deck, analysis);
+        let rust = run_rust(&deck, analysis);
+        assert_eq!(c.point_count(), rust.point_count(), "{analysis}");
+        for point in 0..c.point_count() {
+            for name in ["v(y)", "v(z)", "v(q)", "v(ref)"] {
+                let ours = rust.value(name, point).unwrap();
+                let theirs = c.value(name, point).unwrap();
+                assert!(
+                    (ours - theirs).magnitude() <= 1e-10,
+                    "{analysis}, point {point}, {name}: Rust {ours:?}, C {theirs:?}"
+                );
+            }
+        }
+    }
+
+    // Transient time grids need not coincide. The same independent affine
+    // input is used for both, on a region with no branch discontinuity.
+    let deck = format!("{PHASE_MACROS}v1 x 0 pwl(0 0.6 1m 0.9)\n");
+    let analysis = "tran 10u 1m";
+    for plot in [run_c(analysis, &deck, analysis), run_rust(&deck, analysis)] {
+        assert!(plot.point_count() > 50);
+        for point in 0..plot.point_count() {
+            let time = plot.value("time", point).unwrap().re;
+            let x = 0.6 + 300.0 * time;
+            for (name, expected) in [
+                ("v(y)", 2.0 * x + 3.0),
+                ("v(z)", 0.0),
+                ("v(q)", x),
+                ("v(ref)", 1.0),
+            ] {
+                let actual = plot.value(name, point).unwrap().re;
+                assert!(
+                    (actual - expected).abs() <= 1e-9,
+                    "{name} {time}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+}

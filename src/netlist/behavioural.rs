@@ -41,7 +41,7 @@ use crate::netlist::bexpr::{
 use crate::netlist::elaborate::format_literal;
 use crate::netlist::eval::{EvalBudget, FunctionDef, FunctionScope, ParamScope};
 use crate::netlist::expr::{
-    BinaryOp, Expr, ExprKind, MAX_TREE_DEPTH, MAX_TREE_NODES, SourceSpan, TreeBudget, UnaryOp,
+    BinaryOp, Expr, ExprKind, MAX_TREE_NODES, SourceSpan, TreeBudget, UnaryOp,
 };
 
 mod edits;
@@ -475,6 +475,7 @@ pub fn resolve_expression(
         expansion_budget: TreeBudget::new(MAX_TREE_NODES),
     };
     let root = resolver.resolve(&expression.root, 1, None)?;
+    root.check_tree(1, &mut TreeBudget::new(MAX_TREE_NODES))?;
     Ok(BehaviouralExpression {
         text: expression.text.clone(),
         span: expression.span.clone(),
@@ -518,7 +519,9 @@ fn expand_symbolic(
         syntax_only: true,
         expansion_budget: TreeBudget::new(MAX_TREE_NODES),
     };
-    resolver.resolve(&expression.root, 1, None)
+    let root = resolver.resolve(&expression.root, 1, None)?;
+    root.check_tree(1, &mut TreeBudget::new(MAX_TREE_NODES))?;
+    Ok(root)
 }
 
 /// Inspect the top-level laws *after* the same controlled-source lowering
@@ -899,7 +902,12 @@ impl Resolver<'_> {
                 self.budget,
                 &self.sampler,
             )?),
-            BExprKind::Value(_) => expr.kind.clone(),
+            BExprKind::Value(value) => {
+                value
+                    .root
+                    .check_tree(depth + 1, &mut self.expansion_budget)?;
+                expr.kind.clone()
+            }
             BExprKind::Table(table) => {
                 let input = self.resolve(&table.input, depth + 1, frame)?;
                 let mut points = Vec::with_capacity(table.points.len());
