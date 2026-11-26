@@ -86,8 +86,35 @@ pub(super) struct Hints {
 /// A node that is not part of the circuit (C: warning "IC on non-existent node
 /// ... ignored") or that is ground.
 pub(super) fn resolve(circuit: &Circuit, request: &AnalysisPlan) -> SpiceResult<Hints> {
+    let mut initial = bind(circuit, request.initial_conditions(), ".ic")?;
+    if request.uic() {
+        // Prepared source node hints are not native .ic forcing rows.
+        // They participate only in differential UIC initialization.
+        let mut by_row: BTreeMap<_, _> = initial.into_iter().map(|hint| (hint.row, hint)).collect();
+        for (node, policy) in circuit.prepared_node_hints() {
+            let row = circuit
+                .unknowns()
+                .checked_node_row(node)?
+                .ok_or_else(|| failure("prepared node hint has no physical row"))?;
+            let (value, location) = policy.hint();
+            let name = circuit
+                .nodes()
+                .node(node)
+                .ok_or_else(|| failure("prepared node hint has no node identity"))?;
+            by_row.insert(
+                row,
+                RowHint {
+                    row,
+                    node: name.name.clone(),
+                    value,
+                    location: location.clone(),
+                },
+            );
+        }
+        initial = by_row.into_values().collect();
+    }
     Ok(Hints {
-        initial: bind(circuit, request.initial_conditions(), ".ic")?,
+        initial,
         nodesets: bind(circuit, request.nodesets(), ".nodeset")?,
     })
 }

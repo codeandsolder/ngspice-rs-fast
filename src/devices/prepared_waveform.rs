@@ -59,8 +59,8 @@ impl PreparedForcing {
     /// # Errors
     /// Invalid ordinates, geometry, period, or sine coefficients.
     pub fn new(resolved: ResolvedWaveform) -> SpiceResult<Self> {
-        if !resolved.dc.is_finite() {
-            return Err(invalid("nonfinite DC bias"));
+        if !resolved.dc.is_finite() || !resolved.startup.is_finite() {
+            return Err(invalid("nonfinite DC bias or transient startup"));
         }
         let law = match resolved.forcing {
             Forcing::PiecewiseLinear { knots, repeat } => Law::Pwl(SidedPwl::new(knots, repeat)?),
