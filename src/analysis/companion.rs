@@ -667,6 +667,15 @@ struct CandidateOutput {
     periodic_boundary: Option<Box<PeriodicBoundary>>,
 }
 
+/// Converged point with all fallible observations and mixed-domain
+/// preparation complete, ready to publish after releasing trial borrows.
+struct AcceptedCandidate {
+    output: CandidateOutput,
+    mixed: Option<super::digital::MixedPoint>,
+    solution: Vector,
+    state: TrialState,
+}
+
 struct AcceptedPoint {
     cursor: AcceptedCursor,
     solution: Vector,
@@ -1665,8 +1674,8 @@ impl Driver<'_> {
     fn check_step_budget(&self, time: Real) -> SpiceResult<()> {
         if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
             return Err(failure(format!(
-                "work limit of {} accepted + rejected steps reached at t = {:e}",
-                self.settings.max_steps, time
+                "work limit of {} accepted + rejected steps reached at t = {time:e}",
+                self.settings.max_steps
             )));
         }
         Ok(())
@@ -1754,48 +1763,79 @@ impl Driver<'_> {
                             ready = attempt.retry(next, min_step)?;
                         }
                         StepDecision::Accept(mut next) => {
-                            let event = self.crosses_physical_event(&attempt);
-                            let (x, state) = if event {
-                                next.order = Order::One;
-                                self.derivative_event(&attempt, &x, &state)?
-                            } else {
-                                (x, state)
-                            };
-                            let mixed_point =
-                                self.prepare_mixed_point(&x, attempt.clock.time, preview)?;
-                            let CandidateOutput {
-                                observed,
-                                periodic_boundary,
-                            } = self.candidate_output(
+                            let candidate = self.prepare_accepted_candidate(
                                 &attempt,
                                 &mut prepared,
-                                &x,
-                                &state,
+                                (x, state),
                                 &output,
+                                preview,
+                                &mut next,
                             )?;
                             // Release immutable history before publication.
                             drop(prepared);
-                            let device_breaks =
-                                self.commit_point(Acceptance::Step(&attempt), &x, state)?;
-                            self.commit_mixed_point(mixed_point);
-                            self.stats.device_event_landings +=
-                                usize::from(device_boundary == Some(attempt.clock.time));
-                            if event {
-                                self.history.restart_integration()?;
-                                self.steps.clear();
-                            }
-                            return Ok(AcceptedPoint {
-                                cursor: attempt.accept(next),
-                                solution: x,
-                                observed,
-                                device_breaks,
-                                periodic_boundary,
-                            });
+                            return self.commit_candidate(
+                                attempt,
+                                next,
+                                candidate,
+                                device_boundary,
+                            );
                         }
                     }
                 }
             }
         }
+    }
+
+    fn prepare_accepted_candidate(
+        &self,
+        attempt: &AttemptedStep,
+        prepared: &mut crate::devices::circuit::PreparedTransient<'_>,
+        (x, state): (Vector, TrialState),
+        output: &OutputSelection<'_>,
+        preview: Option<super::digital::EventPreview>,
+        next: &mut NextStep,
+    ) -> SpiceResult<AcceptedCandidate> {
+        let (x, state) = if self.crosses_physical_event(attempt) {
+            next.order = Order::One;
+            self.derivative_event(attempt, &x, &state)?
+        } else {
+            (x, state)
+        };
+        Ok(AcceptedCandidate {
+            mixed: self.prepare_mixed_point(&x, attempt.clock.time, preview)?,
+            output: self.candidate_output(attempt, prepared, &x, &state, output)?,
+            solution: x,
+            state,
+        })
+    }
+
+    fn commit_candidate(
+        &mut self,
+        attempt: AttemptedStep,
+        next: NextStep,
+        candidate: AcceptedCandidate,
+        device_boundary: Option<Real>,
+    ) -> SpiceResult<AcceptedPoint> {
+        let event = self.crosses_physical_event(&attempt);
+        let device_breaks = self.commit_point(
+            Acceptance::Step(&attempt),
+            &candidate.solution,
+            candidate.state,
+        )?;
+        self.commit_mixed_point(candidate.mixed);
+        self.stats.device_event_landings +=
+            usize::from(device_boundary == Some(attempt.clock.time));
+        if event {
+            self.history.restart_integration()?;
+            self.steps.clear();
+        }
+        Ok(AcceptedPoint {
+            cursor: attempt.accept(next),
+            solution: candidate.solution,
+            observed: candidate.output.observed,
+            device_breaks,
+            periodic_boundary: candidate.output.periodic_boundary,
+        })
     }
 
     fn candidate_output(
