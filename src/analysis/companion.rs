@@ -1040,6 +1040,23 @@ fn truncation_devices(circuit: &Circuit) -> SpiceResult<Vec<TruncationDevice>> {
         .collect()
 }
 
+fn event_devices(circuit: &Circuit) -> SpiceResult<Vec<EventDevice<'_>>> {
+    circuit
+        .devices()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, device)| device.transient_events().map(|source| (index, source)))
+        .map(|(index, source)| {
+            Ok(EventDevice {
+                source,
+                rows: circuit
+                    .state_rows(index)
+                    .ok_or_else(|| failure("missing event device state range"))?,
+            })
+        })
+        .collect()
+}
+
 fn run_transient_inner(
     circuit: &mut Circuit,
     request: &AnalysisPlan,
@@ -1110,20 +1127,7 @@ fn run_transient_inner(
     let branch_row = crate::analysis::bias::branch_rows(circuit);
     let limited_rows = crate::analysis::bias::limited_rows(circuit);
     let truncation = truncation_devices(circuit)?;
-    let event_devices = circuit
-        .devices()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, device)| device.transient_events().map(|source| (index, source)))
-        .map(|(index, source)| {
-            Ok(EventDevice {
-                source,
-                rows: circuit
-                    .state_rows(index)
-                    .ok_or_else(|| failure("missing event device state range"))?,
-            })
-        })
-        .collect::<SpiceResult<Vec<_>>>()?;
+    let event_devices = event_devices(circuit)?;
     // A timed receiver must not miss a whole pulse because the ordinary
     // analog breakpoint table coalesced its two known source corners.
     let physical_events = (!event_devices.is_empty())
@@ -1584,6 +1588,31 @@ impl Driver<'_> {
         Ok(next)
     }
 
+    fn device_retry(
+        &self,
+        attempt: &AttemptedStep,
+        solution: &Vector,
+        state: &mut TrialState,
+    ) -> SpiceResult<Option<NextStep>> {
+        let time = attempt.clock.time;
+        let min_step = self.settings.min_step();
+        if let Some(at) = self.refine_device_events(solution, state, time)?
+            && time - at > min_step
+        {
+            let start = attempt
+                .event_start
+                .unwrap_or(time - attempt.clock.next.delta);
+            let delta = (at - start).max(min_step).max(start.next_up() - start);
+            if delta < attempt.clock.next.delta {
+                return Ok(Some(NextStep {
+                    delta,
+                    order: Order::One,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     fn prepare_mixed_point(
         &self,
         solution: &Vector,
@@ -1633,6 +1662,16 @@ impl Driver<'_> {
         self.index_aware && attempt.event_start.is_some() && attempt.clock.time < self.settings.stop
     }
 
+    fn check_step_budget(&self, time: Real) -> SpiceResult<()> {
+        if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
+            return Err(failure(format!(
+                "work limit of {} accepted + rejected steps reached at t = {:e}",
+                self.settings.max_steps, time
+            )));
+        }
+        Ok(())
+    }
+
     /// Advance through rejected trials. Only Newton's starting iterate moves
     /// between attempts; device and integration histories remain accepted-only.
     fn advance(
@@ -1646,16 +1685,12 @@ impl Driver<'_> {
         let device_boundary = self.next_device_boundary(ready.clock.time)?;
         self.stats.device_event_boundary_probes += self.event_devices.len();
         loop {
-            if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
-                return Err(failure(format!(
-                    "work limit of {} accepted + rejected steps reached at t = {:e}",
-                    self.settings.max_steps, ready.clock.time
-                )));
-            }
-            if let Some(event) = physical_event {
-                ready.limit_to_event(event);
-            }
-            if let Some(event) = device_boundary {
+            self.check_step_budget(ready.clock.time)?;
+            if let Some(event) = physical_event
+                .into_iter()
+                .chain(device_boundary)
+                .reduce(Real::min)
+            {
                 ready.limit_to_event(event);
             }
             let preview = self.preview_events(&mut ready)?;
@@ -1697,30 +1732,15 @@ impl Driver<'_> {
                         continue;
                     }
                     self.stats.device_event_trial_probes += self.event_devices.len();
-                    if let Some(at) =
-                        self.refine_device_events(&x, &mut state, attempt.clock.time)?
-                        && attempt.clock.time - at > min_step
-                    {
-                        let start = attempt
-                            .event_start
-                            .unwrap_or(attempt.clock.time - attempt.clock.next.delta);
-                        let delta = (at - start).max(min_step).max(start.next_up() - start);
-                        if delta < attempt.clock.next.delta {
-                            iterate = x;
-                            self.stats.rejected += 1;
-                            self.stats.device_event_retries += 1;
-                            drop(prepared);
-                            ready = attempt.retry(
-                                NextStep {
-                                    delta,
-                                    order: Order::One,
-                                },
-                                min_step,
-                            )?;
-                            ready.boundary = Boundary::Forced;
-                            ready.limit_to_event(start + delta);
-                            continue;
-                        }
+                    if let Some(next) = self.device_retry(&attempt, &x, &mut state)? {
+                        iterate = x;
+                        self.stats.rejected += 1;
+                        self.stats.device_event_retries += 1;
+                        drop(prepared);
+                        ready = attempt.retry(next, min_step)?;
+                        ready.boundary = Boundary::Forced;
+                        ready.limit_to_event(ready.clock.time + ready.clock.next.delta);
+                        continue;
                     }
                     let decision =
                         attempt.decision(&self.settings, &self.steps, |coefficients| {

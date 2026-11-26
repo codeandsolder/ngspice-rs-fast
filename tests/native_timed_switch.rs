@@ -126,14 +126,22 @@ fn closed_loop_reference_and_refinement() -> SpiceResult<()> {
         let (mut c, config) = deck(include_str!("fixtures/native-timed-switch/oscillator.cir"))?;
         let p = plan(&config, AnalysisKind::Transient, &["1n", "10u", "0", step])?;
         let (plot, stats) = companion_transient(&mut c, &p, &config.context())?;
-        let t = times(&plot);
+        let sample_times = times(&plot);
         let mut extrema = Vec::new();
-        for (i, &time) in t.iter().enumerate().take(t.len() - 1).skip(1) {
-            let a = value(&plot, "v(c)", i - 1);
-            let b = value(&plot, "v(c)", i);
-            let c = value(&plot, "v(c)", i + 1);
-            if time > 1e-7 && ((b > a && b >= c) || (b < a && b <= c)) {
-                extrema.push((time, b));
+        for (i, &time) in sample_times
+            .iter()
+            .enumerate()
+            .take(sample_times.len() - 1)
+            .skip(1)
+        {
+            let before = value(&plot, "v(c)", i - 1);
+            let current = value(&plot, "v(c)", i);
+            let after = value(&plot, "v(c)", i + 1);
+            if time > 1e-7
+                && ((current > before && current >= after)
+                    || (current < before && current <= after))
+            {
+                extrema.push((time, current));
             }
         }
         let expected: Vec<_> = include_str!("fixtures/native-timed-switch/oscillator-extrema.csv")
@@ -231,7 +239,7 @@ S1 p n cp cn M IC={INIT}
     close(
         "branch",
         -value(&plot, "i(vbias)", 0),
-        0.100001,
+        0.100_001,
         1e-10,
         1e-13,
     );
@@ -267,4 +275,60 @@ fn invalid_scoped_physics_and_ports_are_rejected() {
         );
         assert!(deck(&source).is_err(), "{ports}");
     }
+}
+
+#[test]
+fn zero_delay_narrow_pulse_and_analytic_branch_jacobian() -> SpiceResult<()> {
+    // At 1.0006 us the rising threshold is crossed, and at 1.0066 us
+    // the falling threshold is crossed. Both corners are far closer
+    // than the coarse timestep. Current is linear in branch voltage
+    // even while the logarithmic conductance ramp is moving.
+    let source = "analytic narrow pulse\n\
+        vref rtn 0 .75\n\
+        vdrive control rtn PWL(0 0 1u 0 1001n 5 1006n 5 1007n 0 2u 0)\n\
+        vpos p rtn 2\n\
+        vneg n rtn -3\n\
+        apos %vd(control rtn) %gd(p rtn) m\n\
+        aneg %vd(control rtn) %gd(n rtn) m\n\
+        .model m preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=.5 ton=2n toff=4n td_on=0 td_off=0)\n\
+        .end\n";
+    for max_step in ["100n", "0.1n"] {
+        let (mut circuit, config) = deck(source)?;
+        let p = plan(
+            &config,
+            AnalysisKind::Transient,
+            &["1n", "2u", "0", max_step],
+        )?;
+        let (plot, stats) = companion_transient(&mut circuit, &p, &config.context())?;
+        let mut reached_on = false;
+        for (index, time) in times(&plot).into_iter().enumerate() {
+            let phase = ((time - 1.0006e-6) / 2e-9)
+                .min((1.0106e-6 - time) / 4e-9)
+                .clamp(0., 1.);
+            let blend = phase * phase * (-2_f64).mul_add(phase, 3.);
+            let expected = 10_f64.powf(5_f64.mul_add(blend, -6.));
+            let positive = -value(&plot, "i(vpos)", index);
+            let negative = -value(&plot, "i(vneg)", index);
+            close("positive branch", positive, 2. * expected, 1e-8, 1e-13);
+            close("negative branch", negative, -3. * expected, 1e-8, 1e-13);
+            close(
+                "branch Jacobian",
+                (positive - negative) / 5.,
+                expected,
+                1e-8,
+                1e-13,
+            );
+            close(
+                "unloaded control",
+                value(&plot, "i(vdrive)", index),
+                0.,
+                0.,
+                1e-13,
+            );
+            reached_on |= positive > 0.199;
+        }
+        assert!(reached_on, "narrow pulse missed at {max_step}: {stats:?}");
+        assert!(stats.device_event_landings >= 2, "{stats:?}");
+    }
+    Ok(())
 }

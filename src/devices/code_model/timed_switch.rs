@@ -109,12 +109,13 @@ impl Material {
         } else if phase >= 1. {
             self.conductance[1]
         } else {
-            let blend = phase * phase * (3. - 2. * phase);
+            let blend = phase * phase * (-2_f64).mul_add(phase, 3.);
             // Convex combination in log space. Clamp only rounding overshoot
             // against the actual physical rails (never a conductance floor).
             let [off, on] = self.log_conductance;
             let [g0, g1] = self.conductance;
-            ((1. - blend) * off + blend * on)
+            (1. - blend)
+                .mul_add(off, blend * on)
                 .exp()
                 .clamp(g0.min(g1), g0.max(g1))
         }
@@ -123,6 +124,10 @@ impl Material {
     /// Interpolated crossing from a converged candidate, never a Newton
     /// iterate's mutable history. Scaled differences also handle opposite
     /// finite voltages whose direct subtraction would overflow.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "crossing interpolation uses separately rounded time coordinates to match the reference event ordering"
+    )]
     fn crossing(self, old: State, time: Real, control: Real, request: bool) -> Real {
         let threshold = self.threshold[usize::from(request)];
         let magnitude = old.control.abs().max(control.abs()).max(threshold.abs());
@@ -138,6 +143,10 @@ impl Material {
         (old.time + fraction.clamp(0., 1.) * (time - old.time)).clamp(old.time, time)
     }
 
+    #[expect(
+        clippy::float_cmp,
+        reason = "exact threshold equality preserves the previous discrete receiver state"
+    )]
     pub(super) fn retry_at(self, old: State, candidate: State) -> Option<Real> {
         let time = candidate.time;
         if candidate.requested == old.requested || time <= old.time {
@@ -153,7 +162,7 @@ impl Material {
             && time - old.time > self.tolerance
             && old.control != self.threshold[usize::from(candidate.requested)]
         {
-            let mid = old.time + 0.5 * (time - old.time);
+            let mid = old.time.midpoint(time);
             (mid > old.time && mid < time).then_some(mid)
         } else {
             None
@@ -256,6 +265,10 @@ impl State {
         Ok(phase.clamp(0., 1.))
     }
 
+    #[expect(
+        clippy::float_cmp,
+        reason = "phase rail identity is exact and determines whether the ramp has started"
+    )]
     fn moving_at(self, material: Material, time: Real) -> SpiceResult<bool> {
         Ok(self.anchor_phase != self.target_phase()
             && !certainly_before(self.ramp_end(material)?, time))
@@ -296,6 +309,10 @@ impl State {
         ]
     }
 
+    #[expect(
+        clippy::float_cmp,
+        reason = "serialized deadline sentinel and Boolean slots are exact discrete encodings"
+    )]
     pub(super) fn from_values(values: &[Real]) -> SpiceResult<Self> {
         let &[
             time,

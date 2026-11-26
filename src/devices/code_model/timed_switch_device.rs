@@ -22,7 +22,7 @@ pub(super) fn compile(card: &ModelCard) -> SpiceResult<Material> {
             "vt" => p.center = value,
             "vh" => p.hysteresis = value,
             "timetol" => p.tolerance = value,
-            "ic" if matches!(value, 0. | 1.) => p.initial = value == 1.,
+            "ic" if matches!(value, 0. | 1.) => p.initial = matches!(value, 1.),
             _ => {
                 return Err(SpiceError::parse(
                     parameter.location.clone(),
