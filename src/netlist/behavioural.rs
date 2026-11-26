@@ -921,6 +921,7 @@ fn from_numparam(
             op: match op {
                 UnaryOp::Plus => BUnaryOp::Plus,
                 UnaryOp::Minus => BUnaryOp::Minus,
+                UnaryOp::Not => BUnaryOp::Not,
             },
             operand: convert(operand)?,
         },
@@ -931,9 +932,32 @@ fn from_numparam(
                 BinaryOp::Mul => BBinaryOp::Mul,
                 BinaryOp::Div => BBinaryOp::Div,
                 BinaryOp::Pow => BBinaryOp::Pow,
+                BinaryOp::Eq => BBinaryOp::Eq,
+                BinaryOp::Ne => BBinaryOp::Ne,
+                BinaryOp::Lt => BBinaryOp::Lt,
+                BinaryOp::Le => BBinaryOp::Le,
+                BinaryOp::Gt => BBinaryOp::Gt,
+                BinaryOp::Ge => BBinaryOp::Ge,
+                BinaryOp::And => BBinaryOp::And,
+                BinaryOp::Or => BBinaryOp::Or,
+                BinaryOp::Rem | BinaryOp::IntDiv => {
+                    return Err(parse_error(
+                        &expr.span,
+                        "numparam quotient operator is not a native behavioural operator".into(),
+                    ));
+                }
             },
             lhs: convert(lhs)?,
             rhs: convert(rhs)?,
+        },
+        ExprKind::Ternary {
+            condition,
+            then,
+            otherwise,
+        } => BExprKind::Ternary {
+            condition: convert(condition)?,
+            then: convert(then)?,
+            otherwise: convert(otherwise)?,
         },
         ExprKind::Call {
             function,

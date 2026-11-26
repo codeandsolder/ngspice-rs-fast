@@ -35,6 +35,7 @@ fn sexp(expr: &Expr) -> String {
             let op = match op {
                 UnaryOp::Plus => "pos",
                 UnaryOp::Minus => "neg",
+                UnaryOp::Not => "not",
             };
             format!("({op} {})", sexp(operand))
         }
@@ -45,9 +46,29 @@ fn sexp(expr: &Expr) -> String {
                 BinaryOp::Mul => "*",
                 BinaryOp::Div => "/",
                 BinaryOp::Pow => "^",
+                BinaryOp::Rem => "%",
+                BinaryOp::IntDiv => "\\",
+                BinaryOp::Eq => "==",
+                BinaryOp::Ne => "!=",
+                BinaryOp::Lt => "<",
+                BinaryOp::Le => "<=",
+                BinaryOp::Gt => ">",
+                BinaryOp::Ge => ">=",
+                BinaryOp::And => "&&",
+                BinaryOp::Or => "||",
             };
             format!("({op} {} {})", sexp(lhs), sexp(rhs))
         }
+        ExprKind::Ternary {
+            condition,
+            then,
+            otherwise,
+        } => format!(
+            "(?: {} {} {})",
+            sexp(condition),
+            sexp(then),
+            sexp(otherwise)
+        ),
         ExprKind::Call {
             function,
             arguments,
@@ -271,14 +292,6 @@ fn malformed_expressions_commit_byte_column_errors() {
 #[test]
 fn valid_numparam_outside_the_subset_is_not_yet_ported() {
     for (text, fragment) in [
-        ("a<b", "operator '<'"),
-        ("a==b", "operator '='"),
-        ("a&&b", "operator '&'"),
-        ("a?b:c", "operator '?'"),
-        ("a%b", "operator '%'"),
-        ("a\\b", "operator '\\'"),
-        ("!a", "operator '!'"),
-        ("a>=1", "operator '>'"),
         // A quote *inside* an expression text (not as its delimiters).
         ("'1+2'", "quoted"),
         ("\"s\"", "quoted"),
@@ -297,7 +310,7 @@ fn calls_outside_the_allowlist_parse_as_user_function_calls() {
     for (text, expected) in [
         ("agauss(1,2,3)", "user:agauss(1, 2, 3)"),
         ("unif(1,2)", "user:unif(1, 2)"),
-        ("ternary_fcn(1,2,3)", "user:ternary_fcn(1, 2, 3)"),
+        ("ternary_fcn(1,2,3)", "ternary_fcn(1, 2, 3)"),
         ("vec(x)", "user:vec(x)"),
         ("myFunc(1)", "user:myfunc(1)"),
         ("f()", "user:f()"),
@@ -501,11 +514,10 @@ fn unmatched_braces_are_tokenizer_errors_with_columns() {
 
 #[test]
 fn quoted_param_values_and_unsupported_syntax_are_not_silently_dropped() {
-    for card in [".param s=\"text\"", ".param a=1<2"] {
-        let error = parse(card).unwrap_err();
-        assert!(error.is_not_yet_ported(), "{card}: {error}");
-        assert!(error.to_string().contains("param.cir:2:"), "{error}");
-    }
+    let card = ".param s=\"text\"";
+    let error = parse(card).unwrap_err();
+    assert!(error.is_not_yet_ported(), "{card}: {error}");
+    assert!(error.to_string().contains("param.cir:2:"), "{error}");
 }
 
 #[test]
@@ -668,9 +680,9 @@ fn site_expression_errors_carry_byte_columns() {
             other => panic!("{card}: expected Parse, got {other}"),
         }
     }
-    // Valid numparam outside the bounded subset is explicit, not dropped.
+    // Comparison and conditional syntax is admitted at scalar value sites.
     for card in ["R1 a 0 {a<b}", ".tran {a?b:c} 1"] {
-        assert!(parse(card).unwrap_err().is_not_yet_ported(), "{card}");
+        assert!(parse(card).is_ok(), "{card}");
     }
 }
 

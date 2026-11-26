@@ -15,17 +15,12 @@ C references (read-only): `src/frontend/numparam/xpressn.c` (`formula()`,
 
 ## Grammar
 
-```text
-sum     := [sign] term { ('+' | '-') term }
-term    := factor { ('*' | '/') factor }          left associative
-factor  := atom { ('^' | '**') atom }             left associative
-atom    := number | '-' number | name | call | '(' sum ')'
-call    := function '(' sum { ',' sum } ')'
-         | name '(' [ sum { ',' sum } ] ')'      user .func call (#107)
-```
-
-Implemented in `src/netlist/parser/expression.rs` with winnow
-`expression()` for the `^`/`*` levels and a fold for the additive level.
+Precedence from lowest to highest is conditional (`?` and `:`),
+logical OR, logical AND, comparisons (all at one level), addition and
+subtraction, multiplication/division/remainder/integer division, power,
+then atomic logical negation. Binary arithmetic and comparisons fold left
+to right. Parentheses and function arguments start fresh expressions.
+Numparam and the behavioural-source parser have distinct precedence rules.
 
 | Behaviour (pinned against the C binary) | Example |
 | --- | --- |
@@ -34,6 +29,10 @@ Implemented in `src/netlist/parser/expression.rs` with winnow
 | A sign at the start of an expression, `(` group or argument has additive weight | `-2^2 = -(2^2) = -4`, `-a*b+1 = (-(a*b))+1` |
 | After a binary operator only `-` directly before a numeric literal is accepted, and binds tightest | `2*-3^2 = 2*((-3)^2)`, `2^-1`, `2--3`, `1+-2`, `--3` |
 | Rejected because C errors on them | `2*+3`, `2*-a`, `2*-(3)`, `a b`, `3 k` |
+| Comparison operators share a precedence level | `2==3<1 = 1` |
+| Logical negation binds to the atom before power | `!2^0 = 1` |
+| Remainder subtracts the truncated quotient times the divisor; integer division truncates the quotient magnitude | `(-7)%3 = -1`, `(-7)\3 = 2` |
+| Conditional chaining follows the native accumulator rules; parentheses isolate a nested conditional | `0?2:3?4:5 = 4`, `1?0?3:4:5 = 3`, `1?(0?3:4):5 = 4` |
 | Whitespace between tokens is allowed inside `{...}`, groups and arguments | `{ a + b * 2 }`, `max(1, 2)` |
 
 `tests/c_param_reference.rs` (opt-in, `NGSPICE_BIN`) folds the parsed trees with
@@ -58,8 +57,8 @@ like numparam). `[`/`]` in names, `&` forms and vector access are not accepted.
 ### Function allowlist
 
 `sqr sqrt sin cos exp ln arctan abs pow pwr max min int log log10 sinh cosh
-tanh sgn ceil floor asin acos atan asinh acosh atanh tan nint` (`Function::ALL`).
-`pow`, `pwr`, `max`, `min` take exactly two arguments; every other function one;
+tanh sgn ceil floor asin acos atan asinh acosh atanh tan nint ternary_fcn` (`Function::ALL`).
+`pow`, `pwr`, `max`, `min` take exactly two arguments; `ternary_fcn` takes three; the remaining functions take one;
 wrong counts are errors. Function names cannot be used as parameter names. The
 call parentheses may follow optional whitespace.
 
@@ -123,8 +122,7 @@ remain possible within the node budget. Valid numparam outside the subset is `Sp
 
 ## Explicit exclusions
 
-Not accepted: comparison/logical/ternary operators (`< > <= >= == != <> && || ! ? :`), `%`
-and `\`; `ternary_fcn`, string
+Not accepted: string
 `vec`/`var` (unless a `.func` defines the name); double-quoted string
 parameters and quotes *inside* an expression; `.param` with `&`, `.if` blocks; expressions inside `ic=` vector, flag and `level=` model-selector sites (explicit
 gaps); nested braces; behavioural/time-dependent device equations
@@ -190,13 +188,16 @@ undefined.
 `RunConfig::from_netlist` evaluates them against the top-level scope (see
 [FRONTEND_STRUCTURE.md](FRONTEND_STRUCTURE.md#expression-option-values-107-option-part)).
 
-Remaining limits: no comparison/ternary operators in the numparam grammar.
+Conditional expressions, `ternary_fcn`, and logical AND/OR evaluate only
+the selected operand(s), so an unselected invalid arithmetic expression
+does not trigger the finite-value checks. The dependency pre-pass still
+validates referenced names and cycles conservatively before evaluation.
 
 ## Public API for an evaluator
 
 `netlist::expr`: `ParameterExpression { text, braced, span, root }`
 (`references()` lists names in source order), `Expr { kind, span }`,
-`ExprKind::{Number, Identifier, Unary, Binary, Call, Group}`, `UnaryOp`,
+`ExprKind::{Number, Identifier, Unary, Binary, Ternary, Call, Group, UserCall}`, `UnaryOp`,
 `BinaryOp`, `Function`, `SourceSpan`, `MAX_NESTING`. Cards:
 `Netlist::params`/`Subcircuit::params: Vec<ParamCard>`, each with
 `assignments: Vec<ParamAssignment { name, name_span, expression }>`.
