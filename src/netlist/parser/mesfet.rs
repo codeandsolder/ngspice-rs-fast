@@ -42,6 +42,7 @@ pub(super) fn mesfet_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     ))
     .parse_next(input)?;
     Ok(ParsedCard::Device(DeviceInstance {
+        code_ports: Vec::new(),
         name: instance.text.to_ascii_lowercase(),
         designator: 'z',
         nodes: [drain, gate, source]

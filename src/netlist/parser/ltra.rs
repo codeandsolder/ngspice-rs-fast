@@ -62,6 +62,7 @@ fn body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
     let parameters =
         line_grammar::parameters(input, &SCALARS, "lossy-line", "v1, i1, v2, i2 or ic")?;
     Ok(ParsedCard::Device(DeviceInstance {
+        code_ports: Vec::new(),
         name: instance.text.to_ascii_lowercase(),
         designator: 'o',
         nodes,

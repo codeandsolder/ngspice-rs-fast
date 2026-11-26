@@ -70,6 +70,7 @@ fn b_body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
     let mut parameters = vec![behavioural(&output, keyword, expression)];
     parameters.extend(b_setters(input, &output)?);
     Ok(ParsedCard::Device(DeviceInstance {
+        code_ports: Vec::new(),
         name: instance.text.to_ascii_lowercase(),
         designator: 'b',
         nodes: vec![

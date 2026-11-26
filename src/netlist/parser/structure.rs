@@ -85,6 +85,7 @@ fn instance(input: &mut Input<'_>) -> Result<ParsedCard> {
             .pop()
             .ok_or_else(|| malformed(input, "expected subcircuit name"))?;
         Ok(ParsedCard::Device(DeviceInstance {
+            code_ports: Vec::new(),
             name: instance.text.to_ascii_lowercase(),
             designator: 'x',
             nodes: connections

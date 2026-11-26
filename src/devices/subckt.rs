@@ -44,9 +44,9 @@ use std::sync::Arc;
 
 use crate::devices::binning::{DeclarationIndex, bin_base};
 use crate::netlist::ast::{
-    DeviceInstance, FourierCard, MeasureCard, ModelCard, Netlist, NodeHintCard, OptionCard,
-    OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind, PrintCard,
-    RequestedVector, SaveCard, ScopeEntry, ScopeView, ScopedCardKind, Subcircuit,
+    CodePortKind, DeviceInstance, FourierCard, MeasureCard, ModelCard, Netlist, NodeHintCard,
+    OptionCard, OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind,
+    PrintCard, RequestedVector, SaveCard, ScopeEntry, ScopeView, ScopedCardKind, Subcircuit,
 };
 use crate::netlist::bexpr::BExprKind;
 use crate::netlist::eval::{EvalBudget, FunctionScope, ParamBinding, ParamScope};
@@ -833,6 +833,7 @@ impl<'a> Expander<'a> {
             for node in &mut instance.nodes {
                 *node = self.rewrite_node(node, terminals, path);
             }
+            self.rewrite_code_ports(&mut instance, terminals, path);
             if instance.designator == 'x' {
                 let target = instance
                     .model
@@ -1125,6 +1126,34 @@ impl<'a> Expander<'a> {
     /// Rename a body node. Ground and `.global` nodes are exempt; a formal
     /// terminal is replaced by the actual node it was bound to; anything else is
     /// prefixed with the instance path.
+    fn rewrite_code_ports(
+        &self,
+        instance: &mut DeviceInstance,
+        terminals: &BTreeMap<String, String>,
+        path: &str,
+    ) {
+        for port in &mut instance.code_ports {
+            let rewrite = |name: &str| {
+                if port.kind != CodePortKind::Digital {
+                    return self.rewrite_node(name, terminals, path);
+                }
+                terminals.get(name).cloned().unwrap_or_else(|| {
+                    if path.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{path}.{name}")
+                    }
+                })
+            };
+            for terminal in &mut port.terminals {
+                terminal.positive = rewrite(&terminal.positive);
+                if let Some(negative) = &mut terminal.negative {
+                    *negative = rewrite(negative);
+                }
+            }
+        }
+    }
+
     fn rewrite_node(&self, name: &str, terminals: &BTreeMap<String, String>, path: &str) -> String {
         if self.global_nodes.contains(&name.to_ascii_lowercase()) {
             return name.to_owned();

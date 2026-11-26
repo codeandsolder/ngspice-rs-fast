@@ -183,6 +183,7 @@ pub(in crate::devices) fn expand<'a, 'n>(
         senses.insert(
             index,
             DeviceInstance {
+                code_ports: Vec::new(),
                 name: source,
                 designator: 'v',
                 nodes: vec![original.nodes[0].clone(), node],
@@ -327,6 +328,7 @@ impl Expansion {
         let location = expr.span.start.clone();
         let span = input.span.clone();
         self.output.push(DeviceInstance {
+            code_ports: Vec::new(),
             name: device,
             designator: 'b',
             nodes: vec![node.clone(), "0".to_owned()],
