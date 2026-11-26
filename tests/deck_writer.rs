@@ -147,7 +147,7 @@ fn waveform_omissions_stay_omitted() {
         other => panic!("{other:?}"),
     };
     assert!(pulse(&second, 0).delay.is_none() && pulse(&second, 0).period.is_none());
-    assert_eq!(pulse(&second, 1).delay.unwrap().text, "1n");
+    assert_eq!(pulse(&second, 1).delay.unwrap().source.text, "1n");
     assert!(pulse(&second, 1).rise.is_none() && pulse(&second, 1).fall.is_none());
 }
 

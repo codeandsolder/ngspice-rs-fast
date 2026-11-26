@@ -278,7 +278,7 @@ fn waveform_candidate_sites_rebuild_and_restore_immutable_forcing() {
         ([2., 0.5], 2.),
     ] {
         session.update(&coords, &mut EvalBudget::default()).unwrap();
-        let mut system = session.circuit().linear_system().unwrap();
+        let mut system = session.circuit_mut().linear_system().unwrap();
         system
             .bind_transient_timing(&TransientTiming::new(0.015625, 2.).unwrap())
             .unwrap();
@@ -294,7 +294,7 @@ fn waveform_candidate_sites_rebuild_and_restore_immutable_forcing() {
             .update(&[2., 0.], &mut EvalBudget::default())
             .is_err()
     );
-    let mut system = session.circuit().linear_system().unwrap();
+    let mut system = session.circuit_mut().linear_system().unwrap();
     system
         .bind_transient_timing(&TransientTiming::new(0.015625, 2.).unwrap())
         .unwrap();
