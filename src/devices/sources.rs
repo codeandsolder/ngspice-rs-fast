@@ -711,14 +711,19 @@ impl Device for IndependentSource {
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let (time, transient_op) = match context.mode {
             AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => (0., context.forcing.is_some()),
-            AnalysisMode::Transient { time, .. } => (time, false),
+            AnalysisMode::Transient { time, .. } | AnalysisMode::Instantaneous { time } => {
+                (time, false)
+            }
             AnalysisMode::Ac { .. } => {
                 return Err(SpiceError::circuit(
                     "use linear equation assembly for AC sources",
                 ));
             }
         };
-        let dc_mode = !matches!(context.mode, AnalysisMode::Transient { .. });
+        let dc_mode = matches!(
+            context.mode,
+            AnalysisMode::OperatingPoint | AnalysisMode::DcSweep
+        );
         let value = if dc_mode && !transient_op && self.dc.given() {
             self.dc.value() * context.source_factor
         } else {
@@ -728,6 +733,13 @@ impl Device for IndependentSource {
                     *context.voltage_source_value + tone
                 }
                 _ => match context.forcing {
+                    Some(forcing) if matches!(context.mode, AnalysisMode::Instantaneous { .. }) => {
+                        self.effective_waveform().physical_value_at_timed(
+                            time,
+                            forcing.limit,
+                            &forcing.timing,
+                        )?
+                    }
                     Some(forcing) => self.effective_waveform().value_at_timed(
                         time,
                         if transient_op

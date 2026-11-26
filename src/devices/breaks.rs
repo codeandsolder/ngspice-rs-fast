@@ -344,7 +344,7 @@ impl<'a> SourceBreaks<'a> {
         let mut current_always = Vec::new();
         let mut exact = Vec::new();
         for (index, source) in system.sources.iter().enumerate() {
-            if matches!(source.waveform.as_ref(), Waveform::Prepared(_)) {
+            if source.waveform.prepared_base().is_some() {
                 exact.push(index);
             }
             let eligibility = eligibility(&source.waveform);
@@ -389,7 +389,7 @@ impl<'a> SourceBreaks<'a> {
     pub fn next_exact(&self, now: Real, stop: Real) -> SpiceResult<Option<Real>> {
         let mut next = None::<Real>;
         for &index in &self.exact {
-            if let Waveform::Prepared(forcing) = self.system.sources[index].waveform.as_ref()
+            if let Some(forcing) = self.system.sources[index].waveform.prepared_base()
                 && let Some(event) = forcing
                     .breakpoints_in(now, stop)?
                     .find(|event| event.time > now)

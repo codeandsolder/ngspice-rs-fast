@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use model_normalize_ngspice::waveform::{Forcing, Knot, Repeat, ResolvedWaveform};
 
-use crate::devices::functions::affine_value;
+use crate::devices::functions::{affine_value, scaled_interval_difference};
 use crate::devices::pulse::MAX_CYCLE;
 use crate::devices::{Limit, WaveformEvent, WaveformEventKind};
+use crate::maths::taylor::Jet;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 fn invalid(message: &str) -> SpiceError {
@@ -34,6 +35,12 @@ struct SidedPwl {
     knots: Arc<[Knot]>,
     repeat: Option<Repeat>,
     min_spacing: Real,
+}
+
+#[derive(Clone, Copy)]
+enum CycleOrHold {
+    Cycle(Real),
+    Hold(Real),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -125,6 +132,26 @@ impl PreparedForcing {
         Ok(value)
     }
 
+    /// Analytic coefficients in increasing absolute time, with the selected
+    /// one-sided segment even at discontinuities and repeat boundaries.
+    pub(super) fn jet(
+        &self,
+        time: Real,
+        scale: Real,
+        order: usize,
+        limit: Limit,
+    ) -> SpiceResult<Jet> {
+        Ok(match &self.law {
+            Law::Pwl(pwl) => {
+                let (value, slope) = pwl.local_affine(time, scale, limit)?;
+                Jet::affine(order, value, slope)
+            }
+            Law::Sine(sine) => sine
+                .jet(time, scale, order, limit)
+                .with_value(self.value_at(time, limit)?),
+        })
+    }
+
     /// Lazy event sequence in the closed time window. Both source kinds use
     /// exactly the same event times as the external-limit evaluator.
     /// # Errors
@@ -151,6 +178,22 @@ impl SignedSine {
         let elapsed = time - self.delay;
         let phase = (elapsed * self.frequency % 1.) * std::f64::consts::TAU;
         (self.amplitude * (-self.damping * elapsed).exp()).mul_add(phase.sin(), self.offset)
+    }
+
+    fn jet(self, time: Real, scale: Real, order: usize, limit: Limit) -> Jet {
+        if self.amplitude == 0.
+            || (self.hold && (time < self.delay || (limit == Limit::Left && time <= self.delay)))
+        {
+            return Jet::constant(order, self.offset);
+        }
+        let elapsed = time - self.delay;
+        let phase = (elapsed * self.frequency % 1.) * std::f64::consts::TAU;
+        let angular_scale = self.frequency * scale * std::f64::consts::TAU;
+        let (sin, _) = Jet::affine(order, phase, angular_scale).sin_cos();
+        let envelope = Jet::affine(order, -self.damping * elapsed, -self.damping * scale)
+            .exp()
+            .scale(self.amplitude);
+        envelope.multiply(&sin).offset(self.offset)
     }
 }
 
@@ -250,42 +293,121 @@ impl SidedPwl {
 
     #[expect(
         clippy::float_cmp,
-        reason = "external limits are selected at exact generated event times"
+        reason = "hold ends at the exact generated repeat origin"
     )]
-    fn value_at(&self, time: Real, limit: Limit) -> SpiceResult<Real> {
-        let cycle = match self.repeat {
+    fn cycle_or_hold(&self, time: Real, limit: Limit) -> SpiceResult<CycleOrHold> {
+        Ok(match self.repeat {
             Some(r) => {
                 if let Some(hold) = r.hold
                     && (time < r.origin || (time == r.origin && limit == Limit::Left))
                 {
-                    return Ok(hold);
+                    CycleOrHold::Hold(hold)
+                } else {
+                    CycleOrHold::Cycle(self.cycle_at(time, r)?)
                 }
-                self.cycle_at(time, r)?
             }
-            None => 0.,
+            None => CycleOrHold::Cycle(0.),
+        })
+    }
+
+    fn next_endpoint(&self, cycle: Real, upper: usize) -> Option<(Real, Real)> {
+        if upper < self.knots.len() {
+            Some((self.time_at(cycle, upper), self.knots[upper].left))
+        } else {
+            self.repeat
+                .map(|r| (Self::cycle_start(r, cycle + 1.), self.knots[0].left))
+        }
+    }
+
+    /// The one-sided derivative uses the same rounded absolute interval
+    /// as the scalar evaluator. No difference of rounded waveform samples
+    /// is involved.
+    fn segment_slope(
+        &self,
+        cycle: Real,
+        upper: usize,
+        time: Real,
+        scale: Real,
+    ) -> SpiceResult<Real> {
+        let (t0, v0, t1, v1) = if upper == 0 {
+            let Some(r) = self.repeat else {
+                return Ok(0.);
+            };
+            // At a repeat boundary the incoming segment belongs to the
+            // previous cycle. Validate that cycle as well as the new one.
+            let previous = self.cycle_at(time.next_down(), r)?;
+            let last = self.knots.len() - 1;
+            (
+                self.time_at(previous, last),
+                self.knots[last].right,
+                self.time_at(cycle, 0),
+                self.knots[0].left,
+            )
+        } else {
+            let Some((end, value)) = self.next_endpoint(cycle, upper) else {
+                return Ok(0.);
+            };
+            (
+                self.time_at(cycle, upper - 1),
+                self.knots[upper - 1].right,
+                end,
+                value,
+            )
+        };
+        if !(t0.is_finite() && t1.is_finite() && t0 < t1 && (t0..=t1).contains(&time)) {
+            return Err(invalid("unrepresentable Taylor interpolation interval"));
+        }
+        Ok(scaled_interval_difference(v0, v1, scale, t0, t1))
+    }
+
+    fn value_at(&self, time: Real, limit: Limit) -> SpiceResult<Real> {
+        self.local_affine(time, 0., limit).map(|(value, _)| value)
+    }
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "external limits are selected at exact generated event times"
+    )]
+    fn local_affine(&self, time: Real, scale: Real, limit: Limit) -> SpiceResult<(Real, Real)> {
+        let cycle = match self.cycle_or_hold(time, limit)? {
+            CycleOrHold::Cycle(cycle) => cycle,
+            CycleOrHold::Hold(hold) => return Ok((hold, 0.)),
         };
         let upper = self
             .knots
             .partition_point(|k| self.absolute_time(cycle, k.time) <= time);
         if upper == 0 {
-            return Ok(self.knots[0].left);
+            return Ok((self.knots[0].left, 0.));
         }
         let i = upper - 1;
         let left = self.knots[i];
         let t0 = self.time_at(cycle, i);
-        if time == t0 {
-            return Ok(if limit == Limit::Left {
-                left.left
-            } else {
-                left.right
-            });
-        }
-        let (t1, v1) = if upper < self.knots.len() {
-            (self.time_at(cycle, upper), self.knots[upper].left)
-        } else if let Some(r) = self.repeat {
-            (Self::cycle_start(r, cycle + 1.), self.knots[0].left)
+        let (value, segment_upper) = if time == t0 {
+            match limit {
+                Limit::Left => (left.left, i),
+                Limit::Right => (left.right, upper),
+            }
         } else {
-            return Ok(left.right);
+            (self.interpolate(cycle, upper, time, t0, left.right)?, upper)
+        };
+        let slope = if scale == 0. {
+            0.
+        } else {
+            self.segment_slope(cycle, segment_upper, time, scale)?
+        };
+        Ok((value, slope))
+    }
+
+    fn interpolate(
+        &self,
+        cycle: Real,
+        upper: usize,
+        time: Real,
+        t0: Real,
+        v0: Real,
+    ) -> SpiceResult<Real> {
+        let Some((t1, v1)) = self.next_endpoint(cycle, upper) else {
+            return Ok(v0);
         };
         if !(t0 < time && time < t1) {
             return Err(invalid("unrepresentable interpolation interval"));
@@ -296,7 +418,7 @@ impl SidedPwl {
         } else {
             t0.mul_add(-0.5, time * 0.5) / t0.mul_add(-0.5, t1 * 0.5)
         };
-        Ok(affine_value(left.right, v1, fraction))
+        Ok(affine_value(v0, v1, fraction))
     }
 
     fn time_at(&self, cycle: Real, knot: usize) -> Real {

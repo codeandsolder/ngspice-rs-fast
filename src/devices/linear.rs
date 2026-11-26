@@ -81,6 +81,16 @@ pub enum Waveform {
     Stochastic(crate::devices::stochastic::StochasticWaveform),
 }
 impl Waveform {
+    // The preceding non-PORT source remains the baseline of a PORT sum.
+    // Its sided startup and exact-event semantics survive composition.
+    pub(super) fn prepared_base(&self) -> Option<&super::prepared_waveform::PreparedForcing> {
+        match self {
+            Self::Prepared(forcing) => Some(forcing),
+            Self::PortSeries { baseline, .. } => baseline.prepared_base(),
+            _ => None,
+        }
+    }
+
     /// Checks finite values and strictly increasing nonnegative knot times.
     /// # Errors
     /// Invalid source data.
@@ -232,6 +242,109 @@ impl Waveform {
             Self::PulseDefaults(spec) => spec.resolve(timing)?.value_at(t, limit),
             Self::FunctionDefaults(spec) => spec.resolve(timing)?.value_at(t, limit),
             other => other.value_at(t, limit),
+        }
+    }
+
+    /// Physical one-sided value, including zero-duration pulse edges and
+    /// PWL repetition jumps. This selects the mathematical limit rather
+    /// than the reference simulator's single landing sample.
+    ///
+    /// # Errors
+    /// Invalid time or unresolved waveform defaults.
+    pub fn physical_value_at(&self, t: Real, limit: Limit) -> SpiceResult<Real> {
+        match self {
+            Self::Pwl(pwl) => Ok(pwl.local_affine(t, 0., limit)?.0),
+            Self::Pulse(pulse) => Ok(pulse.local_affine(t, 0., limit)?.0),
+            Self::PortSeries { baseline, tones } => Ok(baseline.physical_value_at(t, limit)?
+                + tones.iter().map(|(a, w)| a * (w * t).cos()).sum::<Real>()),
+            other => other.value_at(t, limit),
+        }
+    }
+
+    /// Analytic local Taylor coefficients of a resolved waveform.
+    ///
+    /// Coefficient k is the derivative of order k times scale^k / k!.
+    /// The chosen side determines the polynomial at corners or jumps.
+    /// Stochastic forcing has no general classical Taylor expansion.
+    ///
+    /// # Errors
+    /// Nonfinite time, invalid scale, excessive order, unresolved waveform
+    /// defaults, stochastic forcing or unrepresentable coefficients.
+    pub fn taylor_at(
+        &self,
+        t: Real,
+        scale: Real,
+        order: usize,
+        limit: Limit,
+    ) -> SpiceResult<Vec<Real>> {
+        if !t.is_finite()
+            || !scale.is_finite()
+            || scale <= 0.
+            || order > crate::maths::taylor::MAX_ORDER
+        {
+            return Err(SpiceError::circuit(
+                "invalid waveform Taylor expansion request",
+            ));
+        }
+        self.jet(t, scale, order, limit)?.finish()
+    }
+
+    fn jet(
+        &self,
+        t: Real,
+        scale: Real,
+        order: usize,
+        limit: Limit,
+    ) -> SpiceResult<crate::maths::taylor::Jet> {
+        use crate::maths::taylor::Jet;
+        if order == 0 {
+            return Ok(Jet::constant(0, self.physical_value_at(t, limit)?));
+        }
+        Ok(match self {
+            Self::Pwl(pwl) => {
+                let (value, slope) = pwl.local_affine(t, scale, limit)?;
+                Jet::affine(order, value, slope)
+            }
+            Self::Pulse(pulse) => {
+                let (value, slope) = pulse.local_affine(t, scale, limit)?;
+                Jet::affine(order, value, slope)
+            }
+            Self::Function(function) => function.jet(t, scale, order, limit)?,
+            Self::Prepared(forcing) => forcing.jet(t, scale, order, limit)?,
+            Self::PortSeries { baseline, tones } => {
+                let mut result = baseline.jet(t, scale, order, limit)?;
+                for &(amplitude, frequency) in tones {
+                    result = result.add(
+                        &Jet::affine(order, frequency * t, frequency * scale)
+                            .sin_cos()
+                            .1
+                            .scale(amplitude),
+                    );
+                }
+                result.with_value(self.physical_value_at(t, limit)?)
+            }
+            Self::Stochastic(_) => {
+                return Err(SpiceError::circuit(
+                    "stochastic forcing has no general classical Taylor expansion",
+                ));
+            }
+            other => Jet::constant(order, other.value_at(t, limit)?),
+        })
+    }
+
+    pub(super) fn physical_value_at_timed(
+        &self,
+        t: Real,
+        limit: Limit,
+        timing: &TransientTiming,
+    ) -> SpiceResult<Real> {
+        match self {
+            Self::PortSeries { baseline, tones } => Ok(baseline
+                .physical_value_at_timed(t, limit, timing)?
+                + tones.iter().map(|(a, w)| a * (w * t).cos()).sum::<Real>()),
+            Self::PulseDefaults(spec) => Ok(spec.resolve(timing)?.local_affine(t, 0., limit)?.0),
+            Self::FunctionDefaults(spec) => spec.resolve(timing)?.value_at(t, limit),
+            other => other.physical_value_at(t, limit),
         }
     }
 
@@ -662,7 +775,7 @@ impl LinearSystem {
         self.transient_rhs_with(|waveform| {
             waveform.value_at(
                 0.,
-                if matches!(waveform, Waveform::Prepared(_)) {
+                if waveform.prepared_base().is_some() {
                     Limit::Right
                 } else {
                     Limit::Left
@@ -687,6 +800,52 @@ impl LinearSystem {
         }
         Ok(rhs)
     }
+    /// Independent forcing Taylor coefficients in original equation rows.
+    ///
+    /// The waveform defaults must already be bound to transient timing.
+    /// Each output vector is the forcing coefficient for one Taylor degree.
+    ///
+    /// # Errors
+    /// Invalid Taylor request, unsupported waveform derivative, invalid
+    /// equation row, or nonfinite aggregate forcing.
+    pub fn transient_taylor_rhs(
+        &self,
+        t: Real,
+        scale: Real,
+        order: usize,
+        limit: Limit,
+    ) -> SpiceResult<Vec<Vector>> {
+        if !t.is_finite()
+            || !scale.is_finite()
+            || scale <= 0.
+            || order > crate::maths::taylor::MAX_ORDER
+        {
+            return Err(SpiceError::circuit(
+                "invalid forcing Taylor expansion request",
+            ));
+        }
+        let mut coefficients = Vec::with_capacity(order + 1);
+        for _ in 0..=order {
+            coefficients.push(Vector::from(crate::primitives::filled_vec(
+                self.a.rows(),
+                0.,
+                "independent forcing Taylor coefficients",
+            )?));
+        }
+        for source in &self.sources {
+            let jet = source.waveform.taylor_at(t, scale, order, limit)?;
+            for (rhs, value) in coefficients.iter_mut().zip(jet) {
+                for &(row, sign) in &source.rows {
+                    rhs.add_to(row, sign * value)?;
+                }
+            }
+        }
+        if coefficients.iter().any(|rhs| !rhs.is_finite()) {
+            return Err(SpiceError::circuit("nonfinite forcing Taylor expansion"));
+        }
+        Ok(coefficients)
+    }
+
     /// Clear the assembled operators and forcing, retaining outer storage.
     pub(crate) fn clear(&mut self) {
         self.a.clear();
@@ -935,6 +1094,56 @@ pub(crate) fn branch_stamp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_series_inherits_prepared_startup_and_exact_events() {
+        use model_normalize_ngspice::waveform::{Forcing, Knot, ResolvedWaveform};
+        let baseline = Waveform::Prepared(
+            super::super::prepared_waveform::PreparedForcing::new(ResolvedWaveform {
+                dc: 3.,
+                forcing: Forcing::PiecewiseLinear {
+                    knots: vec![
+                        Knot {
+                            time: 0.,
+                            left: 2.,
+                            right: 3.,
+                        },
+                        Knot {
+                            time: 1.,
+                            left: 3.,
+                            right: 4.,
+                        },
+                    ],
+                    repeat: None,
+                },
+                idle_in_pop: false,
+            })
+            .unwrap(),
+        );
+        let wave = Waveform::PortSeries {
+            baseline: Box::new(baseline),
+            tones: vec![(5., 7.)],
+        };
+        let mut system = LinearSystem::new(1);
+        let mut rows = SourceRows::new();
+        rows.push(0, 1.).unwrap();
+        system.sources.push(LinearSource {
+            name: Arc::new("vport".to_owned()),
+            kind: SourceKind::Voltage,
+            rows,
+            dc: 8.,
+            ac: Complex::real(0.),
+            waveform: Arc::new(wave),
+        });
+        assert_eq!(system.transient_startup_rhs().unwrap().as_slice(), &[8.]);
+        assert_eq!(
+            system.transient_rhs(0., Limit::Left).unwrap().as_slice(),
+            &[7.]
+        );
+        let breaks = crate::devices::breaks::SourceBreaks::new(&system);
+        assert!(breaks.has_exact());
+        assert_eq!(breaks.next_exact(0., 2.).unwrap(), Some(1.));
+    }
 
     fn scan_merge(mut sources: Vec<std::iter::Peekable<WaveformBreakpoints>>) -> Vec<u64> {
         let mut result = Vec::new();

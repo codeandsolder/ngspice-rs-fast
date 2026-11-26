@@ -30,6 +30,18 @@ restarts at first integration order. Rejected trials cannot consume events.
 An unrepresentable periodic index or knot spacing is an error, not an
 approximation or an implicit merge.
 
+For the physical derivative-array solver, the same sided interpolation
+interval supplies the analytic, time-normalized Taylor coefficients: the
+zeroth coefficient is the external limit, the first is the scaled slope,
+and higher coefficients vanish on each linear segment. Damped sine
+coefficients follow the analytic envelope and phase; a held sine has a
+constant left germ at its activation boundary. These coefficients do not
+differentiate rounded samples. The derivative solver uses its merged exact
+event iterator rather than a second prepared-source scheduler. At an
+interior event it establishes the right-limit state while retaining physical
+storage and rejects derivative-input jumps that require impulses. The
+requested final endpoint retains the left limit.
+
 Native PULSE/PWL and native source parsing remain unchanged. The currently
 pinned producer contract defines DC as the right-hand startup value. Periodic
 operating-point metadata is retained in the resolved forcing; dispatch of the

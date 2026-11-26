@@ -355,3 +355,369 @@ fn rounded_periodic_knots_cannot_silently_collapse() {
     assert!(wave.breakpoints_in(begin, end).is_err());
     assert!(wave.value_at(begin, Limit::Right).is_err());
 }
+
+#[test]
+fn prepared_knot_jets_use_exact_incoming_and_outgoing_segments() {
+    let wave = Waveform::Prepared(pwl(
+        vec![knot(-2., -1., 2.), knot(1., 5., 7.), knot(3., 3., 9.)],
+        None,
+        4.,
+    ));
+    for (time, limit, value, slope) in [
+        (-3., Limit::Right, -1., 0.),
+        (-2., Limit::Left, -1., 0.),
+        (-2., Limit::Right, 2., 0.5),
+        (0., Limit::Right, 4., 0.5),
+        (1., Limit::Left, 5., 0.5),
+        (1., Limit::Right, 7., -1.),
+        (3., Limit::Left, 3., -1.),
+        (3., Limit::Right, 9., 0.),
+    ] {
+        let jet = wave.taylor_at(time, 0.5, 3, limit).unwrap();
+        assert_eq!(jet, [value, slope, 0., 0.]);
+    }
+}
+
+#[test]
+fn prepared_repeat_jets_follow_previous_cycle_and_startup_hold() {
+    for hold in [None, Some(17.)] {
+        let wave = Waveform::Prepared(pwl(
+            vec![knot(0., 6., 2.), knot(0.25, 4., 8.)],
+            Some(Repeat {
+                origin: -0.25,
+                period: 1.,
+                hold,
+            }),
+            0.,
+        ));
+        for cycle in [-2., -1., 0., 1., 100.] {
+            if hold.is_some() && cycle < 0. {
+                continue;
+            }
+            let t = -0.25 + cycle;
+            let left = wave.taylor_at(t, 0.25, 2, Limit::Left).unwrap();
+            if let Some(value) = hold.filter(|_| cycle == 0.) {
+                assert_eq!(left, [value, 0., 0.]);
+            } else {
+                assert_eq!(left, [6., -2. / 3., 0.]);
+            }
+            assert_eq!(
+                wave.taylor_at(t, 0.25, 2, Limit::Right).unwrap(),
+                [2., 2., 0.]
+            );
+            assert_eq!(
+                wave.taylor_at(t + 0.25, 0.25, 2, Limit::Left).unwrap(),
+                [4., 2., 0.]
+            );
+            assert_eq!(
+                wave.taylor_at(t + 0.25, 0.25, 2, Limit::Right).unwrap(),
+                [8., -2. / 3., 0.]
+            );
+        }
+    }
+}
+
+#[test]
+fn prepared_affine_jets_do_not_overflow_duration_or_round_away_subnormals() {
+    let max = f64::MAX;
+    let wave = Waveform::Prepared(pwl(
+        vec![knot(-max, -max, -max), knot(max, max, max)],
+        None,
+        0.,
+    ));
+    assert_eq!(
+        wave.taylor_at(0., 1., 2, Limit::Right).unwrap(),
+        [0., 1., 0.]
+    );
+    let tiny = f64::from_bits(1);
+    let wave = Waveform::Prepared(pwl(
+        vec![knot(-max, 0., 0.), knot(max / 2., tiny, tiny)],
+        None,
+        0.,
+    ));
+    assert_eq!(
+        wave.taylor_at(-max, max, 1, Limit::Right).unwrap(),
+        [0., tiny]
+    );
+}
+
+#[test]
+fn prepared_sine_jets_respect_delay_hold_and_exact_analytic_derivatives() {
+    for hold in [false, true] {
+        let wave = Waveform::Prepared(
+            PreparedForcing::new(ResolvedWaveform {
+                dc: 2.,
+                forcing: Forcing::Sine {
+                    offset: 2.,
+                    amplitude: 3.,
+                    frequency: 1.,
+                    delay: -0.25,
+                    damping: 2.,
+                    hold_before_delay: hold,
+                },
+                idle_in_pop: false,
+            })
+            .unwrap(),
+        );
+        let phase = std::f64::consts::FRAC_PI_4;
+        let damping = 0.25;
+        let expected = [
+            2.,
+            3. * phase,
+            -3. * damping * phase,
+            3. * (0.5 * damping * damping * phase - phase.powi(3) / 6.),
+        ];
+        for limit in [Limit::Left, Limit::Right] {
+            let actual = wave.taylor_at(-0.25, 0.125, 3, limit).unwrap();
+            if hold && limit == Limit::Left {
+                assert_eq!(actual, [2., 0., 0., 0.]);
+            } else {
+                for (a, b) in actual.into_iter().zip(expected) {
+                    close(a, b, 2e-15);
+                }
+            }
+        }
+    }
+}
+
+fn derivative_deck(body: &str) -> (ngspice_rs::netlist::ast::Netlist, RunConfig) {
+    let deck =
+        format!("prepared derivative witness\n{body}\n.options reltol=1e-8 vntol=1n\n.end\n");
+    let netlist = Parser::new()
+        .parse_deck(&ngspice_rs::netlist::source::parse_deck_text(
+            Path::new("derivative.cir"),
+            &deck,
+        ))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    (netlist, config)
+}
+
+fn derivative_declaration(
+    spec: model_normalize_ngspice::waveform::WaveformSpec,
+) -> model_normalize_ngspice::waveform::PreparedWaveform {
+    model_normalize_ngspice::waveform::PreparedWaveform {
+        artifact: "derivative.cir".into(),
+        scope: Vec::new(),
+        source: "v1".into(),
+        spec,
+        idle_in_pop: "0".into(),
+    }
+}
+
+#[test]
+fn prepared_pwl_derivative_changes_slope_at_exact_event() {
+    use model_normalize_ngspice::waveform::{SymbolicPoint, WaveformSpec};
+    let (netlist, config) = derivative_deck("V1 in 0 0\nB1 out 0 v=1u*ddt(v(in))\nR1 out 0 1k");
+    let declaration = derivative_declaration(WaveformSpec::PiecewiseLinear {
+        segments: "2".into(),
+        points: [("0", "0"), ("10u", "1"), ("20u", "0")]
+            .map(|(time, value)| SymbolicPoint {
+                time: time.into(),
+                value: value.into(),
+            })
+            .to_vec(),
+    });
+    for method in ["method=trap", "method=gear"] {
+        for uic in [false, true] {
+            let mut circuit = config
+                .prepared_circuit(&netlist, std::slice::from_ref(&declaration))
+                .unwrap();
+            let timelines = circuit
+                .source_timelines(TransientTiming::new(1.7e-6, 25e-6).unwrap())
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let events = timelines[0]
+                .waveform
+                .breakpoints_in(0., 25e-6)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 3);
+            let mut input = AnalysisInput::with_arguments(
+                AnalysisKind::Transient,
+                ["1.7u", "25u", "0", "1.7u", method],
+            );
+            input.uic = uic;
+            let plot = config
+                .plan(input)
+                .unwrap()
+                .run(&mut circuit, &config.context())
+                .unwrap();
+            for event in &events {
+                // UIC suppresses the t=0 output row by design.
+                if uic && *event == 0. {
+                    continue;
+                }
+                assert!(
+                    (0..plot.point_count())
+                        .any(|i| plot.value("time", i).unwrap().re.to_bits() == event.to_bits())
+                );
+            }
+            for index in 0..plot.point_count() {
+                let t = plot.value("time", index).unwrap().re;
+                let expected = if t < events[1] {
+                    0.1
+                } else if t < events[2] {
+                    -0.1
+                } else {
+                    0.
+                };
+                close(plot.value("v(out)", index).unwrap().re, expected, 1e-10);
+                close(
+                    plot.value("i(b1)", index).unwrap().re,
+                    -expected * 1e-3,
+                    1e-13,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_signed_sine_drives_nested_derivatives_and_kcl() {
+    use model_normalize_ngspice::waveform::{SineDelay, WaveformSpec};
+    let (netlist, config) = derivative_deck(
+        "V1 in 0 0\nB1 first 0 v=1m*ddt(v(in))\nB2 out 0 v=1m*ddt(v(first))\nR1 out 0 1k",
+    );
+    let declaration = derivative_declaration(WaveformSpec::Sine {
+        offset: "2".into(),
+        amplitude: "0.5".into(),
+        frequency: "1k".into(),
+        delay: SineDelay::Seconds("-125u".into()),
+        damping: "500".into(),
+        hold_before_delay: "0".into(),
+    });
+    for method in ["method=trap", "method=gear"] {
+        let mut circuit = config
+            .prepared_circuit(&netlist, std::slice::from_ref(&declaration))
+            .unwrap();
+        let mut input = AnalysisInput::with_arguments(
+            AnalysisKind::Transient,
+            ["2u", "80u", "0", "2u", method],
+        );
+        input.uic = true;
+        let plot = config
+            .plan(input)
+            .unwrap()
+            .run(&mut circuit, &config.context())
+            .unwrap();
+        let omega = std::f64::consts::TAU;
+        let decay = 0.5_f64;
+        for index in 0..plot.point_count() {
+            let elapsed = 1e3 * plot.value("time", index).unwrap().re + 0.125;
+            let amplitude = 0.5 * (-decay * elapsed).exp();
+            let (sin, cos) = (omega * elapsed).sin_cos();
+            let first = amplitude * (omega * cos - decay * sin);
+            let second =
+                amplitude * ((decay * decay - omega * omega) * sin - 2. * decay * omega * cos);
+            close(plot.value("v(first)", index).unwrap().re, first, 1e-8);
+            close(plot.value("v(out)", index).unwrap().re, second, 1e-8);
+            close(
+                plot.value("i(b2)", index).unwrap().re,
+                -second * 1e-3,
+                1e-11,
+            );
+        }
+    }
+}
+
+#[test]
+fn prepared_source_startup_bias_and_actual_jump_have_distinct_semantics() {
+    use model_normalize_ngspice::waveform::{Period, PulseEdges, PulseSpec, WaveformSpec};
+    let (netlist, config) = derivative_deck("V1 in 0 0\nB1 out 0 v=1u*ddt(v(in))\nR1 out 0 1k");
+    let declaration = |delay: &str, held: bool| {
+        derivative_declaration(WaveformSpec::Pulse(PulseSpec {
+            first: "2".into(),
+            second: "3".into(),
+            period: Period::Seconds("1m".into()),
+            delay: delay.into(),
+            hold_before_delay: if held { "1" } else { "0" }.into(),
+            edges: PulseEdges::Rectangular {
+                duty: "0.75".into(),
+            },
+        }))
+    };
+    for method in ["method=trap", "method=gear"] {
+        let mut circuit = config
+            .prepared_circuit(&netlist, &[declaration("0", false)])
+            .unwrap();
+        let input = AnalysisInput::with_arguments(
+            AnalysisKind::Transient,
+            ["2u", "80u", "0", "2u", method],
+        );
+        let plot = config
+            .plan(input)
+            .unwrap()
+            .run(&mut circuit, &config.context())
+            .unwrap();
+        // Prepared bias is the declared right-limit startup, not an invented
+        // pulse-low prehistory; there is no derivative impulse at zero.
+        for index in 0..plot.point_count() {
+            close(plot.value("v(in)", index).unwrap().re, 3., 1e-12);
+            close(plot.value("v(out)", index).unwrap().re, 0., 1e-12);
+        }
+        for uic in [false, true] {
+            let mut circuit = config
+                .prepared_circuit(&netlist, &[declaration("10u", true)])
+                .unwrap();
+            let mut input = AnalysisInput::with_arguments(
+                AnalysisKind::Transient,
+                ["2u", "80u", "0", "2u", method],
+            );
+            input.uic = uic;
+            let error = config
+                .plan(input)
+                .unwrap()
+                .run(&mut circuit, &config.context())
+                .expect_err("an actual source jump requires an impulse")
+                .to_string();
+            assert!(
+                error.contains("source event") && error.contains("derivative input jumps"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prepared_periodic_jets_agree_with_every_generated_interval_at_wide_time_scales() {
+    for exponent in [-300, -100, 0, 100, 300] {
+        let period = 2_f64.powi(exponent);
+        for origin in [-0.37 * period, 0.19 * period] {
+            let wave = Waveform::Prepared(pwl(
+                vec![
+                    knot(0., -3., 5.),
+                    knot(0.1 * period, 2., -4.),
+                    knot(0.73 * period, 7., 1.),
+                ],
+                Some(Repeat {
+                    origin,
+                    period,
+                    hold: None,
+                }),
+                0.,
+            ));
+            for cycle in [-1024_f64, -1., 0., 1., 1024., 1048576.] {
+                let begin = cycle.mul_add(period, origin);
+                let end = (cycle + 1.).mul_add(period, origin);
+                let times = wave.breakpoints_in(begin, end).unwrap().collect::<Vec<_>>();
+                assert_eq!(times.len(), 4);
+                for interval in times.windows(2) {
+                    let (a, b) = (interval[0], interval[1]);
+                    let width = b - a;
+                    let va = wave.value_at(a, Limit::Right).unwrap();
+                    let vb = wave.value_at(b, Limit::Left).unwrap();
+                    let slope = vb - va;
+                    let right = wave.taylor_at(a, width, 2, Limit::Right).unwrap();
+                    let left = wave.taylor_at(b, width, 2, Limit::Left).unwrap();
+                    assert_eq!(right[0], va);
+                    assert_eq!(left[0], vb);
+                    close(right[1], slope, 2e-14);
+                    close(left[1], slope, 2e-14);
+                    assert_eq!(right[2], 0.);
+                    assert_eq!(left[2], 0.);
+                }
+            }
+        }
+    }
+}

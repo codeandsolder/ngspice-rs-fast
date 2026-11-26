@@ -154,7 +154,7 @@ impl<'a> CircuitModel<'a> {
         )?;
         let mut charge = Vector::zeros(n);
         let mut dynamic = SparseMatrix::new(n, n);
-        run.dae_nonlinear_charge(&model, &zero, &mut charge, &mut dynamic)?;
+        run.dae_nonlinear_charge(&model, &zero, 0., &mut charge, &mut dynamic)?;
         let base = circuit
             .matrix_pattern()
             .ok_or_else(|| failure("missing finalized MNA pattern"))?;
@@ -231,6 +231,7 @@ impl HarmonicModel for CircuitModel<'_> {
         self.run.dae_nonlinear_charge(
             &self.model,
             state,
+            0.,
             &mut sample.charge,
             &mut sample.capacitance,
         )

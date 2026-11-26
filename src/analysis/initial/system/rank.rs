@@ -5,8 +5,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::maths::{SparseMatrix, Vector};
-use crate::primitives::numeric::{binary_exponent, scale_power};
+use crate::primitives::numeric::binary_exponent;
+
+mod wide;
 use crate::primitives::{Real, SpiceResult};
+use wide::Wide;
 
 use super::failure;
 
@@ -14,42 +17,59 @@ use super::failure;
 /// in unrelated columns must not suppress a small but independent pivot.
 #[derive(Clone, Copy, Debug, Default)]
 struct Coefficient {
-    value: Real,
-    error: Real,
+    value: Wide,
+    error: Wide,
 }
 
 impl Coefficient {
-    const fn exact(value: Real) -> Self {
-        Self { value, error: 0. }
+    fn exact(value: Real) -> Self {
+        Self {
+            value: Wide::from_real(value),
+            error: Wide::ZERO,
+        }
+    }
+
+    fn scaled(value: Real, exponent: i32) -> Self {
+        Self {
+            value: Wide::from_real(value).shifted(i64::from(exponent)),
+            error: Wide::ZERO,
+        }
     }
 
     const fn finite(self) -> bool {
-        self.value.is_finite() && self.error.is_finite()
+        self.value.finite() && self.error.finite()
     }
 
     fn eliminate(self, factor: Self, pivot: Self) -> Self {
-        let value = (-factor.value).mul_add(pivot.value, self.value);
-        let error = Real::EPSILON.mul_add(
-            value.abs(),
-            factor.error.mul_add(
-                pivot.value.abs() + pivot.error,
-                factor.value.abs().mul_add(pivot.error, self.error),
-            ),
-        );
+        let (value, roundoff) = factor
+            .value
+            .negate()
+            .mul_add_with_roundoff(pivot.value, self.value);
+        let error = factor
+            .error
+            .upper_mul_add(
+                pivot.value.abs().upper_add(pivot.error),
+                factor.value.abs().upper_mul_add(pivot.error, self.error),
+            )
+            .upper_add(roundoff);
         Self { value, error }
     }
 
     fn normalized(self, pivot: Self) -> Self {
-        let value = self.value / pivot.value;
-        let error = Real::EPSILON.mul_add(
-            value.abs(),
-            value.abs().mul_add(pivot.error, self.error) / (pivot.value.abs() - pivot.error),
-        );
+        let (value, residual) = self.value.divide_with_residual(pivot.value);
+        // For exact numerator n+dn and denominator d+dd,
+        // (n+dn)-q*(d+dd) = (n-q*d)+dn-q*dd. Bound the residual
+        // before dividing by the lower bound on the pivot magnitude.
+        let numerator = value
+            .abs()
+            .upper_mul_add(pivot.error, self.error)
+            .upper_add(residual);
+        let error = numerator.upper_divide(pivot.value.abs().lower_subtract(pivot.error));
         Self { value, error }
     }
 
     fn significant(self) -> bool {
-        self.value.abs() > self.error
+        self.value.magnitude_cmp(self.error).is_gt()
     }
 }
 
@@ -58,28 +78,41 @@ type Row = BTreeMap<usize, Coefficient>;
 struct Pivot {
     column: usize,
     terms: Row,
-    rhs: Real,
+    rhs: Wide,
 }
 
 struct Basis {
     pivots: Vec<Pivot>,
     by_column: Vec<Option<usize>>,
+    required_prefix: usize,
+    remaining_work: usize,
 }
 
 impl Basis {
-    fn new(columns: usize) -> Self {
+    fn new(columns: usize, required_prefix: usize) -> Self {
         Self {
             pivots: Vec::new(),
             by_column: vec![None; columns],
+            required_prefix,
+            remaining_work: 67_108_864,
         }
     }
 
-    fn insert(&mut self, mut terms: Row, mut rhs: Real) -> SpiceResult<bool> {
+    fn charge(&mut self, work: usize) -> SpiceResult<()> {
+        self.remaining_work = self.remaining_work.checked_sub(work).ok_or_else(|| {
+            failure("instantaneous rank reduction exceeded its elimination work limit")
+        })?;
+        Ok(())
+    }
+
+    fn insert(&mut self, mut terms: Row, mut rhs: Wide) -> SpiceResult<bool> {
+        self.charge(terms.len())?;
         let mut pending: BTreeSet<_> = terms
             .keys()
             .filter_map(|&column| self.by_column[column])
             .collect();
         while let Some(index) = pending.pop_first() {
+            self.charge(self.pivots[index].terms.len().saturating_add(1))?;
             let pivot = &self.pivots[index];
             let Some(factor) = terms.remove(&pivot.column) else {
                 continue;
@@ -87,7 +120,7 @@ impl Basis {
             for (&column, &value) in &pivot.terms {
                 let old = terms.get(&column).copied().unwrap_or_default();
                 let next = old.eliminate(factor, value);
-                if next.value == 0. && next.error == 0. {
+                if next.value.is_zero() && next.error.is_zero() {
                     terms.remove(&column);
                 } else {
                     terms.insert(column, next);
@@ -96,9 +129,9 @@ impl Basis {
                     }
                 }
             }
-            rhs = (-factor.value).mul_add(pivot.rhs, rhs);
+            rhs = factor.value.negate().mul_add(pivot.rhs, rhs);
         }
-        if !rhs.is_finite() || terms.values().any(|v| !v.finite()) {
+        if !rhs.finite() || terms.values().any(|v| !v.finite()) {
             return Err(failure(
                 "nonfinite rank reduction of instantaneous constraints",
             ));
@@ -106,7 +139,14 @@ impl Basis {
         let Some((&column, &pivot)) = terms
             .iter()
             .filter(|(_, coefficient)| coefficient.significant())
-            .max_by(|(_, a), (_, b)| a.value.abs().total_cmp(&b.value.abs()))
+            // Eliminate higher Taylor degrees first. A prefix pivot can
+            // appear only when no significant tail coefficient survives;
+            // it is then a constraint on the required initial coordinates.
+            .max_by(|(ca, a), (cb, b)| {
+                (**ca >= self.required_prefix)
+                    .cmp(&(**cb >= self.required_prefix))
+                    .then_with(|| a.value.magnitude_cmp(b.value))
+            })
         else {
             return Ok(false);
         };
@@ -114,8 +154,8 @@ impl Basis {
         for coefficient in terms.values_mut() {
             *coefficient = coefficient.normalized(pivot);
         }
-        rhs /= pivot.value;
-        if !rhs.is_finite() || terms.values().any(|v| !v.finite()) {
+        rhs = rhs.divide(pivot.value);
+        if !rhs.finite() || terms.values().any(|v| !v.finite()) {
             return Err(failure("nonfinite normalized instantaneous constraint"));
         }
         self.by_column[column] = Some(self.pivots.len());
@@ -124,24 +164,49 @@ impl Basis {
     }
 
     fn solution(&self, column_exponents: &[i32]) -> SpiceResult<Vector> {
-        if self.pivots.len() != self.by_column.len() {
-            return Err(failure(
-                "uic initial conditions cannot be shown consistent: singular instantaneous system has freedoms not resolved by storage-coordinate gauges",
-            ));
+        if self.by_column[..self.required_prefix]
+            .iter()
+            .any(Option::is_none)
+        {
+            return Err(failure(if self.required_prefix == self.by_column.len() {
+                "uic initial conditions cannot be shown consistent: singular instantaneous system has freedoms not resolved by storage-coordinate gauges"
+            } else {
+                "derivative array leaves required initial coordinates undetermined at this order"
+            }));
         }
-        let mut solution = Vector::zeros(self.by_column.len());
+        self.particular_solution(column_exponents)
+    }
+
+    fn prefix_rank(&self) -> usize {
+        self.by_column[..self.required_prefix]
+            .iter()
+            .filter(|pivot| pivot.is_some())
+            .count()
+    }
+
+    /// Particular Newton correction with zero corrections in unresolved
+    /// coordinates. This does not prove consistency of the initial prefix.
+    fn particular_solution(&self, column_exponents: &[i32]) -> SpiceResult<Vector> {
+        // Free tail coefficients are not initial gauges. The projected
+        // equations proved that none changes the required prefix, so zero
+        // is only a choice of particular solution for the unused tail.
+        let mut solution = vec![Wide::ZERO; self.by_column.len()];
         for pivot in self.pivots.iter().rev() {
             let value = pivot
                 .terms
                 .iter()
                 .fold(pivot.rhs, |rhs, (&column, &coefficient)| {
-                    (-coefficient.value).mul_add(solution.as_slice()[column], rhs)
+                    coefficient.value.negate().mul_add(solution[column], rhs)
                 });
-            solution.as_mut_slice()[pivot.column] = value;
+            solution[pivot.column] = value;
         }
-        for (value, &exponent) in solution.as_mut_slice().iter_mut().zip(column_exponents) {
-            *value = scale_power(*value, -exponent);
-        }
+        let solution = Vector::from(
+            solution
+                .into_iter()
+                .zip(column_exponents)
+                .map(|(value, &exponent)| value.shifted(-i64::from(exponent)).finish())
+                .collect::<Vec<_>>(),
+        );
         if !solution.is_finite() {
             return Err(failure("nonfinite rank-completed instantaneous solution"));
         }
@@ -155,6 +220,7 @@ impl Basis {
 pub(super) struct Completed {
     pub values: Vector,
     pub independent: Vec<bool>,
+    pub prefix_rank: usize,
 }
 
 /// A rectangular or singular instantaneous linearization can contain dependent
@@ -162,14 +228,79 @@ pub(super) struct Completed {
 /// zero-current gauge equations. Scaling by exact powers of two keeps charge,
 /// voltage and current rows on comparable numerical scales. No least-squares
 /// relaxation of the original constraints is performed.
+///
+/// When only an initial coordinate prefix is required, higher-order
+/// columns are eliminated preferentially. Every required coordinate must
+/// have a pivot independent of the free tail; unused jet coefficients
+/// may remain arbitrary. The ordinary instantaneous solve requires all
+/// columns and therefore retains its original pivot selection.
 pub(super) fn complete(
     matrix: &SparseMatrix,
     rhs: &[Real],
     gauges: &[usize],
     late_rows: &[usize],
     optional_rows: &[usize],
+    required_prefix: usize,
 ) -> SpiceResult<Completed> {
-    if rhs.len() != matrix.rows()
+    let reduction = reduce(
+        matrix,
+        rhs,
+        gauges,
+        late_rows,
+        optional_rows,
+        required_prefix,
+    )?;
+    Ok(Completed {
+        values: reduction.basis.solution(&reduction.column_exponents)?,
+        independent: reduction.independent,
+        prefix_rank: reduction.basis.prefix_rank(),
+    })
+}
+
+/// A provisional Newton correction to a possibly rank-deficient array.
+/// Free coordinates retain their current iterate; the caller must recheck
+/// the projected rank and may not accept an incomplete correction.
+pub(super) fn projected_step(
+    matrix: &SparseMatrix,
+    rhs: &[Real],
+    late_rows: &[usize],
+    optional_rows: &[usize],
+    required_prefix: usize,
+) -> SpiceResult<Completed> {
+    let reduction = reduce(matrix, rhs, &[], late_rows, optional_rows, required_prefix)?;
+    Ok(Completed {
+        values: reduction
+            .basis
+            .particular_solution(&reduction.column_exponents)?,
+        independent: reduction.independent,
+        prefix_rank: reduction.basis.prefix_rank(),
+    })
+}
+
+/// The number of independent constraints on the initial-coordinate prefix
+/// after projecting away all higher derivative coefficients.
+pub(super) fn projected_rank(matrix: &SparseMatrix, required_prefix: usize) -> SpiceResult<usize> {
+    let rhs = crate::primitives::filled_vec(matrix.rows(), 0., "derivative array rank")?;
+    let reduction = reduce(matrix, &rhs, &[], &[], &[], required_prefix)?;
+    Ok(reduction.basis.prefix_rank())
+}
+
+struct Reduction {
+    basis: Basis,
+    column_exponents: Vec<i32>,
+    independent: Vec<bool>,
+}
+
+fn reduce(
+    matrix: &SparseMatrix,
+    rhs: &[Real],
+    gauges: &[usize],
+    late_rows: &[usize],
+    optional_rows: &[usize],
+    required_prefix: usize,
+) -> SpiceResult<Reduction> {
+    if required_prefix > matrix.cols()
+        || rhs.len() != matrix.rows()
         || late_rows
             .iter()
             .chain(optional_rows)
@@ -202,7 +333,7 @@ pub(super) fn complete(
             *exponent = 0;
         }
     }
-    let mut basis = Basis::new(matrix.cols());
+    let mut basis = Basis::new(matrix.cols(), required_prefix);
     let entries = matrix.triplets();
     let mut ranges = Vec::with_capacity(matrix.rows());
     let mut cursor = 0;
@@ -221,10 +352,17 @@ pub(super) fn complete(
         priority[row] = 2;
     }
     let mut independent = vec![false; matrix.rows()];
-    let priority = &priority;
-    for row in
-        (0..=2).flat_map(|level| (0..matrix.rows()).filter(move |&row| priority[row] == level))
-    {
+    // Process sparse physical rows before denser rows. In particular,
+    // direct source constraints must not be buried behind a long chain
+    // of equivalent normalized pivots with correlated rounding errors.
+    // Preserve the order of late and optional constraints: their priority
+    // is physical policy, not a matrix fill-reduction heuristic.
+    let mut order: Vec<_> = (0..matrix.rows()).collect();
+    order.sort_unstable_by_key(|&row| {
+        let level = priority[row];
+        (level, if level == 0 { ranges[row].len() } else { 0 }, row)
+    });
+    for row in order {
         let exponent = row_exponents[row];
         if exponent == i32::MIN {
             continue;
@@ -232,25 +370,26 @@ pub(super) fn complete(
         let mut terms = Row::new();
         for entry in &entries[ranges[row].clone()] {
             if entry.value != 0. {
-                let value = scale_power(entry.value, -exponent - column_exponents[entry.col]);
-                if value == 0. {
-                    return Err(failure(
-                        "instantaneous rank scaling would lose a nonzero coefficient",
-                    ));
-                }
-                terms.insert(entry.col, Coefficient::exact(value));
+                terms.insert(
+                    entry.col,
+                    Coefficient::scaled(entry.value, -exponent - column_exponents[entry.col]),
+                );
             }
         }
-        independent[row] = basis.insert(terms, scale_power(rhs[row], -exponent))?;
+        independent[row] = basis.insert(
+            terms,
+            Wide::from_real(rhs[row]).shifted(-i64::from(exponent)),
+        )?;
     }
     for &column in gauges {
         if basis.pivots.len() == matrix.cols() {
             break;
         }
-        basis.insert(Row::from([(column, Coefficient::exact(1.))]), 0.)?;
+        basis.insert(Row::from([(column, Coefficient::exact(1.))]), Wide::ZERO)?;
     }
-    Ok(Completed {
-        values: basis.solution(&column_exponents)?,
+    Ok(Reduction {
+        basis,
+        column_exponents,
         independent,
     })
 }
@@ -266,8 +405,8 @@ mod tests {
         matrix.add(1, 0, 1e300).unwrap();
         matrix.fold_duplicates();
         let rhs = [2e-300, 2e300];
-        assert!(complete(&matrix, &rhs, &[1], &[], &[]).is_err());
-        let result = complete(&matrix, &rhs, &[1, 2], &[], &[]).unwrap();
+        assert!(complete(&matrix, &rhs, &[1], &[], &[], matrix.cols()).is_err());
+        let result = complete(&matrix, &rhs, &[1, 2], &[], &[], matrix.cols()).unwrap();
         assert!((result.values.as_slice()[0] - 2.).abs() < 1e-14);
         assert_eq!(&result.values.as_slice()[1..], &[0., 0.]);
     }
@@ -281,7 +420,7 @@ mod tests {
         // Inconsistent linearization: the algebraic source must win over
         // the dependent charge tangent. The outer physical residual check
         // decides whether the nonlinear charge constraint is satisfied.
-        let result = complete(&matrix, &[1e-6, 2.], &[], &[0], &[]).unwrap();
+        let result = complete(&matrix, &[1e-6, 2.], &[], &[0], &[], matrix.cols()).unwrap();
         assert_eq!(result.values.as_slice(), &[2.]);
     }
 
@@ -293,8 +432,8 @@ mod tests {
         }
         matrix.fold_duplicates();
         let rhs = [3e-15, 6e6, 2.];
-        assert!(complete(&matrix, &rhs, &[], &[], &[]).is_err());
-        let solution = complete(&matrix, &rhs, &[1, 2], &[], &[]).unwrap();
+        assert!(complete(&matrix, &rhs, &[], &[], &[], matrix.cols()).is_err());
+        let solution = complete(&matrix, &rhs, &[1, 2], &[], &[], matrix.cols()).unwrap();
         assert!((solution.values.as_slice()[0] - 3.).abs() < 1e-14);
         assert_eq!(
             solution.values.as_slice()[1] + solution.values.as_slice()[2],
@@ -315,7 +454,15 @@ mod priority_tests {
             matrix.add(row, col, value).unwrap();
         }
         matrix.fold_duplicates();
-        let result = complete(&matrix, &[1., 7., 2., 8.], &[2], &[2], &[1, 3]).unwrap();
+        let result = complete(
+            &matrix,
+            &[1., 7., 2., 8.],
+            &[2],
+            &[2],
+            &[1, 3],
+            matrix.cols(),
+        )
+        .unwrap();
         assert_eq!(result.values.as_slice(), &[1., 2., 0.]);
         assert_eq!(result.independent, [true, false, true, false]);
     }
@@ -324,18 +471,21 @@ mod priority_tests {
     fn unrelated_elimination_rounding_does_not_hide_a_small_pivot() {
         // First pivot mixes column 0 and 1, but the independent column 2
         // is never touched by it. A scalar row error can lose that column.
-        let mut basis = Basis::new(3);
+        let mut basis = Basis::new(3, 3);
         assert!(
             basis
                 .insert(
                     Row::from([(0, Coefficient::exact(2.)), (1, Coefficient::exact(1.))]),
-                    4.
+                    Wide::from_real(4.)
                 )
                 .unwrap()
         );
         assert!(
             basis
-                .insert(Row::from([(1, Coefficient::exact(1.))]), 2.)
+                .insert(
+                    Row::from([(1, Coefficient::exact(1.))]),
+                    Wide::from_real(2.)
+                )
                 .unwrap()
         );
         assert!(
@@ -346,11 +496,212 @@ mod priority_tests {
                         (1, Coefficient::exact(1.)),
                         (2, Coefficient::exact(1e-30))
                     ]),
-                    4.
+                    Wide::from_real(4.)
                 )
                 .unwrap()
         );
         let result = basis.solution(&[0, 0, 0]).unwrap();
         assert_eq!(result.as_slice(), &[1., 2., 0.]);
+    }
+}
+
+#[cfg(test)]
+mod projected_tests {
+    use super::*;
+
+    // Exact derivative-array structure for an arbitrary linear chain:
+    // x_0(t) = p(t), x_i(t) = d x_(i-1) / dt. Highest-order
+    // Taylor coefficients are intentionally not assigned boundary values.
+    fn derivative_chain(depth: usize, order: usize, scale: Real) -> (SparseMatrix, Vec<Real>) {
+        let width = depth + 1;
+        let mut matrix = SparseMatrix::new(order * width, (order + 1) * width);
+        let mut rhs = vec![0.; order * width];
+        let mut degree = 1.;
+        for k in 0..order {
+            let offset = k * width;
+            matrix.add(offset, offset, 1.).unwrap();
+            rhs[offset] = [1., 2. * scale, 3. * scale.powi(2), 4. * scale.powi(3)]
+                .get(k)
+                .copied()
+                .unwrap_or(0.);
+            for i in 1..width {
+                matrix.add(offset + i, offset + i, 1.).unwrap();
+                matrix
+                    .add(offset + i, offset + width + i - 1, -degree / scale)
+                    .unwrap();
+            }
+            degree += 1.;
+        }
+        matrix.fold_duplicates();
+        (matrix, rhs)
+    }
+
+    #[test]
+    fn derivative_depth_resolves_prefix_without_gauging_highest_jets() {
+        for depth in 1..=32 {
+            let width = depth + 1;
+            let (short, rhs) = derivative_chain(depth, depth, 1.);
+            assert!(complete(&short, &rhs, &[], &[], &[], width).is_err());
+            let (matrix, rhs) = derivative_chain(depth, depth + 1, 1.);
+            let result = complete(&matrix, &rhs, &[], &[], &[], width).unwrap();
+            let expected = [1., 2., 6., 24.];
+            for (i, &value) in result.values.as_slice()[..width].iter().enumerate() {
+                assert!((value - expected.get(i).copied().unwrap_or(0.)).abs() < 1e-12);
+            }
+            // The full system must still be rank deficient: projected
+            // uniqueness is not the same as inventing a full-rank system.
+            assert!(complete(&matrix, &rhs, &[], &[], &[], matrix.cols()).is_err());
+        }
+    }
+
+    #[test]
+    fn rank_and_solution_do_not_depend_on_taylor_time_normalization() {
+        for depth in [8, 32, 60] {
+            let width = depth + 1;
+            for scale in [1e-12, 1e-6, 1., 1e6, 1e12] {
+                let (matrix, rhs) = derivative_chain(depth, depth + 2, scale);
+                assert_eq!(
+                    projected_rank(&matrix, 2 * width).unwrap(),
+                    2 * width,
+                    "depth={depth}, scale={scale:e}"
+                );
+                let result = complete(&matrix, &rhs, &[], &[], &[], 2 * width).unwrap();
+                for (index, &value) in result.values.as_slice()[..width].iter().enumerate() {
+                    let expected = [1., 2., 6., 24.].get(index).copied().unwrap_or(0.);
+                    assert!(
+                        (value - expected).abs() < 1e-11,
+                        "depth={depth}, scale={scale:e}, x[{index}]={value:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_feedback_storage_needs_an_independent_initial_constraint() {
+        // x_1 = dx_0/dt, x_1 + x_0 = 0. The first derivative and
+        // subsequent jets are fixed by the physical initial storage x_0.
+        let mut matrix = SparseMatrix::new(8, 8);
+        let mut degree = 1.;
+        for k in 0..3 {
+            let row = 2 * k;
+            matrix.add(row, row + 1, 1.).unwrap();
+            matrix.add(row, row + 2, -degree).unwrap();
+            matrix.add(row + 1, row, 1.).unwrap();
+            matrix.add(row + 1, row + 1, 1.).unwrap();
+            degree += 1.;
+        }
+        matrix.fold_duplicates();
+        assert!(complete(&matrix, &[0.; 8], &[], &[], &[], 2).is_err());
+        matrix.add(6, 0, 1.).unwrap();
+        // The derived condition x_1 = 0 is dependent and must not
+        // displace the physical storage x_0 = 2.
+        matrix.add(7, 1, 1.).unwrap();
+        matrix.fold_duplicates();
+        let result = complete(
+            &matrix,
+            &[0., 0., 0., 0., 0., 0., 2., 0.],
+            &[],
+            &[6],
+            &[7],
+            2,
+        )
+        .unwrap();
+        assert_eq!(&result.values.as_slice()[..2], &[2., -2.]);
+        assert!(result.independent[6]);
+        assert!(!result.independent[7]);
+    }
+}
+
+#[cfg(test)]
+mod projected_oracle {
+    use super::*;
+
+    // Fraction-free integer elimination, independent of sparse floating
+    // pivot selection and scaling. Tiny test matrices keep all products
+    // well within i128 even without fraction reduction.
+    fn exact_rank(mut rows: Vec<Vec<i128>>, columns: usize) -> usize {
+        let mut rank = 0;
+        for col in 0..columns {
+            let Some(pivot) = (rank..rows.len()).find(|&row| rows[row][col] != 0) else {
+                continue;
+            };
+            rows.swap(rank, pivot);
+            let reference = rows[rank].clone();
+            let scale = reference[col];
+            for row in &mut rows[rank + 1..] {
+                let factor = row[col];
+                if factor == 0 {
+                    continue;
+                }
+                for j in col + 1..columns {
+                    row[j] = row[j] * scale - reference[j] * factor;
+                }
+                row[col] = 0;
+            }
+            rank += 1;
+        }
+        rank
+    }
+
+    #[test]
+    fn projected_rank_matches_exact_integer_nullspace_dimension() {
+        let mut random = 0x243f_6a88_85a3_08d3_u64;
+        let mut next = || {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (random >> 32).cast_signed()
+        };
+        for case in 0..512 {
+            let columns = 6;
+            let rows = 1 + case % 7;
+            let prefix = 1 + case % columns;
+            let mut entries: Vec<Vec<i128>> = (0..rows)
+                .map(|_| (0..columns).map(|_| i128::from(next() % 7 - 3)).collect())
+                .collect();
+            // Include dependencies spanning the projected/free boundary.
+            if case % 3 == 0 {
+                for row in &mut entries {
+                    row[columns - 1] = row[0] + row[1];
+                }
+            }
+            if case % 5 == 0 && rows > 1 {
+                entries[rows - 1] = entries[0].clone();
+            }
+            let tail: Vec<_> = entries.iter().map(|row| row[prefix..].to_vec()).collect();
+            let determined =
+                exact_rank(entries.clone(), columns) == prefix + exact_rank(tail, columns - prefix);
+            let known = [2., -3., 5., 7., -1., 4.];
+            let mut matrix = SparseMatrix::new(rows, columns);
+            let mut rhs = vec![0.; rows];
+            for (r, row) in entries.iter().enumerate() {
+                for (c, &value) in row.iter().enumerate() {
+                    // Every oracle coefficient is a small integer.
+                    let value = Real::from(i32::try_from(value).unwrap());
+                    matrix.add(r, c, value).unwrap();
+                    rhs[r] += value * known[c];
+                }
+            }
+            matrix.fold_duplicates();
+            let result = complete(&matrix, &rhs, &[], &[], &[], prefix);
+            assert_eq!(result.is_ok(), determined, "case {case}: {entries:?}");
+            if let Ok(result) = result {
+                for (&actual, &expected) in result.values.as_slice()[..prefix]
+                    .iter()
+                    .zip(&known[..prefix])
+                {
+                    assert!(
+                        (actual - expected).abs() < 1e-9,
+                        "case {case}: {actual} != {expected}"
+                    );
+                }
+                let residual = matrix.mul_vector(&result.values).unwrap();
+                for (&actual, &expected) in residual.as_slice().iter().zip(&rhs) {
+                    assert!(
+                        (actual - expected).abs() < 1e-9,
+                        "case {case}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
     }
 }
