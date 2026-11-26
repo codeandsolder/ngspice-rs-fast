@@ -153,10 +153,11 @@ esac
 fn aggregate_budget_charges_both_streams_and_repeated_section_visits() {
     let scratch = tempfile::tempdir().unwrap();
     let directory = scratch.path();
-    let root_text = "title\n.lib shared.lib a\n.lib shared.lib b\n.op\n.end\n";
+    let root_text = "title\n.lib shared.lib a\n.lib alias.lib b\n.op\n.end\n";
     let lib_text = ".lib a\nr1 a 0 1k\n.endl a\n.lib b\nr2 b 0 2k\n.endl b\n";
     let root = write(directory, "root.cir", root_text);
-    write(directory, "shared.lib", lib_text);
+    let library = write(directory, "shared.lib", lib_text);
+    std::os::unix::fs::symlink(library, directory.join("alias.lib")).unwrap();
     let command = executable(directory, "cat");
     let settings = config(command);
     let bytes = 2 * (root_text.len() + 2 * lib_text.len());
@@ -347,5 +348,26 @@ printf '%s\n' 'control output' 'v1 in 0 2' 'r1 in 0 1k' '.control' 'op' 'print v
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn configured_root_alias_resolves_links_from_command_origin() {
+    let scratch = tempfile::tempdir().unwrap();
+    let directory = scratch.path();
+    let actual = write(
+        directory,
+        "original/root.cir",
+        "title\n.include child.inc\n.op\n.end\n",
+    );
+    let child = write(directory, "original/child.inc", "r1 a 0 1k\n");
+    let alias = directory.join("root-link.cir");
+    std::os::unix::fs::symlink(actual, &alias).unwrap();
+    let command = executable(directory, "cat");
+    let parsed = parse(&alias, config(command), SourceLimits::default()).unwrap();
+    assert_eq!(parsed.netlist.path, alias);
+    assert_eq!(
+        parsed.netlist.devices[0].location.path(),
+        child.canonicalize().unwrap()
     );
 }

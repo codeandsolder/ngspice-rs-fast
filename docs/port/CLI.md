@@ -278,7 +278,7 @@ Without an explicit executable, ordinary plaintext processing is unchanged.
 Semantic parsing, simulation and control execution run the command once per
 unique canonical source during deck admission, including linked include and
 library files. Multiple visits or sections share one transformed snapshot.
-Relative directives retain their original source path context; the ordinary
+Relative directives use the canonical source directory passed to the command; the ordinary
 resolver still selects sections, tracks include chains and detects cycles.
 Locations refer to physical lines in the admitted replacement text at the
 original source path. Summary, cards and tokens admit only the root, as before.

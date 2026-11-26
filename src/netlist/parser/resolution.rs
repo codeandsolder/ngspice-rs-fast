@@ -207,6 +207,9 @@ impl<'a> Resolver<'a> {
     /// Each visit consumes the original full file length, even a cache hit
     /// selecting an empty library section. Only physical I/O is deduplicated.
     fn fragment(&mut self, path: &Path, location: &SourceLoc) -> SpiceResult<Rc<Fragment>> {
+        if let Some(admission) = self.admission {
+            admission.check_cancelled(location)?;
+        }
         let remaining = self.budget.begin_file(location)?;
         if let Some(source) = self.sources.get_mut(path) {
             self.budget.bytes(source.bytes, location)?;
@@ -249,9 +252,22 @@ impl<'a> Resolver<'a> {
                 "source include depth limit exceeded",
             ));
         }
-        let target = directive
-            .location
-            .path()
+        // An explicit transformation receives the canonical source path
+        // and runs in its directory, so linked output must use that same
+        // physical origin (including when the root was opened via a symlink).
+        // Preserve the caller's root spelling in diagnostic locations.
+        let origin = if self.admission.is_some_and(SourceAdmission::transforms) {
+            &self
+                .dependencies
+                .node_weight(parent)
+                .ok_or_else(|| {
+                    SpiceError::parse(directive.location.clone(), "missing source origin")
+                })?
+                .0
+        } else {
+            directive.location.path()
+        };
+        let target = origin
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(&directive.path);
@@ -453,11 +469,14 @@ mod tests {
         ));
         let original = ".lib tt\nr1 a 0 1k\n+ tc1=0.1\n.endl tt\n.lib ff\nmalformed {\n.endl ff\n";
         fs::write(&path, original).unwrap();
-        let mut resolver = Resolver::new(SourceLimits {
-            files: 3,
-            bytes: 2 * original.len(),
-            ..SourceLimits::default()
-        });
+        let mut resolver = Resolver::new(
+            SourceLimits {
+                files: 3,
+                bytes: 2 * original.len(),
+                ..SourceLimits::default()
+            },
+            None,
+        );
         let location = SourceLoc::new(PathBuf::from("root.cir"), 2, 1);
         let first = resolver.fragment(&path, &location).unwrap();
         let selected = first

@@ -26,6 +26,21 @@ impl SourceAdmission {
         }
     }
 
+    pub(in crate::netlist) const fn transforms(&self) -> bool {
+        self.config.command.is_some()
+    }
+
+    pub(in crate::netlist) fn check_cancelled(&self, location: &SourceLoc) -> SpiceResult<()> {
+        if self.cancellation.is_cancelled() {
+            Err(SpiceError::parse(
+                location.clone(),
+                "source processing cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) fn read(
         &self,
         path: &Path,

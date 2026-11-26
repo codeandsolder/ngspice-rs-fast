@@ -321,12 +321,14 @@ EXIT STATUS:
 ///
 /// Returns an unsupported-command error for missing required arguments.
 pub fn run(args: &Args) -> SpiceResult<()> {
-    args.preprocess
-        .validate(args.command.needs_netlist())
-        .map_err(|feature| SpiceError::Unsupported {
-            feature,
-            location: None,
-        })?;
+    if !matches!(args.command, Command::Help | Command::Version) {
+        args.preprocess
+            .validate(args.command.needs_netlist())
+            .map_err(|feature| SpiceError::Unsupported {
+                feature,
+                location: None,
+            })?;
+    }
     let admission = args.preprocess.admission();
     match args.command {
         Command::Help => {
