@@ -217,3 +217,56 @@ fn uic_storage_ic_overrides_differential_node_hint_without_bias_stamps() {
         close(last(&p, "i(c1:bias)"), 0., 1e-12);
     }
 }
+
+#[test]
+fn prepared_hard_bias_survives_binned_geometry_candidates() {
+    use model_normalize_ngspice::passive_ic::{
+        InitialConditions, PassiveInitialCondition, PassiveKind,
+    };
+    use ngspice_rs::netlist::prepared_initialization::PreparedInitialConditions;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deck.cir");
+    std::fs::write(
+        &path,
+        "geometry sweep with independent capacitor bias
+v1 supply 0 10
+r1 supply p 10
+c1 p 0 1n
+vd d 0 0.1
+vg g 0 0.8
+m1 d g 0 0 nch l=1u w=1u
+.model nch.1 nmos level=8 lmin=0.5u lmax=2u wmin=0.5u wmax=2u vth0=0.3
+.model nch.2 nmos level=8 lmin=0.5u lmax=2u wmin=2u wmax=5u vth0=0.5
+.dc @m1[w] 1u 3u 1u
+.end
+",
+    )
+    .unwrap();
+    let mut netlist = Parser::new().parse_file(&path).unwrap();
+    PreparedInitialConditions::attach(
+        &mut netlist,
+        dir.path(),
+        InitialConditions {
+            devices: vec![PassiveInitialCondition {
+                artifact: "deck.cir".to_owned(),
+                scope: Vec::new(),
+                device: "c1".to_owned(),
+                kind: PassiveKind::Capacitor,
+                target: Some("3".to_owned()),
+                branch: Some("1".to_owned()),
+                mode: None,
+            }],
+            ..InitialConditions::default()
+        },
+    )
+    .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+    let plot = plan.run(&mut circuit, &config.context()).unwrap();
+    assert_eq!(plot.point_count(), 3);
+    for point in 0..plot.point_count() {
+        close(plot.value("v(p)", point).unwrap().re, 3., 1e-10);
+        close(plot.value("i(c1:bias)", point).unwrap().re, 0.7, 1e-10);
+    }
+}

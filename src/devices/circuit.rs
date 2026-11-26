@@ -4734,6 +4734,14 @@ impl Circuit {
             .iter()
             .any(|card| card.kind == crate::primitives::AnalysisKind::Noise);
         circuit.add_instances(&expanded.devices, &models, &setup)?;
+        let binned_deck = BinnedDeck::capture(
+            &expanded.devices,
+            &expanded.models,
+            &models,
+            setup.noise_analysis,
+            &expanded.prepared_initialization,
+        )
+        .map(Arc::new);
         circuit.apply_prepared_initializations(expanded.prepared_initialization)?;
         circuit.add_topology_shunts(setup.shunts)?;
         let referenced: BTreeSet<_> = expanded
@@ -4762,13 +4770,7 @@ impl Circuit {
         circuit.finalize()?;
         // Reject an invalid inductive system (K coupling) before any analysis.
         circuit.prepared_mutual_terms(context)?;
-        circuit.binned_deck = BinnedDeck::capture(
-            &expanded.devices,
-            &expanded.models,
-            &models,
-            setup.noise_analysis,
-        )
-        .map(Arc::new);
+        circuit.binned_deck = binned_deck;
         Ok(circuit)
     }
 
