@@ -36,6 +36,7 @@ pub mod elaborate;
 pub mod eval;
 pub mod expr;
 pub mod parser;
+pub mod prepared_initialization;
 pub mod semantic;
 pub mod snapshot;
 pub mod source;

@@ -1233,6 +1233,9 @@ pub enum ScopedCardKind {
 /// `docs/port/FRONTEND_STRUCTURE.md` and the central `TODO.md`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Netlist {
+    /// Typed source-prepared initialization, separate from native .ic cards.
+    pub prepared_initialization:
+        Option<crate::netlist::prepared_initialization::PreparedInitialConditions>,
     /// The deck's title line.
     pub title: String,
     /// The file the deck came from.
