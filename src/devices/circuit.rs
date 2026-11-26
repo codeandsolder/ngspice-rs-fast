@@ -4546,6 +4546,29 @@ impl Circuit {
         elaboration_limits: ElaborationLimits,
         scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
     ) -> SpiceResult<Self> {
+        Self::from_prepared_netlist_with_limits(
+            netlist,
+            context,
+            mutual_limits,
+            elaboration_limits,
+            scope,
+            &[],
+        )
+    }
+
+    /// Elaborate a prepared electrical artifact with its explicit waveform
+    /// declarations. An optional immutable root scope binds a parameter
+    /// candidate; every subcircuit occurrence resolves its own coefficients.
+    /// # Errors
+    /// Invalid deck, identity, waveform, parameter scope, or resource limits.
+    pub fn from_prepared_netlist_with_limits(
+        netlist: &crate::netlist::ast::Netlist,
+        context: &ModelContext,
+        mutual_limits: MutualLimits,
+        elaboration_limits: ElaborationLimits,
+        scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
+        waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
+    ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
         if !netlist.includes.is_empty() {
             return Err(SpiceError::Unsupported {
@@ -4572,13 +4595,14 @@ impl Circuit {
         // `X` instances are expanded into a fresh device/model list before any
         // device is built, so a deck that fails to elaborate never leaves a
         // partial circuit behind (#18).
-        let expanded = crate::devices::subckt::expand_subcircuits(
+        let expanded = crate::devices::subckt::expand_prepared(
             netlist,
             &elaborated.scope,
             crate::devices::subckt::SubcircuitLimits {
                 max_devices: elaboration_limits.devices,
                 ..Default::default()
             },
+            waveforms,
         )?;
         let models = crate::devices::models::ModelResolver::new(&expanded.models)?
             .with_bin_options(crate::devices::binning::BinOptions {
@@ -4597,6 +4621,24 @@ impl Circuit {
             .iter()
             .any(|card| card.kind == crate::primitives::AnalysisKind::Noise);
         circuit.add_instances(&expanded.devices, &models, &setup)?;
+        let mut prepared: BTreeMap<_, _> = expanded.prepared_waveforms.into_iter().collect();
+        if !prepared.is_empty() {
+            for device in &mut circuit.devices {
+                if let Some(forcing) = prepared.remove(device.name()) {
+                    let source = (&mut *device.device as &mut dyn std::any::Any)
+                        .downcast_mut::<crate::devices::IndependentSource>()
+                        .ok_or_else(|| {
+                            SpiceError::circuit(
+                                "prepared waveform identity is not an independent source",
+                            )
+                        })?;
+                    source.bind_prepared(forcing)?;
+                }
+            }
+            if !prepared.is_empty() {
+                return Err(SpiceError::circuit("unbound expanded prepared waveform"));
+            }
+        }
         circuit.add_topology_shunts(setup.shunts)?;
         let referenced: BTreeSet<_> = expanded
             .devices

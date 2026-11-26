@@ -87,6 +87,8 @@ impl Default for SubcircuitLimits {
 pub struct ExpandedNetlist {
     /// Top-level devices in deck order, `X` instances expanded in place.
     pub devices: Vec<DeviceInstance>,
+    /// Explicit prepared forcing resolved in each flattened instance scope.
+    pub prepared_waveforms: Vec<(String, super::prepared_waveform::PreparedForcing)>,
     /// Root `.model` cards in declaration order, then each instance's renamed
     /// local models in first-reference order.
     pub models: Vec<ModelCard>,
@@ -143,6 +145,40 @@ pub fn expand_with_output(
     measurements: &[MeasureCard],
     fourier: &[FourierCard],
 ) -> SpiceResult<ExpandedNetlist> {
+    expand_with_prepared_output(netlist, root, limits, output, measurements, fourier, &[])
+}
+
+/// Expand a deck with typed prepared source declarations, binding each in its
+/// actual lexical occurrence scope before constructing the physical device.
+/// # Errors
+/// Invalid, duplicate or unbound source identity, scope or waveform.
+pub fn expand_prepared(
+    netlist: &Netlist,
+    root: &Arc<ParamScope>,
+    limits: SubcircuitLimits,
+    waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
+) -> SpiceResult<ExpandedNetlist> {
+    expand_with_prepared_output(
+        netlist,
+        root,
+        limits,
+        &OutputCards::default(),
+        &[],
+        &[],
+        waveforms,
+    )
+}
+
+fn expand_with_prepared_output(
+    netlist: &Netlist,
+    root: &Arc<ParamScope>,
+    limits: SubcircuitLimits,
+    output: &OutputCards,
+    measurements: &[MeasureCard],
+    fourier: &[FourierCard],
+    waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
+) -> SpiceResult<ExpandedNetlist> {
+    let waveforms = PreparedIndex::new(netlist, waveforms)?;
     let sequence = expansion_plan(ScopeView::from(netlist), output, measurements)?;
     let definitions = definitions(netlist);
     check_acyclic(&definitions, &netlist.devices)?;
@@ -174,6 +210,8 @@ pub fn expand_with_output(
         limits,
         budget: EvalBudget::default(),
         devices: Vec::new(),
+        waveforms,
+        prepared_waveforms: Vec::new(),
         models: netlist.models.clone(),
         frontend_cards: 0,
         frontend: Frontend {
@@ -194,6 +232,7 @@ pub fn expand_with_output(
     let mut locals = vec![expander.root_models()];
     let directives = Directives {
         devices: &netlist.devices,
+        definition: "",
         sequence: &sequence,
         initial_conditions: &netlist.initial_conditions,
         nodesets: &netlist.nodesets,
@@ -207,6 +246,7 @@ pub fn expand_with_output(
     )?;
     Ok(ExpandedNetlist {
         devices: expander.devices,
+        prepared_waveforms: expander.prepared_waveforms,
         models: expander.models,
         options: expander.frontend.options,
         initial_conditions: expander.frontend.initial_conditions,
@@ -215,6 +255,83 @@ pub fn expand_with_output(
         measurements: expander.frontend.measurements,
         fourier: expander.frontend.fourier,
     })
+}
+
+/// A declaration is matched once against physical artifact provenance and
+/// lexical definition identity. Multiple occurrences then bind independently.
+type WaveformKey = (String, String, String);
+struct PreparedIndex<'a>(
+    BTreeMap<WaveformKey, &'a model_normalize_ngspice::waveform::PreparedWaveform>,
+);
+
+impl<'a> PreparedIndex<'a> {
+    fn key(device: &DeviceInstance, definition: &str) -> Option<WaveformKey> {
+        let artifact = device.location.path().file_name()?.to_str()?;
+        Some((
+            artifact.to_owned(),
+            definition.to_ascii_lowercase(),
+            device.name.to_ascii_lowercase(),
+        ))
+    }
+
+    fn new(
+        netlist: &Netlist,
+        declarations: &'a [model_normalize_ngspice::waveform::PreparedWaveform],
+    ) -> SpiceResult<Self> {
+        let mut index = BTreeMap::new();
+        if declarations.is_empty() {
+            return Ok(Self(index));
+        }
+        let mut identities = BTreeMap::<WaveformKey, usize>::new();
+        for (definition, devices) in std::iter::once(("", netlist.devices.as_slice())).chain(
+            netlist
+                .subcircuits
+                .iter()
+                .map(|definition| (definition.name.as_str(), definition.devices.as_slice())),
+        ) {
+            for device in devices
+                .iter()
+                .filter(|device| matches!(device.designator, 'v' | 'i'))
+            {
+                if let Some(key) = Self::key(device, definition) {
+                    *identities.entry(key).or_default() += 1;
+                }
+            }
+        }
+        for declaration in declarations {
+            if declaration.scope.len() > 1 {
+                return Err(SpiceError::circuit(
+                    "nested prepared source definition is unsupported",
+                ));
+            }
+            let key = (
+                declaration.artifact.clone(),
+                declaration
+                    .scope
+                    .first()
+                    .map_or_else(String::new, |name| name.to_ascii_lowercase()),
+                declaration.source.to_ascii_lowercase(),
+            );
+            if identities.get(&key) != Some(&1) || index.insert(key, declaration).is_some() {
+                return Err(SpiceError::circuit(format!(
+                    "ambiguous, duplicate or missing prepared source {} in {}",
+                    declaration.source, declaration.artifact
+                )));
+            }
+        }
+        Ok(Self(index))
+    }
+
+    fn get(
+        &self,
+        device: &DeviceInstance,
+        definition: &str,
+    ) -> Option<&'a model_normalize_ngspice::waveform::PreparedWaveform> {
+        if self.0.is_empty() || !matches!(device.designator, 'v' | 'i') {
+            return None;
+        }
+        self.0.get(&Self::key(device, definition)?).copied()
+    }
 }
 
 /// One frame's model identity and an owned card awaiting first use.
@@ -239,6 +356,7 @@ struct Frontend {
 
 struct Directives<'a> {
     devices: &'a [DeviceInstance],
+    definition: &'a str,
     sequence: &'a [ExpansionItem<'a>],
     initial_conditions: &'a [NodeHintCard],
     nodesets: &'a [NodeHintCard],
@@ -335,6 +453,8 @@ struct Expander<'a> {
     limits: SubcircuitLimits,
     budget: EvalBudget,
     devices: Vec<DeviceInstance>,
+    waveforms: PreparedIndex<'a>,
+    prepared_waveforms: Vec<(String, super::prepared_waveform::PreparedForcing)>,
     models: Vec<ModelCard>,
     frontend: Frontend,
     frontend_cards: usize,
@@ -763,6 +883,29 @@ impl<'a> Expander<'a> {
                 }
             }
             instance.name = device_name(&instance.name, instance.designator, path);
+            if let Some(declaration) = self.waveforms.get(original, directives.definition) {
+                let resolved = declaration
+                    .resolve(|text| {
+                        let text = text.trim();
+                        let expression = crate::netlist::parser::parse_parameter_expression(
+                            text.strip_prefix('{')
+                                .and_then(|text| text.strip_suffix('}'))
+                                .unwrap_or(text),
+                            &original.location,
+                        )?;
+                        Ok(scope.evaluate(&expression, &mut self.budget)?)
+                    })
+                    .map_err(|error| {
+                        SpiceError::parse(
+                            original.location.clone(),
+                            format!("prepared source {}: {error}", instance.name),
+                        )
+                    })?;
+                self.prepared_waveforms.push((
+                    instance.name.clone(),
+                    super::prepared_waveform::PreparedForcing::new(resolved)?,
+                ));
+            }
             self.devices.push(instance);
         }
         Ok(())
@@ -848,6 +991,7 @@ impl<'a> Expander<'a> {
             locals,
             &Directives {
                 devices: &body.devices,
+                definition: &definition.name,
                 sequence: &plan.sequence,
                 initial_conditions: &body.initial_conditions,
                 nodesets: &body.nodesets,

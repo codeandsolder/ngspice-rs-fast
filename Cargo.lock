@@ -261,6 +261,7 @@ dependencies = [
  "model-kernel-api",
  "model-kernel-diode",
  "model-kernel-vdmos",
+ "model-normalize-ngspice",
  "ngspice-conformance",
  "ngspice-rs-preprocess",
  "petgraph",

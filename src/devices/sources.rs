@@ -289,6 +289,24 @@ impl IndependentSource {
         Ok(SourceExcitation::from_inputs(voltage, inputs)?.bind(name, terminals))
     }
 
+    /// Replace the reference forcing before circuit finalization, preserving
+    /// the source's electrical identity, terminal order and AC excitation.
+    pub(super) fn bind_prepared(
+        &mut self,
+        forcing: super::prepared_waveform::PreparedForcing,
+    ) -> SpiceResult<()> {
+        if self.port.is_some() || self.power_tone.is_some() {
+            return Err(SpiceError::circuit(
+                "prepared forcing cannot replace an RF port",
+            ));
+        }
+        self.dc = DcExcitation::Explicit(forcing.dc());
+        self.function_given = true;
+        self.accumulated_waveform = None;
+        self.waveform = Arc::new(Waveform::Prepared(forcing));
+        Ok(())
+    }
+
     /// Selects C's PORT cosine time function, including its zero-amplitude
     /// nonport form. Values are initialized by `VSRCtemp`.
     pub(crate) const fn with_power_tone(mut self, tone: Option<(Real, Real)>) -> Self {
@@ -495,6 +513,11 @@ impl Device for IndependentSource {
             return Ok(None);
         }
         let value = match time {
+            // The initial transient observation is the prepared startup
+            // state, not its external left-hand limit.
+            Some((0., _)) if matches!(self.effective_waveform(), Waveform::Prepared(_)) => {
+                self.dc.value()
+            }
             Some((t, f)) => self
                 .effective_waveform()
                 .value_at_timed(t, f.limit, &f.timing)?,
@@ -707,7 +730,13 @@ impl Device for IndependentSource {
                 _ => match context.forcing {
                     Some(forcing) => self.effective_waveform().value_at_timed(
                         time,
-                        forcing.limit,
+                        if transient_op
+                            && matches!(self.effective_waveform(), Waveform::Prepared(_))
+                        {
+                            crate::devices::Limit::Right
+                        } else {
+                            forcing.limit
+                        },
                         &forcing.timing,
                     )?,
                     // DC without a given value: the function at time 0,

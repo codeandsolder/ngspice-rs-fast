@@ -307,6 +307,7 @@ fn eligibility(waveform: &Waveform) -> Eligibility {
         | Waveform::PulseDefaults(_)
         | Waveform::FunctionDefaults(_)
         | Waveform::Stochastic(_) => Eligibility::EveryAccept,
+        Waveform::Prepared(_) => Eligibility::Inert,
     }
 }
 
@@ -321,6 +322,7 @@ pub struct SourceBreaks<'a> {
     current: Vec<ActiveSource>,
     /// Positions in the ordered current list checked off-break too.
     current_always: Vec<usize>,
+    exact: Vec<usize>,
 }
 
 impl PartialEq for SourceBreaks<'_> {
@@ -329,6 +331,7 @@ impl PartialEq for SourceBreaks<'_> {
             && self.voltage == other.voltage
             && self.current == other.current
             && self.current_always == other.current_always
+            && self.exact == other.exact
     }
 }
 
@@ -340,7 +343,11 @@ impl<'a> SourceBreaks<'a> {
         let mut voltage = Vec::new();
         let mut current = Vec::new();
         let mut current_always = Vec::new();
+        let mut exact = Vec::new();
         for (index, source) in system.sources.iter().enumerate() {
+            if matches!(source.waveform.as_ref(), Waveform::Prepared(_)) {
+                exact.push(index);
+            }
             let eligibility = eligibility(&source.waveform);
             if eligibility == Eligibility::Inert {
                 continue;
@@ -366,7 +373,31 @@ impl<'a> SourceBreaks<'a> {
             voltage,
             current,
             current_always,
+            exact,
         }
+    }
+
+    /// Whether this circuit contains a source with exact event semantics.
+    pub const fn has_exact(&self) -> bool {
+        !self.exact.is_empty()
+    }
+
+    /// Next exact prepared-source event after an accepted time. No trial
+    /// consumes the sequence, and native breakpoint coalescing never sees it.
+    /// # Errors
+    /// An unrepresentable periodic event window.
+    pub fn next_exact(&self, now: Real, stop: Real) -> SpiceResult<Option<Real>> {
+        let mut next = None::<Real>;
+        for &index in &self.exact {
+            if let Waveform::Prepared(forcing) = self.system.sources[index].waveform.as_ref()
+                && let Some(event) = forcing
+                    .breakpoints_in(now, stop)?
+                    .find(|event| event.time > now)
+            {
+                next = Some(next.map_or(event.time, |previous| previous.min(event.time)));
+            }
+        }
+        Ok(next)
     }
 
     /// Restart the phases on the same bound system without reallocating.
@@ -458,6 +489,7 @@ impl Request<'_> {
                 self.pwl(pwl.knots(), pwl.delay(), pwl.repeat(), break_time, table)
             }
             Waveform::Step { time, .. } => self.pwl(&[(*time, 0.)], 0., None, break_time, table),
+            Waveform::Prepared(_) => Ok(()),
             Waveform::Stochastic(process) => {
                 let mut events = process.events(self.now, table.final_time)?;
                 while let Some(event) = events.next_event() {
