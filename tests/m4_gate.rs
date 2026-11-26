@@ -179,6 +179,7 @@ fn nonlinear_charge_companion_conserves_charge_on_accepted_timepoints() {
 fn all_device_charge_pairs_are_disposable_and_integrate_actual_nonlinear_q() {
     for body in [
         "v1 a 0 0.3\nd1 a 0 dm\n.model dm d(cjo=1u vj=1)",
+        "v1 a 0 0.3\nd1 a 0 dm\n.model dm d(cjo=1u vj=1 tt=100n vp=0.05)",
         "vc c 0 2\nvb a 0 0.3\nq1 c a 0 qm\n.model qm npn(cje=1u cjc=2u tf=1n)",
         "vd d 0 2\nvg a 0 0.3\nm1 d a 0 0 mm\n.model mm nmos(vto=1 cbd=1u cbs=2u cgso=0.01 cgdo=0.02)",
     ] {
@@ -199,6 +200,12 @@ fn all_device_charge_pairs_are_disposable_and_integrate_actual_nonlinear_q() {
         let mut x = solved.values;
         let row = c.unknowns().node_row(c.nodes().get("a").unwrap()).unwrap();
         x.as_mut_slice()[row] += 0.01;
+        // Independently change the active diode's private charge coordinate:
+        // rejected trials must not advance either charge history.
+        if let Some(node) = c.nodes().get("d1#qp") {
+            let row = c.unknowns().node_row(node).unwrap();
+            x.as_mut_slice()[row] += 1e-5;
+        }
         let dt = 1e-6;
         let coeff = StepHistory::new()
             .trial(IntegrationMethod::Trapezoidal, 1, dt, DEFAULT_XMU)
@@ -325,7 +332,7 @@ fn typed_nested_source_and_temperature_sweeps_are_bounded_and_nonmutating() {
 #[test]
 fn unsupported_physics_and_initialization_are_explicit_not_successful_zero_stamps() {
     for body in [
-        "d1 a 0 dm\n.model dm d(vp=1 tt=1n)",
+        "d1 a 0 dm\n.model dm d(rsw=1)",
         // Gummel-Poon physics is ported (#87); quasi-saturation and excess
         // phase are not.
         "q1 c b 0 qm\n.model qm npn(rco=10)",

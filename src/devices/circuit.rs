@@ -1415,6 +1415,15 @@ impl Circuit {
         self.bindings.convergence_kinds =
             vec![crate::devices::ConvergenceKind::Voltage; self.bindings.unknowns.len()];
         for (device, rows) in self.devices.iter().zip(&self.bindings.branch_rows) {
+            for node in device.constitutive_nodes() {
+                let row = self
+                    .bindings
+                    .unknowns
+                    .node_row(*node)
+                    .ok_or_else(|| SpiceError::circuit("unbound constitutive node"))?;
+                self.bindings.convergence_kinds[row] =
+                    crate::devices::ConvergenceKind::Constitutive;
+            }
             for (local, row) in rows.clone().enumerate() {
                 self.bindings.convergence_kinds[row] = device.branch_convergence(local);
             }
@@ -1455,8 +1464,9 @@ impl Circuit {
             .iter()
             .zip(&self.bindings.branch_rows)
             .any(|(device, rows)| {
-                (0..rows.len())
-                    .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
+                !device.constitutive_nodes().is_empty()
+                    || (0..rows.len())
+                        .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
             });
         mixed.then(|| {
             self.physical_voltage_nodes()
@@ -3266,6 +3276,7 @@ impl Circuit {
                 || original.c_device_type() != replacement.c_device_type()
                 || original.designator() != replacement.designator()
                 || original.terminals() != replacement.terminals()
+                || original.constitutive_nodes() != replacement.constitutive_nodes()
                 || original.branch_currents() != replacement.branch_currents()
                 || (0..original.branch_currents()).any(|row| {
                     original.branch_convergence(row) != replacement.branch_convergence(row)
@@ -3494,6 +3505,7 @@ impl Circuit {
                             && left.c_device_type() == right.c_device_type()
                             && left.designator() == right.designator()
                             && left.terminals() == right.terminals()
+                            && left.constitutive_nodes() == right.constitutive_nodes()
                             && left.findable_branch() == right.findable_branch()
                             && left.expression_current_branch() == right.expression_current_branch()
                             && (0..left.branch_currents())
@@ -4659,9 +4671,15 @@ impl Circuit {
                 InitialStorageRow::Branch(_) => None,
             })
             .collect();
+        let constitutive: BTreeSet<_> = self
+            .devices
+            .iter()
+            .flat_map(|device| device.constitutive_nodes().iter().copied())
+            .collect();
         self.nodes.nodes().iter().filter(move |node| {
             matches!(node.kind, NodeKind::Terminal | NodeKind::Internal)
                 && !signals.contains(&node.id)
+                && !constitutive.contains(&node.id)
         })
     }
 
