@@ -23,7 +23,7 @@ const MAX_ARRAY_ENTRIES: usize = 8_388_608;
 const MAX_ARRAY_VARIABLES: usize = 1_048_576;
 const MAX_ARRAY_ROWS: usize = 1_048_576;
 
-/// PhysicalDaeTaylor validates and folds every Jacobian before returning it.
+/// `PhysicalDaeTaylor` validates and folds every Jacobian before returning it.
 /// Restrict constraint traversal to the requested row rather than scanning
 /// the entire derivative matrix for each independent storage coordinate.
 fn folded_row(matrix: &SparseMatrix, row: usize) -> &[Triplet] {
