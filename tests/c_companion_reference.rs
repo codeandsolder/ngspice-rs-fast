@@ -68,9 +68,7 @@ fn run_rust(deck: &str) -> Plot {
     let config = RunConfig::from_netlist(&netlist).unwrap();
     let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
-    request
-        .run(&mut circuit, &config.context())
-        .unwrap()
+    request.run(&mut circuit, &config.context()).unwrap()
 }
 
 /// Compares `vectors` on `0, grid, 2 grid, ... , stop` plus `breakpoints`.
