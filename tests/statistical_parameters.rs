@@ -487,3 +487,18 @@ fn prepared_model_bins_preserve_mixed_geometry_selection() -> SpiceResult<()> {
     );
     Ok(())
 }
+
+#[test]
+fn prepared_runtime_passive_macros_retain_occurrence_paths() -> SpiceResult<()> {
+    let source = deck(
+        ".func law(t) {1000*simetrix_stat_unif(9,1,7,1,0,0,t)+time}\nv1 a 0 1\nv2 b 0 1\nr1 a 0 {law(.2)}\nr2 b 0 {law(.2)}",
+    );
+    let mut circuit = RunConfig::from_netlist(&source)?.circuit(&source)?;
+    let bias = op(&mut circuit)?;
+    let first = bias.value("i(v1)", 0).unwrap().re;
+    let second = bias.value("i(v2)", 0).unwrap().re;
+    assert!((-1. / 800. ..=-1. / 1200.).contains(&first));
+    assert!((-1. / 800. ..=-1. / 1200.).contains(&second));
+    assert_ne!(first, second);
+    Ok(())
+}

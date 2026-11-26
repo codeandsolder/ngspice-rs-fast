@@ -618,10 +618,10 @@ pub(crate) fn classify_passive(
         };
     });
     if runtime {
-        parameter.kind = ParameterKind::Behavioural(Box::new(BehaviouralExpression {
-            root,
-            ..expression.clone()
-        }));
+        // The symbolic expansion classifies the law, but retain the original
+        // call tree for realization: otherwise macro invocation identities
+        // are lost before statistical calls can be bound.
+        parameter.kind = ParameterKind::Behavioural(Box::new(expression.clone()));
     } else if matches!(parameter.kind, ParameterKind::Behavioural(_)) {
         // A locally shadowed probe call or an erased macro argument may
         // make the syntactically behavioural candidate an ordinary scalar.
