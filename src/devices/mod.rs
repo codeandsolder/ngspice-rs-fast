@@ -60,6 +60,7 @@ mod elaboration;
 mod factory;
 pub mod functions;
 pub mod hfet;
+mod ideal_diode;
 /// Shared Berkeley short-channel input plumbing (BSIM3/BSIM4).
 pub(crate) mod ifparam;
 mod initial;

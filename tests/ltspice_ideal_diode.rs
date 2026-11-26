@@ -1,0 +1,240 @@
+//! Independent LTspice 24.0.12 DC observations from the synthetic model
+//! witness in issue #226, and analytic small-signal/transient checks.
+use std::path::Path;
+
+use ngspice_rs::{
+    analysis::{AnalysisContext, AnalysisInput, bias::solve_dc, newton::NewtonOptions},
+    devices::{Circuit, ModelContext, nonlinear::Diode},
+    netlist::{Parser, ast::Netlist, source::parse_deck_text},
+    primitives::{AnalysisKind, Real},
+};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn parse(body: &str) -> Result<Netlist> {
+    Ok(Parser::new().parse_deck(&parse_deck_text(Path::new("ideal-diode.cir"), body))?)
+}
+
+fn close(actual: Real, expected: Real, abs: Real, rel: Real) {
+    assert!(
+        (actual - expected).abs() <= rel.mul_add(expected.abs(), abs),
+        "{actual:e} != {expected:e}"
+    );
+}
+
+fn dc_current(circuit: &Circuit, context: &ModelContext, source: &str) -> Result<Real> {
+    let options = NewtonOptions {
+        reltol: 1e-10,
+        abstol: 1e-14,
+        vntol: 1e-10,
+        ..NewtonOptions::default()
+    };
+    let solved = solve_dc(circuit, context, &options, &[], None, None)?;
+    let index = circuit
+        .devices()
+        .iter()
+        .position(|device| device.name() == source)
+        .ok_or("source")?;
+    let row = circuit.branch_rows(index).ok_or("source branch")?.start;
+    Ok(-solved.values.get(row).ok_or("source current")?)
+}
+
+const BASE: &str = "ron=2 roff=100 vfwd=1 vrev=2 rrev=3";
+
+#[test]
+fn independent_measured_dc_points() -> Result<()> {
+    let cases: &[(&str, &[(Real, Real)])] = &[
+        (
+            "",
+            &[
+                (1., 0.01),
+                (1.2, 0.11),
+                (2., 0.51),
+                (-2., -0.02),
+                (-3., -0.353333333333),
+            ],
+        ),
+        (
+            "epsilon=0.4 revepsilon=0.6",
+            &[
+                (1.2, 0.0365),
+                (1.4, 0.112),
+                (2., 0.412),
+                (-2.4, -0.0671111111111),
+                (-3., -0.256333333333),
+            ],
+        ),
+        (
+            "ilimit=0.25 revilimit=0.3",
+            &[
+                (1.2, 0.104987240564),
+                (2., 0.251006895019),
+                (4., 0.259996927913),
+                (-3., -0.26133644009),
+            ],
+        ),
+        (
+            "epsilon=0.4 revepsilon=0.6 ilimit=0.25 revilimit=0.3",
+            &[
+                (1.2, 0.0333134917499),
+                (1.4, 0.0992539669997),
+                (2., 0.239393660113),
+                (-2.4, -0.0628102703503),
+                (-3., -0.213411129383),
+            ],
+        ),
+    ];
+    for (extra, points) in cases {
+        for &(voltage, expected) in *points {
+            let deck = parse(&format!(
+                "ideal diode\nV1 a 0 {voltage}\nD1 a 0 dm\n.model dm ltspice_ideal_diode({BASE} {extra})\n.end\n"
+            ))?;
+            let context = ModelContext::default().with_gmin(1e-12);
+            let circuit = Circuit::from_netlist_with_context(&deck, &context)?;
+            close(
+                dc_current(&circuit, &context, "v1")?,
+                expected,
+                1e-12,
+                1e-10,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn small_signal_matches_the_tangent_and_has_no_storage() -> Result<()> {
+    for (extra, voltage, expected) in [
+        ("", 1.2, 0.5),
+        ("epsilon=0.4", 1.2, 0.255),
+        ("ilimit=0.25", 1.2, 0.5 / 0.4_f64.cosh().powi(2)),
+        ("ilimit=0.25 epsilon=0.4", 1.2, 0.223_134_917_499_262_4),
+        ("ilimit=0.25 epsilon=0.4", 1.4, 0.436_269_834_998_524_7),
+        (
+            "revepsilon=0.6 revilimit=0.3",
+            -2.6,
+            0.301_077_027_627_483_34,
+        ),
+    ] {
+        let deck = parse(&format!(
+            "AC\nV1 a 0 DC {voltage} AC 1\nD1 a 0 dm\n.model dm ltspice_ideal_diode({BASE} {extra})\n.end\n"
+        ))?;
+        let context = AnalysisContext {
+            gmin: 1e-12,
+            ..AnalysisContext::default()
+        };
+        let mut circuit = Circuit::from_netlist_with_context(&deck, &context.model_context())?;
+        let plots = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "2", "1k", "1g"])
+            .resolve()?
+            .run_plots(&mut circuit, &context)?;
+        for point in 0..2 {
+            let current = plots[0].value("i(v1)", point).ok_or("AC current")?;
+            close(-current.re, expected, 1e-11, 1e-10);
+            close(current.im, 0., 1e-14, 0.);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn source_family_and_geometry() -> Result<()> {
+    let native = Circuit::from_netlist(&parse("native\nD1 a 0 dm\n.model dm D(IS=1p)\n.end\n")?)?;
+    assert!((native.devices()[0].as_ref() as &dyn std::any::Any).is::<Diode>());
+    let deck = parse(
+        "geometry\nV1 a 0 2\nV2 b 0 4\nV3 c 0 -3\nD1 a 0 dm m=3\nD2 b 0 dm m=3 n=2\nD3 c 0 other\n.model dm ltspice_ideal_diode(ron=2 roff=100 vfwd=1)\n.model other ltspice_ideal_diode(ron=2 roff=100 vrev=2)\n.end\n",
+    )?;
+    let context = ModelContext::default();
+    let circuit = Circuit::from_netlist_with_context(&deck, &context)?;
+    close(dc_current(&circuit, &context, "v1")?, 1.53, 1e-12, 1e-10);
+    close(dc_current(&circuit, &context, "v2")?, 1.53, 1e-12, 1e-10);
+    close(dc_current(&circuit, &context, "v3")?, -0.52, 1e-12, 1e-10);
+    assert_eq!(
+        circuit
+            .devices()
+            .iter()
+            .find(|d| d.name() == "d1")
+            .and_then(|d| d.model_name()),
+        Some("dm")
+    );
+    Ok(())
+}
+
+#[test]
+fn default_off_conductance_rebinds_with_gmin() -> Result<()> {
+    let deck = parse(
+        "default leakage\nV1 a 0 -1\nD1 a 0 dm\n.model dm ltspice_ideal_diode(ron=2)\n.end\n",
+    )?;
+    let context = ModelContext::default().with_gmin(1e-12);
+    let circuit = Circuit::from_netlist_with_context(&deck, &context)?;
+    // Public default is Gmin; the measured vendor point differs by 1e-15 S.
+    close(
+        dc_current(&circuit, &context, "v1")?,
+        -1.001e-12,
+        1.1e-15,
+        0.,
+    );
+    let other = context.with_gmin(1e-5);
+    close(dc_current(&circuit, &other, "v1")?, -1e-5, 1e-12, 1e-10);
+    Ok(())
+}
+
+#[test]
+fn invalid_model_and_instance_fields_are_not_ignored() -> Result<()> {
+    for parameters in [
+        "ron=0",
+        "roff=-1",
+        "epsilon=-1",
+        "ilimit=0",
+        "level=2",
+        "is=1p",
+        "roff=1 epsilon=10 ilimit=1",
+    ] {
+        let deck = parse(&format!(
+            "bad\nD1 a 0 dm\n.model dm ltspice_ideal_diode({parameters})\n.end\n"
+        ))?;
+        assert!(Circuit::from_netlist(&deck).is_err(), "{parameters}");
+    }
+    for fields in ["m=0", "n=0", "temp=-300", "dtemp=1", "off"] {
+        let deck = parse(&format!(
+            "bad\nD1 a 0 dm {fields}\n.model dm ltspice_ideal_diode(ron=2)\n.end\n"
+        ))?;
+        assert!(Circuit::from_netlist(&deck).is_err(), "{fields}");
+    }
+    Ok(())
+}
+
+#[test]
+fn transient_has_exact_memoryless_current_through_both_knees() -> Result<()> {
+    let deck = parse(
+        "transient\nV1 a 0 PWL(0 -4 1u -4 3u 4 4u 4 6u -4)\nD1 a 0 dm\n.model dm ltspice_ideal_diode(ron=2 roff=100 vfwd=1 vrev=2 rrev=3 epsilon=0.4 revepsilon=0.6)\n.end\n",
+    )?;
+    let context = AnalysisContext {
+        gmin: 1e-12,
+        ..AnalysisContext::default()
+    };
+    let mut circuit = Circuit::from_netlist_with_context(&deck, &context.model_context())?;
+    let plots = AnalysisInput::with_arguments(AnalysisKind::Transient, ["10n", "6u", "0", "10n"])
+        .resolve()?
+        .run_plots(&mut circuit, &context)?;
+    let plot = &plots[0];
+    assert!(plot.point_count() > 100);
+    for row in 0..plot.point_count() {
+        let voltage = plot.value("v(a)", row).ok_or("voltage")?.re;
+        let current = -plot.value("i(v1)", row).ok_or("current")?.re;
+        // Independent closed-form piecewise quadratic law, both ramp
+        // directions and plateaus. No dynamic charge term is present.
+        let expected = if voltage > 1.4 {
+            (voltage - 1.4) / 2. + 0.112
+        } else if voltage > 1. {
+            0.01 * voltage + 0.6125 * (voltage - 1.).powi(2)
+        } else if voltage < -2.6 {
+            (voltage + 2.6) / 3. - 0.123
+        } else if voltage < -2. {
+            0.01 * voltage - (1. / 3. - 0.01) * (voltage + 2.).powi(2) / 1.2
+        } else {
+            0.01 * voltage
+        };
+        close(current, expected, 2e-9, 1e-8);
+    }
+    Ok(())
+}
