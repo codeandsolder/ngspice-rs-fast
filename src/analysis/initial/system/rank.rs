@@ -41,26 +41,30 @@ impl Coefficient {
     }
 
     fn eliminate(self, factor: Self, pivot: Self) -> Self {
-        let value = factor.value.negate().mul_add(pivot.value, self.value);
-        let error = Wide::from_real(Real::EPSILON).mul_add(
-            value.abs(),
-            factor.error.mul_add(
-                pivot.value.abs().add(pivot.error),
-                factor.value.abs().mul_add(pivot.error, self.error),
-            ),
-        );
+        let (value, roundoff) = factor
+            .value
+            .negate()
+            .mul_add_with_roundoff(pivot.value, self.value);
+        let error = factor
+            .error
+            .upper_mul_add(
+                pivot.value.abs().upper_add(pivot.error),
+                factor.value.abs().upper_mul_add(pivot.error, self.error),
+            )
+            .upper_add(roundoff);
         Self { value, error }
     }
 
     fn normalized(self, pivot: Self) -> Self {
-        let value = self.value.divide(pivot.value);
-        let error = Wide::from_real(Real::EPSILON).mul_add(
-            value.abs(),
-            value
-                .abs()
-                .mul_add(pivot.error, self.error)
-                .divide(pivot.value.abs().subtract(pivot.error)),
-        );
+        let (value, residual) = self.value.divide_with_residual(pivot.value);
+        // For exact numerator n+dn and denominator d+dd,
+        // (n+dn)-q*(d+dd) = (n-q*d)+dn-q*dd. Bound the residual
+        // before dividing by the lower bound on the pivot magnitude.
+        let numerator = value
+            .abs()
+            .upper_mul_add(pivot.error, self.error)
+            .upper_add(residual);
+        let error = numerator.upper_divide(pivot.value.abs().lower_subtract(pivot.error));
         Self { value, error }
     }
 
