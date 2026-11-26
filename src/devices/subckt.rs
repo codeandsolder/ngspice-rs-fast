@@ -1266,7 +1266,7 @@ impl<'a> Expander<'a> {
                 .ok_or_else(|| SpiceError::circuit("missing emitted model declaration"))?
                 .clone(),
         };
-        card.name = name.to_owned();
+        name.clone_into(&mut card.name);
         self.emitted_locals.insert(name.to_ascii_lowercase());
         if local.root {
             self.statistical_model_origins

@@ -25,6 +25,10 @@ pub(super) struct Realization {
 /// Identities of a bound scalar declaration, its physical occurrence, and
 /// (where applicable) the lexically selected model owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
 pub(crate) struct PreparedSite {
     pub(crate) expression: Identity,
     pub(crate) occurrence: Identity,
