@@ -1,0 +1,254 @@
+//! Branch observations of the executed compiled physical expression graph.
+//! A predicted Taylor root is a probe hint, never proof of an event.
+
+use crate::maths::taylor::Jet;
+use crate::primitives::{Real, SpiceError, SpiceResult};
+use std::cmp::Ordering;
+
+const MAX_GUARD_COEFFICIENTS: usize = 8_388_608;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Region {
+    Sign(Ordering),
+    Interval(usize),
+    Discrete(u64),
+}
+
+/// One operation's active branch and the adjacent candidate boundaries in
+/// its operand coordinate. The slot and operand discriminator are stable
+/// across evaluations of the same compiled program.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalGuard {
+    pub slot: usize,
+    pub operand: u8,
+    pub region: Region,
+    pub argument: Jet,
+    pub boundaries: [Option<Real>; 2],
+}
+
+impl LocalGuard {
+    pub(crate) fn sign(slot: usize, operand: u8, argument: Jet, boundary: Real) -> Self {
+        Self {
+            slot,
+            operand,
+            region: Region::Sign(argument.compare(boundary).unwrap_or(Ordering::Equal)),
+            argument,
+            boundaries: [Some(boundary), None],
+        }
+    }
+
+    pub(crate) fn interval(slot: usize, argument: Jet, boundaries: &[Real]) -> Self {
+        let index = boundaries
+            .partition_point(|&boundary| argument.compare(boundary) != Some(Ordering::Less));
+        Self {
+            slot,
+            operand: 0,
+            region: Region::Interval(index),
+            argument,
+            boundaries: [
+                index
+                    .checked_sub(1)
+                    .and_then(|i| boundaries.get(i))
+                    .copied(),
+                boundaries.get(index).copied(),
+            ],
+        }
+    }
+
+    fn predicted_root(&self, horizon: Real) -> Option<Real> {
+        self.boundaries
+            .iter()
+            .flatten()
+            .filter_map(|&boundary| {
+                let mut coefficients = self.argument.coefficients().to_vec();
+                coefficients[0] -= boundary;
+                first_root(&coefficients, horizon)
+            })
+            .min_by(Real::total_cmp)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Guard {
+    device: usize,
+    local: LocalGuard,
+}
+
+/// Observations belong to a disposable physical point until it is accepted.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BranchTrace {
+    guards: Vec<Guard>,
+    coefficients: usize,
+}
+
+impl BranchTrace {
+    pub(crate) fn extend(&mut self, device: usize, guards: Vec<LocalGuard>) -> SpiceResult<()> {
+        for local in guards {
+            self.coefficients = self
+                .coefficients
+                .checked_add(local.argument.coefficients().len())
+                .filter(|&count| count <= MAX_GUARD_COEFFICIENTS)
+                .ok_or_else(|| SpiceError::circuit("physical branch guard resource limit"))?;
+            self.guards
+                .try_reserve(1)
+                .map_err(|_| SpiceError::circuit("physical branch guard allocation failed"))?;
+            self.guards.push(Guard { device, local });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.guards.is_empty()
+    }
+
+    /// Trace order is the fixed device load order, then compiled slot order.
+    /// Missing guards mean a formerly lazy branch is now active or vice versa.
+    pub(crate) fn same_regions(&self, other: &Self) -> bool {
+        self.guards.len() == other.guards.len()
+            && self.guards.iter().zip(&other.guards).all(|(a, b)| {
+                a.device == b.device
+                    && a.local.slot == b.local.slot
+                    && a.local.operand == b.local.operand
+                    && a.local.region == b.local.region
+            })
+    }
+
+    pub(crate) fn changed_device(&self, other: &Self) -> Option<usize> {
+        for (a, b) in self.guards.iter().zip(&other.guards) {
+            if a.device != b.device
+                || a.local.slot != b.local.slot
+                || a.local.operand != b.local.operand
+                || a.local.region != b.local.region
+            {
+                return Some(a.device.min(b.device));
+            }
+        }
+        if self.guards.len() != other.guards.len() {
+            self.guards
+                .get(other.guards.len())
+                .or_else(|| other.guards.get(self.guards.len()))
+                .map(|guard| guard.device)
+        } else {
+            None
+        }
+    }
+
+    /// Earliest possible root of the local Taylor approximations, in seconds.
+    /// The time scale is the one used to normalize the derivative array.
+    pub(crate) fn predicted_offset(&self, duration: Real, scale: Real) -> Option<Real> {
+        let horizon = duration / scale;
+        self.guards
+            .iter()
+            .filter_map(|guard| {
+                let offset = guard.local.predicted_root(horizon)? * scale;
+                (offset.is_finite() && offset > 0. && offset <= duration).then_some(offset)
+            })
+            .min_by(Real::total_cmp)
+    }
+}
+
+/// First positive root of a Taylor polynomial over (0, horizon]. Strip
+/// the root at the accepted origin; an event already crossed must not be
+/// scheduled again. The coefficients are dimensionless local-time powers.
+fn first_root(coefficients: &[Real], horizon: Real) -> Option<Real> {
+    if !(horizon.is_finite() && horizon > 0.) {
+        return None;
+    }
+    let first = coefficients.iter().position(|&value| value != 0.)?;
+    let last = coefficients.iter().rposition(|&value| value != 0.)?;
+    let coefficients = &coefficients[first..=last];
+    match coefficients {
+        [_] => return None,
+        [a, b] => {
+            let root = -a / b;
+            return (root > 0. && root <= horizon).then_some(root);
+        }
+        _ => {}
+    }
+    // Convert power coefficients on [0,1] to Bernstein coefficients.
+    // Their convex hull encloses the polynomial, so intervals with one
+    // strict sign need no subdivision. This is a hint from a truncated
+    // local germ, not a bound on the actual nonlinear trajectory.
+    let degree = coefficients.len() - 1;
+    let mut power = 1.;
+    let scaled = coefficients
+        .iter()
+        .map(|&value| {
+            let result = if value == 0. { 0. } else { value * power };
+            power *= horizon;
+            result
+        })
+        .collect::<Vec<_>>();
+    if scaled.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let magnitude = scaled.iter().map(|value| value.abs()).fold(0., Real::max);
+    if magnitude == 0. {
+        return None;
+    }
+    let n = u32::try_from(degree).ok()?;
+    let mut bernstein = Vec::with_capacity(degree + 1);
+    for i in 0..=n {
+        let mut ratio = 1.;
+        let mut sum = scaled[0] / magnitude;
+        for k in 0..i {
+            ratio *= Real::from(i - k) / Real::from(n - k);
+            sum = ratio.mul_add(scaled[usize::try_from(k).ok()? + 1] / magnitude, sum);
+        }
+        bernstein.push(sum);
+    }
+    isolate(bernstein).map(|fraction| fraction * horizon)
+}
+
+/// Left-first de Casteljau subdivision, bounded by both work and binary64
+/// time resolution. No recursive call stack or unbounded root search.
+fn isolate(coefficients: Vec<Real>) -> Option<Real> {
+    let mut pending = vec![(0., 1., coefficients)];
+    for _ in 0..512 {
+        let (lo, hi, coefficients) = pending.pop()?;
+        let positive = coefficients.iter().any(|&value| value > 0.);
+        let negative = coefficients.iter().any(|&value| value < 0.);
+        if !(positive && negative) {
+            if coefficients[coefficients.len() - 1] == 0. && hi > 0. {
+                return Some(hi);
+            }
+            continue;
+        }
+        let mid = Real::midpoint(lo, hi);
+        if hi - lo <= 8. * Real::EPSILON || mid <= lo || mid >= hi {
+            return Some(mid);
+        }
+        let n = coefficients.len();
+        let mut work = coefficients;
+        let mut left = Vec::with_capacity(n);
+        let mut right = vec![0.; n];
+        left.push(work[0]);
+        right[n - 1] = work[n - 1];
+        for k in 1..n {
+            for i in 0..n - k {
+                work[i] = Real::midpoint(work[i], work[i + 1]);
+            }
+            left.push(work[0]);
+            right[n - k - 1] = work[n - k - 1];
+        }
+        pending.push((mid, hi, right));
+        pending.push((lo, mid, left));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_roots_include_a_pair_hidden_by_equal_endpoint_signs() {
+        let root = first_root(&[0.1875, -1., 1.], 1.).unwrap();
+        assert!((root - 0.25).abs() < 1e-13);
+        let root = first_root(&[0., 0., -0.75, 1.], 1.).unwrap();
+        assert!((root - 0.75).abs() < 1e-13);
+        assert!(first_root(&[1., 0., 1.], 1.).is_none());
+        assert!(first_root(&[0., 1.], 1.).is_none());
+        assert_eq!(first_root(&[-0.5, 1.], 1.), Some(0.5));
+    }
+}

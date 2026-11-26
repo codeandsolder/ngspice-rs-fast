@@ -5,6 +5,9 @@
 //! coefficient, time discretization, device limiting, or artificial gmin
 //! is introduced by this evaluator.
 
+mod guards;
+pub(crate) use guards::{BranchTrace, LocalGuard, Region};
+
 use crate::devices::{
     AnalysisMode, Forcing, Limit, LoadRequest, ModelContext, PreparedRun, StateHistory,
     TransientTiming, TrialState,
@@ -97,6 +100,27 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         scale: Real,
         limit: Limit,
     ) -> SpiceResult<PhysicalDaeTaylor> {
+        self.evaluate_taylor_inner(state, time, scale, limit, false)
+    }
+
+    pub(crate) fn evaluate_taylor_with_guards(
+        &self,
+        state: &[Vector],
+        time: Real,
+        scale: Real,
+        limit: Limit,
+    ) -> SpiceResult<PhysicalDaeTaylor> {
+        self.evaluate_taylor_inner(state, time, scale, limit, true)
+    }
+
+    fn evaluate_taylor_inner(
+        &self,
+        state: &[Vector],
+        time: Real,
+        scale: Real,
+        limit: Limit,
+        collect_guards: bool,
+    ) -> SpiceResult<PhysicalDaeTaylor> {
         use crate::maths::taylor::{Jet, MAX_ORDER};
         let n = self.run.circuit().unknown_count();
         if state.is_empty()
@@ -121,6 +145,7 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
             (state, Jet::affine(order, time, scale))
         };
         let mut output = PhysicalDaeTaylor::linear(&self.linear, state, forcing)?;
+        output.guards = collect_guards.then(BranchTrace::default);
         self.run
             .dae_nonlinear_taylor(&self.model, state, &time, &mut output)?;
         if limit == Limit::Left {
@@ -233,6 +258,8 @@ pub struct PhysicalDaeTaylor {
     pub conductance: Vec<SparseMatrix>,
     /// Charge/flux Jacobian coefficients.
     pub capacitance: Vec<SparseMatrix>,
+    pub(crate) guards: Option<BranchTrace>,
+    pub(crate) candidate_states: Vec<(usize, Real)>,
 }
 
 impl PhysicalDaeTaylor {
@@ -247,6 +274,8 @@ impl PhysicalDaeTaylor {
             charge: Vec::with_capacity(state.len()),
             conductance: Vec::with_capacity(state.len()),
             capacitance: Vec::with_capacity(state.len()),
+            guards: None,
+            candidate_states: Vec::new(),
         };
         for (degree, x) in state.iter().enumerate() {
             let mut f = system.a.mul_vector(x)?;
@@ -299,6 +328,8 @@ impl PhysicalDaeTaylor {
 /// Device-local bindings and accumulation target for exact physical jets.
 /// Construction is restricted to the prepared physical DAE evaluator.
 pub struct TaylorContext<'a> {
+    pub(crate) device: usize,
+    pub(crate) state_rows: std::ops::Range<usize>,
     pub(crate) model: &'a ModelContext,
     pub(crate) unknowns: &'a crate::devices::MnaUnknowns,
     pub(crate) branch: Option<usize>,
@@ -309,6 +340,24 @@ pub struct TaylorContext<'a> {
 }
 
 impl TaylorContext<'_> {
+    /// Retain the value chosen by the physical germ, not the scalar value
+    /// at an isolated branch boundary.
+    pub(crate) fn candidate_state(&mut self, slot: usize, value: Real) -> SpiceResult<()> {
+        if self.output.guards.is_some() {
+            let row = self
+                .state_rows
+                .start
+                .checked_add(slot)
+                .filter(|&row| self.state_rows.contains(&row))
+                .ok_or_else(|| SpiceError::circuit("invalid physical candidate slot"))?;
+            if !value.is_finite() {
+                return Err(SpiceError::circuit("nonfinite physical candidate state"));
+            }
+            self.output.candidate_states.push((row, value));
+        }
+        Ok(())
+    }
+
     pub(crate) fn variable(&self, column: Option<usize>) -> SpiceResult<crate::maths::taylor::Jet> {
         use crate::maths::taylor::Jet;
         column.map_or_else(

@@ -782,6 +782,9 @@ impl Device for Passive {
             context.linear_static(columns[1], Some(branch), -1.)?;
         }
         let (evaluation, controls) = self.expression.bound_taylor(context)?;
+        if let Some(trace) = &mut context.output.guards {
+            trace.extend(context.device, evaluation.guards)?;
+        }
         let factor = self.expression.checked_factor(context.model.temperature)?;
         let (linear, multiplier) = self.law.constitutive();
         for (&column, coefficient) in columns.iter().zip(linear) {
