@@ -175,7 +175,6 @@ pub fn expand_with_output(
     let binder = crate::netlist::prepared_initialization::Binder::new(netlist, root, &mut budget)?;
     let mut expander = Expander {
         binder,
-        lexical_scope: Vec::new(),
         netlist,
         definitions,
         limits,
@@ -200,6 +199,7 @@ pub fn expand_with_output(
     };
     let mut locals = vec![expander.root_models()];
     let directives = Directives {
+        lexical_scope: &[],
         devices: &netlist.devices,
         sequence: &sequence,
         initial_conditions: &netlist.initial_conditions,
@@ -248,6 +248,9 @@ struct Frontend {
 }
 
 struct Directives<'a> {
+    /// Declaration identity, not the chain of invoking X instances. The
+    /// current native definition index contains root lexical definitions.
+    lexical_scope: &'a [String],
     devices: &'a [DeviceInstance],
     sequence: &'a [ExpansionItem<'a>],
     initial_conditions: &'a [NodeHintCard],
@@ -357,7 +360,6 @@ struct DefinitionPlan<'a> {
 
 struct Expander<'a> {
     binder: Option<crate::netlist::prepared_initialization::Binder<'a>>,
-    lexical_scope: Vec<String>,
     netlist: &'a Netlist,
     definitions: BTreeMap<String, &'a Subcircuit>,
     limits: SubcircuitLimits,
@@ -707,7 +709,7 @@ impl<'a> Expander<'a> {
     ) -> SpiceResult<()> {
         if let Some(binder) = &mut self.binder {
             binder.nodes(
-                &self.lexical_scope,
+                directives.lexical_scope,
                 scope,
                 |node| rewrite_node(&self.global_nodes, node, terminals, path),
                 &mut self.budget,
@@ -803,7 +805,7 @@ impl<'a> Expander<'a> {
                 binder.device(
                     original,
                     &instance.name,
-                    &self.lexical_scope,
+                    directives.lexical_scope,
                     scope,
                     &mut self.budget,
                 )?;
@@ -876,8 +878,6 @@ impl<'a> Expander<'a> {
         let body =
             crate::netlist::elaborate::literalize_body(definition, &scope, &mut self.budget)?;
         locals.push(Self::local_models(body.models, &child_path));
-        self.lexical_scope
-            .push(definition.name.to_ascii_lowercase());
         let result = self.expand_body(
             &child_path,
             depth + 1,
@@ -885,6 +885,7 @@ impl<'a> Expander<'a> {
             &scope,
             locals,
             &Directives {
+                lexical_scope: std::slice::from_ref(&definition.name),
                 devices: &body.devices,
                 sequence: &plan.sequence,
                 initial_conditions: &body.initial_conditions,
@@ -892,7 +893,6 @@ impl<'a> Expander<'a> {
             },
         );
         locals.pop();
-        self.lexical_scope.pop();
         result
     }
 
