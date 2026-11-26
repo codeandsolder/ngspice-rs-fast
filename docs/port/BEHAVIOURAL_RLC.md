@@ -193,8 +193,12 @@ X. Independent sources supply analytic one-sided waveform coefficients;
 behavioural expressions propagate local coefficients through the compiled
 instruction DAG. Reverse differentiation of the active value graph
 provides the Jacobian of the same branch, including clipped exponential
-and regularized division kernels. No finite differences or artificial
-derivative prehistory are used to construct the array.
+and regularized division kernels. Typed source power laws retain their
+absolute-base, real-domain caret and principal complex-real distinctions.
+The physical Jacobian differentiates the local value law, not legacy
+regularized scalar Newton slopes; singular or nonanalytic power germs
+without a classical expansion are rejected. No finite differences or
+artificial derivative prehistory are used to construct the array.
 
 Sparse elimination projects out the free higher coefficients before
 selecting the necessary state and first-rate coordinates. Mandatory

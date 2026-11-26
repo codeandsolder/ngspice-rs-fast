@@ -761,7 +761,7 @@ fn binary(op: Binary, a: &Jet, b: &Jet) -> SpiceResult<Jet> {
     match op {
         Binary::Power(law, PowerPart::Value) => typed_power_jet(law, a, b),
         Binary::Min | Binary::Max => Ok(select_extremum(op, a, b, a, b).clone()),
-        _ => Err(SpiceError::circuit(
+        Binary::Power(_, PowerPart::Base | PowerPart::Exponent) => Err(SpiceError::circuit(
             "derivative-only instruction in physical value graph",
         )),
     }
