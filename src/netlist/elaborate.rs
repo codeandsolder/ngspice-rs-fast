@@ -302,15 +302,28 @@ fn literalize_device_models(
 ) -> SpiceResult<()> {
     for (di, device) in devices.iter_mut().enumerate() {
         crate::netlist::behavioural::classify_device_passives(device, scope, budget)?;
+        let device_site = device
+            .parameters
+            .iter()
+            .any(|parameter| match &parameter.kind {
+                ParameterKind::Expression(expr) => scope.uses_prepared_statistics(&expr.root),
+                ParameterKind::NumericVector(entries) => entries.iter().any(|entry| {
+                    entry
+                        .expression
+                        .as_ref()
+                        .is_some_and(|expr| scope.uses_prepared_statistics(&expr.root))
+                }),
+                ParameterKind::Behavioural(_) | ParameterKind::Waveform(_) => true,
+                _ => false,
+            })
+            .then(|| scope.statistical_site(b"device", &device.name))
+            .flatten();
         literalize_parameters(
             &mut device.parameters,
             scope,
             budget,
             sites.as_deref_mut(),
-            (
-                ParameterOwner::Device(di),
-                scope.statistical_site(b"device", &device.name),
-            ),
+            (ParameterOwner::Device(di), device_site),
         )?;
     }
     for (mi, model) in models.iter_mut().enumerate() {
@@ -324,10 +337,7 @@ fn literalize_device_models(
             scope,
             budget,
             sites.as_deref_mut(),
-            (
-                ParameterOwner::Model(mi),
-                scope.statistical_site(b"model", &model.name),
-            ),
+            (ParameterOwner::Model(mi), None),
         )?;
     }
     Ok(())
@@ -503,11 +513,13 @@ fn literalize_parameters(
 ) -> SpiceResult<()> {
     let mut ordinals = std::collections::HashMap::<String, u64>::new();
     for (index, parameter) in parameters.iter_mut().enumerate() {
-        let name = parameter.name.to_ascii_lowercase();
-        let ordinal = ordinals.entry(name.clone()).or_default();
-        let site =
-            statistical.map(|site| site.field(name.as_bytes()).field(&ordinal.to_le_bytes()));
-        *ordinal += 1;
+        let site = statistical.map(|site| {
+            let name = parameter.name.to_ascii_lowercase();
+            let ordinal = ordinals.entry(name.clone()).or_default();
+            let field = site.field(name.as_bytes()).field(&ordinal.to_le_bytes());
+            *ordinal += 1;
+            field
+        });
         let vector = match &mut parameter.kind {
             ParameterKind::NumericVector(entries) => Some((entries.iter_mut().collect(), false)),
             ParameterKind::Waveform(waveform) => Some((waveform.coefficients_mut(), true)),
@@ -541,8 +553,8 @@ fn literalize_parameters(
         if let ParameterKind::Behavioural(expression) = &parameter.kind {
             // Behavioural expressions stay symbolic: only their `.param`
             // names, `.func` calls and numparam values are resolved here.
-            let resolved = crate::netlist::behavioural::resolve_expression(
-                expression, scope, budget,
+            let resolved = crate::netlist::behavioural::resolve_expression_at(
+                expression, scope, budget, site,
             )
             .map_err(|error| match error {
                 SpiceError::Parse { location, message } => SpiceError::parse(

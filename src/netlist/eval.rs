@@ -874,8 +874,12 @@ impl ParamScope {
         })
     }
 
-    pub(crate) const fn sampler<'a>(&self, location: &'a SourceLoc) -> Sampler<'a> {
-        self.realization.sampler(location)
+    pub(crate) const fn sampler<'a>(
+        &self,
+        location: &'a SourceLoc,
+        site: Option<PreparedSite>,
+    ) -> Sampler<'a> {
+        self.realization.at(site).sampler(location)
     }
 
     pub(crate) fn evaluate_sampled(
@@ -883,12 +887,14 @@ impl ParamScope {
         expression: &ParameterExpression,
         budget: &mut EvalBudget,
         sampler: &Sampler<'_>,
+        expression_identity: Option<model_statistics::Identity>,
     ) -> SpiceResult<Real> {
         evaluate_sampled_root(
             expression,
             &|name| self.get(name),
             self.functions.as_deref(),
             sampler,
+            expression_identity,
             budget,
         )
         .map_err(Failure::into_error)
@@ -896,6 +902,12 @@ impl ParamScope {
 
     /// Inspect the lexical call graph, including shadowed macro definitions.
     pub(crate) fn uses_prepared_statistics(&self, expression: &Expr) -> bool {
+        if matches!(
+            expression.kind,
+            ExprKind::Number { .. } | ExprKind::Identifier(_)
+        ) {
+            return false;
+        }
         let mut pending = vec![(expression, self.functions.as_deref())];
         let mut visited = HashSet::new();
         while let Some((expression, lexical)) = pending.pop() {
@@ -1443,7 +1455,7 @@ struct Frame<'a> {
     scope: &'a FunctionScope,
     args: Vec<Real>,
     call: SourceLoc,
-    call_offset: u64,
+    call_offset: Option<u64>,
     outer: Option<&'a Self>,
 }
 
@@ -1455,12 +1467,15 @@ struct Env<'a> {
     functions: Option<&'a FunctionScope>,
     frame: Option<&'a Frame<'a>>,
     sampler: &'a Sampler<'a>,
+    expression_identity: Option<model_statistics::Identity>,
 }
 
 impl<'a> Env<'a> {
     /// The path of static macro invocations, not evaluation order or values.
     fn statistical_expression(&self) -> Option<model_statistics::Identity> {
-        let mut identity = self.sampler.prepared_site()?.expression;
+        let mut identity = self
+            .expression_identity
+            .or_else(|| self.sampler.prepared_site().map(|site| site.expression))?;
         let mut frames = Vec::new();
         let mut frame = self.frame;
         while let Some(active) = frame {
@@ -1471,7 +1486,7 @@ impl<'a> Env<'a> {
             identity = identity
                 .child(b"macro")
                 .child(active.def.name.as_bytes())
-                .child(&active.call_offset.to_le_bytes());
+                .child(&active.call_offset?.to_le_bytes());
         }
         Some(identity)
     }
@@ -1510,7 +1525,7 @@ fn evaluate_root(
     budget: &mut EvalBudget,
 ) -> Result<Real, Failure> {
     let sampler = realization.sampler(&root.span.start);
-    evaluate_sampled_root(root, lookup, functions, &sampler, budget)
+    evaluate_sampled_root(root, lookup, functions, &sampler, None, budget)
 }
 
 fn evaluate_sampled_root(
@@ -1518,6 +1533,7 @@ fn evaluate_sampled_root(
     lookup: Lookup<'_>,
     functions: Option<&FunctionScope>,
     sampler: &Sampler<'_>,
+    expression_identity: Option<model_statistics::Identity>,
     budget: &mut EvalBudget,
 ) -> Result<Real, Failure> {
     let env = Env {
@@ -1525,6 +1541,7 @@ fn evaluate_sampled_root(
         functions,
         frame: None,
         sampler,
+        expression_identity,
     };
     eval(&root.root, root, env, budget, 0)
 }
@@ -1860,7 +1877,7 @@ fn call(
         call_offset: node
             .span
             .relative_to(&root.span)
-            .map_or(0, |span| span.start as u64),
+            .map(|span| span.start as u64),
         outer: env.frame,
     };
     let inner = Env {
@@ -1868,6 +1885,7 @@ fn call(
         functions: env.functions,
         frame: Some(&frame),
         sampler: env.sampler,
+        expression_identity: env.expression_identity,
     };
     let value =
         eval(&def.body.root, &def.body, inner, budget, depth + CALL_DEPTH).map_err(|f| {

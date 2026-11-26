@@ -214,12 +214,7 @@ fn expand_with_prepared_output(
         devices: Vec::new(),
         waveforms,
         prepared_waveforms: Vec::new(),
-        models: netlist
-            .models
-            .iter()
-            .filter(|card| !crate::netlist::elaborate::model_uses_statistics(card, root))
-            .cloned()
-            .collect(),
+        models: Vec::new(),
         statistical_model_origins: BTreeSet::new(),
         frontend_cards: 0,
         frontend: Frontend {
@@ -343,18 +338,30 @@ impl<'a> PreparedIndex<'a> {
     }
 }
 
-/// One frame's model identity and an owned card awaiting first use.
-///
-/// Root cards already reside in the flattened deck; local cards are moved
-/// there once, while their flattened names remain available for lookup.
+/// One frame's model identity. Ordinary model cards are moved into the
+/// flattened deck once; statistical declarations retain their defining scope
+/// and immutable source until each physical occurrence is bound.
+#[derive(Debug)]
+enum ModelMaterial {
+    Emitted(usize),
+    Pending(ModelCard),
+    Statistical {
+        card: ModelCard,
+        owner: Arc<ParamScope>,
+    },
+}
+
 #[derive(Debug)]
 struct LocalModel {
     name: String,
-    card: ModelCard,
-    owner: Arc<ParamScope>,
-    statistical: bool,
+    material: ModelMaterial,
     root: bool,
-    emitted: bool,
+}
+
+impl LocalModel {
+    const fn statistical(&self) -> bool {
+        matches!(self.material, ModelMaterial::Statistical { .. })
+    }
 }
 
 #[derive(Default)]
@@ -787,16 +794,23 @@ impl<'a> Expander<'a> {
     }
 
     /// The root frame's models: every top-level declaration, unrenamed.
-    fn root_models(&self, scope: &Arc<ParamScope>) -> DeclarationIndex<LocalModel> {
+    fn root_models(&mut self, scope: &Arc<ParamScope>) -> DeclarationIndex<LocalModel> {
         let mut index = DeclarationIndex::new();
         for card in &self.netlist.models {
+            let material = if crate::netlist::elaborate::model_uses_statistics(card, scope) {
+                ModelMaterial::Statistical {
+                    card: card.clone(),
+                    owner: Arc::clone(scope),
+                }
+            } else {
+                let index = self.models.len();
+                self.models.push(card.clone());
+                ModelMaterial::Emitted(index)
+            };
             index.insert_first(&card.name, || LocalModel {
                 name: card.name.clone(),
-                card: card.clone(),
-                owner: Arc::clone(scope),
-                statistical: crate::netlist::elaborate::model_uses_statistics(card, scope),
+                material,
                 root: true,
-                emitted: true,
             });
         }
         index
@@ -815,11 +829,15 @@ impl<'a> Expander<'a> {
             let source_name = card.name.clone();
             index.insert_first(&source_name, || LocalModel {
                 name: format!("{path}.{source_name}"),
-                statistical: crate::netlist::elaborate::model_uses_statistics(&card, scope),
-                card,
-                owner: Arc::clone(scope),
+                material: if crate::netlist::elaborate::model_uses_statistics(&card, scope) {
+                    ModelMaterial::Statistical {
+                        card,
+                        owner: Arc::clone(scope),
+                    }
+                } else {
+                    ModelMaterial::Pending(card)
+                },
                 root: false,
-                emitted: false,
             });
         }
         index
@@ -1192,7 +1210,7 @@ impl<'a> Expander<'a> {
         };
         for frame in locals.iter_mut().rev() {
             if let Some(local) = frame.get_mut(reference) {
-                let name = if local.statistical {
+                let name = if local.statistical() {
                     let site = occurrence()?;
                     let name = format!("{}.__stat_{}", local.name, occurrence_suffix(site));
                     self.emit_statistical_model(local, &name, site)?;
@@ -1217,12 +1235,17 @@ impl<'a> Expander<'a> {
     }
 
     fn emit_model(&mut self, local: &mut LocalModel) {
-        if !local.emitted {
-            let mut card = local.card.clone();
-            card.name.clone_from(&local.name);
-            self.emitted_locals.insert(local.name.to_ascii_lowercase());
-            self.models.push(card);
-            local.emitted = true;
+        let material = std::mem::replace(
+            &mut local.material,
+            ModelMaterial::Emitted(self.models.len()),
+        );
+        match material {
+            ModelMaterial::Pending(mut card) => {
+                card.name.clone_from(&local.name);
+                self.emitted_locals.insert(local.name.to_ascii_lowercase());
+                self.models.push(card);
+            }
+            other => local.material = other,
         }
     }
 
@@ -1232,21 +1255,22 @@ impl<'a> Expander<'a> {
         name: &str,
         site: crate::netlist::eval::statistics::PreparedSite,
     ) -> SpiceResult<()> {
-        let mut card = if local.statistical {
-            crate::netlist::elaborate::realize_model(
-                &local.card,
-                &local.owner,
-                site,
-                &mut self.budget,
-            )?
-        } else {
-            local.card.clone()
+        let mut card = match &local.material {
+            ModelMaterial::Statistical { card, owner } => {
+                crate::netlist::elaborate::realize_model(card, owner, site, &mut self.budget)?
+            }
+            ModelMaterial::Pending(card) => card.clone(),
+            ModelMaterial::Emitted(index) => self
+                .models
+                .get(*index)
+                .ok_or_else(|| SpiceError::circuit("missing emitted model declaration"))?
+                .clone(),
         };
         card.name = name.to_owned();
         self.emitted_locals.insert(name.to_ascii_lowercase());
         if local.root {
             self.statistical_model_origins
-                .insert(local.card.name.to_ascii_lowercase());
+                .insert(local.name.to_ascii_lowercase());
         }
         self.models.push(card);
         Ok(())
@@ -1267,16 +1291,16 @@ impl<'a> Expander<'a> {
         let Some(base) = bin_base(&entries[first_id].name).map(str::to_owned) else {
             return Ok(None);
         };
-        if ids.iter().any(|&id| entries[id].statistical) {
+        if ids.iter().any(|&id| entries[id].statistical()) {
             let site = occurrence()?;
             let sampled_base = format!("{base}.__stat_{}", occurrence_suffix(site));
             for &id in ids {
                 let local = &entries[id];
-                let suffix = local
+                let (_, suffix) = local
                     .name
-                    .strip_prefix(&base)
+                    .rsplit_once('.')
                     .ok_or_else(|| SpiceError::circuit("invalid model bin identity"))?;
-                self.emit_statistical_model(local, &format!("{sampled_base}{suffix}"), site)?;
+                self.emit_statistical_model(local, &format!("{sampled_base}.{suffix}"), site)?;
             }
             self.binned_bases.insert(sampled_base.to_ascii_lowercase());
             return Ok(Some(sampled_base));
@@ -1292,11 +1316,11 @@ impl<'a> Expander<'a> {
 }
 
 fn occurrence_suffix(site: crate::netlist::eval::statistics::PreparedSite) -> String {
-    use std::fmt::Write as _;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut suffix = String::with_capacity(64);
     for byte in site.occurrence.bytes() {
-        // Writing to an owned String cannot fail.
-        let _ = write!(suffix, "{byte:02x}");
+        suffix.push(char::from(HEX[usize::from(byte >> 4)]));
+        suffix.push(char::from(HEX[usize::from(byte & 15)]));
     }
     suffix
 }
