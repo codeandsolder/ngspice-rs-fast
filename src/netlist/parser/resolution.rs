@@ -17,7 +17,8 @@ use super::grammar::{self, ParsedCard};
 use super::scopes::{InputCard, ModelVisibility};
 use crate::netlist::ast::LibrarySection;
 use crate::netlist::card::{DotCommand, RawCard};
-use crate::netlist::source::{Deck, fold_bounded, read_text};
+use crate::netlist::source::admission::SourceAdmission;
+use crate::netlist::source::{Deck, fold_bounded, read_admitted};
 
 use crate::netlist::source::budget::{SourceBudget, SourceLimits};
 
@@ -143,7 +144,8 @@ struct Expansion {
     chain: Arc<[SourceLoc]>,
 }
 
-struct Resolver {
+struct Resolver<'a> {
+    admission: Option<&'a SourceAdmission>,
     budget: SourceBudget,
     sources: BTreeMap<PathBuf, SourceSnapshot>,
     dependencies: DiGraph<SourceKey, ()>,
@@ -153,14 +155,14 @@ struct Resolver {
 pub(super) fn resolve(
     path: &Path,
     limits: SourceLimits,
+    admission: Option<&SourceAdmission>,
 ) -> SpiceResult<(Deck, Vec<SpiceResult<InputCard>>)> {
     let location = SourceLoc::new(path.to_path_buf(), 1, 1);
-    let mut resolver = Resolver::new(limits);
+    let mut resolver = Resolver::new(limits, admission);
     resolver.budget.validate(&location)?;
     let canonical = fs::canonicalize(path).map_err(|e| SpiceError::io(path, &e))?;
     let remaining = resolver.budget.begin_file(&location)?;
-    let text = read_text(&canonical, remaining, &location)?;
-    let bytes = text.len();
+    let (text, bytes) = read_admitted(&canonical, remaining, &location, admission)?;
     resolver.budget.bytes(bytes, &location)?;
     // Keep the caller's root path/title API; fragments use canonical paths.
     let deck = fold_bounded(path, &text, true, &mut resolver.budget)?;
@@ -191,9 +193,10 @@ pub(super) fn resolve(
     Ok((fragment.deck, output))
 }
 
-impl Resolver {
-    fn new(limits: SourceLimits) -> Self {
+impl<'a> Resolver<'a> {
+    fn new(limits: SourceLimits, admission: Option<&'a SourceAdmission>) -> Self {
         Self {
+            admission,
             budget: SourceBudget::new(limits),
             sources: BTreeMap::new(),
             dependencies: DiGraph::new(),
@@ -209,8 +212,7 @@ impl Resolver {
             self.budget.bytes(source.bytes, location)?;
             return source.fragment(path, &mut self.budget);
         }
-        let text = read_text(path, remaining, location)?;
-        let bytes = text.len();
+        let (text, bytes) = read_admitted(path, remaining, location, self.admission)?;
         self.budget.bytes(bytes, location)?;
         let deck = fold_bounded(path, &text, false, &mut self.budget)?;
         let fragment = Rc::new(Fragment::new(deck, &mut self.budget)?);
