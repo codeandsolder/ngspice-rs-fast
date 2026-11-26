@@ -16,9 +16,10 @@ fn knot(time: f64, left: f64, right: f64) -> Knot {
     Knot { time, left, right }
 }
 
-fn pwl(knots: Vec<Knot>, repeat: Option<Repeat>, dc: f64) -> PreparedForcing {
+fn pwl(knots: Vec<Knot>, repeat: Option<Repeat>, dc: f64, startup: f64) -> PreparedForcing {
     PreparedForcing::new(ResolvedWaveform {
         dc,
+        startup,
         forcing: Forcing::PiecewiseLinear { knots, repeat },
         idle_in_pop: false,
     })
@@ -38,6 +39,7 @@ fn aperiodic_external_limits_and_adjacent_events_are_exact() {
     let wave = pwl(
         vec![knot(-2., -1., 2.), knot(1., 5., 7.), knot(next, 7., 9.)],
         None,
+        4.,
         4.,
     );
     for (t, side, expected) in [
@@ -73,6 +75,7 @@ fn signed_cycles_hold_and_lazy_repetition_preserve_limits() {
                 hold: None,
             }),
             0.,
+            if origin < 0. { 3. } else { 5. },
         );
         for cycle in [-2., -1., 0., 1., 100.] {
             let t = origin + cycle;
@@ -97,6 +100,7 @@ fn signed_cycles_hold_and_lazy_repetition_preserve_limits() {
             hold: Some(-3.),
         }),
         -3.,
+        -3.,
     );
     close(held.value_at(0.25, Limit::Left).unwrap(), -3., 0.);
     close(held.value_at(0.25, Limit::Right).unwrap(), 2., 0.);
@@ -109,6 +113,7 @@ fn signed_cycles_hold_and_lazy_repetition_preserve_limits() {
 fn invalid_geometry_is_rejected_and_sine_respects_signed_delay() {
     let invalid = ResolvedWaveform {
         dc: 0.,
+        startup: 1.,
         forcing: Forcing::PiecewiseLinear {
             knots: vec![knot(0., 0., 1.), knot(0., 1., 2.)],
             repeat: None,
@@ -118,6 +123,7 @@ fn invalid_geometry_is_rejected_and_sine_respects_signed_delay() {
     assert!(PreparedForcing::new(invalid).is_err());
     let wave = PreparedForcing::new(ResolvedWaveform {
         dc: 0.,
+        startup: 1. + 2. * (-0.1_f64).exp(),
         forcing: Forcing::Sine {
             offset: 1.,
             amplitude: 2.,
@@ -288,6 +294,7 @@ fn explicit_root_candidate_rebinds_without_changing_source_rows_or_ac() {
             hold_before_delay: "0".into(),
             edges: PulseEdges::Rectangular { duty: "0.5".into() },
         }),
+        dc_override: None,
         idle_in_pop: "0".into(),
     }];
     for height in [1., 3., -2.] {
@@ -349,6 +356,7 @@ fn rounded_periodic_knots_cannot_silently_collapse() {
             hold: None,
         }),
         0.,
+        0.,
     );
     let begin = 2_f64.mul_add(period, origin);
     let end = 3_f64.mul_add(period, origin);
@@ -361,6 +369,7 @@ fn prepared_knot_jets_use_exact_incoming_and_outgoing_segments() {
     let wave = Waveform::Prepared(pwl(
         vec![knot(-2., -1., 2.), knot(1., 5., 7.), knot(3., 3., 9.)],
         None,
+        4.,
         4.,
     ));
     for (time, limit, value, slope) in [
@@ -389,6 +398,7 @@ fn prepared_repeat_jets_follow_previous_cycle_and_startup_hold() {
                 hold,
             }),
             0.,
+            8.,
         ));
         for cycle in [-2., -1., 0., 1., 100.] {
             if hold.is_some() && cycle < 0. {
@@ -424,6 +434,7 @@ fn prepared_affine_jets_do_not_overflow_duration_or_round_away_subnormals() {
         vec![knot(-max, -max, -max), knot(max, max, max)],
         None,
         0.,
+        0.,
     ));
     assert_eq!(
         wave.taylor_at(0., 1., 2, Limit::Right).unwrap(),
@@ -433,6 +444,7 @@ fn prepared_affine_jets_do_not_overflow_duration_or_round_away_subnormals() {
     let wave = Waveform::Prepared(pwl(
         vec![knot(-max, 0., 0.), knot(max / 2., tiny, tiny)],
         None,
+        0.,
         0.,
     ));
     assert_eq!(
@@ -447,6 +459,7 @@ fn prepared_sine_jets_respect_delay_hold_and_exact_analytic_derivatives() {
         let wave = Waveform::Prepared(
             PreparedForcing::new(ResolvedWaveform {
                 dc: 2.,
+                startup: (3. * (-0.5_f64).exp()).mul_add(1., 2.),
                 forcing: Forcing::Sine {
                     offset: 2.,
                     amplitude: 3.,
@@ -501,6 +514,7 @@ fn derivative_declaration(
         scope: Vec::new(),
         source: "v1".into(),
         spec,
+        dc_override: None,
         idle_in_pop: "0".into(),
     }
 }
@@ -696,6 +710,13 @@ fn prepared_periodic_jets_agree_with_every_generated_interval_at_wide_time_scale
                     hold: None,
                 }),
                 0.,
+                if origin < 0. {
+                    // Fraction of the second interval, measured in period units.
+                    -4. + 11. * (0.37 - 0.1) / (0.73 - 0.1)
+                } else {
+                    // Previous cycle: interpolate its last knot to the first left limit.
+                    1. - 4. * (0.81 - 0.73) / (1. - 0.73)
+                },
             ));
             for cycle in [-1024_f64, -1., 0., 1., 1024., 1048576.] {
                 let begin = cycle.mul_add(period, origin);
