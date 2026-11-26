@@ -257,12 +257,86 @@ fn ill_conditioned_source_currents_are_common_mode_invariant() {
 
 #[test]
 fn recover_contributions_cancelled_inside_matrix_or_rhs_cells() {
-    for deck in [
-        "v1 a 0 1\ng1 a 0 a 0 1e12\nr1 a 0 1k\ng2 a 0 a 0 -1e12\n.op",
-        "v1 a 0 1\ni1 0 a 1e12\ni2 0 a 1m\ni3 a 0 1e12\n.op",
+    for (deck, expected) in [
+        (
+            "v1 a 0 1\ng1 a 0 a 0 1e12\nr1 a 0 1k\ng2 a 0 a 0 -1e12\n.op",
+            -1e-3,
+        ),
+        ("v1 a 0 1\ni1 0 a 1e12\ni2 0 a 1m\ni3 a 0 1e12\n.op", 1e-3),
     ] {
         let plot = simulate(deck).unwrap();
-        assert!((value(&plot, "i(v1)").abs() - 1e-3).abs() < 2e-15, "{deck}");
+        assert!((value(&plot, "i(v1)") - expected).abs() < 2e-15, "{deck}");
+    }
+}
+
+/// Correction must happen at nominal convergence, not after exhausting
+/// repeated absolute iterations or invoking continuation.
+#[test]
+fn early_current_correction_stays_in_the_direct_stage() {
+    use ngspice_rs::analysis::bias::{DcOutcome, DcSettings, DcStrategy, solve_dc_with};
+    use ngspice_rs::devices::{Circuit, ModelContext};
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("early.cir"),
+            "Early correction\nv1 a 0 1\nr1 a b 0\nr2 b 0 1k\n.op\n.end\n",
+        ))
+        .unwrap();
+    let circuit = Circuit::from_netlist(&netlist).unwrap();
+    let solved = solve_dc_with(
+        &circuit,
+        &ModelContext::default(),
+        &DcSettings::default(),
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        solved.report.outcome,
+        DcOutcome::Converged(DcStrategy::Direct)
+    );
+    assert_eq!(solved.report.stages.len(), 1);
+    assert!(
+        solved.solution.iterations <= 5,
+        "{} passes",
+        solved.solution.iterations
+    );
+    let row = circuit.branch_rows(0).unwrap().start;
+    assert!((solved.solution.values.get(row).unwrap() + 1. / (1000. + 1e-12)).abs() <= 2e-15);
+    eprintln!(
+        "early current recovery: {} direct Newton passes",
+        solved.solution.iterations
+    );
+}
+
+/// A short feeding a floating RC load at large common mode must retain
+/// both the source current and the accepted capacitor history. Away from
+/// the ramp corner the negligible series-R time constant gives
+/// I = C*dV/dt + V/R = 1 mA + 1000*t A.
+#[test]
+fn ill_conditioned_transient_recovers_source_and_return_currents() {
+    for common in [0., 1000.] {
+        let plot = simulate(&format!(
+            "vh h 0 pwl(0 {common} 1u {} 2u {})\nvl l 0 {common}\nr1 h b 0\nr2 b l 1k\nc1 b l 1n\n.tran 20n 1.8u 0 20n", common+1., common+2.
+        )).unwrap();
+        for point in 0..plot.point_count() {
+            let t = plot.value("time", point).unwrap().re;
+            // Exclude startup and the PWL breakpoint, where companion
+            // restart semantics differ from the smooth analytic ramp.
+            if t < 0.2e-6 || (t - 1e-6).abs() < 0.1e-6 {
+                continue;
+            }
+            let expected = 1000_f64.mul_add(t, 1e-3);
+            for (name, sign) in [("i(vh)", -1.), ("i(vl)", 1.)] {
+                let actual = sign * plot.value(name, point).unwrap().re;
+                assert!(
+                    (actual - expected).abs() < 2e-8,
+                    "CM={common} t={t:e} {name} {actual:e} != {expected:e}"
+                );
+            }
+            let v = plot.value("v(b)", point).unwrap().re - common;
+            assert!((v - 1e6 * t).abs() < 1e-10, "CM={common} t={t:e} v={v:e}");
+        }
     }
 }
 
