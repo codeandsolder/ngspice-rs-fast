@@ -1,0 +1,14 @@
+Series inductance verification
+.options reltol=1e-10 abstol=1e-15
+Vin p 0 0 ac 1
+Vc c 0 0
+S1 p 0 c 0 m1
+S2 p 0 c 0 m2
+S3 p 0 c 0 m3
+S4 p 0 c 0 m4
+.model m1 SW(ron=10 roff=1k vh=-1 lser=1m)
+.model m2 SW(ron=10 roff=1k vh=-1 lser=1m level=2)
+.model m3 SW(ron=10 roff=1k vh=-1)
+.model m4 SW(ron=10 roff=1k vh=-1 level=2)
+.ac dec 1 100 100k
+.end

@@ -27,6 +27,7 @@ pub(super) fn model(input: &mut Input<'_>, base: &str) -> Result<ParameterAssign
                 "nmos" | "pmos" => matches!(key.as_str(), "nmos" | "pmos"),
                 // SW_MOD_SW / CSW_CSW: "just says that this is a switch".
                 "sw" => key == "sw",
+                "ltspice_switch" => key == "oneway",
                 "csw" => key == "csw",
                 // JFETmPTable: JFET_MOD_NJF / JFET_MOD_PJF set the type.
                 "njf" | "pjf" => matches!(key.as_str(), "njf" | "pjf"),

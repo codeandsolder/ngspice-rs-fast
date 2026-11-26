@@ -1,0 +1,23 @@
+Switch control gain
+.options reltol=1e-10 abstol=1e-15 gmin=1e-9
+Vc c 0 dc 0 ac 1
+V1 a 0 -.3
+V2 b 0 -.3
+V3 d 0 -.3
+V4 e 0 -.3
+V5 f 0 -.3
+V6 h 0 -.3
+S1 a 0 c 0 m1
+S2 b 0 c 0 m2
+S3 d 0 c 0 m3
+S4 e 0 c 0 m4
+S5 f 0 c 0 m5
+S6 h 0 c 0 m6
+.model m1 SW(Ron=.1 Roff=100 Vh=-1)
+.model m2 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05)
+.model m3 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=2)
+.model m4 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=2 epsilon=.2)
+.model m5 SW(Ron=.1 Roff=100 Vh=-1 Vser=.1)
+.model m6 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 Vser=.1)
+.ac lin 1 1k 1k
+.end

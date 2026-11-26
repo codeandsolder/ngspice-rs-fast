@@ -64,6 +64,8 @@ pub enum ModelFamily {
     Pmos,
     /// Voltage-controlled switch (`sw`, `sw/sw.c`).
     Switch,
+    /// Explicit prepared LTspice voltage-controlled switch.
+    LtspiceSwitch,
     /// Current-controlled switch (`csw`, `csw/csw.c`).
     CurrentSwitch,
     /// N-channel JFET (`njf`; level 1 `jfet/`, level 2 `jfet2/`).
@@ -104,6 +106,7 @@ impl ModelFamily {
             "nmos" => Some(Self::Nmos),
             "pmos" => Some(Self::Pmos),
             "sw" => Some(Self::Switch),
+            "ltspice_switch" => Some(Self::LtspiceSwitch),
             "csw" => Some(Self::CurrentSwitch),
             "njf" => Some(Self::Njf),
             "pjf" => Some(Self::Pjf),
@@ -131,7 +134,7 @@ impl ModelFamily {
             Self::Diode | Self::SimetrixDiodeLevel1 => 'd',
             Self::Npn | Self::Pnp => 'q',
             Self::Nmos | Self::Pmos => 'm',
-            Self::Switch => 's',
+            Self::Switch | Self::LtspiceSwitch => 's',
             Self::CurrentSwitch => 'w',
             Self::Njf | Self::Pjf => 'j',
             Self::Urc => 'u',
@@ -188,6 +191,8 @@ pub enum ModelBackend {
     Hfet2,
     /// Voltage-controlled switch.
     Switch,
+    /// Explicit prepared LTspice voltage-controlled switch.
+    LtspiceSwitch,
     /// Current-controlled switch.
     CurrentSwitch,
     /// Uniform RC expansion.
@@ -282,11 +287,11 @@ impl ModelBackend {
             }
             's' => {
                 const {
-                    &[BackendSpec::new(
-                        Self::Switch,
-                        "Voltage-controlled switch",
-                        &[1],
-                    )]
+                    &[
+                        BackendSpec::new(Self::Switch, "Voltage-controlled switch", &[1]),
+                        BackendSpec::new(Self::LtspiceSwitch, "Prepared LTspice switch", &[1, 2])
+                            .for_family(ModelFamily::LtspiceSwitch),
+                    ]
                 }
             }
             'w' => {
@@ -1174,6 +1179,14 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
                     format!("SIMetrix diode requires LEVEL=1, got {raw}"),
                 ));
             }
+            if family == ModelFamily::LtspiceSwitch
+                && ![1_f64.to_bits(), 2_f64.to_bits()].contains(&raw.to_bits())
+            {
+                return Err(SpiceError::parse(
+                    p.location.clone(),
+                    format!("LTspice switch requires LEVEL=1 or LEVEL=2, got {raw}"),
+                ));
+            }
             let integer = rounded_level(raw, &p.location)?;
             first.get_or_insert((raw, integer, &p.location));
             last = Some(integer);
@@ -1191,6 +1204,11 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
     // Preserve the first rounded selector, including aliases. Fixed-backend
     // families have separate level setter policy.
     let (selector, valid_setter, applied) = match family {
+        ModelFamily::LtspiceSwitch => (
+            first_integer,
+            last.is_none_or(|last| last == first_integer),
+            None,
+        ),
         ModelFamily::Npn
         | ModelFamily::Pnp
         | ModelFamily::Nmos

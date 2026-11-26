@@ -938,6 +938,7 @@ fn model_flags(base: &str) -> &'static [&'static str] {
         "npn" | "pnp" => &["npn", "pnp"],
         "nmos" | "pmos" => &["nmos", "pmos"],
         "sw" => &["sw"],
+        "ltspice_switch" => &["oneway"],
         "csw" => &["csw"],
         "njf" | "pjf" => &["njf", "pjf"],
         "urc" => &["urc"],
