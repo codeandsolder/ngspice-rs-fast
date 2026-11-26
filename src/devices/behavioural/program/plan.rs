@@ -12,8 +12,10 @@ use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::{collections::HashMap, sync::Arc};
 
 mod derivative;
+mod taylor;
 #[cfg(test)]
 use super::Evaluation;
+pub(in crate::devices::behavioural) use taylor::TaylorEvaluation;
 
 const MAX_INSTRUCTIONS: usize = 262_144;
 /// Index of an instruction and its corresponding scratch value.

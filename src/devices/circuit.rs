@@ -698,23 +698,46 @@ impl<'a> PreparedRun<'a> {
         &self,
         context: &ModelContext,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
+        self.validate_physical_dae(context, false)?;
+        self.transient_forcing_system(context)
+    }
+
+    /// Prepare the memoryless physical DAE with independent forcing at the
+    /// requested time, rather than treating it as a DC or integrated load.
+    ///
+    /// # Errors
+    /// History-dependent or unsupported model, or invalid linear assembly.
+    pub fn prepare_physical_dae(
+        &self,
+        context: &ModelContext,
+        timing: crate::devices::TransientTiming,
+    ) -> SpiceResult<crate::devices::physical_dae::PhysicalDae<'_, 'a>> {
+        self.validate_physical_dae(context, true)?;
+        let linear = self.transient_forcing_system(context)?;
+        crate::devices::physical_dae::PhysicalDae::new(self, *context, timing, linear)
+    }
+
+    fn validate_physical_dae(
+        &self,
+        context: &ModelContext,
+        time_dependent: bool,
+    ) -> SpiceResult<()> {
         let point = self.point(context)?;
         for index in self.circuit.load_order() {
             let device = point.device(self.circuit, index);
-            if device.depends_on_time()
+            if (!time_dependent && device.depends_on_time())
                 || device.depends_on_frequency()
                 || device.small_signal_depends_on_frequency()
                 || device.delay_line().is_some()
                 || device.has_discrete_state()
             {
                 return Err(SpiceError::Unsupported {
-                    feature: format!("frequency-domain physical DAE for {}", device.name()),
+                    feature: format!("memoryless physical DAE for {}", device.name()),
                     location: None,
                 });
             }
         }
-        drop(point);
-        self.circuit.assemble_linear_devices(self, context, true)
+        Ok(())
     }
 
     /// Add exact nonlinear device charge and its derivative to a linear
@@ -723,10 +746,45 @@ impl<'a> PreparedRun<'a> {
         &self,
         context: &ModelContext,
         state: &Vector,
+        time: Real,
         charge: &mut Vector,
         jacobian: &mut SparseMatrix,
     ) -> SpiceResult<()> {
-        self.assemble_charge_for(context, state, charge, jacobian, self.circuit.load_order())
+        self.assemble_charge_for(
+            context,
+            state,
+            time,
+            charge,
+            jacobian,
+            self.circuit.load_order(),
+        )
+    }
+
+    pub(crate) fn dae_nonlinear_taylor(
+        &self,
+        model: &ModelContext,
+        state: &[Vector],
+        time: &crate::maths::taylor::Jet,
+        output: &mut crate::devices::physical_dae::PhysicalDaeTaylor,
+    ) -> SpiceResult<()> {
+        let point = self.point(model)?;
+        for index in self.circuit.load_order() {
+            let device = point.device(self.circuit, index);
+            if device.is_nonlinear() {
+                device.assemble_nonlinear_taylor(
+                    &mut crate::devices::physical_dae::TaylorContext {
+                        model,
+                        unknowns: &self.circuit.bindings.unknowns,
+                        branch: self.circuit.bindings.branch_rows[index].clone().next(),
+                        controls: self.circuit.controls(index)?,
+                        state,
+                        time,
+                        output,
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Assemble only selected physical charge equations for a constrained
@@ -736,6 +794,7 @@ impl<'a> PreparedRun<'a> {
         &self,
         context: &ModelContext,
         state: &Vector,
+        time: Real,
         charge: &mut Vector,
         jacobian: &mut SparseMatrix,
         indices: impl Iterator<Item = usize>,
@@ -747,6 +806,7 @@ impl<'a> PreparedRun<'a> {
             branch: None,
             controls: &[],
             state,
+            time,
             charge,
             jacobian,
         };

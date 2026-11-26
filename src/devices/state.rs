@@ -502,6 +502,21 @@ impl StateHistory {
         Ok(())
     }
 
+    /// Re-anchor integration history at an accepted right-limit event.
+    /// No new physical point or device hook is published. Only the
+    /// pre-event integration stencil is discarded.
+    pub(crate) fn restart_integration(&mut self) -> SpiceResult<()> {
+        let latest = self
+            .accepted
+            .first()
+            .cloned()
+            .ok_or_else(|| state_error("cannot restart empty integration history"))?;
+        self.accepted.clear();
+        self.accepted.resize(ACCEPTED_DEPTH, latest);
+        self.revision = Arc::new(());
+        Ok(())
+    }
+
     /// Begin a new inner DC sweep from the state just accepted.
     pub(crate) fn retain_latest(&mut self) {
         self.accepted.truncate(1);
@@ -511,16 +526,16 @@ impl StateHistory {
         }
     }
 
-    /// Fill a constrained absolute UIC slot in the already loaded trial.
-    pub(crate) fn set_initial_slot(
+    /// Fill a verified absolute slot of a candidate point before acceptance.
+    pub(crate) fn set_candidate_slot(
         &self,
         trial: &mut TrialState,
         slot: usize,
         value: Real,
     ) -> SpiceResult<()> {
         self.check_trial(trial)?;
-        if !trial.initial_conditions() || self.depth() != 0 || !value.is_finite() {
-            return Err(state_error("invalid initial-state override"));
+        if !value.is_finite() {
+            return Err(state_error("invalid candidate-state override"));
         }
         let target = Arc::make_mut(&mut trial.values)
             .get_mut(slot)

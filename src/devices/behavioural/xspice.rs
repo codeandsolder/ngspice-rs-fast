@@ -73,23 +73,45 @@ impl XspicePwl {
     /// The output and its derivative with respect to the input.
     #[must_use = "the returned pair supplies the transfer value and its exact input derivative"]
     pub fn evaluate(&self, input: Real) -> (Real, Real) {
-        let size = self.x.len();
-        // Preserve the reference's priority for the two end tests, even
-        // when mirroring or adding extreme finite abscissas overflows.
-        if input <= self.midpoints[0] {
-            return self.segment(input, 0, 0);
-        }
-        if input >= self.midpoints[size - 2] {
-            return self.segment(input, size - 2, size - 1);
-        }
+        let (value, slope, _) =
+            self.local_polynomial(input, |boundary| input.partial_cmp(&boundary));
+        (value, slope)
+    }
 
-        // All interior midpoints are nondecreasing: the source abscissas
-        // are finite and strictly increasing. Skip exactly the same
-        // midpoints as C's left-to-right scan, including ties. The end
-        // midpoints are excluded from the search because the mirrored
-        // abscissas may overflow.
-        let i = 1 + self.midpoints[1..size - 2].partition_point(|&midpoint| input >= midpoint);
-        self.corner(input, i)
+    /// Value, first derivative and quadratic coefficient of the selected
+    /// local polynomial, evaluated at the original (not perturbed) input.
+    pub(super) fn local_polynomial(
+        &self,
+        input: Real,
+        compare: impl Fn(Real) -> Option<std::cmp::Ordering>,
+    ) -> (Real, Real, Real) {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let size = self.x.len();
+        let affine = |lower, at| {
+            let (value, slope) = self.segment(input, lower, at);
+            (value, slope, 0.)
+        };
+        if matches!(compare(self.midpoints[0]), Some(Less | Equal)) {
+            return affine(0, 0);
+        }
+        if matches!(compare(self.midpoints[size - 2]), Some(Greater | Equal)) {
+            return affine(size - 2, size - 1);
+        }
+        let i = 1 + self.midpoints[1..size - 2]
+            .partition_point(|&midpoint| matches!(compare(midpoint), Some(Greater | Equal)));
+        let (x, y) = (&self.x, &self.y);
+        let lower = x[i] - x[i - 1];
+        let upper = x[i + 1] - x[i];
+        let domain = self.fraction * lower.min(upper);
+        if compare(x[i] - domain) == Some(Less) {
+            return affine(i - 1, i);
+        }
+        if compare(x[i] + domain) == Some(Less) {
+            let lower_slope = (y[i] - y[i - 1]) / lower;
+            let upper_slope = (y[i + 1] - y[i]) / upper;
+            return smooth_corner(input, x[i], y[i], domain, lower_slope, upper_slope);
+        }
+        affine(i, i)
     }
 
     fn segment(&self, input: Real, lower: usize, at: usize) -> (Real, Real) {
@@ -99,6 +121,7 @@ impl XspicePwl {
         (y[at] + offset, slope)
     }
 
+    #[cfg(test)]
     fn corner(&self, input: Real, i: usize) -> (Real, Real) {
         let (x, y) = (&self.x, &self.y);
         let lower = x[i] - x[i - 1];
@@ -110,7 +133,9 @@ impl XspicePwl {
         if input < x[i] + domain {
             let lower_slope = (y[i] - y[i - 1]) / lower;
             let upper_slope = (y[i + 1] - y[i]) / upper;
-            return smooth_corner(input, x[i], y[i], domain, lower_slope, upper_slope);
+            let (value, slope, _) =
+                smooth_corner(input, x[i], y[i], domain, lower_slope, upper_slope);
+            return (value, slope);
         }
         self.segment(input, i, i)
     }
@@ -138,7 +163,7 @@ fn smooth_corner(
     domain: Real,
     lower_slope: Real,
     upper_slope: Real,
-) -> (Real, Real) {
+) -> (Real, Real, Real) {
     let x_upper = centre + domain;
     let upper_rise = upper_slope * domain;
     let y_upper = value + upper_rise;
@@ -151,7 +176,7 @@ fn smooth_corner(
     let quadratic = a * input * input;
     let linear = b * input;
     let derivative = 2. * a * input;
-    (quadratic + linear + c, derivative + b)
+    (quadratic + linear + c, derivative + b, a)
 }
 
 fn invalid(message: &str) -> SpiceError {

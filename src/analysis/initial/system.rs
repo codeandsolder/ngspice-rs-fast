@@ -1,10 +1,14 @@
 //! Ordered elimination of fixed storage coordinates and compact instantaneous MNA.
+mod derivative_array;
 mod rank;
 use super::constraints::{AbsoluteRow, VoltageVertex};
 use super::{CapacitorInitial, ImpulseStorage, Tolerances, failure};
 use crate::devices::{Circuit, InitialStoragePolicy};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceResult};
+pub(super) use derivative_array::{
+    RightLimit, SolveOutcome, solve_event, solve_right_limit, solve_step,
+};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]
@@ -660,7 +664,7 @@ impl<'a> InstantaneousSystem<'a> {
             })
             .collect();
         let optional: Vec<_> = derived.iter().map(|(_, row)| *row).collect();
-        let result = rank::complete(matrix, rhs, &gauges, &charges, &optional)?;
+        let result = rank::complete(matrix, rhs, &gauges, &charges, &optional, matrix.cols())?;
         let retained = derived
             .into_iter()
             .filter_map(|(absolute, row)| result.independent[row].then_some(absolute))

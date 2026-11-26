@@ -40,8 +40,8 @@ use std::sync::Arc;
 use super::xspice::XspicePwl;
 
 mod plan;
-pub(super) use plan::Workspace;
 use plan::{Plan, PlanBuilder, Slot};
+pub(super) use plan::{TaylorEvaluation, Workspace};
 
 /// A circuit quantity an expression reads, in first-use order (C
 /// `mkvnode`/`mkinode` deduplicate them the same way).
@@ -370,6 +370,21 @@ impl Program {
             value,
             gradient: workspace.into_gradient(),
         })
+    }
+
+    pub(super) fn evaluate_taylor(
+        &self,
+        environment: &Environment<'_>,
+        variables: &[crate::maths::taylor::Jet],
+        time: &crate::maths::taylor::Jet,
+    ) -> SpiceResult<TaylorEvaluation> {
+        if variables.len() != self.quantities.len() {
+            return Err(SpiceError::circuit(
+                "wrong number of behavioural Taylor variables",
+            ));
+        }
+        self.plan
+            .evaluate_taylor(self.root, environment, variables, time)
     }
 
     pub(super) fn evaluate_with_workspace<'w>(
@@ -729,10 +744,14 @@ impl PwlTable {
     /// The original C binary search, including extrapolation at both ends.
     /// Preserve its midpoint and strict comparison even for duplicate knots.
     fn segment(&self, arg: Real, order: PwlOrder) -> [(Real, Real); 2] {
+        self.segment_by(|x| order.is_upper(x, arg))
+    }
+
+    fn segment_by(&self, mut upper_than_arg: impl FnMut(Real) -> bool) -> [(Real, Real); 2] {
         let (mut lower, mut upper) = (0, self.points.len() - 1);
         while upper - lower > 1 {
             let middle = usize::midpoint(lower, upper);
-            if order.is_upper(self.points[middle].0, arg) {
+            if upper_than_arg(self.points[middle].0) {
                 upper = middle;
             } else {
                 lower = middle;
