@@ -112,12 +112,18 @@ fn soft_capacitor_and_node_forcing_are_physical_norton_sources() {
         .unwrap();
     }
     c.finalize().unwrap();
+    c.set_observations(&["i(c1)".into(), "@c1[p]".into()])
+        .unwrap();
     let plans = config.plans_for(&n.analyses).unwrap();
     let op = plans[0].run(&mut c, &config.context()).unwrap();
     // Three equal conductances to 2, 0 and the first node hint 1 V.
     close(last(&op, "v(d)"), 1., 1e-12);
+    close(last(&op, "i(c1)"), 1e-3, 1e-12);
+    close(last(&op, "@c1[p]"), 1e-3, 1e-12);
     let dc = plans[1].run(&mut c, &config.context()).unwrap();
     close(last(&dc, "v(d)"), 2., 1e-12);
+    close(last(&dc, "i(c1)"), 0., 1e-12);
+    close(last(&dc, "@c1[p]"), 0., 1e-12);
 }
 
 #[test]
@@ -258,6 +264,7 @@ m1 d g 0 0 nch l=1u w=1u
             }],
             ..InitialConditions::default()
         },
+        [(AnalysisKind::DcSweep, false)],
     )
     .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();

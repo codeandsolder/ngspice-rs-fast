@@ -4732,7 +4732,14 @@ impl Circuit {
         setup.noise_analysis = netlist
             .analyses
             .iter()
-            .any(|card| card.kind == crate::primitives::AnalysisKind::Noise);
+            .any(|card| card.kind == crate::primitives::AnalysisKind::Noise)
+            || expanded
+                .prepared_initialization
+                .analyses
+                .as_ref()
+                .is_some_and(|analyses| {
+                    analyses.contains(&(crate::primitives::AnalysisKind::Noise, false))
+                });
         circuit.add_instances(&expanded.devices, &models, &setup)?;
         let binned_deck = BinnedDeck::capture(
             &expanded.devices,

@@ -117,7 +117,7 @@ fn materialize(bundle: &PreparedBundle, requests: &[AnalysisInput]) -> SpiceResu
         fs::write(dir.path().join(&artifact.filename), &artifact.bytes).unwrap();
     }
     let mut netlist = Parser::new().parse_file(dir.path().join(&bundle.primary.filename))?;
-    PreparedInitialConditions::attach_for_analyses(
+    PreparedInitialConditions::attach(
         &mut netlist,
         dir.path(),
         bundle.initial_conditions.clone().unwrap(),
