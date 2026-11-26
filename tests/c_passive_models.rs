@@ -79,7 +79,7 @@ fn passive_effective_geometry_temperature_and_precedence_match_c() {
             }
             let model = resolver.resolve(instance).unwrap().unwrap();
             let value = model
-                .passive_parameters(instance)
+                .passive_parameters(instance, 1.)
                 .unwrap()
                 .effective_value(&context.model_context())
                 .unwrap();

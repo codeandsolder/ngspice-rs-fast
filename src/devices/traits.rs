@@ -1539,6 +1539,15 @@ pub trait Device: fmt::Debug + std::any::Any {
         }
     }
 
+    /// Dimensional transformation of a raw source setter. Effective device
+    /// replacements always consume physical values, never apply scale again.
+    fn parameter_geometry_scale(
+        &self,
+        _key: crate::devices::sweep::ParameterKey,
+    ) -> crate::devices::sweep::GeometryScale {
+        crate::devices::sweep::GeometryScale::Identity
+    }
+
     /// Create an independent effective device with a previously bound setter.
     /// # Errors
     /// Foreign parameter or invalid physical input.

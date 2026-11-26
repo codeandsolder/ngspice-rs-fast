@@ -1285,7 +1285,7 @@ impl State<'_, '_> {
                         && positioned.text.starts_with('$')
                     {
                         let value =
-                            self.evaluate(&expression(&positioned.text, &positioned.location)?)?;
+                            self.evaluate(&*expression(&positioned.text, &positioned.location)?)?;
                         positioned.text = crate::netlist::elaborate::format_literal(value);
                     }
                 }

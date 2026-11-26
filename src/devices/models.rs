@@ -791,6 +791,8 @@ pub struct ModelContext {
     pub gmin: Real,
     /// Physical shunts used at topology elaboration.
     pub shunts: TopologyShunts,
+    /// Global source geometry scale, applied only when resolving setters.
+    pub geometry_scale: Real,
     /// Resolved circuit relative tolerance (C `CKTreltol`), used by device preparation.
     /// Independent of analysis-local Newton tolerance overrides.
     pub reltol: Real,
@@ -836,6 +838,7 @@ impl ModelContext {
                 resistance: None,
                 capacitance: 0.,
             },
+            geometry_scale: 1.,
             reltol: DEFAULT_RELTOL,
             frequency: 0.,
             spice3_noise: false,
@@ -977,6 +980,12 @@ impl ModelContext {
         self.shunts
             .validate()
             .map_err(|error| SpiceError::parse(location.clone(), error.to_string()))?;
+        if !self.geometry_scale.is_finite() || self.geometry_scale <= 0. {
+            return Err(SpiceError::parse(
+                location.clone(),
+                "geometry scale must be finite and positive",
+            ));
+        }
         temperature_kelvin(self.temperature, location)?;
         temperature_kelvin(self.nominal_temperature, location)?;
         if !(self.frequency.is_finite() && self.frequency >= 0.) {

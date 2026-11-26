@@ -164,7 +164,7 @@ impl Bsim4 {
             ));
         }
         let params = super::model_parameters(model)?;
-        let inputs = params.instance_parameters(instance, 1.)?;
+        let inputs = params.instance_parameters(instance, context.geometry_scale)?;
         let has_start_settings = inputs
             .applied()
             .iter()
@@ -1266,6 +1266,17 @@ impl Device for Bsim4 {
 
     /// Every real instance setter of `b4.c`'s table (`DCTfindInstParam`
     /// accepts any settable instance parameter).
+    fn parameter_geometry_scale(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+    ) -> crate::devices::sweep::GeometryScale {
+        use crate::devices::sweep::{GeometryScale, ParameterKey};
+        match key {
+            ParameterKey::Native(name) => GeometryScale::mos(name),
+            ParameterKey::Prepared(_) => GeometryScale::Identity,
+        }
+    }
+
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
         let p = super::DEVICE.instance.get(keyword)?;
         (p.input_type == super::InputType::Real

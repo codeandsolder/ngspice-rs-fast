@@ -323,9 +323,11 @@ impl<'a> ControlSession<'a> {
         config: &RunConfig,
     ) -> SpiceResult<(Circuit, Vec<InstanceOverride>)> {
         let context = config.context().model_context();
+        let mut setup = context;
+        setup.geometry_scale = self.candidate.config().context().geometry_scale;
         let mut circuit = Circuit::from_netlist_with_scoped_limits(
             self.plan.source(),
-            &context,
+            &setup,
             crate::devices::MutualLimits::default(),
             crate::devices::ElaborationLimits::default(),
             Some(std::sync::Arc::new(self.scope()?.clone())),
@@ -397,7 +399,7 @@ impl<'a> ControlSession<'a> {
         if edits.len() >= max_edits {
             return Err(SpiceError::circuit("control instance edit budget exceeded"));
         }
-        edits.push(target.at(value)?);
+        edits.push(target.at_source(value, self.config().context().geometry_scale)?);
         let context = self.model_context_for(self.config());
         self.circuit_mut().set_control_overrides(&context, &edits)?;
         self.edits = edits;

@@ -112,6 +112,44 @@ pub enum ParameterKey {
     Prepared(usize),
 }
 
+/// Dimensional transformation applied to a raw source instance setter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeometryScale {
+    /// The parameter is already in its physical unit.
+    Identity,
+    /// A length (including perimeter).
+    Length,
+    /// An area.
+    Area,
+}
+impl GeometryScale {
+    /// MOS geometry setter convention used by MOS1/2/3 and BSIM.
+    pub(crate) fn mos(name: &str) -> Self {
+        match name {
+            "l" | "w" | "pd" | "ps" => Self::Length,
+            "ad" | "as" => Self::Area,
+            _ => Self::Identity,
+        }
+    }
+
+    /// Resolve once, before binding an immutable physical override.
+    /// # Errors
+    /// Nonfinite input or result, or invalid global scale.
+    pub fn resolve(self, value: Real, scale: Real) -> crate::primitives::SpiceResult<Real> {
+        let result = match self {
+            Self::Identity => value,
+            Self::Length => value * scale,
+            Self::Area => value * scale * scale,
+        };
+        if !scale.is_finite() || scale <= 0. || !value.is_finite() || !result.is_finite() {
+            return Err(crate::primitives::SpiceError::circuit(
+                "invalid geometry scale or setter conversion overflow",
+            ));
+        }
+        Ok(result)
+    }
+}
+
 /// A value-independent instance parameter binding in a finalized topology.
 ///
 /// The canonical keyword comes from the device's existing setter registry.
@@ -121,14 +159,21 @@ pub struct InstanceTarget {
     topology: TopologyId,
     device: usize,
     parameter: ParameterKey,
+    geometry_scale: GeometryScale,
 }
 
 impl InstanceTarget {
-    pub(crate) const fn new(topology: TopologyId, device: usize, parameter: ParameterKey) -> Self {
+    pub(crate) const fn new(
+        topology: TopologyId,
+        device: usize,
+        parameter: ParameterKey,
+        geometry_scale: GeometryScale,
+    ) -> Self {
         Self {
             topology,
             device,
             parameter,
+            geometry_scale,
         }
     }
 
@@ -148,7 +193,18 @@ impl InstanceTarget {
         self.parameter
     }
 
-    /// Bind a candidate scalar without looking up its name again.
+    /// Bind a raw source scalar using the current geometry scale.
+    /// # Errors
+    /// Invalid scale or nonfinite conversion.
+    pub fn at_source(
+        self,
+        value: Real,
+        scale: Real,
+    ) -> crate::primitives::SpiceResult<InstanceOverride> {
+        self.at(self.geometry_scale.resolve(value, scale)?)
+    }
+
+    /// Bind an already resolved physical scalar without looking up its name again.
     /// Physical validation is performed against the effective model context.
     ///
     /// # Errors

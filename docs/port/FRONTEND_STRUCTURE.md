@@ -169,6 +169,7 @@ C references: `cktsopt.c` (`OPTtbl`, `CKTsetOpt`), `inpdoopt.c`,
 | Option | Status | Port semantics (request key) | C behaviour / justification |
 | --- | --- | --- | --- |
 | `temp`, `tnom` | effect | circuit / nominal temperature (C) | `TSKtemp`/`TSKnomTemp` |
+| `scale` | effect | Positive finite source geometry scale (default 1); affects supported native dimensional setters and model-bin selection, not previously resolved overrides. | device geometry setters |
 | `gmin` | effect | `AnalysisContext::gmin` = `ModelContext::gmin`: parallel junction conductance of diode, BJT (B-E, B-C and the default substrate junction: collector for NPN/vertical, base for PNP/lateral; scaled by the instance `m`, not by `area`) and MOS1 (B-D, B-S) in every analysis; finite, `>= 0`, default 1e-12. It does **not** move the artificial DC gmin-stepping ladder (C's `spice3_gmin` starts at `gmin * gminfactor^gminsteps` and `dynamic_gmin` stops at `max(gmin, gshunt)`; this port's ladder starts at 1e-3 S and ends with the configured continuation diagonal (zero unless gshunt is set), see DC_CONTINUATION.md) | `CKTgmin` in `dioload.c`, `bjtload.c` (`m *` every conductance), `mos1load.c` |
 | `rshunt`, `cshunt` | effect | noiseless resistive shunt to every analog voltage node, capacitive shunt to parsed voltage nodes; ground, branch-current coordinates, automatic probe aliases and private expression signals excluded. Real-valued ohms/farads; topology generated per deck | `cktsetup.c`, `cktload.c`, `acan.c`, `inppas4.c` |
 | `reltol` | effect | Resolved circuit tolerance, diode breakdown preparation, and the default analysis-local relative tolerance | `TSKreltol` |
@@ -192,7 +193,7 @@ C references: `cktsopt.c` (`OPTtbl`, `CKTsetOpt`), `inpdoopt.c`,
 | `indverbosity` | no-op (non-negative integer validated) | none | selects only which stderr diagnostics `muttemp.c` prints for an inductive system (`CKTindverbosity`); the port prints none and always rejects a coupled inductance matrix that is not positive semidefinite (MUTUAL_INDUCTANCE.md) |
 | `bypass=0` | no-op | none | C default (`TSKbypass = 0`); this port never bypasses device evaluation. Other values `NotYetPorted` |
 | `oldlimit`, `numdgt`, `defm`/`defl`/`defw`/`defad`/`defas`, `badmos3`, `trytocompact`, `copynodesets`, `nodedamping`, `linesearch`, `absdv`, `reldv`, `noopac`, `epsmin`, `sparse`, `klu`, `klu_memgrow_factor`, XSPICE options | `NotYetPorted` | | |
-| `filetype`, `savecurrents`, `scale`, `scalm`, `seed`, `seedinfo`, `rndseed`, `interp`, `warn`, `measureprec`, `rawfileprec`, `strict_errorhandling` | `NotYetPorted` | | front-end variables with an output/setup effect |
+| `filetype`, `savecurrents`, `scalm`, `seed`, `seedinfo`, `rndseed`, `interp`, `warn`, `measureprec`, `rawfileprec`, `strict_errorhandling` | `NotYetPorted` | | front-end variables with an output/setup effect |
 | anything else | parse error | | C would store an unread variable or warn |
 
 No-ops are recorded with their reason in `RunConfig::ignored()` (`IgnoredOption`)

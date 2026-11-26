@@ -97,6 +97,22 @@ impl Device for ModelPassive {
             _ => p.instance_values.get(keyword).map(|v| v.value),
         })
     }
+    fn parameter_geometry_scale(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+    ) -> crate::devices::sweep::GeometryScale {
+        use crate::devices::sweep::{GeometryScale, ParameterKey};
+        if matches!(
+            self.parameters.kind,
+            PassiveKind::Resistor | PassiveKind::Capacitor
+        ) && matches!(key, ParameterKey::Native("l" | "w"))
+        {
+            GeometryScale::Length
+        } else {
+            GeometryScale::Identity
+        }
+    }
+
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
         let keyword = if keyword.eq_ignore_ascii_case("r") {
             "resistance"
@@ -371,7 +387,7 @@ pub(in crate::devices) fn instantiate(
     model: &ResolvedModel<'_>,
     context: &ModelContext,
 ) -> SpiceResult<Box<dyn Device>> {
-    let parameters = model.passive_parameters(instance)?;
+    let parameters = model.passive_parameters(instance, context.geometry_scale)?;
     // The schema validates the IC and effective_value validates the scalar
     // before any terminals are interned.
     parameters.validate_effective(context)?;

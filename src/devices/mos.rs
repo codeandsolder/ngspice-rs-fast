@@ -911,6 +911,20 @@ struct MosPreparation<L> {
 }
 
 impl<L: MosLevel> Mosfet<L> {
+    fn geometry_scale(name: &str) -> crate::devices::sweep::GeometryScale {
+        use crate::devices::sweep::GeometryScale;
+        if matches!(
+            L::BACKEND,
+            crate::devices::models::ModelBackend::Mos1
+                | crate::devices::models::ModelBackend::Mos2
+                | crate::devices::models::ModelBackend::Mos3
+        ) {
+            GeometryScale::mos(name)
+        } else {
+            GeometryScale::Identity
+        }
+    }
+
     pub(crate) fn instantiate(
         i: &DeviceInstance,
         nodes: &mut NodeAppend<'_>,
@@ -933,7 +947,14 @@ impl<L: MosLevel> Mosfet<L> {
         })?;
         let model = prepared.model;
         let v = INSTANCE_SCHEMA.validate(prepared.defaults.iter().chain(&setters), &i.location)?;
-        let required = |name: &str| required(&v, name, L::LABEL);
+        let required = |name: &str| {
+            let value = required(&v, name, L::LABEL)?;
+            if v.get(name).is_some_and(|v| v.location.is_some()) {
+                Self::geometry_scale(name).resolve(value, context.geometry_scale)
+            } else {
+                Ok(value)
+            }
+        };
         let geometry = Geometry {
             m: required("m")?,
             l: required("l")?,
@@ -1388,6 +1409,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
         let p = &self.geometry;
         Ok(match key {
             "w" => Some(p.w),
+            "l" => Some(p.l),
             "m" => Some(p.m),
             "ad" => Some(p.ad),
             "as" => Some(p.as_),
@@ -1395,7 +1417,7 @@ impl<L: MosLevel> Device for Mosfet<L> {
             "ps" => Some(p.ps),
             "nrd" => Some(p.nrd),
             "nrs" => Some(p.nrs),
-            "temp" => Some(p.temp.map_or(context.temperature + p.dtemp, |t| t - 273.15)),
+            "temp" => Some(p.temp.unwrap_or(context.temperature + p.dtemp)),
             "dtemp" => Some(p.dtemp),
             _ => None,
         })
@@ -1432,6 +1454,18 @@ impl<L: MosLevel> Device for Mosfet<L> {
     /// `mos1.c` `MOS1pTable` (and `MOS3pTable`): M, L, W, AD, AS, PD, PS,
     /// NRD, NRS, TEMP and DTEMP, which `mosXtemp.c`/`mosXload.c` re-derive
     /// (`dctrcurv.c` `DCTsetInstParam`).
+    fn parameter_geometry_scale(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+    ) -> crate::devices::sweep::GeometryScale {
+        match key {
+            crate::devices::sweep::ParameterKey::Native(name) => Self::geometry_scale(name),
+            crate::devices::sweep::ParameterKey::Prepared(_) => {
+                crate::devices::sweep::GeometryScale::Identity
+            }
+        }
+    }
+
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
         [
             "icvds", "icvgs", "icvbs", "m", "l", "w", "ad", "as", "pd", "ps", "nrd", "nrs", "temp",

@@ -868,3 +868,37 @@ fn option_card_failure_preserves_previous_session_snapshot() {
         .unwrap();
     assert!((plots[0].value("v(out)", 0).unwrap().re - 3. / 2.1).abs() < 1e-12);
 }
+
+#[test]
+fn scaled_instance_sweeps_and_alters_preserve_resolved_geometry() {
+    let deck = ScriptDeck::from_text(
+        "scaled-mos",
+        "* scaled MOS1\n.options scale=1u\nvd d 0 1\nvg g 0 1\nm1 d g 0 0 n w=1 l=1 ad=2 pd=4\n.model n nmos level=1 vto=0.5 kp=1m\n.control\nop\ndc @m1[w] 1 3 1\nop\ndc @m1[ad] 0 2 1\nop\nalter @m1[w]=2\nop\noption scale=2u\nop\ndc @m1[w] 1 2 1\nop\nalter @m1[w]=2\nop\noption rshunt=1G\nop\nreset\nop\nquit\n.endc\n.end\n",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    let expected = [
+        vec![-125e-6],
+        vec![-125e-6, -250e-6, -375e-6],
+        vec![-125e-6],
+        vec![-125e-6; 3],
+        vec![-125e-6],
+        vec![-250e-6],
+        vec![-250e-6],
+        vec![-250e-6, -500e-6],
+        vec![-250e-6],
+        vec![-500e-6],
+        vec![-500e-6 - 1e-9],
+        vec![-125e-6],
+    ];
+    assert_eq!(report.plots.len(), expected.len());
+    for (plot, expected) in report.plots.iter().zip(expected) {
+        assert_eq!(plot.plot.point_count(), expected.len());
+        for (row, expected) in expected.into_iter().enumerate() {
+            let actual = plot.plot.value("i(vd)", row).unwrap().re;
+            assert!(
+                (actual - expected).abs() < 2e-10,
+                "{actual:e} != {expected:e}"
+            );
+        }
+    }
+}

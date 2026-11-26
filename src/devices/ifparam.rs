@@ -336,11 +336,11 @@ impl Inputs {
                 } else {
                     // b3par.c multiplies left-to-right, not by scale^2:
                     // a small area can remain finite even when scale^2 overflows.
-                    value = match descriptor.canonical {
-                        "ad" | "as" => value * scale * scale,
-                        "l" | "w" | "pd" | "ps" => value * scale,
-                        _ => value,
-                    };
+                    value = crate::devices::sweep::GeometryScale::mos(descriptor.canonical)
+                        .resolve(value, scale)
+                        .map_err(|error| {
+                            SpiceError::parse(p.location.clone(), error.to_string())
+                        })?;
                 }
                 if !value.is_finite() {
                     return Err(SpiceError::parse(

@@ -69,7 +69,7 @@
 //!
 //! Every other name from `cktsopt.c` (`oldlimit`, ...)
 //! and the front-end variables with an effect (`filetype`, `numdgt`,
-//! `savecurrents`, `scale`, ...) is [`SpiceError::NotYetPorted`]; names
+//! `savecurrents`, ...) is [`SpiceError::NotYetPorted`]; names
 //! absent from both are parse errors. `no_auto_gnd` is a front-end variable in
 //! C, not an `.option`: use `Parser::with_auto_gnd`.
 //!
@@ -152,7 +152,6 @@ const KNOWN_UNIMPLEMENTED: &[&str] = &[
 /// output or setup, not implemented here.
 const FRONTEND_UNIMPLEMENTED: &[&str] = &[
     "savecurrents",
-    "scale",
     "scalm",
     "seedinfo",
     "interp",
@@ -707,6 +706,7 @@ impl RunConfig {
                 | "gshunt"
                 | "rshunt"
                 | "cshunt"
+                | "scale"
                 | "pivtol"
                 | "pivrel"
                 | "reltol"
@@ -1029,6 +1029,16 @@ impl RunConfig {
                 }
                 self.transient.xmu = Some(xmu);
             }
+            "scale" => {
+                let scale = input.number("a finite positive number")?;
+                if scale <= 0. {
+                    return Err(SpiceError::parse(
+                        value.location.clone(),
+                        "geometry scale must be positive",
+                    ));
+                }
+                self.context.geometry_scale = scale;
+            }
             "rshunt" | "cshunt" => {
                 let number = input.number("a finite number")?;
                 let mut shunts = self.context.shunts;
@@ -1302,6 +1312,7 @@ fn accepted(name: &str) -> bool {
                 | "gshunt"
                 | "rshunt"
                 | "cshunt"
+                | "scale"
                 | "pivtol"
                 | "pivrel"
                 | "reltol"

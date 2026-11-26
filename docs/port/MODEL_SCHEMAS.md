@@ -279,13 +279,9 @@ The port's resolver selects exactly that card. Differences are explicit:
   ordinary level selector and fails with `NotYetPorted`
   (`m1 binned to model 'nch.2': ... selector 8 ...`), so deck-visible binning
   is gated per family by `levels()`; nothing is silently dropped.
-- `.options scale` and `.options wnflag` are not deck settings in this port
-  (`scale` is rejected as an unimplemented front-end option; `wnflag` is not an
-  accepted option), and the `M` grammar does not accept `nf`/`wnflag`
-  instance parameters yet. `devices::binning::BinOptions` and
-  `ModelResolver::with_bin_options` carry both inputs, and the selection
-  logic is unit-tested for them, so a later front-end change only has to
-  supply the values.
+- `.options scale` is passed to the resolver and the supported native
+  geometry setters. `wnflag` remains unsupported as a deck option.
+  The resolver API carries both inputs.
 - Subcircuit-local models are flattened to `<path>.<name>` (C: `<path>:<name>`).
   A body's bin set is emitted whole, in declaration order, and the `M`
   reference becomes `<path>.<name>`. A root declaration that would join or

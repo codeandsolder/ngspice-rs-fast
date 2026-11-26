@@ -35,7 +35,8 @@ use crate::devices::state::{
     DeviceState, HistoryPublication, StateHistory, StateSnapshot, TrialState,
 };
 use crate::devices::sweep::{
-    InstanceOverride, InstanceTarget, ParameterKey, ResistorMetadata, ResistorOverride,
+    GeometryScale, InstanceOverride, InstanceTarget, ParameterKey, ResistorMetadata,
+    ResistorOverride,
 };
 use crate::devices::traits::{
     AcceptContext, AnalysisMode, Device, InductanceValue, MnaUnknowns, MutualTerm, StampContext,
@@ -1102,6 +1103,7 @@ fn ordered_control_targets(
                 value.topology(),
                 value.device(),
                 ParameterKey::Native("resistance"),
+                GeometryScale::Identity,
             )
             .at(value.supplied())?,
             CandidateNumericOverride::Instance(value) => value,
@@ -2735,8 +2737,14 @@ impl Circuit {
         value: Real,
         context: &ModelContext,
     ) -> SpiceResult<InstanceOverride> {
-        let target = self.bind_instance_override(name, keyword, value)?;
-        self.devices[target.device()].with_bound_parameter(target.parameter(), value, context)?;
+        let target = self
+            .bind_instance_target(name, keyword)?
+            .at_source(value, context.geometry_scale)?;
+        self.devices[target.device()].with_bound_parameter(
+            target.parameter(),
+            target.value(),
+            context,
+        )?;
         Ok(target)
     }
 
@@ -2749,7 +2757,12 @@ impl Circuit {
         let (index, parameter) = self.instance_parameter(name, keyword)?;
         #[cfg(test)]
         preparation_metrics::record(|counts| counts.bindings += 1);
-        Ok(InstanceTarget::new(self.topology_id()?, index, parameter))
+        Ok(InstanceTarget::new(
+            self.topology_id()?,
+            index,
+            parameter,
+            self.devices[index].parameter_geometry_scale(parameter),
+        ))
     }
 
     /// Bind a resistor's supplied (not effective) resistance via its metadata.
@@ -2766,16 +2779,8 @@ impl Circuit {
             self.topology_id()?,
             index,
             ParameterKey::Native("resistance"),
+            GeometryScale::Identity,
         ))
-    }
-
-    pub(crate) fn bind_instance_override(
-        &self,
-        name: &str,
-        keyword: &str,
-        value: Real,
-    ) -> SpiceResult<InstanceOverride> {
-        self.bind_instance_target(name, keyword)?.at(value)
     }
 
     /// A DC value override of the independent V or I source `name`, as
@@ -2810,6 +2815,7 @@ impl Circuit {
             self.topology_id()?,
             index,
             ParameterKey::Native("dc"),
+            GeometryScale::Identity,
         ))
     }
 
@@ -4564,7 +4570,11 @@ impl Circuit {
                 ..Default::default()
             },
         )?;
-        let models = crate::devices::models::ModelResolver::new(&expanded.models)?;
+        let models = crate::devices::models::ModelResolver::new(&expanded.models)?
+            .with_bin_options(crate::devices::binning::BinOptions {
+                scale: context.geometry_scale,
+                ..Default::default()
+            });
         let mut circuit = Self {
             mutual_limits,
             elaboration_limits,

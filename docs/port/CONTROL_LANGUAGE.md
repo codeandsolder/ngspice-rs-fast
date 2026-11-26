@@ -27,6 +27,13 @@ retained typed plots and scalar variables.
   `reset` applies all staged updates transactionally. A failed update does not
   replace the current circuit. Reusable candidate parameter plans avoid
   rebuilding topology where possible; solver state is independent per run.
+- `option name=value [name=value ...]` (also `options`) applies a validated
+  configuration snapshot at that point in execution. The ordinary deck option
+  schema and expressions are reused; runtime values may refer to script scalars.
+  Numerical settings affect subsequent analyses, not earlier plots. Shunt
+  changes rebuild and rebind instance edits transactionally. `reset` restores
+  the resolved deck configuration. Global geometry `scale` changes affect
+  subsequent raw setters, never geometry that has already been resolved.
 - `run` executes deck analyses in their ordinary batch order. Deck
   `.save`, `.print`, `.measure` and `.four` use the ordinary streaming
   output routes; measurements bind scalar results and consume full rows
