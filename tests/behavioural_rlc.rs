@@ -1006,3 +1006,47 @@ fn smooth_right_limit_recovers_from_singular_uic_taylor_seed() -> SpiceResult<()
     }
     Ok(())
 }
+
+#[test]
+fn prepared_power_laws_preserve_distinct_physical_derivatives_and_kcl() -> SpiceResult<()> {
+    let body = "v1 in 0 PWL(0 -2 1m -1)\nv2 exponent 0 PWL(0 2 1m 3)\nv3 negative 0 -2\nb1 absolute 0 v=1m*ddt(simetrix_abs_pow(v(in),3))\nb2 caret 0 v=1m*ddt(simetrix_caret_pow(v(in),3))\nb3 realpart 0 v=1m*ddt(simetrix_pow(v(negative),v(exponent)))\nb4 second 0 v=1m*ddt(v(realpart))\nr1 absolute 0 1k\nr2 caret 0 1k\nr3 realpart 0 1k\nr4 second 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["2u", "80u", "0", "2u", "uic", method],
+        )?;
+        assert!(plot.point_count() > 20);
+        for index in 0..plot.point_count() {
+            let u = 1000. * plot.value("time", index).unwrap().re;
+            let x = 2. - u;
+            let p = 2. + u;
+            let pi = std::f64::consts::PI;
+            let log = 2_f64.ln();
+            let (sin, cos) = (pi * u).sin_cos();
+            let scale = 2_f64.powf(p);
+            let first = scale * log.mul_add(cos, -pi * sin);
+            let second = scale
+                * log
+                    .mul_add(log, -pi * pi)
+                    .mul_add(cos, -2. * pi * log * sin);
+            for ((node, branch), expected) in [
+                ("v(absolute)", "i(b1)"),
+                ("v(caret)", "i(b2)"),
+                ("v(realpart)", "i(b3)"),
+                ("v(second)", "i(b4)"),
+            ]
+            .into_iter()
+            .zip([-3. * x * x, 3. * x * x, first, second])
+            {
+                close(plot.value(node, index).unwrap().re, expected, 2e-8);
+                close(
+                    plot.value(branch, index).unwrap().re,
+                    -expected * 1e-3,
+                    2e-11,
+                );
+            }
+        }
+    }
+    Ok(())
+}

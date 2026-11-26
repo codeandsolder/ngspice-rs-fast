@@ -657,12 +657,11 @@ fn typed_power_jet(law: PowerLaw, a: &Jet, b: &Jet) -> SpiceResult<Jet> {
             }
             a.power(b)?
         }
-        PowerLaw::SimetrixCaret => a.power(b)?,
         PowerLaw::SimetrixAbsolute => magnitude(a).power(b)?,
         PowerLaw::SimetrixRealPart if negative => {
             magnitude(a).power(b)?.multiply(&principal_phase(b).1)
         }
-        PowerLaw::SimetrixRealPart => a.power(b)?,
+        PowerLaw::SimetrixCaret | PowerLaw::SimetrixRealPart => a.power(b)?,
         _ => return Err(nonregular_power()),
     };
     // At a zero crossing use the actual one-sided expansion, not the
