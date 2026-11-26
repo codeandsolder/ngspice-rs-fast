@@ -516,7 +516,7 @@ struct LoadStorage<T> {
     matrix: Option<SparseMatrix>,
     rhs: Option<Vector>,
     spare_trial: Option<T>,
-    capture_original: bool,
+    correction: Correction,
 }
 
 impl<T> Default for LoadStorage<T> {
@@ -525,7 +525,7 @@ impl<T> Default for LoadStorage<T> {
             matrix: None,
             rhs: None,
             spare_trial: None,
-            capture_original: false,
+            correction: Correction::Absolute,
         }
     }
 }
@@ -594,8 +594,8 @@ impl LoadStorage<TrialState> {
             .ok_or_else(|| failure("missing Newton RHS"))?;
         matrix.clear();
         rhs.clear();
-        matrix.record_original(self.capture_original);
-        rhs.record_original(self.capture_original);
+        matrix.record_original(self.correction.capturing());
+        rhs.record_original(self.correction.capturing());
         Ok((matrix, rhs))
     }
 }
@@ -766,15 +766,14 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     // Each solve begins with ordinary absolute NI iteration. Only an
     // otherwise converged, potentially cancellation-dominated circuit load
     // switches to original-stamp correction coordinates.
-    storage.capture_original = false;
-    let mut corrected = false;
+    storage.correction = Correction::Absolute;
     loop {
         // NIiter increments before checking the CKTload return code.
         progress.iterations += 1;
         let iterno = progress.iterations;
         let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
         let flagged = (phases.nonconvergent)(&trial);
-        let capturing = storage.capture_original;
+        let correction = storage.correction;
         let (matrix, rhs) = storage.checked_system(n)?;
         if phase == IterationPhase::Junction {
             reorder = true;
@@ -786,7 +785,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
             &mut ordering,
             reorder,
             options,
-            capturing,
+            correction.capturing(),
         )? {
             crate::maths::NiStep::Solved(next) => {
                 reorder = false;
@@ -821,30 +820,11 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
             !converged(&next, &guess, branch_rows, phases.coordinate_kinds, options)
                 || device_test(&next, &guess, &trial)?
         };
-        // An absolute solve can stop with a tiny iterate change while
-        // large cancelling original terms obscure a physical KCL residual.
-        // Estimate the worst product roundoff from original stamp peaks,
-        // including stamps that cancelled within one assembled coefficient.
-        // Legacy SPARSE pivot-diagonal gmin is not an original nodal
-        // operator: only its final zero-gmin stage is corrected.
-        if !noncon
-            && !capturing
-            && phases.coordinate_kinds.is_some()
-            && options.diag_gmin == 0.
-            && phase != IterationPhase::Junction
-            && correction_risk(matrix, rhs, &next, options)
-        {
-            storage.capture_original = true;
-            // Do not accept the absolute solution; load the candidate again
-            // so original matrix AND RHS stamps correspond to its trial.
-            noncon = phase == IterationPhase::Float;
-        }
-        if capturing && !corrected {
-            corrected = true;
-            // At least one load must own the corrected values; ordinary
-            // iterate tolerances alone could accept the pre-correction state.
-            noncon |= next != guess;
-        }
+        (storage.correction, noncon) = correction.after_solve(noncon, phase, &guess, &next, || {
+            phases.coordinate_kinds.is_some()
+                && options.diag_gmin == 0.
+                && correction_risk(matrix, rhs, &next, options)
+        });
         if phase == IterationPhase::Float {
             if phases.nodesets {
                 noncon |= ipass;
@@ -883,6 +863,41 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         guess = next;
     }
 }
+/// A corrective load must be followed by a state-owning reload if the
+/// first correction changes the solution. Subsequent loads use the same
+/// convergence test as the absolute-coordinate solver.
+#[derive(Clone, Copy)]
+enum Correction {
+    Absolute,
+    First,
+    Subsequent,
+}
+
+impl Correction {
+    const fn capturing(self) -> bool {
+        !matches!(self, Self::Absolute)
+    }
+
+    fn after_solve(
+        self,
+        noncon: bool,
+        phase: IterationPhase,
+        guess: &Vector,
+        next: &Vector,
+        risk: impl FnOnce() -> bool,
+    ) -> (Self, bool) {
+        match self {
+            Self::Absolute if !noncon && phase != IterationPhase::Junction && risk() => {
+                // Fix must still advance to Float. A converged Float pass
+                // must reload rather than accept the absolute solution.
+                (Self::First, phase == IterationPhase::Float)
+            }
+            Self::First => (Self::Subsequent, noncon || next != guess),
+            _ => (self, noncon),
+        }
+    }
+}
+
 /// A conservative roundoff envelope (eight binary64 epsilons) on the
 /// scale of the largest original stamped product or RHS term. This is
 /// only a trigger for a physical correction, never a singularity test.
@@ -964,7 +979,7 @@ fn reconstruct_storage(
     Ok(())
 }
 
-/// One NIiter solve, in absolute or correction coordinates. Both use
+/// One `NIiter` solve, in absolute or correction coordinates. Both use
 /// the same assembled Jacobian, pivot policy and reusable factor frame.
 /// The exact residual is only evaluated for a captured physical load.
 fn linearised_solve(
