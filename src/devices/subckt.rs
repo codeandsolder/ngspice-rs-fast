@@ -51,7 +51,7 @@ use crate::netlist::ast::{
 use crate::netlist::bexpr::BExprKind;
 use crate::netlist::eval::{EvalBudget, FunctionScope, ParamBinding, ParamScope};
 use crate::netlist::expr::{Expr, ExprKind, ParameterExpression, SourceSpan};
-use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 use petgraph::Direction;
 use petgraph::algo::tarjan_scc;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -105,6 +105,14 @@ pub struct ExpandedNetlist {
     pub measurements: Vec<MeasureCard>,
     /// Fourier cards hoisted once per used definition, without operand renaming.
     pub fourier: Vec<FourierCard>,
+}
+
+/// A subcircuit actual connection may be used in either domain. Do not
+/// canonicalize digital names as analog ground or .global nodes.
+#[derive(Default)]
+struct HierarchyBindings {
+    analog: BTreeMap<String, String>,
+    digital: BTreeMap<String, String>,
 }
 
 /// Expand every subcircuit instance in `netlist`.
@@ -238,7 +246,14 @@ fn expand_with_prepared_output(
         initial_conditions: &netlist.initial_conditions,
         nodesets: &netlist.nodesets,
     };
-    expander.expand_body("", 0, &BTreeMap::new(), root, &mut locals, &directives)?;
+    expander.expand_body(
+        "",
+        0,
+        &HierarchyBindings::default(),
+        root,
+        &mut locals,
+        &directives,
+    )?;
     check_flattened_model_names(&expander.models, &expander.emitted_locals)?;
     check_binned_bases(
         &expander.models,
@@ -809,7 +824,7 @@ impl<'a> Expander<'a> {
         &mut self,
         path: &str,
         depth: usize,
-        terminals: &BTreeMap<String, String>,
+        terminals: &HierarchyBindings,
         scope: &Arc<ParamScope>,
         locals: &mut Vec<DeclarationIndex<LocalModel>>,
         directives: &Directives<'_>,
@@ -819,7 +834,7 @@ impl<'a> Expander<'a> {
             let index = match item {
                 ExpansionItem::Device(index) => index,
                 ExpansionItem::Frontend { location, action } => {
-                    self.directive(location, action, directives, terminals, path, scope)?;
+                    self.directive(location, action, directives, &terminals.analog, path, scope)?;
                     continue;
                 }
             };
@@ -830,10 +845,6 @@ impl<'a> Expander<'a> {
                 )
             })?;
             let mut instance = original.clone();
-            for node in &mut instance.nodes {
-                *node = self.rewrite_node(node, terminals, path);
-            }
-            self.rewrite_code_ports(&mut instance, terminals, path);
             if instance.designator == 'x' {
                 let target = instance
                     .model
@@ -850,9 +861,19 @@ impl<'a> Expander<'a> {
                         ),
                     ));
                 };
-                self.expand_instance(definition, &instance, path, depth, scope, locals)?;
+                self.expand_instance(
+                    definition,
+                    &instance,
+                    (path, depth, terminals),
+                    scope,
+                    locals,
+                )?;
                 continue;
             }
+            for node in &mut instance.nodes {
+                *node = self.rewrite_node(node, &terminals.analog, path);
+            }
+            self.rewrite_code_ports(&mut instance, terminals, path);
             if self.devices.len() >= self.limits.max_devices {
                 return Err(SpiceError::parse(
                     instance.location.clone(),
@@ -873,9 +894,9 @@ impl<'a> Expander<'a> {
                     // text, `translate()` renaming v(...)/i(...) operands).
                     expression.root.visit_mut(&mut |node| match &mut node.kind {
                         BExprKind::Voltage { positive, negative } => {
-                            *positive = self.rewrite_node(positive, terminals, path);
+                            *positive = self.rewrite_node(positive, &terminals.analog, path);
                             if let Some(negative) = negative {
-                                *negative = self.rewrite_node(negative, terminals, path);
+                                *negative = self.rewrite_node(negative, &terminals.analog, path);
                             }
                         }
                         BExprKind::Current(source) => {
@@ -947,11 +968,11 @@ impl<'a> Expander<'a> {
         &mut self,
         definition: &'a Subcircuit,
         instance: &DeviceInstance,
-        path: &str,
-        depth: usize,
+        frame: (&str, usize, &HierarchyBindings),
         parent: &Arc<ParamScope>,
         locals: &mut Vec<DeclarationIndex<LocalModel>>,
     ) -> SpiceResult<()> {
+        let (path, depth, parent_terminals) = frame;
         if depth + 1 > self.limits.max_depth {
             return Err(SpiceError::parse(
                 instance.location.clone(),
@@ -991,9 +1012,18 @@ impl<'a> Expander<'a> {
                 C_REFERENCE,
             ));
         }
-        let mut terminals: BTreeMap<String, String> = BTreeMap::new();
+        let mut terminals = HierarchyBindings::default();
         for (formal, actual) in definition.terminals.iter().zip(&instance.nodes) {
-            terminals.insert(formal.clone(), actual.clone());
+            let analog_formal = NodeTable::canonical_name(formal, self.netlist.auto_gnd);
+            let analog_actual = NodeTable::canonical_name(actual, self.netlist.auto_gnd);
+            terminals.analog.insert(
+                analog_formal,
+                self.rewrite_node(&analog_actual, &parent_terminals.analog, path),
+            );
+            terminals.digital.insert(
+                formal.clone(),
+                Self::rewrite_digital_node(actual, &parent_terminals.digital, path),
+            );
         }
         let (scope, plan) = self.instance_scope(definition, instance, parent)?;
         let child_path = if path.is_empty() {
@@ -1129,21 +1159,16 @@ impl<'a> Expander<'a> {
     fn rewrite_code_ports(
         &self,
         instance: &mut DeviceInstance,
-        terminals: &BTreeMap<String, String>,
+        terminals: &HierarchyBindings,
         path: &str,
     ) {
         for port in &mut instance.code_ports {
             let rewrite = |name: &str| {
-                if port.kind != CodePortKind::Digital {
-                    return self.rewrite_node(name, terminals, path);
+                if port.kind == CodePortKind::Digital {
+                    Self::rewrite_digital_node(name, &terminals.digital, path)
+                } else {
+                    self.rewrite_node(name, &terminals.analog, path)
                 }
-                terminals.get(name).cloned().unwrap_or_else(|| {
-                    if path.is_empty() {
-                        name.to_owned()
-                    } else {
-                        format!("{path}.{name}")
-                    }
-                })
             };
             for terminal in &mut port.terminals {
                 terminal.positive = rewrite(&terminal.positive);
@@ -1152,6 +1177,20 @@ impl<'a> Expander<'a> {
                 }
             }
         }
+    }
+
+    fn rewrite_digital_node(
+        name: &str,
+        terminals: &BTreeMap<String, String>,
+        path: &str,
+    ) -> String {
+        terminals.get(name).cloned().unwrap_or_else(|| {
+            if path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{path}.{name}")
+            }
+        })
     }
 
     fn rewrite_node(&self, name: &str, terminals: &BTreeMap<String, String>, path: &str) -> String {

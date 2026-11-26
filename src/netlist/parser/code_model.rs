@@ -11,9 +11,16 @@ use super::syntax::{canonical_node, malformed, name, named_device, punctuation};
 pub(super) fn code_model_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     let (instance, designator) = named_device("a").parse_next(input)?;
     cut_err(|input: &mut Input<'_>| {
+        let schema = input
+            .input
+            .last()
+            .and_then(|token| input.state.declared_models.code_model(&token.text));
         let mut ports = Vec::new();
         while input.input.len() > 1 {
-            ports.push(port(input)?);
+            let default = schema
+                .and_then(|schema| schema.ports().get(ports.len()))
+                .map_or(CodePortKind::Default, |port| port.default);
+            ports.push(port(input, default)?);
         }
         if ports.is_empty() {
             return Err(malformed(input, "A instance requires at least one port"));
@@ -46,7 +53,7 @@ fn terminal_name<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
     Ok(token)
 }
 
-fn port(input: &mut Input<'_>) -> Result<CodePort> {
+fn port(input: &mut Input<'_>, default: CodePortKind) -> Result<CodePort> {
     let token = input
         .input
         .first()
@@ -64,9 +71,12 @@ fn port(input: &mut Input<'_>) -> Result<CodePort> {
         }
         _ => CodePortKind::Default,
     };
-    if kind != CodePortKind::Default {
+    let kind = if kind == CodePortKind::Default {
+        default
+    } else {
         any.parse_next(input)?;
-    }
+        kind
+    };
     let vector = opt(|input: &mut Input<'_>| marker(input, "["))
         .parse_next(input)?
         .is_some();
@@ -76,7 +86,7 @@ fn port(input: &mut Input<'_>) -> Result<CodePort> {
             if !terminals.is_empty() {
                 opt(punctuation(TokenKind::Comma)).parse_next(input)?;
             }
-            terminals.push(element(input, kind, false)?);
+            terminals.push(element(input, kind)?);
         }
         marker(input, "]")?;
         if terminals.is_empty() {
@@ -84,7 +94,7 @@ fn port(input: &mut Input<'_>) -> Result<CodePort> {
         }
         terminals
     } else {
-        vec![element(input, kind, kind != CodePortKind::Default)?]
+        vec![element(input, kind)?]
     };
     Ok(CodePort {
         kind,
@@ -93,17 +103,10 @@ fn port(input: &mut Input<'_>) -> Result<CodePort> {
     })
 }
 
-fn element(
-    input: &mut Input<'_>,
-    kind: CodePortKind,
-    explicit_scalar: bool,
-) -> Result<CodeTerminal> {
+fn element(input: &mut Input<'_>, kind: CodePortKind) -> Result<CodeTerminal> {
     let grouped = opt(punctuation(TokenKind::LParen))
         .parse_next(input)?
         .is_some();
-    if explicit_scalar && !grouped && kind != CodePortKind::Digital {
-        return Err(malformed(input, "expected parenthesized analog port"));
-    }
     let inverted = opt(|input: &mut Input<'_>| marker(input, "~"))
         .parse_next(input)?
         .is_some();

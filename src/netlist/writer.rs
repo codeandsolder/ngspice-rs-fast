@@ -800,9 +800,11 @@ impl Writer<'_> {
                     append_cpl_material(&mut parts, parameter, entries)?;
                 }
                 ParameterKind::NumericVector(entries)
-                    if base == "s_xfer"
-                        && ["num_coeff", "den_coeff", "int_ic"]
-                            .contains(&parameter.name.as_str()) =>
+                    if crate::devices::code_model::source::SourceModel::from_base(base)
+                        .and_then(|schema| schema.parameter(&parameter.name))
+                        .is_some_and(
+                            crate::devices::code_model::source::ParameterShape::vector,
+                        ) =>
                 {
                     append_transfer_vector(&mut parts, parameter, entries)?;
                 }

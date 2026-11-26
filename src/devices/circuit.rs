@@ -183,6 +183,7 @@ struct TopologyBindings {
     state_len: usize,
     stochastic_sources: Vec<usize>,
     prepared_devices: Vec<usize>,
+    native_mixed: Option<crate::analysis::digital::NativeTopology>,
     mutual: MutualBinding,
     identity: Option<TopologyId>,
 }
@@ -214,6 +215,7 @@ pub(super) struct CircuitRuntime {
     carried_state: std::cell::RefCell<Option<StateSnapshot>>,
     continuation_diagonal: std::cell::Cell<Real>,
     completed: Vec<crate::primitives::AnalysisKind>,
+    last_digital_stats: Option<crate::analysis::digital::Stats>,
     final_transient: std::cell::RefCell<Option<StateSnapshot>>,
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
@@ -1978,6 +1980,31 @@ impl Circuit {
         result
     }
 
+    pub(crate) fn prepare_native_mixed(
+        &mut self,
+    ) -> SpiceResult<Option<crate::analysis::digital::MixedSignal>> {
+        self.finalize()?;
+        self.runtime.last_digital_stats = None;
+        self.bindings
+            .native_mixed
+            .as_ref()
+            .map(crate::analysis::digital::NativeTopology::start)
+            .transpose()
+    }
+
+    /// Accepted event work from the most recent successful native mixed analysis.
+    #[must_use]
+    pub const fn last_digital_stats(&self) -> Option<crate::analysis::digital::Stats> {
+        self.runtime.last_digital_stats
+    }
+
+    pub(crate) const fn record_digital_stats(
+        &mut self,
+        stats: Option<crate::analysis::digital::Stats>,
+    ) {
+        self.runtime.last_digital_stats = stats;
+    }
+
     fn prepare_topology(&mut self) -> SpiceResult<()> {
         // Validate graph before any predecessor binding or numbering mutation.
         self.elaboration_limits
@@ -2014,6 +2041,10 @@ impl Circuit {
             .copied()
             .filter(|&index| self.devices[index].prepared_batch_key().is_some())
             .collect();
+        self.bindings.native_mixed = crate::devices::code_model::source::mixed_topology(
+            &self.devices,
+            self.elaboration_limits,
+        )?;
         self.bindings.names = names;
         self.bindings.identity = Some(TopologyId::allocate()?);
         Ok(())
@@ -4706,6 +4737,7 @@ impl Circuit {
                 ..Default::default()
             });
         let mut circuit = Self {
+            nodes: NodeTable::with_auto_gnd(netlist.auto_gnd),
             mutual_limits,
             elaboration_limits,
             ..Self::default()

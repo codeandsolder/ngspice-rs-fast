@@ -90,15 +90,59 @@ pub(super) fn op(
     request: &AnalysisPlan,
     context: &crate::analysis::AnalysisContext,
 ) -> SpiceResult<Plot> {
+    op_inner(circuit, request, context, None)
+}
+
+pub(super) fn mixed_op(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &crate::analysis::AnalysisContext,
+    mixed: &mut super::digital::MixedSignal,
+) -> SpiceResult<Plot> {
+    circuit.finalize()?;
+    mixed.activate(circuit)?;
+    let result = op_inner(circuit, request, context, Some(mixed));
+    mixed.deactivate();
+    result
+}
+
+fn op_inner(
+    circuit: &mut Circuit,
+    request: &AnalysisPlan,
+    context: &crate::analysis::AnalysisContext,
+    mixed: Option<&mut super::digital::MixedSignal>,
+) -> SpiceResult<Plot> {
     // .ic is a transient-only constraint in C (cktload.c, MODETRANOP); a
     // .nodeset is forced in the MODEINITJCT/MODEINITFIX loads of a nonlinear
     // solve and cannot change a linear operating point. Both are validated.
     circuit.finalize()?;
     let model = context.model_context();
     let prepared = circuit.prepare_run();
-    let x = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?
+    let start = super::bias::OperatingPointStart::resolve(circuit, request)?;
+    let mut x = start
         .solve(&prepared, &model, request.dc_settings())?
         .values;
+    if let Some(mixed) = mixed {
+        let mut settled = false;
+        for _ in 0..request.dc_settings().newton.max_iterations {
+            let point = mixed.prepare_point(circuit, &x, 0., None)?;
+            let changed = mixed.initial_changed(&point)?;
+            mixed.commit_point(point);
+            if !changed {
+                mixed.accept_initial();
+                settled = true;
+                break;
+            }
+            x = start
+                .solve_from(&prepared, &model, request.dc_settings(), &x)?
+                .values;
+        }
+        if !settled {
+            return Err(SpiceError::circuit(
+                "mixed operating point failed to settle",
+            ));
+        }
+    }
     let mut plot = plot(circuit, "op1", "Operating Point", None, false)?;
     circuit.accept_solution(&x, None)?;
     let history = circuit.state_history()?;

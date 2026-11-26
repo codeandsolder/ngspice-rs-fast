@@ -4,6 +4,8 @@
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
 pub mod rational;
+pub mod source;
+mod source_logic;
 
 /// Three-valued digital logic.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -414,6 +416,13 @@ impl CodeModel for DFlipFlop {
 pub struct Adc {
     low: Real,
     high: Real,
+    qualification: Option<ReceiverQualification>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReceiverQualification {
+    initial: Logic,
+    inverted: bool,
 }
 
 impl Adc {
@@ -440,7 +449,69 @@ impl Adc {
         if !low.is_finite() || !high.is_finite() {
             return Err(SpiceError::circuit("nonfinite ADC threshold"));
         }
-        Ok(Self { low, high })
+        Ok(Self {
+            low,
+            high,
+            qualification: None,
+        })
+    }
+
+    /// Construct a qualified binary receiver. Equality at either threshold
+    /// retains history; in the initial operating point the declared hint
+    /// replaces history. The inversion is applied only on a decisive sample.
+    ///
+    /// # Errors
+    /// Invalid threshold order or nonbinary initial state.
+    pub fn qualified(low: Real, high: Real, initial: Logic, inverted: bool) -> SpiceResult<Self> {
+        if !low.is_finite() || !high.is_finite() || low > high || initial == Logic::Unknown {
+            return Err(SpiceError::circuit("invalid qualified receiver"));
+        }
+        Ok(Self {
+            low,
+            high,
+            qualification: Some(ReceiverQualification { initial, inverted }),
+        })
+    }
+
+    pub(crate) const fn is_qualified(self) -> bool {
+        self.qualification.is_some()
+    }
+
+    pub(crate) fn sample_at(
+        self,
+        voltage: Real,
+        previous: Logic,
+        initial: bool,
+    ) -> SpiceResult<Logic> {
+        if let Some(qualification) = self.qualification {
+            if !voltage.is_finite() {
+                return Err(SpiceError::circuit("nonfinite qualified receiver input"));
+            }
+            let decisive = if voltage > self.high {
+                Some(Logic::One)
+            } else if voltage < self.low {
+                Some(Logic::Zero)
+            } else {
+                None
+            };
+            return Ok(decisive.map_or_else(
+                || {
+                    if initial || previous == Logic::Unknown {
+                        qualification.initial
+                    } else {
+                        previous
+                    }
+                },
+                |bit| {
+                    if qualification.inverted {
+                        bit.invert()
+                    } else {
+                        bit
+                    }
+                },
+            ));
+        }
+        self.sample(voltage, previous)
     }
 
     /// Evaluate a voltage against the previous accepted state.
@@ -448,6 +519,9 @@ impl Adc {
     /// # Errors
     /// Nonfinite voltage.
     pub fn sample(self, voltage: Real, previous: Logic) -> SpiceResult<Logic> {
+        if self.is_qualified() {
+            return self.sample_at(voltage, previous, false);
+        }
         if !voltage.is_finite() {
             return Err(SpiceError::circuit("nonfinite ADC input"));
         }
@@ -478,6 +552,9 @@ impl Adc {
         let (t1, v1) = end;
         if ![t0, v0, t1, v1].into_iter().all(Real::is_finite) || t0 < 0. || t1 <= t0 {
             return Err(SpiceError::circuit("invalid ADC crossing interval"));
+        }
+        if let Some(qualification) = self.qualification {
+            return self.qualified_crossing(start, end, previous, qualification);
         }
         // A transition into an open voltage interval may start at its
         // threshold (e.g. zero to unknown on a rising ordinary ADC input).
@@ -519,20 +596,51 @@ impl Adc {
                 .filter(|&v| v < v0 && v > v1)
                 .max_by(Real::total_cmp)
         };
-        Ok(threshold.and_then(|v| {
-            let scale = v0.abs().max(v1.abs());
-            // Prefer unscaled differences when representable, to retain
-            // threshold precision for small excursions around large biases.
-            let span = v1 - v0;
-            let fraction = if span.is_finite() {
-                (v - v0) / span
-            } else {
-                (v / scale - v0 / scale) / (v1 / scale - v0 / scale)
-            };
-            let time = fraction.mul_add(t1 - t0, t0);
-            (time >= t0 && time < t1).then_some(time)
-        }))
+        Ok(threshold.and_then(|v| crossing_time(start, end, v)))
     }
+
+    fn qualified_crossing(
+        self,
+        start: (Real, Real),
+        end: (Real, Real),
+        previous: Logic,
+        qualification: ReceiverQualification,
+    ) -> SpiceResult<Option<Real>> {
+        let (t0, v0) = start;
+        let (t1, v1) = end;
+        if self.sample(v1, previous)? == previous {
+            return Ok(None);
+        }
+        let physical = if qualification.inverted {
+            previous.invert()
+        } else {
+            previous
+        };
+        let threshold = match physical {
+            Logic::Zero if v0 <= self.high && v1 > self.high => self.high,
+            Logic::One if v0 >= self.low && v1 < self.low => self.low,
+            _ => return Ok(None),
+        };
+        // At equality no transition has happened. Land just past the
+        // interpolated threshold; the analog solver still verifies the bit.
+        Ok(crossing_time(start, end, threshold).map(|time| time.next_up().max(t0).min(t1)))
+    }
+}
+
+fn crossing_time(start: (Real, Real), end: (Real, Real), threshold: Real) -> Option<Real> {
+    let (t0, v0) = start;
+    let (t1, v1) = end;
+    let scale = v0.abs().max(v1.abs());
+    // Prefer unscaled differences when representable, to retain precision
+    // for small excursions around large biases.
+    let span = v1 - v0;
+    let fraction = if span.is_finite() {
+        (threshold - v0) / span
+    } else {
+        (threshold / scale - v0 / scale) / (v1 / scale - v0 / scale)
+    };
+    let time = fraction.mul_add(t1 - t0, t0);
+    (time >= t0 && time < t1).then_some(time)
 }
 
 /// DAC voltage targets, including the unknown state.
@@ -585,8 +693,7 @@ impl Dac {
 #[derive(Clone, Copy, Debug)]
 pub struct DacConfig {
     levels: Dac,
-    slew: Delays,
-    span: Real,
+    slew: Option<(Delays, Real)>,
 }
 
 impl DacConfig {
@@ -604,7 +711,29 @@ impl DacConfig {
         {
             return Err(SpiceError::circuit("invalid DAC voltage range"));
         }
-        Ok(Self { levels, slew, span })
+        Ok(Self {
+            levels,
+            slew: Some((slew, span)),
+        })
+    }
+
+    /// Ideal voltage bridge with independently specified rails. Equal and
+    /// inverted rails are valid; unknown logic has the explicit midpoint law.
+    ///
+    /// # Errors
+    /// Nonfinite voltage.
+    pub fn ideal(low: Real, high: Real) -> SpiceResult<Self> {
+        if !low.is_finite() || !high.is_finite() {
+            return Err(SpiceError::circuit("nonfinite ideal logic voltage rail"));
+        }
+        Ok(Self {
+            levels: Dac {
+                low,
+                high,
+                unknown: low.midpoint(high),
+            },
+            slew: None,
+        })
     }
 
     pub(crate) fn target(self, logic: Logic) -> SpiceResult<Real> {
@@ -616,13 +745,17 @@ impl DacConfig {
         if ramp.target.to_bits() == target.to_bits() {
             return Ok(ramp);
         }
+        let Some((slew, span)) = self.slew else {
+            return Ok(DacRamp {
+                start: time,
+                end: time,
+                from: target,
+                target,
+            });
+        };
         let from = ramp.value(time);
-        let duration = ((target - from).abs() / self.span)
-            * if target > from {
-                self.slew.rise
-            } else {
-                self.slew.fall
-            };
+        let duration =
+            ((target - from).abs() / span) * if target > from { slew.rise } else { slew.fall };
         let end = time + duration;
         if !end.is_finite() || (duration > 0. && end <= time) {
             return Err(SpiceError::circuit(
@@ -708,9 +841,13 @@ pub(crate) struct DacSource {
     pub(crate) name: String,
     pub(crate) terminals: [crate::primitives::NodeId; 2],
     pub(crate) port: DacPort,
+    pub(crate) native: Option<source::NativeVoltageBinding>,
 }
 
 impl crate::devices::Device for DacSource {
+    fn model_name(&self) -> Option<&str> {
+        self.native.as_ref().map(|binding| binding.model.as_str())
+    }
     fn name(&self) -> &str {
         &self.name
     }

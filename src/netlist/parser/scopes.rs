@@ -13,7 +13,7 @@ use crate::netlist::source::Deck;
 use crate::primitives::ascii::folded;
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -127,6 +127,7 @@ pub(super) fn assemble(
     let scope = scope(cards, &mut cursor, auto_gnd, &models, None, 0, scripted)?;
     Ok(ParsedDeck {
         netlist: Netlist {
+            auto_gnd,
             title: deck.title.clone(),
             path: deck.path.clone(),
             location: deck.title_location.clone(),
@@ -158,11 +159,12 @@ struct LexicalModels<'a> {
     body_start: usize,
     parent: Option<usize>,
     names: BTreeSet<Cow<'a, str>>,
+    code_models: BTreeMap<Cow<'a, str>, crate::devices::code_model::source::SourceModel>,
     bins: BTreeSet<Cow<'a, str>>,
 }
 
 impl<'a> LexicalModels<'a> {
-    fn insert(&mut self, name: &'a str) {
+    fn insert(&mut self, name: &'a str, base: Option<&str>) {
         // Bin candidates are identified during indexing, not by scanning a
         // prefix range on every MOS terminal/model disambiguation.
         if let Some((base, suffix)) = name.rsplit_once('.')
@@ -171,7 +173,13 @@ impl<'a> LexicalModels<'a> {
         {
             self.bins.insert(folded(base));
         }
-        self.names.insert(folded(name));
+        let key = folded(name);
+        if self.names.insert(key.clone())
+            && let Some(model) =
+                base.and_then(crate::devices::code_model::source::SourceModel::from_base)
+        {
+            self.code_models.insert(key, model);
+        }
     }
 }
 
@@ -231,7 +239,10 @@ impl<'a> ModelIndex<'a> {
                 Some(DotCommand::End) => break,
                 Some(DotCommand::Model) if !in_control && depth <= MAX_SCOPE_DEPTH => {
                     if let Some(name) = entry.source.tokens.get(1).filter(|t| t.is_name_like()) {
-                        scopes[active].insert(&name.text);
+                        scopes[active].insert(
+                            &name.text,
+                            entry.source.tokens.get(2).map(|token| token.text.as_str()),
+                        );
                     }
                 }
                 _ => {}
@@ -265,6 +276,21 @@ pub(super) struct ModelVisibility<'a> {
 }
 
 impl ModelVisibility<'_> {
+    pub(super) fn code_model(
+        self,
+        name: &str,
+    ) -> Option<crate::devices::code_model::source::SourceModel> {
+        let name = folded(name);
+        let mut current = self.scopes.get(self.scope);
+        while let Some(scope) = current {
+            if scope.names.contains(name.as_ref()) {
+                return scope.code_models.get(name.as_ref()).copied();
+            }
+            current = scope.parent.map(|index| &self.scopes[index]);
+        }
+        None
+    }
+
     pub(super) fn contains(self, name: &str, allow_bins: bool) -> bool {
         let name = folded(name);
         let mut current = self.scopes.get(self.scope);

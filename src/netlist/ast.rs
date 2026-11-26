@@ -1305,6 +1305,8 @@ pub enum ScopedCardKind {
 /// `docs/port/FRONTEND_STRUCTURE.md` and the central `TODO.md`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Netlist {
+    /// Whether analog ground aliases are enabled for this deck.
+    pub auto_gnd: bool,
     /// The deck's title line.
     pub title: String,
     /// The file the deck came from.

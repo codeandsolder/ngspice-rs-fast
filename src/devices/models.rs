@@ -89,6 +89,12 @@ pub enum ModelFamily {
     Pmf,
     /// XSPICE rational transfer function (`s_xfer`).
     RationalTransfer,
+    /// Native hybrid analog receiver/event logic.
+    LogicEvent,
+    /// Native ideal logic voltage bridge.
+    LogicVoltage,
+    /// Timed conductance switch.
+    TimedSwitch,
 }
 
 impl ModelFamily {
@@ -115,6 +121,9 @@ impl ModelFamily {
             "txl" => Some(Self::Txl),
             "cpl" | "cpllines" => Some(Self::Cpl),
             "s_xfer" => Some(Self::RationalTransfer),
+            "preprocess_logic_event" => Some(Self::LogicEvent),
+            "preprocess_logic_voltage" => Some(Self::LogicVoltage),
+            "preprocess_timed_switch" => Some(Self::TimedSwitch),
             // `inpdomod.c` accepts the HFET spellings as the same families;
             // `level` then selects the device (5 is `hfet1/`, 6 `hfet2/`).
             "nmf" | "nhfet" => Some(Self::Nmf),
@@ -141,7 +150,9 @@ impl ModelFamily {
             Self::Ltra => 'o',
             Self::Txl => 'y',
             Self::Cpl => 'p',
-            Self::RationalTransfer => 'a',
+            Self::RationalTransfer | Self::LogicEvent | Self::LogicVoltage | Self::TimedSwitch => {
+                'a'
+            }
             Self::Nmf | Self::Pmf => 'z',
         }
     }
@@ -205,6 +216,12 @@ pub enum ModelBackend {
     Cpl,
     /// Native rational transfer model.
     RationalTransfer,
+    /// Native hybrid event logic.
+    LogicEvent,
+    /// Native ideal logic voltage bridge.
+    LogicVoltage,
+    /// Timed conductance switch.
+    TimedSwitch,
 }
 
 /// Authoritative backend catalog entry. Selector aliases are the C levels
@@ -309,11 +326,15 @@ impl ModelBackend {
             'p' => const { &[BackendSpec::new(Self::Cpl, "Coupled line", &[1])] },
             'a' => {
                 const {
-                    &[BackendSpec::new(
-                        Self::RationalTransfer,
-                        "Rational transfer",
-                        &[1],
-                    )]
+                    &[
+                        BackendSpec::new(Self::RationalTransfer, "Rational transfer", &[1]),
+                        BackendSpec::new(Self::LogicEvent, "Native hybrid event logic", &[1])
+                            .for_family(ModelFamily::LogicEvent),
+                        BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
+                            .for_family(ModelFamily::LogicVoltage),
+                        BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
+                            .for_family(ModelFamily::TimedSwitch),
+                    ]
                 }
             }
             _ => &[],
