@@ -22,7 +22,7 @@ pub(super) struct Budget {
 }
 
 impl Budget {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             evaluations: Cell::new(MAX_EVALUATIONS),
             coefficients: Cell::new(MAX_COEFFICIENT_VISITS),
@@ -45,7 +45,7 @@ impl Budget {
         Ok(())
     }
 
-    fn exhausted(&self) -> bool {
+    const fn exhausted(&self) -> bool {
         self.evaluations.get() == 0
     }
 }

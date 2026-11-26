@@ -1294,3 +1294,50 @@ fn singular_germ_recovery_handles_high_order_and_scaled_offsets() -> SpiceResult
     }
     Ok(())
 }
+
+#[test]
+fn singular_germ_recovery_respects_explicit_branch_selection() -> SpiceResult<()> {
+    for sign in [-1., 1.] {
+        let body = format!(
+            "b1 x 0 i=v(x)^2-(2+time/1u)^2\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.ic v(x)={}\n.options reltol=1e-8 vntol=1n",
+            2. * sign
+        );
+        for method in ["method=trap", "method=gear"] {
+            let plot = run(
+                &body,
+                AnalysisKind::Transient,
+                &["0.1u", "1u", "0", "0.1u", "uic", method],
+            )?;
+            for i in 0..plot.point_count() {
+                let u = plot.value("time", i).unwrap().re / 1e-6;
+                close(plot.value("v(x)", i).unwrap().re, sign * (2. + u), 1e-10);
+                close(plot.value("v(out)", i).unwrap().re, sign, 1e-9);
+                close(plot.value("i(b2)", i).unwrap().re, -sign * 1e-3, 1e-12);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_germ_recovery_rejects_ambiguous_curvature_and_nonanalytic_roots() {
+    for (law, diagnostic) in [
+        ("v(x)^2-(2+time/1u)^2", "ambiguous nonlinear DAE"),
+        ("v(x)^2-(time/1u)^4", "ambiguous nonlinear DAE"),
+        ("v(x)^2-time/1u", "could not resolve a singular tangent"),
+        ("v(x)^2+(time/1u)^2", "could not resolve a singular tangent"),
+    ] {
+        let body = format!(
+            "b1 x 0 i={law}\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n"
+        );
+        for method in ["method=trap", "method=gear"] {
+            let error = run(
+                &body,
+                AnalysisKind::Transient,
+                &["0.1u", "1u", "0", "0.1u", "uic", method],
+            )
+            .expect_err("an unresolved or ambiguous germ must not be assigned an arbitrary rate");
+            assert!(error.to_string().contains(diagnostic), "{law}: {error}");
+        }
+    }
+}
