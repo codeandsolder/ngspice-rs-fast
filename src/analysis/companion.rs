@@ -1653,6 +1653,9 @@ impl Driver<'_> {
             if let Some(mixed) = self.mixed.as_deref() {
                 mixed.initial_rhs(self.circuit, &mut right_rhs)?;
             }
+            if initial::needs_right_limit(self.circuit) && self.mixed.is_none() {
+                return self.right_initial_candidate(start.x, trial);
+            }
             let consistent = initial::check_impulse_free(
                 &self.prepared,
                 &self.system.a,
@@ -1750,12 +1753,56 @@ impl Driver<'_> {
             };
             (x, trial)
         };
+        if initial::needs_right_limit(self.circuit) && self.mixed.is_none() {
+            return self.right_initial_candidate(x, trial);
+        }
         // C copies CKTstate0 into CKTstate1..3; the derivative is zero. The
         // port fills every retained vector (ACCEPTED_DEPTH, sized for Gear
         // order 6); dctran.c's orders 1-2 never read beyond CKTstate3.
         // The t = 0 point also starts every transmission line's delay
         // history (traload.c, MODEINITTRAN); it requests no breakpoints.
         Ok((x, trial))
+    }
+
+    fn right_initial_candidate(
+        &self,
+        seed: Vector,
+        trial: TrialState,
+    ) -> SpiceResult<(Vector, TrialState)> {
+        let tolerance = &self.settings.tolerances;
+        let consistent = initial::solve_right_limit(
+            &self.prepared,
+            self.system,
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &seed,
+                model_context: &self.model_context,
+                integration: None,
+                history: &self.history,
+                forcing: Some(Forcing {
+                    limit: crate::devices::Limit::Right,
+                    timing: self.timing,
+                }),
+            },
+            &trial,
+            self.uic,
+            self.settings.step,
+            initial::Tolerances {
+                reltol: tolerance.reltol,
+                vntol: tolerance.vntol,
+                abstol: tolerance.abstol,
+                chgtol: tolerance.chgtol,
+            },
+            &self.bias.newton,
+        )?;
+        // Reload physical values at the verified right-hand point, without
+        // reapplying UIC's old voltage seeds, then publish canonical rates.
+        let mut right = self.initial_state(&consistent.solution, &[], false)?;
+        for (slot, value) in consistent.canonical {
+            self.history
+                .set_right_initial_slot(&mut right, slot, value)?;
+        }
+        Ok((consistent.solution, right))
     }
 
     /// The charge/flux state of the initial point: a DC-mode load at `x`

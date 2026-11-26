@@ -19,12 +19,7 @@ const MAX_COORDINATES: usize = 32_768;
 const MAX_STAMPS: usize = 2_000_000;
 const MAX_RANK_WORK: usize = 20_000_000;
 
-/// Local Taylor coefficients of a physical residual and its exact Jacobian.
-/// Index zero is the actual right-limit point, not a finite-difference value.
-pub(super) struct ResidualJet {
-    pub(super) values: Vec<Vector>,
-    pub(super) jacobians: Vec<SparseMatrix>,
-}
+use crate::devices::physical_jet::ResidualJet;
 
 /// A constraint on the actual initial state, expressed as a Newton
 /// correction. Physical storage wins over optional derived input seeds.
@@ -165,6 +160,39 @@ impl DerivativeArray {
             dimension,
             order,
         })
+    }
+
+    /// Backward-error check of every original equation, including rows
+    /// dependent in the rank-reduced system. Only unretained optional ICs
+    /// are excluded. Each coefficient row is scaled independently.
+    pub(super) fn residual_ratio(
+        &self,
+        trajectory: &[Vector],
+        retained: &[bool],
+        relative: Real,
+        absolute: Real,
+    ) -> SpiceResult<Real> {
+        let mut scales = vec![0.; self.rhs.len()];
+        for term in self.matrix.triplets() {
+            let value = trajectory[term.col / self.dimension].as_slice()[term.col % self.dimension];
+            scales[term.row] = term.value.abs().mul_add(value.abs(), scales[term.row]);
+        }
+        let physical_rows = self.order * self.dimension;
+        let mut ratio: Real = 0.;
+        for (row, residual) in self.rhs.iter().enumerate() {
+            if self.optional.binary_search(&row).is_ok()
+                && !retained.get(row - physical_rows).copied().unwrap_or(false)
+            {
+                continue;
+            }
+            let scale = scales[row];
+            let tolerance = relative.mul_add(scale, absolute);
+            if !scale.is_finite() || !tolerance.is_finite() || tolerance <= 0. {
+                return Err(failure("invalid right-limit residual scaling"));
+            }
+            ratio = ratio.max(residual.abs() / tolerance);
+        }
+        Ok(ratio)
     }
 
     /// Solve only when the requested coefficient coordinates are fixed by

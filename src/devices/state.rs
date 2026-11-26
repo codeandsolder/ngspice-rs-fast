@@ -518,8 +518,22 @@ impl StateHistory {
         slot: usize,
         value: Real,
     ) -> SpiceResult<()> {
+        if !trial.initial_conditions() {
+            return Err(state_error("invalid UIC initial-state override"));
+        }
+        self.set_right_initial_slot(trial, slot, value)
+    }
+
+    /// Canonicalize a quantity or rate from a verified right-limit DAE
+    /// solution. The initial trial must still be unpublished.
+    pub(crate) fn set_right_initial_slot(
+        &self,
+        trial: &mut TrialState,
+        slot: usize,
+        value: Real,
+    ) -> SpiceResult<()> {
         self.check_trial(trial)?;
-        if !trial.initial_conditions() || self.depth() != 0 || !value.is_finite() {
+        if self.depth() != 0 || !value.is_finite() {
             return Err(state_error("invalid initial-state override"));
         }
         let target = Arc::make_mut(&mut trial.values)

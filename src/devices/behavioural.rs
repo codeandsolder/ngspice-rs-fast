@@ -285,6 +285,88 @@ impl Behavioural {
         })
     }
 
+    pub(super) fn expression_jet(
+        &self,
+        binding: &mut super::physical_jet::Binding<'_>,
+    ) -> SpiceResult<(
+        crate::maths::taylor::Taylor,
+        Vec<(Option<usize>, crate::maths::taylor::Taylor)>,
+    )> {
+        let columns = self
+            .variables
+            .iter()
+            .map(|variable| match *variable {
+                Variable::Node(node) => Ok(binding.unknowns.node_row(node)),
+                Variable::Branch(index) => binding
+                    .controls
+                    .get(index)
+                    .copied()
+                    .map(Some)
+                    .ok_or_else(|| SpiceError::circuit("unbound Taylor controlling branch")),
+            })
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let values = columns
+            .iter()
+            .map(|&column| binding.coordinate(column))
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let base = values
+            .iter()
+            .map(crate::maths::taylor::Taylor::base)
+            .collect::<Vec<_>>();
+        let environment = Environment {
+            values: &base,
+            time: binding.time.base(),
+            temperature: binding.model.temperature,
+            gmin: binding.model.gmin,
+            frequency: binding.model.frequency,
+        };
+        let (value, gradient) = self
+            .program
+            .right_taylor(&values, binding.time, &environment, binding.budget)
+            .map_err(|error| self.evaluation_error(error))?;
+        let factor = self.checked_factor(binding.model.temperature)?;
+        Ok((
+            value.scale(factor)?,
+            columns
+                .into_iter()
+                .zip(gradient)
+                .map(|(column, derivative)| Ok((column, derivative.scale(factor)?)))
+                .collect::<SpiceResult<Vec<_>>>()?,
+        ))
+    }
+
+    pub(super) fn physical_jet(
+        &self,
+        binding: &mut super::physical_jet::Binding<'_>,
+        jet: &mut super::physical_jet::PhysicalJet,
+    ) -> SpiceResult<()> {
+        let [p, n] =
+            [self.terminals[0], self.terminals[1]].map(|node| binding.unknowns.node_row(node));
+        let (value, gradient) = self.expression_jet(binding)?;
+        let residual = &mut jet.static_part;
+        let rows = match self.output {
+            BehaviouralOutput::Current => [(p, 1.), (n, -1.)],
+            BehaviouralOutput::Voltage => {
+                let branch = binding
+                    .branch
+                    .ok_or_else(|| SpiceError::circuit("missing Taylor voltage-source branch"))?;
+                let current = binding.coordinate(Some(branch))?;
+                residual.linear(p, Some(branch), &current, 1.)?;
+                residual.linear(n, Some(branch), &current, -1.)?;
+                residual.linear(Some(branch), p, &binding.coordinate(p)?, 1.)?;
+                residual.linear(Some(branch), n, &binding.coordinate(n)?, -1.)?;
+                [(Some(branch), -1.), (None, 0.)]
+            }
+        };
+        for (row, weight) in rows {
+            residual.value(row, &value, weight)?;
+            for (column, derivative) in &gradient {
+                residual.derivative(row, *column, derivative, weight)?;
+            }
+        }
+        Ok(())
+    }
+
     fn evaluation_error(&self, error: SpiceError) -> SpiceError {
         match error {
             SpiceError::Numerical { message, .. } => SpiceError::Numerical {
@@ -991,4 +1073,17 @@ mod tests {
         assert_eq!(nodes.get("sense"), Some(NodeId::new(3)));
         assert_eq!(nodes.get("vx"), None);
     }
+}
+
+pub(super) fn physical_jet(
+    device: &dyn Device,
+    binding: &mut super::physical_jet::Binding<'_>,
+    jet: &mut super::physical_jet::PhysicalJet,
+) -> SpiceResult<bool> {
+    let any = device as &dyn std::any::Any;
+    if let Some(source) = any.downcast_ref::<Behavioural>() {
+        source.physical_jet(binding, jet)?;
+        return Ok(true);
+    }
+    rlc::physical_jet(device, binding, jet)
 }

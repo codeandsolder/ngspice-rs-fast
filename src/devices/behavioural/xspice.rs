@@ -234,7 +234,7 @@ fn invalid(message: &str) -> SpiceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{XspicePwl, reference_midpoint};
+    use super::{XspicePwl, reference_midpoint, smooth_corner};
 
     #[test]
     fn table_is_flat_outside_and_smooth_at_corners() {
@@ -296,7 +296,23 @@ mod tests {
             if input >= midpoint(i) {
                 continue;
             }
-            return map.corner(input, i);
+            let left = map.x[i] - map.x[i - 1];
+            let right = map.x[i + 1] - map.x[i];
+            let domain = map.fraction * left.min(right);
+            return if input < map.x[i] - domain {
+                map.segment(input, i - 1, i)
+            } else if input < map.x[i] + domain {
+                smooth_corner(
+                    input,
+                    map.x[i],
+                    map.y[i],
+                    domain,
+                    (map.y[i] - map.y[i - 1]) / left,
+                    (map.y[i + 1] - map.y[i]) / right,
+                )
+            } else {
+                map.segment(input, i, i)
+            };
         }
         map.segment(input, size - 2, size - 1)
     }

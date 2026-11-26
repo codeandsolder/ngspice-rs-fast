@@ -591,3 +591,37 @@ fn initial_charge_law_uses_charge_not_voltage_tolerance() {
     .to_string();
     assert!(error.contains("c1") && error.contains("initial"), "{error}");
 }
+
+#[test]
+fn right_limit_nested_derivative_of_ramp_has_no_startup_impulse() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            ".options reltol=1e-8 vntol=1e-9\nv1 in 0 PWL(0 2 1m 3)\nb1 out 0 v=ddt(ddt(v(in)))\nr1 out 0 1k",
+            AnalysisKind::Transient,
+            &["1u", "50u", "0", "1u", "uic", method],
+        )?;
+        assert!(plot.point_count() > 20);
+        for point in 0..plot.point_count() {
+            close(plot.value("v(out)", point).unwrap().re, 0., 1e-5);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn right_limit_nonlinear_derivative_with_physical_capacitor_loads() -> SpiceResult<()> {
+    let plot = run(
+        ".options reltol=1e-6 vntol=1n\nv1 in 0 SIN(2 0.1 1k 0 0 90)\nb1 y 0 v=1m*ddt(v(in)^2)\nr1 y 0 1k\nrsh1 in 0 1k\nrsh2 y 0 1k\ncsh1 in 0 1n\ncsh2 y 0 1n",
+        AnalysisKind::Transient,
+        &["5u", "50u", "0", "5u", "method=trap"],
+    )?;
+    let omega = std::f64::consts::TAU * 1000.;
+    assert!(plot.point_count() > 8);
+    for point in 0..plot.point_count() {
+        let t = plot.value("time", point).unwrap().re;
+        let phase = omega * t;
+        let expected = -0.0002 * omega * (2. + 0.1 * phase.cos()) * phase.sin();
+        close(plot.value("v(y)", point).unwrap().re, expected, 0.03);
+    }
+    Ok(())
+}

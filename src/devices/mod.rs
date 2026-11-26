@@ -144,3 +144,5 @@ pub use traits::{
 pub const C_REFERENCE_FRAMEWORK: &str = "src/spicelib/devices/ (ckt*.c)";
 
 pub mod observe;
+
+pub(crate) mod physical_jet;

@@ -939,3 +939,87 @@ pub(in crate::devices) fn instantiate(
         noisy,
     }))
 }
+
+/// Stamp the same constitutive product and storage equations as Law::equations,
+/// retaining each coefficient's time dependence and product-rule Jacobian.
+pub(super) fn physical_jet(
+    device: &dyn Device,
+    binding: &mut crate::devices::physical_jet::Binding<'_>,
+    jet: &mut crate::devices::physical_jet::PhysicalJet,
+) -> SpiceResult<bool> {
+    let Some(passive) = (device as &dyn std::any::Any).downcast_ref::<Passive>() else {
+        return Ok(false);
+    };
+    let rows = passive.rows(binding.unknowns, binding.branch)?;
+    let branch = binding
+        .branch
+        .ok_or_else(|| SpiceError::circuit("missing Taylor constitutive branch"))?;
+    let columns = [
+        binding.unknowns.node_row(passive.expression.terminals[0]),
+        binding.unknowns.node_row(passive.expression.terminals[1]),
+        (passive.law != Law::Derivative).then_some(branch),
+        match passive.law {
+            Law::Derivative => Some(branch),
+            Law::Resistance => None,
+            _ => Some(branch + 1),
+        },
+    ];
+    let values = columns
+        .iter()
+        .map(|&column| binding.coordinate(column))
+        .collect::<SpiceResult<Vec<_>>>()?;
+    let (coefficient, gradient) = passive.expression.expression_jet(binding)?;
+    if passive.law != Law::Derivative {
+        jet.static_part
+            .linear(columns[0], columns[2], &values[2], 1.)?;
+        jet.static_part
+            .linear(columns[1], columns[2], &values[2], -1.)?;
+    }
+    // The scalar equation generator supplies all invariant direct rows
+    // (including storage signs); the varying coefficient is stamped as a
+    // product with its physical multiplier coordinate.
+    let equations = passive.law.equations([0.; 4], 0.);
+    for (index, equation) in equations.into_iter().enumerate() {
+        let Some(equation) = equation else { continue };
+        let row = Some(rows[index]);
+        for ((column, value), weight) in columns
+            .into_iter()
+            .zip(&values)
+            .zip(equation.static_part.direct)
+        {
+            jet.static_part.linear(row, column, value, weight)?;
+        }
+        if index == 0 {
+            let multiplier = match passive.law {
+                Law::Resistance => Some(2),
+                Law::Capacitance | Law::Inductance => Some(3),
+                Law::Charge | Law::Derivative => None,
+            };
+            let product = if let Some(local) = multiplier {
+                jet.static_part
+                    .derivative(row, columns[local], &coefficient, -1.)?;
+                for (column, derivative) in &gradient {
+                    jet.static_part.derivative(
+                        row,
+                        *column,
+                        &derivative.mul(&values[local])?,
+                        -1.,
+                    )?;
+                }
+                coefficient.mul(&values[local])?
+            } else {
+                for (column, derivative) in &gradient {
+                    jet.static_part.derivative(row, *column, derivative, -1.)?;
+                }
+                coefficient.clone()
+            };
+            jet.static_part.value(row, &product, -1.)?;
+        }
+        if let Some(storage) = equation.storage {
+            for ((column, value), weight) in columns.into_iter().zip(&values).zip(storage.direct) {
+                jet.charge.linear(row, column, value, weight)?;
+            }
+        }
+    }
+    Ok(true)
+}
