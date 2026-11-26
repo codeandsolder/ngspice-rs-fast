@@ -216,3 +216,62 @@ fn reused_circuit_rederives_breakdown_at_the_resolved_reltol() {
         assert!(plan.run(&mut circuit, &invalid).is_err());
     }
 }
+
+#[test]
+fn soft_recovery_ac_has_the_physical_relaxation_pole() {
+    // Independently eliminate the charge coordinate from
+    // q + VP*TT*dq/dt = TT*I(v). The signed input admittance is
+    // G * [1 + (1-VP)*s*TT/(1+VP*s*TT)] with CJO=0.
+    for (temp, vp, scale) in [
+        (27., 0., 1e6),
+        (27., 0.01, 1e6),
+        (27., 0.05, 1.),
+        (27., 0.05, 1e6),
+        (27., 0.05, 1e9),
+        (27., 1., 1e6),
+        (77., 0.05, 1e6),
+    ] {
+        let p = simulate(&format!(
+            ".options temp={temp} reltol=1e-9 vntol=1e-12 abstol=1e-15\n\
+             v1 a 0 dc 0.7 ac 1\nd1 a 0 dm\n\
+             .model dm d(is=1e-14 tt=100n ttt1=0.003 ttt2=1e-5 vp={vp} qpscale={scale})\n\
+             .ac dec 3 10k 10g"
+        ));
+        let t = temp + 273.15;
+        let vt = K_OVER_Q * t;
+        let is = 1e-14 * ((t / 300.15 - 1.) * 1.11 / vt + 3. * (t / 300.15).ln()).exp();
+        let g = is * (0.7 / vt).exp() / vt + GMIN;
+        let dt = temp - 27.;
+        let tt = 100e-9 * (1. + 0.003 * dt + 1e-5 * dt * dt);
+        for k in 0..p.point_count() {
+            let wtt = std::f64::consts::TAU * real(&p, "frequency", k) * tt;
+            let x = vp * wtt;
+            let denom = 1. + x * x;
+            let re = g * (1. + (1. - vp) * wtt * x / denom);
+            let im = g * (1. - vp) * wtt / denom;
+            let measured = p.value("i(v1)", k).unwrap();
+            let bound = 2e-6 * re.hypot(im) + 1e-12;
+            assert!(
+                (measured.re + re).hypot(measured.im + im) < bound,
+                "T={temp} VP={vp} scale={scale} wTT={wtt}: {measured:?} vs {}, {}",
+                -re,
+                -im
+            );
+        }
+    }
+}
+
+#[test]
+fn inactive_recovery_reduces_to_the_original_junction_without_an_auxiliary_node() {
+    let run = |parameters: &str| {
+        simulate(&format!(
+            "v1 a 0 dc .7 ac 1\nd1 a 0 dm\n.model dm d(is=1e-14 cjo=1p {parameters})\n.ac dec 3 1k 1g"
+        ))
+    };
+    for (lhs, rhs) in [("tt=100n", "tt=100n vp=0"), ("tt=0", "tt=0 vp=0.05")] {
+        let a = run(lhs);
+        let b = run(rhs);
+        assert_eq!(a.column("i(v1)").unwrap(), b.column("i(v1)").unwrap());
+        assert!(b.column("v(d1#qp)").is_none());
+    }
+}

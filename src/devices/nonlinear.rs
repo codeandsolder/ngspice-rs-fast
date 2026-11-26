@@ -8,8 +8,8 @@
 //! high-injection knees (IKF/IKR/IKP) and the transit-time/series-resistance
 //! temperature coefficients, and the `.noise` generators of `dionoise.c`
 //! (series-resistance thermal, junction shot and KF/AF flicker noise).
-//! Soft reverse recovery, a separate sidewall series
-//! resistance, self-heating, level-3 geometry and SOA setters fail
+//! Soft reverse recovery uses an independent conservative charge state.
+//! Separate sidewall series resistance, self-heating, level-3 geometry and SOA setters fail
 //! with [`SpiceError::NotYetPorted`] before node interning; unknown setters
 //! remain unsupported errors. The instance `off` flag follows `dioload.c`
 //! (`MODEINITJCT`/`MODEINITFIX` hold at 0 V). The `uic` initial load starts
@@ -38,6 +38,7 @@ use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceError, SpiceResult};
 
 pub(super) mod charge;
+mod recovery;
 mod sens;
 pub(super) mod thermal;
 use thermal::{
@@ -102,6 +103,8 @@ static MODEL: ScalarSchema<'static> = ScalarSchema::new(&[
     scalar("trs2", Unit::InverseKelvinSquared, Domain::Finite, Some(0.)),
     scalar("tnom", Unit::Celsius, Domain::Temperature, None),
     scalar("tt", Unit::Second, Domain::NonNegative, Some(0.)),
+    scalar("vp", Unit::Dimensionless, Domain::NonNegative, Some(0.)),
+    scalar("qpscale", Unit::Dimensionless, Domain::Positive, Some(1e6)),
     scalar("ttt1", Unit::InverseKelvin, Domain::Finite, Some(0.)),
     scalar("ttt2", Unit::InverseKelvinSquared, Domain::Finite, Some(0.)),
     scalar("cjo", Unit::Farad, Domain::NonNegative, Some(0.)),
@@ -177,14 +180,6 @@ const MODEL_PENDING: &[(&str, &str)] = &[
     (
         "rsw",
         "src/spicelib/devices/dio/diosetup.c, dioload.c (separate sidewall series resistance)",
-    ),
-    (
-        "vp",
-        "src/spicelib/devices/dio/dioload.c, diotemp.c (soft reverse recovery)",
-    ),
-    (
-        "qpscale",
-        "src/spicelib/devices/dio/dioload.c, diotemp.c (soft reverse recovery)",
     ),
     ("rth0", "src/spicelib/devices/dio/dioload.c (self-heating)"),
     ("cth0", "src/spicelib/devices/dio/dioload.c (self-heating)"),
@@ -333,6 +328,7 @@ pub struct Diode {
     model: String,
     terminals: Vec<NodeId>,
     junction: [NodeId; 2],
+    recovery_node: Option<NodeId>,
     parameters: DiodeParameters,
     derived: DerivedCache<DiodeThermalKey, Thermal>,
     /// `off` and the instance `ic` (C `DIOoff`, `DIOinitCond`). The `ic`
@@ -439,6 +435,8 @@ struct DiodeModelParameters {
     trs1: Real,
     trs2: Real,
     tt: Real,
+    vp: Real,
+    qpscale: Real,
     ttt1: Real,
     ttt2: Real,
     cjo: Real,
@@ -615,8 +613,16 @@ impl Diode {
             thermal.conductance
         };
         let (mut gd, mut cd) = (p.junction.conductance, p.junction.current);
-        let branch =
-            charge::ChargeBranch::new(DIODE_CHARGE_SLOT, p.junction.charge, p.junction.capacitance);
+        let recovery = self.recovery(thermal);
+        let branch = if recovery.is_some() {
+            charge::ChargeBranch::new(
+                DIODE_CHARGE_SLOT,
+                p.depletion_charge,
+                p.depletion_capacitance,
+            )
+        } else {
+            charge::ChargeBranch::new(DIODE_CHARGE_SLOT, p.junction.charge, p.junction.capacitance)
+        };
         if let Some(coefficients) = context.integration {
             let crate::devices::AnalysisMode::Transient { dt, .. } = context.mode else {
                 return Err(SpiceError::circuit("junction companion outside transient"));
@@ -651,6 +657,9 @@ impl Diode {
             (prime, pos, -gspr),
             (prime, neg, -gd),
         ])?;
+        if let Some(recovery) = recovery {
+            recovery.stamp(context, self.junction, p.junction, v)?;
+        }
         limiter.finish(&mut context.states, &[(DIODE_VOLTAGE_SLOT, v)])
     }
 
@@ -761,11 +770,24 @@ impl DiodeInput {
         } else {
             external[0]
         };
+        let recovery_node = if self.parameters.model.vp > 0. && self.parameters.model.tt > 0. {
+            let name = format!("{}#qp", self.name);
+            if nodes.get(&name).is_some() {
+                return Err(SpiceError::circuit("diode recovery-node name collision"));
+            }
+            let qp = nodes.intern(&name)?;
+            nodes.set_kind(qp, NodeKind::Internal)?;
+            terminals.push(qp);
+            Some(qp)
+        } else {
+            None
+        };
         Ok(Diode {
             name: self.name,
             model: self.model,
             terminals,
             junction: [positive, external[1]],
+            recovery_node,
             parameters: self.parameters,
             derived: self.derived,
             initial: self.initial,
@@ -904,6 +926,8 @@ impl DiodeParameters {
                 trs1: read("trs")?,
                 trs2: read("trs2")?,
                 tt: read("tt")?,
+                vp: read("vp")?,
+                qpscale: read("qpscale")?,
                 ttt1: read("ttt1")?,
                 ttt2: read("ttt2")?,
                 cjo: read("cjo")?,
@@ -1282,6 +1306,8 @@ struct DiodePoint {
     junction: JunctionPoint,
     ac_conductance: Real,
     ac_capacitance: Real,
+    depletion_charge: Real,
+    depletion_capacitance: Real,
 }
 impl Thermal {
     /// `dioload.c`'s junction voltage for this load: `tVcrit` in
@@ -1371,8 +1397,8 @@ impl Thermal {
         Ok(())
     }
 
-    /// `dioload.c` currents and charges at junction voltage `vd` (no RSW, no
-    /// soft recovery, no self-heating).
+    /// `dioload.c` currents and equilibrium charges at junction voltage `vd`
+    /// (no RSW or self-heating). Active recovery uses the separate depletion fields.
     fn point(&self, vd: Real, gmin: Real) -> SpiceResult<DiodePoint> {
         let point = self.point_unchecked(vd, gmin)?;
         point.junction.validate()?;
@@ -1497,6 +1523,8 @@ impl Thermal {
             },
             ac_conductance,
             ac_capacitance: ac_diffusion_capacitance + capacitance + capacitance_sw,
+            depletion_charge: charge + charge_sw,
+            depletion_capacitance: capacitance + capacitance_sw,
         };
         Ok(point)
     }
@@ -1791,6 +1819,11 @@ impl Device for Diode {
         ] {
             setup.nodes(row, col);
         }
+        if let Some(qp) = self.recovery_node {
+            for (row, col) in [(qp, qp), (qp, prime), (qp, neg), (prime, qp), (neg, qp)] {
+                setup.nodes(row, col);
+            }
+        }
         Ok(true)
     }
     fn observation_parameter(
@@ -1825,10 +1858,17 @@ impl Device for Diode {
     }
     fn state_count(&self) -> usize {
         // Charge, its derivative and the limited junction voltage.
-        DIODE_STATE_COUNT
+        DIODE_STATE_COUNT + usize::from(self.recovery_node.is_some()) * 2
     }
     fn truncation_slot(&self) -> Option<usize> {
         Some(0)
+    }
+    fn truncation_slots(&self) -> Vec<usize> {
+        if self.recovery_node.is_some() {
+            vec![DIODE_CHARGE_SLOT, recovery::CHARGE_SLOT]
+        } else {
+            vec![DIODE_CHARGE_SLOT]
+        }
     }
     /// `dio.c` `DIOpTable`: AREA, PJ (alias PERIM), M, TEMP and DTEMP, which
     /// `diotemp.c` re-derives completely (`dctrcurv.c` `DCTsetInstParam`).
@@ -1929,6 +1969,7 @@ impl Device for Diode {
             model: self.model.clone(),
             terminals: self.terminals.clone(),
             junction: self.junction,
+            recovery_node: self.recovery_node,
             parameters: p,
             derived: DerivedCache::from_value(DiodeThermalKey::context(context), thermal),
             initial,
@@ -1942,6 +1983,12 @@ impl Device for Diode {
         &self,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
+        if self.recovery_node.is_some() {
+            return Err(SpiceError::not_yet_ported(
+                "diode soft-recovery sensitivity",
+                "src/spicelib/analysis/cktsens.c",
+            ));
+        }
         Ok(Box::new(sens::DiodeSensitivity::new(self, context)))
     }
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
@@ -1961,14 +2008,22 @@ impl Device for Diode {
         context: &mut crate::devices::traits::ChargeContext<'_>,
     ) -> SpiceResult<()> {
         let voltage = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
-        let point = self
-            .thermal(context.model)?
-            .point(voltage, context.model.gmin)?;
-        context.branch(
-            self.junction,
-            point.junction.charge,
-            point.junction.capacitance,
-        )
+        let thermal = self.thermal(context.model)?;
+        let point = thermal.point(voltage, context.model.gmin)?;
+        if let Some(recovery) = self.recovery(&thermal) {
+            context.branch(
+                self.junction,
+                point.depletion_charge,
+                point.depletion_capacitance,
+            )?;
+            recovery.assemble_charge(context, self.junction)
+        } else {
+            context.branch(
+                self.junction,
+                point.junction.charge,
+                point.junction.capacitance,
+            )
+        }
     }
 
     /// `dioacld.c`: series conductance, C's small-signal junction conductance
@@ -1998,7 +2053,12 @@ impl Device for Diode {
             )?;
         }
         context.nodal(self.junction, p.ac_conductance, false)?;
-        context.nodal(self.junction, p.ac_capacitance, true)
+        if let Some(recovery) = self.recovery(&thermal) {
+            context.nodal(self.junction, p.depletion_capacitance, true)?;
+            recovery.assemble_linear(context, self.junction, p.ac_conductance)
+        } else {
+            context.nodal(self.junction, p.ac_capacitance, true)
+        }
     }
 
     /// Pole-zero load: C `diopzld.c` equals the AC load with `s` for `j omega`.
@@ -2030,6 +2090,12 @@ impl Device for Diode {
         use crate::devices::distortion::{
             Control, DeviceDistortion, DistortionTerm, Response, Taylor,
         };
+        if self.recovery_node.is_some() {
+            return Err(SpiceError::not_yet_ported(
+                "diode soft-recovery distortion",
+                "src/spicelib/devices/dio/diodisto.c",
+            ));
+        }
         let p = &self.parameters;
         let t = self.thermal(context.model_context)?;
         let vd = context.voltage(self.junction[0])? - context.voltage(self.junction[1])?;
@@ -2567,7 +2633,6 @@ mod tests {
     fn unported_and_invalid_setters_fail_explicitly() {
         for (model, instance) in [
             ("rsw=1", ""),
-            ("vp=1 tt=1n", ""),
             ("rth0=10", ""),
             ("bv_max=10", ""),
             ("xom=1e4", ""),

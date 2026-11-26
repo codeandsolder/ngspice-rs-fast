@@ -487,6 +487,7 @@ impl DiodeSensitivity<'_> {
             model: self.diode.model.clone(),
             terminals: self.diode.terminals.clone(),
             junction: self.diode.junction,
+            recovery_node: self.diode.recovery_node,
             parameters,
             derived: DerivedCache::new(),
             initial: self.diode.initial.clone(),

@@ -229,3 +229,22 @@ fn conformance_rc_transient_matches_c() {
         &["v(in)", "v(out)", "i(v1)"],
     );
 }
+
+#[test]
+#[ignore = "requires NGSPICE_BIN; compares native diode soft recovery against live C"]
+fn diode_soft_recovery_matches_c() {
+    for method in ["trap", "gear"] {
+        for (vp, temp) in [(0., 27.), (0.01, 27.), (0.05, 27.), (0.05, 77.)] {
+            compare(
+                &format!("diode-recovery-{method}-{vp}-{temp}"),
+                &DeckInputs::same(&format!(
+                    "recovery\nv1 a 0 pulse(1 -1 1u 1n 1n 2u 5u)\nr1 a d 10\nd1 d 0 dm\n.model dm d(is=1e-14 tt=100n cjo=1p vp={vp} ttt1=0.003)\n.options method={method} temp={temp}\n.tran 100p 1.5u 0 100p\n.end\n"
+                )),
+                100e-12,
+                1.5e-6,
+                &[1e-6, 1.001e-6],
+                &["v(d)", "i(v1)"],
+            );
+        }
+    }
+}
