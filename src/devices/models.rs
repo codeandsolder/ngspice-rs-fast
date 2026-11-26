@@ -1214,11 +1214,8 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
     // Preserve the first rounded selector, including aliases. Fixed-backend
     // families have separate level setter policy.
     let (selector, valid_setter, applied) = match family {
-        ModelFamily::LtspiceSwitch => (
-            first_integer,
-            last.is_none_or(|last| last == first_integer),
-            None,
-        ),
+        // LTspice applies ordered level setters, retaining the last one.
+        ModelFamily::LtspiceSwitch => (last.unwrap_or(1), true, last),
         ModelFamily::Npn
         | ModelFamily::Pnp
         | ModelFamily::Nmos

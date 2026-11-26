@@ -35,7 +35,13 @@ fn close(label: &str, actual: f64, expected: f64, rel: f64, absolute: f64) {
 
 #[test]
 fn all_four_control_modes_match_independent_ltspice_24_measurements() -> TestResult {
-    let original = include_str!("fixtures/ltspice-switch/transfer.cir");
+    check_reference_sweep(
+        include_str!("fixtures/ltspice-switch/transfer.cir"),
+        include_str!("fixtures/ltspice-switch/transfer.tsv"),
+    )
+}
+
+fn check_reference_sweep(original: &str, reference: &str) -> TestResult {
     // Only source family selection differs; no equations are rewritten.
     let normalized = original.replace(" SW(", " ltspice_switch(");
     let netlist =
@@ -44,17 +50,14 @@ fn all_four_control_modes_match_independent_ltspice_24_measurements() -> TestRes
     let mut circuit = config.circuit(&netlist)?;
     let plan = config.plan_for(&netlist.analyses[0])?;
     let plot = plan.run(&mut circuit, &config.context())?;
-    assert_eq!(plot.point_count(), 17);
-    for (index, line) in include_str!("fixtures/ltspice-switch/transfer.tsv")
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .enumerate()
-    {
+    let rows = reference.lines().filter(|line| !line.starts_with('#'));
+    assert_eq!(plot.point_count(), rows.clone().count());
+    for (index, line) in rows.enumerate() {
         let values = line
             .split_whitespace()
             .map(str::parse::<f64>)
             .collect::<Result<Vec<_>, _>>()?;
-        let [control, cubic, hysteresis, ideal, atan]: [f64; 5] =
+        let [control, v1, v2, v3, v4]: [f64; 5] =
             values.try_into().map_err(|_| "reference row width")?;
         close(
             "sweep control",
@@ -63,12 +66,7 @@ fn all_four_control_modes_match_independent_ltspice_24_measurements() -> TestRes
             0.,
             1e-14,
         );
-        for (name, expected) in [
-            ("i(v1)", cubic),
-            ("i(v2)", hysteresis),
-            ("i(v3)", ideal),
-            ("i(v4)", atan),
-        ] {
+        for (name, expected) in [("i(v1)", v1), ("i(v2)", v2), ("i(v3)", v3), ("i(v4)", v4)] {
             close(
                 name,
                 plot.value(name, index).ok_or("missing supply current")?.re,
@@ -79,6 +77,14 @@ fn all_four_control_modes_match_independent_ltspice_24_measurements() -> TestRes
         }
     }
     Ok(())
+}
+
+#[test]
+fn ordered_level_setters_use_last_value() -> TestResult {
+    check_reference_sweep(
+        include_str!("fixtures/ltspice-switch/duplicate-level.cir"),
+        include_str!("fixtures/ltspice-switch/duplicate-level.tsv"),
+    )
 }
 
 /// Independent scalar equation, used to verify the actual circuit-level
@@ -318,7 +324,6 @@ fn native_and_prepared_switch_selection_never_aliases_unqualified_modes() -> Tes
     for bad in [
         "sw(level=2 vh=-1)",
         "ltspice_switch(level=1.5 vh=-1)",
-        "ltspice_switch(level=2 level=1 vh=-1)",
         "ltspice_switch(level=3 vh=-1)",
         "ltspice_switch(level=2 vh=0)",
         "ltspice_switch(ron=-1 vh=-1)",
@@ -581,43 +586,10 @@ fn thermal_noise_matches_independent_measurements_including_gmin_and_hard_limit(
 
 #[test]
 fn descending_hysteresis_and_zero_width_threshold_match_reference() -> TestResult {
-    let original = include_str!("fixtures/ltspice-switch/hysteresis-down.cir");
-    let normalized = original.replace(" SW(", " ltspice_switch(");
-    let netlist =
-        Parser::new().parse_deck(&parse_deck_text(Path::new("descending.cir"), &normalized))?;
-    let config = RunConfig::from_netlist(&netlist)?;
-    let plot = config
-        .plan_for(&netlist.analyses[0])?
-        .run(&mut config.circuit(&netlist)?, &config.context())?;
-    assert_eq!(plot.point_count(), 17);
-    for (index, line) in include_str!("fixtures/ltspice-switch/hysteresis-down.tsv")
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .enumerate()
-    {
-        let values = line
-            .split_whitespace()
-            .map(str::parse::<f64>)
-            .collect::<Result<Vec<_>, _>>()?;
-        let [control, v1, v2, v3, v4]: [f64; 5] =
-            values.try_into().map_err(|_| "reference row width")?;
-        close(
-            "control",
-            plot.value("v(c)", index).ok_or("missing control")?.re,
-            control,
-            0.,
-            1e-14,
-        );
-        for (name, expected) in [("i(v1)", v1), ("i(v2)", v2), ("i(v3)", v3), ("i(v4)", v4)] {
-            close(
-                name,
-                plot.value(name, index).ok_or("missing supply current")?.re,
-                expected,
-                5e-10,
-                5e-15,
-            );
-        }
-    }
+    check_reference_sweep(
+        include_str!("fixtures/ltspice-switch/hysteresis-down.cir"),
+        include_str!("fixtures/ltspice-switch/hysteresis-down.tsv"),
+    )?;
     let normalized = include_str!("fixtures/ltspice-switch/threshold-op.cir")
         .replace(" SW(", " ltspice_switch(");
     let netlist =

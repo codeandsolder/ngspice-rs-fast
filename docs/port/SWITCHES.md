@@ -187,7 +187,8 @@ signed-hysteresis state machine remains intact.
 | LSER | finite signed transient series inductance | unsupported |
 
 Resistances must be finite and positive; signed current limits follow the measured rules above.
-Level selectors must be exactly 1 or 2. Unsupported nonzero options are
+Level setters must be exactly 1 or 2; the last ordered setter selects
+the constitutive law (verified for alternating repeated setters). Unsupported nonzero options are
 diagnosed before elaboration rather than silently discarded.
 
 ### Constitutive law and reference differences
