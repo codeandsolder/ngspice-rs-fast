@@ -10,7 +10,7 @@ use ngspice_rs::{
 };
 use ngspice_rs_preprocess::{
     Cancellation, InputFormat, Options, PreparedBundle, Request, SourceInput,
-    analysis_plan::{AnalysisKind as SourceAnalysis, Directive},
+    analysis_plan::{AnalysisKind as SourceAnalysis, Directive, Disposition},
     prepare,
 };
 
@@ -28,7 +28,9 @@ fn prepared(path: &Path) -> SpiceResult<(Netlist, Vec<AnalysisInput>)> {
     .map_err(|e| ngspice_rs::primitives::SpiceError::circuit(e.to_string()))?;
     let plan = bundle.analysis_plan.as_ref().unwrap();
     let requests = plan
-        .native_requests()
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.directive, Directive::Analysis { .. }))
         .map(|entry| {
             let Directive::Analysis {
                 analysis,
@@ -53,13 +55,60 @@ fn prepared(path: &Path) -> SpiceResult<(Netlist, Vec<AnalysisInput>)> {
                     ));
                 }
             };
-            let mut input = AnalysisInput::with_arguments(kind, arguments.clone());
+            let arguments = match entry.disposition {
+                Disposition::NativeRequest => arguments.clone(),
+                Disposition::RequiresBinding if kind == AnalysisKind::DcSweep => {
+                    bind_source_sweep(&bundle, arguments)?
+                }
+                _ => {
+                    return Err(ngspice_rs::primitives::SpiceError::circuit(
+                        "unsupported reference analysis binding",
+                    ));
+                }
+            };
+            let mut input = AnalysisInput::with_arguments(kind, arguments);
             input.uic = *uic;
             Ok(input)
         })
         .collect::<SpiceResult<Vec<_>>>()?;
     let netlist = materialize(&bundle, &requests)?;
     Ok((netlist, requests))
+}
+
+// For the measured independent-source sweeps, the producer retains a
+// source namespace identity. Bind each axis through that identity, not
+// through an assumption that a source token survived translation unchanged.
+// More general parameter/temperature sweeps belong to the analysis-plan binder.
+fn bind_source_sweep(bundle: &PreparedBundle, arguments: &[String]) -> SpiceResult<Vec<String>> {
+    use ngspice_rs::primitives::SpiceError;
+    if !matches!(arguments.len(), 4 | 8) {
+        return Err(SpiceError::circuit(
+            "expected independent source sweep axes",
+        ));
+    }
+    let mut bound = arguments.to_vec();
+    for axis in bound.chunks_exact_mut(4) {
+        let target = &axis[0];
+        let mut matches = bundle.device_identities.iter().filter(|identity| {
+            identity.scope.is_empty() && identity.displayed.eq_ignore_ascii_case(target)
+        });
+        let identity = matches
+            .next()
+            .ok_or_else(|| SpiceError::circuit(format!("unbound source sweep target {target}")))?;
+        if matches.next().is_some()
+            || !identity
+                .linked
+                .as_bytes()
+                .first()
+                .is_some_and(|first| matches!(first.to_ascii_lowercase(), b'v' | b'i'))
+        {
+            return Err(SpiceError::circuit(format!(
+                "ambiguous or non-source sweep target {target}"
+            )));
+        }
+        axis[0] = identity.linked.clone();
+    }
+    Ok(bound)
 }
 
 fn materialize(bundle: &PreparedBundle, requests: &[AnalysisInput]) -> SpiceResult<Netlist> {
