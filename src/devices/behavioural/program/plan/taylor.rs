@@ -196,11 +196,11 @@ fn unary(op: Unary, x: &Jet) -> SpiceResult<Jet> {
         Unary::Sin => x.clone().with_value(modulus(x.value(), TWO_PI)).sin_cos().0,
         Unary::Cos => x.clone().with_value(modulus(x.value(), TWO_PI)).sin_cos().1,
         Unary::Tan => {
-            let (sin, cos) = x
+            let (sine, cosine) = x
                 .clone()
                 .with_value(modulus(x.value(), std::f64::consts::PI))
                 .sin_cos();
-            sin.divide(&cos)?.with_value(value)
+            sine.divide(&cos)?.with_value(value)
         }
         Unary::Sinh => x.sinh_cosh().0,
         Unary::Cosh => x.sinh_cosh().1,
@@ -290,10 +290,10 @@ fn operator(op: Operator, a: &Jet, b: &Jet, fudge: Real) -> SpiceResult<Jet> {
                 fudge
             };
             let result = a.divide(&b.clone().offset(offset))?;
-            if b.value() != 0. {
-                result.with_value(divide(a.value(), b.value(), fudge))
-            } else {
+            if b.value() == 0. {
                 result
+            } else {
+                result.with_value(divide(a.value(), b.value(), fudge))
             }
         }
         Operator::Power => power_jet(a, b, PowerKind::Operator)?,
@@ -341,10 +341,10 @@ fn power_jet(a: &Jet, b: &Jet, kind: PowerKind) -> SpiceResult<Jet> {
     };
     // At a zero crossing the mathematical right limit can differ from the
     // reference scalar pow(0,0); preserve the branch-local expansion.
-    Ok(if a.value() != 0. {
-        result.with_value(scalar)
-    } else {
+    Ok(if a.value() == 0. {
         result
+    } else {
+        result.with_value(scalar)
     })
 }
 

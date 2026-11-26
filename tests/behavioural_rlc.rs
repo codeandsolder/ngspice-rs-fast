@@ -6,6 +6,15 @@ use ngspice_rs::netlist::{Parser, semantic_diff, source::parse_deck_text, write_
 use ngspice_rs::primitives::{AnalysisKind, SpiceResult};
 
 fn run(body: &str, kind: AnalysisKind, args: &[&str]) -> SpiceResult<Plot> {
+    run_observed(body, kind, args, &[])
+}
+
+fn run_observed(
+    body: &str,
+    kind: AnalysisKind,
+    args: &[&str],
+    observations: &[&str],
+) -> SpiceResult<Plot> {
     let deck = parse_deck_text(
         Path::new("passive.cir"),
         &format!("passive\n{body}\n.end\n"),
@@ -13,6 +22,12 @@ fn run(body: &str, kind: AnalysisKind, args: &[&str]) -> SpiceResult<Plot> {
     let netlist = Parser::new().parse_deck(&deck)?;
     let config = RunConfig::from_netlist(&netlist)?;
     let mut circuit = config.circuit(&netlist)?;
+    circuit.set_observations(
+        &observations
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>(),
+    )?;
     let mut request =
         AnalysisInput::with_arguments(kind, args.iter().copied().filter(|arg| *arg != "uic"));
     request.uic = args.contains(&"uic");
@@ -765,12 +780,13 @@ fn sinusoidal_capacitor_loaded_derivative_matches_physical_current() -> SpiceRes
     // A smooth right limit with zero initial derivative output, but a
     // nonzero second derivative of the source. Both explicit physical
     // capacitors have an algebraically determined current.
-    let body = "v1 in 0 sin(2 0.1 1k 0 0 90)\nb1 y 0 v=1m*ddt(v(in)^2)\nr1 y 0 1k\nrsh1 in 0 1k\nrsh2 y 0 1k\ncsh1 in 0 1n\ncsh2 y 0 1n\n.save v(y) i(v1) i(b1) @csh1[i] @csh2[i]\n.options reltol=1e-6 vntol=1n";
+    let body = "v1 in 0 sin(2 0.1 1k 0 0 90)\nb1 y 0 v=1m*ddt(v(in)^2)\nr1 y 0 1k\nrsh1 in 0 1k\nrsh2 y 0 1k\ncsh1 in 0 1n\ncsh2 y 0 1n\n.options reltol=1e-6 vntol=1n";
     for method in ["method=trap", "method=gear"] {
-        let plot = run(
+        let plot = run_observed(
             body,
             AnalysisKind::Transient,
             &["5u", "50u", "0", "5u", method],
+            &["@csh1[i]", "@csh2[i]"],
         )?;
         let omega = std::f64::consts::TAU * 1000.;
         for point in 0..plot.point_count() {

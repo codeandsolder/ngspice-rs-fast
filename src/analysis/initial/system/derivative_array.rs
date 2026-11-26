@@ -77,7 +77,10 @@ impl Constraint<'_> {
                     .filter(|term| term.row == equation)
                 {
                     matrix.add(row, term.col, term.value)?;
-                    scale += term.value.abs() * state.as_slice()[term.col].abs();
+                    scale = term
+                        .value
+                        .abs()
+                        .mul_add(state.as_slice()[term.col].abs(), scale);
                 }
                 let value = point.charge[0].as_slice()[equation];
                 scale = scale.max(value.abs()).max(charge.target.abs());
@@ -89,12 +92,11 @@ impl Constraint<'_> {
 
     fn absolute(self, tol: Tolerances) -> Real {
         match self {
-            Self::Coordinate(..) => tol.abstol,
             Self::Voltage(..) => tol.vntol,
             Self::Charge(_, charge) if charge.policy == InitialStoragePolicy::Derived => tol.vntol,
             Self::Charge(..) => tol.chgtol,
             Self::Companion(c) if c.derived => tol.vntol,
-            Self::Companion(_) => tol.abstol,
+            Self::Coordinate(..) | Self::Companion(_) => tol.abstol,
         }
     }
 }
@@ -243,7 +245,7 @@ fn companions<'a>(
             derived,
             history,
             coefficients,
-        }))
+        }));
     };
     for (&AbsoluteRow(row), charge) in &storage.charges {
         add(
@@ -325,9 +327,9 @@ impl Array {
                 .enumerate()
             {
                 array.residual[offset + r] = multiplier.mul_add(q, f);
-                array.scale[offset + r] = f.abs() + multiplier * q.abs();
+                array.scale[offset + r] = multiplier.mul_add(q.abs(), f.abs());
             }
-            for j in 0..=k + 1 {
+            for (j, coefficient_state) in state.iter().enumerate().take(k + 2) {
                 for (matrix, factor) in [
                     (point.conductance.get(k.wrapping_sub(j)), 1.),
                     (point.capacitance.get(k + 1 - j), multiplier),
@@ -341,7 +343,10 @@ impl Array {
                         let row = offset + term.row;
                         let coefficient = factor * term.value;
                         array.matrix.add(row, j * width + term.col, coefficient)?;
-                        array.scale[row] += coefficient.abs() * state[j].as_slice()[term.col].abs();
+                        array.scale[row] = coefficient.abs().mul_add(
+                            coefficient_state.as_slice()[term.col].abs(),
+                            array.scale[row],
+                        );
                     }
                 }
             }
@@ -408,6 +413,7 @@ pub(in crate::analysis::initial) struct RightLimit {
     pub rate: Vector,
     pub charge: Vector,
     pub charge_rate: Vector,
+    pub order_hint: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -415,6 +421,7 @@ struct LocalPoint {
     time: Real,
     scale: Real,
     limit: Limit,
+    order_hint: usize,
 }
 
 impl LocalPoint {
@@ -437,7 +444,7 @@ fn extend(state: &mut Vec<Vector>) -> SpiceResult<()> {
     let width = state[0].len();
     if state.len() > MAX_ORDER || width.saturating_mul(state.len() + 1) > MAX_ARRAY_VARIABLES {
         return Err(failure(
-            "physical DAE initial derivative order or state budget exhausted",
+            "physical DAE derivative order or state budget exhausted: required coordinates may be noncausal or underdetermined",
         ));
     }
     state.push(Vector::zeros(width));
@@ -460,6 +467,28 @@ fn stable_rank_order(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArrayNewton {
+    Converged,
+    NeedOrder,
+}
+
+fn apply_step(state: &mut [Vector], correction: &Vector) -> SpiceResult<()> {
+    let width = state[0].len();
+    for (jet, delta) in state
+        .iter_mut()
+        .zip(correction.as_slice().chunks_exact(width))
+    {
+        for (value, &delta) in jet.as_mut_slice().iter_mut().zip(delta) {
+            *value += delta;
+        }
+        if !jet.is_finite() {
+            return Err(failure("nonfinite derivative array Newton iterate"));
+        }
+    }
+    Ok(())
+}
+
 fn newton(
     dae: &PhysicalDae<'_, '_>,
     state: &mut [Vector],
@@ -467,7 +496,7 @@ fn newton(
     initial: &[Constraint<'_>],
     tol: Tolerances,
     iterations: usize,
-) -> SpiceResult<()> {
+) -> SpiceResult<ArrayNewton> {
     let width = state[0].len();
     let mut best: Option<(Real, Vec<Vector>)> = None;
     for _ in 0..iterations {
@@ -478,36 +507,31 @@ fn newton(
             .iter()
             .map(|value| -value)
             .collect::<Vec<_>>();
-        let step = rank::complete(
-            &array.matrix,
-            &rhs,
-            &[],
-            &array.late,
-            &array.optional,
-            2 * width,
-        )?;
+        let step =
+            rank::projected_step(&array.matrix, &rhs, &array.late, &array.optional, 2 * width)?;
+        if step.prefix_rank < 2 * width {
+            // A nonlinear coefficient can vanish at a provisional seed,
+            // then recover after the determined coordinates are corrected.
+            // Do not confuse a deficient tangent with a noncausal DAE.
+            // The expanded array must prove the whole prefix before use.
+            apply_step(state, &step.values)?;
+            return Ok(ArrayNewton::NeedOrder);
+        }
         let (ratio, roundoff) = array.merit(initial, &step.independent, tol);
         if ratio <= 1. {
             if roundoff <= 1. {
-                return Ok(());
+                return Ok(ArrayNewton::Converged);
             }
             if best.as_ref().is_some_and(|(score, _)| roundoff >= *score) {
                 break;
             }
             best = Some((roundoff, state.to_vec()));
         }
-        for (jet, delta) in state
-            .iter_mut()
-            .zip(step.values.as_slice().chunks_exact(width))
-        {
-            for (value, &delta) in jet.as_mut_slice().iter_mut().zip(delta) {
-                *value += delta;
-            }
-        }
+        apply_step(state, &step.values)?;
     }
     if let Some((_, best)) = best {
         state.clone_from_slice(&best);
-        Ok(())
+        Ok(ArrayNewton::Converged)
     } else {
         Err(failure(
             "physical right-limit derivative array did not converge; initial constraints may require an impulse",
@@ -535,6 +559,7 @@ pub(in crate::analysis::initial) fn solve_right_limit(
             time: 0.,
             scale,
             limit: Limit::Right,
+            order_hint: 2,
         },
         tol,
         iterations,
@@ -547,6 +572,7 @@ pub(in crate::analysis::initial) fn solve_event(
     storage: &ImpulseStorage,
     tol: Tolerances,
     iterations: usize,
+    order_hint: usize,
 ) -> SpiceResult<RightLimit> {
     let forcing = request
         .forcing
@@ -562,6 +588,7 @@ pub(in crate::analysis::initial) fn solve_event(
             time,
             scale: forcing.timing.step(),
             limit: Limit::Right,
+            order_hint,
         },
         tol,
         iterations,
@@ -575,6 +602,7 @@ pub(in crate::analysis::initial) fn solve_step(
     storage: &ImpulseStorage,
     tol: Tolerances,
     iterations: usize,
+    order_hint: usize,
 ) -> SpiceResult<RightLimit> {
     let forcing = request
         .forcing
@@ -582,9 +610,8 @@ pub(in crate::analysis::initial) fn solve_step(
     let coefficients = request
         .integration
         .ok_or_else(|| failure("missing derivative step coefficients"))?;
-    let time = match request.mode {
-        crate::devices::AnalysisMode::Transient { time, .. } => time,
-        _ => return Err(failure("invalid derivative step mode")),
+    let crate::devices::AnalysisMode::Transient { time, .. } = request.mode else {
+        return Err(failure("invalid derivative step mode"));
     };
     solve(
         dae,
@@ -594,6 +621,7 @@ pub(in crate::analysis::initial) fn solve_step(
             time,
             scale: forcing.timing.step(),
             limit: forcing.limit,
+            order_hint,
         },
         tol,
         iterations,
@@ -608,20 +636,26 @@ fn solve(
     tol: Tolerances,
     iterations: usize,
 ) -> SpiceResult<RightLimit> {
-    let mut state = vec![
-        seed.clone(),
-        Vector::zeros(seed.len()),
-        Vector::zeros(seed.len()),
-    ];
+    let mut state = vec![seed.clone()];
+    for _ in 0..local.order_hint.max(2) {
+        extend(&mut state)?;
+    }
     loop {
         stable_rank_order(dae, &mut state, local)?;
-        newton(dae, &mut state, local, initial, tol, iterations)?;
+        if newton(dae, &mut state, local, initial, tol, iterations)? == ArrayNewton::NeedOrder {
+            extend(&mut state)?;
+            continue;
+        }
         let rank = local.prefix_rank(dae, &state)?;
         extend(&mut state)?;
         if local.prefix_rank(dae, &state)? == rank {
             // Re-solve the extended array: rank equality alone does not
             // establish its affine residual or the chosen right-hand branch.
-            newton(dae, &mut state, local, initial, tol, iterations)?;
+            if newton(dae, &mut state, local, initial, tol, iterations)? == ArrayNewton::NeedOrder
+                || local.prefix_rank(dae, &state)? != rank
+            {
+                continue;
+            }
             let point = local.evaluate(dae, &state)?;
             let to_rate = |vector: &Vector| {
                 Vector::from_slice(
@@ -637,6 +671,9 @@ fn solve(
                 rate: to_rate(&state[1]),
                 charge: point.charge[0].clone(),
                 charge_rate: to_rate(&point.charge[1]),
+                // The two extra orders were rank/affine lookahead checks;
+                // retain a lower bound so the next trial still repeats them.
+                order_hint: state.len().saturating_sub(3).max(2),
             });
         }
     }

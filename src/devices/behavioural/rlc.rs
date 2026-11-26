@@ -74,12 +74,10 @@ impl Law {
         let current_row = [0., 0., 1., 0.];
         let auxiliary_row = [0., 0., 0., 1.];
         let (mut direct, multiplier) = self.constitutive();
-        let (expression, offset) = if let Some(index) = multiplier {
+        let (expression, offset) = multiplier.map_or((-1., coefficient), |index| {
             direct[index] -= coefficient;
             (-values[index], 0.)
-        } else {
-            (-1., coefficient)
-        };
+        });
         let constitutive = Algebraic {
             direct,
             expression,

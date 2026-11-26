@@ -221,6 +221,7 @@ fn reverse_odd_vectors(vectors: &[Vector]) -> Vec<Vector> {
 }
 
 /// Coefficients of the physical equations and their state Jacobians.
+///
 /// Index k denotes the coefficient of the k-th normalized time power.
 /// Jacobian coefficients act by convolution on corrections to state jets.
 pub struct PhysicalDaeTaylor {
@@ -310,15 +311,17 @@ pub struct TaylorContext<'a> {
 impl TaylorContext<'_> {
     pub(crate) fn variable(&self, column: Option<usize>) -> SpiceResult<crate::maths::taylor::Jet> {
         use crate::maths::taylor::Jet;
-        match column {
-            Some(column) => Jet::from_coefficients(
-                self.state
-                    .iter()
-                    .map(|x| x.get(column).unwrap_or(Real::NAN))
-                    .collect(),
-            ),
-            None => Ok(Jet::constant(self.time.order(), 0.)),
-        }
+        column.map_or_else(
+            || Ok(Jet::constant(self.time.order(), 0.)),
+            |column| {
+                Jet::from_coefficients(
+                    self.state
+                        .iter()
+                        .map(|x| x.get(column).unwrap_or(Real::NAN))
+                        .collect(),
+                )
+            },
+        )
     }
 
     pub(crate) fn static_value(

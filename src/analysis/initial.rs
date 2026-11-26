@@ -1050,6 +1050,14 @@ fn potential(state: &Vector, vertex: VoltageVertex) -> Real {
     }
 }
 
+/// A completely determined physical derivative point. The order hint is
+/// disposable computational metadata, not an accepted integration state.
+pub(super) struct DerivativePoint {
+    pub solution: Vector,
+    pub canonical: Vec<(usize, Real)>,
+    pub order_hint: usize,
+}
+
 /// Calculate the right-limit state and all declared initial storage rates.
 /// The caller publishes a fresh exact device trial only after this succeeds.
 pub(super) fn consistent_derivative_start(
@@ -1059,7 +1067,7 @@ pub(super) fn consistent_derivative_start(
     uic: bool,
     tolerances: Tolerances,
     options: &crate::analysis::newton::NewtonOptions,
-) -> SpiceResult<Option<CheckedInitial>> {
+) -> SpiceResult<Option<DerivativePoint>> {
     let circuit = prepared.circuit();
     if !has_derived_storage(circuit) {
         return Ok(None);
@@ -1088,8 +1096,9 @@ pub(super) fn consistent_derivative_start(
         )?;
         let canonical =
             storage.consistent_history(circuit, &right, (!uic).then_some(0.), tolerances)?;
-        Ok(CheckedInitial {
-            solution: Some(right.state),
+        Ok(DerivativePoint {
+            solution: right.state,
+            order_hint: right.order_hint,
             canonical,
         })
     })();
@@ -1108,7 +1117,8 @@ pub(super) fn consistent_derivative_step(
     request: &LoadRequest<'_>,
     tolerances: Tolerances,
     iterations: usize,
-) -> SpiceResult<CheckedInitial> {
+    order_hint: usize,
+) -> SpiceResult<DerivativePoint> {
     let circuit = prepared.circuit();
     let forcing = request
         .forcing
@@ -1120,10 +1130,13 @@ pub(super) fn consistent_derivative_step(
     let storage =
         ImpulseStorage::collect(circuit, request.solution, request.model_context, values)?;
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
-    let right = system::solve_step(&dae, circuit, request, &storage, tolerances, iterations)?;
+    let right = system::solve_step(
+        &dae, circuit, request, &storage, tolerances, iterations, order_hint,
+    )?;
     let canonical = storage.consistent_history(circuit, &right, None, tolerances)?;
-    Ok(CheckedInitial {
-        solution: Some(right.state),
+    Ok(DerivativePoint {
+        solution: right.state,
+        order_hint: right.order_hint,
         canonical,
     })
 }
@@ -1136,7 +1149,8 @@ pub(super) fn consistent_derivative_event(
     left: &crate::devices::TrialState,
     tolerances: Tolerances,
     iterations: usize,
-) -> SpiceResult<CheckedInitial> {
+    order_hint: usize,
+) -> SpiceResult<DerivativePoint> {
     let circuit = prepared.circuit();
     let forcing = request
         .forcing
@@ -1152,10 +1166,11 @@ pub(super) fn consistent_derivative_event(
     )?;
     storage.retain_operating_point(request.solution);
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
-    let right = system::solve_event(&dae, request, &storage, tolerances, iterations)?;
+    let right = system::solve_event(&dae, request, &storage, tolerances, iterations, order_hint)?;
     let canonical = storage.consistent_history(circuit, &right, Some(time), tolerances)?;
-    Ok(CheckedInitial {
-        solution: Some(right.state),
+    Ok(DerivativePoint {
+        solution: right.state,
+        order_hint: right.order_hint,
         canonical,
     })
 }

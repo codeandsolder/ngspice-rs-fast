@@ -46,7 +46,7 @@ impl Jet {
         self.coefficients[0]
     }
 
-    pub(crate) fn order(&self) -> usize {
+    pub(crate) const fn order(&self) -> usize {
         self.coefficients.len() - 1
     }
 

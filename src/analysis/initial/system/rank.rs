@@ -154,6 +154,19 @@ impl Basis {
                 "derivative array leaves required initial coordinates undetermined at this order"
             }));
         }
+        self.particular_solution(column_exponents)
+    }
+
+    fn prefix_rank(&self) -> usize {
+        self.by_column[..self.required_prefix]
+            .iter()
+            .filter(|pivot| pivot.is_some())
+            .count()
+    }
+
+    /// Particular Newton correction with zero corrections in unresolved
+    /// coordinates. This does not prove consistency of the initial prefix.
+    fn particular_solution(&self, column_exponents: &[i32]) -> SpiceResult<Vector> {
         // Free tail coefficients are not initial gauges. The projected
         // equations proved that none changes the required prefix, so zero
         // is only a choice of particular solution for the unused tail.
@@ -183,6 +196,7 @@ impl Basis {
 pub(super) struct Completed {
     pub values: Vector,
     pub independent: Vec<bool>,
+    pub prefix_rank: usize,
 }
 
 /// A rectangular or singular instantaneous linearization can contain dependent
@@ -215,6 +229,27 @@ pub(super) fn complete(
     Ok(Completed {
         values: reduction.basis.solution(&reduction.column_exponents)?,
         independent: reduction.independent,
+        prefix_rank: reduction.basis.prefix_rank(),
+    })
+}
+
+/// A provisional Newton correction to a possibly rank-deficient array.
+/// Free coordinates retain their current iterate; the caller must recheck
+/// the projected rank and may not accept an incomplete correction.
+pub(super) fn projected_step(
+    matrix: &SparseMatrix,
+    rhs: &[Real],
+    late_rows: &[usize],
+    optional_rows: &[usize],
+    required_prefix: usize,
+) -> SpiceResult<Completed> {
+    let reduction = reduce(matrix, rhs, &[], late_rows, optional_rows, required_prefix)?;
+    Ok(Completed {
+        values: reduction
+            .basis
+            .particular_solution(&reduction.column_exponents)?,
+        independent: reduction.independent,
+        prefix_rank: reduction.basis.prefix_rank(),
     })
 }
 
@@ -223,10 +258,7 @@ pub(super) fn complete(
 pub(super) fn projected_rank(matrix: &SparseMatrix, required_prefix: usize) -> SpiceResult<usize> {
     let rhs = crate::primitives::filled_vec(matrix.rows(), 0., "derivative array rank")?;
     let reduction = reduce(matrix, &rhs, &[], &[], &[], required_prefix)?;
-    Ok(reduction.basis.by_column[..required_prefix]
-        .iter()
-        .filter(|p| p.is_some())
-        .count())
+    Ok(reduction.basis.prefix_rank())
 }
 
 struct Reduction {
