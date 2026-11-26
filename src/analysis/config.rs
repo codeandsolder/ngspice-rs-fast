@@ -1195,6 +1195,25 @@ impl RunConfig {
         Circuit::from_netlist_with_context(netlist, &self.context.model_context())
     }
 
+    /// Elaborate the prepared waveform sidecar at the same root scope as
+    /// this configuration. Rebuilding for a candidate rebinds all declarations.
+    /// # Errors
+    /// Invalid deck, source identity, or waveform coefficients.
+    pub fn prepared_circuit(
+        &self,
+        netlist: &Netlist,
+        waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
+    ) -> SpiceResult<Circuit> {
+        Circuit::from_prepared_netlist_with_limits(
+            netlist,
+            &self.context.model_context(),
+            crate::devices::MutualLimits::default(),
+            crate::devices::ElaborationLimits::default(),
+            self.params.clone(),
+            waveforms,
+        )
+    }
+
     /// Resolve an analysis card with its deck's parameter scope and options.
     ///
     /// # Errors

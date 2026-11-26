@@ -82,6 +82,7 @@ pub mod nport;
 pub mod passive;
 pub mod physical_dae;
 pub mod prepared_model;
+pub mod prepared_waveform;
 pub mod pulse;
 pub mod rf_passive;
 mod simetrix_diode;

@@ -426,6 +426,34 @@ pub(super) fn affine_value(first: Real, second: Real, fraction: Real) -> Real {
 
 /// Scaled slope without an overflowing endpoint difference or time ratio.
 pub(super) fn scaled_difference(first: Real, second: Real, scale: Real, duration: Real) -> Real {
+    scaled_difference_with_span(first, second, scale, duration, 0)
+}
+
+/// The duration can itself overflow even though both endpoints and the
+/// desired scaled slope are finite. Defer its exponent until the final
+/// normalization, rather than rounding half of a subnormal ordinate.
+pub(super) fn scaled_interval_difference(
+    first: Real,
+    second: Real,
+    scale: Real,
+    start: Real,
+    end: Real,
+) -> Real {
+    let span = end - start;
+    if span.is_finite() {
+        scaled_difference(first, second, scale, span)
+    } else {
+        scaled_difference_with_span(first, second, scale, start.mul_add(-0.5, end * 0.5), 1)
+    }
+}
+
+fn scaled_difference_with_span(
+    first: Real,
+    second: Real,
+    scale: Real,
+    duration: Real,
+    duration_exponent: i32,
+) -> Real {
     use crate::primitives::numeric::{scale_power, split_power};
     let difference = second - first;
     if scale == 0. || difference == 0. {
@@ -444,7 +472,7 @@ pub(super) fn scaled_difference(first: Real, second: Real, scale: Real, duration
     let (duration_m, duration_e) = split_power(duration);
     scale_power(
         mantissa * scale_m / duration_m,
-        exponent + scale_e - duration_e,
+        exponent + scale_e - duration_e - duration_exponent,
     )
 }
 

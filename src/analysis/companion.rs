@@ -560,9 +560,12 @@ impl AttemptedStep {
         })
     }
 
-    const fn accept(self, next: NextStep) -> AcceptedCursor {
+    const fn accept(self, mut next: NextStep) -> AcceptedCursor {
         let mut clock = self.clock;
         clock.phase = Phase::Continuing;
+        if self.event_start.is_some() {
+            next.order = Order::One;
+        }
         clock.next = next;
         AcceptedCursor {
             clock,
@@ -1263,7 +1266,8 @@ impl Driver<'_> {
                     &mut point,
                 )?;
             }
-            if almost_equal_ulps(accepted.cursor.clock.time, stop, 100) {
+            let exact_stop = self.index_aware || sources.has_exact();
+            if (exact_stop && time >= stop) || (!exact_stop && almost_equal_ulps(time, stop, 100)) {
                 break;
             }
             let AcceptedPoint {
@@ -1277,7 +1281,7 @@ impl Driver<'_> {
             if let Some(at) = next_sample {
                 ready.limit_to_sample(at);
             }
-            self.limit_mixed_step(&mut ready, time)?;
+            self.limit_source_step(&mut ready, &sources, time)?;
             accepted = self.advance(
                 ready,
                 solution,
@@ -1420,6 +1424,23 @@ impl Driver<'_> {
             device_breaks,
             periodic_boundary: None,
         })
+    }
+
+    fn limit_source_step(
+        &self,
+        ready: &mut ReadyStep,
+        sources: &SourceBreaks<'_>,
+        time: Real,
+    ) -> SpiceResult<()> {
+        self.limit_mixed_step(ready, time)?;
+        // The derivative solver's merged iterator already contains
+        // every native and prepared event. Do not schedule it twice.
+        if !self.index_aware
+            && let Some(at) = sources.next_exact(time, self.settings.stop)?
+        {
+            ready.limit_to_event(at);
+        }
+        Ok(())
     }
 
     fn limit_mixed_step(&self, ready: &mut ReadyStep, time: Real) -> SpiceResult<()> {
@@ -1810,7 +1831,7 @@ impl Driver<'_> {
         if self.uic {
             return self.initial_uic_candidate();
         }
-        let mut rhs = self.system.transient_rhs(0., crate::devices::Limit::Left)?;
+        let mut rhs = self.system.transient_startup_rhs()?;
         if let Some(mixed) = self.mixed.as_deref() {
             mixed.initial_rhs(self.circuit, &mut rhs)?;
         }
@@ -1851,7 +1872,7 @@ impl Driver<'_> {
                 &self.bias,
                 &[],
                 Some(&seed),
-                // MODETRANOP: the sources' time functions at 0-.
+                // MODETRANOP: native sources at 0-, prepared sources at 0+.
                 Some(Forcing {
                     limit: crate::devices::Limit::Left,
                     timing: self.timing,

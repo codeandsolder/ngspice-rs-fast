@@ -64,6 +64,8 @@ pub enum Waveform {
     },
     /// Validated PWL knots, with optional C delay and repetition.
     Pwl(PwlSource),
+    /// Explicit sided forcing from a resolved prepared source declaration.
+    Prepared(crate::devices::prepared_waveform::PreparedForcing),
     /// A fully specified periodic pulse; see [`Pulse`].
     Pulse(Pulse),
     /// A PULSE as written, with C's analysis-dependent defaults still pending.
@@ -79,6 +81,16 @@ pub enum Waveform {
     Stochastic(crate::devices::stochastic::StochasticWaveform),
 }
 impl Waveform {
+    // The preceding non-PORT source remains the baseline of a PORT sum.
+    // Its sided startup and exact-event semantics survive composition.
+    pub(super) fn prepared_base(&self) -> Option<&super::prepared_waveform::PreparedForcing> {
+        match self {
+            Self::Prepared(forcing) => Some(forcing),
+            Self::PortSeries { baseline, .. } => baseline.prepared_base(),
+            _ => None,
+        }
+    }
+
     /// Checks finite values and strictly increasing nonnegative knot times.
     /// # Errors
     /// Invalid source data.
@@ -100,7 +112,7 @@ impl Waveform {
             }
             // Pulse and PWL/function values are only constructed through
             // validating constructors, so they need no further checks here.
-            Self::Pulse(_) | Self::Pwl(_) | Self::Function(_) => true,
+            Self::Pulse(_) | Self::Pwl(_) | Self::Function(_) | Self::Prepared(_) => true,
             Self::FunctionDefaults(spec) => {
                 spec.validate()?;
                 true
@@ -135,10 +147,13 @@ impl Waveform {
     /// are not.
     #[must_use = "the result determines whether segment endpoint samples suffice to reconstruct the waveform"]
     pub const fn is_piecewise_linear(&self) -> bool {
-        !matches!(
-            self,
-            Self::Function(_) | Self::FunctionDefaults(_) | Self::PortSeries { .. }
-        )
+        match self {
+            Self::Prepared(forcing) => forcing.is_piecewise_linear(),
+            _ => !matches!(
+                self,
+                Self::Function(_) | Self::FunctionDefaults(_) | Self::PortSeries { .. }
+            ),
+        }
     }
 
     /// The value C loads in OP/DC analyses when the source has no explicit DC
@@ -158,6 +173,7 @@ impl Waveform {
             }
             Self::FunctionDefaults(spec) => spec.time_zero(),
             Self::Stochastic(process) => Ok(process.time_zero()),
+            Self::Prepared(forcing) => Ok(forcing.dc()),
             other => other.value_at(0., Limit::Left),
         }
     }
@@ -191,6 +207,7 @@ impl Waveform {
                 if before_jump { *before } else { *after }
             }
             Self::Pwl(pwl) => return pwl.value_at(t, limit),
+            Self::Prepared(forcing) => return forcing.value_at(t, limit),
             Self::Pulse(pulse) => return pulse.value_at(t, limit),
             Self::Function(function) => return function.value_at(t, limit),
             Self::Stochastic(process) => return process.value_at(t, limit),
@@ -293,6 +310,7 @@ impl Waveform {
                 Jet::affine(order, value, slope)
             }
             Self::Function(function) => function.jet(t, scale, order, limit)?,
+            Self::Prepared(forcing) => forcing.jet(t, scale, order, limit)?,
             Self::PortSeries { baseline, tones } => {
                 let mut result = baseline.jet(t, scale, order, limit)?;
                 for &(amplitude, frequency) in tones {
@@ -370,6 +388,11 @@ impl Waveform {
             Self::Pwl(pwl) => {
                 return Ok(WaveformBreakpoints(Inner::Pwl(pwl.breakpoints_in(t0, t1)?)));
             }
+            Self::Prepared(forcing) => {
+                return Ok(WaveformBreakpoints(Inner::Prepared(
+                    forcing.breakpoints_in(t0, t1)?,
+                )));
+            }
             Self::Stochastic(process) => {
                 return Ok(WaveformBreakpoints(Inner::Stochastic(
                     process.events(t0, t1)?,
@@ -418,6 +441,8 @@ pub enum WaveformEventKind {
     FunctionCorner,
     /// Physical white/colored noise knot or random-held sample.
     StochasticSample,
+    /// Explicit prepared knot or startup-hold boundary.
+    PreparedKnot,
     /// Exact RTS transition time.
     StochasticTelegraph,
 }
@@ -436,6 +461,7 @@ impl WaveformEventKind {
                 | Self::PwlKnot
                 | Self::PwlRepeatBoundary
                 | Self::StepJump
+                | Self::PreparedKnot
                 | Self::StochasticSample
                 | Self::StochasticTelegraph
         )
@@ -475,6 +501,7 @@ enum Inner {
     Pulse(crate::devices::pulse::PulseBreakpoints),
     Pwl(crate::devices::functions::PwlBreakpoints),
     Stochastic(crate::devices::stochastic::StochasticEvents),
+    Prepared(crate::devices::prepared_waveform::PreparedEvents),
 }
 impl WaveformBreakpoints {
     /// Advance the same sequence as the time-only iterator, retaining event
@@ -484,6 +511,7 @@ impl WaveformBreakpoints {
             Inner::Fixed(it) => it.next(),
             Inner::Pulse(it) => it.next_event(),
             Inner::Pwl(it) => it.next_event(),
+            Inner::Prepared(it) => it.next(),
             Inner::Stochastic(it) => it.next_event().map(|event| WaveformEvent {
                 time: event.time,
                 kind: match event.kind {
@@ -740,9 +768,29 @@ impl LinearSystem {
     /// # Errors
     /// Nonfinite time, unresolved PULSE defaults or a nonfinite source sum.
     pub fn transient_rhs(&self, t: Real, limit: Limit) -> SpiceResult<Vector> {
+        self.transient_rhs_with(|waveform| waveform.value_at(t, limit))
+    }
+
+    pub(crate) fn transient_startup_rhs(&self) -> SpiceResult<Vector> {
+        self.transient_rhs_with(|waveform| {
+            waveform.value_at(
+                0.,
+                if waveform.prepared_base().is_some() {
+                    Limit::Right
+                } else {
+                    Limit::Left
+                },
+            )
+        })
+    }
+
+    fn transient_rhs_with(
+        &self,
+        value: impl Fn(&Waveform) -> SpiceResult<Real>,
+    ) -> SpiceResult<Vector> {
         let mut rhs = Vector::zeros(self.a.rows());
         for s in &self.sources {
-            let value = s.waveform.value_at(t, limit)?;
+            let value = value(&s.waveform)?;
             for (r, sign) in &s.rows {
                 rhs.add_to(*r, sign * value)?;
             }
@@ -1046,6 +1094,56 @@ pub(crate) fn branch_stamp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_series_inherits_prepared_startup_and_exact_events() {
+        use model_normalize_ngspice::waveform::{Forcing, Knot, ResolvedWaveform};
+        let baseline = Waveform::Prepared(
+            super::super::prepared_waveform::PreparedForcing::new(ResolvedWaveform {
+                dc: 3.,
+                forcing: Forcing::PiecewiseLinear {
+                    knots: vec![
+                        Knot {
+                            time: 0.,
+                            left: 2.,
+                            right: 3.,
+                        },
+                        Knot {
+                            time: 1.,
+                            left: 3.,
+                            right: 4.,
+                        },
+                    ],
+                    repeat: None,
+                },
+                idle_in_pop: false,
+            })
+            .unwrap(),
+        );
+        let wave = Waveform::PortSeries {
+            baseline: Box::new(baseline),
+            tones: vec![(5., 7.)],
+        };
+        let mut system = LinearSystem::new(1);
+        let mut rows = SourceRows::new();
+        rows.push(0, 1.).unwrap();
+        system.sources.push(LinearSource {
+            name: Arc::new("vport".to_owned()),
+            kind: SourceKind::Voltage,
+            rows,
+            dc: 8.,
+            ac: Complex::real(0.),
+            waveform: Arc::new(wave),
+        });
+        assert_eq!(system.transient_startup_rhs().unwrap().as_slice(), &[8.]);
+        assert_eq!(
+            system.transient_rhs(0., Limit::Left).unwrap().as_slice(),
+            &[7.]
+        );
+        let breaks = crate::devices::breaks::SourceBreaks::new(&system);
+        assert!(breaks.has_exact());
+        assert_eq!(breaks.next_exact(0., 2.).unwrap(), Some(1.));
+    }
 
     fn scan_merge(mut sources: Vec<std::iter::Peekable<WaveformBreakpoints>>) -> Vec<u64> {
         let mut result = Vec::new();

@@ -226,8 +226,11 @@ Derivative input discontinuities that require impulses are rejected
 rather than approximated by large finite rates. A successful event
 starts fresh integration history on the right; the final endpoint retains
 its left limit. Non-UIC initialization also checks continuity from the
-DC prehistory. UIC does not invent a prehistory before the requested
-initial time.
+DC prehistory (the prepared source contract supplies its own right-hand
+startup bias, rather than the native source left-limit convention). UIC
+does not invent a prehistory before the requested initial time. Prepared
+PWL and signed damped-sine laws provide the same exact one-sided analytic
+coefficients as the physical source evaluator.
 
 The high-order path currently covers linear memoryless and rational
 models and analytic behavioural constitutive kernels. Other nonlinear
