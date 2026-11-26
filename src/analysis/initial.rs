@@ -977,20 +977,22 @@ impl ImpulseStorage {
         &self,
         circuit: &Circuit,
         right: &system::RightLimit,
-        uic: bool,
+        continuity: Option<Real>,
         tolerances: Tolerances,
     ) -> SpiceResult<Vec<(usize, Real)>> {
         let mut slots = Vec::new();
         for (&AbsoluteRow(row), charge) in &self.charges {
             let actual = right.charge.as_slice()[row];
-            if !uic && charge.policy == InitialStoragePolicy::Derived {
+            if let Some(time) = continuity
+                && charge.policy == InitialStoragePolicy::Derived
+            {
                 let tolerance = VoltageTolerance {
                     reltol: tolerances.reltol,
                     vntol: tolerances.vntol,
                 };
                 if !tolerance.agree(actual, charge.target) {
                     return Err(failure(format!(
-                        "{}: the derivative input jumps from {} to {} at t = 0; a classical derivative does not exist across this prehistory discontinuity",
+                        "{}: the derivative input jumps from {} to {} at t = {time}; a classical derivative does not exist across this prehistory discontinuity or source event",
                         charge.name, -charge.target, -actual
                     )));
                 }
@@ -1084,7 +1086,8 @@ pub(super) fn consistent_derivative_start(
             tolerances,
             options.max_iterations,
         )?;
-        let canonical = storage.consistent_history(circuit, &right, uic, tolerances)?;
+        let canonical =
+            storage.consistent_history(circuit, &right, (!uic).then_some(0.), tolerances)?;
         Ok(CheckedInitial {
             solution: Some(right.state),
             canonical,
@@ -1118,7 +1121,39 @@ pub(super) fn consistent_derivative_step(
         ImpulseStorage::collect(circuit, request.solution, request.model_context, values)?;
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
     let right = system::solve_step(&dae, circuit, request, &storage, tolerances, iterations)?;
-    let canonical = storage.consistent_history(circuit, &right, true, tolerances)?;
+    let canonical = storage.consistent_history(circuit, &right, None, tolerances)?;
+    Ok(CheckedInitial {
+        solution: Some(right.state),
+        canonical,
+    })
+}
+
+/// Cross an event without changing physical or derivative-input storage.
+/// The left point is a disposable, already validated integration candidate.
+pub(super) fn consistent_derivative_event(
+    prepared: &PreparedRun<'_>,
+    request: &LoadRequest<'_>,
+    left: &crate::devices::TrialState,
+    tolerances: Tolerances,
+    iterations: usize,
+) -> SpiceResult<CheckedInitial> {
+    let circuit = prepared.circuit();
+    let forcing = request
+        .forcing
+        .ok_or_else(|| failure("missing derivative event timing"))?;
+    let crate::devices::AnalysisMode::Instantaneous { time } = request.mode else {
+        return Err(failure("invalid derivative event mode"));
+    };
+    let mut storage = ImpulseStorage::collect(
+        circuit,
+        request.solution,
+        request.model_context,
+        left.values(),
+    )?;
+    storage.retain_operating_point(request.solution);
+    let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+    let right = system::solve_event(&dae, request, &storage, tolerances, iterations)?;
+    let canonical = storage.consistent_history(circuit, &right, Some(time), tolerances)?;
     Ok(CheckedInitial {
         solution: Some(right.state),
         canonical,

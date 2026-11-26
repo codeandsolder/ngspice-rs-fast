@@ -84,7 +84,7 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         self.linear.transient_taylor_rhs(time, scale, order, limit)
     }
 
-    /// Assemble exact right-hand physical Taylor coefficients from the same prepared
+    /// Assemble exact one-sided physical Taylor coefficients from the same prepared
     /// device topology and analytic independent forcing.
     ///
     /// # Errors
@@ -95,6 +95,7 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         state: &[Vector],
         time: Real,
         scale: Real,
+        limit: Limit,
     ) -> SpiceResult<PhysicalDaeTaylor> {
         use crate::maths::taylor::{Jet, MAX_ORDER};
         let n = self.run.circuit().unknown_count();
@@ -110,11 +111,31 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
             ));
         }
         let order = state.len() - 1;
-        let forcing = self.forcing_taylor_rhs(time, scale, order, Limit::Right)?;
+        let mut forcing = self.forcing_taylor_rhs(time, scale, order, limit)?;
+        let reversed;
+        let (state, time) = if limit == Limit::Left {
+            reversed = reverse_odd_vectors(state);
+            negate_odd_vectors(&mut forcing);
+            (reversed.as_slice(), Jet::affine(order, time, -scale))
+        } else {
+            (state, Jet::affine(order, time, scale))
+        };
         let mut output = PhysicalDaeTaylor::linear(&self.linear, state, forcing)?;
-        let time = Jet::affine(order, time, scale);
         self.run
             .dae_nonlinear_taylor(&self.model, state, &time, &mut output)?;
+        if limit == Limit::Left {
+            negate_odd_vectors(&mut output.residual);
+            negate_odd_vectors(&mut output.charge);
+            for matrices in [&mut output.conductance, &mut output.capacitance] {
+                for matrix in matrices.iter_mut().skip(1).step_by(2) {
+                    let (rows, cols) = (matrix.rows(), matrix.cols());
+                    let old = std::mem::replace(matrix, SparseMatrix::new(rows, cols));
+                    for term in old.triplets() {
+                        matrix.add(term.row, term.col, -term.value)?;
+                    }
+                }
+            }
+        }
         output.validate()?;
         Ok(output)
     }
@@ -183,6 +204,20 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         }
         Ok(point)
     }
+}
+
+fn negate_odd_vectors(vectors: &mut [Vector]) {
+    for vector in vectors.iter_mut().skip(1).step_by(2) {
+        for value in vector.as_mut_slice() {
+            *value = -*value;
+        }
+    }
+}
+
+fn reverse_odd_vectors(vectors: &[Vector]) -> Vec<Vector> {
+    let mut reversed = vectors.to_vec();
+    negate_odd_vectors(&mut reversed);
+    reversed
 }
 
 /// Coefficients of the physical equations and their state Jacobians.

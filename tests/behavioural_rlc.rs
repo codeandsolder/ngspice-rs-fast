@@ -622,3 +622,187 @@ fn non_uic_derivative_input_jump_is_reported_as_a_discontinuity() {
         .to_string();
     assert!(error.contains("prehistory discontinuity"), "{error}");
 }
+
+#[test]
+fn nonlinear_derivative_chain_preserves_analytic_polynomial_and_kcl() -> SpiceResult<()> {
+    // With u = t/1ms, x = 2 + u, first = (x^4)' = 4*x^3,
+    // second = (first^2)' = 96*x^5, third = (second*x)' = 576*x^5.
+    let body = "v1 in 0 PWL(0 2 1m 3)\nb1 first 0 v=1m*ddt(v(in)^4)\nb2 second 0 v=1m*ddt(v(first)^2)\nb3 out 0 v=1m*ddt(v(second)*v(in))\nr1 first 0 1k\nr2 second 0 1k\nr3 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["2u", "50u", "0", "2u", "uic", method],
+        )?;
+        assert!(plot.point_count() > 20);
+        for point in 0..plot.point_count() {
+            let t = plot.value("time", point).unwrap().re;
+            let x = 2. + 1000. * t;
+            let expected = [4. * x.powi(3), 96. * x.powi(5), 576. * x.powi(5)];
+            for ((node, branch), value) in [
+                ("v(first)", "i(b1)"),
+                ("v(second)", "i(b2)"),
+                ("v(out)", "i(b3)"),
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                close(plot.value(node, point).unwrap().re, value, 2e-10 * value);
+                close(
+                    plot.value(branch, point).unwrap().re,
+                    -value * 1e-3,
+                    2e-13 * value,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn derivative_array_resolves_current_controls_and_algebraic_coupling() -> SpiceResult<()> {
+    let body = "v1 in 0 PWL(0 2 1m 3)\nr1 in 0 1k\ne1 scaled 0 in 0 2\nb1 first 0 v=1m*ddt((1000*i(v1))^3+v(scaled))\nb2 out 0 v=1m*ddt(v(first))\nr2 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["2u", "50u", "0", "2u", "uic", method],
+        )?;
+        for point in 0..plot.point_count() {
+            let x = 2. + 1000. * plot.value("time", point).unwrap().re;
+            close(
+                plot.value("v(first)", point).unwrap().re,
+                2. - 3. * x * x,
+                1e-9,
+            );
+            close(plot.value("v(out)", point).unwrap().re, -6. * x, 1e-9);
+            close(plot.value("i(v1)", point).unwrap().re, -1e-3 * x, 1e-13);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn nonlinear_rc_derivative_array_preserves_independent_storage() -> SpiceResult<()> {
+    let body = "c1 a 0 c={1u*(1+v(a))} ic=1\nr1 a 0 1k\nb1 first 0 v=1m*ddt(v(a))\nb2 second 0 v=1m*ddt(v(first))\nb3 third 0 v=1m*ddt(v(second))\nr2 third 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "100u", "0", "1u", "uic", method],
+        )?;
+        assert!(plot.point_count() > 50);
+        for point in 0..plot.point_count() {
+            let t = plot.value("time", point).unwrap().re;
+            let v = plot.value("v(a)", point).unwrap().re;
+            // Integrate dv/du = -v/(1+v) exactly: v+log(v)=1-u.
+            close(v + v.ln(), 1. - 1000. * t, 2e-6);
+            close(
+                plot.value("v(first)", point).unwrap().re,
+                -v / (1. + v),
+                1e-9,
+            );
+            close(
+                plot.value("v(second)", point).unwrap().re,
+                v / (1. + v).powi(3),
+                1e-9,
+            );
+            close(
+                plot.value("v(third)", point).unwrap().re,
+                v * (2. * v - 1.) / (1. + v).powi(5),
+                1e-9,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn source_corner_changes_first_derivative_without_creating_a_false_impulse() -> SpiceResult<()> {
+    let body = "v1 in 0 PWL(0 2 10u 3 30u 1)\nb1 out 0 v=1u*ddt(v(in))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "25u", "0", "1u", "uic", method],
+        )?;
+        let mut corner = false;
+        for point in 0..plot.point_count() {
+            let t = plot.value("time", point).unwrap().re;
+            let at_corner = (t - 10e-6).abs() < 1e-18;
+            corner |= at_corner;
+            close(
+                plot.value("v(out)", point).unwrap().re,
+                if t < 10e-6 && !at_corner { 0.1 } else { -0.1 },
+                1e-9,
+            );
+        }
+        assert!(corner);
+    }
+    Ok(())
+}
+
+#[test]
+fn source_corner_with_discontinuous_derivative_input_is_rejected() {
+    let body = "v1 in 0 PWL(0 2 10u 3 30u 1)\nb1 out 0 v=1u*ddt(1u*ddt(v(in)))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let error = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "25u", "0", "1u", "uic", method],
+        )
+        .expect_err("the inner slope jump requires an impulse")
+        .to_string();
+        assert!(
+            error.contains("source event") && error.contains("derivative input jumps"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn sinusoidal_capacitor_loaded_derivative_matches_physical_current() -> SpiceResult<()> {
+    // A smooth right limit with zero initial derivative output, but a
+    // nonzero second derivative of the source. Both explicit physical
+    // capacitors have an algebraically determined current.
+    let body = "v1 in 0 sin(2 0.1 1k 0 0 90)\nb1 y 0 v=1m*ddt(v(in)^2)\nr1 y 0 1k\nrsh1 in 0 1k\nrsh2 y 0 1k\ncsh1 in 0 1n\ncsh2 y 0 1n\n.save v(y) i(v1) i(b1) @csh1[i] @csh2[i]\n.options reltol=1e-6 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["5u", "50u", "0", "5u", method],
+        )?;
+        let omega = std::f64::consts::TAU * 1000.;
+        for point in 0..plot.point_count() {
+            let t = plot.value("time", point).unwrap().re;
+            let (sin, cos) = (omega * t).sin_cos();
+            let x = 2. + 0.1 * cos;
+            let rate = -0.1 * omega * sin;
+            let acceleration = -0.1 * omega * omega * cos;
+            let y = 2e-3 * x * rate;
+            let y_rate = 2e-3 * rate.mul_add(rate, x * acceleration);
+            close(
+                plot.value("@csh1[i]", point).unwrap().re,
+                1e-9 * rate,
+                1e-13,
+            );
+            close(
+                plot.value("@csh2[i]", point).unwrap().re,
+                1e-9 * y_rate,
+                1e-13,
+            );
+            close(plot.value("v(y)", point).unwrap().re, y, 1e-9);
+            close(
+                plot.value("i(v1)", point).unwrap().re,
+                -1e-3 * x - 1e-9 * rate,
+                1e-12,
+            );
+            close(
+                plot.value("i(b1)", point).unwrap().re,
+                -2e-3 * y - 1e-9 * y_rate,
+                1e-12,
+            );
+        }
+    }
+    Ok(())
+}

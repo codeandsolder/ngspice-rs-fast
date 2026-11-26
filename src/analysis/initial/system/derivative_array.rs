@@ -12,7 +12,7 @@ use crate::analysis::initial::{
 };
 use crate::devices::physical_dae::{PhysicalDae, PhysicalDaeTaylor};
 use crate::devices::{
-    Circuit, InitialCoordinateHistory, InitialStoragePolicy, LoadRequest, StateHistory,
+    Circuit, InitialCoordinateHistory, InitialStoragePolicy, Limit, LoadRequest, StateHistory,
 };
 use crate::maths::integrator::{ChargeHistory, Coefficients};
 use crate::maths::taylor::MAX_ORDER;
@@ -410,15 +410,27 @@ pub(in crate::analysis::initial) struct RightLimit {
     pub charge_rate: Vector,
 }
 
-fn initial_prefix_rank(
-    dae: &PhysicalDae<'_, '_>,
-    state: &[Vector],
-    scale: Real,
+#[derive(Clone, Copy)]
+struct LocalPoint {
     time: Real,
-) -> SpiceResult<usize> {
-    let point = dae.evaluate_taylor(state, time, scale)?;
-    let array = Array::build(&point, state, scale, &[])?;
-    rank::projected_rank(&array.matrix, 2 * state[0].len())
+    scale: Real,
+    limit: Limit,
+}
+
+impl LocalPoint {
+    fn evaluate(
+        self,
+        dae: &PhysicalDae<'_, '_>,
+        state: &[Vector],
+    ) -> SpiceResult<PhysicalDaeTaylor> {
+        dae.evaluate_taylor(state, self.time, self.scale, self.limit)
+    }
+
+    fn prefix_rank(self, dae: &PhysicalDae<'_, '_>, state: &[Vector]) -> SpiceResult<usize> {
+        let point = self.evaluate(dae, state)?;
+        let array = Array::build(&point, state, self.scale, &[])?;
+        rank::projected_rank(&array.matrix, 2 * state[0].len())
+    }
 }
 
 fn extend(state: &mut Vec<Vector>) -> SpiceResult<()> {
@@ -435,13 +447,12 @@ fn extend(state: &mut Vec<Vector>) -> SpiceResult<()> {
 fn stable_rank_order(
     dae: &PhysicalDae<'_, '_>,
     state: &mut Vec<Vector>,
-    scale: Real,
-    time: Real,
+    local: LocalPoint,
 ) -> SpiceResult<()> {
-    let mut previous = initial_prefix_rank(dae, state, scale, time)?;
+    let mut previous = local.prefix_rank(dae, state)?;
     loop {
         extend(state)?;
-        let next = initial_prefix_rank(dae, state, scale, time)?;
+        let next = local.prefix_rank(dae, state)?;
         if next == previous {
             return Ok(());
         }
@@ -452,17 +463,16 @@ fn stable_rank_order(
 fn newton(
     dae: &PhysicalDae<'_, '_>,
     state: &mut [Vector],
-    scale: Real,
+    local: LocalPoint,
     initial: &[Constraint<'_>],
     tol: Tolerances,
     iterations: usize,
-    time: Real,
 ) -> SpiceResult<()> {
     let width = state[0].len();
     let mut best: Option<(Real, Vec<Vector>)> = None;
     for _ in 0..iterations {
-        let point = dae.evaluate_taylor(state, time, scale)?;
-        let array = Array::build(&point, state, scale, initial)?;
+        let point = local.evaluate(dae, state)?;
+        let array = Array::build(&point, state, local.scale, initial)?;
         let rhs = array
             .residual
             .iter()
@@ -517,7 +527,45 @@ pub(in crate::analysis::initial) fn solve_right_limit(
     tol: Tolerances,
     iterations: usize,
 ) -> SpiceResult<RightLimit> {
-    solve(dae, seed, &constraints(storage), scale, tol, iterations, 0.)
+    solve(
+        dae,
+        seed,
+        &constraints(storage),
+        LocalPoint {
+            time: 0.,
+            scale,
+            limit: Limit::Right,
+        },
+        tol,
+        iterations,
+    )
+}
+
+pub(in crate::analysis::initial) fn solve_event(
+    dae: &PhysicalDae<'_, '_>,
+    request: &LoadRequest<'_>,
+    storage: &ImpulseStorage,
+    tol: Tolerances,
+    iterations: usize,
+) -> SpiceResult<RightLimit> {
+    let forcing = request
+        .forcing
+        .ok_or_else(|| failure("missing derivative event forcing"))?;
+    let crate::devices::AnalysisMode::Instantaneous { time } = request.mode else {
+        return Err(failure("invalid derivative event mode"));
+    };
+    solve(
+        dae,
+        request.solution,
+        &constraints(storage),
+        LocalPoint {
+            time,
+            scale: forcing.timing.step(),
+            limit: Limit::Right,
+        },
+        tol,
+        iterations,
+    )
 }
 
 pub(in crate::analysis::initial) fn solve_step(
@@ -542,10 +590,13 @@ pub(in crate::analysis::initial) fn solve_step(
         dae,
         request.solution,
         &companions(circuit, storage, request.history, coefficients)?,
-        forcing.timing.step(),
+        LocalPoint {
+            time,
+            scale: forcing.timing.step(),
+            limit: forcing.limit,
+        },
         tol,
         iterations,
-        time,
     )
 }
 
@@ -553,10 +604,9 @@ fn solve(
     dae: &PhysicalDae<'_, '_>,
     seed: &Vector,
     initial: &[Constraint<'_>],
-    scale: Real,
+    local: LocalPoint,
     tol: Tolerances,
     iterations: usize,
-    time: Real,
 ) -> SpiceResult<RightLimit> {
     let mut state = vec![
         seed.clone(),
@@ -564,21 +614,21 @@ fn solve(
         Vector::zeros(seed.len()),
     ];
     loop {
-        stable_rank_order(dae, &mut state, scale, time)?;
-        newton(dae, &mut state, scale, initial, tol, iterations, time)?;
-        let rank = initial_prefix_rank(dae, &state, scale, time)?;
+        stable_rank_order(dae, &mut state, local)?;
+        newton(dae, &mut state, local, initial, tol, iterations)?;
+        let rank = local.prefix_rank(dae, &state)?;
         extend(&mut state)?;
-        if initial_prefix_rank(dae, &state, scale, time)? == rank {
+        if local.prefix_rank(dae, &state)? == rank {
             // Re-solve the extended array: rank equality alone does not
             // establish its affine residual or the chosen right-hand branch.
-            newton(dae, &mut state, scale, initial, tol, iterations, time)?;
-            let point = dae.evaluate_taylor(&state, time, scale)?;
+            newton(dae, &mut state, local, initial, tol, iterations)?;
+            let point = local.evaluate(dae, &state)?;
             let to_rate = |vector: &Vector| {
                 Vector::from_slice(
                     &vector
                         .as_slice()
                         .iter()
-                        .map(|value| value / scale)
+                        .map(|value| value / local.scale)
                         .collect::<Vec<_>>(),
                 )
             };

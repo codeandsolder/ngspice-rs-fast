@@ -468,7 +468,7 @@ fn physical_taylor_equations_preserve_nonlinear_coefficients_and_gradients() -> 
     )?;
     let time = 0.;
     let scale = 1e-3;
-    let taylor = dae.evaluate_taylor(&state, time, scale)?;
+    let taylor = dae.evaluate_taylor(&state, time, scale, Limit::Right)?;
     let close = |a: f64, b: f64| {
         assert!(
             (a - b).abs() <= 2e-11 * a.abs().max(b.abs()).max(1e-9),
@@ -523,6 +523,65 @@ fn physical_taylor_equations_preserve_nonlinear_coefficients_and_gradients() -> 
                 );
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn physical_taylor_left_and_right_germs_use_same_time_coordinate() -> SpiceResult<()> {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+    let deck = parse_deck_text(
+        Path::new("germs.cir"),
+        "physical germs\nv1 a 0 PWL(0 -1 1m 0 2m 2)\nb1 b 0 v={abs(v(a))+v(a)^3+1000*time}\nr1 b 0 1k\n.end\n",
+    );
+    let netlist = Parser::new().parse_deck(&deck)?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let mut circuit = config.circuit(&netlist)?;
+    circuit.finalize()?;
+    let a = circuit
+        .unknowns()
+        .node_row(circuit.nodes().get("a").unwrap())
+        .unwrap();
+    let b = circuit
+        .unknowns()
+        .node_row(circuit.nodes().get("b").unwrap())
+        .unwrap();
+    let i = circuit
+        .devices()
+        .iter()
+        .position(|device| device.name() == "b1")
+        .unwrap();
+    let branch = circuit.branch_rows(i).unwrap().start;
+    let run = circuit.prepare_run();
+    let dae = run.prepare_physical_dae(
+        &config.context().model_context(),
+        TransientTiming::new(1e-6, 2e-3)?,
+    )?;
+    let mut state = vec![Vector::zeros(circuit.unknown_count()); 4];
+    state[0].set(b, 1.)?;
+    // Use identical state jets on each side; only the one-sided
+    // constitutive and independent forcing choices may differ.
+    state[1].set(a, 1.)?;
+    state[1].set(b, 1.)?;
+    for (limit, slope, source_slope) in [(Limit::Left, 1., 1.), (Limit::Right, -1., 2.)] {
+        let point = dae.evaluate_taylor(&state, 1e-3, 1e-3, limit)?;
+        assert_eq!(point.residual[0].as_slice()[branch], 0.);
+        assert_eq!(point.residual[1].as_slice()[branch], slope);
+        assert_eq!(point.residual[3].as_slice()[branch], -1.);
+        assert_eq!(point.conductance[0].get(branch, a), slope);
+        assert_eq!(point.conductance[2].get(branch, a), -3.);
+        let forcing = dae.forcing_taylor_rhs(1e-3, 1e-3, 1, limit)?;
+        let source = circuit
+            .devices()
+            .iter()
+            .position(|device| device.name() == "v1")
+            .unwrap();
+        assert_eq!(
+            forcing[1].as_slice()[circuit.branch_rows(source).unwrap().start],
+            source_slope
+        );
     }
     Ok(())
 }

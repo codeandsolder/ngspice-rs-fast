@@ -1011,7 +1011,13 @@ impl Driver<'_> {
         selected: Option<&[usize]>,
     ) -> SpiceResult<Vec<Complex>> {
         if self.index_aware {
-            return self.observe_derivative_point(solution, None, 0., selected);
+            return self.observe_derivative_point(
+                solution,
+                None,
+                0.,
+                crate::devices::Limit::Right,
+                selected,
+            );
         }
         let request = LoadRequest {
             mode: AnalysisMode::OperatingPoint,
@@ -1042,10 +1048,11 @@ impl Driver<'_> {
         solution: &Vector,
         state: Option<&TrialState>,
         time: Real,
+        limit: crate::devices::Limit,
         selected: Option<&[usize]>,
     ) -> SpiceResult<Vec<Complex>> {
         let forcing = Forcing {
-            limit: crate::devices::Limit::Right,
+            limit,
             timing: self.timing,
         };
         let request = LoadRequest {
@@ -1124,6 +1131,11 @@ impl Driver<'_> {
                 ..
             }
         );
+        let mut physical_events = if self.index_aware {
+            Some(self.system.breakpoints_in(0., stop)?.peekable())
+        } else {
+            None
+        };
         loop {
             self.accumulate_charge_scales(charge_scales.as_deref_mut())?;
             let time = accepted.cursor.clock.time;
@@ -1154,11 +1166,23 @@ impl Driver<'_> {
             if let Some(at) = next_sample {
                 ready.limit_to_sample(at);
             }
+            let next_physical_event = if let Some(events) = &mut physical_events {
+                while events.peek().is_some_and(|&event| event <= time) {
+                    events.next();
+                }
+                events.peek().copied()
+            } else {
+                None
+            };
+            if let Some(event) = next_physical_event {
+                ready.limit_to_event(event);
+            }
             self.limit_mixed_step(&mut ready, time)?;
             accepted = self.advance(
                 ready,
                 solution,
                 next_sample,
+                next_physical_event,
                 capture_boundary,
                 selected
                     .as_ref()
@@ -1381,6 +1405,7 @@ impl Driver<'_> {
         mut ready: ReadyStep,
         mut iterate: Vector,
         sample_at: Option<Real>,
+        physical_event: Option<Real>,
         capture_boundary: bool,
         selected: Option<&[usize]>,
     ) -> SpiceResult<AcceptedPoint> {
@@ -1391,6 +1416,9 @@ impl Driver<'_> {
                     "work limit of {} accepted + rejected steps reached at t = {:e}",
                     self.settings.max_steps, ready.clock.time
                 )));
+            }
+            if let Some(event) = physical_event {
+                ready.limit_to_event(event);
             }
             let preview = self.preview_events(&mut ready)?;
             let attempt = ready.begin(&self.steps, &self.settings)?;
@@ -1441,7 +1469,17 @@ impl Driver<'_> {
                             drop(prepared);
                             ready = attempt.retry(next, min_step)?;
                         }
-                        StepDecision::Accept(next) => {
+                        StepDecision::Accept(mut next) => {
+                            let (x, state) = if self.index_aware
+                                && physical_event
+                                    .is_some_and(|at| at.to_bits() == attempt.clock.time.to_bits())
+                                && attempt.clock.time < self.settings.stop
+                            {
+                                next.order = Order::One;
+                                self.derivative_event(&attempt, &x, &state)?
+                            } else {
+                                (x, state)
+                            };
                             let mixed_point =
                                 self.prepare_mixed_point(&x, attempt.clock.time, preview)?;
                             let observed = if attempt.clock.time < self.settings.start
@@ -1454,6 +1492,13 @@ impl Driver<'_> {
                                     &x,
                                     Some(&state),
                                     attempt.clock.time,
+                                    if attempt.event_start.is_some()
+                                        && attempt.clock.time >= self.settings.stop
+                                    {
+                                        crate::devices::Limit::Left
+                                    } else {
+                                        crate::devices::Limit::Right
+                                    },
                                     selected,
                                 )?)
                             } else {
@@ -1481,6 +1526,13 @@ impl Driver<'_> {
                             let device_breaks =
                                 self.commit_point(Acceptance::Step(&attempt), &x, state)?;
                             self.commit_mixed_point(mixed_point);
+                            if self.index_aware
+                                && physical_event
+                                    .is_some_and(|at| at.to_bits() == attempt.clock.time.to_bits())
+                            {
+                                self.history.restart_integration()?;
+                                self.steps.clear();
+                            }
                             return Ok(AcceptedPoint {
                                 cursor: attempt.accept(next),
                                 solution: x,
@@ -1755,22 +1807,7 @@ impl Driver<'_> {
         else {
             return Ok(None);
         };
-        let x = consistent
-            .solution
-            .ok_or_else(|| failure("missing consistent derivative initial state"))?;
-        let mut trial = self.history.trial();
-        self.prepared.load(
-            &LoadRequest {
-                solution: &x,
-                ..request
-            },
-            &mut self.circuit.new_matrix()?,
-            &mut Vector::zeros(x.len()),
-            &mut trial,
-        )?;
-        for (slot, value) in consistent.canonical {
-            self.history.set_candidate_slot(&mut trial, slot, value)?;
-        }
+        let (x, trial) = self.physical_candidate(&request, consistent)?;
         self.index_aware = true;
         Ok(Some((x, trial)))
     }
@@ -1814,6 +1851,69 @@ impl Driver<'_> {
     /// (`firsttime`) and `MODEINITPRED` after, for linear and nonlinear
     /// circuits alike. The trial is that of the last Newton load, one iterate
     /// behind the returned solution, as C's `CKTstate0`.
+    fn physical_candidate(
+        &self,
+        request: &LoadRequest<'_>,
+        consistent: initial::CheckedInitial,
+    ) -> SpiceResult<(Vector, TrialState)> {
+        let x = consistent
+            .solution
+            .ok_or_else(|| failure("missing consistent derivative state"))?;
+        let mut trial = self.history.trial();
+        self.prepared.load(
+            &LoadRequest {
+                solution: &x,
+                ..*request
+            },
+            &mut self.circuit.new_matrix()?,
+            &mut Vector::zeros(x.len()),
+            &mut trial,
+        )?;
+        for (slot, value) in consistent.canonical {
+            self.history.set_candidate_slot(&mut trial, slot, value)?;
+        }
+        Ok((x, trial))
+    }
+
+    fn physical_tolerances(&self) -> initial::Tolerances {
+        let t = &self.settings.tolerances;
+        initial::Tolerances {
+            reltol: t.reltol,
+            vntol: t.vntol,
+            abstol: t.abstol,
+            chgtol: t.chgtol,
+        }
+    }
+
+    fn derivative_event(
+        &self,
+        attempt: &AttemptedStep,
+        x: &Vector,
+        left: &TrialState,
+    ) -> SpiceResult<(Vector, TrialState)> {
+        let request = LoadRequest {
+            mode: AnalysisMode::Instantaneous {
+                time: attempt.clock.time,
+            },
+            solution: x,
+            model_context: &self.model_context,
+            integration: None,
+            history: &self.history,
+            forcing: Some(Forcing {
+                limit: crate::devices::Limit::Right,
+                timing: self.timing,
+            }),
+        };
+        let consistent = initial::consistent_derivative_event(
+            &self.prepared,
+            &request,
+            left,
+            self.physical_tolerances(),
+            self.settings.tran_max_iter,
+        )?;
+        self.physical_candidate(&request, consistent)
+    }
+
     fn derivative_trial(&self, attempt: &AttemptedStep, previous: &Vector) -> SpiceResult<Trial> {
         let request = LoadRequest {
             mode: AnalysisMode::Transient {
@@ -1825,42 +1925,30 @@ impl Driver<'_> {
             integration: Some(&attempt.coefficients),
             history: &self.history,
             forcing: Some(Forcing {
-                limit: crate::devices::Limit::Right,
+                limit: if attempt.event_start.is_some() {
+                    crate::devices::Limit::Left
+                } else {
+                    crate::devices::Limit::Right
+                },
                 timing: self.timing,
             }),
         };
-        let t = &self.settings.tolerances;
         let consistent = initial::consistent_derivative_step(
             &self.prepared,
             &request,
-            initial::Tolerances {
-                reltol: t.reltol,
-                vntol: t.vntol,
-                abstol: t.abstol,
-                chgtol: t.chgtol,
-            },
+            self.physical_tolerances(),
             self.settings.tran_max_iter,
         )?;
-        let x = consistent
-            .solution
-            .ok_or_else(|| failure("missing consistent derivative step"))?;
-        let mut state = self.history.trial();
-        self.prepared.load(
+        let (x, state) = self.physical_candidate(
             &LoadRequest {
                 mode: AnalysisMode::Instantaneous {
                     time: attempt.clock.time,
                 },
-                solution: &x,
                 integration: None,
                 ..request
             },
-            &mut self.circuit.new_matrix()?,
-            &mut Vector::zeros(x.len()),
-            &mut state,
+            consistent,
         )?;
-        for (slot, value) in consistent.canonical {
-            self.history.set_candidate_slot(&mut state, slot, value)?;
-        }
         Ok(Trial::Converged { x, state })
     }
 

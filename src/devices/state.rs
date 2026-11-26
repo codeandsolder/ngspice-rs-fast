@@ -502,6 +502,21 @@ impl StateHistory {
         Ok(())
     }
 
+    /// Re-anchor integration history at an accepted right-limit event.
+    /// No new physical point or device hook is published. Only the
+    /// pre-event integration stencil is discarded.
+    pub(crate) fn restart_integration(&mut self) -> SpiceResult<()> {
+        let latest = self
+            .accepted
+            .first()
+            .cloned()
+            .ok_or_else(|| state_error("cannot restart empty integration history"))?;
+        self.accepted.clear();
+        self.accepted.resize(ACCEPTED_DEPTH, latest);
+        self.revision = Arc::new(());
+        Ok(())
+    }
+
     /// Begin a new inner DC sweep from the state just accepted.
     pub(crate) fn retain_latest(&mut self) {
         self.accepted.truncate(1);
