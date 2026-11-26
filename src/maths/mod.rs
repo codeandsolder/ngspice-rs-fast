@@ -70,7 +70,7 @@ impl StampPeak {
     }
 
     #[inline]
-    fn observe(&mut self, value: f64) {
+    const fn observe(&mut self, value: f64) {
         let magnitude = value.to_bits() & i64::MAX.cast_unsigned();
         if magnitude > self.0 {
             self.0 = magnitude;
