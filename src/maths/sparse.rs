@@ -734,6 +734,9 @@ pub struct SparseMatrix {
     /// Logical stamped-operator identity, minted only for grouped dynamic E.
     /// Ordinary ungrouped matrices incur no atomic or allocation cost.
     dynamic_owner: u64,
+    // Optional ledger retains contributions before binary64 assembly.
+    original: Option<Vec<Triplet>>,
+    peak_stamp: Real,
 }
 
 impl PartialEq for SparseMatrix {
@@ -796,6 +799,8 @@ impl SparseMatrix {
             pivot: crate::maths::PivotTolerances::DEFAULT,
             names: None,
             dynamic_owner: 0,
+            original: None,
+            peak_stamp: 0.,
         }
     }
 
@@ -846,6 +851,8 @@ impl SparseMatrix {
             pivot: crate::maths::PivotTolerances::DEFAULT,
             names: None,
             dynamic_owner: 0,
+            original: None,
+            peak_stamp: 0.,
         })
     }
 
@@ -953,6 +960,10 @@ impl SparseMatrix {
     /// load (C's `TSTALLOC` pointers); only its values change.
     #[inline]
     pub fn add_fixed<const N: usize>(&mut self, values: &[Real; N]) -> bool {
+        // The ordinary fixed path does not need coordinates or a ledger.
+        if self.original.is_some() {
+            return false;
+        }
         let Some(bound) = &mut self.bound else {
             return false;
         };
@@ -978,11 +989,13 @@ impl SparseMatrix {
         bound.view.take();
         if traced.len() == N {
             for (&(_, _, id), &value) in traced.iter().zip(values) {
+                self.peak_stamp = self.peak_stamp.max(value.abs());
                 bound.values[id as usize] += value;
             }
         } else {
             for &(_, _, id) in traced {
                 let k = mask.trailing_zeros() as usize;
+                self.peak_stamp = self.peak_stamp.max(values[k].abs());
                 bound.values[id as usize] += values[k];
                 mask &= mask - 1;
             }
@@ -1054,6 +1067,14 @@ impl SparseMatrix {
             .values
             .get_mut(element.index())
             .ok_or_else(|| pattern_error("element handle outside bound pattern"))?;
+        if let Some(original) = &mut self.original {
+            let (row, col) = bound
+                .pattern
+                .position(element)
+                .ok_or_else(|| pattern_error("element handle outside bound pattern"))?;
+            Self::retain_stamp(original, row, col, value)?;
+        }
+        self.peak_stamp = self.peak_stamp.max(value.abs());
         *slot += value;
         bound.view.take();
         Ok(())
@@ -1065,6 +1086,9 @@ impl SparseMatrix {
     /// The predicate is a column selection, independent of traversal order.
     pub fn zero_row(&mut self, row: usize, keep: impl Fn(usize) -> bool) -> bool {
         self.dynamic_owner = 0;
+        if let Some(original) = &mut self.original {
+            original.retain(|t| t.row != row || keep(t.col));
+        }
         let mut kept = false;
         if let Some(bound) = &mut self.bound
             && row < bound.pattern.order()
@@ -1107,11 +1131,18 @@ impl SparseMatrix {
     /// [`SpiceError::Numerical`] when the position is out of range.
     pub fn set(&mut self, row: usize, col: usize, value: Real) -> SpiceResult<()> {
         self.dynamic_owner = 0;
+        if let Some(original) = &mut self.original {
+            original.retain(|t| t.row != row || t.col != col);
+        }
         if let Some(bound) = &mut self.bound
             && let Some(id) = bound.pattern.find(row, col)
         {
             // Overflow coordinates are disjoint from the pattern.
             bound.view.take();
+            if let Some(original) = &mut self.original {
+                Self::retain_stamp(original, row, col, value)?;
+            }
+            self.peak_stamp = self.peak_stamp.max(value.abs());
             bound.values[id.index()] = value;
             return Ok(());
         }
@@ -1184,6 +1215,10 @@ impl SparseMatrix {
         if let Some(bound) = &mut self.bound
             && let Some(id) = bound.replay(row, col)
         {
+            if let Some(original) = &mut self.original {
+                Self::retain_stamp(original, row, col, value)?;
+            }
+            self.peak_stamp = self.peak_stamp.max(value.abs());
             bound.view.take();
             bound.values[id.index()] += value;
             return Ok(());
@@ -1204,6 +1239,10 @@ impl SparseMatrix {
                 ),
             });
         }
+        if let Some(original) = &mut self.original {
+            Self::retain_stamp(original, row, col, value)?;
+        }
+        self.peak_stamp = self.peak_stamp.max(value.abs());
         if let Some(bound) = &mut self.bound {
             bound.view.take();
             if let Some(id) = bound.element(row, col)? {
@@ -1261,12 +1300,84 @@ impl SparseMatrix {
     pub fn clear(&mut self) {
         self.dynamic_owner = 0;
         self.triplets.clear();
+        self.peak_stamp = 0.;
+        if let Some(original) = &mut self.original {
+            original.clear();
+        }
         self.folded = true;
         if let Some(bound) = &mut self.bound {
             bound.values.fill(0.0);
             bound.view.take();
             bound.reset_trace();
         }
+    }
+
+    fn retain_stamp(
+        original: &mut Vec<Triplet>,
+        row: usize,
+        col: usize,
+        value: Real,
+    ) -> SpiceResult<()> {
+        if value != 0. {
+            if original.len() == original.capacity() {
+                reserve(original, 1)?;
+            }
+            original.push(Triplet { row, col, value });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_original(&mut self, enabled: bool) {
+        if enabled {
+            self.original.get_or_insert_with(Vec::new).clear();
+        } else {
+            self.original = None;
+        }
+    }
+
+    /// Cheap, conservative bound on the scale of the original products.
+    pub(crate) const fn peak_stamp(&self) -> Real {
+        self.peak_stamp
+    }
+
+    /// Compute b - A*x from individual original stamps. Sorting by equation
+    /// uses sparse storage rather than an exact accumulator per unknown.
+    /// The already rounded matrix remains the numerical Jacobian.
+    pub(crate) fn original_correction(
+        &mut self,
+        rhs: &mut Vector,
+        solution: &Vector,
+    ) -> SpiceResult<Vector> {
+        let entries = self
+            .original
+            .as_mut()
+            .ok_or_else(|| pattern_error("missing original matrix contributions"))?;
+        let sources = rhs
+            .original_by_row()
+            .ok_or_else(|| pattern_error("missing original RHS contributions"))?;
+        entries.sort_unstable_by_key(|t| t.row);
+        let mut matrix = entries.iter().peekable();
+        let mut sources = sources.iter().peekable();
+        let mut correction = Vector::zeros(self.rows);
+        for (row, value) in correction.as_mut_slice().iter_mut().enumerate() {
+            let mut sum = crate::primitives::ExactSum::new();
+            let mut has_entry = false;
+            while let Some(t) = matrix.next_if(|t| t.row == row) {
+                sum.add_product(-t.value, solution.as_slice()[t.col]);
+                has_entry = true;
+            }
+            while let Some(&(_, source)) = sources.next_if(|&&(r, _)| r == row) {
+                sum.add_product(source, 1.);
+            }
+            // C's untranslated empty row is copied from RHS to solution.
+            // Its correction-coordinate counterpart must subtract the old
+            // coordinate rather than accumulating the same RHS every load.
+            if !has_entry {
+                sum.add_product(-solution.as_slice()[row], 1.);
+            }
+            *value = sum.rounded_sum();
+        }
+        Ok(correction)
     }
 
     /// The stored contributions. For a bound matrix: the folded nonzero

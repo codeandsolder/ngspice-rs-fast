@@ -199,16 +199,64 @@ fn small_pivots_are_accepted_like_c() {
     }
 }
 
-/// `resparam.c` raises a zero resistance to `RESMIN = 1e-12` (with a
-/// warning). The 1e12 S conductance then loses digits, and C's answer
-/// (`b = 9.99999999999999001e-01`, `v1#branch = -9.7656250000000000e-04`)
-/// is reproduced exactly.
+/// C's RESMIN clamp is physical, but its supply current loses 2.34375%
+/// through cancellation. Check the independent series solution instead.
 #[test]
-fn zero_resistance_is_clamped_like_c() {
+fn zero_resistance_preserves_physical_clamped_current() {
+    let current = 1. / (1000. + 1e-12);
     for r1 in ["r1 a b 0", "r1 a b rm r=0\n.model rm r"] {
-        let plot = simulate(&format!("v1 a 0 1\n{r1}\nr2 b 0 1k\n.op")).unwrap();
-        assert_eq!(value(&plot, "v(b)"), 9.999_999_999_999_99e-1, "{r1}");
-        assert_eq!(value(&plot, "i(v1)"), -9.765_625e-4, "{r1}");
+        let plot =
+            simulate_observed(&format!("v1 a 0 1\n{r1}\nr2 b 0 1k\n.op"), &["i(r2)"]).unwrap();
+        assert!(
+            (value(&plot, "v(b)") - 1000. * current).abs() < 2e-15,
+            "{r1}"
+        );
+        assert!((value(&plot, "i(v1)") + current).abs() < 2e-15, "{r1}");
+        assert!(
+            (value(&plot, "i(v1)") + value(&plot, "i(r2)")).abs() < 2e-15,
+            "{r1}"
+        );
+    }
+}
+
+#[test]
+fn ill_conditioned_source_currents_are_common_mode_invariant() {
+    for common in [0., 1., 1000.] {
+        for resistance in [1e-3_f64, 1e-6, 1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 0.] {
+            let expected = 1. / (1000. + if resistance == 0. { 1e-12 } else { resistance });
+            let deck = format!(
+                "vh h 0 {}\nvl l 0 {common}\nr1 h b {resistance:e}\nr2 b l 1k\nh1 sense 0 vh 1000\nr3 sense 0 1k\n.op",
+                common + 1.
+            );
+            let plot = simulate_observed(&deck, &["i(r1)", "i(r2)"]).unwrap();
+            let upper = -value(&plot, "i(vh)");
+            let lower = value(&plot, "i(vl)");
+            let load = value(&plot, "i(r2)");
+            for actual in [upper, lower, load, -value(&plot, "v(sense)") / 1000.] {
+                assert!(
+                    (actual - expected).abs() <= 2e-12,
+                    "CM={common}, R={resistance:e}: actual {actual:e}, expected {expected:e}"
+                );
+            }
+            let b = value(&plot, "v(b)");
+            assert!((b - (common + 1000. * expected)).abs() <= 4. * f64::EPSILON * (common + 1.));
+            // The ideal short's local constitutive drop is bounded by the
+            // representation of separately rounded absolute node voltages.
+            let effective_r = if resistance == 0. { 1e-12 } else { resistance };
+            let current_resolution = 4. * f64::EPSILON * (common + 1.) / effective_r;
+            assert!((value(&plot, "i(r1)") - expected).abs() <= current_resolution.max(2e-12));
+        }
+    }
+}
+
+#[test]
+fn recover_contributions_cancelled_inside_matrix_or_rhs_cells() {
+    for deck in [
+        "v1 a 0 1\ng1 a 0 a 0 1e12\nr1 a 0 1k\ng2 a 0 a 0 -1e12\n.op",
+        "v1 a 0 1\ni1 0 a 1e12\ni2 0 a 1m\ni3 a 0 1e12\n.op",
+    ] {
+        let plot = simulate(deck).unwrap();
+        assert!((value(&plot, "i(v1)").abs() - 1e-3).abs() < 2e-15, "{deck}");
     }
 }
 

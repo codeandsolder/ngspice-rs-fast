@@ -561,14 +561,27 @@ fn jacobi_eigenvalues(mut data: Vec<Real>, order: usize) -> SpiceResult<Option<V
 }
 
 /// A dense real vector, used for the MNA right-hand side and the solution.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Vector {
     data: Vec<Real>,
+    // Optional exact-RHS contribution ledger for a correction-coordinate load.
+    original: Option<Vec<(usize, Real)>>,
+    peak_stamp: Real,
+}
+
+impl PartialEq for Vector {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
 }
 
 impl From<Vec<Real>> for Vector {
     fn from(data: Vec<Real>) -> Self {
-        Self { data }
+        Self {
+            data,
+            original: None,
+            peak_stamp: 0.,
+        }
     }
 }
 
@@ -578,6 +591,8 @@ impl Vector {
     pub fn zeros(len: usize) -> Self {
         Self {
             data: vec![0.0; len],
+            original: None,
+            peak_stamp: 0.,
         }
     }
 
@@ -586,6 +601,8 @@ impl Vector {
     pub fn from_slice(values: &[Real]) -> Self {
         Self {
             data: values.to_vec(),
+            original: None,
+            peak_stamp: 0.,
         }
     }
 
@@ -615,6 +632,11 @@ impl Vector {
     pub fn set(&mut self, index: usize, value: Real) -> SpiceResult<()> {
         match self.data.get_mut(index) {
             Some(slot) => {
+                if let Some(original) = &mut self.original {
+                    original.retain(|&(row, _)| row != index);
+                    Self::record(original, index, value)?;
+                }
+                self.peak_stamp = self.peak_stamp.max(value.abs());
                 *slot = value;
                 Ok(())
             }
@@ -637,6 +659,10 @@ impl Vector {
     pub fn add_to(&mut self, index: usize, value: Real) -> SpiceResult<()> {
         match self.data.get_mut(index) {
             Some(slot) => {
+                if let Some(original) = &mut self.original {
+                    Self::record(original, index, value)?;
+                }
+                self.peak_stamp = self.peak_stamp.max(value.abs());
                 *slot += value;
                 Ok(())
             }
@@ -652,12 +678,50 @@ impl Vector {
 
     /// The elements, mutable.
     pub fn as_mut_slice(&mut self) -> &mut [Real] {
+        // Arbitrary writes cannot preserve an original contribution ledger.
+        self.original = None;
         &mut self.data
     }
 
     /// Sets every element to zero.
     pub fn clear(&mut self) {
         self.data.fill(0.0);
+        self.peak_stamp = 0.;
+        if let Some(original) = &mut self.original {
+            original.clear();
+        }
+    }
+
+    fn record(original: &mut Vec<(usize, Real)>, index: usize, value: Real) -> SpiceResult<()> {
+        if value != 0. {
+            original
+                .try_reserve(1)
+                .map_err(|error| SpiceError::Numerical {
+                    context: "original RHS".to_owned(),
+                    message: format!("cannot retain contribution: {error}"),
+                })?;
+            original.push((index, value));
+        }
+        Ok(())
+    }
+
+    /// Enable original contribution recording for the next empty load.
+    pub(crate) fn record_original(&mut self, enabled: bool) {
+        if enabled {
+            self.original.get_or_insert_with(Vec::new).clear();
+        } else {
+            self.original = None;
+        }
+    }
+
+    pub(crate) const fn peak_stamp(&self) -> Real {
+        self.peak_stamp
+    }
+
+    pub(crate) fn original_by_row(&mut self) -> Option<&[(usize, Real)]> {
+        let original = self.original.as_mut()?;
+        original.sort_unstable_by_key(|&(row, _)| row);
+        Some(original)
     }
 
     /// Dot product.

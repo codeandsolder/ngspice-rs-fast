@@ -516,6 +516,7 @@ struct LoadStorage<T> {
     matrix: Option<SparseMatrix>,
     rhs: Option<Vector>,
     spare_trial: Option<T>,
+    capture_original: bool,
 }
 
 impl<T> Default for LoadStorage<T> {
@@ -524,6 +525,7 @@ impl<T> Default for LoadStorage<T> {
             matrix: None,
             rhs: None,
             spare_trial: None,
+            capture_original: false,
         }
     }
 }
@@ -535,14 +537,14 @@ impl<T> LoadStorage<T> {
     }
 
     /// Check the assembled system and fold duplicates before factorization.
-    fn checked_system(&mut self, n: usize) -> SpiceResult<(&mut SparseMatrix, &Vector)> {
+    fn checked_system(&mut self, n: usize) -> SpiceResult<(&mut SparseMatrix, &mut Vector)> {
         let matrix = self
             .matrix
             .as_mut()
             .ok_or_else(|| failure("Newton load returned no matrix"))?;
         let rhs = self
             .rhs
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| failure("Newton load returned no RHS"))?;
         check(matrix, rhs, n)?;
         matrix.fold_duplicates();
@@ -592,6 +594,8 @@ impl LoadStorage<TrialState> {
             .ok_or_else(|| failure("missing Newton RHS"))?;
         matrix.clear();
         rhs.clear();
+        matrix.record_original(self.capture_original);
+        rhs.record_original(self.capture_original);
         Ok((matrix, rhs))
     }
 }
@@ -759,17 +763,34 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     let mut ordering = None;
     let mut reorder = phases.initial_transient;
     let mut ipass = false;
+    // Each solve begins with ordinary absolute NI iteration. Only an
+    // otherwise converged, potentially cancellation-dominated circuit load
+    // switches to original-stamp correction coordinates.
+    storage.capture_original = false;
+    let mut corrected = false;
     loop {
         // NIiter increments before checking the CKTload return code.
         progress.iterations += 1;
         let iterno = progress.iterations;
         let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
         let flagged = (phases.nonconvergent)(&trial);
+        let capturing = storage.capture_original;
         let (matrix, rhs) = storage.checked_system(n)?;
+        let correction = if capturing {
+            Some(matrix.original_correction(rhs, &guess)?)
+        } else {
+            None
+        };
         if phase == IterationPhase::Junction {
             reorder = true;
         }
-        let mut next = match linearised_solve(matrix, rhs, &mut ordering, reorder, options)? {
+        let mut next = match linearised_solve(
+            matrix,
+            correction.as_ref().unwrap_or(rhs),
+            &mut ordering,
+            reorder,
+            options,
+        )? {
             crate::maths::NiStep::Solved(next) => {
                 reorder = false;
                 next
@@ -783,6 +804,11 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
                 continue;
             }
         };
+        if capturing {
+            for (new, old) in next.as_mut_slice().iter_mut().zip(guess.as_slice()) {
+                *new += old;
+            }
+        }
         if phases.damped {
             damp(
                 &mut next,
@@ -803,6 +829,30 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
             !converged(&next, &guess, branch_rows, phases.coordinate_kinds, options)
                 || device_test(&next, &guess, &trial)?
         };
+        // An absolute solve can stop with a tiny iterate change while
+        // large cancelling original terms obscure a physical KCL residual.
+        // Estimate the worst product roundoff from original stamp peaks,
+        // including stamps that cancelled within one assembled coefficient.
+        // Legacy SPARSE pivot-diagonal gmin is not an original nodal
+        // operator: only its final zero-gmin stage is corrected.
+        if !noncon
+            && !capturing
+            && phases.coordinate_kinds.is_some()
+            && options.diag_gmin == 0.
+            && phase != IterationPhase::Junction
+            && correction_risk(matrix, rhs, &next, options)
+        {
+            storage.capture_original = true;
+            // Do not accept the absolute solution; load the candidate again
+            // so original matrix AND RHS stamps correspond to its trial.
+            noncon = phase == IterationPhase::Float;
+        }
+        if capturing && !corrected {
+            corrected = true;
+            // At least one load must own the corrected values; ordinary
+            // iterate tolerances alone could accept the pre-correction state.
+            noncon |= next != guess;
+        }
         if phase == IterationPhase::Float {
             if phases.nodesets {
                 noncon |= ipass;
@@ -841,6 +891,22 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         guess = next;
     }
 }
+/// A conservative roundoff envelope (eight binary64 epsilons) on the
+/// scale of the largest original stamped product or RHS term. This is
+/// only a trigger for a physical correction, never a singularity test.
+/// No row traversal, exact sums or factorization are required here.
+fn correction_risk(
+    matrix: &SparseMatrix,
+    rhs: &Vector,
+    values: &Vector,
+    options: &NewtonOptions,
+) -> bool {
+    let roundoff = 8. * Real::EPSILON;
+    let coefficient = roundoff * matrix.peak_stamp() * values.max_abs();
+    let source = roundoff * rhs.peak_stamp();
+    coefficient.max(source) >= options.abstol
+}
+
 /// [`StepLimiting::Global`]: scale the step so no watched nodal voltage moves
 /// by more than `limit` (all non-branch rows when `limited_rows` is `None`).
 fn damp(
