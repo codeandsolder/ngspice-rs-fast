@@ -210,10 +210,9 @@ carry the preprocessing library's `passive_ic::InitialConditions` sidecar.
 After the electrical artifacts have been materialized, parse the primary
 artifact with `Parser::parse_file_with_output`, then call
 `PreparedInitialConditions::attach(&mut parsed.netlist, bundle_directory,
-initial_conditions)`. The artifact directory is the emitted bundle root,
-not the original source directory. When the producer supplies a separate
-typed analysis plan, use `attach_for_analyses` with the selected native
-job kinds and UIC flags before elaborating the circuit. Do not discard the typed sidecar or
+initial_conditions, analyses)`, supplying the selected native job kinds
+and UIC flags before elaborating the circuit. The artifact directory is the
+emitted bundle root, not the original source directory. Do not discard the typed sidecar or
 serialize it into native IC syntax. The native writer refuses to serialize
 a deck with attached prepared initialization metadata.
 
@@ -236,6 +235,6 @@ The resolved equations are independent of the source language:
 
 Prepared analysis selection is distinct from Newton load mode. A newly
 introduced analysis must be present when the policy is bound; a command-only
-deck reserves all supported enclosing analyses. The original producer
+deck must explicitly select its enclosing analyses too. The original producer
 fixture snapshot under `tests/fixtures/passive-ic` exercises the actual
 prepared artifacts through the solver, with independent voltage references.
