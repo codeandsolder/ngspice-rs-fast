@@ -1550,6 +1550,9 @@ impl Driver<'_> {
             // C's single MODETRANOP|MODEUIC|MODEINITJCT load: nonlinear
             // devices evaluate at their instance initial conditions.
             let mut trial = self.initial_state(&start.x, &start.charges, true)?;
+            if let Some(consistent) = self.derivative_initial(&start.x, &trial, true)? {
+                return Ok(consistent);
+            }
             let tolerances = &self.settings.tolerances;
             let mut right_rhs = self
                 .system
@@ -1654,12 +1657,73 @@ impl Driver<'_> {
             };
             (x, trial)
         };
+        if !self.uic
+            && let Some(consistent) = self.derivative_initial(&x, &trial, false)?
+        {
+            return Ok(consistent);
+        }
         // C copies CKTstate0 into CKTstate1..3; the derivative is zero. The
         // port fills every retained vector (ACCEPTED_DEPTH, sized for Gear
         // order 6); dctran.c's orders 1-2 never read beyond CKTstate3.
         // The t = 0 point also starts every transmission line's delay
         // history (traload.c, MODEINITTRAN); it requests no breakpoints.
         Ok((x, trial))
+    }
+
+    fn derivative_initial(
+        &self,
+        x: &Vector,
+        trial: &TrialState,
+        uic: bool,
+    ) -> SpiceResult<Option<(Vector, TrialState)>> {
+        if self.mixed.is_some() || !initial::has_derived_storage(self.circuit) {
+            return Ok(None);
+        }
+        let request = LoadRequest {
+            mode: AnalysisMode::Instantaneous { time: 0. },
+            solution: x,
+            model_context: &self.model_context,
+            integration: None,
+            history: &self.history,
+            forcing: Some(Forcing {
+                limit: crate::devices::Limit::Right,
+                timing: self.timing,
+            }),
+        };
+        let tolerance = &self.settings.tolerances;
+        let Some(consistent) = initial::consistent_derivative_start(
+            &self.prepared,
+            &request,
+            trial,
+            uic,
+            initial::Tolerances {
+                reltol: tolerance.reltol,
+                vntol: tolerance.vntol,
+                abstol: tolerance.abstol,
+                chgtol: tolerance.chgtol,
+            },
+            &self.bias.newton,
+        )?
+        else {
+            return Ok(None);
+        };
+        let x = consistent
+            .solution
+            .ok_or_else(|| failure("missing consistent derivative initial state"))?;
+        let mut trial = self.history.trial();
+        self.prepared.load(
+            &LoadRequest {
+                solution: &x,
+                ..request
+            },
+            &mut self.circuit.new_matrix()?,
+            &mut Vector::zeros(x.len()),
+            &mut trial,
+        )?;
+        for (slot, value) in consistent.canonical {
+            self.history.set_initial_slot(&mut trial, slot, value)?;
+        }
+        Ok(Some((x, trial)))
     }
 
     /// The charge/flux state of the initial point: a DC-mode load at `x`

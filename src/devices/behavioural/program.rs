@@ -40,8 +40,8 @@ use std::sync::Arc;
 use super::xspice::XspicePwl;
 
 mod plan;
-pub(super) use plan::Workspace;
 use plan::{Plan, PlanBuilder, Slot};
+pub(super) use plan::{TaylorEvaluation, Workspace};
 
 /// A circuit quantity an expression reads, in first-use order (C
 /// `mkvnode`/`mkinode` deduplicate them the same way).
@@ -370,6 +370,21 @@ impl Program {
             value,
             gradient: workspace.into_gradient(),
         })
+    }
+
+    pub(super) fn evaluate_taylor(
+        &self,
+        environment: &Environment<'_>,
+        variables: &[crate::maths::taylor::Jet],
+        time: &crate::maths::taylor::Jet,
+    ) -> SpiceResult<TaylorEvaluation> {
+        if variables.len() != self.quantities.len() {
+            return Err(SpiceError::circuit(
+                "wrong number of behavioural Taylor variables",
+            ));
+        }
+        self.plan
+            .evaluate_taylor(self.root, &self.derivatives, environment, variables, time)
     }
 
     pub(super) fn evaluate_with_workspace<'w>(

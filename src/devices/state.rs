@@ -511,7 +511,7 @@ impl StateHistory {
         }
     }
 
-    /// Fill a constrained absolute UIC slot in the already loaded trial.
+    /// Fill a verified absolute slot of the initial point before acceptance.
     pub(crate) fn set_initial_slot(
         &self,
         trial: &mut TrialState,
@@ -519,7 +519,7 @@ impl StateHistory {
         value: Real,
     ) -> SpiceResult<()> {
         self.check_trial(trial)?;
-        if !trial.initial_conditions() || self.depth() != 0 || !value.is_finite() {
+        if self.depth() != 0 || !value.is_finite() {
             return Err(state_error("invalid initial-state override"));
         }
         let target = Arc::make_mut(&mut trial.values)

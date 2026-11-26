@@ -591,3 +591,43 @@ fn initial_charge_law_uses_charge_not_voltage_tolerance() {
     .to_string();
     assert!(error.contains("c1") && error.contains("initial"), "{error}");
 }
+
+#[test]
+fn nested_derivative_uic_starts_at_consistent_right_limit() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            "v1 in 0 PWL(0 2 1m 3)\nb1 first 0 v=ddt(v(in))\nb2 out 0 v=ddt(v(first))\nr1 out 0 1k",
+            AnalysisKind::Transient,
+            &[
+                "1u",
+                "50u",
+                "0",
+                "1u",
+                "uic",
+                method,
+                "reltol=1e-8",
+                "vntol=1e-9",
+            ],
+        )?;
+        assert!(plot.point_count() > 20);
+        for point in 0..plot.point_count() {
+            close(plot.value("v(first)", point).unwrap().re, 1000., 1e-6);
+            close(plot.value("v(out)", point).unwrap().re, 0., 1e-6);
+            close(plot.value("i(b2)", point).unwrap().re, 0., 1e-9);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn non_uic_derivative_input_jump_is_reported_as_a_discontinuity() {
+    let result = run(
+        "v1 in 0 PWL(0 2 1m 3)\nb1 out 0 v=ddt(ddt(v(in)))\nr1 out 0 1k",
+        AnalysisKind::Transient,
+        &["1u", "50u", "0", "1u", "method=gear"],
+    );
+    let error = result
+        .expect_err("prehistory slope jump is not a classical second derivative")
+        .to_string();
+    assert!(error.contains("prehistory discontinuity"), "{error}");
+}

@@ -392,3 +392,137 @@ fn analytic_waveform_jets_do_not_differentiate_rounded_samples() -> SpiceResult<
     }
     Ok(())
 }
+
+#[test]
+fn physical_taylor_equations_preserve_nonlinear_coefficients_and_gradients() -> SpiceResult<()> {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+    let deck = parse_deck_text(
+        Path::new("jets.cir"),
+        "jet DAE\nv1 a 0 PWL(0 2 1m 3)\nb1 b 0 v={v(a)^2+1000*time}\nc1 a 0 2u\nr1 b 0 1k\nc2 b 0 q={1u*(v(b)^2+1000*time)}\n.end\n",
+    );
+    let netlist = Parser::new().parse_deck(&deck)?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let mut circuit = config.circuit(&netlist)?;
+    circuit.finalize()?;
+    let row = |name| {
+        circuit
+            .unknowns()
+            .node_row(circuit.nodes().get(name).unwrap())
+            .unwrap()
+    };
+    let branch = |name| {
+        let i = circuit
+            .devices()
+            .iter()
+            .position(|d| d.name() == name)
+            .unwrap();
+        circuit.branch_rows(i).unwrap().start
+    };
+    let (a, b, v, bv, q) = (row("a"), row("b"), branch("v1"), branch("b1"), branch("c2"));
+    let mut state = vec![Vector::zeros(circuit.unknown_count()); 5];
+    for (degree, values) in [
+        (
+            0,
+            [
+                (a, 2.),
+                (b, 5.),
+                (v, -2e-3),
+                (bv, -6e-3),
+                (q, 1e-3),
+                (q + 1, 26e-6),
+            ],
+        ),
+        (
+            1,
+            [
+                (a, 1.),
+                (b, 4.),
+                (v, -1e-3),
+                (bv, -1e-3),
+                (q, 2e-3),
+                (q + 1, 40e-6),
+            ],
+        ),
+        (
+            2,
+            [
+                (a, 0.5),
+                (b, 2.),
+                (v, 0.),
+                (bv, 0.),
+                (q, 0.),
+                (q + 1, 36e-6),
+            ],
+        ),
+    ] {
+        for (r, value) in values {
+            state[degree].set(r, value)?;
+        }
+    }
+    let run = circuit.prepare_run();
+    let mut dae = run.prepare_physical_dae(
+        &config.context().model_context(),
+        TransientTiming::new(1e-6, 1e-3)?,
+    )?;
+    let time = 0.;
+    let scale = 1e-3;
+    let taylor = dae.evaluate_taylor(&state, time, scale)?;
+    let close = |a: f64, b: f64| {
+        assert!(
+            (a - b).abs() <= 2e-11 * a.abs().max(b.abs()).max(1e-9),
+            "{a:e} != {b:e}"
+        )
+    };
+    // F_b = v(b)-v(a)^2-1000*time.
+    for (degree, expected) in [1., -1., -1., -1., -0.25].into_iter().enumerate() {
+        close(taylor.residual[degree].as_slice()[bv], expected);
+    }
+    // The explicitly retained charge law and its state Jacobian.
+    for (degree, expected) in [1e-6, -1e-6, 0., -16e-6, -4e-6].into_iter().enumerate() {
+        close(taylor.residual[degree].as_slice()[q], expected);
+    }
+    for (degree, expected) in [-4., -2., -1., 0., 0.].into_iter().enumerate() {
+        close(taylor.conductance[degree].get(bv, a), expected);
+    }
+    for (degree, expected) in [-10e-6, -8e-6, -4e-6, 0., 0.].into_iter().enumerate() {
+        close(taylor.conductance[degree].get(q, b), expected);
+    }
+    // Reconstruct every physical row and Jacobian at independently sampled
+    // interior points. These polynomial laws have no omitted higher terms.
+    for tau in [0.125_f64, 0.25, 0.5] {
+        let mut x = Vector::zeros(circuit.unknown_count());
+        for k in (0..state.len()).rev() {
+            for (value, &coefficient) in x.as_mut_slice().iter_mut().zip(state[k].as_slice()) {
+                *value = value.mul_add(tau, coefficient);
+            }
+        }
+        let actual = dae.evaluate(&x, time + scale * tau, Limit::Right)?;
+        for r in 0..x.len() {
+            let reconstruct = |jets: &[Vector]| {
+                jets.iter()
+                    .rev()
+                    .fold(0_f64, |sum, jet| sum.mul_add(tau, jet.as_slice()[r]))
+            };
+            close(reconstruct(&taylor.residual), actual.residual.as_slice()[r]);
+            close(reconstruct(&taylor.charge), actual.charge.as_slice()[r]);
+            for c in 0..x.len() {
+                let reconstruct = |jets: &[SparseMatrix]| {
+                    jets.iter()
+                        .rev()
+                        .fold(0_f64, |sum, jet| sum.mul_add(tau, jet.get(r, c)))
+                };
+                close(
+                    reconstruct(&taylor.conductance),
+                    actual.conductance.get(r, c),
+                );
+                close(
+                    reconstruct(&taylor.capacitance),
+                    actual.capacitance.get(r, c),
+                );
+            }
+        }
+    }
+    Ok(())
+}

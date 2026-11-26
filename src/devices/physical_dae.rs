@@ -84,6 +84,41 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         self.linear.transient_taylor_rhs(time, scale, order, limit)
     }
 
+    /// Assemble exact right-hand physical Taylor coefficients from the same prepared
+    /// device topology and analytic independent forcing.
+    ///
+    /// # Errors
+    /// Invalid state jet, unsupported nonlinear Taylor kernel, singular
+    /// constitutive expansion or nonfinite result.
+    pub fn evaluate_taylor(
+        &self,
+        state: &[Vector],
+        time: Real,
+        scale: Real,
+    ) -> SpiceResult<PhysicalDaeTaylor> {
+        use crate::maths::taylor::{Jet, MAX_ORDER};
+        let n = self.run.circuit().unknown_count();
+        if state.is_empty()
+            || state.len() > MAX_ORDER + 1
+            || state
+                .iter()
+                .any(|vector| vector.len() != n || !vector.is_finite())
+            || n.saturating_mul(state.len()) > 8_388_608
+        {
+            return Err(SpiceError::circuit(
+                "invalid physical Taylor state or resource limit",
+            ));
+        }
+        let order = state.len() - 1;
+        let forcing = self.forcing_taylor_rhs(time, scale, order, Limit::Right)?;
+        let mut output = PhysicalDaeTaylor::linear(&self.linear, state, forcing)?;
+        let time = Jet::affine(order, time, scale);
+        self.run
+            .dae_nonlinear_taylor(&self.model, state, &time, &mut output)?;
+        output.validate()?;
+        Ok(output)
+    }
+
     /// Evaluate at an explicitly chosen time and side of a source event.
     ///
     /// # Errors
@@ -147,5 +182,170 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
             return Err(SpiceError::circuit("nonfinite physical DAE residual"));
         }
         Ok(point)
+    }
+}
+
+/// Coefficients of the physical equations and their state Jacobians.
+/// Index k denotes the coefficient of the k-th normalized time power.
+/// Jacobian coefficients act by convolution on corrections to state jets.
+pub struct PhysicalDaeTaylor {
+    /// Static residual coefficients.
+    pub residual: Vec<Vector>,
+    /// Charge/flux coefficients.
+    pub charge: Vec<Vector>,
+    /// Static Jacobian coefficients.
+    pub conductance: Vec<SparseMatrix>,
+    /// Charge/flux Jacobian coefficients.
+    pub capacitance: Vec<SparseMatrix>,
+}
+
+impl PhysicalDaeTaylor {
+    fn linear(
+        system: &crate::devices::linear::LinearSystem,
+        state: &[Vector],
+        forcing: Vec<Vector>,
+    ) -> SpiceResult<Self> {
+        let n = system.a.rows();
+        let mut result = Self {
+            residual: forcing,
+            charge: Vec::with_capacity(state.len()),
+            conductance: Vec::with_capacity(state.len()),
+            capacitance: Vec::with_capacity(state.len()),
+        };
+        for (degree, x) in state.iter().enumerate() {
+            let mut f = system.a.mul_vector(x)?;
+            for (a, b) in f
+                .as_mut_slice()
+                .iter_mut()
+                .zip(result.residual[degree].as_slice())
+            {
+                *a -= b;
+            }
+            result.residual[degree] = f;
+            result.charge.push(system.e.mul_vector(x)?);
+            result.conductance.push(if degree == 0 {
+                system.a.clone()
+            } else {
+                SparseMatrix::new(n, n)
+            });
+            result.capacitance.push(if degree == 0 {
+                system.e.clone()
+            } else {
+                SparseMatrix::new(n, n)
+            });
+        }
+        Ok(result)
+    }
+
+    fn validate(&mut self) -> SpiceResult<()> {
+        for matrix in self.conductance.iter_mut().chain(&mut self.capacitance) {
+            matrix.fold_duplicates();
+            if matrix
+                .triplets()
+                .iter()
+                .any(|entry| !entry.value.is_finite())
+            {
+                return Err(SpiceError::circuit("nonfinite physical Taylor Jacobian"));
+            }
+        }
+        if self
+            .residual
+            .iter()
+            .chain(&self.charge)
+            .any(|vector| !vector.is_finite())
+        {
+            return Err(SpiceError::circuit("nonfinite physical Taylor residual"));
+        }
+        Ok(())
+    }
+}
+
+/// Device-local bindings and accumulation target for exact physical jets.
+/// Construction is restricted to the prepared physical DAE evaluator.
+pub struct TaylorContext<'a> {
+    pub(crate) model: &'a ModelContext,
+    pub(crate) unknowns: &'a crate::devices::MnaUnknowns,
+    pub(crate) branch: Option<usize>,
+    pub(crate) controls: &'a [usize],
+    pub(crate) state: &'a [Vector],
+    pub(crate) time: &'a crate::maths::taylor::Jet,
+    pub(crate) output: &'a mut PhysicalDaeTaylor,
+}
+
+impl TaylorContext<'_> {
+    pub(crate) fn variable(&self, column: Option<usize>) -> SpiceResult<crate::maths::taylor::Jet> {
+        use crate::maths::taylor::Jet;
+        match column {
+            Some(column) => Jet::from_coefficients(
+                self.state
+                    .iter()
+                    .map(|x| x.get(column).unwrap_or(Real::NAN))
+                    .collect(),
+            ),
+            None => Ok(Jet::constant(self.time.order(), 0.)),
+        }
+    }
+
+    pub(crate) fn static_value(
+        &mut self,
+        row: Option<usize>,
+        jet: &crate::maths::taylor::Jet,
+        scale: Real,
+    ) -> SpiceResult<()> {
+        if let Some(row) = row {
+            for (vector, &value) in self.output.residual.iter_mut().zip(jet.coefficients()) {
+                vector.add_to(row, scale * value)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn static_gradient(
+        &mut self,
+        row: Option<usize>,
+        column: Option<usize>,
+        jet: &crate::maths::taylor::Jet,
+        scale: Real,
+    ) -> SpiceResult<()> {
+        if let (Some(row), Some(column)) = (row, column) {
+            for (matrix, &value) in self.output.conductance.iter_mut().zip(jet.coefficients()) {
+                matrix.add(row, column, scale * value)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn linear_static(
+        &mut self,
+        row: Option<usize>,
+        column: Option<usize>,
+        coefficient: Real,
+    ) -> SpiceResult<()> {
+        if let (Some(row), Some(column)) = (row, column)
+            && coefficient != 0.
+        {
+            self.output.conductance[0].add(row, column, coefficient)?;
+            for (vector, x) in self.output.residual.iter_mut().zip(self.state) {
+                vector.add_to(row, coefficient * x.as_slice()[column])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn linear_charge(
+        &mut self,
+        row: Option<usize>,
+        column: Option<usize>,
+        coefficient: Real,
+    ) -> SpiceResult<()> {
+        if let (Some(row), Some(column)) = (row, column)
+            && coefficient != 0.
+        {
+            self.output.capacitance[0].add(row, column, coefficient)?;
+            for (vector, x) in self.output.charge.iter_mut().zip(self.state) {
+                vector.add_to(row, coefficient * x.as_slice()[column])?;
+            }
+        }
+        Ok(())
     }
 }

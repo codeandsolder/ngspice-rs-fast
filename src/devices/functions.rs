@@ -437,7 +437,7 @@ pub(super) fn scaled_difference(first: Real, second: Real, scale: Real, duration
     } else {
         // An overflowing difference of two finite levels requires opposite
         // signs and nonzero magnitudes. Halving is then exact.
-        let (m, e) = split_power(second * 0.5 - first * 0.5);
+        let (m, e) = split_power(first.mul_add(-0.5, second * 0.5));
         (m, e + 1)
     };
     let (scale_m, scale_e) = split_power(scale);

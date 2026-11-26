@@ -43,8 +43,8 @@
 use std::collections::BTreeMap;
 
 use crate::devices::{
-    Circuit, InitialStoragePolicy, InitialStorageRow, IterationPhase, LoadRequest, ModelContext,
-    PreparedRun,
+    Circuit, InitialCoordinateHistory, InitialStoragePolicy, InitialStorageRow, IterationPhase,
+    LoadRequest, ModelContext, PreparedRun,
 };
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
@@ -334,6 +334,8 @@ fn bound_initial_coordinates(
                 name: device.name().to_owned(),
                 value: coordinate.value,
                 equation: AbsoluteRow(rows.start + coordinate.equation),
+                history: coordinate.history,
+                device: index,
             },
         ));
     }
@@ -402,6 +404,8 @@ struct FixedCoordinate {
     name: String,
     value: Real,
     equation: AbsoluteRow,
+    history: InitialCoordinateHistory,
+    device: usize,
 }
 
 struct CapacitorInitial {
@@ -944,5 +948,148 @@ pub(super) fn check_impulse_free(
                 .collect::<Vec<_>>()
                 .join("; ")
         ))),
+    }
+}
+
+/// Whether this circuit has explicitly derived, rather than physical,
+/// initial storage. Ordinary RLC and charge-law circuits keep their established
+/// operating-point and UIC initialization path.
+pub(super) fn has_derived_storage(circuit: &Circuit) -> bool {
+    circuit.devices().iter().any(|device| {
+        device
+            .initial_expression_storage()
+            .is_some_and(|storage| storage.policy == InitialStoragePolicy::Derived)
+    })
+}
+
+impl ImpulseStorage {
+    fn retain_operating_point(&mut self, state: &Vector) {
+        for (&AbsoluteRow(row), coordinate) in &mut self.fixed_coordinates {
+            coordinate.value = state.as_slice()[row];
+        }
+        for capacitor in &mut self.capacitors {
+            capacitor.voltage =
+                potential(state, capacitor.positive) - potential(state, capacitor.negative);
+        }
+    }
+
+    fn consistent_history(
+        &self,
+        circuit: &Circuit,
+        right: &system::RightLimit,
+        uic: bool,
+        tolerances: Tolerances,
+    ) -> SpiceResult<Vec<(usize, Real)>> {
+        let mut slots = Vec::new();
+        for (&AbsoluteRow(row), charge) in &self.charges {
+            let actual = right.charge.as_slice()[row];
+            if !uic && charge.policy == InitialStoragePolicy::Derived {
+                let tolerance = VoltageTolerance {
+                    reltol: tolerances.reltol,
+                    vntol: tolerances.vntol,
+                };
+                if !tolerance.agree(actual, charge.target) {
+                    return Err(failure(format!(
+                        "{}: the derivative input jumps from {} to {} at t = 0; a classical derivative does not exist across this prehistory discontinuity",
+                        charge.name, -charge.target, -actual
+                    )));
+                }
+            }
+            slots.extend([
+                (charge.slot, actual),
+                (charge.slot + 1, right.charge_rate.as_slice()[row]),
+            ]);
+        }
+        for capacitor in &self.capacitors {
+            let voltage = potential(&right.state, capacitor.positive)
+                - potential(&right.state, capacitor.negative);
+            let slope = potential(&right.rate, capacitor.positive)
+                - potential(&right.rate, capacitor.negative);
+            slots.extend([
+                (capacitor.slot, capacitor.scale * voltage),
+                (capacitor.slot + 1, capacitor.scale * slope),
+            ]);
+        }
+        for (&AbsoluteRow(row), coordinate) in &self.fixed_coordinates {
+            let states = circuit
+                .state_rows(coordinate.device)
+                .ok_or_else(|| failure("missing initial coordinate history"))?;
+            let (slot, value, rate) = match coordinate.history {
+                InitialCoordinateHistory::EquationCharge { slot, scale } => {
+                    let AbsoluteRow(equation) = coordinate.equation;
+                    (
+                        slot,
+                        scale * right.charge.as_slice()[equation],
+                        scale * right.charge_rate.as_slice()[equation],
+                    )
+                }
+                InitialCoordinateHistory::Coordinate { slot } => (
+                    slot,
+                    right.state.as_slice()[row],
+                    right.rate.as_slice()[row],
+                ),
+            };
+            if slot.saturating_add(1) >= states.len() {
+                return Err(failure("invalid initial coordinate history binding"));
+            }
+            slots.extend([
+                (states.start + slot, value),
+                (states.start + slot + 1, rate),
+            ]);
+        }
+        Ok(slots)
+    }
+}
+
+fn potential(state: &Vector, vertex: VoltageVertex) -> Real {
+    match vertex {
+        VoltageVertex::Ground => 0.,
+        VoltageVertex::Node(AbsoluteRow(row)) => state.as_slice()[row],
+    }
+}
+
+/// Calculate the right-limit state and all declared initial storage rates.
+/// The caller publishes a fresh exact device trial only after this succeeds.
+pub(super) fn consistent_derivative_start(
+    prepared: &PreparedRun<'_>,
+    request: &LoadRequest<'_>,
+    trial: &crate::devices::TrialState,
+    uic: bool,
+    tolerances: Tolerances,
+    options: &crate::analysis::newton::NewtonOptions,
+) -> SpiceResult<Option<CheckedInitial>> {
+    let circuit = prepared.circuit();
+    if !has_derived_storage(circuit) {
+        return Ok(None);
+    }
+    let forcing = request
+        .forcing
+        .ok_or_else(|| failure("missing derivative initialization timing"))?;
+    let mut storage =
+        ImpulseStorage::collect(circuit, request.solution, request.model_context, trial)?;
+    if !uic {
+        storage.retain_operating_point(request.solution);
+    }
+    let result = (|| {
+        let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+        let right = system::solve_right_limit(
+            &dae,
+            request.solution,
+            &storage,
+            forcing.timing.step(),
+            tolerances,
+            options.max_iterations,
+        )?;
+        let canonical = storage.consistent_history(circuit, &right, uic, tolerances)?;
+        Ok(CheckedInitial {
+            solution: Some(right.state),
+            canonical,
+        })
+    })();
+    match result {
+        // Existing ordinary transient loads remain available for device
+        // families that have not yet acquired a high-order physical kernel.
+        Err(SpiceError::Unsupported { .. }) => Ok(None),
+        other => other.map(Some),
     }
 }

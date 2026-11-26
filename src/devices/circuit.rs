@@ -749,6 +749,33 @@ impl<'a> PreparedRun<'a> {
         )
     }
 
+    pub(crate) fn dae_nonlinear_taylor(
+        &self,
+        model: &ModelContext,
+        state: &[Vector],
+        time: &crate::maths::taylor::Jet,
+        output: &mut crate::devices::physical_dae::PhysicalDaeTaylor,
+    ) -> SpiceResult<()> {
+        let point = self.point(model)?;
+        for index in self.circuit.load_order() {
+            let device = point.device(self.circuit, index);
+            if device.is_nonlinear() {
+                device.assemble_nonlinear_taylor(
+                    &mut crate::devices::physical_dae::TaylorContext {
+                        model,
+                        unknowns: &self.circuit.bindings.unknowns,
+                        branch: self.circuit.bindings.branch_rows[index].clone().next(),
+                        controls: self.circuit.controls(index)?,
+                        state,
+                        time,
+                        output,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Assemble only selected physical charge equations for a constrained
     /// instantaneous load. Uses the same prepared model and physical kernel
     /// as the frequency-domain DAE; does not evaluate unrelated devices.

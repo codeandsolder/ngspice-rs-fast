@@ -191,6 +191,23 @@ pub struct StorageElement {
     pub initial: Option<Real>,
 }
 
+/// How an initial dynamic coordinate is represented in adjacent history slots.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InitialCoordinateHistory {
+    /// The signed physical charge/flux in the associated evolution equation.
+    EquationCharge {
+        /// Local state slot; its successor holds the time derivative.
+        slot: usize,
+        /// Conversion from signed equation charge to stored device quantity.
+        scale: Real,
+    },
+    /// The state coordinate itself is integrated by the device.
+    Coordinate {
+        /// Local state slot; its successor holds the time derivative.
+        slot: usize,
+    },
+}
+
 /// A prescribed internal state coordinate for UIC.
 ///
 /// The coordinate and the equation that normally evolves it are distinct: e.g. an implicit
@@ -204,6 +221,8 @@ pub struct InitialCoordinate {
     pub equation: usize,
     /// Value of the coordinate at the initial point.
     pub value: Real,
+    /// Mapping to accepted history.
+    pub history: InitialCoordinateHistory,
 }
 
 /// A voltage-controlled storage coordinate at UIC. Scalar capacitors
@@ -1232,6 +1251,10 @@ pub trait Device: fmt::Debug + std::any::Any {
                 coordinate: 0,
                 equation: 0,
                 value: storage.initial.unwrap_or(0.),
+                history: InitialCoordinateHistory::EquationCharge {
+                    slot: 0,
+                    scale: -1.,
+                },
             })
             .into_iter()
             .collect())
@@ -1356,6 +1379,21 @@ pub trait Device: fmt::Debug + std::any::Any {
     fn assemble_nonlinear_charge(&self, _context: &mut ChargeContext<'_>) -> SpiceResult<()> {
         Err(SpiceError::Unsupported {
             feature: format!("nonlinear frequency-domain charge for {}", self.name()),
+            location: None,
+        })
+    }
+
+    /// Assemble nonlinear physical residual/charge Taylor coefficients and
+    /// the corresponding state-Jacobian jets.
+    ///
+    /// # Errors
+    /// No analytic Taylor kernel for this device or invalid local physics.
+    fn assemble_nonlinear_taylor(
+        &self,
+        _context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        Err(SpiceError::Unsupported {
+            feature: format!("physical Taylor equations for {}", self.name()),
             location: None,
         })
     }

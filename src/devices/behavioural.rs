@@ -285,6 +285,47 @@ impl Behavioural {
         })
     }
 
+    fn bound_taylor(
+        &self,
+        context: &crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<(program::TaylorEvaluation, Vec<Option<usize>>)> {
+        let mut columns = Vec::with_capacity(self.variables.len());
+        for variable in &self.variables {
+            columns.push(match *variable {
+                Variable::Node(node) => context.unknowns.node_row(node),
+                Variable::Branch(index) => Some(*context.controls.get(index).ok_or_else(|| {
+                    SpiceError::circuit(format!("{}: unbound Taylor current control", self.name))
+                })?),
+            });
+        }
+        let variables = columns
+            .iter()
+            .map(|&column| context.variable(column))
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let values = variables
+            .iter()
+            .map(crate::maths::taylor::Jet::value)
+            .collect::<Vec<_>>();
+        let model = context.model;
+        let result = self
+            .program
+            .evaluate_taylor(
+                &Environment {
+                    values: &values,
+                    time: context.time.value(),
+                    temperature: model.temperature,
+                    gmin: model.gmin,
+                    frequency: 2. * std::f64::consts::PI * model.frequency
+                        / 2.
+                        / std::f64::consts::PI,
+                },
+                &variables,
+                context.time,
+            )
+            .map_err(|error| self.evaluation_error(error))?;
+        Ok((result, columns))
+    }
+
     fn evaluation_error(&self, error: SpiceError) -> SpiceError {
         match error {
             SpiceError::Numerical { message, .. } => SpiceError::Numerical {
@@ -710,6 +751,38 @@ impl Device for Behavioural {
                 )
             },
         )
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        let (evaluation, columns) = self.bound_taylor(context)?;
+        let factor = self.checked_factor(context.model.temperature)?;
+        let p = context.unknowns.node_row(self.terminals[0]);
+        let n = context.unknowns.node_row(self.terminals[1]);
+        let outputs = match self.output {
+            BehaviouralOutput::Voltage => {
+                let k = Some(
+                    context
+                        .branch
+                        .ok_or_else(|| SpiceError::circuit("missing Taylor voltage branch"))?,
+                );
+                context.linear_static(p, k, 1.)?;
+                context.linear_static(n, k, -1.)?;
+                context.linear_static(k, p, 1.)?;
+                context.linear_static(k, n, -1.)?;
+                [(k, -1.), (None, 0.)]
+            }
+            BehaviouralOutput::Current => [(p, 1.), (n, -1.)],
+        };
+        for (row, sign) in outputs {
+            context.static_value(row, &evaluation.value, sign * factor)?;
+            for (&column, gradient) in columns.iter().zip(&evaluation.gradient) {
+                context.static_gradient(row, column, gradient, sign * factor)?;
+            }
+        }
+        Ok(())
     }
 
     // The retained physical output is an algebraic observation, not a charge.

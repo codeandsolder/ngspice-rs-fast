@@ -65,6 +65,7 @@ struct Basis {
     pivots: Vec<Pivot>,
     by_column: Vec<Option<usize>>,
     required_prefix: usize,
+    remaining_work: usize,
 }
 
 impl Basis {
@@ -73,15 +74,25 @@ impl Basis {
             pivots: Vec::new(),
             by_column: vec![None; columns],
             required_prefix,
+            remaining_work: 67_108_864,
         }
     }
 
+    fn charge(&mut self, work: usize) -> SpiceResult<()> {
+        self.remaining_work = self.remaining_work.checked_sub(work).ok_or_else(|| {
+            failure("instantaneous rank reduction exceeded its elimination work limit")
+        })?;
+        Ok(())
+    }
+
     fn insert(&mut self, mut terms: Row, mut rhs: Real) -> SpiceResult<bool> {
+        self.charge(terms.len())?;
         let mut pending: BTreeSet<_> = terms
             .keys()
             .filter_map(|&column| self.by_column[column])
             .collect();
         while let Some(index) = pending.pop_first() {
+            self.charge(self.pivots[index].terms.len().saturating_add(1))?;
             let pivot = &self.pivots[index];
             let Some(factor) = terms.remove(&pivot.column) else {
                 continue;
@@ -193,6 +204,45 @@ pub(super) fn complete(
     optional_rows: &[usize],
     required_prefix: usize,
 ) -> SpiceResult<Completed> {
+    let reduction = reduce(
+        matrix,
+        rhs,
+        gauges,
+        late_rows,
+        optional_rows,
+        required_prefix,
+    )?;
+    Ok(Completed {
+        values: reduction.basis.solution(&reduction.column_exponents)?,
+        independent: reduction.independent,
+    })
+}
+
+/// The number of independent constraints on the initial-coordinate prefix
+/// after projecting away all higher derivative coefficients.
+pub(super) fn projected_rank(matrix: &SparseMatrix, required_prefix: usize) -> SpiceResult<usize> {
+    let rhs = crate::primitives::filled_vec(matrix.rows(), 0., "derivative array rank")?;
+    let reduction = reduce(matrix, &rhs, &[], &[], &[], required_prefix)?;
+    Ok(reduction.basis.by_column[..required_prefix]
+        .iter()
+        .filter(|p| p.is_some())
+        .count())
+}
+
+struct Reduction {
+    basis: Basis,
+    column_exponents: Vec<i32>,
+    independent: Vec<bool>,
+}
+
+fn reduce(
+    matrix: &SparseMatrix,
+    rhs: &[Real],
+    gauges: &[usize],
+    late_rows: &[usize],
+    optional_rows: &[usize],
+    required_prefix: usize,
+) -> SpiceResult<Reduction> {
     if required_prefix > matrix.cols()
         || rhs.len() != matrix.rows()
         || late_rows
@@ -274,8 +324,9 @@ pub(super) fn complete(
         }
         basis.insert(Row::from([(column, Coefficient::exact(1.))]), 0.)?;
     }
-    Ok(Completed {
-        values: basis.solution(&column_exponents)?,
+    Ok(Reduction {
+        basis,
+        column_exponents,
         independent,
     })
 }
