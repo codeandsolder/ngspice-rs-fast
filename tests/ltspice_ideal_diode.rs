@@ -238,3 +238,64 @@ fn transient_has_exact_memoryless_current_through_both_knees() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn independent_c_common_regions_dc_sweep() -> Result<()> {
+    let deck = parse(&format!(
+        "common regions\nV1 a 0 0\nD1 a 0 dm\n.model dm ltspice_ideal_diode({BASE})\n.end\n"
+    ))?;
+    let context = AnalysisContext {
+        gmin: 1e-12,
+        ..AnalysisContext::default()
+    };
+    let mut circuit = Circuit::from_netlist_with_context(&deck, &context.model_context())?;
+    let plots = AnalysisInput::with_arguments(AnalysisKind::DcSweep, ["v1", "-4", "4", "0.1"])
+        .resolve()?
+        .run_plots(&mut circuit, &context)?;
+    let plot = &plots[0];
+    let witness = include_str!("fixtures/ltspice_ideal_diode/common.tsv");
+    assert_eq!(plot.point_count(), witness.lines().count());
+    for (row, line) in witness.lines().enumerate() {
+        let (voltage, current) = line.split_once('\t').ok_or("malformed witness")?;
+        close(
+            plot.value("v(a)", row).ok_or("voltage")?.re,
+            voltage.parse()?,
+            1e-12,
+            1e-10,
+        );
+        close(
+            -plot.value("i(v1)", row).ok_or("current")?.re,
+            current.parse()?,
+            1e-12,
+            1e-10,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn current_driven_limited_branches() -> Result<()> {
+    for (current, expected) in [
+        (0.2, 1. + 0.5 * (0.19_f64 / 0.25).atanh()),
+        (-0.25, -2. - 0.9 * (0.23_f64 / 0.3).atanh()),
+    ] {
+        let deck = parse(&format!(
+            "current drive\nI1 0 a {current}\nD1 a 0 dm\n.model dm ltspice_ideal_diode({BASE} ilimit=0.25 revilimit=0.3)\n.end\n"
+        ))?;
+        let context = AnalysisContext {
+            gmin: 1e-12,
+            ..AnalysisContext::default()
+        };
+        let mut circuit = Circuit::from_netlist_with_context(&deck, &context.model_context())?;
+        let plots = AnalysisInput::new(AnalysisKind::OperatingPoint)
+            .resolve()?
+            .run_plots(&mut circuit, &context)?;
+        close(
+            plots[0].value("v(a)", 0).ok_or("voltage")?.re,
+            expected,
+            1e-8,
+            1e-7,
+        );
+    }
+    Ok(())
+}

@@ -9,7 +9,9 @@ use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
 use crate::primitives::{NodeAppend, NodeId, Real, SourceLoc, SpiceError, SpiceResult};
 
 use super::{
-    Device, ModelContext, ResolvedModel, StampContext, linear::LinearContext,
+    Device, ModelContext, ResolvedModel, StampContext,
+    limiting::{Linearization, previous_finite},
+    linear::LinearContext,
     schema::finite_literal,
 };
 use law::{Branch, Point};
@@ -141,6 +143,19 @@ struct Prepared {
 }
 
 impl Prepared {
+    fn has_limit(self) -> bool {
+        self.forward.has_limit() || self.reverse.is_some_and(Branch::has_limit)
+    }
+
+    fn limit_trial(self, raw: Real, previous: Real) -> Real {
+        if raw >= 0. {
+            self.forward.limit_trial(raw, previous)
+        } else {
+            self.reverse
+                .map_or(raw, |reverse| -reverse.limit_trial(-raw, -previous))
+        }
+    }
+
     fn point(self, voltage: Real) -> Point {
         if voltage >= 0. {
             self.forward.point(voltage)
@@ -290,9 +305,30 @@ impl Device for IdealDiode {
     fn validate_dc_inputs(&self, context: &ModelContext) -> SpiceResult<()> {
         self.prepared_at(context).map(|_| ())
     }
+    fn state_count(&self) -> usize {
+        usize::from(self.prepared.has_limit())
+    }
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let [a, c] = self.terminals;
-        let voltage = context.node_voltage(a) - context.node_voltage(c);
+        let raw = context.node_voltage(a) - context.node_voltage(c);
+        let mut voltage = raw;
+        if self.prepared.has_limit() {
+            let states = &mut context.states;
+            match Linearization::classify(states) {
+                Linearization::Initial | Linearization::Limited => {
+                    let previous = previous_finite(states, 0).unwrap_or(0.);
+                    let local = self
+                        .prepared
+                        .limit_trial(raw / self.instance.series, previous / self.instance.series);
+                    if local.to_bits() != (raw / self.instance.series).to_bits() {
+                        voltage = local * self.instance.series;
+                        states.report_nonconvergence()?;
+                    }
+                }
+                _ => {}
+            }
+            states.set(0, voltage)?;
+        }
         let point = self.point(voltage, &context.model_context())?;
         super::rlc::stamp_conductance(self.terminals, point.conductance, context)?;
         let rhs = point.conductance.mul_add(voltage, -point.current);
@@ -355,9 +391,9 @@ impl Device for IdealDiode {
         let point = self.point(bias, context)?;
         Ok(match keyword {
             "vd" | "vj" => Some(bias),
-            "id" | "i" => Some(point.current),
+            "id" | "i" | "cd" => Some(point.current),
             "gd" | "g" => Some(point.conductance),
-            "cd" | "cap" | "charge" => Some(0.),
+            "cap" | "charge" => Some(0.),
             "p" | "power" => Some(bias * point.current),
             _ => None,
         })

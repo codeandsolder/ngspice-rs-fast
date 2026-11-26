@@ -130,6 +130,31 @@ impl Branch {
         }
     }
 
+    pub(super) const fn has_limit(self) -> bool {
+        self.limited.is_some()
+    }
+
+    /// Keep an increasing Newton trial from jumping directly into a
+    /// numerically flat current-limit tail. The physical law is unchanged.
+    pub(super) fn limit_trial(self, raw: Real, previous: Real) -> Real {
+        let Some(limit) = self.limited else {
+            return raw;
+        };
+        let join = self.threshold + self.width;
+        let reference = previous.max(join);
+        if raw <= reference {
+            return raw;
+        }
+        let normalized = ratio_product(reference - join, self.on, limit.maximum);
+        if normalized.tanh() >= 1. {
+            // Already on the rounded asymptote: allow an imposed voltage
+            // to advance without taking arbitrarily many tiny steps.
+            return raw;
+        }
+        let next = reference + limit.maximum / self.on;
+        if next > reference { raw.min(next) } else { raw }
+    }
+
     fn limited_point(self, excess: Real, limit: Limited) -> Point {
         let z = ratio_product(excess, self.on, limit.maximum);
         let t = z.tanh();
