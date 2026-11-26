@@ -17,6 +17,7 @@
 //! boundary has a defined left and right limit instead of a single sampled value.
 
 use crate::devices::{Limit, WaveformEvent, WaveformEventKind};
+use crate::maths::taylor::Taylor;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// The largest cycle index whose start time is still resolvable in `f64`.
@@ -369,6 +370,55 @@ impl Pulse {
         } else {
             v2 + (v1 - v2) * (time - (tr + pw)) / tf
         })
+    }
+
+    /// Outgoing analytic segment, including exact cut/period boundaries.
+    pub(super) fn right_taylor(&self, t: Real, scale: Real, order: usize) -> SpiceResult<Taylor> {
+        let mut local = t - self.delay;
+        if !local.is_finite() {
+            return Err(invalid("nonfinite right-limit time"));
+        }
+        let constant = |value| Taylor::constant(value, order);
+        if local < 0. || self.stop.is_some_and(|stop| local >= stop) {
+            return Ok(constant(self.initial));
+        }
+        if local >= self.period {
+            let cycle = cycle_position(local, self.period);
+            if !cycle.resolvable() {
+                return Err(invalid("unrepresentable right-limit cycle"));
+            }
+            local = cycle.phase;
+        }
+        let plateau_end = self.rise + self.width;
+        if local < self.rise {
+            let base = super::functions::affine_value(self.initial, self.pulsed, local / self.rise);
+            super::functions::affine_taylor(
+                base,
+                self.initial,
+                self.pulsed,
+                self.rise,
+                scale,
+                order,
+            )
+        } else if local < plateau_end {
+            Ok(constant(self.pulsed))
+        } else if local < plateau_end + self.fall {
+            let base = super::functions::affine_value(
+                self.pulsed,
+                self.initial,
+                (local - plateau_end) / self.fall,
+            );
+            super::functions::affine_taylor(
+                base,
+                self.pulsed,
+                self.initial,
+                self.fall,
+                scale,
+                order,
+            )
+        } else {
+            Ok(constant(self.initial))
+        }
     }
 
     /// Lazily enumerates the corner and jump times in the closed window

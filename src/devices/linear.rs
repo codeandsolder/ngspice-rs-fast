@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::devices::MnaUnknowns;
 use crate::devices::functions::{FunctionSpec, PwlSource, SourceFunction};
 use crate::devices::pulse::{Pulse, PulseSpec, TransientTiming};
+use crate::maths::taylor::Taylor;
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
 
@@ -205,6 +206,44 @@ impl Waveform {
                 ));
             }
         })
+    }
+
+    /// Analytic time coefficients on the open right-hand interval.
+    /// Native sampled-value policies at isolated repeated knots are not
+    /// extrapolated into that interval.
+    pub(crate) fn right_taylor(
+        &self,
+        time: Real,
+        scale: Real,
+        order: usize,
+    ) -> SpiceResult<Taylor> {
+        if !time.is_finite() || !scale.is_finite() || scale <= 0. {
+            return Err(SpiceError::circuit(
+                "invalid waveform right-limit scale or time",
+            ));
+        }
+        match self {
+            Self::Constant(_) | Self::Step { .. } => {
+                Ok(Taylor::constant(self.value_at(time, Limit::Right)?, order))
+            }
+            Self::Pwl(pwl) => pwl.right_taylor(time, scale, order),
+            Self::Pulse(pulse) => pulse.right_taylor(time, scale, order),
+            Self::Function(function) => function.right_taylor(time, scale, order),
+            Self::Stochastic(process) => process.right_taylor(time, scale, order),
+            Self::PortSeries { baseline, tones } => {
+                let mut series = baseline.right_taylor(time, scale, order)?;
+                for &(amplitude, omega) in tones {
+                    let angle = Taylor::affine(omega * time, omega * scale, order);
+                    let (_, cosine) =
+                        angle.trig_pair(angle.base().sin(), angle.base().cos(), false)?;
+                    series = series.add(&cosine.scale(amplitude)?)?;
+                }
+                Ok(series)
+            }
+            Self::PulseDefaults(_) | Self::FunctionDefaults(_) => Err(SpiceError::circuit(
+                "bind source timing before right-limit differentiation",
+            )),
+        }
     }
 
     /// Like [`Self::value_at`], but resolves a [`Waveform::PulseDefaults`]

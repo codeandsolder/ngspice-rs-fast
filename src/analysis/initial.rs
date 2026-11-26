@@ -52,6 +52,7 @@ use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 use crate::analysis::{AnalysisPlan, NodeCondition};
 
 mod constraints;
+mod derivative_array;
 mod system;
 use constraints::{AbsoluteRow, ConstraintGraph, Join, Origin, VoltageVertex};
 use system::{InstantaneousSolution, InstantaneousSystem};

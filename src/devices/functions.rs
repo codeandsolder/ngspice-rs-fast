@@ -52,6 +52,7 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use crate::devices::{Limit, TransientTiming};
+use crate::maths::taylor::Taylor;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 use super::pulse::{MAX_CYCLE, cycle_position, seek_cycle};
@@ -424,6 +425,26 @@ pub(super) fn affine_value(first: Real, second: Real, fraction: Real) -> Real {
     }
 }
 
+/// Form the outgoing affine law without subtracting two rounded waveform
+/// samples. Scale the slope before publication to the normalized time basis.
+pub(super) fn affine_taylor(
+    base: Real,
+    first: Real,
+    last: Real,
+    span: Real,
+    scale: Real,
+    order: usize,
+) -> SpiceResult<Taylor> {
+    let difference = last - first;
+    let fraction = scale / span;
+    let slope = if difference.is_finite() {
+        difference * fraction
+    } else {
+        first.mul_add(-fraction, last * fraction)
+    };
+    Taylor::affine(base, slope, order).with_base(base)
+}
+
 /// Reduce the exact binary64 degree input by its integer period before
 /// converting. This preserves the physical phase even when conversion of
 /// unreduced degrees would overflow or lose many radians. For the ordinary
@@ -653,6 +674,76 @@ impl SourceFunction {
         finite(kind, value)
     }
 
+    /// Analytic right-hand time coefficients; the scale is independent of
+    /// the transient integration step and the held interval ends exactly.
+    pub(super) fn right_taylor(&self, t: Real, scale: Real, order: usize) -> SpiceResult<Taylor> {
+        let constant = |v| Taylor::constant(v, order);
+        let oscillation = |frequency: Real, elapsed: Real, phase: Real| {
+            Taylor::affine(
+                modulation_angle(frequency, elapsed, phase_radians(phase)),
+                std::f64::consts::TAU * frequency * scale,
+                order,
+            )
+        };
+        let sine = |arg: &Taylor| {
+            arg.trig_pair(arg.base().sin(), arg.base().cos(), false)
+                .map(|(s, _)| s)
+        };
+        let decay = |rate: Real, elapsed: Real| {
+            let arg = Taylor::affine(rate * elapsed, rate * scale, order);
+            arg.exp(arg.base().exp())
+        };
+        let series = match *self {
+            Self::Sine(s) if t >= s.delay => {
+                let elapsed = t - s.delay;
+                let angle = oscillation(s.frequency, elapsed, s.phase);
+                sine(&angle)?
+                    .mul(&decay(-s.damping, elapsed)?)?
+                    .scale(s.amplitude)?
+                    .add(&constant(s.offset))?
+            }
+            Self::Exp(e) if t >= e.rise_delay => {
+                let rise = decay(-e.rise_tau.recip(), t - e.rise_delay)?;
+                let weight = if t < e.fall_delay {
+                    constant(1.).sub(&rise)?
+                } else {
+                    decay(-e.fall_tau.recip(), t - e.fall_delay)?.sub(&rise)?
+                };
+                weight
+                    .scale(e.pulsed - e.initial)?
+                    .add(&constant(e.initial))?
+            }
+            Self::Sffm(f) if t >= f.delay => {
+                let elapsed = t - f.delay;
+                let carrier = oscillation(f.carrier, elapsed, f.carrier_phase);
+                let signal = sine(&oscillation(f.signal, elapsed, f.signal_phase))?;
+                sine(&carrier.add(&signal.scale(f.index)?)?)?
+                    .scale(f.amplitude)?
+                    .add(&constant(f.offset))?
+            }
+            Self::Am(a) if t >= a.delay => {
+                let elapsed = t - a.delay;
+                let carrier = sine(&oscillation(a.carrier_frequency, elapsed, a.carrier_phase))?;
+                let modulator = sine(&oscillation(
+                    a.modulation_frequency,
+                    elapsed,
+                    a.modulation_phase,
+                ))?;
+                carrier
+                    .mul(
+                        &modulator
+                            .scale(a.modulation_amplitude)?
+                            .add(&constant(a.carrier_amplitude))?,
+                    )?
+                    .add(&constant(a.offset))?
+            }
+            _ => constant(self.value_at(t, Limit::Right)?),
+        };
+        // Keep the established scalar evaluation (including its stable
+        // exponential cancellation and source phase rounding) at order zero.
+        series.with_base(self.value_at(t, Limit::Right)?)
+    }
+
     /// The corners the port lands on, ascending and unique: SIN/SFFM/AM
     /// delay, EXP `TD1` and `TD2`. See the module notes on C parity.
     #[must_use = "the returned times locate waveform transitions that the timestep scheduler must account for"]
@@ -874,6 +965,36 @@ impl PwlSource {
             }
         }
         Ok(self.interpolate(time))
+    }
+
+    /// Exact affine right-hand law, selecting the outgoing segment rather
+    /// than the native single-valued sample at a repeating boundary.
+    pub(super) fn right_taylor(&self, t: Real, scale: Real, order: usize) -> SpiceResult<Taylor> {
+        let mut local = t - self.delay();
+        if !local.is_finite() {
+            return Err(invalid("PWL", "nonfinite right-limit time"));
+        }
+        let (first, last) = (self.knots[0], self.knots[self.knots.len() - 1]);
+        if local < first.0 {
+            return Ok(Taylor::constant(first.1, order));
+        }
+        if local >= last.0 {
+            let Some(index) = self.repeat() else {
+                return Ok(Taylor::constant(last.1, order));
+            };
+            let start = self.knots[index].0;
+            let cycle = cycle_position(local - start, last.0 - start);
+            if !cycle.resolvable() {
+                return Err(invalid("PWL", "unrepresentable right-limit cycle"));
+            }
+            local = cycle.phase + start;
+        }
+        let upper = self.knots.partition_point(|&(time, _)| time <= local);
+        let Some(&(t1, v1)) = self.knots.get(upper) else {
+            return Err(invalid("PWL", "unrepresentable outgoing segment"));
+        };
+        let (t0, v0) = self.knots[upper - 1];
+        affine_taylor(self.interpolate(local), v0, v1, t1 - t0, scale, order)
     }
 
     /// Lazily enumerates the delayed knot times in `[t0, t1]`, continuing

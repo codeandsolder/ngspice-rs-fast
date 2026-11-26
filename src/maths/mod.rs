@@ -31,6 +31,7 @@ pub use linear::{
 pub mod pencil;
 pub mod sparse;
 pub(crate) mod sparse13;
+pub(crate) mod taylor;
 mod telemetry;
 pub use telemetry::{FactorStorage, FactorWork, PatternTelemetry, PatternWork};
 

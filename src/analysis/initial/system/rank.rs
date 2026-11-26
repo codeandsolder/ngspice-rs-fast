@@ -64,22 +64,35 @@ struct Pivot {
 struct Basis {
     pivots: Vec<Pivot>,
     by_column: Vec<Option<usize>>,
+    work_left: Option<usize>,
 }
 
 impl Basis {
-    fn new(columns: usize) -> Self {
+    fn new(columns: usize, work_left: Option<usize>) -> Self {
         Self {
             pivots: Vec::new(),
             by_column: vec![None; columns],
+            work_left,
         }
     }
 
-    fn insert(&mut self, mut terms: Row, mut rhs: Real) -> SpiceResult<bool> {
+    fn spend(&mut self, work: usize) -> SpiceResult<()> {
+        if let Some(left) = &mut self.work_left {
+            *left = left
+                .checked_sub(work)
+                .ok_or_else(|| failure("right-limit derivative rank work limit exceeded"))?;
+        }
+        Ok(())
+    }
+
+    fn reduce(&mut self, mut terms: Row, mut rhs: Real) -> SpiceResult<(Row, Real)> {
+        self.spend(terms.len())?;
         let mut pending: BTreeSet<_> = terms
             .keys()
             .filter_map(|&column| self.by_column[column])
             .collect();
         while let Some(index) = pending.pop_first() {
+            self.spend(self.pivots[index].terms.len().saturating_add(1))?;
             let pivot = &self.pivots[index];
             let Some(factor) = terms.remove(&pivot.column) else {
                 continue;
@@ -103,6 +116,16 @@ impl Basis {
                 "nonfinite rank reduction of instantaneous constraints",
             ));
         }
+        Ok((terms, rhs))
+    }
+
+    fn determines(&mut self, column: usize) -> SpiceResult<bool> {
+        let (terms, _) = self.reduce(Row::from([(column, Coefficient::exact(1.))]), 0.)?;
+        Ok(terms.values().all(|coefficient| !coefficient.significant()))
+    }
+
+    fn insert(&mut self, terms: Row, rhs: Real) -> SpiceResult<bool> {
+        let (mut terms, mut rhs) = self.reduce(terms, rhs)?;
         let Some((&column, &pivot)) = terms
             .iter()
             .filter(|(_, coefficient)| coefficient.significant())
@@ -152,7 +175,7 @@ impl Basis {
 /// Result of rank selection. Independent original rows are identified
 /// separately from synthetic gauge rows so optional initial expressions
 /// can be checked against the actual selected physical state.
-pub(super) struct Completed {
+pub(in crate::analysis::initial) struct Completed {
     pub values: Vector,
     pub independent: Vec<bool>,
 }
@@ -169,12 +192,49 @@ pub(super) fn complete(
     late_rows: &[usize],
     optional_rows: &[usize],
 ) -> SpiceResult<Completed> {
+    complete_with_projection(matrix, rhs, gauges, late_rows, optional_rows, None)?
+        .ok_or_else(|| failure("unexpected incomplete instantaneous rank"))
+}
+
+/// A derivative array may leave its highest Taylor coefficients free.
+/// Return no solution until all requested low-order coordinates are fixed
+/// by the original rows and declared physical gauges. Completing the
+/// remaining coefficients cannot change any of those coordinates.
+pub(in crate::analysis::initial) fn complete_projected(
+    matrix: &SparseMatrix,
+    rhs: &[Real],
+    gauges: &[usize],
+    late_rows: &[usize],
+    optional_rows: &[usize],
+    required: &[usize],
+    work_limit: usize,
+) -> SpiceResult<Option<Completed>> {
+    complete_with_projection(
+        matrix,
+        rhs,
+        gauges,
+        late_rows,
+        optional_rows,
+        Some((required, work_limit)),
+    )
+}
+
+fn complete_with_projection(
+    matrix: &SparseMatrix,
+    rhs: &[Real],
+    gauges: &[usize],
+    late_rows: &[usize],
+    optional_rows: &[usize],
+    projection: Option<(&[usize], usize)>,
+) -> SpiceResult<Option<Completed>> {
     if rhs.len() != matrix.rows()
         || late_rows
             .iter()
             .chain(optional_rows)
             .any(|&row| row >= matrix.rows())
         || gauges.iter().any(|&column| column >= matrix.cols())
+        || projection
+            .is_some_and(|(required, _)| required.iter().any(|&column| column >= matrix.cols()))
         || rhs.iter().any(|value| !value.is_finite())
         || matrix
             .triplets()
@@ -202,7 +262,7 @@ pub(super) fn complete(
             *exponent = 0;
         }
     }
-    let mut basis = Basis::new(matrix.cols());
+    let mut basis = Basis::new(matrix.cols(), projection.map(|(_, work)| work));
     let entries = matrix.triplets();
     let mut ranges = Vec::with_capacity(matrix.rows());
     let mut cursor = 0;
@@ -249,10 +309,30 @@ pub(super) fn complete(
         }
         basis.insert(Row::from([(column, Coefficient::exact(1.))]), 0.)?;
     }
-    Ok(Completed {
+    if let Some((required, _)) = projection {
+        if basis.pivots.len() < matrix.cols() {
+            for &column in required {
+                if !basis.determines(column)? {
+                    return Ok(None);
+                }
+            }
+        }
+        // Prefer gauges at the highest derivative order; these are only
+        // numerical completions of a solution whose required projection
+        // has already been proven invariant.
+        for column in (0..matrix.cols()).rev() {
+            if basis.pivots.len() == matrix.cols() {
+                break;
+            }
+            if basis.by_column[column].is_none() {
+                basis.insert(Row::from([(column, Coefficient::exact(1.))]), 0.)?;
+            }
+        }
+    }
+    Ok(Some(Completed {
         values: basis.solution(&column_exponents)?,
         independent,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -324,7 +404,7 @@ mod priority_tests {
     fn unrelated_elimination_rounding_does_not_hide_a_small_pivot() {
         // First pivot mixes column 0 and 1, but the independent column 2
         // is never touched by it. A scalar row error can lose that column.
-        let mut basis = Basis::new(3);
+        let mut basis = Basis::new(3, None);
         assert!(
             basis
                 .insert(

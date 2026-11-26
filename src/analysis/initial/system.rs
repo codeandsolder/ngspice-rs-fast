@@ -1,5 +1,5 @@
 //! Ordered elimination of fixed storage coordinates and compact instantaneous MNA.
-mod rank;
+pub(super) mod rank;
 use super::constraints::{AbsoluteRow, VoltageVertex};
 use super::{CapacitorInitial, ImpulseStorage, Tolerances, failure};
 use crate::devices::{Circuit, InitialStoragePolicy};

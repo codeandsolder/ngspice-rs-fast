@@ -24,6 +24,20 @@ pub struct XspicePwl {
     midpoints: Vec<Real>,
 }
 
+#[derive(Clone, Copy)]
+enum Region {
+    Segment {
+        lower: usize,
+        at: usize,
+    },
+    Corner {
+        index: usize,
+        domain: Real,
+        lower_slope: Real,
+        upper_slope: Real,
+    },
+}
+
 impl XspicePwl {
     /// Builds the map from `(x, y)` points and the smoothing `fraction`.
     ///
@@ -73,23 +87,96 @@ impl XspicePwl {
     /// The output and its derivative with respect to the input.
     #[must_use = "the returned pair supplies the transfer value and its exact input derivative"]
     pub fn evaluate(&self, input: Real) -> (Real, Real) {
-        let size = self.x.len();
-        // Preserve the reference's priority for the two end tests, even
-        // when mirroring or adding extreme finite abscissas overflows.
-        if input <= self.midpoints[0] {
-            return self.segment(input, 0, 0);
-        }
-        if input >= self.midpoints[size - 2] {
-            return self.segment(input, size - 2, size - 1);
-        }
+        self.evaluate_region(input, self.region(input, 0.))
+    }
 
-        // All interior midpoints are nondecreasing: the source abscissas
-        // are finite and strictly increasing. Skip exactly the same
-        // midpoints as C's left-to-right scan, including ties. The end
-        // midpoints are excluded from the search because the mirrored
-        // abscissas may overflow.
-        let i = 1 + self.midpoints[1..size - 2].partition_point(|&midpoint| input >= midpoint);
-        self.corner(input, i)
+    #[expect(
+        clippy::float_cmp,
+        reason = "the analytic side is selected only at an exact boundary"
+    )]
+    fn region(&self, input: Real, direction: Real) -> Region {
+        let size = self.x.len();
+        let less = |boundary| input < boundary || (input == boundary && direction < 0.);
+        let greater = |boundary| input > boundary || (input == boundary && direction > 0.);
+        // Preserve the native end-test priority and equal-midpoint choices.
+        if less(self.midpoints[0]) || (input == self.midpoints[0] && direction == 0.) {
+            return Region::Segment { lower: 0, at: 0 };
+        }
+        if greater(self.midpoints[size - 2])
+            || (input == self.midpoints[size - 2] && direction == 0.)
+        {
+            return Region::Segment {
+                lower: size - 2,
+                at: size - 1,
+            };
+        }
+        let i = 1 + self.midpoints[1..size - 2].partition_point(|&midpoint| {
+            greater(midpoint) || (input == midpoint && direction == 0.)
+        });
+        let lower = self.x[i] - self.x[i - 1];
+        let upper = self.x[i + 1] - self.x[i];
+        let domain = self.fraction * lower.min(upper);
+        if less(self.x[i] - domain) {
+            Region::Segment {
+                lower: i - 1,
+                at: i,
+            }
+        } else if less(self.x[i] + domain) {
+            Region::Corner {
+                index: i,
+                domain,
+                lower_slope: (self.y[i] - self.y[i - 1]) / lower,
+                upper_slope: (self.y[i + 1] - self.y[i]) / upper,
+            }
+        } else {
+            Region::Segment { lower: i, at: i }
+        }
+    }
+
+    fn evaluate_region(&self, input: Real, region: Region) -> (Real, Real) {
+        match region {
+            Region::Segment { lower, at } => self.segment(input, lower, at),
+            Region::Corner {
+                index,
+                domain,
+                lower_slope,
+                upper_slope,
+            } => smooth_corner(
+                input,
+                self.x[index],
+                self.y[index],
+                domain,
+                lower_slope,
+                upper_slope,
+            ),
+        }
+    }
+
+    pub(super) fn right_taylor(
+        &self,
+        input: &crate::maths::taylor::Taylor,
+    ) -> SpiceResult<(crate::maths::taylor::Taylor, crate::maths::taylor::Taylor)> {
+        use crate::maths::taylor::Taylor;
+        let region = self.region(input.base(), input.direction());
+        let (value, slope) = self.evaluate_region(input.base(), region);
+        let curvature = match region {
+            Region::Segment { .. } => 0.,
+            Region::Corner {
+                domain,
+                lower_slope,
+                upper_slope,
+                ..
+            } => (upper_slope - lower_slope) / (2. * domain),
+        };
+        let delta = input.clone().with_base(0.)?;
+        let output = delta
+            .scale(slope)?
+            .add(&delta.mul(&delta)?.scale(curvature * 0.5)?)?
+            .with_base(value)?;
+        let slope = delta
+            .scale(curvature)?
+            .add(&Taylor::constant(slope, input.order()))?;
+        Ok((output, slope))
     }
 
     fn segment(&self, input: Real, lower: usize, at: usize) -> (Real, Real) {
@@ -97,22 +184,6 @@ impl XspicePwl {
         let slope = (y[lower + 1] - y[lower]) / (x[lower + 1] - x[lower]);
         let offset = (input - x[at]) * slope;
         (y[at] + offset, slope)
-    }
-
-    fn corner(&self, input: Real, i: usize) -> (Real, Real) {
-        let (x, y) = (&self.x, &self.y);
-        let lower = x[i] - x[i - 1];
-        let upper = x[i + 1] - x[i];
-        let domain = self.fraction * lower.min(upper);
-        if input < x[i] - domain {
-            return self.segment(input, i - 1, i);
-        }
-        if input < x[i] + domain {
-            let lower_slope = (y[i] - y[i - 1]) / lower;
-            let upper_slope = (y[i + 1] - y[i]) / upper;
-            return smooth_corner(input, x[i], y[i], domain, lower_slope, upper_slope);
-        }
-        self.segment(input, i, i)
     }
 }
 

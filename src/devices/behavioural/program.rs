@@ -372,6 +372,34 @@ impl Program {
         })
     }
 
+    /// Evaluate the compiled value and Jacobian along a local analytic
+    /// trajectory. The original plan, including lazy branch selection and
+    /// source-specific numerical kernels, remains authoritative.
+    pub(super) fn right_taylor(
+        &self,
+        values: &[crate::maths::taylor::Taylor],
+        time: &crate::maths::taylor::Taylor,
+        environment: &Environment<'_>,
+        budget: &mut usize,
+    ) -> SpiceResult<(
+        crate::maths::taylor::Taylor,
+        Vec<crate::maths::taylor::Taylor>,
+    )> {
+        if values.len() != self.quantities.len() {
+            return Err(SpiceError::circuit(
+                "right-limit expression binding dimension mismatch",
+            ));
+        }
+        self.plan.right_taylor(
+            self.root,
+            &self.derivatives,
+            values,
+            time,
+            environment,
+            budget,
+        )
+    }
+
     pub(super) fn evaluate_with_workspace<'w>(
         &self,
         environment: &Environment<'_>,
@@ -733,6 +761,28 @@ impl PwlTable {
         while upper - lower > 1 {
             let middle = usize::midpoint(lower, upper);
             if order.is_upper(self.points[middle].0, arg) {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        [self.points[lower], self.points[upper]]
+    }
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "only an exact abscissa tie selects a one-sided segment"
+    )]
+    fn right_segment(&self, arg: Real, direction: Real) -> [(Real, Real); 2] {
+        let (mut lower, mut upper) = (0, self.points.len() - 1);
+        while upper - lower > 1 {
+            let middle = usize::midpoint(lower, upper);
+            let x = self.points[middle].0;
+            let incoming = match self.order {
+                PwlOrder::Ascending => direction < 0.,
+                PwlOrder::Descending => direction > 0.,
+            };
+            if self.order.is_upper(x, arg) || (x == arg && incoming) {
                 upper = middle;
             } else {
                 lower = middle;

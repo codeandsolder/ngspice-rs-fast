@@ -12,6 +12,7 @@ use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::{collections::HashMap, sync::Arc};
 
 mod derivative;
+mod taylor;
 #[cfg(test)]
 use super::Evaluation;
 
