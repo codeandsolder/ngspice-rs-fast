@@ -449,3 +449,58 @@ L1 e 0 2m IC=9
         (previous_time, previous_a, previous_b) = (time, a, b);
     }
 }
+
+#[test]
+fn one_prepared_circuit_switches_enclosing_jobs_without_stale_bias() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multi.net");
+    fs::write(
+        &path,
+        r"* analysis lifetime
+.options INITCONDMODE=2 ICRES=2
+V1 supply 0 DC 10 AC 1
+R1 supply p 10
+C1 p 0 1m IC={IF(ANALYSIS=2,3,5)} BRANCH={IF(ANALYSIS=2,1,0)}
+.op
+.ac lin 1 10 10
+.tran 1u 5u 0 100n
+.tran 1u 5u 0 100n UIC
+.dc V1 10 11 1
+.end
+",
+    )
+    .unwrap();
+    let (netlist, requests) = prepared(&path).unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let plans = requests
+        .into_iter()
+        .map(|input| config.plan(input).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(plans.len(), 5);
+    let mut run = |index: usize| plans[index].run(&mut circuit, &config.context()).unwrap();
+    let op = run(0);
+    let v = op.value("v(p)", 0).unwrap().re;
+    assert!((v - 35. / 6.).abs() < 1e-10);
+    let ac = run(1);
+    let h = ac.value("v(p)", 0).unwrap();
+    let omega_rc = std::f64::consts::TAU * 10. * 0.01;
+    let expected = (1. + omega_rc * omega_rc).sqrt().recip();
+    assert!((h.re.hypot(h.im) - expected).abs() < 1e-10);
+    let ordinary = run(2);
+    assert!((ordinary.value("v(p)", 0).unwrap().re - 3.).abs() < 1e-10);
+    let uic = run(3);
+    for plot in [&ordinary, &uic] {
+        for point in 0..plot.point_count() {
+            let time = plot.value("time", point).unwrap().re;
+            let expected = 10. - 7. * (-time / 0.01).exp();
+            assert!((plot.value("v(p)", point).unwrap().re - expected).abs() < 3e-6);
+        }
+    }
+    let dc = run(4);
+    assert_eq!(dc.point_count(), 2);
+    assert!((dc.value("v(p)", 0).unwrap().re - 10.).abs() < 1e-10);
+    assert!((dc.value("v(p)", 1).unwrap().re - 11.).abs() < 1e-10);
+    let again = run(0);
+    assert!((again.value("v(p)", 0).unwrap().re - v).abs() < 1e-10);
+}
