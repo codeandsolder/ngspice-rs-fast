@@ -32,6 +32,30 @@ duplicate quantity in the two axes) is `Unsupported` and is rejected **before
 the first sample**, as is every invalid grid or value below. Instance
 parameters are described in [Instance-parameter targets](#instance-parameter-targets-97).
 
+## Geometry-dependent model bins (#240)
+
+For a MOS instance referencing a model-bin family, sweeps of written length,
+width, finger count or width-normalization flag use the indexed lexical model
+resolver at each geometry. Scale is applied by the ordinary factory, once;
+multiplicity remains an instance property rather than a bin-selection input.
+This deliberately corrects C's stale initial-bin behavior (upstream bug 890).
+Explicit references to a particular declaration retain ordinary setter semantics.
+
+The original expanded deck and its device/state bindings are not modified.
+Compatible changes replace only the affected prepared devices after checking the
+selected declaration, terminals, state layout and exact matrix elements. A bin
+or layout change builds and validates a fresh candidate and binds both sweep
+axes and observations to its topology. Warm-start history is reset at a
+rebuild. Before emitting the header, the driver validates candidate geometries
+and physical contexts. The plot is a deterministic union of column identities
+in first-appearance order; a structural internal node absent from a sample has
+a NaN value, not a fictitious zero voltage.
+
+The regression compares every sample to a separately elaborated operating
+point and independent ngspice 47 current references, including overlapping
+bins, scaled dimensions, nested temperature, a bin with internal series
+resistance nodes and restoration after success or an unmatched geometry.
+
 ## What C sweeps (#97)
 
 Established by reading `dctrcurv.c`, `dctsetp.c`, `inp2dot.c` (`dot_dc`) and
