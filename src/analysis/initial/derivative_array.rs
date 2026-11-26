@@ -92,7 +92,7 @@ impl DerivativeArray {
         if order == 0
             || dimension == 0
             || !scale.is_finite()
-            || scale <= 0.
+            || scale == 0.
             || !valid_jet(static_part, order)
             || !valid_jet(charge, levels)
         {
@@ -143,8 +143,8 @@ impl DerivativeArray {
                 optional.push(row);
             }
             for &(column, value) in &constraint.terms {
-                if column >= dimension {
-                    return Err(failure("right-limit initial constraint outside base state"));
+                if column >= columns {
+                    return Err(failure("right-limit constraint outside derivative array"));
                 }
                 matrix.add(row, column, value)?;
             }

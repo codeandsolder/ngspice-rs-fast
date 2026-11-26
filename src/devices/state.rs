@@ -409,6 +409,7 @@ impl StateHistory {
                 mode,
                 previous: previous.map(|previous| Arc::clone(&previous.values)),
                 nonconvergent: false,
+                physical_rates: false,
                 patches: previous.map_or_default(|previous| previous.patches.clone()),
             };
         };
@@ -426,6 +427,7 @@ impl StateHistory {
         reused.mode = mode;
         reused.previous = previous.map(|previous| Arc::clone(&previous.values));
         reused.nonconvergent = false;
+        reused.physical_rates = false;
         reused.patches = previous.map_or_default(|previous| previous.patches.clone());
         reused
     }
@@ -540,6 +542,28 @@ impl StateHistory {
             .get_mut(slot)
             .ok_or_else(|| set_error(slot, value))?;
         *target = value;
+        Ok(())
+    }
+
+    /// Store quantities and exact rates from a verified differentiated
+    /// physical DAE. This changes only the disposable trial, never history.
+    pub(crate) fn set_physical_slots(
+        &self,
+        trial: &mut TrialState,
+        slots: &[(usize, Real)],
+    ) -> SpiceResult<()> {
+        self.check_trial(trial)?;
+        if slots
+            .iter()
+            .any(|&(slot, value)| slot >= self.len || !value.is_finite())
+        {
+            return Err(state_error("invalid physical history slot"));
+        }
+        let values = Arc::make_mut(&mut trial.values);
+        for &(slot, value) in slots {
+            values[slot] = value;
+        }
+        trial.physical_rates = true;
         Ok(())
     }
 
@@ -762,6 +786,7 @@ pub struct TrialState {
     mode: LoadMode,
     previous: Option<Arc<[Real]>>,
     nonconvergent: bool,
+    physical_rates: bool,
     /// `MODEINITTRAN` writes into `CKTstate1` (absolute slot, value), seen by
     /// the later loads of the same solve and applied when the trial is
     /// committed ([`DeviceState::patch_state1`]).
@@ -875,6 +900,10 @@ impl TrialState {
     #[must_use = "the nonconvergence flag determines whether the trial may be accepted"]
     pub const fn is_nonconvergent(&self) -> bool {
         self.nonconvergent
+    }
+
+    pub(super) const fn physical_rates(&self) -> bool {
+        self.physical_rates
     }
 
     /// The trial values; unset slots are NaN.

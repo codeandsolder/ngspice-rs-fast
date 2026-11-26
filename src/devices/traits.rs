@@ -202,6 +202,11 @@ pub struct InitialCoordinate {
     pub equation: usize,
     /// Value of the coordinate at the initial point.
     pub value: Real,
+    /// Local history slot storing the integrated quantity.
+    pub slot: usize,
+    /// Convert the signed physical charge residual in the evolution row
+    /// to the quantity in the device history (e.g. flux or transfer state).
+    pub history_scale: Real,
 }
 
 /// A voltage-controlled storage coordinate at UIC. Scalar capacitors
@@ -1245,6 +1250,8 @@ pub trait Device: fmt::Debug + std::any::Any {
                 coordinate: 0,
                 equation: 0,
                 value: storage.initial.unwrap_or(0.),
+                slot: 0,
+                history_scale: -1.,
             })
             .into_iter()
             .collect())

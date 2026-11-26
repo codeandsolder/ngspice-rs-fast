@@ -208,30 +208,33 @@ impl Waveform {
         })
     }
 
-    /// Analytic time coefficients on the open right-hand interval.
-    /// Native sampled-value policies at isolated repeated knots are not
-    /// extrapolated into that interval.
-    pub(crate) fn right_taylor(
+    /// Analytic time coefficients on the specified open one-sided interval.
+    /// The sign of the normalized time scale chooses the side; isolated
+    /// native repeated-knot samples are not extrapolated into that interval.
+    pub(crate) fn local_taylor(
         &self,
         time: Real,
         scale: Real,
         order: usize,
     ) -> SpiceResult<Taylor> {
-        if !time.is_finite() || !scale.is_finite() || scale <= 0. {
-            return Err(SpiceError::circuit(
-                "invalid waveform right-limit scale or time",
-            ));
+        if !time.is_finite() || !scale.is_finite() || scale == 0. {
+            return Err(SpiceError::circuit("invalid waveform Taylor scale or time"));
         }
+        let limit = if scale < 0. {
+            Limit::Left
+        } else {
+            Limit::Right
+        };
         match self {
             Self::Constant(_) | Self::Step { .. } => {
-                Ok(Taylor::constant(self.value_at(time, Limit::Right)?, order))
+                Ok(Taylor::constant(self.value_at(time, limit)?, order))
             }
-            Self::Pwl(pwl) => pwl.right_taylor(time, scale, order),
-            Self::Pulse(pulse) => pulse.right_taylor(time, scale, order),
-            Self::Function(function) => function.right_taylor(time, scale, order),
-            Self::Stochastic(process) => process.right_taylor(time, scale, order),
+            Self::Pwl(pwl) => pwl.local_taylor(time, scale, order),
+            Self::Pulse(pulse) => pulse.local_taylor(time, scale, order),
+            Self::Function(function) => function.local_taylor(time, scale, order),
+            Self::Stochastic(process) => process.local_taylor(time, scale, order),
             Self::PortSeries { baseline, tones } => {
-                let mut series = baseline.right_taylor(time, scale, order)?;
+                let mut series = baseline.local_taylor(time, scale, order)?;
                 for &(amplitude, omega) in tones {
                     let angle = Taylor::affine(omega * time, omega * scale, order);
                     let (_, cosine) =

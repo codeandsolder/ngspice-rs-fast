@@ -91,8 +91,8 @@
 //! `nicomcof.c` (default 0.5).
 
 use crate::devices::{
-    AnalysisMode, BreakTable, Circuit, Forcing, LinearSystem, LoadRequest, SourceBreaks,
-    SourceKind, TransientTiming, TrialState,
+    AnalysisMode, BreakTable, Circuit, Forcing, IterationPhase, LinearSystem, LoadRequest,
+    SourceBreaks, SourceKind, TransientTiming, TrialState,
 };
 use crate::maths::integrator::TruncationTolerances;
 use crate::maths::{Coefficients, IntegrationMethod, StepHistory, Vector};
@@ -767,6 +767,7 @@ struct Driver<'a> {
     /// acceptance and rejected smaller-step retries.
     workspace: crate::analysis::newton::CircuitNewtonWorkspace,
     mixed: Option<&'a mut super::digital::MixedSignal>,
+    right_limit: Option<initial::RightLimitPlan>,
 }
 
 /// Runs an ordinary `.tran` with the companion backend, returning the plot and
@@ -1092,6 +1093,7 @@ fn run_transient_inner(
         stats: TransientStats::default(),
         workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
         mixed,
+        right_limit: None,
     };
     driver.run(purpose, sink)
 }
@@ -1110,18 +1112,44 @@ impl Driver<'_> {
             history: &self.history,
             forcing: None,
         };
+        let mut physical = None;
+        if self.right_limit.is_some() {
+            let mut trial = self.history.trial();
+            let slots = self
+                .history
+                .accepted(1)
+                .ok_or_else(|| failure("missing consistent initial history"))?
+                .iter()
+                .copied()
+                .enumerate()
+                .collect::<Vec<_>>();
+            self.history.set_physical_slots(&mut trial, &slots)?;
+            physical = Some(trial);
+        }
         let forcing = Some((
             0.,
             Forcing {
-                limit: crate::devices::Limit::Left,
+                limit: if physical.is_some() {
+                    crate::devices::Limit::Right
+                } else {
+                    crate::devices::Limit::Left
+                },
                 timing: self.timing,
             },
         ));
         selected.map_or_else(
-            || self.prepared.observe_real(&request, &[], forcing, None),
-            |indices| {
+            || {
                 self.prepared
-                    .observe_real_selected(&request, &[], forcing, None, indices)
+                    .observe_real(&request, &[], forcing, physical.as_ref())
+            },
+            |indices| {
+                self.prepared.observe_real_selected(
+                    &request,
+                    &[],
+                    forcing,
+                    physical.as_ref(),
+                    indices,
+                )
             },
         )
     }
@@ -1636,7 +1664,7 @@ impl Driver<'_> {
         Err(failure("mixed-signal operating point did not settle"))
     }
 
-    fn initial_candidate(&self) -> SpiceResult<(Vector, TrialState)> {
+    fn initial_candidate(&mut self) -> SpiceResult<(Vector, TrialState)> {
         let mut rhs = self.system.transient_rhs(0., crate::devices::Limit::Left)?;
         if let Some(mixed) = self.mixed.as_deref() {
             mixed.initial_rhs(self.circuit, &mut rhs)?;
@@ -1765,7 +1793,7 @@ impl Driver<'_> {
     }
 
     fn right_initial_candidate(
-        &self,
+        &mut self,
         seed: Vector,
         trial: TrialState,
     ) -> SpiceResult<(Vector, TrialState)> {
@@ -1798,10 +1826,9 @@ impl Driver<'_> {
         // Reload physical values at the verified right-hand point, without
         // reapplying UIC's old voltage seeds, then publish canonical rates.
         let mut right = self.initial_state(&consistent.solution, &[], false)?;
-        for (slot, value) in consistent.canonical {
-            self.history
-                .set_right_initial_slot(&mut right, slot, value)?;
-        }
+        self.history
+            .set_physical_slots(&mut right, &consistent.canonical)?;
+        self.right_limit = Some(consistent.plan);
         Ok((consistent.solution, right))
     }
 
@@ -1851,6 +1878,41 @@ impl Driver<'_> {
         previous: &Vector,
         workspace: &mut crate::analysis::newton::CircuitNewtonWorkspace,
     ) -> SpiceResult<Trial> {
+        if let Some(plan) = &self.right_limit {
+            let tolerance = &self.settings.tolerances;
+            let (solution, canonical) = plan.step(
+                &self.prepared,
+                self.system,
+                &self.model_context,
+                previous,
+                attempt.clock.time,
+                attempt.boundary.limit(),
+                &attempt.coefficients,
+                &self.history,
+                initial::Tolerances {
+                    reltol: tolerance.reltol,
+                    vntol: tolerance.vntol,
+                    abstol: tolerance.abstol,
+                    chgtol: tolerance.chgtol,
+                },
+                self.settings.tran_max_iter,
+            )?;
+            // The differentiated DAE has already converged. Load the normal
+            // device-owned auxiliary slots without MODEINITTRAN's history
+            // patches, then publish the exact physical rates of the plan.
+            let mut state = self
+                .history
+                .trial_in(IterationPhase::Float, None)?
+                .with_device_limiting(false);
+            prepared.load(
+                &solution,
+                &mut self.circuit.new_matrix()?,
+                &mut Vector::zeros(solution.len()),
+                &mut state,
+            )?;
+            self.history.set_physical_slots(&mut state, &canonical)?;
+            return Ok(Trial::Converged { x: solution, state });
+        }
         let tolerance = &self.settings.tolerances;
         let options = crate::analysis::newton::NewtonOptions {
             max_iterations: self.settings.tran_max_iter,
@@ -1938,6 +2000,13 @@ impl Driver<'_> {
                 explicit_derivative,
             } in bases
             {
+                if self
+                    .right_limit
+                    .as_ref()
+                    .is_some_and(|plan| !plan.independent(base))
+                {
+                    continue;
+                }
                 let accepted = |age: usize, offset: usize| {
                     self.history
                         .accepted(age)
@@ -1946,7 +2015,7 @@ impl Driver<'_> {
                         .ok_or_else(|| failure("accepted state history is too short"))
                 };
                 let mut storage = [0.0; IntegrationMethod::MAX_GEAR_ORDER as usize + 2];
-                let bound = if explicit_derivative {
+                let bound = if explicit_derivative || self.right_limit.is_some() {
                     let derivative = &mut storage[..=order];
                     derivative[0] = trial.values()[base + 1];
                     for (age, value) in derivative.iter_mut().enumerate().skip(1) {

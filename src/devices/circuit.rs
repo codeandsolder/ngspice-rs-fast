@@ -719,11 +719,12 @@ impl<'a> PreparedRun<'a> {
 
     /// Assemble physical right-limit Taylor coefficients from the prepared
     /// device equations, with one immutable parameter context.
-    pub(crate) fn right_limit_jet(
+    pub(crate) fn physical_taylor_jet(
         &self,
         context: &ModelContext,
         linear: &crate::devices::linear::LinearSystem,
         trajectory: &[Vector],
+        at: Real,
         scale: Real,
     ) -> SpiceResult<crate::devices::physical_jet::PhysicalJet> {
         use crate::devices::physical_jet::{Binding, PhysicalJet, ResidualJet};
@@ -736,7 +737,7 @@ impl<'a> PreparedRun<'a> {
         let coordinates = (0..size)
             .map(|column| Taylor::new(trajectory.iter().map(|x| x.as_slice()[column]).collect()))
             .collect::<SpiceResult<Vec<_>>>()?;
-        let time = Taylor::affine(0., scale, order);
+        let time = Taylor::affine(at, scale, order);
         let mut jet = PhysicalJet {
             static_part: ResidualJet::new(size, order),
             charge: ResidualJet::new(size, order),
@@ -755,7 +756,7 @@ impl<'a> PreparedRun<'a> {
             }
         }
         for source in &linear.sources {
-            let forcing = source.waveform.right_taylor(0., scale, order)?;
+            let forcing = source.waveform.local_taylor(at, scale, order)?;
             for (row, sign) in &source.rows {
                 jet.static_part.value(Some(*row), &forcing, -*sign)?;
             }

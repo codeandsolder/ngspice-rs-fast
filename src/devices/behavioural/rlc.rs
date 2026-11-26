@@ -413,6 +413,8 @@ impl Device for Passive {
                 coordinate: 0,
                 equation: 1,
                 value: self.initial.unwrap_or(0.),
+                slot: 0,
+                history_scale: 1.,
             })
             .into_iter()
             .collect())

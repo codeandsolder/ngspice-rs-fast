@@ -53,6 +53,8 @@ use crate::analysis::{AnalysisPlan, NodeCondition};
 
 mod constraints;
 mod derivative_array;
+mod right_limit;
+pub(super) use right_limit::{RightLimitPlan, needs_right_limit, solve_right_limit};
 mod system;
 use constraints::{AbsoluteRow, ConstraintGraph, Join, Origin, VoltageVertex};
 use system::{InstantaneousSolution, InstantaneousSystem};
@@ -318,11 +320,20 @@ fn bound_initial_coordinates(
     let rows = circuit
         .branch_rows(index)
         .ok_or_else(|| failure("missing initial coordinate rows"))?;
+    let states = circuit
+        .state_rows(index)
+        .ok_or_else(|| failure("missing initial coordinate history range"))?;
     let mut bound = Vec::with_capacity(coordinates.len());
     for coordinate in coordinates {
         if coordinate.coordinate >= rows.len()
             || coordinate.equation >= rows.len()
             || !coordinate.value.is_finite()
+            || coordinate
+                .slot
+                .checked_add(1)
+                .is_none_or(|rate| rate >= states.len())
+            || !coordinate.history_scale.is_finite()
+            || coordinate.history_scale == 0.
         {
             return Err(failure(format!(
                 "{}: invalid initial coordinate binding",
@@ -335,6 +346,8 @@ fn bound_initial_coordinates(
                 name: device.name().to_owned(),
                 value: coordinate.value,
                 equation: AbsoluteRow(rows.start + coordinate.equation),
+                slot: states.start + coordinate.slot,
+                history_scale: coordinate.history_scale,
             },
         ));
     }
@@ -403,6 +416,8 @@ struct FixedCoordinate {
     name: String,
     value: Real,
     equation: AbsoluteRow,
+    slot: usize,
+    history_scale: Real,
 }
 
 struct CapacitorInitial {
@@ -945,190 +960,4 @@ pub(super) fn check_impulse_free(
                 .join("; ")
         ))),
     }
-}
-
-/// Generated differentiators require actual right-hand derivatives rather
-/// than the zero-rate DC state. Ordinary circuits retain their C startup.
-pub(super) fn needs_right_limit(circuit: &Circuit) -> bool {
-    circuit.devices().iter().any(|device| {
-        device
-            .initial_expression_storage()
-            .is_some_and(|storage| storage.policy == InitialStoragePolicy::Derived)
-    })
-}
-
-fn vertex_value(x: &Vector, vertex: VoltageVertex) -> Real {
-    match vertex {
-        VoltageVertex::Ground => 0.,
-        VoltageVertex::Node(AbsoluteRow(row)) => x.as_slice()[row],
-    }
-}
-
-fn derivative_constraints(
-    storage: &ImpulseStorage,
-    trajectory: &[Vector],
-    charge: &crate::devices::physical_jet::ResidualJet,
-) -> Vec<derivative_array::InitialConstraint> {
-    use derivative_array::InitialConstraint;
-    let x = &trajectory[0];
-    let mut constraints = Vec::new();
-    for (&AbsoluteRow(row), coordinate) in &storage.fixed_coordinates {
-        constraints.push(InitialConstraint {
-            terms: vec![(row, 1.)],
-            residual: x.as_slice()[row] - coordinate.value,
-            optional: false,
-        });
-    }
-    for cap in &storage.capacitors {
-        constraints.push(InitialConstraint {
-            terms: [(cap.positive, 1.), (cap.negative, -1.)]
-                .into_iter()
-                .filter_map(|(vertex, weight)| match vertex {
-                    VoltageVertex::Ground => None,
-                    VoltageVertex::Node(AbsoluteRow(row)) => Some((row, weight)),
-                })
-                .collect(),
-            residual: vertex_value(x, cap.positive) - vertex_value(x, cap.negative) - cap.voltage,
-            optional: false,
-        });
-    }
-    for (&AbsoluteRow(row), item) in &storage.charges {
-        constraints.push(InitialConstraint {
-            terms: charge.jacobians[0]
-                .triplets()
-                .iter()
-                .filter(|term| term.row == row)
-                .map(|term| (term.col, term.value))
-                .collect(),
-            residual: charge.values[0].as_slice()[row] - item.target,
-            optional: item.policy == InitialStoragePolicy::Derived,
-        });
-    }
-    constraints
-}
-
-/// A verified initial algebraic solution, with canonical history rates
-/// and quantities. All evaluations use disposable coefficient-space state.
-pub(super) struct RightInitial {
-    pub(super) solution: Vector,
-    pub(super) canonical: Vec<(usize, Real)>,
-}
-
-pub(super) fn solve_right_limit(
-    prepared: &PreparedRun<'_>,
-    system: &crate::devices::LinearSystem,
-    request: &LoadRequest<'_>,
-    trial: &crate::devices::TrialState,
-    uic: bool,
-    scale: Real,
-    tolerances: Tolerances,
-    options: &crate::analysis::newton::NewtonOptions,
-) -> SpiceResult<RightInitial> {
-    use derivative_array::DerivativeArray;
-    let circuit = prepared.circuit();
-    let mut storage =
-        ImpulseStorage::collect(circuit, request.solution, request.model_context, trial)?;
-    if !uic {
-        // Instance ic= is only authoritative under UIC. Otherwise the
-        // physical storage is fixed by the already converged left bias.
-        for (&AbsoluteRow(row), coordinate) in &mut storage.fixed_coordinates {
-            coordinate.value = request.solution.as_slice()[row];
-        }
-        for cap in &mut storage.capacitors {
-            cap.voltage = vertex_value(request.solution, cap.positive)
-                - vertex_value(request.solution, cap.negative);
-        }
-    }
-    let n = circuit.unknown_count();
-    // Require both the complete MNA point and its first derivative. This
-    // forces enough prolongation even if an optional derived input seed
-    // could temporarily determine a lower-order algebraic coordinate.
-    let required = (0..n.saturating_mul(2)).collect::<Vec<_>>();
-    let mut trajectory = vec![request.solution.clone(), Vector::zeros(n)];
-    let max_order = 32_768_usize
-        .checked_div(n.max(1))
-        .unwrap_or(0)
-        .saturating_sub(1)
-        .min(64);
-    if max_order == 0 {
-        return Err(failure("right-limit derivative coordinate budget exceeded"));
-    }
-    for order in 1..=max_order {
-        trajectory.resize_with(order + 1, || Vector::zeros(n));
-        let mut previous = Real::INFINITY;
-        for _ in 0..options.max_iterations {
-            let jet =
-                prepared.right_limit_jet(request.model_context, system, &trajectory, scale)?;
-            let constraints = derivative_constraints(&storage, &trajectory, &jet.charge);
-            let array =
-                DerivativeArray::assemble(&jet.static_part, &jet.charge, &constraints, scale)?;
-            let Some(correction) = array.solve(&required, &[])? else {
-                break;
-            };
-            let residual = array.residual_ratio(
-                &trajectory,
-                &correction.retained,
-                tolerances.reltol.min(1e-10),
-                tolerances
-                    .abstol
-                    .min(tolerances.vntol)
-                    .min(tolerances.chgtol),
-            )?;
-            let change = trajectory
-                .iter()
-                .zip(&correction.coefficients)
-                .flat_map(|(x, dx)| {
-                    x.as_slice()
-                        .iter()
-                        .zip(dx.as_slice())
-                        .map(|(&value, &delta)| delta.abs() / (value.abs() + 1.))
-                })
-                .fold(0., Real::max);
-            if residual <= 1. && (change <= 64. * Real::EPSILON || residual >= previous) {
-                let mut canonical = Vec::new();
-                let point = &trajectory[0];
-                let slope = &trajectory[1];
-                for cap in &storage.capacitors {
-                    canonical.push((
-                        cap.slot,
-                        cap.scale
-                            * (vertex_value(point, cap.positive)
-                                - vertex_value(point, cap.negative)),
-                    ));
-                    canonical.push((
-                        cap.slot + 1,
-                        cap.scale
-                            * (vertex_value(slope, cap.positive)
-                                - vertex_value(slope, cap.negative))
-                            / scale,
-                    ));
-                }
-                for (&AbsoluteRow(row), item) in &storage.charges {
-                    canonical.push((item.slot, jet.charge.values[0].as_slice()[row]));
-                    canonical.push((item.slot + 1, jet.charge.values[1].as_slice()[row] / scale));
-                }
-                return Ok(RightInitial {
-                    solution: trajectory.remove(0),
-                    canonical,
-                });
-            }
-            if change == 0. {
-                return Err(failure(format!(
-                    "inconsistent right-limit derivative constraints (residual ratio {residual:e}); an impulse or noncausal dependency may be required"
-                )));
-            }
-            for (x, dx) in trajectory.iter_mut().zip(correction.coefficients) {
-                for (value, delta) in x.as_mut_slice().iter_mut().zip(dx.as_slice()) {
-                    *value += delta;
-                }
-                if !x.is_finite() {
-                    return Err(failure("nonfinite right-limit Newton correction"));
-                }
-            }
-            previous = residual;
-        }
-    }
-    Err(failure(
-        "right-limit DAE derivatives are not uniquely consistent within the bounded derivative array",
-    ))
 }

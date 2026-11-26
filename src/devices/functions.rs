@@ -676,8 +676,14 @@ impl SourceFunction {
 
     /// Analytic right-hand time coefficients; the scale is independent of
     /// the transient integration step and the held interval ends exactly.
-    pub(super) fn right_taylor(&self, t: Real, scale: Real, order: usize) -> SpiceResult<Taylor> {
+    pub(super) fn local_taylor(&self, t: Real, scale: Real, order: usize) -> SpiceResult<Taylor> {
         let constant = |v| Taylor::constant(v, order);
+        let limit = if scale < 0. {
+            Limit::Left
+        } else {
+            Limit::Right
+        };
+        let active = |edge| t > edge || (t == edge && limit == Limit::Right);
         let oscillation = |frequency: Real, elapsed: Real, phase: Real| {
             Taylor::affine(
                 modulation_angle(frequency, elapsed, phase_radians(phase)),
@@ -694,7 +700,7 @@ impl SourceFunction {
             arg.exp(arg.base().exp())
         };
         let series = match *self {
-            Self::Sine(s) if t >= s.delay => {
+            Self::Sine(s) if active(s.delay) => {
                 let elapsed = t - s.delay;
                 let angle = oscillation(s.frequency, elapsed, s.phase);
                 sine(&angle)?
@@ -702,9 +708,9 @@ impl SourceFunction {
                     .scale(s.amplitude)?
                     .add(&constant(s.offset))?
             }
-            Self::Exp(e) if t >= e.rise_delay => {
+            Self::Exp(e) if active(e.rise_delay) => {
                 let rise = decay(-e.rise_tau.recip(), t - e.rise_delay)?;
-                let weight = if t < e.fall_delay {
+                let weight = if !active(e.fall_delay) {
                     constant(1.).sub(&rise)?
                 } else {
                     decay(-e.fall_tau.recip(), t - e.fall_delay)?.sub(&rise)?
@@ -713,7 +719,7 @@ impl SourceFunction {
                     .scale(e.pulsed - e.initial)?
                     .add(&constant(e.initial))?
             }
-            Self::Sffm(f) if t >= f.delay => {
+            Self::Sffm(f) if active(f.delay) => {
                 let elapsed = t - f.delay;
                 let carrier = oscillation(f.carrier, elapsed, f.carrier_phase);
                 let signal = sine(&oscillation(f.signal, elapsed, f.signal_phase))?;
@@ -721,7 +727,7 @@ impl SourceFunction {
                     .scale(f.amplitude)?
                     .add(&constant(f.offset))?
             }
-            Self::Am(a) if t >= a.delay => {
+            Self::Am(a) if active(a.delay) => {
                 let elapsed = t - a.delay;
                 let carrier = sine(&oscillation(a.carrier_frequency, elapsed, a.carrier_phase))?;
                 let modulator = sine(&oscillation(
@@ -737,11 +743,11 @@ impl SourceFunction {
                     )?
                     .add(&constant(a.offset))?
             }
-            _ => constant(self.value_at(t, Limit::Right)?),
+            _ => constant(self.value_at(t, limit)?),
         };
         // Keep the established scalar evaluation (including its stable
         // exponential cancellation and source phase rounding) at order zero.
-        series.with_base(self.value_at(t, Limit::Right)?)
+        series.with_base(self.value_at(t, limit)?)
     }
 
     /// The corners the port lands on, ascending and unique: SIN/SFFM/AM
@@ -967,31 +973,38 @@ impl PwlSource {
         Ok(self.interpolate(time))
     }
 
-    /// Exact affine right-hand law, selecting the outgoing segment rather
-    /// than the native single-valued sample at a repeating boundary.
-    pub(super) fn right_taylor(&self, t: Real, scale: Real, order: usize) -> SpiceResult<Taylor> {
+    /// Exact affine one-sided law, including the incoming/outgoing
+    /// repeating segment rather than the native single-valued sample.
+    pub(super) fn local_taylor(&self, t: Real, scale: Real, order: usize) -> SpiceResult<Taylor> {
         let mut local = t - self.delay();
         if !local.is_finite() {
-            return Err(invalid("PWL", "nonfinite right-limit time"));
+            return Err(invalid("PWL", "nonfinite Taylor time"));
         }
+        let right = scale > 0.;
         let (first, last) = (self.knots[0], self.knots[self.knots.len() - 1]);
-        if local < first.0 {
+        if local < first.0 || (!right && local == first.0) {
             return Ok(Taylor::constant(first.1, order));
         }
-        if local >= last.0 {
+        if local > last.0 || (right && local == last.0) {
             let Some(index) = self.repeat() else {
                 return Ok(Taylor::constant(last.1, order));
             };
             let start = self.knots[index].0;
             let cycle = cycle_position(local - start, last.0 - start);
             if !cycle.resolvable() {
-                return Err(invalid("PWL", "unrepresentable right-limit cycle"));
+                return Err(invalid("PWL", "unrepresentable Taylor cycle"));
             }
-            local = cycle.phase + start;
+            local = if !right && cycle.phase == 0. {
+                last.0
+            } else {
+                cycle.phase + start
+            };
         }
-        let upper = self.knots.partition_point(|&(time, _)| time <= local);
+        let upper = self
+            .knots
+            .partition_point(|&(time, _)| time < local || (right && time == local));
         let Some(&(t1, v1)) = self.knots.get(upper) else {
-            return Err(invalid("PWL", "unrepresentable outgoing segment"));
+            return Err(invalid("PWL", "unrepresentable one-sided segment"));
         };
         let (t0, v0) = self.knots[upper - 1];
         affine_taylor(self.interpolate(local), v0, v1, t1 - t0, scale, order)

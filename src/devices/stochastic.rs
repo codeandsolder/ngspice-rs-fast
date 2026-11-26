@@ -399,13 +399,18 @@ impl StochasticWaveform {
     /// The reproducible realized process is affine between physical
     /// sample-grid knots; held random and telegraph components are constant
     /// on each open right-hand interval.
-    pub(super) fn right_taylor(
+    pub(super) fn local_taylor(
         &self,
         time: Real,
         scale: Real,
         order: usize,
     ) -> SpiceResult<Taylor> {
-        let base = self.value_at(time, Limit::Right)?;
+        let limit = if scale < 0. {
+            Limit::Left
+        } else {
+            Limit::Right
+        };
+        let base = self.value_at(time, limit)?;
         let slope = match self.spec {
             StochasticSpec::Random(_) => 0.,
             StochasticSpec::Noise(n) => {
@@ -502,7 +507,13 @@ fn interpolated_slope(
     step: Real,
     scale: Real,
 ) -> SpiceResult<Real> {
-    let (index, _) = grid_index(time / step)?;
+    if scale < 0. && time == 0. {
+        return Ok(0.);
+    }
+    let (mut index, fraction) = grid_index(time / step)?;
+    if scale < 0. && fraction == 0. && index > 0 {
+        index -= 1;
+    }
     let sample = |n| if n == 0 { 0. } else { gaussian(key, stream, n) };
     Ok((sample(index + 1) - sample(index)) * (scale / step))
 }

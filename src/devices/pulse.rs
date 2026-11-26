@@ -372,25 +372,31 @@ impl Pulse {
         })
     }
 
-    /// Outgoing analytic segment, including exact cut/period boundaries.
-    pub(super) fn right_taylor(&self, t: Real, scale: Real, order: usize) -> SpiceResult<Taylor> {
+    /// One-sided analytic segment, including exact cut/period boundaries.
+    pub(super) fn local_taylor(&self, t: Real, scale: Real, order: usize) -> SpiceResult<Taylor> {
         let mut local = t - self.delay;
         if !local.is_finite() {
             return Err(invalid("nonfinite right-limit time"));
         }
         let constant = |value| Taylor::constant(value, order);
-        if local < 0. || self.stop.is_some_and(|stop| local >= stop) {
+        let right = scale > 0.;
+        let before = |position, edge| position < edge || (!right && position == edge);
+        if before(local, 0.) || self.stop.is_some_and(|stop| !before(local, stop)) {
             return Ok(constant(self.initial));
         }
-        if local >= self.period {
+        if !before(local, self.period) {
             let cycle = cycle_position(local, self.period);
             if !cycle.resolvable() {
                 return Err(invalid("unrepresentable right-limit cycle"));
             }
-            local = cycle.phase;
+            local = if !right && cycle.phase == 0. {
+                self.period
+            } else {
+                cycle.phase
+            };
         }
         let plateau_end = self.rise + self.width;
-        if local < self.rise {
+        if before(local, self.rise) {
             let base = super::functions::affine_value(self.initial, self.pulsed, local / self.rise);
             super::functions::affine_taylor(
                 base,
@@ -400,9 +406,9 @@ impl Pulse {
                 scale,
                 order,
             )
-        } else if local < plateau_end {
+        } else if before(local, plateau_end) {
             Ok(constant(self.pulsed))
-        } else if local < plateau_end + self.fall {
+        } else if before(local, plateau_end + self.fall) {
             let base = super::functions::affine_value(
                 self.pulsed,
                 self.initial,

@@ -248,6 +248,30 @@ impl PointLoads<'_, '_> {
                 self.mutual = Some(self.point.mutual(self.circuit)?);
             }
             let device = self.point.device(self.circuit, layout.device);
+            if let Some(trial) = self.previous.filter(|trial| trial.physical_rates())
+                && device
+                    .storage_element(self.request.model_context)
+                    .transpose()?
+                    .is_some_and(|storage| storage.kind == crate::devices::StorageKind::Capacitor)
+            {
+                let range = self
+                    .circuit
+                    .state_rows(layout.device)
+                    .ok_or_else(|| gap(name))?;
+                let offset = device.truncation_slot().ok_or_else(|| gap(name))?;
+                let rate = trial
+                    .values()
+                    .get(range.start + offset + 1)
+                    .copied()
+                    .ok_or_else(|| gap(name))?;
+                loaded.currents.resize(layout.rows.len() + 1, 0.);
+                loaded.currents.fill(0.);
+                for (&port, sign) in layout.ports.iter().zip([1., -1.]) {
+                    loaded.currents[port] += sign * rate;
+                }
+                loaded.epoch = work.epoch;
+                return loaded.currents.get(slot).copied().ok_or_else(|| gap(name));
+            }
             work.matrix.clear();
             work.rhs.clear();
             let states = self.request.history.isolated_device(
