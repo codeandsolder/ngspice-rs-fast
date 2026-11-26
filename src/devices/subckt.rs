@@ -952,7 +952,11 @@ impl<'a> Expander<'a> {
                 C_REFERENCE,
             ));
         }
-        if !definition.includes.is_empty() {
+        if definition
+            .includes
+            .iter()
+            .any(|include| include.resolved_path.is_none())
+        {
             return Err(SpiceError::not_yet_ported(
                 format!(
                     "{}: .include/.lib inside .subckt '{}'",

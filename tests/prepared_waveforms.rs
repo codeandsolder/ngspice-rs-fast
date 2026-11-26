@@ -189,12 +189,14 @@ C1 out 0 1u
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(events.len(), 2);
-        let plot =
-            AnalysisInput::with_arguments(AnalysisKind::Transient, [step, "1m", "0", step, "uic"])
-                .resolve()
-                .unwrap()
-                .run(&mut circuit, &config.context())
-                .unwrap();
+        let mut input =
+            AnalysisInput::with_arguments(AnalysisKind::Transient, [step, "1m", "0", step]);
+        input.uic = true;
+        let plot = input
+            .resolve()
+            .unwrap()
+            .run(&mut circuit, &config.context())
+            .unwrap();
         for event in events {
             assert!(
                 (0..plot.point_count())
@@ -255,4 +257,78 @@ R2 b 0 1k
     let mut missing = bundle.waveforms.clone();
     missing[0].source = "missing_source".into();
     assert!(config.prepared_circuit(&netlist, &missing).is_err());
+}
+
+#[test]
+fn explicit_root_candidate_rebinds_without_changing_source_rows_or_ac() {
+    use std::sync::Arc;
+
+    use model_normalize_ngspice::waveform::{
+        Period, PreparedWaveform, PulseEdges, PulseSpec, WaveformSpec,
+    };
+    use ngspice_rs::devices::Circuit;
+    use ngspice_rs::netlist::eval::{EvalBudget, ParamBinding, ParamScope};
+    use ngspice_rs::netlist::source::parse_deck_text;
+
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("deck.cir"),
+            "candidate witness\n.param height=1\nV1 a 0 DC 0 AC 2 90\nR1 a 0 1k\n.end\n",
+        ))
+        .unwrap();
+    let declarations = [PreparedWaveform {
+        artifact: "deck.cir".into(),
+        scope: Vec::new(),
+        source: "v1".into(),
+        spec: WaveformSpec::Pulse(PulseSpec {
+            first: "0".into(),
+            second: "{height}".into(),
+            period: Period::Seconds("1m".into()),
+            delay: "0".into(),
+            hold_before_delay: "0".into(),
+            edges: PulseEdges::Rectangular { duty: "0.5".into() },
+        }),
+        idle_in_pop: "0".into(),
+    }];
+    for height in [1., 3., -2.] {
+        let scope = ParamScope::resolve_instance(
+            None,
+            &[ParamBinding {
+                name: "height".into(),
+                value: height,
+                location: netlist.location.clone(),
+            }],
+            &netlist.params,
+            &mut EvalBudget::default(),
+        )
+        .unwrap();
+        let mut circuit = Circuit::from_prepared_netlist_with_limits(
+            &netlist,
+            &Default::default(),
+            Default::default(),
+            Default::default(),
+            Some(Arc::new(scope)),
+            &declarations,
+        )
+        .unwrap();
+        let linear = circuit.linear_system().unwrap();
+        let [source] = linear.sources.as_slice() else {
+            panic!("one independent source expected")
+        };
+        assert_eq!(source.name.as_str(), "v1");
+        close(source.dc, height, 0.);
+        close(source.waveform.value_at(0., Limit::Left).unwrap(), 0., 0.);
+        close(
+            source.waveform.value_at(0., Limit::Right).unwrap(),
+            height,
+            0.,
+        );
+        close(source.ac.re, 0., 1e-14);
+        close(source.ac.im, 2., 1e-14);
+        let plan = AnalysisInput::with_arguments(AnalysisKind::Transient, ["10u", "100u"])
+            .resolve()
+            .unwrap();
+        let plot = plan.run(&mut circuit, &Default::default()).unwrap();
+        close(plot.value("v(a)", 0).unwrap().re, height, 1e-12);
+    }
 }

@@ -4570,7 +4570,11 @@ impl Circuit {
         waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
     ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
-        if !netlist.includes.is_empty() {
+        if netlist
+            .includes
+            .iter()
+            .any(|include| include.resolved_path.is_none())
+        {
             return Err(SpiceError::Unsupported {
                 feature: "includes in linear elaboration".into(),
                 location: None,

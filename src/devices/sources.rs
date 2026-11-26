@@ -515,9 +515,9 @@ impl Device for IndependentSource {
         let value = match time {
             // The initial transient observation is the prepared startup
             // state, not its external left-hand limit.
-            Some((0., _)) if matches!(self.effective_waveform(), Waveform::Prepared(_)) => {
-                self.dc.value()
-            }
+            Some((0., f)) if matches!(self.effective_waveform(), Waveform::Prepared(_)) => self
+                .effective_waveform()
+                .value_at_timed(0., crate::devices::Limit::Right, &f.timing)?,
             Some((t, f)) => self
                 .effective_waveform()
                 .value_at_timed(t, f.limit, &f.timing)?,

@@ -378,6 +378,7 @@ impl<'a> SourceBreaks<'a> {
     }
 
     /// Whether this circuit contains a source with exact event semantics.
+    #[must_use = "the exact-event policy controls the transient stopping condition"]
     pub const fn has_exact(&self) -> bool {
         !self.exact.is_empty()
     }
