@@ -522,3 +522,75 @@ m2 a b 0 0 nch w=1u l=1u
         );
     }
 }
+
+fn sweep_deck(length: f64, width: f64, scale: f64, temperature: f64) -> Netlist {
+    parse(&format!(
+        "m1 d g 0 0 nch l={length:.17e} w={width:.17e} m=2 nrd=2 nrs=3\n\
+         .model nch.1 nmos level=8 lmin=0.5u lmax=1.1u wmin=0.5u wmax=5u vth0=0.3\n\
+         .model nch.2 nmos level=8 lmin=1u lmax=3u wmin=0.5u wmax=5u vth0=0.5 rsh=10\n\
+         .options scale={scale} temp={temperature}\n"
+    ))
+}
+
+fn operating(netlist: &Netlist) -> ngspice_rs::analysis::Plot {
+    let config = RunConfig::from_netlist(netlist).unwrap();
+    let mut circuit = config.circuit(netlist).unwrap();
+    config
+        .plan_for(&netlist.analyses[0])
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap()
+}
+
+#[test]
+fn geometry_sweep_rebinds_overlapping_bins_and_structural_nodes() {
+    use ngspice_rs::analysis::AnalysisInput;
+    use ngspice_rs::primitives::AnalysisKind;
+    let scale = 0.5;
+    let width = 4e-6;
+    let netlist = sweep_deck(1.5e-6, width, scale, 27.);
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let context = config.context();
+    let op = config.plan_for(&netlist.analyses[0]).unwrap();
+    let before = op.run(&mut circuit, &context).unwrap();
+    let plan = AnalysisInput::with_arguments(
+        AnalysisKind::DcSweep,
+        "@M1[L] 1.5u 5u 0.5u temp 27 67 40".split_whitespace(),
+    )
+    .resolve()
+    .unwrap();
+    let plot = plan.run(&mut circuit, &context).unwrap();
+    assert_eq!(plot.point_count(), 16);
+    for row in 0..plot.point_count() {
+        let length = plot.value("v(param-sweep)", row).unwrap().re;
+        let temperature = if row < 8 { 27. } else { 67. };
+        let expected = operating(&sweep_deck(length, width, scale, temperature));
+        let current = plot.value("i(vd)", row).unwrap().re;
+        let want = expected.value("i(vd)", 0).unwrap().re;
+        assert!(
+            (current - want).abs() <= 1e-10 + 1e-6 * want.abs(),
+            "row {row}: {current:e} vs {want:e}"
+        );
+        for variable in expected.variables() {
+            let actual = plot.value(&variable.name, row).unwrap();
+            let want = expected.value(&variable.name, 0).unwrap();
+            assert!(
+                (actual.re - want.re).abs() <= 1e-9 + 1e-6 * want.re.abs(),
+                "row {row}: {}: {actual:?} vs {want:?}",
+                variable.name
+            );
+        }
+    }
+    let after = op.run(&mut circuit, &context).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(circuit.device("m1").unwrap().model_name(), Some("nch.1"));
+    let absent = AnalysisInput::with_arguments(
+        AnalysisKind::DcSweep,
+        "@m1[l] 1.5u 8u 0.5u".split_whitespace(),
+    )
+    .resolve()
+    .unwrap();
+    assert!(absent.run(&mut circuit, &context).is_err());
+    assert_eq!(before, op.run(&mut circuit, &context).unwrap());
+}

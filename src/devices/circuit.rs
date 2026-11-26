@@ -14,6 +14,9 @@
 //! [`Circuit::finalize`], which validates the graph and rebuilds the numbering
 //! in one go.
 
+mod bin_sweep;
+pub(crate) use bin_sweep::{BinnedDeck, GeometryEdit};
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -159,6 +162,7 @@ pub struct Circuit {
     bindings: TopologyBindings,
     mutual_limits: MutualLimits,
     elaboration_limits: ElaborationLimits,
+    binned_deck: Option<Arc<BinnedDeck>>,
     pub(super) runtime: CircuitRuntime,
 }
 
@@ -1299,6 +1303,7 @@ impl Circuit {
     }
 
     fn invalidate_topology(&mut self) {
+        self.binned_deck = None;
         if self.bindings.identity.is_some() {
             self.bindings = TopologyBindings::default();
             self.runtime = CircuitRuntime::default();
@@ -4624,7 +4629,18 @@ impl Circuit {
         circuit.finalize()?;
         // Reject an invalid inductive system (K coupling) before any analysis.
         circuit.prepared_mutual_terms(context)?;
+        circuit.binned_deck = BinnedDeck::capture(
+            &expanded.devices,
+            &expanded.models,
+            &models,
+            setup.noise_analysis,
+        )
+        .map(Arc::new);
         Ok(circuit)
+    }
+
+    pub(crate) fn binned_deck(&self) -> Option<&BinnedDeck> {
+        self.binned_deck.as_deref()
     }
 
     /// Electrical voltage nodes, excluding probe aliases and solver-owned signals.

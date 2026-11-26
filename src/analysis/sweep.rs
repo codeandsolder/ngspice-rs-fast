@@ -9,6 +9,8 @@
 //! `dcValue`/`dcGiven`), temperature, resistor and instance-parameter values
 //! travel in an immutable per-point `ModelContext`, and every point runs
 //! `NIiter`, linear circuits included. See `docs/port/DC_SWEEPS.md`.
+mod binning;
+
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::{AnalysisContext, AnalysisPlan};
 use crate::devices::{Circuit, InstanceTarget, ModelContext};
@@ -65,6 +67,8 @@ pub enum ParameterRoute {
     /// Any other supported parameter: a per-point device replacement
     /// ([`crate::devices::Device::with_instance_parameter`]).
     Device,
+    /// Written geometry of a binned model, requiring fresh setup.
+    Geometry,
 }
 impl SweepTarget {
     /// The scale vector of a sweep whose first (inner) axis is this target,
@@ -457,6 +461,7 @@ enum Written<'a> {
     Resistance(&'a str, InstanceTarget),
     /// `@instance[parameter]` that the device replaces itself.
     Device(&'a str, InstanceTarget, &'a str),
+    Geometry(&'a str, &'a str),
     /// `@instance[parameter]` left for the source table (`dc`, current `c`)
     /// or for an explicit rejection.
     Other(&'a str, &'a str),
@@ -471,6 +476,15 @@ impl<'a> Written<'a> {
                 parameter,
             } => (instance.as_str(), parameter.as_str()),
         };
+        if let Some(keyword) = ["l", "w", "nf", "wnflag"]
+            .into_iter()
+            .find(|key| parameter.eq_ignore_ascii_case(key))
+            && circuit
+                .binned_deck()
+                .is_some_and(|deck| deck.contains(instance, keyword))
+        {
+            return Self::Geometry(instance, keyword);
+        }
         if (parameter.eq_ignore_ascii_case("r") || parameter.eq_ignore_ascii_case("resistance"))
             && let Ok(target) = circuit.bind_resistor_target(instance)
         {
@@ -489,7 +503,7 @@ impl<'a> Written<'a> {
         match self {
             Self::Temperature => "temp".into(),
             Self::Name(name) | Self::Resistance(name, _) => name.to_ascii_lowercase(),
-            Self::Device(name, _, parameter) => {
+            Self::Device(name, _, parameter) | Self::Geometry(name, parameter) => {
                 format!("@{}[{parameter}]", name.to_ascii_lowercase())
             }
             Self::Other(name, parameter) => match parameter.to_ascii_lowercase().as_str() {
@@ -554,6 +568,18 @@ fn resolve_target(
             ),
             AxisBinding::Resistor(target),
         ),
+        Written::Geometry(name, keyword) => (
+            parameter(
+                circuit
+                    .device(name)
+                    .ok_or_else(|| unsupported("missing binned instance"))?
+                    .name()
+                    .to_owned(),
+                keyword,
+                ParameterRoute::Geometry,
+            ),
+            AxisBinding::Geometry,
+        ),
         Written::Device(_, target, keyword) => (
             parameter(
                 instance_name(target.device()),
@@ -600,6 +626,7 @@ enum AxisBinding {
     Resistor(InstanceTarget),
     Device(InstanceTarget),
     Source(InstanceTarget),
+    Geometry,
 }
 
 impl AxisBinding {
@@ -608,11 +635,11 @@ impl AxisBinding {
     }
 
     const fn changes_physics(self) -> bool {
-        matches!(self, Self::Temperature | Self::Device(_))
+        matches!(self, Self::Temperature | Self::Device(_) | Self::Geometry)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BoundAxis {
     spec: SweepSpec,
     binding: AxisBinding,
@@ -640,7 +667,11 @@ pub fn resolve(
     };
     let prepared = circuit.prepare_run();
     let axes = bind_axes(circuit, axes)?;
-    validate_start(&prepared, &axes, context.model_context())?;
+    if binning::active(&axes) {
+        binning::validate_start(circuit, &axes, context.model_context())?;
+    } else {
+        validate_start(&prepared, &axes, context.model_context())?;
+    }
     Ok(axes.into_iter().map(|axis| axis.spec).collect())
 }
 
@@ -724,7 +755,7 @@ fn point_context<'a>(
             AxisBinding::Resistor(target) => {
                 model = model.with_resistor_override(target.at_resistance(value)?)?;
             }
-            AxisBinding::Source(_) | AxisBinding::Device(_) => {}
+            AxisBinding::Source(_) | AxisBinding::Device(_) | AxisBinding::Geometry => {}
         }
     }
     // Preserve the temperature-first and source-last setter ordering. The
@@ -963,6 +994,18 @@ pub(super) fn run(
 ) -> SpiceResult<()> {
     circuit.finalize()?;
     let circuit: &Circuit = circuit;
+    let axes = bind_axes(circuit, sweep)?;
+    if binning::active(&axes) {
+        return binning::run(
+            circuit,
+            request,
+            context,
+            sweep,
+            &axes,
+            point_iterations,
+            sink,
+        );
+    }
     // Everything that can be rejected is rejected before the first sample.
     let hints = crate::analysis::initial::resolve(circuit, request)?;
     // cktload.c forces .nodeset rows in the MODEINITJCT/MODEINITFIX loads
@@ -972,7 +1015,6 @@ pub(super) fn run(
         nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
     };
     let prepared = circuit.prepare_run();
-    let axes = bind_axes(circuit, sweep)?;
     let settings = request.dc_settings();
     let warm_settings = warm_start_settings(point_iterations, settings);
     let solver = SweepSolver {
