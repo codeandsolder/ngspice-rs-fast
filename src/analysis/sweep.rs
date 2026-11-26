@@ -1006,6 +1006,26 @@ pub(super) fn run(
             sink,
         );
     }
+    run_fixed(
+        circuit,
+        request,
+        context,
+        sweep,
+        &axes,
+        point_iterations,
+        sink,
+    )
+}
+
+fn run_fixed(
+    circuit: &Circuit,
+    request: &AnalysisPlan,
+    context: &AnalysisContext,
+    sweep: &DcSweepPlan,
+    axes: &[BoundAxis],
+    point_iterations: Option<usize>,
+    sink: &mut dyn crate::analysis::PointSink,
+) -> SpiceResult<()> {
     // Everything that can be rejected is rejected before the first sample.
     let hints = crate::analysis::initial::resolve(circuit, request)?;
     // cktload.c forces .nodeset rows in the MODEINITJCT/MODEINITFIX loads
@@ -1024,7 +1044,7 @@ pub(super) fn run(
         nodes: &nodes,
     };
     let grids = &sweep.grids;
-    preflight(&solver.prepared, &axes, grids, context).map_err(|error| match error {
+    preflight(&solver.prepared, axes, grids, context).map_err(|error| match error {
         SpiceError::Numerical { context, message } => {
             SpiceError::circuit(format!("DC sweep input validation ({context}): {message}"))
         }
@@ -1066,7 +1086,7 @@ pub(super) fn run(
         for inner_value in inner.clone() {
             let point_context = point_context(
                 circuit,
-                &axes,
+                axes,
                 [inner_value, outer_value],
                 context.model_context(),
             )?;

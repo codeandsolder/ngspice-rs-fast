@@ -8,7 +8,7 @@ use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment, Parame
 use crate::primitives::{NodeTable, Real, SpiceError, SpiceResult};
 use std::collections::BTreeMap;
 
-pub(crate) struct BinnedDeck {
+pub struct BinnedDeck {
     devices: Vec<DeviceInstance>,
     models: Vec<ModelCard>,
     binned: BTreeMap<String, usize>,
@@ -16,7 +16,7 @@ pub(crate) struct BinnedDeck {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct GeometryEdit<'a> {
+pub struct GeometryEdit<'a> {
     pub(crate) instance: &'a str,
     pub(crate) parameter: &'a str,
     pub(crate) value: Real,
@@ -290,7 +290,7 @@ impl Circuit {
     /// and canonical parameter, retaining already physical setter values.
     pub(crate) fn rebind_sweep_context(
         &mut self,
-        original: &Circuit,
+        original: &Self,
         mut context: ModelContext,
     ) -> SpiceResult<ModelContext> {
         use super::CandidateNumericOverride::{Instance, Resistor};
@@ -370,7 +370,7 @@ impl Circuit {
     }
 }
 
-fn instance_override(
+const fn instance_override(
     target: &CandidateNumericOverride,
 ) -> Option<crate::devices::sweep::InstanceOverride> {
     match *target {

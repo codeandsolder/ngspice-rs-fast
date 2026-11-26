@@ -186,10 +186,55 @@ impl Columns {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "same explicit sweep inputs as the fixed-topology driver"
-)]
+fn preflight(
+    baseline: &Circuit,
+    request: &AnalysisPlan,
+    sweep: &DcSweepPlan,
+    axes: &[BoundAxis],
+    resolver: &ModelResolver<'_>,
+    base: ModelContext,
+) -> SpiceResult<Columns> {
+    let source_axes =
+        std::array::from_fn(|i| axes.get(i).is_some_and(|axis| axis.binding.is_source()));
+    let mut columns = Columns::default();
+    let mut current: Option<Candidate> = None;
+    // Validate every distinct geometry and physical context before publishing a header.
+    for values in GridPair::new(&sweep.grids)
+        .physical_contexts(source_axes)
+        .points()
+    {
+        if advance(&mut current, baseline, resolver, axes, values, base)? {
+            let c = current
+                .as_ref()
+                .ok_or_else(|| unsupported("missing geometry candidate"))?;
+            columns.map(&header(&c.circuit, axes)?);
+            crate::analysis::initial::resolve(&c.circuit, request)?;
+        }
+        let c = current
+            .as_ref()
+            .ok_or_else(|| unsupported("missing geometry candidate"))?;
+        let point = point_context(&c.circuit, &c.axes, values, c.base)?;
+        c.circuit.prepare_run().validate_dc_inputs(&point.model)?;
+    }
+    Ok(columns)
+}
+
+fn projection(
+    sink: &dyn crate::analysis::PointSink,
+    result: &Plot,
+) -> SpiceResult<Option<Vec<usize>>> {
+    let selected = sink.selected_columns().map(<[usize]>::to_vec);
+    if selected.as_ref().is_some_and(|indices| {
+        indices
+            .iter()
+            .any(|&index| index >= result.variable_count())
+            || indices.windows(2).any(|pair| pair[0] >= pair[1])
+    }) {
+        return Err(unsupported("invalid geometry sweep projection"));
+    }
+    Ok(selected)
+}
+
 pub(super) fn run(
     baseline: &Circuit,
     request: &AnalysisPlan,
@@ -204,28 +249,7 @@ pub(super) fn run(
         .binned_deck()
         .ok_or_else(|| unsupported("missing binned source graph"))?
         .resolver(base.geometry_scale)?;
-    let source_axes =
-        std::array::from_fn(|i| axes.get(i).is_some_and(|axis| axis.binding.is_source()));
-    let mut columns = Columns::default();
-    let mut current: Option<Candidate> = None;
-    // Validate every distinct geometry and physical context before publishing a header.
-    for values in GridPair::new(&sweep.grids)
-        .physical_contexts(source_axes)
-        .points()
-    {
-        if advance(&mut current, baseline, &resolver, axes, values, base)? {
-            let c = current
-                .as_ref()
-                .ok_or_else(|| unsupported("missing geometry candidate"))?;
-            columns.map(&header(&c.circuit, axes)?);
-            crate::analysis::initial::resolve(&c.circuit, request)?;
-        }
-        let c = current
-            .as_ref()
-            .ok_or_else(|| unsupported("missing geometry candidate"))?;
-        let point = point_context(&c.circuit, &c.axes, values, c.base)?;
-        c.circuit.prepare_run().validate_dc_inputs(&point.model)?;
-    }
+    let mut columns = preflight(baseline, request, sweep, axes, &resolver, base)?;
     let result = Plot::new(
         "dc1",
         "DC transfer characteristic",
@@ -233,15 +257,7 @@ pub(super) fn run(
         columns.variables.clone(),
     );
     sink.begin(&result)?;
-    let selected = sink.selected_columns().map(<[usize]>::to_vec);
-    if selected.as_ref().is_some_and(|indices| {
-        indices
-            .iter()
-            .any(|&index| index >= result.variable_count())
-            || indices.windows(2).any(|pair| pair[0] >= pair[1])
-    }) {
-        return Err(unsupported("invalid geometry sweep projection"));
-    }
+    let selected = projection(sink, &result)?;
     let settings = request.dc_settings();
     let warm = warm_start_settings(point_iterations, settings);
     let mut current = None;
