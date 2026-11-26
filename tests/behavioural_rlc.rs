@@ -1092,3 +1092,37 @@ fn delayed_physical_rank_emerges_at_startup_and_interior_events() -> SpiceResult
     }
     Ok(())
 }
+
+#[test]
+fn wide_parallel_derivative_constraints_do_not_lose_physical_rank() -> SpiceResult<()> {
+    use std::fmt::Write as _;
+    // Every output is independently determined by the same source slope.
+    // Repeated elimination through the shared input must not manufacture
+    // uncertainty and discard a physically independent output.
+    for branches in [128, 256] {
+        let mut body = String::from("v1 in 0 PWL(0 2 1m 3)\n.options reltol=1e-8 vntol=1n\n");
+        for index in 1..=branches {
+            writeln!(
+                body,
+                "b{index} out{index} 0 v=1m*ddt(v(in))\nr{index} out{index} 0 1k"
+            )
+            .unwrap();
+        }
+        for method in ["method=trap", "method=gear"] {
+            let plot = run(
+                &body,
+                AnalysisKind::Transient,
+                &["1u", "2u", "0", "1u", "uic", method],
+            )?;
+            for branch in 1..=branches {
+                let voltage = format!("v(out{branch})");
+                let current = format!("i(b{branch})");
+                for point in 0..plot.point_count() {
+                    close(plot.value(&voltage, point).unwrap().re, 1., 1e-10);
+                    close(plot.value(&current, point).unwrap().re, -1e-3, 1e-13);
+                }
+            }
+        }
+    }
+    Ok(())
+}
