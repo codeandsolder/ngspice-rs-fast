@@ -875,6 +875,7 @@ impl AnalysisPlan {
         let PlanKind::Sensitivity { card, frequencies } = &self.analysis else {
             return Err(unsupported("sensitivity resolution requires a .sens plan"));
         };
+        circuit.validate_prepared_analysis(self.kind(), self.uic())?;
         let context = &crate::analysis::AnalysisContext {
             bias_analysis: circuit.has_prepared_bias().then(|| self.kind()),
             ..*context
@@ -893,6 +894,7 @@ impl AnalysisPlan {
         sink: &mut dyn crate::analysis::PointSink,
     ) -> SpiceResult<()> {
         use crate::analysis::{ac, disto, linear, noise, pz, sens, sparam, sweep, tf};
+        circuit.validate_prepared_analysis(self.kind(), self.uic())?;
         let context = &crate::analysis::AnalysisContext {
             bias_analysis: (!self.uic() && circuit.has_prepared_bias()).then(|| self.kind()),
             ..*context
@@ -958,6 +960,7 @@ impl AnalysisPlan {
         let PlanKind::PeriodicSteadyState { settings, .. } = &self.analysis else {
             return Err(unsupported("periodic orbit requires a .pss plan"));
         };
+        circuit.validate_prepared_analysis(self.kind(), self.uic())?;
         let context = &crate::analysis::AnalysisContext {
             bias_analysis: (!self.uic() && circuit.has_prepared_bias()).then(|| self.kind()),
             ..*context
