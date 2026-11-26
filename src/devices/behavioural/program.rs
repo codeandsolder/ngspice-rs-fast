@@ -384,7 +384,7 @@ impl Program {
             ));
         }
         self.plan
-            .evaluate_taylor(self.root, &self.derivatives, environment, variables, time)
+            .evaluate_taylor(self.root, environment, variables, time)
     }
 
     pub(super) fn evaluate_with_workspace<'w>(

@@ -1086,14 +1086,40 @@ pub(super) fn consistent_derivative_start(
     }
     let result = (|| {
         let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
-        let right = system::solve_right_limit(
-            &dae,
-            request.solution,
-            &storage,
-            forcing.timing.step(),
-            tolerances,
-            options.max_iterations,
-        )?;
+        let solve = |seed: &Vector| {
+            system::solve_right_limit(
+                &dae,
+                seed,
+                &storage,
+                forcing.timing.step(),
+                tolerances,
+                options.max_iterations,
+            )
+        };
+        let right = match solve(request.solution) {
+            // A zero UIC guess can lie outside a regular Taylor domain
+            // even when the physical right limit is smooth (for example,
+            // sqrt of a positive voltage fixed by an ideal source).
+            // Use the existing reduced algebraic solve only for a new
+            // Newton seed. Its history and derivative gauges are discarded;
+            // the original storage and full array still decide acceptance.
+            Err(original @ SpiceError::Circuit { .. }) if uic => {
+                let mut linear = prepared.transient_forcing_system(request.model_context)?;
+                linear.bind_transient_timing(&forcing.timing)?;
+                let rhs = linear.transient_rhs(0., crate::devices::Limit::Right)?;
+                let Ok(CheckedInitial {
+                    solution: Some(seed),
+                    ..
+                }) = check_impulse_free(
+                    prepared, &linear.a, &rhs, request, trial, tolerances, options,
+                )
+                else {
+                    return Err(original);
+                };
+                solve(&seed)?
+            }
+            other => other?,
+        };
         let canonical =
             storage.consistent_history(circuit, &right, (!uic).then_some(0.), tolerances)?;
         Ok(DerivativePoint {
@@ -1176,7 +1202,8 @@ pub(super) fn consistent_derivative_event(
     )?;
     storage.retain_operating_point(request.solution);
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
-    let right = system::solve_event(&dae, request, &storage, tolerances, iterations, order_hint)?;
+    let right = system::solve_event(&dae, request, &storage, tolerances, iterations, order_hint)
+        .map_err(|error| failure(format!("source event at t = {time:e}: {error}")))?;
     let canonical = storage.consistent_history(circuit, &right, Some(time), tolerances)?;
     Ok(DerivativePoint {
         solution: right.state,

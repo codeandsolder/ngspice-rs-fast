@@ -190,8 +190,10 @@ contributes F[k] + (k+1) Q[k+1]/h = 0. Conductance and storage Jacobian
 coefficients act by convolution on the corresponding perturbations of
 X. Independent sources supply analytic one-sided waveform coefficients;
 behavioural expressions propagate local coefficients through the compiled
-instruction DAG. No finite differences or artificial derivative
-prehistory are used to construct the array.
+instruction DAG. Reverse differentiation of the active value graph
+provides the Jacobian of the same branch, including clipped exponential
+and regularized division kernels. No finite differences or artificial
+derivative prehistory are used to construct the array.
 
 Sparse elimination projects out the free higher coefficients before
 selecting the necessary state and first-rate coordinates. Mandatory

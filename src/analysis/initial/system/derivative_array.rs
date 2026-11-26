@@ -31,14 +31,14 @@ struct ResidualScale {
 }
 
 impl ResidualScale {
-    fn equal(value: Real) -> Self {
+    const fn equal(value: Real) -> Self {
         Self {
             physical: value,
             backward: value,
         }
     }
 
-    fn comparison(actual: Real, target: Real, backward: Real) -> Self {
+    const fn comparison(actual: Real, target: Real, backward: Real) -> Self {
         let physical = actual.abs().max(target.abs());
         Self {
             physical,
@@ -50,7 +50,7 @@ impl ResidualScale {
         (32. * Real::EPSILON * self.backward).max(Real::MIN_POSITIVE)
     }
 
-    fn finite(self) -> bool {
+    const fn finite(self) -> bool {
         self.physical.is_finite() && self.backward.is_finite()
     }
 }

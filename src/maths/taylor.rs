@@ -54,6 +54,10 @@ impl Jet {
         self.coefficients[1..].iter().all(|&value| value == 0.)
     }
 
+    pub(crate) fn is_zero(&self) -> bool {
+        self.coefficients.iter().all(|&value| value == 0.)
+    }
+
     /// Compare the local right-hand germ to a scalar boundary without
     /// perturbing the constant value (which might be one ulp from the knot).
     pub(crate) fn compare(&self, boundary: Real) -> Option<std::cmp::Ordering> {
@@ -104,6 +108,12 @@ impl Jet {
     }
 
     pub(crate) fn multiply(&self, rhs: &Self) -> Self {
+        if self.is_constant() {
+            return rhs.clone().scale(self.value());
+        }
+        if rhs.is_constant() {
+            return self.clone().scale(rhs.value());
+        }
         let order = self.coefficients.len() - 1;
         let mut product = Self::constant(order, 0.);
         for (n, coefficient) in product.coefficients.iter_mut().enumerate() {

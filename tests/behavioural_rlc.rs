@@ -986,3 +986,23 @@ fn derivative_array_distinguishes_a_repeating_jump_and_a_storage_impulse() {
         );
     }
 }
+
+#[test]
+fn smooth_right_limit_recovers_from_singular_uic_taylor_seed() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            "v1 in 0 PWL(0 4 1m 5)\nb1 out 0 v=1m*ddt(sqrt(v(in)))\nr1 out 0 1k",
+            AnalysisKind::Transient,
+            &["1u", "25u", "0", "1u", "uic", method],
+        )?;
+        for point in 0..plot.point_count() {
+            let t = plot.value("time", point).unwrap().re;
+            close(
+                plot.value("v(out)", point).unwrap().re,
+                0.5 / (1000. * t + 4.).sqrt(),
+                1e-10,
+            );
+        }
+    }
+    Ok(())
+}
