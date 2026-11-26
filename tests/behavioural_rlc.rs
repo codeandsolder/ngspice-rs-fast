@@ -822,3 +822,86 @@ fn sinusoidal_capacitor_loaded_derivative_matches_physical_current() -> SpiceRes
     }
     Ok(())
 }
+
+#[test]
+fn derivative_initial_storage_tolerance_is_independent_of_common_mode() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        for common_mode in [0., 1e9, -1e9] {
+            let body = format!(
+                "v1 p 0 {common_mode}\nv2 n 0 {common_mode}\nc1 p n 1u ic=1\nb1 out 0 v=1u*ddt(v(p)-v(n))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n"
+            );
+            let error = run(
+                &body,
+                AnalysisKind::Transient,
+                &["1u", "10u", "0", "1u", "uic", method],
+            )
+            .expect_err("contradictory differential voltage must not be hidden by common mode")
+            .to_string();
+            assert!(
+                error.contains("c1")
+                    && error.contains("initial voltage")
+                    && error.contains("impulse"),
+                "{error}"
+            );
+            let consistent = format!(
+                "v1 p 0 {}\nv2 n 0 {common_mode}\nc1 p n 1u ic=1\nb1 out 0 v=1u*ddt(v(p)-v(n))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
+                common_mode + 1.
+            );
+            let plot = run(
+                &consistent,
+                AnalysisKind::Transient,
+                &["1u", "10u", "0", "1u", "uic", method],
+            )?;
+            for point in 0..plot.point_count() {
+                close(
+                    plot.value("v(p)", point).unwrap().re - plot.value("v(n)", point).unwrap().re,
+                    1.,
+                    1e-9,
+                );
+                close(plot.value("v(out)", point).unwrap().re, 0., 1e-9);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn derivative_chain_preserves_rational_transfer_initial_coordinates() -> SpiceResult<()> {
+    let body = "v1 in 0 dc 3\na1 in out mdl\nr1 out 0 1k\n.model mdl s_xfer(num_coeff=[1] den_coeff=[1 1] denormalized_freq=1000 int_ic=[2])\nb1 first 0 v=1m*ddt(v(out))\nb2 second 0 v=1m*ddt(v(first))\nr2 second 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "100u", "0", "1u", "uic", method],
+        )?;
+        for point in 0..plot.point_count() {
+            let t = plot.value("time", point).unwrap().re;
+            let out = plot.value("v(out)", point).unwrap().re;
+            close(out, 3. - (-1000. * t).exp(), 2e-6);
+            close(plot.value("v(first)", point).unwrap().re, 3. - out, 1e-9);
+            close(plot.value("v(second)", point).unwrap().re, out - 3., 1e-9);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn derivative_chain_preserves_inductor_initial_flux_and_exact_kcl() -> SpiceResult<()> {
+    let body = "v1 in 0 0\nr1 in a 1\nl1 a 0 1m ic=1\nb1 first 0 v=1m*ddt(i(l1))\nb2 second 0 v=1m*ddt(v(first))\nr2 second 0 1k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "100u", "0", "1u", "uic", method],
+        )?;
+        for point in 0..plot.point_count() {
+            let t = plot.value("time", point).unwrap().re;
+            let current = plot.value("i(l1)", point).unwrap().re;
+            close(current, (-1000. * t).exp(), 2e-6);
+            close(plot.value("v(a)", point).unwrap().re, -current, 1e-9);
+            close(plot.value("v(first)", point).unwrap().re, -current, 1e-9);
+            close(plot.value("v(second)", point).unwrap().re, current, 1e-9);
+        }
+    }
+    Ok(())
+}

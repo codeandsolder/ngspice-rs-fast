@@ -6,7 +6,7 @@
 
 use super::rank;
 use crate::analysis::initial::{
-    ChargeInitial, ImpulseStorage, Tolerances,
+    CapacitorInitial, ChargeInitial, FixedCoordinate, ImpulseStorage, Tolerances,
     constraints::{AbsoluteRow, VoltageVertex},
     failure,
 };
@@ -22,18 +22,62 @@ use crate::primitives::{Real, SpiceResult};
 const MAX_ARRAY_ENTRIES: usize = 8_388_608;
 const MAX_ARRAY_VARIABLES: usize = 1_048_576;
 
+#[derive(Clone, Copy, Default)]
+struct ResidualScale {
+    /// Magnitude of the actual physical quantity being constrained.
+    physical: Real,
+    /// Sum of magnitudes before cancellation, for floating-point error.
+    backward: Real,
+}
+
+impl ResidualScale {
+    fn equal(value: Real) -> Self {
+        Self {
+            physical: value,
+            backward: value,
+        }
+    }
+
+    fn comparison(actual: Real, target: Real, backward: Real) -> Self {
+        let physical = actual.abs().max(target.abs());
+        Self {
+            physical,
+            backward: backward.max(physical),
+        }
+    }
+
+    fn roundoff(self) -> Real {
+        (32. * Real::EPSILON * self.backward).max(Real::MIN_POSITIVE)
+    }
+
+    fn finite(self) -> bool {
+        self.physical.is_finite() && self.backward.is_finite()
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Constraint<'a> {
-    Coordinate(usize, Real),
-    Voltage(VoltageVertex, VoltageVertex, Real),
+    Coordinate(usize, &'a FixedCoordinate),
+    Voltage(&'a CapacitorInitial),
     Charge(usize, &'a ChargeInitial),
     Companion(CompanionConstraint<'a>),
 }
 
-impl Constraint<'_> {
+impl<'a> Constraint<'a> {
     fn optional(self) -> bool {
         matches!(self,Self::Charge(_,charge) if charge.policy==InitialStoragePolicy::Derived)
             || matches!(self, Self::Companion(c) if c.derived)
+    }
+
+    fn initial_name(self) -> Option<(&'a str, &'static str)> {
+        match self {
+            Self::Coordinate(_, coordinate) => Some((&coordinate.name, "coordinate")),
+            Self::Voltage(cap) => Some((&cap.name, "voltage")),
+            Self::Charge(_, charge) if charge.policy == InitialStoragePolicy::Physical => {
+                Some((&charge.name, "charge"))
+            }
+            _ => None,
+        }
     }
 
     fn stamp(
@@ -43,51 +87,57 @@ impl Constraint<'_> {
         time_scale: Real,
         point: &PhysicalDaeTaylor,
         matrix: &mut SparseMatrix,
-    ) -> SpiceResult<(Real, Real)> {
+    ) -> SpiceResult<(Real, ResidualScale)> {
         if let Self::Companion(companion) = self {
             return companion.stamp(row, state, time_scale, point, matrix);
         }
         let state = &state[0];
-        let mut scale = 0.;
-        let value = match self {
-            Self::Coordinate(column, target) => {
+        match self {
+            Self::Coordinate(column, coordinate) => {
                 matrix.add(row, column, 1.)?;
                 let value = state.as_slice()[column];
-                scale = value.abs().max(target.abs());
-                value - target
+                Ok((
+                    value - coordinate.value,
+                    ResidualScale::comparison(value, coordinate.value, 0.),
+                ))
             }
-            Self::Voltage(positive, negative, target) => {
-                let mut value = -target;
-                scale = target.abs();
-                for (vertex, sign) in [(positive, 1.), (negative, -1.)] {
+            Self::Voltage(cap) => {
+                let positive = crate::analysis::initial::potential(state, cap.positive);
+                let negative = crate::analysis::initial::potential(state, cap.negative);
+                for (vertex, sign) in [(cap.positive, 1.), (cap.negative, -1.)] {
                     if let VoltageVertex::Node(AbsoluteRow(column)) = vertex {
                         matrix.add(row, column, sign)?;
-                        let voltage = state.as_slice()[column];
-                        value = sign.mul_add(voltage, value);
-                        scale += voltage.abs();
                     }
                 }
-                value
+                // Subtract common-mode voltage before the specified IC.
+                // A large common mode must not loosen a differential IC.
+                let actual = positive - negative;
+                Ok((
+                    actual - cap.voltage,
+                    ResidualScale::comparison(actual, cap.voltage, positive.abs() + negative.abs()),
+                ))
             }
-            Self::Companion(_) => return Err(failure("unexpected companion constraint")),
             Self::Charge(equation, charge) => {
+                let mut backward = 0.;
                 for term in point.capacitance[0]
                     .triplets()
                     .iter()
                     .filter(|term| term.row == equation)
                 {
                     matrix.add(row, term.col, term.value)?;
-                    scale = term
+                    backward = term
                         .value
                         .abs()
-                        .mul_add(state.as_slice()[term.col].abs(), scale);
+                        .mul_add(state.as_slice()[term.col].abs(), backward);
                 }
                 let value = point.charge[0].as_slice()[equation];
-                scale = scale.max(value.abs()).max(charge.target.abs());
-                value - charge.target
+                Ok((
+                    value - charge.target,
+                    ResidualScale::comparison(value, charge.target, backward),
+                ))
             }
-        };
-        Ok((value, scale))
+            Self::Companion(_) => Err(failure("unexpected companion constraint")),
+        }
     }
 
     fn absolute(self, tol: Tolerances) -> Real {
@@ -99,19 +149,26 @@ impl Constraint<'_> {
             Self::Coordinate(..) | Self::Companion(_) => tol.abstol,
         }
     }
+
+    fn tolerance(self, scale: ResidualScale, tol: Tolerances) -> Real {
+        let requested = tol.reltol.mul_add(scale.physical, self.absolute(tol));
+        // A selected numerical companion is constrained by finite-precision
+        // history differences, not by an exact prescribed IC. Its backward
+        // error floor cannot be applied to mandatory initial storage.
+        if matches!(self, Self::Companion(_)) {
+            requested.max(scale.roundoff())
+        } else {
+            requested
+        }
+    }
 }
 
 fn constraints(storage: &ImpulseStorage) -> Vec<Constraint<'_>> {
     storage
         .fixed_coordinates
         .iter()
-        .map(|(&AbsoluteRow(row), item)| Constraint::Coordinate(row, item.value))
-        .chain(
-            storage
-                .capacitors
-                .iter()
-                .map(|item| Constraint::Voltage(item.positive, item.negative, item.voltage)),
-        )
+        .map(|(&AbsoluteRow(row), item)| Constraint::Coordinate(row, item))
+        .chain(storage.capacitors.iter().map(Constraint::Voltage))
         .chain(
             storage
                 .charges
@@ -190,7 +247,7 @@ impl CompanionConstraint<'_> {
         time_scale: Real,
         point: &PhysicalDaeTaylor,
         matrix: &mut SparseMatrix,
-    ) -> SpiceResult<(Real, Real)> {
+    ) -> SpiceResult<(Real, ResidualScale)> {
         let accepted = |age, offset| {
             self.history
                 .accepted(age)
@@ -210,6 +267,7 @@ impl CompanionConstraint<'_> {
             .then(|| accepted(1, 1))
             .transpose()?;
         let companion = self.coefficients.integrate(&history, previous, 1.)?;
+        let physical = rate.abs().max(companion.derivative.abs());
         let mut scale = rate.abs() + companion.derivative.abs();
         let width = state[0].len();
         self.quantity.gradient(point, 0, |column, gradient| {
@@ -227,7 +285,13 @@ impl CompanionConstraint<'_> {
             scale += (term * state[0].as_slice()[column]).abs();
             Ok(())
         })?;
-        Ok((rate - companion.derivative, scale))
+        Ok((
+            rate - companion.derivative,
+            ResidualScale {
+                physical,
+                backward: scale,
+            },
+        ))
     }
 }
 
@@ -284,7 +348,7 @@ fn companions<'a>(
 struct Array {
     matrix: SparseMatrix,
     residual: Vec<Real>,
-    scale: Vec<Real>,
+    scale: Vec<ResidualScale>,
     physical_rows: usize,
     late: Vec<usize>,
     optional: Vec<usize>,
@@ -310,7 +374,11 @@ impl Array {
         let mut array = Self {
             matrix: SparseMatrix::new(rows, variables),
             residual: crate::primitives::filled_vec(rows, 0., "derivative array residual")?,
-            scale: crate::primitives::filled_vec(rows, 0., "derivative array residual scale")?,
+            scale: crate::primitives::filled_vec(
+                rows,
+                ResidualScale::default(),
+                "derivative array residual scale",
+            )?,
             physical_rows,
             late: Vec::new(),
             optional: Vec::new(),
@@ -327,7 +395,8 @@ impl Array {
                 .enumerate()
             {
                 array.residual[offset + r] = multiplier.mul_add(q, f);
-                array.scale[offset + r] = multiplier.mul_add(q.abs(), f.abs());
+                array.scale[offset + r] =
+                    ResidualScale::equal(multiplier.mul_add(q.abs(), f.abs()));
             }
             for (j, coefficient_state) in state.iter().enumerate().take(k + 2) {
                 for (matrix, factor) in [
@@ -343,10 +412,10 @@ impl Array {
                         let row = offset + term.row;
                         let coefficient = factor * term.value;
                         array.matrix.add(row, j * width + term.col, coefficient)?;
-                        array.scale[row] = coefficient.abs().mul_add(
+                        array.scale[row] = ResidualScale::equal(coefficient.abs().mul_add(
                             coefficient_state.as_slice()[term.col].abs(),
-                            array.scale[row],
-                        );
+                            array.scale[row].backward,
+                        ));
                     }
                 }
             }
@@ -365,11 +434,8 @@ impl Array {
             }
         }
         array.matrix.fold_duplicates();
-        if array
-            .residual
-            .iter()
-            .chain(&array.scale)
-            .any(|v| !v.is_finite())
+        if array.residual.iter().any(|v| !v.is_finite())
+            || array.scale.iter().any(|scale| !scale.finite())
         {
             return Err(failure("nonfinite derivative array residual or scale"));
         }
@@ -385,12 +451,11 @@ impl Array {
         let mut user: Real = 0.;
         let mut roundoff: Real = 0.;
         for (row, (&residual, &scale)) in self.residual.iter().zip(&self.scale).enumerate() {
-            let absolute = if row < self.physical_rows {
-                // Physical equations have mixed dimensions. Their Jacobian
-                // contribution scale is the primary backward-error measure.
-                // Use the smallest configured absolute tolerance as a
-                // fallback; mandatory ICs below retain their actual units.
-                tol.abstol.min(tol.vntol).min(tol.chgtol)
+            let tolerance = if row < self.physical_rows {
+                // Mixed-dimensional original equations retain their
+                // stamp scale as the residual's physical reference.
+                tol.reltol
+                    .mul_add(scale.physical, tol.abstol.min(tol.vntol).min(tol.chgtol))
             } else {
                 let constraint = initial[row - self.physical_rows];
                 if (constraint.optional() || matches!(constraint, Constraint::Companion(_)))
@@ -398,13 +463,24 @@ impl Array {
                 {
                     continue;
                 }
-                constraint.absolute(tol)
+                constraint.tolerance(scale, tol)
             };
-            user = user.max(residual.abs() / tol.reltol.mul_add(scale, absolute));
-            roundoff = roundoff
-                .max(residual.abs() / (32. * Real::EPSILON * scale).max(Real::MIN_POSITIVE));
+            user = user.max(residual.abs() / tolerance);
+            roundoff = roundoff.max(residual.abs() / scale.roundoff());
         }
         (user, roundoff)
+    }
+
+    fn initial_violation(&self, initial: &[Constraint<'_>], tol: Tolerances) -> Option<String> {
+        initial.iter().copied().enumerate().filter_map(|(index,constraint)|{
+            let (name,quantity)=constraint.initial_name()?;
+            let row=self.physical_rows+index;
+            let residual=self.residual[row];
+            let tolerance=constraint.tolerance(self.scale[row],tol);
+            (residual.abs()>tolerance).then_some((residual.abs()/tolerance,name,quantity,residual,tolerance))
+        }).max_by(|a,b|a.0.total_cmp(&b.0)).map(|(_,name,quantity,residual,tolerance)|format!(
+            "{name}: initial {quantity} constraint differs by {residual:e} (tolerance {tolerance:e}); the requested state may require an impulse"
+        ))
     }
 }
 
@@ -467,10 +543,10 @@ fn stable_rank_order(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum ArrayNewton {
     Converged,
     NeedOrder,
+    NotConverged(String),
 }
 
 fn apply_step(state: &mut [Vector], correction: &Vector) -> SpiceResult<()> {
@@ -499,6 +575,7 @@ fn newton(
 ) -> SpiceResult<ArrayNewton> {
     let width = state[0].len();
     let mut best: Option<(Real, Vec<Vector>)> = None;
+    let mut violation = None;
     for _ in 0..iterations {
         let point = local.evaluate(dae, state)?;
         let array = Array::build(&point, state, local.scale, initial)?;
@@ -533,9 +610,23 @@ fn newton(
         state.clone_from_slice(&best);
         Ok(ArrayNewton::Converged)
     } else {
-        Err(failure(
-            "physical right-limit derivative array did not converge; initial constraints may require an impulse",
-        ))
+        Ok(ArrayNewton::NotConverged(violation.unwrap_or_else(|| {
+            "physical derivative array Newton iteration did not converge".to_owned()
+        })))
+    }
+}
+
+pub(in crate::analysis::initial) enum SolveOutcome {
+    Converged(RightLimit),
+    NotConverged { last: Vector, reason: String },
+}
+
+impl SolveOutcome {
+    fn require(self) -> SpiceResult<RightLimit> {
+        match self {
+            Self::Converged(right) => Ok(right),
+            Self::NotConverged { reason, .. } => Err(failure(reason)),
+        }
     }
 }
 
@@ -563,7 +654,8 @@ pub(in crate::analysis::initial) fn solve_right_limit(
         },
         tol,
         iterations,
-    )
+    )?
+    .require()
 }
 
 pub(in crate::analysis::initial) fn solve_event(
@@ -592,7 +684,8 @@ pub(in crate::analysis::initial) fn solve_event(
         },
         tol,
         iterations,
-    )
+    )?
+    .require()
 }
 
 pub(in crate::analysis::initial) fn solve_step(
@@ -603,7 +696,7 @@ pub(in crate::analysis::initial) fn solve_step(
     tol: Tolerances,
     iterations: usize,
     order_hint: usize,
-) -> SpiceResult<RightLimit> {
+) -> SpiceResult<SolveOutcome> {
     let forcing = request
         .forcing
         .ok_or_else(|| failure("missing derivative step forcing"))?;
@@ -635,25 +728,42 @@ fn solve(
     local: LocalPoint,
     tol: Tolerances,
     iterations: usize,
-) -> SpiceResult<RightLimit> {
+) -> SpiceResult<SolveOutcome> {
     let mut state = vec![seed.clone()];
     for _ in 0..local.order_hint.max(2) {
         extend(&mut state)?;
     }
     loop {
         stable_rank_order(dae, &mut state, local)?;
-        if newton(dae, &mut state, local, initial, tol, iterations)? == ArrayNewton::NeedOrder {
-            extend(&mut state)?;
-            continue;
+        match newton(dae, &mut state, local, initial, tol, iterations)? {
+            ArrayNewton::Converged => {}
+            ArrayNewton::NeedOrder => {
+                extend(&mut state)?;
+                continue;
+            }
+            ArrayNewton::NotConverged(reason) => {
+                return Ok(SolveOutcome::NotConverged {
+                    last: state.remove(0),
+                    reason,
+                });
+            }
         }
         let rank = local.prefix_rank(dae, &state)?;
         extend(&mut state)?;
         if local.prefix_rank(dae, &state)? == rank {
             // Re-solve the extended array: rank equality alone does not
             // establish its affine residual or the chosen right-hand branch.
-            if newton(dae, &mut state, local, initial, tol, iterations)? == ArrayNewton::NeedOrder
-                || local.prefix_rank(dae, &state)? != rank
-            {
+            match newton(dae, &mut state, local, initial, tol, iterations)? {
+                ArrayNewton::Converged => {}
+                ArrayNewton::NeedOrder => continue,
+                ArrayNewton::NotConverged(reason) => {
+                    return Ok(SolveOutcome::NotConverged {
+                        last: state.remove(0),
+                        reason,
+                    });
+                }
+            }
+            if local.prefix_rank(dae, &state)? != rank {
                 continue;
             }
             let point = local.evaluate(dae, &state)?;
@@ -666,7 +776,7 @@ fn solve(
                         .collect::<Vec<_>>(),
                 )
             };
-            return Ok(RightLimit {
+            return Ok(SolveOutcome::Converged(RightLimit {
                 state: state[0].clone(),
                 rate: to_rate(&state[1]),
                 charge: point.charge[0].clone(),
@@ -674,7 +784,7 @@ fn solve(
                 // The two extra orders were rank/affine lookahead checks;
                 // retain a lower bound so the next trial still repeats them.
                 order_hint: state.len().saturating_sub(3).max(2),
-            });
+            }));
         }
     }
 }

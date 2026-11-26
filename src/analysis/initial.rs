@@ -1110,6 +1110,11 @@ pub(super) fn consistent_derivative_start(
     }
 }
 
+pub(super) enum DerivativeTrial {
+    Converged(DerivativePoint),
+    NotConverged(Vector),
+}
+
 /// Solve the physical derivative array with independent numerical storage
 /// constraints; dependent companion equations are intentionally projected out.
 pub(super) fn consistent_derivative_step(
@@ -1118,7 +1123,7 @@ pub(super) fn consistent_derivative_step(
     tolerances: Tolerances,
     iterations: usize,
     order_hint: usize,
-) -> SpiceResult<DerivativePoint> {
+) -> SpiceResult<DerivativeTrial> {
     let circuit = prepared.circuit();
     let forcing = request
         .forcing
@@ -1130,15 +1135,20 @@ pub(super) fn consistent_derivative_step(
     let storage =
         ImpulseStorage::collect(circuit, request.solution, request.model_context, values)?;
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
-    let right = system::solve_step(
+    let right = match system::solve_step(
         &dae, circuit, request, &storage, tolerances, iterations, order_hint,
-    )?;
+    )? {
+        system::SolveOutcome::Converged(right) => right,
+        system::SolveOutcome::NotConverged { last, .. } => {
+            return Ok(DerivativeTrial::NotConverged(last));
+        }
+    };
     let canonical = storage.consistent_history(circuit, &right, None, tolerances)?;
-    Ok(DerivativePoint {
+    Ok(DerivativeTrial::Converged(DerivativePoint {
         solution: right.state,
         order_hint: right.order_hint,
         canonical,
-    })
+    }))
 }
 
 /// Cross an event without changing physical or derivative-input storage.

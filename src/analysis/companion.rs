@@ -564,7 +564,7 @@ impl AttemptedStep {
         mut truncate: impl FnMut(&Coefficients) -> SpiceResult<Real>,
     ) -> SpiceResult<StepDecision> {
         let mut next = self.clock.next;
-        if self.clock.phase == Phase::First {
+        if self.clock.phase == Phase::First || steps.is_empty() {
             return Ok(StepDecision::Accept(next));
         }
         let delta = next.delta;
@@ -630,6 +630,7 @@ impl SampleGrid {
     }
 }
 
+#[derive(Clone, Copy)]
 struct OutputSelection<'a> {
     sample_at: Option<Real>,
     capture_boundary: bool,
@@ -1947,13 +1948,19 @@ impl Driver<'_> {
                 timing: self.timing,
             }),
         };
-        let consistent = initial::consistent_derivative_step(
+        let outcome = initial::consistent_derivative_step(
             &self.prepared,
             &request,
             self.physical_tolerances(),
             self.settings.tran_max_iter,
             self.derivative_order.get(),
         )?;
+        let consistent = match outcome {
+            initial::DerivativeTrial::Converged(point) => point,
+            initial::DerivativeTrial::NotConverged(last) => {
+                return Ok(Trial::NotConverged { last });
+            }
+        };
         let (x, state) = self.physical_candidate(
             &LoadRequest {
                 mode: AnalysisMode::Instantaneous {
@@ -2071,7 +2078,7 @@ impl Driver<'_> {
                         .ok_or_else(|| failure("accepted state history is too short"))
                 };
                 let mut storage = [0.0; IntegrationMethod::MAX_GEAR_ORDER as usize + 2];
-                let bound = if explicit_derivative {
+                let bound = if self.index_aware || explicit_derivative {
                     let derivative = &mut storage[..=order];
                     derivative[0] = trial.values()[base + 1];
                     for (age, value) in derivative.iter_mut().enumerate().skip(1) {

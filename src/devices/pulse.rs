@@ -98,7 +98,7 @@ pub(super) fn physical_cycle(
     if passed(guess) && guess + 1. < MAX_CYCLE && !passed(guess + 1.) {
         return Some(guess + 1.);
     }
-    if guess > 0. && !passed(guess - 1.) && (guess == 1. || passed(guess - 2.)) {
+    if guess > 0. && !passed(guess - 1.) && (guess <= 1. || passed(guess - 2.)) {
         return Some(guess - 1.);
     }
     seek_cycle(0., passed)
