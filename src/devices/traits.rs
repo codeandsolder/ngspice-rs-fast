@@ -1441,6 +1441,13 @@ pub trait Device: fmt::Debug + std::any::Any {
         })
     }
 
+    /// Local charge/charge-rate history pairs supplied by the physical Taylor
+    /// kernel. Unlike a global MNA charge row, these identify one device's
+    /// own constitutive storage even when several devices share a node.
+    fn physical_taylor_storage_slots(&self) -> &[usize] {
+        &[]
+    }
+
     /// Assemble nonlinear physical residual/charge Taylor coefficients and
     /// the corresponding state-Jacobian jets.
     ///

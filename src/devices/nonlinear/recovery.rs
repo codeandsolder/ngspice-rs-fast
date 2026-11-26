@@ -165,6 +165,9 @@ impl Recovery {
     ) -> SpiceResult<()> {
         let node = context.unknowns.node_row(self.node);
         let gain = -self.row_weight * self.scale * self.tt;
+        let charge = context.variable(node)?.scale(self.scale.recip());
+        let gradient = crate::maths::taylor::Jet::constant(charge.order(), self.scale.recip());
+        context.record_charge(CHARGE_SLOT, &charge, node.map(|node| (node, gradient)))?;
         context.branch_taylor(
             [node, None],
             junction,

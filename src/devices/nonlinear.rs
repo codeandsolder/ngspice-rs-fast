@@ -2024,6 +2024,14 @@ impl Device for Diode {
             recovery.not_converged(context, current)
         })
     }
+    fn physical_taylor_storage_slots(&self) -> &[usize] {
+        if self.recovery_node.is_some() {
+            &[DIODE_CHARGE_SLOT, recovery::CHARGE_SLOT]
+        } else {
+            &[DIODE_CHARGE_SLOT]
+        }
+    }
+
     fn assemble_nonlinear_taylor(
         &self,
         context: &mut crate::devices::physical_dae::TaylorContext<'_>,
@@ -2336,12 +2344,6 @@ mod tests {
     #[test]
     fn diode_taylor_reconstructs_physical_scalar_equations() -> SpiceResult<()> {
         use crate::maths::taylor::Jet;
-        let close = |actual: Real, expected: Real| {
-            assert!(
-                (actual - expected).abs() <= 2e-11 * actual.abs().max(expected.abs()).max(1e-30),
-                "{actual:e} vs {expected:e}"
-            );
-        };
         for (model, instance) in [
             ("is=1e-18 n=10", ""),
             (
@@ -2380,10 +2382,17 @@ mod tests {
                                 .rev()
                                 .fold(0_f64, |sum, coefficient| sum.mul_add(t, *coefficient))
                         };
-                        close(at(&current.value), expected.current);
-                        close(at(&current.slope), expected.conductance);
-                        close(at(&charge.value), expected.charge);
-                        close(at(&charge.slope), expected.capacitance);
+                        let close = |kind: &str, actual: Real, expected: Real| {
+                            assert!(
+                                (actual - expected).abs()
+                                    <= 2e-11 * actual.abs().max(expected.abs()).max(1e-30),
+                                "{model} {temperature} {voltage} {t} {kind}: {actual:e} vs {expected:e}"
+                            );
+                        };
+                        close("I", at(&current.value), expected.current);
+                        close("G", at(&current.slope), expected.conductance);
+                        close("Q", at(&charge.value), expected.charge);
+                        close("C", at(&charge.slope), expected.capacitance);
                     }
                 }
             }
