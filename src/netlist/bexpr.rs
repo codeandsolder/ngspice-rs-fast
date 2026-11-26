@@ -221,7 +221,10 @@ pub struct TableTransfer {
 
 /// The function names of `inpptree.c`'s `funcs[]` table (plus the
 /// parse-time `ternary_fcn` and `gauss`), in that order. Only these names are
-/// callable in a B expression; anything else must be a user `.func`.
+/// callable in a B expression.
+///
+/// Explicit prepared source-law intrinsics are listed alongside native
+/// built-ins. Other names must be user `.func` calls.
 pub const BUILTIN_FUNCTIONS: &[&str] = &[
     "abs",
     "acos",
@@ -258,6 +261,10 @@ pub const BUILTIN_FUNCTIONS: &[&str] = &[
     "le0",
     "pow",
     "pwr",
+    "simetrix_abs_pow",
+    "simetrix_caret_pow",
+    "simetrix_pow",
+    "simetrix_abs_pow_product",
     "min",
     "max",
     "ddt",

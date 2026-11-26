@@ -1,6 +1,6 @@
 //! The previous tree differentiator, retained only as a regression oracle.
 
-use super::{Binary, Node, Operator, Real, Tree, Unary, c_pow, unary_value};
+use super::{Binary, Node, Operator, PowerLaw, PowerPart, Real, Tree, Unary, c_pow, unary_value};
 use std::sync::Arc;
 
 thread_local! {
@@ -122,17 +122,9 @@ fn squared(u: &Tree) -> Tree {
 }
 
 /// `mkf(PTF_LOG, mkf(PTF_ABS, a))`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PowerRule {
-    Ordinary,
-    Signed,
-}
-
-fn differentiate_power(rule: PowerRule, a: &Tree, b: &Tree, variable: usize) -> Tree {
-    let (base, exponent) = match rule {
-        PowerRule::Ordinary => (Binary::PowBaseSlope, Binary::PowExponentSlope),
-        PowerRule::Signed => (Binary::PwrBaseSlope, Binary::PwrExponentSlope),
-    };
+fn differentiate_power(law: PowerLaw, a: &Tree, b: &Tree, variable: usize) -> Tree {
+    let base = Binary::Power(law, PowerPart::Base);
+    let exponent = Binary::Power(law, PowerPart::Exponent);
     let left = times(mk_binary(base, a, b.clone()), differentiate(a, variable));
     let db = differentiate(b, variable);
     if db.constant() == Some(0.) {
@@ -235,8 +227,11 @@ pub(super) fn differentiate(p: &Tree, variable: usize) -> Tree {
             ),
             squared(b),
         ),
-        Node::Operator(Operator::Power, a, b) | Node::Binary(Binary::Pow, a, b) => {
-            differentiate_power(PowerRule::Ordinary, a, b, variable)
+        Node::Operator(Operator::Power, a, b) => {
+            differentiate_power(PowerLaw::NativePow, a, b, variable)
+        }
+        Node::Binary(Binary::Power(law, PowerPart::Value), a, b) => {
+            differentiate_power(*law, a, b, variable)
         }
         Node::Ternary(condition, then, otherwise) => mk_ternary(
             condition.clone(),
@@ -259,14 +254,9 @@ pub(super) fn differentiate(p: &Tree, variable: usize) -> Tree {
                 differentiate(b, variable),
             )
         }
-        Node::Binary(Binary::Pwr, a, b) => differentiate_power(PowerRule::Signed, a, b, variable),
-        Node::Binary(
-            Binary::PowBaseSlope
-            | Binary::PwrBaseSlope
-            | Binary::PowExponentSlope
-            | Binary::PwrExponentSlope,
-            ..,
-        ) => panic!("derivative instruction is not a source expression"),
+        Node::Binary(Binary::Power(_, PowerPart::Base | PowerPart::Exponent), ..) => {
+            panic!("derivative instruction is not a source expression")
+        }
         Node::Unary(function, u) => times(unary_slope(*function, u), differentiate(u, variable)),
         Node::Pwl(u, table) => {
             let slope = u.constant().map_or_else(
