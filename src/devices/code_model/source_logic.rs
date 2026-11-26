@@ -6,56 +6,142 @@ use super::{
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Operation {
-    Gate(GateKind),
+pub(super) enum SrPolicy {
     ResetDominant,
     SetDominant,
     HoldOnEqual,
+    ToggleOnBoth,
 }
 
-impl Operation {
-    pub(super) fn from_value(value: Real, inputs: usize) -> SpiceResult<Self> {
-        if inputs == 0 {
-            return Err(SpiceError::circuit("empty logic input vector"));
-        }
-        let operation = match value {
-            0. => Self::Gate(GateKind::And),
-            1. => Self::Gate(GateKind::Or),
-            2. => Self::Gate(GateKind::Nand),
-            3. => Self::Gate(GateKind::Nor),
-            4. => Self::ResetDominant,
-            5. => Self::SetDominant,
-            6. => Self::HoldOnEqual,
-            _ => return Err(SpiceError::circuit("unsupported native logic operation")),
-        };
-        if !matches!(operation, Self::Gate(_)) && inputs != 2 {
-            return Err(SpiceError::circuit("latch requires set and reset inputs"));
-        }
-        Ok(operation)
-    }
-
-    fn desired(self, inputs: &[Drive], committed: Logic) -> SpiceResult<Logic> {
-        if inputs.iter().any(|drive| drive.logic == Logic::Unknown) {
-            return Err(SpiceError::circuit(
-                "qualified receiver supplied unknown logic",
-            ));
-        }
-        if let Self::Gate(kind) = self {
-            return Ok(kind.evaluate(inputs));
-        }
-        let [set, reset] = inputs else {
-            return Err(SpiceError::circuit("invalid latch input dimensions"));
-        };
-        Ok(match (set.logic, reset.logic) {
+impl SrPolicy {
+    const fn next(self, set: Logic, reset: Logic, previous: Logic) -> Logic {
+        match (set, reset) {
             (Logic::One, Logic::Zero) => Logic::One,
             (Logic::Zero, Logic::One) => Logic::Zero,
             (Logic::One, Logic::One) => match self {
                 Self::ResetDominant => Logic::Zero,
                 Self::SetDominant => Logic::One,
-                _ => committed,
+                Self::HoldOnEqual => previous,
+                Self::ToggleOnBoth => previous.invert(),
             },
-            _ => committed,
-        })
+            _ => previous,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ClockedKind {
+    Sr,
+    Jk,
+    Data,
+    Toggle,
+}
+
+impl ClockedKind {
+    const fn arity(self) -> usize {
+        match self {
+            Self::Sr | Self::Jk => 3,
+            Self::Data | Self::Toggle => 2,
+        }
+    }
+
+    fn capture(self, inputs: &[Drive], previous: Logic) -> SpiceResult<Logic> {
+        match (self, inputs) {
+            (Self::Sr, [set, reset, _]) => {
+                Ok(SrPolicy::HoldOnEqual.next(set.logic, reset.logic, previous))
+            }
+            (Self::Jk, [set, reset, _]) => {
+                Ok(SrPolicy::ToggleOnBoth.next(set.logic, reset.logic, previous))
+            }
+            (Self::Data, [data, _]) => Ok(data.logic),
+            (Self::Toggle, [toggle, _]) => Ok(if toggle.logic == Logic::One {
+                previous.invert()
+            } else {
+                previous
+            }),
+            _ => Err(SpiceError::circuit(
+                "invalid clocked logic input dimensions",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Operation {
+    Gate(GateKind),
+    Sr(SrPolicy),
+    Clocked { kind: ClockedKind, trigger: Logic },
+    Enabled(Logic),
+}
+
+impl Operation {
+    pub(super) fn from_value(value: Real, inputs: usize) -> SpiceResult<Self> {
+        let clocked = |kind, trigger| Self::Clocked { kind, trigger };
+        let operation = match value {
+            0. => Self::Gate(GateKind::And),
+            1. => Self::Gate(GateKind::Or),
+            2. => Self::Gate(GateKind::Nand),
+            3. => Self::Gate(GateKind::Nor),
+            4. => Self::Sr(SrPolicy::ResetDominant),
+            5. => Self::Sr(SrPolicy::SetDominant),
+            6. => Self::Sr(SrPolicy::HoldOnEqual),
+            7. => clocked(ClockedKind::Sr, Logic::One),
+            8. => clocked(ClockedKind::Sr, Logic::Zero),
+            9. => clocked(ClockedKind::Jk, Logic::One),
+            10. => clocked(ClockedKind::Jk, Logic::Zero),
+            11. => clocked(ClockedKind::Data, Logic::One),
+            12. => clocked(ClockedKind::Data, Logic::Zero),
+            13. => clocked(ClockedKind::Toggle, Logic::One),
+            14. => clocked(ClockedKind::Toggle, Logic::Zero),
+            15. => Self::Enabled(Logic::One),
+            16. => Self::Enabled(Logic::Zero),
+            _ => return Err(SpiceError::circuit("unsupported native logic operation")),
+        };
+        let valid = match operation {
+            Self::Gate(_) => inputs > 0,
+            Self::Sr(_) | Self::Enabled(_) => inputs == 2,
+            Self::Clocked { kind, .. } => inputs == kind.arity(),
+        };
+        if !valid {
+            return Err(SpiceError::circuit("invalid native logic input arity"));
+        }
+        Ok(operation)
+    }
+
+    fn desired(
+        self,
+        inputs: &[Drive],
+        state: &mut LogicState,
+        initial: bool,
+    ) -> SpiceResult<Logic> {
+        if inputs.iter().any(|drive| drive.logic == Logic::Unknown) {
+            return Err(SpiceError::circuit(
+                "qualified receiver supplied unknown logic",
+            ));
+        }
+        match (self, inputs) {
+            (Self::Gate(kind), _) => Ok(kind.evaluate(inputs)),
+            (Self::Sr(policy), [set, reset]) => {
+                Ok(policy.next(set.logic, reset.logic, state.committed))
+            }
+            (Self::Enabled(active), [data, enable]) => Ok(if enable.logic == active {
+                data.logic
+            } else {
+                state.committed
+            }),
+            (Self::Clocked { kind, trigger }, [.., clock]) => {
+                let previous_clock = std::mem::replace(&mut state.clock, clock.logic);
+                // Bias initialization establishes receiver history, not an edge.
+                // The most recent captured bit is independent of output delay.
+                // A timer wakeup or a nontriggering input must not erase it.
+                if !initial && previous_clock != clock.logic && clock.logic == trigger {
+                    kind.capture(inputs, state.requested)
+                } else {
+                    Ok(state.requested)
+                }
+            }
+            _ => Err(SpiceError::circuit("invalid logic input dimensions")),
+        }
     }
 }
 
@@ -73,6 +159,7 @@ pub(super) struct LogicState {
     committed: Logic,
     requested: Logic,
     deadline: Option<Real>,
+    clock: Logic,
 }
 
 impl CodeModel for LogicKernel {
@@ -87,6 +174,7 @@ impl CodeModel for LogicKernel {
             committed: self.initial,
             requested: self.initial,
             deadline: None,
+            clock: Logic::Unknown,
         }
     }
 
@@ -107,9 +195,10 @@ impl CodeModel for LogicKernel {
         }
         if context.initial {
             state.committed = self.initial;
+            state.requested = self.initial;
             state.deadline = None;
         }
-        let desired = self.operation.desired(inputs, state.committed)?;
+        let desired = self.operation.desired(inputs, state, context.initial)?;
         let delay = if context.initial {
             state.committed = desired;
             state.requested = desired;

@@ -389,3 +389,106 @@ fn mixed_vector_type_changes_inherit_within_group() -> SpiceResult<()> {
     );
     Ok(())
 }
+
+#[test]
+fn clocked_and_enabled_logic_match_independent_reference() -> SpiceResult<()> {
+    let deck = Parser::new().parse_deck(&parse_deck_text(
+        Path::new("sequential.cir"),
+        include_str!("fixtures/native-logic/sequential.cir"),
+    ))?;
+    let mut c = Circuit::from_netlist(&deck)?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "7u", "0", "1n"])?;
+    let times: Vec<_> = (0..plot.point_count())
+        .map(|i| plot.value("time", i).unwrap().re)
+        .collect();
+    let mut nodes = std::collections::BTreeSet::new();
+    for row in include_str!("fixtures/native-logic/sequential-levels.csv")
+        .lines()
+        .skip(1)
+    {
+        let fields: Vec<_> = row.split(',').collect();
+        nodes.insert(fields[0]);
+        let time: f64 = fields[1].parse().unwrap();
+        let expected: f64 = fields[2].parse().unwrap();
+        let index = times.partition_point(|t| *t < time).min(times.len() - 1);
+        let actual = plot.value(&format!("v({})", fields[0]), index).unwrap().re;
+        assert!(
+            (actual - expected).abs() < 1e-8,
+            "{} at {time}: {actual} != {expected}",
+            fields[0]
+        );
+    }
+    let mut max_edge_error: f64 = 0.;
+    for node in nodes {
+        let name = format!("v({node})");
+        let expected: Vec<_> = include_str!("fixtures/native-logic/sequential-transitions.csv")
+            .lines()
+            .skip(1)
+            .filter_map(|row| {
+                let fields: Vec<_> = row.split(',').collect();
+                (fields[0] == node).then(|| {
+                    (
+                        fields[1].parse::<f64>().unwrap(),
+                        fields[2].parse::<f64>().unwrap(),
+                    )
+                })
+            })
+            .collect();
+        let actual: Vec<_> = (1..times.len())
+            .filter_map(|i| {
+                let prev = plot.value(&name, i - 1).unwrap().re;
+                let value = plot.value(&name, i).unwrap().re;
+                ((prev > 2.5) != (value > 2.5)).then_some((times[i], value))
+            })
+            .collect();
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{node}: actual {actual:?}, expected {expected:?}"
+        );
+        for ((time, voltage), (reference_time, reference_voltage)) in
+            actual.into_iter().zip(expected)
+        {
+            close(voltage, reference_voltage);
+            max_edge_error = max_edge_error.max((time - reference_time).abs());
+            assert!(
+                (time - reference_time).abs() <= 2e-9,
+                "{node}: {time} != {reference_time}"
+            );
+        }
+    }
+    eprintln!("sequential reference: maximum edge error {max_edge_error:e} s");
+    Ok(())
+}
+
+#[test]
+fn clocked_inertial_capture_survives_intervening_receiver_changes() -> SpiceResult<()> {
+    // At 1.015 us, D is high. D falls at 1.050 us and the clock falls
+    // before the 1.115 us deadline. Neither is a rising sampling edge.
+    let mut c = circuit(
+        "vd d 0 pwl(0 4 1.04u 4 1.06u 0 4u 0)\n\
+         vc clk 0 pulse(0 4 1u 20n 20n 40n 2u)\n\
+         a1 %v[d clk] bit ff\n.model ff preprocess_logic_event(operation=11 delay=100n inertial=true)\n\
+         a2 bit out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "4u", "0", "1n"])?;
+    let mut edges = Vec::new();
+    for i in 1..plot.point_count() {
+        let before = output(&plot, i - 1);
+        let after = output(&plot, i);
+        if (before > 2.5) != (after > 2.5) {
+            edges.push((plot.value("time", i).unwrap().re, after));
+        }
+    }
+    assert_eq!(edges.len(), 2, "{edges:?}");
+    for ((time, voltage), (expected_time, expected_voltage)) in
+        edges.into_iter().zip([(1.115e-6, 5.), (3.115e-6, 0.)])
+    {
+        close(voltage, expected_voltage);
+        assert!(
+            (time - expected_time).abs() <= 1e-9,
+            "{time} != {expected_time}"
+        );
+    }
+    Ok(())
+}

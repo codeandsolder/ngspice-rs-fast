@@ -66,7 +66,10 @@ continue using the analog backend.
 
 `preprocess_logic_event` binds qualified analog receivers to the native
 transactional event network, with AND, OR, NAND, NOR and reset-dominant,
-set-dominant and hold-on-equal latches (operations 0–6). Strict threshold
+set-dominant and hold-on-equal latches (operations 0–6), rising/falling-edge
+SR/JK/D/T storage (7–14), and active-high/low transparent latches (15–16).
+Clocked storage retains the most recent logical capture independently of
+its pending output propagation; no startup edge is invented. Strict threshold
 comparisons retain the previous receiver state at equality and between
 thresholds. Each input has independent inversion and initial receiver state.
 Transport changes schedule delayed output events; inertial changes commit
@@ -82,7 +85,7 @@ network. Separate accepted event counters are available via
 
 The `preprocess_timed_switch` descriptor is available for typed syntax;
 its conductance kernel is a separate implementation task. Operations outside
-0–6 are rejected rather than approximated.
+0–16 are rejected rather than approximated.
 
 ## Numerical verification
 

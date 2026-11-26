@@ -32,3 +32,15 @@ rows are the first reference samples on the opposite side of the midpoint
 (2.113636363636364 V for matrix, 2.5 V for pulse). No interpolation or
 smoothing of reference transitions. The native tests compare the same
 settled values, direction, number and timing of edges.
+
+
+The sequential matrix adds 22 configurations spanning operations 7–16 with
+zero delay and transport delay, plus positive inertial delay for transparent
+latches. It uses the same ngspice-47 reference and 1 ns maximum timestep,
+with a 7 us stop time and 2.5 V transition midpoint. The sampled columns are
+named in the CSV headers/rows; nominal times are 0, 0.5, 1.3, 1.95, 2.4,
+3.3, 3.95, 4.4, 5.3, 5.95, 6.4 and 7 us. 264 sampled levels and 53
+transitions. The producer's positive-inertial-delay clocked models currently
+lose captured events (ngspice-rs-preprocess #78); native positive-inertial
+clocked timing is tested independently against the specified edge and
+propagation time, not against that known defective oracle.
