@@ -37,7 +37,7 @@ env:
 jobs:
   strict-rust:
     name: Strict Rust and workflow policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@073d436b3d759343900bdc5e4ddecfa120792b8c # pinned
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@073d436b3d759343900bdc5e4ddecfa120792b8c # main
     with:
       rust-toolchain: nightly-2026-11-20
       allow-test-panics: true
