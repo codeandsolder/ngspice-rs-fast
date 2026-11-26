@@ -155,3 +155,53 @@ impl CodeModel for LogicKernel {
         }])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::digital::{Engine, Limits, Network};
+
+    #[test]
+    fn deadline_cancellation_and_rejected_trial_preserve_state() -> SpiceResult<()> {
+        let mut network = Network::default();
+        let input = network.add_net();
+        let output = network.add_net();
+        let source = network.add_source(input)?;
+        network.add_model(
+            LogicKernel {
+                operation: Operation::Gate(GateKind::And),
+                inputs: 1,
+                initial: Logic::Zero,
+                delay: 2.,
+                mode: DelayMode::Inertial,
+            },
+            &[input],
+            &[output],
+        )?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let mut initial = engine.trial();
+        initial.schedule(source, 0., Drive::strong(Logic::Zero))?;
+        initial.schedule(source, 1., Drive::strong(Logic::One))?;
+        initial.advance_to(2.)?;
+        initial.commit()?;
+        let before = engine.stats();
+        {
+            let mut rejected = engine.trial();
+            rejected.advance_to(3.)?;
+            assert_eq!(rejected.value(output), Some(Drive::strong(Logic::One)));
+        }
+        assert_eq!(engine.stats(), before);
+        let mut equal_width = engine.trial();
+        equal_width.schedule(source, 3., Drive::strong(Logic::Zero))?;
+        equal_width.advance_to(5.)?;
+        assert_eq!(equal_width.value(output), Some(Drive::strong(Logic::Zero)));
+        assert!(
+            equal_width
+                .changes()
+                .iter()
+                .all(|change| change.net != output)
+        );
+        equal_width.commit()?;
+        Ok(())
+    }
+}

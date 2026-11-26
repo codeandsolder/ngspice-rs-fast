@@ -92,7 +92,7 @@ impl PortSpec {
 impl SourceModel {
     /// Registered model type, without applying node aliasing.
     #[must_use]
-    pub fn from_base(base: &str) -> Option<Self> {
+    pub const fn from_base(base: &str) -> Option<Self> {
         if base.eq_ignore_ascii_case("s_xfer") {
             Some(Self::RationalTransfer)
         } else if base.eq_ignore_ascii_case("preprocess_logic_event") {
@@ -172,15 +172,16 @@ impl SourceModel {
     /// Unknown domain, invalid grouping, inversion, missing or extra ports.
     pub fn validate_ports(self, instance: &DeviceInstance) -> SpiceResult<()> {
         let invalid = |message| SpiceError::parse(instance.location.clone(), message);
+        let schema_ports = self.ports();
         if !instance.nodes.is_empty()
             || !instance.parameters.is_empty()
-            || instance.code_ports.len() != self.ports().len()
+            || instance.code_ports.len() != schema_ports.len()
         {
             return Err(invalid(
                 "invalid A-instance port count or instance parameters",
             ));
         }
-        for (port, spec) in instance.code_ports.iter().zip(self.ports()) {
+        for (port, spec) in instance.code_ports.iter().zip(schema_ports) {
             let kind = if port.kind == CodePortKind::Default {
                 spec.default
             } else {
@@ -276,7 +277,7 @@ fn validate_value(
 ) -> SpiceResult<()> {
     let valid = match shape {
         ParameterShape::Integer | ParameterShape::IntegerVector => value.fract() == 0.,
-        ParameterShape::Boolean | ParameterShape::BooleanVector => value == 0. || value == 1.,
+        ParameterShape::Boolean | ParameterShape::BooleanVector => matches!(value, 0. | 1.),
         ParameterShape::Real | ParameterShape::RealVector => true,
     };
     if !valid {
@@ -576,7 +577,13 @@ fn bind_receiver(
     let output = digital_net(network, names, &device.output, limits.nodes)?;
     let mut inputs = Vec::with_capacity(device.receivers.len());
     let zero = Delays::new(0., 0.)?;
-    for (terminals, &thresholds) in device.terminals.chunks_exact(2).zip(&device.receivers) {
+    for (terminals, &thresholds) in device
+        .terminals
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(&device.receivers)
+    {
         if network.net_count() >= limits.nodes || adcs.len() >= limits.state_slots {
             return Err(SpiceError::circuit(
                 "qualified receiver resource limit exceeded",
@@ -587,7 +594,7 @@ fn bind_receiver(
         let net = network.add_net();
         let source = network.add_source(net)?;
         adcs.push(AdcBinding {
-            terminals: [terminals[0], terminals[1]],
+            terminals: *terminals,
             source,
             thresholds,
             delays: zero,
@@ -606,6 +613,9 @@ pub(in crate::devices) fn mixed_topology(
 ) -> SpiceResult<Option<NativeTopology>> {
     let mut topology = None;
     for device in devices {
+        if device.designator() != 'a' {
+            continue;
+        }
         let any = device.as_ref() as &dyn std::any::Any;
         let receiver = any.downcast_ref::<LogicReceiverDevice>();
         let voltage = any

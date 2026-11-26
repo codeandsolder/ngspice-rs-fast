@@ -258,8 +258,7 @@ fn scan_token<'a>(
             let mut end = start + 1;
             while end < bytes.len()
                 && !bytes[end].is_ascii_whitespace()
-                && !DELIMITERS.contains(&bytes[end])
-                && !(code_card && b"[]~".contains(&bytes[end]))
+                && !(DELIMITERS.contains(&bytes[end]) || code_card && b"[]~".contains(&bytes[end]))
             {
                 end += 1;
             }
