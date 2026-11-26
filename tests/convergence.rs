@@ -505,3 +505,37 @@ fn longer_diode_chains_recover_without_transient_fallback() {
         assert_chain_physics(&plot, stages, profile_bound, 2e-4, 3e-17);
     }
 }
+
+/// The improved bias path changes pivot history. The subsequent unit
+/// excitation must still solve the original small-signal operator.
+#[test]
+fn recovered_long_chain_transfer_solves_the_original_operator() {
+    for stages in [1000_u32, 2000, 5000] {
+        let (junction, _) = chain_root(stages);
+        let conductance = (1e-14 / VT).mul_add((junction / VT).exp(), 1e-12);
+        let resistance = f64::from(stages).mul_add(100. + conductance.recip(), 1000.);
+        let netlist = parse(&format!(
+            "{}\n.tf v(n{stages}) v1",
+            diode_chain(stages as usize)
+        ));
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let plans = config.plans_for(&netlist.analyses).unwrap();
+        let plot = plans[0].run(&mut circuit, &config.context()).unwrap();
+        let output_impedance = format!("v(output_impedance_at_V(n{stages}))");
+        for (name, expected) in [
+            ("v(Transfer_function)", 1000. / resistance),
+            ("v(v1#Input_impedance)", resistance),
+            (
+                output_impedance.as_str(),
+                1000. * (resistance - 1000.) / resistance,
+            ),
+        ] {
+            let got = value(&plot, name);
+            assert!(
+                (got / expected - 1.).abs() <= 1e-6,
+                "{stages} stages {name}: {got:e} != {expected:e}"
+            );
+        }
+    }
+}

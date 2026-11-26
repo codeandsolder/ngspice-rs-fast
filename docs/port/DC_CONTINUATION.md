@@ -202,6 +202,19 @@ limiting, trial ownership, convergence tests and iteration budgets are
 preserved. Transient integration and hidden permuted SPARSE diagonal
 regularization retain the original absolute-coordinate path.
 
+When the final load used correction coordinates, the retained real factors
+also own that load's unfolded coefficient stamps. Subsequent normal (`.tf`)
+and transposed (`.sens`) RHS solves use those factors as a preconditioner for
+iterative corrections against the original physical operator. This prevents
+changes in Newton pivot history from degrading small-signal results. Every
+ordinary factor/load transaction invalidates those stamps, including an exact
+rounded-input cache hit: equal rounded coefficients do not establish equality
+of unfolded operators. No new factorization is required for corrections.
+The recovery stops on small relative coordinate updates, lack of progress, or
+a finite work bound; a stalled or exhausted correction budget emits a numerical
+warning and returns the candidate with the smallest observed relative update.
+This is a recovery criterion, not a general forward-error certificate.
+
 Independent validation on the 5 V series diode-chain benchmark (C ngspice
 47 SPARSE on Linux; voltage-profile error against a 70-digit scalar root):
 
