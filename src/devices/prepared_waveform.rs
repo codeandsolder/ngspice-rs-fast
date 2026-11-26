@@ -172,7 +172,7 @@ impl SidedPwl {
             if !r.period.is_finite()
                 || r.period <= 0.
                 || !r.origin.is_finite()
-                || knots[0].time != 0.
+                || knots[0].time.abs().to_bits() != 0
                 || knots[knots.len() - 1].time >= r.period
                 || r.hold.is_some_and(|v| !v.is_finite())
             {
@@ -187,9 +187,13 @@ impl SidedPwl {
         })
     }
 
-    fn event_time(&self, cycle: Real, knot: usize) -> Real {
-        self.repeat.map_or(self.knots[knot].time, |r| {
-            r.origin + cycle.mul_add(r.period, self.knots[knot].time)
+    fn absolute_time(&self, cycle: Real, time: Real) -> Real {
+        self.repeat.map_or(time, |r| {
+            if time.abs().to_bits() == 0 {
+                Self::cycle_start(r, cycle)
+            } else {
+                r.origin + cycle.mul_add(r.period, time)
+            }
         })
     }
 
@@ -214,16 +218,34 @@ impl SidedPwl {
         if cycle.abs() >= MAX_CYCLE || !(start <= time && time < end && end.is_finite()) {
             return Err(invalid("unrepresentable cycle boundaries"));
         }
-        self.check_spacing(start.abs().max(end.abs()), cycle, r)?;
+        if !self.spacing_proven(cycle, cycle, r) {
+            // A short query need not reject a representable cycle merely
+            // because the inexpensive uniform rounding bound is inconclusive.
+            let mut previous = start;
+            for knot in self.knots.iter().skip(1) {
+                let next = self.absolute_time(cycle, knot.time);
+                if !(previous < next && next < end) {
+                    return Err(invalid("unrepresentable periodic knot spacing"));
+                }
+                previous = next;
+            }
+        }
         Ok(cycle)
     }
 
-    fn check_spacing(&self, extent: Real, cycle: Real, r: Repeat) -> SpiceResult<()> {
-        let scale = extent.max((cycle * r.period).abs());
-        if self.min_spacing < scale.next_up() - scale {
-            return Err(invalid("unrepresentable periodic knot spacing"));
-        }
-        Ok(())
+    // Both the fused cycle-plus-knot operation and the addition of origin
+    // round once. The combined error of two adjacent events is at most two
+    // ULPs at an upper bound on the magnitude of either intermediate.
+    // Strict separation also excludes rounding-to-even ties. This uniform
+    // proof is independent of the number of cycles in the requested window.
+    fn spacing_proven(&self, first: Real, last: Real, r: Repeat) -> bool {
+        let end = last + 1.;
+        let scale = Self::cycle_start(r, first)
+            .abs()
+            .max(Self::cycle_start(r, end).abs())
+            .max((first * r.period).abs())
+            .max((end * r.period).abs());
+        self.min_spacing > 2. * (scale.next_up() - scale)
     }
 
     #[expect(
@@ -242,15 +264,9 @@ impl SidedPwl {
             }
             None => 0.,
         };
-        let upper = self.knots.partition_point(|k| {
-            self.repeat.map_or(k.time, |r| {
-                if k.time == 0. {
-                    Self::cycle_start(r, cycle)
-                } else {
-                    r.origin + cycle.mul_add(r.period, k.time)
-                }
-            }) <= time
-        });
+        let upper = self
+            .knots
+            .partition_point(|k| self.absolute_time(cycle, k.time) <= time);
         if upper == 0 {
             return Ok(self.knots[0].left);
         }
@@ -278,16 +294,13 @@ impl SidedPwl {
         let fraction = if span.is_finite() {
             (time - t0) / span
         } else {
-            (time * 0.5 - t0 * 0.5) / (t1 * 0.5 - t0 * 0.5)
+            t0.mul_add(-0.5, time * 0.5) / t0.mul_add(-0.5, t1 * 0.5)
         };
         Ok(affine_value(left.right, v1, fraction))
     }
 
     fn time_at(&self, cycle: Real, knot: usize) -> Real {
-        match self.repeat {
-            Some(r) if knot == 0 => Self::cycle_start(r, cycle),
-            _ => self.event_time(cycle, knot),
-        }
+        self.absolute_time(cycle, self.knots[knot].time)
     }
 
     fn events(&self, start: Real, end: Real) -> SpiceResult<PwlEvents> {
@@ -300,20 +313,21 @@ impl SidedPwl {
                     self.cycle_at(start, r)?
                 };
                 let last = self.cycle_at(end, r)?;
-                self.check_spacing(start.abs().max(end.abs()), first.abs().max(last.abs()), r)?;
+                // Each endpoint cycle has been checked exactly if necessary.
+                // For an arbitrarily long window require a uniform proof:
+                // iterating all intervening cycles would destroy laziness.
+                if first < last && !self.spacing_proven(first, last, r) {
+                    return Err(invalid(
+                        "unrepresentable periodic knot spacing over event window",
+                    ));
+                }
                 (first, false)
             }
             None => (0., false),
         };
-        let index = self.knots.partition_point(|k| {
-            self.repeat.map_or(k.time, |r| {
-                if k.time == 0. {
-                    Self::cycle_start(r, cycle)
-                } else {
-                    r.origin + cycle.mul_add(r.period, k.time)
-                }
-            }) < start
-        });
+        let index = self
+            .knots
+            .partition_point(|k| self.absolute_time(cycle, k.time) < start);
         Ok(PwlEvents {
             pwl: self.clone(),
             cycle,

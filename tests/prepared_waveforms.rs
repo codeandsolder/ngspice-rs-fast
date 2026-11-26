@@ -332,3 +332,26 @@ fn explicit_root_candidate_rebinds_without_changing_source_rows_or_ac() {
         close(plot.value("v(a)", 0).unwrap().re, height, 1e-12);
     }
 }
+
+#[test]
+fn rounded_periodic_knots_cannot_silently_collapse() {
+    let period = 1.169423730035861e-89;
+    let origin = -1.3266700643923667e-90;
+    let wave = pwl(
+        vec![
+            knot(0., 0., 0.),
+            knot(9.999089847601106e-90, 0., 1.),
+            knot(9.999089847601113e-90, 1., 0.),
+        ],
+        Some(Repeat {
+            origin,
+            period,
+            hold: None,
+        }),
+        0.,
+    );
+    let begin = 2_f64.mul_add(period, origin);
+    let end = 3_f64.mul_add(period, origin);
+    assert!(wave.breakpoints_in(begin, end).is_err());
+    assert!(wave.value_at(begin, Limit::Right).is_err());
+}
