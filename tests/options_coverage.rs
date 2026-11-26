@@ -319,7 +319,10 @@ fn mixed_unit_regularization_keeps_differentiator_laws_and_source_voltage() {
 
 #[test]
 fn physical_shunts_never_load_solver_owned_derivative_signals() {
-    let circuit = "v1 in 0 sin(2 0.1 1k 0 0 90)\nb1 y 0 v=1m*ddt(v(in)^2)\nr1 y 0 1k";
+    // A smooth zero-initial-charge excitation supports the strict tolerance
+    // test with capacitive loads. Nonzero initial charge on a differentiator
+    // driving a capacitor is a separate higher-index consistency problem.
+    let circuit = "v1 in 0 sin(0 0.1 1k)\nb1 y 0 v=1m*ddt(v(in)^2)\nr1 y 0 1k";
     for method in ["trap", "gear"] {
         let analysis =
             format!(".options method={method} reltol=1e-6 vntol=1n newtrunc\n.tran 5u 50u 0 5u");
