@@ -272,6 +272,17 @@ impl Diode {
         let (current, charge) = thermal.taylor(&v, context.model.gmin, recovery.is_some())?;
         context.branch_taylor(rows, rows, &current.value, &current.slope, false)?;
         context.branch_taylor(rows, rows, &charge.value, &charge.slope, true)?;
+        let gradients = if rows[0] == rows[1] {
+            Vec::new()
+        } else {
+            rows.into_iter()
+                .zip([1., -1.])
+                .filter_map(|(column, sign)| {
+                    column.map(|column| (column, charge.slope.clone().scale(sign)))
+                })
+                .collect()
+        };
+        context.record_charge(super::DIODE_CHARGE_SLOT, &charge.value, gradients)?;
         let external = context.unknowns.node_row(self.terminals[0]);
         if external != rows[0] {
             for (row, sign) in [external, rows[0]].into_iter().zip([1., -1.]) {

@@ -11,6 +11,7 @@ use crate::devices::{
 };
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceError, SpiceResult};
+use std::collections::BTreeMap;
 
 /// Exact physical residuals and their Jacobians with respect to the state.
 pub struct PhysicalDaePoint {
@@ -35,6 +36,7 @@ pub struct PhysicalDae<'run, 'circuit> {
     trial: Option<TrialState>,
     rhs: Vector,
     point: PhysicalDaePoint,
+    storage_bindings: Vec<(usize, String)>,
 }
 
 impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
@@ -60,6 +62,7 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
             history: circuit.independent_state_history()?,
             trial: None,
             rhs: Vector::zeros(n),
+            storage_bindings: run.physical_taylor_storage_bindings(&model)?,
             point: PhysicalDaePoint {
                 residual: Vector::zeros(n),
                 charge: Vector::zeros(n),
@@ -67,6 +70,10 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
                 capacitance: SparseMatrix::new(n, n),
             },
         })
+    }
+
+    pub(crate) fn storage_bindings(&self) -> &[(usize, String)] {
+        &self.storage_bindings
     }
 
     /// Analytic coefficients of the independent forcing in the same
@@ -126,6 +133,18 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         if limit == Limit::Left {
             negate_odd_vectors(&mut output.residual);
             negate_odd_vectors(&mut output.charge);
+            for storage in output.storage.values_mut() {
+                for coefficients in std::iter::once(&mut storage.values).chain(
+                    storage
+                        .gradients
+                        .iter_mut()
+                        .map(|(_, coefficients)| coefficients),
+                ) {
+                    for value in coefficients.iter_mut().skip(1).step_by(2) {
+                        *value = -*value;
+                    }
+                }
+            }
             for matrices in [&mut output.conductance, &mut output.capacitance] {
                 for matrix in matrices.iter_mut().skip(1).step_by(2) {
                     let (rows, cols) = (matrix.rows(), matrix.cols());
@@ -137,6 +156,16 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
             }
         }
         output.validate()?;
+        if !output
+            .storage
+            .keys()
+            .copied()
+            .eq(self.storage_bindings.iter().map(|(slot, _)| *slot))
+        {
+            return Err(SpiceError::circuit(
+                "physical Taylor storage does not match declared history bindings",
+            ));
+        }
         Ok(output)
     }
 
@@ -220,6 +249,13 @@ fn reverse_odd_vectors(vectors: &[Vector]) -> Vec<Vector> {
     reversed
 }
 
+/// A device-local stored charge, in its history units rather than the
+/// signed sum of all device contributions to a global MNA equation.
+pub(crate) struct LocalChargeTaylor {
+    pub(crate) values: Vec<Real>,
+    pub(crate) gradients: Vec<(usize, Vec<Real>)>,
+}
+
 /// Coefficients of the physical equations and their state Jacobians.
 ///
 /// Index k denotes the coefficient of the k-th normalized time power.
@@ -233,6 +269,8 @@ pub struct PhysicalDaeTaylor {
     pub conductance: Vec<SparseMatrix>,
     /// Charge/flux Jacobian coefficients.
     pub capacitance: Vec<SparseMatrix>,
+    pub(crate) storage: BTreeMap<usize, LocalChargeTaylor>,
+    storage_coefficients: usize,
 }
 
 impl PhysicalDaeTaylor {
@@ -247,6 +285,8 @@ impl PhysicalDaeTaylor {
             charge: Vec::with_capacity(state.len()),
             conductance: Vec::with_capacity(state.len()),
             capacitance: Vec::with_capacity(state.len()),
+            storage: BTreeMap::new(),
+            storage_coefficients: 0,
         };
         for (degree, x) in state.iter().enumerate() {
             let mut f = system.a.mul_vector(x)?;
@@ -303,6 +343,7 @@ pub struct TaylorContext<'a> {
     pub(crate) unknowns: &'a crate::devices::MnaUnknowns,
     pub(crate) branch: Option<usize>,
     pub(crate) controls: &'a [usize],
+    pub(crate) state_slots: std::ops::Range<usize>,
     pub(crate) state: &'a [Vector],
     pub(crate) time: &'a crate::maths::taylor::Jet,
     pub(crate) output: &'a mut PhysicalDaeTaylor,
@@ -349,6 +390,60 @@ impl TaylorContext<'_> {
             for (matrix, &value) in self.output.conductance.iter_mut().zip(jet.coefficients()) {
                 matrix.add(row, column, scale * value)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Retain a device's own charge jet and sparse state gradient for
+    /// independent initial storage and companion constraints.
+    pub(crate) fn record_charge(
+        &mut self,
+        slot: usize,
+        value: &crate::maths::taylor::Jet,
+        gradients: impl IntoIterator<Item = (usize, crate::maths::taylor::Jet)>,
+    ) -> SpiceResult<()> {
+        if slot.saturating_add(1) >= self.state_slots.len() {
+            return Err(SpiceError::circuit("invalid physical Taylor charge slot"));
+        }
+        let degree = self.state.len();
+        let mut charge = LocalChargeTaylor {
+            values: value.coefficients().to_vec(),
+            gradients: Vec::new(),
+        };
+        let account = |output: &mut PhysicalDaeTaylor| -> SpiceResult<()> {
+            output.storage_coefficients = output
+                .storage_coefficients
+                .checked_add(degree)
+                .filter(|&count| count <= 8_388_608)
+                .ok_or_else(|| {
+                    SpiceError::circuit("physical Taylor charge coefficient budget exceeded")
+                })?;
+            Ok(())
+        };
+        value.check()?;
+        if charge.values.len() != degree {
+            return Err(SpiceError::circuit("invalid physical Taylor charge order"));
+        }
+        account(self.output)?;
+        for (column, gradient) in gradients {
+            gradient.check()?;
+            if column >= self.state[0].len() || gradient.coefficients().len() != degree {
+                return Err(SpiceError::circuit(
+                    "invalid physical Taylor charge gradient",
+                ));
+            }
+            account(self.output)?;
+            charge
+                .gradients
+                .push((column, gradient.coefficients().to_vec()));
+        }
+        if self
+            .output
+            .storage
+            .insert(self.state_slots.start + slot, charge)
+            .is_some()
+        {
+            return Err(SpiceError::circuit("duplicate physical Taylor charge slot"));
         }
         Ok(())
     }
