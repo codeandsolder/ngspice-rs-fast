@@ -75,6 +75,27 @@ impl SourceSpan {
     }
 }
 
+/// A macro body interpreted in the language of its eventual use site.
+///
+/// A valid definition may be accepted in just one phase: numparam and
+/// behavioural syntax have different operators and precedence. Diagnostics
+/// for the other phase are retained until a call selects that phase.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionBody {
+    /// Original text without the enclosing delimiters.
+    pub text: String,
+    /// Whether the definition uses braces or single quotes.
+    pub braced: bool,
+    /// Whether the delimiters are single quotes.
+    pub quoted: bool,
+    /// Physical and logical span of the original text.
+    pub span: SourceSpan,
+    /// Native scalar interpretation.
+    pub scalar: SpiceResult<Expr>,
+    /// Native behavioural interpretation.
+    pub behavioural: SpiceResult<crate::netlist::bexpr::BExpr>,
+}
+
 /// A parsed expression together with the text it was written as.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParameterExpression {
