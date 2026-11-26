@@ -77,7 +77,7 @@ impl Driver<'_> {
                     search.event = None;
                 }
             } else {
-                self.limit_branch_probe(&mut ready);
+                self.limit_branch_probe(&mut ready)?;
             }
             let attempt = ready.begin(&self.steps, &self.settings)?;
             let point = match self.derivative_trial(&attempt, &iterate)? {
@@ -149,7 +149,7 @@ impl Driver<'_> {
             };
             return Ok(BranchResolution::Probe(ready));
         }
-        if let Some(at) = self.backward_branch_probe(search.start, attempt, &point) {
+        if let Some(at) = self.backward_branch_probe(search.start, attempt, &point)? {
             return Ok(BranchResolution::Probe(Self::branch_probe_step(
                 search.start,
                 attempt,
@@ -245,9 +245,9 @@ impl Driver<'_> {
         Ok(None)
     }
 
-    pub(super) fn limit_branch_probe(&self, ready: &mut ReadyStep) {
+    pub(super) fn limit_branch_probe(&self, ready: &mut ReadyStep) -> SpiceResult<()> {
         if self.accepted_guards.is_empty() {
-            return;
+            return Ok(());
         }
         let start = ready.clock.time;
         let end = ready.end_time();
@@ -255,6 +255,11 @@ impl Driver<'_> {
         if let Some(offset) = self
             .accepted_guards
             .predicted_offset(duration, self.timing.step())
+            .map_err(|error| {
+                failure(format!(
+                    "behavioural branch prediction at t = {start:e}: {error}"
+                ))
+            })?
         {
             let at = (start + offset).max(start.next_up());
             if at < end {
@@ -266,6 +271,7 @@ impl Driver<'_> {
                 ready.boundary = Boundary::Ordinary;
             }
         }
+        Ok(())
     }
 
     /// If the endpoint's backward germ predicts a hidden interior root,
@@ -275,17 +281,27 @@ impl Driver<'_> {
         start: StepClock,
         attempt: &AttemptedStep,
         point: &TrialPoint,
-    ) -> Option<Real> {
+    ) -> SpiceResult<Option<Real>> {
         let end = attempt.clock.time;
-        let offset = point.guards.predicted_backward_offset(
-            end - start.time,
-            self.timing.step(),
-            attempt.event_start.is_some(),
-        )?;
+        let Some(offset) = point
+            .guards
+            .predicted_backward_offset(
+                end - start.time,
+                self.timing.step(),
+                attempt.event_start.is_some(),
+            )
+            .map_err(|error| {
+                failure(format!(
+                    "behavioural backward branch prediction at t = {end:e}: {error}"
+                ))
+            })?
+        else {
+            return Ok(None);
+        };
         let at = end - offset;
         // Adjacent floating-point endpoint roots are already covered by
         // the endpoint germ comparison. Avoid an endless probe loop.
-        (at > start.time.next_up() && at < end.next_down()).then_some(at)
+        Ok((at > start.time.next_up() && at < end.next_down()).then_some(at))
     }
 
     pub(super) fn branch_probe_step(

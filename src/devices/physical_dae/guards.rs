@@ -6,9 +6,23 @@ use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::cmp::Ordering;
 
 const MAX_GUARD_COEFFICIENTS: usize = 8_388_608;
+// Aggregate arithmetic budget for one trace prediction, independent of the
+// number of guards. Charge quadratic Bernstein conversion/subdivision work.
+const MAX_ROOT_WORK: usize = 64 * 1024 * 1024;
+
+struct RootWork(usize);
+
+impl RootWork {
+    fn charge(&mut self, operations: usize) -> SpiceResult<()> {
+        self.0 = self.0.checked_sub(operations).ok_or_else(|| {
+            SpiceError::circuit("physical branch root prediction budget exhausted")
+        })?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Region {
+pub(crate) enum Region {
     Sign(Ordering),
     Interval(usize),
     Discrete(u64),
@@ -18,7 +32,7 @@ pub enum Region {
 /// its operand coordinate. The slot and operand discriminator are stable
 /// across evaluations of the same compiled program.
 #[derive(Debug, Clone)]
-pub struct LocalGuard {
+pub(crate) struct LocalGuard {
     pub slot: usize,
     pub operand: u8,
     pub region: Region,
@@ -55,21 +69,27 @@ impl LocalGuard {
         }
     }
 
-    fn predicted_root(&self, horizon: Real, reverse: bool) -> Option<Real> {
-        self.boundaries
-            .iter()
-            .flatten()
-            .filter_map(|&boundary| {
-                let mut coefficients = self.argument.coefficients().to_vec();
-                coefficients[0] -= boundary;
-                if reverse {
-                    for coefficient in coefficients.iter_mut().skip(1).step_by(2) {
-                        *coefficient = -*coefficient;
-                    }
+    fn predicted_root(
+        &self,
+        horizon: Real,
+        reverse: bool,
+        work: &mut RootWork,
+    ) -> SpiceResult<Option<Real>> {
+        let mut earliest = None;
+        for &boundary in self.boundaries.iter().flatten() {
+            work.charge(self.argument.coefficients().len())?;
+            let mut coefficients = self.argument.coefficients().to_vec();
+            coefficients[0] -= boundary;
+            if reverse {
+                for coefficient in coefficients.iter_mut().skip(1).step_by(2) {
+                    *coefficient = -*coefficient;
                 }
-                first_root(&coefficients, horizon)
-            })
-            .min_by(Real::total_cmp)
+            }
+            if let Some(root) = first_root(&coefficients, earliest.unwrap_or(horizon), work)? {
+                earliest = Some(root);
+            }
+        }
+        Ok(earliest)
     }
 }
 
@@ -81,7 +101,7 @@ struct Guard {
 
 /// Observations belong to a disposable physical point until it is accepted.
 #[derive(Debug, Default, Clone)]
-pub struct BranchTrace {
+pub(crate) struct BranchTrace {
     guards: Vec<Guard>,
     coefficients: usize,
 }
@@ -140,7 +160,11 @@ impl BranchTrace {
 
     /// Earliest possible root of the local Taylor approximations, in seconds.
     /// The time scale is the one used to normalize the derivative array.
-    pub(crate) fn predicted_offset(&self, duration: Real, scale: Real) -> Option<Real> {
+    pub(crate) fn predicted_offset(
+        &self,
+        duration: Real,
+        scale: Real,
+    ) -> SpiceResult<Option<Real>> {
         self.root_offset(duration, scale, false)
     }
 
@@ -149,40 +173,67 @@ impl BranchTrace {
         duration: Real,
         scale: Real,
         already_left: bool,
-    ) -> Option<Real> {
+    ) -> SpiceResult<Option<Real>> {
         self.root_offset(duration, scale, !already_left)
     }
 
-    fn root_offset(&self, duration: Real, scale: Real, reverse: bool) -> Option<Real> {
-        let horizon = duration / scale;
-        self.guards
-            .iter()
-            .filter_map(|guard| {
-                let offset = guard.local.predicted_root(horizon, reverse)? * scale;
-                (offset.is_finite() && offset > 0. && offset <= duration).then_some(offset)
-            })
-            .min_by(Real::total_cmp)
+    fn root_offset(&self, duration: Real, scale: Real, reverse: bool) -> SpiceResult<Option<Real>> {
+        let mut work = RootWork(MAX_ROOT_WORK);
+        let mut earliest = None;
+        for guard in &self.guards {
+            let horizon = earliest.unwrap_or(duration) / scale;
+            let root = guard
+                .local
+                .predicted_root(horizon, reverse, &mut work)
+                .map_err(|error| {
+                    SpiceError::circuit(format!(
+                        "physical branch guard device {} slot {}: {error}",
+                        guard.device, guard.local.slot
+                    ))
+                })?;
+            if let Some(root) = root {
+                let offset = root * scale;
+                if offset.is_finite() && offset > 0. && offset <= duration {
+                    earliest = Some(offset);
+                }
+            }
+        }
+        Ok(earliest)
     }
 }
 
 /// First positive root of a Taylor polynomial over (0, horizon]. Strip
 /// the root at the accepted origin; an event already crossed must not be
 /// scheduled again. The coefficients are dimensionless local-time powers.
-fn first_root(coefficients: &[Real], horizon: Real) -> Option<Real> {
+fn first_root(
+    coefficients: &[Real],
+    horizon: Real,
+    work: &mut RootWork,
+) -> SpiceResult<Option<Real>> {
     if !(horizon.is_finite() && horizon > 0.) {
-        return None;
+        return Ok(None);
     }
-    let first = coefficients.iter().position(|&value| value != 0.)?;
-    let last = coefficients.iter().rposition(|&value| value != 0.)?;
+    let Some(first) = coefficients.iter().position(|&value| value != 0.) else {
+        return Ok(None);
+    };
+    let Some(last) = coefficients.iter().rposition(|&value| value != 0.) else {
+        return Ok(None);
+    };
     let coefficients = &coefficients[first..=last];
     match coefficients {
-        [_] => return None,
+        [_] => return Ok(None),
         [a, b] => {
             let root = -a / b;
-            return (root > 0. && root <= horizon).then_some(root);
+            return Ok((root > 0. && root <= horizon).then_some(root));
         }
         _ => {}
     }
+    if coefficients.iter().all(|&value| value >= 0.)
+        || coefficients.iter().all(|&value| value <= 0.)
+    {
+        return Ok(None);
+    }
+    work.charge(coefficients.len().saturating_mul(coefficients.len()))?;
     // Convert power coefficients on [0,1] to Bernstein coefficients.
     // Their convex hull encloses the polynomial, so intervals with one
     // strict sign need no subdivision. This is a hint from a truncated
@@ -198,45 +249,56 @@ fn first_root(coefficients: &[Real], horizon: Real) -> Option<Real> {
         })
         .collect::<Vec<_>>();
     if scaled.iter().any(|value| !value.is_finite()) {
-        return None;
+        return Ok(None);
     }
     let magnitude = scaled.iter().map(|value| value.abs()).fold(0., Real::max);
     if magnitude == 0. {
-        return None;
+        return Ok(None);
     }
-    let n = u32::try_from(degree).ok()?;
+    let n = u32::try_from(degree)
+        .map_err(|_| SpiceError::circuit("branch polynomial degree exceeds u32"))?;
     let mut bernstein = Vec::with_capacity(degree + 1);
     for i in 0..=n {
         let mut ratio = 1.;
         let mut sum = scaled[0] / magnitude;
         for k in 0..i {
             ratio *= Real::from(i - k) / Real::from(n - k);
-            sum = ratio.mul_add(scaled[usize::try_from(k).ok()? + 1] / magnitude, sum);
+            sum = ratio.mul_add(
+                scaled[usize::try_from(k)
+                    .map_err(|_| SpiceError::circuit("branch polynomial index overflow"))?
+                    + 1]
+                    / magnitude,
+                sum,
+            );
         }
         bernstein.push(sum);
     }
-    isolate(bernstein).map(|fraction| fraction * horizon)
+    Ok(isolate(bernstein, work)?.map(|fraction| fraction * horizon))
 }
 
 /// Left-first de Casteljau subdivision, bounded by both work and binary64
 /// time resolution. No recursive call stack or unbounded root search.
-fn isolate(coefficients: Vec<Real>) -> Option<Real> {
+fn isolate(coefficients: Vec<Real>, budget: &mut RootWork) -> SpiceResult<Option<Real>> {
     let mut pending = vec![(0., 1., coefficients)];
     for _ in 0..512 {
-        let (lo, hi, coefficients) = pending.pop()?;
+        let Some((lo, hi, coefficients)) = pending.pop() else {
+            return Ok(None);
+        };
+        budget.charge(coefficients.len())?;
         let positive = coefficients.iter().any(|&value| value > 0.);
         let negative = coefficients.iter().any(|&value| value < 0.);
         if !(positive && negative) {
             if coefficients[coefficients.len() - 1] == 0. && hi > 0. {
-                return Some(hi);
+                return Ok(Some(hi));
             }
             continue;
         }
         let mid = Real::midpoint(lo, hi);
         if hi - lo <= 8. * Real::EPSILON || mid <= lo || mid >= hi {
-            return Some(mid);
+            return Ok(Some(mid));
         }
         let n = coefficients.len();
+        budget.charge(n.saturating_mul(n))?;
         let mut work = coefficients;
         let mut left = Vec::with_capacity(n);
         let mut right = vec![0.; n];
@@ -252,21 +314,36 @@ fn isolate(coefficients: Vec<Real>) -> Option<Real> {
         pending.push((mid, hi, right));
         pending.push((lo, mid, left));
     }
-    None
+    if pending.is_empty() {
+        Ok(None)
+    } else {
+        Err(SpiceError::circuit(
+            "physical branch Bernstein subdivision limit exhausted",
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn root(coefficients: &[Real], horizon: Real) -> Option<Real> {
+        first_root(coefficients, horizon, &mut RootWork(MAX_ROOT_WORK)).unwrap()
+    }
+
+    #[test]
+    fn prediction_budget_is_explicit() {
+        assert!(first_root(&[0.1875, -1., 1.], 1., &mut RootWork(1)).is_err());
+    }
+
     #[test]
     fn local_roots_include_a_pair_hidden_by_equal_endpoint_signs() {
-        let root = first_root(&[0.1875, -1., 1.], 1.).unwrap();
-        assert!((root - 0.25).abs() < 1e-13);
-        let root = first_root(&[0., 0., -0.75, 1.], 1.).unwrap();
-        assert!((root - 0.75).abs() < 1e-13);
-        assert!(first_root(&[1., 0., 1.], 1.).is_none());
-        assert!(first_root(&[0., 1.], 1.).is_none());
-        assert_eq!(first_root(&[-0.5, 1.], 1.), Some(0.5));
+        let found = root(&[0.1875, -1., 1.], 1.).unwrap();
+        assert!((found - 0.25).abs() < 1e-13);
+        let found = root(&[0., 0., -0.75, 1.], 1.).unwrap();
+        assert!((found - 0.75).abs() < 1e-13);
+        assert!(root(&[1., 0., 1.], 1.).is_none());
+        assert!(root(&[0., 1.], 1.).is_none());
+        assert_eq!(root(&[-0.5, 1.], 1.), Some(0.5));
     }
 }

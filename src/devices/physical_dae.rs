@@ -5,7 +5,7 @@
 //! coefficient, time discretization, device limiting, or artificial gmin
 //! is introduced by this evaluator.
 
-mod guards;
+pub(crate) mod guards;
 pub(crate) use guards::{BranchTrace, LocalGuard, Region};
 
 use crate::devices::{
