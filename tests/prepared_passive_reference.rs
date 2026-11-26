@@ -9,7 +9,7 @@ use ngspice_rs::{
     primitives::{AnalysisKind, SpiceResult},
 };
 use ngspice_rs_preprocess::{
-    Cancellation, InputFormat, Options, Request, SourceInput,
+    Cancellation, InputFormat, Options, PreparedBundle, Request, SourceInput,
     analysis_plan::{AnalysisKind as SourceAnalysis, Directive},
     prepare,
 };
@@ -26,12 +26,7 @@ fn prepared(path: &Path) -> SpiceResult<(Netlist, Vec<AnalysisInput>)> {
         &Cancellation::default(),
     )
     .map_err(|e| ngspice_rs::primitives::SpiceError::circuit(e.to_string()))?;
-    let dir = tempfile::tempdir().unwrap();
-    for artifact in bundle.artifacts() {
-        fs::write(dir.path().join(&artifact.filename), &artifact.bytes).unwrap();
-    }
-    let mut netlist = Parser::new().parse_file(dir.path().join(&bundle.primary.filename))?;
-    let plan = bundle.analysis_plan.unwrap();
+    let plan = bundle.analysis_plan.as_ref().unwrap();
     let requests = plan
         .native_requests()
         .map(|entry| {
@@ -63,13 +58,23 @@ fn prepared(path: &Path) -> SpiceResult<(Netlist, Vec<AnalysisInput>)> {
             Ok(input)
         })
         .collect::<SpiceResult<Vec<_>>>()?;
+    let netlist = materialize(&bundle, &requests)?;
+    Ok((netlist, requests))
+}
+
+fn materialize(bundle: &PreparedBundle, requests: &[AnalysisInput]) -> SpiceResult<Netlist> {
+    let dir = tempfile::tempdir().unwrap();
+    for artifact in bundle.artifacts() {
+        fs::write(dir.path().join(&artifact.filename), &artifact.bytes).unwrap();
+    }
+    let mut netlist = Parser::new().parse_file(dir.path().join(&bundle.primary.filename))?;
     PreparedInitialConditions::attach_for_analyses(
         &mut netlist,
         dir.path(),
-        bundle.initial_conditions.unwrap(),
+        bundle.initial_conditions.clone().unwrap(),
         requests.iter().map(|input| (input.kind, input.uic)),
     )?;
-    Ok((netlist, requests))
+    Ok(netlist)
 }
 
 fn run(path: &Path) -> SpiceResult<(AnalysisKind, Plot)> {
@@ -236,4 +241,162 @@ fn source_prepared_passive_reference_matrix() {
     );
     assert_eq!(cases, 35);
     assert_eq!(samples, 965);
+}
+
+// These are the original producer #17 independent reactive-state witnesses.
+// The solver consumes the emitted electrical artifacts and typed storage IC;
+// no conversion from physical voltage/current is repeated here.
+fn simplis_uic(source: &str, args: [&str; 4]) -> Plot {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.net");
+    fs::write(&input, source).unwrap();
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::SimplisDeck,
+            input: SourceInput::File(input),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )
+    .unwrap();
+    assert_eq!(bundle.initial_conditions.as_ref().unwrap().devices.len(), 4);
+    let mut request = AnalysisInput::with_arguments(AnalysisKind::Transient, args);
+    request.uic = true;
+    let netlist = materialize(&bundle, std::slice::from_ref(&request)).unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    config
+        .plan(request)
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap()
+}
+
+fn physical_charge(voltage: f64) -> f64 {
+    if voltage < 0. {
+        2.0_f64.mul_add(voltage, 4.)
+    } else {
+        4.0_f64.mul_add(voltage, 4.)
+    }
+}
+
+#[test]
+fn prepared_nonlinear_floating_capacitors_conserve_charge() {
+    for (unit, current) in [("n", "1m"), ("p", "1u")] {
+        let source = format!(
+            r"* storage witness
+Vbase n 0 0.75
+I1 n a {current}
+I2 n b {current}
+I3 n c {current}
+I4 n d {current}
+X1 a n PARENT
+X2 b n PARENT
+X3 c n PARENT
+X4 d n PARENT
+.INIT V(X1.XC.!C1)=-2 V(X2.XC.!C1)=1
++ V(X3.XC.!C1)=3
+.subckt PARENT p n
+XC p n CELL
+.INIT V(XC.!C1)=0
+.subckt CELL p n
+!C1 p n MC IC=1.5
+.MODEL MC PWLC NSEG=2 X0=-1 Y0=2{unit} X1=0 Y1=4{unit} X2=2 Y2=12{unit}
+.INIT V(!C1)=-0.5
+.ends CELL
+.ends PARENT
+.end
+"
+        );
+        let plot = simplis_uic(&source, ["10n", "10u", "0", "5n"]);
+        let times = plot.column("time").unwrap();
+        let reference = plot.column("v(n)").unwrap();
+        let mut max_error = 0_f64;
+        for (name, start) in [("v(a)", -2.), ("v(b)", 1.), ("v(c)", 3.), ("v(d)", 0.)] {
+            let values = plot.column(name).unwrap();
+            for point in 0..plot.point_count() {
+                let voltage = values[point].re - reference[point].re;
+                let expected = physical_charge(start) + times[point].re * 1e6;
+                let error = (physical_charge(voltage) - expected).abs();
+                max_error = max_error.max(error);
+            }
+        }
+        eprintln!("{unit}: max normalized charge error {max_error:e}");
+        assert!(max_error < 1e-7);
+    }
+}
+
+#[test]
+fn prepared_nonlinear_inductors_conserve_signed_flux_and_work() {
+    let plot = simplis_uic(
+        r"* signed flux witness
+V1 a 0 1
+V2 b 0 -1
+!L1 a 0 ML IC=0
+!L2 b 0 ML IC=0
+.MODEL ML PWLL NSEG=2 X0=-2 Y0=-1m X1=0 Y1=3m X2=2 Y2=11m
+.INIT I(!L1)=-1 I(!L2)=3
+H1 ha 0 !L1 1
+H2 hb 0 !L2 1
+Rha ha 0 1k
+Rhb hb 0 1k
+Icap 0 c 1m
+C1 c 0 1u IC=-5
+.INIT V(C1)=2
+Vlin e 0 2
+L1 e 0 2m IC=9
+.INIT I(L1)=-0.5
+.end
+",
+        ["1u", "4m", "0", "0.5u"],
+    );
+    let flux = |current: f64| {
+        if current < 0. {
+            2e-3_f64.mul_add(current, 3e-3)
+        } else {
+            4e-3_f64.mul_add(current, 3e-3)
+        }
+    };
+    let energy = |current: f64| {
+        if current < 0. {
+            1e-3 * current * current
+        } else {
+            2e-3 * current * current
+        }
+    };
+    let (mut previous_time, mut previous_a, mut previous_b) = (0., -1., 3.);
+    let (mut work_a, mut work_b) = (0., 0.);
+    let times = plot.column("time").unwrap();
+    let current_a = plot.column("i(v1)").unwrap();
+    let current_b = plot.column("i(v2)").unwrap();
+    let current_linear = plot.column("i(vlin)").unwrap();
+    let observed_a = plot.column("v(ha)").unwrap();
+    let observed_b = plot.column("v(hb)").unwrap();
+    let capacitor = plot.column("v(c)").unwrap();
+    for point in 0..plot.point_count() {
+        let time = times[point].re;
+        let a = -current_a[point].re;
+        let b = -current_b[point].re;
+        assert!(
+            (flux(a) - flux(-1.) - time).abs() < 1e-10,
+            "forward flux t={time} i={a}"
+        );
+        assert!(
+            (flux(b) - flux(3.) + time).abs() < 1e-10,
+            "reverse flux t={time} i={b}"
+        );
+        assert!(
+            (observed_a[point].re - a).abs() < 1e-10 && (observed_b[point].re - b).abs() < 1e-10
+        );
+        let step = time - previous_time;
+        work_a = (a + previous_a).mul_add(0.5 * step, work_a);
+        work_b = (b + previous_b).mul_add(-0.5 * step, work_b);
+        assert!((energy(a) - energy(-1.) - work_a).abs() < 1e-9);
+        assert!((energy(b) - energy(3.) - work_b).abs() < 1e-9);
+        assert!((capacitor[point].re - 1000_f64.mul_add(time, 2.)).abs() < 1e-7);
+        assert!((-current_linear[point].re - 1000_f64.mul_add(time, -0.5)).abs() < 1e-7);
+        (previous_time, previous_a, previous_b) = (time, a, b);
+    }
 }
