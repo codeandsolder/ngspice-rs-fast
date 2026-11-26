@@ -64,6 +64,8 @@ pub enum Waveform {
     },
     /// Validated PWL knots, with optional C delay and repetition.
     Pwl(PwlSource),
+    /// Explicit sided forcing from a resolved prepared source declaration.
+    Prepared(crate::devices::prepared_waveform::PreparedForcing),
     /// A fully specified periodic pulse; see [`Pulse`].
     Pulse(Pulse),
     /// A PULSE as written, with C's analysis-dependent defaults still pending.
@@ -100,7 +102,7 @@ impl Waveform {
             }
             // Pulse and PWL/function values are only constructed through
             // validating constructors, so they need no further checks here.
-            Self::Pulse(_) | Self::Pwl(_) | Self::Function(_) => true,
+            Self::Pulse(_) | Self::Pwl(_) | Self::Function(_) | Self::Prepared(_) => true,
             Self::FunctionDefaults(spec) => {
                 spec.validate()?;
                 true
@@ -135,10 +137,13 @@ impl Waveform {
     /// are not.
     #[must_use = "the result determines whether segment endpoint samples suffice to reconstruct the waveform"]
     pub const fn is_piecewise_linear(&self) -> bool {
-        !matches!(
-            self,
-            Self::Function(_) | Self::FunctionDefaults(_) | Self::PortSeries { .. }
-        )
+        match self {
+            Self::Prepared(forcing) => forcing.is_piecewise_linear(),
+            _ => !matches!(
+                self,
+                Self::Function(_) | Self::FunctionDefaults(_) | Self::PortSeries { .. }
+            ),
+        }
     }
 
     /// The value C loads in OP/DC analyses when the source has no explicit DC
@@ -158,6 +163,7 @@ impl Waveform {
             }
             Self::FunctionDefaults(spec) => spec.time_zero(),
             Self::Stochastic(process) => Ok(process.time_zero()),
+            Self::Prepared(forcing) => Ok(forcing.dc()),
             other => other.value_at(0., Limit::Left),
         }
     }
@@ -191,6 +197,7 @@ impl Waveform {
                 if before_jump { *before } else { *after }
             }
             Self::Pwl(pwl) => return pwl.value_at(t, limit),
+            Self::Prepared(forcing) => return forcing.value_at(t, limit),
             Self::Pulse(pulse) => return pulse.value_at(t, limit),
             Self::Function(function) => return function.value_at(t, limit),
             Self::Stochastic(process) => return process.value_at(t, limit),
@@ -268,6 +275,11 @@ impl Waveform {
             Self::Pwl(pwl) => {
                 return Ok(WaveformBreakpoints(Inner::Pwl(pwl.breakpoints_in(t0, t1)?)));
             }
+            Self::Prepared(forcing) => {
+                return Ok(WaveformBreakpoints(Inner::Prepared(
+                    forcing.breakpoints_in(t0, t1)?,
+                )));
+            }
             Self::Stochastic(process) => {
                 return Ok(WaveformBreakpoints(Inner::Stochastic(
                     process.events(t0, t1)?,
@@ -316,6 +328,8 @@ pub enum WaveformEventKind {
     FunctionCorner,
     /// Physical white/colored noise knot or random-held sample.
     StochasticSample,
+    /// Explicit prepared knot or startup-hold boundary.
+    PreparedKnot,
     /// Exact RTS transition time.
     StochasticTelegraph,
 }
@@ -334,6 +348,7 @@ impl WaveformEventKind {
                 | Self::PwlKnot
                 | Self::PwlRepeatBoundary
                 | Self::StepJump
+                | Self::PreparedKnot
                 | Self::StochasticSample
                 | Self::StochasticTelegraph
         )
@@ -373,6 +388,7 @@ enum Inner {
     Pulse(crate::devices::pulse::PulseBreakpoints),
     Pwl(crate::devices::functions::PwlBreakpoints),
     Stochastic(crate::devices::stochastic::StochasticEvents),
+    Prepared(crate::devices::prepared_waveform::PreparedEvents),
 }
 impl WaveformBreakpoints {
     /// Advance the same sequence as the time-only iterator, retaining event
@@ -382,6 +398,7 @@ impl WaveformBreakpoints {
             Inner::Fixed(it) => it.next(),
             Inner::Pulse(it) => it.next_event(),
             Inner::Pwl(it) => it.next_event(),
+            Inner::Prepared(it) => it.next(),
             Inner::Stochastic(it) => it.next_event().map(|event| WaveformEvent {
                 time: event.time,
                 kind: match event.kind {
@@ -638,9 +655,29 @@ impl LinearSystem {
     /// # Errors
     /// Nonfinite time, unresolved PULSE defaults or a nonfinite source sum.
     pub fn transient_rhs(&self, t: Real, limit: Limit) -> SpiceResult<Vector> {
+        self.transient_rhs_with(|waveform| waveform.value_at(t, limit))
+    }
+
+    pub(crate) fn transient_startup_rhs(&self) -> SpiceResult<Vector> {
+        self.transient_rhs_with(|waveform| {
+            waveform.value_at(
+                0.,
+                if matches!(waveform, Waveform::Prepared(_)) {
+                    Limit::Right
+                } else {
+                    Limit::Left
+                },
+            )
+        })
+    }
+
+    fn transient_rhs_with(
+        &self,
+        value: impl Fn(&Waveform) -> SpiceResult<Real>,
+    ) -> SpiceResult<Vector> {
         let mut rhs = Vector::zeros(self.a.rows());
         for s in &self.sources {
-            let value = s.waveform.value_at(t, limit)?;
+            let value = value(&s.waveform)?;
             for (r, sign) in &s.rows {
                 rhs.add_to(*r, sign * value)?;
             }
