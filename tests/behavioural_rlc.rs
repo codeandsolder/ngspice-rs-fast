@@ -1231,13 +1231,66 @@ fn singular_germ_recovery_at_exact_source_event_preserves_storage() -> SpiceResu
 }
 
 #[test]
-fn singular_repeated_root_without_rank_certificate_is_not_gauged() {
-    let error=run(
-        "b1 x 0 i=(v(x)-time/1u)^2\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
-        AnalysisKind::Transient,&["0.1u","1u","0","0.1u","uic","method=gear"]
-    ).expect_err("a persistent singular tangent cannot certify the repeated root");
+fn singular_moving_repeated_root_recovers_consistent_germ() -> SpiceResult<()> {
+    // A repeated root can have a unique moving germ despite a vanishing
+    // instantaneous tangent. Verify the actual recovered trajectory.
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            "b1 x 0 i=(v(x)-time/1u)^2\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )?;
+        for i in 0..plot.point_count() {
+            let u = plot.value("time", i).unwrap().re / 1e-6;
+            close(plot.value("v(x)", i).unwrap().re, u, 1e-10);
+            close(plot.value("v(out)", i).unwrap().re, 1., 1e-9);
+            close(plot.value("i(b2)", i).unwrap().re, -1e-3, 1e-12);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_homogeneous_repeated_root_is_not_arbitrarily_gauged() {
+    let error = run(
+        "b1 x 0 i=v(x)^2\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k",
+        AnalysisKind::Transient,
+        &["0.1u", "1u", "0", "0.1u", "uic", "method=gear"],
+    )
+    .expect_err("a zero residual and unresolved tangent must not establish rank");
     assert!(
-        error.to_string().contains("singular") || error.to_string().contains("nonlinear DAE"),
+        error.to_string().contains("singular") || error.to_string().contains("underdetermined"),
         "{error}"
     );
+}
+
+#[test]
+fn singular_germ_recovery_handles_high_order_and_scaled_offsets() -> SpiceResult<()> {
+    for (power, offset, h) in [
+        (3, 0.001, 1e-6),
+        (15, 0.001, 1e-6),
+        (15, 0., 1e-9),
+        (15, 0., 1e-3),
+        (15, 1000., 1e-6),
+    ] {
+        let body = format!(
+            "b1 x 0 i=v(x)^{power}-({offset:e}+time/{h:e})^{power}\nb2 out 0 v={h:e}*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n"
+        );
+        let step = format!("{:e}", h / 10.);
+        let stop = format!("{h:e}");
+        for method in ["method=trap", "method=gear"] {
+            let plot = run(
+                &body,
+                AnalysisKind::Transient,
+                &[&step, &stop, "0", &step, "uic", method],
+            )?;
+            for i in 0..plot.point_count() {
+                let u = plot.value("time", i).unwrap().re / h;
+                close(plot.value("v(x)", i).unwrap().re, offset + u, 1e-9);
+                close(plot.value("v(out)", i).unwrap().re, 1., 1e-9);
+                close(plot.value("i(b2)", i).unwrap().re, -1e-3, 1e-12);
+            }
+        }
+    }
+    Ok(())
 }

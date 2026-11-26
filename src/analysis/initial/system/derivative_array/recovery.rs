@@ -59,7 +59,7 @@ struct Search<'a, 'run, 'circuit> {
     iterations: usize,
     baseline_rank: usize,
     targets: Vec<(usize, Real)>,
-    found: Option<RightLimit>,
+    found: Option<Candidate>,
 }
 
 impl Search<'_, '_, '_> {
@@ -207,41 +207,44 @@ impl Search<'_, '_, '_> {
             return Ok(());
         }
         if let Some(previous) = &self.found {
-            if distinct(previous, &candidate.right, self.local.scale, self.tol) {
+            if distinct(previous, &candidate, self.local.scale, self.tol) {
                 return Err(failure(
                     "ambiguous nonlinear DAE right-limit germs: distinct physical states or rates satisfy the original equations",
                 ));
             }
         } else {
-            self.found = Some(candidate.right);
+            self.found = Some(candidate);
         }
         Ok(())
     }
 }
 
-fn distinct(a: &RightLimit, b: &RightLimit, scale: Real, tol: Tolerances) -> bool {
-    // Compare dimensionless local Taylor coordinates, not raw derivatives.
-    // The derivative-coordinate comparison includes a rounding floor
-    // from its constant coefficient: generated differentiator signals
-    // can be scaled by inverse seconds, even when observable voltages
-    // and currents agree to binary64 precision. This is a comparison
-    // between already verified roots, not a relaxed physical tolerance.
-    a.state
-        .as_slice()
-        .iter()
-        .zip(b.state.as_slice())
-        .zip(a.rate.as_slice().iter().zip(b.rate.as_slice()))
-        .any(|((&x, &y), (&dx, &dy))| {
-            let value_scale = x.abs().max(y.abs());
-            let absolute = tol.vntol.min(tol.abstol);
-            let value_tolerance = tol.reltol.mul_add(value_scale, absolute);
-            let (dx, dy) = (scale * dx, scale * dy);
-            let rate_tolerance = tol
-                .reltol
-                .mul_add(dx.abs().max(dy.abs()), absolute)
-                .max(32. * Real::EPSILON * value_scale);
-            (x - y).abs() > value_tolerance || (dx - dy).abs() > rate_tolerance
-        })
+fn distinct(a: &Candidate, b: &Candidate, scale: Real, tol: Tolerances) -> bool {
+    // Compare in the same normalized coordinates used by the physical
+    // equations. Propagate row-local backward error through each selected
+    // tangent basis, rather than interpreting amplified cancellation
+    // in higher derivatives as another nonlinear branch.
+    let width = a.right.state.len();
+    let values = |point: &RightLimit, index: usize| {
+        if index < width {
+            point.state.as_slice()[index]
+        } else {
+            scale * point.rate.as_slice()[index - width]
+        }
+    };
+    (0..2 * width).any(|index| {
+        let (x, y) = (values(&a.right, index), values(&b.right, index));
+        let tolerance = tol
+            .reltol
+            .mul_add(x.abs().max(y.abs()), tol.vntol.min(tol.abstol));
+        let error = |candidate: &Candidate| {
+            candidate
+                .uncertainty
+                .as_ref()
+                .map_or(0., |bound| bound.as_slice()[index])
+        };
+        (x - y).abs() > tolerance.max(error(a) + error(b))
+    })
 }
 
 fn normalize(direction: &mut Vector, prefix: usize) {
@@ -338,5 +341,5 @@ pub(super) fn recover(
             }
         }
     }
-    search.found.ok_or_else(|| failure("nonlinear DAE germ recovery could not resolve a singular tangent within its bounded search; required coordinates may be underdetermined or noncausal"))
+    search.found.map(|candidate| candidate.right).ok_or_else(|| failure("nonlinear DAE germ recovery could not resolve a singular tangent within its bounded search; required coordinates may be underdetermined or noncausal"))
 }

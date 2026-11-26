@@ -1212,8 +1212,24 @@ pub(super) fn consistent_derivative_event(
     )?;
     storage.retain_operating_point(request.solution);
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
-    let right = system::solve_event(&dae, request, &storage, tolerances, iterations, guess)
-        .map_err(|error| failure(format!("source event at t = {time:e}: {error}")))?;
+    let right = match system::solve_event(&dae, request, &storage, tolerances, iterations, guess) {
+        // A one-sided germ may have a different admissible derivative
+        // domain than the incoming one. Retry without the disposable rate
+        // hint, retaining exactly the same physical event constraints.
+        Err(SpiceError::Circuit { .. }) if guess.rate.is_some() => system::solve_event(
+            &dae,
+            request,
+            &storage,
+            tolerances,
+            iterations,
+            DerivativeGuess {
+                rate: None,
+                ..guess
+            },
+        ),
+        result => result,
+    }
+    .map_err(|error| failure(format!("source event at t = {time:e}: {error}")))?;
     let canonical = storage.consistent_history(circuit, &right, Some(time), tolerances)?;
     Ok(DerivativePoint {
         solution: right.state,

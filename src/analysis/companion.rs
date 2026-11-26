@@ -2110,16 +2110,36 @@ impl Driver<'_> {
                 timing: self.timing,
             }),
         };
-        let outcome = initial::consistent_derivative_step(
-            &self.prepared,
-            &request,
-            self.physical_tolerances(),
-            self.settings.tran_max_iter,
-            initial::DerivativeGuess {
-                order_hint: self.derivative_order.get(),
-                rate: predictor.as_ref().map(|point| &point.rate),
-            },
-        )?;
+        let solve = |request: &LoadRequest<'_>, rate| {
+            initial::consistent_derivative_step(
+                &self.prepared,
+                request,
+                self.physical_tolerances(),
+                self.settings.tran_max_iter,
+                initial::DerivativeGuess {
+                    order_hint: self.derivative_order.get(),
+                    rate,
+                },
+            )
+        };
+        let rate = predictor.as_ref().map(|point| &point.rate);
+        let outcome = match solve(&request, rate) {
+            // An extrapolated state can leave the domain of an otherwise
+            // smooth constitutive law. Fall back to the ordinary Newton
+            // seed; do not retry away a detected physical ambiguity.
+            Err(SpiceError::Circuit { .. }) | Ok(initial::DerivativeTrial::NotConverged(_))
+                if prediction.is_some() || rate.is_some() =>
+            {
+                solve(
+                    &LoadRequest {
+                        solution: previous,
+                        ..request
+                    },
+                    None,
+                )
+            }
+            result => result,
+        }?;
         drop(predictor);
         let consistent = match outcome {
             initial::DerivativeTrial::Converged(point) => point,

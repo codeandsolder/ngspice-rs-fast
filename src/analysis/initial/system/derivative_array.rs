@@ -779,6 +779,7 @@ pub(in crate::analysis::initial) fn solve_step(
 struct Candidate {
     right: RightLimit,
     mandatory_rank: usize,
+    uncertainty: Option<Vector>,
 }
 
 enum CoreOutcome {
@@ -894,18 +895,26 @@ fn candidate(
     local: LocalPoint<'_>,
 ) -> SpiceResult<Candidate> {
     let point = local.evaluate(dae, state)?;
-    let mandatory_rank = if local.recovery.is_some() {
+    let (mandatory_rank, uncertainty) = if local.recovery.is_some() {
         let array = Array::build(&point, state, local.scale, initial)?;
-        rank::probe_space(
+        let prefix = 2 * state[0].len();
+        let physical_rank =
+            rank::probe_space(&array.matrix, &array.late, &array.optional, prefix, 0)?.rank;
+        let bounds = array
+            .scale
+            .iter()
+            .map(|scale| scale.roundoff())
+            .collect::<Vec<_>>();
+        let uncertainty = rank::projected_uncertainty(
             &array.matrix,
+            &bounds,
             &array.late,
             &array.optional,
-            2 * state[0].len(),
-            0,
-        )?
-        .rank
+            prefix,
+        )?;
+        (physical_rank, Some(uncertainty))
     } else {
-        0
+        (0, None)
     };
     let to_rate = |vector: &Vector| {
         Vector::from_slice(
@@ -927,6 +936,7 @@ fn candidate(
             order_hint: state.len().saturating_sub(3).max(2),
         },
         mandatory_rank,
+        uncertainty,
     })
 }
 
