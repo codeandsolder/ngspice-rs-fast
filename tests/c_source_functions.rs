@@ -107,9 +107,13 @@ fn rust_netlist(text: &str) -> ngspice_rs::netlist::ast::Netlist {
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs a temporary C deck out of process"]
 fn source_function_values_match_c_at_c_timepoints() {
-    let (step, stop) = (10e-6, 2e-3);
     let cards = format!("{SOURCES}{}", loads());
-    let (plot, text) = run_c("values", &cards, "tran 10u 2m", "");
+    compare_source_values(&cards, 22);
+}
+
+fn compare_source_values(cards: &str, expected_sources: usize) {
+    let (step, stop) = (10e-6, 2e-3);
+    let (plot, text) = run_c("values", cards, "tran 10u 2m", "");
     let plot = plot.unwrap_or_else(|| panic!("no C rawfile:\n{text}"));
     let netlist = rust_netlist(&format!("t\n{cards}.end\n"));
     let mut system = Circuit::from_netlist(&netlist)
@@ -167,7 +171,7 @@ fn source_function_values_match_c_at_c_timepoints() {
             compared += 1;
         }
     }
-    assert_eq!(system.sources.len(), 22);
+    assert_eq!(system.sources.len(), expected_sources);
     println!(
         "{compared} source values compared at {} C timepoints",
         time.len()
@@ -178,7 +182,11 @@ fn source_function_values_match_c_at_c_timepoints() {
 #[ignore = "requires absolute NGSPICE_BIN; runs a temporary C deck out of process"]
 fn operating_points_match_c_time_zero_values() {
     let cards = format!("{SOURCES}{}", loads());
-    let (plot, text) = run_c("op", &cards, "op", "");
+    compare_source_operating_points(&cards, 22);
+}
+
+fn compare_source_operating_points(cards: &str, expected_sources: usize) {
+    let (plot, text) = run_c("op", cards, "op", "");
     let c = plot.unwrap_or_else(|| panic!("no C rawfile:\n{text}"));
     let netlist = rust_netlist(&format!("t\n{cards}.op\n.end\n"));
     let config = RunConfig::from_netlist(&netlist).unwrap();
@@ -187,7 +195,7 @@ fn operating_points_match_c_time_zero_values() {
     let rust = request
         .run(&mut circuit, &AnalysisContext::default())
         .unwrap();
-    for k in 1..=22 {
+    for k in 1..=expected_sources {
         let name = format!("v(n{k})");
         let (ours, theirs) = (
             rust.value(&name, 0).unwrap().re,
@@ -198,6 +206,34 @@ fn operating_points_match_c_time_zero_values() {
             "{name}: port {ours}, C {theirs}"
         );
     }
+}
+
+/// Static coefficients are resolved before waveform construction, then checked
+/// against independent ngspice values at its own accepted timepoints.
+#[test]
+#[ignore = "requires absolute NGSPICE_BIN; independent C waveform oracle"]
+fn parameterized_coefficients_match_independent_c_waveforms() {
+    let cards = "\
+.param a=2 t=0.1m f=1k
+v1 n1 0 sin({a/4} {a} {f} {t} 300 45)
+v2 n2 0 exp({a/2} {-a/2} {3*t} {t})
+v3 n3 0 sffm({a/20} {a/2} {5*f} {a} {f/2})
+v4 n4 0 am(0 {a/2} {a/4} {f} {10*f})
+v5 n5 0 pulse(0 {a/2} {t} {t/5} {t/5} {t} {3*t} 3)
+v6 n6 0 dc {a/8} pwl(0 0 {2*t} {a/2} {4*t} 0) r=0 td={-t/2}
+i1 n7 0 sin(0 {a/2000} {2*f} {t/2} 0 90)
+i2 n8 0 pulse(0 {a/2000} {t} {t/10} {t/10} {t/2} {2*t} 2)
+r1 n1 0 1k
+r2 n2 0 1k
+r3 n3 0 1k
+r4 n4 0 1k
+r5 n5 0 1k
+r6 n6 0 1k
+r7 n7 0 1k
+r8 n8 0 1k
+";
+    compare_source_values(cards, 8);
+    compare_source_operating_points(cards, 8);
 }
 
 /// A 1 kHz SIN into a resistor-diode clipper: strongly distorted, so the THD

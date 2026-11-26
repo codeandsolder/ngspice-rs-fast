@@ -637,7 +637,7 @@ fn write_scope_options(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scop
             let value = setting
                 .value
                 .as_ref()
-                .map_or_else(|| "flag".to_owned(), |v| positioned(ctx, &v.source));
+                .map_or_else(|| "flag".to_owned(), |v| positioned(ctx, v));
             out.line(
                 indent + 2,
                 format!(

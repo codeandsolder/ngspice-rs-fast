@@ -120,10 +120,10 @@ pub struct NumericVectorEntry {
     pub expression: Option<Box<crate::netlist::expr::ParameterExpression>>,
 }
 
-/// One finite textual waveform/IC value and its byte-column position.
+/// One numeric or expression source token and its byte-column position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionedValue {
-    /// Original numeric spelling, including scale/unit suffixes.
+    /// Original token spelling, including scale/unit suffixes or expression delimiters.
     pub text: String,
     /// Physical source location, with a 1-based UTF-8 byte column.
     pub location: SourceLoc,

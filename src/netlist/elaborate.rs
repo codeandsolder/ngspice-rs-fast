@@ -438,12 +438,12 @@ fn literalize_parameters(
     owner: ParameterOwner,
 ) -> SpiceResult<()> {
     for (index, parameter) in parameters.iter_mut().enumerate() {
-        let (mut entries, waveform) = match &mut parameter.kind {
-            ParameterKind::NumericVector(entries) => (entries.iter_mut().collect(), false),
-            ParameterKind::Waveform(waveform) => (waveform.coefficients_mut(), true),
-            _ => (Vec::new(), false),
+        let vector = match &mut parameter.kind {
+            ParameterKind::NumericVector(entries) => Some((entries.iter_mut().collect(), false)),
+            ParameterKind::Waveform(waveform) => Some((waveform.coefficients_mut(), true)),
+            _ => None,
         };
-        if !entries.is_empty() {
+        if let Some((mut entries, waveform)) = vector {
             let mut changed = false;
             for (entry_index, entry) in entries.iter_mut().enumerate() {
                 changed |= literalize_vector_entry(

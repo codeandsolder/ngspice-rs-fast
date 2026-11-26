@@ -39,7 +39,7 @@ pub(super) fn numeric<'a>(
         .is_some();
     let first = cut_err(&mut field).parse_next(input)?;
     let mut count = 1;
-    let values: Vec<Value<'_>> = repeat(0.., |input: &mut Input<'a>| {
+    let mut values: Vec<Value<'_>> = repeat(0.., |input: &mut Input<'a>| {
         // A comma claims another value. So do numeric and expression tokens;
         // their errors must survive repeat's optional stopping rule.
         let comma = opt(punctuation(TokenKind::Comma)).parse_next(input)?;
@@ -57,14 +57,8 @@ pub(super) fn numeric<'a>(
         count += 1;
         Ok(value)
     })
-    .fold(
-        || vec![first],
-        |mut values, value| {
-            values.push(value);
-            values
-        },
-    )
     .parse_next(input)?;
+    values.insert(0, first);
     let last = if parenthesized {
         cut_err(punctuation(TokenKind::RParen).context("')' after numeric vector"))
             .parse_next(input)?
