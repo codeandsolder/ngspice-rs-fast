@@ -516,6 +516,7 @@ struct LoadStorage<T> {
     matrix: Option<SparseMatrix>,
     rhs: Option<Vector>,
     spare_trial: Option<T>,
+    correction: Correction,
 }
 
 impl<T> Default for LoadStorage<T> {
@@ -524,6 +525,7 @@ impl<T> Default for LoadStorage<T> {
             matrix: None,
             rhs: None,
             spare_trial: None,
+            correction: Correction::Absolute,
         }
     }
 }
@@ -535,14 +537,14 @@ impl<T> LoadStorage<T> {
     }
 
     /// Check the assembled system and fold duplicates before factorization.
-    fn checked_system(&mut self, n: usize) -> SpiceResult<(&mut SparseMatrix, &Vector)> {
+    fn checked_system(&mut self, n: usize) -> SpiceResult<(&mut SparseMatrix, &mut Vector)> {
         let matrix = self
             .matrix
             .as_mut()
             .ok_or_else(|| failure("Newton load returned no matrix"))?;
         let rhs = self
             .rhs
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| failure("Newton load returned no RHS"))?;
         check(matrix, rhs, n)?;
         matrix.fold_duplicates();
@@ -592,6 +594,8 @@ impl LoadStorage<TrialState> {
             .ok_or_else(|| failure("missing Newton RHS"))?;
         matrix.clear();
         rhs.clear();
+        matrix.record_original(self.correction.capturing());
+        rhs.record_original(self.correction.capturing());
         Ok((matrix, rhs))
     }
 }
@@ -759,17 +763,30 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     let mut ordering = None;
     let mut reorder = phases.initial_transient;
     let mut ipass = false;
+    // Each solve begins with ordinary absolute NI iteration. Only an
+    // otherwise converged, potentially cancellation-dominated circuit load
+    // switches to original-stamp correction coordinates.
+    storage.correction = Correction::Absolute;
     loop {
         // NIiter increments before checking the CKTload return code.
         progress.iterations += 1;
         let iterno = progress.iterations;
         let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
         let flagged = (phases.nonconvergent)(&trial);
+        let correction = storage.correction;
         let (matrix, rhs) = storage.checked_system(n)?;
         if phase == IterationPhase::Junction {
             reorder = true;
         }
-        let mut next = match linearised_solve(matrix, rhs, &mut ordering, reorder, options)? {
+        let mut next = match linearised_solve(
+            matrix,
+            rhs,
+            &guess,
+            &mut ordering,
+            reorder,
+            options,
+            correction.capturing(),
+        )? {
             crate::maths::NiStep::Solved(next) => {
                 reorder = false;
                 next
@@ -803,6 +820,11 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
             !converged(&next, &guess, branch_rows, phases.coordinate_kinds, options)
                 || device_test(&next, &guess, &trial)?
         };
+        (storage.correction, noncon) = correction.after_solve(noncon, phase, &guess, &next, || {
+            phases.coordinate_kinds.is_some()
+                && options.diag_gmin == 0.
+                && correction_risk(matrix, rhs, &next, options)
+        });
         if phase == IterationPhase::Float {
             if phases.nodesets {
                 noncon |= ipass;
@@ -841,6 +863,65 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         guess = next;
     }
 }
+/// A corrective load must be followed by a state-owning reload if the
+/// first correction changes the solution. Subsequent loads use the same
+/// convergence test as the absolute-coordinate solver.
+#[derive(Clone, Copy)]
+enum Correction {
+    Absolute,
+    First,
+    Subsequent,
+}
+
+impl Correction {
+    const fn capturing(self) -> bool {
+        !matches!(self, Self::Absolute)
+    }
+
+    fn after_solve(
+        self,
+        noncon: bool,
+        phase: IterationPhase,
+        guess: &Vector,
+        next: &Vector,
+        risk: impl FnOnce() -> bool,
+    ) -> (Self, bool) {
+        match self {
+            Self::Absolute if !noncon && phase != IterationPhase::Junction && risk() => {
+                // Fix must still advance to Float. A converged Float pass
+                // must reload rather than accept the absolute solution.
+                (Self::First, phase == IterationPhase::Float)
+            }
+            Self::First => (Self::Subsequent, noncon || next != guess),
+            _ => (self, noncon),
+        }
+    }
+}
+
+/// A conservative roundoff envelope (eight binary64 epsilons) on the
+/// scale of the largest original stamped product or RHS term. This is
+/// only a trigger for a physical correction, never a singularity test.
+/// No row traversal, exact sums or factorization are required here.
+fn correction_risk(
+    matrix: &SparseMatrix,
+    rhs: &Vector,
+    values: &Vector,
+    options: &NewtonOptions,
+) -> bool {
+    let roundoff = 8. * Real::EPSILON;
+    let source = roundoff * rhs.peak_stamp();
+    if source >= options.abstol {
+        return true;
+    }
+    let coefficient = roundoff * matrix.peak_stamp();
+    // The solution has already passed the finite check. Integer magnitude
+    // reduction avoids a serial floating-point max and NaN handling.
+    let largest = values.as_slice().iter().fold(0_u64, |peak, value| {
+        peak.max(value.to_bits() & i64::MAX.cast_unsigned())
+    });
+    coefficient * Real::from_bits(largest) >= options.abstol
+}
+
 /// [`StepLimiting::Global`]: scale the step so no watched nodal voltage moves
 /// by more than `limit` (all non-branch rows when `limited_rows` is `None`).
 fn damp(
@@ -906,16 +987,36 @@ fn reconstruct_storage(
     Ok(())
 }
 
-/// One `NIiter` factor-and-solve on the raw matrix ([`crate::maths::solve_ni`]):
-/// there is no row equilibration or conditioning guard; ngspice has neither.
+/// One `NIiter` solve, in absolute or correction coordinates. Both use
+/// the same assembled Jacobian, pivot policy and reusable factor frame.
+/// The exact residual is only evaluated for a captured physical load.
 fn linearised_solve(
-    matrix: &SparseMatrix,
-    rhs: &Vector,
+    matrix: &mut SparseMatrix,
+    rhs: &mut Vector,
+    guess: &Vector,
     ordering: &mut Option<crate::maths::SparseSymbolic>,
     reorder: bool,
     options: &NewtonOptions,
+    capturing: bool,
 ) -> SpiceResult<crate::maths::NiStep> {
-    crate::maths::solve_ni(matrix, rhs, ordering, reorder, options.diag_gmin)
+    let correction = if capturing {
+        Some(matrix.original_correction(rhs, guess)?)
+    } else {
+        None
+    };
+    let mut step = crate::maths::solve_ni(
+        matrix,
+        correction.as_ref().unwrap_or(rhs),
+        ordering,
+        reorder,
+        options.diag_gmin,
+    )?;
+    if capturing && let crate::maths::NiStep::Solved(delta) = &mut step {
+        for (new, old) in delta.as_mut_slice().iter_mut().zip(guess.as_slice()) {
+            *new += old;
+        }
+    }
+    Ok(step)
 }
 
 fn check(matrix: &SparseMatrix, rhs: &Vector, n: usize) -> SpiceResult<()> {

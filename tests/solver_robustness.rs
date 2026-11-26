@@ -199,16 +199,144 @@ fn small_pivots_are_accepted_like_c() {
     }
 }
 
-/// `resparam.c` raises a zero resistance to `RESMIN = 1e-12` (with a
-/// warning). The 1e12 S conductance then loses digits, and C's answer
-/// (`b = 9.99999999999999001e-01`, `v1#branch = -9.7656250000000000e-04`)
-/// is reproduced exactly.
+/// C's RESMIN clamp is physical, but its supply current loses 2.34375%
+/// through cancellation. Check the independent series solution instead.
 #[test]
-fn zero_resistance_is_clamped_like_c() {
+fn zero_resistance_preserves_physical_clamped_current() {
+    let current = 1. / (1000. + 1e-12);
     for r1 in ["r1 a b 0", "r1 a b rm r=0\n.model rm r"] {
-        let plot = simulate(&format!("v1 a 0 1\n{r1}\nr2 b 0 1k\n.op")).unwrap();
-        assert_eq!(value(&plot, "v(b)"), 9.999_999_999_999_99e-1, "{r1}");
-        assert_eq!(value(&plot, "i(v1)"), -9.765_625e-4, "{r1}");
+        let plot =
+            simulate_observed(&format!("v1 a 0 1\n{r1}\nr2 b 0 1k\n.op"), &["i(r2)"]).unwrap();
+        assert!(
+            (value(&plot, "v(b)") - 1000. * current).abs() < 2e-15,
+            "{r1}"
+        );
+        assert!((value(&plot, "i(v1)") + current).abs() < 2e-15, "{r1}");
+        assert!(
+            (value(&plot, "i(v1)") + value(&plot, "i(r2)")).abs() < 2e-15,
+            "{r1}"
+        );
+    }
+}
+
+#[test]
+fn ill_conditioned_source_currents_are_common_mode_invariant() {
+    let mut worst_relative_error = 0_f64;
+    for common in [0., 1., 1000.] {
+        for resistance in [1e-3_f64, 1e-6, 1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 0.] {
+            let expected = 1. / (1000. + if resistance == 0. { 1e-12 } else { resistance });
+            let deck = format!(
+                "vh h 0 {}\nvl l 0 {common}\nr1 h b {resistance:e}\nr2 b l 1k\nh1 sense 0 vh 1000\nr3 sense 0 1k\n.op",
+                common + 1.
+            );
+            let plot = simulate_observed(&deck, &["i(r1)", "i(r2)"]).unwrap();
+            let upper = -value(&plot, "i(vh)");
+            let lower = value(&plot, "i(vl)");
+            let load = value(&plot, "i(r2)");
+            for actual in [upper, lower, load, -value(&plot, "v(sense)") / 1000.] {
+                let error = (actual - expected).abs();
+                worst_relative_error = worst_relative_error.max(error / expected);
+                assert!(
+                    error <= 2e-15,
+                    "CM={common}, R={resistance:e}: actual {actual:e}, expected {expected:e}"
+                );
+            }
+            let b = value(&plot, "v(b)");
+            assert!((b - (common + 1000. * expected)).abs() <= 4. * f64::EPSILON * (common + 1.));
+            // The ideal short's local constitutive drop is bounded by the
+            // representation of separately rounded absolute node voltages.
+            let effective_r = if resistance == 0. { 1e-12 } else { resistance };
+            let current_resolution = 4. * f64::EPSILON * (common + 1.) / effective_r;
+            assert!((value(&plot, "i(r1)") - expected).abs() <= current_resolution.max(2e-12));
+        }
+    }
+    eprintln!(
+        "24 common-mode cases: max relative source/load/control current error {worst_relative_error:e}"
+    );
+}
+
+#[test]
+fn recover_contributions_cancelled_inside_matrix_or_rhs_cells() {
+    for (deck, expected) in [
+        (
+            "v1 a 0 1\ng1 a 0 a 0 1e12\nr1 a 0 1k\ng2 a 0 a 0 -1e12\n.op",
+            -1e-3,
+        ),
+        ("v1 a 0 1\ni1 0 a 1e12\ni2 0 a 1m\ni3 a 0 1e12\n.op", 1e-3),
+    ] {
+        let plot = simulate(deck).unwrap();
+        assert!((value(&plot, "i(v1)") - expected).abs() < 2e-15, "{deck}");
+    }
+}
+
+/// Correction must happen at nominal convergence, not after exhausting
+/// repeated absolute iterations or invoking continuation.
+#[test]
+fn early_current_correction_stays_in_the_direct_stage() {
+    use ngspice_rs::analysis::bias::{DcOutcome, DcSettings, DcStrategy, solve_dc_with};
+    use ngspice_rs::devices::{Circuit, ModelContext};
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(
+            Path::new("early.cir"),
+            "Early correction\nv1 a 0 1\nr1 a b 0\nr2 b 0 1k\n.op\n.end\n",
+        ))
+        .unwrap();
+    let circuit = Circuit::from_netlist(&netlist).unwrap();
+    let solved = solve_dc_with(
+        &circuit,
+        &ModelContext::default(),
+        &DcSettings::default(),
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        solved.report.outcome,
+        DcOutcome::Converged(DcStrategy::Direct)
+    );
+    assert_eq!(solved.report.stages.len(), 1);
+    assert!(
+        solved.solution.iterations <= 5,
+        "{} passes",
+        solved.solution.iterations
+    );
+    let row = circuit.branch_rows(0).unwrap().start;
+    assert!((solved.solution.values.get(row).unwrap() + 1. / (1000. + 1e-12)).abs() <= 2e-15);
+    eprintln!(
+        "early current recovery: {} direct Newton passes",
+        solved.solution.iterations
+    );
+}
+
+/// A short feeding a floating RC load at large common mode must retain
+/// both the source current and the accepted capacitor history. Away from
+/// the ramp corner the negligible series-R time constant gives
+/// I = C*dV/dt + V/R = 1 mA + 1000*t A.
+#[test]
+fn ill_conditioned_transient_recovers_source_and_return_currents() {
+    for common in [0., 1000.] {
+        let plot = simulate(&format!(
+            "vh h 0 pwl(0 {common} 1u {} 2u {})\nvl l 0 {common}\nr1 h b 0\nr2 b l 1k\nc1 b l 1n\n.tran 20n 1.8u 0 20n", common+1., common+2.
+        )).unwrap();
+        for point in 0..plot.point_count() {
+            let t = plot.value("time", point).unwrap().re;
+            // Exclude startup and the PWL breakpoint, where companion
+            // restart semantics differ from the smooth analytic ramp.
+            if t < 0.2e-6 || (t - 1e-6).abs() < 0.1e-6 {
+                continue;
+            }
+            let expected = 1000_f64.mul_add(t, 1e-3);
+            for (name, sign) in [("i(vh)", -1.), ("i(vl)", 1.)] {
+                let actual = sign * plot.value(name, point).unwrap().re;
+                assert!(
+                    (actual - expected).abs() < 2e-8,
+                    "CM={common} t={t:e} {name} {actual:e} != {expected:e}"
+                );
+            }
+            let v = plot.value("v(b)", point).unwrap().re - common;
+            assert!((v - 1e6 * t).abs() < 1e-10, "CM={common} t={t:e} v={v:e}");
+        }
     }
 }
 
