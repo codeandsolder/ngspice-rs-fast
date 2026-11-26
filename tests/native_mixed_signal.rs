@@ -374,3 +374,18 @@ fn native_delay_and_rc_feedback_match_independent_reference() -> SpiceResult<()>
     );
     Ok(())
 }
+
+#[test]
+fn mixed_vector_type_changes_inherit_within_group() -> SpiceResult<()> {
+    let mut c = circuit(
+        "v1 a 0 4\nv2 b ref 4\nv3 c ref 4\nvref ref 0 7\nv4 d 0 4\n\
+         a1 %v[a %vd(b ref) (c ref) %v d] bus gate\n\
+         .model gate preprocess_logic_event(operation=0)\n\
+         a2 bus out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    close(
+        output(&run(&mut c, AnalysisKind::OperatingPoint, &[])?, 0),
+        5.,
+    );
+    Ok(())
+}

@@ -579,15 +579,26 @@ fn model_vector_candidates_invalidate_transfer_realization_transactionally() -> 
 #[test]
 fn typed_a_ports_roundtrip_without_flattening_domains() -> SpiceResult<()> {
     use ngspice_rs::netlist::ast::CodePortKind;
-    let netlist = parsed("a1 %vd[(a GND) (b 0)] %d(~GND) logic\na2 %d(d) %gd(out ref) switch")?;
+    let netlist = parsed(
+        "a1 %vd[(a GND) (b 0) %v c d %vd(e f)] %d(~GND) logic\na2 %d(d) %gd(out ref) switch",
+    )?;
     let ports = &netlist.devices[0].code_ports;
     assert!(netlist.devices[0].nodes.is_empty());
     assert_eq!(ports.len(), 2);
-    assert_eq!(ports[0].kind, CodePortKind::VoltageDifferential);
+    assert_eq!(
+        ports[0].terminals[0].kind,
+        CodePortKind::VoltageDifferential
+    );
     assert!(ports[0].vector);
-    assert_eq!(ports[0].terminals.len(), 2);
+    assert_eq!(ports[0].terminals.len(), 5);
+    assert_eq!(ports[0].terminals[2].kind, CodePortKind::Voltage);
+    assert_eq!(ports[0].terminals[3].kind, CodePortKind::Voltage);
+    assert_eq!(
+        ports[0].terminals[4].kind,
+        CodePortKind::VoltageDifferential
+    );
     assert_eq!(ports[0].terminals[0].negative.as_deref(), Some("0"));
-    assert_eq!(ports[1].kind, CodePortKind::Digital);
+    assert_eq!(ports[1].terminals[0].kind, CodePortKind::Digital);
     assert_eq!(ports[1].terminals[0].positive, "gnd");
     assert!(ports[1].terminals[0].inverted);
     let written = ngspice_rs::netlist::write_netlist(&netlist)?;

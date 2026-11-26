@@ -408,6 +408,8 @@ impl CodePortKind {
 /// One scalar or differential element of an A-instance port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeTerminal {
+    /// Type of this element, including changes within a vector.
+    pub kind: CodePortKind,
     /// Positive or single-ended node, case folded.
     pub positive: NodeName,
     /// Explicit negative node, absent for single-ended terminals.
@@ -420,8 +422,6 @@ pub struct CodeTerminal {
 /// from the number of nodes: a one-element vector remains a vector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodePort {
-    /// Declared port type.
-    pub kind: CodePortKind,
     /// Whether the source used a bracketed vector.
     pub vector: bool,
     /// Elements in source order.

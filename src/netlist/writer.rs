@@ -968,8 +968,8 @@ fn model_flags(base: &str) -> &'static [&'static str] {
 }
 
 // Write and validate the common positional device fields before its setters.
-/// Write the two explicitly typed differential analog ports in XSPICE
-/// input/output order. Internal lowered A cards remain unrepresentable.
+/// Write ordered typed scalar/vector ports, retaining type changes within
+/// vectors. Internal lowered A cards remain unrepresentable.
 fn code_model_ports(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
     let location = &device.location;
     if device.code_ports.is_empty() || !device.nodes.is_empty() || !device.parameters.is_empty() {
@@ -985,18 +985,29 @@ fn code_model_ports(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResul
                 Some(location),
             ));
         }
-        if let Some(marker) = port.kind.marker() {
+        let mut kind = port.terminals[0].kind;
+        if let Some(marker) = kind.marker() {
             parts.word(marker)?;
         }
         if port.vector {
             parts.word("[")?;
-        } else if port.kind.marker().is_some() {
+        } else if kind.marker().is_some() {
             parts.push('(')?;
         }
         for terminal in &port.terminals {
-            if terminal.negative.is_some() != port.kind.differential()
+            if terminal.kind != kind {
+                let marker = terminal.kind.marker().ok_or_else(|| {
+                    refuse(
+                        "unresolved type change inside A-instance vector",
+                        Some(location),
+                    )
+                })?;
+                parts.word(marker)?;
+                kind = terminal.kind;
+            }
+            if terminal.negative.is_some() != kind.differential()
                 || (terminal.inverted
-                    && !matches!(port.kind, CodePortKind::Digital | CodePortKind::Default))
+                    && !matches!(kind, CodePortKind::Digital | CodePortKind::Default))
             {
                 return Err(refuse("invalid A-instance terminal", Some(location)));
             }
@@ -1010,7 +1021,7 @@ fn code_model_ports(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResul
         }
         if port.vector {
             parts.word("]")?;
-        } else if port.kind.marker().is_some() {
+        } else if kind.marker().is_some() {
             parts.push(')')?;
         }
     }

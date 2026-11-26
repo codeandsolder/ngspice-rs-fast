@@ -722,13 +722,14 @@ fn transfer_port(port: &CodePort) -> SpiceResult<(PortLaw, &str, &str)> {
     let [terminal] = port.terminals.as_slice() else {
         return Err(invalid("expected scalar transfer port"));
     };
-    if port.vector || terminal.inverted || port.kind.differential() != terminal.negative.is_some() {
+    if port.vector
+        || terminal.inverted
+        || terminal.kind.differential() != terminal.negative.is_some()
+    {
         return Err(invalid("invalid transfer terminal shape"));
     }
-    let law = match port.kind {
-        CodePortKind::Default | CodePortKind::Voltage | CodePortKind::VoltageDifferential => {
-            PortLaw::Voltage
-        }
+    let law = match terminal.kind {
+        CodePortKind::Voltage | CodePortKind::VoltageDifferential => PortLaw::Voltage,
         CodePortKind::Current | CodePortKind::CurrentDifferential => PortLaw::Current,
         _ => return Err(invalid("expected voltage or current transfer port")),
     };

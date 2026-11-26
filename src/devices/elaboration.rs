@@ -233,11 +233,10 @@ impl<'a> PlannedBatch<'a> {
                 i.nodes.iter().chain(
                     i.code_ports
                         .iter()
-                        .filter(|port| port.kind != CodePortKind::Digital)
-                        .flat_map(|port| {
-                            port.terminals.iter().flat_map(|terminal| {
-                                std::iter::once(&terminal.positive).chain(terminal.negative.iter())
-                            })
+                        .flat_map(|port| &port.terminals)
+                        .filter(|terminal| terminal.kind != CodePortKind::Digital)
+                        .flat_map(|terminal| {
+                            std::iter::once(&terminal.positive).chain(terminal.negative.iter())
                         }),
                 )
             })

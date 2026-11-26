@@ -182,22 +182,16 @@ impl SourceModel {
             ));
         }
         for (port, spec) in instance.code_ports.iter().zip(schema_ports) {
-            let kind = if port.kind == CodePortKind::Default {
-                spec.default
-            } else {
-                port.kind
-            };
             if port.vector != spec.vector
                 || port.terminals.is_empty()
                 || (!spec.vector && port.terminals.len() != 1)
-                || !spec.allowed.contains(&kind)
             {
-                return Err(invalid(
-                    "A-instance port type or grouping does not match model",
-                ));
+                return Err(invalid("A-instance port grouping does not match model"));
             }
             for terminal in &port.terminals {
-                if terminal.negative.is_some() != kind.differential()
+                let kind = terminal.kind;
+                if !spec.allowed.contains(&kind)
+                    || terminal.negative.is_some() != kind.differential()
                     || (terminal.inverted && !spec.inversion)
                     || terminal.positive.eq_ignore_ascii_case("null")
                     || terminal

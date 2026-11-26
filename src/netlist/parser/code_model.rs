@@ -53,7 +53,7 @@ fn terminal_name<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
     Ok(token)
 }
 
-fn port(input: &mut Input<'_>, default: CodePortKind) -> Result<CodePort> {
+fn port_type(input: &mut Input<'_>, default: CodePortKind) -> Result<CodePortKind> {
     let token = input
         .input
         .first()
@@ -71,12 +71,16 @@ fn port(input: &mut Input<'_>, default: CodePortKind) -> Result<CodePort> {
         }
         _ => CodePortKind::Default,
     };
-    let kind = if kind == CodePortKind::Default {
-        default
+    if kind == CodePortKind::Default {
+        Ok(default)
     } else {
         any.parse_next(input)?;
-        kind
-    };
+        Ok(kind)
+    }
+}
+
+fn port(input: &mut Input<'_>, default: CodePortKind) -> Result<CodePort> {
+    let mut kind = port_type(input, default)?;
     let vector = opt(|input: &mut Input<'_>| marker(input, "["))
         .parse_next(input)?
         .is_some();
@@ -86,6 +90,7 @@ fn port(input: &mut Input<'_>, default: CodePortKind) -> Result<CodePort> {
             if !terminals.is_empty() {
                 opt(punctuation(TokenKind::Comma)).parse_next(input)?;
             }
+            kind = port_type(input, kind)?;
             terminals.push(element(input, kind)?);
         }
         marker(input, "]")?;
@@ -96,11 +101,7 @@ fn port(input: &mut Input<'_>, default: CodePortKind) -> Result<CodePort> {
     } else {
         vec![element(input, kind)?]
     };
-    Ok(CodePort {
-        kind,
-        vector,
-        terminals,
-    })
+    Ok(CodePort { vector, terminals })
 }
 
 fn element(input: &mut Input<'_>, kind: CodePortKind) -> Result<CodeTerminal> {
@@ -131,6 +132,7 @@ fn element(input: &mut Input<'_>, kind: CodePortKind) -> Result<CodeTerminal> {
         punctuation(TokenKind::RParen).parse_next(input)?;
     }
     Ok(CodeTerminal {
+        kind,
         positive,
         negative,
         inverted,

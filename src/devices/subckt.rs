@@ -1250,19 +1250,21 @@ impl<'a> Expander<'a> {
         terminals: &HierarchyBindings,
         path: &str,
     ) {
-        for port in &mut instance.code_ports {
+        for terminal in instance
+            .code_ports
+            .iter_mut()
+            .flat_map(|port| &mut port.terminals)
+        {
             let rewrite = |name: &str| {
-                if port.kind == CodePortKind::Digital {
+                if terminal.kind == CodePortKind::Digital {
                     Self::rewrite_digital_node(name, &terminals.digital, path)
                 } else {
                     self.rewrite_node(name, &terminals.analog, path)
                 }
             };
-            for terminal in &mut port.terminals {
-                terminal.positive = rewrite(&terminal.positive);
-                if let Some(negative) = &mut terminal.negative {
-                    *negative = rewrite(negative);
-                }
+            terminal.positive = rewrite(&terminal.positive);
+            if let Some(negative) = &mut terminal.negative {
+                *negative = rewrite(negative);
             }
         }
     }
