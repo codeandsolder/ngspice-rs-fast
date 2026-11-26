@@ -238,7 +238,7 @@ fn scalar_name(designator: char, text: &str) -> Option<String> {
         | ('l', "l" | "inductance") => primary_name(designator),
         (_, "temp" | "dtemp" | "m" | "tc1" | "tc2" | "scale")
         | ('r' | 'c', "w" | "l" | "bv_max")
-        | ('r', "ac" | "tc" | "tce" | "noisy")
+        | ('r', "ac" | "tc" | "tce" | "noisy" | "initial_segment")
         | ('c' | 'l', "ic")
         | ('l', "nt") => &name,
         _ => return None,
