@@ -1377,6 +1377,9 @@ impl Circuit {
         &mut self,
         waveforms: Vec<(String, crate::devices::prepared_waveform::PreparedForcing)>,
     ) -> SpiceResult<()> {
+        if waveforms.is_empty() {
+            return Ok(());
+        }
         let mut prepared = BTreeMap::new();
         for (name, forcing) in waveforms {
             if prepared.insert(name, forcing).is_some() {
@@ -3620,7 +3623,7 @@ impl Circuit {
             .fixed_stamps
             .replace(unlent.unwrap_or_else(|| matrix.return_fixed()));
         stamped?;
-        if request.mode.is_dc()
+        if request.mode.is_bias()
             && let Some(analysis) = request.model_context.bias_analysis
         {
             for (&node, policy) in &self.prepared_node_initializations {

@@ -408,14 +408,17 @@ impl AnalysisMode {
         matches!(self, Self::Transient { .. })
     }
 
-    /// True for the DC analyses, where capacitors are open and inductors are
-    /// shorts.
-    #[must_use = "DC loads omit time-dependent companion terms"]
+    /// True only for equilibrium bias loads, not unintegrated transient
+    /// physical residuals.
+    #[must_use = "bias constraints must be released during transient physical loads"]
+    pub const fn is_bias(self) -> bool {
+        matches!(self, Self::OperatingPoint | Self::DcSweep)
+    }
+
+    /// True for static loads, including the unintegrated physical DAE.
+    #[must_use = "static loads omit time-dependent companion terms"]
     pub const fn is_dc(self) -> bool {
-        matches!(
-            self,
-            Self::OperatingPoint | Self::DcSweep | Self::Instantaneous { .. }
-        )
+        self.is_bias() || matches!(self, Self::Instantaneous { .. })
     }
 }
 
