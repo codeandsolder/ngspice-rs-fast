@@ -60,6 +60,7 @@ pub use plan::{
 };
 use statistics::{PreparedSite, Realization, Sampler};
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -1559,11 +1560,14 @@ const CALL_DEPTH: usize = 4;
 const CALL_DEPTH_NOTE: &str = " (each nested .func call counts as 4 levels)";
 
 /// One active `.func` call: the definition, the scope it was defined in and
-/// its argument values, linked to the enclosing call.
+/// its lazily bound argument values, linked to the enclosing call.
 struct Frame<'a> {
     def: &'a FunctionDef,
     scope: &'a FunctionScope,
-    args: Vec<Real>,
+    args: &'a [Expr],
+    values: Vec<Cell<Option<Real>>>,
+    caller: Env<'a>,
+    source: ExprSource<'a>,
     call: SourceLoc,
     call_offset: Option<u64>,
     outer: Option<&'a Self>,
@@ -1604,15 +1608,28 @@ impl<'a> Env<'a> {
     /// A name: the formals of the active calls, innermost first (C's textual
     /// expansion lets an enclosing call's formal capture a callee's free
     /// name), then the site's parameters.
-    fn value(&self, name: &str) -> Option<Real> {
+    fn value(
+        &self,
+        name: &str,
+        budget: &mut EvalBudget,
+        depth: usize,
+    ) -> Result<Option<Real>, Failure> {
         let mut frame = self.frame;
         while let Some(f) = frame {
             if let Some(i) = f.def.parameters.iter().position(|p| p == name) {
-                return Some(f.args[i]);
+                if let Some(value) = f.values[i].get() {
+                    return Ok(Some(value));
+                }
+                // Evaluate in the argument's caller environment, not the
+                // callee's shadowing formals. Cache once per invocation so
+                // a reused stochastic argument still has one realization.
+                let value = eval(&f.args[i], f.source, f.caller, budget, depth + CALL_DEPTH)?;
+                f.values[i].set(Some(value));
+                return Ok(Some(value));
             }
             frame = f.outer;
         }
-        (self.lookup)(name)
+        Ok((self.lookup)(name))
     }
 
     /// A user function: looked up where the calling body was defined (or at
@@ -1764,7 +1781,7 @@ fn eval(
     match &node.kind {
         ExprKind::Number { value, .. } => Ok(*value),
         ExprKind::Identifier(name) => env
-            .value(name)
+            .value(name, budget, depth)?
             .ok_or_else(|| undefined_parameter(node, name)),
         ExprKind::Group(inner) => eval(inner, root, env, budget, depth + 1),
         ExprKind::Unary { op, operand } => {
@@ -1924,12 +1941,12 @@ fn builtin_call(
             depth + 1,
         );
     }
+    if let Some((def, scope)) = definition {
+        return call(node, root, env, budget, depth, def, scope, arguments);
+    }
     let mut args = Vec::with_capacity(arguments.len());
     for a in arguments {
         args.push(eval(a, root, env, budget, depth + 1)?);
-    }
-    if let Some((def, scope)) = definition {
-        return call(node, root, env, budget, depth, def, scope, args);
     }
     let result = apply(function, &args);
     checked(result, node, root, || {
@@ -2010,14 +2027,10 @@ fn user_call(
             format_args!("undefined function '{name}' (no .func definition is in scope)"),
         ));
     };
-    let mut args = Vec::with_capacity(arguments.len());
-    for a in arguments {
-        args.push(eval(a, root, env, budget, depth + 1)?);
-    }
-    call(node, root, env, budget, depth, def, scope, args)
+    call(node, root, env, budget, depth, def, scope, arguments)
 }
 
-/// Evaluates one `.func` call with already evaluated arguments.
+/// Evaluates one `.func` call with lazily memoized argument values.
 #[expect(
     clippy::too_many_arguments,
     reason = "keeps the positional interface explicit at the reference solver or device boundary"
@@ -2030,7 +2043,7 @@ fn call(
     depth: usize,
     def: &FunctionDef,
     scope: &FunctionScope,
-    args: Vec<Real>,
+    args: &[Expr],
 ) -> Result<Real, Failure> {
     if args.len() != def.parameters.len() {
         return Err(fail(
@@ -2065,6 +2078,9 @@ fn call(
         def,
         scope,
         args,
+        values: vec![Cell::new(None); args.len()],
+        caller: env,
+        source: root,
         call: node.span.start.clone(),
         call_offset: node
             .span
