@@ -4,7 +4,8 @@
 
 use super::{Binary, Instruction, Operator, Plan, Slot, Unary};
 use crate::devices::behavioural::program::{
-    EXP_LIMIT, Environment, TWO_PI, divide, modulus, power, power_h, pwr, unary_value,
+    EXP_LIMIT, Environment, PowerLaw, PowerPart, TWO_PI, divide, modulus, power, power_h, pwr,
+    unary_value,
 };
 use crate::maths::taylor::Jet;
 use crate::primitives::{Real, SpiceError, SpiceResult, almost_equal_ulps};
@@ -172,7 +173,7 @@ impl Evaluator<'_> {
             Instruction::Unary(op, a) if !discrete(op) => [Some(a), None],
             Instruction::Pwl(a, _) | Instruction::Table(a, _) => [Some(a), None],
             Instruction::Operator(_, a, b)
-            | Instruction::Binary(Binary::Pow | Binary::Pwr, a, b) => [Some(a), Some(b)],
+            | Instruction::Binary(Binary::Power(_, PowerPart::Value), a, b) => [Some(a), Some(b)],
             Instruction::Binary(op @ (Binary::Min | Binary::Max), a, b) => [
                 Some(select_extremum(op, self.read(a)?, self.read(b)?, a, b)),
                 None,
@@ -251,8 +252,8 @@ impl Evaluator<'_> {
                 side,
                 self.environment.gmin * 1e-20,
             )?,
-            Instruction::Binary(op @ (Binary::Pow | Binary::Pwr), a, b) => {
-                power_partial(self.read(a)?, self.read(b)?, op == Binary::Pwr, side != 0)?
+            Instruction::Binary(Binary::Power(law, PowerPart::Value), a, b) => {
+                typed_power_partial(law, self.read(a)?, self.read(b)?, side != 0)?
             }
             Instruction::Binary(Binary::Min | Binary::Max, ..) | Instruction::Ternary(..) => {
                 constant(1.)
@@ -595,6 +596,157 @@ fn power_partial(a: &Jet, b: &Jet, signed: bool, exponent: bool) -> SpiceResult<
     Ok(magnitude.power(&b.clone().offset(-1.))?.multiply(b))
 }
 
+/// Sine and cosine of the principal complex-power phase. Reduce only the
+/// center, then propagate the displacement from its exact (possibly
+/// integral) phase, so integer branches never acquire spurious derivatives.
+fn principal_phase(b: &Jet) -> (Jet, Jet) {
+    let pi = std::f64::consts::PI;
+    let center = b.value().rem_euclid(2.);
+    let (s0, c0) = if b.value().fract() == 0. {
+        (0., if center == 0. { 1. } else { -1. })
+    } else {
+        (pi * center).sin_cos()
+    };
+    let (s, c) = b.clone().with_value(0.).scale(pi).sin_cos();
+    (
+        s.clone().scale(c0).add(&c.clone().scale(s0)),
+        c.scale(c0).add(&s.scale(-s0)),
+    )
+}
+
+fn magnitude(a: &Jet) -> Jet {
+    if a.sign() == Ordering::Less {
+        a.clone().scale(-1.)
+    } else {
+        a.clone()
+    }
+}
+
+fn nonregular_power() -> SpiceError {
+    SpiceError::circuit("power law has no regular local physical Taylor expansion")
+}
+
+fn typed_power_jet(law: PowerLaw, a: &Jet, b: &Jet) -> SpiceResult<Jet> {
+    match law {
+        PowerLaw::NativePow => return power_jet(a, b, PowerKind::Ordinary),
+        PowerLaw::NativePwr => return power_jet(a, b, PowerKind::Signed),
+        _ => {}
+    }
+    let scalar = law.evaluate(PowerPart::Value, a.value(), b.value());
+    let constant = |value| Jet::constant(a.order(), value);
+    if a.is_constant() && b.is_constant() {
+        return Ok(constant(scalar));
+    }
+    if a.sign() == Ordering::Equal {
+        if b.sign() != Ordering::Greater {
+            return Err(nonregular_power());
+        }
+        // The caret law's measured floor at exactly zero is a separate
+        // value branch, not a surrogate derivative of the positive-base law.
+        return Ok(if law == PowerLaw::SimetrixCaret {
+            b.clone().scale(1e-308_f64.ln()).exp()
+        } else {
+            constant(0.)
+        });
+    }
+    let negative = a.sign() == Ordering::Less;
+    let result = match law {
+        PowerLaw::SimetrixCaret if negative => {
+            if !b.is_constant() || b.value().fract() != 0. {
+                return Err(nonregular_power());
+            }
+            a.power(b)?
+        }
+        PowerLaw::SimetrixCaret => a.power(b)?,
+        PowerLaw::SimetrixAbsolute => magnitude(a).power(b)?,
+        PowerLaw::SimetrixRealPart if negative => {
+            magnitude(a).power(b)?.multiply(&principal_phase(b).1)
+        }
+        PowerLaw::SimetrixRealPart => a.power(b)?,
+        _ => return Err(nonregular_power()),
+    };
+    // At a zero crossing use the actual one-sided expansion, not the
+    // separately regularized scalar value at the isolated boundary.
+    Ok(if a.value() == 0. {
+        result
+    } else {
+        result.with_value(scalar)
+    })
+}
+
+fn zero_base_partial(law: PowerLaw, a: &Jet, b: &Jet, exponent: bool) -> SpiceResult<Jet> {
+    let constant = |value| Jet::constant(a.order(), value);
+    if exponent {
+        if b.sign() != Ordering::Greater {
+            return Err(nonregular_power());
+        }
+        if law != PowerLaw::SimetrixCaret {
+            return Ok(constant(0.));
+        }
+        if b.is_constant() && b.value().fract() == 0. {
+            // The isolated exact-integer branch has no exponent derivative.
+            return Err(nonregular_power());
+        }
+        return Ok(b
+            .clone()
+            .scale(1e-308_f64.ln())
+            .exp()
+            .scale(1e-308_f64.ln()));
+    }
+    if b.is_zero() {
+        return Ok(constant(0.));
+    }
+    if law == PowerLaw::SimetrixCaret && (!b.is_constant() || b.value().fract() != 0.) {
+        // A finite scalar floor at zero is not a physical base derivative.
+        return Err(nonregular_power());
+    }
+    match b.compare(1.) {
+        Some(Ordering::Greater) => Ok(constant(0.)),
+        Some(Ordering::Equal) if law != PowerLaw::SimetrixAbsolute => Ok(constant(1.)),
+        _ => Err(nonregular_power()),
+    }
+}
+
+fn typed_power_partial(law: PowerLaw, a: &Jet, b: &Jet, exponent: bool) -> SpiceResult<Jet> {
+    match law {
+        PowerLaw::NativePow => return power_partial(a, b, false, exponent),
+        PowerLaw::NativePwr => return power_partial(a, b, true, exponent),
+        _ => {}
+    }
+    if a.sign() == Ordering::Equal {
+        return zero_base_partial(law, a, b, exponent);
+    }
+    let negative = a.sign() == Ordering::Less;
+    let mag = magnitude(a);
+    if exponent {
+        if negative && law == PowerLaw::SimetrixCaret {
+            return Err(nonregular_power());
+        }
+        let log = mag.ln()?;
+        let value = mag.power(b)?;
+        if negative && law == PowerLaw::SimetrixRealPart {
+            let (sin, cos) = principal_phase(b);
+            return Ok(value.multiply(&log.multiply(&cos).add(&sin.scale(-std::f64::consts::PI))));
+        }
+        return Ok(value.multiply(&log));
+    }
+    if b.is_zero() {
+        return Ok(Jet::constant(a.order(), 0.));
+    }
+    let shifted = b.clone().offset(-1.);
+    if law == PowerLaw::SimetrixCaret {
+        return Ok(a.power(&shifted)?.multiply(b));
+    }
+    let mut slope = mag.power(&shifted)?.multiply(b);
+    if negative {
+        slope = slope.scale(-1.);
+        if law == PowerLaw::SimetrixRealPart {
+            slope = slope.multiply(&principal_phase(b).1);
+        }
+    }
+    Ok(slope)
+}
+
 fn select_extremum<T>(op: Binary, a: &Jet, b: &Jet, left: T, right: T) -> T {
     let comparison = a.clone().add(&b.clone().scale(-1.)).sign();
     if (op == Binary::Min && comparison == Ordering::Greater)
@@ -608,8 +760,7 @@ fn select_extremum<T>(op: Binary, a: &Jet, b: &Jet, left: T, right: T) -> T {
 
 fn binary(op: Binary, a: &Jet, b: &Jet) -> SpiceResult<Jet> {
     match op {
-        Binary::Pow => power_jet(a, b, PowerKind::Ordinary),
-        Binary::Pwr => power_jet(a, b, PowerKind::Signed),
+        Binary::Power(law, PowerPart::Value) => typed_power_jet(law, a, b),
         Binary::Min | Binary::Max => Ok(select_extremum(op, a, b, a, b).clone()),
         _ => Err(SpiceError::circuit(
             "derivative-only instruction in physical value graph",
@@ -625,6 +776,10 @@ mod tests {
     use crate::primitives::SourceLoc;
 
     fn evaluate(text: &str, variables: &[Jet]) -> TaylorEvaluation {
+        try_evaluate(text, variables).unwrap()
+    }
+
+    fn try_evaluate(text: &str, variables: &[Jet]) -> SpiceResult<TaylorEvaluation> {
         let expression = Parser::new()
             .parse_behavioural_expression(
                 text,
@@ -642,13 +797,11 @@ mod tests {
             gmin: 1e-12,
             frequency: 0.,
         };
-        program
-            .evaluate_taylor(
-                &environment,
-                variables,
-                &Jet::affine(variables[0].order(), 0., 1.),
-            )
-            .unwrap()
+        program.evaluate_taylor(
+            &environment,
+            variables,
+            &Jet::affine(variables[0].order(), 0., 1.),
+        )
     }
 
     fn close(actual: &Jet, expected: &[Real]) {
@@ -710,5 +863,65 @@ mod tests {
             close(&result.value, &[2., slope * direction, 0., 0.]);
             close(&result.gradient[0], &[slope, 0., 0., 0.]);
         }
+    }
+    #[test]
+    fn typed_power_laws_preserve_distinct_negative_base_germs() {
+        for (name, sign) in [
+            ("simetrix_abs_pow", 1.),
+            ("simetrix_caret_pow", -1.),
+            ("simetrix_pow", -1.),
+        ] {
+            let result = evaluate(&format!("{name}(v(a),3)"), &[Jet::affine(3, -2., 1.)]);
+            close(&result.value, &[8. * sign, -12. * sign, 6. * sign, -sign]);
+            close(
+                &result.gradient[0],
+                &[-12. * sign, 12. * sign, -3. * sign, 0.],
+            );
+        }
+    }
+
+    #[test]
+    fn real_component_power_differentiates_principal_phase() {
+        let result = evaluate(
+            "simetrix_pow(v(a),v(b))",
+            &[Jet::constant(2, -2.), Jet::affine(2, 2., 1.)],
+        );
+        let log = 2_f64.ln();
+        let pi = std::f64::consts::PI;
+        let second = log.mul_add(log, -pi * pi);
+        close(&result.value, &[4., 4. * log, 2. * second]);
+        close(
+            &result.gradient[0],
+            &[-4., -2. - 4. * log, -2. * (second + log)],
+        );
+        close(
+            &result.gradient[1],
+            &[
+                4. * log,
+                4. * second,
+                2. * log * log.mul_add(log, -3. * pi * pi),
+            ],
+        );
+    }
+
+    #[test]
+    fn typed_zero_crossing_uses_the_selected_germ_or_rejects_nonregular_rank() {
+        for direction in [-1., 1.] {
+            let result = evaluate("simetrix_abs_pow(v(a),2)", &[Jet::affine(2, 0., direction)]);
+            close(&result.value, &[0., 0., 1.]);
+            close(&result.gradient[0], &[0., 2. * direction, 0.]);
+            let result = evaluate("simetrix_abs_pow(v(a),1)", &[Jet::affine(2, 0., direction)]);
+            close(&result.value, &[0., 1., 0.]);
+            close(&result.gradient[0], &[direction, 0., 0.]);
+        }
+        assert!(try_evaluate("simetrix_abs_pow(v(a),1)", &[Jet::constant(2, 0.)]).is_err());
+        assert!(try_evaluate("simetrix_caret_pow(v(a),0.5)", &[Jet::affine(2, 0., 1.)]).is_err());
+        assert!(
+            try_evaluate(
+                "simetrix_caret_pow(v(a),v(b))",
+                &[Jet::constant(2, -2.), Jet::affine(2, 2., 1.)],
+            )
+            .is_err()
+        );
     }
 }
