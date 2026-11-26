@@ -779,3 +779,26 @@ fn complex_linearization_preserves_both_components() {
     assert!((spectrum.value("v(out)", 0).unwrap() - Complex::new(4., 0.5)).magnitude() < 1e-12);
     assert!(spectrum.value("frequency", 8).unwrap().re < 0.);
 }
+
+#[test]
+fn control_transient_breakpoint_spacing_matches_deck_and_is_request_local() {
+    let deck = ScriptDeck::from_text(
+        "minbreak",
+        "breakpoint options\nv1 in 0 PWL(0 0 1m 0 1.001m 0.001 2m 1)\n\
+        r1 in out 1k\nc1 out 0 1u\n.options minbreak=2u\n.tran 10u 3m\n\
+        .control\nrun\ntran 10u 3m minbreak=0\ntran 10u 3m minbreak=2u\n\
+        tran 10u 3m\nquit\n.endc\n.end\n",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    assert_eq!(report.plots.len(), 4);
+    let plots = report.plots.iter().map(|p| &p.plot).collect::<Vec<_>>();
+    let axis = |plot: &ngspice_rs::analysis::Plot| {
+        (0..plot.point_count())
+            .map(|point| plot.value("time", point).unwrap().re.to_bits())
+            .collect::<Vec<_>>()
+    };
+    let reference = axis(plots[0]);
+    assert_ne!(reference, axis(plots[1]));
+    assert_eq!(reference, axis(plots[2]));
+    assert_eq!(reference, axis(plots[3]));
+}

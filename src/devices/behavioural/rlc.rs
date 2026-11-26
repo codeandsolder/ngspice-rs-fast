@@ -491,7 +491,7 @@ impl Device for Passive {
                                 .reltol
                                 .mul_add(actual.abs().max(expected.abs()), absolute)
                 };
-                let derivative = |quantity: Real| -> SpiceResult<Real> {
+                let derivative = |quantity: Real| -> SpiceResult<(Real, Real)> {
                     if let Some(integration) = context.integration {
                         let accepted = |age, slot| {
                             context.accepted(age, slot).ok_or_else(|| {
@@ -506,12 +506,20 @@ impl Device for Passive {
                             .needs_previous_derivative()
                             .then(|| accepted(1, 1))
                             .transpose()?;
-                        Ok(integration.integrate(&history, previous, 1.)?.derivative)
+                        let companion = integration.integrate(&history, previous, 1.)?;
+                        // The linear evolution stamp contains the rounded history
+                        // source and present-charge coefficient. Their cancellation
+                        // can amplify one ulp of stored charge into a large rate
+                        // error at small dt. Test against that arithmetic's
+                        // backward-error floor, not a fictitious exact derivative.
+                        let rounding = (4. * Real::EPSILON * companion.conductance.abs())
+                            .mul_add(quantity.abs(), 4. * Real::EPSILON * companion.current.abs());
+                        Ok((companion.derivative, rounding))
                     } else {
-                        Ok(0.)
+                        Ok((0., 0.))
                     }
                 };
-                let dynamic = || -> SpiceResult<Real> {
+                let dynamic = || -> SpiceResult<(Real, Real)> {
                     let storage = equations
                         .into_iter()
                         .flatten()
@@ -538,16 +546,17 @@ impl Device for Passive {
                         } else {
                             (voltage, context.vntol)
                         };
+                        let (expected, rate_rounding) = dynamic()?;
                         disagree(rate, coefficient, rounding)
-                            || disagree(actual, -dynamic()?, absolute)
+                            || disagree(actual, -expected, absolute + rate_rounding)
                     }
                     Law::Capacitance => {
                         disagree(current, coefficient * rate, context.abstol)
-                            || disagree(current, -coefficient * dynamic()?, context.abstol)
+                            || disagree(current, -coefficient * dynamic()?.0, context.abstol)
                     }
                     Law::Inductance => {
                         disagree(voltage, coefficient * rate, context.vntol)
-                            || disagree(voltage, -coefficient * dynamic()?, context.vntol)
+                            || disagree(voltage, -coefficient * dynamic()?.0, context.vntol)
                     }
                 })
             },

@@ -172,6 +172,7 @@ struct TopologyBindings {
     branch_rows: Vec<std::ops::Range<usize>>,
     convergence_kinds: Vec<crate::devices::ConvergenceKind>,
     private_storage_rows: Vec<(usize, usize)>,
+    regularization_nodes: Option<Vec<usize>>,
     control_rows: Vec<Vec<usize>>,
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
@@ -206,6 +207,7 @@ pub(super) struct CircuitRuntime {
     initial_revision: std::cell::RefCell<Arc<()>>,
     pattern: std::cell::RefCell<Option<Arc<crate::maths::Pattern>>>,
     carried_state: std::cell::RefCell<Option<StateSnapshot>>,
+    continuation_diagonal: std::cell::Cell<Real>,
     completed: Vec<crate::primitives::AnalysisKind>,
     final_transient: std::cell::RefCell<Option<StateSnapshot>>,
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
@@ -1425,8 +1427,31 @@ impl Circuit {
             .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect::<SpiceResult<_>>()?;
         self.bindings.private_storage_rows = self.bind_private_storage()?;
+        self.bindings.regularization_nodes = self.bind_regularization_nodes();
         self.bindings.mutual = self.resolve_mutual(names)?;
         Ok(())
+    }
+
+    /// Mixed-unit constitutive systems require a physical nodal regularization.
+    ///
+    /// Unlike the legacy SPARSE internal diagonal, a conductance in an
+    /// original electrical KCL row cannot perturb a charge, flux or
+    /// derivative equation, regardless of numerical pivot permutations.
+    fn bind_regularization_nodes(&self) -> Option<Vec<usize>> {
+        use crate::devices::BranchQuantity;
+        let mixed = self
+            .devices
+            .iter()
+            .zip(&self.bindings.branch_rows)
+            .any(|(device, rows)| {
+                (0..rows.len())
+                    .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
+            });
+        mixed.then(|| {
+            self.physical_voltage_nodes()
+                .filter_map(|node| self.bindings.unknowns.node_row(node.id))
+                .collect()
+        })
     }
 
     /// Bind each private expression storage coordinate and its derivative
@@ -1976,7 +2001,10 @@ impl Circuit {
     /// same elements is kept, so its pivot order survives re-finalization
     /// (C sets a circuit up once).
     fn allocate_matrix(&mut self, order: Vec<usize>) -> SpiceResult<()> {
-        let elements = self.ordered_elements(&order, 0)?;
+        let mut elements = self.ordered_elements(&order, 0)?;
+        if let Some(rows) = &self.bindings.regularization_nodes {
+            elements.extend(rows.iter().map(|&row| (row, row)));
+        }
         self.bindings.order = order;
         let n = self.unknown_count();
         let mut slot = self.runtime.pattern.borrow_mut();
@@ -2339,6 +2367,18 @@ impl Circuit {
 
     pub(crate) fn convergence_kinds(&self) -> &[crate::devices::ConvergenceKind] {
         &self.bindings.convergence_kinds
+    }
+
+    pub(crate) const fn continuation_diagonal(&self) -> Real {
+        self.runtime.continuation_diagonal.get()
+    }
+
+    pub(crate) fn set_continuation_diagonal(&self, value: Real) {
+        self.runtime.continuation_diagonal.set(value);
+    }
+
+    pub(crate) fn regularization_nodes(&self) -> Option<&[usize]> {
+        self.bindings.regularization_nodes.as_deref()
     }
 
     pub(crate) fn private_storage_rows(&self) -> &[(usize, usize)] {
@@ -2946,6 +2986,7 @@ impl Circuit {
     /// changes its candidate. Preserve finalized bindings, sparse pattern and
     /// prepared names; only independent simulation state is invalidated.
     pub(crate) fn clear_candidate_analysis_state(&mut self) {
+        self.runtime.continuation_diagonal.set(0.);
         self.runtime.completed.clear();
         self.runtime.carried_state.get_mut().take();
         self.runtime.final_transient.get_mut().take();
@@ -3417,6 +3458,7 @@ impl Circuit {
                 && a.branch_rows == b.branch_rows
                 && a.control_rows == b.control_rows
                 && a.private_storage_rows == b.private_storage_rows
+                && a.regularization_nodes == b.regularization_nodes
                 && a.state_rows == b.state_rows
                 && self.nodes.nodes() == previous.nodes.nodes()
                 && self.devices.len() == previous.devices.len()
@@ -3452,6 +3494,7 @@ impl Circuit {
     /// this circuit has allocated (the rule `finalize` applies on
     /// re-finalization); otherwise this circuit keeps its own.
     pub fn inherit_from(&mut self, previous: &Self) {
+        self.runtime.continuation_diagonal.set(0.);
         self.runtime.fixed_stamps.get_mut().forget();
         self.runtime.completed.clear();
         self.runtime.final_transient.get_mut().take();
@@ -3463,6 +3506,9 @@ impl Circuit {
         if !self.compatible_topology(previous) {
             return;
         }
+        self.runtime
+            .continuation_diagonal
+            .set(previous.continuation_diagonal());
         self.runtime
             .completed
             .clone_from(&previous.runtime.completed);
@@ -4148,7 +4194,8 @@ impl Circuit {
             self.devices.iter().map(|device| device.name()),
             limits.devices.saturating_sub(existing.devices),
         )?;
-        let instances = instances.as_ref();
+        let aliases = instances.probe_aliases;
+        let instances = instances.instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
         let plan =
@@ -4162,6 +4209,12 @@ impl Circuit {
         let staged = self.nodes.transaction(|nodes| {
             let staged =
                 Self::elaborate_batch(plan, models, context, nodes, existing, limits, seen)?;
+            for alias in &aliases {
+                let id = nodes.get(alias).ok_or_else(|| {
+                    SpiceError::circuit(format!("missing generated probe alias {alias}"))
+                })?;
+                nodes.set_kind(id, NodeKind::ProbeAlias)?;
+            }
             // The node transaction commits only after the final device and
             // provenance vector can hold the entire staged suffix.
             devices.try_reserve(staged.len()).map_err(|error| {
@@ -4524,6 +4577,7 @@ impl Circuit {
             .iter()
             .any(|card| card.kind == crate::primitives::AnalysisKind::Noise);
         circuit.add_instances(&expanded.devices, &models, &setup)?;
+        circuit.add_topology_shunts(setup.shunts)?;
         let referenced: BTreeSet<_> = expanded
             .devices
             .iter()
@@ -4551,6 +4605,110 @@ impl Circuit {
         // Reject an invalid inductive system (K coupling) before any analysis.
         circuit.prepared_mutual_terms(context)?;
         Ok(circuit)
+    }
+
+    /// Electrical voltage nodes, excluding probe aliases and solver-owned signals.
+    ///
+    /// A generated differentiator signal is a matrix coordinate, but its
+    /// row contains a constitutive equation rather than a physical KCL.
+    /// Its values also need not have voltage units.
+    pub(crate) fn physical_voltage_nodes(&self) -> impl Iterator<Item = &crate::primitives::Node> {
+        use crate::devices::InitialStorageRow;
+        let signals: BTreeSet<_> = self
+            .devices
+            .iter()
+            .filter_map(|device| device.initial_expression_storage())
+            .filter_map(|storage| match storage.gauge {
+                InitialStorageRow::Signal(node) => Some(node),
+                InitialStorageRow::Branch(_) => None,
+            })
+            .collect();
+        self.nodes.nodes().iter().filter(move |node| {
+            matches!(node.kind, NodeKind::Terminal | NodeKind::Internal)
+                && !signals.contains(&node.id)
+        })
+    }
+
+    /// C `INPpas4` adds capacitors to parsed voltage nodes before device
+    /// setup; `CKTsetup`'s rshunt adds noiseless conductance to all voltage
+    /// nodes after setup. Branch-current, automatic probe aliases and private storage coordinates
+    /// are never physical shunt targets. Materialize real device equations
+    /// so all analysis paths see the same topology and charge states.
+    fn add_topology_shunts(
+        &mut self,
+        shunts: crate::devices::models::TopologyShunts,
+    ) -> SpiceResult<()> {
+        use crate::devices::{Capacitor, Resistor, ResistorNoise};
+        if shunts == crate::devices::models::TopologyShunts::default() {
+            return Ok(());
+        }
+        let mut names: BTreeSet<_> = self
+            .devices
+            .iter()
+            .map(|device| device.name().to_ascii_lowercase())
+            .collect();
+        let nodes: Vec<_> = self.physical_voltage_nodes().collect();
+        let resistors = if shunts.resistance.is_some() {
+            nodes.len()
+        } else {
+            0
+        };
+        let capacitors = if shunts.capacitance > 0. {
+            nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::Terminal)
+                .count()
+        } else {
+            0
+        };
+        let size = ElaborationSize::new(resistors, 0, 0).checked_add(
+            ElaborationSize::new(
+                capacitors,
+                0,
+                capacitors
+                    .checked_mul(crate::devices::rlc::REACTIVE_STATE_COUNT)
+                    .ok_or_else(|| resource_error(None, "shunt charge state count overflows"))?,
+            ),
+            None,
+        )?;
+        self.elaboration_limits
+            .check(self.elaboration_size()?.checked_add(size, None)?, None)?;
+        let mut devices: Vec<Box<dyn Device>> = Vec::new();
+        reserve(&mut devices, size.devices, None)?;
+        let mut unique = |base: String| {
+            let mut name = base.clone();
+            let mut suffix = 0_usize;
+            while !names.insert(name.to_ascii_lowercase()) {
+                suffix += 1;
+                name = format!("{base}_{suffix}");
+            }
+            name
+        };
+        for node in nodes {
+            let terminals = [node.id, NodeId::GROUND];
+            if let Some(resistance) = shunts.resistance {
+                devices.push(Box::new(
+                    Resistor::new(
+                        unique(format!("r__rshunt_{}", node.id.index())),
+                        terminals,
+                        resistance,
+                    )?
+                    .with_noise(ResistorNoise {
+                        noisy: false,
+                        ..Default::default()
+                    }),
+                ));
+            }
+            if shunts.capacitance > 0. && node.kind == NodeKind::Terminal {
+                devices.push(Box::new(Capacitor::new(
+                    unique(format!("capac{}shunt", node.id.index())),
+                    terminals,
+                    shunts.capacitance,
+                    None,
+                )?));
+            }
+        }
+        self.add_prepared_devices(size, |_| Ok(devices))
     }
 
     /// Looks up a device by instance name, case-insensitively.

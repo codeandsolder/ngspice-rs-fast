@@ -413,19 +413,28 @@ impl CircuitNewton<'_, '_> {
                     Some(&mut **attempt),
                 ),
             };
-        let options = self.options;
         let circuit = prepared.circuit();
+        let nodal_regularization = circuit.regularization_nodes();
+        let gmin = self.options.diag_gmin;
+        let options = NewtonOptions {
+            diag_gmin: if nodal_regularization.is_some() && gmin.is_finite() && gmin >= 0. {
+                0.
+            } else {
+                gmin
+            },
+            ..*self.options
+        };
         solve_phased_into(
             initial,
             self.branch_rows,
             Some(circuit.convergence_kinds()),
-            if integration.is_some() && options.diag_gmin == 0. {
+            if integration.is_some() {
                 circuit.private_storage_rows()
             } else {
                 &[]
             },
             self.limited_rows,
-            options,
+            &options,
             policy,
             continued,
             &mut self.workspace.load,
@@ -461,6 +470,7 @@ impl CircuitNewton<'_, '_> {
                         &mut trial,
                     )?;
                 }
+                stamp_nodal_regularization(matrix, nodal_regularization, gmin)?;
                 after_load(phase, matrix, rhs)?;
                 Ok(trial)
             },
@@ -480,6 +490,22 @@ impl CircuitNewton<'_, '_> {
             },
         )
     }
+}
+
+/// Stamp the requested conductance only on original electrical KCL rows.
+fn stamp_nodal_regularization(
+    matrix: &mut SparseMatrix,
+    rows: Option<&[usize]>,
+    conductance: Real,
+) -> SpiceResult<()> {
+    if let Some(rows) = rows
+        && conductance > 0.
+    {
+        for &row in rows {
+            matrix.add(row, row, conductance)?;
+        }
+    }
+    Ok(())
 }
 
 /// One ordinary Newton driver's disposable load slots. The matrix/RHS stay
@@ -506,6 +532,21 @@ impl<T> LoadStorage<T> {
     fn loaded(&mut self, matrix: SparseMatrix, rhs: Vector) {
         self.matrix = Some(matrix);
         self.rhs = Some(rhs);
+    }
+
+    /// Check the assembled system and fold duplicates before factorization.
+    fn checked_system(&mut self, n: usize) -> SpiceResult<(&mut SparseMatrix, &Vector)> {
+        let matrix = self
+            .matrix
+            .as_mut()
+            .ok_or_else(|| failure("Newton load returned no matrix"))?;
+        let rhs = self
+            .rhs
+            .as_ref()
+            .ok_or_else(|| failure("Newton load returned no RHS"))?;
+        check(matrix, rhs, n)?;
+        matrix.fold_duplicates();
+        Ok((matrix, rhs))
     }
 }
 
@@ -647,6 +688,29 @@ fn iterate<T, F: Fn(&T) -> bool>(
     })
 }
 
+/// Validate dimensions and numerical options before any disposable load.
+fn validate_iteration_input(
+    initial: &Vector,
+    branch_rows: &[bool],
+    limited_rows: Option<&[bool]>,
+    coordinate_kinds: Option<&[crate::devices::ConvergenceKind]>,
+    options: &NewtonOptions,
+) -> SpiceResult<()> {
+    options.validate()?;
+    let n = initial.len();
+    if n == 0
+        || n != branch_rows.len()
+        || limited_rows.is_some_and(|rows| rows.len() != n)
+        || coordinate_kinds.is_some_and(|rows| rows.len() != n)
+        || !initial.is_finite()
+    {
+        return Err(failure(
+            "Newton requires a nonempty square system, finite solution and matching row kinds",
+        ));
+    }
+    Ok(())
+}
+
 /// C `NIiter` (`niiter.c`, the SPARSE path) over disposable loads.
 ///
 /// Each pass loads at the present iterate, factors the matrix of the
@@ -681,18 +745,14 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
     release_previous: impl Fn(&mut T),
     progress: &mut Progress,
 ) -> SpiceResult<NewtonSolution<T>> {
-    options.validate()?;
+    validate_iteration_input(
+        initial,
+        branch_rows,
+        limited_rows,
+        phases.coordinate_kinds,
+        options,
+    )?;
     let n = initial.len();
-    if n == 0
-        || n != branch_rows.len()
-        || limited_rows.is_some_and(|rows| rows.len() != n)
-        || phases.coordinate_kinds.is_some_and(|rows| rows.len() != n)
-        || !initial.is_finite()
-    {
-        return Err(failure(
-            "Newton requires a nonempty square system, finite solution and matching row kinds",
-        ));
-    }
     let mut guess = initial.clone();
     let mut phase = phases.first;
     let mut previous = phases.previous;
@@ -704,17 +764,8 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         progress.iterations += 1;
         let iterno = progress.iterations;
         let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
-        let matrix = storage
-            .matrix
-            .as_mut()
-            .ok_or_else(|| failure("Newton load returned no matrix"))?;
-        let rhs = storage
-            .rhs
-            .as_ref()
-            .ok_or_else(|| failure("Newton load returned no RHS"))?;
         let flagged = (phases.nonconvergent)(&trial);
-        check(matrix, rhs, n)?;
-        matrix.fold_duplicates();
+        let (matrix, rhs) = storage.checked_system(n)?;
         if phase == IterationPhase::Junction {
             reorder = true;
         }

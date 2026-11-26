@@ -27,12 +27,13 @@ ported.
    `SpiceError::Numerical` (iteration limit, singular or nonfinite system).
    Structural, device, unsupported or invalid-input errors are returned at once,
    unchanged, with no retry.
-3. **Success solves the original equations.** Every strategy ends with a solve
-   at **full sources, zero artificial nodal gmin and the configured junction
-   gmin**, with the same iterate *and* reloaded physical-residual tests as
-   direct Newton. Only that solve is ever returned (`DcStage::is_unregularized`).
-   A circuit that is singular without regularization therefore fails even though
-   its regularized stages converge.
+3. **Success removes temporary regularization.** Every strategy ends with
+   full sources and the configured junction and continuation floors (zero
+   artificial nodal conductance unless `gshunt` was requested and retained
+   by recovery). With default settings only an unregularized closing solve
+   can succeed (`DcStage::is_unregularized`); a circuit singular without
+   regularization therefore fails even when its temporary stages converge.
+   Requested persistent regularization is reported as such.
 4. **A returned point is an exact evaluation.** With device limiting, a load in
    which any device limited a voltage (or the `MODEINITJCT` load) is marked
    nonconvergent (C `CKTnoncon`), so Newton can only stop on a load evaluated at
@@ -138,7 +139,7 @@ match solve_dc_with(&circuit, &context, &settings, &[], Some(&seed), None) {
   `AnalysisPlan`. Explicit values override deck options, which override defaults.
   `plan.dc_settings()` includes the shared Newton and continuation settings:
   `rtol`, `vntol`, `abstol`, `maxiter`, `limiting`, `continuation`,
-  `srcsteps`, `gminsteps`, `gminfactor`, `stagemaxiter`, `adaptiter` and
+  `srcsteps`, `gminsteps`, `gminfactor`, `gshunt`, `stagemaxiter`, `adaptiter` and
   `noopiter` (0/1). The raw and effective meanings of ITL2 remain distinct.
   There is no separate Newton-only argument parser. Programmatic solver clients
   can construct `DcSettings` directly.
@@ -203,8 +204,15 @@ which `dynamic_gmin`/`new_gmin` approach and `spice3_gmin` starts from.
   failed iterate; the port does not retain failed iterates and ends the
   strategy. `spice3_gmin` starts from the seed, not from the failed direct
   attempt's last iterate.
-- **Not ported**: `gshunt` (C's `dynamic_gmin` target `max(gmin, gshunt)` and
-  gshunt diagonal), `.options oldlimit` (`CKTfixLimit`), the front-end
+- **Gshunt** is a finite nonnegative SPARSE diagonal conductance after a
+  nodal gmin fallback, not a physical nodal resistor. The fixed ladder uses
+  it as its seed when nonzero; adaptive recovery targets `max(gmin,gshunt)`.
+  The completed real solve retains the diagonal on the same circuit/task
+  (candidate resets and independent decks clear it); AC complex factorization
+  does not apply it. Mixed-unit constitutive systems instead use stable original electrical
+  KCL diagonals, never auxiliary equations or solver-owned signal nodes.
+  Numeric reordering cannot change the physical regularization in those systems.
+- **Not ported**: `.options oldlimit` (`CKTfixLimit`), the front-end
   `dyngmin` variable (skip `new_gmin`), BJT quasi-saturation limiting (the
   quasi-saturation model itself is rejected), `OFF`/`IC` instance start values
   (rejected per device). These are `NotYetPorted` where they are inputs.

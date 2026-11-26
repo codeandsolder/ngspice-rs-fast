@@ -130,17 +130,25 @@ fn measured_targets(
 /// expansion. Their outputs are solver-owned internal nodes; the original
 /// expression becomes a static program reading these coordinates.
 /// The common non-dynamic path borrows the input without cloning it.
+pub(in crate::devices) struct ExpandedInstances<'a> {
+    pub instances: Cow<'a, [DeviceInstance]>,
+    pub probe_aliases: Vec<String>,
+}
+
 pub(in crate::devices) fn expand<'a, 'n>(
     instances: &'a [DeviceInstance],
     nodes: &NodeTable,
     models: &crate::devices::models::ModelResolver<'_>,
     existing_names: impl Iterator<Item = &'n str>,
     capacity: usize,
-) -> SpiceResult<Cow<'a, [DeviceInstance]>> {
+) -> SpiceResult<ExpandedInstances<'a>> {
     let count = derivative_count(instances);
     let measured = measured_targets(instances, models)?;
     if count == 0 && measured.is_empty() {
-        return Ok(Cow::Borrowed(instances));
+        return Ok(ExpandedInstances {
+            instances: Cow::Borrowed(instances),
+            probe_aliases: Vec::new(),
+        });
     }
     let total = instances
         .len()
@@ -150,35 +158,7 @@ pub(in crate::devices) fn expand<'a, 'n>(
         .ok_or_else(|| {
             SpiceError::circuit("dynamic expression exceeds device elaboration limit")
         })?;
-    let mut occupied_nodes: BTreeSet<String> =
-        nodes.nodes().iter().map(|node| node.name.clone()).collect();
-    let mut occupied_devices: BTreeSet<String> =
-        existing_names.map(str::to_ascii_lowercase).collect();
-    for instance in instances {
-        occupied_devices.insert(instance.name.to_ascii_lowercase());
-        occupied_devices.extend(
-            instance
-                .parameters
-                .iter()
-                .filter(|parameter| matches!(parameter.kind, ParameterKind::Instance))
-                .map(|parameter| parameter.value.to_ascii_lowercase()),
-        );
-        occupied_nodes.extend(instance.nodes.iter().map(|name| name.to_ascii_lowercase()));
-        for expression in expressions(instance) {
-            expression.root.visit(&mut |expr| match &expr.kind {
-                BExprKind::Voltage { positive, negative } => {
-                    occupied_nodes.insert(positive.to_ascii_lowercase());
-                    if let Some(negative) = negative {
-                        occupied_nodes.insert(negative.to_ascii_lowercase());
-                    }
-                }
-                BExprKind::Current(name) => {
-                    occupied_devices.insert(name.to_ascii_lowercase());
-                }
-                _ => {}
-            });
-        }
-    }
+    let (occupied_nodes, occupied_devices) = occupied_names(instances, nodes, existing_names);
     let mut expansion = Expansion {
         nodes: occupied_nodes,
         devices: occupied_devices,
@@ -189,10 +169,15 @@ pub(in crate::devices) fn expand<'a, 'n>(
         .output
         .try_reserve_exact(total)
         .map_err(|error| SpiceError::circuit(format!("dynamic expression allocation: {error}")))?;
+    let mut probe_aliases = Vec::new();
+    probe_aliases
+        .try_reserve_exact(measured.len())
+        .map_err(|error| SpiceError::circuit(format!("current probe allocation: {error}")))?;
     let mut senses = BTreeMap::new();
     let mut renames = BTreeMap::new();
     for index in measured {
         let (node, source) = expansion.names("sense", 'v')?;
+        probe_aliases.push(node.clone());
         let original = &instances[index];
         renames.insert(original.name.to_ascii_lowercase(), source.clone());
         senses.insert(
@@ -232,7 +217,48 @@ pub(in crate::devices) fn expand<'a, 'n>(
         }
         expansion.output.push(instance);
     }
-    Ok(Cow::Owned(expansion.output))
+    Ok(ExpandedInstances {
+        instances: Cow::Owned(expansion.output),
+        probe_aliases,
+    })
+}
+
+/// Reserve names used by the input and all resolved expressions before generating nodes.
+fn occupied_names<'n>(
+    instances: &[DeviceInstance],
+    nodes: &NodeTable,
+    existing_names: impl Iterator<Item = &'n str>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut occupied_nodes: BTreeSet<String> =
+        nodes.nodes().iter().map(|node| node.name.clone()).collect();
+    let mut occupied_devices: BTreeSet<String> =
+        existing_names.map(str::to_ascii_lowercase).collect();
+    for instance in instances {
+        occupied_devices.insert(instance.name.to_ascii_lowercase());
+        occupied_devices.extend(
+            instance
+                .parameters
+                .iter()
+                .filter(|parameter| matches!(parameter.kind, ParameterKind::Instance))
+                .map(|parameter| parameter.value.to_ascii_lowercase()),
+        );
+        occupied_nodes.extend(instance.nodes.iter().map(|name| name.to_ascii_lowercase()));
+        for expression in expressions(instance) {
+            expression.root.visit(&mut |expr| match &expr.kind {
+                BExprKind::Voltage { positive, negative } => {
+                    occupied_nodes.insert(positive.to_ascii_lowercase());
+                    if let Some(negative) = negative {
+                        occupied_nodes.insert(negative.to_ascii_lowercase());
+                    }
+                }
+                BExprKind::Current(name) => {
+                    occupied_devices.insert(name.to_ascii_lowercase());
+                }
+                _ => {}
+            });
+        }
+    }
+    (occupied_nodes, occupied_devices)
 }
 
 fn derivative_count(instances: &[DeviceInstance]) -> usize {
