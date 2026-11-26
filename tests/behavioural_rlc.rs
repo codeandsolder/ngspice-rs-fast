@@ -1158,7 +1158,7 @@ fn behavioural_step_inside_derivative_requires_impulse() {
 #[test]
 fn compiled_behavioural_corner_uses_right_germ_and_preserves_storage() -> SpiceResult<()> {
     for method in ["method=trap", "method=gear"] {
-        let body = "bdrive x 0 v=time/1u\nrdrive x 0 1k\nbv out 0 v=1u*ddt(abs(v(x)-10))\nbi other 0 v=1u*ddt(abs(1000*i(bdrive)+10))\nrout out 0 1k\nrother other 0 1k\nrcap cap 0 1k\nccap cap 0 1n ic=1\n.options reltol=1e-8 vntol=1n";
+        let body = "bdrive x 0 v=(time-10u)/1u\nrdrive x 0 1\nbv out 0 v=1u*ddt(abs(v(x)))\nbi other 0 v=1u*ddt(abs(i(bdrive)))\nrout out 0 1k\nrother other 0 1k\nrcap cap 0 1k\nccap cap 0 1n ic=1\n.options reltol=1e-8 vntol=1n chgtol=1e-18";
         let plot = run(
             body,
             AnalysisKind::Transient,
@@ -1248,6 +1248,41 @@ fn behavioural_two_corners_within_one_requested_step() -> SpiceResult<()> {
             close(plot.value("v(out)", index).unwrap().re, expected, 1e-7);
         }
         assert_eq!(seen, [true; 3]);
+    }
+    Ok(())
+}
+
+#[test]
+fn behavioural_adjacent_representable_events_are_not_coalesced() -> SpiceResult<()> {
+    let a = 2_f64.powi(-16);
+    let b = a.next_up();
+    let body = format!(
+        "b1 out 0 v=ddt(uramp(time-{a:.17e})+uramp(time-{b:.17e}))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n"
+    );
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            &body,
+            AnalysisKind::Transient,
+            &["1u", "20u", "0", "1u", "uic", method],
+        )?;
+        let mut seen = [false; 2];
+        let mut previous = 0.;
+        for index in 0..plot.point_count() {
+            let t = plot.value("time", index).unwrap().re;
+            assert!(t > previous, "duplicate or reversed event at {t:e}");
+            previous = t;
+            seen[0] |= t.to_bits() == a.to_bits();
+            seen[1] |= t.to_bits() == b.to_bits();
+            let expected = if t < a {
+                0.
+            } else if t < b {
+                1.
+            } else {
+                2.
+            };
+            close(plot.value("v(out)", index).unwrap().re, expected, 1e-9);
+        }
+        assert_eq!(seen, [true, true], "{method}");
     }
     Ok(())
 }
