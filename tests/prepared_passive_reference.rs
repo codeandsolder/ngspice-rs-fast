@@ -77,7 +77,29 @@ fn run(path: &Path) -> SpiceResult<(AnalysisKind, Plot)> {
     let config = RunConfig::from_netlist(&netlist)?;
     let mut circuit = config.circuit(&netlist)?;
     assert_eq!(requests.len(), 1);
-    let request = config.plan(requests.remove(0))?;
+    let input = requests.remove(0);
+    // The C-native linear grid intentionally collapses two points into one.
+    // Replay the two source-requested coordinates using native singleton
+    // plans, without changing the electrical deck or its enclosing AC bias.
+    if input.kind == AnalysisKind::Ac
+        && input.arguments.len() == 4
+        && input.arguments[0].eq_ignore_ascii_case("lin")
+        && input.arguments[1] == "2"
+    {
+        let mut plots = input.arguments[2..].iter().map(|frequency| {
+            let singleton = AnalysisInput::with_arguments(
+                AnalysisKind::Ac,
+                ["lin", "1", frequency.as_str(), frequency.as_str()],
+            );
+            config.plan(singleton)?.run(&mut circuit, &config.context())
+        });
+        let mut plot = plots.next().unwrap()?;
+        let last = plots.next().unwrap()?;
+        assert_eq!(last.point_count(), 1);
+        plot.push_point(last.row(0).unwrap())?;
+        return Ok((AnalysisKind::Ac, plot));
+    }
+    let request = config.plan(input)?;
     Ok((
         request.kind(),
         request.run(&mut circuit, &config.context())?,
@@ -165,11 +187,23 @@ fn source_prepared_passive_reference_matrix() {
                 .split(',')
                 .map(|text| text.parse::<f64>().unwrap())
                 .collect::<Vec<_>>();
+            if kind == AnalysisKind::Ac {
+                let axis = plot.value("frequency", index).map(|v| v.re);
+                if axis != Some(values[0]) {
+                    errors.push(format!(
+                        "{name}: wrong AC coordinate {axis:?}, expected {}",
+                        values[0]
+                    ));
+                }
+            }
             for (name_column, expected) in headers.iter().zip(&values[1..]) {
                 let actual = if kind == AnalysisKind::Transient {
                     at(&plot, name_column, values[0])
                 } else {
-                    let v = plot.value(name_column, index).unwrap();
+                    let Some(v) = plot.value(name_column, index) else {
+                        errors.push(format!("{name}: missing {name_column} at index {index}; {} points, columns {:?}", plot.point_count(), plot.variables()));
+                        continue;
+                    };
                     if kind == AnalysisKind::Ac {
                         v.re.hypot(v.im)
                     } else {
