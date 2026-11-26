@@ -293,4 +293,64 @@ mod tests {
         equal_width.commit()?;
         Ok(())
     }
+
+    #[test]
+    fn clocked_pending_capture_and_toggle_rollback() -> SpiceResult<()> {
+        let mut network = Network::default();
+        let data = network.add_net();
+        let clock = network.add_net();
+        let output = network.add_net();
+        let d = network.add_source(data)?;
+        let c = network.add_source(clock)?;
+        network.add_model(
+            LogicKernel {
+                operation: Operation::from_value(13., 2)?,
+                inputs: 2,
+                initial: Logic::Zero,
+                delay: 2.,
+                mode: DelayMode::Inertial,
+            },
+            &[data, clock],
+            &[output],
+        )?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let mut init = engine.trial();
+        // Initial high clock must not toggle. First real rising edge toggles.
+        init.schedule(d, 0., Drive::strong(Logic::One))?;
+        init.schedule(c, 0., Drive::strong(Logic::One))?;
+        init.schedule(c, 0.5, Drive::strong(Logic::Zero))?;
+        init.schedule(c, 1., Drive::strong(Logic::One))?;
+        init.advance_to(1.5)?;
+        assert_eq!(init.value(output), Some(Drive::strong(Logic::Zero)));
+        init.commit()?;
+        let before = engine.stats();
+        {
+            let mut rejected = engine.trial();
+            rejected.schedule(c, 2., Drive::strong(Logic::Zero))?;
+            // Second trigger toggles the captured one back to zero before
+            // the first delayed output becomes visible.
+            rejected.schedule(c, 2.5, Drive::strong(Logic::One))?;
+            rejected.advance_to(5.)?;
+            assert_eq!(rejected.value(output), Some(Drive::strong(Logic::Zero)));
+            assert!(rejected.changes().iter().all(|change| change.net != output));
+        }
+        assert_eq!(engine.stats(), before);
+        let mut retry = engine.trial();
+        retry.schedule(c, 2., Drive::strong(Logic::Zero))?;
+        retry.advance_to(3.)?;
+        assert_eq!(retry.value(output), Some(Drive::strong(Logic::One)));
+        retry.schedule(c, 4., Drive::strong(Logic::One))?;
+        retry.advance_to(6.)?;
+        assert_eq!(retry.value(output), Some(Drive::strong(Logic::Zero)));
+        assert_eq!(
+            retry
+                .changes()
+                .iter()
+                .filter(|change| change.net == output)
+                .count(),
+            2
+        );
+        retry.commit()?;
+        Ok(())
+    }
 }

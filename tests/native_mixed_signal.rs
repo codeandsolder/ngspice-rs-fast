@@ -492,3 +492,72 @@ fn clocked_inertial_capture_survives_intervening_receiver_changes() -> SpiceResu
     }
     Ok(())
 }
+
+#[test]
+fn prepared_clocked_hierarchy_preserves_occurrence_initialization_and_complement()
+-> anyhow::Result<()> {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs_preprocess::{
+        Cancellation, CodeModelRuntime, InputFormat, Options, Request, SourceInput, prepare,
+    };
+    use std::fs;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("clocked.net");
+    fs::write(
+        &path,
+        r"* prepared clocked state
+Vd d 0 5
+Vc clk 0 PWL(0 0 1u 0 1.02u 5 2u 5)
+X1 a ab d clk CELL
+X2 b bb d clk CELL
+.INIT X1.!D1=1 X2.!D1=0
+.subckt CELL q qb d c
+!D1 q qb 0 d c M IC=0
+.MODEL M CLK_DFF TH=2.5 HYSTWD=1 VOL=0.5 VOH=4.5 RIN=10Meg ROUT=10 LOGIC=POS TRIG_COND=0_TO_1
+.ends CELL
+R1 a 0 100
+R2 ab 0 100
+R3 b 0 100
+R4 bb 0 100
+.end
+",
+    )?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::SimplisDeck,
+            input: SourceInput::File(path),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    assert_eq!(bundle.required_code_models(), [CodeModelRuntime::Logic]);
+    for artifact in bundle.artifacts() {
+        fs::write(dir.path().join(&artifact.filename), &artifact.bytes)?;
+    }
+    let deck = Parser::new().parse_file(dir.path().join(&bundle.primary.filename))?;
+    let config = RunConfig::from_netlist(&deck)?;
+    let mut c = config.prepared_circuit(&deck, &bundle.waveforms)?;
+    let op =
+        AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+            .resolve()?
+            .run(&mut c, &config.context())?;
+    for (node, rail) in [("a", 4.5), ("ab", 0.5), ("b", 0.5), ("bb", 4.5)] {
+        close(op.value(&format!("v({node})"), 0).unwrap().re, rail / 1.1);
+    }
+    let tran = AnalysisInput::with_arguments(AnalysisKind::Transient, ["1n", "2u", "0", "1n"])
+        .resolve()?
+        .run(&mut c, &config.context())?;
+    for (node, rail) in [("a", 4.5), ("ab", 0.5), ("b", 4.5), ("bb", 0.5)] {
+        close(
+            tran.value(&format!("v({node})"), tran.point_count() - 1)
+                .unwrap()
+                .re,
+            rail / 1.1,
+        );
+    }
+    assert!(c.last_digital_stats().unwrap().evaluations > 0);
+    Ok(())
+}
