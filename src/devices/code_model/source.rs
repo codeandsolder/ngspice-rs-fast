@@ -537,10 +537,22 @@ pub(in crate::devices) fn instantiate(
             }))
         }
         SourceModel::RationalTransfer => super::rational::instantiate(instance, nodes, model),
-        SourceModel::TimedSwitch => Err(SpiceError::not_yet_ported(
-            "timed conductance switch",
-            "native timed-switch kernel",
-        )),
+        SourceModel::TimedSwitch => {
+            let material = model.prepare(PreparationKey::Inputs, || {
+                super::timed_switch_device::compile(model.card())
+            })?;
+            let [control, branch] = instance.code_ports.as_slice() else {
+                return Err(SpiceError::circuit("timed switch port count mismatch"));
+            };
+            let [cp, cn] = analog_pair(&control.terminals[0], nodes)?;
+            let [p, n] = analog_pair(&branch.terminals[0], nodes)?;
+            Ok(Box::new(super::timed_switch_device::TimedSwitch {
+                name: instance.name.clone(),
+                model_name: model.card().name.clone(),
+                terminals: [cp, cn, p, n],
+                material: *material,
+            }))
+        }
     }
 }
 

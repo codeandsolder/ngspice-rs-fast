@@ -117,3 +117,31 @@ synthetic circuits with independent ngspice-47 reference traces. The
 2.23e-16 V and all 83 transition times to 8.48e-22 s on the tested decks.
 Reference provenance and regeneration instructions are in
 `tests/fixtures/native-logic/README.md`.
+
+## Timed conductance events
+
+The prepared `preprocess_timed_switch` source descriptor binds a physical
+conductance with an unloaded single-ended/differential voltage receiver
+and a differential conducting branch. Independent input loading remains
+an ordinary circuit element. Each instance has seven finite accepted
+history slots: the previous time/control, phase anchor time and phase,
+target, requested direction, and optional deadline. Newton candidates
+derive a new state exclusively from the preceding accepted state.
+
+The logarithmic conductance law interpolates smoothly between exact
+reciprocal-resistance rails. DC qualifies the initial hint with strict
+threshold comparisons; AC freezes the converged conductance with no
+incremental control-to-branch gain. No fictitious storage or conductance
+floor is introduced.
+
+An opt-in device-local event interface lets the existing transient
+driver land on accepted deadlines and ramp endpoints, and localize
+crossings before publishing a candidate. The driver pre-indexes event
+sources, uses exact source boundaries rather than the coalescing
+breakpoint table for those circuits, and reports probe/retry/landing
+counts separately. Rejected trials cannot change device memory. The
+refined receiver sample is taken from the converged solution. Between
+known source boundaries a nonmonotone control excursion that crosses
+both thresholds without a sampled indication can remain undetected;
+timestep refinement is required for such an excitation. TIMETOL is
+localization tolerance, not a physical delay or breakpoint merge distance.

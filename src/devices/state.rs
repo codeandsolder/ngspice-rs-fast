@@ -544,6 +544,25 @@ impl StateHistory {
         Ok(())
     }
 
+    /// Edit only a verified device-local candidate window. Accepted history
+    /// remains immutable; a failed event probe discards this candidate.
+    pub(crate) fn edit_candidate<T>(
+        &self,
+        trial: &mut TrialState,
+        range: Range<usize>,
+        edit: impl FnOnce(&mut [Real]) -> SpiceResult<T>,
+    ) -> SpiceResult<T> {
+        self.check_trial(trial)?;
+        let slots = Arc::make_mut(&mut trial.values)
+            .get_mut(range)
+            .ok_or_else(|| state_error("invalid candidate event state range"))?;
+        let result = edit(slots)?;
+        if slots.iter().any(|value| !value.is_finite()) {
+            return Err(state_error("nonfinite candidate event state"));
+        }
+        Ok(result)
+    }
+
     /// Forgets every accepted vector and delay sample, e.g. when a run
     /// restarts.
     pub fn clear(&mut self) {
