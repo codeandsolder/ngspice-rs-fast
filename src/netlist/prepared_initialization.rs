@@ -471,7 +471,7 @@ impl<'a> Binder<'a> {
     ) -> SpiceResult<()> {
         let key = (
             original.location.path().to_path_buf(),
-            lexical_scope.to_vec(),
+            canonical_scope(lexical_scope),
             original.name.to_ascii_lowercase(),
         );
         let Some(d) = self.devices.get(&key) else {
@@ -516,7 +516,7 @@ impl<'a> Binder<'a> {
         rename: impl Fn(&str) -> String,
         budget: &mut EvalBudget,
     ) -> SpiceResult<()> {
-        let Some(nodes) = self.nodes.get(lexical_scope) else {
+        let Some(nodes) = self.nodes.get(&canonical_scope(lexical_scope)) else {
             return Ok(());
         };
         for &(path, n) in nodes {
