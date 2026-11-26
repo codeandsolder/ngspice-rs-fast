@@ -433,7 +433,7 @@ impl ImpulseStorage {
         circuit: &Circuit,
         initial: &Vector,
         context: &ModelContext,
-        trial: &crate::devices::TrialState,
+        values: &[Real],
     ) -> SpiceResult<Self> {
         if initial.len() != circuit.unknown_count() {
             return Err(failure("initial vector does not match finalized circuit"));
@@ -452,7 +452,7 @@ impl ImpulseStorage {
             if let Some(voltage) = bound_initial_voltage(circuit, index, initial, context)? {
                 storage.capacitors.push(voltage);
             }
-            if let Some((row, item)) = bound_expression_storage(circuit, index, trial)?
+            if let Some((row, item)) = bound_expression_storage(circuit, index, values)?
                 && storage.charges.insert(row, item).is_some()
             {
                 return Err(failure("duplicate initial expression equation"));
@@ -467,7 +467,7 @@ impl ImpulseStorage {
 fn bound_expression_storage(
     circuit: &Circuit,
     index: usize,
-    trial: &crate::devices::TrialState,
+    values: &[Real],
 ) -> SpiceResult<Option<(AbsoluteRow, ChargeInitial)>> {
     let device = &circuit.devices()[index];
     let Some(storage) = device.initial_expression_storage() else {
@@ -501,7 +501,7 @@ fn bound_expression_storage(
             device.name()
         ))
     })?;
-    let target = trial.values()[slot];
+    let target = values[slot];
     if !target.is_finite() {
         return Err(failure(format!(
             "{}: nonfinite initial stored expression",
@@ -887,7 +887,7 @@ pub(super) fn check_impulse_free(
         circuit,
         request.solution,
         request.model_context,
-        initial_trial,
+        initial_trial.values(),
     )?;
     if storage.capacitors.is_empty()
         && storage.fixed_coordinates.is_empty()
@@ -1065,8 +1065,12 @@ pub(super) fn consistent_derivative_start(
     let forcing = request
         .forcing
         .ok_or_else(|| failure("missing derivative initialization timing"))?;
-    let mut storage =
-        ImpulseStorage::collect(circuit, request.solution, request.model_context, trial)?;
+    let mut storage = ImpulseStorage::collect(
+        circuit,
+        request.solution,
+        request.model_context,
+        trial.values(),
+    )?;
     if !uic {
         storage.retain_operating_point(request.solution);
     }
@@ -1092,4 +1096,31 @@ pub(super) fn consistent_derivative_start(
         Err(SpiceError::Unsupported { .. }) => Ok(None),
         other => other.map(Some),
     }
+}
+
+/// Solve the physical derivative array with independent numerical storage
+/// constraints; dependent companion equations are intentionally projected out.
+pub(super) fn consistent_derivative_step(
+    prepared: &PreparedRun<'_>,
+    request: &LoadRequest<'_>,
+    tolerances: Tolerances,
+    iterations: usize,
+) -> SpiceResult<CheckedInitial> {
+    let circuit = prepared.circuit();
+    let forcing = request
+        .forcing
+        .ok_or_else(|| failure("missing derivative step forcing"))?;
+    let values = request
+        .history
+        .accepted(1)
+        .ok_or_else(|| failure("missing derivative step history"))?;
+    let storage =
+        ImpulseStorage::collect(circuit, request.solution, request.model_context, values)?;
+    let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+    let right = system::solve_step(&dae, circuit, request, &storage, tolerances, iterations)?;
+    let canonical = storage.consistent_history(circuit, &right, true, tolerances)?;
+    Ok(CheckedInitial {
+        solution: Some(right.state),
+        canonical,
+    })
 }

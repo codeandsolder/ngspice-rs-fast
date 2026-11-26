@@ -6,7 +6,7 @@ use super::{CapacitorInitial, ImpulseStorage, Tolerances, failure};
 use crate::devices::{Circuit, InitialStoragePolicy};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceResult};
-pub(super) use derivative_array::{RightLimit, solve_right_limit};
+pub(super) use derivative_array::{RightLimit, solve_right_limit, solve_step};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]

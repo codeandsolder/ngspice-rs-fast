@@ -54,25 +54,26 @@ impl Jet {
         self.coefficients[1..].iter().all(|&value| value == 0.)
     }
 
-    /// Sign on the right-hand germ, including a zero constant coefficient.
-    pub(crate) fn sign(&self) -> std::cmp::Ordering {
-        self.coefficients
+    /// Compare the local right-hand germ to a scalar boundary without
+    /// perturbing the constant value (which might be one ulp from the knot).
+    pub(crate) fn compare(&self, boundary: Real) -> Option<std::cmp::Ordering> {
+        let constant = self.value().partial_cmp(&boundary)?;
+        if constant != std::cmp::Ordering::Equal {
+            return Some(constant);
+        }
+        Some(self.direction())
+    }
+
+    pub(crate) fn direction(&self) -> std::cmp::Ordering {
+        self.coefficients[1..]
             .iter()
             .find(|&&value| value != 0.)
             .map_or(std::cmp::Ordering::Equal, |value| value.total_cmp(&0.))
     }
 
-    /// Select the appropriate adjacent interval at a scalar knot.
-    pub(crate) fn right_probe(&self) -> Real {
-        let value = self.value();
-        match self.coefficients[1..]
-            .iter()
-            .find(|&&coefficient| coefficient != 0.)
-        {
-            Some(&coefficient) if coefficient > 0. => value.next_up(),
-            Some(_) => value.next_down(),
-            None => value,
-        }
+    /// Sign on the right-hand germ, including a zero constant coefficient.
+    pub(crate) fn sign(&self) -> std::cmp::Ordering {
+        self.compare(0.).unwrap_or(std::cmp::Ordering::Equal)
     }
 
     pub(crate) fn check(&self) -> SpiceResult<()> {

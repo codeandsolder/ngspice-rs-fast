@@ -73,33 +73,40 @@ impl XspicePwl {
     /// The output and its derivative with respect to the input.
     #[must_use = "the returned pair supplies the transfer value and its exact input derivative"]
     pub fn evaluate(&self, input: Real) -> (Real, Real) {
-        let (value, slope, _) = self.local_polynomial(input, input);
+        let (value, slope, _) =
+            self.local_polynomial(input, |boundary| input.partial_cmp(&boundary));
         (value, slope)
     }
 
     /// Value, first derivative and quadratic coefficient of the selected
     /// local polynomial, evaluated at the original (not perturbed) input.
-    pub(super) fn local_polynomial(&self, input: Real, probe: Real) -> (Real, Real, Real) {
+    pub(super) fn local_polynomial(
+        &self,
+        input: Real,
+        compare: impl Fn(Real) -> Option<std::cmp::Ordering>,
+    ) -> (Real, Real, Real) {
+        use std::cmp::Ordering::{Equal, Greater, Less};
         let size = self.x.len();
         let affine = |lower, at| {
             let (value, slope) = self.segment(input, lower, at);
             (value, slope, 0.)
         };
-        if probe <= self.midpoints[0] {
+        if matches!(compare(self.midpoints[0]), Some(Less | Equal)) {
             return affine(0, 0);
         }
-        if probe >= self.midpoints[size - 2] {
+        if matches!(compare(self.midpoints[size - 2]), Some(Greater | Equal)) {
             return affine(size - 2, size - 1);
         }
-        let i = 1 + self.midpoints[1..size - 2].partition_point(|&midpoint| probe >= midpoint);
+        let i = 1 + self.midpoints[1..size - 2]
+            .partition_point(|&midpoint| matches!(compare(midpoint), Some(Greater | Equal)));
         let (x, y) = (&self.x, &self.y);
         let lower = x[i] - x[i - 1];
         let upper = x[i + 1] - x[i];
         let domain = self.fraction * lower.min(upper);
-        if probe < x[i] - domain {
+        if compare(x[i] - domain) == Some(Less) {
             return affine(i - 1, i);
         }
-        if probe < x[i] + domain {
+        if compare(x[i] + domain) == Some(Less) {
             let lower_slope = (y[i] - y[i - 1]) / lower;
             let upper_slope = (y[i + 1] - y[i]) / upper;
             return smooth_corner(input, x[i], y[i], domain, lower_slope, upper_slope);

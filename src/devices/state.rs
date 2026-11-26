@@ -511,16 +511,16 @@ impl StateHistory {
         }
     }
 
-    /// Fill a verified absolute slot of the initial point before acceptance.
-    pub(crate) fn set_initial_slot(
+    /// Fill a verified absolute slot of a candidate point before acceptance.
+    pub(crate) fn set_candidate_slot(
         &self,
         trial: &mut TrialState,
         slot: usize,
         value: Real,
     ) -> SpiceResult<()> {
         self.check_trial(trial)?;
-        if self.depth() != 0 || !value.is_finite() {
-            return Err(state_error("invalid initial-state override"));
+        if !value.is_finite() {
+            return Err(state_error("invalid candidate-state override"));
         }
         let target = Arc::make_mut(&mut trial.values)
             .get_mut(slot)

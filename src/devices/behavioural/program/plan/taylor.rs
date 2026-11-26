@@ -134,8 +134,13 @@ impl Evaluator<'_> {
                 .clone(),
             Instruction::Pwl(a, table) | Instruction::PwlDerivative(a, table) => {
                 let x = self.read(a)?;
+                let table = &self.plan.pwl[table];
+                let upper = match table.order {
+                    super::super::PwlOrder::Ascending => Ordering::Less,
+                    super::super::PwlOrder::Descending => Ordering::Greater,
+                };
                 let [(x0, y0), (x1, y1)] =
-                    self.plan.pwl[table].segment(x.right_probe(), self.plan.pwl[table].order);
+                    table.segment_by(|boundary| x.compare(boundary) == Some(upper));
                 let slope = (y1 - y0) / (x1 - x0);
                 if matches!(node, Instruction::PwlDerivative(..)) {
                     constant(slope)
@@ -145,8 +150,8 @@ impl Evaluator<'_> {
             }
             Instruction::Table(a, table) | Instruction::TableSlope(a, table) => {
                 let x = self.read(a)?;
-                let (value, slope, quadratic) =
-                    self.plan.tables[table].local_polynomial(x.value(), x.right_probe());
+                let (value, slope, quadratic) = self.plan.tables[table]
+                    .local_polynomial(x.value(), |boundary| x.compare(boundary));
                 let delta = x.clone().with_value(0.);
                 if matches!(node, Instruction::TableSlope(..)) {
                     delta.scale(2. * quadratic).offset(slope)
@@ -234,8 +239,23 @@ fn unary(op: Unary, x: &Jet) -> SpiceResult<Jet> {
                 Ordering::Greater => 1.,
             },
         )),
-        Unary::Floor | Unary::Ceil | Unary::Nint => constant(unary_value(op, x.right_probe())),
+        Unary::Floor | Unary::Ceil | Unary::Nint => constant(discrete_limit(op, x)),
     })
+}
+
+fn discrete_limit(op: Unary, x: &Jet) -> Real {
+    let value = x.value();
+    match (op, x.direction()) {
+        (Unary::Floor, Ordering::Less) if value.fract() == 0. => value - 1.,
+        (Unary::Ceil, Ordering::Greater) if value.fract() == 0. => value + 1.,
+        (Unary::Nint, Ordering::Less) if value.fract().abs().to_bits() == 0.5_f64.to_bits() => {
+            value.floor()
+        }
+        (Unary::Nint, Ordering::Greater) if value.fract().abs().to_bits() == 0.5_f64.to_bits() => {
+            value.ceil()
+        }
+        _ => unary_value(op, value),
+    }
 }
 
 fn inverse_slope(op: Unary, x: &Jet) -> SpiceResult<Jet> {
@@ -297,6 +317,14 @@ fn power_jet(a: &Jet, b: &Jet, kind: PowerKind) -> SpiceResult<Jet> {
     if a.is_constant() && b.is_constant() {
         return Ok(constant(scalar));
     }
+    if a.sign() == Ordering::Equal {
+        if kind == PowerKind::Ordinary || b.value() > 0. {
+            return Ok(constant(0.));
+        }
+        return Err(SpiceError::circuit(
+            "zero base has no regular Taylor power at this exponent",
+        ));
+    }
     let negative = a.sign() == Ordering::Less;
     let result = if kind == PowerKind::Signed && negative {
         a.clone().scale(-1.).power(b)?.scale(-1.)
@@ -350,6 +378,15 @@ fn power_partial(a: &Jet, b: &Jet, signed: bool, exponent: bool) -> SpiceResult<
             },
         )?
         .multiply(&magnitude.ln()?));
+    }
+    if a.sign() == Ordering::Equal {
+        return match b.compare(1.) {
+            Some(Ordering::Greater) => Ok(constant(0.)),
+            Some(Ordering::Equal) => Ok(constant(1.)),
+            _ => Err(SpiceError::circuit(
+                "singular zero-base Taylor power derivative",
+            )),
+        };
     }
     if b.is_constant() && b.value() == 0. {
         return Ok(constant(0.));

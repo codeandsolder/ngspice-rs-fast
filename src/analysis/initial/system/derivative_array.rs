@@ -10,8 +10,11 @@ use crate::analysis::initial::{
     constraints::{AbsoluteRow, VoltageVertex},
     failure,
 };
-use crate::devices::InitialStoragePolicy;
 use crate::devices::physical_dae::{PhysicalDae, PhysicalDaeTaylor};
+use crate::devices::{
+    Circuit, InitialCoordinateHistory, InitialStoragePolicy, LoadRequest, StateHistory,
+};
+use crate::maths::integrator::{ChargeHistory, Coefficients};
 use crate::maths::taylor::MAX_ORDER;
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceResult};
@@ -24,20 +27,27 @@ enum Constraint<'a> {
     Coordinate(usize, Real),
     Voltage(VoltageVertex, VoltageVertex, Real),
     Charge(usize, &'a ChargeInitial),
+    Companion(CompanionConstraint<'a>),
 }
 
 impl Constraint<'_> {
     fn optional(self) -> bool {
         matches!(self,Self::Charge(_,charge) if charge.policy==InitialStoragePolicy::Derived)
+            || matches!(self, Self::Companion(c) if c.derived)
     }
 
     fn stamp(
         self,
         row: usize,
-        state: &Vector,
+        state: &[Vector],
+        time_scale: Real,
         point: &PhysicalDaeTaylor,
         matrix: &mut SparseMatrix,
     ) -> SpiceResult<(Real, Real)> {
+        if let Self::Companion(companion) = self {
+            return companion.stamp(row, state, time_scale, point, matrix);
+        }
+        let state = &state[0];
         let mut scale = 0.;
         let value = match self {
             Self::Coordinate(column, target) => {
@@ -59,6 +69,7 @@ impl Constraint<'_> {
                 }
                 value
             }
+            Self::Companion(_) => return Err(failure("unexpected companion constraint")),
             Self::Charge(equation, charge) => {
                 for term in point.capacitance[0]
                     .triplets()
@@ -82,6 +93,8 @@ impl Constraint<'_> {
             Self::Voltage(..) => tol.vntol,
             Self::Charge(_, charge) if charge.policy == InitialStoragePolicy::Derived => tol.vntol,
             Self::Charge(..) => tol.chgtol,
+            Self::Companion(c) if c.derived => tol.vntol,
+            Self::Companion(_) => tol.abstol,
         }
     }
 }
@@ -104,6 +117,166 @@ fn constraints(storage: &ImpulseStorage) -> Vec<Constraint<'_>> {
                 .map(|(&AbsoluteRow(row), item)| Constraint::Charge(row, item)),
         )
         .collect()
+}
+
+/// A storage coordinate in the same units as its accepted history slots.
+#[derive(Clone, Copy)]
+enum StoredQuantity {
+    Coordinate(usize),
+    Voltage(VoltageVertex, VoltageVertex, Real),
+    Equation(usize, Real),
+}
+
+impl StoredQuantity {
+    fn value(self, state: &[Vector], point: &PhysicalDaeTaylor, degree: usize) -> Real {
+        match self {
+            Self::Coordinate(column) => state[degree].as_slice()[column],
+            Self::Voltage(p, n, scale) => {
+                scale
+                    * (crate::analysis::initial::potential(&state[degree], p)
+                        - crate::analysis::initial::potential(&state[degree], n))
+            }
+            Self::Equation(row, scale) => scale * point.charge[degree].as_slice()[row],
+        }
+    }
+
+    fn gradient(
+        self,
+        point: &PhysicalDaeTaylor,
+        degree: usize,
+        mut visit: impl FnMut(usize, Real) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        match self {
+            Self::Coordinate(column) if degree == 0 => visit(column, 1.),
+            Self::Voltage(p, n, scale) if degree == 0 => {
+                for (vertex, factor) in [(p, scale), (n, -scale)] {
+                    if let VoltageVertex::Node(AbsoluteRow(column)) = vertex {
+                        visit(column, factor)?;
+                    }
+                }
+                Ok(())
+            }
+            Self::Equation(row, scale) => {
+                for term in point.capacitance[degree]
+                    .triplets()
+                    .iter()
+                    .filter(|term| term.row == row)
+                {
+                    visit(term.col, scale * term.value)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CompanionConstraint<'a> {
+    quantity: StoredQuantity,
+    slot: usize,
+    derived: bool,
+    history: &'a StateHistory,
+    coefficients: &'a Coefficients,
+}
+
+impl CompanionConstraint<'_> {
+    fn stamp(
+        self,
+        row: usize,
+        state: &[Vector],
+        time_scale: Real,
+        point: &PhysicalDaeTaylor,
+        matrix: &mut SparseMatrix,
+    ) -> SpiceResult<(Real, Real)> {
+        let accepted = |age, offset| {
+            self.history
+                .accepted(age)
+                .and_then(|values| values.get(self.slot + offset))
+                .copied()
+                .ok_or_else(|| failure("missing independent storage history"))
+        };
+        let value = self.quantity.value(state, point, 0);
+        let rate = self.quantity.value(state, point, 1) / time_scale;
+        let mut history = ChargeHistory::new(value);
+        for age in 1..=self.coefficients.charge_history_len() {
+            history.push(accepted(age, 0)?)?;
+        }
+        let previous = self
+            .coefficients
+            .needs_previous_derivative()
+            .then(|| accepted(1, 1))
+            .transpose()?;
+        let companion = self.coefficients.integrate(&history, previous, 1.)?;
+        let mut scale = rate.abs() + companion.derivative.abs();
+        let width = state[0].len();
+        self.quantity.gradient(point, 0, |column, gradient| {
+            let term = -companion.conductance * gradient;
+            matrix.add(row, column, term)?;
+            scale += (term * state[0].as_slice()[column]).abs();
+            let term = gradient / time_scale;
+            matrix.add(row, width + column, term)?;
+            scale += (term * state[1].as_slice()[column]).abs();
+            Ok(())
+        })?;
+        self.quantity.gradient(point, 1, |column, gradient| {
+            let term = gradient / time_scale;
+            matrix.add(row, column, term)?;
+            scale += (term * state[0].as_slice()[column]).abs();
+            Ok(())
+        })?;
+        Ok((rate - companion.derivative, scale))
+    }
+}
+
+fn companions<'a>(
+    circuit: &Circuit,
+    storage: &ImpulseStorage,
+    history: &'a StateHistory,
+    coefficients: &'a Coefficients,
+) -> SpiceResult<Vec<Constraint<'a>>> {
+    let mut result = Vec::new();
+    let mut add = |quantity, slot, derived| {
+        result.push(Constraint::Companion(CompanionConstraint {
+            quantity,
+            slot,
+            derived,
+            history,
+            coefficients,
+        }))
+    };
+    for (&AbsoluteRow(row), charge) in &storage.charges {
+        add(
+            StoredQuantity::Equation(row, 1.),
+            charge.slot,
+            charge.policy == InitialStoragePolicy::Derived,
+        );
+    }
+    for cap in &storage.capacitors {
+        add(
+            StoredQuantity::Voltage(cap.positive, cap.negative, cap.scale),
+            cap.slot,
+            false,
+        );
+    }
+    for (&AbsoluteRow(row), coordinate) in &storage.fixed_coordinates {
+        let slots = circuit
+            .state_rows(coordinate.device)
+            .ok_or_else(|| failure("missing coordinate history"))?;
+        let (quantity, slot) = match coordinate.history {
+            InitialCoordinateHistory::EquationCharge { slot, scale } => {
+                (StoredQuantity::Equation(coordinate.equation.0, scale), slot)
+            }
+            InitialCoordinateHistory::Coordinate { slot } => {
+                (StoredQuantity::Coordinate(row), slot)
+            }
+        };
+        if slot.saturating_add(1) >= slots.len() {
+            return Err(failure("invalid companion coordinate history"));
+        }
+        add(quantity, slots.start + slot, false);
+    }
+    Ok(result)
 }
 
 struct Array {
@@ -176,7 +349,8 @@ impl Array {
         }
         for (index, constraint) in initial.iter().copied().enumerate() {
             let row = physical_rows + index;
-            let (residual, scale) = constraint.stamp(row, &state[0], point, &mut array.matrix)?;
+            let (residual, scale) =
+                constraint.stamp(row, state, scale, point, &mut array.matrix)?;
             array.residual[row] = residual;
             array.scale[row] = scale;
             if constraint.optional() {
@@ -214,7 +388,9 @@ impl Array {
                 tol.abstol.min(tol.vntol).min(tol.chgtol)
             } else {
                 let constraint = initial[row - self.physical_rows];
-                if constraint.optional() && !independent[row] {
+                if (constraint.optional() || matches!(constraint, Constraint::Companion(_)))
+                    && !independent[row]
+                {
                     continue;
                 }
                 constraint.absolute(tol)
@@ -238,8 +414,9 @@ fn initial_prefix_rank(
     dae: &PhysicalDae<'_, '_>,
     state: &[Vector],
     scale: Real,
+    time: Real,
 ) -> SpiceResult<usize> {
-    let point = dae.evaluate_taylor(state, 0., scale)?;
+    let point = dae.evaluate_taylor(state, time, scale)?;
     let array = Array::build(&point, state, scale, &[])?;
     rank::projected_rank(&array.matrix, 2 * state[0].len())
 }
@@ -259,11 +436,12 @@ fn stable_rank_order(
     dae: &PhysicalDae<'_, '_>,
     state: &mut Vec<Vector>,
     scale: Real,
+    time: Real,
 ) -> SpiceResult<()> {
-    let mut previous = initial_prefix_rank(dae, state, scale)?;
+    let mut previous = initial_prefix_rank(dae, state, scale, time)?;
     loop {
         extend(state)?;
-        let next = initial_prefix_rank(dae, state, scale)?;
+        let next = initial_prefix_rank(dae, state, scale, time)?;
         if next == previous {
             return Ok(());
         }
@@ -278,11 +456,12 @@ fn newton(
     initial: &[Constraint<'_>],
     tol: Tolerances,
     iterations: usize,
+    time: Real,
 ) -> SpiceResult<()> {
     let width = state[0].len();
     let mut best: Option<(Real, Vec<Vector>)> = None;
     for _ in 0..iterations {
-        let point = dae.evaluate_taylor(state, 0., scale)?;
+        let point = dae.evaluate_taylor(state, time, scale)?;
         let array = Array::build(&point, state, scale, initial)?;
         let rhs = array
             .residual
@@ -338,22 +517,62 @@ pub(in crate::analysis::initial) fn solve_right_limit(
     tol: Tolerances,
     iterations: usize,
 ) -> SpiceResult<RightLimit> {
-    let initial = constraints(storage);
+    solve(dae, seed, &constraints(storage), scale, tol, iterations, 0.)
+}
+
+pub(in crate::analysis::initial) fn solve_step(
+    dae: &PhysicalDae<'_, '_>,
+    circuit: &Circuit,
+    request: &LoadRequest<'_>,
+    storage: &ImpulseStorage,
+    tol: Tolerances,
+    iterations: usize,
+) -> SpiceResult<RightLimit> {
+    let forcing = request
+        .forcing
+        .ok_or_else(|| failure("missing derivative step forcing"))?;
+    let coefficients = request
+        .integration
+        .ok_or_else(|| failure("missing derivative step coefficients"))?;
+    let time = match request.mode {
+        crate::devices::AnalysisMode::Transient { time, .. } => time,
+        _ => return Err(failure("invalid derivative step mode")),
+    };
+    solve(
+        dae,
+        request.solution,
+        &companions(circuit, storage, request.history, coefficients)?,
+        forcing.timing.step(),
+        tol,
+        iterations,
+        time,
+    )
+}
+
+fn solve(
+    dae: &PhysicalDae<'_, '_>,
+    seed: &Vector,
+    initial: &[Constraint<'_>],
+    scale: Real,
+    tol: Tolerances,
+    iterations: usize,
+    time: Real,
+) -> SpiceResult<RightLimit> {
     let mut state = vec![
         seed.clone(),
         Vector::zeros(seed.len()),
         Vector::zeros(seed.len()),
     ];
     loop {
-        stable_rank_order(dae, &mut state, scale)?;
-        newton(dae, &mut state, scale, &initial, tol, iterations)?;
-        let rank = initial_prefix_rank(dae, &state, scale)?;
+        stable_rank_order(dae, &mut state, scale, time)?;
+        newton(dae, &mut state, scale, initial, tol, iterations, time)?;
+        let rank = initial_prefix_rank(dae, &state, scale, time)?;
         extend(&mut state)?;
-        if initial_prefix_rank(dae, &state, scale)? == rank {
+        if initial_prefix_rank(dae, &state, scale, time)? == rank {
             // Re-solve the extended array: rank equality alone does not
             // establish its affine residual or the chosen right-hand branch.
-            newton(dae, &mut state, scale, &initial, tol, iterations)?;
-            let point = dae.evaluate_taylor(&state, 0., scale)?;
+            newton(dae, &mut state, scale, initial, tol, iterations, time)?;
+            let point = dae.evaluate_taylor(&state, time, scale)?;
             let to_rate = |vector: &Vector| {
                 Vector::from_slice(
                     &vector

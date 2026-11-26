@@ -241,6 +241,33 @@ struct PointLoads<'a, 'b> {
 impl PointLoads<'_, '_> {
     fn current(&mut self, load: usize, slot: usize, name: &str) -> SpiceResult<Real> {
         let layout = &self.circuit.runtime.observations.loads[load];
+        if matches!(
+            self.request.mode,
+            crate::devices::AnalysisMode::Instantaneous { .. }
+        ) {
+            let device = self.point.device(self.circuit, layout.device);
+            if let Some(storage) = device
+                .storage_element(self.request.model_context)
+                .transpose()?
+                && storage.kind == crate::devices::StorageKind::Capacitor
+            {
+                let states = self
+                    .circuit
+                    .state_rows(layout.device)
+                    .ok_or_else(|| gap(name))?;
+                let base = device.truncation_slot().ok_or_else(|| gap(name))?;
+                let values = self
+                    .previous
+                    .map(TrialState::values)
+                    .or_else(|| self.request.history.accepted(1))
+                    .ok_or_else(|| gap(name))?;
+                let rate = *values
+                    .get(states.start + base + 1)
+                    .ok_or_else(|| gap(name))?;
+                return Ok(if layout.ports[0] == slot { rate } else { 0. }
+                    - if layout.ports[1] == slot { rate } else { 0. });
+            }
+        }
         let work = &mut *self.workspace;
         let loaded = &mut work.loaded[load];
         if loaded.epoch != work.epoch {
@@ -267,7 +294,12 @@ impl PointLoads<'_, '_> {
             );
             work.state.clear();
             stamped?;
-            if device.designator() == 'i' {
+            if device.designator() == 'i'
+                && !matches!(
+                    self.request.mode,
+                    crate::devices::AnalysisMode::Instantaneous { .. }
+                )
+            {
                 let value = device
                     .observation_source_current(self.time)?
                     .ok_or_else(|| gap(name))?;

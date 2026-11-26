@@ -596,18 +596,9 @@ fn initial_charge_law_uses_charge_not_voltage_tolerance() {
 fn nested_derivative_uic_starts_at_consistent_right_limit() -> SpiceResult<()> {
     for method in ["method=trap", "method=gear"] {
         let plot = run(
-            "v1 in 0 PWL(0 2 1m 3)\nb1 first 0 v=ddt(v(in))\nb2 out 0 v=ddt(v(first))\nr1 out 0 1k",
+            "v1 in 0 PWL(0 2 1m 3)\nb1 first 0 v=ddt(v(in))\nb2 out 0 v=ddt(v(first))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1e-9",
             AnalysisKind::Transient,
-            &[
-                "1u",
-                "50u",
-                "0",
-                "1u",
-                "uic",
-                method,
-                "reltol=1e-8",
-                "vntol=1e-9",
-            ],
+            &["1u", "50u", "0", "1u", "uic", method],
         )?;
         assert!(plot.point_count() > 20);
         for point in 0..plot.point_count() {

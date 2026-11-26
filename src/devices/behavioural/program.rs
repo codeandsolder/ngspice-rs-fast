@@ -744,10 +744,14 @@ impl PwlTable {
     /// The original C binary search, including extrapolation at both ends.
     /// Preserve its midpoint and strict comparison even for duplicate knots.
     fn segment(&self, arg: Real, order: PwlOrder) -> [(Real, Real); 2] {
+        self.segment_by(|x| order.is_upper(x, arg))
+    }
+
+    fn segment_by(&self, mut upper_than_arg: impl FnMut(Real) -> bool) -> [(Real, Real); 2] {
         let (mut lower, mut upper) = (0, self.points.len() - 1);
         while upper - lower > 1 {
             let middle = usize::midpoint(lower, upper);
-            if order.is_upper(self.points[middle].0, arg) {
+            if upper_than_arg(self.points[middle].0) {
                 upper = middle;
             } else {
                 lower = middle;

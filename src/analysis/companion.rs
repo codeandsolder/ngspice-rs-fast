@@ -676,6 +676,7 @@ struct Driver<'a> {
     /// acceptance and rejected smaller-step retries.
     workspace: crate::analysis::newton::CircuitNewtonWorkspace,
     mixed: Option<&'a mut super::digital::MixedSignal>,
+    index_aware: bool,
 }
 
 /// Runs an ordinary `.tran` with the companion backend, returning the plot and
@@ -998,6 +999,7 @@ fn run_transient_inner(
         stats: TransientStats::default(),
         workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
         mixed,
+        index_aware: false,
     };
     driver.run(purpose, sink)
 }
@@ -1008,6 +1010,9 @@ impl Driver<'_> {
         solution: &Vector,
         selected: Option<&[usize]>,
     ) -> SpiceResult<Vec<Complex>> {
+        if self.index_aware {
+            return self.observe_derivative_point(solution, None, 0., selected);
+        }
         let request = LoadRequest {
             mode: AnalysisMode::OperatingPoint,
             solution,
@@ -1028,6 +1033,42 @@ impl Driver<'_> {
             |indices| {
                 self.prepared
                     .observe_real_selected(&request, &[], forcing, None, indices)
+            },
+        )
+    }
+
+    fn observe_derivative_point(
+        &self,
+        solution: &Vector,
+        state: Option<&TrialState>,
+        time: Real,
+        selected: Option<&[usize]>,
+    ) -> SpiceResult<Vec<Complex>> {
+        let forcing = Forcing {
+            limit: crate::devices::Limit::Right,
+            timing: self.timing,
+        };
+        let request = LoadRequest {
+            mode: AnalysisMode::Instantaneous { time },
+            solution,
+            model_context: &self.model_context,
+            integration: None,
+            history: &self.history,
+            forcing: Some(forcing),
+        };
+        selected.map_or_else(
+            || {
+                self.prepared
+                    .observe_real(&request, &[], Some((time, forcing)), state)
+            },
+            |indices| {
+                self.prepared.observe_real_selected(
+                    &request,
+                    &[],
+                    Some((time, forcing)),
+                    state,
+                    indices,
+                )
             },
         )
     }
@@ -1408,6 +1449,13 @@ impl Driver<'_> {
                                     !almost_equal_ulps(attempt.clock.time, at, 100)
                                 }) {
                                 None
+                            } else if self.index_aware {
+                                Some(self.observe_derivative_point(
+                                    &x,
+                                    Some(&state),
+                                    attempt.clock.time,
+                                    selected,
+                                )?)
                             } else {
                                 Some(match selected {
                                     Some(indices) => {
@@ -1540,7 +1588,7 @@ impl Driver<'_> {
         Err(failure("mixed-signal operating point did not settle"))
     }
 
-    fn initial_candidate(&self) -> SpiceResult<(Vector, TrialState)> {
+    fn initial_candidate(&mut self) -> SpiceResult<(Vector, TrialState)> {
         let mut rhs = self.system.transient_rhs(0., crate::devices::Limit::Left)?;
         if let Some(mixed) = self.mixed.as_deref() {
             mixed.initial_rhs(self.circuit, &mut rhs)?;
@@ -1588,7 +1636,7 @@ impl Driver<'_> {
             // Newton iteration at the solved algebraic point rather than
             // guessing every unspecified node/branch at zero.
             for (slot, value) in consistent.canonical {
-                self.history.set_initial_slot(&mut trial, slot, value)?;
+                self.history.set_candidate_slot(&mut trial, slot, value)?;
             }
             (consistent.solution.unwrap_or(start.x), trial)
         } else {
@@ -1671,7 +1719,7 @@ impl Driver<'_> {
     }
 
     fn derivative_initial(
-        &self,
+        &mut self,
         x: &Vector,
         trial: &TrialState,
         uic: bool,
@@ -1721,8 +1769,9 @@ impl Driver<'_> {
             &mut trial,
         )?;
         for (slot, value) in consistent.canonical {
-            self.history.set_initial_slot(&mut trial, slot, value)?;
+            self.history.set_candidate_slot(&mut trial, slot, value)?;
         }
+        self.index_aware = true;
         Ok(Some((x, trial)))
     }
 
@@ -1754,7 +1803,7 @@ impl Driver<'_> {
             &mut trial,
         )?;
         for (slot, value) in overrides {
-            self.history.set_initial_slot(&mut trial, *slot, *value)?;
+            self.history.set_candidate_slot(&mut trial, *slot, *value)?;
         }
         Ok(trial)
     }
@@ -1765,6 +1814,56 @@ impl Driver<'_> {
     /// (`firsttime`) and `MODEINITPRED` after, for linear and nonlinear
     /// circuits alike. The trial is that of the last Newton load, one iterate
     /// behind the returned solution, as C's `CKTstate0`.
+    fn derivative_trial(&self, attempt: &AttemptedStep, previous: &Vector) -> SpiceResult<Trial> {
+        let request = LoadRequest {
+            mode: AnalysisMode::Transient {
+                time: attempt.clock.time,
+                dt: attempt.coefficients.dt(),
+            },
+            solution: previous,
+            model_context: &self.model_context,
+            integration: Some(&attempt.coefficients),
+            history: &self.history,
+            forcing: Some(Forcing {
+                limit: crate::devices::Limit::Right,
+                timing: self.timing,
+            }),
+        };
+        let t = &self.settings.tolerances;
+        let consistent = initial::consistent_derivative_step(
+            &self.prepared,
+            &request,
+            initial::Tolerances {
+                reltol: t.reltol,
+                vntol: t.vntol,
+                abstol: t.abstol,
+                chgtol: t.chgtol,
+            },
+            self.settings.tran_max_iter,
+        )?;
+        let x = consistent
+            .solution
+            .ok_or_else(|| failure("missing consistent derivative step"))?;
+        let mut state = self.history.trial();
+        self.prepared.load(
+            &LoadRequest {
+                mode: AnalysisMode::Instantaneous {
+                    time: attempt.clock.time,
+                },
+                solution: &x,
+                integration: None,
+                ..request
+            },
+            &mut self.circuit.new_matrix()?,
+            &mut Vector::zeros(x.len()),
+            &mut state,
+        )?;
+        for (slot, value) in consistent.canonical {
+            self.history.set_candidate_slot(&mut state, slot, value)?;
+        }
+        Ok(Trial::Converged { x, state })
+    }
+
     fn solve_trial(
         &self,
         attempt: &AttemptedStep,
@@ -1772,6 +1871,9 @@ impl Driver<'_> {
         previous: &Vector,
         workspace: &mut crate::analysis::newton::CircuitNewtonWorkspace,
     ) -> SpiceResult<Trial> {
+        if self.index_aware {
+            return self.derivative_trial(attempt, previous);
+        }
         let tolerance = &self.settings.tolerances;
         let options = crate::analysis::newton::NewtonOptions {
             max_iterations: self.settings.tran_max_iter,
