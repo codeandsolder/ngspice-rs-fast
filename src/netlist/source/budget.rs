@@ -14,7 +14,8 @@ pub struct SourceLimits {
     pub depth: usize,
     /// Total logical file visits, including the root.
     pub files: usize,
-    /// Total admitted UTF-8 source bytes, including unselected sections.
+    /// Total source byte work, including unselected sections. An explicit
+    /// external transformation charges both original and replacement bytes.
     pub bytes: usize,
     /// Total processed card occurrences, including directives and terminators.
     pub cards: usize,

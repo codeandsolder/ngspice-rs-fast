@@ -6,7 +6,7 @@
 
 use super::{
     Binary, Environment, EvaluationView, Node, Operator, PwlTable, Tree, Unary, XspicePwl, divide,
-    power, power_h, pwr, unary_value,
+    power_h, unary_value,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::{collections::HashMap, sync::Arc};
@@ -326,12 +326,7 @@ impl Evaluator<'_, '_> {
                 let a = read(lhs);
                 let b = read(rhs);
                 let value = match function {
-                    Binary::Pow => power(a, b),
-                    Binary::Pwr => pwr(a, b),
-                    Binary::PowBaseSlope => super::power_base_slope(a, b, false),
-                    Binary::PwrBaseSlope => super::power_base_slope(a, b, true),
-                    Binary::PowExponentSlope => super::power_exponent_slope(a, b, false),
-                    Binary::PwrExponentSlope => super::power_exponent_slope(a, b, true),
+                    Binary::Power(law, part) => law.evaluate(*part, a, b),
                     Binary::Min => {
                         if a > b {
                             b
@@ -396,19 +391,11 @@ fn describe(node: &Instruction) -> String {
                 Operator::Power => "^",
             }
         ),
-        Instruction::Binary(function, _, _) => format!(
-            "{}()",
-            match function {
-                Binary::Pow => "pow",
-                Binary::Pwr => "pwr",
-                Binary::PowBaseSlope => "pow_base_slope",
-                Binary::PwrBaseSlope => "pwr_base_slope",
-                Binary::PowExponentSlope => "pow_exponent_slope",
-                Binary::PwrExponentSlope => "pwr_exponent_slope",
-                Binary::Min => "min",
-                Binary::Max => "max",
-            }
-        ),
+        Instruction::Binary(Binary::Power(law, part), _, _) => {
+            format!("{}{}()", law.name(), part.suffix())
+        }
+        Instruction::Binary(Binary::Min, _, _) => "min()".into(),
+        Instruction::Binary(Binary::Max, _, _) => "max()".into(),
         Instruction::Ternary(..) => "'?:'".into(),
         Instruction::Pwl(..) => "pwl()".into(),
         Instruction::PwlDerivative(..) => "pwl_derivative()".into(),

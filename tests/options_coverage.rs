@@ -1277,3 +1277,26 @@ fn removed_diffsol_backend_is_rejected_whatever_the_deck_options() {
         );
     }
 }
+
+#[test]
+fn recovery_coordinates_are_not_electrical_shunt_targets() {
+    for scale in [1., 1e6, 1e9] {
+        let circuit = format!(
+            "v1 a 0 dc 0.7 ac 1\nd1 a 0 dm\n.model dm d(is=1e-14 tt=100n vp=.05 qpscale={scale})"
+        );
+        for analysis in [".op", ".ac dec 2 10k 100meg"] {
+            let generated = simulate(&format!(
+                "{circuit}\n.options rshunt=1k cshunt=1p\n{analysis}"
+            ))
+            .unwrap();
+            let explicit =
+                simulate(&format!("{circuit}\nrsh a 0 1k\ncsh a 0 1p\n{analysis}")).unwrap();
+            for point in 0..generated.point_count() {
+                let actual = generated.value("i(v1)", point).unwrap();
+                let expected = explicit.value("i(v1)", point).unwrap();
+                close(actual.re, expected.re, 1e-9, 1e-14);
+                close(actual.im, expected.im, 1e-9, 1e-14);
+            }
+        }
+    }
+}

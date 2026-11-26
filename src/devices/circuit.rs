@@ -14,6 +14,9 @@
 //! [`Circuit::finalize`], which validates the graph and rebuilds the numbering
 //! in one go.
 
+pub(crate) mod bin_sweep;
+pub(crate) use bin_sweep::{BinnedDeck, GeometryEdit};
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -159,6 +162,7 @@ pub struct Circuit {
     bindings: TopologyBindings,
     mutual_limits: MutualLimits,
     elaboration_limits: ElaborationLimits,
+    binned_deck: Option<Arc<BinnedDeck>>,
     pub(super) runtime: CircuitRuntime,
 }
 
@@ -1299,6 +1303,7 @@ impl Circuit {
     }
 
     fn invalidate_topology(&mut self) {
+        self.binned_deck = None;
         if self.bindings.identity.is_some() {
             self.bindings = TopologyBindings::default();
             self.runtime = CircuitRuntime::default();
@@ -1410,6 +1415,15 @@ impl Circuit {
         self.bindings.convergence_kinds =
             vec![crate::devices::ConvergenceKind::Voltage; self.bindings.unknowns.len()];
         for (device, rows) in self.devices.iter().zip(&self.bindings.branch_rows) {
+            for node in device.constitutive_nodes() {
+                let row = self
+                    .bindings
+                    .unknowns
+                    .node_row(*node)
+                    .ok_or_else(|| SpiceError::circuit("unbound constitutive node"))?;
+                self.bindings.convergence_kinds[row] =
+                    crate::devices::ConvergenceKind::Constitutive;
+            }
             for (local, row) in rows.clone().enumerate() {
                 self.bindings.convergence_kinds[row] = device.branch_convergence(local);
             }
@@ -1450,8 +1464,9 @@ impl Circuit {
             .iter()
             .zip(&self.bindings.branch_rows)
             .any(|(device, rows)| {
-                (0..rows.len())
-                    .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
+                !device.constitutive_nodes().is_empty()
+                    || (0..rows.len())
+                        .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
             });
         mixed.then(|| {
             self.physical_voltage_nodes()
@@ -3261,6 +3276,7 @@ impl Circuit {
                 || original.c_device_type() != replacement.c_device_type()
                 || original.designator() != replacement.designator()
                 || original.terminals() != replacement.terminals()
+                || original.constitutive_nodes() != replacement.constitutive_nodes()
                 || original.branch_currents() != replacement.branch_currents()
                 || (0..original.branch_currents()).any(|row| {
                     original.branch_convergence(row) != replacement.branch_convergence(row)
@@ -3489,6 +3505,7 @@ impl Circuit {
                             && left.c_device_type() == right.c_device_type()
                             && left.designator() == right.designator()
                             && left.terminals() == right.terminals()
+                            && left.constitutive_nodes() == right.constitutive_nodes()
                             && left.findable_branch() == right.findable_branch()
                             && left.expression_current_branch() == right.expression_current_branch()
                             && (0..left.branch_currents())
@@ -4570,16 +4587,6 @@ impl Circuit {
         waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
     ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
-        if netlist
-            .includes
-            .iter()
-            .any(|include| include.resolved_path.is_none())
-        {
-            return Err(SpiceError::Unsupported {
-                feature: "includes in linear elaboration".into(),
-                location: None,
-            });
-        }
         // The nonlinear E/G/F/H forms become B sources and generated XSPICE
         // instances first, as inpcom.c rewrites them before numparam and
         // subcircuit expansion (#79).
@@ -4670,7 +4677,18 @@ impl Circuit {
         circuit.finalize()?;
         // Reject an invalid inductive system (K coupling) before any analysis.
         circuit.prepared_mutual_terms(context)?;
+        circuit.binned_deck = BinnedDeck::capture(
+            &expanded.devices,
+            &expanded.models,
+            &models,
+            setup.noise_analysis,
+        )
+        .map(Arc::new);
         Ok(circuit)
+    }
+
+    pub(crate) fn binned_deck(&self) -> Option<&BinnedDeck> {
+        self.binned_deck.as_deref()
     }
 
     /// Electrical voltage nodes, excluding probe aliases and solver-owned signals.
@@ -4689,9 +4707,15 @@ impl Circuit {
                 InitialStorageRow::Branch(_) => None,
             })
             .collect();
+        let constitutive: BTreeSet<_> = self
+            .devices
+            .iter()
+            .flat_map(|device| device.constitutive_nodes().iter().copied())
+            .collect();
         self.nodes.nodes().iter().filter(move |node| {
             matches!(node.kind, NodeKind::Terminal | NodeKind::Internal)
                 && !signals.contains(&node.id)
+                && !constitutive.contains(&node.id)
         })
     }
 

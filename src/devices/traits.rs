@@ -956,6 +956,13 @@ pub trait Device: fmt::Debug + std::any::Any {
         self.terminals()
     }
 
+    /// Named internal node coordinates whose rows are constitutive equations,
+    /// not electrical KCL. They do not receive physical voltage shunts or
+    /// voltage tolerances; the owner checks their physical residuals.
+    fn constitutive_nodes(&self) -> &[NodeId] {
+        &[]
+    }
+
     /// How many device-local coordinates the device adds to the MNA
     /// system, including branch currents and auxiliary constitutive states.
     fn branch_currents(&self) -> usize {

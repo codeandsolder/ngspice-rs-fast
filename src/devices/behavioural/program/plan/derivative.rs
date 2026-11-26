@@ -8,7 +8,7 @@
 //! the value or a requested derivative.
 
 use super::{Binary, Instruction, Operator, Plan, PlanBuilder, Slot, Unary};
-use crate::devices::behavioural::program::{c_pow, unary_value, unsupported};
+use crate::devices::behavioural::program::{PowerLaw, PowerPart, c_pow, unary_value, unsupported};
 use crate::netlist::bexpr::BExpr;
 use crate::primitives::{Real, SpiceResult};
 use std::ops::Range;
@@ -302,23 +302,26 @@ impl PlanBuilder {
     // arbitrary expressions for the base and exponent.
     fn power_derivative(
         &mut self,
-        kernel: Binary,
+        law: PowerLaw,
         a: Slot,
         b: Slot,
         da: Slot,
         db: Slot,
     ) -> SpiceResult<Slot> {
-        let (base, exponent) = if kernel == Binary::Pow {
-            (Binary::PowBaseSlope, Binary::PowExponentSlope)
-        } else {
-            (Binary::PwrBaseSlope, Binary::PwrExponentSlope)
-        };
-        let slope = self.intern(Instruction::Binary(base, a, b))?;
+        let slope = self.intern(Instruction::Binary(
+            Binary::Power(law, PowerPart::Base),
+            a,
+            b,
+        ))?;
         let left = self.times(slope, da)?;
         if self.literal(db) == Some(0.) {
             return Ok(left);
         }
-        let slope = self.intern(Instruction::Binary(exponent, a, b))?;
+        let slope = self.intern(Instruction::Binary(
+            Binary::Power(law, PowerPart::Exponent),
+            a,
+            b,
+        ))?;
         let right = self.times(slope, db)?;
         self.operator(Operator::Plus, left, right)
     }
@@ -431,22 +434,17 @@ impl PlanBuilder {
                     self.over(numerator, denominator)
                 }
             }
-            Instruction::Operator(Operator::Power, a, b)
-            | Instruction::Binary(Binary::Pow, a, b) => {
-                self.power_derivative(Binary::Pow, a, b, da, db)
+            Instruction::Operator(Operator::Power, a, b) => {
+                self.power_derivative(PowerLaw::NativePow, a, b, da, db)
             }
-            Instruction::Binary(Binary::Pwr, a, b) => {
-                self.power_derivative(Binary::Pwr, a, b, da, db)
+            Instruction::Binary(Binary::Power(law, PowerPart::Value), a, b) => {
+                self.power_derivative(law, a, b, da, db)
             }
-            Instruction::Binary(
-                Binary::PowBaseSlope
-                | Binary::PwrBaseSlope
-                | Binary::PowExponentSlope
-                | Binary::PwrExponentSlope,
-                ..,
-            ) => Err(crate::primitives::SpiceError::circuit(
-                "internal power derivative instruction in source plan",
-            )),
+            Instruction::Binary(Binary::Power(_, PowerPart::Base | PowerPart::Exponent), ..) => {
+                Err(crate::primitives::SpiceError::circuit(
+                    "internal power derivative instruction in source plan",
+                ))
+            }
             Instruction::Ternary(c, ..) => self.ternary(c, da, db),
             Instruction::Binary(function @ (Binary::Min | Binary::Max), a, b) => {
                 let difference = self.operator(Operator::Minus, a, b)?;

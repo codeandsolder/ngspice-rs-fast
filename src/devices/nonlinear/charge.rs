@@ -76,24 +76,31 @@ impl ChargeBranch {
         states: &mut DeviceState<'_>,
         coefficients: &Coefficients,
     ) -> SpiceResult<Companion> {
-        let mut history = ChargeHistory::new(self.charge);
-        for age in 1..=coefficients.charge_history_len() {
-            let Some(charge) = states.accepted(age, self.slot) else {
-                return Err(missing_history("missing accepted junction charge"));
-            };
-            history.push(charge)?;
-        }
-        let previous = if coefficients.needs_previous_derivative() {
-            let Some(derivative) = states.accepted(1, self.slot + 1) else {
-                return Err(missing_history("missing accepted junction derivative"));
-            };
-            Some(derivative)
-        } else {
-            None
-        };
-        let companion = coefficients.integrate(&history, previous, self.capacitance)?;
+        let companion = self.companion(coefficients, |age, slot| states.accepted(age, slot))?;
         states.set(self.slot + 1, companion.derivative)?;
         Ok(companion)
+    }
+
+    /// Evaluate the same accepted-history companion without mutating a trial.
+    pub(in crate::devices) fn companion(
+        self,
+        coefficients: &Coefficients,
+        accepted: impl Fn(usize, usize) -> Option<Real>,
+    ) -> SpiceResult<Companion> {
+        let mut history = ChargeHistory::new(self.charge);
+        for age in 1..=coefficients.charge_history_len() {
+            let charge = accepted(age, self.slot)
+                .ok_or_else(|| missing_history("missing accepted junction charge"))?;
+            history.push(charge)?;
+        }
+        let previous = coefficients
+            .needs_previous_derivative()
+            .then(|| {
+                accepted(1, self.slot + 1)
+                    .ok_or_else(|| missing_history("missing accepted junction derivative"))
+            })
+            .transpose()?;
+        coefficients.integrate(&history, previous, self.capacitance)
     }
 }
 
