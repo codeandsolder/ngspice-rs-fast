@@ -200,7 +200,7 @@ fn unary(op: Unary, x: &Jet) -> SpiceResult<Jet> {
                 .clone()
                 .with_value(modulus(x.value(), std::f64::consts::PI))
                 .sin_cos();
-            sine.divide(&cos)?.with_value(value)
+            sine.divide(&cosine)?.with_value(value)
         }
         Unary::Sinh => x.sinh_cosh().0,
         Unary::Cosh => x.sinh_cosh().1,

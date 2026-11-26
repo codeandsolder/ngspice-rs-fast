@@ -585,3 +585,113 @@ fn physical_taylor_left_and_right_germs_use_same_time_coordinate() -> SpiceResul
     }
     Ok(())
 }
+
+#[test]
+fn delayed_pulse_germs_agree_with_every_scheduled_corner() -> SpiceResult<()> {
+    let delay = 17e-6;
+    let rise = 3e-6;
+    let width = 7e-6;
+    let fall = 11e-6;
+    let period = 31e-6;
+    let waveform = Waveform::Pulse(Pulse::new(2., 3., delay, rise, fall, width, period)?);
+    let offsets = [0., rise, rise + width, rise + width + fall];
+    let slopes = [0., 1e-6 / rise, 0., -1e-6 / fall, 0.];
+    let levels = [2., 3., 3., 2.];
+    let corners = waveform
+        .breakpoints_in(0., delay + 8. * period)?
+        .take(32)
+        .collect::<Vec<_>>();
+    assert_eq!(corners.len(), 32);
+    for (index, time) in corners.into_iter().enumerate() {
+        let edge = index % 4;
+        let cycle = f64::from(u32::try_from(index / 4).unwrap());
+        assert_eq!(time, delay + (period * cycle + offsets[edge]));
+        for (limit, slope) in [
+            (Limit::Left, slopes[edge]),
+            (Limit::Right, slopes[edge + 1]),
+        ] {
+            let actual = waveform.taylor_at(time, 1e-6, 2, limit)?;
+            assert_eq!(actual[0], levels[edge], "{index} {limit:?}");
+            assert!(
+                (actual[1] - slope).abs() < 1e-15,
+                "{index} {limit:?}: {:?}",
+                actual
+            );
+            assert_eq!(actual[2], 0.);
+        }
+        // Adjacent representable times must not be snapped to the corner.
+        let left = waveform.taylor_at(time.next_down(), 1e-6, 1, Limit::Right)?;
+        let right = waveform.taylor_at(time.next_up(), 1e-6, 1, Limit::Left)?;
+        assert!((left[1] - slopes[edge]).abs() < 1e-15);
+        assert!((right[1] - slopes[edge + 1]).abs() < 1e-15);
+    }
+    Ok(())
+}
+
+#[test]
+fn delayed_repeating_pwl_germs_follow_exact_iterator_coordinates() -> SpiceResult<()> {
+    use ngspice_rs::devices::PwlSource;
+    let delay = 17e-6;
+    let first = 5e-6;
+    let middle = 15e-6;
+    let last = 25e-6;
+    let waveform = Waveform::Pwl(PwlSource::new(
+        vec![(0., 1.), (first, 2.), (middle, 3.), (last, 7.)],
+        delay,
+        Some(first),
+    )?);
+    let corners = waveform
+        .breakpoints_in(0., delay + last + 8. * (last - first))?
+        .take(20)
+        .collect::<Vec<_>>();
+    for (index, time) in corners.into_iter().enumerate() {
+        let (l, r) = match index {
+            0 => ([1., 0.], [1., 1e-6 / first]),
+            1 => ([2., 1e-6 / first], [2., 1e-6 / (middle - first)]),
+            _ if index % 2 == 0 => ([3., 1e-6 / (middle - first)], [3., 4e-6 / (last - middle)]),
+            _ => ([7., 4e-6 / (last - middle)], [2., 1e-6 / (middle - first)]),
+        };
+        for (limit, expected) in [(Limit::Left, l), (Limit::Right, r)] {
+            let actual = waveform.taylor_at(time, 1e-6, 2, limit)?;
+            assert_eq!(actual[0], expected[0], "{index} {time:e} {limit:?}");
+            assert!(
+                (actual[1] - expected[1]).abs() < 1e-15,
+                "{index} {limit:?}: {actual:?}"
+            );
+            assert_eq!(actual[2], 0.);
+        }
+        for (at, slope, limit) in [
+            (time.next_down(), l[1], Limit::Right),
+            (time.next_up(), r[1], Limit::Left),
+        ] {
+            let jet = waveform.taylor_at(at, 1e-6, 1, limit)?;
+            assert!(
+                (jet[1] - slope).abs() < 1e-15,
+                "{index} {at:e} {limit:?}: {jet:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn truncated_pulse_retains_correct_left_limit_at_period_and_count_cut() -> SpiceResult<()> {
+    let waveform =
+        Waveform::Pulse(Pulse::new(2., 4., 17e-6, 10e-6, 10e-6, 5e-6, 7e-6)?.with_count(2.5)?);
+    let corners = waveform.breakpoints_in(0., 100e-6)?.collect::<Vec<_>>();
+    for &time in corners.iter().take(3).skip(1) {
+        let left = waveform.taylor_at(time, 1e-6, 1, Limit::Left)?;
+        let right = waveform.taylor_at(time, 1e-6, 1, Limit::Right)?;
+        assert!((left[0] - 3.4).abs() < 1e-14);
+        assert_eq!(right[0], 2.);
+        assert!((left[1] - 0.2).abs() < 1e-15);
+        assert!((right[1] - 0.2).abs() < 1e-15);
+    }
+    let cut = 17e-6 + 2.5 * 7e-6;
+    let left = waveform.taylor_at(cut, 1e-6, 1, Limit::Left)?;
+    let right = waveform.taylor_at(cut, 1e-6, 1, Limit::Right)?;
+    assert!((left[0] - 2.7).abs() < 1e-14);
+    assert!((left[1] - 0.2).abs() < 1e-15);
+    assert_eq!(right, [2., 0.]);
+    Ok(())
+}

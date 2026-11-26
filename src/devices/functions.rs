@@ -54,7 +54,7 @@ use std::sync::Arc;
 use crate::devices::{Limit, TransientTiming};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
-use super::pulse::{MAX_CYCLE, cycle_position, seek_cycle};
+use super::pulse::{MAX_CYCLE, cycle_position, physical_cycle, seek_cycle, segment_fraction};
 
 fn invalid(kind: &str, message: impl Into<String>) -> SpiceError {
     SpiceError::circuit(format!("invalid {kind} waveform: {}", message.into()))
@@ -989,54 +989,73 @@ impl PwlSource {
 
     /// The value and scaled slope of the actual selected one-sided segment.
     /// Scale zero requests the value only, without evaluating a slope.
-    #[expect(
-        clippy::float_cmp,
-        reason = "one-sided segment membership uses exact event equality"
-    )]
     pub(super) fn local_affine(
         &self,
         t: Real,
         scale: Real,
         limit: Limit,
     ) -> SpiceResult<(Real, Real)> {
-        let mut time = t - self.delay();
+        let time = t - self.delay();
         if !time.is_finite() {
             return Err(invalid("PWL", "nonfinite local Taylor time"));
         }
         let (first, last) = (self.knots[0], self.knots[self.knots.len() - 1]);
         let left = limit == Limit::Left;
-        if time < first.0 || (left && time == first.0) {
+        let before = |event: Real| t < event || (left && t <= event);
+        if before(self.event_time(first.0, 0.)) {
             return Ok((first.1, 0.));
         }
-        if time > last.0 || (!left && time == last.0) {
-            let Some(index) = self.repeat() else {
-                return Ok((last.1, 0.));
-            };
-            let start = self.knots[index].0;
-            let period = last.0 - start;
-            let cycle = cycle_position(time - start, period);
-            if !cycle.resolvable() {
-                return Err(invalid("PWL", "unresolvable local Taylor cycle"));
-            }
-            time = if left && cycle.phase == 0. {
-                last.0
+        let (cycle, start, period) = if let Some(index) = self.repeat() {
+            let period = last.0 - self.knots[index].0;
+            let cycle = physical_cycle(t, ((time - last.0) / period).ceil(), limit, |cycle| {
+                self.event_time(last.0, cycle)
+            })
+            .ok_or_else(|| invalid("PWL", "unresolvable local Taylor cycle"))?;
+            (cycle, if cycle == 0. { 0 } else { index }, period)
+        } else if !before(self.event_time(last.0, 0.)) {
+            return Ok((last.1, 0.));
+        } else {
+            (0., 0, 0.)
+        };
+        let absolute = |index: usize| {
+            if cycle > 0. && index == start {
+                // The repeat begins at the previous cycle's final event.
+                // Adding the period to the restart knot may round differently.
+                self.event_time(last.0, cycle - 1.)
             } else {
-                (cycle.phase + start).min(last.0)
-            };
+                self.event_time(self.knots[index].0, cycle)
+            }
+        };
+        let mut low = start;
+        let mut high = self.knots.len();
+        while low < high {
+            let middle = low.midpoint(high);
+            if before(absolute(middle)) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
         }
-        let next = self
-            .knots
-            .partition_point(|&(knot, _)| knot < time || (!left && knot == time));
-        let Some(&(t1, v1)) = self.knots.get(next) else {
+        let Some(&(t1, v1)) = self.knots.get(low) else {
             return Ok((last.1, 0.));
         };
-        let Some(&(t0, v0)) = next.checked_sub(1).and_then(|i| self.knots.get(i)) else {
-            return Ok((first.1, 0.));
+        let Some(index) = low.checked_sub(1).filter(|&i| i >= start) else {
+            return Ok((self.knots[start].1, 0.));
         };
+        let (t0, v0) = self.knots[index];
         let duration = t1 - t0;
-        let value = affine_value(v0, v1, (time - t0) / duration);
-        let slope = scaled_difference(v0, v1, scale, duration);
-        Ok((value, slope))
+        let fraction = segment_fraction(
+            t,
+            absolute(index),
+            absolute(low),
+            (-period).mul_add(cycle, time),
+            t0,
+            duration,
+        );
+        Ok((
+            affine_value(v0, v1, fraction),
+            scaled_difference(v0, v1, scale, duration),
+        ))
     }
 
     /// Lazily enumerates the delayed knot times in `[t0, t1]`, continuing
