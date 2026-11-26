@@ -4745,11 +4745,10 @@ impl Circuit {
             .flat_map(|name| models.declarations_for(name))
             .map(|card| card.name.to_ascii_lowercase())
             .collect();
-        if let Some(model) = netlist
-            .models
-            .iter()
-            .find(|model| !referenced.contains(&model.name.to_ascii_lowercase()))
-        {
+        if let Some(model) = netlist.models.iter().find(|model| {
+            let name = model.name.to_ascii_lowercase();
+            !referenced.contains(&name) && !expanded.statistical_model_origins.contains(&name)
+        }) {
             // First-declaration duplicate policy remains explicit; unused
             // declarations cannot silently discard unsupported physics. A root
             // model shadowed only inside a subcircuit body is unused by this
