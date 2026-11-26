@@ -146,6 +146,8 @@ impl From<&AnalysisCard> for AnalysisInput {
 /// and TNOM = 27.000000` at the start of a run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnalysisContext {
+    /// Enclosing analysis selected by the analysis plan; None for UIC or native low-level loads.
+    pub bias_analysis: Option<AnalysisKind>,
     /// Circuit temperature in degrees Celsius.
     pub temperature: Real,
     /// Nominal temperature at which model parameters were measured.
@@ -185,6 +187,7 @@ impl AnalysisContext {
                 .with_gmin(self.gmin)
                 .with_reltol(self.reltol)
                 .with_pivot_tolerances(self.pivot);
+        context.bias_analysis = self.bias_analysis;
         context.shunts = self.shunts;
         context.geometry_scale = self.geometry_scale;
         if let Some(overrides) = self.candidate_model_overrides {
@@ -220,6 +223,7 @@ impl Default for AnalysisContext {
             pivot: crate::maths::PivotTolerances::DEFAULT,
             rf_limits: crate::analysis::RfLimits::default(),
             candidate_model_overrides: None,
+            bias_analysis: None,
         }
     }
 }

@@ -805,6 +805,8 @@ impl TopologyShunts {
 /// resistor and instance-parameter overrides here (see [`crate::devices::sweep`]) instead of mutating devices.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelContext {
+    /// Enclosing analysis for resolved, bias-only passive initialization.
+    pub bias_analysis: Option<crate::primitives::AnalysisKind>,
     /// Use SPICE3 MOS1 flicker noise (`mos1noi.c`, newcompat.s3).
     pub spice3_noise: bool,
     /// Circuit temperature, degrees Celsius (instance TEMP default).
@@ -879,6 +881,7 @@ impl ModelContext {
             pivot: crate::maths::PivotTolerances::DEFAULT,
             source_factor: 1.,
             noise_analysis: false,
+            bias_analysis: None,
         }
     }
 

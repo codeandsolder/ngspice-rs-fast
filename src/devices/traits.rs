@@ -147,6 +147,8 @@ pub enum BranchQuantity {
     CurrentState(usize),
     /// Oriented current at the transfer's sensing input.
     InputCurrent,
+    /// Auxiliary capacitor voltage-constraint branch, zero outside bias.
+    BiasCurrent,
 }
 
 impl BranchQuantity {
@@ -162,6 +164,7 @@ impl BranchQuantity {
             Self::VoltageState(index) => (format!("state({name},{index})"), "voltage"),
             Self::CurrentState(index) => (format!("state({name},{index})"), "current"),
             Self::InputCurrent => (format!("i({name}:input)"), "current"),
+            Self::BiasCurrent => (format!("i({name}:bias)"), "current"),
         }
     }
 }
@@ -724,6 +727,8 @@ pub struct StampContext<'a> {
     pub frequency: Real,
     /// Which analysis is loading the matrix.
     pub mode: AnalysisMode,
+    /// Enclosing analysis for source-prepared passive bias constraints.
+    pub bias_analysis: Option<crate::primitives::AnalysisKind>,
     /// Branch-current rows allocated to this device, in order (empty if none).
     pub branches: Range<usize>,
     /// Branch rows of the devices named by [`Device::controlling_sources`], in
@@ -954,6 +959,25 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// coordinates. Used for external current and power observations.
     fn external_terminals(&self) -> &[NodeId] {
         self.terminals()
+    }
+
+    /// Install an occurrence-bound prepared passive startup policy before setup.
+    ///
+    /// # Errors
+    /// This device is not the matching physical storage family.
+    fn bind_passive_initialization(
+        &mut self,
+        _policy: crate::devices::passive_bias::PassiveInitialization,
+    ) -> SpiceResult<()> {
+        Err(SpiceError::circuit(
+            "prepared initialization requires a physical capacitor or inductor",
+        ))
+    }
+
+    /// True when bias equations need physical nodal continuation rather
+    /// than perturbing a numerical pivot diagonal.
+    fn has_passive_bias(&self) -> bool {
+        false
     }
 
     /// How many device-local coordinates the device adds to the MNA

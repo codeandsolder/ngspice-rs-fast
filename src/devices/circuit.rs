@@ -163,6 +163,8 @@ pub struct Circuit {
     mutual_limits: MutualLimits,
     elaboration_limits: ElaborationLimits,
     binned_deck: Option<Arc<BinnedDeck>>,
+    prepared_node_initializations:
+        BTreeMap<NodeId, crate::devices::passive_bias::NodeInitialization>,
     pub(super) runtime: CircuitRuntime,
 }
 
@@ -1310,6 +1312,68 @@ impl Circuit {
         }
     }
 
+    /// Bind a fully resolved source-prepared passive occurrence before
+    /// any analysis or observation plan is constructed. Ordinary decks do
+    /// not install these equations.
+    ///
+    /// # Errors
+    /// Unknown device or incompatible physical storage family.
+    pub fn bind_passive_initialization(
+        &mut self,
+        name: &str,
+        policy: crate::devices::passive_bias::PassiveInitialization,
+    ) -> SpiceResult<()> {
+        let index = self
+            .devices
+            .iter()
+            .position(|device| device.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                SpiceError::circuit(format!("unknown prepared passive occurrence {name}"))
+            })?;
+        self.devices[index]
+            .device
+            .bind_passive_initialization(policy)?;
+        self.invalidate_topology();
+        Ok(())
+    }
+
+    /// Bind a source-prepared voltage hint to its resolved node. The first
+    /// declaration targeting the same physical node wins.
+    ///
+    /// # Errors
+    /// An unknown node or ground.
+    pub fn bind_node_initialization(
+        &mut self,
+        name: &str,
+        policy: crate::devices::passive_bias::NodeInitialization,
+    ) -> SpiceResult<()> {
+        let node = self
+            .nodes
+            .get(name)
+            .filter(|node| *node != NodeId::GROUND)
+            .ok_or_else(|| SpiceError::circuit(format!("invalid prepared node hint {name}")))?;
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.prepared_node_initializations.entry(node)
+        {
+            entry.insert(policy);
+            self.invalidate_topology();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_prepared_bias(&self) -> bool {
+        !self.prepared_node_initializations.is_empty()
+            || self.devices.iter().any(|device| device.has_passive_bias())
+    }
+
+    pub(crate) fn prepared_node_hints(
+        &self,
+    ) -> impl Iterator<Item = (NodeId, &crate::devices::passive_bias::NodeInitialization)> {
+        self.prepared_node_initializations
+            .iter()
+            .map(|(&node, policy)| (node, policy))
+    }
+
     /// Number of device instances.
     #[must_use = "the device count determines the size of per-instance workspaces"]
     pub const fn device_count(&self) -> usize {
@@ -1455,8 +1519,9 @@ impl Circuit {
             .iter()
             .zip(&self.bindings.branch_rows)
             .any(|(device, rows)| {
-                (0..rows.len())
-                    .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
+                device.has_passive_bias()
+                    || (0..rows.len())
+                        .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
             });
         mixed.then(|| {
             self.physical_voltage_nodes()
@@ -2013,6 +2078,11 @@ impl Circuit {
     /// (C sets a circuit up once).
     fn allocate_matrix(&mut self, order: Vec<usize>) -> SpiceResult<()> {
         let mut elements = self.ordered_elements(&order, 0)?;
+        elements.extend(
+            self.prepared_node_initializations
+                .keys()
+                .filter_map(|&node| self.bindings.unknowns.node_row(node).map(|row| (row, row))),
+        );
         if let Some(rows) = &self.bindings.regularization_nodes {
             elements.extend(rows.iter().map(|&row| (row, row)));
         }
@@ -2914,6 +2984,7 @@ impl Circuit {
             reltol: request.model_context.reltol,
             frequency: request.model_context.frequency,
             mode: request.mode,
+            bias_analysis: request.model_context.bias_analysis,
             branches: self.bindings.branch_rows[index].clone(),
             controls: self.controls(index)?,
             mutual: mutual.get(index).map_or(&[], Vec::as_slice),
@@ -3383,6 +3454,18 @@ impl Circuit {
             .fixed_stamps
             .replace(unlent.unwrap_or_else(|| matrix.return_fixed()));
         stamped?;
+        if request.mode.is_dc()
+            && let Some(analysis) = request.model_context.bias_analysis
+        {
+            for (&node, policy) in &self.prepared_node_initializations {
+                let row = self
+                    .bindings
+                    .unknowns
+                    .checked_node_row(node)?
+                    .ok_or_else(|| SpiceError::circuit("prepared node bias has no physical row"))?;
+                policy.stamp(analysis, row, matrix, rhs)?;
+            }
+        }
         self.learn_pattern(matrix)?;
         matrix.record_trace()?;
         Ok(())
@@ -3432,6 +3515,7 @@ impl Circuit {
                 reltol: request.model_context.reltol,
                 frequency: request.model_context.frequency,
                 mode: request.mode,
+                bias_analysis: request.model_context.bias_analysis,
                 branches: self.bindings.branch_rows[index].clone(),
                 controls: self.controls(index)?,
                 mutual: mutual.get(index).map_or(&[], Vec::as_slice),
