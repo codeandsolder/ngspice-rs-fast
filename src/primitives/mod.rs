@@ -24,6 +24,7 @@ pub mod node;
 pub mod numeric;
 pub(crate) mod random;
 pub mod value;
+pub(crate) mod wide;
 
 pub use error::{SourceLoc, SpiceError, SpiceResult};
 pub use node::{GROUND_ALIAS, GROUND_NAME, Node, NodeAppend, NodeId, NodeKind, NodeTable};

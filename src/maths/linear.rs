@@ -28,9 +28,11 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+mod recovery;
 use crate::maths::sparse13::{Scalar, Sparse, Status};
 use crate::maths::{FactorStorage, FactorWork, Matrix, Pattern, PatternWork, SparseMatrix, Vector};
 use crate::primitives::{Complex, SpiceError, SpiceResult};
+use recovery::RetainedOriginal;
 
 /// Number of independent right-hand sides in a sparse solve tile.
 pub const RHS_BATCH_WIDTH: usize = 4;
@@ -335,7 +337,7 @@ pub struct SparseSymbolic {
     factored: Option<Arc<FactoredInputs>>,
     /// Unfolded physical operator for a correction-coordinate load. This
     /// belongs to this numeric frame, not merely to its symbolic pattern.
-    original: Option<Arc<OriginalStamps>>,
+    original: Option<RetainedOriginal>,
 }
 
 /// The circuit cache retains the scalar type actually factored. Repeated
@@ -776,9 +778,12 @@ pub(crate) fn solve_ni_with_original(
                 && let Some(original) = original
                 && let Some(frame) = &mut cached
             {
-                frame.original = Some(Arc::new(std::mem::take(original)));
+                frame.original = Some(RetainedOriginal::new(
+                    std::mem::take(original),
+                    matrix.pivot_tolerances(),
+                ));
                 *original = previous
-                    .and_then(|stamps| Arc::try_unwrap(stamps).ok())
+                    .and_then(|original| Arc::try_unwrap(original.stamps).ok())
                     .unwrap_or_default();
             }
             state.frame = cached.map(CachedFrame::Real);
@@ -919,7 +924,7 @@ fn solve_last_factors_direction(
     transpose: bool,
 ) -> SpiceResult<Option<Vector>> {
     pattern.with_ordering(|state| {
-        match &state.frame {
+        match &mut state.frame {
             Some(CachedFrame::Real(symbolic))
                 if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
                     && symbolic.sparse.is_factored() =>
@@ -958,9 +963,8 @@ const RECOVERED_RHS_STALL_STEPS: usize = 8;
 /// Use the existing factors as a preconditioner for the unfolded physical
 /// operator, in either orientation. The original coefficient contributions
 /// can contain terms lost by folding; refinement of only the folded matrix
-/// would miss those terms. Select the best finite correction estimate under
-/// a bounded, progress-sensitive refinement budget. It is not a forward-error
-/// certificate: an exhausted or stalled solve is reported explicitly.
+/// would miss those terms. A stalled, exhausted or non-finite correction
+/// requests precision escalation instead of returning an unreliable iterate.
 fn refine_retained_rhs(
     order: usize,
     stamps: &[OriginalStamp],
@@ -968,12 +972,11 @@ fn refine_retained_rhs(
     initial: Vector,
     transpose: bool,
     mut solve: impl FnMut(&Vector) -> SpiceResult<Vector>,
-) -> SpiceResult<Vector> {
+) -> SpiceResult<Option<Vector>> {
     use crate::maths::equilibration::OriginalResidual;
 
     let original = OriginalResidual::real(order, stamps, transpose)?;
     let mut current = initial;
-    let mut best = current.clone();
     let mut best_change = f64::INFINITY;
     let mut residual = Vector::zeros(order);
     let mut stalled = 0;
@@ -986,17 +989,13 @@ fn refine_retained_rhs(
         let mut next = solve(&residual)?;
         let relative = update_coordinates(&mut next, &current);
         if !next.is_finite() || !relative.is_finite() {
-            return Err(numerical(
-                "retained sparse refinement",
-                "nonfinite correction",
-            ));
+            return Ok(None);
         }
         if relative <= f64::EPSILON.sqrt() {
-            return Ok(next);
+            return Ok(Some(next));
         }
         if relative < best_change {
             best_change = relative;
-            best.clone_from(&current);
             stalled = 0;
         } else {
             stalled += 1;
@@ -1006,19 +1005,24 @@ fn refine_retained_rhs(
         }
         current = next;
     }
-    solver_warning(format!(
-        "retained sparse refinement stalled or exhausted its correction budget (relative update {best_change:e})"
-    ));
-    Ok(best)
+    Ok(None)
 }
 
 fn solve_retained_rhs(
-    symbolic: &SparseSymbolic,
+    symbolic: &mut SparseSymbolic,
     rhs: &Vector,
     transpose: bool,
     workspace: &mut Vec<f64>,
     work: &mut PatternWork,
 ) -> SpiceResult<Vector> {
+    if rhs.len() != symbolic.n || !rhs.is_finite() {
+        return Err(numerical("retained sparse solve", "invalid RHS"));
+    }
+    if let Some(original) = &mut symbolic.original
+        && original.promoted()
+    {
+        return original.solve_wide(symbolic.n, rhs, transpose, work);
+    }
     let mut solve = |rhs: &Vector| {
         let result = if transpose {
             symbolic.solve_transposed_with_workspace(rhs, workspace)
@@ -1028,12 +1032,20 @@ fn solve_retained_rhs(
         work.record_rhs(&result);
         result
     };
-    let initial = solve(rhs)?;
-    if let Some(stamps) = &symbolic.original {
-        refine_retained_rhs(symbolic.n, stamps, rhs, initial, transpose, solve)
+    if let Some(original) = &symbolic.original {
+        if let Ok(Some(solution)) = solve(rhs).and_then(|initial| {
+            refine_retained_rhs(symbolic.n, &original.stamps, rhs, initial, transpose, solve)
+        }) {
+            return Ok(solution);
+        }
     } else {
-        Ok(initial)
+        return solve(rhs);
     }
+    symbolic
+        .original
+        .as_mut()
+        .ok_or_else(|| numerical("retained sparse recovery", "missing unfolded operator"))?
+        .solve_wide(symbolic.n, rhs, transpose, work)
 }
 
 /// Owned numeric sparse LU factors.
@@ -1490,6 +1502,64 @@ mod tests {
             panic!("expected a valid factor")
         };
         assert_eq!(solve_last_factors(&pattern, &rhs).unwrap().unwrap(), plain);
+    }
+
+    #[test]
+    fn divergent_retained_refinement_promotes_and_invalidates_both_orientations() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 1)]).unwrap());
+        let mut matrix = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let large = 2.0_f64.powi(54);
+        let unfolded = |hidden| {
+            vec![
+                (0, 0, large),
+                (0, 0, hidden),
+                (0, 0, -large),
+                (0, 0, 0.25),
+                (0, 1, 0.5),
+                (1, 1, 2.),
+            ]
+        };
+        let mut stamps = unfolded(1.);
+        for &(row, col, value) in &stamps {
+            matrix.add(row, col, value).unwrap();
+        }
+        let rhs = Vector::from_slice(&[4., 6.]);
+        let NiStep::Solved(raw) =
+            solve_ni_with_original(&matrix, &rhs, &mut None, false, 0., Some(&mut stamps)).unwrap()
+        else {
+            panic!("expected valid binary64 factors")
+        };
+        // Rounded A[0,0] is 0.25, unfolded A[0,0] is 1.25.
+        // The refinement iteration has eigenvalue -4 and must not
+        // return the last finite but grossly inaccurate approximation.
+        assert_eq!(raw.as_slice(), &[10., 3.]);
+        let before = pattern.factor_telemetry().work.factor;
+        let direct = solve_last_factors(&pattern, &rhs).unwrap().unwrap();
+        assert_eq!(direct.as_slice(), &[2., 3.]);
+        let promoted = pattern.factor_telemetry().work.factor;
+        assert_ne!(before, promoted);
+        let transpose_rhs = Vector::from_slice(&[2.5, 7.]);
+        let transpose = solve_last_factors_transposed(&pattern, &transpose_rhs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(transpose.as_slice(), &[2., 3.]);
+        assert_eq!(pattern.factor_telemetry().work.factor, promoted);
+        // Hidden coefficient changes, but every folded binary64 value
+        // stays the same. The promoted factors must not survive the load.
+        let mut stamps = unfolded(1.5);
+        let rhs = Vector::from_slice(&[5., 6.]);
+        assert!(matches!(
+            solve_ni_with_original(&matrix, &rhs, &mut None, false, 0., Some(&mut stamps)).unwrap(),
+            NiStep::Solved(_)
+        ));
+        assert_eq!(
+            solve_last_factors(&pattern, &rhs)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            &[2., 3.]
+        );
+        assert_ne!(pattern.factor_telemetry().work.factor, promoted);
     }
 
     #[test]
