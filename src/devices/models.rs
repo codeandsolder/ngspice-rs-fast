@@ -46,6 +46,10 @@ use crate::devices::sweep::{
 pub enum ModelFamily {
     /// Scalar resistor (`r` or `res`).
     Resistor,
+    /// Prepared voltage-defined piecewise-linear resistor.
+    PreparedVpwlr,
+    /// Prepared current-defined piecewise-linear resistor.
+    PreparedIpwlr,
     /// Scalar capacitor.
     Capacitor,
     /// Scalar inductor.
@@ -97,6 +101,8 @@ impl ModelFamily {
     pub fn from_base(base: &str) -> Option<Self> {
         match base.to_ascii_lowercase().as_str() {
             "r" | "res" => Some(Self::Resistor),
+            "prepared_vpwlr" => Some(Self::PreparedVpwlr),
+            "prepared_ipwlr" => Some(Self::PreparedIpwlr),
             "c" => Some(Self::Capacitor),
             "l" => Some(Self::Inductor),
             "d" => Some(Self::Diode),
@@ -128,7 +134,7 @@ impl ModelFamily {
     #[must_use = "the designator selects the corresponding device family"]
     pub const fn designator(self) -> char {
         match self {
-            Self::Resistor => 'r',
+            Self::Resistor | Self::PreparedVpwlr | Self::PreparedIpwlr => 'r',
             Self::Capacitor => 'c',
             Self::Inductor => 'l',
             Self::Diode | Self::SimetrixDiodeLevel1 => 'd',
@@ -153,6 +159,8 @@ impl ModelFamily {
 pub enum ModelBackend {
     /// Scalar resistor.
     Resistor,
+    /// Prepared piecewise-linear resistor (either independent axis).
+    PreparedPwlResistor,
     /// Scalar capacitor.
     Capacitor,
     /// Scalar inductor.
@@ -237,7 +245,25 @@ impl ModelBackend {
     /// Families differing only in polarity share the same selector catalog.
     pub(crate) const fn catalog(designator: char) -> &'static [BackendSpec] {
         match designator.to_ascii_lowercase() {
-            'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
+            'r' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1]),
+                        BackendSpec::new(
+                            Self::PreparedPwlResistor,
+                            "Prepared voltage-defined PWL resistor",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::PreparedVpwlr),
+                        BackendSpec::new(
+                            Self::PreparedPwlResistor,
+                            "Prepared current-defined PWL resistor",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::PreparedIpwlr),
+                    ]
+                }
+            }
             'c' => const { &[BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1])] },
             'l' => const { &[BackendSpec::new(Self::Inductor, "Scalar inductor", &[1])] },
             'd' => {

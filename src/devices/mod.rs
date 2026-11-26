@@ -85,6 +85,7 @@ pub mod physical_dae;
 pub mod prepared_model;
 pub mod prepared_waveform;
 pub mod pulse;
+mod pwl_resistor;
 pub mod rf_passive;
 mod simetrix_diode;
 pub use passive::PassiveParameters;

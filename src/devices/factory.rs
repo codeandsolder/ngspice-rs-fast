@@ -67,6 +67,9 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Resistor | ModelBackend::Capacitor | ModelBackend::Inductor => {
             crate::devices::passive::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::PreparedPwlResistor => {
+            crate::devices::pwl_resistor::instantiate(instance, nodes, &model)
+        }
         ModelBackend::Diode => {
             crate::devices::nonlinear::Diode::instantiate(instance, nodes, &model, context)
         }
