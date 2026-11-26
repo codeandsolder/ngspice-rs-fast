@@ -539,3 +539,41 @@ fn recovered_long_chain_transfer_solves_the_original_operator() {
         }
     }
 }
+
+/// A sensitivity solve uses the transposed retained Jacobian. Differentiate
+/// the independent scalar series law, not the simulator's absolute stamps.
+#[test]
+fn recovered_long_chain_sensitivity_solves_the_original_transpose() {
+    for stages in [1000_u32, 5000] {
+        let (junction, current) = chain_root(stages);
+        let conductance = (1e-14 / VT).mul_add((junction / VT).exp(), 1e-12);
+        let resistance = f64::from(stages).mul_add(100. + conductance.recip(), 1000.);
+        // Vout = RL * I; dI/dVs = 1/Rtotal and dI/dRL = -I/Rtotal.
+        let gain = 1000. / resistance;
+        let load_derivative = current * (1. - gain);
+        for mode in ["", " physical"] {
+            let netlist = parse(&format!(
+                "{}\n.sens v(n{stages}) v1 rl{mode}",
+                diode_chain(stages as usize)
+            ));
+            let config = RunConfig::from_netlist(&netlist).unwrap();
+            let mut circuit = config.circuit(&netlist).unwrap();
+            let plans = config.plans_for(&netlist.analyses).unwrap();
+            let plot = plans[0].run(&mut circuit, &config.context()).unwrap();
+            // Unlike an absolute voltage floor, a relative comparison
+            // resolves the tiny but nonzero physical sensitivities. The
+            // legacy parameter difference has a 1 ppm perturbation;
+            // allow its first-order error and the independently bounded
+            // error in the near-open operating-point current.
+            for (name, expected, relative) in
+                [("v(v1)", gain, 1e-6), ("v(rl)", load_derivative, 1e-5)]
+            {
+                let got = value(&plot, name);
+                assert!(
+                    (got / expected - 1.).abs() <= relative,
+                    "{stages} stages {mode} {name}: {got:e} != {expected:e}"
+                );
+            }
+        }
+    }
+}
