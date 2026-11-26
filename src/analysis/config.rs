@@ -1010,25 +1010,13 @@ impl RunConfig {
     }
 
     /// Apply finite real-valued solver and temperature options.
-    fn apply_real_option(
+    fn apply_geometry_option(
         &mut self,
         input: &OptionInput<'_>,
         value: &crate::netlist::ast::PositionedValue,
-    ) -> SpiceResult<()> {
-        let setting = input.setting;
-        let name = setting.name.as_str();
-        let location = &setting.location;
+    ) -> SpiceResult<bool> {
+        let name = input.setting.name.as_str();
         match name {
-            "xmu" => {
-                let xmu = input.number("a finite number")?;
-                if !(0. ..=0.5).contains(&xmu) {
-                    return Err(SpiceError::parse(
-                        value.location.clone(),
-                        format!("option 'xmu' must be in [0, 0.5], not {xmu}"),
-                    ));
-                }
-                self.transient.xmu = Some(xmu);
-            }
             "scale" => {
                 let scale = input.number("a finite positive number")?;
                 if scale <= 0. {
@@ -1051,6 +1039,33 @@ impl RunConfig {
                     SpiceError::parse(value.location.clone(), error.to_string())
                 })?;
                 self.context.shunts = shunts;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn apply_real_option(
+        &mut self,
+        input: &OptionInput<'_>,
+        value: &crate::netlist::ast::PositionedValue,
+    ) -> SpiceResult<()> {
+        if self.apply_geometry_option(input, value)? {
+            return Ok(());
+        }
+        let setting = input.setting;
+        let name = setting.name.as_str();
+        let location = &setting.location;
+        match name {
+            "xmu" => {
+                let xmu = input.number("a finite number")?;
+                if !(0. ..=0.5).contains(&xmu) {
+                    return Err(SpiceError::parse(
+                        value.location.clone(),
+                        format!("option 'xmu' must be in [0, 0.5], not {xmu}"),
+                    ));
+                }
+                self.transient.xmu = Some(xmu);
             }
             "minbreak" => {
                 let number = input.number("a finite number")?;

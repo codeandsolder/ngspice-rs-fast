@@ -177,10 +177,6 @@ impl InstanceTarget {
         }
     }
 
-    pub(super) const fn topology(self) -> TopologyId {
-        self.topology
-    }
-
     /// Device ordinal in the finalized circuit.
     #[must_use = "the device index locates the instance receiving the parameter change"]
     pub const fn device(self) -> usize {
@@ -216,7 +212,9 @@ impl InstanceTarget {
             ));
         }
         Ok(InstanceOverride {
-            target: self,
+            topology: self.topology,
+            device: self.device,
+            parameter: self.parameter,
             value,
         })
     }
@@ -245,31 +243,34 @@ impl InstanceTarget {
 /// overrides cannot be applied to a structurally different circuit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InstanceOverride {
-    target: InstanceTarget,
+    topology: TopologyId,
+    device: usize,
+    parameter: ParameterKey,
     value: Real,
 }
 
 impl InstanceOverride {
     pub(super) const fn topology(self) -> TopologyId {
-        self.target.topology()
+        self.topology
     }
 
-    /// The value-independent typed target.
-    #[must_use = "the target identifies the instance and parameter to override"]
-    pub const fn target(self) -> InstanceTarget {
-        self.target
+    /// Does this resolved override refer to the same finalized setter?
+    pub(crate) fn matches_target(self, target: InstanceTarget) -> bool {
+        self.topology == target.topology
+            && self.device == target.device
+            && self.parameter == target.parameter
     }
 
     /// The overridden device's ordinal.
     #[must_use = "the device index locates the instance receiving the override"]
     pub const fn device(&self) -> usize {
-        self.target.device()
+        self.device
     }
 
     /// The canonical (lowercase, alias-folded) parameter keyword.
     #[must_use = "the parameter key identifies the instance property receiving the override"]
     pub const fn parameter(&self) -> ParameterKey {
-        self.target.parameter()
+        self.parameter
     }
 
     /// Value in the setter's own unit (Celsius for temperature).

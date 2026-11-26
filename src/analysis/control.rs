@@ -395,7 +395,7 @@ impl<'a> ControlSession<'a> {
             circuit.bind_instance_target(name, parameter)?
         };
         let mut edits = self.edits.clone();
-        edits.retain(|edit| edit.target() != target);
+        edits.retain(|edit| !edit.matches_target(target));
         if edits.len() >= max_edits {
             return Err(SpiceError::circuit("control instance edit budget exceeded"));
         }

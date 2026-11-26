@@ -570,6 +570,26 @@ impl PassiveParameters {
     }
 }
 
+fn scale_instance_geometry(
+    kind: PassiveKind,
+    values: &mut ScalarValues,
+    geometry_scale: Real,
+) -> SpiceResult<()> {
+    if matches!(kind, PassiveKind::Resistor | PassiveKind::Capacitor) {
+        for name in ["l", "w"] {
+            if let Some(written) = values.get(name)
+                && let Some(source) = &written.location
+            {
+                let scaled = crate::devices::sweep::GeometryScale::Length
+                    .resolve(written.value, geometry_scale)
+                    .map_err(|error| SpiceError::parse(source.clone(), error.to_string()))?;
+                values.set(name, scaled, written.unit, source.clone())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ResolvedModel<'_> {
     /// Project bounded passive model/instance setters without changing the AST.
     /// All setters are validated even when a higher-precedence scalar makes a
@@ -609,18 +629,7 @@ impl ResolvedModel<'_> {
         let mut instance_values =
             instance_schema(kind).validate(&instance.parameters, &instance.location)?;
         let location = &instance.location;
-        if matches!(kind, PassiveKind::Resistor | PassiveKind::Capacitor) {
-            for name in ["l", "w"] {
-                if let Some(written) = instance_values.get(name)
-                    && let Some(source) = &written.location
-                {
-                    let scaled = crate::devices::sweep::GeometryScale::Length
-                        .resolve(written.value, geometry_scale)
-                        .map_err(|error| SpiceError::parse(source.clone(), error.to_string()))?;
-                    instance_values.set(name, scaled, written.unit, source.clone())?;
-                }
-            }
-        }
+        scale_instance_geometry(kind, &mut instance_values, geometry_scale)?;
         let prepared = PreparedModel::prepare(kind, &model);
         let base = if let Some(value) = optional(&instance_values, primary) {
             if kind == PassiveKind::Resistor {
