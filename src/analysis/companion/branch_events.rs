@@ -1,7 +1,10 @@
 //! Localize executed behavioural guard transitions using disposable physical
 //! derivative-array solves against the same accepted integration history.
 
-use super::{AttemptedStep, Boundary, Driver, ReadyStep, StepClock, Trial, TrialPoint, failure};
+use super::{
+    Acceptance, AcceptedPoint, AttemptedStep, Boundary, CandidateOutput, Driver, NextStep, Order,
+    OutputSelection, ReadyStep, StepClock, StepDecision, Trial, TrialPoint, failure,
+};
 use crate::maths::Vector;
 use crate::primitives::{Real, SpiceResult};
 
@@ -19,7 +22,187 @@ pub(super) enum Localization {
     Retry(Real),
 }
 
+/// Only accepted start data may anchor a localized crossing. Newton seeds
+/// and bracket candidates are disposable and never become this baseline.
+struct BranchSearch {
+    start: StepClock,
+    seed: Vector,
+    event: Option<BranchBracket>,
+}
+
+impl BranchSearch {
+    fn retry(
+        &mut self,
+        attempt: &AttemptedStep,
+        next: NextStep,
+        min_step: Real,
+    ) -> SpiceResult<ReadyStep> {
+        self.event = None;
+        let mut ready = attempt.retry(next, min_step)?;
+        ready.clock.time = self.start.time;
+        Ok(ready)
+    }
+}
+
+enum BranchResolution {
+    Point(TrialPoint),
+    Probe(ReadyStep),
+}
+
 impl Driver<'_> {
+    /// Physical derivative-array trials are separate from the companion
+    /// Newton loop: guard probes and germ transitions do not need ordinary
+    /// transient stamping or mixed-signal preview state.
+    pub(super) fn advance_physical(
+        &mut self,
+        mut ready: ReadyStep,
+        mut iterate: Vector,
+        output: OutputSelection<'_>,
+    ) -> SpiceResult<AcceptedPoint> {
+        let min_step = self.settings.min_step();
+        let mut search = BranchSearch {
+            start: ready.clock,
+            seed: iterate.clone(),
+            event: None,
+        };
+        let physical_event = self.next_physical_event(search.start.time);
+        loop {
+            self.check_step_work(search.start.time)?;
+            if let Some(event) = physical_event {
+                ready.limit_to_event(event);
+            }
+            if let Some(bracket) = search.event {
+                ready.limit_to_event(bracket.right);
+                if ready.end_time() < bracket.right {
+                    search.event = None;
+                }
+            } else {
+                self.limit_branch_probe(&mut ready);
+            }
+            let attempt = ready.begin(&self.steps, &self.settings)?;
+            let point = match self.derivative_trial(&attempt, &iterate)? {
+                Trial::NotConverged { last } => {
+                    iterate = last;
+                    self.stats.rejected += 1;
+                    ready = search.retry(
+                        &attempt,
+                        NextStep {
+                            delta: attempt.clock.next.delta / 8.,
+                            order: Order::One,
+                        },
+                        min_step,
+                    )?;
+                    continue;
+                }
+                Trial::Converged(point) => point,
+            };
+            let point = match self.resolve_branch(&mut search, &attempt, point)? {
+                BranchResolution::Point(point) => point,
+                BranchResolution::Probe(probe) => {
+                    ready = probe;
+                    iterate = search.seed.clone();
+                    self.stats.rejected += 1;
+                    continue;
+                }
+            };
+            let decision = if let Some(next) = self.derived_storage_retry(&attempt, &point.state)? {
+                StepDecision::Retry(next)
+            } else {
+                attempt.decision(&self.settings, &self.steps, |coefficients| {
+                    self.truncation_limit(coefficients, &point.state, &point.x, attempt.clock.time)
+                })?
+            };
+            match decision {
+                StepDecision::Retry(next) => {
+                    iterate = point.x;
+                    self.stats.rejected += 1;
+                    ready = search.retry(&attempt, next, min_step)?;
+                }
+                StepDecision::Accept(next) => {
+                    return self.accept_physical(attempt, next, point, &output);
+                }
+            }
+        }
+    }
+
+    fn resolve_branch(
+        &mut self,
+        search: &mut BranchSearch,
+        attempt: &AttemptedStep,
+        point: TrialPoint,
+    ) -> SpiceResult<BranchResolution> {
+        let changed = !self.accepted_guards.same_regions(&point.guards);
+        if let Some(bracket) = search.event {
+            return Ok(BranchResolution::Point(if changed {
+                self.count_branch_probe()?;
+                self.branch_left_point(search.start, &search.seed, bracket, attempt)?
+            } else {
+                point
+            }));
+        }
+        if changed {
+            let ready = match self.localize_branch(search.start, &search.seed, attempt, &point)? {
+                Localization::Event(bracket) => {
+                    let mut ready = Self::branch_probe_step(search.start, attempt, bracket.right);
+                    ready.limit_to_event(bracket.right);
+                    search.event = Some(bracket);
+                    ready
+                }
+                Localization::Retry(at) => Self::branch_probe_step(search.start, attempt, at),
+            };
+            return Ok(BranchResolution::Probe(ready));
+        }
+        if let Some(at) = self.backward_branch_probe(search.start, attempt, &point) {
+            return Ok(BranchResolution::Probe(Self::branch_probe_step(
+                search.start,
+                attempt,
+                at,
+            )));
+        }
+        Ok(BranchResolution::Point(point))
+    }
+
+    fn accept_physical(
+        &mut self,
+        attempt: AttemptedStep,
+        mut next: NextStep,
+        point: TrialPoint,
+        output: &OutputSelection<'_>,
+    ) -> SpiceResult<AcceptedPoint> {
+        let event = self.crosses_physical_event(&attempt);
+        let TrialPoint { x, state, guards } = if event {
+            next.order = Order::One;
+            self.derivative_event(&attempt, &point.x, &point.state)?
+        } else {
+            point
+        };
+        let time = attempt.clock.time;
+        let limit = if attempt.event_start.is_some() && time >= self.settings.stop {
+            crate::devices::Limit::Left
+        } else {
+            crate::devices::Limit::Right
+        };
+        let CandidateOutput {
+            observed,
+            periodic_boundary,
+        } = self.candidate_output(&attempt, &x, &state, output, || {
+            self.observe_derivative_point(&x, Some(&state), time, limit, output.selected)
+        })?;
+        let device_breaks = self.commit_point(Acceptance::Step(&attempt), &x, state)?;
+        self.accepted_guards = guards;
+        if event {
+            self.history.restart_integration()?;
+            self.steps.clear();
+        }
+        Ok(AcceptedPoint {
+            cursor: attempt.accept(next),
+            solution: x,
+            observed,
+            device_breaks,
+            periodic_boundary,
+        })
+    }
+
     /// A rate-only truncation estimate cannot see a jump when both endpoint
     /// derivatives vanish. Compare the actual derived coordinate increment
     /// with the endpoint rate envelope, without imposing another DAE row.
@@ -36,13 +219,14 @@ impl Driver<'_> {
             .ok_or_else(|| failure("missing accepted derivative history"))?;
         for (device, truncation) in self.circuit.devices().iter().zip(&self.truncation) {
             for slot in truncation.slots.iter().filter(|slot| slot.derived) {
-                let [q0, r0] = old[slot.base..=slot.base + 1] else {
-                    unreachable!()
+                let range = slot.base..=slot.base + 1;
+                let Some(&[q0, r0]) = old.get(range.clone()) else {
+                    return Err(failure("missing accepted derivative slots"));
                 };
-                let [q1, r1] = trial.values()[slot.base..=slot.base + 1] else {
-                    unreachable!()
+                let Some(&[q1, r1]) = trial.values().get(range) else {
+                    return Err(failure("missing trial derivative slots"));
                 };
-                let error = (q1 - q0 - dt * Real::midpoint(r0, r1)).abs();
+                let error = (-dt).mul_add(Real::midpoint(r0, r1), q1 - q0).abs();
                 let envelope = dt * 0.5 * (r1 - r0).abs();
                 let tolerance = tol.reltol.mul_add(q0.abs().max(q1.abs()), tol.vntol);
                 if error > envelope + tolerance {
