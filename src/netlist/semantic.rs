@@ -443,6 +443,7 @@ semantic_enum!(ExprKind {
     Identifier(name: rname),
     Unary { op: rop, operand: roperand },
     Binary { op: rop, lhs: rlhs, rhs: rrhs },
+    Ternary { condition: rcondition, then: rthen, otherwise: rotherwise },
     Call { function: rfunction, arguments: rarguments },
     Group(inner: rinner),
     UserCall { name: rname, arguments: rarguments },

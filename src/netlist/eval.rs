@@ -1367,6 +1367,15 @@ impl<'a> RefScan<'a, '_> {
                 self.refs(lhs, depth + 1, out)?;
                 self.refs(rhs, depth + 1, out)?;
             }
+            ExprKind::Ternary {
+                condition,
+                then,
+                otherwise,
+            } => {
+                self.refs(condition, depth + 1, out)?;
+                self.refs(then, depth + 1, out)?;
+                self.refs(otherwise, depth + 1, out)?;
+            }
             ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
                 for a in arguments {
                     self.refs(a, depth + 1, out)?;
@@ -1437,6 +1446,15 @@ impl<'a> RefScan<'a, '_> {
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.body_names(lhs, scope, depth + 1, out)?;
                 self.body_names(rhs, scope, depth + 1, out)?;
+            }
+            ExprKind::Ternary {
+                condition,
+                then,
+                otherwise,
+            } => {
+                self.body_names(condition, scope, depth + 1, out)?;
+                self.body_names(then, scope, depth + 1, out)?;
+                self.body_names(otherwise, scope, depth + 1, out)?;
             }
             ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
                 for a in arguments {
@@ -1693,12 +1711,30 @@ fn eval(
             Ok(match op {
                 UnaryOp::Plus => v,
                 UnaryOp::Minus => -v,
+                UnaryOp::Not => Real::from(v == 0.0),
             })
         }
         ExprKind::Binary { op, lhs, rhs } => {
             let x = eval(lhs, root, env, budget, depth + 1)?;
+            if (*op == BinaryOp::And && x == 0.0) || (*op == BinaryOp::Or && x != 0.0) {
+                return Ok(Real::from(x != 0.0));
+            }
             let y = eval(rhs, root, env, budget, depth + 1)?;
             binary(*op, x, y, node, rhs, root)
+        }
+        ExprKind::Ternary {
+            condition,
+            then,
+            otherwise,
+        } => {
+            let condition = eval(condition, root, env, budget, depth + 1)?;
+            eval(
+                if condition != 0.0 { then } else { otherwise },
+                root,
+                env,
+                budget,
+                depth + 1,
+            )
         }
         ExprKind::Call {
             function,
@@ -1771,6 +1807,25 @@ fn binary(
         }
         // xpressn.c operate(), default compatibility.
         BinaryOp::Pow => x.abs().powf(y),
+        BinaryOp::Rem | BinaryOp::IntDiv => {
+            if y == 0.0 {
+                return Err(fail(rhs, root, "division by zero"));
+            }
+            let quotient = x / y;
+            if op == BinaryOp::Rem {
+                x - y * quotient.trunc()
+            } else {
+                quotient.abs().trunc()
+            }
+        }
+        BinaryOp::Eq => Real::from(x == y),
+        BinaryOp::Ne => Real::from(x != y),
+        BinaryOp::Lt => Real::from(x < y),
+        BinaryOp::Le => Real::from(x <= y),
+        BinaryOp::Gt => Real::from(x > y),
+        BinaryOp::Ge => Real::from(x >= y),
+        BinaryOp::And => Real::from(x != 0.0 && y != 0.0),
+        BinaryOp::Or => Real::from(x != 0.0 || y != 0.0),
     };
     checked(result, node, root, || match op {
         BinaryOp::Add => format!("{x} + {y}"),
@@ -1778,6 +1833,7 @@ fn binary(
         BinaryOp::Mul => format!("{x} * {y}"),
         BinaryOp::Div => format!("{x} / {y}"),
         BinaryOp::Pow => format!("pow(fabs({x}), {y})"),
+        other => format!("{x} {other:?} {y}"),
     })
 }
 
@@ -1792,13 +1848,26 @@ fn builtin_call(
     function: Function,
     arguments: &[Expr],
 ) -> Result<Real, Failure> {
+    // A `.func` of the same name replaces the built-in before intrinsic dispatch.
+    let definition = env.function(function.name());
+    if definition.is_none() && function == Function::Ternary {
+        let [condition, then, otherwise] = arguments else {
+            return Err(fail(node, root, "ternary_fcn requires three arguments"));
+        };
+        let condition = eval(condition, root, env, budget, depth + 1)?;
+        return eval(
+            if condition != 0.0 { then } else { otherwise },
+            root,
+            env,
+            budget,
+            depth + 1,
+        );
+    }
     let mut args = Vec::with_capacity(arguments.len());
     for a in arguments {
         args.push(eval(a, root, env, budget, depth + 1)?);
     }
-    // A `.func` of the same name replaces the built-in, as C's textual
-    // expansion does before numparam sees the call.
-    if let Some((def, scope)) = env.function(function.name()) {
+    if let Some((def, scope)) = definition {
         return call(node, root, env, budget, depth, def, scope, args);
     }
     let result = apply(function, &args);
@@ -1966,6 +2035,13 @@ fn apply(function: Function, args: &[Real]) -> Real {
     let x = args[args.len() - 1];
     let z = args[0];
     match function {
+        Function::Ternary => {
+            if z != 0.0 {
+                args[1]
+            } else {
+                x
+            }
+        }
         Function::Sqr => x * x,
         Function::Sqrt => x.sqrt(),
         Function::Sin => x.sin(),

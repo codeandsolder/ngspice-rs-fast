@@ -392,8 +392,10 @@ fn function_errors_are_explicit() {
     // A self reference through a function is a self reference.
     let e = scope_error(".func f(x) {x*k}\n.param k={f(1)}").to_string();
     assert!(e.contains("undefined parameter 'k'"), "{e}");
-    // Excluded numparam built-ins without a .func are not yet ported.
-    let n = deck("r1 a 0 {ternary_fcn(1,2,3)}");
+    // The intrinsic conditional selects the true branch without evaluating the other.
+    assert_eq!(probe("", "ternary_fcn(1,2,sqrt(-1))"), 2.0);
+    // String-valued numparam built-ins remain unsupported.
+    let n = deck("r1 a 0 {vec(1)}");
     let e = literalize(&n).unwrap_err();
     assert!(e.is_not_yet_ported(), "{e}");
     assert!(e.to_string().contains("f.cir:2:9"), "{e}");
