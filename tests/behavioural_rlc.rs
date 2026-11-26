@@ -1158,24 +1158,27 @@ fn behavioural_step_inside_derivative_requires_impulse() {
 #[test]
 fn compiled_behavioural_corner_uses_right_germ_and_preserves_storage() -> SpiceResult<()> {
     for method in ["method=trap", "method=gear"] {
-        let body = "bdrive x 0 v=(time-10u)/1u\nrdrive x 0 1\nbv out 0 v=1u*ddt(abs(v(x)))\nbi other 0 v=1u*ddt(abs(i(bdrive)))\nrout out 0 1k\nrother other 0 1k\nrcap cap 0 1k\nccap cap 0 1n ic=1\n.options reltol=1e-8 vntol=1n chgtol=1e-18 trtol=0.01";
+        let body = "bdrive x 0 v=(time-1u)/1u\nrdrive x 0 1\nbv out 0 v=1u*ddt(abs(v(x)))\nbi other 0 v=1u*ddt(abs(i(bdrive)))\nrout out 0 1k\nrother other 0 1k\nrcap cap 0 1k\nccap cap 0 1n ic=1\nvli lin 0 0\nrli lin li 1\nlli li 0 1u ic=1\nvrational ri 0 dc 3\na1 ri rational mdl\nrrational rational 0 1k\n.model mdl s_xfer(num_coeff=[1] den_coeff=[1 1] denormalized_freq=1e6 int_ic=[2])\n.options reltol=1e-8 vntol=1n chgtol=1e-18 trtol=0.01";
         let plot = run(
             body,
             AnalysisKind::Transient,
-            &["1u", "15u", "0", "1u", "uic", method],
+            &["1u", "3u", "0", "1u", "uic", method],
         )?;
         let mut seen = false;
         for index in 0..plot.point_count() {
             let t = plot.value("time", index).unwrap().re;
-            let at_corner = (t - 10e-6).abs() <= 1e-18;
+            let at_corner = (t - 1e-6).abs() <= 1e-18;
             seen |= at_corner;
-            let expected = if t < 10e-6 && !at_corner { -1. } else { 1. };
+            let expected = if t < 1e-6 && !at_corner { -1. } else { 1. };
             for name in ["v(out)", "v(other)"] {
                 close(plot.value(name, index).unwrap().re, expected, 1e-7);
             }
+            let decay = (-t / 1e-6).exp();
+            close(plot.value("v(cap)", index).unwrap().re, decay, 2e-6);
+            close(plot.value("i(lli)", index).unwrap().re, decay, 2e-6);
             close(
-                plot.value("v(cap)", index).unwrap().re,
-                (-t / 1e-6).exp(),
+                plot.value("v(rational)", index).unwrap().re,
+                3. - decay,
                 2e-6,
             );
         }

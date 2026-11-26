@@ -1,6 +1,7 @@
 //! Branch observations of the executed compiled physical expression graph.
 //! A predicted Taylor root is a probe hint, never proof of an event.
 
+use super::{BranchTrace, Guard, LocalGuard, Region};
 use crate::maths::taylor::Jet;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::cmp::Ordering;
@@ -19,25 +20,6 @@ impl RootWork {
         })?;
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Region {
-    Sign(Ordering),
-    Interval(usize),
-    Discrete(u64),
-}
-
-/// One operation's active branch and the adjacent candidate boundaries in
-/// its operand coordinate. The slot and operand discriminator are stable
-/// across evaluations of the same compiled program.
-#[derive(Debug, Clone)]
-pub(crate) struct LocalGuard {
-    pub slot: usize,
-    pub operand: u8,
-    pub region: Region,
-    pub argument: Jet,
-    pub boundaries: [Option<Real>; 2],
 }
 
 impl LocalGuard {
@@ -91,19 +73,6 @@ impl LocalGuard {
         }
         Ok(earliest)
     }
-}
-
-#[derive(Debug, Clone)]
-struct Guard {
-    device: usize,
-    local: LocalGuard,
-}
-
-/// Observations belong to a disposable physical point until it is accepted.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct BranchTrace {
-    guards: Vec<Guard>,
-    coefficients: usize,
 }
 
 impl BranchTrace {

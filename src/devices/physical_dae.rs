@@ -5,8 +5,7 @@
 //! coefficient, time discretization, device limiting, or artificial gmin
 //! is introduced by this evaluator.
 
-pub(crate) mod guards;
-pub(crate) use guards::{BranchTrace, LocalGuard, Region};
+mod guards;
 
 use crate::devices::{
     AnalysisMode, Forcing, Limit, LoadRequest, ModelContext, PreparedRun, StateHistory,
@@ -14,6 +13,38 @@ use crate::devices::{
 };
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceError, SpiceResult};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Region {
+    Sign(std::cmp::Ordering),
+    Interval(usize),
+    Discrete(u64),
+}
+
+/// One operation's active branch and the adjacent candidate boundaries in
+/// its operand coordinate. The slot and operand discriminator are stable
+/// across evaluations of the same compiled program.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalGuard {
+    pub slot: usize,
+    pub operand: u8,
+    pub region: Region,
+    pub argument: crate::maths::taylor::Jet,
+    pub boundaries: [Option<Real>; 2],
+}
+
+#[derive(Debug, Clone)]
+struct Guard {
+    device: usize,
+    local: LocalGuard,
+}
+
+/// Observations belong to a disposable physical point until it is accepted.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BranchTrace {
+    guards: Vec<Guard>,
+    coefficients: usize,
+}
 
 /// Exact physical residuals and their Jacobians with respect to the state.
 pub struct PhysicalDaePoint {
