@@ -55,6 +55,15 @@ fn diode_dc_obeys_junction_law_kcl_and_matches_c() {
     let want = &raw.plots[0].plot;
     assert_eq!(got.point_count(), want.point_count());
     for point in 0..got.point_count() {
+        // At exactly zero applied voltage the strictly increasing sum
+        // v/R + Is*expm1(v/VT) + Gmin*v has its unique root at zero.
+        // The C golden's ~7.3e-29 V is an iteration-rounding artifact,
+        // not a physical offset. Retain the existing absolute tolerance
+        // against the exact root instead of requiring the artifact.
+        let zero_bias = want.value("v(in)", point).unwrap().re == 0.;
+        if zero_bias {
+            assert_eq!(got.value("v(in)", point).unwrap().re, 0.);
+        }
         for name in ["v(out)", "i(v1)"] {
             let (rust, c) = (
                 got.value(name, point).unwrap().re,
@@ -62,7 +71,7 @@ fn diode_dc_obeys_junction_law_kcl_and_matches_c() {
             );
             // The golden is the stock (FMA) C build; the port reproduces the
             // FMA-free build bit for bit, 1e-10 relative from it at worst.
-            close(rust, c, 1e-9, 1e-30);
+            close(rust, if zero_bias { 0. } else { c }, 1e-9, 1e-30);
         }
     }
     // Tight requested tolerances solve the junction law and KCL themselves.
