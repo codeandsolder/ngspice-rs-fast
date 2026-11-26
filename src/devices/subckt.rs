@@ -883,43 +883,7 @@ impl<'a> Expander<'a> {
                 ));
             }
             self.rewrite_model(&mut instance, locals);
-            // F/H controlling sources are translated like instance names
-            // (`translate()` calls `translate_inst_name` for them), so they
-            // always name a device of the same instance.
-            for parameter in &mut instance.parameters {
-                if let ParameterKind::Behavioural(expression) = &mut parameter.kind {
-                    // Node and source names inside a behavioural expression are
-                    // translated like the card's own (C expands the B line
-                    // text, `translate()` renaming v(...)/i(...) operands).
-                    expression.root.visit_mut(&mut |node| match &mut node.kind {
-                        BExprKind::Voltage { positive, negative } => {
-                            *positive = self.rewrite_node(positive, terminals, path);
-                            if let Some(negative) = negative {
-                                *negative = self.rewrite_node(negative, terminals, path);
-                            }
-                        }
-                        BExprKind::Current(source) => {
-                            let designator = source
-                                .chars()
-                                .next()
-                                .unwrap_or_default()
-                                .to_ascii_lowercase();
-                            *source = device_name(source, designator, path);
-                        }
-                        _ => {}
-                    });
-                    continue;
-                }
-                if parameter.kind == ParameterKind::Instance {
-                    let designator = parameter
-                        .value
-                        .chars()
-                        .next()
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    parameter.value = device_name(&parameter.value, designator, path);
-                }
-            }
+            self.rewrite_parameter_references(&mut instance, terminals, path);
             instance.name = device_name(&instance.name, instance.designator, path);
             self.bind_prepared_waveform(original, directives.definition, &instance, scope)?;
             if let Some(binder) = &mut self.binder {
@@ -934,6 +898,52 @@ impl<'a> Expander<'a> {
             self.devices.push(instance);
         }
         Ok(())
+    }
+
+    /// Rewrite instance-local device and node references in parameters.
+    fn rewrite_parameter_references(
+        &self,
+        instance: &mut DeviceInstance,
+        terminals: &BTreeMap<String, String>,
+        path: &str,
+    ) {
+        // F/H controlling sources are translated like instance names
+        // (`translate()` calls `translate_inst_name` for them), so they
+        // always name a device of the same instance.
+        for parameter in &mut instance.parameters {
+            if let ParameterKind::Behavioural(expression) = &mut parameter.kind {
+                // Node and source names inside a behavioural expression are
+                // translated like the card's own (C expands the B line
+                // text, `translate()` renaming v(...)/i(...) operands).
+                expression.root.visit_mut(&mut |node| match &mut node.kind {
+                    BExprKind::Voltage { positive, negative } => {
+                        *positive = self.rewrite_node(positive, terminals, path);
+                        if let Some(negative) = negative {
+                            *negative = self.rewrite_node(negative, terminals, path);
+                        }
+                    }
+                    BExprKind::Current(source) => {
+                        let designator = source
+                            .chars()
+                            .next()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        *source = device_name(source, designator, path);
+                    }
+                    _ => {}
+                });
+                continue;
+            }
+            if parameter.kind == ParameterKind::Instance {
+                let designator = parameter
+                    .value
+                    .chars()
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                parameter.value = device_name(&parameter.value, designator, path);
+            }
+        }
     }
 
     /// Bind a resolved waveform to the flattened source occurrence.
