@@ -621,7 +621,22 @@ fn write_scope_parameters(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &S
                     ctx.loc(&card.location)
                 ),
             );
-            write_expression(out, indent + 2, &card.body);
+            write_expression_header(
+                out,
+                indent + 2,
+                &card.body.text,
+                &card.body.span,
+                card.body.braced,
+                card.body.quoted,
+            );
+            match &card.body.scalar {
+                Ok(root) => write_expr(out, indent + 3, root),
+                Err(_) => {
+                    if let Ok(root) = &card.body.behavioural {
+                        write_bexpr(out, indent + 3, root);
+                    }
+                }
+            }
         }
     }
 }
@@ -947,21 +962,35 @@ fn write_waveform(ctx: &Ctx<'_>, out: &mut Out, indent: usize, waveform: &Source
 }
 
 fn write_expression(out: &mut Out, indent: usize, expression: &ParameterExpression) {
+    write_expression_header(
+        out,
+        indent,
+        &expression.text,
+        &expression.span,
+        expression.braced,
+        expression.quoted,
+    );
+    write_expr(out, indent + 1, &expression.root);
+}
+
+fn write_expression_header(
+    out: &mut Out,
+    indent: usize,
+    text: &str,
+    span: &SourceSpan,
+    braced: bool,
+    quoted: bool,
+) {
     out.line(
         indent,
         format!(
             "expression braced={}{} text={} span={}",
-            expression.braced,
-            if expression.quoted {
-                " quoted=true"
-            } else {
-                ""
-            },
-            quote(&expression.text),
-            Ctx::span(&expression.span)
+            braced,
+            if quoted { " quoted=true" } else { "" },
+            quote(text),
+            Ctx::span(span)
         ),
     );
-    write_expr(out, indent + 1, &expression.root);
 }
 
 fn write_expr(out: &mut Out, indent: usize, expr: &Expr) {
