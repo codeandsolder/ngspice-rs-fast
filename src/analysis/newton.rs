@@ -539,20 +539,51 @@ impl<T> LoadStorage<T> {
     }
 
     /// Check the assembled system and fold duplicates before factorization.
-    fn checked_system(&mut self, n: usize) -> SpiceResult<(&mut SparseMatrix, &Vector)> {
+    fn checked_system(&mut self, n: usize) -> SpiceResult<CheckedSystem<'_>> {
         let matrix = self
             .matrix
             .as_mut()
             .ok_or_else(|| failure("Newton load returned no matrix"))?;
-        let rhs = if self.correction.active {
-            self.correction.rhs.as_ref()
+        let (rhs, original) = if self.correction.active {
+            (
+                self.correction.rhs.as_ref(),
+                Some(&mut self.correction.entries),
+            )
         } else {
-            self.rhs.as_ref()
-        }
-        .ok_or_else(|| failure("Newton load returned no RHS"))?;
+            (self.rhs.as_ref(), None)
+        };
+        let rhs = rhs.ok_or_else(|| failure("Newton load returned no RHS"))?;
         check(matrix, rhs, n)?;
         matrix.fold_duplicates();
-        Ok((matrix, rhs))
+        Ok(CheckedSystem {
+            matrix,
+            rhs,
+            original,
+        })
+    }
+}
+
+struct CheckedSystem<'a> {
+    matrix: &'a mut SparseMatrix,
+    rhs: &'a Vector,
+    original: Option<&'a mut crate::maths::linear::OriginalStamps>,
+}
+
+impl CheckedSystem<'_> {
+    fn solve(
+        &mut self,
+        ordering: &mut Option<crate::maths::SparseSymbolic>,
+        reorder: bool,
+        diag_gmin: Real,
+    ) -> SpiceResult<crate::maths::NiStep> {
+        crate::maths::linear::solve_ni_with_original(
+            self.matrix,
+            self.rhs,
+            ordering,
+            reorder,
+            diag_gmin,
+            self.original.as_deref_mut(),
+        )
     }
 }
 
@@ -575,7 +606,7 @@ struct CorrectionWorkspace {
     enabled: bool,
     active: bool,
     unfolded: Option<SparseMatrix>,
-    entries: Vec<(usize, usize, Real)>,
+    entries: crate::maths::linear::OriginalStamps,
     rhs: Option<Vector>,
 }
 
@@ -883,11 +914,11 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         let incremental = storage.correction.begin_iteration(iterno);
         let mut trial = load(&guess, phase, previous.as_ref(), storage)?;
         let flagged = (phases.nonconvergent)(&trial);
-        let (matrix, rhs) = storage.checked_system(n)?;
+        let mut system = storage.checked_system(n)?;
         if phase == IterationPhase::Junction {
             reorder = true;
         }
-        let mut next = match linearised_solve(matrix, rhs, &mut ordering, reorder, options)? {
+        let mut next = match system.solve(&mut ordering, reorder, options.diag_gmin)? {
             crate::maths::NiStep::Solved(next) => {
                 reorder = false;
                 next
@@ -915,7 +946,7 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
                 options.voltage_step,
             );
         }
-        reconstruct_storage(matrix, rhs, &mut next, phases.private_storage)?;
+        reconstruct_storage(system.matrix, system.rhs, &mut next, phases.private_storage)?;
         if !next.is_finite() {
             return Err(failure("nonfinite Newton iterate"));
         }
@@ -1029,18 +1060,7 @@ fn reconstruct_storage(
     Ok(())
 }
 
-/// One `NIiter` factor-and-solve on the raw matrix ([`crate::maths::solve_ni`]):
-/// there is no row equilibration or conditioning guard; ngspice has neither.
-fn linearised_solve(
-    matrix: &SparseMatrix,
-    rhs: &Vector,
-    ordering: &mut Option<crate::maths::SparseSymbolic>,
-    reorder: bool,
-    options: &NewtonOptions,
-) -> SpiceResult<crate::maths::NiStep> {
-    crate::maths::solve_ni(matrix, rhs, ordering, reorder, options.diag_gmin)
-}
-
+/// Reject invalid dimensions or nonfinite right-hand sides before factorization.
 fn check(matrix: &SparseMatrix, rhs: &Vector, n: usize) -> SpiceResult<()> {
     if matrix.rows() != n || matrix.cols() != n || rhs.len() != n || !rhs.is_finite() {
         return Err(failure("invalid Newton load dimensions or nonfinite RHS"));
