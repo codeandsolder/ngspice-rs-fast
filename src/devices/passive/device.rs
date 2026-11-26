@@ -22,9 +22,16 @@ struct ModelPassive {
     literal_noise: Option<Box<ResistorNoise>>,
     terminals: [NodeId; 2],
     parameters: PassiveParameters,
+    bias: Option<Box<crate::devices::passive_bias::PassiveInitialization>>,
 }
 
 impl ModelPassive {
+    fn initial_condition(&self) -> Option<Real> {
+        crate::devices::passive_bias::initial_value(
+            self.bias.as_deref(),
+            self.parameters.initial_condition(),
+        )
+    }
     const fn storage_kind(&self) -> Option<StorageKind> {
         match self.parameters.kind {
             PassiveKind::Capacitor => Some(StorageKind::Capacitor),
@@ -37,11 +44,27 @@ impl ModelPassive {
             name: &self.name,
             terminals: self.terminals,
             value,
-            initial: self.parameters.initial_condition(),
+            initial: self.initial_condition(),
+            bias: self.bias.as_deref(),
         }
     }
 }
 impl Device for ModelPassive {
+    fn bind_passive_initialization(
+        &mut self,
+        policy: crate::devices::passive_bias::PassiveInitialization,
+    ) -> SpiceResult<()> {
+        policy.check_kind(self.storage_kind().ok_or_else(|| {
+            SpiceError::circuit("prepared initialization requires reactive storage")
+        })?)?;
+        self.bias = Some(Box::new(policy));
+        Ok(())
+    }
+
+    fn has_passive_bias(&self) -> bool {
+        crate::devices::passive_bias::has_constraints(self.bias.as_deref())
+    }
+
     fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
         match self.parameters.kind {
             PassiveKind::Resistor => self
@@ -63,6 +86,9 @@ impl Device for ModelPassive {
         match self.parameters.kind {
             PassiveKind::Resistor | PassiveKind::Capacitor => {
                 setup.conductance(positive, negative);
+                if crate::devices::passive_bias::needs_branch(self.bias.as_deref()) {
+                    setup.inductor(positive, negative, setup.branch(0)?);
+                }
             }
             PassiveKind::Inductor => {
                 let branch = setup.branch(0)?;
@@ -166,7 +192,17 @@ impl Device for ModelPassive {
         &self.terminals
     }
     fn branch_currents(&self) -> usize {
-        usize::from(self.parameters.kind == PassiveKind::Inductor)
+        usize::from(
+            self.parameters.kind == PassiveKind::Inductor
+                || crate::devices::passive_bias::needs_branch(self.bias.as_deref()),
+        )
+    }
+    fn branch_quantity(&self, _branch: usize) -> crate::devices::BranchQuantity {
+        if self.parameters.kind == PassiveKind::Capacitor {
+            crate::devices::BranchQuantity::BiasCurrent
+        } else {
+            crate::devices::BranchQuantity::Current
+        }
     }
     fn expression_current_branch(&self) -> Option<usize> {
         (self.parameters.kind == PassiveKind::Inductor).then_some(0)
@@ -192,7 +228,7 @@ impl Device for ModelPassive {
                 .map(|value| StorageElement {
                     kind,
                     value,
-                    initial: self.parameters.initial_condition(),
+                    initial: self.initial_condition(),
                 }),
         )
     }
@@ -244,12 +280,15 @@ impl Device for ModelPassive {
             ),
             PassiveKind::Capacitor => {
                 let value = p.checked_scaled(context.model_context)?;
-                context.system.has_initial_conditions |= p.initial_condition.is_some();
+                context.system.has_initial_conditions |= self.initial_condition().is_some();
+                if let Some(bias) = &self.bias {
+                    bias.release_capacitor(context)?;
+                }
                 assemble_capacitor_ac(self.terminals, value, p.multiplicity, context)
             }
             PassiveKind::Inductor => {
                 let value = p.checked_scaled(context.model_context)?;
-                context.system.has_initial_conditions |= p.initial_condition.is_some();
+                context.system.has_initial_conditions |= self.initial_condition().is_some();
                 assemble_inductor_ac(self.terminals, value, p.multiplicity, context)
             }
         }
@@ -307,7 +346,7 @@ impl Device for ModelPassive {
             Ok(InductanceValue {
                 effective: self.parameters.effective_value(context)?,
                 coupling_base: self.parameters.coupling_value(context)?,
-                initial: self.parameters.initial_condition().unwrap_or(0.),
+                initial: self.initial_condition().unwrap_or(0.),
             })
         })
     }
@@ -366,6 +405,7 @@ impl Device for ModelPassive {
                     self.terminals,
                     inputs,
                     context,
+                    crate::devices::passive_bias::needs_branch(self.bias.as_deref()),
                 )))
             }
         }
@@ -396,6 +436,7 @@ pub(in crate::devices) fn instantiate(
         name: instance.name.clone(),
         model: Some(model.card().name.clone()),
         literal_noise: None,
+        bias: None,
         terminals,
         parameters,
     };
@@ -416,6 +457,7 @@ pub(in crate::devices) fn swept_literal(
         name: name.to_owned(),
         model: None,
         literal_noise: None,
+        bias: None,
         terminals,
         parameters: PassiveParameters::literal(kind, value, ic)?
             .swept(change.0, change.1, context)?,
@@ -442,6 +484,7 @@ pub(in crate::devices) fn swept_resistor(
         name: resistor.name().to_owned(),
         model: None,
         literal_noise: Some(Box::new(noise)),
+        bias: None,
         terminals: [*positive, *negative],
         parameters: PassiveParameters::literal(PassiveKind::Resistor, resistor.resistance(), None)?
             .swept(change.0, change.1, context)?,

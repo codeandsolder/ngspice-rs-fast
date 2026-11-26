@@ -127,6 +127,7 @@ pub(super) fn assemble(
     let scope = scope(cards, &mut cursor, auto_gnd, &models, None, 0, scripted)?;
     Ok(ParsedDeck {
         netlist: Netlist {
+            prepared_initialization: None,
             title: deck.title.clone(),
             path: deck.path.clone(),
             location: deck.title_location.clone(),

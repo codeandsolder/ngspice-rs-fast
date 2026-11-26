@@ -131,6 +131,7 @@ semantic_leaves!(
     u32,
     Real,
     PathBuf,
+    crate::netlist::prepared_initialization::PreparedInitialConditions,
     AnalysisKind,
     SourceFunction,
     crate::netlist::ast::StochasticFunction,
@@ -212,7 +213,7 @@ macro_rules! semantic_struct {
 
 // Scope order is compared first, including structural terminators and
 // indexes, then the typed payload vectors in stable diagnostic order.
-semantic_struct!(Netlist { title, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets } ignore { path, location });
+semantic_struct!(Netlist { title, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets, prepared_initialization } ignore { path, location });
 semantic_struct!(Subcircuit { name, terminals, parameters, cards, devices, models, subcircuits, analyses, includes, params, functions, options, globals, initial_conditions, nodesets, output, measurements, fourier } ignore { end_location, location });
 semantic_struct!(DeviceInstance { name, designator, nodes, model, parameters } ignore { location });
 semantic_struct!(ModelCard { name, base, level, parameters } ignore { location });

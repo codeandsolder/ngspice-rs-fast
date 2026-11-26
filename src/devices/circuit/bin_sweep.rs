@@ -4,7 +4,9 @@
 
 use super::{CandidateNumericOverride, Circuit, ModelContext};
 use crate::devices::models::ModelResolver;
+use crate::devices::prepared_waveform::PreparedForcing;
 use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment, ParameterKind};
+use crate::netlist::prepared_initialization::BoundInitializations;
 use crate::primitives::{NodeTable, Real, SpiceError, SpiceResult};
 use std::collections::BTreeMap;
 
@@ -17,6 +19,8 @@ pub(crate) struct BinnedDeck {
     models: Vec<ModelCard>,
     binned: BTreeMap<String, usize>,
     noise_analysis: bool,
+    prepared_initialization: BoundInitializations,
+    prepared_waveforms: Vec<(String, PreparedForcing)>,
 }
 
 #[derive(Clone, Copy)]
@@ -36,6 +40,8 @@ impl BinnedDeck {
         models: &[ModelCard],
         resolver: &ModelResolver<'_>,
         noise_analysis: bool,
+        prepared_initialization: &BoundInitializations,
+        prepared_waveforms: &[(String, PreparedForcing)],
     ) -> Option<Self> {
         let binned: BTreeMap<_, _> = devices
             .iter()
@@ -57,6 +63,8 @@ impl BinnedDeck {
             models: models.to_vec(),
             binned,
             noise_analysis,
+            prepared_initialization: prepared_initialization.clone(),
+            prepared_waveforms: prepared_waveforms.to_vec(),
         })
     }
 
@@ -280,6 +288,8 @@ impl BinnedDeck {
             ..Circuit::default()
         };
         circuit.add_instances(&devices, resolver, &setup)?;
+        circuit.apply_prepared_waveforms(self.prepared_waveforms.clone())?;
+        circuit.apply_prepared_initializations(self.prepared_initialization.clone())?;
         circuit.add_topology_shunts(setup.shunts)?;
         circuit.finalize()?;
         circuit.prepared_mutual_terms(&setup)?;

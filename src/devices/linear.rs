@@ -1101,6 +1101,7 @@ mod tests {
         let baseline = Waveform::Prepared(
             super::super::prepared_waveform::PreparedForcing::new(ResolvedWaveform {
                 dc: 3.,
+                startup: 3.,
                 forcing: Forcing::PiecewiseLinear {
                     knots: vec![
                         Knot {

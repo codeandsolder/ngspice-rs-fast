@@ -86,6 +86,8 @@ impl Default for SubcircuitLimits {
 /// A deck with every `X` instance replaced by its definition's body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpandedNetlist {
+    /// Source-prepared, occurrence-bound passive initialization equations.
+    pub prepared_initialization: crate::netlist::prepared_initialization::BoundInitializations,
     /// Top-level devices in deck order, `X` instances expanded in place.
     pub devices: Vec<DeviceInstance>,
     /// Explicit prepared forcing resolved in each flattened instance scope.
@@ -205,11 +207,14 @@ fn expand_with_prepared_output(
     if netlist.cards.is_empty() {
         hoisted_fourier.extend_from_slice(fourier);
     }
+    let mut budget = EvalBudget::default();
+    let binder = crate::netlist::prepared_initialization::Binder::new(netlist, root, &mut budget)?;
     let mut expander = Expander {
+        binder,
         netlist,
         definitions,
         limits,
-        budget: EvalBudget::default(),
+        budget,
         devices: Vec::new(),
         waveforms,
         prepared_waveforms: Vec::new(),
@@ -232,6 +237,7 @@ fn expand_with_prepared_output(
     };
     let mut locals = vec![expander.root_models()];
     let directives = Directives {
+        lexical_scope: &[],
         devices: &netlist.devices,
         definition: "",
         sequence: &sequence,
@@ -246,6 +252,9 @@ fn expand_with_prepared_output(
         &expander.binned_bases,
     )?;
     Ok(ExpandedNetlist {
+        prepared_initialization: expander
+            .binder
+            .map_or_else(Default::default, |binder| binder.bound),
         devices: expander.devices,
         prepared_waveforms: expander.prepared_waveforms,
         models: expander.models,
@@ -356,6 +365,9 @@ struct Frontend {
 }
 
 struct Directives<'a> {
+    /// Declaration identity, not the chain of invoking X instances. The
+    /// current native definition index contains root lexical definitions.
+    lexical_scope: &'a [String],
     devices: &'a [DeviceInstance],
     definition: &'a str,
     sequence: &'a [ExpansionItem<'a>],
@@ -465,6 +477,7 @@ struct DefinitionPlan<'a> {
 }
 
 struct Expander<'a> {
+    binder: Option<crate::netlist::prepared_initialization::Binder<'a>>,
     netlist: &'a Netlist,
     definitions: BTreeMap<String, &'a Subcircuit>,
     limits: SubcircuitLimits,
@@ -814,6 +827,14 @@ impl<'a> Expander<'a> {
         locals: &mut Vec<DeclarationIndex<LocalModel>>,
         directives: &Directives<'_>,
     ) -> SpiceResult<()> {
+        if let Some(binder) = &mut self.binder {
+            binder.nodes(
+                directives.lexical_scope,
+                scope,
+                |node| rewrite_node(&self.global_nodes, node, terminals, path),
+                &mut self.budget,
+            )?;
+        }
         let devices = directives.devices;
         for &item in directives.sequence {
             let index = match item {
@@ -901,6 +922,15 @@ impl<'a> Expander<'a> {
             }
             instance.name = device_name(&instance.name, instance.designator, path);
             self.bind_prepared_waveform(original, directives.definition, &instance, scope)?;
+            if let Some(binder) = &mut self.binder {
+                binder.device(
+                    original,
+                    &instance.name,
+                    directives.lexical_scope,
+                    scope,
+                    &mut self.budget,
+                )?;
+            }
             self.devices.push(instance);
         }
         Ok(())
@@ -1010,6 +1040,7 @@ impl<'a> Expander<'a> {
             &scope,
             locals,
             &Directives {
+                lexical_scope: std::slice::from_ref(&definition.name),
                 devices: &body.devices,
                 definition: &definition.name,
                 sequence: &plan.sequence,
@@ -1126,16 +1157,7 @@ impl<'a> Expander<'a> {
     /// terminal is replaced by the actual node it was bound to; anything else is
     /// prefixed with the instance path.
     fn rewrite_node(&self, name: &str, terminals: &BTreeMap<String, String>, path: &str) -> String {
-        if self.global_nodes.contains(&name.to_ascii_lowercase()) {
-            return name.to_owned();
-        }
-        if let Some(actual) = terminals.get(name) {
-            return actual.clone();
-        }
-        if path.is_empty() {
-            return name.to_owned();
-        }
-        format!("{path}.{name}")
+        rewrite_node(&self.global_nodes, name, terminals, path)
     }
 
     /// Rewrite one model reference to the flattened name of the declaration it
@@ -1192,6 +1214,24 @@ impl<'a> Expander<'a> {
         }
         Some(base)
     }
+}
+
+fn rewrite_node(
+    global_nodes: &BTreeSet<String>,
+    name: &str,
+    terminals: &BTreeMap<String, String>,
+    path: &str,
+) -> String {
+    if global_nodes.contains(&name.to_ascii_lowercase()) {
+        return name.to_owned();
+    }
+    if let Some(actual) = terminals.get(name) {
+        return actual.clone();
+    }
+    if path.is_empty() {
+        return name.to_owned();
+    }
+    format!("{path}.{name}")
 }
 
 /// `translate_inst_name`: the designator prefix is not repeated for an `X`.
