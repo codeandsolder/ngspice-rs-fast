@@ -366,7 +366,7 @@ mod tests {
                 let point = law.evaluate(conductance, bias, false)?;
                 let expected = values[i + 2];
                 assert!(
-                    (point.current - expected).abs() < 3e-13 + 5e-9 * expected.abs(),
+                    (point.current - expected).abs() < 5e-9_f64.mul_add(expected.abs(), 3e-13),
                     "row {index}, law {law:?}: {:?} != {expected}",
                     point.current
                 );
@@ -406,7 +406,8 @@ mod tests {
                 false,
             )?;
             assert!(
-                (-point.small_signal.control - expected).abs() < 1e-14 + 1e-10 * expected.abs()
+                (-point.small_signal.control - expected).abs()
+                    < 1e-10_f64.mul_add(expected.abs(), 1e-14)
             );
         }
         Ok(())
@@ -509,7 +510,7 @@ mod tests {
                     false,
                 )?;
                 assert!(
-                    (point.current - expected).abs() < 3e-13 + 5e-9 * expected.abs(),
+                    (point.current - expected).abs() < 5e-9_f64.mul_add(expected.abs(), 3e-13),
                     "conductance {}, voltage {voltage}: {} != {expected}",
                     p.on,
                     point.current
@@ -618,11 +619,11 @@ mod tests {
                     let dc =
                         (i(voltage, control + step)? - i(voltage, control - step)?) / (2. * step);
                     assert!(
-                        (dv - point.jacobian.voltage).abs() < 1e-9 + 1e-7 * dv.abs(),
+                        (dv - point.jacobian.voltage).abs() < 1e-7_f64.mul_add(dv.abs(), 1e-9),
                         "{law:?} {bias:?} {dv} {point:?}"
                     );
                     assert!(
-                        (dc - point.jacobian.control).abs() < 1e-9 + 1e-7 * dc.abs(),
+                        (dc - point.jacobian.control).abs() < 1e-7_f64.mul_add(dc.abs(), 1e-9),
                         "{law:?} {bias:?} {dc} {point:?}"
                     );
                 }
