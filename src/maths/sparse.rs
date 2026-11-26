@@ -1269,6 +1269,35 @@ impl SparseMatrix {
         }
     }
 
+    /// Preserve the learned structural zero positions in an otherwise empty
+    /// unfolded assembly. The correction-coordinate Newton path must see the
+    /// same branch columns as a bound load when forcing node rows, while
+    /// retaining each subsequent numeric stamp separately.
+    ///
+    /// # Errors
+    /// The assembly is not empty/unbound, its dimensions do not match the
+    /// pattern, or structural storage cannot be allocated.
+    pub(crate) fn seed_unfolded_structure(&mut self, pattern: &Pattern) -> SpiceResult<()> {
+        if self.bound.is_some()
+            || !self.triplets.is_empty()
+            || self.rows != pattern.order()
+            || self.cols != pattern.order()
+        {
+            return Err(pattern_error(
+                "unfolded structure requires an empty matching matrix",
+            ));
+        }
+        reserve(&mut self.triplets, pattern.len())?;
+        self.triplets
+            .extend(pattern.positions().map(|(row, col)| Triplet {
+                row,
+                col,
+                value: 0.,
+            }));
+        self.folded = false;
+        Ok(())
+    }
+
     /// The stored contributions. For a bound matrix: the folded nonzero
     /// elements in row-major order, merged with any overflow.
     #[must_use = "the returned slice supplies the stored contributions for sparse traversal"]
@@ -1560,6 +1589,17 @@ mod tests {
                 index
             );
         }
+    }
+
+    #[test]
+    fn unfolded_structure_preserves_zero_branch_columns_during_forcing() {
+        let pattern = Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap();
+        let mut raw = SparseMatrix::new(2, 2);
+        raw.seed_unfolded_structure(&pattern).unwrap();
+        raw.add(0, 0, 1.).unwrap();
+        assert!(raw.zero_row(0, |column| column == 1));
+        assert_eq!(raw.get(0, 0), 0.);
+        assert!(raw.seed_unfolded_structure(&pattern).is_err());
     }
 
     #[test]

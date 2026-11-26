@@ -372,13 +372,79 @@ fn diode_chain(n: usize) -> String {
     body
 }
 
-/// Long diode chains once failed `.op` where C converges (M10 0.5h). The
-/// expected strategies, Newton totals (`rusage all`: "Total iterations") and
-/// values are those of C ngspice built without FMA contraction, which the port
-/// reproduces bit for bit. The default (FMA) C build differs from these values
-/// at Newton-tolerance level only: the chain current is below ABSTOL.
+/// Independent series-circuit solution: every junction has the same voltage
+/// and every resistor the same current. Solve the scalar total-voltage law
+/// without using the simulator's device, matrix or continuation code.
+fn chain_root(stages: u32) -> (f64, f64) {
+    let stages = f64::from(stages);
+    let resistance = 100_f64.mul_add(stages, 1000.);
+    let current = |junction: f64| 1e-14_f64.mul_add((junction / VT).exp_m1(), 1e-12 * junction);
+    let (mut low, mut high) = (0_f64, 5. / stages);
+    for _ in 0..64 {
+        let junction = low.midpoint(high);
+        if resistance.mul_add(current(junction), stages * junction) > 5. {
+            high = junction;
+        } else {
+            low = junction;
+        }
+    }
+    let junction = low.midpoint(high);
+    (junction, current(junction))
+}
+
+/// Check the complete voltage profile and the unmodified electrical KCL.
+/// Absolute local residuals are much smaller than the default ABSTOL; the
+/// near-open-circuit chain nevertheless amplifies tiny numerical differences.
+fn assert_chain_physics(
+    plot: &Plot,
+    stages: u32,
+    profile_bound: f64,
+    relative_current_bound: f64,
+    kcl_bound: f64,
+) {
+    let (junction, current) = chain_root(stages);
+    let mut max_profile_error: f64 = 0.;
+    let mut max_kcl_error: f64 = 0.;
+    let mut incoming = -value(plot, "i(v1)");
+    assert!((incoming - current).abs() <= relative_current_bound * current);
+    for i in 0..stages {
+        let node = value(plot, &format!("v(n{i})"));
+        let middle = value(plot, &format!("v(m{i})"));
+        let next = value(plot, &format!("v(n{})", i + 1));
+        let resistor = (node - middle) / 100.;
+        let vd = middle - next;
+        // This entire reference circuit is forward biased.
+        assert!(vd > 0.);
+        let diode = 1e-14_f64.mul_add((vd / VT).exp_m1(), 1e-12 * vd);
+        max_kcl_error = max_kcl_error.max((incoming - resistor).abs());
+        max_kcl_error = max_kcl_error.max((resistor - diode).abs());
+        incoming = diode;
+        let expected =
+            f64::from(stages - i).mul_add(100_f64.mul_add(current, junction), 1000. * current);
+        max_profile_error = max_profile_error.max((node - expected).abs());
+        max_profile_error =
+            max_profile_error.max((middle - (-100_f64).mul_add(current, expected)).abs());
+    }
+    let last = value(plot, &format!("v(n{stages})"));
+    let load_current = last / 1000.;
+    max_profile_error = max_profile_error.max((-1000_f64).mul_add(current, last).abs());
+    max_kcl_error = max_kcl_error.max((incoming - load_current).abs());
+    assert!((load_current - current).abs() <= relative_current_bound * current);
+    assert!(
+        max_kcl_error <= kcl_bound,
+        "{stages} stages: KCL {max_kcl_error:e}"
+    );
+    assert!(
+        max_profile_error <= profile_bound,
+        "{stages} stages: profile {max_profile_error:e}"
+    );
+}
+
+/// Long diode chains once failed `.op` where C converges (M10 0.5h).
+/// Preserve the continuation mechanisms, independently check every physical
+/// node, and compare the accuracy against live C SPARSE reference evidence.
 #[test]
-fn long_diode_chains_take_the_c_continuation_path() {
+fn long_diode_chains_solve_the_original_equations() {
     // 100 stages: C's direct Newton converges in 7 iterations.
     let body = diode_chain(100);
     let (solution, report) = solve(&body, &[]);
@@ -388,53 +454,54 @@ fn long_diode_chains_take_the_c_continuation_path() {
         [(DcStrategy::Direct, AttemptOutcome::Converged)]
     );
     assert_eq!(report.total_iterations, 7);
+    assert_original_equations_solved(&report);
     let plot = operating_point(&body);
-    assert_eq!(value(&plot, "v(n1)"), 4.950001782213789);
-    assert_eq!(value(&plot, "v(n100)"), 1.0911436345166466e-10);
-    assert_eq!(value(&plot, "i(v1)"), -1.0909328995722944e-13);
+    // Live C 47: maximum profile error 50.873 uV; conditioned Rust
+    // junction arithmetic: 54.661 uV. Compare against the physical root.
+    assert_chain_physics(&plot, 100, 6e-5, 1e-3, 3e-17);
 
-    // 1000 stages: direct Newton exhausts ITL1, dynamic gmin stepping
-    // converges ("Note: Dynamic gmin stepping completed"), 216 in total.
+    // C exhausted direct Newton at 1000 stages and then converged by
+    // dynamic nodal gmin (216 iterations on the original oracle, 229 on
+    // Linux). The correction-coordinate solver recovers the direct
+    // route without changing device equations or convergence tolerances.
     let body = diode_chain(1000);
     let (solution, report) = solve(&body, &[]);
     solution.unwrap();
     assert_eq!(
         attempts(&report),
+        [(DcStrategy::Direct, AttemptOutcome::Converged)]
+    );
+    assert_original_equations_solved(&report);
+    assert!(report.total_iterations <= 32, "{report:?}");
+    let plot = operating_point(&body);
+    // The independently measured correction-coordinate result has
+    // 0.496 uV maximum profile error and 3.24e-7 relative terminal error,
+    // versus 13.850 mV and 1.37% for C 47.
+    assert_chain_physics(&plot, 1000, 1e-5, 1e-4, 3e-17);
+
+    // Independently exercise nodal continuation even if the default
+    // direct solve succeeds. NOOPITER is C's explicit strategy control.
+    let (solution, report) = solve(&body, &["noopiter=1"]);
+    solution.unwrap();
+    assert_eq!(
+        attempts(&report),
         [
-            (DcStrategy::Direct, AttemptOutcome::Failed),
+            (DcStrategy::Direct, AttemptOutcome::Disabled),
             (DcStrategy::GminStepping, AttemptOutcome::Converged),
         ]
     );
     assert_original_equations_solved(&report);
-    let plot = operating_point(&body);
-    let expected = [
-        ("v(n1)", 4.9949340993026805),
-        ("v(n1000)", 7.145072049497449e-12),
-        ("i(v1)", -7.230327447871332e-15),
-    ];
-    if C_ORACLE_LIBM {
-        assert_eq!(report.total_iterations, 216);
-        for (name, c) in expected {
-            assert_eq!(value(&plot, name), c, "{name}");
-        }
-    } else {
-        // Another libm rounds exp/ln differently in the last bit, which moves
-        // this rounding-sensitive chain's Newton path (glibc: 229
-        // iterations) as FMA contraction moves C's: the point agrees to the
-        // Newton tolerances (reltol 1e-3, vntol 1e-6 V, abstol 1e-12 A).
-        for (name, c) in expected {
-            let v = value(&plot, name);
-            let bound = if name.starts_with("i(") {
-                1e-12
-            } else {
-                1e-3 * c.abs() + 1e-6
-            };
-            assert!((v - c).abs() <= bound, "{name}: {v:e} vs C {c:e}");
-        }
-    }
+    assert!(report.total_iterations <= 128, "{report:?}");
+    let forced = operating_point(&format!("{body}\n.options noopiter"));
+    // Forced recovery has 84.3 uV maximum profile error and 1.26e-5
+    // relative terminal error; retain a strict local KCL check as well.
+    assert_chain_physics(&forced, 1000, 2e-4, 1e-4, 1e-16);
 }
 
-/// Whether this target's libm is the one the C oracle values above were
-/// captured with (macOS arm64): only then are bit-exact Newton paths of
-/// rounding-sensitive decks expected.
-const C_ORACLE_LIBM: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+#[test]
+fn longer_diode_chains_recover_without_transient_fallback() {
+    for (stages, profile_bound) in [(2000_u32, 2e-5), (5000, 2e-4)] {
+        let plot = operating_point(&diode_chain(stages as usize));
+        assert_chain_physics(&plot, stages, profile_bound, 2e-4, 3e-17);
+    }
+}
