@@ -1,0 +1,19 @@
+Initial threshold state
+.options gmin=1e-12 reltol=1e-10 abstol=1e-15
+Vc c 0 0
+V1 a 0 1
+V2 b 0 1
+V3 d 0 1
+V4 e 0 1
+V5 f 0 1
+V6 h 0 1
+S1 a 0 c 0 m0
+S2 b 0 c 0 m0 on
+S3 d 0 c 0 m0 off
+S4 e 0 c 0 m1
+S5 f 0 c 0 m1 on
+S6 h 0 c 0 m1 off
+.model m0 SW(ron=1 roff=1meg vt=0 vh=0)
+.model m1 SW(ron=1 roff=1meg vt=0 vh=1)
+.op
+.end

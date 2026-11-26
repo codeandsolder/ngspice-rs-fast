@@ -2634,6 +2634,31 @@ impl Circuit {
         Ok(())
     }
 
+    /// Mix the accepted reference state with converged trial slots of devices
+    /// whose explicit constitutive law uses the solved bias instead.
+    pub(crate) fn bias_small_signal_snapshot(
+        &self,
+        trial: &TrialState,
+    ) -> SpiceResult<StateSnapshot> {
+        let history = self.state_history()?;
+        let mut values = history
+            .accepted(1)
+            .map_or_else(|| vec![0.; history.len()], <[Real]>::to_vec);
+        for (index, device) in self.devices.iter().enumerate() {
+            if device.small_signal_uses_trial_state() {
+                let range = self.bindings.state_rows[index].clone();
+                let source = trial
+                    .slice(range.clone())
+                    .ok_or_else(|| SpiceError::circuit("missing solved device state"))?;
+                values
+                    .get_mut(range)
+                    .ok_or_else(|| SpiceError::circuit("invalid small-signal device state"))?
+                    .copy_from_slice(source);
+            }
+        }
+        self.bind_state(values)
+    }
+
     /// Keeps the final accepted transient load's device state for later
     /// analyses (`dctran.c`: instance fields outlive the transient). Called
     /// only after the whole transient succeeds, never on a rejected trial.
@@ -4624,12 +4649,6 @@ impl Circuit {
         scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
     ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
-        if !netlist.includes.is_empty() {
-            return Err(SpiceError::Unsupported {
-                feature: "includes in linear elaboration".into(),
-                location: None,
-            });
-        }
         // The nonlinear E/G/F/H forms become B sources and generated XSPICE
         // instances first, as inpcom.c rewrites them before numparam and
         // subcircuit expansion (#79).

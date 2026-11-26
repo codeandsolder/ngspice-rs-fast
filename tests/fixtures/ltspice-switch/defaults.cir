@@ -1,0 +1,17 @@
+Default resistance and gmin
+.options gmin=1m reltol=1e-10 abstol=1e-15
+V1 a 0 1
+V2 b 0 1
+V3 d 0 1
+V4 e 0 1
+Vc c 0 -2
+S1 a 0 c 0 m1
+S2 b 0 c 0 m2
+S3 d 0 c 0 m3
+S4 e 0 c 0 m4
+.model m1 SW()
+.model m2 SW(roff=1k)
+.model m3 SW(ron=1 vh=-1)
+.model m4 SW(ron=1 vh=-1 level=2)
+.op
+.end

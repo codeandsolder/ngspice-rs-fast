@@ -1,0 +1,16 @@
+Discrete hysteresis descending
+.options gmin=1e-12 reltol=1e-10 abstol=1e-15
+Vc c 0 0
+V1 a 0 1
+V2 b 0 1
+V3 d 0 1
+V4 e 0 1
+S1 a 0 c 0 m1
+S2 b 0 c 0 m2 on
+S3 d 0 c 0 m1 off
+S4 e 0 c 0 m3
+.model m1 SW(ron=1 roff=1meg vt=0 vh=1)
+.model m2 SW(ron=1 roff=1meg vt=0 vh=1)
+.model m3 SW(ron=1 roff=1meg vt=0 vh=0)
+.dc Vc 2 -2 -.25
+.end

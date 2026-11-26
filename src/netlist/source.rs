@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult};
 
+pub mod admission;
 pub(super) mod budget;
+use admission::SourceAdmission;
 use budget::{SourceBudget, SourceLimits, copy_text};
 
 /// One physical line of a deck, with its 1-based line number.
@@ -255,23 +257,39 @@ pub fn load(path: impl AsRef<Path>) -> SpiceResult<Deck> {
     load_bounded(
         path.as_ref(),
         &mut SourceBudget::new(SourceLimits::default()),
+        None,
     )
 }
 
-pub(super) fn load_bounded(path: &Path, budget: &mut SourceBudget) -> SpiceResult<Deck> {
+pub(super) fn load_bounded(
+    path: &Path,
+    budget: &mut SourceBudget,
+    admission: Option<&SourceAdmission>,
+) -> SpiceResult<Deck> {
     let location = SourceLoc::new(path.to_path_buf(), 1, 1);
     budget.validate(&location)?;
     let remaining = budget.begin_file(&location)?;
-    let text = read_text(path, remaining, &location)?;
-    budget.bytes(text.len(), &location)?;
+    let (text, charged) = read_admitted(path, remaining, &location, admission)?;
+    budget.bytes(charged, &location)?;
     fold_bounded(path, &text, true, budget)
 }
 
-pub(super) fn read_text(
+pub(super) fn read_admitted(
     path: &Path,
     remaining: usize,
     location: &SourceLoc,
-) -> SpiceResult<String> {
+    admission: Option<&SourceAdmission>,
+) -> SpiceResult<(String, usize)> {
+    if let Some(admission) = admission {
+        admission.read(path, remaining, location)
+    } else {
+        let text = read_text(path, remaining, location)?;
+        let bytes = text.len();
+        Ok((text, bytes))
+    }
+}
+
+fn read_text(path: &Path, remaining: usize, location: &SourceLoc) -> SpiceResult<String> {
     let mut file = File::open(path).map_err(|error| SpiceError::io(path, &error))?;
     let mut bytes = Vec::new();
     let mut block = [0_u8; 8192];

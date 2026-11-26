@@ -1,0 +1,18 @@
+extra
+V1 a 0 0
+V2 c 0 0
+S1 a 0 c 0 m1
+S2 a 0 c 0 m2
+S3 a 0 c 0 m3
+S4 a 0 c 0 m4
+S5 a 0 c 0 m5
+S6 a 0 c 0 m6
+.model m1 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=2 Vser=-.5)
+.model m2 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=2 oneway Vser=-.5)
+.model m3 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=1 Vser=-.5)
+.model m4 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=1 oneway)
+.model m5 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=1 Vser=.5 epsilon=.2)
+.model m6 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=2 epsilon=.2)
+.options gmin=1e-9
+.dc V1 -1 1 .1 V2 -2 2 2
+.end

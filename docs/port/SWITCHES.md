@@ -168,3 +168,95 @@ operating point) and the opt-in `c_switches::ac_uses_cs_minitsmsig_state`.
   is ported for `.noise` (#100, [NOISE.md](NOISE.md)). Not ported:
   `@s1[i]`/`@s1[p]` queries (`swask.c`), C's `optran` fallback for operating
   points that do not converge.
+
+## Source-selected LTspice voltage switches (#229)
+
+The prepared model family `ltspice_switch` is distinct from native
+`sw` / `csw`. A source normalizer selects it explicitly on LTspice
+S-model declarations. There is no global dialect switch and the native
+signed-hysteresis state machine remains intact.
+
+| Parameter | Level 1 | Level 2 |
+| --- | --- | --- |
+| VT, VH | zero defaults; positive band retains accepted state, zero retains state at VT, on above and off below, negative is smooth | VT defaults zero, nonzero absolute VH required |
+| RON | 1 Ω | 1 Ω |
+| ROFF | 1/gmin | 10 MΩ |
+| ILIMIT | absent or zero means unlimited; symmetric hard clamp of absolute limit | absent or nonpositive means 10 A; tanh limiter |
+| VSER | signed series voltage, opposite direction uses off conductance | positive value enables one-way conduction, negative value alone has no effect |
+| ONEWAY, EPSILON | unsupported | conduction from second terminal to first; positive smoothing width (negative ignored) |
+| LSER | finite signed transient series inductance | unsupported |
+
+Resistances must be finite and positive; signed current limits follow the measured rules above.
+Level setters must be exactly 1 or 2; the last ordered setter selects
+the constitutive law (verified for alternating repeated setters). Unsupported nonzero options are
+diagnosed before elaboration rather than silently discarded.
+
+### Constitutive law and reference differences
+
+Let `g0=1/Roff`, `g1=1/Ron`, `x=(Vc-Vt)/abs(Vh)`.
+For level 1 with negative VH, interpolate **logarithmic** conductance
+using `u=clamp((x+1)/2,0,1)`, `f=u²(3-2u)` and
+`G=exp(log(g0)+f(log(g1)-log(g0)))`. For level 2 the interpolation
+fraction is `0.5+atan(x)/pi`. The actual level-2 branch current is
+`Ilimit*tanh(G*V/Ilimit)`; level 1 limits `G*V` abruptly. Parallel
+gmin is added after the limit. Level-1 VSER shifts the branch voltage
+(including the gmin term) and uses g0 on the nonconducting side;
+level-2 directional conduction instead leaves gmin unshifted.
+
+The one-way level-2 forward overdrive is `w=-(V+Vser)`, positive in
+the direction from the second terminal to the first. For positive
+epsilon, define `a=G*epsilon/Ilimit`. LTspice 24.0.12 computes
+the join argument with **ten Newton iterations**, starting at
+`j=a/2`, of `sinh(2*j)=a`. For `0<w<epsilon`, the current is
+`-Ilimit*tanh(j)*(w/epsilon)^2`; at and above the join it is
+`-Ilimit*tanh(G*(w-epsilon)/Ilimit+j)`. The join is differentiable
+in the converged limit, but the finite reference iteration count
+can produce a slope discontinuity for large a. The implementation
+retains this measured current law and its exact derivative for Newton.
+
+The AC load follows independent reference measurements rather than
+using the physical DC tangent indiscriminately:
+
+- Level 1 cubic control gain is 0.99 times its physical derivative
+  (verified over 81 independent AC biases spanning three resistance ratios,
+  three transition widths and both endpoints). The DC/transient Newton
+  derivative remains exact.
+- Level 1 hard current limiting uses the chord conductance
+  `Ilimit/abs(V_shifted)`, not the zero differential conductance.
+- Level 2 uses the differential voltage slope. For epsilon, the
+  AC control slope uses the implicit root derivative evaluated at
+  the ten-iteration join, whereas Newton differentiates the actual
+  iterations. Both use the same current law.
+- Discrete LTspice switches use the converged bias state, not the
+  native ngspice MODEINITSMSIG accepted-state convention.
+- Level 1 LSER uses the existing inductor companion (private
+  topology node, physical branch-current coordinate, two flux
+  history slots before any switch-state slots). Independent AC
+  measurements show that LTspice shorts LSER in AC. Its transient
+  flux and derivative remain available to physical DAE assembly. Negative
+  LSER is an active signed storage coefficient, verified by its growing RL
+  step response; native passive inductor validation is unchanged.
+- Thermal noise includes the reference small-signal conductance,
+  including gmin; the series inductor itself is noiseless.
+
+The nonlinear source-selected models explicitly refuse native
+`.sens` and `.disto` formulas that do not represent their physics.
+Reference AC/PZ use the same affine pencil. No discrete state is
+allocated for a memoryless smooth branch.
+
+### Evidence
+
+Independent public-law probes used LTspice 24.0.12, synthetic
+netlists, and its ASCII RAW output. The committed transfer deck
+and table contain 17 control samples for four modes (68 currents).
+The directional and offset tables cover 205 terminal/control
+points across seven variants and 63 points across six variants
+(1,813 additional current observations). The latter intentionally
+include source variants that LTspice warns about and ignores
+(level 1 ONEWAY/EPSILON); they establish the actual law, not support
+for those ignored options. The integration tests additionally
+check exact KCL/Jacobians against independent finite differences,
+two-terminal and control excitation AC, default Roff, measured
+noise, and transient RL and control-ramp behavior.
+
+Reference manual: [Voltage Controlled Switch](https://ltwiki.org/LTspiceHelpXVII/LTspiceHelp/html/S-device.htm).

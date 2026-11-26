@@ -111,7 +111,7 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Hfet2 => {
             crate::devices::hfet::hfet2::Hfet2::instantiate(instance, nodes, &model, context)
         }
-        ModelBackend::Switch | ModelBackend::CurrentSwitch => {
+        ModelBackend::Switch | ModelBackend::LtspiceSwitch | ModelBackend::CurrentSwitch => {
             crate::devices::switch::Switch::instantiate(instance, nodes, &model, context)
         }
         ModelBackend::RationalTransfer => {

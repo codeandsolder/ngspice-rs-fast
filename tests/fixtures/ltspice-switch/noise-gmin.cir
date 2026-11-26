@@ -1,0 +1,9 @@
+Noise gmin
+.options gmin=1m
+Vin in 0 dc 0 ac 1
+R1 in a 1
+Vc c 0 -2
+S1 a 0 c 0 m1
+.model m1 SW(Ron=.1 Roff=1k)
+.noise V(a) Vin dec 2 1k 10k
+.end

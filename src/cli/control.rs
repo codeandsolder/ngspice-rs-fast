@@ -24,7 +24,9 @@ use crate::netlist::eval::{EvalBudget, EvalLimits, ParamBinding, ParamScope};
 use crate::netlist::parser::{
     control_analysis, control_measure, control_options, parse_control_expression,
 };
-use crate::netlist::{DotCommand, ParameterExpression, Parser, RawCard, SourceLimits};
+use crate::netlist::{
+    DotCommand, ParameterExpression, Parser, RawCard, SourceAdmission, SourceLimits,
+};
 use crate::primitives::{AnalysisKind, Real, SourceLoc, SpiceError, SpiceResult};
 
 /// Independent work and storage bounds for one script invocation.
@@ -1337,8 +1339,25 @@ pub fn run_file(
     limits: ScriptLimits,
     output: &mut dyn Write,
 ) -> SpiceResult<ScriptReport> {
-    let parsed =
-        Parser::with_auto_gnd(auto_gnd).parse_control_file(path, SourceLimits::default())?;
+    run_file_with_admission(path, auto_gnd, limits, None, output)
+}
+
+/// Compile and execute a control deck with optional explicit source admission.
+///
+/// # Errors
+/// Admission, script parsing, compilation or execution failures.
+pub fn run_file_with_admission(
+    path: &Path,
+    auto_gnd: bool,
+    limits: ScriptLimits,
+    admission: Option<&SourceAdmission>,
+    output: &mut dyn Write,
+) -> SpiceResult<ScriptReport> {
+    let parsed = Parser::with_auto_gnd(auto_gnd).parse_control_file_with_admission(
+        path,
+        SourceLimits::default(),
+        admission,
+    )?;
     let program = Program::compile(&parsed.netlist, auto_gnd)?;
     let tunables: Vec<_> = program.tunables.iter().map(String::as_str).collect();
     let analyses = parsed.netlist.analyses.clone();
