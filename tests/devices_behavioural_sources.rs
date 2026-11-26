@@ -807,7 +807,10 @@ fn explicit_caret_and_complex_real_powers_are_distinct() {
     assert!((result.value / 1e-154 - 1.).abs() < 1e-12);
     assert!((result.gradient[0] / 5e99 - 1.).abs() < 1e-12);
     assert_gradient("simetrix_pow(v(a),v(b))", POINTS);
-    assert_gradient("simetrix_caret_pow(v(a),v(b))", &[&[("a", 0.3), ("b", -0.7)]]);
+    assert_gradient(
+        "simetrix_caret_pow(v(a),v(b))",
+        &[&[("a", 0.3), ("b", -0.7)]],
+    );
     // Native compatibility policy remains selected by native spellings.
     assert_eq!(value("pow(0,0)", &[]), 0.);
     assert_eq!(value("pwr(-2,3)", &[]), -8.);
