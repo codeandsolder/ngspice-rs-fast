@@ -74,7 +74,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use crate::netlist::ast::{FuncCard, Netlist, ParamCard};
 use crate::netlist::expr::{
     BinaryOp, EXCLUDED_FUNCTIONS, Expr, ExprKind, Function, FunctionBody, ParameterExpression,
-    SourceSpan, UnaryOp,
+    SourceSpan,
 };
 
 /// C reference used in diagnostics.
@@ -1617,16 +1617,12 @@ fn eval(
         ExprKind::Group(inner) => eval(inner, root, env, budget, depth + 1),
         ExprKind::Unary { op, operand } => {
             let v = eval(operand, root, env, budget, depth + 1)?;
-            Ok(match op {
-                UnaryOp::Plus => v,
-                UnaryOp::Minus => -v,
-                UnaryOp::Not => Real::from(v == 0.0),
-            })
+            Ok(op.evaluate(v))
         }
         ExprKind::Binary { op, lhs, rhs } => {
             let x = eval(lhs, root, env, budget, depth + 1)?;
-            if (*op == BinaryOp::And && x == 0.0) || (*op == BinaryOp::Or && x != 0.0) {
-                return Ok(Real::from(x != 0.0));
+            if let Some(value) = op.short_circuit(x) {
+                return Ok(value);
             }
             let y = eval(rhs, root, env, budget, depth + 1)?;
             binary(*op, x, y, node, rhs, root)
@@ -1700,42 +1696,17 @@ fn binary(
     rhs: &Expr,
     root: ExprSource<'_>,
 ) -> Result<Real, Failure> {
-    let result = match op {
-        BinaryOp::Add => x + y,
-        BinaryOp::Sub => x - y,
-        BinaryOp::Mul => x * y,
-        BinaryOp::Div => {
-            if y == 0.0 {
-                return Err(Failure {
-                    location: rhs.span.start.clone(),
-                    message: format!("division by zero ({x} / {y}) in `{}`", snippet(root, node)),
-                    unsupported: false,
-                });
-            }
-            x / y
+    if y == 0.0 && matches!(op, BinaryOp::Div | BinaryOp::Rem | BinaryOp::IntDiv) {
+        if op == BinaryOp::Div {
+            return Err(Failure {
+                location: rhs.span.start.clone(),
+                message: format!("division by zero ({x} / {y}) in `{}`", snippet(root, node)),
+                unsupported: false,
+            });
         }
-        // xpressn.c operate(), default compatibility.
-        BinaryOp::Pow => x.abs().powf(y),
-        BinaryOp::Rem | BinaryOp::IntDiv => {
-            if y == 0.0 {
-                return Err(fail(rhs, root, "division by zero"));
-            }
-            let quotient = x / y;
-            if op == BinaryOp::Rem {
-                x - y * quotient.trunc()
-            } else {
-                quotient.abs().trunc()
-            }
-        }
-        BinaryOp::Eq => Real::from(x == y),
-        BinaryOp::Ne => Real::from(x != y),
-        BinaryOp::Lt => Real::from(x < y),
-        BinaryOp::Le => Real::from(x <= y),
-        BinaryOp::Gt => Real::from(x > y),
-        BinaryOp::Ge => Real::from(x >= y),
-        BinaryOp::And => Real::from(x != 0.0 && y != 0.0),
-        BinaryOp::Or => Real::from(x != 0.0 || y != 0.0),
-    };
+        return Err(fail(rhs, root, "division by zero"));
+    }
+    let result = op.evaluate(x, y);
     checked(result, node, root, || match op {
         BinaryOp::Add => format!("{x} + {y}"),
         BinaryOp::Sub => format!("{x} - {y}"),
@@ -1779,7 +1750,9 @@ fn builtin_call(
     for a in arguments {
         args.push(eval(a, root, env, budget, depth + 1)?);
     }
-    let result = apply(function, &args);
+    let result = function
+        .evaluate(&args)
+        .ok_or_else(|| fail(node, root, "incorrect intrinsic arity"))?;
     checked(result, node, root, || {
         let list: Vec<String> = args.iter().map(ToString::to_string).collect();
         format!("{}({})", function.name(), list.join(", "))
@@ -1937,68 +1910,6 @@ fn call(
             })
         })?;
     checked(value, node, root, || format!("{}(...)", def.name))
-}
-
-/// xpressn.c `mathfunction(f, z, x)`: `z` is the first argument of two.
-fn apply(function: Function, args: &[Real]) -> Real {
-    let x = args[args.len() - 1];
-    let z = args[0];
-    match function {
-        Function::Ternary => {
-            if z != 0.0 {
-                args[1]
-            } else {
-                x
-            }
-        }
-        Function::Sqr => x * x,
-        Function::Sqrt => x.sqrt(),
-        Function::Sin => x.sin(),
-        Function::Cos => x.cos(),
-        Function::Exp => x.exp(),
-        Function::Ln | Function::Log => x.ln(),
-        Function::Arctan | Function::Atan => x.atan(),
-        Function::Abs => x.abs(),
-        Function::Pow => z.powf(x),
-        Function::Pwr => z.abs().powf(x),
-        Function::Max => {
-            if x > z {
-                x
-            } else {
-                z
-            }
-        }
-        Function::Min => {
-            if x < z {
-                x
-            } else {
-                z
-            }
-        }
-        Function::Int => x.trunc(),
-        Function::Nint => x.round_ties_even(),
-        Function::Log10 => x.log10(),
-        Function::Sinh => x.sinh(),
-        Function::Cosh => x.cosh(),
-        Function::Tanh => x.tanh(),
-        Function::Sgn => {
-            if x > 0.0 {
-                1.0
-            } else if x == 0.0 {
-                0.0
-            } else {
-                -1.0
-            }
-        }
-        Function::Ceil => x.ceil(),
-        Function::Floor => x.floor(),
-        Function::Asin => x.asin(),
-        Function::Acos => x.acos(),
-        Function::Asinh => x.asinh(),
-        Function::Acosh => x.acosh(),
-        Function::Atanh => x.atanh(),
-        Function::Tan => x.tan(),
-    }
 }
 
 #[cfg(test)]

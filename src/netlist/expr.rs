@@ -28,6 +28,8 @@
 
 use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
+pub use model_normalize_ngspice::native_scalar::{BinaryOp, Function, UnaryOp};
+
 /// A half-open source span.
 ///
 /// Physical endpoints can be on different lines; the separate logical byte
@@ -291,54 +293,6 @@ pub enum ExprKind {
     },
 }
 
-/// Prefix signs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnaryOp {
-    /// `+x`
-    Plus,
-    /// `-x`
-    Minus,
-    /// `!x`
-    Not,
-}
-
-/// Binary arithmetic operators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinaryOp {
-    /// `+`
-    Add,
-    /// `-`
-    Sub,
-    /// `*`
-    Mul,
-    /// `/`
-    Div,
-    /// `^` or `**` (both spellings are one operator in C). Left associative:
-    /// `2^3^2` is `(2^3)^2 = 64` in C. C's default `^` is `pow(fabs(x), y)`
-    /// (xpressn.c `operate()`), so an evaluator must not use plain `powf`.
-    Pow,
-    /// Remainder after truncating the quotient.
-    Rem,
-    /// Truncated magnitude of the quotient.
-    IntDiv,
-    /// Equality.
-    Eq,
-    /// Inequality.
-    Ne,
-    /// Less than.
-    Lt,
-    /// Less than or equal.
-    Le,
-    /// Greater than.
-    Gt,
-    /// Greater than or equal.
-    Ge,
-    /// Logical conjunction.
-    And,
-    /// Logical disjunction.
-    Or,
-}
-
 /// Maximum parenthesis/call nesting accepted by the parser; deeper input is a
 /// committed error instead of unbounded recursion.
 pub const MAX_NESTING: usize = 64;
@@ -384,84 +338,6 @@ impl TreeBudget {
         })?;
         Ok(())
     }
-}
-
-macro_rules! functions {
-    ($($variant:ident => $name:literal / $arity:literal,)*) => {
-        /// The allowlisted numparam functions (a subset of `fmathS` in
-        /// `xpressn.c`). Statistical calls are realized separately from
-        /// ordinary deterministic math functions.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum Function {
-            $(
-                #[doc = concat!("`", $name, "`")]
-                $variant,
-            )*
-        }
-
-        impl Function {
-            /// Every allowlisted function, in `fmathS` order.
-            pub const ALL: &'static [Function] = &[$(Self::$variant,)*];
-
-            /// Looks a function up by (case-insensitive) name.
-            #[must_use = "the lookup result identifies the supported intrinsic function"]
-            pub fn from_name(name: &str) -> Option<Self> {
-                match name.to_ascii_lowercase().as_str() {
-                    $($name => Some(Self::$variant),)*
-                    _ => None,
-                }
-            }
-
-            /// Canonical lowercase name.
-            #[must_use = "the name is the canonical intrinsic function spelling"]
-            pub const fn name(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $name,)*
-                }
-            }
-
-            /// Required argument count.
-            #[must_use = "the returned arity determines the required argument count"]
-            pub const fn arity(self) -> usize {
-                match self {
-                    $(Self::$variant => $arity,)*
-                }
-            }
-        }
-    };
-}
-
-functions! {
-    Sqr => "sqr" / 1,
-    Sqrt => "sqrt" / 1,
-    Sin => "sin" / 1,
-    Cos => "cos" / 1,
-    Exp => "exp" / 1,
-    Ln => "ln" / 1,
-    Arctan => "arctan" / 1,
-    Abs => "abs" / 1,
-    Pow => "pow" / 2,
-    Pwr => "pwr" / 2,
-    Max => "max" / 2,
-    Min => "min" / 2,
-    Int => "int" / 1,
-    Log => "log" / 1,
-    Log10 => "log10" / 1,
-    Sinh => "sinh" / 1,
-    Cosh => "cosh" / 1,
-    Tanh => "tanh" / 1,
-    Sgn => "sgn" / 1,
-    Ceil => "ceil" / 1,
-    Floor => "floor" / 1,
-    Asin => "asin" / 1,
-    Acos => "acos" / 1,
-    Atan => "atan" / 1,
-    Asinh => "asinh" / 1,
-    Acosh => "acosh" / 1,
-    Atanh => "atanh" / 1,
-    Tan => "tan" / 1,
-    Nint => "nint" / 1,
-    Ternary => "ternary_fcn" / 3,
 }
 
 /// C `fmathS` names outside the allowlist. A call to one parses as
