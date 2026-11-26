@@ -72,7 +72,8 @@ use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::netlist::ast::{FuncCard, Netlist, ParamCard};
 use crate::netlist::expr::{
-    BinaryOp, EXCLUDED_FUNCTIONS, Expr, ExprKind, Function, ParameterExpression, UnaryOp,
+    BinaryOp, EXCLUDED_FUNCTIONS, Expr, ExprKind, Function, FunctionBody, ParameterExpression,
+    SourceSpan, UnaryOp,
 };
 
 /// C reference used in diagnostics.
@@ -938,8 +939,9 @@ impl ParamScope {
                     .and_then(|scope| scope.get(name))
                     .or_else(|| self.functions.as_deref().and_then(|scope| scope.get(name)))
                     && visited.insert(std::ptr::from_ref(definition))
+                    && let Ok(body) = &definition.body.scalar
                 {
-                    pending.push((&definition.body.root, Some(owner)));
+                    pending.push((body, Some(owner)));
                 }
             }
         }
@@ -1081,7 +1083,7 @@ pub struct FunctionDef {
     /// Lowercased formal parameters, in order.
     pub parameters: Vec<String>,
     /// The body expression.
-    pub body: ParameterExpression,
+    pub body: FunctionBody,
     /// Where the `.func` card was written.
     pub location: SourceLoc,
 }
@@ -1177,7 +1179,7 @@ impl FunctionScope {
         let mut graph = DependencyGraph::new(self.definitions.len(), &live);
         for &i in &live {
             let def = &self.definitions[i];
-            for (name, arguments, location) in collect_calls(&def.body.root) {
+            for (name, arguments, location) in function_body_calls(&def.body) {
                 let local = self.active.get(name).copied();
                 let callee = local.map_or_else(
                     || {
@@ -1260,6 +1262,29 @@ fn collect_calls(expr: &Expr) -> impl Iterator<Item = (&str, usize, &SourceLoc)>
         }
         _ => None,
     })
+}
+
+/// Calls from the available phase trees. When scalar parsing succeeds it
+/// already describes the call spellings, including shadowable probes.
+fn function_body_calls(body: &FunctionBody) -> Vec<(&str, usize, &SourceLoc)> {
+    if let Ok(root) = &body.scalar {
+        return collect_calls(root).collect();
+    }
+    let mut calls = Vec::new();
+    if let Ok(root) = &body.behavioural {
+        use crate::netlist::bexpr::BExprKind;
+        root.visit(&mut |node| match &node.kind {
+            BExprKind::Call { name, arguments } => {
+                calls.push((name.as_str(), arguments.len(), &node.span.start))
+            }
+            BExprKind::Voltage { negative, .. } => {
+                calls.push(("v", 1 + usize::from(negative.is_some()), &node.span.start))
+            }
+            BExprKind::Current(_) => calls.push(("i", 1, &node.span.start)),
+            _ => {}
+        });
+    }
+    calls
 }
 
 /// First-use order of a function's free names. Its formals are already
@@ -1419,7 +1444,12 @@ impl<'a> RefScan<'a, '_> {
         let cuts = self.cuts;
         self.stack.push(key);
         let mut names = FreeNames::new(&def.parameters);
-        let result = self.body_names(&def.body.root, scope, depth + CALL_DEPTH, &mut names);
+        let result = def
+            .body
+            .scalar
+            .as_ref()
+            .map_err(|error| phase_failure(error, &def.body.span))
+            .and_then(|body| self.body_names(body, scope, depth + CALL_DEPTH, &mut names));
         self.stack.pop();
         result?;
         let free: Arc<[&str]> = names.ordered.into();
@@ -1623,7 +1653,16 @@ fn evaluate_sampled_root(
         sampler,
         expression_identity,
     };
-    eval(&root.root, root, env, budget, 0)
+    eval(
+        &root.root,
+        ExprSource {
+            text: &root.text,
+            span: &root.span,
+        },
+        env,
+        budget,
+        0,
+    )
 }
 
 fn evaluate_definition(
@@ -1649,14 +1688,36 @@ fn evaluate_definition(
     })
 }
 
-fn snippet<'a>(root: &'a ParameterExpression, node: &Expr) -> &'a str {
-    node.span
-        .relative_to(&root.span)
-        .and_then(|range| root.text.get(range))
-        .unwrap_or(root.text.as_str())
+#[derive(Clone, Copy)]
+struct ExprSource<'a> {
+    text: &'a str,
+    span: &'a SourceSpan,
 }
 
-fn fail(node: &Expr, root: &ParameterExpression, message: impl std::fmt::Display) -> Failure {
+fn phase_failure(error: &SpiceError, span: &SourceSpan) -> Failure {
+    if let SpiceError::Parse { location, message } = error {
+        Failure {
+            location: location.clone(),
+            message: message.clone(),
+            unsupported: false,
+        }
+    } else {
+        Failure {
+            location: span.start.clone(),
+            message: error.to_string(),
+            unsupported: error.is_not_yet_ported(),
+        }
+    }
+}
+
+fn snippet<'a>(root: ExprSource<'a>, node: &Expr) -> &'a str {
+    node.span
+        .relative_to(root.span)
+        .and_then(|range| root.text.get(range))
+        .unwrap_or(root.text)
+}
+
+fn fail(node: &Expr, root: ExprSource<'_>, message: impl std::fmt::Display) -> Failure {
     Failure {
         location: node.span.start.clone(),
         message: format!("{message} in `{}`", snippet(root, node)),
@@ -1667,7 +1728,7 @@ fn fail(node: &Expr, root: &ParameterExpression, message: impl std::fmt::Display
 fn checked(
     value: Real,
     node: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
     what: impl FnOnce() -> String,
 ) -> Result<Real, Failure> {
     if value.is_finite() {
@@ -1688,7 +1749,7 @@ fn checked(
 /// levels must fit a 2 MiB thread stack.
 fn eval(
     node: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
     env: Env<'_>,
     budget: &mut EvalBudget,
     depth: usize,
@@ -1748,7 +1809,7 @@ fn eval(
 
 #[inline(never)]
 #[cold]
-fn too_deep(node: &Expr, root: &ParameterExpression, env: Env<'_>, max: usize) -> Failure {
+fn too_deep(node: &Expr, root: ExprSource<'_>, env: Env<'_>, max: usize) -> Failure {
     let call_depth_note = if env.frame.is_some() {
         CALL_DEPTH_NOTE
     } else {
@@ -1763,7 +1824,7 @@ fn too_deep(node: &Expr, root: &ParameterExpression, env: Env<'_>, max: usize) -
 
 #[inline(never)]
 #[cold]
-fn over_budget(node: &Expr, root: &ParameterExpression, max: usize) -> Failure {
+fn over_budget(node: &Expr, root: ExprSource<'_>, max: usize) -> Failure {
     fail(
         node,
         root,
@@ -1789,7 +1850,7 @@ fn binary(
     y: Real,
     node: &Expr,
     rhs: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
 ) -> Result<Real, Failure> {
     let result = match op {
         BinaryOp::Add => x + y,
@@ -1841,7 +1902,7 @@ fn binary(
 #[inline(never)]
 fn builtin_call(
     node: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
     env: Env<'_>,
     budget: &mut EvalBudget,
     depth: usize,
@@ -1887,7 +1948,7 @@ const PROBE_FUNCTIONS: &[&str] = &["v", "i"];
 #[inline(never)]
 fn user_call(
     node: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
     env: Env<'_>,
     budget: &mut EvalBudget,
     depth: usize,
@@ -1963,7 +2024,7 @@ fn user_call(
 )]
 fn call(
     node: &Expr,
-    root: &ParameterExpression,
+    root: ExprSource<'_>,
     env: Env<'_>,
     budget: &mut EvalBudget,
     depth: usize,
@@ -2018,8 +2079,24 @@ fn call(
         sampler: env.sampler,
         expression_identity: env.expression_identity,
     };
-    let value =
-        eval(&def.body.root, &def.body, inner, budget, depth + CALL_DEPTH).map_err(|f| {
+    let value = def
+        .body
+        .scalar
+        .as_ref()
+        .map_err(|error| phase_failure(error, &def.body.span))
+        .and_then(|body| {
+            eval(
+                body,
+                ExprSource {
+                    text: &def.body.text,
+                    span: &def.body.span,
+                },
+                inner,
+                budget,
+                depth + CALL_DEPTH,
+            )
+        })
+        .map_err(|f| {
             f.context(|| {
                 format!(
                     "in function '{}' (defined at {}) called at {}",

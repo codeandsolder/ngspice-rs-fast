@@ -27,7 +27,9 @@ use crate::netlist::bexpr::{
     BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression, TableTransfer,
 };
 use crate::netlist::card::{CardKind, RawCard};
-use crate::netlist::expr::{BinaryOp, Expr, ExprKind, Function, ParameterExpression, UnaryOp};
+use crate::netlist::expr::{
+    BinaryOp, Expr, ExprKind, Function, FunctionBody, ParameterExpression, UnaryOp,
+};
 use crate::netlist::token::{Token, TokenKind};
 use crate::primitives::{AnalysisKind, Real};
 
@@ -177,6 +179,16 @@ impl<T: Semantic> Semantic for Option<T> {
     }
 }
 
+impl<T: Semantic> Semantic for Result<T, crate::primitives::SpiceError> {
+    fn compare_semantic(&self, other: &Self) -> Comparison {
+        match (self, other) {
+            (Ok(left), Ok(right)) => left.compare_semantic(right),
+            (Err(_), Err(_)) => Ok(()),
+            _ => Err(Difference::new(Reason::Variant)),
+        }
+    }
+}
+
 impl<T: Semantic> Semantic for Box<T> {
     fn compare_semantic(&self, other: &Self) -> Comparison {
         (**self).compare_semantic(other)
@@ -244,6 +256,7 @@ semantic_struct!(VectorRequest { vector } ignore { location });
 semantic_struct!(MeasureCard { analysis, name, request } ignore { analysis_location, name_location, location });
 semantic_struct!(MeasureWindow { from, to } ignore {});
 semantic_struct!(ParameterExpression { text, braced, quoted, root } ignore { span });
+semantic_struct!(FunctionBody { text, braced, quoted, scalar, behavioural } ignore { span });
 semantic_struct!(Expr { kind } ignore { span });
 semantic_struct!(BehaviouralExpression { text, verbatim, root } ignore { span });
 semantic_struct!(BExpr { kind } ignore { span });

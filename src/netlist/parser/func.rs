@@ -24,7 +24,7 @@ use winnow::token::{any, literal, one_of, take_while};
 
 use crate::netlist::ast::{FuncCard, FuncParameter, FuncSpelling};
 use crate::netlist::card::{DotCommand, RawCard};
-use crate::netlist::expr::{Function, ParameterExpression, SourceSpan};
+use crate::netlist::expr::{Function, FunctionBody, SourceSpan};
 use crate::netlist::token::Token;
 
 use super::expression::{
@@ -55,8 +55,13 @@ pub(super) fn func_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     // The text grammar owns the whole tail (the tokenizer already matched
     // braces and quotes), so drain the token slice.
     winnow::token::rest.parse_next(input)?;
-    let card = definition(input.state.card, start, FuncSpelling::Func)
-        .map_err(|error| ErrMode::Cut(Failure(error)))?;
+    let card = definition(
+        input.state.card,
+        start,
+        FuncSpelling::Func,
+        input.state.auto_gnd,
+    )
+    .map_err(|error| ErrMode::Cut(Failure(error)))?;
     Ok(ParsedCard::Func(card))
 }
 
@@ -65,6 +70,7 @@ pub(super) fn definition(
     raw: &RawCard,
     start: usize,
     spelling: FuncSpelling,
+    auto_gnd: bool,
 ) -> SpiceResult<FuncCard> {
     let text = &raw.raw[start..];
     let origin = raw.position().advance(start);
@@ -79,7 +85,7 @@ pub(super) fn definition(
             control_names: false,
         },
     };
-    let card = match card(&mut input, spelling, &raw.location) {
+    let card = match card(&mut input, spelling, &raw.location, auto_gnd) {
         Ok(card) => card,
         Err(ErrMode::Backtrack(fail) | ErrMode::Cut(fail)) => {
             return Err(into_error(origin, text.len(), fail));
@@ -102,7 +108,12 @@ fn identifier<'a>(input: &mut In<'a>) -> Res<(&'a str, SourceSpan)> {
     ))
 }
 
-fn card(input: &mut In<'_>, spelling: FuncSpelling, location: &SourceLoc) -> Res<FuncCard> {
+fn card(
+    input: &mut In<'_>,
+    spelling: FuncSpelling,
+    location: &SourceLoc,
+    auto_gnd: bool,
+) -> Res<FuncCard> {
     ws.parse_next(input)?;
     let here = input.eof_offset();
     let Some((name, name_span)) = opt(identifier).parse_next(input)? else {
@@ -159,7 +170,7 @@ fn card(input: &mut In<'_>, spelling: FuncSpelling, location: &SourceLoc) -> Res
         .filter(|p| is_builtin_name(&p.name))
         .map(|p| p.name.clone())
         .collect();
-    let body = body(input, name, &shadowing)?;
+    let body = body(input, name, &shadowing, auto_gnd)?;
     Ok(FuncCard {
         name: name.to_ascii_lowercase(),
         name_span,
@@ -170,7 +181,7 @@ fn card(input: &mut In<'_>, spelling: FuncSpelling, location: &SourceLoc) -> Res
     })
 }
 
-fn body(input: &mut In<'_>, name: &str, shadowing: &[String]) -> Res<ParameterExpression> {
+fn body(input: &mut In<'_>, name: &str, shadowing: &[String], auto_gnd: bool) -> Res<FunctionBody> {
     let start = input.eof_offset();
     let expression = match peek(opt(any)).parse_next(input)? {
         None => {
@@ -196,12 +207,13 @@ fn body(input: &mut In<'_>, name: &str, shadowing: &[String]) -> Res<ParameterEx
                     },
                 ));
             }
-            parse_func_body(
+            interpret_body(
                 text,
                 input.state.position(body_start),
                 true,
                 open == '\'',
                 shadowing,
+                auto_gnd,
             )
             .map_err(resolved)?
         }
@@ -214,8 +226,15 @@ fn body(input: &mut In<'_>, name: &str, shadowing: &[String]) -> Res<ParameterEx
         Some(_) => {
             let text: &str = winnow::token::rest.parse_next(input)?;
             let text = text.trim_end();
-            parse_func_body(text, input.state.position(start), false, false, shadowing)
-                .map_err(resolved)?
+            interpret_body(
+                text,
+                input.state.position(start),
+                false,
+                false,
+                shadowing,
+                auto_gnd,
+            )
+            .map_err(resolved)?
         }
     };
     ws.parse_next(input)?;
@@ -275,4 +294,45 @@ fn validate(card: &FuncCard) -> SpiceResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Interpret both phases against the same positioned source text. An invalid
+/// phase becomes an error only when a call actually requires that phase.
+fn interpret_body(
+    text: &str,
+    origin: crate::netlist::source::SourcePosition<'_>,
+    braced: bool,
+    quoted: bool,
+    shadowing: &[String],
+    auto_gnd: bool,
+) -> SpiceResult<FunctionBody> {
+    let scalar = parse_func_body(text, origin, braced, quoted, shadowing).map(|e| e.root);
+    let behavioural = super::bexpression::parse_complete(text, origin, false, auto_gnd)
+        .map(|e| e.root)
+        .and_then(|root| {
+            let mut invalid = None;
+            root.visit(&mut |node| {
+                if let crate::netlist::bexpr::BExprKind::Call { name, .. } = &node.kind
+                    && shadowing.contains(name)
+                    && invalid.is_none()
+                {
+                    invalid = Some(SpiceError::parse(
+                        node.span.start.clone(),
+                        format!("'{name}' is a parameter of this function"),
+                    ));
+                }
+            });
+            invalid.map_or(Ok(root), Err)
+        });
+    if let (Err(error), Err(_)) = (&scalar, &behavioural) {
+        return Err(error.clone());
+    }
+    Ok(FunctionBody {
+        text: text.to_owned(),
+        braced,
+        quoted,
+        span: SourceSpan::from_positions(origin, origin.advance(text.len())),
+        scalar,
+        behavioural,
+    })
 }
