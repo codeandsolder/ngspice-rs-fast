@@ -803,10 +803,10 @@ impl Switch {
     }
 
     const fn storage_slots(&self) -> usize {
-        if self.model.series_inductance != 0. {
-            crate::devices::rlc::REACTIVE_STATE_COUNT
-        } else {
+        if self.model.series_inductance == 0. {
             0
+        } else {
+            crate::devices::rlc::REACTIVE_STATE_COUNT
         }
     }
 

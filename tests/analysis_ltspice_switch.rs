@@ -136,28 +136,33 @@ fn smooth_devices_have_no_history_and_stamp_consistent_kcl_and_jacobians() -> Te
 }
 
 fn check_smooth_point(
-    c: &Circuit,
+    circuit: &Circuit,
     level: u8,
     limit: Option<f64>,
     control: f64,
     voltage: f64,
 ) -> TestResult {
     let step = 1e-5;
-    let [p, n, cp, cn] = [row(c, "p")?, row(c, "n")?, row(c, "cp")?, row(c, "cn")?];
-    let history = c.state_history()?;
-    let width = c.unknown_count();
-    let mut x = Vector::zeros(width);
-    x.as_mut_slice()[p] = voltage + 0.3;
-    x.as_mut_slice()[n] = 0.3;
-    x.as_mut_slice()[cp] = control - 0.41;
-    x.as_mut_slice()[cn] = -0.41;
+    let [p, n, cp, cn] = [
+        row(circuit, "p")?,
+        row(circuit, "n")?,
+        row(circuit, "cp")?,
+        row(circuit, "cn")?,
+    ];
+    let history = circuit.state_history()?;
+    let width = circuit.unknown_count();
+    let mut bias = Vector::zeros(width);
+    bias.as_mut_slice()[p] = voltage + 0.3;
+    bias.as_mut_slice()[n] = 0.3;
+    bias.as_mut_slice()[cp] = control - 0.41;
+    bias.as_mut_slice()[cn] = -0.41;
     let mut matrix = SparseMatrix::new(width, width);
     let mut rhs = Vector::zeros(width);
     let mut trial = history.trial_in(IterationPhase::Predict, None)?;
-    c.load(
+    circuit.load(
         &LoadRequest {
             mode: AnalysisMode::OperatingPoint,
-            solution: &x,
+            solution: &bias,
             model_context: &ModelContext::default(),
             integration: None,
             history: &history,
@@ -168,11 +173,11 @@ fn check_smooth_point(
         &mut trial,
     )?;
     matrix.fold_duplicates();
-    let actual = |r: usize| -> TestResult<f64> {
+    let actual = |row_index: usize| -> TestResult<f64> {
         let residual = (0..width)
-            .map(|col| matrix.get(r, col) * x.as_slice()[col])
+            .map(|col| matrix.get(row_index, col) * bias.as_slice()[col])
             .sum::<f64>()
-            - rhs.get(r).ok_or("missing RHS row")?;
+            - rhs.get(row_index).ok_or("missing RHS row")?;
         Ok(residual)
     };
     let expected = reference(level, control, voltage, limit);
@@ -196,22 +201,22 @@ fn check_smooth_point(
     let dc = (reference(level, control + step, voltage, limit)
         - reference(level, control - step, voltage, limit))
         / (2. * step);
-    for (r, sign) in [(p, 1.), (n, -1.)] {
+    for (row_index, sign) in [(p, 1.), (n, -1.)] {
         for (col, derivative) in [(p, dv), (n, -dv), (cp, dc), (cn, -dc)] {
             close(
                 "nodal derivative",
-                matrix.get(r, col),
+                matrix.get(row_index, col),
                 sign * derivative,
                 2e-7,
                 1e-11,
             );
         }
     }
-    let linear = c.small_signal_system(&ModelContext::default(), &x)?;
-    let pencil = c.pole_zero_system_at(&ModelContext::default(), &x, None)?;
-    for r in [p, n] {
+    let linear = circuit.small_signal_system(&ModelContext::default(), &bias)?;
+    let pencil = circuit.pole_zero_system_at(&ModelContext::default(), &bias, None)?;
+    for row_index in [p, n] {
         for col in [p, n, cp, cn] {
-            let physical = matrix.get(r, col);
+            let physical = matrix.get(row_index, col);
             let expected_ac = if level == 1
                 && limit.is_some_and(|limit| {
                     voltage
@@ -222,25 +227,25 @@ fn check_smooth_point(
                 && [p, n].contains(&col)
             {
                 let chord = expected / voltage;
-                if r == col { chord } else { -chord }
+                if row_index == col { chord } else { -chord }
             } else {
                 physical
             };
             close(
                 "AC derivative",
-                linear.a.get(r, col),
+                linear.a.get(row_index, col),
                 expected_ac,
                 1e-13,
                 1e-18,
             );
             close(
                 "PZ derivative",
-                pencil.a.get(r, col),
+                pencil.a.get(row_index, col),
                 expected_ac,
                 1e-13,
                 1e-18,
             );
-            assert_eq!(pencil.e.get(r, col).to_bits(), 0_f64.to_bits());
+            assert_eq!(pencil.e.get(row_index, col).to_bits(), 0_f64.to_bits());
         }
     }
     Ok(())
