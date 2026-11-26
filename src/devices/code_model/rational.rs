@@ -615,7 +615,9 @@ impl Device for RationalTransfer {
 }
 
 use crate::devices::models::{PreparationKey, ResolvedModel};
-use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
+use crate::netlist::ast::{
+    CodePort, CodePortKind, DeviceInstance, ParameterAssignment, ParameterKind,
+};
 use crate::primitives::{NodeAppend, parse_spice_number};
 
 fn literal(parameter: &ParameterAssignment) -> SpiceResult<Real> {
@@ -716,6 +718,27 @@ impl Model {
     }
 }
 
+fn transfer_port(port: &CodePort) -> SpiceResult<(PortLaw, &str, &str)> {
+    let [terminal] = port.terminals.as_slice() else {
+        return Err(invalid("expected scalar transfer port"));
+    };
+    if port.vector || terminal.inverted || port.kind.differential() != terminal.negative.is_some() {
+        return Err(invalid("invalid transfer terminal shape"));
+    }
+    let law = match port.kind {
+        CodePortKind::Default | CodePortKind::Voltage | CodePortKind::VoltageDifferential => {
+            PortLaw::Voltage
+        }
+        CodePortKind::Current | CodePortKind::CurrentDifferential => PortLaw::Current,
+        _ => return Err(invalid("expected voltage or current transfer port")),
+    };
+    Ok((
+        law,
+        &terminal.positive,
+        terminal.negative.as_deref().unwrap_or("0"),
+    ))
+}
+
 /// Bind a parsed XSPICE `s_xfer` model. Its immutable realization is shared
 /// across instances; accepted histories remain entirely device-local.
 pub(in crate::devices) fn instantiate(
@@ -723,23 +746,11 @@ pub(in crate::devices) fn instantiate(
     nodes: &mut NodeAppend<'_>,
     model: &ResolvedModel<'_>,
 ) -> SpiceResult<Box<dyn Device>> {
-    let [op, on, ip, inn] = instance.nodes.as_slice() else {
-        return Err(invalid("expected two differential ports"));
+    let [input, output] = instance.code_ports.as_slice() else {
+        return Err(invalid("expected two scalar analog ports"));
     };
-    let [input, output] = instance.parameters.as_slice() else {
-        return Err(invalid("expected typed transfer port modes"));
-    };
-    let port = |parameter: &ParameterAssignment, name: &str| match (
-        parameter.name.as_str(),
-        &parameter.kind,
-        parameter.value.as_str(),
-    ) {
-        (actual, ParameterKind::Textual, "voltage") if actual == name => Ok(PortLaw::Voltage),
-        (actual, ParameterKind::Textual, "current") if actual == name => Ok(PortLaw::Current),
-        _ => Err(invalid("invalid transfer port mode")),
-    };
-    let input = port(input, "input")?;
-    let output = port(output, "output")?;
+    let (input, ip, inn) = transfer_port(input)?;
+    let (output, op, on) = transfer_port(output)?;
     let prepared = model.prepare(PreparationKey::Inputs, || Model::compile(model))?;
     nodes.transaction(|nodes| {
         let terminals = [

@@ -31,6 +31,7 @@ pub(super) fn jfet_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     ))
     .parse_next(input)?;
     Ok(ParsedCard::Device(DeviceInstance {
+        code_ports: Vec::new(),
         name: instance.text.to_ascii_lowercase(),
         designator: 'j',
         nodes: [drain, gate, source]
