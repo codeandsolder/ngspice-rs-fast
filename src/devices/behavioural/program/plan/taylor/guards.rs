@@ -120,7 +120,7 @@ impl Evaluator<'_> {
         let smooth = integer
             && match law {
                 PowerLaw::NativePow | PowerLaw::SimetrixRealPart => true,
-                PowerLaw::NativePwr => exponent.value().rem_euclid(2.) == 1.,
+                PowerLaw::NativePwr => exponent.value().rem_euclid(2.).to_bits() == 1_f64.to_bits(),
                 PowerLaw::SimetrixAbsolute => exponent.value().rem_euclid(2.) == 0.,
                 // The measured SIMetrix caret regularization has an isolated
                 // zero-base branch, even at an integral exponent.

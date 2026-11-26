@@ -71,7 +71,7 @@ impl XspicePwl {
             boundaries.extend([x[i] - domain, x[i] + domain]);
         }
         boundaries.sort_by(Real::total_cmp);
-        boundaries.dedup_by(|a, b| *a == *b);
+        boundaries.dedup_by(|a, b| (*a).partial_cmp(&*b) == Some(std::cmp::Ordering::Equal));
         Ok(Self {
             x,
             y,

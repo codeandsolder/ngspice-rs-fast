@@ -229,12 +229,10 @@ impl Driver<'_> {
                 if error > envelope + tolerance {
                     if dt * 0.5 <= self.settings.min_step() {
                         return Err(failure(format!(
-                            "{}: unresolved derivative input increment at t = {:e}; change {:e} is inconsistent with endpoint rates {:e}, {:e}",
+                            "{}: unresolved derivative input increment at t = {:e}; change {:e} is inconsistent with endpoint rates {r0:e}, {r1:e}",
                             device.name(),
                             attempt.clock.time,
-                            q1 - q0,
-                            r0,
-                            r1
+                            q1 - q0
                         )));
                     }
                     return Ok(Some(super::NextStep {

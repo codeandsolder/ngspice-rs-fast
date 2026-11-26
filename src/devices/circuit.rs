@@ -771,8 +771,8 @@ impl<'a> PreparedRun<'a> {
         for index in self.circuit.load_order() {
             let device = point.device(self.circuit, index);
             if device.is_nonlinear() {
-                device.assemble_nonlinear_taylor(
-                    &mut crate::devices::physical_dae::TaylorContext {
+                device
+                    .assemble_nonlinear_taylor(&mut crate::devices::physical_dae::TaylorContext {
                         device: index,
                         state_rows: self
                             .circuit
@@ -785,8 +785,15 @@ impl<'a> PreparedRun<'a> {
                         state,
                         time,
                         output,
-                    },
-                )?;
+                    })
+                    .map_err(|error| match error {
+                        SpiceError::Circuit { message } => SpiceError::circuit(format!(
+                            "{}: physical Taylor evaluation at t = {:e}: {message}",
+                            device.name(),
+                            time.value()
+                        )),
+                        other => other,
+                    })?;
             }
         }
         Ok(())
@@ -817,11 +824,11 @@ impl<'a> PreparedRun<'a> {
         let mut matrix = SparseMatrix::new(n, n);
         let mut rhs = Vector::zeros(n);
         for index in self.circuit.load_order() {
-            let rows = self
+            let mut rows = self
                 .circuit
                 .state_rows(index)
                 .ok_or_else(|| SpiceError::circuit("missing physical state range"))?;
-            if rows.clone().all(|slot| covered[slot]) {
+            if rows.all(|slot| covered[slot]) {
                 continue;
             }
             matrix.clear();

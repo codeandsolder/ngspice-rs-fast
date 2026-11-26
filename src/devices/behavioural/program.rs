@@ -844,7 +844,7 @@ impl PwlTable {
         if matches!(order, PwlOrder::Descending) {
             boundaries.reverse();
         }
-        boundaries.dedup_by(|a, b| *a == *b);
+        boundaries.dedup_by(|a, b| (*a).partial_cmp(&*b) == Some(std::cmp::Ordering::Equal));
         Some(Self {
             points,
             order,

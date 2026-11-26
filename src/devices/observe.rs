@@ -239,60 +239,74 @@ struct PointLoads<'a, 'b> {
 }
 
 impl PointLoads<'_, '_> {
+    fn physical_current(
+        &self,
+        layout: &TerminalLayout,
+        slot: usize,
+        name: &str,
+    ) -> SpiceResult<Option<Real>> {
+        let device = self.point.device(self.circuit, layout.device);
+        let states = self
+            .circuit
+            .state_rows(layout.device)
+            .ok_or_else(|| gap(name))?;
+        let branches = self
+            .circuit
+            .branch_rows(layout.device)
+            .ok_or_else(|| gap(name))?;
+        let values = self
+            .previous
+            .map(TrialState::values)
+            .or_else(|| self.request.history.accepted(1))
+            .and_then(|values| values.get(states))
+            .ok_or_else(|| gap(name))?;
+        let branches = self
+            .request
+            .solution
+            .as_slice()
+            .get(branches)
+            .ok_or_else(|| gap(name))?;
+        if let [pos, neg] = layout.ports.as_slice()
+            && let Some(current) = device.physical_terminal_current(values, branches)
+        {
+            return Ok(Some(
+                if *pos == slot { current } else { 0. } - if *neg == slot { current } else { 0. },
+            ));
+        }
+        if let Some(storage) = device
+            .storage_element(self.request.model_context)
+            .transpose()?
+            && storage.kind == crate::devices::StorageKind::Capacitor
+        {
+            let states = self
+                .circuit
+                .state_rows(layout.device)
+                .ok_or_else(|| gap(name))?;
+            let base = device.truncation_slot().ok_or_else(|| gap(name))?;
+            let values = self
+                .previous
+                .map(TrialState::values)
+                .or_else(|| self.request.history.accepted(1))
+                .ok_or_else(|| gap(name))?;
+            let rate = *values
+                .get(states.start + base + 1)
+                .ok_or_else(|| gap(name))?;
+            return Ok(Some(
+                if layout.ports[0] == slot { rate } else { 0. }
+                    - if layout.ports[1] == slot { rate } else { 0. },
+            ));
+        }
+        Ok(None)
+    }
+
     fn current(&mut self, load: usize, slot: usize, name: &str) -> SpiceResult<Real> {
         let layout = &self.circuit.runtime.observations.loads[load];
         if matches!(
             self.request.mode,
             crate::devices::AnalysisMode::Instantaneous { .. }
-        ) {
-            let device = self.point.device(self.circuit, layout.device);
-            let states = self
-                .circuit
-                .state_rows(layout.device)
-                .ok_or_else(|| gap(name))?;
-            let branches = self
-                .circuit
-                .branch_rows(layout.device)
-                .ok_or_else(|| gap(name))?;
-            let values = self
-                .previous
-                .map(TrialState::values)
-                .or_else(|| self.request.history.accepted(1))
-                .and_then(|values| values.get(states))
-                .ok_or_else(|| gap(name))?;
-            let branches = self
-                .request
-                .solution
-                .as_slice()
-                .get(branches)
-                .ok_or_else(|| gap(name))?;
-            if let [pos, neg] = layout.ports.as_slice()
-                && let Some(current) = device.physical_terminal_current(values, branches)
-            {
-                return Ok(if *pos == slot { current } else { 0. }
-                    - if *neg == slot { current } else { 0. });
-            }
-            if let Some(storage) = device
-                .storage_element(self.request.model_context)
-                .transpose()?
-                && storage.kind == crate::devices::StorageKind::Capacitor
-            {
-                let states = self
-                    .circuit
-                    .state_rows(layout.device)
-                    .ok_or_else(|| gap(name))?;
-                let base = device.truncation_slot().ok_or_else(|| gap(name))?;
-                let values = self
-                    .previous
-                    .map(TrialState::values)
-                    .or_else(|| self.request.history.accepted(1))
-                    .ok_or_else(|| gap(name))?;
-                let rate = *values
-                    .get(states.start + base + 1)
-                    .ok_or_else(|| gap(name))?;
-                return Ok(if layout.ports[0] == slot { rate } else { 0. }
-                    - if layout.ports[1] == slot { rate } else { 0. });
-            }
+        ) && let Some(value) = self.physical_current(layout, slot, name)?
+        {
+            return Ok(value);
         }
         let work = &mut *self.workspace;
         let loaded = &mut work.loaded[load];

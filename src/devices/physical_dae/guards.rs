@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 const MAX_GUARD_COEFFICIENTS: usize = 8_388_608;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Region {
+pub enum Region {
     Sign(Ordering),
     Interval(usize),
     Discrete(u64),
@@ -18,7 +18,7 @@ pub(crate) enum Region {
 /// its operand coordinate. The slot and operand discriminator are stable
 /// across evaluations of the same compiled program.
 #[derive(Debug, Clone)]
-pub(crate) struct LocalGuard {
+pub struct LocalGuard {
     pub slot: usize,
     pub operand: u8,
     pub region: Region,
@@ -81,7 +81,7 @@ struct Guard {
 
 /// Observations belong to a disposable physical point until it is accepted.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct BranchTrace {
+pub struct BranchTrace {
     guards: Vec<Guard>,
     coefficients: usize,
 }
@@ -102,7 +102,7 @@ impl BranchTrace {
         Ok(())
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.guards.is_empty()
     }
 
@@ -128,13 +128,13 @@ impl BranchTrace {
                 return Some(a.device.min(b.device));
             }
         }
-        if self.guards.len() != other.guards.len() {
+        if self.guards.len() == other.guards.len() {
+            None
+        } else {
             self.guards
                 .get(other.guards.len())
                 .or_else(|| other.guards.get(self.guards.len()))
                 .map(|guard| guard.device)
-        } else {
-            None
         }
     }
 
