@@ -16,7 +16,7 @@
 use ngspice_conformance::fixtures::DeckInputs;
 use ngspice_conformance::ngspice::Scratch;
 use ngspice_conformance::process::{ProcessLimits, run};
-use ngspice_rs::analysis::{AnalysisContext, Plot, RawFile, RunConfig};
+use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
@@ -69,7 +69,7 @@ fn run_rust(deck: &str) -> Plot {
     let request = config.plan_for(&netlist.analyses[0]).unwrap();
     let mut circuit = config.circuit(&netlist).unwrap();
     request
-        .run(&mut circuit, &AnalysisContext::default())
+        .run(&mut circuit, &config.context())
         .unwrap()
 }
 
