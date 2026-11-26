@@ -249,7 +249,7 @@ pub(crate) struct Binder<'a> {
     pub(crate) bound: BoundInitializations,
 }
 
-fn source_analysis(kind: AnalysisKind, uic: bool) -> Option<Analysis> {
+const fn source_analysis(kind: AnalysisKind, uic: bool) -> Option<Analysis> {
     Some(match kind {
         AnalysisKind::OperatingPoint => Analysis::OperatingPoint,
         AnalysisKind::Transient => Analysis::Transient { uic },
@@ -500,7 +500,7 @@ impl<'a> Binder<'a> {
                     } => constraints.push((job.kind, voltage, resistance.recip())),
                     _ => {
                         return Err(SpiceError::parse(
-                            location.clone(),
+                            location,
                             "passive constraint returned for node",
                         ));
                     }

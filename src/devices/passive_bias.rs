@@ -1,4 +1,6 @@
-//! Resolved physical passive startup constraints. Source-language policy
+//! Resolved physical passive startup constraints.
+//!
+//! Source-language policy
 //! (BRANCH, analysis expressions, mode defaults) is resolved by preparation;
 //! the engine consumes only the resulting voltage/current equations.
 use std::collections::BTreeMap;
@@ -28,7 +30,7 @@ pub enum PassiveBias {
 }
 
 impl PassiveBias {
-    fn kind(self) -> StorageKind {
+    const fn kind(self) -> StorageKind {
         match self {
             Self::Voltage { .. } => StorageKind::Capacitor,
             Self::Current { .. } => StorageKind::Inductor,
@@ -124,7 +126,7 @@ impl PassiveInitialization {
         self.storage_ic
     }
 
-    pub(super) fn has_constraints(&self) -> bool {
+    pub(super) const fn has_constraints(&self) -> bool {
         !self.bias.is_empty()
     }
 
