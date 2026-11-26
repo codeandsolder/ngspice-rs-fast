@@ -10,9 +10,10 @@ use super::measure::{self, Measurement};
 use super::optimization::parameters::{CandidateTopology, CircuitCandidate, CircuitParameterPlan};
 use super::results::PlotCollector;
 use super::selection::{RowProjection, Selection};
-use super::{AnalysisInput, AnalysisPlan, Plot, PointSink};
+use super::{AnalysisInput, AnalysisPlan, Plot, PointSink, RunConfig};
 use crate::devices::sweep::InstanceOverride;
-use crate::netlist::ast::{AnalysisCard, FourierCard, MeasureCard, OutputCards};
+use crate::devices::{Circuit, ModelContext};
+use crate::netlist::ast::{AnalysisCard, FourierCard, MeasureCard, OptionCard, OutputCards};
 use crate::netlist::eval::{EvalBudget, EvalLimits, ParamScope};
 use crate::netlist::expr::ParameterExpression;
 use crate::primitives::{AnalysisKind, Complex, Real, SpiceError, SpiceResult};
@@ -188,6 +189,8 @@ pub struct ControlSession<'a> {
     values: Vec<Real>,
     limits: EvalLimits,
     edits: Vec<InstanceOverride>,
+    option_config: Option<RunConfig>,
+    option_circuit: Option<Circuit>,
 }
 
 impl<'a> ControlSession<'a> {
@@ -202,6 +205,8 @@ impl<'a> ControlSession<'a> {
             values: plan.inputs().iter().map(|input| input.default).collect(),
             limits,
             edits: Vec::new(),
+            option_config: None,
+            option_circuit: None,
         })
     }
 
@@ -253,7 +258,98 @@ impl<'a> ControlSession<'a> {
                 .set_control_overrides(&context, &[])?;
             self.edits.clear();
         }
+        self.option_config = None;
+        self.option_circuit = None;
         Ok(self.candidate.topology())
+    }
+
+    /// Effective immutable options for the next analysis.
+    #[must_use = "the returned snapshot determines the next analysis settings"]
+    pub fn config(&self) -> &RunConfig {
+        self.option_config
+            .as_ref()
+            .unwrap_or_else(|| self.candidate.config())
+    }
+
+    fn circuit(&self) -> &Circuit {
+        self.option_circuit
+            .as_ref()
+            .unwrap_or_else(|| self.candidate.circuit())
+    }
+
+    fn circuit_mut(&mut self) -> &mut Circuit {
+        self.option_circuit
+            .as_mut()
+            .unwrap_or_else(|| self.candidate.circuit_mut())
+    }
+
+    fn model_context_for(&self, config: &RunConfig) -> ModelContext {
+        let mut context = config.context().model_context();
+        if self.option_circuit.is_none() {
+            let candidate = self.candidate.model_context();
+            context.resistor_overrides = candidate.resistor_overrides;
+            context.instance_overrides = candidate.instance_overrides;
+        }
+        context
+    }
+
+    /// Execute a resolved option command at its script position. Options
+    /// affecting topology create a fresh circuit before publishing the change;
+    /// numerical settings retain the existing topology and instance edits.
+    /// Reset restores the current deck's options.
+    /// # Errors
+    /// Invalid option values, incompatible settings or device/topology physics.
+    pub fn apply_options(&mut self, card: &OptionCard) -> SpiceResult<()> {
+        let config = self.config().with_control_options(card)?;
+        if config.context().shunts == self.config().context().shunts {
+            let mut context = self.model_context_for(&config);
+            if !self.edits.is_empty() {
+                context.resistor_overrides.fill(None);
+                context.instance_overrides.fill(None);
+            }
+            self.circuit().prepare_run().validate_dc_inputs(&context)?;
+            self.circuit_mut().clear_candidate_analysis_state();
+        } else {
+            let (circuit, edits) = self.rebuild_option_circuit(&config)?;
+            self.option_circuit = Some(circuit);
+            self.edits = edits;
+        }
+        self.option_config = Some(config);
+        Ok(())
+    }
+
+    fn rebuild_option_circuit(
+        &self,
+        config: &RunConfig,
+    ) -> SpiceResult<(Circuit, Vec<InstanceOverride>)> {
+        let context = config.context().model_context();
+        let mut circuit = Circuit::from_netlist_with_scoped_limits(
+            self.plan.source(),
+            &context,
+            crate::devices::MutualLimits::default(),
+            crate::devices::ElaborationLimits::default(),
+            Some(std::sync::Arc::new(self.scope()?.clone())),
+        )?;
+        let old = self.circuit();
+        let edits = self
+            .edits
+            .iter()
+            .map(|edit| {
+                let device = &old.devices()[edit.device()];
+                let parameter = device
+                    .numeric_parameter_name(edit.parameter())
+                    .ok_or_else(|| SpiceError::circuit("invalid control edit binding"))?;
+                let target = if parameter == "dc" && matches!(device.designator(), 'v' | 'i') {
+                    circuit.bind_source_target(device.name())?
+                } else {
+                    circuit.bind_instance_target(device.name(), parameter)?
+                };
+                target.at(edit.value())
+            })
+            .collect::<SpiceResult<Vec<_>>>()?;
+        circuit.set_control_overrides(&context, &edits)?;
+        circuit.prepare_run().validate_dc_inputs(&context)?;
+        Ok((circuit, edits))
     }
 
     /// Change one elaborated numeric instance parameter without rebuilding
@@ -270,7 +366,7 @@ impl<'a> ControlSession<'a> {
         value: Real,
         max_edits: usize,
     ) -> SpiceResult<()> {
-        let circuit = self.candidate.circuit();
+        let circuit = self.circuit();
         let device = circuit
             .device(name)
             .ok_or_else(|| SpiceError::circuit(format!("unknown control instance {name}")))?;
@@ -302,10 +398,8 @@ impl<'a> ControlSession<'a> {
             return Err(SpiceError::circuit("control instance edit budget exceeded"));
         }
         edits.push(target.at(value)?);
-        let context = self.candidate.model_context();
-        self.candidate
-            .circuit_mut()
-            .set_control_overrides(&context, &edits)?;
+        let context = self.model_context_for(self.config());
+        self.circuit_mut().set_control_overrides(&context, &edits)?;
         self.edits = edits;
         Ok(())
     }
@@ -315,8 +409,7 @@ impl<'a> ControlSession<'a> {
     /// # Errors
     /// Missing parameter scope, an invalid candidate configuration.
     pub fn scope(&self) -> SpiceResult<&ParamScope> {
-        self.candidate
-            .config()
+        self.config()
             .params()
             .ok_or_else(|| SpiceError::circuit("control candidate has no parameter scope"))
     }
@@ -336,11 +429,11 @@ impl<'a> ControlSession<'a> {
     }
 
     pub(crate) fn plan(&self, card: &AnalysisCard) -> SpiceResult<AnalysisPlan> {
-        self.candidate.config().plan_for(card)
+        self.config().plan_for(card)
     }
 
     pub(crate) fn plans(&self, cards: &[AnalysisCard]) -> SpiceResult<Vec<AnalysisPlan>> {
-        self.candidate.config().plans_for(cards)
+        self.config().plans_for(cards)
     }
 
     fn expand_frontend(
@@ -415,9 +508,7 @@ impl<'a> ControlSession<'a> {
         let mut collector = PlotCollector::bounded(budget.plots, budget.cells);
         let mut origins = Vec::with_capacity(expected);
         let mut measurements = Vec::new();
-        self.candidate
-            .circuit_mut()
-            .clear_candidate_analysis_state();
+        self.circuit_mut().clear_candidate_analysis_state();
         for entry in &schedule {
             let plan = &plans[entry.card_index];
             let planned = routes.plan_outputs(entry);
@@ -426,7 +517,7 @@ impl<'a> ControlSession<'a> {
                 planned: &planned,
                 select: !cards.output.saves.is_empty(),
                 scope: &scope,
-                settings: self.candidate.config().fourier_settings(),
+                settings: self.config().fourier_settings(),
                 collector: &mut collector,
                 measurements: &mut measurements,
                 emit: &mut emit,
@@ -434,7 +525,7 @@ impl<'a> ControlSession<'a> {
                 next: 0,
             };
             self.execute_prepared(plan, &mut sink)?;
-            self.candidate.circuit_mut().note_completed(entry.kind);
+            self.circuit_mut().note_completed(entry.kind);
             if sink.active.is_some() || sink.next != planned.len() {
                 return Err(SpiceError::circuit(
                     "control driver did not complete planned plots",
@@ -492,7 +583,7 @@ impl<'a> ControlSession<'a> {
         if supported {
             names.extend_from_slice(cards.script_observations);
         }
-        let circuit = self.candidate.circuit_mut();
+        let circuit = self.circuit_mut();
         circuit.set_observations(&names)?;
         if !supported && !circuit.observations().is_empty() {
             return Err(SpiceError::not_yet_ported(
@@ -509,7 +600,7 @@ impl<'a> ControlSession<'a> {
     /// # Errors
     /// Analysis planning, solver or consumer failure.
     pub fn run_into(&mut self, input: AnalysisInput, sink: &mut dyn PointSink) -> SpiceResult<()> {
-        let plan = self.candidate.config().plan(input)?;
+        let plan = self.config().plan(input)?;
         self.execute(&plan, sink)
     }
 
@@ -524,7 +615,7 @@ impl<'a> ControlSession<'a> {
         max_plots: usize,
         max_cells: usize,
     ) -> SpiceResult<Vec<Plot>> {
-        let plan = self.candidate.config().plan(input)?;
+        let plan = self.config().plan(input)?;
         let expected = plan.plot_count();
         let mut collector = super::results::PlotCollector::bounded(max_plots, max_cells);
         self.execute(&plan, &mut collector)?;
@@ -532,9 +623,7 @@ impl<'a> ControlSession<'a> {
     }
 
     fn execute(&mut self, plan: &AnalysisPlan, sink: &mut dyn PointSink) -> SpiceResult<()> {
-        self.candidate
-            .circuit_mut()
-            .clear_candidate_analysis_state();
+        self.circuit_mut().clear_candidate_analysis_state();
         self.execute_prepared(plan, sink)
     }
 
@@ -543,12 +632,15 @@ impl<'a> ControlSession<'a> {
         plan: &AnalysisPlan,
         sink: &mut dyn PointSink,
     ) -> SpiceResult<()> {
-        let mut context = self.candidate.analysis_context();
+        let mut context = self
+            .config()
+            .context()
+            .with_candidate_model_overrides(self.model_context_for(self.config()));
         if !self.edits.is_empty() {
             // Persistent edits already include all candidate overlays. The
             // remaining context slots belong to the individual sweep point.
             context.candidate_model_overrides = None;
         }
-        plan.run_into(self.candidate.circuit_mut(), &context, sink)
+        plan.run_into(self.circuit_mut(), &context, sink)
     }
 }

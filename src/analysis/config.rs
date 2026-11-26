@@ -626,15 +626,28 @@ impl RunConfig {
             };
             config.apply(setting, evaluated)?;
         }
+        config.validate_continuation()?;
+        let unknown = SourceLoc::new(std::path::PathBuf::from("<run overrides>"), 0, 0);
+        if let Some(t) = overrides.temperature {
+            config.context.temperature = temperature(t, &unknown, "temperature override")?;
+        }
+        if let Some(t) = overrides.nominal_temperature {
+            config.context.nominal_temperature =
+                temperature(t, &unknown, "nominal temperature override")?;
+        }
+        Ok(config)
+    }
+
+    fn validate_continuation(&self) -> SpiceResult<()> {
         // The last-set counts and factor must form one valid schedule together
         // (with the deck's junction gmin, which seeds C's `spice3_gmin` ladder).
-        if let Err(error) = config.dc.policy().and_then(|policy| match policy.schedule {
+        if let Err(error) = self.dc.policy().and_then(|policy| match policy.schedule {
             crate::analysis::bias::ContinuationSchedule::Ngspice(stepping) => stepping
-                .fixed_gmin_ladder(policy.gmin_seed(config.context.gmin))
+                .fixed_gmin_ladder(policy.gmin_seed(self.context.gmin))
                 .map(|_| ()),
             crate::analysis::bias::ContinuationSchedule::Ladder { .. } => Ok(()),
         }) {
-            let location = config
+            let location = self
                 .applied
                 .iter()
                 .rev()
@@ -645,15 +658,27 @@ impl RunConfig {
                 );
             return Err(SpiceError::parse(location, error.to_string()));
         }
-        let unknown = SourceLoc::new(std::path::PathBuf::from("<run overrides>"), 0, 0);
-        if let Some(t) = overrides.temperature {
-            config.context.temperature = temperature(t, &unknown, "temperature override")?;
+        Ok(())
+    }
+
+    /// Transactionally apply an executed control option card to this snapshot.
+    /// The command has already resolved scalar expressions in its own scope.
+    /// Runtime records retain only the latest setter of each changed name.
+    pub(crate) fn with_control_options(&self, card: &OptionCard) -> SpiceResult<Self> {
+        let mut next = self.clone();
+        for setting in &card.settings {
+            if setting.expression.is_some() {
+                return Err(SpiceError::parse(
+                    setting.location.clone(),
+                    "unresolved control option",
+                ));
+            }
+            next.applied.retain(|record| record.name != setting.name);
+            next.ignored.retain(|record| record.name != setting.name);
+            next.apply(setting, None)?;
         }
-        if let Some(t) = overrides.nominal_temperature {
-            config.context.nominal_temperature =
-                temperature(t, &unknown, "nominal temperature override")?;
-        }
-        Ok(config)
+        next.validate_continuation()?;
+        Ok(next)
     }
 
     /// Record a validated no-op occurrence.

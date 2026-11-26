@@ -802,3 +802,69 @@ fn control_transient_breakpoint_spacing_matches_deck_and_is_request_local() {
     assert_eq!(reference, axis(plots[2]));
     assert_eq!(reference, axis(plots[3]));
 }
+
+#[test]
+fn option_commands_take_effect_in_execution_order_and_reset_restores_deck() {
+    let deck = ScriptDeck::from_text(
+        "ordered-options",
+        "* ordered options\n.param bias=-10\nv1 a 0 {bias}\nd1 a 0 dm\n.model dm d is=1e-30\n.options gmin=1e-12\n.op\n.control\nop\noption gmin=3e-14\nrun\nlet next_gmin=5e-14\noptions gmin={next_gmin} reltol=1e-6\nop\nalterparam bias=-20\nreset\nop\nquit\n.endc\n.end\n",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    assert_eq!(report.plots.len(), 4);
+    for (plot, expected) in report.plots.iter().zip([1e-11, 3e-13, 5e-13, 2e-11]) {
+        let actual = plot.plot.value("i(v1)", 0).unwrap().re;
+        assert!(
+            (actual - expected).abs() <= 1e-8 * expected,
+            "{actual:e} != {expected:e}"
+        );
+    }
+}
+
+#[test]
+fn runtime_shunts_rebuild_atomically_without_losing_instance_edits() {
+    let deck = ScriptDeck::from_text(
+        "runtime-shunt",
+        "* shunt option\n.param resistance=1k\nv1 a 0 1\nr1 a out {resistance}\n.control\nalter r1=2k\nop\noption rshunt=1k\nop\noption rshunt=2k\nop\nreset\nop\nquit\n.endc\n.end\n",
+    );
+    let (report, _) = deck.run(ScriptLimits::default()).unwrap();
+    assert_eq!(report.plots.len(), 4);
+    for (plot, expected) in report.plots.iter().zip([1., 1. / 3., 0.5, 1.]) {
+        let actual = plot.plot.value("v(out)", 0).unwrap().re;
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "{actual:e} != {expected:e}"
+        );
+    }
+}
+
+#[test]
+fn option_card_failure_preserves_previous_session_snapshot() {
+    let plan = divider();
+    let mut session = ControlSession::new(&plan, EvalLimits::default()).unwrap();
+    let option = |text: &str| {
+        Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("option.cir"),
+                &format!("* option\n.options {text}\n.end\n"),
+            ))
+            .unwrap()
+            .options
+            .remove(0)
+    };
+    session
+        .apply_options(&option("gmin=3e-14 rshunt=10k"))
+        .unwrap();
+    let before = session.config().clone();
+    assert!(
+        session
+            .apply_options(&option("gmin=5e-14 reltol=-1"))
+            .is_err()
+    );
+    assert_eq!(session.config(), &before);
+    assert!(session.apply_options(&option("rshunt=0")).is_err());
+    assert_eq!(session.config(), &before);
+    let plots = session
+        .run(AnalysisInput::new(AnalysisKind::OperatingPoint), 1, 100)
+        .unwrap();
+    assert!((plots[0].value("v(out)", 0).unwrap().re - 3. / 2.1).abs() < 1e-12);
+}
