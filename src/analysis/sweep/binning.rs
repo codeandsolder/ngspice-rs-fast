@@ -235,6 +235,28 @@ fn projection(
     Ok(selected)
 }
 
+fn emit(
+    sink: &mut dyn crate::analysis::PointSink,
+    result: &Plot,
+    row: &[Complex],
+    selected: Option<&[usize]>,
+    projected: &mut Vec<Complex>,
+) -> SpiceResult<()> {
+    if let Some(selected) = selected {
+        projected.clear();
+        for &index in selected {
+            projected.push(
+                *row.get(index)
+                    .ok_or_else(|| unsupported("invalid geometry sweep projection"))?,
+            );
+        }
+        sink.point(projected)
+    } else {
+        result.check_point(row)?;
+        sink.point(row)
+    }
+}
+
 pub(super) fn run(
     baseline: &Circuit,
     request: &AnalysisPlan,
@@ -330,19 +352,7 @@ pub(super) fn run(
                     unsupported("geometry sweep schema changed after validation")
                 })? = value;
             }
-            if let Some(selected) = &selected {
-                projected.clear();
-                for &index in selected {
-                    projected.push(
-                        *row.get(index)
-                            .ok_or_else(|| unsupported("invalid geometry sweep projection"))?,
-                    );
-                }
-                sink.point(&projected)?;
-            } else {
-                result.check_point(&row)?;
-                sink.point(&row)?;
-            }
+            emit(sink, &result, &row, selected.as_deref(), &mut projected)?;
             previous = x;
         }
     }

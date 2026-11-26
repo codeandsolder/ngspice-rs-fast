@@ -14,7 +14,7 @@
 //! [`Circuit::finalize`], which validates the graph and rebuilds the numbering
 //! in one go.
 
-mod bin_sweep;
+pub(crate) mod bin_sweep;
 pub(crate) use bin_sweep::{BinnedDeck, GeometryEdit};
 
 use std::borrow::Cow;

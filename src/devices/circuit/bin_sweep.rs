@@ -8,7 +8,7 @@ use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment, Parame
 use crate::primitives::{NodeTable, Real, SpiceError, SpiceResult};
 use std::collections::BTreeMap;
 
-pub struct BinnedDeck {
+pub(crate) struct BinnedDeck {
     devices: Vec<DeviceInstance>,
     models: Vec<ModelCard>,
     binned: BTreeMap<String, usize>,
@@ -16,7 +16,7 @@ pub struct BinnedDeck {
 }
 
 #[derive(Clone, Copy)]
-pub struct GeometryEdit<'a> {
+pub(crate) struct GeometryEdit<'a> {
     pub(crate) instance: &'a str,
     pub(crate) parameter: &'a str,
     pub(crate) value: Real,
