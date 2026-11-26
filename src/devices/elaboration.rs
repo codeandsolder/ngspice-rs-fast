@@ -4,7 +4,7 @@ use super::{
     txl::TxlPlan,
     urc::UrcPlan,
 };
-use crate::netlist::ast::DeviceInstance;
+use crate::netlist::ast::{CodePortKind, DeviceInstance};
 use crate::primitives::{NodeId, NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 use std::collections::BTreeSet;
 
@@ -229,7 +229,18 @@ impl<'a> PlannedBatch<'a> {
         let deck_nodes = instances
             .iter()
             .filter(|instance| !super::behavioural::dynamic::is_generated(instance))
-            .flat_map(|i| &i.nodes)
+            .flat_map(|i| {
+                i.nodes.iter().chain(
+                    i.code_ports
+                        .iter()
+                        .filter(|port| port.kind != CodePortKind::Digital)
+                        .flat_map(|port| {
+                            port.terminals.iter().flat_map(|terminal| {
+                                std::iter::once(&terminal.positive).chain(terminal.negative.iter())
+                            })
+                        }),
+                )
+            })
             .map(|name| NodeTable::canonical_name(name, nodes.auto_gnd()))
             .collect();
         Ok(Self {

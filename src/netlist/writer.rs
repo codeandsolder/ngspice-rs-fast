@@ -107,10 +107,10 @@ use std::io::{self, Write};
 use crate::primitives::{AnalysisKind, SourceLoc, SpiceError, SpiceResult, parse_spice_number};
 
 use crate::netlist::ast::{
-    AnalysisCard, DeviceInstance, FuncCard, FuncSpelling, GlobalCard, IncludeDirective, ModelCard,
-    Netlist, NodeHintCard, NodeHintValue, NumericVectorEntry, OptionCard, ParamCard,
-    ParameterAssignment, ParameterKind, PositionedValue, ScopeEntry, ScopeView, ScopedCardKind,
-    SourceWaveform, Subcircuit,
+    AnalysisCard, CodePortKind, DeviceInstance, FuncCard, FuncSpelling, GlobalCard,
+    IncludeDirective, ModelCard, Netlist, NodeHintCard, NodeHintValue, NumericVectorEntry,
+    OptionCard, ParamCard, ParameterAssignment, ParameterKind, PositionedValue, ScopeEntry,
+    ScopeView, ScopedCardKind, SourceWaveform, Subcircuit,
 };
 use crate::netlist::behavioural::forms::{
     B_SETTERS, NonlinearForm, PolyControls, PolyForm, TableForm, TableInput,
@@ -969,45 +969,65 @@ fn model_flags(base: &str) -> &'static [&'static str] {
 /// Write the two explicitly typed differential analog ports in XSPICE
 /// input/output order. Internal lowered A cards remain unrepresentable.
 fn code_model_ports(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResult<()> {
-    let [op, on, ip, inn] = device.nodes.as_slice() else {
-        return Err(refuse("expected two analog ports", Some(&device.location)));
-    };
-    let [input, output] = device.parameters.as_slice() else {
+    let location = &device.location;
+    if device.code_ports.is_empty() || !device.nodes.is_empty() || !device.parameters.is_empty() {
         return Err(refuse(
-            "expected two typed analog ports",
-            Some(&device.location),
+            "expected ordered typed A-instance ports",
+            Some(location),
         ));
-    };
-    for (direction, parameter, positive, negative) in
-        [("input", input, ip, inn), ("output", output, op, on)]
-    {
-        if parameter.name != direction || parameter.kind != ParameterKind::Textual {
+    }
+    for port in &device.code_ports {
+        if port.terminals.is_empty() || (!port.vector && port.terminals.len() != 1) {
             return Err(refuse(
-                "invalid analog port parameter",
-                Some(&parameter.location),
+                "invalid A-instance port cardinality",
+                Some(location),
             ));
         }
-        let kind = match parameter.value.as_str() {
-            "voltage" => "%vd",
-            "current" => "%id",
-            _ => {
-                return Err(refuse(
-                    "unsupported analog port type",
-                    Some(&parameter.location),
-                ));
+        if let Some(marker) = port.kind.marker() {
+            parts.word(marker)?;
+        }
+        if port.vector {
+            parts.word("[")?;
+        } else if port.kind.marker().is_some() {
+            parts.push('(')?;
+        }
+        for terminal in &port.terminals {
+            if terminal.negative.is_some() != port.kind.differential()
+                || (terminal.inverted
+                    && !matches!(port.kind, CodePortKind::Digital | CodePortKind::Default))
+            {
+                return Err(refuse("invalid A-instance terminal", Some(location)));
             }
-        };
-        parts.word(kind)?;
-        parts.push('(')?;
-        parts.push_str(node(parts, positive, &device.location)?)?;
-        parts.word(node(parts, negative, &device.location)?)?;
-        parts.push(')')?;
+            if terminal.inverted {
+                parts.word("~")?;
+            }
+            parts.word(code_port_name(parts, &terminal.positive, location)?)?;
+            if let Some(negative) = &terminal.negative {
+                parts.word(code_port_name(parts, negative, location)?)?;
+            }
+        }
+        if port.vector {
+            parts.word("]")?;
+        } else if port.kind.marker().is_some() {
+            parts.push(')')?;
+        }
     }
     let model = device
         .model
         .as_deref()
-        .ok_or_else(|| refuse("A instance needs a declared model", Some(&device.location)))?;
-    parts.word(node(parts, model, &device.location)?)
+        .ok_or_else(|| refuse("A instance needs a declared model", Some(location)))?;
+    parts.word(code_port_name(parts, model, location)?)
+}
+
+fn code_port_name<'a>(
+    parts: &Card<'_>,
+    value: &'a str,
+    location: &SourceLoc,
+) -> SpiceResult<&'a str> {
+    if value.starts_with('%') || value.contains(['[', ']', '~']) {
+        return Err(refuse("invalid A-instance name", Some(location)));
+    }
+    node(parts, value, location)
 }
 
 fn device_prefix<'a>(

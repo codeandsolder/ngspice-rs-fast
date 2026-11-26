@@ -170,6 +170,7 @@ pub(super) fn tokenize_bounded(
     budget.card_size(line.text.len(), &line.location)?;
     let text = line.text.as_str();
     let bytes = text.as_bytes();
+    let code_card = text.trim_start().starts_with(['a', 'A']);
     let mut tokens = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
@@ -180,7 +181,7 @@ pub(super) fn tokenize_bounded(
         let location = line.location_at(index);
         budget.tokens(1, &location)?;
         budget.allocation(tokens.try_reserve(1), &location)?;
-        let (kind, end) = scan_token(text, index, budget, &location)?;
+        let (kind, end) = scan_token(text, index, budget, &location, code_card)?;
         let spelling = copy_text(&text[index..end], budget, &location)?;
         let kind = kind.into_owned(budget, &location)?;
         tokens.push(Token::new(kind, spelling, line, index, location));
@@ -215,7 +216,7 @@ pub(super) fn scan_next<'a>(
     let mut budget = SourceBudget::new(SourceLimits::default());
     budget.card_size(text.len(), &position)?;
     budget.tokens(1, &position)?;
-    let (kind, end) = scan_token(text, start, &mut budget, &position)?;
+    let (kind, end) = scan_token(text, start, &mut budget, &position, false)?;
     *cursor = end;
     Ok(Some(Lexeme {
         kind,
@@ -228,9 +229,11 @@ fn scan_token<'a>(
     start: usize,
     budget: &mut SourceBudget,
     location: &SourceLoc,
+    code_card: bool,
 ) -> SpiceResult<(TokenKind<Cow<'a, str>>, usize)> {
     let bytes = text.as_bytes();
     let kind = match bytes[start] {
+        b'[' | b']' | b'~' if code_card => TokenKind::Word,
         b'(' => TokenKind::LParen,
         b')' => TokenKind::RParen,
         b',' => TokenKind::Comma,
@@ -256,6 +259,7 @@ fn scan_token<'a>(
             while end < bytes.len()
                 && !bytes[end].is_ascii_whitespace()
                 && !DELIMITERS.contains(&bytes[end])
+                && !(code_card && b"[]~".contains(&bytes[end]))
             {
                 end += 1;
             }

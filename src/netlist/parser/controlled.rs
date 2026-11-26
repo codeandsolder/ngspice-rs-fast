@@ -74,6 +74,7 @@ fn body(input: &mut Input<'_>, instance: &Token, designator: char) -> Result<Par
     ];
     let device = |nodes: Vec<String>, parameters: Vec<ParameterAssignment>, input: &Input<'_>| {
         let device = DeviceInstance {
+            code_ports: Vec::new(),
             name: instance.text.to_ascii_lowercase(),
             designator,
             nodes,

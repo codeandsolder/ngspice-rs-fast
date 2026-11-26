@@ -35,6 +35,7 @@ pub(super) fn transistor_card<'a>(input: &mut Input<'a>) -> Result<ParsedCard> {
     .parse_next(input)?;
     let (nodes, model) = connections;
     Ok(ParsedCard::Device(DeviceInstance {
+        code_ports: Vec::new(),
         name: instance.text.to_ascii_lowercase(),
         designator,
         nodes: nodes

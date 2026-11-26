@@ -99,6 +99,7 @@ fn instance(
     location: &SourceLoc,
 ) -> DeviceInstance {
     DeviceInstance {
+        code_ports: Vec::new(),
         name,
         designator,
         nodes,

@@ -768,6 +768,9 @@ fn write_device(ctx: &Ctx<'_>, out: &mut Out, indent: usize, n: usize, device: &
     );
     let nodes: Vec<String> = device.nodes.iter().map(|x| quote(x)).collect();
     out.line(indent + 1, format!("nodes: {}", nodes.join(" ")));
+    if !device.code_ports.is_empty() {
+        out.line(indent + 1, format!("code ports: {:?}", device.code_ports));
+    }
     out.line(
         indent + 1,
         format!(

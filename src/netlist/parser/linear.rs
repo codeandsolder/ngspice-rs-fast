@@ -39,6 +39,7 @@ pub(super) fn device_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     })
     .parse_next(input)?;
     Ok(ParsedCard::Device(DeviceInstance {
+        code_ports: Vec::new(),
         name: name.text.to_ascii_lowercase(),
         designator,
         nodes: vec![
