@@ -259,7 +259,7 @@ fn bind_numeric_site(
         _ if (card.model.is_none()
             || circuit
                 .device(&card.name)
-                .is_some_and(|device| device.model_candidate_setters_are_stable()))
+                .is_some_and(crate::devices::Device::model_candidate_setters_are_stable))
             && circuit
                 .bind_instance_target(&card.name, &setter.name)
                 .is_ok() =>
