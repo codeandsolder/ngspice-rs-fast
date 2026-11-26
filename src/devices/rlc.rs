@@ -501,6 +501,7 @@ pub(super) fn resistor_noise<'a>(
 /// supplies a validated effective value and IC; no identity or history is
 /// allocated here. The two families keep their distinct C stamp ordering.
 pub(super) struct ReactiveLoad<'a> {
+    pub(super) bias: Option<&'a crate::devices::passive_bias::PassiveInitialization>,
     pub(super) name: &'a str,
     pub(super) terminals: [NodeId; 2],
     pub(super) value: Real,
@@ -536,6 +537,9 @@ impl ReactiveLoad<'_> {
         let [positive, negative] = self.terminals;
         let v = context.node_voltage(positive) - context.node_voltage(negative);
         let charge = self.value * v;
+        if let Some(bias) = self.bias {
+            bias.stamp_capacitor(self.terminals, context)?;
+        }
         if context.mode.is_dc() {
             return record_dc_state(context, charge);
         }
@@ -569,6 +573,9 @@ impl ReactiveLoad<'_> {
         context: &mut crate::devices::linear::LinearContext<'_>,
     ) -> SpiceResult<()> {
         context.system.has_initial_conditions |= self.initial.is_some();
+        if let Some(bias) = self.bias {
+            bias.release_capacitor(context)?;
+        }
         context.nodal(self.terminals, self.value, true)
     }
 
@@ -581,6 +588,11 @@ impl ReactiveLoad<'_> {
         }
         if context.mode.is_dc() {
             record_dc_state(context, flux)?;
+            if let Some(bias) = self.bias
+                && bias.stamp_inductor(self.terminals, row, context)?
+            {
+                return Ok(());
+            }
             return crate::devices::linear::branch_stamp(
                 context.matrix,
                 context.unknowns,
@@ -685,6 +697,7 @@ pub struct Capacitor {
     capacitance: Real,
     /// Initial voltage, from `ic=`; `None` when not given.
     initial_voltage: Option<Real>,
+    bias: Option<Box<crate::devices::passive_bias::PassiveInitialization>>,
 }
 
 impl Capacitor {
@@ -714,6 +727,7 @@ impl Capacitor {
             terminals,
             capacitance,
             initial_voltage,
+            bias: None,
         })
     }
 
@@ -722,7 +736,11 @@ impl Capacitor {
             name: &self.name,
             terminals: self.terminals,
             value: self.capacitance,
-            initial: self.initial_voltage,
+            initial: crate::devices::passive_bias::initial_value(
+                self.bias.as_deref(),
+                self.initial_voltage,
+            ),
+            bias: self.bias.as_deref(),
         }
     }
 
@@ -741,11 +759,27 @@ impl Capacitor {
 
 impl Device for Capacitor {
     /// `capsetup.c`.
+    fn bind_passive_initialization(
+        &mut self,
+        policy: crate::devices::passive_bias::PassiveInitialization,
+    ) -> SpiceResult<()> {
+        policy.check_kind(crate::devices::traits::StorageKind::Capacitor)?;
+        self.bias = Some(Box::new(policy));
+        Ok(())
+    }
+
+    fn has_passive_bias(&self) -> bool {
+        crate::devices::passive_bias::has_constraints(self.bias.as_deref())
+    }
+
     fn setup_matrix(
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
     ) -> SpiceResult<bool> {
         setup.conductance(self.terminals[0], self.terminals[1]);
+        if crate::devices::passive_bias::needs_branch(self.bias.as_deref()) {
+            setup.inductor(self.terminals[0], self.terminals[1], setup.branch(0)?);
+        }
         Ok(true)
     }
     fn observation_parameter(
@@ -801,7 +835,7 @@ impl Device for Capacitor {
         value: Real,
         context: &crate::devices::ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        crate::devices::passive::swept_literal(
+        let mut replacement = crate::devices::passive::swept_literal(
             &self.name,
             self.terminals,
             crate::devices::passive::PassiveKind::Capacitor,
@@ -809,7 +843,11 @@ impl Device for Capacitor {
             self.initial_voltage,
             (parameter, value),
             context,
-        )
+        )?;
+        if let Some(policy) = &self.bias {
+            replacement.bind_passive_initialization((**policy).clone())?;
+        }
+        Ok(replacement)
     }
 
     /// Linear in `.disto`: C gives this device no distortion routine
@@ -844,9 +882,16 @@ impl Device for Capacitor {
         &self.terminals
     }
 
-    /// A capacitor is an open circuit at DC, so it adds no unknown.
+    /// Reserve an exact voltage constraint branch only when a prepared
+    /// analysis needs one. Native capacitors add no branch.
     fn branch_currents(&self) -> usize {
-        0
+        usize::from(crate::devices::passive_bias::needs_branch(
+            self.bias.as_deref(),
+        ))
+    }
+
+    fn branch_quantity(&self, _branch: usize) -> crate::devices::BranchQuantity {
+        crate::devices::BranchQuantity::BiasCurrent
     }
 
     /// Charge `q = C v` and current `dq/dt` (C `CAPqcap`/`CAPccap`).
@@ -865,7 +910,7 @@ impl Device for Capacitor {
         Some(Ok(crate::devices::traits::StorageElement {
             kind: crate::devices::traits::StorageKind::Capacitor,
             value: self.capacitance,
-            initial: self.initial_voltage,
+            initial: self.load().initial,
         }))
     }
 
@@ -899,6 +944,7 @@ impl Device for Capacitor {
                 initial_condition: self.initial_voltage,
             },
             context,
+            crate::devices::passive_bias::needs_branch(self.bias.as_deref()),
         )))
     }
 
@@ -924,6 +970,7 @@ pub struct Inductor {
     inductance: Real,
     /// Initial current, from `ic=`; `None` when not given.
     initial_current: Option<Real>,
+    bias: Option<Box<crate::devices::passive_bias::PassiveInitialization>>,
 }
 
 impl Inductor {
@@ -953,6 +1000,7 @@ impl Inductor {
             terminals,
             inductance,
             initial_current,
+            bias: None,
         })
     }
 
@@ -961,7 +1009,11 @@ impl Inductor {
             name: &self.name,
             terminals: self.terminals,
             value: self.inductance,
-            initial: self.initial_current,
+            initial: crate::devices::passive_bias::initial_value(
+                self.bias.as_deref(),
+                self.initial_current,
+            ),
+            bias: self.bias.as_deref(),
         }
     }
 
@@ -980,6 +1032,19 @@ impl Inductor {
 
 impl Device for Inductor {
     /// `indsetup.c`.
+    fn bind_passive_initialization(
+        &mut self,
+        policy: crate::devices::passive_bias::PassiveInitialization,
+    ) -> SpiceResult<()> {
+        policy.check_kind(crate::devices::traits::StorageKind::Inductor)?;
+        self.bias = Some(Box::new(policy));
+        Ok(())
+    }
+
+    fn has_passive_bias(&self) -> bool {
+        crate::devices::passive_bias::has_constraints(self.bias.as_deref())
+    }
+
     fn setup_matrix(
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
@@ -1017,7 +1082,7 @@ impl Device for Inductor {
         value: Real,
         context: &crate::devices::ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
-        crate::devices::passive::swept_literal(
+        let mut replacement = crate::devices::passive::swept_literal(
             &self.name,
             self.terminals,
             crate::devices::passive::PassiveKind::Inductor,
@@ -1025,7 +1090,11 @@ impl Device for Inductor {
             self.initial_current,
             (parameter, value),
             context,
-        )
+        )?;
+        if let Some(policy) = &self.bias {
+            replacement.bind_passive_initialization((**policy).clone())?;
+        }
+        Ok(replacement)
     }
 
     /// Linear in `.disto`: C gives this device no distortion routine
@@ -1084,7 +1153,7 @@ impl Device for Inductor {
         Some(Ok(crate::devices::traits::StorageElement {
             kind: crate::devices::traits::StorageKind::Inductor,
             value: self.inductance,
-            initial: self.initial_current,
+            initial: self.load().initial,
         }))
     }
 
@@ -1095,7 +1164,7 @@ impl Device for Inductor {
         Some(Ok(crate::devices::traits::InductanceValue {
             effective: self.inductance,
             coupling_base: self.inductance,
-            initial: self.initial_current.unwrap_or(0.),
+            initial: self.load().initial.unwrap_or(0.),
         }))
     }
 
@@ -1136,6 +1205,7 @@ impl Device for Inductor {
                 initial_condition: self.initial_current,
             },
             context,
+            false,
         )))
     }
 
@@ -1231,6 +1301,7 @@ mod tests {
             reltol: crate::devices::DEFAULT_RELTOL,
             frequency: 0.,
             mode: crate::devices::traits::AnalysisMode::Transient { time: 0., dt: 1e-6 },
+            bias_analysis: None,
             branches: 0..0,
             controls: &[],
             mutual: &[],
