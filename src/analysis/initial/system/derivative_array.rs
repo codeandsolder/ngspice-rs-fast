@@ -16,11 +16,39 @@ use crate::devices::{
 };
 use crate::maths::integrator::{ChargeHistory, Coefficients};
 use crate::maths::taylor::MAX_ORDER;
-use crate::maths::{SparseMatrix, Vector};
+use crate::maths::{SparseMatrix, Triplet, Vector};
 use crate::primitives::{Real, SpiceResult};
 
 const MAX_ARRAY_ENTRIES: usize = 8_388_608;
 const MAX_ARRAY_VARIABLES: usize = 1_048_576;
+const MAX_ARRAY_ROWS: usize = 1_048_576;
+
+/// PhysicalDaeTaylor validates and folds every Jacobian before returning it.
+/// Restrict constraint traversal to the requested row rather than scanning
+/// the entire derivative matrix for each independent storage coordinate.
+fn folded_row(matrix: &SparseMatrix, row: usize) -> &[Triplet] {
+    let entries = matrix.triplets();
+    let start = entries.partition_point(|term| term.row < row);
+    let end = start + entries[start..].partition_point(|term| term.row == row);
+    &entries[start..end]
+}
+
+/// Account for raw contributions before inserting them, including duplicates
+/// that will later be folded. Storage and companion rows share the same cap.
+struct Stamps<'a> {
+    matrix: &'a mut SparseMatrix,
+    remaining: usize,
+}
+
+impl Stamps<'_> {
+    fn add(&mut self, row: usize, col: usize, value: Real) -> SpiceResult<()> {
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .ok_or_else(|| failure("derivative array exceeds its stamp budget"))?;
+        self.matrix.add(row, col, value)
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct ResidualScale {
@@ -86,7 +114,7 @@ impl<'a> Constraint<'a> {
         state: &[Vector],
         time_scale: Real,
         point: &PhysicalDaeTaylor,
-        matrix: &mut SparseMatrix,
+        matrix: &mut Stamps<'_>,
     ) -> SpiceResult<(Real, ResidualScale)> {
         if let Self::Companion(companion) = self {
             return companion.stamp(row, state, time_scale, point, matrix);
@@ -119,11 +147,7 @@ impl<'a> Constraint<'a> {
             }
             Self::Charge(equation, charge) => {
                 let mut backward = 0.;
-                for term in point.capacitance[0]
-                    .triplets()
-                    .iter()
-                    .filter(|term| term.row == equation)
-                {
+                for term in folded_row(&point.capacitance[0], equation) {
                     matrix.add(row, term.col, term.value)?;
                     backward = term
                         .value
@@ -216,11 +240,7 @@ impl StoredQuantity {
                 Ok(())
             }
             Self::Equation(row, scale) => {
-                for term in point.capacitance[degree]
-                    .triplets()
-                    .iter()
-                    .filter(|term| term.row == row)
-                {
+                for term in folded_row(&point.capacitance[degree], row) {
                     visit(term.col, scale * term.value)?;
                 }
                 Ok(())
@@ -246,7 +266,7 @@ impl CompanionConstraint<'_> {
         state: &[Vector],
         time_scale: Real,
         point: &PhysicalDaeTaylor,
-        matrix: &mut SparseMatrix,
+        matrix: &mut Stamps<'_>,
     ) -> SpiceResult<(Real, ResidualScale)> {
         let accepted = |age, offset| {
             self.history
@@ -370,7 +390,8 @@ impl Array {
         let physical_rows = width * order;
         let rows = physical_rows
             .checked_add(initial.len())
-            .ok_or_else(|| failure("derivative array row count overflow"))?;
+            .filter(|&n| n <= MAX_ARRAY_ROWS)
+            .ok_or_else(|| failure("derivative array exceeds its row budget"))?;
         let mut array = Self {
             matrix: SparseMatrix::new(rows, variables),
             residual: crate::primitives::filled_vec(rows, 0., "derivative array residual")?,
@@ -384,7 +405,10 @@ impl Array {
             optional: Vec::new(),
         };
         let mut degree = 1.;
-        let mut entries = 0_usize;
+        let mut stamps = Stamps {
+            matrix: &mut array.matrix,
+            remaining: MAX_ARRAY_ENTRIES,
+        };
         for k in 0..order {
             let multiplier = degree / scale;
             let offset = k * width;
@@ -404,14 +428,10 @@ impl Array {
                     (point.capacitance.get(k + 1 - j), multiplier),
                 ] {
                     let Some(matrix) = matrix else { continue };
-                    entries = entries.saturating_add(matrix.triplets().len());
-                    if entries > MAX_ARRAY_ENTRIES {
-                        return Err(failure("derivative array exceeds its stamp budget"));
-                    }
                     for term in matrix.triplets() {
                         let row = offset + term.row;
                         let coefficient = factor * term.value;
-                        array.matrix.add(row, j * width + term.col, coefficient)?;
+                        stamps.add(row, j * width + term.col, coefficient)?;
                         array.scale[row] = ResidualScale::equal(coefficient.abs().mul_add(
                             coefficient_state.as_slice()[term.col].abs(),
                             array.scale[row].backward,
@@ -423,8 +443,7 @@ impl Array {
         }
         for (index, constraint) in initial.iter().copied().enumerate() {
             let row = physical_rows + index;
-            let (residual, scale) =
-                constraint.stamp(row, state, scale, point, &mut array.matrix)?;
+            let (residual, scale) = constraint.stamp(row, state, scale, point, &mut stamps)?;
             array.residual[row] = residual;
             array.scale[row] = scale;
             if constraint.optional() {
@@ -789,5 +808,51 @@ fn solve(
                 order_hint: state.len().saturating_sub(3).max(2),
             }));
         }
+    }
+}
+
+#[cfg(test)]
+mod assembly_tests {
+    use super::*;
+
+    #[test]
+    fn folded_storage_rows_include_only_their_own_terms() {
+        let mut matrix = SparseMatrix::new(8, 8);
+        for (row, col, value) in [(5, 2, 3.), (1, 4, 2.), (5, 0, 1.), (5, 2, -1.)] {
+            matrix.add(row, col, value).unwrap();
+        }
+        matrix.fold_duplicates();
+        assert_eq!(
+            folded_row(&matrix, 5),
+            &[
+                Triplet {
+                    row: 5,
+                    col: 0,
+                    value: 1.
+                },
+                Triplet {
+                    row: 5,
+                    col: 2,
+                    value: 2.
+                }
+            ]
+        );
+        for row in [0, 2, 4, 6, 7] {
+            assert!(folded_row(&matrix, row).is_empty());
+        }
+    }
+
+    #[test]
+    fn raw_stamp_budget_counts_repeated_contributions_before_folding() {
+        let mut matrix = SparseMatrix::new(1, 1);
+        let mut stamps = Stamps {
+            matrix: &mut matrix,
+            remaining: 2,
+        };
+        stamps.add(0, 0, 1.).unwrap();
+        stamps.add(0, 0, -1.).unwrap();
+        assert!(stamps.add(0, 0, 2.).is_err());
+        matrix.fold_duplicates();
+        assert_eq!(matrix.get(0, 0), 0.);
     }
 }
