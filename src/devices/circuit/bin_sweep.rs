@@ -8,6 +8,10 @@ use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment, Parame
 use crate::primitives::{NodeTable, Real, SpiceError, SpiceResult};
 use std::collections::BTreeMap;
 
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
 pub(crate) struct BinnedDeck {
     devices: Vec<DeviceInstance>,
     models: Vec<ModelCard>,
@@ -16,6 +20,10 @@ pub(crate) struct BinnedDeck {
 }
 
 #[derive(Clone, Copy)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
 pub(crate) struct GeometryEdit<'a> {
     pub(crate) instance: &'a str,
     pub(crate) parameter: &'a str,
