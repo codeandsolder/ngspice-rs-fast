@@ -905,3 +905,34 @@ fn derivative_chain_preserves_inductor_initial_flux_and_exact_kcl() -> SpiceResu
     }
     Ok(())
 }
+
+#[test]
+fn long_derivative_chain_is_independent_of_print_step_normalization() -> SpiceResult<()> {
+    use std::fmt::Write;
+    let mut body = String::from("v1 in 0 PWL(0 2 1m 3)\n");
+    let mut previous = String::from("in");
+    for index in 1..=60 {
+        let next = format!("n{index}");
+        writeln!(&mut body, "b{index} {next} 0 v=ddt(v({previous}))").unwrap();
+        previous = next;
+    }
+    body.push_str("r1 n60 0 1k\n.options reltol=1e-8 vntol=1n");
+    let plot = run(
+        &body,
+        AnalysisKind::Transient,
+        &["1u", "2u", "0", "1u", "uic", "method=gear"],
+    )?;
+    assert!(plot.point_count() > 10);
+    for point in 0..plot.point_count() {
+        for index in 1..=60 {
+            let expected = if index == 1 { 1000. } else { 0. };
+            close(
+                plot.value(&format!("v(n{index})"), point).unwrap().re,
+                expected,
+                1e-9,
+            );
+        }
+        close(plot.value("i(b60)", point).unwrap().re, 0., 1e-12);
+    }
+    Ok(())
+}

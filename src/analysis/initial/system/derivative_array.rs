@@ -595,6 +595,9 @@ fn newton(
             return Ok(ArrayNewton::NeedOrder);
         }
         let (ratio, roundoff) = array.merit(initial, &step.independent, tol);
+        if ratio > 1. {
+            violation = array.initial_violation(initial, tol);
+        }
         if ratio <= 1. {
             if roundoff <= 1. {
                 return Ok(ArrayNewton::Converged);

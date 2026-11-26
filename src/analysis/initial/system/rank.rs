@@ -5,8 +5,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::maths::{SparseMatrix, Vector};
-use crate::primitives::numeric::{binary_exponent, scale_power};
+use crate::primitives::numeric::binary_exponent;
+
+mod wide;
 use crate::primitives::{Real, SpiceResult};
+use wide::Wide;
 
 use super::failure;
 
@@ -14,25 +17,35 @@ use super::failure;
 /// in unrelated columns must not suppress a small but independent pivot.
 #[derive(Clone, Copy, Debug, Default)]
 struct Coefficient {
-    value: Real,
-    error: Real,
+    value: Wide,
+    error: Wide,
 }
 
 impl Coefficient {
-    const fn exact(value: Real) -> Self {
-        Self { value, error: 0. }
+    fn exact(value: Real) -> Self {
+        Self {
+            value: Wide::from_real(value),
+            error: Wide::ZERO,
+        }
+    }
+
+    fn scaled(value: Real, exponent: i32) -> Self {
+        Self {
+            value: Wide::from_real(value).shifted(i64::from(exponent)),
+            error: Wide::ZERO,
+        }
     }
 
     const fn finite(self) -> bool {
-        self.value.is_finite() && self.error.is_finite()
+        self.value.finite() && self.error.finite()
     }
 
     fn eliminate(self, factor: Self, pivot: Self) -> Self {
-        let value = (-factor.value).mul_add(pivot.value, self.value);
-        let error = Real::EPSILON.mul_add(
+        let value = factor.value.negate().mul_add(pivot.value, self.value);
+        let error = Wide::from_real(Real::EPSILON).mul_add(
             value.abs(),
             factor.error.mul_add(
-                pivot.value.abs() + pivot.error,
+                pivot.value.abs().add(pivot.error),
                 factor.value.abs().mul_add(pivot.error, self.error),
             ),
         );
@@ -40,16 +53,19 @@ impl Coefficient {
     }
 
     fn normalized(self, pivot: Self) -> Self {
-        let value = self.value / pivot.value;
-        let error = Real::EPSILON.mul_add(
+        let value = self.value.divide(pivot.value);
+        let error = Wide::from_real(Real::EPSILON).mul_add(
             value.abs(),
-            value.abs().mul_add(pivot.error, self.error) / (pivot.value.abs() - pivot.error),
+            value
+                .abs()
+                .mul_add(pivot.error, self.error)
+                .divide(pivot.value.abs().subtract(pivot.error)),
         );
         Self { value, error }
     }
 
     fn significant(self) -> bool {
-        self.value.abs() > self.error
+        self.value.magnitude_cmp(self.error).is_gt()
     }
 }
 
@@ -58,7 +74,7 @@ type Row = BTreeMap<usize, Coefficient>;
 struct Pivot {
     column: usize,
     terms: Row,
-    rhs: Real,
+    rhs: Wide,
 }
 
 struct Basis {
@@ -85,7 +101,7 @@ impl Basis {
         Ok(())
     }
 
-    fn insert(&mut self, mut terms: Row, mut rhs: Real) -> SpiceResult<bool> {
+    fn insert(&mut self, mut terms: Row, mut rhs: Wide) -> SpiceResult<bool> {
         self.charge(terms.len())?;
         let mut pending: BTreeSet<_> = terms
             .keys()
@@ -100,7 +116,7 @@ impl Basis {
             for (&column, &value) in &pivot.terms {
                 let old = terms.get(&column).copied().unwrap_or_default();
                 let next = old.eliminate(factor, value);
-                if next.value == 0. && next.error == 0. {
+                if next.value.is_zero() && next.error.is_zero() {
                     terms.remove(&column);
                 } else {
                     terms.insert(column, next);
@@ -109,9 +125,9 @@ impl Basis {
                     }
                 }
             }
-            rhs = (-factor.value).mul_add(pivot.rhs, rhs);
+            rhs = factor.value.negate().mul_add(pivot.rhs, rhs);
         }
-        if !rhs.is_finite() || terms.values().any(|v| !v.finite()) {
+        if !rhs.finite() || terms.values().any(|v| !v.finite()) {
             return Err(failure(
                 "nonfinite rank reduction of instantaneous constraints",
             ));
@@ -125,7 +141,7 @@ impl Basis {
             .max_by(|(ca, a), (cb, b)| {
                 (**ca >= self.required_prefix)
                     .cmp(&(**cb >= self.required_prefix))
-                    .then_with(|| a.value.abs().total_cmp(&b.value.abs()))
+                    .then_with(|| a.value.magnitude_cmp(b.value))
             })
         else {
             return Ok(false);
@@ -134,8 +150,8 @@ impl Basis {
         for coefficient in terms.values_mut() {
             *coefficient = coefficient.normalized(pivot);
         }
-        rhs /= pivot.value;
-        if !rhs.is_finite() || terms.values().any(|v| !v.finite()) {
+        rhs = rhs.divide(pivot.value);
+        if !rhs.finite() || terms.values().any(|v| !v.finite()) {
             return Err(failure("nonfinite normalized instantaneous constraint"));
         }
         self.by_column[column] = Some(self.pivots.len());
@@ -170,19 +186,23 @@ impl Basis {
         // Free tail coefficients are not initial gauges. The projected
         // equations proved that none changes the required prefix, so zero
         // is only a choice of particular solution for the unused tail.
-        let mut solution = Vector::zeros(self.by_column.len());
+        let mut solution = vec![Wide::ZERO; self.by_column.len()];
         for pivot in self.pivots.iter().rev() {
             let value = pivot
                 .terms
                 .iter()
                 .fold(pivot.rhs, |rhs, (&column, &coefficient)| {
-                    (-coefficient.value).mul_add(solution.as_slice()[column], rhs)
+                    coefficient.value.negate().mul_add(solution[column], rhs)
                 });
-            solution.as_mut_slice()[pivot.column] = value;
+            solution[pivot.column] = value;
         }
-        for (value, &exponent) in solution.as_mut_slice().iter_mut().zip(column_exponents) {
-            *value = scale_power(*value, -exponent);
-        }
+        let solution = Vector::from(
+            solution
+                .into_iter()
+                .zip(column_exponents)
+                .map(|(value, &exponent)| value.shifted(-i64::from(exponent)).finish())
+                .collect::<Vec<_>>(),
+        );
         if !solution.is_finite() {
             return Err(failure("nonfinite rank-completed instantaneous solution"));
         }
@@ -339,22 +359,22 @@ fn reduce(
         let mut terms = Row::new();
         for entry in &entries[ranges[row].clone()] {
             if entry.value != 0. {
-                let value = scale_power(entry.value, -exponent - column_exponents[entry.col]);
-                if value == 0. {
-                    return Err(failure(
-                        "instantaneous rank scaling would lose a nonzero coefficient",
-                    ));
-                }
-                terms.insert(entry.col, Coefficient::exact(value));
+                terms.insert(
+                    entry.col,
+                    Coefficient::scaled(entry.value, -exponent - column_exponents[entry.col]),
+                );
             }
         }
-        independent[row] = basis.insert(terms, scale_power(rhs[row], -exponent))?;
+        independent[row] = basis.insert(
+            terms,
+            Wide::from_real(rhs[row]).shifted(-i64::from(exponent)),
+        )?;
     }
     for &column in gauges {
         if basis.pivots.len() == matrix.cols() {
             break;
         }
-        basis.insert(Row::from([(column, Coefficient::exact(1.))]), 0.)?;
+        basis.insert(Row::from([(column, Coefficient::exact(1.))]), Wide::ZERO)?;
     }
     Ok(Reduction {
         basis,
@@ -445,13 +465,16 @@ mod priority_tests {
             basis
                 .insert(
                     Row::from([(0, Coefficient::exact(2.)), (1, Coefficient::exact(1.))]),
-                    4.
+                    Wide::from_real(4.)
                 )
                 .unwrap()
         );
         assert!(
             basis
-                .insert(Row::from([(1, Coefficient::exact(1.))]), 2.)
+                .insert(
+                    Row::from([(1, Coefficient::exact(1.))]),
+                    Wide::from_real(2.)
+                )
                 .unwrap()
         );
         assert!(
@@ -462,7 +485,7 @@ mod priority_tests {
                         (1, Coefficient::exact(1.)),
                         (2, Coefficient::exact(1e-30))
                     ]),
-                    4.
+                    Wide::from_real(4.)
                 )
                 .unwrap()
         );
@@ -478,7 +501,7 @@ mod projected_tests {
     // Exact derivative-array structure for an arbitrary linear chain:
     // x_0(t) = p(t), x_i(t) = d x_(i-1) / dt. Highest-order
     // Taylor coefficients are intentionally not assigned boundary values.
-    fn derivative_chain(depth: usize, order: usize) -> (SparseMatrix, Vec<Real>) {
+    fn derivative_chain(depth: usize, order: usize, scale: Real) -> (SparseMatrix, Vec<Real>) {
         let width = depth + 1;
         let mut matrix = SparseMatrix::new(order * width, (order + 1) * width);
         let mut rhs = vec![0.; order * width];
@@ -486,11 +509,14 @@ mod projected_tests {
         for k in 0..order {
             let offset = k * width;
             matrix.add(offset, offset, 1.).unwrap();
-            rhs[offset] = [1., 2., 3., 4.].get(k).copied().unwrap_or(0.);
+            rhs[offset] = [1., 2. * scale, 3. * scale.powi(2), 4. * scale.powi(3)]
+                .get(k)
+                .copied()
+                .unwrap_or(0.);
             for i in 1..width {
                 matrix.add(offset + i, offset + i, 1.).unwrap();
                 matrix
-                    .add(offset + i, offset + width + i - 1, -degree)
+                    .add(offset + i, offset + width + i - 1, -degree / scale)
                     .unwrap();
             }
             degree += 1.;
@@ -503,9 +529,9 @@ mod projected_tests {
     fn derivative_depth_resolves_prefix_without_gauging_highest_jets() {
         for depth in 1..=32 {
             let width = depth + 1;
-            let (short, rhs) = derivative_chain(depth, depth);
+            let (short, rhs) = derivative_chain(depth, depth, 1.);
             assert!(complete(&short, &rhs, &[], &[], &[], width).is_err());
-            let (matrix, rhs) = derivative_chain(depth, depth + 1);
+            let (matrix, rhs) = derivative_chain(depth, depth + 1, 1.);
             let result = complete(&matrix, &rhs, &[], &[], &[], width).unwrap();
             let expected = [1., 2., 6., 24.];
             for (i, &value) in result.values.as_slice()[..width].iter().enumerate() {
@@ -514,6 +540,29 @@ mod projected_tests {
             // The full system must still be rank deficient: projected
             // uniqueness is not the same as inventing a full-rank system.
             assert!(complete(&matrix, &rhs, &[], &[], &[], matrix.cols()).is_err());
+        }
+    }
+
+    #[test]
+    fn rank_and_solution_do_not_depend_on_taylor_time_normalization() {
+        for depth in [8, 32, 60] {
+            let width = depth + 1;
+            for scale in [1e-12, 1e-6, 1., 1e6, 1e12] {
+                let (matrix, rhs) = derivative_chain(depth, depth + 2, scale);
+                assert_eq!(
+                    projected_rank(&matrix, 2 * width).unwrap(),
+                    2 * width,
+                    "depth={depth}, scale={scale:e}"
+                );
+                let result = complete(&matrix, &rhs, &[], &[], &[], 2 * width).unwrap();
+                for (index, &value) in result.values.as_slice()[..width].iter().enumerate() {
+                    let expected = [1., 2., 6., 24.].get(index).copied().unwrap_or(0.);
+                    assert!(
+                        (value - expected).abs() < 1e-11,
+                        "depth={depth}, scale={scale:e}, x[{index}]={value:e}"
+                    );
+                }
+            }
         }
     }
 
