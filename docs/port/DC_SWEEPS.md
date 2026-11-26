@@ -392,3 +392,17 @@ observed medians, not isolated estimates of solve-time speedup. No
 cross-context live replacement caching is assumed: device-local immutable
 derivation dependencies and mutable trial state would have to be explicitly
 separated before permitting that reuse.
+
+
+## Geometry scale and immutable overrides
+
+Source instance setters and physical overrides are distinct. The global
+`scale` option defaults to 1, is finite and positive, and is applied once
+to the raw value of each length, perimeter or area setter that uses it in
+the native device's C reference. MOS1/2/3 and BSIM length/perimeter setters
+multiply by scale, area setters multiply left-to-right twice. Model-backed
+R/C length and width use the same length conversion. MOS6/9 do not apply
+global scale. Per-instance passive `scale` is a separate electrical factor.
+The raw sweep coordinate remains the plot's axis value; the bound instance
+override stores a physical value. Repeated analysis and failure recovery
+discard overlays rather than rescaling or restoring mutable device fields.

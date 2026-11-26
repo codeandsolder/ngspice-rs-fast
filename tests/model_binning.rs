@@ -302,7 +302,7 @@ fn resolver_exposes_candidates_and_selection() {
         .find(|d| d.designator == 'm')
         .unwrap();
     assert_eq!(resolver.select_bin(mos).unwrap().unwrap().name, "nch.2");
-    // `.options scale` is not yet a deck setting; the API takes it explicitly.
+    // The resolver API and deck option must select the same scaled bin.
     let scaled = ModelResolver::new(&netlist.models)
         .unwrap()
         .with_bin_options(BinOptions {
@@ -310,6 +310,13 @@ fn resolver_exposes_candidates_and_selection() {
             wnflag: false,
         });
     assert_eq!(scaled.select_bin(mos).unwrap().unwrap().name, "nch.1");
+    let scaled_deck = parse(&format!(
+        "{BINS}m1 d g 0 0 nch l=2u w=2u\n.options scale=0.35\n"
+    ));
+    let config = RunConfig::from_netlist(&scaled_deck).unwrap();
+    let circuit = config.circuit(&scaled_deck).unwrap();
+    assert_eq!(circuit.device("m1").unwrap().model_name(), Some("nch.1"));
+
     // An exact-name or non-MOS reference is not a binning lookup.
     let vd = netlist.devices.iter().find(|d| d.name == "vd").unwrap();
     assert!(resolver.select_bin(vd).unwrap().is_none());

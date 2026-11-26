@@ -173,7 +173,7 @@ impl Bsim3 {
             ));
         }
         let params = super::model_parameters(model)?;
-        let inputs = params.instance_parameters(instance, 1.)?;
+        let inputs = params.instance_parameters(instance, context.geometry_scale)?;
         context.validate(&params.location)?;
         let defaults = model.prepare(
             PreparationKey::Nominal(context.nominal_temperature.to_bits()),

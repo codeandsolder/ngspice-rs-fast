@@ -156,6 +156,8 @@ pub struct AnalysisContext {
     pub gmin: Real,
     /// Physical nodal shunts used during circuit elaboration.
     pub shunts: crate::devices::models::TopologyShunts,
+    /// Global scale of source geometry setters.
+    pub geometry_scale: Real,
     /// Resolved circuit relative tolerance (C `CKTreltol`). Device preparation
     /// uses this value even when the analysis has a local Newton override.
     pub reltol: Real,
@@ -184,6 +186,7 @@ impl AnalysisContext {
                 .with_reltol(self.reltol)
                 .with_pivot_tolerances(self.pivot);
         context.shunts = self.shunts;
+        context.geometry_scale = self.geometry_scale;
         if let Some(overrides) = self.candidate_model_overrides {
             context.resistor_overrides = overrides.resistor_overrides;
             context.instance_overrides = overrides.instance_overrides;
@@ -212,6 +215,7 @@ impl Default for AnalysisContext {
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
             shunts: crate::devices::models::TopologyShunts::default(),
+            geometry_scale: 1.,
             reltol: crate::devices::DEFAULT_RELTOL,
             pivot: crate::maths::PivotTolerances::DEFAULT,
             rf_limits: crate::analysis::RfLimits::default(),

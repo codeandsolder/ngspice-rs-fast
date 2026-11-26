@@ -731,12 +731,12 @@ fn point_context<'a>(
     // topology ordinal, canonical keyword and route never change per point.
     for (axis, value) in axes.iter().zip(values) {
         if let AxisBinding::Device(target) = axis.binding {
-            model = model.with_instance_override(target.at(value)?)?;
+            model = model.with_instance_override(target.at_source(value, model.geometry_scale)?)?;
         }
     }
     for (axis, value) in axes.iter().zip(values) {
         if let AxisBinding::Source(target) = axis.binding {
-            model = model.with_instance_override(target.at(value)?)?;
+            model = model.with_instance_override(target.at_source(value, model.geometry_scale)?)?;
             sources[source_count] = (circuit.devices()[target.device()].name(), value);
             source_count += 1;
         }

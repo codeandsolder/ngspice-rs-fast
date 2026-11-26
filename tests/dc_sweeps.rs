@@ -1122,3 +1122,81 @@ fn point_and_product_limits_are_enforced_at_resolution() {
     assert!(run(&mut c, &["v1", "0", "100000", "1"]).is_err());
     assert_eq!(accepted.get(), 0);
 }
+
+#[test]
+fn scaled_mos_geometry_and_temperature_sweep_restores_exact_operating_point_on_failure() {
+    let n = netlist(
+        ".options scale=1u\nvd d 0 1\nvg g 0 1\nm1 d g 0 0 n w=1 l=1 ad=2 pd=4\n.model n nmos level=1 vto=0.5 kp=1m",
+    );
+    let before = n.clone();
+    let config = RunConfig::from_netlist(&n).unwrap();
+    let context = config.context();
+    let mut circuit = config.circuit(&n).unwrap();
+    circuit
+        .set_observations(&[
+            "@m1[w]".into(),
+            "@m1[l]".into(),
+            "@m1[ad]".into(),
+            "@m1[pd]".into(),
+            "@m1[temp]".into(),
+        ])
+        .unwrap();
+    let baseline = op(&mut circuit, &context);
+    for (key, want) in [
+        ("@m1[w]", 1e-6),
+        ("@m1[l]", 1e-6),
+        ("@m1[ad]", 2e-12),
+        ("@m1[pd]", 4e-6),
+    ] {
+        close(baseline.value(key, 0).unwrap().re, want, 1e-12, 1e-24);
+    }
+    let p = run_in(
+        &mut circuit,
+        &["@m1[w]", "1", "2", "1", "temp", "27", "47", "20"],
+        &context,
+    )
+    .unwrap();
+    assert_column(&p, "@m1[w]", &[1e-6, 2e-6, 1e-6, 2e-6], 1e-12, 1e-24);
+    assert_column(&p, "@m1[temp]", &[27., 27., 47., 47.], 1e-12, 1e-24);
+    assert!(run_in(&mut circuit, &["@m1[l]", "1", "-1", "-1"], &context).is_err());
+    assert_eq!(op(&mut circuit, &context), baseline);
+    assert_eq!(n, before);
+}
+
+#[test]
+fn passive_geometry_scale_does_not_change_electrical_scale_or_default_geometry() {
+    let n = netlist(
+        ".options scale=1u\nv1 a 0 1\nr1 a 0 rm l=10 w=2 scale=2\n.model rm r(rsh=100 defw=2u l=10u)\nr2 a 0 1k\nr3 b 0 rm\nc1 a 0 cm l=2 w=3\n.model cm c(cj=1meg)",
+    );
+    let config = RunConfig::from_netlist(&n).unwrap();
+    let context = config.context();
+    let mut circuit = config.circuit(&n).unwrap();
+    circuit
+        .set_observations(&["@r1[w]".into(), "@r1[l]".into(), "@c1[w]".into()])
+        .unwrap();
+    close(
+        circuit
+            .device("r3")
+            .unwrap()
+            .observation_parameter("r", &context.model_context())
+            .unwrap()
+            .unwrap(),
+        500.,
+        1e-12,
+        1e-24,
+    );
+    let baseline = op(&mut circuit, &context);
+    assert_column(&baseline, "i(v1)", &[-0.002], 1e-9, 1e-12);
+    let p = run_in(&mut circuit, &["@r1[w]", "2", "4", "2"], &context).unwrap();
+    assert_column(&p, "@r1[w]", &[2e-6, 4e-6], 1e-12, 1e-24);
+    assert_column(&p, "i(v1)", &[-0.002, -0.003], 1e-9, 1e-12);
+    circuit.set_observations(&["@r2[w]".into()]).unwrap();
+    let p = run_in(&mut circuit, &["@r2[w]", "2", "4", "2"], &context).unwrap();
+    assert_column(&p, "@r2[w]", &[2e-6, 4e-6], 1e-12, 1e-24);
+    circuit
+        .set_observations(&["@r1[w]".into(), "@r1[l]".into(), "@c1[w]".into()])
+        .unwrap();
+    let p = run_in(&mut circuit, &["@c1[w]", "3", "6", "3"], &context).unwrap();
+    assert_column(&p, "@c1[w]", &[3e-6, 6e-6], 1e-12, 1e-24);
+    assert_eq!(op(&mut circuit, &context), baseline);
+}

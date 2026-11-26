@@ -272,6 +272,18 @@ impl Device for Resistor {
             _ => None,
         })
     }
+    fn parameter_geometry_scale(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+    ) -> crate::devices::sweep::GeometryScale {
+        use crate::devices::sweep::{GeometryScale, ParameterKey};
+        if matches!(key, ParameterKey::Native("l" | "w")) {
+            GeometryScale::Length
+        } else {
+            GeometryScale::Identity
+        }
+    }
+
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
         [
             "resistance",
@@ -749,6 +761,18 @@ impl Device for Capacitor {
             _ => None,
         })
     }
+    fn parameter_geometry_scale(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+    ) -> crate::devices::sweep::GeometryScale {
+        use crate::devices::sweep::{GeometryScale, ParameterKey};
+        if matches!(key, ParameterKey::Native("l" | "w")) {
+            GeometryScale::Length
+        } else {
+            GeometryScale::Identity
+        }
+    }
+
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
         [
             "capacitance",

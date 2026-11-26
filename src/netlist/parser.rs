@@ -429,6 +429,20 @@ pub(crate) fn control_measure(card: &RawCard, auto_gnd: bool) -> SpiceResult<Mea
     }
 }
 
+/// Compile an option command using the deck option grammar without applying it.
+pub(crate) fn control_options(
+    card: &RawCard,
+    auto_gnd: bool,
+) -> SpiceResult<crate::netlist::ast::OptionCard> {
+    match control_card(card, DotCommand::Options, auto_gnd)? {
+        grammar::ParsedCard::Options(card) => Ok(card),
+        _ => Err(crate::primitives::SpiceError::parse(
+            card.location.clone(),
+            "expected an option command",
+        )),
+    }
+}
+
 fn control_card(
     card: &RawCard,
     command: DotCommand,

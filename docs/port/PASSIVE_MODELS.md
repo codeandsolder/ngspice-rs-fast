@@ -63,8 +63,8 @@ corrections must be nonnegative; L/W and effective dimensions must be positive.
 The nominal value must be nonzero with representable finite reciprocal. Negative
 model R is rejected (C ignores that setter); negative instance R is retained.
 The explicit instance R setter clamps tiny magnitude to C's RESMIN.
-The model R setter remains bounded and global frontend geometry scale is not
-applied. C's sheet-geometry eligibility tests the uncorrected L*W*RSH product;
+The model R setter remains bounded. Global frontend geometry scale is
+applied once to explicit instance R/C length and width, not model defaults. C's sheet-geometry eligibility tests the uncorrected L*W*RSH product;
 Rust additionally checks effective dimensions before accepting the result.
 
 ### Capacitor

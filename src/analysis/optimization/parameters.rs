@@ -715,9 +715,9 @@ impl CircuitCandidate<'_> {
                 NumericRoute::Resistor(target) => target
                     .at_resistance(value)
                     .map(CandidateNumericOverride::Resistor),
-                NumericRoute::Instance(target) => {
-                    target.at(value).map(CandidateNumericOverride::Instance)
-                }
+                NumericRoute::Instance(target) => target
+                    .at_source(value, baseline_context.geometry_scale)
+                    .map(CandidateNumericOverride::Instance),
                 NumericRoute::Rebuild => {
                     structural = true;
                     continue;

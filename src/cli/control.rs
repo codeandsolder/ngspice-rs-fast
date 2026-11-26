@@ -18,10 +18,12 @@ use crate::analysis::spectrum::{
 };
 use crate::analysis::{Variable, measure};
 use crate::netlist::ast::{
-    AnalysisCard, FourierCard, MeasureCard, Netlist, OutputCards, ScopedCardKind,
+    AnalysisCard, FourierCard, MeasureCard, Netlist, OptionCard, OutputCards, ScopedCardKind,
 };
 use crate::netlist::eval::{EvalBudget, EvalLimits, ParamBinding, ParamScope};
-use crate::netlist::parser::{control_analysis, control_measure, parse_control_expression};
+use crate::netlist::parser::{
+    control_analysis, control_measure, control_options, parse_control_expression,
+};
 use crate::netlist::{DotCommand, ParameterExpression, Parser, RawCard, SourceLimits};
 use crate::primitives::{AnalysisKind, Real, SourceLoc, SpiceError, SpiceResult};
 
@@ -85,6 +87,7 @@ enum Operation {
     Let(String, Scalar),
     AlterParameter(String, Scalar),
     AlterInstance(String, Option<String>, Scalar),
+    Options(Box<OptionCard>),
     Reset,
     Run,
     Analysis(Box<AnalysisCard>),
@@ -573,6 +576,10 @@ impl Compiler<'_> {
                 Ok(Operation::Let(name, value))
             }
             "alter" => instance_assignment(rest, location),
+            "option" | "options" => Ok(Operation::Options(Box::new(control_options(
+                card,
+                self.auto_gnd,
+            )?))),
             "alterparam" => {
                 let (name, value) = assignment(rest, location)?;
                 self.tunables.insert(name.clone());
@@ -1263,6 +1270,26 @@ impl State<'_, '_> {
                     value,
                     self.limits.instance_edits,
                 )?;
+            }
+            Operation::Options(card) => {
+                let mut resolved = card.as_ref().clone();
+                for setting in &mut resolved.settings {
+                    if let Some(expression) = setting.expression.take() {
+                        let value = self.evaluate(&expression)?;
+                        let positioned = setting
+                            .value
+                            .as_mut()
+                            .ok_or_else(|| error(location, "missing option value"))?;
+                        positioned.text = crate::netlist::elaborate::format_literal(value);
+                    } else if let Some(positioned) = &mut setting.value
+                        && positioned.text.starts_with('$')
+                    {
+                        let value =
+                            self.evaluate(&*expression(&positioned.text, &positioned.location)?)?;
+                        positioned.text = crate::netlist::elaborate::format_literal(value);
+                    }
+                }
+                self.session.apply_options(&resolved)?;
             }
             Operation::Reset => {
                 self.session.alter_parameters(

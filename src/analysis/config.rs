@@ -69,7 +69,7 @@
 //!
 //! Every other name from `cktsopt.c` (`oldlimit`, ...)
 //! and the front-end variables with an effect (`filetype`, `numdgt`,
-//! `savecurrents`, `scale`, ...) is [`SpiceError::NotYetPorted`]; names
+//! `savecurrents`, ...) is [`SpiceError::NotYetPorted`]; names
 //! absent from both are parse errors. `no_auto_gnd` is a front-end variable in
 //! C, not an `.option`: use `Parser::with_auto_gnd`.
 //!
@@ -152,7 +152,6 @@ const KNOWN_UNIMPLEMENTED: &[&str] = &[
 /// output or setup, not implemented here.
 const FRONTEND_UNIMPLEMENTED: &[&str] = &[
     "savecurrents",
-    "scale",
     "scalm",
     "seedinfo",
     "interp",
@@ -626,15 +625,28 @@ impl RunConfig {
             };
             config.apply(setting, evaluated)?;
         }
+        config.validate_continuation()?;
+        let unknown = SourceLoc::new(std::path::PathBuf::from("<run overrides>"), 0, 0);
+        if let Some(t) = overrides.temperature {
+            config.context.temperature = temperature(t, &unknown, "temperature override")?;
+        }
+        if let Some(t) = overrides.nominal_temperature {
+            config.context.nominal_temperature =
+                temperature(t, &unknown, "nominal temperature override")?;
+        }
+        Ok(config)
+    }
+
+    fn validate_continuation(&self) -> SpiceResult<()> {
         // The last-set counts and factor must form one valid schedule together
         // (with the deck's junction gmin, which seeds C's `spice3_gmin` ladder).
-        if let Err(error) = config.dc.policy().and_then(|policy| match policy.schedule {
+        if let Err(error) = self.dc.policy().and_then(|policy| match policy.schedule {
             crate::analysis::bias::ContinuationSchedule::Ngspice(stepping) => stepping
-                .fixed_gmin_ladder(policy.gmin_seed(config.context.gmin))
+                .fixed_gmin_ladder(policy.gmin_seed(self.context.gmin))
                 .map(|_| ()),
             crate::analysis::bias::ContinuationSchedule::Ladder { .. } => Ok(()),
         }) {
-            let location = config
+            let location = self
                 .applied
                 .iter()
                 .rev()
@@ -645,15 +657,27 @@ impl RunConfig {
                 );
             return Err(SpiceError::parse(location, error.to_string()));
         }
-        let unknown = SourceLoc::new(std::path::PathBuf::from("<run overrides>"), 0, 0);
-        if let Some(t) = overrides.temperature {
-            config.context.temperature = temperature(t, &unknown, "temperature override")?;
+        Ok(())
+    }
+
+    /// Transactionally apply an executed control option card to this snapshot.
+    /// The command has already resolved scalar expressions in its own scope.
+    /// Runtime records retain only the latest setter of each changed name.
+    pub(crate) fn with_control_options(&self, card: &OptionCard) -> SpiceResult<Self> {
+        let mut next = self.clone();
+        for setting in &card.settings {
+            if setting.expression.is_some() {
+                return Err(SpiceError::parse(
+                    setting.location.clone(),
+                    "unresolved control option",
+                ));
+            }
+            next.applied.retain(|record| record.name != setting.name);
+            next.ignored.retain(|record| record.name != setting.name);
+            next.apply(setting, None)?;
         }
-        if let Some(t) = overrides.nominal_temperature {
-            config.context.nominal_temperature =
-                temperature(t, &unknown, "nominal temperature override")?;
-        }
-        Ok(config)
+        next.validate_continuation()?;
+        Ok(next)
     }
 
     /// Record a validated no-op occurrence.
@@ -682,6 +706,7 @@ impl RunConfig {
                 | "gshunt"
                 | "rshunt"
                 | "cshunt"
+                | "scale"
                 | "pivtol"
                 | "pivrel"
                 | "reltol"
@@ -985,24 +1010,22 @@ impl RunConfig {
     }
 
     /// Apply finite real-valued solver and temperature options.
-    fn apply_real_option(
+    fn apply_geometry_option(
         &mut self,
         input: &OptionInput<'_>,
         value: &crate::netlist::ast::PositionedValue,
-    ) -> SpiceResult<()> {
-        let setting = input.setting;
-        let name = setting.name.as_str();
-        let location = &setting.location;
+    ) -> SpiceResult<bool> {
+        let name = input.setting.name.as_str();
         match name {
-            "xmu" => {
-                let xmu = input.number("a finite number")?;
-                if !(0. ..=0.5).contains(&xmu) {
+            "scale" => {
+                let scale = input.number("a finite positive number")?;
+                if scale <= 0. {
                     return Err(SpiceError::parse(
                         value.location.clone(),
-                        format!("option 'xmu' must be in [0, 0.5], not {xmu}"),
+                        "geometry scale must be positive",
                     ));
                 }
-                self.transient.xmu = Some(xmu);
+                self.context.geometry_scale = scale;
             }
             "rshunt" | "cshunt" => {
                 let number = input.number("a finite number")?;
@@ -1016,6 +1039,33 @@ impl RunConfig {
                     SpiceError::parse(value.location.clone(), error.to_string())
                 })?;
                 self.context.shunts = shunts;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn apply_real_option(
+        &mut self,
+        input: &OptionInput<'_>,
+        value: &crate::netlist::ast::PositionedValue,
+    ) -> SpiceResult<()> {
+        if self.apply_geometry_option(input, value)? {
+            return Ok(());
+        }
+        let setting = input.setting;
+        let name = setting.name.as_str();
+        let location = &setting.location;
+        match name {
+            "xmu" => {
+                let xmu = input.number("a finite number")?;
+                if !(0. ..=0.5).contains(&xmu) {
+                    return Err(SpiceError::parse(
+                        value.location.clone(),
+                        format!("option 'xmu' must be in [0, 0.5], not {xmu}"),
+                    ));
+                }
+                self.transient.xmu = Some(xmu);
             }
             "minbreak" => {
                 let number = input.number("a finite number")?;
@@ -1277,6 +1327,7 @@ fn accepted(name: &str) -> bool {
                 | "gshunt"
                 | "rshunt"
                 | "cshunt"
+                | "scale"
                 | "pivtol"
                 | "pivrel"
                 | "reltol"

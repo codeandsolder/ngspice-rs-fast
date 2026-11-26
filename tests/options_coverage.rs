@@ -1191,7 +1191,7 @@ fn unknown_and_unported_options_still_fail() {
     for pending in [
         ".options numdgt=8",
         ".options savecurrents",
-        ".options scale=1u",
+        ".options scalm=1u",
         ".options klu",
     ] {
         assert!(
