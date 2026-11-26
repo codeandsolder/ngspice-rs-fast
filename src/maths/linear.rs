@@ -6,11 +6,13 @@
 //! (`SMPreorder`, `spOrderAndFactor` with the matrix's [`PivotTolerances`],
 //! C's `CKTpivotRelTol`/`CKTpivotAbsTol`); a reused pattern is refactored with the
 //! existing pivot order (`SMPluFac`, `spFactor`) and, on a zero pivot,
-//! reordered as `NIiter` does after `E_SINGULAR`. Like C there is no
-//! condition estimate or residual check: only structural/numeric singularity
+//! reordered as `NIiter` does after `E_SINGULAR`. Like C the ordinary
+//! factor/solve path has no condition estimate or residual check: only structural/numeric singularity
 //! (`spSINGULAR`/`spZERO_DIAG`) and non-finite solutions are errors, and small
 //! pivots are accepted (`spSMALL_PIVOT` is `OK` in ngspice, which says
-//! nothing; the port prints a warning, see [`solver_warning`]). A singular
+//! nothing; the port prints a warning, see [`solver_warning`]). Retained
+//! real factors from a correction-coordinate Newton load additionally carry
+//! the unfolded operator for subsequent residual-based RHS refinement. A singular
 //! circuit matrix names its unknowns as `NIiter`'s warning does
 //! (`singular matrix:  check node X`).
 //!
@@ -315,6 +317,10 @@ enum Key {
     Pattern(std::sync::Weak<Pattern>),
 }
 
+/// Original coefficient contributions of a recovered real linearization.
+type OriginalStamp = (usize, usize, f64);
+pub(crate) type OriginalStamps = Vec<OriginalStamp>;
+
 /// Reusable pivot order and fill-in structure for one exact assembled
 /// pattern (SPARSE's ordered matrix).
 #[derive(Debug, Clone)]
@@ -327,6 +333,9 @@ pub struct SparseSymbolic {
     /// else wrote the frame (an AC factorization, a fresh order, a zero or
     /// small pivot), which forces the next step to factor.
     factored: Option<Arc<FactoredInputs>>,
+    /// Unfolded physical operator for a correction-coordinate load. This
+    /// belongs to this numeric frame, not merely to its symbolic pattern.
+    original: Option<Arc<OriginalStamps>>,
 }
 
 /// The circuit cache retains the scalar type actually factored. Repeated
@@ -356,6 +365,7 @@ impl CachedFrame {
                     key: Key::Pattern(Arc::downgrade(pattern)),
                     sparse: Arc::new(Sparse::retype_shared(sparse)),
                     factored: None,
+                    original: None,
                 }
             }
         }
@@ -667,6 +677,7 @@ impl LoadedFrame {
             key: self.key,
             sparse: self.sparse,
             factored,
+            original: None,
         }
     }
 }
@@ -718,12 +729,40 @@ pub fn solve_ni(
     reorder: bool,
     diag_gmin: f64,
 ) -> SpiceResult<NiStep> {
+    solve_ni_with_original(matrix, rhs, ordering, reorder, diag_gmin, None)
+}
+
+/// The same NI transaction, optionally retaining an unfolded operator for
+/// later unit excitations and adjoints. Recycle the preceding stamp buffer;
+/// a successful solve moves the current contributions into the exact
+/// numeric frame while the pattern lock is still held.
+///
+/// # Errors
+/// As [`solve_ni`]; an unfolded operator cannot represent SPARSE's hidden
+/// diagonal gmin, so supplying both is rejected.
+pub(crate) fn solve_ni_with_original(
+    matrix: &SparseMatrix,
+    rhs: &Vector,
+    ordering: &mut Option<SparseSymbolic>,
+    reorder: bool,
+    diag_gmin: f64,
+    original: Option<&mut OriginalStamps>,
+) -> SpiceResult<NiStep> {
+    if original.is_some() && diag_gmin != 0. {
+        return Err(numerical(
+            "sparse LU",
+            "unfolded operator excludes internal diagonal gmin",
+        ));
+    }
     if let Some((pattern, _)) = matrix.bound_values() {
         return pattern.with_ordering(|state| {
             let mut cached = state
                 .frame
                 .take()
                 .map(|frame| frame.into_real(pattern, &mut state.work));
+            // Even an exact rounded-input cache hit cannot reuse the old
+            // unfolded coefficients: different stamps can fold identically.
+            let previous = cached.as_mut().and_then(|frame| frame.original.take());
             let step = ni_step(
                 matrix,
                 rhs,
@@ -733,6 +772,15 @@ pub fn solve_ni(
                 &mut state.solve_workspace,
                 &mut state.work,
             );
+            if matches!(&step, Ok(NiStep::Solved(_)))
+                && let Some(original) = original
+                && let Some(frame) = &mut cached
+            {
+                frame.original = Some(Arc::new(std::mem::take(original)));
+                *original = previous
+                    .and_then(|stamps| Arc::try_unwrap(stamps).ok())
+                    .unwrap_or_default();
+            }
             state.frame = cached.map(CachedFrame::Real);
             step
         });
@@ -839,7 +887,8 @@ fn ni_step(
 /// `SMPsolve` with the factors a circuit pattern's frame holds now: those of
 /// the last factorization of the circuit matrix (after `CKTop`, the last
 /// `NIiter` pass's load), as `.tf` (`tfanal.c`) solves its unit excitations.
-/// `None` when the frame holds no factors.
+/// Recovered Newton loads refine unit excitations against their unfolded
+/// coefficients. `None` when the frame holds no factors.
 ///
 /// # Errors
 /// An invalid RHS or a non-finite solution.
@@ -851,7 +900,8 @@ pub fn solve_last_factors(pattern: &Arc<Pattern>, rhs: &Vector) -> SpiceResult<O
 ///
 /// This is an ordinary *transpose*, not an inverse of the transposed input
 /// stamps and not a separately factorized Jacobian. Objective derivatives
-/// use one such solve for all parameter residuals at the same bias.
+/// use one such solve for all parameter residuals at the same bias. Recovered
+/// loads refine against the transposed unfolded coefficients.
 ///
 /// # Errors
 /// Invalid RHS or non-finite solution. Returns `None` if the circuit's
@@ -874,17 +924,116 @@ fn solve_last_factors_direction(
                 if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
                     && symbolic.sparse.is_factored() =>
             {
-                let result = if transpose {
-                    symbolic.solve_transposed_with_workspace(rhs, &mut state.solve_workspace)
-                } else {
-                    symbolic.solve_with_workspace(rhs, &mut state.solve_workspace)
-                };
-                state.work.record_rhs(&result);
-                Some(result)
+                Some(solve_retained_rhs(
+                    symbolic, rhs, transpose, &mut state.solve_workspace, &mut state.work,
+                ))
             }
             _ => None,
         }.transpose()
     })
+}
+
+/// Measure the largest relative correction of any represented unknown.
+/// Unlike a normwise residual this does not hide a small branch current
+/// behind a much larger voltage or conductance.
+fn update_coordinates(next: &mut Vector, current: &Vector) -> f64 {
+    let mut relative = 0.0_f64;
+    for (delta, &value) in next.as_mut_slice().iter_mut().zip(current.as_slice()) {
+        let change = *delta;
+        *delta += value;
+        let scale = value.abs().max(delta.abs());
+        if scale != 0. {
+            relative = relative.max(change.abs() / scale);
+        }
+    }
+    relative
+}
+
+// A poorly conditioned recovered operator can contract much more slowly than
+// an equilibrated ordinary solve. Bound the total work, and stop early if
+// consecutive corrections cannot improve the measured solution change.
+const MAX_RECOVERED_RHS_CORRECTIONS: usize = 64;
+const RECOVERED_RHS_STALL_STEPS: usize = 8;
+
+/// Use the existing factors as a preconditioner for the unfolded physical
+/// operator, in either orientation. The original coefficient contributions
+/// can contain terms lost by folding; refinement of only the folded matrix
+/// would miss those terms. Select the best finite correction estimate under
+/// a bounded, progress-sensitive refinement budget. It is not a forward-error
+/// certificate: an exhausted or stalled solve is reported explicitly.
+fn refine_retained_rhs(
+    order: usize,
+    stamps: &[OriginalStamp],
+    rhs: &Vector,
+    initial: Vector,
+    transpose: bool,
+    mut solve: impl FnMut(&Vector) -> SpiceResult<Vector>,
+) -> SpiceResult<Vector> {
+    use crate::maths::equilibration::OriginalResidual;
+
+    let original = OriginalResidual::real(order, stamps, transpose)?;
+    let mut current = initial;
+    let mut best = current.clone();
+    let mut best_change = f64::INFINITY;
+    let mut residual = Vector::zeros(order);
+    let mut stalled = 0;
+    for _ in 0..MAX_RECOVERED_RHS_CORRECTIONS {
+        let _quality = original.evaluate_with_correction(
+            rhs.as_slice(),
+            current.as_slice(),
+            residual.as_mut_slice(),
+        )?;
+        let mut next = solve(&residual)?;
+        let relative = update_coordinates(&mut next, &current);
+        if !next.is_finite() || !relative.is_finite() {
+            return Err(numerical(
+                "retained sparse refinement",
+                "nonfinite correction",
+            ));
+        }
+        if relative <= f64::EPSILON.sqrt() {
+            return Ok(next);
+        }
+        if relative < best_change {
+            best_change = relative;
+            best.clone_from(&current);
+            stalled = 0;
+        } else {
+            stalled += 1;
+            if stalled == RECOVERED_RHS_STALL_STEPS {
+                break;
+            }
+        }
+        current = next;
+    }
+    solver_warning(format!(
+        "retained sparse refinement stalled or exhausted its correction budget (relative update {best_change:e})"
+    ));
+    Ok(best)
+}
+
+fn solve_retained_rhs(
+    symbolic: &SparseSymbolic,
+    rhs: &Vector,
+    transpose: bool,
+    workspace: &mut Vec<f64>,
+    work: &mut PatternWork,
+) -> SpiceResult<Vector> {
+    let mut solve = |rhs: &Vector| {
+        let result = if transpose {
+            symbolic.solve_transposed_with_workspace(rhs, workspace)
+        } else {
+            symbolic.solve_with_workspace(rhs, workspace)
+        };
+        work.record_rhs(&result);
+        result
+    };
+    let initial = solve(rhs)?;
+    if let Some(stamps) = &symbolic.original {
+        refine_retained_rhs(symbolic.n, stamps, rhs, initial, transpose, solve)
+    } else {
+        Ok(initial)
+    }
 }
 
 /// Owned numeric sparse LU factors.
@@ -1295,6 +1444,52 @@ mod tests {
         assert_ne!(read(), initial);
         assert_eq!(snapshot.solve(&[Complex::real(1.)]).unwrap(), x);
         assert_ne!(next.solve(&[Complex::real(1.)]).unwrap(), x);
+    }
+
+    #[test]
+    fn recovered_factor_refines_original_stamps_in_both_orientations() {
+        let pattern = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
+        let mut matrix = SparseMatrix::bound(Arc::clone(&pattern)).unwrap();
+        let large = 0.01;
+        let small = 1e-15;
+        let mut stamps = vec![
+            (0, 0, large),
+            (0, 0, small),
+            (0, 1, -large),
+            (1, 0, -2. * large),
+            (1, 1, 2. * large),
+            (1, 1, 2. * small),
+        ];
+        for &(row, col, value) in &stamps {
+            matrix.add(row, col, value).unwrap();
+        }
+        let rhs = Vector::from_slice(&[small, 2. * small]);
+        let NiStep::Solved(raw) =
+            solve_ni_with_original(&matrix, &rhs, &mut None, false, 0., Some(&mut stamps)).unwrap()
+        else {
+            panic!("expected a valid factor")
+        };
+        assert!(stamps.is_empty());
+        assert!((raw.as_slice()[0] - 1.).abs() > 1e-6);
+        let work = pattern.factor_telemetry().work.factor;
+        let direct = solve_last_factors(&pattern, &rhs).unwrap().unwrap();
+        for &value in direct.as_slice() {
+            assert!((value - 1.).abs() < 1e-10, "{value}");
+        }
+        let transpose =
+            solve_last_factors_transposed(&pattern, &Vector::from_slice(&[2. * small, 2. * small]))
+                .unwrap()
+                .unwrap();
+        for (&value, expected) in transpose.as_slice().iter().zip([2., 1.]) {
+            assert!((value - expected).abs() < 1e-10, "{value}");
+        }
+        assert_eq!(pattern.factor_telemetry().work.factor, work);
+        // Same rounded inputs, but an ordinary load must drop the prior
+        // unfolded operator even when it reuses the numeric factors.
+        let NiStep::Solved(plain) = solve_ni(&matrix, &rhs, &mut None, false, 0.).unwrap() else {
+            panic!("expected a valid factor")
+        };
+        assert_eq!(solve_last_factors(&pattern, &rhs).unwrap().unwrap(), plain);
     }
 
     #[test]
