@@ -469,3 +469,96 @@ mod projected_tests {
         assert!(!result.independent[7]);
     }
 }
+
+#[cfg(test)]
+mod projected_oracle {
+    use super::*;
+
+    // Fraction-free integer elimination, independent of sparse floating
+    // pivot selection and scaling. Tiny test matrices keep all products
+    // well within i128 even without fraction reduction.
+    fn exact_rank(mut rows: Vec<Vec<i128>>, columns: usize) -> usize {
+        let mut rank = 0;
+        for col in 0..columns {
+            let Some(pivot) = (rank..rows.len()).find(|&row| rows[row][col] != 0) else {
+                continue;
+            };
+            rows.swap(rank, pivot);
+            let reference = rows[rank].clone();
+            let scale = reference[col];
+            for row in &mut rows[rank + 1..] {
+                let factor = row[col];
+                if factor == 0 {
+                    continue;
+                }
+                for j in col + 1..columns {
+                    row[j] = row[j] * scale - reference[j] * factor;
+                }
+                row[col] = 0;
+            }
+            rank += 1;
+        }
+        rank
+    }
+
+    #[test]
+    fn projected_rank_matches_exact_integer_nullspace_dimension() {
+        let mut random = 0x243f_6a88_85a3_08d3_u64;
+        let mut next = || {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (random >> 32).cast_signed()
+        };
+        for case in 0..512 {
+            let columns = 6;
+            let rows = 1 + case % 7;
+            let prefix = 1 + case % columns;
+            let mut entries: Vec<Vec<i128>> = (0..rows)
+                .map(|_| (0..columns).map(|_| i128::from(next() % 7 - 3)).collect())
+                .collect();
+            // Include dependencies spanning the projected/free boundary.
+            if case % 3 == 0 {
+                for row in &mut entries {
+                    row[columns - 1] = row[0] + row[1];
+                }
+            }
+            if case % 5 == 0 && rows > 1 {
+                entries[rows - 1] = entries[0].clone();
+            }
+            let tail: Vec<_> = entries.iter().map(|row| row[prefix..].to_vec()).collect();
+            let determined =
+                exact_rank(entries.clone(), columns) == prefix + exact_rank(tail, columns - prefix);
+            let known = [2., -3., 5., 7., -1., 4.];
+            let mut matrix = SparseMatrix::new(rows, columns);
+            let mut rhs = vec![0.; rows];
+            for (r, row) in entries.iter().enumerate() {
+                for (c, &value) in row.iter().enumerate() {
+                    // Every oracle coefficient is a small integer.
+                    let value = Real::from(i32::try_from(value).unwrap());
+                    matrix.add(r, c, value).unwrap();
+                    rhs[r] += value * known[c];
+                }
+            }
+            matrix.fold_duplicates();
+            let result = complete(&matrix, &rhs, &[], &[], &[], prefix);
+            assert_eq!(result.is_ok(), determined, "case {case}: {entries:?}");
+            if let Ok(result) = result {
+                for (&actual, &expected) in result.values.as_slice()[..prefix]
+                    .iter()
+                    .zip(&known[..prefix])
+                {
+                    assert!(
+                        (actual - expected).abs() < 1e-9,
+                        "case {case}: {actual} != {expected}"
+                    );
+                }
+                let residual = matrix.mul_vector(&result.values).unwrap();
+                for (&actual, &expected) in residual.as_slice().iter().zip(&rhs) {
+                    assert!(
+                        (actual - expected).abs() < 1e-9,
+                        "case {case}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+}
