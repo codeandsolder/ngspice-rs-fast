@@ -236,9 +236,14 @@ physical Taylor kernels for those models are tracked in
 [#242](https://github.com/codeandsolder/ngspice-rs-fast/issues/242).
 Independent source waveform boundaries are scheduled explicitly;
 localization of arbitrary behavioural expression branch changes is
-tracked in [#241](https://github.com/codeandsolder/ngspice-rs-fast/issues/241). The derivative-order bound
-and the projected rank tests are not a proof of solvability for every
-singular or nonanalytic nonlinear DAE.
+tracked in [#241](https://github.com/codeandsolder/ngspice-rs-fast/issues/241).
+The derivative-order bound and projected rank tests are not a proof of
+solvability for every singular or nonanalytic nonlinear DAE. Delayed rank
+emergence from time-dependent coefficients is covered at startup and exact
+interior events, including coefficients vanishing through dozens of Taylor
+orders. Recovery from a singular provisional Newton seed and genuinely
+singular nonlinear germs is tracked in
+[#251](https://github.com/codeandsolder/ngspice-rs-fast/issues/251).
 
 Nonlinear C/L `ic=` is intentionally retained under UIC, rather than
 discarded by the frontend as observed in ngspice 47 (instance and node

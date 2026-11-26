@@ -1050,3 +1050,45 @@ fn prepared_power_laws_preserve_distinct_physical_derivatives_and_kcl() -> Spice
     }
     Ok(())
 }
+
+#[test]
+fn delayed_physical_rank_emerges_at_startup_and_interior_events() -> SpiceResult<()> {
+    // g(t) is zero through many Taylor degrees, but g(t)*(x-f(t))=0
+    // still determines the entire analytic germ. In particular, a
+    // temporary rank plateau must not choose arbitrary derived storage.
+    for order in [2, 12, 48] {
+        for (center, event) in [("0", false), ("0.5u", true)] {
+            let body = format!(
+                "vtrigger trigger 0 PWL(0 0 0.5u 1 1u 0)\nb1 x 0 i=((time-{center})/1u)^{order}*(v(x)-2-time/1u-(time/1u)^2)\nb2 first 0 v=1u*ddt(v(x))\nb3 second 0 v=1u*ddt(v(first))\nr1 first 0 1k\nr2 second 0 1k\n.options reltol=1e-8 vntol=1n"
+            );
+            for method in ["method=trap", "method=gear"] {
+                let plot = run(
+                    &body,
+                    AnalysisKind::Transient,
+                    &["0.1u", "1u", "0", "0.1u", "uic", method],
+                )?;
+                assert!(plot.point_count() > 20);
+                let mut landed = false;
+                for index in 0..plot.point_count() {
+                    let time = plot.value("time", index).unwrap().re;
+                    landed |= time.to_bits() == 0.5e-6_f64.to_bits();
+                    let u = time * 1e6;
+                    let first = 2_f64.mul_add(u, 1.);
+                    close(
+                        plot.value("v(x)", index).unwrap().re,
+                        u.mul_add(u, 2. + u),
+                        1e-12,
+                    );
+                    close(plot.value("v(first)", index).unwrap().re, first, 1e-11);
+                    close(plot.value("v(second)", index).unwrap().re, 2., 2e-11);
+                    close(plot.value("i(b2)", index).unwrap().re, -first * 1e-3, 1e-14);
+                    close(plot.value("i(b3)", index).unwrap().re, -2e-3, 2e-14);
+                }
+                if event {
+                    assert!(landed, "the interior rank collapse was not sampled");
+                }
+            }
+        }
+    }
+    Ok(())
+}
