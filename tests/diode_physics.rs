@@ -388,3 +388,22 @@ fn soft_recovery_observations_are_external_terminal_quantities() {
         }
     }
 }
+
+#[test]
+fn physical_derivative_chain_with_native_diode_preserves_kcl() {
+    for method in ["gear", "trap"] {
+        let p = simulate(&format!(
+            "v1 in 0 PWL(0 2 1m 3)\nb1 first 0 v=1m*ddt(v(in))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\nd1 in 0 dm\n.model dm d(is=1e-18 n=10)\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 1u 50u 0 1u uic"
+        ));
+        let vt = 10. * K_OVER_Q * 300.15;
+        for i in 0..p.point_count() {
+            let t = real(&p, "time", i);
+            let v = 1000_f64.mul_add(t, 2.);
+            let current = 1e-18 * (v / vt).exp_m1() + GMIN * v;
+            assert!((real(&p, "v(in)", i) - v).abs() < 1e-11);
+            assert!((real(&p, "v(first)", i) - 1.).abs() < 1e-10);
+            assert!(real(&p, "v(out)", i).abs() < 1e-10);
+            assert!((real(&p, "i(v1)", i) + current).abs() < 1e-17);
+        }
+    }
+}

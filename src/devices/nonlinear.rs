@@ -40,6 +40,7 @@ use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceErro
 pub(super) mod charge;
 mod recovery;
 mod sens;
+mod taylor;
 pub(super) mod thermal;
 use thermal::{
     BOLTZMANN, DerivedCache, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureKey, band_gap,
@@ -2023,6 +2024,13 @@ impl Device for Diode {
             recovery.not_converged(context, current)
         })
     }
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        self.stamp_taylor(context)
+    }
+
     fn assemble_nonlinear_charge(
         &self,
         context: &mut crate::devices::traits::ChargeContext<'_>,
@@ -2323,6 +2331,80 @@ mod tests {
                 p.capacitance
             );
         }
+    }
+
+    #[test]
+    fn diode_taylor_reconstructs_physical_scalar_equations() -> SpiceResult<()> {
+        use crate::maths::taylor::Jet;
+        let close = |actual: Real, expected: Real| {
+            assert!(
+                (actual - expected).abs() <= 2e-11 * actual.abs().max(expected.abs()).max(1e-30),
+                "{actual:e} vs {expected:e}"
+            );
+        };
+        for (model, instance) in [
+            ("is=1e-18 n=10", ""),
+            (
+                "is=1e-14 n=1.1 bv=5.1 ibv=5m nbv=1.4 tcv=2m cjo=30p vj=0.7 m=0.4 tt=5n",
+                "",
+            ),
+            (
+                "is=1e-14 jsw=2e-15 ns=1.6 cjsw=4p vjsw=0.8 mjsw=0.3 fcs=0.4 bv=5.1",
+                "pj=10",
+            ),
+            (
+                "is=1e-14 jsw=2e-15 cjsw=4p vjsw=0.8 mjsw=0.3 fcs=0.4 ikp=1u",
+                "pj=10 m=2",
+            ),
+            ("isr=1e-11 nr=2.2 vj=0.8 m=0.4 cjo=5p", ""),
+            (
+                "jtun=1e-13 jtunsw=1e-14 ntun=20 xtitun=2 keg=0.9 bv=7",
+                "pj=4",
+            ),
+            ("ikf=1m ikr=1n is=1e-12", ""),
+            (
+                "isr=1e-11 jtun=1e-12 ikf=1m ikr=1u bv=5.1 jsw=1e-15 ns=1.2",
+                "pj=4",
+            ),
+        ] {
+            for temperature in [-40., 27., 100.] {
+                let thermal = thermal(model, instance, temperature);
+                for voltage in [-9., -6.2, -5.4, -5., -3., -0.5, -0.05, 0.1, 0.4, 0.62, 0.75] {
+                    let v = Jet::affine(12, voltage, 1e-4);
+                    let (current, charge) = thermal.taylor(&v, 1e-12, false)?;
+                    for t in [0., -0.25, 0.25, 0.5] {
+                        let expected = thermal.point(1e-4_f64.mul_add(t, voltage), 1e-12)?.junction;
+                        let at = |jet: &Jet| {
+                            jet.coefficients()
+                                .iter()
+                                .rev()
+                                .fold(0_f64, |sum, coefficient| sum.mul_add(t, *coefficient))
+                        };
+                        close(at(&current.value), expected.current);
+                        close(at(&current.slope), expected.conductance);
+                        close(at(&charge.value), expected.charge);
+                        close(at(&charge.slope), expected.capacitance);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diode_taylor_exponential_coefficients_survive_scaled_overflow() -> SpiceResult<()> {
+        use crate::maths::taylor::Jet;
+        let v = Jet::affine(8, 720., 0.25);
+        let law = super::taylor::exponential(&v, 1., 1e-300);
+        let scaled = 4.920_700_930_263_816e12;
+        let mut expected = scaled;
+        for (k, coefficient) in law.slope.coefficients().iter().enumerate() {
+            if k != 0 {
+                expected *= 0.25 / k as Real;
+            }
+            assert!((coefficient / expected - 1.).abs() < 2e-13);
+        }
+        Ok(())
     }
 
     #[test]
