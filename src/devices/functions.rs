@@ -424,6 +424,30 @@ pub(super) fn affine_value(first: Real, second: Real, fraction: Real) -> Real {
     }
 }
 
+/// Scaled slope without an overflowing endpoint difference or time ratio.
+pub(super) fn scaled_difference(first: Real, second: Real, scale: Real, duration: Real) -> Real {
+    use crate::primitives::numeric::{scale_power, split_power};
+    let difference = second - first;
+    if scale == 0. || difference == 0. {
+        return 0.;
+    }
+    // Preserve the small difference of nearby levels before normalization.
+    let (mantissa, exponent) = if difference.is_finite() {
+        split_power(difference)
+    } else {
+        // An overflowing difference of two finite levels requires opposite
+        // signs and nonzero magnitudes. Halving is then exact.
+        let (m, e) = split_power(second * 0.5 - first * 0.5);
+        (m, e + 1)
+    };
+    let (scale_m, scale_e) = split_power(scale);
+    let (duration_m, duration_e) = split_power(duration);
+    scale_power(
+        mantissa * scale_m / duration_m,
+        exponent + scale_e - duration_e,
+    )
+}
+
 /// Reduce the exact binary64 degree input by its integer period before
 /// converting. This preserves the physical phase even when conversion of
 /// unreduced degrees would overflow or lose many radians. For the ordinary
@@ -653,6 +677,93 @@ impl SourceFunction {
         finite(kind, value)
     }
 
+    /// Analytic Taylor coefficients on the chosen side of a delay edge.
+    #[expect(
+        clippy::float_cmp,
+        reason = "waveform derivatives choose an exact one-sided delay branch"
+    )]
+    pub(super) fn jet(
+        self,
+        t: Real,
+        scale: Real,
+        order: usize,
+        limit: Limit,
+    ) -> SpiceResult<crate::maths::taylor::Jet> {
+        use crate::maths::taylor::Jet;
+        let active = |delay| t > delay || (t == delay && limit == Limit::Right);
+        let angle = |frequency, elapsed, phase| {
+            Jet::affine(
+                order,
+                modulation_angle(frequency, elapsed, phase_radians(phase)),
+                (frequency * scale) * (2. * PI),
+            )
+        };
+        let result = match self {
+            Self::Sine(s) if active(s.delay) => {
+                let elapsed = t - s.delay;
+                let phase = angle(s.frequency, elapsed, s.phase);
+                let damping = Jet::affine(order, -elapsed * s.damping, -scale * s.damping);
+                phase
+                    .sin_cos()
+                    .0
+                    .multiply(&damping.exp())
+                    .scale(s.amplitude)
+                    .offset(s.offset)
+            }
+            Self::Exp(e) if active(e.rise_delay) => {
+                let rise =
+                    Jet::affine(order, -(t - e.rise_delay) / e.rise_tau, -scale / e.rise_tau).exp();
+                let weight = if active(e.fall_delay) {
+                    let fall =
+                        Jet::affine(order, -(t - e.fall_delay) / e.fall_tau, -scale / e.fall_tau)
+                            .exp();
+                    fall.add(&rise.scale(-1.))
+                } else {
+                    rise.scale(-1.).offset(1.)
+                };
+                // Apply the two endpoint levels separately: their raw
+                // difference can overflow despite a finite local derivative.
+                weight
+                    .clone()
+                    .scale(e.pulsed)
+                    .add(&weight.scale(-e.initial))
+                    .offset(e.initial)
+            }
+            Self::Sffm(s) if active(s.delay) => {
+                let elapsed = t - s.delay;
+                let modulation = angle(s.signal, elapsed, s.signal_phase)
+                    .sin_cos()
+                    .0
+                    .scale(s.index);
+                angle(s.carrier, elapsed, s.carrier_phase)
+                    .add(&modulation)
+                    .sin_cos()
+                    .0
+                    .scale(s.amplitude)
+                    .offset(s.offset)
+            }
+            Self::Am(a) if active(a.delay) => {
+                let elapsed = t - a.delay;
+                let modulation = angle(a.modulation_frequency, elapsed, a.modulation_phase)
+                    .sin_cos()
+                    .0
+                    .scale(a.modulation_amplitude)
+                    .offset(a.carrier_amplitude);
+                modulation
+                    .multiply(
+                        &angle(a.carrier_frequency, elapsed, a.carrier_phase)
+                            .sin_cos()
+                            .0,
+                    )
+                    .offset(a.offset)
+            }
+            _ => Jet::constant(order, self.value_at(t, limit)?),
+        };
+        // Match the conditioned scalar kernel for the zeroth coefficient,
+        // notably EXP's late-time cancellation and SIN's phase rounding.
+        Ok(result.with_value(self.value_at(t, limit)?))
+    }
+
     /// The corners the port lands on, ascending and unique: SIN/SFFM/AM
     /// delay, EXP `TD1` and `TD2`. See the module notes on C parity.
     #[must_use = "the returned times locate waveform transitions that the timestep scheduler must account for"]
@@ -874,6 +985,58 @@ impl PwlSource {
             }
         }
         Ok(self.interpolate(time))
+    }
+
+    /// The value and scaled slope of the actual selected one-sided segment.
+    /// Scale zero requests the value only, without evaluating a slope.
+    #[expect(
+        clippy::float_cmp,
+        reason = "one-sided segment membership uses exact event equality"
+    )]
+    pub(super) fn local_affine(
+        &self,
+        t: Real,
+        scale: Real,
+        limit: Limit,
+    ) -> SpiceResult<(Real, Real)> {
+        let mut time = t - self.delay();
+        if !time.is_finite() {
+            return Err(invalid("PWL", "nonfinite local Taylor time"));
+        }
+        let (first, last) = (self.knots[0], self.knots[self.knots.len() - 1]);
+        let left = limit == Limit::Left;
+        if time < first.0 || (left && time == first.0) {
+            return Ok((first.1, 0.));
+        }
+        if time > last.0 || (!left && time == last.0) {
+            let Some(index) = self.repeat() else {
+                return Ok((last.1, 0.));
+            };
+            let start = self.knots[index].0;
+            let period = last.0 - start;
+            let cycle = cycle_position(time - start, period);
+            if !cycle.resolvable() {
+                return Err(invalid("PWL", "unresolvable local Taylor cycle"));
+            }
+            time = if left && cycle.phase == 0. {
+                last.0
+            } else {
+                (cycle.phase + start).min(last.0)
+            };
+        }
+        let next = self
+            .knots
+            .partition_point(|&(knot, _)| knot < time || (!left && knot == time));
+        let Some(&(t1, v1)) = self.knots.get(next) else {
+            return Ok((last.1, 0.));
+        };
+        let Some(&(t0, v0)) = next.checked_sub(1).and_then(|i| self.knots.get(i)) else {
+            return Ok((first.1, 0.));
+        };
+        let duration = t1 - t0;
+        let value = affine_value(v0, v1, (time - t0) / duration);
+        let slope = scaled_difference(v0, v1, scale, duration);
+        Ok((value, slope))
     }
 
     /// Lazily enumerates the delayed knot times in `[t0, t1]`, continuing

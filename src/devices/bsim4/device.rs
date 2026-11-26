@@ -575,7 +575,7 @@ fn load_mode(context: &StampContext<'_>) -> SpiceResult<(u32, bool)> {
     }
     let uic = if states.uic() { mode::MODEUIC } else { 0 };
     let base = match context.mode {
-        AnalysisMode::OperatingPoint => mode::MODEDCOP,
+        AnalysisMode::OperatingPoint | AnalysisMode::Instantaneous { .. } => mode::MODEDCOP,
         AnalysisMode::DcSweep => mode::MODEDCTRANCURVE,
         AnalysisMode::Transient { .. } => mode::MODETRAN,
         AnalysisMode::Ac { .. } => {

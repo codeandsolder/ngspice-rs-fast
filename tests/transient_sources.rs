@@ -128,3 +128,267 @@ fn transient_loads_without_forcing_or_in_ac_fail_explicitly() {
         .to_string();
     assert!(error.contains("AC"), "{error}");
 }
+
+#[test]
+fn unintegrated_physical_dae_respects_time_and_source_event_side() {
+    let circuit = circuit(
+        true,
+        Waveform::Step {
+            before: 1.,
+            after: 3.,
+            time: 1e-4,
+        },
+    );
+    let run = circuit.prepare_run();
+    let mut dae = run
+        .prepare_physical_dae(
+            &ModelContext::default(),
+            TransientTiming::new(1e-6, 1e-3).unwrap(),
+        )
+        .unwrap();
+    let x = Vector::from(vec![2., 0.]);
+    for (time, side, expected) in [
+        (1e-4, Limit::Left, 1.),
+        (1e-4, Limit::Right, -1.),
+        (2e-4, Limit::Right, -1.),
+        (0., Limit::Right, 1.),
+    ] {
+        let point = dae.evaluate(&x, time, side).unwrap();
+        assert_eq!(point.residual.as_slice(), &[2e-3, expected]);
+        assert_eq!(point.charge.as_slice(), &[0., 0.]);
+        assert_eq!(point.conductance.get(0, 0), 1e-3);
+        assert_eq!(point.conductance.get(1, 0), 1.);
+    }
+    assert!(dae.evaluate(&x, f64::NAN, Limit::Right).is_err());
+    assert_eq!(
+        rhs(&circuit, AnalysisMode::OperatingPoint, None).unwrap(),
+        [0., 7.]
+    );
+}
+
+#[test]
+fn unintegrated_physical_dae_matches_nonlinear_charge_equations() -> SpiceResult<()> {
+    use ngspice_rs::analysis::RunConfig;
+    use ngspice_rs::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+    let deck = parse_deck_text(
+        Path::new("dae.cir"),
+        "physical DAE\nv1 a 0 dc 7 PWL(0 1 1m 3)\nb1 b 0 v={v(a)^2+1000*time}\nc1 a 0 2u\nr1 b 0 1k\nc2 b 0 q={1u*(v(b)^2+1000*time)}\n.end\n",
+    );
+    let netlist = Parser::new().parse_deck(&deck)?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let mut circuit = config.circuit(&netlist)?;
+    circuit.finalize()?;
+    let row = |name| {
+        circuit
+            .unknowns()
+            .node_row(circuit.nodes().get(name).unwrap())
+            .unwrap()
+    };
+    let branch = |name| {
+        let i = circuit
+            .devices()
+            .iter()
+            .position(|d| d.name() == name)
+            .unwrap();
+        circuit.branch_rows(i).unwrap().start
+    };
+    let (a, b, v, bv, q) = (row("a"), row("b"), branch("v1"), branch("b1"), branch("c2"));
+    let mut x = Vector::zeros(circuit.unknown_count());
+    for (row, value) in [
+        (a, 2.),
+        (b, 5.),
+        (v, -2e-3),
+        (bv, -6e-3),
+        (q, 1e-3),
+        (q + 1, 26e-6),
+    ] {
+        x.set(row, value)?;
+    }
+    let run = circuit.prepare_run();
+    let mut dae = run.prepare_physical_dae(
+        &config.context().model_context(),
+        TransientTiming::new(1e-6, 1e-3)?,
+    )?;
+    let close = |actual: f64, expected: f64| {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "{actual:e} != {expected:e}"
+        )
+    };
+    let point = dae.evaluate(&x, 5e-4, Limit::Right)?;
+    for (r, expected) in [
+        (a, -2e-3),
+        (b, 0.),
+        (v, 0.),
+        (bv, 0.5),
+        (q, 0.5e-6),
+        (q + 1, 1e-3),
+    ] {
+        close(point.residual.as_slice()[r], expected);
+    }
+    close(point.charge.as_slice()[a], 4e-6);
+    close(point.charge.as_slice()[q + 1], -26e-6);
+    close(point.capacitance.get(a, a), 2e-6);
+    close(point.capacitance.get(q + 1, q + 1), -1.);
+    close(point.conductance.get(bv, a), -4.);
+    close(point.conductance.get(q, b), -10e-6);
+    let point = dae.evaluate(&x, 1e-3, Limit::Right)?;
+    close(point.residual.as_slice()[v], -1.);
+    close(point.residual.as_slice()[bv], 0.);
+    close(point.residual.as_slice()[q], 0.);
+    Ok(())
+}
+
+#[test]
+fn exact_source_jets_choose_the_physical_side_at_corners_and_jumps() -> SpiceResult<()> {
+    use ngspice_rs::devices::PwlSource;
+    let waveform = Waveform::Pwl(PwlSource::new(
+        vec![(0., 2.), (1., 3.), (2., 7.)],
+        0.,
+        Some(1.),
+    )?);
+    let cases = [
+        (0., Limit::Left, [2., 0.]),
+        (0., Limit::Right, [2., 1.]),
+        (1., Limit::Left, [3., 1.]),
+        (1., Limit::Right, [3., 4.]),
+        (2., Limit::Left, [7., 4.]),
+        (2., Limit::Right, [3., 4.]),
+        (3., Limit::Left, [7., 4.]),
+        (3., Limit::Right, [3., 4.]),
+    ];
+    for (t, side, expected) in cases {
+        let jet = waveform.taylor_at(t, 1., 6, side)?;
+        assert_eq!(&jet[..2], &expected);
+        assert_eq!(&jet[2..], &[0.; 5]);
+        assert_eq!(waveform.physical_value_at(t, side)?, expected[0]);
+    }
+    let extreme = Waveform::Pwl(PwlSource::plain(vec![(0., -1e308), (1e308, 1e308)])?);
+    let jet = extreme.taylor_at(0., 1e-308, 1, Limit::Right)?;
+    assert!((jet[1] / 2e-308 - 1.).abs() < 1e-14);
+    let pulse = Waveform::Pulse(Pulse::new(1., 3., 0., 0., 1., 1., 4.)?);
+    for (t, side, expected) in [
+        (0., Limit::Left, [1., 0.]),
+        (0., Limit::Right, [3., 0.]),
+        (1., Limit::Left, [3., 0.]),
+        (1., Limit::Right, [3., -2.]),
+        (2., Limit::Left, [1., -2.]),
+        (2., Limit::Right, [1., 0.]),
+        (4., Limit::Left, [1., 0.]),
+        (4., Limit::Right, [3., 0.]),
+    ] {
+        let jet = pulse.taylor_at(t, 1., 4, side)?;
+        assert_eq!(&jet[..2], &expected);
+        assert_eq!(&jet[2..], &[0.; 3]);
+    }
+    let circuit = circuit(true, pulse);
+    let run = circuit.prepare_run();
+    let mut dae =
+        run.prepare_physical_dae(&ModelContext::default(), TransientTiming::new(0.1, 10.)?)?;
+    let x = Vector::from(vec![3., -0.003]);
+    let left = dae.evaluate(&x, 0., Limit::Left)?;
+    assert_eq!(left.residual.as_slice(), &[0., 2.]);
+    let right = dae.evaluate(&x, 0., Limit::Right)?;
+    assert_eq!(right.residual.as_slice(), &[0., 0.]);
+    Ok(())
+}
+
+#[test]
+fn analytic_waveform_jets_do_not_differentiate_rounded_samples() -> SpiceResult<()> {
+    use ngspice_rs::devices::{AmSpec, ExpSpec, FunctionSpec, SffmSpec, SineSpec};
+    use std::f64::consts::TAU;
+    let timing = TransientTiming::new(1e-6, 1e-2)?;
+    let sine = Waveform::FunctionDefaults(FunctionSpec::Sine(SineSpec {
+        offset: 2.,
+        amplitude: 3.,
+        frequency: Some(1000.),
+        delay: None,
+        damping: None,
+        phase: None,
+    }))
+    .resolve(&timing)?;
+    let scale = 1e-3;
+    let slope = TAU * 1000. * scale;
+    let actual = sine.taylor_at(0., scale, 6, Limit::Right)?;
+    let expected = [
+        2.,
+        3. * slope,
+        0.,
+        -3. * slope.powi(3) / 6.,
+        0.,
+        3. * slope.powi(5) / 120.,
+        0.,
+    ];
+    for (a, b) in actual.iter().zip(expected) {
+        assert!((a - b).abs() < 1e-12, "{a:e} != {b:e}");
+    }
+    assert_eq!(
+        sine.taylor_at(0., scale, 6, Limit::Left)?,
+        vec![2., 0., 0., 0., 0., 0., 0.]
+    );
+    let exp = Waveform::FunctionDefaults(FunctionSpec::Exp(ExpSpec {
+        initial: 1.,
+        pulsed: 3.,
+        rise_delay: Some(1e-3),
+        rise_tau: Some(1e-3),
+        fall_delay: Some(4e-3),
+        fall_tau: Some(2e-3),
+    }))
+    .resolve(&timing)?;
+    let actual = exp.taylor_at(1e-3, scale, 4, Limit::Right)?;
+    for (a, b) in actual.iter().zip([1., 2., -1., 1. / 3., -1. / 12.]) {
+        assert!((a - b).abs() < 1e-14);
+    }
+    let fm = Waveform::FunctionDefaults(FunctionSpec::Sffm(SffmSpec {
+        offset: 1.,
+        amplitude: 2.,
+        carrier: Some(1000.),
+        index: Some(1.),
+        signal: Some(100.),
+        delay: Some(1e-3),
+        signal_phase: Some(15.),
+        carrier_phase: Some(30.),
+    }))
+    .resolve(&timing)?;
+    let am = Waveform::FunctionDefaults(FunctionSpec::Am(AmSpec {
+        offset: 1.,
+        carrier_amplitude: 2.,
+        modulation_amplitude: Some(0.3),
+        modulation_frequency: Some(100.),
+        carrier_frequency: Some(1000.),
+        delay: Some(1e-3),
+        modulation_phase: Some(15.),
+        carrier_phase: Some(30.),
+    }))
+    .resolve(&timing)?;
+    let port = Waveform::PortSeries {
+        baseline: Box::new(sine.clone()),
+        tones: vec![(0.7, TAU * 900.)],
+    };
+    for waveform in [&sine, &exp, &fm, &am, &port] {
+        let time = 2e-3;
+        let scale = 1e-5;
+        let jet = waveform.taylor_at(time, scale, 8, Limit::Right)?;
+        for local in [-0.5_f64, 0., 0.5] {
+            let reconstructed = jet
+                .iter()
+                .rev()
+                .fold(0_f64, |sum, &coefficient| sum.mul_add(local, coefficient));
+            let expected = waveform.value_at(time + scale * local, Limit::Right)?;
+            assert!(
+                (reconstructed - expected).abs() < 1e-12,
+                "{reconstructed:e} != {expected:e}"
+            );
+        }
+    }
+    let circuit = circuit(false, sine);
+    // The source's explicit DC value must not enter its derivative coefficients.
+    let run = circuit.prepare_run();
+    let dae = run.prepare_physical_dae(&ModelContext::default(), timing)?;
+    let rhs = dae.forcing_taylor_rhs(0., 1e-3, 6, Limit::Right)?;
+    for (actual, expected) in rhs.iter().zip(expected) {
+        assert!((actual.as_slice()[0] + expected).abs() < 1e-12);
+    }
+    Ok(())
+}

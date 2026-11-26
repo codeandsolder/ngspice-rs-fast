@@ -652,6 +652,7 @@ impl ChargeConstraints {
         prepared.assemble_charge_for(
             request.model_context,
             request.solution,
+            0.,
             &mut self.value,
             &mut self.jacobian,
             storage.charges.values().map(|charge| charge.device),

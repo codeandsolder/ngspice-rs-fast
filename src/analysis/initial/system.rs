@@ -660,7 +660,7 @@ impl<'a> InstantaneousSystem<'a> {
             })
             .collect();
         let optional: Vec<_> = derived.iter().map(|(_, row)| *row).collect();
-        let result = rank::complete(matrix, rhs, &gauges, &charges, &optional)?;
+        let result = rank::complete(matrix, rhs, &gauges, &charges, &optional, matrix.cols())?;
         let retained = derived
             .into_iter()
             .filter_map(|(absolute, row)| result.independent[row].then_some(absolute))

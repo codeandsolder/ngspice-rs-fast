@@ -47,6 +47,8 @@ pub struct ChargeContext<'a> {
     pub controls: &'a [usize],
     /// State at which to evaluate the constitutive law.
     pub state: &'a Vector,
+    /// Absolute time of the constitutive law evaluation.
+    pub time: Real,
     /// Signed charge and flux residual by equation row.
     pub charge: &'a mut Vector,
     /// Exact derivative of that residual.
@@ -355,6 +357,12 @@ pub enum AnalysisMode {
         /// Frequency in Hz.
         frequency: Real,
     },
+    /// Static physical equations at a transient time, without integration.
+    /// Used with separately assembled charge/flux in a memoryless DAE.
+    Instantaneous {
+        /// Absolute time in seconds.
+        time: Real,
+    },
     /// A step of a `.tran` analysis.
     Transient {
         /// Absolute time in seconds.
@@ -382,7 +390,10 @@ impl AnalysisMode {
     /// shorts.
     #[must_use = "DC loads omit time-dependent companion terms"]
     pub const fn is_dc(self) -> bool {
-        matches!(self, Self::OperatingPoint | Self::DcSweep)
+        matches!(
+            self,
+            Self::OperatingPoint | Self::DcSweep | Self::Instantaneous { .. }
+        )
     }
 }
 

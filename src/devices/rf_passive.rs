@@ -164,7 +164,9 @@ impl Device for RfLine {
 
     fn stamp(&self, ctx: &mut StampContext<'_>) -> SpiceResult<()> {
         match ctx.mode {
-            AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
+            AnalysisMode::OperatingPoint
+            | AnalysisMode::DcSweep
+            | AnalysisMode::Instantaneous { .. } => {
                 let branch = ctx.branch(0)?;
                 self.entries(ctx.unknowns, branch, 0., ctx.temperature, |r, c, v| {
                     ctx.matrix.add(r, c, v.re)

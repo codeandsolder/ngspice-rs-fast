@@ -64,13 +64,15 @@ struct Pivot {
 struct Basis {
     pivots: Vec<Pivot>,
     by_column: Vec<Option<usize>>,
+    required_prefix: usize,
 }
 
 impl Basis {
-    fn new(columns: usize) -> Self {
+    fn new(columns: usize, required_prefix: usize) -> Self {
         Self {
             pivots: Vec::new(),
             by_column: vec![None; columns],
+            required_prefix,
         }
     }
 
@@ -106,7 +108,14 @@ impl Basis {
         let Some((&column, &pivot)) = terms
             .iter()
             .filter(|(_, coefficient)| coefficient.significant())
-            .max_by(|(_, a), (_, b)| a.value.abs().total_cmp(&b.value.abs()))
+            // Eliminate higher Taylor degrees first. A prefix pivot can
+            // appear only when no significant tail coefficient survives;
+            // it is then a constraint on the required initial coordinates.
+            .max_by(|(ca, a), (cb, b)| {
+                (**ca >= self.required_prefix)
+                    .cmp(&(**cb >= self.required_prefix))
+                    .then_with(|| a.value.abs().total_cmp(&b.value.abs()))
+            })
         else {
             return Ok(false);
         };
@@ -124,11 +133,19 @@ impl Basis {
     }
 
     fn solution(&self, column_exponents: &[i32]) -> SpiceResult<Vector> {
-        if self.pivots.len() != self.by_column.len() {
-            return Err(failure(
-                "uic initial conditions cannot be shown consistent: singular instantaneous system has freedoms not resolved by storage-coordinate gauges",
-            ));
+        if self.by_column[..self.required_prefix]
+            .iter()
+            .any(Option::is_none)
+        {
+            return Err(failure(if self.required_prefix == self.by_column.len() {
+                "uic initial conditions cannot be shown consistent: singular instantaneous system has freedoms not resolved by storage-coordinate gauges"
+            } else {
+                "derivative array leaves required initial coordinates undetermined at this order"
+            }));
         }
+        // Free tail coefficients are not initial gauges. The projected
+        // equations proved that none changes the required prefix, so zero
+        // is only a choice of particular solution for the unused tail.
         let mut solution = Vector::zeros(self.by_column.len());
         for pivot in self.pivots.iter().rev() {
             let value = pivot
@@ -162,14 +179,22 @@ pub(super) struct Completed {
 /// zero-current gauge equations. Scaling by exact powers of two keeps charge,
 /// voltage and current rows on comparable numerical scales. No least-squares
 /// relaxation of the original constraints is performed.
+///
+/// When only an initial coordinate prefix is required, higher-order
+/// columns are eliminated preferentially. Every required coordinate must
+/// have a pivot independent of the free tail; unused jet coefficients
+/// may remain arbitrary. The ordinary instantaneous solve requires all
+/// columns and therefore retains its original pivot selection.
 pub(super) fn complete(
     matrix: &SparseMatrix,
     rhs: &[Real],
     gauges: &[usize],
     late_rows: &[usize],
     optional_rows: &[usize],
+    required_prefix: usize,
 ) -> SpiceResult<Completed> {
-    if rhs.len() != matrix.rows()
+    if required_prefix > matrix.cols()
+        || rhs.len() != matrix.rows()
         || late_rows
             .iter()
             .chain(optional_rows)
@@ -202,7 +227,7 @@ pub(super) fn complete(
             *exponent = 0;
         }
     }
-    let mut basis = Basis::new(matrix.cols());
+    let mut basis = Basis::new(matrix.cols(), required_prefix);
     let entries = matrix.triplets();
     let mut ranges = Vec::with_capacity(matrix.rows());
     let mut cursor = 0;
@@ -266,8 +291,8 @@ mod tests {
         matrix.add(1, 0, 1e300).unwrap();
         matrix.fold_duplicates();
         let rhs = [2e-300, 2e300];
-        assert!(complete(&matrix, &rhs, &[1], &[], &[]).is_err());
-        let result = complete(&matrix, &rhs, &[1, 2], &[], &[]).unwrap();
+        assert!(complete(&matrix, &rhs, &[1], &[], &[], matrix.cols()).is_err());
+        let result = complete(&matrix, &rhs, &[1, 2], &[], &[], matrix.cols()).unwrap();
         assert!((result.values.as_slice()[0] - 2.).abs() < 1e-14);
         assert_eq!(&result.values.as_slice()[1..], &[0., 0.]);
     }
@@ -281,7 +306,7 @@ mod tests {
         // Inconsistent linearization: the algebraic source must win over
         // the dependent charge tangent. The outer physical residual check
         // decides whether the nonlinear charge constraint is satisfied.
-        let result = complete(&matrix, &[1e-6, 2.], &[], &[0], &[]).unwrap();
+        let result = complete(&matrix, &[1e-6, 2.], &[], &[0], &[], matrix.cols()).unwrap();
         assert_eq!(result.values.as_slice(), &[2.]);
     }
 
@@ -293,8 +318,8 @@ mod tests {
         }
         matrix.fold_duplicates();
         let rhs = [3e-15, 6e6, 2.];
-        assert!(complete(&matrix, &rhs, &[], &[], &[]).is_err());
-        let solution = complete(&matrix, &rhs, &[1, 2], &[], &[]).unwrap();
+        assert!(complete(&matrix, &rhs, &[], &[], &[], matrix.cols()).is_err());
+        let solution = complete(&matrix, &rhs, &[1, 2], &[], &[], matrix.cols()).unwrap();
         assert!((solution.values.as_slice()[0] - 3.).abs() < 1e-14);
         assert_eq!(
             solution.values.as_slice()[1] + solution.values.as_slice()[2],
@@ -315,7 +340,15 @@ mod priority_tests {
             matrix.add(row, col, value).unwrap();
         }
         matrix.fold_duplicates();
-        let result = complete(&matrix, &[1., 7., 2., 8.], &[2], &[2], &[1, 3]).unwrap();
+        let result = complete(
+            &matrix,
+            &[1., 7., 2., 8.],
+            &[2],
+            &[2],
+            &[1, 3],
+            matrix.cols(),
+        )
+        .unwrap();
         assert_eq!(result.values.as_slice(), &[1., 2., 0.]);
         assert_eq!(result.independent, [true, false, true, false]);
     }
@@ -324,7 +357,7 @@ mod priority_tests {
     fn unrelated_elimination_rounding_does_not_hide_a_small_pivot() {
         // First pivot mixes column 0 and 1, but the independent column 2
         // is never touched by it. A scalar row error can lose that column.
-        let mut basis = Basis::new(3);
+        let mut basis = Basis::new(3, 3);
         assert!(
             basis
                 .insert(
@@ -352,5 +385,87 @@ mod priority_tests {
         );
         let result = basis.solution(&[0, 0, 0]).unwrap();
         assert_eq!(result.as_slice(), &[1., 2., 0.]);
+    }
+}
+
+#[cfg(test)]
+mod projected_tests {
+    use super::*;
+
+    // Exact derivative-array structure for an arbitrary linear chain:
+    // x_0(t) = p(t), x_i(t) = d x_(i-1) / dt. Highest-order
+    // Taylor coefficients are intentionally not assigned boundary values.
+    fn derivative_chain(depth: usize, order: usize) -> (SparseMatrix, Vec<Real>) {
+        let width = depth + 1;
+        let mut matrix = SparseMatrix::new(order * width, (order + 1) * width);
+        let mut rhs = vec![0.; order * width];
+        let mut degree = 1.;
+        for k in 0..order {
+            let offset = k * width;
+            matrix.add(offset, offset, 1.).unwrap();
+            rhs[offset] = [1., 2., 3., 4.].get(k).copied().unwrap_or(0.);
+            for i in 1..width {
+                matrix.add(offset + i, offset + i, 1.).unwrap();
+                matrix
+                    .add(offset + i, offset + width + i - 1, -degree)
+                    .unwrap();
+            }
+            degree += 1.;
+        }
+        matrix.fold_duplicates();
+        (matrix, rhs)
+    }
+
+    #[test]
+    fn derivative_depth_resolves_prefix_without_gauging_highest_jets() {
+        for depth in 1..=32 {
+            let width = depth + 1;
+            let (short, rhs) = derivative_chain(depth, depth);
+            assert!(complete(&short, &rhs, &[], &[], &[], width).is_err());
+            let (matrix, rhs) = derivative_chain(depth, depth + 1);
+            let result = complete(&matrix, &rhs, &[], &[], &[], width).unwrap();
+            let expected = [1., 2., 6., 24.];
+            for (i, &value) in result.values.as_slice()[..width].iter().enumerate() {
+                assert!((value - expected.get(i).copied().unwrap_or(0.)).abs() < 1e-12);
+            }
+            // The full system must still be rank deficient: projected
+            // uniqueness is not the same as inventing a full-rank system.
+            assert!(complete(&matrix, &rhs, &[], &[], &[], matrix.cols()).is_err());
+        }
+    }
+
+    #[test]
+    fn genuine_feedback_storage_needs_an_independent_initial_constraint() {
+        // x_1 = dx_0/dt, x_1 + x_0 = 0. The first derivative and
+        // subsequent jets are fixed by the physical initial storage x_0.
+        let mut matrix = SparseMatrix::new(8, 8);
+        let mut degree = 1.;
+        for k in 0..3 {
+            let row = 2 * k;
+            matrix.add(row, row + 1, 1.).unwrap();
+            matrix.add(row, row + 2, -degree).unwrap();
+            matrix.add(row + 1, row, 1.).unwrap();
+            matrix.add(row + 1, row + 1, 1.).unwrap();
+            degree += 1.;
+        }
+        matrix.fold_duplicates();
+        assert!(complete(&matrix, &[0.; 8], &[], &[], &[], 2).is_err());
+        matrix.add(6, 0, 1.).unwrap();
+        // The derived condition x_1 = 0 is dependent and must not
+        // displace the physical storage x_0 = 2.
+        matrix.add(7, 1, 1.).unwrap();
+        matrix.fold_duplicates();
+        let result = complete(
+            &matrix,
+            &[0., 0., 0., 0., 0., 0., 2., 0.],
+            &[],
+            &[6],
+            &[7],
+            2,
+        )
+        .unwrap();
+        assert_eq!(&result.values.as_slice()[..2], &[2., -2.]);
+        assert!(result.independent[6]);
+        assert!(!result.independent[7]);
     }
 }

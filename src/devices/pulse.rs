@@ -371,6 +371,69 @@ impl Pulse {
         })
     }
 
+    /// Value and scaled slope of the selected physical one-sided segment.
+    #[expect(
+        clippy::float_cmp,
+        reason = "pulse edge selection uses exact event equality"
+    )]
+    pub(super) fn local_affine(
+        &self,
+        t: Real,
+        scale: Real,
+        limit: Limit,
+    ) -> SpiceResult<(Real, Real)> {
+        let elapsed = t - self.delay;
+        if !elapsed.is_finite() {
+            return Err(invalid("nonfinite local Taylor time"));
+        }
+        let left = limit == Limit::Left;
+        if elapsed < 0.
+            || (left && elapsed == 0.)
+            || self
+                .stop
+                .is_some_and(|stop| elapsed > stop || (!left && elapsed == stop))
+        {
+            return Ok((self.initial, 0.));
+        }
+        let cycle = cycle_position(elapsed, self.period);
+        if !cycle.resolvable() {
+            return Err(invalid("unresolvable local Taylor cycle"));
+        }
+        let phase = if left && cycle.phase == 0. {
+            self.period
+        } else {
+            cycle.phase
+        };
+        let contains = |start, end| {
+            start < end
+                && if left {
+                    phase > start && phase <= end
+                } else {
+                    phase >= start && phase < end
+                }
+        };
+        let fall_start = self.rise + self.width;
+        if contains(0., self.rise) {
+            Ok((
+                super::functions::affine_value(self.initial, self.pulsed, phase / self.rise),
+                super::functions::scaled_difference(self.initial, self.pulsed, scale, self.rise),
+            ))
+        } else if contains(self.rise, fall_start) {
+            Ok((self.pulsed, 0.))
+        } else if contains(fall_start, fall_start + self.fall) {
+            Ok((
+                super::functions::affine_value(
+                    self.pulsed,
+                    self.initial,
+                    (phase - fall_start) / self.fall,
+                ),
+                super::functions::scaled_difference(self.pulsed, self.initial, scale, self.fall),
+            ))
+        } else {
+            Ok((self.initial, 0.))
+        }
+    }
+
     /// Lazily enumerates the corner and jump times in the closed window
     /// `[t0, t1]`, ascending and strictly increasing, one cycle at a time.
     ///

@@ -582,7 +582,9 @@ impl Device for TransmissionLine {
             context.stamp(r, c, value)?;
         }
         match context.mode {
-            AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
+            AnalysisMode::OperatingPoint
+            | AnalysisMode::DcSweep
+            | AnalysisMode::Instantaneous { .. } => {
                 let z = (1. - context.gmin) * self.z0;
                 for (r, c, value) in self.cross_entries(z) {
                     context.stamp(r, c, value)?;

@@ -679,7 +679,7 @@ impl Device for Behavioural {
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let time = match context.mode {
-            AnalysisMode::Transient { time, .. } => time,
+            AnalysisMode::Transient { time, .. } | AnalysisMode::Instantaneous { time } => time,
             AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => 0.,
             AnalysisMode::Ac { .. } => {
                 return Err(SpiceError::circuit(format!(

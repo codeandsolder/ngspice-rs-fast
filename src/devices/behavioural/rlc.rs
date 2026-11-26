@@ -598,7 +598,7 @@ impl Device for Passive {
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let time = match context.mode {
-            AnalysisMode::Transient { time, .. } => time,
+            AnalysisMode::Transient { time, .. } | AnalysisMode::Instantaneous { time } => time,
             AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => 0.,
             AnalysisMode::Ac { .. } => {
                 return Err(SpiceError::circuit(
@@ -768,7 +768,7 @@ impl Device for Passive {
                 unknowns: context.unknowns,
                 controls: context.controls,
                 branch,
-                time: 0.,
+                time: context.time,
                 model: context.model,
             },
             |bound, equations| {
