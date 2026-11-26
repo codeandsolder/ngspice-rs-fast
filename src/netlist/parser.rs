@@ -24,6 +24,7 @@ use crate::primitives::SpiceResult;
 
 use crate::netlist::ast::{FourierCard, MeasureCard, Netlist, OutputCards};
 use crate::netlist::card::{DotCommand, RawCard};
+use crate::netlist::source::admission::SourceAdmission;
 use crate::netlist::source::{Deck, fold_bounded, load_bounded};
 
 use crate::netlist::source::budget::SourceBudget;
@@ -249,7 +250,20 @@ impl Parser {
         path: impl AsRef<Path>,
         limits: SourceLimits,
     ) -> SpiceResult<ParsedDeck> {
-        let (deck, cards) = resolution::resolve(path.as_ref(), limits)?;
+        self.parse_control_file_with_admission(path, limits, None)
+    }
+
+    /// Admit a control deck and its linked sources with explicit settings.
+    ///
+    /// # Errors
+    /// Source admission, lexical or control-deck parsing failures.
+    pub fn parse_control_file_with_admission(
+        self,
+        path: impl AsRef<Path>,
+        limits: SourceLimits,
+        admission: Option<&SourceAdmission>,
+    ) -> SpiceResult<ParsedDeck> {
+        let (deck, cards) = resolution::resolve(path.as_ref(), limits, admission)?;
         scopes::assemble(&deck, &cards, self.auto_gnd, true)
     }
 
@@ -282,7 +296,21 @@ impl Parser {
         path: impl AsRef<Path>,
         limits: SourceLimits,
     ) -> SpiceResult<ParsedDeck> {
-        let (deck, cards) = resolution::resolve(path.as_ref(), limits)?;
+        self.parse_file_with_admission(path, limits, None)
+    }
+
+    /// Admit and parse a deck and linked sources under one shared source
+    /// budget, optionally transforming each unique source before UTF-8 folding.
+    ///
+    /// # Errors
+    /// Admission, subprocess, source resolution, syntax or budget failures.
+    pub fn parse_file_with_admission(
+        self,
+        path: impl AsRef<Path>,
+        limits: SourceLimits,
+        admission: Option<&SourceAdmission>,
+    ) -> SpiceResult<ParsedDeck> {
+        let (deck, cards) = resolution::resolve(path.as_ref(), limits, admission)?;
         scopes::assemble(&deck, &cards, self.auto_gnd, false)
     }
 }
@@ -397,8 +425,20 @@ pub fn load_classified_with_limits(
     path: impl AsRef<Path>,
     limits: SourceLimits,
 ) -> SpiceResult<(Deck, Vec<RawCard>)> {
+    load_classified_with_admission(path, limits, None)
+}
+
+/// Admit and classify the root source, without expanding include directives.
+///
+/// # Errors
+/// Admission, lexical or source-budget failures.
+pub fn load_classified_with_admission(
+    path: impl AsRef<Path>,
+    limits: SourceLimits,
+    admission: Option<&SourceAdmission>,
+) -> SpiceResult<(Deck, Vec<RawCard>)> {
     let mut budget = SourceBudget::new(limits);
-    let deck = load_bounded(path.as_ref(), &mut budget)?;
+    let deck = load_bounded(path.as_ref(), &mut budget, admission)?;
     let cards = classify_admitted(&deck, &mut budget)?;
     Ok((deck, cards))
 }

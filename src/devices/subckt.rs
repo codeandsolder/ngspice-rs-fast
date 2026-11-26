@@ -35,8 +35,9 @@
 //!
 //! # Not ported
 //!
-//! Nested `.subckt` definitions inside a body, `.include`/`.lib` directives, and
-//! analysis cards inside a body are rejected explicitly rather than ignored.
+//! Nested `.subckt` definitions inside a body, unresolved source directives,
+//! and analysis cards inside a body are rejected explicitly rather than ignored.
+//! Resolved includes already contribute their materialized cards in source order.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -115,7 +116,7 @@ pub struct ExpandedNetlist {
 ///
 /// # Errors
 /// Unknown subcircuit names, arity mismatches, circular definitions, nested
-/// definitions or body `.include`/analysis cards, non-literal parameter values,
+/// definitions or unresolved includes/body analysis cards, non-literal parameter values,
 /// parameter evaluation failures and exceeded [`SubcircuitLimits`]. Each error
 /// carries the location of the card that caused it, which for a body device is
 /// the location inside the definition.
@@ -286,6 +287,22 @@ fn expansion_plan<'a>(
     output: &'a OutputCards,
     measurements: &'a [MeasureCard],
 ) -> SpiceResult<Vec<ExpansionItem<'a>>> {
+    // File admission splices the selected source cards into this very
+    // scope. Keep directives as provenance, not as deferred execution.
+    // Syntax-only/programmatic decks with unresolved source references
+    // must still fail rather than silently omit their contents.
+    if let Some(include) = scope.includes.iter().find(|include| {
+        include.resolved_path.is_none()
+            || (include.section.is_some() && include.selected_section.is_none())
+    }) {
+        return Err(SpiceError::parse(
+            include.location.clone(),
+            format!(
+                "unresolved source directive '{}' requires file admission",
+                include.path
+            ),
+        ));
+    }
     if scope.cards.is_empty() {
         // Programmatically constructed decks may have no source cards.
         return Ok((0..scope.devices.len())
@@ -807,15 +824,6 @@ impl<'a> Expander<'a> {
                     definition.location, definition.name
                 ),
                 C_REFERENCE,
-            ));
-        }
-        if !definition.includes.is_empty() {
-            return Err(SpiceError::not_yet_ported(
-                format!(
-                    "{}: .include/.lib inside .subckt '{}'",
-                    definition.location, definition.name
-                ),
-                "src/frontend/inpcom.c (lexical include expansion)",
             ));
         }
         if let Some(card) = definition.analyses.first() {

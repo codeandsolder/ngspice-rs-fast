@@ -4564,12 +4564,6 @@ impl Circuit {
         scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
     ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
-        if !netlist.includes.is_empty() {
-            return Err(SpiceError::Unsupported {
-                feature: "includes in linear elaboration".into(),
-                location: None,
-            });
-        }
         // The nonlinear E/G/F/H forms become B sources and generated XSPICE
         // instances first, as inpcom.c rewrites them before numparam and
         // subcircuit expansion (#79).
