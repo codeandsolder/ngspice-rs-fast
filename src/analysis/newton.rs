@@ -473,9 +473,7 @@ impl CircuitNewton<'_, '_> {
                 }
                 stamp_nodal_regularization(matrix, nodal_regularization, gmin)?;
                 after_load(phase, matrix, rhs)?;
-                if storage.correction.active {
-                    storage.finish_incremental_load(circuit, guess)?;
-                }
+                storage.finish_load(circuit, guess)?;
                 Ok(trial)
             },
             |new, old, trial| {
@@ -685,11 +683,14 @@ impl LoadStorage<TrialState> {
     /// pattern. The rounded Jacobian supplies the correction solve; the
     /// accurate residual retains all individual physical coefficient stamps.
     /// The final factors still belong to this circuit and physical trial.
-    fn finish_incremental_load(
+    fn finish_load(
         &mut self,
         circuit: &crate::devices::Circuit,
         guess: &Vector,
     ) -> SpiceResult<()> {
+        if !self.correction.active {
+            return Ok(());
+        }
         let rhs = self
             .rhs
             .as_ref()
