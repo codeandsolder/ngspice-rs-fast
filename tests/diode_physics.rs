@@ -337,3 +337,54 @@ fn soft_recovery_transient_conserves_physical_charge_independent_of_coordinate_s
         }
     }
 }
+
+#[test]
+fn soft_recovery_approaches_the_instantaneous_diffusion_limit() {
+    let run = |vp: f64| {
+        simulate(&format!(
+            "v1 a 0 dc .7 ac 1\nd1 a 0 dm\n.model dm d(is=1e-14 tt=100n vp={vp})\n.ac dec 3 1k 1meg"
+        ))
+    };
+    let baseline = run(0.);
+    let small = run(1e-8);
+    for point in 0..baseline.point_count() {
+        let want = baseline.value("i(v1)", point).unwrap();
+        let actual = small.value("i(v1)", point).unwrap();
+        assert!(
+            (actual - want).magnitude() <= 2e-8 * want.magnitude(),
+            "point={point}: {actual:?} vs {want:?}"
+        );
+    }
+}
+
+#[test]
+fn soft_recovery_observations_are_external_terminal_quantities() {
+    for rs in [0., 10.] {
+        let n = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("diode_recovery_observations.cir"),
+                &format!(
+                    "diode recovery observations\nv1 a 0 pulse(1 -1 20n 1n 1n 2u 5u)\n\
+                     d1 a 0 dm\n.model dm d(is=1e-14 tt=100n vp=.05 rs={rs} cjo=1p)\n\
+                     .options reltol=1e-6 vntol=1n abstol=1e-14\n\
+                     .save v(a) i(v1) @d1[i] @d1[p]\n.tran 100p 100n 0 100p\n.end\n"
+                ),
+            ))
+            .unwrap();
+        let config = RunConfig::from_netlist(&n).unwrap();
+        let mut circuit = config.circuit(&n).unwrap();
+        circuit
+            .set_observations(&["@d1[i]".into(), "@d1[p]".into()])
+            .unwrap();
+        let request = config.plan_for(&n.analyses[0]).unwrap();
+        let plot = request.run(&mut circuit, &config.context()).unwrap();
+        for point in 0..plot.point_count() {
+            let current = real(&plot, "@d1[i]", point);
+            let input = real(&plot, "i(v1)", point);
+            let power = real(&plot, "@d1[p]", point);
+            let voltage = real(&plot, "v(a)", point);
+            assert!((current + input).abs() <= 1e-12 + 1e-6 * input.abs());
+            assert!((power - voltage * current).abs() <= 1e-12 + 1e-6 * power.abs());
+        }
+    }
+}
