@@ -936,3 +936,53 @@ fn long_derivative_chain_is_independent_of_print_step_normalization() -> SpiceRe
     }
     Ok(())
 }
+
+#[test]
+fn derivative_array_rejects_underdetermined_and_inconsistent_algebraic_loops() {
+    // An algebraic identity cannot determine its output. With a nonzero
+    // input slope the identity becomes a contradictory physical equation.
+    // Neither problem may be resolved by inventing a zero derivative gauge.
+    for source in ["0", "PWL(0 0 1m 1)"] {
+        let body = format!("v1 in 0 {source}\nb1 out 0 v=v(out)+ddt(v(in))\nr1 out 0 1k");
+        let error = run(
+            &body,
+            AnalysisKind::Transient,
+            &["1u", "25u", "0", "1u", "uic", "method=gear"],
+        )
+        .expect_err("the physical equations do not determine a solution")
+        .to_string();
+        assert!(
+            error.contains("noncausal") || error.contains("underdetermined"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn derivative_array_distinguishes_a_repeating_jump_and_a_storage_impulse() {
+    for method in ["method=trap", "method=gear"] {
+        let jump = run(
+            "v1 in 0 PWL(0 0 10u 1) r=0\nb1 out 0 v=1u*ddt(v(in))\nr1 out 0 1k",
+            AnalysisKind::Transient,
+            &["1u", "25u", "0", "1u", "uic", method],
+        )
+        .expect_err("a repeating PWL voltage jump has no classical derivative")
+        .to_string();
+        assert!(
+            jump.contains("source event") && jump.contains("derivative input jumps"),
+            "{jump}"
+        );
+
+        let impulse = run(
+            "v1 in 0 PWL(0 0 10u 1 20u 0)\nb1 out 0 v=1u*ddt(v(in))\nc1 out 0 1n ic=0.1\nr1 out 0 1k",
+            AnalysisKind::Transient,
+            &["1u", "25u", "0", "1u", "uic", method],
+        )
+        .expect_err("the derivative voltage step cannot preserve capacitor voltage")
+        .to_string();
+        assert!(
+            impulse.contains("c1") && impulse.contains("impulse"),
+            "{impulse}"
+        );
+    }
+}
