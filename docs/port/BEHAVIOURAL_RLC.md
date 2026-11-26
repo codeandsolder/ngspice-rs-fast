@@ -178,8 +178,9 @@ algebraic equations and mandatory physical storage constraints. If those
 already determine the input, the history is initialized at the actual
 consistent input rather than an arbitrary zero seed. If the derivative
 defines an independent state (for example v=1-tau*ddt(v)), its seed is
-retained, including a supplied .ic. For circuits with analytic physical Taylor kernels, the derivative-array
-solver now determines consistent right-limit values and rates instead of
+retained, including a supplied .ic. For circuits with analytic physical
+Taylor kernels, the derivative-array solver determines consistent
+right-limit values and rates instead of
 assigning zero to undetermined derivative outputs.
 
 ### Physical derivative arrays
@@ -226,10 +227,12 @@ initial time.
 
 The high-order path currently covers linear memoryless and rational
 models and analytic behavioural constitutive kernels. Other nonlinear
-device families continue to use their existing ordinary solver.
+device families continue to use their existing ordinary solver; general
+physical Taylor kernels for those models are tracked in
+[#242](https://github.com/codeandsolder/ngspice-rs-fast/issues/242).
 Independent source waveform boundaries are scheduled explicitly;
-arbitrary state-dependent behavioural branch changes do not yet have
-a general event localization mechanism. The derivative-order bound
+localization of arbitrary behavioural expression branch changes is
+tracked in [#241](https://github.com/codeandsolder/ngspice-rs-fast/issues/241). The derivative-order bound
 and the projected rank tests are not a proof of solvability for every
 singular or nonanalytic nonlinear DAE.
 
@@ -359,10 +362,10 @@ is used.
 ## Remaining work
 
 Source-dialect E/G LAPLACE normalization is tracked in the preprocessing
-repository (#44), using the native rational transfer model. General
-high-index right-tangent initialization is tracked in [#230](https://github.com/codeandsolder/ngspice-rs-fast/issues/230):
-a nested derivative of a linear PWL ramp under UIC currently aborts
-at the first trial instead of initializing the inner derivative to
-the right-hand slope. Broader reference coverage and numerical
-golden validation remain ongoing. Static statistical realization is documented in
+repository (#44), using the native rational transfer model. The
+physical derivative-array implementation initializes cascaded derivatives
+of linear and analytic behavioural networks at their consistent right
+limits, including under UIC. Remaining higher-order model kernels and
+behavioural branch-event localization are tracked in #242 and #241.
+Broader reference coverage and numerical golden validation remain ongoing. Static statistical realization is documented in
 [PARAM_EXPRESSIONS.md](PARAM_EXPRESSIONS.md).
