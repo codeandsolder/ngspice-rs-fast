@@ -776,20 +776,17 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
         let flagged = (phases.nonconvergent)(&trial);
         let capturing = storage.capture_original;
         let (matrix, rhs) = storage.checked_system(n)?;
-        let correction = if capturing {
-            Some(matrix.original_correction(rhs, &guess)?)
-        } else {
-            None
-        };
         if phase == IterationPhase::Junction {
             reorder = true;
         }
         let mut next = match linearised_solve(
             matrix,
-            correction.as_ref().unwrap_or(rhs),
+            rhs,
+            &guess,
             &mut ordering,
             reorder,
             options,
+            capturing,
         )? {
             crate::maths::NiStep::Solved(next) => {
                 reorder = false;
@@ -804,11 +801,6 @@ fn iterate_inner<T, F: Fn(&T) -> bool>(
                 continue;
             }
         };
-        if capturing {
-            for (new, old) in next.as_mut_slice().iter_mut().zip(guess.as_slice()) {
-                *new += old;
-            }
-        }
         if phases.damped {
             damp(
                 &mut next,
@@ -972,16 +964,36 @@ fn reconstruct_storage(
     Ok(())
 }
 
-/// One `NIiter` factor-and-solve on the raw matrix ([`crate::maths::solve_ni`]):
-/// there is no row equilibration or conditioning guard; ngspice has neither.
+/// One NIiter solve, in absolute or correction coordinates. Both use
+/// the same assembled Jacobian, pivot policy and reusable factor frame.
+/// The exact residual is only evaluated for a captured physical load.
 fn linearised_solve(
-    matrix: &SparseMatrix,
-    rhs: &Vector,
+    matrix: &mut SparseMatrix,
+    rhs: &mut Vector,
+    guess: &Vector,
     ordering: &mut Option<crate::maths::SparseSymbolic>,
     reorder: bool,
     options: &NewtonOptions,
+    capturing: bool,
 ) -> SpiceResult<crate::maths::NiStep> {
-    crate::maths::solve_ni(matrix, rhs, ordering, reorder, options.diag_gmin)
+    let correction = if capturing {
+        Some(matrix.original_correction(rhs, guess)?)
+    } else {
+        None
+    };
+    let mut step = crate::maths::solve_ni(
+        matrix,
+        correction.as_ref().unwrap_or(rhs),
+        ordering,
+        reorder,
+        options.diag_gmin,
+    )?;
+    if capturing && let crate::maths::NiStep::Solved(delta) = &mut step {
+        for (new, old) in delta.as_mut_slice().iter_mut().zip(guess.as_slice()) {
+            *new += old;
+        }
+    }
+    Ok(step)
 }
 
 fn check(matrix: &SparseMatrix, rhs: &Vector, n: usize) -> SpiceResult<()> {

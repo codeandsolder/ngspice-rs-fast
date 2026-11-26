@@ -1355,6 +1355,15 @@ impl SparseMatrix {
         let sources = rhs
             .original_by_row()
             .ok_or_else(|| pattern_error("missing original RHS contributions"))?;
+        if solution.len() != self.cols
+            || !solution.is_finite()
+            || entries.iter().any(|t| !t.value.is_finite())
+            || sources.iter().any(|&(_, v)| !v.is_finite())
+        {
+            return Err(pattern_error(
+                "invalid original residual dimensions or nonfinite stamps",
+            ));
+        }
         entries.sort_unstable_by_key(|t| t.row);
         let mut matrix = entries.iter().peekable();
         let mut sources = sources.iter().peekable();
@@ -1560,6 +1569,57 @@ impl SparseMatrix {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn original_stamp_ledger_survives_assembly_and_physical_row_edits() {
+        use super::{Pattern, SparseMatrix};
+        use crate::maths::Vector;
+        use std::sync::Arc;
+        for bound in [false, true] {
+            let pattern = Arc::new(Pattern::new(3, [(0, 0), (0, 1), (1, 1)]).unwrap());
+            let mut a = if bound {
+                SparseMatrix::bound(pattern.clone()).unwrap()
+            } else {
+                SparseMatrix::new(3, 3)
+            };
+            let mut b = Vector::zeros(3);
+            a.record_original(true);
+            b.record_original(true);
+            for coefficient in [1e16, 1., -1e16] {
+                if bound {
+                    a.add_element(pattern.find(0, 0).unwrap(), coefficient)
+                        .unwrap();
+                } else {
+                    a.add(0, 0, coefficient).unwrap();
+                }
+                b.add_to(0, coefficient).unwrap();
+            }
+            a.add(0, 1, 2.).unwrap();
+            a.add(1, 1, 1e16).unwrap();
+            a.add(1, 0, 2.).unwrap(); // overflow on a bound pattern
+            b.add_to(1, 1e16).unwrap();
+            assert!(a.zero_row(1, |col| col == 1));
+            a.set(1, 1, 4.).unwrap();
+            b.set(1, 9.).unwrap();
+            b.add_to(2, 7.).unwrap();
+            a.fold_duplicates();
+            assert_eq!(a.get(0, 0), 0.);
+            assert_eq!(b.get(0), Some(0.));
+            let x = Vector::from_slice(&[2., 3., 5.]);
+            assert_eq!(
+                a.original_correction(&mut b, &x).unwrap().as_slice(),
+                &[-7., -3., 2.]
+            );
+            a.clear();
+            b.clear();
+            a.add(0, 0, 1.).unwrap();
+            b.add_to(0, 2.).unwrap();
+            assert_eq!(
+                a.original_correction(&mut b, &x).unwrap().as_slice(),
+                &[0., -3., -5.]
+            );
+        }
+    }
 
     #[test]
     #[ignore = "manual sparse construction and replay throughput benchmark"]

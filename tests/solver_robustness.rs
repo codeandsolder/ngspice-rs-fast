@@ -221,6 +221,7 @@ fn zero_resistance_preserves_physical_clamped_current() {
 
 #[test]
 fn ill_conditioned_source_currents_are_common_mode_invariant() {
+    let mut worst_relative_error = 0_f64;
     for common in [0., 1., 1000.] {
         for resistance in [1e-3_f64, 1e-6, 1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 0.] {
             let expected = 1. / (1000. + if resistance == 0. { 1e-12 } else { resistance });
@@ -233,8 +234,10 @@ fn ill_conditioned_source_currents_are_common_mode_invariant() {
             let lower = value(&plot, "i(vl)");
             let load = value(&plot, "i(r2)");
             for actual in [upper, lower, load, -value(&plot, "v(sense)") / 1000.] {
+                let error = (actual - expected).abs();
+                worst_relative_error = worst_relative_error.max(error / expected);
                 assert!(
-                    (actual - expected).abs() <= 2e-12,
+                    error <= 2e-15,
                     "CM={common}, R={resistance:e}: actual {actual:e}, expected {expected:e}"
                 );
             }
@@ -247,6 +250,9 @@ fn ill_conditioned_source_currents_are_common_mode_invariant() {
             assert!((value(&plot, "i(r1)") - expected).abs() <= current_resolution.max(2e-12));
         }
     }
+    eprintln!(
+        "24 common-mode cases: max relative source/load/control current error {worst_relative_error:e}"
+    );
 }
 
 #[test]
