@@ -1126,3 +1126,118 @@ fn wide_parallel_derivative_constraints_do_not_lose_physical_rank() -> SpiceResu
     }
     Ok(())
 }
+
+#[test]
+fn singular_provisional_tangent_recovers_regular_nonlinear_root() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            "b1 x 0 i=v(x)^3-(2+time/1u)^3\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )?;
+        for i in 0..plot.point_count() {
+            let u = plot.value("time", i).unwrap().re / 1e-6;
+            close(plot.value("v(x)", i).unwrap().re, 2. + u, 1e-10);
+            close(plot.value("v(out)", i).unwrap().re, 1., 1e-9);
+            close(plot.value("i(b2)", i).unwrap().re, -1e-3, 1e-12);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_nonlinear_germ_recovers_unique_cubic_rate() -> SpiceResult<()> {
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            "b1 x 0 i=v(x)^3-(time/1u)^3\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )?;
+        for i in 0..plot.point_count() {
+            let u = plot.value("time", i).unwrap().re / 1e-6;
+            close(plot.value("v(x)", i).unwrap().re, u, 1e-10);
+            close(plot.value("v(out)", i).unwrap().re, 1., 1e-9);
+            close(plot.value("i(b2)", i).unwrap().re, -1e-3, 1e-12);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_quadratic_germ_reports_distinct_branches() {
+    for method in ["method=trap", "method=gear"] {
+        let error = run(
+            "b1 x 0 i=v(x)^2-(time/1u)^2\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        ).expect_err("two distinct right-hand slopes must not be chosen by a numerical gauge");
+        assert!(
+            error.to_string().contains("ambiguous nonlinear DAE"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn singular_germ_recovery_uses_coupled_nonpolynomial_equations() -> SpiceResult<()> {
+    // The two nonlinear equations have a singular Jacobian at the zero
+    // seed, but each real solution of sinh(z)-z=a is unique. The actual
+    // variables are recovered through their coupled linear combinations.
+    let body = "b1 x 0 i=sinh(v(x)+v(y))-(v(x)+v(y))-(sinh(3+time/1u)-(3+time/1u))\nb2 y 0 i=sinh(v(x)-v(y))-(v(x)-v(y))-(sinh(1+3*time/1u)-(1+3*time/1u))\nb3 dx 0 v=1u*ddt(v(x))\nb4 dy 0 v=1u*ddt(v(y))\nr1 dx 0 1k\nr2 dy 0 2k\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "0.5u", "0", "0.1u", "uic", method],
+        )?;
+        for i in 0..plot.point_count() {
+            let u = plot.value("time", i).unwrap().re / 1e-6;
+            close(plot.value("v(x)", i).unwrap().re, 2. + 2. * u, 1e-9);
+            close(plot.value("v(y)", i).unwrap().re, 1. - u, 1e-9);
+            close(plot.value("v(dx)", i).unwrap().re, 2., 1e-9);
+            close(plot.value("v(dy)", i).unwrap().re, -1., 1e-9);
+            close(plot.value("i(b3)", i).unwrap().re, -2e-3, 1e-12);
+            close(plot.value("i(b4)", i).unwrap().re, 0.5e-3, 1e-12);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_germ_recovery_at_exact_source_event_preserves_storage() -> SpiceResult<()> {
+    let body = "vtrigger trigger 0 PWL(0 0 0.5u 1 1u 0)\nb1 x 0 i=v(x)^3-((time-0.5u)/1u)^3\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\nc1 stored 0 1u ic=2\nr2 stored 0 1k\n.ic v(x)=-0.5\n.options reltol=1e-8 vntol=1n";
+    for method in ["method=trap", "method=gear"] {
+        let plot = run(
+            body,
+            AnalysisKind::Transient,
+            &["0.1u", "1u", "0", "0.1u", "uic", method],
+        )?;
+        let mut event = false;
+        for i in 0..plot.point_count() {
+            let t = plot.value("time", i).unwrap().re;
+            event |= t.to_bits() == 0.5e-6_f64.to_bits();
+            close(plot.value("v(x)", i).unwrap().re, (t - 0.5e-6) / 1e-6, 1e-9);
+            close(plot.value("v(out)", i).unwrap().re, 1., 1e-8);
+            close(plot.value("i(b2)", i).unwrap().re, -1e-3, 1e-11);
+            close(
+                plot.value("v(stored)", i).unwrap().re,
+                2. * (-t / 1e-3).exp(),
+                1e-7,
+            );
+        }
+        assert!(event, "the physical singular event was not sampled");
+    }
+    Ok(())
+}
+
+#[test]
+fn singular_repeated_root_without_rank_certificate_is_not_gauged() {
+    let error=run(
+        "b1 x 0 i=(v(x)-time/1u)^2\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n",
+        AnalysisKind::Transient,&["0.1u","1u","0","0.1u","uic","method=gear"]
+    ).expect_err("a persistent singular tangent cannot certify the repeated root");
+    assert!(
+        error.to_string().contains("singular") || error.to_string().contains("nonlinear DAE"),
+        "{error}"
+    );
+}

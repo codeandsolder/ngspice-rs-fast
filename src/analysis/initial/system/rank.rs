@@ -187,19 +187,35 @@ impl Basis {
     /// Particular Newton correction with zero corrections in unresolved
     /// coordinates. This does not prove consistency of the initial prefix.
     fn particular_solution(&self, column_exponents: &[i32]) -> SpiceResult<Vector> {
-        // Free tail coefficients are not initial gauges. The projected
-        // equations proved that none changes the required prefix, so zero
-        // is only a choice of particular solution for the unused tail.
         let mut solution = vec![Wide::ZERO; self.by_column.len()];
+        self.back_substitute(&mut solution, false);
+        Self::unscale(solution, column_exponents)
+    }
+
+    /// A homogeneous direction along a free prefix coordinate. Its tail
+    /// follows the same selected linearized equations, not artificial
+    /// independent constraints on the unresolved Taylor coefficients.
+    fn direction(&self, column_exponents: &[i32], column: usize) -> SpiceResult<Vector> {
+        let mut solution = vec![Wide::ZERO; self.by_column.len()];
+        solution[column] = Wide::from_real(1.).shifted(i64::from(column_exponents[column]));
+        self.back_substitute(&mut solution, true);
+        Self::unscale(solution, column_exponents)
+    }
+
+    fn back_substitute(&self, solution: &mut [Wide], homogeneous: bool) {
         for pivot in self.pivots.iter().rev() {
+            let rhs = if homogeneous { Wide::ZERO } else { pivot.rhs };
             let value = pivot
                 .terms
                 .iter()
-                .fold(pivot.rhs, |rhs, (&column, &coefficient)| {
+                .fold(rhs, |rhs, (&column, &coefficient)| {
                     coefficient.value.negate().mul_add(solution[column], rhs)
                 });
             solution[pivot.column] = value;
         }
+    }
+
+    fn unscale(solution: Vec<Wide>, column_exponents: &[i32]) -> SpiceResult<Vector> {
         let solution = Vector::from(
             solution
                 .into_iter()
@@ -283,6 +299,55 @@ pub(super) fn projected_rank(matrix: &SparseMatrix, required_prefix: usize) -> S
     let rhs = crate::primitives::filled_vec(matrix.rows(), 0., "derivative array rank")?;
     let reduction = reduce(matrix, &rhs, &[], &[], &[], required_prefix)?;
     Ok(reduction.basis.prefix_rank())
+}
+
+/// Projected physical rank and disposable nullspace directions, with
+/// optional numerical storage constraints excluded. Such constraints
+/// must not prevent a search for a physically determined nonlinear root.
+pub(super) struct ProbeSpace {
+    pub rank: usize,
+    pub directions: Vec<Vector>,
+}
+
+pub(super) fn probe_space(
+    matrix: &SparseMatrix,
+    late: &[usize],
+    optional: &[usize],
+    prefix: usize,
+    max_directions: usize,
+) -> SpiceResult<ProbeSpace> {
+    let mut mandatory = SparseMatrix::new(matrix.rows(), matrix.cols());
+    let mut excluded = vec![false; matrix.rows()];
+    for &row in optional {
+        excluded[row] = true;
+    }
+    for term in matrix.triplets() {
+        if !excluded[term.row] {
+            mandatory.add(term.row, term.col, term.value)?;
+        }
+    }
+    mandatory.fold_duplicates();
+    let rhs = vec![0.; matrix.rows()];
+    let reduction = reduce(&mandatory, &rhs, &[], late, &[], prefix)?;
+    let rank = reduction.basis.prefix_rank();
+    let count = prefix - rank;
+    if count > max_directions && max_directions != 0 {
+        return Err(failure(
+            "nonlinear germ recovery exceeds its nullspace dimension budget",
+        ));
+    }
+    let directions = reduction.basis.by_column[..prefix]
+        .iter()
+        .enumerate()
+        .filter(|(_, pivot)| pivot.is_none())
+        .take(max_directions)
+        .map(|(column, _)| {
+            reduction
+                .basis
+                .direction(&reduction.column_exponents, column)
+        })
+        .collect::<SpiceResult<Vec<_>>>()?;
+    Ok(ProbeSpace { rank, directions })
 }
 
 struct Reduction {
