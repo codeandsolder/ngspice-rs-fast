@@ -33,7 +33,7 @@ struct BranchSearch {
 impl BranchSearch {
     fn retry(
         &mut self,
-        attempt: &AttemptedStep,
+        attempt: AttemptedStep,
         next: NextStep,
         min_step: Real,
     ) -> SpiceResult<ReadyStep> {
@@ -84,14 +84,11 @@ impl Driver<'_> {
                 Trial::NotConverged { last } => {
                     iterate = last;
                     self.stats.rejected += 1;
-                    ready = search.retry(
-                        &attempt,
-                        NextStep {
-                            delta: attempt.clock.next.delta / 8.,
-                            order: Order::One,
-                        },
-                        min_step,
-                    )?;
+                    let next = NextStep {
+                        delta: attempt.clock.next.delta / 8.,
+                        order: Order::One,
+                    };
+                    ready = search.retry(attempt, next, min_step)?;
                     continue;
                 }
                 Trial::Converged(point) => point,
@@ -116,7 +113,7 @@ impl Driver<'_> {
                 StepDecision::Retry(next) => {
                     iterate = point.x;
                     self.stats.rejected += 1;
-                    ready = search.retry(&attempt, next, min_step)?;
+                    ready = search.retry(attempt, next, min_step)?;
                 }
                 StepDecision::Accept(next) => {
                     return self.accept_physical(attempt, next, point, &output);
