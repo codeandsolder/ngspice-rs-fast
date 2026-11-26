@@ -11,10 +11,10 @@ use crate::netlist::ast::PositionedValue;
 use crate::netlist::token::{Token, TokenKind};
 
 use super::grammar::{Input, Result};
-use super::syntax::{literal, malformed, punctuation};
+use super::syntax::{Value, malformed, punctuation};
 
 pub(super) struct NumericVector<'a> {
-    pub values: Vec<&'a Token>,
+    pub values: Vec<Value<'a>>,
     pub text: String,
 }
 
@@ -25,7 +25,11 @@ pub(super) fn positioned(token: &Token) -> PositionedValue {
     }
 }
 
-pub(super) fn numeric<'a>(input: &mut Input<'a>, maximum: usize) -> Result<NumericVector<'a>> {
+pub(super) fn numeric<'a>(
+    input: &mut Input<'a>,
+    maximum: usize,
+    mut field: impl FnMut(&mut Input<'a>) -> Result<Value<'a>>,
+) -> Result<NumericVector<'a>> {
     let start = input
         .input
         .first()
@@ -33,9 +37,9 @@ pub(super) fn numeric<'a>(input: &mut Input<'a>, maximum: usize) -> Result<Numer
     let parenthesized = opt(punctuation(TokenKind::LParen))
         .parse_next(input)?
         .is_some();
-    let first = cut_err(literal).parse_next(input)?;
+    let first = cut_err(&mut field).parse_next(input)?;
     let mut count = 1;
-    let values: Vec<&Token> = repeat(0.., |input: &mut Input<'a>| {
+    let values: Vec<Value<'_>> = repeat(0.., |input: &mut Input<'a>| {
         // A comma claims another value. So do numeric and expression tokens;
         // their errors must survive repeat's optional stopping rule.
         let comma = opt(punctuation(TokenKind::Comma)).parse_next(input)?;
@@ -49,7 +53,7 @@ pub(super) fn numeric<'a>(input: &mut Input<'a>, maximum: usize) -> Result<Numer
         if count == maximum {
             return Err(malformed(input, "too many numeric vector fields"));
         }
-        let value = cut_err(literal).parse_next(input)?;
+        let value = cut_err(&mut field).parse_next(input)?;
         count += 1;
         Ok(value)
     })
@@ -65,7 +69,7 @@ pub(super) fn numeric<'a>(input: &mut Input<'a>, maximum: usize) -> Result<Numer
         cut_err(punctuation(TokenKind::RParen).context("')' after numeric vector"))
             .parse_next(input)?
     } else {
-        values[values.len() - 1]
+        values[values.len() - 1].token()
     };
     let end = last.raw_offset + last.text.len();
     // Use joined offsets, not physical diagnostic coordinates.

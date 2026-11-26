@@ -286,7 +286,7 @@ fn every_r_setter_is_validated_in_order_like_c() {
 
 #[test]
 fn hand_built_function_asts_with_bad_field_counts_are_refused() {
-    use ngspice_rs::netlist::ast::{ParameterKind, PositionedValue, SourceWaveform};
+    use ngspice_rs::netlist::ast::{NumericVectorEntry, ParameterKind, SourceWaveform};
     use ngspice_rs::primitives::SpiceError;
     let netlist = Parser::new()
         .parse_deck(&parse_deck_text(
@@ -295,7 +295,7 @@ fn hand_built_function_asts_with_bad_field_counts_are_refused() {
         ))
         .unwrap();
     let edit = |netlist: &ngspice_rs::netlist::ast::Netlist,
-                change: &dyn Fn(&mut Vec<PositionedValue>)| {
+                change: &dyn Fn(&mut Vec<NumericVectorEntry>)| {
         let mut netlist = netlist.clone();
         let setter = &mut netlist.devices[0].parameters[0];
         let ParameterKind::Waveform(SourceWaveform::Function(f)) = &mut setter.kind else {
@@ -308,11 +308,11 @@ fn hand_built_function_asts_with_bad_field_counts_are_refused() {
     // A seventh SIN field must not be dropped silently: refused at that field.
     let (seven, _) = edit(&netlist, &|values| {
         let mut extra = values[5].clone();
-        extra.text = "9".to_owned();
+        extra.source.text = "9".to_owned();
         values.push(extra);
     });
     let extra_at = match &seven.devices[0].parameters[0].kind {
-        ParameterKind::Waveform(SourceWaveform::Function(f)) => f.values[6].location.clone(),
+        ParameterKind::Waveform(SourceWaveform::Function(f)) => f.values[6].source.location.clone(),
         _ => unreachable!(),
     };
     match Circuit::from_netlist(&seven) {
@@ -334,6 +334,97 @@ fn hand_built_function_asts_with_bad_field_counts_are_refused() {
                 assert_eq!(location, Some(setter_at.clone()));
             }
             other => panic!("{keep}-field SIN accepted: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn expression_coefficients_match_literal_physics_for_every_waveform_family() {
+    // Binary-exact parameter values ensure equality at the physical boundary,
+    // without comparing two different decimal rounding paths.
+    for (expression, literal) in [
+        (
+            "pulse({a} {a*2} {s} {s/2} {s/2} {s} {4*s} {a})",
+            "pulse(2 4 .125 .0625 .0625 .125 .5 2)",
+        ),
+        (
+            "pwl(0 {a} {s} {a*2} {2*s} {a}) r={0} td={-s/2}",
+            "pwl(0 2 .125 4 .25 2) r=0 td=-.0625",
+        ),
+        (
+            "sin({a} {a/2} {1/s} {s} {a} {a*15})",
+            "sin(2 1 8 .125 2 30)",
+        ),
+        ("sine({a} {a/2})", "sine(2 1)"),
+        (
+            "exp({a} {a*2} {s} {s/2} {2*s} {s})",
+            "exp(2 4 .125 .0625 .25 .125)",
+        ),
+        (
+            "sffm({a} {a/2} {1/s} {a} {a*2} {s} {a*15} {a*30})",
+            "sffm(2 1 8 2 4 .125 30 60)",
+        ),
+        (
+            "am({a} {a/2} {a/4} {a} {1/s} {s} {a*15} {a*30})",
+            "am(2 1 .5 2 8 .125 30 60)",
+        ),
+        (
+            "trnoise({a/2} {s} {a/4} {a/4} {a} {s} {s/2})",
+            "trnoise(1 .125 .5 .5 2 .125 .0625)",
+        ),
+        (
+            "trrandom({a} {s} {s/2} {a/4} {a})",
+            "trrandom(2 .125 .0625 .5 2)",
+        ),
+    ] {
+        for designator in ['v', 'i'] {
+            let make = |coefficients: &str| {
+                system(&format!(
+                    ".param a=2 s=.125\n{designator}1 in 0 {coefficients}\nr1 in 0 1k"
+                ))
+            };
+            let mut actual = make(expression);
+            let mut expected = make(literal);
+            assert_eq!(
+                actual.sources[0].waveform, expected.sources[0].waveform,
+                "{expression}"
+            );
+            assert_eq!(actual.dc_rhs(None).unwrap(), expected.dc_rhs(None).unwrap());
+            let binding = timing(0.015625, 1.);
+            actual.bind_transient_timing(&binding).unwrap();
+            expected.bind_transient_timing(&binding).unwrap();
+            for sample in [0., 0.0625, 0.125, 0.1875, 0.5, 0.75] {
+                assert_eq!(
+                    rhs(&actual, sample, Limit::Right),
+                    rhs(&expected, sample, Limit::Right),
+                    "{expression} at {sample}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn waveform_coefficients_bind_to_nested_occurrences_not_definition_defaults() {
+    let mut s = system(
+        ".subckt inner x y params: height=1 period=1\nv1 x 0 pwl(0 0 {period/2} {height} {period} 0) r=0\ni1 y 0 pulse(0 {height/1000} 0 {period/8} {period/8} {period/2} {period})\n.ends\n.subckt outer x y params: a=1 b=1\nx1 x y inner height={a} period={b}\n.ends\nx1 a b outer a=2 b=.5\nx2 c d outer a=4 b=1\nr1 a 0 1k\nr2 b 0 1k\nr3 c 0 1k\nr4 d 0 1k",
+    );
+    s.bind_transient_timing(&timing(0.015625, 2.)).unwrap();
+    // Physical voltage/current pairs at the same time reflect independent
+    // parameter values and periods, with current-source sign handled by MNA.
+    let expected = system(
+        "v1 a 0 pwl(0 0 .25 2 .5 0) r=0\ni1 b 0 pulse(0 2m 0 .0625 .0625 .25 .5)\nv2 c 0 pwl(0 0 .5 4 1 0) r=0\ni2 d 0 pulse(0 4m 0 .125 .125 .5 1)\nr1 a 0 1k\nr2 b 0 1k\nr3 c 0 1k\nr4 d 0 1k",
+    );
+    let mut expected = expected;
+    expected
+        .bind_transient_timing(&timing(0.015625, 2.))
+        .unwrap();
+    for (actual, want) in s.sources.iter().zip(&expected.sources) {
+        assert_eq!(actual.kind, want.kind);
+        for time in [0., 0.0625, 0.125, 0.25, 0.5, 0.75, 1.25] {
+            let a = actual.waveform.value_at(time, Limit::Right).unwrap();
+            let b = want.waveform.value_at(time, Limit::Right).unwrap();
+            assert!((a - b).abs() < 1e-14, "{}: {time} {a} != {b}", actual.name);
         }
     }
 }

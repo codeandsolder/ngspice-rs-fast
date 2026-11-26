@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ngspice_rs::netlist::ast::{
-    Netlist, ParameterKind, PositionedValue, ScopedCardKind, SourceWaveform,
+    Netlist, NumericVectorEntry, ParameterKind, PositionedValue, ScopedCardKind, SourceWaveform,
 };
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::netlist::{Parser, semantic_diff, semantic_eq, write_netlist};
@@ -487,9 +487,12 @@ fn unrepresentable_asts_are_explicit_errors() {
     let mut n = base.clone();
     if let ParameterKind::Waveform(SourceWaveform::Pulse(p)) = &mut n.devices[0].parameters[0].kind
     {
-        p.fall = Some(PositionedValue {
-            text: "1".into(),
-            location: p.initial.location.clone(),
+        p.fall = Some(NumericVectorEntry {
+            source: PositionedValue {
+                text: "1".into(),
+                location: p.initial.source.location.clone(),
+            },
+            expression: None,
         });
         p.rise = None;
     }
@@ -580,7 +583,7 @@ fn source_functions_pulse_count_and_pwl_options_round_trip() {
     else {
         panic!("PULSE AST")
     };
-    assert_eq!(pulse.count.as_ref().unwrap().text, "5");
+    assert_eq!(pulse.count.as_ref().unwrap().source.text, "5");
     let names: Vec<_> = second.devices[6]
         .parameters
         .iter()
@@ -1013,4 +1016,13 @@ fn nested_writer_checks_depth_and_preserves_exact_normalization() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("depth limit"), "{error}");
+}
+
+#[test]
+fn expression_waveform_coefficients_round_trip_with_typed_trees() {
+    let (written, _, _) = round_trip(
+        "typed sources\n.param a=2 s=0.125\nv1 a 0 pulse({a},'a*2', {s})\ni1 b 0 pwl(0 0 {s} {a/2}) td={-s/2}\nv2 c 0 sine({a} 1 {1/s})\nv3 d 0 exp(0 {a} {s})\nv4 e 0 am(0 {a})\ni2 f 0 sffm(0 {a})\nv5 g 0 trnoise({a} {s})\ni3 h 0 trrandom(1 {s} 0 {a})\n.end\n",
+    );
+    assert!(written.contains("pulse({a} 'a*2' {s})"), "{written}");
+    assert!(written.contains("pwl(0 0 {s} {a/2})"), "{written}");
 }

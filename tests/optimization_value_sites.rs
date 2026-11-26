@@ -250,3 +250,59 @@ fn benchmark_ten_thousand_candidates_and_one_hundred_twenty_eight_sites() {
         10_000 * 128
     );
 }
+
+#[test]
+fn waveform_candidate_sites_rebuild_and_restore_immutable_forcing() {
+    use ngspice_rs::devices::{Limit, TransientTiming};
+    let source =
+        deck(".param a=2 period=.5\nv1 in 0 pwl(0 0 {period/2} {a} {period} 0) r=0\nr1 in 0 1k");
+    let plan = CircuitParameterPlan::new(source, &["a", "period"]).unwrap();
+    let entries = plan
+        .sites()
+        .iter()
+        .map(|site| match site.kind {
+            SiteKind::DeviceVectorEntry {
+                device: 0,
+                parameter: 0,
+                entry,
+            } => entry,
+            other => panic!("unexpected site {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(entries, [2, 3, 4]);
+    let mut session = plan.session().unwrap();
+    for (coords, value) in [
+        ([2., 0.5], 2.),
+        ([4., 1.], 2.),
+        ([6., 0.5], 6.),
+        ([2., 0.5], 2.),
+    ] {
+        session.update(&coords, &mut EvalBudget::default()).unwrap();
+        let mut system = session.circuit().linear_system().unwrap();
+        system
+            .bind_transient_timing(&TransientTiming::new(0.015625, 2.).unwrap())
+            .unwrap();
+        let actual = system.sources[0]
+            .waveform
+            .value_at(0.25, Limit::Right)
+            .unwrap();
+        assert_eq!(actual, value);
+    }
+    assert_eq!(session.topology(), CandidateTopology::Reused);
+    assert!(
+        session
+            .update(&[2., 0.], &mut EvalBudget::default())
+            .is_err()
+    );
+    let mut system = session.circuit().linear_system().unwrap();
+    system
+        .bind_transient_timing(&TransientTiming::new(0.015625, 2.).unwrap())
+        .unwrap();
+    assert_eq!(
+        system.sources[0]
+            .waveform
+            .value_at(0.25, Limit::Right)
+            .unwrap(),
+        2.
+    );
+}

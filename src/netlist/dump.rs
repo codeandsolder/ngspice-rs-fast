@@ -55,8 +55,8 @@ use std::path::Path;
 use crate::primitives::{SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{
-    DeviceInstance, FuncSpelling, Netlist, NodeHintValue, ParameterAssignment, ParameterKind,
-    PositionedValue, ScopeView, ScopedCard, ScopedCardKind, SourceWaveform,
+    DeviceInstance, FuncSpelling, Netlist, NodeHintValue, NumericVectorEntry, ParameterAssignment,
+    ParameterKind, PositionedValue, ScopeView, ScopedCard, ScopedCardKind, SourceWaveform,
 };
 use crate::netlist::bexpr::{BExpr, BExprKind, BUnaryOp};
 use crate::netlist::card::{CardKind, RawCard};
@@ -637,7 +637,7 @@ fn write_scope_options(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scop
             let value = setting
                 .value
                 .as_ref()
-                .map_or_else(|| "flag".to_owned(), |v| positioned(ctx, v));
+                .map_or_else(|| "flag".to_owned(), |v| positioned(ctx, &v.source));
             out.line(
                 indent + 2,
                 format!(
@@ -785,8 +785,8 @@ fn positioned(ctx: &Ctx<'_>, value: &PositionedValue) -> String {
     format!("{}@{}", quote(&value.text), ctx.loc(&value.location))
 }
 
-fn optional(ctx: &Ctx<'_>, value: Option<&PositionedValue>) -> String {
-    value.map_or_else(|| "none".to_owned(), |v| positioned(ctx, v))
+fn optional(ctx: &Ctx<'_>, value: Option<&NumericVectorEntry>) -> String {
+    value.map_or_else(|| "none".to_owned(), |v| positioned(ctx, &v.source))
 }
 
 fn write_parameters(
@@ -878,11 +878,11 @@ fn write_waveform(ctx: &Ctx<'_>, out: &mut Out, indent: usize, waveform: &Source
             out.line(indent, "pulse");
             out.line(
                 indent + 1,
-                format!("initial: {}", positioned(ctx, &pulse.initial)),
+                format!("initial: {}", positioned(ctx, &pulse.initial.source)),
             );
             out.line(
                 indent + 1,
-                format!("pulsed: {}", positioned(ctx, &pulse.pulsed)),
+                format!("pulsed: {}", positioned(ctx, &pulse.pulsed.source)),
             );
             out.line(
                 indent + 1,
@@ -906,19 +906,28 @@ fn write_waveform(ctx: &Ctx<'_>, out: &mut Out, indent: usize, waveform: &Source
             );
             // Only printed when supplied, so seven-field snapshots are stable.
             if let Some(count) = &pulse.count {
-                out.line(indent + 1, format!("count: {}", positioned(ctx, count)));
+                out.line(
+                    indent + 1,
+                    format!("count: {}", positioned(ctx, &count.source)),
+                );
             }
         }
         SourceWaveform::Function(function) => {
             out.line(indent, function.function.keyword());
             for (name, value) in function.function.fields().iter().zip(&function.values) {
-                out.line(indent + 1, format!("{name}: {}", positioned(ctx, value)));
+                out.line(
+                    indent + 1,
+                    format!("{name}: {}", positioned(ctx, &value.source)),
+                );
             }
         }
         SourceWaveform::Stochastic { function, values } => {
             out.line(indent, function.keyword());
             for (name, value) in function.fields().iter().zip(values) {
-                out.line(indent + 1, format!("{name}: {}", positioned(ctx, value)));
+                out.line(
+                    indent + 1,
+                    format!("{name}: {}", positioned(ctx, &value.source)),
+                );
             }
         }
         SourceWaveform::Pwl(points) => {
@@ -928,8 +937,8 @@ fn write_waveform(ctx: &Ctx<'_>, out: &mut Out, indent: usize, waveform: &Source
                     indent + 1,
                     format!(
                         "point [{m}] time={} value={}",
-                        positioned(ctx, &point.time),
-                        positioned(ctx, &point.value)
+                        positioned(ctx, &point.time.source),
+                        positioned(ctx, &point.value.source)
                     ),
                 );
             }

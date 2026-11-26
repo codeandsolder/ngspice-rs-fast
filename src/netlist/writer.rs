@@ -108,9 +108,9 @@ use crate::primitives::{AnalysisKind, SourceLoc, SpiceError, SpiceResult, parse_
 
 use crate::netlist::ast::{
     AnalysisCard, DeviceInstance, FuncCard, FuncSpelling, GlobalCard, IncludeDirective, ModelCard,
-    Netlist, NodeHintCard, NodeHintValue, OptionCard, ParamCard, ParameterAssignment,
-    ParameterKind, PositionedValue, ScopeEntry, ScopeView, ScopedCardKind, SourceWaveform,
-    Subcircuit,
+    Netlist, NodeHintCard, NodeHintValue, NumericVectorEntry, OptionCard, ParamCard,
+    ParameterAssignment, ParameterKind, PositionedValue, ScopeEntry, ScopeView, ScopedCardKind,
+    SourceWaveform, Subcircuit,
 };
 use crate::netlist::behavioural::forms::{
     B_SETTERS, NonlinearForm, PolyControls, PolyForm, TableForm, TableInput,
@@ -1271,21 +1271,7 @@ fn append_transfer_vector(
         if index != 0 {
             parts.push(' ')?;
         }
-        if let Some(expression) = &entry.expression {
-            check_value_expression(
-                parts,
-                &entry.source.text,
-                expression,
-                &entry.source.location,
-            )?;
-            parts.push_str(&entry.source.text)?;
-        } else {
-            parts.push_str(positioned_number(
-                parts,
-                &entry.source,
-                &entry.source.location,
-            )?)?;
-        }
+        append_vector_entry(parts, entry)?;
     }
     parts.push(']')?;
     Ok(())
@@ -1918,6 +1904,40 @@ fn source_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResu
     Ok(())
 }
 
+fn append_vector_entry(parts: &mut Card<'_>, entry: &NumericVectorEntry) -> SpiceResult<()> {
+    if let Some(expression) = &entry.expression {
+        check_value_expression(
+            parts,
+            &entry.source.text,
+            expression,
+            &entry.source.location,
+        )?;
+        parts.push_str(&entry.source.text)
+    } else {
+        parts.push_str(positioned_number(
+            parts,
+            &entry.source,
+            &entry.source.location,
+        )?)
+    }
+}
+
+fn waveform_vector_text<'a>(
+    parts: &mut Card<'_>,
+    keyword: &str,
+    fields: impl IntoIterator<Item = &'a NumericVectorEntry>,
+) -> SpiceResult<()> {
+    parts.word(keyword)?;
+    parts.push('(')?;
+    for (index, entry) in fields.into_iter().enumerate() {
+        if index != 0 {
+            parts.push(' ')?;
+        }
+        append_vector_entry(parts, entry)?;
+    }
+    parts.push(')')
+}
+
 fn waveform_text(
     parts: &mut Card<'_>,
     waveform: &SourceWaveform,
@@ -1953,26 +1973,22 @@ fn waveform_text(
                     ));
                 }
             }
-            numeric_vector_text(
+            waveform_vector_text(
                 parts,
                 keyword,
                 [&pulse.initial, &pulse.pulsed]
                     .into_iter()
                     .chain(optional.into_iter().filter_map(Option::as_ref)),
-                ' ',
-                location,
             )
         }
         SourceWaveform::Pwl(points) => {
             if points.is_empty() || points.len() > kind.maximum_fields() / 2 {
                 return Err(refuse("PWL needs 1 to 2048 points", Some(location)));
             }
-            numeric_vector_text(
+            waveform_vector_text(
                 parts,
                 keyword,
                 points.iter().flat_map(|p| [&p.time, &p.value]),
-                ' ',
-                location,
             )
         }
         SourceWaveform::Function(function) => {
@@ -1986,7 +2002,7 @@ fn waveform_text(
                     Some(location),
                 ));
             }
-            numeric_vector_text(parts, keyword, &function.values, ' ', location)
+            waveform_vector_text(parts, keyword, &function.values)
         }
         SourceWaveform::Stochastic { values, .. } => {
             let maximum = kind.maximum_fields();
@@ -1996,7 +2012,7 @@ fn waveform_text(
                     Some(location),
                 ));
             }
-            numeric_vector_text(parts, keyword, values, ' ', location)
+            waveform_vector_text(parts, keyword, values)
         }
     }
 }

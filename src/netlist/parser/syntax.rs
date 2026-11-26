@@ -126,7 +126,7 @@ pub(super) fn value<'a>(input: &mut Input<'a>) -> Result<Value<'a>> {
 }
 
 /// A strictly numeric literal. Expressions are a gap at sites that have not
-/// adopted [`value`] (waveform and IC-vector components).
+/// adopted [`value`] (IC-vector components).
 pub(super) fn literal<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
     if input.input.first().is_some_and(|token| {
         matches!(

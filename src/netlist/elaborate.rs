@@ -27,7 +27,7 @@ use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{
     AnalysisCard, DeviceInstance, ModelCard, Netlist, NodeHint, NodeHintCard, NodeHintValue,
-    ParameterAssignment, ParameterKind, Subcircuit,
+    NumericVectorEntry, ParameterAssignment, ParameterKind, Subcircuit,
 };
 use crate::netlist::eval::{EvalBudget, FunctionScope, ParamScope};
 
@@ -438,40 +438,31 @@ fn literalize_parameters(
     owner: ParameterOwner,
 ) -> SpiceResult<()> {
     for (index, parameter) in parameters.iter_mut().enumerate() {
-        if let ParameterKind::NumericVector(entries) = &mut parameter.kind {
+        let (mut entries, waveform) = match &mut parameter.kind {
+            ParameterKind::NumericVector(entries) => (entries.iter_mut().collect(), false),
+            ParameterKind::Waveform(waveform) => (waveform.coefficients_mut(), true),
+            _ => (Vec::new(), false),
+        };
+        if !entries.is_empty() {
+            let mut changed = false;
             for (entry_index, entry) in entries.iter_mut().enumerate() {
-                if let Some(expression) = entry.expression.take() {
-                    let value =
-                        scope
-                            .evaluate(&expression, budget)
-                            .map_err(|error| match error {
-                                SpiceError::Parse { location, message } => SpiceError::parse(
-                                    location,
-                                    format!(
-                                        "{message} while resolving {} vector coefficient at {}",
-                                        parameter.name, entry.source.location
-                                    ),
-                                ),
-                                other => other,
-                            })?;
-                    let text = format_literal(value);
-                    if let Some(sites) = sites.as_deref_mut() {
-                        sites.push(ResolvedSite::record(
-                            owner.site(index, Some(entry_index)),
-                            entry.source.text.clone(),
-                            &expression,
-                            value,
-                            &text,
-                        )?);
-                    }
-                    entry.source.text = text;
-                }
+                changed |= literalize_vector_entry(
+                    entry,
+                    scope,
+                    budget,
+                    sites.as_deref_mut(),
+                    owner.site(index, Some(entry_index)),
+                    &parameter.name,
+                )?;
             }
-            parameter.value = entries
-                .iter()
-                .map(|entry| entry.source.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
+            if changed || !waveform {
+                let text = entries
+                    .iter()
+                    .map(|entry| entry.source.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                parameter.value = if waveform { format!("({text})") } else { text };
+            }
             continue;
         }
         if let ParameterKind::Behavioural(expression) = &parameter.kind {
@@ -522,6 +513,43 @@ fn literalize_parameters(
         parameter.kind = ParameterKind::Scalar;
     }
     Ok(())
+}
+
+fn literalize_vector_entry(
+    entry: &mut NumericVectorEntry,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+    sites: Option<&mut Vec<ResolvedSite>>,
+    kind: SiteKind,
+    name: &str,
+) -> SpiceResult<bool> {
+    let Some(expression) = entry.expression.take() else {
+        return Ok(false);
+    };
+    let value = scope
+        .evaluate(&expression, budget)
+        .map_err(|error| match error {
+            SpiceError::Parse { location, message } => SpiceError::parse(
+                location,
+                format!(
+                    "{message} while resolving {name} vector coefficient at {}",
+                    entry.source.location
+                ),
+            ),
+            other => other,
+        })?;
+    let text = format_literal(value);
+    if let Some(sites) = sites {
+        sites.push(ResolvedSite::record(
+            kind,
+            entry.source.text.clone(),
+            &expression,
+            value,
+            &text,
+        )?);
+    }
+    entry.source.text = text;
+    Ok(true)
 }
 
 /// Replace the braced arguments of one analysis card with their values.

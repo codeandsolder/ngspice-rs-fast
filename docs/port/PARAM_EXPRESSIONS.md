@@ -126,8 +126,7 @@ remain possible within the node budget. Valid numparam outside the subset is `Sp
 Not accepted: comparison/logical/ternary operators (`< > <= >= == != <> && || ! ? :`), `%`
 and `\`; `ternary_fcn`, string
 `vec`/`var` (unless a `.func` defines the name); double-quoted string
-parameters and quotes *inside* an expression; `.param` with `&`, `.if` blocks; expressions inside waveform
-(`PULSE`/`PWL`), `ic=` vector, flag and `level=` model-selector sites (explicit
+parameters and quotes *inside* an expression; `.param` with `&`, `.if` blocks; expressions inside `ic=` vector, flag and `level=` model-selector sites (explicit
 gaps); nested braces; behavioural/time-dependent device equations
 (`B`, `E`/`G` expression sources); and full numparam compatibility. Subcircuit
 parameter passing semantics and flattening are implemented separately (#18,
@@ -223,7 +222,7 @@ delimited expression at every site that accepts braces (device, model, `X`,
 whose quoted value may contain spaces like a braced one). The AST keeps the
 spelling: `ParameterExpression::quoted` (with `braced` also true),
 `ParameterExpression::spelling()`, and `quoted=true` in AST dumps; the writer
-writes the quotes back. Sites that reject braces (waveform fields, `ic=`
+writes the quotes back. Independent-source waveform coefficients accept the same static expressions, including quoted expressions; they are evaluated in the enclosing lexical scope before waveform construction. Sites that reject braces (`ic=`
 vectors, `level=`, `.four`, `.measure` values, `.option` values) reject quotes
 with the same `NotYetPorted` gap. Double-quoted strings are not expressions;
 `.include`/`.lib` paths keep their quoting. Quotes inside a `{...}` expression

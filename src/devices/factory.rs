@@ -8,7 +8,7 @@ use crate::devices::{
     SffmSpec, SineSpec, Waveform,
 };
 use crate::netlist::ast::{
-    DeviceInstance, FunctionWaveform, ParameterKind, PositionedValue, SourceFunction,
+    DeviceInstance, FunctionWaveform, NumericVectorEntry, ParameterKind, SourceFunction,
     SourceWaveform, WaveformKind,
 };
 use crate::netlist::source::{Deck, LogicalLine};
@@ -610,12 +610,16 @@ impl PortSetters {
 }
 
 /// Numeric text of a waveform field. `what` names the field in diagnostics.
-fn field(value: &PositionedValue, what: &str) -> SpiceResult<f64> {
-    parse_spice_number(&value.text)
+fn field(value: &NumericVectorEntry, what: &str) -> SpiceResult<f64> {
+    value
+        .expression
+        .is_none()
+        .then(|| parse_spice_number(&value.source.text))
+        .flatten()
         .filter(|v| v.is_finite())
         .ok_or_else(|| SpiceError::Unsupported {
-            feature: format!("non-finite or nonliteral {what}={}", value.text),
-            location: Some(value.location.clone()),
+            feature: format!("non-finite or nonliteral {what}={}", value.source.text),
+            location: Some(value.source.location.clone()),
         })
 }
 
@@ -703,7 +707,8 @@ fn source_waveform(
             Ok(Waveform::Stochastic(StochasticWaveform::new(spec)?))
         }
         SourceWaveform::Pulse(p) => {
-            let optional = |v: &Option<PositionedValue>, what| v.as_ref().map(|v| field(v, what));
+            let optional =
+                |v: &Option<NumericVectorEntry>, what| v.as_ref().map(|v| field(v, what));
             let spec = PulseSpec {
                 initial: field(&p.initial, "pulse v1")?,
                 pulsed: field(&p.pulsed, "pulse v2")?,
@@ -732,7 +737,7 @@ fn source_waveform(
                     location: Some(
                         points
                             .first()
-                            .map_or_else(|| setter.clone(), |p| p.time.location.clone()),
+                            .map_or_else(|| setter.clone(), |p| p.time.source.location.clone()),
                     ),
                 })
         }
@@ -752,7 +757,7 @@ fn function_waveform(f: &FunctionWaveform, setter: &SourceLoc) -> SpiceResult<Wa
             location: Some(
                 f.values
                     .get(most)
-                    .map_or_else(|| setter.clone(), |extra| extra.location.clone()),
+                    .map_or_else(|| setter.clone(), |extra| extra.source.location.clone()),
             ),
         });
     }
@@ -808,10 +813,10 @@ fn function_waveform(f: &FunctionWaveform, setter: &SourceLoc) -> SpiceResult<Wa
     Ok(waveform)
 }
 
-fn waveform_error(at: &PositionedValue, error: &SpiceError) -> SpiceError {
+fn waveform_error(at: &NumericVectorEntry, error: &SpiceError) -> SpiceError {
     SpiceError::Unsupported {
         feature: error.to_string(),
-        location: Some(at.location.clone()),
+        location: Some(at.source.location.clone()),
     }
 }
 

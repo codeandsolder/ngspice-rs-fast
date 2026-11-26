@@ -143,7 +143,7 @@ pub struct InitialCondition {
 ///
 /// PWL `td=`/`r=` are separate ordered scalar setters (`VSRC_TD`/`VSRC_R` in
 /// `vsrc.c`), not part of this value, exactly as C applies them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SourceWaveform {
     /// Two required levels and up to six optional fields.
     Pulse(Box<PulseWaveform>),
@@ -156,7 +156,7 @@ pub enum SourceWaveform {
         /// Noise law selected by the upstream waveform name.
         function: StochasticFunction,
         /// Two required fields and a contiguous optional prefix.
-        values: Vec<PositionedValue>,
+        values: Vec<NumericVectorEntry>,
     },
 }
 
@@ -236,6 +236,34 @@ impl WaveformKind {
 }
 
 impl SourceWaveform {
+    /// Visit supplied coefficients in physical setter order, including PWL
+    /// time/value pairs. Omitted trailing fields never become sites.
+    pub(super) fn coefficients_mut(&mut self) -> Vec<&mut NumericVectorEntry> {
+        match self {
+            Self::Pulse(pulse) => [&mut pulse.initial, &mut pulse.pulsed]
+                .into_iter()
+                .chain(
+                    [
+                        &mut pulse.delay,
+                        &mut pulse.rise,
+                        &mut pulse.fall,
+                        &mut pulse.width,
+                        &mut pulse.period,
+                        &mut pulse.count,
+                    ]
+                    .into_iter()
+                    .filter_map(Option::as_mut),
+                )
+                .collect(),
+            Self::Pwl(points) => points
+                .iter_mut()
+                .flat_map(|p| [&mut p.time, &mut p.value])
+                .collect(),
+            Self::Function(function) => function.values.iter_mut().collect(),
+            Self::Stochastic { values, .. } => values.iter_mut().collect(),
+        }
+    }
+
     pub(crate) fn kind(&self) -> WaveformKind {
         match self {
             Self::Pulse(_) => WaveformKind::Pulse,
@@ -291,43 +319,43 @@ impl SourceFunction {
 /// One SIN/EXP/SFFM/AM setter: its function and the supplied fields in C
 /// coefficient order. Omitted trailing fields are simply absent; defaults that
 /// depend on `.tran` (`CKTstep`, `CKTfinalTime`) belong to elaboration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FunctionWaveform {
     /// Which function.
     pub function: SourceFunction,
     /// Two to `function.fields().len()` positioned values.
-    pub values: Vec<PositionedValue>,
+    pub values: Vec<NumericVectorEntry>,
 }
 
 /// `PULSE(V1 V2 [TD [TR [TF [PW [PER [NP]]]]]])`; omissions stay explicit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PulseWaveform {
     /// Initial level (volts for V, amperes for I).
-    pub initial: PositionedValue,
+    pub initial: NumericVectorEntry,
     /// Pulsed level.
-    pub pulsed: PositionedValue,
+    pub pulsed: NumericVectorEntry,
     /// Delay in seconds.
-    pub delay: Option<PositionedValue>,
+    pub delay: Option<NumericVectorEntry>,
     /// Rise time in seconds.
-    pub rise: Option<PositionedValue>,
+    pub rise: Option<NumericVectorEntry>,
     /// Fall time in seconds.
-    pub fall: Option<PositionedValue>,
+    pub fall: Option<NumericVectorEntry>,
     /// Pulse width in seconds.
-    pub width: Option<PositionedValue>,
+    pub width: Option<NumericVectorEntry>,
     /// Period in seconds.
-    pub period: Option<PositionedValue>,
+    pub period: Option<NumericVectorEntry>,
     /// The eighth field (`PHASE` in `vsrcload.c`): in ngspice's default
     /// compatibility mode a positive value is the number of pulses.
-    pub count: Option<PositionedValue>,
+    pub count: Option<NumericVectorEntry>,
 }
 
 /// One PWL knot, retained in supplied order (syntax is not runtime validation).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PwlPoint {
     /// Time in seconds.
-    pub time: PositionedValue,
+    pub time: NumericVectorEntry,
     /// Level in volts for V, amperes for I.
-    pub value: PositionedValue,
+    pub value: NumericVectorEntry,
 }
 
 /// A device instance, e.g. `r1 in out 1k tc1=0.01`.
