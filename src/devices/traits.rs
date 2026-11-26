@@ -1514,6 +1514,13 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// Never called for Newton trials or rejected steps.
     fn accept(&self, _context: &AcceptContext<'_>) {}
 
+    /// Opt in to exact transient event scheduling, using ordinary accepted
+    /// and tentative device state. No event queue is needed for devices
+    /// whose next event follows directly from their accepted state.
+    fn transient_events(&self) -> Option<&dyn DeviceTransientEvents> {
+        None
+    }
+
     /// An upper bound on the next transient step from this device's discrete
     /// state (C `DEVtrunc` of devices without charge storage, e.g.
     /// `swtrunc.c`), or `None` (the default) for no bound. Called for an
@@ -1750,6 +1757,52 @@ pub trait Device: fmt::Debug + std::any::Any {
             "",
         ))
     }
+}
+
+/// Converged trial data for a device-local, rollback-safe transient event.
+#[derive(Debug)]
+pub struct TransientEventContext<'a> {
+    /// Device-local state at the preceding accepted point.
+    pub accepted: &'a [Real],
+    /// Absolute candidate time.
+    pub time: Real,
+    /// The candidate solution.
+    pub solution: &'a Vector,
+    /// The circuit's ground-eliminated node numbering.
+    pub unknowns: &'a MnaUnknowns,
+}
+
+impl TransientEventContext<'_> {
+    /// Candidate node potential, zero at ground.
+    #[must_use]
+    pub fn voltage(&self, node: NodeId) -> Real {
+        self.unknowns
+            .node_row(node)
+            .and_then(|row| self.solution.get(row))
+            .unwrap_or(0.)
+    }
+}
+
+/// A device whose finite history directly determines future exact boundaries.
+/// Accepted state is read-only; probes cannot commit, queue or cancel events.
+pub trait DeviceTransientEvents {
+    /// The next boundary after the supplied accepted state, if any.
+    ///
+    /// # Errors
+    /// Invalid state or unrepresentable event time.
+    fn next_boundary(&self, accepted: &[Real]) -> SpiceResult<Option<Real>>;
+
+    /// Refine receiver state from the converged solution and optionally
+    /// request a retry at an interior crossing. Only candidate slots may
+    /// change; the Newton stamp must already satisfy its convergence test.
+    ///
+    /// # Errors
+    /// Invalid candidate physics, time or state.
+    fn refine_trial(
+        &self,
+        context: &TransientEventContext<'_>,
+        trial: &mut [Real],
+    ) -> SpiceResult<Option<Real>>;
 }
 
 /// What [`Device::timestep_limit`] sees for one converged trial step.

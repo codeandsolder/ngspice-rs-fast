@@ -1,0 +1,53 @@
+Independent timed-switch bias and AC matrix
+vref rtn 0 0.75
+vd00 a00 rtn DC 0 AC 1
+vb00 p00 rtn DC 1 AC 1
+ri00 a00 rtn 8
+a00 %vd(a00 rtn) %gd(p00 rtn) m00
+.model m00 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ic=0)
+vd01 a01 rtn DC 0 AC 1
+vb01 p01 rtn DC 1 AC 1
+ri01 a01 rtn 8
+a01 %vd(a01 rtn) %gd(p01 rtn) m01
+.model m01 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ic=1)
+vd10 a10 rtn DC 2 AC 1
+vb10 p10 rtn DC 1 AC 1
+ri10 a10 rtn 8
+a10 %vd(a10 rtn) %gd(p10 rtn) m10
+.model m10 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ic=0)
+vd11 a11 rtn DC 2 AC 1
+vb11 p11 rtn DC 1 AC 1
+ri11 a11 rtn 8
+a11 %vd(a11 rtn) %gd(p11 rtn) m11
+.model m11 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ic=1)
+vd20 a20 rtn DC 2.5 AC 1
+vb20 p20 rtn DC 1 AC 1
+ri20 a20 rtn 8
+a20 %vd(a20 rtn) %gd(p20 rtn) m20
+.model m20 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ic=0)
+vd21 a21 rtn DC 2.5 AC 1
+vb21 p21 rtn DC 1 AC 1
+ri21 a21 rtn 8
+a21 %vd(a21 rtn) %gd(p21 rtn) m21
+.model m21 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ic=1)
+vd30 a30 rtn DC 3 AC 1
+vb30 p30 rtn DC 1 AC 1
+ri30 a30 rtn 8
+a30 %vd(a30 rtn) %gd(p30 rtn) m30
+.model m30 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ic=0)
+vd31 a31 rtn DC 3 AC 1
+vb31 p31 rtn DC 1 AC 1
+ri31 a31 rtn 8
+a31 %vd(a31 rtn) %gd(p31 rtn) m31
+.model m31 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ic=1)
+vd40 a40 rtn DC 5 AC 1
+vb40 p40 rtn DC 1 AC 1
+ri40 a40 rtn 8
+a40 %vd(a40 rtn) %gd(p40 rtn) m40
+.model m40 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ic=0)
+vd41 a41 rtn DC 5 AC 1
+vb41 p41 rtn DC 1 AC 1
+ri41 a41 rtn 8
+a41 %vd(a41 rtn) %gd(p41 rtn) m41
+.model m41 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ic=1)
+.end

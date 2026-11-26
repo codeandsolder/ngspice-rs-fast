@@ -6,6 +6,8 @@ pub mod analog;
 pub mod rational;
 pub mod source;
 mod source_logic;
+mod timed_switch;
+mod timed_switch_device;
 
 /// Three-valued digital logic.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

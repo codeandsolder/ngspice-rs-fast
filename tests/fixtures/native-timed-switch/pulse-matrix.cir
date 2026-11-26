@@ -1,0 +1,84 @@
+Independent timed-switch pulse matrix
+vref rtn 0 0.75
+.options reltol=1e-6 abstol=1e-13
+vdb0 ab0 rtn PWL(0 0 1u 0 1.01u 5 1.2u 5 1.21u 0 3u 0 3.01u 5 4u 5 4.01u 0 6u 0)
+vbb0 pb0 rtn 1
+rib0 ab0 rtn 8
+ab0 %vd(ab0 rtn) %gd(pb0 rtn) mb0
+.model mb0 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=1f ic=0)
+vdb1 ab1 rtn PWL(0 0 1u 0 1.01u 5 1.2u 5 1.21u 0 3u 0 3.01u 5 4u 5 4.01u 0 6u 0)
+vbb1 pb1 rtn 1
+rib1 ab1 rtn 8
+ab1 %vd(ab1 rtn) %gd(pb1 rtn) mb1
+.model mb1 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=1p ic=0)
+vdb2 ab2 rtn PWL(0 0 1u 0 1.01u 5 1.2u 5 1.21u 0 3u 0 3.01u 5 4u 5 4.01u 0 6u 0)
+vbb2 pb2 rtn 1
+rib2 ab2 rtn 8
+ab2 %vd(ab2 rtn) %gd(pb2 rtn) mb2
+.model mb2 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10p ic=0)
+vdb3 ab3 rtn PWL(0 0 1u 0 1.01u 5 1.2u 5 1.21u 0 3u 0 3.01u 5 4u 5 4.01u 0 6u 0)
+vbb3 pb3 rtn 1
+rib3 ab3 rtn 8
+ab3 %vd(ab3 rtn) %gd(pb3 rtn) mb3
+.model mb3 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=100p ic=0)
+vdb4 ab4 rtn PWL(0 0 1u 0 1.01u 5 1.2u 5 1.21u 0 3u 0 3.01u 5 4u 5 4.01u 0 6u 0)
+vbb4 pb4 rtn 1
+rib4 ab4 rtn 8
+ab4 %vd(ab4 rtn) %gd(pb4 rtn) mb4
+.model mb4 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=1n ic=0)
+vdb5 ab5 rtn PWL(0 0 1u 0 1.01u 5 1.2u 5 1.21u 0 3u 0 3.01u 5 4u 5 4.01u 0 6u 0)
+vbb5 pb5 rtn 1
+rib5 ab5 rtn 8
+ab5 %vd(ab5 rtn) %gd(pb5 rtn) mb5
+.model mb5 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10n ic=0)
+vdb6 ab6 rtn PWL(0 0 1u 0 1.01u 5 1.2u 5 1.21u 0 3u 0 3.01u 5 4u 5 4.01u 0 6u 0)
+vbb6 pb6 rtn 1
+rib6 ab6 rtn 8
+ab6 %vd(ab6 rtn) %gd(pb6 rtn) mb6
+.model mb6 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=100n ic=0)
+vdw499 aw499 rtn PWL(0 0 1u 0 1.01u 5 1499n 5 1509n 0 6u 0)
+vbw499 pw499 rtn 1
+riw499 aw499 rtn 8
+aw499 %vd(aw499 rtn) %gd(pw499 rtn) mw499
+.model mw499 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10p ic=0)
+vdw500 aw500 rtn PWL(0 0 1u 0 1.01u 5 1500n 5 1510n 0 6u 0)
+vbw500 pw500 rtn 1
+riw500 aw500 rtn 8
+aw500 %vd(aw500 rtn) %gd(pw500 rtn) mw500
+.model mw500 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10p ic=0)
+vdw501 aw501 rtn PWL(0 0 1u 0 1.01u 5 1501n 5 1511n 0 6u 0)
+vbw501 pw501 rtn 1
+riw501 aw501 rtn 8
+aw501 %vd(aw501 rtn) %gd(pw501 rtn) mw501
+.model mw501 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10p ic=0)
+vdw550 aw550 rtn PWL(0 0 1u 0 1.01u 5 1550n 5 1560n 0 6u 0)
+vbw550 pw550 rtn 1
+riw550 aw550 rtn 8
+aw550 %vd(aw550 rtn) %gd(pw550 rtn) mw550
+.model mw550 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10p ic=0)
+vdw599 aw599 rtn PWL(0 0 1u 0 1.01u 5 1599n 5 1609n 0 6u 0)
+vbw599 pw599 rtn 1
+riw599 aw599 rtn 8
+aw599 %vd(aw599 rtn) %gd(pw599 rtn) mw599
+.model mw599 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10p ic=0)
+vdw600 aw600 rtn PWL(0 0 1u 0 1.01u 5 1600n 5 1610n 0 6u 0)
+vbw600 pw600 rtn 1
+riw600 aw600 rtn 8
+aw600 %vd(aw600 rtn) %gd(pw600 rtn) mw600
+.model mw600 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10p ic=0)
+vdw601 aw601 rtn PWL(0 0 1u 0 1.01u 5 1601n 5 1611n 0 6u 0)
+vbw601 pw601 rtn 1
+riw601 aw601 rtn 8
+aw601 %vd(aw601 rtn) %gd(pw601 rtn) mw601
+.model mw601 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10p ic=0)
+vdw650 aw650 rtn PWL(0 0 1u 0 1.01u 5 1650n 5 1660n 0 6u 0)
+vbw650 pw650 rtn 1
+riw650 aw650 rtn 8
+aw650 %vd(aw650 rtn) %gd(pw650 rtn) mw650
+.model mw650 preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10p ic=0)
+vdreverse areverse rtn PWL(0 5 1u 5 1.01u 0 1.35u 0 1.36u 5 6u 5)
+vbreverse preverse rtn 1
+rireverse areverse rtn 8
+areverse %vd(areverse rtn) %gd(preverse rtn) mreverse
+.model mreverse preprocess_timed_switch(ron=10 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=500n td_off=300n timetol=10p ic=0)
+.end
