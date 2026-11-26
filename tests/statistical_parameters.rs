@@ -116,7 +116,7 @@ fn candidate_aba_retains_the_normalized_realization_on_dependent_sites() -> Spic
     let a = run(&mut session)?;
     session.update(&[2000.], &mut EvalBudget::default())?;
     let b = run(&mut session)?;
-    assert!((2. * b - a).abs() < 1e-12, "{a} {b}");
+    assert!(2.0_f64.mul_add(b, -a).abs() < 1e-12, "{a} {b}");
     session.update(&[1000.], &mut EvalBudget::default())?;
     assert_eq!(a, run(&mut session)?);
     Ok(())
@@ -133,7 +133,7 @@ fn statistical_values_do_not_change_with_transient_time_or_newton_loads() -> Spi
     for index in 0..plot.point_count() {
         let t = plot.value("time", index).unwrap().re;
         let actual = plot.value("v(out)", index).unwrap().re;
-        assert!((actual - bias - 1000. * t).abs() < 1e-10);
+        assert!(1000.0_f64.mul_add(-t, actual - bias).abs() < 1e-10);
     }
     Ok(())
 }
@@ -162,7 +162,7 @@ fn behavioural_candidates_keep_draws_across_reelaboration_and_hierarchy() -> Spi
     candidate.update(&[20.], &mut EvalBudget::default())?;
     let second = run(&mut candidate)?;
     for (a, b) in first.into_iter().zip(second) {
-        assert!((b - 2. * a).abs() < 1e-12, "{a} {b}");
+        assert!(2.0_f64.mul_add(-a, b).abs() < 1e-12, "{a} {b}");
     }
     candidate.update(&[10.], &mut EvalBudget::default())?;
     assert_eq!(first, run(&mut candidate)?);
@@ -206,7 +206,7 @@ fn prepared_parameters_and_device_fields_are_occurrence_bound() -> SpiceResult<(
         .value("i(v1)", 0)
         .unwrap()
         .re;
-    assert!((2. * b - a).abs() < 1e-12, "{a} {b}");
+    assert!(2.0_f64.mul_add(b, -a).abs() < 1e-12, "{a} {b}");
     session.update(&[1000.], &mut EvalBudget::default())?;
     assert_eq!(a, op(session.circuit_mut())?.value("i(v1)", 0).unwrap().re);
     Ok(())
@@ -221,7 +221,7 @@ fn prepared_model_draws_use_the_defining_scope_and_physical_occurrence() -> Spic
     let expanded = ngspice_rs::devices::subckt::expand_subcircuits(
         &result.netlist,
         &result.scope,
-        Default::default(),
+        ngspice_rs::devices::subckt::SubcircuitLimits::default(),
     )?;
     let parameter = |device: &str, field: &str| {
         let instance = expanded.devices.iter().find(|d| d.name == device).unwrap();
@@ -279,7 +279,7 @@ fn prepared_behavioural_draws_are_static_and_macro_arguments_are_shared() -> Spi
     for index in 0..plot.point_count() {
         let t = plot.value("time", index).unwrap().re;
         let actual = plot.value("v(a)", index).unwrap().re;
-        assert!((actual - a - 1000. * t).abs() < 1e-10);
+        assert!(1000.0_f64.mul_add(-t, actual - a).abs() < 1e-10);
     }
     Ok(())
 }
@@ -293,7 +293,7 @@ fn prepared_nested_models_preserve_the_actual_ancestor_owner() -> SpiceResult<()
     let expanded = ngspice_rs::devices::subckt::expand_subcircuits(
         &literal.netlist,
         &literal.scope,
-        Default::default(),
+        ngspice_rs::devices::subckt::SubcircuitLimits::default(),
     )?;
     let value = |name: &str| {
         let device = expanded.devices.iter().find(|d| d.name == name).unwrap();
@@ -421,7 +421,7 @@ fn realized_prepared_values_match_c_operating_point() -> SpiceResult<()> {
     let expanded = ngspice_rs::devices::subckt::expand_subcircuits(
         &literal.netlist,
         &literal.scope,
-        Default::default(),
+        ngspice_rs::devices::subckt::SubcircuitLimits::default(),
     )?;
     let resistance = &expanded
         .devices
@@ -464,7 +464,7 @@ fn realized_prepared_values_match_c_operating_point() -> SpiceResult<()> {
         let want = c(name);
         let got = plot.value(name, 0).unwrap().re;
         assert!(
-            (want - got).abs() <= relative * want.abs() + absolute,
+            (want - got).abs() <= f64::mul_add(relative, want.abs(), absolute),
             "{name}: C {want} Rust {got}"
         );
     }
