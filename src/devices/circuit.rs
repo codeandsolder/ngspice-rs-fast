@@ -165,6 +165,7 @@ pub struct Circuit {
     binned_deck: Option<Arc<BinnedDeck>>,
     prepared_node_initializations:
         BTreeMap<NodeId, crate::devices::passive_bias::NodeInitialization>,
+    prepared_initialization_analyses: Option<BTreeSet<(crate::primitives::AnalysisKind, bool)>>,
     pub(super) runtime: CircuitRuntime,
 }
 
@@ -1312,6 +1313,29 @@ impl Circuit {
         }
     }
 
+    fn apply_prepared_initializations(
+        &mut self,
+        bound: crate::netlist::prepared_initialization::BoundInitializations,
+    ) -> SpiceResult<()> {
+        self.prepared_initialization_analyses = bound.analyses;
+        if !bound.devices.is_empty() {
+            let names = self.validate_topology()?;
+            for (name, policy) in bound.devices {
+                let index = names.get(&name).ok_or_else(|| {
+                    SpiceError::circuit(format!("unknown prepared passive occurrence {name}"))
+                })?;
+                self.devices[index]
+                    .device
+                    .bind_passive_initialization(policy)?;
+            }
+            self.invalidate_topology();
+        }
+        for (name, policy) in bound.nodes {
+            self.bind_node_initialization(&name, policy)?;
+        }
+        Ok(())
+    }
+
     /// Bind a fully resolved source-prepared passive occurrence before
     /// any analysis or observation plan is constructed. Ordinary decks do
     /// not install these equations.
@@ -1357,6 +1381,24 @@ impl Circuit {
         {
             entry.insert(policy);
             self.invalidate_topology();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_prepared_analysis(
+        &self,
+        kind: crate::primitives::AnalysisKind,
+        uic: bool,
+    ) -> SpiceResult<()> {
+        if self
+            .prepared_initialization_analyses
+            .as_ref()
+            .is_some_and(|analyses| !analyses.contains(&(kind, uic)))
+        {
+            return Err(SpiceError::circuit(format!(
+                "prepared initialization was not bound for {} (uic={uic}); elaborate the requested analysis first",
+                kind.as_str()
+            )));
         }
         Ok(())
     }
@@ -1529,7 +1571,7 @@ impl Circuit {
             .zip(&self.bindings.branch_rows)
             .any(|(device, rows)| {
                 !device.constitutive_nodes().is_empty()
-                || device.has_passive_bias()
+                    || device.has_passive_bias()
                     || (0..rows.len())
                         .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
             });
@@ -4698,6 +4740,7 @@ impl Circuit {
             .iter()
             .any(|card| card.kind == crate::primitives::AnalysisKind::Noise);
         circuit.add_instances(&expanded.devices, &models, &setup)?;
+        circuit.apply_prepared_initializations(expanded.prepared_initialization)?;
         circuit.add_topology_shunts(setup.shunts)?;
         let referenced: BTreeSet<_> = expanded
             .devices
