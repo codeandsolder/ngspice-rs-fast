@@ -875,6 +875,10 @@ impl AnalysisPlan {
         let PlanKind::Sensitivity { card, frequencies } = &self.analysis else {
             return Err(unsupported("sensitivity resolution requires a .sens plan"));
         };
+        let context = &crate::analysis::AnalysisContext {
+            bias_analysis: circuit.has_prepared_bias().then(|| self.kind()),
+            ..*context
+        };
         let (plot, resolution) =
             super::sens::run(circuit, self, context, card, frequencies.as_ref(), true)?;
         let resolution = resolution.ok_or_else(|| unsupported("missing sensitivity resolution"))?;
@@ -889,6 +893,10 @@ impl AnalysisPlan {
         sink: &mut dyn crate::analysis::PointSink,
     ) -> SpiceResult<()> {
         use crate::analysis::{ac, disto, linear, noise, pz, sens, sparam, sweep, tf};
+        let context = &crate::analysis::AnalysisContext {
+            bias_analysis: (!self.uic() && circuit.has_prepared_bias()).then(|| self.kind()),
+            ..*context
+        };
         // Large sweeps emit rows directly. Drivers whose numerical method
         // still requires a materialized output transfer ownership instead.
         let plots = match &self.analysis {
@@ -949,6 +957,10 @@ impl AnalysisPlan {
     ) -> SpiceResult<super::PeriodicOrbit> {
         let PlanKind::PeriodicSteadyState { settings, .. } = &self.analysis else {
             return Err(unsupported("periodic orbit requires a .pss plan"));
+        };
+        let context = &crate::analysis::AnalysisContext {
+            bias_analysis: (!self.uic() && circuit.has_prepared_bias()).then(|| self.kind()),
+            ..*context
         };
         super::pss::run(circuit, self, context, settings, warm, sink)
     }

@@ -80,6 +80,7 @@ pub mod noise;
 pub mod nonlinear;
 pub mod nport;
 pub mod passive;
+pub mod passive_bias;
 pub mod prepared_model;
 pub mod pulse;
 pub mod rf_passive;
