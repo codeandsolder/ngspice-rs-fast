@@ -207,8 +207,13 @@ Rank and residuals are rechecked at the nonlinear solution; the retained
 order hint is only a performance optimization. Intermediate pivot products
 and coefficient-local uncertainty use extended binary exponents so that
 changing the time normalization does not itself erase independent
-constraints through underflow. The array has explicit order, variable and
-stamp budgets.
+constraints through underflow. Measured rounding residuals avoid charging
+error for exact operations. Within the physical rows, sparse equations
+are reduced first, so direct constraints are not obscured by chains of
+correlated elimination errors in wide fanout circuits. This does not
+change the ordering of mandatory and optional storage constraints.
+The array has explicit order, row, variable and raw-stamp budgets,
+including the additional initial and companion constraint rows.
 
 During a smooth transient step, the physical array is completed with
 independent companion constraints, in physical-before-derived order.
