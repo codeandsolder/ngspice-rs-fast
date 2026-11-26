@@ -868,6 +868,40 @@ impl Resolver<'_> {
         self.call(expr, name, &arguments, depth)
     }
 
+    fn prepared_call(
+        &mut self,
+        expr: &BExpr,
+        name: &str,
+        arguments: &[BExpr],
+        depth: usize,
+    ) -> SpiceResult<BExpr> {
+        let identity = self
+            .prepared_frame(&expr.span)
+            .map(|(identity, _)| identity);
+        if identity.is_none() && self.sampler.prepared_site().is_some() {
+            return Err(parse_error(
+                &expr.span,
+                "prepared statistical call has no static expression identity".into(),
+            ));
+        }
+        let previous = std::mem::replace(&mut self.exact, true);
+        let values = arguments
+            .iter()
+            .map(|argument| {
+                let resolved = self.resolve(argument, depth + 1)?;
+                statistical_argument(&resolved)
+            })
+            .collect::<SpiceResult<Vec<_>>>();
+        self.exact = previous;
+        let value = self
+            .sampler
+            .sample_prepared(name, &values?, identity, &expr.span.start)?;
+        Ok(BExpr {
+            kind: self.numeric_value(value),
+            span: expr.span.clone(),
+        })
+    }
+
     fn call(
         &mut self,
         expr: &BExpr,
@@ -876,31 +910,7 @@ impl Resolver<'_> {
         depth: usize,
     ) -> SpiceResult<BExpr> {
         if !self.syntax_only && name.starts_with(model_statistics::PREPARED_PREFIX) {
-            let identity = self
-                .prepared_frame(&expr.span)
-                .map(|(identity, _)| identity);
-            if identity.is_none() && self.sampler.prepared_site().is_some() {
-                return Err(parse_error(
-                    &expr.span,
-                    "prepared statistical call has no static expression identity".into(),
-                ));
-            }
-            let previous = std::mem::replace(&mut self.exact, true);
-            let values = arguments
-                .iter()
-                .map(|argument| {
-                    let resolved = self.resolve(argument, depth + 1)?;
-                    statistical_argument(&resolved)
-                })
-                .collect::<SpiceResult<Vec<_>>>();
-            self.exact = previous;
-            let value = self
-                .sampler
-                .sample_prepared(name, &values?, identity, &expr.span.start)?;
-            return Ok(BExpr {
-                kind: self.numeric_value(value),
-                span: expr.span.clone(),
-            });
+            return self.prepared_call(expr, name, arguments, depth);
         }
         let functions = self.functions.clone();
         let definition = functions
