@@ -353,6 +353,46 @@ impl TaylorContext<'_> {
         Ok(())
     }
 
+    /// Stamp one scalar constitutive law between two rows, controlled by
+    /// the difference of two columns. Static and charge equations use the
+    /// same incidence and chain rule; aliased terminals cancel exactly.
+    pub(crate) fn branch_taylor(
+        &mut self,
+        rows: [Option<usize>; 2],
+        columns: [Option<usize>; 2],
+        value: &crate::maths::taylor::Jet,
+        gradient: &crate::maths::taylor::Jet,
+        charge: bool,
+    ) -> SpiceResult<()> {
+        if rows[0] == rows[1] {
+            return Ok(());
+        }
+        let (values, jacobians) = if charge {
+            (&mut self.output.charge, &mut self.output.capacitance)
+        } else {
+            (&mut self.output.residual, &mut self.output.conductance)
+        };
+        for (row, sign) in rows.into_iter().zip([1., -1.]) {
+            if let Some(row) = row {
+                for (vector, &coefficient) in values.iter_mut().zip(value.coefficients()) {
+                    vector.add_to(row, sign * coefficient)?;
+                }
+                if columns[0] != columns[1] {
+                    for (column, orientation) in columns.into_iter().zip([sign, -sign]) {
+                        if let Some(column) = column {
+                            for (matrix, &coefficient) in
+                                jacobians.iter_mut().zip(gradient.coefficients())
+                            {
+                                matrix.add(row, column, orientation * coefficient)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn linear_static(
         &mut self,
         row: Option<usize>,
