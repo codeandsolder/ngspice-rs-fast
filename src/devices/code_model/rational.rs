@@ -502,8 +502,7 @@ impl Device for RationalTransfer {
                 coordinate: index + 1,
                 equation: index + 1,
                 value: self.model.initial.get(index).copied().unwrap_or(0.),
-                slot: 2 * index,
-                history_scale: self.model.tau.recip(),
+                history: crate::devices::InitialCoordinateHistory::Coordinate { slot: 2 * index },
             })
             .collect())
     }

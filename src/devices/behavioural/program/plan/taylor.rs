@@ -1,467 +1,714 @@
-//! Directional Taylor evaluation of the existing immutable value/gradient
-//! plan. All roots share the same right-hand branch decisions. Only the
-//! active path of a ternary is evaluated, as in the ordinary scalar plan.
+//! Local right-hand Taylor propagation through the compiled expression DAG.
+//! Conditional expressions remain lazy, and branch choice follows the
+//! first nonzero coefficient of the input germ instead of a finite sample.
 
-use super::{Binary, Environment, Instruction, Operator, Plan, Slot, Unary, describe};
+use super::{Binary, Instruction, Operator, Plan, Slot, Unary};
 use crate::devices::behavioural::program::{
-    EXP_LIMIT, divide, power, power_base_slope, power_exponent_slope, power_h, pwr, unary_value,
+    EXP_LIMIT, Environment, TWO_PI, divide, modulus, power, power_h, pwr, unary_value,
 };
-use crate::maths::taylor::Taylor;
+use crate::maths::taylor::Jet;
 use crate::primitives::{Real, SpiceError, SpiceResult, almost_equal_ulps};
+use std::cmp::Ordering;
 
-fn failure(message: impl Into<String>) -> SpiceError {
-    SpiceError::Numerical {
-        context: "behavioural right-limit derivative".into(),
-        message: message.into(),
-    }
+const MAX_JET_ENTRIES: usize = 8_388_608;
+
+pub(in crate::devices::behavioural) struct TaylorEvaluation {
+    pub value: Jet,
+    pub gradient: Vec<Jet>,
 }
 
 struct Evaluator<'a> {
     plan: &'a Plan,
-    variables: &'a [Taylor],
-    time: &'a Taylor,
     environment: &'a Environment<'a>,
-    values: Vec<Option<Taylor>>,
+    variables: &'a [Jet],
+    time: &'a Jet,
+    values: Vec<Option<Jet>>,
     pending: Vec<Slot>,
-    budget: &'a mut usize,
 }
 
 impl Plan {
-    pub(in crate::devices::behavioural::program) fn right_taylor(
+    pub(in crate::devices::behavioural::program) fn evaluate_taylor(
         &self,
         root: Slot,
-        derivatives: &[Slot],
-        variables: &[Taylor],
-        time: &Taylor,
         environment: &Environment<'_>,
-        budget: &mut usize,
-    ) -> SpiceResult<(Taylor, Vec<Taylor>)> {
-        if variables.iter().any(|value| value.order() != time.order()) {
-            return Err(failure("incompatible input Taylor orders"));
+        variables: &[Jet],
+        time: &Jet,
+    ) -> SpiceResult<TaylorEvaluation> {
+        if variables.iter().any(|jet| jet.order() != time.order())
+            || (root + 1)
+                .saturating_mul(time.order() + 1)
+                .saturating_mul(2)
+                > MAX_JET_ENTRIES
+        {
+            return Err(SpiceError::circuit(
+                "behavioural Taylor evaluation resource limit or inconsistent order",
+            ));
         }
         let mut evaluator = Evaluator {
             plan: self,
+            environment,
             variables,
             time,
-            environment,
-            values: vec![None; self.instructions.len()],
+            values: vec![None; root + 1],
             pending: Vec::new(),
-            budget,
         };
-        let value = evaluator.evaluate(root)?;
-        let gradient = derivatives
-            .iter()
-            .map(|&slot| evaluator.evaluate(slot))
-            .collect::<SpiceResult<_>>()?;
-        Ok((value, gradient))
+        let value = evaluator.eval(root)?.clone();
+        let gradient = evaluator.gradient(root)?;
+        Ok(TaylorEvaluation { value, gradient })
     }
 }
 
-impl Evaluator<'_> {
-    fn evaluate(&mut self, root: Slot) -> SpiceResult<Taylor> {
-        self.pending.push(root);
-        while let Some(&slot) = self.pending.last() {
-            if self.values[slot].is_none() {
-                let instruction = self.plan.instructions[slot];
-                if let Some(input) = self.missing(instruction) {
-                    self.pending.push(input);
-                    continue;
-                }
-                let work = (self.time.order() + 1).saturating_pow(2);
-                *self.budget = self
-                    .budget
-                    .checked_sub(work)
-                    .ok_or_else(|| failure("Taylor plan work budget exceeded"))?;
-                self.values[slot] =
-                    Some(self.ready(instruction).map_err(|error| {
-                        failure(format!("{}: {error}", describe(&instruction)))
-                    })?);
-            }
-            self.pending.pop();
+fn missing(node: Instruction, values: &[Option<Jet>]) -> Option<Slot> {
+    let absent = |slot: Slot| values[slot].is_none().then_some(slot);
+    match node {
+        Instruction::Unary(_, a) | Instruction::Pwl(a, _) | Instruction::Table(a, _) => absent(a),
+        Instruction::Operator(_, a, b) | Instruction::Binary(_, a, b) => {
+            absent(a).or_else(|| absent(b))
         }
-        self.read(root).cloned()
-    }
-
-    fn read(&self, slot: Slot) -> SpiceResult<&Taylor> {
-        self.values[slot]
-            .as_ref()
-            .ok_or_else(|| failure("missing Taylor instruction dependency"))
-    }
-
-    fn missing(&self, instruction: Instruction) -> Option<Slot> {
-        let missing = |slot: Slot| self.values[slot].is_none().then_some(slot);
-        match instruction {
-            Instruction::Unary(_, a)
-            | Instruction::Pwl(a, _)
-            | Instruction::PwlDerivative(a, _)
-            | Instruction::Table(a, _)
-            | Instruction::TableSlope(a, _) => missing(a),
-            Instruction::Operator(_, a, b) | Instruction::Binary(_, a, b) => {
-                missing(a).or_else(|| missing(b))
-            }
-            Instruction::Ternary(c, a, b) => missing(c).or_else(|| {
-                self.values[c]
-                    .as_ref()
-                    .and_then(|c| missing(if c.right_sign() == 0. { b } else { a }))
-            }),
-            _ => None,
-        }
-    }
-
-    fn ready(&self, instruction: Instruction) -> SpiceResult<Taylor> {
-        let order = self.time.order();
-        let constant = |value| Taylor::constant(value, order);
-        match instruction {
-            Instruction::Constant(bits) => {
-                constant(Real::from_bits(bits)).with_base(Real::from_bits(bits))
-            }
-            Instruction::Variable(index) => Ok(self.variables[index].clone()),
-            Instruction::Time => Ok(self.time.clone()),
-            Instruction::Temperature => Ok(constant(self.environment.temperature)),
-            Instruction::Frequency => Ok(constant(self.environment.frequency)),
-            Instruction::Unary(op, a) => unary(op, self.read(a)?),
-            Instruction::Operator(op, a, b) => {
-                let (a, b) = (self.read(a)?, self.read(b)?);
-                match op {
-                    Operator::Plus => a.add(b),
-                    Operator::Minus => a.sub(b),
-                    Operator::Times => a.mul(b),
-                    Operator::Divide => {
-                        let fudge = self.environment.gmin * 1e-20;
-                        let adjusted = b.base() + if b.right_sign() < 0. { -fudge } else { fudge };
-                        let denominator = b.clone().with_base(adjusted)?;
-                        a.div(&denominator)?
-                            .with_base(if b.base() == 0. && b.direction() < 0. {
-                                a.base() / adjusted
-                            } else {
-                                divide(a.base(), b.base(), fudge)
-                            })
-                    }
-                    Operator::Power => native_power(a, b, Power::Caret),
-                }
-            }
-            Instruction::Binary(op, a, b) => {
-                let (a, b) = (self.read(a)?, self.read(b)?);
-                match op {
-                    Binary::Pow => native_power(a, b, Power::Ordinary),
-                    Binary::Pwr => native_power(a, b, Power::Signed),
-                    Binary::PowBaseSlope => base_slope(a, b, false),
-                    Binary::PwrBaseSlope => base_slope(a, b, true),
-                    Binary::PowExponentSlope => exponent_slope(a, b, false),
-                    Binary::PwrExponentSlope => exponent_slope(a, b, true),
-                    Binary::Min | Binary::Max => {
-                        let sign = a.sub(b)?.right_sign();
-                        let select_a = if op == Binary::Min {
-                            sign <= 0.
-                        } else {
-                            sign > 0.
-                        };
-                        Ok(if select_a { a.clone() } else { b.clone() })
-                    }
-                }
-            }
-            Instruction::Ternary(c, a, b) => self
-                .read(if self.read(c)?.right_sign() == 0. {
+        Instruction::Ternary(c, a, b) => absent(c).or_else(|| {
+            values[c].as_ref().and_then(|value| {
+                absent(if value.sign() == Ordering::Equal {
                     b
                 } else {
                     a
                 })
-                .cloned(),
-            Instruction::Pwl(a, table) | Instruction::PwlDerivative(a, table) => {
-                let arg = self.read(a)?;
-                let [(x0, y0), (x1, y1)] =
-                    self.plan.pwl[table].right_segment(arg.base(), arg.direction());
-                let slope = (y1 - y0) / (x1 - x0);
-                if matches!(instruction, Instruction::PwlDerivative(..)) {
-                    constant(slope).with_base(slope)
-                } else {
-                    arg.clone()
-                        .with_base(arg.base() - x0)?
-                        .scale(slope)?
-                        .with_base(slope.mul_add(arg.base() - x0, y0))
-                }
-            }
-            Instruction::Table(a, table) | Instruction::TableSlope(a, table) => {
-                let (value, slope) = self.plan.tables[table].right_taylor(self.read(a)?)?;
-                Ok(if matches!(instruction, Instruction::TableSlope(..)) {
-                    slope
-                } else {
-                    value
-                })
-            }
-        }
+            })
+        }),
+        _ => None,
     }
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "exact switches and integral exponent branches define the right-hand law"
-)]
-fn unary(op: Unary, x: &Taylor) -> SpiceResult<Taylor> {
-    let base = x.base();
-    let value = unary_value(op, base);
-    let order = x.order();
-    let constant = |value| Taylor::constant(value, order).with_base(value);
-    let one = Taylor::constant(1., order);
-    let sign = x.right_sign();
-    if x.is_constant() {
-        return constant(value);
+impl Evaluator<'_> {
+    fn eval(&mut self, root: Slot) -> SpiceResult<&Jet> {
+        self.pending.push(root);
+        while let Some(&slot) = self.pending.last() {
+            if self.values[slot].is_none() {
+                let instruction = self.plan.instructions[slot];
+                if let Some(input) = missing(instruction, &self.values) {
+                    self.pending.push(input);
+                    continue;
+                }
+                let value = self.ready(instruction)?;
+                value.check()?;
+                self.values[slot] = Some(value);
+            }
+            self.pending.pop();
+        }
+        self.read(root)
     }
-    match op {
-        Unary::Abs => x.scale(sign),
-        Unary::Uminus => x.scale(-1.),
-        Unary::Sgn => constant(sign),
-        Unary::Ustep => constant(if sign < 0. { 0. } else { 1. }),
+
+    fn read(&self, slot: Slot) -> SpiceResult<&Jet> {
+        self.values[slot]
+            .as_ref()
+            .ok_or_else(|| SpiceError::circuit("missing behavioural Taylor operand"))
+    }
+
+    fn ready(&self, node: Instruction) -> SpiceResult<Jet> {
+        let constant = |value| Jet::constant(self.time.order(), value);
+        Ok(match node {
+            Instruction::Constant(bits) => constant(Real::from_bits(bits)),
+            Instruction::Variable(index) => self.variables[index].clone(),
+            Instruction::Time => self.time.clone(),
+            Instruction::Temperature => constant(self.environment.temperature),
+            Instruction::Frequency => constant(self.environment.frequency),
+            Instruction::Unary(op, a) => unary(op, self.read(a)?)?,
+            Instruction::Operator(op, a, b) => operator(
+                op,
+                self.read(a)?,
+                self.read(b)?,
+                self.environment.gmin * 1e-20,
+            )?,
+            Instruction::Binary(op, a, b) => binary(op, self.read(a)?, self.read(b)?)?,
+            Instruction::Ternary(c, a, b) => self
+                .read(if self.read(c)?.sign() == Ordering::Equal {
+                    b
+                } else {
+                    a
+                })?
+                .clone(),
+            Instruction::Pwl(a, table) => {
+                let x = self.read(a)?;
+                let [(x0, y0), (x1, y1)] = self.pwl_segment(x, table);
+                x.clone()
+                    .offset(-x0)
+                    .scale((y1 - y0) / (x1 - x0))
+                    .offset(y0)
+            }
+            Instruction::Table(a, table) => {
+                let x = self.read(a)?;
+                let (value, slope, quadratic) = self.table_polynomial(x, table);
+                let delta = x.clone().with_value(0.);
+                delta
+                    .multiply(&delta)
+                    .scale(quadratic)
+                    .add(&delta.scale(slope))
+                    .offset(value)
+            }
+            Instruction::PwlDerivative(..) | Instruction::TableSlope(..) => {
+                return Err(SpiceError::circuit(
+                    "derivative-only instruction in physical value graph",
+                ));
+            }
+        })
+    }
+    fn pwl_segment(&self, x: &Jet, table: usize) -> [(Real, Real); 2] {
+        let table = &self.plan.pwl[table];
+        let upper = match table.order {
+            super::super::PwlOrder::Ascending => Ordering::Less,
+            super::super::PwlOrder::Descending => Ordering::Greater,
+        };
+        table.segment_by(|boundary| x.compare(boundary) == Some(upper))
+    }
+
+    fn table_polynomial(&self, x: &Jet, table: usize) -> (Real, Real, Real) {
+        self.plan.tables[table].local_polynomial(x.value(), |boundary| x.compare(boundary))
+    }
+
+    /// Only the active differentiable children of the executed value graph.
+    /// Inactive conditional branches and discrete controls are not evaluated
+    /// by the reverse pass.
+    fn active_inputs(&self, node: Instruction) -> SpiceResult<[Option<Slot>; 2]> {
+        Ok(match node {
+            Instruction::Unary(op, a) if !discrete(op) => [Some(a), None],
+            Instruction::Pwl(a, _) | Instruction::Table(a, _) => [Some(a), None],
+            Instruction::Operator(_, a, b)
+            | Instruction::Binary(Binary::Pow | Binary::Pwr, a, b) => [Some(a), Some(b)],
+            Instruction::Binary(op @ (Binary::Min | Binary::Max), a, b) => [
+                Some(select_extremum(op, self.read(a)?, self.read(b)?, a, b)),
+                None,
+            ],
+            Instruction::Ternary(c, a, b) => [
+                Some(if self.read(c)?.sign() == Ordering::Equal {
+                    b
+                } else {
+                    a
+                }),
+                None,
+            ],
+            _ => [None, None],
+        })
+    }
+
+    /// Reverse-mode differentiation of the actual local value kernels.
+    /// The ordinary scalar solver retains its legacy symbolic Newton
+    /// slopes; those are not exact derivatives of clipped or regularized
+    /// functions and must not be used to establish physical DAE rank.
+    fn gradient(&self, root: Slot) -> SpiceResult<Vec<Jet>> {
+        let constant = |value| Jet::constant(self.time.order(), value);
+        let mut gradient = vec![constant(0.); self.variables.len()];
+        let mut active = vec![[None; 2]; root + 1];
+        let mut depends = vec![false; root + 1];
+        for slot in 0..=root {
+            if self.values[slot].is_some() {
+                let node = self.plan.instructions[slot];
+                active[slot] = self.active_inputs(node)?;
+                depends[slot] = matches!(node, Instruction::Variable(_))
+                    || active[slot].iter().flatten().any(|&child| depends[child]);
+            }
+        }
+        let mut adjoints = vec![None; root + 1];
+        adjoints[root] = Some(constant(1.));
+        for slot in (0..=root).rev() {
+            let Some(adjoint) = adjoints[slot].take() else {
+                continue;
+            };
+            if !depends[slot] || adjoint.is_zero() {
+                continue;
+            }
+            let node = self.plan.instructions[slot];
+            if let Instruction::Variable(variable) = node {
+                gradient[variable] = gradient[variable].clone().add(&adjoint);
+                gradient[variable].check()?;
+                continue;
+            }
+            for (side, child) in active[slot].into_iter().enumerate() {
+                let Some(child) = child.filter(|&child| depends[child]) else {
+                    continue;
+                };
+                let partial = self.partial(slot, node, side)?;
+                let contribution = adjoint.multiply(&partial);
+                contribution.check()?;
+                let sum = match adjoints[child].take() {
+                    Some(old) => old.add(&contribution),
+                    None => contribution,
+                };
+                sum.check()?;
+                adjoints[child] = Some(sum);
+            }
+        }
+        Ok(gradient)
+    }
+
+    fn partial(&self, slot: Slot, node: Instruction, side: usize) -> SpiceResult<Jet> {
+        let constant = |value| Jet::constant(self.time.order(), value);
+        Ok(match node {
+            Instruction::Unary(op, a) => unary_partial(op, self.read(a)?, self.read(slot)?)?,
+            Instruction::Operator(op, a, b) => operator_partial(
+                op,
+                self.read(a)?,
+                self.read(b)?,
+                self.read(slot)?,
+                side,
+                self.environment.gmin * 1e-20,
+            )?,
+            Instruction::Binary(op @ (Binary::Pow | Binary::Pwr), a, b) => {
+                power_partial(self.read(a)?, self.read(b)?, op == Binary::Pwr, side != 0)?
+            }
+            Instruction::Binary(Binary::Min | Binary::Max, ..) | Instruction::Ternary(..) => {
+                constant(1.)
+            }
+            Instruction::Pwl(a, table) => {
+                let [(x0, y0), (x1, y1)] = self.pwl_segment(self.read(a)?, table);
+                constant((y1 - y0) / (x1 - x0))
+            }
+            Instruction::Table(a, table) => {
+                let x = self.read(a)?;
+                let (_, slope, quadratic) = self.table_polynomial(x, table);
+                x.clone().with_value(0.).scale(2. * quadratic).offset(slope)
+            }
+            _ => return Err(SpiceError::circuit("invalid physical Taylor partial")),
+        })
+    }
+}
+
+fn unary(op: Unary, x: &Jet) -> SpiceResult<Jet> {
+    let constant = |value| Jet::constant(x.order(), value);
+    if x.is_constant() {
+        return Ok(constant(unary_value(op, x.value())));
+    }
+    let value = unary_value(op, x.value());
+    let sign = x.sign();
+    Ok(match op {
+        Unary::Abs => {
+            if sign == Ordering::Less {
+                x.clone().scale(-1.)
+            } else {
+                x.clone()
+            }
+        }
+        Unary::Uminus => x.clone().scale(-1.),
+        Unary::Exp => {
+            if x.clone().offset(-EXP_LIMIT).sign() == Ordering::Greater {
+                constant(1e99)
+            } else {
+                x.exp()
+            }
+        }
+        Unary::Log => x.ln()?,
+        Unary::Log10 => x.ln()?.scale(std::f64::consts::LOG10_E).with_value(value),
+        Unary::Sqrt => x.sqrt()?,
+        Unary::Sin => x.clone().with_value(modulus(x.value(), TWO_PI)).sin_cos().0,
+        Unary::Cos => x.clone().with_value(modulus(x.value(), TWO_PI)).sin_cos().1,
+        Unary::Tan => {
+            let (sine, cosine) = x
+                .clone()
+                .with_value(modulus(x.value(), std::f64::consts::PI))
+                .sin_cos();
+            sine.divide(&cosine)?.with_value(value)
+        }
+        Unary::Sinh => x.sinh_cosh().0,
+        Unary::Cosh => x.sinh_cosh().1,
+        Unary::Tanh => x.tanh(),
+        Unary::Acos | Unary::Asin | Unary::Acosh | Unary::Asinh | Unary::Atan | Unary::Atanh => {
+            x.compose_derivative(value, &inverse_slope(op, x)?)
+        }
         Unary::Uramp => {
-            if sign < 0. {
+            if sign == Ordering::Less {
                 constant(0.)
             } else {
-                Ok(x.clone())
+                x.clone()
             }
         }
         Unary::Ustep2 => {
-            if sign < 0. {
+            if sign == Ordering::Less {
                 constant(0.)
-            } else if base > 1. || (base == 1. && x.direction() > 0.) {
+            } else if x.clone().offset(-1.).sign() == Ordering::Greater {
                 constant(1.)
             } else {
-                Ok(x.clone())
+                x.clone()
             }
         }
-        Unary::Eq0 | Unary::Ne0 | Unary::Gt0 | Unary::Lt0 | Unary::Ge0 | Unary::Le0 => {
-            constant(unary_value(op, sign))
-        }
-        Unary::Floor => constant(if base.fract() == 0. && x.direction() < 0. {
-            base - 1.
-        } else {
-            value
+        Unary::Sgn
+        | Unary::Ustep
+        | Unary::Eq0
+        | Unary::Ne0
+        | Unary::Gt0
+        | Unary::Lt0
+        | Unary::Ge0
+        | Unary::Le0 => constant(unary_value(
+            op,
+            match sign {
+                Ordering::Less => -1.,
+                Ordering::Equal => 0.,
+                Ordering::Greater => 1.,
+            },
+        )),
+        Unary::Floor | Unary::Ceil | Unary::Nint => constant(discrete_limit(op, x)),
+    })
+}
+
+const fn discrete(op: Unary) -> bool {
+    matches!(
+        op,
+        Unary::Sgn
+            | Unary::Ustep
+            | Unary::Ceil
+            | Unary::Floor
+            | Unary::Nint
+            | Unary::Eq0
+            | Unary::Ne0
+            | Unary::Gt0
+            | Unary::Lt0
+            | Unary::Ge0
+            | Unary::Le0
+    )
+}
+
+fn unary_partial(op: Unary, x: &Jet, value: &Jet) -> SpiceResult<Jet> {
+    let constant = |value| Jet::constant(x.order(), value);
+    let sign = x.sign();
+    Ok(match op {
+        Unary::Abs => constant(match sign {
+            Ordering::Less => -1.,
+            Ordering::Equal => 0.,
+            Ordering::Greater => 1.,
         }),
-        Unary::Ceil => constant(if base.fract() == 0. && x.direction() > 0. {
-            base + 1.
-        } else {
-            value
-        }),
-        Unary::Nint => constant(if base.fract().abs() == 0.5 {
-            if x.direction() < 0. {
-                base.floor()
+        Unary::Uminus => constant(-1.),
+        Unary::Exp if x.compare(EXP_LIMIT) == Some(Ordering::Greater) => constant(0.),
+        Unary::Exp => value.clone(),
+        Unary::Log => x.reciprocal()?,
+        Unary::Log10 => x.reciprocal()?.scale(std::f64::consts::LOG10_E),
+        Unary::Sqrt => value.reciprocal()?.scale(0.5),
+        Unary::Sin => x.clone().with_value(modulus(x.value(), TWO_PI)).sin_cos().1,
+        Unary::Cos => x
+            .clone()
+            .with_value(modulus(x.value(), TWO_PI))
+            .sin_cos()
+            .0
+            .scale(-1.),
+        Unary::Tan => value.multiply(value).offset(1.),
+        Unary::Sinh => x.sinh_cosh().1,
+        Unary::Cosh => x.sinh_cosh().0,
+        Unary::Tanh => value.multiply(value).scale(-1.).offset(1.),
+        Unary::Acos | Unary::Asin | Unary::Acosh | Unary::Asinh | Unary::Atan | Unary::Atanh => {
+            inverse_slope(op, x)?
+        }
+        Unary::Uramp => constant(if sign == Ordering::Less { 0. } else { 1. }),
+        Unary::Ustep2 => constant(
+            if sign == Ordering::Less || x.compare(1.) == Some(Ordering::Greater) {
+                0.
             } else {
-                base.ceil()
-            }
-        } else {
-            value
-        }),
-        Unary::Exp => {
-            if base > EXP_LIMIT || (base == EXP_LIMIT && x.direction() > 0.) {
-                constant(1e99)
+                1.
+            },
+        ),
+        _ => constant(0.),
+    })
+}
+
+fn operator_partial(
+    op: Operator,
+    a: &Jet,
+    b: &Jet,
+    value: &Jet,
+    side: usize,
+    fudge: Real,
+) -> SpiceResult<Jet> {
+    let constant = |value| Jet::constant(a.order(), value);
+    Ok(match op {
+        Operator::Plus => constant(1.),
+        Operator::Minus => constant(if side == 0 { 1. } else { -1. }),
+        Operator::Times => {
+            if side == 0 {
+                b.clone()
             } else {
-                x.exp(value)
+                a.clone()
             }
         }
-        Unary::Log => x.log(value),
-        Unary::Log10 => x
-            .log(base.ln())?
-            .scale(std::f64::consts::LOG10_E)?
-            .with_base(value),
-        Unary::Sqrt => x.sqrt(value),
-        Unary::Sin | Unary::Cos | Unary::Tan => {
-            let (s, c) = x.trig_pair(
-                unary_value(Unary::Sin, base),
-                unary_value(Unary::Cos, base),
-                false,
-            )?;
-            match op {
-                Unary::Sin => Ok(s),
-                Unary::Cos => Ok(c),
-                _ => s.div(&c)?.with_base(value),
-            }
-        }
-        Unary::Sinh | Unary::Cosh | Unary::Tanh => {
-            if op == Unary::Tanh {
-                // Stable at large finite arguments: use exp(-2|x|), not
-                // an overflowing ratio of sinh and cosh.
-                let arg = x.scale(-2. * sign)?;
-                let decay = arg.exp(arg.base().exp())?;
-                return one
-                    .sub(&decay)?
-                    .div(&one.add(&decay)?)?
-                    .scale(sign)?
-                    .with_base(value);
-            }
-            let (s, c) = x.trig_pair(base.sinh(), base.cosh(), true)?;
-            Ok(if op == Unary::Sinh { s } else { c })
-        }
-        Unary::Asin | Unary::Acos | Unary::Asinh | Unary::Acosh | Unary::Atan | Unary::Atanh => {
-            let square = x.mul(x)?;
-            let denominator = match op {
-                Unary::Asin | Unary::Acos => {
-                    let d = one.sub(&square)?;
-                    d.sqrt(d.base().sqrt())?
-                }
-                Unary::Asinh => {
-                    let d = one.add(&square)?;
-                    d.sqrt(d.base().sqrt())?
-                }
-                Unary::Acosh => {
-                    let d = square.sub(&one)?;
-                    d.sqrt(d.base().sqrt())?
-                }
-                Unary::Atan => one.add(&square)?,
-                _ => one.sub(&square)?,
-            };
-            let numerator = if op == Unary::Acos {
-                one.scale(-1.)?
+        Operator::Divide => {
+            let denominator = b.clone().offset(if b.sign() == Ordering::Less {
+                -fudge
             } else {
-                one
-            };
-            x.compose_derivative(&numerator.div(&denominator)?, value)
+                fudge
+            });
+            if side == 0 {
+                denominator.reciprocal()?
+            } else {
+                value.divide(&denominator)?.scale(-1.)
+            }
         }
+        Operator::Power => power_partial(a, b, false, side != 0)?,
+    })
+}
+
+fn discrete_limit(op: Unary, x: &Jet) -> Real {
+    let value = x.value();
+    match (op, x.direction()) {
+        (Unary::Floor, Ordering::Less) if value.fract() == 0. => value - 1.,
+        (Unary::Ceil, Ordering::Greater) if value.fract() == 0. => value + 1.,
+        (Unary::Nint, Ordering::Less) if value.fract().abs().to_bits() == 0.5_f64.to_bits() => {
+            value.floor()
+        }
+        (Unary::Nint, Ordering::Greater) if value.fract().abs().to_bits() == 0.5_f64.to_bits() => {
+            value.ceil()
+        }
+        _ => unary_value(op, value),
     }
+}
+
+fn inverse_slope(op: Unary, x: &Jet) -> SpiceResult<Jet> {
+    let square = x.multiply(x);
+    let radicand = match op {
+        Unary::Acos | Unary::Asin | Unary::Atanh => square.scale(-1.).offset(1.),
+        Unary::Acosh => square.offset(-1.),
+        _ => square.offset(1.),
+    };
+    let denominator = if matches!(op, Unary::Atan | Unary::Atanh) {
+        radicand
+    } else {
+        radicand.sqrt()?
+    };
+    let slope = denominator.reciprocal()?;
+    Ok(if op == Unary::Acos {
+        slope.scale(-1.)
+    } else {
+        slope
+    })
+}
+
+fn operator(op: Operator, a: &Jet, b: &Jet, fudge: Real) -> SpiceResult<Jet> {
+    Ok(match op {
+        Operator::Plus => a.clone().add(b),
+        Operator::Minus => a.clone().add(&b.clone().scale(-1.)),
+        Operator::Times => a.multiply(b),
+        Operator::Divide => {
+            let offset = if b.sign() == Ordering::Less {
+                -fudge
+            } else {
+                fudge
+            };
+            let result = a.divide(&b.clone().offset(offset))?;
+            if b.value() == 0. {
+                result
+            } else {
+                result.with_value(divide(a.value(), b.value(), fudge))
+            }
+        }
+        Operator::Power => power_jet(a, b, PowerKind::Operator)?,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Power {
+enum PowerKind {
+    Operator,
     Ordinary,
-    Caret,
     Signed,
 }
 
-fn integral_power(a: &Taylor, exponent: Real) -> SpiceResult<Taylor> {
-    if (Real::from(i32::MIN)..=Real::from(i32::MAX)).contains(&exponent) {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "caller supplies a finite integral exponent in the i32 range"
-        )]
-        let exponent = exponent as i32;
-        return a.powi(exponent);
-    }
-    if a.base() == 0. && exponent > 0. {
-        // A power beyond i32::MAX has no nonzero coefficient within the
-        // bounded right-limit order.
-        return Ok(Taylor::constant(0., a.order()));
-    }
-    let sign = if a.base() < 0. && exponent.rem_euclid(2.) != 0. {
-        -1.
-    } else {
-        1.
+fn power_jet(a: &Jet, b: &Jet, kind: PowerKind) -> SpiceResult<Jet> {
+    let constant = |value| Jet::constant(a.order(), value);
+    let scalar = match kind {
+        PowerKind::Operator => power_h(a.value(), b.value()),
+        PowerKind::Ordinary => power(a.value(), b.value()),
+        PowerKind::Signed => pwr(a.value(), b.value()),
     };
-    let magnitude = a.scale(if a.base() < 0. { -1. } else { 1. })?;
-    let arg = magnitude.log(magnitude.base().ln())?.scale(exponent)?;
-    arg.exp(arg.base().exp())?.scale(sign)
-}
-
-#[expect(
-    clippy::float_cmp,
-    reason = "native power kernels distinguish exact zero and integer branches"
-)]
-fn native_power(a: &Taylor, b: &Taylor, law: Power) -> SpiceResult<Taylor> {
-    let value = match law {
-        Power::Ordinary => power(a.base(), b.base()),
-        Power::Caret => power_h(a.base(), b.base()),
-        Power::Signed => pwr(a.base(), b.base()),
-    };
-    let constant = |value| Taylor::constant(value, a.order()).with_base(value);
     if a.is_constant() && b.is_constant() {
-        return constant(value);
+        return Ok(constant(scalar));
     }
-    let sign = a.right_sign();
-    if sign == 0. {
-        if b.base() == 0. && !b.is_constant() {
-            return Err(failure("nonregular exponent at a zero base"));
+    if a.sign() == Ordering::Equal {
+        if kind == PowerKind::Ordinary || b.value() > 0. {
+            return Ok(constant(0.));
         }
-        return constant(value);
+        return Err(SpiceError::circuit(
+            "zero base has no regular Taylor power at this exponent",
+        ));
     }
-    if sign < 0. && law != Power::Signed {
-        if almost_equal_ulps(b.base().round_ties_even(), b.base(), 10) {
-            return integral_power(a, b.base().round())?.with_base(if a.base() == 0. {
-                integral_power(a, b.base().round())?.base()
-            } else {
-                value
-            });
-        }
-        return constant(0.);
-    }
-    let magnitude = a.scale(if sign < 0. { -1. } else { 1. })?;
-    let sign = if sign < 0. && law == Power::Signed {
-        -1.
-    } else {
-        1.
-    };
-    let result = if b.is_constant() && b.base().fract() == 0. {
-        integral_power(&magnitude, b.base())?.scale(sign)?
-    } else {
-        let arg = magnitude.log(magnitude.base().ln())?.mul(b)?;
-        arg.exp(arg.base().exp())?.scale(sign)?
-    };
-    // At a zero base the open right-hand branch can differ from an isolated
-    // native sample (e.g. pow(0,0)). Preserve the actual right limit.
-    if a.base() == 0. {
-        Ok(result)
-    } else {
-        result.with_base(value)
-    }
-}
-
-#[expect(
-    clippy::float_cmp,
-    reason = "the scalar law has separate exact zero/integer power branches"
-)]
-fn base_slope(a: &Taylor, b: &Taylor, signed: bool) -> SpiceResult<Taylor> {
-    let value = power_base_slope(a.base(), b.base(), signed);
-    if a.is_constant() && b.is_constant() {
-        return Taylor::constant(value, a.order()).with_base(value);
-    }
-    if b.is_constant() && b.base() == 0. {
-        return Ok(Taylor::constant(0., a.order()));
-    }
-    if a.right_sign() == 0. {
-        if b.base() > 1. {
-            return Ok(Taylor::constant(0., a.order()));
-        }
-        if b.is_constant() && b.base() == 1. {
-            return Ok(Taylor::constant(1., a.order()));
-        }
-        return Err(failure("nonregular base derivative at zero"));
-    }
-    let one = Taylor::constant(1., a.order());
-    let (base, exponent) = if signed {
-        (
-            a.scale(if a.right_sign() < 0. { -1. } else { 1. })?,
-            b.clone(),
-        )
-    } else if a.right_sign() < 0. {
-        if !almost_equal_ulps(b.base().round_ties_even(), b.base(), 10) {
-            return Ok(Taylor::constant(0., a.order()));
-        }
-        (a.clone(), Taylor::constant(b.base().round(), a.order()))
-    } else {
-        (a.clone(), b.clone())
-    };
-    let result = exponent.mul(&native_power(&base, &exponent.sub(&one)?, Power::Caret)?)?;
-    if a.base() == 0. {
-        Ok(result)
-    } else {
-        result.with_base(value)
-    }
-}
-
-fn exponent_slope(a: &Taylor, b: &Taylor, signed: bool) -> SpiceResult<Taylor> {
-    let value = power_exponent_slope(a.base(), b.base(), signed);
-    if a.is_constant() && b.is_constant() {
-        return Taylor::constant(value, a.order()).with_base(value);
-    }
-    if a.right_sign() == 0. || (!signed && a.right_sign() < 0.) {
-        return Ok(Taylor::constant(0., a.order()));
-    }
-    let magnitude = a.scale(if a.right_sign() < 0. { -1. } else { 1. })?;
-    native_power(
-        a,
-        b,
-        if signed {
-            Power::Signed
+    let negative = a.sign() == Ordering::Less;
+    let result = if kind == PowerKind::Signed && negative {
+        a.clone().scale(-1.).power(b)?.scale(-1.)
+    } else if negative {
+        // Negative-base ordinary powers use the existing quasi-integer
+        // exponent convention. No derivative w.r.t. exponent in that branch.
+        if almost_equal_ulps(b.value().round_ties_even(), b.value(), 10) {
+            a.power(&constant(b.value().round()))?
         } else {
-            Power::Ordinary
-        },
-    )?
-    .mul(&magnitude.log(magnitude.base().ln())?)?
-    .with_base(value)
+            constant(0.)
+        }
+    } else {
+        a.power(b)?
+    };
+    // At a zero crossing the mathematical right limit can differ from the
+    // reference scalar pow(0,0); preserve the branch-local expansion.
+    Ok(if a.value() == 0. {
+        result
+    } else {
+        result.with_value(scalar)
+    })
+}
+
+fn power_partial(a: &Jet, b: &Jet, signed: bool, exponent: bool) -> SpiceResult<Jet> {
+    let constant = |value| Jet::constant(a.order(), value);
+    let negative = a.sign() == Ordering::Less;
+    if exponent {
+        if a.sign() == Ordering::Equal || (!signed && negative) {
+            return Ok(constant(0.));
+        }
+        let magnitude = if negative {
+            a.clone().scale(-1.)
+        } else {
+            a.clone()
+        };
+        return Ok(power_jet(
+            a,
+            b,
+            if signed {
+                PowerKind::Signed
+            } else {
+                PowerKind::Ordinary
+            },
+        )?
+        .multiply(&magnitude.ln()?));
+    }
+    if b.is_constant() && b.value() == 0. {
+        return Ok(constant(0.));
+    }
+    if a.sign() == Ordering::Equal {
+        return match b.compare(1.) {
+            Some(Ordering::Greater) => Ok(constant(0.)),
+            Some(Ordering::Equal) => Ok(constant(1.)),
+            _ => Err(SpiceError::circuit(
+                "singular zero-base Taylor power derivative",
+            )),
+        };
+    }
+    if negative && !signed {
+        if !almost_equal_ulps(b.value().round_ties_even(), b.value(), 10) {
+            return Ok(constant(0.));
+        }
+        let exponent = b.value().round();
+        return Ok(a.power(&constant(exponent - 1.))?.scale(exponent));
+    }
+    let magnitude = if signed && negative {
+        a.clone().scale(-1.)
+    } else {
+        a.clone()
+    };
+    Ok(magnitude.power(&b.clone().offset(-1.))?.multiply(b))
+}
+
+fn select_extremum<T>(op: Binary, a: &Jet, b: &Jet, left: T, right: T) -> T {
+    let comparison = a.clone().add(&b.clone().scale(-1.)).sign();
+    if (op == Binary::Min && comparison == Ordering::Greater)
+        || (op == Binary::Max && comparison != Ordering::Greater)
+    {
+        right
+    } else {
+        left
+    }
+}
+
+fn binary(op: Binary, a: &Jet, b: &Jet) -> SpiceResult<Jet> {
+    match op {
+        Binary::Pow => power_jet(a, b, PowerKind::Ordinary),
+        Binary::Pwr => power_jet(a, b, PowerKind::Signed),
+        Binary::Min | Binary::Max => Ok(select_extremum(op, a, b, a, b).clone()),
+        _ => Err(SpiceError::circuit(
+            "derivative-only instruction in physical value graph",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::behavioural::program::Program;
+    use crate::netlist::Parser;
+    use crate::primitives::SourceLoc;
+
+    fn evaluate(text: &str, variables: &[Jet]) -> TaylorEvaluation {
+        let expression = Parser::new()
+            .parse_behavioural_expression(
+                text,
+                &SourceLoc::new(std::path::PathBuf::from("physical-jacobian.cir"), 1, 1),
+                true,
+            )
+            .unwrap()
+            .root;
+        let program = Program::compile(&expression).unwrap();
+        let values: Vec<_> = variables.iter().map(Jet::value).collect();
+        let environment = Environment {
+            values: &values,
+            time: 0.,
+            temperature: 27.,
+            gmin: 1e-12,
+            frequency: 0.,
+        };
+        program
+            .evaluate_taylor(
+                &environment,
+                variables,
+                &Jet::affine(variables[0].order(), 0., 1.),
+            )
+            .unwrap()
+    }
+
+    fn close(actual: &Jet, expected: &[Real]) {
+        assert_eq!(actual.coefficients().len(), expected.len());
+        for (&a, &b) in actual.coefficients().iter().zip(expected) {
+            assert!(
+                (a - b).abs() <= 2e-13 * b.abs().max(1e-20),
+                "{a:e} != {b:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_jacobian_is_zero_on_clipped_exponential_branch() {
+        let result = evaluate("exp(v(a))", &[Jet::affine(3, 230., 1.)]);
+        close(&result.value, &[1e99, 0., 0., 0.]);
+        close(&result.gradient[0], &[0.; 4]);
+        let result = evaluate("exp(v(a))", &[Jet::affine(3, 0., 1.)]);
+        close(&result.value, &[1., 1., 0.5, 1. / 6.]);
+        close(&result.gradient[0], &[1., 1., 0.5, 1. / 6.]);
+    }
+
+    #[test]
+    fn physical_division_jacobian_regularizes_only_the_value_denominator() {
+        let result = evaluate(
+            "v(a)/v(b)",
+            &[Jet::constant(3, 1e-32), Jet::affine(3, 1e-32, 1e-32)],
+        );
+        close(&result.value, &[0.5, -0.25, 0.125, -0.0625]);
+        close(&result.gradient[0], &[5e31, -2.5e31, 1.25e31, -6.25e30]);
+        close(&result.gradient[1], &[-2.5e31, 2.5e31, -1.875e31, 1.25e31]);
+    }
+
+    #[test]
+    fn physical_reverse_pass_accumulates_shared_operands_and_ignores_inactive_branches() {
+        let result = evaluate("v(a)*v(a)+v(a)^3", &[Jet::affine(3, 2., 1.)]);
+        close(&result.value, &[12., 16., 7., 1.]);
+        close(&result.gradient[0], &[16., 14., 3., 0.]);
+        let result = evaluate(
+            "v(a)>0 ? 2*v(b) : sqrt(-1)",
+            &[Jet::affine(3, 1., 1.), Jet::affine(3, 2., 3.)],
+        );
+        close(&result.value, &[4., 6., 0., 0.]);
+        close(&result.gradient[0], &[0.; 4]);
+        close(&result.gradient[1], &[2., 0., 0., 0.]);
+    }
+
+    #[test]
+    fn physical_reverse_pass_uses_the_same_germ_as_value_selection() {
+        let result = evaluate(
+            "min(v(a),v(b))",
+            &[Jet::affine(3, 1., 1.), Jet::affine(3, 1., -1.)],
+        );
+        close(&result.value, &[1., -1., 0., 0.]);
+        close(&result.gradient[0], &[0.; 4]);
+        close(&result.gradient[1], &[1., 0., 0., 0.]);
+        for (direction, slope) in [(1., -1.), (-1., 2.)] {
+            let result = evaluate("pwl(v(a),0,0,1,2,2,1)", &[Jet::affine(3, 1., direction)]);
+            close(&result.value, &[2., slope * direction, 0., 0.]);
+            close(&result.gradient[0], &[slope, 0., 0., 0.]);
+        }
+    }
 }

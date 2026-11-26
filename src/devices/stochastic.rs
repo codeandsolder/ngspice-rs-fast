@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use crate::devices::Limit;
-use crate::maths::taylor::Taylor;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 const MAX_INDEX: Real = 9_007_199_254_740_991.;
@@ -396,49 +395,6 @@ impl StochasticWaveform {
             Err(bad("noise amplitude overflows binary64"))
         }
     }
-    /// The reproducible realized process is affine between physical
-    /// sample-grid knots; held random and telegraph components are constant
-    /// on each open right-hand interval.
-    pub(super) fn local_taylor(
-        &self,
-        time: Real,
-        scale: Real,
-        order: usize,
-    ) -> SpiceResult<Taylor> {
-        let limit = if scale < 0. {
-            Limit::Left
-        } else {
-            Limit::Right
-        };
-        let base = self.value_at(time, limit)?;
-        let slope = match self.spec {
-            StochasticSpec::Random(_) => 0.,
-            StochasticSpec::Noise(n) => {
-                let key = self.key();
-                let mut slope = if n.white_rms > 0. {
-                    n.white_rms * interpolated_slope(key, 0x5748_4954, time, n.step, scale)?
-                } else {
-                    0.
-                };
-                if n.flicker_drive_rms > 0. {
-                    let mut colored = interpolated_slope(key, 0x464c_4943, time, n.step, scale)?;
-                    for (octave, &weight) in self.flicker_bands.iter().enumerate() {
-                        let spacing =
-                            n.step * 2_f64.powi(i32::try_from(octave).unwrap_or_default());
-                        let stream = 0x464c_4943 ^ (u64::try_from(octave).unwrap_or_default() + 1);
-                        colored = weight.mul_add(
-                            interpolated_slope(key, stream, time, spacing, scale)?,
-                            colored,
-                        );
-                    }
-                    slope = n.flicker_drive_rms.mul_add(colored, slope);
-                }
-                slope
-            }
-        };
-        Taylor::affine(base, slope, order).with_base(base)
-    }
-
     /// Lazily enumerate physical noise knots and RTS transitions.
     /// # Errors
     /// Invalid window/grid.
@@ -499,23 +455,6 @@ fn interpolated(key: u64, stream: u64, time: Real, step: Real) -> SpiceResult<Re
     let left = sample(index);
     let right = sample(index + 1);
     Ok((right - left).mul_add(fraction, left))
-}
-fn interpolated_slope(
-    key: u64,
-    stream: u64,
-    time: Real,
-    step: Real,
-    scale: Real,
-) -> SpiceResult<Real> {
-    if scale < 0. && time == 0. {
-        return Ok(0.);
-    }
-    let (mut index, fraction) = grid_index(time / step)?;
-    if scale < 0. && fraction == 0. && index > 0 {
-        index -= 1;
-    }
-    let sample = |n| if n == 0 { 0. } else { gaussian(key, stream, n) };
-    Ok((sample(index + 1) - sample(index)) * (scale / step))
 }
 /// Group the exact C Kasdin fractional-difference kernel's squared
 /// coefficients by octave. h[k] = h[k-1] * (alpha/2 + k - 1)/k. This

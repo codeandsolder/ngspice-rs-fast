@@ -443,7 +443,9 @@ impl Device for CoupledLine {
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         match context.mode {
-            AnalysisMode::OperatingPoint | AnalysisMode::DcSweep => {
+            AnalysisMode::OperatingPoint
+            | AnalysisMode::DcSweep
+            | AnalysisMode::Instantaneous { .. } => {
                 let first = context.branch(0)?;
                 if matches!(self.propagation, Propagation::Spatial) {
                     self.dc_spatial_state(context)?;

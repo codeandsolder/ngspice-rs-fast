@@ -698,97 +698,46 @@ impl<'a> PreparedRun<'a> {
         &self,
         context: &ModelContext,
     ) -> SpiceResult<crate::devices::linear::LinearSystem> {
+        self.validate_physical_dae(context, false)?;
+        self.transient_forcing_system(context)
+    }
+
+    /// Prepare the memoryless physical DAE with independent forcing at the
+    /// requested time, rather than treating it as a DC or integrated load.
+    ///
+    /// # Errors
+    /// History-dependent or unsupported model, or invalid linear assembly.
+    pub fn prepare_physical_dae(
+        &self,
+        context: &ModelContext,
+        timing: crate::devices::TransientTiming,
+    ) -> SpiceResult<crate::devices::physical_dae::PhysicalDae<'_, 'a>> {
+        self.validate_physical_dae(context, true)?;
+        let linear = self.transient_forcing_system(context)?;
+        crate::devices::physical_dae::PhysicalDae::new(self, *context, timing, linear)
+    }
+
+    fn validate_physical_dae(
+        &self,
+        context: &ModelContext,
+        time_dependent: bool,
+    ) -> SpiceResult<()> {
         let point = self.point(context)?;
         for index in self.circuit.load_order() {
             let device = point.device(self.circuit, index);
-            if device.depends_on_time()
+            if (!time_dependent && device.depends_on_time())
                 || device.depends_on_frequency()
                 || device.small_signal_depends_on_frequency()
                 || device.delay_line().is_some()
                 || device.has_discrete_state()
             {
                 return Err(SpiceError::Unsupported {
-                    feature: format!("frequency-domain physical DAE for {}", device.name()),
+                    feature: format!("memoryless physical DAE for {}", device.name()),
                     location: None,
                 });
             }
         }
-        drop(point);
-        self.circuit.assemble_linear_devices(self, context, true)
-    }
-
-    /// Assemble physical right-limit Taylor coefficients from the prepared
-    /// device equations, with one immutable parameter context.
-    pub(crate) fn physical_taylor_jet(
-        &self,
-        context: &ModelContext,
-        linear: &crate::devices::linear::LinearSystem,
-        trajectory: &[Vector],
-        at: Real,
-        scale: Real,
-    ) -> SpiceResult<crate::devices::physical_jet::PhysicalJet> {
-        use crate::devices::physical_jet::{Binding, PhysicalJet, ResidualJet};
-        use crate::maths::taylor::Taylor;
-        let size = self.circuit.unknown_count();
-        let order = trajectory
-            .len()
-            .checked_sub(1)
-            .ok_or_else(|| SpiceError::circuit("empty right-limit trajectory"))?;
-        let coordinates = (0..size)
-            .map(|column| Taylor::new(trajectory.iter().map(|x| x.as_slice()[column]).collect()))
-            .collect::<SpiceResult<Vec<_>>>()?;
-        let time = Taylor::affine(at, scale, order);
-        let mut jet = PhysicalJet {
-            static_part: ResidualJet::new(size, order),
-            charge: ResidualJet::new(size, order),
-        };
-        for (matrix, residual) in [
-            (&linear.a, &mut jet.static_part),
-            (&linear.e, &mut jet.charge),
-        ] {
-            for term in matrix.triplets() {
-                residual.linear(
-                    Some(term.row),
-                    Some(term.col),
-                    &coordinates[term.col],
-                    term.value,
-                )?;
-            }
-        }
-        for source in &linear.sources {
-            let forcing = source.waveform.local_taylor(at, scale, order)?;
-            for (row, sign) in &source.rows {
-                jet.static_part.value(Some(*row), &forcing, -*sign)?;
-            }
-        }
-        let point = self.point(context)?;
-        let mut budget = 20_000_000;
-        for index in self.circuit.load_order() {
-            let device = point.device(self.circuit, index);
-            if !device.is_nonlinear() {
-                continue;
-            }
-            let mut binding = Binding {
-                coordinates: &coordinates,
-                time: &time,
-                model: context,
-                unknowns: &self.circuit.bindings.unknowns,
-                branch: self.circuit.bindings.branch_rows[index].clone().next(),
-                controls: self.circuit.controls(index)?,
-                budget: &mut budget,
-            };
-            if !crate::devices::behavioural::physical_jet(device, &mut binding, &mut jet)? {
-                return Err(SpiceError::Unsupported {
-                    feature: format!("right-limit physical Taylor stamp for {}", device.name()),
-                    location: None,
-                });
-            }
-        }
-        jet.static_part.values.pop();
-        jet.static_part.jacobians.pop();
-        jet.static_part.finish();
-        jet.charge.finish();
-        Ok(jet)
+        Ok(())
     }
 
     /// Add exact nonlinear device charge and its derivative to a linear
@@ -797,10 +746,45 @@ impl<'a> PreparedRun<'a> {
         &self,
         context: &ModelContext,
         state: &Vector,
+        time: Real,
         charge: &mut Vector,
         jacobian: &mut SparseMatrix,
     ) -> SpiceResult<()> {
-        self.assemble_charge_for(context, state, charge, jacobian, self.circuit.load_order())
+        self.assemble_charge_for(
+            context,
+            state,
+            time,
+            charge,
+            jacobian,
+            self.circuit.load_order(),
+        )
+    }
+
+    pub(crate) fn dae_nonlinear_taylor(
+        &self,
+        model: &ModelContext,
+        state: &[Vector],
+        time: &crate::maths::taylor::Jet,
+        output: &mut crate::devices::physical_dae::PhysicalDaeTaylor,
+    ) -> SpiceResult<()> {
+        let point = self.point(model)?;
+        for index in self.circuit.load_order() {
+            let device = point.device(self.circuit, index);
+            if device.is_nonlinear() {
+                device.assemble_nonlinear_taylor(
+                    &mut crate::devices::physical_dae::TaylorContext {
+                        model,
+                        unknowns: &self.circuit.bindings.unknowns,
+                        branch: self.circuit.bindings.branch_rows[index].clone().next(),
+                        controls: self.circuit.controls(index)?,
+                        state,
+                        time,
+                        output,
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Assemble only selected physical charge equations for a constrained
@@ -810,6 +794,7 @@ impl<'a> PreparedRun<'a> {
         &self,
         context: &ModelContext,
         state: &Vector,
+        time: Real,
         charge: &mut Vector,
         jacobian: &mut SparseMatrix,
         indices: impl Iterator<Item = usize>,
@@ -821,6 +806,7 @@ impl<'a> PreparedRun<'a> {
             branch: None,
             controls: &[],
             state,
+            time,
             charge,
             jacobian,
         };

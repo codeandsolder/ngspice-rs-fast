@@ -17,7 +17,6 @@
 //! boundary has a defined left and right limit instead of a single sampled value.
 
 use crate::devices::{Limit, WaveformEvent, WaveformEventKind};
-use crate::maths::taylor::Taylor;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// The largest cycle index whose start time is still resolvable in `f64`.
@@ -71,6 +70,62 @@ pub(super) fn seek_cycle(first: Real, mut omit: impl FnMut(Real) -> bool) -> Opt
         }
     }
     (low < MAX_CYCLE).then_some(low)
+}
+
+/// Select a periodic segment using the same rounded absolute end times
+/// as its event iterator. Reconstructing a local phase by subtraction
+/// can move an exactly scheduled corner across its own boundary.
+pub(super) fn physical_cycle(
+    time: Real,
+    guess: Real,
+    limit: Limit,
+    end: impl Fn(Real) -> Real,
+) -> Option<Real> {
+    let passed = |cycle| {
+        let edge = end(cycle);
+        edge < time || (limit == Limit::Right && edge <= time)
+    };
+    if !guess.is_finite() || guess >= MAX_CYCLE {
+        return None;
+    }
+    let guess = guess.max(0.);
+    if !passed(guess) && (guess == 0. || passed(guess - 1.)) {
+        return Some(guess);
+    }
+    // Near an ordinary rounding boundary the estimate is off by only
+    // one cycle. Large translations can collapse many cycles; use the
+    // bounded monotone search rather than walking them.
+    if passed(guess) && guess + 1. < MAX_CYCLE && !passed(guess + 1.) {
+        return Some(guess + 1.);
+    }
+    if guess > 0. && !passed(guess - 1.) && (guess <= 1. || passed(guess - 2.)) {
+        return Some(guess - 1.);
+    }
+    seek_cycle(0., passed)
+}
+
+/// Fraction within the selected physical interval. Exact event coordinates
+/// use their stored endpoint values, not a phase reconstructed from delay
+/// subtraction. Interior samples retain the nominal physical duration.
+#[expect(
+    clippy::float_cmp,
+    reason = "exact absolute event coordinates select stored endpoint ordinates"
+)]
+pub(super) fn segment_fraction(
+    time: Real,
+    from: Real,
+    to: Real,
+    phase: Real,
+    start: Real,
+    duration: Real,
+) -> Real {
+    if time == from {
+        0.
+    } else if time == to {
+        1.
+    } else {
+        ((phase - start) / duration).clamp(0., 1.)
+    }
 }
 
 fn invalid(message: impl Into<String>) -> SpiceError {
@@ -372,58 +427,85 @@ impl Pulse {
         })
     }
 
-    /// One-sided analytic segment, including exact cut/period boundaries.
-    pub(super) fn local_taylor(&self, t: Real, scale: Real, order: usize) -> SpiceResult<Taylor> {
-        let mut local = t - self.delay;
-        if !local.is_finite() {
-            return Err(invalid("nonfinite right-limit time"));
+    // Use exactly the same arithmetic as PulseBreakpoints.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "absolute physical corner times follow the event iterator's rounding"
+    )]
+    fn event_time(&self, cycle: Real, offset: Real) -> Real {
+        self.delay + (self.period * cycle + offset)
+    }
+
+    /// Value and scaled slope of the selected physical one-sided segment.
+    pub(super) fn local_affine(
+        &self,
+        t: Real,
+        scale: Real,
+        limit: Limit,
+    ) -> SpiceResult<(Real, Real)> {
+        let elapsed = t - self.delay;
+        if !elapsed.is_finite() {
+            return Err(invalid("nonfinite local Taylor time"));
         }
-        let constant = |value| Taylor::constant(value, order);
-        let right = scale > 0.;
-        let before = |position, edge| position < edge || (!right && position == edge);
-        if before(local, 0.) || self.stop.is_some_and(|stop| !before(local, stop)) {
-            return Ok(constant(self.initial));
+        let left = limit == Limit::Left;
+        if t < self.delay
+            || (left && t <= self.delay)
+            || self.stop.is_some_and(|stop| {
+                let end = self.delay + stop;
+                t > end || (!left && t >= end)
+            })
+        {
+            return Ok((self.initial, 0.));
         }
-        if !before(local, self.period) {
-            let cycle = cycle_position(local, self.period);
-            if !cycle.resolvable() {
-                return Err(invalid("unrepresentable right-limit cycle"));
-            }
-            local = if !right && cycle.phase == 0. {
-                self.period
+        let cycle = physical_cycle(t, (elapsed / self.period).floor(), limit, |index| {
+            self.event_time(index + 1., 0.)
+        })
+        .ok_or_else(|| invalid("unresolvable local Taylor cycle"))?;
+        let phase = (-self.period).mul_add(cycle, elapsed);
+        let edge = |offset: Real| {
+            if offset >= self.period {
+                self.event_time(cycle + 1., 0.)
             } else {
-                cycle.phase
-            };
-        }
-        let plateau_end = self.rise + self.width;
-        if before(local, self.rise) {
-            let base = super::functions::affine_value(self.initial, self.pulsed, local / self.rise);
-            super::functions::affine_taylor(
-                base,
-                self.initial,
-                self.pulsed,
-                self.rise,
-                scale,
-                order,
-            )
-        } else if before(local, plateau_end) {
-            Ok(constant(self.pulsed))
-        } else if before(local, plateau_end + self.fall) {
-            let base = super::functions::affine_value(
-                self.pulsed,
-                self.initial,
-                (local - plateau_end) / self.fall,
-            );
-            super::functions::affine_taylor(
-                base,
-                self.pulsed,
-                self.initial,
-                self.fall,
-                scale,
-                order,
-            )
+                self.event_time(cycle, offset)
+            }
+        };
+        let contains = |start: Real, end: Real| {
+            let (from, to) = (edge(start), edge(end));
+            start < end.min(self.period)
+                && if left {
+                    t > from && t <= to
+                } else {
+                    t >= from && t < to
+                }
+        };
+        let fraction = |start: Real, duration: Real, end: Real| {
+            let clipped = end.min(self.period);
+            segment_fraction(t, edge(start), edge(clipped), phase, start, clipped - start)
+                * ((clipped - start) / duration)
+        };
+        let fall_start = self.rise + self.width;
+        if contains(0., self.rise) {
+            Ok((
+                super::functions::affine_value(
+                    self.initial,
+                    self.pulsed,
+                    fraction(0., self.rise, self.rise),
+                ),
+                super::functions::scaled_difference(self.initial, self.pulsed, scale, self.rise),
+            ))
+        } else if contains(self.rise, fall_start) {
+            Ok((self.pulsed, 0.))
+        } else if contains(fall_start, fall_start + self.fall) {
+            Ok((
+                super::functions::affine_value(
+                    self.pulsed,
+                    self.initial,
+                    fraction(fall_start, self.fall, fall_start + self.fall),
+                ),
+                super::functions::scaled_difference(self.pulsed, self.initial, scale, self.fall),
+            ))
         } else {
-            Ok(constant(self.initial))
+            Ok((self.initial, 0.))
         }
     }
 
@@ -551,7 +633,7 @@ impl PulseBreakpoints {
                     if self.pulse.stop.is_some_and(|stop| local_last > stop) {
                         return false;
                     }
-                    let end = self.pulse.delay + local_last;
+                    let end = self.pulse.event_time(cycle, self.offsets[self.count - 1]);
                     end < self.t0 || self.last.is_some_and(|last| end <= last)
                 }) else {
                     self.done = true;
@@ -561,7 +643,7 @@ impl PulseBreakpoints {
             }
             let cycle_start = self.pulse.period * self.cycle;
             let local = cycle_start + self.offsets[self.index];
-            let t = self.pulse.delay + local;
+            let t = self.pulse.event_time(self.cycle, self.offsets[self.index]);
             let kind = if self.index == 0 {
                 WaveformEventKind::PulsePeriodStart
             } else {

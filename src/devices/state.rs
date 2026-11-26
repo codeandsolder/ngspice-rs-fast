@@ -409,7 +409,6 @@ impl StateHistory {
                 mode,
                 previous: previous.map(|previous| Arc::clone(&previous.values)),
                 nonconvergent: false,
-                physical_rates: false,
                 patches: previous.map_or_default(|previous| previous.patches.clone()),
             };
         };
@@ -427,7 +426,6 @@ impl StateHistory {
         reused.mode = mode;
         reused.previous = previous.map(|previous| Arc::clone(&previous.values));
         reused.nonconvergent = false;
-        reused.physical_rates = false;
         reused.patches = previous.map_or_default(|previous| previous.patches.clone());
         reused
     }
@@ -504,6 +502,21 @@ impl StateHistory {
         Ok(())
     }
 
+    /// Re-anchor integration history at an accepted right-limit event.
+    /// No new physical point or device hook is published. Only the
+    /// pre-event integration stencil is discarded.
+    pub(crate) fn restart_integration(&mut self) -> SpiceResult<()> {
+        let latest = self
+            .accepted
+            .first()
+            .cloned()
+            .ok_or_else(|| state_error("cannot restart empty integration history"))?;
+        self.accepted.clear();
+        self.accepted.resize(ACCEPTED_DEPTH, latest);
+        self.revision = Arc::new(());
+        Ok(())
+    }
+
     /// Begin a new inner DC sweep from the state just accepted.
     pub(crate) fn retain_latest(&mut self) {
         self.accepted.truncate(1);
@@ -513,57 +526,21 @@ impl StateHistory {
         }
     }
 
-    /// Fill a constrained absolute UIC slot in the already loaded trial.
-    pub(crate) fn set_initial_slot(
-        &self,
-        trial: &mut TrialState,
-        slot: usize,
-        value: Real,
-    ) -> SpiceResult<()> {
-        if !trial.initial_conditions() {
-            return Err(state_error("invalid UIC initial-state override"));
-        }
-        self.set_right_initial_slot(trial, slot, value)
-    }
-
-    /// Canonicalize a quantity or rate from a verified right-limit DAE
-    /// solution. The initial trial must still be unpublished.
-    pub(crate) fn set_right_initial_slot(
+    /// Fill a verified absolute slot of a candidate point before acceptance.
+    pub(crate) fn set_candidate_slot(
         &self,
         trial: &mut TrialState,
         slot: usize,
         value: Real,
     ) -> SpiceResult<()> {
         self.check_trial(trial)?;
-        if self.depth() != 0 || !value.is_finite() {
-            return Err(state_error("invalid initial-state override"));
+        if !value.is_finite() {
+            return Err(state_error("invalid candidate-state override"));
         }
         let target = Arc::make_mut(&mut trial.values)
             .get_mut(slot)
             .ok_or_else(|| set_error(slot, value))?;
         *target = value;
-        Ok(())
-    }
-
-    /// Store quantities and exact rates from a verified differentiated
-    /// physical DAE. This changes only the disposable trial, never history.
-    pub(crate) fn set_physical_slots(
-        &self,
-        trial: &mut TrialState,
-        slots: &[(usize, Real)],
-    ) -> SpiceResult<()> {
-        self.check_trial(trial)?;
-        if slots
-            .iter()
-            .any(|&(slot, value)| slot >= self.len || !value.is_finite())
-        {
-            return Err(state_error("invalid physical history slot"));
-        }
-        let values = Arc::make_mut(&mut trial.values);
-        for &(slot, value) in slots {
-            values[slot] = value;
-        }
-        trial.physical_rates = true;
         Ok(())
     }
 
@@ -786,7 +763,6 @@ pub struct TrialState {
     mode: LoadMode,
     previous: Option<Arc<[Real]>>,
     nonconvergent: bool,
-    physical_rates: bool,
     /// `MODEINITTRAN` writes into `CKTstate1` (absolute slot, value), seen by
     /// the later loads of the same solve and applied when the trial is
     /// committed ([`DeviceState::patch_state1`]).
@@ -900,10 +876,6 @@ impl TrialState {
     #[must_use = "the nonconvergence flag determines whether the trial may be accepted"]
     pub const fn is_nonconvergent(&self) -> bool {
         self.nonconvergent
-    }
-
-    pub(super) const fn physical_rates(&self) -> bool {
-        self.physical_rates
     }
 
     /// The trial values; unset slots are NaN.

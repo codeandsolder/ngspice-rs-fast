@@ -40,8 +40,8 @@ use std::sync::Arc;
 use super::xspice::XspicePwl;
 
 mod plan;
-pub(super) use plan::Workspace;
 use plan::{Plan, PlanBuilder, Slot};
+pub(super) use plan::{TaylorEvaluation, Workspace};
 
 /// A circuit quantity an expression reads, in first-use order (C
 /// `mkvnode`/`mkinode` deduplicate them the same way).
@@ -372,32 +372,19 @@ impl Program {
         })
     }
 
-    /// Evaluate the compiled value and Jacobian along a local analytic
-    /// trajectory. The original plan, including lazy branch selection and
-    /// source-specific numerical kernels, remains authoritative.
-    pub(super) fn right_taylor(
+    pub(super) fn evaluate_taylor(
         &self,
-        values: &[crate::maths::taylor::Taylor],
-        time: &crate::maths::taylor::Taylor,
         environment: &Environment<'_>,
-        budget: &mut usize,
-    ) -> SpiceResult<(
-        crate::maths::taylor::Taylor,
-        Vec<crate::maths::taylor::Taylor>,
-    )> {
-        if values.len() != self.quantities.len() {
+        variables: &[crate::maths::taylor::Jet],
+        time: &crate::maths::taylor::Jet,
+    ) -> SpiceResult<TaylorEvaluation> {
+        if variables.len() != self.quantities.len() {
             return Err(SpiceError::circuit(
-                "right-limit expression binding dimension mismatch",
+                "wrong number of behavioural Taylor variables",
             ));
         }
-        self.plan.right_taylor(
-            self.root,
-            &self.derivatives,
-            values,
-            time,
-            environment,
-            budget,
-        )
+        self.plan
+            .evaluate_taylor(self.root, environment, variables, time)
     }
 
     pub(super) fn evaluate_with_workspace<'w>(
@@ -757,32 +744,14 @@ impl PwlTable {
     /// The original C binary search, including extrapolation at both ends.
     /// Preserve its midpoint and strict comparison even for duplicate knots.
     fn segment(&self, arg: Real, order: PwlOrder) -> [(Real, Real); 2] {
-        let (mut lower, mut upper) = (0, self.points.len() - 1);
-        while upper - lower > 1 {
-            let middle = usize::midpoint(lower, upper);
-            if order.is_upper(self.points[middle].0, arg) {
-                upper = middle;
-            } else {
-                lower = middle;
-            }
-        }
-        [self.points[lower], self.points[upper]]
+        self.segment_by(|x| order.is_upper(x, arg))
     }
 
-    #[expect(
-        clippy::float_cmp,
-        reason = "only an exact abscissa tie selects a one-sided segment"
-    )]
-    fn right_segment(&self, arg: Real, direction: Real) -> [(Real, Real); 2] {
+    fn segment_by(&self, mut upper_than_arg: impl FnMut(Real) -> bool) -> [(Real, Real); 2] {
         let (mut lower, mut upper) = (0, self.points.len() - 1);
         while upper - lower > 1 {
             let middle = usize::midpoint(lower, upper);
-            let x = self.points[middle].0;
-            let incoming = match self.order {
-                PwlOrder::Ascending => direction < 0.,
-                PwlOrder::Descending => direction > 0.,
-            };
-            if self.order.is_upper(x, arg) || (x == arg && incoming) {
+            if upper_than_arg(self.points[middle].0) {
                 upper = middle;
             } else {
                 lower = middle;

@@ -169,8 +169,8 @@ uncertainty. Only declared storage-current and derivative-signal
 coordinates can complete the basis as zero gauges. The
 original algebraic equations and actual nonlinear charge values are
 all checked on reload; no constraint is relaxed by dropping it from
-the basis. This does not establish full derivative consistency of a
-general high-index DAE or resolve unrelated floating coordinates.
+the basis. The instantaneous reduction alone does not establish derivative
+consistency of a high-index DAE or resolve unrelated floating coordinates.
 
 The stored input of ddt is not automatically an independent initial
 condition. The rank basis considers its seeded value only after the
@@ -178,10 +178,60 @@ algebraic equations and mandatory physical storage constraints. If those
 already determine the input, the history is initialized at the actual
 consistent input rather than an arbitrary zero seed. If the derivative
 defines an independent state (for example v=1-tau*ddt(v)), its seed is
-retained, including a supplied .ic. Undetermined derivative outputs use
-a zero prehistory convention; this is not a general high-index
-right-tangent initialization algorithm. In particular, cascaded
-derivatives across startup discontinuities require additional treatment.
+retained, including a supplied .ic. For circuits with analytic physical Taylor kernels, the derivative-array
+solver now determines consistent right-limit values and rates instead of
+assigning zero to undetermined derivative outputs.
+
+### Physical derivative arrays
+
+Use local coefficients X[k] = h^k x^(k)/k!, where h is a positive time
+normalization scale. Each degree k of the original physical equations
+contributes F[k] + (k+1) Q[k+1]/h = 0. Conductance and storage Jacobian
+coefficients act by convolution on the corresponding perturbations of
+X. Independent sources supply analytic one-sided waveform coefficients;
+behavioural expressions propagate local coefficients through the compiled
+instruction DAG. Reverse differentiation of the active value graph
+provides the Jacobian of the same branch, including clipped exponential
+and regularized division kernels. No finite differences or artificial
+derivative prehistory are used to construct the array.
+
+Sparse elimination projects out the free higher coefficients before
+selecting the necessary state and first-rate coordinates. Mandatory
+physical storage constraints precede optional derived inputs.
+Rank and residuals are rechecked at the nonlinear solution; the retained
+order hint is only a performance optimization. Intermediate pivot products
+and coefficient-local uncertainty use extended binary exponents so that
+changing the time normalization does not itself erase independent
+constraints through underflow. The array has explicit order, variable and
+stamp budgets.
+
+During a smooth transient step, the physical array is completed with
+independent companion constraints, in physical-before-derived order.
+Redundant numerical derivative constraints are not imposed: they would
+differentiate the integration error of an already determined quantity.
+Accepted history stores the independently evaluated storage rates.
+Mandatory initial conditions are checked in the units of the stored
+quantity (including differential voltage, not common-mode voltage);
+only numerical companion residuals receive an arithmetic backward-error
+floor.
+
+At an independent-source breakpoint the solver integrates to the left
+limit and solves the right limit while preserving physical storage.
+Derivative input discontinuities that require impulses are rejected
+rather than approximated by large finite rates. A successful event
+starts fresh integration history on the right; the final endpoint retains
+its left limit. Non-UIC initialization also checks continuity from the
+DC prehistory. UIC does not invent a prehistory before the requested
+initial time.
+
+The high-order path currently covers linear memoryless and rational
+models and analytic behavioural constitutive kernels. Other nonlinear
+device families continue to use their existing ordinary solver.
+Independent source waveform boundaries are scheduled explicitly;
+arbitrary state-dependent behavioural branch changes do not yet have
+a general event localization mechanism. The derivative-order bound
+and the projected rank tests are not a proof of solvability for every
+singular or nonanalytic nonlinear DAE.
 
 Nonlinear C/L `ic=` is intentionally retained under UIC, rather than
 discarded by the frontend as observed in ngspice 47 (instance and node

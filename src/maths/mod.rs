@@ -31,7 +31,6 @@ pub use linear::{
 pub mod pencil;
 pub mod sparse;
 pub(crate) mod sparse13;
-pub(crate) mod taylor;
 mod telemetry;
 pub use telemetry::{FactorStorage, FactorWork, PatternTelemetry, PatternWork};
 
@@ -54,3 +53,4 @@ pub const C_REFERENCE_SPARSE: &str = "src/maths/sparse/ (SPARSE 1.3), src/maths/
 pub const C_REFERENCE_INTEGRATION: &str = "src/maths/ni/niinteg.c, src/maths/ni/nicomcof.c";
 
 pub mod polynomial;
+pub mod taylor;

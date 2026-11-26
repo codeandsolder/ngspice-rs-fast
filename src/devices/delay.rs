@@ -410,7 +410,7 @@ impl<'a, const N: usize> DelaySamples<'a, N> {
             (Some(seam), remaining)
         };
         let (second_rows, remainder) = second.as_chunks::<N>();
-        debug_assert!(remainder.is_empty());
+        debug_assert_eq!(remainder, []);
         first_rows
             .iter()
             .copied()

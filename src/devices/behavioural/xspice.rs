@@ -24,20 +24,6 @@ pub struct XspicePwl {
     midpoints: Vec<Real>,
 }
 
-#[derive(Clone, Copy)]
-enum Region {
-    Segment {
-        lower: usize,
-        at: usize,
-    },
-    Corner {
-        index: usize,
-        domain: Real,
-        lower_slope: Real,
-        upper_slope: Real,
-    },
-}
-
 impl XspicePwl {
     /// Builds the map from `(x, y)` points and the smoothing `fraction`.
     ///
@@ -87,96 +73,45 @@ impl XspicePwl {
     /// The output and its derivative with respect to the input.
     #[must_use = "the returned pair supplies the transfer value and its exact input derivative"]
     pub fn evaluate(&self, input: Real) -> (Real, Real) {
-        self.evaluate_region(input, self.region(input, 0.))
+        let (value, slope, _) =
+            self.local_polynomial(input, |boundary| input.partial_cmp(&boundary));
+        (value, slope)
     }
 
-    #[expect(
-        clippy::float_cmp,
-        reason = "the analytic side is selected only at an exact boundary"
-    )]
-    fn region(&self, input: Real, direction: Real) -> Region {
-        let size = self.x.len();
-        let less = |boundary| input < boundary || (input == boundary && direction < 0.);
-        let greater = |boundary| input > boundary || (input == boundary && direction > 0.);
-        // Preserve the native end-test priority and equal-midpoint choices.
-        if less(self.midpoints[0]) || (input == self.midpoints[0] && direction == 0.) {
-            return Region::Segment { lower: 0, at: 0 };
-        }
-        if greater(self.midpoints[size - 2])
-            || (input == self.midpoints[size - 2] && direction == 0.)
-        {
-            return Region::Segment {
-                lower: size - 2,
-                at: size - 1,
-            };
-        }
-        let i = 1 + self.midpoints[1..size - 2].partition_point(|&midpoint| {
-            greater(midpoint) || (input == midpoint && direction == 0.)
-        });
-        let lower = self.x[i] - self.x[i - 1];
-        let upper = self.x[i + 1] - self.x[i];
-        let domain = self.fraction * lower.min(upper);
-        if less(self.x[i] - domain) {
-            Region::Segment {
-                lower: i - 1,
-                at: i,
-            }
-        } else if less(self.x[i] + domain) {
-            Region::Corner {
-                index: i,
-                domain,
-                lower_slope: (self.y[i] - self.y[i - 1]) / lower,
-                upper_slope: (self.y[i + 1] - self.y[i]) / upper,
-            }
-        } else {
-            Region::Segment { lower: i, at: i }
-        }
-    }
-
-    fn evaluate_region(&self, input: Real, region: Region) -> (Real, Real) {
-        match region {
-            Region::Segment { lower, at } => self.segment(input, lower, at),
-            Region::Corner {
-                index,
-                domain,
-                lower_slope,
-                upper_slope,
-            } => smooth_corner(
-                input,
-                self.x[index],
-                self.y[index],
-                domain,
-                lower_slope,
-                upper_slope,
-            ),
-        }
-    }
-
-    pub(super) fn right_taylor(
+    /// Value, first derivative and quadratic coefficient of the selected
+    /// local polynomial, evaluated at the original (not perturbed) input.
+    pub(super) fn local_polynomial(
         &self,
-        input: &crate::maths::taylor::Taylor,
-    ) -> SpiceResult<(crate::maths::taylor::Taylor, crate::maths::taylor::Taylor)> {
-        use crate::maths::taylor::Taylor;
-        let region = self.region(input.base(), input.direction());
-        let (value, slope) = self.evaluate_region(input.base(), region);
-        let curvature = match region {
-            Region::Segment { .. } => 0.,
-            Region::Corner {
-                domain,
-                lower_slope,
-                upper_slope,
-                ..
-            } => (upper_slope - lower_slope) / (2. * domain),
+        input: Real,
+        compare: impl Fn(Real) -> Option<std::cmp::Ordering>,
+    ) -> (Real, Real, Real) {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let size = self.x.len();
+        let affine = |lower, at| {
+            let (value, slope) = self.segment(input, lower, at);
+            (value, slope, 0.)
         };
-        let delta = input.clone().with_base(0.)?;
-        let output = delta
-            .scale(slope)?
-            .add(&delta.mul(&delta)?.scale(curvature * 0.5)?)?
-            .with_base(value)?;
-        let slope = delta
-            .scale(curvature)?
-            .add(&Taylor::constant(slope, input.order()))?;
-        Ok((output, slope))
+        if matches!(compare(self.midpoints[0]), Some(Less | Equal)) {
+            return affine(0, 0);
+        }
+        if matches!(compare(self.midpoints[size - 2]), Some(Greater | Equal)) {
+            return affine(size - 2, size - 1);
+        }
+        let i = 1 + self.midpoints[1..size - 2]
+            .partition_point(|&midpoint| matches!(compare(midpoint), Some(Greater | Equal)));
+        let (x, y) = (&self.x, &self.y);
+        let lower = x[i] - x[i - 1];
+        let upper = x[i + 1] - x[i];
+        let domain = self.fraction * lower.min(upper);
+        if compare(x[i] - domain) == Some(Less) {
+            return affine(i - 1, i);
+        }
+        if compare(x[i] + domain) == Some(Less) {
+            let lower_slope = (y[i] - y[i - 1]) / lower;
+            let upper_slope = (y[i + 1] - y[i]) / upper;
+            return smooth_corner(input, x[i], y[i], domain, lower_slope, upper_slope);
+        }
+        affine(i, i)
     }
 
     fn segment(&self, input: Real, lower: usize, at: usize) -> (Real, Real) {
@@ -184,6 +119,25 @@ impl XspicePwl {
         let slope = (y[lower + 1] - y[lower]) / (x[lower + 1] - x[lower]);
         let offset = (input - x[at]) * slope;
         (y[at] + offset, slope)
+    }
+
+    #[cfg(test)]
+    fn corner(&self, input: Real, i: usize) -> (Real, Real) {
+        let (x, y) = (&self.x, &self.y);
+        let lower = x[i] - x[i - 1];
+        let upper = x[i + 1] - x[i];
+        let domain = self.fraction * lower.min(upper);
+        if input < x[i] - domain {
+            return self.segment(input, i - 1, i);
+        }
+        if input < x[i] + domain {
+            let lower_slope = (y[i] - y[i - 1]) / lower;
+            let upper_slope = (y[i + 1] - y[i]) / upper;
+            let (value, slope, _) =
+                smooth_corner(input, x[i], y[i], domain, lower_slope, upper_slope);
+            return (value, slope);
+        }
+        self.segment(input, i, i)
     }
 }
 
@@ -209,7 +163,7 @@ fn smooth_corner(
     domain: Real,
     lower_slope: Real,
     upper_slope: Real,
-) -> (Real, Real) {
+) -> (Real, Real, Real) {
     let x_upper = centre + domain;
     let upper_rise = upper_slope * domain;
     let y_upper = value + upper_rise;
@@ -222,7 +176,7 @@ fn smooth_corner(
     let quadratic = a * input * input;
     let linear = b * input;
     let derivative = 2. * a * input;
-    (quadratic + linear + c, derivative + b)
+    (quadratic + linear + c, derivative + b, a)
 }
 
 fn invalid(message: &str) -> SpiceError {
@@ -234,7 +188,7 @@ fn invalid(message: &str) -> SpiceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{XspicePwl, reference_midpoint, smooth_corner};
+    use super::{XspicePwl, reference_midpoint};
 
     #[test]
     fn table_is_flat_outside_and_smooth_at_corners() {
@@ -296,23 +250,7 @@ mod tests {
             if input >= midpoint(i) {
                 continue;
             }
-            let left = map.x[i] - map.x[i - 1];
-            let right = map.x[i + 1] - map.x[i];
-            let domain = map.fraction * left.min(right);
-            return if input < map.x[i] - domain {
-                map.segment(input, i - 1, i)
-            } else if input < map.x[i] + domain {
-                smooth_corner(
-                    input,
-                    map.x[i],
-                    map.y[i],
-                    domain,
-                    (map.y[i] - map.y[i - 1]) / left,
-                    (map.y[i + 1] - map.y[i]) / right,
-                )
-            } else {
-                map.segment(input, i, i)
-            };
+            return map.corner(input, i);
         }
         map.segment(input, size - 2, size - 1)
     }
