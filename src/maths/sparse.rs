@@ -736,7 +736,7 @@ pub struct SparseMatrix {
     dynamic_owner: u64,
     // Optional ledger retains contributions before binary64 assembly.
     original: Option<Vec<Triplet>>,
-    peak_stamp: Real,
+    peak_stamp: super::StampPeak,
 }
 
 impl PartialEq for SparseMatrix {
@@ -800,7 +800,7 @@ impl SparseMatrix {
             names: None,
             dynamic_owner: 0,
             original: None,
-            peak_stamp: 0.,
+            peak_stamp: super::StampPeak::DISABLED,
         }
     }
 
@@ -852,7 +852,7 @@ impl SparseMatrix {
             names: None,
             dynamic_owner: 0,
             original: None,
-            peak_stamp: 0.,
+            peak_stamp: super::StampPeak::DISABLED,
         })
     }
 
@@ -987,15 +987,14 @@ impl SparseMatrix {
         let mut mask = batch.mask;
         debug_assert_eq!(traced.len(), mask.count_ones() as usize);
         bound.view.take();
+        self.peak_stamp.observe_batch(values);
         if traced.len() == N {
             for (&(_, _, id), &value) in traced.iter().zip(values) {
-                self.peak_stamp = self.peak_stamp.max(value.abs());
                 bound.values[id as usize] += value;
             }
         } else {
             for &(_, _, id) in traced {
                 let k = mask.trailing_zeros() as usize;
-                self.peak_stamp = self.peak_stamp.max(values[k].abs());
                 bound.values[id as usize] += values[k];
                 mask &= mask - 1;
             }
@@ -1074,7 +1073,7 @@ impl SparseMatrix {
                 .ok_or_else(|| pattern_error("element handle outside bound pattern"))?;
             Self::retain_stamp(original, row, col, value)?;
         }
-        self.peak_stamp = self.peak_stamp.max(value.abs());
+        self.peak_stamp.observe(value);
         *slot += value;
         bound.view.take();
         Ok(())
@@ -1142,7 +1141,7 @@ impl SparseMatrix {
             if let Some(original) = &mut self.original {
                 Self::retain_stamp(original, row, col, value)?;
             }
-            self.peak_stamp = self.peak_stamp.max(value.abs());
+            self.peak_stamp.observe(value);
             bound.values[id.index()] = value;
             return Ok(());
         }
@@ -1212,13 +1211,11 @@ impl SparseMatrix {
     pub fn add(&mut self, row: usize, col: usize, value: Real) -> SpiceResult<()> {
         // The common case: the device's next traced stamp, which lies in the
         // pattern and hence in range.
-        if let Some(bound) = &mut self.bound
+        if self.original.is_none()
+            && let Some(bound) = &mut self.bound
             && let Some(id) = bound.replay(row, col)
         {
-            if let Some(original) = &mut self.original {
-                Self::retain_stamp(original, row, col, value)?;
-            }
-            self.peak_stamp = self.peak_stamp.max(value.abs());
+            self.peak_stamp.observe(value);
             bound.view.take();
             bound.values[id.index()] += value;
             return Ok(());
@@ -1242,7 +1239,7 @@ impl SparseMatrix {
         if let Some(original) = &mut self.original {
             Self::retain_stamp(original, row, col, value)?;
         }
-        self.peak_stamp = self.peak_stamp.max(value.abs());
+        self.peak_stamp.observe(value);
         if let Some(bound) = &mut self.bound {
             bound.view.take();
             if let Some(id) = bound.element(row, col)? {
@@ -1300,7 +1297,7 @@ impl SparseMatrix {
     pub fn clear(&mut self) {
         self.dynamic_owner = 0;
         self.triplets.clear();
-        self.peak_stamp = 0.;
+        self.peak_stamp = super::StampPeak::DISABLED;
         if let Some(original) = &mut self.original {
             original.clear();
         }
@@ -1312,6 +1309,8 @@ impl SparseMatrix {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn retain_stamp(
         original: &mut Vec<Triplet>,
         row: usize,
@@ -1328,6 +1327,7 @@ impl SparseMatrix {
     }
 
     pub(crate) fn record_original(&mut self, enabled: bool) {
+        self.peak_stamp = super::StampPeak::EMPTY;
         if enabled {
             self.original.get_or_insert_with(Vec::new).clear();
         } else {
@@ -1336,8 +1336,8 @@ impl SparseMatrix {
     }
 
     /// Cheap, conservative bound on the scale of the original products.
-    pub(crate) const fn peak_stamp(&self) -> Real {
-        self.peak_stamp
+    pub(crate) fn peak_stamp(&self) -> Real {
+        self.peak_stamp.value()
     }
 
     /// Compute b - A*x from individual original stamps. Sorting by equation

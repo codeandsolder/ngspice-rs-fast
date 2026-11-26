@@ -566,7 +566,7 @@ pub struct Vector {
     data: Vec<Real>,
     // Optional exact-RHS contribution ledger for a correction-coordinate load.
     original: Option<Vec<(usize, Real)>>,
-    peak_stamp: Real,
+    peak_stamp: super::StampPeak,
 }
 
 impl PartialEq for Vector {
@@ -580,7 +580,7 @@ impl From<Vec<Real>> for Vector {
         Self {
             data,
             original: None,
-            peak_stamp: 0.,
+            peak_stamp: super::StampPeak::DISABLED,
         }
     }
 }
@@ -592,7 +592,7 @@ impl Vector {
         Self {
             data: vec![0.0; len],
             original: None,
-            peak_stamp: 0.,
+            peak_stamp: super::StampPeak::DISABLED,
         }
     }
 
@@ -602,7 +602,7 @@ impl Vector {
         Self {
             data: values.to_vec(),
             original: None,
-            peak_stamp: 0.,
+            peak_stamp: super::StampPeak::DISABLED,
         }
     }
 
@@ -636,7 +636,7 @@ impl Vector {
                     original.retain(|&(row, _)| row != index);
                     Self::record(original, index, value)?;
                 }
-                self.peak_stamp = self.peak_stamp.max(value.abs());
+                self.peak_stamp.observe(value);
                 *slot = value;
                 Ok(())
             }
@@ -662,7 +662,7 @@ impl Vector {
                 if let Some(original) = &mut self.original {
                     Self::record(original, index, value)?;
                 }
-                self.peak_stamp = self.peak_stamp.max(value.abs());
+                self.peak_stamp.observe(value);
                 *slot += value;
                 Ok(())
             }
@@ -686,12 +686,14 @@ impl Vector {
     /// Sets every element to zero.
     pub fn clear(&mut self) {
         self.data.fill(0.0);
-        self.peak_stamp = 0.;
+        self.peak_stamp = super::StampPeak::DISABLED;
         if let Some(original) = &mut self.original {
             original.clear();
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn record(original: &mut Vec<(usize, Real)>, index: usize, value: Real) -> SpiceResult<()> {
         if value != 0. {
             original
@@ -705,8 +707,9 @@ impl Vector {
         Ok(())
     }
 
-    /// Enable original contribution recording for the next empty load.
+    /// Track the next empty Newton load, optionally retaining contributions.
     pub(crate) fn record_original(&mut self, enabled: bool) {
+        self.peak_stamp = super::StampPeak::EMPTY;
         if enabled {
             self.original.get_or_insert_with(Vec::new).clear();
         } else {
@@ -714,8 +717,8 @@ impl Vector {
         }
     }
 
-    pub(crate) const fn peak_stamp(&self) -> Real {
-        self.peak_stamp
+    pub(crate) fn peak_stamp(&self) -> Real {
+        self.peak_stamp.value()
     }
 
     pub(crate) fn original_by_row(&mut self) -> Option<&[(usize, Real)]> {

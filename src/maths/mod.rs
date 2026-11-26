@@ -54,3 +54,44 @@ pub const C_REFERENCE_INTEGRATION: &str = "src/maths/ni/niinteg.c, src/maths/ni/
 
 pub mod polynomial;
 pub mod taylor;
+
+/// Nonnegative binary64 encodings preserve magnitude order. Keep the peak
+/// as an integer so hot stamp accumulation does not serialize FP additions
+/// with a floating-point max. The sentinel disables observation outside NI.
+#[derive(Debug, Clone, Copy)]
+struct StampPeak(u64);
+
+impl StampPeak {
+    const DISABLED: Self = Self(u64::MAX);
+    const EMPTY: Self = Self(0);
+
+    const fn enabled(self) -> bool {
+        self.0 != u64::MAX
+    }
+
+    #[inline]
+    fn observe(&mut self, value: f64) {
+        let magnitude = value.to_bits() & i64::MAX.cast_unsigned();
+        if magnitude > self.0 {
+            self.0 = magnitude;
+        }
+    }
+
+    fn observe_batch(&mut self, values: &[f64]) {
+        if self.enabled() {
+            // Including ground entries which the verified trace omits is
+            // conservative. Do the reduction once, outside the stamp loop.
+            for &value in values {
+                self.observe(value);
+            }
+        }
+    }
+
+    fn value(self) -> f64 {
+        if self.enabled() {
+            f64::from_bits(self.0.min(f64::INFINITY.to_bits()))
+        } else {
+            0.
+        }
+    }
+}
