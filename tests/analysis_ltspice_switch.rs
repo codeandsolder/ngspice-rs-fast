@@ -1,5 +1,5 @@
 //! Independently measured transfer and analytic residual/Jacobian tests for
-//! explicitly selected LTspice switches. Ordinary ngspice SW is not changed.
+//! explicitly selected `LTspice` switches. Ordinary ngspice SW is not changed.
 
 use std::path::Path;
 
@@ -384,7 +384,7 @@ fn series_inductance_uses_transient_flux_but_is_shorted_by_reference_ac() -> Tes
     Ok(())
 }
 
-/// Source LTspice 24.0.12 AC measurements. Independent terminal-voltage
+/// Source `LTspice` 24.0.12 AC measurements. Independent terminal-voltage
 /// excitation and control-voltage excitation distinguish chord loads,
 /// differential loads, and the high-a epsilon approximation.
 #[test]

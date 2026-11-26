@@ -64,7 +64,7 @@ pub enum ModelFamily {
     Pmos,
     /// Voltage-controlled switch (`sw`, `sw/sw.c`).
     Switch,
-    /// Explicit prepared LTspice voltage-controlled switch.
+    /// Explicit prepared `LTspice` voltage-controlled switch.
     LtspiceSwitch,
     /// Current-controlled switch (`csw`, `csw/csw.c`).
     CurrentSwitch,
@@ -191,7 +191,7 @@ pub enum ModelBackend {
     Hfet2,
     /// Voltage-controlled switch.
     Switch,
-    /// Explicit prepared LTspice voltage-controlled switch.
+    /// Explicit prepared `LTspice` voltage-controlled switch.
     LtspiceSwitch,
     /// Current-controlled switch.
     CurrentSwitch,
@@ -1167,7 +1167,12 @@ const fn mos_level_reference(selector: u8) -> &'static str {
     }
 }
 
-fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> {
+struct LevelSetters<'a> {
+    first: Option<(Real, u8, &'a SourceLoc)>,
+    last: Option<u8>,
+}
+
+fn level_setters(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSetters<'_>> {
     let mut first = None;
     let mut last = None;
     for p in &card.parameters {
@@ -1192,6 +1197,11 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
             last = Some(integer);
         }
     }
+    Ok(LevelSetters { first, last })
+}
+
+fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> {
+    let LevelSetters { first, last } = level_setters(card, family)?;
     let raw = first.map(|(raw, _, _)| raw);
     if card.level != raw {
         return Err(SpiceError::parse(

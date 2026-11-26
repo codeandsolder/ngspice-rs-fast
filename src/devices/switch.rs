@@ -74,7 +74,9 @@ use crate::netlist::ast::{DeviceInstance, ParameterKind};
 use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
 
 use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseFamily, NoiseKind, NoiseSource};
-use crate::devices::schema::{ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit};
+use crate::devices::schema::{
+    ScalarDomain, ScalarParameter, ScalarSchema, ScalarUnit, ScalarValues,
+};
 use crate::devices::state::IterationPhase;
 use crate::devices::traits::{ControlReference, Device, StampContext, TruncationContext};
 use crate::devices::{LinearContext, ModelContext, ModelFamily, ResolvedModel};
@@ -304,11 +306,11 @@ fn schema(kind: SwitchKind, ltspice: bool) -> &'static ScalarSchema<'static> {
         },
     ];
     static LTSPICE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(LTSPICE);
+    static SW_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(SW);
+    static CSW_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(CSW);
     if ltspice {
         return &LTSPICE_SCHEMA;
     }
-    static SW_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(SW);
-    static CSW_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(CSW);
     match kind {
         SwitchKind::Voltage => &SW_SCHEMA,
         SwitchKind::Current => &CSW_SCHEMA,
@@ -337,6 +339,57 @@ pub struct Switch {
 const STATE: usize = 0;
 /// State slot of the control value.
 const CONTROL: usize = 1;
+
+fn resolve_ltspice_law(
+    model: &ResolvedModel<'_>,
+    values: &ScalarValues,
+    hysteresis: Real,
+    oneway: bool,
+) -> SpiceResult<ltspice::Law> {
+    let card = model.card();
+    let get = |name: &str| values.get(name).map(|value| value.value);
+    let level = model.levels().selector;
+    if level == 2 && get("lser").unwrap_or(0.) != 0. {
+        return Err(SpiceError::Unsupported {
+            feature: "LTspice level-2 switch does not support Lser".into(),
+            location: Some(card.location.clone()),
+        });
+    }
+    let offset = get("vser").unwrap_or(0.);
+    let epsilon = get("epsilon").unwrap_or(0.);
+    let direction = if level == 2 {
+        let epsilon = epsilon.max(0.);
+        if oneway || offset > 0. || epsilon > 0. {
+            ltspice::Direction::OneWay { offset, epsilon }
+        } else {
+            ltspice::Direction::Bidirectional
+        }
+    } else {
+        if oneway || epsilon != 0. {
+            return Err(SpiceError::Unsupported {
+                feature: "LTspice level-1 switch does not support oneway or epsilon".into(),
+                location: Some(card.location.clone()),
+            });
+        }
+        if offset == 0. {
+            ltspice::Direction::Bidirectional
+        } else {
+            ltspice::Direction::Offset(offset)
+        }
+    };
+    if level == 2 && hysteresis == 0. {
+        return Err(SpiceError::Unsupported {
+            feature: "LTspice level-2 switch with zero transition width".into(),
+            location: Some(card.location.clone()),
+        });
+    }
+    Ok(ltspice::Law::new(
+        level,
+        hysteresis,
+        get("ilimit"),
+        direction,
+    ))
+}
 
 /// Read the model setters and preserve the written values for sensitivity.
 fn resolve_switch_model(
@@ -406,51 +459,9 @@ fn resolve_switch_model(
         off: written_value("roff"),
     };
     let hysteresis = get(hysteresis).unwrap_or(0.);
-    let ltspice = if is_ltspice {
-        let level = model.levels().selector;
-        if level == 2 && get("lser").unwrap_or(0.) != 0. {
-            return Err(SpiceError::Unsupported {
-                feature: "LTspice level-2 switch does not support Lser".into(),
-                location: Some(card.location.clone()),
-            });
-        }
-        let offset = get("vser").unwrap_or(0.);
-        let epsilon = get("epsilon").unwrap_or(0.);
-        let direction = if level == 2 {
-            let epsilon = epsilon.max(0.);
-            if oneway || offset > 0. || epsilon > 0. {
-                ltspice::Direction::OneWay { offset, epsilon }
-            } else {
-                ltspice::Direction::Bidirectional
-            }
-        } else {
-            if oneway || epsilon != 0. {
-                return Err(SpiceError::Unsupported {
-                    feature: "LTspice level-1 switch does not support oneway or epsilon".into(),
-                    location: Some(card.location.clone()),
-                });
-            }
-            if offset == 0. {
-                ltspice::Direction::Bidirectional
-            } else {
-                ltspice::Direction::Offset(offset)
-            }
-        };
-        if level == 2 && hysteresis == 0. {
-            return Err(SpiceError::Unsupported {
-                feature: "LTspice level-2 switch with zero transition width".into(),
-                location: Some(card.location.clone()),
-            });
-        }
-        Some(ltspice::Law::new(
-            level,
-            hysteresis,
-            get("ilimit"),
-            direction,
-        ))
-    } else {
-        None
-    };
+    let ltspice = is_ltspice
+        .then(|| resolve_ltspice_law(model, &values, hysteresis, oneway))
+        .transpose()?;
     let parameters = SwitchModel {
         threshold: get(threshold).unwrap_or(0.),
         hysteresis,
@@ -1045,11 +1056,7 @@ impl Device for Switch {
             if let Some(series) = self.series() {
                 series.stamp_inductor(context)?;
             }
-            let closed = if law.discrete() {
-                self.load_state(context, control)?.is_closed()
-            } else {
-                false
-            };
+            let closed = law.discrete() && self.load_state(context, control)?.is_closed();
             let [p, n] = self.conducting_terminals();
             let voltage = context.node_voltage(p) - context.node_voltage(n);
             let point = self.ltspice_point(law, voltage, control, closed, context.gmin)?;

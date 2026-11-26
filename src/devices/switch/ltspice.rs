@@ -1,9 +1,9 @@
-//! Explicit LTspice voltage-controlled switch laws.
+//! Explicit `LTspice` voltage-controlled switch laws.
 //!
 //! The source-defined control transfer is separate from ngspice's discrete
 //! SW/CSW state machine. This module contains only memoryless branch physics;
 //! the outer switch owns any discrete state and sparse row binding.
-//! Reference: LTspice help, S. Voltage Controlled Switch.
+//! Reference: `LTspice` help, S. Voltage Controlled Switch.
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -145,7 +145,7 @@ impl Law {
                     (normalized_width / denom) / scale
                 };
                 (
-                    (span / std::f64::consts::PI).mul_add(angle, 0.5 * (low + high)),
+                    (span / std::f64::consts::PI).mul_add(angle, Real::midpoint(low, high)),
                     (span / std::f64::consts::PI) * slope,
                 )
             }
@@ -250,7 +250,7 @@ fn epsilon_join(a: Real) -> (Real, Real, Real) {
     for _ in 0..10 {
         let doubled = 2. * join;
         let tail = (-doubled).exp();
-        let sech = 2. * tail / (1. + tail * tail);
+        let sech = 2. * tail / tail.mul_add(tail, 1.);
         let tanh = doubled.tanh();
         let scaled = a * sech;
         derivative = (tanh * (tanh - scaled)).mul_add(derivative, 0.5 * scaled);
@@ -259,13 +259,13 @@ fn epsilon_join(a: Real) -> (Real, Real, Real) {
     // The reference AC law differentiates the implicit root equation at
     // the final approximate join, not the ten actual iterations.
     let tail = (-2. * join).exp();
-    let implicit = a * tail / (1. + tail * tail);
+    let implicit = a * tail / tail.mul_add(tail, 1.);
     (join, derivative, implicit)
 }
 
 /// The one-way branch conducts from the second terminal to the first.
 /// At epsilon, a quadratic joins the shifted tanh with equal value and
-/// slope in the converged limit. LTspice 24.0.12 uses ten Newton steps
+/// slope in the converged limit. `LTspice` 24.0.12 uses ten Newton steps
 /// from a/2, not the exact asinh(a)/2 root; its high-a transfer differs
 /// substantially. Propagate the derivative of those same iterations.
 fn directional_current(
@@ -348,8 +348,9 @@ mod tests {
         {
             let values: Vec<Real> = line
                 .split_whitespace()
-                .map(|v| v.parse().expect("numeric fixture"))
-                .collect();
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .map_err(|_| SpiceError::circuit("invalid numeric fixture"))?;
             assert_eq!(values.len(), laws.len() + 2);
             let bias = Bias {
                 voltage: values[0],
@@ -444,8 +445,9 @@ mod tests {
         for line in data.lines().filter(|line| !line.starts_with('#')) {
             let values: Vec<Real> = line
                 .split_whitespace()
-                .map(|v| v.parse().expect("numeric fixture"))
-                .collect();
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .map_err(|_| SpiceError::circuit("invalid numeric fixture"))?;
             assert_eq!(values.len(), 5);
             let p = Conductance {
                 on: values[0],
