@@ -836,11 +836,14 @@ impl NodeForcing {
             // diagonal for an `.ic`: the same value).
             let currents = a.zero_row(row, |col| branch.get(col).copied().unwrap_or(false));
             a.set(row, row, if currents { 1e10 } else { 1. })?;
-            b.as_mut_slice()[row] = if currents {
-                1e10 * value * scale
-            } else {
-                value * scale
-            };
+            b.set(
+                row,
+                if currents {
+                    1e10 * value * scale
+                } else {
+                    value * scale
+                },
+            )?;
         }
         Ok(())
     }
