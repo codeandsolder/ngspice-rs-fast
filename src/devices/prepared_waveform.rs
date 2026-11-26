@@ -197,7 +197,7 @@ impl SidedPwl {
         })
     }
 
-    fn cycle_start(r: Repeat, cycle: Real) -> Real {
+    const fn cycle_start(r: Repeat, cycle: Real) -> Real {
         cycle.mul_add(r.period, r.origin)
     }
 

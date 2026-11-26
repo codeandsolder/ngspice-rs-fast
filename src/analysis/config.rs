@@ -1207,8 +1207,8 @@ impl RunConfig {
         Circuit::from_prepared_netlist_with_limits(
             netlist,
             &self.context.model_context(),
-            Default::default(),
-            Default::default(),
+            crate::devices::MutualLimits::default(),
+            crate::devices::ElaborationLimits::default(),
             self.params.clone(),
             waveforms,
         )

@@ -299,7 +299,7 @@ enum Eligibility {
 
 fn eligibility(waveform: &Waveform) -> Eligibility {
     match waveform {
-        Waveform::Constant(_) | Waveform::Function(_) => Eligibility::Inert,
+        Waveform::Constant(_) | Waveform::Function(_) | Waveform::Prepared(_) => Eligibility::Inert,
         Waveform::PortSeries { baseline, .. } => eligibility(baseline),
         Waveform::Pulse(_) => Eligibility::AtBreakOnly,
         Waveform::Pwl(_)
@@ -307,7 +307,6 @@ fn eligibility(waveform: &Waveform) -> Eligibility {
         | Waveform::PulseDefaults(_)
         | Waveform::FunctionDefaults(_)
         | Waveform::Stochastic(_) => Eligibility::EveryAccept,
-        Waveform::Prepared(_) => Eligibility::Inert,
     }
 }
 
@@ -480,7 +479,7 @@ impl Request<'_> {
         table: &mut BreakTable,
     ) -> SpiceResult<()> {
         match waveform {
-            Waveform::Constant(_) | Waveform::Function(_) => Ok(()),
+            Waveform::Constant(_) | Waveform::Function(_) | Waveform::Prepared(_) => Ok(()),
             Waveform::PortSeries { baseline, .. } => self.waveform(baseline, break_time, table),
             Waveform::Pulse(pulse) => match self.kind {
                 SourceKind::Voltage => self.vsrc_pulse(pulse, break_time, table),
@@ -490,7 +489,6 @@ impl Request<'_> {
                 self.pwl(pwl.knots(), pwl.delay(), pwl.repeat(), break_time, table)
             }
             Waveform::Step { time, .. } => self.pwl(&[(*time, 0.)], 0., None, break_time, table),
-            Waveform::Prepared(_) => Ok(()),
             Waveform::Stochastic(process) => {
                 let mut events = process.events(self.now, table.final_time)?;
                 while let Some(event) = events.next_event() {

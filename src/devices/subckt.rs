@@ -883,30 +883,42 @@ impl<'a> Expander<'a> {
                 }
             }
             instance.name = device_name(&instance.name, instance.designator, path);
-            if let Some(declaration) = self.waveforms.get(original, directives.definition) {
-                let resolved = declaration
-                    .resolve(|text| {
-                        let text = text.trim();
-                        let expression = crate::netlist::parser::parse_parameter_expression(
-                            text.strip_prefix('{')
-                                .and_then(|text| text.strip_suffix('}'))
-                                .unwrap_or(text),
-                            &original.location,
-                        )?;
-                        Ok(scope.evaluate(&expression, &mut self.budget)?)
-                    })
-                    .map_err(|error| {
-                        SpiceError::parse(
-                            original.location.clone(),
-                            format!("prepared source {}: {error}", instance.name),
-                        )
-                    })?;
-                self.prepared_waveforms.push((
-                    instance.name.clone(),
-                    super::prepared_waveform::PreparedForcing::new(resolved)?,
-                ));
-            }
+            self.bind_prepared_waveform(original, directives.definition, &instance, scope)?;
             self.devices.push(instance);
+        }
+        Ok(())
+    }
+
+    /// Bind a resolved waveform to the flattened source occurrence.
+    fn bind_prepared_waveform(
+        &mut self,
+        original: &DeviceInstance,
+        definition: &str,
+        instance: &DeviceInstance,
+        scope: &Arc<ParamScope>,
+    ) -> SpiceResult<()> {
+        if let Some(declaration) = self.waveforms.get(original, definition) {
+            let resolved = declaration
+                .resolve(|text| {
+                    let text = text.trim();
+                    let expression = crate::netlist::parser::parse_parameter_expression(
+                        text.strip_prefix('{')
+                            .and_then(|text| text.strip_suffix('}'))
+                            .unwrap_or(text),
+                        &original.location,
+                    )?;
+                    Ok(scope.evaluate(&expression, &mut self.budget)?)
+                })
+                .map_err(|error| {
+                    SpiceError::parse(
+                        original.location.clone(),
+                        format!("prepared source {}: {error}", instance.name),
+                    )
+                })?;
+            self.prepared_waveforms.push((
+                instance.name.clone(),
+                super::prepared_waveform::PreparedForcing::new(resolved)?,
+            ));
         }
         Ok(())
     }
