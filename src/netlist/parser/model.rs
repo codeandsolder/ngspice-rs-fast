@@ -277,7 +277,7 @@ fn cpl_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> 
 /// names. Parse delimiters only at the model-vector site; no global token
 /// splitting changes bus node names. Numeric and expression entries retain
 /// exact physical spans.
-fn boolean_literal(text: &str) -> Option<&'static str> {
+const fn boolean_literal(text: &str) -> Option<&'static str> {
     if text.eq_ignore_ascii_case("true") {
         Some("1")
     } else if text.eq_ignore_ascii_case("false") {
@@ -323,6 +323,54 @@ fn code_boolean(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment
     })
 }
 
+fn code_vector_entry(
+    input: &mut Input<'_>,
+    token: &Token,
+    text: &str,
+    prefix: usize,
+    closed: bool,
+    boolean: bool,
+) -> Result<NumericVectorEntry> {
+    if prefix == 0
+        && !closed
+        && matches!(token.kind, TokenKind::Expression(_) | TokenKind::Quoted(_))
+    {
+        let Value::Expression(source, expression) = value(input)? else {
+            return Err(malformed(
+                input,
+                "invalid code-model coefficient expression",
+            ));
+        };
+        return Ok(NumericVectorEntry {
+            source: PositionedValue {
+                text: source.text.clone(),
+                location: source.location.clone(),
+            },
+            expression: Some(expression),
+        });
+    }
+    let text = if boolean {
+        boolean_literal(text).unwrap_or(text)
+    } else {
+        text
+    };
+    if text.contains(['[', ']'])
+        || !crate::primitives::parse_spice_number(text).is_some_and(f64::is_finite)
+    {
+        return Err(malformed(input, "expected finite code-model coefficient"));
+    }
+    let position = token.position().advance(prefix).location();
+    let entry = NumericVectorEntry {
+        source: PositionedValue {
+            text: text.to_owned(),
+            location: position,
+        },
+        expression: None,
+    };
+    any.parse_next(input)?;
+    Ok(entry)
+}
+
 fn code_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
     peek(any.verify(|token: &Token| {
         SourceModel::from_base(base)
@@ -340,8 +388,8 @@ fn code_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment>
         let mut first = true;
         let mut comma = false;
         loop {
-            let token = input
-                .input
+            let tokens = input.input.clone();
+            let token = tokens
                 .first()
                 .ok_or_else(|| malformed(input, "unterminated code-model coefficient vector"))?;
             let text = if first {
@@ -378,41 +426,9 @@ fn code_vector(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment>
                 comma = true;
                 continue;
             }
-            if prefix == 0
-                && !closed
-                && matches!(token.kind, TokenKind::Expression(_) | TokenKind::Quoted(_))
-            {
-                let Value::Expression(source, expression) = value(input)? else {
-                    return Err(malformed(input, "invalid transfer coefficient expression"));
-                };
-                entries.push(NumericVectorEntry {
-                    source: PositionedValue {
-                        text: source.text.clone(),
-                        location: source.location.clone(),
-                    },
-                    expression: Some(expression),
-                });
-            } else {
-                let text = if boolean {
-                    boolean_literal(text).unwrap_or(text)
-                } else {
-                    text
-                };
-                if text.contains(['[', ']'])
-                    || !crate::primitives::parse_spice_number(text).is_some_and(f64::is_finite)
-                {
-                    return Err(malformed(input, "expected finite code-model coefficient"));
-                }
-                let position = token.position().advance(prefix).location();
-                entries.push(NumericVectorEntry {
-                    source: PositionedValue {
-                        text: text.to_owned(),
-                        location: position,
-                    },
-                    expression: None,
-                });
-                any.parse_next(input)?;
-            }
+            entries.push(code_vector_entry(
+                input, token, text, prefix, closed, boolean,
+            )?);
             comma = false;
             if closed {
                 break;

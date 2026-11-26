@@ -48,12 +48,41 @@ gain, one-pole low-pass and unsaturated integrator kernels. They reuse the
 companion charge-history and truncation machinery, expose the affine AC pencil,
 and explicitly declare no intrinsic noise. Integrators initialize their
 output at the supplied bias value; their AC pencil uses the dynamic equation.
-Arbitrary nonlinear analog model kernels, A-instance parsing, additional
-sequential models, mixed-signal UIC, periodic shooting, and mixed-signal AC and
-noise are not implemented by this interface.
+Arbitrary nonlinear analog model kernels, additional sequential models,
+mixed-signal UIC, periodic shooting, and mixed-signal AC and noise are not
+implemented by this interface.
 ADC crossing detection is based on accepted and trial endpoint samples;
 nonmonotone crossings wholly within one analog step require a suitable analog
 maximum timestep.
+
+## Deck-bound mixed-domain models
+
+The parser and writer retain ordered typed scalar and vector A-instance
+ports. Lexical model schemas supply default types, define grouping and
+polarity, and validate scalar/array parameter values after scoped expression
+realization. Analog and digital nets have independent hierarchical identities;
+a digital node named `gnd` is not analog ground. Rational transfer models
+continue using the analog backend.
+
+`preprocess_logic_event` binds qualified analog receivers to the native
+transactional event network, with AND, OR, NAND, NOR and reset-dominant,
+set-dominant and hold-on-equal latches (operations 0–6). Strict threshold
+comparisons retain the previous receiver state at equality and between
+thresholds. Each input has independent inversion and initial receiver state.
+Transport changes schedule delayed output events; inertial changes commit
+only after the requested state survives its deadline. Same-time receiver
+updates precede the corresponding timer, so equal-width pulses cancel.
+`preprocess_logic_voltage` is an ideal differential voltage bridge with
+independently specified rails (including reversed/equal rails). The unknown
+state produces their midpoint. Ordinary OP and transient plans construct a
+fresh event engine from the immutable bound topology; unsupported mixed
+analysis kinds fail explicitly. Analog-only circuits construct no event
+network. Separate accepted event counters are available via
+`Circuit::last_digital_stats`.
+
+The `preprocess_timed_switch` descriptor is available for typed syntax;
+its conductance kernel is a separate implementation task. Operations outside
+0–6 are rejected rather than approximated.
 
 ## Numerical verification
 
@@ -78,3 +107,10 @@ threshold sampling error; they do not require identical internal time grids.
 Run the native tests with `cargo +nightly test --locked --test digital_events`.
 For the live reference, set `NGSPICE_BIN` to an XSPICE-enabled ngspice binary
 and run the same command with `-- --ignored`.
+
+The source-level tests in `tests/native_mixed_signal.rs` additionally compare
+synthetic circuits with independent ngspice-47 reference traces. The
+28-configuration logic matrix matches all 308 sampled voltages to
+2.23e-16 V and all 83 transition times to 8.48e-22 s on the tested decks.
+Reference provenance and regeneration instructions are in
+`tests/fixtures/native-logic/README.md`.

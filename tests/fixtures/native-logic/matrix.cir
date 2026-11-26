@@ -1,0 +1,173 @@
+Native logic gate matrix
+vref ref 0 .75
+va a ref pwl(0 0 1u 0 1.1u 4 3u 4 3.1u 0 5u 0 5.1u 4 7u 4 7.1u 0 9u 0)
+vb b ref pwl(0 0 2u 0 2.1u 4 4u 4 4.1u 0 5u 0 5.1u 4 7u 4 7.1u 0 9u 0)
+ag000 %vd[a ref b ref] dg000 mg000
+.model mg000 preprocess_logic_event(operation=0 delay=100n inertial=true ic=0 low=2 high=3 inverted=[0 0] rx_ic=[0 0])
+abg000 dg000 %vd(rawg000 ref) mbg000
+.model mbg000 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg000 rawg000 g000 10
+rlg000 g000 ref 100
+ag001 %vd[a ref b ref] dg001 mg001
+.model mg001 preprocess_logic_event(operation=0 delay=100n inertial=true ic=0 low=2 high=3 inverted=[1 0] rx_ic=[0 0])
+abg001 dg001 %vd(rawg001 ref) mbg001
+.model mbg001 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg001 rawg001 g001 10
+rlg001 g001 ref 100
+ag010 %vd[a ref b ref] dg010 mg010
+.model mg010 preprocess_logic_event(operation=0 delay=100n inertial=true ic=1 low=2 high=3 inverted=[0 0] rx_ic=[1 0])
+abg010 dg010 %vd(rawg010 ref) mbg010
+.model mbg010 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg010 rawg010 g010 10
+rlg010 g010 ref 100
+ag011 %vd[a ref b ref] dg011 mg011
+.model mg011 preprocess_logic_event(operation=0 delay=100n inertial=true ic=1 low=2 high=3 inverted=[1 0] rx_ic=[1 0])
+abg011 dg011 %vd(rawg011 ref) mbg011
+.model mbg011 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg011 rawg011 g011 10
+rlg011 g011 ref 100
+ag100 %vd[a ref b ref] dg100 mg100
+.model mg100 preprocess_logic_event(operation=1 delay=100n inertial=true ic=0 low=2 high=3 inverted=[0 0] rx_ic=[0 0])
+abg100 dg100 %vd(rawg100 ref) mbg100
+.model mbg100 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg100 rawg100 g100 10
+rlg100 g100 ref 100
+ag101 %vd[a ref b ref] dg101 mg101
+.model mg101 preprocess_logic_event(operation=1 delay=100n inertial=true ic=0 low=2 high=3 inverted=[1 0] rx_ic=[0 0])
+abg101 dg101 %vd(rawg101 ref) mbg101
+.model mbg101 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg101 rawg101 g101 10
+rlg101 g101 ref 100
+ag110 %vd[a ref b ref] dg110 mg110
+.model mg110 preprocess_logic_event(operation=1 delay=100n inertial=true ic=1 low=2 high=3 inverted=[0 0] rx_ic=[1 0])
+abg110 dg110 %vd(rawg110 ref) mbg110
+.model mbg110 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg110 rawg110 g110 10
+rlg110 g110 ref 100
+ag111 %vd[a ref b ref] dg111 mg111
+.model mg111 preprocess_logic_event(operation=1 delay=100n inertial=true ic=1 low=2 high=3 inverted=[1 0] rx_ic=[1 0])
+abg111 dg111 %vd(rawg111 ref) mbg111
+.model mbg111 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg111 rawg111 g111 10
+rlg111 g111 ref 100
+ag200 %vd[a ref b ref] dg200 mg200
+.model mg200 preprocess_logic_event(operation=2 delay=100n inertial=true ic=0 low=2 high=3 inverted=[0 0] rx_ic=[0 0])
+abg200 dg200 %vd(rawg200 ref) mbg200
+.model mbg200 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg200 rawg200 g200 10
+rlg200 g200 ref 100
+ag201 %vd[a ref b ref] dg201 mg201
+.model mg201 preprocess_logic_event(operation=2 delay=100n inertial=true ic=0 low=2 high=3 inverted=[1 0] rx_ic=[0 0])
+abg201 dg201 %vd(rawg201 ref) mbg201
+.model mbg201 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg201 rawg201 g201 10
+rlg201 g201 ref 100
+ag210 %vd[a ref b ref] dg210 mg210
+.model mg210 preprocess_logic_event(operation=2 delay=100n inertial=true ic=1 low=2 high=3 inverted=[0 0] rx_ic=[1 0])
+abg210 dg210 %vd(rawg210 ref) mbg210
+.model mbg210 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg210 rawg210 g210 10
+rlg210 g210 ref 100
+ag211 %vd[a ref b ref] dg211 mg211
+.model mg211 preprocess_logic_event(operation=2 delay=100n inertial=true ic=1 low=2 high=3 inverted=[1 0] rx_ic=[1 0])
+abg211 dg211 %vd(rawg211 ref) mbg211
+.model mbg211 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg211 rawg211 g211 10
+rlg211 g211 ref 100
+ag300 %vd[a ref b ref] dg300 mg300
+.model mg300 preprocess_logic_event(operation=3 delay=100n inertial=true ic=0 low=2 high=3 inverted=[0 0] rx_ic=[0 0])
+abg300 dg300 %vd(rawg300 ref) mbg300
+.model mbg300 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg300 rawg300 g300 10
+rlg300 g300 ref 100
+ag301 %vd[a ref b ref] dg301 mg301
+.model mg301 preprocess_logic_event(operation=3 delay=100n inertial=true ic=0 low=2 high=3 inverted=[1 0] rx_ic=[0 0])
+abg301 dg301 %vd(rawg301 ref) mbg301
+.model mbg301 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg301 rawg301 g301 10
+rlg301 g301 ref 100
+ag310 %vd[a ref b ref] dg310 mg310
+.model mg310 preprocess_logic_event(operation=3 delay=100n inertial=true ic=1 low=2 high=3 inverted=[0 0] rx_ic=[1 0])
+abg310 dg310 %vd(rawg310 ref) mbg310
+.model mbg310 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg310 rawg310 g310 10
+rlg310 g310 ref 100
+ag311 %vd[a ref b ref] dg311 mg311
+.model mg311 preprocess_logic_event(operation=3 delay=100n inertial=true ic=1 low=2 high=3 inverted=[1 0] rx_ic=[1 0])
+abg311 dg311 %vd(rawg311 ref) mbg311
+.model mbg311 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg311 rawg311 g311 10
+rlg311 g311 ref 100
+ag400 %vd[a ref b ref] dg400 mg400
+.model mg400 preprocess_logic_event(operation=4 delay=100n inertial=true ic=0 low=2 high=3 inverted=[0 0] rx_ic=[0 0])
+abg400 dg400 %vd(rawg400 ref) mbg400
+.model mbg400 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg400 rawg400 g400 10
+rlg400 g400 ref 100
+ag401 %vd[a ref b ref] dg401 mg401
+.model mg401 preprocess_logic_event(operation=4 delay=100n inertial=true ic=0 low=2 high=3 inverted=[1 0] rx_ic=[0 0])
+abg401 dg401 %vd(rawg401 ref) mbg401
+.model mbg401 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg401 rawg401 g401 10
+rlg401 g401 ref 100
+ag410 %vd[a ref b ref] dg410 mg410
+.model mg410 preprocess_logic_event(operation=4 delay=100n inertial=true ic=1 low=2 high=3 inverted=[0 0] rx_ic=[1 0])
+abg410 dg410 %vd(rawg410 ref) mbg410
+.model mbg410 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg410 rawg410 g410 10
+rlg410 g410 ref 100
+ag411 %vd[a ref b ref] dg411 mg411
+.model mg411 preprocess_logic_event(operation=4 delay=100n inertial=true ic=1 low=2 high=3 inverted=[1 0] rx_ic=[1 0])
+abg411 dg411 %vd(rawg411 ref) mbg411
+.model mbg411 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg411 rawg411 g411 10
+rlg411 g411 ref 100
+ag500 %vd[a ref b ref] dg500 mg500
+.model mg500 preprocess_logic_event(operation=5 delay=100n inertial=true ic=0 low=2 high=3 inverted=[0 0] rx_ic=[0 0])
+abg500 dg500 %vd(rawg500 ref) mbg500
+.model mbg500 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg500 rawg500 g500 10
+rlg500 g500 ref 100
+ag501 %vd[a ref b ref] dg501 mg501
+.model mg501 preprocess_logic_event(operation=5 delay=100n inertial=true ic=0 low=2 high=3 inverted=[1 0] rx_ic=[0 0])
+abg501 dg501 %vd(rawg501 ref) mbg501
+.model mbg501 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg501 rawg501 g501 10
+rlg501 g501 ref 100
+ag510 %vd[a ref b ref] dg510 mg510
+.model mg510 preprocess_logic_event(operation=5 delay=100n inertial=true ic=1 low=2 high=3 inverted=[0 0] rx_ic=[1 0])
+abg510 dg510 %vd(rawg510 ref) mbg510
+.model mbg510 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg510 rawg510 g510 10
+rlg510 g510 ref 100
+ag511 %vd[a ref b ref] dg511 mg511
+.model mg511 preprocess_logic_event(operation=5 delay=100n inertial=true ic=1 low=2 high=3 inverted=[1 0] rx_ic=[1 0])
+abg511 dg511 %vd(rawg511 ref) mbg511
+.model mbg511 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg511 rawg511 g511 10
+rlg511 g511 ref 100
+ag600 %vd[a ref b ref] dg600 mg600
+.model mg600 preprocess_logic_event(operation=6 delay=100n inertial=true ic=0 low=2 high=3 inverted=[0 0] rx_ic=[0 0])
+abg600 dg600 %vd(rawg600 ref) mbg600
+.model mbg600 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg600 rawg600 g600 10
+rlg600 g600 ref 100
+ag601 %vd[a ref b ref] dg601 mg601
+.model mg601 preprocess_logic_event(operation=6 delay=100n inertial=true ic=0 low=2 high=3 inverted=[1 0] rx_ic=[0 0])
+abg601 dg601 %vd(rawg601 ref) mbg601
+.model mbg601 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg601 rawg601 g601 10
+rlg601 g601 ref 100
+ag610 %vd[a ref b ref] dg610 mg610
+.model mg610 preprocess_logic_event(operation=6 delay=100n inertial=true ic=1 low=2 high=3 inverted=[0 0] rx_ic=[1 0])
+abg610 dg610 %vd(rawg610 ref) mbg610
+.model mbg610 preprocess_logic_voltage(out_low=-2 out_high=5)
+rsg610 rawg610 g610 10
+rlg610 g610 ref 100
+ag611 %vd[a ref b ref] dg611 mg611
+.model mg611 preprocess_logic_event(operation=6 delay=100n inertial=true ic=1 low=2 high=3 inverted=[1 0] rx_ic=[1 0])
+abg611 dg611 %vd(rawg611 ref) mbg611
+.model mbg611 preprocess_logic_voltage(out_low=5 out_high=-2)
+rsg611 rawg611 g611 10
+rlg611 g611 ref 100
+.end
