@@ -309,7 +309,6 @@ fn native_and_prepared_switch_selection_never_aliases_unqualified_modes() -> Tes
         "ltspice_switch(level=3 vh=-1)",
         "ltspice_switch(level=2 vh=0)",
         "ltspice_switch(ron=-1 vh=-1)",
-        "ltspice_switch(lser=-1u vh=-1)",
         "ltspice_switch(level=2 lser=1u vh=-1)",
         "ltspice_switch(epsilon=.1 vh=-1)",
         "ltspice_switch(level=1 vh=-1 oneway)",
@@ -351,7 +350,29 @@ fn discrete_ac_uses_converged_bias_instead_of_native_accepted_state() -> TestRes
 
 #[test]
 fn series_inductance_uses_transient_flux_but_is_shorted_by_reference_ac() -> TestResult {
-    let model = ".model sm ltspice_switch(ron=10 roff=1k vt=0 vh=0 lser=1m)";
+    for (inductance, time_constant, reference) in [
+        (
+            "1m",
+            100e-6,
+            include_str!("fixtures/ltspice-switch/series-transient.tsv"),
+        ),
+        (
+            "-1m",
+            -100e-6,
+            include_str!("fixtures/ltspice-switch/series-negative.tsv"),
+        ),
+    ] {
+        check_series_inductance(inductance, time_constant, reference)?;
+    }
+    Ok(())
+}
+
+fn series_response(time: f64, time_constant: f64) -> f64 {
+    -0.1 * (-(time - 10.0005e-6) / time_constant).exp_m1()
+}
+
+fn check_series_inductance(inductance: &str, time_constant: f64, reference: &str) -> TestResult {
+    let model = format!(".model sm ltspice_switch(ron=10 roff=1k vt=0 vh=0 lser={inductance})");
     let ac = run(
         &format!("vdrive p 0 dc 1 ac 1\nvc c 0 2\ns1 p 0 c 0 sm\n{model}"),
         AnalysisKind::Ac,
@@ -387,12 +408,27 @@ fn series_inductance_uses_transient_flux_but_is_shorted_by_reference_ac() -> Tes
         }
         // The 1 ns linear ramp is equivalent to a half-rise-time delayed
         // step up to a relative correction below 1e-10 for this RL circuit.
-        let expected = -0.1 * (-(time - 10.0005e-6) / 100e-6).exp_m1();
+        let expected = series_response(time, time_constant);
         let current = -plot.value("i(vdrive)", point).ok_or("missing current")?.re;
         close("RL response", current, expected, 1e-5, 1e-9);
         compared += 1;
     }
     assert!(compared > 1000);
+    // Independent reference samples are on its own adaptive time grid
+    // (maximum step 1 us), so compare to the same analytic response.
+    for line in reference.lines().filter(|line| !line.starts_with('#')) {
+        let values = line
+            .split_whitespace()
+            .map(str::parse::<f64>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let [time, current]: [f64; 2] = values.try_into().map_err(|_| "reference row width")?;
+        let expected = if time == 0. {
+            0.
+        } else {
+            series_response(time, time_constant)
+        };
+        close("measured RL response", current, expected, 2e-4, 1e-9);
+    }
     Ok(())
 }
 

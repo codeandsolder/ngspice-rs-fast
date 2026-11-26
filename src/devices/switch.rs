@@ -289,7 +289,7 @@ fn schema(kind: SwitchKind, ltspice: bool) -> &'static ScalarSchema<'static> {
         ScalarParameter {
             name: "lser",
             unit: ScalarUnit::Henry,
-            domain: ScalarDomain::NonNegative,
+            domain: ScalarDomain::Finite,
             default: Some(0.),
         },
         ScalarParameter {
@@ -554,7 +554,7 @@ impl Switch {
                 .iter()
                 .map(|node| staged.intern(node))
                 .collect::<SpiceResult<Vec<_>>>()?;
-            if parameters.series_inductance > 0. {
+            if parameters.series_inductance != 0. {
                 let label = format!("{}#lser", instance.name);
                 if staged.get(&label).is_some() {
                     return Err(SpiceError::circuit(format!(
@@ -803,7 +803,7 @@ impl Switch {
     }
 
     const fn storage_slots(&self) -> usize {
-        if self.model.series_inductance > 0. {
+        if self.model.series_inductance != 0. {
             crate::devices::rlc::REACTIVE_STATE_COUNT
         } else {
             0
@@ -975,15 +975,15 @@ impl Device for Switch {
     }
 
     fn branch_currents(&self) -> usize {
-        usize::from(self.model.series_inductance > 0.)
+        usize::from(self.model.series_inductance != 0.)
     }
 
     fn expression_current_branch(&self) -> Option<usize> {
-        (self.model.series_inductance > 0.).then_some(0)
+        (self.model.series_inductance != 0.).then_some(0)
     }
 
     fn truncation_slot(&self) -> Option<usize> {
-        (self.model.series_inductance > 0.).then_some(crate::devices::rlc::QUANTITY)
+        (self.model.series_inductance != 0.).then_some(crate::devices::rlc::QUANTITY)
     }
 
     fn storage_element(

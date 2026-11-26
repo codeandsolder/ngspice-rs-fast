@@ -184,7 +184,7 @@ signed-hysteresis state machine remains intact.
 | ILIMIT | absent or zero means unlimited; symmetric hard clamp of absolute limit | absent or nonpositive means 10 A; tanh limiter |
 | VSER | signed series voltage, opposite direction uses off conductance | positive value enables one-way conduction, negative value alone has no effect |
 | ONEWAY, EPSILON | unsupported | conduction from second terminal to first; positive smoothing width (negative ignored) |
-| LSER | nonnegative transient series inductance | unsupported |
+| LSER | finite signed transient series inductance | unsupported |
 
 Resistances must be finite and positive; signed current limits follow the measured rules above.
 Level selectors must be exactly 1 or 2. Unsupported nonzero options are
@@ -228,7 +228,9 @@ using the physical DC tangent indiscriminately:
   topology node, physical branch-current coordinate, two flux
   history slots before any switch-state slots). Independent AC
   measurements show that LTspice shorts LSER in AC. Its transient
-  flux and derivative remain available to physical DAE assembly.
+  flux and derivative remain available to physical DAE assembly. Negative
+  LSER is an active signed storage coefficient, verified by its growing RL
+  step response; native passive inductor validation is unchanged.
 - Thermal noise includes the reference small-signal conductance,
   including gmin; the series inductor itself is noiseless.
 
