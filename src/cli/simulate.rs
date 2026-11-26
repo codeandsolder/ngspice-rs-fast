@@ -63,7 +63,7 @@ use crate::analysis::{
     BinaryByteOrder, Plot, PointSink, RawFileTransaction, RawFormat, RawPlot, RunConfig,
 };
 use crate::netlist::eval::ParamScope;
-use crate::netlist::{ParsedDeck, Parser};
+use crate::netlist::{ParsedDeck, Parser, SourceAdmission, SourceLimits};
 use crate::primitives::{AnalysisKind, Complex, SpiceError, SpiceResult};
 
 use crate::cli::args::kind_name;
@@ -179,7 +179,21 @@ pub fn run_with_format(
     auto_gnd: bool,
     format: Option<RawFormat>,
 ) -> SpiceResult<Report> {
-    let (parsed, scope) = prepare_deck(deck, auto_gnd)?;
+    run_with_admission(deck, output, auto_gnd, format, None)
+}
+
+/// Simulate a deck admitted through optional explicit source transformation.
+///
+/// # Errors
+/// Source admission, parsing, simulation or atomic output failure.
+pub fn run_with_admission(
+    deck: &Path,
+    output: &Path,
+    auto_gnd: bool,
+    format: Option<RawFormat>,
+    admission: Option<&SourceAdmission>,
+) -> SpiceResult<Report> {
+    let (parsed, scope) = prepare_deck(deck, auto_gnd, admission)?;
     let netlist = &parsed.netlist;
     if netlist.analyses.is_empty() {
         return Err(SpiceError::parse(
@@ -491,8 +505,16 @@ fn prepare_observations(
 /// Prepare frontend requests and the top-level scope once. Expanding
 /// subcircuit output cards already requires a resolved scope, so reuse it
 /// when evaluating the root Fourier cards and measurement outputs.
-fn prepare_deck(deck: &Path, auto_gnd: bool) -> SpiceResult<(ParsedDeck, Arc<ParamScope>)> {
-    let mut parsed = Parser::with_auto_gnd(auto_gnd).parse_file_with_output(deck)?;
+fn prepare_deck(
+    deck: &Path,
+    auto_gnd: bool,
+    admission: Option<&SourceAdmission>,
+) -> SpiceResult<(ParsedDeck, Arc<ParamScope>)> {
+    let mut parsed = Parser::with_auto_gnd(auto_gnd).parse_file_with_admission(
+        deck,
+        SourceLimits::default(),
+        admission,
+    )?;
     let scope = if parsed.netlist.subcircuits.iter().any(|sub| {
         !sub.output.is_empty() || !sub.measurements.is_empty() || !sub.fourier.is_empty()
     }) {

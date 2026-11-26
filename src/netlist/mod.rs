@@ -49,6 +49,7 @@ pub use parser::{
     ParsedDeck, Parser, SourceLimits, classify_deck, load_classified, parse_parameter_expression,
 };
 pub use semantic::{semantic_diff, semantic_eq};
+pub use source::admission::SourceAdmission;
 pub use source::{Deck, LogicalLine, PhysicalLine, load};
 pub use token::{Token, TokenKind, tokenize};
 pub use writer::{WriteLimits, write_netlist, write_netlist_to};
