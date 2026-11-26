@@ -999,6 +999,30 @@ pub(super) fn run_transient(
     run_transient_inner(circuit, request, context, settings, purpose, sink, None)
 }
 
+fn truncation_devices(circuit: &Circuit) -> SpiceResult<Vec<TruncationDevice>> {
+    circuit
+        .devices()
+        .iter()
+        .enumerate()
+        .map(|(index, device)| {
+            let rows = circuit
+                .state_rows(index)
+                .ok_or_else(|| failure("missing state range"))?;
+            let bases = device
+                .truncation_slots()
+                .into_iter()
+                .map(|slot| TruncationSlot {
+                    base: rows.start + slot,
+                    explicit_derivative: device
+                        .initial_expression_storage()
+                        .is_some_and(|storage| storage.slot == slot),
+                })
+                .collect();
+            Ok(TruncationDevice { rows, slots: bases })
+        })
+        .collect()
+}
+
 fn run_transient_inner(
     circuit: &mut Circuit,
     request: &AnalysisPlan,
@@ -1068,27 +1092,7 @@ fn run_transient_inner(
     let circuit: &Circuit = circuit;
     let branch_row = crate::analysis::bias::branch_rows(circuit);
     let limited_rows = crate::analysis::bias::limited_rows(circuit);
-    let truncation = circuit
-        .devices()
-        .iter()
-        .enumerate()
-        .map(|(index, device)| {
-            let rows = circuit
-                .state_rows(index)
-                .ok_or_else(|| failure("missing state range"))?;
-            let bases = device
-                .truncation_slots()
-                .into_iter()
-                .map(|slot| TruncationSlot {
-                    base: rows.start + slot,
-                    explicit_derivative: device
-                        .initial_expression_storage()
-                        .is_some_and(|storage| storage.slot == slot),
-                })
-                .collect();
-            Ok(TruncationDevice { rows, slots: bases })
-        })
-        .collect::<SpiceResult<_>>()?;
+    let truncation = truncation_devices(circuit)?;
     let driver = Driver {
         circuit,
         prepared: circuit.prepare_run(),
