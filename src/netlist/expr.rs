@@ -10,20 +10,16 @@
 //!
 //! # Accepted syntax
 //!
-//! ```text
-//! sum     := [sign] term { ('+' | '-') term }
-//! term    := factor { ('*' | '/') factor }          (left associative)
-//! factor  := atom { ('^' | '**') atom }             (left associative, as in C)
-//! atom    := number | '-' number | identifier | call | '(' sum ')'
-//! call    := function '(' sum { ',' sum } ')'
-//!          | name '(' [ sum { ',' sum } ] ')'     (user `.func`, see below)
-//! ```
+//! Precedence (lowest first): conditional, logical OR, logical AND,
+//! comparisons, addition/subtraction, multiplication/division/remainder/
+//! integer division, power, then atomic logical negation. The conditional
+//! accumulator follows native numparam rather than behavioural precedence.
 //!
 //! A call to a name outside the [`Function`] allowlist is an
 //! [`ExprKind::UserCall`]; whether a `.func` defines it is decided during
 //! evaluation ([`crate::netlist::eval::FunctionScope`]).
 //!
-//! Precedence, tightest first: `^`/`**`, then `*` `/`, then `+` `-`. A sign at
+//! A sign at
 //! the start of an expression, group or argument binds like C's
 //! additive-level operator (`-2^2` is `-(2^2)`, `-a*b+1` is `(-(a*b))+1`).
 //! After a binary operator C accepts only `-` directly before a numeric
@@ -155,6 +151,15 @@ impl Expr {
                 child(lhs)?;
                 child(rhs)?;
             }
+            ExprKind::Ternary {
+                condition,
+                then,
+                otherwise,
+            } => {
+                child(condition)?;
+                child(then)?;
+                child(otherwise)?;
+            }
             ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
                 for argument in arguments {
                     child(argument)?;
@@ -179,6 +184,15 @@ impl Expr {
                 ExprKind::Binary { lhs, rhs, .. } => {
                     pending.push(rhs);
                     pending.push(lhs);
+                }
+                ExprKind::Ternary {
+                    condition,
+                    then,
+                    otherwise,
+                } => {
+                    pending.push(otherwise);
+                    pending.push(then);
+                    pending.push(condition);
                 }
                 ExprKind::Call { arguments, .. } | ExprKind::UserCall { arguments, .. } => {
                     pending.extend(arguments.iter().rev());
@@ -220,6 +234,15 @@ pub enum ExprKind {
         /// Right operand.
         rhs: Box<Expr>,
     },
+    /// A conditional expression, selecting only one branch.
+    Ternary {
+        /// Condition (nonzero is true).
+        condition: Box<Expr>,
+        /// True branch.
+        then: Box<Expr>,
+        /// False branch.
+        otherwise: Box<Expr>,
+    },
     /// An allowlisted function call; `arguments.len() == function.arity()`.
     Call {
         /// The function.
@@ -250,6 +273,8 @@ pub enum UnaryOp {
     Plus,
     /// `-x`
     Minus,
+    /// `!x`
+    Not,
 }
 
 /// Binary arithmetic operators.
@@ -267,6 +292,26 @@ pub enum BinaryOp {
     /// `2^3^2` is `(2^3)^2 = 64` in C. C's default `^` is `pow(fabs(x), y)`
     /// (xpressn.c `operate()`), so an evaluator must not use plain `powf`.
     Pow,
+    /// Remainder after truncating the quotient.
+    Rem,
+    /// Truncated magnitude of the quotient.
+    IntDiv,
+    /// Equality.
+    Eq,
+    /// Inequality.
+    Ne,
+    /// Less than.
+    Lt,
+    /// Less than or equal.
+    Le,
+    /// Greater than.
+    Gt,
+    /// Greater than or equal.
+    Ge,
+    /// Logical conjunction.
+    And,
+    /// Logical disjunction.
+    Or,
 }
 
 /// Maximum parenthesis/call nesting accepted by the parser; deeper input is a
@@ -350,7 +395,7 @@ macro_rules! functions {
                 }
             }
 
-            /// Required argument count: 2 for `pow`/`pwr`/`max`/`min`, else 1.
+            /// Required argument count.
             #[must_use = "the returned arity determines the required argument count"]
             pub const fn arity(self) -> usize {
                 match self {
@@ -391,9 +436,10 @@ functions! {
     Atanh => "atanh" / 1,
     Tan => "tan" / 1,
     Nint => "nint" / 1,
+    Ternary => "ternary_fcn" / 3,
 }
 
 /// C `fmathS` names outside the allowlist. A call to one parses as
 /// [`ExprKind::UserCall`] and is rejected as not yet ported during evaluation
 /// unless a `.func` of that name is in scope.
-pub const EXCLUDED_FUNCTIONS: &[&str] = &["ternary_fcn", "vec", "var"];
+pub const EXCLUDED_FUNCTIONS: &[&str] = &["vec", "var"];

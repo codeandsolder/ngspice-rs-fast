@@ -982,6 +982,7 @@ fn write_expr(out: &mut Out, indent: usize, expr: &Expr) {
             let op = match op {
                 UnaryOp::Plus => "plus",
                 UnaryOp::Minus => "minus",
+                UnaryOp::Not => "not",
             };
             out.line(indent, format!("unary {op} span={span}"));
             write_expr(out, indent + 1, operand);
@@ -993,10 +994,30 @@ fn write_expr(out: &mut Out, indent: usize, expr: &Expr) {
                 BinaryOp::Mul => "mul",
                 BinaryOp::Div => "div",
                 BinaryOp::Pow => "pow",
+                BinaryOp::Rem => "rem",
+                BinaryOp::IntDiv => "int-div",
+                BinaryOp::Eq => "eq",
+                BinaryOp::Ne => "ne",
+                BinaryOp::Lt => "lt",
+                BinaryOp::Le => "le",
+                BinaryOp::Gt => "gt",
+                BinaryOp::Ge => "ge",
+                BinaryOp::And => "and",
+                BinaryOp::Or => "or",
             };
             out.line(indent, format!("binary {op} span={span}"));
             write_expr(out, indent + 1, lhs);
             write_expr(out, indent + 1, rhs);
+        }
+        ExprKind::Ternary {
+            condition,
+            then,
+            otherwise,
+        } => {
+            out.line(indent, format!("ternary span={span}"));
+            write_expr(out, indent + 1, condition);
+            write_expr(out, indent + 1, then);
+            write_expr(out, indent + 1, otherwise);
         }
         ExprKind::Call {
             function,
