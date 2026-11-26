@@ -77,13 +77,15 @@ impl StampPeak {
         }
     }
 
-    fn observe_batch(&mut self, values: &[f64]) {
+    #[inline]
+    fn observe_batch<const N: usize>(&mut self, values: &[f64; N]) {
         if self.enabled() {
-            // Including ground entries which the verified trace omits is
-            // conservative. Do the reduction once, outside the stamp loop.
-            for &value in values {
-                self.observe(value);
-            }
+            // Include even ground entries omitted by the trace. Reduce a
+            // fixed-size batch in registers before touching the load peak.
+            let magnitude = values.iter().fold(0, |peak, value| {
+                peak.max(value.to_bits() & i64::MAX.cast_unsigned())
+            });
+            self.0 = self.0.max(magnitude);
         }
     }
 

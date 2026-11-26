@@ -909,9 +909,17 @@ fn correction_risk(
     options: &NewtonOptions,
 ) -> bool {
     let roundoff = 8. * Real::EPSILON;
-    let coefficient = roundoff * matrix.peak_stamp() * values.max_abs();
     let source = roundoff * rhs.peak_stamp();
-    coefficient.max(source) >= options.abstol
+    if source >= options.abstol {
+        return true;
+    }
+    let coefficient = roundoff * matrix.peak_stamp();
+    // The solution has already passed the finite check. Integer magnitude
+    // reduction avoids a serial floating-point max and NaN handling.
+    let largest = values.as_slice().iter().fold(0_u64, |peak, value| {
+        peak.max(value.to_bits() & i64::MAX.cast_unsigned())
+    });
+    coefficient * Real::from_bits(largest) >= options.abstol
 }
 
 /// [`StepLimiting::Global`]: scale the step so no watched nodal voltage moves
