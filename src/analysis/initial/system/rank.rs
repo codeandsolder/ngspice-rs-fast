@@ -84,7 +84,6 @@ struct Pivot {
 struct Basis {
     pivots: Vec<Pivot>,
     by_column: Vec<Option<usize>>,
-    column_use: Vec<usize>,
     required_prefix: usize,
     remaining_work: usize,
 }
@@ -94,7 +93,6 @@ impl Basis {
         Self {
             pivots: Vec::new(),
             by_column: vec![None; columns],
-            column_use: vec![0; columns],
             required_prefix,
             remaining_work: 67_108_864,
         }
@@ -138,7 +136,18 @@ impl Basis {
                 "nonfinite rank reduction of instantaneous constraints",
             ));
         }
-        let Some((column, pivot)) = self.choose_pivot(&terms) else {
+        let Some((&column, &pivot)) = terms
+            .iter()
+            .filter(|(_, coefficient)| coefficient.significant())
+            // Eliminate higher Taylor degrees first. A prefix pivot can
+            // appear only when no significant tail coefficient survives;
+            // it is then a constraint on the required initial coordinates.
+            .max_by(|(ca, a), (cb, b)| {
+                (**ca >= self.required_prefix)
+                    .cmp(&(**cb >= self.required_prefix))
+                    .then_with(|| a.value.magnitude_cmp(b.value))
+            })
+        else {
             return Ok(false);
         };
         terms.remove(&column);
@@ -152,37 +161,6 @@ impl Basis {
         self.by_column[column] = Some(self.pivots.len());
         self.pivots.push(Pivot { column, terms, rhs });
         Ok(true)
-    }
-
-    fn choose_pivot(&self, terms: &Row) -> Option<(usize, Coefficient)> {
-        // Project the tail first. Within the chosen coordinate class, avoid
-        // repeatedly eliminating a shared hub when a comparably scaled local
-        // column is available. A fixed threshold keeps every chosen pivot
-        // within a factor of two of the largest certified pivot in the row.
-        let (&largest_column, largest) = terms
-            .iter()
-            .filter(|(_, coefficient)| coefficient.significant())
-            .max_by(|(ca, a), (cb, b)| {
-                (**ca >= self.required_prefix)
-                    .cmp(&(**cb >= self.required_prefix))
-                    .then_with(|| a.value.magnitude_cmp(b.value))
-            })?;
-        let tail = largest_column >= self.required_prefix;
-        let threshold = largest.value.shifted(-1);
-        terms
-            .iter()
-            .filter(|(column, coefficient)| {
-                (**column >= self.required_prefix) == tail
-                    && coefficient.significant()
-                    && coefficient.value.magnitude_cmp(threshold).is_ge()
-            })
-            .min_by(|(ca, a), (cb, b)| {
-                self.column_use[**ca]
-                    .cmp(&self.column_use[**cb])
-                    .then_with(|| b.value.magnitude_cmp(a.value))
-                    .then_with(|| cb.cmp(ca))
-            })
-            .map(|(&column, &coefficient)| (column, coefficient))
     }
 
     fn solution(&self, column_exponents: &[i32]) -> SpiceResult<Vector> {
@@ -356,11 +334,6 @@ fn reduce(
         }
     }
     let mut basis = Basis::new(matrix.cols(), required_prefix);
-    for entry in matrix.triplets() {
-        if entry.value != 0. {
-            basis.column_use[entry.col] += 1;
-        }
-    }
     let entries = matrix.triplets();
     let mut ranges = Vec::with_capacity(matrix.rows());
     let mut cursor = 0;
