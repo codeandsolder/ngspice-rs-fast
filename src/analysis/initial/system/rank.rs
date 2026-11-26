@@ -352,10 +352,17 @@ fn reduce(
         priority[row] = 2;
     }
     let mut independent = vec![false; matrix.rows()];
-    let priority = &priority;
-    for row in
-        (0..=2).flat_map(|level| (0..matrix.rows()).filter(move |&row| priority[row] == level))
-    {
+    // Process sparse physical rows before denser rows. In particular,
+    // direct source constraints must not be buried behind a long chain
+    // of equivalent normalized pivots with correlated rounding errors.
+    // Preserve the order of late and optional constraints: their priority
+    // is physical policy, not a matrix fill-reduction heuristic.
+    let mut order: Vec<_> = (0..matrix.rows()).collect();
+    order.sort_unstable_by_key(|&row| {
+        let level = priority[row];
+        (level, if level == 0 { ranges[row].len() } else { 0 }, row)
+    });
+    for row in order {
         let exponent = row_exponents[row];
         if exponent == i32::MIN {
             continue;
