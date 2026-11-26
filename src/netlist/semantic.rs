@@ -253,10 +253,10 @@ semantic_struct!(PrintCard { ascii_plot, analysis, requests } ignore { analysis_
 semantic_struct!(VectorRequest { vector } ignore { location });
 semantic_struct!(MeasureCard { analysis, name, request } ignore { analysis_location, name_location, location });
 semantic_struct!(MeasureWindow { from, to } ignore {});
-semantic_struct!(ParameterExpression { text, braced, quoted, root } ignore { span });
+semantic_struct!(ParameterExpression { text, braced, quoted, behavioural_alternative, root } ignore { span });
 semantic_struct!(FunctionBody { text, braced, quoted, scalar, behavioural } ignore { span });
 semantic_struct!(Expr { kind } ignore { span });
-semantic_struct!(BehaviouralExpression { text, verbatim, root } ignore { span });
+semantic_struct!(BehaviouralExpression { text, verbatim, scalar_alternative, root } ignore { span });
 semantic_struct!(BExpr { kind } ignore { span });
 semantic_struct!(TableTransfer { input, points, domain } ignore {});
 semantic_struct!(RawCard { raw, tokens, kind } ignore { location, source_map });

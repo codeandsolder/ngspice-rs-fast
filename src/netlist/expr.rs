@@ -113,6 +113,10 @@ pub struct ParameterExpression {
     pub quoted: bool,
     /// Span of [`text`](Self::text), excluding enclosing delimiters.
     pub span: SourceSpan,
+    /// Retained native behavioural interpretation of a potentially dynamic
+    /// passive value. Other scalar sites never need this alternative.
+    pub behavioural_alternative:
+        Option<Box<SpiceResult<crate::netlist::bexpr::BehaviouralExpression>>>,
     /// The syntax tree. `root.span` excludes surrounding whitespace.
     pub root: Expr,
 }

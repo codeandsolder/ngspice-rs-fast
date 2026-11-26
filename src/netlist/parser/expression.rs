@@ -804,6 +804,7 @@ fn parse_with_names(
                 text: text.to_owned(),
                 braced: braced || quoted,
                 quoted,
+                behavioural_alternative: None,
                 span: SourceSpan::from_positions(origin, origin.advance(text.len())),
                 root: root.node,
             },

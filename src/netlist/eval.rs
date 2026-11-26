@@ -1121,13 +1121,17 @@ fn collect_calls(expr: &Expr) -> impl Iterator<Item = (&str, usize, &SourceLoc)>
     })
 }
 
-/// Calls from the available phase trees. When scalar parsing succeeds it
-/// already describes the call spellings, including shadowable probes.
+/// Call descriptors from both phase trees. A repeated native conditional
+/// operator can discard a scalar operand, but macro expansion precedes that
+/// reduction in C; retain calls visible in the behavioural interpretation.
 fn function_body_calls(body: &FunctionBody) -> Vec<(&str, usize, &SourceLoc)> {
-    if let Ok(root) = &body.scalar {
-        return collect_calls(root).collect();
-    }
-    let mut calls = Vec::new();
+    let mut calls: Vec<_> = body
+        .scalar
+        .as_ref()
+        .ok()
+        .into_iter()
+        .flat_map(collect_calls)
+        .collect();
     if let Ok(root) = &body.behavioural {
         use crate::netlist::bexpr::BExprKind;
         root.visit(&mut |node| match &node.kind {
@@ -1141,6 +1145,8 @@ fn function_body_calls(body: &FunctionBody) -> Vec<(&str, usize, &SourceLoc)> {
             _ => {}
         });
     }
+    calls.sort_by_key(|&(name, arity, location)| (location.line, location.column, name, arity));
+    calls.dedup();
     calls
 }
 

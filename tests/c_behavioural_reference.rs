@@ -233,3 +233,21 @@ fn phase_correct_nested_macros_match_native_op_dc_ac_and_transient() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires NGSPICE_BIN; run with -- --ignored"]
+fn hidden_runtime_passive_macros_select_behavioural_precedence() {
+    let deck = "Hidden runtime passive macro precedence\n\
+        .func law(x) {v(ctrl)+x}\n\
+        v1 out 0 1\nv2 ctrl 0 1\n\
+        r1 out 0 {1+(2==3<1)+law(0)}\n";
+    let c = run_c("hidden-runtime-passive", deck, "op");
+    let rust = run_rust(deck, "op");
+    let expected = c.value("i(v1)", 0).unwrap().re;
+    let actual = rust.value("i(v1)", 0).unwrap().re;
+    assert!((expected + 0.5).abs() <= 1e-12);
+    assert!(
+        (actual - expected).abs() <= 1e-12,
+        "Rust {actual}, C {expected}"
+    );
+}

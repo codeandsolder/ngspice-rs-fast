@@ -35,14 +35,12 @@ use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{DeviceInstance, Netlist, ParameterAssignment, ParameterKind, ScopeView};
 use crate::netlist::bexpr::{
-    BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression, SPECIAL_NAMES,
-    STATISTICAL_FUNCTIONS, TableTransfer, is_builtin_function, round_like_c_literal,
+    BBinaryOp, BExpr, BExprKind, BehaviouralExpression, SPECIAL_NAMES, STATISTICAL_FUNCTIONS,
+    TableTransfer, is_builtin_function, round_like_c_literal,
 };
 use crate::netlist::elaborate::format_literal;
 use crate::netlist::eval::{EvalBudget, FunctionDef, FunctionScope, ParamScope};
-use crate::netlist::expr::{
-    BinaryOp, Expr, ExprKind, MAX_TREE_NODES, SourceSpan, TreeBudget, UnaryOp,
-};
+use crate::netlist::expr::{Expr, ExprKind, MAX_TREE_NODES, SourceSpan, TreeBudget};
 
 mod edits;
 pub(super) mod forms;
@@ -187,6 +185,7 @@ fn generated(root: BExpr, text: String, location: &SourceLoc) -> ParameterKind {
             logical: 0..0,
         },
         verbatim: true,
+        scalar_alternative: None,
         root,
     }))
 }
@@ -480,6 +479,7 @@ pub fn resolve_expression(
         text: expression.text.clone(),
         span: expression.span.clone(),
         verbatim: expression.verbatim,
+        scalar_alternative: None,
         root,
     })
 }
@@ -558,82 +558,83 @@ pub(crate) fn classify_passive(
         return Ok(());
     }
     let functions = scope.functions().map(Arc::as_ref);
-    let numeric;
-    let expression = match &parameter.kind {
+    let selected = match &parameter.kind {
         ParameterKind::Expression(value) => {
-            // A simple arithmetic parameter value cannot hide a runtime law.
-            let potentially_runtime = value.root.preorder().any(|node| match &node.kind {
-                ExprKind::Identifier(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
-                ExprKind::UserCall { .. } => true,
-                ExprKind::Call { function, .. } => {
-                    functions.is_some_and(|scope| scope.get(function.name()).is_some())
-                }
-                _ => false,
-            });
-            if !potentially_runtime
-                || !has_runtime(
-                    &value.root,
-                    functions,
-                    None,
-                    1,
-                    &mut TreeBudget::new(MAX_TREE_NODES),
-                )?
-            {
+            let Some(alternative) = &value.behavioural_alternative else {
                 return Ok(());
-            }
-            numeric = BehaviouralExpression {
-                text: value.spelling(),
-                span: value.span.clone(),
-                verbatim: false,
-                root: from_numparam(
-                    &value.root,
-                    1,
-                    &mut TreeBudget::new(MAX_TREE_NODES),
-                    functions,
-                )?,
             };
-            &numeric
+            match alternative
+                .as_ref()
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|expression| {
+                    expand_symbolic(expression, scope, budget).map(|root| (expression, root))
+                }) {
+                Ok((expression, root)) if root.uses_runtime() => {
+                    ParameterKind::Behavioural(Box::new(BehaviouralExpression {
+                        root,
+                        scalar_alternative: None,
+                        ..expression.clone()
+                    }))
+                }
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    // A scalar-only operator or function can be legal when
+                    // the expansion has no runtime dependencies. Use the
+                    // scalar grammar only to decide whether that phase is
+                    // still viable, never to construct a behavioural tree.
+                    if has_runtime(
+                        &value.root,
+                        functions,
+                        None,
+                        1,
+                        &mut TreeBudget::new(MAX_TREE_NODES),
+                    )? {
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+            }
         }
-        ParameterKind::Behavioural(expression) => expression,
+        ParameterKind::Behavioural(expression) => {
+            match expand_symbolic(expression, scope, budget) {
+                Ok(root) if root.uses_runtime() => {
+                    ParameterKind::Behavioural(Box::new(BehaviouralExpression {
+                        root,
+                        scalar_alternative: None,
+                        ..expression.as_ref().clone()
+                    }))
+                }
+                Ok(_) => {
+                    // Directly written behavioural laws without a retained
+                    // scalar alternative are already classified.
+                    let Some(alternative) = &expression.scalar_alternative else {
+                        return Ok(());
+                    };
+                    ParameterKind::Expression(Box::new(
+                        alternative.as_ref().as_ref().map_err(Clone::clone)?.clone(),
+                    ))
+                }
+                Err(error) => {
+                    let Some(Ok(scalar)) = expression.scalar_alternative.as_deref() else {
+                        return Err(error);
+                    };
+                    if has_runtime(
+                        &scalar.root,
+                        functions,
+                        None,
+                        1,
+                        &mut TreeBudget::new(MAX_TREE_NODES),
+                    )? {
+                        return Err(error);
+                    }
+                    ParameterKind::Expression(Box::new(scalar.clone()))
+                }
+            }
+        }
         _ => return Ok(()),
     };
-    let root = expand_symbolic(expression, scope, budget)?;
-    let mut runtime = false;
-    root.visit(&mut |expr| {
-        runtime |= match &expr.kind {
-            BExprKind::Voltage { .. } | BExprKind::Current(_) => true,
-            BExprKind::Name(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
-            BExprKind::Call { name, .. } => name == "ddt",
-            _ => false,
-        };
-    });
-    if runtime {
-        parameter.kind = ParameterKind::Behavioural(Box::new(BehaviouralExpression {
-            root,
-            ..expression.clone()
-        }));
-    } else if matches!(parameter.kind, ParameterKind::Behavioural(_)) {
-        // A locally shadowed probe call or an erased macro argument may
-        // make the syntactically behavioural candidate an ordinary scalar.
-        // Preserve the original numeric evaluation and its site metadata.
-        let text = &expression.text;
-        let inner = text.get(1..text.len().saturating_sub(1)).ok_or_else(|| {
-            parse_error(
-                &expression.span,
-                "missing passive expression delimiters".into(),
-            )
-        })?;
-        let mut value = crate::netlist::parse_parameter_expression(
-            inner,
-            &expression
-                .span
-                .start
-                .at_column(expression.span.start.column + 1),
-        )?;
-        value.braced = true;
-        value.quoted = text.starts_with('\'');
-        parameter.kind = ParameterKind::Expression(Box::new(value));
-    }
+    parameter.kind = selected;
     Ok(())
 }
 
@@ -1028,123 +1029,6 @@ impl Resolver<'_> {
             },
             span: expr.span.clone(),
         })
-    }
-}
-
-/// Convert a passive's potentially runtime scalar site to a behavioural
-/// tree. Macro bodies themselves select their native phase grammar.
-fn from_numparam(
-    expr: &Expr,
-    depth: usize,
-    budget: &mut TreeBudget,
-    functions: Option<&FunctionScope>,
-) -> SpiceResult<BExpr> {
-    budget.charge(depth, 1, &expr.span.start)?;
-    let mut convert = |expr: &Expr| from_numparam(expr, depth + 1, budget, functions).map(Box::new);
-    let kind = match &expr.kind {
-        ExprKind::Number { value, spelling } => BExprKind::Number {
-            value: *value,
-            spelling: spelling.clone(),
-        },
-        ExprKind::Identifier(name) => BExprKind::Name(name.clone()),
-        ExprKind::Unary { op, operand } => BExprKind::Unary {
-            op: match op {
-                UnaryOp::Plus => BUnaryOp::Plus,
-                UnaryOp::Minus => BUnaryOp::Minus,
-                UnaryOp::Not => BUnaryOp::Not,
-            },
-            operand: convert(operand)?,
-        },
-        ExprKind::Binary { op, lhs, rhs } => BExprKind::Binary {
-            op: match op {
-                BinaryOp::Add => BBinaryOp::Add,
-                BinaryOp::Sub => BBinaryOp::Sub,
-                BinaryOp::Mul => BBinaryOp::Mul,
-                BinaryOp::Div => BBinaryOp::Div,
-                BinaryOp::Pow => BBinaryOp::Pow,
-                BinaryOp::Eq => BBinaryOp::Eq,
-                BinaryOp::Ne => BBinaryOp::Ne,
-                BinaryOp::Lt => BBinaryOp::Lt,
-                BinaryOp::Le => BBinaryOp::Le,
-                BinaryOp::Gt => BBinaryOp::Gt,
-                BinaryOp::Ge => BBinaryOp::Ge,
-                BinaryOp::And => BBinaryOp::And,
-                BinaryOp::Or => BBinaryOp::Or,
-                BinaryOp::Rem | BinaryOp::IntDiv => {
-                    return Err(parse_error(
-                        &expr.span,
-                        "numparam quotient operator is not a native behavioural operator".into(),
-                    ));
-                }
-            },
-            lhs: convert(lhs)?,
-            rhs: convert(rhs)?,
-        },
-        ExprKind::Ternary {
-            condition,
-            then,
-            otherwise,
-        } => BExprKind::Ternary {
-            condition: convert(condition)?,
-            then: convert(then)?,
-            otherwise: convert(otherwise)?,
-        },
-        ExprKind::Call {
-            function,
-            arguments: operands,
-        } => BExprKind::Call {
-            name: function.name().to_owned(),
-            arguments: operands
-                .iter()
-                .map(|operand| from_numparam(operand, depth + 1, budget, functions))
-                .collect::<SpiceResult<_>>()?,
-        },
-        ExprKind::Group(inner) => BExprKind::Group(convert(inner)?),
-        ExprKind::UserCall {
-            name,
-            arguments: operands,
-        } => {
-            if functions.is_none_or(|scope| scope.get(name).is_none())
-                && let Some(kind) = circuit_quantity(name, operands)
-            {
-                kind
-            } else {
-                BExprKind::Call {
-                    name: name.clone(),
-                    arguments: operands
-                        .iter()
-                        .map(|operand| from_numparam(operand, depth + 1, budget, functions))
-                        .collect::<SpiceResult<_>>()?,
-                }
-            }
-        }
-    };
-    Ok(BExpr {
-        kind,
-        span: expr.span.clone(),
-    })
-}
-
-fn literal_name(expr: &Expr) -> Option<String> {
-    match &expr.kind {
-        ExprKind::Identifier(name) => Some(name.clone()),
-        ExprKind::Number { spelling, .. } => Some(spelling.to_ascii_lowercase()),
-        _ => None,
-    }
-}
-
-fn circuit_quantity(name: &str, arguments: &[Expr]) -> Option<BExprKind> {
-    match (name, arguments) {
-        ("v", [positive]) => Some(BExprKind::Voltage {
-            positive: literal_name(positive)?,
-            negative: None,
-        }),
-        ("v", [positive, negative]) => Some(BExprKind::Voltage {
-            positive: literal_name(positive)?,
-            negative: Some(literal_name(negative)?),
-        }),
-        ("i", [source]) => Some(BExprKind::Current(literal_name(source)?)),
-        _ => None,
     }
 }
 

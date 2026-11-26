@@ -71,7 +71,7 @@ fn passive_parameters(
     let leading = opt(|input: &mut Input<'_>| passive_leading(input, primary)).parse_next(input)?;
     let model = opt(passive_model).parse_next(input)?;
     let after_model = if model.is_some() {
-        opt(leading_value).parse_next(input)?
+        opt(|input: &mut Input<'_>| passive_leading(input, primary)).parse_next(input)?
     } else {
         None
     };
@@ -83,7 +83,7 @@ fn passive_parameters(
     }
     parameters.extend(remaining);
     if let Some(value) = after_model {
-        parameters.push(assignment(primary, value));
+        parameters.push(value);
     }
     if model.is_none()
         && !parameters.iter().any(|parameter| {
@@ -141,8 +141,9 @@ fn passive_model<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
     .parse_next(input)
 }
 
-// Runtime quantities are identified in the parsed tree, not by matching
-// substrings (e.g. a parameter called "time_constant" is still static).
+// Parse both languages from the original positioned token when lexical
+// expansion can affect the phase of a passive law. Do not translate the
+// scalar AST: its precedence and literal semantics differ from B sources.
 fn behavioural_passive_value(
     input: &mut Input<'_>,
     name: &str,
@@ -162,32 +163,58 @@ fn behavioural_passive_value(
             Ok(None)
         };
     };
-    let expression = super::bexpression::parse_complete(
+    let behavioural = super::bexpression::parse_complete(
         &token.text,
         token.position(),
         false,
         input.state.auto_gnd,
     );
-    let tree = match expression {
-        Ok(tree) => tree,
-        Err(error) if force => return Err(ErrMode::Cut(Failure(error))),
-        Err(_) => return Ok(None),
-    };
-    let mut runtime = force;
-    tree.root.visit(&mut |node| {
-        use crate::netlist::bexpr::BExprKind;
-        runtime |= match &node.kind {
-            BExprKind::Voltage { .. } | BExprKind::Current(_) => true,
-            BExprKind::Name(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
-            BExprKind::Call { name, .. } => name == "ddt",
-            _ => false,
-        };
-    });
-    if !runtime {
-        return Ok(None);
+    if force {
+        let tree = behavioural.map_err(|error| ErrMode::Cut(Failure(error)))?;
+        let at = any.parse_next(input)?;
+        return Ok(Some(super::behavioural::behavioural(name, at, tree)));
     }
-    let at = any.parse_next(input)?;
-    Ok(Some(super::behavioural::behavioural(name, at, tree)))
+    let scalar = super::expression::from_brace_token(token);
+    let runtime = behavioural
+        .as_ref()
+        .is_ok_and(|tree| tree.root.uses_runtime());
+    let parameter = match (scalar, behavioural) {
+        (scalar, Ok(mut tree)) if runtime => {
+            tree.scalar_alternative = Some(Box::new(scalar));
+            super::behavioural::behavioural(name, token, tree)
+        }
+        (Ok(mut scalar), alternative) => {
+            use crate::netlist::expr::ExprKind;
+            // A function can hide a runtime quantity, or be shadowed at a
+            // later lexical site. Pure arithmetic needs only one tree.
+            if scalar.root.preorder().any(|node| {
+                matches!(node.kind, ExprKind::Call { .. } | ExprKind::UserCall { .. })
+                    || matches!(&node.kind, ExprKind::Identifier(name) if matches!(name.as_str(), "time" | "temper" | "hertz"))
+            }) {
+                scalar.behavioural_alternative = Some(Box::new(alternative));
+            }
+            assignment(
+                name,
+                super::syntax::Value::Expression(token, Box::new(scalar)),
+            )
+        }
+        (Err(error), Ok(mut tree)) => {
+            // A behavioural-only spelling with a macro may be legal once
+            // the definition's runtime dependencies are known.
+            let mut has_call = false;
+            tree.root.visit(&mut |node| {
+                has_call |= matches!(node.kind, crate::netlist::bexpr::BExprKind::Call { .. });
+            });
+            if !has_call {
+                return Err(ErrMode::Cut(Failure(error)));
+            }
+            tree.scalar_alternative = Some(Box::new(Err(error)));
+            super::behavioural::behavioural(name, token, tree)
+        }
+        (Err(error), Err(_)) => return Err(ErrMode::Cut(Failure(error))),
+    };
+    any.parse_next(input)?;
+    Ok(Some(parameter))
 }
 
 fn passive_leading(input: &mut Input<'_>, name: &str) -> Result<ParameterAssignment> {
