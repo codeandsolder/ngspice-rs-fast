@@ -221,8 +221,10 @@ pub struct TableTransfer {
 
 /// The function names of `inpptree.c`'s `funcs[]` table (plus the
 /// parse-time `ternary_fcn` and `gauss`), in that order. Only these names are
-/// callable in a B expression; explicit prepared source-law intrinsics
-/// are listed alongside native built-ins. Other names must be user `.func` calls.
+/// callable in a B expression.
+///
+/// Explicit prepared source-law intrinsics are listed alongside native
+/// built-ins. Other names must be user `.func` calls.
 pub const BUILTIN_FUNCTIONS: &[&str] = &[
     "abs",
     "acos",

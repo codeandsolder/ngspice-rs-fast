@@ -996,7 +996,7 @@ fn real_part_power(part: PowerPart, a: Real, b: Real) -> Real {
         PowerPart::Base if b == 0. => 0.,
         PowerPart::Base => a.signum() * b * c_pow(magnitude, b - 1.) * cos,
         PowerPart::Exponent => {
-            c_pow(magnitude, b) * (magnitude.ln() * cos - core::f64::consts::PI * sin)
+            c_pow(magnitude, b) * magnitude.ln().mul_add(cos, -core::f64::consts::PI * sin)
         }
     }
 }
