@@ -756,3 +756,80 @@ fn series_probe_elimination_preserves_the_physical_residual_and_jacobian() {
         }
     }
 }
+
+#[test]
+fn explicit_absolute_power_values_and_jacobians() {
+    let compiled = program("simetrix_abs_pow(v(x),v(p))");
+    for (base, exponent, expected, slope, exponent_slope) in [
+        (-4., 0.5, 2., -0.25, 2. * 4_f64.ln()),
+        (4., 0.5, 2., 0.25, 2. * 4_f64.ln()),
+        (-2., 3., 8., -12., 8. * 2_f64.ln()),
+        (0., 0.25, 0., 0., 0.),
+        (0., 0.5, 0., 0., 0.),
+        (0., 1., 0., 0., 0.),
+        (0., 1.5, 0., 0., 0.),
+        (0., 0., 1., 0., 0.),
+    ] {
+        let actual = compiled.evaluate(&environment(&[base, exponent])).unwrap();
+        assert_eq!(actual.value, expected);
+        assert_eq!(actual.gradient, [slope, exponent_slope]);
+    }
+    assert!(compiled.evaluate(&environment(&[0., -0.5])).is_err());
+    assert_gradient("simetrix_abs_pow(v(a),v(b))", POINTS);
+}
+
+#[test]
+fn explicit_caret_and_complex_real_powers_are_distinct() {
+    let caret = program("simetrix_caret_pow(v(x),v(p))");
+    let real = program("simetrix_pow(v(x),v(p))");
+    for (base, exponent, expected, slope) in [
+        (-2., 3., -8., 12.),
+        (-2., 2., 4., -4.),
+        (-2., -3., -0.125, -0.1875),
+        (0., 1., 0., 1.),
+        (0., 0., 1., 0.),
+    ] {
+        for compiled in [&caret, &real] {
+            let actual = compiled.evaluate(&environment(&[base, exponent])).unwrap();
+            assert_eq!(actual.value, expected);
+            assert_eq!(actual.gradient[0], slope);
+        }
+    }
+    let result = caret.evaluate(&environment(&[-2., 3.])).unwrap();
+    assert!((result.gradient[1] - 1842.068_074_4).abs() < 1e-7);
+    let result = real.evaluate(&environment(&[-2., 3.])).unwrap();
+    assert!((result.gradient[1] + 5.545_177_444_5).abs() < 1e-10);
+    assert!(caret.evaluate(&environment(&[-2., 0.5])).is_err());
+    let result = real.evaluate(&environment(&[-2., 0.5])).unwrap();
+    assert!((result.value - 8.673_617_379_9e-17).abs() < 1e-18);
+    assert!((result.gradient[0] + 2.164_89e-17).abs() < 1e-18);
+    let result = caret.evaluate(&environment(&[0., 0.5])).unwrap();
+    assert!((result.value / 1e-154 - 1.).abs() < 1e-12);
+    assert!((result.gradient[0] / 5e99 - 1.).abs() < 1e-12);
+    assert_gradient("simetrix_pow(v(a),v(b))", POINTS);
+    assert_gradient("simetrix_caret_pow(v(a),v(b))", &[&[("a", 0.3), ("b", -0.7)]]);
+    // Native compatibility policy remains selected by native spellings.
+    assert_eq!(value("pow(0,0)", &[]), 0.);
+    assert_eq!(value("pwr(-2,3)", &[]), -8.);
+    assert_eq!(value("(-2)^.5", &[]), 0.);
+}
+
+#[test]
+fn only_explicit_ordered_zero_factor_masks_absolute_power_singularity() {
+    let compiled = program("simetrix_abs_pow_product(sgn(v(x)),v(x),-.5)");
+    for (base, expected, slope) in [(0., 0., 0.), (4., 0.5, -0.0625), (-4., -0.5, -0.0625)] {
+        let actual = compiled.evaluate(&environment(&[base])).unwrap();
+        assert_eq!(actual.value, expected);
+        assert_eq!(actual.gradient, [slope]);
+    }
+    let compiled = program("simetrix_abs_pow_product(v(f),v(x),v(p))");
+    let result = compiled.evaluate(&environment(&[0., 4., 0.5])).unwrap();
+    assert_eq!(result.value, 0.);
+    assert_eq!(result.gradient, [2., 0., 0.]);
+    assert!(compiled.evaluate(&environment(&[1., 0., -0.5])).is_err());
+    let result = compiled.evaluate(&environment(&[0., 0., -0.5])).unwrap();
+    assert_eq!(result.value, 0.);
+    assert_eq!(result.gradient, [0., 0., 0.]);
+    let ordinary = program("sgn(v(x))*simetrix_abs_pow(v(x),-.5)");
+    assert!(ordinary.evaluate(&environment(&[0.])).is_err());
+}

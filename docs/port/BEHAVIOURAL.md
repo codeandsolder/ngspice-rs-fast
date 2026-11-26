@@ -74,3 +74,32 @@ Independent candidates and new prepared circuits retain separate scratch.
 Current test results, performance measurements and deployment details live
 in the companion Notion implementation page; this page describes only
 the current runtime contract.
+
+## Explicit prepared source power laws (#196)
+
+Native ngspice `^`, `**`, `pow()` and `pwr()` retain their existing
+value and Jacobian policies. A producer targeting this engine can instead
+select an explicit prepared behavioral intrinsic. These names denote
+typed numerical operations, not a simulator-wide compatibility setting.
+
+| Intrinsic | Value law | Jacobian |
+| --- | --- | --- |
+| `simetrix_abs_pow(x,p)` | Absolute-base power (source `**` and PWR); 0^0 = 1, zero-base negative exponent is a domain error | Signed base slope off zero; both partials zero at zero for nonnegative exponents |
+| `simetrix_caret_pow(x,p)` | Signed integer power; rejects negative fractional bases | Signed base derivative; measured zero-base fractional floors and nonpositive-base logarithmic floor |
+| `simetrix_pow(x,p)` | Real component of principal complex power | Partials of that real component; exact integer signs |
+| `simetrix_abs_pow_product(f,x,p)` | Ordered factor times absolute-base power; zero factor masks only the zero-base negative-power singularity | Zero for the masked branch, ordinary product rule elsewhere |
+
+The value and analytic partials use one explicit power-law selector in the
+immutable execution plan. The product guard is lazy; it does not turn
+an isolated singular power into a finite number. Ordinary native
+multiplication retains its original evaluation behavior.
+
+A native-deck producer must preserve the source power precedence (both
+infix powers left-associate, and source unary signs bind to operands).
+These intrinsic calls are the prepared runtime representation, not a
+change to the native infix grammar or static numparam grammar. The
+observed caret floors are 1e-308 for the positive fractional primal at
+zero, 1e-200 for its base derivative at zero, and 1e-100 for the exponent
+logarithm at nonpositive base. General static comparison/conditional
+expressions are tracked separately. The native ngspice-compatible
+guarded expression output remains a distinct target.
