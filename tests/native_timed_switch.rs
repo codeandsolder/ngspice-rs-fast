@@ -1,6 +1,6 @@
 //! Native physical timed-switch qualification against the independent
 //! ngspice-47 reference, with actual source-deck and MNA execution.
-use ngspice_rs::analysis::{AnalysisInput, Plot, RunConfig, companion::companion_transient};
+use ngspice_rs::analysis::{AnalysisInput, Plot, RunConfig, companion_transient};
 use ngspice_rs::devices::Circuit;
 use ngspice_rs::netlist::{Parser, source::parse_deck_text};
 use ngspice_rs::primitives::{AnalysisKind, SpiceResult};
@@ -184,4 +184,87 @@ fn zero_delay_stiff_load_and_analog_fast_path() -> SpiceResult<()> {
     assert_eq!(stats.device_event_retries, 0);
     assert_eq!(stats.device_event_landings, 0);
     Ok(())
+}
+
+#[test]
+fn actual_prepared_timed_switch_scopes_and_input_loading() -> anyhow::Result<()> {
+    use ngspice_rs_preprocess::{
+        Cancellation, CodeModelRuntime, InputFormat, Options, Request, SourceInput, prepare,
+    };
+    use std::fs;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("timed.net");
+    fs::write(
+        &path,
+        r"* scoped timed switch
+Vref rtn 0 0.75
+Vdrive a rtn 2.5
+Vbias p rtn 1
+X1 p rtn a rtn T R=10 INIT=1
+X2 p rtn a rtn T R=20 INIT=0
+.subckt T p n cp cn params: R=10 OFF=1Meg TOL=100p INIT=1
+S1 p n cp cn M IC={INIT}
+.model M VSWITCH(RON={max(R,1)}, ROFF={OFF}, VT=2.5, VH=0.5, TIMETOL={max(TOL,1p)}, GIN=0.125)
+.ends T
+.end
+",
+    )?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::SimetrixDeck,
+            input: SourceInput::File(path),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    assert_eq!(bundle.required_code_models(), [CodeModelRuntime::Logic]);
+    for artifact in bundle.artifacts() {
+        fs::write(dir.path().join(&artifact.filename), &artifact.bytes)?;
+    }
+    let source = Parser::new().parse_file(dir.path().join(&bundle.primary.filename))?;
+    let config = RunConfig::from_netlist(&source)?;
+    let mut c = config.prepared_circuit(&source, &bundle.waveforms)?;
+    let p = plan(&config, AnalysisKind::OperatingPoint, &[])?;
+    let plot = p.run(&mut c, &config.context())?;
+    close(
+        "branch",
+        -value(&plot, "i(vbias)", 0),
+        0.100001,
+        1e-10,
+        1e-13,
+    );
+    close("input", -value(&plot, "i(vdrive)", 0), 0.625, 1e-10, 1e-13);
+    Ok(())
+}
+
+#[test]
+fn invalid_scoped_physics_and_ports_are_rejected() {
+    for parameter in [
+        "ron=0",
+        "roff=-1",
+        "ron=1e-320",
+        "ton=0",
+        "toff=-1n",
+        "td_on=-1n",
+        "td_off=-1n",
+        "vh=-1",
+        "vt=1e308 vh=1e308",
+        "timetol=0",
+        "timetol=.1f",
+        "ic=2",
+        "extra=1",
+    ] {
+        let source = format!(
+            "invalid timed model\nvdrive a 0 5\nvbias p 0 1\na1 %v(a) %gd(p 0) m\n.model m preprocess_timed_switch({parameter})\n.end\n"
+        );
+        assert!(deck(&source).is_err(), "{parameter}");
+    }
+    for ports in ["%d(a) %gd(p 0)", "%v(a) %v(p)", "%v[a] %gd(p 0)"] {
+        let source = format!(
+            "invalid timed ports\nvdrive a 0 5\nvbias p 0 1\na1 {ports} m\n.model m preprocess_timed_switch(ron=10)\n.end\n"
+        );
+        assert!(deck(&source).is_err(), "{ports}");
+    }
 }
