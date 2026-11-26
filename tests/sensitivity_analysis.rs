@@ -718,3 +718,23 @@ fn physical_sensitivity_workload_timing() {
         );
     }
 }
+
+#[test]
+fn active_diode_recovery_dc_sensitivity_preserves_the_static_root() {
+    let run = |vp: f64, scale: f64| {
+        sens(&format!(
+            "v1 a 0 dc 1\nr1 a d 100\nd1 d 0 dm\n\
+             .model dm d(is=1e-14 tt=100n vp={vp} qpscale={scale})\n\
+             .options reltol=1e-10 vntol=1e-13 abstol=1e-16\n\
+             .sens v(d) d1:vp d1:qpscale d1:n"
+        ))
+        .unwrap()
+    };
+    let baseline = run(0., 1e6);
+    for scale in [1., 1e6, 1e9] {
+        let active = run(0.05, scale);
+        close(value(&active, "v(d1:n)"), value(&baseline, "v(d1:n)"), 1e-5);
+        assert!(value(&active, "v(d1:vp)").abs() < 1e-9);
+        assert!(value(&active, "v(d1:qpscale)").abs() < 1e-12);
+    }
+}

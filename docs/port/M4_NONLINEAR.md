@@ -110,8 +110,8 @@ use the same relaxation equation. VP defaults to zero; if VP or TT is zero,
 the original junction charge and topology are retained. QPSCALE controls
 only the numerical coordinate (default 1e6), not the physical charge or
 relaxation time. The ngspice 47 reference does not recognize QPSCALE;
-coordinate scaling is independently qualified. Active recovery sensitivity
-and distortion are not yet qualified.
+coordinate scaling is independently qualified. Sensitivity replays retain the original recovery coordinate and equation
+normalization. Active recovery distortion is explicitly unsupported.
 
 Not yet ported (`SpiceError::NotYetPorted`, naming the C file): separate
 sidewall resistance (`RSW`), self-heating

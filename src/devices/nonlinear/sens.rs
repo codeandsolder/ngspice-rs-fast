@@ -561,7 +561,14 @@ impl Device for ResetDiode {
             })
             .collect();
         ResetStamps::new(&self.current.name, 'd', &self.current.terminals, stamps)?
-            .assemble_linear(context)
+            .assemble_linear(context)?;
+        // C's reset AC load retains the resistive Jacobian from the
+        // reset records but uses current VP/TT for the recovery subcircuit.
+        let thermal = self.current.thermal(model)?;
+        if let Some(recovery) = self.current.recovery(&thermal) {
+            recovery.assemble_linear(context, self.current.junction, geq)?;
+        }
+        Ok(())
     }
 }
 

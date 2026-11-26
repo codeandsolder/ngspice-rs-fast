@@ -275,3 +275,65 @@ fn inactive_recovery_reduces_to_the_original_junction_without_an_auxiliary_node(
         assert!(b.column("v(d1#qp)").is_none());
     }
 }
+
+#[test]
+fn soft_recovery_transient_conserves_physical_charge_independent_of_coordinate_scale() {
+    // An ideal voltage source holds the junction at 0.7 V before a finite
+    // ramp to 0.2 V. The inhomogeneous recovery ODE can be integrated
+    // analytically over the ramp, followed by exponential relaxation.
+    let tt: f64 = 100e-9;
+    let vp = 0.05;
+    let tau = vp * tt;
+    let vt = K_OVER_Q * 300.15;
+    let saturation = 1e-14;
+    let initial_v = 0.7;
+    let final_v = 0.2;
+    let ramp_start = 100e-9;
+    let ramp_duration = 1e-9;
+    let ramp_end = ramp_start + ramp_duration;
+    let rate = (initial_v - final_v) / ramp_duration;
+    let k = rate / vt;
+    let decay = (-ramp_duration / tau).exp();
+    let current = |v: f64| saturation * (v / vt).exp_m1() + GMIN * v;
+    let initial_q = tt * current(initial_v);
+    let exponential =
+        saturation * (initial_v / vt).exp() * ((-k * ramp_duration).exp() - decay) / (1. - k * tau);
+    let linear = GMIN * (final_v + rate * tau - (initial_v + rate * tau) * decay);
+    let final_q = initial_q * decay + tt * (exponential - saturation * (1. - decay) + linear);
+    let equilibrium = tt * current(final_v);
+    let excess = |t: f64| (final_q - equilibrium) * (-(t - ramp_end) / tau).exp();
+    for method in ["trap", "gear"] {
+        for scale in [1., 1e6, 1e9] {
+            let p = simulate(&format!(
+                "v1 a 0 pwl(0 0.7 100n 0.7 101n 0.2 160n 0.2)\n\
+                 d1 a 0 dm\n.model dm d(is=1e-14 tt=100n vp={vp} qpscale={scale})\n\
+                 .options method={method} reltol=1e-6 vntol=1e-9 abstol=1e-14\n\
+                 .tran 50p 160n 0 50p"
+            ));
+            let time = p.column("time").unwrap();
+            let input = p.column("i(v1)").unwrap();
+            let first = time.partition_point(|v| v.re < ramp_end + 0.25e-9);
+            assert!(first + 1 < time.len());
+            let mut integral = 0.;
+            let conduction = current(final_v);
+            for i in first..time.len() {
+                let expected = (1. - vp) * excess(time[i].re) / tau;
+                let recovery = input[i].re + conduction;
+                assert!(
+                    (recovery - expected).abs() <= 2e-3 * expected.abs() + 1e-8,
+                    "{method} scale={scale} t={}: {recovery} vs {expected}",
+                    time[i].re
+                );
+                if i > first {
+                    let previous = input[i - 1].re + conduction;
+                    integral += 0.5 * (recovery + previous) * (time[i].re - time[i - 1].re);
+                }
+            }
+            let expected = (1. - vp) * (excess(time[first].re) - excess(time.last().unwrap().re));
+            assert!(
+                (integral - expected).abs() <= 2e-3 * expected.abs(),
+                "{method} scale={scale}: integrated {integral} vs {expected}"
+            );
+        }
+    }
+}

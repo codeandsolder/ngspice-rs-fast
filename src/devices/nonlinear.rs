@@ -328,7 +328,7 @@ pub struct Diode {
     model: String,
     terminals: Vec<NodeId>,
     junction: [NodeId; 2],
-    recovery_node: Option<NodeId>,
+    recovery_node: Option<recovery::RecoveryBinding>,
     parameters: DiodeParameters,
     derived: DerivedCache<DiodeThermalKey, Thermal>,
     /// `off` and the instance `ic` (C `DIOoff`, `DIOinitCond`). The `ic`
@@ -778,7 +778,7 @@ impl DiodeInput {
             let qp = nodes.intern(&name)?;
             nodes.set_kind(qp, NodeKind::Internal)?;
             terminals.push(qp);
-            Some(qp)
+            Some(recovery::RecoveryBinding::new(qp, &self.parameters.model))
         } else {
             None
         };
@@ -1819,7 +1819,8 @@ impl Device for Diode {
         ] {
             setup.nodes(row, col);
         }
-        if let Some(qp) = self.recovery_node {
+        if let Some(binding) = self.recovery_node {
+            let qp = binding.node;
             for (row, col) in [(qp, qp), (qp, prime), (qp, neg), (prime, qp), (neg, qp)] {
                 setup.nodes(row, col);
             }
@@ -1849,6 +1850,14 @@ impl Device for Diode {
     }
     fn terminals(&self) -> &[NodeId] {
         &self.terminals
+    }
+    fn external_terminals(&self) -> &[NodeId] {
+        &self.terminals[..2]
+    }
+    fn constitutive_nodes(&self) -> &[NodeId] {
+        self.recovery_node
+            .as_ref()
+            .map_or(&[], |binding| std::slice::from_ref(&binding.node))
     }
     fn is_nonlinear(&self) -> bool {
         true
@@ -1983,12 +1992,6 @@ impl Device for Diode {
         &self,
         context: &ModelContext,
     ) -> SpiceResult<Box<dyn crate::devices::sensitivity::DeviceSensitivity + '_>> {
-        if self.recovery_node.is_some() {
-            return Err(SpiceError::not_yet_ported(
-                "diode soft-recovery sensitivity",
-                "src/spicelib/analysis/cktsens.c",
-            ));
-        }
         Ok(Box::new(sens::DiodeSensitivity::new(self, context)))
     }
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
@@ -2002,6 +2005,23 @@ impl Device for Diode {
         )?;
         let evaluation = sample.evaluate(context.gmin)?;
         self.commit_load(context, &evaluation)
+    }
+    fn convergence_test(
+        &self,
+        context: &crate::devices::traits::ConvergenceContext<'_>,
+    ) -> SpiceResult<bool> {
+        if self.recovery_node.is_none() {
+            return Ok(false);
+        }
+        let thermal = self.thermal(context.model_context)?;
+        let voltage = context.voltage(self.junction[0]) - context.voltage(self.junction[1]);
+        let current = thermal
+            .point(voltage, context.model_context.gmin)?
+            .junction
+            .current;
+        self.recovery(&thermal).map_or(Ok(false), |recovery| {
+            recovery.not_converged(context, current)
+        })
     }
     fn assemble_nonlinear_charge(
         &self,
