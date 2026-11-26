@@ -305,3 +305,80 @@ m1 d g 0 0 nch l=1u w=1u
         }
     }
 }
+
+#[test]
+fn instantaneous_physical_residual_releases_all_bias_constraints() {
+    use ngspice_rs::devices::{Limit, TransientTiming};
+    use ngspice_rs::maths::Vector;
+    let (netlist, config, mut circuit) =
+        deck("v1 a 0 2\nr1 a b 1k\nc1 b 0 1n\nr2 a c 1k\nl1 c 0 1m\n.tran 1u 10u");
+    circuit
+        .bind_passive_initialization(
+            "c1",
+            PassiveInitialization::new(
+                StorageKind::Capacitor,
+                Some(1.),
+                [(AnalysisKind::Transient, voltage(1., None))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    circuit
+        .bind_passive_initialization(
+            "l1",
+            PassiveInitialization::new(
+                StorageKind::Inductor,
+                Some(1e-3),
+                [(AnalysisKind::Transient, current(1e-3, 0.))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    circuit
+        .bind_node_initialization(
+            "b",
+            NodeInitialization::new(
+                3.,
+                netlist.location.clone(),
+                [(AnalysisKind::Transient, 3., 0.1)],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    circuit.finalize().unwrap();
+    let names = circuit.unknown_names();
+    let row = |name: &str| {
+        names
+            .iter()
+            .position(|candidate| candidate == name)
+            .unwrap()
+    };
+    let (a, b, c, cb, lb) = (
+        row("a"),
+        row("b"),
+        row("c"),
+        row("c1#branch"),
+        row("l1#branch"),
+    );
+    let mut state = Vector::zeros(circuit.unknown_count());
+    for (row, value) in [(a, 2.), (b, 0.5), (c, 0.2), (cb, 0.25), (lb, 3e-3)] {
+        state.set(row, value).unwrap();
+    }
+    let mut model = config.context().model_context();
+    model.bias_analysis = Some(AnalysisKind::Transient);
+    let run = circuit.prepare_run();
+    let mut dae = run
+        .prepare_physical_dae(&model, TransientTiming::new(1e-6, 10e-6).unwrap())
+        .unwrap();
+    let point = dae.evaluate(&state, 1e-6, Limit::Right).unwrap();
+    close(point.residual.as_slice()[a], 3.3e-3, 1e-12);
+    close(point.residual.as_slice()[b], -1.5e-3, 1e-12);
+    close(point.residual.as_slice()[c], 1.2e-3, 1e-12);
+    close(point.residual.as_slice()[cb], 0.25, 1e-12);
+    close(point.residual.as_slice()[lb], 0.2, 1e-12);
+    close(point.conductance.get(cb, cb), 1., 1e-12);
+    close(point.conductance.get(b, cb), 0., 1e-12);
+    close(point.conductance.get(b, b), 1e-3, 1e-12);
+    close(point.charge.as_slice()[b], 0.5e-9, 1e-20);
+    close(point.charge.as_slice()[lb], -3e-6, 1e-15);
+}

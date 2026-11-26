@@ -135,7 +135,7 @@ impl PassiveInitialization {
     }
 
     fn active(&self, context: &StampContext<'_>) -> Option<PassiveBias> {
-        if !context.mode.is_dc() {
+        if !context.mode.is_bias() {
             return None;
         }
         self.bias.get(&context.bias_analysis?).copied()
