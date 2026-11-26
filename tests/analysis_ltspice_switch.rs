@@ -218,8 +218,44 @@ fn check_smooth_point(
             );
         }
     }
-    let linear = circuit.small_signal_system(&ModelContext::default(), &bias)?;
-    let pencil = circuit.pole_zero_system_at(&ModelContext::default(), &bias, None)?;
+    check_smooth_small_signal(
+        circuit,
+        &bias,
+        &matrix,
+        [p, n, cp, cn],
+        SmoothBias {
+            level,
+            limit,
+            control,
+            voltage,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SmoothBias {
+    level: u8,
+    limit: Option<f64>,
+    control: f64,
+    voltage: f64,
+}
+
+fn check_smooth_small_signal(
+    circuit: &Circuit,
+    bias: &Vector,
+    matrix: &SparseMatrix,
+    [p, n, cp, cn]: [usize; 4],
+    point: SmoothBias,
+) -> TestResult {
+    let SmoothBias {
+        level,
+        limit,
+        control,
+        voltage,
+    } = point;
+    let expected = reference(level, control, voltage, limit);
+    let linear = circuit.small_signal_system(&ModelContext::default(), bias)?;
+    let pencil = circuit.pole_zero_system_at(&ModelContext::default(), bias, None)?;
     for row_index in [p, n] {
         for col in [p, n, cp, cn] {
             let physical = matrix.get(row_index, col);
