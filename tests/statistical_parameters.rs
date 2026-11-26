@@ -168,3 +168,96 @@ fn behavioural_candidates_keep_draws_across_reelaboration_and_hierarchy() -> Spi
     assert_eq!(first, run(&mut candidate)?);
     Ok(())
 }
+
+#[test]
+fn prepared_parameters_and_device_fields_are_occurrence_bound() -> SpiceResult<()> {
+    let body = ".param n=1000 s={simetrix_stat_unif(4294967295,4294967295,7,1,0,0,.2)}\n        .func draw(t) {simetrix_stat_unif(4294967295,4294967295,7,1,1,0,t)}\n        .param p={draw(.2)} q={draw(.2)-draw(.2)}\n        v1 in 0 1\nr1 in 0 {n*s}\nr2 in 0 {n*s}\nr3 in 0 {n*draw(.2)}\nr4 in 0 {n*draw(.2)}";
+    let source = deck(body);
+    let result = ngspice_rs::netlist::elaborate::literalize(&source)?;
+    assert_ne!(result.scope.get("q"), Some(0.));
+    let values = |result: &ngspice_rs::netlist::elaborate::ElaboratedNetlist| {
+        result
+            .netlist
+            .devices
+            .iter()
+            .filter(|device| device.name.starts_with('r'))
+            .map(|device| (device.name.clone(), device.parameters[0].value.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let first = values(&result);
+    assert_eq!(first["r1"], first["r2"]);
+    assert_ne!(first["r3"], first["r4"]);
+    let reordered = deck(&body.replace(
+        "r3 in 0 {n*draw(.2)}\nr4 in 0 {n*draw(.2)}",
+        "r4 in 0 {n*draw(.2)}\nr3 in 0 {n*draw(.2)}",
+    ));
+    assert_eq!(
+        first,
+        values(&ngspice_rs::netlist::elaborate::literalize(&reordered)?)
+    );
+    let plan = CircuitParameterPlan::new(source, &["n"])?;
+    let mut session = plan.session()?;
+    let a = op(session.circuit_mut())?.value("i(v1)", 0).unwrap().re;
+    session.update(&[2000.], &mut EvalBudget::default())?;
+    let context = session.analysis_context();
+    let b = AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
+        .resolve()?
+        .run(session.circuit_mut(), &context)?
+        .value("i(v1)", 0)
+        .unwrap()
+        .re;
+    assert!((2. * b - a).abs() < 1e-12, "{a} {b}");
+    session.update(&[1000.], &mut EvalBudget::default())?;
+    assert_eq!(a, op(session.circuit_mut())?.value("i(v1)", 0).unwrap().re);
+    Ok(())
+}
+
+#[test]
+fn prepared_model_draws_use_the_defining_scope_and_physical_occurrence() -> SpiceResult<()> {
+    let source = deck(
+        ".param tolerance=.2\n        .model shared d(is={1e-14*simetrix_stat_unifl(9,1,7,1,0,0,tolerance)} n={simetrix_stat_unif(9,1,7,1,1,0,tolerance)})\n        .subckt cell a b c\n.param tolerance=.4\n        .model local d(is={1e-14*simetrix_stat_unifl(9,1,7,1,0,0,tolerance)})\n        d1 a 0 shared\nd2 b 0 local\nd3 c 0 local\n.ends\n        x1 a1 b1 c1 cell\nx2 a2 b2 c2 cell\n        v1 a1 0 .5\nv2 b1 0 .5\nv3 c1 0 .5\nv4 a2 0 .5\nv5 b2 0 .5\nv6 c2 0 .5",
+    );
+    let result = ngspice_rs::netlist::elaborate::literalize(&source)?;
+    let expanded = ngspice_rs::devices::subckt::expand_subcircuits(
+        &result.netlist,
+        &result.scope,
+        Default::default(),
+    )?;
+    let parameter = |device: &str, field: &str| {
+        let instance = expanded.devices.iter().find(|d| d.name == device).unwrap();
+        let model = expanded
+            .models
+            .iter()
+            .find(|m| Some(&m.name) == instance.model.as_ref())
+            .unwrap();
+        model
+            .parameters
+            .iter()
+            .find(|p| p.name == field)
+            .unwrap()
+            .value
+            .clone()
+    };
+    assert_eq!(parameter("d.x1.d1", "is"), parameter("d.x2.d1", "is"));
+    assert_ne!(parameter("d.x1.d1", "n"), parameter("d.x2.d1", "n"));
+    assert_eq!(parameter("d.x1.d2", "is"), parameter("d.x1.d3", "is"));
+    assert_eq!(parameter("d.x2.d2", "is"), parameter("d.x2.d3", "is"));
+    assert_ne!(parameter("d.x1.d2", "is"), parameter("d.x2.d2", "is"));
+    let mut circuit = RunConfig::from_netlist(&source)?.circuit(&source)?;
+    let plot = op(&mut circuit)?;
+    assert_eq!(plot.value("i(v2)", 0), plot.value("i(v3)", 0));
+    assert_ne!(plot.value("i(v2)", 0), plot.value("i(v5)", 0));
+    Ok(())
+}
+
+#[test]
+fn prepared_markers_reject_missing_lot_owner_and_unsupported_law() {
+    for expression in [
+        "simetrix_stat_unifl(9,1,7,1,0,0,.2)",
+        "simetrix_stat_gausse(9,1,7,1,0,0,.2)",
+        "simetrix_stat_unif(4294967296,1,7,1,0,0,.2)",
+    ] {
+        let source = deck(&format!(".param p={{{expression}}}"));
+        assert!(ParamScope::for_netlist(&source).is_err(), "{expression}");
+    }
+}

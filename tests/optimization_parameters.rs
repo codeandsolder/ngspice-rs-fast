@@ -315,6 +315,7 @@ fn scoped_functions_and_aliases_bind_only_true_transitive_inputs() {
         .add_scope(
             ParameterScopeSpec {
                 parent: None,
+                instance: None,
                 functions: Some(functions),
                 bindings: &[],
                 cards: &source.params,

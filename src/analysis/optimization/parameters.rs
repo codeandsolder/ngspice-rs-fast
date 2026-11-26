@@ -85,6 +85,7 @@ pub struct CircuitParameterPlan {
     /// Input coordinates affecting numeric options rather than device stamps.
     option_dependencies: BoundExpression,
     behavioural_dependencies: BoundExpression,
+    statistical_model_dependencies: BoundExpression,
     requires_rebuild: bool,
 }
 
@@ -102,6 +103,7 @@ impl CircuitParameterPlan {
         let root = parameters.add_scope(
             ParameterScopeSpec {
                 parent: None,
+                instance: None,
                 functions: Some(functions),
                 bindings: &[],
                 cards: &source.params,
@@ -122,7 +124,9 @@ impl CircuitParameterPlan {
         let mut sites = Vec::new();
         for site in &elaborated.sites {
             let expression = &site.expression;
-            let inputs = parameters.bind_expression(root, expression, &mut budget)?;
+            let inputs = parameters
+                .bind_expression(root, expression, &mut budget)?
+                .at(site.statistical);
             if inputs.inputs().is_empty() {
                 continue;
             }
@@ -158,6 +162,15 @@ impl CircuitParameterPlan {
         // Nested formal scopes still require independent validation through
         // the full elaborator. Root options need revalidation only when their
         // actual parameter reads differ from the validated baseline.
+        let statistical_model_dependencies = parameters.bind_expressions(
+            root,
+            source
+                .models
+                .iter()
+                .filter(|card| elaborate::model_uses_statistics(card, &scope))
+                .flat_map(elaborate::model_expressions),
+            &mut budget,
+        )?;
         let requires_rebuild = !source.subcircuits.is_empty();
         Ok(Self {
             source,
@@ -167,6 +180,7 @@ impl CircuitParameterPlan {
             sites,
             option_dependencies,
             behavioural_dependencies,
+            statistical_model_dependencies,
             requires_rebuild,
         })
     }
@@ -578,6 +592,11 @@ impl CircuitCandidate<'_> {
                 "behavioural parameter dependency lacks a validated derivative binding".to_owned(),
             ));
         }
+        for &input in self.plan.statistical_model_dependencies.inputs() {
+            output[input] = Err(GradientSiteFailure::Unsupported(
+                "input affects occurrence-bound model realization".to_owned(),
+            ));
+        }
         for &input in self.plan.option_dependencies.inputs() {
             output[input] = Err(GradientSiteFailure::Unsupported(
                 "input affects numerical analysis options".to_owned(),
@@ -672,6 +691,10 @@ impl CircuitCandidate<'_> {
         let baseline_context = self.plan.config.context().model_context();
         let mut fixed_context = baseline_context;
         let mut structural = self.plan.requires_rebuild
+            || self
+                .plan
+                .statistical_model_dependencies
+                .changed_from_baseline(parameters)
             || self
                 .plan
                 .option_dependencies
