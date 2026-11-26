@@ -1517,6 +1517,12 @@ pub trait Device: fmt::Debug + std::any::Any {
         None
     }
 
+    /// Whether small-signal assembly requires the converged operating-point
+    /// trial state rather than the native reference's accepted history.
+    fn small_signal_uses_trial_state(&self) -> bool {
+        false
+    }
+
     /// The state slots C's `MODEINITSMSIG` load writes at the operating
     /// point that later analyses of the deck read back (C keeps one
     /// `CKTstate0` for the whole deck): `slots` is this device's window of

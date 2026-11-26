@@ -1,0 +1,20 @@
+Switch transfer and series drop
+.options reltol=1e-10 abstol=1e-14 vntol=1e-12 gmin=1e-9
+Vc c 0 0
+Vd a 0 0
+S1 a 0 c 0 m1
+S2 a 0 c 0 m2
+S3 a 0 c 0 m3
+S4 a 0 c 0 m4
+S5 a 0 c 0 m5
+S6 a 0 c 0 m6
+S7 a 0 c 0 m7
+.model m1 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05)
+.model m2 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=2)
+.model m3 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=2 Vser=.5)
+.model m4 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=2 oneway)
+.model m5 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=2 Vser=.5 epsilon=.2)
+.model m6 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 level=2 oneway epsilon=.2)
+.model m7 SW(Ron=.1 Roff=100 Vh=-1 Ilimit=.05 Vser=.5)
+.dc Vd -2 2 .1 Vc -2 2 1
+.end

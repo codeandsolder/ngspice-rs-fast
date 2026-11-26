@@ -74,7 +74,9 @@ fn integrate(
     capacitance: Real,
     name: &str,
 ) -> SpiceResult<Companion> {
-    if context.states.len() != REACTIVE_STATE_COUNT {
+    // Composed devices may own additional non-reactive slots after this
+    // pair. The shared scalar load reads/writes only its first two slots.
+    if context.states.len() < REACTIVE_STATE_COUNT {
         return Err(SpiceError::circuit(format!(
             "{name}: companion load without its two state slots"
         )));
