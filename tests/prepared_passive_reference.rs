@@ -4,13 +4,17 @@
 use std::{fs, path::Path};
 
 use ngspice_rs::{
-    analysis::{Plot, RunConfig},
+    analysis::{AnalysisInput, Plot, RunConfig},
     netlist::{Parser, ast::Netlist, prepared_initialization::PreparedInitialConditions},
     primitives::{AnalysisKind, SpiceResult},
 };
-use ngspice_rs_preprocess::{Cancellation, InputFormat, Options, Request, SourceInput, prepare};
+use ngspice_rs_preprocess::{
+    Cancellation, InputFormat, Options, Request, SourceInput,
+    analysis_plan::{AnalysisKind as SourceAnalysis, Directive},
+    prepare,
+};
 
-fn prepared(path: &Path) -> SpiceResult<Netlist> {
+fn prepared(path: &Path) -> SpiceResult<(Netlist, Vec<AnalysisInput>)> {
     let bundle = prepare(
         &Request {
             format: InputFormat::SimetrixDeck,
@@ -27,19 +31,53 @@ fn prepared(path: &Path) -> SpiceResult<Netlist> {
         fs::write(dir.path().join(&artifact.filename), &artifact.bytes).unwrap();
     }
     let mut netlist = Parser::new().parse_file(dir.path().join(&bundle.primary.filename))?;
-    PreparedInitialConditions::attach(
+    let plan = bundle.analysis_plan.unwrap();
+    let requests = plan
+        .native_requests()
+        .map(|entry| {
+            let Directive::Analysis {
+                analysis,
+                arguments,
+                uic,
+            } = &entry.directive
+            else {
+                return Err(ngspice_rs::primitives::SpiceError::circuit(
+                    "expected typed analysis request",
+                ));
+            };
+            let kind = match analysis {
+                SourceAnalysis::OperatingPoint => AnalysisKind::OperatingPoint,
+                SourceAnalysis::DcSweep => AnalysisKind::DcSweep,
+                SourceAnalysis::Ac => AnalysisKind::Ac,
+                SourceAnalysis::Transient => AnalysisKind::Transient,
+                SourceAnalysis::Noise => AnalysisKind::Noise,
+                SourceAnalysis::TransferFunction => AnalysisKind::TransferFunction,
+                SourceAnalysis::Pop | SourceAnalysis::Other => {
+                    return Err(ngspice_rs::primitives::SpiceError::circuit(
+                        "unsupported reference analysis",
+                    ));
+                }
+            };
+            let mut input = AnalysisInput::with_arguments(kind, arguments.clone());
+            input.uic = *uic;
+            Ok(input)
+        })
+        .collect::<SpiceResult<Vec<_>>>()?;
+    PreparedInitialConditions::attach_for_analyses(
         &mut netlist,
         dir.path(),
         bundle.initial_conditions.unwrap(),
+        requests.iter().map(|input| (input.kind, input.uic)),
     )?;
-    Ok(netlist)
+    Ok((netlist, requests))
 }
 
 fn run(path: &Path) -> SpiceResult<(AnalysisKind, Plot)> {
-    let netlist = prepared(path)?;
+    let (netlist, mut requests) = prepared(path)?;
     let config = RunConfig::from_netlist(&netlist)?;
     let mut circuit = config.circuit(&netlist)?;
-    let request = config.plan_for(&netlist.analyses[0])?;
+    assert_eq!(requests.len(), 1);
+    let request = config.plan(requests.remove(0))?;
     Ok((
         request.kind(),
         request.run(&mut circuit, &config.context())?,
@@ -89,8 +127,19 @@ fn source_prepared_passive_reference_matrix() {
                 name,
                 "icres-zero" | "parallel-hard" | "parallel-hard-equal"
             ));
-            if result.is_ok() {
-                errors.push(format!("{name}: invalid constraint unexpectedly solved"));
+            match result {
+                Ok(_) => errors.push(format!("{name}: invalid constraint unexpectedly solved")),
+                Err(error) => {
+                    let message = error.to_string();
+                    let expected = if name == "icres-zero" {
+                        "icres"
+                    } else {
+                        "singular"
+                    };
+                    if !message.to_ascii_lowercase().contains(expected) {
+                        errors.push(format!("{name}: wrong rejection: {message}"));
+                    }
+                }
             }
             continue;
         };

@@ -29,6 +29,7 @@ type Identity = (PathBuf, Scope, String);
 pub struct PreparedInitialConditions {
     source: Arc<InitialConditions>,
     artifacts: BTreeMap<String, PathBuf>,
+    analyses: Option<BTreeSet<(AnalysisKind, bool)>>,
 }
 
 impl PreparedInitialConditions {
@@ -44,6 +45,39 @@ impl PreparedInitialConditions {
         netlist: &mut Netlist,
         directory: &Path,
         source: InitialConditions,
+    ) -> SpiceResult<()> {
+        Self::attach_with_selection(netlist, directory, source, None)
+    }
+
+    /// Attach the policy for explicitly selected jobs from a prepared source
+    /// analysis plan, which need not be embedded in the electrical artifact.
+    /// # Errors
+    /// As `attach`, or an empty or unsupported analysis selection.
+    pub fn attach_for_analyses(
+        netlist: &mut Netlist,
+        directory: &Path,
+        source: InitialConditions,
+        analyses: impl IntoIterator<Item = (AnalysisKind, bool)>,
+    ) -> SpiceResult<()> {
+        let analyses = analyses.into_iter().collect::<BTreeSet<_>>();
+        if analyses.is_empty()
+            || analyses.iter().any(|&(kind, uic)| {
+                source_analysis(kind, uic).is_none() || (uic && kind != AnalysisKind::Transient)
+            })
+        {
+            return Err(SpiceError::parse(
+                netlist.location.clone(),
+                "invalid prepared initialization analysis selection",
+            ));
+        }
+        Self::attach_with_selection(netlist, directory, source, Some(analyses))
+    }
+
+    fn attach_with_selection(
+        netlist: &mut Netlist,
+        directory: &Path,
+        source: InitialConditions,
+        analyses: Option<BTreeSet<(AnalysisKind, bool)>>,
     ) -> SpiceResult<()> {
         let fail = |message| SpiceError::parse(netlist.location.clone(), message);
         let root = directory
@@ -77,6 +111,7 @@ impl PreparedInitialConditions {
         let policy = Self {
             source: Arc::new(source),
             artifacts,
+            analyses,
         };
         policy.validate(netlist)?;
         netlist.prepared_initialization = Some(policy);
@@ -350,11 +385,13 @@ impl<'a> Binder<'a> {
             return Ok(None);
         };
         policy.validate(netlist)?;
-        let mut kinds: BTreeSet<_> = netlist
-            .analyses
-            .iter()
-            .map(|card| (card.kind, card.uic))
-            .collect();
+        let mut kinds = policy.analyses.clone().unwrap_or_else(|| {
+            netlist
+                .analyses
+                .iter()
+                .map(|card| (card.kind, card.uic))
+                .collect()
+        });
         if kinds.is_empty() {
             // A command-only deck has no static analysis cards. Reserve the
             // supported enclosing jobs so later commands can select them.
