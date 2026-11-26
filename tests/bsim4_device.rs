@@ -511,8 +511,7 @@ cl d 0 2f
 
 #[test]
 fn an_instance_width_sweep_matches_c() {
-    let plots = plots(
-        r"BSIM4 nmos width sweep
+    let deck = r"BSIM4 nmos width sweep
 vdd dd 0 1.0
 rl dd d 1k
 vg g 0 dc 0.7 ac 1
@@ -535,10 +534,30 @@ cl d 0 2f
 + rshg=0.4 rbpb=5 rbpd=15 rbps=15 rbdb=15 rbsb=15
 .dc @m1[w] 0.3u 1.2u 0.3u
 .end
-",
-    );
+";
+    let physical = plots(deck);
+    let scaled_deck = deck
+        .replace(
+            "l=45n w=0.5u ad=5e-14 as=5e-14 pd=1.2u ps=1.2u",
+            "l=90n w=1u ad=2e-13 as=2e-13 pd=2.4u ps=2.4u",
+        )
+        .replace(
+            ".dc @m1[w] 0.3u 1.2u 0.3u",
+            ".options scale=0.5\n.dc @m1[w] 0.6u 2.4u 0.6u",
+        );
+    let scaled = plots(&scaled_deck);
+    let physical = &physical[physical.len() - 1];
+    let scaled = &scaled[scaled.len() - 1];
+    assert_eq!(physical.point_count(), scaled.point_count());
+    for point in 0..physical.point_count() {
+        for name in ["v(d)", "i(vdd)"] {
+            let expected = physical.value(name, point).unwrap().re;
+            let actual = scaled.value(name, point).unwrap().re;
+            same(actual, expected, name);
+        }
+    }
     check(
-        &plots[plots.len() - 1],
+        physical,
         &[
             (
                 "v(d)",

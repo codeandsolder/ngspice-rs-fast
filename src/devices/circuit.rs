@@ -222,7 +222,7 @@ pub(super) struct CircuitRuntime {
 ///
 /// It fits in `Copy` analysis requests; exhaustion is an explicit error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TopologyId(u64);
+pub(crate) struct TopologyId(std::num::NonZeroU64);
 
 impl TopologyId {
     fn allocate() -> SpiceResult<Self> {
@@ -234,7 +234,11 @@ impl TopologyId {
                 .checked_add(1)
                 .ok_or_else(|| SpiceError::circuit("topology identity space exhausted"))?;
             match NEXT.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => return Ok(Self(id)),
+                Ok(_) => {
+                    return std::num::NonZeroU64::new(id)
+                        .map(Self)
+                        .ok_or_else(|| SpiceError::circuit("invalid zero topology identity"));
+                }
                 Err(observed) => id = observed,
             }
         }
