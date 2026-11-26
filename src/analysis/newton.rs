@@ -470,13 +470,7 @@ impl CircuitNewton<'_, '_> {
                         &mut trial,
                     )?;
                 }
-                if let Some(rows) = nodal_regularization
-                    && gmin > 0.
-                {
-                    for &row in rows {
-                        matrix.add(row, row, gmin)?;
-                    }
-                }
+                stamp_nodal_regularization(matrix, nodal_regularization, gmin)?;
                 after_load(phase, matrix, rhs)?;
                 Ok(trial)
             },
@@ -496,6 +490,22 @@ impl CircuitNewton<'_, '_> {
             },
         )
     }
+}
+
+/// Stamp the requested conductance only on original electrical KCL rows.
+fn stamp_nodal_regularization(
+    matrix: &mut SparseMatrix,
+    rows: Option<&[usize]>,
+    conductance: Real,
+) -> SpiceResult<()> {
+    if let Some(rows) = rows
+        && conductance > 0.
+    {
+        for &row in rows {
+            matrix.add(row, row, conductance)?;
+        }
+    }
+    Ok(())
 }
 
 /// One ordinary Newton driver's disposable load slots. The matrix/RHS stay
