@@ -707,7 +707,6 @@ fn physical_taylor_reconstructs_multivariate_gummel_poon_equations()
                             .fold(0_f64, |sum, v| sum.mul_add(t, v.get(row).unwrap()))
                     };
                     for row in 0..sample.len() {
-                        eprintln!("{family} {subs} {base} {collector} t={t} residual/charge row={row}");
                         close(
                             series(&jet.residual, row),
                             actual.residual.get(row).unwrap(),
@@ -722,30 +721,60 @@ fn physical_taylor_reconstructs_multivariate_gummel_poon_equations()
                         );
                     }
                 }
-                // Compare exact state partials with centered differences
-                // of the physical residual (not C's frozen gx tangent).
+                // Differentiate the independent scalar residual with a
+                // fourth-order centered stencil. The ordinary load forms
+                // F as G*x-rhs, so cancellation limits the accuracy of
+                // small derivatives in a row carrying large substrate
+                // current. Bound that roundoff separately from truncation.
+                let h = 1e-3;
                 for col in 0..c.unknown_count() {
-                    let h = 1e-6;
-                    let mut plus = state[0].clone();
-                    let mut minus = state[0].clone();
-                    plus.set(col, plus.get(col).unwrap() + h)?;
-                    minus.set(col, minus.get(col).unwrap() - h)?;
-                    let point = dae.evaluate(&plus, 0., Limit::Right)?;
-                    let plus_f = point.residual.clone();
-                    let plus_q = point.charge.clone();
-                    let minus = dae.evaluate(&minus, 0., Limit::Right)?;
+                    let mut samples = Vec::new();
+                    for step in [-2_f64, -1., 1., 2.] {
+                        let mut sample = state[0].clone();
+                        sample.set(col, step.mul_add(h, sample.get(col).unwrap()))?;
+                        let point = dae.evaluate(&sample, 0., Limit::Right)?;
+                        let scales = (0..sample.len())
+                            .map(|row| {
+                                point.residual.get(row).unwrap().abs()
+                                    + sample
+                                        .as_slice()
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, v)| (point.conductance.get(row, i) * v).abs())
+                                        .sum::<f64>()
+                            })
+                            .collect::<Vec<_>>();
+                        samples.push((point.residual.clone(), point.charge.clone(), scales));
+                    }
+                    let stencil = |component: usize, row: usize| {
+                        let value = |i: usize| {
+                            let sample = &samples[i];
+                            if component == 0 {
+                                sample.0.get(row).unwrap()
+                            } else {
+                                sample.1.get(row).unwrap()
+                            }
+                        };
+                        (8. * (value(2) - value(1)) - (value(3) - value(0))) / (12. * h)
+                    };
                     for row in 0..c.unknown_count() {
-                        eprintln!("{family} {subs} {base} {collector} gradient row={row} col={col}");
-                        close(
-                            jet.conductance[0].get(row, col),
-                            (plus_f.get(row).unwrap() - minus.residual.get(row).unwrap())
-                                / (2. * h),
-                            2e-6,
-                            1e-10,
+                        // 32 eps covers the sparse stamp accumulation,
+                        // matrix-vector product and subtraction; the stencil
+                        // amplifies point error by at most 1.5/h.
+                        let scale = samples
+                            .iter()
+                            .map(|sample| sample.2[row])
+                            .fold(0_f64, f64::max);
+                        let roundoff = 48. * f64::EPSILON * scale / h;
+                        let exact = jet.conductance[0].get(row, col);
+                        let numeric = stencil(0, row);
+                        assert!(
+                            (exact - numeric).abs() <= 2e-6 * numeric.abs() + 1e-10 + roundoff,
+                            "{family} {subs} {base} {collector} dF[{row},{col}]: {exact:e} != {numeric:e} (roundoff {roundoff:e})"
                         );
                         close(
                             jet.capacitance[0].get(row, col),
-                            (plus_q.get(row).unwrap() - minus.charge.get(row).unwrap()) / (2. * h),
+                            stencil(1, row),
                             2e-6,
                             1e-19,
                         );
