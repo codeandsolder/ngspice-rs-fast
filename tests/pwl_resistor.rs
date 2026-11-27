@@ -245,3 +245,58 @@ fn specialized_occurrence_hints_and_current_probes() -> anyhow::Result<()> {
     near(&plot, "v(other)", 0, -4.5);
     Ok(())
 }
+
+#[test]
+fn physical_taylor_tangent_at_knot_uses_one_sided_germ() -> anyhow::Result<()> {
+    use ngspice_rs::devices::{Limit, TransientTiming};
+    use ngspice_rs::maths::Vector;
+    for (model, card) in [(VOLTAGE, "MR"), (CURRENT, "MC")] {
+        let (deck, bundle) = source(
+            &format!("V1 p 0 0\n!R1 p 0 {card} IC=2\n{model}"),
+            InputFormat::ExpandedDeck,
+        )?;
+        let (c, config) = circuit(&deck, &bundle)?;
+        let name = match &bundle.pwl_resistors[0].binding {
+            NativeBinding::CurrentLaw { source } | NativeBinding::VoltageLaw { source, .. } => {
+                source
+            }
+        };
+        let index = c
+            .devices()
+            .iter()
+            .position(|device| device.name().eq_ignore_ascii_case(name))
+            .unwrap();
+        let device = &c.devices()[index];
+        let positive = c.unknowns().node_row(device.terminals()[0]).unwrap();
+        let branch = c.branch_rows(index).unwrap().start;
+        let mut state = vec![Vector::zeros(c.unknown_count()); 3];
+        let current_defined = card == "MC";
+        let (independent, dependent) = if current_defined {
+            (branch, positive)
+        } else {
+            (positive, branch)
+        };
+        state[0].set(dependent, 2.)?;
+        state[1].set(independent, 1.)?;
+        let prepared = c.prepare_run();
+        let dae = prepared.prepare_physical_dae(
+            &config.context().model_context(),
+            TransientTiming::new(1e-6, 1e-3)?,
+        )?;
+        for (limit, slope) in [(Limit::Left, 3.), (Limit::Right, -2.)] {
+            let result = dae.evaluate_taylor(&state, 0., 1e-6, limit)?;
+            assert_eq!(result.residual[0].get(branch), Some(0.));
+            assert_eq!(result.residual[1].get(branch), Some(-slope));
+            assert_eq!(
+                result.conductance[0].get(branch, independent).to_bits(),
+                (-slope).to_bits()
+            );
+            assert_eq!(
+                result.conductance[0].get(branch, dependent).to_bits(),
+                1_f64.to_bits()
+            );
+            assert_eq!(result.residual[2].get(branch), Some(0.));
+        }
+    }
+    Ok(())
+}

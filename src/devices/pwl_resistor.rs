@@ -31,27 +31,30 @@ impl Curve {
             .validate()
             .map_err(|error| SpiceError::circuit(error.to_string()))?;
         let axis = declaration.axis;
-        let points = declaration
-            .knots
-            .iter()
-            .map(|knot| match axis {
-                Axis::Voltage => (knot.voltage, knot.current),
-                Axis::Current => (knot.current, knot.voltage),
-            })
-            .collect::<Vec<_>>();
-        let count = points.len() - 1;
+        let count = declaration.knots.len() - 1;
         let mut segments = Vec::with_capacity(count);
-        for (index, window) in points.windows(2).enumerate() {
-            let [(x0, y0), (x1, y1)] = *window else {
+        let coordinates = |knot: model_normalize_ngspice::pwl_resistor::Knot| match axis {
+            Axis::Voltage => (knot.voltage, knot.current),
+            Axis::Current => (knot.current, knot.voltage),
+        };
+        for (index, window) in declaration.knots.windows(2).enumerate() {
+            let [first, second] = *window else {
                 return Err(SpiceError::circuit("missing prepared PWL endpoint"));
             };
-            let dx = x1 - x0;
-            let slope = (y1 - y0) / dx;
-            let intercept = (-slope).mul_add(x0, y0);
-            if dx <= 0.
-                || !dx.is_finite()
-                || !slope.is_finite()
+            let (x0, y0) = coordinates(first);
+            let (x1, y1) = coordinates(second);
+            // The producer has verified finite ordered coordinates. Compute
+            // the ratios from exact binary64 endpoint products: a finite
+            // slope or intercept must not be rejected just because an
+            // intermediate endpoint difference/product overflows.
+            let span = [(x1, false), (x0, true)];
+            let slope =
+                crate::primitives::rounded_product_ratio([(y1, 1., false), (y0, 1., true)], span);
+            let intercept =
+                crate::primitives::rounded_product_ratio([(x1, y0, false), (x0, y1, true)], span);
+            if !slope.is_finite()
                 || !intercept.is_finite()
+                || (slope == 0. && y0.partial_cmp(&y1) != Some(std::cmp::Ordering::Equal))
                 || ((index == 0 || index + 1 == count) && slope <= 0.)
             {
                 return Err(SpiceError::circuit("unrepresentable prepared PWL segment"));
@@ -71,14 +74,14 @@ impl Curve {
         &self.segments[index.min(self.segments.len() - 1)]
     }
 
-    fn coordinates(&self, voltage: Real, current: Real) -> (Real, Real) {
+    const fn coordinates(&self, voltage: Real, current: Real) -> (Real, Real) {
         match self.axis {
             Axis::Voltage => (voltage, current),
             Axis::Current => (current, voltage),
         }
     }
 
-    fn coefficients(&self, segment: &Segment) -> (Real, Real) {
+    const fn coefficients(&self, segment: &Segment) -> (Real, Real) {
         match self.axis {
             Axis::Voltage => (-segment.slope, 1.),
             Axis::Current => (1., -segment.slope),
@@ -118,13 +121,13 @@ fn matches_nodes(card: &DeviceInstance, p: &str, n: &str, auto_gnd: bool) -> boo
 
 fn validate_anchor(
     cards: &BTreeMap<Identity, Option<&DeviceInstance>>,
-    key: Identity,
+    key: &Identity,
     positive: &str,
     negative: &str,
     output: Option<&str>,
     auto_gnd: bool,
 ) -> SpiceResult<()> {
-    let card = cards.get(&key).and_then(|card| *card).ok_or_else(|| {
+    let card = cards.get(key).and_then(|card| *card).ok_or_else(|| {
         SpiceError::circuit(format!(
             "missing or ambiguous prepared resistor anchor {}",
             key.2
@@ -204,7 +207,7 @@ impl Index {
                 if !anchors.insert(key.clone()) {
                     return Err(SpiceError::circuit("shared prepared resistor anchor"));
                 }
-                validate_anchor(&cards, key, p, n, output, netlist.auto_gnd)
+                validate_anchor(&cards, &key, p, n, output, netlist.auto_gnd)
             };
             if let Some(sensor) = &declaration.series_sensor {
                 anchor(&sensor.source, positive, &sensor.intermediate, None)?;
@@ -248,6 +251,9 @@ impl Index {
         device: &DeviceInstance,
         definition: &str,
     ) -> Option<BoundPwlResistor> {
+        if self.0.is_empty() {
+            return None;
+        }
         self.0.get(&identity(device, definition)?).cloned()
     }
 }
@@ -447,6 +453,44 @@ impl Device for PwlResistor {
         &self,
         _context: &mut crate::devices::traits::ChargeContext<'_>,
     ) -> SpiceResult<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model_normalize_ngspice::pwl_resistor::Knot;
+
+    #[test]
+    fn exact_segment_ratios_survive_overflowing_endpoint_differences() -> SpiceResult<()> {
+        let declaration = PreparedPwlResistor {
+            artifact: "native.cir".into(),
+            scope: Vec::new(),
+            device: "!r1".into(),
+            positive: "a".into(),
+            negative: "0".into(),
+            axis: Axis::Voltage,
+            knots: vec![
+                Knot {
+                    voltage: -1e308,
+                    current: -1e308,
+                },
+                Knot {
+                    voltage: 1e308,
+                    current: 1e308,
+                },
+            ],
+            initial_segment: Some(1),
+            binding: NativeBinding::CurrentLaw {
+                source: "b1".into(),
+            },
+            series_sensor: None,
+        };
+        let curve = Curve::prepare(&declaration)?;
+        assert_eq!(curve.segments.len(), 1);
+        assert_eq!(curve.segments[0].slope.to_bits(), 1_f64.to_bits());
+        assert_eq!(curve.segments[0].intercept, 0.);
         Ok(())
     }
 }
