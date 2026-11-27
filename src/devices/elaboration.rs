@@ -234,7 +234,12 @@ impl<'a> PlannedBatch<'a> {
                     i.code_ports
                         .iter()
                         .flat_map(|port| &port.terminals)
-                        .filter(|terminal| terminal.kind != CodePortKind::Digital)
+                        .filter(|terminal| {
+                            !matches!(
+                                terminal.kind,
+                                CodePortKind::Digital | CodePortKind::BranchCurrent
+                            )
+                        })
                         .flat_map(|terminal| {
                             std::iter::once(&terminal.positive).chain(terminal.negative.iter())
                         }),

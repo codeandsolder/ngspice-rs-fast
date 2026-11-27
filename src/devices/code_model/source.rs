@@ -16,6 +16,10 @@ pub enum SourceModel {
     LogicVoltage,
     /// Timed conductance switch.
     TimedSwitch,
+    /// Cubic logarithmic or linear PSpice-style switch.
+    PSwitch,
+    /// Exponential or linear analog switch.
+    ASwitch,
 }
 
 /// Static parameter representation accepted by a source model.
@@ -66,7 +70,8 @@ pub struct PortSpec {
 }
 
 use CodePortKind::{
-    ConductanceDifferential, Current, CurrentDifferential, Digital, Voltage, VoltageDifferential,
+    BranchCurrent, Conductance, ConductanceDifferential, Current, CurrentDifferential, Digital,
+    Voltage, VoltageDifferential,
 };
 const ANALOG: &[CodePortKind] = &[Voltage, VoltageDifferential];
 const TRANSFER: &[CodePortKind] = &[Voltage, VoltageDifferential, Current, CurrentDifferential];
@@ -101,6 +106,10 @@ impl SourceModel {
             Some(Self::LogicVoltage)
         } else if base.eq_ignore_ascii_case("preprocess_timed_switch") {
             Some(Self::TimedSwitch)
+        } else if base.eq_ignore_ascii_case("pswitch") {
+            Some(Self::PSwitch)
+        } else if base.eq_ignore_ascii_case("aswitch") {
+            Some(Self::ASwitch)
         } else {
             None
         }
@@ -125,7 +134,33 @@ impl SourceModel {
             PortSpec::new(VoltageDifferential, ANALOG, false, false),
             PortSpec::new(ConductanceDifferential, BRANCH, false, false),
         ];
+        const PSWITCH_PORTS: &[PortSpec] = &[
+            PortSpec::new(
+                ConductanceDifferential,
+                &[Conductance, ConductanceDifferential],
+                false,
+                false,
+            ),
+            PortSpec::new(ConductanceDifferential, BRANCH, false, false),
+        ];
+        const ASWITCH_PORTS: &[PortSpec] = &[
+            PortSpec::new(
+                Voltage,
+                &[
+                    Voltage,
+                    VoltageDifferential,
+                    Current,
+                    CurrentDifferential,
+                    BranchCurrent,
+                ],
+                false,
+                false,
+            ),
+            PortSpec::new(ConductanceDifferential, BRANCH, false, false),
+        ];
         match self {
+            Self::PSwitch => PSWITCH_PORTS,
+            Self::ASwitch => ASWITCH_PORTS,
             Self::RationalTransfer => TRANSFER_PORTS,
             Self::LogicEvent => LOGIC_PORTS,
             Self::LogicVoltage => VOLTAGE_PORTS,
@@ -154,6 +189,13 @@ impl SourceModel {
             },
             Self::LogicVoltage => match name {
                 "out_low" | "out_high" => Some(Real),
+                _ => None,
+            },
+            Self::PSwitch | Self::ASwitch => match name {
+                "cntl_on" | "cntl_off" | "r_on" | "r_off" => Some(Real),
+                "log" => Some(Boolean),
+                "r_cntl_in" if self == Self::PSwitch => Some(Real),
+                "limit" if self == Self::ASwitch => Some(Boolean),
                 _ => None,
             },
             Self::TimedSwitch => match name {
@@ -537,6 +579,9 @@ pub(in crate::devices) fn instantiate(
             }))
         }
         SourceModel::RationalTransfer => super::rational::instantiate(instance, nodes, model),
+        SourceModel::PSwitch | SourceModel::ASwitch => {
+            super::continuous_switch_device::instantiate(schema, instance, nodes, model)
+        }
         SourceModel::TimedSwitch => {
             let material = model.prepare(PreparationKey::Inputs, || {
                 super::timed_switch_device::compile(model.card())
