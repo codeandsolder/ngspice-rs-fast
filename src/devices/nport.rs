@@ -119,13 +119,13 @@ impl MeasuredNPort {
     }
 
     /// Borrow the immutable file data, including reference impedances.
-    #[must_use]
+    #[must_use = "the returned file data supplies the immutable multiport parameters and reference impedances"]
     pub fn network(&self) -> &Touchstone {
         &self.network
     }
 
     /// Real-positive reference port count.
-    #[must_use]
+    #[must_use = "the port count determines the network terminal and matrix dimensions"]
     pub const fn port_count(&self) -> usize {
         self.terminals.len()
     }

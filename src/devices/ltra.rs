@@ -410,19 +410,19 @@ impl LtraModel {
     }
 
     /// The simulated case.
-    #[must_use]
+    #[must_use = "the returned physical case determines which lossy-line equations apply"]
     pub const fn case(&self) -> LtraCase {
         self.case
     }
 
     /// Propagation delay `sqrt(L C) len` (LC and RLC; 0 otherwise).
-    #[must_use]
+    #[must_use = "the returned propagation delay determines retarded-time evaluation for LC and RLC lines"]
     pub const fn td(&self) -> Real {
         self.td
     }
 
     /// Characteristic impedance `sqrt(L / C)` (LC and RLC; 0 otherwise).
-    #[must_use]
+    #[must_use = "the returned characteristic impedance relates traveling-wave voltage and current"]
     pub const fn z0(&self) -> Real {
         self.imped
     }
@@ -759,13 +759,13 @@ impl LossyLine {
     }
 
     /// The validated model.
-    #[must_use]
+    #[must_use = "the returned validated model supplies the coefficients used for this instance"]
     pub const fn model(&self) -> &LtraModel {
         &self.model
     }
 
     /// The instance `v1 i1 v2 i2` initial conditions.
-    #[must_use]
+    #[must_use = "the returned ordered terminal voltages and currents initialize the line history"]
     pub const fn initial_conditions(&self) -> [Real; 4] {
         self.initial
     }

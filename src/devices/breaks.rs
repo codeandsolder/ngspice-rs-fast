@@ -142,13 +142,13 @@ impl BreakTable {
     }
 
     /// `CKTminBreak`.
-    #[must_use]
+    #[must_use = "the returned interval determines breakpoint coalescing"]
     pub const fn min_break(&self) -> Real {
         self.min_break
     }
 
     /// `CKTbreaks[0]`, the next breakpoint.
-    #[must_use]
+    #[must_use = "the returned time bounds the next accepted step"]
     pub fn first(&self) -> Real {
         self.breaks
             .first_key_value()
@@ -156,7 +156,7 @@ impl BreakTable {
     }
 
     /// `CKTbreaks[1]`, the breakpoint after the next.
-    #[must_use]
+    #[must_use = "the returned time identifies the following pending breakpoint"]
     pub fn second(&self) -> Real {
         self.times().nth(1).unwrap_or(self.final_time)
     }
@@ -168,13 +168,13 @@ impl BreakTable {
     }
 
     /// The pending entry count, including both terminal sentinel entries.
-    #[must_use]
+    #[must_use = "the count includes the two required sentinel entries"]
     pub const fn len(&self) -> usize {
         self.len
     }
 
     /// A valid breakpoint table always has at least two entries.
-    #[must_use]
+    #[must_use = "the result checks the invariant that pending sentinels remain"]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -334,7 +334,7 @@ impl PartialEq for SourceBreaks<'_> {
 impl<'a> SourceBreaks<'a> {
     /// Bind the event-capable source index once per immutable system.
     /// C initializes voltage break-time to -1 and current break-time to 0.
-    #[must_use]
+    #[must_use = "the returned index binds source event schedules to this immutable system"]
     pub fn new(system: &'a LinearSystem) -> Self {
         let mut voltage = Vec::new();
         let mut current = Vec::new();

@@ -119,37 +119,37 @@ impl Matrix {
     }
 
     /// Number of rows.
-    #[must_use]
+    #[must_use = "the row dimension is required to size or validate matrix operations"]
     pub const fn rows(&self) -> usize {
         self.shape.rows
     }
 
     /// Number of columns.
-    #[must_use]
+    #[must_use = "the column dimension is required to size or validate matrix operations"]
     pub const fn cols(&self) -> usize {
         self.shape.cols
     }
 
     /// Total number of elements.
-    #[must_use]
+    #[must_use = "the returned element count determines the matrix storage extent"]
     pub const fn len(&self) -> usize {
         self.data.len()
     }
 
     /// True when the matrix has no elements.
-    #[must_use]
+    #[must_use = "the result distinguishes zero-element matrices from populated storage"]
     pub const fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
     /// True when the matrix is square.
-    #[must_use]
+    #[must_use = "the result determines whether square-matrix operations are applicable"]
     pub const fn is_square(&self) -> bool {
         self.shape.rows == self.shape.cols
     }
 
     /// Reads an element, or `None` when out of range.
-    #[must_use]
+    #[must_use = "the returned option distinguishes an entry from an out-of-range coordinate"]
     pub fn get(&self, row: usize, col: usize) -> Option<Real> {
         self.shape.offset(row, col).map(|offset| self.data[offset])
     }
@@ -183,13 +183,13 @@ impl Matrix {
     }
 
     /// One row, as a slice.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a borrowed row from an invalid row index"]
     pub fn row(&self, row: usize) -> Option<&[Real]> {
         self.shape.row_range(row).map(|range| &self.data[range])
     }
 
     /// The elements, row-major.
-    #[must_use]
+    #[must_use = "the returned slice is the row-major matrix storage"]
     pub fn data(&self) -> &[Real] {
         &self.data
     }
@@ -574,7 +574,7 @@ impl From<Vec<Real>> for Vector {
 
 impl Vector {
     /// A zeroed vector of `len` elements.
-    #[must_use]
+    #[must_use = "the allocated zero vector must be retained to supply initial vector storage"]
     pub fn zeros(len: usize) -> Self {
         Self {
             data: vec![0.0; len],
@@ -582,7 +582,7 @@ impl Vector {
     }
 
     /// A vector with the given elements.
-    #[must_use]
+    #[must_use = "the newly owned copy must be retained to use the supplied values"]
     pub fn from_slice(values: &[Real]) -> Self {
         Self {
             data: values.to_vec(),
@@ -590,19 +590,19 @@ impl Vector {
     }
 
     /// Number of elements.
-    #[must_use]
+    #[must_use = "the returned element count determines the vector extent"]
     pub const fn len(&self) -> usize {
         self.data.len()
     }
 
     /// True when the vector has no elements.
-    #[must_use]
+    #[must_use = "the result distinguishes zero-length vectors from populated storage"]
     pub const fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
     /// Reads an element, or `None` when out of range.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a vector element from an invalid index"]
     pub fn get(&self, index: usize) -> Option<Real> {
         self.data.get(index).copied()
     }
@@ -645,7 +645,7 @@ impl Vector {
     }
 
     /// The elements.
-    #[must_use]
+    #[must_use = "the returned slice provides access to the vector elements"]
     pub fn as_slice(&self) -> &[Real] {
         &self.data
     }
@@ -678,7 +678,7 @@ impl Vector {
     }
 
     /// Largest absolute element.
-    #[must_use]
+    #[must_use = "the returned magnitude is needed to assess vector scaling"]
     pub fn max_abs(&self) -> Real {
         self.data
             .iter()
@@ -686,7 +686,7 @@ impl Vector {
     }
 
     /// True when every element is finite.
-    #[must_use]
+    #[must_use = "discarding the result leaves nonfinite elements undetected"]
     pub fn is_finite(&self) -> bool {
         self.data.iter().all(|value| value.is_finite())
     }

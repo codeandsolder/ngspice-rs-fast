@@ -51,7 +51,7 @@ pub enum Command {
 
 impl Command {
     /// The name as typed on the command line.
-    #[must_use]
+    #[must_use = "the returned name is the command-line spelling of this subcommand"]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Summary => "summary",
@@ -68,7 +68,7 @@ impl Command {
     }
 
     /// Parses a subcommand name.
-    #[must_use]
+    #[must_use = "the result identifies a supported subcommand or an invalid name"]
     pub fn parse(name: &str) -> Option<Self> {
         [
             Self::Summary,
@@ -87,7 +87,7 @@ impl Command {
     }
 
     /// Whether the command needs a netlist.
-    #[must_use]
+    #[must_use = "the result determines whether the command requires a deck path"]
     pub const fn needs_netlist(self) -> bool {
         matches!(
             self,
@@ -101,7 +101,7 @@ impl Command {
     }
 
     /// Whether the command writes a rawfile and therefore needs `--output`.
-    #[must_use]
+    #[must_use = "the result determines whether a rawfile output path is required"]
     const fn needs_output(self) -> bool {
         matches!(self, Self::Simulate)
     }
@@ -245,7 +245,7 @@ impl Args {
 }
 
 /// The usage text.
-#[must_use]
+#[must_use = "the returned usage text is not printed automatically"]
 pub const fn usage() -> &'static str {
     "\
 spice-rs — a Rust port of ngspice
@@ -388,7 +388,7 @@ fn required_path<'a>(args: &Args, path: Option<&'a Path>, name: &str) -> SpiceRe
 }
 
 /// Renders the deck summary.
-#[must_use]
+#[must_use = "the returned summary describes the parsed deck and coverage"]
 pub fn summary_text(deck: &Deck, cards: &[RawCard], auto_gnd: bool) -> String {
     let mut out = String::new();
     let title = if deck.title.trim().is_empty() {
@@ -461,7 +461,7 @@ pub fn summary_text(deck: &Deck, cards: &[RawCard], auto_gnd: bool) -> String {
 }
 
 /// Renders every card, one per line.
-#[must_use]
+#[must_use = "the returned report lists the parsed cards without printing them"]
 pub fn cards_text(_deck: &Deck, cards: &[RawCard]) -> String {
     let mut out = String::new();
     for card in cards {
@@ -476,7 +476,7 @@ pub fn cards_text(_deck: &Deck, cards: &[RawCard]) -> String {
 }
 
 /// Renders the token stream of every card.
-#[must_use]
+#[must_use = "the returned report exposes the token stream without printing it"]
 pub fn tokens_text(cards: &[RawCard]) -> String {
     let mut out = String::new();
     for card in cards {
@@ -497,7 +497,7 @@ pub fn tokens_text(cards: &[RawCard]) -> String {
 /// Renders the device registry: `ported` devices build from their card,
 /// `bounded` ones only from a deck (with the subset built), `pending` ones are
 /// refused with their C reference.
-#[must_use]
+#[must_use = "the returned report distinguishes ported, bounded and pending devices"]
 pub fn devices_text(registry: &Registry) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -549,7 +549,7 @@ pub fn devices_text(registry: &Registry) -> String {
 }
 
 /// Renders the analysis coverage.
-#[must_use]
+#[must_use = "the returned report describes available analysis coverage"]
 pub fn analyses_text() -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{} analysis kind(s)", Kind::ALL.len());

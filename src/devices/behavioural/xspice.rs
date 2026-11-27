@@ -71,7 +71,7 @@ impl XspicePwl {
     }
 
     /// The output and its derivative with respect to the input.
-    #[must_use]
+    #[must_use = "the returned pair supplies the transfer value and its exact input derivative"]
     pub fn evaluate(&self, input: Real) -> (Real, Real) {
         let size = self.x.len();
         // Preserve the reference's priority for the two end tests, even

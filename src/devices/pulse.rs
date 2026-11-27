@@ -99,12 +99,12 @@ impl TransientTiming {
         Ok(Self { step, final_time })
     }
     /// The `.tran` step (`CKTstep`).
-    #[must_use]
+    #[must_use = "the returned transient step supplies the source default timing scale"]
     pub const fn step(&self) -> Real {
         self.step
     }
     /// The stop time (`CKTfinalTime`).
-    #[must_use]
+    #[must_use = "the returned time supplies the transient stop and source timing defaults"]
     pub const fn final_time(&self) -> Real {
         self.final_time
     }
@@ -283,42 +283,42 @@ impl Pulse {
         Ok(self)
     }
     /// The time after `delay` past which the source holds V1, if limited.
-    #[must_use]
+    #[must_use = "the result identifies when a limited pulse train returns to its initial value"]
     pub const fn stop(&self) -> Option<Real> {
         self.stop
     }
     /// V1.
-    #[must_use]
+    #[must_use = "the returned voltage or current is the initial waveform level"]
     pub const fn initial(&self) -> Real {
         self.initial
     }
     /// V2.
-    #[must_use]
+    #[must_use = "the returned voltage or current is the pulsed waveform level"]
     pub const fn pulsed(&self) -> Real {
         self.pulsed
     }
     /// TD.
-    #[must_use]
+    #[must_use = "the returned delay determines the first pulse start"]
     pub const fn delay(&self) -> Real {
         self.delay
     }
     /// TR.
-    #[must_use]
+    #[must_use = "the returned duration determines the rising transition interval"]
     pub const fn rise(&self) -> Real {
         self.rise
     }
     /// TF.
-    #[must_use]
+    #[must_use = "the returned duration determines the falling transition interval"]
     pub const fn fall(&self) -> Real {
         self.fall
     }
     /// PW.
-    #[must_use]
+    #[must_use = "the returned duration determines the pulse plateau interval"]
     pub const fn width(&self) -> Real {
         self.width
     }
     /// PER.
-    #[must_use]
+    #[must_use = "the returned duration determines repeated pulse spacing"]
     pub const fn period(&self) -> Real {
         self.period
     }

@@ -135,7 +135,7 @@ pub struct SensitivityParameter {
 
 impl SensitivityParameter {
     /// A parameter that every analysis perturbs.
-    #[must_use]
+    #[must_use = "the returned descriptor selects a DC sensitivity parameter"]
     pub const fn dc(keyword: &'static str) -> Self {
         Self {
             keyword,
@@ -145,7 +145,7 @@ impl SensitivityParameter {
     }
 
     /// An `IF_AC`/`IF_AC_ONLY` parameter.
-    #[must_use]
+    #[must_use = "the returned descriptor selects an AC sensitivity parameter"]
     pub const fn ac(keyword: &'static str) -> Self {
         Self {
             keyword,
@@ -155,7 +155,7 @@ impl SensitivityParameter {
     }
 
     /// An `IF_PRINCIPAL` parameter, `ac` when it is also `IF_AC`/`IF_AC_ONLY`.
-    #[must_use]
+    #[must_use = "the returned descriptor identifies the principal sensitivity parameter and AC support"]
     pub const fn principal(keyword: &'static str, ac: bool) -> Self {
         Self {
             keyword,
@@ -419,7 +419,7 @@ impl SensitivityRecord {
     }
 
     /// A scalar field's given flag (false for an absent field).
-    #[must_use]
+    #[must_use = "the result distinguishes explicitly given parameters from defaulted ones"]
     pub fn given(&self, keyword: &str) -> bool {
         self.entry(keyword).is_ok_and(|entry| entry.given)
     }
@@ -1020,7 +1020,7 @@ impl Device for ResetStamps {
 
 /// The explicit refusal of `.sens` for a device whose sensitivity is not
 /// ported.
-#[must_use]
+#[must_use = "the error must be propagated to report the unsupported sensitivity operation"]
 pub fn not_ported(name: &str, designator: char, detail: &str) -> SpiceError {
     SpiceError::not_yet_ported(
         format!("sensitivity analysis of device {name} (designator '{designator}'){detail}"),

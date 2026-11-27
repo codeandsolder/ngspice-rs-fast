@@ -74,7 +74,7 @@ impl SweepTarget {
     /// leaves `v-sweep` and `param-sweep` as voltages. Like the port's other
     /// vectors, voltage and current names carry their `v(...)`/`i(...)`
     /// wrapping, as C's rawfile writes them.
-    #[must_use]
+    #[must_use = "the returned name and quantity identify the rawfile sweep axis"]
     pub const fn scale(&self) -> (&'static str, &'static str) {
         match self {
             Self::VoltageSource(_) => ("v(v-sweep)", "voltage"),
@@ -85,7 +85,7 @@ impl SweepTarget {
         }
     }
     /// The instance name, `temp`, or `@instance[parameter]`.
-    #[must_use]
+    #[must_use = "the returned identifier selects the swept source, device parameter or temperature"]
     pub fn name(&self) -> &str {
         match self {
             Self::VoltageSource(n) | Self::CurrentSource(n) | Self::Resistor(n) => n,

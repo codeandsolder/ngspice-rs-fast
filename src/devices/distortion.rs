@@ -57,13 +57,13 @@ pub struct Control {
 
 impl Control {
     /// The voltage `v(a) - v(b)`.
-    #[must_use]
+    #[must_use = "the returned observation represents the specified differential voltage"]
     pub fn between(a: NodeId, b: NodeId) -> Self {
         Self::sum(vec![[a, b]])
     }
 
     /// The sum of the differences of `pairs`.
-    #[must_use]
+    #[must_use = "the returned observation sums the specified differential voltages"]
     pub const fn sum(pairs: Vec<[NodeId; 2]>) -> Self {
         Self {
             pairs,
@@ -74,7 +74,7 @@ impl Control {
 
     /// The difference `(v(a) - v(b)) - (v(c) - v(d))` of two node
     /// differences, evaluated in that order on the kernels.
-    #[must_use]
+    #[must_use = "the returned observation subtracts the two differential voltages in order"]
     pub fn difference(plus: [NodeId; 2], minus: [NodeId; 2]) -> Self {
         Self {
             minus: vec![minus],
@@ -83,7 +83,7 @@ impl Control {
     }
 
     /// Adds `pairs` as [`Self::unconjugated_in_f1_minus_f2`] pairs.
-    #[must_use]
+    #[must_use = "the returned observation includes the additional unconjugated kernel pairs"]
     pub fn with_unconjugated_in_f1_minus_f2(mut self, pairs: Vec<[NodeId; 2]>) -> Self {
         self.unconjugated_in_f1_minus_f2.extend(pairs);
         self
@@ -189,7 +189,7 @@ pub struct Taylor {
 
 impl Taylor {
     /// A one-variable polynomial `c2 x^2 + c3 x^3` (C's `D1*` functions).
-    #[must_use]
+    #[must_use = "the returned Taylor polynomial supplies quadratic and cubic coefficients"]
     pub fn single(c2: Real, c3: Real) -> Self {
         Self {
             xx: c2,
@@ -284,7 +284,7 @@ pub struct DistortionTerm {
 
 impl DistortionTerm {
     /// A term.
-    #[must_use]
+    #[must_use = "the returned term binds a nonlinear polynomial to its injection and observation coordinates"]
     pub const fn new(
         response: Response,
         nodes: [NodeId; 2],
@@ -303,7 +303,7 @@ impl DistortionTerm {
 
     /// Folds the charge polynomial `charge` into this term as `diodisto.c`
     /// does (see [`Self::charge`]).
-    #[must_use]
+    #[must_use = "the returned term includes the additional charge polynomial"]
     pub const fn with_charge(mut self, charge: Taylor) -> Self {
         self.charge = Some(charge);
         self
@@ -311,7 +311,7 @@ impl DistortionTerm {
 
     /// Marks the term with `mos1dist.c`'s `2f1 - f2` kernel quirk (see
     /// [`Self::first_order_im3_kernel`]).
-    #[must_use]
+    #[must_use = "the returned term selects the special first-order intermodulation kernel"]
     pub const fn with_first_order_im3_kernel(mut self) -> Self {
         self.first_order_im3_kernel = true;
         self
@@ -331,7 +331,7 @@ pub struct DistortionInput {
 impl DistortionInput {
     /// The half-amplitude phasor C drives the first-order solve with
     /// (`cktdisto.c`: `0.5 * mag * (cos, sin)(pi * phase / 180)`).
-    #[must_use]
+    #[must_use = "the returned half-amplitude complex drive supplies the first-order distortion excitation"]
     pub fn phasor(self) -> Complex {
         let angle = std::f64::consts::PI * self.phase / 180.;
         Complex::new(
@@ -471,13 +471,13 @@ pub struct CircuitDistortion<'a> {
 
 impl CircuitDistortion<'_> {
     /// The source names and their first- and second-tone inputs.
-    #[must_use]
+    #[must_use = "the returned inputs identify source names and both tone excitations"]
     pub fn inputs(&self) -> &[(String, Option<DistortionInput>, Option<DistortionInput>)] {
         &self.inputs
     }
 
     /// Number of bound nonlinear terms.
-    #[must_use]
+    #[must_use = "the count bounds the bound nonlinear distortion term inventory"]
     pub const fn term_count(&self) -> usize {
         self.terms.len()
     }

@@ -210,7 +210,7 @@ pub enum SourceFunction {
 impl SourceFunction {
     /// Field names in C coefficient order; the length is the maximum the
     /// runtime reads (extra fields are a parse error, not silently dropped).
-    #[must_use]
+    #[must_use = "the field list defines the source coefficient order and maximum arity"]
     pub const fn fields(self) -> &'static [&'static str] {
         match self {
             Self::Sin => &["vo", "va", "freq", "td", "theta", "phase"],
@@ -221,7 +221,7 @@ impl SourceFunction {
     }
 
     /// Canonical keyword (`sine` is an accepted alias of `sin`).
-    #[must_use]
+    #[must_use = "the keyword identifies the canonical deterministic source syntax"]
     pub const fn keyword(self) -> &'static str {
         match self {
             Self::Sin => "sin",
@@ -589,7 +589,7 @@ pub enum NodeHintValue {
 
 impl NodeHintValue {
     /// The finite value, if this is (or was literalized to) a literal.
-    #[must_use]
+    #[must_use = "the optional value distinguishes resolved hints from unevaluated expressions"]
     pub const fn literal(&self) -> Option<Real> {
         match self {
             Self::Literal { value, .. } => Some(*value),
@@ -600,7 +600,7 @@ impl NodeHintValue {
 
 impl NodeHint {
     /// The finite value, unless the entry still holds an unevaluated expression.
-    #[must_use]
+    #[must_use = "the optional value determines whether the node hint is ready for binding"]
     pub const fn literal(&self) -> Option<Real> {
         self.value.literal()
     }
@@ -712,7 +712,7 @@ pub enum VectorComponent {
 
 impl VectorComponent {
     /// The spelling as written on the card.
-    #[must_use]
+    #[must_use = "the function spelling identifies the requested complex component"]
     pub const fn function(self) -> &'static str {
         match self {
             Self::Magnitude => "vm",
@@ -727,7 +727,7 @@ impl VectorComponent {
 impl RequestedVector {
     /// The canonical spelling of the request, for diagnostics and for the name
     /// of a computed column: `all`, `v(out)`, `v(in,out)`, `i(v1)`, `vm(out)`.
-    #[must_use]
+    #[must_use = "the returned name identifies the output vector or diagnostic request"]
     pub fn name(&self) -> String {
         fn terminals(positive: &str, negative: Option<&str>) -> String {
             negative.map_or_else(
@@ -770,7 +770,7 @@ impl RequestedVector {
 
     /// True when the request is a node voltage difference. The single-node form
     /// has `negative == None`.
-    #[must_use]
+    #[must_use = "the predicate distinguishes differential voltage evaluation from a single node"]
     pub const fn is_difference(&self) -> bool {
         match self {
             Self::Voltage { negative, .. } | Self::Component { negative, .. } => negative.is_some(),
@@ -795,13 +795,13 @@ pub struct OutputCards {
 
 impl OutputCards {
     /// True when the deck has no `.save` and no `.print` card.
-    #[must_use]
+    #[must_use = "the predicate determines whether default output selection applies"]
     pub const fn is_empty(&self) -> bool {
         self.saves.is_empty() && self.prints.is_empty()
     }
 
     /// Number of output cards.
-    #[must_use]
+    #[must_use = "the count accounts for all explicit output requests"]
     pub const fn len(&self) -> usize {
         self.saves.len() + self.prints.len()
     }
@@ -924,7 +924,7 @@ pub enum MeasureStatistic {
 
 impl MeasureStatistic {
     /// The spelling as written on the card.
-    #[must_use]
+    #[must_use = "the returned spelling identifies the requested measurement statistic"]
     pub const fn name(self) -> &'static str {
         match self {
             Self::PhaseMargin => "PHASE_MARGIN",
@@ -999,7 +999,7 @@ pub enum MeasureTransition {
 impl MeasureTransition {
     /// The selector's spelling, for diagnostics and for the `TRIG`/`TARG`
     /// crossings a measurement looks for.
-    #[must_use]
+    #[must_use = "the returned spelling identifies the selected trigger or target crossing"]
     pub fn name(self) -> String {
         match self {
             Self::First => "first".to_owned(),
@@ -1027,7 +1027,7 @@ pub struct MeasureWindow {
 
 impl MeasureWindow {
     /// True when neither bound was written.
-    #[must_use]
+    #[must_use = "the predicate determines whether the entire measurement domain is selected"]
     pub const fn is_unbounded(&self) -> bool {
         self.from.is_none() && self.to.is_none()
     }
@@ -1398,7 +1398,7 @@ impl Netlist {
     }
 
     /// Number of top-level device instances, excluding subcircuit bodies.
-    #[must_use]
+    #[must_use = "the count excludes devices declared in subcircuit definitions"]
     pub const fn top_level_device_count(&self) -> usize {
         self.devices.len()
     }
@@ -1408,7 +1408,7 @@ impl Netlist {
     /// named them. Matching is ASCII case-insensitive on canonical names, so
     /// with automatic gnd aliasing `.global gnd` is the same as ground, while
     /// under `no_auto_gnd` `gnd` is a distinct ordinary global node.
-    #[must_use]
+    #[must_use = "the predicate determines whether flattening preserves the node name"]
     pub fn is_global_node(&self, name: &str) -> bool {
         name == "0"
             || self
@@ -1419,7 +1419,7 @@ impl Netlist {
 
     /// Declared global nodes in first-declaration order without duplicates.
     /// Ground `0` is implicit and listed only if written (or aliased) explicitly.
-    #[must_use]
+    #[must_use = "the list determines which declared nodes remain global during flattening"]
     pub fn global_node_names(&self) -> Vec<&str> {
         let active = self.active_subcircuit_indices();
         let mut names: Vec<&str> = Vec::new();
@@ -1499,7 +1499,7 @@ impl Netlist {
     }
 
     /// The first transient card that requested `uic`, if any.
-    #[must_use]
+    #[must_use = "the returned card identifies transient initialization without a bias solve"]
     pub fn transient_uic(&self) -> Option<&AnalysisCard> {
         self.analyses
             .iter()
@@ -1507,7 +1507,7 @@ impl Netlist {
     }
 
     /// Looks up a top-level device by instance name, case-insensitively.
-    #[must_use]
+    #[must_use = "the lookup result identifies the named top-level device"]
     pub fn device(&self, name: &str) -> Option<&DeviceInstance> {
         self.devices
             .iter()
@@ -1515,7 +1515,7 @@ impl Netlist {
     }
 
     /// Looks up a model by name, case-insensitively.
-    #[must_use]
+    #[must_use = "the lookup result identifies the selected model declaration"]
     pub fn model(&self, name: &str) -> Option<&ModelCard> {
         self.models
             .iter()
@@ -1523,7 +1523,7 @@ impl Netlist {
     }
 
     /// Looks up a subcircuit by name, case-insensitively.
-    #[must_use]
+    #[must_use = "the lookup result identifies the selected subcircuit definition"]
     pub fn subcircuit(&self, name: &str) -> Option<&Subcircuit> {
         self.subcircuits
             .iter()

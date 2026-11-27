@@ -224,26 +224,26 @@ impl Resistor {
     }
 
     /// The same resistor with the given `.noise` description.
-    #[must_use]
+    #[must_use = "the returned resistor carries the replacement noise description"]
     pub fn with_noise(self, noise: ResistorNoise) -> Self {
         Self { noise, ..self }
     }
 
     /// The `.noise` description.
-    #[must_use]
+    #[must_use = "the returned parameters determine the resistor noise law"]
     pub const fn noise_parameters(&self) -> &ResistorNoise {
         &self.noise
     }
 
     /// The resistance in ohms.
-    #[must_use]
+    #[must_use = "the returned resistance is the physical branch value in ohms"]
     pub const fn resistance(&self) -> Real {
         self.resistance
     }
 
     /// The conductance ngspice stamps, `1/R` (`resload.c` computes it as
     /// `1/model->RESconduct`).
-    #[must_use]
+    #[must_use = "the returned reciprocal resistance supplies the resistor stamp"]
     pub fn conductance(&self) -> Real {
         1.0 / self.resistance
     }
@@ -715,13 +715,13 @@ impl Capacitor {
     }
 
     /// The capacitance in farads.
-    #[must_use]
+    #[must_use = "the returned capacitance determines stored charge per volt"]
     pub const fn capacitance(&self) -> Real {
         self.capacitance
     }
 
     /// The `ic=` initial voltage, if any.
-    #[must_use]
+    #[must_use = "the result supplies the capacitor initial voltage when specified"]
     pub const fn initial_voltage(&self) -> Option<Real> {
         self.initial_voltage
     }
@@ -942,13 +942,13 @@ impl Inductor {
     }
 
     /// The inductance in henries.
-    #[must_use]
+    #[must_use = "the returned inductance determines stored flux per ampere"]
     pub const fn inductance(&self) -> Real {
         self.inductance
     }
 
     /// The `ic=` initial current, if any.
-    #[must_use]
+    #[must_use = "the result supplies the inductor initial current when specified"]
     pub const fn initial_current(&self) -> Option<Real> {
         self.initial_current
     }

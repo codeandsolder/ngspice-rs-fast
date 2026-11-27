@@ -63,7 +63,7 @@ pub enum NameMatch {
 
 /// Case-insensitive `model_name_match`: `None` when `model_name` is neither the
 /// reference nor `<reference>.<one or more ASCII digits>`.
-#[must_use]
+#[must_use = "the result distinguishes exact model selection, a bin candidate and an unrelated name"]
 pub fn model_name_match(reference: &str, model_name: &str) -> Option<NameMatch> {
     if model_name.eq_ignore_ascii_case(reference) {
         Some(NameMatch::Exact)
@@ -148,7 +148,7 @@ impl<T> DeclarationIndex<T> {
 /// `psoi` card whose first `level` rounds (as `INPfindLev`) into
 /// [`BINNABLE_MOS_LEVELS`]. A missing level is 1. Version strings are not
 /// inspected: every BSIM3/BSIM4/HiSIM-HV version C knows is binnable.
-#[must_use]
+#[must_use = "the result determines whether geometry-based model selection is permitted"]
 pub fn is_binnable(card: &ModelCard) -> bool {
     let mos = ["nmos", "pmos", "nsoi", "psoi"]
         .iter()
@@ -287,7 +287,7 @@ impl BinBounds {
     }
 
     /// `inpgmod.c::in_range` on both dimensions.
-    #[must_use]
+    #[must_use = "the result determines whether both device dimensions qualify for this bin"]
     pub fn contains(&self, geometry: BinGeometry) -> bool {
         in_range(geometry.length, self.lmin, self.lmax)
             && in_range(geometry.width, self.wmin, self.wmax)
@@ -296,7 +296,7 @@ impl BinBounds {
 
 /// `inpgmod.c::in_range`: `min <= value <= max` with [`BIN_TOLERANCE`] at
 /// both (inclusive) edges.
-#[must_use]
+#[must_use = "the result determines membership including the reference simulator's boundary tolerance"]
 pub fn in_range(value: Real, min: Real, max: Real) -> bool {
     (value - min).abs() < BIN_TOLERANCE
         || (value - max).abs() < BIN_TOLERANCE

@@ -214,55 +214,55 @@ impl TransientPlan {
     }
 
     /// Requested output time step.
-    #[must_use]
+    #[must_use = "the requested output interval determines the output sampling schedule"]
     pub const fn step(&self) -> Real {
         self.step
     }
 
     /// Requested first output time.
-    #[must_use]
+    #[must_use = "the requested first output time determines which transient points are retained"]
     pub const fn start(&self) -> Real {
         self.start
     }
 
     /// Final simulation time.
-    #[must_use]
+    #[must_use = "the returned end time bounds transient advancement"]
     pub const fn stop(&self) -> Real {
         self.stop
     }
 
     /// The requested integration family and effective Gear order.
-    #[must_use]
+    #[must_use = "the returned integration rule determines the companion equations and effective Gear order"]
     pub const fn method(&self) -> IntegrationMethod {
         self.method
     }
 
     /// The requested maximum integration order.
-    #[must_use]
+    #[must_use = "the returned limit bounds the order of adaptive integration trials"]
     pub const fn max_order(&self) -> u8 {
         self.max_order
     }
 
     /// Newton iteration limit at each accepted or rejected timepoint.
-    #[must_use]
+    #[must_use = "the returned limit bounds Newton work for each transient trial"]
     pub const fn max_iterations(&self) -> usize {
         self.tran_max_iter
     }
 
     /// Trapezoidal weighting in [0, 0.5].
-    #[must_use]
+    #[must_use = "the returned weight is needed to construct the configured trapezoidal coefficients"]
     pub const fn xmu(&self) -> Real {
         self.xmu
     }
 
     /// Charge (flux) absolute truncation tolerance.
-    #[must_use]
+    #[must_use = "the returned absolute charge or flux tolerance controls truncation acceptance"]
     pub const fn chgtol(&self) -> Real {
         self.tolerances.chgtol
     }
 
     /// Truncation error overestimation factor.
-    #[must_use]
+    #[must_use = "the returned overestimation factor scales the truncation error estimate"]
     pub const fn trtol(&self) -> Real {
         self.tolerances.trtol
     }

@@ -422,7 +422,7 @@ impl PreparedPoint {
 
 impl<'a> PreparedRun<'a> {
     /// The finalized circuit borrowed by this analysis.
-    #[must_use]
+    #[must_use = "the borrowed circuit provides the topology associated with this prepared run"]
     pub const fn circuit(&self) -> &'a Circuit {
         self.circuit
     }
@@ -949,7 +949,7 @@ fn ordered_control_targets(
 
 impl Circuit {
     /// An empty circuit holding only ground.
-    #[must_use]
+    #[must_use = "the new circuit must be retained to elaborate and simulate devices"]
     pub fn new() -> Self {
         Self::default()
     }
@@ -957,7 +957,7 @@ impl Circuit {
     /// Start an analysis-owned preparation scope. It lazily validates the
     /// first context, then reuses its effective devices until that context
     /// changes. Separate scopes cannot share disposable trial state.
-    #[must_use]
+    #[must_use = "the prepared run retains the per-analysis point and load workspace"]
     pub const fn prepare_run(&self) -> PreparedRun<'_> {
         PreparedRun {
             circuit: self,
@@ -968,7 +968,7 @@ impl Circuit {
     }
 
     /// Construct an empty circuit with explicit mutual-inductor budgets.
-    #[must_use]
+    #[must_use = "discarding the new circuit loses the specified mutual coupling limits"]
     pub fn with_mutual_limits(limits: MutualLimits) -> Self {
         Self {
             mutual_limits: limits,
@@ -977,7 +977,7 @@ impl Circuit {
     }
 
     /// Construct an empty circuit with explicit aggregate elaboration limits.
-    #[must_use]
+    #[must_use = "discarding the new circuit loses the specified elaboration limits"]
     pub fn with_elaboration_limits(limits: ElaborationLimits) -> Self {
         Self {
             elaboration_limits: limits,
@@ -1005,19 +1005,19 @@ impl Circuit {
     }
 
     /// The node table.
-    #[must_use]
+    #[must_use = "the node table resolves circuit node identities"]
     pub const fn nodes(&self) -> &NodeTable {
         &self.nodes
     }
 
     /// The MNA unknown numbering. Only valid after [`Circuit::finalize`].
-    #[must_use]
+    #[must_use = "the unknown layout maps circuit coordinates to matrix rows"]
     pub const fn unknowns(&self) -> &MnaUnknowns {
         &self.bindings.unknowns
     }
 
     /// The device instances, in insertion order.
-    #[must_use]
+    #[must_use = "the elaborated devices define the circuit topology"]
     pub fn devices(&self) -> &[ElaboratedDevice] {
         &self.devices
     }
@@ -1131,13 +1131,13 @@ impl Circuit {
     }
 
     /// Number of device instances.
-    #[must_use]
+    #[must_use = "the device count determines the size of per-instance workspaces"]
     pub const fn device_count(&self) -> usize {
         self.devices.len()
     }
 
     /// Size of the MNA system.
-    #[must_use]
+    #[must_use = "the unknown count determines the linear system dimensions"]
     pub const fn unknown_count(&self) -> usize {
         self.bindings.unknowns.len()
     }
@@ -2066,7 +2066,7 @@ impl Circuit {
     }
 
     /// Total number of state slots, after finalization.
-    #[must_use]
+    #[must_use = "the state length determines the required device history storage"]
     pub const fn state_len(&self) -> usize {
         self.bindings.state_len
     }
@@ -2108,7 +2108,7 @@ impl Circuit {
     }
 
     /// Whether any device has a delay history (a transmission line).
-    #[must_use]
+    #[must_use = "the presence of delay lines determines whether delay history must be maintained"]
     pub fn has_delay_lines(&self) -> bool {
         self.devices
             .iter()
@@ -2227,7 +2227,7 @@ impl Circuit {
     /// [`Self::inherit_from`] carries it to the next analysis. A changed
     /// device/state layout invalidates it; re-finalizing the same circuit
     /// preserves it. It is not an integration history.
-    #[must_use]
+    #[must_use = "the returned transient state is required to inspect or reuse the final solution"]
     pub fn final_transient_state(&self) -> Option<Vec<Real>> {
         self.runtime
             .final_transient
@@ -2254,7 +2254,7 @@ impl Circuit {
     /// The resistor named `name` (case-insensitive) and its device ordinal,
     /// identified by [`Device::resistor_metadata`], never by the name's first
     /// letter.
-    #[must_use]
+    #[must_use = "the returned index and metadata identify the resistor and its parameters"]
     pub fn resistor(&self, name: &str) -> Option<(usize, ResistorMetadata)> {
         let index = self.device_index(name)?;
         self.devices[index]
@@ -3133,14 +3133,14 @@ impl Circuit {
 
     /// The analyses already run on this circuit (and the circuits it
     /// inherited from), in order.
-    #[must_use]
+    #[must_use = "the completed analysis sequence identifies which results are available"]
     pub fn completed_analyses(&self) -> &[crate::primitives::AnalysisKind] {
         &self.runtime.completed
     }
 
     /// The circuit matrix's element pattern (C's one `CKTmatrix`), once
     /// `finalize` or a load has created it for the present numbering.
-    #[must_use]
+    #[must_use = "the returned pattern determines the reusable sparse matrix structure"]
     pub fn matrix_pattern(&self) -> Option<std::sync::Arc<crate::maths::Pattern>> {
         self.bindings.identity.as_ref()?;
         self.runtime
@@ -4154,7 +4154,7 @@ impl Circuit {
     }
 
     /// Looks up a device by instance name, case-insensitively.
-    #[must_use]
+    #[must_use = "the returned device is needed to inspect the named instance"]
     pub fn device(&self, name: &str) -> Option<&dyn Device> {
         self.device_index(name)
             .map(|index| self.devices[index].as_ref())

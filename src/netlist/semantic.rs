@@ -501,14 +501,14 @@ pub(super) fn equal<T: Semantic>(left: &T, right: &T) -> bool {
 }
 
 /// True when two decks differ only in location and the documented lexical fields.
-#[must_use]
+#[must_use = "the predicate determines whether the decks have equivalent electrical semantics"]
 pub fn semantic_eq(left: &Netlist, right: &Netlist) -> bool {
     equal(left, right)
 }
 
 /// Describes the first semantic difference, or `None` when the decks are
 /// equal. The path is diagnostic text, not a stable serialization format.
-#[must_use]
+#[must_use = "the returned diagnostic identifies the first semantic mismatch"]
 pub fn semantic_diff(left: &Netlist, right: &Netlist) -> Option<String> {
     left.compare_semantic(right)
         .err()

@@ -27,7 +27,7 @@ pub struct ParameterSlot {
 
 impl ParameterSlot {
     /// Defining scope of this entry.
-    #[must_use]
+    #[must_use = "the scope identifies the parameter slot defining environment"]
     pub const fn scope(self) -> ParameterScopeId {
         self.scope
     }
@@ -57,14 +57,14 @@ pub struct BoundExpression {
 
 impl BoundExpression {
     /// The indexes in [`ParameterPlan::inputs`] that may affect this site.
-    #[must_use]
+    #[must_use = "the indexes identify which candidate coordinates can affect this expression"]
     pub fn inputs(&self) -> &[usize] {
         &self.inputs
     }
 
     /// Whether any directly referenced resolved slot differs between two
     /// candidate sessions. Derived values that cancel remain clean.
-    #[must_use]
+    #[must_use = "the predicate determines whether this bound expression needs reevaluation"]
     pub fn changed_between(
         &self,
         previous: &CandidateParameters<'_>,
@@ -77,7 +77,7 @@ impl BoundExpression {
 
     /// Whether the candidate can change this site relative to the baseline.
     /// The full candidate vector uses the plan's original input ordering.
-    #[must_use]
+    #[must_use = "the predicate determines whether candidate inputs can affect this site"]
     pub fn affected(&self, candidate: &[Real], inputs: &[ParameterInput]) -> bool {
         self.inputs.iter().any(|&i| {
             candidate
@@ -141,7 +141,7 @@ pub struct ParameterPlan {
 
 impl ParameterPlan {
     /// Empty plan.
-    #[must_use]
+    #[must_use = "the returned plan owns the parameter dependency graph to be constructed"]
     pub const fn new() -> Self {
         Self {
             scopes: Vec::new(),
@@ -151,13 +151,13 @@ impl ParameterPlan {
     }
 
     /// Candidate coordinate order.
-    #[must_use]
+    #[must_use = "the slice defines the required candidate input coordinate ordering"]
     pub fn inputs(&self) -> &[ParameterInput] {
         &self.inputs
     }
 
     /// Resolved original scope, including provenance and function environment.
-    #[must_use]
+    #[must_use = "the returned scope provides baseline values and function provenance"]
     pub fn baseline(&self, scope: ParameterScopeId) -> Option<&ParamScope> {
         self.scopes
             .get(scope.0)
@@ -177,7 +177,7 @@ impl ParameterPlan {
     }
 
     /// Resolve a name to its stable slot once, for repeated observation.
-    #[must_use]
+    #[must_use = "the returned slot enables repeated parameter access without lexical lookup"]
     pub fn slot(&self, scope: ParameterScopeId, name: &str) -> Option<ParameterSlot> {
         let node = &self.nodes[self.lookup_slot(Some(scope), name)?];
         Some(ParameterSlot {
@@ -410,7 +410,7 @@ impl ParameterPlan {
     }
 
     /// Fresh independent session at the validated baseline.
-    #[must_use]
+    #[must_use = "the returned session owns independent candidate evaluation state"]
     pub fn session(&self) -> CandidateParameters<'_> {
         CandidateParameters {
             plan: self,
@@ -499,7 +499,7 @@ impl CandidateParameters<'_> {
     }
 
     /// Lookup with normal case-insensitive lexical shadowing.
-    #[must_use]
+    #[must_use = "the lookup result supplies the candidate value under lexical shadowing"]
     pub fn get(&self, scope: ParameterScopeId, name: &str) -> Option<Real> {
         self.plan
             .lookup_slot(Some(scope), name)
@@ -507,7 +507,7 @@ impl CandidateParameters<'_> {
     }
 
     /// Read a previously resolved slot without name lookup.
-    #[must_use]
+    #[must_use = "the lookup result supplies the candidate value at the previously bound slot"]
     pub fn get_slot(&self, slot: ParameterSlot) -> Option<Real> {
         self.plan
             .node_index(slot)

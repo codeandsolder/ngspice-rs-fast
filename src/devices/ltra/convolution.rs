@@ -45,7 +45,7 @@ use crate::primitives::{
 /// `LTRAquadInterp`: coefficients `(c1, c2, c3)` of the quadratic through
 /// `(t1, t2, t3)` evaluated at `t`, or `None` for coincident times (C returns
 /// 1 and leaves the coefficients unset).
-#[must_use]
+#[must_use = "the returned coefficients or failure determine whether quadratic history interpolation is defined"]
 pub fn quad_interp(t: Real, t1: Real, t2: Real, t3: Real) -> Option<[Real; 3]> {
     if t == t1 {
         return Some([1., 0., 0.]);
@@ -74,7 +74,7 @@ pub fn quad_interp(t: Real, t1: Real, t2: Real, t3: Real) -> Option<[Real; 3]> {
 
 /// `LTRAlinInterp`: coefficients `(c1, c2)` of the line through `(t1, t2)` at
 /// `t`, or `None` for `t1 == t2`.
-#[must_use]
+#[must_use = "the returned coefficients or failure determine whether linear history interpolation is defined"]
 pub fn lin_interp(t: Real, t1: Real, t2: Real) -> Option<[Real; 2]> {
     if t1 == t2 {
         return None;
@@ -194,7 +194,7 @@ fn polynomial<T: Copy + std::ops::Mul<Output = T> + std::ops::Add<Output = T>>(
 }
 
 /// `bessI0` (Abramowitz and Stegun 9.8.1, 9.8.2).
-#[must_use]
+#[must_use = "the returned modified Bessel I0 value is the special-function contribution to the line kernel"]
 pub fn bess_i0(x: Real) -> Real {
     let ax = x.abs();
     if ax < 3.75 {
@@ -206,7 +206,7 @@ pub fn bess_i0(x: Real) -> Real {
 }
 
 /// `bessI1` (Abramowitz and Stegun 9.8.3, 9.8.4).
-#[must_use]
+#[must_use = "the returned modified Bessel I1 value is the special-function contribution to the line kernel"]
 pub fn bess_i1(x: Real) -> Real {
     let ax = x.abs();
     let ans = if ax < 3.75 {
@@ -219,7 +219,7 @@ pub fn bess_i1(x: Real) -> Real {
 }
 
 /// `bessI1xOverX`: `I1(x) / x` for `x >= 0` (C uses `|x|`).
-#[must_use]
+#[must_use = "the returned ratio supplies the finite limiting kernel value even at zero argument"]
 pub fn bess_i1_x_over_x(x: Real) -> Real {
     let ax = x.abs();
     if ax < 3.75 {
@@ -366,7 +366,7 @@ fn damped_bessel(argument: Real, exponent: Real, leading: &[Real], divided_i1: b
 }
 
 /// `LTRArlcH2Func`: `h2(t)` of the RLC line, zero before `T`.
-#[must_use]
+#[must_use = "the returned impulse-response term supplies the causal RLC convolution contribution"]
 pub fn rlc_h2(time: Real, t: Real, alpha: Real, beta: Real) -> Real {
     if alpha == 0. || time < t || t == 0. {
         return 0.;
@@ -390,7 +390,7 @@ pub fn rlc_h2(time: Real, t: Real, alpha: Real, beta: Real) -> Real {
 /// `LTRAstraightLineCheck`: whether three points lie close enough to a
 /// straight line, by comparing the triangle they span with the trapezoid area
 /// under them (`area * reltol + abstol > triangle`).
-#[must_use]
+#[must_use = "the result determines whether three history points meet the interpolation tolerance"]
 #[expect(
     clippy::too_many_arguments,
     reason = "keeps the positional interface explicit at the reference solver or device boundary"
@@ -420,7 +420,7 @@ pub fn straight_line_check(
 /// C evaluates the straight-line test of `h2` twice (its sum with the
 /// intended `h3'` test repeats the `h2` arguments), so only `h2` decides; the
 /// port keeps that.
-#[must_use]
+#[must_use = "the returned step bound limits interpolation error in RLC transient propagation"]
 pub fn rlc_max_safe_step(td: Real, alpha: Real, beta: Real, reltol: Real, abstol: Real) -> Real {
     let mut xbig = td + 9. * td;
     let xsmall = td;
@@ -450,7 +450,7 @@ pub fn rlc_max_safe_step(td: Real, alpha: Real, beta: Real, reltol: Real, abstol
 /// (Lentz's algorithm) above. Its relative error is below `1e-12` over the
 /// range the line uses (`0 <= x < 10`, tested against reference values), far
 /// inside the simulation tolerances, but it is not bit-identical to `libm`.
-#[must_use]
+#[must_use = "the returned complementary error function supplies the diffusion-kernel term"]
 pub fn erfc(x: Real) -> Real {
     if x.is_nan() {
         return x;

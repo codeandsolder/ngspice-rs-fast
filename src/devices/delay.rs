@@ -51,7 +51,7 @@ pub enum DelayHistory {
 
 impl DelayHistory {
     /// Construct continuous-time waveform history.
-    #[must_use]
+    #[must_use = "the returned history must be retained to record continuous-time samples of the specified width"]
     pub const fn waveform(width: usize) -> Self {
         Self::Waveform(WaveformHistory::new(width))
     }
@@ -79,7 +79,7 @@ impl DelayHistory {
     }
 
     /// Number of accepted samples.
-    #[must_use]
+    #[must_use = "the returned count measures retained history records of the active delay representation"]
     pub fn len(&self) -> usize {
         match self {
             Self::Waveform(history) => history.len(),
@@ -88,7 +88,7 @@ impl DelayHistory {
     }
 
     /// True before the line is initialized.
-    #[must_use]
+    #[must_use = "the result determines whether the line has an initialized history"]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -167,7 +167,7 @@ pub struct WaveformHistory {
 
 impl WaveformHistory {
     /// An empty history with `width` values per sample.
-    #[must_use]
+    #[must_use = "the constructed history must be retained before recording fixed-width waveform samples"]
     pub const fn new(width: usize) -> Self {
         Self {
             width,
@@ -177,25 +177,25 @@ impl WaveformHistory {
     }
 
     /// Values per sample.
-    #[must_use]
+    #[must_use = "the returned width determines the required number of values per sample"]
     pub const fn width(&self) -> usize {
         self.width
     }
 
     /// Number of samples.
-    #[must_use]
+    #[must_use = "the returned sample count bounds valid waveform history indices"]
     pub const fn len(&self) -> usize {
         self.times.len()
     }
 
     /// True before the transient start initialized the history.
-    #[must_use]
+    #[must_use = "the result distinguishes an uninitialized waveform from one containing samples"]
     pub const fn is_empty(&self) -> bool {
         self.times.is_empty()
     }
 
     /// The time of sample `index` (0 is the oldest).
-    #[must_use]
+    #[must_use = "the returned option distinguishes a retained sample time from an invalid history index"]
     pub fn time(&self, index: usize) -> Option<Real> {
         self.times.get(index).copied()
     }
@@ -215,7 +215,7 @@ impl WaveformHistory {
     }
 
     /// Value `component` of sample `index`.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a retained component from an invalid sample or component index"]
     pub fn value(&self, index: usize, component: usize) -> Option<Real> {
         if index >= self.len() || component >= self.width {
             return None;
@@ -224,7 +224,7 @@ impl WaveformHistory {
     }
 
     /// The newest sample's time.
-    #[must_use]
+    #[must_use = "the returned option identifies the newest accepted sample time or an empty history"]
     pub fn last_time(&self) -> Option<Real> {
         self.times.back().copied()
     }
@@ -460,7 +460,7 @@ pub struct DelayContext<'a> {
 
 impl DelayContext<'_> {
     /// The solution's voltage at `node`, zero at ground.
-    #[must_use]
+    #[must_use = "the returned voltage supplies the delay boundary value in circuit coordinates"]
     pub fn node_voltage(&self, node: NodeId) -> Real {
         self.unknowns
             .node_row(node)

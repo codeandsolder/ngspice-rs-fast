@@ -146,20 +146,20 @@ pub enum AnalysisMode {
 impl AnalysisMode {
     /// True for the AC and noise analyses, where everything is complex and the
     /// system is loaded at `omega = 2 pi f`.
-    #[must_use]
+    #[must_use = "AC and real-valued loads require different stamping paths"]
     pub const fn is_ac(self) -> bool {
         matches!(self, Self::Ac { .. })
     }
 
     /// True for transient analysis.
-    #[must_use]
+    #[must_use = "transient loads require history and integration terms"]
     pub const fn is_transient(self) -> bool {
         matches!(self, Self::Transient { .. })
     }
 
     /// True for the DC analyses, where capacitors are open and inductors are
     /// shorts.
-    #[must_use]
+    #[must_use = "static loads omit time-dependent companion terms"]
     pub const fn is_dc(self) -> bool {
         matches!(self, Self::OperatingPoint | Self::DcSweep)
     }
@@ -179,7 +179,7 @@ pub struct MnaUnknowns {
 
 impl MnaUnknowns {
     /// An empty mapping.
-    #[must_use]
+    #[must_use = "the new unknown allocator must be retained to assign matrix rows"]
     pub const fn new() -> Self {
         Self {
             node_rows: Vec::new(),
@@ -250,7 +250,7 @@ impl MnaUnknowns {
     }
 
     /// The matrix row for a node, or `None` for ground.
-    #[must_use]
+    #[must_use = "the row identifies the matrix coordinate or a reference node"]
     #[inline]
     pub fn node_row(&self, node: NodeId) -> Option<usize> {
         self.node_rows.get(node.index()).copied().flatten()
@@ -288,13 +288,13 @@ impl MnaUnknowns {
     }
 
     /// Number of unknowns, i.e. the size of the MNA system.
-    #[must_use]
+    #[must_use = "the unknown count determines the MNA system dimension"]
     pub const fn len(&self) -> usize {
         self.next_row
     }
 
     /// True when the system has no unknowns, which means the circuit is empty.
-    #[must_use]
+    #[must_use = "the empty-system result determines whether matrix rows exist"]
     pub const fn is_empty(&self) -> bool {
         self.next_row == 0
     }
@@ -337,7 +337,7 @@ pub struct ConvergenceContext<'a> {
 
 impl ConvergenceContext<'_> {
     /// The new iterate's value at a node, zero at ground.
-    #[must_use]
+    #[must_use = "the node potential is needed to evaluate convergence at the current iterate"]
     pub fn voltage(&self, node: NodeId) -> Real {
         self.unknowns
             .node_row(node)
@@ -359,7 +359,7 @@ enum RhsTarget<'a> {
 
 impl<'a> StampRhs<'a> {
     /// Stamp into the complete solver RHS.
-    #[must_use]
+    #[must_use = "the returned writer is required to stamp the dense right-hand side"]
     pub const fn dense(rhs: &'a mut Vector) -> Self {
         Self(RhsTarget::Dense(rhs))
     }
@@ -478,7 +478,7 @@ impl StampContext<'_> {
     /// The temperatures and junction `gmin` of this load as a [`crate::devices::ModelContext`]
     /// (without resistor or instance-parameter overrides, which
     /// [`crate::devices::Circuit`] has already applied).
-    #[must_use]
+    #[must_use = "the model context carries the analysis temperature and numerical settings"]
     pub const fn model_context(&self) -> crate::devices::ModelContext {
         crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
             .with_gmin(self.gmin)
@@ -575,7 +575,7 @@ impl StampContext<'_> {
     }
 
     /// The present solution value at a node, or zero at ground.
-    #[must_use]
+    #[must_use = "the node potential determines the voltage-dependent load contribution"]
     #[inline]
     pub fn node_voltage(&self, node: NodeId) -> Real {
         self.unknowns
@@ -585,7 +585,7 @@ impl StampContext<'_> {
     }
 
     /// The name of a node, for diagnostics.
-    #[must_use]
+    #[must_use = "the returned name identifies the node in load diagnostics"]
     pub fn node_name(&self, node: NodeId) -> &str {
         self.nodes
             .node(node)

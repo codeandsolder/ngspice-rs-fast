@@ -242,7 +242,7 @@ pub enum SpectrumWindow {
 
 impl SpectrumWindow {
     /// Parse the supported ngspice window names and aliases.
-    #[must_use]
+    #[must_use = "the parsed window determines the spectral transform weighting"]
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "none" | "rectangular" => Some(Self::Rectangular),

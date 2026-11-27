@@ -240,7 +240,7 @@ impl TemperatureModel {
 
     /// A processed value by its stable name (a model keyword or an internal
     /// name such as `vcrit`, `phi_b`).
-    #[must_use]
+    #[must_use = "the returned option distinguishes a processed temperature-dependent quantity from an unknown name"]
     pub fn get(&self, name: &str) -> Option<Real> {
         match name {
             "pb" => Some(self.pb),

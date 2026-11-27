@@ -479,14 +479,14 @@ impl PlotObjectivePlan {
     /// Ordered raw observation indices required by the objectives, including
     /// the scale whenever interpolation or trace metadata needs it. This is
     /// the producer boundary for selective loading/output in #120.
-    #[must_use]
+    #[must_use = "the returned indices determine which observations the producer must supply for objective evaluation"]
     pub fn required_columns(&self) -> &[usize] {
         &self.required
     }
 
     /// Raw indices that must be retained for postprocessing. Empty for purely
     /// online reductions, regardless of the number of accepted points.
-    #[must_use]
+    #[must_use = "the returned projection determines which observations must survive online reduction for postprocessing"]
     pub fn retained_columns(&self) -> &[usize] {
         self.projection
             .as_ref()
@@ -494,7 +494,7 @@ impl PlotObjectivePlan {
     }
 
     /// The expected source header, with no rows.
-    #[must_use]
+    #[must_use = "the returned header defines the expected input schema for the objective plan"]
     pub const fn header(&self) -> &Plot {
         &self.source
     }
@@ -853,20 +853,20 @@ pub struct ScenarioPlan {
 impl ScenarioPlan {
     /// Bind the ordered expected plots. Include ignored bias/summary outputs
     /// with empty requests; never route by a plot-name substring.
-    #[must_use]
+    #[must_use = "the constructed plan must be retained to bind objective requests to the expected plot sequence"]
     pub const fn new(plots: Vec<PlotObjectivePlan>) -> Self {
         Self { plots }
     }
 
     /// Plans in the same order in which the sink must receive them.
-    #[must_use]
+    #[must_use = "the returned order identifies which plan each incoming plot must use"]
     pub fn plots(&self) -> &[PlotObjectivePlan] {
         &self.plots
     }
 
     /// New independent candidate state. No saved measurements, traces or
     /// partially evaluated namespace survives a previous candidate.
-    #[must_use]
+    #[must_use = "the fresh sink must be retained to collect independent objective state for this candidate"]
     pub fn sink<'a>(&'a self, scope: &'a ParamScope) -> ScenarioSink<'a> {
         ScenarioSink {
             plan: self,

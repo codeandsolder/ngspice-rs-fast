@@ -87,7 +87,7 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     /// A warning: C reports it and continues.
-    #[must_use]
+    #[must_use = "the warning must be retained to report a nonfatal parameter diagnostic"]
     pub fn warning(message: impl Into<String>, c_reference: &'static str) -> Self {
         Self {
             fatal: false,
@@ -96,7 +96,7 @@ impl Diagnostic {
         }
     }
     /// A fatal check: C reports it and fails setup.
-    #[must_use]
+    #[must_use = "the fatal diagnostic must be propagated to reject invalid parameters"]
     pub fn fatal(message: impl Into<String>, c_reference: &'static str) -> Self {
         Self {
             fatal: true,
@@ -188,7 +188,7 @@ impl Parameter {
     /// Reviewed input units for the unambiguous initial subset. `None` means
     /// not audited yet, **not dimensionless**. In particular mobility and
     /// geometry-binning coefficients need the setup phase's unit conventions.
-    #[must_use]
+    #[must_use = "the expected input unit determines how the supplied scalar is interpreted"]
     pub fn input_unit(&self) -> Option<ScalarUnit> {
         use ScalarUnit as U;
         match self.canonical {
@@ -272,13 +272,13 @@ impl Inputs {
 
     /// Every applied setter, in application order; IC is expanded in C's
     /// VBS/VGS/VDS fallthrough order. This does not rewrite the source AST.
-    #[must_use]
+    #[must_use = "the ordered assignments are needed to replay parameter application"]
     pub fn applied(&self) -> &[AppliedParameter] {
         &self.applied.ordered
     }
     /// Last setter for a keyword or any alias of its C parameter ID.
     /// `None` means ungiven, not a default or a simulated ask value.
-    #[must_use]
+    #[must_use = "the returned assignment distinguishes a supplied parameter from a missing one"]
     pub fn get(&self, name: &str) -> Option<&AppliedParameter> {
         let id = self.table().get(name)?.id;
         let index = *self.applied.last.get(&id)?;

@@ -35,55 +35,55 @@ pub(super) struct ShootingSolution {
 
 impl PeriodicOrbit {
     /// MNA solution at the chosen phase section.
-    #[must_use]
+    #[must_use = "the returned solution supplies the initial MNA state at the selected phase section"]
     pub const fn initial(&self) -> &Vector {
         &self.solution.initial
     }
 
     /// Fundamental period in seconds.
-    #[must_use]
+    #[must_use = "the returned period determines the integration interval for one orbit"]
     pub const fn period(&self) -> Real {
         self.solution.period
     }
 
     /// Fundamental frequency in hertz.
-    #[must_use]
+    #[must_use = "the returned frequency determines the physical spacing of the orbit's spectral harmonics"]
     pub const fn frequency(&self) -> Real {
         self.solution.period.recip()
     }
 
     /// Maximum scaled state mismatch at the orbit boundary.
-    #[must_use]
+    #[must_use = "the returned mismatch is needed to assess periodic state closure"]
     pub const fn residual(&self) -> Real {
         self.solution.residual
     }
 
     /// Maximum scaled charge/flux mismatch at the orbit boundary.
-    #[must_use]
+    #[must_use = "the returned mismatch is needed to assess charge and flux closure separately from voltage closure"]
     pub const fn charge_residual(&self) -> Real {
         self.charge_residual
     }
 
     /// Estimated transverse contraction bound (excluding phase).
-    #[must_use]
+    #[must_use = "the returned bound estimates stability transverse to the neutral phase direction"]
     pub const fn transverse_bound(&self) -> Real {
         self.solution.transverse_bound
     }
 
     /// Number of one-period map evaluations, including Jacobian probes.
-    #[must_use]
+    #[must_use = "the returned count measures orbit-search work including finite-difference probes"]
     pub const fn map_evaluations(&self) -> usize {
         self.solution.map_evaluations
     }
 
     /// Total accepted adaptive timesteps, including startup and Jacobian probes.
-    #[must_use]
+    #[must_use = "the returned count measures accepted integration work across all orbit-search evaluations"]
     pub const fn accepted_steps(&self) -> usize {
         self.accepted_steps
     }
 
     /// Total rejected adaptive timesteps.
-    #[must_use]
+    #[must_use = "the returned count measures rejected adaptive trials during the orbit search"]
     pub const fn rejected_steps(&self) -> usize {
         self.rejected_steps
     }
