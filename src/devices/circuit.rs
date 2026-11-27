@@ -773,22 +773,19 @@ impl<'a> PreparedRun<'a> {
         let mut bindings = Vec::new();
         for index in self.circuit.load_order() {
             let device = point.device(self.circuit, index);
-            let slots = device.physical_taylor_storage_slots();
-            if slots.is_empty() {
-                continue;
-            }
-            let range = self
-                .circuit
-                .state_rows(index)
-                .ok_or_else(|| SpiceError::circuit("missing physical Taylor history range"))?;
-            for &slot in slots {
-                if slot.saturating_add(1) >= range.len() {
+            device.physical_charge_histories(&mut |history| {
+                let range = self
+                    .circuit
+                    .state_rows(index)
+                    .ok_or_else(|| SpiceError::circuit("missing physical Taylor history range"))?;
+                if history.slot.saturating_add(1) >= range.len() {
                     return Err(SpiceError::circuit(
                         "physical Taylor history pair outside device",
                     ));
                 }
-                bindings.push((range.start + slot, device.name().to_owned()));
-            }
+                bindings.push((range.start + history.slot, device.name().to_owned()));
+                Ok(())
+            })?;
         }
         bindings.sort_unstable_by_key(|binding| binding.0);
         if bindings

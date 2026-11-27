@@ -2024,12 +2024,24 @@ impl Device for Diode {
             recovery.not_converged(context, current)
         })
     }
-    fn physical_taylor_storage_slots(&self) -> &[usize] {
+    fn physical_charge_histories(
+        &self,
+        visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        use crate::devices::traits::PhysicalChargeHistory;
+        visit(PhysicalChargeHistory {
+            slot: DIODE_CHARGE_SLOT,
+            nodes: self.junction,
+            scale: 1.,
+        })?;
         if self.recovery_node.is_some() {
-            &[DIODE_CHARGE_SLOT, recovery::CHARGE_SLOT]
-        } else {
-            &[DIODE_CHARGE_SLOT]
+            visit(PhysicalChargeHistory {
+                slot: recovery::CHARGE_SLOT,
+                nodes: self.junction,
+                scale: 1. - self.parameters.model.vp,
+            })?;
         }
+        Ok(())
     }
 
     fn assemble_nonlinear_taylor(

@@ -445,6 +445,7 @@ fn physical_derivative_array_preserves_gate_charge_and_channel_kcl() -> Result<(
                     .parse_deck(&parse_deck_text(Path::new("jfet-germ.cir"), &body))?;
                 let config = RunConfig::from_netlist(&netlist)?;
                 let mut c = config.circuit(&netlist)?;
+                c.set_observations(&["@j1[i]".into()])?;
                 let p = config
                     .plan_for(&netlist.analyses[0])?
                     .run(&mut c, &config.context())?;
@@ -468,6 +469,7 @@ fn physical_derivative_array_preserves_gate_charge_and_channel_kcl() -> Result<(
                     let channel = sign * square_law(2e-3, 0.02, -2., active, drain.abs());
                     let gd = gate_current(vgd, 30e-12);
                     let gs = gate_current(vgs, 20e-12);
+                    close(value(&p, "@j1[i]", i), -value(&p, "i(vd)", i), 1e-8, 1e-14);
                     close(
                         value(&p, "v(first)", i),
                         polarity * rate * 1e-3,

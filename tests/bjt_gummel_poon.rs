@@ -801,6 +801,7 @@ fn derivative_array_with_bjt_preserves_independent_base_and_collector_charge()
             let deck = netlist(&body);
             let config = RunConfig::from_netlist(&deck)?;
             let mut c = config.circuit(&deck)?;
+            c.set_observations(&["@q1[i]".into()])?;
             let plot = config
                 .plan_for(&deck.analyses[0])?
                 .run(&mut c, &config.context())?;
@@ -834,6 +835,7 @@ fn derivative_array_with_bjt_preserves_independent_base_and_collector_charge()
                     1e-13,
                 );
                 close(v("i(vc)"), -2. * pol * (collector - qbc_rate), 1e-6, 1e-13);
+                close(v("@q1[i]"), -v("i(vc)"), 1e-8, 1e-14);
             }
         }
     }

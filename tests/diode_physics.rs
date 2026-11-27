@@ -10,6 +10,10 @@ const K_OVER_Q: f64 = 1.38064852e-23 / 1.6021766208e-19;
 const GMIN: f64 = 1e-12;
 
 fn simulate(body: &str) -> Plot {
+    simulate_observed(body, &[])
+}
+
+fn simulate_observed(body: &str, observations: &[String]) -> Plot {
     let n = Parser::new()
         .parse_deck(&parse_deck_text(
             Path::new("diode_physics.cir"),
@@ -18,6 +22,7 @@ fn simulate(body: &str) -> Plot {
         .unwrap();
     let config = RunConfig::from_netlist(&n).unwrap();
     let mut circuit = config.circuit(&n).unwrap();
+    circuit.set_observations(observations).unwrap();
     let request = config.plan_for(&n.analyses[0]).unwrap();
     request.run(&mut circuit, &config.context()).unwrap()
 }
@@ -455,9 +460,12 @@ fn device_local_diode_charges_on_shared_node_have_independent_history() {
 #[test]
 fn diode_recovery_state_participates_in_physical_derivative_array() {
     for method in ["gear", "trap"] {
-        let p = simulate(&format!(
-            "v1 in 0 PWL(0 0 1u 0.05)\nd1 in 0 dm\n.model dm d(is=1e-8 tt=1u vp=0.5 qpscale=1e6)\nb1 first 0 v=1u*ddt(v(in))\nb2 out 0 v=1u*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 10n 0.5u 0 10n uic"
-        ));
+        let p = simulate_observed(
+            &format!(
+                "v1 in 0 PWL(0 0 1u 0.05)\nd1 in 0 dm\n.model dm d(is=1e-8 tt=1u vp=0.5 qpscale=1e6)\nb1 first 0 v=1u*ddt(v(in))\nb2 out 0 v=1u*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 10n 0.5u 0 10n uic"
+            ),
+            &["@d1[i]".into(), "@d1[p]".into()],
+        );
         let slope = 50_000.;
         let a = slope / (K_OVER_Q * 300.15);
         let tau = 0.5e-6;
@@ -471,6 +479,36 @@ fn diode_recovery_state_participates_in_physical_derivative_array() {
             assert!((real(&p, "v(first)", i) - 0.05).abs() < 1e-10);
             assert!(real(&p, "v(out)", i).abs() < 1e-10);
             assert!((real(&p, "i(v1)", i) + current + 0.5 * qdot).abs() < 2e-12);
+            assert!((real(&p, "@d1[i]", i) + real(&p, "i(v1)", i)).abs() < 1e-13);
+            assert!(
+                (real(&p, "@d1[p]", i) - real(&p, "@d1[i]", i) * real(&p, "v(in)", i)).abs()
+                    < 1e-15
+            );
+        }
+    }
+}
+
+#[test]
+fn derivative_array_diode_observation_respects_ground_and_series_nodes() {
+    for resistance in [0., 10.] {
+        for reverse in [false, true] {
+            for method in ["gear", "trap"] {
+                let (terminals, sign) = if reverse { ("0 in", -1.) } else { ("in 0", 1.) };
+                let p = simulate_observed(
+                    &format!(
+                        "v1 in 0 PWL(0 0 1m 1)\nd1 {terminals} dm\n.model dm d(is=1e-12 n=10 cjo=20p rs={resistance})\nb1 first 0 v=1m*ddt(v(in))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1e-9\n.tran 1u 20u 0 1u uic"
+                    ),
+                    &["@d1[i]".into(), "@d1[p]".into()],
+                );
+                for i in 0..p.point_count() {
+                    let expected = -sign * real(&p, "i(v1)", i);
+                    assert!((real(&p, "@d1[i]", i) - expected).abs() < 2e-13);
+                    assert!(
+                        (real(&p, "@d1[p]", i) - expected * sign * real(&p, "v(in)", i)).abs()
+                            < 1e-15
+                    );
+                }
+            }
         }
     }
 }

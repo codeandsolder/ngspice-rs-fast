@@ -361,6 +361,42 @@ impl PointLoads<'_, '_> {
                 self.request.solution,
                 &mut loaded.currents,
             );
+            if matches!(
+                self.request.mode,
+                crate::devices::AnalysisMode::Instantaneous { .. }
+            ) {
+                // The isolated static load deliberately has no integration
+                // companion. Add each physical charge rate from the solved
+                // trial, not the scratch state overwritten by that load.
+                device.physical_charge_histories(&mut |history| {
+                    let range = self
+                        .circuit
+                        .state_rows(layout.device)
+                        .ok_or_else(|| gap(name))?;
+                    let rate = self
+                        .previous
+                        .map(TrialState::values)
+                        .or_else(|| self.request.history.accepted(1))
+                        .and_then(|values| values.get(range))
+                        .and_then(|values| values.get(history.slot + 1))
+                        .copied()
+                        .ok_or_else(|| gap(name))?;
+                    for (node, sign) in history.nodes.into_iter().zip([1., -1.]) {
+                        if let Some(row) = self.circuit.unknowns().node_row(node)
+                            && let Ok(index) =
+                                layout.by_row.binary_search_by_key(&row, |&(row, _)| row)
+                        {
+                            loaded.currents[layout.by_row[index].1] += sign * history.scale * rate;
+                        }
+                    }
+                    Ok(())
+                })?;
+                // Ground is the negative sum of all distinct external
+                // terminal currents, including current through internal
+                // series nodes whose own KCL has already been solved.
+                loaded.currents[layout.rows.len()] =
+                    -loaded.currents[..layout.rows.len()].iter().sum::<Real>();
+            }
             loaded.epoch = work.epoch;
         }
         loaded.currents.get(slot).copied().ok_or_else(|| gap(name))
