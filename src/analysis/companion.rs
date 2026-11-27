@@ -324,12 +324,11 @@ enum Trial {
     Converged {
         x: Vector,
         state: TrialState,
+        derivative_seed: Option<DerivativeSeed>,
     },
     /// The iteration limit was reached; `last` is the iterate of the final
     /// load (C's `CKTrhsOld`, the next trial's starting point).
-    NotConverged {
-        last: Vector,
-    },
+    NotConverged { last: Vector },
 }
 
 /// The first transient step uses MODEINITTRAN, including every retry.
@@ -674,6 +673,7 @@ struct AcceptedCandidate {
     mixed: Option<super::digital::MixedPoint>,
     solution: Vector,
     state: TrialState,
+    derivative_seed: Option<DerivativeSeed>,
 }
 
 struct AcceptedPoint {
@@ -776,12 +776,27 @@ impl VoltageHistory {
     }
 }
 
-/// Most recent verified physical point, retained solely as a Newton seed.
-/// Rejected trials cannot alter accepted charge or flux history.
+/// A disposable physical solution's derivative seed. It becomes a
+/// predictor only when the corresponding physical point is accepted.
+struct DerivativeSeed {
+    rate: Vector,
+    order_hint: usize,
+}
+
+impl DerivativeSeed {
+    const fn guess(&self) -> initial::DerivativeGuess<'_> {
+        initial::DerivativeGuess {
+            order_hint: self.order_hint,
+            rate: Some(&self.rate),
+        }
+    }
+}
+
+/// Most recent accepted physical point, retained solely as a Newton seed.
 struct DerivativePredictor {
     time: Real,
     state: Vector,
-    rate: Vector,
+    seed: DerivativeSeed,
 }
 
 impl DerivativePredictor {
@@ -791,7 +806,7 @@ impl DerivativePredictor {
             self.state
                 .as_slice()
                 .iter()
-                .zip(self.rate.as_slice())
+                .zip(self.seed.rate.as_slice())
                 .map(|(&x, &rate)| rate.mul_add(delta, x))
                 .collect::<Vec<_>>(),
         );
@@ -832,8 +847,7 @@ struct Driver<'a> {
     workspace: crate::analysis::newton::CircuitNewtonWorkspace,
     mixed: Option<&'a mut super::digital::MixedSignal>,
     index_aware: bool,
-    derivative_order: std::cell::Cell<usize>,
-    derivative_predictor: std::cell::RefCell<Option<DerivativePredictor>>,
+    derivative_predictor: Option<DerivativePredictor>,
     physical_events: Option<std::iter::Peekable<crate::devices::SystemBreakpoints>>,
 }
 
@@ -1193,8 +1207,7 @@ fn run_transient_inner(
         workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
         mixed,
         index_aware: false,
-        derivative_order: std::cell::Cell::new(2),
-        derivative_predictor: std::cell::RefCell::new(None),
+        derivative_predictor: None,
         physical_events,
     };
     driver.run(purpose, sink)
@@ -1756,7 +1769,11 @@ impl Driver<'_> {
                     drop(prepared);
                     ready = attempt.retry(next, min_step)?;
                 }
-                Trial::Converged { x, mut state } => {
+                Trial::Converged {
+                    x,
+                    mut state,
+                    derivative_seed,
+                } => {
                     if let Some(next) = self.mixed_retry(&attempt, &x)? {
                         iterate = x;
                         self.stats.rejected += 1;
@@ -1791,7 +1808,7 @@ impl Driver<'_> {
                             let candidate = self.prepare_accepted_candidate(
                                 &attempt,
                                 &mut prepared,
-                                (x, state),
+                                (x, state, derivative_seed),
                                 &output,
                                 preview,
                                 &mut next,
@@ -1815,22 +1832,27 @@ impl Driver<'_> {
         &self,
         attempt: &AttemptedStep,
         prepared: &mut crate::devices::circuit::PreparedTransient<'_>,
-        (x, state): (Vector, TrialState),
+        (x, state, derivative_seed): (Vector, TrialState, Option<DerivativeSeed>),
         output: &OutputSelection<'_>,
         preview: Option<super::digital::EventPreview>,
         next: &mut NextStep,
     ) -> SpiceResult<AcceptedCandidate> {
-        let (x, state) = if self.crosses_physical_event(attempt) {
+        let (x, state, derivative_seed) = if self.crosses_physical_event(attempt) {
             next.order = Order::One;
-            self.derivative_event(attempt, &x, &state)?
+            let seed = derivative_seed
+                .as_ref()
+                .ok_or_else(|| failure("missing left physical derivative seed"))?;
+            let (x, state, seed) = self.derivative_event(attempt, &x, &state, seed)?;
+            (x, state, Some(seed))
         } else {
-            (x, state)
+            (x, state, derivative_seed)
         };
         Ok(AcceptedCandidate {
             mixed: self.prepare_mixed_point(&x, attempt.clock.time, preview)?,
             output: self.candidate_output(attempt, prepared, &x, &state, output)?,
             solution: x,
             state,
+            derivative_seed,
         })
     }
 
@@ -1853,6 +1875,13 @@ impl Driver<'_> {
         if event {
             self.history.restart_integration()?;
             self.steps.clear();
+        }
+        if let Some(seed) = candidate.derivative_seed {
+            self.derivative_predictor = Some(DerivativePredictor {
+                time: attempt.clock.time,
+                state: candidate.solution.clone(),
+                seed,
+            });
         }
         Ok(AcceptedPoint {
             cursor: attempt.accept(next),
@@ -2157,7 +2186,12 @@ impl Driver<'_> {
         else {
             return Ok(None);
         };
-        let (x, trial) = self.physical_candidate(&request, consistent)?;
+        let (x, trial, seed) = self.physical_candidate(&request, consistent)?;
+        self.derivative_predictor = Some(DerivativePredictor {
+            time: 0.,
+            state: x.clone(),
+            seed,
+        });
         self.physical_events = Some(
             self.system
                 .breakpoints_in(0., self.settings.stop)?
@@ -2210,7 +2244,7 @@ impl Driver<'_> {
         &self,
         request: &LoadRequest<'_>,
         consistent: initial::DerivativePoint,
-    ) -> SpiceResult<(Vector, TrialState)> {
+    ) -> SpiceResult<(Vector, TrialState, DerivativeSeed)> {
         let x = consistent.solution;
         let mut trial = self.history.trial();
         self.prepared.load(
@@ -2225,15 +2259,14 @@ impl Driver<'_> {
         for (slot, value) in consistent.canonical {
             self.history.set_candidate_slot(&mut trial, slot, value)?;
         }
-        self.derivative_order.set(consistent.order_hint);
-        if let AnalysisMode::Instantaneous { time } = request.mode {
-            self.derivative_predictor.replace(Some(DerivativePredictor {
-                time,
-                state: x.clone(),
+        Ok((
+            x,
+            trial,
+            DerivativeSeed {
                 rate: consistent.rate,
-            }));
-        }
-        Ok((x, trial))
+                order_hint: consistent.order_hint,
+            },
+        ))
     }
 
     const fn physical_tolerances(&self) -> initial::Tolerances {
@@ -2251,7 +2284,8 @@ impl Driver<'_> {
         attempt: &AttemptedStep,
         x: &Vector,
         left: &TrialState,
-    ) -> SpiceResult<(Vector, TrialState)> {
+        seed: &DerivativeSeed,
+    ) -> SpiceResult<(Vector, TrialState, DerivativeSeed)> {
         let request = LoadRequest {
             mode: AnalysisMode::Instantaneous {
                 time: attempt.clock.time,
@@ -2265,27 +2299,27 @@ impl Driver<'_> {
                 timing: self.timing,
             }),
         };
-        let predictor = self.derivative_predictor.borrow();
         let consistent = initial::consistent_derivative_event(
             &self.prepared,
             &request,
             left,
             self.physical_tolerances(),
             self.settings.tran_max_iter,
-            initial::DerivativeGuess {
-                order_hint: self.derivative_order.get(),
-                rate: predictor.as_ref().map(|point| &point.rate),
-            },
+            seed.guess(),
         )?;
-        drop(predictor);
         self.physical_candidate(&request, consistent)
     }
 
     fn derivative_trial(&self, attempt: &AttemptedStep, previous: &Vector) -> SpiceResult<Trial> {
-        let predictor = self.derivative_predictor.borrow();
-        let prediction = predictor
-            .as_ref()
-            .and_then(|point| point.at(attempt.clock.time));
+        let predictor = self.derivative_predictor.as_ref();
+        let prediction = predictor.and_then(|point| point.at(attempt.clock.time));
+        let guess = predictor.map_or(
+            initial::DerivativeGuess {
+                order_hint: 2,
+                rate: None,
+            },
+            |point| point.seed.guess(),
+        );
         let request = LoadRequest {
             mode: AnalysisMode::Transient {
                 time: attempt.clock.time,
@@ -2311,12 +2345,12 @@ impl Driver<'_> {
                 self.physical_tolerances(),
                 self.settings.tran_max_iter,
                 initial::DerivativeGuess {
-                    order_hint: self.derivative_order.get(),
+                    order_hint: guess.order_hint,
                     rate,
                 },
             )
         };
-        let rate = predictor.as_ref().map(|point| &point.rate);
+        let rate = guess.rate;
         let outcome = match solve(&request, rate) {
             // An extrapolated state can leave the domain of an otherwise
             // smooth constitutive law. Fall back to the ordinary Newton
@@ -2334,14 +2368,13 @@ impl Driver<'_> {
             }
             result => result,
         }?;
-        drop(predictor);
         let consistent = match outcome {
             initial::DerivativeTrial::Converged(point) => point,
             initial::DerivativeTrial::NotConverged(last) => {
                 return Ok(Trial::NotConverged { last });
             }
         };
-        let (x, state) = self.physical_candidate(
+        let (x, state, seed) = self.physical_candidate(
             &LoadRequest {
                 mode: AnalysisMode::Instantaneous {
                     time: attempt.clock.time,
@@ -2351,7 +2384,11 @@ impl Driver<'_> {
             },
             consistent,
         )?;
-        Ok(Trial::Converged { x, state })
+        Ok(Trial::Converged {
+            x,
+            state,
+            derivative_seed: Some(seed),
+        })
     }
 
     fn solve_trial(
@@ -2396,6 +2433,7 @@ impl Driver<'_> {
             Ok(solved) => Ok(Trial::Converged {
                 x: solved.values,
                 state: solved.trial,
+                derivative_seed: None,
             }),
             Err(crate::analysis::newton::NewtonFailure {
                 last_iterate: Some(last),
