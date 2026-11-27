@@ -72,40 +72,43 @@ impl Branch {
         width: Real,
         maximum: Option<Real>,
     ) -> SpiceResult<Self> {
-        let (join, limited) = if let Some(maximum) = maximum {
-            let (normalized_join, conductance, tangent_matched) = if width == 0. {
-                (0., on, true)
-            } else {
-                limited_join(off, on, width, maximum)
-            };
-            let current = width * Real::midpoint(off, conductance);
-            let outer_join = if tangent_matched {
-                current
-            } else if normalized_join < Real::MIN_POSITIVE {
-                ratio_product(width, on, 2.)
-            } else {
-                (maximum * normalized_join).copysign(on)
-            };
-            (
-                Point {
-                    current,
-                    conductance,
-                },
-                Some(Limited {
-                    maximum,
-                    normalized_join,
-                    outer_join,
-                }),
-            )
-        } else {
-            (
-                Point {
-                    current: width * Real::midpoint(off, on),
-                    conductance: on,
-                },
-                None,
-            )
-        };
+        let (join, limited) = maximum.map_or_else(
+            || {
+                (
+                    Point {
+                        current: width * Real::midpoint(off, on),
+                        conductance: on,
+                    },
+                    None,
+                )
+            },
+            |maximum| {
+                let (normalized_join, conductance, tangent_matched) = if width == 0. {
+                    (0., on, true)
+                } else {
+                    limited_join(off, on, width, maximum)
+                };
+                let current = width * Real::midpoint(off, conductance);
+                let outer_join = if tangent_matched {
+                    current
+                } else if normalized_join < Real::MIN_POSITIVE {
+                    ratio_product(width, on, 2.)
+                } else {
+                    (maximum * normalized_join).copysign(on)
+                };
+                (
+                    Point {
+                        current,
+                        conductance,
+                    },
+                    Some(Limited {
+                        maximum,
+                        normalized_join,
+                        outer_join,
+                    }),
+                )
+            },
+        );
         if !(threshold * off).is_finite()
             || !(threshold + width).is_finite()
             || !join.current.is_finite()
@@ -136,7 +139,15 @@ impl Branch {
         let baseline = self.threshold * self.off;
         if self.width > 0. && distance <= self.width {
             let fraction = distance / self.width;
-            let conductance = (self.join.conductance - self.off).mul_add(fraction, self.off);
+            let difference = self.join.conductance - self.off;
+            let conductance = if difference.is_finite() {
+                difference.mul_add(fraction, self.off)
+            } else {
+                // Opposite-sign finite slopes can have an overflowing
+                // difference even though their convex combination is finite.
+                self.off
+                    .mul_add(1. - fraction, self.join.conductance * fraction)
+            };
             return Point {
                 current: distance.mul_add(Real::midpoint(self.off, conductance), baseline),
                 conductance,
@@ -252,7 +263,11 @@ fn limited_join(off: Real, on: Real, width: Real, maximum: Real) -> (Real, Real,
     }
     // Let u=I_join/I_limit. Continuity of current and slope gives
     // u = width/(2*I_limit) * [G_off + G_on*(1-u^2)].
-    let sum = 1. + off / on;
+    let sum = if off < 0. {
+        (on + off) / on
+    } else {
+        1. + off / on
+    };
     let root = if sum == 0. {
         0.
     } else if ratio <= 2. {
@@ -272,7 +287,8 @@ fn limited_join(off: Real, on: Real, width: Real, maximum: Real) -> (Real, Real,
         // Cancel X before evaluating the numerator to avoid overflow for
         // large negative Y. No subtractive cancellation occurs here.
         let inverse = 2. / ratio;
-        on * ((inverse - off / on) / (1. + inverse / factor)).min(1.)
+        let denominator = 1. + inverse / factor;
+        (ratio_product(maximum, 2. / denominator, width) - off / denominator).min(on)
     } else {
         ratio_product(
             maximum,
@@ -351,6 +367,20 @@ mod tests {
                 "{actual:e} != {expected:e}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn signed_smoothing_keeps_finite_convex_slopes() -> SpiceResult<()> {
+        let branch = Branch::new(0., -1e308, 1e308, 0.5, None)?;
+        let threshold = branch.point(0.);
+        assert_eq!(threshold.conductance.to_bits(), (-1e308_f64).to_bits());
+        let middle = branch.point(0.25);
+        assert!(middle.conductance.abs() < Real::MIN_POSITIVE);
+        assert!((middle.current / -1.25e307 - 1.).abs() < 1e-14);
+        let join = branch.point(0.5);
+        assert_eq!(join.conductance.to_bits(), 1e308_f64.to_bits());
+        assert!(join.current.abs() < Real::MIN_POSITIVE);
         Ok(())
     }
 
