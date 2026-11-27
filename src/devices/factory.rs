@@ -115,6 +115,7 @@ pub(super) fn instantiate_with_models(
             crate::devices::switch::Switch::instantiate(instance, nodes, &model, context)
         }
         ModelBackend::RationalTransfer
+        | ModelBackend::FrequencyTransfer
         | ModelBackend::LogicEvent
         | ModelBackend::LogicVoltage
         | ModelBackend::TimedSwitch => {
