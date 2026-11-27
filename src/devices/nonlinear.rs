@@ -2371,28 +2371,50 @@ mod tests {
         ] {
             for temperature in [-40., 27., 100.] {
                 let thermal = thermal(model, instance, temperature);
-                for voltage in [-9., -6.2, -5.4, -5., -3., -0.5, -0.05, 0.1, 0.4, 0.62, 0.75] {
-                    let v = Jet::affine(12, voltage, 1e-4);
-                    let (current, charge) = thermal.taylor(&v, 1e-12, false)?;
-                    for t in [0., -0.25, 0.25, 0.5] {
-                        let expected = thermal.point(1e-4_f64.mul_add(t, voltage), 1e-12)?.junction;
-                        let at = |jet: &Jet| {
-                            jet.coefficients()
-                                .iter()
-                                .rev()
-                                .fold(0_f64, |sum, coefficient| sum.mul_add(t, *coefficient))
-                        };
-                        let close = |kind: &str, actual: Real, expected: Real| {
-                            assert!(
-                                (actual - expected).abs()
-                                    <= 2e-11 * actual.abs().max(expected.abs()).max(1e-30),
-                                "{model} {temperature} {voltage} {t} {kind}: {actual:e} vs {expected:e}"
-                            );
-                        };
-                        close("I", at(&current.value), expected.current);
-                        close("G", at(&current.slope), expected.conductance);
-                        close("Q", at(&charge.value), expected.charge);
-                        close("C", at(&charge.slope), expected.capacitance);
+                let edges = [
+                    thermal.bottom.threshold,
+                    thermal.sidewall.threshold,
+                    -3. * thermal.n * thermal.vt,
+                    -3. * thermal.ns.unwrap_or(thermal.n) * thermal.vt,
+                    -thermal.breakdown.unwrap_or(Real::INFINITY),
+                ];
+                let voltages = [-9., -6.2, -5.4, -5., -3., -0.5, -0.05, 0.1, 0.4, 0.62, 0.75];
+                for voltage in voltages.into_iter().chain(edges[..2].iter().copied()) {
+                    for direction in [-1., 1.] {
+                        // Each Taylor germ belongs to its own analytic
+                        // interval. In particular C is continuous but its
+                        // higher derivatives change at FC*VJ. Evaluating a
+                        // right-hand germ at negative time is not a valid
+                        // oracle at that boundary.
+                        let step = edges
+                            .iter()
+                            .map(|edge| (edge - voltage) * direction)
+                            .filter(|&distance| distance > 0.)
+                            .fold(1e-4_f64, |step, distance| step.min(distance * 0.5));
+                        let slope = step * direction;
+                        let v = Jet::affine(12, voltage, slope);
+                        let (current, charge) = thermal.taylor(&v, 1e-12, false)?;
+                        for t in [0., 0.25, 0.5] {
+                            let expected =
+                                thermal.point(slope.mul_add(t, voltage), 1e-12)?.junction;
+                            let at = |jet: &Jet| {
+                                jet.coefficients()
+                                    .iter()
+                                    .rev()
+                                    .fold(0_f64, |sum, coefficient| sum.mul_add(t, *coefficient))
+                            };
+                            let close = |kind: &str, actual: Real, expected: Real| {
+                                assert!(
+                                    (actual - expected).abs()
+                                        <= 2e-11 * actual.abs().max(expected.abs()).max(1e-30),
+                                    "{model} {temperature} {voltage} {slope} {t} {kind}: {actual:e} vs {expected:e}"
+                                );
+                            };
+                            close("I", at(&current.value), expected.current);
+                            close("G", at(&current.slope), expected.conductance);
+                            close("Q", at(&charge.value), expected.charge);
+                            close("C", at(&charge.slope), expected.capacitance);
+                        }
                     }
                 }
             }
