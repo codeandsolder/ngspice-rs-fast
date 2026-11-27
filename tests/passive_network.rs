@@ -496,3 +496,82 @@ fn voltage_series_impedance_noise_uses_explicit_nonnegative_thermal_law() -> Spi
     }
     Ok(())
 }
+
+#[test]
+fn explicit_network_setters_round_trip_and_bind_after_lexical_expansion() -> SpiceResult<()> {
+    use ngspice_rs::netlist::{semantic_eq, write_netlist};
+    let text = "physical network\nv1 drive 0 dc 0 ac 1\nrdrive drive port 0.1\n\
+                .subckt part p n copies=1 series=0\n\
+                c1 p n 2u pn_rseries={series} pn_rparallel=100 pn_cparallel=1u m={copies}\n\
+                .ends part\n\
+                x1 port 0 part copies=3 series=5\n\
+                c_removed port 0 1m m=0 pn_rseries=0\n.end\n";
+    let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("network.cir"), text))?;
+    let written = write_netlist(&netlist)?;
+    let reparsed =
+        Parser::new().parse_deck(&parse_deck_text(Path::new("network.cir"), &written))?;
+    assert!(semantic_eq(&netlist, &reparsed));
+    let mut circuit = Circuit::from_netlist(&reparsed)?;
+    assert!(circuit.device("c_removed").is_none());
+    let plot = run(
+        &mut circuit,
+        AnalysisKind::Ac,
+        &["lin", "1", "5050", "5050"],
+    )?;
+    close(
+        -plot.value("i(v1)", 0).unwrap() / plot.value("v(port)", 0).unwrap(),
+        Complex::new(0.0282941181150396, 0.0893855180292856) * Complex::real(3.),
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_voltage_network_round_trips_with_symbolic_zero() -> SpiceResult<()> {
+    use ngspice_rs::netlist::{semantic_eq, write_netlist};
+    let text = "physical voltage network\n.param loss=0\n\
+                v1 out 0 1 ac 1 pn_rseries={loss} pn_cparallel=1u\n\
+                rload out 0 3\n.end\n";
+    let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("network.cir"), text))?;
+    let written = write_netlist(&netlist)?;
+    let reparsed =
+        Parser::new().parse_deck(&parse_deck_text(Path::new("network.cir"), &written))?;
+    assert!(semantic_eq(&netlist, &reparsed));
+    let mut circuit = Circuit::from_netlist(&reparsed)?;
+    assert!(circuit.device("rv1#series").is_none());
+    let plot = run(&mut circuit, AnalysisKind::Ac, &["lin", "1", "10k", "10k"])?;
+    close(plot.value("v(out)", 0).unwrap(), Complex::real(1.));
+    close(
+        plot.value("i(vv1#port)", 0).unwrap(),
+        Complex::real(-1. / 3.),
+    );
+    close(
+        plot.value("i(v1)", 0).unwrap(),
+        Complex::new(-1. / 3., -TAU * 1e4 * 1e-6),
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_storage_bias_is_analysis_bound() -> SpiceResult<()> {
+    let text = "physical bias\nv1 drive 0 dc 2 ac 1\nrdrive drive port 10\n\
+                c1 port 0 2u ic=0.75 pn_bias_op=1000 pn_bias_tran=1000\n.end\n";
+    let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("network.cir"), text))?;
+    let mut circuit = Circuit::from_netlist(&netlist)?;
+    let op = run(&mut circuit, AnalysisKind::OperatingPoint, &[])?;
+    close(
+        op.value("v(port)", 0).unwrap(),
+        Complex::real(0.7501249875012499),
+    );
+    let dc = run(&mut circuit, AnalysisKind::DcSweep, &["v1", "2", "2", "1"])?;
+    close(dc.value("v(port)", 0).unwrap(), Complex::real(2.));
+    let ac = run(
+        &mut circuit,
+        AnalysisKind::Ac,
+        &["lin", "1", "1000", "1000"],
+    )?;
+    close(
+        ac.value("v(port)", 0).unwrap(),
+        Complex::real(1.) / Complex::new(1., TAU * 1000. * 2e-6 * 10.),
+    );
+    Ok(())
+}

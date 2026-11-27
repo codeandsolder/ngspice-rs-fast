@@ -1428,6 +1428,7 @@ fn passive_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceRes
         _ => "inductance",
     };
     let allowed = |name: &str| match (designator, name) {
+        (_, name) if crate::netlist::network_parameter(designator, name) => true,
         (_, "temp" | "dtemp" | "m" | "tc1" | "tc2" | "scale")
         | ('r' | 'c', "w" | "l" | "bv_max")
         | ('r', "ac" | "tc" | "tce" | "noisy")
@@ -1924,6 +1925,11 @@ fn source_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceResu
             }
             // PWL delay/repeat setters stay separate ordered scalars (vsrc.c).
             (ParameterKind::Scalar | ParameterKind::Expression(_), "r" | "td") => {
+                named_value(parts, parameter, false)?;
+            }
+            (ParameterKind::Scalar | ParameterKind::Expression(_), name)
+                if crate::netlist::network_parameter(device.designator, name) =>
+            {
                 named_value(parts, parameter, false)?;
             }
             // RFSPICE port setters of a V source, ordered like the PWL ones.

@@ -1,5 +1,7 @@
 //! Physical two-terminal storage networks, bound to ordinary native RLC
-//! devices. Source-dependent defaults and current observation conventions are
+//! devices.
+//!
+//! Source-dependent defaults and current observation conventions are
 //! resolved separately; the winding, storage and terminal identities are
 //! intentionally distinct.
 
@@ -275,19 +277,23 @@ impl PreparedPassiveNetwork {
             primary: name.to_owned(),
             terminal_probe: format!("v{name}#port"),
         };
-        let size = ElaborationSize::new(
+        circuit
+            .add_prepared_devices(self.size(), |nodes| self.build(nodes, &binding, terminals))?;
+        Ok(binding)
+    }
+
+    pub(super) fn size(&self) -> ElaborationSize {
+        ElaborationSize::new(
             self.edges.len() + 1,
             self.nodes - 1,
             self.edges
                 .iter()
                 .map(|edge| edge.element.state_slots())
                 .sum(),
-        );
-        circuit.add_prepared_devices(size, |nodes| self.build(nodes, &binding, terminals))?;
-        Ok(binding)
+        )
     }
 
-    fn build(
+    pub(super) fn build(
         &self,
         nodes: &mut NodeAppend<'_>,
         binding: &PassiveNetworkBinding,
@@ -362,6 +368,7 @@ fn new_node(
 }
 
 /// Explicit physical output impedance of an independent voltage source.
+///
 /// The shunt capacitance is internal to the terminal current probe; the
 /// series impedance carries both the load and capacitive currents.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -375,6 +382,7 @@ pub struct VoltageNetworkCoefficients {
 }
 
 /// Prepared independent voltage source and its physical output impedance.
+///
 /// The excitation identity is unchanged for sweeps and input-referred noise;
 /// the separately named probe gives current into the external positive port.
 #[derive(Debug, Clone)]
@@ -442,15 +450,18 @@ impl PreparedVoltageNetwork {
             excitation: name.to_owned(),
             terminal_probe: format!("v{name}#port"),
         };
-        let series = usize::from(self.coefficients.series_resistance != 0.);
-        let shunt = usize::from(self.coefficients.parallel_capacitance != 0.);
-        let size =
-            ElaborationSize::new(2 + series + shunt, 1 + series, shunt * REACTIVE_STATE_COUNT);
-        circuit.add_prepared_devices(size, |nodes| self.build(nodes, &binding, terminals))?;
+        circuit
+            .add_prepared_devices(self.size(), |nodes| self.build(nodes, &binding, terminals))?;
         Ok(binding)
     }
 
-    fn build(
+    pub(super) fn size(&self) -> ElaborationSize {
+        let series = usize::from(self.coefficients.series_resistance != 0.);
+        let shunt = usize::from(self.coefficients.parallel_capacitance != 0.);
+        ElaborationSize::new(2 + series + shunt, 1 + series, shunt * REACTIVE_STATE_COUNT)
+    }
+
+    pub(super) fn build(
         &self,
         nodes: &mut NodeAppend<'_>,
         binding: &VoltageNetworkBinding,
@@ -496,5 +507,214 @@ impl PreparedVoltageNetwork {
             )?));
         }
         Ok(devices)
+    }
+}
+
+/// Parsed explicit network after lexical expansion and numeric literalization.
+/// A removed storage instance still reserves its written instance identity,
+/// but contributes no devices or private nodes.
+pub(super) enum NetworkPlan {
+    Storage(Option<PreparedPassiveNetwork>),
+    Voltage(PreparedVoltageNetwork),
+}
+
+impl NetworkPlan {
+    pub(super) fn prepare(
+        instance: &crate::netlist::ast::DeviceInstance,
+    ) -> SpiceResult<Option<Self>> {
+        use crate::netlist::ast::ParameterKind;
+
+        if !instance
+            .parameters
+            .iter()
+            .any(|p| crate::netlist::network_parameter(instance.designator, &p.name))
+        {
+            return Ok(None);
+        }
+        let invalid = |message| SpiceError::parse(instance.location.clone(), message);
+        if instance.model.is_some() || instance.nodes.len() != 2 {
+            return Err(invalid(
+                "physical network requires a resolved two-terminal instance",
+            ));
+        }
+
+        // All network-specific setters are finite scalar coefficients after
+        // occurrence expansion. Duplicate setters keep normal last-wins order.
+        let mut values = std::collections::BTreeMap::new();
+        let mut ordinary = instance.clone();
+        ordinary.parameters.clear();
+        for p in &instance.parameters {
+            if crate::netlist::network_parameter(instance.designator, &p.name) {
+                if p.kind != ParameterKind::Scalar {
+                    return Err(SpiceError::parse(
+                        p.location.clone(),
+                        "physical network requires a resolved scalar coefficient",
+                    ));
+                }
+                values.insert(p.name.as_str(), super::factory::scalar_number(p)?);
+            } else {
+                ordinary.parameters.push(p.clone());
+            }
+        }
+        let get = |key| values.get(key).copied();
+        let zero = |key| get(key).unwrap_or(0.);
+        if instance.designator == 'v' {
+            let network = PreparedVoltageNetwork::prepare(
+                VoltageNetworkCoefficients {
+                    series_resistance: zero("pn_rseries"),
+                    parallel_capacitance: zero("pn_cparallel"),
+                    temperature: get("pn_temp"),
+                },
+                super::factory::voltage_network_inputs(&ordinary)?,
+            )?;
+            return Ok(Some(Self::Voltage(network)));
+        }
+
+        Self::storage(&ordinary, &values).map(Some)
+    }
+
+    fn storage(
+        instance: &crate::netlist::ast::DeviceInstance,
+        values: &std::collections::BTreeMap<&str, Real>,
+    ) -> SpiceResult<Self> {
+        use crate::netlist::ast::ParameterKind;
+
+        let invalid = |message| SpiceError::parse(instance.location.clone(), message);
+        let get = |key| values.get(key).copied();
+        let zero = |key| get(key).unwrap_or(0.);
+        let (kind, primary) = match instance.designator {
+            'c' => (StorageKind::Capacitor, "capacitance"),
+            'l' => (StorageKind::Inductor, "inductance"),
+            _ => return Err(invalid("invalid physical storage family")),
+        };
+        let mut value = None;
+        let mut temperature = None;
+        let mut multiplicity = 1.;
+        let mut initial = None;
+        for p in &instance.parameters {
+            if p.kind != ParameterKind::Scalar {
+                return Err(SpiceError::parse(
+                    p.location.clone(),
+                    "physical network requires resolved scalar storage",
+                ));
+            }
+            let scalar = super::factory::scalar_number(p)?;
+            match p.name.as_str() {
+                name if name == primary => value = Some(scalar),
+                "m" => multiplicity = scalar,
+                "temp" => temperature = Some(scalar),
+                "ic" => initial = Some(scalar),
+                _ => {
+                    return Err(SpiceError::parse(
+                        p.location.clone(),
+                        format!("unresolved physical network setter {}", p.name),
+                    ));
+                }
+            }
+        }
+        let value = value.ok_or_else(|| invalid("physical network requires main storage value"))?;
+        let coefficients = PassiveNetworkCoefficients {
+            kind,
+            value,
+            series_resistance: zero("pn_rseries"),
+            series_inductance: zero("pn_lseries"),
+            series_inductance_shunt: get("pn_rseries_shunt").filter(|r| *r != 0.),
+            storage_shunt: get("pn_rstorage_shunt").filter(|r| *r != 0.),
+            parallel_resistance: get("pn_rparallel").filter(|r| *r != 0.),
+            parallel_capacitance: zero("pn_cparallel"),
+            multiplicity,
+            temperature,
+        };
+        let initialization = Self::initialization(kind, initial, multiplicity, values)?;
+        Ok(Self::Storage(PreparedPassiveNetwork::prepare(
+            coefficients,
+            initialization,
+        )?))
+    }
+
+    fn initialization(
+        kind: StorageKind,
+        initial: Option<Real>,
+        multiplicity: Real,
+        coefficients: &std::collections::BTreeMap<&str, Real>,
+    ) -> SpiceResult<Option<PassiveInitialization>> {
+        use super::passive_bias::PassiveBias;
+        use crate::primitives::AnalysisKind;
+        let initial = initial.map(|value| match kind {
+            StorageKind::Capacitor => value,
+            StorageKind::Inductor => value * multiplicity,
+        });
+        let mut constraints = Vec::new();
+        for (analysis, key) in [
+            (AnalysisKind::OperatingPoint, "pn_bias_op"),
+            (AnalysisKind::DcSweep, "pn_bias_dc"),
+            (AnalysisKind::Ac, "pn_bias_ac"),
+            (AnalysisKind::Transient, "pn_bias_tran"),
+        ] {
+            let Some(&g) = coefficients.get(key) else {
+                continue;
+            };
+            let target = initial.ok_or_else(|| {
+                SpiceError::circuit("physical bias requires an explicit storage IC")
+            })?;
+            if !g.is_finite() || g < 0. {
+                return Err(SpiceError::circuit("invalid physical bias conductance"));
+            }
+            let conductance = g * multiplicity;
+            let bias = match kind {
+                StorageKind::Capacitor => PassiveBias::Voltage {
+                    voltage: target,
+                    conductance: (g != 0.).then_some(conductance),
+                },
+                StorageKind::Inductor => PassiveBias::Current {
+                    current: target,
+                    conductance,
+                },
+            };
+            if multiplicity != 0. {
+                constraints.push((analysis, bias));
+            }
+        }
+        if initial.is_none() && constraints.is_empty() {
+            Ok(None)
+        } else {
+            PassiveInitialization::new(kind, initial, constraints).map(Some)
+        }
+    }
+
+    pub(super) fn size(&self) -> ElaborationSize {
+        match self {
+            Self::Storage(Some(network)) => network.size(),
+            Self::Storage(None) => ElaborationSize::default(),
+            Self::Voltage(network) => network.size(),
+        }
+    }
+
+    pub(super) fn build(
+        &self,
+        instance: &crate::netlist::ast::DeviceInstance,
+        nodes: &mut NodeAppend<'_>,
+    ) -> SpiceResult<Vec<Box<dyn Device>>> {
+        let terminals = nodes.intern_array::<2>(&instance.nodes)?;
+        let name = &instance.name;
+        match self {
+            Self::Storage(Some(network)) => network.build(
+                nodes,
+                &PassiveNetworkBinding {
+                    primary: name.clone(),
+                    terminal_probe: format!("v{name}#port"),
+                },
+                terminals,
+            ),
+            Self::Storage(None) => Ok(Vec::new()),
+            Self::Voltage(network) => network.build(
+                nodes,
+                &VoltageNetworkBinding {
+                    excitation: name.clone(),
+                    terminal_probe: format!("v{name}#port"),
+                },
+                terminals,
+            ),
+        }
     }
 }

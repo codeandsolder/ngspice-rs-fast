@@ -126,6 +126,7 @@ pub(super) fn reserve<T>(
 pub(super) enum ExpansionKind {
     Urc(UrcPlan),
     Txl(TxlPlan),
+    Network(super::passive_network::NetworkPlan),
 }
 
 /// Only special expansion cards need a stored plan. Ordinary decks borrow
@@ -143,14 +144,19 @@ impl PlannedExpansion {
         models: &ModelResolver<'_>,
         context: &ModelContext,
     ) -> SpiceResult<Option<Self>> {
-        let kind = match instance.designator.to_ascii_lowercase() {
-            'u' => ExpansionKind::Urc(UrcPlan::prepare(instance, models, context)?),
-            'y' => ExpansionKind::Txl(TxlPlan::prepare(instance, models, context)?),
-            _ => return Ok(None),
+        let kind = if let Some(plan) = super::passive_network::NetworkPlan::prepare(instance)? {
+            ExpansionKind::Network(plan)
+        } else {
+            match instance.designator.to_ascii_lowercase() {
+                'u' => ExpansionKind::Urc(UrcPlan::prepare(instance, models, context)?),
+                'y' => ExpansionKind::Txl(TxlPlan::prepare(instance, models, context)?),
+                _ => return Ok(None),
+            }
         };
         let size = match &kind {
             ExpansionKind::Urc(plan) => plan.size(&instance.location)?,
             ExpansionKind::Txl(plan) => plan.size(),
+            ExpansionKind::Network(plan) => plan.size(),
         };
         Ok(Some(Self {
             ordinal,
@@ -200,18 +206,17 @@ impl<'a> PlannedBatch<'a> {
         existing: ElaborationSize,
         limits: ElaborationLimits,
     ) -> SpiceResult<Self> {
-        let first = instances.first().map(|i| &i.location);
-        let mut known = existing.checked_add(ElaborationSize::new(instances.len(), 0, 0), first)?;
-        limits.check(known, first)?;
+        let mut known = existing;
         let mut expansions = Vec::new();
         let mut generated_terminals = BTreeSet::new();
         for (ordinal, instance) in instances.iter().enumerate() {
             let at = Some(&instance.location);
             let Some(plan) = PlannedExpansion::prepare(ordinal, instance, models, context)? else {
+                known = known.checked_add(ElaborationSize::new(1, 0, 0), at)?;
+                limits.check(known, at)?;
                 continue;
             };
             let mut extra = plan.size;
-            extra.devices -= 1; // the minimum counted every input card already
             for name in &instance.nodes {
                 if nodes.get(name).is_none()
                     && generated_terminals.insert(NodeTable::canonical_name(name, nodes.auto_gnd()))

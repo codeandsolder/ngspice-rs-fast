@@ -57,3 +57,25 @@ pub use writer::{WriteLimits, write_netlist, write_netlist_to};
 /// The C reference for the whole front end, used in `NotYetPorted` errors.
 pub const C_REFERENCE: &str =
     "src/frontend/inp.c, src/frontend/inpcom.c, src/spicelib/parser/inp*.c";
+
+/// Explicit physical network setters shared by the normalized native grammar
+/// and writer. No source-dialect defaults are selected here.
+pub(crate) fn network_parameter(designator: char, name: &str) -> bool {
+    match designator {
+        'c' | 'l' => matches!(
+            name,
+            "pn_rseries"
+                | "pn_lseries"
+                | "pn_rseries_shunt"
+                | "pn_rstorage_shunt"
+                | "pn_rparallel"
+                | "pn_cparallel"
+                | "pn_bias_op"
+                | "pn_bias_dc"
+                | "pn_bias_ac"
+                | "pn_bias_tran"
+        ),
+        'v' => matches!(name, "pn_rseries" | "pn_cparallel" | "pn_temp"),
+        _ => false,
+    }
+}

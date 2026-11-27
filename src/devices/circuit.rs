@@ -4605,6 +4605,30 @@ impl Circuit {
                         &mut staged,
                     )?;
                 }
+                Some(ExpansionKind::Network(network)) => {
+                    let expanded = network.build(instance, nodes)?;
+                    for device in expanded {
+                        if !device.name().eq_ignore_ascii_case(&instance.name)
+                            && !seen.insert(device.name().to_ascii_lowercase())
+                        {
+                            return Err(SpiceError::circuit(format!(
+                                "duplicate network instance {}",
+                                device.name()
+                            )));
+                        }
+                        staged.push(ElaboratedDevice {
+                            device,
+                            origin: DeviceOrigin::default(),
+                        });
+                    }
+                    if let Some(first) = staged.get_mut(first_device) {
+                        first.origin.internal_nodes = nodes.nodes()[first_node..]
+                            .iter()
+                            .filter(|node| node.kind == NodeKind::Internal)
+                            .map(|node| node.id)
+                            .collect();
+                    }
+                }
                 None => {
                     let device = crate::devices::factory::instantiate_with_models(
                         instance, nodes, models, context,
@@ -4635,10 +4659,10 @@ impl Circuit {
         }
         // Factories already reject existing names. Check private nodes which
         // were created before a later parsed card could introduce its name.
-        if let Some(collision) = nodes.nodes()[mark..]
-            .iter()
-            .find(|node| node.kind == NodeKind::Internal && plan.deck_nodes.contains(&node.name))
-        {
+        if let Some(collision) = nodes.nodes()[mark..].iter().find(|node| {
+            matches!(node.kind, NodeKind::Internal | NodeKind::ProbeAlias)
+                && plan.deck_nodes.contains(&node.name)
+        }) {
             return Err(SpiceError::circuit(format!(
                 "internal-node name collision: {}",
                 collision.name
