@@ -98,3 +98,30 @@ separate. Base spreading resistance is differentiated through its
 bias dependence, not frozen as in the ordinary C Newton load. On the
 substrate exponential clamp the physical derivative is the derivative of
 the clamped current, not the C load's retained exponential slope.
+
+## Boundary of memoryless storage
+
+A device's AC capacitance is not sufficient to specify its physical charge.
+In the classic MOS Meyer model, gate-source capacitance depends on both
+junction voltages while the branch charge increment uses only the
+source-junction voltage change. A voltage-only gate-source charge would
+therefore require incompatible mixed partials in the general case. MESFET
+and JFET2 partition a Statz gate charge increment using both the current
+and accepted junction voltages; JFET2 additionally retains delayed gate
+voltages and averaged power. HFET incremental charge updates likewise
+retain accepted charge and voltage. These models cannot in general be
+converted to memoryless F/Q kernels by integrating the AC capacitance at
+one bias or freezing a previous state.
+
+History-dependent models require their own physical state coordinates or
+rate equations and independent validation of their continuous limits
+([#253](https://github.com/codeandsolder/ngspice-rs-fast/issues/253)). Keep
+an explicit unsupported diagnostic in the memoryless path until such an
+implementation is available. Model variants that are genuinely memoryless
+may be qualified on their own exact equations, not an approximate removal
+of their history terms.
+
+Prepared compact models must expose the same exact Taylor equations at the
+producer-owned kernel boundary. Scalar residual and Jacobian values do
+not determine higher derivatives. The ABI work is tracked in
+[preprocess #79](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/79).
