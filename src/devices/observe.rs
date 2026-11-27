@@ -52,6 +52,7 @@ fn unit(device: char, key: &str) -> &'static str {
             "c" => return "current",
             "vd" => return "voltage",
             "gd" => return "conductance",
+            "cd" => return "capacitance",
             _ => {}
         }
     }
