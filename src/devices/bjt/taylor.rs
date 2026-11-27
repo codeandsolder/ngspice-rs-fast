@@ -1,7 +1,9 @@
 //! Analytic Gummel-Poon current and charge germs in normalized local voltages.
 use super::physics::{RESISTANCE_REDUCTION_SERIES, RESISTANCE_SERIES_LIMIT, early_denominator};
 use super::{Bjt, Thermal, slot};
-use crate::devices::nonlinear::taylor::{characteristic, depletion};
+use crate::devices::nonlinear::taylor::{
+    depletion_differential as depletion_law, junction_differential as junction,
+};
 use crate::devices::nonlinear::{DepletionLaw, exponential_junction_at_argument};
 use crate::devices::physical_dae::{TaylorContext, TaylorControl};
 use crate::maths::taylor::differential::Differential;
@@ -13,16 +15,6 @@ const BX: usize = 2;
 const SUB: usize = 3;
 const BB: usize = 4;
 type Law = Differential<5>;
-fn junction(v: &Law, vt: Real, sat: Real) -> SpiceResult<Law> {
-    let law = characteristic(&v.value, vt, sat, None)?;
-    Ok(v.clone().lift(law.value, &law.slope))
-}
-
-fn depletion_law(v: &Law, material: DepletionLaw, cap: Real) -> SpiceResult<Law> {
-    let law = depletion(&v.value, material, cap)?;
-    Ok(v.clone().lift(law.value, &law.slope))
-}
-
 fn base_charge(t: &Thermal, v: &[Law; 5], be: &Law, bc: &Law) -> SpiceResult<Law> {
     let mut denominator = v[BE]
         .clone()

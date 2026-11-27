@@ -69,7 +69,7 @@ additional slot retains physical recovery charge (q=x/qpscale).
 The separate state equation and terminal recovery-current coefficient
 are identical to the ordinary conservative charge-state contract.
 
-This architecture does not by itself port transistor, arbitrary
+This architecture does not by itself port every transistor family, arbitrary
 history-dependent or discrete device models. Other device families
 must provide their own exact kernels and local storage contracts.
 

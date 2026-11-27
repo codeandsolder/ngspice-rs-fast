@@ -11,9 +11,9 @@ use crate::primitives::{Real, SpiceResult};
 
 /// A constitutive value and its local partial derivative with respect to
 /// junction voltage, both expanded along the same state germ.
-pub(in crate::devices) struct Law {
-    pub(in crate::devices) value: Jet,
-    pub(in crate::devices) slope: Jet,
+pub(super) struct Law {
+    pub(super) value: Jet,
+    pub(super) slope: Jet,
 }
 
 impl Law {
@@ -78,7 +78,7 @@ pub(super) fn exponential(v: &Jet, vt: Real, sat: Real) -> Law {
     Law::lift(v, value, argument.exp_with_value(derivative))
 }
 
-pub(in crate::devices) fn characteristic(
+fn characteristic(
     v: &Jet,
     vt: Real,
     sat: Real,
@@ -107,7 +107,7 @@ pub(in crate::devices) fn characteristic(
     }
 }
 
-pub(in crate::devices) fn depletion(v: &Jet, law: DepletionLaw, cz: Real) -> SpiceResult<Law> {
+fn depletion(v: &Jet, law: DepletionLaw, cz: Real) -> SpiceResult<Law> {
     let (value, derivative) = law.charge(v.value(), cz, None);
     let slope = if cz == 0. {
         Jet::constant(v.order(), 0.)
@@ -127,6 +127,25 @@ pub(in crate::devices) fn depletion(v: &Jet, law: DepletionLaw, cz: Real) -> Spi
             .with_value(derivative)
     };
     Law::lift(v, value, slope).checked()
+}
+
+/// Lift the shared normalized junction law into any local gradient basis.
+pub(in crate::devices) fn junction_differential<const N: usize>(
+    v: &crate::maths::taylor::differential::Differential<N>,
+    vt: Real,
+    sat: Real,
+) -> SpiceResult<crate::maths::taylor::differential::Differential<N>> {
+    let law = characteristic(&v.value, vt, sat, None)?;
+    Ok(v.clone().lift(law.value, &law.slope))
+}
+
+pub(in crate::devices) fn depletion_differential<const N: usize>(
+    v: &crate::maths::taylor::differential::Differential<N>,
+    material: DepletionLaw,
+    cap: Real,
+) -> SpiceResult<crate::maths::taylor::differential::Differential<N>> {
+    let law = depletion(&v.value, material, cap)?;
+    Ok(v.clone().lift(law.value, &law.slope))
 }
 
 fn generation(v: &Jet, law: DepletionLaw) -> SpiceResult<Law> {
