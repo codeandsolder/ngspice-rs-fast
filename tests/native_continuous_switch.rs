@@ -260,6 +260,7 @@ Vb source 0 1
 Rseries source out 100
 A1 %gd(c 0) %gd(out 0) m
 .model m pswitch(cntl_off=2 cntl_on=4 r_on=10 r_off=1k log=true r_cntl_in=200)
+.options reltol=1e-8 abstol=1e-14 vntol=1e-10
 ";
     let plot = run(cards, AnalysisKind::Transient, &["10n", "6u", "0", "10n"])?;
     assert!(plot.point_count() > 500);
@@ -408,6 +409,62 @@ fn native_dc_reference() -> SpiceResult<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn accepted_pspice_producer_voltage_and_current_switches_execute_without_dialect_fallback()
+-> SpiceResult<()> {
+    use model_normalize_ngspice::{linked_source::RootKind, pspice};
+    let text = br"Prepared continuous switches
+Vdrive c 0 0
+Rdrive c sense 1
+Vsen sense 0 0
+Vb1 p1 0 1
+Vb2 p2 0 -2
+S1 p1 0 c 0 mv
+W1 p2 0 Vsen mi
+.model mv VSWITCH(VON=4 VOFF=2 RON=10 ROFF=1k)
+.model mi ISWITCH(ION=2 IOFF=4 RON=10 ROFF=1k)
+.options GMIN=1e-5
+.end
+";
+    let prepared = pspice::normalize_mapped(text, RootKind::Deck)
+        .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
+    assert_eq!(prepared.renamed.len(), 2);
+    let native = String::from_utf8(prepared.mapped.model.bytes)
+        .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
+    let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("prepared.cir"), &native))?;
+    let config = RunConfig::from_netlist(&netlist)?;
+    let mut circuit = config.circuit(&netlist)?;
+    let plot = config
+        .plan(AnalysisInput::with_arguments(
+            AnalysisKind::DcSweep,
+            ["vdrive", "1.5", "4.5", ".25"],
+        ))?
+        .run(&mut circuit, &config.context())?;
+    for index in 0..plot.point_count() {
+        let c = value(&plot, "v(c)", index);
+        let t = ((c - 2.) / 2.).clamp(0., 1.);
+        for (name, fraction, voltage) in [("i(vb1)", t, 1.), ("i(vb2)", 1. - t, -2.)] {
+            let g = 100_f64.powf(fraction.powi(2) * (3. - 2. * fraction)) / 1000.;
+            close(name, value(&plot, name, index), -voltage * g, 1e-9, 1e-12);
+        }
+        close(
+            "unloaded sensing branch",
+            value(&plot, "i(vsen)", index),
+            c,
+            1e-10,
+            1e-12,
+        );
+        close(
+            "PSpice control conductance",
+            value(&plot, "i(vdrive)", index),
+            -c * (1. + 1e-5),
+            1e-10,
+            1e-12,
+        );
     }
     Ok(())
 }
