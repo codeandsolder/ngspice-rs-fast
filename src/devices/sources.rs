@@ -169,6 +169,7 @@ pub struct IndependentSource {
     distortion: [Option<crate::devices::distortion::DistortionInput>; 2],
 }
 /// Validated excitation before circuit topology is bound.
+#[derive(Debug, Clone)]
 pub(super) struct SourceExcitation {
     voltage: bool,
     dc: DcExcitation,

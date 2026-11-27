@@ -9,6 +9,7 @@ use crate::devices::{
     elaboration::{ElaborationSize, reserve},
     passive_bias::PassiveInitialization,
     rlc::REACTIVE_STATE_COUNT,
+    sources::{SourceExcitation, SourceInputs},
 };
 use crate::primitives::{Complex, NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
@@ -358,4 +359,142 @@ fn new_node(
     let id = nodes.intern(&name)?;
     nodes.set_kind(id, kind)?;
     Ok(id)
+}
+
+/// Explicit physical output impedance of an independent voltage source.
+/// The shunt capacitance is internal to the terminal current probe; the
+/// series impedance carries both the load and capacitive currents.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoltageNetworkCoefficients {
+    /// Signed series resistance in ohms (zero denotes an exact wire).
+    pub series_resistance: Real,
+    /// Capacitance across the output pair, before the terminal current probe.
+    pub parallel_capacitance: Real,
+    /// Resolved series-resistor noise temperature, in Celsius.
+    pub temperature: Option<Real>,
+}
+
+/// Prepared independent voltage source and its physical output impedance.
+/// The excitation identity is unchanged for sweeps and input-referred noise;
+/// the separately named probe gives current into the external positive port.
+#[derive(Debug, Clone)]
+pub struct PreparedVoltageNetwork {
+    coefficients: VoltageNetworkCoefficients,
+    excitation: SourceExcitation,
+}
+
+/// Identities for voltage forcing and external current reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoltageNetworkBinding {
+    /// Ideal voltage excitation and its internal branch current.
+    pub excitation: String,
+    /// External terminal current (excluding the internal shunt capacitance).
+    pub terminal_probe: String,
+}
+
+impl PreparedVoltageNetwork {
+    /// Resolve voltage excitation and physical output coefficients.
+    ///
+    /// # Errors
+    /// Invalid excitation, nonfinite coefficients or temperature, negative
+    /// capacitance, or a nonzero resistance with nonfinite reciprocal.
+    pub fn prepare(
+        coefficients: VoltageNetworkCoefficients,
+        inputs: SourceInputs,
+    ) -> SpiceResult<Self> {
+        if !coefficients.series_resistance.is_finite()
+            || (coefficients.series_resistance != 0.
+                && !(1. / coefficients.series_resistance).is_finite())
+            || !coefficients.parallel_capacitance.is_finite()
+            || coefficients.parallel_capacitance < 0.
+            || coefficients
+                .temperature
+                .is_some_and(|t| !t.is_finite() || t <= -273.15)
+        {
+            return Err(SpiceError::circuit(
+                "invalid voltage output network coefficients",
+            ));
+        }
+        Ok(Self {
+            coefficients,
+            excitation: SourceExcitation::from_inputs(true, inputs)?,
+        })
+    }
+
+    /// Atomically bind the voltage source and its output impedance.
+    ///
+    /// # Errors
+    /// Unknown terminals, duplicate names or exhausted elaboration limits.
+    pub fn bind(
+        &self,
+        circuit: &mut Circuit,
+        name: &str,
+        terminals: [NodeId; 2],
+    ) -> SpiceResult<VoltageNetworkBinding> {
+        if name.is_empty()
+            || terminals
+                .iter()
+                .any(|&id| circuit.nodes().node(id).is_none())
+        {
+            return Err(SpiceError::circuit("invalid voltage network binding"));
+        }
+        let binding = VoltageNetworkBinding {
+            excitation: name.to_owned(),
+            terminal_probe: format!("v{name}#port"),
+        };
+        let series = usize::from(self.coefficients.series_resistance != 0.);
+        let shunt = usize::from(self.coefficients.parallel_capacitance != 0.);
+        let size =
+            ElaborationSize::new(2 + series + shunt, 1 + series, shunt * REACTIVE_STATE_COUNT);
+        circuit.add_prepared_devices(size, |nodes| self.build(nodes, &binding, terminals))?;
+        Ok(binding)
+    }
+
+    fn build(
+        &self,
+        nodes: &mut NodeAppend<'_>,
+        binding: &VoltageNetworkBinding,
+        [positive, negative]: [NodeId; 2],
+    ) -> SpiceResult<Vec<Box<dyn Device>>> {
+        let name = &binding.excitation;
+        let output = new_node(nodes, name, 0, NodeKind::ProbeAlias)?;
+        let series = self.coefficients.series_resistance;
+        let source = if series == 0. {
+            output
+        } else {
+            new_node(nodes, name, 1, NodeKind::Internal)?
+        };
+        let mut devices: Vec<Box<dyn Device>> = Vec::new();
+        reserve(&mut devices, 4, None)?;
+        devices.push(Box::new(
+            self.excitation.clone().bind(name, [source, negative]),
+        ));
+        devices.push(Box::new(IndependentSource::new(
+            &binding.terminal_probe,
+            [positive, output],
+            true,
+            0.,
+            Complex::ZERO,
+            Waveform::Constant(0.),
+        )?));
+        if series != 0. {
+            devices.push(Box::new(
+                Resistor::new(Role::SeriesResistance.name(name), [source, output], series)?
+                    .with_noise(ResistorNoise {
+                        temperature: self.coefficients.temperature,
+                        absolute_thermal_conductance: true,
+                        ..Default::default()
+                    }),
+            ));
+        }
+        if self.coefficients.parallel_capacitance != 0. {
+            devices.push(Box::new(Capacitor::new(
+                Role::ParallelCapacitance.name(name),
+                [output, negative],
+                self.coefficients.parallel_capacitance,
+                None,
+            )?));
+        }
+        Ok(devices)
+    }
 }

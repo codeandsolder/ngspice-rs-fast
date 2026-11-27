@@ -262,7 +262,7 @@ fn duplicate_names_and_budget_errors_rollback_all_nodes_and_devices() -> SpiceRe
 fn noise_matches_equivalent_native_network() -> SpiceResult<()> {
     let deck = Parser::new().parse_deck(&parse_deck_text(
         Path::new("passive-noise.cir"),
-        "reference\nvdrive drive 0 dc 0 ac 1\nrdrive drive port 0.1\nr1 port mid 5 temp=87\nc1 mid 0 2u\nr2 port 0 100 temp=87\nc2 port 0 1u\n.end\n",
+        "reference\nvdrive drive 0 dc 0 ac 1\nrdrive drive port 0.1\nr1 port mid 5 rm temp=87\nc1 mid 0 2u\nr2 port 0 100 rm temp=87\nc2 port 0 1u\n.model rm r(tc1=0)\n.end\n",
     ))?;
     let mut reference = Circuit::from_netlist(&deck)?;
     let (mut circuit, port) = circuit()?;
@@ -399,5 +399,100 @@ fn startup_bias_applies_to_storage_and_not_to_parallel_terminal_paths() -> Spice
         ac.value("v(port)", 0).unwrap(),
         zc / (zc + Complex::real(10.)),
     );
+    Ok(())
+}
+
+fn voltage_network(
+    series_resistance: f64,
+    parallel_capacitance: f64,
+    load: f64,
+    noiseless_load: bool,
+) -> SpiceResult<(Circuit, String)> {
+    use ngspice_rs::devices::{
+        ResistorNoise,
+        passive_network::{PreparedVoltageNetwork, VoltageNetworkCoefficients},
+        sources::{AcInput, SourceInputs},
+    };
+
+    let mut circuit = Circuit::new();
+    let out = circuit.add_node("out")?;
+    circuit.add_device(Box::new(
+        Resistor::new("rload", [out, NodeId::GROUND], load)?.with_noise(ResistorNoise {
+            noisy: !noiseless_load,
+            ..Default::default()
+        }),
+    ))?;
+    let network = PreparedVoltageNetwork::prepare(
+        VoltageNetworkCoefficients {
+            series_resistance,
+            parallel_capacitance,
+            temperature: None,
+        },
+        SourceInputs {
+            dc: Some(1.),
+            ac: Some(AcInput {
+                magnitude: Some(1.),
+                phase: None,
+            }),
+            waveform: None,
+        },
+    )?;
+    let binding = network.bind(&mut circuit, "v1", [out, NodeId::GROUND])?;
+    assert_eq!(binding.excitation, "v1");
+    Ok((circuit, binding.terminal_probe))
+}
+
+#[test]
+fn signed_series_voltage_impedance_preserves_dc_excitation() -> SpiceResult<()> {
+    for (r, expected) in [(0., 1.), (2., 0.6), (-1., 1.5)] {
+        let (mut circuit, probe) = voltage_network(r, 0., 3., false)?;
+        let plot = run(&mut circuit, AnalysisKind::OperatingPoint, &[])?;
+        close(plot.value("v(out)", 0).unwrap(), Complex::real(expected));
+        close(
+            plot.value(&format!("i({probe})"), 0).unwrap(),
+            Complex::real(-expected / 3.),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn voltage_current_identities_exclude_internal_shunt_from_terminal_current() -> SpiceResult<()> {
+    let (mut circuit, probe) = voltage_network(2., 1e-6, 3., false)?;
+    let ac = run(&mut circuit, AnalysisKind::Ac, &["lin", "1", "10k", "10k"])?;
+    let output = ac.value("v(out)", 0).unwrap();
+    close(
+        output,
+        Complex::new(0.5966083459066635, -0.0449832095176976),
+    );
+    let external_current = -output / Complex::real(3.);
+    close(
+        ac.value(&format!("i({probe})"), 0).unwrap(),
+        external_current,
+    );
+    close(
+        ac.value("i(v1)", 0).unwrap(),
+        external_current - output * Complex::new(0., TAU * 1e4 * 1e-6),
+    );
+    Ok(())
+}
+
+#[test]
+fn voltage_series_impedance_noise_uses_explicit_nonnegative_thermal_law() -> SpiceResult<()> {
+    for (r, expected) in [(1000., 2.035687076996364e-9), (-500., 5.757792546071801e-9)] {
+        let (mut circuit, _) = voltage_network(r, 0., 1000., true)?;
+        let noise = run(
+            &mut circuit,
+            AnalysisKind::Noise,
+            &["v(out)", "v1", "lin", "2", "100", "200"],
+        )?;
+        for index in 0..noise.point_count() {
+            let got = noise.value("onoise_spectrum", index).unwrap().re;
+            assert!(
+                (got - expected).abs() <= 3e-4 * expected,
+                "{got} vs {expected}"
+            );
+        }
+    }
     Ok(())
 }
