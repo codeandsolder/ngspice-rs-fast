@@ -91,7 +91,7 @@ impl Curve {
 
 /// Cold, immutable law material shared by each occurrence of a declaration.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct BoundPwlResistor {
+pub(super) struct BoundPwlResistor {
     curve: Arc<Curve>,
     initial: Option<usize>,
 }
@@ -133,15 +133,12 @@ fn validate_anchor(
             key.2
         ))
     })?;
-    let correct = if let Some(output) = output {
-        card.designator == 'b'
-            && matches!(card.parameters.as_slice(), [parameter]
-            if parameter.name == output && matches!(parameter.kind, ParameterKind::Behavioural(_)))
-    } else {
-        card.designator == 'v'
-            && matches!(card.parameters.as_slice(), [parameter]
-            if parameter.name == "dc" && crate::primitives::parse_spice_number(&parameter.value) == Some(0.))
-    };
+    let correct = output.map_or_else(
+        || card.designator == 'v' && matches!(card.parameters.as_slice(), [parameter]
+            if parameter.name == "dc" && crate::primitives::parse_spice_number(&parameter.value) == Some(0.)),
+        |output| card.designator == 'b' && matches!(card.parameters.as_slice(), [parameter]
+            if parameter.name == output && matches!(parameter.kind, ParameterKind::Behavioural(_))),
+    );
     if !correct || !matches_nodes(card, positive, negative, auto_gnd) {
         return Err(SpiceError::parse(
             card.location.clone(),

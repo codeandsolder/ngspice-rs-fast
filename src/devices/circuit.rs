@@ -4491,7 +4491,7 @@ impl Circuit {
         models: &crate::devices::models::ModelResolver<'_>,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<()> {
-        self.add_prepared_instances(instances, models, context, &Default::default())
+        self.add_prepared_instances(instances, models, context, &BTreeMap::new())
     }
 
     fn add_prepared_instances(

@@ -101,7 +101,7 @@ pub struct ExpandedNetlist {
     pub devices: Vec<DeviceInstance>,
     /// Explicit prepared forcing resolved in each flattened instance scope.
     pub prepared_waveforms: Vec<(String, super::prepared_waveform::PreparedForcing)>,
-    pub(crate) prepared_resistors: super::pwl_resistor::BoundResistors,
+    pub(super) prepared_resistors: super::pwl_resistor::BoundResistors,
     /// Root `.model` cards in declaration order, then each instance's renamed
     /// local models in first-reference order.
     pub models: Vec<ModelCard>,
@@ -247,7 +247,7 @@ fn expand_with_prepared_output(
         waveforms,
         prepared_waveforms: Vec::new(),
         resistors,
-        prepared_resistors: Default::default(),
+        prepared_resistors: BTreeMap::new(),
         models: Vec::new(),
         statistical_model_origins: BTreeSet::new(),
         frontend_cards: 0,
