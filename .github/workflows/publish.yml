@@ -37,7 +37,7 @@ env:
 jobs:
   strict-rust:
     name: Strict Rust and workflow policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@073d436b3d759343900bdc5e4ddecfa120792b8c # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@cb9083676196a8ec3bf013e7253907b2759020c7 # main
     with:
       rust-toolchain: nightly-2026-11-20
       allow-test-panics: true
@@ -60,7 +60,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: nightly-2026-11-20
 
@@ -97,7 +97,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
   publish:
     name: Publish to crates.io
@@ -121,7 +121,7 @@ jobs:
           toolchain: nightly-2026-11-26
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: nightly-2026-11-20
 
@@ -136,4 +136,4 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main

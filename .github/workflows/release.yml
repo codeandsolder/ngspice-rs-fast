@@ -67,7 +67,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
         with:
           rust-toolchain: nightly-2026-11-20
 
@@ -123,7 +123,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
 
   release:
     name: Attach to GitHub release
