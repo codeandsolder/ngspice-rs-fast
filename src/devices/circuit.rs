@@ -4558,6 +4558,16 @@ impl Circuit {
         models: &crate::devices::models::ModelResolver<'_>,
         context: &crate::devices::models::ModelContext,
     ) -> SpiceResult<()> {
+        self.add_prepared_instances(instances, models, context, &BTreeMap::new())
+    }
+
+    fn add_prepared_instances(
+        &mut self,
+        instances: &[crate::netlist::ast::DeviceInstance],
+        models: &crate::devices::models::ModelResolver<'_>,
+        context: &ModelContext,
+        resistors: &crate::devices::pwl_resistor::BoundResistors,
+    ) -> SpiceResult<()> {
         let existing = self.elaboration_size()?;
         let limits = self.elaboration_limits;
         let instances = crate::devices::behavioural::dynamic::expand(
@@ -4566,13 +4576,15 @@ impl Circuit {
             models,
             self.devices.iter().map(|device| device.name()),
             limits.devices.saturating_sub(existing.devices),
+            resistors,
         )?;
         let aliases = instances.probe_aliases;
         let instances = instances.instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
-        let plan =
+        let mut plan =
             PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
+        plan.resistors = (!resistors.is_empty()).then_some(resistors);
         let seen: BTreeSet<String> = self
             .devices
             .iter()
@@ -4673,9 +4685,15 @@ impl Circuit {
                     )?;
                 }
                 None => {
-                    let device = crate::devices::factory::instantiate_with_models(
-                        instance, nodes, models, context,
-                    )?;
+                    let device = if let Some(resistor) =
+                        plan.resistors.and_then(|laws| laws.get(&instance.name))
+                    {
+                        resistor.bind(instance, nodes)?
+                    } else {
+                        crate::devices::factory::instantiate_with_models(
+                            instance, nodes, models, context,
+                        )?
+                    };
                     Self::stage_single(instance, nodes, device, first_node, &mut staged)?;
                 }
                 Some(ExpansionKind::Txl(crate::devices::txl::TxlPlan::Native(native))) => {
@@ -4909,7 +4927,7 @@ impl Circuit {
             mutual_limits,
             elaboration_limits,
             scope,
-            &[],
+            crate::devices::subckt::PreparedDeclarations::default(),
         )
     }
 
@@ -4924,7 +4942,7 @@ impl Circuit {
         mutual_limits: MutualLimits,
         elaboration_limits: ElaborationLimits,
         scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
-        waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
+        declarations: crate::devices::subckt::PreparedDeclarations<'_>,
     ) -> SpiceResult<Self> {
         context.validate(&netlist.location)?;
         // The nonlinear E/G/F/H forms become B sources and generated XSPICE
@@ -4953,7 +4971,7 @@ impl Circuit {
                 max_devices: elaboration_limits.devices,
                 ..Default::default()
             },
-            waveforms,
+            declarations,
         )?;
         let models = crate::devices::models::ModelResolver::new(&expanded.models)?
             .with_bin_options(crate::devices::binning::BinOptions {
@@ -4979,7 +4997,12 @@ impl Circuit {
                 .is_some_and(|analyses| {
                     analyses.contains(&(crate::primitives::AnalysisKind::Noise, false))
                 });
-        circuit.add_instances(&expanded.devices, &models, &setup)?;
+        circuit.add_prepared_instances(
+            &expanded.devices,
+            &models,
+            &setup,
+            &expanded.prepared_resistors,
+        )?;
         let binned_deck = BinnedDeck::capture(
             &expanded.devices,
             &expanded.models,
@@ -4987,6 +5010,7 @@ impl Circuit {
             setup.noise_analysis,
             &expanded.prepared_initialization,
             &expanded.prepared_waveforms,
+            &expanded.prepared_resistors,
         )
         .map(Arc::new);
         circuit.apply_prepared_waveforms(expanded.prepared_waveforms)?;
