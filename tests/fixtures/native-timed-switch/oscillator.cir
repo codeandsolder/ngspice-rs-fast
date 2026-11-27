@@ -1,0 +1,8 @@
+Independent timed-switch oscillator
+Vbias p 0 PWL(0 0 1n 5 10u 5)
+Rcharge p c 1k
+Cstore c 0 1n
+A1 %vd(c 0) %gd(c 0) swmod
+.model swmod preprocess_timed_switch(ron=100 roff=1Meg vt=2.5 vh=0.5 ton=100n toff=200n td_on=50n td_off=30n timetol=10p ic=0)
+.options reltol=1e-6 abstol=1e-13
+.end

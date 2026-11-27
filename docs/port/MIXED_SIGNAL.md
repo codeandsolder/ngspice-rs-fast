@@ -48,12 +48,44 @@ gain, one-pole low-pass and unsaturated integrator kernels. They reuse the
 companion charge-history and truncation machinery, expose the affine AC pencil,
 and explicitly declare no intrinsic noise. Integrators initialize their
 output at the supplied bias value; their AC pencil uses the dynamic equation.
-Arbitrary nonlinear analog model kernels, A-instance parsing, additional
-sequential models, mixed-signal UIC, periodic shooting, and mixed-signal AC and
-noise are not implemented by this interface.
+Arbitrary nonlinear analog model kernels, additional sequential models,
+mixed-signal UIC, periodic shooting, and mixed-signal AC and noise are not
+implemented by this interface.
 ADC crossing detection is based on accepted and trial endpoint samples;
 nonmonotone crossings wholly within one analog step require a suitable analog
 maximum timestep.
+
+## Deck-bound mixed-domain models
+
+The parser and writer retain ordered typed scalar and vector A-instance
+ports. Lexical model schemas supply default types, define grouping and
+polarity, and validate scalar/array parameter values after scoped expression
+realization. Analog and digital nets have independent hierarchical identities;
+a digital node named `gnd` is not analog ground. Rational transfer models
+continue using the analog backend.
+
+`preprocess_logic_event` binds qualified analog receivers to the native
+transactional event network, with AND, OR, NAND, NOR and reset-dominant,
+set-dominant and hold-on-equal latches (operations 0–6), rising/falling-edge
+SR/JK/D/T storage (7–14), and active-high/low transparent latches (15–16).
+Clocked storage retains the most recent logical capture independently of
+its pending output propagation; no startup edge is invented. Strict threshold
+comparisons retain the previous receiver state at equality and between
+thresholds. Each input has independent inversion and initial receiver state.
+Transport changes schedule delayed output events; inertial changes commit
+only after the requested state survives its deadline. Same-time receiver
+updates precede the corresponding timer, so equal-width pulses cancel.
+`preprocess_logic_voltage` is an ideal differential voltage bridge with
+independently specified rails (including reversed/equal rails). The unknown
+state produces their midpoint. Ordinary OP and transient plans construct a
+fresh event engine from the immutable bound topology; unsupported mixed
+analysis kinds fail explicitly. Analog-only circuits construct no event
+network. Separate accepted event counters are available via
+`Circuit::last_digital_stats`.
+
+The `preprocess_timed_switch` descriptor is available for typed syntax;
+its conductance kernel is a separate implementation task. Operations outside
+0–16 are rejected rather than approximated.
 
 ## Numerical verification
 
@@ -78,3 +110,38 @@ threshold sampling error; they do not require identical internal time grids.
 Run the native tests with `cargo +nightly test --locked --test digital_events`.
 For the live reference, set `NGSPICE_BIN` to an XSPICE-enabled ngspice binary
 and run the same command with `-- --ignored`.
+
+The source-level tests in `tests/native_mixed_signal.rs` additionally compare
+synthetic circuits with independent ngspice-47 reference traces. The
+28-configuration logic matrix matches all 308 sampled voltages to
+2.23e-16 V and all 83 transition times to 8.48e-22 s on the tested decks.
+Reference provenance and regeneration instructions are in
+`tests/fixtures/native-logic/README.md`.
+
+## Timed conductance events
+
+The prepared `preprocess_timed_switch` source descriptor binds a physical
+conductance with an unloaded single-ended/differential voltage receiver
+and a differential conducting branch. Independent input loading remains
+an ordinary circuit element. Each instance has seven finite accepted
+history slots: the previous time/control, phase anchor time and phase,
+target, requested direction, and optional deadline. Newton candidates
+derive a new state exclusively from the preceding accepted state.
+
+The logarithmic conductance law interpolates smoothly between exact
+reciprocal-resistance rails. DC qualifies the initial hint with strict
+threshold comparisons; AC freezes the converged conductance with no
+incremental control-to-branch gain. No fictitious storage or conductance
+floor is introduced.
+
+An opt-in device-local event interface lets the existing transient
+driver land on accepted deadlines and ramp endpoints, and localize
+crossings before publishing a candidate. The driver pre-indexes event
+sources, uses exact source boundaries rather than the coalescing
+breakpoint table for those circuits, and reports probe/retry/landing
+counts separately. Rejected trials cannot change device memory. The
+refined receiver sample is taken from the converged solution. Between
+known source boundaries a nonmonotone control excursion that crosses
+both thresholds without a sampled indication can remain undetected;
+timestep refinement is required for such an excitation. TIMETOL is
+localization tolerance, not a physical delay or breakpoint merge distance.

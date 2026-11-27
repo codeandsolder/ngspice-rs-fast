@@ -164,6 +164,10 @@ impl Network {
         id
     }
 
+    pub(crate) const fn net_count(&self) -> usize {
+        self.nets.len()
+    }
+
     fn check_net(&self, id: NetId) -> SpiceResult<()> {
         if id.0 >= self.nets.len() {
             return Err(SpiceError::circuit("unknown digital net"));
@@ -366,6 +370,10 @@ impl State {
     }
 
     fn model_output(&mut self, driver: usize, output: Output) -> SpiceResult<()> {
+        self.model_output_at(driver, output, self.time)
+    }
+
+    fn model_output_at(&mut self, driver: usize, output: Output, at: Time) -> SpiceResult<()> {
         let previous = self.desired[driver];
         if previous == Some(output.drive) {
             return Ok(());
@@ -384,13 +392,13 @@ impl State {
                 return Ok(());
             }
         }
-        let delay = if self.time == Time(0) {
+        let delay = if at == Time(0) {
             0.
         } else {
             output.delays.transition(old.logic, output.drive.logic)
         };
-        let time = Time::new(self.time.value() + delay)?;
-        if delay > 0. && time == self.time {
+        let time = Time::new(at.value() + delay)?;
+        if delay > 0. && time == at {
             return Err(SpiceError::circuit(
                 "digital propagation delay is below time resolution",
             ));
@@ -683,7 +691,7 @@ impl State {
 /// allocate an engine or enter any digital scheduling code.
 #[derive(Debug)]
 pub struct Engine {
-    network: Network,
+    network: std::rc::Rc<Network>,
     accepted: State,
     limits: Limits,
 }
@@ -694,6 +702,10 @@ impl Engine {
     /// # Errors
     /// Zero work or delta-cycle bound.
     pub fn new(network: Network, limits: Limits) -> SpiceResult<Self> {
+        Self::from_shared(std::rc::Rc::new(network), limits)
+    }
+
+    fn from_shared(network: std::rc::Rc<Network>, limits: Limits) -> SpiceResult<Self> {
         if limits.delta_cycles == 0 || limits.work == 0 {
             return Err(SpiceError::circuit("zero digital work limit"));
         }
@@ -727,7 +739,7 @@ impl Engine {
 
     /// True if a model can discover events only by advancing through a horizon.
     #[must_use = "the result determines whether advancement can reveal unqueued autonomous events"]
-    pub const fn has_lookahead(&self) -> bool {
+    pub fn has_lookahead(&self) -> bool {
         !self.network.lookahead.is_empty()
     }
 
@@ -879,12 +891,41 @@ pub struct AdcBinding {
     pub mode: DelayMode,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DacBinding {
+    pub(crate) name: String,
+    pub(crate) net: NetId,
+    pub(crate) config: DacConfig,
+    pub(crate) port: DacPort,
+}
+
+/// Immutable source-bound topology. Each analysis receives a new event
+/// state and accepted history, while its analog device ports stay bound.
 #[derive(Debug)]
-struct DacBinding {
-    name: String,
-    net: NetId,
-    config: DacConfig,
-    port: DacPort,
+pub(crate) struct NativeTopology {
+    network: std::rc::Rc<Network>,
+    adcs: Vec<AdcBinding>,
+    dacs: Vec<DacBinding>,
+}
+
+impl NativeTopology {
+    pub(crate) fn new(network: Network, adcs: Vec<AdcBinding>, dacs: Vec<DacBinding>) -> Self {
+        Self {
+            network: std::rc::Rc::new(network),
+            adcs,
+            dacs,
+        }
+    }
+
+    pub(crate) fn start(&self) -> SpiceResult<MixedSignal> {
+        let mut mixed = MixedSignal::new(Engine::from_shared(
+            std::rc::Rc::clone(&self.network),
+            Limits::default(),
+        )?);
+        mixed.adcs.clone_from(&self.adcs);
+        mixed.dacs.clone_from(&self.dacs);
+        Ok(mixed)
+    }
 }
 
 /// Mixed-signal transient configuration and accepted event history.
@@ -1001,6 +1042,7 @@ impl MixedSignal {
             name: name.clone(),
             terminals,
             port: port.clone(),
+            native: None,
         }))?;
         self.dacs.push(DacBinding {
             name,
@@ -1196,11 +1238,21 @@ impl MixedSignal {
         }
         let voltages = self.voltages(circuit, solution)?;
         let mut updates = Vec::new();
+        let mut qualified_updates = Vec::new();
         for (adc, &voltage) in self.adcs.iter().zip(&voltages) {
             let previous = self.adc_previous(adc);
-            let drive = Drive::strong(adc.thresholds.sample(voltage, previous.logic)?);
+            let drive = Drive::strong(adc.thresholds.sample_at(
+                voltage,
+                previous.logic,
+                end == Time(0),
+            )?);
             if drive != previous {
-                updates.push((
+                let destination = if adc.thresholds.is_qualified() {
+                    &mut qualified_updates
+                } else {
+                    &mut updates
+                };
+                destination.push((
                     self.engine.network.sources[adc.source.0],
                     Output {
                         drive,
@@ -1228,35 +1280,11 @@ impl MixedSignal {
             changes: Vec::new(),
             boundary: ramp_boundary,
         };
-        if !events_due && updates.is_empty() {
+        if !events_due && updates.is_empty() && qualified_updates.is_empty() {
             return Ok(point);
         }
-        let mut state = if let Some(preview) = preview.filter(|p| p.state.time == end) {
-            point.changes = preview.changes;
-            preview.state
-        } else {
-            let mut state = self.engine.accepted.clone();
-            // Before the first event round, seed ADC drivers at t=0. During
-            // transient, queued events precede the hybrid callback.
-            if state.initialized {
-                state.advance(
-                    &self.engine.network,
-                    end,
-                    self.engine.limits,
-                    &mut point.changes,
-                )?;
-            }
-            state
-        };
-        for (driver, output) in updates {
-            state.model_output(driver, output)?;
-        }
-        state.advance(
-            &self.engine.network,
-            end,
-            self.engine.limits,
-            &mut point.changes,
-        )?;
+        let state =
+            self.prepare_event_state(end, preview, qualified_updates, updates, &mut point.changes)?;
         state.charge_work(self.engine.accepted.stats, self.engine.limits.work)?;
         for dac in &self.dacs {
             let logic = state.nets[dac.net.0].logic;
@@ -1271,6 +1299,48 @@ impl MixedSignal {
         }
         point.state = Some(state);
         Ok(point)
+    }
+
+    /// Qualified receivers are sampled before any timer at the same endpoint.
+    /// The pre-end preview is disposable; replay it if a receiver changes.
+    fn prepare_event_state(
+        &self,
+        end: Time,
+        preview: Option<EventPreview>,
+        early: Vec<(usize, Output)>,
+        late: Vec<(usize, Output)>,
+        changes: &mut Vec<Change>,
+    ) -> SpiceResult<State> {
+        let mut state = if early.is_empty() {
+            if let Some(preview) = preview.filter(|p| p.state.time == end) {
+                *changes = preview.changes;
+                preview.state
+            } else {
+                let mut state = self.engine.accepted.clone();
+                if state.initialized {
+                    state.advance(&self.engine.network, end, self.engine.limits, changes)?;
+                }
+                state
+            }
+        } else {
+            let mut state = self.engine.accepted.clone();
+            if state.initialized && end > state.time {
+                let before = Time::new(end.value().next_down())?;
+                state.advance(&self.engine.network, before, self.engine.limits, changes)?;
+            }
+            for (driver, output) in early {
+                state.model_output_at(driver, output, end)?;
+            }
+            if state.initialized {
+                state.advance(&self.engine.network, end, self.engine.limits, changes)?;
+            }
+            state
+        };
+        for (driver, output) in late {
+            state.model_output(driver, output)?;
+        }
+        state.advance(&self.engine.network, end, self.engine.limits, changes)?;
+        Ok(state)
     }
 
     pub(super) fn initial_changed(&self, point: &MixedPoint) -> SpiceResult<bool> {

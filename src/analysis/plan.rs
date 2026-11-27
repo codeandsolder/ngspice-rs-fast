@@ -872,8 +872,16 @@ impl AnalysisPlan {
         circuit: &mut crate::devices::Circuit,
         context: &crate::analysis::AnalysisContext,
     ) -> SpiceResult<(crate::analysis::Plot, crate::analysis::Plot)> {
+        if circuit.prepare_native_mixed()?.is_some() {
+            return Err(unsupported("native mixed-signal sensitivity"));
+        }
         let PlanKind::Sensitivity { card, frequencies } = &self.analysis else {
             return Err(unsupported("sensitivity resolution requires a .sens plan"));
+        };
+        circuit.validate_prepared_analysis(self.kind(), self.uic())?;
+        let context = &crate::analysis::AnalysisContext {
+            bias_analysis: circuit.has_prepared_bias().then(|| self.kind()),
+            ..*context
         };
         let (plot, resolution) =
             super::sens::run(circuit, self, context, card, frequencies.as_ref(), true)?;
@@ -889,6 +897,26 @@ impl AnalysisPlan {
         sink: &mut dyn crate::analysis::PointSink,
     ) -> SpiceResult<()> {
         use crate::analysis::{ac, disto, linear, noise, pz, sens, sparam, sweep, tf};
+        circuit.validate_prepared_analysis(self.kind(), self.uic())?;
+        let context = &crate::analysis::AnalysisContext {
+            bias_analysis: (!self.uic() && circuit.has_prepared_bias()).then(|| self.kind()),
+            ..*context
+        };
+        if let Some(mut mixed) = circuit.prepare_native_mixed()? {
+            let result = match &self.analysis {
+                PlanKind::OperatingPoint => linear::mixed_op(circuit, self, context, &mut mixed)
+                    .and_then(|plot| sink.complete(plot)),
+                PlanKind::Transient { .. } => super::companion::mixed_signal_transient_into(
+                    circuit, self, context, &mut mixed, sink,
+                )
+                .map(drop),
+                _ => Err(unsupported(
+                    "native mixed-signal analysis requires OP or transient",
+                )),
+            };
+            circuit.record_digital_stats(result.as_ref().ok().map(|()| mixed.engine().stats()));
+            return result;
+        }
         // Large sweeps emit rows directly. Drivers whose numerical method
         // still requires a materialized output transfer ownership instead.
         let plots = match &self.analysis {
@@ -947,8 +975,16 @@ impl AnalysisPlan {
         warm: Option<&super::PeriodicOrbit>,
         sink: &mut dyn crate::analysis::PointSink,
     ) -> SpiceResult<super::PeriodicOrbit> {
+        if circuit.prepare_native_mixed()?.is_some() {
+            return Err(unsupported("native mixed-signal periodic analysis"));
+        }
         let PlanKind::PeriodicSteadyState { settings, .. } = &self.analysis else {
             return Err(unsupported("periodic orbit requires a .pss plan"));
+        };
+        circuit.validate_prepared_analysis(self.kind(), self.uic())?;
+        let context = &crate::analysis::AnalysisContext {
+            bias_analysis: (!self.uic() && circuit.has_prepared_bias()).then(|| self.kind()),
+            ..*context
         };
         super::pss::run(circuit, self, context, settings, warm, sink)
     }

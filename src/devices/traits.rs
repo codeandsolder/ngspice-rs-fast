@@ -149,6 +149,8 @@ pub enum BranchQuantity {
     CurrentState(usize),
     /// Oriented current at the transfer's sensing input.
     InputCurrent,
+    /// Auxiliary capacitor voltage-constraint branch, zero outside bias.
+    BiasCurrent,
 }
 
 impl BranchQuantity {
@@ -164,6 +166,7 @@ impl BranchQuantity {
             Self::VoltageState(index) => (format!("state({name},{index})"), "voltage"),
             Self::CurrentState(index) => (format!("state({name},{index})"), "current"),
             Self::InputCurrent => (format!("i({name}:input)"), "current"),
+            Self::BiasCurrent => (format!("i({name}:bias)"), "current"),
         }
     }
 }
@@ -405,14 +408,17 @@ impl AnalysisMode {
         matches!(self, Self::Transient { .. })
     }
 
-    /// True for the DC analyses, where capacitors are open and inductors are
-    /// shorts.
-    #[must_use = "DC loads omit time-dependent companion terms"]
+    /// True only for equilibrium bias loads, not unintegrated transient
+    /// physical residuals.
+    #[must_use = "bias constraints must be released during transient physical loads"]
+    pub const fn is_bias(self) -> bool {
+        matches!(self, Self::OperatingPoint | Self::DcSweep)
+    }
+
+    /// True for static loads, including the unintegrated physical DAE.
+    #[must_use = "static loads omit time-dependent companion terms"]
     pub const fn is_dc(self) -> bool {
-        matches!(
-            self,
-            Self::OperatingPoint | Self::DcSweep | Self::Instantaneous { .. }
-        )
+        self.is_bias() || matches!(self, Self::Instantaneous { .. })
     }
 }
 
@@ -754,6 +760,8 @@ pub struct StampContext<'a> {
     pub frequency: Real,
     /// Which analysis is loading the matrix.
     pub mode: AnalysisMode,
+    /// Enclosing analysis for source-prepared passive bias constraints.
+    pub bias_analysis: Option<crate::primitives::AnalysisKind>,
     /// Branch-current rows allocated to this device, in order (empty if none).
     pub branches: Range<usize>,
     /// Branch rows of the devices named by [`Device::controlling_sources`], in
@@ -991,6 +999,25 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// voltage tolerances; the owner checks their physical residuals.
     fn constitutive_nodes(&self) -> &[NodeId] {
         &[]
+    }
+
+    /// Install an occurrence-bound prepared passive startup policy before setup.
+    ///
+    /// # Errors
+    /// This device is not the matching physical storage family.
+    fn bind_passive_initialization(
+        &mut self,
+        _policy: crate::devices::passive_bias::PassiveInitialization,
+    ) -> SpiceResult<()> {
+        Err(SpiceError::circuit(
+            "prepared initialization requires a physical capacitor or inductor",
+        ))
+    }
+
+    /// True when bias equations need physical nodal continuation rather
+    /// than perturbing a numerical pivot diagonal.
+    fn has_passive_bias(&self) -> bool {
+        false
     }
 
     /// How many device-local coordinates the device adds to the MNA
@@ -1487,6 +1514,13 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// Never called for Newton trials or rejected steps.
     fn accept(&self, _context: &AcceptContext<'_>) {}
 
+    /// Opt in to exact transient event scheduling, using ordinary accepted
+    /// and tentative device state. No event queue is needed for devices
+    /// whose next event follows directly from their accepted state.
+    fn transient_events(&self) -> Option<&dyn DeviceTransientEvents> {
+        None
+    }
+
     /// An upper bound on the next transient step from this device's discrete
     /// state (C `DEVtrunc` of devices without charge storage, e.g.
     /// `swtrunc.c`), or `None` (the default) for no bound. Called for an
@@ -1723,6 +1757,52 @@ pub trait Device: fmt::Debug + std::any::Any {
             "",
         ))
     }
+}
+
+/// Converged trial data for a device-local, rollback-safe transient event.
+#[derive(Debug)]
+pub struct TransientEventContext<'a> {
+    /// Device-local state at the preceding accepted point.
+    pub accepted: &'a [Real],
+    /// Absolute candidate time.
+    pub time: Real,
+    /// The candidate solution.
+    pub solution: &'a Vector,
+    /// The circuit's ground-eliminated node numbering.
+    pub unknowns: &'a MnaUnknowns,
+}
+
+impl TransientEventContext<'_> {
+    /// Candidate node potential, zero at ground.
+    #[must_use]
+    pub fn voltage(&self, node: NodeId) -> Real {
+        self.unknowns
+            .node_row(node)
+            .and_then(|row| self.solution.get(row))
+            .unwrap_or(0.)
+    }
+}
+
+/// A device whose finite history directly determines future exact boundaries.
+/// Accepted state is read-only; probes cannot commit, queue or cancel events.
+pub trait DeviceTransientEvents {
+    /// The next boundary after the supplied accepted state, if any.
+    ///
+    /// # Errors
+    /// Invalid state or unrepresentable event time.
+    fn next_boundary(&self, accepted: &[Real]) -> SpiceResult<Option<Real>>;
+
+    /// Refine receiver state from the converged solution and optionally
+    /// request a retry at an interior crossing. Only candidate slots may
+    /// change; the Newton stamp must already satisfy its convergence test.
+    ///
+    /// # Errors
+    /// Invalid candidate physics, time or state.
+    fn refine_trial(
+        &self,
+        context: &TransientEventContext<'_>,
+        trial: &mut [Real],
+    ) -> SpiceResult<Option<Real>>;
 }
 
 /// What [`Device::timestep_limit`] sees for one converged trial step.

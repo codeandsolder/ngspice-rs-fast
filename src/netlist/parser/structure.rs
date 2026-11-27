@@ -8,7 +8,7 @@ use winnow::token::any;
 
 use super::expression::{is_ident_continue, is_ident_start};
 use super::grammar::{Failure, Input, ParsedCard, Result, keyword};
-use super::syntax::{canonical_node, equals, malformed, name, named_device};
+use super::syntax::{equals, malformed, name, named_device};
 use crate::netlist::ast::{
     DeviceInstance, IncludeDirective, OutputCards, ParameterAssignment, ParameterKind, Subcircuit,
 };
@@ -44,7 +44,7 @@ fn subckt(input: &mut Input<'_>) -> Result<ParsedCard> {
             name: name.text.to_ascii_lowercase(),
             terminals: terminals
                 .iter()
-                .map(|t| canonical_node(t, input.state.auto_gnd))
+                .map(|t| t.text.to_ascii_lowercase())
                 .collect(),
             parameters,
             devices: Vec::new(),
@@ -85,11 +85,12 @@ fn instance(input: &mut Input<'_>) -> Result<ParsedCard> {
             .pop()
             .ok_or_else(|| malformed(input, "expected subcircuit name"))?;
         Ok(ParsedCard::Device(DeviceInstance {
+            code_ports: Vec::new(),
             name: instance.text.to_ascii_lowercase(),
             designator: 'x',
             nodes: connections
                 .iter()
-                .map(|t| canonical_node(t, input.state.auto_gnd))
+                .map(|t| t.text.to_ascii_lowercase())
                 .collect(),
             model: Some(target.text.to_ascii_lowercase()),
             parameters,

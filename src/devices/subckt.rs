@@ -44,14 +44,14 @@ use std::sync::Arc;
 
 use crate::devices::binning::{DeclarationIndex, bin_base};
 use crate::netlist::ast::{
-    DeviceInstance, FourierCard, MeasureCard, ModelCard, Netlist, NodeHintCard, OptionCard,
-    OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind, PrintCard,
-    RequestedVector, SaveCard, ScopeEntry, ScopeView, ScopedCardKind, Subcircuit,
+    CodePortKind, DeviceInstance, FourierCard, MeasureCard, ModelCard, Netlist, NodeHintCard,
+    OptionCard, OutputCards, ParamAssignment, ParamCard, ParameterAssignment, ParameterKind,
+    PrintCard, RequestedVector, SaveCard, ScopeEntry, ScopeView, ScopedCardKind, Subcircuit,
 };
 use crate::netlist::bexpr::BExprKind;
 use crate::netlist::eval::{EvalBudget, FunctionScope, ParamBinding, ParamScope};
 use crate::netlist::expr::{Expr, ExprKind, ParameterExpression, SourceSpan};
-use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
+use crate::primitives::{NodeTable, Real, SourceLoc, SpiceError, SpiceResult};
 use petgraph::Direction;
 use petgraph::algo::tarjan_scc;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -86,6 +86,8 @@ impl Default for SubcircuitLimits {
 /// A deck with every `X` instance replaced by its definition's body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpandedNetlist {
+    /// Source-prepared, occurrence-bound passive initialization equations.
+    pub prepared_initialization: crate::netlist::prepared_initialization::BoundInitializations,
     /// Top-level devices in deck order, `X` instances expanded in place.
     pub devices: Vec<DeviceInstance>,
     /// Explicit prepared forcing resolved in each flattened instance scope.
@@ -93,6 +95,7 @@ pub struct ExpandedNetlist {
     /// Root `.model` cards in declaration order, then each instance's renamed
     /// local models in first-reference order.
     pub models: Vec<ModelCard>,
+    pub(crate) statistical_model_origins: BTreeSet<String>,
     /// Instantiated options in expanded card order, with local expressions resolved.
     pub options: Vec<OptionCard>,
     /// Renamed, literalized initial conditions in expanded card order.
@@ -105,6 +108,14 @@ pub struct ExpandedNetlist {
     pub measurements: Vec<MeasureCard>,
     /// Fourier cards hoisted once per used definition, without operand renaming.
     pub fourier: Vec<FourierCard>,
+}
+
+/// A subcircuit actual connection may be used in either domain. Do not
+/// canonicalize digital names as analog ground or .global nodes.
+#[derive(Default)]
+struct HierarchyBindings {
+    analog: BTreeMap<String, String>,
+    digital: BTreeMap<String, String>,
 }
 
 /// Expand every subcircuit instance in `netlist`.
@@ -205,15 +216,19 @@ fn expand_with_prepared_output(
     if netlist.cards.is_empty() {
         hoisted_fourier.extend_from_slice(fourier);
     }
+    let mut budget = EvalBudget::default();
+    let binder = crate::netlist::prepared_initialization::Binder::new(netlist, root, &mut budget)?;
     let mut expander = Expander {
+        binder,
         netlist,
         definitions,
         limits,
-        budget: EvalBudget::default(),
+        budget,
         devices: Vec::new(),
         waveforms,
         prepared_waveforms: Vec::new(),
-        models: netlist.models.clone(),
+        models: Vec::new(),
+        statistical_model_origins: BTreeSet::new(),
         frontend_cards: 0,
         frontend: Frontend {
             fourier: hoisted_fourier,
@@ -230,15 +245,23 @@ fn expand_with_prepared_output(
         root_functions: root.functions().cloned(),
         plans: BTreeMap::new(),
     };
-    let mut locals = vec![expander.root_models()];
+    let mut locals = vec![expander.root_models(root)];
     let directives = Directives {
+        lexical_scope: &[],
         devices: &netlist.devices,
         definition: "",
         sequence: &sequence,
         initial_conditions: &netlist.initial_conditions,
         nodesets: &netlist.nodesets,
     };
-    expander.expand_body("", 0, &BTreeMap::new(), root, &mut locals, &directives)?;
+    expander.expand_body(
+        "",
+        0,
+        &HierarchyBindings::default(),
+        root,
+        &mut locals,
+        &directives,
+    )?;
     check_flattened_model_names(&expander.models, &expander.emitted_locals)?;
     check_binned_bases(
         &expander.models,
@@ -246,9 +269,13 @@ fn expand_with_prepared_output(
         &expander.binned_bases,
     )?;
     Ok(ExpandedNetlist {
+        prepared_initialization: expander
+            .binder
+            .map_or_else(Default::default, |binder| binder.bound),
         devices: expander.devices,
         prepared_waveforms: expander.prepared_waveforms,
         models: expander.models,
+        statistical_model_origins: expander.statistical_model_origins,
         options: expander.frontend.options,
         initial_conditions: expander.frontend.initial_conditions,
         nodesets: expander.frontend.nodesets,
@@ -335,14 +362,30 @@ impl<'a> PreparedIndex<'a> {
     }
 }
 
-/// One frame's model identity and an owned card awaiting first use.
-///
-/// Root cards already reside in the flattened deck; local cards are moved
-/// there once, while their flattened names remain available for lookup.
+/// One frame's model identity. Ordinary model cards are moved into the
+/// flattened deck once; statistical declarations retain their defining scope
+/// and immutable source until each physical occurrence is bound.
+#[derive(Debug)]
+enum ModelMaterial {
+    Emitted(usize),
+    Pending(ModelCard),
+    Statistical {
+        card: ModelCard,
+        owner: Arc<ParamScope>,
+    },
+}
+
 #[derive(Debug)]
 struct LocalModel {
     name: String,
-    pending: Option<ModelCard>,
+    material: ModelMaterial,
+    root: bool,
+}
+
+impl LocalModel {
+    const fn statistical(&self) -> bool {
+        matches!(self.material, ModelMaterial::Statistical { .. })
+    }
 }
 
 #[derive(Default)]
@@ -356,6 +399,9 @@ struct Frontend {
 }
 
 struct Directives<'a> {
+    /// Declaration identity, not the chain of invoking X instances. The
+    /// current native definition index contains root lexical definitions.
+    lexical_scope: &'a [String],
     devices: &'a [DeviceInstance],
     definition: &'a str,
     sequence: &'a [ExpansionItem<'a>],
@@ -465,6 +511,7 @@ struct DefinitionPlan<'a> {
 }
 
 struct Expander<'a> {
+    binder: Option<crate::netlist::prepared_initialization::Binder<'a>>,
     netlist: &'a Netlist,
     definitions: BTreeMap<String, &'a Subcircuit>,
     limits: SubcircuitLimits,
@@ -473,6 +520,7 @@ struct Expander<'a> {
     waveforms: PreparedIndex<'a>,
     prepared_waveforms: Vec<(String, super::prepared_waveform::PreparedForcing)>,
     models: Vec<ModelCard>,
+    statistical_model_origins: BTreeSet<String>,
     frontend: Frontend,
     frontend_cards: usize,
     global_nodes: BTreeSet<String>,
@@ -774,12 +822,23 @@ impl<'a> Expander<'a> {
     }
 
     /// The root frame's models: every top-level declaration, unrenamed.
-    fn root_models(&self) -> DeclarationIndex<LocalModel> {
+    fn root_models(&mut self, scope: &Arc<ParamScope>) -> DeclarationIndex<LocalModel> {
         let mut index = DeclarationIndex::new();
         for card in &self.netlist.models {
+            let material = if crate::netlist::elaborate::model_uses_statistics(card, scope) {
+                ModelMaterial::Statistical {
+                    card: card.clone(),
+                    owner: Arc::clone(scope),
+                }
+            } else {
+                let index = self.models.len();
+                self.models.push(card.clone());
+                ModelMaterial::Emitted(index)
+            };
             index.insert_first(&card.name, || LocalModel {
                 name: card.name.clone(),
-                pending: None,
+                material,
+                root: true,
             });
         }
         index
@@ -788,16 +847,25 @@ impl<'a> Expander<'a> {
     /// One frame's literalized models, renamed to `<path>.<name>`. They stay
     /// out of the flattened deck until a device in this frame or a descendant
     /// frame references one, so unused declarations are not invented.
-    fn local_models(cards: Vec<ModelCard>, path: &str) -> DeclarationIndex<LocalModel> {
+    fn local_models(
+        cards: Vec<ModelCard>,
+        path: &str,
+        scope: &Arc<ParamScope>,
+    ) -> DeclarationIndex<LocalModel> {
         let mut index = DeclarationIndex::new();
-        for mut card in cards {
-            let source_name = std::mem::take(&mut card.name);
-            index.insert_first(&source_name, || {
-                card.name = format!("{path}.{source_name}");
-                LocalModel {
-                    name: card.name.clone(),
-                    pending: Some(card),
-                }
+        for card in cards {
+            let source_name = card.name.clone();
+            index.insert_first(&source_name, || LocalModel {
+                name: format!("{path}.{source_name}"),
+                material: if crate::netlist::elaborate::model_uses_statistics(&card, scope) {
+                    ModelMaterial::Statistical {
+                        card,
+                        owner: Arc::clone(scope),
+                    }
+                } else {
+                    ModelMaterial::Pending(card)
+                },
+                root: false,
             });
         }
         index
@@ -809,17 +877,25 @@ impl<'a> Expander<'a> {
         &mut self,
         path: &str,
         depth: usize,
-        terminals: &BTreeMap<String, String>,
+        terminals: &HierarchyBindings,
         scope: &Arc<ParamScope>,
         locals: &mut Vec<DeclarationIndex<LocalModel>>,
         directives: &Directives<'_>,
     ) -> SpiceResult<()> {
+        if let Some(binder) = &mut self.binder {
+            binder.nodes(
+                directives.lexical_scope,
+                scope,
+                |node| rewrite_node(&self.global_nodes, node, &terminals.analog, path),
+                &mut self.budget,
+            )?;
+        }
         let devices = directives.devices;
         for &item in directives.sequence {
             let index = match item {
                 ExpansionItem::Device(index) => index,
                 ExpansionItem::Frontend { location, action } => {
-                    self.directive(location, action, directives, terminals, path, scope)?;
+                    self.directive(location, action, directives, &terminals.analog, path, scope)?;
                     continue;
                 }
             };
@@ -830,9 +906,6 @@ impl<'a> Expander<'a> {
                 )
             })?;
             let mut instance = original.clone();
-            for node in &mut instance.nodes {
-                *node = self.rewrite_node(node, terminals, path);
-            }
             if instance.designator == 'x' {
                 let target = instance
                     .model
@@ -849,9 +922,19 @@ impl<'a> Expander<'a> {
                         ),
                     ));
                 };
-                self.expand_instance(definition, &instance, path, depth, scope, locals)?;
+                self.expand_instance(
+                    definition,
+                    &instance,
+                    (path, depth, terminals),
+                    scope,
+                    locals,
+                )?;
                 continue;
             }
+            for node in &mut instance.nodes {
+                *node = self.rewrite_node(node, &terminals.analog, path);
+            }
+            self.rewrite_code_ports(&mut instance, terminals, path);
             if self.devices.len() >= self.limits.max_devices {
                 return Err(SpiceError::parse(
                     instance.location.clone(),
@@ -861,49 +944,68 @@ impl<'a> Expander<'a> {
                     ),
                 ));
             }
-            self.rewrite_model(&mut instance, locals);
-            // F/H controlling sources are translated like instance names
-            // (`translate()` calls `translate_inst_name` for them), so they
-            // always name a device of the same instance.
-            for parameter in &mut instance.parameters {
-                if let ParameterKind::Behavioural(expression) = &mut parameter.kind {
-                    // Node and source names inside a behavioural expression are
-                    // translated like the card's own (C expands the B line
-                    // text, `translate()` renaming v(...)/i(...) operands).
-                    expression.root.visit_mut(&mut |node| match &mut node.kind {
-                        BExprKind::Voltage { positive, negative } => {
-                            *positive = self.rewrite_node(positive, terminals, path);
-                            if let Some(negative) = negative {
-                                *negative = self.rewrite_node(negative, terminals, path);
-                            }
-                        }
-                        BExprKind::Current(source) => {
-                            let designator = source
-                                .chars()
-                                .next()
-                                .unwrap_or_default()
-                                .to_ascii_lowercase();
-                            *source = device_name(source, designator, path);
-                        }
-                        _ => {}
-                    });
-                    continue;
-                }
-                if parameter.kind == ParameterKind::Instance {
-                    let designator = parameter
-                        .value
-                        .chars()
-                        .next()
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    parameter.value = device_name(&parameter.value, designator, path);
-                }
-            }
+            self.rewrite_model(&mut instance, scope, locals)?;
+            self.rewrite_parameter_references(&mut instance, &terminals.analog, path);
             instance.name = device_name(&instance.name, instance.designator, path);
             self.bind_prepared_waveform(original, directives.definition, &instance, scope)?;
+            if let Some(binder) = &mut self.binder {
+                binder.device(
+                    original,
+                    &instance.name,
+                    directives.lexical_scope,
+                    scope,
+                    &mut self.budget,
+                )?;
+            }
             self.devices.push(instance);
         }
         Ok(())
+    }
+
+    /// Rewrite instance-local device and node references in parameters.
+    fn rewrite_parameter_references(
+        &self,
+        instance: &mut DeviceInstance,
+        terminals: &BTreeMap<String, String>,
+        path: &str,
+    ) {
+        // F/H controlling sources are translated like instance names
+        // (`translate()` calls `translate_inst_name` for them), so they
+        // always name a device of the same instance.
+        for parameter in &mut instance.parameters {
+            if let ParameterKind::Behavioural(expression) = &mut parameter.kind {
+                // Node and source names inside a behavioural expression are
+                // translated like the card's own (C expands the B line
+                // text, `translate()` renaming v(...)/i(...) operands).
+                expression.root.visit_mut(&mut |node| match &mut node.kind {
+                    BExprKind::Voltage { positive, negative } => {
+                        *positive = self.rewrite_node(positive, terminals, path);
+                        if let Some(negative) = negative {
+                            *negative = self.rewrite_node(negative, terminals, path);
+                        }
+                    }
+                    BExprKind::Current(source) => {
+                        let designator = source
+                            .chars()
+                            .next()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        *source = device_name(source, designator, path);
+                    }
+                    _ => {}
+                });
+                continue;
+            }
+            if parameter.kind == ParameterKind::Instance {
+                let designator = parameter
+                    .value
+                    .chars()
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                parameter.value = device_name(&parameter.value, designator, path);
+            }
+        }
     }
 
     /// Bind a resolved waveform to the flattened source occurrence.
@@ -915,6 +1017,10 @@ impl<'a> Expander<'a> {
         scope: &Arc<ParamScope>,
     ) -> SpiceResult<()> {
         if let Some(declaration) = self.waveforms.get(original, definition) {
+            let mut ordinal = 0_u64;
+            let site = scope
+                .statistical_site(b"device", &original.name)
+                .map(|site| site.field(b"prepared_waveform"));
             let resolved = declaration
                 .resolve(|text| {
                     let text = text.trim();
@@ -924,7 +1030,9 @@ impl<'a> Expander<'a> {
                             .unwrap_or(text),
                         &original.location,
                     )?;
-                    Ok(scope.evaluate(&expression, &mut self.budget)?)
+                    let field = site.map(|site| site.field(&ordinal.to_le_bytes()));
+                    ordinal += 1;
+                    Ok(scope.evaluate_at(&expression, field, &mut self.budget)?)
                 })
                 .map_err(|error| {
                     SpiceError::parse(
@@ -946,11 +1054,11 @@ impl<'a> Expander<'a> {
         &mut self,
         definition: &'a Subcircuit,
         instance: &DeviceInstance,
-        path: &str,
-        depth: usize,
+        frame: (&str, usize, &HierarchyBindings),
         parent: &Arc<ParamScope>,
         locals: &mut Vec<DeclarationIndex<LocalModel>>,
     ) -> SpiceResult<()> {
+        let (path, depth, parent_terminals) = frame;
         if depth + 1 > self.limits.max_depth {
             return Err(SpiceError::parse(
                 instance.location.clone(),
@@ -990,9 +1098,18 @@ impl<'a> Expander<'a> {
                 C_REFERENCE,
             ));
         }
-        let mut terminals: BTreeMap<String, String> = BTreeMap::new();
+        let mut terminals = HierarchyBindings::default();
         for (formal, actual) in definition.terminals.iter().zip(&instance.nodes) {
-            terminals.insert(formal.clone(), actual.clone());
+            let analog_formal = NodeTable::canonical_name(formal, self.netlist.auto_gnd);
+            let analog_actual = NodeTable::canonical_name(actual, self.netlist.auto_gnd);
+            terminals.analog.insert(
+                analog_formal,
+                self.rewrite_node(&analog_actual, &parent_terminals.analog, path),
+            );
+            terminals.digital.insert(
+                formal.clone(),
+                Self::rewrite_digital_node(actual, &parent_terminals.digital, path),
+            );
         }
         let (scope, plan) = self.instance_scope(definition, instance, parent)?;
         let child_path = if path.is_empty() {
@@ -1002,7 +1119,7 @@ impl<'a> Expander<'a> {
         };
         let body =
             crate::netlist::elaborate::literalize_body(definition, &scope, &mut self.budget)?;
-        locals.push(Self::local_models(body.models, &child_path));
+        locals.push(Self::local_models(body.models, &child_path, &scope));
         let result = self.expand_body(
             &child_path,
             depth + 1,
@@ -1010,6 +1127,7 @@ impl<'a> Expander<'a> {
             &scope,
             locals,
             &Directives {
+                lexical_scope: std::slice::from_ref(&definition.name),
                 devices: &body.devices,
                 definition: &definition.name,
                 sequence: &plan.sequence,
@@ -1048,6 +1166,7 @@ impl<'a> Expander<'a> {
         let plan = self.definition_plan(definition)?;
         let scope = Arc::new(ParamScope::resolve_instance_scoped(
             Some(Arc::clone(parent)),
+            &instance.name,
             plan.functions.clone(),
             &bindings,
             &plan.parameters,
@@ -1125,17 +1244,47 @@ impl<'a> Expander<'a> {
     /// Rename a body node. Ground and `.global` nodes are exempt; a formal
     /// terminal is replaced by the actual node it was bound to; anything else is
     /// prefixed with the instance path.
+    fn rewrite_code_ports(
+        &self,
+        instance: &mut DeviceInstance,
+        terminals: &HierarchyBindings,
+        path: &str,
+    ) {
+        for terminal in instance
+            .code_ports
+            .iter_mut()
+            .flat_map(|port| &mut port.terminals)
+        {
+            let rewrite = |name: &str| {
+                if terminal.kind == CodePortKind::Digital {
+                    Self::rewrite_digital_node(name, &terminals.digital, path)
+                } else {
+                    self.rewrite_node(name, &terminals.analog, path)
+                }
+            };
+            terminal.positive = rewrite(&terminal.positive);
+            if let Some(negative) = &mut terminal.negative {
+                *negative = rewrite(negative);
+            }
+        }
+    }
+
+    fn rewrite_digital_node(
+        name: &str,
+        terminals: &BTreeMap<String, String>,
+        path: &str,
+    ) -> String {
+        terminals.get(name).cloned().unwrap_or_else(|| {
+            if path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{path}.{name}")
+            }
+        })
+    }
+
     fn rewrite_node(&self, name: &str, terminals: &BTreeMap<String, String>, path: &str) -> String {
-        if self.global_nodes.contains(&name.to_ascii_lowercase()) {
-            return name.to_owned();
-        }
-        if let Some(actual) = terminals.get(name) {
-            return actual.clone();
-        }
-        if path.is_empty() {
-            return name.to_owned();
-        }
-        format!("{path}.{name}")
+        rewrite_node(&self.global_nodes, name, terminals, path)
     }
 
     /// Rewrite one model reference to the flattened name of the declaration it
@@ -1145,33 +1294,88 @@ impl<'a> Expander<'a> {
     fn rewrite_model(
         &mut self,
         instance: &mut DeviceInstance,
+        scope: &ParamScope,
         locals: &mut [DeclarationIndex<LocalModel>],
-    ) {
+    ) -> SpiceResult<()> {
         let Some(reference) = instance.model.as_deref() else {
-            return;
+            return Ok(());
+        };
+        let occurrence = || {
+            scope
+                .statistical_site(b"device", &instance.name)
+                .ok_or_else(|| {
+                    SpiceError::parse(
+                        instance.location.clone(),
+                        "statistical device has no physical occurrence",
+                    )
+                })
         };
         for frame in locals.iter_mut().rev() {
             if let Some(local) = frame.get_mut(reference) {
-                self.emit_model(local);
-                instance.model = Some(local.name.clone());
-                return;
+                let name = if local.statistical() {
+                    let site = occurrence()?;
+                    let name = format!("{}.__stat_{}", local.name, occurrence_suffix(site));
+                    self.emit_statistical_model(local, &name, site)?;
+                    name
+                } else {
+                    self.emit_model(local);
+                    local.name.clone()
+                };
+                instance.model = Some(name);
+                return Ok(());
             }
             // A frame declaring only `<name>.<digits>` bins also captures
             // MOS model names. Each group is already in declaration order.
             if instance.designator.eq_ignore_ascii_case(&'m')
-                && let Some(base) = self.rewrite_binned(reference, frame)
+                && let Some(base) = self.rewrite_binned(reference, frame, &occurrence)?
             {
                 instance.model = Some(base);
-                return;
+                return Ok(());
             }
         }
+        Ok(())
     }
 
     fn emit_model(&mut self, local: &mut LocalModel) {
-        if let Some(card) = local.pending.take() {
-            self.emitted_locals.insert(local.name.to_ascii_lowercase());
-            self.models.push(card);
+        let material = std::mem::replace(
+            &mut local.material,
+            ModelMaterial::Emitted(self.models.len()),
+        );
+        match material {
+            ModelMaterial::Pending(mut card) => {
+                card.name.clone_from(&local.name);
+                self.emitted_locals.insert(local.name.to_ascii_lowercase());
+                self.models.push(card);
+            }
+            other => local.material = other,
         }
+    }
+
+    fn emit_statistical_model(
+        &mut self,
+        local: &LocalModel,
+        name: &str,
+        site: crate::netlist::eval::statistics::PreparedSite,
+    ) -> SpiceResult<()> {
+        let mut card = match &local.material {
+            ModelMaterial::Statistical { card, owner } => {
+                crate::netlist::elaborate::realize_model(card, owner, site, &mut self.budget)?
+            }
+            ModelMaterial::Pending(card) => card.clone(),
+            ModelMaterial::Emitted(index) => self
+                .models
+                .get(*index)
+                .ok_or_else(|| SpiceError::circuit("missing emitted model declaration"))?
+                .clone(),
+        };
+        name.clone_into(&mut card.name);
+        self.emitted_locals.insert(name.to_ascii_lowercase());
+        if local.root {
+            self.statistical_model_origins
+                .insert(local.name.to_ascii_lowercase());
+        }
+        self.models.push(card);
+        Ok(())
     }
 
     /// Bind an M reference to a frame's bin set, emitting the ordered
@@ -1180,18 +1384,65 @@ impl<'a> Expander<'a> {
         &mut self,
         key: &str,
         frame: &mut DeclarationIndex<LocalModel>,
-    ) -> Option<String> {
+        occurrence: &impl Fn() -> SpiceResult<crate::netlist::eval::statistics::PreparedSite>,
+    ) -> SpiceResult<Option<String>> {
         let (ids, entries) = frame.bin_slots_mut(key);
-        let first = &entries[*ids.first()?];
-        let base = bin_base(&first.name)?.to_owned();
+        let Some(&first_id) = ids.first() else {
+            return Ok(None);
+        };
+        let Some(base) = bin_base(&entries[first_id].name).map(str::to_owned) else {
+            return Ok(None);
+        };
+        if ids.iter().any(|&id| entries[id].statistical()) {
+            let site = occurrence()?;
+            let sampled_base = format!("{base}.__stat_{}", occurrence_suffix(site));
+            for &id in ids {
+                let local = &entries[id];
+                let (_, suffix) = local
+                    .name
+                    .rsplit_once('.')
+                    .ok_or_else(|| SpiceError::circuit("invalid model bin identity"))?;
+                self.emit_statistical_model(local, &format!("{sampled_base}.{suffix}"), site)?;
+            }
+            self.binned_bases.insert(sampled_base.to_ascii_lowercase());
+            return Ok(Some(sampled_base));
+        }
         for &id in ids {
             self.emit_model(&mut entries[id]);
         }
         if !base.eq_ignore_ascii_case(key) {
             self.binned_bases.insert(base.to_ascii_lowercase());
         }
-        Some(base)
+        Ok(Some(base))
     }
+}
+
+fn occurrence_suffix(site: crate::netlist::eval::statistics::PreparedSite) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut suffix = String::with_capacity(64);
+    for byte in site.occurrence.bytes() {
+        suffix.push(char::from(HEX[usize::from(byte >> 4)]));
+        suffix.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    suffix
+}
+
+fn rewrite_node(
+    global_nodes: &BTreeSet<String>,
+    name: &str,
+    terminals: &BTreeMap<String, String>,
+    path: &str,
+) -> String {
+    if global_nodes.contains(&name.to_ascii_lowercase()) {
+        return name.to_owned();
+    }
+    if let Some(actual) = terminals.get(name) {
+        return actual.clone();
+    }
+    if path.is_empty() {
+        return name.to_owned();
+    }
+    format!("{path}.{name}")
 }
 
 /// `translate_inst_name`: the designator prefix is not repeated for an `X`.

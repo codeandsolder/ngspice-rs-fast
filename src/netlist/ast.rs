@@ -358,6 +358,76 @@ pub struct PwlPoint {
     pub value: NumericVectorEntry,
 }
 
+/// Declared XSPICE port type; an untyped terminal is resolved by the model schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodePortKind {
+    /// Model-declared default domain.
+    Default,
+    /// Single-ended voltage.
+    Voltage,
+    /// Differential voltage.
+    VoltageDifferential,
+    /// Single-ended current.
+    Current,
+    /// Differential current.
+    CurrentDifferential,
+    /// Digital event terminal.
+    Digital,
+    /// Single-ended conductance.
+    Conductance,
+    /// Differential conductance.
+    ConductanceDifferential,
+}
+
+impl CodePortKind {
+    /// Whether one element contains an ordered pair of nodes.
+    #[must_use]
+    pub const fn differential(self) -> bool {
+        matches!(
+            self,
+            Self::VoltageDifferential | Self::CurrentDifferential | Self::ConductanceDifferential
+        )
+    }
+
+    /// Canonical explicit marker; the default is written without a marker.
+    #[must_use]
+    pub const fn marker(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::Voltage => Some("%v"),
+            Self::VoltageDifferential => Some("%vd"),
+            Self::Current => Some("%i"),
+            Self::CurrentDifferential => Some("%id"),
+            Self::Digital => Some("%d"),
+            Self::Conductance => Some("%g"),
+            Self::ConductanceDifferential => Some("%gd"),
+        }
+    }
+}
+
+/// One scalar or differential element of an A-instance port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeTerminal {
+    /// Type of this element, including changes within a vector.
+    pub kind: CodePortKind,
+    /// Positive or single-ended node, case folded.
+    pub positive: NodeName,
+    /// Explicit negative node, absent for single-ended terminals.
+    pub negative: Option<NodeName>,
+    /// Digital inversion marker, validated against the selected schema.
+    pub inverted: bool,
+}
+
+/// Ordered scalar or vector port group. Vector grouping is never inferred
+/// from the number of nodes: a one-element vector remains a vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodePort {
+    /// Whether the source used a bracketed vector.
+    pub vector: bool,
+    /// Elements in source order.
+    pub terminals: Vec<CodeTerminal>,
+}
+
 /// A device instance, e.g. `r1 in out 1k tc1=0.01`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceInstance {
@@ -369,6 +439,8 @@ pub struct DeviceInstance {
     /// three or four ports; an omitted substrate is not injected here. Circuit
     /// elaboration must ground it as INP2Q does.
     pub nodes: Vec<NodeName>,
+    /// Typed A-instance ports, stored separately from ordinary analog nodes.
+    pub code_ports: Vec<CodePort>,
     /// The model this instance refers to, if the device takes one.
     pub model: Option<String>,
     /// Parameter assignments, including positional values, in application order.
@@ -1233,6 +1305,11 @@ pub enum ScopedCardKind {
 /// `docs/port/FRONTEND_STRUCTURE.md` and the central `TODO.md`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Netlist {
+    /// Typed source-prepared initialization, separate from native .ic cards.
+    pub prepared_initialization:
+        Option<crate::netlist::prepared_initialization::PreparedInitialConditions>,
+    /// Whether analog ground aliases are enabled for this deck.
+    pub auto_gnd: bool,
     /// The deck's title line.
     pub title: String,
     /// The file the deck came from.

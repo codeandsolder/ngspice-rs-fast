@@ -39,6 +39,7 @@ use crate::netlist::bexpr::{
     STATISTICAL_FUNCTIONS, TableTransfer, is_builtin_function, round_like_c_literal,
 };
 use crate::netlist::elaborate::format_literal;
+use crate::netlist::eval::statistics::PreparedSite;
 use crate::netlist::eval::{EvalBudget, FunctionScope, ParamScope};
 use crate::netlist::expr::{
     BinaryOp, Expr, ExprKind, MAX_TREE_DEPTH, MAX_TREE_NODES, SourceSpan, TreeBudget, UnaryOp,
@@ -98,6 +99,7 @@ fn instance(
     location: &SourceLoc,
 ) -> DeviceInstance {
     DeviceInstance {
+        code_ports: Vec::new(),
         name,
         designator,
         nodes,
@@ -465,11 +467,25 @@ pub fn resolve_expression(
     scope: &ParamScope,
     budget: &mut EvalBudget,
 ) -> SpiceResult<BehaviouralExpression> {
+    resolve_expression_at(expression, scope, budget, None)
+}
+
+pub(crate) fn resolve_expression_at(
+    expression: &BehaviouralExpression,
+    scope: &ParamScope,
+    budget: &mut EvalBudget,
+    site: Option<PreparedSite>,
+) -> SpiceResult<BehaviouralExpression> {
     let mut resolver = Resolver {
         scope,
         functions: scope.functions().cloned(),
         budget,
-        sampler: scope.sampler(&expression.span.start),
+        sampler: scope.sampler(&expression.span.start, site),
+        prepared_frames: site
+            .into_iter()
+            .map(|site| (expression.span.clone(), site.expression))
+            .collect(),
+        exact: false,
         verbatim: expression.verbatim,
         syntax_only: false,
         nodes: 0,
@@ -514,7 +530,9 @@ fn expand_symbolic(
         scope,
         functions: scope.functions().cloned(),
         budget,
-        sampler: scope.sampler(&expression.span.start),
+        sampler: scope.sampler(&expression.span.start, None),
+        prepared_frames: Vec::new(),
+        exact: false,
         verbatim: expression.verbatim,
         syntax_only: true,
         nodes: 0,
@@ -601,10 +619,10 @@ pub(crate) fn classify_passive(
         };
     });
     if runtime {
-        parameter.kind = ParameterKind::Behavioural(Box::new(BehaviouralExpression {
-            root,
-            ..expression.clone()
-        }));
+        // The symbolic expansion classifies the law, but retain the original
+        // call tree for realization: otherwise macro invocation identities
+        // are lost before statistical calls can be bound.
+        parameter.kind = ParameterKind::Behavioural(Box::new(expression.clone()));
     } else if matches!(parameter.kind, ParameterKind::Behavioural(_)) {
         // A locally shadowed probe call or an erased macro argument may
         // make the syntactically behavioural candidate an ordinary scalar.
@@ -664,6 +682,8 @@ struct Resolver<'a> {
     functions: Option<Arc<FunctionScope>>,
     budget: &'a mut EvalBudget,
     sampler: crate::netlist::eval::statistics::Sampler<'a>,
+    prepared_frames: Vec<(SourceSpan, model_statistics::Identity)>,
+    exact: bool,
     verbatim: bool,
     syntax_only: bool,
     nodes: usize,
@@ -675,6 +695,40 @@ fn parse_error(span: &SourceSpan, message: String) -> SpiceError {
 }
 
 impl Resolver<'_> {
+    // Macro arguments retain their original source spans when textually
+    // substituted. Resolve their prepared identity in the caller frame, not
+    // the callee frame: repeated formal reads must not resample the argument.
+    fn prepared_frame(&self, span: &SourceSpan) -> Option<(model_statistics::Identity, u64)> {
+        self.prepared_frames
+            .iter()
+            .rev()
+            .find_map(|(parent, identity)| {
+                let start = (span.start.line, span.start.column);
+                let end = (span.end.line, span.end.column);
+                let parent_start = (parent.start.line, parent.start.column);
+                let parent_end = (parent.end.line, parent.end.column);
+                if span.start.path() != parent.start.path()
+                    || start < parent_start
+                    || end > parent_end
+                {
+                    return None;
+                }
+                span.relative_to(parent)
+                    .map(|range| (*identity, range.start as u64))
+            })
+    }
+
+    fn numeric_value(&self, value: Real) -> BExprKind {
+        if self.exact {
+            BExprKind::Number {
+                value,
+                spelling: format_literal(value),
+            }
+        } else {
+            spliced(value)
+        }
+    }
+
     fn resolve(&mut self, expr: &BExpr, depth: usize) -> SpiceResult<BExpr> {
         self.nodes += 1;
         if self.nodes > MAX_TREE_NODES || depth > MAX_TREE_DEPTH {
@@ -689,7 +743,7 @@ impl Resolver<'_> {
         let boxed = |this: &mut Self, expr: &BExpr| this.resolve(expr, depth + 1).map(Box::new);
         let kind = match &expr.kind {
             BExprKind::Number { value, spelling } => BExprKind::Number {
-                value: if self.verbatim || self.syntax_only {
+                value: if self.verbatim || self.syntax_only || self.exact {
                     *value
                 } else {
                     round_like_c_literal(*value)
@@ -744,11 +798,15 @@ impl Resolver<'_> {
             BExprKind::Call { name, arguments } => {
                 return self.call(expr, name, arguments, depth);
             }
-            BExprKind::Value(value) if !self.syntax_only => spliced(self.scope.evaluate_sampled(
-                value,
-                self.budget,
-                &self.sampler,
-            )?),
+            BExprKind::Value(value) if !self.syntax_only => {
+                let identity = self
+                    .prepared_frame(&expr.span)
+                    .map(|(identity, _)| identity);
+                let evaluated =
+                    self.scope
+                        .evaluate_sampled(value, self.budget, &self.sampler, identity)?;
+                self.numeric_value(evaluated)
+            }
             BExprKind::Value(_) => expr.kind.clone(),
             BExprKind::Table(table) => {
                 let input = self.resolve(&table.input, depth + 1)?;
@@ -789,7 +847,7 @@ impl Resolver<'_> {
             )
         })?;
         Ok(BExpr {
-            kind: spliced(value),
+            kind: self.numeric_value(value),
             span: expr.span.clone(),
         })
     }
@@ -811,6 +869,40 @@ impl Resolver<'_> {
         self.call(expr, name, &arguments, depth)
     }
 
+    fn prepared_call(
+        &mut self,
+        expr: &BExpr,
+        name: &str,
+        arguments: &[BExpr],
+        depth: usize,
+    ) -> SpiceResult<BExpr> {
+        let identity = self
+            .prepared_frame(&expr.span)
+            .map(|(identity, _)| identity);
+        if identity.is_none() && self.sampler.prepared_site().is_some() {
+            return Err(parse_error(
+                &expr.span,
+                "prepared statistical call has no static expression identity".into(),
+            ));
+        }
+        let previous = std::mem::replace(&mut self.exact, true);
+        let values = arguments
+            .iter()
+            .map(|argument| {
+                let resolved = self.resolve(argument, depth + 1)?;
+                statistical_argument(&resolved)
+            })
+            .collect::<SpiceResult<Vec<_>>>();
+        self.exact = previous;
+        let value = self
+            .sampler
+            .sample_prepared(name, &values?, identity, &expr.span.start)?;
+        Ok(BExpr {
+            kind: self.numeric_value(value),
+            span: expr.span.clone(),
+        })
+    }
+
     fn call(
         &mut self,
         expr: &BExpr,
@@ -818,6 +910,9 @@ impl Resolver<'_> {
         arguments: &[BExpr],
         depth: usize,
     ) -> SpiceResult<BExpr> {
+        if !self.syntax_only && name.starts_with(model_statistics::PREPARED_PREFIX) {
+            return self.prepared_call(expr, name, arguments, depth);
+        }
         let functions = self.functions.clone();
         let definition = functions
             .as_deref()
@@ -845,9 +940,23 @@ impl Resolver<'_> {
                 &mut self.expansion_budget,
                 functions.as_deref(),
             )?;
-            let expanded = self.resolve(&body, depth + 1)?;
+            let frame = self.prepared_frame(&expr.span).map(|(identity, offset)| {
+                (
+                    definition.body.span.clone(),
+                    identity
+                        .child(b"macro")
+                        .child(definition.name.as_bytes())
+                        .child(&offset.to_le_bytes()),
+                )
+            });
+            let pushed = frame.is_some();
+            self.prepared_frames.extend(frame);
+            let expanded = self.resolve(&body, depth + 1);
+            if pushed {
+                self.prepared_frames.pop();
+            }
             return Ok(BExpr {
-                kind: BExprKind::Group(Box::new(expanded)),
+                kind: BExprKind::Group(Box::new(expanded?)),
                 span: expr.span.clone(),
             });
         }

@@ -97,6 +97,7 @@ fn body(input: &mut Input<'_>, instance: &Token) -> Result<ParsedCard> {
     }
     parameters.push(coupling);
     Ok(ParsedCard::Device(DeviceInstance {
+        code_ports: Vec::new(),
         name: instance.text.to_ascii_lowercase(),
         designator: 'k',
         nodes: Vec::new(),

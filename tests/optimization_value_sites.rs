@@ -115,6 +115,7 @@ fn bound_function_names_shadowing_and_scalar_evaluator_agree() {
         .add_scope(
             ParameterScopeSpec {
                 parent: None,
+                instance: None,
                 functions: Some(Arc::clone(&functions)),
                 bindings: &[],
                 cards: &root.params,
@@ -128,6 +129,7 @@ fn bound_function_names_shadowing_and_scalar_evaluator_agree() {
         .add_scope(
             ParameterScopeSpec {
                 parent: Some(top),
+                instance: Some("xchild"),
                 functions: Some(functions),
                 bindings: &[],
                 cards: &child.params,

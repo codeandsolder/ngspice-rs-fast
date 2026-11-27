@@ -201,3 +201,40 @@ snap preserves the endpoint, with a regression for integer/noninteger spans and
 no change to value-comparison tolerances. See
 [VERIFICATION.md](VERIFICATION.md#bounded-passive-elaboration-verification) for
 commands, counts and bounds.
+
+## Source-prepared initialization
+
+A native deck keeps ngspice's existing `.ic`, `.nodeset`, instance
+`ic=` and UIC behavior. An explicitly prepared source deck can additionally
+carry the preprocessing library's `passive_ic::InitialConditions` sidecar.
+After the electrical artifacts have been materialized, parse the primary
+artifact with `Parser::parse_file_with_output`, then call
+`PreparedInitialConditions::attach(&mut parsed.netlist, bundle_directory,
+initial_conditions, analyses)`, supplying the selected native job kinds
+and UIC flags before elaborating the circuit. The artifact directory is the
+emitted bundle root, not the original source directory. Do not discard the typed sidecar or
+serialize it into native IC syntax. The native writer refuses to serialize
+a deck with attached prepared initialization metadata.
+
+The binder validates exact emitted lexical device identities and resolves
+the policy once per elaborated occurrence and enclosing analysis using
+its parameter/function scope and the producer's normalized scalar evaluator.
+The resolved equations are independent of the source language:
+
+- Hard capacitor bias uses an exact differential voltage source with a
+  reserved current row. In transient and AC the row enforces zero current,
+  and ordinary capacitor charge remains the only physical storage.
+- Soft capacitor/node bias uses the specified finite Norton conductance.
+- Hard/soft inductor bias reuses the oriented branch current and enforces
+  `i - g*v = target`; ordinary transient flux uses the total terminal current.
+- The ordinary bias solve and its continuation attempts retain the
+  constraints. Small-signal and transient steps do not.
+- UIC bypasses bias equations and uses explicit storage initial values
+  before differential node hints. Native node-hint row replacement is not
+  used for the prepared soft node bias.
+
+Prepared analysis selection is distinct from Newton load mode. A newly
+introduced analysis must be present when the policy is bound; a command-only
+deck must explicitly select its enclosing analyses too. The original producer
+fixture snapshot under `tests/fixtures/passive-ic` exercises the actual
+prepared artifacts through the solver, with independent voltage references.

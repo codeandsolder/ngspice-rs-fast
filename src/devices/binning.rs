@@ -429,6 +429,7 @@ mod tests {
 
     fn mos(parameters: &[(&str, &str)]) -> DeviceInstance {
         DeviceInstance {
+            code_ports: Vec::new(),
             name: "m1".into(),
             designator: 'm',
             nodes: Vec::new(),

@@ -3,6 +3,8 @@
 //! iteration, candidate evaluation order, or a mutable global generator.
 use std::cell::Cell;
 
+use model_statistics::{Identity, Invocation, Site};
+
 use crate::netlist::ast::OptionCard;
 use crate::primitives::numeric::{scale_power, split_power};
 use crate::primitives::random::{gaussian, mix, uniform};
@@ -14,18 +16,71 @@ pub(super) const DEFAULT_SEED: u64 = 1;
 pub(super) struct Realization {
     pub seed: u64,
     pub scope: u64,
+    // Native ngspice retains its original sampling stream. Prepared source
+    // functions instead use explicitly bound declaration and occurrence keys.
+    pub(super) identity: Option<Identity>,
+    pub(super) prepared: Option<PreparedSite>,
+}
+
+/// Identities of a bound scalar declaration, its physical occurrence, and
+/// (where applicable) the lexically selected model owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-restricted visibility is required by the unreachable_pub lint"
+)]
+pub(crate) struct PreparedSite {
+    pub(crate) expression: Identity,
+    pub(crate) occurrence: Identity,
+    pub(crate) lot: Option<Identity>,
+}
+
+impl PreparedSite {
+    pub(crate) fn field(self, field: &[u8]) -> Self {
+        Self {
+            expression: self.expression.child(field),
+            ..self
+        }
+    }
 }
 
 impl Realization {
-    pub(super) const fn root(seed: u64) -> Self {
-        Self { seed, scope: 0 }
+    pub(super) fn root(seed: u64) -> Self {
+        Self {
+            seed,
+            scope: 0,
+            identity: Some(Identity::root(b"solver/lexical-root")),
+            prepared: None,
+        }
     }
 
-    pub(super) const fn child(self, index: u64) -> Self {
+    pub(super) fn child(self, index: u64, name: Option<&str>) -> Self {
         Self {
             seed: self.seed,
             scope: mix(self.scope ^ mix(index)),
+            identity: self.identity.zip(name).map(|(parent, name)| {
+                parent
+                    .child(b"instance")
+                    .child(name.to_ascii_lowercase().as_bytes())
+            }),
+            prepared: None,
         }
+    }
+
+    pub(super) fn site(self, kind: &[u8], name: &str) -> Option<PreparedSite> {
+        let occurrence = self
+            .identity?
+            .child(kind)
+            .child(name.to_ascii_lowercase().as_bytes());
+        Some(PreparedSite {
+            expression: occurrence,
+            occurrence,
+            lot: None,
+        })
+    }
+
+    pub(super) const fn at(self, prepared: Option<PreparedSite>) -> Self {
+        Self { prepared, ..self }
     }
 
     pub(super) const fn sampler(self, location: &SourceLoc) -> Sampler<'_> {
@@ -54,6 +109,48 @@ pub(crate) struct Sampler<'a> {
 }
 
 impl Sampler<'_> {
+    /// Prepared laws are sampled only in an explicitly bound source site.
+    /// The declaration-local ordinal is decoded by the shared kernel.
+    pub(crate) fn sample_prepared(
+        &self,
+        name: &str,
+        args: &[Real],
+        expression: Option<Identity>,
+        location: &SourceLoc,
+    ) -> SpiceResult<Real> {
+        let site = self.realization.prepared.ok_or_else(|| {
+            SpiceError::parse(
+                location.clone(),
+                "prepared statistical call has no bound declaration occurrence",
+            )
+        })?;
+        let expression = expression.ok_or_else(|| {
+            SpiceError::parse(
+                location.clone(),
+                "prepared statistical call has no static expression identity",
+            )
+        })?;
+        let (invocation, law) = Invocation::decode(name, args)
+            .map_err(|error| SpiceError::parse(location.clone(), error.to_string()))?;
+        invocation
+            .sample(
+                law,
+                Site {
+                    expression: expression.bytes(),
+                    occurrence: site.occurrence.bytes(),
+                    lot: site
+                        .lot
+                        .as_ref()
+                        .map(|identity| identity.bytes().as_slice()),
+                },
+            )
+            .map_err(|error| SpiceError::parse(location.clone(), error.to_string()))
+    }
+
+    pub(crate) const fn prepared_site(&self) -> Option<PreparedSite> {
+        self.realization.prepared
+    }
+
     fn key(&self) -> u64 {
         if let Some(key) = self.key.get() {
             return key;

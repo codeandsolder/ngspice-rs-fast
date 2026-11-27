@@ -1,5 +1,6 @@
 //! Reusable structural parameter scheduling and isolated candidate values.
 
+use super::statistics::PreparedSite;
 use super::{
     Bindings, DefinitionState, DependencyReference, EvalBudget, Failure, FunctionScope,
     ParamBinding, ParamScope, ParamState, RefScan, ScopeDefinitions, collect_definitions,
@@ -54,9 +55,14 @@ pub struct BoundExpression {
     scope: ParameterScopeId,
     direct: HashMap<String, usize>,
     inputs: Vec<usize>,
+    statistical: Option<PreparedSite>,
 }
 
 impl BoundExpression {
+    pub(crate) const fn at(mut self, site: Option<PreparedSite>) -> Self {
+        self.statistical = site;
+        self
+    }
     /// The indexes in [`ParameterPlan::inputs`] that may affect this site.
     #[must_use = "the indexes identify which candidate coordinates can affect this expression"]
     pub fn inputs(&self) -> &[usize] {
@@ -102,6 +108,8 @@ impl BoundExpression {
 pub struct ParameterScopeSpec<'a> {
     /// Parent parameter scope, if any.
     pub parent: Option<ParameterScopeId>,
+    /// Stable physical X-instance name within the parent (none for root).
+    pub instance: Option<&'a str>,
     /// Lexically visible functions; pass the definition's function scope for instances.
     pub functions: Option<Arc<FunctionScope>>,
     /// Pre-evaluated formal or instance bindings.
@@ -313,6 +321,7 @@ impl ParameterPlan {
             scope,
             direct,
             inputs,
+            statistical: None,
         })
     }
 
@@ -391,6 +400,7 @@ impl ParameterPlan {
             definitions,
             sequence,
             budget,
+            spec.instance,
         )?);
         for (node, entry) in nodes.iter_mut().zip(baseline.entries()) {
             if let ParamState::Resolved(value) = entry.state {
@@ -628,7 +638,7 @@ impl CandidateParameters<'_> {
                     .and_then(|&index| self.values[index])
             },
             baseline.functions.as_deref(),
-            baseline.realization,
+            baseline.realization.at(bound.statistical),
             budget,
         )
         .map_err(Failure::into_error)

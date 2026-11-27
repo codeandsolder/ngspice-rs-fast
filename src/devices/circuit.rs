@@ -163,6 +163,9 @@ pub struct Circuit {
     mutual_limits: MutualLimits,
     elaboration_limits: ElaborationLimits,
     binned_deck: Option<Arc<BinnedDeck>>,
+    prepared_node_initializations:
+        BTreeMap<NodeId, crate::devices::passive_bias::NodeInitialization>,
+    prepared_initialization_analyses: Option<BTreeSet<(crate::primitives::AnalysisKind, bool)>>,
     pub(super) runtime: CircuitRuntime,
 }
 
@@ -183,6 +186,7 @@ struct TopologyBindings {
     state_len: usize,
     stochastic_sources: Vec<usize>,
     prepared_devices: Vec<usize>,
+    native_mixed: Option<crate::analysis::digital::NativeTopology>,
     mutual: MutualBinding,
     identity: Option<TopologyId>,
 }
@@ -214,6 +218,7 @@ pub(super) struct CircuitRuntime {
     carried_state: std::cell::RefCell<Option<StateSnapshot>>,
     continuation_diagonal: std::cell::Cell<Real>,
     completed: Vec<crate::primitives::AnalysisKind>,
+    last_digital_stats: Option<crate::analysis::digital::Stats>,
     final_transient: std::cell::RefCell<Option<StateSnapshot>>,
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
@@ -1370,6 +1375,140 @@ impl Circuit {
         }
     }
 
+    fn apply_prepared_waveforms(
+        &mut self,
+        waveforms: Vec<(String, crate::devices::prepared_waveform::PreparedForcing)>,
+    ) -> SpiceResult<()> {
+        if waveforms.is_empty() {
+            return Ok(());
+        }
+        let mut prepared = BTreeMap::new();
+        for (name, forcing) in waveforms {
+            if prepared.insert(name, forcing).is_some() {
+                return Err(SpiceError::circuit("duplicate expanded prepared waveform"));
+            }
+        }
+        for device in &mut self.devices {
+            if let Some(forcing) = prepared.remove(device.name()) {
+                let source = (&mut *device.device as &mut dyn std::any::Any)
+                    .downcast_mut::<crate::devices::IndependentSource>()
+                    .ok_or_else(|| {
+                        SpiceError::circuit(
+                            "prepared waveform identity is not an independent source",
+                        )
+                    })?;
+                source.bind_prepared(forcing)?;
+            }
+        }
+        if !prepared.is_empty() {
+            return Err(SpiceError::circuit("unbound expanded prepared waveform"));
+        }
+        Ok(())
+    }
+
+    fn apply_prepared_initializations(
+        &mut self,
+        bound: crate::netlist::prepared_initialization::BoundInitializations,
+    ) -> SpiceResult<()> {
+        self.prepared_initialization_analyses = bound.analyses;
+        if !bound.devices.is_empty() {
+            let names = self.validate_topology()?;
+            for (name, policy) in bound.devices {
+                let index = names.get(&name).ok_or_else(|| {
+                    SpiceError::circuit(format!("unknown prepared passive occurrence {name}"))
+                })?;
+                self.devices[index]
+                    .device
+                    .bind_passive_initialization(policy)?;
+            }
+            self.invalidate_topology();
+        }
+        for (name, policy) in bound.nodes {
+            self.bind_node_initialization(&name, policy)?;
+        }
+        Ok(())
+    }
+
+    /// Bind a fully resolved source-prepared passive occurrence before
+    /// any analysis or observation plan is constructed. Ordinary decks do
+    /// not install these equations.
+    ///
+    /// # Errors
+    /// Unknown device or incompatible physical storage family.
+    pub fn bind_passive_initialization(
+        &mut self,
+        name: &str,
+        policy: crate::devices::passive_bias::PassiveInitialization,
+    ) -> SpiceResult<()> {
+        let index = self
+            .devices
+            .iter()
+            .position(|device| device.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                SpiceError::circuit(format!("unknown prepared passive occurrence {name}"))
+            })?;
+        self.devices[index]
+            .device
+            .bind_passive_initialization(policy)?;
+        self.invalidate_topology();
+        Ok(())
+    }
+
+    /// Bind a source-prepared voltage hint to its resolved node. The first
+    /// declaration targeting the same physical node wins.
+    ///
+    /// # Errors
+    /// An unknown node or ground.
+    pub fn bind_node_initialization(
+        &mut self,
+        name: &str,
+        policy: crate::devices::passive_bias::NodeInitialization,
+    ) -> SpiceResult<()> {
+        let node = self
+            .nodes
+            .get(name)
+            .filter(|node| *node != NodeId::GROUND)
+            .ok_or_else(|| SpiceError::circuit(format!("invalid prepared node hint {name}")))?;
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.prepared_node_initializations.entry(node)
+        {
+            entry.insert(policy);
+            self.invalidate_topology();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_prepared_analysis(
+        &self,
+        kind: crate::primitives::AnalysisKind,
+        uic: bool,
+    ) -> SpiceResult<()> {
+        if self
+            .prepared_initialization_analyses
+            .as_ref()
+            .is_some_and(|analyses| !analyses.contains(&(kind, uic)))
+        {
+            return Err(SpiceError::circuit(format!(
+                "prepared initialization was not bound for {} (uic={uic}); elaborate the requested analysis first",
+                kind.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_prepared_bias(&self) -> bool {
+        !self.prepared_node_initializations.is_empty()
+            || self.devices.iter().any(|device| device.has_passive_bias())
+    }
+
+    pub(crate) fn prepared_node_hints(
+        &self,
+    ) -> impl Iterator<Item = (NodeId, &crate::devices::passive_bias::NodeInitialization)> {
+        self.prepared_node_initializations
+            .iter()
+            .map(|(&node, policy)| (node, policy))
+    }
+
     /// Number of device instances.
     #[must_use = "the device count determines the size of per-instance workspaces"]
     pub const fn device_count(&self) -> usize {
@@ -1525,6 +1664,7 @@ impl Circuit {
             .zip(&self.bindings.branch_rows)
             .any(|(device, rows)| {
                 !device.constitutive_nodes().is_empty()
+                    || device.has_passive_bias()
                     || (0..rows.len())
                         .any(|local| device.branch_quantity(local) != BranchQuantity::Current)
             });
@@ -1978,6 +2118,31 @@ impl Circuit {
         result
     }
 
+    pub(crate) fn prepare_native_mixed(
+        &mut self,
+    ) -> SpiceResult<Option<crate::analysis::digital::MixedSignal>> {
+        self.finalize()?;
+        self.runtime.last_digital_stats = None;
+        self.bindings
+            .native_mixed
+            .as_ref()
+            .map(crate::analysis::digital::NativeTopology::start)
+            .transpose()
+    }
+
+    /// Accepted event work from the most recent successful native mixed analysis.
+    #[must_use]
+    pub const fn last_digital_stats(&self) -> Option<crate::analysis::digital::Stats> {
+        self.runtime.last_digital_stats
+    }
+
+    pub(crate) const fn record_digital_stats(
+        &mut self,
+        stats: Option<crate::analysis::digital::Stats>,
+    ) {
+        self.runtime.last_digital_stats = stats;
+    }
+
     fn prepare_topology(&mut self) -> SpiceResult<()> {
         // Validate graph before any predecessor binding or numbering mutation.
         self.elaboration_limits
@@ -2014,6 +2179,10 @@ impl Circuit {
             .copied()
             .filter(|&index| self.devices[index].prepared_batch_key().is_some())
             .collect();
+        self.bindings.native_mixed = crate::devices::code_model::source::mixed_topology(
+            &self.devices,
+            self.elaboration_limits,
+        )?;
         self.bindings.names = names;
         self.bindings.identity = Some(TopologyId::allocate()?);
         Ok(())
@@ -2083,6 +2252,11 @@ impl Circuit {
     /// (C sets a circuit up once).
     fn allocate_matrix(&mut self, order: Vec<usize>) -> SpiceResult<()> {
         let mut elements = self.ordered_elements(&order, 0)?;
+        elements.extend(
+            self.prepared_node_initializations
+                .keys()
+                .filter_map(|&node| self.bindings.unknowns.node_row(node).map(|row| (row, row))),
+        );
         if let Some(rows) = &self.bindings.regularization_nodes {
             elements.extend(rows.iter().map(|&row| (row, row)));
         }
@@ -3009,6 +3183,7 @@ impl Circuit {
             reltol: request.model_context.reltol,
             frequency: request.model_context.frequency,
             mode: request.mode,
+            bias_analysis: request.model_context.bias_analysis,
             branches: self.bindings.branch_rows[index].clone(),
             controls: self.controls(index)?,
             mutual: mutual.get(index).map_or(&[], Vec::as_slice),
@@ -3479,6 +3654,18 @@ impl Circuit {
             .fixed_stamps
             .replace(unlent.unwrap_or_else(|| matrix.return_fixed()));
         stamped?;
+        if request.mode.is_bias()
+            && let Some(analysis) = request.model_context.bias_analysis
+        {
+            for (&node, policy) in &self.prepared_node_initializations {
+                let row = self
+                    .bindings
+                    .unknowns
+                    .checked_node_row(node)?
+                    .ok_or_else(|| SpiceError::circuit("prepared node bias has no physical row"))?;
+                policy.stamp(analysis, row, matrix, rhs)?;
+            }
+        }
         self.learn_pattern(matrix)?;
         matrix.record_trace()?;
         Ok(())
@@ -3528,6 +3715,7 @@ impl Circuit {
                 reltol: request.model_context.reltol,
                 frequency: request.model_context.frequency,
                 mode: request.mode,
+                bias_analysis: request.model_context.bias_analysis,
                 branches: self.bindings.branch_rows[index].clone(),
                 controls: self.controls(index)?,
                 mutual: mutual.get(index).map_or(&[], Vec::as_slice),
@@ -4706,6 +4894,7 @@ impl Circuit {
                 ..Default::default()
             });
         let mut circuit = Self {
+            nodes: NodeTable::with_auto_gnd(netlist.auto_gnd),
             mutual_limits,
             elaboration_limits,
             ..Self::default()
@@ -4715,26 +4904,26 @@ impl Circuit {
         setup.noise_analysis = netlist
             .analyses
             .iter()
-            .any(|card| card.kind == crate::primitives::AnalysisKind::Noise);
+            .any(|card| card.kind == crate::primitives::AnalysisKind::Noise)
+            || expanded
+                .prepared_initialization
+                .analyses
+                .as_ref()
+                .is_some_and(|analyses| {
+                    analyses.contains(&(crate::primitives::AnalysisKind::Noise, false))
+                });
         circuit.add_instances(&expanded.devices, &models, &setup)?;
-        let mut prepared: BTreeMap<_, _> = expanded.prepared_waveforms.into_iter().collect();
-        if !prepared.is_empty() {
-            for device in &mut circuit.devices {
-                if let Some(forcing) = prepared.remove(device.name()) {
-                    let source = (&mut *device.device as &mut dyn std::any::Any)
-                        .downcast_mut::<crate::devices::IndependentSource>()
-                        .ok_or_else(|| {
-                            SpiceError::circuit(
-                                "prepared waveform identity is not an independent source",
-                            )
-                        })?;
-                    source.bind_prepared(forcing)?;
-                }
-            }
-            if !prepared.is_empty() {
-                return Err(SpiceError::circuit("unbound expanded prepared waveform"));
-            }
-        }
+        let binned_deck = BinnedDeck::capture(
+            &expanded.devices,
+            &expanded.models,
+            &models,
+            setup.noise_analysis,
+            &expanded.prepared_initialization,
+            &expanded.prepared_waveforms,
+        )
+        .map(Arc::new);
+        circuit.apply_prepared_waveforms(expanded.prepared_waveforms)?;
+        circuit.apply_prepared_initializations(expanded.prepared_initialization)?;
         circuit.add_topology_shunts(setup.shunts)?;
         let referenced: BTreeSet<_> = expanded
             .devices
@@ -4745,11 +4934,10 @@ impl Circuit {
             .flat_map(|name| models.declarations_for(name))
             .map(|card| card.name.to_ascii_lowercase())
             .collect();
-        if let Some(model) = netlist
-            .models
-            .iter()
-            .find(|model| !referenced.contains(&model.name.to_ascii_lowercase()))
-        {
+        if let Some(model) = netlist.models.iter().find(|model| {
+            let name = model.name.to_ascii_lowercase();
+            !referenced.contains(&name) && !expanded.statistical_model_origins.contains(&name)
+        }) {
             // First-declaration duplicate policy remains explicit; unused
             // declarations cannot silently discard unsupported physics. A root
             // model shadowed only inside a subcircuit body is unused by this
@@ -4762,13 +4950,7 @@ impl Circuit {
         circuit.finalize()?;
         // Reject an invalid inductive system (K coupling) before any analysis.
         circuit.prepared_mutual_terms(context)?;
-        circuit.binned_deck = BinnedDeck::capture(
-            &expanded.devices,
-            &expanded.models,
-            &models,
-            setup.noise_analysis,
-        )
-        .map(Arc::new);
+        circuit.binned_deck = binned_deck;
         Ok(circuit)
     }
 

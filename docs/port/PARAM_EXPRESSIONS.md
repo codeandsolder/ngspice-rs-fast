@@ -334,3 +334,23 @@ Native realizations are deterministic and distribution-equivalent,
 not bitwise matches for C's global RNG sequence or its six-significant-
 digit B-card text substitution. The native sampler retains full
 binary64 precision before ordinary numparam serialization.
+
+### Prepared statistical calls
+
+The reserved `simetrix_stat_` marker family uses the shared public
+`model-statistics` distribution kernel. Its six metadata operands carry
+exact unsigned 32-bit words for the seed, sample and source-call ordinal.
+These are decoded before device material preparation; ordinary native
+statistical functions keep their existing semantics.
+
+Prepared calls use stable declaration names, field identities, static macro
+call paths and physical occurrence identities, not numerical values or
+statement traversal order. Model fields are realized in the defining
+lexical scope after the referencing physical occurrence is known. Lot
+variants share the actual bound model declaration owner; a call without
+a model owner is rejected rather than assigned an arbitrary lot. Model
+bin groups retain their geometry selection. A changed candidate preserves
+the draw identity, and independent circuit preparations share no mutable
+random state. Numerical kernels consume only realized values. Reference
+comparisons with C ngspice use the realized numeric deck, not the reserved
+marker syntax.

@@ -190,7 +190,7 @@ fn scope_order_forward_models_and_nested_scopes() {
             ScopedCardKind::End
         ]
     );
-    let expected = "t\nx0 a 0 outer k=2 k={base*2}\n\
+    let expected = "t\nx0 a gnd outer k=2 k={base*2}\n\
         .subckt outer a b params: k=1k k=base\n  .model dm d\n  x1 a b inner t='k + 1'\n\
         \x20 .subckt inner 1 0\n    d1 1 0 dm\n  .ends inner\n  r1 a b 1k\n  .param local={k*2} z=3\n.ends outer\n\
         .subckt inner a b\n  r9 a b 1\n.ends inner\n.op\n.end\n";

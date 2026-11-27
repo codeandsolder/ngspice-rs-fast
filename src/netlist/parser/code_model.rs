@@ -1,8 +1,6 @@
-//! Scalar XSPICE analog ports and model-bound code-model instances.
-//! The declared model selects the backend at elaboration; other code models
-//! do not acquire rational-transfer semantics merely by using an A card.
-use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
-use crate::netlist::token::TokenKind;
+//! Ordered, model-independent XSPICE A-instance ports.
+use crate::netlist::ast::{CodePort, CodePortKind, CodeTerminal, DeviceInstance};
+use crate::netlist::token::{Token, TokenKind};
 use winnow::Parser as _;
 use winnow::combinator::{cut_err, opt};
 use winnow::token::any;
@@ -13,65 +11,130 @@ use super::syntax::{canonical_node, malformed, name, named_device, punctuation};
 pub(super) fn code_model_card(input: &mut Input<'_>) -> Result<ParsedCard> {
     let (instance, designator) = named_device("a").parse_next(input)?;
     cut_err(|input: &mut Input<'_>| {
-        let (input_nodes, input_mode) = port(input, "input")?;
-        let (output_nodes, output_mode) = port(input, "output")?;
-        let model = name("code model name").parse_next(input)?;
+        let schema = input
+            .input
+            .last()
+            .and_then(|token| input.state.declared_models.code_model(&token.text));
+        let mut ports = Vec::new();
+        while input.input.len() > 1 {
+            let default = schema
+                .and_then(|schema| schema.ports().get(ports.len()))
+                .map_or(CodePortKind::Default, |port| port.default);
+            ports.push(port(input, default)?);
+        }
+        if ports.is_empty() {
+            return Err(malformed(input, "A instance requires at least one port"));
+        }
+        let model = terminal_name(input)?;
         Ok(ParsedCard::Device(DeviceInstance {
             name: instance.text.to_ascii_lowercase(),
             designator,
-            nodes: output_nodes.into_iter().chain(input_nodes).collect(),
+            nodes: Vec::new(),
+            code_ports: ports,
             model: Some(model.text.to_ascii_lowercase()),
-            parameters: vec![input_mode, output_mode],
+            parameters: Vec::new(),
             location: instance.location.clone(),
         }))
     })
     .parse_next(input)
 }
 
-fn port(input: &mut Input<'_>, direction: &str) -> Result<([String; 2], ParameterAssignment)> {
+fn marker(input: &mut Input<'_>, spelling: &str) -> Result<()> {
+    any.verify(|token: &Token| token.text == spelling)
+        .void()
+        .parse_next(input)
+}
+
+fn terminal_name<'a>(input: &mut Input<'a>) -> Result<&'a Token> {
+    let token = name("code model terminal or model name").parse_next(input)?;
+    if matches!(token.text.as_str(), "[" | "]" | "~") || token.text.starts_with('%') {
+        return Err(malformed(input, "invalid code model name"));
+    }
+    Ok(token)
+}
+
+fn port_type(input: &mut Input<'_>, default: CodePortKind) -> Result<CodePortKind> {
     let token = input
         .input
         .first()
         .ok_or_else(|| malformed(input, "missing code model port"))?;
-    let spelling = token.text.to_ascii_lowercase();
-    let (current, differential, explicit) = match spelling.as_str() {
-        "%v" => (false, false, true),
-        "%vd" => (false, true, true),
-        "%i" => (true, false, true),
-        "%id" => (true, true, true),
-        _ if spelling.starts_with('%') => {
-            return Err(malformed(input, "unsupported analog port type"));
+    let kind = match token.text.to_ascii_lowercase().as_str() {
+        "%v" => CodePortKind::Voltage,
+        "%vd" => CodePortKind::VoltageDifferential,
+        "%i" => CodePortKind::Current,
+        "%id" => CodePortKind::CurrentDifferential,
+        "%d" => CodePortKind::Digital,
+        "%g" => CodePortKind::Conductance,
+        "%gd" => CodePortKind::ConductanceDifferential,
+        value if value.starts_with('%') => {
+            return Err(malformed(input, "unsupported code model port type"));
         }
-        _ => (false, false, false),
+        _ => CodePortKind::Default,
     };
-    let location = token.location.clone();
-    if explicit {
-        any.parse_next(input)?;
-        punctuation(TokenKind::LParen)
-            .context("'(' after port type")
-            .parse_next(input)?;
-    }
-    let positive = name("positive analog port node").parse_next(input)?;
-    let positive = canonical_node(positive, input.state.auto_gnd);
-    let negative = if differential {
-        opt(punctuation(TokenKind::Comma)).parse_next(input)?;
-        let negative = name("negative analog port node").parse_next(input)?;
-        canonical_node(negative, input.state.auto_gnd)
+    if kind == CodePortKind::Default {
+        Ok(default)
     } else {
-        "0".to_owned()
-    };
-    if explicit {
-        punctuation(TokenKind::RParen)
-            .context("')' after port nodes")
-            .parse_next(input)?;
+        any.parse_next(input)?;
+        Ok(kind)
     }
-    Ok((
-        [positive, negative],
-        ParameterAssignment {
-            name: direction.to_owned(),
-            value: if current { "current" } else { "voltage" }.to_owned(),
-            kind: ParameterKind::Textual,
-            location,
-        },
-    ))
+}
+
+fn port(input: &mut Input<'_>, default: CodePortKind) -> Result<CodePort> {
+    let mut kind = port_type(input, default)?;
+    let vector = opt(|input: &mut Input<'_>| marker(input, "["))
+        .parse_next(input)?
+        .is_some();
+    let terminals = if vector {
+        let mut terminals = Vec::new();
+        while input.input.first().is_some_and(|token| token.text != "]") {
+            if !terminals.is_empty() {
+                opt(punctuation(TokenKind::Comma)).parse_next(input)?;
+            }
+            kind = port_type(input, kind)?;
+            terminals.push(element(input, kind)?);
+        }
+        marker(input, "]")?;
+        if terminals.is_empty() {
+            return Err(malformed(input, "empty code model vector"));
+        }
+        terminals
+    } else {
+        vec![element(input, kind)?]
+    };
+    Ok(CodePort { vector, terminals })
+}
+
+fn element(input: &mut Input<'_>, kind: CodePortKind) -> Result<CodeTerminal> {
+    let grouped = opt(punctuation(TokenKind::LParen))
+        .parse_next(input)?
+        .is_some();
+    let inverted = opt(|input: &mut Input<'_>| marker(input, "~"))
+        .parse_next(input)?
+        .is_some();
+    if inverted && !matches!(kind, CodePortKind::Digital | CodePortKind::Default) {
+        return Err(malformed(input, "inverted analog terminal"));
+    }
+    let node = |token: &Token, auto_gnd| {
+        if matches!(kind, CodePortKind::Digital | CodePortKind::Default) {
+            token.text.to_ascii_lowercase()
+        } else {
+            canonical_node(token, auto_gnd)
+        }
+    };
+    let positive = node(terminal_name(input)?, input.state.auto_gnd);
+    let negative = if kind.differential() {
+        opt(punctuation(TokenKind::Comma)).parse_next(input)?;
+        Some(node(terminal_name(input)?, input.state.auto_gnd))
+    } else {
+        None
+    };
+    if grouped {
+        punctuation(TokenKind::RParen).parse_next(input)?;
+    }
+    Ok(CodeTerminal {
+        kind,
+        positive,
+        negative,
+        inverted,
+    })
 }

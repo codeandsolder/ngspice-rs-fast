@@ -118,6 +118,14 @@ pub struct TransientStats {
     pub max_step: Real,
     /// Observed transient-attempt and LTRA preparation work.
     pub ltra: crate::devices::ltra::LtraWork,
+    /// Probes of opt-in device-local event sources at accepted states.
+    pub device_event_boundary_probes: usize,
+    /// Converged candidate probes of opt-in device event sources.
+    pub device_event_trial_probes: usize,
+    /// Rejected trials localized to a device crossing.
+    pub device_event_retries: usize,
+    /// Accepted landings on previously scheduled device boundaries.
+    pub device_event_landings: usize,
 }
 
 /// Convergence and truncation tolerances. `vntol` applies to node voltages and
@@ -659,6 +667,15 @@ struct CandidateOutput {
     periodic_boundary: Option<Box<PeriodicBoundary>>,
 }
 
+/// Converged point with all fallible observations and mixed-domain
+/// preparation complete, ready to publish after releasing trial borrows.
+struct AcceptedCandidate {
+    output: CandidateOutput,
+    mixed: Option<super::digital::MixedPoint>,
+    solution: Vector,
+    state: TrialState,
+}
+
 struct AcceptedPoint {
     cursor: AcceptedCursor,
     solution: Vector,
@@ -782,6 +799,11 @@ impl DerivativePredictor {
     }
 }
 
+struct EventDevice<'a> {
+    source: &'a dyn crate::devices::traits::DeviceTransientEvents,
+    rows: std::ops::Range<usize>,
+}
+
 struct Driver<'a> {
     circuit: &'a Circuit,
     prepared: crate::devices::PreparedRun<'a>,
@@ -802,6 +824,7 @@ struct Driver<'a> {
     /// Each device's state rows and the absolute state index of every
     /// charge it hands `CKTterr` (`truncation_slots`), fixed for the run.
     truncation: Vec<TruncationDevice>,
+    event_devices: Vec<EventDevice<'a>>,
     voltage_history: Option<VoltageHistory>,
     stats: TransientStats,
     /// Reuse the ordinary Newton MNA/RHS/trial storage across timepoint
@@ -1050,6 +1073,23 @@ fn truncation_devices(circuit: &Circuit) -> SpiceResult<Vec<TruncationDevice>> {
         .collect()
 }
 
+fn event_devices(circuit: &Circuit) -> SpiceResult<Vec<EventDevice<'_>>> {
+    circuit
+        .devices()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, device)| device.transient_events().map(|source| (index, source)))
+        .map(|(index, source)| {
+            Ok(EventDevice {
+                source,
+                rows: circuit
+                    .state_rows(index)
+                    .ok_or_else(|| failure("missing event device state range"))?,
+            })
+        })
+        .collect()
+}
+
 fn run_transient_inner(
     circuit: &mut Circuit,
     request: &AnalysisPlan,
@@ -1120,6 +1160,16 @@ fn run_transient_inner(
     let branch_row = crate::analysis::bias::branch_rows(circuit);
     let limited_rows = crate::analysis::bias::limited_rows(circuit);
     let truncation = truncation_devices(circuit)?;
+    let event_devices = event_devices(circuit)?;
+    // A timed receiver must not miss a whole pulse because the ordinary
+    // analog breakpoint table coalesced its two known source corners.
+    let physical_events = (!event_devices.is_empty())
+        .then(|| {
+            system
+                .breakpoints_in(0., settings.stop)
+                .map(Iterator::peekable)
+        })
+        .transpose()?;
     let driver = Driver {
         circuit,
         prepared: circuit.prepare_run(),
@@ -1135,6 +1185,7 @@ fn run_transient_inner(
         branch_row,
         limited_rows,
         truncation,
+        event_devices,
         voltage_history: settings
             .voltage_lte
             .map(|options| VoltageHistory::new(circuit, options)),
@@ -1144,7 +1195,7 @@ fn run_transient_inner(
         index_aware: false,
         derivative_order: std::cell::Cell::new(2),
         derivative_predictor: std::cell::RefCell::new(None),
-        physical_events: None,
+        physical_events,
     };
     driver.run(purpose, sink)
 }
@@ -1291,7 +1342,7 @@ impl Driver<'_> {
                     &mut point,
                 )?;
             }
-            let exact_stop = self.index_aware || sources.has_exact();
+            let exact_stop = self.physical_events.is_some() || sources.has_exact();
             if (exact_stop && time >= stop) || (!exact_stop && almost_equal_ulps(time, stop, 100)) {
                 break;
             }
@@ -1508,6 +1559,94 @@ impl Driver<'_> {
         Ok(None)
     }
 
+    /// Cold-indexed event sources probe only accepted local state; no
+    /// per-device scan or additional event queue in the analog-only path.
+    fn next_device_boundary(&self, time: Real) -> SpiceResult<Option<Real>> {
+        if self.event_devices.is_empty() {
+            return Ok(None);
+        }
+        let history = self
+            .history
+            .accepted(1)
+            .ok_or_else(|| failure("missing accepted event state"))?;
+        let mut next = None::<Real>;
+        for event in &self.event_devices {
+            let slots = history
+                .get(event.rows.clone())
+                .ok_or_else(|| failure("invalid event state window"))?;
+            if let Some(at) = event.source.next_boundary(slots)? {
+                if !at.is_finite() || at <= time {
+                    return Err(failure("invalid device event boundary"));
+                }
+                next = Some(next.map_or(at, |prior| prior.min(at)));
+            }
+        }
+        Ok(next)
+    }
+
+    fn refine_device_events(
+        &self,
+        solution: &Vector,
+        state: &mut TrialState,
+        time: Real,
+    ) -> SpiceResult<Option<Real>> {
+        if self.event_devices.is_empty() {
+            return Ok(None);
+        }
+        let history = self
+            .history
+            .accepted(1)
+            .ok_or_else(|| failure("missing accepted event state"))?;
+        let mut next = None::<Real>;
+        for event in &self.event_devices {
+            let context = crate::devices::traits::TransientEventContext {
+                accepted: history
+                    .get(event.rows.clone())
+                    .ok_or_else(|| failure("invalid event state window"))?,
+                time,
+                solution,
+                unknowns: self.circuit.unknowns(),
+            };
+            if let Some(at) = self
+                .history
+                .edit_candidate(state, event.rows.clone(), |slots| {
+                    event.source.refine_trial(&context, slots)
+                })?
+            {
+                if !at.is_finite() || at > time {
+                    return Err(failure("invalid device crossing time"));
+                }
+                next = Some(next.map_or(at, |prior| prior.min(at)));
+            }
+        }
+        Ok(next)
+    }
+
+    fn device_retry(
+        &self,
+        attempt: &AttemptedStep,
+        solution: &Vector,
+        state: &mut TrialState,
+    ) -> SpiceResult<Option<NextStep>> {
+        let time = attempt.clock.time;
+        let min_step = self.settings.min_step();
+        if let Some(at) = self.refine_device_events(solution, state, time)?
+            && time - at > min_step
+        {
+            let start = attempt
+                .event_start
+                .unwrap_or(time - attempt.clock.next.delta);
+            let delta = (at - start).max(min_step).max(start.next_up() - start);
+            if delta < attempt.clock.next.delta {
+                return Ok(Some(NextStep {
+                    delta,
+                    order: Order::One,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     fn prepare_mixed_point(
         &self,
         solution: &Vector,
@@ -1557,6 +1696,16 @@ impl Driver<'_> {
         self.index_aware && attempt.event_start.is_some() && attempt.clock.time < self.settings.stop
     }
 
+    fn check_step_budget(&self, time: Real) -> SpiceResult<()> {
+        if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
+            return Err(failure(format!(
+                "work limit of {} accepted + rejected steps reached at t = {time:e}",
+                self.settings.max_steps
+            )));
+        }
+        Ok(())
+    }
+
     /// Advance through rejected trials. Only Newton's starting iterate moves
     /// between attempts; device and integration histories remain accepted-only.
     fn advance(
@@ -1567,14 +1716,15 @@ impl Driver<'_> {
     ) -> SpiceResult<AcceptedPoint> {
         let min_step = self.settings.min_step();
         let physical_event = self.next_physical_event(ready.clock.time);
+        let device_boundary = self.next_device_boundary(ready.clock.time)?;
+        self.stats.device_event_boundary_probes += self.event_devices.len();
         loop {
-            if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
-                return Err(failure(format!(
-                    "work limit of {} accepted + rejected steps reached at t = {:e}",
-                    self.settings.max_steps, ready.clock.time
-                )));
-            }
-            if let Some(event) = physical_event {
+            self.check_step_budget(ready.clock.time)?;
+            if let Some(event) = physical_event
+                .into_iter()
+                .chain(device_boundary)
+                .reduce(Real::min)
+            {
                 ready.limit_to_event(event);
             }
             let preview = self.preview_events(&mut ready)?;
@@ -1606,13 +1756,24 @@ impl Driver<'_> {
                     drop(prepared);
                     ready = attempt.retry(next, min_step)?;
                 }
-                Trial::Converged { x, state } => {
+                Trial::Converged { x, mut state } => {
                     if let Some(next) = self.mixed_retry(&attempt, &x)? {
                         iterate = x;
                         self.stats.rejected += 1;
                         drop(prepared);
                         ready = attempt.retry(next, min_step)?;
                         ready.boundary = Boundary::Forced;
+                        continue;
+                    }
+                    self.stats.device_event_trial_probes += self.event_devices.len();
+                    if let Some(next) = self.device_retry(&attempt, &x, &mut state)? {
+                        iterate = x;
+                        self.stats.rejected += 1;
+                        self.stats.device_event_retries += 1;
+                        drop(prepared);
+                        ready = attempt.retry(next, min_step)?;
+                        ready.boundary = Boundary::Forced;
+                        ready.limit_to_event(ready.clock.time + ready.clock.next.delta);
                         continue;
                     }
                     let decision =
@@ -1627,46 +1788,79 @@ impl Driver<'_> {
                             ready = attempt.retry(next, min_step)?;
                         }
                         StepDecision::Accept(mut next) => {
-                            let event = self.crosses_physical_event(&attempt);
-                            let (x, state) = if event {
-                                next.order = Order::One;
-                                self.derivative_event(&attempt, &x, &state)?
-                            } else {
-                                (x, state)
-                            };
-                            let mixed_point =
-                                self.prepare_mixed_point(&x, attempt.clock.time, preview)?;
-                            let CandidateOutput {
-                                observed,
-                                periodic_boundary,
-                            } = self.candidate_output(
+                            let candidate = self.prepare_accepted_candidate(
                                 &attempt,
                                 &mut prepared,
-                                &x,
-                                &state,
+                                (x, state),
                                 &output,
+                                preview,
+                                &mut next,
                             )?;
                             // Release immutable history before publication.
                             drop(prepared);
-                            let device_breaks =
-                                self.commit_point(Acceptance::Step(&attempt), &x, state)?;
-                            self.commit_mixed_point(mixed_point);
-                            if event {
-                                self.history.restart_integration()?;
-                                self.steps.clear();
-                            }
-                            return Ok(AcceptedPoint {
-                                cursor: attempt.accept(next),
-                                solution: x,
-                                observed,
-                                device_breaks,
-                                periodic_boundary,
-                            });
+                            return self.commit_candidate(
+                                attempt,
+                                next,
+                                candidate,
+                                device_boundary,
+                            );
                         }
                     }
                 }
             }
         }
+    }
+
+    fn prepare_accepted_candidate(
+        &self,
+        attempt: &AttemptedStep,
+        prepared: &mut crate::devices::circuit::PreparedTransient<'_>,
+        (x, state): (Vector, TrialState),
+        output: &OutputSelection<'_>,
+        preview: Option<super::digital::EventPreview>,
+        next: &mut NextStep,
+    ) -> SpiceResult<AcceptedCandidate> {
+        let (x, state) = if self.crosses_physical_event(attempt) {
+            next.order = Order::One;
+            self.derivative_event(attempt, &x, &state)?
+        } else {
+            (x, state)
+        };
+        Ok(AcceptedCandidate {
+            mixed: self.prepare_mixed_point(&x, attempt.clock.time, preview)?,
+            output: self.candidate_output(attempt, prepared, &x, &state, output)?,
+            solution: x,
+            state,
+        })
+    }
+
+    fn commit_candidate(
+        &mut self,
+        attempt: AttemptedStep,
+        next: NextStep,
+        candidate: AcceptedCandidate,
+        device_boundary: Option<Real>,
+    ) -> SpiceResult<AcceptedPoint> {
+        let event = self.crosses_physical_event(&attempt);
+        let device_breaks = self.commit_point(
+            Acceptance::Step(&attempt),
+            &candidate.solution,
+            candidate.state,
+        )?;
+        self.commit_mixed_point(candidate.mixed);
+        self.stats.device_event_landings +=
+            usize::from(device_boundary == Some(attempt.clock.time));
+        if event {
+            self.history.restart_integration()?;
+            self.steps.clear();
+        }
+        Ok(AcceptedPoint {
+            cursor: attempt.accept(next),
+            solution: candidate.solution,
+            observed: candidate.output.observed,
+            device_breaks,
+            periodic_boundary: candidate.output.periodic_boundary,
+        })
     }
 
     fn candidate_output(

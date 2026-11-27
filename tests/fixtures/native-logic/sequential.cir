@@ -1,0 +1,94 @@
+Native sequential oracle
+vd d 0 pwl(0 4 2u 4 2.1u 0 4u 0 4.1u 4 7u 4)
+vr r 0 pwl(0 0 3u 0 3.1u 4 5u 4 5.1u 0 7u 0)
+vc c 0 pulse(0 4 1u 20n 20n 0.8u 2u)
+aq7z %v[d r c] eq7z mq7z
+.model mq7z preprocess_logic_event(operation=7 delay=0 inertial=true)
+avq7z eq7z q7z bridge
+rq7z q7z 0 1k
+aq7t %v[d r c] eq7t mq7t
+.model mq7t preprocess_logic_event(operation=7 delay=100n inertial=false)
+avq7t eq7t q7t bridge
+rq7t q7t 0 1k
+aq8z %v[d r c] eq8z mq8z
+.model mq8z preprocess_logic_event(operation=8 delay=0 inertial=true)
+avq8z eq8z q8z bridge
+rq8z q8z 0 1k
+aq8t %v[d r c] eq8t mq8t
+.model mq8t preprocess_logic_event(operation=8 delay=100n inertial=false)
+avq8t eq8t q8t bridge
+rq8t q8t 0 1k
+aq9z %v[d r c] eq9z mq9z
+.model mq9z preprocess_logic_event(operation=9 delay=0 inertial=true)
+avq9z eq9z q9z bridge
+rq9z q9z 0 1k
+aq9t %v[d r c] eq9t mq9t
+.model mq9t preprocess_logic_event(operation=9 delay=100n inertial=false)
+avq9t eq9t q9t bridge
+rq9t q9t 0 1k
+aq10z %v[d r c] eq10z mq10z
+.model mq10z preprocess_logic_event(operation=10 delay=0 inertial=true)
+avq10z eq10z q10z bridge
+rq10z q10z 0 1k
+aq10t %v[d r c] eq10t mq10t
+.model mq10t preprocess_logic_event(operation=10 delay=100n inertial=false)
+avq10t eq10t q10t bridge
+rq10t q10t 0 1k
+aq11z %v[d c] eq11z mq11z
+.model mq11z preprocess_logic_event(operation=11 delay=0 inertial=true)
+avq11z eq11z q11z bridge
+rq11z q11z 0 1k
+aq11t %v[d c] eq11t mq11t
+.model mq11t preprocess_logic_event(operation=11 delay=100n inertial=false)
+avq11t eq11t q11t bridge
+rq11t q11t 0 1k
+aq12z %v[d c] eq12z mq12z
+.model mq12z preprocess_logic_event(operation=12 delay=0 inertial=true)
+avq12z eq12z q12z bridge
+rq12z q12z 0 1k
+aq12t %v[d c] eq12t mq12t
+.model mq12t preprocess_logic_event(operation=12 delay=100n inertial=false)
+avq12t eq12t q12t bridge
+rq12t q12t 0 1k
+aq13z %v[d c] eq13z mq13z
+.model mq13z preprocess_logic_event(operation=13 delay=0 inertial=true)
+avq13z eq13z q13z bridge
+rq13z q13z 0 1k
+aq13t %v[d c] eq13t mq13t
+.model mq13t preprocess_logic_event(operation=13 delay=100n inertial=false)
+avq13t eq13t q13t bridge
+rq13t q13t 0 1k
+aq14z %v[d c] eq14z mq14z
+.model mq14z preprocess_logic_event(operation=14 delay=0 inertial=true)
+avq14z eq14z q14z bridge
+rq14z q14z 0 1k
+aq14t %v[d c] eq14t mq14t
+.model mq14t preprocess_logic_event(operation=14 delay=100n inertial=false)
+avq14t eq14t q14t bridge
+rq14t q14t 0 1k
+aq15z %v[d c] eq15z mq15z
+.model mq15z preprocess_logic_event(operation=15 delay=0 inertial=true)
+avq15z eq15z q15z bridge
+rq15z q15z 0 1k
+aq15t %v[d c] eq15t mq15t
+.model mq15t preprocess_logic_event(operation=15 delay=100n inertial=false)
+avq15t eq15t q15t bridge
+rq15t q15t 0 1k
+aq15i %v[d c] eq15i mq15i
+.model mq15i preprocess_logic_event(operation=15 delay=100n inertial=true)
+avq15i eq15i q15i bridge
+rq15i q15i 0 1k
+aq16z %v[d c] eq16z mq16z
+.model mq16z preprocess_logic_event(operation=16 delay=0 inertial=true)
+avq16z eq16z q16z bridge
+rq16z q16z 0 1k
+aq16t %v[d c] eq16t mq16t
+.model mq16t preprocess_logic_event(operation=16 delay=100n inertial=false)
+avq16t eq16t q16t bridge
+rq16t q16t 0 1k
+aq16i %v[d c] eq16i mq16i
+.model mq16i preprocess_logic_event(operation=16 delay=100n inertial=true)
+avq16i eq16i q16i bridge
+rq16i q16i 0 1k
+.model bridge preprocess_logic_voltage(out_high=5)
+.end
