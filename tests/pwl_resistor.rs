@@ -1,30 +1,60 @@
-//! Prepared PWL resistor segment selection and physical branch identity.
-use std::path::Path;
+//! Prepared physical PWL laws: producer-to-solver qualification against
+//! independent SIMPLIS multiroot observations and analytic load lines.
+use ngspice_rs::analysis::{AnalysisInput, Plot, RunConfig};
+use ngspice_rs::devices::{Circuit, subckt::PreparedDeclarations};
+use ngspice_rs::netlist::{Parser, ast::Netlist};
+use ngspice_rs::primitives::AnalysisKind;
+use ngspice_rs_preprocess::{
+    Cancellation, InputFormat, Options, PreparedBundle, Request, SourceInput, prepare,
+    pwl_resistor::NativeBinding,
+};
+use std::fs;
 
-use ngspice_rs::analysis::{Plot, RunConfig};
-use ngspice_rs::netlist::{Parser, source::parse_deck_text};
-use ngspice_rs::primitives::SpiceResult;
+const VOLTAGE: &str = ".model MR VPWLR NSEG=4 X0=-1 Y0=-1 X1=0 Y1=2 X2=1 Y2=0 X3=2 Y3=2 X4=3 Y4=3";
+const CURRENT: &str = ".model MC IPWLR NSEG=4 X0=-1 Y0=-1 X1=2 Y1=0 X2=0 Y2=1 X3=2 Y3=2 X4=3 Y4=3";
 
-const KNOTS: &str = "nseg=4 x0=-1 y0=-1 x1=0 y1=2 x2=1 y2=0 x3=2 y3=2 x4=3 y4=3";
-const INVERSE_KNOTS: &str = "nseg=4 x0=-1 y0=-1 x1=2 y1=0 x2=0 y2=1 x3=2 y3=2 x4=3 y4=3";
+fn source(body: &str, format: InputFormat) -> anyhow::Result<(Netlist, PreparedBundle)> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("source.cir");
+    fs::write(&path, format!("* prepared PWL\n{body}\n.end\n"))?;
+    let bundle = prepare(
+        &Request {
+            format,
+            input: SourceInput::File(path),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    for artifact in bundle.artifacts() {
+        fs::write(dir.path().join(&artifact.filename), &artifact.bytes)?;
+    }
+    let deck = Parser::new().parse_file(dir.path().join(&bundle.primary.filename))?;
+    Ok((deck, bundle))
+}
 
-fn simulate(body: &str) -> SpiceResult<Vec<Plot>> {
-    let deck = parse_deck_text(
-        Path::new("prepared-pwl.cir"),
-        &format!("test\n{body}\n.end\n"),
-    );
-    let netlist = Parser::new().parse_deck(&deck)?;
-    let config = RunConfig::from_netlist(&netlist)?;
-    let mut circuit = config.circuit(&netlist)?;
-    netlist
-        .analyses
-        .iter()
-        .map(|analysis| {
-            config
-                .plan_for(analysis)?
-                .run(&mut circuit, &config.context())
-        })
-        .collect()
+fn circuit(deck: &Netlist, bundle: &PreparedBundle) -> anyhow::Result<(Circuit, RunConfig)> {
+    let config = RunConfig::from_netlist(deck)?;
+    let circuit = config.prepared_circuit(
+        deck,
+        PreparedDeclarations {
+            waveforms: &bundle.waveforms,
+            pwl_resistors: &bundle.pwl_resistors,
+        },
+    )?;
+    Ok((circuit, config))
+}
+
+fn run(
+    circuit: &mut Circuit,
+    config: &RunConfig,
+    kind: AnalysisKind,
+    args: &[&str],
+) -> anyhow::Result<Plot> {
+    Ok(config
+        .plan(AnalysisInput::with_arguments(kind, args.iter().copied()))?
+        .run(circuit, &config.context())?)
 }
 
 fn near(plot: &Plot, name: &str, index: usize, expected: f64) {
@@ -33,50 +63,159 @@ fn near(plot: &Plot, name: &str, index: usize, expected: f64) {
         .unwrap_or_else(|| panic!("missing {name}"))
         .re;
     assert!(
-        (actual - expected).abs() < 1e-10,
+        (actual - expected).abs() < 1e-8,
         "{name} at {index}: {actual:.17e} != {expected:.17e}"
     );
 }
 
 #[test]
-fn voltage_defined_multiroot_hints_are_advisory() {
+fn actual_prepared_voltage_defined_multiroot_hints_are_advisory() -> anyhow::Result<()> {
     for (segment, root) in [(1, -1. / 3.), (2, 0.5), (3, 1.5), (4, 1.5)] {
-        let plots=simulate(&format!("i1 0 a 1\nr1 a 0 curve initial_segment={segment}\n.model curve prepared_vpwlr ({KNOTS})\n.op")).unwrap();
-        near(&plots[0], "v(a)", 0, root);
-        near(&plots[0], "i(r1)", 0, 1.);
+        let (deck, bundle) = source(
+            &format!("I1 0 p 1\n!R1 p 0 MR IC={segment}\n{VOLTAGE}"),
+            InputFormat::ExpandedDeck,
+        )?;
+        let (mut c, config) = circuit(&deck, &bundle)?;
+        let plot = run(&mut c, &config, AnalysisKind::OperatingPoint, &[])?;
+        near(&plot, "v(p)", 0, root);
+        let NativeBinding::CurrentLaw { source } = &bundle.pwl_resistors[0].binding else {
+            anyhow::bail!("wrong branch");
+        };
+        near(&plot, &format!("i({})", source.to_ascii_lowercase()), 0, 1.);
     }
+    Ok(())
 }
 
 #[test]
-fn current_defined_multiroot_hints_are_advisory() {
+fn actual_prepared_current_defined_multiroot_hints_are_advisory() -> anyhow::Result<()> {
     for (segment, root) in [(1, -1. / 3.), (2, 0.5), (3, 1.5), (4, 1.5)] {
-        let plots=simulate(&format!("v1 a 0 1\nr1 a 0 curve initial_segment={segment}\n.model curve prepared_ipwlr ({INVERSE_KNOTS})\n.op")).unwrap();
-        near(&plots[0], "i(r1)", 0, root);
-        near(&plots[0], "i(v1)", 0, -root);
+        let (deck, bundle) = source(
+            &format!("V1 p 0 1\n!R1 p 0 MC IC={segment}\n{CURRENT}"),
+            InputFormat::ExpandedDeck,
+        )?;
+        let (mut c, config) = circuit(&deck, &bundle)?;
+        let plot = run(&mut c, &config, AnalysisKind::OperatingPoint, &[])?;
+        near(&plot, "i(v1)", 0, -root);
+        let NativeBinding::VoltageLaw { sensor, source, .. } = &bundle.pwl_resistors[0].binding
+        else {
+            anyhow::bail!("wrong branch");
+        };
+        for name in [sensor, source] {
+            near(&plot, &format!("i({})", name.to_ascii_lowercase()), 0, root);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn floating_shared_terminals_and_transient_startup() -> anyhow::Result<()> {
+    let (deck, bundle) = source(
+        &format!(
+            "Vcm cm 0 10\nI1 cm a 1\nI2 cm b 1\n!R1 a cm MR IC=1\n!R2 b cm MR IC=3\n{VOLTAGE}"
+        ),
+        InputFormat::ExpandedDeck,
+    )?;
+    let (mut c, config) = circuit(&deck, &bundle)?;
+    let plot = run(&mut c, &config, AnalysisKind::OperatingPoint, &[])?;
+    near(&plot, "v(a)", 0, 10. - 1. / 3.);
+    near(&plot, "v(b)", 0, 11.5);
+    near(&plot, "i(vcm)", 0, 0.);
+    let (mut c, config) = circuit(&deck, &bundle)?;
+    let plot = run(&mut c, &config, AnalysisKind::Transient, &["1n", "10n"])?;
+    for index in 0..plot.point_count() {
+        near(&plot, "v(a)", index, 10. - 1. / 3.);
+        near(&plot, "v(b)", index, 11.5);
+    }
+    Ok(())
+}
+
+fn expected(x: f64) -> f64 {
+    if x <= 0. {
+        3_f64.mul_add(x, 2.)
+    } else if x <= 1. {
+        (-2_f64).mul_add(x, 2.)
+    } else if x <= 2. {
+        2. * (x - 1.)
+    } else {
+        x
     }
 }
 
 #[test]
-fn simultaneous_floating_resistor_hints_preserve_terminal_currents() {
-    let plots=simulate(&format!("vcm cm 0 10\ni1 cm a 1\ni2 cm b 1\nr1 a cm curve initial_segment=1\nr2 b cm curve initial_segment=3\n.model curve prepared_vpwlr ({KNOTS})\n.op")).unwrap();
-    near(&plots[0], "v(a)", 0, 10. - 1. / 3.);
-    near(&plots[0], "v(b)", 0, 11.5);
-    near(&plots[0], "i(r1)", 0, 1.);
-    near(&plots[0], "i(r2)", 0, 1.);
-    near(&plots[0], "i(vcm)", 0, 0.);
+fn independent_sweeps_and_small_signal() -> anyhow::Result<()> {
+    let (deck, bundle) = source(
+        &format!(
+            "Vref n 0 5\nVdrive p n 0\nIforce n q 0\n!R1 p n MR IC=2\n!R2 q n MC IC=3\n{VOLTAGE}\n{CURRENT}"
+        ),
+        InputFormat::ExpandedDeck,
+    )?;
+    let (mut c, config) = circuit(&deck, &bundle)?;
+    for (source, signal, sign) in [("vdrive", "i(vdrive)", -1.), ("iforce", "v(q)", 1.)] {
+        let plot = run(
+            &mut c,
+            &config,
+            AnalysisKind::DcSweep,
+            &[source, "-2", "4", "0.5"],
+        )?;
+        assert_eq!(plot.point_count(), 13);
+        for index in 0..13_u32 {
+            let x = f64::from(index) * 0.5 - 2.;
+            near(
+                &plot,
+                signal,
+                index as usize,
+                if sign > 0. {
+                    5. + expected(x)
+                } else {
+                    -expected(x)
+                },
+            );
+        }
+    }
+    // A native prepared branch has the exact signed tangent at the bias;
+    // interior negative resistance is not regularized away.
+    let (deck, bundle) = source(
+        &format!("V1 p 0 0.5 AC 1\n!R1 p 0 MR IC=1\n{VOLTAGE}"),
+        InputFormat::ExpandedDeck,
+    )?;
+    let (mut c, config) = circuit(&deck, &bundle)?;
+    let ac = run(&mut c, &config, AnalysisKind::Ac, &["lin", "1", "1k", "1k"])?;
+    near(&ac, "i(v1)", 0, 2.);
+    Ok(())
 }
 
 #[test]
-fn prepared_segment_validation_rejects_invalid_hints_and_knots() {
-    for hint in ["0", "5", "1.5", "-1"] {
-        assert!(simulate(&format!("i1 0 a 1\nr1 a 0 curve initial_segment={hint}\n.model curve prepared_vpwlr ({KNOTS})\n.op")).is_err());
+fn sidecar_validation_and_candidate_isolation() -> anyhow::Result<()> {
+    let (deck, mut bundle) = source(
+        &format!("I1 0 p 1\n!R1 p 0 MR IC=1\n{VOLTAGE}"),
+        InputFormat::ExpandedDeck,
+    )?;
+    for (hint, root) in [(1, -1. / 3.), (3, 1.5), (1, -1. / 3.)] {
+        bundle.pwl_resistors[0].initial_segment = Some(hint);
+        let (mut c, config) = circuit(&deck, &bundle)?;
+        near(
+            &run(&mut c, &config, AnalysisKind::OperatingPoint, &[])?,
+            "v(p)",
+            0,
+            root,
+        );
     }
-    for knots in [
-        "nseg=2 x0=0 y0=0 x1=0 y1=1 x2=2 y2=3",
-        "nseg=2 x0=0 y0=0 x1=1 y1=-1 x2=2 y2=3",
-        "nseg=2 x0=0 y0=0 x1=1 y1=1 x2=2",
-        "nseg=2 x0=0 y0=0 x1=1 y1=1 x2=2 y2=3 foo=1",
-    ] {
-        assert!(simulate(&format!("i1 0 a 1\nr1 a 0 curve initial_segment=1\n.model curve prepared_vpwlr ({knots})\n.op")).is_err());
+    let original = bundle.pwl_resistors[0].clone();
+    bundle.pwl_resistors.push(original.clone());
+    assert!(circuit(&deck, &bundle).is_err());
+    bundle.pwl_resistors.pop();
+    for hint in [0, 5] {
+        bundle.pwl_resistors[0].initial_segment = Some(hint);
+        assert!(circuit(&deck, &bundle).is_err());
     }
+    bundle.pwl_resistors[0] = original.clone();
+    bundle.pwl_resistors[0].negative = "not-the-terminal".into();
+    assert!(circuit(&deck, &bundle).is_err());
+    bundle.pwl_resistors[0] = original.clone();
+    bundle.pwl_resistors[0].knots[2].voltage = bundle.pwl_resistors[0].knots[1].voltage;
+    assert!(circuit(&deck, &bundle).is_err());
+    bundle.pwl_resistors[0] = original;
+    bundle.pwl_resistors[0].artifact = "wrong.cir".into();
+    assert!(circuit(&deck, &bundle).is_err());
+    Ok(())
 }

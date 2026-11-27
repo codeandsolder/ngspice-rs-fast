@@ -83,6 +83,15 @@ impl Default for SubcircuitLimits {
     }
 }
 
+/// Borrowed typed declarations accompanying one prepared electrical artifact set.
+#[derive(Clone, Copy, Default)]
+pub struct PreparedDeclarations<'a> {
+    /// Explicit source waveforms.
+    pub waveforms: &'a [model_normalize_ngspice::waveform::PreparedWaveform],
+    /// Exact piecewise-linear resistor laws and advisory segment hints.
+    pub pwl_resistors: &'a [model_normalize_ngspice::pwl_resistor::PreparedPwlResistor],
+}
+
 /// A deck with every `X` instance replaced by its definition's body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpandedNetlist {
@@ -92,6 +101,7 @@ pub struct ExpandedNetlist {
     pub devices: Vec<DeviceInstance>,
     /// Explicit prepared forcing resolved in each flattened instance scope.
     pub prepared_waveforms: Vec<(String, super::prepared_waveform::PreparedForcing)>,
+    pub(crate) prepared_resistors: super::pwl_resistor::BoundResistors,
     /// Root `.model` cards in declaration order, then each instance's renamed
     /// local models in first-reference order.
     pub models: Vec<ModelCard>,
@@ -157,7 +167,15 @@ pub fn expand_with_output(
     measurements: &[MeasureCard],
     fourier: &[FourierCard],
 ) -> SpiceResult<ExpandedNetlist> {
-    expand_with_prepared_output(netlist, root, limits, output, measurements, fourier, &[])
+    expand_with_prepared_output(
+        netlist,
+        root,
+        limits,
+        output,
+        measurements,
+        fourier,
+        PreparedDeclarations::default(),
+    )
 }
 
 /// Expand a deck with typed prepared source declarations, binding each in its
@@ -168,7 +186,7 @@ pub fn expand_prepared(
     netlist: &Netlist,
     root: &Arc<ParamScope>,
     limits: SubcircuitLimits,
-    waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
+    declarations: PreparedDeclarations<'_>,
 ) -> SpiceResult<ExpandedNetlist> {
     expand_with_prepared_output(
         netlist,
@@ -177,7 +195,7 @@ pub fn expand_prepared(
         &OutputCards::default(),
         &[],
         &[],
-        waveforms,
+        declarations,
     )
 }
 
@@ -188,9 +206,10 @@ fn expand_with_prepared_output(
     output: &OutputCards,
     measurements: &[MeasureCard],
     fourier: &[FourierCard],
-    waveforms: &[model_normalize_ngspice::waveform::PreparedWaveform],
+    declarations: PreparedDeclarations<'_>,
 ) -> SpiceResult<ExpandedNetlist> {
-    let waveforms = PreparedIndex::new(netlist, waveforms)?;
+    let waveforms = PreparedIndex::new(netlist, declarations.waveforms)?;
+    let resistors = super::pwl_resistor::Index::new(netlist, declarations.pwl_resistors)?;
     let sequence = expansion_plan(ScopeView::from(netlist), output, measurements)?;
     let definitions = definitions(netlist);
     check_acyclic(&definitions, &netlist.devices)?;
@@ -227,6 +246,8 @@ fn expand_with_prepared_output(
         devices: Vec::new(),
         waveforms,
         prepared_waveforms: Vec::new(),
+        resistors,
+        prepared_resistors: Default::default(),
         models: Vec::new(),
         statistical_model_origins: BTreeSet::new(),
         frontend_cards: 0,
@@ -274,6 +295,7 @@ fn expand_with_prepared_output(
             .map_or_else(Default::default, |binder| binder.bound),
         devices: expander.devices,
         prepared_waveforms: expander.prepared_waveforms,
+        prepared_resistors: expander.prepared_resistors,
         models: expander.models,
         statistical_model_origins: expander.statistical_model_origins,
         options: expander.frontend.options,
@@ -518,6 +540,8 @@ struct Expander<'a> {
     budget: EvalBudget,
     devices: Vec<DeviceInstance>,
     waveforms: PreparedIndex<'a>,
+    resistors: super::pwl_resistor::Index,
+    prepared_resistors: super::pwl_resistor::BoundResistors,
     prepared_waveforms: Vec<(String, super::prepared_waveform::PreparedForcing)>,
     models: Vec<ModelCard>,
     statistical_model_origins: BTreeSet<String>,
@@ -948,6 +972,14 @@ impl<'a> Expander<'a> {
             self.rewrite_parameter_references(&mut instance, &terminals.analog, path);
             instance.name = device_name(&instance.name, instance.designator, path);
             self.bind_prepared_waveform(original, directives.definition, &instance, scope)?;
+            if let Some(resistor) = self.resistors.get(original, directives.definition)
+                && self
+                    .prepared_resistors
+                    .insert(instance.name.clone(), resistor)
+                    .is_some()
+            {
+                return Err(SpiceError::circuit("duplicate expanded prepared resistor"));
+            }
             if let Some(binder) = &mut self.binder {
                 binder.device(
                     original,

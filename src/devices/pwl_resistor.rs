@@ -1,94 +1,49 @@
 //! Prepared piecewise-linear two-terminal resistors. A segment hint is an
 //! advisory first Newton tangent, not an electrical initial condition.
+use model_normalize_ngspice::pwl_resistor::{Axis, NativeBinding, PreparedPwlResistor};
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::devices::{
     ConvergenceContext, Device, IterationPhase, LinearContext, MnaUnknowns, StampContext,
-    models::{ModelFamily, PreparationKey, ResolvedModel},
-    schema::finite_literal,
 };
 use crate::maths::{SparseMatrix, Vector};
-use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment};
-use crate::primitives::{
-    NodeAppend, NodeId, Real, SpiceError, SpiceResult, exact_nonnegative_integer,
-};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Axis {
-    Voltage,
-    Current,
-}
+use crate::netlist::ast::{DeviceInstance, Netlist, ParameterKind};
+use crate::primitives::{NodeAppend, NodeId, NodeTable, Real, SpiceError, SpiceResult};
 
 /// The physical line `y = slope*x + intercept`. The upper coordinate is
 /// exclusive except on the final, extrapolating segment.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Segment {
     upper: Real,
     slope: Real,
     intercept: Real,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Curve {
     axis: Axis,
     segments: Vec<Segment>,
 }
 
-fn integer(parameter: &ParameterAssignment) -> SpiceResult<usize> {
-    exact_nonnegative_integer(finite_literal(parameter)?).ok_or_else(|| {
-        SpiceError::parse(
-            parameter.location.clone(),
-            format!("{} requires an exact nonnegative integer", parameter.name),
-        )
-    })
-}
-
 impl Curve {
-    fn prepare(card: &ModelCard, axis: Axis) -> SpiceResult<Self> {
-        let error = |message| SpiceError::parse(card.location.clone(), message);
-        let mut coordinates = BTreeMap::new();
-        let mut count = None;
-        for parameter in &card.parameters {
-            match parameter.name.as_str() {
-                "level" => continue,
-                "nseg" => {
-                    if count.replace(integer(parameter)?).is_some() {
-                        return Err(error("duplicate prepared PWL NSEG"));
-                    }
-                }
-                name => {
-                    if coordinates
-                        .insert(name, finite_literal(parameter)?)
-                        .is_some()
-                    {
-                        return Err(error("duplicate prepared PWL coordinate"));
-                    }
-                }
-            }
-        }
-        let count = count
-            .filter(|n| (2..=255).contains(n))
-            .ok_or_else(|| error("prepared PWL NSEG must be in 2..=255"))?;
-        let mut points = Vec::with_capacity(count + 1);
-        for i in 0..=count {
-            let x = coordinates
-                .remove(format!("x{i}").as_str())
-                .ok_or_else(|| error("missing prepared PWL voltage knot"))?;
-            let y = coordinates
-                .remove(format!("y{i}").as_str())
-                .ok_or_else(|| error("missing prepared PWL current knot"))?;
-            points.push(match axis {
-                Axis::Voltage => (x, y),
-                Axis::Current => (y, x),
-            });
-        }
-        if !coordinates.is_empty() {
-            return Err(error("unknown prepared PWL model parameter"));
-        }
+    fn prepare(declaration: &PreparedPwlResistor) -> SpiceResult<Self> {
+        declaration
+            .validate()
+            .map_err(|error| SpiceError::circuit(error.to_string()))?;
+        let axis = declaration.axis;
+        let points = declaration
+            .knots
+            .iter()
+            .map(|knot| match axis {
+                Axis::Voltage => (knot.voltage, knot.current),
+                Axis::Current => (knot.current, knot.voltage),
+            })
+            .collect::<Vec<_>>();
+        let count = points.len() - 1;
         let mut segments = Vec::with_capacity(count);
         for (index, window) in points.windows(2).enumerate() {
             let [(x0, y0), (x1, y1)] = *window else {
-                return Err(error("missing prepared PWL endpoint"));
+                return Err(SpiceError::circuit("missing prepared PWL endpoint"));
             };
             let dx = x1 - x0;
             let slope = (y1 - y0) / dx;
@@ -99,9 +54,7 @@ impl Curve {
                 || !intercept.is_finite()
                 || ((index == 0 || index + 1 == count) && slope <= 0.)
             {
-                return Err(error(
-                    "invalid prepared PWL independent coordinates or end slopes",
-                ));
+                return Err(SpiceError::circuit("unrepresentable prepared PWL segment"));
             }
             segments.push(Segment {
                 upper: x1,
@@ -133,66 +86,195 @@ impl Curve {
     }
 }
 
+/// Cold, immutable law material shared by each occurrence of a declaration.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BoundPwlResistor {
+    curve: Arc<Curve>,
+    initial: Option<usize>,
+}
+
+type Identity = (String, String, String);
+pub(super) type BoundResistors = BTreeMap<String, BoundPwlResistor>;
+
+/// Declaration index: artifact, lexical definition, emitted law anchor.
+#[derive(Default)]
+pub(super) struct Index(BTreeMap<Identity, BoundPwlResistor>);
+
+fn identity(device: &DeviceInstance, definition: &str) -> Option<Identity> {
+    Some((
+        device.location.path().file_name()?.to_str()?.to_owned(),
+        definition.to_ascii_lowercase(),
+        device.name.to_ascii_lowercase(),
+    ))
+}
+
+fn matches_nodes(card: &DeviceInstance, p: &str, n: &str, auto_gnd: bool) -> bool {
+    card.nodes.as_slice()
+        == [
+            NodeTable::canonical_name(p, auto_gnd),
+            NodeTable::canonical_name(n, auto_gnd),
+        ]
+}
+
+fn validate_anchor(
+    cards: &BTreeMap<Identity, Option<&DeviceInstance>>,
+    key: Identity,
+    positive: &str,
+    negative: &str,
+    output: Option<&str>,
+    auto_gnd: bool,
+) -> SpiceResult<()> {
+    let card = cards.get(&key).and_then(|card| *card).ok_or_else(|| {
+        SpiceError::circuit(format!(
+            "missing or ambiguous prepared resistor anchor {}",
+            key.2
+        ))
+    })?;
+    let correct = if let Some(output) = output {
+        card.designator == 'b'
+            && matches!(card.parameters.as_slice(), [parameter]
+            if parameter.name == output && matches!(parameter.kind, ParameterKind::Behavioural(_)))
+    } else {
+        card.designator == 'v'
+            && matches!(card.parameters.as_slice(), [parameter]
+            if parameter.name == "dc" && crate::primitives::parse_spice_number(&parameter.value) == Some(0.))
+    };
+    if !correct || !matches_nodes(card, positive, negative, auto_gnd) {
+        return Err(SpiceError::parse(
+            card.location.clone(),
+            "incorrect prepared resistor anchor shape or orientation",
+        ));
+    }
+    Ok(())
+}
+
+impl Index {
+    pub(super) fn new(
+        netlist: &Netlist,
+        declarations: &[PreparedPwlResistor],
+    ) -> SpiceResult<Self> {
+        if declarations.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut cards = BTreeMap::new();
+        for (definition, devices) in std::iter::once(("", netlist.devices.as_slice())).chain(
+            netlist
+                .subcircuits
+                .iter()
+                .map(|definition| (definition.name.as_str(), definition.devices.as_slice())),
+        ) {
+            for card in devices {
+                if let Some(key) = identity(card, definition) {
+                    cards
+                        .entry(key)
+                        .and_modify(|entry| *entry = None)
+                        .or_insert(Some(card));
+                }
+            }
+        }
+        let mut index = BTreeMap::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for declaration in declarations {
+            if declaration.scope.len() > 1 {
+                return Err(SpiceError::circuit(
+                    "nested prepared resistor definition is unsupported",
+                ));
+            }
+            let definition = declaration
+                .scope
+                .first()
+                .map_or_else(String::new, |name| name.to_ascii_lowercase());
+            let key = |name: &str| {
+                (
+                    declaration.artifact.clone(),
+                    definition.clone(),
+                    name.to_ascii_lowercase(),
+                )
+            };
+            let curve = Arc::new(Curve::prepare(declaration)?);
+            if !seen.insert(key(&declaration.device)) {
+                return Err(SpiceError::circuit(
+                    "duplicate prepared resistor declaration",
+                ));
+            }
+            let mut positive = declaration.positive.as_str();
+            let anchor = |name: &str, p: &str, n: &str, output: Option<&str>| {
+                let key = key(name);
+                validate_anchor(&cards, key, p, n, output, netlist.auto_gnd)
+            };
+            if let Some(sensor) = &declaration.series_sensor {
+                anchor(&sensor.source, positive, &sensor.intermediate, None)?;
+                positive = &sensor.intermediate;
+            }
+            let source = match &declaration.binding {
+                NativeBinding::CurrentLaw { source } => {
+                    anchor(source, positive, &declaration.negative, Some("i"))?;
+                    source
+                }
+                NativeBinding::VoltageLaw {
+                    sensor,
+                    source,
+                    intermediate,
+                } => {
+                    anchor(sensor, positive, intermediate, None)?;
+                    anchor(source, intermediate, &declaration.negative, Some("v"))?;
+                    source
+                }
+            };
+            if index
+                .insert(
+                    key(source),
+                    BoundPwlResistor {
+                        curve,
+                        initial: declaration.initial_segment.map(|segment| segment - 1),
+                    },
+                )
+                .is_some()
+            {
+                return Err(SpiceError::circuit(
+                    "duplicate prepared resistor law anchor",
+                ));
+            }
+        }
+        Ok(Self(index))
+    }
+
+    pub(super) fn get(
+        &self,
+        device: &DeviceInstance,
+        definition: &str,
+    ) -> Option<BoundPwlResistor> {
+        self.0.get(&identity(device, definition)?).cloned()
+    }
+}
+
 #[derive(Debug)]
 struct PwlResistor {
     name: String,
-    model: String,
     terminals: [NodeId; 2],
     curve: Arc<Curve>,
     initial: Option<usize>,
 }
 
-pub(super) fn instantiate(
-    instance: &DeviceInstance,
-    nodes: &mut NodeAppend<'_>,
-    model: &ResolvedModel<'_>,
-) -> SpiceResult<Box<dyn Device>> {
-    let axis = match model.family() {
-        ModelFamily::PreparedVpwlr => Axis::Voltage,
-        ModelFamily::PreparedIpwlr => Axis::Current,
-        _ => {
+impl BoundPwlResistor {
+    pub(super) fn bind(
+        &self,
+        instance: &DeviceInstance,
+        nodes: &mut NodeAppend<'_>,
+    ) -> SpiceResult<Box<dyn Device>> {
+        let [p, n] = instance.nodes.as_slice() else {
             return Err(SpiceError::parse(
                 instance.location.clone(),
-                "wrong prepared PWL resistor family",
+                "prepared PWL resistor requires two terminals",
             ));
-        }
-    };
-    let curve = model.prepare(PreparationKey::Inputs, || {
-        Curve::prepare(model.card(), axis)
-    })?;
-    let mut initial = None;
-    for parameter in &instance.parameters {
-        if parameter.name != "initial_segment" || initial.is_some() {
-            return Err(SpiceError::parse(
-                parameter.location.clone(),
-                "unsupported or duplicate prepared PWL resistor instance parameter",
-            ));
-        }
-        initial = Some(
-            integer(parameter)?
-                .checked_sub(1)
-                .filter(|i| *i < curve.segments.len())
-                .ok_or_else(|| {
-                    SpiceError::parse(
-                        parameter.location.clone(),
-                        "initial_segment must select a defined segment (one-based)",
-                    )
-                })?,
-        );
+        };
+        Ok(Box::new(PwlResistor {
+            name: instance.name.clone(),
+            terminals: [nodes.intern(p)?, nodes.intern(n)?],
+            curve: Arc::clone(&self.curve),
+            initial: self.initial,
+        }))
     }
-    let [p, n] = instance.nodes.as_slice() else {
-        return Err(SpiceError::parse(
-            instance.location.clone(),
-            "prepared PWL resistor requires two terminals",
-        ));
-    };
-    Ok(Box::new(PwlResistor {
-        name: instance.name.clone(),
-        model: model.card().name.clone(),
-        terminals: [nodes.intern(p)?, nodes.intern(n)?],
-        curve,
-        initial,
-    }))
 }
 
 impl PwlResistor {
@@ -229,13 +311,10 @@ impl Device for PwlResistor {
         &self.name
     }
     fn designator(&self) -> char {
-        'r'
+        'b'
     }
     fn terminals(&self) -> &[NodeId] {
         &self.terminals
-    }
-    fn model_name(&self) -> Option<&str> {
-        Some(&self.model)
     }
     fn branch_currents(&self) -> usize {
         1

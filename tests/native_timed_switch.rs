@@ -233,7 +233,13 @@ S1 p n cp cn M IC={INIT}
     }
     let source = Parser::new().parse_file(dir.path().join(&bundle.primary.filename))?;
     let config = RunConfig::from_netlist(&source)?;
-    let mut c = config.prepared_circuit(&source, &bundle.waveforms)?;
+    let mut c = config.prepared_circuit(
+        &source,
+        ngspice_rs::devices::subckt::PreparedDeclarations {
+            waveforms: &bundle.waveforms,
+            pwl_resistors: &bundle.pwl_resistors,
+        },
+    )?;
     let p = plan(&config, AnalysisKind::OperatingPoint, &[])?;
     let plot = p.run(&mut c, &config.context())?;
     close(
