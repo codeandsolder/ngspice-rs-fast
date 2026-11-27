@@ -641,14 +641,14 @@ fn newton(
 }
 
 pub(in crate::analysis::initial) enum SolveOutcome {
-    Converged(RightLimit),
+    Converged(Box<RightLimit>),
     NotConverged { last: Vector, reason: String },
 }
 
 impl SolveOutcome {
     fn require(self) -> SpiceResult<RightLimit> {
         match self {
-            Self::Converged(right) => Ok(right),
+            Self::Converged(right) => Ok(*right),
             Self::NotConverged { reason, .. } => Err(failure(reason)),
         }
     }
@@ -801,7 +801,7 @@ fn solve(
                         .collect::<Vec<_>>(),
                 )
             };
-            return Ok(SolveOutcome::Converged(RightLimit {
+            return Ok(SolveOutcome::Converged(Box::new(RightLimit {
                 state: state[0].clone(),
                 rate: to_rate(&state[1]),
                 charge: point.charge[0].clone(),
@@ -811,7 +811,7 @@ fn solve(
                 order_hint: state.len().saturating_sub(3).max(2),
                 guards: point.guards.unwrap_or_default(),
                 candidate_states: point.candidate_states,
-            }));
+            })));
         }
     }
 }

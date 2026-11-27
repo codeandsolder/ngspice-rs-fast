@@ -1193,7 +1193,7 @@ pub(super) fn consistent_derivative_step(
     let right = match system::solve_step(
         &dae, circuit, request, &storage, tolerances, iterations, order_hint,
     )? {
-        system::SolveOutcome::Converged(right) => right,
+        system::SolveOutcome::Converged(right) => *right,
         system::SolveOutcome::NotConverged { last, .. } => {
             return Ok(DerivativeTrial::NotConverged(last));
         }
