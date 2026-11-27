@@ -880,7 +880,7 @@ impl AnalysisPlan {
         };
         circuit.validate_prepared_analysis(self.kind(), self.uic())?;
         let context = &crate::analysis::AnalysisContext {
-            bias_analysis: circuit.has_prepared_bias().then(|| self.kind()),
+            bias_analysis: circuit.requires_analysis_context().then(|| self.kind()),
             ..*context
         };
         let (plot, resolution) =
@@ -899,7 +899,8 @@ impl AnalysisPlan {
         use crate::analysis::{ac, disto, linear, noise, pz, sens, sparam, sweep, tf};
         circuit.validate_prepared_analysis(self.kind(), self.uic())?;
         let context = &crate::analysis::AnalysisContext {
-            bias_analysis: (!self.uic() && circuit.has_prepared_bias()).then(|| self.kind()),
+            bias_analysis: (!self.uic() && circuit.requires_analysis_context())
+                .then(|| self.kind()),
             ..*context
         };
         if let Some(mut mixed) = circuit.prepare_native_mixed()? {
@@ -983,7 +984,8 @@ impl AnalysisPlan {
         };
         circuit.validate_prepared_analysis(self.kind(), self.uic())?;
         let context = &crate::analysis::AnalysisContext {
-            bias_analysis: (!self.uic() && circuit.has_prepared_bias()).then(|| self.kind()),
+            bias_analysis: (!self.uic() && circuit.requires_analysis_context())
+                .then(|| self.kind()),
             ..*context
         };
         super::pss::run(circuit, self, context, settings, warm, sink)

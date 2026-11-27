@@ -1496,9 +1496,12 @@ impl Circuit {
         Ok(())
     }
 
-    pub(crate) fn has_prepared_bias(&self) -> bool {
+    pub(crate) fn requires_analysis_context(&self) -> bool {
         !self.prepared_node_initializations.is_empty()
-            || self.devices.iter().any(|device| device.has_passive_bias())
+            || self
+                .devices
+                .iter()
+                .any(|device| device.requires_analysis_context())
     }
 
     pub(crate) fn prepared_node_hints(

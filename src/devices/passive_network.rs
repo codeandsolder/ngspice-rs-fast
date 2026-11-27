@@ -5,6 +5,10 @@
 //! resolved separately; the winding, storage and terminal identities are
 //! intentionally distinct.
 
+mod damping;
+use damping::DampingShunt;
+pub use damping::{AnalysisDamping, ConductanceLaw};
+
 use crate::devices::{
     Capacitor, Circuit, Device, IndependentSource, Inductor, Resistor, ResistorNoise, StorageKind,
     Waveform,
@@ -43,6 +47,10 @@ pub struct PassiveNetworkCoefficients {
     pub multiplicity: Real,
     /// Resolved resistor noise temperature in Celsius, or circuit temperature.
     pub temperature: Option<Real>,
+    /// Analysis-dependent damping directly across the main storage.
+    pub storage_damping: Option<AnalysisDamping>,
+    /// Analysis-dependent damping across the external terminal pair.
+    pub terminal_damping: Option<AnalysisDamping>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +62,8 @@ enum Role {
     StorageShunt,
     ParallelResistance,
     ParallelCapacitance,
+    StorageDamping,
+    TerminalDamping,
 }
 
 impl Role {
@@ -66,6 +76,8 @@ impl Role {
             Self::StorageShunt => format!("r{primary}#storage_shunt"),
             Self::ParallelResistance => format!("r{primary}#parallel"),
             Self::ParallelCapacitance => format!("c{primary}#parallel"),
+            Self::StorageDamping => format!("r{primary}#storage_damping"),
+            Self::TerminalDamping => format!("r{primary}#terminal_damping"),
         }
     }
 }
@@ -74,12 +86,13 @@ impl Role {
 enum Element {
     Resistance(Real),
     Storage(StorageKind, Real),
+    Damping(AnalysisDamping),
 }
 
 impl Element {
     const fn state_slots(self) -> usize {
         match self {
-            Self::Resistance(_) => 0,
+            Self::Resistance(_) | Self::Damping(_) => 0,
             Self::Storage(..) => REACTIVE_STATE_COUNT,
         }
     }
@@ -87,6 +100,7 @@ impl Element {
     fn scaled(self, multiplicity: Real) -> SpiceResult<Self> {
         let (original, scaled) = match self {
             Self::Resistance(r) => (r, Self::Resistance(r / multiplicity)),
+            Self::Damping(damping) => return damping.scaled(multiplicity).map(Self::Damping),
             Self::Storage(kind, v) => (
                 v,
                 Self::Storage(
@@ -100,6 +114,7 @@ impl Element {
         };
         let value = match scaled {
             Self::Resistance(r) | Self::Storage(_, r) => r,
+            Self::Damping(_) => return Err(SpiceError::circuit("unexpected scalar damping")),
         };
         if !original.is_finite()
             || original < 0.
@@ -191,7 +206,7 @@ impl PreparedPassiveNetwork {
         }
 
         let mut edges = Vec::new();
-        reserve(&mut edges, 7, None)?;
+        reserve(&mut edges, 9, None)?;
         let mut append = |role, element: Element, nodes| -> SpiceResult<()> {
             edges.push(Edge {
                 role,
@@ -234,6 +249,16 @@ impl PreparedPassiveNetwork {
         )?;
         if let Some(r) = input.storage_shunt {
             append(Role::StorageShunt, Element::Resistance(r), [positive, 1])?;
+        }
+        if let Some(damping) = input.storage_damping {
+            append(
+                Role::StorageDamping,
+                Element::Damping(damping),
+                [positive, 1],
+            )?;
+        }
+        if let Some(damping) = input.terminal_damping {
+            append(Role::TerminalDamping, Element::Damping(damping), [0, 1])?;
         }
         if let Some(r) = input.parallel_resistance {
             append(Role::ParallelResistance, Element::Resistance(r), [0, 1])?;
@@ -332,6 +357,12 @@ impl PreparedPassiveNetwork {
                         ..Default::default()
                     },
                 )),
+                Element::Damping(damping) => Box::new(DampingShunt {
+                    name,
+                    terminals,
+                    damping,
+                    temperature: self.temperature,
+                }),
                 Element::Storage(StorageKind::Capacitor, c) => {
                     Box::new(Capacitor::new(name, terminals, c, None)?)
                 }
@@ -624,12 +655,40 @@ impl NetworkPlan {
             parallel_capacitance: zero("pn_cparallel"),
             multiplicity,
             temperature,
+            storage_damping: Self::damping(values, "storage")?,
+            terminal_damping: Self::damping(values, "terminal")?,
         };
         let initialization = Self::initialization(kind, initial, multiplicity, values)?;
         Ok(Self::Storage(PreparedPassiveNetwork::prepare(
             coefficients,
             initialization,
         )?))
+    }
+
+    fn damping(
+        coefficients: &std::collections::BTreeMap<&str, Real>,
+        site: &str,
+    ) -> SpiceResult<Option<AnalysisDamping>> {
+        let get = |kind: &str, suffix: &str| {
+            coefficients
+                .get(format!("pn_g{site}_{kind}{suffix}").as_str())
+                .copied()
+        };
+        let law = |kind| ConductanceLaw {
+            constant: get(kind, "").unwrap_or(0.),
+            gmin_scale: get(kind, "_gmin").unwrap_or(0.),
+        };
+        let noisy = get("noise", "").unwrap_or(0.);
+        if noisy != 0. && noisy.to_bits() != 1_f64.to_bits() {
+            return Err(SpiceError::circuit("damping noise selector must be 0 or 1"));
+        }
+        let damping = AnalysisDamping {
+            steady: law("dc"),
+            small_signal: law("ac"),
+            transient: law("tran"),
+            noisy: noisy != 0.,
+        };
+        Ok((damping != AnalysisDamping::default()).then_some(damping))
     }
 
     fn initialization(

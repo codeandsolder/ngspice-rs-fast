@@ -1020,6 +1020,12 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
+    /// Whether real loads require the enclosing analysis selected by the
+    /// analysis plan, independently of numerical regularization.
+    fn requires_analysis_context(&self) -> bool {
+        self.has_passive_bias()
+    }
+
     /// How many device-local coordinates the device adds to the MNA
     /// system, including branch currents and auxiliary constitutive states.
     fn branch_currents(&self) -> usize {

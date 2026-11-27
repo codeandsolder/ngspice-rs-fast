@@ -25,6 +25,8 @@ fn coefficients(kind: StorageKind, value: f64) -> PassiveNetworkCoefficients {
         parallel_capacitance: 0.,
         multiplicity: 1.,
         temperature: None,
+        storage_damping: None,
+        terminal_damping: None,
     }
 }
 
@@ -573,5 +575,36 @@ fn explicit_storage_bias_is_analysis_bound() -> SpiceResult<()> {
         ac.value("v(port)", 0).unwrap(),
         Complex::real(1.) / Complex::new(1., TAU * 1000. * 2e-6 * 10.),
     );
+    Ok(())
+}
+
+#[test]
+fn explicit_damping_distinguishes_bias_frequency_and_time_domain() -> SpiceResult<()> {
+    let text = "physical damping\nv1 drive 0 dc 1 ac 1\nrdrive drive port 10\n\
+                c1 port 0 1u pn_gterminal_dc=.01 pn_gterminal_ac=.02 \
+                pn_gterminal_tran_gmin=3e10\n.end\n";
+    let netlist = Parser::new().parse_deck(&parse_deck_text(Path::new("network.cir"), text))?;
+    let mut circuit = Circuit::from_netlist(&netlist)?;
+    let op = run(&mut circuit, AnalysisKind::OperatingPoint, &[])?;
+    close(op.value("v(port)", 0).unwrap(), Complex::real(1. / 1.1));
+    let ac = run(
+        &mut circuit,
+        AnalysisKind::Ac,
+        &["lin", "1", "1000", "1000"],
+    )?;
+    close(
+        ac.value("v(port)", 0).unwrap(),
+        Complex::real(1.) / Complex::new(1.2, TAU * 1000. * 1e-6 * 10.),
+    );
+    let tran = run(
+        &mut circuit,
+        AnalysisKind::Transient,
+        &["100n", "30u", "0", "100n"],
+    )?;
+    for v in tran.column("v(port)").unwrap().iter() {
+        assert!((v.re - 1. / 1.3).abs() <= 1e-8, "{v:?}");
+    }
+    let op = run(&mut circuit, AnalysisKind::OperatingPoint, &[])?;
+    close(op.value("v(port)", 0).unwrap(), Complex::real(1. / 1.1));
     Ok(())
 }
