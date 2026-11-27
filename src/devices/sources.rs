@@ -8,8 +8,10 @@
 //! therefore a Thevenin source with series resistance `z0`, and its branch
 //! current is the current through the ideal source from `<name>#res` to the
 //! negative terminal. See `docs/port/SPARAM.md`.
+use crate::devices::linear::SourceRows;
 use crate::devices::{AnalysisMode, Device, LinearContext, LinearSource, StampContext, Waveform};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult};
+use std::sync::Arc;
 
 /// The RFSPICE port data of a voltage source (C `VSRCisPort` and its
 /// `VSRCportNum`, `VSRCportZ0`, `VSRCportPower`, `VSRCportFreq`,
@@ -148,7 +150,7 @@ pub struct SourceInputs {
 /// Independent V or I source. AC, DC and transient excitations are distinct.
 #[derive(Debug, Clone)]
 pub struct IndependentSource {
-    name: String,
+    name: Arc<String>,
     /// Inline `[positive, negative, internal]`. The third entry is exposed
     /// only when a port is present.
     terminals: [NodeId; 3],
@@ -159,8 +161,8 @@ pub struct IndependentSource {
     pub(super) function_given: bool,
     /// The source's immutable original function. Only PORT accumulation
     /// has a second, derived waveform.
-    waveform: Waveform,
-    accumulated_waveform: Option<Box<Waveform>>,
+    waveform: Arc<Waveform>,
+    accumulated_waveform: Option<Arc<Waveform>>,
     power_tone: Option<(Real, Real)>,
     port: Option<RfPort>,
     /// `distof1`/`distof2` distortion inputs (C `VSRCdF1given`, ...).
@@ -230,7 +232,7 @@ impl SourceExcitation {
 
     pub(super) fn bind(self, name: impl Into<String>, terminals: [NodeId; 2]) -> IndependentSource {
         IndependentSource {
-            name: name.into(),
+            name: Arc::new(name.into()),
             terminals: [terminals[0], terminals[1], NodeId::GROUND],
             voltage: self.voltage,
             dc: self.dc,
@@ -239,7 +241,7 @@ impl SourceExcitation {
             function_given: self.function_given,
             accumulated_waveform: None,
             power_tone: None,
-            waveform: self.waveform,
+            waveform: Arc::new(self.waveform),
             port: None,
             distortion: [None, None],
         }
@@ -388,6 +390,13 @@ impl IndependentSource {
             .unwrap_or(&self.waveform)
     }
 
+    fn effective_waveform_handle(&self) -> Arc<Waveform> {
+        self.accumulated_waveform
+            .as_ref()
+            .unwrap_or(&self.waveform)
+            .clone()
+    }
+
     /// The terminals of the ideal source: `[positive, negative]`, or
     /// `[#res, negative]` for a port.
     fn ideal(&self) -> [NodeId; 2] {
@@ -401,6 +410,29 @@ impl IndependentSource {
 }
 
 impl Device for IndependentSource {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        // The independent DC value is a bias-independent input. The current
+        // source additionally scales it by its instance multiplier, just as
+        // ISRCload does. Reject an unrepresentable forcing before solving.
+        let value = if self.dc.given() {
+            self.dc.value() * context.source_factor
+        } else {
+            self.dc.value()
+        };
+        let forcing = if self.voltage {
+            value
+        } else {
+            value * self.multiplier.unwrap_or(1.)
+        };
+        if !forcing.is_finite() {
+            return Err(SpiceError::circuit(format!(
+                "{}: nonfinite independent DC forcing",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
     /// `vsrcset.c` (an RF port first stamps its reference resistor towards
     /// its internal node, whose branch replaces the positive terminal);
     /// current sources allocate nothing.
@@ -500,7 +532,8 @@ impl Device for IndependentSource {
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Ok(crate::devices::noise::DeviceNoise::Noiseless)
     }
 
@@ -580,7 +613,7 @@ impl Device for IndependentSource {
             tones.push(tone);
             let accumulated = Waveform::PortSeries { baseline, tones };
             accumulated.validate()?;
-            self.accumulated_waveform = Some(Box::new(accumulated));
+            self.accumulated_waveform = Some(Arc::new(accumulated));
             self.dc.accumulate(Some(previous_dc + tone.0));
             if !self.dc.value().is_finite() {
                 return Err(SpiceError::circuit("nonfinite PORT DC accumulation"));
@@ -670,26 +703,23 @@ impl Device for IndependentSource {
         if let Some(port) = &self.port {
             context.nodal([self.terminals[0], port.internal], 1. / port.z0, false)?;
         }
-        let rows = if self.voltage {
-            vec![(context.branch(self.ideal())?, 1.)]
+        let mut rows = SourceRows::new();
+        if self.voltage {
+            rows.push(context.branch(self.ideal())?, 1.)?;
         } else {
-            [(self.terminals[0], -1.), (self.terminals[1], 1.)]
-                .into_iter()
-                .filter_map(|(node, sign)| {
-                    context
-                        .unknowns
-                        .node_row(node)
-                        .map(|r| (r, sign * self.multiplier.unwrap_or(1.)))
-                })
-                .collect()
-        };
+            for (node, sign) in [(self.terminals[0], -1.), (self.terminals[1], 1.)] {
+                if let Some(row) = context.unknowns.node_row(node) {
+                    rows.push(row, sign * self.multiplier.unwrap_or(1.))?;
+                }
+            }
+        }
         context.system.sources.push(LinearSource {
             name: self.name.clone(),
             kind: self.source_kind(),
             rows,
             dc: self.dc.value(),
             ac: self.ac.phasor,
-            waveform: self.effective_waveform().clone(),
+            waveform: self.effective_waveform_handle(),
         });
         Ok(())
     }
@@ -766,7 +796,7 @@ mod tests {
                 .unwrap();
             assert_eq!(actual, expected);
             assert_eq!(dc, 0.);
-            assert_eq!(source.waveform, original);
+            assert_eq!(*source.waveform, original);
         }
         source.power_tone = None;
         let (actual, dc) = source
@@ -871,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_ac_and_explicit_zero_are_distinct_and_overflow_is_rejected() {
+    fn omitted_ac_and_explicit_zero_are_distinct_and_finite_phases_are_periodic() {
         let context = crate::devices::ModelContext::default();
         let absent = polar_source(true, None, None, None);
         assert!(!absent.ac_given());
@@ -896,23 +926,37 @@ mod tests {
             ac_bits(coefficients(swept).ac),
             [1.0_f64.to_bits(), (-0.0_f64).to_bits()]
         );
-        assert!(
-            absent
-                .with_instance_parameter("acphase", Real::MAX, &context)
-                .is_err()
+        let huge = absent
+            .with_instance_parameter("acphase", Real::MAX, &context)
+            .unwrap();
+        let reduced = absent
+            .with_instance_parameter("acphase", 128., &context)
+            .unwrap();
+        assert_eq!(
+            ac_bits(coefficients(huge).ac),
+            ac_bits(coefficients(reduced).ac)
         );
-        assert!(
+        assert_eq!(
             AcInput {
                 magnitude: Some(0.),
                 phase: Some(Real::MAX)
             }
             .resolve()
+            .unwrap()
+            .magnitude(),
+            0.
+        );
+        assert!(
+            AcInput {
+                magnitude: Some(1.),
+                phase: Some(Real::INFINITY)
+            }
+            .resolve()
             .is_err()
         );
-        // The exact binary64 intermediate distinguishes C from to_radians().
         assert_eq!(
             crate::devices::functions::phase_radians(123_456_789_012_345.).to_bits(),
-            2_154_727_452_205.378_4_f64.to_bits()
+            (105. * std::f64::consts::PI / 180.).to_bits()
         );
     }
 

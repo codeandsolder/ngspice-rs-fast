@@ -4,8 +4,6 @@
 //! size-dependent and temperature-dependent parameters, and `b3check.c`'s
 //! model/instance diagnostics. This is geometry and parameter setup only: no
 //! nodes are interned, no states are allocated and no load equations run.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -17,14 +15,6 @@
 #![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
-)]
-#![expect(
-    clippy::imprecise_flops,
-    reason = "the original C floating-point algorithm and libm operation sequence must remain intact"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use super::defaults::{ModelDefaults, ModelValues};
@@ -187,10 +177,13 @@ macro_rules! define_binned_parameters {
         impl BinnedParameters {
             const fn new(model: &ModelValues, inv_l: Real, inv_w: Real, inv_lw: Real) -> Self {
                 Self {
-                    $($base: model.$base.value
-                        + model.$l.value * inv_l
-                        + model.$w.value * inv_w
-                        + model.$area.value * inv_lw,)*
+                    $($base: model.$area.value.mul_add(
+                        inv_lw,
+                        model.$w.value.mul_add(
+                            inv_w,
+                            model.$l.value.mul_add(inv_l, model.$base.value),
+                        ),
+                    ),)*
                 }
             }
 
@@ -253,10 +246,10 @@ impl Geometry {
             + model.values.wlc.value / t2
             + model.values.wwc.value / t3
             + model.values.wwlc.value / (t2 * t3);
-        let leff = length + model.values.xl.value - 2.0 * dl;
-        let weff = width + model.values.xw.value - 2.0 * dw;
-        let leff_cv = length + model.values.xl.value - 2.0 * dlc;
-        let weff_cv = width + model.values.xw.value - 2.0 * dwc;
+        let leff = 2.0f64.mul_add(-dl, length + model.values.xl.value);
+        let weff = 2.0f64.mul_add(-dw, width + model.values.xw.value);
+        let leff_cv = 2.0f64.mul_add(-dlc, length + model.values.xl.value);
+        let weff_cv = 2.0f64.mul_add(-dwc, width + model.values.xw.value);
         for (name, value, message) in [
             ("Leff", leff, "Effective channel length <= 0"),
             ("Weff", weff, "Effective channel width <= 0"),
@@ -342,15 +335,16 @@ impl AdjustedSize {
         let t0 = ratio - 1.0;
         // C takes the temperature coefficients from the model, not the
         // binned coefficient values.
-        binned.ua += model.values.ua1.value * t0;
-        binned.ub += model.values.ub1.value * t0;
-        binned.uc += model.values.uc1.value * t0;
+        binned.ua = model.values.ua1.value.mul_add(t0, binned.ua);
+        binned.ub = model.values.ub1.value.mul_add(t0, binned.ub);
+        binned.uc = model.values.uc1.value.mul_add(t0, binned.uc);
         if binned.u0 > 1.0 {
             binned.u0 /= 1.0e4;
         }
         let u0temp = binned.u0 * ratio.powf(binned.ute);
-        let vsattemp = binned.vsat - binned.at * t0;
-        let rds0 = (binned.rdsw + binned.prt * t0) / (geometry.weff * METER2MICRON).powf(binned.wr);
+        let vsattemp = binned.at.mul_add(-t0, binned.vsat);
+        let rds0 =
+            binned.prt.mul_add(t0, binned.rdsw) / (geometry.weff * METER2MICRON).powf(binned.wr);
         Self {
             geometry,
             binned,
@@ -1071,7 +1065,7 @@ impl CheckedSize {
             }
         } else {
             if !model.values.vbx.given {
-                let vbx = phi - 7.7348e-4 * npeak * binned.xt.powi(2);
+                let vbx = f64::mul_add(7.7348e-4 * npeak, -binned.xt.powi(2), phi);
                 binned.vbx = vbx;
             }
             if binned.vbx > 0.0 {
@@ -1095,8 +1089,8 @@ impl CheckedSize {
             let t0 = gamma1 - gamma2;
             let t1 = (phi - vbx).sqrt() - sqrt_phi;
             let t2 = (phi * (phi - vbm)).sqrt() - phi;
-            let k2 = t0 * t1 / (2.0 * t2 + vbm);
-            let k1 = gamma2 - 2.0 * k2 * (phi - vbm).sqrt();
+            let k2 = t0 * t1 / 2.0f64.mul_add(t2, vbm);
+            let k1 = (2.0 * k2).mul_add(-(phi - vbm).sqrt(), gamma2);
             binned.k2 = k2;
             binned.k1 = k1;
         }
@@ -1107,7 +1101,7 @@ impl CheckedSize {
         let vbsc = if k2 < 0.0 {
             let t0 = 0.5 * k1 / k2;
             // `b3temp.c` clamps to [-30, -3]; endpoint values are unchanged.
-            (0.9 * (phi - t0 * t0)).clamp(-30.0, -3.0)
+            (0.9 * f64::mul_add(t0, -t0, phi)).clamp(-30.0, -3.0)
         } else {
             -30.0
         };
@@ -1116,7 +1110,7 @@ impl CheckedSize {
         let polarity = Real::from(model.polarity);
         if !model.values.vfb.given {
             let vfb = if model.values.vth0.given {
-                polarity * binned.vth0 - phi - k1 * sqrt_phi
+                f64::mul_add(k1, -sqrt_phi, f64::mul_add(polarity, binned.vth0, -phi))
             } else {
                 -1.0
             };
@@ -1124,7 +1118,7 @@ impl CheckedSize {
         }
         if !model.values.vth0.given {
             let vfb = binned.vfb;
-            binned.vth0 = polarity * (vfb + phi + k1 * sqrt_phi);
+            binned.vth0 = polarity * f64::mul_add(k1, sqrt_phi, vfb + phi);
         }
         let k1ox = k1 * model.values.tox.value / model.values.toxm.value;
         let k2ox = k2 * model.values.tox.value / model.values.toxm.value;
@@ -1133,10 +1127,10 @@ impl CheckedSize {
         let dsub = binned.dsub;
         let t1 = (eps_si / 3.453_133e-11 * model.values.tox.value * xdep0).sqrt();
         let t0 = (-0.5 * dsub * leff / t1).exp();
-        let theta0vb0 = t0 + 2.0 * t0 * t0;
+        let theta0vb0 = (2.0 * t0).mul_add(t0, t0);
         let t0 = (-0.5 * binned.drout * leff / t1).exp();
-        let t2 = t0 + 2.0 * t0 * t0;
-        let thetarout = binned.pdiblc1 * t2 + binned.pdiblc2;
+        let t2 = (2.0 * t0).mul_add(t0, t0);
+        let thetarout = f64::mul_add(binned.pdiblc1, t2, binned.pdiblc2);
 
         let tmp = xdep0.sqrt();
         let tmp1 = vbi - phi;
@@ -1144,26 +1138,35 @@ impl CheckedSize {
         let t0 = -0.5 * binned.dvt1w * weff * leff / tmp2;
         let t2 = if t0 > -EXP_THRESHOLD {
             let e = t0.exp();
-            e * (1.0 + 2.0 * e)
+            e * 2.0f64.mul_add(e, 1.0)
         } else {
-            MIN_EXP * (1.0 + 2.0 * MIN_EXP)
+            MIN_EXP * 2.0f64.mul_add(MIN_EXP, 1.0)
         };
         let t0 = binned.dvt0w * t2;
         let t2w = t0 * tmp1;
         let t0 = -0.5 * binned.dvt1 * leff / tmp2;
         let t3 = if t0 > -EXP_THRESHOLD {
             let e = t0.exp();
-            e * (1.0 + 2.0 * e)
+            e * 2.0f64.mul_add(e, 1.0)
         } else {
-            MIN_EXP * (1.0 + 2.0 * MIN_EXP)
+            MIN_EXP * 2.0f64.mul_add(MIN_EXP, 1.0)
         };
         let t3 = binned.dvt0 * t3 * tmp1;
         let t4 = model.values.tox.value * phi / (weff + binned.w0);
         let nlx = binned.nlx;
-        let t0 = (1.0 + nlx / leff).sqrt();
-        let t5 = k1ox * (t0 - 1.0) * sqrt_phi + (binned.kt1 + binned.kt1l / leff) * (ratio - 1.0);
-        let tmp3 = polarity * binned.vth0 - t2w - t3 + binned.k3 * t4 + t5;
-        let vfbzb = tmp3 - phi - k1 * sqrt_phi;
+        let length_ratio = nlx / leff;
+        let root_offset = length_ratio / ((1.0 + length_ratio).sqrt() + 1.0);
+        let t5 = f64::mul_add(
+            binned.kt1 + binned.kt1l / leff,
+            ratio - 1.0,
+            k1ox * root_offset * sqrt_phi,
+        );
+        let tmp3 = f64::mul_add(
+            binned.k3,
+            t4,
+            f64::mul_add(polarity, binned.vth0, -t2w) - t3,
+        ) + t5;
+        let vfbzb = f64::mul_add(k1, -sqrt_phi, tmp3 - phi);
         let derived = DerivedParameters {
             npeak,
             phi,
@@ -1468,8 +1471,8 @@ impl InstanceSetup {
 
         // Instance-level adjustments: DELVTO and MULU0.
         let vth0 = binned.vth0 + delvto;
-        let vfb = binned.vfb + polarity * delvto;
-        let vfbzb = derived.vfbzb + polarity * delvto;
+        let vfb = f64::mul_add(polarity, delvto, binned.vfb);
+        let vfbzb = f64::mul_add(polarity, delvto, derived.vfbzb);
         let u0temp_instance = thermal.u0temp * mulu0;
         // C recomputes `tconst` here with `T0 = sqrt(1 + nlx/leff)` from above.
         let tconst_quirk = u0temp_instance * binned.elm
@@ -1499,21 +1502,21 @@ impl InstanceSetup {
         let source_sat_current = if source_area <= 0.0 && source_perimeter <= 0.0 {
             1.0e-14
         } else {
-            source_area * jct_temp + source_perimeter * jct_sidewall_temp
+            f64::mul_add(source_perimeter, jct_sidewall_temp, source_area * jct_temp)
         };
         let drain_sat_current = if drain_area <= 0.0 && drain_perimeter <= 0.0 {
             1.0e-14
         } else {
-            drain_area * jct_temp + drain_perimeter * jct_sidewall_temp
+            f64::mul_add(drain_perimeter, jct_sidewall_temp, drain_area * jct_temp)
         };
         let (mut vjsm, mut isevjsm) = (0.0, 0.0);
         if source_sat_current > 0.0 && ijth > 0.0 {
-            vjsm = nvtm * (ijth / source_sat_current + 1.0).ln();
+            vjsm = nvtm * (ijth / source_sat_current).ln_1p();
             isevjsm = source_sat_current * (vjsm / nvtm).exp();
         }
         let (mut vjdm, mut isevjdm) = (0.0, 0.0);
         if drain_sat_current > 0.0 && ijth > 0.0 {
-            vjdm = nvtm * (ijth / drain_sat_current + 1.0).ln();
+            vjdm = nvtm * (ijth / drain_sat_current).ln_1p();
             isevjdm = drain_sat_current * (vjdm / nvtm).exp();
         }
         let setup = Self {

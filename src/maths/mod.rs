@@ -17,7 +17,7 @@
 //! external solver crate is used. See `docs/port/NATIVE_SOLVER.md`.
 
 pub mod complex;
-pub use complex::DynamicGroup;
+pub use complex::{DynamicGroup, DynamicGroups};
 pub mod dense;
 pub mod dense_complex;
 pub mod equilibration;
@@ -30,6 +30,8 @@ pub use linear::{
 pub mod pencil;
 pub mod sparse;
 pub(crate) mod sparse13;
+mod telemetry;
+pub use telemetry::{FactorStorage, FactorWork, PatternTelemetry, PatternWork};
 
 pub use dense::{Matrix, Vector};
 pub use equilibration::{

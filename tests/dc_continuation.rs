@@ -173,9 +173,8 @@ impl ngspice_rs::devices::Device for Cubic {
             .unwrap_or(0.);
         context.nodal(self.nodes, 3. * v * v, false)
     }
-    fn accept(&self, _: &ngspice_rs::devices::AcceptContext<'_>) -> SpiceResult<()> {
+    fn accept(&self, _: &ngspice_rs::devices::AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
-        Ok(())
     }
 }
 fn cubic(accepted: &Rc<Cell<usize>>) -> Circuit {
@@ -223,9 +222,8 @@ impl ngspice_rs::devices::Device for Rejecting {
     ) -> SpiceResult<()> {
         context.nodal(self.nodes, 1e-3, false)
     }
-    fn accept(&self, _: &ngspice_rs::devices::AcceptContext<'_>) -> SpiceResult<()> {
+    fn accept(&self, _: &ngspice_rs::devices::AcceptContext<'_>) {
         self.accepted.set(self.accepted.get() + 1);
-        Ok(())
     }
 }
 
@@ -884,12 +882,12 @@ fn easy_nonlinear_and_linear_solves_stay_direct_and_exact() {
 fn trial_state_belongs_to_the_solution_and_history_is_untouched() {
     let c = circuit("v1 a 0 0.3\nd1 a 0 dm\n.model dm d(cjo=1u vj=1)");
     let context = ModelContext::default();
-    let history_before = c.state_history();
+    let history_before = c.state_history().unwrap();
     let rhs_before = dc_rhs(&c);
     let solved = solve_dc_with(&c, &context, &DcSettings::default(), &[], None, None).unwrap();
-    assert_eq!(c.state_history(), history_before);
+    assert_eq!(c.state_history().unwrap(), history_before);
     assert_eq!(dc_rhs(&c), rhs_before);
-    let history = c.state_history();
+    let history = c.state_history().unwrap();
     let mut trial = history.trial();
     c.load(
         &LoadRequest {
@@ -914,7 +912,7 @@ fn continuation_never_accepts_state_or_edits_sources_on_success_or_failure() {
     let c = cubic(&accepted);
     let context = ModelContext::default();
     let rhs_before = dc_rhs(&c);
-    let history_before = c.state_history();
+    let history_before = c.state_history().unwrap();
 
     // Success needs gmin continuation; an override is applied to a temporary RHS.
     let solved = solve_dc_with(
@@ -934,7 +932,7 @@ fn continuation_never_accepts_state_or_edits_sources_on_success_or_failure() {
     assert!(solved.report.stages.len() > 1);
     assert_eq!(accepted.get(), 0);
     assert_eq!(dc_rhs(&c), rhs_before);
-    assert_eq!(c.state_history(), history_before);
+    assert_eq!(c.state_history().unwrap(), history_before);
 
     // Failure (continuation disabled) leaves the same invariants.
     let failure = solve_dc_with(

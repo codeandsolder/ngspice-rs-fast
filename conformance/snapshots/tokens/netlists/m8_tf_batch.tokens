@@ -63,7 +63,7 @@ card 8 @netlists/m8_tf_batch.cir:12:1 lines=12-12 continuations=0
   token 6 12:13 word "nmos"
   token 7 12:18 word "w"
   token 8 12:19 equals "="
-  token 9 12:20 number "10u" value=9.999999999999999e-6
+  token 9 12:20 number "10u" value=1e-5
   token 10 12:24 word "l"
   token 11 12:25 equals "="
   token 12 12:26 number "2u" value=2e-6
@@ -79,7 +79,7 @@ card 9 @netlists/m8_tf_batch.cir:13:1 lines=13-13 continuations=0
   token 7 13:18 number "1e-14" value=1e-14
   token 8 13:24 word "n"
   token 9 13:25 equals "="
-  token 10 13:26 number "1.2" value=1.2000000000000002e0
+  token 10 13:26 number "1.2" value=1.2e0
   token 11 13:30 word "rs"
   token 12 13:32 equals "="
   token 13 13:33 number "5" value=5e0
@@ -99,7 +99,7 @@ card 10 @netlists/m8_tf_batch.cir:14:1 lines=14-14 continuations=0
   token 10 14:30 number "0.8" value=8e-1
   token 11 14:34 word "kp"
   token 12 14:36 equals "="
-  token 13 14:37 number "60u" value=5.9999999999999995e-5
+  token 13 14:37 number "60u" value=6e-5
   token 14 14:41 word "lambda"
   token 15 14:47 equals "="
   token 16 14:48 number "0.02" value=2e-2

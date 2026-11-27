@@ -42,6 +42,43 @@ fn assert_close(got: Complex, re: Real, im: Real, relative: Real) {
     );
 }
 
+#[test]
+fn hfet2_recovers_the_independently_verified_drain_pole() {
+    let deck = include_str!("../conformance/netlists/m10_hfet2_pz.cir");
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("hfet2.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let request = config.plan_for(&netlist.analyses[0]).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
+    let poles = roots(&plot, "pole");
+    assert_eq!(poles.len(), 2);
+    assert_close(poles[0], -10_000_000_014.000_954, 0., 1e-12);
+    assert_close(poles[1], -1.915_532_913_552_036e-4, 0., 1e-9);
+
+    // Exact-rational determinant expansion of the original affine stamps,
+    // normalized by its linear coefficient (POLE_ZERO_ADR.md). The two
+    // remaining polynomial roots lie past the search's frequency range.
+    let coefficients = [
+        1.915_525_405_325_939_3e-4,
+        1.,
+        9.999_999_985_998_895e-11,
+        3.930_777_229_431_393_4e-35,
+        1.456_255_297_316_451_5e-70,
+    ];
+    let s = poles[0].re;
+    let residual = coefficients
+        .iter()
+        .rev()
+        .fold(0.0_f64, |acc, &v| acc.mul_add(s, v));
+    let scale = coefficients
+        .iter()
+        .rev()
+        .fold(0.0_f64, |acc, &v| acc.mul_add(s.abs(), v.abs()));
+    assert!(residual.abs() / scale < 1e-12);
+}
+
 fn error(cards: &str, analysis: &str) -> String {
     run(cards, analysis)
         .expect_err("the analysis is refused")
@@ -104,11 +141,39 @@ fn a_two_pole_rc_ladder_matches_its_characteristic_polynomial() {
     assert_close(poles[1], (-b + disc) / (2.0 * a), 0.0, 1e-12);
 }
 
+/// Validate every root independently and reconstruct all coefficients from
+/// the complete root set. A duplicate/missing root cannot pass the residual
+/// check alone; Vieta's identities also require the correct multiplicities.
+fn assert_cubic(roots: &[Complex], coefficients: [Real; 4]) {
+    assert_eq!(roots.len(), 3, "{roots:?}");
+    let [a0, a1, a2, a3] = coefficients;
+    for &root in roots {
+        let value = ((Complex::real(a3) * root + Complex::real(a2)) * root + Complex::real(a1))
+            * root
+            + Complex::real(a0);
+        let radius = root.magnitude();
+        let bound = ((a3.abs() * radius + a2.abs()) * radius + a1.abs()) * radius + a0.abs();
+        assert!(
+            value.magnitude() <= 1e-10 * bound,
+            "polynomial residual {value} at {root}"
+        );
+    }
+    let [x, y, z] = <[Complex; 3]>::try_from(roots).unwrap();
+    for (actual, expected) in [
+        (-(x + y + z), a2 / a3),
+        (x * y + x * z + y * z, a1 / a3),
+        (-(x * y * z), a0 / a3),
+    ] {
+        assert!(
+            (actual - Complex::real(expected)).magnitude() <= 1e-9 * expected.abs(),
+            "Vieta {actual} != {expected}"
+        );
+    }
+}
+
 #[test]
-fn a_notch_gives_up_on_the_poles_like_c_muller_but_finds_the_zeros() {
-    // C ngspice-47 reports "Pole-zero iteration limit reached" for this deck
-    // and returns no poles at all; the port's Muller port does the same.
-    let (l, c1): (Real, Real) = (10e-3, 1e-6);
+fn a_notch_finds_all_poles_and_zeros() {
+    let (l, c1, c2, g1, g2): (Real, Real, Real, Real, Real) = (10e-3, 1e-6, 1e-7, 1e-3, 1e-3);
     let plot = run(
         "v1 in 0 dc 0 ac 1\nr1 in a 1k\nc1 a out 1u\nl1 a out 10m\nr2 out 0 1k\nc2 out 0 100n\n",
         ".pz in 0 out 0 vol pz",
@@ -117,11 +182,33 @@ fn a_notch_gives_up_on_the_poles_like_c_muller_but_finds_the_zeros() {
     let zeros = roots(&plot, "zero");
     assert_eq!(zeros.len(), 2);
     let notch = 1.0 / (l * c1).sqrt();
-    assert!(zeros[0].re.abs() <= 1e-9 * notch, "{zeros:?}");
-    assert_close(Complex::new(0.0, zeros[0].im), 0.0, notch, 1e-12);
-    // Like C, the deflated Muller search gives up on the poles ("Pole-zero
-    // iteration limit reached") and reports none; the zeros are still found.
-    assert!(roots(&plot, "pole").is_empty());
+    assert_close(zeros[0], 0., notch, 1e-12);
+    assert_close(zeros[1], 0., -notch, 1e-12);
+    // With source shorted, inter-node admittance is s*C1+1/(s*L).
+    // The nodal determinant times s*L is
+    // s*L*g1*(g2+s*C2) + (1+s^2*L*C1)*(g1+g2+s*C2).
+    assert_cubic(
+        &roots(&plot, "pole"),
+        [
+            g1 + g2,
+            c2 + l * g1 * g2,
+            l * (g1 * c2 + c1 * (g1 + g2)),
+            l * c1 * c2,
+        ],
+    );
+}
+
+#[test]
+fn distinct_nearby_real_poles_are_not_merged() {
+    let plot = run(
+        "i1 0 a dc 1\nr1 a 0 1\nc1 a 0 1\nr2 b 0 0.99999\nc2 b 0 1\n",
+        ".pz a 0 a 0 cur pol",
+    )
+    .unwrap();
+    let poles = roots(&plot, "pole");
+    assert_eq!(poles.len(), 2);
+    assert_close(poles[0], -1. / 0.99999, 0., 1e-10);
+    assert_close(poles[1], -1., 0., 1e-10);
 }
 
 #[test]
@@ -326,16 +413,29 @@ fn simulate_writes_c_layout_and_composes_with_other_analyses() {
             .collect()
     };
     assert_eq!(names(2), ["v(zero(1))", "v(zero(2))", "v(zero(3))"]);
-    // The port follows C's Muller search bit for bit. On this deck the
-    // search is sensitive to the last bit of every determinant: the C
-    // reference built with `-ffp-contract=off` (no FMA contraction, which the
-    // port matches) hits the iteration limit in the pole search, warns and
-    // writes an empty real pole plot, as here; an FMA-contracted C build
-    // happens to find 3 poles instead.
-    assert!(names(3).is_empty(), "{:?}", names(3));
+    assert_eq!(names(3), ["v(pole(1))", "v(pole(2))", "v(pole(3))"]);
     assert!(
-        warnings.contains("Pole-zero iteration limit reached; giving up after 201 trials"),
+        !warnings.contains("Pole-zero iteration limit"),
         "{warnings}"
+    );
+    let (g1, g2, c1, c2, c3, l) = (1e-3, 1e-2, 1e-6, 1e-7, 1e-8, 1e-2);
+    let ct = c2 + c3;
+    // KCL for the two nodes, with the input voltage held fixed.
+    // Multiplying the determinant by s*L removes the branch denominator.
+    assert_cubic(
+        &roots(&raw.plots[3].plot, "pole"),
+        [
+            g1 + g2,
+            c1 + ct + l * g1 * g2,
+            l * (g1 * ct + g2 * c1),
+            l * c1 * ct,
+        ],
+    );
+    // The transfer numerator comes from the same nodal equations with the
+    // input feedthrough capacitance on the RHS.
+    assert_cubic(
+        &roots(&raw.plots[2].plot, "zero"),
+        [g1, c3, l * g1 * c3, l * c1 * c3],
     );
     let ascii = dir.join("out.txt");
     simulate("ascii", &ascii);

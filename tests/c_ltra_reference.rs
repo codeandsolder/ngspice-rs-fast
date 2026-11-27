@@ -12,20 +12,14 @@
 //! takes C's timepoints and samples are compared row by row. Ordinary
 //! `cargo test` never needs C.
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use ngspice_rs::analysis::{Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-
-struct Cleanup(PathBuf);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn run_c(tag: &str, cards: &str, analysis: &str) -> Plot {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
@@ -33,19 +27,13 @@ fn run_c(tag: &str, cards: &str, analysis: &str) -> Plot {
         Path::new(&binary).is_absolute(),
         "NGSPICE_BIN must be absolute"
     );
-    let dir = std::env::temp_dir().join(format!("spice-ltra-{}-{tag}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).unwrap();
-    let _cleanup = Cleanup(dir.clone());
+    let scratch = Scratch::new("c-ltra-reference").unwrap_or_else(|error| panic!("{tag}: {error}"));
+    let dir = scratch.path();
     let deck = format!(
         "c\n{cards}.control\nset filetype=ascii\n{analysis}\nwrite result.raw\nquit\n.endc\n.end\n"
     );
     fs::write(dir.join("c.cir"), deck).unwrap();
-    let output = Command::new(&binary)
-        .args(["-b", "c.cir"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let output = run(&binary, dir, &["-b", "c.cir"], ProcessLimits::ORACLE).unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

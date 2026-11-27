@@ -3,21 +3,15 @@
 //! back with `@model[keyword]`, and the instance asks `b4ask.c` answers from
 //! values `b4temp.c` leaves and `b4ld.c` does not overwrite. The instance
 //! is the deck's only one, so it is the instance C checks.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::devices::{ModelResolver, bsim4};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// `(label, instance parameters, model card, .temp in Celsius)`.
 fn decks() -> Vec<(&'static str, &'static str, &'static str, f64)> {
@@ -82,18 +76,16 @@ fn decks() -> Vec<(&'static str, &'static str, &'static str, f64)> {
 }
 
 fn probe(binary: &Path, label: &str, text: &str) -> String {
-    let directory = Scratch(std::env::temp_dir().join(format!(
-        "bsim4-temp-{}-{}",
-        std::process::id(),
-        label.replace(' ', "-")
-    )));
-    fs::create_dir_all(&directory.0).unwrap();
-    fs::write(directory.0.join("probe.cir"), text).unwrap();
-    let output = Command::new(binary)
-        .args(["-b", "probe.cir"])
-        .current_dir(&directory.0)
-        .output()
-        .unwrap();
+    let directory =
+        Scratch::new("c-bsim4-temp-reference").unwrap_or_else(|error| panic!("{label}: {error}"));
+    fs::write(directory.path().join("probe.cir"), text).unwrap();
+    let output = run(
+        binary,
+        directory.path(),
+        &["-b", "probe.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .unwrap();
     String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr)
 }
 

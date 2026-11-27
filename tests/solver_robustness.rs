@@ -122,15 +122,24 @@ fn small_pivots_are_accepted_like_c() {
 }
 
 /// `resparam.c` raises a zero resistance to `RESMIN = 1e-12` (with a
-/// warning). The 1e12 S conductance then loses digits, and C's answer
-/// (`b = 9.99999999999999001e-01`, `v1#branch = -9.7656250000000000e-04`)
-/// is reproduced exactly.
+/// warning). The 1e12 S conductance then loses digits. C's reference
+/// is `b = 9.99999999999999001e-01` and
+/// `v1#branch = -9.7656250000000000e-04`. The branch-current result
+/// suffers cancellation at 1e12 S, so compare within a few FP rounding
+/// steps on its physical 1 V / 1 kohm current scale, not bit-for-bit.
 #[test]
 fn zero_resistance_is_clamped_like_c() {
     for r1 in ["r1 a b 0", "r1 a b rm r=0\n.model rm r"] {
         let plot = simulate(&format!("v1 a 0 1\n{r1}\nr2 b 0 1k\n.op")).unwrap();
         assert_eq!(value(&plot, "v(b)"), 9.999_999_999_999_99e-1, "{r1}");
-        assert_eq!(value(&plot, "i(v1)"), -9.765_625e-4, "{r1}");
+        let branch_current = value(&plot, "i(v1)");
+        let expected = -9.765_625e-4;
+        let current_scale = 1e-3; // 1 V source into the 1 kohm load
+        let bound = 8. * f64::EPSILON * current_scale;
+        assert!(
+            (branch_current - expected).abs() <= bound,
+            "{r1}: branch current {branch_current:e}, C {expected:e}, bound {bound:e}"
+        );
     }
 }
 
@@ -153,4 +162,128 @@ fn zero_capacitance_and_inductance_simulate() {
     ] {
         simulate(body).unwrap_or_else(|error| panic!("{body}: {error}"));
     }
+}
+
+/// Optional quality telemetry must not overflow while the physical residual
+/// ratio is finite, or erase cancelling entries before summation.
+#[test]
+fn original_backward_error_retains_extreme_real_products_and_small_residuals() {
+    use ngspice_rs::maths::equilibration::OriginalResidual;
+
+    let huge = f64::MAX;
+    let tiny = f64::from_bits(1);
+    let m = [(0, 0, huge)];
+    let report = OriginalResidual::real(1, &m, false)
+        .unwrap()
+        .evaluate(&[huge], &[2.])
+        .unwrap();
+    assert!((report.maximum - 1. / 3.).abs() < 1e-15, "{report:?}");
+    let mut correction = [0.];
+    OriginalResidual::real(1, &m, false)
+        .unwrap()
+        .evaluate_with_correction(&[huge], &[2.], &mut correction)
+        .unwrap();
+    assert_eq!(correction, [-huge]);
+
+    let m = [(0, 0, tiny)];
+    let report = OriginalResidual::real(1, &m, false)
+        .unwrap()
+        .evaluate(&[tiny], &[2.])
+        .unwrap();
+    assert!((report.maximum - 1. / 3.).abs() < 1e-15, "{report:?}");
+    OriginalResidual::real(1, &m, false)
+        .unwrap()
+        .evaluate_with_correction(&[tiny], &[2.], &mut correction)
+        .unwrap();
+    assert_eq!(correction, [-tiny]);
+
+    let m = [(0, 0, huge), (0, 1, -huge)];
+    let report = OriginalResidual::real(2, &m, false)
+        .unwrap()
+        .evaluate(&[0., 0.], &[2., 2.])
+        .unwrap();
+    assert_eq!(report.rows, [0., 0.]);
+    assert_eq!(report.maximum, 0.);
+    let m = [(0, 0, huge)];
+    let ratio = OriginalResidual::real(1, &m, false).unwrap();
+    assert_eq!(
+        ratio
+            .evaluate_with_correction(&[0.], &[3.], &mut correction)
+            .unwrap()
+            .maximum,
+        1.
+    );
+    assert_eq!(correction, [f64::NEG_INFINITY]);
+}
+
+/// The very same original operator can evaluate normal, transposed, and
+/// repeated RHS without allocating a new coefficient snapshot or refactoring.
+#[test]
+fn original_backward_error_uses_transposed_equations_and_many_rhs() {
+    use ngspice_rs::maths::equilibration::OriginalResidual;
+
+    let a = [(0, 0, 1.), (0, 1, 2.), (1, 0, 3.), (1, 1, 4.)];
+    let normal = OriginalResidual::real(2, &a, false).unwrap();
+    let transposed = OriginalResidual::real(2, &a, true).unwrap();
+    let x1 = [1., 1.];
+    let x2 = [2., -1.];
+    let b1 = [3., 7.];
+    let b2 = [0., 2.];
+    let bt1 = [4., 6.];
+    let bt2 = [-1., 0.];
+    assert_eq!(normal.evaluate(&b1, &x1).unwrap().maximum, 0.);
+    assert_eq!(transposed.evaluate(&bt1, &x1).unwrap().maximum, 0.);
+    let pairs: [(&[f64], &[f64]); 2] = [(&b1, &x1), (&b2, &x2)];
+    assert_eq!(
+        normal
+            .evaluate_many(&pairs)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.maximum)
+            .collect::<Vec<_>>(),
+        [0., 0.]
+    );
+    assert_eq!(transposed.evaluate(&bt2, &x2).unwrap().maximum, 0.);
+    assert!(normal.evaluate(&bt1, &x1).unwrap().maximum > 0.);
+    assert!(normal.evaluate(&[f64::NAN, 0.], &x1).is_err());
+    assert!(normal.evaluate(&b1, &[1.]).is_err());
+    assert!(OriginalResidual::real(2, &[(2, 0, 1.)], false).is_err());
+    assert!(OriginalResidual::real(1, &[(0, 0, f64::INFINITY)], false).is_err());
+}
+
+/// Complex residuals retain their phase and products even where the
+/// unnormalized imaginary product would exceed the binary64 exponent range.
+#[test]
+fn original_backward_error_inspects_complex_phases_and_transpose() {
+    use ngspice_rs::maths::equilibration::OriginalResidual;
+    use ngspice_rs::primitives::Complex;
+
+    let huge = f64::MAX;
+    let a = [(0, 0, Complex::new(huge, huge))];
+    let report = OriginalResidual::complex(1, &a, false)
+        .unwrap()
+        .evaluate(&[Complex::ZERO], &[Complex::new(1., 1.)])
+        .unwrap();
+    assert_eq!(report.maximum, 0.5);
+
+    let a = [
+        (0, 0, Complex::new(1., 2.)),
+        (0, 1, Complex::new(2., -1.)),
+        (1, 0, Complex::new(3., 0.)),
+        (1, 1, Complex::new(0., -1.)),
+    ];
+    let x = [Complex::new(1., 0.), Complex::new(0., 1.)];
+    let b = [Complex::new(2., 4.), Complex::new(4., 0.)];
+    let bt = [Complex::new(1., 5.), Complex::new(3., -1.)];
+    assert_eq!(
+        OriginalResidual::complex(2, &a, false)
+            .unwrap()
+            .evaluate(&b, &x)
+            .unwrap()
+            .maximum,
+        0.
+    );
+    let transposed = OriginalResidual::complex(2, &a, true).unwrap();
+    assert_eq!(transposed.evaluate(&bt, &x).unwrap().maximum, 0.);
+    assert_eq!(transposed.evaluate_many(&[(&bt, &x)]).unwrap().len(), 1);
 }

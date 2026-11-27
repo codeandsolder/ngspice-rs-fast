@@ -1,21 +1,15 @@
 //! Opt-in end-to-end BSIM3 comparison: the port's own `.op` solution against
 //! C's, including internal-node circuits (RSH/NRD/NRS) and PMOS polarity.
 //! `.dc`, `.ac` and `.tran` are compared in `c_bsim3_small_signal_reference.rs`.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::analysis::RunConfig;
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn c_values(log: &str) -> BTreeMap<String, f64> {
     log.lines()
@@ -74,15 +68,15 @@ fn operating_point_matches_c() {
              .control\nset numdgt=17\nop\nprint all\n\
              print @m1[id] @m1[gm] @m1[gds] @m1[gmbs] @m1[vth] @m1[vdsat]\nquit\n.endc\n.end\n"
         );
-        let directory =
-            Scratch(std::env::temp_dir().join(format!("bsim3-dev-{}-{index}", std::process::id())));
-        fs::create_dir_all(&directory.0).unwrap();
-        fs::write(directory.0.join("probe.cir"), &deck).unwrap();
-        let output = Command::new(&binary)
-            .args(["-b", "probe.cir"])
-            .current_dir(&directory.0)
-            .output()
-            .unwrap();
+        let directory = Scratch::new("c-bsim3-device-reference").unwrap();
+        fs::write(directory.path().join("probe.cir"), &deck).unwrap();
+        let output = run(
+            &binary,
+            directory.path(),
+            &["-b", "probe.cir"],
+            ProcessLimits::ORACLE,
+        )
+        .unwrap();
         let log = String::from_utf8_lossy(&output.stdout).into_owned()
             + &String::from_utf8_lossy(&output.stderr);
         assert!(!log.contains("aborted"), "case {index}: {log}");

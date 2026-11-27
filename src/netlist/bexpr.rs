@@ -284,82 +284,91 @@ pub fn is_builtin_function(name: &str) -> bool {
 pub const SPECIAL_NAMES: &[&str] = &["time", "temper", "hertz", "pi", "e"];
 
 impl BExpr {
-    /// Check a subtree before recursively cloning it at its destination depth.
-    pub(super) fn check_tree(&self, depth: usize, budget: &mut TreeBudget) -> SpiceResult<()> {
-        budget.charge(depth, 1, &self.span.start)?;
-        let mut child = |expr: &Self| expr.check_tree(depth + 1, budget);
+    /// Visit behavioural children in original preorder. The embedded numparam
+    /// tree inside Value is not a behavioural child: callers decide whether
+    /// to account for it, since compiled programs reject unevaluated values.
+    fn try_children<'a, E>(
+        &'a self,
+        visit: &mut impl FnMut(&'a Self) -> Result<(), E>,
+    ) -> Result<(), E> {
         match &self.kind {
-            BExprKind::Unary { operand, .. } | BExprKind::Group(operand) => child(operand)?,
+            BExprKind::Unary { operand, .. } | BExprKind::Group(operand) => visit(operand),
             BExprKind::Binary { lhs, rhs, .. } => {
-                child(lhs)?;
-                child(rhs)?;
+                visit(lhs)?;
+                visit(rhs)
             }
             BExprKind::Ternary {
                 condition,
                 then,
                 otherwise,
             } => {
-                child(condition)?;
-                child(then)?;
-                child(otherwise)?;
+                visit(condition)?;
+                visit(then)?;
+                visit(otherwise)
             }
             BExprKind::Call { arguments, .. } => {
                 for argument in arguments {
-                    child(argument)?;
+                    visit(argument)?;
                 }
+                Ok(())
             }
             BExprKind::Table(table) => {
-                child(&table.input)?;
+                visit(&table.input)?;
                 for (x, y) in &table.points {
-                    child(x)?;
-                    child(y)?;
+                    visit(x)?;
+                    visit(y)?;
                 }
+                Ok(())
             }
-            BExprKind::Value(value) => {
-                value.root.check_tree(depth + 1, budget)?;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Visits every node, parents before children.
-    pub fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Self)) {
-        visitor(self);
-        match &self.kind {
             BExprKind::Number { .. }
             | BExprKind::Name(_)
             | BExprKind::Voltage { .. }
             | BExprKind::Current(_)
-            | BExprKind::Value(_) => {}
-            BExprKind::Unary { operand, .. } | BExprKind::Group(operand) => {
-                operand.visit(visitor);
-            }
-            BExprKind::Binary { lhs, rhs, .. } => {
-                lhs.visit(visitor);
-                rhs.visit(visitor);
-            }
-            BExprKind::Ternary {
-                condition,
-                then,
-                otherwise,
-            } => {
-                condition.visit(visitor);
-                then.visit(visitor);
-                otherwise.visit(visitor);
-            }
-            BExprKind::Call { arguments, .. } => {
-                for argument in arguments {
-                    argument.visit(visitor);
-                }
-            }
-            BExprKind::Table(table) => {
-                table.input.visit(visitor);
-                for (x, y) in &table.points {
-                    x.visit(visitor);
-                    y.visit(visitor);
-                }
-            }
+            | BExprKind::Value(_) => Ok(()),
+        }
+    }
+
+    /// Shared bounded preorder traversal for mutable admission state. Every
+    /// behavioural node is charged before its children, and an optional
+    /// embedded numparam value is charged after its behavioural wrapper.
+    /// No child inventory is materialized and the first error is propagated.
+    pub(crate) fn walk_bounded<S>(
+        &self,
+        depth: usize,
+        state: &mut S,
+        on_node: &mut impl FnMut(&Self, usize, &mut S) -> SpiceResult<()>,
+        on_value: &mut impl FnMut(&ParameterExpression, usize, &mut S) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        on_node(self, depth, state)?;
+        let child_depth = depth + 1;
+        if let BExprKind::Value(value) = &self.kind {
+            return on_value(value, child_depth, state);
+        }
+        self.try_children(&mut |child| child.walk_bounded(child_depth, state, on_node, on_value))
+    }
+
+    /// Check a subtree before recursively cloning it at its destination depth.
+    /// Unlike device compilation, AST construction also counts the embedded
+    /// numparam subtree of Value, which may be cloned during elaboration.
+    pub(super) fn check_tree(&self, depth: usize, budget: &mut TreeBudget) -> SpiceResult<()> {
+        self.walk_bounded(
+            depth,
+            budget,
+            &mut |node, depth, budget| budget.charge(depth, 1, &node.span.start),
+            &mut |value, depth, budget| value.root.check_tree(depth, budget).map(|_| ()),
+        )
+    }
+
+    /// Visits every behavioural node, parents before children. Numparam
+    /// Value contents belong to a separate expression language.
+    pub fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Self)) {
+        visitor(self);
+        match self.try_children(&mut |child| {
+            child.visit(visitor);
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(()) => {}
+            Err(never) => match never {},
         }
     }
 
@@ -432,14 +441,12 @@ impl BExpr {
     }
 }
 
-/// Replicate the numeric rounding of the C B-source literal rewriter.
+/// Retain the eleven-significant-digit B-source literal rewrite.
 ///
 /// Rounds a value to the 11 significant digits that `inp_modify_exp()`
 /// (`src/frontend/inpcom.c`) keeps when it re-prints a B-source literal with
-/// `%18.10e`, then reads the printed text back the way the B-source lexer
-/// does (`PTlex` -> `INPevaluate()`, which is not correctly rounded: C's
-/// `5.0000000000e-01` is 0.49999999999999994). Non-finite input is returned
-/// unchanged.
+/// `%18.10e`, then correctly rounds the resulting decimal to binary64.
+/// Non-finite input is returned unchanged.
 #[must_use]
 pub fn round_like_c_literal(value: Real) -> Real {
     if !value.is_finite() {
@@ -452,15 +459,157 @@ pub fn round_like_c_literal(value: Real) -> Real {
 mod tests {
     use super::*;
 
+    fn span(line: u32) -> SourceSpan {
+        let loc = crate::primitives::SourceLoc::new(
+            std::path::PathBuf::from("behavioural-budget.cir"),
+            line,
+            1,
+        );
+        SourceSpan {
+            start: loc.clone(),
+            end: loc,
+            logical: 0..1,
+        }
+    }
+
+    fn expr(kind: BExprKind, line: u32) -> BExpr {
+        BExpr {
+            kind,
+            span: span(line),
+        }
+    }
+
+    fn literal(line: u32) -> BExpr {
+        expr(
+            BExprKind::Number {
+                value: f64::from(line),
+                spelling: line.to_string(),
+            },
+            line,
+        )
+    }
+
+    #[test]
+    fn shared_child_inventory_preserves_preorder_and_mutable_visiting() {
+        use crate::netlist::expr::{Expr, ExprKind};
+        let value = ParameterExpression {
+            text: "inner".into(),
+            braced: true,
+            quoted: false,
+            span: span(90),
+            root: Expr {
+                kind: ExprKind::Identifier("inner".into()),
+                span: span(91),
+            },
+        };
+        let mut tree = expr(
+            BExprKind::Call {
+                name: "max".into(),
+                arguments: vec![
+                    expr(
+                        BExprKind::Unary {
+                            op: BUnaryOp::Minus,
+                            operand: Box::new(expr(
+                                BExprKind::Group(Box::new(expr(
+                                    BExprKind::Value(Box::new(value)),
+                                    4,
+                                ))),
+                                3,
+                            )),
+                        },
+                        2,
+                    ),
+                    expr(
+                        BExprKind::Binary {
+                            op: BBinaryOp::Add,
+                            lhs: Box::new(literal(6)),
+                            rhs: Box::new(expr(BExprKind::Name("node".into()), 7)),
+                        },
+                        5,
+                    ),
+                    expr(
+                        BExprKind::Ternary {
+                            condition: Box::new(expr(
+                                BExprKind::Voltage {
+                                    positive: "a".into(),
+                                    negative: Some("b".into()),
+                                },
+                                9,
+                            )),
+                            then: Box::new(expr(BExprKind::Current("v1".into()), 10)),
+                            otherwise: Box::new(expr(
+                                BExprKind::Table(Box::new(TableTransfer {
+                                    input: literal(12),
+                                    points: vec![(
+                                        expr(BExprKind::Name("x".into()), 13),
+                                        literal(14),
+                                    )],
+                                    domain: 0.1,
+                                })),
+                                11,
+                            )),
+                        },
+                        8,
+                    ),
+                ],
+            },
+            1,
+        );
+        let mut read = Vec::new();
+        tree.visit(&mut |node| read.push(node.span.start.line));
+        assert_eq!(read, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+        tree.visit_mut(&mut |node| {
+            if let BExprKind::Name(name) = &mut node.kind {
+                name.push_str("_changed");
+            }
+        });
+        let mut after = Vec::new();
+        tree.visit(&mut |node| after.push(node.span.start.line));
+        assert_eq!(after, read);
+        assert_eq!(tree.node_references(), ["a", "b"]);
+        assert_eq!(tree.current_references(), ["v1"]);
+        let mut names = Vec::new();
+        tree.visit(&mut |node| {
+            if let BExprKind::Name(name) = &node.kind {
+                names.push(name.as_str());
+            }
+        });
+        assert_eq!(names, ["node_changed", "x_changed"]);
+
+        // Each of the 14 behavioural nodes and the embedded numparam
+        // identifier must be charged by AST construction.
+        let mut enough = TreeBudget::new(15);
+        tree.check_tree(1, &mut enough).unwrap();
+        let mut short = TreeBudget::new(3);
+        let error = tree.check_tree(1, &mut short).unwrap_err();
+        assert!(error.to_string().contains("expression node limit"));
+        assert!(error.to_string().contains("behavioural-budget.cir:4:1"));
+    }
+
+    #[test]
+    fn child_traversal_stops_at_first_failure_without_reordering() {
+        let tree = expr(
+            BExprKind::Binary {
+                op: BBinaryOp::Add,
+                lhs: Box::new(literal(2)),
+                rhs: Box::new(literal(3)),
+            },
+            1,
+        );
+        let mut visited = Vec::new();
+        let result = tree.try_children(&mut |child| {
+            visited.push(child.span.start.line);
+            Err::<(), u32>(child.span.start.line)
+        });
+        assert_eq!(visited, [2]);
+        assert_eq!(result, Err(2));
+    }
+
     #[test]
     fn literals_are_rounded_to_eleven_significant_digits() {
-        // Values read back from the reference binary's B sources
-        // (`v=1.23456789012345`, `v=0.5`): INPevaluate of the %18.10e text.
-        assert_eq!(
-            round_like_c_literal(1.234_567_890_123_456),
-            1.234_567_890_100_000_1
-        );
-        assert_eq!(round_like_c_literal(0.5), 0.499_999_999_999_999_94);
+        // Preserve the decimal rewrite, not C's per-digit double rounding.
+        assert_eq!(round_like_c_literal(1.234_567_890_123_456), 1.234_567_890_1);
+        assert_eq!(round_like_c_literal(0.5), 0.5);
         assert_eq!(round_like_c_literal(-2.5e-3), -2.5e-3);
         assert_eq!(round_like_c_literal(0.0), 0.0);
         assert_eq!(round_like_c_literal(1e300), 1e300);

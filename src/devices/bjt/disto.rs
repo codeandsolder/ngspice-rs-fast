@@ -31,8 +31,6 @@
 //! phase itself (`PTF`) is rejected at instantiation, so the delayed `vbe`
 //! control equals `vbe`.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -40,10 +38,6 @@
 #![expect(
     clippy::float_cmp,
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
 )]
 
 use crate::devices::distortion::deriv::Dderivs;
@@ -54,7 +48,9 @@ use crate::primitives::{Real, SpiceError, SpiceResult};
 
 use super::{
     Bjt, Thermal,
-    physics::{base_current, early_denominator},
+    physics::{
+        RESISTANCE_REDUCTION_SERIES, RESISTANCE_SERIES_LIMIT, base_current, early_denominator,
+    },
 };
 
 /// The `dloadfns.c` coefficients `bjtdset.c` stores from a derivative
@@ -131,10 +127,11 @@ fn distortion_junction(
     gmin: Real,
 ) -> DistortionJunction {
     if voltage > -5. * vtn {
-        let ev = (voltage / vtn).exp();
-        let current = saturation * (ev - 1.) + gmin * voltage;
-        let first = saturation * ev / vtn + gmin;
-        let second = saturation * ev / vtn / vtn;
+        let (current, differential) =
+            crate::devices::nonlinear::exponential_junction(voltage, vtn, saturation);
+        let current = gmin.mul_add(voltage, current);
+        let first = differential + gmin;
+        let second = differential / vtn;
         let third = second / vtn;
         let main = JunctionDerivatives {
             current,
@@ -150,9 +147,8 @@ fn distortion_junction(
                 third: 0.,
             }
         } else {
-            let ev = (voltage / vleak).exp();
-            let current = leakage * (ev - 1.);
-            let first = leakage * ev / vleak;
+            let (current, first) =
+                crate::devices::nonlinear::exponential_junction(voltage, vleak, leakage);
             let second = first / vleak;
             let third = second / vleak;
             JunctionDerivatives {
@@ -236,7 +232,7 @@ fn distortion_base_charge(
     if oik == 0. && oikr == 0. {
         d_q1
     } else {
-        let q2 = oik * cbe + oikr * cbc;
+        let q2 = oik.mul_add(cbe, oikr * cbc);
         let mut d_q2 = d_p;
         d_q2.value = q2;
         d_q2.d1_p = oik * gbe;
@@ -245,7 +241,7 @@ fn distortion_base_charge(
         d_q2.d2_q2 = oikr * gbc2;
         d_q2.d3_p3 = oik * gbe3;
         d_q2.d3_q3 = oikr * gbc3;
-        let arg = c_max(0., 1. + 4. * q2);
+        let arg = c_max(0., 4_f64.mul_add(q2, 1.));
         let d_arg = if arg == 0. {
             let mut d = d_p;
             d.d1_p = 0.;
@@ -347,17 +343,32 @@ fn distortion_base_resistance(
             let mut d_dummy = d_p;
             d_dummy.value = c_max(cb / xjrb, 1e-9);
             d_dummy.d1_p = 1. / xjrb;
-            let d_dummy = d_dummy.sqrt().times(2.4317);
-            let mut d_dummy2 = d_p;
-            d_dummy2.value = 1. + 14.59025 * c_max(cb / xjrb, 1e-9);
-            d_dummy2.d1_p = 14.59025 / xjrb;
-            let mut d_dummy2 = d_dummy2.sqrt();
-            d_dummy2.value -= 1.0;
-            let d_z = d_dummy2.div(&d_dummy);
-            let d_tanz = d_z.tan();
-            let d_dummy = d_z.times(-1.0).plus(&d_tanz);
-            let d_dummy2 = d_tanz.mul(&d_tanz).mul(&d_z);
-            let mut d_rbb = d_dummy.div(&d_dummy2).times(3.0 * rbpi);
+            let numerator = d_dummy.sqrt().times(14.59025 / 2.4317);
+            let mut denominator = d_dummy.times(14.59025);
+            denominator.value += 1.;
+            let mut denominator = denominator.sqrt();
+            denominator.value += 1.;
+            let d_z = numerator.div(&denominator);
+            let mut d_rbb = if d_z.value.abs() < RESISTANCE_SERIES_LIMIT {
+                let squared = d_z.mul(&d_z);
+                // The same series as the ordinary bias kernel, lifted to
+                // the derivative tensor. Do not subtract nearly equal
+                // tan(z) and z, including their first derivatives.
+                let reduction = RESISTANCE_REDUCTION_SERIES.iter().rev().fold(
+                    Dderivs::default(),
+                    |value, &coefficient| {
+                        let mut next = value.mul(&squared);
+                        next.value += coefficient;
+                        next
+                    },
+                );
+                reduction.times(rbpi)
+            } else {
+                let d_tanz = d_z.tan();
+                let numerator = d_z.times(-1.0).plus(&d_tanz);
+                let denominator = d_tanz.mul(&d_tanz).mul(&d_z);
+                numerator.div(&denominator).times(3.0 * rbpi)
+            };
             d_rbb.value += rbpr;
             let d_vbb = d_rbb.mul(&d_p);
             if d_vbb.d1_p == 0. {
@@ -373,7 +384,7 @@ fn distortion_base_resistance(
                 * gbb1
                 * gbb1
                 * gbb1
-                * (-(d_vbb.d3_p3 / 6.0) + 2. * (d_vbb.d2_p2 * 0.5) * (d_vbb.d2_p2 * 0.5) * gbb1);
+                * (0.5 * d_vbb.d2_p2 * d_vbb.d2_p2).mul_add(gbb1, -(d_vbb.d3_p3 / 6.));
             let mut d = d_r;
             d.value = cb;
             d.d1_r = gbb1;
@@ -516,8 +527,8 @@ fn distortion_be_charge(
     } else {
         (0.5 * xme * (czbe / t.be.f2) / pe, 0.)
     };
-    d_qbe.d2_p2 += capbe2 * 2.;
-    d_qbe.d3_p3 += capbe3 * 6.;
+    d_qbe.d2_p2 = capbe2.mul_add(2., d_qbe.d2_p2);
+    d_qbe.d3_p3 = capbe3.mul_add(6., d_qbe.d3_p3);
     d_qbe
 }
 
@@ -578,10 +589,10 @@ impl Bjt {
         let n = self.nodes;
         let v = |node| context.voltage(node);
         let bias = DistortionBias {
-            vbe: pol * (v(n.bp) - v(n.ep)),
-            vbc: pol * (v(n.b) - v(n.cp)),
-            vsc: pol * (v(n.s) - v(n.cp)),
-            vbb: pol * (v(n.b) - v(n.bp)),
+            vbe: pol * (v(n.bp)? - v(n.ep)?),
+            vbc: pol * (v(n.b)? - v(n.cp)?),
+            vsc: pol * (v(n.s)? - v(n.cp)?),
+            vbb: pol * (v(n.b)? - v(n.bp)?),
         };
         let junctions = distortion_junctions(&t, bias, m, gmin);
         let d_qb = distortion_base_charge(&t, bias, m, &junctions);

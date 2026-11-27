@@ -1,18 +1,12 @@
 //! Opt-in #35 live C checks; no committed oracle data is overwritten.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use ngspice_rs::analysis::{RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::AnalysisKind;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-struct Cleanup(PathBuf);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use std::path::Path;
 
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs temporary C decks out of process"]
@@ -35,10 +29,8 @@ fn typed_resistor_temperature_and_nested_source_sweeps_match_c() {
         ("negative-resistance", modeled, "r1 -3k -4k -500"),
         ("nested-sources", sources, "i1 1m -1m -1m v1 2 1 -1"),
     ] {
-        let dir =
-            std::env::temp_dir().join(format!("spice-dc-oracle-{}-{tag}", std::process::id()));
-        fs::create_dir(&dir).unwrap();
-        let _cleanup = Cleanup(dir.clone());
+        let scratch = Scratch::new("c-dc-sweep-reference").unwrap();
+        let dir = scratch.path();
         let netlist = Parser::new()
             .parse_deck(&parse_deck_text(
                 Path::new("sweep.cir"),
@@ -53,11 +45,7 @@ fn typed_resistor_temperature_and_nested_source_sweeps_match_c() {
         fs::write(dir.join("sweep.cir"), format!(
             "DC oracle\n{body}\n.control\nset filetype=ascii\ndc {sweep}\nwrite result.raw\nquit\n.endc\n.end\n"
         )).unwrap();
-        let result = Command::new(&binary)
-            .args(["-b", "sweep.cir"])
-            .current_dir(&dir)
-            .output()
-            .unwrap();
+        let result = run(&binary, dir, &["-b", "sweep.cir"], ProcessLimits::ORACLE).unwrap();
         assert!(
             result.status.success(),
             "{tag}: {}\n{}",

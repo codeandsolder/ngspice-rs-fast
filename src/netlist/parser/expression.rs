@@ -37,6 +37,8 @@ pub(super) struct Ctx<'a> {
     /// `.func` formals named like a built-in function: a bare use binds to
     /// the formal, a call is an error (as in C's numparam). Empty elsewhere.
     pub shadowing: &'a [String],
+    /// Control vectors and variables may share names with callable functions.
+    pub control_names: bool,
 }
 
 impl Ctx<'_> {
@@ -148,6 +150,7 @@ pub(super) fn into_error(origin: SourcePosition<'_>, total: usize, fail: Fail) -
         depth: 0,
         remaining_nodes: MAX_TREE_NODES,
         shadowing: &[],
+        control_names: false,
     }
     .location(fail.remaining);
     if fail.unsupported {
@@ -491,7 +494,7 @@ fn identifier_or_call(input: &mut In<'_>) -> Res<Built<Expr>> {
         });
     }
     if !call {
-        if is_builtin_name(&lowered) {
+        if !input.state.control_names && is_builtin_name(&lowered) {
             return Err(cut(
                 start,
                 format!("function name '{name}' requires an argument list"),
@@ -609,6 +612,34 @@ pub(super) fn parse_with_budget(
     shadowing: &[String],
     remaining_nodes: usize,
 ) -> SpiceResult<(ParameterExpression, usize, usize)> {
+    parse_with_names(
+        text,
+        origin,
+        braced,
+        quoted,
+        shadowing,
+        remaining_nodes,
+        false,
+    )
+}
+
+pub(super) fn parse_control_expression(
+    text: &str,
+    origin: SourcePosition<'_>,
+) -> SpiceResult<ParameterExpression> {
+    parse_with_names(text, origin, false, false, &[], MAX_TREE_NODES, true)
+        .map(|(expression, _, _)| expression)
+}
+
+fn parse_with_names(
+    text: &str,
+    origin: SourcePosition<'_>,
+    braced: bool,
+    quoted: bool,
+    shadowing: &[String],
+    remaining_nodes: usize,
+    control_names: bool,
+) -> SpiceResult<(ParameterExpression, usize, usize)> {
     let mut input = In {
         input: text,
         state: Ctx {
@@ -617,6 +648,7 @@ pub(super) fn parse_with_budget(
             depth: 0,
             remaining_nodes,
             shadowing,
+            control_names,
         },
     };
     let run = |input: &mut In<'_>| -> Res<Built<Expr>> {

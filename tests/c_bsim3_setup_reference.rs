@@ -1,21 +1,15 @@
 //! Opt-in `b3check.c` diagnostic parity against C. The check messages embed
 //! the computed size-dependent parameters, so exact text equality also
 //! compares those numbers the way C reports them. Not a load/simulation test.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::devices::bsim3;
 use ngspice_rs::devices::{ModelContext, ModelResolver};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Check-log lines C writes to stderr, excluding its header and unrelated
 /// messages. C's version warning goes to stdout, so it cannot appear here.
@@ -47,14 +41,15 @@ fn model_card(card: &str) -> String {
 
 fn run_c(binary: &Path, deck: &str, tag: &str) -> (String, bool) {
     let directory =
-        Scratch(std::env::temp_dir().join(format!("bsim3-check-{}-{tag}", std::process::id())));
-    fs::create_dir_all(&directory.0).unwrap();
-    fs::write(directory.0.join("probe.cir"), deck).unwrap();
-    let output = Command::new(binary)
-        .args(["-b", "probe.cir"])
-        .current_dir(&directory.0)
-        .output()
-        .unwrap();
+        Scratch::new("c-bsim3-setup-reference").unwrap_or_else(|error| panic!("{tag}: {error}"));
+    fs::write(directory.path().join("probe.cir"), deck).unwrap();
+    let output = run(
+        binary,
+        directory.path(),
+        &["-b", "probe.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .unwrap();
     let log = String::from_utf8_lossy(&output.stdout).into_owned()
         + &String::from_utf8_lossy(&output.stderr);
     (log, output.status.success())

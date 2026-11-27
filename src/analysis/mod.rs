@@ -12,7 +12,7 @@
 //! | [`noise`] | `.noise`: adjoint small-signal noise spectra and integrated totals | resistor, diode, BJT, MOS1 and switch generators (`docs/port/NOISE.md`) |
 //! | [`driver`] | the typed [`AnalysisPlan`] and the `.op`/`.dc`/`.ac`/`.tran`/`.pz`/`.tf`/`.sp`/`.noise` drivers | linear DC/AC and the adaptive trap/Gear-2 companion transient |
 //! | `tf` | `.tf` DC small-signal gain, input and output resistance at the bias point | ported (`tfanal.c`; see [`AnalysisPlan`]) |
-//! | `sparam` | `.sp` S-parameter analysis over RF port sources (S, Y, Z) | ported without `donoise` (`docs/port/SPARAM.md`) |
+//! | `sparam` | `.sp` S-parameter analysis over RF port sources (S, Y, Z) | ported, including `donoise` (`docs/port/SPARAM.md`) |
 //!
 //! The C equivalent is `src/spicelib/analysis/` (21,993 lines: the `CKT*`
 //! job-control, loading and iteration machinery) and `src/frontend/rawfile.c`.
@@ -36,6 +36,7 @@ pub mod batch;
 pub mod bias;
 mod companion;
 pub mod config;
+pub mod control;
 pub mod disto;
 pub mod driver;
 pub mod fourier;
@@ -45,20 +46,27 @@ mod linear;
 pub mod measure;
 pub mod newton;
 pub mod noise;
+pub mod optimization;
 mod ordered_samples;
+mod output_probe;
+mod periodic_orbit;
 mod plan;
+mod pss;
 mod pz;
 pub mod rawfile;
+mod reduction;
 pub mod results;
 pub mod selection;
 mod sens;
 mod sparam;
 pub mod sweep;
 mod tf;
+pub mod touchstone;
 
 pub use companion::{TransientPlan, TransientStats, companion_transient, companion_transient_into};
 pub use config::{
-    AppliedOption, DcOptions, IgnoredOption, RunConfig, RunOverrides, TransientSettings,
+    AppliedOption, DcOptions, IgnoredOption, PlanningLimits, RunConfig, RunOverrides,
+    TransientSettings,
 };
 pub use driver::{
     AnalysisContext, AnalysisInput, AnalysisSupport, DRIVERS, NodeCondition, NoiseOptions,
@@ -66,14 +74,16 @@ pub use driver::{
 };
 pub use fourier::{FourierAnalysis, FourierWindow, Harmonic};
 pub use measure::{MeasureEvents, MeasureSpan, Measurement};
+pub use periodic_orbit::PeriodicOrbit;
 pub use plan::{AnalysisPlan, IntegrationFamily};
 pub use rawfile::{
     BinaryByteOrder, RawCollectPolicy, RawFile, RawFileReader, RawFileWriter, RawFormat, RawPlot,
-    RawPlotRows, RawReadPolicy, StreamedPlot,
+    RawPlotRows, RawReadPolicy,
 };
 pub use rawfile::{FinishedPlot, RawFileTransaction};
 pub use results::{ColumnView, Plot, PlotBuilder, PlotFlags, PlotSchema, PointSink, Variable};
 pub use selection::{Selection, print_requests, write_requests};
+pub use sparam::RfLimits;
 
 /// The C reference for the analysis drivers.
 ///

@@ -40,6 +40,7 @@ fn input_for(kind: AnalysisKind) -> AnalysisInput {
         AnalysisKind::Sensitivity => "v ( out )",
         AnalysisKind::TransferFunction => "v ( out ) v1",
         AnalysisKind::Transient => "1u 10u",
+        AnalysisKind::PeriodicSteadyState => "1k 1m out",
         AnalysisKind::Fourier => unreachable!("not a driver"),
     };
     AnalysisInput::with_arguments(kind, text.split_whitespace())
@@ -508,8 +509,7 @@ fn itl4_is_the_companion_newton_limit_per_timepoint() {
 #[test]
 fn xmu_weights_the_companion_trapezoidal_rule() {
     let c = config(".options xmu=0.3").unwrap();
-    // INPevaluate("0.3") is 3 * 0.1.
-    assert_eq!(c.transient().xmu, Some(3. * 0.1));
+    assert_eq!(c.transient().xmu, Some(0.3));
     assert_eq!(
         c.plan(tran()).unwrap().transient().unwrap().xmu(),
         c.transient().xmu.unwrap()
@@ -604,8 +604,8 @@ fn existing_effective_options_are_still_applied() {
     assert_eq!(c.context().nominal_temperature, 20.);
     let t = c.transient();
     assert_eq!(
-        (t.rtol, t.vntol, t.abstol, t.chgtol, t.trtol),
-        (Some(1e-4), Some(2e-6), Some(3e-12), Some(1e-13), Some(5.))
+        (c.context().reltol, t.vntol, t.abstol, t.chgtol, t.trtol),
+        (1e-4, Some(2e-6), Some(3e-12), Some(1e-13), Some(5.))
     );
     assert_eq!(
         (c.method(), c.maxord()),
@@ -636,10 +636,11 @@ fn every_analysis_with_an_operating_point_gets_the_deck_tolerances() {
         AnalysisKind::Sensitivity,
         AnalysisKind::TransferFunction,
         AnalysisKind::SParameter,
+        AnalysisKind::PeriodicSteadyState,
     ] {
         let request = c.plan(input_for(kind)).unwrap();
         let newton = &request.dc_settings().newton;
-        assert_eq!(newton.reltol, c.transient().rtol.unwrap(), "{kind:?}");
+        assert_eq!(newton.reltol, c.context().reltol, "{kind:?}");
         assert_eq!(newton.vntol, c.transient().vntol.unwrap(), "{kind:?}");
         assert_eq!(newton.abstol, c.transient().abstol.unwrap(), "{kind:?}");
     }
@@ -870,7 +871,7 @@ fn braced_and_quoted_option_values_evaluate_against_params() {
     assert_eq!(c.context().temperature, 50.);
     assert_eq!(c.context().nominal_temperature, 35.);
     close(c.context().gmin, 1e-7, 1e-12, 0.);
-    close(c.transient().rtol.unwrap(), 2e-3, 1e-12, 0.);
+    close(c.context().reltol, 2e-3, 1e-12, 0.);
     assert_eq!(c.dc().itl1, Some(150));
     assert_eq!(c.transient().xmu, Some(0.25));
     assert_eq!(c.applied()[0].value, "{t+10}");

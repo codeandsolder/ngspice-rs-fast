@@ -78,10 +78,10 @@ card 6 @netlists/m7_ic_latch_nodeset_op.cir:11:1 lines=11-11 continuations=0
   token 4 11:15 lparen "("
   token 5 11:16 word "vto"
   token 6 11:19 equals "="
-  token 7 11:20 number "0.7" value=7.000000000000001e-1
+  token 7 11:20 number "0.7" value=7e-1
   token 8 11:24 word "kp"
   token 9 11:26 equals "="
-  token 10 11:27 number "60u" value=5.9999999999999995e-5
+  token 10 11:27 number "60u" value=6e-5
   token 11 11:31 word "lambda"
   token 12 11:37 equals "="
   token 13 11:38 number "0.02" value=2e-2
@@ -104,7 +104,7 @@ card 7 @netlists/m7_ic_latch_nodeset_op.cir:12:1 lines=12-12 continuations=0
   token 7 12:20 number "-0.8" value=-8e-1
   token 8 12:25 word "kp"
   token 9 12:27 equals "="
-  token 10 12:28 number "25u" value=2.4999999999999998e-5
+  token 10 12:28 number "25u" value=2.5e-5
   token 11 12:32 word "lambda"
   token 12 12:38 equals "="
   token 13 12:39 number "0.03" value=3e-2

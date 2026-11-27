@@ -12,7 +12,7 @@ card 1 @netlists/rc_exp_tran.cir:6:1 lines=6-6 continuations=0
   token 6 6:13 number "0" value=0e0
   token 7 6:15 number "1" value=1e0
   token 8 6:17 number "0.2m" value=2e-4
-  token 9 6:22 number "0.3m" value=3.0000000000000003e-4
+  token 9 6:22 number "0.3m" value=3e-4
   token 10 6:27 number "1.5m" value=1.5e-3
   token 11 6:32 number "0.5m" value=5e-4
   token 12 6:36 rparen ")"
@@ -56,7 +56,7 @@ card 6 @netlists/rc_exp_tran.cir:11:1 lines=11-11 continuations=0
   raw: ".tran 5u 4m"
   kind: dot(.tran)
   token 1 11:1 word ".tran"
-  token 2 11:7 number "5u" value=4.9999999999999996e-6
+  token 2 11:7 number "5u" value=5e-6
   token 3 11:10 number "4m" value=4e-3
 card 7 @netlists/rc_exp_tran.cir:12:1 lines=12-12 continuations=0
   raw: ".end"

@@ -640,7 +640,8 @@ impl Device for TransmissionLine {
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Err(self.unsupported(".noise"))
     }
 
@@ -776,10 +777,7 @@ mod tests {
 
     // The former linear-scan implementation, kept only as an independent
     // regression oracle for index selection, interpolation and C rounding.
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "Preserve the previous non-fused C arithmetic"
-    )]
+    // Independent historical C-rounding oracle: keep unfused operations.
     fn scan_interpolate(history: &WaveformHistory, target: Real) -> [Real; 2] {
         let last = history.len() - 1;
         let mut index = 2;

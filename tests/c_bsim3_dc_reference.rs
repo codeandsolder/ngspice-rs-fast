@@ -1,21 +1,15 @@
 //! Opt-in differential test of the BSIM3 DC core against C's `b3ask.c`
 //! operating-point values. C supplies the converged internal bias, so this
 //! isolates the load physics from solver wiring that does not exist yet.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, run};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use ngspice_rs::devices::bsim3::{self, dc};
 use ngspice_rs::devices::{ModelContext, ModelResolver};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
-
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 // `cbs`/`cbd` in the instance table are capacitances (`BSIM3_CBSB/CBDB`);
 // the junction currents are `ibs`/`ibd` (`BSIM3_CBS/CBD`).
@@ -180,16 +174,15 @@ fn run_case(binary: &Path, index: usize, case: &Case, vgs: f64, vds: f64, family
         case.temp,
         ASKS.map(|ask| format!("@m1[{ask}]")).join(" "),
     );
-    let directory = Scratch(
-        std::env::temp_dir().join(format!("bsim3-dc-{}-{index}-{family}", std::process::id())),
-    );
-    fs::create_dir_all(&directory.0).unwrap();
-    fs::write(directory.0.join("probe.cir"), &deck).unwrap();
-    let output = Command::new(binary)
-        .args(["-b", "probe.cir"])
-        .current_dir(&directory.0)
-        .output()
-        .unwrap();
+    let directory = Scratch::new("c-bsim3-dc-reference").unwrap();
+    fs::write(directory.path().join("probe.cir"), &deck).unwrap();
+    let output = run(
+        binary,
+        directory.path(),
+        &["-b", "probe.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .unwrap();
     let log = String::from_utf8_lossy(&output.stdout).into_owned()
         + &String::from_utf8_lossy(&output.stderr);
     assert!(

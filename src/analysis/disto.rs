@@ -4,7 +4,7 @@
 //! frequency loop, the solves and the plots), `cktdisto.c` (`CKTdisto`: the
 //! source inputs and the device dispatch), `dkerproc.c` (`DkerProc`: the
 //! output scaling), `dloadfns.c` (the kernel polynomials, see
-//! [`crate::devices::distortion::add_products`]), `dsetparm.c`/`inp2dot.c`
+//! [`crate::devices::distortion::CircuitDistortion::add_products`]), `dsetparm.c`/`inp2dot.c`
 //! (the card) and the device routines summarised in
 //! [`crate::devices::distortion`].
 //!
@@ -37,16 +37,16 @@
 //! 1)` (so it measures `pts + 2` frequencies) while `f <= fstop +
 //! delta*reltol`.
 
-use crate::analysis::frequency::{Advance, FrequencyGrid};
+use crate::analysis::frequency::{Advance, FrequencyPlan};
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::results::Plot;
 use crate::analysis::{AnalysisContext, AnalysisPlan};
-use crate::devices::distortion::{
-    CircuitDistortion, DistortionInput, Kernels, Product, add_products, circuit_distortion,
-};
-use crate::devices::{Circuit, LinearSystem, SourceKind};
-use crate::maths::complex::ComplexMatrix;
-use crate::primitives::{Complex, Real, SpiceError, SpiceResult, parse_spice_number};
+use crate::devices::Circuit;
+use crate::devices::distortion::circuit_distortion;
+use crate::primitives::{Real, SpiceResult, parse_spice_number};
+
+mod workspace;
+use workspace::{Inputs, Workspace};
 
 /// C's default `CKTreltol`, the frequency-loop tolerance without `.option
 /// reltol`.
@@ -145,7 +145,7 @@ pub(super) fn parse(arguments: &[String]) -> SpiceResult<DistoCard> {
 }
 
 /// `distoan.c`'s frequency sweep.
-pub(super) fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<Vec<Real>> {
+pub(super) fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<FrequencyPlan> {
     let n = Real::from(card.steps);
     let (delta, tolerance) = match card.stepping {
         Stepping::Decade => {
@@ -170,147 +170,7 @@ pub(super) fn frequencies(card: &DistoCard, reltol: Real) -> SpiceResult<Vec<Rea
         Stepping::Linear if delta == 0. => Advance::Single,
         Stepping::Linear => Advance::Add(delta),
     };
-    FrequencyGrid::new(card.start, card.stop, tolerance, advance, ".disto")?.collect()
-}
-
-/// `NIdIter`: solves `(A + j omega E) x = rhs` on the circuit's matrix at
-/// `CKTomega = omega`, negative for `f1 - f2` below `f2`, factoring even for
-/// a zero right-hand side as C does (the factorization is shared state).
-/// When the system does not fit the circuit's elements, a negative `omega`
-/// is solved as the conjugate of the positive-frequency system, which is
-/// exact for the real operators `A` and `E`.
-fn solve_at(
-    circuit: &Circuit,
-    system: &LinearSystem,
-    omega: Real,
-    rhs: &[Complex],
-) -> SpiceResult<Vec<Complex>> {
-    if let Some(pattern) = circuit.matrix_pattern()
-        && let Some(matrix) = ComplexMatrix::from_operators_grouped_on(
-            &pattern,
-            &system.a,
-            &system.e,
-            &system.e_groups,
-            omega,
-        )?
-    {
-        let lu = matrix.factorize()?;
-        if rhs.iter().all(|value| *value == Complex::ZERO) {
-            return Ok(vec![Complex::ZERO; rhs.len()]);
-        }
-        return lu.solve(rhs);
-    }
-    let flip = omega < 0.;
-    let matrix =
-        ComplexMatrix::from_operators_grouped(&system.a, &system.e, &system.e_groups, omega.abs())?;
-    let lu = matrix.factorize()?;
-    if rhs.iter().all(|value| *value == Complex::ZERO) {
-        return Ok(vec![Complex::ZERO; rhs.len()]);
-    }
-    if flip {
-        let conjugated: Vec<Complex> = rhs.iter().map(|value| value.conj()).collect();
-        Ok(lu
-            .solve(&conjugated)?
-            .into_iter()
-            .map(Complex::conj)
-            .collect())
-    } else {
-        lu.solve(rhs)
-    }
-}
-
-/// The first-order forcing of the `distof1` (`second = false`) or `distof2`
-/// inputs (`cktdisto.c` `D_RHSF1`/`D_RHSF2`).
-fn input_rhs(
-    system: &LinearSystem,
-    distortion: &CircuitDistortion,
-    second: bool,
-) -> SpiceResult<Vec<Complex>> {
-    let mut rhs = vec![Complex::ZERO; system.a.rows()];
-    for (name, f1, f2) in &distortion.inputs {
-        let Some(input): Option<DistortionInput> = (if second { *f2 } else { *f1 }) else {
-            continue;
-        };
-        let source = system
-            .sources
-            .iter()
-            .find(|source| source.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| {
-                SpiceError::circuit(format!("distortion input source {name} has no AC row"))
-            })?;
-        // cktdisto.c drives a current source's input as `rhs[pos] = -0.5 mag
-        // e^(j phase)`, `rhs[neg] = +...`: the opposite of the AC and DC
-        // stamps (`isrcacld.c`, `isrcload.c` add the value at `pos`), so a
-        // current input enters with the inverted sign. A voltage source sets
-        // its branch row as its AC stamp does.
-        let phasor = match source.kind {
-            SourceKind::Voltage => input.phasor(),
-            SourceKind::Current => {
-                let p = input.phasor();
-                Complex::new(-p.re, -p.im)
-            }
-        };
-        for (row, sign) in &source.rows {
-            rhs[*row] = rhs[*row] + Complex::new(sign * phasor.re, sign * phasor.im);
-        }
-    }
-    Ok(rhs)
-}
-
-fn scaled(values: &[Complex], k: Real) -> Vec<Complex> {
-    values
-        .iter()
-        .map(|value| Complex::new(k * value.re, k * value.im))
-        .collect()
-}
-
-fn harmonic_outputs(
-    products: &impl Fn(Product, Kernels<'_>, Real) -> SpiceResult<Vec<Complex>>,
-    base: Kernels<'_>,
-    h2: &[Complex],
-    omega1: Real,
-) -> SpiceResult<Vec<Vec<Complex>>> {
-    let h3 = products(
-        Product::ThreeF1,
-        Kernels {
-            h2: Some(h2),
-            ..base
-        },
-        3. * omega1,
-    )?;
-    Ok(vec![scaled(h2, 2.), scaled(&h3, 2.)])
-}
-
-fn intermodulation_outputs(
-    products: &impl Fn(Product, Kernels<'_>, Real) -> SpiceResult<Vec<Complex>>,
-    base: Kernels<'_>,
-    h2: &[Complex],
-    h1_f2: &[Complex],
-    omega1: Real,
-    omega2: Real,
-) -> SpiceResult<Vec<Vec<Complex>>> {
-    let with_f2 = Kernels {
-        h1_f2: Some(h1_f2),
-        ..base
-    };
-    let sum = products(Product::F1PlusF2, with_f2, omega1 + omega2)?;
-    let difference = products(Product::F1MinusF2, with_f2, omega1 - omega2)?;
-    // C computes the doubled frequency before subtracting f2.
-    let twice_omega1 = 2. * omega1;
-    let third = products(
-        Product::TwoF1MinusF2,
-        Kernels {
-            h2: Some(h2),
-            h2_minus: Some(&difference),
-            ..with_f2
-        },
-        twice_omega1 - omega2,
-    )?;
-    Ok(vec![
-        scaled(&sum, 4.),
-        scaled(&difference, 4.),
-        scaled(&third, 6.),
-    ])
+    FrequencyPlan::new(card.start, card.stop, tolerance, advance, ".disto")
 }
 
 fn output_plots(circuit: &Circuit, intermodulation: bool) -> SpiceResult<Vec<Plot>> {
@@ -341,7 +201,7 @@ pub(super) fn run(
     request: &AnalysisPlan,
     context: &AnalysisContext,
     card: &DistoCard,
-    grid: &[Real],
+    grid: &FrequencyPlan,
     include_bias: bool,
 ) -> SpiceResult<Vec<Plot>> {
     let settings = request.dc_settings().clone();
@@ -357,66 +217,14 @@ pub(super) fn run(
     let model = context.model_context();
     let distortion = circuit_distortion(circuit, &model, small.bias())?;
     let system = small.system();
-    let unknowns = circuit.unknowns();
-    let rhs_f1 = input_rhs(system, &distortion, false)?;
     let intermodulation = card.f2_over_f1.is_some();
-    let rhs_f2 = if intermodulation {
-        if !distortion.inputs.iter().any(|(_, _, f2)| f2.is_some()) {
-            // distoan.c E_NOF2SRC.
-            return Err(unsupported(
-                ".disto with f2overf1 needs a source with a distof2 input (distoan.c: No \
-                 source with f2 distortion input)",
-            ));
-        }
-        Some(input_rhs(system, &distortion, true)?)
-    } else {
-        None
-    };
+    let inputs = Inputs::bind(system, &distortion, intermodulation)?;
     let two_pi = 2. * std::f64::consts::PI;
     let omega2 = two_pi * card.start * card.f2_over_f1.unwrap_or(0.);
     let mut plots = output_plots(circuit, intermodulation)?;
-    let n = circuit.unknown_count();
-    let products = |product: Product, kernels: Kernels<'_>, omega: Real| {
-        let mut rhs = vec![Complex::ZERO; n];
-        add_products(
-            &distortion.terms,
-            product,
-            kernels,
-            omega,
-            unknowns,
-            &mut rhs,
-        )?;
-        solve_at(circuit, system, omega, &rhs)
-    };
-    for &freq in grid {
-        let omega1 = two_pi * freq;
-        let h1 = solve_at(circuit, system, omega1, &rhs_f1)?;
-        let base = Kernels {
-            h1: &h1,
-            h1_f2: None,
-            h2: None,
-            h2_minus: None,
-        };
-        let h2 = products(Product::TwoF1, base, 2. * omega1)?;
-        let outputs = match &rhs_f2 {
-            None => harmonic_outputs(&products, base, &h2, omega1)?,
-            Some(rhs_f2) => {
-                let h1_f2 = solve_at(circuit, system, omega2, rhs_f2)?;
-                intermodulation_outputs(&products, base, &h2, &h1_f2, omega1, omega2)?
-            }
-        };
-        for (plot, values) in plots.iter_mut().zip(outputs) {
-            let mut point = Vec::with_capacity(values.len() + 1);
-            point.push(Complex::real(freq));
-            point.extend(values);
-            plot.push_point(&point)?;
-        }
-    }
-    if plots.iter().any(|plot| !plot.is_finite()) {
-        return Err(SpiceError::Numerical {
-            context: ".disto".into(),
-            message: "nonfinite distortion response".into(),
-        });
+    let mut workspace = Workspace::new(circuit, system, inputs, &mut plots, grid.len())?;
+    for freq in grid.values() {
+        workspace.frequency(&distortion, freq, two_pi * freq, omega2, &mut plots)?;
     }
     retained.extend(plots);
     Ok(retained)
@@ -455,14 +263,59 @@ mod tests {
             f2_over_f1: None,
         };
         // lin measures pts + 2 frequencies.
-        let lin = frequencies(&card(Stepping::Linear, 3, 1e3, 4e3), 1e-3).unwrap();
+        let lin: Vec<_> = frequencies(&card(Stepping::Linear, 3, 1e3, 4e3), 1e-3)
+            .unwrap()
+            .values()
+            .collect();
         assert_eq!(lin, vec![1e3, 1.75e3, 2.5e3, 3.25e3, 4e3]);
-        let dec = frequencies(&card(Stepping::Decade, 2, 1e3, 1e5), 1e-3).unwrap();
+        let dec: Vec<_> = frequencies(&card(Stepping::Decade, 2, 1e3, 1e5), 1e-3)
+            .unwrap()
+            .values()
+            .collect();
         assert_eq!(dec.len(), 5);
         assert!((dec[4] / 1e5 - 1.).abs() < 1e-12);
-        let one = frequencies(&card(Stepping::Linear, 0, 1e3, 1e3), 1e-3).unwrap();
+        let one: Vec<_> = frequencies(&card(Stepping::Linear, 0, 1e3, 1e3), 1e-3)
+            .unwrap()
+            .values()
+            .collect();
         assert_eq!(one, vec![1e3]);
-        let oct = frequencies(&card(Stepping::Octave, 1, 1., 8.), 1e-3).unwrap();
+        let oct: Vec<_> = frequencies(&card(Stepping::Octave, 1, 1., 8.), 1e-3)
+            .unwrap()
+            .values()
+            .collect();
         assert_eq!(oct.len(), 4);
+    }
+    #[test]
+    fn distortion_source_rows_and_contributions_are_checked() {
+        use crate::devices::distortion::circuit_distortion;
+        use crate::devices::{Circuit, ModelContext};
+        use crate::maths::Vector;
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use std::path::Path;
+
+        let deck = Parser::new()
+            .parse_deck(&parse_deck_text(
+                Path::new("input.cir"),
+                "source test\nv1 a 0 0 distof1 2\nr1 a 0 1k\n.end\n",
+            ))
+            .unwrap();
+        let mut circuit = Circuit::from_netlist(&deck).unwrap();
+        let mut system = circuit.linear_system().unwrap();
+        let model = ModelContext::default();
+        let bias = Vector::zeros(circuit.unknown_count());
+        let distortion = circuit_distortion(&circuit, &model, &bias).unwrap();
+        assert!(super::Inputs::bind(&system, &distortion, false).is_ok());
+        let [source] = system.sources.as_mut_slice() else {
+            panic!("expected one source")
+        };
+        let original_rows = source.rows;
+        source.rows.push(usize::MAX, 1.).unwrap();
+        assert!(super::Inputs::bind(&system, &distortion, false).is_err());
+        let [source] = system.sources.as_mut_slice() else {
+            panic!("expected one source")
+        };
+        source.rows = original_rows;
+        source.rows[0].1 = f64::INFINITY;
+        assert!(super::Inputs::bind(&system, &distortion, false).is_err());
     }
 }

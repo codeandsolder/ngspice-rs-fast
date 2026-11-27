@@ -119,11 +119,21 @@ fn the_expansion_follows_urcsetup_names_and_order() {
     let (p, r0, c0): (Real, Real, Real) = (1.5, 1e-5 * 1000., 1e-5 * 1e-12);
     let r1 = (r0 * (p - 1.)) / ((2. * p.powf(3.)) - 2.);
     let c1 = (c0 * (p - 1.)) / (p.powf(2.) * (p + 1.) - 2.);
-    assert_eq!(parameter(&c, "u1#rlo1", "resistance"), r1);
-    assert_eq!(parameter(&c, "u1#rhi2", "resistance"), p * r1);
-    assert_eq!(parameter(&c, "u1#rlo3", "resistance"), p * p * r1);
-    assert_eq!(parameter(&c, "u1#clo1", "capacitance"), c1);
-    assert_eq!(parameter(&c, "u1#clo3", "capacitance"), p * p * c1);
+    // The ladder is normalized by actual positive geometric weights rather
+    // than subtracting nearly equal powers of K. That changes only the last
+    // bits of individual coefficients, without changing the physical model.
+    let same = |observed: Real, reference: Real| {
+        let tolerance = 4. * Real::EPSILON * reference.abs();
+        assert!(
+            (observed - reference).abs() <= tolerance,
+            "{observed:e} vs {reference:e} (tolerance {tolerance:e})"
+        );
+    };
+    same(parameter(&c, "u1#rlo1", "resistance"), r1);
+    same(parameter(&c, "u1#rhi2", "resistance"), p * r1);
+    same(parameter(&c, "u1#rlo3", "resistance"), p * p * r1);
+    same(parameter(&c, "u1#clo1", "capacitance"), c1);
+    same(parameter(&c, "u1#clo3", "capacitance"), p * p * c1);
 }
 
 #[test]
@@ -330,4 +340,254 @@ fn generated_urc_terminal_collision_is_case_insensitive_for_future_cards() {
     assert!(error.to_string().contains("collision"), "{error}");
     assert_eq!(circuit.device_count(), 0);
     assert_eq!(circuit.nodes().len(), 1);
+}
+
+fn limited_circuit(
+    body: &str,
+    limits: ngspice_rs::devices::ElaborationLimits,
+) -> SpiceResult<Circuit> {
+    let netlist = parse(body)?;
+    let models = ngspice_rs::devices::ModelResolver::new(&netlist.models)?;
+    let mut c = Circuit::with_elaboration_limits(limits);
+    c.add_instances(&netlist.devices, &models, &ModelContext::default())?;
+    c.finalize()?;
+    Ok(c)
+}
+
+#[test]
+fn capacitor_and_diode_ladders_use_exact_aggregate_resource_counts() {
+    use ngspice_rs::devices::ElaborationLimits;
+    for n in [1, 3, 7] {
+        for (model, primed, slots) in [
+            ("", false, 2),
+            ("isperl=1e-12 rsperl=0", false, 3),
+            ("isperl=1e-12 rsperl=10", true, 3),
+        ] {
+            let body = format!("u1 in out 0 m l=1m n={n}\n.model m urc {model}");
+            let shunts = 2 * n - 1;
+            let limits = ElaborationLimits {
+                devices: 4 * n,
+                nodes: 2 + shunts * (1 + usize::from(primed)),
+                state_slots: shunts * slots,
+            };
+            let c = limited_circuit(&body, limits).unwrap();
+            assert_eq!(c.device_count(), limits.devices);
+            assert_eq!(c.nodes().len() - 1, limits.nodes);
+            assert_eq!(c.state_len(), limits.state_slots);
+            let ordinary = circuit(&body).unwrap();
+            assert_eq!(names(&c), names(&ordinary));
+            assert_eq!(c.unknown_names(), ordinary.unknown_names());
+            for (smaller, label) in [
+                (
+                    ElaborationLimits {
+                        devices: limits.devices - 1,
+                        ..limits
+                    },
+                    "devices",
+                ),
+                (
+                    ElaborationLimits {
+                        nodes: limits.nodes - 1,
+                        ..limits
+                    },
+                    "non-ground nodes",
+                ),
+                (
+                    ElaborationLimits {
+                        state_slots: limits.state_slots - 1,
+                        ..limits
+                    },
+                    "state slots",
+                ),
+            ] {
+                let error = limited_circuit(&body, smaller).unwrap_err();
+                assert!(matches!(error, SpiceError::Parse { .. }), "{error}");
+                assert!(
+                    message(&error).contains("elaboration resource limit")
+                        && message(&error).contains(label),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn aggregate_generated_terminals_are_deduplicated_across_plans_and_existing_nodes() {
+    use ngspice_rs::devices::{ElaborationLimits, ModelResolver};
+    let mut netlist = parse("u1 a a 0 m l=1m n=1\nu2 b a 0 m l=1m n=1\n.model m urc").unwrap();
+    // Hand-built ASTs retain written case and aliases.
+    netlist.devices[0].nodes[1] = "A".into();
+    netlist.devices[1].nodes[2] = "GND".into();
+    let models = ModelResolver::new(&netlist.models).unwrap();
+    let mut c = Circuit::with_elaboration_limits(ElaborationLimits {
+        devices: 8,
+        nodes: 4,
+        state_slots: 4,
+    });
+    c.add_node("a").unwrap();
+    c.add_instances(&netlist.devices, &models, &ModelContext::default())
+        .unwrap();
+    c.finalize().unwrap();
+    assert_eq!(c.device_count(), 8);
+    assert_eq!(c.nodes().len(), 5);
+    assert_eq!(c.state_len(), 4);
+}
+
+#[test]
+fn aggregate_default_limit_precedes_any_large_ladder_materialization() {
+    use ngspice_rs::devices::ModelResolver;
+    use std::fmt::Write as _;
+    // Each line is individually valid with 10,000 sections; seven lines
+    // exceed the default 250,000 total materialized records.
+    let mut body = String::new();
+    for i in 1..=7 {
+        writeln!(body, "u{i} a b 0 m l=1m n=10000").unwrap();
+    }
+    body.push_str(".model m urc k=1.0001");
+    let netlist = parse(&body).unwrap();
+    let models = ModelResolver::new(&netlist.models).unwrap();
+    let mut c = Circuit::new();
+    // This collision would fail the first group immediately if it were
+    // materialized before checking the entire batch's aggregate plan.
+    c.add_node("u1#hi1").unwrap();
+    let before = c.nodes().nodes().to_vec();
+    let error = c
+        .add_instances(&netlist.devices, &models, &ModelContext::default())
+        .unwrap_err();
+    assert!(
+        message(&error).contains("280000 devices exceed 250000"),
+        "{error}"
+    );
+    assert_eq!(c.nodes().nodes(), before);
+    assert_eq!(c.device_count(), 0);
+}
+
+#[test]
+fn repeated_batches_and_late_ordinary_state_failure_preserve_finalized_bindings() {
+    use ngspice_rs::devices::{ElaborationLimits, ModelResolver};
+    let context = ModelContext::default();
+    let initial = parse("rkeep keep 0 1k\n.model m urc").unwrap();
+    let mut c = Circuit::with_elaboration_limits(ElaborationLimits {
+        devices: 10,
+        nodes: 12,
+        state_slots: 5,
+    });
+    let models = ModelResolver::new(&initial.models).unwrap();
+    c.add_instances(&initial.devices, &models, &context)
+        .unwrap();
+    let urc = parse("u1 a b 0 m l=1m n=1\n.model m urc").unwrap();
+    let models = ModelResolver::new(&urc.models).unwrap();
+    c.add_instances(&urc.devices, &models, &context).unwrap();
+    c.finalize().unwrap();
+    let before_nodes = c.nodes().nodes().to_vec();
+    let before_names = names(&c);
+    let before_unknowns = c.unknowns().clone();
+    let before_pattern = c.matrix_pattern().unwrap();
+    let bad = parse("u2 b c 0 m l=1m n=1\nc2 c 0 1n\n.model m urc").unwrap();
+    // The generated group alone fits; the ordinary capacitor contributes
+    // another two actual state slots after binding, so the whole batch fails.
+    let models = ModelResolver::new(&bad.models).unwrap();
+    let error = c
+        .add_instances(&bad.devices, &models, &context)
+        .unwrap_err();
+    assert!(
+        message(&error).contains("6 state slots exceed 5"),
+        "{error}"
+    );
+    assert_eq!(c.nodes().nodes(), before_nodes);
+    assert_eq!(names(&c), before_names);
+    assert_eq!(c.unknowns(), &before_unknowns);
+    assert!(std::sync::Arc::ptr_eq(
+        &before_pattern,
+        &c.matrix_pattern().unwrap()
+    ));
+    assert_eq!(c.state_len(), 2);
+    c.add_instances(&bad.devices[..1], &models, &context)
+        .unwrap();
+    c.finalize().unwrap();
+    assert_eq!(c.device_count(), 9);
+    assert_eq!(c.state_len(), 4);
+    let third = parse("u3 c d 0 m l=1m n=1\n.model m urc").unwrap();
+    let models = ModelResolver::new(&third.models).unwrap();
+    let error = c
+        .add_instances(&third.devices, &models, &context)
+        .unwrap_err();
+    assert!(message(&error).contains("13 devices exceed 10"), "{error}");
+    assert_eq!(c.device_count(), 9);
+    assert_eq!(c.state_len(), 4);
+}
+
+#[test]
+fn mixed_urc_txl_and_normal_records_share_the_complete_deck_budget() {
+    use ngspice_rs::devices::{ElaborationLimits, MutualLimits};
+    let body = "u1 a b 0 m l=1m n=2\ny1 b 0 c 0 ym\nrkeep c 0 1k\n.model m urc\n.model ym txl r=1e9 l=1e-2 c=1e-9 g=0 length=3e-11";
+    let netlist = parse(body).unwrap();
+    let limits = ElaborationLimits {
+        devices: 16,
+        nodes: 8,
+        state_slots: 14,
+    };
+    let c = Circuit::from_netlist_with_limits(
+        &netlist,
+        &ModelContext::default(),
+        MutualLimits::default(),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(c.device_count(), limits.devices);
+    assert_eq!(c.nodes().len() - 1, limits.nodes);
+    assert_eq!(c.state_len(), limits.state_slots);
+    assert_eq!(names(&c), names(&circuit(body).unwrap()));
+    for limit in [
+        ElaborationLimits {
+            devices: 15,
+            ..limits
+        },
+        ElaborationLimits { nodes: 7, ..limits },
+        ElaborationLimits {
+            state_slots: 13,
+            ..limits
+        },
+    ] {
+        let error = Circuit::from_netlist_with_limits(
+            &netlist,
+            &ModelContext::default(),
+            MutualLimits::default(),
+            limit,
+        )
+        .unwrap_err();
+        assert!(
+            message(&error).contains("elaboration resource limit"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn shared_model_defaults_keep_instance_geometry_and_failures_independent() {
+    let parsed = parse(
+        "u1 a b 0 m\nu2 b c 0 m l=3m n=1\nu3 c d 0 m n=0\nu4 c e 0 m\n.model m urc l=1m l=2m n=2 n=3",
+    )
+    .unwrap();
+    let models = ngspice_rs::devices::ModelResolver::new(&parsed.models).unwrap();
+    let context = ModelContext::default();
+    let mut c = Circuit::new();
+    c.add_instances(&parsed.devices[..2], &models, &context)
+        .unwrap();
+    assert_eq!(parameter(&c, "u1", "l"), 1e-3);
+    assert_eq!(parameter(&c, "u1", "n"), 2.);
+    assert_eq!(parameter(&c, "u2", "l"), 3e-3);
+    assert_eq!(parameter(&c, "u2", "n"), 1.);
+    assert_eq!(c.device_count(), 12);
+    assert!(
+        c.add_instances(&parsed.devices[2..3], &models, &context)
+            .is_err()
+    );
+    assert_eq!(c.device_count(), 12);
+    c.add_instances(&parsed.devices[3..], &models, &context)
+        .unwrap();
+    assert_eq!(parameter(&c, "u4", "l"), 1e-3);
+    assert_eq!(parameter(&c, "u4", "n"), 2.);
+    assert_eq!(c.device_count(), 20);
 }

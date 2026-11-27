@@ -346,13 +346,14 @@ fn real_stamp_uses_explicit_temperature_and_initial_conditions_remain_visible() 
     let solution = Vector::zeros(1);
     let mut context = StampContext {
         matrix: &mut matrix,
-        rhs: &mut rhs,
+        rhs: ngspice_rs::devices::traits::StampRhs::dense(&mut rhs),
         unknowns,
         nodes,
         solution: &solution,
         temperature: 77.0,
         nominal_temperature: 27.0,
         gmin: ngspice_rs::devices::DEFAULT_GMIN,
+        reltol: ngspice_rs::devices::DEFAULT_RELTOL,
         frequency: 0.,
         mode: AnalysisMode::OperatingPoint,
         branches: 0..0,
@@ -414,7 +415,7 @@ fn model_backed_capacitors_and_inductors_own_companion_state() {
     let circuit = Circuit::from_netlist(&n).unwrap();
     assert_eq!(circuit.state_rows(0), Some(0..2));
     assert_eq!(circuit.state_rows(1), Some(2..4));
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let solution = Vector::from_slice(&[1.0, 0.5]);
     let context = ModelContext::default();
     fn request<'a>(
@@ -495,7 +496,7 @@ fn fixed_passive_batches_match_unbound_stamps() {
     let n = circuit.unknown_count();
     let solution = Vector::from_slice(&[2., -1., 0.5]);
     assert_eq!(n, solution.len());
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history().unwrap();
     let model = ModelContext::default();
     let mut initial = history.trial();
     circuit
@@ -584,12 +585,22 @@ fn modeled_noise_uses_the_same_resistor_kernel_and_model_identity() {
     let literal = Resistor::new("r1", [NodeId::new(1), NodeId::GROUND], 4.)
         .unwrap()
         .with_noise(p.resistor_noise("rm"));
+    let mut modeled_sources = Vec::new();
+    let mut literal_sources = Vec::new();
     assert_eq!(
-        circuit.devices()[0].noise(&context).unwrap(),
-        literal.noise(&context).unwrap()
+        circuit.devices()[0]
+            .noise(&context, &mut modeled_sources)
+            .unwrap(),
+        literal.noise(&context, &mut literal_sources).unwrap()
     );
+    assert_eq!(modeled_sources, literal_sources);
     for device in &circuit.devices()[1..] {
-        assert_eq!(device.noise(&context).unwrap(), DeviceNoise::Noiseless);
+        modeled_sources.clear();
+        assert_eq!(
+            device.noise(&context, &mut modeled_sources).unwrap(),
+            DeviceNoise::Noiseless
+        );
+        assert!(modeled_sources.is_empty());
     }
 }
 

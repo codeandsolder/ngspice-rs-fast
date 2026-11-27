@@ -4,8 +4,9 @@
 //! ([`SmallSignal`]) are shared with the `.sp` driver
 //! (`crate::analysis::sparam`), because `span.c` steps frequencies and
 //! prepares its operating point exactly as `acan.c` does.
-use crate::analysis::frequency::{Advance, FrequencyGrid};
+use crate::analysis::frequency::{Advance, FrequencyPlan};
 use crate::analysis::linear::{number, plot, unsupported};
+use crate::analysis::results::SelectedOutput;
 use crate::analysis::{AnalysisPlan, Plot, PointSink};
 use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
@@ -17,11 +18,12 @@ pub(super) fn run(
     circuit: &mut Circuit,
     request: &AnalysisPlan,
     context: &crate::analysis::AnalysisContext,
-    grid: &[Real],
+    grid: &FrequencyPlan,
     include_bias: bool,
     sink: &mut dyn PointSink,
 ) -> SpiceResult<()> {
     let settings = request.dc_settings().clone();
+    circuit.finalize()?;
     let mut small_signal = SmallSignal::prepare(circuit, request, context, settings)?;
     for bias in small_signal.retained_bias(circuit, request, context, include_bias)? {
         sink.complete(bias)?;
@@ -34,24 +36,37 @@ pub(super) fn run(
         true,
     )?;
     sink.begin(&plot)?;
+    let mut selected = SelectedOutput::bind(sink, &plot, circuit.unknown_count(), true)?;
     // NIacIter on the circuit's own matrix: the first AC solve of the
     // circuit reorders (`SMPcReorder`, starting from the real pivot order),
     // later frequencies refactor (`SMPcLUfac`) and reorder only after a zero
     // pivot. See [`ac_matrix`].
     let shared: &Circuit = circuit;
     let mut point = Vec::with_capacity(plot.variable_count());
-    for &f in grid {
-        let x = small_signal.at_frequency(shared, context, f, |system| {
+    for f in grid.values() {
+        let x = small_signal.at_frequency(context, f, |system| {
             ac_matrix(shared, system, 2. * std::f64::consts::PI * f)?
                 .factorize()?
                 .solve(&system.ac_rhs())
         })?;
-        point.clear();
-        point.push(Complex::real(f));
-        point.extend(x);
-        point.extend(circuit.observe_parameters(&context.model_context().with_frequency(f))?);
-        plot.check_point(&point)?;
-        sink.point(&point)?;
+        let model = context.model_context().with_frequency(f);
+        let observed = if let Some(output) = selected.as_ref() {
+            small_signal
+                .prepared()
+                .observe_parameters_selected(&model, output.observations())?
+        } else {
+            small_signal.prepared().observe_parameters(&model)?
+        };
+        if let Some(output) = selected.as_mut() {
+            output.complex(sink, Some(f), &x, &observed)?;
+        } else {
+            point.clear();
+            point.push(Complex::real(f));
+            point.extend(x);
+            point.extend(observed);
+            plot.check_point(&point)?;
+            sink.point(&point)?;
+        }
     }
     sink.end()
 }
@@ -81,7 +96,7 @@ pub(super) fn frequency_grid(
     arguments: &[String],
     reltol: Real,
     kind: GridKind,
-) -> SpiceResult<Vec<Real>> {
+) -> SpiceResult<FrequencyPlan> {
     let argument = |index: usize| arguments.get(index).map(String::as_str);
     let mode = argument(0).unwrap_or_default().to_ascii_lowercase();
     // ACnumberSteps is IF_INTEGER: floor(0.5 + value).
@@ -134,7 +149,7 @@ pub(super) fn frequency_grid(
         GridKind::Ac => ".ac",
         GridKind::Sp => ".sp",
     };
-    FrequencyGrid::new(start, stop, tolerance, advance, analysis)?.collect()
+    FrequencyPlan::new(start, stop, tolerance, advance, analysis)
 }
 
 /// `CKTacLoad`: the small-signal system at `omega` loaded into the circuit's
@@ -165,10 +180,11 @@ pub(super) fn ac_matrix(
 
 /// The circuit linearized at its DC operating point, as `acan.c` and `span.c`
 /// prepare it before their frequency loops.
-pub(super) struct SmallSignal {
+pub(super) struct SmallSignal<'a> {
+    prepared: crate::devices::PreparedRun<'a>,
     settings: crate::analysis::bias::DcSettings,
     start: crate::analysis::bias::OperatingPointStart,
-    state1: Vec<Real>,
+    state1: crate::devices::StateSnapshot,
     system: LinearSystem,
     /// A `hertz`-dependent device forces a new operating point per frequency.
     varies: bool,
@@ -179,31 +195,33 @@ pub(super) struct SmallSignal {
     previous: Vector,
 }
 
-impl SmallSignal {
+impl<'a> SmallSignal<'a> {
     /// Solves the operating point and assembles the small-signal system.
     pub(crate) fn prepare(
-        circuit: &mut Circuit,
+        circuit: &'a Circuit,
         request: &AnalysisPlan,
         context: &crate::analysis::AnalysisContext,
         settings: crate::analysis::bias::DcSettings,
     ) -> SpiceResult<Self> {
-        circuit.finalize()?;
+        let prepared = circuit.prepare_run();
         let start = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?;
-        let solved = start.solve(circuit, &context.model_context(), &settings)?;
+        let solved = start.solve(&prepared, &context.model_context(), &settings)?;
         // The MODEINITSMSIG load's state writes outlive the analysis (C keeps
         // one CKTstate0 per deck): later analyses read them back.
-        circuit.record_small_signal_state(&context.model_context(), &solved.values)?;
+        prepared.record_small_signal_state(&context.model_context(), &solved.values)?;
         // acan.c reloads with MODEINITSMSIG after CKTop, and SWload/CSWload then
         // copy CKTstate1 into CKTstate0. CKTop never accepts or rotates states, so
         // CKTstate1 is still the zero ("really off") vector: the AC conductance of
         // a switch is that of the accepted history, not of the converged
         // operating point (`swacload.c`/`cswacld.c`). The operating point's own
         // trial state is therefore deliberately not used here.
-        let history = circuit.state_history();
-        let state1 = history
-            .accepted(1)
-            .map_or_else(|| vec![0.; history.len()], <[Real]>::to_vec);
-        let system = circuit.small_signal_system_at(
+        let history = circuit.state_history()?;
+        let state1 = circuit.bind_state(
+            history
+                .accepted(1)
+                .map_or_else(|| vec![0.; history.len()], <[Real]>::to_vec),
+        )?;
+        let system = prepared.small_signal_system_at(
             &context.model_context(),
             &solved.values,
             Some(&state1),
@@ -219,6 +237,7 @@ impl SmallSignal {
             .iter()
             .any(|device| device.small_signal_depends_on_frequency());
         Ok(Self {
+            prepared,
             settings,
             start,
             state1,
@@ -252,9 +271,13 @@ impl SmallSignal {
         point.extend(self.bias().as_slice().iter().copied().map(Complex::real));
         // Spectral observations support scalar instance parameters. Include
         // them in the bias row as well; its header already names them.
-        point.extend(circuit.observe_parameters(&context.model_context())?);
+        point.extend(self.prepared.observe_parameters(&context.model_context())?);
         plot.push_point(&point)?;
         Ok(vec![plot])
+    }
+
+    pub(super) const fn prepared(&self) -> &crate::devices::PreparedRun<'a> {
+        &self.prepared
     }
 
     /// The system linearized at the operating point (re-solved at the last
@@ -271,7 +294,7 @@ impl SmallSignal {
 
     /// The small-signal state (C's `CKTstate0` after the `MODEINITSMSIG`
     /// load): the zero accepted state.
-    pub(crate) fn state(&self) -> &[Real] {
+    pub(crate) const fn state(&self) -> &crate::devices::StateSnapshot {
         &self.state1
     }
 
@@ -289,7 +312,6 @@ impl SmallSignal {
     /// Calls `with` on the small-signal system valid at frequency `f`.
     pub(crate) fn at_frequency<R>(
         &mut self,
-        circuit: &Circuit,
         context: &crate::analysis::AnalysisContext,
         f: Real,
         with: impl FnOnce(&LinearSystem) -> SpiceResult<R>,
@@ -298,19 +320,22 @@ impl SmallSignal {
             let model = context.model_context().with_frequency(f);
             self.previous = self
                 .start
-                .solve_from(circuit, &model, &self.settings, &self.previous)?
+                .solve_from(&self.prepared, &model, &self.settings, &self.previous)?
                 .values;
             // C repeats MODEINITSMSIG after every frequency-dependent CKTop.
             // Preserve its carried device slots for the next bias and analysis.
-            circuit.record_small_signal_state(&model, &self.previous)?;
+            self.prepared
+                .record_small_signal_state(&model, &self.previous)?;
             self.system =
-                circuit.small_signal_system_at(&model, &self.previous, Some(&self.state1))?;
+                self.prepared
+                    .small_signal_system_at(&model, &self.previous, Some(&self.state1))?;
         } else if self.reassemble {
             // traacld.c loads exp(-j omega TD) at every frequency; the
             // operating point itself does not depend on it.
             let model = context.model_context().with_frequency(f);
             self.system =
-                circuit.small_signal_system_at(&model, &self.previous, Some(&self.state1))?;
+                self.prepared
+                    .small_signal_system_at(&model, &self.previous, Some(&self.state1))?;
         }
         with(&self.system)
     }
@@ -331,6 +356,8 @@ mod tests {
             kind,
         )
         .unwrap()
+        .values()
+        .collect()
     }
 
     #[test]
@@ -347,10 +374,91 @@ mod tests {
     }
 
     fn carried(circuit: &Circuit) -> Vec<Option<Real>> {
-        let history = circuit.state_history();
+        let history = circuit.state_history().unwrap();
         let mut trial = history.trial();
-        let state = history.device(&mut trial, 0..history.len()).unwrap();
-        (0..history.len()).map(|slot| state.carried(slot)).collect()
+        let mut values = Vec::new();
+        for index in 0..circuit.device_count() {
+            let state = history.device_of(&mut trial, index).unwrap();
+            values.extend((0..state.len()).map(|slot| state.carried(slot)));
+        }
+        values
+    }
+
+    #[test]
+    fn independent_ac_frequency_tiles_preserve_point_order_and_physical_solution() {
+        // Keep the scalar AC driver as the throughput baseline. Exercise
+        // the explicit independent batch against the same circuit and plot.
+        let text = "RC ladder\nv1 in 0 dc 2 ac 1\nr1 in mid 1k\nc1 mid 0 220n\nr2 mid out 680\nc2 out 0 47n\nr3 out 0 2k\n.end\n";
+        let parse = || {
+            Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("ac-independent.cir"), text))
+                .unwrap()
+        };
+        let context = AnalysisContext::default();
+        let request = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "9", "100", "900"])
+            .resolve()
+            .unwrap();
+        let mut reference_circuit = Circuit::from_netlist(&parse()).unwrap();
+        reference_circuit
+            .set_observations(&["@r1[resistance]".to_owned()])
+            .unwrap();
+        let reference = request.run(&mut reference_circuit, &context).unwrap();
+        assert_eq!(reference.point_count(), 9);
+        let mut circuit = Circuit::from_netlist(&parse()).unwrap();
+        circuit
+            .set_observations(&["@r1[resistance]".to_owned()])
+            .unwrap();
+        circuit.finalize().unwrap();
+        let small =
+            SmallSignal::prepare(&circuit, &request, &context, request.dc_settings().clone())
+                .unwrap();
+        assert!(!small.varies() && !small.reassembles());
+        let rhs = small.system().ac_rhs();
+        let rhs_lanes = [rhs.as_slice(); 4];
+        let mut batch = crate::maths::complex::IndependentComplexBatch::default();
+        let frequencies: Vec<_> = (1..=9).map(|index| f64::from(index) * 100.).collect();
+        let mut row = 0;
+        for tile in frequencies.chunks(4) {
+            let matrices = tile
+                .iter()
+                .map(|&f| ac_matrix(&circuit, small.system(), 2. * std::f64::consts::PI * f))
+                .collect::<SpiceResult<Vec<_>>>()
+                .unwrap();
+            let solved = batch
+                .solve(&matrices, &rhs_lanes[..matrices.len()], false)
+                .unwrap();
+            for (&f, solution) in tile.iter().zip(solved) {
+                let mut point = vec![Complex::real(f)];
+                point.extend(solution.unwrap());
+                point.extend(
+                    small
+                        .prepared()
+                        .observe_parameters(&context.model_context().with_frequency(f))
+                        .unwrap(),
+                );
+                assert_eq!(point.len(), reference.variable_count());
+                for (var, &actual) in reference.variables().iter().zip(&point) {
+                    let expected = reference.value(&var.name, row).unwrap();
+                    let scale = expected.re.abs().max(expected.im.abs()).max(1.);
+                    assert!(
+                        (actual.re - expected.re).abs() <= 2e-12 * scale,
+                        "{} at row {row}: {:?} != {:?}",
+                        var.name,
+                        actual,
+                        expected
+                    );
+                    assert!(
+                        (actual.im - expected.im).abs() <= 2e-12 * scale,
+                        "{} at row {row}: {:?} != {:?}",
+                        var.name,
+                        actual,
+                        expected
+                    );
+                }
+                row += 1;
+            }
+        }
+        assert_eq!(row, reference.point_count());
     }
 
     #[test]
@@ -360,7 +468,7 @@ mod tests {
             "BJT operating point\nvcc c 0 5\nvbase b 0 0.3\nq1 c b 0 qmod\n.model qmod npn (is=1e-15 bf=100 rb=100 cjc=2p xcjc=0.5 cjs=3p)\n.end\n",
         )).unwrap();
         let mut circuit = Circuit::from_netlist(&netlist).unwrap();
-        let mut same_bias = Circuit::from_netlist(&netlist).unwrap();
+        let same_bias = Circuit::from_netlist(&netlist).unwrap();
         let context = AnalysisContext::default();
         let request =
             AnalysisInput::with_arguments(AnalysisKind::OperatingPoint, std::iter::empty::<&str>())
@@ -368,7 +476,7 @@ mod tests {
                 .unwrap();
         crate::analysis::linear::op(&mut circuit, &request, &context).unwrap();
         let settings = request.dc_settings().clone();
-        SmallSignal::prepare(&mut same_bias, &request, &context, settings).unwrap();
+        SmallSignal::prepare(&same_bias, &request, &context, settings).unwrap();
         let expected = carried(&same_bias);
         assert!(expected.iter().flatten().any(|value| *value > 0.));
         assert_eq!(carried(&circuit), expected);
@@ -435,18 +543,16 @@ mod tests {
             Path::new("rebias.cir"),
             "frequency dependent BJT bias\nb1 c 0 v=5+hertz/100\nvbase b 0 dc 0.3 ac 1\nq1 c b 0 qmod\n.model qmod npn (is=1e-15 bf=100 rb=100 cjc=2p xcjc=0.5 cjs=3p)\n.end\n",
         )).unwrap();
-        let mut circuit = Circuit::from_netlist(&netlist).unwrap();
+        let circuit = Circuit::from_netlist(&netlist).unwrap();
         let context = AnalysisContext::default();
         let request = AnalysisInput::with_arguments(AnalysisKind::Ac, ["lin", "3", "100", "300"])
             .resolve()
             .unwrap();
         let settings = request.dc_settings().clone();
-        let mut small = SmallSignal::prepare(&mut circuit, &request, &context, settings).unwrap();
+        let mut small = SmallSignal::prepare(&circuit, &request, &context, settings).unwrap();
         assert!(small.varies());
         let initial = carried(&circuit);
-        small
-            .at_frequency(&circuit, &context, 300., |_| Ok(()))
-            .unwrap();
+        small.at_frequency(&context, 300., |_| Ok(())).unwrap();
         let actual = carried(&circuit);
         circuit
             .record_small_signal_state(&context.model_context().with_frequency(300.), small.bias())

@@ -259,15 +259,15 @@ after an already selected event.
 | `FIND` | the operand at one axis value | the operand's |
 | `MIN`/`MAX` | whole samples in the window | the operand's |
 | `AVG` | trapezoidal integral over the window ÷ the window's width | the operand's |
-| `RMS` | √(trapezoidal integral of the square over the window ÷ the width) | the operand's |
-| `INTEG` | trapezoidal integral over the window | `<operand>*<axis>` |
+| `RMS` | √(weighted quadrature of the square over the window ÷ the width) | the operand's |
+| `INTEG` | Simpson/trapezoidal quadrature over the window | `<operand>*<axis>` |
 | `TRIG/TARG` | `targ - trig` | the axis' |
 
-The trapezoid rule is exact for linear data and is the rule C uses for `AVG`;
-the port uses it for `INTEG` and `RMS` too, where C only reaches for Simpson's
-rules on uniformly spaced samples (see above). `AVG` and
-`INTEG/(to - from)` therefore agree exactly, which is C's own Enhancement-302
-contract.
+The trapezoid rule is exact for linear data and is the rule C uses for `AVG`.
+INTEG and RMS use greedy Simpson 3/8, Simpson 1/3 and trapezoidal panels.
+AVG and INTEG share clipped endpoints, but can use different quadrature
+rules and have different representable ranges: a valid AVG does not require
+the integral to fit in binary64.
 
 Every value the arithmetic touches comes from the **full** plot through the
 shared operand resolution, so a vector that the `.save`/`.print` selection
@@ -275,7 +275,7 @@ dropped is still measured, and every result is checked to be finite:
 
 * a non-finite operand value at a point the measurement uses is
   `SpiceError::Numerical`;
-* a non-finite result (an overflowing square, a sum that overflows) is
+* a non-finite final result is
   `SpiceError::Numerical`;
 * neither is ever written to stdout or to a rawfile.
 
@@ -440,7 +440,7 @@ duplicate names), and scalar/deferred expressions share the existing expression
 node budget. Independent analyses do not share published values. Results are
 returned in source order; undefined/forward scalar references, domain errors and nonfinite results
 fail the run before publication. Library callers use `measure::resolve_with_scope`
-using the scheduled `batch::plan_outputs` and scoped `batch::resolve_outputs` for retained plots.
+for retained plots. The ordinary batch CLI uses the same schema-bound objective reducers as optimization scenarios; only nonlocal operands retain selected history.
 The local C input preprocessor mishandles `EXPR` with a user function and a
 measurement-result argument; the live C regression uses its `PARAM` spelling.
 Numeric setters AT/VAL/TD/FROM/TO and crossing counts accept braced or
@@ -460,3 +460,63 @@ its equation functions are disabled empty stubs. No formulas are invented.
 left-minus-right samples, including both slopes. FIND and DERIV can use the
 same event. Nonfinite differences fail explicitly. Analytic tests and an opt-in
 C comparison cover moving references and both directions.
+
+
+## Numerical accuracy audit (#92)
+
+AVG retains trapezoidal panels; INTEG and RMS retain C's greedy Simpson
+3/8, Simpson 1/3 and trapezoid selection on positive steps within 100 ULPs.
+Each selected panel uses the **exact difference of the actual binary64 axis
+endpoints** (#147). A subtraction with zero TwoSum residual uses the ordinary
+single-span fast path; otherwise the signed product accumulator (#138) adds
+weighted endpoint products separately, before any rounding. The full window
+denominator is likewise an exact endpoint difference, evaluated in the shared
+68-limb ratio engine (#139). The final AVG is rounded once even if a width
+would overflow binary64 or separately rounded panel widths disagree.
+
+RMS evaluates squared ordinates using the existing scaled-exponent accumulator,
+with exact endpoint geometry reduced to a normalized mantissa and exponent.
+The normalization does not need a finite binary64 width or squared ordinates;
+its result is bounded between the smallest and largest contributing absolute
+values, including a constant MAX or subnormal trace. INTEG divides the exact
+weighted sum by 24 without width normalization: only a genuinely nonfinite
+final integral is rejected. The fixed-size accumulators preserve cancellation
+and require no stored history. Zero-width repeated-axis panels contribute
+nothing, retaining discontinuity and clipped-window policies.
+
+Linear interpolation takes its fraction from the nearer endpoint and uses
+a fused multiply-add; scaled coordinate differences handle an otherwise
+overflowing finite span. Exact sample groups, clipping, crossing selection
+and the 100-ULP panel rule are unchanged. DERIV uses the same local
+quadratic stencil but evaluates its divided-difference derivative, avoiding
+large common-ordinate cancellation. Margins interpolate with fused arithmetic
+and preserve exact crossover endpoints. Tests include analytic cubic
+quadrature, a cancellation-sensitive signed integral, large-offset quadratic
+derivatives and finite interpolation across extreme endpoint values.
+
+
+### Finite-range crossing geometry
+
+Retained and objective-only streaming WHEN/TRIG/TARG event selectors now
+compare each finite left/right operand directly before choosing a side.
+They do not form an overflowing left-minus-right residual at each sample.
+For a crossing that requires interpolation, the common path keeps the
+original endpoint and jump policy, the existing conditioned binary64
+interpolation for ordinary finite spans, and an exact signed rational
+fallback for overflowing residuals and fractions that underflow before a
+large coordinate/ordinate difference can recover them.
+
+The fallback reuses the 68-limb finite-product accumulator from signed
+quadrature. It evaluates the four signed products in the coordinate
+numerator and up to four signed values in the denominator without separate
+wide-int arithmetic implementations. A leading-limb quotient estimate,
+at most one downward correction, and an exact remainder comparison round
+the output once to nearest-even binary64. No scale-normalization of
+independent residuals, tolerance snap, or extra retained history is used.
+The ordinary conditioned path remains the performance-critical default.
+
+Regression coverage includes opposite-sign MAX vector crossings,
+asymmetric residual magnitudes, a recovered minimum-subnormal crossing,
+falling transitions, duplicate-time jumps, and retained/objective-only
+agreement. The standalone 14,203-case exact-rational oracle and corrected
+quotient benchmark live in the campaign issue #139 evidence directory.

@@ -52,7 +52,7 @@ fn names(plot: &Plot) -> Vec<&str> {
 
 fn close(got: f64, want: f64, relative: f64) {
     assert!(
-        (got - want).abs() <= relative * want.abs() + 1e-15,
+        (got - want).abs() <= relative.mul_add(want.abs(), 1e-15),
         "{got} != {want}"
     );
 }
@@ -354,9 +354,10 @@ fn ac_sensitivity_linearizes_a_diode_at_the_reset_state() {
     let at = |plot: &Plot, name: &str| plot.value(name, 0).unwrap();
     assert_eq!(at(&forward, "v(r1)"), at(&off, "v(r1)"));
     // CONSTKoverQ * 300.15 K, gmin = 1e-12.
-    let vt = 1.38064852e-23 / 1.6021766208e-19 * 300.15;
+    let vt = 1.380_648_52e-23 / 1.602_176_620_8e-19 * 300.15;
     let gd = 1e-14 / vt + 1e-12;
-    let want = -gd / ((1. + 1e3 * gd) * (1. + 1e3 * gd));
+    let divisor = 1e3_f64.mul_add(gd, 1.);
+    let want = -gd / (divisor * divisor);
     let got = at(&forward, "v(r1)");
     close(got.re, want, 2e-6);
     assert_eq!(got.im, 0.);
@@ -447,7 +448,11 @@ fn transient_load_snapshots_require_a_matching_device_layout() {
     inherited.inherit_from(&original);
     inherited.finalize().unwrap();
     assert_eq!(inherited.final_transient_state(), Some(snapshot.clone()));
-    inherited.devices_mut().reverse();
+    for index in 0..inherited.device_count() / 2 {
+        inherited
+            .swap_devices(index, inherited.device_count() - 1 - index)
+            .unwrap();
+    }
     inherited.finalize().unwrap();
     assert!(inherited.final_transient_state().is_none());
     inherited.inherit_from(&original);
@@ -530,7 +535,13 @@ fn unsupported_cases_fail_explicitly() {
             .count(),
         2
     );
-    let error = batch::check_targets(&schedule, &Default::default(), &[], &[]).unwrap_err();
+    let error = batch::check_targets(
+        &schedule,
+        &ngspice_rs::netlist::ast::OutputCards::default(),
+        &[],
+        &[],
+    )
+    .unwrap_err();
     assert!(
         error.to_string().contains("more than one .sens card"),
         "{error}"
@@ -612,4 +623,98 @@ fn replay_rejects_foreign_and_swapped_records_without_mutating() {
     );
     assert!(resistor.setup_elements(foreign).is_err());
     assert!(resistor.load(correct, correct, SensitivityMode::Dc).is_ok());
+}
+
+/// The JFET2 DELTA=0 derivative can be computed independently by implicit
+/// differentiation of the intrinsic thermal current law at the solved bias.
+/// See #144: the reference is a physical derivative, not C's 1 ppm `.sens`.
+#[test]
+fn jfet2_delta_matches_independent_physical_derivative() {
+    let deck = include_str!("../conformance/netlists/sens_jfet2.cir")
+        .replace(".sens v(2)", ".sens v(2) j1:delta physical");
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("sens_jfet2.cir"), &deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let plan = config.plans_for(&netlist.analyses).unwrap().remove(0);
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let plot = plan.run(&mut circuit, &config.context()).unwrap();
+    let delta = value(&plot, "v(j1:delta)");
+    let analytic = 0.001_167_486_715_527_478;
+    let original_relative_bound = 1e-6_f64;
+    assert!(
+        (delta - analytic).abs() <= original_relative_bound.mul_add(analytic.abs(), 1e-9),
+        "JFET2 DELTA physical derivative {delta:.17e} vs analytic {analytic:.17e}"
+    );
+}
+
+/// Physical HFET2 D2 derivative from independently converged C/Rust
+/// operating-point central sweeps and Richardson limits in issue #118.
+#[test]
+fn hfet2_d2_matches_independent_operating_point_derivative() {
+    let deck = include_str!("../conformance/netlists/sens_hfet2.cir")
+        .replace(".sens i(vids)", ".sens i(vids) z3:d2 physical");
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("sens_hfet2.cir"), &deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let plan = config.plans_for(&netlist.analyses).unwrap().remove(0);
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let plot = plan.run(&mut circuit, &config.context()).unwrap();
+    let d2 = value(&plot, "v(z3:d2)");
+    let expected = -0.715_879_864_056_800_2;
+    assert!(
+        (d2 - expected).abs() <= 1e-6_f64.mul_add(expected.abs(), 1e-9),
+        "HFET2 D2 physical derivative {d2:.17e} vs independent {expected:.17e}"
+    );
+}
+
+#[test]
+fn physical_ac_complex_derivative_matches_rc_analytic_law() {
+    let plot = sens(
+        "v1 in 0 dc 0 ac 1\nr1 in out 1k\nc1 out 0 1u\n.sens v(out) c1 physical ac dec 1 10 1k",
+    )
+    .unwrap();
+    assert_eq!(plot.point_count(), 3);
+    assert_eq!(names(&plot), ["frequency", "v(c1)"]);
+    for point in 0..3 {
+        let w = 2. * std::f64::consts::PI * plot.value("frequency", point).unwrap().re;
+        let h = Complex::real(1.) / Complex::new(1., w * 1e3 * 1e-6);
+        let expected = Complex::new(0., -w * 1e3) * h * h;
+        let actual = plot.value("v(c1)", point).unwrap();
+        assert!(
+            (actual - expected).magnitude() <= 1e-8 * expected.magnitude(),
+            "frequency {w}: {actual} vs {expected}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "opt-in physical/legacy sensitivity workload benchmark"]
+fn physical_sensitivity_workload_timing() {
+    use std::time::Instant;
+    let source = include_str!("../conformance/netlists/sens_jfet2.cir");
+    for mode in ["historical", "physical"] {
+        let deck = if mode == "physical" {
+            source.replace(".sens v(2)", ".sens v(2) physical")
+        } else {
+            source.to_owned()
+        };
+        let start = Instant::now();
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("sens_jfet2.cir"), &deck))
+            .unwrap();
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let plan = config.plans_for(&netlist.analyses).unwrap().remove(0);
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let prepare = start.elapsed();
+        let start = Instant::now();
+        let plot = plan.run(&mut circuit, &config.context()).unwrap();
+        println!(
+            "workload=jfet2_sensitivity,mode={mode},columns={},prep_ns={},analysis_ns={}",
+            plot.variables().len(),
+            prepare.as_nanos(),
+            start.elapsed().as_nanos()
+        );
+    }
 }

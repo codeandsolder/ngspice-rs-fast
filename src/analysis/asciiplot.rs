@@ -24,7 +24,7 @@ fn plot_column(value: f64, low: f64, span: f64) -> Option<usize> {
 ///
 /// # Errors
 /// Invalid, empty or nonmonotonic data, nonfinite scale arithmetic.
-pub fn render(plot: &Plot) -> SpiceResult<String> {
+pub fn render(plot: &Plot, mut emit: impl FnMut(&str) -> SpiceResult<()>) -> SpiceResult<()> {
     let invalid = |message: &str| SpiceError::Unsupported {
         feature: format!(".plot: {message}"),
         location: None,
@@ -76,7 +76,9 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
         "\n{}     {low:.3e} .. {high:.3e}",
         plot.variables()[0].name
     );
+    emit(&text)?;
     for row in plot.rows() {
+        text.clear();
         let mut field = [b' '; LAST_COLUMN as usize + 1];
         for i in (0..=usize::from(LAST_COLUMN)).step_by(15) {
             field[i] = b'.';
@@ -97,8 +99,9 @@ pub fn render(plot: &Plot) -> SpiceResult<String> {
             row[1].re,
             String::from_utf8_lossy(&field)
         );
+        emit(&text)?;
     }
-    Ok(text)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -118,7 +121,7 @@ mod tests {
         assert!(plot.push_point(&[]).is_err());
         plot.push_point(&[Complex::real(f64::NAN), Complex::ZERO])
             .unwrap();
-        let error = render(&plot).expect_err("inconsistent row");
+        let error = render(&plot, |_| Ok(())).expect_err("inconsistent row");
         assert!(error.to_string().contains("inconsistent or nonfinite"));
     }
 

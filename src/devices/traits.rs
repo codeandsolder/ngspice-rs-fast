@@ -170,7 +170,7 @@ impl AnalysisMode {
 /// Ground is not an unknown: it is the reference and its row is eliminated.
 /// Branch currents are unknowns too, and get rows after the nodes; the circuit
 /// numbers them, and device-internal nodes, in C's setup order
-/// ([`crate::devices::Circuit::rebuild_unknowns`]).
+/// ([`crate::devices::Circuit::finalize`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MnaUnknowns {
     node_rows: Vec<Option<usize>>,
@@ -256,22 +256,35 @@ impl MnaUnknowns {
         self.node_rows.get(node.index()).copied().flatten()
     }
 
+    /// Resolve a node at an analysis boundary. Only ground has no row;
+    /// a non-ground node absent from the finalized mapping is an error.
+    ///
+    /// # Errors
+    /// The node is unknown or has no validated MNA row.
+    pub fn checked_node_row(&self, node: NodeId) -> SpiceResult<Option<usize>> {
+        if node == NodeId::GROUND {
+            return Ok(None);
+        }
+        self.node_row(node)
+            .map(Some)
+            .ok_or_else(|| SpiceError::circuit(format!("unmapped MNA node {node}")))
+    }
+
     /// Reserves `count` rows after every node row, for branch currents.
     ///
     /// Returns the first reserved row, or `None` when `count` is zero.
-    pub const fn add_rows(&mut self, count: usize) -> Option<usize> {
+    ///
+    /// # Errors
+    /// MNA row count overflow.
+    pub fn add_rows(&mut self, count: usize) -> SpiceResult<Option<usize>> {
         if count == 0 {
-            return None;
+            return Ok(None);
         }
         let first = self.next_row;
-        self.next_row += count;
-        Some(first)
-    }
-
-    /// Whether every node slot in the table has been numbered (including
-    /// the eliminated ground slot).
-    pub(super) const fn covers_nodes(&self, nodes: &NodeTable) -> bool {
-        self.node_rows.len() == nodes.len()
+        self.next_row = first
+            .checked_add(count)
+            .ok_or_else(|| SpiceError::circuit("MNA row count overflow"))?;
+        Ok(Some(first))
     }
 
     /// Number of unknowns, i.e. the size of the MNA system.
@@ -333,13 +346,93 @@ impl ConvergenceContext<'_> {
     }
 }
 
+/// RHS sink used by full and isolated device loads. Isolated stamps retain
+/// only the rows actually written, rather than clearing a circuit-sized vector.
+#[derive(Debug)]
+pub struct StampRhs<'a>(RhsTarget<'a>);
+
+#[derive(Debug)]
+enum RhsTarget<'a> {
+    Dense(&'a mut Vector),
+    Sparse(&'a mut IsolatedRhs),
+}
+
+impl<'a> StampRhs<'a> {
+    /// Stamp into the complete solver RHS.
+    #[must_use]
+    pub const fn dense(rhs: &'a mut Vector) -> Self {
+        Self(RhsTarget::Dense(rhs))
+    }
+
+    pub(super) const fn isolated(rhs: &'a mut IsolatedRhs) -> Self {
+        Self(RhsTarget::Sparse(rhs))
+    }
+
+    /// Add a contribution at a matrix row, preserving stamp order.
+    ///
+    /// # Errors
+    /// The row is outside the finalized MNA dimensions.
+    #[inline]
+    pub fn add_to(&mut self, row: usize, value: Real) -> SpiceResult<()> {
+        match &mut self.0 {
+            RhsTarget::Dense(rhs) => rhs.add_to(row, value),
+            RhsTarget::Sparse(rhs) => rhs.write(row, |old| old + value),
+        }
+    }
+}
+
+/// Sparse scratch for a single isolated load. Capacity is retained across
+/// devices and points; rows are unique and sorted.
+#[derive(Debug)]
+pub(super) struct IsolatedRhs {
+    rows: usize,
+    values: Vec<(usize, Real)>,
+}
+
+impl IsolatedRhs {
+    pub(super) const fn new(rows: usize) -> Self {
+        Self {
+            rows,
+            values: Vec::new(),
+        }
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.values.clear();
+    }
+
+    fn write(&mut self, row: usize, update: impl FnOnce(Real) -> Real) -> SpiceResult<()> {
+        if row >= self.rows {
+            return Err(SpiceError::Numerical {
+                context: "isolated RHS".to_owned(),
+                message: format!("row {row} is out of range for length {}", self.rows),
+            });
+        }
+        match self.values.binary_search_by_key(&row, |&(row, _)| row) {
+            Ok(index) => self.values[index].1 = update(self.values[index].1),
+            Err(index) => self.values.insert(index, (row, update(0.))),
+        }
+        Ok(())
+    }
+
+    pub(super) fn set(&mut self, row: usize, value: Real) -> SpiceResult<()> {
+        self.write(row, |_| value)
+    }
+
+    pub(super) fn get(&self, row: usize) -> Real {
+        self.values
+            .binary_search_by_key(&row, |&(row, _)| row)
+            .map_or(0., |index| self.values[index].1)
+    }
+}
+
 /// Everything a device needs in order to stamp itself.
 #[derive(Debug)]
 pub struct StampContext<'a> {
     /// The MNA matrix being assembled.
     pub matrix: &'a mut SparseMatrix,
     /// The right-hand side being assembled.
-    pub rhs: &'a mut Vector,
+    pub rhs: StampRhs<'a>,
     /// Where the unknowns live.
     pub unknowns: &'a MnaUnknowns,
     /// The node table, for diagnostics.
@@ -352,6 +445,8 @@ pub struct StampContext<'a> {
     pub nominal_temperature: Real,
     /// Junction minimum conductance (S), [`crate::devices::ModelContext::gmin`].
     pub gmin: Real,
+    /// Resolved circuit relative tolerance, not a Newton-local override.
+    pub reltol: Real,
     /// The `hertz` frequency (Hz), [`crate::devices::ModelContext::frequency`].
     pub frequency: Real,
     /// Which analysis is loading the matrix.
@@ -387,6 +482,7 @@ impl StampContext<'_> {
     pub const fn model_context(&self) -> crate::devices::ModelContext {
         crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
             .with_gmin(self.gmin)
+            .with_reltol(self.reltol)
             .with_frequency(self.frequency)
     }
 
@@ -504,7 +600,7 @@ impl StampContext<'_> {
 ///
 /// [`fmt::Debug`] is a supertrait so that a `Box<dyn Device>` can be printed in
 /// diagnostics and compared in tests.
-pub trait Device: fmt::Debug {
+pub trait Device: fmt::Debug + std::any::Any {
     /// Scalar instance ask (`*ask.c`), evaluated at the point's model context.
     /// Unavailable keywords return `None`; callers report an explicit error.
     /// # Errors
@@ -641,6 +737,12 @@ pub trait Device: fmt::Debug {
         false
     }
 
+    /// Whether a device's equations depend explicitly on transient time.
+    /// Independent source waveforms are checked separately at analysis binding.
+    fn depends_on_time(&self) -> bool {
+        false
+    }
+
     /// True when the device's small-signal (AC) stamp itself depends on the
     /// analysis frequency in a way the affine `A + j omega E` pencil cannot
     /// express, e.g. a transmission line's `exp(-j omega TD)` (`traacld.c`).
@@ -719,6 +821,22 @@ pub trait Device: fmt::Debug {
         _context: &crate::devices::models::ModelContext,
     ) -> Option<SpiceResult<StorageElement>> {
         None
+    }
+
+    /// Validate bias-independent device inputs at a DC point, without an
+    /// AC load, Newton trial, or accepted-state mutation. Context-independent
+    /// devices need no extra checks beyond construction and replacement.
+    /// Context-dependent devices must check their thermal/effective parameters
+    /// here using the same derivation as their DC stamp. The recipe already
+    /// carries its own setters; the context contains common scalar inputs,
+    /// not per-device override tables. Cross-device mutual constraints are
+    /// validated by the circuit. Solution-dependent errors belong to the
+    /// actual solve, not to a fabricated zero bias.
+    ///
+    /// # Errors
+    /// Invalid contextual parameters or nonfinite derived device inputs.
+    fn validate_dc_inputs(&self, _context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        Ok(())
     }
 
     /// Loads the device's contribution into the MNA system for one trial.
@@ -827,20 +945,19 @@ pub trait Device: fmt::Debug {
         })
     }
 
-    /// Observes an accepted solution point before its state is committed.
-    ///
-    /// Called by [`crate::devices::Circuit::accept_point`] for the accepted initial
-    /// state, accepted adaptive steps and changed event (right-limit) states;
-    /// never for Newton trials, rejected steps or interpolated output samples.
-    /// Any error aborts the acceptance and nothing is committed. Device history
-    /// lives in state slots, so the hook cannot mutate the device.
+    /// Validate a prospective accepted point without observable side effects.
+    /// All devices must approve before any accept notification is delivered.
     ///
     /// # Errors
-    ///
     /// Device-specific failures.
-    fn accept(&self, _context: &AcceptContext<'_>) -> SpiceResult<()> {
+    fn validate_accept(&self, _context: &AcceptContext<'_>) -> SpiceResult<()> {
         Ok(())
     }
+
+    /// Infallible notification of an accepted point, after all acceptance
+    /// checks succeeded and immediately before the histories are published.
+    /// Never called for Newton trials or rejected steps.
+    fn accept(&self, _context: &AcceptContext<'_>) {}
 
     /// An upper bound on the next transient step from this device's discrete
     /// state (C `DEVtrunc` of devices without charge storage, e.g.
@@ -885,13 +1002,17 @@ pub trait Device: fmt::Debug {
     /// routine return [`crate::devices::noise::DeviceNoise::Noiseless`]
     /// explicitly; the default is an error, so a device whose noise is not
     /// ported can never be silently omitted from the spectrum.
+    /// Append generators in reference order to the caller-provided empty
+    /// scratch buffer; a noiseless device leaves it empty. Model identity
+    /// borrows from the effective device.
     ///
     /// # Errors
     /// [`SpiceError::NotYetPorted`] by default; invalid bias physics.
     fn noise(
         &self,
         _context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        _sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Err(SpiceError::not_yet_ported(
             format!(
                 "noise analysis of device {} (designator '{}')",
@@ -1085,9 +1206,9 @@ mod tests {
     #[test]
     fn rows_can_be_reserved_for_branch_currents() {
         let mut unknowns = MnaUnknowns::new();
-        assert_eq!(unknowns.add_rows(0), None);
-        assert_eq!(unknowns.add_rows(2), Some(0));
-        assert_eq!(unknowns.add_rows(1), Some(2));
+        assert_eq!(unknowns.add_rows(0).unwrap(), None);
+        assert_eq!(unknowns.add_rows(2).unwrap(), Some(0));
+        assert_eq!(unknowns.add_rows(1).unwrap(), Some(2));
         assert_eq!(unknowns.len(), 3);
     }
 

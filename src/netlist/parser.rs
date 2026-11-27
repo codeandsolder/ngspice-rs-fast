@@ -24,9 +24,10 @@ use crate::primitives::SpiceResult;
 
 use crate::netlist::ast::{FourierCard, MeasureCard, Netlist, OutputCards};
 use crate::netlist::card::{DotCommand, RawCard};
-use crate::netlist::source::{Deck, load};
+use crate::netlist::source::{Deck, fold_bounded, load_bounded};
 
-pub use resolution::SourceLimits;
+use crate::netlist::source::budget::SourceBudget;
+pub use crate::netlist::source::budget::SourceLimits;
 
 mod behavioural;
 mod bexpression;
@@ -40,6 +41,7 @@ mod grammar;
 mod hints;
 mod ic;
 mod jfet;
+mod line_grammar;
 mod linear;
 mod ltra;
 mod measure;
@@ -149,7 +151,45 @@ impl Parser {
     ///
     /// The same failures as [`Parser::parse_deck`].
     pub fn parse_deck_with_output(self, deck: &Deck) -> SpiceResult<ParsedDeck> {
-        scopes::assemble(deck, &prepare_cards(deck), self.auto_gnd)
+        self.parse_deck_with_limits_and_output(deck, SourceLimits::default())
+    }
+
+    /// Parse a caller-owned folded deck with explicit admission and lexical limits.
+    ///
+    /// # Errors
+    /// Invalid source structure, unsupported syntax or exhausted resource limits.
+    pub fn parse_deck_with_limits_and_output(
+        self,
+        deck: &Deck,
+        limits: SourceLimits,
+    ) -> SpiceResult<ParsedDeck> {
+        let mut budget = SourceBudget::new(limits);
+        budget.admit_deck(deck)?;
+        self.parse_admitted(deck, &mut budget)
+    }
+
+    /// Parse borrowed, potentially large text without first constructing an
+    /// unbounded owned deck. Includes remain unresolved as in [`Self::parse_deck`].
+    ///
+    /// # Errors
+    /// Invalid source structure, unsupported syntax or exhausted resource limits.
+    pub fn parse_text(
+        self,
+        file: &Path,
+        text: &str,
+        limits: SourceLimits,
+    ) -> SpiceResult<ParsedDeck> {
+        let location = crate::primitives::SourceLoc::new(file.to_path_buf(), 1, 1);
+        let mut budget = SourceBudget::new(limits);
+        budget.validate(&location)?;
+        budget.begin_file(&location)?;
+        budget.bytes(text.len(), &location)?;
+        let deck = fold_bounded(file, text, true, &mut budget)?;
+        self.parse_admitted(&deck, &mut budget)
+    }
+
+    fn parse_admitted(self, deck: &Deck, budget: &mut SourceBudget) -> SpiceResult<ParsedDeck> {
+        scopes::assemble(deck, &prepare_cards(deck, budget)?, self.auto_gnd, false)
     }
 
     /// Parses `text` (whose first byte is at `location`) as one complete
@@ -195,6 +235,22 @@ impl Parser {
         self.parse_file_with_limits_and_output(path, SourceLimits::default())
     }
 
+    /// Load a deck for explicit script execution, retaining executable control
+    /// cards in source order instead of interpreting them as batch directives.
+    /// Pre-run frontend settings still use the ordinary settings grammar.
+    ///
+    /// # Errors
+    /// Source, netlist or frontend-setting errors; the script consumer must
+    /// separately compile and validate every retained command.
+    pub fn parse_control_file(
+        self,
+        path: impl AsRef<Path>,
+        limits: SourceLimits,
+    ) -> SpiceResult<ParsedDeck> {
+        let (deck, cards) = resolution::resolve(path.as_ref(), limits)?;
+        scopes::assemble(&deck, &cards, self.auto_gnd, true)
+    }
+
     /// Resolves and parses a file with explicit source work limits.
     ///
     /// Paths are relative to the file containing each directive, not the process
@@ -225,7 +281,7 @@ impl Parser {
         limits: SourceLimits,
     ) -> SpiceResult<ParsedDeck> {
         let (deck, cards) = resolution::resolve(path.as_ref(), limits)?;
-        scopes::assemble(&deck, &cards, self.auto_gnd)
+        scopes::assemble(&deck, &cards, self.auto_gnd, false)
     }
 }
 
@@ -252,21 +308,37 @@ pub fn parse_parameter_expression(
     )
 }
 
+/// Parse a control-language expression with a distinct variable/function namespace.
+pub(crate) fn parse_control_expression(
+    text: &str,
+    location: &crate::primitives::SourceLoc,
+) -> SpiceResult<crate::netlist::expr::ParameterExpression> {
+    expression::parse_control_expression(text, super::source::SourcePosition::physical(location))
+}
+
 /// Cache lexical results for ordered replay; later errors do not mask earlier
 /// semantic failures. Forward declaration lookup belongs to each scope.
-fn prepare_cards(deck: &Deck) -> Vec<SpiceResult<scopes::InputCard>> {
+fn prepare_cards(
+    deck: &Deck,
+    budget: &mut SourceBudget,
+) -> SpiceResult<Vec<SpiceResult<scopes::InputCard>>> {
     let mut cards = Vec::new();
     for line in &deck.lines {
-        let card = RawCard::parse(line);
+        budget.allocation(cards.try_reserve(1), &line.location)?;
+        if let Err(error) = budget.card(&line.location) {
+            cards.push(Err(error));
+            break;
+        }
+        let card = RawCard::parse_bounded(line, budget);
         let end = card
             .as_ref()
             .is_ok_and(|c| c.dot_command() == Some(&DotCommand::End));
         cards.push(card.map(Into::into));
-        if end {
+        if end || budget.exhausted() {
             break;
         }
     }
-    cards
+    Ok(cards)
 }
 
 impl Default for Parser {
@@ -281,7 +353,28 @@ impl Default for Parser {
 ///
 /// Propagates tokenizer errors.
 pub fn classify_deck(deck: &Deck) -> SpiceResult<Vec<RawCard>> {
-    deck.lines.iter().map(RawCard::parse).collect()
+    classify_deck_with_limits(deck, SourceLimits::default())
+}
+
+/// Classify a caller-owned deck under explicit source and lexical limits.
+/// Unlike semantic parsing this visits every card, including after `.end`.
+///
+/// # Errors
+/// Invalid lexical syntax or exhausted source/work limits.
+pub fn classify_deck_with_limits(deck: &Deck, limits: SourceLimits) -> SpiceResult<Vec<RawCard>> {
+    let mut budget = SourceBudget::new(limits);
+    budget.admit_deck(deck)?;
+    classify_admitted(deck, &mut budget)
+}
+
+fn classify_admitted(deck: &Deck, budget: &mut SourceBudget) -> SpiceResult<Vec<RawCard>> {
+    let mut out = Vec::new();
+    for line in &deck.lines {
+        budget.card(&line.location)?;
+        budget.allocation(out.try_reserve(1), &line.location)?;
+        out.push(RawCard::parse_bounded(line, budget)?);
+    }
+    Ok(out)
 }
 
 /// Loads a deck from disk and classifies it.
@@ -290,9 +383,65 @@ pub fn classify_deck(deck: &Deck) -> SpiceResult<Vec<RawCard>> {
 ///
 /// Fails if the file cannot be read or a card cannot be tokenized.
 pub fn load_classified(path: impl AsRef<Path>) -> SpiceResult<(Deck, Vec<RawCard>)> {
-    let deck = load(path)?;
-    let cards = classify_deck(&deck)?;
+    load_classified_with_limits(path, SourceLimits::default())
+}
+
+/// Load and classify a file under one shared source and lexical budget.
+/// This does not expand included sources.
+///
+/// # Errors
+/// Invalid UTF-8, I/O, lexical syntax or exhausted source/work limits.
+pub fn load_classified_with_limits(
+    path: impl AsRef<Path>,
+    limits: SourceLimits,
+) -> SpiceResult<(Deck, Vec<RawCard>)> {
+    let mut budget = SourceBudget::new(limits);
+    let deck = load_bounded(path.as_ref(), &mut budget)?;
+    let cards = classify_admitted(&deck, &mut budget)?;
     Ok((deck, cards))
+}
+
+/// Compile an analysis command using the same grammar as its deck directive.
+pub(crate) fn control_analysis(
+    card: &RawCard,
+    kind: crate::primitives::AnalysisKind,
+    auto_gnd: bool,
+) -> SpiceResult<crate::netlist::ast::AnalysisCard> {
+    match control_card(card, DotCommand::Analysis(kind), auto_gnd)? {
+        grammar::ParsedCard::Analysis(card) => Ok(card),
+        _ => Err(crate::primitives::SpiceError::parse(
+            card.location.clone(),
+            "expected an analysis command",
+        )),
+    }
+}
+
+/// Compile a control-language meas command using the same grammar as .measure.
+pub(crate) fn control_measure(card: &RawCard, auto_gnd: bool) -> SpiceResult<MeasureCard> {
+    match control_card(card, DotCommand::Measure, auto_gnd)? {
+        grammar::ParsedCard::Measure(card) => Ok(card),
+        _ => Err(crate::primitives::SpiceError::parse(
+            card.location.clone(),
+            "expected a measurement command",
+        )),
+    }
+}
+
+fn control_card(
+    card: &RawCard,
+    command: DotCommand,
+    auto_gnd: bool,
+) -> SpiceResult<grammar::ParsedCard> {
+    let mut converted = card.clone();
+    let Some(head) = converted.tokens.first_mut() else {
+        return Err(crate::primitives::SpiceError::parse(
+            card.location.clone(),
+            "empty control command",
+        ));
+    };
+    head.text = command.card_name();
+    converted.kind = crate::netlist::card::CardKind::DotCommand(command);
+    grammar::parse_card(&converted, auto_gnd, scopes::ModelVisibility::default())
 }
 
 /// Evaluates a measurement's numeric setters, retaining positioned diagnostics.
@@ -321,7 +470,7 @@ pub(crate) fn resolve_measure_card(
             token.text = crate::netlist::elaborate::format_literal(value);
         }
     }
-    match grammar::parse_card(&prepared, *auto_gnd, &std::collections::BTreeSet::new())? {
+    match grammar::parse_card(&prepared, *auto_gnd, scopes::ModelVisibility::default())? {
         grammar::ParsedCard::Measure(card) => Ok(card),
         _ => Err(crate::primitives::SpiceError::parse(
             card.location.clone(),

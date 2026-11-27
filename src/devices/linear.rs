@@ -1,6 +1,7 @@
 //! Immutable linear MNA assembly, distinct from timestep-dependent companions.
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 
 use crate::devices::MnaUnknowns;
 use crate::devices::functions::{FunctionSpec, PwlSource, SourceFunction};
@@ -457,21 +458,87 @@ pub enum SourceKind {
     Current,
 }
 
+/// Signed independent-source RHS rows, stored inline in physical source order.
+///
+/// One voltage source has one branch equation; one current source can inject
+/// into at most two terminal equations. Ground has no equation and is omitted.
+/// The explicit fallible push prevents silently truncating a malformed source.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SourceRows {
+    entries: [(usize, Real); 2],
+    len: u8,
+}
+
+impl SourceRows {
+    /// Empty row set (for a ground-to-ground current source).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: [(0, 0.); 2],
+            len: 0,
+        }
+    }
+
+    /// Add a signed row without allocation, retaining duplicate row positions.
+    ///
+    /// # Errors
+    /// More than two source-row contributions cannot be represented.
+    pub fn push(&mut self, row: usize, coefficient: Real) -> SpiceResult<()> {
+        let Some(slot) = self.entries.get_mut(usize::from(self.len)) else {
+            return Err(SpiceError::circuit(
+                "independent source has more than two RHS rows",
+            ));
+        };
+        *slot = (row, coefficient);
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Signed rows in insertion order, without a heap allocation.
+    #[must_use]
+    pub fn as_slice(&self) -> &[(usize, Real)] {
+        &self.entries[..usize::from(self.len)]
+    }
+}
+
+impl std::ops::Deref for SourceRows {
+    type Target = [(usize, Real)];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for SourceRows {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries[..usize::from(self.len)]
+    }
+}
+
+impl<'a> IntoIterator for &'a SourceRows {
+    type Item = &'a (usize, Real);
+    type IntoIter = std::slice::Iter<'a, (usize, Real)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
 /// A source bound to RHS rows with signed contributions.
 #[derive(Debug, Clone)]
 pub struct LinearSource {
     /// Instance name (for sweep selection).
-    pub name: String,
+    pub name: Arc<String>,
     /// Physical target type; not inferred from a programmatic device name.
     pub kind: SourceKind,
     /// Signed RHS locations, omitting ground.
-    pub rows: Vec<(usize, Real)>,
+    pub rows: SourceRows,
     /// Operating-point value.
     pub dc: Real,
     /// Small-signal phasor.
     pub ac: Complex,
     /// Transient forcing.
-    pub waveform: Waveform,
+    pub waveform: Arc<Waveform>,
 }
 
 /// Preassembled state-independent `E x' + A x = b(t)`.
@@ -488,7 +555,7 @@ pub struct LinearSystem {
     /// Contributions of `e` that one device adds to one element as a single
     /// `omega`-scaled sum ([`LinearContext::dynamic_sum`]); empty for most
     /// systems.
-    pub e_groups: Vec<crate::maths::DynamicGroup>,
+    pub e_groups: crate::maths::DynamicGroups,
 }
 impl LinearSystem {
     /// Empty assembly for n unknowns.
@@ -499,7 +566,7 @@ impl LinearSystem {
             e: SparseMatrix::new(n, n),
             sources: vec![],
             has_initial_conditions: false,
-            e_groups: vec![],
+            e_groups: crate::maths::DynamicGroups::new(),
         }
     }
     /// DC forcing, optionally overriding one independent source.
@@ -534,7 +601,7 @@ impl LinearSystem {
             .map(|s| s.waveform.resolve(timing))
             .collect::<SpiceResult<Vec<_>>>()?;
         for (source, waveform) in self.sources.iter_mut().zip(resolved) {
-            source.waveform = waveform;
+            source.waveform = Arc::new(waveform);
         }
         Ok(())
     }
@@ -698,13 +765,9 @@ impl LinearContext<'_> {
         }
         let end = self.system.e.triplets().len();
         if end > start && self.system.e.overflow().is_none() {
-            self.system.e_groups.push(crate::maths::DynamicGroup {
-                range: start..end,
-                terms: terms.to_vec(),
-                scale,
-                divisor: 1.,
-                prescaled: true,
-            });
+            self.system
+                .e_groups
+                .push(&mut self.system.e, start..end, terms, scale, 1., true)?;
         }
         Ok(())
     }
@@ -719,13 +782,9 @@ impl LinearContext<'_> {
         self.system.e.add(r, c, value)?;
         let end = self.system.e.triplets().len();
         if end > start && self.system.e.overflow().is_none() {
-            self.system.e_groups.push(crate::maths::DynamicGroup {
-                range: start..end,
-                terms: vec![value],
-                scale: 1.,
-                divisor: 1.,
-                prescaled: true,
-            });
+            self.system
+                .e_groups
+                .push(&mut self.system.e, start..end, &[value], 1., 1., true)?;
         }
         Ok(())
     }
@@ -754,13 +813,14 @@ impl LinearContext<'_> {
                 || divisor.to_bits() != 1_f64.to_bits())
             && self.system.e.overflow().is_none()
         {
-            self.system.e_groups.push(crate::maths::DynamicGroup {
-                range: start..end,
-                terms: terms.to_vec(),
+            self.system.e_groups.push(
+                &mut self.system.e,
+                start..end,
+                terms,
                 scale,
                 divisor,
-                prescaled: false,
-            });
+                false,
+            )?;
         }
         Ok(())
     }

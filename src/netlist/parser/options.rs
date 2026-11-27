@@ -123,7 +123,7 @@ fn option_value(input: &mut Input<'_>) -> Result<OptionValue> {
     ))
 }
 
-/// A single-quoted option value as an (unbraced) expression. Double-quoted
+/// A single-quoted option value with its delimiter metadata. Double-quoted
 /// strings and quotes holding escapes are rejected: their byte columns would
 /// not map onto the card text.
 fn quoted_expression(token: &Token, inner: &str) -> SpiceResult<ParameterExpression> {
@@ -133,7 +133,7 @@ fn quoted_expression(token: &Token, inner: &str) -> SpiceResult<ParameterExpress
             "only single-quoted 'expression' option values (without escapes) are accepted",
         ));
     }
-    super::expression::parse_expression(inner, token.position().advance(1), false)
+    super::expression::parse_delimited(inner, token.position().advance(1), true, true)
 }
 
 fn global(input: &mut Input<'_>) -> Result<ParsedCard> {
@@ -155,6 +155,19 @@ fn global(input: &mut Input<'_>) -> Result<ParsedCard> {
     .parse_next(input)
 }
 
+pub(super) fn frontend_setting_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sqrnoise"
+            | "ngbehavior"
+            | "filetype"
+            | "nfreqs"
+            | "nperiods"
+            | "polydegree"
+            | "fourgridsize"
+    )
+}
+
 /// Bounded front-end pre-run settings; no commands are silently skipped.
 pub(super) fn frontend_setting(input: &mut Input<'_>) -> Result<ParsedCard> {
     if !input.input.first().is_some_and(|t| t.is_keyword("set")) {
@@ -170,16 +183,7 @@ pub(super) fn frontend_setting(input: &mut Input<'_>) -> Result<ParsedCard> {
     cut_err(|input: &mut Input<'_>| {
         let settings: Vec<OptionSetting> = repeat(1.., setting).parse_next(input)?;
         for option in &settings {
-            if !matches!(
-                option.name.as_str(),
-                "sqrnoise"
-                    | "ngbehavior"
-                    | "filetype"
-                    | "nfreqs"
-                    | "nperiods"
-                    | "polydegree"
-                    | "fourgridsize"
-            ) {
+            if !frontend_setting_name(&option.name) {
                 return Err(ErrMode::Cut(Failure(SpiceError::not_yet_ported(
                     format!("front-end setting {}", option.name),
                     "src/frontend/variable.c",

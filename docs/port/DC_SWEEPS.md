@@ -166,14 +166,36 @@ swept source in load order. Temperature is the per-point
 ## Validation before samples
 
 Besides target/grid checks, the driver rejects input-validity failures that would
-otherwise surface mid-run: actual Cartesian R/TEMP point contexts are assembled
-and every swept resistance is evaluated over the whole grid. Original resistor
+otherwise surface mid-run: actual Cartesian R/TEMP point contexts are prepared
+and validated without a matrix assembly, and every swept resistance is validated through its actual replacement
+recipe over the whole grid (including the model-backed resistor floor). Contextual device hooks reuse the DC load's thermal and
+effective-value derivations; mutual-inductance constraints use the same prepared
+replacement view as the solve. A DC-only device does not need an AC load, and
+solution-dependent device failures are not inferred from an artificial zero bias. Original resistor
 recipes are not evaluated in place of the replacements; an otherwise invalid
 original resistance at a swept temperature must not reject valid replacement points. A model
 with `tc1=-0.03` swept to 67 C, or `scale=1e300` swept to 1e10 ohm, is rejected
 up front with zero accepted points. Convergence failures of nonlinear points
 remain run-time errors; they return `Err` and no plot, and device accept hooks
 have run only for points that were solved.
+
+Source axes are projected onto the largest absolute endpoint for physical
+input validation: their values do not alter thermal derivation, while that
+endpoint checks the worst-case finite independent current-source forcing
+(including a separately swept current multiplier). Pure source/resistor
+sweeps validate one complete effective context, followed by only the
+remaining independent resistor values through the actual replacement path.
+For two resistor axes at fixed temperature this is one full validation
+plus the sum of the remaining axis lengths, not their Cartesian product.
+Temperature or general device-parameter axes validate every physical
+combination, with source-only axes still projected. Unchanged recipes are
+validated once per scalar temperature context in the original C traversal
+order; later combinations at that temperature validate the actual replaced
+devices and, for general setters, the effective mutual system. This retains
+only the last exact prepared context rather than storing any Cartesian
+product of live devices or reusing mutable state. No numerical matrix,
+zero-bias AC Jacobian or fictitious accepted state is constructed during
+preflight.
 
 ## Newton at every point and warm starts
 
@@ -256,7 +278,7 @@ two parameters of one device are allowed, the same parameter twice is not.
 terminals, branch rows and state layout — in place of the original for that
 point. A temperature axis is applied before the instance parameters of the
 same point. Every Cartesian point of a sweep with a device-parameter or
-temperature axis is assembled once before the first sample, so an invalid
+temperature axis is validated without stamping before the first sample, so an invalid
 value anywhere in the grid is an up-front error.
 
 Tests: `tests/dc_parameter_sweeps.rs` (diode junction law over AREA, AREA/M
@@ -303,3 +325,70 @@ existing goldens and bounds remain unchanged.
 NGSPICE_BIN=/absolute/path/to/ngspice cargo test -p ngspice-rs \
   --test c_dc_sweep_reference --locked -- --ignored
 ```
+
+## Run-owned effective devices
+
+A finalized circuit lends an immutable topology to `Circuit::prepare_run`.
+The resulting `PreparedRun` retains only the latest successfully prepared
+`ModelContext`, whose identity includes the exact binary64 representation of
+each numerical setting and each ordered override slot, target identity and
+parameter. It validates the ordered setters once per context transition,
+checks that replacement devices preserve finalized topology, and indexes
+replacements by their ordinals. Failed context transitions do not replace a
+valid preparation. A topology edit requires ending the immutable borrow;
+foreign or stale override identities are rejected on a subsequent run.
+
+The DC sweep driver binds each source, resistance and instance setter to a
+topology-scoped `InstanceTarget` once, using the same handle definitions as
+candidate optimization. The finalized name index serves binding; no name
+lookup or setter registry lookup occurs during per-point construction.
+Resistance axes retain their dedicated supplied-value override route, while
+the generic device setters and source setters are applied afterward in
+the original order. The per-point source observation uses its ordinal.
+The same prepared run serves preflight, warm-start Newton, fallback
+continuation and real observation. Different continuation settings are
+different contexts, not an excuse to reuse a replacement derived for a
+different junction conductance or source scale. The transient driver retains
+a scope across timepoints and rejected trials. Newton convergence uses the
+same effective devices that stamped its matrices; it does not fall back to
+the unswept originals. Coupled-inductor terms are lazily prepared once for
+the effective context. Spectral preparation shares the scope between bias,
+small-signal state/assembly and observations (including noise generators).
+
+The scope contains immutable effective device recipes and derived caches,
+not trial vectors, time histories, Newton workspaces or accepted state.
+Independent runs and sensitivity perturbations do not share a live
+replacement scope. The public one-shot load and observation methods remain
+useful for isolated probes; repeated callers should use a prepared run.
+
+## Bound sweep measurements
+
+The focused sweep unit test records the actual shared preparation operations
+(thread-local test counters, absent from production). For example, three R
+values at each of three temperatures require one target binding, three full
+physical input validations and six replacement-only validations; neither
+preflight nor point preparation performs a name lookup or small-signal
+assembly. Two independent three-value resistor axes require one full
+validation and four replacement-only validations, not nine full validations.
+Every point preserves its exact numerical context and setter order.
+
+The ignored `dc_sweep_binding_bench` tests report preparation and solve time
+separately, plus a checksum of the complete output. Three alternating native
+runs per variant on Acer (baseline `705d102`, candidate `bd92837`, pinned
+campaign nightly, optimized test profile):
+
+| Workload (devices / rows) | Baseline prep (ms) | Bound prep (ms) | Baseline solve (s) | Bound solve (s) |
+| --- | ---: | ---: | ---: | ---: |
+| Source (8194 / 512) | 0.098 | 2.452 | 5.895 | 2.936 |
+| Resistance (8194 / 512) | 0.160 | 3.959 | 4.771 | 3.667 |
+| R/TEMP (1026 / 2048) | 203.572 | 4.107 | 0.976 | 0.916 |
+
+The checksums were identical across all runs for each workload. The mixed
+sweep validates unchanged recipes 16 times rather than 2048, while still
+validating every changed replacement. Source and resistance preparation now
+perform more comprehensive input validation; their increased preparation
+time is expected. Shared-host contention varied during the runs, so these are
+observed medians, not isolated estimates of solve-time speedup. No
+cross-context live replacement caching is assumed: device-local immutable
+derivation dependencies and mutable trial state would have to be explicitly
+separated before permitting that reuse.

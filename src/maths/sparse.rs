@@ -20,6 +20,9 @@
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+static NEXT_DYNAMIC_OWNER: AtomicU64 = AtomicU64::new(1);
 
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 use petgraph::graphmap::UnGraphMap;
@@ -69,6 +72,7 @@ struct PatternIndex {
 #[derive(Debug)]
 pub struct Pattern {
     index: PatternIndex,
+    namespace: Arc<()>,
     ordering: std::sync::Mutex<OrderingState>,
     /// The `(row, col, id)` sequence of the last load, replayed by bound
     /// matrices to skip lookups (ngspice's per-device element pointers).
@@ -84,6 +88,7 @@ pub struct Pattern {
 pub(super) struct OrderingState {
     pub(super) frame: Option<crate::maths::linear::CachedFrame>,
     pub(super) ac_reorder: bool,
+    pub(super) work: crate::maths::PatternWork,
     /// Reused real factor/triangular-solve scratch, owned by the circuit
     /// transaction rather than by an immutable factor snapshot.
     pub(super) solve_workspace: Vec<Real>,
@@ -94,6 +99,7 @@ impl Default for OrderingState {
         Self {
             frame: None,
             ac_reorder: true,
+            work: crate::maths::PatternWork::default(),
             solve_workspace: Vec::new(),
         }
     }
@@ -151,7 +157,9 @@ const FIXED_MAX: usize = u32::BITS as usize;
 impl Clone for Pattern {
     /// A copy without the cached pivot order.
     fn clone(&self) -> Self {
-        Self::with_index(self.index.clone())
+        let mut copy = Self::with_index(self.index.clone());
+        copy.namespace = Arc::clone(&self.namespace);
+        copy
     }
 }
 
@@ -229,6 +237,7 @@ impl Pattern {
     fn with_index(index: PatternIndex) -> Self {
         Self {
             index,
+            namespace: Arc::new(()),
             ordering: std::sync::Mutex::new(OrderingState::default()),
             trace: std::sync::Mutex::new(Arc::new(Trace::default())),
             complex_workspace: std::sync::Mutex::new(Vec::new()),
@@ -275,6 +284,19 @@ impl Pattern {
         result
     }
 
+    /// Read actual work and current valid factor storage in one cache transaction.
+    /// Independent factor snapshots do not update these counters.
+    #[must_use]
+    pub fn factor_telemetry(&self) -> crate::maths::PatternTelemetry {
+        self.with_ordering(|state| crate::maths::PatternTelemetry {
+            work: state.work,
+            storage: state
+                .frame
+                .as_ref()
+                .and_then(crate::maths::linear::CachedFrame::storage),
+        })
+    }
+
     /// Extend in creation order while retaining existing element ids.
     /// # Errors
     /// Invalid coordinates, unsupported compact handle count or allocation.
@@ -287,7 +309,13 @@ impl Pattern {
                 push_compact(&mut positions, position)?;
             }
         }
-        Self::index(self.index.n, positions)
+        let mut extended = Self::index(self.index.n, positions)?;
+        extended.namespace = Arc::clone(&self.namespace);
+        Ok(extended)
+    }
+
+    pub(crate) fn same_namespace(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.namespace, &other.namespace)
     }
 
     /// Matrix positions in stable creation order.
@@ -690,7 +718,7 @@ fn fold_triplets(triplets: &mut Vec<Triplet>) {
 /// [`SparseMatrix::fold_duplicates`]. Devices rely on this: a resistor between
 /// two non-ground nodes stamps four positions, and several devices may stamp the
 /// same position.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SparseMatrix {
     rows: usize,
     cols: usize,
@@ -703,9 +731,59 @@ pub struct SparseMatrix {
     /// Per row, the circuit unknown's name (C `NODENAME`), used by solver
     /// diagnostics; `None` for a standalone matrix.
     names: Option<crate::maths::UnknownNames>,
+    /// Logical stamped-operator identity, minted only for grouped dynamic E.
+    /// Ordinary ungrouped matrices incur no atomic or allocation cost.
+    dynamic_owner: u64,
+}
+
+impl PartialEq for SparseMatrix {
+    fn eq(&self, other: &Self) -> bool {
+        // Assembly identity is provenance, not part of numeric matrix value.
+        self.rows == other.rows
+            && self.cols == other.cols
+            && self.triplets == other.triplets
+            && self.folded == other.folded
+            && self.bound == other.bound
+            && self.pivot == other.pivot
+            && self.names == other.names
+    }
 }
 
 impl SparseMatrix {
+    /// Identity of the current unfolded grouped operator; zero means invalid.
+    pub(crate) const fn dynamic_owner(&self) -> u64 {
+        self.dynamic_owner
+    }
+
+    /// Bind one grouped operator to its logical stamp sequence.
+    /// Additional append-only stamps retain the binding. Reordering or
+    /// clearing the operator invalidates its groups.
+    ///
+    /// # Errors
+    /// Exhausted unique assembly IDs.
+    pub(crate) fn bind_dynamic_owner(&mut self) -> SpiceResult<u64> {
+        if self.dynamic_owner != 0 {
+            return Ok(self.dynamic_owner);
+        }
+        let mut current = NEXT_DYNAMIC_OWNER.load(AtomicOrdering::Relaxed);
+        let id = loop {
+            let next = current
+                .checked_add(1)
+                .ok_or_else(|| SpiceError::circuit("dynamic operator identity exhausted"))?;
+            match NEXT_DYNAMIC_OWNER.compare_exchange_weak(
+                current,
+                next,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(previous) => break previous,
+                Err(observed) => current = observed,
+            }
+        };
+        self.dynamic_owner = id;
+        Ok(id)
+    }
+
     /// An empty `rows` by `cols` matrix.
     #[must_use]
     pub const fn new(rows: usize, cols: usize) -> Self {
@@ -717,6 +795,7 @@ impl SparseMatrix {
             bound: None,
             pivot: crate::maths::PivotTolerances::DEFAULT,
             names: None,
+            dynamic_owner: 0,
         }
     }
 
@@ -766,6 +845,7 @@ impl SparseMatrix {
             }),
             pivot: crate::maths::PivotTolerances::DEFAULT,
             names: None,
+            dynamic_owner: 0,
         })
     }
 
@@ -965,6 +1045,7 @@ impl SparseMatrix {
     /// # Errors
     /// No bound pattern, or the handle lies outside it.
     pub fn add_element(&mut self, element: ElementId, value: Real) -> SpiceResult<()> {
+        self.dynamic_owner = 0;
         let bound = self
             .bound
             .as_mut()
@@ -983,6 +1064,7 @@ impl SparseMatrix {
     /// through `SMPfindElt`). Returns whether a kept column holds an element.
     /// The predicate is a column selection, independent of traversal order.
     pub fn zero_row(&mut self, row: usize, keep: impl Fn(usize) -> bool) -> bool {
+        self.dynamic_owner = 0;
         let mut kept = false;
         if let Some(bound) = &mut self.bound
             && row < bound.pattern.order()
@@ -1024,6 +1106,7 @@ impl SparseMatrix {
     ///
     /// [`SpiceError::Numerical`] when the position is out of range.
     pub fn set(&mut self, row: usize, col: usize, value: Real) -> SpiceResult<()> {
+        self.dynamic_owner = 0;
         if let Some(bound) = &mut self.bound
             && let Some(id) = bound.pattern.find(row, col)
         {
@@ -1169,12 +1252,14 @@ impl SparseMatrix {
         if self.folded {
             return;
         }
+        self.dynamic_owner = 0;
         fold_triplets(&mut self.triplets);
         self.folded = true;
     }
 
     /// Drops every contribution, keeping the dimensions.
     pub fn clear(&mut self) {
+        self.dynamic_owner = 0;
         self.triplets.clear();
         self.folded = true;
         if let Some(bound) = &mut self.bound {
@@ -1466,6 +1551,7 @@ mod tests {
                     pattern.with_ordering(|state| {
                         state.ac_reorder = false;
                         state.solve_workspace.push(42.);
+                        state.work.factor.successful_factors = 9;
                         panic!("interrupted ordering transaction");
                     })
                 })
@@ -1475,6 +1561,7 @@ mod tests {
         pattern.with_ordering(|state| {
             assert!(state.ac_reorder);
             assert!(state.solve_workspace.is_empty());
+            assert_eq!(state.work, crate::maths::PatternWork::default());
             state.ac_reorder = false;
         });
         assert!(!pattern.ordering.is_poisoned());

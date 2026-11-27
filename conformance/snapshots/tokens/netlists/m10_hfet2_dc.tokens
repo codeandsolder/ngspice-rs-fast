@@ -14,7 +14,7 @@ card 1 @netlists/m10_hfet2_dc.cir:2:1 lines=2-2 continuations=0
   token 8 2:15 number "2u" value=2e-6
   token 9 2:18 word "w"
   token 10 2:19 equals "="
-  token 11 2:20 number "20u" value=1.9999999999999998e-5
+  token 11 2:20 number "20u" value=2e-5
   token 12 2:24 word "m"
   token 13 2:25 equals "="
   token 14 2:26 number "2" value=2e0

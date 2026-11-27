@@ -11,7 +11,7 @@
 //! `NIiter`, linear circuits included. See `docs/port/DC_SWEEPS.md`.
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::{AnalysisContext, AnalysisPlan};
-use crate::devices::{Circuit, ModelContext};
+use crate::devices::{Circuit, InstanceTarget, ModelContext};
 use crate::maths::Vector;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
@@ -104,18 +104,6 @@ impl SweepTarget {
                 }
         )
     }
-    /// The independent source this target sweeps, if any.
-    fn source(&self) -> Option<&str> {
-        match self {
-            Self::VoltageSource(name) | Self::CurrentSource(name) => Some(name),
-            Self::InstanceParameter {
-                instance,
-                route: ParameterRoute::VoltageSource | ParameterRoute::CurrentSource,
-                ..
-            } => Some(instance),
-            _ => None,
-        }
-    }
 }
 /// A finite directional sweep with an inclusive reachable stop and bounded work.
 #[derive(Debug, Clone, PartialEq)]
@@ -170,13 +158,13 @@ impl SweepSpec {
     /// # Errors
     /// As [`Self::grid`], including bounds on accumulated progress and work.
     pub fn accumulated_grid(&self) -> SpiceResult<Vec<Real>> {
-        let expected = self.exact_values()?.len();
+        let _ = self.exact_values()?;
         let temperature = self.target == SweepTarget::Temperature;
-        let values = self.range().accumulate(expected, temperature)?;
-        for &value in &values {
+        let values = self.range().accumulate(temperature)?;
+        for value in values.values() {
             check_domain(value, temperature, self.target.is_resistance())?;
         }
-        Ok(values)
+        Ok(values.values().collect())
     }
 }
 
@@ -221,6 +209,70 @@ impl ExactGrid {
     }
 }
 
+/// Compact, validated C accumulated traversal, including Kelvin offset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AccumulatedGrid {
+    range: SweepRange,
+    temperature: bool,
+    count: usize,
+}
+
+impl AccumulatedGrid {
+    fn values(self) -> GridValues {
+        let offset = if self.temperature {
+            CELSIUS_TO_KELVIN
+        } else {
+            0.
+        };
+        GridValues {
+            stored: self.range.start + offset,
+            offset,
+            step: self.range.step,
+            remaining: self.count,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GridValues {
+    stored: Real,
+    offset: Real,
+    step: Real,
+    remaining: usize,
+}
+
+impl GridValues {
+    const fn singleton(value: Real) -> Self {
+        Self {
+            stored: value,
+            offset: 0.,
+            step: 0.,
+            remaining: 1,
+        }
+    }
+}
+
+impl Iterator for GridValues {
+    type Item = Real;
+
+    fn next(&mut self) -> Option<Real> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let value = self.stored - self.offset;
+        self.remaining -= 1;
+        if self.remaining != 0 {
+            self.stored += self.step;
+        }
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+impl ExactSizeIterator for GridValues {}
+
 impl SweepRange {
     fn exact_grid(self) -> SpiceResult<ExactGrid> {
         let (start, stop, increment) = (self.start, self.stop, self.step);
@@ -257,25 +309,31 @@ impl SweepRange {
         Ok(grid)
     }
 
-    fn accumulate(self, expected: usize, temperature: bool) -> SpiceResult<Vec<Real>> {
+    fn accumulate(self, temperature: bool) -> SpiceResult<AccumulatedGrid> {
         let offset = if temperature { CELSIUS_TO_KELVIN } else { 0. };
         let tolerance = 1e3 * Real::EPSILON;
         let direction = self.step.signum();
         let mut stored = self.start + offset;
-        let mut values = Vec::with_capacity(expected);
+        let mut previous = None;
+        let mut count = 0;
         loop {
             let value = stored - offset;
             if direction * (value - self.stop) > tolerance {
                 break;
             }
-            if values.len() >= MAX_SWEEP_POINTS {
+            if count >= MAX_SWEEP_POINTS {
                 return Err(unsupported("DC sweep point limit exceeded"));
             }
-            self.check_progress(value, values.last().copied())?;
-            values.push(value);
+            self.check_progress(value, previous)?;
+            count += 1;
+            previous = Some(value);
             stored += self.step;
         }
-        Ok(values)
+        Ok(AccumulatedGrid {
+            range: self,
+            temperature,
+            count,
+        })
     }
 
     fn check_progress(self, value: Real, previous: Option<Real>) -> SpiceResult<()> {
@@ -334,7 +392,7 @@ impl AxisTarget {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct DcSweepPlan {
     axes: Vec<AxisPlan>,
-    grids: Vec<Vec<Real>>,
+    grids: Vec<AccumulatedGrid>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -364,10 +422,10 @@ pub(super) fn parse_axes(args: &[String]) -> SpiceResult<DcSweepPlan> {
         let expected = exact.values().len();
         exact_work = bounded_product(exact_work, expected)?;
         let temperature = target == AxisTarget::Temperature;
-        let values = range.accumulate(expected, temperature)?;
-        accumulated_work = bounded_product(accumulated_work, values.len())?;
+        let values = range.accumulate(temperature)?;
+        accumulated_work = bounded_product(accumulated_work, values.count)?;
         if temperature {
-            for value in exact.values().chain(values.iter().copied()) {
+            for value in exact.values().chain(values.values()) {
                 check_domain(value, true, false)?;
             }
         }
@@ -375,6 +433,12 @@ pub(super) fn parse_axes(args: &[String]) -> SpiceResult<DcSweepPlan> {
         grids.push(values);
     }
     Ok(DcSweepPlan { axes, grids })
+}
+
+impl DcSweepPlan {
+    pub(super) fn point_count(&self) -> usize {
+        self.grids.iter().map(|grid| grid.count).product()
+    }
 }
 
 fn bounded_product(work: usize, points: usize) -> SpiceResult<usize> {
@@ -390,9 +454,9 @@ enum Written<'a> {
     /// A plain name: an independent source or a resistor.
     Name(&'a str),
     /// `@instance[r|resistance]` of a resistor.
-    Resistance(&'a str),
+    Resistance(&'a str, InstanceTarget),
     /// `@instance[parameter]` that the device replaces itself.
-    Device(&'a str, &'static str),
+    Device(&'a str, InstanceTarget),
     /// `@instance[parameter]` left for the source table (`dc`, current `c`)
     /// or for an explicit rejection.
     Other(&'a str, &'a str),
@@ -407,15 +471,13 @@ impl<'a> Written<'a> {
                 parameter,
             } => (instance.as_str(), parameter.as_str()),
         };
-        if matches!(parameter.to_ascii_lowercase().as_str(), "r" | "resistance")
-            && circuit.resistor(instance).is_some()
+        if (parameter.eq_ignore_ascii_case("r") || parameter.eq_ignore_ascii_case("resistance"))
+            && let Ok(target) = circuit.bind_resistor_target(instance)
         {
-            return Self::Resistance(instance);
+            return Self::Resistance(instance, target);
         }
-        if let Some(device) = circuit.device(instance)
-            && let Some(canonical) = device.instance_parameter(parameter)
-        {
-            return Self::Device(instance, canonical);
+        if let Ok(target) = circuit.bind_instance_target(instance, parameter) {
+            return Self::Device(instance, target);
         }
         Self::Other(instance, parameter)
     }
@@ -423,8 +485,10 @@ impl<'a> Written<'a> {
     fn key(&self) -> String {
         match self {
             Self::Temperature => "temp".into(),
-            Self::Name(name) | Self::Resistance(name) => name.to_ascii_lowercase(),
-            Self::Device(name, parameter) => format!("@{}[{parameter}]", name.to_ascii_lowercase()),
+            Self::Name(name) | Self::Resistance(name, _) => name.to_ascii_lowercase(),
+            Self::Device(name, target) => {
+                format!("@{}[{}]", name.to_ascii_lowercase(), target.parameter())
+            }
             Self::Other(name, parameter) => match parameter.to_ascii_lowercase().as_str() {
                 "dc" | "c" => name.to_ascii_lowercase(),
                 other => format!("@{}[{other}]", name.to_ascii_lowercase()),
@@ -433,7 +497,10 @@ impl<'a> Written<'a> {
     }
 }
 
-fn resolve_target(circuit: &Circuit, written: &Written<'_>) -> SpiceResult<SweepTarget> {
+fn resolve_target(
+    circuit: &Circuit,
+    written: &Written<'_>,
+) -> SpiceResult<(SweepTarget, AxisBinding)> {
     let source = |name: &str| {
         circuit.device(name).and_then(|device| {
             device
@@ -449,19 +516,26 @@ fn resolve_target(circuit: &Circuit, written: &Written<'_>) -> SpiceResult<Sweep
         route,
     };
     Ok(match *written {
-        Written::Temperature => SweepTarget::Temperature,
+        Written::Temperature => (SweepTarget::Temperature, AxisBinding::Temperature),
         Written::Name(name) => {
             if let Some((name, kind)) = source(name) {
-                match kind {
+                let target = match kind {
                     crate::devices::SourceKind::Voltage => {
                         SweepTarget::VoltageSource(name.to_owned())
                     }
                     crate::devices::SourceKind::Current => {
                         SweepTarget::CurrentSource(name.to_owned())
                     }
-                }
-            } else if let Some((index, _)) = circuit.resistor(name) {
-                SweepTarget::Resistor(instance_name(index))
+                };
+                (
+                    target,
+                    AxisBinding::Source(circuit.bind_source_target(name)?),
+                )
+            } else if let Ok(target) = circuit.bind_resistor_target(name) {
+                (
+                    SweepTarget::Resistor(instance_name(target.device())),
+                    AxisBinding::Resistor(target),
+                )
             } else {
                 return Err(unsupported(format!(
                     "DC sweep supports independent V/I sources, resistors, temp and \
@@ -469,16 +543,22 @@ fn resolve_target(circuit: &Circuit, written: &Written<'_>) -> SpiceResult<Sweep
                 )));
             }
         }
-        Written::Resistance(name) => {
-            let (index, _) = circuit
-                .resistor(name)
-                .ok_or_else(|| SpiceError::circuit("resolved DC resistor disappeared"))?;
-            parameter(instance_name(index), "r", ParameterRoute::Resistor)
-        }
-        Written::Device(name, canonical) => {
-            let (index, _) = circuit.instance_parameter(name, canonical)?;
-            parameter(instance_name(index), canonical, ParameterRoute::Device)
-        }
+        Written::Resistance(_, target) => (
+            parameter(
+                instance_name(target.device()),
+                "r",
+                ParameterRoute::Resistor,
+            ),
+            AxisBinding::Resistor(target),
+        ),
+        Written::Device(_, target) => (
+            parameter(
+                instance_name(target.device()),
+                target.parameter(),
+                ParameterRoute::Device,
+            ),
+            AxisBinding::Device(target),
+        ),
         Written::Other(name, keyword) => {
             let keyword = keyword.to_ascii_lowercase();
             match source(name) {
@@ -492,7 +572,10 @@ fn resolve_target(circuit: &Circuit, written: &Written<'_>) -> SpiceResult<Sweep
                         crate::devices::SourceKind::Voltage => ParameterRoute::VoltageSource,
                         crate::devices::SourceKind::Current => ParameterRoute::CurrentSource,
                     };
-                    parameter(name.to_owned(), "dc", route)
+                    (
+                        parameter(name.to_owned(), "dc", route),
+                        AxisBinding::Source(circuit.bind_source_target(name)?),
+                    )
                 }
                 // Explicit NotYetPorted/Unsupported with the C reference.
                 _ => {
@@ -504,6 +587,32 @@ fn resolve_target(circuit: &Circuit, written: &Written<'_>) -> SpiceResult<Sweep
             }
         }
     })
+}
+
+/// A topology-bound setter, independent of any particular grid value.
+/// Resistors retain the supplied-scalar route, including its slot ordering.
+#[derive(Debug, Clone, Copy)]
+enum AxisBinding {
+    Temperature,
+    Resistor(InstanceTarget),
+    Device(InstanceTarget),
+    Source(InstanceTarget),
+}
+
+impl AxisBinding {
+    const fn is_source(self) -> bool {
+        matches!(self, Self::Source(_))
+    }
+
+    const fn changes_physics(self) -> bool {
+        matches!(self, Self::Temperature | Self::Device(_))
+    }
+}
+
+#[derive(Debug)]
+struct BoundAxis {
+    spec: SweepSpec,
+    binding: AxisBinding,
 }
 
 /// Resolve one or two DC sweep axes against circuit devices and parameters.
@@ -526,14 +635,13 @@ pub fn resolve(
     let crate::analysis::plan::PlanKind::Dc { axes, .. } = request.analysis() else {
         return Err(unsupported("typed sweep requires a DC request"));
     };
-    bind_axes(circuit, axes, context)
+    let prepared = circuit.prepare_run();
+    let axes = bind_axes(circuit, axes)?;
+    validate_start(&prepared, &axes, context.model_context())?;
+    Ok(axes.into_iter().map(|axis| axis.spec).collect())
 }
 
-fn bind_axes(
-    circuit: &Circuit,
-    plan: &DcSweepPlan,
-    context: &AnalysisContext,
-) -> SpiceResult<Vec<SweepSpec>> {
+fn bind_axes(circuit: &Circuit, plan: &DcSweepPlan) -> SpiceResult<Vec<BoundAxis>> {
     // Targets are physical metadata, not an AC matrix. Do not require an
     // otherwise DC-capable device to implement a small-signal load merely to
     // discover which name denotes an independent source.
@@ -548,25 +656,38 @@ fn bind_axes(
     }
     let mut axes = Vec::with_capacity(plan.axes.len());
     for ((axis, written), grid) in plan.axes.iter().zip(&written).zip(&plan.grids) {
-        let target = resolve_target(circuit, written)?;
+        let (target, binding) = resolve_target(circuit, written)?;
         if target.is_resistance() {
-            for value in axis.exact.values().chain(grid.iter().copied()) {
+            for value in axis.exact.values().chain(grid.values()) {
                 check_domain(value, false, true)?;
             }
         }
         let SweepRange { start, stop, step } = axis.exact.range;
-        axes.push(SweepSpec {
-            target,
-            start,
-            stop,
-            step,
+        axes.push(BoundAxis {
+            spec: SweepSpec {
+                target,
+                start,
+                stop,
+                step,
+            },
+            binding,
         });
     }
-    // Validate the first point's actual replacements at its temperature.
-    // The run's preflight validates the remaining physical contexts.
-    let start = [axes[0].start, axes.get(1).map_or(0., |axis| axis.start)];
-    point_context(circuit, &axes, start, context.model_context())?;
     Ok(axes)
+}
+
+fn validate_start(
+    prepared: &crate::devices::PreparedRun<'_>,
+    axes: &[BoundAxis],
+    base: ModelContext,
+) -> SpiceResult<()> {
+    // The public resolver checks the first written value, not every point.
+    let start = [
+        axes[0].spec.start,
+        axes.get(1).map_or(0., |axis| axis.spec.start),
+    ];
+    let point = point_context(prepared.circuit(), axes, start, base)?;
+    prepared.validate_context(&point.model)
 }
 
 /// Independent source values fit in C's two-axis sweep layout. No heap
@@ -586,8 +707,8 @@ impl PointContext<'_> {
 /// The per-point model context and source values of one Cartesian point:
 /// `values` pairs with `axes` (inner first).
 fn point_context<'a>(
-    circuit: &Circuit,
-    axes: &'a [SweepSpec],
+    circuit: &'a Circuit,
+    axes: &[BoundAxis],
     values: [Real; 2],
     base: ModelContext,
 ) -> SpiceResult<PointContext<'a>> {
@@ -595,37 +716,26 @@ fn point_context<'a>(
     let mut sources = [("", 0.); 2];
     let mut source_count = 0;
     for (axis, value) in axes.iter().zip(values) {
-        if let Some(name) = axis.target.source() {
-            sources[source_count] = (name, value);
-            source_count += 1;
-            continue;
-        }
-        match &axis.target {
-            SweepTarget::Temperature => model.temperature = value,
-            SweepTarget::Resistor(name)
-            | SweepTarget::InstanceParameter {
-                instance: name,
-                route: ParameterRoute::Resistor,
-                ..
-            } => {
-                model = model.with_resistor_override(circuit.resistor_override(name, value)?)?;
+        match axis.binding {
+            AxisBinding::Temperature => model.temperature = value,
+            AxisBinding::Resistor(target) => {
+                model = model.with_resistor_override(target.at_resistance(value)?)?;
             }
-            _ => {}
+            AxisBinding::Source(_) | AxisBinding::Device(_) => {}
         }
     }
-    // Instance parameters are applied (and validated) at the point's
-    // temperature, after a temperature axis in either position.
+    // Preserve the temperature-first and source-last setter ordering. The
+    // topology ordinal, canonical keyword and route never change per point.
     for (axis, value) in axes.iter().zip(values) {
-        if let SweepTarget::InstanceParameter {
-            instance,
-            parameter,
-            route: ParameterRoute::Device,
-            ..
-        } = &axis.target
-        {
-            model = model.with_instance_override(
-                circuit.instance_override(instance, parameter, value, &model)?,
-            )?;
+        if let AxisBinding::Device(target) = axis.binding {
+            model = model.with_instance_override(target.at(value)?)?;
+        }
+    }
+    for (axis, value) in axes.iter().zip(values) {
+        if let AxisBinding::Source(target) = axis.binding {
+            model = model.with_instance_override(target.at(value)?)?;
+            sources[source_count] = (circuit.devices()[target.device()].name(), value);
+            source_count += 1;
         }
     }
     Ok(PointContext {
@@ -635,94 +745,126 @@ fn point_context<'a>(
     })
 }
 
-/// The same Cartesian traversal serves validation and execution. Source-only
-/// axes do not affect the small-signal validation matrix: project those axes
-/// onto one representative value during preflight.
-struct GridPair<'a> {
-    inner: &'a [Real],
-    outer: &'a [Real],
+/// The same Cartesian traversal serves validation and execution. Independent
+/// DC source values do not change thermal derivations; their largest absolute
+/// value additionally validates the worst-case linear forcing (including a
+/// concurrently swept current-source multiplier).
+struct GridPair {
+    inner: GridValues,
+    outer: GridValues,
 }
 
-impl<'a> GridPair<'a> {
-    fn new(grids: &'a [Vec<Real>]) -> Self {
+impl GridPair {
+    fn new(grids: &[AccumulatedGrid]) -> Self {
         Self {
-            inner: &grids[0],
-            outer: grids.get(1).map_or(&[0.][..], Vec::as_slice),
+            inner: grids[0].values(),
+            outer: grids
+                .get(1)
+                .map_or(GridValues::singleton(0.), |grid| grid.values()),
         }
     }
 
-    fn physical_contexts(self, axes: &[SweepSpec]) -> Self {
-        let unique = |grid: &'a [Real], axis: &SweepSpec| {
-            if axis.target.source().is_some() {
-                &grid[..grid.len().min(1)]
+    fn physical_contexts(mut self, sources: [bool; 2]) -> Self {
+        let unique = |grid: GridValues, is_source| {
+            if is_source {
+                match (grid.clone().next(), grid.clone().last()) {
+                    (Some(first), Some(last)) => {
+                        GridValues::singleton(if last.abs() > first.abs() {
+                            last
+                        } else {
+                            first
+                        })
+                    }
+                    _ => grid,
+                }
             } else {
                 grid
             }
         };
-        Self {
-            inner: unique(self.inner, &axes[0]),
-            outer: axes
-                .get(1)
-                .map_or(self.outer, |axis| unique(self.outer, axis)),
-        }
+        self.inner = unique(self.inner, sources[0]);
+        self.outer = unique(self.outer, sources[1]);
+        self
     }
 
     fn points(&self) -> impl Iterator<Item = [Real; 2]> + '_ {
         self.outer
-            .iter()
-            .flat_map(|&outer| self.inner.iter().map(move |&inner| [inner, outer]))
+            .clone()
+            .flat_map(|outer| self.inner.clone().map(move |inner| [inner, outer]))
     }
 }
 
 /// Reject every point the run would later fail on for *input* reasons: a swept
 /// resistance whose effective value is invalid at some swept temperature, or a
-/// circuit that cannot be assembled at some swept temperature. Convergence
+/// circuit whose contextual device inputs are invalid at some swept temperature. Convergence
 /// failures remain run-time errors.
 fn preflight(
-    circuit: &Circuit,
-    axes: &[SweepSpec],
-    grids: &[Vec<Real>],
+    prepared: &crate::devices::PreparedRun<'_>,
+    axes: &[BoundAxis],
+    grids: &[AccumulatedGrid],
     context: &AnalysisContext,
 ) -> SpiceResult<()> {
-    let zero = Vector::zeros(circuit.unknown_count());
-    // A temperature or device-parameter axis changes the devices themselves:
-    // validate actual Cartesian point contexts, not the original recipes at
-    // each temperature (those recipes are replaced by the sweep).
-    if axes.iter().any(|axis| {
-        matches!(
-            axis.target,
-            SweepTarget::Temperature
-                | SweepTarget::InstanceParameter {
-                    route: ParameterRoute::Device,
-                    ..
-                }
-        )
-    }) {
-        let contexts = GridPair::new(grids).physical_contexts(axes);
+    let circuit = prepared.circuit();
+    let base = context.model_context();
+    let sources = [
+        axes[0].binding.is_source(),
+        axes.get(1).is_some_and(|axis| axis.binding.is_source()),
+    ];
+    let contexts = GridPair::new(grids).physical_contexts(sources);
+    let (Some(inner), Some(outer)) = (contexts.inner.clone().next(), contexts.outer.clone().next())
+    else {
+        return Ok(());
+    };
+    let start = [inner, outer];
+    // Check every coupled physical combination, but unchanged devices only
+    // need validation once at each scalar temperature context. The grids
+    // are strictly monotone, so the first value of the other axis identifies
+    // the first visit to each temperature in either C traversal order.
+    // Rebuild replacements every visit; no live device or trial state is
+    // reused for a different ModelContext.
+    if axes.iter().any(|axis| axis.binding.changes_physics()) {
+        let temperature = axes
+            .iter()
+            .position(|axis| matches!(axis.binding, AxisBinding::Temperature));
+        let coupling_may_change = axes
+            .iter()
+            .any(|axis| matches!(axis.binding, AxisBinding::Device(_)));
         for values in contexts.points() {
-            let point = point_context(circuit, axes, values, context.model_context())?;
-            circuit.small_signal_system(&point.model, &zero)?;
+            let point = point_context(circuit, axes, values, base)?;
+            let first_scalar_context = temperature.map_or_else(
+                || values.map(Real::to_bits) == start.map(Real::to_bits),
+                |axis| values[1 - axis].to_bits() == start[1 - axis].to_bits(),
+            );
+            if first_scalar_context {
+                prepared.validate_dc_inputs(&point.model)?;
+            } else {
+                prepared.validate_dc_replacements(&point.model, coupling_may_change)?;
+            }
         }
         return Ok(());
     }
-    let model = context.model_context();
-    for (axis, grid) in axes.iter().zip(grids) {
-        let (SweepTarget::Resistor(name)
-        | SweepTarget::InstanceParameter {
-            instance: name,
-            route: ParameterRoute::Resistor,
-            ..
-        }) = &axis.target
-        else {
+
+    // Only independent resistances and source values (or both) vary. Their
+    // physical recipes are independent at fixed temperature. Validate the
+    // whole effective circuit once, then each resistor's remaining values
+    // through the actual ordered setter/replacement path, not an approximate
+    // resistance formula. This also validates C's clamping and any recipe
+    // metadata. Avoid a full Cartesian product of unrelated resistors.
+    let point = point_context(circuit, axes, start, base)?;
+    prepared.validate_dc_inputs(&point.model)?;
+    for (index, (axis, grid)) in axes.iter().zip(grids).enumerate() {
+        if !matches!(axis.binding, AxisBinding::Resistor(_)) {
             continue;
-        };
-        for value in grid {
-            let target = circuit.resistor_override(name, *value)?;
-            circuit.effective_resistance(&target, &model)?;
+        }
+        for value in grid.values().skip(1) {
+            let mut values = start;
+            values[index] = value;
+            let point = point_context(circuit, axes, values, base)?;
+            prepared.validate_dc_replacements(&point.model, false)?;
         }
     }
     Ok(())
 }
+
 fn warm_start_settings(
     point_iterations: Option<usize>,
     settings: &crate::analysis::bias::DcSettings,
@@ -750,7 +892,7 @@ fn warm_start_settings(
 
 /// Policy and circuit inputs shared by all points in a DC sweep.
 struct SweepSolver<'a> {
-    circuit: &'a Circuit,
+    prepared: crate::devices::PreparedRun<'a>,
     settings: &'a crate::analysis::bias::DcSettings,
     warm_settings: Option<&'a crate::analysis::bias::DcSettings>,
     nodes: &'a crate::analysis::bias::NodeForcing,
@@ -766,14 +908,13 @@ impl SweepSolver<'_> {
     ) -> SpiceResult<crate::analysis::newton::NewtonSolution<crate::devices::TrialState>> {
         use crate::analysis::bias::{DcOutcome, solve_dc_from};
         use crate::analysis::newton::PhasePolicy;
-        let overrides = point.source_values();
         // After the first point, C tries a bounded warm Newton solve before CKTop.
         if let Some(direct) = self.warm_settings.filter(|_| !first) {
             match solve_dc_from(
-                self.circuit,
+                &self.prepared,
                 &point.model,
                 direct,
-                overrides,
+                &[],
                 Some(previous),
                 history,
                 PhasePolicy::Predicted,
@@ -796,10 +937,10 @@ impl SweepSolver<'_> {
             PhasePolicy::Predicted
         };
         Ok(solve_dc_from(
-            self.circuit,
+            &self.prepared,
             &point.model,
             self.settings,
-            overrides,
+            &[],
             Some(previous),
             history,
             phase,
@@ -827,17 +968,23 @@ pub(super) fn run(
         initial: Vec::new(),
         nodesets: crate::analysis::initial::forced_nodesets(&hints.nodesets),
     };
-    let axes = bind_axes(circuit, sweep, context)?;
+    let prepared = circuit.prepare_run();
+    let axes = bind_axes(circuit, sweep)?;
     let settings = request.dc_settings();
     let warm_settings = warm_start_settings(point_iterations, settings);
     let solver = SweepSolver {
-        circuit,
+        prepared,
         settings,
         warm_settings: warm_settings.as_ref(),
         nodes: &nodes,
     };
     let grids = &sweep.grids;
-    preflight(circuit, &axes, grids, context)?;
+    preflight(&solver.prepared, &axes, grids, context).map_err(|error| match error {
+        SpiceError::Numerical { context, message } => {
+            SpiceError::circuit(format!("DC sweep input validation ({context}): {message}"))
+        }
+        other => other,
+    })?;
     // C order: the first axis is the inner (fast) loop, the second the outer.
     let GridPair { inner, outer } = GridPair::new(grids);
     let result = plot(
@@ -845,15 +992,21 @@ pub(super) fn run(
         "dc1",
         "DC transfer characteristic",
         // C writes only the inner axis' scale; an outer axis has no vector.
-        Some(axes[0].target.scale()),
+        Some(axes[0].spec.target.scale()),
         false,
     )?;
     sink.begin(&result)?;
+    let mut selected = crate::analysis::results::SelectedOutput::bind(
+        sink,
+        &result,
+        circuit.unknown_count(),
+        true,
+    )?;
     let mut previous = Vector::zeros(circuit.unknown_count());
     // dctrcurv.c rotates the state vectors before every point, so a point's
     // CKTstate1 is the previous point's state (the first point's own state is
     // copied in after it). Only devices with discrete state (switches) read it.
-    let mut history = circuit.state_history();
+    let mut history = circuit.state_history()?;
     for hint in hints.nodesets {
         previous.as_mut_slice()[hint.row] = hint.value;
     }
@@ -865,11 +1018,11 @@ pub(super) fn run(
         // instance flags like the very first point, and its converged state
         // then becomes the accepted history (C's `firstTime` memcpy).
         let mut first = true;
-        for inner_value in inner {
+        for inner_value in inner.clone() {
             let point_context = point_context(
                 circuit,
                 &axes,
-                [*inner_value, *outer_value],
+                [inner_value, outer_value],
                 context.model_context(),
             )?;
             let model = point_context.model;
@@ -882,33 +1035,45 @@ pub(super) fn run(
             // Only a solved point is accepted; a failure above returns before
             // any accept hook runs for it. A nonlinear point's state becomes the
             // accepted history of the next one.
-            let observed = circuit.observe_real(
-                &crate::devices::LoadRequest {
-                    mode: crate::devices::AnalysisMode::DcSweep,
-                    solution: &x,
-                    model_context: &model,
-                    integration: None,
-                    history: &history,
-                    forcing: None,
-                },
-                overrides,
-                None,
-                Some(&trial),
-            )?;
+            let load = crate::devices::LoadRequest {
+                mode: crate::devices::AnalysisMode::DcSweep,
+                solution: &x,
+                model_context: &model,
+                integration: None,
+                history: &history,
+                forcing: None,
+            };
+            let observed = if let Some(output) = selected.as_ref() {
+                solver.prepared.observe_real_selected(
+                    &load,
+                    overrides,
+                    None,
+                    Some(&trial),
+                    output.observations(),
+                )?
+            } else {
+                solver
+                    .prepared
+                    .observe_real(&load, overrides, None, Some(&trial))?
+            };
             // dctrcurv.c `firstTime`: after the first point of an inner
             // sweep C copies CKTstate0 into CKTstate1, so after the next
             // rotation CKTstate2 equals CKTstate1 (DEVpred extrapolates
             // flat) instead of holding the previous outer value's last point.
-            if first_point {
-                history.clear();
-            }
             circuit.accept_point(&x, None, &mut history, trial)?;
-            point.clear();
-            point.push(Complex::real(*inner_value));
-            point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
-            point.extend(observed);
-            result.check_point(&point)?;
-            sink.point(&point)?;
+            if first_point {
+                history.retain_latest();
+            }
+            if let Some(output) = selected.as_mut() {
+                output.real(sink, Some(inner_value), x.as_slice(), &observed)?;
+            } else {
+                point.clear();
+                point.push(Complex::real(inner_value));
+                point.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
+                point.extend(observed);
+                result.check_point(&point)?;
+                sink.point(&point)?;
+            }
             previous = x;
         }
     }
@@ -939,38 +1104,167 @@ mod grid_tests {
 
     #[test]
     fn preflight_projects_only_source_axes_out_of_the_physical_grid() {
-        let make = |target| SweepSpec {
-            target,
-            start: 1.,
-            stop: 3.,
-            step: 1.,
-        };
-        let grids = [vec![1., 2., 3.], vec![10., 20.]];
-        let source = make(SweepTarget::VoltageSource("v1".into()));
-        let temperature = make(SweepTarget::Temperature);
-        let axes = [source.clone(), temperature.clone()];
-        let full = GridPair::new(&grids);
-        assert_eq!(full.points().count(), 6);
-        assert_eq!(
-            full.physical_contexts(&axes).points().collect::<Vec<_>>(),
-            [[1., 10.], [1., 20.]]
-        );
-        let axes = [temperature.clone(), source];
+        let grids = [
+            SweepRange {
+                start: 1.,
+                stop: 3.,
+                step: 1.,
+            }
+            .accumulate(false)
+            .unwrap(),
+            SweepRange {
+                start: 10.,
+                stop: 20.,
+                step: 10.,
+            }
+            .accumulate(false)
+            .unwrap(),
+        ];
+        assert_eq!(GridPair::new(&grids).points().count(), 6);
         assert_eq!(
             GridPair::new(&grids)
-                .physical_contexts(&axes)
+                .physical_contexts([true, false])
                 .points()
                 .collect::<Vec<_>>(),
-            [[1., 10.], [2., 10.], [3., 10.]]
+            [[3., 10.], [3., 20.]]
         );
-        let axes = [temperature, make(SweepTarget::Resistor("r1".into()))];
         assert_eq!(
             GridPair::new(&grids)
-                .physical_contexts(&axes)
+                .physical_contexts([false, true])
+                .points()
+                .collect::<Vec<_>>(),
+            [[1., 20.], [2., 20.], [3., 20.]]
+        );
+        assert_eq!(
+            GridPair::new(&grids)
+                .physical_contexts([false, false])
                 .points()
                 .count(),
             6
         );
+    }
+
+    fn fixture() -> Circuit {
+        let deck = crate::netlist::source::parse_deck_text(
+            std::path::Path::new("binding.cir"),
+            "binding\nv1 a 0 1\nv2 b 0 1\nr1 a 0 rm 1000\nr2 b 0 2000\nd1 0 a dm\n.model rm r(tc1=0.001)\n.model dm d\n.end\n",
+        );
+        let netlist = crate::netlist::Parser::new().parse_deck(&deck).unwrap();
+        Circuit::from_netlist(&netlist).unwrap()
+    }
+
+    #[test]
+    fn actual_sweep_binding_and_preflight_work_follows_axes_not_points() {
+        use crate::devices::circuit::preparation_metrics::take;
+        use crate::primitives::AnalysisKind;
+        // (request, target bindings, physical validation contexts, replacement-only checks)
+        for (args, bindings, physical, resistances) in [
+            ("v1 0 2 1", 1, 1, 0),
+            ("r1 1000 1002 1", 1, 1, 2),
+            ("temp 27 29 1", 0, 3, 0),
+            ("@d1[area] 1 3 1", 1, 1, 2),
+            ("v1 0 3 1 temp 27 29 1", 1, 3, 0),
+            ("r1 1000 1002 1 temp 27 29 1", 1, 3, 6),
+            ("@d1[area] 1 3 1 v1 0 3 1", 2, 1, 2),
+            ("temp 27 29 1 r1 1000 1002 1", 1, 3, 6),
+            ("temp 27 29 1 @d1[area] 1 3 1", 1, 3, 6),
+            ("@d1[area] 1 3 1 temp 27 29 1", 1, 3, 6),
+            ("@d1[area] 1 3 1 @d1[m] 1 3 1", 2, 1, 8),
+            ("@v1[dc] 0 3 1 v2 0 2 1", 2, 1, 0),
+            ("r1 1000 1002 1 @r2[resistance] 2000 2002 1", 2, 1, 4),
+        ] {
+            let mut circuit = fixture();
+            let context = AnalysisContext::default();
+            let plan = parse_axes(
+                &args
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let prepared = circuit.prepare_run();
+            take();
+            let axes = bind_axes(&circuit, &plan).unwrap();
+            let binding = take();
+            assert_eq!(binding.bindings, bindings, "{args}: {binding:?}");
+            assert!(binding.name_lookups <= 3 * bindings, "{args}: {binding:?}");
+            preflight(&prepared, &axes, &plan.grids, &context).unwrap();
+            let pre = take();
+            assert_eq!(pre.name_lookups, 0, "{args}: {pre:?}");
+            assert_eq!(pre.bindings, 0, "{args}: {pre:?}");
+            assert_eq!(pre.physical_validations, physical, "{args}: {pre:?}");
+            assert_eq!(pre.replacement_validations, resistances, "{args}: {pre:?}");
+            assert_eq!(pre.small_signal_assemblies, 0, "{args}: {pre:?}");
+            for values in GridPair::new(&plan.grids).points() {
+                let point =
+                    point_context(&circuit, &axes, values, context.model_context()).unwrap();
+                prepared.validate_context(&point.model).unwrap();
+            }
+            let points = take();
+            assert_eq!(points.bindings, 0, "{args}: {points:?}");
+            assert_eq!(points.name_lookups, 0, "{args}: {points:?}");
+            assert_eq!(points.small_signal_assemblies, 0, "{args}: {points:?}");
+            // Verify the same actual solver path, not only synthetic point construction.
+            drop(prepared);
+            let request = crate::analysis::AnalysisInput::with_arguments(
+                AnalysisKind::DcSweep,
+                args.split_whitespace(),
+            )
+            .resolve()
+            .unwrap();
+            let plot = request.run(&mut circuit, &context).unwrap();
+            let run = take();
+            assert_eq!(run.bindings, bindings, "{args}: {run:?}");
+            assert_eq!(run.name_lookups, binding.name_lookups, "{args}: {run:?}");
+            assert_eq!(run.replacement_validations, resistances, "{args}: {run:?}");
+            assert_eq!(run.small_signal_assemblies, 0, "{args}: {run:?}");
+            assert_eq!(run.physical_validations, physical, "{args}: {run:?}");
+            assert_eq!(
+                plot.point_count(),
+                GridPair::new(&plan.grids).points().count()
+            );
+            println!(
+                "{args}: bind={binding:?}; preflight={pre:?}; point_preparation={points:?}; run={run:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_handles_replay_values_and_reject_foreign_topologies() {
+        let mut a = fixture();
+        let b = fixture();
+        let resistance = a.bind_resistor_target("R1").unwrap();
+        let area = a.bind_instance_target("D1", "AREA").unwrap();
+        let voltage = a.bind_source_target("V1").unwrap();
+        let base = ModelContext::default();
+        let run = a.prepare_run();
+        for value in [1., 2., 1.] {
+            let context = base
+                .with_resistor_override(resistance.at_resistance(1000. * value).unwrap())
+                .unwrap()
+                .with_instance_override(area.at(value).unwrap())
+                .unwrap()
+                .with_instance_override(voltage.at(value).unwrap())
+                .unwrap();
+            run.validate_dc_inputs(&context).unwrap();
+            assert!(b.prepare_run().validate_dc_inputs(&context).is_err());
+            assert_eq!(a.resistor("r1").unwrap().1.supplied, 1000.);
+        }
+        drop(run);
+        let node = a.nodes().get("a").unwrap();
+        a.add_device(Box::new(
+            crate::devices::Resistor::new("r_stale", [node, crate::primitives::NodeId::GROUND], 1.)
+                .unwrap(),
+        ))
+        .unwrap();
+        a.finalize().unwrap();
+        let stale = base
+            .with_instance_override(voltage.at(1.).unwrap())
+            .unwrap();
+        assert!(a.prepare_run().validate_context(&stale).is_err());
+        assert!(resistance.at_resistance(0.).is_err());
+        assert!(area.at(Real::NAN).is_err());
+        assert!(voltage.at_resistance(1.).is_err());
     }
 
     #[test]

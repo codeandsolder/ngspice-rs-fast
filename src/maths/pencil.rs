@@ -5,29 +5,22 @@
 //! (`src/maths/ni/nipzmeth.c`). Each trial loads `A + s E` into one SPARSE
 //! matrix (`maths::sparse13`), reorders it as `SMPcReorder(1e-30, 0)`
 //! does (keeping the previous pivots when they pass the threshold test) and
-//! takes the determinant (`SMPcDProd`: SPARSE's base-10 mantissa converted to
-//! a base-2 mantissa/exponent pair). The search walks the real axis with the
-//! trial list kept sorted by `s`, brackets sign changes with a deflated
+//! takes the determinant directly as a binary mantissa/exponent pair. The search walks the real axis with the
+//! trial list built by a frequency scan, brackets sign changes with a deflated
 //! quadratic fit (`NIpzSym2`), deflates every found root out of the stored
 //! trials (`CKTpzVerify`), and continues into the complex plane with Muller's
 //! method from the curvature hint `NIpzK`.
 //!
 //! C's file-scope state (`CKTpzTrapped`, `NIpzK`, the guess bounds, move
 //! history) lives in `Search`; `Last_Move` starts at zero for each search
-//! instead of carrying over from a previous one. C's warnings (iteration limit,
-//! numerical aberrations) go to standard error and the roots found so far are
-//! returned, as in C; a determinant that vanishes at every trial is C's
-//! `E_SHORT`.
+//! instead of carrying over from a previous one. C's iteration-limit warning
+//! goes to standard error and the roots found so far are returned, as in C.
+//! The reference's aberration flag has no producer and its flatness counter is
+//! debug-only. A determinant that vanishes at every trial is C's `E_SHORT`.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::float_cmp,
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
-)]
-#![expect(
-    clippy::manual_midpoint,
-    reason = "C source midpoint arithmetic retains its original evaluation and rounding order"
 )]
 #![expect(
     clippy::too_many_lines,
@@ -37,19 +30,16 @@
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
 )]
-#![expect(
-    clippy::while_float,
-    reason = "the C iterative floating-point loop must preserve its original termination and rounding order"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 
 use crate::maths::Matrix;
 use crate::maths::linear::numerical;
 use crate::maths::sparse13::{Sparse, Status};
 use crate::primitives::{Complex, Real, SpiceResult};
+
+mod search;
+
+#[cfg(test)]
+pub(crate) use search::report_c_trace;
 
 /// The roots of a pencil, see [`pencil_roots`].
 #[derive(Debug, Clone, PartialEq)]
@@ -81,7 +71,7 @@ impl PencilTerm {
     /// The value this term adds at `s`.
     fn at(&self, s: Cx) -> Complex {
         match (self.conductance, self.capacitance) {
-            (Some(g), Some(c)) => Complex::new(g + c * s.re, c * s.im),
+            (Some(g), Some(c)) => Complex::new(c.mul_add(s.re, g), c * s.im),
             (Some(g), None) => Complex::new(g, 0.0),
             (None, Some(c)) => Complex::new(c * s.re, c * s.im),
             (None, None) => Complex::ZERO,
@@ -165,6 +155,30 @@ impl PencilLoad {
         })
     }
 
+    /// Each determinant monomial can select an s-dependent entry at
+    /// most once per row and column. Count the support after the drive
+    /// column replacement; cancellations can only lower this upper bound.
+    fn degree_bound(&self) -> usize {
+        let mut rows = std::collections::BTreeSet::new();
+        let mut cols = std::collections::BTreeSet::new();
+        for term in &self.terms {
+            if term.capacitance.is_none_or(|c| c == 0.) {
+                continue;
+            }
+            let col = if Some(term.col) == self.solution {
+                let Some(balance) = self.balance.filter(|&col| Some(col) != self.solution) else {
+                    continue;
+                };
+                balance
+            } else {
+                term.col
+            };
+            rows.insert(term.row);
+            cols.insert(col);
+        }
+        rows.len().min(cols.len())
+    }
+
     fn validate(&self) -> SpiceResult<()> {
         let n = self.order;
         if n == 0 {
@@ -196,35 +210,7 @@ impl PencilLoad {
     }
 }
 
-const NITER_LIM: usize = 200;
-
-const SHIFT_LEFT: u8 = 2;
-const SHIFT_RIGHT: u8 = 3;
-const SKIP_LEFT: u8 = 4;
-const SKIP_RIGHT: u8 = 5;
-const INIT: u8 = 6;
-const GUESS: u8 = 7;
-const SPLIT_LEFT: u8 = 8;
-const SPLIT_RIGHT: u8 = 9;
-const MULLER: u8 = 10;
-const SYM: u8 = 11;
-const SYM2: u8 = 12;
-const COMPLEX_INIT: u8 = 13;
-const COMPLEX_GUESS: u8 = 14;
-
-const NEAR_LEFT: u8 = 4;
-const MID_LEFT: u8 = 5;
-const FAR_LEFT: u8 = 6;
-const NEAR_RIGHT: u8 = 7;
-const FAR_RIGHT: u8 = 8;
-const MID_RIGHT: u8 = 9;
-
-const ISAROOT: u8 = 2;
-const ISAREPEAT: u8 = 4;
-const ISANABERRATION: u8 = 8;
-const ISAMINIMA: u8 = 16;
-
-/// `SPcomplex` arithmetic with the exact C macro formulas (`complex.h`).
+/// Complex arithmetic for the scaled determinant search.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Cx {
     re: Real,
@@ -249,22 +235,14 @@ impl Cx {
     }
     /// `C_MULEQ` / `C_MUL`.
     fn mul(self, b: Self) -> Self {
-        Self::new(
-            self.re * b.re - self.im * b.im,
-            self.re * b.im + self.im * b.re,
-        )
+        let product = Complex::new(self.re, self.im) * Complex::new(b.re, b.im);
+        Self::new(product.re, product.im)
     }
     /// `C_DIV` / `C_DIVEQ`.
     fn div(self, b: Self) -> Self {
-        // The C numerator's imaginary sum is the same finite binary64
-        // operation as Complex::div (including signed zeros). Share its
-        // exceptional exponent-scaled path as well.
+        // Use the shared cancellation-aware and exponent-scaled kernel.
         let quotient = Complex::new(self.re, self.im) / Complex::new(b.re, b.im);
         Self::new(quotient.re, quotient.im)
-    }
-    /// `C_MAG2`: squared modulus as the real part.
-    fn mag2(self) -> Self {
-        Self::new(self.re * self.re + self.im * self.im, 0.0)
     }
     /// `C_SQRT`.
     fn sqrt(self) -> Self {
@@ -275,14 +253,17 @@ impl Cx {
                 Self::new(self.re.sqrt(), 0.0)
             }
         } else {
-            let mag = self.re.hypot(self.im);
-            let a = (mag - self.re) / 2.0;
-            if a <= 0.0 {
-                let re = mag.sqrt();
-                Self::new(re, self.im / (2.0 * re))
+            let scale = self.re.abs().max(self.im.abs());
+            let re = self.re / scale;
+            let im = self.im / scale;
+            let large = scale.sqrt() * re.abs().midpoint(re.hypot(im)).sqrt();
+            if self.re >= 0.0 {
+                // Choose the sign that makes the imaginary part positive,
+                // as in C. Divide the original small component, not its
+                // potentially underflowed normalized value.
+                Self::new(large.copysign(self.im), (self.im / large).abs() * 0.5)
             } else {
-                let a = a.sqrt();
-                Self::new(self.im / (2.0 * a), a)
+                Self::new((self.im / large) * 0.5, large)
             }
         }
     }
@@ -291,8 +272,8 @@ impl Cx {
     }
 }
 
-/// `C_NORM`: scale `a` into `(0.5, 1]` per component, tracking the binary
-/// exponent in `mag` (set to zero for a zero value).
+/// Scale a nonzero finite value into a binary mantissa with maximum
+/// component in (0.5, 1]. Shifts are exact except at the subnormal limit.
 fn c_norm(a: &mut Cx, mag: &mut i64) -> SpiceResult<()> {
     if !a.re.is_finite() || !a.im.is_finite() {
         return Err(numerical(
@@ -300,61 +281,47 @@ fn c_norm(a: &mut Cx, mag: &mut i64) -> SpiceResult<()> {
             "non-finite complex normalization",
         ));
     }
-    if a.is_zero() {
+    let max = a.re.abs().max(a.im.abs());
+    if max == 0.0 {
         *mag = 0;
         return Ok(());
     }
-    while a.re.abs() > 1.0 || a.im.abs() > 1.0 {
-        *mag += 1;
-        a.re /= 2.0;
-        a.im /= 2.0;
-    }
-    while a.re.abs() <= 0.5 && a.im.abs() <= 0.5 {
-        *mag -= 1;
-        a.re *= 2.0;
-        a.im *= 2.0;
-    }
+    let shift = normalization_shift(max)?;
+    a.re = materialize_power(a.re, -i64::from(shift));
+    a.im = materialize_power(a.im, -i64::from(shift));
+    *mag += i64::from(shift);
     Ok(())
 }
 
-/// `R_NORM`.
+fn normalization_shift(value: Real) -> SpiceResult<i32> {
+    let exponent = crate::primitives::numeric::binary_exponent(value)
+        .ok_or_else(|| numerical("pole-zero search", "invalid normalization component"))?;
+    Ok(exponent + i32::from(crate::primitives::numeric::scale_power(value, -exponent) > 1.))
+}
+
+/// Normalize a real independently of the other components.
 fn r_norm(a: &mut Real, mag: &mut i64) -> SpiceResult<()> {
-    if !a.is_finite() {
-        return Err(numerical(
-            "pole-zero search",
-            "non-finite real normalization",
-        ));
-    }
     if *a == 0.0 {
         *mag = 0;
         return Ok(());
     }
-    while a.abs() > 1.0 {
-        *mag += 1;
-        *a /= 2.0;
-    }
-    while a.abs() < 0.5 {
-        *mag -= 1;
-        *a *= 2.0;
-    }
+    let shift = normalization_shift(a.abs())?;
+    *a = crate::primitives::numeric::scale_power(*a, -shift);
+    *mag += i64::from(shift);
     Ok(())
 }
 
-/// Materialize a scaled real in C's repeated doubling/halving order.
-/// Stopping once zero or infinity is reached keeps the work bounded by
-/// binary64's exponent range, even for enormous determinant exponents.
-fn materialize_power(mut value: Real, exponent: i64) -> Real {
-    for _ in 0..exponent.unsigned_abs() {
-        if value == 0.0 || !value.is_finite() {
-            break;
-        }
-        if exponent > 0 {
-            value *= 2.0;
-        } else {
-            value /= 2.0;
-        }
+/// Materialize a power-of-two-scaled value without a loop proportional to
+/// the caller's exponent. Any nonzero finite binary64 over/underflows for
+/// shifts of more than 2,200 bits in the corresponding direction.
+fn materialize_power(value: Real, exponent: i64) -> Real {
+    let exponent = exponent.clamp(-2200, 2200);
+    let exponent = i32::try_from(exponent).unwrap_or_default();
+    if value == 0.0 || !value.is_finite() {
+        value
+    } else {
+        crate::primitives::numeric::scale_power(value, exponent)
     }
-    value
 }
 
 fn normalize_muller(a: &mut Cx, b: &mut Cx, c: &mut Cx) -> SpiceResult<()> {
@@ -386,27 +353,14 @@ fn zaddeq(x: Real, xmag: i64, y: Real, ymag: i64) -> SpiceResult<(Real, i64)> {
     if !x.is_finite() || !y.is_finite() {
         return Err(numerical("pole-zero search", "non-finite scaled sum"));
     }
-    let (mut x, mut y) = (x, y);
-    let mut amag;
-    if xmag > ymag {
-        amag = xmag;
-        if xmag > 50 + ymag {
-            y = 0.0;
-        } else {
-            for _ in 0..(xmag - ymag) {
-                y /= 2.0;
-            }
-        }
-    } else {
-        amag = ymag;
-        if ymag > 50 + xmag {
-            x = 0.0;
-        } else {
-            for _ in 0..(ymag - xmag) {
-                x /= 2.0;
-            }
-        }
+    if x == 0.0 || y == 0.0 {
+        let (mut value, mut exponent) = if x == 0.0 { (y, ymag) } else { (x, xmag) };
+        r_norm(&mut value, &mut exponent)?;
+        return Ok((value, exponent));
     }
+    let mut amag = xmag.max(ymag);
+    let x = materialize_power(x, xmag.saturating_sub(amag));
+    let y = materialize_power(y, ymag.saturating_sub(amag));
     let mut a = x + y;
     r_norm(&mut a, &mut amag)?;
     Ok((a, amag))
@@ -415,51 +369,6 @@ fn zaddeq(x: Real, xmag: i64, y: Real, ymag: i64) -> SpiceResult<(Real, i64)> {
 fn sgn(x: Real) -> i32 {
     if x < 0.0 { -1 } else { i32::from(x != 0.0) }
 }
-
-/// C `logb`: the unbiased binary exponent of a nonzero finite value.
-fn logb(x: Real) -> SpiceResult<Real> {
-    crate::primitives::numeric::binary_exponent(x)
-        .map(Real::from)
-        .ok_or_else(|| numerical("pole-zero search", "invalid determinant component exponent"))
-}
-
-/// `SMPcDProd`: SPARSE's `mantissa * 10^p` as a base-2 mantissa/exponent.
-fn base2_determinant(mantissa: Complex, p: i32) -> SpiceResult<(Cx, i64)> {
-    let (mut re, mut im) = (mantissa.re, mantissa.im);
-    let mut y = Real::from(p) * std::f64::consts::LN_10 / std::f64::consts::LN_2;
-    let x = y.trunc();
-    y -= x;
-    let z = 2.0_f64.powf(y);
-    re *= z;
-    im *= z;
-    // C treats a zero component as exponent zero, even when the other
-    // component has a negative exponent. Do not drop that convention.
-    let mut y = if re == 0.0 { 0.0 } else { logb(re)? };
-    let z = if im == 0.0 { 0.0 } else { logb(im)? };
-    if y < z {
-        y = z;
-    }
-    let exponent = crate::primitives::exact_signed_integer(x + y)
-        .ok_or_else(|| numerical("pole-zero search", "invalid determinant exponent"))?;
-    let shift = crate::primitives::truncating_signed_integer::<i32>(y)
-        .map(|shift| 2.0_f64.powi(-shift))
-        .ok_or_else(|| numerical("pole-zero search", "invalid determinant shift"))?;
-    Ok((Cx::new(re * shift, im * shift), exponent))
-}
-
-#[derive(Debug, Clone)]
-struct Trial {
-    s: Cx,
-    f_def: Cx,
-    mag_def: i64,
-    multiplicity: u32,
-    flags: u8,
-    count: u32,
-    next: Option<usize>,
-    prev: Option<usize>,
-}
-
-type Set = [Option<usize>; 3];
 
 /// One compiled pencil load, retaining element handles and the SPARSE
 /// pivot frame between trials. The root-search state does not own matrix
@@ -550,32 +459,10 @@ impl<'a> LoadedPencil<'a> {
             )),
             Status::Okay | Status::SmallPivot => {
                 let (mantissa, exponent) = sparse.factors()?.determinant()?;
-                base2_determinant(mantissa, exponent).map(Some)
+                Ok(Some((Cx::new(mantissa.re, mantissa.im), exponent)))
             }
         }
     }
-}
-
-/// One `CKTpzFindZeros` run with its file-scope state.
-struct Search<'a> {
-    pencil: LoadedPencil<'a>,
-    trials: Vec<Trial>,
-    head: Option<usize>,
-    zero_trial: Option<usize>,
-    nzeros: usize,
-    nflat: usize,
-    max_zeros: usize,
-    seq_num: usize,
-    guess_param: Real,
-    high_guess: Real,
-    low_guess: Real,
-    last_move: u8,
-    consec_moves: u32,
-    niter: usize,
-    aberr_num: usize,
-    trapped: u8,
-    pz_k: Real,
-    pz_k_mag: i64,
 }
 
 /// Roots of `det(A + s E)` found by ngspice's pole-zero search
@@ -597,907 +484,7 @@ pub fn pencil_roots(a: &Matrix, e: &Matrix) -> SpiceResult<PencilRoots> {
 /// `E_PANIC`).
 pub fn pencil_load_roots(load: &PencilLoad) -> SpiceResult<PencilRoots> {
     load.validate()?;
-    let n = load.order;
-    let mut search = Search {
-        pencil: LoadedPencil::new(load)?,
-        trials: Vec::new(),
-        head: None,
-        zero_trial: None,
-        nzeros: 0,
-        nflat: 0,
-        max_zeros: n,
-        seq_num: 1,
-        guess_param: 0.0,
-        high_guess: -1.0,
-        low_guess: 1.0,
-        last_move: 0,
-        consec_moves: 0,
-        niter: 0,
-        aberr_num: 0,
-        trapped: 0,
-        pz_k: 0.0,
-        pz_k_mag: 0,
-    };
-    search.find_zeros().map(|roots| PencilRoots { roots })
-}
-
-impl Search<'_> {
-    fn neighborhood_trial(&self, index: Option<usize>) -> SpiceResult<&Trial> {
-        index
-            .and_then(|index| self.trials.get(index))
-            .ok_or_else(|| {
-                numerical(
-                    "pole-zero search",
-                    "missing neighborhood trial for search strategy",
-                )
-            })
-    }
-
-    fn s(&self, index: Option<usize>) -> SpiceResult<Cx> {
-        self.neighborhood_trial(index).map(|trial| trial.s)
-    }
-
-    /// `CKTpzFindZeros`.
-    fn find_zeros(&mut self) -> SpiceResult<Vec<Complex>> {
-        let mut set: Set = [None; 3];
-        self.reset(&mut set);
-        loop {
-            let mut strat;
-            loop {
-                strat = self.strat(&set)?;
-                if !(strat < GUESS && self.trapped == 0) {
-                    break;
-                }
-                if !self.step(strat, &mut set) {
-                    strat = GUESS;
-                    break;
-                }
-            }
-            self.niter += 1;
-            let candidate = self.eval(strat, &set)?;
-            let new = self.run_trial(candidate, &set)?;
-            let flags = self.trials[new].flags;
-            if flags & ISAROOT != 0 {
-                if self.verify(new)? {
-                    self.niter = 0;
-                    self.reset(&mut set);
-                } else {
-                    self.update_set(&mut set, new)?;
-                }
-            } else if flags & ISANABERRATION != 0 {
-                self.reset(&mut set);
-                self.aberr_num += 1;
-            } else if flags & ISAMINIMA != 0 {
-                set = [None, Some(new), None];
-            } else {
-                self.update_set(&mut set, new)?;
-            }
-            let spread = self.high_guess - self.low_guess;
-            let open = set[0].is_none()
-                || set[2].is_none()
-                || self.trapped != 0
-                || self.s(set[2])?.re - self.s(set[0])?.re < 1e22;
-            if !(spread < 1e40
-                && self.nzeros < self.max_zeros
-                && self.niter < NITER_LIM
-                && self.aberr_num < 3
-                && spread < 1e35
-                && open)
-            {
-                break;
-            }
-        }
-        if self.nzeros + 1 >= self.seq_num {
-            return Err(numerical(
-                "pole-zero search",
-                "singular pencil: the determinant vanished at every trial (C E_SHORT, \
-                 \"The input signal is shorted on the way to the output\")",
-            ));
-        }
-        if self.aberr_num > 2 {
-            eprintln!(
-                "warning: Pole-zero converging to numerical aberrations; giving up after {} trials",
-                self.seq_num
-            );
-        }
-        if self.niter >= NITER_LIM {
-            eprintln!(
-                "warning: Pole-zero iteration limit reached; giving up after {} trials",
-                self.seq_num
-            );
-        }
-        // clear_trials(0) and PZpost.
-        let mut roots = Vec::new();
-        let mut t = self.head;
-        while let Some(i) = t {
-            let trial = &self.trials[i];
-            if trial.flags & ISAROOT != 0 {
-                for _ in 0..trial.multiplicity {
-                    roots.push(Complex::new(trial.s.re, trial.s.im));
-                    if trial.s.im != 0.0 {
-                        roots.push(Complex::new(trial.s.re, -trial.s.im));
-                    }
-                }
-            }
-            t = trial.next;
-        }
-        Ok(roots)
-    }
-
-    /// `PZeval`: the next trial point for a strategy (not yet in the list).
-    fn eval(&mut self, strat: u8, set: &Set) -> SpiceResult<usize> {
-        let mut trial = Trial {
-            s: Cx::ZERO,
-            f_def: Cx::ZERO,
-            mag_def: 0,
-            multiplicity: 0,
-            flags: 0,
-            count: 0,
-            next: None,
-            prev: None,
-        };
-        self.seq_num += 1;
-        match strat {
-            GUESS => {
-                if self.high_guess < self.low_guess {
-                    self.guess_param = 0.0;
-                } else if self.guess_param > 0.0 {
-                    self.guess_param = if self.high_guess > 0.0 {
-                        self.high_guess * 10.0
-                    } else {
-                        1.0
-                    };
-                } else {
-                    self.guess_param = if self.low_guess < 0.0 {
-                        self.low_guess * 10.0
-                    } else {
-                        -1.0
-                    };
-                }
-                if self.high_guess < self.guess_param {
-                    self.high_guess = self.guess_param;
-                }
-                if self.low_guess > self.guess_param {
-                    self.low_guess = self.guess_param;
-                }
-                trial.s.re = self.guess_param;
-                trial.s.im = set[1].map_or(0.0, |i| self.trials[i].s.im);
-            }
-            SYM | SYM2 => {
-                trial.s = Cx::new(self.sym2(set)?, 0.0);
-                let (s0, s1) = (self.s(set[0])?, self.s(set[1])?);
-                match self.trapped {
-                    1 => {
-                        if trial.s.re < s0.re || trial.s.re > s1.re {
-                            trial.s.re = (s0.re + s1.re) / 2.0;
-                        }
-                    }
-                    2 => {
-                        let s2 = self.s(set[2])?;
-                        if trial.s.re < s1.re || trial.s.re > s2.re {
-                            trial.s.re = (s1.re + s2.re) / 2.0;
-                        }
-                    }
-                    3 => {
-                        let s2 = self.s(set[2])?;
-                        if trial.s.re <= s0.re
-                            || (trial.s.re == s1.re && trial.s.im == s1.im)
-                            || trial.s.re >= s2.re
-                        {
-                            trial.s.re = (s0.re + s2.re) / 2.0;
-                            if trial.s.re == s1.re {
-                                trial.s.re =
-                                    if self.last_move == MID_LEFT || self.last_move == NEAR_RIGHT {
-                                        (s0.re + s1.re) / 2.0
-                                    } else {
-                                        (s1.re + s2.re) / 2.0
-                                    };
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            COMPLEX_INIT => {
-                trial.s.re = self.s(set[1])?.re;
-                if self.pz_k != 0.0 && self.pz_k_mag > -10 {
-                    trial.s.im = materialize_power(self.pz_k, self.pz_k_mag);
-                } else {
-                    trial.s.im = 10000.0;
-                }
-                self.pz_k = 0.0;
-                self.pz_k_mag = 0;
-            }
-            COMPLEX_GUESS => {
-                trial.s.re = self.s(set[0])?.re;
-                trial.s.im = if set[2].is_none() { 1.0e8 } else { 1.0e12 };
-            }
-            MULLER => trial.s = self.muller(set)?,
-            SPLIT_LEFT => {
-                trial.s.re = (self.s(set[0])?.re + 2.0 * self.s(set[1])?.re) / 3.0;
-            }
-            SPLIT_RIGHT => {
-                trial.s.re = (self.s(set[2])?.re + 2.0 * self.s(set[1])?.re) / 3.0;
-            }
-            _ => return Err(numerical("pole-zero search", "Step type unknown")),
-        }
-        if !trial.s.re.is_finite() || !trial.s.im.is_finite() {
-            return Err(numerical("pole-zero search", "non-finite trial frequency"));
-        }
-        self.trials.push(trial);
-        Ok(self.trials.len() - 1)
-    }
-
-    /// `CKTpzStrat`.
-    #[expect(
-        clippy::needless_late_init,
-        reason = "initialization position follows the original C control-flow structure"
-    )] // keeps C's branch structure
-    fn strat(&mut self, set: &Set) -> SpiceResult<u8> {
-        let mut new_trap = 0;
-        let suggestion;
-        let minima = set[1].is_some_and(|i| self.trials[i].flags & ISAMINIMA != 0);
-        if minima {
-            suggestion = COMPLEX_INIT;
-        } else if set[0].is_some_and(|i| self.trials[i].s.im != 0.0) {
-            suggestion = if set[1].is_none() || set[2].is_none() {
-                COMPLEX_GUESS
-            } else {
-                MULLER
-            };
-        } else if set.iter().any(Option::is_none) {
-            suggestion = INIT;
-        } else {
-            let t0 = self.neighborhood_trial(set[0])?;
-            let t1 = self.neighborhood_trial(set[1])?;
-            let t2 = self.neighborhood_trial(set[2])?;
-            let mut chosen;
-            if sgn(t0.f_def.re) != sgn(t1.f_def.re) {
-                new_trap = 1;
-                chosen = SYM2;
-            } else if sgn(t1.f_def.re) != sgn(t2.f_def.re) {
-                new_trap = 2;
-                chosen = SYM2;
-            } else {
-                let (a, a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def)?;
-                let (b, b_mag) = zaddeq(t2.f_def.re, t2.mag_def, -t1.f_def.re, t1.mag_def)?;
-                if self.trapped == 0 {
-                    let k1 = t1.s.re - t0.s.re;
-                    let k2 = t2.s.re - t1.s.re;
-                    chosen = if a_mag + 10 < t0.mag_def
-                        && a_mag + 10 < t1.mag_def
-                        && b_mag + 10 < t1.mag_def
-                        && b_mag + 10 < t2.mag_def
-                    {
-                        if k1 > k2 { SKIP_RIGHT } else { SKIP_LEFT }
-                    } else if sgn(a) != -sgn(b) {
-                        if a == 0.0 {
-                            SKIP_LEFT
-                        } else if b == 0.0 {
-                            SKIP_RIGHT
-                        } else if sgn(a) == sgn(t1.f_def.re) {
-                            SHIFT_LEFT
-                        } else {
-                            SHIFT_RIGHT
-                        }
-                    } else if sgn(a) == -sgn(t1.f_def.re) {
-                        new_trap = 3;
-                        SYM
-                    } else if k1 > k2 {
-                        SKIP_RIGHT
-                    } else {
-                        SKIP_LEFT
-                    };
-                } else {
-                    new_trap = 3;
-                    chosen = if sgn(a) != sgn(b) {
-                        SYM
-                    } else if a_mag > b_mag || (a_mag == b_mag && a.abs() > b.abs()) {
-                        SPLIT_LEFT
-                    } else {
-                        SPLIT_RIGHT
-                    };
-                }
-            }
-            if self.consec_moves >= 3 && self.trapped == new_trap {
-                new_trap = self.trapped;
-                chosen = if self.last_move == MID_LEFT || self.last_move == NEAR_RIGHT {
-                    SPLIT_LEFT
-                } else if self.last_move == MID_RIGHT || self.last_move == NEAR_LEFT {
-                    SPLIT_RIGHT
-                } else {
-                    return Err(numerical(
-                        "pole-zero search",
-                        "trapped search has no usable last move (C calls controlled_exit)",
-                    ));
-                };
-                self.consec_moves = 0;
-            }
-            suggestion = chosen;
-        }
-        self.trapped = new_trap;
-        Ok(suggestion)
-    }
-
-    /// `CKTpzRunTrial`: evaluates (or merges) a trial and links it into the
-    /// sorted list. Returns the trial now standing for it.
-    fn run_trial(&mut self, candidate: usize, set: &Set) -> SpiceResult<usize> {
-        let mut new = candidate;
-        if self.trials[new].s.im < 0.0 {
-            self.trials[new].s.im *= -1.0;
-        }
-        let mut pretest = false;
-        let mut shifted = false;
-        let mut repeat = false;
-        let mut def_frac;
-        let mut def_mag;
-        let mut prev;
-        let mut matched;
-        let mut hit = None;
-        loop {
-            def_mag = 0;
-            def_frac = Cx::new(1.0, 0.0);
-            let was_shifted = shifted;
-            shifted = false;
-            prev = None;
-            matched = None;
-            let mut p = self.head;
-            while let Some(pi) = p {
-                let diff = self.trials[pi].s.sub(self.trials[new].s);
-                if diff.re < 0.0 || (diff.re == 0.0 && diff.im < 0.0) {
-                    prev = Some(pi);
-                }
-                let root = self.trials[pi].flags & ISAROOT != 0;
-                let (abstol, reltol) = if root { (1e-5, 1e-6) } else { (1e-20, 1e-12) };
-                if diff.im == 0.0
-                    && diff.re.abs() / (self.trials[pi].s.re.abs() + abstol / reltol) < reltol
-                {
-                    if was_shifted
-                        || self.trials[pi].count >= 3
-                        || !self.alter(new, set[1], abstol, reltol)
-                    {
-                        self.trials[pi].count = 0;
-                        pretest = true;
-                        hit = Some(pi);
-                        break;
-                    }
-                    self.trials[pi].count += 1;
-                    shifted = true;
-                    break;
-                }
-                if self.trapped == 0 {
-                    self.trials[pi].count = 0;
-                }
-                if root {
-                    let mut diff = diff;
-                    let mut diff_mag = 0;
-                    c_norm(&mut diff, &mut diff_mag)?;
-                    if diff.im != 0.0 {
-                        diff = diff.mag2();
-                        diff_mag *= 2;
-                    }
-                    c_norm(&mut diff, &mut diff_mag)?;
-                    for _ in 0..self.trials[pi].multiplicity {
-                        def_frac = def_frac.mul(diff);
-                        def_mag += diff_mag;
-                        c_norm(&mut def_frac, &mut def_mag)?;
-                    }
-                } else if matched.is_none() {
-                    matched = Some(pi);
-                }
-                p = self.trials[pi].next;
-            }
-            if !shifted {
-                break;
-            }
-        }
-        let mut singular = false;
-        if pretest {
-            let p = hit.unwrap_or(new);
-            if self.trials[p].flags & ISAROOT == 0
-                && self.trapped == 3
-                && self.pz_k != 0.0
-                && self.pz_k_mag > -10
-            {
-                self.trials[p].flags |= ISAMINIMA;
-                new = p;
-                repeat = true;
-            } else if self.trials[p].flags & ISAROOT != 0 {
-                new = p;
-                self.trials[p].flags |= ISAREPEAT;
-                self.trials[p].multiplicity += 1;
-                repeat = true;
-            } else {
-                singular = true;
-            }
-        }
-        if !repeat {
-            let mut f_raw = Cx::ZERO;
-            let mut mag_raw = 0;
-            if !pretest {
-                match self.pencil.determinant_at(self.trials[new].s)? {
-                    Some((f, mag)) => {
-                        f_raw = f;
-                        mag_raw = mag;
-                    }
-                    None => singular = true,
-                }
-            }
-            let trial = &mut self.trials[new];
-            if singular || f_raw.is_zero() {
-                trial.f_def = Cx::ZERO;
-                trial.mag_def = 0;
-                trial.flags = ISAROOT;
-            } else {
-                // PZnumswaps is always 1 after SMPcReorder.
-                trial.f_def = f_raw.div(def_frac);
-                trial.mag_def = mag_raw - def_mag;
-                c_norm(&mut trial.f_def, &mut trial.mag_def)?;
-            }
-            if let Some(prev) = prev {
-                let after = self.trials[prev].next;
-                self.trials[new].next = after;
-                if let Some(after) = after {
-                    self.trials[after].prev = Some(new);
-                }
-                self.trials[prev].next = Some(new);
-            } else {
-                match self.head {
-                    Some(head) => self.trials[head].prev = Some(new),
-                    None => self.zero_trial = Some(new),
-                }
-                self.trials[new].next = self.head;
-                self.head = Some(new);
-            }
-            self.trials[new].prev = prev;
-            if self.trials[new].flags & ISAROOT == 0 {
-                match matched {
-                    Some(m) => self.check_flat(m, new),
-                    None => self.nflat = 1,
-                }
-            }
-        }
-        Ok(new)
-    }
-
-    /// `CKTpzVerify`: count the root, deflate every stored non-root trial
-    /// by it and drop trials too close to it (always "verified").
-    fn verify(&mut self, new: usize) -> SpiceResult<bool> {
-        self.nzeros += 1;
-        let s = self.trials[new].s;
-        if s.im != 0.0 {
-            self.nzeros += 1;
-        }
-        self.nflat = 0;
-        if self.trials[new].multiplicity == 0 {
-            self.trials[new].flags |= ISAROOT;
-            self.trials[new].multiplicity = 1;
-        }
-        let mut prev: Option<usize> = None;
-        let mut t = self.head;
-        while let Some(ti) = t {
-            let next = self.trials[ti].next;
-            if self.trials[ti].flags & ISAROOT != 0 {
-                prev = Some(ti);
-                t = next;
-                continue;
-            }
-            let mut diff = s.sub(self.trials[ti].s);
-            if s.im != 0.0 {
-                diff = diff.mag2();
-            }
-            let tdiff = diff.re;
-            if diff.re != 0.0 {
-                let mut diff_mag = 0;
-                c_norm(&mut diff, &mut diff_mag)?;
-                diff_mag *= -1;
-                let trial = &mut self.trials[ti];
-                trial.f_def = trial.f_def.div(diff);
-                c_norm(&mut trial.f_def, &mut diff_mag)?;
-                trial.mag_def += diff_mag;
-            }
-            if self.trials[ti].s.im != 0.0 || tdiff.abs() / (s.re.abs() + 200.0) < 0.005 {
-                if let Some(p) = prev {
-                    self.trials[p].next = next;
-                }
-                if let Some(n) = next {
-                    self.trials[n].prev = prev;
-                }
-                if self.zero_trial == Some(ti) {
-                    self.zero_trial = next.or(self.trials[ti].prev);
-                }
-                if self.head == Some(ti) {
-                    self.head = next;
-                }
-            } else {
-                match prev {
-                    Some(p) => self.check_flat(p, ti),
-                    None => self.nflat = 1,
-                }
-                self.trials[ti].flags &= !ISAMINIMA;
-                prev = Some(ti);
-            }
-            t = next;
-        }
-        Ok(true)
-    }
-
-    /// `pzseek`: the nearest non-root, non-minimum trial in a direction.
-    fn seek(&mut self, t: Option<usize>, dir: i32) -> Option<usize> {
-        self.guess_param = Real::from(dir);
-        let mut t = t?;
-        let skip = |trial: &Trial| trial.flags & (ISAROOT | ISAMINIMA) != 0;
-        if dir == 0 && !skip(&self.trials[t]) {
-            return Some(t);
-        }
-        loop {
-            let next = if dir >= 0 {
-                self.trials[t].next
-            } else {
-                self.trials[t].prev
-            };
-            t = next?;
-            if !skip(&self.trials[t]) {
-                return Some(t);
-            }
-        }
-    }
-
-    /// `CKTpzUpdateSet`.
-    fn update_set(&mut self, set: &mut Set, new: usize) -> SpiceResult<()> {
-        let mut this_move = 0;
-        let trial = self.trials[new].clone();
-        let n = trial.s;
-        if n.im != 0.0 {
-            set[2] = set[1];
-            set[1] = set[0];
-            set[0] = Some(new);
-        } else if set[1].is_none() {
-            set[1] = Some(new);
-        } else if set[2].is_none() && n.re > self.s(set[1])?.re {
-            set[2] = Some(new);
-        } else if set[0].is_none() {
-            set[0] = Some(new);
-        } else if trial.flags & ISAMINIMA != 0 {
-            set[1] = Some(new);
-        } else if n.re < self.s(set[0])?.re {
-            set[2] = set[1];
-            set[1] = set[0];
-            set[0] = Some(new);
-            this_move = FAR_LEFT;
-        } else {
-            let middle = self.neighborhood_trial(set[1])?;
-            let better = self.trapped == 0
-                || trial.mag_def < middle.mag_def
-                || (trial.mag_def == middle.mag_def
-                    && trial.f_def.re.abs() < middle.f_def.re.abs());
-            if n.re < middle.s.re {
-                if better {
-                    set[2] = set[1];
-                    set[1] = Some(new);
-                    this_move = MID_LEFT;
-                } else {
-                    set[0] = Some(new);
-                    this_move = NEAR_LEFT;
-                }
-            } else if set[2].is_some() && n.re < self.s(set[2])?.re {
-                if better {
-                    set[0] = set[1];
-                    set[1] = Some(new);
-                    this_move = MID_RIGHT;
-                } else {
-                    set[2] = Some(new);
-                    this_move = NEAR_RIGHT;
-                }
-            } else {
-                set[0] = set[1];
-                set[1] = set[2];
-                set[2] = Some(new);
-                this_move = FAR_RIGHT;
-            }
-        }
-        if self.trapped != 0 && this_move == self.last_move {
-            self.consec_moves += 1;
-        } else {
-            self.consec_moves = 0;
-        }
-        self.last_move = this_move;
-        Ok(())
-    }
-
-    /// `check_flat`.
-    fn check_flat(&mut self, a: usize, b: usize) {
-        let (a, b) = (&self.trials[a], &self.trials[b]);
-        let diff_mag = a.mag_def - b.mag_def;
-        if diff_mag.abs() <= 1 {
-            let mult = match diff_mag {
-                1 => 2.0,
-                -1 => 0.5,
-                _ => 1.0,
-            };
-            let diff = a.f_def.scale(mult).sub(b.f_def).mag2();
-            if diff.re < 1.0e-20 {
-                self.nflat += 1;
-            }
-        }
-    }
-
-    /// `CKTpzStep`.
-    fn step(&mut self, strat: u8, set: &mut Set) -> bool {
-        match strat {
-            INIT => {
-                if set[1].is_none() {
-                    set[1] = self.seek(self.zero_trial, 0);
-                } else if set[2].is_none() {
-                    set[2] = self.seek(set[1], 1);
-                } else if set[0].is_none() {
-                    set[0] = self.seek(set[1], -1);
-                }
-            }
-            SKIP_LEFT => set[0] = self.seek(set[0], -1),
-            SKIP_RIGHT => set[2] = self.seek(set[2], 1),
-            SHIFT_LEFT => {
-                set[2] = set[1];
-                set[1] = set[0];
-                set[0] = self.seek(set[0], -1);
-            }
-            SHIFT_RIGHT => {
-                set[0] = set[1];
-                set[1] = set[2];
-                set[2] = self.seek(set[2], 1);
-            }
-            _ => {}
-        }
-        set.iter().all(Option::is_some)
-    }
-
-    /// `CKTpzReset`.
-    fn reset(&mut self, set: &mut Set) {
-        self.trapped = 0;
-        self.consec_moves = 0;
-        set[1] = self.seek(self.zero_trial, 0);
-        if set[1].is_some() {
-            set[0] = self.seek(set[1], -1);
-            set[2] = self.seek(set[1], 1);
-        } else {
-            set[0] = None;
-            set[2] = None;
-        }
-    }
-
-    /// `alter`: move a trial that collides with an existing one.
-    fn alter(&mut self, new: usize, nearto: Option<usize>, abstol: Real, reltol: Real) -> bool {
-        let Some(near) = nearto else {
-            return false;
-        };
-        let t = self.trials[near].clone();
-        let neighbor = |i: Option<usize>| i.map(|i| self.trials[i].s.re);
-        let (left, right) = (neighbor(t.prev), neighbor(t.next));
-        let root = t.flags & ISAROOT != 0;
-        let p1 = if self.trapped == 2 {
-            t.s.re
-        } else {
-            let mut p1 = t.s.re;
-            if root {
-                p1 -= 1e-6 * t.s.re + 1e-5;
-            }
-            match left {
-                Some(l) => p1 += l,
-                None => p1 -= 10.0 * (p1.abs() + 1.0),
-            }
-            p1 / 2.0
-        };
-        let p2 = if self.trapped == 1 {
-            t.s.re
-        } else {
-            let mut p2 = t.s.re;
-            if root {
-                p2 += 1e-6 * t.s.re + 1e-5;
-            }
-            match right {
-                Some(r) => p2 += r,
-                None => p2 += 10.0 * (p2.abs() + 1.0),
-            }
-            p2 / 2.0
-        };
-        // C's precedence: |p - x| / |x| + abstol / reltol < reltol.
-        if left.is_some_and(|l| (p1 - l).abs() / l.abs() + abstol / reltol < reltol)
-            || right.is_some_and(|r| (p2 - r).abs() / r.abs() + abstol / reltol < reltol)
-        {
-            return false;
-        }
-        self.trials[new].s.re = if self.trapped != 2 && t.s.re - p1 > p2 - t.s.re {
-            p1
-        } else {
-            p2
-        };
-        true
-    }
-
-    /// `NIpzSym2`: deflated quadratic fit through three real trials.
-    fn sym2(&mut self, set: &Set) -> SpiceResult<Real> {
-        let t0 = self.neighborhood_trial(set[0])?.clone();
-        let t1 = self.neighborhood_trial(set[1])?.clone();
-        let t2 = self.neighborhood_trial(set[2])?.clone();
-        let mut dx0 = t1.s.re - t0.s.re;
-        let mut dx1 = t2.s.re - t1.s.re;
-        let x0 = (t0.s.re + t1.s.re) / 2.0;
-        let mut d2x = (t2.s.re - t0.s.re) / 2.0;
-
-        let (mut a, mut a_mag) = zaddeq(t1.f_def.re, t1.mag_def, -t0.f_def.re, t0.mag_def)?;
-        let mut tmag = 0;
-        r_norm(&mut dx0, &mut tmag)?;
-        a /= dx0;
-        a_mag -= tmag;
-        r_norm(&mut a, &mut a_mag)?;
-
-        let (mut b, mut b_mag) = zaddeq(t2.f_def.re, t2.mag_def, -t1.f_def.re, t1.mag_def)?;
-        tmag = 0;
-        r_norm(&mut dx1, &mut tmag)?;
-        b /= dx1;
-        b_mag -= tmag;
-        r_norm(&mut b, &mut b_mag)?;
-
-        let (mut c, mut c_mag) = zaddeq(b, b_mag, -a, a_mag)?;
-        tmag = 0;
-        r_norm(&mut d2x, &mut tmag)?;
-        c /= d2x;
-        c_mag -= tmag;
-        r_norm(&mut c, &mut c_mag)?;
-
-        if c == 0.0 || ((a == 0.0 || c_mag < a_mag - 40) && (b == 0.0 || c_mag < b_mag - 40)) {
-            if a == 0.0 {
-                a = b;
-                a_mag = b_mag;
-            }
-            if a == 0.0 {
-                return Ok(t1.s.re);
-            }
-            let s = materialize_power(-t1.f_def.re / a, t1.mag_def - a_mag);
-            return Ok(s + t1.s.re);
-        }
-
-        a /= c;
-        r_norm(&mut a, &mut a_mag)?;
-        a_mag -= c_mag;
-        let mut diff = t1.s.re - x0;
-        tmag = 0;
-        r_norm(&mut diff, &mut tmag)?;
-        (a, a_mag) = zaddeq(a, a_mag, diff, tmag)?;
-
-        b = 2.0 * t1.f_def.re / c;
-        b_mag = t1.mag_def - c_mag;
-        r_norm(&mut b, &mut b_mag)?;
-
-        let (mut disc, mut disc_mag) = zaddeq(a * a, 2 * a_mag, -b, b_mag)?;
-        let complex = disc < 0.0;
-        if complex {
-            disc *= -1.0;
-        }
-        if disc_mag % 2 == 0 {
-            disc = disc.sqrt();
-        } else {
-            disc = (2.0 * disc).sqrt();
-            disc_mag -= 1;
-        }
-        disc_mag /= 2;
-        if complex {
-            if self.pz_k == 0.0 {
-                self.pz_k = disc;
-                self.pz_k_mag = disc_mag;
-            }
-            disc = 0.0;
-            disc_mag = 0;
-        }
-        (c, c_mag) = if a * disc >= 0.0 {
-            zaddeq(a, a_mag, disc, disc_mag)?
-        } else {
-            zaddeq(a, a_mag, -disc, disc_mag)?
-        };
-        if c == 0.0 {
-            b = 0.0;
-            b_mag = 0;
-        } else {
-            b /= c;
-            b_mag -= c_mag;
-        }
-        (b, b_mag) = zaddeq(t1.s.re, 0, -b, b_mag)?;
-        (c, c_mag) = zaddeq(t1.s.re, 0, -c, c_mag)?;
-        b = materialize_power(b, b_mag);
-        c = materialize_power(c, c_mag);
-        let outside = |x: Real| x < t0.s.re || x > t2.s.re;
-        Ok(if outside(b) {
-            if outside(c) {
-                match self.trapped {
-                    1 => (t0.s.re + t1.s.re) / 2.0,
-                    2 => (t1.s.re + t2.s.re) / 2.0,
-                    3 => {
-                        if (t1.s.re - c).abs() < (t1.s.re - b).abs() {
-                            (t1.s.re + c) / 2.0
-                        } else {
-                            (t1.s.re + b) / 2.0
-                        }
-                    }
-                    _ => {
-                        return Err(numerical("pole-zero search", "Lost numerical stability"));
-                    }
-                }
-            } else {
-                c
-            }
-        } else if outside(c) || a > 0.0 {
-            b
-        } else {
-            c
-        })
-    }
-
-    /// `NIpzMuller`.
-    fn muller(&self, set: &Set) -> SpiceResult<Cx> {
-        let t = [
-            self.neighborhood_trial(set[0])?,
-            self.neighborhood_trial(set[1])?,
-            self.neighborhood_trial(set[2])?,
-        ];
-        let mut min = -999_999;
-        let mut count = 0;
-        let mut total = 0;
-        for trial in t {
-            if !trial.f_def.is_zero() {
-                if min < trial.mag_def - 50 {
-                    min = trial.mag_def - 50;
-                }
-                total += trial.mag_def;
-                count += 1;
-            }
-        }
-        let mut magx = if count != 0 { total / count } else { total };
-        if magx < min {
-            magx = min;
-        }
-        let mut scale = [1.0; 3];
-        for (i, trial) in t.iter().enumerate() {
-            let mag = trial.mag_def - magx;
-            scale[i] = if mag < -90 {
-                0.0
-            } else {
-                materialize_power(1.0, mag)
-            };
-        }
-        let f: [Cx; 3] = std::array::from_fn(|i| t[i].f_def.scale(scale[i]));
-        let h0 = t[0].s.sub(t[1].s);
-        let h1 = t[1].s.sub(t[2].s);
-        let lambda = h0.div(h1);
-        let mut delta = lambda;
-        delta.re += 1.0;
-
-        let mut a = f[2].mul(lambda);
-        let mut c = f[1].mul(delta);
-        a = a.sub(c);
-        a = a.add(f[0]);
-        a = a.mul(lambda);
-
-        let mut b = lambda.mul(lambda);
-        b = b.mul(f[2]);
-        c = delta.mul(delta);
-        c = c.mul(f[1]);
-        b = b.sub(c);
-        c = lambda.add(delta);
-        c = c.mul(f[0]);
-        b = b.add(c);
-
-        c = delta.mul(f[0]);
-
-        normalize_muller(&mut a, &mut b, &mut c)?;
-        let mut d = b.mul(b);
-        let e = a.scale(4.0).mul(c);
-        d = d.sub(e);
-        d = d.sqrt();
-        let q = b.re * d.re + b.im * d.im;
-        b = if q > 0.0 { b.add(d) } else { b.sub(d) };
-        c = c.div(b.scale(-0.5));
-        Ok(h0.mul(c).add(t[0].s))
-    }
+    search::find_zeros(load).map(|roots| PencilRoots { roots })
 }
 
 #[cfg(test)]
@@ -1533,13 +520,8 @@ mod tests {
             materialize_power(-1.0, i64::MIN).to_bits(),
             (-0.0_f64).to_bits()
         );
-        let (_, high) = base2_determinant(Complex::real(1.), i32::MAX).unwrap();
-        let (_, low) = base2_determinant(Complex::real(1.), i32::MIN).unwrap();
-        assert!(logb(0.).is_err());
-        assert!(logb(f64::INFINITY).is_err());
-        assert!(base2_determinant(Complex::real(f64::NAN), 0).is_err());
-        assert!(high > i64::from(i32::MAX));
-        assert!(low < i64::from(i32::MIN));
+        let high = i64::from(i32::MAX) * 2;
+        let low = i64::from(i32::MIN) * 2;
         let (_, mag) = zaddeq(0.75, high, 0.75, low).unwrap();
         assert_eq!(mag, high);
         let mut a = Cx::new(2., -1.);
@@ -1551,11 +533,6 @@ mod tests {
         assert_eq!(c, Cx::new(0.0625, 0.));
         c.re = f64::INFINITY;
         assert!(normalize_muller(&mut a, &mut b, &mut c).is_err());
-        assert_eq!(logb(f64::from_bits(1)).unwrap(), -1074.);
-        assert_eq!(
-            logb(f64::from_bits(f64::MIN_POSITIVE.to_bits() - 1)).unwrap(),
-            -1023.
-        );
     }
 
     #[test]

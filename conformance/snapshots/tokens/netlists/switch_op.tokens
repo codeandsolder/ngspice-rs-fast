@@ -254,7 +254,7 @@ card 28 @netlists/switch_op.cir:36:1 lines=36-36 continuations=0
   token 4 36:14 lparen "("
   token 5 36:15 word "it"
   token 6 36:17 equals "="
-  token 7 36:18 number "1.8m" value=1.8000000000000002e-3
+  token 7 36:18 number "1.8m" value=1.8e-3
   token 8 36:23 word "ih"
   token 9 36:25 equals "="
   token 10 36:26 number "0.4m" value=4e-4

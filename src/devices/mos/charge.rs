@@ -67,7 +67,7 @@ pub(super) fn integrate_gates(
         *value = if transient {
             e.half[k] + accepted(states, slot::CAPG[k], name, label)? + overlap[k]
         } else {
-            2. * e.half[k] + overlap[k]
+            2.0f64.mul_add(e.half[k], overlap[k])
         };
     }
     let mut charge = [0.; 3];
@@ -87,8 +87,8 @@ pub(super) fn integrate_gates(
                 vgs1 - accepted(states, slot::VBS, name, label)?,
             ];
             for (k, value) in charge.iter_mut().enumerate() {
-                *value =
-                    (gate[k] - gate1[k]) * cap[k] + accepted(states, slot::QG[k], name, label)?;
+                *value = (gate[k] - gate1[k])
+                    .mul_add(cap[k], accepted(states, slot::QG[k], name, label)?);
             }
         }
     } else {
@@ -109,12 +109,16 @@ pub(super) fn integrate_gates(
         for (k, branch) in branches.into_iter().enumerate() {
             let companion = branch.integrate(states, coefficients)?;
             result.conductance[k] = companion.conductance;
-            result.equivalent[k] = companion.derivative - ag0 * branch.charge;
+            result.equivalent[k] = f64::mul_add(ag0, -branch.charge, companion.derivative);
         }
         // Do not cancel the two ag0*q terms: NIintegrate's ceq and the
         // subsequent voltage linearization have independent rounding.
         for (k, equivalent) in result.equivalent.iter_mut().enumerate() {
-            *equivalent = *equivalent - result.conductance[k] * gate[k] + ag0 * charge[k];
+            *equivalent = f64::mul_add(
+                ag0,
+                charge[k],
+                f64::mul_add(result.conductance[k], -gate[k], *equivalent),
+            );
         }
     } else {
         for branch in branches {

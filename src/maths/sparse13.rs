@@ -39,22 +39,20 @@
 //! one; and `SearchForSingleton` stops on a structurally missing diagonal,
 //! which is where ngspice's version either breaks or dereferences `NULL`.
 
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::float_cmp,
     reason = "C device branches compare floating-point values exactly, including nonfinite cases"
 )]
-#![expect(
-    clippy::while_float,
-    reason = "the C iterative floating-point loop must preserve its original termination and rounding order"
-)]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 
 use super::linear::numerical;
+use std::simd::{
+    Mask, Select,
+    cmp::{SimdPartialEq, SimdPartialOrd},
+    f64x4,
+    num::SimdFloat,
+};
+
+use crate::maths::linear::{BatchSolveFailure, RHS_BATCH_WIDTH, SolveBatchWorkspace};
 use crate::primitives::{Complex, SpiceResult};
 
 const NONE: usize = usize::MAX;
@@ -92,10 +90,359 @@ fn sparse_indices(size: usize) -> SpiceResult<Vec<usize>> {
     Ok(indices)
 }
 
+type LaneMask = Mask<i64, RHS_BATCH_WIDTH>;
+
+/// One SIMD tile, split by component so scatter updates never repack
+/// interleaved complex numbers. Real solves leave the imaginary plane empty.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LaneParts {
+    re: f64x4,
+    im: f64x4,
+}
+
+/// Scratch for independent numeric factor tiles. Reuses the packed matrix,
+/// scatter rows and reciprocal storage across successive frequency tiles.
+#[derive(Debug, Default)]
+pub(super) struct IndependentFactorTileWorkspace {
+    values: Vec<LaneParts>,
+    scratch: Vec<LaneParts>,
+    inverses: Vec<LaneParts>,
+}
+
+impl LaneParts {
+    const ZERO: Self = Self {
+        re: f64x4::splat(0.),
+        im: f64x4::splat(0.),
+    };
+
+    fn from_lanes<T: Scalar>(values: [T; RHS_BATCH_WIDTH]) -> Self {
+        Self {
+            re: f64x4::from_array(values.map(Scalar::real)),
+            im: f64x4::from_array(values.map(Scalar::imaginary)),
+        }
+    }
+
+    fn get<T: Scalar>(self, lane: usize) -> T {
+        T::from_parts(self.re[lane], self.im[lane])
+    }
+
+    fn set<T: Scalar>(&mut self, lane: usize, value: T) {
+        self.re[lane] = value.real();
+        self.im[lane] = value.imaginary();
+    }
+
+    fn select(mask: LaneMask, yes: Self, no: Self) -> Self {
+        Self {
+            re: mask.select(yes.re, no.re),
+            im: mask.select(yes.im, no.im),
+        }
+    }
+}
+
+fn read_tile_row<T: Scalar>(work: &SolveBatchWorkspace<T>, index: usize) -> LaneParts {
+    LaneParts {
+        re: work.real[index],
+        im: if T::HAS_IMAGINARY {
+            work.imag[index]
+        } else {
+            f64x4::splat(0.)
+        },
+    }
+}
+
+fn write_tile_row<T: Scalar>(work: &mut SolveBatchWorkspace<T>, index: usize, value: LaneParts) {
+    work.real[index] = value.re;
+    if T::HAS_IMAGINARY {
+        work.imag[index] = value.im;
+    }
+}
+
+/// Keep the original numerator alongside the normalized multiplier.
+/// Ordinary independent lanes use SIMD; exceptional lanes retain the
+/// scalar cross-product recovery and its exact arithmetic order.
+pub(super) struct BatchUpdate {
+    numerator: LaneParts,
+    multiplier: LaneParts,
+    active: LaneMask,
+    normal: LaneMask,
+}
+
+impl BatchUpdate {
+    fn new<T: Scalar>(numerator: LaneParts, pivot: T, inverse: T) -> Self {
+        let zero = f64x4::splat(0.);
+        let active = numerator.re.simd_ne(zero) | numerator.im.simd_ne(zero);
+        if !active.any() {
+            return Self {
+                numerator,
+                multiplier: numerator,
+                active,
+                normal: LaneMask::splat(false),
+            };
+        }
+        let candidate = T::batch_mul(numerator, inverse);
+        let fast = T::batch_normal(candidate) & LaneMask::splat(!inverse.is_zero());
+        let mut multiplier = LaneParts::select(active, candidate, numerator);
+        let exceptional = active & !fast;
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    let value = numerator.get::<T>(lane);
+                    multiplier.set(lane, value.quotient(pivot, inverse));
+                }
+            }
+        }
+        Self {
+            numerator,
+            multiplier,
+            active,
+            normal: T::batch_normal(multiplier),
+        }
+    }
+
+    fn recover<T: Scalar>(
+        &self,
+        old: LaneParts,
+        ordinary: LaneParts,
+        pivot: T,
+        lower: T,
+        fast: LaneMask,
+    ) -> LaneParts {
+        let mut next = LaneParts::select(self.active, ordinary, old);
+        let exceptional = self.active & !fast;
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    let value = old.get::<T>(lane).schur(
+                        pivot,
+                        self.numerator.get(lane),
+                        self.multiplier.get(lane),
+                        lower,
+                        self.normal.test(lane),
+                    );
+                    next.set(lane, value);
+                }
+            }
+        }
+        next
+    }
+}
+
+/// SIMD Schur update for distinct numeric matrices sharing one symbolic
+/// traversal. Unlike multiple-RHS updates, each lane owns its own pivot
+/// and reciprocal. Exceptional lanes use the ordinary scalar recovery.
+#[derive(Clone, Copy)]
+struct IndependentBatchUpdate {
+    numerator: LaneParts,
+    pivot: LaneParts,
+    multiplier: LaneParts,
+    normal: LaneMask,
+    active: LaneMask,
+}
+
+impl IndependentBatchUpdate {
+    fn new(numerator: LaneParts, pivot: LaneParts, inverse: LaneParts, enabled: LaneMask) -> Self {
+        let zero = f64x4::splat(0.);
+        let active = (numerator.re.simd_ne(zero) | numerator.im.simd_ne(zero)) & enabled;
+        let mut multiplier = LaneParts {
+            re: numerator.re * inverse.re - numerator.im * inverse.im,
+            im: numerator.re * inverse.im + numerator.im * inverse.re,
+        };
+        let normal = (multiplier.re.abs() + multiplier.im.abs()).is_normal();
+        let inverse_zero = inverse.re.simd_eq(zero) & inverse.im.simd_eq(zero);
+        let exceptional = active & (!normal | inverse_zero);
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    multiplier.set(
+                        lane,
+                        numerator
+                            .get::<Complex>(lane)
+                            .quotient(pivot.get::<Complex>(lane), inverse.get::<Complex>(lane)),
+                    );
+                }
+            }
+        }
+        Self {
+            numerator,
+            pivot,
+            multiplier,
+            normal: (multiplier.re.abs() + multiplier.im.abs()).is_normal(),
+            active,
+        }
+    }
+
+    fn apply(self, acc: LaneParts, lower: LaneParts) -> LaneParts {
+        let product = LaneParts {
+            re: self.multiplier.re * lower.re - self.multiplier.im * lower.im,
+            im: self.multiplier.re * lower.im + self.multiplier.im * lower.re,
+        };
+        let mut result = LaneParts {
+            re: acc.re - product.re,
+            im: acc.im - product.im,
+        };
+        let norm = result.re.abs() + result.im.abs();
+        let scale = (acc.re.abs() + acc.im.abs()) * f64x4::splat(0.0625);
+        let zero = f64x4::splat(0.);
+        let lower_zero = lower.re.simd_eq(zero) & lower.im.simd_eq(zero);
+        let finite = result.re.is_finite() & result.im.is_finite();
+        let fast = (self.normal & norm.is_normal() & norm.simd_gt(scale)) | (finite & lower_zero);
+        let exceptional = self.active & !fast;
+        if exceptional.any() {
+            for lane in 0..RHS_BATCH_WIDTH {
+                if exceptional.test(lane) {
+                    result.set(
+                        lane,
+                        acc.get::<Complex>(lane).schur(
+                            self.pivot.get::<Complex>(lane),
+                            self.numerator.get::<Complex>(lane),
+                            self.multiplier.get::<Complex>(lane),
+                            lower.get::<Complex>(lane),
+                            self.normal.test(lane),
+                        ),
+                    );
+                }
+            }
+        }
+        LaneParts::select(self.active, result, acc)
+    }
+}
+
+/// One real RHS or a SIMD tile of independent real RHS values. Both
+/// instantiations perform the same rounded operations and safety checks.
+trait RealGatherLane:
+    Copy + std::ops::Add<Output = Self> + std::ops::Sub<Output = Self> + std::ops::Mul<Output = Self>
+{
+    type Valid: Copy
+        + std::ops::BitAnd<Output = Self::Valid>
+        + std::ops::BitOr<Output = Self::Valid>;
+    fn broadcast(value: f64) -> Self;
+    fn mask(value: bool) -> Self::Valid;
+    fn zero(self) -> Self::Valid;
+    fn normal(self) -> Self::Valid;
+    fn finite(self) -> Self::Valid;
+    fn magnitude(self) -> Self;
+    fn greater(self, other: Self) -> Self::Valid;
+    fn choose(mask: Self::Valid, yes: Self, no: Self) -> Self;
+}
+
+impl RealGatherLane for f64 {
+    type Valid = bool;
+    fn broadcast(value: f64) -> Self {
+        value
+    }
+    fn mask(value: bool) -> bool {
+        value
+    }
+    fn zero(self) -> bool {
+        self == 0.
+    }
+    fn normal(self) -> bool {
+        self.is_normal()
+    }
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+    fn magnitude(self) -> Self {
+        self.abs()
+    }
+    fn greater(self, other: Self) -> bool {
+        self > other
+    }
+    fn choose(mask: bool, yes: Self, no: Self) -> Self {
+        if mask { yes } else { no }
+    }
+}
+
+impl RealGatherLane for f64x4 {
+    type Valid = LaneMask;
+    fn broadcast(value: f64) -> Self {
+        Self::splat(value)
+    }
+    fn mask(value: bool) -> LaneMask {
+        LaneMask::splat(value)
+    }
+    fn zero(self) -> LaneMask {
+        self.simd_eq(Self::splat(0.))
+    }
+    fn normal(self) -> LaneMask {
+        self.is_normal()
+    }
+    fn finite(self) -> LaneMask {
+        self.is_finite()
+    }
+    fn magnitude(self) -> Self {
+        self.abs()
+    }
+    fn greater(self, other: Self) -> LaneMask {
+        self.simd_gt(other)
+    }
+    fn choose(mask: LaneMask, yes: Self, no: Self) -> Self {
+        mask.select(yes, no)
+    }
+}
+
+/// Standard normalized backward row, with a local arithmetic error bound.
+/// Retain the raw scatter route if normalization/product loses exponent
+/// range or the sign/zero of the result is unresolved by rounded terms.
+/// This is not a global forward-error certificate for an ill-conditioned A.
+struct RealGatherRow<V: RealGatherLane> {
+    value: V,
+    magnitude_sum: V,
+    error: V,
+    valid: V::Valid,
+}
+
+impl<V: RealGatherLane> RealGatherRow<V> {
+    fn new(numerator: V, inverse: f64) -> Self {
+        let value = numerator * V::broadcast(inverse);
+        let valid = numerator.zero() | (V::mask(inverse.is_normal()) & value.normal());
+        let value = V::choose(numerator.zero(), numerator, value);
+        let magnitude_sum = value.magnitude();
+        Self {
+            value,
+            magnitude_sum,
+            error: magnitude_sum * V::broadcast(2. * f64::EPSILON),
+            valid,
+        }
+    }
+
+    fn subtract(&mut self, upper: f64, inverse: f64, solved: V) {
+        if upper == 0. {
+            return;
+        }
+        let coefficient = upper * inverse;
+        let term = V::broadcast(coefficient) * solved;
+        self.valid =
+            self.valid & (solved.zero() | (V::mask(coefficient.is_normal()) & term.normal()));
+        let term = V::choose(solved.zero(), V::broadcast(0.), term);
+        self.value = V::choose(solved.zero(), self.value, self.value - term);
+        self.magnitude_sum = self.magnitude_sum + term.magnitude();
+        // Reciprocal, coefficient, term and accumulation rounding, with
+        // slack for the positive error-bound accumulation itself.
+        self.error = self.error + self.magnitude_sum * V::broadcast(4. * f64::EPSILON);
+    }
+
+    fn finish(self) -> (V, V::Valid) {
+        let valid = self.valid
+            & self.magnitude_sum.finite()
+            & self.error.finite()
+            & (self.value.normal() | self.value.zero())
+            & (self.magnitude_sum.zero() | self.value.magnitude().greater(self.error));
+        (self.value, valid)
+    }
+}
+
 /// Matrix entry type: `f64` for real systems, [`Complex`] for AC.
-pub(super) trait Scalar: Copy + PartialEq + std::fmt::Debug {
+pub(super) trait Scalar:
+    Copy + PartialEq + std::fmt::Debug + std::ops::Div<Output = Self>
+{
     /// Additive identity.
     const ZERO: Self;
+    const HAS_IMAGINARY: bool;
+    fn imaginary(self) -> f64;
+    fn from_parts(real: f64, imaginary: f64) -> Self;
+    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts;
+    fn batch_normal(parts: LaneParts) -> LaneMask;
     /// C `ELEMENT_MAG`: `|re| + |im|`.
     fn mag(self) -> f64;
     /// Real part, used by `CountTwins`' `ABS(Real) == 1.0` test.
@@ -104,8 +451,38 @@ pub(super) trait Scalar: Copy + PartialEq + std::fmt::Debug {
     fn recip(self) -> Self;
     /// C `x * y` or `CMPLX_MULT`.
     fn mul(self, other: Self) -> Self;
-    /// C `to -= a * b` or `CMPLX_MULT_SUBT_ASSIGN(to, a, b)`.
-    fn mul_sub(self, a: Self, b: Self) -> Self;
+    /// Cache only a normal reciprocal. A finite raw pivot can have an
+    /// unrepresentable reciprocal, or one with a subnormal significand.
+    fn cached_recip(self) -> Self {
+        let inverse = self.recip();
+        if inverse.normal_multiplier() {
+            inverse
+        } else {
+            Self::ZERO
+        }
+    }
+    /// Normalize a raw triangular entry without requiring its reciprocal
+    /// to be representable. Use the actual division at exponent limits.
+    #[inline]
+    fn quotient(self, pivot: Self, inverse: Self) -> Self {
+        if inverse.is_zero() {
+            return self / pivot;
+        }
+        let result = self.mul(inverse);
+        if result.normal_multiplier() || self.is_zero() {
+            result
+        } else {
+            self / pivot
+        }
+    }
+    /// Update a Schur entry using the rounded multiplier only when well
+    /// conditioned; otherwise recover the unnormalized cross-product.
+    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self, normal: bool) -> Self;
+    /// Update four independently normalized RHS lanes, recovering unsafe
+    /// ordinary results with the same scalar kernel.
+    fn schur_batch(acc: LaneParts, pivot: Self, lower: Self, update: &BatchUpdate) -> LaneParts;
+    /// Classify the multiplier once before traversing the lower column.
+    fn normal_multiplier(self) -> bool;
     /// Whether the value is exactly zero (`== 0.0` on every part).
     fn is_zero(self) -> bool;
     /// Whether every scalar component is finite.
@@ -116,6 +493,22 @@ pub(super) trait Scalar: Copy + PartialEq + std::fmt::Debug {
 
 impl Scalar for f64 {
     const ZERO: Self = 0.0;
+    const HAS_IMAGINARY: bool = false;
+    fn imaginary(self) -> f64 {
+        0.
+    }
+    fn from_parts(real: f64, _imaginary: f64) -> Self {
+        real
+    }
+    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts {
+        LaneParts {
+            re: parts.re * f64x4::splat(value),
+            im: f64x4::splat(0.),
+        }
+    }
+    fn batch_normal(parts: LaneParts) -> LaneMask {
+        parts.re.is_normal()
+    }
     fn mag(self) -> f64 {
         self.abs()
     }
@@ -128,8 +521,42 @@ impl Scalar for f64 {
     fn mul(self, other: Self) -> Self {
         self * other
     }
-    fn mul_sub(self, a: Self, b: Self) -> Self {
-        self - a * b
+    #[inline]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "the rounded multiplier cannot supply a reliable cancellation residual; near cancellation uses the original cross-products instead"
+    )]
+    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self, normal: bool) -> Self {
+        let result = self - mult * lower;
+        if result.is_finite()
+            && ((normal && result.abs() > self.abs() * 0.0625) || upper == 0. || lower == 0.)
+        {
+            result
+        } else if self.is_finite() && upper.is_finite() && lower.is_finite() {
+            crate::primitives::value::real_schur(self, pivot, upper, lower)
+        } else {
+            result
+        }
+    }
+    #[inline]
+    fn schur_batch(acc: LaneParts, pivot: Self, lower: Self, update: &BatchUpdate) -> LaneParts {
+        let result = acc.re - update.multiplier.re * f64x4::splat(lower);
+        let fast = result.is_finite()
+            & ((update.normal & result.abs().simd_gt(acc.re.abs() * f64x4::splat(0.0625)))
+                | LaneMask::splat(lower == 0.));
+        update.recover(
+            acc,
+            LaneParts {
+                re: result,
+                im: f64x4::splat(0.),
+            },
+            pivot,
+            lower,
+            fast,
+        )
+    }
+    fn normal_multiplier(self) -> bool {
+        self.is_normal()
     }
     fn is_zero(self) -> bool {
         self == 0.0
@@ -144,6 +571,24 @@ impl Scalar for f64 {
 
 impl Scalar for Complex {
     const ZERO: Self = Self::ZERO;
+    const HAS_IMAGINARY: bool = true;
+    fn imaginary(self) -> f64 {
+        self.im
+    }
+    fn from_parts(real: f64, imaginary: f64) -> Self {
+        Self::new(real, imaginary)
+    }
+    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts {
+        let re = f64x4::splat(value.re);
+        let im = f64x4::splat(value.im);
+        LaneParts {
+            re: parts.re * re - parts.im * im,
+            im: parts.re * im + parts.im * re,
+        }
+    }
+    fn batch_normal(parts: LaneParts) -> LaneMask {
+        (parts.re.abs() + parts.im.abs()).is_normal()
+    }
     fn mag(self) -> f64 {
         self.re.abs() + self.im.abs()
     }
@@ -156,11 +601,11 @@ impl Scalar for Complex {
         let result =
             if (den.re >= den.im && den.re > -den.im) || (den.re < den.im && den.re <= -den.im) {
                 let r = den.im / den.re;
-                let re = 1.0 / (den.re + r * den.im);
+                let re = 1.0 / (r.mul_add(den.im, den.re));
                 Self::new(re, -r * re)
             } else {
                 let r = den.re / den.im;
-                let im = -1.0 / (den.im + r * den.re);
+                let im = -1.0 / (r.mul_add(den.re, den.im));
                 Self::new(-r * im, im)
             };
         if !result.is_finite() || result == Self::ZERO {
@@ -171,17 +616,67 @@ impl Scalar for Complex {
             result
         }
     }
+    #[inline]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "ordinary normwise products use the cheap two-product sum; only exponent-range failures need the robust kernel"
+    )]
     fn mul(self, b: Self) -> Self {
-        Self::new(
+        // Matrix factors and triangular solves use normwise error bounds:
+        // a normal finite complex product already meets that bound with
+        // ordinary arithmetic. Recover exponent-range failures using the
+        // componentwise robust public multiplication.
+        let result = Self::new(
             self.re * b.re - self.im * b.im,
             self.re * b.im + self.im * b.re,
-        )
+        );
+        if (result.re.abs() + result.im.abs()).is_normal() || self.is_zero() || b.is_zero() {
+            result
+        } else {
+            self * b
+        }
     }
-    fn mul_sub(self, a: Self, b: Self) -> Self {
-        Self::new(
-            self.re - (a.re * b.re - a.im * b.im),
-            self.im - (a.re * b.im + a.im * b.re),
-        )
+    #[inline]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "the cheap update estimates cancellation; a fused update using the rounded multiplier would not remove its rounding error"
+    )]
+    fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self, normal: bool) -> Self {
+        // The ordinary Schur update is a three-term dot product.
+        // Avoid separately compensating the normalized multiplier's product:
+        // its error is dominated by the multiplier itself near cancellation.
+        let product = Self::new(
+            mult.re * lower.re - mult.im * lower.im,
+            mult.re * lower.im + mult.im * lower.re,
+        );
+        let result = self - product;
+        let norm = result.re.abs() + result.im.abs();
+        let scale = (self.re.abs() + self.im.abs()) * 0.0625;
+        if (normal && norm.is_normal() && norm > scale)
+            || (result.is_finite() && (upper.is_zero() || lower.is_zero()))
+        {
+            result
+        } else if self.is_finite() && upper.is_finite() && lower.is_finite() {
+            crate::primitives::value::complex_schur(self, pivot, upper, lower)
+        } else {
+            result
+        }
+    }
+    #[inline]
+    fn schur_batch(acc: LaneParts, pivot: Self, lower: Self, update: &BatchUpdate) -> LaneParts {
+        let product = Self::batch_mul(update.multiplier, lower);
+        let result = LaneParts {
+            re: acc.re - product.re,
+            im: acc.im - product.im,
+        };
+        let norm = result.re.abs() + result.im.abs();
+        let scale = (acc.re.abs() + acc.im.abs()) * f64x4::splat(0.0625);
+        let fast = (update.normal & norm.is_normal() & norm.simd_gt(scale))
+            | (result.re.is_finite() & result.im.is_finite() & LaneMask::splat(lower.is_zero()));
+        update.recover(acc, result, pivot, lower, fast)
+    }
+    fn normal_multiplier(self) -> bool {
+        (self.re.abs() + self.im.abs()).is_normal()
     }
     fn is_zero(self) -> bool {
         self.re == 0.0 && self.im == 0.0
@@ -248,7 +743,7 @@ impl PlanIndex for u32 {
 }
 
 /// A numeric traversal entry: stable element handle and internal row
-/// (column runs) or internal column (upper-row runs).
+/// (column runs) or internal column (row runs).
 #[derive(Debug, Clone, Copy)]
 struct RunEntry<I> {
     handle: I,
@@ -269,13 +764,13 @@ impl<I: PlanIndex> RunEntry<I> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ColumnRun<I> {
+struct AxisRun<I> {
     start: I,
     diagonal: I,
     end: I,
 }
 
-impl<I: PlanIndex> ColumnRun<I> {
+impl<I: PlanIndex> AxisRun<I> {
     fn new(start: usize, diagonal: usize, end: usize) -> Option<Self> {
         if !(start <= diagonal && diagonal < end) {
             return None;
@@ -288,13 +783,35 @@ impl<I: PlanIndex> ColumnRun<I> {
     }
 }
 
+/// One packed axis, with per-coordinate diagonal split points.
+#[derive(Debug)]
+struct AxisRuns<I> {
+    runs: Vec<AxisRun<I>>,
+    entries: Vec<RunEntry<I>>,
+}
+
+impl<I: PlanIndex> AxisRuns<I> {
+    fn all(&self, coordinate: usize) -> &[RunEntry<I>] {
+        let run = self.runs[coordinate - 1];
+        &self.entries[run.start.unpack()..run.end.unpack()]
+    }
+
+    fn before_diagonal(&self, coordinate: usize) -> &[RunEntry<I>] {
+        let run = self.runs[coordinate - 1];
+        &self.entries[run.start.unpack()..run.diagonal.unpack()]
+    }
+
+    fn after_diagonal(&self, coordinate: usize) -> &[RunEntry<I>] {
+        let run = self.runs[coordinate - 1];
+        &self.entries[run.diagonal.unpack() + 1..run.end.unpack()]
+    }
+}
+
 /// Immutable packed traversal, derived from linked topology after ordering.
 #[derive(Debug)]
 struct FactorRuns<I> {
-    columns: Vec<ColumnRun<I>>,
-    column_entries: Vec<RunEntry<I>>,
-    upper_row_start: Vec<I>,
-    upper_row_entries: Vec<RunEntry<I>>,
+    columns: AxisRuns<I>,
+    rows: AxisRuns<I>,
 }
 
 #[derive(Debug)]
@@ -309,105 +826,308 @@ enum RefactorIssue {
 }
 
 impl<I: PlanIndex> FactorRuns<I> {
-    fn column(&self, col: usize) -> &[RunEntry<I>] {
-        let run = self.columns[col - 1];
-        &self.column_entries[run.start.unpack()..run.end.unpack()]
-    }
-
-    fn upper_column(&self, col: usize) -> &[RunEntry<I>] {
-        let run = self.columns[col - 1];
-        &self.column_entries[run.start.unpack()..run.diagonal.unpack()]
-    }
-
-    fn lower_column(&self, col: usize) -> &[RunEntry<I>] {
-        let run = self.columns[col - 1];
-        &self.column_entries[run.diagonal.unpack() + 1..run.end.unpack()]
-    }
-
-    fn upper_row(&self, row: usize) -> &[RunEntry<I>] {
-        &self.upper_row_entries
-            [self.upper_row_start[row - 1].unpack()..self.upper_row_start[row].unpack()]
-    }
-
     /// The fixed-order SPARSE scatter/gather refactor, after column one.
     fn refactor<T: Scalar>(
         &self,
         values: &mut [T],
         diag: &[usize],
         dest: &mut [T],
+        inverses: &mut [T],
     ) -> Result<(), RefactorIssue> {
-        for step in 2..=self.columns.len() {
-            for entry in self.column(step) {
+        for step in 2..=self.columns.runs.len() {
+            for entry in self.columns.all(step) {
                 let (handle, row) = entry.indices();
                 dest[row] = values[handle];
             }
-            for entry in self.upper_column(step) {
+            for entry in self.columns.before_diagonal(step) {
                 let (handle, row) = entry.indices();
-                let mult = dest[row].mul(values[diag[row]]);
-                values[handle] = mult;
-                for entry in self.lower_column(row) {
+                let upper = dest[row];
+                values[handle] = upper;
+                if upper.is_zero() {
+                    continue;
+                }
+                let pivot = values[diag[row]];
+                let mult = upper.quotient(pivot, inverses[row]);
+                let normal = mult.normal_multiplier();
+                for entry in self.columns.after_diagonal(row) {
                     let (handle, r) = entry.indices();
-                    dest[r] = dest[r].mul_sub(mult, values[handle]);
+                    dest[r] = dest[r].schur(pivot, upper, mult, values[handle], normal);
                 }
             }
-            for entry in self.lower_column(step) {
+            for entry in self.columns.after_diagonal(step) {
                 let (handle, row) = entry.indices();
                 values[handle] = dest[row];
             }
             if dest[step].is_zero() {
                 return Err(RefactorIssue::ZeroPivot(step));
             }
-            let inverse = dest[step].recip();
-            if !inverse.is_finite() || inverse.is_zero() {
+            if !dest[step].is_finite() {
                 return Err(RefactorIssue::NonFinite);
             }
-            values[diag[step]] = inverse;
+            values[diag[step]] = dest[step];
+            inverses[step] = dest[step].cached_recip();
         }
         Ok(())
     }
 
-    fn solve<T: Scalar>(&self, values: &[T], diag: &[usize], x: &mut [T]) {
-        let size = self.columns.len();
-        for i in 1..=size {
-            let mut temp = x[i];
-            if !temp.is_zero() {
-                temp = temp.mul(values[diag[i]]);
-                x[i] = temp;
-                for entry in self.lower_column(i) {
-                    let (handle, r) = entry.indices();
-                    x[r] = x[r].mul_sub(temp, values[handle]);
+    /// Refactor distinct numeric matrices with one immutable symbolic plan.
+    /// Coefficients and row scratch are packed by element/row into four SIMD
+    /// lanes. Pivots are independent; exceptional Schur updates use the
+    /// scalar range-preserving kernel for that lane.
+    fn refactor_independent_tile(
+        &self,
+        values: &mut [LaneParts],
+        diag: &[usize],
+        scratch: &mut [LaneParts],
+        inverses: &mut [LaneParts],
+        statuses: &mut [Status; RHS_BATCH_WIDTH],
+        count: usize,
+    ) {
+        for step in 2..=self.columns.runs.len() {
+            for entry in self.columns.all(step) {
+                let (handle, row) = entry.indices();
+                scratch[row] = values[handle];
+            }
+            for entry in self.columns.before_diagonal(step) {
+                let (handle, row) = entry.indices();
+                let upper = scratch[row];
+                values[handle] = upper;
+                let pivot = values[diag[row]];
+                let enabled = LaneMask::from_array(std::array::from_fn(|lane| {
+                    lane < count && statuses[lane] == Status::Okay
+                }));
+                let update = IndependentBatchUpdate::new(upper, pivot, inverses[row], enabled);
+                if update.active.any() {
+                    for entry in self.columns.after_diagonal(row) {
+                        let (handle, target) = entry.indices();
+                        scratch[target] = update.apply(scratch[target], values[handle]);
+                    }
                 }
             }
-        }
-        for i in (1..=size).rev() {
-            let mut temp = x[i];
-            for entry in self.upper_row(i) {
-                let (handle, c) = entry.indices();
-                temp = temp.mul_sub(values[handle], x[c]);
+            for entry in self.columns.after_diagonal(step) {
+                let (handle, row) = entry.indices();
+                values[handle] = scratch[row];
             }
-            x[i] = temp;
+            for (lane, status) in statuses.iter_mut().enumerate().take(count) {
+                if *status != Status::Okay {
+                    continue;
+                }
+                let pivot = scratch[step].get::<Complex>(lane);
+                *status = if pivot.is_zero() {
+                    Status::ZeroDiag
+                } else if !pivot.is_finite() {
+                    Status::NonFinite
+                } else {
+                    Status::Okay
+                };
+                if *status == Status::Okay {
+                    values[diag[step]].set(lane, pivot);
+                    inverses[step].set(lane, pivot.cached_recip());
+                }
+            }
         }
     }
 
-    fn solve_transposed<T: Scalar>(&self, values: &[T], diag: &[usize], x: &mut [T]) {
-        let size = self.columns.len();
-        for i in 1..=size {
-            let temp = x[i];
-            if !temp.is_zero() {
-                for entry in self.upper_row(i) {
-                    let (handle, c) = entry.indices();
-                    x[c] = x[c].mul_sub(temp, values[handle]);
+    /// Solve independent, identically ordered complex factors in their
+    /// packed lanes. The same elimination traversal serves normal and
+    /// transposed solves without sharing numeric pivots.
+    fn solve_independent_tile(
+        &self,
+        values: &[LaneParts],
+        diag: &[usize],
+        inverses: &[LaneParts],
+        x: &mut [LaneParts],
+        enabled: LaneMask,
+        transposed: bool,
+    ) {
+        let axis = if transposed {
+            &self.rows
+        } else {
+            &self.columns
+        };
+        for step in 1..=self.columns.runs.len() {
+            let update =
+                IndependentBatchUpdate::new(x[step], values[diag[step]], inverses[step], enabled);
+            if update.active.any() {
+                for entry in axis.after_diagonal(step) {
+                    let (handle, row) = entry.indices();
+                    x[row] = update.apply(x[row], values[handle]);
                 }
             }
         }
-        for i in (1..=size).rev() {
-            let mut temp = x[i];
-            for entry in self.lower_column(i) {
-                let (handle, r) = entry.indices();
-                temp = temp.mul_sub(x[r], values[handle]);
+        for step in (1..=self.columns.runs.len()).rev() {
+            let update =
+                IndependentBatchUpdate::new(x[step], values[diag[step]], inverses[step], enabled);
+            if update.active.any() {
+                for entry in axis.before_diagonal(step) {
+                    let (handle, row) = entry.indices();
+                    x[row] = update.apply(x[row], values[handle]);
+                }
+                x[step] = LaneParts::select(update.active, update.multiplier, x[step]);
             }
-            x[i] = temp.mul(values[diag[i]]);
         }
+    }
+
+    fn forward<T: Scalar>(
+        &self,
+        values: &[T],
+        diag: &[usize],
+        inverses: &[T],
+        x: &mut [T],
+        transposed: bool,
+    ) {
+        let size = self.columns.runs.len();
+        // A = L D^-1 U, where both L and U carry the raw pivot D.
+        // Forward substitution keeps D*y rather than materializing y
+        // into the result buffer. The normalized value is only an
+        // approximation used for updating later rows.
+        for i in 1..=size {
+            let numerator = x[i];
+            if numerator.is_zero() {
+                continue;
+            }
+            let pivot = values[diag[i]];
+            let mult = numerator.quotient(pivot, inverses[i]);
+            let normal = mult.normal_multiplier();
+            let entries = if transposed {
+                self.rows.after_diagonal(i)
+            } else {
+                self.columns.after_diagonal(i)
+            };
+            for entry in entries {
+                let (handle, r) = entry.indices();
+                x[r] = x[r].schur(pivot, numerator, mult, values[handle], normal);
+            }
+        }
+    }
+
+    fn backward_raw<T: Scalar>(
+        &self,
+        values: &[T],
+        diag: &[usize],
+        inverses: &[T],
+        x: &mut [T],
+        transposed: bool,
+    ) {
+        let size = self.columns.runs.len();
+        // Solve the other raw triangular factor in reverse. Scatter
+        // immediately, while the unrounded numerator is still available.
+        for i in (1..=size).rev() {
+            let numerator = x[i];
+            if numerator.is_zero() {
+                continue;
+            }
+            let pivot = values[diag[i]];
+            let mult = numerator.quotient(pivot, inverses[i]);
+            let normal = mult.normal_multiplier();
+            let entries = if transposed {
+                self.rows.before_diagonal(i)
+            } else {
+                self.columns.before_diagonal(i)
+            };
+            for entry in entries {
+                let (handle, r) = entry.indices();
+                x[r] = x[r].schur(pivot, numerator, mult, values[handle], normal);
+            }
+            x[i] = mult;
+        }
+    }
+
+    fn solve<T: Scalar>(
+        &self,
+        values: &[T],
+        diag: &[usize],
+        inverses: &[T],
+        x: &mut [T],
+        transposed: bool,
+        raw_only: bool,
+    ) -> bool {
+        self.forward(values, diag, inverses, x, transposed);
+        if !T::HAS_IMAGINARY && !raw_only {
+            let axis = if transposed {
+                &self.columns
+            } else {
+                &self.rows
+            };
+            for i in (1..=self.columns.runs.len()).rev() {
+                let inverse = inverses[i].real();
+                let mut row = RealGatherRow::new(x[i].real(), inverse);
+                for entry in axis.after_diagonal(i) {
+                    let (handle, col) = entry.indices();
+                    row.subtract(values[handle].real(), inverse, x[col].real());
+                }
+                let (value, valid) = row.finish();
+                if !valid {
+                    return false;
+                }
+                x[i] = T::from_parts(value, 0.);
+            }
+        } else {
+            self.backward_raw(values, diag, inverses, x, transposed);
+        }
+        true
+    }
+
+    fn solve_batch<T: Scalar>(
+        &self,
+        values: &[T],
+        diag: &[usize],
+        inverses: &[T],
+        work: &mut SolveBatchWorkspace<T>,
+        transposed: bool,
+    ) -> LaneMask {
+        let size = self.columns.runs.len();
+        let axis = if transposed {
+            &self.rows
+        } else {
+            &self.columns
+        };
+        for i in 1..=size {
+            let pivot = values[diag[i]];
+            let update = BatchUpdate::new(read_tile_row(work, i), pivot, inverses[i]);
+            if update.active.any() {
+                for entry in axis.after_diagonal(i) {
+                    let (handle, r) = entry.indices();
+                    let next =
+                        T::schur_batch(read_tile_row(work, r), pivot, values[handle], &update);
+                    write_tile_row(work, r, next);
+                }
+            }
+        }
+        if !T::HAS_IMAGINARY {
+            let gather = if transposed {
+                &self.columns
+            } else {
+                &self.rows
+            };
+            let mut valid = LaneMask::splat(true);
+            for i in (1..=size).rev() {
+                let inverse = inverses[i].real();
+                let mut row = RealGatherRow::new(work.real[i], inverse);
+                for entry in gather.after_diagonal(i) {
+                    let (handle, col) = entry.indices();
+                    row.subtract(values[handle].real(), inverse, work.real[col]);
+                }
+                let (value, row_valid) = row.finish();
+                work.real[i] = value;
+                valid &= row_valid;
+            }
+            return valid;
+        }
+        for i in (1..=size).rev() {
+            let pivot = values[diag[i]];
+            let update = BatchUpdate::new(read_tile_row(work, i), pivot, inverses[i]);
+            if update.active.any() {
+                for entry in axis.before_diagonal(i) {
+                    let (handle, r) = entry.indices();
+                    let next =
+                        T::schur_batch(read_tile_row(work, r), pivot, values[handle], &update);
+                    write_tile_row(work, r, next);
+                }
+                write_tile_row(work, i, update.multiplier);
+            }
+        }
+        LaneMask::splat(true)
     }
 }
 
@@ -423,6 +1143,7 @@ enum Slot {
 /// ordering that changes their structure detaches only the writer.
 #[derive(Debug, Clone)]
 struct Topology {
+    original_entries: usize,
     elements: Vec<Element>,
     diag: Vec<usize>,
     first_in_col: Vec<usize>,
@@ -431,6 +1152,96 @@ struct Topology {
     ext_to_int_col: Vec<usize>,
     int_to_ext_row: Vec<usize>,
     int_to_ext_col: Vec<usize>,
+}
+
+/// Statically selected direction of an ordered sparse linked list.
+///
+/// A row list is ordered by its element columns; a column list by its rows.
+/// Each orientation names its orthogonal list at the type level, so swapping
+/// one axis cannot accidentally relink that same axis instead.
+trait LinkedAxis {
+    type Orthogonal: LinkedAxis;
+
+    fn link(topology: &Topology, slot: Slot) -> usize;
+    fn set_link(topology: &mut Topology, slot: Slot, element: usize);
+    fn coordinate(element: &Element) -> usize;
+    fn set_coordinate(element: &mut Element, coordinate: usize);
+    fn successor(element: &Element) -> usize;
+    fn set_successor(element: &mut Element, successor: usize);
+    fn swap_maps(topology: &mut Topology, first: usize, second: usize);
+}
+
+struct AlongRows;
+struct AlongColumns;
+
+impl LinkedAxis for AlongRows {
+    type Orthogonal = AlongColumns;
+
+    fn link(topology: &Topology, slot: Slot) -> usize {
+        topology.row_get(slot)
+    }
+
+    fn set_link(topology: &mut Topology, slot: Slot, element: usize) {
+        topology.row_set(slot, element);
+    }
+
+    fn coordinate(element: &Element) -> usize {
+        element.col
+    }
+
+    fn set_coordinate(element: &mut Element, coordinate: usize) {
+        element.col = coordinate;
+    }
+
+    fn successor(element: &Element) -> usize {
+        element.next_in_row
+    }
+
+    fn set_successor(element: &mut Element, successor: usize) {
+        element.next_in_row = successor;
+    }
+
+    fn swap_maps(topology: &mut Topology, first: usize, second: usize) {
+        topology.first_in_row.swap(first, second);
+        topology.int_to_ext_row.swap(first, second);
+        topology.ext_to_int_row[topology.int_to_ext_row[first]] = first;
+        topology.ext_to_int_row[topology.int_to_ext_row[second]] = second;
+    }
+}
+
+impl LinkedAxis for AlongColumns {
+    type Orthogonal = AlongRows;
+
+    fn link(topology: &Topology, slot: Slot) -> usize {
+        topology.col_get(slot)
+    }
+
+    fn set_link(topology: &mut Topology, slot: Slot, element: usize) {
+        topology.col_set(slot, element);
+    }
+
+    fn coordinate(element: &Element) -> usize {
+        element.row
+    }
+
+    fn set_coordinate(element: &mut Element, coordinate: usize) {
+        element.row = coordinate;
+    }
+
+    fn successor(element: &Element) -> usize {
+        element.next_in_col
+    }
+
+    fn set_successor(element: &mut Element, successor: usize) {
+        element.next_in_col = successor;
+    }
+
+    fn swap_maps(topology: &mut Topology, first: usize, second: usize) {
+        topology.first_in_col.swap(first, second);
+        topology.int_to_ext_col.swap(first, second);
+        topology.ext_to_int_col[topology.int_to_ext_col[first]] = first;
+        topology.ext_to_int_col[topology.int_to_ext_col[second]] = second;
+    }
 }
 
 impl Topology {
@@ -590,230 +1401,144 @@ impl Topology {
         }
     }
 
-    /// Exchange elements in one column, preserving its row order.
-    fn exchange_col_elements(
+    /// Relink the two affected coordinates within an orthogonal linked list.
+    ///
+    /// Preserve the SPARSE case order exactly: missing first, missing second,
+    /// adjacent elements and non-adjacent elements. In particular, direct
+    /// coordinate updates and predecessor writes must remain in this order to
+    /// preserve stable element handles and the singly linked sort invariant.
+    fn exchange_list_elements<A: LinkedAxis>(
         &mut self,
-        row1: usize,
+        first: usize,
         e1: usize,
-        row2: usize,
+        second: usize,
         e2: usize,
-        column: usize,
+        list: usize,
     ) {
-        let mut above1 = Slot::Head(column);
-        let mut p = self.col_get(above1);
-        while self.elements[p].row < row1 {
-            above1 = Slot::After(p);
-            p = self.col_get(above1);
+        let mut preceding_first = Slot::Head(list);
+        let mut cursor = A::link(self, preceding_first);
+        while A::coordinate(&self.elements[cursor]) < first {
+            preceding_first = Slot::After(cursor);
+            cursor = A::link(self, preceding_first);
         }
         if e1 == NONE {
-            let below1 = p;
-            if self.elements[below1].row != row2 {
-                let mut above2;
+            let following_first = cursor;
+            if A::coordinate(&self.elements[following_first]) != second {
+                let preceding_second;
                 loop {
-                    above2 = Slot::After(p);
-                    p = self.col_get(above2);
-                    if self.elements[p].row >= row2 {
+                    let preceding = Slot::After(cursor);
+                    cursor = A::link(self, preceding);
+                    if A::coordinate(&self.elements[cursor]) >= second {
+                        preceding_second = preceding;
                         break;
                     }
                 }
-                let below2 = self.elements[e2].next_in_col;
-                self.col_set(above2, below2);
-                self.col_set(above1, e2);
-                self.elements[e2].next_in_col = below1;
+                let following_second = A::successor(&self.elements[e2]);
+                A::set_link(self, preceding_second, following_second);
+                A::set_link(self, preceding_first, e2);
+                A::set_successor(&mut self.elements[e2], following_first);
             }
-            self.elements[e2].row = row1;
+            A::set_coordinate(&mut self.elements[e2], first);
         } else {
-            let below1 = self.elements[e1].next_in_col;
+            let following_first = A::successor(&self.elements[e1]);
             if e2 == NONE {
-                if below1 != NONE && self.elements[below1].row < row2 {
-                    self.col_set(above1, below1);
-                    let mut p = below1;
-                    let mut above2;
+                if following_first != NONE
+                    && A::coordinate(&self.elements[following_first]) < second
+                {
+                    A::set_link(self, preceding_first, following_first);
+                    let mut cursor = following_first;
+                    let preceding_second;
                     loop {
-                        above2 = Slot::After(p);
-                        p = self.col_get(above2);
-                        if !(p != NONE && self.elements[p].row < row2) {
+                        let preceding = Slot::After(cursor);
+                        cursor = A::link(self, preceding);
+                        if cursor == NONE || A::coordinate(&self.elements[cursor]) >= second {
+                            preceding_second = preceding;
                             break;
                         }
                     }
-                    self.col_set(above2, e1);
-                    self.elements[e1].next_in_col = p;
-                    self.col_set(above1, below1);
+                    A::set_link(self, preceding_second, e1);
+                    A::set_successor(&mut self.elements[e1], cursor);
+                    A::set_link(self, preceding_first, following_first);
                 }
-                self.elements[e1].row = row2;
+                A::set_coordinate(&mut self.elements[e1], second);
             } else {
-                if self.elements[below1].row == row2 {
-                    self.elements[e1].next_in_col = self.elements[e2].next_in_col;
-                    self.elements[e2].next_in_col = e1;
-                    self.col_set(above1, e2);
+                if A::coordinate(&self.elements[following_first]) == second {
+                    let following_second = A::successor(&self.elements[e2]);
+                    A::set_successor(&mut self.elements[e1], following_second);
+                    A::set_successor(&mut self.elements[e2], e1);
+                    A::set_link(self, preceding_first, e2);
                 } else {
-                    let mut p = below1;
-                    let mut above2;
+                    let mut cursor = following_first;
+                    let preceding_second;
                     loop {
-                        above2 = Slot::After(p);
-                        p = self.col_get(above2);
-                        if self.elements[p].row >= row2 {
+                        let preceding = Slot::After(cursor);
+                        cursor = A::link(self, preceding);
+                        if A::coordinate(&self.elements[cursor]) >= second {
+                            preceding_second = preceding;
                             break;
                         }
                     }
-                    let below2 = self.elements[e2].next_in_col;
-                    self.col_set(above1, e2);
-                    self.elements[e2].next_in_col = below1;
-                    self.col_set(above2, e1);
-                    self.elements[e1].next_in_col = below2;
+                    let following_second = A::successor(&self.elements[e2]);
+                    A::set_link(self, preceding_first, e2);
+                    A::set_successor(&mut self.elements[e2], following_first);
+                    A::set_link(self, preceding_second, e1);
+                    A::set_successor(&mut self.elements[e1], following_second);
                 }
-                self.elements[e1].row = row2;
-                self.elements[e2].row = row1;
+                A::set_coordinate(&mut self.elements[e1], second);
+                A::set_coordinate(&mut self.elements[e2], first);
             }
         }
     }
 
-    /// Row-list counterpart of the column exchange.
-    fn exchange_row_elements(
-        &mut self,
-        col1: usize,
-        e1: usize,
-        col2: usize,
-        e2: usize,
-        row: usize,
-    ) {
-        let mut left1 = Slot::Head(row);
-        let mut p = self.row_get(left1);
-        while self.elements[p].col < col1 {
-            left1 = Slot::After(p);
-            p = self.row_get(left1);
+    /// Exchange the selected axis while relinking only orthogonal lists.
+    ///
+    /// One monomorphized walk implements SPARSE row and column exchange.
+    /// The linked ordering and the permutation-map mutation remain ordered
+    /// exactly as in the original two routines.
+    fn exchange_axis<A: LinkedAxis>(&mut self, mut first: usize, mut second: usize) {
+        if first == second {
+            return;
         }
-        if e1 == NONE {
-            let right1 = p;
-            if self.elements[right1].col != col2 {
-                let mut left2;
-                loop {
-                    left2 = Slot::After(p);
-                    p = self.row_get(left2);
-                    if self.elements[p].col >= col2 {
-                        break;
-                    }
-                }
-                let right2 = self.elements[e2].next_in_row;
-                self.row_set(left2, right2);
-                self.row_set(left1, e2);
-                self.elements[e2].next_in_row = right1;
-            }
-            self.elements[e2].col = col1;
-        } else {
-            let right1 = self.elements[e1].next_in_row;
-            if e2 == NONE {
-                if right1 != NONE && self.elements[right1].col < col2 {
-                    self.row_set(left1, right1);
-                    let mut p = right1;
-                    let mut left2;
-                    loop {
-                        left2 = Slot::After(p);
-                        p = self.row_get(left2);
-                        if !(p != NONE && self.elements[p].col < col2) {
-                            break;
-                        }
-                    }
-                    self.row_set(left2, e1);
-                    self.elements[e1].next_in_row = p;
-                    self.row_set(left1, right1);
-                }
-                self.elements[e1].col = col2;
-            } else {
-                if self.elements[right1].col == col2 {
-                    self.elements[e1].next_in_row = self.elements[e2].next_in_row;
-                    self.elements[e2].next_in_row = e1;
-                    self.row_set(left1, e2);
-                } else {
-                    let mut p = right1;
-                    let mut left2;
-                    loop {
-                        left2 = Slot::After(p);
-                        p = self.row_get(left2);
-                        if self.elements[p].col >= col2 {
-                            break;
-                        }
-                    }
-                    let right2 = self.elements[e2].next_in_row;
-                    self.row_set(left1, e2);
-                    self.elements[e2].next_in_row = right1;
-                    self.row_set(left2, e1);
-                    self.elements[e1].next_in_row = right2;
-                }
-                self.elements[e1].col = col2;
-                self.elements[e2].col = col1;
-            }
+        if first > second {
+            std::mem::swap(&mut first, &mut second);
         }
-    }
-
-    /// `spcRowExchange` (topology only).
-    fn row_exchange(&mut self, mut row1: usize, mut row2: usize) {
-        if row1 > row2 {
-            std::mem::swap(&mut row1, &mut row2);
-        }
-        let mut p1 = self.first_in_row[row1];
-        let mut p2 = self.first_in_row[row2];
+        let mut p1 = A::link(self, Slot::Head(first));
+        let mut p2 = A::link(self, Slot::Head(second));
         while p1 != NONE || p2 != NONE {
-            let (column, e1, e2);
+            let (orthogonal, e1, e2);
             if p1 == NONE {
-                column = self.elements[p2].col;
+                orthogonal = A::coordinate(&self.elements[p2]);
                 (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_row;
-            } else if p2 == NONE || self.elements[p1].col < self.elements[p2].col {
-                column = self.elements[p1].col;
+                p2 = A::successor(&self.elements[p2]);
+            } else if p2 == NONE
+                || A::coordinate(&self.elements[p1]) < A::coordinate(&self.elements[p2])
+            {
+                orthogonal = A::coordinate(&self.elements[p1]);
                 (e1, e2) = (p1, NONE);
-                p1 = self.elements[p1].next_in_row;
-            } else if self.elements[p1].col > self.elements[p2].col {
-                column = self.elements[p2].col;
+                p1 = A::successor(&self.elements[p1]);
+            } else if A::coordinate(&self.elements[p1]) > A::coordinate(&self.elements[p2]) {
+                orthogonal = A::coordinate(&self.elements[p2]);
                 (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_row;
+                p2 = A::successor(&self.elements[p2]);
             } else {
-                column = self.elements[p1].col;
+                orthogonal = A::coordinate(&self.elements[p1]);
                 (e1, e2) = (p1, p2);
-                p1 = self.elements[p1].next_in_row;
-                p2 = self.elements[p2].next_in_row;
+                p1 = A::successor(&self.elements[p1]);
+                p2 = A::successor(&self.elements[p2]);
             }
-            self.exchange_col_elements(row1, e1, row2, e2, column);
+            self.exchange_list_elements::<A::Orthogonal>(first, e1, second, e2, orthogonal);
         }
-        self.first_in_row.swap(row1, row2);
-        self.int_to_ext_row.swap(row1, row2);
-        self.ext_to_int_row[self.int_to_ext_row[row1]] = row1;
-        self.ext_to_int_row[self.int_to_ext_row[row2]] = row2;
+        A::swap_maps(self, first, second);
     }
 
-    /// `spcColExchange` (topology only).
-    fn col_exchange(&mut self, mut col1: usize, mut col2: usize) {
-        if col1 > col2 {
-            std::mem::swap(&mut col1, &mut col2);
-        }
-        let mut p1 = self.first_in_col[col1];
-        let mut p2 = self.first_in_col[col2];
-        while p1 != NONE || p2 != NONE {
-            let (row, e1, e2);
-            if p1 == NONE {
-                row = self.elements[p2].row;
-                (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_col;
-            } else if p2 == NONE || self.elements[p1].row < self.elements[p2].row {
-                row = self.elements[p1].row;
-                (e1, e2) = (p1, NONE);
-                p1 = self.elements[p1].next_in_col;
-            } else if self.elements[p1].row > self.elements[p2].row {
-                row = self.elements[p2].row;
-                (e1, e2) = (NONE, p2);
-                p2 = self.elements[p2].next_in_col;
-            } else {
-                row = self.elements[p1].row;
-                (e1, e2) = (p1, p2);
-                p1 = self.elements[p1].next_in_col;
-                p2 = self.elements[p2].next_in_col;
-            }
-            self.exchange_row_elements(col1, e1, col2, e2, row);
-        }
-        self.first_in_col.swap(col1, col2);
-        self.int_to_ext_col.swap(col1, col2);
-        self.ext_to_int_col[self.int_to_ext_col[col1]] = col1;
-        self.ext_to_int_col[self.int_to_ext_col[col2]] = col2;
+    /// SPARSE spcRowExchange, with statically bound row orientation.
+    fn row_exchange(&mut self, first: usize, second: usize) {
+        self.exchange_axis::<AlongRows>(first, second);
+    }
+
+    /// SPARSE spcColExchange, with statically bound column orientation.
+    fn col_exchange(&mut self, first: usize, second: usize) {
+        self.exchange_axis::<AlongColumns>(first, second);
     }
 }
 
@@ -1127,12 +1852,16 @@ pub(super) struct Sparse<T> {
     /// Reordering changes links, never moves element handles.
     topology: std::sync::Arc<Topology>,
     values: Vec<T>,
+    /// Reciprocals of the raw pivots, indexed by internal row. Only valid
+    /// with the numeric factors; reused across unique reload/refactor cycles.
+    inverses: Vec<T>,
     lifecycle: Lifecycle,
     ordering_scratch: Markowitz,
     rel_threshold: f64,
     abs_threshold: f64,
     parity: PermutationParity,
     diagnostic: Diagnostic,
+    last_attempt: Option<crate::maths::telemetry::FactorAttempt>,
 }
 
 impl<T: Clone> Clone for Sparse<T> {
@@ -1142,12 +1871,14 @@ impl<T: Clone> Clone for Sparse<T> {
             ext_size: self.ext_size,
             topology: self.topology.clone(),
             values: self.values.clone(),
+            inverses: self.inverses.clone(),
             lifecycle: self.lifecycle.clone(),
             ordering_scratch: Markowitz::default(),
             rel_threshold: self.rel_threshold,
             abs_threshold: self.abs_threshold,
             parity: self.parity,
             diagnostic: self.diagnostic,
+            last_attempt: self.last_attempt,
         }
     }
 }
@@ -1166,6 +1897,7 @@ impl<T: Scalar> Sparse<T> {
             size: 0,
             ext_size: size,
             topology: std::sync::Arc::new(Topology {
+                original_entries: 0,
                 elements: Vec::new(),
                 diag: empty()?,
                 first_in_col: empty()?,
@@ -1176,12 +1908,14 @@ impl<T: Scalar> Sparse<T> {
                 int_to_ext_col: sparse_indices(size)?,
             }),
             values: Vec::new(),
+            inverses: Vec::new(),
             lifecycle: Lifecycle::ColumnsOnly,
             ordering_scratch: Markowitz::default(),
             rel_threshold: DEFAULT_THRESHOLD,
             abs_threshold: 0.0,
             parity: PermutationParity::Even,
             diagnostic: Diagnostic::Okay,
+            last_attempt: None,
         })
     }
 
@@ -1294,6 +2028,7 @@ impl<T: Scalar> Sparse<T> {
         let topology = std::sync::Arc::make_mut(&mut self.topology);
         let e = topology.create_element(row, col, last, self.lifecycle.rows_linked());
         if !fillin {
+            topology.original_entries += 1;
             self.note_numeric_write();
         }
         self.lifecycle.invalidate_structure(!fillin);
@@ -1326,6 +2061,7 @@ impl<T: Scalar> Sparse<T> {
     fn reset_numeric_status(&mut self) {
         self.lifecycle.invalidate_numeric();
         self.diagnostic = Diagnostic::Okay;
+        self.last_attempt = None;
     }
 
     /// A write into existing LU storage revokes its factor view but does
@@ -1376,6 +2112,7 @@ impl<T: Scalar> Sparse<T> {
             sparse.values.push(value);
         }
         topology.finish_original_columns(&tails[..=sparse.size])?;
+        topology.original_entries = topology.elements.len();
         Ok(sparse)
     }
 
@@ -1421,6 +2158,7 @@ impl<T: Scalar> Sparse<T> {
             size: self.size,
             ext_size: self.ext_size,
             values,
+            inverses: Vec::new(),
             topology: self.topology,
             lifecycle: self.lifecycle.into_loaded(),
             ordering_scratch: self.ordering_scratch,
@@ -1428,6 +2166,7 @@ impl<T: Scalar> Sparse<T> {
             abs_threshold: self.abs_threshold,
             parity: self.parity,
             diagnostic: Diagnostic::Okay,
+            last_attempt: None,
         }
     }
 
@@ -1438,12 +2177,14 @@ impl<T: Scalar> Sparse<T> {
             ext_size: self.ext_size,
             topology: self.topology.clone(),
             values,
+            inverses: Vec::new(),
             lifecycle: self.lifecycle.clone().into_loaded(),
             ordering_scratch: Markowitz::default(),
             rel_threshold: self.rel_threshold,
             abs_threshold: self.abs_threshold,
             parity: self.parity,
             diagnostic: Diagnostic::Okay,
+            last_attempt: None,
         }
     }
 
@@ -1703,13 +2444,52 @@ impl<T: Scalar> Sparse<T> {
 
     /// `spOrderAndFactor(Matrix, NULL, rel, abs, DiagPivoting = YES)`.
     pub(crate) fn order_and_factor(&mut self, rel_threshold: f64, abs_threshold: f64) -> Status {
-        if !self.coefficients_loaded() {
-            return Status::NeedsReload;
-        }
-        let mut scratch = std::mem::take(&mut self.ordering_scratch);
-        let status = self.order_with_scratch(rel_threshold, abs_threshold, &mut scratch);
-        self.ordering_scratch = scratch;
+        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
+
+        let mut searched = false;
+        let status = if self.coefficients_loaded() {
+            let mut scratch = std::mem::take(&mut self.ordering_scratch);
+            let status =
+                self.order_with_scratch(rel_threshold, abs_threshold, &mut scratch, &mut searched);
+            self.ordering_scratch = scratch;
+            status
+        } else {
+            Status::NeedsReload
+        };
+        self.last_attempt = Some(FactorAttempt {
+            path: AttemptPath::Order { searched },
+            status,
+        });
         status
+    }
+
+    /// The most recent actual factor attempt, not a lifetime count.
+    pub(super) fn last_attempt(&self) -> crate::maths::FactorWork {
+        let mut work = crate::maths::FactorWork::default();
+        if let Some(attempt) = self.last_attempt {
+            work.record(attempt);
+        }
+        work
+    }
+
+    /// Storage of this frame; callers expose it only for valid factors.
+    pub(super) fn storage(&self) -> crate::maths::FactorStorage {
+        crate::maths::FactorStorage {
+            external_order: self.ext_size,
+            translated_order: self.size,
+            original_entries: self.topology.original_entries,
+            factor_entries: self.values.len(),
+            numeric_bytes: std::mem::size_of_val(self.values.as_slice())
+                + std::mem::size_of_val(self.inverses.as_slice()),
+        }
+    }
+
+    fn prepare_inverses(&mut self) -> SpiceResult<()> {
+        let required = self.size + 1;
+        let additional = required.saturating_sub(self.inverses.len());
+        sparse_reserve(&mut self.inverses, additional)?;
+        self.inverses.resize(required, T::ZERO);
+        Ok(())
     }
 
     fn order_with_scratch(
@@ -1717,9 +2497,13 @@ impl<T: Scalar> Sparse<T> {
         rel_threshold: f64,
         abs_threshold: f64,
         scratch: &mut Markowitz,
+        searched: &mut bool,
     ) -> Status {
         if !self.values_are_finite() {
             return self.nonfinite_factor();
+        }
+        if self.prepare_inverses().is_err() {
+            return self.resource_failure();
         }
         let size = self.size;
         if rel_threshold > 0.0 && rel_threshold <= 1.0 {
@@ -1768,6 +2552,7 @@ impl<T: Scalar> Sparse<T> {
         if scratch.ensure_size(size).is_err() {
             return self.resource_failure();
         }
+        *searched = step <= size;
         self.count_markowitz(scratch, step);
         self.markowitz_products(scratch, step);
         while step <= size {
@@ -1825,92 +2610,69 @@ impl<T: Scalar> Sparse<T> {
         if self.values.len() != elements.len() || !self.lifecycle.rows_linked() {
             return Err(Status::InvalidPlan);
         }
-        let mut columns = Vec::new();
-        columns
-            .try_reserve_exact(self.size)
-            .map_err(|_| Status::Resource)?;
-        let mut column_entries = Vec::new();
-        column_entries
-            .try_reserve_exact(self.topology.elements.len())
-            .map_err(|_| Status::Resource)?;
-        let mut upper_row_start = Vec::new();
-        upper_row_start
-            .try_reserve_exact(self.size.checked_add(1).ok_or(Status::Resource)?)
-            .map_err(|_| Status::Resource)?;
-        let mut upper_row_entries = Vec::new();
+        Ok(FactorRuns {
+            columns: self.compile_axis(false)?,
+            rows: self.compile_axis(true)?,
+        })
+    }
 
-        let mut column_upper_count = 0;
-        upper_row_start.push(I::pack(0).ok_or(Status::InvalidPlan)?);
+    fn compile_axis<I: PlanIndex>(&self, rows: bool) -> Result<AxisRuns<I>, Status> {
+        let elements = &self.topology.elements;
+        let mut runs = Vec::new();
+        runs.try_reserve_exact(self.size)
+            .map_err(|_| Status::Resource)?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(elements.len())
+            .map_err(|_| Status::Resource)?;
+        let heads = if rows {
+            &self.topology.first_in_row
+        } else {
+            &self.topology.first_in_col
+        };
         for i in 1..=self.size {
-            let start = column_entries.len();
+            let start = entries.len();
             let diagonal = *self.topology.diag.get(i).ok_or(Status::InvalidPlan)?;
             let mut diagonal_offset = None;
-            let mut e = *self
-                .topology
-                .first_in_col
-                .get(i)
-                .ok_or(Status::InvalidPlan)?;
+            let mut e = *heads.get(i).ok_or(Status::InvalidPlan)?;
             let mut previous = 0;
             while e != NONE {
                 let element = elements.get(e).ok_or(Status::InvalidPlan)?;
-                // Strict coordinate order also rules out cyclic links and
-                // duplicate handles, before constructing packed offsets.
-                if element.col != i || element.row <= previous || element.row > self.size {
+                let (axis, coordinate, next) = if rows {
+                    (element.row, element.col, element.next_in_row)
+                } else {
+                    (element.col, element.row, element.next_in_col)
+                };
+                // Strict coordinate order excludes cycles and duplicates.
+                if axis != i || coordinate <= previous || coordinate > self.size {
                     return Err(Status::InvalidPlan);
                 }
-                previous = element.row;
-                if element.row == i {
+                previous = coordinate;
+                if coordinate == i {
                     if e != diagonal {
                         return Err(Status::InvalidPlan);
                     }
-                    diagonal_offset = Some(column_entries.len());
-                } else if element.row < i {
-                    column_upper_count += 1;
+                    diagonal_offset = Some(entries.len());
                 }
-                if column_entries.len() == elements.len() {
+                if entries.len() == elements.len() {
                     return Err(Status::InvalidPlan);
                 }
-                column_entries.push(RunEntry::new(e, element.row).ok_or(Status::InvalidPlan)?);
-                e = element.next_in_col;
+                entries.push(RunEntry::new(e, coordinate).ok_or(Status::InvalidPlan)?);
+                e = next;
             }
-            columns.push(
-                ColumnRun::new(
+            runs.push(
+                AxisRun::new(
                     start,
                     diagonal_offset.ok_or(Status::InvalidPlan)?,
-                    column_entries.len(),
+                    entries.len(),
                 )
                 .ok_or(Status::InvalidPlan)?,
             );
-            let mut e = elements
-                .get(diagonal)
-                .ok_or(Status::InvalidPlan)?
-                .next_in_row;
-            let mut previous = i;
-            while e != NONE {
-                let element = elements.get(e).ok_or(Status::InvalidPlan)?;
-                if element.row != i || element.col <= previous || element.col > self.size {
-                    return Err(Status::InvalidPlan);
-                }
-                previous = element.col;
-                if upper_row_entries.len() == upper_row_entries.capacity() {
-                    upper_row_entries
-                        .try_reserve(1)
-                        .map_err(|_| Status::Resource)?;
-                }
-                upper_row_entries.push(RunEntry::new(e, element.col).ok_or(Status::InvalidPlan)?);
-                e = element.next_in_row;
-            }
-            upper_row_start.push(I::pack(upper_row_entries.len()).ok_or(Status::InvalidPlan)?);
         }
-        if column_entries.len() != elements.len() || upper_row_entries.len() != column_upper_count {
+        if entries.len() != elements.len() {
             return Err(Status::InvalidPlan);
         }
-        Ok(FactorRuns {
-            columns,
-            column_entries,
-            upper_row_start,
-            upper_row_entries,
-        })
+        Ok(AxisRuns { runs, entries })
     }
 
     #[cfg(test)]
@@ -1921,14 +2683,40 @@ impl<T: Scalar> Sparse<T> {
     /// `spFactor`: refactor with the existing pivot order (no threshold
     /// test). Scratch belongs to the operation, not to factor snapshots.
     pub(super) fn factor_with_workspace(&mut self, workspace: &mut Vec<T>) -> Status {
+        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
+
         // C retains a partial order after a singular reordering. If
         // topology changed, no complete numeric traversal is available;
         // retry the threshold path, preserving C's existing pivot prefix.
         if !self.coefficients_loaded() {
+            self.last_attempt = Some(FactorAttempt {
+                path: AttemptPath::Rejected,
+                status: Status::NeedsReload,
+            });
             return Status::NeedsReload;
         }
-        let Lifecycle::Symbolic(plan) = &self.lifecycle else {
+        if !matches!(self.lifecycle, Lifecycle::Symbolic(_)) {
             return self.order_and_factor(0.0, 0.0);
+        }
+        if self.prepare_inverses().is_err() {
+            let status = self.resource_failure();
+            self.last_attempt = Some(FactorAttempt {
+                path: AttemptPath::Refactor,
+                status,
+            });
+            return status;
+        }
+        let status = self.refactor_with_workspace(workspace);
+        self.last_attempt = Some(FactorAttempt {
+            path: AttemptPath::Refactor,
+            status,
+        });
+        status
+    }
+
+    fn refactor_with_workspace(&mut self, workspace: &mut Vec<T>) -> Status {
+        let Lifecycle::Symbolic(plan) = &self.lifecycle else {
+            return self.invalid_plan();
         };
         let size = self.size;
         if size == 0 {
@@ -1938,25 +2726,35 @@ impl<T: Scalar> Sparse<T> {
         if self.values[first].is_zero() {
             return self.refactor_zero_pivot(1);
         }
-        let inverse = self.values[first].recip();
-        if !inverse.is_finite() || inverse.is_zero() {
+        let first_pivot = self.values[first];
+        if !first_pivot.is_finite() {
             return self.nonfinite_factor();
         }
-        self.values[first] = inverse;
+        self.inverses[1] = first_pivot.cached_recip();
         // Each column is scattered before use. Successful ordering
         // inserted every structural elimination target as a fill-in, so
         // the lower-column updates cannot read an unscattered row.
         // Existing scratch may hold the previous solve's internal RHS;
         // no blanket initialization is required.
-        let additional = (size + 1).saturating_sub(workspace.len());
+        let required = size + 1;
+        let additional = required.saturating_sub(workspace.len());
         if sparse_reserve(workspace, additional).is_err() {
             return self.resource_failure();
         }
         workspace.resize(size + 1, T::ZERO);
-        let dest = workspace;
         let result = match plan.as_ref() {
-            FactorPlan::Compact(runs) => runs.refactor(&mut self.values, &self.topology.diag, dest),
-            FactorPlan::Wide(runs) => runs.refactor(&mut self.values, &self.topology.diag, dest),
+            FactorPlan::Compact(runs) => runs.refactor(
+                &mut self.values,
+                &self.topology.diag,
+                workspace,
+                &mut self.inverses,
+            ),
+            FactorPlan::Wide(runs) => runs.refactor(
+                &mut self.values,
+                &self.topology.diag,
+                workspace,
+                &mut self.inverses,
+            ),
         };
         match result {
             Ok(()) => {}
@@ -2363,20 +3161,18 @@ impl<T: Scalar> Sparse<T> {
             self.matrix_is_singular(row);
             return;
         }
-        let inverse = self.values[pivot].recip();
-        if !inverse.is_finite() || inverse.is_zero() {
+        let raw_pivot = self.values[pivot];
+        if !raw_pivot.is_finite() {
             self.nonfinite_factor();
             return;
         }
-        self.values[pivot] = inverse;
+        let inverse = raw_pivot.cached_recip();
+        self.inverses[self.topology.elements[pivot].row] = inverse;
         let mut upper = self.topology.elements[pivot].next_in_row;
         while upper != NONE {
-            let u = self.values[upper].mul(inverse);
-            if !u.is_finite() {
-                self.nonfinite_factor();
-                return;
-            }
-            self.values[upper] = u;
+            let raw_upper = self.values[upper];
+            let u = raw_upper.quotient(raw_pivot, inverse);
+            let normal = u.normal_multiplier();
             let upper_col = self.topology.elements[upper].col;
             let mut above = upper;
             let mut sub = self.topology.elements[upper].next_in_col;
@@ -2400,7 +3196,7 @@ impl<T: Scalar> Sparse<T> {
                     sub = element;
                 }
                 let l = self.values[lower];
-                let value = self.values[sub].mul_sub(u, l);
+                let value = self.values[sub].schur(raw_pivot, raw_upper, u, l, normal);
                 if !value.is_finite() {
                     self.nonfinite_factor();
                     return;
@@ -2544,18 +3340,24 @@ impl<T: Scalar> Sparse<T> {
 
     /// Emit external-order values sequentially. Untranslated unknowns keep
     /// exactly their original RHS bits, including signed zeros.
-    fn scatter_solution(&self, rhs: &[T], x: &[T], transposed: bool) -> SpiceResult<Vec<T>> {
+    fn scatter_solution(
+        &self,
+        rhs: &[T],
+        x: &[T],
+        transposed: bool,
+        result: &mut Vec<T>,
+    ) -> SpiceResult<()> {
         let indices = if transposed {
             &self.topology.ext_to_int_row
         } else {
             &self.topology.ext_to_int_col
         };
-        let mut result = Vec::new();
-        sparse_reserve(&mut result, rhs.len())?;
+        result.clear();
+        sparse_reserve(result, rhs.len())?;
         result.extend(rhs.iter().zip(&indices[1..]).map(|(&value, &internal)| {
             if internal == NONE { value } else { x[internal] }
         }));
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -2568,16 +3370,9 @@ pub(super) struct FactorView<'a, T> {
 
 impl<T: Scalar> FactorView<'_, T> {
     pub(super) fn solve(&self, rhs: &[T], workspace: &mut Vec<T>) -> SpiceResult<Vec<T>> {
-        self.frame.gather_rhs(rhs, workspace, false)?;
-        match self.plan {
-            FactorPlan::Compact(runs) => {
-                runs.solve(&self.frame.values, &self.frame.topology.diag, workspace);
-            }
-            FactorPlan::Wide(runs) => {
-                runs.solve(&self.frame.values, &self.frame.topology.diag, workspace);
-            }
-        }
-        self.frame.scatter_solution(rhs, workspace, false)
+        let mut out = Vec::new();
+        self.solve_into(rhs, workspace, &mut out, false)?;
+        Ok(out)
     }
 
     pub(super) fn solve_transposed(
@@ -2585,122 +3380,226 @@ impl<T: Scalar> FactorView<'_, T> {
         rhs: &[T],
         workspace: &mut Vec<T>,
     ) -> SpiceResult<Vec<T>> {
-        self.frame.gather_rhs(rhs, workspace, true)?;
-        match self.plan {
-            FactorPlan::Compact(runs) => {
-                runs.solve_transposed(&self.frame.values, &self.frame.topology.diag, workspace);
-            }
-            FactorPlan::Wide(runs) => {
-                runs.solve_transposed(&self.frame.values, &self.frame.topology.diag, workspace);
-            }
-        }
-        self.frame.scatter_solution(rhs, workspace, true)
+        let mut out = Vec::new();
+        self.solve_into(rhs, workspace, &mut out, true)?;
+        Ok(out)
     }
 
-    /// `spDeterminant`: normalized decimal mantissa and exponent.
-    /// Preserve C's multiplication/division and
-    /// decimal scaling on every representable intermediate. If an individual
-    /// step would overflow or underflow, normalize its inverse pivot first.
-    pub(super) fn determinant(&self) -> SpiceResult<(T, i32)>
+    pub(super) fn solve_into(
+        &self,
+        rhs: &[T],
+        workspace: &mut Vec<T>,
+        out: &mut Vec<T>,
+        transposed: bool,
+    ) -> SpiceResult<()> {
+        self.solve_workspace(rhs, workspace, transposed)?;
+        self.frame.scatter_solution(rhs, workspace, transposed, out)
+    }
+
+    fn solve_workspace(
+        &self,
+        rhs: &[T],
+        workspace: &mut Vec<T>,
+        transposed: bool,
+    ) -> SpiceResult<()> {
+        self.frame.gather_rhs(rhs, workspace, transposed)?;
+        if !self.solve_loaded_workspace(workspace, transposed, false) {
+            self.frame.gather_rhs(rhs, workspace, transposed)?;
+            self.solve_loaded_workspace(workspace, transposed, true);
+        }
+        Ok(())
+    }
+
+    fn solve_loaded_workspace(
+        &self,
+        workspace: &mut [T],
+        transposed: bool,
+        raw_only: bool,
+    ) -> bool {
+        match self.plan {
+            FactorPlan::Compact(runs) => runs.solve(
+                &self.frame.values,
+                &self.frame.topology.diag,
+                &self.frame.inverses,
+                workspace,
+                transposed,
+                raw_only,
+            ),
+            FactorPlan::Wide(runs) => runs.solve(
+                &self.frame.values,
+                &self.frame.topology.diag,
+                &self.frame.inverses,
+                workspace,
+                transposed,
+                raw_only,
+            ),
+        }
+    }
+
+    pub(super) fn solve_batch_into(
+        &self,
+        rhs: &[T],
+        workspace: &mut SolveBatchWorkspace<T>,
+        out: &mut Vec<T>,
+        transposed: bool,
+    ) -> Result<(), BatchSolveFailure> {
+        let frame = self.frame;
+        let n = frame.ext_size;
+        out.clear();
+        if rhs.is_empty() {
+            return Ok(());
+        }
+        if n == 0 || !rhs.len().is_multiple_of(n) {
+            return Err(numerical("SPARSE batch solve", "invalid RHS size").into());
+        }
+        if let Some(index) = rhs.iter().position(|v| !v.is_finite()) {
+            return Err(BatchSolveFailure {
+                rhs_index: Some(index / n),
+                cause: numerical("SPARSE batch solve", "non-finite RHS"),
+            });
+        }
+        let tile_size = n
+            .checked_mul(RHS_BATCH_WIDTH)
+            .ok_or_else(|| numerical("SPARSE batch solve", "RHS tile size overflows"))?;
+        sparse_reserve(out, rhs.len())?;
+        out.extend_from_slice(rhs);
+        let gather = if transposed {
+            &frame.topology.int_to_ext_col
+        } else {
+            &frame.topology.int_to_ext_row
+        };
+        let scatter = if transposed {
+            &frame.topology.ext_to_int_row
+        } else {
+            &frame.topology.ext_to_int_col
+        };
+        for (tile, result) in rhs.chunks(tile_size).zip(out.chunks_mut(tile_size)) {
+            if tile.len() < tile_size {
+                for (rhs, vector) in tile.chunks_exact(n).zip(result.chunks_exact_mut(n)) {
+                    self.solve_workspace(rhs, &mut workspace.scalar, transposed)?;
+                    for (value, &internal) in vector.iter_mut().zip(&scatter[1..]) {
+                        if internal != NONE {
+                            *value = workspace.scalar[internal];
+                        }
+                    }
+                }
+                continue;
+            }
+            workspace.real.clear();
+            sparse_reserve(&mut workspace.real, frame.size + 1)?;
+            workspace.real.resize(frame.size + 1, LaneParts::ZERO.re);
+            if T::HAS_IMAGINARY {
+                workspace.imag.clear();
+                sparse_reserve(&mut workspace.imag, frame.size + 1)?;
+                workspace.imag.resize(frame.size + 1, LaneParts::ZERO.im);
+            }
+            for (internal, &external) in gather[1..=frame.size].iter().enumerate() {
+                let parts = LaneParts::from_lanes(std::array::from_fn(|lane| {
+                    tile[lane * n + external - 1]
+                }));
+                write_tile_row(workspace, internal + 1, parts);
+            }
+            let valid = match self.plan {
+                FactorPlan::Compact(runs) => runs.solve_batch(
+                    &frame.values,
+                    &frame.topology.diag,
+                    &frame.inverses,
+                    workspace,
+                    transposed,
+                ),
+                FactorPlan::Wide(runs) => runs.solve_batch(
+                    &frame.values,
+                    &frame.topology.diag,
+                    &frame.inverses,
+                    workspace,
+                    transposed,
+                ),
+            };
+            // Untranslated unknowns keep their original RHS, including signed zeros.
+            for (lane, vector) in result.chunks_exact_mut(n).enumerate() {
+                if !valid.test(lane) {
+                    self.frame.gather_rhs(
+                        &tile[lane * n..(lane + 1) * n],
+                        &mut workspace.scalar,
+                        transposed,
+                    )?;
+                    self.solve_loaded_workspace(&mut workspace.scalar, transposed, true);
+                }
+                for (value, &internal) in vector.iter_mut().zip(&scatter[1..]) {
+                    if internal != NONE {
+                        *value = if valid.test(lane) {
+                            read_tile_row(workspace, internal).get(lane)
+                        } else {
+                            workspace.scalar[internal]
+                        };
+                    }
+                }
+            }
+        }
+        if let Some(index) = out.iter().position(|value| !value.is_finite()) {
+            return Err(BatchSolveFailure {
+                rhs_index: Some(index / n),
+                cause: numerical("SPARSE batch solve", "non-finite solution/singular system"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Binary-scaled determinant, with `1 <= max(|component|) < 2`.
+    /// Normalize each raw pivot before multiplying and renormalize the
+    /// product after every step. Binary shifts do not perturb the mantissa
+    /// as decimal scaling followed by logarithmic base conversion does.
+    pub(super) fn determinant(&self) -> SpiceResult<(T, i64)>
     where
         T: DeterminantScale,
     {
-        use crate::maths::linear::numerical;
         let mut exponent = 0_i64;
         let mut det = T::one();
         for i in 1..=self.frame.size {
-            let inverse = self.frame.values[self.frame.topology.diag[i]];
-            if !inverse.is_finite() || inverse.is_zero() {
-                return Err(numerical(
-                    "SPARSE determinant",
-                    "non-finite or zero inverse pivot",
-                ));
-            }
-            let mut next = T::det_step(det, inverse);
-            if !next.is_finite() || next.is_zero() || next.norm().is_subnormal() {
-                let mut shift = 0;
-                let normalized = normalize_decimal(inverse, &mut shift, DecimalScale::Coarse);
-                next = T::det_step(det, normalized);
-                exponent -= shift;
-                if !next.is_finite() || next.is_zero() {
-                    return Err(numerical(
-                        "SPARSE determinant",
-                        "unrepresentable determinant step",
-                    ));
-                }
-            }
-            det = normalize_decimal(next, &mut exponent, DecimalScale::Coarse);
+            let pivot = self.frame.values[self.frame.topology.diag[i]];
+            let (pivot, shift) = normalize_binary(pivot)?;
+            exponent += i64::from(shift);
+            let (next, shift) = normalize_binary(det * pivot)?;
+            exponent += i64::from(shift);
+            det = next;
         }
-        det = normalize_decimal(det, &mut exponent, DecimalScale::Final);
         if self.frame.parity == PermutationParity::Odd {
-            det = det.scale(-1.0);
+            det = -det;
         }
-        let exponent = i32::try_from(exponent)
-            .map_err(|_| numerical("SPARSE determinant", "decimal exponent out of range"))?;
         Ok((det, exponent))
     }
 }
 
-/// Decimal normalization stages in C's spDeterminant. The constants and
-/// order of multiplications are intentional: replacing them with logarithms,
-/// powi, or a reciprocal changes rounding on ordinary matrices.
-#[derive(Clone, Copy)]
-enum DecimalScale {
-    Coarse,
-    Final,
-}
-
-fn normalize_decimal<T: DeterminantScale>(
-    mut value: T,
-    exponent: &mut i64,
-    scale: DecimalScale,
-) -> T {
-    debug_assert!(value.is_finite());
-    let (low, high, up, down, step) = match scale {
-        DecimalScale::Coarse => (1.0e-12, 1.0e12, 1.0e12, 1.0e-12, 12),
-        DecimalScale::Final => (1.0, 10.0, 10.0, 0.1, 1),
-    };
-    let mut norm = value.norm();
-    if norm != 0.0 {
-        while norm >= high {
-            value = value.scale(down);
-            *exponent += step;
-            norm = value.norm();
-        }
-        while norm < low {
-            value = value.scale(up);
-            *exponent -= step;
-            norm = value.norm();
-        }
+fn normalize_binary<T: DeterminantScale>(value: T) -> SpiceResult<(T, i32)> {
+    if !value.is_finite() {
+        return Err(numerical(
+            "SPARSE determinant",
+            "non-finite determinant factor",
+        ));
     }
-    value
+    let exponent = crate::primitives::numeric::binary_exponent(value.norm())
+        .ok_or_else(|| numerical("SPARSE determinant", "zero determinant factor"))?;
+    Ok((value.scale_power(-exponent), exponent))
 }
 
-/// Scalar operations used only by [`Sparse::determinant`].
-pub(super) trait DeterminantScale: Scalar {
-    /// One.
+/// Scalar operations used only by the checked determinant accumulation.
+pub(super) trait DeterminantScale:
+    Scalar + std::ops::Neg<Output = Self> + std::ops::Mul<Output = Self>
+{
     fn one() -> Self;
-    /// C's per-pivot update: real `det /= diag` (diag holds `1/pivot`), complex
-    /// `det *= CMPLX_RECIPROCAL(diag)`.
-    fn det_step(det: Self, inverse_pivot: Self) -> Self;
-    /// `NORM`: `max(|re|, |im|)` (real: `|x|`).
     fn norm(self) -> f64;
-    /// Multiply by a real factor.
-    fn scale(self, factor: f64) -> Self;
+    fn scale_power(self, exponent: i32) -> Self;
 }
 
 impl DeterminantScale for f64 {
     fn one() -> Self {
         1.0
     }
-    fn det_step(det: Self, inverse_pivot: Self) -> Self {
-        det / inverse_pivot
-    }
     fn norm(self) -> f64 {
         self.abs()
     }
-    fn scale(self, factor: f64) -> Self {
-        self * factor
+    fn scale_power(self, exponent: i32) -> Self {
+        crate::primitives::numeric::scale_power(self, exponent)
     }
 }
 
@@ -2708,15 +3607,237 @@ impl DeterminantScale for Complex {
     fn one() -> Self {
         Self::real(1.0)
     }
-    fn det_step(det: Self, inverse_pivot: Self) -> Self {
-        // CMPLX_MULT_ASSIGN(det, reciprocal).
-        det.mul(inverse_pivot.recip())
-    }
     fn norm(self) -> f64 {
         self.re.abs().max(self.im.abs())
     }
-    fn scale(self, factor: f64) -> Self {
-        Self::new(self.re * factor, self.im * factor)
+    fn scale_power(self, exponent: i32) -> Self {
+        use crate::primitives::numeric::scale_power;
+        Self::new(
+            scale_power(self.re, exponent),
+            scale_power(self.im, exponent),
+        )
+    }
+}
+
+/// Numeric per-lane factorization outcomes and ordered external solutions.
+type IndependentTileSolutions = ([Status; RHS_BATCH_WIDTH], Vec<Option<Vec<Complex>>>);
+
+impl Sparse<Complex> {
+    /// Factor independent original coefficient streams using one immutable
+    /// ordered symbolic topology. The reference's numeric factors are never
+    /// read or mutated. On allocation or layout mismatch callers use scalar
+    /// factorization, which has smaller peak scratch requirements.
+    fn factor_independent_packed(
+        reference: &Self,
+        inputs: &[&[Complex]],
+        workspace: &mut IndependentFactorTileWorkspace,
+    ) -> Option<[Status; RHS_BATCH_WIDTH]> {
+        if !(2..=RHS_BATCH_WIDTH).contains(&inputs.len()) {
+            return None;
+        }
+        let plan = reference.lifecycle.plan()?;
+        let topology = &reference.topology;
+        let original_entries = topology.original_entries;
+        if reference.size == 0 || inputs.iter().any(|values| values.len() != original_entries) {
+            return None;
+        }
+        let values_len = reference.values.len();
+        let size = reference.size;
+        let IndependentFactorTileWorkspace {
+            values,
+            scratch,
+            inverses,
+        } = workspace;
+        sparse_reserve(values, values_len.saturating_sub(values.len())).ok()?;
+        sparse_reserve(scratch, (size + 1).saturating_sub(scratch.len())).ok()?;
+        sparse_reserve(inverses, (size + 1).saturating_sub(inverses.len())).ok()?;
+        values.resize(values_len, LaneParts::ZERO);
+        scratch.resize(size + 1, LaneParts::ZERO);
+        inverses.resize(size + 1, LaneParts::ZERO);
+        for (index, packed) in values.iter_mut().enumerate() {
+            *packed = LaneParts::from_lanes(std::array::from_fn(|lane| {
+                if index < original_entries {
+                    inputs.get(lane).map_or(Complex::ZERO, |input| input[index])
+                } else {
+                    Complex::ZERO
+                }
+            }));
+        }
+        let count = inputs.len();
+        let mut status = [Status::Okay; RHS_BATCH_WIDTH];
+        let first_pivot = topology.diag[1];
+        for (lane, lane_status) in status.iter_mut().enumerate().take(count) {
+            let pivot = values[first_pivot].get::<Complex>(lane);
+            *lane_status = if pivot.is_zero() {
+                Status::ZeroDiag
+            } else if !pivot.is_finite() {
+                Status::NonFinite
+            } else {
+                inverses[1].set(lane, pivot.cached_recip());
+                Status::Okay
+            };
+        }
+        match plan.as_ref() {
+            FactorPlan::Compact(runs) => runs.refactor_independent_tile(
+                values,
+                &topology.diag,
+                scratch,
+                inverses,
+                &mut status,
+                count,
+            ),
+            FactorPlan::Wide(runs) => runs.refactor_independent_tile(
+                values,
+                &topology.diag,
+                scratch,
+                inverses,
+                &mut status,
+                count,
+            ),
+        }
+        for (lane, status) in status.iter_mut().enumerate().take(count) {
+            if *status == Status::Okay && values.iter().any(|v| !v.get::<Complex>(lane).is_finite())
+            {
+                *status = Status::NonFinite;
+            }
+        }
+        Some(status)
+    }
+
+    /// Materialize independent immutable numeric factors for callers that
+    /// must retain snapshots, perform multiple RHS or transposed solves.
+    pub(super) fn factor_independent_tile(
+        frames: &mut [Self],
+        workspace: &mut IndependentFactorTileWorkspace,
+    ) -> Option<[Status; RHS_BATCH_WIDTH]> {
+        use crate::maths::telemetry::{AttemptPath, FactorAttempt};
+
+        let first = frames.first()?;
+        let plan = first.lifecycle.plan()?;
+        if frames.iter().any(|frame| {
+            !frame.coefficients_loaded()
+                || !matches!(frame.lifecycle.plan(), Some(other)
+                    if std::sync::Arc::ptr_eq(other, plan))
+                || !std::sync::Arc::ptr_eq(&frame.topology, &first.topology)
+        }) {
+            return None;
+        }
+        let original_entries = first.topology.original_entries;
+        let inputs: [&[Complex]; RHS_BATCH_WIDTH] = std::array::from_fn(|lane| {
+            frames
+                .get(lane)
+                .map_or(&[][..], |frame| &frame.values[..original_entries])
+        });
+        let mut status =
+            Self::factor_independent_packed(first, &inputs[..frames.len()], workspace)?;
+        for (lane, frame) in frames.iter_mut().enumerate() {
+            if status[lane] == Status::Okay {
+                if frame.prepare_inverses().is_err() {
+                    status[lane] = Status::Resource;
+                } else {
+                    for (dst, packed) in frame.values.iter_mut().zip(&workspace.values) {
+                        *dst = packed.get::<Complex>(lane);
+                    }
+                    for (dst, packed) in frame.inverses.iter_mut().zip(&workspace.inverses) {
+                        *dst = packed.get::<Complex>(lane);
+                    }
+                    status[lane] = frame.done();
+                }
+            }
+            frame.last_attempt = Some(FactorAttempt {
+                path: AttemptPath::Refactor,
+                status: status[lane],
+            });
+        }
+        Some(status)
+    }
+
+    /// Factor and solve independent numeric matrices without creating one
+    /// scalar LU snapshot per lane. Each input is the original-element
+    /// stream in the reference's order, and each RHS is in external order.
+    /// None indicates an unsupported packed shape or exhausted scratch,
+    /// in which case the caller can use independent scalar factors.
+    pub(super) fn factor_and_solve_independent_tile(
+        reference: &Self,
+        inputs: &[&[Complex]],
+        rhs: &[&[Complex]],
+        workspace: &mut IndependentFactorTileWorkspace,
+        transposed: bool,
+    ) -> Option<IndependentTileSolutions> {
+        if inputs.len() != rhs.len()
+            || rhs.iter().any(|source| {
+                source.len() != reference.ext_size || source.iter().any(|value| !value.is_finite())
+            })
+        {
+            return None;
+        }
+        let mut status = Self::factor_independent_packed(reference, inputs, workspace)?;
+        let count = inputs.len();
+        let active = LaneMask::from_array(std::array::from_fn(|lane| {
+            lane < count && status[lane] == Status::Okay
+        }));
+        let topology = &reference.topology;
+        if active.any() {
+            let gather = if transposed {
+                &topology.int_to_ext_col
+            } else {
+                &topology.int_to_ext_row
+            };
+            for (internal, &external) in gather[1..=reference.size].iter().enumerate() {
+                workspace.scratch[internal + 1] =
+                    LaneParts::from_lanes(std::array::from_fn(|lane| {
+                        rhs.get(lane)
+                            .map_or(Complex::ZERO, |source| source[external - 1])
+                    }));
+            }
+            match reference.lifecycle.plan()?.as_ref() {
+                FactorPlan::Compact(runs) => runs.solve_independent_tile(
+                    &workspace.values,
+                    &topology.diag,
+                    &workspace.inverses,
+                    &mut workspace.scratch,
+                    active,
+                    transposed,
+                ),
+                FactorPlan::Wide(runs) => runs.solve_independent_tile(
+                    &workspace.values,
+                    &topology.diag,
+                    &workspace.inverses,
+                    &mut workspace.scratch,
+                    active,
+                    transposed,
+                ),
+            }
+        }
+        let scatter = if transposed {
+            &topology.ext_to_int_row
+        } else {
+            &topology.ext_to_int_col
+        };
+        let mut output = Vec::new();
+        output.try_reserve(count).ok()?;
+        for lane in 0..count {
+            if status[lane] != Status::Okay {
+                output.push(None);
+                continue;
+            }
+            let mut solution = Vec::new();
+            solution.try_reserve(reference.ext_size).ok()?;
+            for (index, &internal) in scatter[1..].iter().enumerate() {
+                let value = if internal == NONE {
+                    rhs[lane][index]
+                } else {
+                    workspace.scratch[internal].get::<Complex>(lane)
+                };
+                if !value.is_finite() {
+                    status[lane] = Status::NonFinite;
+                    break;
+                }
+                solution.push(value);
+            }
+            output.push((status[lane] == Status::Okay).then_some(solution));
+        }
+        Some((status, output))
     }
 }
 
@@ -2765,6 +3886,166 @@ mod tests {
         assert_eq!(sparse.get_element(2, 1).unwrap(), first);
         assert_ne!(second, first);
         assert_eq!(sparse.value(first), 5.);
+    }
+
+    /// Structural oracle independent of the linked-list exchange algorithm:
+    /// every stable element handle has one expected matrix coordinate; the
+    /// explicit per-axis permutations define the only allowed coordinate moves.
+    fn assert_exchange_topology(
+        topology: &Topology,
+        n: usize,
+        expected: &[(usize, usize)],
+        row_permutation: &[usize],
+        col_permutation: &[usize],
+    ) {
+        assert_eq!(topology.elements.len(), expected.len());
+        let mut counted_rows = vec![0_usize; expected.len()];
+        let mut counted_cols = vec![0_usize; expected.len()];
+        for row in 1..=n {
+            let mut prev_col = 0;
+            let mut element = topology.first_in_row[row];
+            let mut visited = 0;
+            while element != NONE {
+                assert!(element < expected.len(), "dangling row-list link at {row}");
+                visited += 1;
+                assert!(visited <= expected.len(), "row-list cycle at {row}");
+                let node = &topology.elements[element];
+                assert_eq!(node.row, row);
+                assert!(node.col > prev_col, "row-list not ordered at {row}");
+                prev_col = node.col;
+                counted_rows[element] += 1;
+                element = node.next_in_row;
+            }
+        }
+        for col in 1..=n {
+            let mut prev_row = 0;
+            let mut element = topology.first_in_col[col];
+            let mut visited = 0;
+            while element != NONE {
+                assert!(
+                    element < expected.len(),
+                    "dangling column-list link at {col}"
+                );
+                visited += 1;
+                assert!(visited <= expected.len(), "column-list cycle at {col}");
+                let node = &topology.elements[element];
+                assert_eq!(node.col, col);
+                assert!(node.row > prev_row, "column-list not ordered at {col}");
+                prev_row = node.row;
+                counted_cols[element] += 1;
+                element = node.next_in_col;
+            }
+        }
+        assert!(counted_rows.iter().all(|count| *count == 1));
+        assert!(counted_cols.iter().all(|count| *count == 1));
+        for (element, position) in topology.elements.iter().zip(expected) {
+            assert_eq!((element.row, element.col), *position);
+        }
+        for i in 1..=n {
+            assert_eq!(topology.int_to_ext_row[i], row_permutation[i]);
+            assert_eq!(topology.int_to_ext_col[i], col_permutation[i]);
+            assert_eq!(topology.ext_to_int_row[row_permutation[i]], i);
+            assert_eq!(topology.ext_to_int_col[col_permutation[i]], i);
+        }
+    }
+
+    #[test]
+    fn row_and_column_exchange_match_reference_permutations_for_sparse_patterns() {
+        let mut seed = 0x22ac_b703_ef84_a911_u64;
+        let mut sample = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed >> 32
+        };
+        for n in [1, 2, 3, 5, 9, 16] {
+            for density in 0..5 {
+                let mut matrix = Sparse::<f64>::new(n).unwrap();
+                // Bind every coordinate to identity in the external/internal
+                // maps. The off-diagonal pattern is independently randomized.
+                for i in 1..=n {
+                    matrix.get_element(i, i).unwrap();
+                }
+                for row in 1..=n {
+                    for col in 1..=n {
+                        if row != col && sample() % 5 <= density {
+                            matrix.get_element(row, col).unwrap();
+                        }
+                    }
+                }
+                matrix.link_rows();
+                let mut positions: Vec<_> = matrix
+                    .topology
+                    .elements
+                    .iter()
+                    .map(|node| (node.row, node.col))
+                    .collect();
+                let mut row_permutation: Vec<_> = (0..=n).collect();
+                let mut col_permutation: Vec<_> = (0..=n).collect();
+                assert_exchange_topology(
+                    &matrix.topology,
+                    n,
+                    &positions,
+                    &row_permutation,
+                    &col_permutation,
+                );
+                for step in 0..(9 * n + 53) {
+                    let a = if step % 17 == 0 {
+                        1
+                    } else {
+                        sample() as usize % n + 1
+                    };
+                    let b = if step % 17 == 0 {
+                        n
+                    } else {
+                        sample() as usize % n + 1
+                    };
+                    if step % 2 == 0 {
+                        std::sync::Arc::make_mut(&mut matrix.topology).row_exchange(a, b);
+                        for (row, _) in &mut positions {
+                            if *row == a {
+                                *row = b;
+                            } else if *row == b {
+                                *row = a;
+                            }
+                        }
+                        row_permutation.swap(a, b);
+                    } else {
+                        std::sync::Arc::make_mut(&mut matrix.topology).col_exchange(a, b);
+                        for (_, col) in &mut positions {
+                            if *col == a {
+                                *col = b;
+                            } else if *col == b {
+                                *col = a;
+                            }
+                        }
+                        col_permutation.swap(a, b);
+                    }
+                    assert_exchange_topology(
+                        &matrix.topology,
+                        n,
+                        &positions,
+                        &row_permutation,
+                        &col_permutation,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_element_and_empty_orthogonal_lists_exchange_without_losing_links() {
+        let mut matrix = Sparse::<f64>::new(2).unwrap();
+        let handle = matrix.get_element(1, 2).unwrap().0;
+        matrix.link_rows();
+        assert_eq!(matrix.topology.first_in_row[2], NONE);
+        assert_eq!(matrix.topology.first_in_col[1], NONE);
+        let topology = std::sync::Arc::make_mut(&mut matrix.topology);
+        topology.row_exchange(1, 2);
+        topology.col_exchange(1, 2);
+        topology.row_exchange(2, 2);
+        topology.col_exchange(1, 1);
+        assert_exchange_topology(topology, 2, &[(2, 1)], &[0, 2, 1], &[0, 2, 1]);
+        assert_eq!(topology.elements[handle].row, 2);
+        assert_eq!(topology.elements[handle].col, 1);
     }
 
     #[test]
@@ -2863,11 +4144,11 @@ mod tests {
                 Err(Status::InvalidPlan)
             ));
         }
-        assert!(ColumnRun::<u32>::new(0, 0, 0).is_none());
-        assert!(ColumnRun::<usize>::new(3, 2, 4).is_none());
+        assert!(AxisRun::<u32>::new(0, 0, 0).is_none());
+        assert!(AxisRun::<usize>::new(3, 2, 4).is_none());
         if let Ok(max) = usize::try_from(u64::from(u32::MAX) + 1) {
-            assert!(ColumnRun::<u32>::new(0, 0, max).is_none());
-            assert!(ColumnRun::<usize>::new(0, 0, max).is_some());
+            assert!(AxisRun::<u32>::new(0, 0, max).is_none());
+            assert!(AxisRun::<usize>::new(0, 0, max).is_some());
         }
     }
 
@@ -2949,6 +4230,256 @@ mod tests {
         assert_eq!(transposed[3], -17.);
     }
 
+    fn check_batch<T: Scalar>(matrix: &Sparse<T>, rhs: &[T], bits: impl Fn(T) -> [u64; 2]) {
+        let factor = matrix.factors().unwrap();
+        let n = matrix.ext_size;
+        let mut batch = SolveBatchWorkspace::default();
+        let mut out = Vec::new();
+        let mut scalar = Vec::new();
+        let mut expected = Vec::new();
+        let mut storage = None;
+        for transposed in [false, true] {
+            for count in [9, 0, 1, 2, 3, 4, 5, 8, 7, 9] {
+                let rhs = &rhs[..count * n];
+                factor
+                    .solve_batch_into(rhs, &mut batch, &mut out, transposed)
+                    .unwrap();
+                if let Some(storage) = storage {
+                    assert_eq!(batch.real.as_ptr(), storage);
+                } else {
+                    storage = Some(batch.real.as_ptr());
+                }
+                let mut checked = Vec::new();
+                for vector in rhs.chunks_exact(n) {
+                    factor
+                        .solve_into(vector, &mut scalar, &mut expected, transposed)
+                        .unwrap();
+                    checked.extend(expected.iter().copied().map(&bits));
+                }
+                assert_eq!(out.iter().copied().map(&bits).collect::<Vec<_>>(), checked);
+            }
+        }
+        assert!(
+            factor
+                .solve_batch_into(&rhs[..n + 1], &mut batch, &mut out, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn real_rhs_tiles_preserve_permutation_untranslated_signed_zero_and_range() {
+        let mut matrix = build(
+            6,
+            &[
+                (3, 1, 2.),
+                (1, 3, 4.),
+                (3, 3, 1.),
+                (3, 5, 0.25),
+                (5, 3, -0.5),
+                (5, 5, 3.),
+                (6, 6, 1e-200),
+            ],
+        );
+        matrix.mna_preorder();
+        assert!(matches!(
+            matrix.order_and_factor(1e-3, 0.),
+            Status::Okay | Status::SmallPivot
+        ));
+        let values = [
+            0.,
+            -0.,
+            1.,
+            -2.,
+            1e-200,
+            -1e100,
+            1e-100,
+            f64::MIN_POSITIVE,
+            1e100,
+        ];
+        let rhs: Vec<_> = (0_usize..9)
+            .flat_map(|lane| {
+                [
+                    values[lane],
+                    -0.,
+                    values[(lane + 1) % 9],
+                    values[lane],
+                    values[(lane + 2) % 9],
+                    values[(lane + 3) % 9],
+                ]
+            })
+            .collect();
+        check_batch(&matrix, &rhs, |value| [value.to_bits(), 0]);
+        // Invalid lanes cannot be silently ignored just because other RHS
+        // are finite and the tile is not full.
+        let mut invalid = rhs[..18].to_vec();
+        invalid[12] = f64::NAN;
+        let failure = matrix
+            .factors()
+            .unwrap()
+            .solve_batch_into(
+                &invalid,
+                &mut SolveBatchWorkspace::default(),
+                &mut Vec::new(),
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(failure.rhs_index, Some(2));
+    }
+
+    #[test]
+    fn batch_reports_overflowing_lane_and_recovers_workspace() {
+        let mut matrix = build(1, &[(1, 1, f64::MIN_POSITIVE)]);
+        assert!(matches!(
+            matrix.order_and_factor(1e-3, 0.),
+            Status::Okay | Status::SmallPivot
+        ));
+        let factor = matrix.factors().unwrap();
+        let mut work = SolveBatchWorkspace::default();
+        let mut output = Vec::new();
+        for transposed in [false, true] {
+            let failure = factor
+                .solve_batch_into(&[0., 1e300, 1., -0.], &mut work, &mut output, transposed)
+                .unwrap_err();
+            assert_eq!(failure.rhs_index, Some(1));
+            factor
+                .solve_batch_into(&[0., 1., 0.5, -0.], &mut work, &mut output, transposed)
+                .unwrap();
+            assert_eq!(output[1], 1. / f64::MIN_POSITIVE);
+            assert_eq!(output[3].to_bits(), (-0.0_f64).to_bits());
+        }
+    }
+
+    #[test]
+    fn complex_rhs_tiles_match_independent_solve_bits_at_exponent_limits() {
+        let mut matrix = Sparse::<Complex>::new(6).unwrap();
+        for (r, c, value) in [
+            (1, 3, Complex::new(2., -0.25)),
+            (3, 1, Complex::new(4., 0.5)),
+            (3, 3, Complex::new(1., -1.)),
+            (3, 5, Complex::new(0.125, -0.5)),
+            (5, 3, Complex::new(-0.25, 0.5)),
+            (5, 5, Complex::new(2., 3.)),
+            (6, 6, Complex::new(f64::MAX, f64::MAX)),
+        ] {
+            let entry = matrix.get_element(r, c).unwrap();
+            matrix.set(entry, value);
+        }
+        assert!(matches!(
+            matrix.order_and_factor(1e-3, 0.),
+            Status::Okay | Status::SmallPivot
+        ));
+        let values = [
+            0.,
+            -0.,
+            1.,
+            -2.,
+            1e-200,
+            -1e100,
+            1e-100,
+            f64::MIN_POSITIVE,
+            1e100,
+        ];
+        let rhs: Vec<_> = (0_usize..9)
+            .flat_map(|lane| {
+                let value = |offset: usize| {
+                    Complex::new(values[(lane + offset) % 9], values[(lane + offset + 1) % 9])
+                };
+                [
+                    value(0),
+                    Complex::new(-0., 0.),
+                    value(1),
+                    value(2),
+                    value(3),
+                    value(4),
+                ]
+            })
+            .collect();
+        check_batch(&matrix, &rhs, |z| [z.re.to_bits(), z.im.to_bits()]);
+    }
+
+    fn time_rhs_batches<T: Scalar>(matrix: &Sparse<T>, rhs: &[T], scalar: &str) {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let factor = matrix.factors().unwrap();
+        let n = matrix.ext_size;
+        let mut batch = SolveBatchWorkspace::default();
+        let mut work = Vec::new();
+        let mut single = Vec::new();
+        let mut before = Vec::with_capacity(rhs.len());
+        let mut after = Vec::with_capacity(rhs.len());
+        for transposed in [false, true] {
+            for count in [1, 2, 4, 8, 32, 64] {
+                let rhs = &rhs[..n * count];
+                let mut baseline = Vec::new();
+                let mut batched = Vec::new();
+                for _ in 0..5 {
+                    let start = Instant::now();
+                    for _ in 0..16 {
+                        before.clear();
+                        for row in black_box(rhs).chunks_exact(n) {
+                            factor
+                                .solve_into(row, &mut work, &mut single, transposed)
+                                .unwrap();
+                            before.extend_from_slice(&single);
+                        }
+                        black_box(&before);
+                    }
+                    baseline.push(start.elapsed());
+                    let start = Instant::now();
+                    for _ in 0..16 {
+                        factor
+                            .solve_batch_into(black_box(rhs), &mut batch, &mut after, transposed)
+                            .unwrap();
+                        black_box(&after);
+                    }
+                    batched.push(start.elapsed());
+                    assert_eq!(before, after);
+                }
+                baseline.sort_unstable();
+                batched.sort_unstable();
+                println!(
+                    "scalar={scalar} transpose={transposed} rhs={count} independent_ns={} batch_ns={}",
+                    baseline[2].as_nanos(),
+                    batched[2].as_nanos()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in sparse multiple RHS kernel benchmark"]
+    fn sparse_rhs_batch_benchmark() {
+        let n = 512;
+        let mut real = Sparse::<f64>::new(n).unwrap();
+        let mut complex = Sparse::<Complex>::new(n).unwrap();
+        for row in 1..=n {
+            for (col, value) in [
+                (row, 5.),
+                (row.saturating_sub(1), -0.75),
+                (row + 1, -0.5),
+                (row.saturating_sub(16), -0.125),
+                (row + 16, -0.25),
+            ] {
+                if !(1..=n).contains(&col) {
+                    continue;
+                }
+                let h = real.get_element(row, col).unwrap();
+                real.set(h, value);
+                let h = complex.get_element(row, col).unwrap();
+                complex.set(h, Complex::new(value, value * 0.25));
+            }
+        }
+        assert_eq!(real.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(complex.order_and_factor(1e-3, 0.), Status::Okay);
+        let rhs: Vec<_> = (0..n * 64)
+            .map(|i| f64::from(u32::try_from((i * 13 + 7) % 127).unwrap()) / 64. - 1.)
+            .collect();
+        let imaginary: Vec<_> = rhs.iter().map(|&v| Complex::new(v, 0.25 - v)).collect();
+        time_rhs_batches(&real, &rhs, "real");
+        time_rhs_batches(&complex, &imaginary, "complex");
+    }
+
     #[test]
     fn extreme_complex_reciprocals_and_invalid_factor_recovery() {
         let mut c = Sparse::<Complex>::new(1).unwrap();
@@ -3019,19 +4550,24 @@ mod tests {
 
     #[test]
     fn determinant_rescales_extreme_pivots_without_nonfinite_loops() {
-        for (a, b, expected) in [(1e307, 1e308, 615), (1e-307, 1e-308, -615)] {
+        for (a, b) in [(1e307, 1e308), (1e-307, 1e-308)] {
             let mut m = build(2, &[(1, 1, a), (2, 2, b)]);
             assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
             let (mantissa, exponent) = m.factors().unwrap().determinant().unwrap();
-            assert!((mantissa * 10_f64.powi(exponent - expected) - 1.).abs() < 1e-12);
+            let (am, ae) = normalize_binary(a).unwrap();
+            let (bm, be) = normalize_binary(b).unwrap();
+            let shift = i32::try_from(exponent - i64::from(ae + be)).unwrap();
+            assert!((mantissa * 2_f64.powi(shift) / (am * bm) - 1.).abs() < 1e-14);
         }
-        let mut m = build(1, &[(1, 1, f64::from_bits(1))]);
-        assert_eq!(m.order_and_factor(1e-3, 0.), Status::NonFinite);
-        assert!(!m.is_factored());
-        assert!(
-            m.factors().is_err(),
-            "inverse pivot overflow must be explicit"
-        );
+        let tiny = f64::from_bits(1);
+        let mut m = build(1, &[(1, 1, tiny)]);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(m.factors().unwrap().determinant().unwrap(), (1., -1074));
+        assert_eq!(m.solve(&[tiny]), [1.]);
+        assert_eq!(m.solve_transposed(&[tiny]), [1.]);
+        m.reload_originals(&[tiny * 2.]);
+        assert_eq!(m.factor(), Status::Okay);
+        assert_eq!(m.solve(&[tiny]), [0.5]);
 
         let mut m = Sparse::<Complex>::new(2).unwrap();
         for i in 1..=2 {
@@ -3040,9 +4576,66 @@ mod tests {
         }
         assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
         let (mantissa, exponent) = m.factors().unwrap().determinant().unwrap();
-        let imag = mantissa.im * 10_f64.powi(exponent - 614);
-        assert!((imag - 2.).abs() < 1e-12);
-        assert!((mantissa.re * 10_f64.powi(exponent - 614)).abs() < 1e-12);
+        let (m, e) = normalize_binary(1e307).unwrap();
+        let shift = i32::try_from(exponent - 2 * i64::from(e)).unwrap();
+        let imag = mantissa.im * 2_f64.powi(shift);
+        assert!((imag / (m * m) - 2.).abs() < 1e-14);
+        assert!(mantissa.re.abs() < 1e-14);
+    }
+
+    #[test]
+    fn raw_factors_do_not_require_representable_normalized_entries() {
+        use crate::primitives::numeric::scale_power;
+        let tiny = scale_power(1., -1000);
+        let large = scale_power(1., 1000);
+        // Retain the same diagonal order as the well-scaled factorization.
+        // U12/D11 is 2^2000 or 2^-2000, but the Schur entry and solution
+        // are finite. Check both fresh ordering and numerical refactor.
+        let mut m = build(2, &[(1, 1, 2.), (1, 2, 1.), (2, 1, 1.), (2, 2, 2.)]);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        let c = |x| Complex::new(x, x);
+        let mut complex = Sparse::from_originals(
+            2,
+            [(1, 1, c(2.)), (1, 2, c(1.)), (2, 1, c(1.)), (2, 2, c(2.))],
+        )
+        .unwrap();
+        assert_eq!(complex.order_and_factor(1e-3, 0.), Status::Okay);
+        for (a, b) in [(tiny, large), (large, tiny), (-tiny, large), (-large, tiny)] {
+            m.reload_originals(&[a, b, a, b * 2.]);
+            assert_eq!(m.factor(), Status::Okay);
+            assert_eq!(m.solve(&[b, b * 2.]), [0., 1.]);
+            assert_eq!(m.solve_transposed(&[a, b * 2.]), [0., 1.]);
+            let mut fresh = build(2, &[(1, 1, a), (1, 2, b), (2, 1, a), (2, 2, b * 2.)]);
+            assert_eq!(fresh.order_and_factor(1e-3, 0.), Status::Okay);
+            assert_eq!(fresh.solve(&[b, b * 2.]), [0., 1.]);
+
+            complex.reload_originals(&[c(a), c(b), c(a), c(b * 2.)]);
+            assert_eq!(complex.factor(), Status::Okay);
+            assert_eq!(
+                complex.solve(&[c(b), c(b * 2.)]),
+                [Complex::ZERO, Complex::real(1.)]
+            );
+            assert_eq!(
+                complex.solve_transposed(&[c(a), c(b * 2.)]),
+                [Complex::ZERO, Complex::real(1.)]
+            );
+            let mut fresh = Sparse::from_originals(
+                2,
+                [(1, 1, c(a)), (1, 2, c(b)), (2, 1, c(a)), (2, 2, c(b * 2.))],
+            )
+            .unwrap();
+            assert_eq!(fresh.order_and_factor(1e-3, 0.), Status::Okay);
+            assert_eq!(
+                fresh.solve(&[c(b), c(b * 2.)]),
+                [Complex::ZERO, Complex::real(1.)]
+            );
+        }
+
+        let smallest = c(f64::from_bits(1));
+        let mut m = Sparse::from_originals(1, [(1, 1, smallest)]).unwrap();
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        assert_eq!(m.solve(&[smallest]), [Complex::real(1.)]);
+        assert_eq!(m.solve_transposed(&[smallest]), [Complex::real(1.)]);
     }
 
     #[test]
@@ -3143,18 +4736,32 @@ mod tests {
                 col.push((e, m.topology.elements[e].row));
                 e = m.topology.elements[e].next_in_col;
             }
-            assert!(runs.column(i).iter().map(|entry| entry.indices()).eq(col));
+            assert!(
+                runs.columns
+                    .all(i)
+                    .iter()
+                    .map(|entry| entry.indices())
+                    .eq(col)
+            );
             let mut row = Vec::new();
-            let mut e = m.topology.elements[m.topology.diag[i]].next_in_row;
+            let mut e = m.topology.first_in_row[i];
             while e != NONE {
                 row.push((e, m.topology.elements[e].col));
                 e = m.topology.elements[e].next_in_row;
             }
             assert!(
-                runs.upper_row(i)
+                runs.rows
+                    .after_diagonal(i)
                     .iter()
                     .map(|entry| entry.indices())
-                    .eq(row)
+                    .eq(row.iter().copied().filter(|&(_, col)| col > i))
+            );
+            assert!(
+                runs.rows
+                    .before_diagonal(i)
+                    .iter()
+                    .map(|entry| entry.indices())
+                    .eq(row.iter().copied().filter(|&(_, col)| col < i))
             );
         }
         let rhs = [5., 6., 7., 8.];
@@ -3176,7 +4783,7 @@ mod tests {
     #[test]
     fn compact_and_wide_runs_preserve_factor_and_solve_bits() {
         assert_eq!(std::mem::size_of::<RunEntry<u32>>(), 8);
-        assert_eq!(std::mem::size_of::<ColumnRun<u32>>(), 12);
+        assert_eq!(std::mem::size_of::<AxisRun<u32>>(), 12);
         let entries = [
             (1, 1, 4.),
             (1, 2, 1.),
@@ -3239,6 +4846,33 @@ mod tests {
     }
 
     #[test]
+    fn original_handles_added_after_fill_keep_storage_attribution() {
+        let entries = (1..=6).flat_map(|i| {
+            let next = i % 6 + 1;
+            [(i, i, 4.), (i, next, -1.), (next, i, -1.)]
+        });
+        let mut frame = Sparse::from_originals(6, entries).unwrap();
+        assert_eq!(frame.order_and_factor(1e-3, 0.), Status::Okay);
+        let initial = frame.storage();
+        assert_eq!(initial.original_entries, 18);
+        assert_eq!(initial.fill_entries(), 6);
+        frame.clear();
+        let (row, col) = (1..=6)
+            .flat_map(|row| (1..=6).map(move |col| (row, col)))
+            .find(|&(row, col)| {
+                let r = frame.topology.ext_to_int_row[row];
+                let c = frame.topology.ext_to_int_col[col];
+                frame.topology.locate_in_col(Slot::Head(c), r).1 == NONE
+            })
+            .unwrap();
+        frame.get_element(row, col).unwrap();
+        let extended = frame.storage();
+        assert_eq!(extended.original_entries, initial.original_entries + 1);
+        assert_eq!(extended.factor_entries, initial.factor_entries + 1);
+        assert_eq!(extended.fill_entries(), initial.fill_entries());
+    }
+
+    #[test]
     fn failed_reorder_cannot_publish_a_partial_traversal() {
         let entries = [
             (1, 1, 4.),
@@ -3274,6 +4908,10 @@ mod tests {
         threshold.reload_originals(&input);
         assert_eq!(threshold.order_and_factor(0., 0.), Status::Okay);
         assert_eq!(a.factor(), Status::Okay);
+        let work = a.last_attempt();
+        assert_eq!(work.order_attempts, 1);
+        assert_eq!(work.fixed_refactors, 0);
+        assert_eq!(work.successful_factors, 1);
         assert_eq!(a.topology.int_to_ext_row, threshold.topology.int_to_ext_row);
         assert_eq!(a.topology.int_to_ext_col, threshold.topology.int_to_ext_col);
         assert_eq!(a.values, threshold.values);
@@ -3622,7 +5260,7 @@ mod tests {
         assert!((2.0 * x[0] + x[2] - 3.0).abs() < 1e-15 && (x[0] + 4.0 * x[2] - 5.0).abs() < 1e-15);
         assert_eq!(m.solve_transposed(&[3.0, -1.0, 5.0])[1], -1.0);
         let (mantissa, exponent) = m.factors().unwrap().determinant().unwrap();
-        assert!((mantissa * 10f64.powi(exponent) - 7.0).abs() < 1e-12);
+        assert!((mantissa * 2f64.powi(i32::try_from(exponent).unwrap()) - 7.0).abs() < 1e-12);
     }
 
     /// No element passes the absolute threshold, so `SearchEntireMatrix`
@@ -3639,13 +5277,165 @@ mod tests {
     }
 
     #[test]
+    fn normalized_gather_guard_is_lane_local() {
+        let numerators = [6., 3., -0., f64::MIN_POSITIVE];
+        let solutions = [1., 1., 0., 0.];
+        let mut tile = RealGatherRow::new(f64x4::from_array(numerators), 0.5);
+        tile.subtract(3., 0.5, f64x4::from_array(solutions));
+        let (values, valid) = tile.finish();
+        assert_eq!(valid.to_array(), [true, false, true, false]);
+        for i in 0..4 {
+            let mut row = RealGatherRow::new(numerators[i], 0.5);
+            row.subtract(3., 0.5, solutions[i]);
+            let (value, scalar_valid) = row.finish();
+            assert_eq!(valid.test(i), scalar_valid);
+            assert_eq!(values[i].to_bits(), value.to_bits());
+        }
+        let mut row = RealGatherRow::new(1., 2.);
+        row.subtract(f64::MAX, 2., 0.5);
+        assert!(!row.finish().1);
+        let mut row = RealGatherRow::new(1., 0.5);
+        row.subtract(f64::MIN_POSITIVE, 0.5, 1.);
+        assert!(!row.finish().1);
+    }
+
+    #[test]
+    fn substitution_uses_raw_rhs_ratios_in_both_triangular_directions() {
+        // Exact solution is (1/3, 0), although 1/3 is not representable.
+        // A more accurate subtraction of 5 - 15*rounded(1/3) would
+        // expose a false residual. Preserve the actual RHS relation.
+        for (row, col) in [(2, 1), (1, 2)] {
+            let mut m = build(2, &[(1, 1, 3.), (2, 2, 2.), (row, col, 15.)]);
+            assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+            let solve = |rhs: &[f64]| {
+                if row == 2 {
+                    m.solve(rhs)
+                } else {
+                    m.solve_transposed(rhs)
+                }
+            };
+            assert_eq!(solve(&[1., 5.]), [1. / 3., 0.]);
+            let perturbed = 5.0_f64.next_up();
+            assert_eq!(solve(&[1., perturbed]), [1. / 3., (perturbed - 5.) / 2.]);
+            let rhs = [
+                1., 5., 1., perturbed, -1., -5., 0., -0., 2., 10., -2., -10., 1., 4., -1., -4., 2.,
+                9.,
+            ];
+            check_batch(&m, &rhs, |value| [value.to_bits(), 0]);
+        }
+        for (row, col) in [(1, 2), (2, 1)] {
+            let mut m = build(2, &[(1, 1, 2.), (2, 2, 3.), (row, col, 15.)]);
+            assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+            let solve = |rhs: &[f64]| {
+                if row == 1 {
+                    m.solve(rhs)
+                } else {
+                    m.solve_transposed(rhs)
+                }
+            };
+            assert_eq!(solve(&[5., 1.]), [0., 1. / 3.]);
+            let perturbed = 5.0_f64.next_up();
+            assert_eq!(solve(&[perturbed, 1.]), [(perturbed - 5.) / 2., 1. / 3.]);
+            let rhs = [
+                5., 1., perturbed, 1., 7., 2., -0., 0., -5., -1., 10., 2., -7., -2., 1., 1., 5., 2.,
+            ];
+            check_batch(&m, &rhs, |value| [value.to_bits(), 0]);
+        }
+        let pivot = Complex::new(3., 7.);
+        let rhs = Complex::new(1., 2.);
+        let lower = pivot * Complex::real(5.);
+        for (row, col) in [(2, 1), (1, 2)] {
+            let mut m = Sparse::from_originals(
+                2,
+                [(1, 1, pivot), (2, 2, Complex::real(2.)), (row, col, lower)],
+            )
+            .unwrap();
+            assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+            let b = [rhs, rhs * Complex::real(5.)];
+            let x = if row == 2 {
+                m.solve(&b)
+            } else {
+                m.solve_transposed(&b)
+            };
+            assert!((x[0] - rhs / pivot).magnitude() < 1e-15);
+            assert_eq!(x[1], Complex::ZERO);
+        }
+    }
+
+    #[test]
+    fn proportional_rows_do_not_acquire_spurious_pivots() {
+        for x in 1..=100 {
+            for y in 1..=100 {
+                for z in 1..=7 {
+                    let (x, y, z) = (f64::from(x), f64::from(y), f64::from(z));
+                    let entries = [(1, 1, x), (1, 2, y), (2, 1, z * x), (2, 2, z * y)];
+                    let mut m = build(2, &entries);
+                    assert_eq!(
+                        m.order_and_factor(1e-3, 0.),
+                        Status::Singular,
+                        "{entries:?}"
+                    );
+                }
+            }
+        }
+        let entries = [(1, 1, 3.), (1, 2, 7.), (2, 1, 9.), (2, 2, 22.)];
+        let mut m = build(2, &entries);
+        assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+        m.reload_originals(&[3., 7., 9., 21.]);
+        assert_eq!(m.factor(), Status::ZeroDiag);
+        m.reload_originals(&[3., 7., 9., 21.0_f64.next_up()]);
+        assert_eq!(m.factor(), Status::Okay);
+        let (mantissa, exponent) = m.factors().unwrap().determinant().unwrap();
+        let expected = 3. * (21.0_f64.next_up() - 21.);
+        let actual =
+            crate::primitives::numeric::scale_power(mantissa, i32::try_from(exponent).unwrap());
+        assert!((actual / expected - 1.).abs() < 1e-14);
+    }
+
+    #[test]
+    fn complex_proportional_rows_and_nearby_nonsingular_rows() {
+        for a in [
+            Complex::new(3., 7.),
+            Complex::new(7., -3.),
+            Complex::new(1., 0.),
+        ] {
+            for b in [Complex::new(-5., 11.), Complex::new(13., 17.)] {
+                for ratio in [
+                    Complex::new(3., -2.),
+                    Complex::new(0., 7.),
+                    Complex::real(5.),
+                ] {
+                    let c = a * ratio;
+                    let d = b * ratio;
+                    let entries = [(1, 1, a), (1, 2, b), (2, 1, c), (2, 2, d)];
+                    let mut m = Sparse::from_originals(2, entries).unwrap();
+                    assert_eq!(
+                        m.order_and_factor(1e-3, 0.),
+                        Status::Singular,
+                        "{entries:?}"
+                    );
+                    let different = Complex::new(d.re.next_up(), d.im);
+                    let mut m = Sparse::from_originals(
+                        2,
+                        [(1, 1, a), (1, 2, b), (2, 1, c), (2, 2, different)],
+                    )
+                    .unwrap();
+                    assert_eq!(m.order_and_factor(1e-3, 0.), Status::Okay);
+                    m.reload_originals(&[a, b, c, d]);
+                    assert_eq!(m.factor(), Status::ZeroDiag);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn singular_and_determinant() {
         let mut m = build(2, &[(1, 1, 1.0), (1, 2, 2.0), (2, 1, 2.0), (2, 2, 4.0)]);
         assert_eq!(m.order_and_factor(1e-3, 0.0), Status::Singular);
         let mut m = build(2, &[(1, 1, 3.0), (1, 2, 1.0), (2, 1, 2.0), (2, 2, 4.0)]);
         assert_eq!(m.order_and_factor(1e-3, 0.0), Status::Okay);
         let (mantissa, exponent) = m.factors().unwrap().determinant().unwrap();
-        assert!((mantissa * 10f64.powi(exponent) - 10.0).abs() < 1e-12);
+        assert!((mantissa * 2f64.powi(i32::try_from(exponent).unwrap()) - 10.0).abs() < 1e-12);
     }
 
     #[test]

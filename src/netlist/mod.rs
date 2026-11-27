@@ -50,7 +50,7 @@ pub use parser::{
 pub use semantic::{semantic_diff, semantic_eq};
 pub use source::{Deck, LogicalLine, PhysicalLine, load};
 pub use token::{Token, TokenKind, tokenize};
-pub use writer::write_netlist;
+pub use writer::{WriteLimits, write_netlist, write_netlist_to};
 
 /// The C reference for the whole front end, used in `NotYetPorted` errors.
 pub const C_REFERENCE: &str =

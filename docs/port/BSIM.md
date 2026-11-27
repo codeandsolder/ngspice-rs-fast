@@ -19,8 +19,9 @@ parameters), `.ac`, `.noise`, `.pz`, `.tf`, `.disto` (BSIM4 has no `DEVdisto`,
 so it is linear there, as in C) and `.tran`, in every `capMod`, `mobMod`,
 `rdsMod`, `rgateMod`, `rbodyMod`, `igcMod`/`igbMod`, `tempMod`, `mtrlMod`,
 `gidlMod`, `dioMod`, `tnoiMod`/`fnoiMod` and NQS (`trnqsMod`/`acnqsMod`)
-selection, bit-identical to an FMA-free build of the reference C (see
-[BSIM4](#bsim4) below), and DC/AC `.sens` (`sens.rs`, see
+selection, checked against the FMA-free reference C and independent physical
+accuracy tests (original bit parity is not a constraint on numerical fixes;
+see [BSIM4](#bsim4) below), and DC/AC `.sens` (`sens.rs`, see
 [SENSITIVITY.md](SENSITIVITY.md)). The B3-0/B4-0
 physical-unit audit of `Parameter::input_unit` is still partial.
 
@@ -276,7 +277,7 @@ the other BSIM families are unchanged.
 | B3-4 small signal / noise | done for `.dc`, `.ac`, `.pz`, `.tf`, `.noise` and `.disto` (linear, as C); `.sens` refused |
 | B3-5 goldens and binning coverage | done: `m11_bsim3_{op,dc,ac,tran}` and `m11_bsim4_{op,dc,ac,pz,noise,tran,bin_dc}` under `xtask golden verify` (binning end to end in `m11_bsim4_bin_dc`) |
 | B4-0 tables/schema | done |
-| B4-1..B4-4 BSIM4 setup, temperature, checks, load, small signal, noise, pole-zero | done, bit-exact against the FMA-free C oracle ([BSIM4](#bsim4)) |
+| B4-1..B4-4 BSIM4 setup, temperature, checks, load, small signal, noise, pole-zero | done; FMA-free C reference coverage and targeted physical numerics ([BSIM4](#bsim4)) |
 | B4 `.sens` | done (DC and AC), bit-exact on every deck C completes; see [SENSITIVITY.md](SENSITIVITY.md) |
 
 ### Next: what remains
@@ -300,10 +301,104 @@ the other BSIM families are unchanged.
 
 ## BSIM4
 
+### AC/NQS numerical accuracy (#89)
+
+The AC kernel does not inherit all rounding choices of the C translation as
+requirements. In `acld.rs`, 36 algebraic product/sum sites use explicit
+fused multiply-add, primarily combining current and capacitive conductance
+stamps. At high dynamic range the AC NQS transfer function is evaluated as
+
+`Re = r²/(1+r²), Im = r/(1+r²)` with `r = 1/(ωτ)` when `|ωτ| > 1`; the
+original low-frequency `Re = 1/(1+x²), Im = x/(1+x²)` form remains for
+`|x| ≤ 1`. For the overflow of a product of two *finite* inputs, `Im` is
+computed as `(1/ω)/τ`. This avoids squaring overflow for `|ωτ| > ~1e154`,
+which previously changed a physically representable quadrature tail to zero.
+The capacitance-to-real-conductance contribution computes `ω Im` before
+multiplying the small capacitance, avoiding premature underflow. Invalid
+nonfinite input physics still propagates IEEE nonfinites.
+
+Acceptance tests cover the NQS transfer over 0–1e250, finite-input product
+overflow, signed quadrature, conservation of a high-frequency device column,
+all AC stamp shapes, nonlinear BSIM4 integration, and the committed C reference
+fixtures. The C oracle remains valuable for equation/ordering checks, but
+bitwise identity of its intermediate rounded expressions is no longer an
+accuracy target. Other BSIM4 stages (geometry, temperature, nonlinear charge,
+convergence and noise) remain separately audited under #89.
+
+A 34-site FMA scalar-loop microbenchmark on Acer measured 12.82 ns/FMA vs
+4.15 ns/unfused operation for generic `x86-64`, and 5.82 ns/FMA vs 4.29 ns
+unfused with `target-cpu=native` (five-run median; includes black-boxed
+operands, so these are not complete-device timings). The generic-target
+software fallback has a measurable cost; the real device comparison must
+include the full AC kernel and its source-level numerical error. We retain
+FMA where its extra accuracy is meaningful, rather than assuming generic
+throughput is unchanged.
+
+The four existing `tests/bsim4_device.rs` OP/DC/temperature C-oracle
+comparisons that exceed their pre-existing 1e-9 relative bound also fail on
+an unchanged base commit; their separate diagnosis is tracked in
+[issue #154](https://github.com/codeandsolder/ngspice-rs-fast/issues/154).
+The AC/NQS changes do not execute in those cases and must not be used to
+justify altering the established reference tolerances.
+
+
+### BSIM4 noise trap-density conditioning (#89)
+
+The flicker-noise kernel (`noise.rs`) removes its blanket
+`clippy::suboptimal_flops` suppression (16 reviewed FMA sites) and now
+retains physically measurable carrier depletion even if the factor
+`1 - Vdseff*AbovVgst2Vtm` rounds to exactly one. The trap density
+change is evaluated as `N0 * depletion` while depletion is small, rather
+than subtracting two independently rounded large densities. This value
+feeds both the B term and the factored quadratic C term
+`(N0 - Nl) * (N0 + Nl) / 2`, avoiding cancellation in `N0² - Nl²`.
+The A logarithmic term uses `ln1p(density_drop/(Nl+nstar))` over the
+positive finite physical domain, falling back to the original clamped
+formula for invalid or boundary values. The correlated thermal-noise
+branch likewise uses its direct depletion product instead of
+`1 - (1 - depletion)`, which would lose sub-ULP signal. No threshold
+or temperature/state selector was altered.
+
+The regression uses the actual flicker-noise model with charge depletion
+`2^-55`, at which both old `N0 - Nl` and old `N0² - Nl²` are zero after
+binary64 rounding, and verifies the logarithmic A and quadratic C
+noise-density components against independent analytic expressions. Pinned
+C full-noise goldens and all noise-mode integration tests provide the
+normal-domain guard; the tiny-gradient result intentionally improves
+on C's lost precision.
+
+### Pole-zero NQS charge-partition accuracy (#89)
+
+The PZ kernel (`pzld.rs`) no longer suppresses 40 FMA opportunities,
+including six cancellation-sensitive drain/source charge-partition
+Jacobian derivatives. These are evaluated as an algebraic fused product
+plus the direct capacitance rather than a rounded product followed by
+subtraction. The branch at `abs(qcheq) <= 1e-5*CoxWL` remains unchanged:
+it is a physical model threshold, not a rounding artifact. The test
+`pz_nqs_partition_derivative_retains_sub_ulp_cancellation` assembles an
+actual `A+sE` PZ matrix whose analytic drain partition derivative is
+exactly `2^-55`; un-fused multiplication rounds it away, while FMA
+retains the derivative and equal-and-opposite source stamp (KCL).
+The same branch uses C's NQS setup, state, mode and charge-node ordering.
+
+### Geometry/perimeter accuracy (#89)
+
+`geo.rs` removes another 28 blanket-fused-arithmetic suppressions in effective
+source/drain perimeters and areas. For positive finite interior/end diffusion
+resistances the equivalent parallel resistance now uses
+`min(Rint,Rend) / (1 + min(Rint,Rend)/max(Rint,Rend))`; the older
+`Rint*Rend/(Rint+Rend)` overflowed for both ~1e200 Ω legs and underflowed
+for both ~1e-200 Ω legs, despite finite true resistance. The original
+nonfinite-input propagation and warning behavior is retained. Geometry unit
+tests include the analytic three-finger `Rsh/3` law from `Rsh=1e-200` to
+`Rsh≈9e307`. Pinned C goldens pass for `m11_bsim4_bin_dc` (13 points),
+`m11_bsim4_dc` (39 points), and `m11_bsim4_op` (1 point).
+
 ### How it is ported
 
 Unlike BSIM3 (a free reimplementation), BSIM4 is **translated statement by
-statement** from `bsim4/` so that its arithmetic is C's: the BSIM4 sources
+statement** from `bsim4/` for inspectable equation provenance; targeted
+accuracy-first arithmetic changes are documented below. The BSIM4 sources
 are licensed under the Educational Community License 2.0 with Berkeley's
 terms of use, which allow modified redistribution with attribution (see
 `NOTICE` and `LICENSE-ECL-2.0`). The translation keeps C's struct members:

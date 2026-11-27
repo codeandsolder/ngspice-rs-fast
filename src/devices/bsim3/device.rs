@@ -3,8 +3,6 @@
 //! Conditional drain/source primes implement external sheet resistance.
 //! ACM geometry, NQS and unsupported analysis combinations are refused
 //! explicitly rather than silently producing incomplete stamps.
-// C-compatible numerical expressions are kept in their reference order:
-// Clippy's fused multiply-add suggestions change IEEE-754 rounding.
 #![expect(
     clippy::similar_names,
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
@@ -21,10 +19,6 @@
     clippy::many_single_char_names,
     reason = "physical-model equation symbols are kept consistent with the ngspice C reference"
 )]
-#![expect(
-    clippy::suboptimal_flops,
-    reason = "SPICE numerical reference parity requires the original non-fused C operation order"
-)]
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,6 +28,7 @@ use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use super::{Inputs, ModelParameters, Value, charges, dc};
+use crate::devices::limiting::{fetlim, limvds, pnjlim};
 use crate::devices::models::{ModelContext, PreparationKey, ResolvedModel};
 use crate::devices::nonlinear::{JunctionPoint, junction_companion};
 use crate::devices::state::{DeviceState, IterationPhase};
@@ -326,7 +321,7 @@ impl Bsim3 {
                     [0.; 3]
                 } else if scaled.iter().all(|v| *v == 0.) {
                     // `b3ld.c`: Vbs=0, Vgs=type*Vth0+0.1, Vds=0.1.
-                    [0., polarity * cached.setup.vth0 + 0.1, 0.1]
+                    [0., polarity.mul_add(cached.setup.vth0, 0.1), 0.1]
                 } else {
                     scaled
                 };
@@ -423,102 +418,24 @@ fn limit(raw: [Real; 3], old: [Real; 3], von: Real, cached: &Cached) -> ([Real; 
         vgs = limited_vgd + limited_vds;
     }
     let vbs = if vds >= 0. {
-        let (limited, changed) = pnjlim(vbs_in, old_vbs, CONST_VT0, vcrit);
-        check |= changed;
-        limited
+        let result = pnjlim(vbs_in, old_vbs, CONST_VT0, vcrit);
+        check |= result.limited;
+        result.value
     } else {
         let vbd_in = vbs_in - vds_in;
-        let (limited, changed) = pnjlim(vbd_in, vbs_in - old_vds, CONST_VT0, vcrit);
-        check |= changed;
-        limited + vds
+        let result = pnjlim(vbd_in, vbs_in - old_vds, CONST_VT0, vcrit);
+        check |= result.limited;
+        result.value + vds
     };
     ([vbs, vgs, vds], check)
 }
 
-/// `devsup.c::DEVfetlim`.
-fn fetlim(vnew: Real, vold: Real, vto: Real) -> Real {
-    let vtsthi = (2. * (vold - vto)).abs() + 2.;
-    let vtstlo = (vold - vto).abs() + 1.;
-    let vtox = vto + 3.5;
-    let delv = vnew - vold;
-    if vold >= vto {
-        if vold >= vtox {
-            if delv <= 0. {
-                if vnew >= vtox {
-                    if -delv > vtstlo { vold - vtstlo } else { vnew }
-                } else {
-                    vnew.max(vto + 2.)
-                }
-            } else if delv >= vtsthi {
-                vold + vtsthi
-            } else {
-                vnew
-            }
-        } else if delv <= 0. {
-            vnew.max(vto - 0.5)
-        } else {
-            vnew.min(vto + 4.)
-        }
-    } else if delv <= 0. {
-        if -delv > vtsthi { vold - vtsthi } else { vnew }
-    } else {
-        let vtemp = vto + 0.5;
-        if vnew <= vtemp {
-            if delv > vtstlo { vold + vtstlo } else { vnew }
-        } else {
-            vtemp
-        }
-    }
-}
-
-/// `devsup.c::DEVlimvds`.
-fn limvds(vnew: Real, vold: Real) -> Real {
-    if vold >= 3.5 {
-        if vnew > vold {
-            vnew.min(3. * vold + 2.)
-        } else if vnew < 3.5 {
-            vnew.max(2.)
-        } else {
-            vnew
-        }
-    } else if vnew > vold {
-        vnew.min(4.)
-    } else {
-        vnew.max(-0.5)
-    }
-}
-
-/// `devsup.c::DEVpnjlim`, returning the limited voltage and C's `icheck`.
-fn pnjlim(vnew: Real, vold: Real, vt: Real, vcrit: Real) -> (Real, bool) {
-    if vnew > vcrit && (vnew - vold).abs() > vt + vt {
-        let value = if vold > 0. {
-            let arg = (vnew - vold) / vt;
-            if arg > 0. {
-                vold + vt * (2. + (arg - 2.).ln())
-            } else {
-                vold - vt * (2. + (2. - arg).ln())
-            }
-        } else {
-            vt * (vnew / vt).ln()
-        };
-        (value, true)
-    } else if vnew < 0. {
-        let arg = if vold > 0. {
-            -vold - 1.
-        } else {
-            2. * vold - 1.
-        };
-        if vnew < arg {
-            (arg, true)
-        } else {
-            (vnew, false)
-        }
-    } else {
-        (vnew, false)
-    }
-}
-
 impl Device for Bsim3 {
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.ensure(context.temperature, context.nominal_temperature)
+            .map(|_| ())
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -612,30 +529,64 @@ impl Device for Bsim3 {
         let mut cd = at(slot::CD) - at(slot::CBD);
         let cdhat = if forward {
             cd += csub;
-            cd - gbd * delvbd
-                + (gmbs + gbbs) * delvbs
-                + (gm + gbgs) * delvgs
-                + (gds + gbds) * delvds
+            f64::mul_add(
+                gds + gbds,
+                delvds,
+                f64::mul_add(
+                    gm + gbgs,
+                    delvgs,
+                    f64::mul_add(gmbs + gbbs, delvbs, f64::mul_add(gbd, -delvbd, cd)),
+                ),
+            )
         } else {
-            cd + (gmbs - gbd) * delvbd + gm * delvgd - gds * delvds
+            f64::mul_add(
+                gds,
+                -delvds,
+                f64::mul_add(gm, delvgd, f64::mul_add(gmbs - gbd, delvbd, cd)),
+            )
         };
         let fix = context.phase == crate::devices::IterationPhase::Fix;
         if !self.off || !fix {
             let max = |a: Real, b: Real| if a > b { a } else { b };
-            let tol = context.reltol * max(cdhat.abs(), cd.abs()) + context.abstol;
+            let tol = context
+                .reltol
+                .mul_add(max(cdhat.abs(), cd.abs()), context.abstol);
             if (cdhat - cd).abs() >= tol {
                 return Ok(true);
             }
             let (cbs, cbd) = (at(slot::CBS), at(slot::CBD));
             let cbhat = if forward {
-                cbs + cbd - csub + gbd * delvbd + (gbs - gbbs) * delvbs
-                    - gbgs * delvgs
-                    - gbds * delvds
+                f64::mul_add(
+                    gbds,
+                    -delvds,
+                    f64::mul_add(
+                        gbgs,
+                        -delvgs,
+                        f64::mul_add(
+                            gbs - gbbs,
+                            delvbs,
+                            f64::mul_add(gbd, delvbd, cbs + cbd - csub),
+                        ),
+                    ),
+                )
             } else {
-                cbs + cbd - csub + gbs * delvbs + (gbd - gbbs) * delvbd - gbgs * delvgd
-                    + gbds * delvds
+                f64::mul_add(
+                    gbds,
+                    delvds,
+                    f64::mul_add(
+                        gbgs,
+                        -delvgd,
+                        f64::mul_add(
+                            gbd - gbbs,
+                            delvbd,
+                            f64::mul_add(gbs, delvbs, cbs + cbd - csub),
+                        ),
+                    ),
+                )
             };
-            let tol = context.reltol * max(cbhat.abs(), (cbs + cbd - csub).abs()) + context.abstol;
+            let tol = context
+                .reltol
+                .mul_add(max(cbhat.abs(), (cbs + cbd - csub).abs()), context.abstol);
             if (cbhat - (cbs + cbd - csub)).abs() > tol {
                 return Ok(true);
             }
@@ -712,22 +663,44 @@ impl Device for Bsim3 {
         } = conductance_parts(&e);
         let (cdreq, ceqbs, ceqbd) = if e.mode >= 0 {
             (
-                pol * (e.ids - e.gds * vds - e.gm * vgs - e.gmbs * vbs),
+                pol * f64::mul_add(
+                    e.gmbs,
+                    -vbs,
+                    f64::mul_add(e.gm, -vgs, f64::mul_add(e.gds, -vds, e.ids)),
+                ),
                 0.,
-                -pol * (e.isub - e.gbds * vds - e.gbgs * vgs - e.gbbs * vbs),
+                -pol * f64::mul_add(
+                    e.gbbs,
+                    -vbs,
+                    f64::mul_add(e.gbgs, -vgs, f64::mul_add(e.gbds, -vds, e.isub)),
+                ),
             )
         } else {
             let vgd = vgs - vds;
             (
-                -pol * (e.ids + e.gds * vds - e.gm * vgd - e.gmbs * vbd),
-                -pol * (e.isub + e.gbds * vds - e.gbgs * vgd - e.gbbs * vbd),
+                -pol * f64::mul_add(
+                    e.gmbs,
+                    -vbd,
+                    f64::mul_add(e.gm, -vgd, f64::mul_add(e.gds, vds, e.ids)),
+                ),
+                -pol * f64::mul_add(
+                    e.gbbs,
+                    -vbd,
+                    f64::mul_add(e.gbgs, -vgd, f64::mul_add(e.gbds, vds, e.isub)),
+                ),
                 0.,
             )
         };
         let (ceqbs, ceqbd) = if pol > 0. {
-            (ceqbs + (e.cbs - e.gbs * vbs), ceqbd + (e.cbd - e.gbd * vbd))
+            (
+                ceqbs + f64::mul_add(e.gbs, -vbs, e.cbs),
+                ceqbd + f64::mul_add(e.gbd, -vbd, e.cbd),
+            )
         } else {
-            (ceqbs - (e.cbs - e.gbs * vbs), ceqbd - (e.cbd - e.gbd * vbd))
+            (
+                ceqbs - f64::mul_add(e.gbs, -vbs, e.cbs),
+                ceqbd - f64::mul_add(e.gbd, -vbd, e.cbd),
+            )
         };
         let ConductanceParts {
             gmbs_eff,
@@ -1032,7 +1005,8 @@ impl Device for Bsim3 {
     fn noise(
         &self,
         context: &crate::devices::noise::NoiseContext<'_>,
-    ) -> SpiceResult<crate::devices::noise::DeviceNoise> {
+        sources: &mut Vec<crate::devices::noise::NoiseSource>,
+    ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         use crate::devices::noise::{DeviceNoise, FlickerLaw, NoiseFamily, NoiseKind, NoiseSource};
         let model = context.model_context;
         let cached = self.ensure(model.temperature, model.nominal_temperature)?;
@@ -1062,7 +1036,7 @@ impl Device for Bsim3 {
             conductance,
             temperature: context.circuit_kelvin(),
         };
-        let sources = vec![
+        sources.extend([
             NoiseSource::new(".rd", [dp, d], thermal(densities.drain_conductance)),
             NoiseSource::new(".rs", [sp, s], thermal(densities.source_conductance)),
             NoiseSource::new(".id", [dp, sp], thermal(densities.channel)),
@@ -1077,12 +1051,11 @@ impl Device for Bsim3 {
                     },
                 },
             ),
-        ];
+        ]);
         Ok(DeviceNoise::Sources {
             family: NoiseFamily::Bsim3,
-            model: Some(self.model_name.clone()),
+            model: Some(&self.model_name),
             total: true,
-            sources,
         })
     }
 }
@@ -1302,9 +1275,21 @@ fn stamp_charge(
         (0., 0., 0.)
     };
     let mut ceqq = [
-        cqg - gc.gcggb * vgb + gc.gcgdb * vbd + gc.gcgsb * vbs,
-        cqb - gc.gcbgb * vgb + gc.gcbdb * vbd + gc.gcbsb * vbs,
-        cqd - gc.gcdgb * vgb + gc.gcddb * vbd + gc.gcdsb * vbs,
+        f64::mul_add(
+            gc.gcgsb,
+            vbs,
+            f64::mul_add(gc.gcgdb, vbd, f64::mul_add(gc.gcggb, -vgb, cqg)),
+        ),
+        f64::mul_add(
+            gc.gcbsb,
+            vbs,
+            f64::mul_add(gc.gcbdb, vbd, f64::mul_add(gc.gcbgb, -vgb, cqb)),
+        ),
+        f64::mul_add(
+            gc.gcdsb,
+            vbs,
+            f64::mul_add(gc.gcddb, vbd, f64::mul_add(gc.gcdgb, -vgb, cqd)),
+        ),
     ];
     // `b3ld.c` negates the charge equivalents for negative polarity.
     if polarity < 0. {

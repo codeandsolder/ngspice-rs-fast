@@ -16,7 +16,10 @@
 //! Behaviour documented here is ported from the C tree; the C file and function
 //! that define it are named in each doc comment.
 
+pub mod ascii;
 pub mod error;
+mod exact;
+pub(crate) use exact::{positive_axis_span, rounded_product_ratio};
 pub mod node;
 pub mod numeric;
 pub mod value;
@@ -31,6 +34,13 @@ pub use value::{
     parse_numparam_number, parse_numparam_number_prefix, parse_spice_number,
     parse_spice_number_prefix,
 };
+
+/// Bounded, exact accumulator of finite binary64 weighted products.
+/// Arithmetic is implemented in the private exact module.
+pub(crate) struct ExactSum {
+    bins: [i128; exact::LIMBS],
+    terms: u32,
+}
 
 /// Allocate initialized storage without overflowing the allocation size.
 pub(crate) fn filled_vec<T: Clone>(len: usize, value: T, context: &str) -> SpiceResult<Vec<T>> {
@@ -75,11 +85,13 @@ pub enum AnalysisKind {
     /// `.sp` — S-parameter analysis over RF port sources (`span.c`, an
     /// `RFSPICE` build option).
     SParameter,
+    /// `.pss` — autonomous periodic steady-state shooting.
+    PeriodicSteadyState,
 }
 
 impl AnalysisKind {
     /// Every analysis kind, in the order ngspice documents them.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::OperatingPoint,
         Self::DcSweep,
         Self::Ac,
@@ -91,6 +103,7 @@ impl AnalysisKind {
         Self::TransferFunction,
         Self::Fourier,
         Self::SParameter,
+        Self::PeriodicSteadyState,
     ];
 
     /// The name without the leading dot, e.g. `"tran"`.
@@ -108,6 +121,7 @@ impl AnalysisKind {
             Self::TransferFunction => "tf",
             Self::Fourier => "four",
             Self::SParameter => "sp",
+            Self::PeriodicSteadyState => "pss",
         }
     }
 

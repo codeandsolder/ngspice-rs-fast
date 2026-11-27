@@ -313,6 +313,64 @@ fn ports_are_ordered_by_number_not_by_deck_order() {
 }
 
 #[test]
+fn five_ports_cross_a_batch_boundary_and_keep_last_excitation_and_noise_order() {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    // Reverse deck order; the partial final tile must still drive port 5.
+    for port in (1..=5).rev() {
+        writeln!(
+            body,
+            "v{port} n{port} 0 dc 0 portnum {port} z0 {}",
+            40 + 5 * port
+        )
+        .unwrap();
+        writeln!(body, "r{port} n{port} 0 {}", 100 + 20 * port).unwrap();
+    }
+    let plot = sp(&body, ".sp lin 2 1k 2k 1").unwrap();
+    for point in 0..plot.point_count() {
+        for row in 1..=5 {
+            let z0 = f64::from(40 + 5 * row);
+            let r = f64::from(100 + 20 * row);
+            let expected = if row == 5 { r / (r + z0) } else { 0. };
+            close_real(&plot, &format!("v(n{row})"), point, expected);
+            for col in 1..=5 {
+                let diagonal = row == col;
+                close_real(
+                    &plot,
+                    &format!("S_{row}_{col}"),
+                    point,
+                    if diagonal { (r - z0) / (r + z0) } else { 0. },
+                );
+                close_real(
+                    &plot,
+                    &format!("Y_{row}_{col}"),
+                    point,
+                    if diagonal { 1. / r } else { 0. },
+                );
+                close_real(
+                    &plot,
+                    &format!("Z_{row}_{col}"),
+                    point,
+                    if diagonal { r } else { 0. },
+                );
+                let noise = value(&plot, &format!("i(Cy_{row}_{col})"), point);
+                if diagonal {
+                    assert!(noise.re > 0. && noise.im.abs() <= 1e-14 * noise.re);
+                } else {
+                    assert_eq!(
+                        [
+                            noise.re.to_bits() & 0x7fff_ffff_ffff_ffff,
+                            noise.im.to_bits() & 0x7fff_ffff_ffff_ffff
+                        ],
+                        [0, 0]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn the_ac_excitation_of_ordinary_sources_is_off() {
     let plain = "v1 1 0 dc 0 portnum 1\nr1 1 2 50\nr2 2 0 100\nv2 2 0 dc 0 portnum 2";
     let reference = sp(plain, ".sp lin 2 1k 2k").unwrap();
@@ -572,5 +630,165 @@ fn port_cosines_accumulate_in_c_load_order() {
                 "{name} t={t}: {got} != {expected}"
             );
         }
+    }
+}
+
+fn benchmark_rf_sweep(ports: u32) {
+    use std::fmt::Write as _;
+    use std::time::Instant;
+    // Grounded reciprocal RC chain, distinct positive reference impedances,
+    // with resistor noise active. Every port drives one independent RHS.
+    let mut deck = String::from("RF workspace benchmark\n");
+    for i in 1..=ports {
+        writeln!(deck, "v{i} n{i} 0 dc 0 portnum {i} z0 {}", 40 + i).unwrap();
+        writeln!(deck, "r{i} n{i} 0 {}", 100 + i).unwrap();
+        writeln!(deck, "c{i} n{i} 0 1n").unwrap();
+        if i > 1 {
+            writeln!(deck, "rt{i} n{} n{i} 50", i - 1).unwrap();
+        }
+    }
+    deck.push_str(".sp lin 64 1000 1000000 1\n.end\n");
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("rf-bench.cir"), &deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+    for _ in 0..3 {
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let start = Instant::now();
+        let p = plan.run(&mut circuit, &config.context()).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(p.point_count(), 64);
+        assert!(p.cells().iter().all(|v| v.is_finite()));
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for cell in p.cells() {
+            for bits in [cell.re.to_bits(), cell.im.to_bits()] {
+                hash = (hash ^ bits).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        println!(
+            "ports={ports},cells={},elapsed_ns={},bits={hash:016x}",
+            p.cells().len(),
+            elapsed.as_nanos()
+        );
+    }
+}
+
+#[test]
+#[ignore = "opt-in RF allocation and timing workload"]
+fn rf_sweep_benchmark_02() {
+    benchmark_rf_sweep(2);
+}
+
+#[test]
+#[ignore = "opt-in RF allocation and timing workload"]
+fn rf_sweep_benchmark_08() {
+    benchmark_rf_sweep(8);
+}
+
+#[test]
+#[ignore = "opt-in RF allocation and timing workload"]
+fn rf_sweep_benchmark_32() {
+    benchmark_rf_sweep(32);
+}
+
+#[test]
+fn rf_resource_limits_are_configurable_and_aggregate() {
+    use ngspice_rs::analysis::RfLimits;
+    let deck = "RF limits\nv1 in 0 portnum 1 z0 50\nr1 in 0 100\nv2 out 0 portnum 2 z0 75\nr2 in out 25\nr3 out 0 100\n.sp lin 4 1k 4k 1\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("rf-limits.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+    for (limits, expected) in [
+        (
+            RfLimits {
+                variables: 1,
+                ..Default::default()
+            },
+            "variables",
+        ),
+        (
+            RfLimits {
+                numeric_bytes: 1,
+                ..Default::default()
+            },
+            "numeric bytes",
+        ),
+        (
+            RfLimits {
+                work_units: 1,
+                ..Default::default()
+            },
+            "work units",
+        ),
+    ] {
+        let mut context = config.context();
+        context.rf_limits = limits;
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let error = plan.run(&mut circuit, &context).unwrap_err().to_string();
+        assert!(
+            error.contains(".sp RF resource limit") && error.contains(expected),
+            "{error}"
+        );
+    }
+    let mut text = String::new();
+    use std::fmt::Write as _;
+    for i in 1..=32 {
+        writeln!(text, "v{i} n{i} 0 portnum {i}\nr{i} n{i} 0 100").unwrap();
+    }
+    let error = sp(&text, ".sp lin 10000 1 10000 1")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("numeric bytes"), "{error}");
+    // Angular-frequency overflow would otherwise reach model assembly or
+    // an unrelated nonfinite matrix operation.
+    let error = sp("v1 1 0 portnum 1\nr1 1 0 100", ".sp lin 1 1e308 1e308")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("angular frequency"), "{error}");
+}
+
+#[test]
+fn reusable_rf_sweep_matches_independent_frequencies_with_noise() {
+    let body = "v3 c 0 portnum 3 z0 25\nv2 b 0 portnum 2 z0 75\nv1 a 0 portnum 1 z0 50\nr1 a b 30\nr2 b c 40\nr3 c 0 100\nr4 a 0 80\nc1 b 0 1n";
+    let sweep = sp(body, ".sp lin 3 1000 3000 1").unwrap();
+    for (index, f) in [1000, 2000, 3000].into_iter().enumerate() {
+        let independent = sp(body, &format!(".sp lin 1 {f} {f} 1")).unwrap();
+        assert_eq!(independent.variables(), sweep.variables());
+        for (a, b) in sweep
+            .row(index)
+            .unwrap()
+            .iter()
+            .zip(independent.row(0).unwrap())
+        {
+            close(*a, *b);
+        }
+    }
+}
+
+#[test]
+fn rf_parameter_observations_match_the_bound_schema() {
+    let deck = "RF observations\nv1 in 0 portnum 1 z0 50\nr1 in 0 100\n.sp lin 3 1k 3k\n.end\n";
+    let netlist = Parser::new()
+        .parse_deck(&parse_deck_text(Path::new("rf-observations.cir"), deck))
+        .unwrap();
+    let config = RunConfig::from_netlist(&netlist).unwrap();
+    let plan = config.plan_for(&netlist.analyses[0]).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    let original = plan.run(&mut circuit, &config.context()).unwrap();
+    let mut circuit = config.circuit(&netlist).unwrap();
+    circuit
+        .set_observations(&["@r1[resistance]".into()])
+        .unwrap();
+    let observed = plan.run(&mut circuit, &config.context()).unwrap();
+    assert_eq!(observed.point_count(), original.point_count());
+    let index = observed.variable_index("@r1[resistance]").unwrap();
+    assert_eq!(index + 1, observed.variable_index("S_1_1").unwrap());
+    for (row, base) in observed.rows().zip(original.rows()) {
+        assert_eq!(row[index], Complex::real(100.));
+        assert_eq!(&row[..index], &base[..index]);
+        assert_eq!(&row[index + 1..], &base[index..]);
     }
 }

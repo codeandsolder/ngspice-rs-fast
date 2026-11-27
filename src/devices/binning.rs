@@ -36,11 +36,11 @@
 //! selected card can be simulated is decided by the ordinary level selector in
 //! [`crate::devices::models`], which keeps unported families `NotYetPorted`.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::OnceLock;
 
 use crate::netlist::ast::{DeviceInstance, ModelCard, ParameterAssignment};
+use crate::primitives::ascii::folded;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
 use crate::devices::schema::finite_literal;
@@ -80,14 +80,6 @@ pub(super) fn bin_base(name: &str) -> Option<&str> {
     (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(base)
 }
 
-fn canonical_name(name: &str) -> Cow<'_, str> {
-    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        Cow::Owned(name.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(name)
-    }
-}
-
 /// A scope's first declarations and their ordered bin groups. IDs are private
 /// to the index and stable for its lifetime; names are never mutated in place.
 #[derive(Debug)]
@@ -107,7 +99,7 @@ impl<T> DeclarationIndex<T> {
     }
 
     pub(super) fn insert_first(&mut self, name: &str, make: impl FnOnce() -> T) {
-        if let Entry::Vacant(slot) = self.names.entry(canonical_name(name).into_owned()) {
+        if let Entry::Vacant(slot) = self.names.entry(folded(name).into_owned()) {
             let id = self.entries.len();
             if let Some(base) = bin_base(slot.key()) {
                 self.bins.entry(base.to_owned()).or_default().push(id);
@@ -119,13 +111,13 @@ impl<T> DeclarationIndex<T> {
 
     pub(super) fn get(&self, name: &str) -> Option<&T> {
         self.names
-            .get(canonical_name(name).as_ref())
+            .get(folded(name).as_ref())
             .map(|&id| &self.entries[id])
     }
 
     pub(super) fn get_mut(&mut self, name: &str) -> Option<&mut T> {
         self.names
-            .get(canonical_name(name).as_ref())
+            .get(folded(name).as_ref())
             .map(|&id| &mut self.entries[id])
     }
 
@@ -134,7 +126,7 @@ impl<T> DeclarationIndex<T> {
         name: &str,
     ) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator + use<'b, T> {
         self.bins
-            .get(canonical_name(name).as_ref())
+            .get(folded(name).as_ref())
             .map_or(&[][..], Vec::as_slice)
             .iter()
             .map(|&id| &self.entries[id])
@@ -144,7 +136,7 @@ impl<T> DeclarationIndex<T> {
     pub(super) fn bin_slots_mut(&mut self, name: &str) -> (&[usize], &mut [T]) {
         let ids = self
             .bins
-            .get(canonical_name(name).as_ref())
+            .get(folded(name).as_ref())
             .map_or(&[][..], Vec::as_slice);
         (ids, &mut self.entries)
     }

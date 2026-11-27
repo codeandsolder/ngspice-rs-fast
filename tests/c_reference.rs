@@ -1,11 +1,11 @@
 //! Opt-in live syntax oracles. Compare parsed scalar parameters, not Rust
 //! simulation results, with C's `print @instance[parameter]` / model queries.
 
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, ProcessOutput, run};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::{Netlist, ParameterAssignment, ParameterKind};
@@ -19,14 +19,6 @@ const FLAGS_IC: &str = include_str!("../conformance/parser/flags_ic.cir");
 const WAVEFORMS: &str = include_str!("../conformance/parser/source_waveforms.cir");
 const FUNCTIONS: &str = include_str!("../conformance/parser/source_functions.cir");
 const CONTROLLED: &str = include_str!("../conformance/parser/controlled_sources.cir");
-
-struct Scratch(PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn parse(text: &str) -> Netlist {
     let deck = ngspice_rs::netlist::source::parse_deck_text(Path::new("reference.cir"), text);
@@ -258,15 +250,15 @@ fn parsed_flags_and_ic_vectors_match_live_c_setter_order() {
     // Independent expectations pin fallthrough/omission and precedence.
     assert_eq!(expected["@dlead[area]"], 2.0);
     assert_eq!(expected["@qfull[area]"], 2.0);
-    // INPevaluate builds a decimal from its digits and power of ten, which is
-    // not always the nearest double: 0.7 and -0.3 land one ulp away.
-    assert_eq!(expected["@qfull[icvbe]"], 0.7000000000000001);
+    // Rust expects the nearest binary64; the live C comparison below
+    // already permits the documented one-ULP INPevaluate differences.
+    assert_eq!(expected["@qfull[icvbe]"], 0.7);
     assert_eq!(expected["@qfull[icvce]"], 4.0);
     assert_eq!(expected["@qpartial[icvce]"], 5.0);
     assert_eq!(expected["@mfull[icvgs]"], 4.0);
     assert_eq!(expected["@mpartial[icvds]"], 0.4);
     assert_eq!(expected["@mpartial[icvgs]"], 6.0);
-    assert_eq!(expected["@mpartial[icvbs]"], -0.30000000000000004);
+    assert_eq!(expected["@mpartial[icvbs]"], -0.3);
     // Model type flags are input-only; successful C setup checks their syntax,
     // not a fictitious scalar query or Rust model polarity implementation.
     assert_reference("flags-ic", FLAGS_IC, expected);
@@ -414,15 +406,11 @@ fn parsed_source_structure_matches_live_c_setup() {
     );
 }
 
-fn reference_output(label: &str, text: &str) -> std::process::Output {
+fn reference_output(label: &str, text: &str) -> ProcessOutput {
     reference_output_sources(label, text, &[])
 }
 
-fn reference_output_sources(
-    label: &str,
-    text: &str,
-    sources: &[(&str, &str)],
-) -> std::process::Output {
+fn reference_output_sources(label: &str, text: &str, sources: &[(&str, &str)]) -> ProcessOutput {
     let workspace = ngspice_conformance::fixtures::workspace_root().unwrap();
     let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
     let binary = if binary.is_absolute() {
@@ -431,23 +419,20 @@ fn reference_output_sources(
         workspace.join(binary)
     };
     let binary = binary.canonicalize().expect("reference binary exists");
-    let nonce = scratch_nonce();
-    let scratch = Scratch(std::env::temp_dir().join(format!(
-        "spice-parser-{label}-{}-{nonce}",
-        std::process::id()
-    )));
-    fs::create_dir_all(&scratch.0).unwrap();
-    fs::write(scratch.0.join("probe.cir"), text).unwrap();
+    let scratch = Scratch::new("c-reference").unwrap_or_else(|error| panic!("{label}: {error}"));
+    fs::write(scratch.path().join("probe.cir"), text).unwrap();
     for (path, content) in sources {
-        let path = scratch.0.join(path);
+        let path = scratch.path().join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
     }
-    Command::new(binary)
-        .args(["-b", "probe.cir"])
-        .current_dir(&scratch.0)
-        .output()
-        .expect("run reference ngspice")
+    run(
+        binary,
+        scratch.path(),
+        &["-b", "probe.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .expect("run reference ngspice")
 }
 
 fn assert_reference(label: &str, text: &str, expected: BTreeMap<String, f64>) {
@@ -493,21 +478,3 @@ fn assert_reference_commands(
         );
     }
 }
-
-/// A process-local counter appended to scratch directory names.
-///
-/// `SystemTime::now()` is coarsened on some platforms (1 ms on macOS), so the
-/// process id and the clock alone do not distinguish two tests of one binary
-/// that start in the same tick - and tests run in parallel, so two of them
-/// collided and `create_dir(...).unwrap()` panicked.
-static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(0);
-
-fn scratch_nonce() -> u128 {
-    let clock = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after the epoch")
-        .as_nanos();
-    clock + u128::from(SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed))
-}
-
-use std::sync::atomic::{AtomicU64, Ordering};

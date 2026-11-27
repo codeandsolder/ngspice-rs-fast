@@ -38,6 +38,32 @@ and check the loaded residual. Retained output is encoded and decoded
 losslessly; non-retaining output checks plot count, row count and row width.
 Existing live C conformance remains the detailed independent physics oracle.
 
+## Direct nonlinear diode loading (#99, #164)
+
+The finalized topology preserves the C device load order. Each diode samples
+its model and accepted-state inputs, evaluates its complete junction physics,
+and commits the MNA/RHS, charge and limiting state before the next device.
+There is **no diode tile plan, buffering or separate SIMD load path**.
+The explicit diode sampling/evaluation/commit decomposition remains useful
+for independent numerical verification without changing scalar execution.
+
+The previous homogeneous 64-lane load planner (#99) was retired after release
+measurements showed that scalar gather/queue/commit was consistently slower
+than direct scalar loading. An experimental four-lane portable-SIMD finish
+for complete diode physics (#164) preserved all tested numerical bits but
+also slowed complete device loading. On native Ryzen 7 4700U and generic
+x86-64, and independently on Intel Celeron N4100, the overhead remained
+material across 4–4,096-device networks; exact full-physics and simpler
+diode model variants were both measured. No approximate vector exponential
+or reduced model coverage was accepted.
+
+The experimental branch commits, all three host/compiler results, individual
+load/factor+solve medians and the reproduction harness are recorded in the
+[issue #164 engineering log](https://app.notion.com/p/421f74be9020817eaefcd4ac4e1fb933).
+Future vectorization must show **whole-load** gains with C-reference fidelity
+before reinstating a batch planner. The regular diode physics tests, full C
+golden verification and ordered scalar stamps remain the regression gates.
+
 ## Measurements
 
 Records contain workload, phase, operation count and elapsed nanoseconds.
@@ -48,19 +74,41 @@ Repeat steady-state phases three times; use medians per operation.
 - Fresh order/factor includes factor-frame construction; retained solve uses a
   factor snapshot with caller-owned scratch. The two NI solve phases exercise
   the same bound matrix with changed and then identical coefficients.
-- Complex assembly, factorization and solve are measured independently. The
-  orders_requested and reuse_requested fields count controlled requests, not
-  internal fallback decisions. The public solver API does not expose actual LU
-  fill-in, reorder/refactor/cache-hit counts; those diagnostics should follow
-  concurrent matrix lifecycle work (#34). Do not infer LU fill from coefficient
-  density or invent internal counters.
+- FactorStorage records structural original handle creations, total stored LU
+  entries, fill-in handle creations, translated/external order and logical
+  numeric bytes. The fill ratio is factor_entries / original_entries
+  (including structurally allocated zeroes). It is not heap allocation
+  capacity, a count of nonzero values, or a process-wide memory measurement.
+- FactorWork records actual order calls, searches, fixed-plan refactors,
+  outcomes, and immediate zero-pivot retries. Retaining every existing pivot
+  during threshold ordering counts an order attempt but no search. The
+  complex phase sums producing-operation snapshots across frequencies and
+  reports the observed storage range. Each successful independent snapshot
+  solve is counted by the harness after the solve succeeds.
+- Real NI measurements read the shared pattern's cumulative work before and
+  after the timed pair of changed/identical coefficient solves. They assert
+  exactly one numerical refactor and one exact-input hit per pair, plus two
+  successful RHS solves and no additional order/search. The warmup and
+  post-repeat records are cumulative within the pattern's cache epoch, so their
+  difference isolates the measured pair work.
+- Full-deck retained, streamed, bias and transient measurements report the
+  final pattern cache epoch; an extended/replaced pattern starts a new epoch.
+  Those records do not count discarded predecessor epochs, or independent
+  snapshot RHS solves (including RF). They must not be interpreted as totals
+  of all internal operations in an entire analysis.
+- All telemetry reads occur outside the timed kernels. Counter definitions
+  and snapshot/reset semantics are documented in [NATIVE_SOLVER.md](NATIVE_SOLVER.md).
+  Workload timings and process-wide DHAT measures remain separate from
+  numeric storage and work counters.
 - Device load excludes solver time and uses the finalized circuit matrix and
   state history. Parse, elaboration, retained analysis, streamed analysis, and
   rawfile codec have separate measurements. Every retained and streaming trial
   gets a fresh circuit. Transient-specific runs report actual accepted/rejected
   work and do not reuse the prior trial's history.
 - The independent parameter ensemble carries no earlier Newton seed or factor
-  cache across jobs. The sequential sweep is measured separately.
+  cache across jobs. The final cache epochs of independent jobs are summed,
+  and the largest observed factor storage is reported separately. The sequential
+  sweep is measured separately.
 
 ## Reproduction
 
@@ -107,3 +155,4 @@ belong in the issue/worklog.
 
 - [2026-11-22 scalar reference](performance-baselines/2026-11-22.md):
   generic/native release timing, nine allocation profiles and numerical records.
+- [2026-11-22 sparse factor telemetry](performance-baselines/2026-11-22-factor-telemetry.md): actual storage and work counters, release workload timings and numerical signatures.

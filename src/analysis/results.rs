@@ -6,8 +6,9 @@
 //! variables and points, which is what a rawfile contains, and leaves plotting
 //! to whoever consumes the result.
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
+use crate::primitives::ascii::folded;
 use crate::primitives::{Complex, Real, SpiceError, SpiceResult};
 
 /// Ordered output lifecycle for every plot produced by an analysis.
@@ -21,6 +22,17 @@ pub trait PointSink {
     /// # Errors
     /// Whatever the consumer reports; the analysis stops with that error.
     fn begin(&mut self, header: &Plot) -> SpiceResult<()>;
+
+    /// Optional sorted full-schema column ordinals selected by this sink.
+    ///
+    /// The producer may supply only these columns, in this order, after a
+    /// successful full-header begin. Normal sinks return None and still
+    /// receive complete rows. This is called once per output, never per point.
+    /// The source's physical state and convergence are never projected.
+    #[must_use]
+    fn selected_columns(&self) -> Option<&[usize]> {
+        None
+    }
 
     /// One borrowed row, with one value per variable of the active header.
     ///
@@ -48,6 +60,133 @@ pub trait PointSink {
     }
 }
 
+/// One checked objective-only projection of a driver's fixed output schema.
+///
+/// Selected column ordinals refer to the full header. The solved state and
+/// output ordering are untouched; only the delivered row and independently
+/// requested optional device quantities are compacted. Ordinary sinks return
+/// None and keep the original full-row production path.
+pub(crate) struct SelectedOutput {
+    columns: Vec<usize>,
+    observations: Vec<usize>,
+    first_unknown: usize,
+    first_observation: usize,
+    buffer: Vec<Complex>,
+}
+
+impl SelectedOutput {
+    /// Negotiate exactly once, after the full header has been validated by
+    /// the sink. The output is scale, unknowns, then observations.
+    pub(crate) fn bind(
+        sink: &dyn PointSink,
+        header: &Plot,
+        unknowns: usize,
+        has_scale: bool,
+    ) -> SpiceResult<Option<Self>> {
+        let Some(columns) = sink.selected_columns() else {
+            return Ok(None);
+        };
+        let first_unknown = usize::from(has_scale);
+        let first_observation = first_unknown
+            .checked_add(unknowns)
+            .filter(|&first| first <= header.variable_count())
+            .ok_or_else(|| lifecycle_error("selected output has invalid unknown layout"))?;
+        if columns
+            .iter()
+            .any(|&index| index >= header.variable_count())
+            || columns.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(lifecycle_error("invalid selected output column ordering"));
+        }
+        let observations = columns
+            .iter()
+            .copied()
+            .filter(|&index| index >= first_observation)
+            .map(|index| index - first_observation)
+            .collect();
+        Ok(Some(Self {
+            columns: columns.to_vec(),
+            observations,
+            first_unknown,
+            first_observation,
+            buffer: Vec::with_capacity(columns.len()),
+        }))
+    }
+
+    /// Device observation ordinals to request from the already bound Circuit.
+    /// Empty means no isolated device loads or spectral parameter asks.
+    pub(crate) fn observations(&self) -> &[usize] {
+        &self.observations
+    }
+
+    fn emit(
+        &mut self,
+        sink: &mut dyn PointSink,
+        scale: Option<Real>,
+        unknown_count: usize,
+        mut unknown: impl FnMut(usize) -> Complex,
+        observations: &[Complex],
+    ) -> SpiceResult<()> {
+        if observations.len() != self.observations.len() {
+            return Err(lifecycle_error(
+                "selected device observation width mismatch",
+            ));
+        }
+        if self.first_observation != unknown_count + self.first_unknown {
+            return Err(lifecycle_error("selected output unknown dimension changed"));
+        }
+        self.buffer.clear();
+        let mut observation = 0;
+        for &column in &self.columns {
+            let value = if column < self.first_unknown {
+                Complex::real(scale.ok_or_else(|| lifecycle_error("missing output scale"))?)
+            } else if column < self.first_observation {
+                unknown(column - self.first_unknown)
+            } else {
+                let value = observations[observation];
+                observation += 1;
+                value
+            };
+            self.buffer.push(value);
+        }
+        sink.point(&self.buffer)
+    }
+
+    /// Emit a compact real solution row in physical source-column order.
+    pub(crate) fn real(
+        &mut self,
+        sink: &mut dyn PointSink,
+        scale: Option<Real>,
+        unknowns: &[Real],
+        observations: &[Complex],
+    ) -> SpiceResult<()> {
+        self.emit(
+            sink,
+            scale,
+            unknowns.len(),
+            |index| Complex::real(unknowns[index]),
+            observations,
+        )
+    }
+
+    /// Emit a compact complex solution row in physical source-column order.
+    pub(crate) fn complex(
+        &mut self,
+        sink: &mut dyn PointSink,
+        scale: Option<Real>,
+        unknowns: &[Complex],
+        observations: &[Complex],
+    ) -> SpiceResult<()> {
+        self.emit(
+            sink,
+            scale,
+            unknowns.len(),
+            |index| unknowns[index],
+            observations,
+        )
+    }
+}
+
 pub(super) fn lifecycle_error(message: &str) -> SpiceError {
     SpiceError::Numerical {
         context: "analysis output".into(),
@@ -56,13 +195,44 @@ pub(super) fn lifecycle_error(message: &str) -> SpiceError {
 }
 
 /// Collect only when requested by the caller, never inside a streaming driver.
-#[derive(Default)]
 pub(super) struct PlotCollector {
     plots: Vec<Plot>,
     active: Option<Plot>,
+    remaining_cells: usize,
+    max_plots: usize,
+}
+
+impl Default for PlotCollector {
+    fn default() -> Self {
+        Self::bounded(usize::MAX, usize::MAX)
+    }
 }
 
 impl PlotCollector {
+    pub(super) const fn bounded(max_plots: usize, max_cells: usize) -> Self {
+        Self {
+            plots: Vec::new(),
+            active: None,
+            remaining_cells: max_cells,
+            max_plots,
+        }
+    }
+
+    fn check_plot_limit(&self) -> SpiceResult<()> {
+        if self.plots.len() >= self.max_plots {
+            return Err(lifecycle_error("plot retention count limit exceeded"));
+        }
+        Ok(())
+    }
+
+    fn charge(&mut self, cells: usize) -> SpiceResult<()> {
+        self.remaining_cells = self
+            .remaining_cells
+            .checked_sub(cells)
+            .ok_or_else(|| lifecycle_error("plot retention cell limit exceeded"))?;
+        Ok(())
+    }
+
     pub(super) fn finish(self, expected: usize) -> SpiceResult<Vec<Plot>> {
         if self.active.is_some() || self.plots.len() != expected {
             return Err(lifecycle_error(
@@ -80,11 +250,13 @@ impl PointSink for PlotCollector {
                 "began a plot before completing the previous one",
             ));
         }
+        self.check_plot_limit()?;
         self.active = Some(header.header());
         Ok(())
     }
 
     fn point(&mut self, values: &[Complex]) -> SpiceResult<()> {
+        self.charge(values.len())?;
         self.active
             .as_mut()
             .ok_or_else(|| lifecycle_error("point without an active plot"))?
@@ -96,13 +268,16 @@ impl PointSink for PlotCollector {
             .active
             .take()
             .ok_or_else(|| lifecycle_error("end without an active plot"))?;
-        self.complete(plot)
+        self.plots.push(plot);
+        Ok(())
     }
 
     fn complete(&mut self, plot: Plot) -> SpiceResult<()> {
         if self.active.is_some() {
             return Err(lifecycle_error("completed a plot while another is active"));
         }
+        self.check_plot_limit()?;
+        self.charge(plot.cells().len())?;
         self.plots.push(plot);
         Ok(())
     }
@@ -198,14 +373,6 @@ pub struct PlotSchema {
     names: HashMap<String, usize>,
     voltages: HashMap<String, usize>,
     currents: HashMap<String, usize>,
-}
-
-fn folded(name: &str) -> Cow<'_, str> {
-    if name.bytes().any(|b| b.is_ascii_uppercase()) {
-        Cow::Owned(name.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(name)
-    }
 }
 
 impl PlotSchema {
@@ -548,6 +715,53 @@ impl Plot {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.variables().is_empty() || self.point_count == 0
+    }
+
+    /// Publish or replace a named vector in the packed table. Schema identity
+    /// changes only after its entire replacement column has been validated.
+    ///
+    /// # Errors
+    /// Invalid vector shape, nonfinite values or storage allocation failure.
+    pub(crate) fn set_column(&mut self, variable: Variable, values: &[Complex]) -> SpiceResult<()> {
+        self.validate_shape()?;
+        if values.len() != self.point_count || values.iter().any(|value| !value.is_finite()) {
+            return Err(self.storage_error("invalid derived vector shape or value"));
+        }
+        let mut variables = self.variables().to_vec();
+        let flags = if variable.is_real {
+            self.flags()
+        } else {
+            PlotFlags::Complex
+        };
+        if let Some(index) = self.variable_index(&variable.name) {
+            for (row, &value) in self.rows_mut().zip(values) {
+                row[index] = value;
+            }
+            variables[index] = variable;
+        } else {
+            let old_width = self.variable_count();
+            let width = old_width
+                .checked_add(1)
+                .ok_or_else(|| self.storage_error("derived vector width overflows"))?;
+            let count = self
+                .point_count
+                .checked_mul(width)
+                .ok_or_else(|| self.storage_error("derived vector cell count overflows"))?;
+            self.cells
+                .try_reserve_exact(values.len())
+                .map_err(|error| self.storage_error(error))?;
+            self.cells.resize(count, Complex::ZERO);
+            for (index, &value) in values.iter().enumerate().rev() {
+                let source = index * old_width;
+                let destination = index * width;
+                self.cells
+                    .copy_within(source..source + old_width, destination);
+                self.cells[destination + old_width] = value;
+            }
+            variables.push(variable);
+        }
+        self.schema = Arc::new(PlotSchema::new(flags, variables));
+        Ok(())
     }
 
     /// Append a borrowed row, copying its cells once into the packed table.

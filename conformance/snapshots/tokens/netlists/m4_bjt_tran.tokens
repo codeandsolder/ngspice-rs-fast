@@ -21,7 +21,7 @@ card 2 @netlists/m4_bjt_tran.cir:3:1 lines=3-3 continuations=0
   token 8 3:26 number "10n" value=1e-8
   token 9 3:30 number "10n" value=1e-8
   token 10 3:34 number "10n" value=1e-8
-  token 11 3:38 number "30n" value=3.0000000000000004e-8
+  token 11 3:38 number "30n" value=3e-8
   token 12 3:42 number "80n" value=8e-8
   token 13 3:45 rparen ")"
 card 3 @netlists/m4_bjt_tran.cir:4:1 lines=4-4 continuations=0
@@ -74,7 +74,7 @@ card 7 @netlists/m4_bjt_tran.cir:8:1 lines=8-8 continuations=0
   kind: dot(.tran)
   token 1 8:1 word ".tran"
   token 2 8:7 number "1n" value=1e-9
-  token 3 8:10 number "100n" value=1.0000000000000001e-7
+  token 3 8:10 number "100n" value=1e-7
   token 4 8:15 number "0" value=0e0
   token 5 8:17 number "0.1n" value=1e-10
 card 8 @netlists/m4_bjt_tran.cir:9:1 lines=9-9 continuations=0

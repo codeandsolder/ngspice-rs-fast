@@ -4,8 +4,6 @@
 //! source locations, ground-alias configuration and C references; backtracking
 //! never mutates the AST or parser configuration.
 
-use std::collections::BTreeSet;
-
 use crate::primitives::{AnalysisKind, SourceLoc, SpiceError, SpiceResult};
 use winnow::Parser as _;
 use winnow::combinator::{alt, peek};
@@ -20,6 +18,7 @@ use crate::netlist::ast::{
 use crate::netlist::card::{CardKind, DotCommand, RawCard};
 use crate::netlist::token::Token;
 
+use super::scopes::ModelVisibility;
 use super::{
     behavioural, controlled, diode, expression, fourier, func, hints, linear, ltra, measure, model,
     mutual, options, param, save, structure, switch, tline, transistor, urc,
@@ -53,7 +52,7 @@ pub(super) enum ParsedCard {
 pub(super) struct Context<'a> {
     pub card: &'a RawCard,
     pub auto_gnd: bool,
-    pub declared_models: &'a BTreeSet<String>,
+    pub declared_models: ModelVisibility<'a>,
 }
 
 pub(super) type Input<'a> = Stateful<TokenSlice<'a, Token>, Context<'a>>;
@@ -97,7 +96,7 @@ impl AddContext<Input<'_>, &'static str> for Failure {
 pub(super) fn parse_card(
     card: &RawCard,
     auto_gnd: bool,
-    declared_models: &BTreeSet<String>,
+    declared_models: ModelVisibility<'_>,
 ) -> SpiceResult<ParsedCard> {
     let input = Input {
         input: TokenSlice::new(&card.tokens),
@@ -153,7 +152,7 @@ pub(super) fn parse_card(
 pub(super) fn parse_frontend_setting(
     card: &RawCard,
     auto_gnd: bool,
-    declared_models: &BTreeSet<String>,
+    declared_models: ModelVisibility<'_>,
 ) -> SpiceResult<ParsedCard> {
     options::frontend_setting
         .parse(Input {
@@ -184,7 +183,10 @@ fn analysis_card(input: &mut Input<'_>) -> Result<ParsedCard> {
         rest,
     )
         .parse_next(input)?;
-    let (arguments, uic) = if kind == AnalysisKind::Transient {
+    let (arguments, uic) = if matches!(
+        kind,
+        AnalysisKind::Transient | AnalysisKind::PeriodicSteadyState
+    ) {
         split_uic(arguments)?
     } else {
         (arguments.iter().collect(), None)

@@ -6,40 +6,25 @@
 //!
 //! Run with `NGSPICE_BIN=/absolute/path/to/ngspice cargo test -p
 //! analysis --test c_mutual_inductance -- --ignored`.
+use ngspice_conformance::ngspice::Scratch;
+use ngspice_conformance::process::{ProcessLimits, ProcessOutput, run};
 use ngspice_rs::analysis::{AnalysisInput, Plot, RawFile, RunConfig};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::source::parse_deck_text;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new() -> Self {
-        let nonce = scratch_nonce();
-        let scratch = Self(std::env::temp_dir().join(format!(
-            "spice-mutual-oracle-{}-{nonce}",
-            std::process::id()
-        )));
-        fs::create_dir_all(&scratch.0).unwrap();
-        scratch
-    }
-    fn run(&self, text: &str) -> Output {
-        fs::write(self.0.join("probe.cir"), text).unwrap();
-        let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
-        assert!(binary.is_absolute(), "NGSPICE_BIN must be absolute");
-        Command::new(binary)
-            .args(["-b", "probe.cir"])
-            .current_dir(&self.0)
-            .output()
-            .unwrap()
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
+fn run_probe(scratch: &Scratch, text: &str) -> ProcessOutput {
+    fs::write(scratch.path().join("probe.cir"), text).unwrap();
+    let binary = PathBuf::from(std::env::var_os("NGSPICE_BIN").expect("set NGSPICE_BIN"));
+    assert!(binary.is_absolute(), "NGSPICE_BIN must be absolute");
+    run(
+        binary,
+        scratch.path(),
+        &["-b", "probe.cir"],
+        ProcessLimits::ORACLE,
+    )
+    .unwrap()
 }
 
 fn rust(deck: &str) -> ngspice_rs::primitives::SpiceResult<Plot> {
@@ -53,10 +38,13 @@ fn rust(deck: &str) -> ngspice_rs::primitives::SpiceResult<Plot> {
 /// C's AC plot of `body` (whose analysis is given separately as a control
 /// command so that the rawfile can be written).
 fn c_ac(body: &str, command: &str) -> Plot {
-    let scratch = Scratch::new();
-    let output = scratch.run(&format!(
-        "k\n{body}\n.control\nset filetype=ascii\nset numdgt=17\n{command}\nwrite out.raw\nquit\n.endc\n.end\n"
-    ));
+    let scratch = Scratch::new("c-mutual-inductance").unwrap();
+    let output = run_probe(
+        &scratch,
+        &format!(
+            "k\n{body}\n.control\nset filetype=ascii\nset numdgt=17\n{command}\nwrite out.raw\nquit\n.endc\n.end\n"
+        ),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
@@ -64,7 +52,7 @@ fn c_ac(body: &str, command: &str) -> Plot {
         !stderr.to_lowercase().contains("error"),
         "{stdout}\n{stderr}"
     );
-    let raw = fs::read_to_string(scratch.0.join("out.raw")).unwrap();
+    let raw = fs::read_to_string(scratch.path().join("out.raw")).unwrap();
     let raw = RawFile::parse(&raw).unwrap();
     assert_eq!(raw.plots.len(), 1);
     raw.plots[0].plot.clone()
@@ -117,10 +105,11 @@ fn coupled_ac_matches_c() {
 #[ignore = "requires NGSPICE_BIN; documents C's warning-only definiteness check"]
 fn c_only_warns_about_an_indefinite_system_that_the_port_rejects() {
     let body = "v1 a 0 dc 0 ac 1\nr1 a b 1\nl1 b 0 1m\nl2 c 0 4m\nr2 c 0 10\nk1 l1 l2 1.5";
-    let scratch = Scratch::new();
-    let output = scratch.run(&format!(
-        "k\n{body}\n.ac lin 1 1k 1k\n.print ac v(c)\n.end\n"
-    ));
+    let scratch = Scratch::new("c-mutual-inductance").unwrap();
+    let output = run_probe(
+        &scratch,
+        &format!("k\n{body}\n.ac lin 1 1k 1k\n.print ac v(c)\n.end\n"),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
@@ -145,10 +134,11 @@ fn c_is_silent_when_multiplicity_makes_the_stamped_system_indefinite() {
     // rejects the indefinite matrix it would actually simulate.
     let body = "v1 a 0 dc 0 ac 1\nr1 a b 1\nl1 b 0 lm m=2\nl2 c 0 lm2\nr2 c 0 10\n\
                 k1 l1 l2 0.9\n.model lm l(ind=10m)\n.model lm2 l(ind=40m)";
-    let scratch = Scratch::new();
-    let output = scratch.run(&format!(
-        "k\n{body}\n.ac lin 1 1k 1k\n.print ac v(c)\n.end\n"
-    ));
+    let scratch = Scratch::new("c-mutual-inductance").unwrap();
+    let output = run_probe(
+        &scratch,
+        &format!("k\n{body}\n.ac lin 1 1k 1k\n.print ac v(c)\n.end\n"),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success());
     assert!(!stderr.contains("Inductive System"), "{stderr}");
@@ -157,21 +147,3 @@ fn c_is_silent_when_multiplicity_makes_the_stamped_system_indefinite() {
     assert!(message.contains("multiplicity m"), "{message}");
     assert!(!message.contains("C only warns"), "{message}");
 }
-
-/// A process-local counter appended to scratch directory names.
-///
-/// `SystemTime::now()` is coarsened on some platforms (1 ms on macOS), so the
-/// process id and the clock alone do not distinguish two tests of one binary
-/// that start in the same tick - and tests run in parallel, so two of them
-/// collided and `create_dir(...).unwrap()` panicked.
-static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(0);
-
-fn scratch_nonce() -> u128 {
-    let clock = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after the epoch")
-        .as_nanos();
-    clock + u128::from(SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed))
-}
-
-use std::sync::atomic::{AtomicU64, Ordering};

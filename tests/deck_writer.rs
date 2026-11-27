@@ -892,3 +892,131 @@ fn deferred_subcircuit_measurement_ignores_physical_source_maps() {
         Some("subcircuits[0].measurements[0].request.Deferred.auto_gnd: differs")
     );
 }
+
+#[test]
+fn streaming_writer_matches_collector_and_exact_limits() {
+    use ngspice_rs::netlist::{WriteLimits, write_netlist_to};
+
+    let netlist = parse("t\n.subckt cell a b\nr1 a b 1k\n.ends cell\nx1 a 0 cell\n.end\n");
+    let expected = write_netlist(&netlist).unwrap();
+    let limits = WriteLimits {
+        bytes: expected.len(),
+        card_bytes: expected.split_inclusive('\n').map(str::len).max().unwrap(),
+        cards: 5,
+        depth: 1,
+    };
+    let mut output = Vec::new();
+    write_netlist_to(&netlist, &mut output, limits).unwrap();
+    assert_eq!(output, expected.as_bytes());
+    for limit in [
+        WriteLimits {
+            bytes: limits.bytes - 1,
+            ..limits
+        },
+        WriteLimits {
+            card_bytes: limits.card_bytes - 1,
+            ..limits
+        },
+        WriteLimits {
+            cards: limits.cards - 1,
+            ..limits
+        },
+        WriteLimits { depth: 0, ..limits },
+    ] {
+        output.clear();
+        assert!(matches!(
+            write_netlist_to(&netlist, &mut output, limit),
+            Err(SpiceError::Unsupported { .. })
+        ));
+        assert!(expected.as_bytes().starts_with(&output));
+    }
+}
+
+#[test]
+fn streaming_writer_reports_partial_sink_failure_without_flushing() {
+    use ngspice_rs::netlist::{WriteLimits, write_netlist_to};
+    use std::io::{self, Write};
+
+    struct FailingSink {
+        output: Vec<u8>,
+        remaining: usize,
+    }
+    impl Write for FailingSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::other("intentional sink failure"));
+            }
+            let count = bytes.len().min(self.remaining);
+            self.output.extend_from_slice(&bytes[..count]);
+            self.remaining -= count;
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            panic!("the writer must not flush a caller-owned sink");
+        }
+    }
+
+    let netlist = parse("t\n.subckt cell a b\nr1 a b 1k\n.ends cell\n.end\n");
+    let expected = write_netlist(&netlist).unwrap();
+    for at in 0..expected.len() {
+        let mut sink = FailingSink {
+            output: Vec::new(),
+            remaining: at,
+        };
+        let error = write_netlist_to(&netlist, &mut sink, WriteLimits::default()).unwrap_err();
+        assert!(matches!(error, SpiceError::Io { .. }), "{error}");
+        assert_eq!(sink.output, expected.as_bytes()[..at]);
+    }
+}
+
+#[test]
+fn oversized_parameter_is_refused_before_its_card_is_emitted() {
+    use ngspice_rs::netlist::{WriteLimits, write_netlist_to};
+
+    let mut netlist = parse("t\nr1 a b 1k\n.end\n");
+    netlist.devices[0].parameters[0].value = "1".repeat(1 << 20);
+    let mut output = Vec::new();
+    let error = write_netlist_to(
+        &netlist,
+        &mut output,
+        WriteLimits {
+            card_bytes: 128,
+            ..WriteLimits::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("byte limit"), "{error}");
+    assert_eq!(output, b"t\n");
+}
+
+#[test]
+fn nested_writer_checks_depth_and_preserves_exact_normalization() {
+    use ngspice_rs::netlist::{WriteLimits, write_netlist_to};
+    use std::fmt::Write as _;
+
+    let mut text = String::from("deep\n");
+    for i in 0..64 {
+        writeln!(text, ".subckt c{i} a b").unwrap();
+    }
+    text.push_str("r1 a b 1k\n");
+    for i in (0..64).rev() {
+        writeln!(text, ".ends c{i}").unwrap();
+    }
+    text.push_str(".end\n");
+    let (expected, netlist, _) = round_trip(&text);
+    let mut output = Vec::new();
+    write_netlist_to(&netlist, &mut output, WriteLimits::default()).unwrap();
+    assert_eq!(output, expected.as_bytes());
+    output.clear();
+    let error = write_netlist_to(
+        &netlist,
+        &mut output,
+        WriteLimits {
+            depth: 63,
+            ..WriteLimits::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("depth limit"), "{error}");
+}

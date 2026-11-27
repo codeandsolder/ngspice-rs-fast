@@ -8,7 +8,7 @@ card 1 @parser/bsim3_schema.cir:4:1 lines=4-4 continuations=0
   token 2 4:4 word "d"
   token 3 4:6 number "0" value=0e0
   token 4 4:8 word "dc"
-  token 5 4:11 number "1.2" value=1.2000000000000002e0
+  token 5 4:11 number "1.2" value=1.2e0
 card 2 @parser/bsim3_schema.cir:5:1 lines=5-5 continuations=0
   raw: "vg g 0 dc 1"
   kind: device(v)
@@ -24,7 +24,7 @@ card 3 @parser/bsim3_schema.cir:6:1 lines=6-6 continuations=0
   token 2 6:4 word "dp"
   token 3 6:7 number "0" value=0e0
   token 4 6:9 word "dc"
-  token 5 6:12 number "-1.2" value=-1.2000000000000002e0
+  token 5 6:12 number "-1.2" value=-1.2e0
 card 4 @parser/bsim3_schema.cir:7:1 lines=7-7 continuations=0
   raw: "vpg gp 0 dc -1"
   kind: device(v)
@@ -44,7 +44,7 @@ card 5 @parser/bsim3_schema.cir:8:1 lines=8-9 continuations=1
   token 6 8:12 word "nch"
   token 7 8:16 word "l"
   token 8 8:17 equals "="
-  token 9 8:18 number "180n" value=1.8000000000000002e-7
+  token 9 8:18 number "180n" value=1.8e-7
   token 10 8:23 word "w"
   token 11 8:24 equals "="
   token 12 8:25 number "1u" value=1e-6
@@ -83,7 +83,7 @@ card 5 @parser/bsim3_schema.cir:8:1 lines=8-9 continuations=1
   token 45 9:48 number "5m" value=5e-3
   token 46 9:51 word "mulu0"
   token 47 9:56 equals "="
-  token 48 9:57 number "0.95" value=9.500000000000001e-1
+  token 48 9:57 number "0.95" value=9.5e-1
 card 6 @parser/bsim3_schema.cir:10:1 lines=10-10 continuations=0
   raw: "m2 dp gp 0 0 pcore l=500n w=2u ic=(-0.1,-0.2,0) off"
   kind: device(m)
@@ -95,7 +95,7 @@ card 6 @parser/bsim3_schema.cir:10:1 lines=10-10 continuations=0
   token 6 10:14 word "pcore"
   token 7 10:20 word "l"
   token 8 10:21 equals "="
-  token 9 10:22 number "500n" value=5.000000000000001e-7
+  token 9 10:22 number "500n" value=5e-7
   token 10 10:27 word "w"
   token 11 10:28 equals "="
   token 12 10:29 number "2u" value=2e-6
@@ -123,16 +123,16 @@ card 7 @parser/bsim3_schema.cir:11:1 lines=11-21 continuations=10
   token 9 11:36 word "3.3.0"
   token 10 12:3 word "lmin"
   token 11 12:7 equals "="
-  token 12 12:8 number "100n" value=1.0000000000000001e-7
+  token 12 12:8 number "100n" value=1e-7
   token 13 12:13 word "lmax"
   token 14 12:17 equals "="
-  token 15 12:18 number "250n" value=2.5000000000000004e-7
+  token 15 12:18 number "250n" value=2.5e-7
   token 16 12:23 word "wmin"
   token 17 12:27 equals "="
-  token 18 12:28 number "500n" value=5.000000000000001e-7
+  token 18 12:28 number "500n" value=5e-7
   token 19 12:33 word "wmax"
   token 20 12:37 equals "="
-  token 21 12:38 number "10u" value=9.999999999999999e-6
+  token 21 12:38 number "10u" value=1e-5
   token 22 13:3 word "capmod"
   token 23 13:9 equals "="
   token 24 13:10 number "3" value=3e0
@@ -159,7 +159,7 @@ card 7 @parser/bsim3_schema.cir:11:1 lines=11-21 continuations=10
   token 45 14:25 number "4.1n" value=4.1e-9
   token 46 14:30 word "xj"
   token 47 14:32 equals "="
-  token 48 14:33 number "100n" value=1.0000000000000001e-7
+  token 48 14:33 number "100n" value=1e-7
   token 49 14:38 word "nch"
   token 50 14:41 equals "="
   token 51 14:42 number "2.3e17" value=2.3e17
@@ -177,7 +177,7 @@ card 7 @parser/bsim3_schema.cir:11:1 lines=11-21 continuations=10
   token 63 15:15 number "0.53" value=5.3e-1
   token 64 15:20 word "k2"
   token 65 15:22 equals "="
-  token 66 15:23 number "-0.018" value=-1.8000000000000002e-2
+  token 66 15:23 number "-0.018" value=-1.8e-2
   token 67 15:30 word "u0"
   token 68 15:32 equals "="
   token 69 15:33 number "450" value=4.5e2
@@ -186,7 +186,7 @@ card 7 @parser/bsim3_schema.cir:11:1 lines=11-21 continuations=10
   token 72 15:40 number "2.25e-9" value=2.25e-9
   token 73 15:48 word "ub"
   token 74 15:50 equals "="
-  token 75 15:51 number "5.87e-19" value=5.869999999999999e-19
+  token 75 15:51 number "5.87e-19" value=5.87e-19
   token 76 15:60 word "uc"
   token 77 15:62 equals "="
   token 78 15:63 number "-4.65e-11" value=-4.65e-11
@@ -204,7 +204,7 @@ card 7 @parser/bsim3_schema.cir:11:1 lines=11-21 continuations=10
   token 90 16:25 number "1" value=1e0
   token 91 16:27 word "nfactor"
   token 92 16:34 equals "="
-  token 93 16:35 number "1.2" value=1.2000000000000002e0
+  token 93 16:35 number "1.2" value=1.2e0
   token 94 16:39 word "voff"
   token 95 16:43 equals "="
   token 96 16:44 number "-0.08" value=-8e-2
@@ -315,19 +315,19 @@ card 8 @parser/bsim3_schema.cir:22:1 lines=22-23 continuations=1
   token 6 22:25 number "8" value=8e0
   token 7 22:27 word "version"
   token 8 22:34 equals "="
-  token 9 22:35 number "3.3" value=3.3000000000000003e0
+  token 9 22:35 number "3.3" value=3.3e0
   token 10 22:39 word "lmin"
   token 11 22:43 equals "="
-  token 12 22:44 number "250n" value=2.5000000000000004e-7
+  token 12 22:44 number "250n" value=2.5e-7
   token 13 22:49 word "lmax"
   token 14 22:53 equals "="
   token 15 22:54 number "1u" value=1e-6
   token 16 22:57 word "wmin"
   token 17 22:61 equals "="
-  token 18 22:62 number "500n" value=5.000000000000001e-7
+  token 18 22:62 number "500n" value=5e-7
   token 19 22:67 word "wmax"
   token 20 22:71 equals "="
-  token 21 22:72 number "10u" value=9.999999999999999e-6
+  token 21 22:72 number "10u" value=1e-5
   token 22 23:3 word "tox"
   token 23 23:6 equals "="
   token 24 23:7 number "4.1n" value=4.1e-9
@@ -348,7 +348,7 @@ card 9 @parser/bsim3_schema.cir:24:1 lines=24-25 continuations=1
   token 6 24:25 number "8" value=8e0
   token 7 24:27 word "version"
   token 8 24:34 equals "="
-  token 9 24:35 number "3.30" value=3.3000000000000003e0
+  token 9 24:35 number "3.30" value=3.3e0
   token 10 24:40 word "tox"
   token 11 24:43 equals "="
   token 12 24:44 number "4.1n" value=4.1e-9
@@ -369,7 +369,7 @@ card 9 @parser/bsim3_schema.cir:24:1 lines=24-25 continuations=1
   token 27 25:27 number "0.55" value=5.5e-1
   token 28 25:32 word "k2"
   token 29 25:34 equals "="
-  token 30 25:35 number "-0.018" value=-1.8000000000000002e-2
+  token 30 25:35 number "-0.018" value=-1.8e-2
   token 31 25:42 word "rsh"
   token 32 25:45 equals "="
   token 33 25:46 number "10" value=1e1
