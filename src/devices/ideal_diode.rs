@@ -1,4 +1,4 @@
-//! Explicit native LTspice idealized diode; standard D models are untouched.
+//! Explicit native `LTspice` idealized diode; standard D models are untouched.
 //! The source front end selects this family instead of translating it to an
 //! approximate XSPICE code model.
 
@@ -259,9 +259,11 @@ impl IdealDiode {
     }
 
     fn point(&self, voltage: Real, context: &ModelContext) -> SpiceResult<Point> {
-        let local = self
-            .prepared_at(context)?
-            .point(voltage / self.instance.series);
+        self.scaled_point(voltage, self.prepared_at(context)?)
+    }
+
+    fn scaled_point(&self, voltage: Real, prepared: Prepared) -> SpiceResult<Point> {
+        let local = prepared.point(voltage / self.instance.series);
         let current = local.current * self.instance.multiplier;
         let conductance = law::ratio_product(
             local.conductance,
@@ -312,13 +314,13 @@ impl Device for IdealDiode {
         let [a, c] = self.terminals;
         let raw = context.node_voltage(a) - context.node_voltage(c);
         let mut voltage = raw;
-        if self.prepared.has_limit() {
+        let prepared = self.prepared_at(&context.model_context())?;
+        if prepared.has_limit() {
             let states = &mut context.states;
             match Linearization::classify(states) {
                 Linearization::Initial | Linearization::Limited => {
                     let previous = previous_finite(states, 0).unwrap_or(0.);
-                    let local = self
-                        .prepared
+                    let local = prepared
                         .limit_trial(raw / self.instance.series, previous / self.instance.series);
                     if local.to_bits() != (raw / self.instance.series).to_bits() {
                         voltage = local * self.instance.series;
@@ -329,7 +331,7 @@ impl Device for IdealDiode {
             }
             states.set(0, voltage)?;
         }
-        let point = self.point(voltage, &context.model_context())?;
+        let point = self.scaled_point(voltage, prepared)?;
         super::rlc::stamp_conductance(self.terminals, point.conductance, context)?;
         let rhs = point.conductance.mul_add(voltage, -point.current);
         context.stamp_rhs(a, rhs)?;

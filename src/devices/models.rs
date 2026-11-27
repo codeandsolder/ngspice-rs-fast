@@ -54,7 +54,7 @@ pub enum ModelFamily {
     Diode,
     /// Explicit source-selected `SIMetrix` level-1 diode.
     SimetrixDiodeLevel1,
-    /// Explicit source-selected LTspice idealized diode.
+    /// Explicit source-selected `LTspice` idealized diode.
     LtspiceIdealDiode,
     /// NPN classic BJT.
     Npn,
@@ -175,7 +175,7 @@ pub enum ModelBackend {
     Diode,
     /// Explicit source-selected `SIMetrix` level-1 diode.
     SimetrixDiodeLevel1,
-    /// Explicit source-selected LTspice idealized diode.
+    /// Explicit source-selected `LTspice` idealized diode.
     LtspiceIdealDiode,
     /// Gummel-Poon.
     Bjt,

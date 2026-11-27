@@ -162,34 +162,56 @@ impl Branch {
         // Hyperbolic addition avoids subtracting the (potentially very
         // large) horizontal offset. Evaluate sech^2 without cancellation
         // when tanh(z) has rounded to one.
-        let scaled = if t == 0. {
-            excess * self.on
+        let increment = if z < Real::MIN_POSITIVE {
+            // In the subnormal/zero range tanh(z) is z to machine precision.
+            // Avoid losing a representable current to normalization by L.
+            excess * self.join.conductance
         } else {
-            limit.maximum * t
+            ratio_product(limit.maximum * t, self.join.conductance, self.on) / denominator
         };
         let decay = (-2. * z).exp();
-        let sech_squared = 4. * decay / (1. + decay).powi(2);
-        let increment = ratio_product(scaled, self.join.conductance, self.on) / denominator;
+        let conductance = if decay.is_normal() {
+            self.join.conductance * (4. * decay / (1. + decay).powi(2)) / denominator.powi(2)
+        } else {
+            // Four equal exponent factors keep every possible nonzero
+            // binary64 result in range, even if exp(-2z) underflows.
+            // The first factor includes 4 / denominator^2; all following
+            // factors decrease magnitude, and 1 + decay rounds to one.
+            let quarter = (-0.5 * z).exp();
+            (((self.join.conductance * (4. * quarter / denominator.powi(2))) * quarter) * quarter)
+                * quarter
+        };
         Point {
             current: (self.join.current + increment).min(limit.maximum),
-            conductance: self.join.conductance * sech_squared / denominator.powi(2),
+            conductance,
         }
     }
+}
+
+/// Compute 1 - w*h/(2*L) without rounding the product before subtracting.
+/// A negative remainder means there is no nonnegative tangent solution.
+fn remaining_limit_fraction(width: Real, off: Real, maximum: Real) -> SpiceResult<Real> {
+    if off == 0. {
+        return Ok(1.);
+    }
+    let (mw, ew) = split_power(width);
+    let (mh, eh) = split_power(off);
+    let (ml, el) = split_power(maximum);
+    let remainder = (-mw).mul_add(scale_power(mh, ew + eh - el - 1), ml);
+    if remainder < 0. {
+        return Err(SpiceError::circuit(
+            "ideal diode smoothing width and leakage exceed the current limit",
+        ));
+    }
+    Ok(remainder / ml)
 }
 
 fn limited_join(off: Real, on: Real, width: Real, maximum: Real) -> SpiceResult<(Real, Real)> {
     // Let u=I_join/I_limit. Continuity of current and slope gives
     // u = width/(2*I_limit) * [G_off + G_on*(1-u^2)].
     // Normalize conductances before solving the quadratic, then use its
-    // cancellation-free positive root. The physically possible root is
-    // within [0,1]; a wider transition than the leakage alone permits
-    // has no finite tangent match.
-    let leakage = ratio_product(width, off, maximum);
-    if leakage > 2. {
-        return Err(SpiceError::circuit(
-            "ideal diode smoothing width and leakage exceed the current limit",
-        ));
-    }
+    // cancellation-free positive root.
+    let remaining = remaining_limit_fraction(width, off, maximum)?;
     let scale = on.max(off);
     let a = on / scale;
     let b = off / scale;
@@ -203,12 +225,21 @@ fn limited_join(off: Real, on: Real, width: Real, maximum: Real) -> SpiceResult<
         2. * sum / (inverse + inverse.hypot(2. * (a * sum).sqrt()))
     };
     let u = root.clamp(0., 1.);
-    let conductance = if u.to_bits() == 1_f64.to_bits() {
-        // At machine precision the root can round to the asymptote while
-        // the tangent slope remains nonzero.
-        (ratio_product(maximum, 2. * u, width) - off).max(0.)
+    // Use the complementary quadratic identity instead of subtracting
+    // a rounded u from one. With X=w*g/(2*L), Y=w*h/(2*L):
+    // (1-u)*(1+X*(1+u)) = 1-Y.
+    // Both branches preserve a finite slope even when X overflows or u
+    // rounds to one. The second form cancels X analytically.
+    let on_ratio = ratio_product(width, on, maximum);
+    let factor = 1. + u;
+    let conductance = if on_ratio <= 2. {
+        ratio_product(on, remaining * factor, (0.5 * on_ratio).mul_add(factor, 1.))
     } else {
-        on * ((1. - u) * (1. + u))
+        ratio_product(
+            maximum,
+            2. * remaining / (1. + (2. / on_ratio) / factor),
+            width,
+        )
     };
     Ok((u, conductance))
 }
@@ -260,6 +291,47 @@ mod tests {
         assert_eq!(point.current.to_bits(), 1_f64.to_bits());
         let expected = 1. / 30_f64.cosh().powi(2);
         assert!((point.conductance / expected - 1.).abs() < 1e-14);
+        Ok(())
+    }
+
+    #[test]
+    fn limited_tail_preserves_representable_conductance_at_extreme_scales() -> SpiceResult<()> {
+        // Independent 100-digit decimal evaluation of 4*g*exp(-2*z)/(1+exp(-2*z))^2.
+        for (on, voltage, expected) in [
+            (1e300, 400., 1.467_149_833_671_074_9e-47),
+            (1e300, 700., 3.888_528_861_902_665e-308),
+            (1e308, 720., 1.651_984_6e-317),
+            (1e308, 727., Real::from_bits(3)),
+        ] {
+            let branch = Branch::new(0., 0., on, 0., Some(on))?;
+            let actual = branch.point(voltage).conductance;
+            assert!(actual > 0.);
+            let ulp = Real::from_bits(expected.to_bits() + 1) - expected;
+            assert!(
+                (actual - expected).abs() <= 2e-13 * expected + ulp,
+                "{actual:e} != {expected:e}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tangent_matching_retains_small_join_slope() -> SpiceResult<()> {
+        // When the normalized join rounds toward one, its complementary
+        // distance is not recoverable by subtraction. Compare the implicit
+        // tangent equation in terms of physical conductance.
+        for on in [1e10, 1e14, 1e16, 1e100, 1e300] {
+            let (u, slope) = limited_join(0., on, 1., 1.)?;
+            assert!((slope - 2. * u).abs() < 4e-15, "{on:e} {u:e} {slope:e}");
+        }
+        // (1+2^-52)*(1-2^-52) = 1-2^-104. The rounded product is
+        // exactly one, but the positive remaining current must survive.
+        let width = 1. + Real::EPSILON;
+        let off = 1. - Real::EPSILON;
+        let remaining = remaining_limit_fraction(width, off, 0.5)?;
+        assert_eq!(remaining.to_bits(), 2_f64.powi(-104).to_bits());
+        let (_, slope) = limited_join(off, 1., width, 0.5)?;
+        assert!(slope > 0.);
         Ok(())
     }
 }

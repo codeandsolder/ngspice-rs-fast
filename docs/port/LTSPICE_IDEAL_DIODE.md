@@ -32,7 +32,9 @@ G_join = g*(1-u*u)
 ```
 
 The positive quadratic root is evaluated without subtracting nearly
-equal roots. Beyond the join, z=(d-w)*g/L and t=tanh(z).
+equal roots. The complementary quadratic identity computes the join
+slope independently of the rounded normalized current, and fused scaled
+subtraction retains a small remaining current budget. Beyond the join, z=(d-w)*g/L and t=tanh(z).
 Hyperbolic addition yields
 
 ```text
@@ -42,7 +44,9 @@ G = G_join*sech(z)^2/(1+u*t)^2
 
 With w=0, u and I_join are zero. Computing sech squared from the
 decaying exponential retains representable derivatives after tanh
-rounds to one. Model inputs for which no tangent-matched transition
+rounds to one. In the extreme tail, factor the exponential before
+multiplication so a large conductance can recover a representable
+derivative even after the standalone exponential underflows. Model inputs for which no tangent-matched transition
 exists are rejected. Forward and reverse parameters are independent.
 
 ## Solver binding
