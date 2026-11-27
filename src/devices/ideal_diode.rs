@@ -5,13 +5,17 @@
 mod law;
 
 use crate::maths::Vector;
-use crate::netlist::ast::{DeviceInstance, ParameterAssignment};
+use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind};
 use crate::primitives::{NodeAppend, NodeId, Real, SourceLoc, SpiceError, SpiceResult};
 
 use super::{
     Device, ModelContext, ResolvedModel, StampContext,
     limiting::{Linearization, previous_finite},
     linear::LinearContext,
+    noise::{
+        CELSIUS_TO_KELVIN, DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind,
+        NoiseSource,
+    },
     schema::finite_literal,
 };
 use law::{Branch, Point};
@@ -29,6 +33,8 @@ struct Model {
     revilimit: Option<Real>,
     epsilon: Real,
     revepsilon: Real,
+    kf: Real,
+    af: Real,
 }
 
 impl Default for Model {
@@ -43,6 +49,8 @@ impl Default for Model {
             revilimit: None,
             epsilon: 0.,
             revepsilon: 0.,
+            kf: 0.,
+            af: 1.,
         }
     }
 }
@@ -94,7 +102,12 @@ impl Model {
                 "revilimit" => result.revilimit = Some(positive(value, location, name)?),
                 "epsilon" => result.epsilon = nonnegative(value, location, name)?,
                 "revepsilon" => result.revepsilon = nonnegative(value, location, name)?,
-                "level" if value.to_bits() == 1_f64.to_bits() => {}
+                "kf" => result.kf = nonnegative(value, location, name)?,
+                "af" => result.af = value,
+                "level" => {} // Ordered level resolution already selected this family.
+                // Semiconductor-only parameters have no effect on idealized conduction.
+                "is" | "rs" | "n" | "tt" | "cjo" | "vj" | "m" | "eg" | "xti" | "fc" | "bv"
+                | "ibv" | "isr" | "nr" | "ikf" | "tikf" | "tnom" | "trs1" | "trs2" => {}
                 // Documented schematic ratings, not electrical setters.
                 "vpk" | "ipk" | "iave" | "irms" | "diss" => {}
                 _ => return Err(unsupported(field)),
@@ -105,7 +118,9 @@ impl Model {
 
     fn prepare(self, gmin: Real) -> SpiceResult<Prepared> {
         let off = self.roff.map_or(gmin, Real::recip);
-        if !off.is_finite()
+        if !gmin.is_finite()
+            || gmin < 0.
+            || !off.is_finite()
             || off < 0.
             || !self.ron.recip().is_finite()
             || self.rrev.is_some_and(|value| !value.recip().is_finite())
@@ -129,6 +144,7 @@ impl Model {
             .transpose()?;
         Ok(Prepared {
             off,
+            floor: gmin / 1000.,
             forward,
             reverse,
         })
@@ -138,6 +154,7 @@ impl Model {
 #[derive(Clone, Copy, Debug)]
 struct Prepared {
     off: Real,
+    floor: Real,
     forward: Branch,
     reverse: Option<Branch>,
 }
@@ -157,7 +174,7 @@ impl Prepared {
     }
 
     fn point(self, voltage: Real) -> Point {
-        if voltage >= 0. {
+        if voltage > 0. || (voltage == 0. && self.forward.starts_at_zero()) {
             self.forward.point(voltage)
         } else if let Some(reverse) = self.reverse {
             let point = reverse.point(-voltage);
@@ -208,6 +225,9 @@ impl Instance {
     fn read(instance: &DeviceInstance) -> SpiceResult<Self> {
         let mut result = Self::default();
         for field in &instance.parameters {
+            if field.name == "off" && field.kind == ParameterKind::Flag {
+                continue; // No stored on/off state in the idealized family.
+            }
             result.set(&field.name, finite_literal(field)?, &field.location)?;
         }
         Ok(result)
@@ -263,13 +283,16 @@ impl IdealDiode {
     }
 
     fn scaled_point(&self, voltage: Real, prepared: Prepared) -> SpiceResult<Point> {
-        let local = prepared.point(voltage / self.instance.series);
-        let current = local.current * self.instance.multiplier;
+        let local_voltage = voltage / self.instance.series;
+        let local = prepared.point(local_voltage);
+        let current = prepared
+            .floor
+            .mul_add(local_voltage, local.current * self.instance.multiplier);
         let conductance = law::ratio_product(
             local.conductance,
             self.instance.multiplier,
             self.instance.series,
-        );
+        ) + prepared.floor / self.instance.series;
         if voltage.is_finite() && current.is_finite() && conductance.is_finite() {
             Ok(Point {
                 current,
@@ -368,6 +391,58 @@ impl Device for IdealDiode {
     ) -> SpiceResult<()> {
         // Idealized conduction has no stored charge.
         Ok(())
+    }
+    fn noise(
+        &self,
+        context: &NoiseContext<'_>,
+        sources: &mut Vec<NoiseSource>,
+    ) -> SpiceResult<DeviceNoise<'_>> {
+        let [a, c] = self.terminals;
+        let point = self.point(
+            context.voltage(a) - context.voltage(c),
+            context.model_context,
+        )?;
+        let temperature = self
+            .instance
+            .temperature
+            .map_or_else(|| context.circuit_kelvin(), |t| t + CELSIUS_TO_KELVIN);
+        let current = point.current.abs();
+        let flicker = law::flicker_numerator(self.model.kf, self.model.af, current);
+        if !flicker.is_finite() {
+            return Err(SpiceError::circuit(
+                "nonrepresentable ideal diode flicker noise",
+            ));
+        }
+        sources.extend([
+            NoiseSource::new(
+                "_rs",
+                self.terminals,
+                NoiseKind::Thermal {
+                    conductance: point.conductance,
+                    temperature,
+                },
+            ),
+            NoiseSource::new(
+                "_id",
+                self.terminals,
+                NoiseKind::Shot {
+                    current: current / self.instance.series,
+                },
+            ),
+            NoiseSource::new(
+                "_1overf",
+                self.terminals,
+                NoiseKind::Flicker {
+                    numerator: flicker,
+                    law: FlickerLaw::PerHertz,
+                },
+            ),
+        ]);
+        Ok(DeviceNoise::Sources {
+            family: NoiseFamily::Diode,
+            model: Some(&self.model_name),
+            total: true,
+        })
     }
     fn observation_parameter(
         &self,

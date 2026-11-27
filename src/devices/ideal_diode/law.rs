@@ -30,6 +30,20 @@ pub(super) fn ratio_product(a: Real, b: Real, c: Real) -> Real {
     scale_power(mantissa, ea + eb - ec + adjustment)
 }
 
+/// Preserve finite scaled power-law noise even when the unscaled power is
+/// outside the floating-point range. A disabled generator is exactly zero.
+pub(super) fn flicker_numerator(kf: Real, af: Real, current: Real) -> Real {
+    if kf == 0. {
+        return 0.;
+    }
+    let power = current.powf(af);
+    if power.is_normal() || current == 0. {
+        kf * power
+    } else {
+        af.mul_add(current.ln(), kf.ln()).exp()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Limited {
     maximum: Real,
@@ -100,7 +114,7 @@ impl Branch {
     }
 
     pub(super) fn point(self, voltage: Real) -> Point {
-        if voltage <= self.threshold {
+        if voltage < self.threshold {
             return Point {
                 current: voltage * self.off,
                 conductance: self.off,
@@ -128,6 +142,10 @@ impl Branch {
             current: baseline + outer.current,
             conductance: outer.conductance,
         }
+    }
+
+    pub(super) fn starts_at_zero(self) -> bool {
+        self.threshold == 0.
     }
 
     pub(super) const fn has_limit(self) -> bool {

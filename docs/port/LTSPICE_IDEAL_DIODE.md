@@ -16,7 +16,9 @@ the off conductance, g the on conductance, w the smoothing width and
 L an optional current limit. Use the magnitude of voltage on that
 side and reflect the reverse current's sign.
 
-Below T, I=hV. Above T define d=V-T and the baseline I0=hT.
+Below T, I=hV. At an unsmoothed threshold the conducting-side slope
+applies (at zero, a zero forward threshold takes precedence over a zero
+reverse threshold). Above T define d=V-T and the baseline I0=hT.
 For w>0 the transition adds a quadratic increment to I0:
 d times the average of h and the interpolated slope.
 Without a finite current limit the slope at the outer join is g;
@@ -53,10 +55,15 @@ exists are rejected. Forward and reverse parameters are independent.
 
 Ron defaults to one ohm; Roff defaults to the reciprocal of the
 effective Gmin (zero conductance for zero Gmin); Rrev defaults to Ron.
-No explicit Vrev means no reverse conducting branch. M scales
-terminal current and N scales terminal voltage; differential
-conductance scales by M/N. Model values are resolved before
-elaboration. Explicit parameter edits are validated.
+No explicit Vrev means no reverse conducting branch. Independent
+measurements establish an additional parallel conductance of Gmin/1000
+per series element, unaffected by M. For local voltage v=V/N,
+terminal current is M*I(v)+(Gmin/1000)*v, and differential conductance
+is (M*G(v)+Gmin/1000)/N. This floor is outside the smoothing and
+current-limiting law. Model values are resolved before elaboration.
+The last rounded LEVEL setter must be 0 or 1 for the ideal family;
+other levels require a distinct semiconductor model. Explicit
+parameter edits are validated.
 
 The DC Jacobian is the derivative of the same current used in the
 residual. AC and pole-zero use this differential conductance.
@@ -76,10 +83,16 @@ only for common piecewise-linear regions, not as an oracle for the
 different smooth or finite-limit regions. The witness circuit and
 regeneration command are under `tests/fixtures/ltspice_ideal_diode`.
 
-A small default leakage discrepancy remains: a measured 1.001 pS
-with a documented 1 pS Gmin. The implementation follows the
-documented default rather than inventing an additional conductance.
-Area and temperature are observable instance metadata; a
-temperature-dependent constitutive law has not been established.
-Noise and unsupported model/instance fields are explicit
-diagnostics rather than approximated semiconductor physics.
+The independent LTspice 24.0.12 witnesses include 85 DC floor samples,
+11 AC bias/level configurations and 135 noise-frequency samples.
+Thermal current noise is 4*k*T times the complete terminal differential
+conductance. Shot noise is 2*q*abs(I)/N, and flicker noise is
+KF*abs(I)^AF/f (no extra multiplier or series-count factor). The common
+noise machinery sums independent generator powers; instance temperature
+overrides circuit temperature. The two simulators use slightly different
+physical constants, accounted for by the measured comparison tolerance.
+
+Area is observable metadata but electrically inert in the ideal family.
+The tested semiconductor-only setters (including RS, IS, junction charge
+and temperature coefficients) and the OFF flag do not modify this law.
+Unrecognized fields and nonrepresentable noise remain explicit errors.

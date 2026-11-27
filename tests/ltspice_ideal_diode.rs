@@ -167,15 +167,10 @@ fn default_off_conductance_rebinds_with_gmin() -> Result<()> {
     )?;
     let context = ModelContext::default().with_gmin(1e-12);
     let circuit = Circuit::from_netlist_with_context(&deck, &context)?;
-    // Public default is Gmin; the measured vendor point differs by 1e-15 S.
-    close(
-        dc_current(&circuit, &context, "v1")?,
-        -1.001e-12,
-        1.1e-15,
-        0.,
-    );
+    // The independently measured parallel floor is Gmin/1000.
+    close(dc_current(&circuit, &context, "v1")?, -1.001e-12, 0., 1e-10);
     let other = context.with_gmin(1e-5);
-    close(dc_current(&circuit, &other, "v1")?, -1e-5, 1e-12, 1e-10);
+    close(dc_current(&circuit, &other, "v1")?, -1.001e-5, 0., 1e-10);
     Ok(())
 }
 
@@ -187,7 +182,8 @@ fn invalid_model_and_instance_fields_are_not_ignored() -> Result<()> {
         "epsilon=-1",
         "ilimit=0",
         "level=2",
-        "is=1p",
+        "kf=-1p",
+        "unknown_parameter=1p",
         "roff=1 epsilon=10 ilimit=1",
     ] {
         let deck = parse(&format!(
@@ -195,7 +191,7 @@ fn invalid_model_and_instance_fields_are_not_ignored() -> Result<()> {
         ))?;
         assert!(Circuit::from_netlist(&deck).is_err(), "{parameters}");
     }
-    for fields in ["m=0", "n=0", "temp=-300", "dtemp=1", "off"] {
+    for fields in ["m=0", "n=0", "temp=-300", "dtemp=1"] {
         let deck = parse(&format!(
             "bad\nD1 a 0 dm {fields}\n.model dm ltspice_ideal_diode(ron=2)\n.end\n"
         ))?;
@@ -308,6 +304,178 @@ fn current_driven_limited_branches() -> Result<()> {
             1e-8,
             1e-7,
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn vendor_threshold_and_level_selection() -> Result<()> {
+    for line in include_str!("fixtures/ltspice_ideal_diode/ac-witness.tsv").lines() {
+        let fields: Vec<_> = line.split('\t').collect();
+        let [name, bias, instance, model, gmin, conductance] = fields.as_slice() else {
+            return Err("invalid AC witness row".into());
+        };
+        let text = format!(
+            "{name}\nV1 a 0 DC {bias} AC 1\nD1 a 0 dm {instance}\n.model dm ltspice_ideal_diode({model})\n.options gmin={gmin}\n.ac lin 3 1k 1meg\n.end\n"
+        );
+        let deck = parse(&text)?;
+        let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
+        let plot = config
+            .plan_for(&deck.analyses[0])?
+            .run(&mut config.circuit(&deck)?, &config.context())?;
+        for row in 0..plot.point_count() {
+            let current = plot.value("i(v1)", row).ok_or("AC current")?;
+            close(-current.re, conductance.parse()?, 0., 1e-10);
+            close(current.im, 0., 0., 0.);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vendor_parallel_floor_across_all_branches() -> Result<()> {
+    let rows: Vec<_> = include_str!("fixtures/ltspice_ideal_diode/floor-witness.tsv")
+        .lines()
+        .collect();
+    for block in rows.chunks(17) {
+        let first: Vec<_> = block[0].split('\t').collect();
+        let [name, model, instance, ..] = first.as_slice() else {
+            return Err("invalid DC witness row".into());
+        };
+        let text = format!(
+            "{name}\nV1 a 0 0\nD1 a 0 dm {instance}\n.model dm ltspice_ideal_diode({model})\n.options gmin=1e-12 reltol=1e-10 abstol=1e-24 vntol=1e-12\n.dc V1 -4 4 0.5\n.end\n"
+        );
+        let deck = parse(&text)?;
+        let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
+        let plot = config
+            .plan_for(&deck.analyses[0])?
+            .run(&mut config.circuit(&deck)?, &config.context())?;
+        assert_eq!(plot.point_count(), block.len());
+        for (row, line) in block.iter().enumerate() {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [_, _, _, voltage, current] = fields.as_slice() else {
+                return Err("invalid DC witness row".into());
+            };
+            close(
+                plot.value("v(a)", row).ok_or("voltage")?.re,
+                voltage.parse()?,
+                1e-13,
+                1e-12,
+            );
+            close(
+                -plot.value("i(v1)", row).ok_or("current")?.re,
+                current.parse()?,
+                1e-25,
+                1e-9,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vendor_noise_spectrum_and_geometry() -> Result<()> {
+    let rows: Vec<_> = include_str!("fixtures/ltspice_ideal_diode/noise-witness.tsv")
+        .lines()
+        .collect();
+    for block in rows.chunks(3) {
+        let first: Vec<_> = block[0].split('\t').collect();
+        let [
+            name,
+            bias,
+            model,
+            instance,
+            gmin,
+            temp,
+            voltage,
+            _,
+            gain,
+            ..,
+        ] = first.as_slice()
+        else {
+            return Err("invalid noise witness row".into());
+        };
+        // Preserve the deliberately tiny conductance probes without the
+        // default absolute sparse pivot threshold masking their physics.
+        let pivot = if gain.parse::<Real>()? > 1e12 {
+            "pivtol=1e-30"
+        } else {
+            ""
+        };
+        let text = format!(
+            "{name}\nI1 0 a DC {bias} AC 1\nD1 a 0 dm {instance}\n.model dm ltspice_ideal_diode({model})\n.options gmin={gmin} temp={temp} reltol=1e-10 abstol=1e-18 vntol=1e-12 {pivot}\n.op\n.ac lin 3 1k 1meg\n.noise V(a) I1 lin 3 1k 1meg 1\n.end\n"
+        );
+        let deck = parse(&text)?;
+        let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
+        let mut circuit = config.circuit(&deck)?;
+        let context = config.context();
+        let op = config
+            .plan_for(&deck.analyses[0])?
+            .run(&mut circuit, &context)?;
+        close(
+            op.value("v(a)", 0).ok_or("OP voltage")?.re,
+            voltage.parse()?,
+            1e-10,
+            1e-8,
+        );
+        let ac = config
+            .plan_for(&deck.analyses[1])?
+            .run(&mut circuit, &context)?;
+        let plots = config
+            .plan_for(&deck.analyses[2])?
+            .run_plots(&mut circuit, &context)?;
+        let spectrum = &plots[0];
+        assert_eq!(spectrum.point_count(), block.len(), "{name}");
+        for (row, line) in block.iter().enumerate() {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                frequency,
+                gain,
+                thermal,
+                shot,
+                flicker,
+                total,
+                input,
+            ] = fields.as_slice()
+            else {
+                return Err("invalid noise witness row".into());
+            };
+            close(
+                spectrum.value("frequency", row).ok_or("frequency")?.re,
+                frequency.parse()?,
+                1e-10,
+                1e-12,
+            );
+            close(
+                ac.value("v(a)", row).ok_or("AC gain")?.re,
+                gain.parse()?,
+                0.,
+                1e-8,
+            );
+            for (column, expected) in [
+                ("onoise_d1_rs", thermal),
+                ("onoise_d1_id", shot),
+                ("onoise_d1_1overf", flicker),
+                ("onoise_d1", total),
+                ("onoise_spectrum", total),
+                ("inoise_spectrum", input),
+            ] {
+                let expected: Real = expected.parse()?;
+                let got = spectrum.value(column, row).ok_or(column)?.re;
+                // The two programs use slightly different physical constants.
+                assert!(
+                    (got - expected).abs() <= 2e-6 * expected.abs(),
+                    "{name}: {column}: {got:.17e} != {expected:.17e}"
+                );
+            }
+        }
     }
     Ok(())
 }

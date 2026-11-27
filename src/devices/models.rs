@@ -1209,21 +1209,10 @@ fn level_setters(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSett
     for p in &card.parameters {
         if p.name.eq_ignore_ascii_case("level") {
             let raw = finite_literal(p)?;
-            if matches!(
-                family,
-                ModelFamily::SimetrixDiodeLevel1 | ModelFamily::LtspiceIdealDiode
-            ) && raw.to_bits() != 1_f64.to_bits()
-            {
+            if family == ModelFamily::SimetrixDiodeLevel1 && raw.to_bits() != 1_f64.to_bits() {
                 return Err(SpiceError::parse(
                     p.location.clone(),
-                    format!(
-                        "{} diode requires LEVEL=1, got {raw}",
-                        if family == ModelFamily::SimetrixDiodeLevel1 {
-                            "SIMetrix"
-                        } else {
-                            "LTspice ideal"
-                        }
-                    ),
+                    format!("SIMetrix diode requires LEVEL=1, got {raw}"),
                 ));
             }
             if family == ModelFamily::LtspiceSwitch
@@ -1267,6 +1256,10 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
         | ModelFamily::Nmf
         | ModelFamily::Pmf => (first_integer, true, None),
         ModelFamily::Resistor if card.base.eq_ignore_ascii_case("r") => (first_integer, true, None),
+        ModelFamily::LtspiceIdealDiode => {
+            let applied = last.unwrap_or(1);
+            (1, applied <= 1, Some(applied))
+        }
         ModelFamily::Diode => {
             let applied = last.unwrap_or(1);
             (1, applied == 1, Some(applied))
@@ -1292,15 +1285,16 @@ fn levels(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSelection> 
                 "src/spicelib/parser/inpdomod.c (only MESFET levels 1-4 and HFET levels 5-6 exist in C)",
             ));
         }
-        let setter_location = if family == ModelFamily::Diode {
-            card.parameters
-                .iter()
-                .rev()
-                .find(|p| p.name.eq_ignore_ascii_case("level"))
-                .map_or(location, |p| &p.location)
-        } else {
-            location
-        };
+        let setter_location =
+            if matches!(family, ModelFamily::Diode | ModelFamily::LtspiceIdealDiode) {
+                card.parameters
+                    .iter()
+                    .rev()
+                    .find(|p| p.name.eq_ignore_ascii_case("level"))
+                    .map_or(location, |p| &p.location)
+            } else {
+                location
+            };
         let reference = if matches!(family, ModelFamily::Nmos | ModelFamily::Pmos) {
             mos_level_reference(selector)
         } else {
