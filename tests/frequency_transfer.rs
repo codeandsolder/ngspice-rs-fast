@@ -110,7 +110,7 @@ fn one_row_and_zero_real_dc_gain_are_valid() -> SpiceResult<()> {
     );
     let ac = run(&mut c, AnalysisKind::Ac, &["lin", "3", "1", "100"])?;
     for v in ac.column("v(out)").unwrap() {
-        close(*v, Complex::imaginary(-3.));
+        close(v, Complex::imaginary(-3.));
     }
     Ok(())
 }
@@ -263,5 +263,47 @@ fn live_ngspice_47_reference() -> SpiceResult<()> {
         }
     }
     println!("live ngspice 47: 28 complex samples; max absolute error {worst:e}");
+    Ok(())
+}
+
+#[test]
+fn dc_first_ordinate_and_transfer_branch_observations() -> SpiceResult<()> {
+    for (model, gain) in [
+        ("r_i=true table=[100 -2 9 300 3 4]", -2.),
+        ("db=false table=[100 4 60 300 3 0]", 2.),
+        ("r_i=true table=[100 0 -3 300 4 0]", 0.),
+        ("r_i=true table=[100 2 0]", 2.),
+    ] {
+        let mut c = Circuit::from_netlist(&parse(&format!(
+            "v1 in 0 1\na1 in out mdl\n.model mdl xfer({model})\nr1 out 0 1\nbprobe probe 0 v=i(a1)"
+        ))?)?;
+        let dc = run(&mut c, AnalysisKind::DcSweep, &["v1", "-2", "2", "1"])?;
+        assert_eq!(dc.point_count(), 5);
+        for (index, input) in [-2., -1., 0., 1., 2.].into_iter().enumerate() {
+            close(
+                dc.value("v(out)", index).unwrap(),
+                Complex::real(input * gain),
+            );
+            close(
+                dc.value("i(a1)", index).unwrap(),
+                Complex::real(-input * gain),
+            );
+            close(
+                dc.value("v(probe)", index).unwrap(),
+                Complex::real(-input * gain),
+            );
+        }
+    }
+    let mut c = Circuit::from_netlist(&parse(&format!(
+        "i1 0 in dc 1 ac 1\na1 %i(in) %i(out) mdl\n.model mdl xfer({RI})\nr1 out 0 1\nbprobe probe 0 v=i(a1)"
+    ))?)?;
+    let ac = run(&mut c, AnalysisKind::Ac, &["lin", "7", "50", "350"])?;
+    for i in 0..ac.point_count() {
+        let f = ac.value("frequency", i).unwrap().re;
+        close(ac.value("i(a1:input)", i).unwrap(), Complex::real(1.));
+        close(ac.value("i(a1)", i).unwrap(), expected(f));
+        close(ac.value("v(probe)", i).unwrap(), expected(f));
+        close(ac.value("v(out)", i).unwrap(), -expected(f));
+    }
     Ok(())
 }

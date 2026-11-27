@@ -41,9 +41,9 @@ impl Table {
         for parameter in &card.parameters {
             match parameter.name.as_str() {
                 "table" => table = Some(numeric_vector(parameter)?),
-                "r_i" => cartesian = numeric_scalar(parameter)? == 1.,
-                "db" => db = numeric_scalar(parameter)? == 1.,
-                "rad" => radians = numeric_scalar(parameter)? == 1.,
+                "r_i" => cartesian = matches!(numeric_scalar(parameter)?, 1.),
+                "db" => db = matches!(numeric_scalar(parameter)?, 1.),
+                "rad" => radians = matches!(numeric_scalar(parameter)?, 1.),
                 "span" => span = integer(parameter)?,
                 "offset" => offset = integer(parameter)?,
                 _ => return Err(invalid("unsupported table parameter")),
@@ -105,7 +105,7 @@ impl Table {
             return Ok(self.0[0].1);
         }
         let (lo, a) = self.0[upper - 1];
-        if upper == self.0.len() || frequency == lo {
+        if upper == self.0.len() || frequency <= lo {
             return Ok(a);
         }
         let (hi, b) = self.0[upper];
