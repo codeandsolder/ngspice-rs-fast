@@ -50,6 +50,7 @@
 
 pub(super) mod lifecycle;
 pub(super) mod linear;
+mod taylor;
 
 use self::lifecycle::{
     GateStamp, GateUpdate, Junctions, LoadPhase, Loaded, gate_charges, setup_gate_matrix,
@@ -1013,6 +1014,17 @@ impl Device for Jfet {
         }
         .finish(context, start, &loaded)
     }
+    fn physical_taylor_storage_slots(&self) -> &[usize] {
+        &[slot::QGS, slot::QGD]
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        self.stamp_taylor(context)
+    }
+
     fn assemble_nonlinear_charge(
         &self,
         context: &mut crate::devices::traits::ChargeContext<'_>,

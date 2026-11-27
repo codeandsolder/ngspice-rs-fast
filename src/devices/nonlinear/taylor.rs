@@ -11,9 +11,9 @@ use crate::primitives::{Real, SpiceResult};
 
 /// A constitutive value and its local partial derivative with respect to
 /// junction voltage, both expanded along the same state germ.
-pub(super) struct Law {
-    pub(super) value: Jet,
-    pub(super) slope: Jet,
+pub(in crate::devices) struct Law {
+    pub(in crate::devices) value: Jet,
+    pub(in crate::devices) slope: Jet,
 }
 
 impl Law {
@@ -78,7 +78,7 @@ pub(super) fn exponential(v: &Jet, vt: Real, sat: Real) -> Law {
     Law::lift(v, value, argument.exp_with_value(derivative))
 }
 
-fn characteristic(
+pub(in crate::devices) fn characteristic(
     v: &Jet,
     vt: Real,
     sat: Real,
@@ -107,7 +107,7 @@ fn characteristic(
     }
 }
 
-fn depletion(v: &Jet, law: DepletionLaw, cz: Real) -> SpiceResult<Law> {
+pub(in crate::devices) fn depletion(v: &Jet, law: DepletionLaw, cz: Real) -> SpiceResult<Law> {
     let (value, derivative) = law.charge(v.value(), cz, None);
     let slope = if cz == 0. {
         Jet::constant(v.order(), 0.)

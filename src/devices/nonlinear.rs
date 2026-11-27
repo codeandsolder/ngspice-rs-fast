@@ -40,7 +40,7 @@ use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceErro
 pub(super) mod charge;
 mod recovery;
 mod sens;
-mod taylor;
+pub(super) mod taylor;
 pub(super) mod thermal;
 use thermal::{
     BOLTZMANN, DerivedCache, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureKey, band_gap,

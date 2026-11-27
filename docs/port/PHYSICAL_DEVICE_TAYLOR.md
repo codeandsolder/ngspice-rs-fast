@@ -72,3 +72,16 @@ are identical to the ordinary conservative charge-state contract.
 This architecture does not by itself port transistor, arbitrary
 history-dependent or discrete device models. Other device families
 must provide their own exact kernels and local storage contracts.
+
+## Level-1 JFET
+
+The normal and inverse Sydney channel polynomials and their analytic gate
+and drain partials are expanded on the active one-sided germ. Gate
+junction current and depletion charge reuse the native diode Taylor
+laws, with the JFET's temperature-adjusted emission and grading.
+Source/drain series conductances retain their physical prime-node
+coordinates. The two local charge/rate pairs retain the normalized
+per-unit-multiplicity charge expected by the ordinary JFET load; global
+MNA charge includes polarity and multiplicity. This distinction matters
+for P-channel devices and parallel instances. No finite differences or
+AC-to-transient approximations are used.

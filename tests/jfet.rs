@@ -420,3 +420,152 @@ fn gate_device_alias_series_parameters_remain_unobservable() {
         }
     }
 }
+
+#[test]
+fn physical_derivative_array_preserves_gate_charge_and_channel_kcl() -> Result<(), SpiceError> {
+    use ngspice_rs::netlist::Parser;
+    use ngspice_rs::netlist::source::parse_deck_text;
+    use std::path::Path;
+    // Drive both junctions through a smooth ramp in the linear and
+    // saturation regions, including exchanged drain/source and polarity.
+    for polarity in [1., -1.] {
+        let model = if polarity > 0. { "njf" } else { "pjf" };
+        for drain in [0.4, 2.4, -0.4] {
+            for method in ["gear", "trap"] {
+                let initial = -0.7;
+                let rate: f64 = 100.;
+                let end = initial + 1e-3 * rate;
+                let body = format!(
+                    "JFET analytic derivative KCL\nvd d 0 {}\nvg g 0 PWL(0 {} 1m {})\nj1 d g 0 jm area=2 m=3\n.model jm {model}(vto=-2 beta=1m lambda=0.02 b=1 is=1e-15 n=10 cgs=20p cgd=30p pb=0.8)\nb1 first 0 v=1m*ddt(v(g))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1n\n.tran 1u 20u 0 1u uic\n.end\n",
+                    polarity * drain,
+                    polarity * initial,
+                    polarity * end
+                );
+                let netlist = Parser::new()
+                    .parse_deck(&parse_deck_text(Path::new("jfet-germ.cir"), &body))?;
+                let config = RunConfig::from_netlist(&netlist)?;
+                let mut c = config.circuit(&netlist)?;
+                let p = config
+                    .plan_for(&netlist.analyses[0])?
+                    .run(&mut c, &config.context())?;
+                let vt = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+                for i in 0..p.point_count() {
+                    let t = value(&p, "time", i);
+                    let vgs = rate.mul_add(t, initial);
+                    let vgd = vgs - drain;
+                    // Independent scalar reference: square-law channel and
+                    // two depletion capacitors, each with its own charge.
+                    let gate_current = |v: f64, cap: f64| {
+                        let junction = if v < -3. * vt {
+                            -2e-15 * (1. + (3. * vt / (std::f64::consts::E * v)).powi(3))
+                        } else {
+                            2e-15 * (v / vt).exp_m1()
+                        };
+                        junction + GMIN * v + rate * 2. * cap / (1. - v / 0.8).sqrt()
+                    };
+                    let sign: f64 = if drain >= 0. { 1. } else { -1. };
+                    let active = if drain >= 0. { vgs } else { vgd };
+                    let channel = sign * square_law(2e-3, 0.02, -2., active, drain.abs());
+                    let gd = gate_current(vgd, 30e-12);
+                    let gs = gate_current(vgs, 20e-12);
+                    close(
+                        value(&p, "v(first)", i),
+                        polarity * rate * 1e-3,
+                        1e-8,
+                        1e-10,
+                    );
+                    close(value(&p, "v(out)", i), 0., 0., 1e-9);
+                    close(
+                        value(&p, "i(vd)", i),
+                        -3. * polarity * (channel - gd),
+                        1e-6,
+                        1e-12,
+                    );
+                    close(
+                        value(&p, "i(vg)", i),
+                        -3. * polarity * (gs + gd),
+                        1e-5,
+                        1e-14,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn physical_taylor_matches_scalar_dae_for_doping_tail_and_series_nodes() -> Result<(), SpiceError> {
+    use ngspice_rs::devices::{Limit, TransientTiming};
+    use ngspice_rs::maths::Vector;
+    for family in ["njf", "pjf"] {
+        let polarity = if family == "njf" { 1. } else { -1. };
+        let mut c = circuit(&format!(
+            "j1 d g s jm area=2 m=3\n.model jm {family}(vto=-2 beta=1m b=0.6 lambda=0.02 rd=7 rs=3 is=1p n=2 cgs=20p cgd=30p pb=0.8)"
+        ))?;
+        c.finalize()?;
+        let prepared = c.prepare_run();
+        let mut dae = prepared
+            .prepare_physical_dae(&ModelContext::default(), TransientTiming::new(1e-6, 1e-3)?)?;
+        let rows = ["d", "g", "s", "j1#drain", "j1#source"].map(|name| mos_jfet::row(&c, name));
+        for (gate, drain) in [
+            (-2.5, 0.3),
+            (-0.9, 0.3),
+            (-0.9, 3.),
+            (-0.9, -0.5),
+            (-0.9, -3.),
+            (0.5, 0.2),
+        ] {
+            let mut state = vec![Vector::zeros(c.unknown_count()); 4];
+            for (row, bias, slope) in [
+                (rows[0], drain + 0.1, 0.02),
+                (rows[1], gate, -0.03),
+                (rows[2], -0.1, 0.04),
+                (rows[3], drain, 0.05),
+                (rows[4], 0., -0.01),
+            ] {
+                state[0].set(row, polarity * bias)?;
+                state[1].set(row, polarity * slope)?;
+            }
+            let taylor = dae.evaluate_taylor(&state, 0., 1e-6, Limit::Right)?;
+            let scalar = dae.evaluate(&state[0], 0., Limit::Right)?;
+            for row in 0..c.unknown_count() {
+                close(
+                    taylor.residual[0].get(row).unwrap(),
+                    scalar.residual.get(row).unwrap(),
+                    1e-10,
+                    1e-13,
+                );
+                close(
+                    taylor.charge[0].get(row).unwrap(),
+                    scalar.charge.get(row).unwrap(),
+                    1e-10,
+                    1e-20,
+                );
+                let mut current_rate = 0.;
+                let mut charge_rate = 0.;
+                for column in 0..c.unknown_count() {
+                    let g = scalar.conductance.get(row, column);
+                    let cap = scalar.capacitance.get(row, column);
+                    close(taylor.conductance[0].get(row, column), g, 1e-10, 1e-13);
+                    close(taylor.capacitance[0].get(row, column), cap, 1e-10, 1e-20);
+                    current_rate += g * state[1].get(column).unwrap();
+                    charge_rate += cap * state[1].get(column).unwrap();
+                }
+                close(
+                    taylor.residual[1].get(row).unwrap(),
+                    current_rate,
+                    1e-10,
+                    1e-13,
+                );
+                close(
+                    taylor.charge[1].get(row).unwrap(),
+                    charge_rate,
+                    1e-10,
+                    1e-20,
+                );
+            }
+        }
+    }
+    Ok(())
+}
