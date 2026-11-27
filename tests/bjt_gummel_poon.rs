@@ -650,3 +650,161 @@ fn bipolar_and_diode_fixed_stamps_replay_the_unbound_matrix() {
         }
     }
 }
+
+#[test]
+fn physical_taylor_reconstructs_multivariate_gummel_poon_equations()
+-> Result<(), ngspice_rs::primitives::SpiceError> {
+    // Includes varying base-spread resistance (C's ordinary Newton matrix
+    // freezes it), bias-modulated diffusion charge, partitioned BC charge,
+    // both polarities and both substrate topologies.
+    let common = "is=1e-15 bf=120 br=3 vaf=40 var=9 ikf=8m ikr=1m nkf=0.6 ise=1e-14 ne=1.6 isc=1e-14 nc=1.8 rb=200 rbm=20 irb=0.1m re=1.5 rc=12 cje=3p mje=0.4 cjc=2p mjc=0.45 xcjc=0.5 cjs=1.5p mjs=0.3 iss=1e-17 tf=0.3n xtf=5 vtf=2 itf=30m tr=20n fc=0.7";
+    for (family, pol) in [("npn", 1.), ("pnp", -1.)] {
+        for subs in [-1, 1] {
+            let mut c = circuit(&format!(
+                "q1 c b e s qm area=1.5 m=2\n.model qm {family}({common} subs={subs})"
+            ));
+            c.finalize()?;
+            let context = ModelContext::default();
+            let prepared = c.prepare_run();
+            let mut dae =
+                prepared.prepare_physical_dae(&context, TransientTiming::new(1e-6, 1e-3)?)?;
+            let rows = ["c", "b", "e", "s", "q1#collcx", "q1#base", "q1#emitter"]
+                .map(|name| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap());
+            for (base, collector) in [(0.72, 1.5), (-0.2, 0.5), (0.5, -0.18), (0.81, 0.35)] {
+                let mut state = vec![Vector::zeros(c.unknown_count()); 9];
+                for (i, (bias, slope)) in [
+                    (collector + 0.02, 0.001),
+                    (base + 0.01, -0.002),
+                    (0.01, 0.0015),
+                    (-0.3, 0.0007),
+                    (collector, -0.001),
+                    (base, 0.0012),
+                    (0., -0.0004),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    state[0].set(rows[i], pol * bias)?;
+                    state[1].set(rows[i], pol * slope)?;
+                }
+                let jet = dae.evaluate_taylor(&state, 0., 1e-6, Limit::Right)?;
+                for t in [0., 0.25, 0.5] {
+                    let mut sample = state[0].clone();
+                    for i in 0..sample.len() {
+                        sample.set(
+                            i,
+                            state[1]
+                                .get(i)
+                                .unwrap()
+                                .mul_add(t, state[0].get(i).unwrap()),
+                        )?;
+                    }
+                    let actual = dae.evaluate(&sample, 0., Limit::Right)?;
+                    let series = |values: &[Vector], row: usize| {
+                        values
+                            .iter()
+                            .rev()
+                            .fold(0_f64, |sum, v| sum.mul_add(t, v.get(row).unwrap()))
+                    };
+                    for row in 0..sample.len() {
+                        close(
+                            series(&jet.residual, row),
+                            actual.residual.get(row).unwrap(),
+                            1e-9,
+                            1e-12,
+                        );
+                        close(
+                            series(&jet.charge, row),
+                            actual.charge.get(row).unwrap(),
+                            1e-9,
+                            1e-21,
+                        );
+                    }
+                }
+                // Compare exact state partials with centered differences
+                // of the physical residual (not C's frozen gx tangent).
+                for col in 0..c.unknown_count() {
+                    let h = 1e-6;
+                    let mut plus = state[0].clone();
+                    let mut minus = state[0].clone();
+                    plus.set(col, plus.get(col).unwrap() + h)?;
+                    minus.set(col, minus.get(col).unwrap() - h)?;
+                    let point = dae.evaluate(&plus, 0., Limit::Right)?;
+                    let plus_f = point.residual.clone();
+                    let plus_q = point.charge.clone();
+                    let minus = dae.evaluate(&minus, 0., Limit::Right)?;
+                    for row in 0..c.unknown_count() {
+                        close(
+                            jet.conductance[0].get(row, col),
+                            (plus_f.get(row).unwrap() - minus.residual.get(row).unwrap())
+                                / (2. * h),
+                            2e-6,
+                            1e-10,
+                        );
+                        close(
+                            jet.capacitance[0].get(row, col),
+                            (plus_q.get(row).unwrap() - minus.charge.get(row).unwrap()) / (2. * h),
+                            2e-6,
+                            1e-19,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn derivative_array_with_bjt_preserves_independent_base_and_collector_charge()
+-> Result<(), ngspice_rs::primitives::SpiceError> {
+    use ngspice_rs::analysis::RunConfig;
+    for (family, pol) in [("npn", 1.), ("pnp", -1.)] {
+        for method in ["gear", "trap"] {
+            let body = format!(
+                "vc c 0 {}\nvb b 0 PWL(0 {} 1m {})\nq1 c b 0 qm m=2\n.model qm {family}(is=1e-15 bf=100 br=2 tf=5n tr=2n cje=20p mje=0 cjc=30p mjc=0 xcjc=0.5 subs=1)\nb1 first 0 v=1m*ddt(v(b))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1n\n.tran 1u 20u 0 1u uic",
+                0.9 * pol,
+                0.6 * pol,
+                0.7 * pol
+            );
+            let deck = netlist(&body);
+            let config = RunConfig::from_netlist(&deck)?;
+            let mut c = config.circuit(&deck)?;
+            let plot = config
+                .plan_for(&deck.analyses[0])?
+                .run(&mut c, &config.context())?;
+            let junction = |voltage: f64| {
+                if voltage < -3. * VT {
+                    let a = (3. * VT / (voltage * std::f64::consts::E)).powi(3);
+                    (-1e-15 * (1. + a), 3e-15 * a / voltage)
+                } else {
+                    (
+                        1e-15 * (voltage / VT).exp_m1(),
+                        1e-15 / VT * (voltage / VT).exp(),
+                    )
+                }
+            };
+            for i in 0..plot.point_count() {
+                let v = |name: &str| plot.value(name, i).unwrap().re;
+                let normalized_be = 100_f64.mul_add(v("time"), 0.6);
+                let normalized_bc = normalized_be - 0.9;
+                let (be, gbe) = junction(normalized_be);
+                let (bc, gbc) = junction(normalized_bc);
+                let base = be / 100. + bc / 2. + 1e-12 * (normalized_be + normalized_bc);
+                let collector = be - bc - bc / 2. - 1e-12 * normalized_bc + 0.9e-12;
+                let qbe_rate = 100. * (20e-12 + 5e-9 * gbe);
+                let qbc_rate = 100. * (30e-12 + 2e-9 * gbc);
+                close(v("v(first)"), pol * 0.1, 1e-9, 1e-10);
+                close(v("v(out)"), 0., 0., 1e-9);
+                close(
+                    v("i(vb)"),
+                    -2. * pol * (base + qbe_rate + qbc_rate),
+                    1e-6,
+                    1e-13,
+                );
+                close(v("i(vc)"), -2. * pol * (collector - qbc_rate), 1e-6, 1e-13);
+            }
+        }
+    }
+    Ok(())
+}

@@ -57,6 +57,7 @@
 
 mod disto;
 mod physics;
+mod taylor;
 
 static INSTANCE_SCHEMA: ScalarSchema<'static> = ScalarSchema::new(INSTANCE);
 
@@ -1536,6 +1537,17 @@ impl Device for Bjt {
             ],
         )
     }
+    fn physical_taylor_storage_slots(&self) -> &[usize] {
+        &[slot::QBE, slot::QBC, slot::QSUB, slot::QBX]
+    }
+
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        self.stamp_taylor(context)
+    }
+
     fn assemble_nonlinear_charge(
         &self,
         context: &mut crate::devices::traits::ChargeContext<'_>,

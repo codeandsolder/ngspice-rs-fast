@@ -85,3 +85,16 @@ per-unit-multiplicity charge expected by the ordinary JFET load; global
 MNA charge includes polarity and multiplicity. This distinction matters
 for P-channel devices and parallel instances. No finite differences or
 AC-to-transient approximations are used.
+
+## Gummel-Poon level-1 BJT
+
+The multivariate local differential jet carries sparse partials with respect
+to normalized BE, BC, BX, substrate, and external-base/prime-base voltages.
+The same Taylor arithmetic supplies each current or charge and all of its
+partial series; only absolute sparse MNA derivatives are stamped. BE
+diffusion includes the Early/high-injection base charge and its BC-dependent
+transit-time multiplier. The four physical charge-history pairs stay
+separate. Base spreading resistance is differentiated through its
+bias dependence, not frozen as in the ordinary C Newton load. On the
+substrate exponential clamp the physical derivative is the derivative of
+the clamped current, not the C load's retained exponential slope.
