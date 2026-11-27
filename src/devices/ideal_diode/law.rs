@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn tangent_matching_retains_small_join_slope() -> SpiceResult<()> {
+    fn tangent_matching_retains_small_join_slope() {
         // When the normalized join rounds toward one, its complementary
         // distance is not recoverable by subtraction. Compare the implicit
         // tangent equation in terms of physical conductance.
@@ -373,6 +373,5 @@ mod tests {
         let (_, slope, matched) = limited_join(off, 1., width, 0.5);
         assert!(matched);
         assert!(slope > 0.);
-        Ok(())
     }
 }

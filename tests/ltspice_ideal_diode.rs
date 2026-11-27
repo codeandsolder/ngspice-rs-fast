@@ -516,3 +516,91 @@ fn vendor_signed_parameters_defaults_and_unmatched_transitions() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn vendor_signed_noise() -> Result<()> {
+    // LTspice 24.0.12, voltage drive through 0.1 ohm. Independent OP,
+    // gain and noise amplitudes at 1 kHz and 1 MHz.
+    let rows = [
+        (
+            "ron=-2 roff=100 vfwd=1",
+            2.,
+            2.051_578_947_368_420_7,
+            1.052_631_578_947_368_1,
+            9.583_020_389_645_711e-12,
+            4.279_399_222_815_901e-11,
+            0.,
+            0.,
+        ),
+        (
+            "ron=2 roff=-100 vfwd=1",
+            0.5,
+            0.500_500_500_500_500_4,
+            1.001_001_001_001_001,
+            1.288_770_323_659_408_8e-12,
+            4.008_731_246_280_551e-12,
+            0.,
+            0.,
+        ),
+        (
+            "ron=-2 roff=-100 vfwd=1",
+            2.,
+            2.053_684_210_526_315_6,
+            1.052_631_578_947_368_1,
+            9.583_020_389_645_711e-12,
+            4.365_860_466_700_237e-11,
+            0.,
+            0.,
+        ),
+        (
+            "ron=2 roff=100 vfwd=1 kf=1e-10 af=-1",
+            2.,
+            1.951_428_571_428_570_8,
+            0.952_380_952_380_952_2,
+            8.670_351_781_108_042e-12,
+            3.757_260_534_890_933e-11,
+            4.321_358_157_014_43e-8,
+            1.366_533_436_151_313e-9,
+        ),
+    ];
+    for (model, bias, voltage, gain, thermal, shot, flicker_low, flicker_high) in rows {
+        let deck = parse(&format!(
+            "signed noise\nV1 in 0 DC {bias} AC 1\nR1 in out 0.1\nD1 out 0 dm\n.model dm ltspice_ideal_diode({model})\n.options gmin=1e-12 temp=27 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.op\n.ac lin 2 1k 1meg\n.noise V(out) V1 lin 2 1k 1meg 1\n.end\n"
+        ))?;
+        let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
+        let mut circuit = config.circuit(&deck)?;
+        let context = config.context();
+        let op = config
+            .plan_for(&deck.analyses[0])?
+            .run(&mut circuit, &context)?;
+        close(
+            op.value("v(out)", 0).ok_or("OP voltage")?.re,
+            voltage,
+            1e-10,
+            1e-8,
+        );
+        let ac = config
+            .plan_for(&deck.analyses[1])?
+            .run(&mut circuit, &context)?;
+        let plots = config
+            .plan_for(&deck.analyses[2])?
+            .run_plots(&mut circuit, &context)?;
+        let spectrum = &plots[0];
+        for (row, flicker) in [flicker_low, flicker_high].into_iter().enumerate() {
+            close(ac.value("v(out)", row).ok_or("AC gain")?.re, gain, 0., 1e-8);
+            for (column, expected) in [
+                ("onoise_d1_rs", thermal),
+                ("onoise_d1_id", shot),
+                ("onoise_d1_1overf", flicker),
+            ] {
+                close(
+                    spectrum.value(column, row).ok_or(column)?.re,
+                    expected,
+                    0.,
+                    2e-6,
+                );
+            }
+        }
+    }
+    Ok(())
+}

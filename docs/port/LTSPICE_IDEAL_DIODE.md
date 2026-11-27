@@ -103,7 +103,7 @@ The latter include two independently measured operating-point diode
 currents at exact zero bias where vendor DC sweep reporting disagrees
 with the actual constitutive current.
 Thermal current noise is 4*k*T times the complete terminal differential
-conductance. Shot noise is 2*q*abs(I)/N, and flicker noise is
+conductance magnitude, including negative differential conductance. Shot noise is 2*q*abs(I)/N, and flicker noise is
 KF*abs(I)^AF/f (no extra multiplier or series-count factor). The common
 noise machinery sums independent generator powers; instance temperature
 overrides circuit temperature. The two simulators use slightly different
@@ -113,3 +113,5 @@ Area is observable metadata but electrically inert in the ideal family.
 The tested semiconductor-only setters (including RS, IS, junction charge
 and temperature coefficients) and the OFF flag do not modify this law.
 Unrecognized fields and nonrepresentable noise remain explicit errors.
+Negative KF is rejected because the vendor produces NaN noise spectra;
+negative AF is supported for representable flicker noise.

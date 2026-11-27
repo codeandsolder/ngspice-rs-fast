@@ -418,7 +418,7 @@ impl Device for IdealDiode {
                 "_rs",
                 self.terminals,
                 NoiseKind::Thermal {
-                    conductance: point.conductance,
+                    conductance: point.conductance.abs(),
                     temperature,
                 },
             ),
