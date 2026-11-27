@@ -510,6 +510,8 @@ pub(in crate::analysis::initial) struct RightLimit {
     pub charge: Vector,
     pub charge_rate: Vector,
     pub order_hint: usize,
+    pub guards: crate::devices::physical_dae::BranchTrace,
+    pub candidate_states: Vec<(usize, Real)>,
 }
 
 #[derive(Clone, Copy)]
@@ -666,14 +668,14 @@ fn newton(
 }
 
 pub(in crate::analysis::initial) enum SolveOutcome {
-    Converged(RightLimit),
+    Converged(Box<RightLimit>),
     NotConverged { last: Vector, reason: String },
 }
 
 impl SolveOutcome {
     fn require(self) -> SpiceResult<RightLimit> {
         match self {
-            Self::Converged(right) => Ok(right),
+            Self::Converged(right) => Ok(*right),
             Self::NotConverged { reason, .. } => Err(failure(reason)),
         }
     }
@@ -783,7 +785,7 @@ struct Candidate {
 }
 
 enum CoreOutcome {
-    Converged(Candidate),
+    Converged(Box<Candidate>),
     NotConverged { last: Vector, reason: String },
     Exhausted(Option<Vec<Vector>>),
 }
@@ -814,13 +816,13 @@ fn solve(
         }
     }
     match solve_core(dae, state, initial, local, tol, iterations)? {
-        CoreOutcome::Converged(candidate) => Ok(SolveOutcome::Converged(candidate.right)),
+        CoreOutcome::Converged(candidate) => Ok(SolveOutcome::Converged(Box::new(candidate.right))),
         CoreOutcome::NotConverged { last, reason } => {
             Ok(SolveOutcome::NotConverged { last, reason })
         }
         CoreOutcome::Exhausted(Some(seed)) => {
             recovery::recover(dae, seed, initial, local, tol, iterations)
-                .map(SolveOutcome::Converged)
+                .map(|right| SolveOutcome::Converged(Box::new(right)))
         }
         CoreOutcome::Exhausted(None) => Err(order_limit()),
     }
@@ -883,7 +885,8 @@ fn solve_core(
         if local.prefix_rank(dae, &state)? != rank {
             continue;
         }
-        return candidate(dae, &state, initial, local).map(CoreOutcome::Converged);
+        return candidate(dae, &state, initial, local)
+            .map(|candidate| CoreOutcome::Converged(Box::new(candidate)));
     }
     Ok(CoreOutcome::Exhausted(recovery_seed))
 }
@@ -894,7 +897,10 @@ fn candidate(
     initial: &[Constraint<'_>],
     local: LocalPoint<'_>,
 ) -> SpiceResult<Candidate> {
-    let point = local.evaluate(dae, state)?;
+    if let Some(budget) = local.recovery {
+        budget.charge(state)?;
+    }
+    let point = dae.evaluate_taylor_with_guards(state, local.time, local.scale, local.limit)?;
     let (mandatory_rank, uncertainty) = if local.recovery.is_some() {
         let array = Array::build(&point, state, local.scale, initial)?;
         let prefix = 2 * state[0].len();
@@ -934,6 +940,8 @@ fn candidate(
             // The two extra orders were rank/affine lookahead checks;
             // retain a lower bound so the next trial still repeats them.
             order_hint: state.len().saturating_sub(3).max(2),
+            guards: point.guards.unwrap_or_default(),
+            candidate_states: point.candidate_states,
         },
         mandatory_rank,
         uncertainty,

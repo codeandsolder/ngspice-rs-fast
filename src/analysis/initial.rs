@@ -1007,7 +1007,7 @@ impl ImpulseStorage {
         continuity: Option<Real>,
         tolerances: Tolerances,
     ) -> SpiceResult<Vec<(usize, Real)>> {
-        let mut slots = Vec::new();
+        let mut slots = right.candidate_states.clone();
         for (&AbsoluteRow(row), charge) in &self.charges {
             let actual = right.charge.as_slice()[row];
             if let Some(time) = continuity
@@ -1084,6 +1084,7 @@ pub(super) struct DerivativePoint {
     pub rate: Vector,
     pub canonical: Vec<(usize, Real)>,
     pub order_hint: usize,
+    pub guards: crate::devices::physical_dae::BranchTrace,
 }
 
 /// Calculate the right-limit state and all declared initial storage rates.
@@ -1154,6 +1155,7 @@ pub(super) fn consistent_derivative_start(
             solution: right.state,
             rate: right.rate,
             order_hint: right.order_hint,
+            guards: right.guards,
             canonical,
         })
     })();
@@ -1200,7 +1202,7 @@ pub(super) fn consistent_derivative_step(
     let right = match system::solve_step(
         &dae, circuit, request, &storage, tolerances, iterations, guess,
     )? {
-        system::SolveOutcome::Converged(right) => right,
+        system::SolveOutcome::Converged(right) => *right,
         system::SolveOutcome::NotConverged { last, .. } => {
             return Ok(DerivativeTrial::NotConverged(last));
         }
@@ -1210,6 +1212,7 @@ pub(super) fn consistent_derivative_step(
         solution: right.state,
         rate: right.rate,
         order_hint: right.order_hint,
+        guards: right.guards,
         canonical,
     }))
 }
@@ -1262,6 +1265,7 @@ pub(super) fn consistent_derivative_event(
         solution: right.state,
         rate: right.rate,
         order_hint: right.order_hint,
+        guards: right.guards,
         canonical,
     })
 }
