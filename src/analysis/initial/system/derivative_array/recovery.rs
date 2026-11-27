@@ -186,7 +186,7 @@ impl Search<'_, '_, '_> {
             self.iterations,
         );
         match result {
-            Ok(CoreOutcome::Converged(candidate)) => self.admit(candidate),
+            Ok(CoreOutcome::Converged(candidate)) => self.admit(*candidate),
             Ok(_) | Err(SpiceError::Numerical { .. } | SpiceError::Circuit { .. }) => {
                 if self.local.recovery.is_some_and(Budget::exhausted) {
                     Err(failure(

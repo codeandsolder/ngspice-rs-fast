@@ -783,7 +783,7 @@ struct Candidate {
 }
 
 enum CoreOutcome {
-    Converged(Candidate),
+    Converged(Box<Candidate>),
     NotConverged { last: Vector, reason: String },
     Exhausted(Option<Vec<Vector>>),
 }
@@ -883,7 +883,8 @@ fn solve_core(
         if local.prefix_rank(dae, &state)? != rank {
             continue;
         }
-        return candidate(dae, &state, initial, local).map(CoreOutcome::Converged);
+        return candidate(dae, &state, initial, local)
+            .map(|candidate| CoreOutcome::Converged(Box::new(candidate)));
     }
     Ok(CoreOutcome::Exhausted(recovery_seed))
 }
