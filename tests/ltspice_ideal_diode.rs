@@ -1,4 +1,4 @@
-//! Independent LTspice 24.0.12 DC observations from the synthetic model
+//! Independent `LTspice` 24.0.12 DC observations from the synthetic model
 //! witness in issue #226, and analytic small-signal/transient checks.
 use std::path::Path;
 
@@ -51,7 +51,7 @@ fn independent_measured_dc_points() -> Result<()> {
                 (1.2, 0.11),
                 (2., 0.51),
                 (-2., -0.02),
-                (-3., -0.353333333333),
+                (-3., -0.353_333_333_333),
             ],
         ),
         (
@@ -60,27 +60,27 @@ fn independent_measured_dc_points() -> Result<()> {
                 (1.2, 0.0365),
                 (1.4, 0.112),
                 (2., 0.412),
-                (-2.4, -0.0671111111111),
-                (-3., -0.256333333333),
+                (-2.4, -0.067_111_111_111_1),
+                (-3., -0.256_333_333_333),
             ],
         ),
         (
             "ilimit=0.25 revilimit=0.3",
             &[
-                (1.2, 0.104987240564),
-                (2., 0.251006895019),
-                (4., 0.259996927913),
-                (-3., -0.26133644009),
+                (1.2, 0.104_987_240_564),
+                (2., 0.251_006_895_019),
+                (4., 0.259_996_927_913),
+                (-3., -0.261_336_440_09),
             ],
         ),
         (
             "epsilon=0.4 revepsilon=0.6 ilimit=0.25 revilimit=0.3",
             &[
-                (1.2, 0.0333134917499),
-                (1.4, 0.0992539669997),
-                (2., 0.239393660113),
-                (-2.4, -0.0628102703503),
-                (-3., -0.213411129383),
+                (1.2, 0.033_313_491_749_9),
+                (1.4, 0.099_253_966_999_7),
+                (2., 0.239_393_660_113),
+                (-2.4, -0.062_810_270_350_3),
+                (-3., -0.213_411_129_383),
             ],
         ),
     ];
@@ -176,16 +176,7 @@ fn default_off_conductance_rebinds_with_gmin() -> Result<()> {
 
 #[test]
 fn invalid_model_and_instance_fields_are_not_ignored() -> Result<()> {
-    for parameters in [
-        "ron=0",
-        "roff=-1",
-        "epsilon=-1",
-        "ilimit=0",
-        "level=2",
-        "kf=-1p",
-        "unknown_parameter=1p",
-        "roff=1 epsilon=10 ilimit=1",
-    ] {
+    for parameters in ["level=2", "kf=-1p", "unknown_parameter=1p"] {
         let deck = parse(&format!(
             "bad\nD1 a 0 dm\n.model dm ltspice_ideal_diode({parameters})\n.end\n"
         ))?;
@@ -234,11 +225,11 @@ fn transient_has_exact_memoryless_current_through_both_knees() -> Result<()> {
         let expected = if voltage > 1.4 {
             (voltage - 1.4) / 2. + 0.112
         } else if voltage > 1. {
-            0.01 * voltage + 0.6125 * (voltage - 1.).powi(2)
+            0.6125_f64.mul_add((voltage - 1.).powi(2), 0.01 * voltage)
         } else if voltage < -2.6 {
             (voltage + 2.6) / 3. - 0.123
         } else if voltage < -2. {
-            0.01 * voltage - (1. / 3. - 0.01) * (voltage + 2.).powi(2) / 1.2
+            0.01_f64.mul_add(voltage, -((1. / 3. - 0.01) * (voltage + 2.).powi(2) / 1.2))
         } else {
             0.01 * voltage
         };
@@ -284,8 +275,8 @@ fn independent_c_common_regions_dc_sweep() -> Result<()> {
 #[test]
 fn current_driven_limited_branches() -> Result<()> {
     for (current, expected) in [
-        (0.2, 1. + 0.5 * (0.19_f64 / 0.25).atanh()),
-        (-0.25, -2. - 0.9 * (0.23_f64 / 0.3).atanh()),
+        (0.2, 0.5_f64.mul_add((0.19_f64 / 0.25).atanh(), 1.)),
+        (-0.25, 0.9_f64.mul_add(-(0.23_f64 / 0.3).atanh(), -2.)),
     ] {
         let deck = parse(&format!(
             "current drive\nI1 0 a {current}\nD1 a 0 dm\n.model dm ltspice_ideal_diode({BASE} ilimit=0.25 revilimit=0.3)\n.end\n"
@@ -389,7 +380,7 @@ fn vendor_noise_spectrum_and_geometry() -> Result<()> {
             temp,
             voltage,
             _,
-            gain,
+            impedance,
             ..,
         ] = first.as_slice()
         else {
@@ -397,7 +388,7 @@ fn vendor_noise_spectrum_and_geometry() -> Result<()> {
         };
         // Preserve the deliberately tiny conductance probes without the
         // default absolute sparse pivot threshold masking their physics.
-        let pivot = if gain.parse::<Real>()? > 1e12 {
+        let pivot = if impedance.parse::<Real>()? > 1e12 {
             "pivtol=1e-30"
         } else {
             ""
@@ -437,7 +428,7 @@ fn vendor_noise_spectrum_and_geometry() -> Result<()> {
                 _,
                 _,
                 frequency,
-                gain,
+                impedance,
                 thermal,
                 shot,
                 flicker,
@@ -454,8 +445,8 @@ fn vendor_noise_spectrum_and_geometry() -> Result<()> {
                 1e-12,
             );
             close(
-                ac.value("v(a)", row).ok_or("AC gain")?.re,
-                gain.parse()?,
+                ac.value("v(a)", row).ok_or("AC impedance")?.re,
+                impedance.parse()?,
                 0.,
                 1e-8,
             );
@@ -475,6 +466,52 @@ fn vendor_noise_spectrum_and_geometry() -> Result<()> {
                     "{name}: {column}: {got:.17e} != {expected:.17e}"
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vendor_signed_parameters_defaults_and_unmatched_transitions() -> Result<()> {
+    use std::fmt::Write as _;
+    for block in include_str!("fixtures/ltspice_ideal_diode/edge-witness.tsv").split("\n\n") {
+        let mut lines = block.lines();
+        let (name, model) = lines
+            .next()
+            .ok_or("edge case header")?
+            .split_once('\t')
+            .ok_or("edge case header fields")?;
+        let points = lines
+            .map(|line| line.split_once('\t').ok_or("edge witness columns"))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // Independent voltage drives test the exact sampled biases, not a
+        // regenerated floating-point sweep grid. This matters at a vendor
+        // discontinuity: an ulp on either side can change current sharply.
+        let mut text = format!(
+            "{name}\n.model dm ltspice_ideal_diode({model})\n.options gmin=1e-12 reltol=1e-10 abstol=1e-14 vntol=1e-12\n"
+        );
+        for (index, (voltage, _)) in points.iter().enumerate() {
+            writeln!(
+                text,
+                "V{index} a{index} 0 {voltage}\nD{index} a{index} 0 dm"
+            )?;
+        }
+        text.push_str(".op\n.end\n");
+        let deck = parse(&text)?;
+        let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
+        let plot = config
+            .plan_for(&deck.analyses[0])?
+            .run(&mut config.circuit(&deck)?, &config.context())?;
+        for (index, (voltage, current)) in points.iter().enumerate() {
+            let expected: Real = current.parse()?;
+            let actual = -plot
+                .value(&format!("i(v{index})"), 0)
+                .ok_or("edge diode current")?
+                .re;
+            assert!(
+                (actual - expected).abs() <= 1e-9_f64.mul_add(expected.abs(), 2e-12),
+                "{name} at {voltage}: {actual:.17e} != {expected:.17e}"
+            );
         }
     }
     Ok(())

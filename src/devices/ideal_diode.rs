@@ -21,6 +21,7 @@ use super::{
 use law::{Branch, Point};
 
 pub(super) const MODEL_FAMILY: &str = "ltspice_ideal_diode";
+const DEFAULT_RON: Real = 1e-3;
 
 #[derive(Clone, Copy, Debug)]
 struct Model {
@@ -40,7 +41,7 @@ struct Model {
 impl Default for Model {
     fn default() -> Self {
         Self {
-            ron: 1.,
+            ron: DEFAULT_RON,
             roff: None,
             vfwd: 0.,
             vrev: None,
@@ -93,15 +94,15 @@ impl Model {
             let location = &field.location;
             let name = field.name.as_str();
             match name {
-                "ron" => result.ron = positive(value, location, name)?,
-                "roff" => result.roff = Some(positive(value, location, name)?),
-                "vfwd" => result.vfwd = nonnegative(value, location, name)?,
-                "vrev" => result.vrev = Some(nonnegative(value, location, name)?),
-                "rrev" => result.rrev = Some(positive(value, location, name)?),
-                "ilimit" => result.ilimit = Some(positive(value, location, name)?),
-                "revilimit" => result.revilimit = Some(positive(value, location, name)?),
-                "epsilon" => result.epsilon = nonnegative(value, location, name)?,
-                "revepsilon" => result.revepsilon = nonnegative(value, location, name)?,
+                "ron" => result.ron = if value == 0. { DEFAULT_RON } else { value },
+                "roff" => result.roff = (value != 0.).then_some(value),
+                "vfwd" => result.vfwd = value,
+                "vrev" => result.vrev = Some(value),
+                "rrev" => result.rrev = (value != 0.).then_some(value),
+                "ilimit" => result.ilimit = (value > 0.).then_some(value),
+                "revilimit" => result.revilimit = (value > 0.).then_some(value),
+                "epsilon" => result.epsilon = value.max(0.),
+                "revepsilon" => result.revepsilon = value.max(0.),
                 "kf" => result.kf = nonnegative(value, location, name)?,
                 "af" => result.af = value,
                 // LEVEL is resolved before selecting the family. Semiconductor-only
@@ -120,7 +121,6 @@ impl Model {
         if !gmin.is_finite()
             || gmin < 0.
             || !off.is_finite()
-            || off < 0.
             || !self.ron.recip().is_finite()
             || self.rrev.is_some_and(|value| !value.recip().is_finite())
         {
@@ -164,18 +164,19 @@ impl Prepared {
     }
 
     fn limit_trial(self, raw: Real, previous: Real) -> Real {
-        if raw >= 0. {
+        if self.forward.conducts(raw) {
             self.forward.limit_trial(raw, previous)
+        } else if let Some(reverse) = self.reverse.filter(|reverse| reverse.conducts(-raw)) {
+            -reverse.limit_trial(-raw, -previous)
         } else {
-            self.reverse
-                .map_or(raw, |reverse| -reverse.limit_trial(-raw, -previous))
+            raw
         }
     }
 
     fn point(self, voltage: Real) -> Point {
-        if voltage > 0. || (voltage == 0. && self.forward.starts_at_zero()) {
+        if self.forward.conducts(voltage) {
             self.forward.point(voltage)
-        } else if let Some(reverse) = self.reverse {
+        } else if let Some(reverse) = self.reverse.filter(|reverse| reverse.conducts(-voltage)) {
             let point = reverse.point(-voltage);
             Point {
                 current: -point.current,

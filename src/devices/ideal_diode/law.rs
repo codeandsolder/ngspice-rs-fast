@@ -49,6 +49,9 @@ struct Limited {
     maximum: Real,
     /// Normalized conducting current at the end of the quadratic.
     normalized_join: Real,
+    /// Signed outer-branch increment at the end of the quadratic. It can
+    /// differ from the quadratic increment for the vendor fallback.
+    outer_join: Real,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,19 +73,28 @@ impl Branch {
         maximum: Option<Real>,
     ) -> SpiceResult<Self> {
         let (join, limited) = if let Some(maximum) = maximum {
-            let (normalized_join, conductance) = if width == 0. {
-                (0., on)
+            let (normalized_join, conductance, tangent_matched) = if width == 0. {
+                (0., on, true)
             } else {
-                limited_join(off, on, width, maximum)?
+                limited_join(off, on, width, maximum)
+            };
+            let current = width * Real::midpoint(off, conductance);
+            let outer_join = if tangent_matched {
+                current
+            } else if normalized_join < Real::MIN_POSITIVE {
+                ratio_product(width, on, 2.)
+            } else {
+                (maximum * normalized_join).copysign(on)
             };
             (
                 Point {
-                    current: width * Real::midpoint(off, conductance),
+                    current,
                     conductance,
                 },
                 Some(Limited {
                     maximum,
                     normalized_join,
+                    outer_join,
                 }),
             )
         } else {
@@ -122,7 +134,7 @@ impl Branch {
         }
         let distance = voltage - self.threshold;
         let baseline = self.threshold * self.off;
-        if distance < self.width {
+        if self.width > 0. && distance <= self.width {
             let fraction = distance / self.width;
             let conductance = (self.join.conductance - self.off).mul_add(fraction, self.off);
             return Point {
@@ -144,8 +156,8 @@ impl Branch {
         }
     }
 
-    pub(super) fn starts_at_zero(self) -> bool {
-        self.threshold == 0.
+    pub(super) fn conducts(self, voltage: Real) -> bool {
+        voltage >= self.threshold
     }
 
     pub(super) const fn has_limit(self) -> bool {
@@ -163,18 +175,18 @@ impl Branch {
         if raw <= reference {
             return raw;
         }
-        let normalized = ratio_product(reference - join, self.on, limit.maximum);
+        let normalized = ratio_product(reference - join, self.on.abs(), limit.maximum);
         if normalized.tanh() >= 1. {
             // Already on the rounded asymptote: allow an imposed voltage
             // to advance without taking arbitrarily many tiny steps.
             return raw;
         }
-        let next = reference + limit.maximum / self.on;
+        let next = reference + limit.maximum / self.on.abs();
         if next > reference { raw.min(next) } else { raw }
     }
 
     fn limited_point(self, excess: Real, limit: Limited) -> Point {
-        let z = ratio_product(excess, self.on, limit.maximum);
+        let z = ratio_product(excess, self.on.abs(), limit.maximum);
         let t = z.tanh();
         let denominator = limit.normalized_join.mul_add(t, 1.);
         // Hyperbolic addition avoids subtracting the (potentially very
@@ -185,81 +197,90 @@ impl Branch {
             // Avoid losing a representable current to normalization by L.
             excess * self.join.conductance
         } else {
-            ratio_product(limit.maximum * t, self.join.conductance, self.on) / denominator
+            ratio_product(limit.maximum * t, self.join.conductance, self.on.abs()) / denominator
         };
-        let decay = (-2. * z).exp();
-        let conductance = if decay.is_normal() {
-            self.join.conductance * (4. * decay / (1. + decay).powi(2)) / denominator.powi(2)
-        } else {
-            // Four equal exponent factors keep every possible nonzero
-            // binary64 result in range, even if exp(-2z) underflows.
-            // The first factor includes 4 / denominator^2; all following
-            // factors decrease magnitude, and 1 + decay rounds to one.
-            let quarter = (-0.5 * z).exp();
-            (((self.join.conductance * (4. * quarter / denominator.powi(2))) * quarter) * quarter)
-                * quarter
-        };
+        let current = limit.outer_join + increment;
         Point {
-            current: (self.join.current + increment).min(limit.maximum),
-            conductance,
+            current: current.abs().min(limit.maximum).copysign(self.on),
+            conductance: scaled_sech_squared(self.join.conductance, z, denominator),
         }
     }
 }
 
+/// Scale the signed differential conductance by sech(z)^2 / denominator^2
+/// without losing representable derivatives in the exponential tail.
+fn scaled_sech_squared(conductance: Real, z: Real, denominator: Real) -> Real {
+    let decay = (-2. * z).exp();
+    if decay.is_normal() {
+        conductance * (4. * decay / (1. + decay).powi(2)) / denominator.powi(2)
+    } else {
+        // Four equal exponent factors keep every possible nonzero
+        // binary64 result in range, even if exp(-2z) underflows.
+        let quarter = (-0.5 * z).exp();
+        (((conductance * (4. * quarter / denominator.powi(2))) * quarter) * quarter) * quarter
+    }
+}
+
 /// Compute 1 - w*h/(2*L) without rounding the product before subtracting.
-/// A negative remainder means there is no nonnegative tangent solution.
-fn remaining_limit_fraction(width: Real, off: Real, maximum: Real) -> SpiceResult<Real> {
+/// A nonpositive remainder means there is no finite matched tangent solution.
+fn remaining_limit_fraction(width: Real, off: Real, maximum: Real) -> Real {
     if off == 0. {
-        return Ok(1.);
+        return 1.;
     }
     let (mw, ew) = split_power(width);
     let (mh, eh) = split_power(off);
     let (ml, el) = split_power(maximum);
-    let remainder = (-mw).mul_add(scale_power(mh, ew + eh - el - 1), ml);
-    if remainder < 0. {
-        return Err(SpiceError::circuit(
-            "ideal diode smoothing width and leakage exceed the current limit",
-        ));
-    }
-    Ok(remainder / ml)
+    (-mw).mul_add(scale_power(mh, ew + eh - el - 1), ml) / ml
 }
 
-fn limited_join(off: Real, on: Real, width: Real, maximum: Real) -> SpiceResult<(Real, Real)> {
+/// Return the normalized magnitude at the outer join, signed tangent, and
+/// whether the quadratic and outer branch have matched currents.
+fn limited_join(off: Real, on: Real, width: Real, maximum: Real) -> (Real, Real, bool) {
+    // Normalize to the sign of the conducting branch; the off slope can
+    // have either sign. Reflect the tangent back after solving.
+    let polarity = on.signum();
+    let off = off * polarity;
+    let on = on.abs();
+    let ratio = ratio_product(width, on, maximum);
+    let remaining = remaining_limit_fraction(width, off, maximum);
+    if off >= on || off < -on || remaining <= 0. {
+        // LTspice uses a half-width horizontal offset when the matched
+        // smoothing law is unavailable. The slopes match but the outer
+        // branch can be discontinuous in current at the join.
+        let z = ratio * 0.5;
+        return (z.tanh(), polarity * scaled_sech_squared(on, z, 1.), false);
+    }
     // Let u=I_join/I_limit. Continuity of current and slope gives
     // u = width/(2*I_limit) * [G_off + G_on*(1-u^2)].
-    // Normalize conductances before solving the quadratic, then use its
-    // cancellation-free positive root.
-    let remaining = remaining_limit_fraction(width, off, maximum)?;
-    let scale = on.max(off);
-    let a = on / scale;
-    let b = off / scale;
-    let sum = a + b;
-    let ratio = ratio_product(width, scale, maximum);
-    let root = if ratio <= 2. {
+    let sum = 1. + off / on;
+    let root = if sum == 0. {
+        0.
+    } else if ratio <= 2. {
         let half = ratio * 0.5;
-        2. * half * sum / (1. + (2. * half * (a * sum).sqrt()).hypot(1.))
+        2. * half * sum / (1. + (2. * half * sum.sqrt()).hypot(1.))
     } else {
         let inverse = 2. / ratio;
-        2. * sum / (inverse + inverse.hypot(2. * (a * sum).sqrt()))
+        2. * sum / (inverse + inverse.hypot(2. * sum.sqrt()))
     };
     let u = root.clamp(0., 1.);
-    // Use the complementary quadratic identity instead of subtracting
-    // a rounded u from one. With X=w*g/(2*L), Y=w*h/(2*L):
-    // (1-u)*(1+X*(1+u)) = 1-Y.
-    // Both branches preserve a finite slope even when X overflows or u
-    // rounds to one. The second form cancels X analytically.
-    let on_ratio = ratio_product(width, on, maximum);
+    // Complementary quadratic identity:
+    // (1-u)*(1+X*(1+u)) = 1-Y, X=w*g/(2*L), Y=w*h/(2*L).
     let factor = 1. + u;
-    let conductance = if on_ratio <= 2. {
-        ratio_product(on, remaining * factor, (0.5 * on_ratio).mul_add(factor, 1.))
+    let conductance = if ratio <= 2. {
+        ratio_product(on, remaining * factor, (0.5 * ratio).mul_add(factor, 1.))
+    } else if off < 0. {
+        // Cancel X before evaluating the numerator to avoid overflow for
+        // large negative Y. No subtractive cancellation occurs here.
+        let inverse = 2. / ratio;
+        on * ((inverse - off / on) / (1. + inverse / factor)).min(1.)
     } else {
         ratio_product(
             maximum,
-            2. * remaining / (1. + (2. / on_ratio) / factor),
+            2. * remaining / (1. + (2. / ratio) / factor),
             width,
         )
     };
-    Ok((u, conductance))
+    (u, polarity * conductance, true)
 }
 
 #[cfg(test)]
@@ -339,16 +360,18 @@ mod tests {
         // distance is not recoverable by subtraction. Compare the implicit
         // tangent equation in terms of physical conductance.
         for on in [1e10, 1e14, 1e16, 1e100, 1e300] {
-            let (u, slope) = limited_join(0., on, 1., 1.)?;
+            let (u, slope, matched) = limited_join(0., on, 1., 1.);
+            assert!(matched);
             assert!((slope - 2. * u).abs() < 4e-15, "{on:e} {u:e} {slope:e}");
         }
         // (1+2^-52)*(1-2^-52) = 1-2^-104. The rounded product is
         // exactly one, but the positive remaining current must survive.
         let width = 1. + Real::EPSILON;
         let off = 1. - Real::EPSILON;
-        let remaining = remaining_limit_fraction(width, off, 0.5)?;
+        let remaining = remaining_limit_fraction(width, off, 0.5);
         assert_eq!(remaining.to_bits(), 2_f64.powi(-104).to_bits());
-        let (_, slope) = limited_join(off, 1., width, 0.5)?;
+        let (_, slope, matched) = limited_join(off, 1., width, 0.5);
+        assert!(matched);
         assert!(slope > 0.);
         Ok(())
     }
