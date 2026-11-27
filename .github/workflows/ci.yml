@@ -19,7 +19,6 @@ jobs:
     name: Nightly Rust build, tests, docs and goldens
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
     with:
-      rust-toolchain: "nightly-2026-11-20"
       command: |
         cargo test --workspace --locked
         cargo xtask golden verify
@@ -31,4 +30,3 @@ jobs:
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@cb9083676196a8ec3bf013e7253907b2759020c7 # main
     with:
       allow-test-panics: true
-      rust-toolchain: nightly-2026-11-20

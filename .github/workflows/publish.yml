@@ -39,7 +39,6 @@ jobs:
     name: Strict Rust and workflow policy
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@cb9083676196a8ec3bf013e7253907b2759020c7 # main
     with:
-      rust-toolchain: nightly-2026-11-20
       allow-test-panics: true
 
   verify:
@@ -53,16 +52,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Resolve repository Rust pin
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@9c14ef2d72423958c56944febc620ec50f01d65a # main
+
       - name: Install pinned nightly Rust
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: nightly-2026-11-26
+          toolchain: ${{ steps.compiler.outputs.channel }}
           components: clippy, rustfmt
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
-        with:
-          rust-toolchain: nightly-2026-11-20
 
       - name: Read crate version
         id: version
@@ -115,15 +116,17 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Resolve repository Rust pin
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@9c14ef2d72423958c56944febc620ec50f01d65a # main
+
       - name: Install pinned nightly Rust
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: nightly-2026-11-26
+          toolchain: ${{ steps.compiler.outputs.channel }}
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9c14ef2d72423958c56944febc620ec50f01d65a # main
-        with:
-          rust-toolchain: nightly-2026-11-20
 
       - name: Authenticate with crates.io
         id: auth
