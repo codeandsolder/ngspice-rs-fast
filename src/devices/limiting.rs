@@ -51,7 +51,7 @@ const ROOT2: Real = std::f64::consts::SQRT_2;
 /// The critical junction voltage `vt * ln(vt / (sqrt(2) * is))` above which
 /// [`pnjlim`] limits forward steps (C `DIOtVcrit`, `BJTtVcrit`,
 /// `MOS1sourceVcrit`/`MOS1drainVcrit`).
-#[must_use]
+#[must_use = "the returned junction threshold determines when forward-voltage limiting activates"]
 pub fn critical_voltage(vt: Real, saturation_current: Real) -> Real {
     let ratio = (vt / ROOT2) / saturation_current;
     let logarithm = if ratio.is_normal() {
@@ -75,7 +75,7 @@ pub struct Limited {
 
 /// `DEVpnjlim`: logarithmic limiting of a forward PN-junction step beyond
 /// `vcrit`, and Gillespie's limit on large negative steps.
-#[must_use]
+#[must_use = "the returned limited voltage and convergence flag must replace the raw junction trial"]
 pub fn pnjlim(vnew: Real, vold: Real, vt: Real, vcrit: Real) -> Limited {
     if vnew > vcrit && (vnew - vold).abs() > vt + vt {
         let value = if vold > 0. {
@@ -114,7 +114,7 @@ pub fn pnjlim(vnew: Real, vold: Real, vt: Real, vcrit: Real) -> Limited {
 
 /// `DEVfetlim`: limits the per-iteration change of a FET gate voltage
 /// relative to the threshold `vto` (Gillespie's `vtstlo`).
-#[must_use]
+#[must_use = "the returned gate voltage bounds the iteration step relative to threshold"]
 pub fn fetlim(vnew: Real, vold: Real, vto: Real) -> Real {
     let vtsthi = 2_f64.mul_add((vold - vto).abs(), 2.);
     let vtstlo = (vold - vto).abs() + 1.;
@@ -159,7 +159,7 @@ pub fn fetlim(vnew: Real, vold: Real, vto: Real) -> Real {
 }
 
 /// `DEVlimvds`: limits the per-iteration change of a FET drain-source voltage.
-#[must_use]
+#[must_use = "the returned drain-source voltage bounds the iteration step"]
 pub fn limvds(vnew: Real, vold: Real) -> Real {
     if vold >= 3.5 {
         if vnew > vold {
@@ -271,7 +271,7 @@ pub struct Limiter {
 
 impl Limiter {
     /// The limiting mode of the load `states` belongs to.
-    #[must_use]
+    #[must_use = "the constructed limiter carries this load's linearization mode and accumulated convergence state"]
     pub fn new(states: &DeviceState<'_>) -> Self {
         let mode = Linearization::classify(states);
         Self {
@@ -333,7 +333,7 @@ impl Limiter {
     }
 
     /// The mode chosen by [`Self::new`].
-    #[must_use]
+    #[must_use = "the returned linearization mode determines whether limiting or initialization applies"]
     pub const fn mode(self) -> Linearization {
         self.mode
     }
@@ -342,7 +342,7 @@ impl Limiter {
     /// relative): the previous load's value in this solve, or in
     /// [`IterationPhase::Predict`] the latest accepted value. `None` (no
     /// limiting) without such a value or outside [`Linearization::Limited`].
-    #[must_use]
+    #[must_use = "the returned option determines whether a valid reference voltage exists for limiting"]
     pub fn previous(self, states: &DeviceState<'_>, slot: usize) -> Option<Real> {
         if self.mode != Linearization::Limited {
             return None;
@@ -368,7 +368,7 @@ impl Limiter {
     }
 
     /// Whether the load is nonconvergent so far.
-    #[must_use]
+    #[must_use = "the result indicates whether this load must prevent Newton convergence"]
     pub const fn is_nonconvergent(self) -> bool {
         self.nonconvergent
     }

@@ -273,7 +273,7 @@ impl<'a> NoisePlan<'a> {
     }
 
     /// Number of generators, excluding instance totals.
-    #[must_use]
+    #[must_use = "the returned count bounds individual noise-generator coordinates"]
     pub const fn source_count(&self) -> usize {
         self.sources.len()
     }

@@ -130,7 +130,7 @@ impl Waveform {
     /// [`Waveform::breakpoints_in`] times (constant, step, PWL and PULSE
     /// forms), so a segment's end values determine it exactly. SIN/EXP/SFFM/AM
     /// are not.
-    #[must_use]
+    #[must_use = "the result determines whether segment endpoint samples suffice to reconstruct the waveform"]
     pub const fn is_piecewise_linear(&self) -> bool {
         !matches!(
             self,
@@ -225,7 +225,7 @@ impl Waveform {
 
     /// Value at time t; left limit is used at a segment's terminating jump.
     /// Returns NaN where [`Waveform::value_at`] would fail; prefer `value_at`.
-    #[must_use]
+    #[must_use = "the returned waveform sample respects the requested discontinuity side"]
     pub fn value(&self, t: Real, left_limit: bool) -> Real {
         let limit = if left_limit {
             Limit::Left
@@ -310,7 +310,7 @@ impl WaveformEventKind {
     /// Whether the comparator requires both solvers to sample this nominal
     /// corner. Actual landings remain subject to C's source-specific accept
     /// routines; a missing sample is reported rather than silently ignored.
-    #[must_use]
+    #[must_use = "the result determines whether a missing nominal corner sample is a comparison failure"]
     pub const fn requires_landing(self) -> bool {
         matches!(
             self,
@@ -471,7 +471,7 @@ pub struct SourceRows {
 
 impl SourceRows {
     /// Empty row set (for a ground-to-ground current source).
-    #[must_use]
+    #[must_use = "the returned row set represents an initially empty current-source stamp"]
     pub const fn new() -> Self {
         Self {
             entries: [(0, 0.); 2],
@@ -495,7 +495,7 @@ impl SourceRows {
     }
 
     /// Signed rows in insertion order, without a heap allocation.
-    #[must_use]
+    #[must_use = "the returned slice supplies signed injection rows in stamping order"]
     pub fn as_slice(&self) -> &[(usize, Real)] {
         &self.entries[..usize::from(self.len)]
     }
@@ -559,7 +559,7 @@ pub struct LinearSystem {
 }
 impl LinearSystem {
     /// Empty assembly for n unknowns.
-    #[must_use]
+    #[must_use = "the returned assembly owns storage sized for the requested system dimension"]
     pub const fn new(n: usize) -> Self {
         Self {
             a: SparseMatrix::new(n, n),

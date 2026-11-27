@@ -121,7 +121,7 @@ pub struct RawFile {
 
 impl RawFile {
     /// A rawfile holding a single plot with empty headers.
-    #[must_use]
+    #[must_use = "the constructed rawfile owns the supplied plot"]
     pub fn single(plot: Plot) -> Self {
         Self {
             plots: vec![RawPlot {
@@ -134,13 +134,13 @@ impl RawFile {
     }
 
     /// Number of plots.
-    #[must_use]
+    #[must_use = "the count determines how many plots can be read"]
     pub const fn len(&self) -> usize {
         self.plots.len()
     }
 
     /// True when the rawfile holds no plots.
-    #[must_use]
+    #[must_use = "the result distinguishes an empty rawfile from one containing plots"]
     pub const fn is_empty(&self) -> bool {
         self.plots.is_empty()
     }
@@ -397,7 +397,7 @@ impl RawFileWriter {
     }
 
     /// The encoding this writer uses.
-    #[must_use]
+    #[must_use = "the format determines how plot data is encoded"]
     pub const fn format(&self) -> RawFormat {
         self.format
     }
@@ -417,7 +417,7 @@ impl RawFileWriter {
     }
 
     /// Whether a streamed plot still has an unpatched header.
-    #[must_use]
+    #[must_use = "the active-plot state determines whether further points can be written"]
     const fn has_active_plot(&self) -> bool {
         self.active.is_some()
     }
@@ -483,13 +483,13 @@ impl RawFileWriter {
     }
 
     /// The active plot's schema, or None between plots.
-    #[must_use]
+    #[must_use = "the header identifies the currently active plot and its schema"]
     pub fn active_header(&self) -> Option<&RawPlot> {
         self.active.as_ref().map(|plot| &plot.header)
     }
 
     /// The number of points written since `begin_plot`.
-    #[must_use]
+    #[must_use = "the active point count reports progress through the current plot"]
     pub fn active_point_count(&self) -> Option<usize> {
         self.active.as_ref().map(|plot| plot.point_count)
     }
@@ -904,7 +904,7 @@ impl RawFormat {
     }
 
     /// True for [`RawFormat::Binary`].
-    #[must_use]
+    #[must_use = "the result selects the binary rather than text encoding"]
     pub const fn is_binary(self) -> bool {
         matches!(self, Self::Binary)
     }
@@ -1087,7 +1087,7 @@ pub struct RawFileReader<R> {
 
 impl<R: BufRead> RawFileReader<R> {
     /// Constructs a reader with automatic format detection and little-endian doubles.
-    #[must_use]
+    #[must_use = "the constructed reader owns the input stream"]
     pub const fn new(input: R) -> Self {
         Self {
             cursor: Cursor::new(input),
@@ -1099,21 +1099,21 @@ impl<R: BufRead> RawFileReader<R> {
     }
 
     /// Set resource limits for the complete input. Configure before reading.
-    #[must_use]
+    #[must_use = "the returned reader carries the new read policy"]
     pub const fn with_policy(mut self, policy: RawReadPolicy) -> Self {
         self.cursor.policy = policy;
         self
     }
 
     /// Requires the specified file encoding.
-    #[must_use]
+    #[must_use = "the returned reader carries the explicit format override"]
     pub const fn with_format(mut self, format: RawFormat) -> Self {
         self.format = Some(format);
         self
     }
 
     /// Selects the byte order for binary doubles.
-    #[must_use]
+    #[must_use = "the returned reader carries the selected binary byte order"]
     pub const fn with_byte_order(mut self, byte_order: BinaryByteOrder) -> Self {
         self.byte_order = byte_order;
         self
@@ -1259,13 +1259,13 @@ pub struct RawPlotRows<'a, R> {
 
 impl<R: BufRead> RawPlotRows<'_, R> {
     /// Provisional header; ASCII complex column flags are finalized by finish.
-    #[must_use]
+    #[must_use = "the header describes the schema of subsequent rows"]
     pub const fn header(&self) -> &RawPlot {
         &self.header
     }
 
     /// Number of rows to decode.
-    #[must_use]
+    #[must_use = "the point count bounds the rows available in this plot"]
     pub const fn point_count(&self) -> usize {
         self.point_count
     }

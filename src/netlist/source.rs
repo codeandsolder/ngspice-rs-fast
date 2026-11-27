@@ -205,13 +205,13 @@ impl LogicalLine {
 
     /// Resolves a logical byte offset (including EOF) to its physical location.
     /// EOF denotes the exclusive end of the last retained text.
-    #[must_use]
+    #[must_use = "the returned physical coordinate identifies the diagnostic location"]
     pub fn location_at(&self, offset: usize) -> SourceLoc {
         self.source_map.position(&self.location, offset).location()
     }
 
     /// The card text with its first token removed, as ngspice's callers do.
-    #[must_use]
+    #[must_use = "the returned text contains the card arguments without its first token"]
     pub fn body(&self) -> &str {
         match self.text.split_once(char::is_whitespace) {
             Some((_, body)) => body.trim_start(),
@@ -235,13 +235,13 @@ pub struct Deck {
 
 impl Deck {
     /// The number of cards, excluding the title.
-    #[must_use]
+    #[must_use = "the count describes electrical cards excluding the title"]
     pub const fn len(&self) -> usize {
         self.lines.len()
     }
 
     /// True when the deck has no cards.
-    #[must_use]
+    #[must_use = "the predicate indicates whether there are any cards to interpret"]
     pub const fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }
@@ -307,7 +307,7 @@ pub(super) fn read_text(
 ///
 /// `str::lines()` handles both `\n` and `\r\n`; a trailing newline does not
 /// produce a final empty line.
-#[must_use]
+#[must_use = "the returned lines preserve physical source numbering"]
 pub fn split_physical_lines(text: &str) -> Vec<PhysicalLine> {
     numbered_lines(text)
         .map(|(number, line)| PhysicalLine {
@@ -326,7 +326,7 @@ fn numbered_lines(text: &str) -> impl Iterator<Item = (u32, &str)> {
 /// True when this physical line continues the previous card.
 ///
 /// ngspice tests the first non-whitespace character for `+`.
-#[must_use]
+#[must_use = "the predicate determines whether the line extends the previous card"]
 pub fn is_continuation(text: &str) -> bool {
     text.trim_start().starts_with('+')
 }
@@ -337,7 +337,7 @@ pub fn is_continuation(text: &str) -> bool {
 /// the special directive `*#`, which is only a directive when `*` is in column 1.
 /// A leading `#` is also a comment, as `inp_stripcomments_line()` converts it to
 /// the normal `*` form.
-#[must_use]
+#[must_use = "the predicate determines whether the whole line is ignored as a comment"]
 pub fn is_comment_line(text: &str) -> bool {
     let trimmed = text.trim_start();
     if text.starts_with("*#") {
@@ -362,7 +362,7 @@ pub fn is_comment_line(text: &str) -> bool {
 ///
 /// The PS/LTPS compatibility mode, in which `$` is an ordinary character, is not
 /// modelled; the port implements the default mode.
-#[must_use]
+#[must_use = "the returned prefix excludes the inline comment under the active rules"]
 pub fn strip_comment(text: &str, in_control: bool) -> &str {
     let bytes = text.as_bytes();
     let mut index = 0;
@@ -406,7 +406,7 @@ pub fn strip_comment(text: &str, in_control: bool) -> &str {
 }
 
 /// Folds caller-trusted physical lines into an owned [`Deck`].
-#[must_use]
+#[must_use = "the returned deck contains folded cards and source coordinates"]
 pub fn fold_logical_lines(file: &Path, lines: &[PhysicalLine]) -> Deck {
     fold_lines(
         file,
@@ -576,14 +576,14 @@ fn starts_with_ascii_case(text: &str, prefix: &str) -> bool {
 /// large input use the bounded semantic text/file entrypoints on
 /// [`crate::netlist::Parser`]. Parsing an externally constructed deck still
 /// checks its visible metadata and lexical work.
-#[must_use]
+#[must_use = "the returned deck contains the title and folded logical cards"]
 pub fn parse_deck_text(file: &Path, text: &str) -> Deck {
     fold_lines(file, numbered_lines(text), true, None).0
 }
 
 /// Folds an included source fragment without treating its first line as a
 /// title. Physical line numbers and continuation/comment rules are unchanged.
-#[must_use]
+#[must_use = "the returned fragment preserves the first included source statement"]
 pub fn parse_fragment_text(file: &Path, text: &str) -> Deck {
     fold_lines(file, numbered_lines(text), false, None).0
 }

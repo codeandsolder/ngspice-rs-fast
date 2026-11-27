@@ -235,13 +235,13 @@ impl Selection {
     }
 
     /// True when the driver's whole plot is written, in the driver's order.
-    #[must_use]
+    #[must_use = "the result distinguishes full output from a selected-column projection"]
     pub const fn is_full(&self) -> bool {
         self.full
     }
 
     /// The names of the written vectors, in order.
-    #[must_use]
+    #[must_use = "the names identify the columns of the requested output"]
     pub fn variable_names(&self) -> Vec<&str> {
         self.columns
             .iter()

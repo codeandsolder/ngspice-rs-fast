@@ -42,7 +42,7 @@ pub struct RfPort {
 impl RfPort {
     /// The incident/scattered power-wave scale `ki = 1/(2 sqrt(z0))` of
     /// `vsrctemp.c` (`VSRCki`).
-    #[must_use]
+    #[must_use = "the returned scale converts the source amplitude to the incident power-wave normalization"]
     pub fn ki(&self) -> Real {
         0.5 / self.z0.sqrt()
     }
@@ -331,7 +331,7 @@ impl IndependentSource {
     }
 
     /// Whether the source has an AC excitation (C `VSRCacGiven`).
-    #[must_use]
+    #[must_use = "the result determines whether the source contributes an AC excitation"]
     pub const fn ac_given(&self) -> bool {
         self.ac.input.is_some()
     }

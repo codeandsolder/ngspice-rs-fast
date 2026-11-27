@@ -95,7 +95,7 @@ impl ScheduledAnalysis {
 ///
 /// `.four` is post-processing of a transient plot, not a job, so it sorts after
 /// every real analysis; a driver lookup rejects it before anything runs.
-#[must_use]
+#[must_use = "the returned priority determines reference-compatible analysis execution order"]
 pub const fn job_order(kind: AnalysisKind) -> usize {
     match kind {
         AnalysisKind::Ac => 1,
@@ -117,7 +117,7 @@ pub const fn job_order(kind: AnalysisKind) -> usize {
 
 /// The plot-type abbreviation `ft_plotabbrev()` (`src/frontend/typesdef.c`)
 /// derives from the plot's name for each analysis type.
-#[must_use]
+#[must_use = "the returned abbreviation identifies the analysis plot type in front-end output"]
 pub const fn plot_abbreviation(kind: AnalysisKind) -> &'static str {
     match kind {
         AnalysisKind::OperatingPoint => "op",
@@ -171,7 +171,7 @@ impl PlotNames {
 ///
 /// See the module documentation for the rules. An empty list schedules
 /// nothing; whether that is an error is the caller's decision.
-#[must_use]
+#[must_use = "the returned schedule must be retained to execute analyses in reference order"]
 pub fn schedule(plans: &[crate::analysis::AnalysisPlan]) -> Vec<ScheduledAnalysis> {
     let mut order: Vec<usize> = (0..plans.len()).collect();
     // Same type: reverse deck order (the job list is built by prepending).
@@ -487,7 +487,7 @@ impl<'a> OutputRoutes<'a> {
 
     /// Bias plots take only saves; noise totals route to the integrated result;
     /// measurement/Fourier selection preserves the last-of-kind policy.
-    #[must_use]
+    #[must_use = "the returned output plans route saves, measurements and Fourier requests to the correct plots"]
     pub fn plan_outputs<'b>(&'b self, scheduled: &'b ScheduledAnalysis) -> Vec<PlannedOutput<'b>> {
         let kind = scheduled.kind;
         let has_integrated = kind == AnalysisKind::Noise

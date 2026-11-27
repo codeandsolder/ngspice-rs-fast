@@ -193,7 +193,7 @@ pub fn resolve_cards(
 /// phase in radians, and the THD both as a fraction and in percent. The `unit`
 /// of a [`FourierAnalysis`] is part of the API, not of this block, exactly as
 /// for `.measure`.
-#[must_use]
+#[must_use = "the returned harmonic report must be written to the chosen output"]
 pub fn to_text(results: &[FourierAnalysis]) -> String {
     use std::fmt::Write as _;
 

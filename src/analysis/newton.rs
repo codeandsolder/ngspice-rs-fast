@@ -45,7 +45,7 @@ pub enum StepLimiting {
 
 impl StepLimiting {
     /// Whether devices limit their own voltages (trials allow it).
-    #[must_use]
+    #[must_use = "the result determines whether device voltage limiting is permitted during this Newton load"]
     pub const fn is_device(self) -> bool {
         matches!(self, Self::Device)
     }

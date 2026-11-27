@@ -142,14 +142,14 @@ impl ElaboratedNetlist {
     /// (card order, then entry order). Every expression was evaluated by
     /// [`literalize`], so values are finite. Syntax only: no precedence among
     /// duplicates, `uic`, instance `ic=` or DC bias is applied here.
-    #[must_use]
+    #[must_use = "the returned entries carry resolved initial-condition values and order"]
     pub fn initial_conditions(&self) -> Vec<ResolvedNodeHint<'_>> {
         resolved(self.netlist.initial_conditions())
     }
 
     /// Ordered `.nodeset` entries, as [`Self::initial_conditions`]. A nodeset
     /// is a convergence hint, not a constraint.
-    #[must_use]
+    #[must_use = "the returned entries carry resolved convergence hints in declaration order"]
     pub fn nodesets(&self) -> Vec<ResolvedNodeHint<'_>> {
         resolved(self.netlist.nodesets())
     }
@@ -178,7 +178,7 @@ fn resolved<'a>(entries: impl Iterator<Item = &'a NodeHint>) -> Vec<ResolvedNode
 /// correctly rounds the resulting decimal to binary64, which may differ
 /// from `value` because of the formatting precision; integer arguments use C's
 /// `floor(0.5 + x)` ([`crate::primitives::c_integer`]).
-#[must_use]
+#[must_use = "the returned literal is the canonical emitted numerical spelling"]
 pub fn format_literal(value: Real) -> String {
     crate::primitives::format_spice_number(value)
 }

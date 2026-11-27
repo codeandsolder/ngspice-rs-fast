@@ -29,7 +29,7 @@ pub trait PointSink {
     /// successful full-header begin. Normal sinks return None and still
     /// receive complete rows. This is called once per output, never per point.
     /// The source's physical state and convergence are never projected.
-    #[must_use]
+    #[must_use = "the selection maps sink columns to the requested projection"]
     fn selected_columns(&self) -> Option<&[usize]> {
         None
     }
@@ -297,7 +297,7 @@ impl PlotFlags {
     ///
     /// ngspice writes `real`, `complex`, and for pole-zero analysis
     /// `real poles`. Only the presence of the word `complex` matters.
-    #[must_use]
+    #[must_use = "the parsed flags determine real or complex plot encoding"]
     pub fn parse(raw: &str) -> Self {
         if raw.to_ascii_lowercase().contains("complex") {
             Self::Complex
@@ -307,7 +307,7 @@ impl PlotFlags {
     }
 
     /// The spelling used in a rawfile `Flags:` line.
-    #[must_use]
+    #[must_use = "the returned spelling belongs in the rawfile flags field"]
     pub const fn as_rawfile(self) -> &'static str {
         match self {
             Self::Real => "real",
@@ -316,7 +316,7 @@ impl PlotFlags {
     }
 
     /// True when the data is complex.
-    #[must_use]
+    #[must_use = "the result determines whether imaginary components are represented"]
     pub const fn is_complex(self) -> bool {
         matches!(self, Self::Complex)
     }
@@ -343,7 +343,7 @@ pub struct Variable {
 
 impl Variable {
     /// Builds a variable, flagged real.
-    #[must_use]
+    #[must_use = "the returned variable describes a real-valued plot column"]
     pub fn new(name: impl Into<String>, unit: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -354,7 +354,7 @@ impl Variable {
 
     /// Builds a variable that ngspice does not flag as real: its values are
     /// written as `re,im` even when the imaginary part is zero.
-    #[must_use]
+    #[must_use = "the returned variable describes a complex-valued plot column"]
     pub fn complex(name: impl Into<String>, unit: impl Into<String>) -> Self {
         Self {
             is_real: false,
@@ -400,26 +400,26 @@ impl PlotSchema {
     }
 
     /// Exact ASCII case-insensitive vector identity.
-    #[must_use]
+    #[must_use = "the index identifies the first column with the requested name"]
     pub fn index(&self, name: &str) -> Option<usize> {
         self.names.get(folded(name).as_ref()).copied()
     }
 
     /// Explicit voltage identity, without constructing a wrapper string.
-    #[must_use]
+    #[must_use = "the index identifies the requested node-voltage column"]
     pub fn voltage(&self, node: &str) -> Option<usize> {
         self.voltages.get(folded(node).as_ref()).copied()
     }
 
     /// Explicit branch current identity.
-    #[must_use]
+    #[must_use = "the index identifies the requested branch-current column"]
     pub fn current(&self, device: &str) -> Option<usize> {
         self.currents.get(folded(device).as_ref()).copied()
     }
 
     /// Named requests prefer exact vector names, then voltage, current and
     /// finally the C branch-name alias.
-    #[must_use]
+    #[must_use = "the index identifies the resolved vector or branch alias"]
     pub fn named(&self, vector: &str) -> Option<usize> {
         let name = folded(vector);
         self.names
@@ -436,13 +436,13 @@ impl PlotSchema {
     }
 
     /// Ordered columns of this schema.
-    #[must_use]
+    #[must_use = "the ordered variables determine the schema column positions"]
     pub fn variables(&self) -> &[Variable] {
         &self.variables
     }
 
     /// Real or complex plot representation.
-    #[must_use]
+    #[must_use = "the schema flags determine the plot representation"]
     pub const fn flags(&self) -> PlotFlags {
         self.flags
     }
@@ -463,7 +463,7 @@ impl PlotBuilder {
     }
 
     /// Seal the schema and start collecting rows.
-    #[must_use]
+    #[must_use = "the constructed plot owns the sealed schema"]
     pub fn build(self) -> Plot {
         Plot::new(self.name, self.plotname, self.flags, self.variables)
     }
@@ -484,7 +484,7 @@ pub struct Plot {
 
 impl Plot {
     /// Construct a plot with a complete column schema and no points.
-    #[must_use]
+    #[must_use = "the constructed plot owns its schema and future row storage"]
     pub fn new(
         name: impl Into<String>,
         plotname: impl Into<String>,
@@ -501,7 +501,7 @@ impl Plot {
     }
 
     /// Begin constructing a schema when the columns are generated incrementally.
-    #[must_use]
+    #[must_use = "the returned builder owns the incremental column declarations"]
     pub fn builder(
         name: impl Into<String>,
         plotname: impl Into<String>,
@@ -516,31 +516,31 @@ impl Plot {
     }
 
     /// The immutable schema, shared by clones and bound projections.
-    #[must_use]
+    #[must_use = "the shared schema preserves column identities for bound projections"]
     pub const fn schema(&self) -> &Arc<PlotSchema> {
         &self.schema
     }
 
     /// Ordered columns.
-    #[must_use]
+    #[must_use = "the ordered variables identify the plot columns"]
     pub fn variables(&self) -> &[Variable] {
         self.schema.variables()
     }
 
     /// Real or complex plot representation.
-    #[must_use]
+    #[must_use = "the plot flags determine real or complex serialization"]
     pub fn flags(&self) -> PlotFlags {
         self.schema.flags()
     }
 
     /// All cells in row-major order, without row descriptors or allocations.
-    #[must_use]
+    #[must_use = "the borrowed cells expose the complete row-major data"]
     pub fn cells(&self) -> &[Complex] {
         &self.cells
     }
 
     /// Borrow a row by index.
-    #[must_use]
+    #[must_use = "the borrowed row contains the samples at the requested point"]
     pub fn row(&self, index: usize) -> Option<&[Complex]> {
         if index >= self.point_count {
             return None;
@@ -620,13 +620,13 @@ impl Plot {
     }
 
     /// Consume the plot and transfer its packed cells without allocating.
-    #[must_use]
+    #[must_use = "the returned vector owns the consumed plot data"]
     pub fn into_cells(self) -> Vec<Complex> {
         self.cells
     }
 
     /// A point-free header sharing the same schema.
-    #[must_use]
+    #[must_use = "the returned header preserves metadata without copying sample data"]
     pub fn header(&self) -> Self {
         Self {
             name: self.name.clone(),
@@ -670,7 +670,7 @@ impl Plot {
     }
 
     /// Number of points, including the single empty row of a rootless PZ plot.
-    #[must_use]
+    #[must_use = "the point count bounds valid row indices"]
     pub const fn point_count(&self) -> usize {
         self.point_count
     }
@@ -706,13 +706,13 @@ impl Plot {
     }
 
     /// Number of columns.
-    #[must_use]
+    #[must_use = "the variable count determines the width of every row"]
     pub fn variable_count(&self) -> usize {
         self.variables().len()
     }
 
     /// True when the plot has no columns or no points.
-    #[must_use]
+    #[must_use = "the result identifies a plot without usable sample data"]
     pub fn is_empty(&self) -> bool {
         self.variables().is_empty() || self.point_count == 0
     }
@@ -800,26 +800,26 @@ impl Plot {
     }
 
     /// The index of a variable, matched case-insensitively.
-    #[must_use]
+    #[must_use = "the column index identifies the requested variable"]
     pub fn variable_index(&self, name: &str) -> Option<usize> {
         self.schema.index(name)
     }
 
     /// One value, addressed by variable name and point index.
-    #[must_use]
+    #[must_use = "the returned sample is the requested variable at the given point"]
     pub fn value(&self, variable: &str, point: usize) -> Option<Complex> {
         let column = self.variable_index(variable)?;
         self.row(point)?.get(column).copied()
     }
 
     /// Borrow a strided view of a named column without allocating.
-    #[must_use]
+    #[must_use = "the column view provides the requested named vector"]
     pub fn column(&self, variable: &str) -> Option<ColumnView<'_>> {
         self.column_at(self.variable_index(variable)?)
     }
 
     /// Borrow a strided view by column index.
-    #[must_use]
+    #[must_use = "the column view provides the indexed vector without copying samples"]
     pub fn column_at(&self, column: usize) -> Option<ColumnView<'_>> {
         let width = self.variable_count();
         (column < width).then_some(ColumnView {
@@ -830,7 +830,7 @@ impl Plot {
     }
 
     /// Largest absolute value anywhere in the plot.
-    #[must_use]
+    #[must_use = "the maximum magnitude is needed for numerical range comparisons"]
     pub fn max_abs(&self) -> Real {
         self.cells
             .iter()
@@ -838,7 +838,7 @@ impl Plot {
     }
 
     /// True when every value is finite.
-    #[must_use]
+    #[must_use = "the result detects nonfinite values before subsequent analysis"]
     pub fn is_finite(&self) -> bool {
         self.cells.iter().all(|value| value.is_finite())
     }
@@ -862,19 +862,19 @@ pub struct ColumnView<'a> {
 
 impl<'a> ColumnView<'a> {
     /// Number of values (rows).
-    #[must_use]
+    #[must_use = "the length bounds valid indices in the strided column"]
     pub const fn len(&self) -> usize {
         self.cells.len() / self.width
     }
 
     /// Whether the column contains no values.
-    #[must_use]
+    #[must_use = "the result distinguishes an empty column from one with samples"]
     pub const fn is_empty(&self) -> bool {
         self.cells.is_empty()
     }
 
     /// Borrow the value at a given row.
-    #[must_use]
+    #[must_use = "the returned reference is the requested sample in the column"]
     pub fn get(&self, index: usize) -> Option<&'a Complex> {
         if index >= self.len() {
             return None;
@@ -892,13 +892,13 @@ impl<'a> ColumnView<'a> {
     }
 
     /// First value, if present.
-    #[must_use]
+    #[must_use = "the returned reference identifies the initial sample"]
     pub fn first(&self) -> Option<&'a Complex> {
         self.get(0)
     }
 
     /// Last value, if present.
-    #[must_use]
+    #[must_use = "the returned reference identifies the final sample"]
     pub fn last(&self) -> Option<&'a Complex> {
         self.len().checked_sub(1).and_then(|index| self.get(index))
     }

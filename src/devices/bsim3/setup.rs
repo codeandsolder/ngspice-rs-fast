@@ -1297,7 +1297,7 @@ impl ModelChecks {
 
 impl ModelSetup {
     /// Capture the defaulted model and its temperature pass.
-    #[must_use]
+    #[must_use = "the constructed setup must be retained to share model defaults, temperature data and ordered check state across instances"]
     pub const fn new(defaults: ModelDefaults, temperature: TemperatureModel) -> Self {
         Self {
             checks: ModelChecks::new(&defaults),
@@ -1307,13 +1307,13 @@ impl ModelSetup {
     }
 
     /// The model fields this state was built from.
-    #[must_use]
+    #[must_use = "the returned defaults identify the model fields underlying this instance setup context"]
     pub const fn defaults(&self) -> &ModelDefaults {
         &self.defaults
     }
 
     /// The model-level temperature pass.
-    #[must_use]
+    #[must_use = "the returned temperature pass supplies model-level quantities used for instance setup"]
     pub const fn temperature(&self) -> &TemperatureModel {
         &self.temperature
     }
@@ -1339,14 +1339,14 @@ impl ModelSetup {
 }
 
 /// Every `b3temp.c` size-dependent parameter keyword, in C order.
-#[must_use]
+#[must_use = "the returned ordered keywords identify the reference size-dependent parameter set"]
 pub fn size_dependent_names() -> Vec<&'static str> {
     BINNED_NAMES.to_vec()
 }
 
 impl InstanceSetup {
     /// A size-dependent/derived parameter by keyword, e.g. `phi` or `rdsw`.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a derived instance parameter from an unsupported keyword"]
     pub fn pparam(&self, name: &str) -> Option<Real> {
         match name {
             "dl" => Some(self.dl),

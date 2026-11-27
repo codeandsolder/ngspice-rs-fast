@@ -515,20 +515,20 @@ impl RunConfig {
     }
 
     /// Explicit Fourier front-end settings.
-    #[must_use]
+    #[must_use = "the returned option distinguishes explicit Fourier settings from front-end defaults"]
     pub const fn fourier_settings(&self) -> Option<crate::analysis::fourier::FourierSettings> {
         self.fourier
     }
 
     /// Rawfile encoding selected by the front-end `set filetype` variable.
-    #[must_use]
+    #[must_use = "the returned option determines whether the deck specifies a rawfile encoding"]
     pub const fn raw_format(&self) -> Option<crate::analysis::RawFormat> {
         self.raw_format
     }
 
     /// The deck's resolved top-level `.param` scope (only for configs built by
     /// [`Self::from_netlist`]).
-    #[must_use]
+    #[must_use = "the returned option identifies the resolved top-level parameter scope when available"]
     pub fn params(&self) -> Option<&ParamScope> {
         self.params.as_deref()
     }
@@ -1007,45 +1007,45 @@ impl RunConfig {
 
     /// Resolved circuit temperatures, junction gmin, RELTOL and other
     /// physical settings shared by all analyses.
-    #[must_use]
+    #[must_use = "the returned context carries the resolved physical and numerical settings for the analysis"]
     pub const fn context(&self) -> AnalysisContext {
         self.context
     }
 
     /// Deck-supplied transient tolerances (unset fields keep driver defaults).
-    #[must_use]
+    #[must_use = "the returned options determine which transient defaults the deck replaces"]
     pub const fn transient(&self) -> &TransientSettings {
         &self.transient
     }
 
     /// Deck-supplied DC Newton/continuation settings (unset fields keep the
     /// defaults of [`crate::analysis::bias::DcSettings`]).
-    #[must_use]
+    #[must_use = "the returned options determine which Newton and continuation defaults the deck replaces"]
     pub const fn dc(&self) -> &DcOptions {
         &self.dc
     }
 
     /// Typed integration family, if the deck selected one.
-    #[must_use]
+    #[must_use = "the returned option distinguishes an explicit integration family from the default"]
     pub const fn method(&self) -> Option<IntegrationFamily> {
         self.method
     }
 
     /// Retained `maxord=` selection, if the deck gave one.
-    #[must_use]
+    #[must_use = "the returned option distinguishes an explicit order limit from the default"]
     pub fn maxord(&self) -> Option<u8> {
         self.maxord.as_ref().map(|(order, _)| *order)
     }
 
     /// Accepted options with an effect, in deck order (duplicates included).
-    #[must_use]
+    #[must_use = "the returned ordered options identify the effective deck settings including duplicate assignments"]
     pub fn applied(&self) -> &[AppliedOption] {
         &self.applied
     }
 
     /// Accepted documented no-op options, in deck order, with the reason each
     /// has no effect (see the module documentation).
-    #[must_use]
+    #[must_use = "the returned records explain which accepted deck options have no effect"]
     pub fn ignored(&self) -> &[IgnoredOption] {
         &self.ignored
     }

@@ -117,7 +117,7 @@ pub struct ModelDefaults {
 impl ModelDefaults {
     /// A numeric model field, including setup defaults and zero initialization.
     /// Flags and VERSION are exposed separately; aliases use the same C ID.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a resolved numeric model field from an unknown or nonnumeric parameter"]
     pub fn get(&self, name: &str) -> Option<Real> {
         let parameter = DEVICE.model.get(name)?;
         self.values.get(parameter.canonical)
@@ -125,7 +125,7 @@ impl ModelDefaults {
 
     /// C's given-bit state, not whether the final number differs from a
     /// default. Aliases (and the two type flags) share their actual C bit.
-    #[must_use]
+    #[must_use = "the result distinguishes explicitly supplied parameters from setup defaults even when their values coincide"]
     pub fn is_given(&self, name: &str) -> bool {
         DEVICE.model.get(name).is_some_and(|parameter| {
             parameter.c_given.is_some()

@@ -66,7 +66,7 @@ pub struct CandidateSite {
 
 impl CandidateSite {
     /// Independent input coordinates which may affect this site.
-    #[must_use]
+    #[must_use = "the returned dependency indices determine which coordinate changes invalidate this site"]
     pub fn inputs(&self) -> &[usize] {
         self.inputs.inputs()
     }
@@ -184,13 +184,13 @@ impl CircuitParameterPlan {
     }
 
     /// Coordinate schema in original caller order.
-    #[must_use]
+    #[must_use = "the returned schema defines the required coordinate order for candidate updates"]
     pub fn inputs(&self) -> &[crate::netlist::eval::ParameterInput] {
         self.parameters.inputs()
     }
 
     /// Parameter-dependent site schema and original source provenance.
-    #[must_use]
+    #[must_use = "the returned site schema maps dependent values to their original source provenance"]
     pub fn sites(&self) -> &[CandidateSite] {
         &self.sites
     }
@@ -441,7 +441,7 @@ fn append_numeric_override(
 
 impl CircuitCandidate<'_> {
     /// The baseline circuit or the current candidate's own finalized circuit.
-    #[must_use]
+    #[must_use = "the returned finalized circuit reflects the current candidate rather than necessarily the baseline"]
     pub fn circuit(&self) -> &Circuit {
         self.prepared
             .as_ref()
@@ -459,7 +459,7 @@ impl CircuitCandidate<'_> {
     }
 
     /// Validated configuration of the current candidate.
-    #[must_use]
+    #[must_use = "the returned run configuration includes the current candidate's validated option replacements"]
     pub fn config(&self) -> &RunConfig {
         self.prepared
             .as_ref()
@@ -467,7 +467,7 @@ impl CircuitCandidate<'_> {
     }
 
     /// Model preparation, including all selected typed numeric replacements.
-    #[must_use]
+    #[must_use = "the returned context carries the selected typed model replacements needed for device preparation"]
     pub fn model_context(&self) -> ModelContext {
         self.prepared.as_ref().map_or_else(
             || self.plan.config.context().model_context(),
@@ -479,7 +479,7 @@ impl CircuitCandidate<'_> {
     /// analysis drivers obtain their typed device overrides through this
     /// context's existing `model_context()` conversion; passing the baseline
     /// `RunConfig::context()` would omit candidate values.
-    #[must_use]
+    #[must_use = "the returned context combines run configuration and candidate model overrides; a baseline context loses replacements"]
     pub fn analysis_context(&self) -> crate::analysis::AnalysisContext {
         self.config()
             .context()
@@ -487,7 +487,7 @@ impl CircuitCandidate<'_> {
     }
 
     /// Whether the original topology identity is still valid.
-    #[must_use]
+    #[must_use = "the returned classification determines whether baseline topology identity can be reused"]
     pub fn topology(&self) -> CandidateTopology {
         if self
             .prepared
@@ -652,19 +652,19 @@ impl CircuitCandidate<'_> {
     }
 
     /// Current committed typed site value by stable plan site index.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a committed typed value from an invalid site index"]
     pub fn site_value(&self, index: usize) -> Option<Real> {
         self.site_values.get(index).copied()
     }
 
     /// Site expressions evaluated by the last successful update.
-    #[must_use]
+    #[must_use = "the returned count measures dependency-driven expression evaluation work for the last successful update"]
     pub const fn last_site_evaluations(&self) -> usize {
         self.last_site_evaluations
     }
 
     /// Decimal materializations by the last successful update.
-    #[must_use]
+    #[must_use = "the returned count measures decimal materialization work for the last successful update"]
     pub const fn last_site_roundings(&self) -> usize {
         self.last_site_roundings
     }

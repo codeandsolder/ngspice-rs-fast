@@ -355,18 +355,18 @@ impl PassiveParameters {
     }
 
     /// Validated resistor/capacitor/inductor family.
-    #[must_use]
+    #[must_use = "the returned family identifies the validated passive device model"]
     pub const fn family(&self) -> ModelFamily {
         self.kind.family()
     }
     /// Unadjusted single-instance R/C/L in ohms/farads/henries, respectively.
     /// Does not include temperature, scale or multiplicity.
-    #[must_use]
+    #[must_use = "the returned unadjusted value supplies the base physical R C or L"]
     pub const fn nominal_value(&self) -> Real {
         self.nominal_value
     }
     /// Positive parallel multiplier (default 1).
-    #[must_use]
+    #[must_use = "the returned multiplier determines the parallel instance scaling"]
     pub const fn multiplicity(&self) -> Real {
         self.multiplicity
     }
@@ -393,27 +393,27 @@ impl PassiveParameters {
         Ok(recipe)
     }
     /// The validated model setters (schema defaults have no location).
-    #[must_use]
+    #[must_use = "the returned validated setters supply model-level parameters"]
     pub const fn model_values(&self) -> &ScalarValues {
         &self.model_values
     }
     /// The validated instance setters (schema defaults have no location;
     /// resistor principal is clamped by the C setter).
-    #[must_use]
+    #[must_use = "the returned validated setters supply instance-level parameters"]
     pub const fn instance_values(&self) -> &ScalarValues {
         &self.instance_values
     }
     /// Capacitor initial volts or inductor initial amperes, if given.
     /// Applied by the companion transient under `uic` (see
     /// `Device::storage_element`), ignored otherwise as in C.
-    #[must_use]
+    #[must_use = "the result supplies the explicit storage initial condition when present"]
     pub const fn initial_condition(&self) -> Option<Real> {
         self.initial_condition
     }
 
     /// The resistor's `.noise` description (`resnoise.c`; `ressetup.c`
     /// defaults `KF = 0`, `AF = EF = LF = WF = 1`, `noisy = 1`), for `model`.
-    #[must_use]
+    #[must_use = "the returned noise description supplies the resistor noise parameters"]
     pub fn resistor_noise(&self, model: &str) -> crate::devices::ResistorNoise {
         crate::devices::ResistorNoise {
             model: Some(model.to_owned()),

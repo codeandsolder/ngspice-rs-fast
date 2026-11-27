@@ -106,7 +106,7 @@ impl ChargeEvaluation {
     /// `mode` is the DC mode (>= 0 normal, < 0 inverse). Returns
     /// `CKTstate0`'s `qg`, `qd` and `qb` (C's `qgate`/`qdrn` are updated in
     /// place because the terminal currents read them).
-    #[must_use]
+    #[must_use = "the returned charges include the overlap contributions and terminal-mode redistribution"]
     pub fn with_overlap(&self, mode: i8, vgb: Real) -> OverlapCharges {
         let qgd = self.qgdo;
         let qgs = self.qgso;

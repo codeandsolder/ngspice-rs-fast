@@ -55,7 +55,7 @@ pub enum ControlledKind {
 
 impl ControlledKind {
     /// The designator letter.
-    #[must_use]
+    #[must_use = "the returned letter identifies the controlled-source family"]
     pub const fn designator(self) -> char {
         match self {
             Self::Vcvs => 'e',
@@ -66,7 +66,7 @@ impl ControlledKind {
     }
 
     /// The kind for a designator letter.
-    #[must_use]
+    #[must_use = "the result selects a supported controlled-source family"]
     pub const fn from_designator(designator: char) -> Option<Self> {
         match designator {
             'e' => Some(Self::Vcvs),
@@ -78,13 +78,13 @@ impl ControlledKind {
     }
 
     /// True for the voltage-controlled E/G, which have controlling nodes.
-    #[must_use]
+    #[must_use = "the result determines whether controlling nodes must be bound"]
     pub const fn voltage_controlled(self) -> bool {
         matches!(self, Self::Vcvs | Self::Vccs)
     }
 
     /// True for E/H, which add a branch-current unknown.
-    #[must_use]
+    #[must_use = "the result determines whether an extra current coordinate is required"]
     pub const fn has_branch(self) -> bool {
         matches!(self, Self::Vcvs | Self::Ccvs)
     }
@@ -231,19 +231,19 @@ impl ControlledSource {
     }
 
     /// Which controlled source this is.
-    #[must_use]
+    #[must_use = "the returned kind selects the physical controlled-source stamp"]
     pub const fn kind(&self) -> ControlledKind {
         self.topology.kind()
     }
 
     /// The effective gain after `m` scaling.
-    #[must_use]
+    #[must_use = "the returned effective gain includes instance multiplicity"]
     pub const fn gain(&self) -> Real {
         self.gain
     }
 
     /// The sensed source of an F/H, `None` for E/G.
-    #[must_use]
+    #[must_use = "the result identifies the sensed branch for current-controlled sources"]
     pub const fn control(&self) -> Option<&ControlReference> {
         self.topology.control()
     }

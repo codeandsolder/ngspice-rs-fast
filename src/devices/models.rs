@@ -85,7 +85,7 @@ pub enum ModelFamily {
 
 impl ModelFamily {
     /// Family associated with an ordinary parsed model type.
-    #[must_use]
+    #[must_use = "the family determines the model interpretation and device dispatch"]
     pub fn from_base(base: &str) -> Option<Self> {
         match base.to_ascii_lowercase().as_str() {
             "r" | "res" => Some(Self::Resistor),
@@ -113,7 +113,7 @@ impl ModelFamily {
 
     /// Compatible instance designator. Node and model names have separate
     /// namespaces; model lookup never applies the `gnd` alias.
-    #[must_use]
+    #[must_use = "the designator selects the corresponding device family"]
     pub const fn designator(self) -> char {
         match self {
             Self::Resistor => 'r',
@@ -417,7 +417,7 @@ impl<'a> ModelResolver<'a> {
     }
 
     /// Replace the front-end settings binning reads (`scale`, `wnflag`).
-    #[must_use]
+    #[must_use = "discarding the returned index leaves the previous binning options in effect"]
     pub const fn with_bin_options(mut self, options: BinOptions) -> Self {
         self.bin_options = options;
         self
@@ -511,7 +511,7 @@ impl<'a> ModelResolver<'a> {
     }
 
     /// Raw first declaration by case-insensitive name; no ground aliasing.
-    #[must_use]
+    #[must_use = "the returned declaration determines which model parameters are applied"]
     pub fn model(&self, name: &str) -> Option<&'a ModelCard> {
         self.declarations
             .get(name)
@@ -593,19 +593,19 @@ pub struct ResolvedModel<'a> {
 
 impl<'a> ResolvedModel<'a> {
     /// Original first model card, with raw ordered setters and source locations.
-    #[must_use]
+    #[must_use = "the model card contains the selected declaration and parameters"]
     pub const fn card(&self) -> &'a ModelCard {
         self.card
     }
 
     /// Validated family.
-    #[must_use]
+    #[must_use = "the resolved family determines which device implementation is valid"]
     pub const fn family(&self) -> ModelFamily {
         self.family
     }
 
     /// Backend selection versus applied integer data.
-    #[must_use]
+    #[must_use = "the level selection determines the physical model variant"]
     pub const fn levels(&self) -> LevelSelection {
         self.levels
     }
@@ -774,7 +774,7 @@ impl Default for ModelContext {
 }
 impl ModelContext {
     /// A context at explicit temperatures with no resistor overrides.
-    #[must_use]
+    #[must_use = "the new context carries the circuit and reference temperatures"]
     pub const fn new(temperature: Real, nominal_temperature: Real) -> Self {
         Self {
             temperature,
@@ -793,28 +793,28 @@ impl ModelContext {
 
     /// This context with the matrix pivot thresholds replaced (validated on
     /// use, see [`crate::maths::PivotTolerances::validate`]).
-    #[must_use]
+    #[must_use = "discarding the returned context loses the requested pivot tolerances"]
     pub const fn with_pivot_tolerances(mut self, pivot: crate::maths::PivotTolerances) -> Self {
         self.pivot = pivot;
         self
     }
 
     /// This context with C's `CKTsrcFact` replaced ([`Self::source_factor`]).
-    #[must_use]
+    #[must_use = "discarding the returned context loses the requested source continuation factor"]
     pub const fn with_source_factor(mut self, factor: Real) -> Self {
         self.source_factor = factor;
         self
     }
 
     /// This context with the `hertz` frequency replaced (validated on use).
-    #[must_use]
+    #[must_use = "discarding the returned context loses the requested analysis frequency"]
     pub const fn with_frequency(mut self, frequency: Real) -> Self {
         self.frequency = frequency;
         self
     }
 
     /// This context with the circuit relative tolerance replaced (validated on use).
-    #[must_use]
+    #[must_use = "discarding the returned context loses the requested relative tolerance"]
     pub const fn with_reltol(mut self, reltol: Real) -> Self {
         self.reltol = reltol;
         self
@@ -822,7 +822,7 @@ impl ModelContext {
 
     /// This context with junction `gmin` replaced (validated on use, see
     /// [`Self::gmin`]).
-    #[must_use]
+    #[must_use = "discarding the returned context loses the requested minimum conductance"]
     pub const fn with_gmin(mut self, gmin: Real) -> Self {
         self.gmin = gmin;
         self

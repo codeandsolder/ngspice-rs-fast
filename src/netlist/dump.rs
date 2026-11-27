@@ -135,7 +135,7 @@ fn strip_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
 impl PathMapper {
     /// A mapper for one fixture root. The canonical form of the root is also
     /// accepted, because include resolution reports canonical paths.
-    #[must_use]
+    #[must_use = "the mapper establishes the fixture root for deterministic diagnostics"]
     pub fn new(root: &Path) -> Self {
         let mut roots = vec![slashes(&root.to_string_lossy())];
         if let Ok(canonical) = root.canonicalize() {
@@ -148,7 +148,7 @@ impl PathMapper {
     }
 
     /// A mapper from root spellings, for tests (any separator style).
-    #[must_use]
+    #[must_use = "the mapper establishes root precedence for deterministic path normalization"]
     pub fn from_roots<S: AsRef<str>>(roots: impl IntoIterator<Item = S>) -> Self {
         let mut roots: Vec<String> = roots.into_iter().map(|r| slashes(r.as_ref())).collect();
         roots.sort_by_key(|r| std::cmp::Reverse(r.len()));
@@ -156,7 +156,7 @@ impl PathMapper {
     }
 
     /// Normalizes a path given as text (any separator style).
-    #[must_use]
+    #[must_use = "the returned spelling removes fixture-dependent path prefixes"]
     pub fn map_str(&self, path: &str) -> String {
         let normalized = slashes(path);
         for root in &self.roots {
@@ -176,14 +176,14 @@ impl PathMapper {
     }
 
     /// Normalizes a filesystem path.
-    #[must_use]
+    #[must_use = "the returned spelling makes filesystem paths comparable across hosts"]
     pub fn map(&self, path: &Path) -> String {
         self.map_str(&path.to_string_lossy())
     }
 
     /// Removes the root prefix from free-form diagnostic text (messages embed
     /// canonical paths), in both separator styles.
-    #[must_use]
+    #[must_use = "the returned diagnostic removes fixture-root-dependent text"]
     pub fn scrub(&self, text: &str) -> String {
         let mut text = text.to_owned();
         for root in &self.roots {
@@ -207,7 +207,7 @@ impl PathMapper {
 }
 
 /// Quotes a string with the dump escape rules.
-#[must_use]
+#[must_use = "the returned quoted string preserves the dump escape rules"]
 pub fn quote(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
@@ -367,7 +367,7 @@ fn token_line(ctx: &Ctx<'_>, out: &mut Out, indent: usize, number: usize, token:
 
 /// Dumps the token stream of every card of a loaded deck (the root file only;
 /// included files appear in the AST dump). `paths` normalizes file names.
-#[must_use]
+#[must_use = "the returned dump contains the lexical conformance evidence"]
 pub fn dump_tokens(deck: &Deck, paths: &PathMapper) -> String {
     let ctx = Ctx { paths };
     let mut out = Out::new(TOKEN_DUMP_HEADER);
@@ -418,7 +418,7 @@ pub fn dump_tokens_file(path: &Path, root: &Path) -> SpiceResult<String> {
 
 /// Parses `path` (resolving includes) and dumps the AST, or the positioned
 /// error when parsing fails; the output is deterministic either way.
-#[must_use]
+#[must_use = "the returned dump contains the parse result or positioned error"]
 pub fn dump_ast_file(parser: Parser, path: &Path, root: &Path) -> String {
     let paths = PathMapper::new(root);
     match parser.parse_file(path) {
@@ -428,7 +428,7 @@ pub fn dump_ast_file(parser: Parser, path: &Path, root: &Path) -> String {
 }
 
 /// The AST-dump form of a failed parse.
-#[must_use]
+#[must_use = "the returned dump contains the positioned parse failure"]
 pub fn dump_ast_error(path: &Path, error: &SpiceError, paths: &PathMapper) -> String {
     let ctx = Ctx { paths };
     let mut out = Out::new(AST_DUMP_HEADER);
@@ -438,7 +438,7 @@ pub fn dump_ast_error(path: &Path, error: &SpiceError, paths: &PathMapper) -> St
 }
 
 /// Dumps a parsed netlist.
-#[must_use]
+#[must_use = "the returned dump contains the parsed AST conformance evidence"]
 pub fn dump_ast(netlist: &Netlist, paths: &PathMapper) -> String {
     let ctx = Ctx { paths };
     let mut out = Out::new(AST_DUMP_HEADER);

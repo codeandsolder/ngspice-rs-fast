@@ -107,7 +107,7 @@ impl AnalysisKind {
     ];
 
     /// The name without the leading dot, e.g. `"tran"`.
-    #[must_use]
+    #[must_use = "the returned spelling identifies the analysis in netlist and diagnostic text"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OperatingPoint => "op",
@@ -128,7 +128,7 @@ impl AnalysisKind {
     /// Parses a card name, with or without its leading dot, case-insensitively.
     ///
     /// Returns `None` for a `.` command that is not an analysis.
-    #[must_use]
+    #[must_use = "the result identifies an analysis card or rejects a different command"]
     pub fn parse(name: &str) -> Option<Self> {
         let name = name.strip_prefix('.').unwrap_or(name);
         Self::ALL

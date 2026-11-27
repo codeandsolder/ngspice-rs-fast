@@ -191,19 +191,19 @@ impl MutualInductance {
     }
 
     /// The coupled inductors' names, in card order.
-    #[must_use]
+    #[must_use = "the returned references identify coupled inductors in card order"]
     pub fn inductors(&self) -> &[ControlReference] {
         &self.inductors
     }
 
     /// The coupling coefficient `k`.
-    #[must_use]
+    #[must_use = "the returned coefficient determines mutual coupling strength"]
     pub const fn coefficient(&self) -> Real {
         self.coefficient
     }
 
     /// Where the card was written, if known.
-    #[must_use]
+    #[must_use = "the result identifies the source of coupling diagnostics"]
     pub const fn location(&self) -> Option<&SourceLoc> {
         self.location.as_ref()
     }

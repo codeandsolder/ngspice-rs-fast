@@ -66,13 +66,13 @@ impl DenseComplex {
     }
 
     /// The dimension `n`.
-    #[must_use]
+    #[must_use = "the square-matrix dimension is needed to size or validate complex operations"]
     pub const fn dim(&self) -> usize {
         self.shape.rows()
     }
 
     /// The entry at `(row, col)`, or `None` out of range.
-    #[must_use]
+    #[must_use = "the returned option distinguishes a complex entry from an invalid coordinate"]
     pub fn get(&self, row: usize, col: usize) -> Option<Complex> {
         self.shape.offset(row, col).map(|offset| self.data[offset])
     }
@@ -92,7 +92,7 @@ impl DenseComplex {
     }
 
     /// The entries in row-major order.
-    #[must_use]
+    #[must_use = "the returned slice provides the row-major complex entries"]
     pub fn data(&self) -> &[Complex] {
         &self.data
     }
