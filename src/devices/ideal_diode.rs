@@ -104,12 +104,11 @@ impl Model {
                 "revepsilon" => result.revepsilon = nonnegative(value, location, name)?,
                 "kf" => result.kf = nonnegative(value, location, name)?,
                 "af" => result.af = value,
-                "level" => {} // Ordered level resolution already selected this family.
-                // Semiconductor-only parameters have no effect on idealized conduction.
-                "is" | "rs" | "n" | "tt" | "cjo" | "vj" | "m" | "eg" | "xti" | "fc" | "bv"
-                | "ibv" | "isr" | "nr" | "ikf" | "tikf" | "tnom" | "trs1" | "trs2" => {}
-                // Documented schematic ratings, not electrical setters.
-                "vpk" | "ipk" | "iave" | "irms" | "diss" => {}
+                // LEVEL is resolved before selecting the family. Semiconductor-only
+                // setters and schematic ratings have no effect on ideal conduction.
+                "level" | "is" | "rs" | "n" | "tt" | "cjo" | "vj" | "m" | "eg" | "xti" | "fc"
+                | "bv" | "ibv" | "isr" | "nr" | "ikf" | "tikf" | "tnom" | "trs1" | "trs2"
+                | "vpk" | "ipk" | "iave" | "irms" | "diss" => {}
                 _ => return Err(unsupported(field)),
             }
         }
