@@ -174,6 +174,7 @@ impl Index {
         }
         let mut index = BTreeMap::new();
         let mut seen = std::collections::BTreeSet::new();
+        let mut anchors = std::collections::BTreeSet::new();
         for declaration in declarations {
             if declaration.scope.len() > 1 {
                 return Err(SpiceError::circuit(
@@ -198,8 +199,11 @@ impl Index {
                 ));
             }
             let mut positive = declaration.positive.as_str();
-            let anchor = |name: &str, p: &str, n: &str, output: Option<&str>| {
+            let mut anchor = |name: &str, p: &str, n: &str, output: Option<&str>| {
                 let key = key(name);
+                if !anchors.insert(key.clone()) {
+                    return Err(SpiceError::circuit("shared prepared resistor anchor"));
+                }
                 validate_anchor(&cards, key, p, n, output, netlist.auto_gnd)
             };
             if let Some(sensor) = &declaration.series_sensor {
@@ -328,9 +332,6 @@ impl Device for PwlResistor {
     fn limits_voltage_steps(&self) -> bool {
         false
     }
-    fn has_start_settings(&self) -> bool {
-        self.initial.is_some()
-    }
     // Record that a load has occurred even on a failed factorization retry.
     fn state_count(&self) -> usize {
         1
@@ -349,7 +350,6 @@ impl Device for PwlResistor {
         let current = context.row_value(row)?;
         let (x, _) = self.curve.coordinates(voltage, current);
         let hint = if context.mode.is_bias()
-            && context.states.device_limiting()
             && context.states.phase() == IterationPhase::Junction
             && context.states.iterate(0).is_none()
         {
@@ -408,6 +408,41 @@ impl Device for PwlResistor {
     ) -> SpiceResult<()> {
         self.assemble_small_signal(context, bias)
     }
+    fn assemble_nonlinear_taylor(
+        &self,
+        context: &mut crate::devices::physical_dae::TaylorContext<'_>,
+    ) -> SpiceResult<()> {
+        use crate::maths::taylor::Jet;
+        use std::cmp::Ordering;
+        let branch = context
+            .branch
+            .ok_or_else(|| SpiceError::circuit("missing PWL Taylor branch"))?;
+        let p = context.unknowns.node_row(self.terminals[0]);
+        let n = context.unknowns.node_row(self.terminals[1]);
+        let independent = match self.curve.axis {
+            Axis::Voltage => context.variable(p)?.add(&context.variable(n)?.scale(-1.)),
+            Axis::Current => context.variable(Some(branch))?,
+        };
+        independent.check()?;
+        let index = self
+            .curve
+            .segments
+            .partition_point(|segment| independent.compare(segment.upper) != Some(Ordering::Less));
+        let segment = &self.curve.segments[index.min(self.curve.segments.len() - 1)];
+        let (voltage, current) = self.curve.coefficients(segment);
+        let row = Some(branch);
+        for (node, sign) in [(p, 1.), (n, -1.)] {
+            context.linear_static(node, row, sign)?;
+            context.linear_static(row, node, sign * voltage)?;
+        }
+        context.linear_static(row, row, current)?;
+        context.static_value(
+            row,
+            &Jet::constant(context.time.order(), -segment.intercept),
+            1.,
+        )
+    }
+
     fn assemble_nonlinear_charge(
         &self,
         _context: &mut crate::devices::traits::ChargeContext<'_>,

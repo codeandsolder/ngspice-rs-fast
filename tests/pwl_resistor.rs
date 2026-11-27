@@ -219,3 +219,29 @@ fn sidecar_validation_and_candidate_isolation() -> anyhow::Result<()> {
     assert!(circuit(&deck, &bundle).is_err());
     Ok(())
 }
+
+#[test]
+fn specialized_occurrence_hints_and_current_probes() -> anyhow::Result<()> {
+    let (deck, bundle) = source(
+        &format!(
+            ".INIT X1.!R1=2\n.INIT X2.!R1=3\nVref ref 0 5\nI1 ref a 1\nI2 ref b 1\nI3 ref c 1\nI4 ref d 1\nX1 a ref CHILD\nX2 b ref CHILD\nX3 c ref CHILD\nX4 d ref CHILD\n.subckt CHILD p n\n!R1 p n MR IC=1\n{VOLTAGE}\n.ends CHILD"
+        ),
+        InputFormat::SimplisDeck,
+    )?;
+    let (mut c, config) = circuit(&deck, &bundle)?;
+    let plot = run(&mut c, &config, AnalysisKind::OperatingPoint, &[])?;
+    for (node, root) in [("a", 0.5), ("b", 1.5), ("c", -1. / 3.), ("d", -1. / 3.)] {
+        near(&plot, &format!("v({node})"), 0, 5. + root);
+    }
+    let (deck, bundle) = source(
+        &format!(
+            "V1 a 0 0.5\nV2 b 0 1\n!R1 a 0 MR IC=2\n!R2 b 0 MC IC=3\nF1 out 0 !R1 2\nF2 other 0 !R2 3\nRout out 0 1\nRother other 0 1\n{VOLTAGE}\n{CURRENT}"
+        ),
+        InputFormat::ExpandedDeck,
+    )?;
+    let (mut c, config) = circuit(&deck, &bundle)?;
+    let plot = run(&mut c, &config, AnalysisKind::OperatingPoint, &[])?;
+    near(&plot, "v(out)", 0, -2.);
+    near(&plot, "v(other)", 0, -4.5);
+    Ok(())
+}

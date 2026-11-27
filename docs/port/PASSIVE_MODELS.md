@@ -238,3 +238,29 @@ introduced analysis must be present when the policy is bound; a command-only
 deck must explicitly select its enclosing analyses too. The original producer
 fixture snapshot under `tests/fixtures/passive-ic` exercises the actual
 prepared artifacts through the solver, with independent voltage references.
+
+## Prepared piecewise-linear resistors
+
+The prepared artifact's typed PWL resistor declarations supply signed
+voltage/current knots, an independent coordinate, optional one-based initial
+segment, and the original emitted law/sensor identities. Pass these alongside
+prepared source waveforms in `PreparedDeclarations` when constructing a
+prepared circuit. The solver validates the declaration and its physical
+anchors in the original lexical definition (artifact, scope and name);
+each expanded occurrence retains immutable prepared curve material.
+
+A native branch replaces the emitted behavioral law. Voltage-defined curves
+stamp I - G V = I0; current-defined curves stamp V - R I = V0. Existing
+zero-voltage observation sensors retain their original orientation and names.
+Both forms support negative or zero interior slopes and positive extrapolated
+end slopes, with no numerical conductance added. At an interior knot the
+right-hand segment supplies the deterministic tangent. Small signal and
+pole-zero use the converged branch coordinate's tangent.
+
+An advisory initial segment supplies the first junction-mode Newton tangent
+for a fresh bias attempt, including the operating point before transient.
+It is not a terminal voltage or current constraint. Subsequent loads use the
+actual independent coordinate, even when the initial hint was inconsistent;
+convergence checks the physical law. Predicted sweep points use the previous
+solution rather than reapplying a startup constraint. Candidate elaboration
+retains the original source identities and immutable law data.

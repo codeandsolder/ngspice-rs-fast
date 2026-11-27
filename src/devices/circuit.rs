@@ -4509,6 +4509,7 @@ impl Circuit {
             models,
             self.devices.iter().map(|device| device.name()),
             limits.devices.saturating_sub(existing.devices),
+            resistors,
         )?;
         let aliases = instances.probe_aliases;
         let instances = instances.instances.as_ref();
@@ -4516,7 +4517,7 @@ impl Circuit {
         // create a ladder. Ordinary factories keep their existing order.
         let mut plan =
             PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
-        plan.resistors = Some(resistors);
+        plan.resistors = (!resistors.is_empty()).then_some(resistors);
         let seen: BTreeSet<String> = self
             .devices
             .iter()
