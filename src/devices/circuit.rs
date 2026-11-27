@@ -776,8 +776,13 @@ impl<'a> PreparedRun<'a> {
         for index in self.circuit.load_order() {
             let device = point.device(self.circuit, index);
             if device.is_nonlinear() {
-                device.assemble_nonlinear_taylor(
-                    &mut crate::devices::physical_dae::TaylorContext {
+                device
+                    .assemble_nonlinear_taylor(&mut crate::devices::physical_dae::TaylorContext {
+                        device: index,
+                        state_rows: self
+                            .circuit
+                            .state_rows(index)
+                            .ok_or_else(|| SpiceError::circuit("missing Taylor state range"))?,
                         model,
                         unknowns: &self.circuit.bindings.unknowns,
                         branch: self.circuit.bindings.branch_rows[index].clone().next(),
@@ -785,11 +790,73 @@ impl<'a> PreparedRun<'a> {
                         state,
                         time,
                         output,
-                    },
-                )?;
+                    })
+                    .map_err(|error| match error {
+                        SpiceError::Circuit { message } => SpiceError::circuit(format!(
+                            "{}: physical Taylor evaluation at t = {:e}: {message}",
+                            device.name(),
+                            time.value()
+                        )),
+                        other => other,
+                    })?;
             }
         }
         Ok(())
+    }
+
+    /// Populate a physical trial from its solved one-sided state. Devices
+    /// whose history is already fully specified must not be evaluated again
+    /// at the scalar boundary (which may select an isolated, undefined branch).
+    pub(crate) fn physical_candidate_state(
+        &self,
+        request: &LoadRequest<'_>,
+        canonical: &[(usize, Real)],
+    ) -> SpiceResult<TrialState> {
+        let mut trial = request.history.trial();
+        let mut covered = vec![false; trial.values().len()];
+        for &(slot, value) in canonical {
+            let flag = covered
+                .get_mut(slot)
+                .ok_or_else(|| SpiceError::circuit("invalid physical history slot"))?;
+            *flag = true;
+            request
+                .history
+                .set_candidate_slot(&mut trial, slot, value)?;
+        }
+        let point = self.point(request.model_context)?;
+        let mutual = point.mutual(self.circuit)?;
+        let n = request.solution.len();
+        let mut matrix = SparseMatrix::new(n, n);
+        let mut rhs = Vector::zeros(n);
+        for index in self.circuit.load_order() {
+            let mut rows = self
+                .circuit
+                .state_rows(index)
+                .ok_or_else(|| SpiceError::circuit("missing physical state range"))?;
+            if rows.all(|slot| covered[slot]) {
+                continue;
+            }
+            matrix.clear();
+            rhs.clear();
+            self.circuit.stamp_isolated(
+                index,
+                point.device(self.circuit, index),
+                request,
+                &mut matrix,
+                StampRhs::dense(&mut rhs),
+                request.history.device_of(&mut trial, index)?,
+                &mutual,
+                None,
+            )?;
+        }
+        // Partial device loads may have overwritten canonical coordinates.
+        for &(slot, value) in canonical {
+            request
+                .history
+                .set_candidate_slot(&mut trial, slot, value)?;
+        }
+        trial.snapshot()?;
+        Ok(trial)
     }
 
     /// Assemble only selected physical charge equations for a constrained
