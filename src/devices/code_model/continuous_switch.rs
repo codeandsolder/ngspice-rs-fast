@@ -107,7 +107,7 @@ impl Material {
         })
     }
 
-    fn endpoint(resistance: Real) -> Point {
+    const fn endpoint(resistance: Real) -> Point {
         Point {
             g: resistance.recip(),
             dg: 0.,
@@ -159,9 +159,9 @@ impl Material {
         let s = 1. - t;
         let log_r = if t <= 0.5 {
             self.log_ratio
-                .mul_add(t * t * (3. - 2. * t), self.roff.ln())
+                .mul_add(t * t * 2.0_f64.mul_add(-t, 3.), self.roff.ln())
         } else {
-            (-self.log_ratio).mul_add(s * s * (3. - 2. * s), self.ron.ln())
+            (-self.log_ratio).mul_add(s * s * 2.0_f64.mul_add(-s, 3.), self.ron.ln())
         };
         let g = (-log_r).exp();
         Point {

@@ -38,11 +38,12 @@ struct Coordinates {
 }
 
 fn read_pair(rows: [Option<usize>; 2], values: &Vector) -> SpiceResult<Real> {
-    let read = |row| match row {
-        None => Ok(0.),
-        Some(row) => values
-            .get(row)
-            .ok_or_else(|| SpiceError::circuit("unbound continuous switch coordinate")),
+    let read = |row: Option<usize>| {
+        row.map_or(Ok(0.), |row| {
+            values
+                .get(row)
+                .ok_or_else(|| SpiceError::circuit("unbound continuous switch coordinate"))
+        })
     };
     Ok(read(rows[0])? - read(rows[1])?)
 }
