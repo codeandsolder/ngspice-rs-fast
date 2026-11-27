@@ -5,6 +5,8 @@
 //! coefficient, time discretization, device limiting, or artificial gmin
 //! is introduced by this evaluator.
 
+mod guards;
+
 use crate::devices::{
     AnalysisMode, Forcing, Limit, LoadRequest, ModelContext, PreparedRun, StateHistory,
     TransientTiming, TrialState,
@@ -12,6 +14,38 @@ use crate::devices::{
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Region {
+    Sign(std::cmp::Ordering),
+    Interval(usize),
+    Discrete(u64),
+}
+
+/// One operation's active branch and the adjacent candidate boundaries in
+/// its operand coordinate. The slot and operand discriminator are stable
+/// across evaluations of the same compiled program.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalGuard {
+    pub slot: usize,
+    pub operand: u8,
+    pub region: Region,
+    pub argument: crate::maths::taylor::Jet,
+    pub boundaries: [Option<Real>; 2],
+}
+
+#[derive(Debug, Clone)]
+struct Guard {
+    device: usize,
+    local: LocalGuard,
+}
+
+/// Observations belong to a disposable physical point until it is accepted.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BranchTrace {
+    guards: Vec<Guard>,
+    coefficients: usize,
+}
 
 /// Exact physical residuals and their Jacobians with respect to the state.
 pub struct PhysicalDaePoint {
@@ -104,6 +138,27 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         scale: Real,
         limit: Limit,
     ) -> SpiceResult<PhysicalDaeTaylor> {
+        self.evaluate_taylor_inner(state, time, scale, limit, false)
+    }
+
+    pub(crate) fn evaluate_taylor_with_guards(
+        &self,
+        state: &[Vector],
+        time: Real,
+        scale: Real,
+        limit: Limit,
+    ) -> SpiceResult<PhysicalDaeTaylor> {
+        self.evaluate_taylor_inner(state, time, scale, limit, true)
+    }
+
+    fn evaluate_taylor_inner(
+        &self,
+        state: &[Vector],
+        time: Real,
+        scale: Real,
+        limit: Limit,
+        collect_guards: bool,
+    ) -> SpiceResult<PhysicalDaeTaylor> {
         use crate::maths::taylor::{Jet, MAX_ORDER};
         let n = self.run.circuit().unknown_count();
         if state.is_empty()
@@ -128,6 +183,7 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
             (state, Jet::affine(order, time, scale))
         };
         let mut output = PhysicalDaeTaylor::linear(&self.linear, state, forcing)?;
+        output.guards = collect_guards.then(BranchTrace::default);
         self.run
             .dae_nonlinear_taylor(&self.model, state, &time, &mut output)?;
         if limit == Limit::Left {
@@ -269,6 +325,8 @@ pub struct PhysicalDaeTaylor {
     pub conductance: Vec<SparseMatrix>,
     /// Charge/flux Jacobian coefficients.
     pub capacitance: Vec<SparseMatrix>,
+    pub(crate) guards: Option<BranchTrace>,
+    pub(crate) candidate_states: Vec<(usize, Real)>,
     pub(crate) storage: BTreeMap<usize, LocalChargeTaylor>,
     storage_coefficients: usize,
 }
@@ -285,6 +343,8 @@ impl PhysicalDaeTaylor {
             charge: Vec::with_capacity(state.len()),
             conductance: Vec::with_capacity(state.len()),
             capacitance: Vec::with_capacity(state.len()),
+            guards: None,
+            candidate_states: Vec::new(),
             storage: BTreeMap::new(),
             storage_coefficients: 0,
         };
@@ -394,17 +454,36 @@ fn absolute_gradients<const N: usize>(
 /// Device-local bindings and accumulation target for exact physical jets.
 /// Construction is restricted to the prepared physical DAE evaluator.
 pub struct TaylorContext<'a> {
+    pub(crate) device: usize,
+    pub(crate) state_rows: std::ops::Range<usize>,
     pub(crate) model: &'a ModelContext,
     pub(crate) unknowns: &'a crate::devices::MnaUnknowns,
     pub(crate) branch: Option<usize>,
     pub(crate) controls: &'a [usize],
-    pub(crate) state_slots: std::ops::Range<usize>,
     pub(crate) state: &'a [Vector],
     pub(crate) time: &'a crate::maths::taylor::Jet,
     pub(crate) output: &'a mut PhysicalDaeTaylor,
 }
 
 impl TaylorContext<'_> {
+    /// Retain the value chosen by the physical germ, not the scalar value
+    /// at an isolated branch boundary.
+    pub(crate) fn candidate_state(&mut self, slot: usize, value: Real) -> SpiceResult<()> {
+        if self.output.guards.is_some() {
+            let row = self
+                .state_rows
+                .start
+                .checked_add(slot)
+                .filter(|&row| self.state_rows.contains(&row))
+                .ok_or_else(|| SpiceError::circuit("invalid physical candidate slot"))?;
+            if !value.is_finite() {
+                return Err(SpiceError::circuit("nonfinite physical candidate state"));
+            }
+            self.output.candidate_states.push((row, value));
+        }
+        Ok(())
+    }
+
     pub(crate) fn variable(&self, column: Option<usize>) -> SpiceResult<crate::maths::taylor::Jet> {
         use crate::maths::taylor::Jet;
         column.map_or_else(
@@ -457,7 +536,7 @@ impl TaylorContext<'_> {
         value: &crate::maths::taylor::Jet,
         gradients: impl IntoIterator<Item = (usize, crate::maths::taylor::Jet)>,
     ) -> SpiceResult<()> {
-        if slot.saturating_add(1) >= self.state_slots.len() {
+        if slot.saturating_add(1) >= self.state_rows.len() {
             return Err(SpiceError::circuit("invalid physical Taylor charge slot"));
         }
         let degree = self.state.len();
@@ -495,7 +574,7 @@ impl TaylorContext<'_> {
         if self
             .output
             .storage
-            .insert(self.state_slots.start + slot, charge)
+            .insert(self.state_rows.start + slot, charge)
             .is_some()
         {
             return Err(SpiceError::circuit("duplicate physical Taylor charge slot"));

@@ -490,3 +490,43 @@ fn atomic_transaction_matches_stored_and_streamed_encodings() {
     }
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn behavioural_impulse_never_publishes_rejected_stream_points() {
+    for method in ["trap", "gear"] {
+        let netlist = deck(&format!(
+            "b1 out 0 v=1u*ddt(u(time-10.2u))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1n\n.tran 1u 25u 0 1u uic"
+        ));
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let request = config.plan_for(&netlist.analyses[0]).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let mut recorder = Recorder::default();
+        let error = request
+            .run_into(&mut circuit, &config.context(), &mut recorder)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("derivative input jumps"),
+            "{method}: {error}"
+        );
+        assert!(recorder.plots.is_empty());
+        let partial = recorder.header.as_ref().expect("accepted stream prefix");
+        assert!(partial.point_count() > 2);
+        let mut previous = -1.;
+        for row in 0..partial.point_count() {
+            let time = partial.value("time", row).unwrap().re;
+            assert!(time > previous && time < 10.2e-6, "{method}: {time:e}");
+            assert!(partial.value("v(out)", row).unwrap().re.abs() < 1e-12);
+            previous = time;
+        }
+        assert!(circuit.final_transient_state().is_none());
+    }
+}
+
+#[test]
+fn behavioural_continuous_corner_streams_identical_accepted_points() {
+    for method in ["trap", "gear"] {
+        assert_streams_the_stored_plot(&format!(
+            "b1 out 0 v=1u*ddt(abs((time-10.2u)/1u))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1n\n.tran 1u 25u 0 1u uic"
+        ));
+    }
+}

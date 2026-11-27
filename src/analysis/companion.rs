@@ -90,6 +90,9 @@
 //! (see `docs/port/DC_CONTINUATION.md`). `xmu=` is the trapezoidal weighting of
 //! `nicomcof.c` (default 0.5).
 
+mod branch_events;
+
+use crate::devices::physical_dae::BranchTrace;
 use crate::devices::{
     AnalysisMode, BreakTable, Circuit, Forcing, LinearSystem, LoadRequest, SourceBreaks,
     SourceKind, TransientTiming, TrialState,
@@ -320,11 +323,15 @@ fn failure(message: impl Into<String>) -> SpiceError {
     }
 }
 
+struct TrialPoint {
+    x: Vector,
+    state: TrialState,
+    guards: BranchTrace,
+    order_hint: usize,
+}
+
 enum Trial {
-    Converged {
-        x: Vector,
-        state: TrialState,
-    },
+    Converged(TrialPoint),
     /// The iteration limit was reached; `last` is the iterate of the final
     /// load (C's `CKTrhsOld`, the next trial's starting point).
     NotConverged {
@@ -388,6 +395,7 @@ struct NextStep {
     order: Order,
 }
 
+#[derive(Clone, Copy)]
 struct StepClock {
     time: Real,
     next: NextStep,
@@ -400,10 +408,12 @@ struct AcceptedCursor {
     boundary: Boundary,
 }
 
+#[derive(Clone, Copy)]
 struct ReadyStep {
     clock: StepClock,
     boundary: Boundary,
     event_landing: Option<Real>,
+    probe_landing: Option<Real>,
 }
 
 struct AttemptedStep {
@@ -484,6 +494,7 @@ impl AcceptedCursor {
             clock,
             boundary,
             event_landing: None,
+            probe_landing: None,
         })
     }
 }
@@ -516,11 +527,13 @@ impl ReadyStep {
             self.clock.next.delta = distance;
             self.boundary = Boundary::Forced;
             self.event_landing = Some(at);
+            self.probe_landing = None;
         }
     }
 
     fn end_time(&self) -> Real {
         self.event_landing
+            .or(self.probe_landing)
             .unwrap_or(self.clock.time + self.clock.next.delta)
     }
 
@@ -565,6 +578,7 @@ impl AttemptedStep {
             clock,
             boundary: self.boundary.retry(),
             event_landing: None,
+            probe_landing: None,
         })
     }
 
@@ -698,6 +712,7 @@ struct TruncationDevice {
 struct TruncationSlot {
     base: usize,
     explicit_derivative: bool,
+    derived: bool,
 }
 
 /// Accepted voltage history used only when newtrunc is requested. Rejected
@@ -809,8 +824,9 @@ struct Driver<'a> {
     workspace: crate::analysis::newton::CircuitNewtonWorkspace,
     mixed: Option<&'a mut super::digital::MixedSignal>,
     index_aware: bool,
-    derivative_order: std::cell::Cell<usize>,
+    derivative_order: usize,
     physical_events: Option<std::iter::Peekable<crate::devices::SystemBreakpoints>>,
+    accepted_guards: BranchTrace,
 }
 
 /// Runs an ordinary `.tran` with the companion backend, returning the plot and
@@ -1042,6 +1058,10 @@ fn truncation_devices(circuit: &Circuit) -> SpiceResult<Vec<TruncationDevice>> {
                     explicit_derivative: device
                         .initial_expression_storage()
                         .is_some_and(|storage| storage.slot == slot),
+                    derived: device.initial_expression_storage().is_some_and(|storage| {
+                        storage.slot == slot
+                            && storage.policy == crate::devices::InitialStoragePolicy::Derived
+                    }),
                 })
                 .collect();
             Ok(TruncationDevice { rows, slots: bases })
@@ -1169,8 +1189,9 @@ fn run_transient_inner(
         workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
         mixed,
         index_aware: false,
-        derivative_order: std::cell::Cell::new(2),
+        derivative_order: 2,
         physical_events,
+        accepted_guards: BranchTrace::default(),
     };
     driver.run(purpose, sink)
 }
@@ -1685,6 +1706,18 @@ impl Driver<'_> {
     /// between attempts; device and integration histories remain accepted-only.
     fn advance(
         &mut self,
+        ready: ReadyStep,
+        iterate: Vector,
+        output: OutputSelection<'_>,
+    ) -> SpiceResult<AcceptedPoint> {
+        if self.index_aware {
+            return self.advance_physical(ready, iterate, output);
+        }
+        self.advance_companion(ready, iterate, output)
+    }
+
+    fn advance_companion(
+        &mut self,
         mut ready: ReadyStep,
         mut iterate: Vector,
         output: OutputSelection<'_>,
@@ -1731,7 +1764,7 @@ impl Driver<'_> {
                     drop(prepared);
                     ready = attempt.retry(next, min_step)?;
                 }
-                Trial::Converged { x, mut state } => {
+                Trial::Converged(TrialPoint { x, mut state, .. }) => {
                     if let Some(next) = self.mixed_retry(&attempt, &x)? {
                         iterate = x;
                         self.stats.rejected += 1;
@@ -1762,14 +1795,13 @@ impl Driver<'_> {
                             drop(prepared);
                             ready = attempt.retry(next, min_step)?;
                         }
-                        StepDecision::Accept(mut next) => {
+                        StepDecision::Accept(next) => {
                             let candidate = self.prepare_accepted_candidate(
                                 &attempt,
                                 &mut prepared,
                                 (x, state),
                                 &output,
                                 preview,
-                                &mut next,
                             )?;
                             // Release immutable history before publication.
                             drop(prepared);
@@ -1793,17 +1825,15 @@ impl Driver<'_> {
         (x, state): (Vector, TrialState),
         output: &OutputSelection<'_>,
         preview: Option<super::digital::EventPreview>,
-        next: &mut NextStep,
     ) -> SpiceResult<AcceptedCandidate> {
-        let (x, state) = if self.crosses_physical_event(attempt) {
-            next.order = Order::One;
-            self.derivative_event(attempt, &x, &state)?
-        } else {
-            (x, state)
-        };
         Ok(AcceptedCandidate {
             mixed: self.prepare_mixed_point(&x, attempt.clock.time, preview)?,
-            output: self.candidate_output(attempt, prepared, &x, &state, output)?,
+            output: self.candidate_output(attempt, &x, &state, output, || {
+                match output.selected {
+                    Some(indices) => prepared.observe_selected(&x, &state, Some(indices)),
+                    None => prepared.observe(&x, &state),
+                }
+            })?,
             solution: x,
             state,
         })
@@ -1841,10 +1871,10 @@ impl Driver<'_> {
     fn candidate_output(
         &self,
         attempt: &AttemptedStep,
-        prepared: &mut crate::devices::circuit::PreparedTransient<'_>,
         x: &Vector,
         state: &TrialState,
         output: &OutputSelection<'_>,
+        observe: impl FnOnce() -> SpiceResult<Vec<Complex>>,
     ) -> SpiceResult<CandidateOutput> {
         let time = attempt.clock.time;
         let observed = if time < self.settings.start
@@ -1853,18 +1883,8 @@ impl Driver<'_> {
                 .is_some_and(|at| !almost_equal_ulps(time, at, 100))
         {
             None
-        } else if self.index_aware {
-            let limit = if attempt.event_start.is_some() && time >= self.settings.stop {
-                crate::devices::Limit::Left
-            } else {
-                crate::devices::Limit::Right
-            };
-            Some(self.observe_derivative_point(x, Some(state), time, limit, output.selected)?)
         } else {
-            Some(match output.selected {
-                Some(indices) => prepared.observe_selected(x, state, Some(indices))?,
-                None => prepared.observe(x, state)?,
-            })
+            Some(observe()?)
         };
         let periodic_boundary = (output.capture_boundary
             && almost_equal_ulps(time, self.settings.stop, 100))
@@ -2132,7 +2152,14 @@ impl Driver<'_> {
         else {
             return Ok(None);
         };
-        let (x, trial) = self.physical_candidate(&request, consistent)?;
+        let TrialPoint {
+            x,
+            state: trial,
+            guards,
+            order_hint,
+        } = self.physical_candidate(&request, consistent)?;
+        self.accepted_guards = guards;
+        self.derivative_order = order_hint;
         self.physical_events = Some(
             self.system
                 .breakpoints_in(0., self.settings.stop)?
@@ -2185,23 +2212,21 @@ impl Driver<'_> {
         &self,
         request: &LoadRequest<'_>,
         consistent: initial::DerivativePoint,
-    ) -> SpiceResult<(Vector, TrialState)> {
+    ) -> SpiceResult<TrialPoint> {
         let x = consistent.solution;
-        let mut trial = self.history.trial();
-        self.prepared.load(
+        let trial = self.prepared.physical_candidate_state(
             &LoadRequest {
                 solution: &x,
                 ..*request
             },
-            &mut self.circuit.new_matrix()?,
-            &mut Vector::zeros(x.len()),
-            &mut trial,
+            &consistent.canonical,
         )?;
-        for (slot, value) in consistent.canonical {
-            self.history.set_candidate_slot(&mut trial, slot, value)?;
-        }
-        self.derivative_order.set(consistent.order_hint);
-        Ok((x, trial))
+        Ok(TrialPoint {
+            x,
+            state: trial,
+            guards: consistent.guards,
+            order_hint: consistent.order_hint,
+        })
     }
 
     const fn physical_tolerances(&self) -> initial::Tolerances {
@@ -2219,7 +2244,7 @@ impl Driver<'_> {
         attempt: &AttemptedStep,
         x: &Vector,
         left: &TrialState,
-    ) -> SpiceResult<(Vector, TrialState)> {
+    ) -> SpiceResult<TrialPoint> {
         let request = LoadRequest {
             mode: AnalysisMode::Instantaneous {
                 time: attempt.clock.time,
@@ -2239,7 +2264,7 @@ impl Driver<'_> {
             left,
             self.physical_tolerances(),
             self.settings.tran_max_iter,
-            self.derivative_order.get(),
+            self.derivative_order,
         )?;
         self.physical_candidate(&request, consistent)
     }
@@ -2268,7 +2293,7 @@ impl Driver<'_> {
             &request,
             self.physical_tolerances(),
             self.settings.tran_max_iter,
-            self.derivative_order.get(),
+            self.derivative_order,
         )?;
         let consistent = match outcome {
             initial::DerivativeTrial::Converged(point) => point,
@@ -2276,7 +2301,7 @@ impl Driver<'_> {
                 return Ok(Trial::NotConverged { last });
             }
         };
-        let (x, state) = self.physical_candidate(
+        let point = self.physical_candidate(
             &LoadRequest {
                 mode: AnalysisMode::Instantaneous {
                     time: attempt.clock.time,
@@ -2286,7 +2311,7 @@ impl Driver<'_> {
             },
             consistent,
         )?;
-        Ok(Trial::Converged { x, state })
+        Ok(Trial::Converged(point))
     }
 
     fn solve_trial(
@@ -2296,9 +2321,6 @@ impl Driver<'_> {
         previous: &Vector,
         workspace: &mut crate::analysis::newton::CircuitNewtonWorkspace,
     ) -> SpiceResult<Trial> {
-        if self.index_aware {
-            return self.derivative_trial(attempt, previous);
-        }
         let tolerance = &self.settings.tolerances;
         let options = crate::analysis::newton::NewtonOptions {
             max_iterations: self.settings.tran_max_iter,
@@ -2328,10 +2350,12 @@ impl Driver<'_> {
         }
         .solve(previous, policy, None, |_, _, _| Ok(()));
         match solved {
-            Ok(solved) => Ok(Trial::Converged {
+            Ok(solved) => Ok(Trial::Converged(TrialPoint {
                 x: solved.values,
                 state: solved.trial,
-            }),
+                guards: BranchTrace::default(),
+                order_hint: 2,
+            })),
             Err(crate::analysis::newton::NewtonFailure {
                 last_iterate: Some(last),
                 ..
@@ -2384,6 +2408,7 @@ impl Driver<'_> {
             for &TruncationSlot {
                 base,
                 explicit_derivative,
+                ..
             } in bases
             {
                 let accepted = |age: usize, offset: usize| {
@@ -2516,6 +2541,7 @@ mod step_control_tests {
             },
             boundary: Boundary::Forced,
             event_landing: None,
+            probe_landing: None,
         }
     }
 

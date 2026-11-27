@@ -440,6 +440,7 @@ impl Program {
         environment: &Environment<'_>,
         variables: &[crate::maths::taylor::Jet],
         time: &crate::maths::taylor::Jet,
+        collect_guards: bool,
     ) -> SpiceResult<TaylorEvaluation> {
         if variables.len() != self.quantities.len() {
             return Err(SpiceError::circuit(
@@ -447,7 +448,7 @@ impl Program {
             ));
         }
         self.plan
-            .evaluate_taylor(self.root, environment, variables, time)
+            .evaluate_taylor(self.root, environment, variables, time, collect_guards)
     }
 
     pub(super) fn evaluate_with_workspace<'w>(
@@ -818,6 +819,7 @@ impl PwlOrder {
 struct PwlTable {
     points: Vec<(Real, Real)>,
     order: PwlOrder,
+    boundaries: Vec<Real>,
 }
 
 impl PwlTable {
@@ -832,7 +834,22 @@ impl PwlTable {
         } else {
             return None;
         };
-        order.ordered(&points).then_some(Self { points, order })
+        if !order.ordered(&points) {
+            return None;
+        }
+        let mut boundaries: Vec<_> = points[1..points.len() - 1]
+            .iter()
+            .map(|point| point.0)
+            .collect();
+        if matches!(order, PwlOrder::Descending) {
+            boundaries.reverse();
+        }
+        boundaries.dedup_by(|a, b| (*a).partial_cmp(&*b) == Some(std::cmp::Ordering::Equal));
+        Some(Self {
+            points,
+            order,
+            boundaries,
+        })
     }
 
     /// The original C binary search, including extrapolation at both ends.
@@ -841,7 +858,12 @@ impl PwlTable {
         self.segment_by(|x| order.is_upper(x, arg))
     }
 
-    fn segment_by(&self, mut upper_than_arg: impl FnMut(Real) -> bool) -> [(Real, Real); 2] {
+    fn segment_by(&self, upper_than_arg: impl FnMut(Real) -> bool) -> [(Real, Real); 2] {
+        let lower = self.segment_index_by(upper_than_arg);
+        [self.points[lower], self.points[lower + 1]]
+    }
+
+    fn segment_index_by(&self, mut upper_than_arg: impl FnMut(Real) -> bool) -> usize {
         let (mut lower, mut upper) = (0, self.points.len() - 1);
         while upper - lower > 1 {
             let middle = usize::midpoint(lower, upper);
@@ -851,7 +873,7 @@ impl PwlTable {
                 lower = middle;
             }
         }
-        [self.points[lower], self.points[upper]]
+        lower
     }
 
     /// `PTpwl` in the original floating-point operation order.
