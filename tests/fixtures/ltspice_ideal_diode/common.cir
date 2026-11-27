@@ -1,0 +1,11 @@
+Independent ideal diode C common region witness
+V1 a 0 0
+A1 %gd(a 0) dm
+.model dm sidiode(ron=2 roff=100 vfwd=1 vrev=2 rrev=3)
+.control
+set numdgt=15
+dc V1 -4 4 0.1
+print i(v1)
+quit
+.endc
+.end
