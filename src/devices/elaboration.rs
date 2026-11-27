@@ -189,6 +189,7 @@ pub(super) struct PlannedBatch<'a> {
     pub(super) expansions: Vec<PlannedExpansion>,
     pub(super) devices: usize,
     pub(super) deck_nodes: BTreeSet<String>,
+    pub(super) resistors: Option<&'a super::pwl_resistor::BoundResistors>,
 }
 
 impl<'a> PlannedBatch<'a> {
@@ -247,6 +248,7 @@ impl<'a> PlannedBatch<'a> {
             expansions,
             devices: known.devices - existing.devices,
             deck_nodes,
+            resistors: None,
         })
     }
 }

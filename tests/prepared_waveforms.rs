@@ -182,7 +182,13 @@ C1 out 0 1u
     let config = RunConfig::from_netlist(&netlist).unwrap();
     for step in ["200u", "37u", "8u"] {
         let mut circuit = config
-            .prepared_circuit(&netlist, &bundle.waveforms)
+            .prepared_circuit(
+                &netlist,
+                ngspice_rs::devices::subckt::PreparedDeclarations {
+                    waveforms: &bundle.waveforms,
+                    pwl_resistors: &bundle.pwl_resistors,
+                },
+            )
             .unwrap();
         let timeline = circuit
             .source_timelines(TransientTiming::new(1e-5, 1e-3).unwrap())
@@ -241,7 +247,13 @@ R2 b 0 1k
         .unwrap();
     let config = RunConfig::from_netlist(&netlist).unwrap();
     let circuit = config
-        .prepared_circuit(&netlist, &bundle.waveforms)
+        .prepared_circuit(
+            &netlist,
+            ngspice_rs::devices::subckt::PreparedDeclarations {
+                waveforms: &bundle.waveforms,
+                pwl_resistors: &bundle.pwl_resistors,
+            },
+        )
         .unwrap();
     let timelines = circuit
         .source_timelines(TransientTiming::new(1e-5, 1e-3).unwrap())
@@ -259,10 +271,30 @@ R2 b 0 1k
     assert_eq!(startup, [2., 6.]);
     let mut duplicate = bundle.waveforms.clone();
     duplicate.push(duplicate[0].clone());
-    assert!(config.prepared_circuit(&netlist, &duplicate).is_err());
+    assert!(
+        config
+            .prepared_circuit(
+                &netlist,
+                ngspice_rs::devices::subckt::PreparedDeclarations {
+                    waveforms: &duplicate,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+    );
     let mut missing = bundle.waveforms.clone();
     missing[0].source = "missing_source".into();
-    assert!(config.prepared_circuit(&netlist, &missing).is_err());
+    assert!(
+        config
+            .prepared_circuit(
+                &netlist,
+                ngspice_rs::devices::subckt::PreparedDeclarations {
+                    waveforms: &missing,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -316,7 +348,10 @@ fn explicit_root_candidate_rebinds_without_changing_source_rows_or_ac() {
             Default::default(),
             Default::default(),
             Some(Arc::new(scope)),
-            &declarations,
+            ngspice_rs::devices::subckt::PreparedDeclarations {
+                waveforms: &declarations,
+                ..Default::default()
+            },
         )
         .unwrap();
         let linear = circuit.linear_system().unwrap();
@@ -547,7 +582,13 @@ fn prepared_pwl_derivative_changes_slope_at_exact_event() {
     for method in ["method=trap", "method=gear"] {
         for uic in [false, true] {
             let mut circuit = config
-                .prepared_circuit(&netlist, std::slice::from_ref(&declaration))
+                .prepared_circuit(
+                    &netlist,
+                    ngspice_rs::devices::subckt::PreparedDeclarations {
+                        waveforms: std::slice::from_ref(&declaration),
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
             let timelines = circuit
                 .source_timelines(TransientTiming::new(1.7e-6, 25e-6).unwrap())
@@ -615,7 +656,13 @@ fn prepared_signed_sine_drives_nested_derivatives_and_kcl() {
     });
     for method in ["method=trap", "method=gear"] {
         let mut circuit = config
-            .prepared_circuit(&netlist, std::slice::from_ref(&declaration))
+            .prepared_circuit(
+                &netlist,
+                ngspice_rs::devices::subckt::PreparedDeclarations {
+                    waveforms: std::slice::from_ref(&declaration),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let mut input = AnalysisInput::with_arguments(
             AnalysisKind::Transient,
@@ -665,7 +712,13 @@ fn prepared_source_startup_bias_and_actual_jump_have_distinct_semantics() {
     };
     for method in ["method=trap", "method=gear"] {
         let mut circuit = config
-            .prepared_circuit(&netlist, &[declaration("0", false)])
+            .prepared_circuit(
+                &netlist,
+                ngspice_rs::devices::subckt::PreparedDeclarations {
+                    waveforms: &[declaration("0", false)],
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let input = AnalysisInput::with_arguments(
             AnalysisKind::Transient,
@@ -684,7 +737,13 @@ fn prepared_source_startup_bias_and_actual_jump_have_distinct_semantics() {
         }
         for uic in [false, true] {
             let mut circuit = config
-                .prepared_circuit(&netlist, &[declaration("10u", true)])
+                .prepared_circuit(
+                    &netlist,
+                    ngspice_rs::devices::subckt::PreparedDeclarations {
+                        waveforms: &[declaration("10u", true)],
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
             let mut input = AnalysisInput::with_arguments(
                 AnalysisKind::Transient,

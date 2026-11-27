@@ -291,7 +291,15 @@ m1 d g 0 0 nch l=1u w=1u
     };
     let plan = config.plan_for(&netlist.analyses[0]).unwrap();
     for (declarations, supply) in [(&[][..], 2.), (std::slice::from_ref(&waveform), 10.)] {
-        let mut circuit = config.prepared_circuit(&netlist, declarations).unwrap();
+        let mut circuit = config
+            .prepared_circuit(
+                &netlist,
+                ngspice_rs::devices::subckt::PreparedDeclarations {
+                    waveforms: declarations,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let plot = plan.run(&mut circuit, &config.context()).unwrap();
         assert_eq!(plot.point_count(), 3);
         for point in 0..plot.point_count() {
