@@ -371,3 +371,54 @@ fn configured_root_alias_resolves_links_from_command_origin() {
         child.canonicalize().unwrap()
     );
 }
+
+#[test]
+fn prepared_frequency_transfer_keeps_original_branch_through_command() {
+    use ngspice_rs::primitives::Complex;
+    let scratch = tempfile::tempdir().unwrap();
+    let directory = scratch.path();
+    let source = b"Frequency transfer through admission\n.param f0=100 f1=300 gain=2\nV1 in 0 dc 1 ac 1\nV2 ref 0 dc 0.25 ac 0.25\nEout out 0 FREQ {V(in,ref)*2} MAG RAD ({f0},{gain},0) ({f1},{gain},1.5707963267948966)\nRload out 0 1k\nGout gout 0 FREQ {V(in,ref)*2} R_I (f0,gain,0) (f1,0,gain)\nRg gout 0 1\nFprobe probe 0 Eout 1\nRprobe probe 0 1k\n.ac lin 7 50 350\n.end\n";
+    let normalized = model_normalize_ngspice::normalize_mapped(
+        source,
+        model_normalize_ngspice::linked_source::RootKind::Deck,
+    )
+    .unwrap();
+    let root = write(directory, "root.cir", source);
+    write(directory, "normalized.cir", normalized.model.bytes);
+    let command = executable(directory, "cmp - \"$1\"\ncat normalized.cir");
+    let admission = SourceAdmission::new(config(command), Cancellation::default());
+    let output = directory.join("out.raw");
+    run_with_admission(
+        &root,
+        &output,
+        true,
+        Some(RawFormat::Ascii),
+        Some(&admission),
+    )
+    .unwrap();
+    let raw = RawFile::load(output).unwrap();
+    let plot = &raw
+        .plots
+        .iter()
+        .find(|raw| raw.plot.column("frequency").is_some())
+        .unwrap()
+        .plot;
+    assert_eq!(plot.point_count(), 7);
+    for i in 0..plot.point_count() {
+        let frequency = plot.value("frequency", i).unwrap().re;
+        let t = ((frequency - 100.) / 200.).clamp(0., 1.);
+        let expected = Complex::new(3. * (1. - t), 3. * t);
+        for (name, value) in [
+            ("v(out)", expected),
+            ("v(gout)", -expected),
+            ("v(probe)", expected),
+            ("i(eout)", expected * Complex::real(-0.001)),
+        ] {
+            let actual = plot.value(name, i).unwrap();
+            assert!(
+                (actual - value).magnitude() < 2e-12,
+                "{name} at {frequency}: {actual:?} != {value:?}"
+            );
+        }
+    }
+}
