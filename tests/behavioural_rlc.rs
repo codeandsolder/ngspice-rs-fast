@@ -1341,3 +1341,40 @@ fn singular_germ_recovery_rejects_ambiguous_curvature_and_nonanalytic_roots() {
         }
     }
 }
+
+#[test]
+fn singular_germ_predictor_survives_rejected_steps_and_source_event() -> SpiceResult<()> {
+    for method in ["trap", "gear"] {
+        let body = format!(
+            "predictor transaction\nvtrigger trigger 0 PWL(0 0 0.5u 1 1u 0)\nb1 x 0 i=v(x)^3-((time-0.5u)/1u+0.25*((time-0.5u)/1u)^3)^3\nb2 out 0 v=1u*ddt(v(x))\nr1 out 0 1k\nc1 stored 0 1n ic=1\nr2 stored 0 200\n.options method={method} reltol=1e-8 vntol=1n chgtol=1e-18 trtol=0.1\n.tran 0.2u 1u 0 0.5u uic\n.end"
+        );
+        let netlist = Parser::new().parse_deck(&parse_deck_text(
+            Path::new("predictor-transaction.cir"),
+            &body,
+        ))?;
+        let config = RunConfig::from_netlist(&netlist)?;
+        let plan = config.plan_for(&netlist.analyses[0])?;
+        let mut circuit = config.circuit(&netlist)?;
+        let (plot, stats) =
+            ngspice_rs::analysis::companion_transient(&mut circuit, &plan, &config.context())?;
+        assert!(stats.rejected > 0, "{method}: no rejected trial");
+        let mut event = false;
+        for i in 0..plot.point_count() {
+            let time = plot.value("time", i).unwrap().re;
+            event |= time.to_bits() == 0.5e-6_f64.to_bits();
+            let u = (time - 0.5e-6) / 1e-6;
+            let x = 0.25_f64.mul_add(u.powi(3), u);
+            let rate = 0.75_f64.mul_add(u * u, 1.);
+            close(plot.value("v(x)", i).unwrap().re, x, 1e-8);
+            close(plot.value("v(out)", i).unwrap().re, rate, 1e-7);
+            close(plot.value("i(b2)", i).unwrap().re, -rate * 1e-3, 1e-10);
+            close(
+                plot.value("v(stored)", i).unwrap().re,
+                (-time / 0.2e-6).exp(),
+                2e-5,
+            );
+        }
+        assert!(event, "{method}: missing exact singular event");
+    }
+    Ok(())
+}
