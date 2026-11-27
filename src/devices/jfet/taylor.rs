@@ -24,17 +24,15 @@ impl Model {
         }
         let beta = drain.clone().scale(self.lambda).offset(1.).scale(op.beta);
         let remaining = overdrive.clone().add(&drain.clone().scale(-1.));
-        let part = if remaining.value.sign() != Ordering::Less {
-            let apart = remaining.scale(3. * op.bfac).offset(2. * self.b);
-            drain.clone().multiply(
-                &drain
-                    .clone()
-                    .multiply(&drain.clone().scale(op.bfac).offset(-self.b))
-                    .add(&overdrive.multiply(&apart)),
-            )
-        } else {
+        let part = if remaining.value.sign() == Ordering::Less {
             let shape = overdrive.clone().scale(op.bfac).offset(self.b);
             overdrive.clone().multiply(&overdrive).multiply(&shape)
+        } else {
+            let apart = remaining.scale(3. * op.bfac).offset(2. * self.b);
+            let shape = drain.clone().scale(op.bfac).offset(-self.b);
+            drain
+                .clone()
+                .multiply(&drain.multiply(&shape).add(&overdrive.multiply(&apart)))
         };
         beta.multiply(&part).scale(direction)
     }

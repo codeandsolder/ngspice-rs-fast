@@ -24,7 +24,7 @@ impl Law {
         }
     }
 
-    fn add(self, rhs: Self) -> Self {
+    fn add(self, rhs: &Self) -> Self {
         Self {
             value: self.value.add(&rhs.value),
             slope: self.slope.add(&rhs.slope),
@@ -38,7 +38,7 @@ impl Law {
         }
     }
 
-    fn multiply(self, rhs: Self) -> Self {
+    fn multiply(self, rhs: &Self) -> Self {
         Self {
             value: self.value.multiply(&rhs.value),
             slope: self
@@ -163,7 +163,7 @@ fn generation(v: &Jet, law: DepletionLaw) -> SpiceResult<Law> {
 fn recombination(t: &Thermal, v: &Jet, sat: Real, nr: Real, forward: bool) -> SpiceResult<Law> {
     let vt = nr * t.vt;
     if forward {
-        Ok(exponential(v, vt, sat).multiply(generation(v, t.bottom)?))
+        Ok(exponential(v, vt, sat).multiply(&generation(v, t.bottom)?))
     } else {
         let edge = Jet::constant(v.order(), -3. * (t.n * t.vt));
         let constant = exponential(&edge, vt, sat)
@@ -183,7 +183,7 @@ fn tunnel(v: &Jet, vt: Real, sat: Real) -> Law {
     law
 }
 
-fn injection(law: Law, knee: Real, forward: bool) -> SpiceResult<Law> {
+fn injection(law: &Law, knee: Real, forward: bool) -> SpiceResult<Law> {
     let (value, slope) = high_injection(law.value.value(), law.slope.value(), knee, forward);
     let root = law
         .value
@@ -214,17 +214,17 @@ impl Thermal {
     ) -> SpiceResult<Law> {
         let mut bottom = characteristic(v, self.n * self.vt, self.csat, breakdown)?;
         if let Some((sat, nr)) = self.recombination {
-            bottom = bottom.add(recombination(self, v, sat, nr, forward)?);
+            bottom = bottom.add(&recombination(self, v, sat, nr, forward)?);
         }
         if let Some(sat) = self.tunnel {
-            bottom = bottom.add(tunnel(v, self.ntun * self.vt, sat));
+            bottom = bottom.add(&tunnel(v, self.ntun * self.vt, sat));
         }
         if forward {
             if let Some(knee) = self.ikf.filter(|_| above(&bottom.value, 1e-18)) {
-                bottom = injection(bottom, knee, true)?;
+                bottom = injection(&bottom, knee, true)?;
             }
         } else if let Some(knee) = self.ikr.filter(|_| below(&bottom.value, -1e-18)) {
-            bottom = injection(bottom, knee, false)?;
+            bottom = injection(&bottom, knee, false)?;
         }
         bottom.checked()
     }
@@ -247,10 +247,10 @@ impl Thermal {
             Law::zero(v)
         };
         if let Some(sat) = self.tunnel_sidewall {
-            sidewall = sidewall.add(tunnel(v, self.ntun * self.vt, sat));
+            sidewall = sidewall.add(&tunnel(v, self.ntun * self.vt, sat));
         }
         if let Some(knee) = self.ikp.filter(|_| above(&sidewall.value, 1e-18)) {
-            sidewall = injection(sidewall, knee, true)?;
+            sidewall = injection(&sidewall, knee, true)?;
         }
         sidewall.checked()
     }
@@ -260,7 +260,7 @@ impl Thermal {
         let breakdown = self.breakdown.map(|bv| (bv, self.nbv * self.vt));
         let bottom = self.bottom_taylor(v, forward, breakdown)?;
         let sidewall = self.sidewall_taylor(v, forward, breakdown)?;
-        let current = bottom.add(sidewall).add(Law {
+        let current = bottom.add(&sidewall).add(&Law {
             value: v.clone().scale(gmin),
             slope: Jet::constant(v.order(), gmin),
         });
@@ -274,8 +274,8 @@ impl Thermal {
             .scale(self.tt)
         };
         let charge = diffusion
-            .add(depletion(v, self.bottom, self.cjo)?)
-            .add(depletion(v, self.sidewall, self.cjsw)?);
+            .add(&depletion(v, self.bottom, self.cjo)?)
+            .add(&depletion(v, self.sidewall, self.cjsw)?);
         Ok((current.checked()?, charge.checked()?))
     }
 }

@@ -4,7 +4,7 @@ use super::Jet;
 use crate::primitives::{Real, SpiceResult};
 
 #[derive(Clone)]
-pub(crate) struct Differential<const N: usize> {
+pub struct Differential<const N: usize> {
     pub(crate) value: Jet,
     pub(crate) gradient: [Option<Jet>; N],
 }

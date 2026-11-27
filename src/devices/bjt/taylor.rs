@@ -193,47 +193,67 @@ impl Thermal {
 
 impl Bjt {
     pub(super) fn stamp_taylor(&self, context: &mut TaylorContext<'_>) -> SpiceResult<()> {
-        let t = self.thermal(context.model)?;
-        let n = self.nodes;
+        let thermal = self.thermal(context.model)?;
+        let nodes = self.nodes;
         let row = |node| context.unknowns.node_row(node);
-        let [c, b, e, s, cp, bp, ep, sc] = [n.c, n.b, n.e, n.s, n.cp, n.bp, n.ep, n.sc].map(row);
+        let [
+            collector,
+            base,
+            emitter,
+            substrate,
+            collector_prime,
+            base_prime,
+            emitter_prime,
+            substrate_connection,
+        ] = [
+            nodes.c, nodes.b, nodes.e, nodes.s, nodes.cp, nodes.bp, nodes.ep, nodes.sc,
+        ]
+        .map(row);
         let pol = self.pol;
-        let m = self.instance.multiplier;
+        let multiplier = self.instance.multiplier;
         let controls = [
             TaylorControl {
-                rows: [bp, ep],
+                rows: [base_prime, emitter_prime],
                 polarity: pol,
             },
             TaylorControl {
-                rows: [bp, cp],
+                rows: [base_prime, collector_prime],
                 polarity: pol,
             },
             TaylorControl {
-                rows: [b, cp],
+                rows: [base, collector_prime],
                 polarity: pol,
             },
             TaylorControl {
-                rows: [s, sc],
+                rows: [substrate, substrate_connection],
                 polarity: pol * self.subs,
             },
             TaylorControl {
-                rows: [b, bp],
+                rows: [base, base_prime],
                 polarity: pol,
             },
         ];
-        let v = [
+        let voltages = [
             controls[BE].input(BE, context)?,
             controls[BC].input(BC, context)?,
             controls[BX].input(BX, context)?,
             controls[SUB].input(SUB, context)?,
             controls[BB].input(BB, context)?,
         ];
-        let p = t.taylor_point(&v, context.model.gmin)?;
+        let point = thermal.taylor_point(&voltages, context.model.gmin)?;
         for (rows, law, scale) in [
-            ([cp, ep], &p.collector, pol * m),
-            ([bp, ep], &p.base, pol * m),
-            ([b, bp], &p.spread, pol * m),
-            ([s, sc], &p.substrate, pol * self.subs * m),
+            (
+                [collector_prime, emitter_prime],
+                &point.collector,
+                pol * multiplier,
+            ),
+            ([base_prime, emitter_prime], &point.base, pol * multiplier),
+            ([base, base_prime], &point.spread, pol * multiplier),
+            (
+                [substrate, substrate_connection],
+                &point.substrate,
+                pol * self.subs * multiplier,
+            ),
         ] {
             context.local_law(rows, law, &controls, scale, None)?;
         }
@@ -245,17 +265,20 @@ impl Bjt {
         ] {
             context.local_law(
                 controls[index].rows,
-                &p.charges[index],
+                &point.charges[index],
                 &controls,
-                controls[index].polarity * m,
+                controls[index].polarity * multiplier,
                 Some(slot),
             )?;
         }
-        for (outer, inner, g) in [(c, cp, t.gc), (e, ep, t.ge)] {
+        for (outer, inner, conductance) in [
+            (collector, collector_prime, thermal.gc),
+            (emitter, emitter_prime, thermal.ge),
+        ] {
             if outer != inner {
                 for (row, sign) in [(outer, 1.), (inner, -1.)] {
-                    context.linear_static(row, outer, sign * m * g)?;
-                    context.linear_static(row, inner, -sign * m * g)?;
+                    context.linear_static(row, outer, sign * multiplier * conductance)?;
+                    context.linear_static(row, inner, -sign * multiplier * conductance)?;
                 }
             }
         }
