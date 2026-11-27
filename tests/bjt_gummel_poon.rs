@@ -707,6 +707,7 @@ fn physical_taylor_reconstructs_multivariate_gummel_poon_equations()
                             .fold(0_f64, |sum, v| sum.mul_add(t, v.get(row).unwrap()))
                     };
                     for row in 0..sample.len() {
+                        eprintln!("{family} {subs} {base} {collector} t={t} residual/charge row={row}");
                         close(
                             series(&jet.residual, row),
                             actual.residual.get(row).unwrap(),
@@ -734,6 +735,7 @@ fn physical_taylor_reconstructs_multivariate_gummel_poon_equations()
                     let plus_q = point.charge.clone();
                     let minus = dae.evaluate(&minus, 0., Limit::Right)?;
                     for row in 0..c.unknown_count() {
+                        eprintln!("{family} {subs} {base} {collector} gradient row={row} col={col}");
                         close(
                             jet.conductance[0].get(row, col),
                             (plus_f.get(row).unwrap() - minus.residual.get(row).unwrap())
