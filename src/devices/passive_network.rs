@@ -341,7 +341,7 @@ impl PreparedPassiveNetwork {
     }
 
     /// Select thermal generator policy independently of electrical stamping.
-    #[must_use]
+    #[must_use = "the returned network carries the selected noise policy"]
     pub const fn with_noise_policy(mut self, noiseless: bool, parallel_magnitude: bool) -> Self {
         self.noiseless = noiseless;
         self.parallel_noise_magnitude = parallel_magnitude;
