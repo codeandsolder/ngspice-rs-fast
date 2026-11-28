@@ -300,3 +300,55 @@ fn physical_taylor_tangent_at_knot_uses_one_sided_germ() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn derivative_array_transient_crosses_actual_pwl_knots_on_both_axes() -> anyhow::Result<()> {
+    for (model, card, drive, observed) in [
+        (VOLTAGE, "MR", "Vdrive p 0 pwl(0 -0.5 3u 2.5)", "i(vdrive)"),
+        (CURRENT, "MC", "Idrive 0 p pwl(0 -0.5 3u 2.5)", "v(p)"),
+    ] {
+        let (deck, bundle) = source(
+            &format!(
+                "{drive}\n!R1 p 0 {card} IC=4\n{model}\nB1 derivative 0 v=1u*ddt({observed})\nRload derivative 0 1k"
+            ),
+            InputFormat::ExpandedDeck,
+        )?;
+        for method in ["method=trap", "method=gear"] {
+            let (mut c, config) = circuit(&deck, &bundle)?;
+            let plot = run(
+                &mut c,
+                &config,
+                AnalysisKind::Transient,
+                &["50n", "3u", "0", "50n", "uic", method],
+            )?;
+            let sign = if card == "MR" { -1. } else { 1. };
+            let mut crossed = [false; 3];
+            for index in 0..plot.point_count() {
+                let t = plot.value("time", index).unwrap().re;
+                let x = t.mul_add(1e6, -0.5);
+                let (y, slope) = if x < 0. {
+                    (3. * x + 2., 3.)
+                } else if x < 1. {
+                    (2. - 2. * x, -2.)
+                } else if x < 2. {
+                    (2. * (x - 1.), 2.)
+                } else {
+                    (x, 1.)
+                };
+                near(&plot, observed, index, sign * y);
+                let at_knot = [0., 1., 2.].iter().any(|k| (x - k).abs() < 1e-8);
+                if !at_knot && t > 0. && t < 3e-6 {
+                    near(&plot, "v(derivative)", index, sign * slope);
+                }
+                for (slot, knot) in [0., 1., 2.].into_iter().enumerate() {
+                    crossed[slot] |= (x - knot).abs() < 1e-8;
+                }
+            }
+            assert!(
+                crossed.into_iter().all(|v| v),
+                "missing PWL branch event {card} {method}"
+            );
+        }
+    }
+    Ok(())
+}

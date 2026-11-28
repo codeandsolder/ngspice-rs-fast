@@ -112,7 +112,10 @@ impl<const N: usize> Constitutive for Dual<N> {
     }
     fn reciprocal(self) -> SpiceResult<Self> {
         let value = self.value.recip();
-        let result = self.lift(value, -value * value);
+        let result = Self {
+            value,
+            gradient: self.gradient.map(|g| -(g * value) * value),
+        };
         result.check()?;
         Ok(result)
     }
@@ -208,7 +211,7 @@ impl<const N: usize> Constitutive for Differential<N> {
     }
     fn tanh(self) -> SpiceResult<Self> {
         let value = self.value.value().tanh();
-        if self.value.value().is_infinite() {
+        if self.value.value().is_infinite() || (-2. * self.value.value().abs()).exp() == 0. {
             return Ok(Self::constant(self.value.order(), value));
         }
         let slope = tanh_slope(&self.value)?;

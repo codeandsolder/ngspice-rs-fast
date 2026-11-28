@@ -283,3 +283,48 @@ fn derivative_array_transient_crosses_actual_switch_joins() -> SpiceResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn level_two_zero_bias_keeps_nonlinear_current_and_jacobian_coefficients() -> SpiceResult<()> {
+    let c = Circuit::from_netlist(&parse(
+        "Vb p 0 0\nVc ctrl 0 0\nS1 p 0 ctrl 0 m\n.model m ltspice_switch(level=2 vt=0 vh=-1 ron=1 roff=1 ilimit=2)",
+    )?)?;
+    let p = row(&c, "p");
+    let mut state = vec![Vector::zeros(c.unknown_count()); 6];
+    state[1].set(p, 1.)?;
+    let run = c.prepare_run();
+    let mut dae =
+        run.prepare_physical_dae(&ModelContext::default(), TransientTiming::new(1e-6, 1e-3)?)?;
+    let result = dae.evaluate_taylor(&state, 0., 1e-6, Limit::Right)?;
+    // 2*tanh(u/2) = u-u^3/12+u^5/120+...; the gmin contribution
+    // is linear. The voltage Jacobian is sech^2(u/2)+gmin.
+    close(
+        "cubic current",
+        result.residual[3].get(p).unwrap(),
+        -1. / 12.,
+        1e-13,
+        1e-15,
+    );
+    close(
+        "fifth-order current",
+        result.residual[5].get(p).unwrap(),
+        1. / 120.,
+        1e-13,
+        1e-15,
+    );
+    close(
+        "quadratic Jacobian",
+        result.conductance[2].get(p, p),
+        -1. / 4.,
+        1e-13,
+        1e-15,
+    );
+    close(
+        "fourth-order Jacobian",
+        result.conductance[4].get(p, p),
+        1. / 24.,
+        1e-13,
+        1e-15,
+    );
+    Ok(())
+}

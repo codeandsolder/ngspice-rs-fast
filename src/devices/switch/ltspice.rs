@@ -290,10 +290,15 @@ impl Law {
 fn limited_current<T: Constitutive>(g: T, limit: Real, voltage: T) -> SpiceResult<T> {
     let linear = g.multiply(&voltage);
     let argument = linear.clone().divide_constant(limit);
-    if argument.value().abs() < 1e-8 {
-        return Ok(linear);
-    }
-    Ok(argument.tanh()?.scale(limit))
+    let small = argument.value().abs() < 1e-8;
+    let current = argument.tanh()?.scale(limit);
+    // Keep the scalar rounding shortcut, not a linearized Taylor law.
+    // Even at zero bias the higher odd coefficients matter.
+    Ok(if small {
+        current.with_value(linear.value())
+    } else {
+        current
+    })
 }
 
 // The finite ten-step Newton law itself is shared across scalar and Taylor
@@ -301,6 +306,13 @@ fn limited_current<T: Constitutive>(g: T, limit: Real, voltage: T) -> SpiceResul
 fn epsilon_join<T: Constitutive>(a: &T) -> SpiceResult<T> {
     let mut join = a.clone().scale(0.5);
     for _ in 0..10 {
+        // Once the exponential tail underflows, the reference Newton
+        // increment is exactly -0.5. Avoid forming an overflowing 2*j
+        // and multiplying its derivatives by a zero exponential.
+        if (-2. * join.value()).exp() == 0. {
+            join = join.offset(-0.5);
+            continue;
+        }
         let doubled = join.clone().scale(2.);
         let tail = doubled.clone().scale(-1.).exp();
         let sech = tail.clone().scale(2.).divide(&tail.square().offset(1.))?;
