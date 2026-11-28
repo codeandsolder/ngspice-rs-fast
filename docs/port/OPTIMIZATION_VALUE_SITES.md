@@ -30,3 +30,23 @@ The test reports elapsed wall time, actual site evaluations and decimal round-tr
 ## Measured native candidate update
 
 Acer, pinned nightly and managed sccache, 10,000 prepared independent updates against 128 source sites: 74.383 ms wall time, 10,000 actual site evaluations and decimal roundings versus 1,280,000 naive per-site visits (128-fold reduction in site evaluation count). This measurement is for prepared candidate updates, not SPICE simulation or the entire optimization algorithm. Host contention and debug build settings affect timing; use DHAT separately for allocation counts.
+
+## Numeric-only rounding (#300)
+
+The numeric rounding regression `numparam_numeric_rounding_matches_literal_and_c_oracle` checks 100,000 deterministic binary64 patterns (99,949 finite), adjacent values around decimal powers, exact halfway cases in both directions, signed zero, and integer/overflow boundaries. The expected digest is independently computed by C `snprintf("%.15e", x)` followed by `strtod`. The normal source formatter remains available for source boundaries; the numeric update and gradient paths no longer construct heap-backed literals.
+
+Compare the same base revision with and without the numeric rounding change, with identical benchmark tests, pinned nightly, managed cache, and isolated release builds:
+
+```sh
+cargo +nightly test --release --locked --test optimization_value_sites benchmark_changed_numeric_sites -- --exact --ignored --nocapture
+cargo +nightly test --release --locked --test optimization_derivatives benchmark_repeated_candidate_gradients -- --exact --ignored --nocapture
+```
+
+Run the resulting test executables directly under `perf stat -e instructions:u,cycles:u,task-clock` and separately under `valgrind --tool=dhat`. Three interleaved release runs per version on the same host yielded the following medians:
+
+| Workload | Baseline instructions | Numeric-only instructions | Baseline user CPU | Numeric-only user CPU |
+|---|---:|---:|---:|---:|
+| 111,000 updates with 32 changed sites (3,552,000 conversions) | 24,205,225,154 | 14,911,651,417 | 3.622 s | 2.379 s |
+| 1,000 repeated candidate gradient evaluations | 1,386,272,328 | 1,279,621,381 | 0.286 s | 0.261 s |
+
+The scalar update workload executes 38.4% fewer user-mode instructions and the gradient workload 7.7% fewer. Elapsed wall time was substantially affected by concurrent host load; the instruction counts were stable. The conversion-only DHAT workload (one million numeric conversions) eliminated five million allocation events and 110,000,000 allocated bytes, leaving 13 common process/harness allocations. Both variants produced the same numeric digest. Sampling profiles show that heap-backed formatting disappears from the hot rounding path; exact float formatting, candidate evaluation and device replacement remain visible. These figures describe candidate operations, not the complete solver or optimization algorithm.
