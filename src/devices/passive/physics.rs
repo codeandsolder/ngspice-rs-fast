@@ -58,7 +58,9 @@ impl Coefficients {
         reason = "preserve C passive model arithmetic and separate rounding"
     )]
     const fn resistor(self, difference: Real) -> Real {
-        ((self.quadratic * difference) + self.linear) * difference + 1.
+        self.quadratic
+            .mul_add(difference, self.linear)
+            .mul_add(difference, 1.)
     }
 
     pub(in crate::devices) fn resistor_factor(
@@ -77,7 +79,7 @@ impl Coefficients {
         reason = "preserve C passive model arithmetic and separate rounding"
     )]
     pub(in crate::devices) const fn reactive(self, difference: Real) -> Real {
-        1. + self.linear * difference + self.quadratic * difference * difference
+        (self.quadratic * difference).mul_add(difference, self.linear.mul_add(difference, 1.))
     }
 }
 
@@ -107,7 +109,10 @@ impl SheetGeometry {
         reason = "preserve C passive model arithmetic and separate rounding"
     )]
     pub(in crate::devices) const fn dimensions(self) -> (Real, Real) {
-        (self.length - 2. * self.short, self.width - 2. * self.narrow)
+        (
+            2.0_f64.mul_add(-self.short, self.length),
+            2.0_f64.mul_add(-self.narrow, self.width),
+        )
     }
 
     pub(in crate::devices) const fn uses_sheet(self) -> bool {
@@ -170,7 +175,7 @@ impl CapacitorGeometry {
     )]
     pub(in crate::devices) const fn capacitance(self, length: Real, width: Real) -> Real {
         let (length, width) = self.dimensions(length, width);
-        self.cj * width * length + self.cjsw * 2. * (length + width)
+        (self.cjsw * 2.).mul_add(length + width, self.cj * width * length)
     }
 }
 

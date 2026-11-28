@@ -9,13 +9,13 @@ use ngspice_rs::primitives::Complex;
 fn with_terms(
     e: &mut SparseMatrix,
     groups: &mut DynamicGroups,
-    row: usize,
-    col: usize,
+    coordinate: (usize, usize),
     terms: &[f64],
     scale: f64,
     divisor: f64,
     prescaled: bool,
 ) {
+    let (row, col) = coordinate;
     let start = e.triplets().len();
     for &term in terms {
         e.add(row, col, scale * term / divisor).unwrap();
@@ -45,7 +45,7 @@ fn group_value(e: &SparseMatrix, groups: &DynamicGroups, omega: f64) -> Complex 
 fn prescaled_singleton_divisor_and_grouped_c_rounding_remain_distinct() {
     let mut groups = DynamicGroups::new();
     let mut e = SparseMatrix::new(1, 1);
-    with_terms(&mut e, &mut groups, 0, 0, &[4.], 3., 2., true);
+    with_terms(&mut e, &mut groups, (0, 0), &[4.], 3., 2., true);
     assert_eq!(groups.len(), 1);
     assert_eq!(groups.iter().next().unwrap().terms, &[4.]);
     // Once prescaled, these imaginary contributions are independent of
@@ -62,8 +62,7 @@ fn prescaled_singleton_divisor_and_grouped_c_rounding_remain_distinct() {
     with_terms(
         &mut e,
         &mut groups,
-        0,
-        0,
+        (0, 0),
         &[1e16, 0., -1e16, 1.],
         3.,
         2.,
@@ -138,7 +137,7 @@ fn cleared_assembly_does_not_accept_stale_groups_and_reuses_arena() {
             assert!(groups.is_empty());
         }
         for index in 0..GROUPS {
-            with_terms(&mut e, &mut groups, index, index, &terms, 1., 1., false);
+            with_terms(&mut e, &mut groups, (index, index), &terms, 1., 1., false);
         }
         let term_capacity = groups.term_capacity();
         let group_capacity = groups.group_capacity();
@@ -161,7 +160,7 @@ fn grouped_and_ungrouped_terms_with_gaps_preserve_frequency_assembly() {
     // Ungrouped contributions are scaled individually; groups retain C's
     // summed-before-dividing semantics.
     e.add(0, 0, 0.25).unwrap();
-    with_terms(&mut e, &mut groups, 0, 0, &[1.5, -0.5], 2., 3., false);
+    with_terms(&mut e, &mut groups, (0, 0), &[1.5, -0.5], 2., 3., false);
     e.add(0, 0, -0.125).unwrap();
     for omega in [0.125, 1., 2., 32.] {
         let grouped = omega * 1.5 + omega * (-0.5);
@@ -187,7 +186,7 @@ fn benchmark_many_grouped_stamps_and_arena_reuse() {
         e.clear();
         groups.clear();
         for row in 0..GROUPS {
-            with_terms(&mut e, &mut groups, row, row, &TERMS, 0.75, 2., false);
+            with_terms(&mut e, &mut groups, (row, row), &TERMS, 0.75, 2., false);
         }
         let current = (groups.group_capacity(), groups.term_capacity());
         if let Some(initial) = initial_capacity {
