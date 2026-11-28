@@ -1307,6 +1307,14 @@ pub trait Device: fmt::Debug + std::any::Any {
         0
     }
 
+    /// Device-local state slots populated with final solved control rows
+    /// on acceptance. Each pair is `(state slot, controlling source index)`.
+    /// A trial must still initialize its slots; the acceptance transaction
+    /// replaces these observations before publishing the accepted state.
+    fn accepted_control_samples(&self) -> &[(usize, usize)] {
+        &[]
+    }
+
     /// The state slot holding the integrated charge or flux that takes part in
     /// local-truncation-error control; the *next* slot holds its derivative.
     /// `None` (the default) for devices without a `DEVtrunc` equivalent

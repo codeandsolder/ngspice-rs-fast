@@ -176,6 +176,9 @@ pub(super) fn instantiate(
     {
         return crate::devices::behavioural::rlc::instantiate(instance, nodes);
     }
+    if crate::devices::behavioural::sampled::is_generated(instance) {
+        return crate::devices::behavioural::sampled::instantiate(instance, nodes);
+    }
     if crate::devices::behavioural::dynamic::is_generated(instance) {
         return crate::devices::behavioural::rlc::instantiate(instance, nodes);
     }

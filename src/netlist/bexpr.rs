@@ -268,6 +268,7 @@ pub const BUILTIN_FUNCTIONS: &[&str] = &[
     "min",
     "max",
     "ddt",
+    "sampled_current",
     "ternary_fcn",
     "gauss",
 ];

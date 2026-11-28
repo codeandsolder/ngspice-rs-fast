@@ -1,5 +1,5 @@
-//! Solver-owned integration of a signed storage residual. The expression
-//! compiler supplies its value and Jacobian, never a mutable time history.
+//! Solver-owned dynamic expression lowering and signed storage integration.
+//! The expression compiler never owns mutable time history.
 
 use crate::devices::nonlinear::charge::ChargeBranch;
 use crate::devices::traits::{AnalysisMode, StampContext};
@@ -58,8 +58,42 @@ fn expressions(instance: &DeviceInstance) -> impl Iterator<Item = &BehaviouralEx
         })
 }
 
-fn is_derivative(expr: &BExpr) -> bool {
-    matches!(&expr.kind, BExprKind::Call { name, .. } if name == "ddt")
+fn dynamic_operator(expr: &BExpr) -> Option<DynamicOperator> {
+    match &expr.kind {
+        BExprKind::Call { name, .. } if name == "ddt" => Some(DynamicOperator::Derivative),
+        BExprKind::Call { name, .. } if name == "sampled_current" => {
+            Some(DynamicOperator::SampledCurrent)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DynamicOperator {
+    Derivative,
+    SampledCurrent,
+}
+
+#[derive(Default)]
+struct CurrentTargets {
+    probes: BTreeSet<usize>,
+    zero: BTreeSet<String>,
+}
+
+// A source-prepared storage network with resolved m=0 has no physical
+// current coordinate. Keep its scalar validation in NetworkPlan, but do not
+// attempt to bind the absent branch when a behavioral expression reads it.
+fn removed_network(instance: &DeviceInstance) -> SpiceResult<bool> {
+    if matches!(instance.designator, 'c' | 'l')
+        && instance
+            .parameters
+            .iter()
+            .any(|p| crate::netlist::network_parameter(instance.designator, &p.name))
+        && let Some(m) = instance.parameters.iter().rfind(|p| p.name == "m")
+    {
+        return Ok(crate::devices::factory::scalar_number(m)? == 0.);
+    }
+    Ok(false)
 }
 
 /// A physical output current coordinate supplied by the selected factory.
@@ -101,7 +135,7 @@ fn measured_targets(
     instances: &[DeviceInstance],
     models: &crate::devices::models::ModelResolver<'_>,
     resistors: &crate::devices::pwl_resistor::BoundResistors,
-) -> SpiceResult<BTreeSet<usize>> {
+) -> SpiceResult<CurrentTargets> {
     let mut referenced = BTreeMap::new();
     for expression in instances.iter().flat_map(expressions) {
         expression.root.visit(&mut |node| {
@@ -113,13 +147,17 @@ fn measured_targets(
         });
     }
     if referenced.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok(CurrentTargets::default());
     }
-    let mut targets = BTreeSet::new();
+    let mut targets = CurrentTargets::default();
     for (index, instance) in instances.iter().enumerate() {
-        if let Some(location) = referenced.get(&instance.name.to_ascii_lowercase())
-            && !resistors.contains_key(&instance.name)
-            && !has_native_current(instance, models)?
+        let name = instance.name.to_ascii_lowercase();
+        let Some(location) = referenced.get(&name) else {
+            continue;
+        };
+        if removed_network(instance)? {
+            targets.zero.insert(name);
+        } else if !resistors.contains_key(&instance.name) && !has_native_current(instance, models)?
         {
             // A series probe reads the first physical terminal. A terminal-less
             // object or a collapsed/unknown port cannot be sensed this way.
@@ -133,7 +171,7 @@ fn measured_targets(
                     ),
                 ));
             }
-            targets.insert(index);
+            targets.probes.insert(index);
         }
     }
     Ok(targets)
@@ -156,9 +194,12 @@ pub(in crate::devices) fn expand<'a, 'n>(
     capacity: usize,
     resistors: &crate::devices::pwl_resistor::BoundResistors,
 ) -> SpiceResult<ExpandedInstances<'a>> {
-    let count = derivative_count(instances);
-    let measured = measured_targets(instances, models, resistors)?;
-    if count == 0 && measured.is_empty() {
+    let count = dynamic_count(instances);
+    let CurrentTargets {
+        probes: measured,
+        zero,
+    } = measured_targets(instances, models, resistors)?;
+    if count == 0 && measured.is_empty() && zero.is_empty() {
         return Ok(ExpandedInstances {
             instances: Cow::Borrowed(instances),
             probe_aliases: Vec::new(),
@@ -176,6 +217,7 @@ pub(in crate::devices) fn expand<'a, 'n>(
     let mut expansion = Expansion {
         nodes: occupied_nodes,
         devices: occupied_devices,
+        zero_currents: zero,
         serial: 0,
         output: Vec::new(),
     };
@@ -276,11 +318,11 @@ fn occupied_names<'n>(
     (occupied_nodes, occupied_devices)
 }
 
-fn derivative_count(instances: &[DeviceInstance]) -> usize {
+fn dynamic_count(instances: &[DeviceInstance]) -> usize {
     let mut count = 0usize;
     for expression in instances.iter().flat_map(expressions) {
         expression.root.visit(&mut |expr| {
-            if is_derivative(expr) {
+            if dynamic_operator(expr).is_some() {
                 count = count.saturating_add(1);
             }
         });
@@ -291,6 +333,7 @@ fn derivative_count(instances: &[DeviceInstance]) -> usize {
 struct Expansion {
     nodes: BTreeSet<String>,
     devices: BTreeSet<String>,
+    zero_currents: BTreeSet<String>,
     serial: usize,
     output: Vec<DeviceInstance>,
 }
@@ -315,14 +358,72 @@ impl Expansion {
     fn extract(&mut self, root: &mut BExpr) -> SpiceResult<()> {
         let mut result = Ok(());
         root.visit_mut(&mut |expr| {
-            if result.is_ok() && is_derivative(expr) {
-                result = self.extract_one(expr);
+            if result.is_err() {
+                return;
+            }
+            match dynamic_operator(expr) {
+                Some(DynamicOperator::Derivative) => result = self.extract_derivative(expr),
+                Some(DynamicOperator::SampledCurrent) => result = self.extract_sample(expr),
+                None => {
+                    if let BExprKind::Current(name) = &expr.kind
+                        && self.zero_currents.contains(&name.to_ascii_lowercase())
+                    {
+                        expr.kind = zero_current();
+                    }
+                }
             }
         });
         result
     }
 
-    fn extract_one(&mut self, expr: &mut BExpr) -> SpiceResult<()> {
+    fn extract_sample(&mut self, expr: &mut BExpr) -> SpiceResult<()> {
+        let invalid = || {
+            SpiceError::parse(
+                expr.span.start.clone(),
+                "sampled_current takes one physical current reference, sampled_current(i(instance))",
+            )
+        };
+        let BExprKind::Call { arguments, .. } = &expr.kind else {
+            return Err(invalid());
+        };
+        let [argument] = arguments.as_slice() else {
+            return Err(invalid());
+        };
+        let mut argument = argument;
+        while let BExprKind::Group(inner) = &argument.kind {
+            argument = inner;
+        }
+        let BExprKind::Current(name) = &argument.kind else {
+            return Err(invalid());
+        };
+        if self.zero_currents.contains(&name.to_ascii_lowercase()) {
+            expr.kind = zero_current();
+            return Ok(());
+        }
+        let (node, device) = self.names("sampled_current", 'b')?;
+        let location = expr.span.start.clone();
+        self.output.push(DeviceInstance {
+            code_ports: Vec::new(),
+            name: device,
+            designator: 'b',
+            nodes: vec![node.clone()],
+            model: None,
+            parameters: vec![ParameterAssignment {
+                name: super::sampled::MARKER.to_owned(),
+                value: name.clone(),
+                kind: ParameterKind::Instance,
+                location: location.clone(),
+            }],
+            location,
+        });
+        expr.kind = BExprKind::Voltage {
+            positive: node,
+            negative: None,
+        };
+        Ok(())
+    }
+
+    fn extract_derivative(&mut self, expr: &mut BExpr) -> SpiceResult<()> {
         let BExprKind::Call { arguments, .. } = &mut expr.kind else {
             return Err(SpiceError::circuit("invalid dynamic expression"));
         };
@@ -365,5 +466,12 @@ impl Expansion {
             negative: None,
         };
         Ok(())
+    }
+}
+
+fn zero_current() -> BExprKind {
+    BExprKind::Number {
+        value: 0.,
+        spelling: "0".to_owned(),
     }
 }

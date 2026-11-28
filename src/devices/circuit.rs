@@ -184,6 +184,7 @@ struct TopologyBindings {
     reported_currents: Vec<super::passive_network::BoundCurrentReport>,
     current_controls: std::collections::BTreeMap<usize, usize>,
     control_rows: Vec<Vec<usize>>,
+    accepted_control_samples: Vec<(usize, usize)>,
     state_rows: Arc<[std::ops::Range<usize>]>,
     state_len: usize,
     stochastic_sources: Vec<usize>,
@@ -786,6 +787,7 @@ impl<'a> PreparedRun<'a> {
                 || device.small_signal_depends_on_frequency()
                 || device.delay_line().is_some()
                 || device.has_discrete_state()
+                || !device.accepted_control_samples().is_empty()
             {
                 return Err(SpiceError::Unsupported {
                     feature: format!("memoryless physical DAE for {}", device.name()),
@@ -1818,10 +1820,33 @@ impl Circuit {
             .iter()
             .map(|device| self.resolve_controls(device.as_ref(), names))
             .collect::<SpiceResult<_>>()?;
+        self.bindings.accepted_control_samples = self.bind_accepted_control_samples()?;
         self.bindings.private_storage_rows = self.bind_private_storage()?;
         self.bindings.regularization_nodes = self.bind_regularization_nodes();
         self.bindings.mutual = self.resolve_mutual(names)?;
         Ok(())
+    }
+
+    fn bind_accepted_control_samples(&self) -> SpiceResult<Vec<(usize, usize)>> {
+        let mut samples = Vec::new();
+        for (index, device) in self.devices.iter().enumerate() {
+            for &(slot, control) in device.accepted_control_samples() {
+                let slot = self.bindings.state_rows[index]
+                    .clone()
+                    .nth(slot)
+                    .ok_or_else(|| SpiceError::circuit("invalid accepted-control state slot"))?;
+                let row = self.bindings.control_rows[index]
+                    .get(control)
+                    .copied()
+                    .ok_or_else(|| SpiceError::circuit("invalid accepted-control row"))?;
+                samples.push((slot, row));
+            }
+        }
+        samples.sort_unstable();
+        if samples.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(SpiceError::circuit("duplicate accepted-control state slot"));
+        }
+        Ok(samples)
     }
 
     /// Mixed-unit constitutive systems require a physical nodal regularization.
@@ -3893,6 +3918,7 @@ impl Circuit {
                         || original.branch_quantity(row) != replacement.branch_quantity(row)
                 })
                 || original.state_count() != replacement.state_count()
+                || original.accepted_control_samples() != replacement.accepted_control_samples()
                 || original.findable_branch() != replacement.findable_branch()
                 || original.expression_current_branch() != replacement.expression_current_branch()
                 || original
@@ -4114,6 +4140,7 @@ impl Circuit {
                 && a.order == b.order
                 && a.branch_rows == b.branch_rows
                 && a.control_rows == b.control_rows
+                && a.accepted_control_samples == b.accepted_control_samples
                 && a.private_storage_rows == b.private_storage_rows
                 && a.regularization_nodes == b.regularization_nodes
                 && a.state_rows == b.state_rows
@@ -4304,6 +4331,25 @@ impl Circuit {
         Ok(())
     }
 
+    fn sample_accepted_controls(
+        &self,
+        solution: &Vector,
+        history: &StateHistory,
+        trial: &mut TrialState,
+    ) -> SpiceResult<()> {
+        let samples = &self.bindings.accepted_control_samples;
+        if !samples.is_empty() {
+            history.check(trial)?;
+            for &(slot, row) in samples {
+                let value = solution
+                    .get(row)
+                    .ok_or_else(|| SpiceError::circuit("missing accepted-control solution row"))?;
+                history.set_candidate_slot(trial, slot, value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Accepts a point whose trial state is committed into `history`.
     ///
     /// Validation and every [`Device::accept`] hook run first; the history
@@ -4317,10 +4363,11 @@ impl Circuit {
         solution: &Vector,
         time: Option<Real>,
         history: &mut StateHistory,
-        trial: TrialState,
+        mut trial: TrialState,
     ) -> SpiceResult<()> {
         self.validate_history(history)?;
         self.validate_accept_point(solution, time)?;
+        self.sample_accepted_controls(solution, history, &mut trial)?;
         history
             .accept_transaction(
                 trial,
@@ -4353,7 +4400,7 @@ impl Circuit {
         solution: &Vector,
         time: Real,
         history: &mut StateHistory,
-        trial: TrialState,
+        mut trial: TrialState,
         delay: &DelayAcceptance,
     ) -> SpiceResult<Vec<Real>> {
         self.validate_history(history)?;
@@ -4373,6 +4420,7 @@ impl Circuit {
             }
             HistoryPublication::Rotate
         };
+        self.sample_accepted_controls(solution, history, &mut trial)?;
         history.accept_transaction(
             trial,
             publication,
