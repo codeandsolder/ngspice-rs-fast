@@ -378,6 +378,8 @@ pub struct MutualTerm {
     /// The coupled inductor's `ic=` (C `INDinitCond`, zero when absent),
     /// which `INDload` uses for the mutual flux of a `uic` first step.
     pub initial: Real,
+    /// Optional exact non-UIC startup current of the coupled winding.
+    pub exact_startup: Option<Real>,
 }
 
 /// The inductance of an inductor, as mutual coupling sees it
@@ -392,6 +394,8 @@ pub struct InductanceValue {
     pub coupling_base: Real,
     /// The `ic=` initial current (C `INDinitCond`, zero when absent).
     pub initial: Real,
+    /// Exact startup current, if prescribed independently of bias.
+    pub exact_startup: Option<Real>,
 }
 
 /// What a K (mutual inductance) device couples: every pair of the named
@@ -1080,6 +1084,12 @@ pub trait Device: fmt::Debug + std::any::Any {
         None
     }
 
+    /// Prescribed storage coordinate independent of the solved startup bias.
+    fn exact_startup_storage(&self) -> Option<Real> {
+        self.passive_initialization()
+            .and_then(crate::devices::passive_bias::PassiveInitialization::exact_initial)
+    }
+
     /// True when bias equations need physical nodal continuation rather
     /// than perturbing a numerical pivot diagonal.
     fn has_passive_bias(&self) -> bool {
@@ -1097,7 +1107,7 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// Whether real loads require the enclosing analysis selected by the
     /// analysis plan, independently of numerical regularization.
     fn requires_analysis_context(&self) -> bool {
-        self.has_passive_bias()
+        self.has_passive_bias() || self.exact_startup_storage().is_some()
     }
 
     /// How many device-local coordinates the device adds to the MNA

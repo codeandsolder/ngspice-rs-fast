@@ -698,9 +698,16 @@ struct AcceptedCandidate {
     state: TrialState,
 }
 
+struct InitialCandidate {
+    solution: Vector,
+    state: TrialState,
+    reported_bias: Option<Vector>,
+}
+
 struct AcceptedPoint {
     cursor: AcceptedCursor,
     solution: Vector,
+    reported_bias: Option<Vector>,
     observed: Option<Vec<Complex>>,
     device_breaks: Vec<Real>,
     periodic_boundary: Option<Box<PeriodicBoundary>>,
@@ -1277,8 +1284,9 @@ impl Driver<'_> {
         &self,
         solution: &Vector,
         selected: Option<&[usize]>,
+        report_bias: bool,
     ) -> SpiceResult<Vec<Complex>> {
-        if self.index_aware {
+        if self.index_aware && !report_bias {
             return self.observe_derivative_point(
                 solution,
                 None,
@@ -1466,15 +1474,20 @@ impl Driver<'_> {
         if accepted.cursor.clock.time == 0. && self.uic {
             return Ok(());
         }
+        let solution = accepted
+            .reported_bias
+            .as_ref()
+            .unwrap_or(&accepted.solution);
         let initial;
         let observations = match accepted.observed.as_deref() {
             Some(values) => values,
             None if accepted.cursor.clock.time == 0. => {
                 initial = self.observe_initial(
-                    &accepted.solution,
+                    solution,
                     selected
                         .as_ref()
                         .map(crate::analysis::results::SelectedOutput::observations),
+                    accepted.reported_bias.is_some(),
                 )?;
                 &initial
             }
@@ -1486,7 +1499,7 @@ impl Driver<'_> {
             selected.as_mut(),
             point,
             time,
-            &accepted.solution,
+            solution,
             observations,
         )
     }
@@ -1564,6 +1577,7 @@ impl Driver<'_> {
         Ok(AcceptedPoint {
             cursor: AcceptedCursor::initial(&self.settings),
             solution: seed.clone(),
+            reported_bias: None,
             observed: Some(observed),
             device_breaks,
             periodic_boundary: None,
@@ -1934,6 +1948,7 @@ impl Driver<'_> {
         Ok(AcceptedPoint {
             cursor: attempt.accept(next),
             solution: candidate.solution,
+            reported_bias: None,
             observed: candidate.output.observed,
             device_breaks,
             periodic_boundary: candidate.output.periodic_boundary,
@@ -2043,7 +2058,11 @@ impl Driver<'_> {
         // The provisional digital state is rolled back if initialization
         // fails; analog integration history is committed exactly once.
         for _ in 0..self.bias.newton.max_iterations {
-            let (x, trial) = self.initial_candidate()?;
+            let InitialCandidate {
+                solution: x,
+                state: trial,
+                reported_bias,
+            } = self.initial_candidate()?;
             let mixed_point = self
                 .mixed
                 .as_deref()
@@ -2063,6 +2082,7 @@ impl Driver<'_> {
             return Ok(AcceptedPoint {
                 cursor: AcceptedCursor::initial(&self.settings),
                 solution: x,
+                reported_bias,
                 observed: None,
                 device_breaks,
                 periodic_boundary: None,
@@ -2113,9 +2133,14 @@ impl Driver<'_> {
         Ok((consistent.solution.unwrap_or(start.x), trial))
     }
 
-    fn initial_candidate(&mut self) -> SpiceResult<(Vector, TrialState)> {
+    fn initial_candidate(&mut self) -> SpiceResult<InitialCandidate> {
         if self.uic {
-            return self.initial_uic_candidate();
+            let (solution, state) = self.initial_uic_candidate()?;
+            return Ok(InitialCandidate {
+                solution,
+                state,
+                reported_bias: None,
+            });
         }
         let mut rhs = self.system.transient_startup_rhs()?;
         if let Some(mixed) = self.mixed.as_deref() {
@@ -2181,10 +2206,24 @@ impl Driver<'_> {
         // point's discrete switch states, which a fresh reload in the
         // initial phase would re-derive from the instance flags.
         let trial = solution.trial;
-        if let Some(consistent) = self.derivative_initial(&x, &trial, false)? {
-            return Ok(consistent);
+        if let Some((solution, state)) = self.derivative_initial(&x, &trial, false)? {
+            let reported_bias = self
+                .circuit
+                .devices()
+                .iter()
+                .any(|device| device.exact_startup_storage().is_some())
+                .then_some(x);
+            return Ok(InitialCandidate {
+                solution,
+                state,
+                reported_bias,
+            });
         }
-        Ok((x, trial))
+        Ok(InitialCandidate {
+            solution: x,
+            state: trial,
+            reported_bias: None,
+        })
     }
 
     fn derivative_initial(
