@@ -3232,7 +3232,7 @@ impl Circuit {
                     .map(|&index| {
                         self.devices[index]
                             .delay_line()
-                            .map(|line| line.new_history())
+                            .map(super::delay::DelayLine::new_history)
                             .ok_or_else(|| {
                                 SpiceError::circuit(
                                     "finalized delay capability changed without rebinding",

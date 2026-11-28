@@ -285,7 +285,7 @@ impl StateHistory {
         }
     }
 
-    pub(super) fn bound(
+    pub(super) const fn bound(
         topology: TopologyId,
         rows: Arc<[Range<usize>]>,
         len: usize,
