@@ -70,6 +70,7 @@ fn counted_circuit() -> (Circuit, Arc<AtomicUsize>) {
             charge: Capability::Zero,
             noise: Capability::Zero,
             trial: TrialCapabilities::ENGINE,
+            taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
         },
         CountingConductance(Arc::clone(&count)),
     )
