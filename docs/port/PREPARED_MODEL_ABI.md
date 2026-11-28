@@ -90,3 +90,39 @@ and [preprocess#39](https://github.com/codeandsolder/ngspice-rs-preprocess/issue
 The solver consumes ABI 4 trial capabilities directly, including the
 prepared SIMetrix diode. Families declaring engine-owned numerical policy
 retain exact prepared loads without extra per-instance trial storage.
+
+### Independent VDMOS whole-circuit reference suite (#259)
+
+`tests/vdmos_conformance.rs` reuses the 31 standalone native ngspice 47
+reference decks in `tests/fixtures/vdmos`. The test boundary consumes the
+producer's evaluated `ModelLibrary::instantiate` topology: model variants,
+instance multipliers and ambient laws, structural heating selection, and
+ordered descriptor terminals. It removes the producer-owned single-line
+cards by source positions before parsing the remaining flat fixture with the
+ordinary electrical parser. This is a fixture adapter, not production MOS
+source dispatch. Shared artifacts bind through `PreparedDevice` and the
+standard analysis plans. Thermal voltages are projected from rise above
+circuit ambient to absolute Celsius only for DC operating points and
+transient comparisons, not AC perturbations. Noise generator identities
+`channel` and `flicker` correspond to C's `id` and `1overf`.
+
+The independent C47 measurement with ±1 mV gate perturbations at the
+`thermal_dc_n/p` biases and 1 mHz unit AC gate excitation gives:
+
+| Circuit | Quantity | Central DC derivative | AC real derivative |
+| --- | --- | ---: | ---: |
+| N | Junction K/V | +9.918498 | -10.802951 |
+| N | Case K/V | +8.265415 | -9.002460 |
+| N | Supply A/V | -5.510277 | -6.001640 |
+| P | Junction K/V | -5.166647 | +5.400206 |
+| P | Case K/V | -4.305539 | +4.500171 |
+| P | Supply A/V | -2.870359 | -3.000114 |
+
+C's thermal AC response reverses the sign of its own static derivative and
+has inconsistent drain-current feedback. The physical low-frequency
+consistency test compares the engine to its own central DC derivative and
+independent C DC slope, rather than copying the inconsistent C AC signs.
+At higher frequencies the thermal phase must lag the DC response. No
+model-specific solver branch or relaxed physical tolerance is required by
+this coordinate convention.
+
