@@ -279,3 +279,126 @@ fn fn_linear_ramp_stamps_terminal_charge() -> Result<()> {
     ensure!(count > 100);
     Ok(())
 }
+
+#[test]
+fn ordinary_semiconductor_dispatch_keeps_the_measured_junction_and_charge() -> Result<()> {
+    let source = include_str!("fixtures/ltspice_diode/ordinary.cir");
+    let plot = plot(source)?;
+    let measured = include_str!("fixtures/ltspice_diode/ordinary-dc.tsv");
+    ensure!(plot.point_count() == measured.lines().count() - 1);
+    for (row, line) in measured.lines().skip(1).enumerate() {
+        let data = line
+            .split_ascii_whitespace()
+            .map(str::parse::<f64>)
+            .collect::<Result<Vec<_>, _>>()?;
+        ensure!(data.len() == 15);
+        for (index, expected) in data[1..].iter().enumerate() {
+            let name = format!("i(v{index})");
+            let actual = plot.value(&name, row).with_context(|| name.clone())?.re;
+            // LTspice solves an internal series node and reports branch current
+            // with finite voltage accuracy; near leakage this introduces absolute
+            // error from subtracting nearly equal voltages.
+            close(&name, actual, *expected, 3e-7, 3e-14)?;
+        }
+    }
+    measured_ac(
+        include_str!("fixtures/ltspice_diode/ordinary-ac.cir"),
+        include_str!("fixtures/ltspice_diode/ordinary-ac.tsv"),
+        14,
+    )
+}
+
+#[test]
+fn sidewall_topologies_stamp_independent_series_nodes_and_charge() -> Result<()> {
+    let cases: Vec<_> = include_str!("fixtures/ltspice_diode/side-cases.tsv")
+        .lines()
+        .collect();
+    for row in include_str!("fixtures/ltspice_diode/side-ac-compact.tsv").lines() {
+        let mut fields = row.split('\t');
+        let bias = fields.next().context("missing bias")?;
+        let expected: Vec<_> = fields.collect();
+        ensure!(expected.len() == cases.len());
+        let mut source = format!("sidewall AC\nVx x 0 DC {bias} AC 1\n");
+        for (index, case) in cases.iter().enumerate() {
+            let parts: Vec<_> = case.split('|').collect();
+            let [_, model, instance] = parts.as_slice() else {
+                anyhow::bail!("invalid sidewall case");
+            };
+            use std::fmt::Write as _;
+            writeln!(
+                source,
+                "V{index} x a{index} 0\nD{index} a{index} 0 d{index} {instance}\n.model d{index} D({model})"
+            )?;
+        }
+        source.push_str(
+            ".options reltol=1e-10 abstol=1e-14 vntol=1e-12 gmin=1e-12\n.ac lin 1 1k 1k\n.end\n",
+        );
+        let plot = plot(&source)?;
+        for (index, value) in expected.iter().enumerate() {
+            let name = format!("i(v{index})");
+            let (re, im) = value
+                .split_once(',')
+                .context("invalid complex measurement")?;
+            let actual = plot.value(&name, 0).with_context(|| name.clone())?;
+            close(&name, actual.re, re.parse()?, 3e-7, 1e-17)?;
+            close(&name, actual.im, im.parse()?, 3e-7, 1e-17)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn independent_sidewall_noise_sources_reach_the_terminal() -> Result<()> {
+    let measured = include_str!("fixtures/ltspice_diode/noise-side-extra.tsv");
+    for line in include_str!("fixtures/ltspice_diode/noise-side-extra-cases.tsv").lines() {
+        let fields: Vec<_> = line.split('|').collect();
+        let [name, model, instance] = fields.as_slice() else {
+            anyhow::bail!("invalid semiconductor noise case");
+        };
+        let source = format!(
+            "semiconductor noise {name}\nI1 0 out DC 5u AC 1\nD1 out 0 dm {instance}\n.model dm D({model})\n.options gmin=1e-12 reltol=1e-10 abstol=1e-14 vntol=1e-12\n.op\n.noise V(out) I1 lin 1 1k 1k 1\n.end\n"
+        );
+        if *name == "vp" {
+            // Dynamic reverse recovery requires a separate state equation.
+            // Issue #90 explicitly owns that independent physical law.
+            ensure!(projected(&source).is_err());
+            continue;
+        }
+        let (deck, config, mut circuit) = projected(&source)?;
+        let context = config.context();
+        let op = config
+            .plan_for(&deck.analyses[0])?
+            .run(&mut circuit, &context)?;
+        let spectra = config
+            .plan_for(&deck.analyses[1])?
+            .run_plots(&mut circuit, &context)?;
+        let spectrum = &spectra[0];
+        let prefix = format!("noise-side-extra-{name}\t");
+        let mut rows = measured.lines().filter_map(|row| row.strip_prefix(&prefix));
+        let expected = measured_value(rows.next().context("missing bias")?, "V(out)")?;
+        close(
+            name,
+            op.value("v(out)", 0).context("missing bias voltage")?.re,
+            expected,
+            3e-7,
+            1e-10,
+        )?;
+        let noise = rows.next().context("missing noise measurement")?;
+        for (column, field) in [
+            ("onoise_spectrum", "V(onoise)"),
+            ("inoise_spectrum", "inoise"),
+        ] {
+            close(
+                name,
+                spectrum
+                    .value(column, 0)
+                    .with_context(|| column.to_owned())?
+                    .re,
+                measured_value(noise, field)?,
+                3e-7,
+                1e-22,
+            )?;
+        }
+    }
+    Ok(())
+}

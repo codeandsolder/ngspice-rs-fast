@@ -1,0 +1,18 @@
+base|Is=1e-12 N=1.5|
+perim|Is=1e-12 N=1.5 Perim=2|
+side_is|Is=1e-12 N=1.5 Perim=2 Isw=1e-10|
+side_c|Is=1e-12 N=1.5 Perim=2 Cjsw=2n|
+side_r|Is=1e-12 N=1.5 Perim=2 Rsw=4|
+side_all|Is=1e-12 N=1.5 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n Rsw=4|
+side_rs|Is=1e-12 N=1.5 Rs=3 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n|
+side_rs_rsw|Is=1e-12 N=1.5 Rs=3 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n Rsw=4|
+side_zero|Is=1e-12 N=1.5 Perim=0 Isw=1e-10 Ns=2 Cjsw=2n Rsw=4|
+side_negative|Is=1e-12 N=1.5 Perim=-2 Isw=1e-10 Ns=2 Cjsw=2n|
+side_override|Is=1e-12 N=1.5 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n|perim=3
+side_zero_override|Is=1e-12 N=1.5 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n|perim=0
+side_area0|Is=1e-12 N=1.5 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n|0
+side_area2|Is=1e-12 N=1.5 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n|2
+side_negm|Is=1e-12 N=1.5 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n|m=-2
+side_temp|Is=1e-12 N=1.5 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n|temp=100
+side_tt|Is=1e-12 N=1.5 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n Tt=5n|
+side_vj|Is=1e-12 N=1.5 Perim=2 Isw=1e-10 Ns=2 Cjsw=2n Vjsw=.6 Mjsw=.4 Fcs=.3|
