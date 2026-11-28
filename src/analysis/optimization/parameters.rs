@@ -13,6 +13,7 @@ use crate::analysis::RunConfig;
 use crate::analysis::sens::{PhysicalParameter, conditioned_derivative};
 use crate::devices::circuit::{CandidateNumericOverride, Circuit};
 use crate::devices::models::ModelContext;
+use crate::devices::subckt::PreparedDeclarations;
 use crate::devices::sweep::InstanceTarget;
 use crate::netlist::ast::Netlist;
 use crate::netlist::elaborate::{self, SiteKind};
@@ -23,6 +24,7 @@ use crate::netlist::eval::{
 use crate::netlist::expr::ParameterExpression;
 use crate::primitives::value::round_numparam_literal;
 use crate::primitives::{Complex, Real, SourceLoc, SpiceError, SpiceResult};
+use model_normalize_ngspice::{pwl_resistor::PreparedPwlResistor, waveform::PreparedWaveform};
 
 /// What candidate preparation did to the finalized circuit.
 ///
@@ -73,14 +75,120 @@ impl CandidateSite {
     }
 }
 
-/// Shareable immutable preparation of the original source and validated baseline.
-///
-/// Any number of independent sessions may borrow it. Inputs are top-level `.param` coordinates; nested instance formal scopes
-/// are evaluated by the ordinary subcircuit elaborator when affected.
-pub struct CircuitParameterPlan {
+/// Shared parameter DAG and electrical artifact for independent circuit preparation.
+/// Compilation evaluates the nominal parameter definitions but does not instantiate
+/// a physical circuit; only actual independent sweep candidates need valid geometry.
+pub struct CandidateDeckPlan {
     source: Netlist,
+    waveforms: Vec<PreparedWaveform>,
+    pwl_resistors: Vec<PreparedPwlResistor>,
     parameters: ParameterPlan,
     root: ParameterScopeId,
+}
+
+impl CandidateDeckPlan {
+    /// Compile root parameters and retain the prepared electrical declarations.
+    ///
+    /// # Errors
+    /// Invalid parameter definitions, functions, seed or tunable names.
+    pub fn new(
+        source: Netlist,
+        tunables: &[&str],
+        declarations: PreparedDeclarations<'_>,
+    ) -> SpiceResult<Self> {
+        let mut budget = EvalBudget::for_netlist(&source)?;
+        Self::compile(source, tunables, declarations, &mut budget)
+    }
+
+    fn compile(
+        source: Netlist,
+        tunables: &[&str],
+        declarations: PreparedDeclarations<'_>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Self> {
+        let functions = FunctionScope::for_netlist(&source, budget)?;
+        let mut parameters = ParameterPlan::new();
+        let root = parameters.add_scope(
+            ParameterScopeSpec {
+                parent: None,
+                instance: None,
+                functions: Some(functions),
+                bindings: &[],
+                cards: &source.params,
+                instance_overrides: false,
+                tunables,
+            },
+            budget,
+        )?;
+        Ok(Self {
+            source,
+            waveforms: declarations.waveforms.to_vec(),
+            pwl_resistors: declarations.pwl_resistors.to_vec(),
+            parameters,
+            root,
+        })
+    }
+
+    fn baseline_scope(&self) -> SpiceResult<Arc<crate::netlist::eval::ParamScope>> {
+        Ok(Arc::new(
+            self.parameters
+                .baseline(self.root)
+                .ok_or_else(|| SpiceError::circuit("missing parameter plan root"))?
+                .clone(),
+        ))
+    }
+
+    fn declarations(&self) -> PreparedDeclarations<'_> {
+        PreparedDeclarations {
+            waveforms: &self.waveforms,
+            pwl_resistors: &self.pwl_resistors,
+        }
+    }
+
+    fn elaborate(
+        &self,
+        context: &ModelContext,
+        scope: Arc<crate::netlist::eval::ParamScope>,
+        edits: &[crate::devices::circuit::CandidateEdit<'_>],
+    ) -> SpiceResult<Circuit> {
+        Circuit::from_prepared_netlist_with_edits(
+            &self.source,
+            context,
+            crate::devices::MutualLimits::default(),
+            crate::devices::ElaborationLimits::default(),
+            Some(scope),
+            self.declarations(),
+            edits,
+        )
+    }
+
+    pub(crate) const fn source(&self) -> &Netlist {
+        &self.source
+    }
+
+    /// Coordinate schema in original caller order.
+    #[must_use = "the returned schema defines the required coordinate order for candidate updates"]
+    pub fn inputs(&self) -> &[crate::netlist::eval::ParameterInput] {
+        self.parameters.inputs()
+    }
+
+    /// A session for independent analysis repetitions. Retains the shared
+    /// parameter DAG's validated values, without constructing an optimization
+    /// overlay or carrying the preceding analysis' mutable circuit state.
+    #[must_use = "independent repetitions must use the prepared parameter plan"]
+    pub fn session(&self) -> IndependentCandidate<'_> {
+        IndependentCandidate {
+            plan: self,
+            parameters: self.parameters.session(),
+        }
+    }
+}
+
+/// Shareable immutable optimizer preparation with a validated baseline and
+/// prebound numeric update routes. Independent analysis repetitions use
+/// [`CandidateDeckPlan`] directly, without constructing optimizer overlays.
+pub struct CircuitParameterPlan {
+    deck: CandidateDeckPlan,
     config: RunConfig,
     sites: Vec<CandidateSite>,
     /// Input coordinates affecting numeric options rather than device stamps.
@@ -98,30 +206,29 @@ impl CircuitParameterPlan {
     /// Ordinary netlist, parameter, option, model or circuit validation; an
     /// unknown/duplicate independent coordinate or dependency scan failure.
     pub fn new(source: Netlist, tunables: &[&str]) -> SpiceResult<Self> {
+        Self::with_declarations(source, tunables, PreparedDeclarations::default())
+    }
+
+    /// Compile one candidate plan with the source-prepared constitutive and
+    /// forcing declarations. Every structural elaboration uses these same
+    /// declarations and binds them against the current candidate scope.
+    ///
+    /// # Errors
+    /// Invalid deck, declarations, parameter scope, or physical preparation.
+    pub fn with_declarations(
+        source: Netlist,
+        tunables: &[&str],
+        declarations: PreparedDeclarations<'_>,
+    ) -> SpiceResult<Self> {
         let mut budget = EvalBudget::for_netlist(&source)?;
-        let functions = FunctionScope::for_netlist(&source, &budget)?;
-        let mut parameters = ParameterPlan::new();
-        let root = parameters.add_scope(
-            ParameterScopeSpec {
-                parent: None,
-                instance: None,
-                functions: Some(functions),
-                bindings: &[],
-                cards: &source.params,
-                instance_overrides: false,
-                tunables,
-            },
-            &mut budget,
-        )?;
-        let scope = Arc::new(
-            parameters
-                .baseline(root)
-                .ok_or_else(|| SpiceError::circuit("missing parameter plan root"))?
-                .clone(),
-        );
-        let elaborated = elaborate::literalize_with(&source, Arc::clone(&scope), &mut budget)?;
-        let config = RunConfig::from_netlist(&source)?;
-        let baseline = config.circuit(&source)?;
+        let deck = CandidateDeckPlan::compile(source, tunables, declarations, &mut budget)?;
+        let source = &deck.source;
+        let parameters = &deck.parameters;
+        let root = deck.root;
+        let scope = deck.baseline_scope()?;
+        let elaborated = elaborate::literalize_with(source, Arc::clone(&scope), &mut budget)?;
+        let config = RunConfig::from_netlist_with_scope(source, Arc::clone(&scope))?;
+        let baseline = config.prepared_circuit(source, declarations)?;
         let mut sites = Vec::new();
         for site in &elaborated.sites {
             let expression = &site.expression;
@@ -132,7 +239,7 @@ impl CircuitParameterPlan {
                 continue;
             }
             let route = if let SiteKind::DeviceParameter { device, parameter } = site.kind {
-                bind_numeric_site(&source, &baseline, device, parameter)
+                bind_numeric_site(source, &baseline, device, parameter)
             } else {
                 RouteSpec::Rebuild
             };
@@ -158,7 +265,7 @@ impl CircuitParameterPlan {
         // The original AST does not reveal runtime laws hidden in lexical
         // functions, or coefficients inserted by controlled-source lowering.
         // Inspect the actual macro-expanded laws rather than the card syntax.
-        let laws = crate::netlist::behavioural::candidate_laws(&source, &scope, &mut budget)?;
+        let laws = crate::netlist::behavioural::candidate_laws(source, &scope, &mut budget)?;
         let behavioural_dependencies = parameters.bind_behavioural(root, &laws, &mut budget)?;
         // Nested formal scopes still require independent validation through
         // the full elaborator. Root options need revalidation only when their
@@ -172,11 +279,15 @@ impl CircuitParameterPlan {
                 .flat_map(elaborate::model_expressions),
             &mut budget,
         )?;
-        let requires_rebuild = !source.subcircuits.is_empty();
+        // These declarations are evaluated inside occurrence preparation,
+        // outside the native site's dependency graph. A numeric overlay
+        // cannot prove that their physical equations remain unchanged.
+        let requires_rebuild = !source.subcircuits.is_empty()
+            || source.prepared_initialization.is_some()
+            || !declarations.waveforms.is_empty()
+            || !declarations.pwl_resistors.is_empty();
         Ok(Self {
-            source,
-            parameters,
-            root,
+            deck,
             config,
             sites,
             option_dependencies,
@@ -186,14 +297,14 @@ impl CircuitParameterPlan {
         })
     }
 
-    pub(crate) const fn source(&self) -> &Netlist {
-        &self.source
+    /// Independent coordinate schema in original caller order.
+    #[must_use = "the coordinate schema defines the required candidate input order"]
+    pub fn inputs(&self) -> &[crate::netlist::eval::ParameterInput] {
+        self.deck.inputs()
     }
 
-    /// Coordinate schema in original caller order.
-    #[must_use = "the returned schema defines the required coordinate order for candidate updates"]
-    pub fn inputs(&self) -> &[crate::netlist::eval::ParameterInput] {
-        self.parameters.inputs()
+    pub(crate) const fn source(&self) -> &Netlist {
+        self.deck.source()
     }
 
     /// Parameter-dependent site schema and original source provenance.
@@ -210,29 +321,24 @@ impl CircuitParameterPlan {
     /// Candidate baseline elaboration failure or stale typed setter.
     pub fn session(&self) -> SpiceResult<CircuitCandidate<'_>> {
         let scope = Arc::new(
-            self.parameters
-                .baseline(self.root)
+            self.deck
+                .parameters
+                .baseline(self.deck.root)
                 .ok_or_else(|| SpiceError::circuit("missing parameter plan root"))?
                 .clone(),
         );
         let context = self.config.context().model_context();
-        let baseline = Circuit::from_netlist_with_scoped_limits(
-            &self.source,
-            &context,
-            crate::devices::MutualLimits::default(),
-            crate::devices::ElaborationLimits::default(),
-            Some(scope),
-        )?;
+        let baseline = self.deck.elaborate(&context, scope, &[])?;
         let routes = self
             .sites
             .iter()
-            .map(|site| site.route.bind(&self.source, &baseline))
+            .map(|site| site.route.bind(&self.deck.source, &baseline))
             .collect();
         Ok(CircuitCandidate {
             plan: self,
             baseline,
             routes,
-            parameters: self.parameters.session(),
+            parameters: self.deck.parameters.session(),
             values: self.inputs().iter().map(|input| input.default).collect(),
             site_raw: self.sites.iter().map(|site| site.raw_baseline).collect(),
             site_values: self.sites.iter().map(|site| site.baseline).collect(),
@@ -338,6 +444,43 @@ pub(super) struct GradientSite {
 pub(super) enum GradientSiteFailure {
     Unsupported(String),
     NonSmooth(String),
+}
+
+/// Independent repetition of a parameterized prepared deck. Only the numeric
+/// parameter session persists between analyses: each returned circuit owns
+/// fresh device preparation, topology and solver state.
+pub struct IndependentCandidate<'a> {
+    plan: &'a CandidateDeckPlan,
+    parameters: CandidateParameters<'a>,
+}
+
+impl IndependentCandidate<'_> {
+    /// Resolve all independent root coordinates and the selected temperature
+    /// before elaborating exactly one circuit for this repetition.
+    ///
+    /// # Errors
+    /// Invalid candidate coordinates, temperature, option or physical preparation.
+    /// The last validated parameter session remains intact after a failure.
+    pub fn prepare(
+        &mut self,
+        coordinates: &[Real],
+        temperature: Option<Real>,
+        edits: &[crate::devices::circuit::CandidateEdit<'_>],
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<(Circuit, RunConfig)> {
+        let mut parameters = self.parameters.clone();
+        parameters.update(coordinates, budget)?;
+        let scope = parameters.resolved_scope(self.plan.root)?;
+        let mut config = RunConfig::from_netlist_with_scope(&self.plan.source, Arc::clone(&scope))?;
+        if let Some(value) = temperature {
+            config = config.at_temperature(value, &self.plan.source.location)?;
+        }
+        let circuit = self
+            .plan
+            .elaborate(&config.context().model_context(), scope, edits)?;
+        self.parameters = parameters;
+        Ok((circuit, config))
+    }
 }
 
 /// Independent candidate state with transactional updates.
@@ -475,15 +618,9 @@ impl CircuitCandidate<'_> {
     /// an inconsistent Jacobian and a false gradient. Re-elaborate exactly
     /// once per requested direct objective, never per parameter.
     pub(super) fn physical_sensitivity_circuit(&self) -> SpiceResult<Circuit> {
-        let scope = self.parameters.resolved_scope(self.plan.root)?;
+        let scope = self.parameters.resolved_scope(self.plan.deck.root)?;
         let context = self.config().context().model_context();
-        Circuit::from_netlist_with_scoped_limits(
-            &self.plan.source,
-            &context,
-            crate::devices::MutualLimits::default(),
-            crate::devices::ElaborationLimits::default(),
-            Some(scope),
-        )
+        self.plan.deck.elaborate(&context, scope, &[])
     }
 
     /// Stable name of one independent root coordinate in plan order.
@@ -504,7 +641,7 @@ impl CircuitCandidate<'_> {
             (
                 SiteKind::DeviceParameter { device, parameter },
                 RouteSpec::Resistor(_) | RouteSpec::Instance { .. },
-            ) => self.plan.source.devices.get(device).and_then(|card| {
+            ) => self.plan.deck.source.devices.get(device).and_then(|card| {
                 card.parameters
                     .get(parameter)
                     .map(|parameter| PhysicalParameter::Instance {
@@ -513,7 +650,7 @@ impl CircuitCandidate<'_> {
                     })
             }),
             (SiteKind::ModelParameter { model, parameter }, _) => {
-                self.plan.source.models.get(model).and_then(|card| {
+                self.plan.deck.source.models.get(model).and_then(|card| {
                     card.parameters
                         .get(parameter)
                         .map(|parameter| PhysicalParameter::Model {
@@ -578,7 +715,7 @@ impl CircuitCandidate<'_> {
         // Nested scopes do not yet have a validated physical derivative
         // binding. Runtime law coefficients invalidate only the inputs
         // that actually affect their compiled numerical values.
-        if !self.plan.source.subcircuits.is_empty() {
+        if !self.plan.deck.source.subcircuits.is_empty() {
             for result in &mut output {
                 *result = Err(GradientSiteFailure::Unsupported(
                     "subcircuit parameter dependency lacks a validated derivative binding"
@@ -757,7 +894,7 @@ impl CircuitCandidate<'_> {
         if !structural {
             // Resolve all other fallible candidate metadata before publishing
             // the numeric overlay and its validated physical preparation.
-            let scope = parameters.resolved_scope(self.plan.root)?;
+            let scope = parameters.resolved_scope(self.plan.deck.root)?;
             if self
                 .baseline
                 .commit_candidate_overrides(&context, overrides)
@@ -786,16 +923,11 @@ impl CircuitCandidate<'_> {
         // Every dimension, including non-instance model and topology-changing
         // coordinates, is handled by this general scalar-equivalent path.
         // Failed structural validation cannot escape through the cached matrix.
-        let scope = parameters.resolved_scope(self.plan.root)?;
-        let config = RunConfig::from_netlist_with_scope(&self.plan.source, Arc::clone(&scope))?;
+        let scope = parameters.resolved_scope(self.plan.deck.root)?;
+        let config =
+            RunConfig::from_netlist_with_scope(&self.plan.deck.source, Arc::clone(&scope))?;
         let context = config.context().model_context();
-        let circuit = Circuit::from_netlist_with_scoped_limits(
-            &self.plan.source,
-            &context,
-            crate::devices::MutualLimits::default(),
-            crate::devices::ElaborationLimits::default(),
-            Some(scope),
-        )?;
+        let circuit = self.plan.deck.elaborate(&context, scope, &[])?;
         Ok(PreparedCandidate {
             context,
             config,

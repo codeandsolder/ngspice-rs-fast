@@ -549,6 +549,39 @@ impl RunConfig {
         self.params.as_deref()
     }
 
+    /// Bind one normalized prepared scalar against this candidate's actual
+    /// parameter/function scope. Unlike initialization-policy expressions,
+    /// the name `analysis` is an ordinary lexical parameter here.
+    ///
+    /// # Errors
+    /// Missing candidate scope, invalid scalar, unbound names or evaluation limits.
+    pub fn prepared_scalar(
+        &self,
+        text: &str,
+        location: &SourceLoc,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<Real> {
+        let scope = self.params.as_ref().ok_or_else(|| {
+            SpiceError::parse(
+                location.clone(),
+                "prepared scalar requires a candidate scope",
+            )
+        })?;
+        crate::netlist::prepared_initialization::evaluate_scalar(
+            text, location, scope, None, budget,
+        )
+    }
+
+    /// Select an independent circuit temperature, preserving the nominal
+    /// model temperature and all other resolved candidate configuration.
+    ///
+    /// # Errors
+    /// A nonfinite temperature or a value at/below absolute zero.
+    pub fn at_temperature(mut self, value: Real, location: &SourceLoc) -> SpiceResult<Self> {
+        self.context.temperature = temperature(value, location, "candidate temperature")?;
+        Ok(self)
+    }
+
     /// Resolve option cards in order, then apply `overrides`.
     ///
     /// # Errors

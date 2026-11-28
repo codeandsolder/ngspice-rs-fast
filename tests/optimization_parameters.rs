@@ -2,9 +2,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ngspice_rs::analysis::optimization::parameters::{CandidateTopology, CircuitParameterPlan};
+use ngspice_rs::analysis::optimization::parameters::{
+    CandidateDeckPlan, CandidateTopology, CircuitParameterPlan,
+};
 use ngspice_rs::analysis::{AnalysisContext, AnalysisInput};
-use ngspice_rs::devices::Circuit;
+use ngspice_rs::devices::{Circuit, subckt::PreparedDeclarations};
 use ngspice_rs::netlist::Parser;
 use ngspice_rs::netlist::ast::Netlist;
 use ngspice_rs::netlist::eval::{EvalBudget, FunctionScope, ParameterPlan, ParameterScopeSpec};
@@ -608,5 +610,143 @@ fn sparse_polynomial_candidate_retains_initially_zero_parameter_terms() {
         let context = session.analysis_context();
         let plot = op.run(session.circuit_mut(), &context).unwrap();
         close(plot.value("v(out)", 0).unwrap().re, 1. - gain);
+    }
+}
+
+#[test]
+fn independent_temperature_uses_current_parameter_scope_and_fresh_model_setup() {
+    let source = deck(
+        ".param r=1k analysis=2\n.func delay(x) {x*analysis}\nV1 in 0 2\nR1 in 0 rm {r}\n.model rm r(tc1=0.01 tnom=27)\n.temp 27\n",
+    );
+    let location = source.location.clone();
+    let plan = CandidateDeckPlan::new(source, &["r", "analysis"], PreparedDeclarations::default())
+        .unwrap();
+    let mut candidate = plan.session();
+    let mut budget = EvalBudget::default();
+    for (r, analysis, temp) in [
+        (1e3, 2., 27.),
+        (2e3, 3., 77.),
+        (1e3, 2., -23.),
+        (1e3, 2., 27.),
+    ] {
+        let (mut circuit, config) = candidate
+            .prepare(&[r, analysis], Some(temp), &[], &mut budget)
+            .unwrap();
+        close(
+            config
+                .prepared_scalar("{delay(1u)}", &location, &mut budget)
+                .unwrap(),
+            analysis * 1e-6,
+        );
+        close(config.context().nominal_temperature, 27.);
+        let request = config
+            .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
+            .unwrap();
+        let plot = request.run(&mut circuit, &config.context()).unwrap();
+        close(
+            plot.value("i(v1)", 0).unwrap().re,
+            -2. / (r * (1. + 0.01 * (temp - 27.))),
+        );
+    }
+    assert!(
+        candidate
+            .prepare(&[3e3, 5.], Some(-273.15), &[], &mut budget)
+            .is_err()
+    );
+    let (mut circuit, config) = candidate
+        .prepare(&[1e3, 2.], None, &[], &mut budget)
+        .unwrap();
+    close(config.context().temperature, 27.);
+    let request = config
+        .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
+        .unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
+    close(plot.value("i(v1)", 0).unwrap().re, -2e-3);
+}
+
+#[test]
+fn independent_edits_rebuild_models_geometry_and_source_values_together() {
+    use ngspice_rs::devices::circuit::CandidateEdit;
+    let plan = CandidateDeckPlan::new(
+        deck("v1 a 0 1\nr1 a 0 rm l=2u w=1u\nr2 a 0 rm l=4u w=1u\n.model rm r(rsh=100)"),
+        &[],
+        PreparedDeclarations::default(),
+    )
+    .unwrap();
+    let mut session = plan.session();
+    let mut budget = EvalBudget::default();
+    for (voltage, width, sheet) in [(2., 2e-6, 200.), (-3., 1e-6, 50.), (2., 2e-6, 200.)] {
+        let (mut circuit, config) = session
+            .prepare(
+                &[],
+                None,
+                &[
+                    CandidateEdit::Source {
+                        name: "v1",
+                        value: voltage,
+                    },
+                    CandidateEdit::Instance {
+                        name: "r1",
+                        parameter: "w",
+                        value: width,
+                    },
+                    CandidateEdit::Model {
+                        scope: &[],
+                        name: "rm",
+                        parameter: "rsh",
+                        value: sheet,
+                    },
+                ],
+                &mut budget,
+            )
+            .unwrap();
+        let plot = config
+            .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
+            .unwrap()
+            .run(&mut circuit, &config.context())
+            .unwrap();
+        close(plot.value("v(a)", 0).unwrap().re, voltage);
+        close(
+            plot.value("i(v1)", 0).unwrap().re,
+            -voltage * (width / (2e-6 * sheet) + 1. / (4. * sheet)),
+        );
+    }
+    assert!(
+        session
+            .prepare(
+                &[],
+                None,
+                &[CandidateEdit::Source {
+                    name: "r1",
+                    value: 1.
+                }],
+                &mut budget
+            )
+            .is_err()
+    );
+    let (mut circuit, config) = session.prepare(&[], None, &[], &mut budget).unwrap();
+    let plot = config
+        .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
+        .unwrap()
+        .run(&mut circuit, &config.context())
+        .unwrap();
+    close(plot.value("i(v1)", 0).unwrap().re, -0.0075);
+}
+
+#[test]
+fn independent_sweeps_need_no_physically_valid_nominal_circuit() {
+    let source = deck(".param width=0\nv1 in 0 1\nr1 in 0 rm l=2u w={width}\n.model rm r(rsh=100)");
+    assert!(CircuitParameterPlan::new(source.clone(), &["width"]).is_err());
+    let plan = CandidateDeckPlan::new(source, &["width"], PreparedDeclarations::default()).unwrap();
+    let mut session = plan.session();
+    let mut budget = EvalBudget::default();
+    for width in [1e-6, 2e-6, 1e-6] {
+        let (mut circuit, config) = session.prepare(&[width], None, &[], &mut budget).unwrap();
+        let plot = config
+            .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
+            .unwrap()
+            .run(&mut circuit, &config.context())
+            .unwrap();
+        close(plot.value("i(v1)", 0).unwrap().re, -width / (2e-6 * 100.));
     }
 }

@@ -59,6 +59,12 @@ pub struct AnalysisInput {
     /// positional time arguments. The companion transient driver implements it
     /// (`dctran.c` `MODEUIC`).
     pub uic: bool,
+    /// Independently resolved transient sampling and integration schedules.
+    /// Mutually exclusive with positional transient time arguments.
+    pub transient_schedule: Option<crate::analysis::TransientSchedule>,
+    /// Source-bound continuation axes in inner-to-outer order.
+    /// Mutually exclusive with positional DC sweep arguments.
+    pub dc_axes: Option<Vec<crate::analysis::sweep::DcSweepAxis>>,
     /// The deck's `.ic` entries in deck order (see [`NodeCondition`]). Enforced
     /// by the companion transient initial operating point unless `uic`; ignored
     /// by `.op`/`.dc`/`.ac`, exactly as C (`cktload.c`), but always validated.
@@ -82,6 +88,8 @@ impl AnalysisInput {
             kind,
             arguments: Vec::new(),
             uic: false,
+            transient_schedule: None,
+            dc_axes: None,
             initial_conditions: Vec::new(),
             nodesets: Vec::new(),
             noise: None,
@@ -108,6 +116,10 @@ impl AnalysisInput {
     /// Invalid analysis syntax, ranges, or options.
     pub fn resolve(self) -> SpiceResult<crate::analysis::AnalysisPlan> {
         crate::analysis::RunConfig::default().plan(self)
+    }
+
+    pub(super) fn set_location(&mut self, location: SourceLoc) {
+        self.location = Some(location);
     }
 
     pub(super) const fn location(&self) -> Option<&SourceLoc> {

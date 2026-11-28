@@ -15,7 +15,9 @@
 //! in one go.
 
 pub(crate) mod bin_sweep;
+mod candidate;
 pub(crate) use bin_sweep::{BinnedDeck, GeometryEdit};
+pub use candidate::CandidateEdit;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -5585,6 +5587,28 @@ impl Circuit {
         scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
         declarations: crate::devices::subckt::PreparedDeclarations<'_>,
     ) -> SpiceResult<Self> {
+        Self::from_prepared_netlist_with_edits(
+            netlist,
+            context,
+            mutual_limits,
+            elaboration_limits,
+            scope,
+            declarations,
+            &[],
+        )
+    }
+
+    pub(crate) fn from_prepared_netlist_with_edits(
+        netlist: &crate::netlist::ast::Netlist,
+        context: &ModelContext,
+        mutual_limits: MutualLimits,
+        elaboration_limits: ElaborationLimits,
+        scope: Option<std::sync::Arc<crate::netlist::eval::ParamScope>>,
+        declarations: crate::devices::subckt::PreparedDeclarations<'_>,
+        edits: &[CandidateEdit<'_>],
+    ) -> SpiceResult<Self> {
+        let edited = candidate::edit_models(netlist, edits)?;
+        let netlist = edited.as_ref();
         context.validate(&netlist.location)?;
         // The nonlinear E/G/F/H forms become B sources and generated XSPICE
         // instances first, as inpcom.c rewrites them before numparam and
@@ -5605,7 +5629,7 @@ impl Circuit {
         // `X` instances are expanded into a fresh device/model list before any
         // device is built, so a deck that fails to elaborate never leaves a
         // partial circuit behind (#18).
-        let expanded = crate::devices::subckt::expand_prepared(
+        let mut expanded = crate::devices::subckt::expand_prepared(
             netlist,
             &elaborated.scope,
             crate::devices::subckt::SubcircuitLimits {
@@ -5614,6 +5638,7 @@ impl Circuit {
             },
             declarations,
         )?;
+        let sources = candidate::edit_instances(&mut expanded, edits)?;
         let models = crate::devices::models::ModelResolver::new(&expanded.models)?
             .with_bin_options(crate::devices::binning::BinOptions {
                 scale: context.geometry_scale,
@@ -5683,6 +5708,7 @@ impl Circuit {
         // Reject an invalid inductive system (K coupling) before any analysis.
         circuit.prepared_mutual_terms(context)?;
         circuit.binned_deck = binned_deck;
+        candidate::apply_sources(&mut circuit, context, &sources)?;
         Ok(circuit)
     }
 

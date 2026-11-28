@@ -56,6 +56,7 @@ pub mod periodic_noise;
 mod periodic_orbit;
 pub mod periodic_small_signal;
 mod plan;
+pub mod prepared_plan;
 mod pss;
 mod pz;
 pub mod rawfile;
@@ -71,8 +72,9 @@ mod tf;
 pub mod touchstone;
 
 pub use companion::{
-    TransientPlan, TransientStats, companion_transient, companion_transient_into,
-    mixed_signal_transient, mixed_signal_transient_into,
+    OutputSampling, TimingSegment, TransientPlan, TransientSchedule, TransientStats,
+    companion_transient, companion_transient_into, mixed_signal_transient,
+    mixed_signal_transient_into,
 };
 pub use config::{
     AppliedOption, DcOptions, IgnoredOption, PlanningLimits, RunConfig, RunOverrides,
