@@ -25,8 +25,8 @@ pub mod fft;
 pub mod integrator;
 pub mod linear;
 pub use linear::{
-    DenseLu, NiStep, PivotTolerances, SparseLu, SparseSymbolic, UnknownNames, solve_last_factors,
-    solve_ni,
+    DenseLu, NiStep, NiWorkspace, PivotTolerances, RetainedSolveWorkspace, SparseLu,
+    SparseSymbolic, UnknownNames, solve_last_factors_into, solve_ni,
 };
 pub mod pencil;
 pub mod sparse;

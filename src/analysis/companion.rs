@@ -1830,6 +1830,9 @@ impl Driver<'_> {
             // solve so retries reuse it without borrowing history mutably.
             let mut workspace = std::mem::take(&mut self.workspace);
             let outcome = self.solve_trial(&attempt, &mut prepared, &iterate, &mut workspace);
+            // The input iterate has no remaining reader after Newton.
+            // Recycle it before any success/retry path replaces it.
+            workspace.recycle_current(iterate);
             self.workspace = workspace;
             match outcome? {
                 Trial::NotConverged { last } => {
@@ -2181,9 +2184,11 @@ impl Driver<'_> {
                     timing: self.timing,
                 }),
                 &nodes,
+                &mut self.workspace,
             )?
             .solution
         };
+        self.workspace.recycle_next(solution.next);
         let x = solution.values;
         initial::check_implied(
             &x,
@@ -2495,10 +2500,13 @@ impl Driver<'_> {
         }
         .solve(previous, policy, None, |_, _, _| Ok(()));
         match solved {
-            Ok(solved) => Ok(Trial::Converged {
-                x: solved.values,
-                state: solved.trial,
-            }),
+            Ok(solved) => {
+                workspace.recycle_next(solved.next);
+                Ok(Trial::Converged {
+                    x: solved.values,
+                    state: solved.trial,
+                })
+            }
             Err(crate::analysis::newton::NewtonFailure {
                 last_iterate: Some(last),
                 ..

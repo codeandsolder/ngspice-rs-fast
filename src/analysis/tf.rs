@@ -220,16 +220,19 @@ pub(super) fn run(
         &circuit.prepare_run(),
         &context.model_context(),
         &settings,
+        None,
+        &mut crate::analysis::newton::CircuitNewtonWorkspace::default(),
     )?;
 
     // tfanal.c solves with the LU factors CKTop's last NIiter pass left in
     // the circuit matrix (its load at CKTrhsOld); no further load is made.
     let pattern = circuit.matrix_pattern();
-    let solve = |rhs: &Vector| -> SpiceResult<Vector> {
+    let mut workspace = crate::maths::RetainedSolveWorkspace::default();
+    let mut solve = |rhs: &Vector, out: &mut Vector| -> SpiceResult<()> {
         if let Some(pattern) = &pattern
-            && let Some(x) = crate::maths::solve_last_factors(pattern, rhs)?
+            && crate::maths::solve_last_factors_into(pattern, rhs, &mut workspace, out, false)?
         {
-            return Ok(x);
+            return Ok(());
         }
         Err(SpiceError::Numerical {
             context: ".tf".to_owned(),
@@ -245,7 +248,8 @@ pub(super) fn run(
             add(&mut rhs, minus, 1.)?;
         }
     }
-    let x = solve(&rhs)?;
+    let mut x = Vector::default();
+    solve(&rhs, &mut x)?;
     let read = |x: &Vector| match probe {
         Probe::Voltage { pos, neg } => at(x, pos) - at(x, neg),
         Probe::Current { row, .. } => at(x, Some(row)),
@@ -260,7 +264,7 @@ pub(super) fn run(
     let output_resistance = if same_source {
         input_resistance
     } else {
-        let mut rhs = Vector::zeros(n);
+        rhs.clear();
         match probe {
             Probe::Voltage { pos, neg } => {
                 add(&mut rhs, pos, -1.)?;
@@ -268,10 +272,10 @@ pub(super) fn run(
             }
             Probe::Current { row, .. } => rhs.add_to(row, 1.)?,
         }
-        let y = solve(&rhs)?;
+        solve(&rhs, &mut x)?;
         match probe {
-            Probe::Voltage { pos, neg } => at(&y, neg) - at(&y, pos),
-            Probe::Current { row, .. } => resistance(at(&y, Some(row))),
+            Probe::Voltage { pos, neg } => at(&x, neg) - at(&x, pos),
+            Probe::Current { row, .. } => resistance(at(&x, Some(row))),
         }
     };
 

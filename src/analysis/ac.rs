@@ -190,6 +190,7 @@ pub(super) struct SmallSignal<'a> {
     prepared: crate::devices::PreparedRun<'a>,
     settings: crate::analysis::bias::DcSettings,
     start: crate::analysis::bias::OperatingPointStart,
+    workspace: crate::analysis::newton::CircuitNewtonWorkspace,
     state1: crate::devices::StateSnapshot,
     system: LinearSystem,
     /// A `hertz`-dependent device forces a new operating point per frequency.
@@ -211,7 +212,14 @@ impl<'a> SmallSignal<'a> {
     ) -> SpiceResult<Self> {
         let prepared = circuit.prepare_run();
         let start = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?;
-        let solved = start.solve(&prepared, &context.model_context(), &settings)?;
+        let mut workspace = crate::analysis::newton::CircuitNewtonWorkspace::default();
+        let solved = start.solve(
+            &prepared,
+            &context.model_context(),
+            &settings,
+            None,
+            &mut workspace,
+        )?;
         // The MODEINITSMSIG load's state writes outlive the analysis (C keeps
         // one CKTstate0 per deck): later analyses read them back.
         prepared.record_small_signal_state(&context.model_context(), &solved.values)?;
@@ -238,10 +246,18 @@ impl<'a> SmallSignal<'a> {
             .devices()
             .iter()
             .any(|device| device.small_signal_depends_on_frequency());
+        // A non-varying AC analysis does not need the DC stamp workspace
+        // after its initial bias. Retain scratch only for repeated bias solves.
+        if varies {
+            workspace.recycle_next(solved.next);
+        } else {
+            workspace = crate::analysis::newton::CircuitNewtonWorkspace::default();
+        }
         Ok(Self {
             prepared,
             settings,
             start,
+            workspace,
             state1,
             system,
             varies,
@@ -322,14 +338,20 @@ impl<'a> SmallSignal<'a> {
     ) -> SpiceResult<R> {
         if self.varies {
             let model = context.model_context().with_frequency(f);
-            let solved =
-                self.start
-                    .solve_from(&self.prepared, &model, &self.settings, &self.previous)?;
+            let solved = self.start.solve(
+                &self.prepared,
+                &model,
+                &self.settings,
+                Some(&self.previous),
+                &mut self.workspace,
+            )?;
             self.state1 = self
                 .prepared
                 .circuit()
                 .bias_small_signal_snapshot(&solved.trial)?;
-            self.previous = solved.values;
+            self.workspace
+                .recycle_current(std::mem::replace(&mut self.previous, solved.values));
+            self.workspace.recycle_next(solved.next);
             // C repeats MODEINITSMSIG after every frequency-dependent CKTop.
             // Preserve its carried device slots for the next bias and analysis.
             self.prepared

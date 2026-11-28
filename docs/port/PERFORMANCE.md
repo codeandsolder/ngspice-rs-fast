@@ -64,6 +64,75 @@ Future vectorization must show **whole-load** gains with C-reference fidelity
 before reinstating a batch planner. The regular diode physics tests, full C
 golden verification and ordered scalar stamps remain the regression gates.
 
+## Real Newton workspace ownership (#293)
+
+The Newton driver retains current, next, correction RHS and factor scratch in
+its execution workspace. Each successful iteration swaps the two solution
+vectors; convergence transfers both vectors with the trial that was loaded at
+the accepted iterate. Transient retries and continuation stages recycle consumed
+vectors only after the last reader. A DC sweep owns one workspace across points,
+including predicted-point retries and geometry-driven topology changes. Repeated
+frequency-dependent bias and mixed-signal operating-point solves recycle the
+same slots; a one-shot small-signal bias drops its DC scratch after use.
+The retained primal/adjoint solve and
+immutable LU snapshot interfaces accept caller-owned scratch and output, so
+repeated right-hand sides need not allocate solution vectors.
+
+A circuit's bound pattern still owns its mutable real/complex factor-frame
+transaction: sequential analyses intentionally inherit that frame and its pivot
+history. Independent optimizer sessions construct independent circuits and
+caches. Immutable snapshots remain independent of subsequent refactors;
+separating the topology from this transaction further requires evidence of
+shared-pattern contention or copy-on-write costs, not just removal of a lock.
+
+### Matched release allocation evidence
+
+The measured production changes through `7ed5b664` were compared against
+`f53dfcc7` on the same Ryzen 7 4700U host with the pinned 2026-11-23 nightly
+and mandatory managed sccache. Both builds used the same deterministic
+workloads, lockfile, release profile and CPU affinity. Allocation counting
+used a separate benchmark-only allocator; native timing used the normal
+allocator. All compared output point counts and bitwise plot checksums match.
+
+| Workload | Allocations before | Allocations after | Allocated bytes before | Allocated bytes after |
+| --- | ---: | ---: | ---: | ---: |
+| 2,000 retained RHS, 32 unknowns | 2,000 | 0 | 512,000 | 0 |
+| 2,000 retained RHS, 256 unknowns | 2,000 | 0 | 4,096,000 | 0 |
+| 2,000 retained RHS, 1,024 unknowns | 2,000 | 0 | 16,384,000 | 0 |
+| 2,000 coefficient refactors at each size | 2,000 | 0 | 16,000 × order | 0 |
+| RC transient, 16 sections | 2,877 | 1,300 | 1,044,586 | 817,106 |
+| RC transient, 64 sections | 3,246 | 1,669 | 3,747,720 | 2,913,520 |
+| RC transient, 256 sections | 4,826 | 3,249 | 14,555,902 | 11,294,822 |
+| BSIM3 nested DC | 3,025 | 2,344 | 394,282 | 338,250 |
+| BSIM3 transient | 2,965 | 1,127 | 552,732 | 419,780 |
+| BSIM4 transient | 1,315 | 614 | 505,970 | 392,362 |
+
+The first three rows and the refactor row exclude initial storage growth.
+Whole-circuit allocation counts include the complete analysis after circuit
+construction; output collection, device and state preparation still allocate.
+
+A separate rejected-step RC run on `428828a` exercised 100 analyses per
+trial, with 30 accepted steps, two rejected steps and two breakpoints in every
+analysis. Allocations dropped from 308 to 207 and allocated bytes from 19,074
+to 16,074 per analysis. All six trial checksums were `3cf7c32dc7f82248`.
+
+Five alternating native runs under `perf stat` gave median instruction counts
+of 5.596 billion versus 5.621 billion for the combined linear/nonlinear/RC
+workload, and 2.075 billion versus 2.094 billion for the candidate ensemble.
+Median cycles were 1.738 versus 1.726 billion and 1.051 versus 1.024 billion,
+respectively. Native wall times vary under concurrent host load; six reversed
+pairs on both four-core groups did not reproduce an initial apparent large
+ensemble slowdown. This is a demonstrated allocation reduction, not a claim
+of a general throughput gain. The factor traversal, pivot policy and
+floating-point equations are unchanged.
+
+The harness, binary checksums, raw allocation and hardware-counter logs and
+paired timing summaries are recorded in the
+[issue #293 engineering log](https://app.notion.com/p/426f74be90208135b584d45aab4e8389).
+The existing factor, Newton, DC continuation, transient rejection and
+independent-candidate regression tests exercise cache isolation and acceptance
+semantics.
+
 ## Instantaneous rank-reduction storage (#299)
 
 The rank reducer keeps a reusable sparse accumulator with a column-to-slot
@@ -141,7 +210,7 @@ Repeat steady-state phases three times; use medians per operation.
 - Pattern creation, triplet assembly and bound element assembly are separate
   phases. Coefficient nonzero counts describe matrix sparsity (divide by n²).
 - Fresh order/factor includes factor-frame construction; retained solve uses a
-  factor snapshot with caller-owned scratch. The two NI solve phases exercise
+  factor snapshot with caller-owned scratch and output. The two NI solve phases exercise
   the same bound matrix with changed and then identical coefficients.
 - FactorStorage records structural original handle creations, total stored LU
   entries, fill-in handle creations, translated/external order and logical

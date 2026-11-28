@@ -3451,12 +3451,14 @@ pub(super) struct FactorView<'a, T> {
 }
 
 impl<T: Scalar> FactorView<'_, T> {
+    #[cfg(test)]
     pub(super) fn solve(&self, rhs: &[T], workspace: &mut Vec<T>) -> SpiceResult<Vec<T>> {
         let mut out = Vec::new();
         self.solve_into(rhs, workspace, &mut out, false)?;
         Ok(out)
     }
 
+    #[cfg(test)]
     pub(super) fn solve_transposed(
         &self,
         rhs: &[T],

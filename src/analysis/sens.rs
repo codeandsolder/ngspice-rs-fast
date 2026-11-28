@@ -51,7 +51,7 @@ use crate::devices::sensitivity::{
 };
 use crate::devices::{AnalysisMode, Circuit, Device, IterationPhase, LoadRequest, TrialState};
 use crate::maths::complex::ComplexMatrix;
-use crate::maths::linear::solve_last_factors_transposed;
+use crate::maths::linear::{RetainedSolveWorkspace, solve_last_factors_into};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
 
@@ -1665,6 +1665,8 @@ pub(super) fn run(
         &circuit.prepare_run(),
         &model,
         &settings,
+        None,
+        &mut crate::analysis::newton::CircuitNewtonWorkspace::default(),
     )?;
 
     let mut plot = workspace.plot(ac);
@@ -2025,6 +2027,26 @@ fn run_ac(
     Ok(())
 }
 
+fn dc_adjoint(
+    pattern: &std::sync::Arc<crate::maths::Pattern>,
+    rhs: &Vector,
+) -> SpiceResult<Vector> {
+    let mut adjoint = Vector::default();
+    if !solve_last_factors_into(
+        pattern,
+        rhs,
+        &mut RetainedSolveWorkspace::default(),
+        &mut adjoint,
+        true,
+    )? {
+        return Err(SpiceError::Numerical {
+            context: ".sens".to_owned(),
+            message: "the operating point left no factored circuit matrix".to_owned(),
+        });
+    }
+    Ok(adjoint)
+}
+
 fn run_dc(
     walk: &mut ParameterWalk<'_>,
     solved: crate::analysis::newton::NewtonSolution<TrialState>,
@@ -2078,12 +2100,7 @@ fn run_dc(
         trial,
         circuit,
     };
-    let adjoint = solve_last_factors_transposed(&at.pattern, &probe.dual(n))?.ok_or_else(|| {
-        SpiceError::Numerical {
-            context: ".sens".to_owned(),
-            message: "the operating point left no factored circuit matrix".to_owned(),
-        }
-    })?;
+    let adjoint = dc_adjoint(&at.pattern, &probe.dual(n))?;
     let mut point = Vec::with_capacity(plot.variables().len());
     let mut scratch = DcAssembly::new(n);
     let mut resolution = walk
