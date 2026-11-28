@@ -269,8 +269,12 @@ nonlinear branch or prove global uniqueness, and an exactly singular
 homogeneous repeated root can still remain unresolved.
 
 The last accepted physical state and rate provide an extrapolated
-Newton seed for subsequent trials. A localized event uses its actual
-left-limit solution and rate instead. Neither rejected trials nor branch
+Newton seed for subsequent trials. When the extrapolated sum cancels
+within its floating-point rounding envelope, use zero as the seed, not
+as a physical constraint. This allows an exact singular crossing to be
+solved without carrying a spurious nonzero roundoff residual into the
+branch guard. A localized event uses its actual left-limit solution and
+rate instead. Neither rejected trials nor branch
 probes update the accepted predictor. The verified derivative array
 also supplies the executed guard trace and canonical candidate states,
 without re-evaluating the scalar expression on a potentially different
