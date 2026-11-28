@@ -1,6 +1,7 @@
 //! Qualified receiver logic. Internal timer state is committed only through
 //! the event engine; inertial timers wake the model, not an analog load.
 use super::ModelDiagnostic;
+use super::pulse::{PulseFilter, PulseState};
 use super::sequential_timing::{TimingContract, TimingState};
 use super::{
     CodeModel, DelayMode, Delays, Drive, EventContext, GateKind, Logic, ModelSchema, Output,
@@ -14,7 +15,7 @@ fn possible(value: Logic) -> &'static [Logic] {
     match value {
         Logic::Zero => &[Logic::Zero],
         Logic::One => &[Logic::One],
-        Logic::Unknown => &[Logic::Zero, Logic::One],
+        Logic::Unknown | Logic::Rising | Logic::Falling => &[Logic::Zero, Logic::One],
     }
 }
 
@@ -84,7 +85,7 @@ impl ClockedKind {
             (Self::Jk, [set, reset, _]) => {
                 Ok(SrPolicy::ToggleOnBoth.next(set.logic, reset.logic, previous))
             }
-            (Self::Data, [data, _]) => Ok(data.logic),
+            (Self::Data, [data, _]) => Ok(data.logic.instantaneous()),
             (Self::Toggle, [toggle, _]) => {
                 Ok(consensus(possible(toggle.logic).iter().map(|&bit| {
                     if bit == Logic::One {
@@ -132,6 +133,96 @@ impl Edge {
 /// Explicit active levels and simultaneous preset/clear result for a
 /// single-output clocked primitive. Different source dialects can choose
 /// different conflict policies without changing the engine.
+/// A clock phase denotes a single possible excursion from its known
+/// starting level. Retain the no-edge, leading-edge and completed-pulse
+/// alternatives until the ending level is known. In particular, two
+/// correlated toggles of a dual-edge T flip-flop can restore a known bit.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ClockAmbiguity {
+    phase: Logic,
+    before: Logic,
+    leading: Logic,
+    both: Logic,
+}
+
+impl Edge {
+    const fn on(self, rising: bool) -> bool {
+        matches!(self, Self::Both)
+            || (rising && matches!(self, Self::Rising))
+            || (!rising && matches!(self, Self::Falling))
+    }
+
+    pub(super) fn timed_capture(
+        self,
+        previous: Logic,
+        current: Logic,
+        prior: Logic,
+        uncertainty: &mut Option<ClockAmbiguity>,
+        capture: impl Fn(Logic) -> SpiceResult<Logic>,
+    ) -> SpiceResult<Logic> {
+        if let Some(mut phase) = *uncertainty {
+            if current == phase.phase || current.is_binary() {
+                let rising = phase.phase == Logic::Rising;
+                let leading = if self.on(rising) {
+                    capture(phase.before)?
+                } else {
+                    phase.before
+                };
+                phase.leading = consensus([phase.leading, leading]);
+                let both = if self.on(!rising) {
+                    capture(phase.leading)?
+                } else {
+                    phase.leading
+                };
+                phase.both = consensus([phase.both, both]);
+                if current == phase.phase {
+                    *uncertainty = Some(phase);
+                    return Ok(consensus([phase.before, phase.leading, phase.both]));
+                }
+                *uncertainty = None;
+                return Ok(if current == phase.phase.phase_end() {
+                    phase.leading
+                } else {
+                    consensus([phase.before, phase.both])
+                });
+            }
+            // An unqualified change of ambiguity phase is not proof of
+            // a particular edge sequence.
+            *uncertainty = None;
+            return Ok(Logic::Unknown);
+        }
+        if matches!(current, Logic::Rising | Logic::Falling) {
+            let rising = current == Logic::Rising;
+            let leading = if self.on(rising) {
+                capture(prior)?
+            } else {
+                prior
+            };
+            let both = if self.on(!rising) {
+                capture(leading)?
+            } else {
+                leading
+            };
+            *uncertainty = Some(ClockAmbiguity {
+                phase: current,
+                before: prior,
+                leading,
+                both,
+            });
+            return Ok(consensus([prior, leading, both]));
+        }
+        Ok(self.capture(previous, current, prior, capture(prior)?))
+    }
+}
+
+impl ClockAmbiguity {
+    fn force(&mut self, logic: Logic) {
+        self.before = logic;
+        self.leading = logic;
+        self.both = logic;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AsyncPolicy {
     pub(super) preset: Logic,
@@ -276,11 +367,13 @@ impl Operation {
                 let previous_gate = std::mem::replace(&mut state.clock, enable.logic);
                 let previous_data = std::mem::replace(&mut state.data, data.logic);
                 let transparent = |data: Logic, gate: Logic| {
-                    consensus(
-                        possible(gate)
-                            .iter()
-                            .map(|&bit| if bit == active { data } else { prior }),
-                    )
+                    consensus(possible(gate).iter().map(|&bit| {
+                        if bit == active {
+                            data
+                        } else {
+                            prior.instantaneous()
+                        }
+                    }))
                 };
                 let normal = transparent(data.logic, enable.logic);
                 if previous_gate != enable.logic {
@@ -302,7 +395,7 @@ impl Operation {
                 apply_async(asynchronous, controls, normal, prior, state, &mut causes)?
             }
             (Self::TriState(active), [data, enable]) => {
-                if enable.logic == Logic::Unknown {
+                if !enable.logic.is_binary() {
                     // A conditional connection cannot be expressed as a
                     // single exact Drive; retain uncertainty.
                     Logic::Unknown
@@ -327,16 +420,29 @@ impl Operation {
                     .logic;
                 let previous_clock = std::mem::replace(&mut state.clock, clock);
                 let normal = if initial {
+                    state.clock_ambiguity = None;
                     prior
                 } else {
-                    trigger.capture(
+                    trigger.timed_capture(
                         previous_clock,
                         clock,
                         prior,
-                        kind.capture(synchronous, prior)?,
-                    )
+                        &mut state.clock_ambiguity,
+                        |prior| kind.capture(synchronous, prior),
+                    )?
                 };
-                apply_async(asynchronous, controls, normal, prior, state, &mut causes)?
+                let result =
+                    apply_async(asynchronous, controls, normal, prior, state, &mut causes)?;
+                if let (Some(policy), [preset, clear], Some(phase)) =
+                    (asynchronous, controls, &mut state.clock_ambiguity)
+                    && (preset.logic == policy.preset
+                        || clear.logic == policy.clear
+                        || !preset.logic.is_binary()
+                        || !clear.logic.is_binary())
+                {
+                    phase.force(result);
+                }
+                result
             }
             _ => return Err(SpiceError::circuit("invalid logic input dimensions")),
         };
@@ -470,7 +576,7 @@ impl DriveStrengths {
         let index = match logic {
             Logic::Zero => 0,
             Logic::One => 1,
-            Logic::Unknown => 2,
+            Logic::Unknown | Logic::Rising | Logic::Falling => 2,
         };
         Drive {
             logic,
@@ -487,6 +593,7 @@ pub(super) struct LogicKernel {
     pub(super) delays: Delays,
     pub(super) causal: CausalPaths,
     pub(super) mode: DelayMode,
+    pub(super) pulse: Option<PulseFilter>,
     pub(super) strength: DriveStrengths,
     /// Input inversion at digital terminals, after net resolution.
     pub(super) invert: Vec<bool>,
@@ -498,7 +605,9 @@ pub(super) struct LogicState {
     committed: Drive,
     requested: Drive,
     deadline: Option<Real>,
+    pulse: PulseState,
     clock: Logic,
+    clock_ambiguity: Option<ClockAmbiguity>,
     data: Logic,
     asynchronous: [Logic; 2],
     timing: Option<TimingState>,
@@ -517,7 +626,9 @@ impl CodeModel for LogicKernel {
             committed: self.strength.drive(self.initial),
             requested: self.strength.drive(self.initial),
             deadline: None,
+            pulse: PulseState::default(),
             clock: Logic::Unknown,
+            clock_ambiguity: None,
             data: Logic::Unknown,
             asynchronous: [Logic::Unknown; 2],
             timing: self.timing.as_ref().map(TimingContract::initial_state),
@@ -530,7 +641,7 @@ impl CodeModel for LogicKernel {
     }
 
     fn next_wakeup(&self, state: &Self::State) -> Option<Real> {
-        state.deadline
+        state.pulse.next_wakeup().or(state.deadline)
     }
 
     fn evaluate(
@@ -548,6 +659,7 @@ impl CodeModel for LogicKernel {
             state.committed = self.strength.drive(self.initial);
             state.requested = state.committed;
             state.deadline = None;
+            state.pulse = PulseState::default();
         }
         let transformed;
         let inputs = if self.invert.iter().any(|&value| value) {
@@ -581,11 +693,24 @@ impl CodeModel for LogicKernel {
                 .desired(inputs, state, context.initial, self.strength)?;
         if unknown {
             desired = self.strength.drive(Logic::Unknown);
+            if let Some(phase) = &mut state.clock_ambiguity {
+                phase.force(Logic::Unknown);
+            }
         }
         let transition = |from, to| self.causal.delay(self.delays, causes, from, to);
         let delay = if context.initial {
             state.committed = desired;
             state.requested = desired;
+            0.
+        } else if let Some(filter) = self.pulse {
+            filter.evaluate(
+                context.time,
+                desired,
+                transition,
+                &mut state.requested,
+                &mut state.committed,
+                &mut state.pulse,
+            )?;
             0.
         } else if self.mode == DelayMode::Transport {
             // The requested logical state changes immediately; the queue
@@ -653,6 +778,7 @@ mod tests {
                 delays: Delays::new(1e-6, 1e-6)?,
                 mode: DelayMode::Transport,
                 strength: DriveStrengths::uniform(Strength::STRONG),
+                pulse: None,
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: None,
@@ -732,6 +858,7 @@ mod tests {
                 delays: Delays::ZERO,
                 mode: DelayMode::Inertial,
                 strength: DriveStrengths::uniform(Strength::STRONG),
+                pulse: None,
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: None,
@@ -805,6 +932,7 @@ mod tests {
                         },
                         mode,
                         strength: DriveStrengths::uniform(Strength::STRONG),
+                        pulse: None,
                         invert: Vec::new(),
                         timing: None,
                     },
@@ -866,6 +994,104 @@ mod tests {
     }
 
     #[test]
+    fn native_pulse_policy_preserves_direction_and_correlated_clock_excursions() -> SpiceResult<()>
+    {
+        use Logic::{Falling, One, Rising, Unknown, Zero};
+        let mut network = Network::default();
+        let data = network.add_net();
+        let enable = network.add_net();
+        let pulse = network.add_net();
+        let inverted = network.add_net();
+        let toggle = network.add_net();
+        let d = network.add_source(data)?;
+        let e = network.add_source(enable)?;
+        let kernel = |operation, inputs, initial, delays, pulse| LogicKernel {
+            operation,
+            inputs,
+            initial,
+            delays,
+            pulse,
+            causal: CausalPaths::default(),
+            mode: DelayMode::Transport,
+            strength: DriveStrengths::uniform(Strength::STRONG),
+            invert: Vec::new(),
+            timing: None,
+        };
+        network.add_model(
+            kernel(
+                Operation::Gate(GateKind::Buffer),
+                1,
+                Zero,
+                Delays::new(10., 10.)?,
+                Some(PulseFilter::new(2.)?),
+            ),
+            &[data],
+            &[pulse],
+        )?;
+        network.add_model(
+            kernel(
+                Operation::Gate(GateKind::Inverter),
+                1,
+                One,
+                Delays::ZERO,
+                None,
+            ),
+            &[pulse],
+            &[inverted],
+        )?;
+        network.add_model(
+            kernel(
+                Operation::from_value(20., 2, None)?,
+                2,
+                Zero,
+                Delays::ZERO,
+                None,
+            ),
+            &[enable, pulse],
+            &[toggle],
+        )?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let mut init = engine.trial();
+        init.schedule(d, 0., Drive::strong(Zero))?;
+        init.schedule(e, 0., Drive::strong(One))?;
+        init.schedule(d, 20., Drive::strong(One))?;
+        init.advance_to(21.)?;
+        init.commit()?;
+        // A shorter pulse and the speculative state changes disappear.
+        let mut rejected = engine.trial();
+        rejected.schedule(d, 21.5, Drive::strong(Zero))?;
+        rejected.advance_to(40.)?;
+        assert_eq!(rejected.value(pulse), Some(Drive::strong(Zero)));
+        assert_eq!(rejected.value(toggle), Some(Drive::strong(Zero)));
+        drop(rejected);
+        let mut trial = engine.trial();
+        trial.schedule(d, 22., Drive::strong(Zero))?;
+        trial.advance_to(29.)?;
+        assert_eq!(trial.value(pulse), Some(Drive::strong(Zero)));
+        trial.advance_to(30.)?;
+        assert_eq!(trial.value(pulse), Some(Drive::strong(Rising)));
+        assert_eq!(trial.value(inverted), Some(Drive::strong(Falling)));
+        assert_eq!(trial.value(toggle), Some(Drive::strong(Unknown)));
+        trial.advance_to(32.)?;
+        assert_eq!(trial.value(pulse), Some(Drive::strong(Zero)));
+        assert_eq!(trial.value(toggle), Some(Drive::strong(Zero)));
+        trial.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn directional_gate_dominance_and_convergence_are_distinct_from_unknown() {
+        use Logic::{Falling, One, Rising, Unknown, Zero};
+        let evaluate = |kind: GateKind, a, b| kind.evaluate(&[Drive::strong(a), Drive::strong(b)]);
+        assert_eq!(evaluate(GateKind::And, Zero, Rising), Zero);
+        assert_eq!(evaluate(GateKind::And, Rising, One), Rising);
+        assert_eq!(evaluate(GateKind::And, Rising, Falling), Rising);
+        assert_eq!(evaluate(GateKind::Or, Rising, Falling), Falling);
+        assert_eq!(evaluate(GateKind::And, Rising, Unknown), Unknown);
+        assert_eq!(evaluate(GateKind::Xor, Rising, Falling), Falling);
+    }
+
+    #[test]
     fn timing_warning_is_committed_once_without_poisoning_output() -> SpiceResult<()> {
         use super::super::sequential_timing::TimingSpec;
         let mut network = Network::default();
@@ -887,6 +1113,7 @@ mod tests {
                 delays: Delays::ZERO,
                 mode: DelayMode::Inertial,
                 strength: DriveStrengths::uniform(Strength::STRONG),
+                pulse: None,
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: spec.bind(operation, 2)?,
@@ -942,6 +1169,7 @@ mod tests {
                 delays: Delays::ZERO,
                 mode: DelayMode::Inertial,
                 strength: DriveStrengths::uniform(Strength::STRONG),
+                pulse: None,
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: spec.bind(operation, 2)?,
@@ -999,6 +1227,7 @@ mod tests {
                     delays: Delays::paths([2., 3., 4., 5., 6., 7.])?,
                     mode,
                     strength: DriveStrengths::uniform(Strength::STRONG),
+                    pulse: None,
                     invert: Vec::new(),
                     causal: CausalPaths::default(),
                     timing: None,
@@ -1047,6 +1276,7 @@ mod tests {
                 delays: Delays::new(2., 2.)?,
                 mode: DelayMode::Inertial,
                 strength: DriveStrengths::uniform(Strength::STRONG),
+                pulse: None,
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: None,
@@ -1097,6 +1327,7 @@ mod tests {
                 delays: Delays::new(2., 2.)?,
                 mode: DelayMode::Inertial,
                 strength: DriveStrengths::uniform(Strength::STRONG),
+                pulse: None,
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: None,

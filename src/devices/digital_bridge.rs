@@ -47,7 +47,7 @@ impl Bit {
             match drive.logic {
                 Logic::Zero => Self::Zero,
                 Logic::One => Self::One,
-                Logic::Unknown => Self::X,
+                Logic::Unknown | Logic::Rising | Logic::Falling => Self::X,
             }
         }
     }

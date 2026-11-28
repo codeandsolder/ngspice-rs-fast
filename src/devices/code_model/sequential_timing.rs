@@ -176,12 +176,26 @@ fn check(
 }
 
 fn may_trigger(edge: Edge, before: Logic, after: Logic) -> bool {
-    before != after
-        && match edge {
+    if before == after {
+        return false;
+    }
+    // A phase start is a possible leading edge. Returning to its
+    // starting level can also be the trailing edge of a possible pulse.
+    // The opposite settled endpoint completes the same leading edge.
+    match (before, after) {
+        (_, Logic::Rising) | (Logic::Falling, Logic::One) => {
+            matches!(edge, Edge::Rising | Edge::Both)
+        }
+        (_, Logic::Falling) | (Logic::Rising, Logic::Zero) => {
+            matches!(edge, Edge::Falling | Edge::Both)
+        }
+        (Logic::Rising, Logic::One) | (Logic::Falling, Logic::Zero) => false,
+        _ => match edge {
             Edge::Rising => before != Logic::One && after != Logic::Zero,
             Edge::Falling => before != Logic::Zero && after != Logic::One,
             Edge::Both => true,
-        }
+        },
+    }
 }
 
 impl TimingContract {
@@ -260,7 +274,7 @@ impl TimingContract {
             let minimum = match before {
                 Logic::Zero => self.clock_min[0],
                 Logic::One => self.clock_min[1],
-                Logic::Unknown => 0.,
+                Logic::Unknown | Logic::Rising | Logic::Falling => 0.,
             };
             check(
                 &mut violations,

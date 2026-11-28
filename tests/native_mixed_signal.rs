@@ -271,6 +271,8 @@ fn scoped_arrays_and_typed_port_validation() -> SpiceResult<()> {
         "inverted=[2]",
         "rx_ic=[2]",
         "inertial=2",
+        "pulse_reject=-1n",
+        "inertial=0 pulse_reject=1n",
         "unknown=1",
     ] {
         let result = circuit(&format!(
@@ -772,5 +774,41 @@ fn digital_fanout_loading_is_occurrence_based_and_respects_zero_paths() -> Spice
         close(voltage, expected);
         assert!((time - at).abs() <= 1e-9, "{time:e} != {at:e}");
     }
+    Ok(())
+}
+
+#[test]
+fn short_pulse_direction_reaches_explicit_physical_interface() -> SpiceResult<()> {
+    for (operation, base, phase) in [(25, 0., 2.5), (26, 5. * 0.01 / 0.011, 4.)] {
+        let mut c = circuit(&format!(
+            "vhi hi 0 5\nvd data 0 PWL(0 0 1u 0 1002n 4 1008n 4 1010n 0 2u 0)\n             a1 %v[data] q pulse\n.model pulse preprocess_logic_event(operation={operation} delay=20n pulse_reject=5n)\n             a2 q %gd(out hi) drive\n.model drive preprocess_logic_conductance(conductance=[0 .01 .003 0 0 0 0 .001 .004 0 0])\n             rload out 0 1k"
+        ))?;
+        let plot = run(
+            &mut c,
+            AnalysisKind::Transient,
+            &["0.5n", "2u", "0", "0.5n"],
+        )?;
+        let mut seen = 0;
+        for index in 0..plot.point_count() {
+            let time = plot.value("time", index).unwrap().re;
+            if (1.022e-6..1.0285e-6).contains(&time) {
+                close(output(&plot, index), phase);
+                seen += 1;
+            } else if !(1.021e-6..1.0295e-6).contains(&time) {
+                close(output(&plot, index), base);
+            }
+        }
+        assert!(seen >= 10, "missing directional pulse samples");
+    }
+    let mut c = circuit(
+        "vhi hi 0 5\nvd data 0 PWL(0 0 1u 0 1002n 4 1008n 4 1010n 0 2u 0)\n         a1 %v[data] q pulse\n.model pulse preprocess_logic_event(operation=25 delay=20n pulse_reject=5n)\n         a2 q %gd(out hi) drive\n.model drive preprocess_logic_conductance(conductance=[0 .01 .003 0 0 0 0])\n         rload out 0 1k",
+    )?;
+    let result = run(&mut c, AnalysisKind::Transient, &["1n", "2u", "0", "1n"]);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("R/F conductance entries")
+    );
     Ok(())
 }

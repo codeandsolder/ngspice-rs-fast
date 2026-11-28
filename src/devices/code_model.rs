@@ -3,6 +3,7 @@
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
+mod pulse;
 pub mod rational;
 mod sequential_timing;
 pub mod source;
@@ -10,7 +11,7 @@ mod source_logic;
 mod timed_switch;
 mod timed_switch_device;
 
-/// Three-valued digital logic.
+/// Stable digital logic and directional timing ambiguity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Logic {
     /// Logical zero.
@@ -20,16 +21,64 @@ pub enum Logic {
     /// Unknown or conflicting state.
     #[default]
     Unknown,
+    /// Possible rising transition or positive glitch.
+    Rising,
+    /// Possible falling transition or negative glitch.
+    Falling,
 }
 
 impl Logic {
-    /// Three-valued inversion.
+    /// Inversion preserves transition direction.
     #[must_use = "the returned logic value is inverted without changing the original"]
     pub const fn invert(self) -> Self {
         match self {
             Self::Zero => Self::One,
             Self::One => Self::Zero,
             Self::Unknown => Self::Unknown,
+            Self::Rising => Self::Falling,
+            Self::Falling => Self::Rising,
+        }
+    }
+
+    /// Whether a value is a definite binary level.
+    #[must_use = "binary certainty is required for a definite capture"]
+    pub const fn is_binary(self) -> bool {
+        matches!(self, Self::Zero | Self::One)
+    }
+
+    /// Project a timing-ambiguous phase to the three-valued logical
+    /// information available at an arbitrary instant in the phase.
+    #[must_use = "the projection retains all definite logic information"]
+    pub const fn instantaneous(self) -> Self {
+        match self {
+            Self::Rising | Self::Falling => Self::Unknown,
+            _ => self,
+        }
+    }
+
+    const fn phase_start(self) -> Self {
+        match self {
+            Self::Rising => Self::Zero,
+            Self::Falling => Self::One,
+            _ => self,
+        }
+    }
+
+    const fn phase_end(self) -> Self {
+        match self {
+            Self::Rising => Self::One,
+            Self::Falling => Self::Zero,
+            _ => self,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Zero => 0,
+            Self::One => 1,
+            Self::Unknown => 2,
+            Self::Rising => 3,
+            Self::Falling => 4,
         }
     }
 }
@@ -100,16 +149,12 @@ impl Drive {
         drives: impl IntoIterator<Item = Self>,
         margin: std::num::NonZeroU8,
     ) -> Self {
-        let mut ranks = [Strength::HIGH_IMPEDANCE; 3];
+        let mut ranks = [Strength::HIGH_IMPEDANCE; 5];
         for drive in drives {
-            let index = match drive.logic {
-                Logic::Zero => 0,
-                Logic::One => 1,
-                Logic::Unknown => 2,
-            };
+            let index = drive.logic.index();
             ranks[index] = ranks[index].max(drive.strength);
         }
-        let strength = ranks[0].max(ranks[1]).max(ranks[2]);
+        let strength = ranks.into_iter().max().unwrap_or_default();
         if strength == Strength::HIGH_IMPEDANCE {
             return Self::default();
         }
@@ -117,8 +162,10 @@ impl Drive {
             rank != Strength::HIGH_IMPEDANCE && strength.rank() - rank.rank() < margin.get()
         };
         let logic = match ranks.map(competes) {
-            [true, false, false] => Logic::Zero,
-            [false, true, false] => Logic::One,
+            [true, false, false, false, false] => Logic::Zero,
+            [false, true, false, false, false] => Logic::One,
+            [false, false, false, true, false] => Logic::Rising,
+            [false, false, false, false, true] => Logic::Falling,
             _ => Logic::Unknown,
         };
         Self { logic, strength }
@@ -233,23 +280,27 @@ impl Delays {
                     return match previous.logic {
                         Logic::Zero => paths.low_to_z,
                         Logic::One => paths.high_to_z,
-                        Logic::Unknown => paths.low_to_z.max(paths.high_to_z),
+                        Logic::Unknown | Logic::Rising | Logic::Falling => {
+                            paths.low_to_z.max(paths.high_to_z)
+                        }
                     };
                 }
                 (true, false) => {
                     return match next.logic {
                         Logic::Zero => paths.z_to_low,
                         Logic::One => paths.z_to_high,
-                        Logic::Unknown => paths.z_to_low.max(paths.z_to_high),
+                        Logic::Unknown | Logic::Rising | Logic::Falling => {
+                            paths.z_to_low.max(paths.z_to_high)
+                        }
                     };
                 }
                 (false, false) => {}
             }
         }
         match next.logic {
-            Logic::One => self.rise,
+            Logic::One | Logic::Rising => self.rise,
             Logic::Unknown if previous.logic == Logic::Zero => self.rise,
-            Logic::Zero | Logic::Unknown => self.fall,
+            Logic::Zero | Logic::Falling | Logic::Unknown => self.fall,
         }
     }
 }
@@ -422,7 +473,28 @@ pub enum GateKind {
 
 impl GateKind {
     fn evaluate(self, inputs: &[Drive]) -> Logic {
-        let has = |value| inputs.iter().any(|drive| drive.logic == value);
+        let value = self.evaluate_levels(inputs, Logic::instantaneous);
+        if value.is_binary() {
+            return value;
+        }
+        let start = self.evaluate_levels(inputs, Logic::phase_start);
+        let end = self.evaluate_levels(inputs, Logic::phase_end);
+        // Direction describes departure from the known pre-ambiguity
+        // level. A pure convergence hazard can return to that same
+        // level. Genuine X influence must not be relabelled as R/F.
+        if start.is_binary() && end.is_binary() {
+            if start == Logic::Zero {
+                Logic::Rising
+            } else {
+                Logic::Falling
+            }
+        } else {
+            Logic::Unknown
+        }
+    }
+
+    fn evaluate_levels(self, inputs: &[Drive], level: impl Fn(Logic) -> Logic) -> Logic {
+        let has = |value| inputs.iter().any(|drive| level(drive.logic) == value);
         let and = || {
             if has(Logic::Zero) {
                 Logic::Zero
@@ -444,7 +516,13 @@ impl GateKind {
         let xor = || {
             if has(Logic::Unknown) {
                 Logic::Unknown
-            } else if inputs.iter().filter(|d| d.logic == Logic::One).count() % 2 == 1 {
+            } else if inputs
+                .iter()
+                .filter(|d| level(d.logic) == Logic::One)
+                .count()
+                % 2
+                == 1
+            {
                 Logic::One
             } else {
                 Logic::Zero
@@ -457,8 +535,8 @@ impl GateKind {
             Self::Nand => and().invert(),
             Self::Nor => or().invert(),
             Self::Xnor => xor().invert(),
-            Self::Buffer => inputs[0].logic,
-            Self::Inverter => inputs[0].logic.invert(),
+            Self::Buffer => level(inputs[0].logic),
+            Self::Inverter => level(inputs[0].logic).invert(),
         }
     }
 }
@@ -531,13 +609,25 @@ pub struct DFlipFlop {
     pub mode: DelayMode,
 }
 
+/// Transactional storage and possible clock excursion for a D flip-flop.
+#[derive(Clone, Debug)]
+pub struct DFlipFlopState {
+    clock: Logic,
+    q: Logic,
+    ambiguity: Option<source_logic::ClockAmbiguity>,
+}
+
 impl CodeModel for DFlipFlop {
-    type State = [Logic; 2];
+    type State = DFlipFlopState;
     fn schema(&self) -> ModelSchema {
         ModelSchema::digital(2, 2)
     }
     fn initial_state(&self) -> Self::State {
-        [Logic::Unknown, self.initial]
+        DFlipFlopState {
+            clock: Logic::Unknown,
+            q: self.initial.instantaneous(),
+            ambiguity: None,
+        }
     }
     fn evaluate(
         &self,
@@ -548,14 +638,23 @@ impl CodeModel for DFlipFlop {
         let [data, clock] = inputs else {
             return Err(SpiceError::circuit("flip-flop input dimension mismatch"));
         };
-        let [previous_clock, q] = state;
         if context.initial {
-            *q = self.initial;
-        } else if *previous_clock != Logic::One && clock.logic == Logic::One {
-            *q = data.logic;
+            state.q = self.initial.instantaneous();
+            state.ambiguity = None;
+        } else if state.ambiguity.is_some() || matches!(clock.logic, Logic::Rising | Logic::Falling)
+        {
+            state.q = source_logic::Edge::Rising.timed_capture(
+                state.clock,
+                clock.logic,
+                state.q,
+                &mut state.ambiguity,
+                |_| Ok(data.logic.instantaneous()),
+            )?;
+        } else if state.clock != Logic::One && clock.logic == Logic::One {
+            state.q = data.logic.instantaneous();
         }
-        *previous_clock = clock.logic;
-        Ok([*q, q.invert()]
+        state.clock = clock.logic;
+        Ok([state.q, state.q.invert()]
             .map(|logic| Output {
                 drive: Drive::strong(logic),
                 delays: self.delays,
@@ -618,7 +717,7 @@ impl Adc {
     /// # Errors
     /// Invalid threshold order or nonbinary initial state.
     pub fn qualified(low: Real, high: Real, initial: Logic, inverted: bool) -> SpiceResult<Self> {
-        if !low.is_finite() || !high.is_finite() || low > high || initial == Logic::Unknown {
+        if !low.is_finite() || !high.is_finite() || low > high || !initial.is_binary() {
             return Err(SpiceError::circuit("invalid qualified receiver"));
         }
         Ok(Self {
@@ -651,7 +750,7 @@ impl Adc {
             };
             return Ok(decisive.map_or_else(
                 || {
-                    if initial || previous == Logic::Unknown {
+                    if initial || !previous.is_binary() {
                         qualification.initial
                     } else {
                         previous
@@ -833,7 +932,7 @@ impl Dac {
         let value = match logic {
             Logic::Zero => self.low,
             Logic::One => self.high,
-            Logic::Unknown => self.unknown,
+            Logic::Unknown | Logic::Rising | Logic::Falling => self.unknown,
         };
         if !value.is_finite() {
             return Err(SpiceError::circuit("nonfinite DAC output"));
@@ -938,38 +1037,57 @@ impl DacConfig {
 }
 
 /// A passive output branch selected by the full resolved digital drive.
-/// Entry order: strong L/H/X, resistive L/H/X, high impedance. Explicit
-/// zero conductance is an open circuit, not a simulator-imposed leakage.
+/// The binary table contains strong L/H/X, resistive L/H/X, and Z;
+/// directional ambiguity requires explicit strong/resistive R/F entries.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ConductanceConfig {
     values: [Real; 7],
+    phases: Option<[Real; 4]>,
     inverted: bool,
 }
 
 impl ConductanceConfig {
-    pub(crate) fn new(values: [Real; 7], inverted: bool) -> SpiceResult<Self> {
+    pub(crate) fn new(values: &[Real], inverted: bool) -> SpiceResult<Self> {
         if values.iter().any(|value| !value.is_finite() || *value < 0.) {
             return Err(SpiceError::circuit("invalid digital output conductance"));
         }
-        Ok(Self { values, inverted })
+        let (values, phases) = match values {
+            [a, b, c, d, e, f, z] => ([*a, *b, *c, *d, *e, *f, *z], None),
+            [a, b, c, d, e, f, z, sr, sf, rr, rf] => {
+                ([*a, *b, *c, *d, *e, *f, *z], Some([*sr, *sf, *rr, *rf]))
+            }
+            _ => {
+                return Err(SpiceError::circuit(
+                    "logic conductance table requires seven or eleven entries",
+                ));
+            }
+        };
+        Ok(Self {
+            values,
+            phases,
+            inverted,
+        })
     }
 
-    fn target(self, drive: Drive) -> Real {
+    fn target(self, drive: Drive) -> SpiceResult<Real> {
         let logic = if self.inverted {
             drive.logic.invert()
         } else {
             drive.logic
         };
-        let index = match logic {
-            Logic::Zero => 0,
-            Logic::One => 1,
-            Logic::Unknown => 2,
-        };
-        self.values[match drive.strength {
-            Strength::STRONG => index,
-            Strength::HIGH_IMPEDANCE => 6,
-            _ => 3 + index,
-        }]
+        if drive.strength == Strength::HIGH_IMPEDANCE {
+            return Ok(self.values[6]);
+        }
+        let strong = drive.strength == Strength::STRONG;
+        if matches!(logic, Logic::Rising | Logic::Falling) {
+            let phases = self.phases.ok_or_else(|| {
+                SpiceError::circuit(
+                    "directional timing ambiguity requires explicit R/F conductance entries",
+                )
+            })?;
+            return Ok(phases[usize::from(!strong) * 2 + usize::from(logic == Logic::Falling)]);
+        }
+        Ok(self.values[usize::from(!strong) * 3 + logic.index()])
     }
 }
 
@@ -989,7 +1107,7 @@ impl AnalogOutputConfig {
     pub(crate) fn target(self, drive: Drive) -> SpiceResult<Real> {
         match self {
             Self::Voltage(config) => config.target(drive.logic),
-            Self::Conductance(config) => Ok(config.target(drive)),
+            Self::Conductance(config) => config.target(drive),
         }
     }
 
@@ -1002,7 +1120,7 @@ impl AnalogOutputConfig {
         match self {
             Self::Voltage(config) => config.retarget(ramp, time, drive.logic),
             Self::Conductance(config) => {
-                let target = config.target(drive);
+                let target = config.target(drive)?;
                 Ok(OutputRamp {
                     start: time,
                     end: time,

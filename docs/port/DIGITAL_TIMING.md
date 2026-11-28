@@ -142,3 +142,35 @@ The source-bound digital runtime still uses deterministic delays.
 In particular, uncertain rising/falling transitions must not be encoded
 as an ordinary unknown logic drive. Interval propagation, sensitization,
 hazards, and storage qualification require their own event semantics.
+
+## Pulse qualification and directional ambiguity
+
+The deterministic event kernel distinguishes stable L/H, X, and the two
+directional uncertainty phases R/F. Gates propagate the direction when the
+known pre-phase and post-phase Boolean results permit it; a controlling
+stable input still suppresses ambiguity. Clocked storage retains possible
+leading/trailing capture alternatives, rather than treating an R/F marker
+as a definite clock edge. A pulse that may have toggled a dual-edge T
+flip-flop twice can restore its original known value when it ends.
+
+An optional `pulse_reject` time selects a transactional pulse policy
+instead of the explicit `inertial` selector. If a desired output changes
+again before its propagation deadline, an excursion shorter than the
+rejection threshold is suppressed. A nonzero excursion at or above the
+threshold emits R or F at its original propagation deadline when its
+connected binary endpoints establish a direction, otherwise X. A
+transition persisting through the deadline is definite (including exact
+deadline equality). A later earlier-due transition supersedes pending
+deliveries under the usual queue ordering law. No event time is moved
+backward and trial rollback includes every pending pulse. This implements
+the deterministic short-pulse distinction illustrated by the PSpice user
+guide, chapter 7, but does not claim complete worst-case timing semantics
+for arbitrary correlated overlapping windows.
+
+Ideal voltage observations and the four-state HDL interface explicitly
+project R/F to unknown at their representation boundary. A physical
+conductance bridge does not silently do so: extend the existing
+seven-entry conductance table with four additional entries (strong R,
+strong F, resistive R, resistive F) to bind directional states. Missing
+R/F entries diagnose a directional phase at runtime. Inverted terminals
+exchange R and F as well as L and H.

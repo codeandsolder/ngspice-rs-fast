@@ -158,7 +158,7 @@ impl SourceModel {
                 "operation" | "ic" | "strength" | "override_margin" | "timing_violation" => {
                     Some(Integer)
                 }
-                "delay" | "low" | "high" | "output_capacitance" => Some(Real),
+                "delay" | "low" | "high" | "output_capacitance" | "pulse_reject" => Some(Real),
                 "input_capacitance" | "load_resistance" | "delay_paths" | "delay_gate"
                 | "delay_preset" | "delay_clear" | "timing_setup" | "timing_hold"
                 | "timing_clock_min" | "timing_async_min" | "timing_recovery" => Some(RealVector),
@@ -302,6 +302,7 @@ fn validate_value(
     Ok(())
 }
 
+use super::pulse::PulseFilter;
 use super::sequential_timing::TimingSpec;
 use super::source_logic::{AsyncPolicy, CausalPaths, DriveStrengths, LogicKernel, Operation};
 use super::{
@@ -322,6 +323,7 @@ struct LogicMaterial {
     delays: Delays,
     causal: CausalPaths,
     inertial: bool,
+    pulse: Option<PulseFilter>,
     initial: Logic,
     strength: DriveStrengths,
     margin: Option<std::num::NonZeroU8>,
@@ -343,6 +345,7 @@ impl Default for LogicMaterial {
             delays: Delays::ZERO,
             causal: CausalPaths::default(),
             inertial: true,
+            pulse: None,
             initial: Logic::Zero,
             strength: DriveStrengths::uniform(Strength::STRONG),
             margin: None,
@@ -406,6 +409,7 @@ impl LogicMaterial {
         let mut material = Self::default();
         let mut timing_given = false;
         let mut strength_given = false;
+        let mut mode_given = false;
         for parameter in &card.parameters {
             match parameter.name.as_str() {
                 "operation" => material.operation = numeric_scalar(parameter)?,
@@ -447,7 +451,19 @@ impl LogicMaterial {
                     };
                     *target = Some(Delays::new(rise, fall)?);
                 }
-                "inertial" => material.inertial = binary(numeric_scalar(parameter)?)?,
+                "inertial" | "pulse_reject" => {
+                    if mode_given {
+                        return Err(SpiceError::circuit(
+                            "specify exactly one logic pulse policy",
+                        ));
+                    }
+                    mode_given = true;
+                    if parameter.name == "inertial" {
+                        material.inertial = binary(numeric_scalar(parameter)?)?;
+                    } else {
+                        material.pulse = Some(PulseFilter::new(numeric_scalar(parameter)?)?);
+                    }
+                }
                 "ic" => material.initial = three_logic(numeric_scalar(parameter)?)?,
                 "strength" | "strength_paths" => {
                     if strength_given {
@@ -615,6 +631,7 @@ impl LogicMaterial {
             initial: self.initial,
             delays: self.delays,
             causal: self.causal,
+            pulse: self.pulse,
             mode: if self.inertial {
                 DelayMode::Inertial
             } else {
@@ -708,17 +725,15 @@ fn voltage_material(card: &ModelCard) -> SpiceResult<[Real; 2]> {
     Ok(rails)
 }
 
-fn conductance_material(card: &ModelCard) -> SpiceResult<[Real; 7]> {
+fn conductance_material(card: &ModelCard) -> SpiceResult<Vec<Real>> {
     SourceModel::LogicConductance.validate_parameters(card)?;
     let [parameter] = card.parameters.as_slice() else {
         return Err(SpiceError::circuit(
-            "logic conductance requires one seven-entry conductance table",
+            "logic conductance requires one conductance table",
         ));
     };
-    let values = numeric_vector(parameter)?
-        .try_into()
-        .map_err(|_| SpiceError::circuit("logic conductance table requires seven entries"))?;
-    ConductanceConfig::new(values, false)?;
+    let values = numeric_vector(parameter)?;
+    ConductanceConfig::new(&values, false)?;
     Ok(values)
 }
 
@@ -774,7 +789,7 @@ pub(in crate::devices) fn instantiate(
                 let values = model.prepare(PreparationKey::Inputs, || {
                     conductance_material(model.card())
                 })?;
-                AnalogOutputConfig::Conductance(ConductanceConfig::new(*values, input.inverted)?)
+                AnalogOutputConfig::Conductance(ConductanceConfig::new(&values, input.inverted)?)
             };
             Ok(Box::new(AnalogOutputDevice {
                 name: instance.name.clone(),
