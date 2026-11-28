@@ -22,6 +22,7 @@
 )] // C's if nesting.
 use super::fields::{Instance, Model, SizeParam};
 use super::host::{LoadCkt, mode, state};
+use crate::maths::taylor::arithmetic::Constitutive;
 use crate::primitives::SpiceResult;
 
 mod bias;
@@ -63,14 +64,19 @@ const fn fabs(x: f64) -> f64 {
     x.abs()
 }
 /// `b4ld.c`'s `DEXP(A, B, C)` macro: returns `(B, C)`.
-fn DEXP(A: f64) -> (f64, f64) {
-    if A > EXP_THRESHOLD {
-        (MAX_EXP * (1.0 + (A) - EXP_THRESHOLD), MAX_EXP)
-    } else if A < -EXP_THRESHOLD {
-        (MIN_EXP, 0.0)
+fn DEXP<S: Constitutive>(argument: S) -> (S, S) {
+    use std::cmp::Ordering;
+    if argument.compare(EXP_THRESHOLD) == Some(Ordering::Greater) {
+        let slope = argument.constant(MAX_EXP);
+        (
+            argument.offset(1.).offset(-EXP_THRESHOLD).scale(MAX_EXP),
+            slope,
+        )
+    } else if argument.compare(-EXP_THRESHOLD) == Some(Ordering::Less) {
+        (argument.constant(MIN_EXP), argument.constant(0.))
     } else {
-        let B = exp(A);
-        (B, B)
+        let exponential = argument.exp();
+        (exponential.clone(), exponential)
     }
 }
 
@@ -204,7 +210,7 @@ pub(super) fn load(
         source: bias.vbs_jct,
         drain: bias.vbd_jct,
     };
-    junction::current(model, here, pParam, ckt, junction_bias);
+    junction::current(model, here, pParam, ckt, junction_bias)?;
     let electrostatics = channel::electrostatics(model, here, pParam, ckt, &bias);
     let transport = channel::transport(model, here, pParam, &bias, &electrostatics);
     let cdrain = leakage::evaluate(model, here, pParam, &bias, &electrostatics, &transport);

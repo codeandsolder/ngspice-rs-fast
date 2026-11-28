@@ -1,9 +1,12 @@
 //! Junction diode conduction/reverse tunneling and depletion charge stages.
 //! Ownership: BSIM4 load inventory fields cbs/cbd/gbs/gbd and capbs/capbd;
 //! charge also writes QBS/QBD (no integration here).
+use std::cmp::Ordering;
+
 use super::{DEXP, EXP_THRESHOLD, Instance, LoadCkt, MIN_EXP, Model, SizeParam, state};
 use crate::devices::bsim_physics::{JunctionCapacitance, depletion};
 use crate::devices::nonlinear::exponential_junction_at_argument;
+use crate::maths::taylor::arithmetic::Constitutive;
 use crate::primitives::SpiceResult;
 
 /// Body-source and body-drain voltage, selecting bulk-resistance internal
@@ -35,156 +38,230 @@ impl JunctionDiode {
     /// The change of the reverse breakdown exponential from equilibrium.
     /// In the same unclipped branch, factor the zero-bias exponential
     /// and use expm1; never cancel across an exponential clamp.
-    #[expect(
-        clippy::suboptimal_flops,
-        reason = "subtract the same rounded breakdown product prepared at zero bias, so the clipped branch remains exactly zero at equilibrium"
-    )]
-    fn breakdown_difference(
+    fn breakdown_difference<S: Constitutive>(
         self,
-        argument: f64,
-        reverse_argument: f64,
-        reverse_exp: f64,
+        argument: &S,
+        reverse_argument: &S,
+        reverse_exp: &S,
         clipped: bool,
-    ) -> f64 {
-        if argument.abs() < 0.5
+    ) -> S {
+        if argument.primal().abs() < 0.5
             && self.thermal > 0.
             && self.thermal.is_finite()
             && self.breakdown_coefficient.is_finite()
             && self.breakdown_voltage / self.thermal <= EXP_THRESHOLD
             && !clipped
-            && reverse_argument.is_finite()
+            && reverse_argument.primal().is_finite()
             && self.breakdown_at_zero.is_finite()
         {
-            -self.breakdown_at_zero * (-argument).exp_m1()
+            argument
+                .clone()
+                .scale(-1.)
+                .exp_m1()
+                .scale(-self.breakdown_at_zero)
         } else {
-            self.breakdown_at_zero - self.breakdown_coefficient * reverse_exp
+            argument
+                .constant(self.breakdown_at_zero)
+                .add(&reverse_exp.clone().scale(-self.breakdown_coefficient))
         }
     }
 
     /// C diode modes select distinct forward and reverse continuations.
-    /// Return current/conductance without merging the leakage or gmin laws.
-    fn evaluate(self, selector: i32, voltage: f64, gmin: f64) -> Option<(f64, f64)> {
+    /// Return the physical current and its partial, including gmin.
+    fn evaluate<S: Constitutive>(
+        self,
+        selector: i32,
+        voltage: S,
+        gmin: f64,
+    ) -> SpiceResult<Option<(S, S)>> {
         if self.saturation <= 0. {
-            return Some((gmin * voltage, gmin));
+            return Ok(Some((voltage.clone().scale(gmin), voltage.constant(gmin))));
         }
-        let argument = voltage / self.thermal;
+        let argument = voltage.clone().divide(&voltage.constant(self.thermal))?;
         let (current, slope) = match selector {
-            0 => {
-                let reverse_argument = (self.breakdown_voltage + voltage) / self.thermal;
-                let reverse = (-reverse_argument).exp();
-                let (forward, forward_slope) =
-                    exponential_junction_at_argument(argument, self.thermal, self.saturation);
-                let difference =
-                    self.breakdown_difference(argument, reverse_argument, reverse, false);
-                (
-                    self.saturation.mul_add(difference, forward),
-                    self.saturation.mul_add(
-                        self.breakdown_coefficient * reverse / self.thermal,
-                        forward_slope,
-                    ),
-                )
-            }
-            1 => {
-                if argument < -EXP_THRESHOLD {
-                    (self.saturation * (MIN_EXP - 1.), 0.)
-                } else if voltage <= self.forward_voltage {
-                    exponential_junction_at_argument(argument, self.thermal, self.saturation)
-                } else {
-                    let slope = self.forward_current / self.thermal;
-                    let edge_argument = self.forward_voltage / self.thermal;
-                    let edge = if edge_argument.abs() < 0.5 {
-                        self.saturation * edge_argument.exp_m1()
-                    } else {
-                        self.forward_current - self.saturation
-                    };
-                    (slope.mul_add(voltage - self.forward_voltage, edge), slope)
-                }
-            }
-            2 => {
-                if voltage < self.reverse_voltage {
-                    let (difference, derivative) = limited_forward(argument, self.thermal);
-                    let edge = self
-                        .reverse_slope
-                        .mul_add(voltage - self.reverse_voltage, self.reverse_current);
-                    (
-                        difference * edge,
-                        derivative.mul_add(edge, difference * self.reverse_slope),
-                    )
-                } else if voltage <= self.forward_voltage {
-                    let (difference, derivative) = limited_forward(argument, self.thermal);
-                    let reverse_argument = (self.breakdown_voltage + voltage) / self.thermal;
-                    let clipped = reverse_argument > EXP_THRESHOLD;
-                    let (reverse, reverse_slope) = if clipped {
-                        (MIN_EXP, 0.)
-                    } else {
-                        let exponential = (-reverse_argument).exp();
-                        (exponential, exponential / self.thermal)
-                    };
-                    let reverse_difference =
-                        self.breakdown_difference(argument, reverse_argument, reverse, clipped);
-                    (
-                        self.saturation * (difference + reverse_difference),
-                        self.saturation
-                            * self
-                                .breakdown_coefficient
-                                .mul_add(reverse_slope, derivative),
-                    )
-                } else {
-                    (
-                        self.forward_slope
-                            .mul_add(voltage - self.forward_voltage, self.forward_current),
-                        self.forward_slope,
-                    )
-                }
-            }
-            _ => return None,
+            0 => self.unclipped(&voltage, &argument)?,
+            1 => self.forward_limited(&voltage, &argument),
+            2 => self.both_limited(&voltage, &argument)?,
+            _ => return Ok(None),
         };
-        Some((gmin.mul_add(voltage, current), slope + gmin))
+        Ok(Some((
+            voltage.constant(gmin).mul_add(&voltage, &current),
+            slope.offset(gmin),
+        )))
+    }
+
+    fn unclipped<S: Constitutive>(self, voltage: &S, argument: &S) -> SpiceResult<(S, S)> {
+        let reverse_argument = voltage
+            .clone()
+            .offset(self.breakdown_voltage)
+            .divide(&voltage.constant(self.thermal))?;
+        let reverse = reverse_argument.clone().scale(-1.).exp();
+        let (forward, forward_slope) = exponential(argument, self.thermal, self.saturation);
+        let difference = self.breakdown_difference(argument, &reverse_argument, &reverse, false);
+        let reverse_slope = reverse
+            .scale(self.breakdown_coefficient)
+            .divide(&voltage.constant(self.thermal))?;
+        Ok((
+            voltage
+                .constant(self.saturation)
+                .mul_add(&difference, &forward),
+            voltage
+                .constant(self.saturation)
+                .mul_add(&reverse_slope, &forward_slope),
+        ))
+    }
+
+    fn forward_limited<S: Constitutive>(self, voltage: &S, argument: &S) -> (S, S) {
+        if argument.compare(-EXP_THRESHOLD) == Some(Ordering::Less) {
+            (
+                voltage.constant(self.saturation * (MIN_EXP - 1.)),
+                voltage.constant(0.),
+            )
+        } else if voltage
+            .compare(self.forward_voltage)
+            .is_some_and(Ordering::is_le)
+        {
+            exponential(argument, self.thermal, self.saturation)
+        } else {
+            let slope = self.forward_current / self.thermal;
+            let edge_argument = self.forward_voltage / self.thermal;
+            let edge = if edge_argument.abs() < 0.5 {
+                self.saturation * edge_argument.exp_m1()
+            } else {
+                self.forward_current - self.saturation
+            };
+            (
+                voltage.constant(slope).mul_add(
+                    &voltage.clone().offset(-self.forward_voltage),
+                    &voltage.constant(edge),
+                ),
+                voltage.constant(slope),
+            )
+        }
+    }
+
+    fn both_limited<S: Constitutive>(self, voltage: &S, argument: &S) -> SpiceResult<(S, S)> {
+        if voltage.compare(self.reverse_voltage) == Some(Ordering::Less) {
+            let (difference, derivative) = limited_forward(argument, self.thermal)?;
+            let edge = voltage.constant(self.reverse_slope).mul_add(
+                &voltage.clone().offset(-self.reverse_voltage),
+                &voltage.constant(self.reverse_current),
+            );
+            let slope = derivative.mul_add(&edge, &difference.clone().scale(self.reverse_slope));
+            Ok((difference.multiply(&edge), slope))
+        } else if voltage
+            .compare(self.forward_voltage)
+            .is_some_and(Ordering::is_le)
+        {
+            let (difference, derivative) = limited_forward(argument, self.thermal)?;
+            let reverse_argument = voltage
+                .clone()
+                .offset(self.breakdown_voltage)
+                .divide(&voltage.constant(self.thermal))?;
+            let clipped = reverse_argument.compare(EXP_THRESHOLD) == Some(Ordering::Greater);
+            let (reverse, reverse_slope) = if clipped {
+                (voltage.constant(MIN_EXP), voltage.constant(0.))
+            } else {
+                let exponential = reverse_argument.clone().scale(-1.).exp();
+                let slope = exponential
+                    .clone()
+                    .divide(&voltage.constant(self.thermal))?;
+                (exponential, slope)
+            };
+            let reverse_difference =
+                self.breakdown_difference(argument, &reverse_argument, &reverse, clipped);
+            Ok((
+                difference.add(&reverse_difference).scale(self.saturation),
+                voltage
+                    .constant(self.breakdown_coefficient)
+                    .mul_add(&reverse_slope, &derivative)
+                    .scale(self.saturation),
+            ))
+        } else {
+            Ok((
+                voltage.constant(self.forward_slope).mul_add(
+                    &voltage.clone().offset(-self.forward_voltage),
+                    &voltage.constant(self.forward_current),
+                ),
+                voltage.constant(self.forward_slope),
+            ))
+        }
     }
 }
 
-fn limited_forward(argument: f64, thermal: f64) -> (f64, f64) {
-    if argument < -EXP_THRESHOLD {
-        (MIN_EXP - 1., 0.)
-    } else if argument.abs() < 0.5 {
-        let difference = argument.exp_m1();
-        (difference, (1. + difference) / thermal)
+/// The same cancellation- and overflow-safe exponential law used by the
+/// scalar junctions, lifted from its scaled conductance rather than exp(v/Vt).
+fn exponential<S: Constitutive>(argument: &S, thermal: f64, saturation: f64) -> (S, S) {
+    let (value, slope) = exponential_junction_at_argument(argument.primal(), thermal, saturation);
+    let slope = argument.clone().exp_with_primal(slope);
+    let current = argument
+        .clone()
+        .compose_derivative(value, &slope.clone().scale(thermal));
+    (current, slope)
+}
+
+fn limited_forward<S: Constitutive>(argument: &S, thermal: f64) -> SpiceResult<(S, S)> {
+    if argument.compare(-EXP_THRESHOLD) == Some(Ordering::Less) {
+        Ok((argument.constant(MIN_EXP - 1.), argument.constant(0.)))
+    } else if argument.primal().abs() < 0.5 {
+        let difference = argument.clone().exp_m1();
+        let slope = difference
+            .clone()
+            .offset(1.)
+            .divide(&argument.constant(thermal))?;
+        Ok((difference, slope))
     } else {
-        let exponential = argument.exp();
-        (exponential - 1., exponential / thermal)
+        let exponential = argument.clone().exp();
+        let slope = exponential.clone().divide(&argument.constant(thermal))?;
+        Ok((exponential.offset(-1.), slope))
     }
 }
 
 /// One trap-assisted tunnelling law, shared by area, sidewall and
 /// gate-sidewall terms on both physical junctions. C stores the negative
 /// of its exponent derivative because the tunnelling current is subtracted.
-fn reverse_tunneling(voltage: f64, thermal: f64, threshold: f64) -> (f64, f64) {
-    let distance = threshold - voltage;
-    let (argument, derivative) = if distance < threshold * 1e-3 {
-        (-voltage / thermal * 1e3, 1e3 / thermal)
+fn reverse_tunneling<S: Constitutive>(
+    voltage: S,
+    thermal: f64,
+    threshold: f64,
+) -> SpiceResult<(S, S)> {
+    let distance = voltage.clone().scale(-1.).offset(threshold);
+    let normalized = -voltage.primal() / thermal;
+    let (value, derivative) = if distance.compare(threshold * 1e-3) == Some(Ordering::Less) {
+        (normalized * 1e3, voltage.constant(1e3 / thermal))
     } else {
-        let reciprocal = 1. / distance;
+        let reciprocal = voltage.constant(1.).divide(&distance)?;
         let derivative = if threshold > 0.
             && thermal > 0.
             && threshold.is_finite()
             && thermal.is_finite()
-            && voltage.is_finite()
+            && voltage.primal().is_finite()
         {
-            let factor = threshold / distance;
-            factor * (factor / thermal)
+            let factor = voltage.constant(threshold).divide(&distance)?;
+            factor
+                .clone()
+                .multiply(&factor.divide(&voltage.constant(thermal))?)
         } else {
             // Keep the reference nonphysical argument propagation.
-            threshold / thermal * (voltage * reciprocal).mul_add(reciprocal, reciprocal)
+            voltage
+                .clone()
+                .multiply(&reciprocal)
+                .mul_add(&reciprocal, &reciprocal)
+                .scale(threshold / thermal)
         };
-        (-voltage / thermal * threshold * reciprocal, derivative)
+        (normalized * threshold * reciprocal.primal(), derivative)
     };
-    let (exponential, slope) = DEXP(argument);
-    let difference = if argument.abs() < 0.5 {
+    // The independently rationalized slope avoids cancellation of the two
+    // quotient partials at very large reverse bias. Use it to lift the
+    // original rounded argument rather than differentiating the quotient.
+    let argument = voltage.compose_derivative(value, &derivative.clone().scale(-1.));
+    let (exponential, slope) = DEXP(argument.clone());
+    let difference = if argument.primal().abs() < 0.5 {
         argument.exp_m1()
     } else {
-        exponential - 1.
+        exponential.offset(-1.)
     };
-    (difference, slope * derivative)
+    Ok((difference, slope.multiply(&derivative)))
 }
 
 /// Evaluate the four load-owned junction conduction members.
@@ -198,7 +275,7 @@ pub(super) fn current(
     size: &SizeParam,
     ckt: &dyn LoadCkt,
     bias: JunctionBias,
-) {
+) -> SpiceResult<()> {
     let gate_perimeter = size.weffCJ * here.nf;
     let source_saturation = if here.Aseff <= 0. && here.Pseff <= 0. {
         0.
@@ -240,11 +317,11 @@ pub(super) fn current(
         reverse_current: here.IVjdmRev,
         reverse_slope: here.DslpRev,
     };
-    if let Some((current, slope)) = source.evaluate(model.dioMod, bias.source, ckt.gmin()) {
+    if let Some((current, slope)) = source.evaluate(model.dioMod, bias.source, ckt.gmin())? {
         here.cbs = current;
         here.gbs = slope;
     }
-    if let Some((current, slope)) = drain.evaluate(model.dioMod, bias.drain, ckt.gmin()) {
+    if let Some((current, slope)) = drain.evaluate(model.dioMod, bias.drain, ckt.gmin())? {
         here.cbd = current;
         here.gbd = slope;
     }
@@ -262,18 +339,19 @@ pub(super) fn current(
         (bias.source, source_tunnels, &mut here.cbs, &mut here.gbs),
         (bias.drain, drain_tunnels, &mut here.cbd, &mut here.gbd),
     ] {
-        let [
-            (area, area_slope),
-            (sidewall, sidewall_slope),
-            (gate, gate_slope),
-        ] = terms.map(|(density, emission, threshold)| {
+        let evaluate = |(density, emission, threshold)| {
             let (difference, derivative) =
-                reverse_tunneling(voltage, model.vtm0 * emission, threshold);
-            (density * difference, density * derivative)
-        });
+                reverse_tunneling(voltage, model.vtm0 * emission, threshold)?;
+            Ok::<_, crate::primitives::SpiceError>((density * difference, density * derivative))
+        };
+        let [area, sidewall, gate] = terms.map(evaluate);
+        let (area, area_slope) = area?;
+        let (sidewall, sidewall_slope) = sidewall?;
+        let (gate, gate_slope) = gate?;
         *current -= area + sidewall + gate;
         *slope += area_slope + sidewall_slope + gate_slope;
     }
+    Ok(())
 }
 
 /// Evaluate depletion charge and capacitance (C's finished label).
@@ -359,7 +437,7 @@ mod tests {
             let gain = if selector == 1 { 1. } else { 1.5 };
             let expected = gain * diode.saturation / diode.thermal;
             for voltage in [-1e-22, -1e-18, 1e-18, 1e-22] {
-                let (current, slope) = diode.evaluate(selector, voltage, 0.).unwrap();
+                let (current, slope) = diode.evaluate(selector, voltage, 0.).unwrap().unwrap();
                 assert!((current / (expected * voltage) - 1.).abs() < 8. * f64::EPSILON);
                 assert!((slope / expected - 1.).abs() < 8. * f64::EPSILON);
             }
@@ -371,30 +449,139 @@ mod tests {
         let mut diode = diode();
         diode.breakdown_voltage = 40. * diode.thermal;
         diode.breakdown_at_zero = MIN_EXP;
-        let (current, slope) = diode.evaluate(2, 0., 0.).unwrap();
+        let (current, slope) = diode.evaluate(2, 0., 0.).unwrap().unwrap();
         assert_eq!(current.to_bits(), 0_f64.to_bits());
         assert!((slope / (diode.saturation / diode.thermal) - 1.).abs() < f64::EPSILON);
-        let (current, _) = diode.evaluate(0, 0., 0.).unwrap();
+        let (current, _) = diode.evaluate(0, 0., 0.).unwrap().unwrap();
         // Mode zero retains the C zero-bias floor but uses the unclipped
         // reverse exponential, unlike mode two.
         assert!(current > 0.);
-        let (current, slope) = diode.evaluate(1, -36. * diode.thermal, 0.).unwrap();
+        let (current, slope) = diode
+            .evaluate(1, -36. * diode.thermal, 0.)
+            .unwrap()
+            .unwrap();
         assert_eq!(current, diode.saturation * (MIN_EXP - 1.));
         assert_eq!(slope, 0.);
         diode.forward_voltage = 1e-18;
         diode.forward_current = diode.saturation;
-        let (current, _) = diode.evaluate(1, 2e-18, 0.).unwrap();
+        let (current, _) = diode.evaluate(1, 2e-18, 0.).unwrap().unwrap();
         assert!(
             (current / (2e-18 * diode.saturation / diode.thermal) - 1.).abs() < 4. * f64::EPSILON
         );
     }
 
+    fn close(actual: f64, expected: f64, absolute: f64) {
+        assert!(
+            (actual - expected).abs() <= absolute + 8e-12 * expected.abs(),
+            "{actual:.17e} != {expected:.17e}"
+        );
+    }
+
+    fn sample(jet: &crate::maths::taylor::Jet, time: f64) -> f64 {
+        jet.coefficients()
+            .iter()
+            .rev()
+            .fold(0., |value, coefficient| value.mul_add(time, *coefficient))
+    }
+
+    #[test]
+    fn diode_modes_share_current_and_partial_germs() -> SpiceResult<()> {
+        use crate::maths::taylor::{Jet, differential::Differential};
+        let diode = diode();
+        let gmin = 1e-14;
+        let order = 8;
+        for selector in [0, 1, 2] {
+            for bias in [-1.25, -0.95, -0.7, -0.1, -1e-18, 0., 0.05, 0.15, 1.] {
+                let rate = 0.01;
+                let voltage = Differential::<1>::variable(0, Jet::affine(order, bias, rate))?;
+                let (current, slope) = diode.evaluate(selector, voltage, gmin)?.unwrap();
+                let (scalar_current, scalar_slope) = diode.evaluate(selector, bias, gmin)?.unwrap();
+                close(current.value.value(), scalar_current, 1e-28);
+                close(slope.value.value(), scalar_slope, 1e-28);
+                let partial = current.gradient[0].as_ref().unwrap();
+                for (&actual, &expected) in partial
+                    .coefficients()
+                    .iter()
+                    .zip(slope.value.coefficients())
+                {
+                    close(actual, expected, 1e-25);
+                }
+                for time in [-0.03, 0.03] {
+                    let (expected, expected_slope) = diode
+                        .evaluate(selector, rate.mul_add(time, bias), gmin)?
+                        .unwrap();
+                    close(sample(&current.value, time), expected, 1e-25);
+                    close(sample(&slope.value, time), expected_slope, 1e-25);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diode_continuation_selects_the_right_hand_germ_at_joins() -> SpiceResult<()> {
+        use crate::maths::taylor::{Jet, differential::Differential};
+        let diode = diode();
+        let gmin = 1e-14;
+        for (selector, bias) in [
+            (1, diode.forward_voltage),
+            (2, diode.forward_voltage),
+            (2, diode.reverse_voltage),
+        ] {
+            for rate in [-0.01, 0.01] {
+                let voltage = Differential::<1>::variable(0, Jet::affine(8, bias, rate))?;
+                let (current, slope) = diode.evaluate(selector, voltage, gmin)?.unwrap();
+                let time = 0.03;
+                let (expected, expected_slope) = diode
+                    .evaluate(selector, rate.mul_add(time, bias), gmin)?
+                    .unwrap();
+                close(sample(&current.value, time), expected, 1e-25);
+                close(sample(&slope.value, time), expected_slope, 1e-25);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reverse_tunneling_shares_the_physical_derivative_across_exponential_regions()
+    -> SpiceResult<()> {
+        use crate::maths::taylor::{Jet, differential::Differential};
+        for (bias, rate) in [
+            (-1e18, 1e15),
+            (-100., 0.001),
+            (-8., 0.001),
+            (-3., 0.001),
+            (-0.02, 0.001),
+            (0., 0.001),
+            (0.5, 0.001),
+            (9.995, 0.001),
+        ] {
+            let voltage = Differential::<1>::variable(0, Jet::affine(8, bias, rate))?;
+            let (difference, derivative) = reverse_tunneling(voltage, 0.1, 10.)?;
+            let (value, slope) = reverse_tunneling(bias, 0.1, 10.)?;
+            close(difference.value.value(), value, 1e-24);
+            close(derivative.value.value(), slope, 1e-24);
+            for (degree, &expected) in derivative.value.coefficients().iter().enumerate() {
+                let actual = difference.gradient[0]
+                    .as_ref()
+                    .map_or(0., |gradient| gradient.coefficients()[degree]);
+                close(-actual, expected, 1e-300);
+            }
+            for time in [-0.03, 0.03] {
+                let (value, slope) = reverse_tunneling(rate.mul_add(time, bias), 0.1, 10.)?;
+                close(sample(&difference.value, time), value, 1e-24);
+                close(sample(&derivative.value, time), slope, 1e-24);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn reverse_tunneling_retains_tiny_current_and_large_reverse_derivative() {
-        let (difference, derivative) = reverse_tunneling(-1e-18, 0.1, 10.);
+        let (difference, derivative) = reverse_tunneling(-1e-18, 0.1, 10.).unwrap();
         assert!((difference / 1e-17 - 1.).abs() < 4. * f64::EPSILON);
         assert!((derivative / 10. - 1.).abs() < 4. * f64::EPSILON);
-        let (_, derivative) = reverse_tunneling(-1e18, 0.1, 10.);
+        let (_, derivative) = reverse_tunneling(-1e18, 0.1, 10.).unwrap();
         assert!((derivative / (super::super::MAX_EXP * 1e-33) - 1.).abs() < 4. * f64::EPSILON);
     }
 }
