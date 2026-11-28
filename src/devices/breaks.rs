@@ -170,10 +170,11 @@ impl BreakTable {
         if self.breaks.is_empty() {
             return self.inline[1];
         }
-        self.breaks
-            .values()
-            .flat_map(Events::iter)
-            .nth(1)
+        let mut buckets = self.breaks.values();
+        buckets
+            .next()
+            .and_then(|events| events.rest.front().copied())
+            .or_else(|| buckets.next().map(|events| events.first))
             .unwrap_or(self.final_time)
     }
 
@@ -208,14 +209,20 @@ impl BreakTable {
     }
 
     fn remove_first_of(&mut self, key: EventKey) {
-        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.breaks.entry(key) {
-            let events = entry.get_mut();
-            if let Some(next) = events.rest.pop_front() {
-                events.first = next;
-            } else {
-                entry.remove();
-            }
+        if let std::collections::btree_map::Entry::Occupied(entry) = self.breaks.entry(key) {
+            Self::remove_bucket_head(entry);
             self.len -= 1;
+        }
+    }
+
+    fn remove_bucket_head(
+        mut entry: std::collections::btree_map::OccupiedEntry<'_, EventKey, Events>,
+    ) {
+        let events = entry.get_mut();
+        if let Some(next) = events.rest.pop_front() {
+            events.first = next;
+        } else {
+            entry.remove();
         }
     }
 
@@ -329,8 +336,9 @@ impl BreakTable {
             }
             return;
         }
-        if let Some((&key, _)) = self.breaks.first_key_value() {
-            self.remove_first_of(key);
+        if let Some(entry) = self.breaks.first_entry() {
+            Self::remove_bucket_head(entry);
+            self.len -= 1;
         }
         if self.len == 1
             && let Some((&key, events)) = self.breaks.first_key_value()
