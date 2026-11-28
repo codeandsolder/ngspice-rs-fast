@@ -292,6 +292,7 @@ pub(super) fn depletion<S: Constitutive>(
 /// Tangent-matched rational continuation of a linear constitutive factor.
 /// Below the join, the displacement is compressed toward -1/stiffness;
 /// both value and first partial match the linear law at the join.
+#[inline]
 pub(super) fn rational_floor<S: Constitutive>(
     x: S,
     join: Real,
@@ -317,6 +318,7 @@ pub(super) fn rational_floor<S: Constitutive>(
 }
 
 /// Reciprocal of the same continued resistance/body-bias factor.
+#[inline]
 pub(super) fn reciprocal_floor<S: Constitutive>(
     x: S,
     join: Real,
@@ -341,6 +343,7 @@ pub(super) fn positive_half_sum<S: Constitutive>(x: S, root: S, product: S) -> S
 }
 
 /// Regularized positive part and its partial in the input coordinate.
+#[inline]
 pub(super) fn smooth_positive<S: Constitutive>(
     x: S,
     quarter_width_squared: Real,
@@ -383,6 +386,7 @@ pub(super) struct DrainSmoothing<S> {
     pub(super) drain_partial: S,
 }
 
+#[inline]
 pub(super) fn smooth_drain<S: Constitutive>(
     saturation: S,
     drain: S,
@@ -734,6 +738,7 @@ impl SlopeParameters {
 
 /// Saturation-shape coefficient, with the exact overdrive partial.
 /// The sign of a1 selects a parameterization, not a trajectory event.
+#[inline]
 pub(super) fn saturation_shape<S: Constitutive>(
     overdrive: &S,
     a1: Real,
@@ -768,6 +773,7 @@ pub(super) fn saturation_shape<S: Constitutive>(
 
 /// Substrate-current multiplier before the channel-current product.
 /// The exponential is clipped exactly where the compact model clips it.
+#[inline]
 pub(super) fn impact_ionization<S: Constitutive>(
     excess: &S,
     alpha: Real,
@@ -791,6 +797,7 @@ pub(super) fn impact_ionization<S: Constitutive>(
 
 /// Early voltage due to substrate-current-induced body effect. The
 /// caller supplies the version-specific enable predicate.
+#[inline]
 pub(super) fn substrate_early_voltage<S: Constitutive>(
     excess: &S,
     length: Real,
@@ -817,6 +824,7 @@ pub(super) fn substrate_early_voltage<S: Constitutive>(
 /// Channel conductance before the series-resistance correction. Independent
 /// coordinates are overdrive, bulk factor, effective drain, saturation field
 /// times length, and mobility/oxide/geometry coefficient.
+#[inline]
 pub(super) fn channel_conductance<S: Constitutive>(
     overdrive: &S,
     bulk: &S,
@@ -874,6 +882,7 @@ pub(super) fn channel_conductance<S: Constitutive>(
 }
 
 /// Conductance loaded by the intrinsic source/drain series resistance.
+#[inline]
 pub(super) fn series_conductance<S: Constitutive>(
     conductance: &S,
     resistance: &S,
@@ -930,6 +939,7 @@ impl<S: Constitutive> SaturationRoot<S> {
 /// overdrive, bulk factor, saturation field times length, resistance-width
 /// product and saturation shape. The rationalized root includes the
 /// zero-resistance/unit-shape linear limit without a separate model branch.
+#[inline]
 pub(super) fn saturation_voltage<S: Constitutive>(
     drive: &S,
     bulk: &S,
@@ -984,6 +994,7 @@ pub(super) fn saturation_voltage<S: Constitutive>(
 /// Saturation Early voltage with local partials in overdrive, bulk factor,
 /// saturation voltage, field times length, resistance-width product and
 /// saturation shape.
+#[inline]
 pub(super) fn saturation_early_voltage<S: Constitutive>(
     overdrive: &S,
     bulk: &S,
@@ -1045,6 +1056,7 @@ pub(super) fn saturation_early_voltage<S: Constitutive>(
 /// Drain-induced barrier-lowering Early voltage with exact partials in the
 /// thermal overdrive, bulk factor, saturation voltage and effective body
 /// bias. The caller retains the model generation's enable predicate.
+#[inline]
 pub(super) fn dibl_early_voltage<S: Constitutive>(
     drive: &S,
     bulk: &S,
@@ -1118,6 +1130,7 @@ pub(super) fn charge_overdrive<S: Constitutive>(
 /// Normalized bulk depletion charge, with its differential capacitance.
 /// The negative-potential continuation is linear and the positive root
 /// is rationalized to retain very small nonzero charges.
+#[inline]
 pub(super) fn depletion_charge<S: Constitutive>(k1: Real, increment: S) -> SpiceResult<(S, S)> {
     if k1 == 0. {
         return Ok((increment.constant(0.), increment.constant(0.)));

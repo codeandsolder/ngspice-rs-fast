@@ -1085,7 +1085,7 @@ fn physical_taylor_selects_one_sided_channel_orientation()
                 state[1].set(rows[0], polarity * 1e-3)?;
                 state[1].set(rows[1], polarity * 2e-3)?;
                 let jet = dae.evaluate_taylor(&state, 0., 1e-6, limit)?;
-                let time = if limit == Limit::Left { -0.25 } else { 0.25 };
+                let time: f64 = if limit == Limit::Left { -0.25 } else { 0.25 };
                 let mut sample = state[0].clone();
                 for row in rows {
                     sample.set(
@@ -1094,10 +1094,10 @@ fn physical_taylor_selects_one_sided_channel_orientation()
                     )?;
                 }
                 let point = dae.evaluate(&sample, time * 1e-6, limit)?;
-                let close = |a: f64, b: f64, absolute: f64| {
+                let close = |a: f64, b: f64, absolute: f64, label: &str| {
                     assert!(
                         (a - b).abs() <= absolute + 3e-7 * a.abs().max(b.abs()),
-                        "level={level} capmod={cap} polarity={polarity} side={limit:?}: {a:e} vs {b:e}"
+                        "level={level} capmod={cap} polarity={polarity} side={limit:?} {label}: {a:e} vs {b:e}"
                     );
                 };
                 for row in rows {
@@ -1111,8 +1111,18 @@ fn physical_taylor_selects_one_sided_channel_orientation()
                         .iter()
                         .rev()
                         .fold(0., |v: f64, a| v.mul_add(time, a.get(row).unwrap()));
-                    close(f, point.residual.get(row).unwrap(), 1e-13);
-                    close(q, point.charge.get(row).unwrap(), 1e-21);
+                    close(
+                        f,
+                        point.residual.get(row).unwrap(),
+                        1e-13,
+                        &format!("F[{row}]"),
+                    );
+                    close(
+                        q,
+                        point.charge.get(row).unwrap(),
+                        1e-21,
+                        &format!("Q[{row}]"),
+                    );
                     for col in rows {
                         let g = jet
                             .conductance
@@ -1124,8 +1134,18 @@ fn physical_taylor_selects_one_sided_channel_orientation()
                             .iter()
                             .rev()
                             .fold(0., |v: f64, a| v.mul_add(time, a.get(row, col)));
-                        close(g, point.conductance.get(row, col), 1e-10);
-                        close(cap, point.capacitance.get(row, col), 1e-20);
+                        close(
+                            g,
+                            point.conductance.get(row, col),
+                            1e-10,
+                            &format!("G[{row},{col}]"),
+                        );
+                        close(
+                            cap,
+                            point.capacitance.get(row, col),
+                            1e-20,
+                            &format!("C[{row},{col}]"),
+                        );
                     }
                 }
             }

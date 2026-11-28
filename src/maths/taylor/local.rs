@@ -8,10 +8,12 @@ use crate::primitives::{Real, SpiceResult};
 use std::cmp::Ordering;
 
 impl<S: Constitutive, const N: usize> Local<S, N> {
+    #[inline]
     pub(crate) const fn new(value: S, partials: [Real; N]) -> Self {
         Self { value, partials }
     }
 
+    #[inline]
     fn lifted(self, value: S, slope: Real) -> Self {
         Self::new(
             value,
@@ -21,18 +23,22 @@ impl<S: Constitutive, const N: usize> Local<S, N> {
 }
 
 impl<S: Constitutive, const N: usize> Constitutive for Local<S, N> {
+    #[inline]
     fn constant(&self, value: Real) -> Self {
         Self::new(self.value.constant(value), [0.; N])
     }
 
+    #[inline]
     fn primal(&self) -> Real {
         self.value.primal()
     }
 
+    #[inline]
     fn compare(&self, boundary: Real) -> Option<Ordering> {
         self.value.compare(boundary)
     }
 
+    #[inline]
     fn add(self, rhs: &Self) -> Self {
         Self::new(
             self.value.add(&rhs.value),
@@ -40,6 +46,7 @@ impl<S: Constitutive, const N: usize> Constitutive for Local<S, N> {
         )
     }
 
+    #[inline]
     fn midpoint(self, rhs: &Self) -> Self {
         Self::new(
             self.value.midpoint(&rhs.value),
@@ -47,6 +54,7 @@ impl<S: Constitutive, const N: usize> Constitutive for Local<S, N> {
         )
     }
 
+    #[inline]
     fn multiply(self, rhs: &Self) -> Self {
         let left = self.primal();
         let right = rhs.primal();
@@ -55,6 +63,7 @@ impl<S: Constitutive, const N: usize> Constitutive for Local<S, N> {
         Self::new(self.value.multiply(&rhs.value), partials)
     }
 
+    #[inline]
     fn divide(self, rhs: &Self) -> SpiceResult<Self> {
         let right = rhs.primal();
         let value = self.value.divide(&rhs.value)?;
@@ -64,14 +73,17 @@ impl<S: Constitutive, const N: usize> Constitutive for Local<S, N> {
         Ok(Self::new(value, partials))
     }
 
+    #[inline]
     fn scale(self, factor: Real) -> Self {
         Self::new(self.value.scale(factor), self.partials.map(|p| p * factor))
     }
 
+    #[inline]
     fn offset(self, value: Real) -> Self {
         Self::new(self.value.offset(value), self.partials)
     }
 
+    #[inline]
     fn mul_add(self, rhs: &Self, add: &Self) -> Self {
         let left = self.primal();
         let right = rhs.primal();
@@ -81,28 +93,33 @@ impl<S: Constitutive, const N: usize> Constitutive for Local<S, N> {
         Self::new(self.value.mul_add(&rhs.value, &add.value), partials)
     }
 
+    #[inline]
     fn sqrt(self) -> SpiceResult<Self> {
         let value = self.value.clone().sqrt()?;
         let slope = 0.5 / value.primal();
         Ok(self.lifted(value, slope))
     }
 
+    #[inline]
     fn exp(self) -> Self {
         let value = self.value.clone().exp();
         let slope = value.primal();
         self.lifted(value, slope)
     }
 
+    #[inline]
     fn exp_with_primal(self, value: Real) -> Self {
         let law = self.value.clone().exp_with_primal(value);
         self.lifted(law, value)
     }
 
+    #[inline]
     fn compose_derivative(self, value: Real, slope: &Self) -> Self {
         let law = self.value.clone().compose_derivative(value, &slope.value);
         self.lifted(law, slope.primal())
     }
 
+    #[inline]
     fn with_partials<const M: usize>(self, inputs: [&Self; M], partials: [&Self; M]) -> Self {
         let gradient = std::array::from_fn(|i| {
             inputs
@@ -118,18 +135,21 @@ impl<S: Constitutive, const N: usize> Constitutive for Local<S, N> {
         Self::new(value, gradient)
     }
 
+    #[inline]
     fn exp_m1(self) -> Self {
         let slope = self.primal().exp();
         let value = self.value.clone().exp_m1();
         self.lifted(value, slope)
     }
 
+    #[inline]
     fn ln_1p(self) -> SpiceResult<Self> {
         let slope = (1. + self.primal()).recip();
         let value = self.value.clone().ln_1p()?;
         Ok(self.lifted(value, slope))
     }
 
+    #[inline]
     fn ln(self) -> SpiceResult<Self> {
         let slope = self.primal().recip();
         let value = self.value.clone().ln()?;

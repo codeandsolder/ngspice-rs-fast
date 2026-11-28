@@ -1068,3 +1068,157 @@ fn channel_and_intrinsic_charge_share_physical_trajectory_and_partial_series() -
     }
     Ok(())
 }
+
+/// Check terminal incidence and independent history coordinates against the
+/// ordinary scalar stamp, not the physical evaluator's own reconstruction.
+#[test]
+fn physical_incidence_matches_reference_stamp_and_history() -> SpiceResult<()> {
+    for polarity in [-1, 1] {
+        for cap in 0..=2 {
+            for (gate, body, rds) in [(0, 0, 0), (1, 1, 0), (2, 0, 1), (3, 2, 1)] {
+                let model = Model {
+                    r#type: polarity,
+                    typeGiven: true,
+                    capMod: cap,
+                    capModGiven: true,
+                    dioMod: cap,
+                    dioModGiven: true,
+                    igcMod: 1,
+                    igcModGiven: true,
+                    igbMod: 1,
+                    igbModGiven: true,
+                    rgateMod: gate,
+                    rgateModGiven: true,
+                    rbodyMod: body,
+                    rbodyModGiven: true,
+                    rdsMod: rds,
+                    rdsModGiven: true,
+                    agidl: 1e-8,
+                    agidlGiven: true,
+                    bgidl: 1e9,
+                    bgidlGiven: true,
+                    agisl: 2e-8,
+                    agislGiven: true,
+                    bgisl: 1e9,
+                    bgislGiven: true,
+                    ..Model::default()
+                };
+                let instance = Instance {
+                    l: 0.5e-6,
+                    lGiven: true,
+                    w: 2e-6,
+                    wGiven: true,
+                    nf: 2.,
+                    nfGiven: true,
+                    m: 3.,
+                    mGiven: true,
+                    mult_i: 1.2,
+                    mult_iGiven: true,
+                    mult_q: 0.8,
+                    mult_qGiven: true,
+                    sourceArea: 1e-12,
+                    sourceAreaGiven: true,
+                    drainArea: 2e-12,
+                    drainAreaGiven: true,
+                    sourcePerimeter: 2e-6,
+                    sourcePerimeterGiven: true,
+                    drainPerimeter: 3e-6,
+                    drainPerimeterGiven: true,
+                    ..super::super::acld::tests::shaped(gate, body, 0)
+                };
+                let set::PreparedSetup {
+                    mut model,
+                    mut instance,
+                    mut warnings,
+                    ..
+                } = set::prepare_model(model, 300.15).prepare_instance(instance, false);
+                let size = temp::temperature(
+                    &mut model,
+                    &mut instance,
+                    300.15,
+                    "nch",
+                    "m1",
+                    &mut warnings,
+                )?;
+                for (drain, gate_voltage) in [(0.8, 1.2), (-0.25, 0.9), (0.8, -0.5)] {
+                    let p = f64::from(polarity);
+                    let voltage = [
+                        drain + 0.01,
+                        gate_voltage + 0.03,
+                        0.09,
+                        -0.19,
+                        drain,
+                        gate_voltage,
+                        gate_voltage + 0.02,
+                        0.1,
+                        -0.2,
+                        -0.21,
+                        -0.18,
+                        0.,
+                    ]
+                    .map(|x| p * x);
+                    let mut scalar = instance.clone();
+                    let mut dc = junction_trace(300.15, mode::MODEDCOP, voltage);
+                    super::load(&model, &mut scalar, &size, &mut dc)?;
+                    let mut scalar = instance.clone();
+                    let mut transient = junction_trace(300.15, mode::MODETRAN, voltage);
+                    super::load(&model, &mut scalar, &size, &mut transient)?;
+
+                    let mut physical = instance.clone();
+                    let point = super::physical::evaluate(
+                        &model,
+                        &mut physical,
+                        &size,
+                        300.15,
+                        dc.gmin(),
+                        |n| {
+                            p * (voltage[n.cast_unsigned() as usize]
+                                - voltage[instance.sNodePrime.cast_unsigned() as usize])
+                        },
+                    )?;
+                    let mut residual = [0.; node::COUNT];
+                    for ([from, to], current) in point.currents {
+                        let current = current * p * instance.m * instance.mult_i;
+                        residual[from.cast_unsigned() as usize] += current;
+                        residual[to.cast_unsigned() as usize] -= current;
+                    }
+                    let label = format!(
+                        "polarity={polarity} cap={cap} gate={gate} body={body} rds={rds} drain={drain} vg={gate_voltage}"
+                    );
+                    for (row, value) in residual.into_iter().enumerate() {
+                        let expected = dc.matrix[row]
+                            .iter()
+                            .zip(voltage)
+                            .fold(-dc.rhs[row], |sum, (g, v)| g.mul_add(v, sum));
+                        assert!(
+                            (value - expected).abs()
+                                <= 1e-12 + 1e-7 * value.abs().max(expected.abs()),
+                            "{label} F[{row}]: {value:e} vs {expected:e}"
+                        );
+                    }
+                    for (slot, _, value) in point.charges {
+                        let expected = transient.s0[slot];
+                        assert!(
+                            (value - expected).abs()
+                                <= 1e-24 + 1e-9 * value.abs().max(expected.abs()),
+                            "{label} Q[{slot}]: {value:e} vs {expected:e}"
+                        );
+                    }
+                    let source_charge = point
+                        .auxiliary
+                        .iter()
+                        .find(|(slot, _)| *slot == state::QS)
+                        .unwrap()
+                        .1;
+                    let expected = transient.s0[state::QS];
+                    assert!(
+                        (source_charge - expected).abs()
+                            <= 1e-24 + 1e-9 * source_charge.abs().max(expected.abs()),
+                        "{label} QS: {source_charge:e} vs {expected:e}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
