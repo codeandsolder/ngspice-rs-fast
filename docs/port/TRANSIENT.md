@@ -108,6 +108,7 @@ the run with an error; no partial plot is returned.
   logarithmic predecessor/successor lookup and front removal. An indexed
   update retains the search cursor through insertion, coalescing and
   successor replacement; a timestep reads the front once between mutations.
+  See [the breakpoint and arrival performance record](performance-baselines/2026-11-28-breakpoint-arrivals.md).
   A successor within the merge distance takes
   priority over a predecessor, including an equal predecessor; duplicate
   entries retain insertion order and the original signed-zero bits. The
