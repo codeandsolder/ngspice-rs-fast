@@ -116,10 +116,21 @@ impl Material {
     }
 
     pub(super) fn equilibrium(self, control: Real) -> SpiceResult<State> {
+        self.equilibrium_from(control, None)
+    }
+
+    /// The reference is fixed for the entire bias solve. A Newton iterate
+    /// that briefly leaves the band must not create physical hysteresis.
+    pub(super) fn equilibrium_from(
+        self,
+        control: Real,
+        reference: Option<bool>,
+    ) -> SpiceResult<State> {
         if !control.is_finite() {
             return Err(invalid("nonfinite control value"));
         }
-        let bit = self.receive(control, self.initial);
+        let bias_reference = reference.unwrap_or(self.initial);
+        let bit = self.receive(control, bias_reference);
         Ok(State {
             time: 0.,
             control,
@@ -128,6 +139,7 @@ impl Material {
             target: bit,
             requested: bit,
             deadline: None,
+            bias_reference,
         })
     }
 
@@ -269,7 +281,7 @@ fn future(time: Real, interval: Real) -> SpiceResult<Real> {
     }
 }
 
-/// Accepted state; serializable to seven ordinary finite device slots.
+/// Accepted state; serializable to ordinary finite device slots.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct State {
     time: Real,
@@ -279,10 +291,23 @@ pub(super) struct State {
     target: bool,
     requested: bool,
     deadline: Option<Real>,
+    /// Fixed reference for a zero-time bias solve, never a tentative state.
+    pub(super) bias_reference: bool,
 }
 
 impl State {
-    pub(super) const SLOTS: usize = 7;
+    pub(super) const SLOTS: usize = 8;
+    pub(super) const TARGET_SLOT: usize = 4;
+    pub(super) const BIAS_REFERENCE_SLOT: usize = 7;
+
+    pub(super) fn decode_bit(value: Option<Real>) -> SpiceResult<Option<bool>> {
+        match value {
+            None => Ok(None),
+            Some(0.) => Ok(Some(false)),
+            Some(1.) => Ok(Some(true)),
+            Some(_) => Err(invalid("invalid stored switch bit")),
+        }
+    }
 
     fn target_phase(self) -> Real {
         Real::from(u8::from(self.target))
@@ -362,6 +387,7 @@ impl State {
             self.target_phase(),
             Real::from(u8::from(self.requested)),
             self.deadline.unwrap_or(-1.),
+            Real::from(u8::from(self.bias_reference)),
         ]
     }
 
@@ -378,6 +404,7 @@ impl State {
             target,
             request,
             deadline,
+            bias_reference,
         ] = values
         else {
             return Err(invalid("invalid state dimension"));
@@ -389,6 +416,7 @@ impl State {
             || !(0. ..=1.).contains(&anchor_phase)
             || !matches!(target, 0. | 1.)
             || !matches!(request, 0. | 1.)
+            || !matches!(bias_reference, 0. | 1.)
             || (deadline != -1. && deadline <= time)
         {
             return Err(invalid("invalid accepted switch state"));
@@ -401,6 +429,7 @@ impl State {
             target: target == 1.,
             requested: request == 1.,
             deadline: (deadline >= 0.).then_some(deadline),
+            bias_reference: bias_reference == 1.,
         })
     }
 

@@ -6,7 +6,7 @@ use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseFamily, NoiseKind, N
 use crate::devices::traits::{
     ControlReference, ConvergenceContext, DeviceTransientEvents, MnaUnknowns, TransientEventContext,
 };
-use crate::devices::{AnalysisMode, Device, LinearContext, StampContext};
+use crate::devices::{AnalysisMode, Device, IterationPhase, LinearContext, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::ModelCard;
 use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
@@ -116,15 +116,30 @@ impl TimedSwitch {
         }
     }
 
-    fn state(&self, time: Real, control: Real, accepted: Option<&[Real]>) -> SpiceResult<State> {
+    fn state(
+        &self,
+        time: Real,
+        control: Real,
+        accepted: Option<&[Real]>,
+        bias_reference: Option<bool>,
+    ) -> SpiceResult<State> {
         if time == 0. {
-            self.material.equilibrium(control)
+            self.material.equilibrium_from(control, bias_reference)
         } else {
             let accepted = accepted
                 .ok_or_else(|| SpiceError::circuit("timed switch has no accepted history"))?;
             self.material
                 .advance(State::from_values(accepted)?, time, control)
         }
+    }
+
+    fn bias_reference(state: &crate::devices::state::DeviceState<'_>) -> SpiceResult<Option<bool>> {
+        let reference = match state.phase() {
+            IterationPhase::Junction | IterationPhase::Fix => None,
+            IterationPhase::Predict => state.accepted(1, State::TARGET_SLOT),
+            IterationPhase::Float => state.iterate(State::BIAS_REFERENCE_SLOT),
+        };
+        State::decode_bit(reference)
     }
 }
 
@@ -232,7 +247,12 @@ impl Device for TimedSwitch {
         } else {
             None
         };
-        let state = self.state(time, control, history)?;
+        let bias_reference = if time == 0. {
+            Self::bias_reference(&context.states)?
+        } else {
+            None
+        };
+        let state = self.state(time, control, history, bias_reference)?;
         let conductance = if context.integration.is_some() {
             state.step_conductance(self.material, history.map(State::from_values).transpose()?)?
         } else {
@@ -330,8 +350,8 @@ impl crate::devices::DeviceConvergence for TimedSwitch {
             .history
             .accepted(1)
             .and_then(|values| values.get(context.state_range.clone()));
-        let actual = self.state(time, control, accepted)?;
         let stamped = State::from_values(context.states)?;
+        let actual = self.state(time, control, accepted, Some(stamped.bias_reference))?;
         if actual.discrete() != stamped.discrete() {
             return Ok(true);
         }

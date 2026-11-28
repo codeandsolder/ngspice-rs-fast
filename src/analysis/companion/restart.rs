@@ -159,7 +159,7 @@ impl Driver<'_> {
             .ok_or_else(|| failure("missing restart history"))?;
         let tolerance = self.settings.tolerances;
         let mut ratio: Real = 0.;
-        for slot in self.truncation.iter().flat_map(|device| &device.slots) {
+        for slot in self.truncation.iter().flat_map(|device| device.slots) {
             let base = slot.base;
             let values = [
                 accepted[base],

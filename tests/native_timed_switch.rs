@@ -525,6 +525,68 @@ fn instantaneous_switch_dc_ac_and_thermal_noise() -> SpiceResult<()> {
 }
 
 #[test]
+fn timed_switch_dc_sweeps_retain_accepted_hysteresis() -> SpiceResult<()> {
+    for (control, terminal, swept) in [
+        ("vcontrol c 0 0", "%v(c)", "vcontrol"),
+        ("icontrol 0 c 0\nvsense c 0 0", "%vnam(vsense)", "icontrol"),
+    ] {
+        for instantaneous in [0, 1] {
+            for inclusive in [0, 1] {
+                let source = format!(
+                    "timed switch DC history\n\
+                    {control}\n\
+                    vin p 0 1\n\
+                    vouter aux 0 0\n\
+                    raux aux 0 1k\n\
+                    rload out 0 1k\n\
+                    a1 {terminal} %gd(p out) m\n\
+                    .model m preprocess_timed_switch(ron=10 roff=1Meg vt=-1 vh=.5 instantaneous={instantaneous} inclusive_rise={inclusive} td_on=500n td_off=1u ic=0)\n\
+                    .end\n"
+                );
+                for (start, stop, step) in
+                    [("-2", "0", ".25"), ("0", "-2", "-.25"), ("-1", "0", ".25")]
+                {
+                    let (mut c, config) = deck(&source)?;
+                    let result = plan(
+                        &config,
+                        AnalysisKind::DcSweep,
+                        &[swept, start, stop, step, "vouter", "0", "1", "1"],
+                    )?
+                    .run(&mut c, &config.context())?;
+                    let start: f64 = start.parse().unwrap();
+                    let stop: f64 = stop.parse().unwrap();
+                    let step: f64 = step.parse().unwrap();
+                    let points = 1 + ((stop - start) / step).round() as usize;
+                    assert_eq!(result.point_count(), 2 * points);
+                    for outer in 0..2 {
+                        let mut on = false;
+                        for index in 0..points {
+                            let input = start + index as f64 * step;
+                            if on {
+                                on = input >= -1.5;
+                            } else {
+                                on = input > -0.5 || (inclusive == 1 && input >= -0.5);
+                            }
+                            let r = if on { 10. } else { 1e6 };
+                            close(
+                                &format!(
+                                    "{terminal} instant={instantaneous} inclusive={inclusive} input={input} outer={outer}"
+                                ),
+                                value(&result, "v(out)", outer * points + index),
+                                1e3 / (r + 1e3),
+                                1e-10,
+                                1e-13,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn instantaneous_stiff_switch_rc_converges_to_piecewise_physical_solution() -> SpiceResult<()> {
     // 1 V -> switched R -> C, with different physical off/on RC time
     // constants. Before the turn-on event the cap starts at zero; it

@@ -127,9 +127,11 @@ an existing named branch (`%vnam(name)`), and a differential conducting
 branch. Current is signed from the first control terminal to the second;
 the single-ended sensor references ground. A named branch is sampled
 directly without inserting a sensor or another electrical branch.
-Independent input loading remains an ordinary circuit element. Each instance has seven finite accepted
-history slots: the previous time/control, phase anchor time and phase,
-target, requested direction, and optional deadline. Newton candidates
+Independent input loading remains an ordinary circuit element. Each instance retains eight finite history slots: the previous time/control,
+phase anchor time and phase, target, requested direction, optional deadline,
+and the fixed zero-time bias reference. A warm-started DC point selects its
+reference from the previous accepted point, not intermediate Newton iterates;
+a fresh operating-point initialization uses the model hint. Newton candidates
 derive a new state exclusively from the preceding accepted state.
 
 The logarithmic conductance law interpolates smoothly between exact
