@@ -415,6 +415,31 @@ impl FactoredInputs {
     }
 }
 
+fn solve_real_into(
+    sparse: &Sparse<f64>,
+    n: usize,
+    rhs: &Vector,
+    workspace: &mut Vec<f64>,
+    out: &mut Vector,
+    transposed: bool,
+) -> SpiceResult<()> {
+    rhs_valid(rhs, n)?;
+    let factors = sparse.factors()?;
+    factors.solve_into(
+        rhs.as_slice(),
+        workspace,
+        out.overwrite_storage(),
+        transposed,
+    )?;
+    if !out.is_finite() {
+        return Err(numerical(
+            "LU solve",
+            "non-finite solution (singular system)",
+        ));
+    }
+    Ok(())
+}
+
 fn solve_real(
     sparse: &Sparse<f64>,
     n: usize,
@@ -422,20 +447,9 @@ fn solve_real(
     workspace: &mut Vec<f64>,
     transposed: bool,
 ) -> SpiceResult<Vector> {
-    rhs_valid(rhs, n)?;
-    let factors = sparse.factors()?;
-    let x = Vector::from(if transposed {
-        factors.solve_transposed(rhs.as_slice(), workspace)?
-    } else {
-        factors.solve(rhs.as_slice(), workspace)?
-    });
-    if !x.is_finite() {
-        return Err(numerical(
-            "LU solve",
-            "non-finite solution (singular system)",
-        ));
-    }
-    Ok(x)
+    let mut out = Vector::default();
+    solve_real_into(sparse, n, rhs, workspace, &mut out, transposed)?;
+    Ok(out)
 }
 
 impl SparseSymbolic {
@@ -445,14 +459,6 @@ impl SparseSymbolic {
 
     fn solve_with_workspace(&self, rhs: &Vector, workspace: &mut Vec<f64>) -> SpiceResult<Vector> {
         solve_real(&self.sparse, self.n, rhs, workspace, false)
-    }
-
-    fn solve_transposed_with_workspace(
-        &self,
-        rhs: &Vector,
-        workspace: &mut Vec<f64>,
-    ) -> SpiceResult<Vector> {
-        solve_real(&self.sparse, self.n, rhs, workspace, true)
     }
 
     /// Whether a matrix has exactly this assembled pattern.
@@ -615,8 +621,8 @@ pub(in crate::maths) fn factor_shared_complex(
 /// The result of one `NIiter` factor-and-solve step ([`solve_ni`]).
 #[derive(Debug)]
 pub enum NiStep {
-    /// The new iterate.
-    Solved(Vector),
+    /// The supplied output now contains the new iterate.
+    Solved,
     /// `SMPluFac` met a zero pivot with the existing order (`E_SINGULAR`):
     /// `NIiter` sets `NISHOULDREORDER` and reloads before trying again.
     ZeroPivot,
@@ -706,10 +712,33 @@ fn fresh_frame(matrix: &SparseMatrix) -> SpiceResult<LoadedFrame> {
     })
 }
 
+/// Reusable private factor state for an unbound Newton system.
+/// Bound matrices retain the circuit's shared real/complex pivot history.
+#[derive(Debug, Default)]
+pub struct NiWorkspace {
+    ordering: Option<SparseSymbolic>,
+    solve: Vec<f64>,
+    work: PatternWork,
+}
+
+impl NiWorkspace {
+    /// Start a separate unbound solve without inheriting its pivot order.
+    /// The caller-owned gather and factor scratch remains reusable.
+    pub(crate) fn begin_solve(&mut self) {
+        self.ordering = None;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NiPolicy {
+    reorder: bool,
+    diag_gmin: f64,
+}
+
 /// One `NIiter` step on `matrix`: the factorization ngspice performs after a
 /// load, then `SMPsolve`.
 ///
-/// A matrix never ordered (no matching `ordering`; a bound matrix uses its
+/// A matrix never ordered (no matching workspace order; a bound matrix uses its
 /// pattern's persistent frame instead) is MNA-preordered once
 /// (`SMPpreOrder`). Then `LoadGmin(diag_gmin)` and, with `reorder`
 /// (`NISHOULDREORDER`), `spOrderAndFactor`, which keeps every existing pivot
@@ -719,15 +748,16 @@ fn fresh_frame(matrix: &SparseMatrix) -> SpiceResult<LoadedFrame> {
 ///
 /// # Errors
 /// Invalid assembly or RHS, a singular reordered matrix, or a non-finite
-/// solution.
+/// solution. Output is usable only after a successful solved step.
 pub fn solve_ni(
     matrix: &SparseMatrix,
     rhs: &Vector,
-    ordering: &mut Option<SparseSymbolic>,
+    workspace: &mut NiWorkspace,
+    out: &mut Vector,
     reorder: bool,
     diag_gmin: f64,
 ) -> SpiceResult<NiStep> {
-    solve_ni_impl(matrix, rhs, ordering, reorder, diag_gmin, None)
+    solve_ni_impl(matrix, rhs, workspace, out, reorder, diag_gmin, None)
 }
 
 /// Factor and solve a load that recorded its unfolded physical operator.
@@ -738,7 +768,8 @@ pub fn solve_ni(
 pub(crate) fn solve_ni_recorded(
     matrix: &mut SparseMatrix,
     rhs: &Vector,
-    ordering: &mut Option<SparseSymbolic>,
+    workspace: &mut NiWorkspace,
+    out: &mut Vector,
     reorder: bool,
 ) -> SpiceResult<NiStep> {
     let mut original = matrix.take_original().ok_or_else(|| {
@@ -747,7 +778,15 @@ pub(crate) fn solve_ni_recorded(
             "missing original matrix contributions",
         )
     })?;
-    let result = solve_ni_impl(matrix, rhs, ordering, reorder, 0., Some(&mut original));
+    let result = solve_ni_impl(
+        matrix,
+        rhs,
+        workspace,
+        out,
+        reorder,
+        0.,
+        Some(&mut original),
+    );
     matrix.recycle_original(original);
     result
 }
@@ -755,11 +794,13 @@ pub(crate) fn solve_ni_recorded(
 fn solve_ni_impl(
     matrix: &SparseMatrix,
     rhs: &Vector,
-    ordering: &mut Option<SparseSymbolic>,
+    workspace: &mut NiWorkspace,
+    out: &mut Vector,
     reorder: bool,
     diag_gmin: f64,
     original: Option<&mut Vec<crate::maths::Triplet>>,
 ) -> SpiceResult<NiStep> {
+    let policy = NiPolicy { reorder, diag_gmin };
     if let Some((pattern, _)) = matrix.bound_values() {
         return pattern.with_ordering(|state| {
             let mut cached = state
@@ -771,12 +812,12 @@ fn solve_ni_impl(
                 matrix,
                 rhs,
                 &mut cached,
-                reorder,
-                diag_gmin,
-                &mut state.solve_workspace,
+                out,
+                policy,
+                &mut workspace.solve,
                 &mut state.work,
             );
-            if matches!(&step, Ok(NiStep::Solved(_)))
+            if matches!(&step, Ok(NiStep::Solved))
                 && let Some(original) = original
                 && let Some(frame) = &mut cached
             {
@@ -795,11 +836,11 @@ fn solve_ni_impl(
     ni_step(
         matrix,
         rhs,
-        ordering,
-        reorder,
-        diag_gmin,
-        &mut Vec::new(),
-        &mut PatternWork::default(),
+        &mut workspace.ordering,
+        out,
+        policy,
+        &mut workspace.solve,
+        &mut workspace.work,
     )
 }
 
@@ -807,11 +848,12 @@ fn ni_step(
     matrix: &SparseMatrix,
     rhs: &Vector,
     ordering: &mut Option<SparseSymbolic>,
-    reorder: bool,
-    diag_gmin: f64,
+    out: &mut Vector,
+    policy: NiPolicy,
     workspace: &mut Vec<f64>,
     work: &mut PatternWork,
 ) -> SpiceResult<NiStep> {
+    let NiPolicy { reorder, diag_gmin } = policy;
     let pivot = matrix.pivot_tolerances();
     let previous = ordering.take();
     // spFactor of the very inputs the frame's factors came from, with the
@@ -830,9 +872,8 @@ fn ni_step(
         });
     if reuse && let Some(previous) = previous {
         work.exact_input_hits = work.exact_input_hits.saturating_add(1);
-        let result = previous
-            .solve_with_workspace(rhs, workspace)
-            .map(NiStep::Solved);
+        let result = solve_real_into(&previous.sparse, previous.n, rhs, workspace, out, false)
+            .map(|()| NiStep::Solved);
         work.record_rhs(&result);
         *ordering = Some(previous);
         return result;
@@ -881,9 +922,9 @@ fn ni_step(
         if zero_pivot {
             return Ok(NiStep::ZeroPivot);
         }
-        let result = factored.solve_with_workspace(rhs, workspace);
+        let result = solve_real_into(&factored.sparse, factored.n, rhs, workspace, out, false);
         work.record_rhs(&result);
-        result.map(NiStep::Solved)
+        result.map(|()| NiStep::Solved)
     });
     *ordering = Some(factored);
     result
@@ -971,7 +1012,7 @@ fn refine_retained_rhs(
     rhs: &Vector,
     initial: Vector,
     transpose: bool,
-    mut solve: impl FnMut(&Vector) -> SpiceResult<Vector>,
+    mut solve: impl FnMut(&Vector, &mut Vector) -> SpiceResult<()>,
 ) -> SpiceResult<Option<Vector>> {
     use crate::maths::equilibration::OriginalResidual;
 
@@ -980,10 +1021,11 @@ fn refine_retained_rhs(
     let mut current = initial;
     let mut best_change = f64::INFINITY;
     let mut residual = Vector::zeros(order);
+    let mut next = Vector::default();
     let mut stalled = 0;
     for _ in 0..MAX_RECOVERED_RHS_CORRECTIONS {
         original.correction_into(rhs.as_slice(), current.as_slice(), residual.as_mut_slice())?;
-        let mut next = solve(&residual)?;
+        solve(&residual, &mut next)?;
         let relative = update_coordinates(&mut next, &current);
         if !next.is_finite() || !relative.is_finite() {
             return Ok(None);
@@ -1000,7 +1042,7 @@ fn refine_retained_rhs(
                 break;
             }
         }
-        current = next;
+        std::mem::swap(&mut current, &mut next);
     }
     Ok(None)
 }
@@ -1022,23 +1064,21 @@ fn solve_retained_rhs(
     {
         return original.solve_wide(symbolic.n, rhs, transpose, work);
     }
-    let mut solve = |rhs: &Vector| {
-        let result = if transpose {
-            symbolic.solve_transposed_with_workspace(rhs, workspace)
-        } else {
-            symbolic.solve_with_workspace(rhs, workspace)
-        };
+    let mut solve = |rhs: &Vector, out: &mut Vector| {
+        let result = solve_real_into(&symbolic.sparse, symbolic.n, rhs, workspace, out, transpose);
         work.record_rhs(&result);
         result
     };
+    let mut initial = Vector::default();
+    let result = solve(rhs, &mut initial);
     if let Some(original) = &symbolic.original {
-        if let Ok(Some(solution)) = solve(rhs).and_then(|initial| {
+        if let Ok(Some(solution)) = result.and_then(|()| {
             refine_retained_rhs(symbolic.n, &original.stamps, rhs, initial, transpose, solve)
         }) {
             return Ok(solution);
         }
     } else {
-        return solve(rhs);
+        return result.map(|()| initial);
     }
     symbolic
         .original
@@ -1402,11 +1442,27 @@ mod tests {
             })
         };
         for _ in 0..2 {
-            solve_ni(&a, &rhs, &mut None, false, 0.).unwrap();
+            solve_ni(
+                &a,
+                &rhs,
+                &mut NiWorkspace::default(),
+                &mut Vector::default(),
+                false,
+                0.,
+            )
+            .unwrap();
         }
         let before = read();
         a.set(0, 0, 4.).unwrap();
-        solve_ni(&a, &rhs, &mut None, false, 0.).unwrap();
+        solve_ni(
+            &a,
+            &rhs,
+            &mut NiWorkspace::default(),
+            &mut Vector::default(),
+            false,
+            0.,
+        )
+        .unwrap();
         assert_eq!(before, read());
         let snapshot = pattern.with_ordering(|state| {
             let Some(CachedFrame::Real(symbolic)) = &state.frame else {
@@ -1416,7 +1472,15 @@ mod tests {
         });
         let x = snapshot.solve(&rhs).unwrap();
         a.set(0, 0, 5.).unwrap();
-        solve_ni(&a, &rhs, &mut None, false, 0.).unwrap();
+        solve_ni(
+            &a,
+            &rhs,
+            &mut NiWorkspace::default(),
+            &mut Vector::default(),
+            false,
+            0.,
+        )
+        .unwrap();
         assert_eq!(snapshot.solve(&rhs).unwrap(), x);
         assert_ne!(before.0, read().0);
         assert_ne!(before.1, read().1);
@@ -1495,9 +1559,15 @@ mod tests {
         // Establish a clean refactorized frame, not just a fresh pivot order.
         for _ in 0..2 {
             load(&mut matrix, small, true);
-            let NiStep::Solved(raw) =
-                solve_ni_recorded(&mut matrix, &rhs, &mut None, false).unwrap()
-            else {
+            let mut raw = Vector::default();
+            let NiStep::Solved = solve_ni_recorded(
+                &mut matrix,
+                &rhs,
+                &mut NiWorkspace::default(),
+                &mut raw,
+                false,
+            )
+            .unwrap() else {
                 panic!("expected a valid factor")
             };
             assert!((raw.as_slice()[0] - 1.).abs() > 1e-6);
@@ -1509,8 +1579,15 @@ mod tests {
         load(&mut matrix, changed, true);
         assert_eq!(matrix.bound_values().unwrap().1, rounded);
         assert!(matches!(
-            solve_ni_recorded(&mut matrix, &rhs, &mut None, false).unwrap(),
-            NiStep::Solved(_)
+            solve_ni_recorded(
+                &mut matrix,
+                &rhs,
+                &mut NiWorkspace::default(),
+                &mut Vector::default(),
+                false
+            )
+            .unwrap(),
+            NiStep::Solved
         ));
         assert_eq!(
             pattern.factor_telemetry().work.exact_input_hits,
@@ -1520,7 +1597,16 @@ mod tests {
         assert_eq!(pattern.factor_telemetry().work.factor, work.factor);
         // An ordinary load clears even a bit-identical retained operator.
         load(&mut matrix, changed, false);
-        let NiStep::Solved(plain) = solve_ni(&matrix, &rhs, &mut None, false, 0.).unwrap() else {
+        let mut plain = Vector::default();
+        let NiStep::Solved = solve_ni(
+            &matrix,
+            &rhs,
+            &mut NiWorkspace::default(),
+            &mut plain,
+            false,
+            0.,
+        )
+        .unwrap() else {
             panic!("expected a valid factor")
         };
         assert_eq!(solve_last_factors(&pattern, &rhs).unwrap().unwrap(), plain);
@@ -1547,8 +1633,15 @@ mod tests {
         };
         load(&mut matrix, 1.);
         let rhs = Vector::from_slice(&[4., 6.]);
-        let NiStep::Solved(raw) = solve_ni_recorded(&mut matrix, &rhs, &mut None, false).unwrap()
-        else {
+        let mut raw = Vector::default();
+        let NiStep::Solved = solve_ni_recorded(
+            &mut matrix,
+            &rhs,
+            &mut NiWorkspace::default(),
+            &mut raw,
+            false,
+        )
+        .unwrap() else {
             panic!("expected valid binary64 factors")
         };
         // Rounded A[0,0] is 0.25, unfolded A[0,0] is 1.25.
@@ -1571,8 +1664,15 @@ mod tests {
         assert_eq!(matrix.bound_values().unwrap().1, rounded);
         let rhs = Vector::from_slice(&[5., 6.]);
         assert!(matches!(
-            solve_ni_recorded(&mut matrix, &rhs, &mut None, false).unwrap(),
-            NiStep::Solved(_)
+            solve_ni_recorded(
+                &mut matrix,
+                &rhs,
+                &mut NiWorkspace::default(),
+                &mut Vector::default(),
+                false
+            )
+            .unwrap(),
+            NiStep::Solved
         ));
         assert_eq!(
             solve_last_factors(&pattern, &rhs)
@@ -1593,8 +1693,16 @@ mod tests {
         }
         let source = Vector::from_slice(&[5., 7.]);
         assert!(matches!(
-            solve_ni(&matrix, &source, &mut None, false, 0.).unwrap(),
-            NiStep::Solved(_)
+            solve_ni(
+                &matrix,
+                &source,
+                &mut NiWorkspace::default(),
+                &mut Vector::default(),
+                false,
+                0.
+            )
+            .unwrap(),
+            NiStep::Solved
         ));
         let output = Vector::from_slice(&[1., -1.]);
         let adjoint = solve_last_factors_transposed(&pattern, &output)
@@ -1610,7 +1718,17 @@ mod tests {
         let directly = primal.as_slice()[0] - primal.as_slice()[1];
         assert!((projected - directly).abs() < 1e-14);
         matrix.set(0, 0, f64::from_bits(1)).unwrap();
-        assert!(solve_ni(&matrix, &source, &mut None, false, 0.).is_err());
+        assert!(
+            solve_ni(
+                &matrix,
+                &source,
+                &mut NiWorkspace::default(),
+                &mut Vector::default(),
+                false,
+                0.
+            )
+            .is_err()
+        );
         assert!(
             solve_last_factors_transposed(&pattern, &output)
                 .unwrap()
@@ -1628,16 +1746,37 @@ mod tests {
         let rhs = Vector::from_slice(&[3., 3.]);
         for _ in 0..2 {
             assert!(matches!(
-                solve_ni(&a, &rhs, &mut None, false, 0.).unwrap(),
-                NiStep::Solved(_)
+                solve_ni(
+                    &a,
+                    &rhs,
+                    &mut NiWorkspace::default(),
+                    &mut Vector::default(),
+                    false,
+                    0.
+                )
+                .unwrap(),
+                NiStep::Solved
             ));
         }
         assert!(solve_last_factors(&pattern, &rhs).unwrap().is_some());
         a.set(0, 0, f64::from_bits(1)).unwrap();
-        assert!(solve_ni(&a, &rhs, &mut None, false, 0.).is_err());
+        assert!(
+            solve_ni(
+                &a,
+                &rhs,
+                &mut NiWorkspace::default(),
+                &mut Vector::default(),
+                false,
+                0.
+            )
+            .is_err()
+        );
         assert!(solve_last_factors(&pattern, &rhs).unwrap().is_none());
         a.set(0, 0, 2.).unwrap();
-        let NiStep::Solved(x) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+        let mut x = Vector::default();
+        let NiStep::Solved =
+            solve_ni(&a, &rhs, &mut NiWorkspace::default(), &mut x, false, 0.).unwrap()
+        else {
             panic!("factor recovery failed")
         };
         assert_eq!(x.as_slice(), &[1., 1.]);
@@ -1693,7 +1832,10 @@ mod tests {
             a.add(r, c, value).unwrap();
         }
         let rhs = Vector::from_slice(&[5., 10.]);
-        let NiStep::Solved(real) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+        let mut real = Vector::default();
+        let NiStep::Solved =
+            solve_ni(&a, &rhs, &mut NiWorkspace::default(), &mut real, false, 0.).unwrap()
+        else {
             panic!("initial real solve failed");
         };
         let mut e = SparseMatrix::new(2, 2);
@@ -1727,7 +1869,10 @@ mod tests {
         assert_eq!(Arc::strong_count(sparse), 1);
         pattern.with_ordering(|state| state.frame = Some(frame));
         assert_eq!(solve_last_factors(&pattern, &rhs).unwrap(), None);
-        let NiStep::Solved(after) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+        let mut after = Vector::default();
+        let NiStep::Solved =
+            solve_ni(&a, &rhs, &mut NiWorkspace::default(), &mut after, false, 0.).unwrap()
+        else {
             panic!("real refactor failed");
         };
         assert_eq!(real, after);
@@ -1761,13 +1906,26 @@ mod tests {
                 .as_slice(),
             &[1., 2.]
         );
-        let NiStep::Solved(x) = solve_ni(&a, &rhs, &mut ordering, false, 0.).unwrap() else {
+        let mut x = Vector::default();
+        let mut ni_workspace = NiWorkspace::default();
+        let NiStep::Solved = solve_ni(&a, &rhs, &mut ni_workspace, &mut x, false, 0.).unwrap()
+        else {
             panic!("unexpected zero pivot");
         };
         assert_eq!(x.as_slice(), &[1., 2.]);
         a.add(0, 0, f64::MAX).unwrap();
         a.add(0, 0, f64::MAX).unwrap();
-        assert!(solve_ni(&a, &rhs, &mut ordering, false, 0.).is_err());
+        assert!(
+            solve_ni(
+                &a,
+                &rhs,
+                &mut ni_workspace,
+                &mut Vector::default(),
+                false,
+                0.
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1778,7 +1936,16 @@ mod tests {
         a.add(1, 0, 3.).unwrap();
         a.add(1, 1, 4.).unwrap();
         let rhs = Vector::from_slice(&[4., 11.]);
-        let NiStep::Solved(before) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+        let mut before = Vector::default();
+        let NiStep::Solved = solve_ni(
+            &a,
+            &rhs,
+            &mut NiWorkspace::default(),
+            &mut before,
+            false,
+            0.,
+        )
+        .unwrap() else {
             panic!("first factorization failed");
         };
         assert_eq!(
@@ -1802,7 +1969,10 @@ mod tests {
         // The retained frame is retyped with zero coefficients. Its order
         // can be reused, but it cannot answer a real solve until reloaded.
         assert_eq!(solve_last_factors(&pattern, &rhs).unwrap(), None);
-        let NiStep::Solved(after) = solve_ni(&a, &rhs, &mut None, false, 0.).unwrap() else {
+        let mut after = Vector::default();
+        let NiStep::Solved =
+            solve_ni(&a, &rhs, &mut NiWorkspace::default(), &mut after, false, 0.).unwrap()
+        else {
             panic!("refactorization failed");
         };
         assert_eq!(before, after);

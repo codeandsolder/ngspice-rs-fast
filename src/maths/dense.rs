@@ -585,6 +585,12 @@ impl From<Vec<Real>> for Vector {
     }
 }
 
+impl Default for Vector {
+    fn default() -> Self {
+        Self::zeros(0)
+    }
+}
+
 impl Vector {
     /// A zeroed vector of `len` elements.
     #[must_use = "the allocated zero vector must be retained to supply initial vector storage"]
@@ -681,6 +687,21 @@ impl Vector {
         // Arbitrary writes cannot preserve an original contribution ledger.
         self.original = None;
         &mut self.data
+    }
+
+    /// Reuse the numerical storage without retaining a stamp ledger that
+    /// describes a different vector.
+    pub(super) fn overwrite_storage(&mut self) -> &mut Vec<Real> {
+        self.original = None;
+        self.peak_stamp = super::StampPeak::DISABLED;
+        &mut self.data
+    }
+
+    /// Copy numerical values into reusable solution storage.
+    pub(crate) fn copy_values_from(&mut self, source: &Self) {
+        let data = self.overwrite_storage();
+        data.clear();
+        data.extend_from_slice(source.as_slice());
     }
 
     /// Sets every element to zero.

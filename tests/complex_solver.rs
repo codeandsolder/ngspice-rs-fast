@@ -106,7 +106,7 @@ fn exactly_singular_homogeneous_systems_are_rejected() {
 
 #[test]
 fn measured_complex_and_real_cache_transitions_preserve_snapshot_work() {
-    use ngspice_rs::maths::{FactorWork, Pattern, SparseLu, Vector, solve_ni};
+    use ngspice_rs::maths::{FactorWork, NiWorkspace, Pattern, SparseLu, Vector, solve_ni};
     use std::sync::Arc;
     let p = Arc::new(Pattern::new(2, [(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap());
     let mut g = SparseMatrix::bound(Arc::clone(&p)).unwrap();
@@ -120,7 +120,15 @@ fn measured_complex_and_real_cache_transitions_preserve_snapshot_work() {
     e.add(0, 0, 1.).unwrap();
     e.add(1, 1, 2.).unwrap();
     let r = Vector::from_slice(&[5., 6.]);
-    solve_ni(&g, &r, &mut None, true, 0.).unwrap();
+    solve_ni(
+        &g,
+        &r,
+        &mut NiWorkspace::default(),
+        &mut Vector::default(),
+        true,
+        0.,
+    )
+    .unwrap();
     let ac = |g: &SparseMatrix, e: &SparseMatrix, omega| {
         ComplexMatrix::from_operators_on(&p, g, e, omega)
             .unwrap()
@@ -164,7 +172,15 @@ fn measured_complex_and_real_cache_transitions_preserve_snapshot_work() {
     assert_eq!(retry.factor_work().successful_factors, 1);
     assert_eq!(retry.factor_storage().original_entries, 4);
     assert_eq!(first.solve(&b).unwrap(), before);
-    solve_ni(&g, &r, &mut None, false, 0.).unwrap();
+    solve_ni(
+        &g,
+        &r,
+        &mut NiWorkspace::default(),
+        &mut Vector::default(),
+        false,
+        0.,
+    )
+    .unwrap();
     let after = p.factor_telemetry();
     assert_eq!(after.work.complex_to_real, 1);
     assert_eq!(
@@ -304,7 +320,17 @@ fn unreferenced_named_unknowns_fail_all_factorization_paths() {
             diagnostic(matrix.factorize().unwrap_err());
             diagnostic(matrix.factorize_new_matrix().unwrap_err());
             diagnostic(SparseLu::new(g, None).unwrap_err());
-            diagnostic(solve_ni(g, &Vector::zeros(3), &mut None, false, 0.).unwrap_err());
+            diagnostic(
+                solve_ni(
+                    g,
+                    &Vector::zeros(3),
+                    &mut NiWorkspace::default(),
+                    &mut Vector::default(),
+                    false,
+                    0.,
+                )
+                .unwrap_err(),
+            );
         }
         let mut batch = IndependentComplexBatch::default();
         for result in batch.factorize(&[matrix.clone(), matrix.clone(), matrix]) {
