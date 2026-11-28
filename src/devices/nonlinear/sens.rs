@@ -24,7 +24,7 @@ use crate::devices::sensitivity::{
     ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityParameter as P,
     SensitivityRecord, StampPart, node_stamps, stamp_reset, written,
 };
-use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
+use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// `DIOmPTable` entries `set_param()` accepts in a DC analysis (the `IF_AC`
 /// `tt`, `ttt1`, `ttt2`, `cjo` follow in AC; `tnom`, `rsw` and the SOA and
@@ -547,7 +547,7 @@ mod tests {
     use super::*;
     use crate::devices::Device;
     use crate::devices::{ModelContext, initial::InstanceInitial};
-    use crate::primitives::{NodeTable, SourceLoc};
+    use crate::primitives::{NodeId, NodeTable, SourceLoc};
     use std::path::PathBuf;
 
     fn diode(model: &[(&str, Real)], instance: &[(&str, Real)], context: &ModelContext) -> Diode {
