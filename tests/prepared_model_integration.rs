@@ -155,6 +155,7 @@ fn descriptor(charge: Capability) -> Descriptor {
         charge,
         noise: Capability::Computed,
         trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
+        taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
     }
 }
 
@@ -948,6 +949,7 @@ fn electrothermal_descriptor() -> Descriptor {
         charge: Capability::Computed,
         noise: Capability::Zero,
         trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
+        taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
     }
 }
 
@@ -1225,7 +1227,7 @@ fn actual_vdmos_artifact_binds_hidden_rows_solves_and_reprepares_candidates() {
     assert_eq!(circuit.unknown_count(), 3 * (hidden + 4));
     assert_eq!(
         circuit.state_len(),
-        3 * 2 * model.descriptor().equations.len()
+        3 * (3 * model.descriptor().equations.len() + 1)
     );
     let context = ModelContext::default();
     let options = NewtonOptions {

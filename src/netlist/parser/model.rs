@@ -86,6 +86,7 @@ fn parameters(input: &mut Input<'_>, base: &str) -> Result<Vec<ParameterAssignme
             (|input: &mut Input<'_>| cpl_vector(input, base)).map(Some),
             (|input: &mut Input<'_>| code_vector(input, base)).map(Some),
             (|input: &mut Input<'_>| code_boolean(input, base)).map(Some),
+            (|input: &mut Input<'_>| legacy_partition(input, base)).map(Some),
             (|input: &mut Input<'_>| super::flags::model(input, base)).map(Some),
             (|input: &mut Input<'_>| version_assignment(input, base)).map(Some),
             scalar_assignment.map(Some),
@@ -99,6 +100,36 @@ fn parameters(input: &mut Input<'_>, base: &str) -> Result<Vec<ParameterAssignme
         parameters
     })
     .parse_next(input)
+}
+
+// BSIM1 declares XPART as a flag, while BSIM2/3/4 declare a real
+// scalar. Retain the source shape here and validate it after LEVEL dispatch.
+fn legacy_partition(input: &mut Input<'_>, base: &str) -> Result<ParameterAssignment> {
+    if !matches!(base, "nmos" | "pmos")
+        || !input
+            .input
+            .first()
+            .is_some_and(|token| token.is_keyword("xpart"))
+        || input.input.get(1).is_some_and(|next| {
+            next.kind == TokenKind::Equals
+                || next.number().is_some()
+                || super::expression::is_expression_token(next)
+        })
+    {
+        return Err(winnow::error::ErrMode::Backtrack(Failure(
+            crate::primitives::SpiceError::parse(
+                input.state.card.location.clone(),
+                "expected bare partition flag",
+            ),
+        )));
+    }
+    let token = any.parse_next(input)?;
+    Ok(ParameterAssignment {
+        name: "xpart".into(),
+        value: String::new(),
+        kind: ParameterKind::Flag,
+        location: token.location.clone(),
+    })
 }
 
 /// `INPfindVer`/`IF_STRING` retain a bare dotted VERSION token, not a float.
