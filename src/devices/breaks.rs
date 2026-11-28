@@ -96,13 +96,19 @@ impl Events {
     }
 }
 
+// Ordinary source schedules have few simultaneous pending corners. Bound
+// the contiguous search/shift cost; retain the ordered index for large sets.
+const INLINE_BREAKS: usize = 8;
+
 /// C's breakpoint table `CKTbreaks`: at least two entries, normally ascending.
 ///
-/// Lookup and removal use the ordered index rather than scanning or shifting
-/// the pending events. Equal entries and the terminal sentinel retain C order.
+/// Small pending sets use bounded inline storage; larger sets use the ordered
+/// index, avoiding unbounded scans or shifts. Equal entries and the terminal
+/// sentinel retain C order.
 #[derive(Debug, Clone)]
 pub struct BreakTable {
     breaks: std::collections::BTreeMap<EventKey, Events>,
+    inline: [Real; INLINE_BREAKS],
     len: usize,
     min_break: Real,
     final_time: Real,
@@ -130,15 +136,15 @@ impl BreakTable {
                 "invalid final time or breakpoint merge distance",
             ));
         }
-        let mut table = Self {
+        let mut inline = [0.; INLINE_BREAKS];
+        inline[1] = final_time;
+        Ok(Self {
             breaks: std::collections::BTreeMap::new(),
-            len: 0,
+            inline,
+            len: 2,
             min_break,
             final_time,
-        };
-        table.insert(0., false);
-        table.insert(final_time, false);
-        Ok(table)
+        })
     }
 
     /// `CKTminBreak`.
@@ -150,6 +156,9 @@ impl BreakTable {
     /// `CKTbreaks[0]`, the next breakpoint.
     #[must_use = "the returned time bounds the next accepted step"]
     pub fn first(&self) -> Real {
+        if self.breaks.is_empty() {
+            return self.inline[0];
+        }
         self.breaks
             .first_key_value()
             .map_or(self.final_time, |(_, events)| events.first)
@@ -158,13 +167,24 @@ impl BreakTable {
     /// `CKTbreaks[1]`, the breakpoint after the next.
     #[must_use = "the returned time identifies the following pending breakpoint"]
     pub fn second(&self) -> Real {
-        self.times().nth(1).unwrap_or(self.final_time)
+        if self.breaks.is_empty() {
+            return self.inline[1];
+        }
+        self.breaks
+            .values()
+            .flat_map(Events::iter)
+            .nth(1)
+            .unwrap_or(self.final_time)
     }
 
     /// Borrow the event order (including duplicate sentinels); no snapshot
     /// allocation is needed to inspect or iterate the pending table.
     pub fn times(&self) -> impl Iterator<Item = Real> + '_ {
-        self.breaks.values().flat_map(Events::iter)
+        let inline_len = if self.breaks.is_empty() { self.len } else { 0 };
+        self.inline[..inline_len]
+            .iter()
+            .copied()
+            .chain(self.breaks.values().flat_map(Events::iter))
     }
 
     /// The pending entry count, including both terminal sentinel entries.
@@ -196,6 +216,41 @@ impl BreakTable {
                 entry.remove();
             }
             self.len -= 1;
+        }
+    }
+
+    /// Insert in the bounded contiguous representation. Returns false only
+    /// when a new event needs more space (no state has then changed).
+    fn set_inline(&mut self, time: Real) -> bool {
+        let times = &mut self.inline[..self.len];
+        let index = times
+            .iter()
+            .position(|&entry| entry > time)
+            .unwrap_or(self.len);
+        if index < self.len && times[index] - time <= self.min_break {
+            times[index] = time;
+            return true;
+        }
+        if index > 0 && time - times[index - 1] <= self.min_break {
+            return true;
+        }
+        if self.len == INLINE_BREAKS {
+            return false;
+        }
+        self.inline.copy_within(index..self.len, index + 1);
+        self.inline[index] = time;
+        self.len += 1;
+        true
+    }
+
+    fn promote(&mut self) {
+        let len = self.len;
+        self.len = 0;
+        let mut after_terminal = false;
+        for index in 0..len {
+            let time = self.inline[index];
+            after_terminal |= index > 0 && time < self.inline[index - 1];
+            self.insert(time, after_terminal);
         }
     }
 
@@ -233,6 +288,14 @@ impl BreakTable {
                 message: format!("breakpoint {time:e} in the past (time {now:e})"),
             });
         }
+        if self.breaks.is_empty() {
+            if self.set_inline(time) {
+                return Ok(());
+            }
+            // Retain the index after a spill: recurrent large schedules must
+            // not reallocate it whenever the pending count crosses a threshold.
+            self.promote();
+        }
         if let Some((key, successor)) = self.successor(time) {
             if successor - time <= self.min_break {
                 // Replace exactly the first occurrence of the successor.
@@ -257,6 +320,15 @@ impl BreakTable {
     /// `CKTclrBreak`: drops the first entry; a two-entry table becomes
     /// `{CKTbreaks[1], CKTfinalTime}`, even if that reverses the order.
     pub fn clear(&mut self) {
+        if self.breaks.is_empty() {
+            self.inline.copy_within(1..self.len, 0);
+            if self.len > 2 {
+                self.len -= 1;
+            } else {
+                self.inline[1] = self.final_time;
+            }
+            return;
+        }
         if let Some((&key, _)) = self.breaks.first_key_value() {
             self.remove_first_of(key);
         }
@@ -1071,10 +1143,89 @@ mod tests {
     }
 
     #[test]
+    fn inline_spill_preserves_inverted_terminal_and_duplicates() {
+        let mut table = BreakTable::new(10., 0.25).unwrap();
+        let mut reference = Reference::new(10., 0.25);
+        assert!(reference.set(0., 12.));
+        table.set(0., 12.).unwrap();
+        for _ in 0..2 {
+            table.clear();
+            reference.clear();
+        }
+        reference.compare(&table);
+        for cycle in 0..4 {
+            for i in 1..=16 {
+                let time = Real::from(i + cycle * 20);
+                assert_eq!(table.set(-1., time).is_ok(), reference.set(-1., time));
+                reference.compare(&table);
+            }
+            for time in [1.5, 1.25, 1., -0., 0.] {
+                assert_eq!(table.set(-1., time).is_ok(), reference.set(-1., time));
+                reference.compare(&table);
+            }
+            assert!(!table.breaks.is_empty());
+            while reference.times.len() > 2 {
+                table.clear();
+                reference.clear();
+                reference.compare(&table);
+            }
+            assert!(!table.breaks.is_empty());
+        }
+    }
+
+    #[test]
     fn invalid_constructor_inputs_cannot_enter_the_ordered_index() {
         for invalid in [Real::NAN, Real::INFINITY, Real::NEG_INFINITY, -1.] {
             assert!(BreakTable::new(invalid, 0.).is_err());
             assert!(BreakTable::new(1., invalid).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in source-driven breakpoint occupancy measurement"]
+    fn pulse_schedule_occupancy() {
+        for count in [1_u32, 4, 8, 16, 64] {
+            let stop = 20.;
+            let mut system = LinearSystem::new(0);
+            for i in 0..count {
+                system.sources.push(schedulable_source(
+                    SourceKind::Voltage,
+                    Waveform::Pulse(
+                        Pulse::new(
+                            0.,
+                            1.,
+                            Real::from(i) / Real::from(count),
+                            0.02,
+                            0.03,
+                            0.25,
+                            1. + Real::from(i) * 0.001,
+                        )
+                        .unwrap(),
+                    ),
+                ));
+            }
+            let timing = TransientTiming::new(0.01, stop).unwrap();
+            let mut sources = SourceBreaks::new(&system);
+            let mut table = BreakTable::new(stop, 1e-10).unwrap();
+            let mut visits = 0;
+            let mut small = 0;
+            let mut peak = 0;
+            let mut now = 0.;
+            while now < stop {
+                sources
+                    .accept(SourceKind::Voltage, now, true, &timing, &mut table)
+                    .unwrap();
+                visits += 1;
+                small += usize::from(table.len() <= INLINE_BREAKS);
+                peak = peak.max(table.len());
+                while table.first() <= now {
+                    table.clear();
+                }
+                now = table.first();
+            }
+            println!(
+                "sources={count},accepted={visits},inline_eligible={small},peak_pending={peak}"
+            );
         }
     }
 
