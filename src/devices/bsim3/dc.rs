@@ -22,14 +22,13 @@ use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use crate::devices::bsim_physics::{
-    bsim3_junction, channel_conductance, dibl_early_voltage, impact_ionization, poly_depletion,
-    rational_floor, reciprocal_floor, saturation_early_voltage, saturation_shape,
-    saturation_voltage, series_conductance, smooth_drain, substrate_early_voltage,
+    ThresholdRollOff, bsim3_body_limit, bsim3_junction, bsim3_overdrive, channel_conductance,
+    dibl_early_voltage, impact_ionization, poly_depletion, rational_floor, reciprocal_floor,
+    saturation_early_voltage, saturation_shape, saturation_voltage, series_conductance,
+    smooth_drain, substrate_early_voltage, surface_potential,
 };
 use crate::primitives::{Real, SpiceResult};
 
-const EXP_THRESHOLD: Real = 34.0;
-const MIN_EXP: Real = 1.713_908_431e-15;
 const MAX_EXP: Real = 5.834_617_425e14;
 const EPS_SI: Real = 1.035_94e-10;
 const CHARGE_Q: Real = 1.602_19e-19;
@@ -222,24 +221,12 @@ impl DcModel<'_> {
         // Body-effect and depletion charge.
         let vbsc = p.derived.vbsc;
         let phi = p.derived.phi;
-        let t0 = vbs - vbsc - 0.001;
-        let t1 = 0.004f64.mul_add(-vbsc, t0 * t0).sqrt();
-        let vbseff_raw = vbsc + f64::midpoint(t0, t1);
-        let dvbseff_dvb = f64::midpoint(1.0, t0 / t1);
-        let vbseff = if vbseff_raw < vbs { vbs } else { vbseff_raw };
-        let (sqrt_phis, dsqrt_phis_dvb, phis, dphis_dvb);
-        if vbseff > 0.0 {
-            let t0 = phi / (phi + vbseff);
-            phis = phi * t0;
-            dphis_dvb = -t0 * t0;
-            sqrt_phis = p.derived.phis3 / 0.5f64.mul_add(vbseff, phi);
-            dsqrt_phis_dvb = -0.5 * sqrt_phis * sqrt_phis / p.derived.phis3;
-        } else {
-            phis = phi - vbseff;
-            dphis_dvb = -1.0;
-            sqrt_phis = phis.sqrt();
-            dsqrt_phis_dvb = -0.5 / sqrt_phis;
-        }
+        let (vbseff, dvbseff_dvb) = bsim3_body_limit(&vbs, vbsc)?;
+        let surface = surface_potential(&vbseff, phi, Some(p.derived.phis3))?;
+        let phis = surface.potential;
+        let sqrt_phis = surface.root;
+        let dphis_dvb = surface.potential_partial;
+        let dsqrt_phis_dvb = surface.root_partial;
         let xdep = p.derived.xdep0 * sqrt_phis / p.derived.sqrtphi;
         let dxdep_dvb = (p.derived.xdep0 / p.derived.sqrtphi) * dsqrt_phis_dvb;
 
@@ -258,38 +245,16 @@ impl DcModel<'_> {
         let dltw_dvb = factor1 * t3.mul_add(t2, 0.5 / t3 * t1 * dxdep_dvb);
 
         // Narrow/short-channel threshold shifts.
-        let (theta0, dtheta0_dvb) = {
-            let t0 = -0.5 * p.binned.dvt1 * leff / lt1;
-            if t0 > -EXP_THRESHOLD {
-                let t1 = t0.exp();
-                let dt1_dvb = -t0 / lt1 * t1 * dlt1_dvb;
-                (
-                    t1 * 2.0f64.mul_add(t1, 1.0),
-                    4.0f64.mul_add(t1, 1.0) * dt1_dvb,
-                )
-            } else {
-                let t1 = MIN_EXP;
-                (t1 * 2.0f64.mul_add(t1, 1.0), 0.0)
-            }
-        };
+        let argument = -0.5 * p.binned.dvt1 * leff / lt1;
+        let (theta0, slope) = ThresholdRollOff::Bsim3.evaluate(&argument)?;
+        let dtheta0_dvb = -slope * argument / lt1 * dlt1_dvb;
         let thetavth = p.binned.dvt0 * theta0;
         let delt_vth = thetavth * v0;
         let ddelt_vth_dvb = p.binned.dvt0 * dtheta0_dvb * v0;
 
-        let (t2w, dt2w_dvb) = {
-            let t0 = -0.5 * p.binned.dvt1w * p.weff * leff / ltw;
-            if t0 > -EXP_THRESHOLD {
-                let t1 = t0.exp();
-                let dt1_dvb = -t0 / ltw * t1 * dltw_dvb;
-                (
-                    t1 * 2.0f64.mul_add(t1, 1.0),
-                    4.0f64.mul_add(t1, 1.0) * dt1_dvb,
-                )
-            } else {
-                let t1 = MIN_EXP;
-                (t1 * 2.0f64.mul_add(t1, 1.0), 0.0)
-            }
-        };
+        let argument = -0.5 * p.binned.dvt1w * p.weff * leff / ltw;
+        let (t2w, slope) = ThresholdRollOff::Bsim3.evaluate(&argument)?;
+        let dt2w_dvb = -slope * argument / ltw * dltw_dvb;
         let t0 = p.binned.dvt0w * t2w;
         let t2 = t0 * v0;
         let dt2_dvb = p.binned.dvt0w * dt2w_dvb * v0;
@@ -358,47 +323,11 @@ impl DcModel<'_> {
         let vgst = vgs_eff - vth;
 
         // Effective gate overdrive (Vgsteff), with C's three regimes.
-        let t10 = 2.0 * n * vtm;
-        let vgst_nvt = vgst / t10;
-        let exp_arg = 2.0f64.mul_add(p.binned.voff, -vgst) / t10;
-        let (vgsteff, mut dvgsteff_dvg, dvgsteff_dvd, dvgsteff_dvb);
-        if vgst_nvt > EXP_THRESHOLD {
-            vgsteff = vgst;
-            dvgsteff_dvg = dvgseff_dvg;
-            dvgsteff_dvd = -dvth_dvd;
-            dvgsteff_dvb = -dvth_dvb;
-        } else if exp_arg > EXP_THRESHOLD {
-            let t0 = (vgst - p.binned.voff) / (n * vtm);
-            let exp_vgst = t0.exp();
-            vgsteff = vtm * p.derived.cdep0 / cox * exp_vgst;
-            dvgsteff_dvg = vgsteff / (n * vtm);
-            dvgsteff_dvd = -dvgsteff_dvg * (t0 * vtm).mul_add(dn_dvd, dvth_dvd);
-            dvgsteff_dvb = -dvgsteff_dvg * (t0 * vtm).mul_add(dn_dvb, dvth_dvb);
-            dvgsteff_dvg *= dvgseff_dvg;
-        } else {
-            let exp_vgst = vgst_nvt.exp();
-            let t1 = t10 * exp_vgst.ln_1p();
-            let dt1_dvg = exp_vgst / (1.0 + exp_vgst);
-            let dt1_dvb = (t1 / n).mul_add(dn_dvb, -dt1_dvg * (vgst / n).mul_add(dn_dvb, dvth_dvb));
-            let dt1_dvd = (t1 / n).mul_add(dn_dvd, -dt1_dvg * (vgst / n).mul_add(dn_dvd, dvth_dvd));
-
-            let dt2_dvg = -cox / (vtm * p.derived.cdep0) * exp_arg.exp();
-            let t2v = t10.mul_add(-dt2_dvg, 1.0);
-            let dt2_dvd = ((t2v - 1.0) / n).mul_add(
-                dn_dvd,
-                -dt2_dvg * (2.0 * vtm * exp_arg).mul_add(-dn_dvd, dvth_dvd),
-            );
-            let dt2_dvb = ((t2v - 1.0) / n).mul_add(
-                dn_dvb,
-                -dt2_dvg * (2.0 * vtm * exp_arg).mul_add(-dn_dvb, dvth_dvb),
-            );
-
-            vgsteff = t1 / t2v;
-            let t3 = t2v * t2v;
-            dvgsteff_dvg = t1.mul_add(-dt2_dvg, t2v * dt1_dvg) / t3 * dvgseff_dvg;
-            dvgsteff_dvd = t1.mul_add(-dt2_dvd, t2v * dt1_dvd) / t3;
-            dvgsteff_dvb = t1.mul_add(-dt2_dvb, t2v * dt1_dvb) / t3;
-        }
+        let (vgsteff, voltage_partial, factor_partial) =
+            bsim3_overdrive(&vgst, &n, vtm, p.binned.voff, cox / p.derived.cdep0)?;
+        let dvgsteff_dvg = voltage_partial * dvgseff_dvg;
+        let dvgsteff_dvd = factor_partial.mul_add(dn_dvd, -voltage_partial * dvth_dvd);
+        let dvgsteff_dvb = factor_partial.mul_add(dn_dvb, -voltage_partial * dvth_dvb);
 
         // Effective channel width.
         let t9 = sqrt_phis - p.derived.sqrtphi;
