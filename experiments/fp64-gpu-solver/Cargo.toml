@@ -6,3 +6,6 @@ publish = false
 
 [dependencies]
 ngspice-rs = { path = "../.." }
+
+[lints]
+workspace = true

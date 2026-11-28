@@ -149,3 +149,7 @@ workspace = true
 # assertions and overflow checks; optimizing only dependencies does not help.
 [profile.dev]
 opt-level = 1
+
+[patch.crates-io]
+# Use the centrally maintained Petgraph patch to align Hashbrown with Indexmap.
+petgraph = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/js-redox-deps" }
