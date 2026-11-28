@@ -415,3 +415,33 @@ fn candidate_vector_rebinding_is_transactional_and_matches_fresh_elaboration() -
     );
     Ok(())
 }
+
+#[test]
+fn terminal_damping_can_remain_active_during_soft_voltage_bias() -> SpiceResult<()> {
+    for (card, expected) in [
+        (
+            "c1 p 0 1e9 ic=.5 pn_rseries=5 pn_terminal_bias_op=.2 pn_gterminal_dc=.001 pn_gterminal_during_bias=1",
+            0.9966777408637874,
+        ),
+        (
+            "c1 p 0 1e9 ic=.5 pn_rseries=5 pn_terminal_bias_op=.2 pn_storage_tc=.01 pn_gterminal_positive_storage_dc=1e-12 pn_gterminal_during_bias=1",
+            0.9933774834437087,
+        ),
+        (
+            "c1 p 0 1e9 ic=.5 pn_rseries=5 pn_terminal_bias_op=.2 pn_gterminal_dc=.001 m=3 pn_gterminal_during_bias=1",
+            0.9900990099009901,
+        ),
+        (
+            "c1 p 0 1e9 ic=.5 pn_rseries=5 pn_terminal_bias_op=.2 pn_rparallel=20",
+            1.,
+        ),
+        (
+            "c1 p 0 1e9 ic=.5 pn_rseries=5 pn_terminal_bias_op=.2 pn_gterminal_dc=.001",
+            1.,
+        ),
+    ] {
+        let plot = simulate(&format!("v1 s 0 2\nr1 s p 10\n{card}\n.temp 127\n.op"))?;
+        close(at(&plot, "v(p)", 0)?, Complex::real(expected), 2e-9, 1e-12);
+    }
+    Ok(())
+}

@@ -169,6 +169,7 @@ pub struct PreparedPassiveNetwork {
     control: Option<CurrentReference>,
     primary_probe: bool,
     contextual: Option<Arc<ContextualStorage>>,
+    terminal_damping_during_bias: bool,
 }
 
 /// Stable names for the independently observable currents of a bound network.
@@ -285,6 +286,7 @@ impl PreparedPassiveNetwork {
             control: None,
             primary_probe: false,
             contextual: None,
+            terminal_damping_during_bias: false,
         }))
     }
 
@@ -503,7 +505,14 @@ impl PreparedPassiveNetwork {
             // (C) or carrying its prescribed winding current (L).
             let excluded = terminal_bias
                 .as_ref()
-                .filter(|_| edge.role != Role::SeriesResistance)
+                .filter(|_| {
+                    edge.role != Role::SeriesResistance
+                        && !(self.terminal_damping_during_bias
+                            && matches!(
+                                edge.role,
+                                Role::TerminalDamping | Role::ContextualTerminalDamping
+                            ))
+                })
                 .cloned();
             let mut device: Box<dyn Device> = match edge.element {
                 Element::Resistance(r) if excluded.is_some() => Box::new(DampingShunt::resistive(
@@ -989,6 +998,7 @@ impl NetworkPlan {
             None
         };
         let initialization = Self::initialization(kind, initial, multiplicity, values)?;
+        let terminal_damping_during_bias = flag("pn_gterminal_during_bias")?;
         let noiseless = flag("pn_noiseless")?;
         let parallel_magnitude = flag("pn_rparallel_noise_abs")?;
         let Some(mut network) = PreparedPassiveNetwork::prepare(&coefficients, initialization)?
@@ -998,6 +1008,7 @@ impl NetworkPlan {
             return Ok(Self::Storage(None));
         };
         network.contextual = contextual;
+        network.terminal_damping_during_bias = terminal_damping_during_bias;
         if derived {
             reserve(&mut network.edges, 1, Some(&instance.location))?;
             network.edges.push(Edge {

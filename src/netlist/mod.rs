@@ -91,6 +91,7 @@ pub(crate) fn network_parameter(designator: char, name: &str) -> bool {
                 | "pn_storage_tc"
                 | "pn_storage_tnom"
                 | "pn_coupling_nominal"
+                | "pn_gterminal_during_bias"
                 | "pn_gterminal_positive_storage_dc"
                 | "pn_gterminal_positive_storage_ac"
                 | "pn_gterminal_positive_storage_tran"
