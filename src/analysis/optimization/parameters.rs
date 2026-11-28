@@ -249,6 +249,17 @@ impl CircuitParameterPlan {
         &self.sites
     }
 
+    /// A session for independent analysis repetitions. Retains the shared
+    /// parameter DAG's validated values, without constructing an optimization
+    /// overlay or carrying the preceding analysis' mutable circuit state.
+    #[must_use = "independent repetitions must use the prepared parameter plan"]
+    pub fn independent_session(&self) -> IndependentCandidate<'_> {
+        IndependentCandidate {
+            plan: self,
+            parameters: self.parameters.session(),
+        }
+    }
+
     /// A fresh independent candidate session with its own mutable circuit
     /// and its own topology-bound instance setters. This prevents cross-lane
     /// solver state leaks and never copies one session's device bindings.
@@ -379,6 +390,42 @@ pub(super) struct GradientSite {
 pub(super) enum GradientSiteFailure {
     Unsupported(String),
     NonSmooth(String),
+}
+
+/// Independent repetition of a parameterized prepared deck. Only the numeric
+/// parameter session persists between analyses: each returned circuit owns
+/// fresh device preparation, topology and solver state.
+pub struct IndependentCandidate<'a> {
+    plan: &'a CircuitParameterPlan,
+    parameters: CandidateParameters<'a>,
+}
+
+impl IndependentCandidate<'_> {
+    /// Resolve all independent root coordinates and the selected temperature
+    /// before elaborating exactly one circuit for this repetition.
+    ///
+    /// # Errors
+    /// Invalid candidate coordinates, temperature, option or physical preparation.
+    /// The last validated parameter session remains intact after a failure.
+    pub fn prepare(
+        &mut self,
+        coordinates: &[Real],
+        temperature: Option<Real>,
+        budget: &mut EvalBudget,
+    ) -> SpiceResult<(Circuit, RunConfig)> {
+        let mut parameters = self.parameters.clone();
+        parameters.update(coordinates, budget)?;
+        let scope = parameters.resolved_scope(self.plan.root)?;
+        let mut config = RunConfig::from_netlist_with_scope(&self.plan.source, Arc::clone(&scope))?;
+        if let Some(value) = temperature {
+            config = config.at_temperature(value, &self.plan.source.location)?;
+        }
+        let circuit = self
+            .plan
+            .elaborate(&config.context().model_context(), scope)?;
+        self.parameters = parameters;
+        Ok((circuit, config))
+    }
 }
 
 /// Independent candidate state with transactional updates.
@@ -519,27 +566,6 @@ impl CircuitCandidate<'_> {
         let scope = self.parameters.resolved_scope(self.plan.root)?;
         let context = self.config().context().model_context();
         self.plan.elaborate(&context, scope)
-    }
-
-    /// Materialize an independent analysis circuit at a selected temperature
-    /// using the candidate's actual lexical scope. Model setup and topology
-    /// are revalidated together; no previous solver state is carried.
-    ///
-    /// # Errors
-    /// Invalid candidate temperature, scope, model or device preparation.
-    pub fn independent_circuit(
-        &self,
-        temperature: Option<Real>,
-    ) -> SpiceResult<(Circuit, RunConfig)> {
-        let scope = self.parameters.resolved_scope(self.plan.root)?;
-        let mut config = RunConfig::from_netlist_with_scope(&self.plan.source, Arc::clone(&scope))?;
-        if let Some(value) = temperature {
-            config = config.at_temperature(value, &self.plan.source.location)?;
-        }
-        let circuit = self
-            .plan
-            .elaborate(&config.context().model_context(), scope)?;
-        Ok((circuit, config))
     }
 
     /// Stable name of one independent root coordinate in plan order.

@@ -618,7 +618,7 @@ fn independent_temperature_uses_current_parameter_scope_and_fresh_model_setup() 
     );
     let location = source.location.clone();
     let plan = CircuitParameterPlan::new(source, &["r", "analysis"]).unwrap();
-    let mut candidate = plan.session().unwrap();
+    let mut candidate = plan.independent_session();
     let mut budget = EvalBudget::default();
     for (r, analysis, temp) in [
         (1e3, 2., 27.),
@@ -626,8 +626,9 @@ fn independent_temperature_uses_current_parameter_scope_and_fresh_model_setup() 
         (1e3, 2., -23.),
         (1e3, 2., 27.),
     ] {
-        candidate.update(&[r, analysis], &mut budget).unwrap();
-        let (mut circuit, config) = candidate.independent_circuit(Some(temp)).unwrap();
+        let (mut circuit, config) = candidate
+            .prepare(&[r, analysis], Some(temp), &mut budget)
+            .unwrap();
         close(
             config
                 .prepared_scalar("{delay(1u)}", &location, &mut budget)
@@ -644,6 +645,16 @@ fn independent_temperature_uses_current_parameter_scope_and_fresh_model_setup() 
             -2. / (r * (1. + 0.01 * (temp - 27.))),
         );
     }
-    assert!(candidate.independent_circuit(Some(-273.15)).is_err());
-    close(candidate.config().context().temperature, 27.);
+    assert!(
+        candidate
+            .prepare(&[3e3, 5.], Some(-273.15), &mut budget)
+            .is_err()
+    );
+    let (mut circuit, config) = candidate.prepare(&[1e3, 2.], None, &mut budget).unwrap();
+    close(config.context().temperature, 27.);
+    let request = config
+        .plan(AnalysisInput::new(AnalysisKind::OperatingPoint))
+        .unwrap();
+    let plot = request.run(&mut circuit, &config.context()).unwrap();
+    close(plot.value("i(v1)", 0).unwrap().re, -2e-3);
 }
