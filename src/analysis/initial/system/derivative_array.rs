@@ -7,7 +7,8 @@
 use super::rank;
 mod recovery;
 use crate::analysis::initial::{
-    CapacitorInitial, ChargeInitial, DerivativeGuess, FixedCoordinate, ImpulseStorage, Tolerances,
+    CapacitorInitial, ChargeInitial, DerivativeGuess, FixedCoordinate, ImpulseStorage,
+    LocalChargeInitial, Tolerances,
     constraints::{AbsoluteRow, VoltageVertex},
     failure,
 };
@@ -89,12 +90,14 @@ enum Constraint<'a> {
     Coordinate(usize, &'a FixedCoordinate),
     Voltage(&'a CapacitorInitial),
     Charge(usize, &'a ChargeInitial),
+    LocalCharge(&'a LocalChargeInitial),
     Companion(CompanionConstraint<'a>),
 }
 
 impl<'a> Constraint<'a> {
     fn optional(self) -> bool {
         matches!(self,Self::Charge(_,charge) if charge.policy==InitialStoragePolicy::Derived)
+            || matches!(self, Self::LocalCharge(charge) if charge.optional)
             || matches!(self, Self::Companion(c) if c.derived)
     }
 
@@ -105,6 +108,7 @@ impl<'a> Constraint<'a> {
             Self::Charge(_, charge) if charge.policy == InitialStoragePolicy::Physical => {
                 Some((&charge.name, "charge"))
             }
+            Self::LocalCharge(charge) if !charge.optional => Some((&charge.name, "charge")),
             _ => None,
         }
     }
@@ -161,6 +165,24 @@ impl<'a> Constraint<'a> {
                     ResidualScale::comparison(value, charge.target, backward),
                 ))
             }
+            Self::LocalCharge(charge) => {
+                let local = point
+                    .storage
+                    .get(&charge.slot)
+                    .ok_or_else(|| failure("missing device-local Taylor charge"))?;
+                let mut backward = 0.;
+                for (column, gradient) in &local.gradients {
+                    matrix.add(row, *column, gradient[0])?;
+                    backward = gradient[0]
+                        .abs()
+                        .mul_add(state.as_slice()[*column].abs(), backward);
+                }
+                let value = local.values[0];
+                Ok((
+                    value - charge.target,
+                    ResidualScale::comparison(value, charge.target, backward),
+                ))
+            }
             Self::Companion(_) => Err(failure("unexpected companion constraint")),
         }
     }
@@ -169,7 +191,7 @@ impl<'a> Constraint<'a> {
         match self {
             Self::Voltage(..) => tol.vntol,
             Self::Charge(_, charge) if charge.policy == InitialStoragePolicy::Derived => tol.vntol,
-            Self::Charge(..) => tol.chgtol,
+            Self::Charge(..) | Self::LocalCharge(..) => tol.chgtol,
             Self::Companion(c) if c.derived => tol.vntol,
             Self::Coordinate(..) | Self::Companion(_) => tol.abstol,
         }
@@ -194,6 +216,7 @@ fn constraints(storage: &ImpulseStorage) -> Vec<Constraint<'_>> {
         .iter()
         .map(|(&AbsoluteRow(row), item)| Constraint::Coordinate(row, item))
         .chain(storage.capacitors.iter().map(Constraint::Voltage))
+        .chain(storage.local_charges.iter().map(Constraint::LocalCharge))
         .chain(
             storage
                 .charges
@@ -209,11 +232,17 @@ enum StoredQuantity {
     Coordinate(usize),
     Voltage(VoltageVertex, VoltageVertex, Real),
     Equation(usize, Real),
+    LocalCharge(usize),
 }
 
 impl StoredQuantity {
-    fn value(self, state: &[Vector], point: &PhysicalDaeTaylor, degree: usize) -> Real {
-        match self {
+    fn value(
+        self,
+        state: &[Vector],
+        point: &PhysicalDaeTaylor,
+        degree: usize,
+    ) -> SpiceResult<Real> {
+        Ok(match self {
             Self::Coordinate(column) => state[degree].as_slice()[column],
             Self::Voltage(p, n, scale) => {
                 scale
@@ -221,7 +250,14 @@ impl StoredQuantity {
                         - crate::analysis::initial::potential(&state[degree], n))
             }
             Self::Equation(row, scale) => scale * point.charge[degree].as_slice()[row],
-        }
+            Self::LocalCharge(slot) => {
+                point
+                    .storage
+                    .get(&slot)
+                    .ok_or_else(|| failure("missing device-local Taylor charge"))?
+                    .values[degree]
+            }
+        })
     }
 
     fn gradient(
@@ -243,6 +279,16 @@ impl StoredQuantity {
             Self::Equation(row, scale) => {
                 for term in folded_row(&point.capacitance[degree], row) {
                     visit(term.col, scale * term.value)?;
+                }
+                Ok(())
+            }
+            Self::LocalCharge(slot) => {
+                let local = point
+                    .storage
+                    .get(&slot)
+                    .ok_or_else(|| failure("missing device-local Taylor charge"))?;
+                for (column, gradient) in &local.gradients {
+                    visit(*column, gradient[degree])?;
                 }
                 Ok(())
             }
@@ -276,8 +322,8 @@ impl CompanionConstraint<'_> {
                 .copied()
                 .ok_or_else(|| failure("missing independent storage history"))
         };
-        let value = self.quantity.value(state, point, 0);
-        let rate = self.quantity.value(state, point, 1) / time_scale;
+        let value = self.quantity.value(state, point, 0)?;
+        let rate = self.quantity.value(state, point, 1)? / time_scale;
         let mut history = ChargeHistory::new(value);
         for age in 1..=self.coefficients.charge_history_len() {
             history.push(accepted(age, 0)?)?;
@@ -332,6 +378,9 @@ fn companions<'a>(
             coefficients,
         }));
     };
+    for charge in &storage.local_charges {
+        add(StoredQuantity::LocalCharge(charge.slot), charge.slot, false);
+    }
     for (&AbsoluteRow(row), charge) in &storage.charges {
         add(
             StoredQuantity::Equation(row, 1.),
@@ -509,6 +558,7 @@ pub(in crate::analysis::initial) struct RightLimit {
     pub rate: Vector,
     pub charge: Vector,
     pub charge_rate: Vector,
+    pub local_history: Vec<(usize, Real)>,
     pub order_hint: usize,
     pub guards: crate::devices::physical_dae::BranchTrace,
     pub candidate_states: Vec<(usize, Real)>,
@@ -937,6 +987,16 @@ fn candidate(
             rate: to_rate(&state[1]),
             charge: point.charge[0].clone(),
             charge_rate: to_rate(&point.charge[1]),
+            local_history: point
+                .storage
+                .iter()
+                .flat_map(|(&slot, charge)| {
+                    [
+                        (slot, charge.values[0]),
+                        (slot + 1, charge.values[1] / local.scale),
+                    ]
+                })
+                .collect(),
             // The two extra orders were rank/affine lookahead checks;
             // retain a lower bound so the next trial still repeats them.
             order_hint: state.len().saturating_sub(3).max(2),

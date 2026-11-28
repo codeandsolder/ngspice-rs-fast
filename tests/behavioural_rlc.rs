@@ -1705,3 +1705,48 @@ fn singular_germ_recovery_cannot_accept_discontinuous_derivative_input() {
         );
     }
 }
+
+#[test]
+fn behavioural_event_preserves_independent_semiconductor_charge_histories() -> SpiceResult<()> {
+    // At the interior corner the right-limit candidate must retain both
+    // the selected behavioural value and each diode's charge/rate pair.
+    // Two diodes share an equation row, but have different physical laws.
+    let body = "vdrive in 0 PWL(0 -0.4 1m 0.6)\nd1 in 0 dm1\nd2 in 0 dm2\n.model dm1 d(is=1e-12 n=10 cjo=20p vj=.8 m=.4 tt=5n)\n.model dm2 d(is=2e-12 n=10 cjo=70p vj=.7 m=.3 tt=9n)\nbguard x 0 i=(time==10u ? sqrt(-1) : abs(time/1u-10))\nrguard x 0 1\nb1 out 0 v=1u*ddt(-v(x))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let thermal = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "15u", "0", "1u", "uic", method],
+            &["@bguard[i]", "@d1[i]", "@d2[i]"],
+        )?;
+        let mut seen = false;
+        for index in 0..plot.point_count() {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let time = at("time");
+            let voltage = 1000_f64.mul_add(time, -0.4);
+            let corner = (time - 10e-6).abs() <= 1e-18;
+            seen |= corner;
+            close(at("@bguard[i]"), (time / 1e-6 - 10.).abs(), 1e-7);
+            close(
+                at("v(out)"),
+                if time < 10e-6 && !corner { -1. } else { 1. },
+                1e-7,
+            );
+            let diode = |sat: f64, cap: f64, potential: f64, grading: f64, transit: f64| {
+                let current = sat * (voltage / thermal).exp_m1() + 1e-12 * voltage;
+                let conductance = sat / thermal * (voltage / thermal).exp() + 1e-12;
+                current
+                    + 1000.
+                        * (cap * (1. - voltage / potential).powf(-grading) + transit * conductance)
+            };
+            let first = diode(1e-12, 20e-12, 0.8, 0.4, 5e-9);
+            let second = diode(2e-12, 70e-12, 0.7, 0.3, 9e-9);
+            close(at("@d1[i]"), first, 1e-15);
+            close(at("@d2[i]"), second, 1e-15);
+            close(at("i(vdrive)"), -(first + second), 1e-15);
+        }
+        assert!(seen, "missing semiconductor-loaded branch event");
+    }
+    Ok(())
+}

@@ -425,6 +425,7 @@ struct ImpulseStorage {
     fixed_coordinates: BTreeMap<AbsoluteRow, FixedCoordinate>,
     capacitors: Vec<CapacitorInitial>,
     charges: BTreeMap<AbsoluteRow, ChargeInitial>,
+    local_charges: Vec<LocalChargeInitial>,
 }
 
 struct FixedCoordinate {
@@ -443,6 +444,13 @@ struct CapacitorInitial {
     equation: Option<AbsoluteRow>,
     slot: usize,
     scale: Real,
+}
+
+struct LocalChargeInitial {
+    name: String,
+    slot: usize,
+    target: Real,
+    optional: bool,
 }
 
 struct ChargeInitial {
@@ -469,6 +477,7 @@ impl ImpulseStorage {
             fixed_coordinates: BTreeMap::new(),
             capacitors: Vec::new(),
             charges: BTreeMap::new(),
+            local_charges: Vec::new(),
         };
         for index in 0..circuit.device_count() {
             for (row, coordinate) in bound_initial_coordinates(circuit, index, context)? {
@@ -1000,6 +1009,35 @@ impl ImpulseStorage {
         }
     }
 
+    fn bind_local_charges(
+        &mut self,
+        dae: &crate::devices::physical_dae::PhysicalDae<'_, '_>,
+        values: &[Real],
+        optional: bool,
+    ) -> SpiceResult<()> {
+        self.local_charges = dae
+            .storage_bindings()
+            .iter()
+            .map(|(slot, name)| {
+                let target = *values
+                    .get(*slot)
+                    .ok_or_else(|| failure("missing physical device charge history"))?;
+                if !target.is_finite() {
+                    return Err(failure(format!(
+                        "{name}: nonfinite physical device charge history"
+                    )));
+                }
+                Ok(LocalChargeInitial {
+                    name: name.clone(),
+                    slot: *slot,
+                    target,
+                    optional,
+                })
+            })
+            .collect::<SpiceResult<_>>()?;
+        Ok(())
+    }
+
     fn consistent_history(
         &self,
         circuit: &Circuit,
@@ -1008,6 +1046,7 @@ impl ImpulseStorage {
         tolerances: Tolerances,
     ) -> SpiceResult<Vec<(usize, Real)>> {
         let mut slots = right.candidate_states.clone();
+        slots.extend_from_slice(&right.local_history);
         for (&AbsoluteRow(row), charge) in &self.charges {
             let actual = right.charge.as_slice()[row];
             if let Some(time) = continuity
@@ -1115,6 +1154,10 @@ pub(super) fn consistent_derivative_start(
     }
     let result = (|| {
         let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+        // Like C's junction UIC load, unspecified device charge is a seed.
+        // Prescribed sources may determine it instead; after initialization
+        // the actual accepted charge is retained at events.
+        storage.bind_local_charges(&dae, trial.values(), uic)?;
         let solve = |seed: &Vector| {
             system::solve_right_limit(
                 &dae,
@@ -1196,9 +1239,10 @@ pub(super) fn consistent_derivative_step(
         .history
         .accepted(1)
         .ok_or_else(|| failure("missing derivative step history"))?;
-    let storage =
+    let mut storage =
         ImpulseStorage::collect(circuit, request.solution, request.model_context, values)?;
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+    storage.bind_local_charges(&dae, values, false)?;
     let right = match system::solve_step(
         &dae, circuit, request, &storage, tolerances, iterations, guess,
     )? {
@@ -1242,6 +1286,7 @@ pub(super) fn consistent_derivative_event(
     )?;
     storage.retain_operating_point(request.solution);
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
+    storage.bind_local_charges(&dae, left.values(), false)?;
     let right = match system::solve_event(&dae, request, &storage, tolerances, iterations, guess) {
         // A one-sided germ may have a different admissible derivative
         // domain than the incoming one. Retry without the disposable rate
