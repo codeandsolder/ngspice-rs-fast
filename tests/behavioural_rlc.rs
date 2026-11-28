@@ -2285,7 +2285,7 @@ fn bjt_base_spreading_clamp_tracks_the_intrinsic_base_current() -> SpiceResult<(
 fn polynomial_terminal_observations_follow_the_accepted_physical_germ() -> SpiceResult<()> {
     // The branch-current coordinate and external terminal stamp must agree at
     // both smooth points and the exact one-sided source corner.
-    let body = "vc a 0 PWL(0 -1 1u 1 2u -1)\nil 0 b PWL(0 -1 1u 1 2u -1)\nc1 a 0 cm 1p\nl1 b 0 lm 1u\n.model cm pspice_cap(vc1=0.2 vc2=0.3)\n.model lm pspice_ind(il1=0.2 il2=0.3)\nb1 out 0 v=1u*ddt(v(a))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let body = "vc a 0 PWL(0 -1 1u 1 2u -1)\nil 0 b PWL(0 -1 1u 1 2u -1)\nc1 a 0 cm 1p ic=-1\nl1 b 0 lm 1u ic=-1\n.model cm pspice_cap(vc1=0.2 vc2=0.3)\n.model lm pspice_ind(il1=0.2 il2=0.3)\nb1 out 0 v=1u*ddt(v(a))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
     for method in ["method=trap", "method=gear"] {
         let plot = run_observed(
             body,
