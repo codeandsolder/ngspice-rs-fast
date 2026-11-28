@@ -4,10 +4,31 @@
 //! physical time scale to the k-th power. Products and elementary functions
 //! use coefficient recurrences, not differences of nearly equal samples.
 
-pub(crate) mod arithmetic;
+mod arithmetic;
 pub mod differential;
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
+
+/// Shared physical constitutive arithmetic for scalar and differential jets.
+/// The first partial and every time coefficient follow the same value law.
+pub(crate) trait Constitutive: Clone {
+    fn constant(&self, value: Real) -> Self;
+    fn primal(&self) -> Real;
+    fn compare(&self, boundary: Real) -> Option<std::cmp::Ordering>;
+    fn add(self, rhs: &Self) -> Self;
+    fn midpoint(self, rhs: &Self) -> Self;
+    fn multiply(self, rhs: &Self) -> Self;
+    fn divide(self, rhs: &Self) -> SpiceResult<Self>;
+    fn scale(self, factor: Real) -> Self;
+    fn offset(self, value: Real) -> Self;
+    fn mul_add(self, rhs: &Self, add: &Self) -> Self;
+    fn sqrt(self) -> SpiceResult<Self>;
+    fn exp(self) -> Self;
+    fn exp_with_primal(self, value: Real) -> Self;
+    fn compose_derivative(self, value: Real, slope: &Self) -> Self;
+    fn exp_m1(self) -> Self;
+    fn ln_1p(self) -> SpiceResult<Self>;
+}
 
 /// The resource ceiling for a single local Taylor expansion.
 pub const MAX_ORDER: usize = 64;
