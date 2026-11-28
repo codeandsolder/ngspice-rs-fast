@@ -4,6 +4,8 @@
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
 mod causal_history;
+mod conductance;
+pub(crate) use conductance::ConductanceConfig;
 mod continuous_switch;
 mod continuous_switch_device;
 mod frequency;
@@ -1065,6 +1067,7 @@ impl DacConfig {
                 end: time,
                 from: target,
                 target,
+                law: RampLaw::Linear,
             });
         };
         let from = ramp.value(time);
@@ -1081,79 +1084,25 @@ impl DacConfig {
             end,
             from,
             target,
+            law: RampLaw::Linear,
         })
-    }
-}
-
-/// A passive output branch selected by the full resolved digital drive.
-/// The binary table contains strong L/H/X, resistive L/H/X, and Z;
-/// directional ambiguity requires explicit strong/resistive R/F entries.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ConductanceConfig {
-    values: [Real; 7],
-    phases: Option<[Real; 4]>,
-    inverted: bool,
-}
-
-impl ConductanceConfig {
-    pub(crate) fn new(values: &[Real], inverted: bool) -> SpiceResult<Self> {
-        if values.iter().any(|value| !value.is_finite() || *value < 0.) {
-            return Err(SpiceError::circuit("invalid digital output conductance"));
-        }
-        let (values, phases) = match values {
-            [a, b, c, d, e, f, z] => ([*a, *b, *c, *d, *e, *f, *z], None),
-            [a, b, c, d, e, f, z, sr, sf, rr, rf] => {
-                ([*a, *b, *c, *d, *e, *f, *z], Some([*sr, *sf, *rr, *rf]))
-            }
-            _ => {
-                return Err(SpiceError::circuit(
-                    "logic conductance table requires seven or eleven entries",
-                ));
-            }
-        };
-        Ok(Self {
-            values,
-            phases,
-            inverted,
-        })
-    }
-
-    fn target(self, drive: Drive) -> SpiceResult<Real> {
-        let logic = if self.inverted {
-            drive.logic.invert()
-        } else {
-            drive.logic
-        };
-        if drive.strength == Strength::HIGH_IMPEDANCE {
-            return Ok(self.values[6]);
-        }
-        let strong = drive.strength == Strength::STRONG;
-        if matches!(logic, Logic::Rising | Logic::Falling) {
-            let phases = self.phases.ok_or_else(|| {
-                SpiceError::circuit(
-                    "directional timing ambiguity requires explicit R/F conductance entries",
-                )
-            })?;
-            return Ok(phases[usize::from(!strong) * 2 + usize::from(logic == Logic::Falling)]);
-        }
-        Ok(self.values[usize::from(!strong) * 3 + logic.index()])
     }
 }
 
 /// Shared scalar forcing port; voltage and conductance have different
 /// electrical stamps, but identical accepted event publication semantics.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum AnalogOutputConfig {
     Voltage(DacConfig),
     Conductance(ConductanceConfig),
 }
 
 impl AnalogOutputConfig {
-    pub(crate) const fn is_voltage(self) -> bool {
+    pub(crate) const fn is_voltage(&self) -> bool {
         matches!(self, Self::Voltage(_))
     }
 
-    pub(crate) fn target(self, drive: Drive) -> SpiceResult<Real> {
+    pub(crate) fn target(&self, drive: Drive) -> SpiceResult<Real> {
         match self {
             Self::Voltage(config) => config.target(drive.logic),
             Self::Conductance(config) => config.target(drive),
@@ -1161,24 +1110,22 @@ impl AnalogOutputConfig {
     }
 
     pub(crate) fn retarget(
-        self,
+        &self,
         ramp: OutputRamp,
         time: Real,
         drive: Drive,
     ) -> SpiceResult<OutputRamp> {
         match self {
             Self::Voltage(config) => config.retarget(ramp, time, drive.logic),
-            Self::Conductance(config) => {
-                let target = config.target(drive)?;
-                Ok(OutputRamp {
-                    start: time,
-                    end: time,
-                    from: target,
-                    target,
-                })
-            }
+            Self::Conductance(config) => config.retarget(ramp, time, drive),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RampLaw {
+    Linear,
+    Resistance { shape: Real },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1187,6 +1134,7 @@ pub(crate) struct OutputRamp {
     end: Real,
     from: Real,
     target: Real,
+    law: RampLaw,
 }
 
 impl OutputRamp {
@@ -1196,6 +1144,7 @@ impl OutputRamp {
             end: 0.,
             from: target,
             target,
+            law: RampLaw::Linear,
         }
     }
 
@@ -1205,8 +1154,13 @@ impl OutputRamp {
         } else if time <= self.start {
             self.from
         } else {
-            ((time - self.start) / (self.end - self.start))
-                .mul_add(self.target - self.from, self.from)
+            let u = (time - self.start) / (self.end - self.start);
+            match self.law {
+                RampLaw::Linear => u.mul_add(self.target - self.from, self.from),
+                RampLaw::Resistance { shape } => {
+                    conductance::resistance_value(self.from, self.target, u, shape)
+                }
+            }
         }
     }
 

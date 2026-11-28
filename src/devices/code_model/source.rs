@@ -241,7 +241,8 @@ impl SourceModel {
                 _ => None,
             },
             Self::LogicConductance => match name {
-                "conductance" => Some(RealVector),
+                "conductance" | "conductance_by_rank" | "resistance_duration" => Some(RealVector),
+                "resistance_shape" => Some(Real),
                 _ => None,
             },
             Self::TimedSwitch => match name {
@@ -950,16 +951,54 @@ fn voltage_material(card: &ModelCard) -> SpiceResult<[Real; 2]> {
     Ok(rails)
 }
 
-fn conductance_material(card: &ModelCard) -> SpiceResult<Vec<Real>> {
+fn conductance_material(card: &ModelCard) -> SpiceResult<ConductanceConfig> {
+    use super::conductance::ResistanceSlew;
     SourceModel::LogicConductance.validate_parameters(card)?;
-    let [parameter] = card.parameters.as_slice() else {
-        return Err(SpiceError::circuit(
-            "logic conductance requires one conductance table",
-        ));
+    let mut table = None;
+    let mut duration = None;
+    let mut shape = None;
+    for parameter in &card.parameters {
+        match parameter.name.as_str() {
+            "conductance" | "conductance_by_rank" => {
+                if table.is_some() {
+                    return Err(SpiceError::circuit("specify one electrical drive table"));
+                }
+                table = Some((
+                    numeric_vector(parameter)?,
+                    parameter.name == "conductance_by_rank",
+                ));
+            }
+            "resistance_duration" => {
+                if duration.is_some() {
+                    return Err(SpiceError::circuit("duplicate resistance duration"));
+                }
+                let values: [Real; 6] = numeric_vector(parameter)?.try_into().map_err(|_| {
+                    SpiceError::circuit("resistance_duration requires L H X R F Z durations")
+                })?;
+                duration = Some(values);
+            }
+            "resistance_shape" => {
+                if shape.is_some() {
+                    return Err(SpiceError::circuit("duplicate resistance shape"));
+                }
+                shape = Some(numeric_scalar(parameter)?);
+            }
+            _ => return Err(SpiceError::circuit("unregistered conductance parameter")),
+        }
+    }
+    let (values, ranked) = table.ok_or_else(|| {
+        SpiceError::circuit("logic conductance requires an electrical drive table")
+    })?;
+    let slew = match (duration, shape) {
+        (None, None) => None,
+        (Some(duration), Some(shape)) => Some(ResistanceSlew::new(duration, shape)?),
+        _ => {
+            return Err(SpiceError::circuit(
+                "resistance slew requires both duration and shape",
+            ));
+        }
     };
-    let values = numeric_vector(parameter)?;
-    ConductanceConfig::new(&values, false)?;
-    Ok(values)
+    ConductanceConfig::new(&values, ranked, slew)
 }
 
 pub(in crate::devices) fn instantiate(
@@ -1030,7 +1069,7 @@ pub(in crate::devices) fn instantiate(
                 let values = model.prepare(PreparationKey::Inputs, || {
                     conductance_material(model.card())
                 })?;
-                AnalogOutputConfig::Conductance(ConductanceConfig::new(&values, input.inverted)?)
+                AnalogOutputConfig::Conductance((*values).clone().with_inversion(input.inverted))
             };
             Ok(Box::new(AnalogOutputDevice {
                 name: instance.name.clone(),
@@ -1250,7 +1289,7 @@ pub(in crate::devices) fn mixed_topology(
             analog_outputs.push(AnalogOutputBinding {
                 name: device.name.clone(),
                 net,
-                config: device.config,
+                config: device.config.clone(),
                 port: device.port.clone(),
             });
         }

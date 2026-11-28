@@ -220,3 +220,41 @@ pulse order can reverse. The current causal transport contract requires
 consistent announced endpoint order; reversed earliest-boundary order
 and independent multi-driver waveform convergence need further
 qualification and are diagnosed instead of treated as exact transitions.
+
+## Physical electrical realization
+
+A conductance bridge can use `conductance_by_rank` instead of the
+explicit grouped `conductance` table. Supply Z first, followed by
+L/H/X/R/F conductances in siemens for each connected rank in ascending
+order. Rank-specific tables are shared by occurrences, with inversion
+applied at each port. A strength rank is not itself a resistance law.
+
+An optional `resistance_duration=[L H X R F Z]` vector in seconds and
+`resistance_shape` (positive, dimensionless duration/time-constant
+ratio) describe a finite exponential transition in resistance, not
+conductance. Both are required when the law is selected. For duration
+D and shape s, at normalized time u=(t-t0)/D the resistance is
+
+```text
+w = (1 - exp(-s*u)) / (1 - exp(-s))
+R(t) = (1-w)*R(t0) + w*Rtarget
+G(t) = 1/R(t)
+```
+
+The transition begins with the actual resistance at the accepted event,
+including an interrupted ramp, and reaches the target exactly at t0+D.
+A zero duration selects an immediate change. All table entries must
+represent finite positive resistances if any nonzero resistance duration
+is requested; an ideal open is not a finite resistance. The plain
+conductance table continues to support exact open branches. This is a
+generic explicit law, not an inferred normalization for any source
+dialect's switching-time field.
+
+To represent charge storage, elaborate each driver onto its own digital
+net and connect the corresponding physical rail branches to the common
+analog node. Place the actual capacitances and leakage branches on that
+node, then use an ordered voltage receiver to obtain the digital value
+where needed. Resolving ordinal strengths first would discard parallel
+drive paths, and storing the last logical value would discard leakage.
+The physical RC network retains charge independently of the digital
+event history.

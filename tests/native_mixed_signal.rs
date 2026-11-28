@@ -961,3 +961,105 @@ fn deck_bound_causal_clock_cancels_common_path_uncertainty() -> SpiceResult<()> 
     }
     Ok(())
 }
+
+#[test]
+fn ranked_electrical_drive_table_distinguishes_intermediate_strengths() -> SpiceResult<()> {
+    // All five logic states and each connected rank have explicit
+    // electrical values. Keep the receiver's ordinal rank through binding.
+    let values = std::iter::once("0".to_owned())
+        .chain((1..=63).flat_map(|rank| {
+            (0..5).map(move |logic| format!("{}", (rank * 5 + logic) as f64 * 1e-5))
+        }))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut c = circuit(&format!(
+        "vhi hi 0 5\nvd data 0 0\n\
+         a1 data q r\n.model r preprocess_logic_range(ranges=[-1 1 1 17])\n\
+         a2 q %gd(out hi) b\n.model b preprocess_logic_conductance(conductance_by_rank=[{values}])\n\
+         r1 out 0 1k"
+    ))?;
+    let plot = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
+    let g = 86. * 1e-5;
+    close(output(&plot, 0), 5. * g / (g + 0.001));
+    Ok(())
+}
+
+#[test]
+fn exponential_resistance_slew_matches_analytic_interrupted_waveform() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vhi hi 0 5\nvd data 0 PWL(0 0 1u 0 1002n 4 1200n 4 1202n 0 2u 0)\n\
+         a1 %v[data] q r\n.model r preprocess_logic_event(operation=25)\n\
+         a2 q %gd(out hi) b\n.model b preprocess_logic_conductance(conductance=[.01 .001 .002 .01 .001 .002 .0001] resistance_duration=[200n 400n 300n 0 0 0] resistance_shape=2)\n\
+         r1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["2n", "2u", "0", "2n"])?;
+    let t0 = 1.0015e-6;
+    let t1 = 1.201e-6;
+    let blend = |from: f64, to: f64, u: f64| {
+        let w = -(-2. * u.clamp(0., 1.)).exp_m1() / -(-2_f64).exp_m1();
+        (to - from).mul_add(w, from)
+    };
+    let mid = blend(100., 1000., (t1 - t0) / 400e-9);
+    let mut samples = [0; 4];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        let (region, r) = if t < t0 {
+            (0, 100.)
+        } else if t < t1 {
+            (1, blend(100., 1000., (t - t0) / 400e-9))
+        } else if t < t1 + 200e-9 {
+            (2, blend(mid, 100., (t - t1) / 200e-9))
+        } else {
+            (3, 100.)
+        };
+        let expected = 5000. / (1000. + r);
+        assert!(
+            (output(&plot, i) - expected).abs() < 2e-6,
+            "{t:e}: {} != {expected}",
+            output(&plot, i)
+        );
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 20), "{samples:?}");
+    Ok(())
+}
+
+#[test]
+fn independent_physical_driver_branches_retain_charge_after_disconnect() -> SpiceResult<()> {
+    // Driver occurrences are electrically realized BEFORE resolution.
+    // The analog node, not an arbitrary digital latch, retains charge.
+    let mut c = circuit(
+        "vhi hi 0 5\nvd highdata 0 4\nvl lowdata 0 0\n\
+         ve1 e1 0 PWL(0 4 1u 4 1002n 0 12u 0)\n\
+         ve2 e2 0 PWL(0 0 6u 0 6002n 4 12u 4)\n\
+         a1 %v[highdata e1] highdrv tri\na2 %v[lowdata e2] lowdrv tri\n\
+         .model tri preprocess_logic_event(operation=21)\n\
+         a3 highdrv %gd(out hi) up\n.model up preprocess_logic_conductance(conductance=[0 .01 0 0 .01 0 0])\n\
+         a4 lowdrv %gd(out 0) down\n.model down preprocess_logic_conductance(conductance=[.01 0 0 .01 0 0 0])\n\
+         cleak out 0 1n\nrleak out 0 10k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["5n", "12u", "0", "5n"])?;
+    let released = 1.001e-6;
+    let connected = 6.0015e-6;
+    let initial = 5. * 10000. / 10100.;
+    let held = initial * (-(connected - released) / 10e-6_f64).exp();
+    let mut samples = [0; 3];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        let (region, expected) = if t < released {
+            (0, initial)
+        } else if t < connected {
+            (1, initial * (-(t - released) / 10e-6).exp())
+        } else {
+            (2, held * (-(t - connected) / (1e-9 / 0.0101)).exp())
+        };
+        assert!(
+            (output(&plot, i) - expected).abs() <= 0.002 * expected.abs() + 20e-6,
+            "{t:e}: {} != {expected}",
+            output(&plot, i)
+        );
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 20), "{samples:?}");
+    Ok(())
+}
