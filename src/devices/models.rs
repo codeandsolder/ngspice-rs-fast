@@ -91,6 +91,8 @@ pub enum ModelFamily {
     RationalTransfer,
     /// Native hybrid analog receiver/event logic.
     LogicEvent,
+    /// Native ordered differential receiver.
+    LogicRange,
     /// Native ideal logic voltage bridge.
     LogicVoltage,
     /// Native resolved-drive conductance branch.
@@ -124,6 +126,7 @@ impl ModelFamily {
             "cpl" | "cpllines" => Some(Self::Cpl),
             "s_xfer" => Some(Self::RationalTransfer),
             "preprocess_logic_event" => Some(Self::LogicEvent),
+            "preprocess_logic_range" => Some(Self::LogicRange),
             "preprocess_logic_voltage" => Some(Self::LogicVoltage),
             "preprocess_logic_conductance" => Some(Self::LogicConductance),
             "preprocess_timed_switch" => Some(Self::TimedSwitch),
@@ -155,6 +158,7 @@ impl ModelFamily {
             Self::Cpl => 'p',
             Self::RationalTransfer
             | Self::LogicEvent
+            | Self::LogicRange
             | Self::LogicVoltage
             | Self::LogicConductance
             | Self::TimedSwitch => 'a',
@@ -223,6 +227,8 @@ pub enum ModelBackend {
     RationalTransfer,
     /// Native hybrid event logic.
     LogicEvent,
+    /// Native ordered differential receiver.
+    LogicRange,
     /// Native ideal logic voltage bridge.
     LogicVoltage,
     /// Native resolved-drive conductance branch.
@@ -337,6 +343,8 @@ impl ModelBackend {
                         BackendSpec::new(Self::RationalTransfer, "Rational transfer", &[1]),
                         BackendSpec::new(Self::LogicEvent, "Native hybrid event logic", &[1])
                             .for_family(ModelFamily::LogicEvent),
+                        BackendSpec::new(Self::LogicRange, "Native ordered range receiver", &[1])
+                            .for_family(ModelFamily::LogicRange),
                         BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
                             .for_family(ModelFamily::LogicVoltage),
                         BackendSpec::new(Self::LogicConductance, "Native logic conductance", &[1])

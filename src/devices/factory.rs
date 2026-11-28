@@ -116,6 +116,7 @@ pub(super) fn instantiate_with_models(
         }
         ModelBackend::RationalTransfer
         | ModelBackend::LogicEvent
+        | ModelBackend::LogicRange
         | ModelBackend::LogicVoltage
         | ModelBackend::LogicConductance
         | ModelBackend::TimedSwitch => {

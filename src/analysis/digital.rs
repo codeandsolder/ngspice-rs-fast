@@ -863,7 +863,7 @@ impl State {
         // predecessor, including its completion. This applies to
         // asymmetric exact delays and correlated bounded arrivals.
         let mut superseded = Vec::new();
-        for key in &self.pending[driver] {
+        for key in self.pending[driver].iter().rev() {
             if let Some(Event::Drive {
                 arrival: Some(delivery),
                 ..
@@ -880,10 +880,12 @@ impl State {
                     return Err(SpiceError::circuit(
                         "causal output earliest order may reverse; conditional waveform required",
                     ));
+                } else {
+                    break;
                 }
             }
         }
-        let from = superseded.first().map_or(arrival.from(), |(_, from)| *from);
+        let from = superseded.last().map_or(arrival.from(), |(_, from)| *from);
         if !superseded.is_empty() {
             let removed: BTreeSet<_> = superseded.into_iter().map(|(key, _)| key).collect();
             let keys: Vec<_> = self.pending[driver]
