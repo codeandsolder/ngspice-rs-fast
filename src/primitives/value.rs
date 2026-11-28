@@ -710,6 +710,29 @@ mod tests {
         ] {
             check(value);
         }
+        // Exact binary fractions that fall halfway between two 16-digit
+        // decimals. C rounds down to the even last digit in the first case
+        // and up in the second, for both signs.
+        for (input, expected) in [
+            (0x3ff0_0010_0000_0000, 0x3ff0_000f_ffff_fffe),
+            (0x3ff0_0030_0000_0000, 0x3ff0_0030_0000_0002),
+            (0xbff0_0010_0000_0000, 0xbff0_000f_ffff_fffe),
+            (0xbff0_0030_0000_0000, 0xbff0_0030_0000_0002),
+        ] {
+            assert_eq!(check(Real::from_bits(input)), Some(expected));
+        }
+        // Decimal rounding may move a value across a later integer setter's
+        // rounding boundary. Preserve the decimal read-back before that step.
+        for value in [2_147_483_647.5_f64, -2_147_483_648.5_f64, 0.5_f64, -0.5_f64] {
+            for input in [value.next_down(), value, value.next_up()] {
+                let expected = parse_spice_number(&format_spice_number(input))
+                    .and_then(crate::primitives::c_integer);
+                assert_eq!(
+                    round_numparam_literal(input).and_then(crate::primitives::c_integer),
+                    expected
+                );
+            }
+        }
         for exponent in -323..=308 {
             let power: Real = format!("1e{exponent}").parse().unwrap();
             for value in [power.next_down(), power, power.next_up()] {
