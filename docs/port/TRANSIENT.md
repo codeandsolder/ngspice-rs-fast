@@ -105,8 +105,10 @@ the run with an error; no partial plot is returned.
   [Device-driven breakpoints](#device-driven-breakpoints-and-delay-history-adr-84)).
   The pending table stores up to 32 entries inline, with bounded scans
   and shifts. Larger tables promote once to an ordered index with
-  logarithmic predecessor/successor lookup and front removal. A successor
-  within the merge distance takes
+  logarithmic predecessor/successor lookup and front removal. An indexed
+  update retains the search cursor through insertion, coalescing and
+  successor replacement; a timestep reads the front once between mutations.
+  A successor within the merge distance takes
   priority over a predecessor, including an equal predecessor; duplicate
   entries retain insertion order and the original signed-zero bits. The
   two-entry clear appends the final-time sentinel even when an already

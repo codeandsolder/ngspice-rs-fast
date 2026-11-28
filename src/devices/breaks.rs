@@ -262,24 +262,6 @@ impl BreakTable {
         }
     }
 
-    /// The first strictly greater entry in sequence order (not necessarily
-    /// the globally smallest greater time after C's terminal inversion).
-    fn successor(&self, time: Real) -> Option<(EventKey, Real)> {
-        use std::ops::Bound::{Excluded, Included, Unbounded};
-        self.breaks
-            .range((
-                Excluded(EventKey::new(time, false)),
-                Included(EventKey::new(Real::INFINITY, false)),
-            ))
-            .next()
-            .or_else(|| {
-                self.breaks
-                    .range((Excluded(EventKey::new(time, true)), Unbounded))
-                    .next()
-            })
-            .map(|(&key, events)| (key, events.first))
-    }
-
     /// `CKTsetBreak(ckt, time)` with `CKTtime = now`.
     ///
     /// A request within 3 ULPs of `now` is ignored. Preserve C's successor-
@@ -304,23 +286,70 @@ impl BreakTable {
             // not reallocate it whenever the pending count crosses a threshold.
             self.promote();
         }
-        if let Some((key, successor)) = self.successor(time) {
-            if successor - time <= self.min_break {
-                // Replace exactly the first occurrence of the successor.
-                self.remove_first_of(key);
-                self.insert(time, key.after_terminal);
-            } else if !self
-                .breaks
-                .range(..key)
-                .next_back()
-                .is_some_and(|(_, events)| time - events.last() <= self.min_break)
-            {
-                self.insert(time, key.after_terminal);
-            }
-        } else if let Some((&key, events)) = self.breaks.last_key_value()
-            && time - events.last() > self.min_break
+        self.set_indexed(time)
+    }
+
+    /// Keep a cursor at the first strictly greater entry in sequence order.
+    /// This is not necessarily the globally smallest greater time after a
+    /// terminal inversion. The cursor also gives the preceding bucket and
+    /// can mutate the local gap without a second tree traversal.
+    fn set_indexed(&mut self, time: Real) -> SpiceResult<()> {
+        use std::ops::Bound::Excluded;
+        let mut cursor = self
+            .breaks
+            .lower_bound_mut(Excluded(&EventKey::new(time, false)));
+        // A successor in the second run already satisfies the order if its
+        // time exceeds the requested value. Only skip the rest of that run
+        // when its first element is not strictly greater.
+        if cursor
+            .peek_next()
+            .is_some_and(|(key, _)| key.after_terminal && key.time <= time)
         {
-            self.insert(time, key.after_terminal);
+            cursor = self
+                .breaks
+                .lower_bound_mut(Excluded(&EventKey::new(time, true)));
+        }
+        let successor = cursor.peek_next().map(|(key, events)| (*key, events.first));
+        let (key, replace) = if let Some((key, successor)) = successor {
+            let replace = successor - time <= self.min_break;
+            if !replace
+                && cursor
+                    .peek_prev()
+                    .is_some_and(|(_, events)| time - events.last() <= self.min_break)
+            {
+                return Ok(());
+            }
+            (EventKey::new(time, key.after_terminal), replace)
+        } else if let Some((key, events)) = cursor.peek_prev() {
+            if time - events.last() <= self.min_break {
+                return Ok(());
+            }
+            (EventKey::new(time, key.after_terminal), false)
+        } else {
+            return Ok(());
+        };
+        // Insert before removing the old successor, so an unexpected checked
+        // cursor insertion failure leaves the existing sequence untouched.
+        if let Some((previous, events)) = cursor.peek_prev()
+            && *previous == key
+        {
+            events.rest.push_back(time);
+        } else {
+            cursor
+                .insert_before(key, Events::new(time))
+                .map_err(|_| SpiceError::circuit("breakpoint index order invariant violated"))?;
+        }
+        if replace {
+            let (_, events) = cursor
+                .peek_next()
+                .ok_or_else(|| SpiceError::circuit("missing breakpoint successor"))?;
+            if let Some(next) = events.rest.pop_front() {
+                events.first = next;
+            } else {
+                cursor.remove_next();
+            }
+        } else {
+            self.len += 1;
         }
         Ok(())
     }
@@ -1111,41 +1140,55 @@ mod tests {
         };
         for final_time in [-0., 2., 10.] {
             for min_break in [0., Real::from_bits(1), 0.125, 0.5, 1.] {
-                let mut table = BreakTable::new(final_time, min_break).unwrap();
-                let mut reference = Reference::new(final_time, min_break);
-                for _ in 0..5000 {
-                    let bits = next();
-                    if bits % 4 == 0 {
-                        table.clear();
-                        reference.clear();
-                    } else {
-                        let time = match bits % 19 {
-                            0 => 0.,
-                            1 => -0.,
-                            2 => Real::from_bits(bits % 8),
-                            3 => Real::INFINITY,
-                            4 => Real::NEG_INFINITY,
-                            5 => Real::NAN,
-                            6 => Real::MAX,
-                            7 => -Real::MAX,
-                            8 => table.first(),
-                            9 => table.second(),
-                            _ => Real::from(u32::try_from(next() % 161).unwrap()) / 8. - 5.,
-                        };
-                        let now = match next() % 6 {
-                            0 => time,
-                            1 => Real::from_bits(time.to_bits().wrapping_add(2)),
-                            2 => 0.,
-                            3 => Real::from(u32::try_from(next() % 81).unwrap()) / 8. - 5.,
-                            _ => -Real::MAX,
-                        };
-                        assert_eq!(
-                            table.set(now, time).is_ok(),
-                            reference.set(now, time),
-                            "now={now:e} time={time:e}"
-                        );
+                for spill in [false, true] {
+                    let mut table = BreakTable::new(final_time, min_break).unwrap();
+                    let mut reference = Reference::new(final_time, min_break);
+                    if spill {
+                        for i in 1..=u32::try_from(INLINE_BREAKS).unwrap() + 2 {
+                            let time = final_time + 2. * Real::from(i);
+                            assert_eq!(table.set(-1., time).is_ok(), reference.set(-1., time));
+                        }
+                        while reference.times.len() > 2 {
+                            table.clear();
+                            reference.clear();
+                        }
+                        assert!(!table.breaks.is_empty());
+                        reference.compare(&table);
                     }
-                    reference.compare(&table);
+                    for _ in 0..5000 {
+                        let bits = next();
+                        if bits % 4 == 0 {
+                            table.clear();
+                            reference.clear();
+                        } else {
+                            let time = match bits % 19 {
+                                0 => 0.,
+                                1 => -0.,
+                                2 => Real::from_bits(bits % 8),
+                                3 => Real::INFINITY,
+                                4 => Real::NEG_INFINITY,
+                                5 => Real::NAN,
+                                6 => Real::MAX,
+                                7 => -Real::MAX,
+                                8 => table.first(),
+                                9 => table.second(),
+                                _ => Real::from(u32::try_from(next() % 161).unwrap()) / 8. - 5.,
+                            };
+                            let now = match next() % 6 {
+                                0 => time,
+                                1 => Real::from_bits(time.to_bits().wrapping_add(2)),
+                                2 => 0.,
+                                3 => Real::from(u32::try_from(next() % 81).unwrap()) / 8. - 5.,
+                                _ => -Real::MAX,
+                            };
+                            assert_eq!(
+                                table.set(now, time).is_ok(),
+                                reference.set(now, time),
+                                "now={now:e} time={time:e}"
+                            );
+                        }
+                        reference.compare(&table);
+                    }
                 }
             }
         }
