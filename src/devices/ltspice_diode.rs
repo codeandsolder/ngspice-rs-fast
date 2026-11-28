@@ -1,4 +1,4 @@
-//! Occurrence-resolved LTspice diode dispatch and prepared kernel binding.
+//! Occurrence-resolved `LTspice` diode dispatch and prepared kernel binding.
 //! The numerical transport and charge equations live in model-kernel-diode.
 
 use std::sync::Arc;

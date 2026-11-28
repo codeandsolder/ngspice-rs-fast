@@ -490,7 +490,7 @@ pub struct LevelSelection {
     /// Concrete implementation for the validated selector.
     pub backend: ModelBackend,
     /// Diode's last integer setter (`floor(raw + 0.5)`), defaulting to 1.
-    /// `None` for families with no integer setter or out-of-range LTspice LEVEL.
+    /// `None` for families with no integer setter or out-of-range `LTspice` LEVEL.
     pub applied: Option<u8>,
 }
 

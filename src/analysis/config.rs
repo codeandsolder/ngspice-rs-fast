@@ -69,7 +69,7 @@
 //!
 //! Source-projected `ltspice_output_*` raw-file compression and precision
 //! settings are finite scalar presentation controls. They are also recorded
-//! as no-ops; the solver does not serialize LTspice's proprietary raw format.
+//! as no-ops; the solver does not serialize `LTspice`'s proprietary raw format.
 //! Native ngspice output options retain their own policy.
 //!
 //! Every other name from `cktsopt.c` (`oldlimit`, ...)
