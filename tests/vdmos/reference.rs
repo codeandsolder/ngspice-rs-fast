@@ -482,6 +482,48 @@ fn long_transit_time_qp_without_thermal_stays_at_steady_state() {
     );
 }
 
+/// Moments of the piecewise-linear adaptive output, without giving dense
+/// switching-edge samples more weight than the remaining waveform.
+fn waveform_moments(plot: &ReferencePlot, variable: &str, baseline: f64) -> [f64; 2] {
+    let mut time = plot.value("time", 0).unwrap().re;
+    let initial_time = time;
+    let mut value = plot.value(variable, 0).unwrap().re - baseline;
+    let mut area = 0.;
+    let mut square_area = 0.;
+    for index in 1..plot.point_count() {
+        let next_time = plot.value("time", index).unwrap().re;
+        let next = plot.value(variable, index).unwrap().re - baseline;
+        let delta = next_time - time;
+        assert!(delta >= 0., "nonmonotone adaptive time grid");
+        area = delta.mul_add(f64::midpoint(value, next), area);
+        let mean_square = (value.mul_add(value, value * next) + next * next) / 3.;
+        square_area = delta.mul_add(mean_square, square_area);
+        time = next_time;
+        value = next;
+    }
+    let duration = time - initial_time;
+    assert!(duration > 0., "empty waveform interval");
+    [area / duration, (square_area / duration).sqrt()]
+}
+
+fn buck_metric(
+    variable: &str,
+    metric: &str,
+    actual: f64,
+    expected: f64,
+    absolute: f64,
+    relative: f64,
+) {
+    let tolerance = relative.mul_add(expected.abs(), absolute);
+    println!(
+        "buck {variable} {metric}: Rust {actual:.9e}, C47 {expected:.9e}, tol {tolerance:.3e}"
+    );
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "buck {variable} {metric}: Rust {actual:e}, C47 {expected:e}, tol {tolerance:e}"
+    );
+}
+
 #[test]
 fn synchronous_buck_with_two_thermal_vdmos_matches_ngspice47() {
     // A physically connected 100 kHz synchronous converter: driven P-channel
@@ -519,10 +561,6 @@ fn synchronous_buck_with_two_thermal_vdmos_matches_ngspice47() {
             "i(vdc)",
             [(40.1e-6, -1.34205), (44.5e-6, -1.77360e-7)].as_slice(),
         ),
-        ("v(hj)", [(200e-6, 27.0791)].as_slice()),
-        ("v(hc)", [(200e-6, 27.0675)].as_slice()),
-        ("v(lj)", [(200e-6, 27.0986)].as_slice()),
-        ("v(lc)", [(200e-6, 27.0857)].as_slice()),
     ] {
         for &(at, expected) in reference {
             let observed = interpolation(&plot, variable, at);
@@ -532,6 +570,44 @@ fn synchronous_buck_with_two_thermal_vdmos_matches_ngspice47() {
                 "100 kHz buck {variable} t={at:e}: Rust {observed:e}, ngspice47 {expected:e}, tol {tolerance:e}"
             );
         }
+    }
+    // Compare thermal rise rather than absolute Celsius: a tolerance scaled
+    // by 27 C would allow the entire self-heating contribution to disappear.
+    // C47 max-step 50/25/12.5 ns refinement (same reltol) agrees to < 1 uK
+    // for the final rise; allow independent solver and integration differences.
+    for (variable, final_rise, mean_rise, rms_rise) in [
+        ("v(hj)", 0.079_086_403, 0.025_877_960, 0.035_975_750),
+        ("v(hc)", 0.067_512_783, 0.022_090_941, 0.030_711_006),
+        ("v(lj)", 0.098_567_674, 0.033_071_018, 0.044_479_255),
+        ("v(lc)", 0.085_711_021, 0.028_757_407, 0.038_677_613),
+    ] {
+        buck_metric(
+            variable,
+            "final rise",
+            interpolation(&plot, variable, 200e-6) - 27.,
+            final_rise,
+            0.001,
+            0.03,
+        );
+        let [mean, rms] = waveform_moments(&plot, variable, 27.);
+        buck_metric(variable, "mean rise", mean, mean_rise, 0.0005, 0.03);
+        buck_metric(variable, "RMS rise", rms, rms_rise, 0.0005, 0.03);
+    }
+    // Independently integrate the complete adaptive C reference waveform,
+    // not merely a handful of favorable switching checkpoints.
+    for (variable, mean_reference, rms_reference) in [
+        ("v(out)", 1.882_503_100, 2.424_752_769),
+        ("v(sw)", 4.802_208_910, 7.654_169_645),
+        ("i(vdc)", -1.110_684_303, 1.890_567_851),
+        ("i(lout)", 2.656_324_967, 2.914_575_332),
+    ] {
+        let [mean, rms] = waveform_moments(&plot, variable, 0.);
+        buck_metric(variable, "mean", mean, mean_reference, 0.001, 0.015);
+        buck_metric(variable, "RMS", rms, rms_reference, 0.001, 0.015);
+    }
+    for (variable, reference) in [("i(vgh)", 0.023_464_078), ("i(vgl)", 0.017_008_851)] {
+        let [_, rms] = waveform_moments(&plot, variable, 0.);
+        buck_metric(variable, "RMS gate current", rms, reference, 0.0002, 0.03);
     }
 }
 

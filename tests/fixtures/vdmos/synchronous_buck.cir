@@ -26,6 +26,29 @@ meas tran tjh200 find v(hj) at=200u
 meas tran tch200 find v(hc) at=200u
 meas tran tjl200 find v(lj) at=200u
 meas tran tcl200 find v(lc) at=200u
+* Waveform moments; RMS uses a piecewise-linear waveform integral.
+meas tran vo_mean avg v(out)
+meas tran vo_rms rms v(out)
+meas tran sw_mean avg v(sw)
+meas tran sw_rms rms v(sw)
+meas tran supply_mean avg i(vdc)
+meas tran supply_rms rms i(vdc)
+meas tran inductor_mean avg i(lout)
+meas tran inductor_rms rms i(lout)
+meas tran high_gate_rms rms i(vgh)
+meas tran low_gate_rms rms i(vgl)
+let tjh_rise = v(hj)-27
+let tch_rise = v(hc)-27
+let tjl_rise = v(lj)-27
+let tcl_rise = v(lc)-27
+meas tran tjh_mean avg tjh_rise
+meas tran tjh_rms rms tjh_rise
+meas tran tch_mean avg tch_rise
+meas tran tch_rms rms tch_rise
+meas tran tjl_mean avg tjl_rise
+meas tran tjl_rms rms tjl_rise
+meas tran tcl_mean avg tcl_rise
+meas tran tcl_rms rms tcl_rise
 quit
 .endc
 .end
