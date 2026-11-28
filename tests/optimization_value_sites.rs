@@ -254,6 +254,50 @@ fn benchmark_ten_thousand_candidates_and_one_hundred_twenty_eight_sites() {
 }
 
 #[test]
+fn candidate_values_keep_numparam_decimal_rounding() {
+    let plan =
+        CircuitParameterPlan::new(deck(".param x=1\nv1 in 0 {x}\nr1 in 0 1k"), &["x"]).unwrap();
+    let mut session = plan.session().unwrap();
+    for value in [
+        1.0_f64.next_up(),
+        -1.0_f64.next_up(),
+        9.999_999_999_999_998,
+        0.25,
+    ] {
+        session
+            .update(&[value], &mut EvalBudget::default())
+            .unwrap();
+        let text = ngspice_rs::netlist::elaborate::format_literal(value);
+        let expected = ngspice_rs::primitives::parse_spice_number(&text).unwrap();
+        assert_eq!(session.site_value(0).unwrap().to_bits(), expected.to_bits());
+        assert_eq!(session.last_site_roundings(), 1);
+    }
+}
+
+#[test]
+#[ignore = "manual changed-site throughput and allocation benchmark"]
+fn benchmark_changed_numeric_sites() {
+    let plan = CircuitParameterPlan::new(workload(32), &["x", "y"]).unwrap();
+    let mut session = plan.session().unwrap();
+    for count in [1_000_u32, 10_000, 100_000] {
+        let start = Instant::now();
+        let mut rounded = 0;
+        for index in 0..count {
+            let value = f64::from(index) + 2.123_456_789_012_345;
+            session
+                .update(&[value, value + 1.], &mut EvalBudget::default())
+                .unwrap();
+            rounded += session.last_site_roundings();
+        }
+        assert_eq!(rounded, count as usize * 32);
+        eprintln!(
+            "changed-sites candidates={count} rounded={rounded} elapsed={:?}",
+            start.elapsed()
+        );
+    }
+}
+
+#[test]
 fn waveform_candidate_sites_rebuild_and_restore_immutable_forcing() {
     use ngspice_rs::devices::{Limit, TransientTiming};
     let source =
