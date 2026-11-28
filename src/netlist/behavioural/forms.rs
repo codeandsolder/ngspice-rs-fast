@@ -4,7 +4,7 @@
 //! views rather than independently interpreting the generic setter list.
 use crate::netlist::ast::{DeviceInstance, ParameterAssignment, ParameterKind, poly_dimension};
 use crate::netlist::bexpr::{BExpr, BExprKind, BehaviouralExpression};
-use crate::netlist::expr::{ParameterExpression, SourceSpan};
+use crate::netlist::expr::{MAX_TREE_NODES, ParameterExpression, SourceSpan};
 use crate::primitives::{Real, SpiceError, SpiceResult, parse_spice_number};
 
 use super::malformed;
@@ -41,6 +41,10 @@ impl<'a> Numeric<'a> {
             _ => return Err(invalid(parameter, "expected a numeric parameter")),
         };
         Ok(Self { parameter, value })
+    }
+
+    pub(super) fn literal_zero(&self) -> bool {
+        matches!(self.value, NumericValue::Literal(value) if value == 0.)
     }
 
     pub(super) fn expression(&self) -> BExpr {
@@ -267,6 +271,12 @@ impl<'a> NonlinearForm<'a> {
         let count = remaining.iter().take_while(|p| p.name == "coef").count();
         if count == 0 {
             return Err(malformed(device, "POLY needs at least one coefficient"));
+        }
+        if count > MAX_TREE_NODES {
+            return Err(malformed(
+                device,
+                "POLY coefficient count exceeds expression node limit",
+            ));
         }
         let (coefficients, remaining) = remaining.split_at(count);
         let coefficients = coefficients
