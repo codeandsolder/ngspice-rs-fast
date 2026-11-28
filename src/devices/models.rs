@@ -314,17 +314,7 @@ impl ModelBackend {
                     ]
                 }
             }
-            'q' => {
-                const {
-                    &[
-                        BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2]),
-                        BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal NPN", &[1])
-                            .for_family(ModelFamily::GummelPoonLegacyNpn),
-                        BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal PNP", &[1])
-                            .for_family(ModelFamily::GummelPoonLegacyPnp),
-                    ]
-                }
-            }
+            'q' => Self::bipolar_catalog(),
             'm' => {
                 const {
                     &[
@@ -378,26 +368,40 @@ impl ModelBackend {
             'o' => const { &[BackendSpec::new(Self::Ltra, "Lossy line", &[1])] },
             'y' => const { &[BackendSpec::new(Self::Txl, "TXL lossy line", &[1])] },
             'p' => const { &[BackendSpec::new(Self::Cpl, "Coupled line", &[1])] },
-            'a' => {
-                const {
-                    &[
-                        BackendSpec::new(Self::RationalTransfer, "Rational transfer", &[1]),
-                        BackendSpec::new(Self::FrequencyTransfer, "Tabulated AC transfer", &[1])
-                            .for_family(ModelFamily::FrequencyTransfer),
-                        BackendSpec::new(Self::LogicEvent, "Native hybrid event logic", &[1])
-                            .for_family(ModelFamily::LogicEvent),
-                        BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
-                            .for_family(ModelFamily::LogicVoltage),
-                        BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
-                            .for_family(ModelFamily::TimedSwitch),
-                        BackendSpec::new(Self::PSwitch, "Continuous cubic switch", &[1])
-                            .for_family(ModelFamily::PSwitch),
-                        BackendSpec::new(Self::ASwitch, "Continuous analog switch", &[1])
-                            .for_family(ModelFamily::ASwitch),
-                    ]
-                }
-            }
+            'a' => Self::code_model_catalog(),
             _ => &[],
+        }
+    }
+
+    const fn bipolar_catalog() -> &'static [BackendSpec] {
+        const {
+            &[
+                BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2]),
+                BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal NPN", &[1])
+                    .for_family(ModelFamily::GummelPoonLegacyNpn),
+                BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal PNP", &[1])
+                    .for_family(ModelFamily::GummelPoonLegacyPnp),
+            ]
+        }
+    }
+
+    const fn code_model_catalog() -> &'static [BackendSpec] {
+        const {
+            &[
+                BackendSpec::new(Self::RationalTransfer, "Rational transfer", &[1]),
+                BackendSpec::new(Self::FrequencyTransfer, "Tabulated AC transfer", &[1])
+                    .for_family(ModelFamily::FrequencyTransfer),
+                BackendSpec::new(Self::LogicEvent, "Native hybrid event logic", &[1])
+                    .for_family(ModelFamily::LogicEvent),
+                BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
+                    .for_family(ModelFamily::LogicVoltage),
+                BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
+                    .for_family(ModelFamily::TimedSwitch),
+                BackendSpec::new(Self::PSwitch, "Continuous cubic switch", &[1])
+                    .for_family(ModelFamily::PSwitch),
+                BackendSpec::new(Self::ASwitch, "Continuous analog switch", &[1])
+                    .for_family(ModelFamily::ASwitch),
+            ]
         }
     }
 
