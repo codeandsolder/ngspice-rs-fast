@@ -110,7 +110,7 @@ fn removed_network(instance: &DeviceInstance) -> SpiceResult<bool> {
 /// A genuine voltage-imposing or winding branch, not merely an internal
 /// constitutive row or an artificial observation probe. This selection is
 /// intentionally independent of the factory's current-coordinate allocation.
-fn is_instantaneous_branch(designator: char, voltage_output: bool) -> bool {
+const fn is_instantaneous_branch(designator: char, voltage_output: bool) -> bool {
     matches!(designator, 'v' | 'e' | 'h' | 'l') || (designator == 'b' && voltage_output)
 }
 
@@ -418,7 +418,7 @@ impl Expansion {
             match dynamic_operator(expr) {
                 Some(DynamicOperator::Derivative) => result = self.extract_derivative(expr),
                 Some(DynamicOperator::Current(policy)) => {
-                    result = self.extract_sample(expr, policy)
+                    result = self.extract_sample(expr, policy);
                 }
                 None => {
                     if let BExprKind::Current(name) = &mut expr.kind {
