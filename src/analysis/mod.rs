@@ -71,8 +71,9 @@ mod tf;
 pub mod touchstone;
 
 pub use companion::{
-    TimingSegment, TransientPlan, TransientSchedule, TransientStats, companion_transient,
-    companion_transient_into, mixed_signal_transient, mixed_signal_transient_into,
+    OutputSampling, TimingSegment, TransientPlan, TransientSchedule, TransientStats,
+    companion_transient, companion_transient_into, mixed_signal_transient,
+    mixed_signal_transient_into,
 };
 pub use config::{
     AppliedOption, DcOptions, IgnoredOption, PlanningLimits, RunConfig, RunOverrides,

@@ -15,6 +15,18 @@ pub struct TimingSegment {
     pub step: Real,
 }
 
+/// How a validated transient schedule saves data. Only exact landings
+/// constrain the adaptive integrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputSampling {
+    /// Save a solved state at each requested grid point, anchored at START.
+    Land,
+    /// Save internal accepted timepoints after START, without a sampling grid.
+    Accepted,
+    /// Interpolate accepted output rows on the segment-origin grid after START.
+    Interpolate,
+}
+
 /// Validated, source-independent timing for a continuous transient.
 /// Output times form a lazy grid starting at the output gate, including each
 /// subsequent output-segment boundary and final stop exactly once.
@@ -24,6 +36,9 @@ pub struct TransientSchedule {
     output: Arc<[TimingSegment]>,
     ceiling: Arc<[TimingSegment]>,
     minimum_ceiling: Real,
+    step_hint: Real,
+    sampling: OutputSampling,
+    requested_points: usize,
 }
 
 fn validate(segments: &[TimingSegment]) -> SpiceResult<Real> {
@@ -34,6 +49,7 @@ fn validate(segments: &[TimingSegment]) -> SpiceResult<Real> {
             || !segment.step.is_finite()
             || segment.step <= 0.
             || previous + segment.step <= previous
+            || segment.until - segment.step >= segment.until
         {
             return Err(unsupported("invalid transient timing segment"));
         }
@@ -56,6 +72,8 @@ impl TransientSchedule {
         start: Real,
         output: Vec<TimingSegment>,
         ceiling: Vec<TimingSegment>,
+        step_hint: Real,
+        sampling: OutputSampling,
     ) -> SpiceResult<Self> {
         let stop = validate(&output)?;
         let ceiling_stop = validate(&ceiling)?;
@@ -63,24 +81,64 @@ impl TransientSchedule {
             || !start.is_finite()
             || start < 0.
             || start >= stop
+            || !step_hint.is_finite()
+            || step_hint <= 0.
         {
             return Err(unsupported("inconsistent transient timing schedule"));
         }
         let minimum_ceiling = ceiling
             .iter()
             .fold(Real::INFINITY, |min, s| min.min(s.step));
+        let requested_points = if sampling == OutputSampling::Accepted {
+            0
+        } else {
+            // Reserve a conservative closed-grid bound before any solving.
+            // One extra point per segment covers binary64 endpoint rounding.
+            let mut count = 1usize;
+            let mut anchor = 0.;
+            for segment in &output {
+                if segment.until > start {
+                    let begin = if sampling == OutputSampling::Land {
+                        anchor.max(start)
+                    } else {
+                        anchor
+                    };
+                    let upper = ((segment.until - begin) / segment.step).ceil() + 1.;
+                    let points = crate::primitives::exact_nonnegative_integer::<u32>(upper)
+                        .ok_or_else(|| unsupported("transient output grid limit exceeded"))?;
+                    count = count
+                        .checked_add(points as usize)
+                        .filter(|count| {
+                            *count <= crate::analysis::PlanningLimits::default().max_grid_points
+                        })
+                        .ok_or_else(|| unsupported("transient output grid limit exceeded"))?;
+                }
+                anchor = segment.until;
+            }
+            count
+        };
         Ok(Self {
             start: if matches!(start, 0.) { 0. } else { start },
             minimum_ceiling,
             output: output.into(),
             ceiling: ceiling.into(),
+            step_hint,
+            sampling,
+            requested_points,
         })
     }
 
     pub(super) fn bounds(&self) -> [Real; 4] {
-        let output = self.output[0];
         let stop = self.output[self.output.len() - 1].until;
-        [output.step, stop, self.start, self.ceiling[0].step]
+        [self.step_hint, stop, self.start, self.ceiling[0].step]
+    }
+
+    pub(super) const fn sampling(&self) -> OutputSampling {
+        self.sampling
+    }
+
+    pub(in crate::analysis) const fn requested_points(&self) -> usize {
+        self.requested_points
     }
 
     pub(super) const fn minimum_ceiling(&self) -> Real {
@@ -92,14 +150,44 @@ impl TransientSchedule {
         self.ceiling[index.min(self.ceiling.len() - 1)]
     }
 
-    pub(super) fn grid(&self) -> ScheduledGrid {
-        ScheduledGrid {
+    pub(super) fn grid(&self) -> SpiceResult<ScheduledGrid> {
+        let segment = self.output.partition_point(|s| s.until <= self.start);
+        let mut grid = ScheduledGrid {
             schedule: self.clone(),
-            segment: self.output.partition_point(|s| s.until <= self.start),
+            segment,
             anchor: self.start,
             index: 0,
             time: self.start,
+        };
+        if self.sampling == OutputSampling::Interpolate {
+            grid.anchor = segment.checked_sub(1).map_or(0., |i| self.output[i].until);
+            let current = self.output[segment];
+            let index = ((self.start - grid.anchor) / current.step).ceil();
+            grid.index = crate::primitives::exact_nonnegative_integer::<u32>(index)
+                .ok_or_else(|| unsupported("transient output grid exceeds index range"))?;
+            // Check the actual rounded coordinates rather than trusting a
+            // quotient rounded just above or below an exact integer.
+            let coordinate = |index| {
+                Real::from(index)
+                    .mul_add(current.step, grid.anchor)
+                    .min(current.until)
+            };
+            if grid.index > 0 && coordinate(grid.index - 1) >= self.start {
+                grid.index -= 1;
+            }
+            grid.time = coordinate(grid.index);
+            if grid.time < self.start {
+                grid.index = grid
+                    .index
+                    .checked_add(1)
+                    .ok_or_else(|| unsupported("transient output grid exceeds index range"))?;
+                grid.time = coordinate(grid.index);
+            }
+            if grid.time < self.start {
+                return Err(unsupported("transient output grid cannot reach START"));
+            }
         }
+        Ok(grid)
     }
 }
 

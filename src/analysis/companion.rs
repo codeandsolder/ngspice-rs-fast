@@ -92,7 +92,8 @@
 
 mod branch_events;
 mod schedule;
-pub use schedule::{TimingSegment, TransientSchedule};
+pub use schedule::{OutputSampling, TimingSegment, TransientSchedule};
+mod interpolation;
 
 use crate::devices::physical_dae::BranchTrace;
 use crate::devices::{
@@ -242,10 +243,22 @@ impl TransientPlan {
         plan
     }
 
-    /// Requested output time step.
-    #[must_use = "the requested output interval determines the output sampling schedule"]
+    /// Nominal integration startup and forcing-default time hint.
+    #[must_use = "the time hint determines initial integration and implicit forcing timing"]
     pub const fn step(&self) -> Real {
         self.step
+    }
+
+    pub(super) fn requested_output_points(&self) -> usize {
+        self.schedule
+            .as_ref()
+            .map_or(0, TransientSchedule::requested_points)
+    }
+
+    fn interpolates(&self) -> bool {
+        self.schedule
+            .as_ref()
+            .is_some_and(|schedule| schedule.sampling() == OutputSampling::Interpolate)
     }
 
     /// Requested first output time.
@@ -1359,7 +1372,17 @@ fn run_transient_inner(
         accepted_guards: BranchTrace::default(),
         settings,
     };
-    driver.run(purpose, sink)
+    if let Some(schedule) = driver
+        .settings
+        .schedule
+        .as_ref()
+        .filter(|schedule| schedule.sampling() == OutputSampling::Interpolate)
+    {
+        let mut interpolated = interpolation::InterpolatedSink::new(schedule, uic, sink)?;
+        driver.run(purpose, &mut interpolated)
+    } else {
+        driver.run(purpose, sink)
+    }
 }
 
 impl Driver<'_> {
@@ -1445,6 +1468,11 @@ impl Driver<'_> {
         sink: &mut dyn PointSink,
     ) -> SpiceResult<TransientEnd> {
         let TransientPlan { stop, start, .. } = self.settings;
+        let start = if self.settings.interpolates() {
+            0.
+        } else {
+            start
+        };
         // traninit.c: CKTdelmin; dctran.c (XSPICE build): CKTminBreak.
         let mut breaks = BreakTable::new(stop, self.settings.min_break())?;
         let mut sources = SourceBreaks::new(self.system);
@@ -1482,7 +1510,9 @@ impl Driver<'_> {
                 .settings
                 .schedule
                 .as_ref()
-                .map(|schedule| OutputGrid::Scheduled(schedule.grid())),
+                .filter(|schedule| schedule.sampling() == OutputSampling::Land)
+                .map(|schedule| schedule.grid().map(OutputGrid::Scheduled))
+                .transpose()?,
         };
         let capture_boundary = matches!(
             purpose,
@@ -1562,7 +1592,7 @@ impl Driver<'_> {
         point: &mut Vec<Complex>,
     ) -> SpiceResult<()> {
         // C (dctran.c) writes no t = 0 row under uic.
-        if accepted.cursor.clock.time == 0. && self.uic {
+        if accepted.cursor.clock.time == 0. && self.uic && !self.settings.interpolates() {
             return Ok(());
         }
         let solution = accepted
@@ -2055,7 +2085,7 @@ impl Driver<'_> {
         observe: impl FnOnce() -> SpiceResult<Vec<Complex>>,
     ) -> SpiceResult<CandidateOutput> {
         let time = attempt.clock.time;
-        let observed = if time < self.settings.start
+        let observed = if (time < self.settings.start && !self.settings.interpolates())
             || output.sample_at.is_some_and(|at| {
                 if self.settings.schedule.is_some() {
                     time.to_bits() != at.to_bits()

@@ -722,6 +722,7 @@ impl AnalysisPlan {
     pub(super) fn requested_grid_points(&self) -> usize {
         match &self.analysis {
             PlanKind::Dc { axes, .. } => axes.point_count(),
+            PlanKind::Transient { settings, .. } => settings.requested_output_points(),
             PlanKind::PeriodicSteadyState { settings, .. } => settings.grid_points(),
             PlanKind::HarmonicBalance(settings) => settings.grid_points(),
             PlanKind::Ac { frequencies, .. }
