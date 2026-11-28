@@ -773,17 +773,17 @@ impl<'a> PreparedRun<'a> {
         let mut bindings = Vec::new();
         for index in self.circuit.load_order() {
             let device = point.device(self.circuit, index);
-            device.physical_charge_histories(&mut |history| {
+            device.physical_charge_slots(&mut |slot| {
                 let range = self
                     .circuit
                     .state_rows(index)
                     .ok_or_else(|| SpiceError::circuit("missing physical Taylor history range"))?;
-                if history.slot.saturating_add(1) >= range.len() {
+                if slot.saturating_add(1) >= range.len() {
                     return Err(SpiceError::circuit(
                         "physical Taylor history pair outside device",
                     ));
                 }
-                bindings.push((range.start + history.slot, device.name().to_owned()));
+                bindings.push((range.start + slot, device.name().to_owned()));
                 Ok(())
             })?;
         }
@@ -810,17 +810,15 @@ impl<'a> PreparedRun<'a> {
         for index in self.circuit.load_order() {
             let device = point.device(self.circuit, index);
             if device.is_nonlinear() {
-                let terminal_capture = output
-                    .guards
-                    .is_some()
-                    .then(|| {
-                        self.circuit
-                            .runtime
-                            .observations
-                            .capture_rows(index)
-                            .map(crate::devices::physical_dae::TerminalCapture::new)
-                    })
-                    .flatten();
+                let terminal_capture = if output.guards.is_some() {
+                    self.circuit
+                        .runtime
+                        .observations
+                        .capture_rows(index)
+                        .map(crate::devices::physical_dae::TerminalCapture::new)
+                } else {
+                    None
+                };
                 let mut context = crate::devices::physical_dae::TaylorContext {
                     device: index,
                     state_rows: self

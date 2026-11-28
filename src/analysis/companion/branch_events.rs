@@ -1,4 +1,4 @@
-//! Localize executed behavioural guard transitions using disposable physical
+//! Localize executed physical guard transitions using disposable physical
 //! derivative-array solves against the same accepted integration history.
 
 use super::{
@@ -255,7 +255,7 @@ impl Driver<'_> {
             .predicted_offset(duration, self.timing.step())
             .map_err(|error| {
                 failure(format!(
-                    "behavioural branch prediction at t = {start:e}: {error}"
+                    "physical branch prediction at t = {start:e}: {error}"
                 ))
             })?
         {
@@ -290,7 +290,7 @@ impl Driver<'_> {
             )
             .map_err(|error| {
                 failure(format!(
-                    "behavioural backward branch prediction at t = {end:e}: {error}"
+                    "physical backward branch prediction at t = {end:e}: {error}"
                 ))
             })?
         else {
@@ -385,7 +385,7 @@ impl Driver<'_> {
                     let retry = Real::midpoint(start.time, at);
                     if retry <= start.time || retry - start.time <= self.settings.min_step() {
                         return Err(failure(format!(
-                            "{device}: unresolved behavioural branch crossing at t = {at:e}"
+                            "{device}: unresolved physical branch crossing at t = {at:e}"
                         )));
                     }
                     return Ok(Localization::Retry(retry));
@@ -393,14 +393,14 @@ impl Driver<'_> {
             }
         }
         Err(failure(format!(
-            "{device}: behavioural branch isolation budget exhausted at t = {:e}..{:e}",
+            "{device}: physical branch isolation budget exhausted at t = {:e}..{:e}",
             bracket.left, bracket.right
         )))
     }
 
     fn count_branch_probe(&mut self) -> SpiceResult<()> {
         if self.stats.accepted + self.stats.rejected >= self.settings.max_steps {
-            return Err(failure("work limit during behavioural branch isolation"));
+            return Err(failure("work limit during physical branch isolation"));
         }
         self.stats.rejected += 1;
         Ok(())
@@ -419,18 +419,11 @@ impl Driver<'_> {
         // the new region's storage, for the continuity check.
         if bracket.left.next_up() < bracket.right {
             return Err(failure(
-                "behavioural branch left germ changed after localization",
+                "physical branch left germ changed after localization",
             ));
         }
         if bracket.left <= start.time {
-            let values = self
-                .history
-                .accepted(1)
-                .ok_or_else(|| failure("missing accepted branch history"))?;
-            let mut state = self.history.trial();
-            for (slot, &value) in values.iter().enumerate() {
-                self.history.set_candidate_slot(&mut state, slot, value)?;
-            }
+            let state = self.history.trial_from_latest()?;
             return Ok(TrialPoint {
                 x: seed.clone(),
                 state,
@@ -443,7 +436,7 @@ impl Driver<'_> {
                 Ok(point)
             }
             _ => Err(failure(format!(
-                "could not reproduce behavioural left germ at t = {:e}",
+                "could not reproduce physical left germ at t = {:e}",
                 bracket.left
             ))),
         }

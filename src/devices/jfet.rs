@@ -1014,23 +1014,12 @@ impl Device for Jfet {
         }
         .finish(context, start, &loaded)
     }
-    fn physical_charge_histories(
+    fn physical_charge_slots(
         &self,
-        visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
+        visit: &mut dyn FnMut(usize) -> SpiceResult<()>,
     ) -> SpiceResult<()> {
-        use crate::devices::traits::PhysicalChargeHistory;
-        let [drain, gate, source] = self.inner;
-        let scale = self.model.pol * self.instance.m;
-        visit(PhysicalChargeHistory {
-            slot: slot::QGS,
-            nodes: [gate, source],
-            scale,
-        })?;
-        visit(PhysicalChargeHistory {
-            slot: slot::QGD,
-            nodes: [gate, drain],
-            scale,
-        })
+        visit(slot::QGS)?;
+        visit(slot::QGD)
     }
 
     fn assemble_nonlinear_taylor(

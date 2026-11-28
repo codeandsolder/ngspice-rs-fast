@@ -20,8 +20,13 @@ Two-terminal current and charge use the same incidence signs and
 gradient column signs. Aliased terminals cancel before stamping.
 For a one-sided branch, select the branch from the voltage jet's
 first nonzero coefficient at the boundary, not from an arbitrary
-voltage epsilon. Explicit time/event localization remains a separate
-analysis concern.
+voltage epsilon. The actual constitutive comparisons also register
+stable device-local guard sites with the shared physical branch trace.
+Only enabled junction, charge and channel laws contribute guards; numerical
+implementation switches do not. The transient driver probes predicted
+roots against disposable physical solves, validates storage continuity
+across the crossing, and publishes the selected right-limit germ. An exact
+stop-time boundary retains the left germ.
 
 ## Local storage versus global MNA charge
 
@@ -31,8 +36,9 @@ one device's own integration history. In particular, parallel
 junctions, capacitors, and multi-terminal transistor charge partitions
 must not each be assigned that sum.
 
-Devices declare each local charge/charge-rate history pair together with
-its electrical node incidence and signed scale. The prepared circuit
+Devices declare each local charge/charge-rate history pair. Electrical
+incidence and normalization belong to the actual physical stamps, not a
+second observation-only declaration. The prepared circuit
 binds them to distinct absolute slot pairs.
 A Taylor evaluation records the device-local charge jet and its
 sparse state-gradient jets in addition to its global MNA stamps.
@@ -53,17 +59,17 @@ The verified right-limit charge and rate replace the corresponding
 candidate history slots, so the trial's temporary companion
 linearization does not define accepted physical history.
 
-For instantaneous physical terminal observations, the isolated static
-device load contains no integration companion. Reconstruct displacement
-current by applying each declared electrical incidence and scale to the
-solved local charge rate, not to the temporary observation scratch state.
-Only external rows receive these corrections: the static current at an
-external series-resistance terminal already includes the internal
-displacement current through solved KCL. Ground is the negative sum of
-distinct external rows. This works independently of device multiplicity,
-polarity and recovery-coordinate normalization. Behavioural branch-event
-values remain the solved candidate values rather than a scalar
-re-evaluation at an isolated branch boundary.
+For requested nonlinear physical terminal-current and power observations,
+the final traced Taylor assembly retains each device's static residual
+and first normalized charge coefficient on its external terminal rows.
+Their sum in physical units is the terminal current of the selected germ,
+not a new scalar evaluation. The left-germ normalization is signed.
+Internal series nodes are already constrained by KCL; ground is the
+negative sum of distinct external rows. Trial observations are disposable
+and published atomically with the accepted state. Newton iterations with
+no final trace do not allocate terminal captures. Linear capacitors use
+their solved storage rates, and the ordinary non-derivative transient
+path retains its own existing load/observation contract.
 
 ## Native diode
 

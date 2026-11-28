@@ -1574,20 +1574,12 @@ impl Device for Bjt {
             ],
         )
     }
-    fn physical_charge_histories(
+    fn physical_charge_slots(
         &self,
-        visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
+        visit: &mut dyn FnMut(usize) -> SpiceResult<()>,
     ) -> SpiceResult<()> {
-        use crate::devices::traits::PhysicalChargeHistory;
-        let n = self.nodes;
-        let scale = self.pol * self.instance.multiplier;
-        for (slot, nodes, scale) in [
-            (slot::QBE, [n.bp, n.ep], scale),
-            (slot::QBC, [n.bp, n.cp], scale),
-            (slot::QSUB, [n.s, n.sc], scale * self.subs),
-            (slot::QBX, [n.b, n.cp], scale),
-        ] {
-            visit(PhysicalChargeHistory { slot, nodes, scale })?;
+        for slot in [slot::QBE, slot::QBC, slot::QSUB, slot::QBX] {
+            visit(slot)?;
         }
         Ok(())
     }

@@ -362,6 +362,19 @@ impl StateHistory {
         self.trial_reusing(None)
     }
 
+    /// A disposable copy of the latest accepted physical germ for event
+    /// continuity when the left bracket endpoint is the accepted time.
+    pub(crate) fn trial_from_latest(&self) -> SpiceResult<TrialState> {
+        let values = self
+            .accepted
+            .first()
+            .ok_or_else(|| state_error("missing accepted physical germ"))?;
+        let mut trial = self.trial();
+        trial.values = Arc::clone(values);
+        trial.physical_currents = self.physical_currents.as_ref().map(Arc::clone);
+        Ok(trial)
+    }
+
     /// A fresh trial for a Newton load in `phase`, seeing `previous` (the
     /// trial of the preceding load of the same solve, C's `CKTstate0` before
     /// this load) read-only. Slots still start as NaN. Device limiting is
@@ -1280,6 +1293,28 @@ mod tests {
         assert_eq!(history.accepted(8), None);
         history.clear();
         assert_eq!(history.depth(), 0);
+    }
+
+    #[test]
+    fn physical_terminal_currents_follow_only_published_germs() {
+        let mut history = StateHistory::new(0);
+        let mut accepted = history.trial();
+        accepted.set_physical_currents(BTreeMap::from([(7, vec![1., -1.])]));
+        history.initialize(accepted).unwrap();
+        let mut rejected = history.trial_from_latest().unwrap();
+        rejected.set_physical_currents(BTreeMap::from([(7, vec![2., -2.])]));
+        assert_eq!(history.physical_currents(7), Some(&[1., -1.][..]));
+        assert_eq!(rejected.physical_currents(7), Some(&[2., -2.][..]));
+        let clean = history.trial_reusing(Some(rejected));
+        assert!(clean.physical_currents(7).is_none());
+        let next = history.trial_from_latest().unwrap();
+        assert_eq!(next.physical_currents(7), Some(&[1., -1.][..]));
+        history.restart_integration().unwrap();
+        assert_eq!(history.physical_currents(7), Some(&[1., -1.][..]));
+        history.commit(history.trial()).unwrap();
+        assert!(history.physical_currents(7).is_none());
+        history.clear();
+        assert!(history.physical_currents(7).is_none());
     }
 
     #[test]

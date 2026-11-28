@@ -1579,3 +1579,108 @@ fn bjt_junction_crossings_land_with_collector_kcl() -> SpiceResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn semiconductor_crossing_follows_physical_decay_with_coincident_guard() -> SpiceResult<()> {
+    for coincident in [false, true] {
+        let derivative = if coincident {
+            "abs(v(cap)-0.4)"
+        } else {
+            "v(cap)"
+        };
+        let body = format!(
+            "rcap cap 0 1k\nccap cap 0 1n ic=1\nbdrive in 0 v=v(cap)\nd1 in 0 dm\n.model dm d(is=1e-12 n=10 cjo=20p vj=.8 m=.4 fc=.5 tlevc=1)\nb1 out 0 v=1u*ddt({derivative})\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n chgtol=1e-18 trtol=0.01"
+        );
+        let thermal = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+        for method in ["method=trap", "method=gear"] {
+            let plot = run_observed(
+                &body,
+                AnalysisKind::Transient,
+                &["0.1u", "2u", "0", "0.1u", "uic", method],
+                &["@d1[i]"],
+            )?;
+            let mut crossing = None;
+            let mut previous = 1.;
+            for index in 0..plot.point_count() {
+                let at = |name: &str| plot.value(name, index).unwrap().re;
+                let time = at("time");
+                let voltage = at("v(cap)");
+                close(voltage, (-time / 1e-6).exp(), 2e-6);
+                if voltage <= 0.4 && previous > 0.4 {
+                    crossing = Some(time);
+                    close(voltage, 0.4, 1e-8);
+                }
+                previous = voltage;
+                let current = 1e-12 * (voltage / thermal).exp_m1() + 1e-12 * voltage;
+                let cap = if voltage < 0.4 {
+                    20e-12 * (1. - voltage / 0.8).powf(-0.4)
+                } else {
+                    20e-12 / 0.5_f64.powf(1.4) * 0.5_f64.mul_add(voltage - 0.4, 0.5)
+                };
+                let expected = (-voltage / 1e-6).mul_add(cap, current);
+                close(at("@d1[i]"), expected, 1e-12);
+                close(at("i(bdrive)"), -expected, 1e-12);
+                if coincident {
+                    close(at("v(out)").abs(), voltage, 1e-7);
+                    if (voltage - 0.4).abs() > 1e-8 {
+                        close(at("v(out)"), -voltage * (voltage - 0.4).signum(), 1e-7);
+                    }
+                } else {
+                    close(at("v(out)"), -voltage, 1e-7);
+                }
+            }
+            close(
+                crossing.expect("missing state-dependent semiconductor event"),
+                1e-6 * 2.5_f64.ln(),
+                5e-12,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn diode_breakdown_crossing_retains_selected_current_at_interior_and_stop() -> SpiceResult<()> {
+    // IBV is deliberately smaller than IS*BV/Vt: the matching law
+    // retains BV exactly, so the cubic and breakdown currents differ
+    // at the knot. This distinguishes the selected germ from a scalar ask.
+    let body = "vdrive in 0 PWL(0 -0.875 2u -1.125 4u -0.875)\nd1 in 0 dm\n.model dm d(is=1u n=10 bv=1 ibv=1p nbv=1)\nb1 out 0 v=1u*ddt(v(in))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let thermal = (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    for method in ["method=trap", "method=gear"] {
+        for stop in ["1u", "4u"] {
+            let plot = run_observed(
+                body,
+                AnalysisKind::Transient,
+                &["0.4u", stop, "0", "0.4u", "uic", method],
+                &["@d1[i]", "@d1[p]"],
+            )?;
+            let mut seen = [false; 2];
+            for index in 0..plot.point_count() {
+                let at = |name: &str| plot.value(name, index).unwrap().re;
+                let time = at("time");
+                let at_down = (time - 1e-6).abs() <= 1e-18;
+                let at_up = (time - 3e-6).abs() <= 1e-18;
+                seen[0] |= at_down;
+                seen[1] |= at_up;
+                let voltage = at("v(in)");
+                let breakdown = if at_down {
+                    stop != "1u"
+                } else if at_up {
+                    false
+                } else {
+                    (1e-6..3e-6).contains(&time)
+                };
+                let current = if breakdown {
+                    -1e-6 * (-(1. + voltage) / thermal).exp()
+                } else {
+                    -1e-6 * (1. + (30. * thermal / (voltage * std::f64::consts::E)).powi(3))
+                } + 1e-12 * voltage;
+                close(at("@d1[i]"), current, 1e-12);
+                close(at("i(vdrive)"), -current, 1e-12);
+                close(at("@d1[p]"), voltage * current, 1e-12);
+            }
+            assert_eq!(seen, [true, stop == "4u"], "{method}, stop={stop}");
+        }
+    }
+    Ok(())
+}

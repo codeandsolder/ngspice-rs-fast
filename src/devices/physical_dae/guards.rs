@@ -358,6 +358,31 @@ mod tests {
     }
 
     #[test]
+    fn constitutive_comparisons_select_exact_germs_and_filter_inactive_sites() {
+        let mut up = BranchTrace::default();
+        let mut down = BranchTrace::default();
+        let rising = Jet::affine(2, 0.5, 1.);
+        let falling = Jet::affine(2, 0.5, -1.);
+        let mut guards = ConstitutiveGuards {
+            trace: Some(&mut up),
+            device: 12,
+        };
+        assert!(!guards.below(3, &rising, 0.5, true).unwrap());
+        assert!(guards.above(8, &rising, 0.5, false).unwrap());
+        let mut guards = ConstitutiveGuards {
+            trace: Some(&mut down),
+            device: 12,
+        };
+        assert!(guards.below(3, &falling, 0.5, true).unwrap());
+        assert!(!guards.above(8, &falling, 0.5, false).unwrap());
+        assert_eq!(up.guards.len(), 1);
+        assert_eq!(down.guards.len(), 1);
+        assert_eq!(up.changed_device(&down), Some(12));
+        assert!(up.predicted_offset(1., 1.).unwrap().is_none());
+        assert!(down.predicted_offset(1., 1.).unwrap().is_none());
+    }
+
+    #[test]
     fn prediction_budget_is_explicit() {
         assert!(first_root(&[0.1875, -1., 1.], 1., &mut RootWork(1)).is_err());
     }

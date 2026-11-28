@@ -2053,22 +2053,13 @@ impl Device for Diode {
             recovery.not_converged(context, current)
         })
     }
-    fn physical_charge_histories(
+    fn physical_charge_slots(
         &self,
-        visit: &mut dyn FnMut(crate::devices::traits::PhysicalChargeHistory) -> SpiceResult<()>,
+        visit: &mut dyn FnMut(usize) -> SpiceResult<()>,
     ) -> SpiceResult<()> {
-        use crate::devices::traits::PhysicalChargeHistory;
-        visit(PhysicalChargeHistory {
-            slot: DIODE_CHARGE_SLOT,
-            nodes: self.junction,
-            scale: 1.,
-        })?;
+        visit(DIODE_CHARGE_SLOT)?;
         if self.recovery_node.is_some() {
-            visit(PhysicalChargeHistory {
-                slot: recovery::CHARGE_SLOT,
-                nodes: self.junction,
-                scale: 1. - self.parameters.model.vp,
-            })?;
+            visit(recovery::CHARGE_SLOT)?;
         }
         Ok(())
     }
