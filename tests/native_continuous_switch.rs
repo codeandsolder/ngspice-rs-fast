@@ -529,7 +529,7 @@ fn continuous_physical_taylor_preserves_all_laws_and_one_sided_joins() -> SpiceR
                 let rate = if !bounded && !logarithmic && (fraction - floor).abs() < 0.02 {
                     1e-5
                 } else {
-                    0.02
+                    0.002
                 };
                 state[1].set(cp, rate * width + 0.04)?;
                 state[1].set(cn, 0.04)?;

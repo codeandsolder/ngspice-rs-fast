@@ -5,7 +5,13 @@
 //! the outer switch owns any discrete state and sparse row binding.
 //! Reference: `LTspice` help, S. Voltage Controlled Switch.
 
+mod germ;
+
+use self::germ::{Germ, angle, sech_squared, tanh};
+use crate::devices::physical_dae::LocalGuard;
+use crate::maths::taylor::Jet;
 use crate::primitives::{Real, SpiceError, SpiceResult};
+use std::cmp::Ordering;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Transfer {
@@ -29,27 +35,27 @@ pub(super) struct Law {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Jacobian {
-    pub(super) voltage: Real,
-    pub(super) control: Real,
+pub(super) struct Jacobian<T = Real> {
+    pub(super) voltage: T,
+    pub(super) control: T,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Point {
-    pub(super) current: Real,
+pub(super) struct Point<T = Real> {
+    pub(super) current: T,
     /// Exact derivative of the physical current law for Newton and transient.
-    pub(super) jacobian: Jacobian,
+    pub(super) jacobian: Jacobian<T>,
     /// Reference AC/noise load (level-1 limiting uses a chord rather than a tangent).
-    pub(super) small_signal: Jacobian,
+    pub(super) small_signal: Jacobian<T>,
 }
 
-impl Point {
-    const fn exact(current: Real, voltage: Real, control: Real) -> Self {
+impl<T: Clone> Point<T> {
+    fn exact(current: T, voltage: T, control: T) -> Self {
         let jacobian = Jacobian { voltage, control };
         Self {
             current,
+            small_signal: jacobian.clone(),
             jacobian,
-            small_signal: jacobian,
         }
     }
 }
@@ -100,9 +106,18 @@ impl Law {
         matches!(self.transfer, Transfer::Discrete)
     }
 
-    fn controlled(self, p: Conductance, control: Real, closed: bool) -> SpiceResult<(Real, Real)> {
+    fn controlled<T: Germ>(
+        self,
+        p: Conductance,
+        control: T,
+        closed: bool,
+        guards: &mut Option<Vec<LocalGuard>>,
+    ) -> SpiceResult<(T, T)> {
         if self.discrete() {
-            return Ok((if closed { p.on } else { p.off }, 0.));
+            return Ok((
+                control.constant(if closed { p.on } else { p.off }),
+                control.constant(0.),
+            ));
         }
         if p.off <= 0. || p.on <= 0. || p.width <= 0. {
             return Err(SpiceError::circuit(
@@ -113,94 +128,62 @@ impl Law {
         let low = p.off.ln();
         let high = p.on.ln();
         let span = high - low;
-        let delta = control - p.threshold;
-        let x = delta / p.width;
+        let delta = control.offset(-p.threshold);
         let (log_g, log_slope) = match self.transfer {
             Transfer::Cubic => {
-                if x <= -1. {
-                    return Ok((p.off, 0.));
+                let x = delta.clone().divide(&delta.constant(p.width))?;
+                x.guard(0, &[-1., 1.], guards);
+                if x.compare(-1.) != Ordering::Greater {
+                    return Ok((x.constant(p.off), x.constant(0.)));
                 }
-                if x >= 1. {
-                    return Ok((p.on, 0.));
+                if x.compare(1.) != Ordering::Less {
+                    return Ok((x.constant(p.on), x.constant(0.)));
                 }
-                let fraction = x.mul_add(0.5, 0.5);
-                let smooth = fraction * fraction * 2.0f64.mul_add(-fraction, 3.);
-                (
-                    span.mul_add(smooth, low),
-                    span * (3. * fraction * (1. - fraction)) / p.width,
-                )
+                let fraction = x
+                    .clone()
+                    .scale(0.5)
+                    .offset(0.5)
+                    .with_value(x.value().mul_add(0.5, 0.5));
+                let smooth = fraction
+                    .clone()
+                    .multiply(&fraction)
+                    .multiply(&fraction.clone().scale(-2.).offset(3.));
+                let slope = fraction
+                    .clone()
+                    .multiply(&fraction.clone().scale(-1.).offset(1.))
+                    .scale(3. * span)
+                    .divide(&fraction.constant(p.width))?;
+                let log = smooth
+                    .clone()
+                    .scale(span)
+                    .offset(low)
+                    .with_value(span.mul_add(smooth.value(), low));
+                (log, slope)
             }
             Transfer::Arctangent => {
                 // atan2 retains the correct half-plane even for very large
                 // control/width ratios. The derivative uses a scaled norm.
-                let angle = delta.atan2(p.width);
-                let scale = delta.abs().max(p.width);
-                let normalized_width = p.width / scale;
-                let normalized_delta = delta / scale;
-                let denom =
-                    normalized_delta.mul_add(normalized_delta, normalized_width * normalized_width);
-                let slope = if delta.is_infinite() {
-                    0.
-                } else {
-                    (normalized_width / denom) / scale
-                };
-                (
-                    (span / std::f64::consts::PI).mul_add(angle, Real::midpoint(low, high)),
-                    (span / std::f64::consts::PI) * slope,
-                )
+                let (angle, slope) = angle(delta, p.width)?;
+                let coefficient = span / std::f64::consts::PI;
+                let midpoint = Real::midpoint(low, high);
+                let log = angle
+                    .clone()
+                    .scale(coefficient)
+                    .offset(midpoint)
+                    .with_value(coefficient.mul_add(angle.value(), midpoint));
+                (log, slope.scale(coefficient))
             }
             Transfer::Discrete => {
                 return Err(SpiceError::circuit("invalid smooth-switch transfer"));
             }
         };
         let g = log_g.exp();
-        Ok((g, g * log_slope))
+        Ok((g.clone(), g.multiply(&log_slope)))
     }
 
     /// Current and both independent partials at the same constitutive point.
     pub(super) fn evaluate(self, p: Conductance, bias: Bias, closed: bool) -> SpiceResult<Point> {
-        let (mut g, mut g_control) = self.controlled(p, bias.control, closed)?;
-        let mut voltage = bias.voltage;
-        let mut regularization_voltage = voltage;
-        if let Direction::Offset(offset) = self.direction {
-            voltage += offset;
-            regularization_voltage = voltage;
-            // Level 1 retains the off resistance in the opposite direction.
-            if voltage != 0. && voltage.is_sign_positive() == offset.is_sign_positive() {
-                g = p.off;
-                g_control = 0.;
-            }
-        }
-        let mut point = match (self.transfer, self.limit) {
-            (Transfer::Arctangent, Some(limit)) => {
-                if let Direction::OneWay { offset, epsilon } = self.direction {
-                    directional_current(g, g_control, limit, voltage, offset, epsilon)
-                } else {
-                    limited_current(g, g_control, limit, voltage)
-                }
-            }
-            (_, Some(limit)) if (g * voltage).abs() > limit => {
-                // LTspice level 1 uses the limited current/voltage chord
-                // in AC and noise, although the physical tangent is zero.
-                let mut point = Point::exact(limit.copysign(voltage), 0., 0.);
-                point.small_signal.voltage = limit / voltage.abs();
-                point
-            }
-            _ => Point::exact(g * voltage, g, g_control * voltage),
-        };
-        // Independent AC sweeps show a constant 0.99 factor on the
-        // cubic control derivative. Preserve the exact physical Newton
-        // derivative; only the reference small-signal load is scaled.
-        if self.transfer == Transfer::Cubic {
-            point.small_signal.control *= 0.99;
-        }
-        // Level 1 applies gmin to the shifted voltage; level 2 applies it to
-        // the physical branch voltage, even when reverse conduction is blocked.
-        // Independent noise measurements show that both levels include gmin
-        // in the thermal generator.
-        point.current = p.gmin.mul_add(regularization_voltage, point.current);
-        point.jacobian.voltage += p.gmin;
-        point.small_signal.voltage += p.gmin;
+        let point = self.evaluate_germ(p, bias.voltage, bias.control, closed, &mut None)?;
         if [
             point.current,
             point.jacobian.voltage,
@@ -218,117 +201,221 @@ impl Law {
             ))
         }
     }
+
+    /// The physical Taylor load differentiates the actual iteration law,
+    /// not the reference AC chord or implicit epsilon-join tangent.
+    pub(super) fn taylor(
+        self,
+        p: Conductance,
+        voltage: Jet,
+        control: Jet,
+        guards: &mut Option<Vec<LocalGuard>>,
+    ) -> SpiceResult<Point<Jet>> {
+        self.evaluate_germ(p, voltage, control, false, guards)
+    }
+
+    fn evaluate_germ<T: Germ>(
+        self,
+        p: Conductance,
+        mut voltage: T,
+        control: T,
+        closed: bool,
+        guards: &mut Option<Vec<LocalGuard>>,
+    ) -> SpiceResult<Point<T>> {
+        let (mut g, mut g_control) = self.controlled(p, control, closed, guards)?;
+        if let Direction::Offset(offset) = self.direction {
+            voltage = voltage.offset(offset);
+            voltage.guard(1, &[0.], guards);
+            // Level 1 retains the off resistance in the opposite direction.
+            let sign = voltage.compare(0.);
+            if sign != Ordering::Equal && (sign == Ordering::Greater) == offset.is_sign_positive() {
+                g = g.constant(p.off);
+                g_control = g.constant(0.);
+            }
+        }
+        let mut point = match (self.transfer, self.limit) {
+            (Transfer::Arctangent, Some(limit)) => {
+                if let Direction::OneWay { offset, epsilon } = self.direction {
+                    directional_current(
+                        g,
+                        g_control,
+                        limit,
+                        voltage.clone(),
+                        offset,
+                        epsilon,
+                        guards,
+                    )?
+                } else {
+                    limited_current(g, g_control, limit, voltage.clone())?
+                }
+            }
+            (_, Some(limit)) => {
+                let linear = g.clone().multiply(&voltage);
+                linear.guard(2, &[-limit, limit], guards);
+                if linear.compare(limit) == Ordering::Greater
+                    || linear.compare(-limit) == Ordering::Less
+                {
+                    // Level 1 uses a chord in AC and noise, not the physical tangent.
+                    let current = voltage.constant(limit.copysign(voltage.value()));
+                    let zero = voltage.constant(0.);
+                    let mut point = Point::exact(current, zero.clone(), zero);
+                    point.small_signal.voltage =
+                        voltage.constant(limit).divide(&voltage.clone().abs())?;
+                    point
+                } else {
+                    Point::exact(linear, g, g_control.multiply(&voltage))
+                }
+            }
+            _ => Point::exact(
+                g.clone().multiply(&voltage),
+                g,
+                g_control.multiply(&voltage),
+            ),
+        };
+        if self.transfer == Transfer::Cubic {
+            point.small_signal.control = point.small_signal.control.scale(0.99);
+        }
+        // Level 1 applies gmin to the shifted voltage; level 2 to the
+        // physical branch voltage, even when reverse conduction is blocked.
+        point.current = voltage.constant(p.gmin).mul_add(&voltage, &point.current);
+        point.jacobian.voltage = point.jacobian.voltage.offset(p.gmin);
+        point.small_signal.voltage = point.small_signal.voltage.offset(p.gmin);
+        Ok(point)
+    }
 }
 
-/// Stable derivative of tanh, including the nearly saturated region where
-/// computing 1 - tanh(x)^2 would lose the small remaining conductance.
-fn sech_squared(argument: Real) -> Real {
-    let tail = (-2. * argument.abs()).exp();
-    4. * tail / (1. + tail).powi(2)
-}
-
-fn limited_current(g: Real, g_control: Real, limit: Real, voltage: Real) -> Point {
-    let linear = g * voltage;
-    let argument = linear / limit;
-    let sech2 = sech_squared(argument);
-    let current = if argument.abs() < 1e-8 {
-        linear
+fn limited_current<T: Germ>(g: T, g_control: T, limit: Real, voltage: T) -> SpiceResult<Point<T>> {
+    let linear = g.clone().multiply(&voltage);
+    let argument = linear.clone().divide(&linear.constant(limit))?;
+    let sech2 = sech_squared(&argument)?;
+    // The tiny-argument scalar evaluation is a roundoff shortcut, not a
+    // different physical tangent. Retain the analytic tanh germ.
+    let mut current = tanh(argument.clone())?.scale(limit);
+    if argument.value().abs() < 1e-8 {
+        current = current.with_value(linear.value());
+    }
+    let control_slope = if sech2.value() == 0. {
+        voltage.constant(0.)
     } else {
-        limit * argument.tanh()
+        g_control.multiply(&sech2).multiply(&voltage)
     };
-    let control_slope = if sech2 == 0. {
-        0.
-    } else {
-        (g_control * sech2) * voltage
-    };
-    Point::exact(current, g * sech2, control_slope)
+    Ok(Point::exact(current, g.multiply(&sech2), control_slope))
 }
 
 // Solve sinh(2*j)=a with the measured fixed iteration count. Stable tanh
 // and sech avoid overflow in the original hyperbolic expression. The second
 // result is d j / d ln(a), not the derivative of the converged root.
-fn epsilon_join(a: Real) -> (Real, Real, Real) {
-    let mut join = 0.5 * a;
-    let mut derivative = join;
-    if a.is_infinite() {
-        return (a, 0., 0.);
+fn epsilon_join<T: Germ>(a: T) -> SpiceResult<(T, T, T)> {
+    let mut join = a.clone().scale(0.5);
+    let mut derivative = join.clone();
+    if a.value().is_infinite() {
+        let zero = a.constant(0.);
+        return Ok((a, zero.clone(), zero));
     }
     for _ in 0..10 {
-        let doubled = 2. * join;
-        let tail = (-doubled).exp();
-        let sech = 2. * tail / tail.mul_add(tail, 1.);
-        let tanh = doubled.tanh();
-        let scaled = a * sech;
-        derivative = (tanh * (tanh - scaled)).mul_add(derivative, 0.5 * scaled);
-        join = 0.5_f64.mul_add(scaled - tanh, join);
+        let doubled = join.clone().scale(2.);
+        let tail = doubled.clone().scale(-1.).exp();
+        let denominator = tail.clone().mul_add(&tail, &tail.constant(1.));
+        let sech = tail.scale(2.).divide(&denominator)?;
+        let tanh = tanh(doubled)?;
+        let scaled = a.clone().multiply(&sech);
+        derivative = tanh
+            .clone()
+            .multiply(&tanh.clone().add(&scaled.clone().scale(-1.)))
+            .mul_add(&derivative, &scaled.clone().scale(0.5));
+        join = join
+            .constant(0.5)
+            .mul_add(&scaled.add(&tanh.scale(-1.)), &join);
     }
-    // The reference AC law differentiates the implicit root equation at
-    // the final approximate join, not the ten actual iterations.
-    let tail = (-2. * join).exp();
-    let implicit = a * tail / tail.mul_add(tail, 1.);
-    (join, derivative, implicit)
+    // Reference AC differentiates the implicit equation at the final
+    // approximate join, not the ten actual iterations.
+    let tail = join.clone().scale(-2.).exp();
+    let denominator = tail.clone().mul_add(&tail, &tail.constant(1.));
+    let implicit = a.multiply(&tail).divide(&denominator)?;
+    Ok((join, derivative, implicit))
 }
 
 /// The one-way branch conducts from the second terminal to the first.
-/// At epsilon, a quadratic joins the shifted tanh with equal value and
-/// slope in the converged limit. `LTspice` 24.0.12 uses ten Newton steps
-/// from a/2, not the exact asinh(a)/2 root; its high-a transfer differs
-/// substantially. Propagate the derivative of those same iterations.
-fn directional_current(
-    g: Real,
-    g_control: Real,
+/// At epsilon a quadratic joins the shifted tanh; the vendor uses exactly
+/// ten Newton steps from a/2, not the converged asinh(a)/2 root.
+fn directional_current<T: Germ>(
+    g: T,
+    g_control: T,
     limit: Real,
-    voltage: Real,
+    voltage: T,
     offset: Real,
     epsilon: Real,
-) -> Point {
-    let forward = -(voltage + offset);
-    if forward <= 0. {
-        return Point::exact(0., 0., 0.);
+    guards: &mut Option<Vec<LocalGuard>>,
+) -> SpiceResult<Point<T>> {
+    let forward = voltage.clone().offset(offset).scale(-1.);
+    forward.guard(3, &[0.], guards);
+    if forward.compare(0.) != Ordering::Greater {
+        let zero = forward.constant(0.);
+        return Ok(Point::exact(zero.clone(), zero.clone(), zero));
     }
     if epsilon == 0. {
-        return limited_current(g, g_control, limit, -forward);
+        return limited_current(g, g_control, limit, forward.scale(-1.));
     }
-    let a = g * epsilon / limit;
-    let (join, join_log_derivative, implicit_derivative) = epsilon_join(a);
-    let log_slope = g_control / g;
-    // Compare in terminal-voltage coordinates to select the tanh branch
-    // at the exact shifted join, even if subtracting the offset rounds.
+    let a = g.clone().scale(epsilon).divide(&g.constant(limit))?;
+    let (join, join_log_derivative, implicit_derivative) = epsilon_join(a)?;
+    let log_slope = g_control.divide(&g)?;
+    // Compare in terminal-voltage coordinates at the exact shifted join.
     let boundary_voltage = -offset - epsilon;
-    if voltage > boundary_voltage {
-        let fraction = forward / epsilon;
-        let boundary = limit * join.tanh();
-        let current = -boundary * fraction * fraction;
-        let voltage_slope = 2. * (boundary / epsilon) * fraction;
-        let sech2 = sech_squared(join);
-        let derivative = |join_derivative: Real| {
-            if sech2 == 0. {
-                0.
+    voltage.guard(4, &[boundary_voltage], guards);
+    if voltage.compare(boundary_voltage) == Ordering::Greater {
+        let fraction = forward.clone().divide(&forward.constant(epsilon))?;
+        let boundary = tanh(join.clone())?.scale(limit);
+        let current = boundary
+            .clone()
+            .scale(-1.)
+            .multiply(&fraction)
+            .multiply(&fraction);
+        let voltage_slope = boundary
+            .scale(2.)
+            .divide(&fraction.constant(epsilon))?
+            .multiply(&fraction);
+        let sech2 = sech_squared(&join)?;
+        let derivative = |join_derivative: T| {
+            if sech2.value() == 0. {
+                fraction.constant(0.)
             } else {
-                -limit * sech2 * join_derivative * log_slope * fraction * fraction
+                sech2
+                    .clone()
+                    .scale(-limit)
+                    .multiply(&join_derivative)
+                    .multiply(&log_slope)
+                    .multiply(&fraction)
+                    .multiply(&fraction)
             }
         };
         let mut point = Point::exact(current, voltage_slope, derivative(join_log_derivative));
         point.small_signal.control = derivative(implicit_derivative);
-        return point;
+        return Ok(point);
     }
-    let overdrive = g * (boundary_voltage - voltage) / limit;
-    let argument = overdrive + join;
-    let sech2 = sech_squared(argument);
-    let derivative = |join_derivative: Real| {
-        if sech2 == 0. {
-            0.
+    let overdrive = g
+        .clone()
+        .multiply(&voltage.scale(-1.).offset(boundary_voltage))
+        .divide(&g.constant(limit))?;
+    let argument = overdrive.clone().add(&join);
+    let sech2 = sech_squared(&argument)?;
+    let derivative = |join_derivative: T| {
+        if sech2.value() == 0. {
+            sech2.constant(0.)
         } else {
-            -limit * sech2 * (overdrive + join_derivative) * log_slope
+            sech2
+                .clone()
+                .scale(-limit)
+                .multiply(&overdrive.clone().add(&join_derivative))
+                .multiply(&log_slope)
         }
     };
     let mut point = Point::exact(
-        -limit * argument.tanh(),
-        g * sech2,
+        tanh(argument)?.scale(-limit),
+        g.multiply(&sech2),
         derivative(join_log_derivative),
     );
     point.small_signal.control = derivative(implicit_derivative);
-    point
+    Ok(point)
 }
 
 #[cfg(test)]
