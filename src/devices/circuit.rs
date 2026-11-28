@@ -225,6 +225,9 @@ pub(super) struct CircuitRuntime {
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
     mutual_evaluation: std::cell::RefCell<Option<MutualEvaluation>>,
+    // At most one idle physical preparation; live runs exclusively lease
+    // it and never share mutable tiles with another live run.
+    prepared_idle: std::cell::RefCell<Option<PreparedPoint>>,
     candidate_overrides: Vec<CandidateNumericOverride>,
     control_overrides: Vec<CandidateNumericOverride>,
 }
@@ -336,6 +339,16 @@ pub struct PreparedRun<'a> {
         std::cell::RefCell<Option<crate::devices::observe::ObservationWorkspace>>,
 }
 
+impl Drop for PreparedRun<'_> {
+    fn drop(&mut self) {
+        if !self.circuit.bindings.prepared_devices.is_empty()
+            && let Some(point) = self.point.get_mut().take()
+        {
+            self.circuit.runtime.prepared_idle.replace(Some(point));
+        }
+    }
+}
+
 /// One transient proposal, binding exact time, physical context and immutable
 /// accepted history for repeated Newton loads and isolated observations.
 /// Exclusive scratch ownership prevents another proposal from reusing it.
@@ -417,6 +430,7 @@ impl<'a> PreparedTransient<'a> {
 
 pub(super) struct PreparedPoint {
     context: ModelContext,
+    context_valid: bool,
     replacements: Vec<(usize, Box<dyn Device>)>,
     mutual: std::cell::OnceCell<PreparedMutualTerms>,
     prepared_batches: std::cell::RefCell<crate::devices::prepared_model::batch::Plan>,
@@ -471,7 +485,7 @@ impl<'a> PreparedRun<'a> {
         if let Ok(point) = std::cell::Ref::filter_map(self.point.borrow(), |current| {
             current
                 .as_ref()
-                .filter(|point| point.context.same_preparation(context))
+                .filter(|point| point.context_valid && point.context.same_preparation(context))
         }) {
             return Ok(point);
         }
@@ -506,6 +520,7 @@ impl<'a> PreparedRun<'a> {
         };
         self.point.replace(Some(PreparedPoint {
             context: *context,
+            context_valid: true,
             replacements,
             mutual: std::cell::OnceCell::new(),
             prepared_batches: std::cell::RefCell::new(prepared_batches),
@@ -1303,10 +1318,10 @@ impl Circuit {
     /// first context, then reuses its effective devices until that context
     /// changes. Separate scopes cannot share disposable trial state.
     #[must_use = "the prepared run retains the per-analysis point and load workspace"]
-    pub const fn prepare_run(&self) -> PreparedRun<'_> {
+    pub fn prepare_run(&self) -> PreparedRun<'_> {
         PreparedRun {
             circuit: self,
-            point: std::cell::RefCell::new(None),
+            point: std::cell::RefCell::new(self.runtime.prepared_idle.take()),
             ltra: std::cell::RefCell::new(LtraWorkspace::new()),
             observation_work: std::cell::RefCell::new(None),
         }
@@ -3520,6 +3535,7 @@ impl Circuit {
     /// The replacement preserves terminals, branch rows and device state
     /// layout so finalized topology and symbolic matrices remain valid.
     pub(crate) fn reseed_stochastic_sources(&mut self, identity: u64) {
+        self.invalidate_prepared_context();
         for &ordinal in &self.bindings.stochastic_sources {
             if let Some(source) = self.devices.get_mut(ordinal)
                 && let Some(replacement) = source.device.with_stochastic_candidate(identity)
@@ -3529,10 +3545,17 @@ impl Circuit {
         }
     }
 
+    fn invalidate_prepared_context(&mut self) {
+        if let Some(point) = self.runtime.prepared_idle.get_mut() {
+            point.context_valid = false;
+        }
+    }
+
     /// Clear analysis-scoped accepted/trial state when an optimizer session
     /// changes its candidate. Preserve finalized bindings, sparse pattern and
     /// prepared names; only independent simulation state is invalidated.
     pub(crate) fn clear_candidate_analysis_state(&mut self) {
+        self.invalidate_prepared_context();
         self.runtime.continuation_diagonal.set(0.);
         self.runtime.completed.clear();
         self.runtime.carried_state.get_mut().take();
@@ -3567,6 +3590,7 @@ impl Circuit {
     /// Commit already-validated worker-owned numeric candidates. An exclusive
     /// circuit borrow rules out stale prepared analysis scopes during update.
     pub(crate) fn set_candidate_overrides(&mut self, overrides: Vec<CandidateNumericOverride>) {
+        self.invalidate_prepared_context();
         self.runtime.candidate_overrides = overrides;
         self.runtime.control_overrides.clear();
     }

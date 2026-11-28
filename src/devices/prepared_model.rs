@@ -198,6 +198,7 @@ pub(super) struct SourceBinding {
 #[derive(Debug)]
 enum Physical<K: Kernel> {
     Seed(Option<Prepared<K>>),
+    Pending(Option<Prepared<K>>),
     Scalar(Rc<Prepared<K>>),
     Lane(batch::PreparedLane<K>),
 }
@@ -400,16 +401,8 @@ impl<K: Kernel> PreparedDevice<K> {
     }
 
     fn rebound(&self, values: &[Real], temperature: InstanceTemperature) -> SpiceResult<Self> {
-        let mut device = Self::from_rows(
-            &self.artifact,
-            self.name.clone(),
-            self.terminals.to_vec(),
-            values,
-            temperature,
-        )?;
-        if let Some(source) = &self.source {
-            device.source = Some(Arc::clone(source));
-        }
+        let mut device = self.recipe_rebound(values, temperature)?;
+        *device.physical.get_mut() = Physical::Seed(Some(device.prepare_physical()?));
         Ok(device)
     }
 
@@ -425,7 +418,7 @@ impl<K: Kernel> PreparedDevice<K> {
             values,
             temperature,
         )?;
-        device.source = self.source.clone();
+        device.source.clone_from(&self.source);
         Ok(device)
     }
 
@@ -446,22 +439,53 @@ impl<K: Kernel> PreparedDevice<K> {
                 .eq(other.values.iter().map(|value| value.to_bits()))
     }
 
-    // Consume an existing validated seed rather than repeating physical preparation.
-    // Called only on unpublished candidate-local recipes during tile construction.
+    /// Transfer the circuit's unused initial data into an unpublished run.
+    fn initial_seed(&self) -> Option<Prepared<K>> {
+        let mut physical = self.physical.borrow_mut();
+        match &mut *physical {
+            Physical::Seed(seed) => seed.take(),
+            Physical::Scalar(data) if Rc::strong_count(data) == 1 => {
+                if let Physical::Scalar(data) =
+                    std::mem::replace(&mut *physical, Physical::Seed(None))
+                {
+                    Rc::into_inner(data)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // Only unpublished candidate-local data may be moved into a new tile.
     fn take_prepared(&self) -> SpiceResult<Prepared<K>> {
-        let seed = match std::mem::replace(&mut *self.physical.borrow_mut(), Physical::Seed(None)) {
-            Physical::Seed(seed) => seed,
-            Physical::Scalar(data) => Rc::try_unwrap(data).ok(),
-            Physical::Lane(_) => None,
+        let mut physical = self.physical.borrow_mut();
+        let seed = match std::mem::replace(&mut *physical, Physical::Pending(None)) {
+            Physical::Seed(seed) | Physical::Pending(seed) => seed,
+            Physical::Scalar(data) => Rc::into_inner(data),
+            Physical::Lane(lane) => {
+                *physical = Physical::Lane(lane);
+                return Err(SpiceError::circuit(
+                    "attempt to move an already bound prepared lane",
+                ));
+            }
         };
         seed.map_or_else(|| self.prepare_physical(), Ok)
     }
 
     fn ensure_physical(&self) -> SpiceResult<()> {
         let mut physical = self.physical.borrow_mut();
-        if let Physical::Seed(seed) = &mut *physical {
-            let data = seed.take().map_or_else(|| self.prepare_physical(), Ok)?;
-            *physical = Physical::Scalar(Rc::new(data));
+        match &mut *physical {
+            Physical::Seed(seed) => {
+                // A direct device API call outside a run can consume its own
+                // baseline seed. A run-local numerical load must be bound.
+                let data = seed.take().map_or_else(|| self.prepare_physical(), Ok)?;
+                *physical = Physical::Scalar(Rc::new(data));
+            }
+            Physical::Pending(_) => {
+                return Err(SpiceError::circuit("unbound run-local prepared recipe"));
+            }
+            Physical::Scalar(_) | Physical::Lane(_) => {}
         }
         Ok(())
     }
@@ -475,7 +499,9 @@ impl<K: Kernel> PreparedDevice<K> {
         match &*self.physical.borrow() {
             Physical::Scalar(data) => scalar(data),
             Physical::Lane(data) => lane(data),
-            Physical::Seed(_) => return Err(SpiceError::circuit("unbound prepared recipe")),
+            Physical::Seed(_) | Physical::Pending(_) => {
+                return Err(SpiceError::circuit("unbound prepared recipe"));
+            }
         }
         .map_err(evaluation_error)
     }
@@ -485,7 +511,9 @@ impl<K: Kernel> PreparedDevice<K> {
         match &*self.physical.borrow() {
             Physical::Scalar(data) => self.artifact.evaluate(data, coordinates, point),
             Physical::Lane(data) => data.evaluate(coordinates, point),
-            Physical::Seed(_) => return Err(SpiceError::circuit("unbound prepared recipe")),
+            Physical::Seed(_) | Physical::Pending(_) => {
+                return Err(SpiceError::circuit("unbound prepared recipe"));
+            }
         }
         .map_err(evaluation_error)
     }
@@ -790,7 +818,9 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         let outcome = match &*self.physical.borrow() {
             Physical::Scalar(data) => self.artifact.linearize_trial(data, input, coordinates),
             Physical::Lane(data) => data.linearize(input, coordinates),
-            Physical::Seed(_) => return Err(SpiceError::circuit("unbound prepared recipe")),
+            Physical::Seed(_) | Physical::Pending(_) => {
+                return Err(SpiceError::circuit("unbound prepared recipe"));
+            }
         }
         .map_err(evaluation_error)?;
         for (index, &coordinate) in coordinates.iter().enumerate() {
@@ -1047,20 +1077,37 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         )?;
         let previous =
             previous.and_then(|device| (device as &dyn std::any::Any).downcast_ref::<Self>());
-        if let Some(previous) = previous.filter(|previous| candidate.same_physics(previous)) {
-            if let Physical::Scalar(data) = &*previous.physical.borrow() {
-                *candidate.physical.get_mut() = Physical::Scalar(Rc::clone(data));
+        *candidate.physical.get_mut() = Physical::Pending(None);
+        if let Some(previous) = previous {
+            let old = previous.physical.borrow();
+            if let Physical::Scalar(data) = &*old {
+                if candidate.same_physics(previous) {
+                    *candidate.physical.get_mut() = Physical::Scalar(Rc::clone(data));
+                } else if candidate.same_physics(self) {
+                    *candidate.physical.get_mut() = Physical::Pending(self.initial_seed());
+                }
             }
+            // Grouped candidates never move an unused baseline seed into an
+            // existing tile; the typed lane transaction owns that preparation.
         } else if candidate.same_physics(self) {
-            if let Physical::Seed(seed) = &mut *self.physical.borrow_mut() {
-                *candidate.physical.get_mut() = Physical::Seed(seed.take());
-            }
+            *candidate.physical.get_mut() = Physical::Pending(self.initial_seed());
         }
         Ok(Box::new(candidate))
     }
 
     fn activate_prepared_scalar(&self) -> SpiceResult<()> {
-        self.ensure_physical()
+        let mut physical = self.physical.borrow_mut();
+        match &mut *physical {
+            Physical::Pending(seed) | Physical::Seed(seed) => {
+                let data = seed.take().map_or_else(|| self.prepare_physical(), Ok)?;
+                *physical = Physical::Scalar(Rc::new(data));
+                Ok(())
+            }
+            Physical::Scalar(_) => Ok(()),
+            Physical::Lane(_) => Err(SpiceError::circuit(
+                "grouped prepared lane cannot become a singleton without rebinding",
+            )),
+        }
     }
 
     fn prepared_batch_key(&self) -> Option<batch::Key> {
@@ -1143,7 +1190,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
                     Physical::Lane(data) => {
                         data.noise(&voltage, context.model_context.frequency, &mut sink)
                     }
-                    Physical::Seed(_) => {
+                    Physical::Seed(_) | Physical::Pending(_) => {
                         return Err(SpiceError::circuit("unbound prepared recipe"));
                     }
                 }

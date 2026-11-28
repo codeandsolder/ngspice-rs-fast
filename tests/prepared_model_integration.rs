@@ -1692,7 +1692,7 @@ fn prepared_run_reuses_unaffected_tiles_across_context_changes() {
     for (row, bits) in new.iter().enumerate() {
         assert_eq!(linear.a.get(row, row).to_bits(), *bits);
     }
-    let noise = NoisePlan::bind(&run, &changed, &bias, None).unwrap();
+    let noise = NoisePlan::bind(&run, &changed.with_frequency(1000.), &bias, None).unwrap();
     assert_eq!(noise.source_count(), 129);
     assert_eq!(count(), 130, "AC and noise use the same physical lane");
     assert_eq!(counted_load(&run, &context).unwrap(), original);
@@ -1735,14 +1735,6 @@ fn prepared_tiles_roll_back_all_groups_and_keep_live_runs_independent() {
                 .bind_instance_target("m80", "g")
                 .unwrap()
                 .at(-1.)
-                .unwrap(),
-        )
-        .unwrap()
-        .with_instance_override(
-            circuit
-                .bind_instance_target("m128", "g")
-                .unwrap()
-                .at(3e-3)
                 .unwrap(),
         )
         .unwrap();
@@ -2225,4 +2217,175 @@ fn explicit_bias_constraints_do_not_invoke_kernel_initialization_or_limiting() {
     assert!(!result.solution.trial.is_nonconvergent());
     close(result.solution.trial.values()[4], 2.);
     close(result.solution.trial.values()[0], 3.6e-6);
+}
+
+#[test]
+fn sequential_runs_lease_prepared_data_without_sharing_live_candidates() {
+    use std::sync::atomic::Ordering;
+    let (circuit, preparations) = counted_circuit();
+    let context = ModelContext::default();
+    let original = counted_load(&circuit.prepare_run(), &context).unwrap();
+    assert_eq!(preparations.load(Ordering::Relaxed), 129);
+    let target = circuit.bind_instance_target("m3", "g").unwrap();
+    let changed = context
+        .with_instance_override(target.at(2e-3).unwrap())
+        .unwrap();
+    let updated = counted_load(&circuit.prepare_run(), &changed).unwrap();
+    assert_ne!(original, updated);
+    assert_eq!(preparations.load(Ordering::Relaxed), 130);
+    assert_eq!(
+        counted_load(&circuit.prepare_run(), &context).unwrap(),
+        original
+    );
+    assert_eq!(preparations.load(Ordering::Relaxed), 131);
+}
+
+#[derive(Debug)]
+struct CountingThermal {
+    preparations: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Kernel for CountingThermal {
+    type Prepared = ElectrothermalPrepared;
+
+    fn prepare(
+        &self,
+        parameters: &[Real],
+        temperature: Real,
+    ) -> model_kernel_api::Result<Self::Prepared> {
+        self.preparations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ElectrothermalKernel.prepare(parameters, temperature)
+    }
+
+    fn evaluate(
+        &self,
+        prepared: &Self::Prepared,
+        coordinates: &[Real],
+        point: &mut Point<'_>,
+    ) -> model_kernel_api::Result<()> {
+        ElectrothermalKernel.evaluate(prepared, coordinates, point)
+    }
+}
+
+#[test]
+fn fixed_ambient_tile_updates_thermal_row_offsets_without_physical_preparation() {
+    use ngspice_rs::devices::prepared_model::AmbientTemperature;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let preparations = Arc::new(AtomicUsize::new(0));
+    let artifact = Artifact::new(
+        electrothermal_descriptor(),
+        CountingThermal {
+            preparations: Arc::clone(&preparations),
+        },
+    )
+    .unwrap();
+    let mut circuit = Circuit::new();
+    let mut nodes = Vec::new();
+    for index in 0..2 {
+        let p = circuit.add_node(&format!("p{index}")).unwrap();
+        let t = circuit.add_node(&format!("t{index}")).unwrap();
+        let q = circuit.add_node(&format!("q{index}")).unwrap();
+        nodes.push([p, t, q]);
+        PreparedDevice::bind(
+            &mut circuit,
+            &artifact,
+            &format!("x{index}"),
+            &[p, NodeId::GROUND, t, q],
+            &ELECTROTHERMAL_PARAMETERS,
+            InstanceTemperature {
+                circuit_celsius: 27.,
+                ambient: AmbientTemperature::AbsoluteKelvin(300.15),
+            },
+        )
+        .unwrap();
+    }
+    circuit.finalize().unwrap();
+    let run = circuit.prepare_run();
+    let n = circuit.unknown_count();
+    let mut solution = Vector::zeros(n);
+    let rows: Vec<_> = nodes
+        .iter()
+        .map(|nodes| nodes.map(|node| circuit.unknowns().node_row(node).unwrap()))
+        .collect();
+    for [p, t, q] in &rows {
+        solution.set(*p, 0.5).unwrap();
+        solution.set(*t, 10.).unwrap();
+        solution.set(*q, 0.2).unwrap();
+    }
+    let history = circuit.state_history().unwrap();
+    for temperature in [27., 37., 27.] {
+        let context = ModelContext::new(temperature, 27.);
+        let mut matrix = SparseMatrix::new(n, n);
+        let mut rhs = Vector::zeros(n);
+        let mut trial = history.trial();
+        run.load(
+            &LoadRequest {
+                mode: AnalysisMode::OperatingPoint,
+                solution: &solution,
+                model_context: &context,
+                integration: None,
+                history: &history,
+                forcing: None,
+            },
+            &mut matrix,
+            &mut rhs,
+            &mut trial,
+        )
+        .unwrap();
+        matrix.fold_duplicates();
+        let rise = temperature - 27. + 10.;
+        let g = ELECTROTHERMAL_PARAMETERS[0] * (1. + 0.02 * rise);
+        for [p, t, _] in &rows {
+            close(matrix.get(*p, *p), g);
+            close(
+                matrix.get(*p, *t),
+                ELECTROTHERMAL_PARAMETERS[0] * 0.02 * 0.5,
+            );
+        }
+        let linear = run
+            .small_signal_system_at(&context, &solution, None)
+            .unwrap();
+        for [p, _, _] in &rows {
+            close(linear.a.get(*p, *p), g);
+        }
+        assert_eq!(preparations.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[test]
+#[ignore = "opt-in real prepared candidate preparation timing"]
+fn vdmos_candidate_preparation_benchmark() {
+    use std::time::Instant;
+    let model = vdmos_fixture();
+    let start = Instant::now();
+    let circuit = vdmos_circuit(&model, 128);
+    let binding = start.elapsed();
+    let run = circuit.prepare_run();
+    let context = ModelContext::default();
+    let start = Instant::now();
+    run.validate_context(&context).unwrap();
+    let initial = start.elapsed();
+    let target = circuit.bind_instance_target("m3", "multiplier").unwrap();
+    let mut changed = Vec::with_capacity(31);
+    let mut all = Vec::with_capacity(31);
+    for round in 0..31 {
+        let single = context
+            .with_instance_override(target.at(4.5 + f64::from(round % 2)).unwrap())
+            .unwrap();
+        let start = Instant::now();
+        run.validate_context(&single).unwrap();
+        changed.push(start.elapsed());
+        let warm = ModelContext::new(35. + f64::from(round % 2), 27.);
+        let start = Instant::now();
+        run.validate_context(&warm).unwrap();
+        all.push(start.elapsed());
+        run.validate_context(&context).unwrap();
+    }
+    changed.sort_unstable();
+    all.sort_unstable();
+    println!(
+        "128 VDMOS: initial bind {binding:?}, transfer {initial:?}, one-lane median {:?}, all-lane median {:?}",
+        changed[15], all[15]
+    );
 }
