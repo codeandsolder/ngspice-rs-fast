@@ -1,0 +1,23 @@
+VDMOS P coupled junction case thermal switching transient
+.options temp=27 gmin=1e-20 reltol=1e-6 abstol=1e-14 method=trap
+Vg g 0 PWL(0 0 100u 0 100.1u -4 1m -4 1.0001m 0 2m 0)
+Vd d 0 -0.3
+M1 d g 0 junction case dut thermal
+.model dut vdmosp(vto=-3 kp=10 rthjc=1 rthca=5 cthj=100u mu=-1.5)
+.control
+tran 1u 2m 0 1u
+meas tran tj0 find v(junction) at=50u
+meas tran tc0 find v(case) at=50u
+meas tran tj1 find v(junction) at=110u
+meas tran tc1 find v(case) at=110u
+meas tran tj2 find v(junction) at=500u
+meas tran tc2 find v(case) at=500u
+meas tran tj3 find v(junction) at=1m
+meas tran tc3 find v(case) at=1m
+meas tran tj4 find v(junction) at=1.1m
+meas tran tc4 find v(case) at=1.1m
+meas tran tj5 find v(junction) at=1.8m
+meas tran tc5 find v(case) at=1.8m
+quit
+.endc
+.end

@@ -1,0 +1,25 @@
+VDMOS P circuit-coupled soft reverse recovery
+.options gmin=1e-20 reltol=1e-7 abstol=1e-14 method=trap
+Vgate g 0 0
+Vdrive vin 0 PWL(0 0.55 200n 0.55 205n -0.1 700n -0.1)
+Rdrive vin d 0.3
+Cdrain d 0 300p
+M1 d g 0 dut
+.model dut vdmos(pchan vto=-3 kp=10 is=1e-12 n=1 cjo=1n m=0.5 fc=0.5 tt=100n vp=0.4)
+.control
+tran 0.5n 700n 0 0.5n
+meas tran vpre find v(d) at=180n
+meas tran vfall find v(d) at=201n
+meas tran vreverse find v(d) at=207n
+meas tran vtail1 find v(d) at=220n
+meas tran vtail2 find v(d) at=260n
+meas tran vtail3 find v(d) at=400n
+meas tran ipre find i(vdrive) at=180n
+meas tran ifall find i(vdrive) at=201n
+meas tran ireverse find i(vdrive) at=207n
+meas tran itail1 find i(vdrive) at=220n
+meas tran itail2 find i(vdrive) at=260n
+meas tran itail3 find i(vdrive) at=400n
+quit
+.endc
+.end
