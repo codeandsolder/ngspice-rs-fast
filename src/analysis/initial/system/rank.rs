@@ -2,13 +2,130 @@
 //! Only declared storage currents and derivative signals may be gauges.
 //! Mandatory original equations are retained for physical verification.
 //! Derived storage constraints are considered only after mandatory rows.
-use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::numeric::binary_exponent;
 
+mod storage {
+    //! Sparse scratch for rank reduction. Only the column-to-slot map is dense;
+    //! coefficient storage follows actual fill, not the matrix dimensions.
+    use std::{cmp::Reverse, collections::BinaryHeap, ops::Range};
+
+    use super::Coefficient;
+
+    const ABSENT: usize = usize::MAX;
+
+    pub(super) type Term = (usize, Coefficient);
+
+    pub(super) struct SparseRow {
+        slots: Vec<usize>,
+        entries: Vec<Term>,
+    }
+
+    impl SparseRow {
+        pub(super) fn new(columns: usize) -> Self {
+            Self {
+                slots: vec![ABSENT; columns],
+                entries: Vec::new(),
+            }
+        }
+
+        pub(super) fn clear(&mut self) {
+            for &(column, _) in &self.entries {
+                self.slots[column] = ABSENT;
+            }
+            self.entries.clear();
+        }
+
+        pub(super) fn entries(&self) -> &[Term] {
+            &self.entries
+        }
+
+        pub(super) fn entries_mut(&mut self) -> &mut [Term] {
+            &mut self.entries
+        }
+
+        pub(super) fn get(&self, column: usize) -> Coefficient {
+            self.entries
+                .get(self.slots[column])
+                .map_or_else(Coefficient::default, |&(_, value)| value)
+        }
+
+        pub(super) fn insert(&mut self, column: usize, value: Coefficient) {
+            let slot = &mut self.slots[column];
+            if *slot == ABSENT {
+                *slot = self.entries.len();
+                self.entries.push((column, value));
+            } else {
+                self.entries[*slot].1 = value;
+            }
+        }
+
+        pub(super) fn remove(&mut self, column: usize) -> Option<Coefficient> {
+            let slot = std::mem::replace(&mut self.slots[column], ABSENT);
+            if slot == ABSENT {
+                return None;
+            }
+            let (_, value) = self.entries.swap_remove(slot);
+            if let Some(&(moved, _)) = self.entries.get(slot) {
+                self.slots[moved] = slot;
+            }
+            Some(value)
+        }
+
+        /// Persist only the filled coefficients. Sorting restores the original
+        /// ascending-column accumulation order for all subsequent eliminations,
+        /// back substitutions and uncertainty bounds. Scratch capacity is reused.
+        pub(super) fn append_sorted(&mut self, arena: &mut Vec<Term>) -> Range<usize> {
+            for &(column, _) in &self.entries {
+                self.slots[column] = ABSENT;
+            }
+            self.entries.sort_unstable_by_key(|&(column, _)| column);
+            let start = arena.len();
+            arena.append(&mut self.entries);
+            start..arena.len()
+        }
+    }
+
+    /// Unique, ascending pivot ordinals. Keep stale queued pivots until popped:
+    /// even a cancelled coefficient incurs the original pending-pivot work charge.
+    pub(super) struct PendingPivots {
+        heap: BinaryHeap<Reverse<usize>>,
+        queued: Vec<bool>,
+    }
+
+    impl PendingPivots {
+        pub(super) fn new(columns: usize) -> Self {
+            Self {
+                heap: BinaryHeap::new(),
+                queued: vec![false; columns],
+            }
+        }
+
+        pub(super) fn clear(&mut self) {
+            for Reverse(index) in self.heap.drain() {
+                self.queued[index] = false;
+            }
+        }
+
+        pub(super) fn insert(&mut self, index: usize) {
+            if !std::mem::replace(&mut self.queued[index], true) {
+                self.heap.push(Reverse(index));
+            }
+        }
+
+        pub(super) fn pop_first(&mut self) -> Option<usize> {
+            let Reverse(index) = self.heap.pop()?;
+            self.queued[index] = false;
+            Some(index)
+        }
+    }
+}
+
 mod wide;
 use crate::primitives::{Real, SpiceResult};
+use storage::{PendingPivots, SparseRow, Term};
 use wide::Wide;
 
 use super::failure;
@@ -73,17 +190,18 @@ impl Coefficient {
     }
 }
 
-type Row = BTreeMap<usize, Coefficient>;
-
 struct Pivot {
     column: usize,
-    terms: Row,
+    terms: Range<usize>,
     rhs: Wide,
     rhs_bound: Option<Wide>,
 }
 
 struct Basis {
     pivots: Vec<Pivot>,
+    terms: Vec<Term>,
+    scratch: SparseRow,
+    pending: PendingPivots,
     by_column: Vec<Option<usize>>,
     required_prefix: usize,
     remaining_work: usize,
@@ -93,6 +211,9 @@ impl Basis {
     fn new(columns: usize, required_prefix: usize) -> Self {
         Self {
             pivots: Vec::new(),
+            terms: Vec::new(),
+            scratch: SparseRow::new(columns),
+            pending: PendingPivots::new(columns),
             by_column: vec![None; columns],
             required_prefix,
             remaining_work: 67_108_864,
@@ -106,36 +227,41 @@ impl Basis {
         Ok(())
     }
 
-    fn insert(&mut self, terms: Row, rhs: Wide) -> SpiceResult<bool> {
+    fn insert(&mut self, terms: impl IntoIterator<Item = Term>, rhs: Wide) -> SpiceResult<bool> {
         self.insert_bounded(terms, rhs, None)
     }
 
     fn insert_bounded(
         &mut self,
-        mut terms: Row,
+        terms: impl IntoIterator<Item = Term>,
         mut rhs: Wide,
         mut rhs_bound: Option<Wide>,
     ) -> SpiceResult<bool> {
-        self.charge(terms.len())?;
-        let mut pending: BTreeSet<_> = terms
-            .keys()
-            .filter_map(|&column| self.by_column[column])
-            .collect();
-        while let Some(index) = pending.pop_first() {
+        self.scratch.clear();
+        self.pending.clear();
+        for (column, value) in terms {
+            self.scratch.insert(column, value);
+        }
+        self.charge(self.scratch.entries().len())?;
+        for &(column, _) in self.scratch.entries() {
+            if let Some(index) = self.by_column[column] {
+                self.pending.insert(index);
+            }
+        }
+        while let Some(index) = self.pending.pop_first() {
             self.charge(self.pivots[index].terms.len().saturating_add(1))?;
             let pivot = &self.pivots[index];
-            let Some(factor) = terms.remove(&pivot.column) else {
+            let Some(factor) = self.scratch.remove(pivot.column) else {
                 continue;
             };
-            for (&column, &value) in &pivot.terms {
-                let old = terms.get(&column).copied().unwrap_or_default();
-                let next = old.eliminate(factor, value);
+            for &(column, value) in &self.terms[pivot.terms.clone()] {
+                let next = self.scratch.get(column).eliminate(factor, value);
                 if next.value.is_zero() && next.error.is_zero() {
-                    terms.remove(&column);
+                    self.scratch.remove(column);
                 } else {
-                    terms.insert(column, next);
+                    self.scratch.insert(column, next);
                     if let Some(other) = self.by_column[column] {
-                        pending.insert(other);
+                        self.pending.insert(other);
                     }
                 }
             }
@@ -148,37 +274,44 @@ impl Basis {
                     .upper_mul_add(pivot_bound, *bound);
             }
         }
-        if !rhs.finite() || terms.values().any(|v| !v.finite()) {
+        self.finish_pivot(rhs, rhs_bound)
+    }
+
+    fn finish_pivot(&mut self, mut rhs: Wide, mut rhs_bound: Option<Wide>) -> SpiceResult<bool> {
+        if !rhs.finite() || self.scratch.entries().iter().any(|&(_, v)| !v.finite()) {
             return Err(failure(
                 "nonfinite rank reduction of instantaneous constraints",
             ));
         }
-        let Some((&column, &pivot)) = terms
+        let Some(&(column, pivot)) = self
+            .scratch
+            .entries()
             .iter()
             .filter(|(_, coefficient)| coefficient.significant())
-            // Eliminate higher Taylor degrees first. A prefix pivot can
-            // appear only when no significant tail coefficient survives;
-            // it is then a constraint on the required initial coordinates.
+            // Eliminate higher Taylor degrees first, then largest magnitude.
+            // The former ascending map selected the greatest column on ties.
             .max_by(|(ca, a), (cb, b)| {
-                (**ca >= self.required_prefix)
-                    .cmp(&(**cb >= self.required_prefix))
+                (*ca >= self.required_prefix)
+                    .cmp(&(*cb >= self.required_prefix))
                     .then_with(|| a.value.magnitude_cmp(b.value))
+                    .then_with(|| ca.cmp(cb))
             })
         else {
             return Ok(false);
         };
-        terms.remove(&column);
-        for coefficient in terms.values_mut() {
+        self.scratch.remove(column);
+        for (_, coefficient) in self.scratch.entries_mut() {
             *coefficient = coefficient.normalized(pivot);
         }
         rhs = rhs.divide(pivot.value);
         if let Some(bound) = &mut rhs_bound {
             *bound = bound.upper_divide(pivot.value.abs().lower_subtract(pivot.error));
         }
-        if !rhs.finite() || terms.values().any(|v| !v.finite()) {
+        if !rhs.finite() || self.scratch.entries().iter().any(|&(_, v)| !v.finite()) {
             return Err(failure("nonfinite normalized instantaneous constraint"));
         }
         self.by_column[column] = Some(self.pivots.len());
+        let terms = self.scratch.append_sorted(&mut self.terms);
         self.pivots.push(Pivot {
             column,
             terms,
@@ -230,12 +363,12 @@ impl Basis {
     fn back_substitute(&self, solution: &mut [Wide], homogeneous: bool) {
         for pivot in self.pivots.iter().rev() {
             let rhs = if homogeneous { Wide::ZERO } else { pivot.rhs };
-            let value = pivot
-                .terms
-                .iter()
-                .fold(rhs, |rhs, (&column, &coefficient)| {
-                    coefficient.value.negate().mul_add(solution[column], rhs)
-                });
+            let value =
+                self.terms[pivot.terms.clone()]
+                    .iter()
+                    .fold(rhs, |rhs, &(column, coefficient)| {
+                        coefficient.value.negate().mul_add(solution[column], rhs)
+                    });
             solution[pivot.column] = value;
         }
     }
@@ -252,12 +385,15 @@ impl Basis {
             let rhs = pivot
                 .rhs_bound
                 .ok_or_else(|| failure("missing rank uncertainty input"))?;
-            bounds[pivot.column] = pivot.terms.iter().fold(rhs, |sum, (&column, term)| {
-                term.value
-                    .abs()
-                    .upper_add(term.error)
-                    .upper_mul_add(bounds[column], sum)
-            });
+            bounds[pivot.column] =
+                self.terms[pivot.terms.clone()]
+                    .iter()
+                    .fold(rhs, |sum, &(column, term)| {
+                        term.value
+                            .abs()
+                            .upper_add(term.error)
+                            .upper_mul_add(bounds[column], sum)
+                    });
         }
         bounds.truncate(self.required_prefix);
         Self::unscale(bounds, column_exponents)
@@ -514,15 +650,15 @@ fn reduce(
         if exponent == i32::MIN {
             continue;
         }
-        let mut terms = Row::new();
-        for entry in &entries[ranges[row].clone()] {
-            if entry.value != 0. {
-                terms.insert(
+        let terms = entries[ranges[row].clone()]
+            .iter()
+            .filter(|entry| entry.value != 0.)
+            .map(|entry| {
+                (
                     entry.col,
                     Coefficient::scaled(entry.value, -exponent - column_exponents[entry.col]),
-                );
-            }
-        }
+                )
+            });
         independent[row] = basis.insert_bounded(
             terms,
             Wide::from_real(rhs[row]).shifted(-i64::from(exponent)),
@@ -533,7 +669,7 @@ fn reduce(
         if basis.pivots.len() == matrix.cols() {
             break;
         }
-        basis.insert(Row::from([(column, Coefficient::exact(1.))]), Wide::ZERO)?;
+        basis.insert([(column, Coefficient::exact(1.))], Wide::ZERO)?;
     }
     Ok(Reduction {
         basis,
@@ -653,27 +789,24 @@ mod priority_tests {
         assert!(
             basis
                 .insert(
-                    Row::from([(0, Coefficient::exact(2.)), (1, Coefficient::exact(1.))]),
+                    [(0, Coefficient::exact(2.)), (1, Coefficient::exact(1.))],
                     Wide::from_real(4.)
                 )
                 .unwrap()
         );
         assert!(
             basis
-                .insert(
-                    Row::from([(1, Coefficient::exact(1.))]),
-                    Wide::from_real(2.)
-                )
+                .insert([(1, Coefficient::exact(1.))], Wide::from_real(2.))
                 .unwrap()
         );
         assert!(
             basis
                 .insert(
-                    Row::from([
+                    [
                         (0, Coefficient::exact(2.)),
                         (1, Coefficient::exact(1.)),
                         (2, Coefficient::exact(1e-30))
-                    ]),
+                    ],
                     Wide::from_real(4.)
                 )
                 .unwrap()
@@ -880,6 +1013,136 @@ mod projected_oracle {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use std::{hint::black_box, time::Instant};
+
+    fn banded(columns: usize, width: usize) -> (SparseMatrix, Vec<Real>) {
+        let mut matrix = SparseMatrix::new(columns * 2, columns);
+        let mut rhs = vec![0.; columns * 2];
+        // Cyclic diagonal dominance with redundant physical rows. The exact
+        // solution is one, with increasingly dense elimination fill.
+        for (row, value) in rhs.iter_mut().enumerate() {
+            for offset in 0..width {
+                let column = (row + offset) % columns;
+                let coefficient = if offset == 0 {
+                    2. * f64::from(u32::try_from(width).unwrap())
+                } else {
+                    -1.
+                };
+                matrix.add(row, column, coefficient).unwrap();
+                *value += coefficient;
+            }
+        }
+        matrix.fold_duplicates();
+        (matrix, rhs)
+    }
+
+    fn mix(digest: &mut u64, bits: u64) {
+        *digest = (*digest ^ bits).wrapping_mul(1_099_511_628_211);
+    }
+
+    #[test]
+    fn sparse_storage_preserves_rank_arithmetic_and_work() {
+        // Diverse exact rows with cancellation, disparate scales, late
+        // physical constraints, optional rows and free tail coordinates.
+        // Compare pivot order, selected rows, exact work charging, binary64
+        // solution and uncertainty against the prior ordered-tree basis.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut digest = 0xcbf2_9ce4_8422_2325;
+        for columns in 2..=18 {
+            for case in 0..32 {
+                let rows = columns * 2;
+                let prefix = 1 + case % columns;
+                let mut matrix = SparseMatrix::new(rows, columns);
+                let mut rhs = vec![0.; rows];
+                let mut bounds = vec![0.; rows];
+                for row in 0..rows {
+                    let scale = 2.0_f64.powi(i32::try_from(next() % 161).unwrap() - 80);
+                    bounds[row] = scale * 1e-12;
+                    for col in 0..columns {
+                        let v = next();
+                        if v % 4 == 0 || col == row % columns {
+                            let coefficient = f64::from(i32::try_from(v % 19).unwrap() - 9) * scale;
+                            matrix.add(row, col, coefficient).unwrap();
+                            rhs[row] += coefficient * f64::from(u32::try_from(col + 1).unwrap());
+                        }
+                    }
+                }
+                matrix.fold_duplicates();
+                let reduction = reduce(
+                    &matrix,
+                    &rhs,
+                    &[],
+                    &[rows - 2],
+                    &[rows - 1],
+                    prefix,
+                    Some(&bounds),
+                )
+                .unwrap();
+                mix(&mut digest, reduction.basis.remaining_work as u64);
+                mix(&mut digest, reduction.basis.prefix_rank() as u64);
+                for pivot in &reduction.basis.pivots {
+                    mix(&mut digest, pivot.column as u64);
+                }
+                for independent in reduction.independent {
+                    mix(&mut digest, u64::from(independent));
+                }
+                let solution = reduction
+                    .basis
+                    .particular_solution(&reduction.column_exponents)
+                    .unwrap();
+                for value in solution.as_slice() {
+                    mix(&mut digest, value.to_bits());
+                }
+                if reduction.basis.prefix_rank() == prefix {
+                    let uncertainty = reduction
+                        .basis
+                        .prefix_uncertainty(&reduction.column_exponents)
+                        .unwrap();
+                    for value in uncertainty.as_slice() {
+                        mix(&mut digest, value.to_bits());
+                    }
+                }
+            }
+        }
+        println!("rank arithmetic digest={digest:016x}");
+    }
+
+    #[test]
+    #[ignore = "manual rank reduction throughput measurement"]
+    fn benchmark_rank_reduction_workloads() {
+        for (columns, width, repetitions) in
+            [(32, 3, 500), (256, 3, 80), (128, 24, 20), (64, 64, 20)]
+        {
+            let (matrix, rhs) = banded(columns, width);
+            let start = Instant::now();
+            let mut digest = 0xcbf2_9ce4_8422_2325;
+            for _ in 0..repetitions {
+                let result =
+                    complete(black_box(&matrix), black_box(&rhs), &[], &[], &[], columns).unwrap();
+                assert_eq!(result.prefix_rank, columns);
+                for &value in result.values.as_slice() {
+                    assert!((value - 1.).abs() < 1e-10);
+                    mix(&mut digest, value.to_bits());
+                }
+                black_box(&result.independent);
+            }
+            println!(
+                "rank columns={columns} width={width} repetitions={repetitions} elapsed={:?} digest={digest:016x}",
+                start.elapsed()
+            );
         }
     }
 }
