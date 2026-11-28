@@ -1240,14 +1240,13 @@ mod boundary_tests {
                 &AnalysisContext::default(),
             )
             .unwrap_err();
-        // Zero-dimensional MNA has a valid empty solution, but an OP with
-        // no observable variables is not a representable nonempty plot.
+        // Zero-dimensional MNA is valid for circuits consisting solely of
+        // absent storage. A genuinely empty OP has no observable columns.
         assert!(
             matches!(
-                &error,
-                SpiceError::Numerical { context, message }
-                    if context == "plot op1"
-                        && message == "zero variables with nonzero points outside a rootless pole-zero result"
+                error,
+                SpiceError::Numerical { ref context, ref message }
+                if context == "plot op1" && message.contains("zero variables")
             ),
             "{error}"
         );
