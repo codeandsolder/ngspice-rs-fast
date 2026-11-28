@@ -1521,7 +1521,7 @@ mod tests {
 
     #[test]
     fn truncation_decodes_the_state_before_selecting_a_threshold() {
-        use crate::devices::{Device, TruncationContext};
+        use crate::devices::TruncationContext;
         let s = switch(SwitchKind::Voltage, 1., 0.5, false);
         let context = |trial| TruncationContext {
             trial,
