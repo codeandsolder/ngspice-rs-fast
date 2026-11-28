@@ -79,6 +79,7 @@ struct Pivot {
     column: usize,
     terms: Row,
     rhs: Wide,
+    rhs_bound: Option<Wide>,
 }
 
 struct Basis {
@@ -105,7 +106,16 @@ impl Basis {
         Ok(())
     }
 
-    fn insert(&mut self, mut terms: Row, mut rhs: Wide) -> SpiceResult<bool> {
+    fn insert(&mut self, terms: Row, rhs: Wide) -> SpiceResult<bool> {
+        self.insert_bounded(terms, rhs, None)
+    }
+
+    fn insert_bounded(
+        &mut self,
+        mut terms: Row,
+        mut rhs: Wide,
+        mut rhs_bound: Option<Wide>,
+    ) -> SpiceResult<bool> {
         self.charge(terms.len())?;
         let mut pending: BTreeSet<_> = terms
             .keys()
@@ -130,6 +140,13 @@ impl Basis {
                 }
             }
             rhs = factor.value.negate().mul_add(pivot.rhs, rhs);
+            if let (Some(bound), Some(pivot_bound)) = (&mut rhs_bound, pivot.rhs_bound) {
+                *bound = factor
+                    .value
+                    .abs()
+                    .upper_add(factor.error)
+                    .upper_mul_add(pivot_bound, *bound);
+            }
         }
         if !rhs.finite() || terms.values().any(|v| !v.finite()) {
             return Err(failure(
@@ -155,11 +172,19 @@ impl Basis {
             *coefficient = coefficient.normalized(pivot);
         }
         rhs = rhs.divide(pivot.value);
+        if let Some(bound) = &mut rhs_bound {
+            *bound = bound.upper_divide(pivot.value.abs().lower_subtract(pivot.error));
+        }
         if !rhs.finite() || terms.values().any(|v| !v.finite()) {
             return Err(failure("nonfinite normalized instantaneous constraint"));
         }
         self.by_column[column] = Some(self.pivots.len());
-        self.pivots.push(Pivot { column, terms, rhs });
+        self.pivots.push(Pivot {
+            column,
+            terms,
+            rhs,
+            rhs_bound,
+        });
         Ok(true)
     }
 
@@ -187,19 +212,58 @@ impl Basis {
     /// Particular Newton correction with zero corrections in unresolved
     /// coordinates. This does not prove consistency of the initial prefix.
     fn particular_solution(&self, column_exponents: &[i32]) -> SpiceResult<Vector> {
-        // Free tail coefficients are not initial gauges. The projected
-        // equations proved that none changes the required prefix, so zero
-        // is only a choice of particular solution for the unused tail.
         let mut solution = vec![Wide::ZERO; self.by_column.len()];
+        self.back_substitute(&mut solution, false);
+        Self::unscale(solution, column_exponents)
+    }
+
+    /// A homogeneous direction along a free prefix coordinate. Its tail
+    /// follows the same selected linearized equations, not artificial
+    /// independent constraints on the unresolved Taylor coefficients.
+    fn direction(&self, column_exponents: &[i32], column: usize) -> SpiceResult<Vector> {
+        let mut solution = vec![Wide::ZERO; self.by_column.len()];
+        solution[column] = Wide::from_real(1.).shifted(i64::from(column_exponents[column]));
+        self.back_substitute(&mut solution, true);
+        Self::unscale(solution, column_exponents)
+    }
+
+    fn back_substitute(&self, solution: &mut [Wide], homogeneous: bool) {
         for pivot in self.pivots.iter().rev() {
+            let rhs = if homogeneous { Wide::ZERO } else { pivot.rhs };
             let value = pivot
                 .terms
                 .iter()
-                .fold(pivot.rhs, |rhs, (&column, &coefficient)| {
+                .fold(rhs, |rhs, (&column, &coefficient)| {
                     coefficient.value.negate().mul_add(solution[column], rhs)
                 });
             solution[pivot.column] = value;
         }
+    }
+
+    /// Forward error envelope for perturbations of the selected physical
+    /// rows. This is a local linearized uncertainty, not a global root
+    /// isolation certificate. Free tail perturbations are projected out.
+    fn prefix_uncertainty(&self, column_exponents: &[i32]) -> SpiceResult<Vector> {
+        if self.prefix_rank() != self.required_prefix {
+            return Err(failure("cannot bound an undetermined derivative prefix"));
+        }
+        let mut bounds = vec![Wide::ZERO; self.by_column.len()];
+        for pivot in self.pivots.iter().rev() {
+            let rhs = pivot
+                .rhs_bound
+                .ok_or_else(|| failure("missing rank uncertainty input"))?;
+            bounds[pivot.column] = pivot.terms.iter().fold(rhs, |sum, (&column, term)| {
+                term.value
+                    .abs()
+                    .upper_add(term.error)
+                    .upper_mul_add(bounds[column], sum)
+            });
+        }
+        bounds.truncate(self.required_prefix);
+        Self::unscale(bounds, column_exponents)
+    }
+
+    fn unscale(solution: Vec<Wide>, column_exponents: &[i32]) -> SpiceResult<Vector> {
         let solution = Vector::from(
             solution
                 .into_iter()
@@ -249,6 +313,7 @@ pub(super) fn complete(
         late_rows,
         optional_rows,
         required_prefix,
+        None,
     )?;
     Ok(Completed {
         values: reduction.basis.solution(&reduction.column_exponents)?,
@@ -267,7 +332,15 @@ pub(super) fn projected_step(
     optional_rows: &[usize],
     required_prefix: usize,
 ) -> SpiceResult<Completed> {
-    let reduction = reduce(matrix, rhs, &[], late_rows, optional_rows, required_prefix)?;
+    let reduction = reduce(
+        matrix,
+        rhs,
+        &[],
+        late_rows,
+        optional_rows,
+        required_prefix,
+        None,
+    )?;
     Ok(Completed {
         values: reduction
             .basis
@@ -281,8 +354,78 @@ pub(super) fn projected_step(
 /// after projecting away all higher derivative coefficients.
 pub(super) fn projected_rank(matrix: &SparseMatrix, required_prefix: usize) -> SpiceResult<usize> {
     let rhs = crate::primitives::filled_vec(matrix.rows(), 0., "derivative array rank")?;
-    let reduction = reduce(matrix, &rhs, &[], &[], &[], required_prefix)?;
+    let reduction = reduce(matrix, &rhs, &[], &[], &[], required_prefix, None)?;
     Ok(reduction.basis.prefix_rank())
+}
+
+/// Projected physical rank and disposable nullspace directions, with
+/// optional numerical storage constraints excluded. Such constraints
+/// must not prevent a search for a physically determined nonlinear root.
+pub(super) struct ProbeSpace {
+    pub rank: usize,
+    pub directions: Vec<Vector>,
+    pub independent: Vec<bool>,
+}
+
+pub(super) fn probe_space(
+    matrix: &SparseMatrix,
+    late: &[usize],
+    optional: &[usize],
+    prefix: usize,
+    max_directions: usize,
+) -> SpiceResult<ProbeSpace> {
+    let mut mandatory = SparseMatrix::new(matrix.rows(), matrix.cols());
+    let mut excluded = vec![false; matrix.rows()];
+    for &row in optional {
+        excluded[row] = true;
+    }
+    for term in matrix.triplets() {
+        if !excluded[term.row] {
+            mandatory.add(term.row, term.col, term.value)?;
+        }
+    }
+    mandatory.fold_duplicates();
+    let rhs = vec![0.; matrix.rows()];
+    let reduction = reduce(&mandatory, &rhs, &[], late, &[], prefix, None)?;
+    let rank = reduction.basis.prefix_rank();
+    let count = prefix - rank;
+    if count > max_directions && max_directions != 0 {
+        return Err(failure(
+            "nonlinear germ recovery exceeds its nullspace dimension budget",
+        ));
+    }
+    let directions = reduction.basis.by_column[..prefix]
+        .iter()
+        .enumerate()
+        .filter(|(_, pivot)| pivot.is_none())
+        .take(max_directions)
+        .map(|(column, _)| {
+            reduction
+                .basis
+                .direction(&reduction.column_exponents, column)
+        })
+        .collect::<SpiceResult<Vec<_>>>()?;
+    Ok(ProbeSpace {
+        rank,
+        directions,
+        independent: reduction.independent,
+    })
+}
+
+/// Propagate a residual-space error envelope through the same selected
+/// basis used by the Newton correction. Bounds are in normalized jet units.
+pub(super) fn projected_uncertainty(
+    matrix: &SparseMatrix,
+    bounds: &[Real],
+    late: &[usize],
+    optional: &[usize],
+    prefix: usize,
+) -> SpiceResult<Vector> {
+    let rhs = crate::primitives::filled_vec(matrix.rows(), 0., "derivative uncertainty")?;
+    let reduction = reduce(matrix, &rhs, &[], late, optional, prefix, Some(bounds))?;
+    reduction
+        .basis
+        .prefix_uncertainty(&reduction.column_exponents)
 }
 
 struct Reduction {
@@ -298,9 +441,13 @@ fn reduce(
     late_rows: &[usize],
     optional_rows: &[usize],
     required_prefix: usize,
+    row_bounds: Option<&[Real]>,
 ) -> SpiceResult<Reduction> {
     if required_prefix > matrix.cols()
         || rhs.len() != matrix.rows()
+        || row_bounds.is_some_and(|bounds| {
+            bounds.len() != matrix.rows() || bounds.iter().any(|v| !v.is_finite() || *v < 0.)
+        })
         || late_rows
             .iter()
             .chain(optional_rows)
@@ -376,9 +523,10 @@ fn reduce(
                 );
             }
         }
-        independent[row] = basis.insert(
+        independent[row] = basis.insert_bounded(
             terms,
             Wide::from_real(rhs[row]).shifted(-i64::from(exponent)),
+            row_bounds.map(|bounds| Wide::from_real(bounds[row]).shifted(-i64::from(exponent))),
         )?;
     }
     for &column in gauges {
@@ -397,6 +545,36 @@ fn reduce(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projected_uncertainty_tracks_coupled_conditioning() {
+        let mut matrix = SparseMatrix::new(3, 3);
+        // The first two physical rows constrain x and y. An unrelated
+        // free tail coordinate must not inflate their uncertainty.
+        matrix.add(0, 0, 1e-9).unwrap();
+        matrix.add(1, 0, 2.).unwrap();
+        matrix.add(1, 1, 1.).unwrap();
+        matrix.fold_duplicates();
+        let bound = projected_uncertainty(&matrix, &[1e-15, 1e-12, 1e10], &[], &[], 2).unwrap();
+        assert!(bound.as_slice()[0] >= 1e-6 && bound.as_slice()[0] < 1.00001e-6);
+        assert!(bound.as_slice()[1] >= 2e-6 && bound.as_slice()[1] < 2.00001e-6);
+    }
+
+    #[test]
+    fn nonlinear_probe_directions_preserve_mandatory_constraints() {
+        let mut matrix = SparseMatrix::new(2, 3);
+        matrix.add(0, 0, 2.).unwrap();
+        matrix.add(0, 1, 1.).unwrap();
+        matrix.add(1, 1, 1.).unwrap();
+        matrix.fold_duplicates();
+        let space = probe_space(&matrix, &[], &[1], 2, 2).unwrap();
+        assert_eq!(space.rank, 1);
+        assert_eq!(space.directions.len(), 1);
+        let direction = space.directions[0].as_slice();
+        assert!(direction[0].abs().max(direction[1].abs()) >= 1.);
+        assert!(2_f64.mul_add(direction[0], direction[1]).abs() < 1e-14);
+        assert_eq!(space.independent, [true, false]);
+    }
 
     #[test]
     fn rectangular_basis_only_completes_declared_free_coordinates() {
