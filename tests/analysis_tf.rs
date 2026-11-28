@@ -372,3 +372,33 @@ fn the_driver_is_registered() {
         AnalysisKind::TransferFunction
     ));
 }
+
+/// The DC branch current can be corrected while the new unit-excitation
+/// solve still loses it through the rounded Jacobian. A zero-bias source
+/// exercises explicit operator retention without a DC cancellation trigger.
+#[test]
+fn near_short_transfer_resistance_matches_physical_series_network() {
+    for voltage in [0., 1.] {
+        for (r, physical) in [
+            ("0", 1e-12),
+            ("1e-12", 1e-12),
+            ("1e-10", 1e-10),
+            ("1e-8", 1e-8),
+            ("1e-6", 1e-6),
+        ] {
+            let body = format!("v1 a 0 {voltage}\nr1 a b {r}\nr2 b 0 1k");
+            let actual = values(&tf(&body, ".tf v(b) v1").unwrap());
+            let total = physical + 1000.;
+            for (got, expected) in
+                actual
+                    .into_iter()
+                    .zip([1000. / total, total, physical * 1000. / total])
+            {
+                assert!(
+                    (got / expected - 1.).abs() < 1e-8,
+                    "{body}: {got:e} != {expected:e}"
+                );
+            }
+        }
+    }
+}

@@ -91,6 +91,8 @@ pub enum ModelFamily {
     Pmf,
     /// XSPICE rational transfer function (`s_xfer`).
     RationalTransfer,
+    /// Tabulated complex frequency response.
+    FrequencyTransfer,
     /// Native hybrid analog receiver/event logic.
     LogicEvent,
     /// Native ideal logic voltage bridge.
@@ -124,6 +126,7 @@ impl ModelFamily {
             "txl" => Some(Self::Txl),
             "cpl" | "cpllines" => Some(Self::Cpl),
             "s_xfer" => Some(Self::RationalTransfer),
+            "xfer" => Some(Self::FrequencyTransfer),
             "preprocess_logic_event" => Some(Self::LogicEvent),
             "preprocess_logic_voltage" => Some(Self::LogicVoltage),
             "preprocess_timed_switch" => Some(Self::TimedSwitch),
@@ -153,9 +156,11 @@ impl ModelFamily {
             Self::Ltra => 'o',
             Self::Txl => 'y',
             Self::Cpl => 'p',
-            Self::RationalTransfer | Self::LogicEvent | Self::LogicVoltage | Self::TimedSwitch => {
-                'a'
-            }
+            Self::RationalTransfer
+            | Self::FrequencyTransfer
+            | Self::LogicEvent
+            | Self::LogicVoltage
+            | Self::TimedSwitch => 'a',
             Self::Nmf | Self::Pmf => 'z',
         }
     }
@@ -221,6 +226,8 @@ pub enum ModelBackend {
     Cpl,
     /// Native rational transfer model.
     RationalTransfer,
+    /// Tabulated complex frequency response.
+    FrequencyTransfer,
     /// Native hybrid event logic.
     LogicEvent,
     /// Native ideal logic voltage bridge.
@@ -335,6 +342,8 @@ impl ModelBackend {
                 const {
                     &[
                         BackendSpec::new(Self::RationalTransfer, "Rational transfer", &[1]),
+                        BackendSpec::new(Self::FrequencyTransfer, "Tabulated AC transfer", &[1])
+                            .for_family(ModelFamily::FrequencyTransfer),
                         BackendSpec::new(Self::LogicEvent, "Native hybrid event logic", &[1])
                             .for_family(ModelFamily::LogicEvent),
                         BackendSpec::new(Self::LogicVoltage, "Native logic voltage", &[1])
