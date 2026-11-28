@@ -243,8 +243,19 @@ fn signed_transient_storage_uses_exact_history_and_stable_signed_dynamics() -> S
     let ind = first(
         "v1 s 0 2\nr1 s p -10\nl1 p 0 -3m ic=-.05 pn_rseries=0 pn_exact_ic=1\n.tran 1u 600u 0 1u",
     )?;
+    for (plot, name, reference) in [
+        (&cap, "v(p)", 1.796997918135468),
+        (&ind, "i(l1)", -0.1796997450230323),
+    ] {
+        close(
+            at(plot, name, plot.point_count() - 1)?,
+            Complex::real(reference),
+            2e-5,
+            1e-7,
+        );
+    }
     for (plot, name, final_value, initial, tau) in [
-        (&cap, "v(p)", 2., 0.5, 20e-6),
+        (&cap, "v(p)", 2.0_f64, 0.5, 20e-6),
         (&ind, "i(l1)", -0.2, -0.05, 300e-6),
     ] {
         for index in 1..plot.point_count() {
