@@ -433,7 +433,7 @@ W1 p2 0 Vsen mi
     let prepared = pspice::normalize_mapped(
         text,
         RootKind::Deck,
-        &model_preprocess_command::budget::WorkBudget::default(),
+        &model_preprocess_command::WorkBudget::default(),
     )
     .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
     assert_eq!(prepared.renamed.len(), 2);
