@@ -321,3 +321,74 @@ fn selection_uses_actual_macro_target_before_sensing_aliases() -> SpiceResult<()
     );
     Ok(())
 }
+
+#[test]
+fn physical_dae_and_taylor_use_the_exact_residual_not_the_ac_tangent() -> SpiceResult<()> {
+    use ngspice_rs::devices::{Limit, TransientTiming};
+    let mut c =
+        circuit("physical law\nv1 a 0 1\nr1 a 0 1\nb1 b 0 v=sampled_current(i(v1))\n.end\n")?;
+    c.finalize()?;
+    let index = |name| c.devices().iter().position(|d| d.name() == name).unwrap();
+    let sample = c
+        .devices()
+        .iter()
+        .find(|d| d.name().starts_with("b__sampled_current_"))
+        .unwrap();
+    let row = c
+        .unknowns()
+        .node_row(sample.constitutive_nodes()[0])
+        .unwrap();
+    let control = c.branch_rows(index("v1")).unwrap().start;
+    let run = c.prepare_run();
+    let mut dae =
+        run.prepare_physical_dae(&ModelContext::default(), TransientTiming::new(1e-6, 1e-3)?)?;
+    let mut state = vec![Vector::zeros(c.unknown_count()); 3];
+    for (x, (sample, physical)) in state.iter_mut().zip([(2., 3.), (-3., 1.), (0.5, -0.5)]) {
+        x.set(row, sample)?;
+        x.set(control, physical)?;
+    }
+    let exact = dae.evaluate(&state[0], 0., Limit::Right)?;
+    assert_eq!(exact.residual.get(row), Some(-1.));
+    assert_eq!(exact.conductance.get(row, control), -1.);
+    assert_eq!(exact.conductance.get(row, row), 1.);
+    assert_eq!(exact.charge.get(row), Some(0.));
+    for limit in [Limit::Left, Limit::Right] {
+        let taylor = dae.evaluate_taylor(&state, 0., 1e-6, limit)?;
+        for (degree, expected) in [-1., -4., 1.].into_iter().enumerate() {
+            assert_eq!(taylor.residual[degree].get(row), Some(expected));
+            assert_eq!(taylor.charge[degree].get(row), Some(0.));
+            assert_eq!(
+                taylor.conductance[degree].get(row, control),
+                if degree == 0 { -1. } else { 0. }
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn sampled_current_does_not_add_noise_or_change_small_signal_gain() -> SpiceResult<()> {
+    let mut spectra = Vec::new();
+    for expression in ["v(p)", "v(p)+2*sampled_current(i(r2))"] {
+        let mut c = circuit(&format!(
+            "noise\nv1 s 0 dc 2 ac 1\nr1 s p 3\nr2 p 0 5\nb1 out 0 v={expression}\n.end\n"
+        ))?;
+        spectra.push(run(
+            &mut c,
+            AnalysisKind::Noise,
+            &["v(out)", "v1", "lin", "3", "100", "10000"],
+        )?);
+    }
+    for name in ["onoise_spectrum", "inoise_spectrum"] {
+        for point in 0..3 {
+            let baseline = spectra[0].value(name, point).unwrap();
+            let sample = spectra[1].value(name, point).unwrap();
+            assert!(baseline.magnitude() > 0.);
+            assert!(
+                (sample - baseline).magnitude() <= 1e-12 * baseline.magnitude(),
+                "{name}: {sample:?} != {baseline:?}"
+            );
+        }
+    }
+    Ok(())
+}
