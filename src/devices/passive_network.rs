@@ -959,30 +959,35 @@ pub(crate) enum ReportPhase {
     Transient,
 }
 
-/// Bound projection of one reported current, independent of the solver.
+/// Bound output projection, independent of the solver's unknown layout.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CurrentOutputLaw {
-    row: Option<usize>,
-    voltage_rows: [Option<usize>; 2],
-    conductance: Real,
+pub(crate) enum OutputProjection {
+    /// An observation-only value with no physical MNA coordinate.
+    Zero,
+    /// A physical current and its phase-specific voltage contribution.
+    Current {
+        row: usize,
+        voltage_rows: [Option<usize>; 2],
+        conductance: Real,
+    },
 }
 
-impl CurrentOutputLaw {
-    pub(crate) const ZERO: Self = Self {
-        row: None,
-        voltage_rows: [None; 2],
-        conductance: 0.,
-    };
-
+impl OutputProjection {
     pub(crate) fn evaluate(self, mut value: impl FnMut(usize) -> Complex) -> Complex {
-        let current = self.row.map_or(Complex::ZERO, &mut value);
-        if self.conductance == 0. {
+        let Self::Current {
+            row,
+            voltage_rows,
+            conductance,
+        } = self
+        else {
+            return Complex::ZERO;
+        };
+        let current = value(row);
+        if conductance == 0. {
             return current;
         }
-        let [p, n] = self
-            .voltage_rows
-            .map(|row| row.map_or(Complex::ZERO, &mut value));
-        current + (p - n) * Complex::real(self.conductance)
+        let [p, n] = voltage_rows.map(|row| row.map_or(Complex::ZERO, &mut value));
+        current + (p - n) * Complex::real(conductance)
     }
 }
 
@@ -1025,7 +1030,7 @@ impl BoundCurrentReport {
         })
     }
 
-    pub(crate) fn law(&self, phase: ReportPhase) -> SpiceResult<CurrentOutputLaw> {
+    pub(crate) fn law(&self, phase: ReportPhase) -> SpiceResult<OutputProjection> {
         let law = match phase {
             ReportPhase::Steady => self.reporting.steady,
             ReportPhase::SmallSignal => self.reporting.small_signal,
@@ -1037,8 +1042,8 @@ impl BoundCurrentReport {
                 .primary_row
                 .ok_or_else(|| SpiceError::circuit("unbound primary current"))?,
         };
-        Ok(CurrentOutputLaw {
-            row: Some(row),
+        Ok(OutputProjection::Current {
+            row,
             voltage_rows: self.voltage_rows,
             conductance: law.voltage_conductance,
         })

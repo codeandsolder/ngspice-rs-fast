@@ -223,3 +223,66 @@ fn explicit_save_and_unknown_controls() -> SpiceResult<()> {
     assert!(c.set_observations(&["i(missing)".into()]).is_err());
     Ok(())
 }
+
+#[test]
+fn empty_physical_circuit_and_live_shared_terminal() -> SpiceResult<()> {
+    let mut empty = circuit(REMOVED)?;
+    assert_eq!(empty.device_count(), 0);
+    assert_eq!(empty.unknown_count(), 0);
+    assert_eq!(empty.state_history()?.len(), 0);
+    let op = run(&mut empty, AnalysisKind::OperatingPoint, &[])?;
+    assert_zero(
+        &op,
+        &[
+            "v(live)",
+            "v(ghost)",
+            "v(orphan)",
+            "i(c1)",
+            "i(c2)",
+            "i(l1)",
+        ],
+    );
+
+    let mut shared = circuit(&format!(
+        "{LIVE}{REMOVED}v2 ghost 0 2\nb1 out 0 v=v(ghost)+i(c1)\nr2 out 0 1k"
+    ))?;
+    let op = run(&mut shared, AnalysisKind::OperatingPoint, &[])?;
+    assert_eq!(op.value("v(ghost)", 0), Some(Complex::real(2.)));
+    assert_eq!(op.value("v(out)", 0), Some(Complex::real(2.)));
+    assert_zero(&op, &["i(c1)", "i(c2)", "i(l1)", "v(orphan)"]);
+    Ok(())
+}
+
+#[test]
+fn incremental_elaboration_is_atomic_and_respects_budgets() -> SpiceResult<()> {
+    use ngspice_rs::devices::{ElaborationLimits, ModelContext, models::ModelResolver};
+    let mut c = Circuit::with_elaboration_limits(ElaborationLimits {
+        devices: 4,
+        nodes: 4,
+        state_slots: 10,
+    });
+    let models = ModelResolver::new(&[])?;
+    let context = ModelContext::default();
+    let first = source("c1 ghost 0 1u m=0 pn_rseries=0")?;
+    c.add_instances(&first.devices, &models, &context)?;
+    c.finalize()?;
+    assert_eq!(c.device_count(), 0);
+    let duplicate = source("C1 x 0 1u m=0 pn_rseries=0")?;
+    assert!(
+        c.add_instances(&duplicate.devices, &models, &context)
+            .is_err()
+    );
+    let over = source("c2 p q 1u m=0 pn_rseries=0\nc3 r s 1u m=0 pn_rseries=0")?;
+    assert!(c.add_instances(&over.devices, &models, &context).is_err());
+    assert_eq!(c.nodes().len(), 1);
+    let good = source("v1 live 0 1\nb1 out 0 v=v(live,ghost)+i(c1)\nr1 out 0 1k")?;
+    c.add_instances(&good.devices, &models, &context)?;
+    c.finalize()?;
+    assert!(c.add_node("ghost").is_err());
+    assert!(c.nodes().get("ghost").is_none());
+    let op = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
+    assert_zero(&op, &["v(ghost)", "i(c1)"]);
+    assert_eq!(op.value("v(out)", 0), Some(Complex::real(1.)));
+    assert!(op.variable_index("i(c2)").is_none());
+    Ok(())
+}

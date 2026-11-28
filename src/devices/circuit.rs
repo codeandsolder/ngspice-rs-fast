@@ -1448,7 +1448,8 @@ impl Circuit {
             .get(index)
             .ok_or_else(|| SpiceError::circuit("device ordinal out of bounds"))?
             .origin;
-        if !origin.internal_nodes.is_empty()
+        if origin.prepared_storage
+            || !origin.internal_nodes.is_empty()
             || origin.generated_by.is_some()
             || self
                 .devices
@@ -1458,6 +1459,12 @@ impl Circuit {
             return Err(SpiceError::circuit(
                 "replace generated or private-node devices by re-elaboration",
             ));
+        }
+        if self.is_absent_storage(device.name()) {
+            return Err(SpiceError::circuit(format!(
+                "duplicate instance name '{}'",
+                device.name()
+            )));
         }
         let mut size = self.elaboration_size()?;
         size.states = size
@@ -2767,7 +2774,7 @@ impl Circuit {
                 || names.get(device.name()).is_some(),
                 |seen| !seen.insert(device.name().to_lowercase()),
             );
-            if duplicate {
+            if duplicate || self.is_absent_storage(device.name()) {
                 return Err(SpiceError::circuit(format!(
                     "duplicate instance name '{}'",
                     device.name()

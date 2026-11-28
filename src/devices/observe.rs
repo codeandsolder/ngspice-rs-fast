@@ -80,8 +80,7 @@ fn unit(device: char, key: &str) -> &'static str {
 pub struct Observation {
     name: String,
     unit: &'static str,
-    device: Option<usize>,
-    selector: Selector,
+    target: ObservationTarget,
 }
 
 impl Observation {
@@ -99,8 +98,13 @@ impl Observation {
 }
 
 #[derive(Debug)]
-enum Selector {
+enum ObservationTarget {
     Zero,
+    Physical { device: usize, selector: Selector },
+}
+
+#[derive(Debug)]
+enum Selector {
     Current {
         load: usize,
         slot: usize,
@@ -426,15 +430,18 @@ impl PointLoads<'_, '_> {
 
     fn observe(&mut self, query: &Observation) -> SpiceResult<Real> {
         let name = query.name();
-        let Some(index) = query.device else {
+        let ObservationTarget::Physical {
+            device: index,
+            selector,
+        } = &query.target
+        else {
             return Ok(0.);
         };
-        let device = self.point.device(self.circuit, index);
+        let device = self.point.device(self.circuit, *index);
         let row_value =
             |row: Option<usize>| row.map_or(0., |row| self.request.solution.as_slice()[row]);
         let context = self.request.model_context;
-        match &query.selector {
-            Selector::Zero => Ok(0.),
+        match selector {
             Selector::Current { load, slot } => self.current(*load, *slot, name),
             Selector::Power { load, slot, rows } => {
                 let current = self.current(*load, *slot, name)? * device.observation_current_sign();
@@ -492,8 +499,7 @@ impl ObservationPlan {
                 plan.queries.push(Observation {
                     name,
                     unit,
-                    device: None,
-                    selector: Selector::Zero,
+                    target: ObservationTarget::Zero,
                 });
                 continue;
             }
@@ -557,8 +563,10 @@ impl ObservationPlan {
             plan.queries.push(Observation {
                 unit: unit(device.designator(), key),
                 name,
-                device: Some(index),
-                selector,
+                target: ObservationTarget::Physical {
+                    device: index,
+                    selector,
+                },
             });
         }
         Ok(plan)
@@ -709,11 +717,14 @@ impl Circuit {
         }
         let point = run.point(context)?;
         let ask = |query: &Observation| {
-            let Some(index) = query.device else {
+            let ObservationTarget::Physical {
+                device: index,
+                selector,
+            } = &query.target
+            else {
                 return Ok(Complex::real(0.));
             };
-            let key = match &query.selector {
-                Selector::Zero => return Ok(Complex::real(0.)),
+            let key = match selector {
                 Selector::SourceDc => "dc",
                 Selector::Parameter(key) => key,
                 Selector::Current { .. } | Selector::Power { .. } => {
@@ -721,7 +732,7 @@ impl Circuit {
                 }
             };
             let value = point
-                .device(self, index)
+                .device(self, *index)
                 .observation_parameter(key, context)?
                 .ok_or_else(|| gap(query.name()))?;
             if !value.is_finite() {
