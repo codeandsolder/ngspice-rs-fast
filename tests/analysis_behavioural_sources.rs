@@ -630,7 +630,21 @@ fn sparse_high_degree_polynomial_preserves_signed_powers_ac_and_transient() {
     for point in 0..ac.point_count() {
         close(value(&ac, "v(out)", point), derivative(-1.), 1e-12);
     }
-    let dc = run(&body, AnalysisKind::DcSweep, &["vin", "-1", "1", "0.25"]).unwrap();
+    // Qualify arithmetic independently of default Newton stopping error.
+    let dc = run(
+        &body,
+        AnalysisKind::DcSweep,
+        &[
+            "vin",
+            "-1",
+            "1",
+            "0.25",
+            "rtol=1e-10",
+            "vntol=1e-12",
+            "abstol=1e-14",
+        ],
+    )
+    .unwrap();
     for point in 0..dc.point_count() {
         close(
             value(&dc, "v(out)", point),
@@ -642,7 +656,15 @@ fn sparse_high_degree_polynomial_preserves_signed_powers_ac_and_transient() {
     let plot = run(
         &transient,
         AnalysisKind::Transient,
-        &["10u", "3m", "0", "10u"],
+        &[
+            "10u",
+            "3m",
+            "0",
+            "10u",
+            "rtol=1e-10",
+            "vntol=1e-12",
+            "abstol=1e-14",
+        ],
     )
     .unwrap();
     assert!(plot.point_count() > 200);
