@@ -1442,3 +1442,140 @@ fn behavioural_event_preserves_independent_semiconductor_charge_histories() -> S
     }
     Ok(())
 }
+
+#[test]
+fn diode_constitutive_crossings_land_and_observe_charge_current() -> SpiceResult<()> {
+    // All four constitutive crossings are interior to the source segments.
+    // The derivative input stays continuous; only the source slope reverses.
+    let body = "vdrive in 0 PWL(0 -1 4u 1 8u -1)\nd1 in 0 dm\n.model dm d(is=1e-12 n=10 cjo=20p vj=.8 m=.4 fc=.5 tlevc=1)\nb1 out 0 v=1u*ddt(v(in))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let thermal = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    let reverse = (1. - 3. * thermal) / 5e5;
+    let boundaries = [reverse, 2.8e-6, 5.2e-6, 8e-6 - reverse];
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "8u", "0", "1u", "uic", method],
+            &["@d1[i]", "@d1[p]"],
+        )?;
+        let mut seen = [false; 4];
+        for index in 0..plot.point_count() {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let time = at("time");
+            for (boundary, flag) in boundaries.into_iter().zip(&mut seen) {
+                *flag |= (time - boundary).abs() <= 1e-17;
+            }
+            let voltage = at("v(in)");
+            let current = if voltage < -3. * thermal {
+                -1e-12 * (1. + (3. * thermal / (voltage * std::f64::consts::E)).powi(3))
+            } else {
+                1e-12 * (voltage / thermal).exp_m1()
+            };
+            let cap = if voltage < 0.4 {
+                20e-12 * (1. - voltage / 0.8).powf(-0.4)
+            } else {
+                20e-12 / 0.5_f64.powf(1.4) * 0.5_f64.mul_add(voltage - 0.4, 0.5)
+            };
+            let rate = at("v(out)") / 1e-6;
+            let expected = rate.mul_add(cap, current + 1e-12 * voltage);
+            close(at("@d1[i]"), expected, 1e-13);
+            close(at("i(vdrive)"), -expected, 1e-13);
+            close(at("@d1[p]"), voltage * expected, 1e-13);
+        }
+        assert_eq!(seen, [true; 4], "{method}");
+    }
+    Ok(())
+}
+
+#[test]
+fn jfet_channel_crossings_land_in_both_directions() -> SpiceResult<()> {
+    // VGS=-1.5, VTO=-2. The direction changes at VDS=0 and the
+    // normal channel saturates at VDS=0.5. Both are crossed twice.
+    let body = "vd d 0 PWL(0 -1 5u 1.5 10u -1)\nvg g 0 -1.5\nj1 d g 0 jm\n.model jm njf(vto=-2 beta=1m lambda=0 b=1 is=1e-15 n=10)\nb1 out 0 v=1u*ddt(v(d))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let boundaries = [2e-6, 3e-6, 7e-6, 8e-6];
+    let thermal = 10. * (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "10u", "0", "1u", "uic", method],
+            &["@j1[i]"],
+        )?;
+        let mut seen = [false; 4];
+        for index in 0..plot.point_count() {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let time = at("time");
+            for (boundary, flag) in boundaries.into_iter().zip(&mut seen) {
+                *flag |= (time - boundary).abs() <= 1e-17;
+            }
+            let drain = at("v(d)");
+            let vgd = -1.5 - drain;
+            let gate_current = if vgd < -3. * thermal {
+                -1e-15 * (1. + (3. * thermal / (vgd * std::f64::consts::E)).powi(3))
+            } else {
+                1e-15 * (vgd / thermal).exp_m1()
+            } + 1e-12 * vgd;
+            let overdrive = if drain < 0. { vgd + 2. } else { 0.5 };
+            let active = drain.abs().min(overdrive);
+            let channel = 1e-3 * drain.signum() * active * (2. * overdrive - active);
+            close(at("@j1[i]"), channel - gate_current, 1e-12);
+            close(at("i(vd)"), gate_current - channel, 1e-12);
+        }
+        assert_eq!(seen, [true; 4], "{method}");
+    }
+    Ok(())
+}
+
+#[test]
+fn bjt_junction_crossings_land_with_collector_kcl() -> SpiceResult<()> {
+    let body = "vc c 0 0.4\nvb b 0 PWL(0 -0.2 4u 0.6 8u -0.2)\nq1 c b 0 qm\n.model qm npn(is=1e-15 bf=100 br=2 cje=20p vje=.8 mje=.4 cjc=30p vjc=.8 mjc=.4 fc=.5 tf=5n tr=2n)\nb1 out 0 v=1u*ddt(v(b))\nr1 out 0 1k\n.options reltol=1e-8 vntol=1n";
+    let thermal = (1.380_648_52e-23 / 1.602_176_620_8e-19) * 300.15;
+    let be_reverse = (0.2 - 3. * thermal) / 2e5;
+    let bc_reverse = (0.6 - 3. * thermal) / 2e5;
+    let boundaries = [
+        be_reverse,
+        bc_reverse,
+        3e-6,
+        5e-6,
+        8e-6 - bc_reverse,
+        8e-6 - be_reverse,
+    ];
+    for method in ["method=trap", "method=gear"] {
+        let plot = run_observed(
+            body,
+            AnalysisKind::Transient,
+            &["1u", "8u", "0", "1u", "uic", method],
+            &["@q1[i]"],
+        )?;
+        let mut seen = [false; 6];
+        for index in 0..plot.point_count() {
+            let at = |name: &str| plot.value(name, index).unwrap().re;
+            let time = at("time");
+            for (boundary, flag) in boundaries.into_iter().zip(&mut seen) {
+                *flag |= (time - boundary).abs() <= 1e-17;
+            }
+            let be = at("v(b)");
+            let bc = be - 0.4;
+            let junction = |voltage: f64| {
+                if voltage < -3. * thermal {
+                    let a = (3. * thermal / (voltage * std::f64::consts::E)).powi(3);
+                    (-1e-15 * (1. + a), 3e-15 * a / voltage)
+                } else {
+                    (
+                        1e-15 * (voltage / thermal).exp_m1(),
+                        1e-15 / thermal * (voltage / thermal).exp(),
+                    )
+                }
+            };
+            let (ibe, _) = junction(be);
+            let (ibc, gbc) = junction(bc);
+            let rate = at("v(out)") / 1e-6;
+            let cap = 30e-12 * (1. - bc / 0.8).powf(-0.4) + 2e-9 * gbc;
+            let expected = ibe - 1.5 * ibc - 1e-12 * bc + 0.4e-12 - rate * cap;
+            close(at("@q1[i]"), expected, 1e-12);
+            close(at("i(vc)"), -expected, 1e-12);
+        }
+        assert_eq!(seen, [true; 6], "{method}");
+    }
+    Ok(())
+}
