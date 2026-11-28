@@ -390,3 +390,166 @@ fn instantaneous_physical_residual_releases_all_bias_constraints() {
     close(point.charge.as_slice()[b], 0.5e-9, 1e-20);
     close(point.charge.as_slice()[lb], -3e-6, 1e-15);
 }
+
+#[test]
+fn polynomial_bias_reuses_storage_branches_and_releases_constraints() {
+    for (cap_g, ind_g) in [(None, 0.), (Some(500.), 1e-3)] {
+        let (n, config, mut c) = deck(
+            "vc a 0 dc 2 ac 1\nrc a b 10\nc1 b 0 cm 1u\n.model cm pspice_cap(vc1=0.25 vc2=0.1)\nvl d 0 dc 3 ac 1\nrl d e 10\nl1 e 0 lm 2m\n.model lm pspice_ind(il1=0.25 il2=0.1)\n.op\n.ac lin 1 1k 1k\n.dc vc 2 3 1\n.tran 10n 1u 0 10n",
+        );
+        let kinds = [
+            AnalysisKind::OperatingPoint,
+            AnalysisKind::Ac,
+            AnalysisKind::Transient,
+        ];
+        c.bind_passive_initialization(
+            "c1",
+            PassiveInitialization::new(
+                StorageKind::Capacitor,
+                Some(-1.),
+                kinds.map(|kind| (kind, voltage(-1., cap_g))),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        c.bind_passive_initialization(
+            "l1",
+            PassiveInitialization::new(
+                StorageKind::Inductor,
+                Some(-0.2),
+                kinds.map(|kind| (kind, current(-0.2, ind_g))),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        c.finalize().unwrap();
+        let initial_v = cap_g.map_or(-1., |g| (2. - 10. * g) / (1. + 10. * g));
+        let initial_i = (-0.2 + 3. * ind_g) / (1. + 10. * ind_g);
+        let plans = config.plans_for(&n.analyses).unwrap();
+        let op = plans[0].run(&mut c, &config.context()).unwrap();
+        close(last(&op, "v(b)"), initial_v, 1e-10);
+        close(last(&op, "i(c1)"), (2. - initial_v) / 10., 1e-10);
+        close(last(&op, "v(e)"), 3. - 10. * initial_i, 1e-10);
+        close(last(&op, "i(l1)"), initial_i, 1e-10);
+
+        let ac = plans[1].run(&mut c, &config.context()).unwrap();
+        let omega = std::f64::consts::TAU * 1000.;
+        let cv = 1e-6 * (1. + 0.25 * initial_v + 0.1 * initial_v * initial_v);
+        let li = 2e-3 * (1. + 0.25 * initial_i + 0.1 * initial_i * initial_i);
+        let rc = omega * 10. * cv;
+        let xl = omega * li;
+        let cap = ac.value("v(b)", 0).unwrap();
+        let ind = ac.value("i(l1)", 0).unwrap();
+        close(cap.re, (1. + rc * rc).recip(), 1e-10);
+        close(cap.im, -rc / (1. + rc * rc), 1e-10);
+        close(ind.re, 10. / (100. + xl * xl), 1e-10);
+        close(ind.im, -xl / (100. + xl * xl), 1e-10);
+
+        let dc = plans[2].run(&mut c, &config.context()).unwrap();
+        close(last(&dc, "v(b)"), 3., 1e-10);
+        close(last(&dc, "i(c1)"), 0., 1e-10);
+        close(last(&dc, "v(e)"), 0., 1e-10);
+        close(last(&dc, "i(l1)"), 0.3, 1e-10);
+        let tran = plans[3].run(&mut c, &config.context()).unwrap();
+        close(tran.value("v(b)", 0).unwrap().re, initial_v, 1e-8);
+        close(tran.value("i(l1)", 0).unwrap().re, initial_i, 1e-8);
+        assert!(last(&tran, "v(b)") > initial_v);
+        assert!(last(&tran, "i(l1)") > initial_i);
+    }
+}
+
+#[test]
+fn polynomial_uic_distinguishes_omission_zero_and_signed_coordinates() {
+    for explicit in [None, Some(0.), Some(-1.)] {
+        let (n, config, mut c) = deck(
+            "i1 0 b 1m\nc1 b 0 cm 1u\n.model cm pspice_cap(vc1=0.25)\nv1 e 0 1\nl1 e 0 lm 1m\n.model lm pspice_ind(il1=0.25)\n.ic v(b)=2\n.tran 1u 1m 0 1u uic",
+        );
+        c.bind_passive_initialization(
+            "c1",
+            PassiveInitialization::new(
+                StorageKind::Capacitor,
+                explicit,
+                [(AnalysisKind::Transient, voltage(9., None))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        c.bind_passive_initialization(
+            "l1",
+            PassiveInitialization::new(
+                StorageKind::Inductor,
+                explicit,
+                [(AnalysisKind::Transient, current(9., 0.))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        c.finalize().unwrap();
+        let p = config
+            .plan_for(&n.analyses[0])
+            .unwrap()
+            .run(&mut c, &config.context())
+            .unwrap();
+        for (name, initial) in [
+            ("v(b)", explicit.unwrap_or(2.)),
+            ("i(l1)", explicit.unwrap_or(0.)),
+        ] {
+            for index in 0..p.point_count() {
+                let t = p.value("time", index).unwrap().re;
+                let start = initial + 4.;
+                close(
+                    p.value(name, index).unwrap().re,
+                    (8000_f64.mul_add(t, start * start)).sqrt() - 4.,
+                    5e-4,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn polynomial_exact_history_is_independent_of_reported_bias() {
+    for derivative in [false, true] {
+        let body = format!(
+            "i1 0 b 1m\nc1 b 0 cm 1u\n.model cm pspice_cap(vc1=0.25)\nv1 e 0 1\nl1 e 0 lm 1m\n.model lm pspice_ind(il1=0.25)\n{}\n.tran 1u 100u 0 1u",
+            if derivative {
+                "vtime z 0 PWL(0 0 100u 1)\nb1 obs 0 v=100u*ddt(v(z))\nr1 obs 0 1k"
+            } else {
+                ""
+            },
+        );
+        let (n, config, mut c) = deck(&body);
+        for (name, kind, constraint) in [
+            ("c1", StorageKind::Capacitor, voltage(-0.5, Some(1e-3))),
+            ("l1", StorageKind::Inductor, current(-0.5, 0.1)),
+        ] {
+            c.bind_passive_initialization(
+                name,
+                PassiveInitialization::new(
+                    kind,
+                    Some(-0.5),
+                    [(AnalysisKind::Transient, constraint)],
+                )
+                .unwrap()
+                .with_exact_history()
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        c.finalize().unwrap();
+        let p = config
+            .plan_for(&n.analyses[0])
+            .unwrap()
+            .run(&mut c, &config.context())
+            .unwrap();
+        close(p.value("v(b)", 0).unwrap().re, 0.5, 1e-9);
+        close(p.value("i(l1)", 0).unwrap().re, -0.4, 1e-9);
+        assert!(p.point_count() > 5);
+        for index in 1..p.point_count() {
+            let time = p.value("time", index).unwrap().re;
+            let expected = 8000_f64.mul_add(time, 12.25).sqrt() - 4.;
+            close(p.value("v(b)", index).unwrap().re, expected, 5e-5);
+            close(p.value("i(l1)", index).unwrap().re, expected, 5e-5);
+        }
+    }
+}
