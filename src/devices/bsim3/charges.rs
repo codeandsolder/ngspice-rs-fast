@@ -375,6 +375,7 @@ impl ChargeModel<'_> {
             &abulk_cv,
             &cox_wl_cen,
             m.values.xpart.value,
+            1e-20,
         )?;
         let chain = ChargeChain {
             overdrive: [dvgsteff_dvg, dvgsteff_dvd, dvgsteff_dvb].map(|slope| dvgdp_dvg * slope),

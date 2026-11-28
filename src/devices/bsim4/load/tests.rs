@@ -809,8 +809,8 @@ fn junction_current_and_charge_keep_asymmetric_tiny_bias_terms() {
             source: voltage,
             drain: -voltage,
         };
-        current(m, h, p, &trace, bias);
-        charge(m, h, p, &mut trace, bias);
+        current(m, h, p, &trace, bias).unwrap();
+        charge(m, h, p, &mut trace, bias).unwrap();
         assert!((h.cbs / (source_slope * voltage) - 1.).abs() < 16. * f64::EPSILON);
         assert!((h.cbd / (-drain_slope * voltage) - 1.).abs() < 16. * f64::EPSILON);
         assert!((h.gbs / source_slope - 1.).abs() < 16. * f64::EPSILON);

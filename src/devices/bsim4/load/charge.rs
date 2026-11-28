@@ -48,7 +48,9 @@ use super::{
     bias::LoadBias,
     channel::{Electrostatics, Transport},
 };
-use crate::devices::bsim_physics::{ChargeChain, channel_inversion, charge_overdrive};
+use crate::devices::bsim_physics::{
+    CapZeroBias, CapZeroParameters, ChargeChain, cap_zero, channel_inversion, charge_overdrive,
+};
 use crate::primitives::SpiceResult;
 
 /// Intrinsic terminal charges before extrinsic overlap and junction assembly.
@@ -78,12 +80,12 @@ pub(super) fn intrinsic(
         Vbseff,
         Vds,
         Vgs_eff,
-        mut Vgst,
+        Vgst,
         Vtm,
         dPhis_dVb,
         dVbseff_dVb,
         dVgs_eff_dVg,
-        mut dVth_dVb,
+        dVth_dVb,
         dVth_dVd,
         dn_dVb,
         dn_dVd,
@@ -99,7 +101,6 @@ pub(super) fn intrinsic(
         ..
     } = transport;
     let mut Coxeff: f64;
-    let mut Vth: f64;
     let mut Vgsteff: f64;
     let mut dVgsteff_dVb: f64;
     let mut dVgsteff_dVd: f64;
@@ -117,8 +118,6 @@ pub(super) fn intrinsic(
     let mut qdrn: f64 = 0.0;
     let mut qsrc: f64;
     let mut Vfb: f64;
-    let mut dVgst_dVg: f64;
-    let mut dVgst_dVb: f64;
     let mut voffcv: f64;
     let mut noff: f64;
     let mut dnoff_dVd: f64;
@@ -138,32 +137,17 @@ pub(super) fn intrinsic(
     let mut dCoxeff_dVd: f64;
     let mut dCoxeff_dVg: f64;
     let mut dCoxeff_dVb: f64;
-    let mut Vdsat: f64;
-    let mut dVdsat_dVg: f64;
-    let mut dVdsat_dVb: f64;
-    let mut dAlphaz_dVg: f64;
-    let mut dAlphaz_dVb: f64;
     let mut VbseffCV: f64;
     let mut dVbseffCV_dVb: f64;
-    let mut Arg1: f64;
-    let mut One_Third_CoxWL: f64;
-    let mut Two_Third_CoxWL: f64;
-    let mut Alphaz: f64;
     let mut CoxWL: f64;
     let mut T0: f64;
     let mut dT0_dVg: f64;
     let mut dT0_dVb: f64;
     let mut T1: f64;
-    let mut dT1_dVg: f64;
-    let mut dT1_dVd: f64;
-    let mut dT1_dVb: f64;
     let mut T2: f64;
     let mut T3: f64;
     let mut T4: f64;
     let mut T5: f64;
-    let mut T6: f64;
-    let mut T7: f64;
-    let mut T8: f64;
     let mut T9: f64;
     let mut dT9_dVg: f64;
     let mut dT9_dVd: f64;
@@ -172,10 +156,7 @@ pub(super) fn intrinsic(
     let mut dT10_dVg: f64;
     let mut dT10_dVb: f64;
     let mut dT10_dVd: f64;
-    let mut T11: f64;
-    let mut T12: f64;
     let mut tmp: f64;
-    let mut tmp1: f64;
     let mut VdseffCV: f64;
     let mut dVdseffCV_dVg: f64;
     let mut dVdseffCV_dVd: f64;
@@ -245,216 +226,44 @@ pub(super) fn intrinsic(
             VbseffCV = pParam.phi - Phis;
             dVbseffCV_dVb = -dPhis_dVb * dVbseff_dVb;
         }
-        Vfb = pParam.vfbcv;
-        Vth = Vfb + pParam.phi + pParam.k1ox * sqrtPhis;
-        Vgst = Vgs_eff - Vth;
-        dVth_dVb = pParam.k1ox * dsqrtPhis_dVb * dVbseff_dVb;
-        dVgst_dVb = -dVth_dVb;
-        dVgst_dVg = dVgs_eff_dVg;
-        CoxWL = model.coxe * pParam.weffCV * pParam.leffCV * here.nf;
-        Arg1 = Vgs_eff - VbseffCV - Vfb;
-        if Arg1 <= 0.0 {
-            qgate = CoxWL * Arg1;
-            qbulk = -qgate;
-            qdrn = 0.0;
-            here.cggb = CoxWL * dVgs_eff_dVg;
-            here.cgdb = 0.0;
-            here.cgsb = CoxWL * (dVbseffCV_dVb - dVgs_eff_dVg);
-            here.cdgb = 0.0;
-            here.cddb = 0.0;
-            here.cdsb = 0.0;
-            here.cbgb = -CoxWL * dVgs_eff_dVg;
-            here.cbdb = 0.0;
-            here.cbsb = -here.cgsb;
-        } else if Vgst <= 0.0 {
-            let (charge, slope) = depletion_charge(pParam.k1ox, Arg1)?;
-            qgate = CoxWL * charge;
-            qbulk = -qgate;
-            qdrn = 0.0;
-            T0 = CoxWL * slope;
-            here.cggb = T0 * dVgs_eff_dVg;
-            here.cgdb = 0.0;
-            here.cgsb = T0 * (dVbseffCV_dVb - dVgs_eff_dVg);
-            here.cdgb = 0.0;
-            here.cddb = 0.0;
-            here.cdsb = 0.0;
-            here.cbgb = -here.cggb;
-            here.cbdb = 0.0;
-            here.cbsb = -here.cgsb;
-        } else {
-            One_Third_CoxWL = CoxWL / 3.0;
-            Two_Third_CoxWL = 2.0 * One_Third_CoxWL;
-            AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
-            dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb * dVbseff_dVb;
-            dVdsat_dVg = 1.0 / AbulkCV;
-            Vdsat = Vgst * dVdsat_dVg;
-            dVdsat_dVb = -(Vdsat * dAbulkCV_dVb + dVth_dVb) * dVdsat_dVg;
-            if model.xpart > 0.5 {
-                if Vdsat <= Vds {
-                    T1 = Vdsat / 3.0;
-                    qgate = CoxWL * (Vgs_eff - Vfb - pParam.phi - T1);
-                    T2 = -Two_Third_CoxWL * Vgst;
-                    qbulk = -(qgate + T2);
-                    qdrn = 0.0;
-                    here.cggb = One_Third_CoxWL * (3.0 - dVdsat_dVg) * dVgs_eff_dVg;
-                    T2 = -One_Third_CoxWL * dVdsat_dVb;
-                    here.cgsb = -(here.cggb + T2);
-                    here.cgdb = 0.0;
-                    here.cdgb = 0.0;
-                    here.cddb = 0.0;
-                    here.cdsb = 0.0;
-                    here.cbgb = -(here.cggb - Two_Third_CoxWL * dVgs_eff_dVg);
-                    T3 = -(T2 + Two_Third_CoxWL * dVth_dVb);
-                    here.cbsb = -(here.cbgb + T3);
-                    here.cbdb = 0.0;
-                } else {
-                    Alphaz = Vgst / Vdsat;
-                    T1 = 2.0 * Vdsat - Vds;
-                    T2 = Vds / (3.0 * T1);
-                    T3 = T2 * Vds;
-                    T9 = 0.25 * CoxWL;
-                    T4 = T9 * Alphaz;
-                    T7 = 2.0 * Vds - T1 - 3.0 * T3;
-                    T8 = T3 - T1 - 2.0 * Vds;
-                    qgate = CoxWL * (Vgs_eff - Vfb - pParam.phi - 0.5 * (Vds - T3));
-                    T10 = T4 * T8;
-                    qdrn = T4 * T7;
-                    qbulk = -(qgate + qdrn + T10);
-                    T5 = T3 / T1;
-                    here.cggb = CoxWL * (1.0 - T5 * dVdsat_dVg) * dVgs_eff_dVg;
-                    T11 = -CoxWL * T5 * dVdsat_dVb;
-                    here.cgdb = CoxWL * (T2 - 0.5 + 0.5 * T5);
-                    here.cgsb = -(here.cggb + T11 + here.cgdb);
-                    T6 = 1.0 / Vdsat;
-                    dAlphaz_dVg = T6 * (1.0 - Alphaz * dVdsat_dVg);
-                    dAlphaz_dVb = -T6 * (dVth_dVb + Alphaz * dVdsat_dVb);
-                    T7 = T9 * T7;
-                    T8 = T9 * T8;
-                    T9 = 2.0 * T4 * (1.0 - 3.0 * T5);
-                    here.cdgb = (T7 * dAlphaz_dVg - T9 * dVdsat_dVg) * dVgs_eff_dVg;
-                    T12 = T7 * dAlphaz_dVb - T9 * dVdsat_dVb;
-                    here.cddb = T4 * (3.0 - 6.0 * T2 - 3.0 * T5);
-                    here.cdsb = -(here.cdgb + T12 + here.cddb);
-                    T9 = 2.0 * T4 * (1.0 + T5);
-                    T10 = (T8 * dAlphaz_dVg - T9 * dVdsat_dVg) * dVgs_eff_dVg;
-                    T11 = T8 * dAlphaz_dVb - T9 * dVdsat_dVb;
-                    T12 = T4 * (2.0 * T2 + T5 - 1.0);
-                    T0 = -(T10 + T11 + T12);
-                    here.cbgb = -(here.cggb + here.cdgb + T10);
-                    here.cbdb = -(here.cgdb + here.cddb + T12);
-                    here.cbsb = -(here.cgsb + here.cdsb + T0);
-                }
-            } else if model.xpart < 0.5 {
-                if Vds >= Vdsat {
-                    T1 = Vdsat / 3.0;
-                    qgate = CoxWL * (Vgs_eff - Vfb - pParam.phi - T1);
-                    T2 = -Two_Third_CoxWL * Vgst;
-                    qbulk = -(qgate + T2);
-                    qdrn = 0.4 * T2;
-                    here.cggb = One_Third_CoxWL * (3.0 - dVdsat_dVg) * dVgs_eff_dVg;
-                    T2 = -One_Third_CoxWL * dVdsat_dVb;
-                    here.cgsb = -(here.cggb + T2);
-                    here.cgdb = 0.0;
-                    T3 = 0.4 * Two_Third_CoxWL;
-                    here.cdgb = -T3 * dVgs_eff_dVg;
-                    here.cddb = 0.0;
-                    T4 = T3 * dVth_dVb;
-                    here.cdsb = -(T4 + here.cdgb);
-                    here.cbgb = -(here.cggb - Two_Third_CoxWL * dVgs_eff_dVg);
-                    T3 = -(T2 + Two_Third_CoxWL * dVth_dVb);
-                    here.cbsb = -(here.cbgb + T3);
-                    here.cbdb = 0.0;
-                } else {
-                    Alphaz = Vgst / Vdsat;
-                    T1 = 2.0 * Vdsat - Vds;
-                    T2 = Vds / (3.0 * T1);
-                    T3 = T2 * Vds;
-                    T9 = 0.25 * CoxWL;
-                    T4 = T9 * Alphaz;
-                    qgate = CoxWL * (Vgs_eff - Vfb - pParam.phi - 0.5 * (Vds - T3));
-                    T5 = T3 / T1;
-                    here.cggb = CoxWL * (1.0 - T5 * dVdsat_dVg) * dVgs_eff_dVg;
-                    tmp = -CoxWL * T5 * dVdsat_dVb;
-                    here.cgdb = CoxWL * (T2 - 0.5 + 0.5 * T5);
-                    here.cgsb = -(here.cggb + here.cgdb + tmp);
-                    T6 = 1.0 / Vdsat;
-                    dAlphaz_dVg = T6 * (1.0 - Alphaz * dVdsat_dVg);
-                    dAlphaz_dVb = -T6 * (dVth_dVb + Alphaz * dVdsat_dVb);
-                    T6 = 8.0 * Vdsat * Vdsat - 6.0 * Vdsat * Vds + 1.2 * Vds * Vds;
-                    T8 = T2 / T1;
-                    T7 = Vds - T1 - T8 * T6;
-                    qdrn = T4 * T7;
-                    T7 *= T9;
-                    tmp = T8 / T1;
-                    tmp1 = T4 * (2.0 - 4.0 * tmp * T6 + T8 * (16.0 * Vdsat - 6.0 * Vds));
-                    here.cdgb = (T7 * dAlphaz_dVg - tmp1 * dVdsat_dVg) * dVgs_eff_dVg;
-                    T10 = T7 * dAlphaz_dVb - tmp1 * dVdsat_dVb;
-                    here.cddb = T4
-                        * (2.0 - (1.0 / (3.0 * T1 * T1) + 2.0 * tmp) * T6
-                            + T8 * (6.0 * Vdsat - 2.4 * Vds));
-                    here.cdsb = -(here.cdgb + T10 + here.cddb);
-                    T7 = 2.0 * (T1 + T3);
-                    qbulk = -(qgate - T4 * T7);
-                    T7 *= T9;
-                    T0 = 4.0 * T4 * (1.0 - T5);
-                    T12 = (-T7 * dAlphaz_dVg - T0 * dVdsat_dVg) * dVgs_eff_dVg - here.cdgb;
-                    T11 = -T7 * dAlphaz_dVb - T10 - T0 * dVdsat_dVb;
-                    T10 = -4.0 * T4 * (T2 - 0.5 + 0.5 * T5) - here.cddb;
-                    tmp = -(T10 + T11 + T12);
-                    here.cbgb = -(here.cggb + here.cdgb + T12);
-                    here.cbdb = -(here.cgdb + here.cddb + T10);
-                    here.cbsb = -(here.cgsb + here.cdsb + tmp);
-                }
-            } else {
-                if Vds >= Vdsat {
-                    T1 = Vdsat / 3.0;
-                    qgate = CoxWL * (Vgs_eff - Vfb - pParam.phi - T1);
-                    T2 = -Two_Third_CoxWL * Vgst;
-                    qbulk = -(qgate + T2);
-                    qdrn = 0.5 * T2;
-                    here.cggb = One_Third_CoxWL * (3.0 - dVdsat_dVg) * dVgs_eff_dVg;
-                    T2 = -One_Third_CoxWL * dVdsat_dVb;
-                    here.cgsb = -(here.cggb + T2);
-                    here.cgdb = 0.0;
-                    here.cdgb = -One_Third_CoxWL * dVgs_eff_dVg;
-                    here.cddb = 0.0;
-                    T4 = One_Third_CoxWL * dVth_dVb;
-                    here.cdsb = -(T4 + here.cdgb);
-                    here.cbgb = -(here.cggb - Two_Third_CoxWL * dVgs_eff_dVg);
-                    T3 = -(T2 + Two_Third_CoxWL * dVth_dVb);
-                    here.cbsb = -(here.cbgb + T3);
-                    here.cbdb = 0.0;
-                } else {
-                    Alphaz = Vgst / Vdsat;
-                    T1 = 2.0 * Vdsat - Vds;
-                    T2 = Vds / (3.0 * T1);
-                    T3 = T2 * Vds;
-                    T9 = 0.25 * CoxWL;
-                    T4 = T9 * Alphaz;
-                    qgate = CoxWL * (Vgs_eff - Vfb - pParam.phi - 0.5 * (Vds - T3));
-                    T5 = T3 / T1;
-                    here.cggb = CoxWL * (1.0 - T5 * dVdsat_dVg) * dVgs_eff_dVg;
-                    tmp = -CoxWL * T5 * dVdsat_dVb;
-                    here.cgdb = CoxWL * (T2 - 0.5 + 0.5 * T5);
-                    here.cgsb = -(here.cggb + here.cgdb + tmp);
-                    T6 = 1.0 / Vdsat;
-                    dAlphaz_dVg = T6 * (1.0 - Alphaz * dVdsat_dVg);
-                    dAlphaz_dVb = -T6 * (dVth_dVb + Alphaz * dVdsat_dVb);
-                    T7 = T1 + T3;
-                    qdrn = -T4 * T7;
-                    qbulk = -(qgate + qdrn + qdrn);
-                    T7 *= T9;
-                    T0 = T4 * (2.0 * T5 - 2.0);
-                    here.cdgb = (T0 * dVdsat_dVg - T7 * dAlphaz_dVg) * dVgs_eff_dVg;
-                    T12 = T0 * dVdsat_dVb - T7 * dAlphaz_dVb;
-                    here.cddb = T4 * (1.0 - 2.0 * T2 - T5);
-                    here.cdsb = -(here.cdgb + T12 + here.cddb);
-                    here.cbgb = -(here.cggb + 2.0 * here.cdgb);
-                    here.cbdb = -(here.cgdb + 2.0 * here.cddb);
-                    here.cbsb = -(here.cgsb + 2.0 * here.cdsb);
-                }
-            }
-        }
+        let [gate, bulk, drain] = cap_zero(
+            &CapZeroBias {
+                gate: Vgs_eff,
+                body_cv: VbseffCV,
+                surface: pParam.k1ox * sqrtPhis,
+                drain: Vds,
+                bulk_factor: Abulk0_Q * pParam.abulkCVfactor,
+            },
+            CapZeroParameters {
+                flatband: pParam.vfbcv,
+                phi: pParam.phi,
+                body_effect: pParam.k1ox,
+                oxide_area: model.coxe * pParam.weffCV * pParam.leffCV * here.nf,
+                partition: model.xpart,
+            },
+        )?;
+        let coordinates = [
+            [dVgs_eff_dVg, 0., 0.],
+            [0., 0., dVbseffCV_dVb],
+            [0., 0., pParam.k1ox * dsqrtPhis_dVb * dVbseff_dVb],
+            [0., 1., 0.],
+            [0., 0., pParam.abulkCVfactor * dAbulk0_Q_dVb * dVbseff_dVb],
+        ];
+        let [gg, gd, gb] = gate.project(&coordinates);
+        let [bg, bd, bb] = bulk.project(&coordinates);
+        let [dg, dd, db] = drain.project(&coordinates);
+        qgate = gate.value;
+        qbulk = bulk.value;
+        qdrn = drain.value;
+        here.cggb = gg;
+        here.cgdb = gd;
+        here.cgsb = -(gg + gd + gb);
+        here.cbgb = bg;
+        here.cbdb = bd;
+        here.cbsb = -(bg + bd + bb);
+        here.cdgb = dg;
+        here.cddb = dd;
+        here.cdsb = -(dg + dd + db);
     } else {
         if Vbseff < 0.0 {
             VbseffCV = Vbseff;
@@ -573,7 +382,7 @@ pub(super) fn intrinsic(
             dVdseffCV_dVd = smoothing.drain_partial;
             dVdseffCV_dVb = -smoothing.saturation_partial * VdsatCV * dAbulkCV_dVb / AbulkCV;
             let [inversion, bulk, source] =
-                channel_inversion(&Vgsteff, &VdseffCV, &AbulkCV, &CoxWL, model.xpart)?;
+                channel_inversion(&Vgsteff, &VdseffCV, &AbulkCV, &CoxWL, model.xpart, 1e-20)?;
             let chain = ChargeChain {
                 overdrive: [dVgsteff_dVg, dVgsteff_dVd, dVgsteff_dVb],
                 drain: [
@@ -697,7 +506,7 @@ pub(super) fn intrinsic(
             dVdseffCV_dVd = smoothing.drain_partial;
             dVdseffCV_dVb = -smoothing.saturation_partial * VdsatCV * dAbulkCV_dVb / AbulkCV;
             let [inversion, bulk, source] =
-                channel_inversion(&VgDP, &VdseffCV, &AbulkCV, &CoxWLcen, model.xpart)?;
+                channel_inversion(&VgDP, &VdseffCV, &AbulkCV, &CoxWLcen, model.xpart, 1e-20)?;
             let chain = ChargeChain {
                 overdrive: [dVgsteff_dVg, dVgsteff_dVd, dVgsteff_dVb]
                     .map(|slope| slope * dVgDP_dVg),

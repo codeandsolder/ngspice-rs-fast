@@ -354,9 +354,9 @@ pub(super) fn depletion_charge<S: Constitutive>(k1: Real, increment: S) -> Spice
 
 /// A charge value and its local partials in the (overdrive, effective
 /// drain voltage, bulk factor) coordinates. All include oxide area.
-pub(super) struct ChargePart<S> {
+pub(super) struct ChargePart<S, const N: usize = 3> {
     pub(super) value: S,
-    partials: [S; 3],
+    partials: [S; N],
 }
 
 /// The scalar load's existing local-coordinate derivatives. Oxide area
@@ -393,17 +393,17 @@ pub(super) fn channel_inversion<S: Constitutive>(
     bulk: &S,
     oxide_area: &S,
     partition: Real,
+    regularization: Real,
 ) -> SpiceResult<[ChargePart<S>; 3]> {
-    const REGULARIZATION: Real = 1e-20;
     let one = overdrive.constant(1.);
     let weighted_drain = bulk.clone().multiply(drain);
     let width = weighted_drain
         .clone()
         .scale(-0.5)
         .add(overdrive)
-        .offset(REGULARIZATION);
+        .offset(regularization);
     let ratio = weighted_drain.clone().divide(&width)?;
-    let normalized_sum = overdrive.clone().offset(REGULARIZATION).divide(&width)?;
+    let normalized_sum = overdrive.clone().offset(regularization).divide(&width)?;
     let fraction = ratio.clone().scale(1. / 12.);
     let edge = fraction.clone().scale(-1.).offset(0.5);
     // weighted_drain * d(fraction)/d(weighted_drain).
@@ -477,6 +477,217 @@ pub(super) fn channel_inversion<S: Constitutive>(
         source_weighted_partial.multiply(drain),
     );
     Ok([inversion, bulk_charge, source])
+}
+
+/// Independent local coordinates of the abrupt charge model, in the
+/// reference source-oriented frame. The surface term is k1ox*sqrt(phi_s).
+pub(super) struct CapZeroBias<S> {
+    pub(super) gate: S,
+    pub(super) body_cv: S,
+    pub(super) surface: S,
+    pub(super) drain: S,
+    pub(super) bulk_factor: S,
+}
+
+/// Prepared, bias-independent parameters of the abrupt C-V model.
+#[derive(Clone, Copy)]
+pub(super) struct CapZeroParameters {
+    pub(super) flatband: Real,
+    pub(super) phi: Real,
+    pub(super) body_effect: Real,
+    pub(super) oxide_area: Real,
+    pub(super) partition: Real,
+}
+
+impl<S: Constitutive, const N: usize> ChargePart<S, N> {
+    fn scaled(&self, factor: Real) -> Self {
+        Self {
+            value: self.value.clone().scale(factor),
+            partials: self.partials.clone().map(|partial| partial.scale(factor)),
+        }
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        Self {
+            value: self.value.clone().add(&other.value),
+            partials: std::array::from_fn(|i| self.partials[i].clone().add(&other.partials[i])),
+        }
+    }
+}
+
+impl<const N: usize> ChargePart<Real, N> {
+    /// Project the independent constitutive partials onto terminal biases.
+    pub(super) fn project(&self, coordinates: &[[Real; 3]; N]) -> [Real; 3] {
+        std::array::from_fn(|column| {
+            self.partials
+                .iter()
+                .zip(coordinates)
+                .fold(0., |sum, (&partial, direction)| {
+                    partial.mul_add(direction[column], sum)
+                })
+        })
+    }
+}
+
+/// BSIM4 capMod=0: accumulation, depletion, inversion in the linear
+/// region, and saturated inversion. The latter is the exact endpoint of
+/// the same Ward-Dutton law, with no numerical 1e-20 regularization.
+/// Returns gate, bulk and drain charges and all five local partials.
+pub(super) fn cap_zero<S: Constitutive>(
+    bias: &CapZeroBias<S>,
+    parameters: CapZeroParameters,
+) -> SpiceResult<[ChargePart<S, 5>; 3]> {
+    let CapZeroParameters {
+        flatband,
+        phi,
+        body_effect,
+        oxide_area,
+        partition,
+    } = parameters;
+    let zero = bias.gate.constant(0.);
+    let accumulation = bias
+        .gate
+        .clone()
+        .add(&bias.body_cv.clone().scale(-1.))
+        .offset(-flatband);
+    let overdrive = bias
+        .gate
+        .clone()
+        .add(&bias.surface.clone().offset(phi + flatband).scale(-1.));
+    let accumulating = accumulation
+        .compare(0.)
+        .is_some_and(|order| order != Ordering::Greater);
+    if accumulating
+        || overdrive
+            .compare(0.)
+            .is_some_and(|order| order != Ordering::Greater)
+    {
+        let (charge, slope) = if accumulating {
+            (accumulation, bias.gate.constant(1.))
+        } else {
+            depletion_charge(body_effect, accumulation)?
+        };
+        let gate = ChargePart {
+            value: charge.scale(oxide_area),
+            partials: [
+                slope.clone().scale(oxide_area),
+                slope.scale(-oxide_area),
+                zero.clone(),
+                zero.clone(),
+                zero.clone(),
+            ],
+        };
+        let bulk = gate.scaled(-1.);
+        let drain = ChargePart {
+            value: zero.clone(),
+            partials: std::array::from_fn(|_| zero.clone()),
+        };
+        return Ok([gate, bulk, drain]);
+    }
+
+    let saturation = overdrive.clone().divide(&bias.bulk_factor)?;
+    if bias
+        .drain
+        .clone()
+        .add(&saturation.clone().scale(-1.))
+        .compare(0.)
+        != Some(Ordering::Less)
+    {
+        return cap_zero_saturation(bias, parameters, &overdrive, &saturation);
+    }
+
+    let [inversion, bulk, source] = channel_inversion(
+        &overdrive,
+        &bias.drain,
+        &bias.bulk_factor,
+        &bias.gate.constant(oxide_area),
+        partition,
+        0.,
+    )?;
+    let project = |part: ChargePart<S>| {
+        let [gate, drain, factor] = part.partials;
+        let surface = gate.clone().scale(-1.);
+        ChargePart {
+            value: part.value,
+            partials: [gate, zero.clone(), surface, drain, factor],
+        }
+    };
+    let inversion = project(inversion);
+    let bulk = project(bulk);
+    let source = project(source);
+    let surface = ChargePart {
+        value: bias.surface.clone().scale(oxide_area),
+        partials: [
+            zero.clone(),
+            zero.clone(),
+            bias.gate.constant(oxide_area),
+            zero.clone(),
+            zero,
+        ],
+    };
+    let bulk = bulk.add(&surface.scaled(-1.));
+    let gate = inversion.add(&bulk.scaled(-1.));
+    let drain = inversion.add(&source).scaled(-1.);
+    Ok([gate, bulk, drain])
+}
+
+/// The saturation endpoint is evaluated directly: the 0/100 drain
+/// charge and its derivatives are identically zero, not a subtraction
+/// between nearly equal inversion and source charges.
+fn cap_zero_saturation<S: Constitutive>(
+    bias: &CapZeroBias<S>,
+    parameters: CapZeroParameters,
+    overdrive: &S,
+    saturation: &S,
+) -> SpiceResult<[ChargePart<S, 5>; 3]> {
+    let CapZeroParameters {
+        flatband,
+        phi,
+        oxide_area,
+        partition,
+        ..
+    } = parameters;
+    let zero = bias.gate.constant(0.);
+    let third = oxide_area / 3.;
+    let two_thirds = 2. * third;
+    let saturation_slope = bias.gate.constant(third).divide(&bias.bulk_factor)?;
+    let gate = ChargePart {
+        value: saturation.clone().scale(-third).add(
+            &bias
+                .gate
+                .clone()
+                .offset(-flatband)
+                .offset(-phi)
+                .scale(oxide_area),
+        ),
+        partials: [
+            saturation_slope.clone().scale(-1.).offset(oxide_area),
+            zero.clone(),
+            saturation_slope.clone(),
+            zero.clone(),
+            saturation_slope.multiply(saturation),
+        ],
+    };
+    let inversion = ChargePart {
+        value: overdrive.clone().scale(two_thirds),
+        partials: [
+            bias.gate.constant(two_thirds),
+            zero.clone(),
+            bias.gate.constant(-two_thirds),
+            zero.clone(),
+            zero,
+        ],
+    };
+    let bulk = inversion.add(&gate.scaled(-1.));
+    let drain_fraction = if partition > 0.5 {
+        0.
+    } else if partition < 0.5 {
+        0.4
+    } else {
+        0.5
+    };
+    let drain = inversion.scaled(-drain_fraction);
+    Ok([gate, bulk, drain])
 }
 
 /// Evaluate the Ward-Dutton polynomial and its overdrive/weighted-drain partials.
@@ -652,6 +863,116 @@ mod tests {
         }
     }
 
+    fn cap_zero_reference(point: [Real; 5], p: CapZeroParameters) -> [Real; 3] {
+        let [gate, body, surface, drain, bulk] = point;
+        let argument = gate - body - p.flatband;
+        let overdrive = gate - (p.flatband + p.phi + surface);
+        let area = p.oxide_area;
+        if argument <= 0. {
+            let charge = area * argument;
+            return [charge, -charge, 0.];
+        }
+        if overdrive <= 0. {
+            let half = p.body_effect * 0.5;
+            let charge = area * p.body_effect * (half.mul_add(half, argument).sqrt() - half);
+            return [charge, -charge, 0.];
+        }
+        let saturation = overdrive / bulk;
+        if drain >= saturation {
+            let gate_charge = area * (gate - p.flatband - p.phi - saturation / 3.);
+            let inversion = 2. * area / 3. * overdrive;
+            let fraction = if p.partition > 0.5 {
+                0.
+            } else if p.partition < 0.5 {
+                0.4
+            } else {
+                0.5
+            };
+            return [gate_charge, inversion - gate_charge, -inversion * fraction];
+        }
+        // Direct C capMod=0 linear-region formula; it computes the drain
+        // partition rather than the complementary source partition.
+        let sum = 2.0f64.mul_add(saturation, -drain);
+        let ratio = drain / (3. * sum);
+        let correction = ratio * drain;
+        let factor = 0.25 * area * bulk;
+        let gate_charge = area * (-0.5_f64).mul_add(drain - correction, gate - p.flatband - p.phi);
+        let drain_charge = if p.partition > 0.5 {
+            factor * (-3.0_f64).mul_add(correction, 2.0f64.mul_add(drain, -sum))
+        } else if p.partition < 0.5 {
+            let polynomial = (8. * saturation).mul_add(
+                saturation,
+                (-6. * saturation).mul_add(drain, 1.2 * drain * drain),
+            );
+            factor * (ratio / sum).mul_add(-polynomial, drain - sum)
+        } else {
+            -factor * (sum + correction)
+        };
+        let inversion = 2. * factor * (sum + correction);
+        [gate_charge, inversion - gate_charge, drain_charge]
+    }
+
+    #[test]
+    fn abrupt_cv_matches_reference_regions_and_all_local_jacobian_germs() -> SpiceResult<()> {
+        type Local = Differential<5>;
+        for partition in [0., 0.5, 1.] {
+            let parameters = CapZeroParameters {
+                flatband: -0.5,
+                phi: 0.5,
+                body_effect: 0.75,
+                oxide_area: 2e-12,
+                partition,
+            };
+            for point in [
+                [-0.5, 0.25, 0.375, 0.1, 1.],
+                [-0.25, 0.25, 0.375, 0.1, 1.],
+                [-0.125, 0.25, 0.375, 0.1, 1.],
+                [0.375, 0.25, 0.375, 0.1, 1.],
+                [0.875, 0.25, 0.375, 0., 1.],
+                [0.875, 0.25, 0.375, 0.2, 1.25],
+                [0.875, 0.25, 0.375, 0.5, 1.],
+                [0.875, 0.25, 0.375, 0.7, 1.25],
+            ] {
+                for direction in [-1., 1.] {
+                    let rates = [0.02, 0.003, -0.002, 0.04, 0.004].map(|v| v * direction);
+                    let law = |index: usize| {
+                        Local::variable(index, Jet::affine(ORDER, point[index], rates[index]))
+                    };
+                    let charges = cap_zero(
+                        &CapZeroBias {
+                            gate: law(0)?,
+                            body_cv: law(1)?,
+                            surface: law(2)?,
+                            drain: law(3)?,
+                            bulk_factor: law(4)?,
+                        },
+                        parameters,
+                    )?;
+                    for part in &charges {
+                        for (coordinate, partial) in part.partials.iter().enumerate() {
+                            for (degree, &expected) in
+                                partial.value.coefficients().iter().enumerate()
+                            {
+                                let actual = part.value.gradient[coordinate]
+                                    .as_ref()
+                                    .map_or(0., |g| g.coefficients()[degree]);
+                                close(actual, expected, 3e-25);
+                            }
+                        }
+                    }
+                    for time in [0., 1e-3, 0.025] {
+                        let sample = std::array::from_fn(|i| rates[i].mul_add(time, point[i]));
+                        let expected = cap_zero_reference(sample, parameters);
+                        for (charge, reference) in charges.iter().zip(expected) {
+                            close(value_at(&charge.value.value, time), reference, 3e-25);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn rational_continuations_match_reference_and_one_sided_partials() -> SpiceResult<()> {
         // Original C rational factors, parameterized here only to share
@@ -666,7 +987,8 @@ mod tests {
         ] {
             let reference = |x: Real| {
                 if x < join {
-                    (numerator[1] * x + numerator[0]) / (denominator[1] * x + denominator[0])
+                    f64::mul_add(numerator[1], x, numerator[0])
+                        / f64::mul_add(denominator[1], x, denominator[0])
                 } else {
                     x + offset
                 }
@@ -858,6 +1180,7 @@ mod tests {
                     &Local::variable(2, Jet::affine(ORDER, a, rates[2]))?,
                     &Local::variable(3, Jet::affine(ORDER, c, rates[3]))?,
                     partition,
+                    1e-20,
                 )?;
                 for law in &laws {
                     for (coordinate, partial) in law.partials.iter().enumerate() {
