@@ -67,6 +67,10 @@ impl DenseIndex {
         hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         hash ^= hash >> 31;
         let mask = self.slots.len() - 1;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the bitwise mask originates from usize, so the masked hash fits usize on every supported pointer width"
+        )]
         let mut slot = (hash & mask as u64) as usize;
         loop {
             let handle = self.slots[slot];
@@ -127,7 +131,7 @@ impl DenseIndex {
     }
 }
 
-fn handle_index(handle: u32) -> usize {
+const fn handle_index(handle: u32) -> usize {
     (handle - 1) as usize
 }
 
@@ -289,7 +293,7 @@ struct RowChain<'a> {
 }
 
 impl<'a> RowChain<'a> {
-    fn new(next: u32, links: &'a [u32]) -> Self {
+    const fn new(next: u32, links: &'a [u32]) -> Self {
         Self { next, links }
     }
 }
