@@ -480,7 +480,7 @@ fn conditional_voltage_capacitance_depends_on_expanded_electrical_consumers() ->
     for index in 1..=7 {
         writeln!(
             deck,
-            "v{index} out{index} 0 ac 1 pn_rseries=2 pn_cconditional=1u pn_control=1"
+            "v{index} out{index} 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1"
         )
         .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
         writeln!(deck, "r{index} out{index} 0 3")
@@ -509,7 +509,7 @@ fn conditional_voltage_capacitance_depends_on_expanded_electrical_consumers() ->
 #[test]
 fn conditional_voltage_capacitance_is_selected_per_subcircuit_occurrence() -> SpiceResult<()> {
     let mut circuit = circuit(
-        "conditional source occurrences\nx1 a cell\nx2 b cell\n.subckt cell p\nv1 p 0 ac 1 pn_rseries=2 pn_cconditional=1u pn_control=1\nr1 p 0 3\n.ends\nb1 sense 0 v=i(v.x1.v1)\n.save i(v.x2.v1)\n.end\n",
+        "conditional source occurrences\nx1 a cell\nx2 b cell\n.subckt cell p\nv1 p 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nr1 p 0 3\n.ends\nb1 sense 0 v=i(x1::v1)\n.save i(x2::v1)\n.end\n",
     )?;
     let ac = run(
         &mut circuit,
@@ -543,7 +543,7 @@ fn conditional_voltage_topology_rejects_late_electrical_changes_atomically() -> 
 
     let source = Parser::new().parse_deck(&parse_deck_text(
         Path::new("network.cir"),
-        "incremental source\nv1 out 0 ac 1 pn_rseries=2 pn_cconditional=1u pn_control=1\nr1 out 0 3\n.end\n",
+        "incremental source\nv1 out 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nr1 out 0 3\n.end\n",
     ))?;
     let consumer = Parser::new().parse_deck(&parse_deck_text(
         Path::new("consumer.cir"),
@@ -591,4 +591,89 @@ fn conditional_voltage_topology_rejects_late_electrical_changes_atomically() -> 
         1e-12,
     );
     Ok(())
+}
+
+#[test]
+fn descendant_references_bind_at_the_containing_occurrence() -> SpiceResult<()> {
+    let mut first = circuit(
+        "descendant references\nx1 a outer\nx2 b outer\n.subckt outer p\nxinner p inner\n.ends\n.subckt inner p\nvdrive p 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nrload p 0 3\n.ends\n.func read(x) {branch_or_sampled_current(i(x))}\nb1 sense 0 v=read(x1::xinner::vdrive)\n.save i(x2::xinner::vdrive)\n.end\n",
+    )?;
+    let ac = run(
+        &mut first,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    for (name, expected) in [
+        (
+            "v(a)",
+            Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71),
+        ),
+        (
+            "v(b)",
+            Complex::new(0.596_608_345_906_663_5, -0.044_983_209_517_697_58),
+        ),
+    ] {
+        close(ac.value(name, 0).unwrap(), expected, 1e-10, 1e-12);
+    }
+    let mut relative = circuit(
+        "relative references\nx1 a outer\nx2 b outer\n.subckt outer p\nxinner p inner\nf1 0 sense xinner::vdrive 1\nr1 sense 0 1\n.ends\n.subckt inner p\nvdrive p 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nrload p 0 3\n.ends\n.end\n",
+    )?;
+    let ac = run(
+        &mut relative,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    for name in ["v(a)", "v(b)"] {
+        close(
+            ac.value(name, 0).unwrap(),
+            Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71),
+            1e-10,
+            1e-12,
+        );
+    }
+    Ok(())
+}
+
+/// The producer's LTspice reference includes a zero coupling coefficient:
+/// the K card still selects the ideal-winding topology for both occurrences.
+#[test]
+fn winding_loss_and_bias_follow_resolved_coupling_membership() -> SpiceResult<()> {
+    for (initialization, coupled, uncoupled) in [
+        ("", 0., 0.000_199_980_001_999_800_03),
+        (
+            "ic=.1 pn_terminal_bias_op=0 pn_terminal_bias_tran=0 pn_terminal_bias_zero_series=1e-5 pn_exact_ic=1",
+            0.999_900_009_999_000_3,
+            1.,
+        ),
+    ] {
+        let deck = format!(
+            "conditional winding loss\nv1 supply 0 2\nr1 supply a 10\nr2 supply b 10\nr3 supply c 10\nx1 a cell\nx2 b cell\nx3 c cell\n.subckt cell p\nl1 p 0 3m pn_rseries_uncoupled=1m {initialization}\n.ends\nk1 x1::l1 x2::l1 0\n.end\n"
+        );
+        let mut circuit = circuit(&deck)?;
+        let op = run(&mut circuit, AnalysisKind::OperatingPoint, &[])?;
+        for (name, expected) in [("v(a)", coupled), ("v(b)", coupled), ("v(c)", uncoupled)] {
+            close(
+                op.value(name, 0).unwrap(),
+                Complex::real(expected),
+                1e-9,
+                1e-12,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn conditional_network_alternatives_are_exclusive() {
+    for instance in [
+        "v1 p 0 1 pn_ccontrol=1u pn_cparallel=1u",
+        "v1 p 0 1 pn_ccontrol=1u pn_cseries_shunt=1u",
+        "l1 p 0 1m pn_rseries=1 pn_rseries_uncoupled=1",
+        "l1 p 0 1m pn_terminal_bias_zero_series=1e-5",
+    ] {
+        assert!(
+            circuit(&format!("invalid alternative\n{instance}\n.end\n")).is_err(),
+            "{instance}"
+        );
+    }
 }

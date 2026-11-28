@@ -800,7 +800,7 @@ impl<'a> Expander<'a> {
                     self.frontend.nodesets.push(hint);
                 }
             }
-            FrontendAction::Save(save) => self.output_directive(save, terminals, path),
+            FrontendAction::Save(save) => self.output_directive(save, terminals, path)?,
             FrontendAction::Print(print) => self.frontend.output.prints.push(print.clone()),
             FrontendAction::Measure(measure) => self.frontend.measurements.push(measure.clone()),
             FrontendAction::NoOutput => {}
@@ -815,7 +815,7 @@ impl<'a> Expander<'a> {
         save: &SaveCard,
         terminals: &BTreeMap<String, String>,
         path: &str,
-    ) {
+    ) -> SpiceResult<()> {
         let mut save = save.clone();
         for request in &mut save.requests {
             match &mut request.vector {
@@ -829,13 +829,13 @@ impl<'a> Expander<'a> {
                     }
                 }
                 RequestedVector::Current { device } => {
-                    *device = device_name(device, device.chars().next().unwrap_or_default(), path);
+                    *device = device_reference(device, path, &request.location)?;
                 }
                 RequestedVector::Named { name, .. } if name.starts_with('@') => {
                     if let Some((device, parameter)) = name[1..].split_once('[') {
                         *name = format!(
                             "@{}[{parameter}",
-                            device_name(device, device.chars().next().unwrap_or_default(), path)
+                            device_reference(device, path, &request.location)?
                         );
                     }
                 }
@@ -843,6 +843,7 @@ impl<'a> Expander<'a> {
             }
         }
         self.frontend.output.saves.push(save);
+        Ok(())
     }
 
     /// The root frame's models: every top-level declaration, unrenamed.
@@ -958,7 +959,7 @@ impl<'a> Expander<'a> {
             for node in &mut instance.nodes {
                 *node = self.rewrite_node(node, &terminals.analog, path);
             }
-            self.rewrite_code_ports(&mut instance, terminals, path);
+            self.rewrite_code_ports(&mut instance, terminals, path)?;
             if self.devices.len() >= self.limits.max_devices {
                 return Err(SpiceError::parse(
                     instance.location.clone(),
@@ -969,7 +970,7 @@ impl<'a> Expander<'a> {
                 ));
             }
             self.rewrite_model(&mut instance, scope, locals)?;
-            self.rewrite_parameter_references(&mut instance, &terminals.analog, path);
+            self.rewrite_parameter_references(&mut instance, &terminals.analog, path)?;
             instance.name = device_name(&instance.name, instance.designator, path);
             self.bind_prepared_waveform(original, directives.definition, &instance, scope)?;
             if let Some(resistor) = self.resistors.get(original, directives.definition)
@@ -1000,7 +1001,7 @@ impl<'a> Expander<'a> {
         instance: &mut DeviceInstance,
         terminals: &BTreeMap<String, String>,
         path: &str,
-    ) {
+    ) -> SpiceResult<()> {
         // F/H controlling sources are translated like instance names
         // (`translate()` calls `translate_inst_name` for them), so they
         // always name a device of the same instance.
@@ -1009,35 +1010,35 @@ impl<'a> Expander<'a> {
                 // Node and source names inside a behavioural expression are
                 // translated like the card's own (C expands the B line
                 // text, `translate()` renaming v(...)/i(...) operands).
-                expression.root.visit_mut(&mut |node| match &mut node.kind {
-                    BExprKind::Voltage { positive, negative } => {
-                        *positive = self.rewrite_node(positive, terminals, path);
-                        if let Some(negative) = negative {
-                            *negative = self.rewrite_node(negative, terminals, path);
+                let mut result = Ok(());
+                expression.root.visit_mut(&mut |node| {
+                    if result.is_err() {
+                        return;
+                    }
+                    match &mut node.kind {
+                        BExprKind::Voltage { positive, negative } => {
+                            *positive = self.rewrite_node(positive, terminals, path);
+                            if let Some(negative) = negative {
+                                *negative = self.rewrite_node(negative, terminals, path);
+                            }
                         }
+                        BExprKind::Current(source) => {
+                            match device_reference(source, path, &node.span.start) {
+                                Ok(name) => *source = name,
+                                Err(error) => result = Err(error),
+                            }
+                        }
+                        _ => {}
                     }
-                    BExprKind::Current(source) => {
-                        let designator = source
-                            .chars()
-                            .next()
-                            .unwrap_or_default()
-                            .to_ascii_lowercase();
-                        *source = device_name(source, designator, path);
-                    }
-                    _ => {}
                 });
+                result?;
                 continue;
             }
             if parameter.kind == ParameterKind::Instance {
-                let designator = parameter
-                    .value
-                    .chars()
-                    .next()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                parameter.value = device_name(&parameter.value, designator, path);
+                parameter.value = device_reference(&parameter.value, path, &parameter.location)?;
             }
         }
+        Ok(())
     }
 
     /// Bind a resolved waveform to the flattened source occurrence.
@@ -1281,27 +1282,27 @@ impl<'a> Expander<'a> {
         instance: &mut DeviceInstance,
         terminals: &HierarchyBindings,
         path: &str,
-    ) {
+    ) -> SpiceResult<()> {
         for terminal in instance
             .code_ports
             .iter_mut()
             .flat_map(|port| &mut port.terminals)
         {
-            let rewrite = |name: &str| {
+            let rewrite = |name: &str| -> SpiceResult<String> {
                 if terminal.kind == CodePortKind::Digital {
-                    Self::rewrite_digital_node(name, &terminals.digital, path)
+                    Ok(Self::rewrite_digital_node(name, &terminals.digital, path))
                 } else if terminal.kind == CodePortKind::BranchCurrent {
-                    let designator = name.chars().next().unwrap_or_default().to_ascii_lowercase();
-                    device_name(name, designator, path)
+                    device_reference(name, path, &instance.location)
                 } else {
-                    self.rewrite_node(name, &terminals.analog, path)
+                    Ok(self.rewrite_node(name, &terminals.analog, path))
                 }
             };
-            terminal.positive = rewrite(&terminal.positive);
+            terminal.positive = rewrite(&terminal.positive)?;
             if let Some(negative) = &mut terminal.negative {
-                *negative = rewrite(negative);
+                *negative = rewrite(negative)?;
             }
         }
+        Ok(())
     }
 
     fn rewrite_digital_node(
@@ -1489,6 +1490,36 @@ fn device_name(name: &str, designator: char, path: &str) -> String {
     } else {
         format!("{designator}.{path}.{name}")
     }
+}
+
+/// Bind a source-neutral descendant reference relative to the containing
+/// occurrence. Ordinary native names retain the native translation rules.
+fn device_reference(name: &str, path: &str, at: &SourceLoc) -> SpiceResult<String> {
+    let designator = |name: &str| name.chars().next().unwrap_or_default().to_ascii_lowercase();
+    if !name.contains("::") {
+        return Ok(device_name(name, designator(name), path));
+    }
+    let invalid = || {
+        SpiceError::parse(
+            at.clone(),
+            format!("invalid descendant device reference '{name}'"),
+        )
+    };
+    let (ancestors, leaf) = name.rsplit_once("::").ok_or_else(invalid)?;
+    if !designator(leaf).is_ascii_alphabetic() || leaf.len() < 2 || leaf.contains(':') {
+        return Err(invalid());
+    }
+    let mut occurrence = path.to_owned();
+    for component in ancestors.split("::") {
+        if designator(component) != 'x' || component.len() < 2 || component.contains(':') {
+            return Err(invalid());
+        }
+        if !occurrence.is_empty() {
+            occurrence.push('.');
+        }
+        occurrence.push_str(component);
+    }
+    Ok(device_name(leaf, designator(leaf), &occurrence))
 }
 
 /// One formal default as a `.param` assignment, so that evaluation orders it

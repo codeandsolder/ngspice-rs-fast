@@ -85,11 +85,17 @@ fn dynamic_operator(expr: &BExpr) -> Option<DynamicOperator> {
 }
 
 #[derive(Default)]
+pub(in crate::devices) struct NetworkReferences {
+    pub current: BTreeSet<String>,
+    pub coupled: BTreeSet<String>,
+}
+
+#[derive(Default)]
 struct CurrentTargets {
     probes: BTreeSet<usize>,
     zero: BTreeSet<String>,
     instantaneous: BTreeSet<String>,
-    electrical_controls: BTreeSet<String>,
+    network_references: NetworkReferences,
 }
 
 /// A genuine voltage-imposing or winding branch, not merely an internal
@@ -155,33 +161,49 @@ fn measured_targets(
     // selections or unused function declarations. Behavioural expressions
     // here have already undergone lexical and occurrence expansion.
     let mut targets = CurrentTargets {
-        electrical_controls: referenced
-            .keys()
-            .cloned()
-            .chain(
-                instances
-                    .iter()
-                    .flat_map(|instance| instance.parameters.iter())
-                    .filter(|parameter| {
-                        parameter.name == "control" && parameter.kind == ParameterKind::Instance
-                    })
-                    .map(|parameter| parameter.value.to_ascii_lowercase()),
-            )
-            .chain(
-                instances
-                    .iter()
-                    .flat_map(|instance| &instance.code_ports)
-                    .flat_map(|port| &port.terminals)
-                    .filter(|terminal| terminal.kind == CodePortKind::BranchCurrent)
-                    .map(|terminal| terminal.positive.to_ascii_lowercase()),
-            )
-            .chain(
-                existing
-                    .iter()
-                    .flat_map(|device| device.controlling_sources())
-                    .map(|control| control.name.to_ascii_lowercase()),
-            )
-            .collect(),
+        network_references: NetworkReferences {
+            current: referenced
+                .keys()
+                .cloned()
+                .chain(
+                    instances
+                        .iter()
+                        .flat_map(|instance| instance.parameters.iter())
+                        .filter(|parameter| {
+                            parameter.name == "control" && parameter.kind == ParameterKind::Instance
+                        })
+                        .map(|parameter| parameter.value.to_ascii_lowercase()),
+                )
+                .chain(
+                    instances
+                        .iter()
+                        .flat_map(|instance| &instance.code_ports)
+                        .flat_map(|port| &port.terminals)
+                        .filter(|terminal| terminal.kind == CodePortKind::BranchCurrent)
+                        .map(|terminal| terminal.positive.to_ascii_lowercase()),
+                )
+                .chain(
+                    existing
+                        .iter()
+                        .flat_map(|device| device.controlling_sources())
+                        .map(|control| control.name.to_ascii_lowercase()),
+                )
+                .collect(),
+            coupled: instances
+                .iter()
+                .filter(|instance| instance.designator == 'k')
+                .flat_map(|instance| &instance.parameters)
+                .filter(|parameter| parameter.kind == ParameterKind::Instance)
+                .map(|parameter| parameter.value.to_ascii_lowercase())
+                .chain(
+                    existing
+                        .iter()
+                        .filter_map(|device| device.mutual_coupling())
+                        .flat_map(|coupling| coupling.inductors)
+                        .map(|inductor| inductor.name.to_ascii_lowercase()),
+                )
+                .collect(),
+        },
         ..CurrentTargets::default()
     };
     if referenced.is_empty() {
@@ -240,7 +262,7 @@ fn measured_targets(
 pub(in crate::devices) struct ExpandedInstances<'a> {
     pub instances: Cow<'a, [DeviceInstance]>,
     pub probe_aliases: Vec<String>,
-    pub electrical_controls: BTreeSet<String>,
+    pub network_references: NetworkReferences,
 }
 
 pub(in crate::devices) fn expand<'a>(
@@ -257,13 +279,13 @@ pub(in crate::devices) fn expand<'a>(
         probes: measured,
         zero,
         instantaneous,
-        electrical_controls,
+        network_references,
     } = measured_targets(instances, models, resistors, existing, absent)?;
     if count == 0 && measured.is_empty() && zero.is_empty() {
         return Ok(ExpandedInstances {
             instances: Cow::Borrowed(instances),
             probe_aliases: Vec::new(),
-            electrical_controls,
+            network_references,
         });
     }
     // Selection may remove wrappers, zero-copy reads become constants, and
@@ -344,7 +366,7 @@ pub(in crate::devices) fn expand<'a>(
     Ok(ExpandedInstances {
         instances: Cow::Owned(expansion.output),
         probe_aliases,
-        electrical_controls,
+        network_references,
     })
 }
 

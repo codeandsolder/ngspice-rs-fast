@@ -428,12 +428,20 @@ fn number(input: &mut In<'_>) -> Res<Built<BExpr>> {
 
 fn name_or_call(input: &mut In<'_>, options: Options) -> Res<Built<BExpr>> {
     let start = input.eof_offset();
-    let name: &str = (
-        any.verify(|c: &char| is_name_start(*c)),
-        take_while(0.., is_name_continue),
-    )
-        .take()
-        .parse_next(input)?;
+    let original = input.input;
+    let identifier = || {
+        (
+            any.verify(|c: &char| is_name_start(*c)),
+            take_while(0.., is_name_continue),
+        )
+    };
+    identifier().void().parse_next(input)?;
+    // Double colons are an explicit descendant path, not ternary separators.
+    while input.input.starts_with("::") {
+        literal("::").void().parse_next(input)?;
+        identifier().void().parse_next(input)?;
+    }
+    let name = &original[..original.len() - input.input.len()];
     let lowered = name.to_ascii_lowercase();
     let adjacent = next_char(input) == Some('(');
     let checkpoint = input.checkpoint();

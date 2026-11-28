@@ -165,6 +165,7 @@ pub struct PreparedPassiveNetwork {
     reporting: Option<CurrentReporting>,
     control: Option<CurrentReference>,
     primary_probe: bool,
+    conditional_selection: Option<ConditionalNetworkSelection>,
 }
 
 /// Stable names for the independently observable currents of a bound network.
@@ -280,6 +281,7 @@ impl PreparedPassiveNetwork {
             reporting: None,
             control: None,
             primary_probe: false,
+            conditional_selection: None,
         }))
     }
 
@@ -584,7 +586,7 @@ pub struct PreparedVoltageNetwork {
     excitation: SourceExcitation,
     reporting: Option<CurrentReporting>,
     control: Option<CurrentReference>,
-    conditional_selection: Option<bool>,
+    conditional_selection: Option<ConditionalNetworkSelection>,
 }
 
 /// Identities for voltage forcing and external current reporting.
@@ -738,6 +740,13 @@ impl PreparedVoltageNetwork {
     }
 }
 
+/// Occurrence-level choices that must remain valid during graph edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConditionalNetworkSelection {
+    Voltage { referenced: bool },
+    Inductor { coupled: bool },
+}
+
 /// Parsed explicit network after lexical expansion and numeric literalization.
 /// A removed storage instance still reserves its written instance identity,
 /// but contributes no devices or private nodes.
@@ -747,10 +756,11 @@ pub(super) enum NetworkPlan {
 }
 
 impl NetworkPlan {
-    pub(super) const fn conditional_selection(&self) -> Option<bool> {
+    pub(super) const fn conditional_selection(&self) -> Option<ConditionalNetworkSelection> {
         match self {
             Self::Voltage(network) => network.conditional_selection,
-            Self::Storage(_) => None,
+            Self::Storage(Some(network)) => network.conditional_selection,
+            Self::Storage(None) => None,
         }
     }
 
@@ -771,7 +781,7 @@ impl NetworkPlan {
             return Ok(false);
         }
         Ok(matches!(
-            Self::prepare(instance, false)?,
+            Self::prepare(instance, false, false)?,
             Some(Self::Storage(None))
         ))
     }
@@ -779,6 +789,7 @@ impl NetworkPlan {
     pub(super) fn prepare(
         instance: &crate::netlist::ast::DeviceInstance,
         electrically_referenced: bool,
+        coupled: bool,
     ) -> SpiceResult<Option<Self>> {
         use crate::netlist::ast::ParameterKind;
 
@@ -820,7 +831,14 @@ impl NetworkPlan {
             // An optional source-neutral capacitance is placed once, before
             // resource accounting. The independent current reporting/control
             // policy does not determine its physical location.
-            let conditional = zero("pn_cconditional");
+            if get("pn_ccontrol").is_some()
+                && (get("pn_cparallel").is_some() || get("pn_cseries_shunt").is_some())
+            {
+                return Err(invalid(
+                    "pn_ccontrol conflicts with explicit capacitance placement",
+                ));
+            }
+            let conditional = zero("pn_ccontrol");
             let (output_extra, series_extra) = if electrically_referenced {
                 (0., conditional)
             } else {
@@ -835,7 +853,10 @@ impl NetworkPlan {
                 },
                 super::factory::voltage_network_inputs(&ordinary)?,
             )?;
-            network.conditional_selection = (conditional != 0.).then_some(electrically_referenced);
+            network.conditional_selection =
+                (conditional != 0.).then_some(ConditionalNetworkSelection::Voltage {
+                    referenced: electrically_referenced,
+                });
             if let Some(reporting) = report::parse(&values, 0.)? {
                 network = network.with_reporting(reporting)?;
             }
@@ -845,12 +866,13 @@ impl NetworkPlan {
             return Ok(Some(Self::Voltage(Box::new(network))));
         }
 
-        Self::storage(&ordinary, &values).map(Some)
+        Self::storage(&ordinary, &values, coupled).map(Some)
     }
 
     fn storage(
         instance: &crate::netlist::ast::DeviceInstance,
         values: &std::collections::BTreeMap<&str, Real>,
+        coupled: bool,
     ) -> SpiceResult<Self> {
         use crate::netlist::ast::ParameterKind;
 
@@ -888,10 +910,16 @@ impl NetworkPlan {
             }
         }
         let value = value.ok_or_else(|| invalid("physical network requires main storage value"))?;
+        let uncoupled = get("pn_rseries_uncoupled");
+        if uncoupled.is_some() && get("pn_rseries").is_some() {
+            return Err(invalid("pn_rseries_uncoupled conflicts with pn_rseries"));
+        }
+        let series_resistance =
+            uncoupled.map_or_else(|| zero("pn_rseries"), |r| if coupled { 0. } else { r });
         let coefficients = PassiveNetworkCoefficients {
             kind,
             value,
-            series_resistance: zero("pn_rseries"),
+            series_resistance,
             series_inductance: zero("pn_lseries"),
             series_inductance_shunt: get("pn_rseries_shunt").filter(|r| *r != 0.),
             series_inductance_damping: Self::damping(values, "series")?,
@@ -903,13 +931,17 @@ impl NetworkPlan {
             storage_damping: Self::damping(values, "storage")?,
             terminal_damping: Self::damping(values, "terminal")?,
         };
-        let initialization = Self::initialization(kind, initial, multiplicity, values)?;
+        let initialization =
+            Self::initialization(kind, initial, multiplicity, series_resistance, values)?;
         let Some(mut network) = PreparedPassiveNetwork::prepare(&coefficients, initialization)?
         else {
             report::parse(values, 0.)?;
             report::parse_control(values)?;
             return Ok(Self::Storage(None));
         };
+        network.conditional_selection = uncoupled
+            .filter(|r| *r != 0.)
+            .map(|_| ConditionalNetworkSelection::Inductor { coupled });
         let flag = |key| match get(key).unwrap_or(0.) {
             0. => Ok(false),
             1. => Ok(true),
@@ -966,6 +998,7 @@ impl NetworkPlan {
         kind: StorageKind,
         initial: Option<Real>,
         multiplicity: Real,
+        series_resistance: Real,
         coefficients: &std::collections::BTreeMap<&str, Real>,
     ) -> SpiceResult<Option<PassiveInitialization>> {
         use super::passive_bias::PassiveBias;
@@ -974,6 +1007,17 @@ impl NetworkPlan {
         let terminal = ["op", "dc", "ac", "tran"]
             .into_iter()
             .any(|phase| coefficients.contains_key(format!("pn_terminal_bias_{phase}").as_str()));
+        let zero_series = coefficients.get("pn_terminal_bias_zero_series").copied();
+        if zero_series.is_some() && !terminal {
+            return Err(SpiceError::circuit(
+                "pn_terminal_bias_zero_series requires a terminal bias equation",
+            ));
+        }
+        let bias_addition = if series_resistance == 0. {
+            zero_series.unwrap_or(0.)
+        } else {
+            0.
+        };
         // Terminal bias uses aggregate physical coordinates. Ordinary
         // storage IC and local bias continue to use per-copy winding current.
         let initial = initial.map(|value| {
@@ -1007,6 +1051,11 @@ impl NetworkPlan {
             }
             let Some(&g) = storage.or(external) else {
                 continue;
+            };
+            let g = if external.is_some() {
+                g + bias_addition
+            } else {
+                g
             };
             let target = initial.ok_or_else(|| {
                 SpiceError::circuit("physical bias requires an explicit storage IC")
