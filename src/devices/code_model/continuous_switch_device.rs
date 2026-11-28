@@ -3,6 +3,7 @@
 use super::continuous_switch::{Material, Point};
 use super::source::SourceModel;
 use crate::devices::models::{PreparationKey, ResolvedModel};
+use crate::devices::physical_dae::{TaylorContext, TaylorControl};
 use crate::devices::setup::MatrixSetup;
 use crate::devices::traits::{ChargeContext, ControlReference, ConvergenceContext, MnaUnknowns};
 use crate::devices::{
@@ -291,6 +292,37 @@ impl Device for ContinuousSwitch {
         bias: &Vector,
     ) -> SpiceResult<()> {
         self.assemble_small_signal(context, bias)
+    }
+
+    fn assemble_nonlinear_taylor(&self, context: &mut TaylorContext<'_>) -> SpiceResult<()> {
+        let coordinates =
+            self.mna_coordinates(context.unknowns, context.branch, context.controls)?;
+        let controls = [
+            TaylorControl {
+                rows: coordinates.output,
+                polarity: 1.,
+            },
+            TaylorControl {
+                rows: coordinates.control,
+                polarity: 1.,
+            },
+        ];
+        let voltage = controls[0].input(0, context)?;
+        let control = controls[1].input(1, context)?;
+        let mut guards = context.output.guards.is_some().then(Vec::new);
+        let current = self
+            .material
+            .taylor(control, &mut guards)?
+            .multiply(&voltage);
+        context.local_law(coordinates.output, &current, &controls, 1., None)?;
+        if let (Some(trace), Some(guards)) = (&mut context.output.guards, guards) {
+            trace.extend(context.device, guards)?;
+        }
+        // Keep the existing linear incidence for input loading and the
+        // physical zero-voltage current sensor, without output duplicates.
+        coordinates.entries(0., 0., self.material.control_g, |row, col, value| {
+            context.linear_static(Some(row), Some(col), value)
+        })
     }
 
     fn assemble_nonlinear_charge(&self, _context: &mut ChargeContext<'_>) -> SpiceResult<()> {
