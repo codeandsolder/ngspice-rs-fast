@@ -1,0 +1,43 @@
+Independent legacy BSIM1/2 physical terminal-current witnesses
+.model mod4n nmos(level=4 tox=.024 vdd=5 vfb=-.9 phi=.75 k1=.75 k2=.02 n0=1.2 dl=0 dw=0 rsh=52 js=2e-5 cj=1e-3 cjsw=2e-10 pb=.74 pbsw=.83 mj=.5 mjsw=.33 cgdo=1.5e-10 cgso=2e-10 cgbo=4e-11 kf=2e-25 af=1.2 mus=510 muz=400 eta=.02 u0=.1 u1=.06)
+.model mod4nrev nmos(level=4 tox=.024 vdd=5 vfb=-.9 phi=.75 k1=.75 k2=.02 n0=1.2 dl=0 dw=0 rsh=52 js=2e-5 cj=1e-3 cjsw=2e-10 pb=.74 pbsw=.83 mj=.5 mjsw=.33 cgdo=2e-10 cgso=1.5e-10 cgbo=4e-11 kf=2e-25 af=1.2 mus=510 muz=400 eta=.02 u0=.1 u1=.06)
+vd4nf d4nf 0 0.8
+vg4nf g4nf 0 2 ac 1
+vb4nf b4nf 0 -0.2
+m4nf d4nf g4nf 0 b4nf mod4n l=8.3u w=17.6u m=2 ad=30p as=40p pd=13u ps=17u nrd=2.3 nrs=3.1
+vd4nr d4nr 0 -0.6
+vg4nr g4nr 0 1.5 ac 1
+vb4nr b4nr 0 -1
+m4nr 0 g4nr d4nr b4nr mod4nrev l=8.3u w=17.6u m=2 ad=40p as=30p pd=17u ps=13u nrd=3.1 nrs=2.3
+.model mod4p pmos(level=4 tox=.024 vdd=5 vfb=-.9 phi=.75 k1=.75 k2=.02 n0=1.2 dl=0 dw=0 rsh=52 js=2e-5 cj=1e-3 cjsw=2e-10 pb=.74 pbsw=.83 mj=.5 mjsw=.33 cgdo=1.5e-10 cgso=2e-10 cgbo=4e-11 kf=2e-25 af=1.2 mus=510 muz=400 eta=.02 u0=.1 u1=.06)
+.model mod4prev pmos(level=4 tox=.024 vdd=5 vfb=-.9 phi=.75 k1=.75 k2=.02 n0=1.2 dl=0 dw=0 rsh=52 js=2e-5 cj=1e-3 cjsw=2e-10 pb=.74 pbsw=.83 mj=.5 mjsw=.33 cgdo=2e-10 cgso=1.5e-10 cgbo=4e-11 kf=2e-25 af=1.2 mus=510 muz=400 eta=.02 u0=.1 u1=.06)
+vd4pf d4pf 0 -0.8
+vg4pf g4pf 0 -2 ac 1
+vb4pf b4pf 0 0.2
+m4pf d4pf g4pf 0 b4pf mod4p l=8.3u w=17.6u m=2 ad=30p as=40p pd=13u ps=17u nrd=2.3 nrs=3.1
+vd4pr d4pr 0 0.6
+vg4pr g4pr 0 -1.5 ac 1
+vb4pr b4pr 0 1
+m4pr 0 g4pr d4pr b4pr mod4prev l=8.3u w=17.6u m=2 ad=40p as=30p pd=17u ps=13u nrd=3.1 nrs=2.3
+.model mod5n nmos(level=5 tox=.024 vdd=5 vfb=-.9 phi=.75 k1=.75 k2=.02 n0=1.2 dl=0 dw=0 rsh=52 js=2e-5 cj=1e-3 cjsw=2e-10 pb=.74 pbsw=.83 mj=.5 mjsw=.33 cgdo=1.5e-10 cgso=2e-10 cgbo=4e-11 kf=2e-25 af=1.2 mus0=510 mu0=400 eta0=.02 ua0=.1 u10=.06 vbb=-3 ai0=.05 bi0=.5)
+.model mod5nrev nmos(level=5 tox=.024 vdd=5 vfb=-.9 phi=.75 k1=.75 k2=.02 n0=1.2 dl=0 dw=0 rsh=52 js=2e-5 cj=1e-3 cjsw=2e-10 pb=.74 pbsw=.83 mj=.5 mjsw=.33 cgdo=2e-10 cgso=1.5e-10 cgbo=4e-11 kf=2e-25 af=1.2 mus0=510 mu0=400 eta0=.02 ua0=.1 u10=.06 vbb=-3 ai0=.05 bi0=.5)
+vd5nf d5nf 0 0.8
+vg5nf g5nf 0 2 ac 1
+vb5nf b5nf 0 -0.2
+m5nf d5nf g5nf 0 b5nf mod5n l=8.3u w=17.6u m=2 ad=30p as=40p pd=13u ps=17u nrd=2.3 nrs=3.1
+vd5nr d5nr 0 -0.6
+vg5nr g5nr 0 1.5 ac 1
+vb5nr b5nr 0 -1
+m5nr 0 g5nr d5nr b5nr mod5nrev l=8.3u w=17.6u m=2 ad=40p as=30p pd=17u ps=13u nrd=3.1 nrs=2.3
+.model mod5p pmos(level=5 tox=.024 vdd=5 vfb=-.9 phi=.75 k1=.75 k2=.02 n0=1.2 dl=0 dw=0 rsh=52 js=2e-5 cj=1e-3 cjsw=2e-10 pb=.74 pbsw=.83 mj=.5 mjsw=.33 cgdo=1.5e-10 cgso=2e-10 cgbo=4e-11 kf=2e-25 af=1.2 mus0=510 mu0=400 eta0=.02 ua0=.1 u10=.06 vbb=-3 ai0=.05 bi0=.5)
+.model mod5prev pmos(level=5 tox=.024 vdd=5 vfb=-.9 phi=.75 k1=.75 k2=.02 n0=1.2 dl=0 dw=0 rsh=52 js=2e-5 cj=1e-3 cjsw=2e-10 pb=.74 pbsw=.83 mj=.5 mjsw=.33 cgdo=2e-10 cgso=1.5e-10 cgbo=4e-11 kf=2e-25 af=1.2 mus0=510 mu0=400 eta0=.02 ua0=.1 u10=.06 vbb=-3 ai0=.05 bi0=.5)
+vd5pf d5pf 0 -0.8
+vg5pf g5pf 0 -2 ac 1
+vb5pf b5pf 0 0.2
+m5pf d5pf g5pf 0 b5pf mod5p l=8.3u w=17.6u m=2 ad=30p as=40p pd=13u ps=17u nrd=2.3 nrs=3.1
+vd5pr d5pr 0 0.6
+vg5pr g5pr 0 -1.5 ac 1
+vb5pr b5pr 0 1
+m5pr 0 g5pr d5pr b5pr mod5prev l=8.3u w=17.6u m=2 ad=40p as=30p pd=17u ps=13u nrd=3.1 nrs=2.3
+.options gmin=1e-15 reltol=1e-9 abstol=1e-13 vntol=1e-9
+.end

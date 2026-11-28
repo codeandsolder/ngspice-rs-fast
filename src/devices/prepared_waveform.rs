@@ -4,7 +4,9 @@
 //! validated physical knots without applying native PULSE or PWL defaults.
 use std::sync::Arc;
 
-use model_normalize_ngspice::waveform::{Forcing, Knot, Repeat, ResolvedWaveform};
+use model_normalize_ngspice::waveform::{
+    ExponentialForcing, Forcing, Knot, Repeat, ResolvedWaveform,
+};
 
 use crate::devices::functions::{affine_value, scaled_interval_difference};
 use crate::devices::pulse::MAX_CYCLE;
@@ -28,6 +30,7 @@ pub struct PreparedForcing {
 enum Law {
     Pwl(SidedPwl),
     Sine(SignedSine),
+    Exponential(ExponentialForcing),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +54,8 @@ struct SignedSine {
     delay: Real,
     damping: Real,
     hold: bool,
+    phase: Real,
+    stop_after: Option<Real>,
 }
 
 impl PreparedForcing {
@@ -64,6 +69,24 @@ impl PreparedForcing {
         }
         let law = match resolved.forcing {
             Forcing::PiecewiseLinear { knots, repeat } => Law::Pwl(SidedPwl::new(knots, repeat)?),
+            Forcing::Exponential(exp) => {
+                if ![
+                    exp.initial,
+                    exp.pulsed,
+                    exp.rise_delay,
+                    exp.rise_tau,
+                    exp.fall_delay,
+                    exp.fall_tau,
+                ]
+                .into_iter()
+                .all(Real::is_finite)
+                    || exp.rise_tau <= 0.
+                    || exp.fall_tau <= 0.
+                {
+                    return Err(invalid("invalid exponential coefficients"));
+                }
+                Law::Exponential(exp)
+            }
             Forcing::Sine {
                 offset,
                 amplitude,
@@ -71,12 +94,14 @@ impl PreparedForcing {
                 delay,
                 damping,
                 hold_before_delay,
+                phase,
+                stop_after,
             } => {
-                if ![offset, amplitude, frequency, delay, damping]
+                if ![offset, amplitude, frequency, delay, damping, phase]
                     .iter()
                     .all(|v| v.is_finite())
-                    || amplitude < 0.
-                    || frequency <= 0.
+                    || stop_after
+                        .is_some_and(|stop| !stop.is_finite() || !(delay + stop).is_finite())
                 {
                     return Err(invalid("invalid sine coefficients"));
                 }
@@ -87,6 +112,8 @@ impl PreparedForcing {
                     delay,
                     damping,
                     hold: hold_before_delay,
+                    phase: phase.to_radians(),
+                    stop_after,
                 })
             }
         };
@@ -124,7 +151,8 @@ impl PreparedForcing {
         }
         let value = match &self.law {
             Law::Pwl(pwl) => pwl.value_at(time, limit)?,
-            Law::Sine(sine) => sine.value_at(time),
+            Law::Sine(sine) => sine.value_at(time, limit),
+            Law::Exponential(exp) => exponential_value(*exp, time),
         };
         if !value.is_finite() {
             return Err(invalid("nonfinite forcing"));
@@ -149,6 +177,8 @@ impl PreparedForcing {
             Law::Sine(sine) => sine
                 .jet(time, scale, order, limit)
                 .with_value(self.value_at(time, limit)?),
+            Law::Exponential(exp) => exponential_jet(*exp, time, scale, order, limit)
+                .with_value(self.value_at(time, limit)?),
         })
     }
 
@@ -162,39 +192,98 @@ impl PreparedForcing {
         }
         let events = match &self.law {
             Law::Pwl(pwl) => Events::Pwl(pwl.events(start, end)?),
-            Law::Sine(sine) => Events::Single(
-                (sine.hold && (start..=end).contains(&sine.delay)).then_some(sine.delay),
-            ),
+            Law::Sine(sine) => Events::Finite(FiniteEvents::new(
+                [
+                    sine.hold.then_some(sine.delay),
+                    sine.stop_after
+                        .filter(|stop| !sine.hold || *stop > 0.)
+                        .map(|stop| sine.delay + stop),
+                ],
+                start,
+                end,
+            )),
+            Law::Exponential(exp) => Events::Finite(FiniteEvents::new(
+                [Some(exp.rise_delay), Some(exp.fall_delay)],
+                start,
+                end,
+            )),
         };
         Ok(PreparedEvents(events))
     }
 }
 
 impl SignedSine {
-    fn value_at(self, time: Real) -> Real {
-        if self.amplitude == 0. || (self.hold && time <= self.delay) {
+    fn coordinate(self, time: Real, limit: Limit) -> (Real, bool) {
+        if self.hold && (time < self.delay || (time <= self.delay && limit == Limit::Left)) {
+            return (0., true);
+        }
+        if let Some(stop) = self.stop_after {
+            let end = self.delay + stop;
+            if time >= end {
+                return (stop, time > end || limit == Limit::Right);
+            }
+        }
+        (time - self.delay, false)
+    }
+
+    fn angle(self, elapsed: Real) -> Real {
+        (elapsed * self.frequency % 1.).mul_add(std::f64::consts::TAU, self.phase)
+    }
+
+    fn value_at(self, time: Real, limit: Limit) -> Real {
+        if self.amplitude == 0. {
             return self.offset;
         }
-        let elapsed = time - self.delay;
-        let phase = (elapsed * self.frequency % 1.) * std::f64::consts::TAU;
-        (self.amplitude * (-self.damping * elapsed).exp()).mul_add(phase.sin(), self.offset)
+        let (elapsed, _) = self.coordinate(time, limit);
+        (self.amplitude * (-self.damping * elapsed).exp())
+            .mul_add(self.angle(elapsed).sin(), self.offset)
     }
 
     fn jet(self, time: Real, scale: Real, order: usize, limit: Limit) -> Jet {
-        if self.amplitude == 0.
-            || (self.hold && (time < self.delay || (limit == Limit::Left && time <= self.delay)))
-        {
-            return Jet::constant(order, self.offset);
+        let (elapsed, held) = self.coordinate(time, limit);
+        if self.amplitude == 0. || held {
+            return Jet::constant(order, self.value_at(time, limit));
         }
-        let elapsed = time - self.delay;
-        let phase = (elapsed * self.frequency % 1.) * std::f64::consts::TAU;
         let angular_scale = self.frequency * scale * std::f64::consts::TAU;
-        let (sin, _) = Jet::affine(order, phase, angular_scale).sin_cos();
+        let (sin, _) = Jet::affine(order, self.angle(elapsed), angular_scale).sin_cos();
         let envelope = Jet::affine(order, -self.damping * elapsed, -self.damping * scale)
             .exp()
             .scale(self.amplitude);
         envelope.multiply(&sin).offset(self.offset)
     }
+}
+
+fn exponential_term(time: Real, delay: Real, tau: Real) -> Real {
+    -(-((time - delay).max(0.) / tau)).exp_m1()
+}
+
+fn exponential_value(exp: ExponentialForcing, time: Real) -> Real {
+    let rise = exponential_term(time, exp.rise_delay, exp.rise_tau);
+    let fall = exponential_term(time, exp.fall_delay, exp.fall_tau);
+    (exp.pulsed - exp.initial).mul_add(rise - fall, exp.initial)
+}
+
+fn exponential_jet(
+    exp: ExponentialForcing,
+    time: Real,
+    scale: Real,
+    order: usize,
+    limit: Limit,
+) -> Jet {
+    let term = |delay: Real, tau: Real| {
+        if time < delay || (time <= delay && limit == Limit::Left) {
+            Jet::constant(order, 0.)
+        } else {
+            Jet::affine(order, -(time - delay) / tau, -scale / tau)
+                .exp()
+                .scale(-1.)
+                .offset(1.)
+        }
+    };
+    term(exp.rise_delay, exp.rise_tau)
+        .add(&term(exp.fall_delay, exp.fall_tau).scale(-1.))
+        .scale(exp.pulsed - exp.initial)
+        .offset(exp.initial)
 }
 
 impl SidedPwl {
@@ -218,6 +307,8 @@ impl SidedPwl {
                 || knots[0].time.abs().to_bits() != 0
                 || knots[knots.len() - 1].time >= r.period
                 || r.hold.is_some_and(|v| !v.is_finite())
+                || r.limit
+                    .is_some_and(|limit| !limit.time.is_finite() || !limit.value.is_finite())
             {
                 return Err(invalid("invalid repeating knot geometry"));
             }
@@ -298,7 +389,11 @@ impl SidedPwl {
     fn cycle_or_hold(&self, time: Real, limit: Limit) -> SpiceResult<CycleOrHold> {
         Ok(match self.repeat {
             Some(r) => {
-                if let Some(hold) = r.hold
+                if let Some(end) = r.limit
+                    && (time > end.time || (time == end.time && limit == Limit::Right))
+                {
+                    CycleOrHold::Hold(end.value)
+                } else if let Some(hold) = r.hold
                     && (time < r.origin || (time == r.origin && limit == Limit::Left))
                 {
                     CycleOrHold::Hold(hold)
@@ -426,6 +521,19 @@ impl SidedPwl {
     }
 
     fn events(&self, start: Real, end: Real) -> SpiceResult<PwlEvents> {
+        let cutoff = self.repeat.and_then(|r| r.limit).map(|limit| limit.time);
+        let termination = cutoff.filter(|time| (start..=end).contains(time));
+        let end = cutoff.map_or(end, |time| end.min(time));
+        if cutoff.is_some_and(|time| time <= start) {
+            return Ok(PwlEvents {
+                pwl: self.clone(),
+                cycle: 0.,
+                index: 0,
+                end,
+                done: true,
+                cutoff: termination,
+            });
+        }
         let (cycle, done) = match self.repeat {
             Some(r) if r.hold.is_some() && end < r.origin => (0., true),
             Some(r) => {
@@ -434,7 +542,12 @@ impl SidedPwl {
                 } else {
                     self.cycle_at(start, r)?
                 };
-                let last = self.cycle_at(end, r)?;
+                let last_time = if termination.is_some() {
+                    end.next_down().max(start)
+                } else {
+                    end
+                };
+                let last = self.cycle_at(last_time, r)?;
                 // Each endpoint cycle has been checked exactly if necessary.
                 // For an arbitrarily long window require a uniform proof:
                 // iterating all intervening cycles would destroy laziness.
@@ -456,6 +569,7 @@ impl SidedPwl {
             index,
             end,
             done,
+            cutoff: termination,
         })
     }
 }
@@ -467,7 +581,30 @@ pub struct PreparedEvents(Events);
 #[derive(Debug, Clone)]
 enum Events {
     Pwl(PwlEvents),
-    Single(Option<Real>),
+    Finite(FiniteEvents),
+}
+
+#[derive(Debug, Clone)]
+struct FiniteEvents([Option<Real>; 2]);
+
+impl FiniteEvents {
+    fn new(mut times: [Option<Real>; 2], start: Real, end: Real) -> Self {
+        for time in &mut times {
+            *time = time.filter(|time| (start..=end).contains(time));
+        }
+        if let [Some(a), Some(b)] = times {
+            if a > b {
+                times.swap(0, 1);
+            } else if a.to_bits() == b.to_bits() || (a == 0. && b == 0.) {
+                times[1] = None;
+            }
+        }
+        Self(times)
+    }
+
+    fn next_time(&mut self) -> Option<Real> {
+        self.0[0].take().or_else(|| self.0[1].take())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -477,12 +614,13 @@ struct PwlEvents {
     index: usize,
     end: Real,
     done: bool,
+    cutoff: Option<Real>,
 }
 
 impl PwlEvents {
     fn next_time(&mut self) -> Option<Real> {
         if self.done {
-            return None;
+            return self.cutoff.take();
         }
         if self.index == self.pwl.knots.len() {
             if self.pwl.repeat.is_none() {
@@ -493,9 +631,9 @@ impl PwlEvents {
             self.index = 0;
         }
         let time = self.pwl.time_at(self.cycle, self.index);
-        if time > self.end {
+        if time > self.end || self.cutoff.is_some_and(|cutoff| time >= cutoff) {
             self.done = true;
-            return None;
+            return self.cutoff.take();
         }
         self.index += 1;
         Some(time)
@@ -507,7 +645,7 @@ impl Iterator for PreparedEvents {
     fn next(&mut self) -> Option<Self::Item> {
         let time = match &mut self.0 {
             Events::Pwl(pwl) => pwl.next_time()?,
-            Events::Single(time) => time.take()?,
+            Events::Finite(events) => events.next_time()?,
         };
         Some(WaveformEvent {
             time,

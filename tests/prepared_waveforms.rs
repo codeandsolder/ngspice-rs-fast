@@ -73,6 +73,7 @@ fn signed_cycles_hold_and_lazy_repetition_preserve_limits() {
                 origin,
                 period: 1.,
                 hold: None,
+                limit: None,
             }),
             0.,
             if origin < 0. { 3. } else { 5. },
@@ -98,6 +99,7 @@ fn signed_cycles_hold_and_lazy_repetition_preserve_limits() {
             origin: 0.25,
             period: 1.,
             hold: Some(-3.),
+            limit: None,
         }),
         -3.,
         -3.,
@@ -131,6 +133,8 @@ fn invalid_geometry_is_rejected_and_sine_respects_signed_delay() {
             delay: -0.25,
             damping: 0.4,
             hold_before_delay: false,
+            phase: 0.,
+            stop_after: None,
         },
         idle_in_pop: true,
     })
@@ -401,6 +405,7 @@ fn rounded_periodic_knots_cannot_silently_collapse() {
             origin,
             period,
             hold: None,
+            limit: None,
         }),
         0.,
         0.,
@@ -443,6 +448,7 @@ fn prepared_repeat_jets_follow_previous_cycle_and_startup_hold() {
                 origin: -0.25,
                 period: 1.,
                 hold,
+                limit: None,
             }),
             0.,
             8.,
@@ -514,6 +520,8 @@ fn prepared_sine_jets_respect_delay_hold_and_exact_analytic_derivatives() {
                     delay: -0.25,
                     damping: 2.,
                     hold_before_delay: hold,
+                    phase: 0.,
+                    stop_after: None,
                 },
                 idle_in_pop: false,
             })
@@ -779,6 +787,7 @@ fn prepared_periodic_jets_agree_with_every_generated_interval_at_wide_time_scale
                     origin,
                     period,
                     hold: None,
+                    limit: None,
                 }),
                 0.,
                 if origin < 0. {
@@ -812,4 +821,103 @@ fn prepared_periodic_jets_agree_with_every_generated_interval_at_wide_time_scale
             }
         }
     }
+}
+
+#[test]
+fn sine_phase_and_finite_cycle_hold_bind_exact_sided_jets() {
+    let prepared = PreparedForcing::new(ResolvedWaveform {
+        dc: 1.,
+        startup: 3.,
+        forcing: Forcing::Sine {
+            offset: 1.,
+            amplitude: 2.,
+            frequency: 1.,
+            delay: 0.5,
+            damping: 0.,
+            hold_before_delay: true,
+            phase: 90.,
+            stop_after: Some(0.75),
+        },
+        idle_in_pop: false,
+    })
+    .unwrap();
+    let times: Vec<_> = prepared
+        .breakpoints_in(0., 2.)
+        .unwrap()
+        .map(|event| event.time)
+        .collect();
+    assert_eq!(times, [0.5, 1.25]);
+    for time in [0., 0.5] {
+        close(prepared.value_at(time, Limit::Left).unwrap(), 3., 1e-14);
+    }
+    close(prepared.value_at(1.25, Limit::Left).unwrap(), 1., 1e-14);
+    close(prepared.value_at(5., Limit::Right).unwrap(), 1., 1e-14);
+    let wave = Waveform::Prepared(prepared);
+    let left = wave.taylor_at(1.25, 1., 1, Limit::Left).unwrap();
+    close(left[1], 2. * std::f64::consts::TAU, 1e-13);
+    assert_eq!(wave.taylor_at(1.25, 1., 1, Limit::Right).unwrap()[1], 0.);
+}
+
+#[test]
+fn explicit_exponential_fall_before_rise_is_not_reordered() {
+    use model_normalize_ngspice::waveform::ExponentialForcing;
+    let prepared = PreparedForcing::new(ResolvedWaveform {
+        dc: 1.,
+        startup: 1.,
+        forcing: Forcing::Exponential(ExponentialForcing {
+            initial: 1.,
+            pulsed: 3.,
+            rise_delay: 2.,
+            rise_tau: 0.5,
+            fall_delay: 1.,
+            fall_tau: 1.,
+        }),
+        idle_in_pop: false,
+    })
+    .unwrap();
+    let times: Vec<_> = prepared
+        .breakpoints_in(0., 3.)
+        .unwrap()
+        .map(|event| event.time)
+        .collect();
+    assert_eq!(times, [1., 2.]);
+    close(
+        prepared.value_at(1.5, Limit::Right).unwrap(),
+        1. + 2. * (-0.5_f64).exp_m1(),
+        1e-14,
+    );
+    let wave = Waveform::Prepared(prepared);
+    assert_eq!(wave.taylor_at(1., 1., 1, Limit::Left).unwrap(), [1., 0.]);
+    assert_eq!(wave.taylor_at(1., 1., 1, Limit::Right).unwrap(), [1., -2.]);
+}
+
+#[test]
+fn finite_repeat_cutoff_has_one_sided_limits_and_exact_event() {
+    use model_normalize_ngspice::waveform::RepeatLimit;
+    let wave = pwl(
+        vec![knot(0., 0., 0.), knot(0.5, 2., 2.)],
+        Some(Repeat {
+            origin: 0.,
+            period: 1.,
+            hold: None,
+            limit: Some(RepeatLimit {
+                time: 2.5,
+                value: -1.,
+            }),
+        }),
+        0.,
+        0.,
+    );
+    close(wave.value_at(2.5, Limit::Left).unwrap(), 2., 0.);
+    close(wave.value_at(2.5, Limit::Right).unwrap(), -1., 0.);
+    close(wave.value_at(1e100, Limit::Right).unwrap(), -1., 0.);
+    let events = |start, end| {
+        wave.breakpoints_in(start, end)
+            .unwrap()
+            .map(|event| event.time)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(events(0., 1e100), [0., 0.5, 1., 1.5, 2., 2.5]);
+    assert_eq!(events(2.5, 2.5), [2.5]);
+    assert!(events(1e50, 1e100).is_empty());
 }
