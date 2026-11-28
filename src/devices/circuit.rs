@@ -4319,7 +4319,7 @@ impl Circuit {
         let source_count = self
             .devices
             .iter()
-            .filter(|device| matches!(device.designator(), 'v' | 'i'))
+            .filter(|device| device.input_source().is_some())
             .count();
         system.sources.try_reserve(source_count).map_err(|error| {
             SpiceError::circuit(format!("independent source collection allocation: {error}"))
@@ -4529,7 +4529,7 @@ impl Circuit {
         let source_count = self
             .devices
             .iter()
-            .filter(|device| matches!(device.designator(), 'v' | 'i'))
+            .filter(|device| device.input_source().is_some())
             .count();
         system.sources.try_reserve(source_count).map_err(|error| {
             SpiceError::circuit(format!("independent source collection allocation: {error}"))

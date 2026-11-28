@@ -404,3 +404,70 @@ fn physical_damping_ignores_temporary_junction_continuation() -> SpiceResult<()>
     assert_ne!(normal.a, overridden.a);
     Ok(())
 }
+
+#[test]
+fn generated_probe_is_not_an_excitation_source() -> SpiceResult<()> {
+    let mut circuit =
+        circuit("probe identity\nv1 s 0 1\nr1 s p 2\nc1 p 0 2u pn_rseries=5\n.end\n")?;
+    let system = circuit.linear_system()?;
+    assert_eq!(system.sources.len(), 1);
+    assert_eq!(system.sources[0].name.as_ref(), "v1");
+    assert!(circuit.bind_source_target("vc1#port").is_err());
+    assert!(
+        run(
+            &mut circuit,
+            AnalysisKind::TransferFunction,
+            &["v", "(", "p", ")", "vc1#port"],
+        )
+        .is_err()
+    );
+    let tf = run(
+        &mut circuit,
+        AnalysisKind::TransferFunction,
+        &["v", "(", "p", ")", "v1"],
+    )?;
+    assert_eq!(tf.point_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn series_inductor_shunt_noise_uses_frequency_domain_multiplicity() -> SpiceResult<()> {
+    let mut circuit = circuit(
+        "series shunt noise\nv1 s 0 ac 1\nr1 s p 2\n\
+         c1 p 0 2u m=3 pn_rseries=5 pn_rparallel=100 pn_cparallel=1u \
+         pn_lseries=3m pn_gseries_ac=.05 pn_gseries_tran={1/(20*3)} pn_gseries_noise=1\n.end\n",
+    )?;
+    let noise = run(
+        &mut circuit,
+        AnalysisKind::Noise,
+        &["v(p)", "v1", "lin", "3", "100", "10000"],
+    )?;
+    for (name, reference) in [
+        (
+            "onoise_spectrum",
+            [
+                1.768349869679772e-10,
+                1.580738710815810e-10,
+                1.520717676270345e-10,
+            ],
+        ),
+        (
+            "inoise_spectrum",
+            [
+                1.874645005376138e-10,
+                2.044605719103892e-10,
+                2.067466055045742e-10,
+            ],
+        ),
+    ] {
+        for (index, expected) in reference.into_iter().enumerate() {
+            close(
+                noise.value(name, index).unwrap(),
+                Complex::real(expected),
+                3e-4,
+                0.,
+            );
+        }
+    }
+    Ok(())
+}

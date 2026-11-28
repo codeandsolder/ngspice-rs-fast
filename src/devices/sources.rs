@@ -854,6 +854,9 @@ impl Device for IndependentSource {
                 }
             }
         }
+        if self.is_current_probe() {
+            return Ok(());
+        }
         context.system.sources.push(LinearSource {
             name: self.name.clone(),
             kind: self.source_kind(),
