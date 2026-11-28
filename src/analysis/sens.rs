@@ -1665,6 +1665,8 @@ pub(super) fn run(
         &circuit.prepare_run(),
         &model,
         &settings,
+        None,
+        &mut crate::analysis::newton::CircuitNewtonWorkspace::default(),
     )?;
 
     let mut plot = workspace.plot(ac);

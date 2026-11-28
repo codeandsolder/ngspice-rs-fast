@@ -163,9 +163,16 @@ fn op_inner(
     let model = context.model_context();
     let prepared = circuit.prepare_run();
     let start = super::bias::OperatingPointStart::resolve(circuit, request)?;
-    let mut x = start
-        .solve(&prepared, &model, request.dc_settings())?
-        .values;
+    let mut workspace = crate::analysis::newton::CircuitNewtonWorkspace::default();
+    let solved = start.solve(
+        &prepared,
+        &model,
+        request.dc_settings(),
+        None,
+        &mut workspace,
+    )?;
+    let mut x = solved.values;
+    workspace.recycle_next(solved.next);
     if let Some(mixed) = mixed {
         let mut settled = false;
         for _ in 0..request.dc_settings().newton.max_iterations {
@@ -177,9 +184,15 @@ fn op_inner(
                 settled = true;
                 break;
             }
-            x = start
-                .solve_from(&prepared, &model, request.dc_settings(), &x)?
-                .values;
+            let solved = start.solve(
+                &prepared,
+                &model,
+                request.dc_settings(),
+                Some(&x),
+                &mut workspace,
+            )?;
+            workspace.recycle_current(std::mem::replace(&mut x, solved.values));
+            workspace.recycle_next(solved.next);
         }
         if !settled {
             return Err(SpiceError::circuit(

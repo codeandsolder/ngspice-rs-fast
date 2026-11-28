@@ -633,16 +633,18 @@ impl<T> LoadStorage<T> {
 /// changed matrix pattern is recognized before reusing any bound stamps;
 /// state reuse is checked independently against accepted history revision.
 #[derive(Default)]
-pub(super) struct CircuitNewtonWorkspace {
+pub struct CircuitNewtonWorkspace {
     load: LoadStorage<TrialState>,
 }
 
 impl CircuitNewtonWorkspace {
-    pub(super) fn recycle_current(&mut self, current: Vector) {
+    /// Reclaim a consumed iterate's storage for the next Newton solve.
+    pub fn recycle_current(&mut self, current: Vector) {
         self.load.buffers.current = current;
     }
 
-    pub(super) fn recycle_next(&mut self, next: Vector) {
+    /// Reclaim a consumed next-iterate buffer for the next Newton solve.
+    pub fn recycle_next(&mut self, next: Vector) {
         self.load.buffers.next = next;
     }
 

@@ -2192,9 +2192,11 @@ impl Driver<'_> {
                     timing: self.timing,
                 }),
                 &nodes,
+                &mut self.workspace,
             )?
             .solution
         };
+        self.workspace.recycle_next(solution.next);
         let x = solution.values;
         initial::check_implied(
             &x,

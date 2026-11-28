@@ -8,7 +8,8 @@
 //! default wrapper. See `docs/port/DC_CONTINUATION.md` for the contract and
 //! for the remaining differences from ngspice.
 use crate::analysis::newton::{
-    self, CircuitLoad, CircuitNewton, NewtonFailure, NewtonOptions, NewtonSolution, PhasePolicy,
+    self, CircuitLoad, CircuitNewton, CircuitNewtonWorkspace, NewtonFailure, NewtonOptions,
+    NewtonSolution, PhasePolicy,
 };
 use crate::devices::{
     Circuit, Forcing, IterationPhase, ModelContext, PreparedRun, StateHistory, TrialState,
@@ -873,32 +874,25 @@ impl OperatingPointStart {
         Ok(Self { seed, nodes })
     }
 
+    /// Solve from the original node hints or the previous converged point.
+    /// The phase policy remains CKTop in both cases.
     pub(super) fn solve(
         &self,
         prepared: &PreparedRun<'_>,
         model: &ModelContext,
         settings: &DcSettings,
-    ) -> SpiceResult<NewtonSolution<TrialState>> {
-        self.solve_from(prepared, model, settings, &self.seed)
-    }
-
-    /// Another operating point in the same analysis: keep MODEINITJCT and
-    /// MODEINITFIX node forcing, but warm-start from the previous solution.
-    pub(super) fn solve_from(
-        &self,
-        prepared: &PreparedRun<'_>,
-        model: &ModelContext,
-        settings: &DcSettings,
-        seed: &Vector,
+        seed: Option<&Vector>,
+        workspace: &mut CircuitNewtonWorkspace,
     ) -> SpiceResult<NewtonSolution<TrialState>> {
         Ok(solve_dc_forced_prepared(
             prepared,
             model,
             settings,
             &[],
-            Some(seed),
+            Some(seed.unwrap_or(&self.seed)),
             None,
             &self.nodes,
+            workspace,
         )?
         .solution)
     }
@@ -989,9 +983,14 @@ pub fn solve_dc_forced(
         initial,
         forcing,
         nodes,
+        &mut CircuitNewtonWorkspace::default(),
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the positional interface explicit at the reference solver or device boundary"
+)]
 pub(super) fn solve_dc_forced_prepared(
     prepared: &PreparedRun<'_>,
     context: &ModelContext,
@@ -1000,6 +999,7 @@ pub(super) fn solve_dc_forced_prepared(
     initial: Option<&Vector>,
     forcing: Option<Forcing>,
     nodes: &NodeForcing,
+    workspace: &mut CircuitNewtonWorkspace,
 ) -> Result<DcSolution, DcFailure> {
     let history = prepared
         .circuit()
@@ -1020,6 +1020,7 @@ pub(super) fn solve_dc_forced_prepared(
             policy: PhasePolicy::OperatingPoint,
             nodes,
         },
+        workspace,
     )
 }
 
@@ -1049,6 +1050,7 @@ pub fn solve_dc_from(
     history: &StateHistory,
     policy: PhasePolicy,
     nodes: &NodeForcing,
+    workspace: &mut CircuitNewtonWorkspace,
 ) -> Result<DcSolution, DcFailure> {
     solve(
         prepared,
@@ -1062,6 +1064,7 @@ pub fn solve_dc_from(
             policy,
             nodes,
         },
+        workspace,
     )
 }
 
@@ -1081,9 +1084,18 @@ fn solve(
     settings: &DcSettings,
     overrides: &[(&str, f64)],
     start: &Start<'_>,
+    workspace: &mut CircuitNewtonWorkspace,
 ) -> Result<DcSolution, DcFailure> {
     let mut report = DcReport::default();
-    match run(prepared, context, settings, overrides, start, &mut report) {
+    match run(
+        prepared,
+        context,
+        settings,
+        overrides,
+        start,
+        &mut report,
+        workspace,
+    ) {
         Ok(solution) => Ok(DcSolution { solution, report }),
         Err(error) => Err(DcFailure {
             error,
@@ -1145,7 +1157,7 @@ struct Engine<'a> {
     remaining: usize,
     /// One numeric and disposable-state buffer across every continuation
     /// attempt; an accepted history revision still invalidates spare state.
-    workspace: crate::analysis::newton::CircuitNewtonWorkspace,
+    workspace: &'a mut CircuitNewtonWorkspace,
 }
 
 #[derive(Clone, Copy)]
@@ -1486,7 +1498,7 @@ impl Engine<'_> {
                 forcing: self.forcing,
                 explicit_bias: self.explicit_bias(),
             },
-            workspace: &mut self.workspace,
+            workspace: self.workspace,
         }
         .solve(
             guess,
@@ -1528,8 +1540,12 @@ impl Engine<'_> {
             Ok(solved) => Ok(solved),
             Err(NewtonFailure {
                 error: error @ SpiceError::Numerical { .. },
+                last_iterate,
                 ..
             }) => {
+                if let Some(last) = last_iterate {
+                    self.workspace.recycle_current(last);
+                }
                 let detail = format!("{}: {error}", describe());
                 Err(if cut_short {
                     Halt::Budget(format!("{detail} (iteration limit reduced by the budget)"))
@@ -1816,6 +1832,7 @@ fn run(
     overrides: &[(&str, f64)],
     start: &Start<'_>,
     report: &mut DcReport,
+    workspace: &mut CircuitNewtonWorkspace,
 ) -> SpiceResult<NewtonSolution<TrialState>> {
     let circuit = prepared.circuit();
     let Start {
@@ -1887,7 +1904,7 @@ fn run(
         gshunt: policy.gshunt,
         persistent_gmin: circuit.continuation_diagonal(),
         remaining: budget,
-        workspace: crate::analysis::newton::CircuitNewtonWorkspace::default(),
+        workspace,
     };
     let result = engine.execute_plan(report, &plan);
     if result.is_ok() {

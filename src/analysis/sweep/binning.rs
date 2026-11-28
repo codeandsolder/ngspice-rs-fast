@@ -288,6 +288,7 @@ pub(super) fn run(
     let warm = warm_start_settings(point_iterations, settings);
     let mut current = None;
     let mut previous = Vector::zeros(0);
+    let mut workspace = crate::analysis::newton::CircuitNewtonWorkspace::default();
     let mut history = None;
     let mut nodes = crate::analysis::bias::NodeForcing {
         initial: Vec::new(),
@@ -332,7 +333,7 @@ pub(super) fn run(
                 warm_settings: warm.as_ref(),
                 nodes: &nodes,
             };
-            let solution = solver.solve(&point, &previous, history, first)?;
+            let solution = solver.solve(&point, &previous, history, first, &mut workspace)?;
             let x = solution.values;
             let trial = solution.trial;
             let load = crate::devices::LoadRequest {
@@ -366,7 +367,8 @@ pub(super) fn run(
                 })? = value;
             }
             emit(sink, &result, &row, selected.as_deref(), &mut projected)?;
-            previous = x;
+            workspace.recycle_current(std::mem::replace(&mut previous, x));
+            workspace.recycle_next(solution.next);
         }
     }
     sink.end()

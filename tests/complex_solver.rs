@@ -284,7 +284,7 @@ fn complex_raw_factors_cover_both_binary64_exponent_limits() {
 #[test]
 fn unreferenced_named_unknowns_fail_all_factorization_paths() {
     use ngspice_rs::maths::complex::IndependentComplexBatch;
-    use ngspice_rs::maths::{Pattern, SparseLu, Vector, solve_ni};
+    use ngspice_rs::maths::{NiWorkspace, Pattern, SparseLu, Vector, solve_ni};
     use std::sync::Arc;
     let p = Arc::new(Pattern::new(3, [(0, 0)]).unwrap());
     let names: ngspice_rs::maths::UnknownNames = Arc::from([

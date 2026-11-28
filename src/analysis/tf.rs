@@ -220,6 +220,8 @@ pub(super) fn run(
         &circuit.prepare_run(),
         &context.model_context(),
         &settings,
+        None,
+        &mut crate::analysis::newton::CircuitNewtonWorkspace::default(),
     )?;
 
     // tfanal.c solves with the LU factors CKTop's last NIiter pass left in

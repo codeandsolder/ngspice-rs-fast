@@ -70,7 +70,11 @@ The Newton driver retains current, next, correction RHS and factor scratch in
 its execution workspace. Each successful iteration swaps the two solution
 vectors; convergence transfers both vectors with the trial that was loaded at
 the accepted iterate. Transient retries and continuation stages recycle consumed
-vectors only after the last reader. The retained primal/adjoint solve and
+vectors only after the last reader. A DC sweep owns one workspace across points,
+including predicted-point retries and geometry-driven topology changes. Repeated
+frequency-dependent bias and mixed-signal operating-point solves recycle the
+same slots; a one-shot small-signal bias drops its DC scratch after use.
+The retained primal/adjoint solve and
 immutable LU snapshot interfaces accept caller-owned scratch and output, so
 repeated right-hand sides need not allocate solution vectors.
 
