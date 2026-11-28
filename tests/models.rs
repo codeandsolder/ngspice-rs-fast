@@ -268,8 +268,11 @@ fn first_level_rounding_and_last_diode_integer_setter_are_separate() {
     let default = selection('d', "d", "").unwrap();
     assert_eq!(default.first_raw, None);
     assert_eq!(default.applied, Some(1));
+    assert_eq!(
+        selection('m', "nmos", "level=3.6").unwrap().backend,
+        ModelBackend::Bsim1
+    );
     for (d, base, setters) in [
-        ('m', "nmos", "level=3.6"),
         ('q', "npn", "level=3"),
         ('r', "r", "level=2"),
         ('r', "res", "level=2"),
