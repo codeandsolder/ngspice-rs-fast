@@ -19,7 +19,7 @@ use crate::devices::sensitivity::{
     SensitivityFamily, SensitivityKernel, SensitivityParameter as P, SensitivityRecord as Record,
     StampPart, node_stamps, stamp_reset,
 };
-use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
+use crate::primitives::{Real, SpiceError, SpiceResult};
 
 /// Level-owned model record mapping. `derived` selects the already-stored
 /// process fields rather than recomputing them in the replacement's load.
