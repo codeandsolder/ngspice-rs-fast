@@ -2,6 +2,8 @@
 //! Unlike a threshold switch these have no trial or accepted discrete state.
 
 use super::source::{SourceModel, numeric_scalar};
+use crate::devices::physical_dae::LocalGuard;
+use crate::maths::taylor::{Jet, differential::Differential};
 use crate::netlist::ast::ModelCard;
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::cmp::Ordering;
@@ -107,13 +109,6 @@ impl Material {
         })
     }
 
-    const fn endpoint(resistance: Real) -> Point {
-        Point {
-            g: resistance.recip(),
-            dg: 0.,
-        }
-    }
-
     fn normalized(self, control: Real) -> Real {
         // Exact endpoint identity avoids cancellation in high-ratio laws.
         if control.partial_cmp(&self.on) == Some(Ordering::Equal) {
@@ -126,12 +121,8 @@ impl Material {
     }
 
     pub(super) fn point(self, control: Real) -> SpiceResult<Point> {
-        let t = self.normalized(control);
-        let point = match self.law {
-            Law::CubicLog => self.cubic(t),
-            Law::LinearBounded | Law::Linear => self.linear(t),
-            Law::Exponential => self.exponential(t),
-        };
+        let local = self.local(self.normalized(control), Ordering::Equal);
+        let point = local.law.point(self.delta);
         if !control.is_finite() || !point.g.is_finite() || !point.dg.is_finite() {
             return Err(SpiceError::circuit(
                 "nonfinite continuous switch operating point",
@@ -140,106 +131,269 @@ impl Material {
         Ok(point)
     }
 
-    fn cubic(self, t: Real) -> Point {
-        if t < 0. {
-            return Self::endpoint(self.roff);
-        }
-        if t >= 1. {
-            return Self::endpoint(self.ron);
-        }
-        if self.ron > self.roff {
-            // Native P-switch logarithmic minimum-resistance limiter.
-            return Self::endpoint(self.ron);
-        }
-        if matches!(t, 0.) || matches!(self.log_ratio, 0.) {
-            return Self::endpoint(self.roff);
-        }
-        // Smoothstep in log(R). Evaluate the nearer endpoint's expression
-        // to retain accuracy at high ratios and at both joins.
-        let s = 1. - t;
-        let log_r = if t <= 0.5 {
-            self.log_ratio
-                .mul_add(t * t * 2.0_f64.mul_add(-t, 3.), self.roff.ln())
-        } else {
-            (-self.log_ratio).mul_add(s * s * 2.0_f64.mul_add(-s, 3.), self.ron.ln())
-        };
-        let g = (-log_r).exp();
-        Point {
-            g,
-            dg: (-self.log_ratio * 6. * t * s / self.delta) * g,
+    /// The scalar load and Taylor assembly use the same local polynomial in
+    /// normalized control. Its constant term uses the stable endpoint form;
+    /// the directional comparison selects the physical one-sided branch.
+    fn local(self, t: Real, direction: Ordering) -> Local {
+        let below = compare(t, 0., direction) == Ordering::Less;
+        let above = compare(t, 1., direction) == Ordering::Greater;
+        match self.law {
+            Law::CubicLog => {
+                if below {
+                    return Local::flat(self.roff);
+                }
+                if compare(t, 1., direction) != Ordering::Less || self.ron > self.roff {
+                    return Local::flat(self.ron);
+                }
+                if (matches!(t, 0.) && direction == Ordering::Equal) || matches!(self.log_ratio, 0.)
+                {
+                    return Local::flat(self.roff);
+                }
+                let s = 1. - t;
+                let log_r = if t <= 0.5 {
+                    self.log_ratio
+                        .mul_add(t * t * 2.0_f64.mul_add(-t, 3.), self.roff.ln())
+                } else {
+                    (-self.log_ratio).mul_add(s * s * 2.0_f64.mul_add(-s, 3.), self.ron.ln())
+                };
+                Local::new(ResistanceGerm::Log {
+                    g: self.endpoint_conductance(t, log_r),
+                    coefficients: [
+                        self.log_ratio * 6. * t * s,
+                        self.log_ratio * 3. * 2_f64.mul_add(-t, 1.),
+                        -2. * self.log_ratio,
+                    ],
+                })
+            }
+            Law::Exponential => {
+                if self.limited {
+                    if self.ron > self.roff || below {
+                        return Local::flat(self.roff);
+                    }
+                    if above {
+                        return Local::flat(self.ron);
+                    }
+                }
+                if matches!(self.log_ratio, 0.) {
+                    return Local::flat(self.ron);
+                }
+                let log_r = interpolate(t, self.roff.ln(), self.ron.ln(), self.log_ratio);
+                let law = ResistanceGerm::Log {
+                    g: self.endpoint_conductance(t, log_r),
+                    coefficients: [self.log_ratio, 0., 0.],
+                };
+                if self.limited {
+                    Local::new(law)
+                } else {
+                    Local::floor(law, log_r, self.log_ratio, 1e-9_f64.ln(), direction)
+                }
+            }
+            Law::LinearBounded | Law::Linear => {
+                let bounded = self.law == Law::LinearBounded;
+                if self.limited {
+                    if !bounded && self.ron > self.roff {
+                        return Local::flat(self.roff);
+                    }
+                    if below {
+                        return Local::flat(if bounded {
+                            self.roff.max(1e-9)
+                        } else {
+                            self.roff
+                        });
+                    }
+                    if above {
+                        return Local::flat(self.ron);
+                    }
+                }
+                let slope = self.ron - self.roff;
+                if matches!(slope, 0.) {
+                    return Local::flat(self.ron);
+                }
+                let r = interpolate(t, self.roff, self.ron, slope);
+                let law = ResistanceGerm::Linear { r, slope };
+                if bounded || !self.limited {
+                    Local::floor(law, r, slope, 1e-9, direction)
+                } else {
+                    Local::new(law)
+                }
+            }
         }
     }
 
-    fn exponential(self, t: Real) -> Point {
-        if self.limited {
-            if self.ron > self.roff {
-                // A-switch applies the minimum then the maximum limiter.
-                return Self::endpoint(self.roff);
-            }
-            if t < 0. {
-                return Self::endpoint(self.roff);
-            }
-            if t > 1. {
-                return Self::endpoint(self.ron);
-            }
-        }
-        if matches!(self.log_ratio, 0.) {
-            return Self::endpoint(self.ron);
-        }
-        let log_r = if t <= 0.5 {
-            self.log_ratio.mul_add(t, self.roff.ln())
-        } else {
-            (-self.log_ratio).mul_add(1. - t, self.ron.ln())
-        };
-        if !self.limited && log_r <= 1e-9_f64.ln() {
-            return Self::endpoint(1e-9);
-        }
-        let g = if matches!(t, 0.) {
+    fn endpoint_conductance(self, t: Real, log_r: Real) -> Real {
+        if matches!(t, 0.) {
             self.roff.recip()
         } else if matches!(t, 1.) {
             self.ron.recip()
         } else {
             (-log_r).exp()
-        };
-        Point {
-            g,
-            dg: (-self.log_ratio / self.delta) * g,
         }
     }
 
-    fn linear(self, t: Real) -> Point {
-        let bounded = self.law == Law::LinearBounded;
-        if self.limited {
-            if !bounded && self.ron > self.roff {
-                return Self::endpoint(self.roff);
+    pub(super) fn taylor<const N: usize>(
+        self,
+        control: Differential<N>,
+        guards: &mut Option<Vec<LocalGuard>>,
+    ) -> SpiceResult<Differential<N>> {
+        let t = control
+            .value
+            .clone()
+            .offset(-self.off)
+            .scale(self.delta.recip())
+            .with_value(self.normalized(control.value.value()));
+        let local = self.local(t.value(), t.direction());
+        let delta = t.clone().with_value(0.);
+        if let Some(guards) = guards {
+            if self.limited && t.value().is_finite() {
+                guards.push(LocalGuard::interval(0, t, &[0., 1.]));
             }
-            if t < 0. {
-                return Self::endpoint(if bounded {
-                    self.roff.max(1e-9)
-                } else {
-                    self.roff
-                });
-            }
-            if t > 1. {
-                return Self::endpoint(self.ron);
+            if let Some(floor) = local.floor {
+                let argument = delta.clone().scale(floor.slope).offset(floor.value);
+                if argument.check().is_ok() {
+                    guards.push(LocalGuard::sign(1, 0, argument, floor.boundary));
+                }
             }
         }
-        let difference = self.ron - self.roff;
-        if matches!(difference, 0.) {
-            return Self::endpoint(self.ron);
+        let (g, slope) = local.law.taylor(&delta, self.delta)?;
+        Ok(control.lift(g, &slope))
+    }
+}
+
+/// Compare the accepted coordinate and then its first nonzero time derivative.
+fn compare(value: Real, boundary: Real, direction: Ordering) -> Ordering {
+    value
+        .partial_cmp(&boundary)
+        .map_or(Ordering::Equal, |order| {
+            if order == Ordering::Equal {
+                direction
+            } else {
+                order
+            }
+        })
+}
+
+fn interpolate(t: Real, off: Real, on: Real, slope: Real) -> Real {
+    if t <= 0.5 {
+        slope.mul_add(t, off)
+    } else {
+        (-slope).mul_add(1. - t, on)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResistanceGerm {
+    Flat(Real),
+    Linear { r: Real, slope: Real },
+    // Polynomial log(R) about the accepted normalized coordinate.
+    Log { g: Real, coefficients: [Real; 3] },
+}
+
+impl ResistanceGerm {
+    fn point(self, width: Real) -> Point {
+        match self {
+            Self::Flat(g) => Point { g, dg: 0. },
+            Self::Linear { r, slope } => {
+                let g = r.recip();
+                Point {
+                    g,
+                    dg: -(slope / width) * g * g,
+                }
+            }
+            Self::Log {
+                g,
+                coefficients: [slope, _, _],
+            } => Point {
+                g,
+                dg: (-slope / width) * g,
+            },
         }
-        let r = if t <= 0.5 {
-            difference.mul_add(t, self.roff)
-        } else {
-            (-difference).mul_add(1. - t, self.ron)
+    }
+
+    fn taylor(self, delta: &Jet, width: Real) -> SpiceResult<(Jet, Jet)> {
+        let point = self.point(width);
+        let (g, slope) = match self {
+            Self::Flat(g) => (
+                Jet::constant(delta.order(), g),
+                Jet::constant(delta.order(), 0.),
+            ),
+            Self::Linear { r, slope } => {
+                let g = delta.clone().scale(slope).offset(r).reciprocal()?;
+                let derivative = g.multiply(&g).scale(-slope / width);
+                (g, derivative)
+            }
+            Self::Log {
+                coefficients: [a, b, c],
+                ..
+            } => {
+                let square = delta.multiply(delta);
+                let log_delta = delta
+                    .clone()
+                    .scale(a)
+                    .add(&square.clone().scale(b))
+                    .add(&square.multiply(delta).scale(c));
+                let g = log_delta.scale(-1.).exp_with_value(point.g);
+                let log_slope = delta
+                    .clone()
+                    .scale(2. * b)
+                    .add(&square.scale(3. * c))
+                    .offset(a)
+                    .scale(-width.recip());
+                let derivative = g.multiply(&log_slope);
+                (g, derivative)
+            }
         };
-        if (bounded || !self.limited) && r <= 1e-9 {
-            return Self::endpoint(1e-9);
-        }
-        let g = r.recip();
-        Point {
-            g,
-            dg: -(difference / self.delta) * g * g,
+        g.check()?;
+        slope.check()?;
+        Ok((g, slope))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FloorGuard {
+    value: Real,
+    slope: Real,
+    boundary: Real,
+}
+
+#[derive(Clone, Copy)]
+struct Local {
+    law: ResistanceGerm,
+    floor: Option<FloorGuard>,
+}
+
+impl Local {
+    const fn new(law: ResistanceGerm) -> Self {
+        Self { law, floor: None }
+    }
+
+    const fn flat(resistance: Real) -> Self {
+        Self::new(ResistanceGerm::Flat(resistance.recip()))
+    }
+
+    fn floor(
+        law: ResistanceGerm,
+        value: Real,
+        slope: Real,
+        boundary: Real,
+        direction: Ordering,
+    ) -> Self {
+        let orientation = if slope < 0. {
+            direction.reverse()
+        } else {
+            direction
+        };
+        let law = if compare(value, boundary, orientation) == Ordering::Greater {
+            law
+        } else {
+            ResistanceGerm::Flat(1e-9_f64.recip())
+        };
+        Self {
+            law,
+            floor: Some(FloorGuard {
+                value,
+                slope,
+                boundary,
+            }),
         }
     }
 }
