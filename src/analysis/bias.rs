@@ -1553,10 +1553,14 @@ impl Engine<'_> {
         let mut continued = None;
         for stage in stages {
             let solved = self.stage(report, stage, &guess, continued)?;
-            guess = solved.values;
+            self.workspace
+                .recycle_current(std::mem::replace(&mut guess, solved.values));
+            self.workspace.recycle_next(solved.next);
             continued = Some(solved.trial);
         }
-        self.stage(report, closing, &guess, continued)
+        let result = self.stage(report, closing, &guess, continued);
+        self.workspace.recycle_current(guess);
+        result
     }
 
     /// A stage continuing `from` (a converged stage), or restarting from the
@@ -1604,10 +1608,12 @@ impl Engine<'_> {
             match self.step(report, saved.as_ref(), Stage::Gmin(kind, gmin)) {
                 Ok(solved) => {
                     let iterations = solved.iterations;
-                    saved = Some(solved);
+                    if let Some(old) = saved.replace(solved) {
+                        self.workspace.recycle_current(old.values);
+                        self.workspace.recycle_next(old.next);
+                    }
                     if gmin <= target {
-                        let last = saved.as_ref();
-                        return self.step(report, last, Stage::CloseGmin(kind));
+                        return self.step(report, saved.as_ref(), Stage::CloseGmin(kind));
                     }
                     if iterations <= quick {
                         factor = (factor * factor.sqrt()).min(initial_factor);
@@ -1669,11 +1675,12 @@ impl Engine<'_> {
                 }
                 let mut last = None;
                 for _ in 0..=GILLESPIE_GMIN_DECADES {
-                    last = Some(self.step(
-                        report,
-                        last.as_ref(),
-                        Stage::Source { scale: 0., gmin },
-                    )?);
+                    let solved =
+                        self.step(report, last.as_ref(), Stage::Source { scale: 0., gmin })?;
+                    if let Some(old) = last.replace(solved) {
+                        self.workspace.recycle_current(old.values);
+                        self.workspace.recycle_next(old.next);
+                    }
                     gmin /= 10.;
                 }
                 last.ok_or_else(|| Halt::Retry("empty zero-source gmin ladder".into()))?
@@ -1697,7 +1704,9 @@ impl Engine<'_> {
                 Ok(solved) => {
                     let iterations = solved.iterations;
                     converged = scale;
-                    saved = solved;
+                    let old = std::mem::replace(&mut saved, solved);
+                    self.workspace.recycle_current(old.values);
+                    self.workspace.recycle_next(old.next);
                     scale = converged + raise;
                     if iterations <= quick {
                         raise *= 1.5;

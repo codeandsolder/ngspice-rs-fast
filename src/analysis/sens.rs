@@ -51,7 +51,7 @@ use crate::devices::sensitivity::{
 };
 use crate::devices::{AnalysisMode, Circuit, Device, IterationPhase, LoadRequest, TrialState};
 use crate::maths::complex::ComplexMatrix;
-use crate::maths::linear::solve_last_factors_transposed;
+use crate::maths::linear::{RetainedSolveWorkspace, solve_last_factors_into};
 use crate::maths::{SparseMatrix, Vector};
 use crate::primitives::{Complex, NodeId, Real, SpiceError, SpiceResult, parse_spice_number};
 
@@ -2078,12 +2078,19 @@ fn run_dc(
         trial,
         circuit,
     };
-    let adjoint = solve_last_factors_transposed(&at.pattern, &probe.dual(n))?.ok_or_else(|| {
-        SpiceError::Numerical {
+    let mut adjoint = Vector::default();
+    if !solve_last_factors_into(
+        &at.pattern,
+        &probe.dual(n),
+        &mut RetainedSolveWorkspace::default(),
+        &mut adjoint,
+        true,
+    )? {
+        return Err(SpiceError::Numerical {
             context: ".sens".to_owned(),
             message: "the operating point left no factored circuit matrix".to_owned(),
-        }
-    })?;
+        });
+    }
     let mut point = Vec::with_capacity(plot.variables().len());
     let mut scratch = DcAssembly::new(n);
     let mut resolution = walk

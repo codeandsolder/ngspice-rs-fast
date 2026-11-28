@@ -141,7 +141,9 @@ fn a_complex_factorization_in_the_shared_frame_invalidates_the_factors() {
 
 #[test]
 fn measured_cache_work_distinguishes_order_refactor_exact_hit_and_retained_pivots() {
-    use ngspice_rs::maths::{FactorWork, PatternTelemetry, solve_last_factors};
+    use ngspice_rs::maths::{
+        FactorWork, PatternTelemetry, RetainedSolveWorkspace, solve_last_factors_into,
+    };
 
     let p = pattern();
     assert_eq!(p.factor_telemetry(), PatternTelemetry::default());
@@ -184,9 +186,13 @@ fn measured_cache_work_distinguishes_order_refactor_exact_hit_and_retained_pivot
     assert_eq!(after_order.work.rhs_solves, 4);
     assert_eq!(after_order.storage, Some(storage));
 
-    let retained = solve_last_factors(&p, &rhs()).unwrap().unwrap();
+    let mut retained = Vector::default();
+    let mut scratch = RetainedSolveWorkspace::default();
+    assert!(solve_last_factors_into(&p, &rhs(), &mut scratch, &mut retained, false).unwrap());
     assert_eq!(bits(retained.as_slice()), bits(&reordered));
-    assert!(solve_last_factors(&p, &Vector::zeros(1)).is_err());
+    assert!(
+        solve_last_factors_into(&p, &Vector::zeros(1), &mut scratch, &mut retained, false).is_err()
+    );
     let after_retained = p.factor_telemetry();
     assert_eq!(after_retained.work.rhs_solves, 5);
     assert_eq!(after_retained.work.rhs_failures, 1);

@@ -137,19 +137,15 @@ fn error(matrix: &SparseMatrix, rhs: &Vector, x: &Vector, exact: &Vector) -> (f6
     (forward, residual)
 }
 
-fn ni(matrix: &SparseMatrix, rhs: &Vector, reorder: bool) -> Vector {
-    let mut x = Vector::default();
-    match solve_ni(
-        matrix,
-        rhs,
-        &mut NiWorkspace::default(),
-        &mut x,
-        reorder,
-        0.,
-    )
-    .unwrap()
-    {
-        NiStep::Solved => x,
+fn ni(
+    matrix: &SparseMatrix,
+    rhs: &Vector,
+    workspace: &mut NiWorkspace,
+    out: &mut Vector,
+    reorder: bool,
+) {
+    match solve_ni(matrix, rhs, workspace, out, reorder, 0.).unwrap() {
+        NiStep::Solved => (),
         NiStep::ZeroPivot => panic!("grounded positive-definite workload returned zero pivot"),
     }
 }
@@ -208,11 +204,10 @@ pub(super) fn real(name: &str, width: u32, height: u32, repeats: u32) {
         let start = Instant::now();
         let mut last = Vector::zeros(mesh.n);
         for _ in 0..repeats {
-            last = black_box(
-                factors
-                    .solve_with_workspace(black_box(&rhs), &mut workspace)
-                    .unwrap(),
-            );
+            factors
+                .solve_into(black_box(&rhs), &mut workspace, &mut last, false)
+                .unwrap();
+            black_box(&last);
         }
         report(name, "retained_solve", repeats, start.elapsed());
         println!("workload={name},phase=retained_solve,successful_snapshot_rhs_solves={repeats}");
@@ -222,7 +217,11 @@ pub(super) fn real(name: &str, width: u32, height: u32, repeats: u32) {
         // Each changed diagonal forces new numeric factors; repeated values
         // after that refactor can retain the factors. The actual work is
         // read transactionally outside the timed loops.
-        let _ = ni(&bound, &rhs, true);
+        let mut ni_workspace = NiWorkspace::default();
+        let mut changed = Vector::default();
+        let mut same = Vector::default();
+        ni(&bound, &rhs, &mut ni_workspace, &mut changed, true);
+        ni(&bound, &rhs, &mut ni_workspace, &mut same, false);
         let warm = mesh.pattern.factor_telemetry();
         report_cache(name, "cache_after_warmup_cumulative", warm);
         let mut refactor_time = Duration::ZERO;
@@ -233,10 +232,12 @@ pub(super) fn real(name: &str, width: u32, height: u32, repeats: u32) {
                 .unwrap();
             let rhs = bound.mul_vector(&mesh.exact).unwrap();
             let start = Instant::now();
-            let changed = black_box(ni(&bound, &rhs, false));
+            ni(&bound, &rhs, &mut ni_workspace, &mut changed, false);
+            black_box(&changed);
             refactor_time += start.elapsed();
             let start = Instant::now();
-            let same = black_box(ni(&bound, &rhs, false));
+            ni(&bound, &rhs, &mut ni_workspace, &mut same, false);
+            black_box(&same);
             reuse_time += start.elapsed();
             assert_eq!(same.as_slice(), changed.as_slice());
             let (f, r) = error(&bound, &rhs, &same, &mesh.exact);
