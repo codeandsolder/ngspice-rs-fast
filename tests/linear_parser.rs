@@ -263,6 +263,7 @@ fn unsupported_semantics_never_get_silently_dropped() {
         ("C1 a 0 1u bad=2", "inp2c.c"),
         ("I1 a 0 dc \"ival\"", "inp2i.c"),
         ("V1 a 0 ac \"gain\"", "inp2v.c"),
+        (".control\nquit\n.endc", "frontend/inp.c"),
         // `.save`/`.print` now parse into output requests; `.plot` (the ASCII
         // plotting card) is still outside the port's subset.
         (".model rm r(rsh=\"sheet\")", "inpdomod.c"),
@@ -275,7 +276,7 @@ fn unsupported_semantics_never_get_silently_dropped() {
 
 #[test]
 fn implemented_stochastic_and_control_cards_are_retained() {
-    let deck = parse("V1 a 0 trnoise(0 1n)\n.control\nquit\n.endc").unwrap();
+    let deck = parse("V1 a 0 trnoise(0 1n)\n.op\n.control\nrun\nquit\n.endc").unwrap();
     let source = deck.device("v1").unwrap();
     assert!(matches!(
         &source.parameters[0].kind,

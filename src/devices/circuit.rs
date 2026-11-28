@@ -2745,6 +2745,22 @@ impl Circuit {
         self.bindings.regularization_nodes.as_deref()
     }
 
+    /// Stamp the requested conductance only on original electrical KCL rows.
+    pub(crate) fn stamp_nodal_regularization(
+        &self,
+        matrix: &mut SparseMatrix,
+        conductance: Real,
+    ) -> SpiceResult<()> {
+        if let Some(rows) = self.regularization_nodes()
+            && conductance > 0.
+        {
+            for &row in rows {
+                matrix.add(row, row, conductance)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn private_storage_rows(&self) -> &[(usize, usize)] {
         &self.bindings.private_storage_rows
     }
