@@ -2,8 +2,9 @@
 //!
 //! The same prepared devices and original MNA coordinates are used for both
 //! F(x,t) and Q(x,t), so the equation is F + dQ/dt = 0. No integration
-//! coefficient, time discretization, device limiting, or artificial gmin
-//! is introduced by this evaluator.
+//! coefficient, time discretization, or device limiting is introduced. A
+//! retained continuation conductance, if present, acts only on original
+//! electrical KCL rows in both residual and Taylor evaluations.
 
 mod guards;
 
