@@ -66,17 +66,34 @@ and the public VDMOS artifact with hidden series nodes, DC, AC and noise.
 The live reference test independently compares three VDMOS operating-point
 currents at different multipliers against ngspice 47.
 
-The public producer now supports transactional selective lane replacement
-and lane-local scalar evaluation. Solver ownership of scalar/tile
-preparation and selective lane replacement is addressed separately in
-[#250](https://github.com/codeandsolder/ngspice-rs-fast/issues/250).
+## Preparation ownership
 
-Prepared runs keep immutable tile recipes across candidate transitions.
-Frequency-only and source-only transitions with unchanged recipes reuse
-all tiles; numeric changes replace only affected tiles, after all
-replacement preparations succeed. Stable coordinate-to-row mappings are
-bound during tile preparation. Domain errors during evaluation become
-numerical trial failures rather than structural circuit errors.
+The producer's typed tiles own the contiguous prepared data of grouped
+instances. Initial standalone preparations move into the tile without a
+second physical preparation. Scalar, observation, AC, noise and family
+trial evaluation read the same typed lane, while genuine singleton
+instances own standalone physical data.
+
+A prepared run holds an exclusive lease on its candidate preparation.
+Sequential analysis scopes reuse one idle preparation; concurrent live
+runs never share mutable physical tiles. Candidate validation and
+publication use the same staged physical plan. Numeric setters are
+combined per device before preparing its final recipe.
+
+Every affected tile stages only changed physical lanes. All tile
+transactions, singleton preparations and row-offset updates must be
+validated before committing the new candidate; a rejected candidate
+does not alter the previous prepared lane data or accepted solver state.
+Exact artifact identity or topology changes rebuild membership and
+coordinate bindings. A temperature change with constant effective
+ambient updates thermal row offsets without repeating physical
+preparation. Frequency-only and source-only transitions preserve
+unchanged physical data.
+
+Unchanged Newton loads reuse their prepared recipes, physical data,
+coordinate-to-row maps and output workspaces. Domain errors during
+evaluation become numerical trial failures rather than structural circuit
+errors.
 
 On Acer (Ryzen 7 4700U, CPU 5), the interleaved release benchmark over 128
 VDMOS instances, prebound reusable MNA matrices and 11 measured 300-load

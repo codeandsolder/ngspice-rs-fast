@@ -1,0 +1,19 @@
+Public VDMOS artifact engine reference
+vd0 d0 0 .25
+vg0 g0 0 4
+vd1 d1 0 .25
+vg1 g1 0 4
+vd2 d2 0 .25
+vg2 g2 0 4
+m0 d0 g0 0 dut m=1
+m1 d1 g1 0 dut m=2
+m2 d2 g2 0 dut m=3
+.model dut vdmos(vto=3 kp=2 rd=.02 rg=1 rs=.01 rb=.015 cgs=1n cgdmin=20p cgdmax=800p cjo=100p kf=1e-15)
+.options reltol=1e-10 abstol=1e-13 vntol=1e-10
+.control
+set numdgt=17
+op
+print i(vd0) i(vd1) i(vd2)
+quit
+.endc
+.end

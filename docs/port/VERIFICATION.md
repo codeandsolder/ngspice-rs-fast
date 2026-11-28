@@ -911,6 +911,26 @@ dependent latch states, the `optran.c` failure) and the `limiting.rs` unit
 tests. Fourteen new parser snapshots were blessed; existing snapshots are
 unchanged. See [DC_CONTINUATION.md](DC_CONTINUATION.md).
 
+## Explicit historical Gummel-Poon thermal law (#266)
+
+`gummel_poon_legacy_npn` and `gummel_poon_legacy_pnp` select the same
+classic BJT backend with a model-local historical thermal convention, level
+1 (or omitted). The ordinary NPN/PNP families continue to use ngspice 47
+constants. The historical values are k = 1.3806226e-23 J/K and
+q = 1.6021918e-19 C (public ngspice `const.h`, parent of 0183964d6).
+The ratio k/q is independently witnessed by classic source BJT DC currents
+at -30, 27 and 95 C. Keep TEMP, TNOM, their difference, geometry and model
+parameters in their original physical units. The thermal descriptor is
+computed once per temperature key, not changed in Newton or between
+sensitivity records. Its voltage ratio and the historical pair enter the
+same junction-potential expression used by the historical C temperature
+routine. All existing transport, limiting, depletion charge, AC,
+transient and distortion consumers see the derived thermal descriptor.
+The DC witness does not establish a vendor's independent thermal/shot
+noise prefactors; they retain the native noise convention pending distinct
+noise evidence. The legacy selectors do not imply VBIC, HICUM or unported
+quasi-saturation physics.
+
 ## M7 Gummel-Poon BJT (#87)
 
 Five new C goldens, each captured individually with `cargo xtask golden

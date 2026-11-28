@@ -315,7 +315,7 @@ pub(super) fn uic_start(
     }
     for index in 0..circuit.device_count() {
         if let Some(voltage) = bound_initial_voltage(circuit, index, &x, context)? {
-            charges.push((voltage.slot, voltage.scale * voltage.voltage));
+            charges.push((voltage.slot, voltage.history.at(voltage.voltage)?.0));
         }
     }
     Ok(UicStart { x, charges })
@@ -395,7 +395,10 @@ fn bound_initial_voltage(
     let states = circuit
         .state_rows(index)
         .ok_or_else(|| failure("missing voltage storage range"))?;
-    if storage.slot >= states.len() || !storage.scale.is_finite() || !voltage.is_finite() {
+    if storage.slot >= states.len()
+        || !storage.history.at(voltage)?.0.is_finite()
+        || !voltage.is_finite()
+    {
         return Err(failure("invalid initial voltage storage binding"));
     }
     let equation = storage
@@ -412,7 +415,7 @@ fn bound_initial_voltage(
         .transpose()?;
     Ok(Some(CapacitorInitial {
         slot: states.start + storage.slot,
-        scale: storage.scale,
+        history: storage.history,
         name: device.name().to_owned(),
         positive,
         negative,
@@ -446,7 +449,7 @@ struct CapacitorInitial {
     voltage: Real,
     equation: Option<AbsoluteRow>,
     slot: usize,
-    scale: Real,
+    history: crate::devices::traits::VoltageStorageHistory,
     exact_startup: bool,
 }
 
@@ -609,7 +612,7 @@ impl<'a> CapacitorRelations<'a> {
                 Join::Cycle { expected } if tolerance.agree(expected, *voltage) => {
                     relations
                         .canonical
-                        .push((capacitor.slot, capacitor.scale * expected));
+                        .push((capacitor.slot, capacitor.history.at(expected)?.0));
                 }
                 Join::Cycle { expected } => {
                     return Err(failure(format!(
@@ -661,7 +664,7 @@ impl<'a> CapacitorRelations<'a> {
                 )));
             }
             self.canonical
-                .push((capacitor.slot, capacitor.scale * expected));
+                .push((capacitor.slot, capacitor.history.at(expected)?.0));
         }
         Ok(())
     }
@@ -1081,9 +1084,10 @@ impl ImpulseStorage {
                 - potential(&right.state, capacitor.negative);
             let slope = potential(&right.rate, capacitor.positive)
                 - potential(&right.rate, capacitor.negative);
+            let (quantity, differential) = capacitor.history.at(voltage)?;
             slots.extend([
-                (capacitor.slot, capacitor.scale * voltage),
-                (capacitor.slot + 1, capacitor.scale * slope),
+                (capacitor.slot, quantity),
+                (capacitor.slot + 1, differential * slope),
             ]);
         }
         for (&AbsoluteRow(row), coordinate) in &self.fixed_coordinates {

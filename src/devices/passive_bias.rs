@@ -299,6 +299,23 @@ pub(super) fn release_capacitor_branch(
     Ok(())
 }
 
+pub(super) fn bind(
+    slot: &mut Option<Box<PassiveInitialization>>,
+    kind: StorageKind,
+    policy: PassiveInitialization,
+) -> SpiceResult<()> {
+    policy.check_kind(kind)?;
+    *slot = Some(Box::new(policy));
+    Ok(())
+}
+
+pub(super) fn has_active_constraints(
+    policy: Option<&PassiveInitialization>,
+    analysis: AnalysisKind,
+) -> bool {
+    policy.is_some_and(|policy| policy.constrains(analysis))
+}
+
 pub(super) fn initial_value(
     policy: Option<&PassiveInitialization>,
     native: Option<Real>,

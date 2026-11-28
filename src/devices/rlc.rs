@@ -820,27 +820,17 @@ impl Device for Capacitor {
         &mut self,
         policy: crate::devices::passive_bias::PassiveInitialization,
     ) -> SpiceResult<()> {
-        policy.check_kind(crate::devices::traits::StorageKind::Capacitor)?;
-        self.bias = Some(Box::new(policy));
-        Ok(())
+        crate::devices::passive_bias::bind(
+            &mut self.bias,
+            crate::devices::traits::StorageKind::Capacitor,
+            policy,
+        )
     }
 
-    fn exact_startup_storage(&self) -> Option<Real> {
-        self.load().exact_initial()
-    }
-
-    fn requires_analysis_context(&self) -> bool {
-        self.has_passive_bias() || self.exact_startup_storage().is_some()
-    }
-
-    fn has_passive_bias(&self) -> bool {
-        crate::devices::passive_bias::has_constraints(self.bias.as_deref())
-    }
-
-    fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
-        self.bias
-            .as_deref()
-            .is_some_and(|policy| policy.constrains(analysis))
+    fn passive_initialization(
+        &self,
+    ) -> Option<&crate::devices::passive_bias::PassiveInitialization> {
+        self.bias.as_deref()
     }
 
     fn setup_matrix(
@@ -1107,27 +1097,17 @@ impl Device for Inductor {
         &mut self,
         policy: crate::devices::passive_bias::PassiveInitialization,
     ) -> SpiceResult<()> {
-        policy.check_kind(crate::devices::traits::StorageKind::Inductor)?;
-        self.bias = Some(Box::new(policy));
-        Ok(())
+        crate::devices::passive_bias::bind(
+            &mut self.bias,
+            crate::devices::traits::StorageKind::Inductor,
+            policy,
+        )
     }
 
-    fn exact_startup_storage(&self) -> Option<Real> {
-        self.load().exact_initial()
-    }
-
-    fn requires_analysis_context(&self) -> bool {
-        self.has_passive_bias() || self.exact_startup_storage().is_some()
-    }
-
-    fn has_passive_bias(&self) -> bool {
-        crate::devices::passive_bias::has_constraints(self.bias.as_deref())
-    }
-
-    fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
-        self.bias
-            .as_deref()
-            .is_some_and(|policy| policy.constrains(analysis))
+    fn passive_initialization(
+        &self,
+    ) -> Option<&crate::devices::passive_bias::PassiveInitialization> {
+        self.bias.as_deref()
     }
 
     fn setup_matrix(
