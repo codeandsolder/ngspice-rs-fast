@@ -60,7 +60,7 @@ pub(super) struct JunctionCapacitance {
 /// BSIM4 host retains the state-write sequence while other consumers can
 /// use the final constitutive pair directly.
 pub(super) fn depletion<S: Constitutive>(
-    voltage: S,
+    voltage: &S,
     parts: [JunctionCapacitance; 3],
     mut observe_charge: impl FnMut(&S),
 ) -> SpiceResult<(S, S)> {
@@ -119,6 +119,112 @@ pub(super) fn depletion<S: Constitutive>(
         observe_charge(&charge);
         Ok((charge, increment.offset(zero)))
     }
+}
+
+/// Smooth positive half-root, evaluated using its conjugate on the small
+/// negative tail. The selection is numerical, not a physical branch.
+pub(super) fn positive_half_sum<S: Constitutive>(x: S, root: S, product: S) -> SpiceResult<S> {
+    if x.primal() >= 0. {
+        Ok(root.midpoint(&x))
+    } else {
+        product.scale(2.).divide(&root.add(&x.scale(-1.)))
+    }
+}
+
+/// Regularized positive part and its partial in the input coordinate.
+pub(super) fn smooth_positive<S: Constitutive>(
+    x: S,
+    quarter_width_squared: Real,
+) -> SpiceResult<(S, S)> {
+    if quarter_width_squared == 0.
+        && let Some(direction) = x.compare(0.)
+    {
+        return Ok(match direction {
+            Ordering::Less => (x.constant(0.), x.constant(0.)),
+            Ordering::Greater => {
+                let slope = x.constant(1.);
+                (x, slope)
+            }
+            Ordering::Equal => (x.clone().scale(0.5), x.constant(0.5)),
+        });
+    }
+    let root = x
+        .clone()
+        .mul_add(&x, &x.constant(4. * quarter_width_squared))
+        .sqrt()?;
+    let value = positive_half_sum(x.clone(), root.clone(), x.constant(quarter_width_squared))?;
+    let slope = value.clone().divide(&root)?;
+    Ok((value, slope))
+}
+
+/// Smaller root of y² - (sat + drain + delta)y + sat*drain = 0.
+/// Retain the complementary drain gap and both independent partials.
+pub(super) struct DrainSmoothing<S> {
+    pub(super) effective: S,
+    pub(super) drain_excess: S,
+    pub(super) saturation_partial: S,
+    pub(super) drain_partial: S,
+}
+
+pub(super) fn smooth_drain<S: Constitutive>(
+    saturation: S,
+    drain: S,
+    delta: Real,
+) -> SpiceResult<DrainSmoothing<S>> {
+    let x = saturation
+        .clone()
+        .add(&drain.clone().scale(-1.))
+        .offset(-delta);
+    let root = x
+        .clone()
+        .mul_add(&x, &saturation.clone().scale(4. * delta))
+        .sqrt()?;
+    let effective = saturation
+        .clone()
+        .scale(2.)
+        .divide(&saturation.clone().add(&drain).offset(delta).add(&root))?
+        .multiply(&drain);
+    let drain_excess = positive_half_sum(
+        drain
+            .clone()
+            .add(&saturation.clone().scale(-1.))
+            .offset(-delta),
+        root.clone(),
+        drain.scale(delta),
+    )?;
+    let saturation_excess = positive_half_sum(x, root.clone(), saturation.scale(delta))?;
+    Ok(DrainSmoothing {
+        effective,
+        saturation_partial: drain_excess.clone().divide(&root)?,
+        drain_partial: saturation_excess.divide(&root)?,
+        drain_excess,
+    })
+}
+
+/// Normalized bulk depletion charge, with its differential capacitance.
+/// The negative-potential continuation is linear and the positive root
+/// is rationalized to retain very small nonzero charges.
+pub(super) fn depletion_charge<S: Constitutive>(k1: Real, increment: S) -> SpiceResult<(S, S)> {
+    if k1 == 0. {
+        return Ok((increment.constant(0.), increment.constant(0.)));
+    }
+    if increment.compare(0.) == Some(Ordering::Less) {
+        let slope = increment.constant(1.);
+        return Ok((increment, slope));
+    }
+    let base = 0.5 * k1;
+    // Use the fused primal through the common arithmetic, not a separately rounded base square.
+    let root = increment
+        .constant(base)
+        .mul_add(&increment.constant(base), &increment)
+        .sqrt()?;
+    let slope = increment.constant(base).divide(&root)?;
+    let difference = if base > 0. {
+        increment.divide(&root.offset(base))?
+    } else {
+        root.offset(-base)
+    };
+    Ok((difference.scale(k1), slope))
 }
 
 /// Effective gate voltage and local gate derivative after poly-Si depletion.
@@ -275,8 +381,8 @@ mod tests {
             (0., 0.04),
             (0.25, -0.03),
         ] {
-            let (charge, cap) = depletion(variable(bias, rate)?, parts, |_| {})?;
-            let (scalar_charge, scalar_cap) = depletion(bias, parts, |_| {})?;
+            let (charge, cap) = depletion(&variable(bias, rate)?, parts, |_| {})?;
+            let (scalar_charge, scalar_cap) = depletion(&bias, parts, |_| {})?;
             close(charge.value.value(), scalar_charge, 2e-28);
             close(cap.value.value(), scalar_cap, 2e-28);
             check_charge_gradient(&charge, &cap);
@@ -309,7 +415,7 @@ mod tests {
                 }
             }
             let sample = 0.02;
-            let (reference, _) = depletion(rate.mul_add(sample, bias), parts, |_| {})?;
+            let (reference, _) = depletion(&rate.mul_add(sample, bias), parts, |_| {})?;
             close(value_at(&charge.value, sample), reference, 2e-25);
         }
         Ok(())
@@ -335,6 +441,98 @@ mod tests {
                     (base + extra) * v - extra * (half + 0.5 * kappa * (secondary - 1.));
                 close(value_at(&charge.value, sample), reference, 2e-23);
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn smoothing_retains_full_trajectory_and_local_partials() -> SpiceResult<()> {
+        type Pair = Differential<2>;
+        let delta = 0.01;
+        for (saturation, drain, ds, dd) in [
+            (0.5, 0., 0.01, 0.02),
+            (0.5, 0.1, 0.01, -0.02),
+            (0.5, 0.5, -0.01, 0.02),
+            (0.5, 1.2, 0.01, 0.02),
+            (1e-8, 1., 1e-9, 0.01),
+            (1., 1e-18, 0.01, 1e-19),
+        ] {
+            let sat = Pair::variable(0, Jet::affine(ORDER, saturation, ds))?;
+            let vds = Pair::variable(1, Jet::affine(ORDER, drain, dd))?;
+            let law = smooth_drain(sat, vds, delta)?;
+            for (index, partial) in [&law.saturation_partial, &law.drain_partial]
+                .into_iter()
+                .enumerate()
+            {
+                let gradient = law.effective.gradient[index].as_ref().unwrap();
+                for (&actual, &expected) in gradient
+                    .coefficients()
+                    .iter()
+                    .zip(partial.value.coefficients())
+                {
+                    close(actual, expected, 3e-15);
+                }
+            }
+            let reconstructed = law.effective.value.add(&law.drain_excess.value);
+            let reference = Jet::affine(ORDER, drain, dd);
+            for (&actual, &expected) in reconstructed
+                .coefficients()
+                .iter()
+                .zip(reference.coefficients())
+            {
+                close(actual, expected, 3e-15);
+            }
+            for time in [0.01, 0.02] {
+                let reference =
+                    smooth_drain(ds.mul_add(time, saturation), dd.mul_add(time, drain), delta)?;
+                close(
+                    value_at(&law.effective.value, time),
+                    reference.effective,
+                    2e-24,
+                );
+                close(
+                    value_at(&law.drain_excess.value, time),
+                    reference.drain_excess,
+                    2e-24,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn smooth_positive_and_depletion_share_local_derivatives() -> SpiceResult<()> {
+        for (bias, rate, width) in [
+            (-1e12, 1e10, 0.0025),
+            (-0.5, 0.01, 0.0025),
+            (0., 0.01, 0.0025),
+            (0., -0.01, 0.),
+            (0., 0.01, 0.),
+            (0.5, -0.01, 0.),
+        ] {
+            let (value, slope) = smooth_positive(variable(bias, rate)?, width)?;
+            for (index, &expected) in slope.value.coefficients().iter().enumerate() {
+                let actual = value.gradient[0]
+                    .as_ref()
+                    .map_or(0., |gradient| gradient.coefficients()[index]);
+                close(actual, expected, 1e-300);
+            }
+            let sample = 0.02;
+            let (reference, _) = smooth_positive(rate.mul_add(sample, bias), width)?;
+            close(value_at(&value.value, sample), reference, 1e-24);
+        }
+        for (bias, rate) in [
+            (-0.2, 0.01),
+            (0., -0.01),
+            (0., 0.01),
+            (1e-30, 1e-31),
+            (0.1, -0.01),
+        ] {
+            let (charge, slope) = depletion_charge(0.4, variable(bias, rate)?)?;
+            check_charge_gradient(&charge, &slope);
+            let sample = 0.02;
+            let (reference, _) = depletion_charge(0.4, rate.mul_add(sample, bias))?;
+            close(value_at(&charge.value, sample), reference, 1e-40);
         }
         Ok(())
     }

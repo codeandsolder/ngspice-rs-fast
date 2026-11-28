@@ -321,7 +321,8 @@ impl PhysicalFixture {
             super::channel::electrostatics(&self.model, &mut instance, &self.size, &trace, &bias)
                 .unwrap();
         let transport =
-            super::channel::transport(&self.model, &mut instance, &self.size, &bias, &electro);
+            super::channel::transport(&self.model, &mut instance, &self.size, &bias, &electro)
+                .unwrap();
         let _ = super::charge::intrinsic(
             &self.model,
             &mut instance,
@@ -495,12 +496,12 @@ fn smoothed_drain_preserves_small_signal_and_saturation_limits() {
         (1e-15, 9.803_921_568_627_451e-16),
         (1e-18, 9.803_921_568_627_452e-19),
     ] {
-        let p = super::smooth_drain(sat, drain, delta);
+        let p = super::smooth_drain(sat, drain, delta).unwrap();
         assert!((p.effective - expected).abs() <= 8. * f64::EPSILON * expected);
         assert!((p.effective + p.drain_excess - drain).abs() <= 8. * f64::EPSILON * drain);
         assert!(p.saturation_partial > 0. && p.drain_partial > 0.);
     }
-    let zero = super::smooth_drain(sat, 0., delta);
+    let zero = super::smooth_drain(sat, 0., delta).unwrap();
     assert_eq!(zero.effective, 0.);
     assert_eq!(zero.drain_excess, 0.);
     assert_eq!(zero.saturation_partial, 0.);
@@ -513,15 +514,23 @@ fn smoothed_drain_preserves_small_signal_and_saturation_limits() {
         (1e-8, 1.),
         (1., 1e-8),
     ] {
-        let p = super::smooth_drain(sat, drain, delta);
+        let p = super::smooth_drain(sat, drain, delta).unwrap();
         let h = 1e-5 * sat.min(drain);
         let steps = [-h, h, -h * 0.5, h * 0.5];
         let (ds, es) = richardson(
-            steps.map(|d| super::smooth_drain(sat + d, drain, delta).effective),
+            steps.map(|d| {
+                super::smooth_drain(sat + d, drain, delta)
+                    .unwrap()
+                    .effective
+            }),
             h,
         );
         let (dd, ed) = richardson(
-            steps.map(|d| super::smooth_drain(sat, drain + d, delta).effective),
+            steps.map(|d| {
+                super::smooth_drain(sat, drain + d, delta)
+                    .unwrap()
+                    .effective
+            }),
             h,
         );
         assert!((p.saturation_partial - ds).abs() < 2e-8 * ds.abs() + es * 0.1 + 2e-10);
@@ -609,15 +618,15 @@ fn saturation_quadratic_has_regular_linear_limit() {
 fn depletion_charge_preserves_tiny_positive_charge_and_continuation() {
     let k1 = 0.4;
     for increment in [1e-3_f64, 1e-9, 1e-15, 1e-21, 1e-30] {
-        let (charge, slope) = super::depletion_charge(k1, increment);
+        let (charge, slope) = super::depletion_charge(k1, increment).unwrap();
         assert!(charge > 0.);
         let difference = charge / k1;
         assert!((difference * (k1 + difference) - increment).abs() < 8. * f64::EPSILON * increment);
         assert!(slope > 0. && slope <= 1.);
     }
-    assert_eq!(super::depletion_charge(k1, 0.), (0., 1.));
-    assert_eq!(super::depletion_charge(k1, -1e-30), (-1e-30, 1.));
-    assert_eq!(super::depletion_charge(0., 1e-3), (0., 0.));
+    assert_eq!(super::depletion_charge(k1, 0.).unwrap(), (0., 1.));
+    assert_eq!(super::depletion_charge(k1, -1e-30).unwrap(), (-1e-30, 1.));
+    assert_eq!(super::depletion_charge(0., 1e-3).unwrap(), (0., 0.));
 }
 
 #[test]
@@ -718,17 +727,17 @@ fn subthreshold_and_mobility_modes_have_independent_channel_derivatives() {
 #[test]
 fn smooth_positive_retains_small_tail_and_slope() {
     // Rationalized result for x=-1e12, width²/4=0.0025.
-    let (value, slope) = super::smooth_positive(-1e12, 0.0025);
+    let (value, slope) = super::smooth_positive(-1e12, 0.0025).unwrap();
     assert!((value / 2.5e-15 - 1.).abs() < 1e-14);
     assert!((slope / 2.5e-27 - 1.).abs() < 1e-14);
-    assert_eq!(super::smooth_positive(0., 0.), (0., 0.5));
-    assert_eq!(super::smooth_positive(-2., 0.), (0., 0.));
-    assert_eq!(super::smooth_positive(2., 0.), (2., 1.));
+    assert_eq!(super::smooth_positive(0., 0.).unwrap(), (0., 0.5));
+    assert_eq!(super::smooth_positive(-2., 0.).unwrap(), (0., 0.));
+    assert_eq!(super::smooth_positive(2., 0.).unwrap(), (2., 1.));
     for x in [-10., -0.2, 0., 0.2, 10.] {
-        let (value, slope) = super::smooth_positive(x, 0.0025);
+        let (value, slope) = super::smooth_positive(x, 0.0025).unwrap();
         let h = 1e-4;
-        let samples =
-            [-h, h, -h * 0.5, h * 0.5].map(|delta| super::smooth_positive(x + delta, 0.0025).0);
+        let samples = [-h, h, -h * 0.5, h * 0.5]
+            .map(|delta| super::smooth_positive(x + delta, 0.0025).unwrap().0);
         let (expected, error) = richardson(samples, h);
         assert!(value > 0.);
         assert!((slope - expected).abs() < 1e-8 * expected.abs() + error + 1e-12);

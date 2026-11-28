@@ -270,7 +270,7 @@ pub(super) fn intrinsic(
             here.cbdb = 0.0;
             here.cbsb = -here.cgsb;
         } else if Vgst <= 0.0 {
-            let (charge, slope) = depletion_charge(pParam.k1ox, Arg1);
+            let (charge, slope) = depletion_charge(pParam.k1ox, Arg1)?;
             qgate = CoxWL * charge;
             qbulk = -qgate;
             qdrn = 0.0;
@@ -552,7 +552,7 @@ pub(super) fn intrinsic(
         if model.capMod == 1 {
             Vfb = here.vfbzb;
             V3 = Vfb - Vgs_eff + VbseffCV - DELTA_3;
-            let (flatband_shift, flatband_slope) = smooth_positive(V3, DELTA_3 * Vfb.abs());
+            let (flatband_shift, flatband_slope) = smooth_positive(V3, DELTA_3 * Vfb.abs())?;
             T1 = flatband_slope;
             Vfbeff = Vfb - flatband_shift;
             dVfbeff_dVg = T1 * dVgs_eff_dVg;
@@ -561,7 +561,7 @@ pub(super) fn intrinsic(
             dQac0_dVg = CoxWL * dVfbeff_dVg;
             dQac0_dVb = CoxWL * dVfbeff_dVb;
             T3 = Vgs_eff - Vfbeff - VbseffCV - Vgsteff;
-            let (charge, slope) = depletion_charge(pParam.k1ox, T3);
+            let (charge, slope) = depletion_charge(pParam.k1ox, T3)?;
             Qsub0 = CoxWL * charge;
             T2 = CoxWL * slope;
             dQsub0_dVg = T2 * (dVgs_eff_dVg - dVfbeff_dVg - dVgsteff_dVg);
@@ -570,7 +570,7 @@ pub(super) fn intrinsic(
             AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
             dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb;
             VdsatCV = Vgsteff / AbulkCV;
-            let smoothing = smooth_drain(VdsatCV, Vds, DELTA_4);
+            let smoothing = smooth_drain(VdsatCV, Vds, DELTA_4)?;
             VdseffCV = smoothing.effective;
             dVdseffCV_dVg = smoothing.saturation_partial * (1.0 / AbulkCV);
             dVdseffCV_dVd = smoothing.drain_partial;
@@ -651,7 +651,7 @@ pub(super) fn intrinsic(
             here.cbdb = Cbd;
         } else if model.capMod == 2 {
             V3 = here.vfbzb - Vgs_eff + VbseffCV - DELTA_3;
-            let (flatband_shift, flatband_slope) = smooth_positive(V3, DELTA_3 * here.vfbzb.abs());
+            let (flatband_shift, flatband_slope) = smooth_positive(V3, DELTA_3 * here.vfbzb.abs())?;
             T1 = flatband_slope;
             Vfbeff = here.vfbzb - flatband_shift;
             dVfbeff_dVg = T1 * dVgs_eff_dVg;
@@ -677,7 +677,7 @@ pub(super) fn intrinsic(
                 dTcen_dVg = dTcen_dVb;
             }
             LINK = 1.0e-3 * here.toxp;
-            let centroid = smooth_drain(pParam.ldeb, Tcen, LINK);
+            let centroid = smooth_drain(pParam.ldeb, Tcen, LINK)?;
             Tcen = centroid.effective;
             T1 = centroid.drain_partial;
             dTcen_dVg *= T1;
@@ -695,7 +695,7 @@ pub(super) fn intrinsic(
             dQac0_dVg = CoxWLcen * dVfbeff_dVg + QovCox * dCoxeff_dVg;
             dQac0_dVb = CoxWLcen * dVfbeff_dVb + QovCox * dCoxeff_dVb;
             T3 = Vgs_eff - Vfbeff - VbseffCV - Vgsteff;
-            let (charge, slope) = depletion_charge(pParam.k1ox, T3);
+            let (charge, slope) = depletion_charge(pParam.k1ox, T3)?;
             Qsub0 = CoxWLcen * charge;
             T2 = CoxWLcen * slope;
             QovCox = Qsub0 / Coxeff;
@@ -715,7 +715,7 @@ pub(super) fn intrinsic(
             T0 = Vgsteff - DeltaPhi - 0.001;
             dT0_dVg = 1.0 - dDeltaPhi_dVg;
             T1 = sqrt(T0 * T0 + Vgsteff * 0.004);
-            VgDP = positive_half_sum(T0, T1, 0.001 * Vgsteff);
+            VgDP = positive_half_sum(T0, T1, 0.001 * Vgsteff)?;
             dVgDP_dVg = dT0_dVg.mul_add(VgDP, 0.001) / T1;
             Tox += Tox;
             T0 = (Vgsteff + here.vtfbphi2) / Tox;
@@ -739,7 +739,7 @@ pub(super) fn intrinsic(
             AbulkCV = Abulk0_Q * pParam.abulkCVfactor;
             dAbulkCV_dVb = pParam.abulkCVfactor * dAbulk0_Q_dVb;
             VdsatCV = VgDP / AbulkCV;
-            let smoothing = smooth_drain(VdsatCV, Vds, DELTA_4);
+            let smoothing = smooth_drain(VdsatCV, Vds, DELTA_4)?;
             VdseffCV = smoothing.effective;
             dVdseffCV_dVg = smoothing.saturation_partial * (dVgDP_dVg / AbulkCV);
             dVdseffCV_dVd = smoothing.drain_partial;

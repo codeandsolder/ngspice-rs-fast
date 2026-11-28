@@ -8,11 +8,12 @@ use std::cmp::Ordering;
 use super::differential::Differential;
 use crate::primitives::{Real, SpiceResult};
 
-pub(crate) trait Constitutive: Clone {
+pub trait Constitutive: Clone {
     fn constant(&self, value: Real) -> Self;
     fn primal(&self) -> Real;
     fn compare(&self, boundary: Real) -> Option<Ordering>;
     fn add(self, rhs: &Self) -> Self;
+    fn midpoint(self, rhs: &Self) -> Self;
     fn multiply(self, rhs: &Self) -> Self;
     fn divide(self, rhs: &Self) -> SpiceResult<Self>;
     fn scale(self, factor: Real) -> Self;
@@ -45,6 +46,11 @@ impl Constitutive for Real {
     #[inline]
     fn add(self, rhs: &Self) -> Self {
         self + rhs
+    }
+
+    #[inline]
+    fn midpoint(self, rhs: &Self) -> Self {
+        Self::midpoint(self, *rhs)
     }
 
     #[inline]
@@ -118,6 +124,13 @@ impl<const N: usize> Constitutive for Differential<N> {
 
     fn add(self, rhs: &Self) -> Self {
         Self::add(self, rhs)
+    }
+
+    fn midpoint(self, rhs: &Self) -> Self {
+        let constant = self.primal().midpoint(rhs.primal());
+        let mut result = self.scale(0.5).add(&rhs.clone().scale(0.5));
+        result.value = result.value.with_value(constant);
+        result
     }
 
     fn multiply(self, rhs: &Self) -> Self {
