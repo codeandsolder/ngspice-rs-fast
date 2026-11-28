@@ -99,6 +99,10 @@ pub enum ModelFamily {
     LogicVoltage,
     /// Timed conductance switch.
     TimedSwitch,
+    /// XSPICE cubic logarithmic switch.
+    PSwitch,
+    /// XSPICE exponential analog switch.
+    ASwitch,
 }
 
 impl ModelFamily {
@@ -130,6 +134,8 @@ impl ModelFamily {
             "preprocess_logic_event" => Some(Self::LogicEvent),
             "preprocess_logic_voltage" => Some(Self::LogicVoltage),
             "preprocess_timed_switch" => Some(Self::TimedSwitch),
+            "pswitch" => Some(Self::PSwitch),
+            "aswitch" => Some(Self::ASwitch),
             // `inpdomod.c` accepts the HFET spellings as the same families;
             // `level` then selects the device (5 is `hfet1/`, 6 `hfet2/`).
             "nmf" | "nhfet" => Some(Self::Nmf),
@@ -160,7 +166,9 @@ impl ModelFamily {
             | Self::FrequencyTransfer
             | Self::LogicEvent
             | Self::LogicVoltage
-            | Self::TimedSwitch => 'a',
+            | Self::TimedSwitch
+            | Self::PSwitch
+            | Self::ASwitch => 'a',
             Self::Nmf | Self::Pmf => 'z',
         }
     }
@@ -234,6 +242,10 @@ pub enum ModelBackend {
     LogicVoltage,
     /// Timed conductance switch.
     TimedSwitch,
+    /// XSPICE cubic logarithmic switch.
+    PSwitch,
+    /// XSPICE exponential analog switch.
+    ASwitch,
 }
 
 /// Authoritative backend catalog entry. Selector aliases are the C levels
@@ -350,6 +362,10 @@ impl ModelBackend {
                             .for_family(ModelFamily::LogicVoltage),
                         BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
                             .for_family(ModelFamily::TimedSwitch),
+                        BackendSpec::new(Self::PSwitch, "Continuous cubic switch", &[1])
+                            .for_family(ModelFamily::PSwitch),
+                        BackendSpec::new(Self::ASwitch, "Continuous analog switch", &[1])
+                            .for_family(ModelFamily::ASwitch),
                     ]
                 }
             }
