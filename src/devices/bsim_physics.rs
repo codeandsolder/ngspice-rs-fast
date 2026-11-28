@@ -30,6 +30,17 @@ pub(super) fn thermal_softplus<S: Constitutive>(
             voltage.constant(slope),
         ));
     }
+    thermal_softplus_interior(voltage, factor, thermal, argument)
+}
+
+/// Unclipped softplus. BSIM3's DC lower tail is a different law and may
+/// not use the C-V exponential floor, even when its argument is below -34.
+fn thermal_softplus_interior<S: Constitutive>(
+    voltage: &S,
+    factor: &S,
+    thermal: Real,
+    argument: S,
+) -> SpiceResult<(S, S, S)> {
     // For z > 0, evaluate the linear asymptote plus its small tail.
     // This also avoids cancellation of the n-partial in automatic differentiation.
     if argument.primal() > 0. {
@@ -57,6 +68,56 @@ pub(super) fn thermal_softplus<S: Constitutive>(
             entropy.scale(thermal),
         ))
     }
+}
+
+/// BSIM3 DC effective overdrive. Its weak-inversion asymptote differs
+/// from the BSIM4/C-V clipped softplus and is retained explicitly.
+pub(super) fn bsim3_overdrive<S: Constitutive>(
+    voltage: &S,
+    factor: &S,
+    thermal: Real,
+    offset: Real,
+    oxide_ratio: Real,
+) -> SpiceResult<(S, S, S)> {
+    let thermal_factor = factor.clone().scale(thermal);
+    let double_thermal = thermal_factor.clone().scale(2.);
+    let argument = voltage.clone().divide(&double_thermal)?;
+    if argument.compare(EXP_LIMIT) == Some(Ordering::Greater) {
+        return Ok((voltage.clone(), voltage.constant(1.), voltage.constant(0.)));
+    }
+    let denominator_argument = voltage
+        .clone()
+        .scale(-1.)
+        .offset(2. * offset)
+        .divide(&double_thermal)?;
+    if denominator_argument.compare(EXP_LIMIT) == Some(Ordering::Greater) {
+        let exponent = voltage.clone().offset(-offset).divide(&thermal_factor)?;
+        let value = exponent.clone().exp().scale(thermal / oxide_ratio);
+        let voltage_partial = value.clone().divide(&thermal_factor)?;
+        let factor_partial = exponent.scale(-thermal).multiply(&voltage_partial);
+        return Ok((value, voltage_partial, factor_partial));
+    }
+    let (numerator, numerator_voltage, numerator_factor) =
+        thermal_softplus_interior(voltage, factor, 2. * thermal, argument)?;
+    let exponential = denominator_argument.clone().exp().scale(2. * oxide_ratio);
+    let denominator = factor.clone().mul_add(&exponential, &voltage.constant(1.));
+    let denominator_voltage = exponential.clone().scale(-0.5 / thermal);
+    let denominator_factor = denominator_argument
+        .scale(-1.)
+        .offset(1.)
+        .multiply(&exponential);
+    let value = numerator.divide(&denominator)?;
+    let voltage_partial = value
+        .clone()
+        .scale(-1.)
+        .mul_add(&denominator_voltage, &numerator_voltage)
+        .divide(&denominator)?;
+    let factor_partial = value
+        .clone()
+        .scale(-1.)
+        .mul_add(&denominator_factor, &numerator_factor)
+        .divide(&denominator)?;
+    Ok((value, voltage_partial, factor_partial))
 }
 
 /// BSIM4 effective overdrive, shared between intrinsic DC and the
@@ -354,6 +415,157 @@ pub(super) fn smooth_drain<S: Constitutive>(
         drain_excess,
         saturation_excess,
     })
+}
+
+/// Smooth lower body-bias limit and its exact differential. The conjugate
+/// expression preserves the zero and tiny-bias limit without subtracting
+/// nearly equal threshold voltages.
+pub(super) fn body_lower_limit<S: Constitutive>(bias: &S, cutoff: Real) -> SpiceResult<(S, S)> {
+    const DELTA: Real = 0.001;
+    let argument = bias.clone().offset(-cutoff).offset(-DELTA);
+    let width = -DELTA * cutoff;
+    let root = argument
+        .clone()
+        .mul_add(&argument, &bias.constant(4. * width))
+        .sqrt()?;
+    let half = positive_half_sum(argument, root.clone(), bias.constant(width))?;
+    let derivative = half.clone().divide(&root)?;
+    let sum = bias.clone().offset(cutoff - DELTA);
+    let value = if sum.primal() <= 0. && cutoff < 0. {
+        bias.clone()
+            .scale(2. * cutoff)
+            .divide(&sum.add(&root.scale(-1.)))?
+    } else {
+        half.offset(cutoff)
+    };
+    Ok((value, derivative))
+}
+
+/// BSIM3 reference body limiter: the charge/current value is clamped to
+/// the applied bias when the smoothing lies below it. The original C
+/// stamp retains the smoothing partial even on that clamp. Differential
+/// arithmetic of the returned value follows the actual branch instead.
+pub(super) fn bsim3_body_limit<S: Constitutive>(bias: &S, cutoff: Real) -> SpiceResult<(S, S)> {
+    let (raw, reference_partial) = body_lower_limit(bias, cutoff)?;
+    let value = if raw.clone().add(&bias.clone().scale(-1.)).compare(0.) == Some(Ordering::Less) {
+        bias.clone()
+    } else {
+        raw
+    };
+    Ok((value, reference_partial))
+}
+
+/// BSIM4 upper body-bias limiter at 0.95 phi, in addition to the common
+/// lower threshold. Both are smooth physical laws.
+pub(super) fn bsim4_body_limit<S: Constitutive>(
+    bias: &S,
+    cutoff: Real,
+    phi: Real,
+) -> SpiceResult<(S, S)> {
+    let (lower, lower_partial) = body_lower_limit(bias, cutoff)?;
+    let upper = smooth_drain(bias.constant(0.95 * phi), lower, 0.001)?;
+    Ok((
+        upper.effective,
+        upper.drain_partial.multiply(&lower_partial),
+    ))
+}
+
+/// Surface potential and the model's square-root factor and local partials.
+/// BSIM3 uses a rational approximation in forward body bias; BSIM4 uses
+/// the actual square root of the upper-limited potential.
+pub(super) struct SurfacePotential<S> {
+    pub(super) potential: S,
+    pub(super) root: S,
+    pub(super) potential_partial: S,
+    pub(super) root_partial: S,
+}
+
+pub(super) fn surface_potential<S: Constitutive>(
+    body: &S,
+    phi: Real,
+    forward_approximation: Option<Real>,
+) -> SpiceResult<SurfacePotential<S>> {
+    if let Some(phis3) = forward_approximation
+        && body.compare(0.) == Some(Ordering::Greater)
+    {
+        let ratio = body.constant(phi).divide(&body.clone().offset(phi))?;
+        let root = body
+            .constant(phis3)
+            .divide(&body.clone().scale(0.5).offset(phi))?;
+        let root_partial = root.clone().scale(-0.5 / phis3).multiply(&root);
+        Ok(SurfacePotential {
+            potential: ratio.clone().scale(phi),
+            potential_partial: ratio.clone().scale(-1.).multiply(&ratio),
+            root,
+            root_partial,
+        })
+    } else {
+        let potential = body.clone().scale(-1.).offset(phi);
+        let root = potential.clone().sqrt()?;
+        let root_partial = body.constant(-0.5).divide(&root)?;
+        Ok(SurfacePotential {
+            potential,
+            root,
+            potential_partial: body.constant(-1.),
+            root_partial,
+        })
+    }
+}
+
+/// Short/narrow-channel threshold factor and its exact exponent partial.
+/// BSIM4 uses expm1 near zero instead of losing the small difference from
+/// unity; the original `MIN_EXP` regularizer is retained.
+#[derive(Clone, Copy)]
+pub(super) enum ThresholdRollOff {
+    Bsim3,
+    Bsim4,
+}
+
+impl ThresholdRollOff {
+    pub(super) fn evaluate<S: Constitutive>(self, argument: &S) -> SpiceResult<(S, S)> {
+        match self {
+            Self::Bsim3 => {
+                if argument.compare(-EXP_LIMIT) != Some(Ordering::Greater) {
+                    return Ok((
+                        argument.constant(MIN_EXP * (1. + 2. * MIN_EXP)),
+                        argument.constant(0.),
+                    ));
+                }
+                let exponential = argument.clone().exp();
+                let value = exponential
+                    .clone()
+                    .scale(2.)
+                    .offset(1.)
+                    .multiply(&exponential);
+                let slope = exponential
+                    .clone()
+                    .scale(4.)
+                    .offset(1.)
+                    .multiply(&exponential);
+                Ok((value, slope))
+            }
+            Self::Bsim4 => {
+                if argument.compare(EXP_LIMIT) != Some(Ordering::Less) {
+                    return Ok((
+                        argument.constant(1. / (MAX_EXP - 2.)),
+                        argument.constant(0.),
+                    ));
+                }
+                let exponential = argument.clone().exp();
+                let offset = argument.clone().exp_m1();
+                let denominator = offset
+                    .clone()
+                    .mul_add(&offset, &exponential.clone().scale(2. * MIN_EXP));
+                let value = exponential.clone().divide(&denominator)?;
+                let slope = offset
+                    .scale(-1.)
+                    .multiply(&exponential.offset(1.))
+                    .divide(&denominator)?
+                    .multiply(&value);
+                Ok((value, slope))
+            }
+        }
+    }
 }
 
 /// Saturation-shape coefficient, with the exact overdrive partial.
@@ -1273,6 +1485,159 @@ mod tests {
         for (&actual, &expected) in gradient.coefficients().iter().zip(cap.value.coefficients()) {
             close(actual, expected, 2e-26);
         }
+    }
+
+    #[test]
+    fn body_limits_and_surface_potential_match_reference_and_directional_derivatives()
+    -> SpiceResult<()> {
+        let cutoff: Real = -3.;
+        let phi: Real = 0.75;
+        let phi_three_halves = phi * f64::sqrt(phi);
+        for bias in [
+            -30.0_f64, -3., -2.999, -0.5, -1e-16, 0., 1e-16, 0.1, 0.7125, 1.5,
+        ] {
+            for direction in [-1., 1.] {
+                let rate = if bias.abs() > 0. && bias.abs() < 1e-12 {
+                    0.1 * bias.abs() * direction
+                } else {
+                    0.0001 * direction
+                };
+                let input = variable(bias, rate)?;
+                let (lower, lower_partial) = body_lower_limit(&input, cutoff)?;
+                check_charge_gradient(&lower, &lower_partial);
+                let (bsim3, reference_partial) = bsim3_body_limit(&input, cutoff)?;
+                let (bsim4, exact_partial) = bsim4_body_limit(&input, cutoff, phi)?;
+                check_charge_gradient(&bsim4, &exact_partial);
+                let raw_difference = lower.value.clone().add(&input.value.clone().scale(-1.));
+                if raw_difference.sign() == Ordering::Less {
+                    let actual = bsim3.gradient[0].as_ref().unwrap();
+                    close(actual.value(), 1., 1e-15);
+                } else {
+                    check_charge_gradient(&bsim3, &reference_partial);
+                }
+                for (limited, approximation) in [(&bsim3, Some(phi_three_halves)), (&bsim4, None)] {
+                    let body = Law::variable(0, limited.value.clone())?;
+                    let surface = surface_potential(&body, phi, approximation)?;
+                    check_charge_gradient(&surface.potential, &surface.potential_partial);
+                    check_charge_gradient(&surface.root, &surface.root_partial);
+                    for time in [0., 0.001, 0.02] {
+                        let b = value_at(&body.value, time);
+                        let (potential, root) = if approximation.is_some() && b > 0. {
+                            (
+                                phi * phi / (phi + b),
+                                phi_three_halves / 0.5_f64.mul_add(b, phi),
+                            )
+                        } else {
+                            (phi - b, (phi - b).sqrt())
+                        };
+                        close(value_at(&surface.potential.value, time), potential, 1e-14);
+                        close(value_at(&surface.root.value, time), root, 1e-14);
+                    }
+                }
+                for time in [0., 0.001, 0.02] {
+                    let b = rate.mul_add(time, bias);
+                    let x = b - cutoff - 0.001;
+                    let raw = cutoff + x.midpoint(x.mul_add(x, -0.004 * cutoff).sqrt());
+                    let upper = 0.95 * phi;
+                    let x = upper - raw - 0.001;
+                    let limited = upper - x.midpoint(x.mul_add(x, 0.004 * upper).sqrt());
+                    close(value_at(&lower.value, time), raw, 3e-15);
+                    close(value_at(&bsim3.value, time), raw.max(b), 3e-15);
+                    close(value_at(&bsim4.value, time), limited, 3e-15);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threshold_rolloff_and_bsim3_overdrive_match_independent_equations() -> SpiceResult<()> {
+        let cases: [(ThresholdRollOff, [Real; 7]); 2] = [
+            (
+                ThresholdRollOff::Bsim3,
+                [-45., -34., -10., -1., 0., 1., 10.],
+            ),
+            (
+                ThresholdRollOff::Bsim4,
+                [-10., -1., -1e-8, 0., 1e-8, 1., 34.],
+            ),
+        ];
+        for (generation, arguments) in cases {
+            for bias in arguments {
+                let rate = if matches!(generation, ThresholdRollOff::Bsim4) && bias.abs() < 1e-6 {
+                    1e-11
+                } else {
+                    0.001
+                };
+                for direction in [-1., 1.] {
+                    let slope = rate * direction;
+                    let input = variable(bias, slope)?;
+                    let (value, partial) = generation.evaluate(&input)?;
+                    for (degree, &expected) in partial.value.coefficients().iter().enumerate() {
+                        let actual = value.gradient[0]
+                            .as_ref()
+                            .map_or(0., |g| g.coefficients()[degree]);
+                        close(actual, expected, 1e-10 * value.value.value().abs().max(1.));
+                    }
+                    for time in [0.001, 0.02] {
+                        let z = slope.mul_add(time, bias);
+                        let reference = match generation {
+                            ThresholdRollOff::Bsim3 => {
+                                let exponential = if z <= -34. { MIN_EXP } else { z.exp() };
+                                exponential * 2.0_f64.mul_add(exponential, 1.)
+                            }
+                            ThresholdRollOff::Bsim4 => {
+                                if z >= 34. {
+                                    1. / (MAX_EXP - 2.)
+                                } else {
+                                    let e = z.exp();
+                                    z.exp_m1().mul_add(z.exp_m1(), 2. * MIN_EXP * e).recip() * e
+                                }
+                            }
+                        };
+                        close(value_at(&value.value, time), reference, 1e-20);
+                    }
+                }
+            }
+        }
+        type Local = Differential<2>;
+        let thermal = 0.025;
+        let oxide_ratio = 1.8;
+        for offset in [-2., -0.1, 0.2] {
+            for bias in [-5., -2., -0.5, 0., 0.5, 2., 4.] {
+                let factor = 1.4;
+                let rates = [0.001, 0.0001];
+                let v = Local::variable(0, Jet::affine(ORDER, bias, rates[0]))?;
+                let n = Local::variable(1, Jet::affine(ORDER, factor, rates[1]))?;
+                let (value, voltage_partial, factor_partial) =
+                    bsim3_overdrive(&v, &n, thermal, offset, oxide_ratio)?;
+                for (coordinate, partial) in [voltage_partial, factor_partial].iter().enumerate() {
+                    for (degree, &expected) in partial.value.coefficients().iter().enumerate() {
+                        let actual = value.gradient[coordinate]
+                            .as_ref()
+                            .map_or(0., |g| g.coefficients()[degree]);
+                        close(actual, expected, 1e-20);
+                    }
+                }
+                for time in [0., 0.001, 0.02] {
+                    let v = rates[0].mul_add(time, bias);
+                    let n = rates[1].mul_add(time, factor);
+                    let width = 2. * n * thermal;
+                    let numerator_argument = v / width;
+                    let denominator_argument = 2.0_f64.mul_add(offset, -v) / width;
+                    let reference = if numerator_argument > 34. {
+                        v
+                    } else if denominator_argument > 34. {
+                        thermal / oxide_ratio * ((v - offset) / (n * thermal)).exp()
+                    } else {
+                        width * numerator_argument.exp().ln_1p()
+                            / (2. * n * oxide_ratio).mul_add(denominator_argument.exp(), 1.)
+                    };
+                    close(value_at(&value.value, time), reference, 1e-30);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

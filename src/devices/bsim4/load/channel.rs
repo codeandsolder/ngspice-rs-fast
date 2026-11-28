@@ -43,9 +43,10 @@ use super::{
 };
 
 use crate::devices::bsim_physics::{
-    channel_conductance, dibl_early_voltage, effective_overdrive, impact_ionization,
-    poly_depletion, rational_floor, reciprocal_floor, saturation_early_voltage, saturation_shape,
-    saturation_voltage, series_conductance, substrate_early_voltage,
+    ThresholdRollOff, bsim4_body_limit, channel_conductance, dibl_early_voltage,
+    effective_overdrive, impact_ionization, poly_depletion, rational_floor, reciprocal_floor,
+    saturation_early_voltage, saturation_shape, saturation_voltage, series_conductance,
+    substrate_early_voltage, surface_potential,
 };
 use crate::primitives::SpiceResult;
 
@@ -209,25 +210,12 @@ pub(super) fn electrostatics(
         toxe = model.toxe;
         epssub = EPSSI;
     }
-    T0 = Vbs - here.vbsc - 0.001;
-    T1 = sqrt(T0 * T0 - 0.004 * here.vbsc);
-    if T0 >= 0.0 {
-        Vbseff = here.vbsc + 0.5 * (T0 + T1);
-        dVbseff_dVb = 0.5 * (1.0 + T0 / T1);
-    } else {
-        T2 = -0.002 / (T1 - T0);
-        Vbseff = here.vbsc * (1.0 + T2);
-        dVbseff_dVb = T2 * here.vbsc / T1;
-    }
-    T9 = 0.95 * pParam.phi;
-    T0 = T9 - Vbseff - 0.001;
-    T1 = sqrt(T0 * T0 + 0.004 * T9);
-    Vbseff = T9 - 0.5 * (T0 + T1);
-    dVbseff_dVb *= 0.5 * (1.0 + T0 / T1);
-    Phis = pParam.phi - Vbseff;
-    dPhis_dVb = -1.0;
-    sqrtPhis = sqrt(Phis);
-    dsqrtPhis_dVb = -0.5 / sqrtPhis;
+    (Vbseff, dVbseff_dVb) = bsim4_body_limit(&Vbs, here.vbsc, pParam.phi)?;
+    let surface = surface_potential(&Vbseff, pParam.phi, None)?;
+    Phis = surface.potential;
+    sqrtPhis = surface.root;
+    dPhis_dVb = surface.potential_partial;
+    dsqrtPhis_dVb = surface.root_partial;
     Xdep = pParam.Xdep0 * sqrtPhis / pParam.sqrtPhi;
     dXdep_dVb = (pParam.Xdep0 / pParam.sqrtPhi) * dsqrtPhis_dVb;
     Leff = pParam.leff;
@@ -244,34 +232,14 @@ pub(super) fn electrostatics(
     ltw = model.factor1 * T3 * T1;
     dltw_dVb = model.factor1 * (0.5 / T3 * T1 * dXdep_dVb + T3 * T2);
     T0 = pParam.dvt1 * Leff / lt1;
-    if T0 < EXP_THRESHOLD {
-        T1 = exp(T0);
-        T2 = T1 - 1.0;
-        T3 = T2 * T2;
-        T4 = T3 + 2.0 * T1 * MIN_EXP;
-        Theta0 = T1 / T4;
-        dT1_dVb = -T0 * T1 * dlt1_dVb / lt1;
-        dTheta0_dVb = dT1_dVb * (T4 - 2.0 * T1 * (T2 + MIN_EXP)) / T4 / T4;
-    } else {
-        Theta0 = 1.0 / (MAX_EXP - 2.0);
-        dTheta0_dVb = 0.0;
-    }
+    (Theta0, T1) = ThresholdRollOff::Bsim4.evaluate(&T0)?;
+    dTheta0_dVb = -T1 * T0 / lt1 * dlt1_dVb;
     here.thetavth = pParam.dvt0 * Theta0;
     Delt_vth = here.thetavth * V0;
     dDelt_vth_dVb = pParam.dvt0 * dTheta0_dVb * V0;
     T0 = pParam.dvt1w * pParam.weff * Leff / ltw;
-    if T0 < EXP_THRESHOLD {
-        T1 = exp(T0);
-        T2 = T1 - 1.0;
-        T3 = T2 * T2;
-        T4 = T3 + 2.0 * T1 * MIN_EXP;
-        T5 = T1 / T4;
-        dT1_dVb = -T0 * T1 * dltw_dVb / ltw;
-        dT5_dVb = dT1_dVb * (T4 - 2.0 * T1 * (T2 + MIN_EXP)) / T4 / T4;
-    } else {
-        T5 = 1.0 / (MAX_EXP - 2.0);
-        dT5_dVb = 0.0;
-    }
+    (T5, T1) = ThresholdRollOff::Bsim4.evaluate(&T0)?;
+    dT5_dVb = -T1 * T0 / ltw * dltw_dVb;
     T0 = pParam.dvt0w * T5;
     T2 = T0 * V0;
     dT2_dVb = pParam.dvt0w * dT5_dVb * V0;
