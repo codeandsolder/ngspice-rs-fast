@@ -31,8 +31,10 @@ use super::{Inputs, ModelParameters, Value, charges, dc};
 use crate::devices::limiting::{fetlim, limvds, pnjlim};
 use crate::devices::models::{ModelContext, PreparationKey, ResolvedModel};
 use crate::devices::nonlinear::{JunctionPoint, junction_companion};
+use crate::devices::physical_dae::{LocalGuard, TaylorContext, TaylorControl};
 use crate::devices::state::{DeviceState, IterationPhase};
-use crate::devices::traits::{Device, StampContext};
+use crate::devices::traits::{AnalysisMode, Device, PhysicalChargeHistory, StampContext};
+use crate::maths::taylor::{BranchComparison, Constitutive, ObservedDifferential};
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceError, SpiceResult};
 
@@ -513,7 +515,16 @@ impl Device for Bsim3 {
                     .map_or(1., crate::maths::integrator::Coefficients::predictor_ratio)
             });
         let bias = dc::Bias { vbs, vgs, vds };
-        let e = Self::evaluate_at(&cached, bias, context.gmin)?;
+        let e = if matches!(context.mode, AnalysisMode::Instantaneous { .. }) {
+            dc::DcModel {
+                model: &cached.defaults,
+                temperature: &cached.temperature_model,
+                setup: &cached.setup,
+            }
+            .evaluate_physical(bias, context.gmin)?
+        } else {
+            Self::evaluate_at(&cached, bias, context.gmin)?
+        };
         let report = match start {
             Start::Junction => true,
             Start::Limited => check,
@@ -757,6 +768,134 @@ impl Device for Bsim3 {
         Ok(Some(value * m))
     }
 
+    fn physical_charge_histories(
+        &self,
+        visit: &mut dyn FnMut(PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        let cached = self.cache.borrow();
+        let [drain, gate, source, body] = [0, 1, 2, 3].map(|k| self.terminals[k]);
+        let dp = self.primes[0].unwrap_or(drain);
+        let sp = self.primes[1].unwrap_or(source);
+        let scale = self.polarity * cached.setup.multiplier;
+        for (slot, node) in [(slot::QB, body), (slot::QG, gate), (slot::QD, dp)] {
+            visit(PhysicalChargeHistory {
+                slot,
+                nodes: [node, sp],
+                scale,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn assemble_nonlinear_taylor(&self, context: &mut TaylorContext<'_>) -> SpiceResult<()> {
+        let model = context.model;
+        let cached = self.ensure(model.temperature, model.nominal_temperature)?;
+        let [drain, gate, source, body] = [0, 1, 2, 3].map(|k| self.terminals[k]);
+        let dp = self.primes[0].unwrap_or(drain);
+        let sp = self.primes[1].unwrap_or(source);
+        let [drain, gate, source, body, dp, sp] =
+            [drain, gate, source, body, dp, sp].map(|node| context.unknowns.node_row(node));
+        let pol = self.polarity;
+        let multiplier = cached.setup.multiplier;
+        let scale = pol * multiplier;
+        let controls = [[body, sp], [gate, sp], [dp, sp]].map(|rows| TaylorControl {
+            rows,
+            polarity: pol,
+        });
+        let comparisons: Option<RefCell<Vec<BranchComparison>>> =
+            context.output.guards.is_some().then(RefCell::default);
+        let [vbs, vgs, vds] = [
+            controls[0].input::<3>(0, context)?,
+            controls[1].input::<3>(1, context)?,
+            controls[2].input::<3>(2, context)?,
+        ]
+        .map(|law| ObservedDifferential::new(law, comparisons.as_ref()));
+        let raw = dc::Bias { vbs, vgs, vds };
+        let e = dc::DcModel {
+            model: &cached.defaults,
+            temperature: &cached.temperature_model,
+            setup: &cached.setup,
+        }
+        .evaluate_constitutive(raw.clone(), model.gmin)?;
+        let c = charges::ChargeModel {
+            model: &cached.defaults,
+            temperature: &cached.temperature_model,
+            setup: &cached.setup,
+        }
+        .evaluate_constitutive(&e, raw.clone())?;
+        let q =
+            c.with_overlap_constitutive(e.mode, raw.vgs.clone().add(&raw.vbs.clone().scale(-1.)));
+        let (forward_drain, forward_source) = if e.mode >= 0 { (dp, sp) } else { (sp, dp) };
+        for (rows, law) in [
+            ([forward_drain, forward_source], &e.ids),
+            ([forward_drain, body], &e.isub),
+            ([body, sp], &e.cbs),
+            ([body, dp], &e.cbd),
+        ] {
+            context.local_law(rows, &law.inner, &controls, scale, None)?;
+        }
+        for (slot, node, law) in [
+            (slot::QB, body, &q.qb),
+            (slot::QG, gate, &q.qg),
+            (slot::QD, dp, &q.qd),
+        ] {
+            context.local_law([node, sp], &law.inner, &controls, scale, Some(slot))?;
+        }
+        for (outer, inner, conductance) in [
+            (drain, dp, cached.setup.drain_conductance),
+            (source, sp, cached.setup.source_conductance),
+        ] {
+            if outer != inner {
+                for (row, sign) in [(outer, 1.), (inner, -1.)] {
+                    context.linear_static(row, outer, sign * multiplier * conductance)?;
+                    context.linear_static(row, inner, -sign * multiplier * conductance)?;
+                }
+            }
+        }
+        // Preserve the actual one-sided operating point, including auxiliary
+        // junction and inversion charges which are not independent histories.
+        let [gm, gds, gmbs] = dc::mode_partials(&e.ids.inner, e.mode);
+        let [gbgs, gbds, gbbs] = dc::mode_partials(&e.isub.inner, e.mode);
+        for (slot, value) in [
+            (slot::VBS, raw.vbs.primal()),
+            (slot::VBD, raw.vbs.primal() - raw.vds.primal()),
+            (slot::VGS, raw.vgs.primal()),
+            (slot::VDS, raw.vds.primal()),
+            (slot::VON, e.von.primal()),
+            (slot::VDSAT, e.vdsat.primal()),
+            (slot::MODE, Real::from(e.mode)),
+            (slot::CD, e.ids.primal()),
+            (slot::CBS, e.cbs.primal()),
+            (slot::CBD, e.cbd.primal()),
+            (slot::GM, gm),
+            (slot::GDS, gds),
+            (slot::GMBS, gmbs),
+            (slot::GBD, e.gbd),
+            (slot::GBS, e.gbs),
+            (slot::GBGS, gbgs),
+            (slot::GBDS, gbds),
+            (slot::GBBS, gbbs),
+            (slot::CSUB, e.isub.primal()),
+            (slot::QBS, c.qbs.primal()),
+            (slot::QBD, c.qbd.primal()),
+            (slot::QINV, c.qinv.primal()),
+        ] {
+            context.candidate_state(slot, value)?;
+        }
+        if let (Some(trace), Some(comparisons)) = (&mut context.output.guards, comparisons.as_ref())
+        {
+            let guards = std::mem::take(&mut *comparisons.borrow_mut())
+                .into_iter()
+                .enumerate()
+                .map(|(slot, comparison)| {
+                    LocalGuard::sign(slot, 0, comparison.argument, comparison.boundary)
+                })
+                .collect();
+            trace.extend(context.device, guards)?;
+        }
+        Ok(())
+    }
+
     fn assemble_nonlinear_charge(
         &self,
         context: &mut crate::devices::traits::ChargeContext<'_>,
@@ -772,25 +911,28 @@ impl Device for Bsim3 {
             vbs: pol * (voltage(b) - voltage(sp)),
             vgs: pol * (voltage(g) - voltage(sp)),
             vds: pol * (voltage(dp) - voltage(sp)),
-        };
-        let e = Self::evaluate_at(&cached, point, model.gmin)?;
+        }
+        .differential()?;
+        let e = dc::DcModel {
+            model: &cached.defaults,
+            temperature: &cached.temperature_model,
+            setup: &cached.setup,
+        }
+        .evaluate_constitutive(point.clone(), model.gmin)?;
         let c = charges::ChargeModel {
             model: &cached.defaults,
             temperature: &cached.temperature_model,
             setup: &cached.setup,
         }
-        .evaluate(&e, point)?;
-        let q = c.with_overlap(e.mode, point.vgs - point.vbs);
+        .evaluate_constitutive(&e, point.clone())?;
+        let q = c.with_overlap_constitutive(e.mode, point.vgs.add(&point.vbs.scale(-1.)));
         let m = cached.setup.multiplier;
-        for (node, charge) in [(g, q.qg), (dp, q.qd), (sp, -(q.qg + q.qb + q.qd))] {
-            context.branch([node, b], pol * m * charge, 0.)?;
-        }
-        for (row, col, value) in terminal_capacitances(&c, e.mode, [g, b, dp, sp]) {
-            if let (Some(r), Some(k)) = (
-                context.unknowns.node_row(row),
-                context.unknowns.node_row(col),
-            ) {
-                context.jacobian.add(r, k, m * value)?;
+        for (node, law) in [(g, q.qg), (dp, q.qd), (b, q.qb)] {
+            context.branch([node, sp], pol * m * law.value.value(), 0.)?;
+            for (control, gradient) in [b, g, dp].into_iter().zip(law.gradient) {
+                if let Some(gradient) = gradient {
+                    context.coupling([node, sp], [control, sp], m * gradient.value())?;
+                }
             }
         }
         Ok(())

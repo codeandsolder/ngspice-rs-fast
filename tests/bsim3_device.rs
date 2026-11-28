@@ -309,3 +309,107 @@ fn pole_zero_and_ac_agree_on_the_dominant_pole() {
         "|v(d)| {low:?} vs {expected_gain:e}"
     );
 }
+
+#[test]
+fn physical_taylor_matches_scalar_dae_across_channel_and_charge_modes() -> Result<(), SpiceError> {
+    use ngspice_rs::devices::{Limit, TransientTiming};
+    use ngspice_rs::maths::Vector;
+
+    fn close(actual: f64, expected: f64, absolute: f64) {
+        assert!(
+            (actual - expected).abs() <= absolute + 2e-8 * actual.abs().max(expected.abs()),
+            "actual {actual:e}, expected {expected:e}"
+        );
+    }
+
+    for (family, polarity) in [("nmos", 1.), ("pmos", -1.)] {
+        for (mobility, partition) in [(1, 0.4), (2, 0.5), (3, 0.6)] {
+            let mut c = circuit(&format!(
+                "m1 d g s b nn l=1u w=10u nrd=2 nrs=3 m=2 ad=10p as=12p pd=12u ps=14u\n.model nn {family} level=8 capmod=3 mobmod={mobility} xpart={partition} rsh=10 cj=1m cjsw=1n js=1u cgdo=1n cgso=2n cgbo=1n alpha0=1e-8 beta0=0.1"
+            ));
+            c.finalize()?;
+            let prepared = c.prepare_run();
+            let mut dae = prepared.prepare_physical_dae(
+                &ModelContext::default(),
+                TransientTiming::new(1e-6, 1e-3)?,
+            )?;
+            let nodes = c.device("m1").unwrap().terminals();
+            let rows = nodes
+                .iter()
+                .map(|node| c.unknowns().node_row(*node).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 6);
+
+            for (gate, drain, body) in [
+                (0.5, 0.2, -0.3),
+                (2.5, 0.2, -0.3),
+                (2.5, 1.8, -0.3),
+                (2.0, -0.5, -0.8),
+                (2.5, 0.3, 0.1),
+            ] {
+                let mut state = vec![Vector::zeros(c.unknown_count()); 9];
+                for (i, (bias, slope)) in [
+                    (drain + 0.001, 0.002),
+                    (gate, -0.003),
+                    (-0.001, 0.004),
+                    (body, -0.001),
+                    (drain, 0.001),
+                    (0., -0.002),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    state[0].set(rows[i], polarity * bias)?;
+                    state[1].set(rows[i], polarity * slope)?;
+                    state[2].set(rows[i], polarity * slope * 0.01)?;
+                }
+                let taylor = dae.evaluate_taylor(&state, 0., 1e-6, Limit::Right)?;
+                for t in [0., 0.125, 0.5] {
+                    let mut sample = Vector::zeros(c.unknown_count());
+                    for &row in &rows {
+                        sample.set(
+                            row,
+                            state.iter().rev().fold(0., |v: f64, coefficient| {
+                                v.mul_add(t, coefficient.get(row).unwrap())
+                            }),
+                        )?;
+                    }
+                    let scalar = dae.evaluate(&sample, t * 1e-6, Limit::Right)?;
+                    for &row in &rows {
+                        let f = taylor
+                            .residual
+                            .iter()
+                            .rev()
+                            .fold(0., |v: f64, a| v.mul_add(t, a.get(row).unwrap()));
+                        let q = taylor
+                            .charge
+                            .iter()
+                            .rev()
+                            .fold(0., |v: f64, a| v.mul_add(t, a.get(row).unwrap()));
+                        close(f, scalar.residual.get(row).unwrap(), 1e-12);
+                        close(q, scalar.charge.get(row).unwrap(), 1e-21);
+                        for &col in &rows {
+                            let g = taylor
+                                .conductance
+                                .iter()
+                                .rev()
+                                .fold(0., |v: f64, a| v.mul_add(t, a.get(row, col)));
+                            let cap = taylor
+                                .capacitance
+                                .iter()
+                                .rev()
+                                .fold(0., |v: f64, a| v.mul_add(t, a.get(row, col)));
+                            close(g, scalar.conductance.get(row, col), 1e-11);
+                            close(cap, scalar.capacitance.get(row, col), 1e-20);
+                        }
+                    }
+                }
+                for (f, q) in taylor.residual.iter().zip(&taylor.charge) {
+                    close(rows.iter().map(|&row| f.get(row).unwrap()).sum(), 0., 1e-12);
+                    close(rows.iter().map(|&row| q.get(row).unwrap()).sum(), 0., 1e-21);
+                }
+            }
+        }
+    }
+    Ok(())
+}

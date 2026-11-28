@@ -834,3 +834,302 @@ cl out 0 2f
         }
     }
 }
+
+#[test]
+fn physical_taylor_preserves_terminal_incidence_and_split_charge_histories()
+-> Result<(), ngspice_rs::primitives::SpiceError> {
+    use ngspice_rs::devices::{Circuit, Limit, ModelContext, TransientTiming};
+    use ngspice_rs::maths::Vector;
+
+    fn close(actual: f64, expected: f64, absolute: f64) {
+        assert!(
+            (actual - expected).abs() <= absolute + 3e-7 * actual.abs().max(expected.abs()),
+            "actual {actual:e}, expected {expected:e}"
+        );
+    }
+
+    for (family, polarity) in [("nmos", 1.), ("pmos", -1.)] {
+        for (cap, rgate, rbody, rds, gidl) in [
+            (0, 0, 0, 0, 0),
+            (1, 1, 1, 0, 1),
+            (2, 2, 0, 1, 0),
+            (2, 3, 2, 1, 1),
+        ] {
+            let text = format!(
+                "BSIM4 physical terminal incidence\nm1 d g s b nch l=1u w=10u nf=2 m=3 nrd=2 nrs=3 ad=10p as=12p pd=12u ps=14u\n.model nch {family} level=54 capmod={cap} rgatemod={rgate} rbodymod={rbody} rdsmod={rds} gidlmod={gidl} igcmod=1 igbmod=1 rsh=10 rshg=2 rsw=100 rdw=100 rbpb=5 rbpd=15 rbps=15 rbdb=15 rbsb=15 cjs=1m cjd=2m cjsws=1n cjswd=1n cgdo=1n cgso=2n cgbo=1n agidl=2e-4 bgidl=2e8 cgidl=2e-4 egidl=0.1 agisl=2e-4 bgisl=2e8 cgisl=2e-4 egisl=0.1 alpha0=1e-8 beta0=0.1\n.end"
+            );
+            let deck = Parser::new()
+                .parse_deck(&parse_deck_text(Path::new("bsim4-physical.cir"), &text))?;
+            let mut c = Circuit::from_netlist(&deck)?;
+            c.finalize()?;
+            let prepared = c.prepare_run();
+            let mut dae = prepared.prepare_physical_dae(
+                &ModelContext::default(),
+                TransientTiming::new(1e-6, 1e-3)?,
+            )?;
+            let nodes = c.device("m1").unwrap().terminals();
+            let rows = nodes
+                .iter()
+                .map(|node| c.unknowns().node_row(*node).unwrap())
+                .collect::<Vec<_>>();
+            for (gate, drain, body) in [
+                (0.5, 0.2, -0.3),
+                (2.5, 1.8, -0.3),
+                (2.0, -0.5, -0.8),
+                (2.5, 0.3, 0.1),
+            ] {
+                let mut state = vec![Vector::zeros(c.unknown_count()); 9];
+                for (i, &row) in rows.iter().enumerate() {
+                    let name = &c.nodes().node(nodes[i]).unwrap().name;
+                    let nominal = match name.as_str() {
+                        "d" => drain + 0.001,
+                        "g" => gate + 0.001,
+                        "s" => -0.001,
+                        "b" => body + 0.001,
+                        _ if name.contains("drain") => drain,
+                        _ if name.contains("gate") => gate,
+                        _ if name.contains("source") => 0.,
+                        _ if name.contains("body") => body,
+                        _ => panic!("unexpected BSIM4 internal node {name}"),
+                    };
+                    let slope = [0.002, -0.003, 0.004, -0.001][i % 4];
+                    state[0].set(row, polarity * nominal)?;
+                    state[1].set(row, polarity * slope)?;
+                    state[2].set(row, polarity * slope * 0.01)?;
+                }
+                let taylor = dae.evaluate_taylor(&state, 0., 1e-6, Limit::Right)?;
+                for t in [0., 0.125, 0.5] {
+                    let mut sample = Vector::zeros(c.unknown_count());
+                    for &row in &rows {
+                        sample.set(
+                            row,
+                            state.iter().rev().fold(0., |v: f64, coefficient| {
+                                v.mul_add(t, coefficient.get(row).unwrap())
+                            }),
+                        )?;
+                    }
+                    let scalar = dae.evaluate(&sample, t * 1e-6, Limit::Right)?;
+                    for &row in &rows {
+                        let f = taylor
+                            .residual
+                            .iter()
+                            .rev()
+                            .fold(0., |v: f64, a| v.mul_add(t, a.get(row).unwrap()));
+                        let q = taylor
+                            .charge
+                            .iter()
+                            .rev()
+                            .fold(0., |v: f64, a| v.mul_add(t, a.get(row).unwrap()));
+                        close(f, scalar.residual.get(row).unwrap(), 1e-12);
+                        close(q, scalar.charge.get(row).unwrap(), 1e-21);
+                        for &col in &rows {
+                            let g = taylor
+                                .conductance
+                                .iter()
+                                .rev()
+                                .fold(0., |v: f64, a| v.mul_add(t, a.get(row, col)));
+                            let cap = taylor
+                                .capacitance
+                                .iter()
+                                .rev()
+                                .fold(0., |v: f64, a| v.mul_add(t, a.get(row, col)));
+                            close(g, scalar.conductance.get(row, col), 1e-11);
+                            close(cap, scalar.capacitance.get(row, col), 1e-20);
+                        }
+                    }
+                }
+                for (f, q) in taylor.residual.iter().zip(&taylor.charge) {
+                    close(rows.iter().map(|&row| f.get(row).unwrap()).sum(), 0., 1e-10);
+                    close(rows.iter().map(|&row| q.get(row).unwrap()).sum(), 0., 1e-21);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn coupled_derivative_array_transient_uses_mos_physical_charge()
+-> Result<(), ngspice_rs::primitives::SpiceError> {
+    use ngspice_rs::devices::{Circuit, Limit, ModelContext, TransientTiming};
+    use ngspice_rs::maths::Vector;
+    fn close(actual: f64, expected: f64, absolute: f64, label: &str) {
+        assert!(
+            (actual - expected).abs() <= absolute + 2e-6 * actual.abs().max(expected.abs()),
+            "{label}: actual {actual:e}, expected {expected:e}"
+        );
+    }
+
+    for (level, cap) in [(8, 3), (54, 0), (54, 1), (54, 2)] {
+        for (family, polarity) in [("nmos", 1.), ("pmos", -1.)] {
+            for drain in [0.4, -0.4] {
+                let initial = 1.2;
+                let rate: f64 = 100.;
+                let body = -0.7;
+                let model = format!(
+                    "m1 d g s b nch l=1u w=10u m=2 ad=10p as=12p pd=12u ps=14u\n.model nch {family} level={level} capmod={cap} cgdo=1n cgso=2n cgbo=1n"
+                );
+                let reference_deck = Parser::new().parse_deck(&parse_deck_text(
+                    Path::new("mos-reference.cir"),
+                    &format!("MOS physical reference\n{model}\n.end"),
+                ))?;
+                let mut reference = Circuit::from_netlist(&reference_deck)?;
+                reference.finalize()?;
+                let prepared = reference.prepare_run();
+                let mut dae = prepared.prepare_physical_dae(
+                    &ModelContext::default(),
+                    TransientTiming::new(1e-6, 1e-3)?,
+                )?;
+                let rows = ["d", "g", "s", "b"].map(|name| {
+                    reference
+                        .unknowns()
+                        .node_row(reference.nodes().get(name).unwrap())
+                        .unwrap()
+                });
+                let scalar = |gate: f64| -> Result<Vector, ngspice_rs::primitives::SpiceError> {
+                    let mut state = Vector::zeros(reference.unknown_count());
+                    for (row, value) in rows.into_iter().zip([drain, gate, 0., body]) {
+                        state.set(row, polarity * value)?;
+                    }
+                    Ok(state)
+                };
+                for method in ["gear", "trap"] {
+                    let text = format!(
+                        "MOS coupled derivative array\nvd d 0 {}\nvg g 0 PWL(0 {} 1m {})\nvs s 0 0\nvb b 0 {}\n{model}\nb1 first 0 v=1m*ddt(v(g))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1n\n.tran 1u 20u 0 1u uic\n.end",
+                        polarity * drain,
+                        polarity * initial,
+                        polarity * rate.mul_add(1e-3, initial),
+                        polarity * body
+                    );
+                    let netlist = Parser::new()
+                        .parse_deck(&parse_deck_text(Path::new("mos-coupled.cir"), &text))?;
+                    let config = RunConfig::from_netlist(&netlist)?;
+                    let mut c = config.circuit(&netlist)?;
+                    let plot = config
+                        .plan_for(&netlist.analyses[0])?
+                        .run(&mut c, &config.context())?;
+                    for i in 0..plot.point_count() {
+                        let value = |name| plot.value(name, i).unwrap().re;
+                        let time = value("time");
+                        let gate = rate.mul_add(time, initial);
+                        let sample = scalar(gate)?;
+                        let residual = dae.evaluate(&sample, time, Limit::Right)?.residual.clone();
+                        // Independent sampled charge derivative: not the
+                        // Taylor derivative nor its analytic Jacobian.
+                        let step = 1e-5;
+                        let low = dae
+                            .evaluate(&scalar(gate - step)?, time, Limit::Right)?
+                            .charge
+                            .clone();
+                        let high = dae
+                            .evaluate(&scalar(gate + step)?, time, Limit::Right)?
+                            .charge
+                            .clone();
+                        for (row, source) in
+                            rows.into_iter().zip(["i(vd)", "i(vg)", "i(vs)", "i(vb)"])
+                        {
+                            let displacement = (high.get(row).unwrap() - low.get(row).unwrap())
+                                * rate
+                                / (2. * step);
+                            close(
+                                value(source),
+                                -residual.get(row).unwrap() - displacement,
+                                1e-12,
+                                source,
+                            );
+                        }
+                        close(
+                            value("v(first)"),
+                            polarity * rate * 1e-3,
+                            1e-10,
+                            "first derivative",
+                        );
+                        close(value("v(out)"), 0., 1e-9, "second derivative");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// At exact drain/source equality the physical jet must select its channel
+/// orientation from the one-sided trajectory, not the scalar tie-breaker.
+#[test]
+fn physical_taylor_selects_one_sided_channel_orientation()
+-> Result<(), ngspice_rs::primitives::SpiceError> {
+    use ngspice_rs::devices::{Circuit, Limit, ModelContext, TransientTiming};
+    use ngspice_rs::maths::Vector;
+
+    for (level, cap) in [(8, 3), (54, 0), (54, 1), (54, 2)] {
+        for (family, polarity) in [("nmos", 1.), ("pmos", -1.)] {
+            let text = format!(
+                "MOS channel reversal\nm1 d g s b nch l=1u w=10u m=2 ad=10p as=12p pd=12u ps=14u\n.model nch {family} level={level} capmod={cap} cgdo=1n cgso=2n cgbo=1n\n.end"
+            );
+            let deck =
+                Parser::new().parse_deck(&parse_deck_text(Path::new("mos-reversal.cir"), &text))?;
+            let mut c = Circuit::from_netlist(&deck)?;
+            c.finalize()?;
+            let prepared = c.prepare_run();
+            let mut dae = prepared.prepare_physical_dae(
+                &ModelContext::default(),
+                TransientTiming::new(1e-6, 1e-3)?,
+            )?;
+            let rows = ["d", "g", "s", "b"]
+                .map(|name| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap());
+            for limit in [Limit::Left, Limit::Right] {
+                let mut state = vec![Vector::zeros(c.unknown_count()); 9];
+                for (row, value) in rows.into_iter().zip([0., 1.4, 0., -0.5]) {
+                    state[0].set(row, polarity * value)?;
+                }
+                state[1].set(rows[0], polarity * 1e-3)?;
+                state[1].set(rows[1], polarity * 2e-3)?;
+                let jet = dae.evaluate_taylor(&state, 0., 1e-6, limit)?;
+                let time = if limit == Limit::Left { -0.25 } else { 0.25 };
+                let mut sample = state[0].clone();
+                for row in rows {
+                    sample.set(
+                        row,
+                        time.mul_add(state[1].get(row).unwrap(), state[0].get(row).unwrap()),
+                    )?;
+                }
+                let point = dae.evaluate(&sample, time * 1e-6, limit)?;
+                let close = |a: f64, b: f64, absolute: f64| {
+                    assert!(
+                        (a - b).abs() <= absolute + 3e-7 * a.abs().max(b.abs()),
+                        "level={level} capmod={cap} polarity={polarity} side={limit:?}: {a:e} vs {b:e}"
+                    );
+                };
+                for row in rows {
+                    let f = jet
+                        .residual
+                        .iter()
+                        .rev()
+                        .fold(0., |v: f64, a| v.mul_add(time, a.get(row).unwrap()));
+                    let q = jet
+                        .charge
+                        .iter()
+                        .rev()
+                        .fold(0., |v: f64, a| v.mul_add(time, a.get(row).unwrap()));
+                    close(f, point.residual.get(row).unwrap(), 1e-13);
+                    close(q, point.charge.get(row).unwrap(), 1e-21);
+                    for col in rows {
+                        let g = jet
+                            .conductance
+                            .iter()
+                            .rev()
+                            .fold(0., |v: f64, a| v.mul_add(time, a.get(row, col)));
+                        let cap = jet
+                            .capacitance
+                            .iter()
+                            .rev()
+                            .fold(0., |v: f64, a| v.mul_add(time, a.get(row, col)));
+                        close(g, point.conductance.get(row, col), 1e-10);
+                        close(cap, point.capacitance.get(row, col), 1e-20);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}

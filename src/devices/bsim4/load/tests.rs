@@ -318,9 +318,11 @@ impl PhysicalFixture {
         };
         let bias = super::bias::select(&self.model, &instance, &mut trace);
         let electro =
-            super::channel::electrostatics(&self.model, &mut instance, &self.size, &trace, &bias);
+            super::channel::electrostatics(&self.model, &mut instance, &self.size, &trace, &bias)
+                .unwrap();
         let transport =
-            super::channel::transport(&self.model, &mut instance, &self.size, &bias, &electro);
+            super::channel::transport(&self.model, &mut instance, &self.size, &bias, &electro)
+                .unwrap();
         let _ = super::charge::intrinsic(
             &self.model,
             &mut instance,
@@ -494,12 +496,12 @@ fn smoothed_drain_preserves_small_signal_and_saturation_limits() {
         (1e-15, 9.803_921_568_627_451e-16),
         (1e-18, 9.803_921_568_627_452e-19),
     ] {
-        let p = super::smooth_drain(sat, drain, delta);
+        let p = super::smooth_drain(sat, drain, delta).unwrap();
         assert!((p.effective - expected).abs() <= 8. * f64::EPSILON * expected);
         assert!((p.effective + p.drain_excess - drain).abs() <= 8. * f64::EPSILON * drain);
         assert!(p.saturation_partial > 0. && p.drain_partial > 0.);
     }
-    let zero = super::smooth_drain(sat, 0., delta);
+    let zero = super::smooth_drain(sat, 0., delta).unwrap();
     assert_eq!(zero.effective, 0.);
     assert_eq!(zero.drain_excess, 0.);
     assert_eq!(zero.saturation_partial, 0.);
@@ -512,15 +514,23 @@ fn smoothed_drain_preserves_small_signal_and_saturation_limits() {
         (1e-8, 1.),
         (1., 1e-8),
     ] {
-        let p = super::smooth_drain(sat, drain, delta);
+        let p = super::smooth_drain(sat, drain, delta).unwrap();
         let h = 1e-5 * sat.min(drain);
         let steps = [-h, h, -h * 0.5, h * 0.5];
         let (ds, es) = richardson(
-            steps.map(|d| super::smooth_drain(sat + d, drain, delta).effective),
+            steps.map(|d| {
+                super::smooth_drain(sat + d, drain, delta)
+                    .unwrap()
+                    .effective
+            }),
             h,
         );
         let (dd, ed) = richardson(
-            steps.map(|d| super::smooth_drain(sat, drain + d, delta).effective),
+            steps.map(|d| {
+                super::smooth_drain(sat, drain + d, delta)
+                    .unwrap()
+                    .effective
+            }),
             h,
         );
         assert!((p.saturation_partial - ds).abs() < 2e-8 * ds.abs() + es * 0.1 + 2e-10);
@@ -582,7 +592,7 @@ fn saturation_quadratic_has_regular_linear_limit() {
     for a in [0., 1e-20, 1e-12, 0.1, -0.1] {
         let b = 1_f64;
         let c = 0.125_f64;
-        let root = super::SaturationRoot::new(a, b, c);
+        let root = super::SaturationRoot::new(&a, b, c).unwrap();
         let y = root.value;
         assert!((0.5 * a * y * y - b * y + c).abs() < 4. * f64::EPSILON);
         if a.abs() < 1e-15 {
@@ -593,12 +603,17 @@ fn saturation_quadratic_has_regular_linear_limit() {
         for (da, db, dc) in [(1_f64, 0_f64, 0_f64), (0., 1., 0.), (0., 0., 1.)] {
             let (expected, error) = richardson(
                 samples.map(|d| {
-                    super::SaturationRoot::new(da.mul_add(d, a), db.mul_add(d, b), dc.mul_add(d, c))
-                        .value
+                    super::SaturationRoot::new(
+                        &da.mul_add(d, a),
+                        db.mul_add(d, b),
+                        dc.mul_add(d, c),
+                    )
+                    .unwrap()
+                    .value
                 }),
                 h,
             );
-            let derivative = root.derivative(da, db, dc);
+            let derivative = root.derivative(&da, &db, &dc).unwrap();
             assert!((derivative - expected).abs() < 1e-9 * expected.abs() + error * 0.1 + 1e-12);
         }
     }
@@ -608,15 +623,15 @@ fn saturation_quadratic_has_regular_linear_limit() {
 fn depletion_charge_preserves_tiny_positive_charge_and_continuation() {
     let k1 = 0.4;
     for increment in [1e-3_f64, 1e-9, 1e-15, 1e-21, 1e-30] {
-        let (charge, slope) = super::depletion_charge(k1, increment);
+        let (charge, slope) = super::depletion_charge(k1, increment).unwrap();
         assert!(charge > 0.);
         let difference = charge / k1;
         assert!((difference * (k1 + difference) - increment).abs() < 8. * f64::EPSILON * increment);
         assert!(slope > 0. && slope <= 1.);
     }
-    assert_eq!(super::depletion_charge(k1, 0.), (0., 1.));
-    assert_eq!(super::depletion_charge(k1, -1e-30), (-1e-30, 1.));
-    assert_eq!(super::depletion_charge(0., 1e-3), (0., 0.));
+    assert_eq!(super::depletion_charge(k1, 0.).unwrap(), (0., 1.));
+    assert_eq!(super::depletion_charge(k1, -1e-30).unwrap(), (-1e-30, 1.));
+    assert_eq!(super::depletion_charge(0., 1e-3).unwrap(), (0., 0.));
 }
 
 #[test]
@@ -717,17 +732,17 @@ fn subthreshold_and_mobility_modes_have_independent_channel_derivatives() {
 #[test]
 fn smooth_positive_retains_small_tail_and_slope() {
     // Rationalized result for x=-1e12, width²/4=0.0025.
-    let (value, slope) = super::smooth_positive(-1e12, 0.0025);
+    let (value, slope) = super::smooth_positive(-1e12, 0.0025).unwrap();
     assert!((value / 2.5e-15 - 1.).abs() < 1e-14);
     assert!((slope / 2.5e-27 - 1.).abs() < 1e-14);
-    assert_eq!(super::smooth_positive(0., 0.), (0., 0.5));
-    assert_eq!(super::smooth_positive(-2., 0.), (0., 0.));
-    assert_eq!(super::smooth_positive(2., 0.), (2., 1.));
+    assert_eq!(super::smooth_positive(0., 0.).unwrap(), (0., 0.5));
+    assert_eq!(super::smooth_positive(-2., 0.).unwrap(), (0., 0.));
+    assert_eq!(super::smooth_positive(2., 0.).unwrap(), (2., 1.));
     for x in [-10., -0.2, 0., 0.2, 10.] {
-        let (value, slope) = super::smooth_positive(x, 0.0025);
+        let (value, slope) = super::smooth_positive(x, 0.0025).unwrap();
         let h = 1e-4;
-        let samples =
-            [-h, h, -h * 0.5, h * 0.5].map(|delta| super::smooth_positive(x + delta, 0.0025).0);
+        let samples = [-h, h, -h * 0.5, h * 0.5]
+            .map(|delta| super::smooth_positive(x + delta, 0.0025).unwrap().0);
         let (expected, error) = richardson(samples, h);
         assert!(value > 0.);
         assert!((slope - expected).abs() < 1e-8 * expected.abs() + error + 1e-12);
@@ -794,8 +809,8 @@ fn junction_current_and_charge_keep_asymmetric_tiny_bias_terms() {
             source: voltage,
             drain: -voltage,
         };
-        current(m, h, p, &trace, bias);
-        charge(m, h, p, &mut trace, bias);
+        current(m, h, p, &trace, bias).unwrap();
+        charge(m, h, p, &mut trace, bias).unwrap();
         assert!((h.cbs / (source_slope * voltage) - 1.).abs() < 16. * f64::EPSILON);
         assert!((h.cbd / (-drain_slope * voltage) - 1.).abs() < 16. * f64::EPSILON);
         assert!((h.gbs / source_slope - 1.).abs() < 16. * f64::EPSILON);
@@ -907,4 +922,149 @@ fn full_nonlinear_stamps_conserve_physical_rows_and_common_mode_with_aliases() {
             }
         }
     }
+}
+
+#[test]
+fn channel_and_intrinsic_charge_share_physical_trajectory_and_partial_series() -> SpiceResult<()> {
+    use crate::maths::taylor::{Jet, differential::Differential};
+
+    fn at(jet: &Jet, t: f64) -> f64 {
+        jet.coefficients()
+            .iter()
+            .rev()
+            .fold(0., |sum: f64, coefficient| sum.mul_add(t, *coefficient))
+    }
+
+    fn assert_close(actual: f64, expected: f64, absolute: f64, context: &str) {
+        assert!(
+            actual.is_finite()
+                && expected.is_finite()
+                && (actual - expected).abs() <= absolute + 2e-6 * actual.abs().max(expected.abs()),
+            "{context}: {actual:e} vs {expected:e}"
+        );
+    }
+
+    for polarity in [-1, 1] {
+        for mobility in 0..=6 {
+            for cap in 0..=2 {
+                let fixture = PhysicalFixture::prepare(
+                    Model {
+                        r#type: polarity,
+                        typeGiven: true,
+                        mobMod: mobility,
+                        mobModGiven: true,
+                        capMod: cap,
+                        capModGiven: true,
+                        cvchargeMod: mobility % 2,
+                        cvchargeModGiven: true,
+                        xpart: [0., 0.5, 1.][mobility as usize % 3],
+                        xpartGiven: true,
+                        ..Model::default()
+                    },
+                    300.15,
+                );
+                for initial in [
+                    [0.35, 0.05, -0.3],
+                    [1.2, 0.1, -0.2],
+                    [1.4, 1.1, -0.3],
+                    [1.2, -0.3, -0.7],
+                ] {
+                    let rates = [0.002, -0.001, 0.0007];
+                    let variables = [0, 1, 2].map(|i| {
+                        Differential::<3>::variable(i, Jet::affine(8, initial[i], rates[i]))
+                            .unwrap()
+                    });
+                    let [vg, vd, vb] = variables;
+                    let mut instance = fixture.instance.clone();
+                    let e = super::channel::electrostatics_constitutive(
+                        &fixture.model,
+                        &mut instance,
+                        &fixture.size,
+                        fixture.temperature,
+                        vb.clone(),
+                        vg.clone(),
+                        vd.clone(),
+                    )?;
+                    let transport = super::channel::transport_constitutive(
+                        &fixture.model,
+                        &mut instance,
+                        &fixture.size,
+                        [vb, vg, vd.clone(), vd, Differential::constant(8, 0.)],
+                        &e,
+                    )?;
+                    let charge = super::charge::intrinsic_constitutive(
+                        &fixture.model,
+                        &mut instance,
+                        &fixture.size,
+                        true,
+                        &e,
+                        &transport,
+                    )?;
+                    let laws = [
+                        transport.unscaled_drain_current,
+                        charge.qgate,
+                        charge.qbulk,
+                        charge.qdrn,
+                    ];
+                    let scalar = |[vg, vd, vb]: [f64; 3]| -> SpiceResult<[f64; 4]> {
+                        let mut instance = fixture.instance.clone();
+                        let e = super::channel::electrostatics_constitutive(
+                            &fixture.model,
+                            &mut instance,
+                            &fixture.size,
+                            fixture.temperature,
+                            vb,
+                            vg,
+                            vd,
+                        )?;
+                        let tr = super::channel::transport_constitutive(
+                            &fixture.model,
+                            &mut instance,
+                            &fixture.size,
+                            [vb, vg, vd, vd, 0.],
+                            &e,
+                        )?;
+                        let q = super::charge::intrinsic_constitutive(
+                            &fixture.model,
+                            &mut instance,
+                            &fixture.size,
+                            true,
+                            &e,
+                            &tr,
+                        )?;
+                        Ok([tr.unscaled_drain_current, q.qgate, q.qbulk, q.qdrn])
+                    };
+                    for t in [0., 0.25, 0.5] {
+                        let sample = std::array::from_fn(|i| rates[i].mul_add(t, initial[i]));
+                        let values = scalar(sample)?;
+                        for (row, law) in laws.iter().enumerate() {
+                            let context = format!(
+                                "pol={polarity} mob={mobility} cap={cap} bias={sample:?} row={row}"
+                            );
+                            let absolute = if row == 0 { 1e-14 } else { 1e-23 };
+                            assert_close(at(&law.value, t), values[row], absolute, &context);
+                            for column in 0..3 {
+                                let h = 1e-4;
+                                let samples = [-h, h, -0.5 * h, 0.5 * h].map(|delta| {
+                                    let mut point = sample;
+                                    point[column] += delta;
+                                    scalar(point).unwrap()[row]
+                                });
+                                let (reference, error) = richardson(samples, h);
+                                let actual =
+                                    law.gradient[column].as_ref().map_or(0., |jet| at(jet, t));
+                                assert_close(
+                                    actual,
+                                    reference,
+                                    absolute + 0.1 * error,
+                                    &format!("{context} col={column}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }

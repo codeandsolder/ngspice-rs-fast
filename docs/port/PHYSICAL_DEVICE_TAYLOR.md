@@ -112,6 +112,37 @@ bias dependence, not frozen as in the ordinary C Newton load. On the
 substrate exponential clamp the physical derivative is the derivative of
 the clamped current, not the C load's retained exponential slope.
 
+## Conservative BSIM3 and BSIM4
+
+The scalar current and charge laws and physical differential jets share
+constitutive arithmetic, including channel orientation, depletion, overlap,
+velocity saturation, mobility, substrate current, and (BSIM4) gate tunnelling
+and GIDL/GISL. The ordinary reference Newton and AC stamp conventions remain
+separate from the physical derivative of the actual value law. In particular,
+a clamped scalar value may have a different reference Newton partial than
+its physical derivative.
+
+BSIM3 capMod 3 and BSIM4 capMod 0–2 are the conservative charge modes
+implemented here. Their local histories retain the normalized QB, QG, and
+QD charge/rate pairs at bulk, gate, and drain prime relative to source prime.
+BSIM4 also retains QGMID for distributed gate resistance and QBS/QBD for
+split body resistance. In the split case QD includes the drain-side depletion
+charge with its terminal sign; the independent body histories add the
+corresponding charge on the body sides. Raw source/drain junction and overlap
+incidences do not reverse with channel orientation. Current/charge scales
+include polarity and multiplicity, including the BSIM4 per-instance
+multipliers; finger scaling belongs to the underlying model laws.
+
+Bias-dependent piecewise laws observe comparisons of the active one-sided
+germ, not just its constant coefficient. The shared differential arithmetic
+carries the exact state-gradient jets alongside the values. The scalar
+reference load uses stack-local first derivatives, with no Taylor-series
+allocation. The instantaneous physical load uses order-zero differential
+arithmetic and independent storage constraints; the verified trajectory
+supplies accepted local charge rates. BSIM4's frequency-specific AC
+reassembly does not imply time-domain memory. Transient NQS modes are
+explicitly outside this implementation.
+
 ## Boundary of memoryless storage
 
 A device's AC capacitance is not sufficient to specify its physical charge.
@@ -139,9 +170,7 @@ producer-owned kernel boundary. Scalar residual and Jacobian values do
 not determine higher derivatives. The ABI work is tracked in
 [preprocess #79](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/79).
 
-Conservative BSIM charge modes and their exact multivariate kernels are
-tracked in [#256](https://github.com/codeandsolder/ngspice-rs-fast/issues/256).
 Continuous switch and prepared PWL-resistor branch laws are tracked in
 [#257](https://github.com/codeandsolder/ngspice-rs-fast/issues/257).
-These are separate implementation and qualification obligations, not
-claims that their current scalar models support high-index derivatives.
+That is a separate implementation and qualification obligation, not
+a claim that the current scalar models support high-index derivatives.

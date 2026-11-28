@@ -7,22 +7,9 @@
     clippy::similar_names,
     reason = "C equation names preserve the reference distinctions"
 )]
-#![expect(clippy::manual_midpoint, reason = "retain C midpoint rounding order")]
 #![expect(
     clippy::suboptimal_flops,
     reason = "Remaining translated product-rule sums and branch expressions have no demonstrated cancellation defect; indiscriminate software FMA would add portable-target cost. See BSIM_CHANNEL_NUMERICS.md."
-)]
-#![expect(
-    unused_assignments,
-    reason = "reference intermediate assignments remain in their equation sequence"
-)]
-#![expect(
-    unused_variables,
-    reason = "reference intermediate symbols retain their calculation context"
-)]
-#![expect(
-    unused_mut,
-    reason = "reference scratch variables may be assigned on different branches"
 )]
 #![expect(
     clippy::float_cmp,
@@ -32,33 +19,41 @@
     clippy::too_many_lines,
     reason = "preserve cohesive C physics equation sequence"
 )]
-#![expect(
-    clippy::cognitive_complexity,
-    reason = "retain version-specific reference physics branches"
-)]
 use super::bias::LoadBias;
 use super::{
-    BSIM4polyDepletion, Charge_q, DEXP, EPS0, EPSSI, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP,
-    MIN_EXP, MM, Model, SaturationRoot, SizeParam, exp, log, smooth_drain, smooth_positive, sqrt,
+    CHARGE, Charge_q, DEXP, EPS0, EPSSI, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, MM,
+    Model, SizeParam, smooth_drain, smooth_positive, sqrt,
 };
 
+use crate::devices::bsim_physics::{
+    SlopeParameters, ThresholdParameters, ThresholdRollOff, bsim4_body_limit, channel_conductance,
+    channel_rolloff, dibl_early_voltage, effective_overdrive, impact_ionization, poly_depletion,
+    rational_floor, reciprocal_floor, saturation_early_voltage, saturation_shape,
+    saturation_voltage, series_conductance, substrate_early_voltage, surface_potential,
+};
+use crate::maths::taylor::{Constitutive, Local};
+use crate::primitives::SpiceResult;
+use std::cmp::Ordering;
+
 /// Body potential, threshold, effective gate bias and their independent derivatives.
-pub(super) struct Electrostatics {
+pub(super) struct Electrostatics<S = f64> {
     pub(super) Leff: f64,
     pub(super) Lpe_Vb: f64,
-    pub(super) Phis: f64,
-    pub(super) Vbs: f64,
-    pub(super) Vbseff: f64,
-    pub(super) Vds: f64,
-    pub(super) Vgs: f64,
-    pub(super) Vgs_eff: f64,
-    pub(super) Vgst: f64,
-    pub(super) Vgsteff: f64,
-    pub(super) Vth: f64,
+    pub(super) Phis: S,
+    pub(super) Vbs: S,
+    pub(super) Vbseff: S,
+    pub(super) Vds: S,
+    pub(super) Vgs: S,
+    pub(super) Vgs_eff: S,
+    pub(super) vgs_eff_raw: S,
+    pub(super) vgd_eff_raw: S,
+    pub(super) Vgst: S,
+    pub(super) Vgsteff: S,
+    pub(super) Vth: S,
     pub(super) Vth_NarrowW: f64,
     pub(super) Vtm: f64,
     pub(super) Vtm0: f64,
-    pub(super) Xdep: f64,
+    pub(super) Xdep: S,
     pub(super) dPhis_dVb: f64,
     pub(super) dVbseff_dVb: f64,
     pub(super) dVgs_eff_dVg: f64,
@@ -73,24 +68,28 @@ pub(super) struct Electrostatics {
     pub(super) dsqrtPhis_dVb: f64,
     pub(super) epsrox: f64,
     pub(super) epssub: f64,
-    pub(super) n: f64,
-    pub(super) sqrtPhis: f64,
+    pub(super) n: S,
+    pub(super) sqrtPhis: S,
     pub(super) toxe: f64,
 }
 
 /// Unscaled channel current, effective drain voltage, bulk charge factor and transport quantities used by leakage/C-V.
-pub(super) struct Transport {
-    pub(super) Abulk0_Q: f64,
-    pub(super) Coxeff: f64,
-    pub(super) Rds: f64,
-    pub(super) Vdseff: f64,
-    pub(super) beta: f64,
-    pub(super) unscaled_drain_current: f64,
+pub(super) struct Transport<S = f64> {
+    pub(super) Abulk0_Q: S,
+    pub(super) Coxeff: S,
+    pub(super) Rds: S,
+    pub(super) Vdseff: S,
+    pub(super) beta: S,
+    pub(super) unscaled_drain_current: S,
     pub(super) dAbulk0_Q_dVb: f64,
     pub(super) dVdseff_dVb: f64,
     pub(super) dVdseff_dVd: f64,
     pub(super) dVdseff_dVg: f64,
-    pub(super) gche: f64,
+    pub(super) gche: S,
+    pub(super) substrate_current: S,
+    pub(super) gate_conductance: S,
+    pub(super) source_conductance: S,
+    pub(super) drain_conductance: S,
 }
 
 /// Threshold and effective gate-voltage equations, in the reference orientation.
@@ -100,354 +99,202 @@ pub(super) fn electrostatics(
     pParam: &SizeParam,
     ckt: &dyn LoadCkt,
     bias: &LoadBias,
-) -> Electrostatics {
-    let &LoadBias {
-        vbd,
-        vbs,
-        vds,
-        vgd,
-        vgs,
-        ..
-    } = bias;
-    let mut vgs_eff: f64;
-    let mut vgd_eff: f64;
-    let mut dvgs_eff_dvg: f64;
-    let mut dvgd_eff_dvg: f64;
-    let mut ExpVgst: f64;
-    let mut Vdb: f64;
-    let mut Vds: f64;
-    let mut Vgs: f64;
-    let mut Vbs: f64;
-    let mut Vgs_eff: f64;
-    let mut Vth_NarrowW: f64;
-    let mut Phis: f64;
-    let mut dPhis_dVb: f64;
-    let mut sqrtPhis: f64;
-    let mut dsqrtPhis_dVb: f64;
-    let mut Vth: f64;
-    let mut dVth_dVb: f64;
-    let mut dVth_dVd: f64;
-    let mut Vgst: f64;
-    let mut dVgs_eff_dVg: f64;
-    let mut Vtm: f64;
-    let mut Vtm0: f64;
-    let mut n: f64;
-    let mut dn_dVb: f64;
-    let mut dn_dVd: f64;
-    let mut V0: f64;
-    let mut Vbseff: f64;
-    let mut dVbseff_dVb: f64;
-    let mut T0: f64;
-    let mut T1: f64;
-    let mut dT1_dVb: f64;
-    let mut T2: f64;
-    let mut dT2_dVd: f64;
-    let mut dT2_dVb: f64;
-    let mut T3: f64;
-    let mut dT3_dVd: f64;
-    let mut T4: f64;
-    let mut dT4_dVd: f64;
-    let mut T5: f64;
-    let mut dT5_dVb: f64;
-    let mut T9: f64;
-    let mut dT9_dVg: f64;
-    let mut dT9_dVd: f64;
-    let mut dT9_dVb: f64;
-    let mut T10: f64;
-    let mut dT10_dVg: f64;
-    let mut dT10_dVb: f64;
-    let mut dT10_dVd: f64;
-    let mut T11: f64;
-    let mut Lpe_Vb: f64;
-    let mut dDITS_Sft_dVb: f64;
-    let mut dDITS_Sft_dVd: f64;
-    let mut DITS_Sft2: f64;
-    let mut dDITS_Sft2_dVd: f64;
-    let mut Xdep: f64;
-    let mut dXdep_dVb: f64;
-    let mut lt1: f64;
-    let mut dlt1_dVb: f64;
-    let mut ltw: f64;
-    let mut dltw_dVb: f64;
-    let mut Delt_vth: f64;
-    let mut dDelt_vth_dVb: f64;
-    let mut Theta0: f64;
-    let mut dTheta0_dVb: f64;
-    let mut TempRatio: f64;
-    let mut tmp1: f64;
-    let mut tmp2: f64;
-    let mut tmp3: f64;
-    let mut tmp4: f64;
-    let mut DIBL_Sft: f64;
-    let mut dDIBL_Sft_dVd: f64;
-    let mut Vgsteff: f64;
-    let mut dVgsteff_dVg: f64;
-    let mut dVgsteff_dVd: f64;
-    let mut dVgsteff_dVb: f64;
-    let mut Leff: f64;
-    let mut epssub: f64;
-    let mut toxe: f64;
-    let mut epsrox: f64;
-    if vds >= 0.0 {
-        here.mode = 1;
-        Vds = vds;
-        Vgs = vgs;
-        Vbs = vbs;
-        Vdb = vds - vbs;
-    } else {
+) -> SpiceResult<Electrostatics> {
+    electrostatics_constitutive(
+        model,
+        here,
+        pParam,
+        ckt.temp(),
+        bias.vbs,
+        bias.vgs,
+        bias.vds,
+    )
+}
+
+/// Exact electrostatics for both ordinary reference loading and physical jets.
+/// Instance fields record only the primal operating point, never a derivative
+/// or an alternate physical value path.
+pub(super) fn electrostatics_constitutive<S: Constitutive>(
+    model: &Model,
+    here: &mut Instance,
+    pParam: &SizeParam,
+    temperature: f64,
+    vbs: S,
+    vgs: S,
+    vds: S,
+) -> SpiceResult<Electrostatics<S>> {
+    let vbd = vbs.clone().add(&vds.clone().scale(-1.));
+    let vgd = vgs.clone().add(&vds.clone().scale(-1.));
+    let (Vds, Vgs, Vbs) = if vds.compare(0.) == Some(Ordering::Less) {
         here.mode = -1;
-        Vds = -vds;
-        Vgs = vgd;
-        Vbs = vbd;
-        Vdb = -vbs;
-    }
-    if model.mtrlMod != 0 {
-        epsrox = 3.9;
-        toxe = model.eot;
-        epssub = EPS0 * model.epsrsub;
+        (vds.scale(-1.), vgd.clone(), vbd)
     } else {
-        epsrox = model.epsrox;
-        toxe = model.toxe;
-        epssub = EPSSI;
-    }
-    T0 = Vbs - here.vbsc - 0.001;
-    T1 = sqrt(T0 * T0 - 0.004 * here.vbsc);
-    if T0 >= 0.0 {
-        Vbseff = here.vbsc + 0.5 * (T0 + T1);
-        dVbseff_dVb = 0.5 * (1.0 + T0 / T1);
+        here.mode = 1;
+        (vds, vgs.clone(), vbs)
+    };
+    let (epsrox, toxe, epssub) = if model.mtrlMod != 0 {
+        (3.9, model.eot, EPS0 * model.epsrsub)
     } else {
-        T2 = -0.002 / (T1 - T0);
-        Vbseff = here.vbsc * (1.0 + T2);
-        dVbseff_dVb = T2 * here.vbsc / T1;
+        (model.epsrox, model.toxe, EPSSI)
+    };
+    let (Vbseff, body_partial) = bsim4_body_limit(&Vbs, here.vbsc, pParam.phi)?;
+    let dVbseff_dVb = body_partial.primal();
+    let surface = surface_potential(&Vbseff, pParam.phi, None)?;
+    let Phis = surface.potential;
+    let sqrtPhis = surface.root;
+    let dPhis_dVb = surface.potential_partial.primal();
+    let dsqrtPhis_dVb = surface.root_partial.primal();
+    let depth_factor = pParam.Xdep0 / pParam.sqrtPhi;
+    let Xdep = sqrtPhis.clone().scale(depth_factor);
+    let dXdep_dVb = depth_factor * dsqrtPhis_dVb;
+    let Leff = pParam.leff;
+    let Vtm = model.vtm;
+    let Vtm0 = model.vtm0;
+    let V0 = pParam.vbi - pParam.phi;
+    let short = channel_rolloff(
+        &Vbseff,
+        &Xdep,
+        pParam.dvt2,
+        model.factor1,
+        pParam.dvt1 * Leff,
+        ThresholdRollOff::Bsim4,
+    )?;
+    let narrow = channel_rolloff(
+        &Vbseff,
+        &Xdep,
+        pParam.dvt2w,
+        model.factor1,
+        pParam.dvt1w * pParam.weff * Leff,
+        ThresholdRollOff::Bsim4,
+    )?;
+    let body_depth = [[0., 0., 1.], [0., 0., dXdep_dVb]];
+    let short_slopes = short.project(&body_depth);
+    let narrow_slopes = narrow.project(&body_depth);
+    let Theta0 = short.value;
+    here.thetavth = pParam.dvt0 * Theta0.primal();
+    let TempRatio = temperature / model.tnom - 1.;
+    let length_ratio = pParam.lpe0 / Leff;
+    let root_offset = length_ratio / ((1. + length_ratio).sqrt() + 1.);
+    let temperature_offset = (pParam.kt1 + pParam.kt1l / Leff)
+        .mul_add(TempRatio, pParam.k1ox * root_offset * pParam.sqrtPhi);
+    let Vth_NarrowW = toxe * pParam.phi / (pParam.weff + pParam.w0);
+    let Lpe_Vb = sqrt(1. + pParam.lpeb / Leff);
+    let threshold = ThresholdParameters {
+        fixed: pParam.k3.mul_add(
+            Vth_NarrowW,
+            (pParam.k1 * Lpe_Vb).mul_add(-pParam.sqrtPhi, f64::from(model.r#type) * here.vth0)
+                + temperature_offset,
+        ),
+        surface: pParam.k1ox * Lpe_Vb,
+        body: pParam
+            .kt2
+            .mul_add(TempRatio, pParam.k3b.mul_add(Vth_NarrowW, -here.k2ox)),
+        short: -pParam.dvt0 * V0,
+        narrow: -pParam.dvt0w * V0,
+        eta0: here.eta0,
+        etab: pParam.etab,
+        theta0vb0: pParam.theta0vb0,
     }
-    T9 = 0.95 * pParam.phi;
-    T0 = T9 - Vbseff - 0.001;
-    T1 = sqrt(T0 * T0 + 0.004 * T9);
-    Vbseff = T9 - 0.5 * (T0 + T1);
-    dVbseff_dVb *= 0.5 * (1.0 + T0 / T1);
-    Phis = pParam.phi - Vbseff;
-    dPhis_dVb = -1.0;
-    sqrtPhis = sqrt(Phis);
-    dsqrtPhis_dVb = -0.5 / sqrtPhis;
-    Xdep = pParam.Xdep0 * sqrtPhis / pParam.sqrtPhi;
-    dXdep_dVb = (pParam.Xdep0 / pParam.sqrtPhi) * dsqrtPhis_dVb;
-    Leff = pParam.leff;
-    Vtm = model.vtm;
-    Vtm0 = model.vtm0;
-    T3 = sqrt(Xdep);
-    V0 = pParam.vbi - pParam.phi;
-    T0 = pParam.dvt2 * Vbseff;
-    if T0 >= -0.5 {
-        T1 = 1.0 + T0;
-        T2 = pParam.dvt2;
-    } else {
-        T4 = 1.0 / (3.0 + 8.0 * T0);
-        T1 = (1.0 + 3.0 * T0) * T4;
-        T2 = pParam.dvt2 * T4 * T4;
+    .evaluate(&Vbseff, &Vds, &sqrtPhis, &Theta0, &narrow.value)?;
+    let [_, mut dVth_dVd, mut dVth_dVb] = threshold.project(&[
+        [0., 0., 1.],
+        [0., 1., 0.],
+        [0., 0., dsqrtPhis_dVb],
+        short_slopes,
+        narrow_slopes,
+    ]);
+    let mut Vth = threshold.value;
+    here.nstar = Vtm / Charge_q * (model.coxe + epssub / Xdep.primal() + pParam.cit);
+    let slope = SlopeParameters {
+        depletion: pParam.nfactor * epssub,
+        coupling: [pParam.cdsc, pParam.cdscb, pParam.cdscd],
+        interface: pParam.cit,
+        oxide: model.coxe,
     }
-    lt1 = model.factor1 * T3 * T1;
-    dlt1_dVb = model.factor1 * (0.5 / T3 * T1 * dXdep_dVb + T3 * T2);
-    T0 = pParam.dvt2w * Vbseff;
-    if T0 >= -0.5 {
-        T1 = 1.0 + T0;
-        T2 = pParam.dvt2w;
-    } else {
-        T4 = 1.0 / (3.0 + 8.0 * T0);
-        T1 = (1.0 + 3.0 * T0) * T4;
-        T2 = pParam.dvt2w * T4 * T4;
-    }
-    ltw = model.factor1 * T3 * T1;
-    dltw_dVb = model.factor1 * (0.5 / T3 * T1 * dXdep_dVb + T3 * T2);
-    T0 = pParam.dvt1 * Leff / lt1;
-    if T0 < EXP_THRESHOLD {
-        T1 = exp(T0);
-        T2 = T1 - 1.0;
-        T3 = T2 * T2;
-        T4 = T3 + 2.0 * T1 * MIN_EXP;
-        Theta0 = T1 / T4;
-        dT1_dVb = -T0 * T1 * dlt1_dVb / lt1;
-        dTheta0_dVb = dT1_dVb * (T4 - 2.0 * T1 * (T2 + MIN_EXP)) / T4 / T4;
-    } else {
-        Theta0 = 1.0 / (MAX_EXP - 2.0);
-        dTheta0_dVb = 0.0;
-    }
-    here.thetavth = pParam.dvt0 * Theta0;
-    Delt_vth = here.thetavth * V0;
-    dDelt_vth_dVb = pParam.dvt0 * dTheta0_dVb * V0;
-    T0 = pParam.dvt1w * pParam.weff * Leff / ltw;
-    if T0 < EXP_THRESHOLD {
-        T1 = exp(T0);
-        T2 = T1 - 1.0;
-        T3 = T2 * T2;
-        T4 = T3 + 2.0 * T1 * MIN_EXP;
-        T5 = T1 / T4;
-        dT1_dVb = -T0 * T1 * dltw_dVb / ltw;
-        dT5_dVb = dT1_dVb * (T4 - 2.0 * T1 * (T2 + MIN_EXP)) / T4 / T4;
-    } else {
-        T5 = 1.0 / (MAX_EXP - 2.0);
-        dT5_dVb = 0.0;
-    }
-    T0 = pParam.dvt0w * T5;
-    T2 = T0 * V0;
-    dT2_dVb = pParam.dvt0w * dT5_dVb * V0;
-    TempRatio = ckt.temp() / model.tnom - 1.0;
-    T0 = sqrt(1.0 + pParam.lpe0 / Leff);
-    T1 = pParam.k1ox * (T0 - 1.0) * pParam.sqrtPhi
-        + (pParam.kt1 + pParam.kt1l / Leff + pParam.kt2 * Vbseff) * TempRatio;
-    Vth_NarrowW = toxe * pParam.phi / (pParam.weff + pParam.w0);
-    T3 = here.eta0 + pParam.etab * Vbseff;
-    if T3 < 1.0e-4 {
-        T9 = 1.0 / (3.0 - 2.0e4 * T3);
-        T3 = (2.0e-4 - T3) * T9;
-        T4 = T9 * T9;
-    } else {
-        T4 = 1.0;
-    }
-    dDIBL_Sft_dVd = T3 * pParam.theta0vb0;
-    DIBL_Sft = dDIBL_Sft_dVd * Vds;
-    Lpe_Vb = sqrt(1.0 + pParam.lpeb / Leff);
-    Vth = f64::from(model.r#type) * here.vth0
-        + (pParam.k1ox * sqrtPhis - pParam.k1 * pParam.sqrtPhi) * Lpe_Vb
-        - here.k2ox * Vbseff
-        - Delt_vth
-        - T2
-        + (pParam.k3 + pParam.k3b * Vbseff) * Vth_NarrowW
-        + T1
-        - DIBL_Sft;
-    dVth_dVb = Lpe_Vb * pParam.k1ox * dsqrtPhis_dVb - here.k2ox - dDelt_vth_dVb - dT2_dVb
-        + pParam.k3b * Vth_NarrowW
-        - pParam.etab * Vds * pParam.theta0vb0 * T4
-        + pParam.kt2 * TempRatio;
-    dVth_dVd = -dDIBL_Sft_dVd;
-    tmp1 = epssub / Xdep;
-    here.nstar = model.vtm / Charge_q * (model.coxe + tmp1 + pParam.cit);
-    tmp2 = pParam.nfactor * tmp1;
-    tmp3 = pParam.cdsc + pParam.cdscb * Vbseff + pParam.cdscd * Vds;
-    tmp4 = (tmp2 + tmp3 * Theta0 + pParam.cit) / model.coxe;
-    if tmp4 >= -0.5 {
-        n = 1.0 + tmp4;
-        dn_dVb =
-            (-tmp2 / Xdep * dXdep_dVb + tmp3 * dTheta0_dVb + pParam.cdscb * Theta0) / model.coxe;
-        dn_dVd = pParam.cdscd * Theta0 / model.coxe;
-    } else {
-        T0 = 1.0 / (3.0 + 8.0 * tmp4);
-        n = (1.0 + 3.0 * tmp4) * T0;
-        T0 *= T0;
-        dn_dVb = (-tmp2 / Xdep * dXdep_dVb + tmp3 * dTheta0_dVb + pParam.cdscb * Theta0)
-            / model.coxe
-            * T0;
-        dn_dVd = pParam.cdscd * Theta0 / model.coxe * T0;
-    }
-    if pParam.dvtp0 > 0.0 {
-        T0 = -pParam.dvtp1 * Vds;
-        if T0 < -EXP_THRESHOLD {
-            T2 = MIN_EXP;
-            dT2_dVd = 0.0;
+    .evaluate(&Vbseff, &Vds, &Xdep, &Theta0)?;
+    let [_, dn_dVd, dn_dVb] = slope.project(&[
+        [0., 0., 1.],
+        [0., 1., 0.],
+        [0., 0., dXdep_dVb],
+        short_slopes,
+    ]);
+    let n = slope.value;
+    if pParam.dvtp0 > 0. {
+        let exponent = Vds.clone().scale(-pParam.dvtp1);
+        let (factor, factor_partial) = if exponent.compare(-EXP_THRESHOLD) == Some(Ordering::Less) {
+            (exponent.constant(MIN_EXP), 0.)
         } else {
-            T2 = exp(T0);
-            dT2_dVd = -pParam.dvtp1 * T2;
-        }
-        T3 = Leff + pParam.dvtp0 * (1.0 + T2);
-        dT3_dVd = pParam.dvtp0 * dT2_dVd;
-        if model.tempMod < 2 {
-            T4 = -Vtm * (pParam.dvtp0 * (1.0 + T2) / Leff).ln_1p();
-            dT4_dVd = -Vtm * dT3_dVd / T3;
-        } else {
-            T4 = -model.vtm0 * (pParam.dvtp0 * (1.0 + T2) / Leff).ln_1p();
-            dT4_dVd = -model.vtm0 * dT3_dVd / T3;
-        }
-        dDITS_Sft_dVd = dn_dVd * T4 + n * dT4_dVd;
-        dDITS_Sft_dVb = T4 * dn_dVb;
-        Vth -= n * T4;
-        dVth_dVd -= dDITS_Sft_dVd;
-        dVth_dVb -= dDITS_Sft_dVb;
+            let value = exponent.exp();
+            let partial = -pParam.dvtp1 * value.primal();
+            (value, partial)
+        };
+        let length_ratio = factor.offset(1.).scale(pParam.dvtp0 / Leff);
+        let thermal = if model.tempMod < 2 { Vtm } else { Vtm0 };
+        let shift = length_ratio.clone().ln_1p()?.scale(-thermal);
+        let shift_partial =
+            -thermal * pParam.dvtp0 * factor_partial / (Leff * (1. + length_ratio.primal()));
+        dVth_dVd -= dn_dVd * shift.primal() + n.primal() * shift_partial;
+        dVth_dVb -= shift.primal() * dn_dVb;
+        Vth = Vth.add(&n.clone().multiply(&shift).scale(-1.));
     }
-    if (pParam.dvtp4 == 0.0) || (pParam.dvtp2factor == 0.0) {
-        T0 = 0.0;
-        DITS_Sft2 = 0.0;
+    if pParam.dvtp4 != 0. && pParam.dvtp2factor != 0. {
+        let (factor, partial) = DEXP(Vds.clone().scale(2. * pParam.dvtp4));
+        let den = factor.clone().offset(1.);
+        let shift = factor.offset(-1.).divide(&den)?.scale(pParam.dvtp2factor);
+        dVth_dVd -=
+            pParam.dvtp2factor * pParam.dvtp4 * 4. * partial.primal() / den.primal().powi(2);
+        Vth = Vth.add(&shift.scale(-1.));
+    }
+    here.von = Vth.primal();
+    let poly_threshold = here.vfb + pParam.phi;
+    let poly_permittivity = if model.mtrlMod == 0 {
+        EPSSI
     } else {
-        T1 = 2.0 * pParam.dvtp4 * Vds;
-        (T0, T10) = DEXP(T1);
-        DITS_Sft2 = pParam.dvtp2factor * (T0 - 1.0) / (T0 + 1.0);
-        dDITS_Sft2_dVd = pParam.dvtp2factor * pParam.dvtp4 * 4.0 * T10 / ((T0 + 1.0) * (T0 + 1.0));
-        Vth -= DITS_Sft2;
-        dVth_dVd -= dDITS_Sft2_dVd;
-    }
-    here.von = Vth;
-    T0 = here.vfb + pParam.phi;
-    if model.mtrlMod == 0 {
-        T1 = EPSSI;
+        model.epsrgate * EPS0
+    };
+    let (vgs_eff, dvgs_eff_dvg) = poly_depletion(
+        vgs,
+        poly_threshold,
+        pParam.ngate,
+        poly_permittivity,
+        model.coxe,
+        CHARGE,
+    )?;
+    let (vgd_eff, dvgd_eff_dvg) = poly_depletion(
+        vgd,
+        poly_threshold,
+        pParam.ngate,
+        poly_permittivity,
+        model.coxe,
+        CHARGE,
+    )?;
+    here.vgs_eff = vgs_eff.primal();
+    here.vgd_eff = vgd_eff.primal();
+    here.dvgs_eff_dvg = dvgs_eff_dvg.primal();
+    here.dvgd_eff_dvg = dvgd_eff_dvg.primal();
+    let (Vgs_eff, dVgs_eff_dVg) = if here.mode > 0 {
+        (vgs_eff.clone(), here.dvgs_eff_dvg)
     } else {
-        T1 = model.epsrgate * EPS0;
-    }
-    (vgs_eff, dvgs_eff_dvg) = BSIM4polyDepletion(T0, pParam.ngate, T1, model.coxe, vgs);
-    (vgd_eff, dvgd_eff_dvg) = BSIM4polyDepletion(T0, pParam.ngate, T1, model.coxe, vgd);
-    if here.mode > 0 {
-        Vgs_eff = vgs_eff;
-        dVgs_eff_dVg = dvgs_eff_dvg;
-    } else {
-        Vgs_eff = vgd_eff;
-        dVgs_eff_dVg = dvgd_eff_dvg;
-    }
-    here.vgs_eff = vgs_eff;
-    here.vgd_eff = vgd_eff;
-    here.dvgs_eff_dvg = dvgs_eff_dvg;
-    here.dvgd_eff_dvg = dvgd_eff_dvg;
-    Vgst = Vgs_eff - Vth;
-    T0 = n * Vtm;
-    T1 = pParam.mstar * Vgst;
-    T2 = T1 / T0;
-    if T2 > EXP_THRESHOLD {
-        T10 = T1;
-        dT10_dVg = pParam.mstar * dVgs_eff_dVg;
-        dT10_dVd = -dVth_dVd * pParam.mstar;
-        dT10_dVb = -dVth_dVb * pParam.mstar;
-    } else if T2 < -EXP_THRESHOLD {
-        T10 = Vtm * MIN_EXP.ln_1p();
-        dT10_dVg = 0.0;
-        dT10_dVd = T10 * dn_dVd;
-        dT10_dVb = T10 * dn_dVb;
-        T10 *= n;
-    } else {
-        ExpVgst = exp(T2);
-        T3 = Vtm * ExpVgst.ln_1p();
-        T10 = n * T3;
-        dT10_dVg = pParam.mstar * ExpVgst / (1.0 + ExpVgst);
-        dT10_dVb = T3 * dn_dVb - dT10_dVg * (dVth_dVb + Vgst * dn_dVb / n);
-        dT10_dVd = T3 * dn_dVd - dT10_dVg * (dVth_dVd + Vgst * dn_dVd / n);
-        dT10_dVg *= dVgs_eff_dVg;
-    }
-    T1 = pParam.voffcbn - (1.0 - pParam.mstar) * Vgst;
-    T2 = T1 / T0;
-    if T2 < -EXP_THRESHOLD {
-        T3 = model.coxe * MIN_EXP / pParam.cdep0;
-        T9 = pParam.mstar + T3 * n;
-        dT9_dVg = 0.0;
-        dT9_dVd = dn_dVd * T3;
-        dT9_dVb = dn_dVb * T3;
-    } else if T2 > EXP_THRESHOLD {
-        T3 = model.coxe * MAX_EXP / pParam.cdep0;
-        T9 = pParam.mstar + T3 * n;
-        dT9_dVg = 0.0;
-        dT9_dVd = dn_dVd * T3;
-        dT9_dVb = dn_dVb * T3;
-    } else {
-        ExpVgst = exp(T2);
-        T3 = model.coxe / pParam.cdep0;
-        T4 = T3 * ExpVgst;
-        T5 = T1 * T4 / T0;
-        T9 = pParam.mstar + n * T4;
-        dT9_dVg = T3 * (pParam.mstar - 1.0) * ExpVgst / Vtm;
-        dT9_dVb = T4 * dn_dVb - dT9_dVg * dVth_dVb - T5 * dn_dVb;
-        dT9_dVd = T4 * dn_dVd - dT9_dVg * dVth_dVd - T5 * dn_dVd;
-        dT9_dVg *= dVgs_eff_dVg;
-    }
-    Vgsteff = T10 / T9;
-    here.Vgsteff = Vgsteff;
-    dVgsteff_dVg = (-Vgsteff).mul_add(dT9_dVg, dT10_dVg) / T9;
-    dVgsteff_dVd = (-Vgsteff).mul_add(dT9_dVd, dT10_dVd) / T9;
-    dVgsteff_dVb = (-Vgsteff).mul_add(dT9_dVb, dT10_dVb) / T9;
-    Electrostatics {
+        (vgd_eff.clone(), here.dvgd_eff_dvg)
+    };
+    let Vgst = Vgs_eff.clone().add(&Vth.clone().scale(-1.));
+    let (Vgsteff, voltage_partial, factor_partial) = effective_overdrive(
+        &Vgst,
+        &n,
+        Vtm,
+        pParam.mstar,
+        pParam.voffcbn,
+        model.coxe / pParam.cdep0,
+    )?;
+    here.Vgsteff = Vgsteff.primal();
+    let dVgsteff_dVg = voltage_partial.primal() * dVgs_eff_dVg;
+    let dVgsteff_dVd = factor_partial
+        .primal()
+        .mul_add(dn_dVd, -voltage_partial.primal() * dVth_dVd);
+    let dVgsteff_dVb = factor_partial
+        .primal()
+        .mul_add(dn_dVb, -voltage_partial.primal() * dVth_dVb);
+    Ok(Electrostatics {
         Leff,
         Lpe_Vb,
         Phis,
@@ -456,6 +303,8 @@ pub(super) fn electrostatics(
         Vds,
         Vgs,
         Vgs_eff,
+        vgs_eff_raw: vgs_eff,
+        vgd_eff_raw: vgd_eff,
         Vgst,
         Vgsteff,
         Vth,
@@ -480,7 +329,121 @@ pub(super) fn electrostatics(
         n,
         sqrtPhis,
         toxe,
+    })
+}
+
+/// Mobility degradation, before the rational denominator continuation.
+/// The local coordinates are effective gate overdrive, threshold, and body
+/// potential. Reference load partials use these coordinates, whereas physical
+/// Taylor arithmetic differentiates the same value law through terminal bias.
+fn mobility_degradation<S: Constitutive>(
+    model: &Model,
+    here: &Instance,
+    p: &SizeParam,
+    electro: &Electrostatics<S>,
+) -> SpiceResult<(S, [f64; 3])> {
+    let v = &electro.Vgsteff;
+    let threshold = &electro.Vth;
+    let body = &electro.Vbseff;
+    let tox = electro.toxe;
+    let material_shift = if model.mtrlMod != 0 && model.mtrlCompatMod == 0 {
+        2. * f64::from(model.r#type) * (model.phig - model.easub - 0.5 * model.Eg0 + 0.45)
+    } else {
+        0.
+    };
+    let ua = p.ua;
+    let ub = p.ub;
+    let uc = p.uc;
+    let ud = p.ud;
+    if model.mobMod == 3 || !(0..=6).contains(&model.mobMod) {
+        let field_scale = 1e-8 / tox / 6.;
+        let field = v.clone().offset(here.vtfbphi1).scale(field_scale);
+        let power = field.clone().ln()?.scale(p.eu).exp();
+        let coefficient = body.clone().scale(uc).offset(ua);
+        let denominator = v.clone().scale(0.5 / p.VgsteffVth).offset(0.5);
+        let scattering = denominator.clone().ln()?.scale(-p.ucs).exp().scale(ud);
+        let gate = coefficient.primal() * power.primal() * p.eu * field_scale / field.primal()
+            - 0.5 * p.ucs * scattering.primal() / denominator.primal() / p.VgsteffVth;
+        let bulk = power.primal() * uc;
+        return Ok((
+            power.multiply(&coefficient).add(&scattering),
+            [gate, 0., bulk],
+        ));
     }
+    let fixed_threshold = model.mobMod >= 4;
+    let family = if fixed_threshold {
+        model.mobMod - 4
+    } else {
+        model.mobMod
+    };
+    let coulomb_threshold = if fixed_threshold {
+        v.constant(here.vtfbphi1)
+    } else {
+        threshold.clone()
+    };
+    let softened = coulomb_threshold
+        .clone()
+        .multiply(&coulomb_threshold)
+        .offset(0.0001)
+        .sqrt()?;
+    let screening = v.clone().add(&softened.clone().scale(2.));
+    let scaled_threshold = coulomb_threshold.clone().scale(tox).divide(&screening)?;
+    let coulomb = scaled_threshold
+        .clone()
+        .multiply(&scaled_threshold)
+        .scale(ud);
+    let coulomb_gate = -2. * coulomb.primal() / screening.primal();
+    let coulomb_threshold_partial = if fixed_threshold {
+        0.
+    } else {
+        let threshold = coulomb_threshold.primal();
+        let ratio = tox / screening.primal();
+        2. * (ud * ratio * ratio * threshold + coulomb_gate * threshold / softened.primal())
+    };
+    let (field_term, gate_partial, threshold_partial, body_partial) = if family == 2 {
+        let field = v.clone().offset(here.vtfbphi1).scale(tox.recip());
+        let power = field.clone().ln()?.scale(p.eu).exp();
+        let coefficient = body.clone().scale(uc).offset(ua);
+        let gate_partial = coefficient.primal() * power.primal() * p.eu / field.primal() / tox;
+        let body_partial = power.primal() * uc;
+        (power.multiply(&coefficient), gate_partial, 0., body_partial)
+    } else {
+        let field = if fixed_threshold {
+            v.clone().offset(here.vtfbphi1 - material_shift)
+        } else {
+            v.clone()
+                .add(&threshold.clone().scale(2.))
+                .offset(-material_shift)
+        }
+        .scale(tox.recip());
+        let (term, gate, bulk) = if family == 0 {
+            let coefficient = body.clone().scale(uc).offset(ua);
+            let slope = (coefficient.primal() + 2. * ub * field.primal()) / tox;
+            let bulk = uc * field.primal();
+            let term = field.clone().multiply(&field.scale(ub).add(&coefficient));
+            (term, slope, bulk)
+        } else {
+            let coefficient = body.clone().scale(uc).offset(1.);
+            let field_term = field.clone().multiply(&field.clone().scale(ub).offset(ua));
+            let slope = (ua + 2. * ub * field.primal()) * coefficient.primal() / tox;
+            let bulk = uc * field_term.primal();
+            (field_term.multiply(&coefficient), slope, bulk)
+        };
+        (
+            term,
+            gate,
+            if fixed_threshold { 0. } else { 2. * gate },
+            bulk,
+        )
+    };
+    Ok((
+        field_term.add(&coulomb),
+        [
+            gate_partial + coulomb_gate,
+            threshold_partial + coulomb_threshold_partial,
+            body_partial,
+        ],
+    ))
 }
 
 /// Channel mobility, saturation, current, substrate current and series resistances.
@@ -490,1011 +453,349 @@ pub(super) fn transport(
     pParam: &SizeParam,
     bias: &LoadBias,
     electrostatics: &Electrostatics,
-) -> Transport {
-    let &LoadBias {
-        vbd,
-        vbs,
-        vdes,
-        vds,
-        vgd,
-        vgs,
-        vses,
-        ..
-    } = bias;
-    let &Electrostatics {
-        Leff,
-        Lpe_Vb,
-        Vbseff,
-        Vds,
-        Vgsteff,
-        Vth,
-        Vth_NarrowW,
-        Vtm,
-        Xdep,
-        dVbseff_dVb,
-        dVgsteff_dVb,
-        dVgsteff_dVd,
-        dVgsteff_dVg,
-        dVth_dVb,
-        dVth_dVd,
-        dXdep_dVb,
-        dsqrtPhis_dVb,
-        epssub,
-        sqrtPhis,
-        toxe,
-        ..
-    } = electrostatics;
-    let mut dgstot_dvd: f64;
-    let mut dgstot_dvg: f64;
-    let mut dgstot_dvs: f64;
-    let mut dgstot_dvb: f64;
-    let mut dgdtot_dvd: f64;
-    let mut dgdtot_dvg: f64;
-    let mut dgdtot_dvs: f64;
-    let mut dgdtot_dvb: f64;
-    let mut Rs: f64;
-    let mut Rd: f64;
-    let mut vgs_eff: f64;
-    let mut vgd_eff: f64;
-    let mut dvgs_eff_dvg: f64;
-    let mut dvgd_eff_dvg: f64;
-    let mut dRs_dvg: f64;
-    let mut dRd_dvg: f64;
-    let mut dRs_dvb: f64;
-    let mut dRd_dvb: f64;
-    let mut dT0_dvg: f64;
-    let mut dT1_dvb: f64;
-    let mut dT3_dvg: f64;
-    let mut dT3_dvb: f64;
-    let mut cdrain: f64;
-    let mut Tcen: f64;
-    let mut dTcen_dVg: f64;
-    let mut Coxeff: f64;
-    let mut dCoxeff_dVg: f64;
-    let mut Denomi: f64;
-    let mut dDenomi_dVg: f64;
-    let mut dDenomi_dVd: f64;
-    let mut dDenomi_dVb: f64;
-    let mut ueff: f64;
-    let mut dueff_dVg: f64;
-    let mut dueff_dVd: f64;
-    let mut dueff_dVb: f64;
-    let mut Esat: f64;
-    let mut Vdsat: f64;
-    let mut EsatL: f64;
-    let mut dEsatL_dVg: f64;
-    let mut dEsatL_dVd: f64;
-    let mut dEsatL_dVb: f64;
-    let mut dVdsat_dVg: f64;
-    let mut dVdsat_dVb: f64;
-    let mut dVdsat_dVd: f64;
-    let mut Vasat: f64;
-    let mut dVasat_dVg: f64;
-    let mut dVasat_dVb: f64;
-    let mut dVasat_dVd: f64;
-    let mut Va: f64;
-    let mut dVa_dVd: f64;
-    let mut dVa_dVg: f64;
-    let mut dVa_dVb: f64;
-    let mut VgsteffVth: f64;
-    let mut dT11_dVg: f64;
-    let mut T0: f64;
-    let mut dT0_dVg: f64;
-    let mut dT0_dVd: f64;
-    let mut dT0_dVb: f64;
-    let mut T1: f64;
-    let mut dT1_dVg: f64;
-    let mut dT1_dVd: f64;
-    let mut dT1_dVb: f64;
-    let mut T2: f64;
-    let mut dT2_dVg: f64;
-    let mut dT2_dVd: f64;
-    let mut dT2_dVb: f64;
-    let mut T3: f64;
-    let mut dT3_dVg: f64;
-    let mut dT3_dVd: f64;
-    let mut dT3_dVb: f64;
-    let mut T4: f64;
-    let mut T5: f64;
-    let mut dT5_dVg: f64;
-    let mut dT5_dVd: f64;
-    let mut dT5_dVb: f64;
-    let mut T6: f64;
-    let mut dT6_dVg: f64;
-    let mut dT6_dVd: f64;
-    let mut dT6_dVb: f64;
-    let mut T7: f64;
-    let mut T8: f64;
-    let mut dT8_dVg: f64;
-    let mut dT8_dVd: f64;
-    let mut dT8_dVb: f64;
-    let mut T9: f64;
-    let mut dT9_dVg: f64;
-    let mut dT9_dVd: f64;
-    let mut dT9_dVb: f64;
-    let mut T10: f64;
-    let mut dT10_dVg: f64;
-    let mut dT10_dVb: f64;
-    let mut dT10_dVd: f64;
-    let mut T11: f64;
-    let mut T12: f64;
-    let mut T13: f64;
-    let mut T14: f64;
-    let mut tmp: f64;
-    let mut Abulk: f64;
-    let mut dAbulk_dVb: f64;
-    let mut Abulk0: f64;
-    let mut Abulk0_Q: f64;
-    let mut dAbulk0_dVb: f64;
-    let mut dAbulk0_Q_dVb: f64;
-    let mut Cclm: f64;
-    let mut dCclm_dVg: f64;
-    let mut dCclm_dVd: f64;
-    let mut dCclm_dVb: f64;
-    let mut FP: f64;
-    let mut dFP_dVg: f64;
-    let mut PvagTerm: f64;
-    let mut dPvagTerm_dVg: f64;
-    let mut dPvagTerm_dVd: f64;
-    let mut dPvagTerm_dVb: f64;
-    let mut VADITS: f64;
-    let mut dVADITS_dVg: f64;
-    let mut dVADITS_dVd: f64;
-    let mut VACLM: f64;
-    let mut dVACLM_dVg: f64;
-    let mut dVACLM_dVd: f64;
-    let mut dVACLM_dVb: f64;
-    let mut VADIBL: f64;
-    let mut dVADIBL_dVg: f64;
-    let mut dVADIBL_dVd: f64;
-    let mut dVADIBL_dVb: f64;
-    let mut tmp1: f64;
-    let mut tmp2: f64;
-    let mut tmp3: f64;
-    let mut tmp4: f64;
-    let mut Lambda: f64;
-    let mut dLambda_dVg: f64;
-    let mut a1: f64;
-    let mut Vdseff: f64;
-    let mut dVdseff_dVg: f64;
-    let mut dVdseff_dVd: f64;
-    let mut dVdseff_dVb: f64;
-    let mut diffVds: f64;
-    let mut dAbulk_dVg: f64;
-    let mut beta: f64;
-    let mut dbeta_dVg: f64;
-    let mut dbeta_dVd: f64;
-    let mut dbeta_dVb: f64;
-    let mut gche: f64;
-    let mut dgche_dVg: f64;
-    let mut dgche_dVd: f64;
-    let mut dgche_dVb: f64;
-    let mut fgche1: f64;
-    let mut dfgche1_dVg: f64;
-    let mut dfgche1_dVd: f64;
-    let mut dfgche1_dVb: f64;
-    let mut fgche2: f64;
-    let mut dfgche2_dVg: f64;
-    let mut dfgche2_dVd: f64;
-    let mut dfgche2_dVb: f64;
-    let mut Idl: f64;
-    let mut dIdl_dVg: f64;
-    let mut dIdl_dVd: f64;
-    let mut dIdl_dVb: f64;
-    let mut Idsa: f64;
-    let mut dIdsa_dVg: f64;
-    let mut dIdsa_dVd: f64;
-    let mut dIdsa_dVb: f64;
-    let mut Ids: f64;
-    let mut Gm: f64;
-    let mut Gds: f64;
-    let mut Gmb: f64;
-    let mut Isub: f64;
-    let mut Gbd: f64;
-    let mut Gbg: f64;
-    let mut Gbb: f64;
-    let mut VASCBE: f64;
-    let mut dVASCBE_dVg: f64;
-    let mut dVASCBE_dVd: f64;
-    let mut dVASCBE_dVb: f64;
-    let mut CoxeffWovL: f64;
-    let mut Rds: f64;
-    let mut dRds_dVg: f64;
-    let mut dRds_dVb: f64;
-    let mut WVCox: f64;
-    let mut WVCoxRds: f64;
-    let mut Vgst2Vtm: f64;
-    let mut Weff: f64;
-    let mut dWeff_dVg: f64;
-    let mut dWeff_dVb: f64;
-    let mut vs: f64;
-    let mut Fsevl: f64;
-    let mut dvs_dVg: f64;
-    let mut dvs_dVd: f64;
-    let mut dvs_dVb: f64;
-    let mut dFsevl_dVg: f64;
-    let mut dFsevl_dVd: f64;
-    let mut dFsevl_dVb: f64;
-    T9 = sqrtPhis - pParam.sqrtPhi;
-    Weff = pParam.weff - 2.0 * (pParam.dwg * Vgsteff + pParam.dwb * T9);
-    dWeff_dVg = -2.0 * pParam.dwg;
-    dWeff_dVb = -2.0 * pParam.dwb * dsqrtPhis_dVb;
-    if Weff < 2.0e-8 {
-        T0 = 1.0 / (6.0e-8 - 2.0 * Weff);
-        Weff = 2.0e-8 * (4.0e-8 - Weff) * T0;
-        let correction = T0 * 4.0e-16;
-        T0 *= correction;
-        dWeff_dVg *= T0;
-        dWeff_dVb *= T0;
-    }
-    if model.rdsMod == 1 {
-        dRds_dVb = 0.0;
-        dRds_dVg = dRds_dVb;
-        Rds = dRds_dVg;
+) -> SpiceResult<Transport> {
+    transport_constitutive(
+        model,
+        here,
+        pParam,
+        [bias.vbs, bias.vgs, bias.vds, bias.vdes, bias.vses],
+        electrostatics,
+    )
+}
+
+/// Convert reference partials in (effective overdrive, oriented drain,
+/// effective body) to normalized terminal partials. This is separate from
+/// the exact physical derivatives already present in the generic value.
+fn terminal_partials<S>(partials: [f64; 3], electro: &Electrostatics<S>) -> [f64; 3] {
+    let [gate, drain, body] = partials;
+    [
+        gate * electro.dVgsteff_dVg,
+        gate.mul_add(electro.dVgsteff_dVd, drain),
+        gate.mul_add(electro.dVgsteff_dVb, body) * electro.dVbseff_dVb,
+    ]
+}
+
+fn external_conductance<S: Constitutive>(
+    p: &SizeParam,
+    gate: S,
+    body: S,
+    minimum: f64,
+    resistance: f64,
+    conductance: f64,
+) -> SpiceResult<Local<S, 2>> {
+    let gate = Local::new(gate, [1., 0.]);
+    let body = Local::new(body, [0., 1.]);
+    let (effective, _) = smooth_positive(gate.offset(-p.vfbsd), 2.5e-5)?;
+    let argument = effective
+        .constant(1.)
+        .divide(&effective.scale(p.prwg).offset(1.))?
+        .add(&body.scale(-p.prwb));
+    let (positive, _) = smooth_positive(argument, 0.0025)?;
+    let r = positive.scale(resistance).offset(minimum);
+    r.constant(conductance)
+        .divide(&r.scale(conductance).offset(1.))
+}
+
+/// Reference and physical transport share the complete value sequence.
+/// The stack-only local tangent tracks the three conventional Newton
+/// coordinates even when the value is a differential time series.
+pub(super) fn transport_constitutive<S: Constitutive>(
+    model: &Model,
+    here: &mut Instance,
+    p: &SizeParam,
+    [vbs, vgs, vds, vdes, vses]: [S; 5],
+    electro: &Electrostatics<S>,
+) -> SpiceResult<Transport<S>> {
+    let leff = electro.Leff;
+    let vtm = electro.Vtm;
+    let epssub = electro.epssub;
+    let c = |x| Local::new(electro.Vgsteff.constant(x), [0.; 3]);
+    let gate = Local::new(electro.Vgsteff.clone(), [1., 0., 0.]);
+    let drain = Local::new(electro.Vds.clone(), [0., 1., 0.]);
+    let body = Local::new(electro.Vbseff.clone(), [0., 0., 1.]);
+    let root = Local::new(electro.sqrtPhis.clone(), [0., 0., electro.dsqrtPhis_dVb]);
+    let depth = Local::new(electro.Xdep.clone(), [0., 0., electro.dXdep_dVb]);
+    let root_shift = root.clone().offset(-p.sqrtPhi);
+    let width_argument = gate
+        .clone()
+        .scale(p.dwg)
+        .add(&root_shift.clone().scale(p.dwb))
+        .scale(-2.)
+        .offset(p.weff);
+    let (width, _) = rational_floor(width_argument, 2e-8, 0., 1e8)?;
+    let rds = if model.rdsMod == 1 {
+        c(0.)
     } else {
-        T0 = 1.0 + pParam.prwg * Vgsteff;
-        dT0_dVg = -pParam.prwg / T0 / T0;
-        T1 = pParam.prwb * T9;
-        dT1_dVb = pParam.prwb * dsqrtPhis_dVb;
-        T2 = 1.0 / T0 + T1;
-        let (positive, slope) = smooth_positive(T2, 0.0025);
-        T3 = 2.0 * positive;
-        dT3_dVg = 2.0 * slope;
-        dT3_dVb = dT3_dVg * dT1_dVb;
-        dT3_dVg *= dT0_dVg;
-        T4 = pParam.rds0 * 0.5;
-        Rds = pParam.rdswmin + T3 * T4;
-        dRds_dVg = T4 * dT3_dVg;
-        dRds_dVb = T4 * dT3_dVb;
-        if Rds > 0.0 {
-            here.grdsw = 1.0 / Rds * here.nf;
+        let argument = c(1.)
+            .divide(&gate.clone().scale(p.prwg).offset(1.))?
+            .add(&root_shift.scale(p.prwb));
+        let (positive, _) = smooth_positive(argument, 0.0025)?;
+        let r = positive.scale(p.rds0).offset(p.rdswmin);
+        here.grdsw = if r.primal() > 0. {
+            here.nf / r.primal()
         } else {
-            here.grdsw = 0.0;
+            0.
+        };
+        r
+    };
+    let body_effect = c(0.5 * p.k1ox * electro.Lpe_Vb)
+        .divide(&root)?
+        .offset(here.k2ox - p.k3b * electro.Vth_NarrowW);
+    let geometry = c(leff).divide(&depth.scale(p.xj).sqrt()?.scale(2.).offset(leff))?;
+    let bulk0 = body_effect.clone().mul_add(
+        &geometry.clone().scale(p.a0).offset(p.b0 / (p.weff + p.b1)),
+        &c(1.),
+    );
+    let cubic = geometry.clone().multiply(&geometry).multiply(&geometry);
+    let bulk = body_effect
+        .multiply(&cubic)
+        .scale(-p.ags * p.a0)
+        .mul_add(&gate, &bulk0);
+    let (bulk0, _) = rational_floor(bulk0, 0.1, 0., 20.)?;
+    let (bulk, _) = rational_floor(bulk, 0.1, 0., 20.)?;
+    here.Abulk = bulk.primal();
+    let (bulk_scale, _) = reciprocal_floor(body.clone().scale(p.keta), -0.9, 20.)?;
+    let bulk = bulk.multiply(&bulk_scale);
+    let bulk_cv = if p.ketac == p.keta {
+        bulk0.multiply(&bulk_scale)
+    } else {
+        let (factor, _) = reciprocal_floor(body.clone().scale(p.ketac), -0.9, 20.)?;
+        bulk0.multiply(&factor)
+    };
+
+    let (degradation, [dg, dt, db]) = mobility_degradation(model, here, p, electro)?;
+    let raw = Local::new(
+        degradation,
+        [dg, dt * electro.dVth_dVd, dt.mul_add(electro.dVth_dVb, db)],
+    );
+    let (denominator, _) = rational_floor(raw, -0.8, 1., 10.)?;
+    let mobility = c(here.u0temp).divide(&denominator)?;
+    here.ueff = mobility.primal();
+    let resistance_product = width
+        .clone()
+        .scale(here.vsattemp * model.coxe)
+        .multiply(&rds);
+    let mut field = c(2. * here.vsattemp * leff).divide(&mobility)?;
+    here.EsatL = field.primal();
+    let drive = gate.clone().offset(2. * vtm);
+    let (shape, _) = saturation_shape(&gate, p.a1, p.a2)?;
+    let saturation = saturation_voltage(&drive, &bulk, &field, &resistance_product, &shape)?.value;
+    here.vdsat = saturation.primal();
+    let smoothing = smooth_drain(saturation.clone(), drain.clone(), p.delta)?;
+    let effective = smoothing.effective;
+    let excess = smoothing.drain_excess;
+    here.Vdseff = effective.primal();
+
+    if model.lambdaGiven && model.lambda > 0. {
+        let correction = c(p.lambda / leff).divide(&mobility)?;
+        let ratio = excess.clone().scale(leff / p.litl).divide(&field)?;
+        let square = ratio.offset(1.);
+        let square = square.clone().multiply(&square);
+        let overshoot = c(1.).add(&c(-2.).divide(&square.offset(1.))?);
+        let mut factor = correction.mul_add(&overshoot, &c(1.));
+        // Reference Newton stamp discards the slope when the correction
+        // rounds to unity; the physical value germ retains it.
+        if factor.primal() == 1. {
+            factor.partials = [0.; 3];
         }
+        field = field.multiply(&factor);
+        here.EsatL = field.primal();
     }
-    T9 = 0.5 * pParam.k1ox * Lpe_Vb / sqrtPhis;
-    T1 = T9 + here.k2ox - pParam.k3b * Vth_NarrowW;
-    dT1_dVb = -T9 / sqrtPhis * dsqrtPhis_dVb;
-    T9 = sqrt(pParam.xj * Xdep);
-    tmp1 = Leff + 2.0 * T9;
-    T5 = Leff / tmp1;
-    tmp2 = pParam.a0 * T5;
-    tmp3 = pParam.weff + pParam.b1;
-    tmp4 = pParam.b0 / tmp3;
-    T2 = tmp2 + tmp4;
-    dT2_dVb = -T9 / tmp1 / Xdep * dXdep_dVb;
-    T6 = T5 * T5;
-    T7 = T5 * T6;
-    Abulk0 = 1.0 + T1 * T2;
-    dAbulk0_dVb = T1 * tmp2 * dT2_dVb + T2 * dT1_dVb;
-    T8 = pParam.ags * pParam.a0 * T7;
-    dAbulk_dVg = -T1 * T8;
-    Abulk = Abulk0 + dAbulk_dVg * Vgsteff;
-    dAbulk_dVb = dAbulk0_dVb - T8 * Vgsteff * (dT1_dVb + 3.0 * T1 * dT2_dVb);
-    if Abulk0 < 0.1 {
-        T9 = 1.0 / (3.0 - 20.0 * Abulk0);
-        Abulk0 = (0.2 - Abulk0) * T9;
-        dAbulk0_dVb *= T9 * T9;
-    }
-    if Abulk < 0.1 {
-        T9 = 1.0 / (3.0 - 20.0 * Abulk);
-        Abulk = (0.2 - Abulk) * T9;
-        T10 = T9 * T9;
-        dAbulk_dVb *= T10;
-        dAbulk_dVg *= T10;
-    }
-    here.Abulk = Abulk;
-    T2 = pParam.keta * Vbseff;
-    if T2 >= -0.9 {
-        T0 = 1.0 / (1.0 + T2);
-        dT0_dVb = -pParam.keta * T0 * T0;
+    let vasat = saturation_early_voltage(
+        &gate,
+        &bulk,
+        &saturation,
+        &field,
+        &resistance_product,
+        &shape,
+        vtm,
+    )?
+    .value;
+    let centroid_argument = gate
+        .clone()
+        .offset(here.vtfbphi2)
+        .scale(1. / (2e8 * here.toxp));
+    let centroid_power = centroid_argument.ln()?.scale(model.bdos * 0.7).exp();
+    let centroid = c(model.ados * 1.9e-9).divide(&centroid_power.offset(1.))?;
+    let oxide = c(epssub * here.coxp).divide(&centroid.scale(here.coxp).offset(epssub))?;
+    here.Coxeff = oxide.primal();
+    let oxide_width = oxide.clone().multiply(&width).scale(leff.recip());
+    let beta = mobility.multiply(&oxide_width);
+    here.AbovVgst2Vtm = bulk.primal() / drive.primal();
+    let gche = channel_conductance(&gate, &bulk, &effective, &field, &beta, vtm)?.value;
+    let idl = series_conductance(&gche, &rds)?.value;
+    let fp = if p.fprout <= 0. {
+        c(1.)
     } else {
-        T1 = 1.0 / (0.8 + T2);
-        T0 = (17.0 + 20.0 * T2) * T1;
-        dT0_dVb = -pParam.keta * T1 * T1;
-    }
-    dAbulk_dVg *= T0;
-    dAbulk_dVb = dAbulk_dVb * T0 + Abulk * dT0_dVb;
-    dAbulk0_Q_dVb = dAbulk0_dVb;
-    dAbulk0_dVb = dAbulk0_dVb * T0 + Abulk0 * dT0_dVb;
-    Abulk *= T0;
-    Abulk0_Q = Abulk0;
-    Abulk0 *= T0;
-    if pParam.ketac == pParam.keta {
-        dAbulk0_Q_dVb = dAbulk0_dVb;
-        Abulk0_Q = Abulk0;
+        c(1.).divide(&c(p.fprout * sqrt(leff)).divide(&drive)?.offset(1.))?
+    };
+    let pvag_argument = gate.clone().scale(p.pvag).divide(&field)?;
+    let (pvag, _) = rational_floor(pvag_argument, -0.9, 1., 20.)?;
+    let (cclm, vaclm) = if p.pclm > MIN_EXP && excess.compare(1e-10) == Some(Ordering::Greater) {
+        let length = saturation.clone().scale(leff).divide(&field)?.offset(leff);
+        let resistance_factor = rds.clone().mul_add(&idl, &c(1.));
+        let cclm = fp
+            .clone()
+            .multiply(&pvag)
+            .multiply(&resistance_factor)
+            .multiply(&length)
+            .scale(1. / (p.pclm * p.litl));
+        let vaclm = cclm.clone().multiply(&excess);
+        (cclm, vaclm)
     } else {
-        T2 = pParam.ketac * Vbseff;
-        if T2 >= -0.9 {
-            T0 = 1.0 / (1.0 + T2);
-            dT0_dVb = -pParam.ketac * T0 * T0;
+        (c(MAX_EXP), c(MAX_EXP))
+    };
+    let vadibl = if p.thetaRout > MIN_EXP {
+        dibl_early_voltage(&drive, &bulk, &saturation, &body, p.thetaRout, p.pdiblb)?
+            .value
+            .multiply(&pvag)
+    } else {
+        c(MAX_EXP)
+    };
+    let vadits = if p.pdits > MIN_EXP {
+        let argument = drain.scale(p.pditsd);
+        let exponential = if argument.compare(EXP_THRESHOLD) == Some(Ordering::Greater) {
+            c(MAX_EXP)
         } else {
-            T1 = 1.0 / (0.8 + T2);
-            T0 = (17.0 + 20.0 * T2) * T1;
-            dT0_dVb = -pParam.ketac * T1 * T1;
-        }
-        dAbulk0_Q_dVb = dAbulk0_Q_dVb * T0 + Abulk0_Q * dT0_dVb;
-        Abulk0_Q *= T0;
-    }
-    if (model.mtrlMod != 0) && model.mtrlCompatMod == 0 {
-        T14 = 2.0 * f64::from(model.r#type) * (model.phig - model.easub - 0.5 * model.Eg0 + 0.45);
+            argument.exp()
+        };
+        exponential
+            .scale(1. + model.pditsl * leff)
+            .offset(1.)
+            .scale(p.pdits.recip())
+            .multiply(&fp)
     } else {
-        T14 = 0.0;
-    }
-    if model.mobMod == 0 {
-        T0 = Vgsteff + Vth + Vth - T14;
-        T2 = pParam.ua + pParam.uc * Vbseff;
-        T3 = T0 / toxe;
-        T12 = sqrt(Vth * Vth + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
-        T10 = T9 * toxe;
-        T8 = pParam.ud * T10 * T10 * Vth;
-        T6 = T8 * Vth;
-        T5 = T3 * (T2 + pParam.ub * T3) + T6;
-        T7 = -2.0 * T6 * T9;
-        T11 = T7 * Vth / T12;
-        dDenomi_dVg = (T2 + 2.0 * pParam.ub * T3) / toxe;
-        T13 = 2.0 * (dDenomi_dVg + T11 + T8);
-        dDenomi_dVd = T13 * dVth_dVd;
-        dDenomi_dVb = T13 * dVth_dVb + pParam.uc * T3;
-        dDenomi_dVg += T7;
-    } else if model.mobMod == 1 {
-        T0 = Vgsteff + Vth + Vth - T14;
-        T2 = 1.0 + pParam.uc * Vbseff;
-        T3 = T0 / toxe;
-        T4 = T3 * (pParam.ua + pParam.ub * T3);
-        T12 = sqrt(Vth * Vth + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
-        T10 = T9 * toxe;
-        T8 = pParam.ud * T10 * T10 * Vth;
-        T6 = T8 * Vth;
-        T5 = T4 * T2 + T6;
-        T7 = -2.0 * T6 * T9;
-        T11 = T7 * Vth / T12;
-        dDenomi_dVg = (pParam.ua + 2.0 * pParam.ub * T3) * T2 / toxe;
-        T13 = 2.0 * (dDenomi_dVg + T11 + T8);
-        dDenomi_dVd = T13 * dVth_dVd;
-        dDenomi_dVb = T13 * dVth_dVb + pParam.uc * T4;
-        dDenomi_dVg += T7;
-    } else if model.mobMod == 2 {
-        T0 = (Vgsteff + here.vtfbphi1) / toxe;
-        T1 = exp(pParam.eu * log(T0));
-        dT1_dVg = T1 * pParam.eu / T0 / toxe;
-        T2 = pParam.ua + pParam.uc * Vbseff;
-        T12 = sqrt(Vth * Vth + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
-        T10 = T9 * toxe;
-        T8 = pParam.ud * T10 * T10 * Vth;
-        T6 = T8 * Vth;
-        T5 = T1 * T2 + T6;
-        T7 = -2.0 * T6 * T9;
-        T11 = T7 * Vth / T12;
-        dDenomi_dVg = T2 * dT1_dVg + T7;
-        T13 = 2.0 * (T11 + T8);
-        dDenomi_dVd = T13 * dVth_dVd;
-        dDenomi_dVb = T13 * dVth_dVb + T1 * pParam.uc;
-    } else if model.mobMod == 4 {
-        T0 = Vgsteff + here.vtfbphi1 - T14;
-        T2 = pParam.ua + pParam.uc * Vbseff;
-        T3 = T0 / toxe;
-        T12 = sqrt(here.vtfbphi1 * here.vtfbphi1 + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
-        T10 = T9 * toxe;
-        T8 = pParam.ud * T10 * T10 * here.vtfbphi1;
-        T6 = T8 * here.vtfbphi1;
-        T5 = T3 * (T2 + pParam.ub * T3) + T6;
-        T7 = -2.0 * T6 * T9;
-        dDenomi_dVg = (T2 + 2.0 * pParam.ub * T3) / toxe;
-        dDenomi_dVd = 0.0;
-        dDenomi_dVb = pParam.uc * T3;
-        dDenomi_dVg += T7;
-    } else if model.mobMod == 5 {
-        T0 = Vgsteff + here.vtfbphi1 - T14;
-        T2 = 1.0 + pParam.uc * Vbseff;
-        T3 = T0 / toxe;
-        T4 = T3 * (pParam.ua + pParam.ub * T3);
-        T12 = sqrt(here.vtfbphi1 * here.vtfbphi1 + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
-        T10 = T9 * toxe;
-        T8 = pParam.ud * T10 * T10 * here.vtfbphi1;
-        T6 = T8 * here.vtfbphi1;
-        T5 = T4 * T2 + T6;
-        T7 = -2.0 * T6 * T9;
-        dDenomi_dVg = (pParam.ua + 2.0 * pParam.ub * T3) * T2 / toxe;
-        dDenomi_dVd = 0.0;
-        dDenomi_dVb = pParam.uc * T4;
-        dDenomi_dVg += T7;
-    } else if model.mobMod == 6 {
-        T0 = (Vgsteff + here.vtfbphi1) / toxe;
-        T1 = exp(pParam.eu * log(T0));
-        dT1_dVg = T1 * pParam.eu / T0 / toxe;
-        T2 = pParam.ua + pParam.uc * Vbseff;
-        T12 = sqrt(here.vtfbphi1 * here.vtfbphi1 + 0.0001);
-        T9 = 1.0 / (Vgsteff + 2.0 * T12);
-        T10 = T9 * toxe;
-        T8 = pParam.ud * T10 * T10 * here.vtfbphi1;
-        T6 = T8 * here.vtfbphi1;
-        T5 = T1 * T2 + T6;
-        T7 = -2.0 * T6 * T9;
-        dDenomi_dVg = T2 * dT1_dVg + T7;
-        dDenomi_dVd = 0.0;
-        dDenomi_dVb = T1 * pParam.uc;
-    } else {
-        T0 = (Vgsteff + here.vtfbphi1) * 1.0e-8 / toxe / 6.0;
-        T1 = exp(pParam.eu * log(T0));
-        dT1_dVg = T1 * pParam.eu * 1.0e-8 / T0 / toxe / 6.0;
-        T2 = pParam.ua + pParam.uc * Vbseff;
-        VgsteffVth = pParam.VgsteffVth;
-        T10 = exp(pParam.ucs * log(0.5 + 0.5 * Vgsteff / VgsteffVth));
-        T11 = pParam.ud / T10;
-        dT11_dVg = -0.5 * pParam.ucs * T11 / (0.5 + 0.5 * Vgsteff / VgsteffVth) / VgsteffVth;
-        dDenomi_dVg = T2 * dT1_dVg + dT11_dVg;
-        dDenomi_dVd = 0.0;
-        dDenomi_dVb = T1 * pParam.uc;
-        T5 = T1 * T2 + T11;
-    }
-    if T5 >= -0.8 {
-        Denomi = 1.0 + T5;
-    } else {
-        T9 = 1.0 / (7.0 + 10.0 * T5);
-        Denomi = (0.6 + T5) * T9;
-        T9 *= T9;
-        dDenomi_dVg *= T9;
-        dDenomi_dVd *= T9;
-        dDenomi_dVb *= T9;
-    }
-    ueff = here.u0temp / Denomi;
-    here.ueff = ueff;
-    T9 = -ueff / Denomi;
-    dueff_dVg = T9 * dDenomi_dVg;
-    dueff_dVd = T9 * dDenomi_dVd;
-    dueff_dVb = T9 * dDenomi_dVb;
-    WVCox = Weff * here.vsattemp * model.coxe;
-    WVCoxRds = WVCox * Rds;
-    Esat = 2.0 * here.vsattemp / ueff;
-    EsatL = Esat * Leff;
-    here.EsatL = EsatL;
-    T0 = -EsatL / ueff;
-    dEsatL_dVg = T0 * dueff_dVg;
-    dEsatL_dVd = T0 * dueff_dVd;
-    dEsatL_dVb = T0 * dueff_dVb;
-    a1 = pParam.a1;
-    if a1 == 0.0 {
-        Lambda = pParam.a2;
-        dLambda_dVg = 0.0;
-    } else if a1 > 0.0 {
-        T0 = 1.0 - pParam.a2;
-        T1 = T0 - pParam.a1 * Vgsteff - 0.0001;
-        T2 = sqrt(T1 * T1 + 0.0004 * T0);
-        Lambda = pParam.a2 + T0 - 0.5 * (T1 + T2);
-        dLambda_dVg = 0.5 * pParam.a1 * (1.0 + T1 / T2);
-    } else {
-        T1 = pParam.a2 + pParam.a1 * Vgsteff - 0.0001;
-        T2 = sqrt(T1 * T1 + 0.0004 * pParam.a2);
-        Lambda = 0.5 * (T1 + T2);
-        dLambda_dVg = 0.5 * pParam.a1 * (1.0 + T1 / T2);
-    }
-    Vgst2Vtm = Vgsteff + 2.0 * Vtm;
-    if Rds > 0.0 {
-        tmp2 = dRds_dVg / Rds + dWeff_dVg / Weff;
-        tmp3 = dRds_dVb / Rds + dWeff_dVb / Weff;
-    } else {
-        tmp2 = dWeff_dVg / Weff;
-        tmp3 = dWeff_dVb / Weff;
-    }
-    if (Rds == 0.0) && (Lambda == 1.0) {
-        T0 = 1.0 / (Abulk * EsatL + Vgst2Vtm);
-        tmp1 = 0.0;
-        T1 = T0 * T0;
-        T2 = Vgst2Vtm * T0;
-        T3 = EsatL * Vgst2Vtm;
-        Vdsat = T3 * T0;
-        dT0_dVg = -(Abulk * dEsatL_dVg + EsatL * dAbulk_dVg + 1.0) * T1;
-        dT0_dVd = -(Abulk * dEsatL_dVd) * T1;
-        dT0_dVb = -(Abulk * dEsatL_dVb + dAbulk_dVb * EsatL) * T1;
-        dVdsat_dVg = T3 * dT0_dVg + T2 * dEsatL_dVg + EsatL * T0;
-        dVdsat_dVd = T3 * dT0_dVd + T2 * dEsatL_dVd;
-        dVdsat_dVb = T3 * dT0_dVb + T2 * dEsatL_dVb;
-    } else {
-        tmp1 = dLambda_dVg / (Lambda * Lambda);
-        T9 = Abulk * WVCoxRds;
-        T8 = Abulk * T9;
-        T7 = Vgst2Vtm * T9;
-        T6 = Vgst2Vtm * WVCoxRds;
-        let inverse_lambda_delta = (1.0 - Lambda) / Lambda;
-        T0 = 2.0 * Abulk * (T9 + inverse_lambda_delta);
-        dT0_dVg = 2.0 * (T8 * tmp2 - Abulk * tmp1 + (2.0 * T9 + inverse_lambda_delta) * dAbulk_dVg);
-        dT0_dVb =
-            2.0 * (T8 * (2.0 / Abulk * dAbulk_dVb + tmp3) + inverse_lambda_delta * dAbulk_dVb);
-        dT0_dVd = 0.0;
-        T1 = Vgst2Vtm * (2.0 / Lambda - 1.0) + Abulk * EsatL + 3.0 * T7;
-        dT1_dVg = (2.0 / Lambda - 1.0) - 2.0 * Vgst2Vtm * tmp1
-            + Abulk * dEsatL_dVg
-            + EsatL * dAbulk_dVg
-            + 3.0 * (T9 + T7 * tmp2 + T6 * dAbulk_dVg);
-        dT1_dVb = Abulk * dEsatL_dVb + EsatL * dAbulk_dVb + 3.0 * (T6 * dAbulk_dVb + T7 * tmp3);
-        dT1_dVd = Abulk * dEsatL_dVd;
-        T2 = Vgst2Vtm * (EsatL + 2.0 * T6);
-        dT2_dVg = EsatL + Vgst2Vtm * dEsatL_dVg + T6 * (4.0 + 2.0 * Vgst2Vtm * tmp2);
-        dT2_dVb = Vgst2Vtm * (dEsatL_dVb + 2.0 * T6 * tmp3);
-        dT2_dVd = Vgst2Vtm * dEsatL_dVd;
-        let root = SaturationRoot::new(T0, T1, T2);
-        Vdsat = root.value;
-        dVdsat_dVg = root.derivative(dT0_dVg, dT1_dVg, dT2_dVg);
-        dVdsat_dVd = root.derivative(dT0_dVd, dT1_dVd, dT2_dVd);
-        dVdsat_dVb = root.derivative(dT0_dVb, dT1_dVb, dT2_dVb);
-    }
-    here.vdsat = Vdsat;
-    let smoothing = smooth_drain(Vdsat, Vds, pParam.delta);
-    Vdseff = smoothing.effective;
-    dVdseff_dVg = smoothing.saturation_partial * dVdsat_dVg;
-    dVdseff_dVd = smoothing
-        .saturation_partial
-        .mul_add(dVdsat_dVd, smoothing.drain_partial);
-    dVdseff_dVb = smoothing.saturation_partial * dVdsat_dVb;
-    diffVds = smoothing.drain_excess;
-    here.Vdseff = Vdseff;
-    if (model.lambdaGiven) && (model.lambda > 0.0) {
-        T1 = Leff * ueff;
-        T2 = pParam.lambda / T1;
-        T3 = -T2 / T1 * Leff;
-        dT2_dVd = T3 * dueff_dVd;
-        dT2_dVg = T3 * dueff_dVg;
-        dT2_dVb = T3 * dueff_dVb;
-        T5 = 1.0 / (Esat * pParam.litl);
-        T4 = -T5 / EsatL;
-        dT5_dVg = dEsatL_dVg * T4;
-        dT5_dVd = dEsatL_dVd * T4;
-        dT5_dVb = dEsatL_dVb * T4;
-        T6 = 1.0 + diffVds * T5;
-        dT6_dVg = dT5_dVg * diffVds - dVdseff_dVg * T5;
-        dT6_dVd = dT5_dVd * diffVds + (1.0 - dVdseff_dVd) * T5;
-        dT6_dVb = dT5_dVb * diffVds - dVdseff_dVb * T5;
-        T7 = 2.0 / (T6 * T6 + 1.0);
-        T8 = 1.0 - T7;
-        T9 = T6 * T7 * T7;
-        dT8_dVg = T9 * dT6_dVg;
-        dT8_dVd = T9 * dT6_dVd;
-        dT8_dVb = T9 * dT6_dVb;
-        T10 = 1.0 + T2 * T8;
-        dT10_dVg = dT2_dVg * T8 + T2 * dT8_dVg;
-        dT10_dVd = dT2_dVd * T8 + T2 * dT8_dVd;
-        dT10_dVb = dT2_dVb * T8 + T2 * dT8_dVb;
-        if T10 == 1.0 {
-            dT10_dVb = 0.0;
-            dT10_dVd = dT10_dVb;
-            dT10_dVg = dT10_dVd;
-        }
-        dEsatL_dVg *= T10;
-        dEsatL_dVg += EsatL * dT10_dVg;
-        dEsatL_dVd *= T10;
-        dEsatL_dVd += EsatL * dT10_dVd;
-        dEsatL_dVb *= T10;
-        dEsatL_dVb += EsatL * dT10_dVb;
-        EsatL *= T10;
-        Esat = EsatL / Leff;
-        here.EsatL = EsatL;
-    }
-    tmp4 = 1.0 - 0.5 * Abulk * Vdsat / Vgst2Vtm;
-    T9 = WVCoxRds * Vgsteff;
-    T8 = T9 / Vgst2Vtm;
-    T0 = EsatL + Vdsat + 2.0 * T9 * tmp4;
-    T7 = 2.0 * WVCoxRds * tmp4;
-    dT0_dVg = dEsatL_dVg + dVdsat_dVg + T7 * (1.0 + tmp2 * Vgsteff)
-        - T8 * (Abulk * dVdsat_dVg - Abulk * Vdsat / Vgst2Vtm + Vdsat * dAbulk_dVg);
-    dT0_dVb = dEsatL_dVb + dVdsat_dVb + T7 * tmp3 * Vgsteff
-        - T8 * (dAbulk_dVb * Vdsat + Abulk * dVdsat_dVb);
-    dT0_dVd = dEsatL_dVd + dVdsat_dVd - T8 * Abulk * dVdsat_dVd;
-    T9 = WVCoxRds * Abulk;
-    T1 = 2.0 / Lambda - 1.0 + T9;
-    dT1_dVg = -2.0 * tmp1 + WVCoxRds * (Abulk * tmp2 + dAbulk_dVg);
-    dT1_dVb = dAbulk_dVb * WVCoxRds + T9 * tmp3;
-    Vasat = T0 / T1;
-    dVasat_dVg = (dT0_dVg - Vasat * dT1_dVg) / T1;
-    dVasat_dVb = (dT0_dVb - Vasat * dT1_dVb) / T1;
-    dVasat_dVd = dT0_dVd / T1;
-    tmp1 = here.vtfbphi2;
-    tmp2 = 2.0e8 * here.toxp;
-    dT0_dVg = 1.0 / tmp2;
-    T0 = (Vgsteff + tmp1) * dT0_dVg;
-    tmp3 = exp(model.bdos * 0.7 * log(T0));
-    T1 = 1.0 + tmp3;
-    T2 = model.bdos * 0.7 * tmp3 / T0;
-    Tcen = model.ados * 1.9e-9 / T1;
-    dTcen_dVg = -Tcen * T2 * dT0_dVg / T1;
-    Coxeff = epssub * here.coxp / (epssub + here.coxp * Tcen);
-    here.Coxeff = Coxeff;
-    dCoxeff_dVg = -Coxeff * Coxeff * dTcen_dVg / epssub;
-    CoxeffWovL = Coxeff * Weff / Leff;
-    beta = ueff * CoxeffWovL;
-    T3 = ueff / Leff;
-    dbeta_dVg = CoxeffWovL * dueff_dVg + T3 * (Weff * dCoxeff_dVg + Coxeff * dWeff_dVg);
-    dbeta_dVd = CoxeffWovL * dueff_dVd;
-    dbeta_dVb = CoxeffWovL * dueff_dVb + T3 * Coxeff * dWeff_dVb;
-    here.AbovVgst2Vtm = Abulk / Vgst2Vtm;
-    T0 = 1.0 - 0.5 * Vdseff * here.AbovVgst2Vtm;
-    dT0_dVg =
-        -0.5 * (Abulk * dVdseff_dVg - Abulk * Vdseff / Vgst2Vtm + Vdseff * dAbulk_dVg) / Vgst2Vtm;
-    dT0_dVd = -0.5 * Abulk * dVdseff_dVd / Vgst2Vtm;
-    dT0_dVb = -0.5 * (Abulk * dVdseff_dVb + dAbulk_dVb * Vdseff) / Vgst2Vtm;
-    fgche1 = Vgsteff * T0;
-    dfgche1_dVg = Vgsteff * dT0_dVg + T0;
-    dfgche1_dVd = Vgsteff * dT0_dVd;
-    dfgche1_dVb = Vgsteff * dT0_dVb;
-    T9 = Vdseff / EsatL;
-    fgche2 = 1.0 + T9;
-    dfgche2_dVg = (dVdseff_dVg - T9 * dEsatL_dVg) / EsatL;
-    dfgche2_dVd = (dVdseff_dVd - T9 * dEsatL_dVd) / EsatL;
-    dfgche2_dVb = (dVdseff_dVb - T9 * dEsatL_dVb) / EsatL;
-    gche = beta * fgche1 / fgche2;
-    dgche_dVg = (beta * dfgche1_dVg + fgche1 * dbeta_dVg - gche * dfgche2_dVg) / fgche2;
-    dgche_dVd = (beta * dfgche1_dVd + fgche1 * dbeta_dVd - gche * dfgche2_dVd) / fgche2;
-    dgche_dVb = (beta * dfgche1_dVb + fgche1 * dbeta_dVb - gche * dfgche2_dVb) / fgche2;
-    T0 = 1.0 + gche * Rds;
-    Idl = gche / T0;
-    T1 = (1.0 / T0) / T0;
-    T2 = Idl * Idl;
-    dIdl_dVg = T1 * dgche_dVg - T2 * dRds_dVg;
-    dIdl_dVd = T1 * dgche_dVd;
-    dIdl_dVb = T1 * dgche_dVb - T2 * dRds_dVb;
-    if pParam.fprout <= 0.0 {
-        FP = 1.0;
-        dFP_dVg = 0.0;
-    } else {
-        T9 = pParam.fprout * sqrt(Leff) / Vgst2Vtm;
-        FP = 1.0 / (1.0 + T9);
-        dFP_dVg = FP * FP * T9 / Vgst2Vtm;
-    }
-    T8 = pParam.pvag / EsatL;
-    T9 = T8 * Vgsteff;
-    if T9 > -0.9 {
-        PvagTerm = 1.0 + T9;
-        dPvagTerm_dVg = T8 * (1.0 - Vgsteff * dEsatL_dVg / EsatL);
-        dPvagTerm_dVb = -T9 * dEsatL_dVb / EsatL;
-        dPvagTerm_dVd = -T9 * dEsatL_dVd / EsatL;
-    } else {
-        T4 = 1.0 / (17.0 + 20.0 * T9);
-        PvagTerm = (0.8 + T9) * T4;
-        T4 *= T4;
-        dPvagTerm_dVg = T8 * (1.0 - Vgsteff * dEsatL_dVg / EsatL) * T4;
-        T9 *= T4 / EsatL;
-        dPvagTerm_dVb = -T9 * dEsatL_dVb;
-        dPvagTerm_dVd = -T9 * dEsatL_dVd;
-    }
-    if (pParam.pclm > MIN_EXP) && (diffVds > 1.0e-10) {
-        T0 = 1.0 + Rds * Idl;
-        dT0_dVg = dRds_dVg * Idl + Rds * dIdl_dVg;
-        dT0_dVd = Rds * dIdl_dVd;
-        dT0_dVb = dRds_dVb * Idl + Rds * dIdl_dVb;
-        T2 = Vdsat / Esat;
-        T1 = Leff + T2;
-        dT1_dVg = (dVdsat_dVg - T2 * dEsatL_dVg / Leff) / Esat;
-        dT1_dVd = (dVdsat_dVd - T2 * dEsatL_dVd / Leff) / Esat;
-        dT1_dVb = (dVdsat_dVb - T2 * dEsatL_dVb / Leff) / Esat;
-        Cclm = FP * PvagTerm * T0 * T1 / (pParam.pclm * pParam.litl);
-        dCclm_dVg = Cclm * (dFP_dVg / FP + dPvagTerm_dVg / PvagTerm + dT0_dVg / T0 + dT1_dVg / T1);
-        dCclm_dVb = Cclm * (dPvagTerm_dVb / PvagTerm + dT0_dVb / T0 + dT1_dVb / T1);
-        dCclm_dVd = Cclm * (dPvagTerm_dVd / PvagTerm + dT0_dVd / T0 + dT1_dVd / T1);
-        VACLM = Cclm * diffVds;
-        dVACLM_dVg = dCclm_dVg * diffVds - dVdseff_dVg * Cclm;
-        dVACLM_dVb = dCclm_dVb * diffVds - dVdseff_dVb * Cclm;
-        dVACLM_dVd = dCclm_dVd * diffVds + (1.0 - dVdseff_dVd) * Cclm;
-    } else {
-        Cclm = MAX_EXP;
-        VACLM = Cclm;
-        dVACLM_dVb = 0.0;
-        dVACLM_dVg = dVACLM_dVb;
-        dVACLM_dVd = dVACLM_dVg;
-        dCclm_dVb = 0.0;
-        dCclm_dVg = dCclm_dVb;
-        dCclm_dVd = dCclm_dVg;
-    }
-    if pParam.thetaRout > MIN_EXP {
-        T8 = Abulk * Vdsat;
-        T0 = Vgst2Vtm * T8;
-        dT0_dVg = Vgst2Vtm * Abulk * dVdsat_dVg + T8 + Vgst2Vtm * Vdsat * dAbulk_dVg;
-        dT0_dVb = Vgst2Vtm * (dAbulk_dVb * Vdsat + Abulk * dVdsat_dVb);
-        dT0_dVd = Vgst2Vtm * Abulk * dVdsat_dVd;
-        T1 = Vgst2Vtm + T8;
-        dT1_dVg = 1.0 + Abulk * dVdsat_dVg + Vdsat * dAbulk_dVg;
-        dT1_dVb = Abulk * dVdsat_dVb + dAbulk_dVb * Vdsat;
-        dT1_dVd = Abulk * dVdsat_dVd;
-        T9 = T1 * T1;
-        T2 = pParam.thetaRout;
-        VADIBL = (Vgst2Vtm - T0 / T1) / T2;
-        dVADIBL_dVg = (1.0 - dT0_dVg / T1 + T0 * dT1_dVg / T9) / T2;
-        dVADIBL_dVb = (-dT0_dVb / T1 + T0 * dT1_dVb / T9) / T2;
-        dVADIBL_dVd = (-dT0_dVd / T1 + T0 * dT1_dVd / T9) / T2;
-        T7 = pParam.pdiblb * Vbseff;
-        if T7 >= -0.9 {
-            T3 = 1.0 / (1.0 + T7);
-            VADIBL *= T3;
-            dVADIBL_dVg *= T3;
-            dVADIBL_dVb = (dVADIBL_dVb - VADIBL * pParam.pdiblb) * T3;
-            dVADIBL_dVd *= T3;
+        c(MAX_EXP)
+    };
+    let (vascbe, _) = substrate_early_voltage(
+        &excess,
+        leff,
+        p.pscbe1 * p.litl,
+        p.pscbe2,
+        p.pscbe2 > 0. && p.pscbe1 >= 0.,
+    )?;
+    let idsa = idl
+        .multiply(&excess.clone().divide(&vadibl)?.offset(1.))
+        .multiply(&excess.clone().divide(&vadits)?.offset(1.));
+    let clm = vaclm.divide(&vasat)?.ln_1p()?.divide(&cclm)?.offset(1.);
+    let idsa = idsa.multiply(&clm);
+    let alpha = p.alpha1.mul_add(leff, p.alpha0);
+    let (impact, _) = impact_ionization(&excess, alpha / leff, p.beta0)?;
+    let substrate = impact.multiply(&idsa.clone().multiply(&effective));
+    [here.gbgs, here.gbds, here.gbbs] = terminal_partials(substrate.partials, electro);
+    let ids = idsa.multiply(&excess.divide(&vascbe)?.offset(1.));
+    let current = ids.clone().multiply(&effective);
+    let mut current = Local::new(current.value, terminal_partials(current.partials, electro));
+    if model.vtlGiven && model.vtl > 0. {
+        // Use the reference stamp's velocity derivative convention while
+        // differentiating the actual velocity law in the physical germ.
+        let inverse = c(1. / leff).divide(&oxide_width)?.divide(&gate)?;
+        let velocity = current.value.clone().multiply(&inverse.value);
+        let [gm, gd, gb] = current.partials;
+        let t11 = inverse.primal();
+        let t10 = -t11 / gate.primal() * current.primal();
+        let velocity = Local::new(
+            velocity,
+            [
+                t10.mul_add(electro.dVgsteff_dVg, gm * t11),
+                t10.mul_add(electro.dVgsteff_dVd, gd * t11),
+                t10.mul_add(electro.dVgsteff_dVb, gb * t11),
+            ],
+        );
+        let ratio = velocity.scale(1. / (p.vtl * p.tfactor));
+        let factor = if ratio.compare(0.) == Some(Ordering::Greater) {
+            let exponent = f64::from(2 * MM);
+            ratio
+                .ln()?
+                .scale(exponent)
+                .exp()
+                .offset(1.)
+                .ln()?
+                .scale(-1. / exponent)
+                .exp()
         } else {
-            T4 = 1.0 / (0.8 + T7);
-            T3 = (17.0 + 20.0 * T7) * T4;
-            dVADIBL_dVg *= T3;
-            dVADIBL_dVb = dVADIBL_dVb * T3 - VADIBL * pParam.pdiblb * T4 * T4;
-            dVADIBL_dVd *= T3;
-            VADIBL *= T3;
-        }
-        dVADIBL_dVg = dVADIBL_dVg * PvagTerm + VADIBL * dPvagTerm_dVg;
-        dVADIBL_dVb = dVADIBL_dVb * PvagTerm + VADIBL * dPvagTerm_dVb;
-        dVADIBL_dVd = dVADIBL_dVd * PvagTerm + VADIBL * dPvagTerm_dVd;
-        VADIBL *= PvagTerm;
-    } else {
-        VADIBL = MAX_EXP;
-        dVADIBL_dVb = 0.0;
-        dVADIBL_dVg = dVADIBL_dVb;
-        dVADIBL_dVd = dVADIBL_dVg;
+            c(1.)
+        };
+        current = current.multiply(&factor);
     }
-    Va = Vasat + VACLM;
-    dVa_dVg = dVasat_dVg + dVACLM_dVg;
-    dVa_dVb = dVasat_dVb + dVACLM_dVb;
-    dVa_dVd = dVasat_dVd + dVACLM_dVd;
-    T0 = pParam.pditsd * Vds;
-    if T0 > EXP_THRESHOLD {
-        T1 = MAX_EXP;
-        dT1_dVd = 0.0;
-    } else {
-        T1 = exp(T0);
-        dT1_dVd = T1 * pParam.pditsd;
-    }
-    if pParam.pdits > MIN_EXP {
-        T2 = 1.0 + model.pditsl * Leff;
-        VADITS = (1.0 + T2 * T1) / pParam.pdits;
-        dVADITS_dVg = VADITS * dFP_dVg;
-        dVADITS_dVd = FP * T2 * dT1_dVd / pParam.pdits;
-        VADITS *= FP;
-    } else {
-        VADITS = MAX_EXP;
-        dVADITS_dVd = 0.0;
-        dVADITS_dVg = dVADITS_dVd;
-    }
-    if (pParam.pscbe2 > 0.0) && (pParam.pscbe1 >= 0.0) {
-        if diffVds > pParam.pscbe1 * pParam.litl / EXP_THRESHOLD {
-            T0 = pParam.pscbe1 * pParam.litl / diffVds;
-            VASCBE = Leff * exp(T0) / pParam.pscbe2;
-            T1 = T0 * VASCBE / diffVds;
-            dVASCBE_dVg = T1 * dVdseff_dVg;
-            dVASCBE_dVd = -T1 * (1.0 - dVdseff_dVd);
-            dVASCBE_dVb = T1 * dVdseff_dVb;
-        } else {
-            VASCBE = MAX_EXP * Leff / pParam.pscbe2;
-            dVASCBE_dVb = 0.0;
-            dVASCBE_dVd = dVASCBE_dVb;
-            dVASCBE_dVg = dVASCBE_dVd;
-        }
-    } else {
-        VASCBE = MAX_EXP;
-        dVASCBE_dVb = 0.0;
-        dVASCBE_dVd = dVASCBE_dVb;
-        dVASCBE_dVg = dVASCBE_dVd;
-    }
-    T9 = diffVds / VADIBL;
-    T0 = 1.0 + T9;
-    Idsa = Idl * T0;
-    dIdsa_dVg = T0 * dIdl_dVg - Idl * (dVdseff_dVg + T9 * dVADIBL_dVg) / VADIBL;
-    dIdsa_dVd = T0 * dIdl_dVd + Idl * (1.0 - dVdseff_dVd - T9 * dVADIBL_dVd) / VADIBL;
-    dIdsa_dVb = T0 * dIdl_dVb - Idl * (dVdseff_dVb + T9 * dVADIBL_dVb) / VADIBL;
-    T9 = diffVds / VADITS;
-    T0 = 1.0 + T9;
-    dIdsa_dVg = T0 * dIdsa_dVg - Idsa * (dVdseff_dVg + T9 * dVADITS_dVg) / VADITS;
-    dIdsa_dVd = T0 * dIdsa_dVd + Idsa * (1.0 - dVdseff_dVd - T9 * dVADITS_dVd) / VADITS;
-    dIdsa_dVb = T0 * dIdsa_dVb - Idsa * dVdseff_dVb / VADITS;
-    Idsa *= T0;
-    T0 = log(Va / Vasat);
-    dT0_dVg = dVa_dVg / Va - dVasat_dVg / Vasat;
-    dT0_dVb = dVa_dVb / Va - dVasat_dVb / Vasat;
-    dT0_dVd = dVa_dVd / Va - dVasat_dVd / Vasat;
-    T1 = T0 / Cclm;
-    T9 = 1.0 + T1;
-    dT9_dVg = (dT0_dVg - T1 * dCclm_dVg) / Cclm;
-    dT9_dVb = (dT0_dVb - T1 * dCclm_dVb) / Cclm;
-    dT9_dVd = (dT0_dVd - T1 * dCclm_dVd) / Cclm;
-    dIdsa_dVg = dIdsa_dVg * T9 + Idsa * dT9_dVg;
-    dIdsa_dVb = dIdsa_dVb * T9 + Idsa * dT9_dVb;
-    dIdsa_dVd = dIdsa_dVd * T9 + Idsa * dT9_dVd;
-    Idsa *= T9;
-    tmp = pParam.alpha0 + pParam.alpha1 * Leff;
-    if (tmp <= 0.0) || (pParam.beta0 <= 0.0) {
-        Gbg = 0.0;
-        Gbb = Gbg;
-        Gbd = Gbb;
-        Isub = Gbd;
-    } else {
-        T2 = tmp / Leff;
-        if diffVds > pParam.beta0 / EXP_THRESHOLD {
-            T0 = -pParam.beta0 / diffVds;
-            T1 = T2 * diffVds * exp(T0);
-            T3 = T1 / diffVds * (T0 - 1.0);
-            dT1_dVg = T3 * dVdseff_dVg;
-            dT1_dVd = T3 * (dVdseff_dVd - 1.0);
-            dT1_dVb = T3 * dVdseff_dVb;
-        } else {
-            T3 = T2 * MIN_EXP;
-            T1 = T3 * diffVds;
-            dT1_dVg = -T3 * dVdseff_dVg;
-            dT1_dVd = T3 * (1.0 - dVdseff_dVd);
-            dT1_dVb = -T3 * dVdseff_dVb;
-        }
-        T4 = Idsa * Vdseff;
-        Isub = T1 * T4;
-        Gbg = T1 * (dIdsa_dVg * Vdseff + Idsa * dVdseff_dVg) + T4 * dT1_dVg;
-        Gbd = T1 * (dIdsa_dVd * Vdseff + Idsa * dVdseff_dVd) + T4 * dT1_dVd;
-        Gbb = T1 * (dIdsa_dVb * Vdseff + Idsa * dVdseff_dVb) + T4 * dT1_dVb;
-        Gbd += Gbg * dVgsteff_dVd;
-        Gbb += Gbg * dVgsteff_dVb;
-        Gbg *= dVgsteff_dVg;
-        Gbb *= dVbseff_dVb;
-    }
-    here.csub = Isub;
-    here.gbbs = Gbb;
-    here.gbgs = Gbg;
-    here.gbds = Gbd;
-    T9 = diffVds / VASCBE;
-    T0 = 1.0 + T9;
-    Ids = Idsa * T0;
-    Gm = T0 * dIdsa_dVg - Idsa * (dVdseff_dVg + T9 * dVASCBE_dVg) / VASCBE;
-    Gds = T0 * dIdsa_dVd + Idsa * (1.0 - dVdseff_dVd - T9 * dVASCBE_dVd) / VASCBE;
-    Gmb = T0 * dIdsa_dVb - Idsa * (dVdseff_dVb + T9 * dVASCBE_dVb) / VASCBE;
-    tmp1 = Gds + Gm * dVgsteff_dVd;
-    tmp2 = Gmb + Gm * dVgsteff_dVb;
-    tmp3 = Gm;
-    Gm = (Ids * dVdseff_dVg + Vdseff * tmp3) * dVgsteff_dVg;
-    Gds = Ids * (dVdseff_dVd + dVdseff_dVg * dVgsteff_dVd) + Vdseff * tmp1;
-    Gmb = (Ids * (dVdseff_dVb + dVdseff_dVg * dVgsteff_dVb) + Vdseff * tmp2) * dVbseff_dVb;
-    cdrain = Ids * Vdseff;
-    if (model.vtlGiven) && (model.vtl > 0.0) {
-        T12 = 1.0 / Leff / CoxeffWovL;
-        T11 = T12 / Vgsteff;
-        T10 = -T11 / Vgsteff;
-        vs = cdrain * T11;
-        dvs_dVg = Gm * T11 + cdrain * T10 * dVgsteff_dVg;
-        dvs_dVd = Gds * T11 + cdrain * T10 * dVgsteff_dVd;
-        dvs_dVb = Gmb * T11 + cdrain * T10 * dVgsteff_dVb;
-        T0 = f64::from(2 * MM);
-        T1 = vs / (pParam.vtl * pParam.tfactor);
-        if T1 > 0.0 {
-            T2 = 1.0 + exp(T0 * log(T1));
-            T3 = (T2 - 1.0) * T0 / vs;
-            Fsevl = 1.0 / exp(log(T2) / T0);
-            dT2_dVg = T3 * dvs_dVg;
-            dT2_dVd = T3 * dvs_dVd;
-            dT2_dVb = T3 * dvs_dVb;
-            T4 = -1.0 / T0 * Fsevl / T2;
-            dFsevl_dVg = T4 * dT2_dVg;
-            dFsevl_dVd = T4 * dT2_dVd;
-            dFsevl_dVb = T4 * dT2_dVb;
-        } else {
-            Fsevl = 1.0;
-            dFsevl_dVg = 0.0;
-            dFsevl_dVd = 0.0;
-            dFsevl_dVb = 0.0;
-        }
-        Gm *= Fsevl;
-        Gm += cdrain * dFsevl_dVg;
-        Gmb *= Fsevl;
-        Gmb += cdrain * dFsevl_dVb;
-        Gds *= Fsevl;
-        Gds += cdrain * dFsevl_dVd;
-        cdrain *= Fsevl;
-    }
-    here.gds = Gds;
-    here.gm = Gm;
-    here.gmbs = Gmb;
-    here.IdovVds = Ids;
-    if here.IdovVds <= model.idovvdsc {
-        here.IdovVds = model.idovvdsc;
-    }
-    if (here.rgateMod > 1) || (here.trnqsMod != 0) || (here.acnqsMod != 0) {
-        T9 = pParam.xrcrg2 * model.vtm;
-        T0 = T9 * beta;
-        dT0_dVd = (dbeta_dVd + dbeta_dVg * dVgsteff_dVd) * T9;
-        dT0_dVb = (dbeta_dVb + dbeta_dVg * dVgsteff_dVb) * T9;
-        dT0_dVg = dbeta_dVg * T9;
-        here.gcrg = pParam.xrcrg1 * (T0 + Ids);
-        here.gcrgd = pParam.xrcrg1 * (dT0_dVd + tmp1);
-        here.gcrgb = pParam.xrcrg1 * (dT0_dVb + tmp2) * dVbseff_dVb;
-        here.gcrgg = pParam.xrcrg1 * (dT0_dVg + tmp3) * dVgsteff_dVg;
-        if here.nf != 1.0 {
-            here.gcrg *= here.nf;
-            here.gcrgg *= here.nf;
-            here.gcrgd *= here.nf;
-            here.gcrgb *= here.nf;
-        }
+    [here.gm, here.gds, here.gmbs] = current.partials;
+    here.IdovVds = ids.primal().max(model.idovvdsc);
+    let gate_conductance = if here.rgateMod > 1 || here.trnqsMod != 0 || here.acnqsMod != 0 {
+        let mut law = beta
+            .clone()
+            .scale(p.xrcrg2 * model.vtm)
+            .add(&ids)
+            .scale(p.xrcrg1 * here.nf);
         if here.rgateMod == 2 {
-            T10 = here.grgeltd * here.grgeltd;
-            T11 = here.grgeltd + here.gcrg;
-            here.gcrg = here.grgeltd * here.gcrg / T11;
-            T12 = T10 / T11 / T11;
-            here.gcrgg *= T12;
-            here.gcrgd *= T12;
-            here.gcrgb *= T12;
+            law = law
+                .clone()
+                .scale(here.grgeltd)
+                .divide(&law.offset(here.grgeltd))?;
         }
+        [here.gcrgg, here.gcrgd, here.gcrgb] = terminal_partials(law.partials, electro);
         here.gcrgs = -(here.gcrgg + here.gcrgd + here.gcrgb);
-    }
-    if model.rdsMod != 0 {
-        T0 = vgs - pParam.vfbsd;
-        (vgs_eff, dvgs_eff_dvg) = smooth_positive(T0, 2.5e-5);
-        T0 = 1.0 + pParam.prwg * vgs_eff;
-        dT0_dvg = -pParam.prwg / T0 / T0 * dvgs_eff_dvg;
-        T1 = -pParam.prwb * vbs;
-        dT1_dvb = -pParam.prwb;
-        T2 = 1.0 / T0 + T1;
-        let (positive, slope) = smooth_positive(T2, 0.0025);
-        T3 = 2.0 * positive;
-        dT3_dvg = 2.0 * slope;
-        dT3_dvb = dT3_dvg * dT1_dvb;
-        dT3_dvg *= dT0_dvg;
-        T4 = pParam.rs0 * 0.5;
-        Rs = pParam.rswmin + T3 * T4;
-        dRs_dvg = T4 * dT3_dvg;
-        dRs_dvb = T4 * dT3_dvb;
-        T0 = 1.0 + here.sourceConductance * Rs;
-        here.gstot = here.sourceConductance / T0;
-        T0 = -here.gstot * here.gstot;
-        dgstot_dvd = 0.0;
-        dgstot_dvg = T0 * dRs_dvg;
-        dgstot_dvb = T0 * dRs_dvb;
-        dgstot_dvs = -(dgstot_dvg + dgstot_dvb + dgstot_dvd);
-        T0 = vgd - pParam.vfbsd;
-        (vgd_eff, dvgd_eff_dvg) = smooth_positive(T0, 2.5e-5);
-        T0 = 1.0 + pParam.prwg * vgd_eff;
-        dT0_dvg = -pParam.prwg / T0 / T0 * dvgd_eff_dvg;
-        T1 = -pParam.prwb * vbd;
-        dT1_dvb = -pParam.prwb;
-        T2 = 1.0 / T0 + T1;
-        let (positive, slope) = smooth_positive(T2, 0.0025);
-        T3 = 2.0 * positive;
-        dT3_dvg = 2.0 * slope;
-        dT3_dvb = dT3_dvg * dT1_dvb;
-        dT3_dvg *= dT0_dvg;
-        T4 = pParam.rd0 * 0.5;
-        Rd = pParam.rdwmin + T3 * T4;
-        dRd_dvg = T4 * dT3_dvg;
-        dRd_dvb = T4 * dT3_dvb;
-        T0 = 1.0 + here.drainConductance * Rd;
-        here.gdtot = here.drainConductance / T0;
-        T0 = -here.gdtot * here.gdtot;
-        dgdtot_dvs = 0.0;
-        dgdtot_dvg = T0 * dRd_dvg;
-        dgdtot_dvb = T0 * dRd_dvb;
-        dgdtot_dvd = -(dgdtot_dvg + dgdtot_dvb + dgdtot_dvs);
-        here.gstotd = vses * dgstot_dvd;
-        here.gstotg = vses * dgstot_dvg;
-        here.gstots = vses * dgstot_dvs;
-        here.gstotb = vses * dgstot_dvb;
-        T2 = vdes - vds;
-        here.gdtotd = T2 * dgdtot_dvd;
-        here.gdtotg = T2 * dgdtot_dvg;
-        here.gdtots = T2 * dgdtot_dvs;
-        here.gdtotb = T2 * dgdtot_dvb;
+        law.value
     } else {
-        here.gstotg = 0.0;
-        here.gstotd = here.gstotg;
-        here.gstot = here.gstotd;
-        here.gstotb = 0.0;
-        here.gstots = here.gstotb;
-        here.gdtotg = 0.0;
-        here.gdtotd = here.gdtotg;
-        here.gdtot = here.gdtotd;
-        here.gdtotb = 0.0;
-        here.gdtots = here.gdtotb;
-    }
-    Transport {
-        Abulk0_Q,
-        Coxeff,
-        Rds,
-        Vdseff,
-        beta,
-        unscaled_drain_current: cdrain,
-        dAbulk0_Q_dVb,
-        dVdseff_dVb,
-        dVdseff_dVd,
-        dVdseff_dVg,
-        gche,
-    }
+        electro.Vgsteff.constant(here.gcrg)
+    };
+    let (source_conductance, drain_conductance) = if model.rdsMod != 0 {
+        let source = external_conductance(
+            p,
+            vgs.clone(),
+            vbs.clone(),
+            p.rswmin,
+            p.rs0,
+            here.sourceConductance,
+        )?;
+        let drain = external_conductance(
+            p,
+            vgs.add(&vds.clone().scale(-1.)),
+            vbs.add(&vds.clone().scale(-1.)),
+            p.rdwmin,
+            p.rd0,
+            here.drainConductance,
+        )?;
+        here.gstotd = 0.;
+        here.gstotg = vses.primal() * source.partials[0];
+        here.gstotb = vses.primal() * source.partials[1];
+        here.gstots = -(here.gstotg + here.gstotb);
+        let drop = vdes.primal() - vds.primal();
+        here.gdtots = 0.;
+        here.gdtotg = drop * drain.partials[0];
+        here.gdtotb = drop * drain.partials[1];
+        here.gdtotd = -(here.gdtotg + here.gdtotb);
+        (source.value, drain.value)
+    } else {
+        here.gstotd = 0.;
+        here.gstotg = 0.;
+        here.gstotb = 0.;
+        here.gstots = 0.;
+        here.gdtotd = 0.;
+        here.gdtotg = 0.;
+        here.gdtotb = 0.;
+        here.gdtots = 0.;
+        (electro.Vgsteff.constant(0.), electro.Vgsteff.constant(0.))
+    };
+    let result = Transport {
+        dAbulk0_Q_dVb: bulk_cv.partials[2],
+        dVdseff_dVg: effective.partials[0],
+        dVdseff_dVd: effective.partials[1],
+        dVdseff_dVb: effective.partials[2],
+        Abulk0_Q: bulk_cv.value,
+        Coxeff: oxide.value,
+        Rds: rds.value,
+        Vdseff: effective.value,
+        beta: beta.value,
+        unscaled_drain_current: current.value,
+        gche: gche.value,
+        substrate_current: substrate.value,
+        gate_conductance,
+        source_conductance,
+        drain_conductance,
+    };
+    here.csub = result.substrate_current.primal();
+    here.gcrg = result.gate_conductance.primal();
+    here.gstot = result.source_conductance.primal();
+    here.gdtot = result.drain_conductance.primal();
+    Ok(result)
 }
