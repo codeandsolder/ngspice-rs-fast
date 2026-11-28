@@ -67,6 +67,11 @@
 //! * `bypass=0`: C's default (`cktntask.c`); this port never bypasses device
 //!   evaluation. Any other `bypass` is `NotYetPorted`.
 //!
+//! Source-projected `ltspice_output_*` raw-file compression and precision
+//! settings are finite scalar presentation controls. They are also recorded
+//! as no-ops; the solver does not serialize LTspice's proprietary raw format.
+//! Native ngspice output options retain their own policy.
+//!
 //! Every other name from `cktsopt.c` (`oldlimit`, ...)
 //! and the front-end variables with an effect (`filetype`, `numdgt`,
 //! `savecurrents`, ...) is [`SpiceError::NotYetPorted`]; names
@@ -784,6 +789,14 @@ impl RunConfig {
         let setting = input.setting;
         let name = setting.name.as_str();
         let location = &setting.location;
+        if model_normalize_ngspice::ltspice::output_options::is_projected(name) {
+            input.number("a finite number")?;
+            self.ignore(
+                setting,
+                "LTspice raw-file presentation control; no electrical effect",
+            );
+            return Ok(true);
+        }
         if PRINT_FLAGS.contains(&name) {
             if setting.value.is_some() {
                 return Err(SpiceError::parse(

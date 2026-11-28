@@ -432,3 +432,53 @@ fn fn_source_geometry_overrides_signed_values_and_invalid_domains() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn raw_output_options_preserve_scoped_validation_and_electrical_options() -> Result<()> {
+    let source = "Raw-file controls\n.param pw=0 nd=15\nV1 x 0 1\nR1 x 0 1k\n.options reltol=1m,PlotWinSize pw\n+ numdgt={nd} plotreltol=1m plotvntol=-1 plotabstol=1n\n.options plotwinsize={2**3}\n.options reltol=1e-4\n.op\n.end\n";
+    let (_, config, _) = projected(source)?;
+    let names = config
+        .ignored()
+        .iter()
+        .map(|option| option.name.as_str())
+        .collect::<Vec<_>>();
+    ensure!(
+        names
+            == [
+                "ltspice_output_plotwinsize",
+                "ltspice_output_numdgt",
+                "ltspice_output_plotreltol",
+                "ltspice_output_plotvntol",
+                "ltspice_output_plotabstol",
+                "ltspice_output_plotwinsize",
+            ]
+    );
+    ensure!(
+        config
+            .ignored()
+            .iter()
+            .all(|option| option.reason.contains("no electrical effect"))
+    );
+    close(
+        "electrical tolerance",
+        config.context().reltol,
+        1e-4,
+        0.,
+        0.,
+    )?;
+    for option in [
+        "plotwinsize={missing}",
+        "numdgt=garbage",
+        "plotwinsize",
+        "numdgt={1/0}",
+        "unknown=1",
+    ] {
+        let invalid =
+            format!("Invalid output control\nV1 x 0 1\nR1 x 0 1k\n.options {option}\n.op\n.end\n");
+        ensure!(
+            projected(&invalid).is_err(),
+            "{option} unexpectedly accepted"
+        );
+    }
+    Ok(())
+}
