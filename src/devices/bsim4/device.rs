@@ -1235,33 +1235,8 @@ impl Device for Bsim4 {
         host.finish()
     }
 
-    /// `BSIM4convTest` on the live instance the last load left, reading
-    /// `CKTrhsOld` (the iterate that load used) as C does. `NIiter` runs it
-    /// in `MODEINITFIX` too, where an `off` instance is not tested.
-    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
-        let shared = self.borrow_shared()?;
-        let Some((prepared, h)) = shared.live.as_ref() else {
-            return Ok(true);
-        };
-        let rhs_old = |local: i32| {
-            self.node_id(local)
-                .and_then(|id| context.unknowns.node_row(id))
-                .and_then(|row| context.previous.get(row))
-                .unwrap_or(0.)
-        };
-        let state0 = |slot: usize| context.states.get(slot).copied().unwrap_or(0.);
-        Ok(cvtest::conv_test(
-            &prepared.model,
-            h,
-            &rhs_old,
-            &state0,
-            match context.phase {
-                IterationPhase::Fix => mode::MODEINITFIX,
-                _ => mode::MODEINITFLOAT,
-            },
-            context.reltol,
-            context.abstol,
-        ))
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        Some(self)
     }
 
     /// Every real instance setter of `b4.c`'s table (`DCTfindInstParam`
@@ -1481,6 +1456,37 @@ impl Device for Bsim4 {
             model: Some(&self.model_name),
             total: true,
         })
+    }
+}
+
+impl crate::devices::DeviceConvergence for Bsim4 {
+    /// `BSIM4convTest` on the live instance the last load left, reading
+    /// `CKTrhsOld` (the iterate that load used) as C does. `NIiter` runs it
+    /// in `MODEINITFIX` too, where an `off` instance is not tested.
+    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        let shared = self.borrow_shared()?;
+        let Some((prepared, h)) = shared.live.as_ref() else {
+            return Ok(true);
+        };
+        let rhs_old = |local: i32| {
+            self.node_id(local)
+                .and_then(|id| context.unknowns.node_row(id))
+                .and_then(|row| context.previous.get(row))
+                .unwrap_or(0.)
+        };
+        let state0 = |slot: usize| context.states.get(slot).copied().unwrap_or(0.);
+        Ok(cvtest::conv_test(
+            &prepared.model,
+            h,
+            &rhs_old,
+            &state0,
+            match context.phase {
+                IterationPhase::Fix => mode::MODEINITFIX,
+                _ => mode::MODEINITFLOAT,
+            },
+            context.reltol,
+            context.abstol,
+        ))
     }
 }
 

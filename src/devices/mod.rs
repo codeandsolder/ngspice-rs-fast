@@ -141,7 +141,8 @@ pub use sweep::{
 pub use switch::{Switch, SwitchKind, SwitchState};
 pub use traits::{
     AcceptContext, AnalysisMode, BranchQuantity, ControlReference, ConvergenceContext,
-    ConvergenceKind, Device, InductanceValue, InitialCoordinate, InitialCoordinateHistory,
+    ConvergenceKind, Device, DeviceAcceptNotification, DeviceAcceptValidation, DeviceConvergence,
+    DeviceTimestepControl, InductanceValue, InitialCoordinate, InitialCoordinateHistory,
     InitialExpressionStorage, InitialStoragePolicy, InitialStorageRow, InitialVoltageLaw,
     InitialVoltageRelation, InitialVoltageStorage, MnaUnknowns, MutualCoupling, MutualTerm,
     StampContext, StorageElement, StorageKind, TruncationContext,

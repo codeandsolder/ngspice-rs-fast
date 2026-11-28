@@ -35,7 +35,8 @@ use crate::devices::models::ModelContext;
 use crate::devices::mutual::validation::ValidationBudget;
 use crate::devices::mutual::{CouplingSite, MutualLimits, pair_count};
 use crate::devices::state::{
-    DeviceState, HistoryPublication, StateHistory, StateSnapshot, TrialState,
+    DelayHistories, DelayLayout, DeviceState, HistoryPublication, StateHistory, StateSnapshot,
+    TrialState,
 };
 use crate::devices::sweep::{
     GeometryScale, InstanceOverride, InstanceTarget, ParameterKey, ResistorMetadata,
@@ -78,16 +79,22 @@ pub(crate) mod preparation_metrics {
         pub(crate) replacement_validations: usize,
         pub(crate) physical_validations: usize,
         pub(crate) small_signal_assemblies: usize,
+        pub(crate) truncation_visits: usize,
+        pub(crate) delay_limit_visits: usize,
+        pub(crate) delay_update_visits: usize,
+        pub(crate) accept_notification_visits: usize,
+        pub(crate) accept_validation_visits: usize,
+        pub(crate) convergence_visits: usize,
     }
 
     thread_local! {
         static COUNTS: std::cell::Cell<Counts> = const { std::cell::Cell::new(Counts {
             name_lookups: 0, bindings: 0, contexts: 0, setters: 0,
-            replacement_validations: 0, physical_validations: 0, small_signal_assemblies: 0,
+            replacement_validations: 0, physical_validations: 0, small_signal_assemblies: 0, truncation_visits: 0, delay_limit_visits: 0, delay_update_visits: 0, accept_notification_visits: 0, accept_validation_visits: 0, convergence_visits: 0,
         }) };
     }
 
-    pub(super) fn record(update: impl FnOnce(&mut Counts)) {
+    pub(crate) fn record(update: impl FnOnce(&mut Counts)) {
         COUNTS.with(|cell| {
             let mut counts = cell.get();
             update(&mut counts);
@@ -180,6 +187,7 @@ struct TopologyBindings {
     unknowns: MnaUnknowns,
     names: DeviceNames,
     order: Vec<usize>,
+    lifecycle: LifecycleBindings,
     branch_rows: Vec<std::ops::Range<usize>>,
     convergence_kinds: Vec<crate::devices::ConvergenceKind>,
     private_storage_rows: Vec<(usize, usize)>,
@@ -195,6 +203,92 @@ struct TopologyBindings {
     native_mixed: Option<crate::analysis::digital::NativeTopology>,
     mutual: MutualBinding,
     identity: Option<TopologyId>,
+}
+
+pub(crate) struct TruncationSlot {
+    pub(crate) base: usize,
+    pub(crate) explicit_derivative: bool,
+    pub(crate) derived: bool,
+}
+
+pub(crate) struct TruncationBinding {
+    pub(crate) index: usize,
+    pub(crate) rows: std::ops::Range<usize>,
+    pub(crate) slots: Vec<TruncationSlot>,
+    pub(crate) timestep: bool,
+}
+
+/// Sparse immutable device ordinals for the active lifecycle hooks. Load
+/// order and insertion order differ and are intentionally retained separately.
+#[derive(Default)]
+struct LifecycleBindings {
+    convergence: Vec<usize>,
+    accept_validators: Vec<usize>,
+    accept_notifiers: Vec<usize>,
+    delays: Vec<usize>,
+    delay_load_order: Vec<usize>,
+    delay_layout: DelayLayout,
+    truncation: Vec<TruncationBinding>,
+}
+
+impl LifecycleBindings {
+    fn new(
+        devices: &[ElaboratedDevice],
+        order: &[usize],
+        state_rows: &[std::ops::Range<usize>],
+    ) -> Self {
+        let mut result = Self::default();
+        for (index, device) in devices.iter().enumerate() {
+            if device.accept_validator().is_some() {
+                result.accept_validators.push(index);
+            }
+            if device.accept_notifier().is_some() {
+                result.accept_notifiers.push(index);
+            }
+            if device.delay_line().is_some() {
+                result.delays.push(index);
+            }
+        }
+        result.truncation = devices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, device)| {
+                let rows = state_rows[index].clone();
+                let storage = device.initial_expression_storage();
+                let slots: Vec<_> = device
+                    .truncation_slots()
+                    .into_iter()
+                    .map(|slot| TruncationSlot {
+                        base: rows.start + slot,
+                        explicit_derivative: storage
+                            .as_ref()
+                            .is_some_and(|storage| storage.slot == slot),
+                        derived: storage.as_ref().is_some_and(|storage| {
+                            storage.slot == slot
+                                && storage.policy == crate::devices::InitialStoragePolicy::Derived
+                        }),
+                    })
+                    .collect();
+                let timestep = !rows.is_empty() && device.timestep_control().is_some();
+                (!slots.is_empty() || timestep).then_some(TruncationBinding {
+                    index,
+                    rows,
+                    slots,
+                    timestep,
+                })
+            })
+            .collect();
+        result.delay_layout = DelayLayout::new(devices.len(), &result.delays);
+        for &index in order {
+            if devices[index].convergence_hook().is_some() {
+                result.convergence.push(index);
+            }
+            if devices[index].delay_line().is_some() {
+                result.delay_load_order.push(index);
+            }
+        }
+        result
+    }
 }
 
 /// Independently validated numeric candidate sites, in netlist setter order.
@@ -440,6 +534,7 @@ pub(super) struct PreparedPoint {
     context: ModelContext,
     context_valid: bool,
     replacements: Vec<(usize, Box<dyn Device>)>,
+    convergence: Option<Vec<usize>>,
     mutual: std::cell::OnceCell<PreparedMutualTerms>,
     prepared_batches: std::cell::RefCell<crate::devices::prepared_model::batch::Plan>,
 }
@@ -544,10 +639,27 @@ impl<'a> PreparedRun<'a> {
                 )?
             }
         };
+        let convergence = replacements
+            .iter()
+            .any(|(index, device)| {
+                device.convergence_hook().is_some()
+                    != self.circuit.devices[*index].convergence_hook().is_some()
+            })
+            .then(|| {
+                self.circuit
+                    .load_order()
+                    .filter(|&index| {
+                        effective_device(self.circuit, &replacements, index)
+                            .convergence_hook()
+                            .is_some()
+                    })
+                    .collect()
+            });
         *current = Some(PreparedPoint {
             context: *context,
             context_valid: true,
             replacements,
+            convergence,
             mutual,
             prepared_batches: std::cell::RefCell::new(prepared_batches),
         });
@@ -2407,6 +2519,11 @@ impl Circuit {
         }
         self.check_port_numbering()?;
         self.allocate_matrix(order)?;
+        self.bindings.lifecycle = LifecycleBindings::new(
+            &self.devices,
+            &self.bindings.order,
+            &self.bindings.state_rows,
+        );
         self.bindings.stochastic_sources = self
             .devices
             .iter()
@@ -2728,7 +2845,13 @@ impl Circuit {
             ));
         }
         let point = run.point(request.model_context)?;
-        for index in self.load_order() {
+        let order = point
+            .convergence
+            .as_deref()
+            .unwrap_or(&self.bindings.lifecycle.convergence);
+        for &index in order {
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.convergence_visits += 1);
             let context = crate::devices::traits::ConvergenceContext {
                 unknowns: &self.bindings.unknowns,
                 solution: request.solution,
@@ -2746,7 +2869,15 @@ impl Circuit {
                 abstol: request.abstol,
                 vntol: request.vntol,
             };
-            if point.device(self, index).convergence_test(&context)? {
+            let hook = point
+                .device(self, index)
+                .convergence_hook()
+                .ok_or_else(|| {
+                    SpiceError::circuit(
+                        "finalized convergence capability changed without rebinding",
+                    )
+                })?;
+            if hook.convergence_test(&context)? {
                 return Ok(true);
             }
         }
@@ -3092,12 +3223,24 @@ impl Circuit {
                 .as_ref()
                 .filter(|snapshot| carry && self.snapshot_matches(snapshot))
                 .map(|snapshot| Arc::clone(&snapshot.values)),
-            self.devices
-                .iter()
-                .enumerate()
-                .filter_map(|(index, device)| {
-                    device.delay_line().map(|line| (index, line.new_history()))
-                }),
+            DelayHistories::new(
+                self.bindings.lifecycle.delay_layout.clone(),
+                self.bindings
+                    .lifecycle
+                    .delays
+                    .iter()
+                    .map(|&index| {
+                        self.devices[index]
+                            .delay_line()
+                            .map(super::delay::DelayLine::new_history)
+                            .ok_or_else(|| {
+                                SpiceError::circuit(
+                                    "finalized delay capability changed without rebinding",
+                                )
+                            })
+                    })
+                    .collect::<SpiceResult<Vec<_>>>()?,
+            ),
         ))
     }
 
@@ -3113,9 +3256,13 @@ impl Circuit {
     /// Whether any device has a delay history (a transmission line).
     #[must_use = "the presence of delay lines determines whether delay history must be maintained"]
     pub fn has_delay_lines(&self) -> bool {
-        self.devices
-            .iter()
-            .any(|device| device.delay_line().is_some())
+        if self.bindings.identity.is_some() {
+            !self.bindings.lifecycle.delays.is_empty()
+        } else {
+            self.devices
+                .iter()
+                .any(|device| device.delay_line().is_some())
+        }
     }
 
     /// C's `MODEINITSMSIG` load at the operating point `bias` (`acan.c`,
@@ -4356,6 +4503,10 @@ impl Circuit {
         Ok(())
     }
 
+    pub(crate) fn truncation_bindings(&self) -> &[TruncationBinding] {
+        &self.bindings.lifecycle.truncation
+    }
+
     fn run_accept_hooks(
         &self,
         solution: &Vector,
@@ -4370,18 +4521,35 @@ impl Circuit {
             branches: &self.bindings.branch_rows[index],
             states: trial.map(|trial| &trial.values()[self.bindings.state_rows[index].clone()]),
         };
-        for (index, device) in self.devices.iter().enumerate() {
-            device.validate_accept(&context(index))?;
+        for &index in &self.bindings.lifecycle.accept_validators {
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.accept_validation_visits += 1);
+            let hook = self.devices[index].accept_validator().ok_or_else(|| {
+                SpiceError::circuit(
+                    "finalized acceptance validation capability changed without rebinding",
+                )
+            })?;
+            hook.validate_accept(&context(index))?;
         }
-        for (index, device) in self.devices.iter().enumerate() {
-            device.accept(&context(index));
+        // Bind all notification hooks before the first infallible notification.
+        // The capability is immutable for a finalized device; check that
+        // contract before dispatch, so a failed binding cannot partially notify.
+        let notifications = self.bindings.lifecycle.accept_notifiers.iter().map(|&index| {
+            self.devices[index].accept_notifier().map(|hook| (index, hook)).ok_or_else(|| {
+                SpiceError::circuit("finalized acceptance notification capability changed without rebinding")
+            })
+        }).collect::<SpiceResult<Vec<_>>>()?;
+        for (index, hook) in notifications {
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.accept_notification_visits += 1);
+            hook.accept(&context(index));
         }
         Ok(())
     }
 
     /// Accepts a point whose trial state is committed into `history`.
     ///
-    /// Validation and every [`Device::accept`] hook run first; the history
+    /// Validation and every [`crate::devices::DeviceAcceptNotification::accept`] hook run first; the history
     /// changes only if all of them succeed, so a failure is atomic.
     ///
     /// # Errors
@@ -4465,13 +4633,15 @@ impl Circuit {
         trial: &TrialState,
         delay: &DelayAcceptance,
     ) -> SpiceResult<Vec<(usize, crate::devices::delay::DelayUpdate)>> {
-        let mut updates = Vec::new();
+        let mut updates = Vec::with_capacity(self.bindings.lifecycle.delay_load_order.len());
         // TRAaccept walks C's model/instance lists: the load order.
-        for index in self.load_order() {
+        for &index in &self.bindings.lifecycle.delay_load_order {
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.delay_update_visits += 1);
             let device = &self.devices[index];
-            let Some(line) = device.delay_line() else {
-                continue;
-            };
+            let line = device.delay_line().ok_or_else(|| {
+                SpiceError::circuit("finalized delay capability changed without rebinding")
+            })?;
             let samples = history.delay(index).ok_or_else(|| {
                 SpiceError::circuit(format!(
                     "{}: the state history has no delay history (use Circuit::state_history)",
@@ -4527,10 +4697,13 @@ impl Circuit {
     ) -> SpiceResult<Option<Real>> {
         self.validate_history(history)?;
         let mut limit: Option<Real> = None;
-        for (index, device) in self.devices.iter().enumerate() {
-            let Some(line) = device.delay_line() else {
-                continue;
-            };
+        for &index in &self.bindings.lifecycle.delays {
+            #[cfg(test)]
+            preparation_metrics::record(|counts| counts.delay_limit_visits += 1);
+            let device = &self.devices[index];
+            let line = device.delay_line().ok_or_else(|| {
+                SpiceError::circuit("finalized delay capability changed without rebinding")
+            })?;
             let samples = history
                 .delay(index)
                 .filter(|h| !h.is_empty())
@@ -5667,6 +5840,61 @@ mod tests {
     use petgraph::algo::{connected_components, has_path_connecting};
     use petgraph::graph::NodeIndex;
     use petgraph::visit::EdgeRef;
+
+    #[test]
+    fn transient_lifecycle_visits_only_bound_devices() {
+        use crate::analysis::{AnalysisContext, AnalysisInput, companion_transient};
+        use crate::netlist::{Parser, source::parse_deck_text};
+        use crate::primitives::AnalysisKind;
+        use std::{fmt::Write as _, path::Path};
+
+        let mut deck = String::from(
+            "lifecycle\nv1 in 0 pulse(0 1 0 2n 2n 100n 200n)\nr1 in out 1k\nc1 out 0 1p\nb1 out 0 i=1u*v(out)*v(out)\nt1 in 0 line 0 z0=50 td=8n\nrl line 0 50\n",
+        );
+        for index in 0..256 {
+            writeln!(deck, "ri{index} in 0 1meg").unwrap();
+        }
+        deck.push_str(".end\n");
+        let netlist = Parser::new()
+            .parse_deck(&parse_deck_text(Path::new("lifecycle.cir"), &deck))
+            .unwrap();
+        let mut circuit = Circuit::from_netlist(&netlist).unwrap();
+        let plan =
+            AnalysisInput::with_arguments(AnalysisKind::Transient, ["2n", "200n", "0", "2n"])
+                .resolve()
+                .unwrap();
+        super::preparation_metrics::take();
+        let (_, stats) =
+            companion_transient(&mut circuit, &plan, &AnalysisContext::default()).unwrap();
+        let counts = super::preparation_metrics::take();
+        assert_eq!(circuit.bindings.lifecycle.convergence.len(), 1);
+        assert_eq!(circuit.bindings.lifecycle.truncation.len(), 1);
+        assert_eq!(circuit.bindings.lifecycle.delays.len(), 1);
+        assert_eq!(counts.delay_update_visits, stats.accepted + 1);
+        assert_eq!(counts.accept_validation_visits, 0);
+        assert_eq!(counts.accept_notification_visits, 0);
+        assert!(counts.convergence_visits > 0);
+        assert!(counts.delay_limit_visits > 0);
+        assert_eq!(counts.delay_limit_visits, counts.truncation_visits);
+        assert!(counts.convergence_visits < circuit.devices().len() * stats.accepted);
+        eprintln!(
+            "lifecycle visits: {counts:?}; accepted/rejected: {}/{}",
+            stats.accepted, stats.rejected
+        );
+
+        // A topology edit must invalidate ordinal-based history and rebind
+        // delay and convergence capabilities to their new ordinals.
+        let old_history = circuit.state_history().unwrap();
+        let delay = circuit.bindings.lifecycle.delays[0];
+        let inactive = circuit.devices().len() - 1;
+        circuit.swap_devices(delay, inactive).unwrap();
+        circuit.finalize().unwrap();
+        assert_eq!(circuit.bindings.lifecycle.delays, [inactive]);
+        assert!(circuit.validate_history(&old_history).is_err());
+        let history = circuit.state_history().unwrap();
+        assert!(history.delay(delay).is_none());
+        assert!(history.delay(inactive).is_some());
+    }
 
     // Compare the actual production load and observation paths, not just a
     // synthetic cache lookup. Synthetic accepted histories intentionally

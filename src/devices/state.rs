@@ -150,6 +150,104 @@ pub(super) enum HistoryPublication {
     Rotate,
 }
 
+/// Shared finalized mapping from device ordinal to dense delay-history slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct DelayLayout(Arc<[Option<std::num::NonZeroUsize>]>);
+
+impl DelayLayout {
+    pub(super) fn new(devices: usize, ordinals: &[usize]) -> Self {
+        if ordinals.is_empty() {
+            return Self::default();
+        }
+        let mut slots = vec![None; devices];
+        for (index, &ordinal) in ordinals.iter().enumerate() {
+            slots[ordinal] = std::num::NonZeroUsize::new(index + 1);
+        }
+        Self(slots.into())
+    }
+
+    fn slot(&self, device: usize) -> Option<usize> {
+        self.0
+            .get(device)
+            .copied()
+            .flatten()
+            .map(|slot| slot.get() - 1)
+    }
+}
+
+/// One history per bound delay device, with reusable transaction scratch.
+/// Scratch is always empty/unmarked outside a prepared transaction.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct DelayHistories {
+    layout: DelayLayout,
+    samples: Vec<DelayHistory>,
+    seen: Vec<bool>,
+    checked: Vec<usize>,
+}
+
+impl DelayHistories {
+    pub(super) fn new(
+        layout: DelayLayout,
+        histories: impl IntoIterator<Item = DelayHistory>,
+    ) -> Self {
+        let samples: Vec<_> = histories.into_iter().collect();
+        let count = samples.len();
+        Self {
+            layout,
+            samples,
+            seen: vec![false; count],
+            checked: Vec::with_capacity(count),
+        }
+    }
+
+    fn get(&self, device: usize) -> Option<&DelayHistory> {
+        self.samples.get(self.layout.slot(device)?)
+    }
+
+    fn prepare(&mut self, updates: &[(usize, DelayUpdate)]) -> SpiceResult<()> {
+        let result = updates.iter().try_for_each(|(device, update)| {
+            let slot = self
+                .layout
+                .slot(*device)
+                .ok_or_else(|| state_error(format!("device {device} has no delay history")))?;
+            self.samples[slot].check(update)?;
+            if self.seen[slot] {
+                return Err(state_error(format!(
+                    "duplicate delay update for device {device}"
+                )));
+            }
+            self.seen[slot] = true;
+            self.checked.push(slot);
+            Ok(())
+        });
+        // Clear only marks actually visited, not all histories. This also
+        // restores scratch after any failure before publication.
+        for &slot in &self.checked {
+            self.seen[slot] = false;
+        }
+        if result.is_err() {
+            self.checked.clear();
+        }
+        result
+    }
+
+    fn discard(&mut self) {
+        self.checked.clear();
+    }
+
+    fn apply(&mut self, updates: &[(usize, DelayUpdate)]) {
+        for (slot, (_, update)) in self.checked.drain(..).zip(updates) {
+            self.samples[slot].apply_validated(update);
+        }
+    }
+
+    fn clear(&mut self) {
+        for history in &mut self.samples {
+            history.clear();
+        }
+    }
+}
+
 /// Accepted device state vectors, most recent first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateHistory {
@@ -163,7 +261,7 @@ pub struct StateHistory {
     carried: Option<Arc<[Real]>>,
     /// Delay histories by device ordinal (empty for circuits without delay
     /// lines).
-    delays: BTreeMap<usize, DelayHistory>,
+    delays: DelayHistories,
 }
 
 /// Immutable positional interpretation shared by all histories of a circuit.
@@ -183,17 +281,17 @@ impl StateHistory {
             revision: Arc::new(()),
             accepted: Vec::new(),
             carried: None,
-            delays: BTreeMap::new(),
+            delays: DelayHistories::default(),
         }
     }
 
-    pub(super) fn bound(
+    pub(super) const fn bound(
         topology: TopologyId,
         rows: Arc<[Range<usize>]>,
         len: usize,
         revision: Arc<()>,
         carried: Option<Arc<[Real]>>,
-        delays: impl IntoIterator<Item = (usize, DelayHistory)>,
+        delays: DelayHistories,
     ) -> Self {
         Self {
             len,
@@ -201,7 +299,7 @@ impl StateHistory {
             revision,
             accepted: Vec::new(),
             carried,
-            delays: delays.into_iter().collect(),
+            delays,
         }
     }
 
@@ -245,7 +343,14 @@ impl StateHistory {
     /// The same state history with model-specific delay histories.
     #[cfg(test)]
     fn with_delay_lines(mut self, lines: impl IntoIterator<Item = (usize, DelayHistory)>) -> Self {
-        self.delays = lines.into_iter().collect();
+        let mut lines: Vec<_> = lines.into_iter().collect();
+        lines.sort_unstable_by_key(|(device, _)| *device);
+        let ordinals: Vec<_> = lines.iter().map(|(device, _)| *device).collect();
+        let devices = ordinals.last().map_or(0, |ordinal| ordinal + 1);
+        self.delays = DelayHistories::new(
+            DelayLayout::new(devices, &ordinals),
+            lines.into_iter().map(|(_, history)| history),
+        );
         self.revision = Arc::new(());
         self
     }
@@ -253,7 +358,7 @@ impl StateHistory {
     /// The delay history of the device with ordinal `device`, if it has one.
     #[must_use = "the delay history is needed to evaluate the specified device at earlier times"]
     pub fn delay(&self, device: usize) -> Option<&DelayHistory> {
-        self.delays.get(&device)
+        self.delays.get(device)
     }
 
     /// Checks one delay update per listed device without applying any.
@@ -262,36 +367,16 @@ impl StateHistory {
     ///
     /// [`SpiceError::Numerical`] for a device without a delay history or an
     /// update [`DelayHistory::check`] rejects.
-    pub fn check_delays(&self, updates: &[(usize, DelayUpdate)]) -> SpiceResult<()> {
-        self.prepare_delays(updates).map(drop)
-    }
-
-    /// Validate one update per history and retain the verified association.
-    /// The map is private to the acceptance transaction, so no history can
-    /// change between this check and publication.
-    fn prepare_delays<'a>(
-        &self,
-        updates: &'a [(usize, DelayUpdate)],
-    ) -> SpiceResult<BTreeMap<usize, &'a DelayUpdate>> {
-        let mut checked = BTreeMap::new();
-        for (device, update) in updates {
-            self.delays
-                .get(device)
-                .ok_or_else(|| state_error(format!("device {device} has no delay history")))?
-                .check(update)?;
-            if checked.insert(*device, update).is_some() {
-                return Err(state_error(format!(
-                    "duplicate delay update for device {device}"
-                )));
-            }
-        }
-        Ok(checked)
+    pub fn check_delays(&mut self, updates: &[(usize, DelayUpdate)]) -> SpiceResult<()> {
+        let result = self.delays.prepare(updates);
+        self.delays.discard();
+        result
     }
 
     /// Commit fixed state and delay histories as one transaction. The
     /// preparation callback cannot mutate history; the last fallible step
     /// is the circuit's accept hooks. Breakpoints retain the original
-    /// device visitation order, not the map's ordinal order.
+    /// device visitation order, independent of dense slot order.
     pub(super) fn accept_transaction(
         &mut self,
         trial: TrialState,
@@ -301,16 +386,13 @@ impl StateHistory {
     ) -> SpiceResult<Vec<Real>> {
         self.check_publication(&trial, publication)?;
         let updates = prepare(self, &trial)?;
-        let checked = self.prepare_delays(&updates)?;
-        before_commit(&trial)?;
-        self.commit_validated(trial, publication);
-        if !checked.is_empty() {
-            for (device, history) in &mut self.delays {
-                if let Some(update) = checked.get(device) {
-                    history.apply_validated(update);
-                }
-            }
+        self.delays.prepare(&updates)?;
+        if let Err(error) = before_commit(&trial) {
+            self.delays.discard();
+            return Err(error);
         }
+        self.commit_validated(trial, publication);
+        self.delays.apply(&updates);
         Ok(updates
             .into_iter()
             .flat_map(|(_, update)| update.into_breakpoints())
@@ -521,9 +603,7 @@ impl StateHistory {
     pub(crate) fn retain_latest(&mut self) {
         self.accepted.truncate(1);
         self.revision = Arc::new(());
-        for history in self.delays.values_mut() {
-            history.clear();
-        }
+        self.delays.clear();
     }
 
     /// Fill a verified absolute slot of a candidate point before acceptance.
@@ -568,9 +648,7 @@ impl StateHistory {
     pub fn clear(&mut self) {
         self.accepted.clear();
         self.revision = Arc::new(());
-        for history in self.delays.values_mut() {
-            history.clear();
-        }
+        self.delays.clear();
     }
 
     /// The per-device window for slots `range` of `trial`.
@@ -608,7 +686,7 @@ impl StateHistory {
             .and_then(|binding| binding.rows.get(device))
             .cloned()
             .ok_or_else(|| state_error("device ordinal not in finalized state layout"))?;
-        self.window(trial, range, self.delays.get(&device))
+        self.window(trial, range, self.delays.get(device))
     }
 
     /// Disposable local window with float-mode trial semantics and limiting
@@ -649,7 +727,7 @@ impl StateHistory {
             nonconvergent: Some(&mut scratch.nonconvergent),
             offset: range.start,
             patches: Some(&mut scratch.patches),
-            delay: self.delays.get(&device),
+            delay: self.delays.get(device),
             ltra: None,
         })
     }
@@ -1388,8 +1466,8 @@ mod tests {
         use crate::devices::delay::{DelayHistory, DelayUpdate, WaveformUpdate};
 
         let mut history = StateHistory::new(1).with_delay_lines([
-            (0, DelayHistory::waveform(1)),
-            (1, DelayHistory::waveform(1)),
+            (3, DelayHistory::waveform(1)),
+            (1000, DelayHistory::waveform(1)),
         ]);
         let mut trial = history.trial();
         history
@@ -1410,7 +1488,7 @@ mod tests {
             .accept_transaction(
                 trial.clone(),
                 super::HistoryPublication::Rotate,
-                |_, _| Ok(vec![(0, update(1., 3.)), (0, update(2., 4.))]),
+                |_, _| Ok(vec![(3, update(1., 3.)), (3, update(2., 4.))]),
                 |_| {
                     hook_ran = true;
                     Ok(())
@@ -1421,7 +1499,13 @@ mod tests {
         assert!(!hook_ran);
         assert_eq!(history, original);
 
-        let updates = || vec![(1, update(1., 4.)), (0, update(1., 3.))];
+        assert!(
+            history
+                .check_delays(&[(3, update(1., 3.)), (999, update(1., 4.))])
+                .is_err()
+        );
+        assert_eq!(history, original);
+        let updates = || vec![(1000, update(1., 4.)), (3, update(1., 3.))];
         assert!(
             history
                 .accept_transaction(
@@ -1442,8 +1526,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(breaks, vec![4., 3.]);
+        assert!(history.delay(999).is_none());
         assert_eq!(history.accepted(1), Some(&[42.][..]));
-        for device in [0, 1] {
+        for device in [3, 1000] {
             assert_eq!(
                 history
                     .delay(device)

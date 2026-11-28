@@ -21,7 +21,7 @@
 //! accepted history and write only its [`crate::devices::state::DeviceState`] trial
 //! slots. Nothing a trial does survives unless the analysis accepts the point
 //! through [`crate::devices::Circuit::accept_point`], which first runs every
-//! [`Device::accept`] hook and only then commits the trial state. See
+//! [`DeviceAcceptNotification::accept`] hook and only then commits the trial state. See
 //! [`crate::devices::state`].
 
 use std::fmt;
@@ -644,7 +644,7 @@ impl Default for MnaUnknowns {
     }
 }
 
-/// What a device's convergence test ([`Device::convergence_test`]) sees.
+/// What a device's convergence test ([`DeviceConvergence::convergence_test`]) sees.
 #[derive(Debug)]
 pub struct ConvergenceContext<'a> {
     /// Where the unknowns live.
@@ -1469,17 +1469,11 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// devices that have not been ported.
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()>;
 
-    /// C's `DEVconvTest`, run by `NIconvTest` (`CKTconvTest`) after the node
-    /// voltages and branch currents of a Newton pass converged: `true` when
-    /// this device has not converged. Only devices whose C type has a
-    /// convergence test override it; for the diode and BJT C's test passes
-    /// whenever the load did not already report nonconvergence (it measures
-    /// limiting at the load point), so they rely on the load's flag.
-    ///
-    /// # Errors
-    /// An evaluation failure (C `E_BADPARM`).
-    fn convergence_test(&self, _context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
-        Ok(false)
+    /// Device convergence checks, in finalized load order.
+    /// Returns `None` for an inactive capability. Availability must remain
+    /// stable for this immutable device instance; replacements are rebound.
+    fn convergence_hook(&self) -> Option<&dyn DeviceConvergence> {
+        None
     }
 
     /// The C device type whose `DEVsetup`/`DEVload` handles this instance,
@@ -1602,19 +1596,19 @@ pub trait Device: fmt::Debug + std::any::Any {
         })
     }
 
-    /// Validate a prospective accepted point without observable side effects.
-    /// All devices must approve before any accept notification is delivered.
-    ///
-    /// # Errors
-    /// Device-specific failures.
-    fn validate_accept(&self, _context: &AcceptContext<'_>) -> SpiceResult<()> {
-        Ok(())
+    /// Fallible, side-effect-free acceptance validation.
+    /// Returns `None` for an inactive capability. Availability must remain
+    /// stable for this immutable device instance; replacements are rebound.
+    fn accept_validator(&self) -> Option<&dyn DeviceAcceptValidation> {
+        None
     }
 
-    /// Infallible notification of an accepted point, after all acceptance
-    /// checks succeeded and immediately before the histories are published.
-    /// Never called for Newton trials or rejected steps.
-    fn accept(&self, _context: &AcceptContext<'_>) {}
+    /// Infallible notification after all acceptance checks pass.
+    /// Returns `None` for an inactive capability. Availability must remain
+    /// stable for this immutable device instance; replacements are rebound.
+    fn accept_notifier(&self) -> Option<&dyn DeviceAcceptNotification> {
+        None
+    }
 
     /// Opt in to exact transient event scheduling, using ordinary accepted
     /// and tentative device state. No event queue is needed for devices
@@ -1623,17 +1617,11 @@ pub trait Device: fmt::Debug + std::any::Any {
         None
     }
 
-    /// An upper bound on the next transient step from this device's discrete
-    /// state (C `DEVtrunc` of devices without charge storage, e.g.
-    /// `swtrunc.c`), or `None` (the default) for no bound. Called for an
-    /// accepted-candidate trial alongside the charge/flux truncation estimate;
-    /// a bound at or below `0.9 dt` rejects the trial.
-    ///
-    /// # Errors
-    ///
-    /// Device-specific failures.
-    fn timestep_limit(&self, _context: &TruncationContext<'_>) -> SpiceResult<Option<Real>> {
-        Ok(None)
+    /// Device-local discrete-state truncation bounds.
+    /// Returns `None` for an inactive capability. Availability must remain
+    /// stable for this immutable device instance; replacements are rebound.
+    fn timestep_control(&self) -> Option<&dyn DeviceTimestepControl> {
+        None
     }
 
     /// Physical metadata when this device is a two-terminal resistor a typed
@@ -1927,6 +1915,52 @@ impl TransientEventContext<'_> {
     }
 }
 
+/// Device convergence checks, in finalized load order.
+pub trait DeviceConvergence {
+    /// C's `DEVconvTest`, run by `NIconvTest` (`CKTconvTest`) after the node
+    /// voltages and branch currents of a Newton pass converged: `true` when
+    /// this device has not converged. Only devices whose C type has a
+    /// convergence test override it; for the diode and BJT C's test passes
+    /// whenever the load did not already report nonconvergence (it measures
+    /// limiting at the load point), so they rely on the load's flag.
+    ///
+    /// # Errors
+    /// An evaluation failure (C `E_BADPARM`).
+    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool>;
+}
+
+/// Fallible, side-effect-free acceptance validation.
+pub trait DeviceAcceptValidation {
+    /// Validate a prospective accepted point without observable side effects.
+    /// All devices must approve before any accept notification is delivered.
+    ///
+    /// # Errors
+    /// Device-specific failures.
+    fn validate_accept(&self, context: &AcceptContext<'_>) -> SpiceResult<()>;
+}
+
+/// Infallible notification after all acceptance checks pass.
+pub trait DeviceAcceptNotification {
+    /// Infallible notification of an accepted point, after all acceptance
+    /// checks succeeded and immediately before the histories are published.
+    /// Never called for Newton trials or rejected steps.
+    fn accept(&self, context: &AcceptContext<'_>);
+}
+
+/// Device-local discrete-state truncation bounds.
+pub trait DeviceTimestepControl {
+    /// An upper bound on the next transient step from this device's discrete
+    /// state (C `DEVtrunc` of devices without charge storage, e.g.
+    /// `swtrunc.c`), or `None` (the default) for no bound. Called for an
+    /// accepted-candidate trial alongside the charge/flux truncation estimate;
+    /// a bound at or below `0.9 dt` rejects the trial.
+    ///
+    /// # Errors
+    ///
+    /// Device-specific failures.
+    fn timestep_limit(&self, context: &TruncationContext<'_>) -> SpiceResult<Option<Real>>;
+}
+
 /// A device whose finite history directly determines future exact boundaries.
 /// Accepted state is read-only; probes cannot commit, queue or cancel events.
 pub trait DeviceTransientEvents {
@@ -1949,7 +1983,7 @@ pub trait DeviceTransientEvents {
     ) -> SpiceResult<Option<Real>>;
 }
 
-/// What [`Device::timestep_limit`] sees for one converged trial step.
+/// What [`DeviceTimestepControl::timestep_limit`] sees for one converged trial step.
 #[derive(Debug, Clone, Copy)]
 pub struct TruncationContext<'a> {
     /// This device's slots of the converged trial (C `CKTstate0`).
@@ -1960,7 +1994,7 @@ pub struct TruncationContext<'a> {
     pub dt: Real,
 }
 
-/// What [`Device::accept`] sees for one accepted point.
+/// What [`DeviceAcceptNotification::accept`] sees for one accepted point.
 #[derive(Debug, Clone, Copy)]
 pub struct AcceptContext<'a> {
     /// The accepted solution.

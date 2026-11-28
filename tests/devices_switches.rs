@@ -276,12 +276,14 @@ fn timestep_limits_follow_swtrunc() {
     let c = circuit(BAND).unwrap();
     let s1 = c.device("s1").unwrap();
     let limit = |code: f64, now: f64, before: f64| {
-        s1.timestep_limit(&TruncationContext {
-            trial: &[code, now],
-            accepted: Some(&[0., before]),
-            dt: 1e-6,
-        })
-        .unwrap()
+        s1.timestep_control()
+            .unwrap()
+            .timestep_limit(&TruncationContext {
+                trial: &[code, now],
+                accepted: Some(&[0., before]),
+                dt: 1e-6,
+            })
+            .unwrap()
     };
     // Really off, rising towards VT + VH = 1.5: (0.75 (1.5 - 1) + 0.05) / 0.2 dt.
     close(
@@ -302,27 +304,19 @@ fn timestep_limits_follow_swtrunc() {
     }
     // No accepted point yet: nothing to compare with.
     assert_eq!(
-        s1.timestep_limit(&TruncationContext {
-            trial: &[0., 1.],
-            accepted: None,
-            dt: 1e-6,
-        })
-        .unwrap(),
-        None
-    );
-    // W never limits: CSWload leaves cswtrunc.c's control slot unwritten.
-    let w = circuit("vs a 0 0\nw1 b 0 vs wm\nr1 b 0 1\n.model wm csw(it=1)").unwrap();
-    assert_eq!(
-        w.device("w1")
+        s1.timestep_control()
             .unwrap()
             .timestep_limit(&TruncationContext {
-                trial: &[0., 0.9],
-                accepted: Some(&[0., 0.]),
+                trial: &[0., 1.],
+                accepted: None,
                 dt: 1e-6,
             })
             .unwrap(),
         None
     );
+    // W never limits: CSWload leaves cswtrunc.c's control slot unwritten.
+    let w = circuit("vs a 0 0\nw1 b 0 vs wm\nr1 b 0 1\n.model wm csw(it=1)").unwrap();
+    assert!(w.device("w1").unwrap().timestep_control().is_none());
 }
 
 #[test]

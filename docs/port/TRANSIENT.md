@@ -83,7 +83,7 @@ the run with an error; no partial plot is returned.
   coordinates do not. These options resolve per transient, and request
   `newtrunc=0` disables the deck flag. No predictor state is kept when off.
   Devices without charge storage add their own bound through
-  `Device::timestep_limit` (S switches: `swtrunc.c`, see
+  `DeviceTimestepControl::timestep_limit` (S switches: `swtrunc.c`, see
   [SWITCHES.md](SWITCHES.md#timestep-control)).
 * **Order policy.** Order 1 (backward Euler) for the first step and the first
   step after every breakpoint; after an accepted order-1 step the order-2

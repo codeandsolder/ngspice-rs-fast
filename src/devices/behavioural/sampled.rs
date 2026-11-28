@@ -117,16 +117,8 @@ impl Device for SampledCurrent {
         context.linear_static(row, control, -1.)
     }
 
-    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
-        let actual = context
-            .solution
-            .get(self.row(context.unknowns)?)
-            .ok_or_else(|| SpiceError::circuit("missing sampled-current signal value"))?;
-        let expected = Self::current(context.solution, context.controls)?;
-        Ok((actual - expected).abs()
-            > context
-                .reltol
-                .mul_add(actual.abs().max(expected.abs()), context.abstol))
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        Some(self)
     }
 
     fn assemble_small_signal(
@@ -154,6 +146,20 @@ impl Device for SampledCurrent {
         _sources: &mut Vec<crate::devices::noise::NoiseSource>,
     ) -> SpiceResult<crate::devices::noise::DeviceNoise<'_>> {
         Ok(crate::devices::noise::DeviceNoise::Noiseless)
+    }
+}
+
+impl crate::devices::DeviceConvergence for SampledCurrent {
+    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        let actual = context
+            .solution
+            .get(self.row(context.unknowns)?)
+            .ok_or_else(|| SpiceError::circuit("missing sampled-current signal value"))?;
+        let expected = Self::current(context.solution, context.controls)?;
+        Ok((actual - expected).abs()
+            > context
+                .reltol
+                .mul_add(actual.abs().max(expected.abs()), context.abstol))
     }
 }
 

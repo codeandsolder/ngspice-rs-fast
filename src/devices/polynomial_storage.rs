@@ -521,40 +521,8 @@ impl Device for PolynomialDevice {
         storage.store(&mut context.states)
     }
 
-    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
-        // With no integration the owned branch equation is linear (whether
-        // physical DC or an analysis-selected bias constraint). Only the
-        // nonlinear storage companion requires a device Newton check.
-        let Some(integration) = context.integration else {
-            return Ok(false);
-        };
-        let rows = self.rows(context.unknowns, context.branch)?;
-        let x = rows.coordinate(context.solution)?;
-        let point = self.prepared.at(x)?;
-        let actual = match self.recipe.kind {
-            Kind::Capacitor => context
-                .solution
-                .get(rows.branch)
-                .ok_or_else(|| SpiceError::circuit("missing polynomial branch current"))?,
-            Kind::Inductor => {
-                context.voltage(self.terminals[0]) - context.voltage(self.terminals[1])
-            }
-        };
-        let absolute = match self.recipe.kind {
-            Kind::Capacitor => context.abstol,
-            Kind::Inductor => context.vntol,
-        };
-        let storage = ChargeBranch::new(0, point.stored, 1.);
-        let companion = storage.companion(integration, |age, slot| context.accepted(age, slot))?;
-        let expected = companion.derivative;
-        let rounding = (8. * Real::EPSILON * companion.conductance.abs()).mul_add(
-            point.stored.abs(),
-            8. * Real::EPSILON * companion.current.abs(),
-        );
-        Ok((actual - expected).abs()
-            > context
-                .reltol
-                .mul_add(actual.abs().max(expected.abs()), absolute + rounding))
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        Some(self)
     }
 
     fn assemble_small_signal(
@@ -606,6 +574,44 @@ impl Device for PolynomialDevice {
 
     fn physical_terminal_current(&self, _: &[Real], branches: &[Real]) -> Option<Real> {
         branches.first().copied()
+    }
+}
+
+impl crate::devices::DeviceConvergence for PolynomialDevice {
+    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        // With no integration the owned branch equation is linear (whether
+        // physical DC or an analysis-selected bias constraint). Only the
+        // nonlinear storage companion requires a device Newton check.
+        let Some(integration) = context.integration else {
+            return Ok(false);
+        };
+        let rows = self.rows(context.unknowns, context.branch)?;
+        let x = rows.coordinate(context.solution)?;
+        let point = self.prepared.at(x)?;
+        let actual = match self.recipe.kind {
+            Kind::Capacitor => context
+                .solution
+                .get(rows.branch)
+                .ok_or_else(|| SpiceError::circuit("missing polynomial branch current"))?,
+            Kind::Inductor => {
+                context.voltage(self.terminals[0]) - context.voltage(self.terminals[1])
+            }
+        };
+        let absolute = match self.recipe.kind {
+            Kind::Capacitor => context.abstol,
+            Kind::Inductor => context.vntol,
+        };
+        let storage = ChargeBranch::new(0, point.stored, 1.);
+        let companion = storage.companion(integration, |age, slot| context.accepted(age, slot))?;
+        let expected = companion.derivative;
+        let rounding = (8. * Real::EPSILON * companion.conductance.abs()).mul_add(
+            point.stored.abs(),
+            8. * Real::EPSILON * companion.current.abs(),
+        );
+        Ok((actual - expected).abs()
+            > context
+                .reltol
+                .mul_add(actual.abs().max(expected.abs()), absolute + rounding))
     }
 }
 

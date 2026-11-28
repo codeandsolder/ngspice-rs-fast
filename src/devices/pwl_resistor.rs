@@ -365,24 +365,8 @@ impl Device for PwlResistor {
         self.stamp_matrix(context.matrix, context.unknowns, row, segment)?;
         context.rhs.add_to(row, segment.intercept)
     }
-    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
-        let branch = context
-            .branch
-            .ok_or_else(|| SpiceError::circuit("missing prepared PWL resistor branch"))?;
-        let voltage = self.voltage(context.unknowns, context.solution);
-        let current = context
-            .solution
-            .get(branch)
-            .ok_or_else(|| SpiceError::circuit("missing prepared PWL resistor current"))?;
-        let (x, y) = self.curve.coordinates(voltage, current);
-        let segment = self.curve.segment(x);
-        let target = segment.slope.mul_add(x, segment.intercept);
-        let absolute = match self.curve.axis {
-            Axis::Voltage => context.abstol,
-            Axis::Current => context.vntol,
-        };
-        Ok(!target.is_finite()
-            || (target - y).abs() > context.reltol.mul_add(target.abs().max(y.abs()), absolute))
+    fn convergence_hook(&self) -> Option<&dyn crate::devices::DeviceConvergence> {
+        Some(self)
     }
     fn assemble_small_signal(
         &self,
@@ -470,6 +454,28 @@ impl Device for PwlResistor {
         _context: &mut crate::devices::traits::ChargeContext<'_>,
     ) -> SpiceResult<()> {
         Ok(())
+    }
+}
+
+impl crate::devices::DeviceConvergence for PwlResistor {
+    fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
+        let branch = context
+            .branch
+            .ok_or_else(|| SpiceError::circuit("missing prepared PWL resistor branch"))?;
+        let voltage = self.voltage(context.unknowns, context.solution);
+        let current = context
+            .solution
+            .get(branch)
+            .ok_or_else(|| SpiceError::circuit("missing prepared PWL resistor current"))?;
+        let (x, y) = self.curve.coordinates(voltage, current);
+        let segment = self.curve.segment(x);
+        let target = segment.slope.mul_add(x, segment.intercept);
+        let absolute = match self.curve.axis {
+            Axis::Voltage => context.abstol,
+            Axis::Current => context.vntol,
+        };
+        Ok(!target.is_finite()
+            || (target - y).abs() > context.reltol.mul_add(target.abs().max(y.abs()), absolute))
     }
 }
 
