@@ -60,7 +60,7 @@ fn temperature(input: &mut Input<'_>) -> Result<ParsedCard> {
         }
         if expression.is_none() && !value.text.parse::<f64>().is_ok_and(f64::is_finite) {
             return Err(ErrMode::Cut(Failure(SpiceError::parse(
-                value.location.clone(),
+                value.location,
                 ".temp requires a finite decimal Celsius value or parameter expression",
             ))));
         }
