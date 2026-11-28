@@ -536,6 +536,7 @@ impl Expansion {
                     text: String::new(),
                     span,
                     verbatim: true,
+                    scalar_alternative: None,
                     root: input,
                 })),
                 location: location.clone(),

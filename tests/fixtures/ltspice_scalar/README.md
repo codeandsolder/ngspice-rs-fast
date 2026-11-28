@@ -1,0 +1,5 @@
+# Independent LTspice scalar witnesses
+
+The numerical data and circuit are the first 20 behavioral sources from `vendor_operator_precedence_and_table_limiter_dc_sweep` and `scalar-dc.tsv`, published by ngspice-rs-preprocess issue #48 at accepted revision `28a4093ec06227afe1c9ba4dc17cbe5ed04fcd1c`. They were independently measured in LTspice XVII and 24.0.12: a DC sweep from -3 V to +3 V with 0.25 V steps, reltol=1e-10, abstol=1e-14, vntol=1e-12. The two vendor versions gave identical 25 rows at 12 significant digits (SHA-256 `520d54243c7eb1fe5aa7a6f90dda9fc555fcd66d6d535f381ec8300322ed6f8e`). Columns are the sweep voltage, V(x), and V(a) through V(w) in circuit order. Neither Rust producer nor solver generated these observations.
+
+The phase and derivative tests in the integration test use the analytic affine table and independently qualified smooth limiter laws from the same producer work. No source macro is hand-lowered: the test exercises the actual linked source producer and native solver.

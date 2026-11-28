@@ -35,14 +35,14 @@ use crate::primitives::{Real, SourceLoc, SpiceError, SpiceResult};
 
 use crate::netlist::ast::{DeviceInstance, Netlist, ParameterAssignment, ParameterKind, ScopeView};
 use crate::netlist::bexpr::{
-    BBinaryOp, BExpr, BExprKind, BUnaryOp, BehaviouralExpression, SPECIAL_NAMES,
-    STATISTICAL_FUNCTIONS, TableTransfer, is_builtin_function, round_like_c_literal,
+    BExpr, BExprKind, BehaviouralExpression, DynamicOperator, SPECIAL_NAMES, STATISTICAL_FUNCTIONS,
+    TableTransfer, is_builtin_function, round_like_c_literal,
 };
 use crate::netlist::elaborate::format_literal;
 use crate::netlist::eval::statistics::PreparedSite;
-use crate::netlist::eval::{EvalBudget, FunctionScope, ParamScope};
+use crate::netlist::eval::{EvalBudget, FunctionDef, FunctionScope, ParamScope};
 use crate::netlist::expr::{
-    BinaryOp, Expr, ExprKind, MAX_TREE_DEPTH, MAX_TREE_NODES, SourceSpan, TreeBudget, UnaryOp,
+    Expr, ExprKind, MAX_TREE_NODES, ParameterExpression, SourceSpan, TreeBudget,
 };
 
 mod edits;
@@ -190,6 +190,7 @@ fn generated(root: BExpr, text: String, location: &SourceLoc) -> ParameterKind {
             logical: 0..0,
         },
         verbatim: true,
+        scalar_alternative: None,
         root,
     }))
 }
@@ -355,7 +356,7 @@ pub(crate) fn resolve_expression_at(
 ) -> SpiceResult<BehaviouralExpression> {
     let mut resolver = Resolver {
         scope,
-        functions: scope.functions().cloned(),
+        functions: scope.functions().map(Arc::as_ref),
         budget,
         sampler: scope.sampler(&expression.span.start, site),
         prepared_frames: site
@@ -365,14 +366,15 @@ pub(crate) fn resolve_expression_at(
         exact: false,
         verbatim: expression.verbatim,
         syntax_only: false,
-        nodes: 0,
         expansion_budget: TreeBudget::new(MAX_TREE_NODES),
     };
-    let root = resolver.resolve(&expression.root, 1)?;
+    let root = resolver.resolve(&expression.root, 1, None)?;
+    root.check_tree(1, &mut TreeBudget::new(MAX_TREE_NODES))?;
     Ok(BehaviouralExpression {
         text: expression.text.clone(),
         span: expression.span.clone(),
         verbatim: expression.verbatim,
+        scalar_alternative: None,
         root,
     })
 }
@@ -405,17 +407,18 @@ fn expand_symbolic(
 ) -> SpiceResult<BExpr> {
     let mut resolver = Resolver {
         scope,
-        functions: scope.functions().cloned(),
+        functions: scope.functions().map(Arc::as_ref),
         budget,
         sampler: scope.sampler(&expression.span.start, None),
         prepared_frames: Vec::new(),
         exact: false,
         verbatim: expression.verbatim,
         syntax_only: true,
-        nodes: 0,
         expansion_budget: TreeBudget::new(MAX_TREE_NODES),
     };
-    resolver.resolve(&expression.root, 1)
+    let root = resolver.resolve(&expression.root, 1, None)?;
+    root.check_tree(1, &mut TreeBudget::new(MAX_TREE_NODES))?;
+    Ok(root)
 }
 
 /// Inspect the top-level laws *after* the same controlled-source lowering
@@ -452,78 +455,81 @@ pub(crate) fn classify_passive(
         return Ok(());
     }
     let functions = scope.functions().map(Arc::as_ref);
-    let numeric;
-    let expression = match &parameter.kind {
+    let selected = match &parameter.kind {
         ParameterKind::Expression(value) => {
-            // A simple arithmetic parameter value cannot hide a runtime law.
-            let potentially_runtime = value.root.preorder().any(|node| match &node.kind {
-                ExprKind::Identifier(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
-                ExprKind::UserCall { .. } => true,
-                ExprKind::Call { function, .. } => {
-                    functions.is_some_and(|scope| scope.get(function.name()).is_some())
-                }
-                _ => false,
-            });
-            if !potentially_runtime {
+            let Some(alternative) = &value.behavioural_alternative else {
                 return Ok(());
-            }
-            numeric = BehaviouralExpression {
-                text: value.spelling(),
-                span: value.span.clone(),
-                verbatim: false,
-                root: from_numparam(
-                    &value.root,
-                    &[],
-                    &[],
-                    1,
-                    &mut TreeBudget::new(MAX_TREE_NODES),
-                    functions,
-                )?,
             };
-            &numeric
+            match alternative
+                .as_ref()
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|expression| {
+                    expand_symbolic(expression, scope, budget).map(|root| (expression, root))
+                }) {
+                Ok((expression, root)) if root.uses_runtime() => {
+                    ParameterKind::Behavioural(Box::new(BehaviouralExpression {
+                        scalar_alternative: None,
+                        ..expression.clone()
+                    }))
+                }
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    // A scalar-only operator or function can be legal when
+                    // the expansion has no runtime dependencies. Use the
+                    // scalar grammar only to decide whether that phase is
+                    // still viable, never to construct a behavioural tree.
+                    if has_runtime(
+                        &value.root,
+                        functions,
+                        None,
+                        1,
+                        &mut TreeBudget::new(MAX_TREE_NODES),
+                    )? {
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+            }
         }
-        ParameterKind::Behavioural(expression) => expression,
+        ParameterKind::Behavioural(expression) => {
+            match expand_symbolic(expression, scope, budget) {
+                Ok(root) if root.uses_runtime() => {
+                    ParameterKind::Behavioural(Box::new(BehaviouralExpression {
+                        scalar_alternative: None,
+                        ..expression.as_ref().clone()
+                    }))
+                }
+                Ok(_) => {
+                    // Directly written behavioural laws without a retained
+                    // scalar alternative are already classified.
+                    let Some(alternative) = &expression.scalar_alternative else {
+                        return Ok(());
+                    };
+                    ParameterKind::Expression(Box::new(
+                        alternative.as_ref().as_ref().map_err(Clone::clone)?.clone(),
+                    ))
+                }
+                Err(error) => {
+                    let Some(Ok(scalar)) = expression.scalar_alternative.as_deref() else {
+                        return Err(error);
+                    };
+                    if has_runtime(
+                        &scalar.root,
+                        functions,
+                        None,
+                        1,
+                        &mut TreeBudget::new(MAX_TREE_NODES),
+                    )? {
+                        return Err(error);
+                    }
+                    ParameterKind::Expression(Box::new(scalar.clone()))
+                }
+            }
+        }
         _ => return Ok(()),
     };
-    let root = expand_symbolic(expression, scope, budget)?;
-    let mut runtime = false;
-    root.visit(&mut |expr| {
-        runtime |= match &expr.kind {
-            BExprKind::Voltage { .. } | BExprKind::Current(_) => true,
-            BExprKind::Name(name) => matches!(name.as_str(), "time" | "temper" | "hertz"),
-            BExprKind::Call { name, .. } => {
-                crate::netlist::bexpr::DynamicOperator::from_name(name).is_some()
-            }
-            _ => false,
-        };
-    });
-    if runtime {
-        // The symbolic expansion classifies the law, but retain the original
-        // call tree for realization: otherwise macro invocation identities
-        // are lost before statistical calls can be bound.
-        parameter.kind = ParameterKind::Behavioural(Box::new(expression.clone()));
-    } else if matches!(parameter.kind, ParameterKind::Behavioural(_)) {
-        // A locally shadowed probe call or an erased macro argument may
-        // make the syntactically behavioural candidate an ordinary scalar.
-        // Preserve the original numeric evaluation and its site metadata.
-        let text = &expression.text;
-        let inner = text.get(1..text.len().saturating_sub(1)).ok_or_else(|| {
-            parse_error(
-                &expression.span,
-                "missing passive expression delimiters".into(),
-            )
-        })?;
-        let mut value = crate::netlist::parse_parameter_expression(
-            inner,
-            &expression
-                .span
-                .start
-                .at_column(expression.span.start.column + 1),
-        )?;
-        value.braced = true;
-        value.quoted = text.starts_with('\'');
-        parameter.kind = ParameterKind::Expression(Box::new(value));
-    }
+    parameter.kind = selected;
     Ok(())
 }
 
@@ -536,7 +542,7 @@ fn statistical_argument(expr: &BExpr) -> SpiceResult<Real> {
             &node.kind,
             BExprKind::Voltage { .. } | BExprKind::Current(_)
         ) || matches!(&node.kind, BExprKind::Name(name) if !matches!(name.as_str(),"pi"|"e"))
-            || matches!(&node.kind, BExprKind::Call { name,.. } if crate::netlist::bexpr::DynamicOperator::from_name(name).is_some());
+            || matches!(&node.kind, BExprKind::Call { name,.. } if DynamicOperator::from_name(name).is_some());
     });
     if dynamic {
         return Err(parse_error(
@@ -556,16 +562,153 @@ fn statistical_argument(expr: &BExpr) -> SpiceResult<Real> {
         .value)
 }
 
+/// Substitution retains the caller environment for each argument while
+/// resolving free names through the enclosing active macro chain.
+struct MacroFrame<'a, T> {
+    def: &'a FunctionDef,
+    scope: &'a FunctionScope,
+    arguments: &'a [T],
+    outer: Option<&'a Self>,
+}
+
+fn macro_definition<'a, T>(
+    site: Option<&'a FunctionScope>,
+    frame: Option<&'a MacroFrame<'a, T>>,
+    name: &str,
+) -> Option<(&'a FunctionDef, &'a FunctionScope)> {
+    frame
+        .map(|f| f.scope)
+        .or(site)
+        .and_then(|scope| scope.get(name))
+        .or_else(|| site.and_then(|scope| scope.get(name)))
+}
+
+fn macro_argument<'a, T>(
+    mut frame: Option<&'a MacroFrame<'a, T>>,
+    name: &str,
+) -> Option<(&'a T, Option<&'a MacroFrame<'a, T>>)> {
+    while let Some(f) = frame {
+        if let Some(index) = f.def.parameters.iter().position(|p| p == name) {
+            return Some((&f.arguments[index], f.outer));
+        }
+        frame = f.outer;
+    }
+    None
+}
+
+fn check_macro_call<T>(
+    def: &FunctionDef,
+    arguments: &[T],
+    mut frame: Option<&MacroFrame<'_, T>>,
+    span: &SourceSpan,
+) -> SpiceResult<()> {
+    if def.parameters.len() != arguments.len() {
+        return Err(parse_error(
+            span,
+            format!(
+                "function '{}' (defined at {}) takes {} argument(s), found {}",
+                def.name,
+                def.location,
+                def.parameters.len(),
+                arguments.len()
+            ),
+        ));
+    }
+    while let Some(f) = frame {
+        if std::ptr::eq(f.def, def) {
+            return Err(parse_error(
+                span,
+                format!(
+                    "recursive call of function '{}' (defined at {})",
+                    def.name, def.location
+                ),
+            ));
+        }
+        frame = f.outer;
+    }
+    Ok(())
+}
+
+/// Classify the expanded scalar syntax without evaluating values, or
+/// imposing behavioural operators on a scalar-only expression.
+fn has_runtime(
+    expr: &Expr,
+    site: Option<&FunctionScope>,
+    frame: Option<&MacroFrame<'_, Expr>>,
+    depth: usize,
+    budget: &mut TreeBudget,
+) -> SpiceResult<bool> {
+    budget.charge(depth, 1, &expr.span.start)?;
+    let mut child = |node: &Expr| has_runtime(node, site, frame, depth + 1, budget);
+    match &expr.kind {
+        ExprKind::Number { .. } => Ok(false),
+        ExprKind::Identifier(name) => {
+            if let Some((argument, outer)) = macro_argument(frame, name) {
+                has_runtime(argument, site, outer, depth + 1, budget)
+            } else {
+                Ok(matches!(name.as_str(), "time" | "temper" | "hertz"))
+            }
+        }
+        ExprKind::Unary { operand, .. } | ExprKind::Group(operand) => child(operand),
+        ExprKind::Binary { lhs, rhs, .. } => Ok(child(lhs)? || child(rhs)?),
+        ExprKind::Ternary {
+            condition,
+            then,
+            otherwise,
+        } => Ok(child(condition)? || child(then)? || child(otherwise)?),
+        ExprKind::Call {
+            function,
+            arguments,
+        } => runtime_call(function.name(), arguments, expr, site, frame, depth, budget),
+        ExprKind::UserCall { name, arguments } => {
+            runtime_call(name, arguments, expr, site, frame, depth, budget)
+        }
+    }
+}
+
+fn runtime_call(
+    name: &str,
+    arguments: &[Expr],
+    expr: &Expr,
+    site: Option<&FunctionScope>,
+    outer: Option<&MacroFrame<'_, Expr>>,
+    depth: usize,
+    budget: &mut TreeBudget,
+) -> SpiceResult<bool> {
+    if let Some((def, scope)) = macro_definition(site, outer, name) {
+        check_macro_call(def, arguments, outer, &expr.span)?;
+        let frame = MacroFrame {
+            def,
+            scope,
+            arguments,
+            outer,
+        };
+        // A behavioural-only definition must be resolved in that phase
+        // before the final classification can be made.
+        return def.body.scalar.as_ref().map_or(Ok(true), |body| {
+            has_runtime(body, site, Some(&frame), depth + 1, budget)
+        });
+    }
+    if matches!(name, "v" | "i") || DynamicOperator::from_name(name).is_some() {
+        return Ok(true);
+    }
+    for argument in arguments {
+        if has_runtime(argument, site, outer, depth + 1, budget)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 struct Resolver<'a> {
     scope: &'a ParamScope,
-    functions: Option<Arc<FunctionScope>>,
+    functions: Option<&'a FunctionScope>,
     budget: &'a mut EvalBudget,
     sampler: crate::netlist::eval::statistics::Sampler<'a>,
     prepared_frames: Vec<(SourceSpan, model_statistics::Identity)>,
     exact: bool,
     verbatim: bool,
     syntax_only: bool,
-    nodes: usize,
     expansion_budget: TreeBudget,
 }
 
@@ -608,18 +751,15 @@ impl Resolver<'_> {
         }
     }
 
-    fn resolve(&mut self, expr: &BExpr, depth: usize) -> SpiceResult<BExpr> {
-        self.nodes += 1;
-        if self.nodes > MAX_TREE_NODES || depth > MAX_TREE_DEPTH {
-            return Err(parse_error(
-                &expr.span,
-                format!(
-                    "behavioural expression too large after .func expansion \
-                     (more than {MAX_TREE_NODES} nodes or nesting deeper than {MAX_TREE_DEPTH})"
-                ),
-            ));
-        }
-        let boxed = |this: &mut Self, expr: &BExpr| this.resolve(expr, depth + 1).map(Box::new);
+    fn resolve(
+        &mut self,
+        expr: &BExpr,
+        depth: usize,
+        frame: Option<&MacroFrame<'_, BExpr>>,
+    ) -> SpiceResult<BExpr> {
+        self.expansion_budget.charge(depth, 1, &expr.span.start)?;
+        let boxed =
+            |this: &mut Self, expr: &BExpr| this.resolve(expr, depth + 1, frame).map(Box::new);
         let kind = match &expr.kind {
             BExprKind::Number { value, spelling } => BExprKind::Number {
                 value: if self.verbatim || self.syntax_only || self.exact {
@@ -629,29 +769,40 @@ impl Resolver<'_> {
                 },
                 spelling: spelling.clone(),
             },
-            BExprKind::Name(name) => return self.name(expr, name),
+            BExprKind::Name(name) => {
+                if let Some((argument, outer)) = macro_argument(frame, name) {
+                    return Ok(BExpr {
+                        kind: BExprKind::Group(Box::new(self.resolve(
+                            argument,
+                            depth + 1,
+                            outer,
+                        )?)),
+                        span: argument.span.clone(),
+                    });
+                }
+                return self.name(expr, name);
+            }
             BExprKind::Voltage { positive, negative } => {
-                if self
-                    .functions
-                    .as_deref()
-                    .is_some_and(|scope| scope.get("v").is_some())
-                {
+                if macro_definition(self.functions, frame, "v").is_some() {
                     return self.shadowed_probe(
                         expr,
                         "v",
                         std::iter::once(positive.as_str()).chain(negative.as_deref()),
                         depth,
+                        frame,
                     );
                 }
                 expr.kind.clone()
             }
             BExprKind::Current(name) => {
-                if self
-                    .functions
-                    .as_deref()
-                    .is_some_and(|scope| scope.get("i").is_some())
-                {
-                    return self.shadowed_probe(expr, "i", std::iter::once(name.as_str()), depth);
+                if macro_definition(self.functions, frame, "i").is_some() {
+                    return self.shadowed_probe(
+                        expr,
+                        "i",
+                        std::iter::once(name.as_str()),
+                        depth,
+                        frame,
+                    );
                 }
                 expr.kind.clone()
             }
@@ -675,23 +826,17 @@ impl Resolver<'_> {
             },
             BExprKind::Group(inner) => BExprKind::Group(boxed(self, inner)?),
             BExprKind::Call { name, arguments } => {
-                return self.call(expr, name, arguments, depth);
+                return self.call(expr, name, arguments, depth, frame);
             }
-            BExprKind::Value(value) if !self.syntax_only => {
-                let identity = self
-                    .prepared_frame(&expr.span)
-                    .map(|(identity, _)| identity);
-                let evaluated =
-                    self.scope
-                        .evaluate_sampled(value, self.budget, &self.sampler, identity)?;
-                self.numeric_value(evaluated)
-            }
-            BExprKind::Value(_) => expr.kind.clone(),
+            BExprKind::Value(value) => self.resolve_value(expr, value, depth)?,
             BExprKind::Table(table) => {
-                let input = self.resolve(&table.input, depth + 1)?;
+                let input = self.resolve(&table.input, depth + 1, frame)?;
                 let mut points = Vec::with_capacity(table.points.len());
                 for (x, y) in &table.points {
-                    points.push((self.resolve(x, depth + 1)?, self.resolve(y, depth + 1)?));
+                    points.push((
+                        self.resolve(x, depth + 1, frame)?,
+                        self.resolve(y, depth + 1, frame)?,
+                    ));
                 }
                 BExprKind::Table(Box::new(TableTransfer {
                     input,
@@ -704,6 +849,27 @@ impl Resolver<'_> {
             kind,
             span: expr.span.clone(),
         })
+    }
+
+    fn resolve_value(
+        &mut self,
+        expr: &BExpr,
+        value: &ParameterExpression,
+        depth: usize,
+    ) -> SpiceResult<BExprKind> {
+        value
+            .root
+            .check_tree(depth + 1, &mut self.expansion_budget)?;
+        if self.syntax_only {
+            return Ok(expr.kind.clone());
+        }
+        let identity = self
+            .prepared_frame(&expr.span)
+            .map(|(identity, _)| identity);
+        let evaluated = self
+            .scope
+            .evaluate_sampled(value, self.budget, &self.sampler, identity)?;
+        Ok(self.numeric_value(evaluated))
     }
 
     fn name(&self, expr: &BExpr, name: &str) -> SpiceResult<BExpr> {
@@ -737,6 +903,7 @@ impl Resolver<'_> {
         name: &str,
         operands: impl Iterator<Item = &'a str>,
         depth: usize,
+        frame: Option<&MacroFrame<'_, BExpr>>,
     ) -> SpiceResult<BExpr> {
         let arguments = operands
             .map(|operand| {
@@ -745,7 +912,7 @@ impl Resolver<'_> {
                     .map(|expression| expression.root)
             })
             .collect::<SpiceResult<Vec<_>>>()?;
-        self.call(expr, name, &arguments, depth)
+        self.call(expr, name, &arguments, depth, frame)
     }
 
     fn prepared_call(
@@ -754,6 +921,7 @@ impl Resolver<'_> {
         name: &str,
         arguments: &[BExpr],
         depth: usize,
+        frame: Option<&MacroFrame<'_, BExpr>>,
     ) -> SpiceResult<BExpr> {
         let identity = self
             .prepared_frame(&expr.span)
@@ -768,7 +936,7 @@ impl Resolver<'_> {
         let values = arguments
             .iter()
             .map(|argument| {
-                let resolved = self.resolve(argument, depth + 1)?;
+                let resolved = self.resolve(argument, depth + 1, frame)?;
                 statistical_argument(&resolved)
             })
             .collect::<SpiceResult<Vec<_>>>();
@@ -782,44 +950,77 @@ impl Resolver<'_> {
         })
     }
 
+    /// Prepared sampling binds an explicit i(formal) operand to the actual
+    /// device name without evaluating it as a numeric parameter. Follow the
+    /// caller frame through nested macro forwarding, including parentheses.
+    /// A shadowed i() remains an ordinary user macro.
+    fn sampled_operand(
+        &mut self,
+        operand: &BExpr,
+        depth: usize,
+        frame: Option<&MacroFrame<'_, BExpr>>,
+    ) -> SpiceResult<BExpr> {
+        let mut current = operand;
+        let mut level = depth;
+        while let BExprKind::Group(inner) = &current.kind {
+            current = inner;
+            level += 1;
+        }
+        if let BExprKind::Current(name) = &current.kind
+            && macro_definition(self.functions, frame, "i").is_none()
+            && let Some((mut actual, mut caller)) = macro_argument(frame, name)
+        {
+            self.expansion_budget
+                .charge(level, 1, &current.span.start)?;
+            loop {
+                level += 1;
+                self.expansion_budget.charge(level, 1, &actual.span.start)?;
+                match &actual.kind {
+                    BExprKind::Group(inner) => actual = inner,
+                    BExprKind::Name(name) => {
+                        if let Some((next, outer)) = macro_argument(caller, name) {
+                            actual = next;
+                            caller = outer;
+                        } else {
+                            return Ok(BExpr {
+                                kind: BExprKind::Current(name.clone()),
+                                span: actual.span.clone(),
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(parse_error(
+                            &actual.span,
+                            "prepared current reference formal requires a device name".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        self.resolve(operand, depth, frame)
+    }
+
     fn call(
         &mut self,
         expr: &BExpr,
         name: &str,
         arguments: &[BExpr],
         depth: usize,
+        frame: Option<&MacroFrame<'_, BExpr>>,
     ) -> SpiceResult<BExpr> {
         if !self.syntax_only && name.starts_with(model_statistics::PREPARED_PREFIX) {
-            return self.prepared_call(expr, name, arguments, depth);
+            return self.prepared_call(expr, name, arguments, depth, frame);
         }
-        let functions = self.functions.clone();
-        let definition = functions
-            .as_deref()
-            .and_then(|scope| scope.get(name))
-            .map(|(definition, _)| definition);
-        if let Some(definition) = definition {
-            if definition.parameters.len() != arguments.len() {
-                return Err(parse_error(
-                    &expr.span,
-                    format!(
-                        "function '{name}' (defined at {}) takes {} argument(s), found {}",
-                        definition.location,
-                        definition.parameters.len(),
-                        arguments.len()
-                    ),
-                ));
-            }
-            // inp_expand_macro_in_str(): the body replaces the call, each
-            // formal by its parenthesised argument text.
-            let body = from_numparam(
-                &definition.body.root,
-                &definition.parameters,
+        if let Some((definition, scope)) = macro_definition(self.functions, frame, name) {
+            check_macro_call(definition, arguments, frame, &expr.span)?;
+            let body = definition.body.behavioural.as_ref().map_err(Clone::clone)?;
+            let inner = MacroFrame {
+                def: definition,
+                scope,
                 arguments,
-                depth + 1,
-                &mut self.expansion_budget,
-                functions.as_deref(),
-            )?;
-            let frame = self.prepared_frame(&expr.span).map(|(identity, offset)| {
+                outer: frame,
+            };
+            let identity_frame = self.prepared_frame(&expr.span).map(|(identity, offset)| {
                 (
                     definition.body.span.clone(),
                     identity
@@ -828,9 +1029,9 @@ impl Resolver<'_> {
                         .child(&offset.to_le_bytes()),
                 )
             });
-            let pushed = frame.is_some();
-            self.prepared_frames.extend(frame);
-            let expanded = self.resolve(&body, depth + 1);
+            let pushed = identity_frame.is_some();
+            self.prepared_frames.extend(identity_frame);
+            let expanded = self.resolve(body, depth + 1, Some(&inner));
             if pushed {
                 self.prepared_frames.pop();
             }
@@ -842,7 +1043,7 @@ impl Resolver<'_> {
         if !self.syntax_only && STATISTICAL_FUNCTIONS.contains(&name) {
             let mut values = Vec::with_capacity(arguments.len());
             for argument in arguments {
-                let resolved = self.resolve(argument, depth + 1)?;
+                let resolved = self.resolve(argument, depth + 1, frame)?;
                 values.push(statistical_argument(&resolved)?);
             }
             let value = self.sampler.sample(name, &values, &expr.span.start)?;
@@ -862,7 +1063,16 @@ impl Resolver<'_> {
         }
         let mut resolved = Vec::with_capacity(arguments.len());
         for argument in arguments {
-            resolved.push(self.resolve(argument, depth + 1)?);
+            let value = if matches!(
+                DynamicOperator::from_name(name),
+                Some(DynamicOperator::Current(_))
+            ) && arguments.len() == 1
+            {
+                self.sampled_operand(argument, depth + 1, frame)?
+            } else {
+                self.resolve(argument, depth + 1, frame)?
+            };
+            resolved.push(value);
         }
         Ok(BExpr {
             kind: BExprKind::Call {
@@ -871,174 +1081,5 @@ impl Resolver<'_> {
             },
             span: expr.span.clone(),
         })
-    }
-}
-
-/// Explicit prepared sampling permits a macro's formal to name its actual
-/// device argument. Native unwrapped i(name) retains ngspice's literal-name
-/// behavior. A user-defined i or sampling function takes lexical precedence.
-fn prepared_sample_operand(
-    operand: &Expr,
-    formals: &[String],
-    arguments: &[BExpr],
-    functions: Option<&FunctionScope>,
-) -> SpiceResult<Option<BExpr>> {
-    let ExprKind::UserCall {
-        name,
-        arguments: probes,
-    } = &operand.kind
-    else {
-        return Ok(None);
-    };
-    if name != "i" || functions.is_some_and(|scope| scope.get(name).is_some()) {
-        return Ok(None);
-    }
-    let [probe] = probes.as_slice() else {
-        return Ok(None);
-    };
-    let ExprKind::Identifier(target) = &probe.kind else {
-        return Ok(None);
-    };
-    let Some(index) = formals.iter().position(|formal| formal == target) else {
-        return Ok(None);
-    };
-    let mut actual = &arguments[index];
-    while let BExprKind::Group(inner) = &actual.kind {
-        actual = inner;
-    }
-    let BExprKind::Name(name) = &actual.kind else {
-        return Err(parse_error(
-            &actual.span,
-            "prepared current reference formal requires a device name".into(),
-        ));
-    };
-    Ok(Some(BExpr {
-        kind: BExprKind::Current(name.clone()),
-        span: actual.span.clone(),
-    }))
-}
-
-/// Converts a numparam `.func` body into a behavioural tree, binding formals.
-/// `v(name[, name])`/`i(name)` calls in a body name nodes/sources literally:
-/// C does not substitute formals inside them (verified with the C binary).
-fn from_numparam(
-    expr: &Expr,
-    formals: &[String],
-    arguments: &[BExpr],
-    depth: usize,
-    budget: &mut TreeBudget,
-    functions: Option<&FunctionScope>,
-) -> SpiceResult<BExpr> {
-    budget.charge(depth, 1, &expr.span.start)?;
-    let mut convert = |expr: &Expr| {
-        from_numparam(expr, formals, arguments, depth + 1, budget, functions).map(Box::new)
-    };
-    let kind = match &expr.kind {
-        ExprKind::Number { value, spelling } => BExprKind::Number {
-            value: *value,
-            spelling: spelling.clone(),
-        },
-        ExprKind::Identifier(name) => {
-            if let Some(index) = formals.iter().position(|formal| formal == name) {
-                let argument = &arguments[index];
-                argument.check_tree(depth + 1, budget)?;
-                return Ok(BExpr {
-                    kind: BExprKind::Group(Box::new(argument.clone())),
-                    span: argument.span.clone(),
-                });
-            }
-            BExprKind::Name(name.clone())
-        }
-        ExprKind::Unary { op, operand } => BExprKind::Unary {
-            op: match op {
-                UnaryOp::Plus => BUnaryOp::Plus,
-                UnaryOp::Minus => BUnaryOp::Minus,
-            },
-            operand: convert(operand)?,
-        },
-        ExprKind::Binary { op, lhs, rhs } => BExprKind::Binary {
-            op: match op {
-                BinaryOp::Add => BBinaryOp::Add,
-                BinaryOp::Sub => BBinaryOp::Sub,
-                BinaryOp::Mul => BBinaryOp::Mul,
-                BinaryOp::Div => BBinaryOp::Div,
-                BinaryOp::Pow => BBinaryOp::Pow,
-            },
-            lhs: convert(lhs)?,
-            rhs: convert(rhs)?,
-        },
-        ExprKind::Call {
-            function,
-            arguments: operands,
-        } => BExprKind::Call {
-            name: function.name().to_owned(),
-            arguments: operands
-                .iter()
-                .map(|operand| {
-                    from_numparam(operand, formals, arguments, depth + 1, budget, functions)
-                })
-                .collect::<SpiceResult<_>>()?,
-        },
-        ExprKind::Group(inner) => BExprKind::Group(convert(inner)?),
-        ExprKind::UserCall {
-            name,
-            arguments: operands,
-        } => {
-            let builtin = functions.is_none_or(|scope| scope.get(name).is_none());
-            if builtin && let Some(kind) = circuit_quantity(name, operands) {
-                kind
-            } else if builtin
-                && matches!(
-                    crate::netlist::bexpr::DynamicOperator::from_name(name),
-                    Some(crate::netlist::bexpr::DynamicOperator::Current(_))
-                )
-                && let [operand] = operands.as_slice()
-                && let Some(current) =
-                    prepared_sample_operand(operand, formals, arguments, functions)?
-            {
-                budget.charge(depth + 1, 1, &current.span.start)?;
-                BExprKind::Call {
-                    name: name.clone(),
-                    arguments: vec![current],
-                }
-            } else {
-                BExprKind::Call {
-                    name: name.clone(),
-                    arguments: operands
-                        .iter()
-                        .map(|operand| {
-                            from_numparam(operand, formals, arguments, depth + 1, budget, functions)
-                        })
-                        .collect::<SpiceResult<_>>()?,
-                }
-            }
-        }
-    };
-    Ok(BExpr {
-        kind,
-        span: expr.span.clone(),
-    })
-}
-
-fn literal_name(expr: &Expr) -> Option<String> {
-    match &expr.kind {
-        ExprKind::Identifier(name) => Some(name.clone()),
-        ExprKind::Number { spelling, .. } => Some(spelling.to_ascii_lowercase()),
-        _ => None,
-    }
-}
-
-fn circuit_quantity(name: &str, arguments: &[Expr]) -> Option<BExprKind> {
-    match (name, arguments) {
-        ("v", [positive]) => Some(BExprKind::Voltage {
-            positive: literal_name(positive)?,
-            negative: None,
-        }),
-        ("v", [positive, negative]) => Some(BExprKind::Voltage {
-            positive: literal_name(positive)?,
-            negative: Some(literal_name(negative)?),
-        }),
-        ("i", [source]) => Some(BExprKind::Current(literal_name(source)?)),
-        _ => None,
     }
 }
