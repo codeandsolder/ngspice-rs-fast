@@ -249,9 +249,34 @@ The derivative-order bound and projected rank tests are not a proof of
 solvability for every singular or nonanalytic nonlinear DAE. Delayed rank
 emergence from time-dependent coefficients is covered at startup and exact
 interior events, including coefficients vanishing through dozens of Taylor
-orders. Recovery from a singular provisional Newton seed and genuinely
-singular nonlinear germs is tracked in
-[#251](https://github.com/codeandsolder/ngspice-rs-fast/issues/251).
+orders.
+
+When the ordinary order search exhausts with an unrepresented nonlinear
+physical residual, the solver can explore homogeneous nullspace
+directions of the mandatory derivative array. Probe amplitudes are
+bracketed by the response of the physical residual, not by a fixed
+voltage or time scale. Opposite directions and coupled combinations
+are tried; the perturbed state is only a disposable Newton seed.
+Recovered candidates must increase mandatory projected rank, satisfy
+the original physical residuals and storage constraints, and pass the
+same order lookahead checks. A residual-space arithmetic error envelope
+is propagated through the selected tangent basis for comparison of
+candidate states and normalized rates. Resolved distinct germs are
+reported as ambiguous. A search that cannot establish a determined
+prefix reports its numerical limit instead of installing an arbitrary
+derivative gauge. This bounded local recovery does not enumerate every
+nonlinear branch or prove global uniqueness, and an exactly singular
+homogeneous repeated root can still remain unresolved.
+
+The last accepted physical state and rate provide an extrapolated
+Newton seed for subsequent trials. A localized event uses its actual
+left-limit solution and rate instead. Neither rejected trials nor branch
+probes update the accepted predictor. The verified derivative array
+also supplies the executed guard trace and canonical candidate states,
+without re-evaluating the scalar expression on a potentially different
+branch. A domain failure in a predictor falls back to the ordinary
+state and zero-rate guess without changing the constraints.
+See [#251](https://github.com/codeandsolder/ngspice-rs-fast/issues/251).
 
 Nonlinear C/L `ic=` is intentionally retained under UIC, rather than
 discarded by the frontend as observed in ngspice 47 (instance and node

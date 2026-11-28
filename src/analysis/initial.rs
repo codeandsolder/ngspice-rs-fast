@@ -1081,6 +1081,7 @@ fn potential(state: &Vector, vertex: VoltageVertex) -> Real {
 /// disposable computational metadata, not an accepted integration state.
 pub(super) struct DerivativePoint {
     pub solution: Vector,
+    pub rate: Vector,
     pub canonical: Vec<(usize, Real)>,
     pub order_hint: usize,
     pub guards: crate::devices::physical_dae::BranchTrace,
@@ -1152,6 +1153,7 @@ pub(super) fn consistent_derivative_start(
             storage.consistent_history(circuit, &right, (!uic).then_some(0.), tolerances)?;
         Ok(DerivativePoint {
             solution: right.state,
+            rate: right.rate,
             order_hint: right.order_hint,
             guards: right.guards,
             canonical,
@@ -1163,6 +1165,13 @@ pub(super) fn consistent_derivative_start(
         Err(SpiceError::Unsupported { .. }) => Ok(None),
         other => other.map(Some),
     }
+}
+
+/// Disposable Taylor seed metadata, not a constraint or accepted history.
+#[derive(Clone, Copy)]
+pub(super) struct DerivativeGuess<'a> {
+    pub order_hint: usize,
+    pub rate: Option<&'a Vector>,
 }
 
 pub(super) enum DerivativeTrial {
@@ -1177,7 +1186,7 @@ pub(super) fn consistent_derivative_step(
     request: &LoadRequest<'_>,
     tolerances: Tolerances,
     iterations: usize,
-    order_hint: usize,
+    guess: DerivativeGuess<'_>,
 ) -> SpiceResult<DerivativeTrial> {
     let circuit = prepared.circuit();
     let forcing = request
@@ -1191,7 +1200,7 @@ pub(super) fn consistent_derivative_step(
         ImpulseStorage::collect(circuit, request.solution, request.model_context, values)?;
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
     let right = match system::solve_step(
-        &dae, circuit, request, &storage, tolerances, iterations, order_hint,
+        &dae, circuit, request, &storage, tolerances, iterations, guess,
     )? {
         system::SolveOutcome::Converged(right) => *right,
         system::SolveOutcome::NotConverged { last, .. } => {
@@ -1201,6 +1210,7 @@ pub(super) fn consistent_derivative_step(
     let canonical = storage.consistent_history(circuit, &right, None, tolerances)?;
     Ok(DerivativeTrial::Converged(DerivativePoint {
         solution: right.state,
+        rate: right.rate,
         order_hint: right.order_hint,
         guards: right.guards,
         canonical,
@@ -1215,7 +1225,7 @@ pub(super) fn consistent_derivative_event(
     left: &crate::devices::TrialState,
     tolerances: Tolerances,
     iterations: usize,
-    order_hint: usize,
+    guess: DerivativeGuess<'_>,
 ) -> SpiceResult<DerivativePoint> {
     let circuit = prepared.circuit();
     let forcing = request
@@ -1232,11 +1242,28 @@ pub(super) fn consistent_derivative_event(
     )?;
     storage.retain_operating_point(request.solution);
     let dae = prepared.prepare_physical_dae(request.model_context, forcing.timing)?;
-    let right = system::solve_event(&dae, request, &storage, tolerances, iterations, order_hint)
-        .map_err(|error| failure(format!("source event at t = {time:e}: {error}")))?;
+    let right = match system::solve_event(&dae, request, &storage, tolerances, iterations, guess) {
+        // A one-sided germ may have a different admissible derivative
+        // domain than the incoming one. Retry without the disposable rate
+        // hint, retaining exactly the same physical event constraints.
+        Err(SpiceError::Circuit { .. }) if guess.rate.is_some() => system::solve_event(
+            &dae,
+            request,
+            &storage,
+            tolerances,
+            iterations,
+            DerivativeGuess {
+                rate: None,
+                ..guess
+            },
+        ),
+        result => result,
+    }
+    .map_err(|error| failure(format!("source event at t = {time:e}: {error}")))?;
     let canonical = storage.consistent_history(circuit, &right, Some(time), tolerances)?;
     Ok(DerivativePoint {
         solution: right.state,
+        rate: right.rate,
         order_hint: right.order_hint,
         guards: right.guards,
         canonical,
