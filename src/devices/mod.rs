@@ -60,6 +60,7 @@ mod elaboration;
 mod factory;
 pub mod functions;
 pub mod hfet;
+mod ideal_diode;
 /// Shared Berkeley short-channel input plumbing (BSIM3/BSIM4).
 pub(crate) mod ifparam;
 mod initial;
@@ -81,6 +82,7 @@ pub mod nonlinear;
 pub mod nport;
 pub mod passive;
 pub mod passive_bias;
+pub mod passive_network;
 pub mod physical_dae;
 pub mod prepared_model;
 pub mod prepared_waveform;

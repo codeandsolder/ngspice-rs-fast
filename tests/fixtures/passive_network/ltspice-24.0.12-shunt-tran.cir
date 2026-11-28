@@ -1,0 +1,14 @@
+Synthetic shunt multiplicity
+.options reltol=1e-8 abstol=1e-12 vntol=1e-10 plotwinsize=0
+V1 s 0 PULSE(0 1 1u 0.1u 0.1u 10u 20u)
+R1 s p1 2
+C1 p1 0 2u Rser=5 Rpar=100 Cpar=1u Lser=3m RLshunt=20 m=1
+R2 s p2 2
+C2 p2 0 2u Rser=5 Rpar=100 Cpar=1u Lser=3m RLshunt=20 m=2
+R3 s p3 2
+C3 p3 0 2u Rser=5 Rpar=100 Cpar=1u Lser=3m RLshunt=20 m=3
+R4 s p4 2
+C4 p4 0 2u Rser=5 Rpar=100 Cpar=1u Lser=3m RLshunt=20 m=.5
+.tran 0 30u 0 .1u
+.save V(p1) V(p2) V(p3) V(p4)
+.end

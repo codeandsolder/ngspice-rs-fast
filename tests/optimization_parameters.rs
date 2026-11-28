@@ -584,3 +584,29 @@ fn benchmark_behavioural_candidate_preparation() {
         prepared.as_secs_f64() / scalar.as_secs_f64()
     );
 }
+
+#[test]
+fn sparse_polynomial_candidate_retains_initially_zero_parameter_terms() {
+    let mut coefficients = vec!["0"; 302];
+    coefficients[0] = "1";
+    coefficients[300] = "{gain}";
+    coefficients[301] = "{2*gain}";
+    let plan = CircuitParameterPlan::new(
+        deck(&format!(
+            ".param gain=0\nv1 in 0 -1\neout out 0 poly(1) in 0 {}\nr1 out 0 1k",
+            coefficients.join(" ")
+        )),
+        &["gain"],
+    )
+    .unwrap();
+    let mut session = plan.session().unwrap();
+    let op = AnalysisInput::new(AnalysisKind::OperatingPoint)
+        .resolve()
+        .unwrap();
+    for gain in [0., 3., -2., 0.] {
+        session.update(&[gain], &mut EvalBudget::default()).unwrap();
+        let context = session.analysis_context();
+        let plot = op.run(session.circuit_mut(), &context).unwrap();
+        close(plot.value("v(out)", 0).unwrap().re, 1. - gain);
+    }
+}

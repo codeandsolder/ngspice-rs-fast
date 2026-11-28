@@ -33,7 +33,7 @@
 
 use crate::analysis::ac::{GridKind, SmallSignal, frequency_grid};
 use crate::analysis::frequency::FrequencyPlan;
-use crate::analysis::linear::{plot, unsupported};
+use crate::analysis::linear::{LinearOutput, plot, unsupported};
 use crate::analysis::results::Variable;
 use crate::analysis::{AnalysisPlan, Plot};
 use crate::devices::Circuit;
@@ -276,7 +276,10 @@ impl<'a> RfPlan<'a> {
         let budget = RfBudget::preflight(
             count,
             unknowns,
-            circuit.observations().len(),
+            sum(&[
+                circuit.observations().len(),
+                circuit.reported_currents().len(),
+            ])?,
             grid.len(),
             noise,
             bias,
@@ -314,7 +317,15 @@ pub(super) fn run(
     let mut plots = small_signal.retained_bias(circuit, request, context, include_bias)?;
     reject_imaginary_current_excitation(small_signal.system())?;
     let mut workspace = RfWorkspace::new(&plan)?;
-    let mut plot = parameter_plot(circuit, plan.ports.len(), donoise, plan.budget.width)?;
+    let output = plot(
+        circuit,
+        "sp1",
+        "SP Analysis",
+        Some(("frequency", "frequency")),
+        true,
+        crate::devices::passive_network::ReportPhase::SmallSignal,
+    )?;
+    let mut plot = parameter_plot(&output, plan.ports.len(), donoise, plan.budget.width)?;
     plot.reserve_points(plan.grid.len())?;
     let reference = plan.ports[0].z0;
     let mut noise_plan: Option<NoisePlan<'_>> = None;
@@ -336,6 +347,7 @@ pub(super) fn run(
         workspace
             .point
             .extend_from_slice(workspace.solve.last_solution());
+        output.append_reports(&mut workspace.point);
         if !circuit.observations().is_empty() {
             workspace.point.extend(
                 small_signal
@@ -579,18 +591,12 @@ impl RfWorkspace {
 
 /// Schema in the same order as the per-frequency point assembly.
 fn parameter_plot(
-    circuit: &Circuit,
+    output: &LinearOutput,
     port_count: usize,
     donoise: bool,
     width: usize,
 ) -> SpiceResult<Plot> {
-    let plot = plot(
-        circuit,
-        "sp1",
-        "SP Analysis",
-        Some(("frequency", "frequency")),
-        true,
-    )?;
+    let plot = &output.header;
     let base = plot.variables();
     let mut variables = Vec::new();
     variables

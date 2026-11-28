@@ -69,6 +69,7 @@ fn has_native_current(
 ) -> SpiceResult<bool> {
     Ok(match instance.designator {
         'v' | 'e' | 'h' | 'l' => true,
+        'c' if instance.parameters.iter().any(|p| p.name == "pn_control") => true,
         'r' | 'c' => expressions(instance).next().is_some(),
         'b' => instance
             .parameters
@@ -76,7 +77,11 @@ fn has_native_current(
             .any(|parameter| parameter.name == "v"),
         'a' => {
             models.resolve(instance)?.is_some_and(|model| {
-                model.levels().backend == crate::devices::models::ModelBackend::RationalTransfer
+                matches!(
+                    model.levels().backend,
+                    crate::devices::models::ModelBackend::RationalTransfer
+                        | crate::devices::models::ModelBackend::FrequencyTransfer
+                )
             }) || instance
                 .parameters
                 .iter()

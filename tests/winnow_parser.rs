@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use ngspice_rs::netlist::Parser;
-use ngspice_rs::netlist::ast::Netlist;
+use ngspice_rs::netlist::ast::{Netlist, ParameterKind, SourceWaveform, StochasticFunction};
 use ngspice_rs::netlist::source::parse_deck_text;
 use ngspice_rs::primitives::SpiceError;
 
@@ -100,7 +100,6 @@ fn optional_and_repeated_branches_preserve_domain_errors() {
         ("I1 a 0 dc 2m ac 1 \"phase\"", "\"phase\"", "inp2i.c"),
         ("R1 a 0 1k tc1=\"tc\"", "\"tc\"", "inp2r.c"),
         ("C1 a 0 1u unknown=2", "unknown", "inp2c.c"),
-        ("V1 a 0 dc 5 trnoise(0 1n)", "trnoise", "inp2v.c"),
     ] {
         match parse(card).unwrap_err() {
             SpiceError::NotYetPorted { what, c_reference } => {
@@ -111,6 +110,20 @@ fn optional_and_repeated_branches_preserve_domain_errors() {
             other => panic!("{card}: domain error became {other}"),
         }
     }
+}
+
+#[test]
+fn stochastic_waveform_after_dc_retains_both_branches() {
+    let netlist = parse("V1 a 0 dc 5 trnoise(0 1n)").unwrap();
+    let parameters = &netlist.devices[0].parameters;
+    assert_eq!(parameters.len(), 2);
+    assert_eq!(
+        (parameters[0].name.as_str(), parameters[0].value.as_str()),
+        ("dc", "5")
+    );
+    assert!(
+        matches!(&parameters[1].kind, ParameterKind::Waveform(SourceWaveform::Stochastic {function: StochasticFunction::Noise, values}) if values.len() == 2)
+    );
 }
 
 #[test]

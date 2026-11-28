@@ -10,6 +10,8 @@ use crate::primitives::{Real, SpiceError, SpiceResult, parse_spice_number};
 pub enum SourceModel {
     /// Rational voltage/current transfer.
     RationalTransfer,
+    /// Tabulated complex AC transfer.
+    FrequencyTransfer,
     /// Qualified analog receivers with event logic output.
     LogicEvent,
     /// Ideal digital-to-voltage bridge.
@@ -37,7 +39,7 @@ pub enum ParameterShape {
 
 impl ParameterShape {
     /// Whether a bracketed array is required.
-    #[must_use]
+    #[must_use = "the shape determines whether a parameter requires bracketed grouping"]
     pub const fn vector(self) -> bool {
         matches!(
             self,
@@ -46,7 +48,7 @@ impl ParameterShape {
     }
 
     /// Whether literal boolean spellings are accepted.
-    #[must_use]
+    #[must_use = "the result determines whether boolean spellings are valid"]
     pub const fn boolean(self) -> bool {
         matches!(self, Self::Boolean | Self::BooleanVector)
     }
@@ -91,10 +93,12 @@ impl PortSpec {
 
 impl SourceModel {
     /// Registered model type, without applying node aliasing.
-    #[must_use]
+    #[must_use = "the lookup result identifies the registered source model or an unsupported name"]
     pub const fn from_base(base: &str) -> Option<Self> {
         if base.eq_ignore_ascii_case("s_xfer") {
             Some(Self::RationalTransfer)
+        } else if base.eq_ignore_ascii_case("xfer") {
+            Some(Self::FrequencyTransfer)
         } else if base.eq_ignore_ascii_case("preprocess_logic_event") {
             Some(Self::LogicEvent)
         } else if base.eq_ignore_ascii_case("preprocess_logic_voltage") {
@@ -107,7 +111,7 @@ impl SourceModel {
     }
 
     /// Ordered terminal groups and their default domains.
-    #[must_use]
+    #[must_use = "the port specifications are required to bind terminal groups in source order"]
     pub const fn ports(self) -> &'static [PortSpec] {
         const TRANSFER_PORTS: &[PortSpec] = &[
             PortSpec::new(Voltage, TRANSFER, false, false),
@@ -126,7 +130,7 @@ impl SourceModel {
             PortSpec::new(ConductanceDifferential, BRANCH, false, false),
         ];
         match self {
-            Self::RationalTransfer => TRANSFER_PORTS,
+            Self::RationalTransfer | Self::FrequencyTransfer => TRANSFER_PORTS,
             Self::LogicEvent => LOGIC_PORTS,
             Self::LogicVoltage => VOLTAGE_PORTS,
             Self::TimedSwitch => SWITCH_PORTS,
@@ -135,13 +139,19 @@ impl SourceModel {
 
     /// Shape of a declared static setter. Unknown setters are rejected during
     /// model binding, after source expressions have been evaluated.
-    #[must_use]
+    #[must_use = "the shape determines how the static setter must be interpreted"]
     pub fn parameter(self, name: &str) -> Option<ParameterShape> {
         use ParameterShape::{Boolean, BooleanVector, Integer, IntegerVector, Real, RealVector};
         match self {
             Self::RationalTransfer => match name {
                 "num_coeff" | "den_coeff" | "int_ic" => Some(RealVector),
                 "gain" | "denormalized_freq" | "in_offset" => Some(Real),
+                _ => None,
+            },
+            Self::FrequencyTransfer => match name {
+                "table" => Some(RealVector),
+                "r_i" | "db" | "rad" => Some(Boolean),
+                "span" | "offset" => Some(Integer),
                 _ => None,
             },
             Self::LogicEvent => match name {
@@ -538,6 +548,7 @@ pub(in crate::devices) fn instantiate(
             }))
         }
         SourceModel::RationalTransfer => super::rational::instantiate(instance, nodes, model),
+        SourceModel::FrequencyTransfer => super::frequency::instantiate(instance, nodes, model),
         SourceModel::TimedSwitch => {
             let material = model.prepare(PreparationKey::Inputs, || {
                 super::timed_switch_device::compile(model.card())

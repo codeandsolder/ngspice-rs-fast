@@ -1,0 +1,85 @@
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		-4	-5.5000100000000016e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		-3.5	-4.7500100000000016e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		-3	-4.0000100000000017e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		-2.5	-3.2500100000000005e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		-2	-2.5000100000000006e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		-1.5	-1.7500100000000006e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		-1	-1.0000100000000002e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		-0.5	-5.0000500000000012e-16
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		0	0
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		0.5	5.0000500000000012e-16
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		1	1.0000100000000001e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		1.5	2.0000099999999999e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		2	3.0000100000000004e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		2.5	4.0000100000000001e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		3	5.0000100000000006e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		3.5	6.000010000000001e-15
+floor-linear	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15		4	7.0000100000000007e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		-4	-5.3500130000000014e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		-3.5	-4.6000130000000014e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		-3	-3.8500130000000014e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		-2.5	-3.1000130000000003e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		-2	-2.3500130000000007e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		-1.5	-1.6041795833333338e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		-1	-1.0000100000000002e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		-0.5	-5.0000500000000012e-16
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		0	0
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		0.5	5.0000500000000012e-16
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		1	1.0000100000000002e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		1.5	1.8000120000000003e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		2	2.800012e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		2.5	3.8000120000000004e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		3	4.8000120000000001e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		3.5	5.8000120000000006e-15
+floor-smooth	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6		4	6.8000120000000011e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		-4	-4.9051582536448677e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		-3.5	-4.348293639957514e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		-3	-3.7616041559557652e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		-2.5	-3.1351589523872876e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		-2	-2.4621271572600105e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		-1.5	-1.7449286624037098e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		-1	-1.0000100000000002e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		-0.5	-5.0000500000000012e-16
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		0	0
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		0.5	5.0000500000000012e-16
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		1	1.0000100000000001e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		1.5	1.9621271572600099e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		2	2.7616041559557655e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		2.5	3.4051582536448669e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		3	3.9640375800758183e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		3.5	4.486624298151431e-15
+floor-limit	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Ilimit=1e-15 Revilimit=1e-15		4	4.9950647536867315e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		-4	-4.8735523698803117e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		-3.5	-4.2997316098043111e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		-3	-3.6899490683187513e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		-2.5	-3.0355203916136016e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		-2	-2.3344680761319438e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		-1.5	-1.6019356317924907e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		-1	-1.0000100000000002e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		-0.5	-5.0000500000000012e-16
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		0	0
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		0.5	5.0000500000000012e-16
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		1	1.0000100000000002e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		1.5	1.7867582692072328e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		2	2.6612532297702981e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		2.5	3.3604455204647929e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		3	3.9462978102235733e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		3.5	4.4799091518188403e-15
+floor-both	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15		4	4.9925680317869168e-15
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	-4	-3.0034042283958299e-15
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	-3.5	-2.4076982134437427e-15
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	-3	-1.8058068953774713e-15
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	-2.5	-1.3264779738443679e-15
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	-2	-1.0000300000000002e-15
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	-1.5	-7.5002250000000015e-16
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	-1	-5.000150000000001e-16
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	-0.5	-2.5000750000000005e-16
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	0	0
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	0.5	2.5000750000000005e-16
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	1	5.000150000000001e-16
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	1.5	7.5002250000000015e-16
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	2	1.0000300000000002e-15
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	2.5	1.4757174927968676e-15
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	3	2.3602748076216979e-15
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	3.5	3.2403645926073482e-15
+floor-mn	Ron=1e15 Roff=1e20 Vfwd=1 Vrev=1 Rrev=2e15 Epsilon=0.4 Revepsilon=0.6 Ilimit=1e-15 Revilimit=1e-15	m=3 n=2	4	3.9837596893108936e-15

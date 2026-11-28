@@ -73,6 +73,9 @@ pub(super) fn instantiate_with_models(
         ModelBackend::SimetrixDiodeLevel1 => {
             crate::devices::simetrix_diode::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::LtspiceIdealDiode => {
+            crate::devices::ideal_diode::instantiate(instance, nodes, &model, context)
+        }
         ModelBackend::Bjt => {
             crate::devices::bjt::Bjt::instantiate(instance, nodes, &model, context)
         }
@@ -115,6 +118,7 @@ pub(super) fn instantiate_with_models(
             crate::devices::switch::Switch::instantiate(instance, nodes, &model, context)
         }
         ModelBackend::RationalTransfer
+        | ModelBackend::FrequencyTransfer
         | ModelBackend::LogicEvent
         | ModelBackend::LogicVoltage
         | ModelBackend::TimedSwitch => {
@@ -461,6 +465,20 @@ fn validate_pwl_repeat(
             location: Some(p.location.clone()),
         })?;
     Ok(())
+}
+
+/// Prepare the ordinary source inputs for a composed voltage network.
+/// RF ports and distortion forcing have distinct physical identities and
+/// cannot be silently discarded by the network binder.
+pub(super) fn voltage_network_inputs(instance: &DeviceInstance) -> SpiceResult<SourceInputs> {
+    let setters = parse_source_setters(instance)?;
+    if setters.port.any.is_some() || setters.distortion.iter().any(Option::is_some) {
+        return Err(SpiceError::parse(
+            instance.location.clone(),
+            "voltage network does not accept RF or distortion port setters",
+        ));
+    }
+    Ok(setters.inputs)
 }
 
 fn instantiate_source(

@@ -8,8 +8,8 @@ use crate::analysis::frequency::{Advance, FrequencyPlan};
 use crate::analysis::linear::{number, plot, unsupported};
 use crate::analysis::results::SelectedOutput;
 use crate::analysis::{AnalysisPlan, Plot, PointSink};
-use crate::devices::Circuit;
 use crate::devices::linear::LinearSystem;
+use crate::devices::{Circuit, passive_network::ReportPhase};
 use crate::maths::Vector;
 use crate::maths::complex::ComplexMatrix;
 use crate::primitives::{Complex, Real, SpiceResult};
@@ -28,15 +28,17 @@ pub(super) fn run(
     for bias in small_signal.retained_bias(circuit, request, context, include_bias)? {
         sink.complete(bias)?;
     }
-    let plot = plot(
+    let output = plot(
         circuit,
         "ac1",
         "AC Analysis",
         Some(("frequency", "frequency")),
         true,
+        ReportPhase::SmallSignal,
     )?;
-    sink.begin(&plot)?;
-    let mut selected = SelectedOutput::bind(sink, &plot, circuit.unknown_count(), true)?;
+    let plot = &output.header;
+    sink.begin(plot)?;
+    let mut selected = SelectedOutput::bind(sink, &output, circuit.unknown_count(), true)?;
     // NIacIter on the circuit's own matrix: the first AC solve of the
     // circuit reorders (`SMPcReorder`, starting from the real pivot order),
     // later frequencies refactor (`SMPcLUfac`) and reorder only after a zero
@@ -63,6 +65,7 @@ pub(super) fn run(
             point.clear();
             point.push(Complex::real(f));
             point.extend(x);
+            output.append_reports(&mut point);
             point.extend(observed);
             plot.check_point(&point)?;
             sink.point(&point)?;
@@ -262,12 +265,14 @@ impl<'a> SmallSignal<'a> {
             | crate::primitives::AnalysisKind::PoleZero => "Distortion Operating Point",
             _ => "AC Operating Point",
         };
-        let mut plot = plot(circuit, "op1", title, None, false)?;
-        let mut point = Vec::with_capacity(plot.variables().len());
+        let output = plot(circuit, "op1", title, None, false, ReportPhase::Steady)?;
+        let mut point = Vec::with_capacity(output.header.variables().len());
         point.extend(self.bias().as_slice().iter().copied().map(Complex::real));
+        output.append_reports(&mut point);
         // Spectral observations support scalar instance parameters. Include
         // them in the bias row as well; its header already names them.
         point.extend(self.prepared.observe_parameters(&context.model_context())?);
+        let mut plot = output.header;
         plot.push_point(&point)?;
         Ok(vec![plot])
     }

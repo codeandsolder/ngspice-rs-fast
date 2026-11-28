@@ -242,7 +242,17 @@ a Newton aid and is not reproduced. POLY is the SPICE2 polynomial
 `c0 + c1 x1 + ... + cn xn + c(n+1) x1^2 + c(n+2) x1 x2 + ...`, terms in
 `nxtpwr()` order (total degree, then lexicographically descending exponents),
 `m=` multiplying G/F outputs; `m=` on an E/H POLY is rejected (C drops it with
-a warning).
+a warning). A sparse run-length exponent cursor advances in that order even
+across literal-zero coefficients. Only provable literal zeros are omitted;
+parameter expressions remain unevaluated until their normal lexical binding.
+All original controlling quantities are bound, including those absent from
+nonzero terms. Products use signed repeated multiplication, not the general
+behavioural absolute-base power law. Count-balanced sums and products retain
+term order with logarithmic structural height. Preflight charges coefficient
+traversal, generated nodes, and embedded coefficient depths before cloning
+any generated expression; the ordinary expression node/depth and compiler
+work budgets remain in force. Regrouping changes floating-point summation
+order, but not the polynomial or its analytical derivatives.
 
 Current references are bound after lexical expansion, parameter evaluation,
 controlled-source lowering and hierarchy expansion. Voltage-output sources,

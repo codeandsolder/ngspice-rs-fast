@@ -325,7 +325,7 @@ impl RationalTransfer {
     }
 
     /// Number of dynamic states in the retained realization.
-    #[must_use]
+    #[must_use = "the order determines the number of retained dynamic states"]
     pub fn order(&self) -> usize {
         self.model.order()
     }
@@ -340,7 +340,6 @@ impl RationalTransfer {
         dc: bool,
         mut emit: impl FnMut(usize, usize, Real, bool) -> SpiceResult<()>,
     ) -> SpiceResult<()> {
-        let [op, on, ip, inn] = nodes;
         let mut term = |row: usize, column: Option<usize>, value: Real| -> SpiceResult<()> {
             if let Some(column) = column
                 && value != 0.
@@ -349,29 +348,14 @@ impl RationalTransfer {
             }
             Ok(())
         };
-        for (node, sign) in [(op, 1.), (on, -1.)] {
-            if let Some(row) = node {
-                term(row, Some(branch), sign)?;
-                if self.output == PortLaw::Voltage {
-                    term(branch, Some(row), sign)?;
-                }
-            }
-        }
-        if self.output == PortLaw::Current {
-            term(branch, Some(branch), 1.)?;
-        }
-        let sensor = branch + 1 + self.order();
-        let input = if self.input == PortLaw::Current {
-            for (node, sign) in [(ip, 1.), (inn, -1.)] {
-                if let Some(row) = node {
-                    term(row, Some(sensor), sign)?;
-                    term(sensor, Some(row), sign)?;
-                }
-            }
-            [(Some(sensor), -1.), (None, 0.)]
-        } else {
-            [(ip, -1.), (inn, 1.)]
-        };
+        let input = transfer_ports(
+            self.input,
+            self.output,
+            branch,
+            branch + 1 + self.order(),
+            nodes,
+            &mut term,
+        )?;
         for (node, sign) in input {
             term(branch, node, sign * self.model.feedthrough)?;
         }
@@ -718,7 +702,43 @@ impl Model {
     }
 }
 
-fn transfer_port(port: &CodePort) -> SpiceResult<(PortLaw, &str, &str)> {
+/// Shared physical port incidence for rational and tabulated transfers. The
+/// output branch is observable even for current output; the current input
+/// uses a separate zero-voltage sensing branch.
+pub(super) fn transfer_ports(
+    input: PortLaw,
+    output: PortLaw,
+    branch: usize,
+    sensor: usize,
+    nodes: [Option<usize>; 4],
+    mut term: impl FnMut(usize, Option<usize>, Real) -> SpiceResult<()>,
+) -> SpiceResult<[(Option<usize>, Real); 2]> {
+    let [op, on, ip, inn] = nodes;
+    for (node, sign) in [(op, 1.), (on, -1.)] {
+        if let Some(row) = node {
+            term(row, Some(branch), sign)?;
+            if output == PortLaw::Voltage {
+                term(branch, Some(row), sign)?;
+            }
+        }
+    }
+    if output == PortLaw::Current {
+        term(branch, Some(branch), 1.)?;
+    }
+    if input == PortLaw::Current {
+        for (node, sign) in [(ip, 1.), (inn, -1.)] {
+            if let Some(row) = node {
+                term(row, Some(sensor), sign)?;
+                term(sensor, Some(row), sign)?;
+            }
+        }
+        Ok([(Some(sensor), -1.), (None, 0.)])
+    } else {
+        Ok([(ip, -1.), (inn, 1.)])
+    }
+}
+
+pub(super) fn transfer_port(port: &CodePort) -> SpiceResult<(PortLaw, &str, &str)> {
     let [terminal] = port.terminals.as_slice() else {
         return Err(invalid("expected scalar transfer port"));
     };

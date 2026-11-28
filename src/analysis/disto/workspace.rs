@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::analysis::results::Plot;
+use crate::analysis::linear::LinearOutput;
 use crate::devices::distortion::{CircuitDistortion, Product};
 use crate::devices::{Circuit, LinearSystem, SourceKind};
 use crate::maths::complex::ComplexMatrix;
@@ -234,21 +234,24 @@ impl<'a> Workspace<'a> {
         circuit: &'a Circuit,
         system: &'a LinearSystem,
         inputs: Inputs,
-        plots: &mut [Plot],
+        plots: &mut [LinearOutput],
         points: usize,
     ) -> SpiceResult<Self> {
         let n = circuit.unknown_count();
         let width = n
             .checked_add(1)
+            .and_then(|width| width.checked_add(circuit.reported_currents().len()))
             .ok_or_else(|| SpiceError::circuit("distortion output dimension overflow"))?;
         let intermodulation = inputs.second.is_some();
         if plots.len() != if intermodulation { 3 } else { 2 }
-            || plots.iter().any(|plot| plot.variable_count() != width)
+            || plots
+                .iter()
+                .any(|plot| plot.header.variable_count() != width)
         {
             return Err(SpiceError::circuit("invalid distortion plot dimensions"));
         }
         for plot in plots {
-            plot.reserve_points(points)?;
+            plot.header.reserve_points(points)?;
         }
         let products = if let Some(forcing) = inputs.second {
             Products::Intermodulation {
@@ -277,7 +280,7 @@ impl<'a> Workspace<'a> {
         freq: Real,
         omega1: Real,
         omega2: Real,
-        plots: &mut [Plot],
+        plots: &mut [LinearOutput],
     ) -> SpiceResult<()> {
         let Self {
             first_input,
@@ -359,29 +362,30 @@ impl<'a> Workspace<'a> {
 }
 
 fn append(
-    plot: &mut Plot,
-    row: &mut [Complex],
+    plot: &mut LinearOutput,
+    row: &mut Vec<Complex>,
     frequency: Real,
     kernel: &[Complex],
     scale: Real,
 ) -> SpiceResult<()> {
-    let Some((axis, values)) = row.split_first_mut() else {
-        return Err(SpiceError::circuit("empty distortion row"));
-    };
-    if values.len() != kernel.len() {
+    if kernel.len() + plot.reports.len() + 1 != plot.header.variable_count() {
         return Err(SpiceError::circuit("distortion output kernel dimensions"));
     }
-    *axis = Complex::real(frequency);
-    for (target, value) in values.iter_mut().zip(kernel) {
-        *target = Complex::new(scale * value.re, scale * value.im);
-    }
+    row.clear();
+    row.push(Complex::real(frequency));
+    row.extend(
+        kernel
+            .iter()
+            .map(|value| Complex::new(scale * value.re, scale * value.im)),
+    );
+    plot.append_reports(row);
     if row.iter().any(|value| !value.is_finite()) {
         return Err(SpiceError::Numerical {
             context: ".disto".into(),
             message: "nonfinite distortion response".into(),
         });
     }
-    plot.push_point(row)
+    plot.header.push_point(row)
 }
 
 #[cfg(test)]

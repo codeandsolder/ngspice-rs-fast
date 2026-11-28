@@ -58,8 +58,8 @@ fn scalar_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
             let name = token.text.to_ascii_lowercase();
             let canonical = match name.as_str() {
                 "perim" => "pj",
-                "area" | "pj" | "w" | "l" | "m" | "ic" | "temp" | "dtemp" | "lm" | "lp" | "wm"
-                | "wp" => &name,
+                "area" | "pj" | "w" | "l" | "m" | "n" | "ic" | "temp" | "dtemp" | "lm" | "lp"
+                | "wm" | "wp" => &name,
                 _ => return None,
             };
             Some((token, canonical.to_owned()))

@@ -1633,8 +1633,9 @@ pub(super) fn run(
     grid: Option<&FrequencyPlan>,
     estimate_resolution: bool,
 ) -> SpiceResult<(Plot, Option<Plot>)> {
-    let settings = request.dc_settings();
+    let mut settings = request.dc_settings().clone();
     let ac = grid.is_some();
+    settings.newton.retain_linearization = !ac;
     circuit.finalize()?;
     let circuit: &Circuit = circuit;
     let probe = output_probe::bind(circuit, &card.output, Card::Sens)?.probe;
@@ -1650,7 +1651,7 @@ pub(super) fn run(
     let solved = crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?.solve(
         &circuit.prepare_run(),
         &model,
-        settings,
+        &settings,
     )?;
 
     let mut plot = workspace.plot(ac);

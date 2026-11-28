@@ -144,15 +144,15 @@ fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<(Input, usize)> {
         ))
     })?;
     let device = &circuit.devices()[index];
-    match device.designator() {
-        'v' => {
+    match device.input_source().map(|source| source.kind) {
+        Some(crate::devices::linear::SourceKind::Voltage) => {
             let branch = circuit
                 .branch_rows(index)
                 .and_then(|mut rows| rows.next())
                 .ok_or_else(|| not_found(format_args!("{name}: missing branch row")))?;
             Ok((Input::Voltage { branch }, index))
         }
-        'i' => {
+        Some(crate::devices::linear::SourceKind::Current) => {
             let row = |terminal: usize| {
                 device
                     .terminals()
@@ -205,7 +205,8 @@ pub(super) fn run(
     context: &AnalysisContext,
     card: &TransferRequest,
 ) -> SpiceResult<Plot> {
-    let settings = request.dc_settings();
+    let mut settings = request.dc_settings().clone();
+    settings.newton.retain_linearization = true;
     circuit.finalize()?;
     let (input, input_device) = resolve_input(circuit, &card.input)?;
     let bound = output_probe::bind(circuit, &card.output, Card::Tf)?;
@@ -218,7 +219,7 @@ pub(super) fn run(
     crate::analysis::bias::OperatingPointStart::resolve(circuit, request)?.solve(
         &circuit.prepare_run(),
         &context.model_context(),
-        settings,
+        &settings,
     )?;
 
     // tfanal.c solves with the LU factors CKTop's last NIiter pass left in
