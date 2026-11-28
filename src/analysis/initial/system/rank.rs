@@ -1147,7 +1147,9 @@ mod storage_tests {
                 }
             }
         }
-        println!("rank arithmetic digest={digest:016x}");
+        // Matched against the original ordered-tree implementation on all
+        // 544 systems, including exact pivot sequence and work consumption.
+        assert_eq!(digest, 0xcefc_b985_a5d8_faee);
     }
 
     #[test]
