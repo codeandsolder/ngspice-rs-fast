@@ -254,3 +254,100 @@ fn lundin(length: Real, csect: Real) -> Real {
         2. * (num / den + kk) / (std::f64::consts::PI * x)
     }
 }
+
+/// Immutable contextual storage coefficient in aggregate physical coordinates.
+/// The same recipe is consumed by charge/flux and any derived conductance.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::devices) struct ContextualStorage {
+    base: Real,
+    temperature: Option<Real>,
+    nominal: Option<Real>,
+    coefficients: Box<[Real]>,
+    nominal_coupling: bool,
+    location: crate::primitives::SourceLoc,
+}
+
+impl ContextualStorage {
+    pub(in crate::devices) fn new(
+        base: Real,
+        temperature: Option<Real>,
+        nominal: Option<Real>,
+        coefficients: Vec<Real>,
+        nominal_coupling: bool,
+        location: crate::primitives::SourceLoc,
+    ) -> crate::primitives::SpiceResult<Self> {
+        use crate::devices::schema::temperature_kelvin;
+        use crate::primitives::SpiceError;
+        for value in [temperature, nominal].into_iter().flatten() {
+            temperature_kelvin(value, &location)?;
+        }
+        if !base.is_finite() || coefficients.iter().any(|value| !value.is_finite()) {
+            return Err(SpiceError::parse(
+                location,
+                "nonfinite storage temperature recipe",
+            ));
+        }
+        Ok(Self {
+            base,
+            temperature,
+            nominal,
+            coefficients: coefficients.into_boxed_slice(),
+            nominal_coupling,
+            location,
+        })
+    }
+
+    pub(in crate::devices) fn temperature(&self, context: &crate::devices::ModelContext) -> Real {
+        self.temperature.unwrap_or(context.temperature)
+    }
+
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "separately rounded polynomial preserves exact zero crossings"
+    )]
+    pub(in crate::devices) fn effective(
+        &self,
+        context: &crate::devices::ModelContext,
+    ) -> crate::primitives::SpiceResult<Real> {
+        use crate::devices::schema::temperature_kelvin;
+        use crate::primitives::SpiceError;
+        let temperature = TemperaturePoint::resolve(
+            self.temperature
+                .map(|value| temperature_kelvin(value, &self.location))
+                .transpose()?,
+            None,
+            temperature_kelvin(context.temperature, &self.location)?,
+        );
+        let nominal = temperature_kelvin(
+            self.nominal.unwrap_or(context.nominal_temperature),
+            &self.location,
+        )?;
+        let difference = temperature.difference(nominal);
+        let factor = self
+            .coefficients
+            .iter()
+            .rev()
+            .fold(0., |sum: Real, coefficient| sum * difference + *coefficient)
+            * difference
+            + 1.;
+        let effective = self.base * factor;
+        if !effective.is_finite()
+            || !factor.is_finite()
+            || (self.base != 0. && factor != 0. && effective == 0.)
+        {
+            return Err(SpiceError::parse(
+                self.location.clone(),
+                "invalid contextual storage coefficient",
+            ));
+        }
+        Ok(effective)
+    }
+
+    pub(in crate::devices) fn coupling_base(&self, effective: Real) -> Real {
+        if self.nominal_coupling {
+            self.base
+        } else {
+            effective
+        }
+    }
+}

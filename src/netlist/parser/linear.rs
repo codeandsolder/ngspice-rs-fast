@@ -243,6 +243,27 @@ fn passive_assignment(input: &mut Input<'_>) -> Result<ParameterAssignment> {
     // INPgetTok() gobbles '=': both tc1=0.01 and tc1 0.01 are legal.
     cut_err(|input: &mut Input<'_>| {
         opt(equals).parse_next(input)?;
+        if name == "pn_storage_tc" {
+            let vector = super::vector::numeric(input, usize::MAX, value)?;
+            let entries = vector
+                .values
+                .into_iter()
+                .map(|value| {
+                    let source = super::vector::positioned(value.token());
+                    let expression = match value {
+                        super::syntax::Value::Literal(_) => None,
+                        super::syntax::Value::Expression(_, expression) => Some(expression),
+                    };
+                    crate::netlist::ast::NumericVectorEntry { source, expression }
+                })
+                .collect();
+            return Ok(ParameterAssignment {
+                name: name.clone(),
+                value: vector.text,
+                kind: ParameterKind::NumericVector(entries),
+                location: token.location.clone(),
+            });
+        }
         if (name == primary_name(designator) || name == "charge")
             && let Some(mut parameter) = behavioural_passive_value(input, &name, name == "charge")?
         {

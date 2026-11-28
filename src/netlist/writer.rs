@@ -1492,7 +1492,26 @@ fn passive_parameters(device: &DeviceInstance, parts: &mut Card<'_>) -> SpiceRes
             .first()
             .is_some_and(|parameter| parameter.name == primary);
     for (index, parameter) in device.parameters.iter().enumerate() {
-        if matches!(parameter.kind, ParameterKind::Behavioural(_)) {
+        if let ParameterKind::NumericVector(entries) = &parameter.kind {
+            if parameter.name != "pn_storage_tc"
+                || !matches!(designator, 'c' | 'l')
+                || entries.is_empty()
+            {
+                return Err(refuse(
+                    "invalid physical storage coefficient vector",
+                    Some(&parameter.location),
+                ));
+            }
+            parts.push(' ')?;
+            parts.push_str("pn_storage_tc=(")?;
+            for (index, entry) in entries.iter().enumerate() {
+                if index != 0 {
+                    parts.push(' ')?;
+                }
+                append_vector_entry(parts, entry)?;
+            }
+            parts.push(')')?;
+        } else if matches!(parameter.kind, ParameterKind::Behavioural(_)) {
             if parameter.name != primary && !(designator == 'c' && parameter.name == "charge") {
                 return Err(refuse(
                     "invalid behavioural passive setter",

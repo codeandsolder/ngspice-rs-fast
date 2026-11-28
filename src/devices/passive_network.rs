@@ -20,6 +20,7 @@ use crate::devices::{
     Capacitor, Circuit, Device, IndependentSource, Inductor, Resistor, ResistorNoise, StorageKind,
     ThermalConductance,
     elaboration::{ElaborationSize, reserve},
+    passive::physics::ContextualStorage,
     passive_bias::PassiveInitialization,
     rlc::REACTIVE_STATE_COUNT,
     sources::{SourceExcitation, SourceInputs},
@@ -76,6 +77,7 @@ enum Role {
     ParallelCapacitance,
     StorageDamping,
     TerminalDamping,
+    ContextualTerminalDamping,
 }
 
 impl Role {
@@ -91,6 +93,7 @@ impl Role {
             Self::ParallelCapacitance => format!("c{primary}#parallel"),
             Self::StorageDamping => format!("r{primary}#storage_damping"),
             Self::TerminalDamping => format!("r{primary}#terminal_damping"),
+            Self::ContextualTerminalDamping => format!("r{primary}#storage_derived_damping"),
         }
     }
 }
@@ -165,6 +168,7 @@ pub struct PreparedPassiveNetwork {
     reporting: Option<CurrentReporting>,
     control: Option<CurrentReference>,
     primary_probe: bool,
+    contextual: Option<Arc<ContextualStorage>>,
 }
 
 /// Stable names for the independently observable currents of a bound network.
@@ -280,6 +284,7 @@ impl PreparedPassiveNetwork {
             reporting: None,
             control: None,
             primary_probe: false,
+            contextual: None,
         }))
     }
 
@@ -516,14 +521,39 @@ impl PreparedPassiveNetwork {
                     name,
                     terminals,
                     damping,
+                    derived_storage: (edge.role == Role::ContextualTerminalDamping)
+                        .then(|| self.contextual.clone())
+                        .flatten(),
                     noise: self.resistor_noise(edge.role, damping.noisy),
                     excluded_bias: excluded,
                 }),
                 Element::Storage(StorageKind::Capacitor, c) => {
-                    Box::new(Capacitor::new(name, terminals, c, None)?)
+                    let device = Capacitor::new(name, terminals, c, None)?;
+                    Box::new(
+                        if let Some(recipe) = self
+                            .contextual
+                            .as_ref()
+                            .filter(|_| edge.role == Role::Primary)
+                        {
+                            device.with_contextual_storage(Arc::clone(recipe))
+                        } else {
+                            device
+                        },
+                    )
                 }
                 Element::Storage(StorageKind::Inductor, l) => {
-                    Box::new(Inductor::new(name, terminals, l, None)?)
+                    let device = Inductor::new(name, terminals, l, None)?;
+                    Box::new(
+                        if let Some(recipe) = self
+                            .contextual
+                            .as_ref()
+                            .filter(|_| edge.role == Role::Primary)
+                        {
+                            device.with_contextual_storage(Arc::clone(recipe))
+                        } else {
+                            device
+                        },
+                    )
                 }
             };
             if edge.role == Role::Primary
@@ -789,10 +819,34 @@ impl NetworkPlan {
         // All network-specific setters are finite scalar coefficients after
         // occurrence expansion. Duplicate setters keep normal last-wins order.
         let mut values = std::collections::BTreeMap::new();
+        let mut temperature_coefficients = None;
         let mut ordinary = instance.clone();
         ordinary.parameters.clear();
         for p in &instance.parameters {
-            if crate::netlist::network_parameter(instance.designator, &p.name) {
+            if p.name == "pn_storage_tc" && matches!(instance.designator, 'c' | 'l') {
+                let ParameterKind::NumericVector(entries) = &p.kind else {
+                    return Err(invalid(
+                        "physical storage temperature coefficients require a numeric vector",
+                    ));
+                };
+                if entries.is_empty() {
+                    return Err(invalid("empty storage temperature coefficient vector"));
+                }
+                let mut coefficients = Vec::new();
+                reserve(&mut coefficients, entries.len(), Some(&p.location))?;
+                for entry in entries {
+                    let value = crate::primitives::parse_spice_number(&entry.source.text)
+                        .filter(|value| value.is_finite() && entry.expression.is_none())
+                        .ok_or_else(|| {
+                            SpiceError::parse(
+                                entry.source.location.clone(),
+                                "unresolved storage temperature coefficient",
+                            )
+                        })?;
+                    coefficients.push(value);
+                }
+                temperature_coefficients = Some(coefficients);
+            } else if crate::netlist::network_parameter(instance.designator, &p.name) {
                 if p.kind != ParameterKind::Scalar {
                     return Err(SpiceError::parse(
                         p.location.clone(),
@@ -825,12 +879,13 @@ impl NetworkPlan {
             return Ok(Some(Self::Voltage(Box::new(network))));
         }
 
-        Self::storage(&ordinary, &values).map(Some)
+        Self::storage(&ordinary, &values, temperature_coefficients).map(Some)
     }
 
     fn storage(
         instance: &crate::netlist::ast::DeviceInstance,
         values: &std::collections::BTreeMap<&str, Real>,
+        temperature_coefficients: Option<Vec<Real>>,
     ) -> SpiceResult<Self> {
         use crate::netlist::ast::ParameterKind;
 
@@ -883,19 +938,75 @@ impl NetworkPlan {
             storage_damping: Self::damping(values, "storage")?,
             terminal_damping: Self::damping(values, "terminal")?,
         };
+        let flag = |key| match get(key).unwrap_or(0.) {
+            0. => Ok(false),
+            1. => Ok(true),
+            _ => Err(SpiceError::circuit(format!("{key} must be 0 or 1"))),
+        };
+        let nominal_coupling = flag("pn_coupling_nominal")?;
+        if kind == StorageKind::Capacitor && nominal_coupling {
+            return Err(invalid("nominal coupling base requires an inductor"));
+        }
+        let nominal = get("pn_storage_tnom");
+        let positive_storage_damping = AnalysisDamping {
+            steady: ConductanceLaw {
+                constant: zero("pn_gterminal_positive_storage_dc"),
+                gmin_scale: 0.,
+            },
+            small_signal: ConductanceLaw {
+                constant: zero("pn_gterminal_positive_storage_ac"),
+                gmin_scale: 0.,
+            },
+            transient: ConductanceLaw {
+                constant: zero("pn_gterminal_positive_storage_tran"),
+                gmin_scale: 0.,
+            },
+            noisy: false,
+        };
+        let derived = positive_storage_damping != AnalysisDamping::default();
+        let contextual = if temperature_coefficients.is_some()
+            || nominal.is_some()
+            || nominal_coupling
+            || derived
+        {
+            let base = if multiplicity == 0. {
+                0.
+            } else {
+                match Element::Storage(kind, value).scaled(multiplicity)? {
+                    Element::Storage(_, value) => value,
+                    _ => return Err(invalid("invalid contextual storage base")),
+                }
+            };
+            Some(Arc::new(ContextualStorage::new(
+                base,
+                temperature,
+                nominal,
+                temperature_coefficients.unwrap_or_default(),
+                nominal_coupling,
+                instance.location.clone(),
+            )?))
+        } else {
+            None
+        };
         let initialization = Self::initialization(kind, initial, multiplicity, values)?;
+        let noiseless = flag("pn_noiseless")?;
+        let parallel_magnitude = flag("pn_rparallel_noise_abs")?;
         let Some(mut network) = PreparedPassiveNetwork::prepare(&coefficients, initialization)?
         else {
             report::parse(values, 0.)?;
             report::parse_control(values)?;
             return Ok(Self::Storage(None));
         };
-        let flag = |key| match get(key).unwrap_or(0.) {
-            0. => Ok(false),
-            1. => Ok(true),
-            _ => Err(SpiceError::circuit(format!("{key} must be 0 or 1"))),
-        };
-        network = network.with_noise_policy(flag("pn_noiseless")?, flag("pn_rparallel_noise_abs")?);
+        network.contextual = contextual;
+        if derived {
+            reserve(&mut network.edges, 1, Some(&instance.location))?;
+            network.edges.push(Edge {
+                role: Role::ContextualTerminalDamping,
+                element: Element::Damping(positive_storage_damping),
+                nodes: [0, 1],
+            });
+        }
+        network = network.with_noise_policy(noiseless, parallel_magnitude);
         if let Some(voltage) = get("pn_parallel_ic") {
             network = network.with_parallel_initial_voltage(voltage)?;
         }

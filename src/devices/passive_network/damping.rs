@@ -108,11 +108,25 @@ pub(super) struct DampingShunt {
     pub(super) name: String,
     pub(super) terminals: [NodeId; 2],
     pub(super) damping: AnalysisDamping,
+    pub(super) derived_storage: Option<Arc<crate::devices::passive::physics::ContextualStorage>>,
     pub(super) noise: ResistorNoise,
     pub(super) excluded_bias: Option<Arc<PassiveInitialization>>,
 }
 
 impl DampingShunt {
+    fn evaluate(&self, law: ConductanceLaw, context: &ModelContext) -> SpiceResult<Real> {
+        let coefficient = law.evaluate(context.configured_gmin)?;
+        let conductance = if let Some(storage) = &self.derived_storage {
+            coefficient * storage.effective(context)?.max(0.)
+        } else {
+            coefficient
+        };
+        if !conductance.is_finite() {
+            return Err(SpiceError::circuit("invalid storage-derived conductance"));
+        }
+        Ok(conductance)
+    }
+
     pub(super) fn resistive(
         name: String,
         terminals: [NodeId; 2],
@@ -135,6 +149,7 @@ impl DampingShunt {
                 noisy: noise.noisy,
             },
             noise,
+            derived_storage: None,
         }
     }
 }
@@ -169,18 +184,19 @@ impl Device for DampingShunt {
         {
             0.
         } else {
-            self.damping
-                .stamp_law(context.mode, context.analysis_kind)
-                .evaluate(context.configured_gmin)?
+            self.evaluate(
+                self.damping.stamp_law(context.mode, context.analysis_kind),
+                &context.model_context(),
+            )?
         };
         stamp_conductance(self.terminals, g, context)
     }
 
     fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        let g = self
-            .damping
-            .law(context.model_context.analysis_kind)
-            .evaluate(context.model_context.configured_gmin)?;
+        let g = self.evaluate(
+            self.damping.law(context.model_context.analysis_kind),
+            context.model_context,
+        )?;
         assemble_conductance(self.terminals, g, context)
     }
 
@@ -189,10 +205,7 @@ impl Device for DampingShunt {
         context: &mut LinearContext<'_>,
         _bias: &Vector,
     ) -> SpiceResult<()> {
-        let g = self
-            .damping
-            .small_signal
-            .evaluate(context.model_context.configured_gmin)?;
+        let g = self.evaluate(self.damping.small_signal, context.model_context)?;
         assemble_conductance(self.terminals, g, context)
     }
 
@@ -211,9 +224,7 @@ impl Device for DampingShunt {
     ) -> SpiceResult<Option<Real>> {
         match keyword {
             "g" | "conductance" => self
-                .damping
-                .law(context.analysis_kind)
-                .evaluate(context.configured_gmin)
+                .evaluate(self.damping.law(context.analysis_kind), context)
                 .map(Some),
             _ => Ok(None),
         }
@@ -228,10 +239,7 @@ impl Device for DampingShunt {
         context: &NoiseContext<'_>,
         sources: &mut Vec<NoiseSource>,
     ) -> SpiceResult<DeviceNoise<'_>> {
-        let g = self
-            .damping
-            .small_signal
-            .evaluate(context.model_context.configured_gmin)?;
+        let g = self.evaluate(self.damping.small_signal, context.model_context)?;
         resistor_noise(self.terminals, g, &self.noise, None, context, None, sources)
     }
 }
