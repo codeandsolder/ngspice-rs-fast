@@ -345,7 +345,7 @@ fn malformed_or_nonfinite_contextual_recipes_fail_even_when_removed() {
         "c1 p 0 1u pn_storage_tc=(1,)",
         "c1 p 0 1u pn_storage_tc=.01 pn_storage_tnom=-300",
         "c1 p 0 1u m=0 pn_storage_tc=.01 pn_storage_tnom=-300",
-        "c1 p 0 1u pn_storage_tc=1e300 1e300 1e300",
+        "c1 p 0 1u pn_storage_tc=1e308 1e308 1e308",
         "c1 p 0 1u pn_coupling_nominal=1",
         "l1 p 0 1m m=0 pn_coupling_nominal=2",
     ] {
