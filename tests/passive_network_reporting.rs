@@ -471,3 +471,63 @@ fn series_inductor_shunt_noise_uses_frequency_domain_multiplicity() -> SpiceResu
     }
     Ok(())
 }
+
+#[test]
+fn conditional_voltage_capacitance_depends_on_expanded_electrical_consumers() -> SpiceResult<()> {
+    let mut deck = String::from("conditional physical source capacitance\n");
+    for index in 1..=7 {
+        writeln!(
+            deck,
+            "v{index} out{index} 0 ac 1 pn_rseries=2 pn_cconditional=1u pn_control=1"
+        )
+        .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
+        writeln!(deck, "r{index} out{index} 0 3")
+            .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
+    }
+    deck.push_str(".func probe(x) {i(x)}\n.func nested(y) {probe(y)}\n.func direct() {i(v2)}\n.func unused() {i(v3)}\nb1 b1out 0 v=nested(v1)\nb2 b2out 0 v=direct()\n.save i(v3)\nf1 0 f1out v4 1\nrf1 f1out 0 1\nh1 h1out 0 v5 1\nfpoly 0 fpolyout poly(2) v6 v7 0 1 1\nrfpoly fpolyout 0 1\n.end\n");
+    let mut circuit = circuit(&deck)?;
+    let ac = run(
+        &mut circuit,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    let sensed = Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71);
+    let unsensed = Complex::new(0.596_608_345_906_663_5, -0.044_983_209_517_697_58);
+    for index in 1..=7 {
+        let expected = if index == 3 { unsensed } else { sensed };
+        let name = format!("v(out{index})");
+        let actual = ac.value(&name, 0).ok_or_else(|| {
+            ngspice_rs::primitives::SpiceError::circuit(format!("missing {name}"))
+        })?;
+        close(actual, expected, 1e-10, 1e-12);
+    }
+    Ok(())
+}
+
+#[test]
+fn conditional_voltage_capacitance_is_selected_per_subcircuit_occurrence() -> SpiceResult<()> {
+    let mut circuit = circuit(
+        "conditional source occurrences\nx1 a cell\nx2 b cell\n.subckt cell p\nv1 p 0 ac 1 pn_rseries=2 pn_cconditional=1u pn_control=1\nr1 p 0 3\n.ends\nb1 sense 0 v=i(v.x1.v1)\n.save i(v.x2.v1)\n.end\n",
+    )?;
+    let ac = run(
+        &mut circuit,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    for (name, expected) in [
+        (
+            "v(a)",
+            Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71),
+        ),
+        (
+            "v(b)",
+            Complex::new(0.596_608_345_906_663_5, -0.044_983_209_517_697_58),
+        ),
+    ] {
+        let actual = ac.value(name, 0).ok_or_else(|| {
+            ngspice_rs::primitives::SpiceError::circuit(format!("missing {name}"))
+        })?;
+        close(actual, expected, 1e-10, 1e-12);
+    }
+    Ok(())
+}

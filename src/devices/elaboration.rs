@@ -143,8 +143,11 @@ impl PlannedExpansion {
         instance: &DeviceInstance,
         models: &ModelResolver<'_>,
         context: &ModelContext,
+        electrically_referenced: bool,
     ) -> SpiceResult<Option<Self>> {
-        let kind = if let Some(plan) = super::passive_network::NetworkPlan::prepare(instance)? {
+        let kind = if let Some(plan) =
+            super::passive_network::NetworkPlan::prepare(instance, electrically_referenced)?
+        {
             ExpansionKind::Network(plan)
         } else {
             match instance.designator.to_ascii_lowercase() {
@@ -206,13 +209,23 @@ impl<'a> PlannedBatch<'a> {
         nodes: &NodeTable,
         existing: ElaborationSize,
         limits: ElaborationLimits,
+        electrical_controls: &BTreeSet<String>,
     ) -> SpiceResult<Self> {
         let mut known = existing;
         let mut expansions = Vec::new();
         let mut generated_terminals = BTreeSet::new();
         for (ordinal, instance) in instances.iter().enumerate() {
             let at = Some(&instance.location);
-            let Some(plan) = PlannedExpansion::prepare(ordinal, instance, models, context)? else {
+            let Some(plan) = PlannedExpansion::prepare(
+                ordinal,
+                instance,
+                models,
+                context,
+                instance.designator == 'v'
+                    && !electrical_controls.is_empty()
+                    && electrical_controls.contains(&instance.name.to_ascii_lowercase()),
+            )?
+            else {
                 known = known.checked_add(ElaborationSize::new(1, 0, 0), at)?;
                 limits.check(known, at)?;
                 continue;

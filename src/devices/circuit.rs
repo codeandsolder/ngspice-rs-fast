@@ -4960,11 +4960,19 @@ impl Circuit {
             &absent,
         )?;
         let aliases = instances.probe_aliases;
+        let electrical_controls = instances.electrical_controls;
         let instances = instances.instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
-        let mut plan =
-            PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
+        let mut plan = PlannedBatch::prepare(
+            instances,
+            models,
+            context,
+            &self.nodes,
+            existing,
+            limits,
+            &electrical_controls,
+        )?;
         plan.resistors = (!resistors.is_empty()).then_some(resistors);
         plan.deck_nodes.extend(absent.terminals.iter().cloned());
         let devices = &mut self.devices;

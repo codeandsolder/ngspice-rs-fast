@@ -89,6 +89,7 @@ struct CurrentTargets {
     probes: BTreeSet<usize>,
     zero: BTreeSet<String>,
     instantaneous: BTreeSet<String>,
+    electrical_controls: BTreeSet<String>,
 }
 
 /// A genuine voltage-imposing or winding branch, not merely an internal
@@ -150,10 +151,28 @@ fn measured_targets(
             }
         });
     }
+    // Resolve physical topology from actual circuit consumers, not output
+    // selections or unused function declarations. Behavioural expressions
+    // here have already undergone lexical and occurrence expansion.
+    let mut targets = CurrentTargets {
+        electrical_controls: referenced
+            .keys()
+            .cloned()
+            .chain(
+                instances
+                    .iter()
+                    .flat_map(|instance| instance.parameters.iter())
+                    .filter(|parameter| {
+                        parameter.name == "control" && parameter.kind == ParameterKind::Instance
+                    })
+                    .map(|parameter| parameter.value.to_ascii_lowercase()),
+            )
+            .collect(),
+        ..CurrentTargets::default()
+    };
     if referenced.is_empty() {
-        return Ok(CurrentTargets::default());
+        return Ok(targets);
     }
-    let mut targets = CurrentTargets::default();
     for name in referenced.keys() {
         if absent.names.contains(name) {
             targets.zero.insert(name.clone());
@@ -207,6 +226,7 @@ fn measured_targets(
 pub(in crate::devices) struct ExpandedInstances<'a> {
     pub instances: Cow<'a, [DeviceInstance]>,
     pub probe_aliases: Vec<String>,
+    pub electrical_controls: BTreeSet<String>,
 }
 
 pub(in crate::devices) fn expand<'a>(
@@ -223,11 +243,13 @@ pub(in crate::devices) fn expand<'a>(
         probes: measured,
         zero,
         instantaneous,
+        electrical_controls,
     } = measured_targets(instances, models, resistors, existing, absent)?;
     if count == 0 && measured.is_empty() && zero.is_empty() {
         return Ok(ExpandedInstances {
             instances: Cow::Borrowed(instances),
             probe_aliases: Vec::new(),
+            electrical_controls,
         });
     }
     // Selection may remove wrappers, zero-copy reads become constants, and
@@ -308,6 +330,7 @@ pub(in crate::devices) fn expand<'a>(
     Ok(ExpandedInstances {
         instances: Cow::Owned(expansion.output),
         probe_aliases,
+        electrical_controls,
     })
 }
 

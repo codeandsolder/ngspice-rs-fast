@@ -762,13 +762,14 @@ impl NetworkPlan {
             return Ok(false);
         }
         Ok(matches!(
-            Self::prepare(instance)?,
+            Self::prepare(instance, false)?,
             Some(Self::Storage(None))
         ))
     }
 
     pub(super) fn prepare(
         instance: &crate::netlist::ast::DeviceInstance,
+        electrically_referenced: bool,
     ) -> SpiceResult<Option<Self>> {
         use crate::netlist::ast::ParameterKind;
 
@@ -807,11 +808,20 @@ impl NetworkPlan {
         let get = |key| values.get(key).copied();
         let zero = |key| get(key).unwrap_or(0.);
         if instance.designator == 'v' {
+            // An optional source-neutral capacitance is placed once, before
+            // resource accounting. The independent current reporting/control
+            // policy does not determine its physical location.
+            let conditional = zero("pn_cconditional");
+            let (output_extra, series_extra) = if electrically_referenced {
+                (0., conditional)
+            } else {
+                (conditional, 0.)
+            };
             let mut network = PreparedVoltageNetwork::prepare(
                 VoltageNetworkCoefficients {
                     series_resistance: zero("pn_rseries"),
-                    parallel_capacitance: zero("pn_cparallel"),
-                    series_shunt_capacitance: zero("pn_cseries_shunt"),
+                    parallel_capacitance: zero("pn_cparallel") + output_extra,
+                    series_shunt_capacitance: zero("pn_cseries_shunt") + series_extra,
                     temperature: get("pn_temp"),
                 },
                 super::factory::voltage_network_inputs(&ordinary)?,

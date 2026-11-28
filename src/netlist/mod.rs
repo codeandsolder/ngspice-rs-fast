@@ -123,7 +123,7 @@ pub(crate) fn network_parameter(designator: char, name: &str) -> bool {
         ),
         'v' => matches!(
             name,
-            "pn_rseries" | "pn_cparallel" | "pn_cseries_shunt" | "pn_temp"
+            "pn_rseries" | "pn_cparallel" | "pn_cseries_shunt" | "pn_cconditional" | "pn_temp"
         ),
         _ => false,
     }
