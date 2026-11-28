@@ -38,9 +38,12 @@
 )]
 use super::bias::LoadBias;
 use super::{
-    BSIM4polyDepletion, Charge_q, DEXP, EPS0, EPSSI, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP,
-    MIN_EXP, MM, Model, SaturationRoot, SizeParam, exp, log, smooth_drain, smooth_positive, sqrt,
+    CHARGE, Charge_q, DEXP, EPS0, EPSSI, EXP_THRESHOLD, Instance, LoadCkt, MAX_EXP, MIN_EXP, MM,
+    Model, SaturationRoot, SizeParam, exp, log, smooth_drain, smooth_positive, sqrt,
 };
+
+use crate::devices::bsim_physics::poly_depletion;
+use crate::primitives::SpiceResult;
 
 /// Body potential, threshold, effective gate bias and their independent derivatives.
 pub(super) struct Electrostatics {
@@ -100,7 +103,7 @@ pub(super) fn electrostatics(
     pParam: &SizeParam,
     ckt: &dyn LoadCkt,
     bias: &LoadBias,
-) -> Electrostatics {
+) -> SpiceResult<Electrostatics> {
     let &LoadBias {
         vbd,
         vbs,
@@ -380,8 +383,8 @@ pub(super) fn electrostatics(
     } else {
         T1 = model.epsrgate * EPS0;
     }
-    (vgs_eff, dvgs_eff_dvg) = BSIM4polyDepletion(T0, pParam.ngate, T1, model.coxe, vgs);
-    (vgd_eff, dvgd_eff_dvg) = BSIM4polyDepletion(T0, pParam.ngate, T1, model.coxe, vgd);
+    (vgs_eff, dvgs_eff_dvg) = poly_depletion(vgs, T0, pParam.ngate, T1, model.coxe, CHARGE)?;
+    (vgd_eff, dvgd_eff_dvg) = poly_depletion(vgd, T0, pParam.ngate, T1, model.coxe, CHARGE)?;
     if here.mode > 0 {
         Vgs_eff = vgs_eff;
         dVgs_eff_dVg = dvgs_eff_dvg;
@@ -447,7 +450,7 @@ pub(super) fn electrostatics(
     dVgsteff_dVg = (-Vgsteff).mul_add(dT9_dVg, dT10_dVg) / T9;
     dVgsteff_dVd = (-Vgsteff).mul_add(dT9_dVd, dT10_dVd) / T9;
     dVgsteff_dVb = (-Vgsteff).mul_add(dT9_dVb, dT10_dVb) / T9;
-    Electrostatics {
+    Ok(Electrostatics {
         Leff,
         Lpe_Vb,
         Phis,
@@ -480,7 +483,7 @@ pub(super) fn electrostatics(
         n,
         sqrtPhis,
         toxe,
-    }
+    })
 }
 
 /// Channel mobility, saturation, current, substrate current and series resistances.

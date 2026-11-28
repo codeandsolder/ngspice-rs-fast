@@ -318,7 +318,8 @@ impl PhysicalFixture {
         };
         let bias = super::bias::select(&self.model, &instance, &mut trace);
         let electro =
-            super::channel::electrostatics(&self.model, &mut instance, &self.size, &trace, &bias);
+            super::channel::electrostatics(&self.model, &mut instance, &self.size, &trace, &bias)
+                .unwrap();
         let transport =
             super::channel::transport(&self.model, &mut instance, &self.size, &bias, &electro);
         let _ = super::charge::intrinsic(

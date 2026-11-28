@@ -21,7 +21,7 @@
 use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
-use crate::devices::bsim_physics::bsim3_junction;
+use crate::devices::bsim_physics::{bsim3_junction, poly_depletion};
 use crate::primitives::{Real, SpiceResult};
 
 const EXP_THRESHOLD: Real = 34.0;
@@ -383,25 +383,8 @@ impl DcModel<'_> {
             )
         };
 
-        // Poly-gate depletion.
-        let t0 = p.vfb + phi;
         let (vgs_eff, dvgseff_dvg) =
-            if p.binned.ngate > 1.0e18 && p.binned.ngate < 1.0e25 && vgs > t0 {
-                let t1 = 1.0e6 * CHARGE_Q * EPS_SI * p.binned.ngate / (cox * cox);
-                let t4 = (1.0 + 2.0 * (vgs - t0) / t1).sqrt();
-                // Rationalize both subtractive square-root differences.
-                let t2 = 2.0 * (vgs - t0) / (t4 + 1.0);
-                let t3 = 0.5 * t2 * t2 / t1;
-                let t7 = 1.07 - t3;
-                let t6 = t7.mul_add(t7, 0.224).sqrt();
-                let t5 = 2.24 * t3 / (2.24 - t7 + t6);
-                (
-                    vgs - t5,
-                    (0.5 * t2 / (t1 * t4)).mul_add(-(1.0 + t7 / t6), 1.0),
-                )
-            } else {
-                (vgs, 1.0)
-            };
+            poly_depletion(vgs, p.vfb + phi, p.binned.ngate, EPS_SI, cox, CHARGE_Q)?;
         let vgst = vgs_eff - vth;
 
         // Effective gate overdrive (Vgsteff), with C's three regimes.

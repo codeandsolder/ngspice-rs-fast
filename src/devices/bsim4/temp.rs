@@ -35,6 +35,7 @@
 use super::check::check_model;
 use super::fields::{Instance, Model, SizeParam};
 use super::geo::{pa_eff_geo, parallel_resistance, rdseff_geo};
+use crate::devices::bsim_physics::poly_depletion;
 use crate::primitives::numeric::{scale_power, split_power};
 use crate::primitives::{SpiceError, SpiceResult};
 
@@ -2294,7 +2295,7 @@ pub(super) fn temperature_instance(
             tmp2 = h.vfb + phieot;
             vddeot = f64::from(m.r#type) * m.vddeot;
             T0 = m.epsrgate * EPS0;
-            Vgs_eff = super::load::BSIM4polyDepletion(tmp2, p.ngate, T0, m.coxe, vddeot).0;
+            Vgs_eff = poly_depletion(vddeot, tmp2, p.ngate, T0, m.coxe, CHARGE)?.0;
             V0 = vbieot - phieot;
             lt1 = m.factor1 * p.sqrtXdep0;
             ltw = lt1;
