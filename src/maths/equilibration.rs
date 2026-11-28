@@ -389,14 +389,14 @@ trait ResidualScalar: ScaleValue {
         real: &crate::primitives::ExactSum,
         imaginary: &crate::primitives::ExactSum,
     ) -> Self;
-    fn product(
+    fn product<const MEASURE: bool>(
         left: Self,
         right: Self,
         real: &mut crate::primitives::ExactSum,
         imaginary: &mut crate::primitives::ExactSum,
         denominator: &mut crate::primitives::ExactSum,
     );
-    fn rhs(
+    fn rhs<const MEASURE: bool>(
         rhs: Self,
         real: &mut crate::primitives::ExactSum,
         imaginary: &mut crate::primitives::ExactSum,
@@ -412,7 +412,7 @@ impl ResidualScalar for f64 {
         -real.rounded_sum()
     }
 
-    fn product(
+    fn product<const MEASURE: bool>(
         left: Self,
         right: Self,
         real: &mut crate::primitives::ExactSum,
@@ -420,17 +420,21 @@ impl ResidualScalar for f64 {
         denominator: &mut crate::primitives::ExactSum,
     ) {
         real.add_product(left, right);
-        denominator.add_product(left.abs(), right.abs());
+        if MEASURE {
+            denominator.add_product(left.abs(), right.abs());
+        }
     }
 
-    fn rhs(
+    fn rhs<const MEASURE: bool>(
         rhs: Self,
         real: &mut crate::primitives::ExactSum,
         _imaginary: &mut crate::primitives::ExactSum,
         denominator: &mut crate::primitives::ExactSum,
     ) {
         real.add_product(-rhs, 1.);
-        denominator.add_product(rhs.abs(), 1.);
+        if MEASURE {
+            denominator.add_product(rhs.abs(), 1.);
+        }
     }
 }
 
@@ -442,7 +446,7 @@ impl ResidualScalar for Complex {
         Self::new(-real.rounded_sum(), -imaginary.rounded_sum())
     }
 
-    fn product(
+    fn product<const MEASURE: bool>(
         left: Self,
         right: Self,
         real: &mut crate::primitives::ExactSum,
@@ -453,17 +457,19 @@ impl ResidualScalar for Complex {
         real.add_product(-left.im, right.im);
         imaginary.add_product(left.re, right.im);
         imaginary.add_product(left.im, right.re);
-        for (a, b) in [
-            (left.re, right.re),
-            (left.im, right.im),
-            (left.re, right.im),
-            (left.im, right.re),
-        ] {
-            denominator.add_product(a.abs(), b.abs());
+        if MEASURE {
+            for (a, b) in [
+                (left.re, right.re),
+                (left.im, right.im),
+                (left.re, right.im),
+                (left.im, right.re),
+            ] {
+                denominator.add_product(a.abs(), b.abs());
+            }
         }
     }
 
-    fn rhs(
+    fn rhs<const MEASURE: bool>(
         rhs: Self,
         real: &mut crate::primitives::ExactSum,
         imaginary: &mut crate::primitives::ExactSum,
@@ -471,8 +477,10 @@ impl ResidualScalar for Complex {
     ) {
         real.add_product(-rhs.re, 1.);
         imaginary.add_product(-rhs.im, 1.);
-        denominator.add_product(rhs.re.abs(), 1.);
-        denominator.add_product(rhs.im.abs(), 1.);
+        if MEASURE {
+            denominator.add_product(rhs.re.abs(), 1.);
+            denominator.add_product(rhs.im.abs(), 1.);
+        }
     }
 }
 
@@ -511,7 +519,7 @@ fn original_residual_prepare<T: ResidualScalar>(
     })
 }
 
-fn original_residual_measure<T: ResidualScalar>(
+fn original_residual_measure<T: ResidualScalar, const MEASURE: bool>(
     view: &OriginalResidual<'_, T>,
     rhs: &[T],
     solution: &[T],
@@ -530,12 +538,14 @@ fn original_residual_measure<T: ResidualScalar>(
         ));
     }
     let mut rows = Vec::new();
-    rows.try_reserve_exact(view.order).map_err(|e| {
-        numerical(
-            "original operator residual",
-            format!("cannot allocate rows: {e}"),
-        )
-    })?;
+    if MEASURE {
+        rows.try_reserve_exact(view.order).map_err(|e| {
+            numerical(
+                "original operator residual",
+                format!("cannot allocate rows: {e}"),
+            )
+        })?;
+    }
     let mut cursor = 0;
     let mut maximum = 0.0_f64;
     for (row, &rhs_value) in rhs.iter().enumerate() {
@@ -552,7 +562,7 @@ fn original_residual_measure<T: ResidualScalar>(
             if actual_row != row {
                 break;
             }
-            T::product(
+            T::product::<MEASURE>(
                 value,
                 solution[actual_col],
                 &mut real,
@@ -561,15 +571,17 @@ fn original_residual_measure<T: ResidualScalar>(
             );
             cursor += 1;
         }
-        T::rhs(rhs_value, &mut real, &mut imaginary, &mut denominator);
+        T::rhs::<MEASURE>(rhs_value, &mut real, &mut imaginary, &mut denominator);
         if let Some(values) = correction.as_deref_mut() {
             values[row] = T::correction(&real, &imaginary);
         }
-        let relative = real
-            .magnitude_ratio(&denominator)
-            .max(imaginary.magnitude_ratio(&denominator));
-        maximum = maximum.max(relative);
-        rows.push(relative);
+        if MEASURE {
+            let relative = real
+                .magnitude_ratio(&denominator)
+                .max(imaginary.magnitude_ratio(&denominator));
+            maximum = maximum.max(relative);
+            rows.push(relative);
+        }
     }
     Ok(ComponentwiseBackwardError { rows, maximum })
 }
@@ -586,7 +598,9 @@ fn original_residual_many<T: ResidualScalar>(
         )
     })?;
     for &(rhs, solution) in systems {
-        reports.push(original_residual_measure(view, rhs, solution, None)?);
+        reports.push(original_residual_measure::<T, true>(
+            view, rhs, solution, None,
+        )?);
     }
     Ok(reports)
 }
@@ -608,7 +622,7 @@ impl<'a> OriginalResidual<'a, f64> {
         rhs: &[f64],
         solution: &[f64],
     ) -> SpiceResult<ComponentwiseBackwardError> {
-        original_residual_measure(self, rhs, solution, None)
+        original_residual_measure::<_, true>(self, rhs, solution, None)
     }
 
     /// Inspect one solution while rounding each exact physical correction
@@ -622,7 +636,59 @@ impl<'a> OriginalResidual<'a, f64> {
         solution: &[f64],
         correction: &mut [f64],
     ) -> SpiceResult<ComponentwiseBackwardError> {
-        original_residual_measure(self, rhs, solution, Some(correction))
+        original_residual_measure::<_, true>(self, rhs, solution, Some(correction))
+    }
+
+    /// Form only the exact residual correction, avoiding normalization
+    /// products and diagnostic report allocation when the caller uses
+    /// coordinate updates rather than backward-error ratios.
+    /// # Errors
+    /// Invalid dimensions or non-finite inputs.
+    pub(crate) fn correction_into(
+        &self,
+        rhs: &[f64],
+        solution: &[f64],
+        correction: &mut [f64],
+    ) -> SpiceResult<()> {
+        original_residual_measure::<_, false>(self, rhs, solution, Some(correction)).map(drop)
+    }
+
+    /// Form the exact residual of both solution words against the unfolded
+    /// stamps. Retain both words when rounding each correction RHS.
+    pub(super) fn wide_correction(
+        &self,
+        rhs: &[f64],
+        solution: &[crate::primitives::Wide],
+        out: &mut [crate::primitives::Wide],
+    ) -> SpiceResult<()> {
+        use crate::primitives::{ExactSum, Wide};
+        if rhs.len() != self.order
+            || solution.len() != self.order
+            || out.len() != self.order
+            || rhs.iter().any(|value| !value.is_finite())
+            || solution.iter().any(|value| !value.finite())
+        {
+            return Err(numerical(
+                "original operator residual",
+                "invalid promoted RHS/solution",
+            ));
+        }
+        let mut cursor = 0;
+        for (row, (&rhs_value, correction)) in rhs.iter().zip(out).enumerate() {
+            let mut sum = ExactSum::new();
+            sum.add_product(rhs_value, 1.);
+            while let Some(&index) = self.by_equation.get(cursor) {
+                let (r, c, value) = self.entries[index];
+                let (r, c) = if self.transposed { (c, r) } else { (r, c) };
+                if r != row {
+                    break;
+                }
+                solution[c].add_product(-value, &mut sum);
+                cursor += 1;
+            }
+            *correction = Wide::from_sum(sum);
+        }
+        Ok(())
     }
 
     /// Inspect many real RHS and solution pairs, reusing the same operator.
@@ -657,7 +723,7 @@ impl<'a> OriginalResidual<'a, Complex> {
         rhs: &[Complex],
         solution: &[Complex],
     ) -> SpiceResult<ComponentwiseBackwardError> {
-        original_residual_measure(self, rhs, solution, None)
+        original_residual_measure::<_, true>(self, rhs, solution, None)
     }
 
     /// Report exact complex-product residual quality while rounding both
@@ -670,7 +736,7 @@ impl<'a> OriginalResidual<'a, Complex> {
         solution: &[Complex],
         correction: &mut [Complex],
     ) -> SpiceResult<ComponentwiseBackwardError> {
-        original_residual_measure(self, rhs, solution, Some(correction))
+        original_residual_measure::<_, true>(self, rhs, solution, Some(correction))
     }
 
     /// Inspect many complex RHS and solution pairs with a shared traversal.
@@ -1144,6 +1210,36 @@ mod floor_log2_tests {
             complex_entries(&a, &e, 0.).unwrap(),
             [(0, 0, Complex::real(2.)), (1, 0, Complex::real(-1.))]
         );
+    }
+
+    #[test]
+    fn correction_only_matches_diagnostic_in_both_orientations() {
+        use super::*;
+        let stamps = [
+            (0, 0, 1e12),
+            (0, 0, 1e-3),
+            (0, 1, -1e12),
+            (1, 0, -2e12),
+            (1, 1, 2e12),
+            (1, 1, 1e-3),
+        ];
+        let x = [1., 1.];
+        let b = [0.002, 0.003];
+        for transpose in [false, true] {
+            let operator = OriginalResidual::real(2, &stamps, transpose).unwrap();
+            let mut diagnostic = [0.; 2];
+            let mut correction = [0.; 2];
+            operator
+                .evaluate_with_correction(&b, &x, &mut diagnostic)
+                .unwrap();
+            operator.correction_into(&b, &x, &mut correction).unwrap();
+            assert_eq!(correction, diagnostic);
+            assert!(
+                operator
+                    .correction_into(&b, &x, &mut correction[..1])
+                    .is_err()
+            );
+        }
     }
 
     #[test]
