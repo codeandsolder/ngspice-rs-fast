@@ -768,12 +768,16 @@ pub struct StampContext<'a> {
     pub nominal_temperature: Real,
     /// Junction minimum conductance (S), [`crate::devices::ModelContext::gmin`].
     pub gmin: Real,
+    /// Configured physical damping conductance basis, not temporary junction gmin.
+    pub configured_gmin: Real,
     /// Resolved circuit relative tolerance, not a Newton-local override.
     pub reltol: Real,
     /// The `hertz` frequency (Hz), [`crate::devices::ModelContext::frequency`].
     pub frequency: Real,
     /// Which analysis is loading the matrix.
     pub mode: AnalysisMode,
+    /// Enclosing analysis for phase-dependent physical coefficients.
+    pub analysis_kind: Option<crate::primitives::AnalysisKind>,
     /// Enclosing analysis for source-prepared passive bias constraints.
     pub bias_analysis: Option<crate::primitives::AnalysisKind>,
     /// Branch-current rows allocated to this device, in order (empty if none).
@@ -805,10 +809,15 @@ impl StampContext<'_> {
     /// [`crate::devices::Circuit`] has already applied).
     #[must_use = "the model context carries the analysis temperature and numerical settings"]
     pub const fn model_context(&self) -> crate::devices::ModelContext {
-        crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
-            .with_gmin(self.gmin)
-            .with_reltol(self.reltol)
-            .with_frequency(self.frequency)
+        let mut context =
+            crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
+                .with_gmin(self.configured_gmin)
+                .with_junction_gmin(self.gmin)
+                .with_reltol(self.reltol)
+                .with_frequency(self.frequency);
+        context.analysis_kind = self.analysis_kind;
+        context.bias_analysis = self.bias_analysis;
+        context
     }
 
     /// The `index`-th branch row of this device.
@@ -1039,6 +1048,12 @@ pub trait Device: fmt::Debug + std::any::Any {
     /// than perturbing a numerical pivot diagonal.
     fn has_passive_bias(&self) -> bool {
         false
+    }
+
+    /// Whether real loads require the enclosing analysis selected by the
+    /// analysis plan, independently of numerical regularization.
+    fn requires_analysis_context(&self) -> bool {
+        self.has_passive_bias()
     }
 
     /// How many device-local coordinates the device adds to the MNA

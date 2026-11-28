@@ -146,6 +146,8 @@ impl From<&AnalysisCard> for AnalysisInput {
 /// and TNOM = 27.000000` at the start of a run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnalysisContext {
+    /// Enclosing analysis for physical phase-dependent device coefficients, including UIC.
+    pub analysis_kind: Option<AnalysisKind>,
     /// Enclosing analysis selected by the analysis plan; None for UIC or native low-level loads.
     pub bias_analysis: Option<AnalysisKind>,
     /// Circuit temperature in degrees Celsius.
@@ -187,6 +189,7 @@ impl AnalysisContext {
                 .with_gmin(self.gmin)
                 .with_reltol(self.reltol)
                 .with_pivot_tolerances(self.pivot);
+        context.analysis_kind = self.analysis_kind;
         context.bias_analysis = self.bias_analysis;
         context.shunts = self.shunts;
         context.geometry_scale = self.geometry_scale;
@@ -223,6 +226,7 @@ impl Default for AnalysisContext {
             pivot: crate::maths::PivotTolerances::DEFAULT,
             rf_limits: crate::analysis::RfLimits::default(),
             candidate_model_overrides: None,
+            analysis_kind: None,
             bias_analysis: None,
         }
     }

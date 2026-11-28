@@ -126,6 +126,10 @@ pub struct ResistorNoise {
     /// C `RESnoisy`: `false` (`noisy=0`) removes the resistor from `.noise`
     /// entirely, names included. Default `true`.
     pub noisy: bool,
+    /// Use the magnitude of the signed conductance for the thermal generator.
+    /// This is an explicit noise law for synthesized active series impedances,
+    /// not the default resistor law.
+    pub absolute_thermal_conductance: bool,
     /// Flicker coefficient `KF` (default 0, no flicker noise).
     pub kf: Real,
     /// Flicker current exponent `AF` (default 1).
@@ -147,6 +151,7 @@ impl Default for ResistorNoise {
     fn default() -> Self {
         Self {
             noisy: true,
+            absolute_thermal_conductance: false,
             kf: 0.0,
             af: 1.0,
             ef: 1.0,
@@ -476,7 +481,11 @@ pub(super) fn resistor_noise<'a>(
             "_thermal",
             terminals,
             NoiseKind::Thermal {
-                conductance,
+                conductance: if n.absolute_thermal_conductance {
+                    conductance.abs()
+                } else {
+                    conductance
+                },
                 temperature,
             },
         ),
@@ -1300,9 +1309,11 @@ mod tests {
             temperature: 27.0,
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
+            configured_gmin: crate::devices::DEFAULT_GMIN,
             reltol: crate::devices::DEFAULT_RELTOL,
             frequency: 0.,
             mode: crate::devices::traits::AnalysisMode::Transient { time: 0., dt: 1e-6 },
+            analysis_kind: None,
             bias_analysis: None,
             branches: 0..0,
             controls: &[],

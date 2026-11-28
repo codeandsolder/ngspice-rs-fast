@@ -1,0 +1,7 @@
+Synthetic shunt resistor noise
+.options reltol=1e-8 abstol=1e-12 vntol=1e-10
+V1 s 0 AC 1
+R1 s p 2
+C1 p 0 2u Rser=5 Rpar=100 Cpar=1u Lser=3m RLshunt=20 m=3
+.noise V(p) V1 lin 3 100 10000
+.end

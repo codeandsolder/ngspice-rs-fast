@@ -75,7 +75,9 @@ impl SensitivityKernel for SourceSensitivity<'_> {
     }
 
     fn instance_parameters(&self) -> &'static [P] {
-        if self.source.voltage {
+        if self.source.is_current_probe() {
+            &[]
+        } else if self.source.voltage {
             VOLTAGE
         } else {
             CURRENT

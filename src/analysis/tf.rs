@@ -144,15 +144,15 @@ fn resolve_input(circuit: &Circuit, name: &str) -> SpiceResult<(Input, usize)> {
         ))
     })?;
     let device = &circuit.devices()[index];
-    match device.designator() {
-        'v' => {
+    match device.input_source().map(|source| source.kind) {
+        Some(crate::devices::linear::SourceKind::Voltage) => {
             let branch = circuit
                 .branch_rows(index)
                 .and_then(|mut rows| rows.next())
                 .ok_or_else(|| not_found(format_args!("{name}: missing branch row")))?;
             Ok((Input::Voltage { branch }, index))
         }
-        'i' => {
+        Some(crate::devices::linear::SourceKind::Current) => {
             let row = |terminal: usize| {
                 device
                     .terminals()
