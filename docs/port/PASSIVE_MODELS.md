@@ -291,8 +291,19 @@ copies: capacitor charge multiplies by m; inductor flux is S(I/m), with
 total branch current I. These are native prepared-model extensions, not a
 claim that PSpice accepts these instance keywords. Nonlinear mutual
 inductance is rejected until a coupled energy law is available.
-Source-specific non-UIC initial bias semantics require a separate producer
-policy; the native instance IC alone does not impose a DC clamp.
+Source-prepared non-UIC initialization binds the same typed physical bias
+policy as scalar C/L (#279). A polynomial device already owns a branch row:
+during the selected equilibrium, its capacitor equation becomes either
+`v = Vtarget` or `i = G(v - Vtarget)`; its inductor equation becomes
+`i = Itarget + Gv`. The branch current is still the signed terminal current.
+Ordinary DC sweeps without a selected constraint, AC perturbations, and
+transient physical equations use the original storage law. UIC evaluates the
+integrated polynomial at the supplied coordinate (including explicit zero);
+an omitted capacitor coordinate retains the native differential node hint
+unless the producer specifies a different default. An exact-history policy
+can also seed S(x) independently of a finite bias constraint without UIC.
+Candidate and temperature replacement retain the bound policy. A native
+instance IC alone does not impose a DC clamp.
 
 
 ## Explicit physical passive networks
