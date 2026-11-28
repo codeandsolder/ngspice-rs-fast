@@ -1146,3 +1146,30 @@ fn causal_descendants_preserve_uncertainty_through_exact_transport_and_zero_dela
     assert!(samples.iter().all(|&n| n > 10), "{samples:?}");
     Ok(())
 }
+
+#[test]
+fn bounded_latch_paths_preserve_transparency_hold_and_async_controls() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vd data 0 PWL(0 4 1500n 4 1502n 0 2500n 0 2502n 4 4u 4)\n\
+         vg gate 0 PWL(0 0 1u 0 1002n 4 2u 4 2002n 0 4u 0)\n\
+         vp preset 0 PWL(0 0 3u 0 3002n 4 4u 4)\nvc clear 0 0\n\
+         a1 %v[data gate preset clear] q latch\n.model latch preprocess_logic_event(operation=15 async_policy=[1 1 2] delay_windows=[5n 15n 30n 40n] delay_gate_windows=[10n 20n 10n 20n] delay_preset_windows=[50n 60n 70n 80n])\n\
+         a2 q out b\n.model b preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "4u", "0", "1n"])?;
+    let boundaries = [
+        1.0115e-6, 1.0215e-6, 1.531e-6, 1.541e-6, 3.0515e-6, 3.0615e-6,
+    ];
+    let mut samples = [0; 7];
+    for i in 0..plot.point_count() {
+        let t = plot.value("time", i).unwrap().re;
+        if boundaries.iter().any(|b| (t - b).abs() <= 1.1e-9) {
+            continue;
+        }
+        let region = boundaries.iter().filter(|&&b| t > b).count();
+        close(output(&plot, i), [0., 2.5, 5., 2.5, 0., 2.5, 5.][region]);
+        samples[region] += 1;
+    }
+    assert!(samples.iter().all(|&n| n > 4), "{samples:?}");
+    Ok(())
+}

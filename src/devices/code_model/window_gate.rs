@@ -2,6 +2,7 @@
 //! Keep phase boundaries attached to the same transition, not two
 //! independently delayed scalar events.
 
+use super::causal_history::{COMPARISON_BUDGET, ordered_groups};
 use super::source_logic::DriveStrengths;
 use super::{
     CodeModel, DelayMode, Delays, Drive, EventContext, GateKind, Logic, ModelSchema, Output,
@@ -347,49 +348,12 @@ impl WindowGate {
     }
 }
 
-/// Return a causal total preorder when provable from relative timing.
-/// Sorting by absolute lower/upper endpoints cannot reverse a strict
-/// physical order, because the bounds are monotone in delay origins.
-/// Adjacent relations suffice by transitivity.
-fn ordered_groups(transitions: &[(usize, Arrival)]) -> SpiceResult<Option<Vec<Vec<usize>>>> {
-    let mut order: Vec<_> = (0..transitions.len()).collect();
-    order.sort_by(|&a, &b| {
-        let a = transitions[a].1.window().bounds();
-        let b = transitions[b].1.window().bounds();
-        a.minimum()
-            .total_cmp(&b.minimum())
-            .then_with(|| a.maximum().total_cmp(&b.maximum()))
-    });
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for index in order {
-        if let Some(group) = groups.last_mut() {
-            let previous = group[0];
-            let a = transitions[previous].1.window();
-            let b = transitions[index].1.window();
-            if a.same_expression(b) {
-                group.push(index);
-                continue;
-            }
-            let separation = b.relative_to(a, 100_000)?;
-            if separation.is_exact() && separation.minimum() == 0. {
-                group.push(index);
-                continue;
-            }
-            if separation.minimum() <= 0. {
-                return Ok(None);
-            }
-        }
-        groups.push(vec![index]);
-    }
-    Ok(Some(groups))
-}
-
 fn strictly_after(new: &[(usize, Arrival)], old: &[(usize, Arrival)]) -> SpiceResult<bool> {
     for (_, next) in new {
         for (_, prior) in old {
             if next
                 .window()
-                .relative_to(prior.window(), 100_000)?
+                .relative_to(prior.window(), COMPARISON_BUDGET)?
                 .minimum()
                 <= 0.
             {
@@ -521,7 +485,12 @@ impl CodeModel for WindowGate {
         // earlier envelope. Keep both transitions instead of refusing
         // overlap or treating the old boundary as another edge.
         if (old_active.is_empty() || strictly_after(&transitions, &old_active)?)
-            && let Some(groups) = ordered_groups(&transitions)?
+            && let Some(groups) = ordered_groups(
+                transitions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, a))| (i, a.window())),
+            )?
         {
             let waveform = self.ordered_waveform(state, &transitions, previous, groups)?;
             if let Some(last) = waveform.last() {

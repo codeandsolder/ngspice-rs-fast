@@ -351,10 +351,10 @@ impl Operation {
         )
     }
 
-    fn desired(
+    pub(super) fn desired(
         self,
         inputs: &[Drive],
-        state: &mut LogicState,
+        state: &mut LogicMemory,
         initial: bool,
         strength: DriveStrengths,
     ) -> SpiceResult<(Drive, Causes)> {
@@ -459,11 +459,11 @@ impl Operation {
 /// A simultaneous group can have more than one causally relevant path.
 /// For the deterministic contract, the latest selected path wins.
 #[derive(Clone, Copy, Debug, Default)]
-struct Causes {
-    primary: bool,
-    gate: bool,
-    preset: bool,
-    clear: bool,
+pub(super) struct Causes {
+    pub(super) primary: bool,
+    pub(super) gate: bool,
+    pub(super) preset: bool,
+    pub(super) clear: bool,
 }
 
 impl Causes {
@@ -480,7 +480,7 @@ fn apply_async(
     controls: &[Drive],
     normal: Logic,
     prior: Logic,
-    state: &mut LogicState,
+    state: &mut LogicMemory,
     causes: &mut Causes,
 ) -> SpiceResult<Logic> {
     match (policy, controls) {
@@ -615,25 +615,37 @@ impl LogicKernel {
             && [self.causal.gate, self.causal.preset, self.causal.clear]
                 .into_iter()
                 .all(|d| d.is_none_or(Delays::is_zero));
-        self.pulse.is_none()
-            && (self.mode == DelayMode::Transport || zero)
-            && matches!(
-                self.operation,
-                Operation::Gate(_) | Operation::TriState(_) | Operation::Clocked { .. }
-            )
+        self.pulse.is_none() && (self.mode == DelayMode::Transport || zero)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct LogicMemory {
+    pub(super) requested: Drive,
+    clock: Logic,
+    clock_ambiguity: Option<ClockAmbiguity>,
+    data: Logic,
+    asynchronous: [Logic; 2],
+}
+
+impl LogicMemory {
+    pub(super) fn new(requested: Drive) -> Self {
+        Self {
+            requested,
+            clock: Logic::Unknown,
+            clock_ambiguity: None,
+            data: Logic::Unknown,
+            asynchronous: [Logic::Unknown; 2],
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct LogicState {
     committed: Drive,
-    requested: Drive,
+    memory: LogicMemory,
     deadline: Option<Real>,
     pulse: PulseState,
-    clock: Logic,
-    clock_ambiguity: Option<ClockAmbiguity>,
-    data: Logic,
-    asynchronous: [Logic; 2],
     timing: Option<TimingState>,
     diagnostics: Vec<ModelDiagnostic>,
 }
@@ -648,13 +660,9 @@ impl CodeModel for LogicKernel {
     fn initial_state(&self) -> Self::State {
         LogicState {
             committed: self.strength.drive(self.initial),
-            requested: self.strength.drive(self.initial),
+            memory: LogicMemory::new(self.strength.drive(self.initial)),
             deadline: None,
             pulse: PulseState::default(),
-            clock: Logic::Unknown,
-            clock_ambiguity: None,
-            data: Logic::Unknown,
-            asynchronous: [Logic::Unknown; 2],
             timing: self.timing.as_ref().map(TimingContract::initial_state),
             diagnostics: Vec::new(),
         }
@@ -681,7 +689,7 @@ impl CodeModel for LogicKernel {
         }
         if context.initial {
             state.committed = self.strength.drive(self.initial);
-            state.requested = state.committed;
+            state.memory = LogicMemory::new(state.committed);
             state.deadline = None;
             state.pulse = PulseState::default();
         }
@@ -714,24 +722,24 @@ impl CodeModel for LogicKernel {
         };
         let (mut desired, causes) =
             self.operation
-                .desired(inputs, state, context.initial, self.strength)?;
+                .desired(inputs, &mut state.memory, context.initial, self.strength)?;
         if unknown {
             desired = self.strength.drive(Logic::Unknown);
-            if let Some(phase) = &mut state.clock_ambiguity {
+            if let Some(phase) = &mut state.memory.clock_ambiguity {
                 phase.force(Logic::Unknown);
             }
         }
         let transition = |from, to| self.causal.delay(self.delays, causes, from, to);
         let delay = if context.initial {
             state.committed = desired;
-            state.requested = desired;
+            state.memory.requested = desired;
             0.
         } else if let Some(filter) = self.pulse {
             filter.evaluate(
                 context.time,
                 desired,
                 transition,
-                &mut state.requested,
+                &mut state.memory.requested,
                 &mut state.committed,
                 &mut state.pulse,
             )?;
@@ -739,24 +747,24 @@ impl CodeModel for LogicKernel {
         } else if self.mode == DelayMode::Transport {
             // The requested logical state changes immediately; the queue
             // delivers its output at the propagation time.
-            let delay = transition(state.requested, desired);
+            let delay = transition(state.memory.requested, desired);
             state.committed = desired;
-            state.requested = desired;
+            state.memory.requested = desired;
             delay
         } else {
             if state
                 .deadline
                 .is_some_and(|deadline| context.time >= deadline)
-                && desired == state.requested
+                && desired == state.memory.requested
             {
-                state.committed = state.requested;
+                state.committed = state.memory.requested;
                 state.deadline = None;
             }
             if desired == state.committed {
-                state.requested = desired;
+                state.memory.requested = desired;
                 state.deadline = None;
-            } else if state.deadline.is_none() || desired != state.requested {
-                state.requested = desired;
+            } else if state.deadline.is_none() || desired != state.memory.requested {
+                state.memory.requested = desired;
                 let delay = transition(state.committed, desired);
                 let deadline = context.time + delay;
                 if delay == 0. {

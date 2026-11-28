@@ -1,18 +1,16 @@
 //! Clocked storage samples the causal waveform, not its displayed phase.
 //! Each announced edge is processed once; completion only settles its
 //! envelope. History belongs to the disposable digital trial.
-use super::causal_history::{COMPARISON_BUDGET, InputEdge, PortHistory, Relation};
-use super::sequential_timing::{TimingContract, ViolationPolicy, may_trigger};
+use super::causal_checks::{aperture, check_capture, check_widths};
+use super::causal_history::{InputEdge, PortHistory, Relation, qualify_inputs};
+use super::sequential_timing::may_trigger;
 use super::source_logic::{AsyncPolicy, ClockedKind, Edge, LogicKernel, Operation};
 use super::window_gate::WindowPaths;
 use super::{
     CodeModel, DelayMode, Delays, Drive, EventContext, Logic, ModelDiagnostic, ModelSchema, Output,
     WindowDelays,
 };
-use crate::analysis::digital::timing::{
-    ApertureResult, Arrival, Bounds, Certainty, ConstraintResult, Origin, TimedInput, TimedOutput,
-    TimingWindow,
-};
+use crate::analysis::digital::timing::{Arrival, Origin, TimedInput, TimedOutput, TimingWindow};
 use crate::primitives::{Real, SpiceError, SpiceResult};
 use std::collections::VecDeque;
 
@@ -119,30 +117,6 @@ impl WindowClocked {
         self.kind.arity() - 1
     }
 
-    fn inputs(&self, inputs: &[TimedInput]) -> SpiceResult<Vec<TimedInput>> {
-        inputs
-            .iter()
-            .zip(&self.kernel.invert)
-            .map(|(input, &invert)| {
-                if !invert {
-                    return Ok(input.clone());
-                }
-                let invert = |drive: Drive| Drive {
-                    logic: drive.logic.invert(),
-                    ..drive
-                };
-                Ok(TimedInput {
-                    drive: invert(input.drive),
-                    arrival: input
-                        .arrival
-                        .as_ref()
-                        .map(|a| Arrival::new(invert(a.from()), invert(a.to()), a.window().clone()))
-                        .transpose()?,
-                })
-            })
-            .collect()
-    }
-
     fn sample(&self, ports: &[PortHistory], edge: &InputEdge, prior: Logic) -> SpiceResult<Logic> {
         let inputs = ports
             .iter()
@@ -205,164 +179,6 @@ impl WindowClocked {
         Ok(())
     }
 
-    fn aperture(
-        &self,
-        timing: &TimingContract,
-        capture: &InputEdge,
-        data: &InputEdge,
-        index: usize,
-        diagnostics: &mut Vec<ModelDiagnostic>,
-    ) -> SpiceResult<bool> {
-        if !data.logic_changed() || (timing.setup[index] == 0. && timing.hold[index] == 0.) {
-            return Ok(false);
-        }
-        let bounds = capture.relative_to(data)?;
-        let result = ApertureResult::from_ordered_bounds(
-            bounds,
-            timing.setup[index],
-            timing.hold[index],
-            data.precedes_at_equality(capture),
-        )?;
-        let mut violated = false;
-        for (kind, certainty, minimum, elapsed) in [
-            ("setup", result.setup, timing.setup[index], bounds),
-            (
-                "hold",
-                result.hold,
-                timing.hold[index],
-                Bounds::new(-bounds.maximum(), -bounds.minimum())?,
-            ),
-        ] {
-            violated |= report(
-                timing.policy,
-                kind,
-                index,
-                ConstraintResult {
-                    separation: elapsed,
-                    minimum,
-                    certainty,
-                },
-                diagnostics,
-            );
-        }
-        Ok(violated)
-    }
-
-    fn check_widths(
-        &self,
-        timing: &TimingContract,
-        state: &mut WindowClockedState,
-        changes: &[Option<InputEdge>],
-    ) -> SpiceResult<bool> {
-        let clock = self.clock();
-        let mut poisoned = false;
-        for (index, edge) in changes.iter().enumerate().skip(clock) {
-            let Some(edge) = edge.as_ref().filter(|edge| edge.logic_changed()) else {
-                continue;
-            };
-            let (kind, minimum) = if index == clock {
-                (
-                    "clock/gate pulse width",
-                    match edge.from.logic {
-                        Logic::Zero => timing.clock_min[0],
-                        Logic::One => timing.clock_min[1],
-                        _ => 0.,
-                    },
-                )
-            } else if let Some(policy) = self.asynchronous {
-                let active = if index == clock + 1 {
-                    policy.preset
-                } else {
-                    policy.clear
-                };
-                (
-                    "asynchronous pulse width",
-                    if edge.from.logic == active && edge.to.logic != active {
-                        timing.async_min[index - clock - 1]
-                    } else {
-                        0.
-                    },
-                )
-            } else {
-                continue;
-            };
-            if minimum == 0. {
-                continue;
-            }
-            if let Some(previous) = state.ports[index]
-                .edges()
-                .iter()
-                .rev()
-                .filter(|edge| edge.logic_changed())
-                .nth(1)
-            {
-                let result = ConstraintResult::minimum(
-                    &edge.window,
-                    &previous.window,
-                    minimum,
-                    COMPARISON_BUDGET,
-                )?;
-                let unknown = report(timing.policy, kind, index, result, &mut state.diagnostics);
-                poisoned |= unknown && (index != clock || self.enabled_at(&state.ports, edge)?);
-            }
-        }
-        Ok(poisoned)
-    }
-
-    fn check_capture(
-        &self,
-        state: &mut WindowClockedState,
-        capture: &InputEdge,
-    ) -> SpiceResult<bool> {
-        let Some(timing) = &self.kernel.timing else {
-            return Ok(false);
-        };
-        if !self.enabled_at(&state.ports, capture)? {
-            return Ok(false);
-        }
-        let mut poisoned = false;
-        for (index, port) in state.ports.iter().enumerate().take(self.clock()) {
-            for edge in port.edges() {
-                poisoned |= self.aperture(timing, capture, edge, index, &mut state.diagnostics)?;
-            }
-        }
-        if let Some(policy) = self.asynchronous {
-            for (offset, active) in [policy.preset, policy.clear].into_iter().enumerate() {
-                let index = self.kind.arity() + offset;
-                let minimum = timing.recovery[offset];
-                if minimum == 0. {
-                    continue;
-                }
-                for edge in state.ports[index].edges() {
-                    if edge.from.logic != active || edge.to.logic == active {
-                        continue;
-                    }
-                    // Recovery is the setup aperture of an asynchronous release.
-                    let bounds = capture.relative_to(edge)?;
-                    let certainty = ApertureResult::from_ordered_bounds(
-                        bounds,
-                        minimum,
-                        0.,
-                        edge.precedes_at_equality(capture),
-                    )?
-                    .setup;
-                    poisoned |= report(
-                        timing.policy,
-                        "asynchronous recovery",
-                        index,
-                        ConstraintResult {
-                            separation: bounds,
-                            minimum,
-                            certainty,
-                        },
-                        &mut state.diagnostics,
-                    );
-                }
-            }
-        }
-        Ok(poisoned)
-    }
-
     fn revise_captures(
         &self,
         state: &mut WindowClockedState,
@@ -387,7 +203,7 @@ impl WindowClocked {
                 }
                 if let Some(timing) = &self.kernel.timing
                     && self.enabled_at(&state.ports, &capture.edge)?
-                    && self.aperture(timing, &capture.edge, edge, index, &mut state.diagnostics)?
+                    && aperture(timing, &capture.edge, edge, index, &mut state.diagnostics)?
                 {
                     capture.poisoned = true;
                     causes.push(edge.window.clone());
@@ -501,28 +317,6 @@ impl WindowClocked {
     }
 }
 
-fn report(
-    policy: ViolationPolicy,
-    kind: &'static str,
-    input: usize,
-    result: ConstraintResult,
-    diagnostics: &mut Vec<ModelDiagnostic>,
-) -> bool {
-    if result.certainty == Certainty::Satisfied {
-        return false;
-    }
-    diagnostics.push(ModelDiagnostic {
-        fatal: matches!(policy, ViolationPolicy::Error),
-        kind,
-        input,
-        elapsed: result.separation.minimum(),
-        maximum_elapsed: result.separation.maximum(),
-        minimum: result.minimum,
-        certainty: result.certainty,
-    });
-    matches!(policy, ViolationPolicy::Unknown)
-}
-
 impl CodeModel for WindowClocked {
     type State = WindowClockedState;
 
@@ -565,7 +359,7 @@ impl CodeModel for WindowClocked {
                 "causal clocked input dimension mismatch",
             ));
         }
-        let inputs = self.inputs(inputs)?;
+        let inputs = qualify_inputs(inputs, &self.kernel.invert)?;
         if context.initial {
             return Ok(self.initial(&inputs, state));
         }
@@ -600,7 +394,7 @@ impl CodeModel for WindowClocked {
             }
         }
         let width_poison = if let Some(timing) = &self.kernel.timing {
-            self.check_widths(timing, state, &changes)?
+            check_widths(timing, &state.ports, &mut state.diagnostics, &changes)?
         } else {
             false
         };
@@ -654,7 +448,12 @@ impl CodeModel for WindowClocked {
             }
             if self.enabled_at(&state.ports, edge)? {
                 let before = state.requested.logic;
-                let poisoned = self.check_capture(state, edge)? || width_poison;
+                let poisoned = match &self.kernel.timing {
+                    Some(timing) => {
+                        check_capture(timing, &state.ports, &mut state.diagnostics, edge)?
+                    }
+                    None => false,
+                } || width_poison;
                 let value = if poisoned {
                     Logic::Unknown
                 } else {
@@ -708,7 +507,7 @@ mod tests {
     use super::super::sequential_timing::TimingSpec;
     use super::super::source_logic::{CausalPaths, DriveStrengths};
     use super::*;
-    use crate::analysis::digital::timing::DelayWindow;
+    use crate::analysis::digital::timing::{Bounds, Certainty, DelayWindow};
     use crate::analysis::digital::{Engine, Limits, Network};
 
     fn model(setup: Real, hold: Real, policy: Real, op: Real) -> SpiceResult<WindowClocked> {

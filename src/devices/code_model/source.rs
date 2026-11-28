@@ -778,16 +778,6 @@ impl LogicMaterial {
             ));
         }
         let timing = self.timing.bind(operation, inputs)?;
-        if self.windows.is_some()
-            && !matches!(
-                operation,
-                Operation::Gate(_) | Operation::TriState(_) | Operation::Clocked { .. }
-            )
-        {
-            return Err(SpiceError::circuit(
-                "causal arrival windows require a combinational gate, tri-state driver or clocked storage",
-            ));
-        }
         let kernel = LogicKernel {
             operation,
             timing,
@@ -1255,7 +1245,12 @@ fn bind_receiver(
                 &inputs,
                 &[output],
             ),
-            _ => Err(SpiceError::circuit("causal window logic binding mismatch")),
+            Operation::Enabled { .. } | Operation::Sr(_) => network.add_named_model(
+                &device.name,
+                super::window_latch::WindowLatch::new(kernel, windows, window_paths)?,
+                &inputs,
+                &[output],
+            ),
         }
     } else {
         network.add_named_model(&device.name, kernel, &inputs, &[output])

@@ -78,8 +78,8 @@ impl PortHistory {
         &self.edges
     }
 
-    pub(super) fn observe(
-        &mut self,
+    pub(super) fn preview(
+        &self,
         context: EventContext,
         input: &TimedInput,
     ) -> SpiceResult<Option<InputEdge>> {
@@ -101,18 +101,32 @@ impl PortHistory {
             if self.latest == input.drive {
                 return Ok(None);
             }
-            // An unqualified R/F marker is an observed uncertainty
-            // phase, not a guaranteed binary transition.
             (self.latest, input.drive, TimingWindow::exact(context.time)?)
         };
-        let edge = InputEdge {
+        Ok(Some(InputEdge {
             from,
             to,
             window,
             announced: context,
+        }))
+    }
+
+    pub(super) fn observe(
+        &mut self,
+        context: EventContext,
+        input: &TimedInput,
+    ) -> SpiceResult<Option<InputEdge>> {
+        let Some(edge) = self.preview(context, input)? else {
+            return Ok(None);
         };
-        self.latest = to;
+        self.latest = edge.to;
         self.last_arrival = input.arrival.clone();
+        // These histories are logical, not electrical. A strength-only
+        // change still updates the endpoint identity but must not reset
+        // the logical pulse-width origin or consume history space.
+        if !edge.logic_changed() {
+            return Ok(None);
+        }
         self.edges.push_back(edge.clone());
         Ok(Some(edge))
     }
@@ -159,9 +173,8 @@ impl PortHistory {
         Ok(Drive::strong(value.unwrap_or(Logic::Unknown)))
     }
 
-    /// Retain the newest completed predecessor and every potentially
-    /// relevant later edge. A newer definitely completed transport
-    /// event makes older pending events irrelevant.
+    /// Keep the newest completed logical predecessor and all later
+    /// logical events. Rank-only deliveries never enter this history.
     pub(super) fn prune(&mut self, before: Real) {
         let Some(index) = self
             .edges
@@ -173,5 +186,104 @@ impl PortHistory {
         for edge in self.edges.drain(..index) {
             self.initial = edge.to;
         }
+    }
+}
+
+pub(super) fn qualify_inputs(
+    inputs: &[TimedInput],
+    inversion: &[bool],
+) -> SpiceResult<Vec<TimedInput>> {
+    inputs
+        .iter()
+        .zip(inversion)
+        .map(|(input, &invert)| {
+            if !invert {
+                return Ok(input.clone());
+            }
+            let invert = |drive: Drive| Drive {
+                logic: drive.logic.invert(),
+                ..drive
+            };
+            Ok(TimedInput {
+                drive: invert(input.drive),
+                arrival: input
+                    .arrival
+                    .as_ref()
+                    .map(|a| Arrival::new(invert(a.from()), invert(a.to()), a.window().clone()))
+                    .transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// A group of newly announced transitions at the same physical time.
+/// For distinct groups, the earlier group's arrival is proven to
+/// precede the later group's for every realization.
+pub(super) fn ordered_groups<'a>(
+    windows: impl IntoIterator<Item = (usize, &'a TimingWindow)>,
+) -> SpiceResult<Option<Vec<Vec<usize>>>> {
+    let mut order: Vec<_> = windows.into_iter().collect();
+    order.sort_by(|(_, a), (_, b)| {
+        let a = a.bounds();
+        let b = b.bounds();
+        a.minimum()
+            .total_cmp(&b.minimum())
+            .then_with(|| a.maximum().total_cmp(&b.maximum()))
+    });
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut previous: Option<&TimingWindow> = None;
+    for (index, window) in order {
+        if let (Some(prior), Some(group)) = (previous, groups.last_mut()) {
+            let separation = window.relative_to(prior, COMPARISON_BUDGET)?;
+            if separation.is_exact() && separation.minimum() == 0. {
+                group.push(index);
+                continue;
+            }
+            if separation.minimum() <= 0. {
+                return Ok(None);
+            }
+        }
+        groups.push(vec![index]);
+        previous = Some(window);
+    }
+    Ok(Some(groups))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Strength;
+    use super::*;
+
+    #[test]
+    fn pruning_does_not_discard_logic_edge_on_strength_change() -> SpiceResult<()> {
+        let low = Drive::strong(Logic::Zero);
+        let high = Drive::strong(Logic::One);
+        let weak_high = Drive {
+            logic: Logic::One,
+            strength: Strength::RESISTIVE,
+        };
+        let input = |drive| TimedInput {
+            drive,
+            arrival: None,
+        };
+        let context = |time| EventContext {
+            time,
+            delta: 0,
+            initial: false,
+        };
+        let mut history = PortHistory::new(&input(low));
+        history.observe(context(1.), &input(high))?;
+        history.observe(context(2.), &input(weak_high))?;
+        history.prune(5.);
+        history.observe(context(6.), &input(low))?;
+        history.prune(6.);
+        let edges: Vec<_> = history
+            .edges()
+            .iter()
+            .filter(|edge| edge.logic_changed())
+            .collect();
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[1].relative_to(edges[0])?, Bounds::new(5., 5.)?);
+        Ok(())
     }
 }

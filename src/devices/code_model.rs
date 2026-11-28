@@ -3,6 +3,7 @@
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
+mod causal_checks;
 mod causal_history;
 mod conductance;
 pub(crate) use conductance::ConductanceConfig;
@@ -20,6 +21,7 @@ mod timed_switch;
 mod timed_switch_device;
 mod window_clocked;
 mod window_gate;
+mod window_latch;
 pub use window_gate::{WindowDelays, WindowGate, WindowGateState};
 
 /// Stable digital logic and directional timing ambiguity.
