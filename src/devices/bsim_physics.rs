@@ -54,7 +54,9 @@ fn thermal_softplus_interior<S: Constitutive>(
             .clone()
             .multiply(&logarithm.scale(thermal))
             .add(voltage);
-        Ok((value, sigmoid, entropy.scale(thermal)))
+        let factor_partial = entropy.scale(thermal);
+        let value = value.with_partials([voltage, factor], [&sigmoid, &factor_partial]);
+        Ok((value, sigmoid, factor_partial))
     } else {
         let exponential = argument.clone().exp();
         let sigmoid = exponential
@@ -62,11 +64,10 @@ fn thermal_softplus_interior<S: Constitutive>(
             .divide(&exponential.clone().offset(1.))?;
         let logarithm = exponential.ln_1p()?;
         let entropy = argument.scale(-1.).mul_add(&sigmoid, &logarithm);
-        Ok((
-            factor.clone().multiply(&logarithm.scale(thermal)),
-            sigmoid,
-            entropy.scale(thermal),
-        ))
+        let value = factor.clone().multiply(&logarithm.scale(thermal));
+        let factor_partial = entropy.scale(thermal);
+        let value = value.with_partials([voltage, factor], [&sigmoid, &factor_partial]);
+        Ok((value, sigmoid, factor_partial))
     }
 }
 
@@ -95,6 +96,7 @@ pub(super) fn bsim3_overdrive<S: Constitutive>(
         let value = exponent.clone().exp().scale(thermal / oxide_ratio);
         let voltage_partial = value.clone().divide(&thermal_factor)?;
         let factor_partial = exponent.scale(-thermal).multiply(&voltage_partial);
+        let value = value.with_partials([voltage, factor], [&voltage_partial, &factor_partial]);
         return Ok((value, voltage_partial, factor_partial));
     }
     let (numerator, numerator_voltage, numerator_factor) =
@@ -117,6 +119,7 @@ pub(super) fn bsim3_overdrive<S: Constitutive>(
         .scale(-1.)
         .mul_add(&denominator_factor, &numerator_factor)
         .divide(&denominator)?;
+    let value = value.with_partials([voltage, factor], [&voltage_partial, &factor_partial]);
     Ok((value, voltage_partial, factor_partial))
 }
 
@@ -167,6 +170,7 @@ pub(super) fn effective_overdrive<S: Constitutive>(
         .scale(-1.)
         .mul_add(&denominator_factor, &numerator_factor)
         .divide(&denominator)?;
+    let value = value.with_partials([voltage, factor], [&voltage_partial, &factor_partial]);
     Ok((value, voltage_partial, factor_partial))
 }
 
@@ -358,7 +362,14 @@ pub(super) fn smooth_positive<S: Constitutive>(
         .mul_add(&x, &x.constant(4. * quarter_width_squared))
         .sqrt()?;
     let value = positive_half_sum(x.clone(), root.clone(), x.constant(quarter_width_squared))?;
-    let slope = value.clone().divide(&root)?;
+    let slope_value = value.clone().divide(&root)?.primal();
+    let curvature = x
+        .constant(2. * quarter_width_squared)
+        .divide(&root)?
+        .divide(&root)?
+        .divide(&root)?;
+    let slope = x.clone().compose_derivative(slope_value, &curvature);
+    let value = x.compose_derivative(value.primal(), &slope);
     Ok((value, slope))
 }
 
@@ -428,8 +439,14 @@ pub(super) fn body_lower_limit<S: Constitutive>(bias: &S, cutoff: Real) -> Spice
         .clone()
         .mul_add(&argument, &bias.constant(4. * width))
         .sqrt()?;
-    let half = positive_half_sum(argument, root.clone(), bias.constant(width))?;
-    let derivative = half.clone().divide(&root)?;
+    let half = positive_half_sum(argument.clone(), root.clone(), bias.constant(width))?;
+    let slope_value = half.clone().divide(&root)?.primal();
+    let curvature = bias
+        .constant(2. * width)
+        .divide(&root)?
+        .divide(&root)?
+        .divide(&root)?;
+    let derivative = argument.compose_derivative(slope_value, &curvature);
     let sum = bias.clone().offset(cutoff - DELTA);
     let value = if sum.primal() <= 0. && cutoff < 0. {
         bias.clone()
@@ -438,7 +455,10 @@ pub(super) fn body_lower_limit<S: Constitutive>(bias: &S, cutoff: Real) -> Spice
     } else {
         half.offset(cutoff)
     };
-    Ok((value, derivative))
+    Ok((
+        bias.clone().compose_derivative(value.primal(), &derivative),
+        derivative,
+    ))
 }
 
 /// BSIM3 reference body limiter: the charge/current value is clamped to
@@ -447,11 +467,12 @@ pub(super) fn body_lower_limit<S: Constitutive>(bias: &S, cutoff: Real) -> Spice
 /// arithmetic of the returned value follows the actual branch instead.
 pub(super) fn bsim3_body_limit<S: Constitutive>(bias: &S, cutoff: Real) -> SpiceResult<(S, S)> {
     let (raw, reference_partial) = body_lower_limit(bias, cutoff)?;
-    let value = if raw.clone().add(&bias.clone().scale(-1.)).compare(0.) == Some(Ordering::Less) {
-        bias.clone()
+    let clamp = if cutoff < 0. {
+        bias.compare(0.) == Some(Ordering::Greater)
     } else {
-        raw
+        raw.clone().add(&bias.clone().scale(-1.)).compare(0.) == Some(Ordering::Less)
     };
+    let value = if clamp { bias.clone() } else { raw };
     Ok((value, reference_partial))
 }
 
@@ -463,11 +484,13 @@ pub(super) fn bsim4_body_limit<S: Constitutive>(
     phi: Real,
 ) -> SpiceResult<(S, S)> {
     let (lower, lower_partial) = body_lower_limit(bias, cutoff)?;
-    let upper = smooth_drain(bias.constant(0.95 * phi), lower, 0.001)?;
-    Ok((
-        upper.effective,
-        upper.drain_partial.multiply(&lower_partial),
-    ))
+    let upper_limit = 0.95 * phi;
+    let argument = lower.clone().scale(-1.).offset(upper_limit - 0.001);
+    let (_, slope) = smooth_positive(argument, 0.001 * upper_limit)?;
+    // The conjugate smaller root retains the value at near-zero body bias.
+    let upper = smooth_drain(bias.constant(upper_limit), lower.clone(), 0.001)?;
+    let value = lower.compose_derivative(upper.effective.primal(), &slope);
+    Ok((value, slope.multiply(&lower_partial)))
 }
 
 /// Surface potential and the model's square-root factor and local partials.
@@ -551,17 +574,23 @@ impl ThresholdRollOff {
                         argument.constant(0.),
                     ));
                 }
-                let exponential = argument.clone().exp();
-                let offset = argument.clone().exp_m1();
+                // Divide numerator and denominator by exp(x). Evaluate the
+                // resulting even law on the negative exponential tail.
+                // This retains a zero derivative at the exact extremum.
+                let sign = if argument.primal() < 0. { -1. } else { 1. };
+                let z = argument.clone().scale(-sign);
+                let exponential = z.clone().exp();
+                let offset = z.exp_m1().scale(-1.);
                 let denominator = offset
                     .clone()
                     .mul_add(&offset, &exponential.clone().scale(2. * MIN_EXP));
                 let value = exponential.clone().divide(&denominator)?;
                 let slope = offset
-                    .scale(-1.)
+                    .scale(-sign)
                     .multiply(&exponential.offset(1.))
                     .divide(&denominator)?
                     .multiply(&value);
+                let value = argument.clone().compose_derivative(value.primal(), &slope);
                 Ok((value, slope))
             }
         }
@@ -1128,13 +1157,15 @@ pub(super) struct ChargeChain {
 }
 
 impl ChargeChain {
-    pub(super) fn apply(&self, part: &LocalPart<Real>) -> [Real; 3] {
+    pub(super) fn apply<S: Constitutive>(&self, part: &LocalPart<S>) -> [Real; 3] {
         std::array::from_fn(|i| {
-            part.partials[0].mul_add(
+            part.partials[0].primal().mul_add(
                 self.overdrive[i],
-                part.partials[1].mul_add(
+                part.partials[1].primal().mul_add(
                     self.drain[i],
-                    part.partials[2].mul_add(self.bulk[i], part.value * self.relative_oxide[i]),
+                    part.partials[2]
+                        .primal()
+                        .mul_add(self.bulk[i], part.value.primal() * self.relative_oxide[i]),
                 ),
             )
         })
@@ -1274,15 +1305,15 @@ impl<S: Constitutive, const N: usize> LocalPart<S, N> {
     }
 }
 
-impl<const N: usize> LocalPart<Real, N> {
+impl<S: Constitutive, const N: usize> LocalPart<S, N> {
     /// Project the independent constitutive partials onto terminal biases.
     pub(super) fn project(&self, coordinates: &[[Real; 3]; N]) -> [Real; 3] {
         std::array::from_fn(|column| {
             self.partials
                 .iter()
                 .zip(coordinates)
-                .fold(0., |sum, (&partial, direction)| {
-                    partial.mul_add(direction[column], sum)
+                .fold(0., |sum, (partial, direction)| {
+                    partial.primal().mul_add(direction[column], sum)
                 })
         })
     }
@@ -1683,8 +1714,7 @@ mod tests {
                 let (bsim3, reference_partial) = bsim3_body_limit(&input, cutoff)?;
                 let (bsim4, exact_partial) = bsim4_body_limit(&input, cutoff, phi)?;
                 check_charge_gradient(&bsim4, &exact_partial);
-                let raw_difference = lower.value.clone().add(&input.value.clone().scale(-1.));
-                if raw_difference.sign() == Ordering::Less {
+                if input.value.sign() == Ordering::Greater {
                     let actual = bsim3.gradient[0].as_ref().unwrap();
                     close(actual.value(), 1., 1e-15);
                 } else {

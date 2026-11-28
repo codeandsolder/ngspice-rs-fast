@@ -29,7 +29,9 @@ use crate::devices::bsim_physics::{
     ChargeChain, JunctionCapacitance, channel_inversion, charge_overdrive, depletion,
     depletion_charge, overlap, smooth_drain, smooth_positive, thermal_softplus,
 };
+use crate::maths::taylor::Constitutive;
 use crate::primitives::{Real, SpiceError, SpiceResult};
+use std::cmp::Ordering;
 
 const EXP_THRESHOLD: Real = 34.0;
 const MIN_EXP: Real = 1.713_908_431e-15;
@@ -49,15 +51,15 @@ const DELTA_4: Real = 0.02;
 /// `qbulk` and `qdrn` are the CTM results, exactly as C has them when the
 /// `capMod == 3` block ends. `qbs`/`qbd` are C's `CKTstate0` junction charges.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ChargeEvaluation {
+pub struct ChargeEvaluation<S = Real> {
     /// Intrinsic gate charge (C `qgate` at the end of the CTM block).
-    pub qgate: Real,
+    pub qgate: S,
     /// Intrinsic bulk charge (C `qbulk`).
-    pub qbulk: Real,
+    pub qbulk: S,
     /// Intrinsic drain charge (C `qdrn`).
-    pub qdrn: Real,
+    pub qdrn: S,
     /// Intrinsic source charge (C `qsrc`, from the XPART partition).
-    pub qsrc: Real,
+    pub qsrc: S,
     /// C `here->BSIM3cggb`.
     pub cggb: Real,
     /// C `here->BSIM3cgdb`.
@@ -83,19 +85,19 @@ pub struct ChargeEvaluation {
     /// Gate-bulk overlap capacitance (C `pParam->BSIM3cgbo`).
     pub cgbo: Real,
     /// Gate-drain overlap charge (C `qgdo`), for the gate/drain adjustment.
-    pub qgdo: Real,
+    pub qgdo: S,
     /// Gate-source overlap charge (C `qgso`).
-    pub qgso: Real,
+    pub qgso: S,
     /// Source junction capacitance (C `here->BSIM3capbs`).
     pub capbs: Real,
     /// Drain junction capacitance (C `here->BSIM3capbd`).
     pub capbd: Real,
     /// Source junction charge (C `CKTstate0[here->BSIM3qbs]`).
-    pub qbs: Real,
+    pub qbs: S,
     /// Drain junction charge (C `CKTstate0[here->BSIM3qbd]`).
-    pub qbd: Real,
+    pub qbd: S,
     /// Inversion charge for the noise model (C `here->BSIM3qinv`).
-    pub qinv: Real,
+    pub qinv: S,
 }
 
 impl ChargeEvaluation {
@@ -106,28 +108,35 @@ impl ChargeEvaluation {
     /// place because the terminal currents read them).
     #[must_use = "the returned charges include the overlap contributions and terminal-mode redistribution"]
     pub fn with_overlap(&self, mode: i8, vgb: Real) -> OverlapCharges {
-        let qgd = self.qgdo;
-        let qgs = self.qgso;
-        let qgb = self.cgbo * vgb;
-        let qgate = self.qgate + qgd + qgs + qgb;
-        let qbulk = self.qbulk - qgb;
+        self.with_overlap_constitutive(mode, vgb)
+    }
+}
+
+impl<S> ChargeEvaluation<S> {
+    pub(super) fn with_overlap_constitutive(&self, mode: i8, vgb: S) -> OverlapCharges<S>
+    where
+        S: Constitutive,
+    {
+        let qgb = vgb.scale(self.cgbo);
+        let qgate = self.qgate.clone().add(&self.qgdo).add(&self.qgso).add(&qgb);
+        let qbulk = self.qbulk.clone().add(&qgb.scale(-1.));
         let (qdrn, qsrc) = if mode >= 0 {
-            let qdrn = self.qdrn - qgd;
-            (qdrn, -(qgate + qbulk + qdrn))
+            let qdrn = self.qdrn.clone().add(&self.qgdo.clone().scale(-1.));
+            let qsrc = qgate.clone().add(&qbulk).add(&qdrn).scale(-1.);
+            (qdrn, qsrc)
         } else {
-            let qsrc = self.qdrn - qgs;
-            (-(qgate + qbulk + qsrc), qsrc)
+            let qsrc = self.qdrn.clone().add(&self.qgso.clone().scale(-1.));
+            let qdrn = qgate.clone().add(&qbulk).add(&qsrc).scale(-1.);
+            (qdrn, qsrc)
         };
         OverlapCharges {
+            qg: qgate.clone(),
+            qd: qdrn.clone().add(&self.qbd.clone().scale(-1.)),
+            qb: qbulk.clone().add(&self.qbd).add(&self.qbs),
             qgate,
             qbulk,
             qdrn,
             qsrc,
-            // C stores the state after the adjustment; the junction charges
-            // are already on the bulk/drain nodes.
-            qg: qgate,
-            qd: qdrn - self.qbd,
-            qb: qbulk + self.qbd + self.qbs,
         }
     }
 }
@@ -135,21 +144,21 @@ impl ChargeEvaluation {
 /// C's `qgate`/`qbulk`/`qdrn`/`qsrc` after the overlap-charge adjustment and
 /// the `CKTstate0` charge values `b3ask.c` reports.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OverlapCharges {
+pub struct OverlapCharges<S = Real> {
     /// Gate charge including overlaps and gate-bulk.
-    pub qgate: Real,
+    pub qgate: S,
     /// Bulk charge including gate-bulk.
-    pub qbulk: Real,
+    pub qbulk: S,
     /// Drain charge including the gate-drain overlap.
-    pub qdrn: Real,
+    pub qdrn: S,
     /// Source charge (C solves it from the node-charge sum).
-    pub qsrc: Real,
+    pub qsrc: S,
     /// C `CKTstate0[here->BSIM3qg]`.
-    pub qg: Real,
+    pub qg: S,
     /// C `CKTstate0[here->BSIM3qd]`.
-    pub qd: Real,
+    pub qd: S,
     /// C `CKTstate0[here->BSIM3qb]`.
-    pub qb: Real,
+    pub qb: S,
 }
 
 /// The BSIM3 charge core for one defaulted model and one set-up instance.
@@ -171,6 +180,18 @@ impl ChargeModel<'_> {
     /// A `capMod` other than 3 or any NQS mode (`NotYetPorted` naming the C
     /// file), or a nonfinite result.
     pub fn evaluate(&self, dc: &DcEvaluation, bias: Bias) -> SpiceResult<ChargeEvaluation> {
+        self.evaluate_constitutive(dc, bias)
+    }
+
+    /// The complete CTM charge law shares the scalar and differential
+    /// value path. C's scalar capacitance stamp uses the reference
+    /// partial convention, while the differential values retain the
+    /// derivatives of the actual physical charge.
+    pub(super) fn evaluate_constitutive<S: Constitutive>(
+        &self,
+        dc: &DcEvaluation<S>,
+        bias: Bias<S>,
+    ) -> SpiceResult<ChargeEvaluation<S>> {
         let cap_mod = self.model.values.capmod.value;
         if cap_mod != 3 {
             return Err(SpiceError::not_yet_ported(
@@ -196,84 +217,84 @@ impl ChargeModel<'_> {
         let vbs = bias.vbs;
         let vgs = bias.vgs;
         let vds = bias.vds;
-        let vds_mode = dc.vds;
+        let vds_mode = &dc.vds;
 
-        // ---- b3ld.c C-V preamble: VbseffCV, CoxWL and the noff VgsteffCV.
-        let (vbseff_cv, dvbseff_cv_dvb) = if cv.vbseff < 0.0 {
-            (cv.vbseff, 1.0)
+        // C-V preamble: effective body bias and thermal overdrive.
+        let (vbseff_cv, dvbseff_cv_dvb) = if cv.vbseff.compare(0.) == Some(Ordering::Less) {
+            (cv.vbseff.clone(), 1.)
         } else {
-            // C `VbseffCV = phi - Phis`.
-            (cv.phi - cv.phis, -cv.d_phis_dvb)
+            (cv.phis.clone().scale(-1.).offset(cv.phi), -cv.d_phis_dvb)
         };
         let cox = m.oxide_capacitance;
-        let cox_wl = cox * p.weff_cv * p.leff_cv;
-
-        let noff = cv.n * p.binned.noff;
+        let area = p.weff_cv * p.leff_cv;
+        let noff = cv.n.clone().scale(p.binned.noff);
         let dnoff_dvd = p.binned.noff * cv.d_n_dvd;
         let dnoff_dvb = p.binned.noff * cv.d_n_dvb;
         let (vgsteff, voltage_partial, factor_partial) =
-            thermal_softplus(&(cv.vgst - p.binned.voffcv), &noff, cv.vtm)?;
+            thermal_softplus(&cv.vgst.clone().offset(-p.binned.voffcv), &noff, cv.vtm)?;
+        let voltage_partial = voltage_partial.primal();
+        let factor_partial = factor_partial.primal();
         let dvgsteff_dvg = voltage_partial * cv.d_vgs_eff_dvg;
         let dvgsteff_dvd = factor_partial.mul_add(dnoff_dvd, -voltage_partial * cv.d_vth_dvd);
         let dvgsteff_dvb = factor_partial.mul_add(dnoff_dvb, -voltage_partial * cv.d_vth_dvb);
 
-        // ---- capMod == 3, the charge-thickness model (CTM).
+        // Flatband and accumulation centroid.
         let vfbzb = p.vfbzb;
-        let v3 = vfbzb - cv.vgs_eff + vbseff_cv - DELTA_3;
-        let (flatband_drop, t1) = smooth_positive(v3, DELTA_3 * vfbzb.abs())?;
-        let vfbeff = vfbzb - flatband_drop;
-        let dvfbeff_dvg = t1 * cv.d_vgs_eff_dvg;
-        let dvfbeff_dvb = -t1 * dvbseff_cv_dvb;
+        let v3 = vbseff_cv
+            .clone()
+            .add(&cv.vgs_eff.clone().scale(-1.))
+            .offset(vfbzb - DELTA_3);
+        let (flatband_drop, slope) = smooth_positive(v3, DELTA_3 * vfbzb.abs())?;
+        let vfbeff = flatband_drop.clone().scale(-1.).offset(vfbzb);
+        let dvfbeff_dvg = slope.primal() * cv.d_vgs_eff_dvg;
+        let dvfbeff_dvb = -slope.primal() * dvbseff_cv_dvb;
 
         let tox = m.values.tox.value;
-        // C `Tox = 1.0e8 * model->BSIM3tox` (centimetres for the ACDE exponent).
-        let mut tox_cm = 1.0e8 * tox;
-        let t0 = (cv.vgs_eff - vbseff_cv - vfbzb) / tox_cm;
-        let dt0_dvg = cv.d_vgs_eff_dvg / tox_cm;
-        let dt0_dvb = -dvbseff_cv_dvb / tox_cm;
-
-        let acde = p.binned.acde;
+        let tox_cm = 1e8 * tox;
+        let argument = cv
+            .vgs_eff
+            .clone()
+            .add(&vbseff_cv.clone().scale(-1.))
+            .offset(-vfbzb)
+            .scale(p.binned.acde / tox_cm);
         let ldeb = p.derived.ldeb;
-        let tmp = t0 * acde;
-        let (tcen, mut dtcen_dvg, mut dtcen_dvb) = if tmp > -EXP_THRESHOLD && tmp < EXP_THRESHOLD {
-            let tcen = ldeb * tmp.exp();
-            let mut dvg = acde * tcen;
-            let dvb = dvg * dt0_dvb;
-            dvg *= dt0_dvg;
-            (tcen, dvg, dvb)
-        } else if tmp <= -EXP_THRESHOLD {
-            (ldeb * MIN_EXP, 0.0, 0.0)
-        } else {
-            (ldeb * MAX_EXP, 0.0, 0.0)
-        };
-
-        let link = 1.0e-3 * tox;
-        let centroid = smooth_drain(ldeb, tcen, link)?;
+        let (centroid, centroid_partial) =
+            if argument.compare(-EXP_THRESHOLD) != Some(Ordering::Greater) {
+                (argument.constant(ldeb * MIN_EXP), 0.)
+            } else if argument.compare(EXP_THRESHOLD) != Some(Ordering::Less) {
+                (argument.constant(ldeb * MAX_EXP), 0.)
+            } else {
+                let value = argument.exp().scale(ldeb);
+                let partial = value.primal() * p.binned.acde / tox_cm;
+                (value, partial)
+            };
+        let centroid = smooth_drain(vds.constant(ldeb), centroid, 1e-3 * tox)?;
         let tcen = centroid.effective;
-        dtcen_dvg *= centroid.drain_partial;
-        dtcen_dvb *= centroid.drain_partial;
+        let centroid_partial = centroid_partial * centroid.drain_partial.primal();
+        let dtcen_dvg = centroid_partial * cv.d_vgs_eff_dvg;
+        let dtcen_dvb = -centroid_partial * dvbseff_cv_dvb;
+        let coxeff = effective_oxide(&tcen, cox)?;
+        let oxide_partial = -coxeff.primal() * coxeff.primal() / EPS_SI;
+        let dcoxeff_dvg = oxide_partial * dtcen_dvg;
+        let dcoxeff_dvb = oxide_partial * dtcen_dvb;
+        let cox_wl_cen = coxeff.clone().scale(area);
+        let qac0 = cox_wl_cen.clone().scale(-1.).multiply(&flatband_drop);
+        let qov_cox = qac0.primal() / coxeff.primal();
+        let dqac0_dvg = qov_cox.mul_add(dcoxeff_dvg, cox_wl_cen.primal() * dvfbeff_dvg);
+        let dqac0_dvb = qov_cox.mul_add(dcoxeff_dvb, cox_wl_cen.primal() * dvfbeff_dvb);
 
-        let ccen = EPS_SI / tcen;
-        let t2 = cox / (cox + ccen);
-        let coxeff = t2 * ccen;
-        let t3 = -ccen / tcen;
-        let mut dcoxeff_dvg = t2 * t2 * t3;
-        let dcoxeff_dvb = dcoxeff_dvg * dtcen_dvb;
-        dcoxeff_dvg *= dtcen_dvg;
-        let cox_wl_cen = cox_wl * coxeff / cox;
-
-        let qac0 = -cox_wl_cen * flatband_drop;
-        let qov_cox = qac0 / coxeff;
-        let dqac0_dvg = qov_cox.mul_add(dcoxeff_dvg, cox_wl_cen * dvfbeff_dvg);
-        let dqac0_dvb = qov_cox.mul_add(dcoxeff_dvb, cox_wl_cen * dvfbeff_dvb);
-
-        // Poly-gate depletion share of the bulk charge.
+        // Poly-gate depletion share of bulk charge.
         let k1ox = p.derived.k1ox;
-        let t3 = cv.vgs_eff - vfbeff - vbseff_cv - vgsteff;
-        let (charge, slope) = depletion_charge(k1ox, t3)?;
-        let qsub0 = cox_wl_cen * charge;
-        let t2 = cox_wl_cen * slope;
-        let qov_cox = qsub0 / coxeff;
+        let depletion_argument = cv
+            .vgs_eff
+            .clone()
+            .add(&vfbeff.scale(-1.))
+            .add(&vbseff_cv.scale(-1.))
+            .add(&vgsteff.clone().scale(-1.));
+        let (charge, slope) = depletion_charge(k1ox, depletion_argument)?;
+        let qsub0 = cox_wl_cen.clone().multiply(&charge);
+        let t2 = cox_wl_cen.primal() * slope.primal();
+        let qov_cox = qsub0.primal() / coxeff.primal();
         let dqsub0_dvg = qov_cox.mul_add(
             dcoxeff_dvg,
             t2 * (cv.d_vgs_eff_dvg - dvfbeff_dvg - dvgsteff_dvg),
@@ -284,67 +305,66 @@ impl ChargeModel<'_> {
             -t2 * (dvfbeff_dvb + dvbseff_cv_dvb + dvgsteff_dvb),
         );
 
-        let (vgdp, dvgdp_dvg) =
-            charge_overdrive(vgsteff, k1ox, p.binned.moin, cv.vtm, p.derived.sqrtphi)?;
+        let (vgdp, dvgdp_dvg) = charge_overdrive(
+            vgsteff.clone(),
+            k1ox,
+            p.binned.moin,
+            cv.vtm,
+            p.derived.sqrtphi,
+        )?;
+        let dvgdp_dvg = dvgdp_dvg.primal();
 
-        // Bias-dependent channel thickness for the inversion charge.
-        let t3 = 4.0 * (cv.vth - vfbzb - cv.phi);
-        tox_cm += tox_cm;
-        let (t0, dt0_dvd, dt0_dvb) = if t3 >= 0.0 {
-            (
-                (vgsteff + t3) / tox_cm,
-                4.0f64.mul_add(cv.d_vth_dvd, dvgsteff_dvd) / tox_cm,
-                4.0f64.mul_add(cv.d_vth_dvb, dvgsteff_dvb) / tox_cm,
-            )
-        } else {
-            (
-                (vgsteff + 1.0e-20) / tox_cm,
-                dvgsteff_dvd / tox_cm,
-                dvgsteff_dvb / tox_cm,
-            )
-        };
-        let tmp = (0.7 * t0.ln()).exp();
-        let t1 = 1.0 + tmp;
-        let t2 = 0.7 * tmp / (t0 * tox_cm);
-        let tcen = 1.9e-9 / t1;
-        let mut dtcen_dvg2 = -1.9e-9 * t2 / t1 / t1;
-        let mut dtcen_dvd = tox_cm * dtcen_dvg2;
-        let dtcen_dvb2 = dtcen_dvd * dt0_dvb;
-        dtcen_dvd *= dt0_dvd;
-        dtcen_dvg2 *= dvgsteff_dvg;
-
-        let ccen = EPS_SI / tcen;
-        let t0 = cox / (cox + ccen);
-        let coxeff = t0 * ccen;
-        let t1 = -ccen / tcen;
-        let mut dcoxeff_dvg = t0 * t0 * t1;
-        let dcoxeff_dvd = dcoxeff_dvg * dtcen_dvd;
-        let dcoxeff_dvb = dcoxeff_dvg * dtcen_dvb2;
-        dcoxeff_dvg *= dtcen_dvg2;
-        let cox_wl_cen = cox_wl * coxeff / cox;
+        // Bias-dependent channel thickness for inversion charge.
+        let threshold_offset = cv.vth.clone().offset(-vfbzb - cv.phi).scale(4.);
+        let tox_cm = 2. * tox_cm;
+        let (field, dfield_dvd, dfield_dvb) =
+            if threshold_offset.compare(0.) != Some(Ordering::Less) {
+                (
+                    vgsteff.clone().add(&threshold_offset).scale(tox_cm.recip()),
+                    4.0_f64.mul_add(cv.d_vth_dvd, dvgsteff_dvd) / tox_cm,
+                    4.0_f64.mul_add(cv.d_vth_dvb, dvgsteff_dvb) / tox_cm,
+                )
+            } else {
+                (
+                    vgsteff.offset(1e-20).scale(tox_cm.recip()),
+                    dvgsteff_dvd / tox_cm,
+                    dvgsteff_dvb / tox_cm,
+                )
+            };
+        let power = field.clone().ln()?.scale(0.7).exp();
+        let divisor = power.clone().offset(1.);
+        let tcen = field.constant(1.9e-9).divide(&divisor)?;
+        let centroid_partial =
+            -tcen.primal() * 0.7 * power.primal() / (field.primal() * divisor.primal());
+        let coxeff = effective_oxide(&tcen, cox)?;
+        let oxide_partial = -coxeff.primal() * coxeff.primal() / EPS_SI * centroid_partial;
+        let dcoxeff_dvg = oxide_partial * dvgsteff_dvg / tox_cm;
+        let dcoxeff_dvd = oxide_partial * dfield_dvd;
+        let dcoxeff_dvb = oxide_partial * dfield_dvb;
+        let cox_wl_cen = coxeff.clone().scale(area);
 
         // Effective drain voltage for C-V.
-        let abulk_cv = cv.abulk0 * p.thermal.abulkcvfactor;
+        let abulk_cv = cv.abulk0.clone().scale(p.thermal.abulkcvfactor);
         let dabulk_cv_dvb = p.thermal.abulkcvfactor * cv.d_abulk0_dvb;
-        let vdsat_cv = vgdp / abulk_cv;
-        let smoothing = smooth_drain(vdsat_cv, vds_mode, DELTA_4)?;
+        let vdsat_cv = vgdp.clone().divide(&abulk_cv)?;
+        let smoothing = smooth_drain(vdsat_cv.clone(), vds_mode.clone(), DELTA_4)?;
         let vdseff_cv = smoothing.effective;
-        let dvdseff_cv_dvg = smoothing.saturation_partial * dvgdp_dvg / abulk_cv;
-        let dvdseff_cv_dvd = smoothing.drain_partial;
-        // The BSIM3 capMod=3 scalar load uses (1 - T5) instead of
-        // (T4 - T5) in the body derivative of the negative-root branch.
-        // Its published capacitance/stamp convention therefore differs
-        // from the exact derivative of its charge by the saturation gap.
-        // Keep this discrepancy at the scalar load boundary; the shared
-        // smoothing law itself returns the actual physical partials.
-        let saturation_factor = if vdsat_cv - vds_mode - DELTA_4 < 0. && vds_mode.abs() > 0. {
+        let dvdseff_cv_dvg = smoothing.saturation_partial.primal() * dvgdp_dvg / abulk_cv.primal();
+        let dvdseff_cv_dvd = smoothing.drain_partial.primal();
+        // Preserve the BSIM3 scalar reference capacitance convention at
+        // the negative-root branch. The charge law differentiates its
+        // actual effective drain voltage instead.
+        let saturation_factor = if vdsat_cv.primal() - vds_mode.primal() - DELTA_4 < 0.
+            && vds_mode.primal().abs() > 0.
+        {
             smoothing
                 .saturation_partial
-                .mul_add(vdsat_cv, smoothing.saturation_excess)
+                .primal()
+                .mul_add(vdsat_cv.primal(), smoothing.saturation_excess.primal())
         } else {
-            smoothing.saturation_partial * vdsat_cv
+            smoothing.saturation_partial.primal() * vdsat_cv.primal()
         };
-        let dvdseff_cv_dvb = -saturation_factor * dabulk_cv_dvb / abulk_cv;
+        let dvdseff_cv_dvb = -saturation_factor * dabulk_cv_dvb / abulk_cv.primal();
 
         let [inversion, bulk, source] = channel_inversion(
             &vgdp,
@@ -362,20 +382,22 @@ impl ChargeModel<'_> {
                 dvdseff_cv_dvg.mul_add(dvgsteff_dvb, dvdseff_cv_dvb),
             ],
             bulk: [0., 0., dabulk_cv_dvb],
-            relative_oxide: [dcoxeff_dvg, dcoxeff_dvd, dcoxeff_dvb].map(|slope| slope / coxeff),
+            relative_oxide: [dcoxeff_dvg, dcoxeff_dvd, dcoxeff_dvb]
+                .map(|slope| slope / coxeff.primal()),
         };
         let [cgg1, cgd1, cgb1] = chain.apply(&inversion);
         let [cbg1, cbd1, cbb1] = chain.apply(&bulk);
         let [csg, csd, mut csb] = chain.apply(&source);
         let qgate = inversion.value;
-        let qinoi = qgate;
+        let qinoi = qgate.clone();
         let qbulk = bulk.value;
         let qsrc = source.value;
 
         // Fold the accumulation/subthreshold charges into gate and bulk.
-        let qgate = qgate + qac0 + qsub0 - qbulk;
-        let qbulk = qbulk - (qac0 + qsub0);
-        let qdrn = -(qgate + qbulk + qsrc);
+        let accumulation = qac0.add(&qsub0);
+        let qgate = qgate.add(&accumulation).add(&qbulk.clone().scale(-1.));
+        let qbulk = qbulk.add(&accumulation.scale(-1.));
+        let qdrn = qgate.clone().add(&qbulk).add(&qsrc).scale(-1.);
 
         let cbg = cbg1 - dqac0_dvg - dqsub0_dvg;
         let cbd = cbd1 - dqsub0_dvd;
@@ -402,7 +424,7 @@ impl ChargeModel<'_> {
         let cgdo_param = p.cgdo;
         let cgso_param = p.cgso;
         let ck = p.binned.ckappa;
-        let vgd = vgs - vds;
+        let vgd = vgs.clone().add(&vds.clone().scale(-1.));
 
         let (cgdo, qgdo) = overlap(vgd, cgdo_param, p.weff_cv * p.binned.cgdl, ck)?;
         let (cgso, qgso) = overlap(vgs, cgso_param, p.weff_cv * p.binned.cgsl, ck)?;
@@ -416,7 +438,7 @@ impl ChargeModel<'_> {
         let source = junction_parts(t, m, p.source_area, p.source_perimeter, p.weff);
         let drain = junction_parts(t, m, p.drain_area, p.drain_perimeter, p.weff);
         let (qbs, capbs) = depletion(&vbs, source, |_| {})?;
-        let (qbd, capbd) = depletion(&(vbs - vds), drain, |_| {})?;
+        let (qbd, capbd) = depletion(&vbs.add(&vds.scale(-1.)), drain, |_| {})?;
 
         let result = ChargeEvaluation {
             qgate,
@@ -432,24 +454,24 @@ impl ChargeModel<'_> {
             cbgb,
             cbdb,
             cbsb,
-            cgdo,
-            cgso,
+            cgdo: cgdo.primal(),
+            cgso: cgso.primal(),
             cgbo,
             qgdo,
             qgso,
-            capbs,
-            capbd,
+            capbs: capbs.primal(),
+            capbd: capbd.primal(),
             qbs,
             qbd,
-            qinv: -qinoi,
+            qinv: qinoi.scale(-1.),
         };
         for (name, value) in [
-            ("qgate", result.qgate),
-            ("qbulk", result.qbulk),
-            ("qdrn", result.qdrn),
-            ("qsrc", result.qsrc),
-            ("qbs", result.qbs),
-            ("qbd", result.qbd),
+            ("qgate", result.qgate.primal()),
+            ("qbulk", result.qbulk.primal()),
+            ("qdrn", result.qdrn.primal()),
+            ("qsrc", result.qsrc.primal()),
+            ("qbs", result.qbs.primal()),
+            ("qbd", result.qbd.primal()),
             ("capbs", result.capbs),
             ("capbd", result.capbd),
             ("cggb", result.cggb),
@@ -473,6 +495,14 @@ impl ChargeModel<'_> {
         }
         Ok(result)
     }
+}
+
+/// Series oxide/centroid capacitance in the nonsingular form, including
+/// the zero-centroid limit.
+fn effective_oxide<S: Constitutive>(centroid: &S, oxide: Real) -> SpiceResult<S> {
+    centroid
+        .constant(oxide * EPS_SI)
+        .divide(&centroid.clone().scale(oxide).offset(EPS_SI))
 }
 
 /// `b3ld.c`'s zero-bias junction capacitances for one junction, split into the

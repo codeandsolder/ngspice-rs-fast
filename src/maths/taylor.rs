@@ -5,6 +5,7 @@
 //! use coefficient recurrences, not differences of nearly equal samples.
 
 mod arithmetic;
+pub(crate) use arithmetic::{BranchComparison, ObservedDifferential};
 pub mod differential;
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
@@ -26,8 +27,12 @@ pub(crate) trait Constitutive: Clone {
     fn exp(self) -> Self;
     fn exp_with_primal(self, value: Real) -> Self;
     fn compose_derivative(self, value: Real, slope: &Self) -> Self;
+    /// Lift an analytic multivariate law from its primal and local partial
+    /// series, without subtracting nearly equal intermediate derivatives.
+    fn with_partials<const N: usize>(self, inputs: [&Self; N], partials: [&Self; N]) -> Self;
     fn exp_m1(self) -> Self;
     fn ln_1p(self) -> SpiceResult<Self>;
+    fn ln(self) -> SpiceResult<Self>;
 }
 
 /// The resource ceiling for a single local Taylor expansion.
