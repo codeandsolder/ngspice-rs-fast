@@ -520,6 +520,22 @@ pub(super) struct ReactiveLoad<'a> {
 }
 
 impl ReactiveLoad<'_> {
+    fn exact_initial(&self) -> Option<Real> {
+        self.bias
+            .and_then(crate::devices::passive_bias::PassiveInitialization::exact_initial)
+    }
+
+    fn exact_bias_history(context: &StampContext<'_>) -> bool {
+        context.mode.is_bias()
+            && context.bias_analysis == Some(crate::primitives::AnalysisKind::Transient)
+    }
+
+    fn retained_quantity(&self, context: &StampContext<'_>) -> SpiceResult<Real> {
+        context.states.accepted(1, QUANTITY).ok_or_else(|| {
+            SpiceError::circuit(format!("{}: no accepted startup storage", self.name))
+        })
+    }
+
     /// Perform `NIintegrate` and publish the trial charge/flux and derivative.
     /// MODEINITTRAN patches state1 before integration and its derivative
     /// afterwards; the trial owns those patches until acceptance.
@@ -552,6 +568,12 @@ impl ReactiveLoad<'_> {
             bias.stamp_capacitor(self.terminals, context)?;
         }
         if context.mode.is_dc() {
+            let charge = if Self::exact_bias_history(context) {
+                self.exact_initial()
+                    .map_or(charge, |voltage| self.value * voltage)
+            } else {
+                charge
+            };
             return record_dc_state(context, charge);
         }
         if context.mode.is_ac() {
@@ -566,6 +588,8 @@ impl ReactiveLoad<'_> {
                 .states
                 .accepted(1, QUANTITY)
                 .ok_or_else(|| SpiceError::circuit(format!("{}: no accepted charge", self.name)))?
+        } else if initial && !context.states.uic() && self.exact_initial().is_some() {
+            self.retained_quantity(context)?
         } else if initial && context.states.uic() {
             // cond1 (MODEUIC && MODEINITTRAN): vcap = CAPinitCond, which
             // CAPgetic defaults to the node voltages of the uic start vector
@@ -592,9 +616,22 @@ impl ReactiveLoad<'_> {
 
     pub(super) fn stamp_inductor(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
         let row = context.branch(0)?;
-        let mut flux = self.value * context.row_value(row)?;
+        let exact_bias = Self::exact_bias_history(context);
+        let current = context.row_value(row)?;
+        let mut flux = self.value
+            * if exact_bias {
+                self.exact_initial().unwrap_or(current)
+            } else {
+                current
+            };
         for term in context.mutual {
-            let mutual_flux = term.inductance * context.row_value(term.row)?;
+            let current = context.row_value(term.row)?;
+            let mutual_flux = term.inductance
+                * if exact_bias {
+                    term.exact_startup.unwrap_or(current)
+                } else {
+                    current
+                };
             flux += mutual_flux;
         }
         if context.mode.is_dc() {
@@ -624,6 +661,15 @@ impl ReactiveLoad<'_> {
                 .states
                 .accepted(1, QUANTITY)
                 .ok_or_else(|| SpiceError::circuit(format!("{}: no accepted flux", self.name)))?
+        } else if initial
+            && !context.states.uic()
+            && (self.exact_initial().is_some()
+                || context
+                    .mutual
+                    .iter()
+                    .any(|term| term.exact_startup.is_some()))
+        {
+            self.retained_quantity(context)?
         } else if initial && context.states.uic() {
             // MODEUIC && MODEINITTRAN: INDinduct/m * INDinitCond, plus each
             // MUTfactor * the coupled inductor's INDinitCond.
@@ -777,6 +823,14 @@ impl Device for Capacitor {
         policy.check_kind(crate::devices::traits::StorageKind::Capacitor)?;
         self.bias = Some(Box::new(policy));
         Ok(())
+    }
+
+    fn exact_startup_storage(&self) -> Option<Real> {
+        self.load().exact_initial()
+    }
+
+    fn requires_analysis_context(&self) -> bool {
+        self.has_passive_bias() || self.exact_startup_storage().is_some()
     }
 
     fn has_passive_bias(&self) -> bool {
@@ -1058,6 +1112,14 @@ impl Device for Inductor {
         Ok(())
     }
 
+    fn exact_startup_storage(&self) -> Option<Real> {
+        self.load().exact_initial()
+    }
+
+    fn requires_analysis_context(&self) -> bool {
+        self.has_passive_bias() || self.exact_startup_storage().is_some()
+    }
+
     fn has_passive_bias(&self) -> bool {
         crate::devices::passive_bias::has_constraints(self.bias.as_deref())
     }
@@ -1188,6 +1250,7 @@ impl Device for Inductor {
             effective: self.inductance,
             coupling_base: self.inductance,
             initial: self.load().initial.unwrap_or(0.),
+            exact_startup: self.exact_startup_storage(),
         }))
     }
 

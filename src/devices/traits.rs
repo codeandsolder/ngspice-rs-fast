@@ -349,6 +349,8 @@ pub struct MutualTerm {
     /// The coupled inductor's `ic=` (C `INDinitCond`, zero when absent),
     /// which `INDload` uses for the mutual flux of a `uic` first step.
     pub initial: Real,
+    /// Optional exact non-UIC startup current of the coupled winding.
+    pub exact_startup: Option<Real>,
 }
 
 /// The inductance of an inductor, as mutual coupling sees it
@@ -363,6 +365,8 @@ pub struct InductanceValue {
     pub coupling_base: Real,
     /// The `ic=` initial current (C `INDinitCond`, zero when absent).
     pub initial: Real,
+    /// Exact startup current, if prescribed independently of bias.
+    pub exact_startup: Option<Real>,
 }
 
 /// What a K (mutual inductance) device couples: every pair of the named
@@ -1042,6 +1046,12 @@ pub trait Device: fmt::Debug + std::any::Any {
         Err(SpiceError::circuit(
             "prepared initialization requires a physical capacitor or inductor",
         ))
+    }
+
+    /// Explicit storage coordinate that also supersedes the solved non-UIC
+    /// startup bias. Ordinary native ICs remain UIC-only.
+    fn exact_startup_storage(&self) -> Option<Real> {
+        None
     }
 
     /// True when bias equations need physical nodal continuation rather

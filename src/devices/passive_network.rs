@@ -5,8 +5,10 @@
 //! resolved separately; the winding, storage and terminal identities are
 //! intentionally distinct.
 
+mod bias;
 mod damping;
 mod report;
+use bias::TerminalBias;
 use damping::DampingShunt;
 pub use damping::{AnalysisDamping, ConductanceLaw};
 pub(super) use report::CurrentReportSpec;
@@ -19,6 +21,8 @@ use crate::devices::{
     rlc::REACTIVE_STATE_COUNT,
     sources::{SourceExcitation, SourceInputs},
 };
+use std::sync::Arc;
+
 use crate::primitives::{Complex, NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 /// Resolved physical coefficients of one parallel copy of a storage network.
@@ -271,6 +275,12 @@ impl PreparedPassiveNetwork {
         }))
     }
 
+    fn terminal_bias(&self) -> Option<&PassiveInitialization> {
+        self.initialization
+            .as_ref()
+            .filter(|policy| policy.terminal_bias() && policy.has_constraints())
+    }
+
     fn validate(
         input: &PassiveNetworkCoefficients,
         initialization: Option<&PassiveInitialization>,
@@ -364,7 +374,10 @@ impl PreparedPassiveNetwork {
 
     pub(super) fn size(&self) -> ElaborationSize {
         ElaborationSize::new(
-            self.edges.len() + 1 + usize::from(self.primary_probe),
+            self.edges.len()
+                + 1
+                + usize::from(self.primary_probe)
+                + usize::from(self.terminal_bias().is_some()),
             self.nodes - 1 + usize::from(self.primary_probe),
             self.edges
                 .iter()
@@ -393,11 +406,7 @@ impl PreparedPassiveNetwork {
             )?);
         }
         let mut devices: Vec<Box<dyn Device>> = Vec::new();
-        reserve(
-            &mut devices,
-            self.edges.len() + 1 + usize::from(self.primary_probe),
-            None,
-        )?;
+        reserve(&mut devices, self.size().devices, None)?;
         let primary = if self.primary_probe {
             format!("v{}#primary", binding.primary)
         } else {
@@ -416,6 +425,14 @@ impl PreparedPassiveNetwork {
             [positive, alias],
             report,
         )?));
+        let terminal_bias = self.terminal_bias().map(|policy| Arc::new(policy.clone()));
+        if let Some(policy) = &terminal_bias {
+            devices.push(Box::new(TerminalBias {
+                name: format!("{}#terminal_bias", binding.primary),
+                terminals: [alias, negative],
+                policy: Arc::clone(policy),
+            }));
+        }
         for edge in &self.edges {
             let name = edge.role.name(&binding.primary);
             let mut terminals = edge.nodes.map(|index| ids[index]);
@@ -428,30 +445,42 @@ impl PreparedPassiveNetwork {
                 )?));
                 terminals[0] = sense;
             }
-            let mut device: Box<dyn Device> = match edge.element {
-                Element::Resistance(r) => Box::new(Resistor::new(name, terminals, r)?.with_noise(
-                    ResistorNoise {
+            // The alternate terminal bias replaces shunt paths; the ordinary
+            // series chain remains connected, with the primary storage open
+            // (C) or carrying its prescribed winding current (L).
+            let excluded = terminal_bias
+                .as_ref()
+                .filter(|_| edge.role != Role::SeriesResistance)
+                .cloned();
+            let mut device: Box<dyn Device> =
+                match edge.element {
+                    Element::Resistance(r) if excluded.is_some() => Box::new(
+                        DampingShunt::resistive(name, terminals, r, self.temperature, excluded),
+                    ),
+                    Element::Resistance(r) => Box::new(
+                        Resistor::new(name, terminals, r)?.with_noise(ResistorNoise {
+                            temperature: self.temperature,
+                            ..Default::default()
+                        }),
+                    ),
+                    Element::Damping(damping) => Box::new(DampingShunt {
+                        name,
+                        terminals,
+                        damping,
                         temperature: self.temperature,
-                        ..Default::default()
-                    },
-                )),
-                Element::Damping(damping) => Box::new(DampingShunt {
-                    name,
-                    terminals,
-                    damping,
-                    temperature: self.temperature,
-                }),
-                Element::Storage(StorageKind::Capacitor, c) => {
-                    Box::new(Capacitor::new(name, terminals, c, None)?)
-                }
-                Element::Storage(StorageKind::Inductor, l) => {
-                    Box::new(Inductor::new(name, terminals, l, None)?)
-                }
-            };
+                        excluded_bias: excluded,
+                    }),
+                    Element::Storage(StorageKind::Capacitor, c) => {
+                        Box::new(Capacitor::new(name, terminals, c, None)?)
+                    }
+                    Element::Storage(StorageKind::Inductor, l) => {
+                        Box::new(Inductor::new(name, terminals, l, None)?)
+                    }
+                };
             if edge.role == Role::Primary
                 && let Some(policy) = &self.initialization
             {
-                device.bind_passive_initialization(policy.clone())?;
+                device.bind_passive_initialization(policy.primary_policy())?;
             }
             devices.push(device);
         }
@@ -843,13 +872,32 @@ impl NetworkPlan {
             StorageKind::Inductor => value * multiplicity,
         });
         let mut constraints = Vec::new();
-        for (analysis, key) in [
-            (AnalysisKind::OperatingPoint, "pn_bias_op"),
-            (AnalysisKind::DcSweep, "pn_bias_dc"),
-            (AnalysisKind::Ac, "pn_bias_ac"),
-            (AnalysisKind::Transient, "pn_bias_tran"),
+        let terminal = ["op", "dc", "ac", "tran"]
+            .into_iter()
+            .any(|phase| coefficients.contains_key(format!("pn_terminal_bias_{phase}").as_str()));
+        let exact = match coefficients.get("pn_exact_ic").copied().unwrap_or(0.) {
+            0. => false,
+            1. => true,
+            _ => {
+                return Err(SpiceError::circuit(
+                    "exact startup history selector must be 0 or 1",
+                ));
+            }
+        };
+        for (analysis, phase) in [
+            (AnalysisKind::OperatingPoint, "op"),
+            (AnalysisKind::DcSweep, "dc"),
+            (AnalysisKind::Ac, "ac"),
+            (AnalysisKind::Transient, "tran"),
         ] {
-            let Some(&g) = coefficients.get(key) else {
+            let storage = coefficients.get(format!("pn_bias_{phase}").as_str());
+            let external = coefficients.get(format!("pn_terminal_bias_{phase}").as_str());
+            if terminal && storage.is_some() {
+                return Err(SpiceError::circuit(
+                    "cannot mix storage and terminal bias equations",
+                ));
+            }
+            let Some(&g) = storage.or(external) else {
                 continue;
             };
             let target = initial.ok_or_else(|| {
@@ -858,7 +906,7 @@ impl NetworkPlan {
             if !g.is_finite() || g < 0. {
                 return Err(SpiceError::circuit("invalid physical bias conductance"));
             }
-            let conductance = g * multiplicity;
+            let conductance = if terminal { g } else { g * multiplicity };
             let bias = match kind {
                 StorageKind::Capacitor => PassiveBias::Voltage {
                     voltage: target,
@@ -873,11 +921,17 @@ impl NetworkPlan {
                 constraints.push((analysis, bias));
             }
         }
-        if initial.is_none() && constraints.is_empty() {
-            Ok(None)
-        } else {
-            PassiveInitialization::new(kind, initial, constraints).map(Some)
+        if initial.is_none() && constraints.is_empty() && !exact {
+            return Ok(None);
         }
+        let mut policy = PassiveInitialization::new(kind, initial, constraints)?;
+        if terminal {
+            policy = policy.with_terminal_bias();
+        }
+        if exact {
+            policy = policy.with_exact_history()?;
+        }
+        Ok(Some(policy))
     }
 
     pub(super) fn size(&self) -> ElaborationSize {

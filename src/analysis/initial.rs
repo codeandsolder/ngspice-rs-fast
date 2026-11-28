@@ -363,6 +363,7 @@ fn bound_initial_coordinates(
                 equation: AbsoluteRow(rows.start + coordinate.equation),
                 history: coordinate.history,
                 device: index,
+                exact_startup: device.exact_startup_storage().is_some(),
             },
         ));
     }
@@ -417,6 +418,7 @@ fn bound_initial_voltage(
         negative,
         voltage,
         equation,
+        exact_startup: device.exact_startup_storage().is_some(),
     }))
 }
 
@@ -434,6 +436,7 @@ struct FixedCoordinate {
     equation: AbsoluteRow,
     history: InitialCoordinateHistory,
     device: usize,
+    exact_startup: bool,
 }
 
 struct CapacitorInitial {
@@ -444,6 +447,7 @@ struct CapacitorInitial {
     equation: Option<AbsoluteRow>,
     slot: usize,
     scale: Real,
+    exact_startup: bool,
 }
 
 struct LocalChargeInitial {
@@ -1001,11 +1005,15 @@ pub(super) fn has_derived_storage(circuit: &Circuit) -> bool {
 impl ImpulseStorage {
     fn retain_operating_point(&mut self, state: &Vector) {
         for (&AbsoluteRow(row), coordinate) in &mut self.fixed_coordinates {
-            coordinate.value = state.as_slice()[row];
+            if !coordinate.exact_startup {
+                coordinate.value = state.as_slice()[row];
+            }
         }
         for capacitor in &mut self.capacitors {
-            capacitor.voltage =
-                potential(state, capacitor.positive) - potential(state, capacitor.negative);
+            if !capacitor.exact_startup {
+                capacitor.voltage =
+                    potential(state, capacitor.positive) - potential(state, capacitor.negative);
+            }
         }
     }
 

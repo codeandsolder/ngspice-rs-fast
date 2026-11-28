@@ -61,6 +61,16 @@ impl Device for ModelPassive {
         Ok(())
     }
 
+    fn exact_startup_storage(&self) -> Option<Real> {
+        self.bias
+            .as_deref()
+            .and_then(crate::devices::passive_bias::PassiveInitialization::exact_initial)
+    }
+
+    fn requires_analysis_context(&self) -> bool {
+        self.has_passive_bias() || self.exact_startup_storage().is_some()
+    }
+
     fn has_passive_bias(&self) -> bool {
         crate::devices::passive_bias::has_constraints(self.bias.as_deref())
     }
@@ -353,6 +363,7 @@ impl Device for ModelPassive {
                 effective: self.parameters.effective_value(context)?,
                 coupling_base: self.parameters.coupling_value(context)?,
                 initial: self.initial_condition().unwrap_or(0.),
+                exact_startup: self.exact_startup_storage(),
             })
         })
     }
