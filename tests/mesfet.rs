@@ -1035,7 +1035,7 @@ fn physical_statz_ramp_currents_match_continuous_partition() -> Result<(), Spice
         for method in ["gear", "trap"] {
             let plots = FIXTURE.run_all(&format!(
                 "vd d 0 PWL(0 {} 40u {})\nvg g 0 PWL(0 {} 40u {})\nz1 d g 0 zm area=2 m=3\n.model zm {family}(vto=-1.8 beta=3m lambda=0.05 alpha=2.5 b=0.4 is=1p cgs=20p cgd=5p pb=0.8)\nb1 first 0 v=1m*ddt(v(g))\nb2 out 0 v=1m*ddt(v(first))\nr1 out 0 1k\n.options method={method} reltol=1e-8 vntol=1n\n.tran 1u 20u 0 1u uic",
-                pol*0.3,pol*(-0.2),pol*(-0.7),pol*(-0.5)
+                pol*0.3,pol*(-0.7),pol*(-0.7),pol*(-0.3)
             ))?;
             let p = &plots[0];
             for index in 0..p.point_count() {

@@ -112,6 +112,32 @@ bias dependence, not frozen as in the ordinary C Newton load. On the
 substrate exponential clamp the physical derivative is the derivative of
 the clamped current, not the C load's retained exponential slope.
 
+## Path-dependent storage and MESFET Statz partition
+
+A non-exact differential charge form, `dq = C(x) dv`, requires a
+separate charge coordinate for each independent history pair. Append
+these coordinates to the physical derivative system only; the ordinary
+companion MNA topology and accepted history layout stay unchanged.
+The internal equation is `dq/dt - C(x) dv/dt = 0`, and the same charge
+coordinate contributes to electrical KCL by its declared signed incidence.
+Retain separate Jacobian jets for the state and state-rate dependence of
+this rate term. The derivative array convolves both, differentiating the
+rate input with the normalized-time scale. Project the solved coordinates
+back into the original MNA vector and their canonical history slots.
+
+The MESFET Statz kernel uses the continuous limit of the C rectangle
+partition: `dqgs = Q_gs dvgs` and `dqgd = Q_gd dvgd`. The total charge
+partials come from the smoothed Statz law, including its forward clamp.
+The two retained charges are not individually voltage-only functions.
+Their normalized values and rates exclude instance polarity and
+multiplicity; electrical stamps restore both. Channel and junction
+currents use analytic normal/inverse, cutoff and saturation germs.
+The physical path is not a replacement for the finite-step C companion.
+At a source event, preserve both retained charges and control voltages;
+an incompatible voltage jump has no specified continuous charge path
+and receives an explicit impulse diagnostic. Memoryless scalar evaluation
+is valid only for the zero-charge MESFET variant.
+
 ## Boundary of memoryless storage
 
 A device's AC capacitance is not sufficient to specify its physical charge.

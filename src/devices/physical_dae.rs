@@ -131,7 +131,7 @@ impl<'run, 'circuit> PhysicalDae<'run, 'circuit> {
         &self.storage_bindings
     }
 
-    pub(crate) fn original_width(&self) -> usize {
+    pub(crate) const fn original_width(&self) -> usize {
         self.linear.a.rows()
     }
 

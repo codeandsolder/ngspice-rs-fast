@@ -1,6 +1,6 @@
 //! Continuous Statz partition, independently integrated in each gate branch.
 //! The incremental C companion uses the average of two rectangular paths;
-//! shrinking the rectangle gives dqgs = Q_gs dvgs, dqgd = Q_gd dvgd.
+//! shrinking the rectangle gives `dqgs = Q_gs dvgs`, `dqgd = Q_gd dvgd`.
 use super::{DEL, Mesfet, Model, Operating, VMAX, VT0, jfet, slot};
 use crate::devices::nonlinear::taylor::junction_differential;
 use crate::devices::physical_dae::{TaylorContext, TaylorControl};
@@ -22,7 +22,7 @@ fn smooth_high(a: &Law, b: &Law, width: Real) -> SpiceResult<(Law, [Law; 2])> {
     // Scale before squaring; neither a large voltage nor a small smoothing
     // width alone should overflow the norm calculation.
     let norm = distance.value.value().abs().max(width);
-    let scaled = distance.clone().scale(norm.recip());
+    let scaled = distance.scale(norm.recip());
     let span = scaled
         .clone()
         .multiply(&scaled)
