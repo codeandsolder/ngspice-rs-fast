@@ -209,16 +209,55 @@ fn nested_temperature_and_width_sweeps_match_c() {
     // Both inner axes return to their starting value when the outer one
     // advances. Cached snapshots must restore preparation-owned fields,
     // while load-only fields continue from the preceding operating point.
-    for (label, card) in [
-        ("temp-inner", ".dc temp 27 47 20 @m1[w] 0.3u 0.6u 0.3u"),
-        ("width-inner", ".dc @m1[w] 0.3u 0.6u 0.3u temp 27 47 20"),
+    for (label, card, points) in [
+        (
+            "temp-inner",
+            ".dc temp 27 47 20 @m1[w] 0.3u 0.6u 0.3u",
+            [(27., 0.3e-6), (47., 0.3e-6), (27., 0.6e-6), (47., 0.6e-6)],
+        ),
+        (
+            "width-inner",
+            ".dc @m1[w] 0.3u 0.6u 0.3u temp 27 47 20",
+            [(27., 0.3e-6), (27., 0.6e-6), (47., 0.3e-6), (47., 0.6e-6)],
+        ),
     ] {
-        let deck = amplifier("", card);
-        let c = c_plots(&binary, &deck, label);
-        let rust = rust_plots(&deck);
-        assert_eq!(c.len(), rust.len(), "{label}: plot count");
-        for (c, rust) in c.iter().zip(&rust) {
-            compare(c, rust, label);
+        let rust = rust_plots(&amplifier("", card));
+        assert_eq!(rust.len(), 1, "{label}: plot count");
+        let rust = &rust[0];
+        assert_eq!(
+            rust.point_count(),
+            points.len(),
+            "{label}: grid point count"
+        );
+        // C's DC transfer dispatcher supports source, resistor and
+        // temperature sweeps, not arbitrary MOS instance parameters.
+        // Independently prepare a C circuit at every point instead.
+        for (index, (temperature, width)) in points.into_iter().enumerate() {
+            let axis = if label == "temp-inner" {
+                temperature
+            } else {
+                width
+            };
+            let row = rust.row(index).unwrap();
+            assert!(
+                (row[0].re - axis).abs() <= axis.abs() * 1e-12,
+                "{label}: axis {index}"
+            );
+            let point_label = format!("{label}-{index}-T{temperature}-W{width:e}");
+            let deck = amplifier("", ".op")
+                .replace("w=0.5u", &format!("w={width:e}"))
+                .replace("\n.op\n", &format!("\n.temp {temperature}\n.op\n"));
+            let c = c_plots(&binary, &deck, &point_label);
+            assert_eq!(c.len(), 1, "{point_label}: C plot count");
+            assert_eq!(c[0].point_count(), 1, "{point_label}: C point count");
+            let mut point = Plot::new(
+                &rust.name,
+                &rust.plotname,
+                rust.flags(),
+                rust.variables().to_vec(),
+            );
+            point.push_point(row).unwrap();
+            compare(&c[0], &point, &point_label);
         }
     }
 }
