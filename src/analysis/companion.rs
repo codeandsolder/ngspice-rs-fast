@@ -2622,11 +2622,12 @@ mod step_control_tests {
         let mut cursor = AcceptedCursor::initial(&settings);
         cursor.clock.time = settings.stop.next_down();
         cursor.clock.phase = Phase::Continuing;
+        let start = cursor.clock.time;
         let mut ready = cursor.prepare(&settings, &mut breaks, false).unwrap();
         ready.limit_to_event(settings.stop);
         let attempt = ready.begin(&StepHistory::new(), &settings).unwrap();
         assert_eq!(attempt.clock.time, settings.stop);
-        assert_eq!(attempt.coefficients.dt(), settings.stop - cursor.clock.time);
+        assert_eq!(attempt.coefficients.dt(), settings.stop - start);
     }
 
     #[test]
