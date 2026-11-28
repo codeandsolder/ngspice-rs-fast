@@ -1,0 +1,7 @@
+Synthetic zero multiplicity topology
+V1 live 0 1
+R1 live 0 2
+C1 ghost 0 2u m=0
+C2 live 0 2u m=0 Rser=5 Cpar=1u
+.op
+.end
