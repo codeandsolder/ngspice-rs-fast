@@ -1050,6 +1050,11 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
+    /// Whether an explicit physical initialization equation applies in this bias analysis.
+    fn has_active_passive_bias(&self, _analysis: crate::primitives::AnalysisKind) -> bool {
+        false
+    }
+
     /// Whether real loads require the enclosing analysis selected by the
     /// analysis plan, independently of numerical regularization.
     fn requires_analysis_context(&self) -> bool {

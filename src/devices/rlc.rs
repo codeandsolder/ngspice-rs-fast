@@ -783,6 +783,12 @@ impl Device for Capacitor {
         crate::devices::passive_bias::has_constraints(self.bias.as_deref())
     }
 
+    fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
+        self.bias
+            .as_deref()
+            .is_some_and(|policy| policy.constrains(analysis))
+    }
+
     fn setup_matrix(
         &self,
         setup: &mut crate::devices::setup::MatrixSetup<'_>,
@@ -1054,6 +1060,12 @@ impl Device for Inductor {
 
     fn has_passive_bias(&self) -> bool {
         crate::devices::passive_bias::has_constraints(self.bias.as_deref())
+    }
+
+    fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
+        self.bias
+            .as_deref()
+            .is_some_and(|policy| policy.constrains(analysis))
     }
 
     fn setup_matrix(
