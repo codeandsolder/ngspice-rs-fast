@@ -88,3 +88,35 @@ fn incompatible_topology_selectors_are_diagnostic() {
         assert!(simulate(&format!("{card}\nr1 p 0 10\n.op")).is_err());
     }
 }
+
+#[test]
+fn descendant_references_select_only_the_actual_occurrence() -> SpiceResult<()> {
+    let source = ".subckt winding p n\nl1 p n 3m pn_rseries_uncoupled=1m\n.ends\nv1 s 0 2\nr1 s p1 10\nr2 s p2 10\nr3 s p3 10\nx1 p1 0 winding\nx2 p2 0 winding\nx3 p3 0 winding\nk1 x1::l1 x2::l1 0\n.op";
+    let plot = simulate(source)?;
+    check(&plot, "v(p1)", Complex::real(0.))?;
+    check(&plot, "v(p2)", Complex::real(0.))?;
+    check(&plot, "v(p3)", Complex::real(0.0001999800019998000))?;
+
+    let sensed = Complex::new(0.602261102728891, 0.02998880634513171);
+    let unsensed = Complex::new(0.5966083459066635, -0.04498320951769758);
+    let common = ".subckt leaf p n\nvdrive p n ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1 pn_report_dc=1\nr1 p n 3\n.ends\n";
+    for (definition, control, expected) in [
+        (
+            ".subckt outer p n\nxinner p n leaf\n.ends",
+            "b1 q 0 v=i(x1::xinner::vdrive)\nr2 q 0 1k",
+            [sensed, unsensed],
+        ),
+        (
+            ".subckt outer p n\nxinner p n leaf\nb1 q n v=i(xinner::vdrive)\nr2 q n 1k\n.ends",
+            "",
+            [sensed, sensed],
+        ),
+    ] {
+        let plot = simulate(&format!(
+            "{common}{definition}\nx1 p1 0 outer\nx2 p2 0 outer\n{control}\n.ac lin 1 10k 10k"
+        ))?;
+        check(&plot, "v(p1)", expected[0])?;
+        check(&plot, "v(p2)", expected[1])?;
+    }
+    Ok(())
+}
