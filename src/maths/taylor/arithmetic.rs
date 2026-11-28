@@ -20,6 +20,8 @@ pub(crate) trait Constitutive: Clone {
     fn mul_add(self, rhs: &Self, add: &Self) -> Self;
     fn sqrt(self) -> SpiceResult<Self>;
     fn exp(self) -> Self;
+    fn exp_with_primal(self, value: Real) -> Self;
+    fn compose_derivative(self, value: Real, slope: &Self) -> Self;
     fn exp_m1(self) -> Self;
     fn ln_1p(self) -> SpiceResult<Self>;
 }
@@ -81,6 +83,16 @@ impl Constitutive for Real {
     }
 
     #[inline]
+    fn exp_with_primal(self, value: Real) -> Self {
+        value
+    }
+
+    #[inline]
+    fn compose_derivative(self, value: Real, _slope: &Self) -> Self {
+        value
+    }
+
+    #[inline]
     fn exp_m1(self) -> Self {
         Self::exp_m1(self)
     }
@@ -137,6 +149,16 @@ impl<const N: usize> Constitutive for Differential<N> {
 
     fn exp(self) -> Self {
         Self::exp(self)
+    }
+
+    fn exp_with_primal(self, value: Real) -> Self {
+        let value = self.value.exp_with_value(value);
+        self.lift(value.clone(), &value)
+    }
+
+    fn compose_derivative(self, value: Real, slope: &Self) -> Self {
+        let germ = self.value.compose_derivative(value, &slope.value);
+        self.lift(germ, &slope.value)
     }
 
     fn exp_m1(self) -> Self {
