@@ -33,7 +33,7 @@ impl ConductanceLaw {
             scaled.gmin_scale,
         ]
         .into_iter()
-        .any(|g| !g.is_finite() || g < 0.)
+        .any(|g| !g.is_finite())
             || (self.constant != 0. && scaled.constant == 0.)
             || (self.gmin_scale != 0. && scaled.gmin_scale == 0.)
         {
@@ -44,7 +44,7 @@ impl ConductanceLaw {
 
     fn evaluate(self, gmin: Real) -> SpiceResult<Real> {
         let conductance = self.gmin_scale.mul_add(gmin, self.constant);
-        if !conductance.is_finite() || conductance < 0. {
+        if !conductance.is_finite() {
             return Err(SpiceError::circuit(
                 "invalid contextual damping conductance",
             ));
@@ -108,7 +108,7 @@ pub(super) struct DampingShunt {
     pub(super) name: String,
     pub(super) terminals: [NodeId; 2],
     pub(super) damping: AnalysisDamping,
-    pub(super) temperature: Option<Real>,
+    pub(super) noise: ResistorNoise,
     pub(super) excluded_bias: Option<Arc<PassiveInitialization>>,
 }
 
@@ -117,7 +117,7 @@ impl DampingShunt {
         name: String,
         terminals: [NodeId; 2],
         resistance: Real,
-        temperature: Option<Real>,
+        noise: ResistorNoise,
         excluded_bias: Option<Arc<PassiveInitialization>>,
     ) -> Self {
         let law = ConductanceLaw {
@@ -127,14 +127,14 @@ impl DampingShunt {
         Self {
             name,
             terminals,
-            temperature,
             excluded_bias,
             damping: AnalysisDamping {
                 steady: law,
                 small_signal: law,
                 transient: law,
-                noisy: true,
+                noisy: noise.noisy,
             },
+            noise,
         }
     }
 }
@@ -232,18 +232,6 @@ impl Device for DampingShunt {
             .damping
             .small_signal
             .evaluate(context.model_context.configured_gmin)?;
-        Ok(resistor_noise(
-            self.terminals,
-            g,
-            &ResistorNoise {
-                noisy: self.damping.noisy,
-                temperature: self.temperature,
-                ..Default::default()
-            },
-            None,
-            context,
-            None,
-            sources,
-        ))
+        resistor_noise(self.terminals, g, &self.noise, None, context, None, sources)
     }
 }

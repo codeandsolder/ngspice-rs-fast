@@ -2108,6 +2108,12 @@ impl Circuit {
             let value = device.inductance(context).ok_or_else(|| {
                 SpiceError::circuit(format!("{} is not an inductor", device.name()))
             })??;
+            if value.effective < 0. {
+                return Err(SpiceError::circuit(format!(
+                    "{}: coupled inductive system cannot be positive semidefinite with negative self-inductance",
+                    device.name()
+                )));
+            }
             values.insert(index, value);
         }
         let site = CouplingSite::of(self.devices[self.bindings.mutual.pairs[0].coupling].as_ref());
