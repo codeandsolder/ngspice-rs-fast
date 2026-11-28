@@ -250,7 +250,11 @@ fn scoped_arrays_and_typed_port_validation() -> SpiceResult<()> {
         "delay_paths=[1n 2n 3n 4n 5n -6n]",
         "delay=1n delay_paths=[1n 2n 3n 4n 5n 6n]",
         "low=4 high=3",
-        "ic=2",
+        "ic=3",
+        "strength=0",
+        "strength=3",
+        "async_policy=[1 1 2]",
+        "async_policy=[1 1 3]",
         "inverted=[1 0]",
         "inverted=[2]",
         "rx_ic=[2]",
@@ -568,5 +572,57 @@ R4 bb 0 100
         );
     }
     assert!(c.last_digital_stats().unwrap().evaluations > 0);
+    Ok(())
+}
+
+#[test]
+fn source_bound_digital_bus_resolves_strength_and_unknown() -> SpiceResult<()> {
+    for data in [0, 4] {
+        for enable in [0, 4] {
+            for pull in [0, 4] {
+                let mut c = circuit(&format!(
+                    "vdata d 0 {data}\nvenable e 0 {enable}\nvpull p 0 {pull}\n                    a1 %v[d e] bus tri\n.model tri preprocess_logic_event(operation=21 delay_paths=[1n 2n 3n 4n 5n 6n])\n                    a2 %v[p] bus weak\n.model weak preprocess_logic_event(operation=25 strength=1)\n                    a3 %d[bus] direct buf\n.model buf preprocess_logic_event(operation=25)\n                    a4 direct out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k"
+                ))?;
+                let expected = if enable == 4 { data } else { pull };
+                close(
+                    output(&run(&mut c, AnalysisKind::OperatingPoint, &[])?, 0),
+                    if expected == 4 { 5. } else { 0. },
+                );
+                assert!(c.nodes().get("bus").is_none());
+                assert!(c.nodes().get("direct").is_none());
+            }
+        }
+    }
+    // A disconnected input is unknown, but AND with a decisive zero is
+    // still zero. Invert the second digital terminal after net resolution.
+    let mut c = circuit(
+        "vzero zero 0 0\na1 %v[zero zero] floating tri\n.model tri preprocess_logic_event(operation=21)\n         a2 %v[zero] known buf\n.model buf preprocess_logic_event(operation=25)\n         a3 %d[floating known] result gate\n.model gate preprocess_logic_event(operation=0)\n         a4 %d[floating ~known] uncertain gate\n         a5 result out bridge\na6 uncertain other bridge\n.model bridge preprocess_logic_voltage(out_high=5)\n         r1 out 0 1k\nr2 other 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::OperatingPoint, &[])?;
+    close(output(&plot, 0), 0.);
+    close(plot.value("v(other)", 0).unwrap().re, 2.5);
+    Ok(())
+}
+
+#[test]
+fn source_bound_asymmetric_tristate_delivery() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vd data 0 4\nve en 0 PWL(0 0 1u 0 1002n 4 3u 4 3002n 0 5u 0)\n         vp pull 0 0\n         a1 %v[data en] bus tri\n.model tri preprocess_logic_event(operation=21 delay_paths=[10n 20n 30n 40n 50n 60n])\n         a2 %v[pull] bus weak\n.model weak preprocess_logic_event(operation=25 strength=1)\n         a3 %d[bus] result copy\n.model copy preprocess_logic_event(operation=25)\n         a4 result out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "5u", "0", "10n"])?;
+    let edges: Vec<_> = (1..plot.point_count())
+        .filter(|&i| (output(&plot, i) > 2.5) != (output(&plot, i - 1) > 2.5))
+        .map(|i| (plot.value("time", i).unwrap().re, output(&plot, i)))
+        .collect();
+    assert_eq!(edges.len(), 2, "{edges:?}");
+    // Qualified ADC strict crossing: rising at 3 V, falling at 2 V.
+    // The existing one-sided plot convention shows a new voltage at the
+    // first sample after the event (within the 10 ns maximum step).
+    for ((time, voltage), (at, expected)) in
+        edges.into_iter().zip([(1.0615e-6, 5.), (3.041e-6, 0.)])
+    {
+        close(voltage, expected);
+        assert!((time - at).abs() <= 10e-9, "{time:e} != {at:e}");
+    }
     Ok(())
 }
