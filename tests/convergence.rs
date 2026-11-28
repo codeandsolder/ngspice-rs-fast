@@ -445,8 +445,8 @@ fn assert_chain_physics(plot: &Plot, stages: u32, drop_bound: f64, tail_relative
 /// scalar solution, and controlled cancellation-recovery ablation.
 #[test]
 fn long_diode_chains_converge_on_original_equations() {
-    use AttemptOutcome::{Converged, Failed};
-    use DcStrategy::{Direct, GminStepping, JunctionGminStepping};
+    use AttemptOutcome::Converged;
+    use DcStrategy::{Direct, GminStepping};
 
     let body = diode_chain(100);
     let (solution, report) = solve(&body, &[]);
@@ -464,22 +464,75 @@ fn long_diode_chains_converge_on_original_equations() {
     let body = diode_chain(1000);
     let (solution, report) = solve(&body, &[]);
     solution.unwrap();
-    let path = attempts(&report);
-    assert!(
-        matches!(
-            path.as_slice(),
-            [(Direct, Failed), (GminStepping, Converged)]
-                | [
-                    (Direct, Failed),
-                    (GminStepping, Failed),
-                    (JunctionGminStepping, Converged)
-                ]
-        ),
-        "{path:?}"
-    );
-    assert!(report.total_iterations <= report.budget);
+    assert_eq!(attempts(&report), [(Direct, Converged)]);
+    assert!(report.total_iterations <= 24, "{report:?}");
     assert_original_equations_solved(&report);
-    // C's maximum diode-drop error is 113.09 µV; allow 120 µV.
-    // Its tail current is 0.69% from the scalar root, requiring <1%.
-    assert_chain_physics(&operating_point(&body), 1000, 1.2e-4, 1e-2);
+    assert_chain_physics(&operating_point(&body), 1000, 1e-5, 1e-4);
+
+    // Explicitly exercise the nodal continuation path independently of
+    // the improved direct solve.
+    let (solution, report) = solve(&body, &["noopiter=1"]);
+    solution.unwrap();
+    assert_eq!(
+        attempts(&report),
+        [
+            (Direct, AttemptOutcome::Disabled),
+            (GminStepping, Converged)
+        ]
+    );
+    assert!(report.total_iterations <= 128, "{report:?}");
+    assert_original_equations_solved(&report);
+    assert_chain_physics(
+        &operating_point(&format!("{body}\n.options noopiter")),
+        1000,
+        1e-5,
+        1e-4,
+    );
+}
+
+#[test]
+fn longer_diode_chains_recover_without_transient_fallback() {
+    for stages in [2000_u32, 5000] {
+        let body = diode_chain(stages as usize);
+        let (solution, report) = solve(&body, &[]);
+        solution.unwrap();
+        assert_eq!(
+            attempts(&report),
+            [(DcStrategy::Direct, AttemptOutcome::Converged)]
+        );
+        assert_original_equations_solved(&report);
+        assert_chain_physics(&operating_point(&body), stages, 1e-5, 2e-4);
+    }
+}
+
+#[test]
+fn recovered_long_chain_transfer_solves_the_original_operator() {
+    for stages in [1000_u32, 2000, 5000] {
+        let (junction, _) = exact_chain_point(stages);
+        let conductance = (1e-14 / VT).mul_add((junction / VT).exp(), 1e-12);
+        let resistance = f64::from(stages).mul_add(100. + conductance.recip(), 1000.);
+        let netlist = parse(&format!(
+            "{}\n.tf v(n{stages}) v1",
+            diode_chain(stages as usize)
+        ));
+        let config = RunConfig::from_netlist(&netlist).unwrap();
+        let mut circuit = config.circuit(&netlist).unwrap();
+        let plans = config.plans_for(&netlist.analyses).unwrap();
+        let plot = plans[0].run(&mut circuit, &config.context()).unwrap();
+        let output_impedance = format!("v(output_impedance_at_V(n{stages}))");
+        for (name, expected) in [
+            ("v(Transfer_function)", 1000. / resistance),
+            ("v(v1#Input_impedance)", resistance),
+            (
+                output_impedance.as_str(),
+                1000. * (resistance - 1000.) / resistance,
+            ),
+        ] {
+            let got = value(&plot, name);
+            assert!(
+                (got / expected - 1.).abs() <= 1e-6,
+                "{stages} stages {name}: {got:e} != {expected:e}"
+            );
+        }
+    }
 }

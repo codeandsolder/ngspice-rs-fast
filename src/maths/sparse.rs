@@ -1335,6 +1335,17 @@ impl SparseMatrix {
         }
     }
 
+    /// Move the physical contribution ledger into a retained factor frame.
+    pub(super) fn take_original(&mut self) -> Option<Vec<Triplet>> {
+        self.original.take()
+    }
+
+    /// Keep the discarded frame's allocation as scratch for the next load.
+    pub(super) fn recycle_original(&mut self, mut entries: Vec<Triplet>) {
+        entries.clear();
+        self.original = Some(entries);
+    }
+
     /// Cheap, conservative bound on the scale of the original products.
     pub(crate) fn peak_stamp(&self) -> Real {
         self.peak_stamp.value()
