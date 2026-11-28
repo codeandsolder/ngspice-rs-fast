@@ -3,8 +3,8 @@
 //! loads (`vsrcload.c`, `vsrcacld.c`, `isrcload.c`, `isrcacld.c`).
 
 use super::{
-    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
-    SensitivityMode, SensitivityParameter as P, SensitivityRecord,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityParameter as P,
+    SensitivityRecord, reconstructed_loads,
 };
 use crate::devices::IndependentSource;
 use crate::devices::sources::{AcExcitation, AcInput};
@@ -148,17 +148,19 @@ impl SensitivityKernel for SourceSensitivity<'_> {
         instance.store("acimag", ac.im)
     }
 
-    /// The DC load drives the DC value when given, otherwise the transient
-    /// function's time-zero value (`dcValue`, zero, without a function); the
-    /// AC load drives the phasor; a current source scales both by `m`. RF
-    /// port setters (`z0`, `pwr`, `freq`, `phase`) do nothing on a source
-    /// that is not a port.
-    fn load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-        _mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
+    reconstructed_loads!(
+        ordinary,
+        /// The DC load drives the DC value when given, otherwise the transient
+        /// function's time-zero value (`dcValue`, zero, without a function); the
+        /// AC load drives the phasor; a current source scales both by `m`. RF
+        /// port setters (`z0`, `pwr`, `freq`, `phase`) do nothing on a source
+        /// that is not a port.
+        replacement
+    );
+}
+
+impl SourceSensitivity<'_> {
+    fn replacement(&self, current: RecordPair<'_>) -> SpiceResult<IndependentSource> {
         let i = current.instance;
         let dc = if i.given("dc") || !self.source.function_given {
             i.value("dc")?
@@ -172,8 +174,6 @@ impl SensitivityKernel for SourceSensitivity<'_> {
         let multiplier = (!self.source.voltage && i.given("m"))
             .then(|| i.value("m"))
             .transpose()?;
-        Ok(SensitivityLoad::Replacement(Box::new(
-            self.source.sensitivity_copy(dc, ac, multiplier)?,
-        )))
+        self.source.sensitivity_copy(dc, ac, multiplier)
     }
 }

@@ -4,8 +4,8 @@
 
 use super::{
     CELSIUS_TO_KELVIN, ParameterScope, PassiveInputs, RecordPair, SensitivityConductance,
-    SensitivityFamily, SensitivityKernel, SensitivityLoad, SensitivityMode,
-    SensitivityParameter as P, SensitivityRecord,
+    SensitivityFamily, SensitivityKernel, SensitivityParameter as P, SensitivityRecord,
+    reconstructed_loads,
 };
 use crate::devices::passive::physics::{
     Coefficients, SheetGeometry, TemperaturePoint, conductance, scaled,
@@ -309,22 +309,22 @@ impl SensitivityKernel for ResistorSensitivity<'_> {
         Ok(())
     }
 
-    /// `RESload` stamps `RESconduct`; `RESacload` `RESacConduct` when `ac`
-    /// was given, else `RESconduct`.
-    fn load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-        _mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
+    reconstructed_loads!(
+        ordinary,
+        /// `RESload` stamps `RESconduct`; `RESacload` `RESacConduct` when `ac`
+        /// was given, else `RESconduct`.
+        replacement
+    );
+}
+
+impl ResistorSensitivity<'_> {
+    fn replacement(&self, current: RecordPair<'_>) -> SpiceResult<SensitivityConductance> {
         let conduct = current.instance.value("conduct")?;
         let ac = if current.instance.given("ac") {
             current.instance.value("acconduct")?
         } else {
             conduct
         };
-        Ok(SensitivityLoad::Replacement(Box::new(
-            SensitivityConductance::new(self.name, 'r', self.terminals, conduct, ac)?,
-        )))
+        SensitivityConductance::new(self.name, 'r', self.terminals, conduct, ac)
     }
 }

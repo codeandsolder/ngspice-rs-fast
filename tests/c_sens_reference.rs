@@ -7,7 +7,10 @@
 //! with their units and every value must agree: linear decks within
 //! `1e-8 |C| + 1e-12` (`xtask::compare::SENSITIVITY`), nonlinear decks within
 //! `1e-3 |C| + 1e-9` (`SENSITIVITY_NONLINEAR`); frequency coordinates
-//! retain the linear comparison budget. C's NaN must be NaN.
+//! retain the linear comparison budget. C's NaN must be NaN. The pinned
+//! ngspice 47 reference has no QPSCALE parameter: the diode decks explicitly
+//! require the additional Rust coordinate columns in order and verify zero
+//! sensitivity independently.
 //!
 //! `#[ignore]`d because it needs a built C `ngspice`:
 //!
@@ -102,6 +105,15 @@ fn mos_ac_sensitivity_after_transient_matches_c() {
 }
 
 fn compare_with_c(name: &str, inputs: &DeckInputs<'_>, tolerance: Tolerance) {
+    compare_with_c_and_qpscale(name, inputs, tolerance, &[]);
+}
+
+fn compare_with_c_and_qpscale(
+    name: &str,
+    inputs: &DeckInputs<'_>,
+    tolerance: Tolerance,
+    qpscale_instances: &[&str],
+) {
     let binary = std::env::var_os("NGSPICE_BIN").expect("set absolute NGSPICE_BIN");
     assert!(Path::new(&binary).is_absolute());
     let scratch = Scratch::new("c-sens-reference").unwrap();
@@ -164,14 +176,32 @@ fn compare_with_c(name: &str, inputs: &DeckInputs<'_>, tolerance: Tolerance) {
                 .map(|variable| (variable.name.clone(), variable.unit.clone()))
                 .collect()
         };
-        assert_eq!(
-            names(got),
-            names(want),
-            "{name}: plot {index} names in order"
-        );
+        let mut expected = names(want);
+        for instance in qpscale_instances {
+            let coordinate = format!("v({instance}:qpscale)");
+            let vp = format!("v({instance}:vp)");
+            assert!(want.variable_index(&coordinate).is_none());
+            let after = expected.iter().position(|(name, _)| name == &vp).unwrap() + 1;
+            expected.insert(after, (coordinate.clone(), "voltage".into()));
+            for (point, value) in got.column(&coordinate).unwrap().iter().enumerate() {
+                assert!(
+                    value.is_finite() && value.magnitude() <= 1e-12,
+                    "{name}: '{coordinate}' point {point}: numerical coordinate sensitivity {value}"
+                );
+            }
+        }
+        assert_eq!(names(got), expected, "{name}: plot {index} names in order");
         assert_eq!(got.point_count(), want.point_count(), "{name}");
+        let rust_columns: Vec<_> = want
+            .variables()
+            .iter()
+            .map(|variable| got.variable_index(&variable.name).unwrap())
+            .collect();
         for (point, (a, b)) in got.rows().zip(want.rows()).enumerate() {
-            for (column, ((x, y), variable)) in a.iter().zip(b).zip(want.variables()).enumerate() {
+            for (column, ((&rust_column, y), variable)) in
+                rust_columns.iter().zip(b).zip(want.variables()).enumerate()
+            {
+                let x = &a[rust_column];
                 let [re, im] = ngspice_conformance::ngspice::batch_reference_sample(
                     column,
                     &variable.name,
@@ -300,7 +330,7 @@ rw w 0 1k
 #[test]
 #[ignore = "requires absolute NGSPICE_BIN; runs C batch mode out of process"]
 fn diode_decks_match_c() {
-    compare_with_c(
+    compare_with_c_and_qpscale(
         "diode",
         &DeckInputs::same(
             "\
@@ -316,8 +346,9 @@ d1 a 0 dmod
 ",
         ),
         NONLINEAR,
+        &["d1"],
     );
-    compare_with_c(
+    compare_with_c_and_qpscale(
         "diodes",
         &DeckInputs::same(
             "\
@@ -338,6 +369,7 @@ rc c 0 10k
 ",
         ),
         NONLINEAR,
+        &["d1", "d2", "d3"],
     );
 }
 

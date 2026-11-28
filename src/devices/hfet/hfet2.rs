@@ -48,15 +48,16 @@
 use super::channel::{ChannelModel, ChannelTemperature};
 use super::lifecycle::{ChargeInput, Linearization, Start, accepted, charge_step};
 use super::{CELSIUS_TO_KELVIN, HfetInstance as Instance};
-use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet, stamp_reset};
+use super::{NodeSetup, TemperatureCache, ask_hfet, set_hfet};
 use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{BOLTZMANN, CHARGE, p};
 use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
-    SensitivityMode, SensitivityParameter, SensitivityRecord,
+    ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
+    SensitivityParameter, SensitivityRecord, StampPart, node_stamps, reconstructed_loads,
+    stamp_reset,
 };
 use crate::devices::{
     AnalysisMode, Device, DeviceState, LinearContext, ModelContext, ResolvedModel, StampContext,
@@ -1090,35 +1091,14 @@ impl SensitivityKernel for Hfet2Sensitivity<'_> {
         Ok(())
     }
 
-    fn load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(
-                "an HFET2's AC sensitivity load is its reset load",
-            ));
-        }
-        Ok(SensitivityLoad::Replacement(Box::new(self.hfet2(current)?)))
-    }
-
-    /// `HFET2acLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
-    /// `ggd` are the `CKTstate0` values `hfet2load.c` stored at zero gate
-    /// voltages with the reset records, the charge slots `qgs`/`qgd` are
-    /// zero, and `RD`/`RS` and `m` come from `current`.
-    fn reset_ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
-        Ok(SensitivityLoad::Replacement(Box::new(ResetHfet2 {
-            state: self.hfet2(reset.state)?,
-            current: self.hfet2(current)?,
-        })))
-    }
+    reconstructed_loads!(
+        reset,
+        /// `HFET2acLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
+        /// `ggd` are the `CKTstate0` values `hfet2load.c` stored at zero gate
+        /// voltages with the reset records, the charge slots `qgs`/`qgd` are
+        /// zero, and `RD`/`RS` and `m` come from `current`.
+        hfet2
+    );
 }
 
 impl Hfet2Sensitivity<'_> {
@@ -1184,48 +1164,22 @@ impl Hfet2Sensitivity<'_> {
     }
 }
 
-/// An HFET2's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
-#[derive(Debug)]
-struct ResetHfet2 {
-    /// Built from the reset load's records: the gate and channel
-    /// conductances.
-    state: Hfet2,
-    /// Built from the current records: series conductances and `m`.
-    current: Hfet2,
-}
-
-impl Device for ResetHfet2 {
-    fn name(&self) -> &str {
-        &self.current.name
-    }
-
-    fn designator(&self) -> char {
-        'z'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.current.terminals
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.current.name
-        )))
-    }
-
+impl ResetAcDevice for Hfet2 {
     /// `hfet2acl.c`'s real stamps; its `xgs`/`xgd` imaginary parts are zero.
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        _omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()> {
         let temperature = context.model_context.temperature;
-        let state = &self.state;
         // `type * (0 - 0)`: a signed zero, as C's at zero node voltages.
         let zero = state.model.pol * 0.;
         let point = state.point(&state.derived(temperature)?, zero, zero)?;
-        let derived = self.current.derived(temperature)?;
+        let derived = current.derived(temperature)?;
         let (gm, gds, ggs, ggd) = (point.gm, point.gds, point.ggs, point.ggd);
-        let m = self.current.instance.m;
-        let n = self.current.nodes;
+        let m = current.instance.m;
+        let n = current.nodes;
         let [gdpr, gspr] = n.series(&derived);
         let stamps = [
             (n.d, n.d, m * gdpr),
@@ -1244,7 +1198,11 @@ impl Device for ResetHfet2 {
             (n.sp, n.s, -(m * gspr)),
             (n.sp, n.dp, -(m * gds)),
         ];
-        stamp_reset(&self.current.name, context, &stamps, &[])
+        stamp_reset(
+            &current.name,
+            node_stamps(&stamps, StampPart::Real),
+            context,
+        )
     }
 }
 

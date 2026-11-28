@@ -9,8 +9,8 @@
 //! after `m` was perturbed zeroes the coefficient). The port replays this.
 
 use super::{
-    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityLoad,
-    SensitivityMode, SensitivityParameter as P, SensitivityRecord,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityParameter as P,
+    SensitivityRecord, reconstructed_loads,
 };
 use crate::devices::{ControlledKind, ControlledSource};
 use crate::primitives::{Real, SpiceResult};
@@ -98,15 +98,12 @@ impl SensitivityKernel for ControlledSensitivity<'_> {
         }
     }
 
-    fn load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-        _mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        Ok(SensitivityLoad::Replacement(Box::new(
-            self.source
-                .with_coefficient(current.instance.value("gain")?)?,
-        )))
+    reconstructed_loads!(ordinary, replacement);
+}
+
+impl ControlledSensitivity<'_> {
+    fn replacement(&self, current: RecordPair<'_>) -> SpiceResult<ControlledSource> {
+        self.source
+            .with_coefficient(current.instance.value("gain")?)
     }
 }
