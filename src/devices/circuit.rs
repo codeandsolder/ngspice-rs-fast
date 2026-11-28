@@ -188,6 +188,7 @@ struct TopologyBindings {
     state_len: usize,
     stochastic_sources: Vec<usize>,
     prepared_devices: Vec<usize>,
+    context_devices: Vec<usize>,
     native_mixed: Option<crate::analysis::digital::NativeTopology>,
     mutual: MutualBinding,
     identity: Option<TopologyId>,
@@ -225,6 +226,9 @@ pub(super) struct CircuitRuntime {
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
     mutual_evaluation: std::cell::RefCell<Option<MutualEvaluation>>,
+    // At most one idle physical preparation; live runs exclusively lease
+    // it and never share mutable tiles with another live run.
+    prepared_idle: std::cell::RefCell<Option<PreparedPoint>>,
     candidate_overrides: Vec<CandidateNumericOverride>,
     control_overrides: Vec<CandidateNumericOverride>,
 }
@@ -336,6 +340,17 @@ pub struct PreparedRun<'a> {
         std::cell::RefCell<Option<crate::devices::observe::ObservationWorkspace>>,
 }
 
+impl Drop for PreparedRun<'_> {
+    fn drop(&mut self) {
+        if (!self.circuit.bindings.prepared_devices.is_empty()
+            || !self.circuit.bindings.context_devices.is_empty())
+            && let Some(point) = self.point.get_mut().take()
+        {
+            self.circuit.runtime.prepared_idle.replace(Some(point));
+        }
+    }
+}
+
 /// One transient proposal, binding exact time, physical context and immutable
 /// accepted history for repeated Newton loads and isolated observations.
 /// Exclusive scratch ownership prevents another proposal from reusing it.
@@ -417,10 +432,10 @@ impl<'a> PreparedTransient<'a> {
 
 pub(super) struct PreparedPoint {
     context: ModelContext,
+    context_valid: bool,
     replacements: Vec<(usize, Box<dyn Device>)>,
     mutual: std::cell::OnceCell<PreparedMutualTerms>,
-    prepared_batches:
-        std::cell::OnceCell<std::cell::RefCell<crate::devices::prepared_model::batch::Plan>>,
+    prepared_batches: std::cell::RefCell<crate::devices::prepared_model::batch::Plan>,
 }
 
 fn effective_device<'a>(
@@ -443,24 +458,8 @@ impl PreparedPoint {
 
     fn batches(
         &self,
-        circuit: &Circuit,
     ) -> SpiceResult<std::cell::RefMut<'_, crate::devices::prepared_model::batch::Plan>> {
-        if self.prepared_batches.get().is_none() {
-            let plan = crate::devices::prepared_model::batch::Plan::new(
-                circuit.devices.len(),
-                &circuit.bindings.unknowns,
-                circuit
-                    .bindings
-                    .prepared_devices
-                    .iter()
-                    .copied()
-                    .map(|index| (index, self.device(circuit, index))),
-            )?;
-            let _ = self.prepared_batches.set(std::cell::RefCell::new(plan));
-        }
         self.prepared_batches
-            .get()
-            .ok_or_else(|| SpiceError::circuit("missing prepared batch plan"))?
             .try_borrow_mut()
             .map_err(|_| SpiceError::circuit("prepared batch plan already active"))
     }
@@ -485,10 +484,14 @@ impl<'a> PreparedRun<'a> {
         &self,
         context: &ModelContext,
     ) -> SpiceResult<std::cell::Ref<'_, PreparedPoint>> {
-        if let Ok(point) = std::cell::Ref::filter_map(self.point.borrow(), |current| {
+        let current = self
+            .point
+            .try_borrow()
+            .map_err(|_| SpiceError::circuit("prepared candidate transaction already active"))?;
+        if let Ok(point) = std::cell::Ref::filter_map(current, |current| {
             current
                 .as_ref()
-                .filter(|point| point.context.same_preparation(context))
+                .filter(|point| point.context_valid && point.context.same_preparation(context))
         }) {
             return Ok(point);
         }
@@ -497,8 +500,64 @@ impl<'a> PreparedRun<'a> {
         #[cfg(test)]
         preparation_metrics::record(|counts| counts.contexts += 1);
         context.validate(&MODEL_CONTEXT_LOCATION)?;
-        let mut replacements = self.circuit.replacements(context)?;
-        for &index in &self.circuit.bindings.prepared_devices {
+        let replacements = self.circuit.replacements(context)?;
+        self.install_point(context, replacements, std::cell::OnceCell::new())?;
+        std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
+            .map_err(|_| SpiceError::circuit("missing prepared model context"))
+    }
+
+    fn install_point(
+        &self,
+        context: &ModelContext,
+        mut replacements: Vec<(usize, Box<dyn Device>)>,
+        mutual: std::cell::OnceCell<PreparedMutualTerms>,
+    ) -> SpiceResult<()> {
+        let mut current = self
+            .point
+            .try_borrow_mut()
+            .map_err(|_| SpiceError::circuit("prepared candidate is borrowed"))?;
+        let prepared_batches = {
+            self.prepare_instances(context, &mut replacements, current.as_ref())?;
+            if let Some(previous) = current.as_ref() {
+                let mut plan = previous.batches()?;
+                plan.rebind(
+                    |index| effective_device(self.circuit, &replacements, index),
+                    &self.circuit.bindings.unknowns,
+                )?;
+                std::mem::take(&mut *plan)
+            } else {
+                crate::devices::prepared_model::batch::Plan::new(
+                    self.circuit.devices.len(),
+                    &self.circuit.bindings.unknowns,
+                    self.circuit
+                        .bindings
+                        .prepared_devices
+                        .iter()
+                        .copied()
+                        .map(|index| (index, effective_device(self.circuit, &replacements, index))),
+                )?
+            }
+        };
+        *current = Some(PreparedPoint {
+            context: *context,
+            context_valid: true,
+            replacements,
+            mutual,
+            prepared_batches: std::cell::RefCell::new(prepared_batches),
+        });
+        Ok(())
+    }
+
+    fn prepare_instances(
+        &self,
+        context: &ModelContext,
+        replacements: &mut Vec<(usize, Box<dyn Device>)>,
+        previous: Option<&PreparedPoint>,
+    ) -> SpiceResult<()> {
+        // Context-only native storage models are independent of the
+        // physical tile ownership contract. Stage these first, so an invalid
+        // scalar recipe cannot mutate an existing candidate's prepared lanes.
+        for &index in &self.circuit.bindings.context_devices {
             match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
                 Ok(slot) => {
                     if let Some(device) = replacements[slot].1.reprepare_context(context)? {
@@ -512,31 +571,21 @@ impl<'a> PreparedRun<'a> {
                 }
             }
         }
-        let prepared_batches = std::cell::OnceCell::new();
-        {
-            let previous = self.point.borrow();
-            if let Some(plan) = previous
-                .as_ref()
-                .and_then(|point| point.prepared_batches.get())
-            {
-                let mut plan = plan
-                    .try_borrow_mut()
-                    .map_err(|_| SpiceError::circuit("prepared batch plan already active"))?;
-                plan.rebind(
-                    |index| effective_device(self.circuit, &replacements, index),
-                    &self.circuit.bindings.unknowns,
-                )?;
-                let _ = prepared_batches.set(std::cell::RefCell::new(std::mem::take(&mut *plan)));
+        for &index in &self.circuit.bindings.prepared_devices {
+            let prior = previous.map(|point| point.device(self.circuit, index));
+            match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
+                Ok(slot) => {
+                    let instance = replacements[slot].1.prepared_run_instance(context, prior)?;
+                    replacements[slot].1 = instance;
+                }
+                Err(slot) => {
+                    let instance =
+                        self.circuit.devices[index].prepared_run_instance(context, prior)?;
+                    replacements.insert(slot, (index, instance));
+                }
             }
         }
-        self.point.replace(Some(PreparedPoint {
-            context: *context,
-            replacements,
-            mutual: std::cell::OnceCell::new(),
-            prepared_batches,
-        }));
-        std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
-            .map_err(|_| SpiceError::circuit("missing prepared model context"))
+        Ok(())
     }
 
     /// Begin a proposal without eagerly evaluating devices: preserve load-order
@@ -1305,10 +1354,10 @@ impl Circuit {
     /// first context, then reuses its effective devices until that context
     /// changes. Separate scopes cannot share disposable trial state.
     #[must_use = "the prepared run retains the per-analysis point and load workspace"]
-    pub const fn prepare_run(&self) -> PreparedRun<'_> {
+    pub fn prepare_run(&self) -> PreparedRun<'_> {
         PreparedRun {
             circuit: self,
-            point: std::cell::RefCell::new(None),
+            point: std::cell::RefCell::new(self.runtime.prepared_idle.take()),
             ltra: std::cell::RefCell::new(LtraWorkspace::new()),
             observation_work: std::cell::RefCell::new(None),
         }
@@ -2305,6 +2354,13 @@ impl Circuit {
             .iter()
             .copied()
             .filter(|&index| self.devices[index].prepared_batch_key().is_some())
+            .collect();
+        self.bindings.context_devices = self
+            .bindings
+            .order
+            .iter()
+            .copied()
+            .filter(|&index| self.devices[index].needs_context_preparation())
             .collect();
         self.bindings.native_mixed = crate::devices::code_model::source::mixed_topology(
             &self.devices,
@@ -3522,12 +3578,21 @@ impl Circuit {
     /// The replacement preserves terminals, branch rows and device state
     /// layout so finalized topology and symbolic matrices remain valid.
     pub(crate) fn reseed_stochastic_sources(&mut self, identity: u64) {
+        if !self.bindings.stochastic_sources.is_empty() {
+            self.invalidate_prepared_context();
+        }
         for &ordinal in &self.bindings.stochastic_sources {
             if let Some(source) = self.devices.get_mut(ordinal)
                 && let Some(replacement) = source.device.with_stochastic_candidate(identity)
             {
                 source.device = replacement;
             }
+        }
+    }
+
+    fn invalidate_prepared_context(&mut self) {
+        if let Some(point) = self.runtime.prepared_idle.get_mut() {
+            point.context_valid = false;
         }
     }
 
@@ -3544,12 +3609,10 @@ impl Circuit {
         *self.runtime.initial_revision.get_mut() = Arc::new(());
     }
 
-    /// Validate an arbitrary sparse numeric candidate overlay transactionally.
-    /// This uses the same ordered replacement construction, physical setters
-    /// and mutual-coupling checks as an actual prepared simulation load, but
-    /// does not publish any value on failure. The caller owns the resulting
-    /// overlay and commits it to its exclusive circuit after validation.
-    pub(crate) fn validate_candidate_overrides(
+    /// Prepare a complete proposed overlay before changing the published
+    /// override list. Ordinary replacements and mutual terms validate first;
+    /// the prepared plan then stages all physical lanes as one transaction.
+    fn prepare_candidate_overrides(
         &self,
         context: &ModelContext,
         overrides: &[CandidateNumericOverride],
@@ -3558,19 +3621,41 @@ impl Circuit {
         preparation_metrics::record(|counts| counts.replacement_validations += 1);
         context.validate(&MODEL_CONTEXT_LOCATION)?;
         let replacements = self.replacements_with_overrides(context, overrides)?;
-        self.mutual_terms_with_replacements(context, &replacements)?;
+        let mutual = self.mutual_terms_with_replacements(context, &replacements)?;
         let inputs = PreparedRun::dc_device_context(context);
         for (_, device) in &replacements {
-            device.validate_dc_inputs(&inputs)?;
+            if device.prepared_batch_key().is_none() {
+                device.validate_dc_inputs(&inputs)?;
+            }
+        }
+        if !self.bindings.prepared_devices.is_empty() || !self.bindings.context_devices.is_empty() {
+            let run = self.prepare_run();
+            run.install_point(context, replacements, std::cell::OnceCell::from(mutual))?;
         }
         Ok(())
     }
 
-    /// Commit already-validated worker-owned numeric candidates. An exclusive
-    /// circuit borrow rules out stale prepared analysis scopes during update.
-    pub(crate) fn set_candidate_overrides(&mut self, overrides: Vec<CandidateNumericOverride>) {
+    /// Validate and publish an optimizer candidate in one transaction.
+    /// The next analysis leases the physical preparation used by validation,
+    /// rather than preparing an independent copy of changed instances.
+    pub(crate) fn commit_candidate_overrides(
+        &mut self,
+        context: &ModelContext,
+        overrides: Vec<CandidateNumericOverride>,
+    ) -> SpiceResult<()> {
+        self.prepare_candidate_overrides(context, &overrides)?;
         self.runtime.candidate_overrides = overrides;
         self.runtime.control_overrides.clear();
+        self.clear_candidate_analysis_state();
+        Ok(())
+    }
+
+    /// Discard the baseline overlay when a structural candidate becomes active.
+    pub(crate) fn reset_candidate_overrides(&mut self) {
+        self.invalidate_prepared_context();
+        self.runtime.candidate_overrides.clear();
+        self.runtime.control_overrides.clear();
+        self.clear_candidate_analysis_state();
     }
 
     /// Validate and publish persistent script edits over the current candidate.
@@ -3582,6 +3667,7 @@ impl Circuit {
         edits: &[InstanceOverride],
     ) -> SpiceResult<()> {
         if edits.is_empty() {
+            self.invalidate_prepared_context();
             self.runtime.control_overrides.clear();
             self.clear_candidate_analysis_state();
             return Ok(());
@@ -3604,7 +3690,7 @@ impl Circuit {
         let mut context = *context;
         context.resistor_overrides.fill(None);
         context.instance_overrides.fill(None);
-        self.validate_candidate_overrides(&context, &combined)?;
+        self.prepare_candidate_overrides(&context, &combined)?;
         self.runtime.control_overrides = combined;
         self.clear_candidate_analysis_state();
         Ok(())
@@ -3682,7 +3768,7 @@ impl Circuit {
                 if value.topology() != topology {
                     return Err(SpiceError::circuit("foreign or stale instance override"));
                 }
-                original.with_bound_parameter(value.parameter(), value.value(), context)?
+                original.stage_bound_parameter(value.parameter(), value.value(), context)?
             }
         };
         #[cfg(test)]
@@ -3769,7 +3855,7 @@ impl Circuit {
                     preparation_metrics::record(|counts| counts.setters += 1);
                     if let Some(index) = device_slots.get(&ordinal).copied() {
                         let previous = replacements[index].1.as_ref();
-                        replacements[index].1 = previous.with_bound_parameter(
+                        replacements[index].1 = previous.stage_bound_parameter(
                             value.parameter(),
                             value.value(),
                             context,
@@ -3778,7 +3864,7 @@ impl Circuit {
                         device_slots.insert(ordinal, replacements.len());
                         replacements.push((
                             ordinal,
-                            original.with_bound_parameter(
+                            original.stage_bound_parameter(
                                 value.parameter(),
                                 value.value(),
                                 context,
@@ -3951,7 +4037,7 @@ impl Circuit {
         voltage_source_value: &mut Real,
         mut ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
-        let mut batches = point.batches(self)?;
+        let mut batches = point.batches()?;
         batches.begin();
         for (position, index) in self.load_order().enumerate() {
             let device = point.device(self, index);
@@ -4666,7 +4752,7 @@ impl Circuit {
         })?;
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
-        let mut batches = point.batches(self)?;
+        let mut batches = point.batches()?;
         batches.begin();
         for index in self.load_order() {
             let device = point.device(self, index);

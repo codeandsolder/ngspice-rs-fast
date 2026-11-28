@@ -242,6 +242,35 @@ pub struct InitialCoordinate {
     pub history: InitialCoordinateHistory,
 }
 
+/// Physical history associated with a prescribed initial voltage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VoltageStorageHistory {
+    /// A signed linear storage coordinate.
+    Linear(Real),
+    /// Integrated nonlinear charge with a signed MNA evolution equation.
+    Polynomial {
+        /// Prepared physical charge law.
+        law: model_normalize_ngspice::passive_storage::PolynomialStorage,
+        /// Multiplier from the evolution equation residual to physical charge.
+        equation_scale: Real,
+    },
+}
+
+impl VoltageStorageHistory {
+    /// Evaluate the stored quantity and its derivative at a voltage.
+    /// # Errors
+    /// Nonfinite constitutive evaluation.
+    pub fn at(self, voltage: Real) -> SpiceResult<(Real, Real)> {
+        match self {
+            Self::Linear(scale) => Ok((scale * voltage, scale)),
+            Self::Polynomial { law, .. } => law
+                .evaluate(voltage)
+                .map(|point| (point.stored, point.differential))
+                .map_err(|error| SpiceError::circuit(error.to_string())),
+        }
+    }
+}
+
 /// A voltage-controlled storage coordinate at UIC. Scalar capacitors
 /// need a new free-current equation; implicit capacitors already have
 /// that current and specify the local evolution equation to replace.
@@ -251,8 +280,8 @@ pub struct InitialVoltageStorage {
     pub voltage: Option<Real>,
     /// Local history slot containing the signed integrated quantity.
     pub slot: usize,
-    /// Storage coordinate per volt (not necessarily a physical capacitance).
-    pub scale: Real,
+    /// Physical stored quantity as a function of voltage.
+    pub history: VoltageStorageHistory,
     /// Existing evolution row, or None to append a free-current constraint.
     pub equation: Option<usize>,
 }
@@ -1044,15 +1073,25 @@ pub trait Device: fmt::Debug + std::any::Any {
         ))
     }
 
+    /// Occurrence-bound physical passive startup policy, if installed.
+    fn passive_initialization(
+        &self,
+    ) -> Option<&crate::devices::passive_bias::PassiveInitialization> {
+        None
+    }
+
     /// True when bias equations need physical nodal continuation rather
     /// than perturbing a numerical pivot diagonal.
     fn has_passive_bias(&self) -> bool {
-        false
+        crate::devices::passive_bias::has_constraints(self.passive_initialization())
     }
 
     /// Whether an explicit physical initialization equation applies in this bias analysis.
-    fn has_active_passive_bias(&self, _analysis: crate::primitives::AnalysisKind) -> bool {
-        false
+    fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
+        crate::devices::passive_bias::has_active_constraints(
+            self.passive_initialization(),
+            analysis,
+        )
     }
 
     /// Whether real loads require the enclosing analysis selected by the
@@ -1380,7 +1419,7 @@ pub trait Device: fmt::Debug + std::any::Any {
         Ok(Some(InitialVoltageStorage {
             voltage: storage.initial,
             slot,
-            scale: storage.value,
+            history: VoltageStorageHistory::Linear(storage.value),
             equation: None,
         }))
     }
@@ -1740,6 +1779,20 @@ pub trait Device: fmt::Debug + std::any::Any {
         }
     }
 
+    /// Stage an effective recipe before the candidate's physical preparation.
+    /// Ordinary devices validate immediately; prepared kernels validate the
+    /// final combined recipe once at the candidate boundary.
+    /// # Errors
+    /// Invalid parameter or structural change.
+    fn stage_bound_parameter(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+        value: Real,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Box<dyn Device>> {
+        self.with_bound_parameter(key, value, context)
+    }
+
     /// Whether typed instance setters preserve the selected model declaration.
     /// Model-backed devices opt in only when no setter can change model
     /// selection (including binning). The candidate validator still checks
@@ -1748,8 +1801,13 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
-    /// Reprepare immutable context-dependent data at a context transition.
-    /// Ordinary native devices need no replacement.
+    /// Whether this native device needs context preparation independently of batching.
+    /// Prepared artifact lanes use the separate run-instance contract.
+    fn needs_context_preparation(&self) -> bool {
+        false
+    }
+
+    /// Reprepare immutable context-dependent native data at a context transition.
     /// # Errors
     /// Invalid effective physical parameters.
     fn reprepare_context(
@@ -1757,6 +1815,29 @@ pub trait Device: fmt::Debug + std::any::Any {
         _context: &crate::devices::ModelContext,
     ) -> SpiceResult<Option<Box<dyn Device>>> {
         Ok(None)
+    }
+
+    /// Construct a run-local prepared recipe. A previous candidate may lend
+    /// immutable singleton data; grouped physical lanes are bound by its plan.
+    /// # Errors
+    /// Invalid context or unsupported prepared device.
+    fn prepared_run_instance(
+        &self,
+        _context: &crate::devices::ModelContext,
+        _previous: Option<&dyn Device>,
+    ) -> SpiceResult<Box<dyn Device>> {
+        Err(SpiceError::circuit(
+            "device has no prepared run implementation",
+        ))
+    }
+
+    /// Validate and activate an independent singleton's prepared data.
+    /// # Errors
+    /// Invalid physical parameters or unsupported prepared device.
+    fn activate_prepared_scalar(&self) -> SpiceResult<()> {
+        Err(SpiceError::circuit(
+            "device has no prepared scalar implementation",
+        ))
     }
 
     /// The canonical (lowercase, alias-folded) keyword of a settable real

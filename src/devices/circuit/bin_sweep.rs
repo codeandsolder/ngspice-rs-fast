@@ -262,6 +262,7 @@ impl BinnedDeck {
         for (ordinal, replacement) in replacements {
             circuit.devices[ordinal].device = replacement;
         }
+        circuit.invalidate_prepared_context();
         circuit.clear_candidate_analysis_state();
         Ok(true)
     }

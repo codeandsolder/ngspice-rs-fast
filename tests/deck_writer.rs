@@ -1026,3 +1026,16 @@ fn expression_waveform_coefficients_round_trip_with_typed_trees() {
     assert!(written.contains("pulse({a} 'a*2' {s})"), "{written}");
     assert!(written.contains("pwl(0 0 {s} {a/2})"), "{written}");
 }
+
+#[test]
+fn scalar_temperature_preserves_distinct_precedence_on_round_trip() {
+    let (written, first, second) = round_trip(
+        "t\n.param tc=-30\nv1 a 0 1\nr1 a 0 1k\n.TEMP {tc}\n.option temp=75 tnom=20\n.temp 'tc+1'\n.op\n.end\n",
+    );
+    assert!(written.contains(".temp {tc}\n.options temp=75 tnom=20\n.temp 'tc+1'\n"));
+    for n in [&first, &second] {
+        let c = ngspice_rs::analysis::RunConfig::from_netlist(n).unwrap();
+        assert_eq!(c.context().temperature, -29.);
+        assert_eq!(c.context().nominal_temperature, 20.);
+    }
+}

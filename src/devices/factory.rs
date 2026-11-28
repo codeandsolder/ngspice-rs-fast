@@ -67,6 +67,9 @@ pub(super) fn instantiate_with_models(
         ModelBackend::Resistor | ModelBackend::Capacitor | ModelBackend::Inductor => {
             crate::devices::passive::instantiate(instance, nodes, &model, context)
         }
+        ModelBackend::PolynomialCapacitor | ModelBackend::PolynomialInductor => {
+            crate::devices::polynomial_storage::instantiate(instance, nodes, &model, context)
+        }
         ModelBackend::Diode => {
             crate::devices::nonlinear::Diode::instantiate(instance, nodes, &model, context)
         }
@@ -124,7 +127,9 @@ pub(super) fn instantiate_with_models(
         | ModelBackend::FrequencyTransfer
         | ModelBackend::LogicEvent
         | ModelBackend::LogicVoltage
-        | ModelBackend::TimedSwitch => {
+        | ModelBackend::TimedSwitch
+        | ModelBackend::PSwitch
+        | ModelBackend::ASwitch => {
             let schema =
                 crate::devices::code_model::source::SourceModel::from_base(&model.card().base)
                     .ok_or_else(|| SpiceError::circuit("missing registered code-model schema"))?;

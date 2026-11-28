@@ -51,7 +51,13 @@ fn entry(matrix: &SparseMatrix, row: usize, col: usize) -> f64 {
 #[test]
 fn operating_point_obeys_independent_gummel_poon_equations_and_kcl() {
     let model = "is=1e-15 bf=100 br=2 vaf=50 var=10 ikf=10m ikr=1m ise=1e-14 ne=1.5 isc=1e-14 nc=2 rb=100 rbm=10 re=2 rc=5";
-    for (family, pol) in [("npn", 1.), ("pnp", -1.)] {
+    let legacy_vt = (1.3806226e-23 / 1.6021918e-19) * 300.15;
+    for (family, pol, vt) in [
+        ("npn", 1., VT),
+        ("pnp", -1., VT),
+        ("gummel_poon_legacy_npn", 1., legacy_vt),
+        ("gummel_poon_legacy_pnp", -1., legacy_vt),
+    ] {
         // SUBS=1 makes both devices vertical so that the PNP mirrors the NPN.
         let mut c = circuit(&format!(
             "vc c 0 {}\nvb b 0 {}\nve e 0 0\nq1 c b e qm\n.model qm {family}({model} subs=1)",
@@ -69,7 +75,7 @@ fn operating_point_obeys_independent_gummel_poon_equations_and_kcl() {
         let (vb, vc, ve) = (v("q1#base"), v("q1#collcx"), v("q1#emitter"));
         let (vbe, vbc) = (vb - ve, vb - vc);
         let gmin = 1e-12;
-        let junction = |v: f64, n: f64, is: f64| is * ((v / (n * VT)).exp() - 1.);
+        let junction = |v: f64, n: f64, is: f64| is * ((v / (n * vt)).exp() - 1.);
         let cbe = junction(vbe, 1., 1e-15);
         let cbc = junction(vbc, 1., 1e-15);
         let cben = junction(vbe, 1.5, 1e-14) + gmin * vbe;
@@ -86,6 +92,88 @@ fn operating_point_obeys_independent_gummel_poon_equations_and_kcl() {
         close(ib + ic - gmin * vc, ve / 2., 1e-7, 1e-15);
         close(ib, (0.78 - vb) / (10. + 90. / qb), 1e-7, 1e-15);
         assert!(qb > 1.05, "high injection and Early effect act: qb = {qb}");
+    }
+}
+
+/// Independent authored saturation/high-injection witness (#266). Both
+/// conventions and both polarities coexist at every temperature. TNOM is
+/// intentionally fixed at 27 C; the actual junction temperature varies.
+#[test]
+fn mixed_thermal_conventions_match_independent_saturation_currents() {
+    let body = "is=3e-13 bf=150 br=9 ikf=.018 ikr=.06 vaf=55 var=22 ise=4e-14 ne=1.4 isc=2e-13 nc=1.3 tnom=27";
+    for (temp, legacy_ic, native_ic, legacy_ib, native_ib) in [
+        (
+            -30.,
+            0.009273769520897595,
+            0.009268867219610736,
+            0.00010078238320271607,
+            0.00010071085939234458,
+        ),
+        (
+            27.,
+            0.10677327952666454,
+            0.10672691389191268,
+            0.005358872646165118,
+            0.005354550361926742,
+        ),
+        (
+            95.,
+            0.5772918837663642,
+            0.5770333602215145,
+            0.13844845897562896,
+            0.13832637287993252,
+        ),
+    ] {
+        let mut deck = String::new();
+        use std::fmt::Write as _;
+        let cases = [
+            ("npn", 1., native_ic, native_ib),
+            ("pnp", -1., native_ic, native_ib),
+            ("gummel_poon_legacy_npn", 1., legacy_ic, legacy_ib),
+            ("gummel_poon_legacy_pnp", -1., legacy_ic, legacy_ib),
+        ];
+        for (i, (family, pol, _, _)) in cases.iter().enumerate() {
+            writeln!(deck, "vc{i} c{i} 0 {}\nvb{i} b{i} 0 {}\nq{i} c{i} b{i} 0 m{i} temp={temp}\n.model m{i} {family}({body})", pol * 0.36, pol * 0.74).unwrap();
+        }
+        let p = run(
+            &mut circuit(&deck),
+            AnalysisKind::OperatingPoint,
+            &["rtol=1e-12", "vntol=1e-12"],
+        );
+        for (i, (_, pol, ic, ib)) in cases.into_iter().enumerate() {
+            // Reference currents exclude the default 1 pS junction gmin.
+            close(
+                -pol * p.value(&format!("i(vc{i})"), 0).unwrap().re,
+                ic,
+                1e-9,
+                3e-12,
+            );
+            close(
+                -pol * p.value(&format!("i(vb{i})"), 0).unwrap().re,
+                ib,
+                1e-9,
+                3e-12,
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_legacy_family_rejects_noncanonical_level_setters() {
+    for family in ["gummel_poon_legacy_npn", "gummel_poon_legacy_pnp"] {
+        for setters in ["level=0", "level=2", "level=1 level=2", "level=1.1"] {
+            assert!(
+                Circuit::from_netlist(&netlist(&format!(
+                    "q1 c b 0 qm\n.model qm {family}({setters})"
+                )))
+                .is_err(),
+                "{family} {setters}"
+            );
+        }
+        Circuit::from_netlist(&netlist(&format!(
+            "q1 c b 0 qm\n.model qm {family}(level=1)"
+        )))
+        .unwrap();
     }
 }
 
@@ -197,36 +285,41 @@ fn residual(a: &SparseMatrix, b: &Vector, x: &Vector) -> Vec<f64> {
 /// like C, the load stamps `gx` alone and omits `d(gx)/dV`.
 #[test]
 fn newton_and_companion_jacobians_are_exact() {
-    let c = circuit(&FULL.replace("rb=200 rbm=20 irb=0.1m", "rb=200"));
-    for temperature in [27., 90.] {
-        let context = ModelContext::new(temperature, 27.);
-        let (bias, history) = solved(&c, &context);
-        // Move off the solution so every branch carries a nonzero residual.
-        let mut x = bias.clone();
-        for (i, value) in x.as_mut_slice().iter_mut().enumerate() {
-            *value += 0.003 * ((i % 5) as f64 - 2.);
-        }
-        let dt = 1e-9;
-        let coefficients = StepHistory::new()
-            .trial(IntegrationMethod::Trapezoidal, 1, dt, DEFAULT_XMU)
-            .unwrap();
-        for k in [None, Some(&coefficients)] {
-            let (a, _, _) = load(&c, &x, &history, &context, k);
-            let n = c.unknown_count();
-            for col in 0..n {
-                let h = 1e-6;
-                let mut low = x.clone();
-                let mut high = x.clone();
-                low.as_mut_slice()[col] -= h;
-                high.as_mut_slice()[col] += h;
-                let (al, bl, _) = load(&c, &low, &history, &context, k);
-                let (ah, bh, _) = load(&c, &high, &history, &context, k);
-                let rl = residual(&al, &bl, &low);
-                let rh = residual(&ah, &bh, &high);
-                for row in 0..n {
-                    let numerical = (rh[row] - rl[row]) / (2. * h);
-                    let analytic = entry(&a, row, col);
-                    close(numerical, analytic, 2e-5, 1e-9);
+    for family in ["npn", "gummel_poon_legacy_npn"] {
+        let body = FULL
+            .replace("rb=200 rbm=20 irb=0.1m", "rb=200")
+            .replace(".model qm npn(", &format!(".model qm {family}("));
+        let c = circuit(&body);
+        for temperature in [27., 90.] {
+            let context = ModelContext::new(temperature, 27.);
+            let (bias, history) = solved(&c, &context);
+            // Move off the solution so every branch carries a nonzero residual.
+            let mut x = bias.clone();
+            for (i, value) in x.as_mut_slice().iter_mut().enumerate() {
+                *value += 0.003 * ((i % 5) as f64 - 2.);
+            }
+            let dt = 1e-9;
+            let coefficients = StepHistory::new()
+                .trial(IntegrationMethod::Trapezoidal, 1, dt, DEFAULT_XMU)
+                .unwrap();
+            for k in [None, Some(&coefficients)] {
+                let (a, _, _) = load(&c, &x, &history, &context, k);
+                let n = c.unknown_count();
+                for col in 0..n {
+                    let h = 1e-6;
+                    let mut low = x.clone();
+                    let mut high = x.clone();
+                    low.as_mut_slice()[col] -= h;
+                    high.as_mut_slice()[col] += h;
+                    let (al, bl, _) = load(&c, &low, &history, &context, k);
+                    let (ah, bh, _) = load(&c, &high, &history, &context, k);
+                    let rl = residual(&al, &bl, &low);
+                    let rh = residual(&ah, &bh, &high);
+                    for row in 0..n {
+                        let numerical = (rh[row] - rl[row]) / (2. * h);
+                        let analytic = entry(&a, row, col);
+                        close(numerical, analytic, 2e-5, 1e-9);
+                    }
                 }
             }
         }

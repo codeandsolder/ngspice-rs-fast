@@ -659,7 +659,7 @@ impl CircuitCandidate<'_> {
         }
         let mut numeric = self.parameters.clone();
         let evaluated = numeric.update(candidate, budget)?;
-        let (prepared, overrides, evaluations, roundings) = self.prepare(&numeric, budget)?;
+        let (prepared, evaluations, roundings) = self.prepare(&numeric, budget)?;
         for change in self.site_updates.drain(..) {
             self.site_raw[change.index] = change.raw;
             self.site_values[change.index] = change.value;
@@ -667,8 +667,6 @@ impl CircuitCandidate<'_> {
         self.last_site_evaluations = evaluations;
         self.last_site_roundings = roundings;
         self.parameters = numeric;
-        self.baseline.set_candidate_overrides(overrides);
-        self.baseline.clear_candidate_analysis_state();
         self.prepared = Some(prepared);
         self.values.clear();
         self.values.extend_from_slice(candidate);
@@ -679,12 +677,7 @@ impl CircuitCandidate<'_> {
         &mut self,
         parameters: &CandidateParameters<'_>,
         budget: &mut EvalBudget,
-    ) -> SpiceResult<(
-        PreparedCandidate,
-        Vec<CandidateNumericOverride>,
-        usize,
-        usize,
-    )> {
+    ) -> SpiceResult<(PreparedCandidate, usize, usize)> {
         self.site_updates.clear();
         let mut evaluations = 0;
         let mut roundings = 0;
@@ -762,28 +755,29 @@ impl CircuitCandidate<'_> {
             || (fixed_context, Vec::new()),
             |sparse| (baseline_context, sparse),
         );
-        if !structural
-            && self
-                .baseline
-                .validate_candidate_overrides(&context, &overrides)
-                .is_ok()
-        {
-            // Keep the verified topology for both small fixed contexts and
-            // arbitrary numeric overlays without full re-elaboration.
+        if !structural {
+            // Resolve all other fallible candidate metadata before publishing
+            // the numeric overlay and its validated physical preparation.
             let scope = parameters.resolved_scope(self.plan.root)?;
-            return Ok((
-                PreparedCandidate {
-                    context,
-                    config: self.plan.config.clone().with_parameter_scope(scope),
-                    circuit: None,
-                },
-                overrides,
-                evaluations,
-                roundings,
-            ));
+            if self
+                .baseline
+                .commit_candidate_overrides(&context, overrides)
+                .is_ok()
+            {
+                return Ok((
+                    PreparedCandidate {
+                        context,
+                        config: self.plan.config.clone().with_parameter_scope(scope),
+                        circuit: None,
+                    },
+                    evaluations,
+                    roundings,
+                ));
+            }
         }
         let prepared = self.prepare_structural(parameters)?;
-        Ok((prepared, Vec::new(), evaluations, roundings))
+        self.baseline.reset_candidate_overrides();
+        Ok((prepared, evaluations, roundings))
     }
 
     fn prepare_structural(
