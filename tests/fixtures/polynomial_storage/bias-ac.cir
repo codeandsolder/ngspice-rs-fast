@@ -1,0 +1,12 @@
+Independent charge and flux-dual AC tangent witness
+Vc c 0 dc -2 ac 1
+Cq c 0 Q='2u*(v(c)+0.1*v(c)^2+0.07/3*v(c)^3)'
+Vf f 0 dc -0.5 ac 1
+Cf f 0 Q='6m*(v(f)-0.05*v(f)^2+0.02/3*v(f)^3)'
+.ac lin 1 1k 1k
+.control
+run
+set numdgt=16
+print i(vc) i(vf)
+.endc
+.end

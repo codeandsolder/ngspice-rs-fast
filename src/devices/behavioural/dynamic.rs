@@ -70,7 +70,13 @@ fn has_native_current(
     Ok(match instance.designator {
         'v' | 'e' | 'h' | 'l' => true,
         'c' if instance.parameters.iter().any(|p| p.name == "pn_control") => true,
-        'r' | 'c' => expressions(instance).next().is_some(),
+        'r' => expressions(instance).next().is_some(),
+        'c' => {
+            expressions(instance).next().is_some()
+                || models.resolve(instance)?.is_some_and(|model| {
+                    model.family() == crate::devices::ModelFamily::PolynomialCapacitor
+                })
+        }
         'b' => instance
             .parameters
             .iter()

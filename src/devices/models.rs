@@ -50,6 +50,10 @@ pub enum ModelFamily {
     Capacitor,
     /// Scalar inductor.
     Inductor,
+    /// Prepared polynomial charge law.
+    PolynomialCapacitor,
+    /// Prepared polynomial flux law.
+    PolynomialInductor,
     /// Junction diode.
     Diode,
     /// Explicit source-selected `SIMetrix` level-1 diode.
@@ -117,6 +121,12 @@ impl ModelFamily {
             "r" | "res" => Some(Self::Resistor),
             "c" => Some(Self::Capacitor),
             "l" => Some(Self::Inductor),
+            model_normalize_ngspice::passive_storage::PSPICE_CAPACITOR => {
+                Some(Self::PolynomialCapacitor)
+            }
+            model_normalize_ngspice::passive_storage::PSPICE_INDUCTOR => {
+                Some(Self::PolynomialInductor)
+            }
             "d" => Some(Self::Diode),
             model_kernel_diode::MODEL_FAMILY => Some(Self::SimetrixDiodeLevel1),
             super::ideal_diode::MODEL_FAMILY => Some(Self::LtspiceIdealDiode),
@@ -156,8 +166,8 @@ impl ModelFamily {
     pub const fn designator(self) -> char {
         match self {
             Self::Resistor => 'r',
-            Self::Capacitor => 'c',
-            Self::Inductor => 'l',
+            Self::Capacitor | Self::PolynomialCapacitor => 'c',
+            Self::Inductor | Self::PolynomialInductor => 'l',
             Self::Diode | Self::SimetrixDiodeLevel1 | Self::LtspiceIdealDiode => 'd',
             Self::Npn | Self::Pnp | Self::GummelPoonLegacyNpn | Self::GummelPoonLegacyPnp => 'q',
             Self::Nmos | Self::Pmos => 'm',
@@ -190,6 +200,10 @@ pub enum ModelBackend {
     Capacitor,
     /// Scalar inductor.
     Inductor,
+    /// Prepared polynomial charge law.
+    PolynomialCapacitor,
+    /// Prepared polynomial flux law.
+    PolynomialInductor,
     /// Junction diode.
     Diode,
     /// Explicit source-selected `SIMetrix` level-1 diode.
@@ -284,9 +298,7 @@ impl ModelBackend {
     /// Families differing only in polarity share the same selector catalog.
     pub(crate) const fn catalog(designator: char) -> &'static [BackendSpec] {
         match designator.to_ascii_lowercase() {
-            'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
-            'c' => const { &[BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1])] },
-            'l' => const { &[BackendSpec::new(Self::Inductor, "Scalar inductor", &[1])] },
+            'r' | 'c' | 'l' => Self::passive_catalog(designator),
             'd' => {
                 const {
                     &[
@@ -382,6 +394,39 @@ impl ModelBackend {
                             .for_family(ModelFamily::PSwitch),
                         BackendSpec::new(Self::ASwitch, "Continuous analog switch", &[1])
                             .for_family(ModelFamily::ASwitch),
+                    ]
+                }
+            }
+            _ => &[],
+        }
+    }
+
+    const fn passive_catalog(designator: char) -> &'static [BackendSpec] {
+        match designator.to_ascii_lowercase() {
+            'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
+            'c' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1]),
+                        BackendSpec::new(
+                            Self::PolynomialCapacitor,
+                            "Prepared polynomial charge",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::PolynomialCapacitor),
+                    ]
+                }
+            }
+            'l' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Inductor, "Scalar inductor", &[1]),
+                        BackendSpec::new(
+                            Self::PolynomialInductor,
+                            "Prepared polynomial flux",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::PolynomialInductor),
                     ]
                 }
             }
@@ -1058,47 +1103,63 @@ impl ModelContext {
     /// Exact identity of every immutable load setting. Ordinary floating
     /// equality does not distinguish signed zero, including swept values.
     pub(super) fn same_preparation(&self, other: &Self) -> bool {
-        if self.spice3_noise != other.spice3_noise || self.noise_analysis != other.noise_analysis {
-            return false;
-        }
-        let bits = |context: &Self| {
-            [
-                context.temperature,
-                context.nominal_temperature,
-                context.gmin,
-                context.reltol,
-                context.frequency,
-                context.pivot.absolute,
-                context.pivot.relative,
-                context.source_factor,
-            ]
-            .map(Real::to_bits)
+        // Exhaustive destructuring makes every new context field an explicit
+        // cache-key decision instead of silently reusing stale preparation.
+        let key = |context: &Self| {
+            let Self {
+                analysis_kind,
+                bias_analysis,
+                spice3_noise,
+                temperature,
+                nominal_temperature,
+                resistor_overrides,
+                instance_overrides,
+                gmin,
+                configured_gmin,
+                shunts,
+                geometry_scale,
+                reltol,
+                frequency,
+                pivot,
+                source_factor,
+                noise_analysis,
+            } = *context;
+            (
+                analysis_kind,
+                bias_analysis,
+                spice3_noise,
+                noise_analysis,
+                [
+                    temperature,
+                    nominal_temperature,
+                    gmin,
+                    configured_gmin,
+                    geometry_scale,
+                    reltol,
+                    frequency,
+                    pivot.absolute,
+                    pivot.relative,
+                    source_factor,
+                    shunts.capacitance,
+                ]
+                .map(Real::to_bits),
+                shunts.resistance.map(Real::to_bits),
+                resistor_overrides.map(|slot| {
+                    slot.map(|value| (value.topology(), value.device(), value.supplied().to_bits()))
+                }),
+                instance_overrides.map(|slot| {
+                    slot.map(|value| {
+                        (
+                            value.topology(),
+                            value.device(),
+                            value.parameter(),
+                            value.value().to_bits(),
+                        )
+                    })
+                }),
+            )
         };
-        bits(self) == bits(other)
-            && self.resistor_overrides.map(|slot| {
-                slot.map(|value| (value.topology(), value.device(), value.supplied().to_bits()))
-            }) == other.resistor_overrides.map(|slot| {
-                slot.map(|value| (value.topology(), value.device(), value.supplied().to_bits()))
-            })
-            && self.instance_overrides.map(|slot| {
-                slot.map(|value| {
-                    (
-                        value.topology(),
-                        value.device(),
-                        value.parameter(),
-                        value.value().to_bits(),
-                    )
-                })
-            }) == other.instance_overrides.map(|slot| {
-                slot.map(|value| {
-                    (
-                        value.topology(),
-                        value.device(),
-                        value.parameter(),
-                        value.value().to_bits(),
-                    )
-                })
-            })
+        key(self) == key(other)
     }
 
     pub(crate) fn validate(&self, location: &SourceLoc) -> SpiceResult<()> {
