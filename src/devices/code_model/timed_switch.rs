@@ -393,6 +393,30 @@ impl State {
     pub(super) fn at_conductance(self, material: Material) -> SpiceResult<Real> {
         Ok(material.conductance(self.phase(material, self.time)?))
     }
+
+    pub(super) fn discontinuity(self, material: Material, accepted: Self) -> Option<Real> {
+        (material.instantaneous() && self.target != accepted.target).then_some(self.anchor_time)
+    }
+
+    pub(super) fn step_conductance(
+        self,
+        material: Material,
+        accepted: Option<Self>,
+    ) -> SpiceResult<Real> {
+        // A step ending at a jump integrates the *left* branch law. The
+        // discrete candidate still commits the new state at the deadline,
+        // ready for the subsequent interval. Applying the new conductance
+        // across the preceding integration interval would inject fictitious
+        // charge into capacitive loads (or fictitious flux into inductors).
+        if let Some(old) = accepted
+            && self.discontinuity(material, old) == Some(self.time)
+            && self.time > old.time
+        {
+            old.at_conductance(material)
+        } else {
+            self.at_conductance(material)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +689,10 @@ mod tests {
         assert_eq!(material.retry_at(equality, candidate), Some(5.));
         let landed = material.advance(equality, 5., -1.5)?;
         assert_eq!(landed.at_conductance(material)?, 1e3);
+        assert_eq!(landed.step_conductance(material, Some(equality))?, 0.01);
+        assert_eq!(landed.discontinuity(material, equality), Some(5.));
+        let next = material.advance(landed, 5.5, -1.5)?;
+        assert_eq!(next.step_conductance(material, Some(landed))?, 1e3);
         let lower_equality = material.advance(landed, 6., -4.)?;
         assert_eq!(lower_equality.at_conductance(material)?, 1e3);
         let off = material.advance(lower_equality, 7., -5.)?;

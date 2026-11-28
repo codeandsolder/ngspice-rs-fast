@@ -216,7 +216,11 @@ impl Device for TimedSwitch {
             None
         };
         let state = self.state(time, control, history)?;
-        let conductance = state.at_conductance(self.material)?;
+        let conductance = if context.integration.is_some() {
+            state.step_conductance(self.material, history.map(State::from_values).transpose()?)?
+        } else {
+            state.at_conductance(self.material)?
+        };
         if !context.states.is_empty() {
             for (slot, value) in state.values().into_iter().enumerate() {
                 context.states.set(slot, value)?;
@@ -257,8 +261,13 @@ impl Device for TimedSwitch {
         }
         let [p, n] = self.branch();
         let voltage = context.voltage(p) - context.voltage(n);
-        let expected = actual.at_conductance(self.material)? * voltage;
-        let observed = stamped.at_conductance(self.material)? * voltage;
+        let old = if context.integration.is_some() {
+            accepted.map(State::from_values).transpose()?
+        } else {
+            None
+        };
+        let expected = actual.step_conductance(self.material, old)? * voltage;
+        let observed = stamped.step_conductance(self.material, old)? * voltage;
         if !expected.is_finite() || !observed.is_finite() {
             return Err(SpiceError::circuit("nonfinite timed switch branch current"));
         }
@@ -334,6 +343,11 @@ impl Device for TimedSwitch {
 impl DeviceTransientEvents for TimedSwitch {
     fn next_boundary(&self, accepted: &[Real]) -> SpiceResult<Option<Real>> {
         State::from_values(accepted)?.next_boundary(self.material)
+    }
+
+    fn discontinuity(&self, accepted: &[Real], candidate: &[Real]) -> SpiceResult<Option<Real>> {
+        Ok(State::from_values(candidate)?
+            .discontinuity(self.material, State::from_values(accepted)?))
     }
 
     fn refine_trial(

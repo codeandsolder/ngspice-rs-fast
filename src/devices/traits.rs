@@ -1827,6 +1827,14 @@ pub trait DeviceTransientEvents {
     /// Invalid state or unrepresentable event time.
     fn next_boundary(&self, accepted: &[Real]) -> SpiceResult<Option<Real>>;
 
+    /// Time of an abrupt physical law change between accepted and refined
+    /// candidate state, if any. Unlike a smooth ramp endpoint, this requires
+    /// restarting the integration stencil.
+    ///
+    /// # Errors
+    /// Invalid device-local history or candidate state.
+    fn discontinuity(&self, accepted: &[Real], candidate: &[Real]) -> SpiceResult<Option<Real>>;
+
     /// Refine receiver state from the converged solution and optionally
     /// request a retry at an interior crossing. Only candidate slots may
     /// change; the Newton stamp must already satisfy its convergence test.
