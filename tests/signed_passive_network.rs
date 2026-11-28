@@ -46,7 +46,9 @@ fn close(got: Complex, want: Complex, relative: f64, absolute: f64) {
 #[test]
 fn signed_storage_and_loss_match_independent_ac_witnesses() -> SpiceResult<()> {
     // Independent LTspice 24.0.12, each 10 kHz, source AC 1 / DC 2,
-    // a 10-ohm series drive and one storage network.
+    // a 10-ohm series drive and one storage network. For the damped
+    // auxiliary winding cases Cpar=2p and Rpar=0 are explicitly written
+    // in the reference circuit, rather than relying on implicit parasitics.
     for (card, re, im) in [
         (
             "c1 p 0 2u pn_rseries=-2",
@@ -70,13 +72,13 @@ fn signed_storage_and_loss_match_independent_ac_witnesses() -> SpiceResult<()> {
         ),
         (
             "c1 p 0 2u pn_lseries=3m pn_gseries_ac=-.05 pn_cparallel=2p",
-            1.752517974113890,
-            -0.4509694496139617,
+            1.752518514224599,
+            -0.4509691608164983,
         ),
         (
             "c1 p 0 2u pn_lseries=-3m pn_gseries_ac=-.05 pn_cparallel=2p",
-            1.497007406959305,
-            -0.5111864514526565,
+            1.497007811313457,
+            -0.5111864628262530,
         ),
         (
             "c1 p 0 2u pn_rseries=-2 pn_cparallel=-1u",
