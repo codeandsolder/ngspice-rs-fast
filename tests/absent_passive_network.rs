@@ -212,12 +212,24 @@ fn explicit_save_and_unknown_controls() -> SpiceResult<()> {
         &file.plots[0].plot,
         &["v(ghost)", "i(c1)", "i(l1)", "@c2[i]"],
     );
-    for bad in [
-        "f1 out 0 c1 1\nr2 out 0 1k",
-        "b1 out 0 v=i(missing)\nr2 out 0 1k",
-        "C1 live 0 1u m=0 pn_rseries=0",
+    for (bad, expected) in [
+        (
+            "f1 out 0 c1 1\nr2 out 0 1k",
+            "zero-multiplicity storage c1 has no physical controlling branch",
+        ),
+        (
+            "h1 out 0 l1 1\nr2 out 0 1k",
+            "zero-multiplicity storage l1 has no physical controlling branch",
+        ),
+        (
+            "l2 live 0 2m pn_rseries=5\nk1 l1 l2 .5",
+            "coupling to zero-multiplicity storage l1",
+        ),
+        ("b1 out 0 v=i(missing)\nr2 out 0 1k", "missing"),
+        ("C1 live 0 1u m=0 pn_rseries=0", "duplicate instance"),
     ] {
-        assert!(circuit(&format!("{LIVE}{REMOVED}{bad}")).is_err(), "{bad}");
+        let error = circuit(&format!("{LIVE}{REMOVED}{bad}")).unwrap_err();
+        assert!(error.to_string().contains(expected), "{bad}: {error}");
     }
     let mut c = circuit(&format!("{LIVE}{REMOVED}"))?;
     assert!(c.set_observations(&["i(missing)".into()]).is_err());
@@ -282,5 +294,67 @@ fn incremental_elaboration_is_atomic_and_respects_budgets() -> SpiceResult<()> {
     assert_zero(&op, &["v(ghost)", "i(c1)"]);
     assert_eq!(op.value("v(out)", 0), Some(Complex::real(1.)));
     assert!(op.variable_index("i(c2)").is_none());
+    Ok(())
+}
+#[test]
+fn exact_startup_policy_disappears_with_zero_copies_and_rebinds() -> SpiceResult<()> {
+    let body = |copies: f64| {
+        format!(
+            "v1 s 0 2\nr1 s p 10\n.param copies={copies}\n\
+             c1 p 0 2u m={{copies}} ic=.75 pn_rseries=5 pn_rparallel=20 \
+             pn_cparallel=1u pn_parallel_ic=.75 pn_terminal_bias_op=.2 \
+             pn_terminal_bias_tran=.2 pn_exact_ic=1 pn_control=1 pn_report_dc=1\n\
+             l1 orphan 0 3m m=0 ic=.1 pn_rseries=5 pn_cparallel=1u \
+             pn_terminal_bias_op=0 pn_terminal_bias_tran=0 pn_exact_ic=1\n"
+        )
+    };
+    for initial in [0., 1.] {
+        let plan = CircuitParameterPlan::new(source(&body(initial))?, &["copies"])?;
+        let mut session = plan.session()?;
+        for copies in [0., 1., 3., 0., 1.] {
+            session.update(&[copies], &mut EvalBudget::default())?;
+            let context = session.analysis_context();
+            let candidate = session.circuit_mut();
+            let mut reference = circuit(&body(copies))?;
+            assert_eq!(candidate.device_count(), reference.device_count());
+            assert_eq!(candidate.unknown_count(), reference.unknown_count());
+            assert_eq!(
+                candidate.state_history()?.len(),
+                reference.state_history()?.len()
+            );
+            if copies == 0. {
+                assert_eq!(candidate.device_count(), 2);
+                assert_eq!(candidate.state_history()?.len(), 0);
+            }
+            for (kind, args) in [
+                (AnalysisKind::OperatingPoint, vec![]),
+                (AnalysisKind::Transient, vec!["1n", "20n", "0", "1n"]),
+            ] {
+                let request =
+                    AnalysisInput::with_arguments(kind, args.iter().copied()).resolve()?;
+                let actual = request.run(candidate, &context)?;
+                let expected = request.run(&mut reference, &AnalysisContext::default())?;
+                assert_eq!(actual.point_count(), expected.point_count());
+                assert_zero(&actual, &["i(l1)", "v(orphan)"]);
+                if copies == 0. {
+                    assert_zero(&actual, &["i(c1)"]);
+                }
+                for name in ["i(c1)", "i(v1)", "v(p)"] {
+                    for point in 0..expected.point_count() {
+                        let a = actual.value(name, point).unwrap();
+                        let b = expected.value(name, point).unwrap();
+                        assert!(
+                            (a - b).magnitude() < 1e-12,
+                            "{initial} -> {copies}: {name} {a:?} {b:?}"
+                        );
+                    }
+                }
+                if kind == AnalysisKind::OperatingPoint {
+                    let voltage = if copies == 0. { 2. } else { 7. / 6. };
+                    assert!((actual.value("v(p)", 0).unwrap().re - voltage).abs() < 1e-12);
+                }
+            }
+        }
+    }
     Ok(())
 }

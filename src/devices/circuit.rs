@@ -1961,8 +1961,13 @@ impl Circuit {
                     None => SpiceError::circuit(message),
                 };
                 let Some(index) = names.get(&reference.name) else {
+                    let reason = if self.is_absent_storage(&reference.name) {
+                        "coupling to zero-multiplicity storage"
+                    } else {
+                        "coupling to non-existent inductor"
+                    };
                     return Err(failure(format!(
-                        "{}: coupling to non-existent inductor {}",
+                        "{}: {reason} {}",
                         device.name(),
                         reference.name
                     )));
