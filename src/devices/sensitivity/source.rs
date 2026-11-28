@@ -3,8 +3,8 @@
 //! loads (`vsrcload.c`, `vsrcacld.c`, `isrcload.c`, `isrcacld.c`).
 
 use super::{
-    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, SensitivityFamily,
-    SensitivityKernel, SensitivityParameter as P, SensitivityRecord,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityParameter as P,
+    SensitivityRecord, reconstructed_loads,
 };
 use crate::devices::IndependentSource;
 use crate::devices::sources::{AcExcitation, AcInput};
@@ -148,27 +148,15 @@ impl SensitivityKernel for SourceSensitivity<'_> {
         instance.store("acimag", ac.im)
     }
 
-    /// The DC load drives the DC value when given, otherwise the transient
-    /// function's time-zero value (`dcValue`, zero, without a function); the
-    /// AC load drives the phasor; a current source scales both by `m`. RF
-    /// port setters (`z0`, `pwr`, `freq`, `phase`) do nothing on a source
-    /// that is not a port.
-    fn dc_load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<DcSensitivityLoad> {
-        Ok(DcSensitivityLoad::replacement(self.replacement(current)?))
-    }
-
-    fn ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        _reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<AcSensitivityLoad> {
-        Ok(AcSensitivityLoad::device(self.replacement(current)?))
-    }
+    reconstructed_loads!(
+        ordinary,
+        /// The DC load drives the DC value when given, otherwise the transient
+        /// function's time-zero value (`dcValue`, zero, without a function); the
+        /// AC load drives the phasor; a current source scales both by `m`. RF
+        /// port setters (`z0`, `pwr`, `freq`, `phase`) do nothing on a source
+        /// that is not a port.
+        replacement
+    );
 }
 
 impl SourceSensitivity<'_> {

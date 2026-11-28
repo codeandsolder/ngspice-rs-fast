@@ -82,7 +82,7 @@ use crate::devices::schema::{
 };
 use crate::devices::sensitivity::{
     ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
-    SensitivityParameter, SensitivityRecord, reconstructed_reset_loads,
+    SensitivityParameter, SensitivityRecord, reconstructed_loads,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -965,7 +965,8 @@ impl SensitivityKernel for MesfetSensitivity<'_> {
         Ok(())
     }
 
-    reconstructed_reset_loads!(
+    reconstructed_loads!(
+        reset,
         /// `MESacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
         /// `ggd` are the `CKTstate0` values `mesload.c` stored at zero junction
         /// voltages with the reset records, the charge slots `qgs`/`qgd` are

@@ -9,8 +9,8 @@
 //! after `m` was perturbed zeroes the coefficient). The port replays this.
 
 use super::{
-    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, SensitivityFamily,
-    SensitivityKernel, SensitivityParameter as P, SensitivityRecord,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityParameter as P,
+    SensitivityRecord, reconstructed_loads,
 };
 use crate::devices::{ControlledKind, ControlledSource};
 use crate::primitives::{Real, SpiceResult};
@@ -98,22 +98,7 @@ impl SensitivityKernel for ControlledSensitivity<'_> {
         }
     }
 
-    fn dc_load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<DcSensitivityLoad> {
-        Ok(DcSensitivityLoad::replacement(self.replacement(current)?))
-    }
-
-    fn ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        _reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<AcSensitivityLoad> {
-        Ok(AcSensitivityLoad::device(self.replacement(current)?))
-    }
+    reconstructed_loads!(ordinary, replacement);
 }
 
 impl ControlledSensitivity<'_> {

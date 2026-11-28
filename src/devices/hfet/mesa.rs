@@ -46,7 +46,7 @@ use crate::devices::jfet::{self, BOLTZMANN, CHARGE};
 use crate::devices::nonlinear::unaliased_conductance;
 use crate::devices::sensitivity::{
     ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
-    SensitivityParameter, SensitivityRecord, StampPart, node_stamps, reconstructed_reset_loads,
+    SensitivityParameter, SensitivityRecord, StampPart, node_stamps, reconstructed_loads,
     stamp_reset,
 };
 use crate::devices::sweep::check_swept;
@@ -1913,7 +1913,8 @@ impl SensitivityKernel for MesaSensitivity<'_> {
         Ok(())
     }
 
-    reconstructed_reset_loads!(
+    reconstructed_loads!(
+        reset,
         /// `MESAacLoad` after `cktsens.c`'s reset load: `ggs`/`ggd` in
         /// `CKTstate0` and the instance fields `gm0`..`gds0`/`delidgch0`.. that
         /// `mesaload.c` wrote at zero gate voltages with the reset records (at the

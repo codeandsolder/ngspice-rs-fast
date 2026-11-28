@@ -560,8 +560,13 @@ pub enum AcSensitivityLoad {
 }
 
 impl AcSensitivityLoad {
-    pub(in crate::devices) fn device(device: impl Device) -> Self {
-        Self::Device(Box::new(device))
+    /// Reconstruct the ordinary small-signal device from the current records.
+    pub(in crate::devices) fn ordinary<D: Device>(
+        _reset: AcReset<'_>,
+        current: RecordPair<'_>,
+        reconstruct: impl FnOnce(RecordPair<'_>) -> SpiceResult<D>,
+    ) -> SpiceResult<Self> {
+        Ok(Self::Device(Box::new(reconstruct(current)?)))
     }
 
     pub(in crate::devices) fn stamp(stamp: impl AcSensitivityStamp + 'static) -> Self {
@@ -593,12 +598,12 @@ impl AcSensitivityLoad {
     }
 }
 
-// Implement the two disjoint replay hooks for families that reconstruct an
-// ordinary DC device and use two snapshots of that device for historical AC.
+// Implement the two disjoint replay hooks for families that reconstruct a
+// device for DC and explicitly choose ordinary AC or historical reset AC.
 // This macro only supplies the trait methods; all reconstruction and stamp
 // computation remains in the typed device implementation.
-macro_rules! reconstructed_reset_loads {
-    ($(#[$ac_doc:meta])* $reconstruct:ident) => {
+macro_rules! reconstructed_loads {
+    ($ac:ident, $(#[$ac_doc:meta])* $reconstruct:ident) => {
         fn dc_load(
             &self,
             _setup: $crate::devices::sensitivity::RecordPair<'_>,
@@ -614,12 +619,12 @@ macro_rules! reconstructed_reset_loads {
             reset: $crate::devices::sensitivity::AcReset<'_>,
             current: $crate::devices::sensitivity::RecordPair<'_>,
         ) -> $crate::primitives::SpiceResult<$crate::devices::sensitivity::AcSensitivityLoad> {
-            $crate::devices::sensitivity::AcSensitivityLoad::reset(reset, current, |records| self.$reconstruct(records))
+            $crate::devices::sensitivity::AcSensitivityLoad::$ac(reset, current, |records| self.$reconstruct(records))
         }
     };
 }
 
-pub(in crate::devices) use reconstructed_reset_loads;
+pub(in crate::devices) use reconstructed_loads;
 
 /// One device as `.sens` sees it: C's parameter tables, its records, and its
 /// setter, setup, temperature and load routines replayed on those records.

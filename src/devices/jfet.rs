@@ -65,8 +65,7 @@ use crate::devices::schema::{
 };
 use crate::devices::sensitivity::{
     ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
-    SensitivityParameter, SensitivityRecord, junction_temperature_defaults,
-    reconstructed_reset_loads,
+    SensitivityParameter, SensitivityRecord, junction_temperature_defaults, reconstructed_loads,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -1325,7 +1324,8 @@ impl SensitivityKernel for JfetSensitivity<'_> {
         junction_temperature_defaults(model, instance, self.nominal_kelvin, self.circuit_kelvin)
     }
 
-    reconstructed_reset_loads!(
+    reconstructed_loads!(
+        reset,
         /// `JFETacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
         /// `ggd` are the `CKTstate0` values `jfetload.c` stored at zero junction
         /// voltages with the reset records, the charge slots `qgs`/`qgd` (written

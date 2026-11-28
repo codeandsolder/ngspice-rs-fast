@@ -3,9 +3,9 @@
 //! `resload.c` (`RESload`, `RESacload`).
 
 use super::{
-    AcReset, AcSensitivityLoad, CELSIUS_TO_KELVIN, DcSensitivityLoad, ParameterScope,
-    PassiveInputs, RecordPair, SensitivityConductance, SensitivityFamily, SensitivityKernel,
-    SensitivityParameter as P, SensitivityRecord,
+    CELSIUS_TO_KELVIN, ParameterScope, PassiveInputs, RecordPair, SensitivityConductance,
+    SensitivityFamily, SensitivityKernel, SensitivityParameter as P, SensitivityRecord,
+    reconstructed_loads,
 };
 use crate::devices::passive::physics::{
     Coefficients, SheetGeometry, TemperaturePoint, conductance, scaled,
@@ -309,24 +309,12 @@ impl SensitivityKernel for ResistorSensitivity<'_> {
         Ok(())
     }
 
-    /// `RESload` stamps `RESconduct`; `RESacload` `RESacConduct` when `ac`
-    /// was given, else `RESconduct`.
-    fn dc_load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<DcSensitivityLoad> {
-        Ok(DcSensitivityLoad::replacement(self.replacement(current)?))
-    }
-
-    fn ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        _reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<AcSensitivityLoad> {
-        Ok(AcSensitivityLoad::device(self.replacement(current)?))
-    }
+    reconstructed_loads!(
+        ordinary,
+        /// `RESload` stamps `RESconduct`; `RESacload` `RESacConduct` when `ac`
+        /// was given, else `RESconduct`.
+        replacement
+    );
 }
 
 impl ResistorSensitivity<'_> {

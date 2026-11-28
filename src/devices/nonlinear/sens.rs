@@ -22,7 +22,7 @@ use crate::devices::LinearContext;
 use crate::devices::sensitivity::{
     CELSIUS_TO_KELVIN, ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily,
     SensitivityKernel, SensitivityParameter as P, SensitivityRecord, StampPart,
-    instance_temperature_defaults, node_stamps, reconstructed_reset_loads, stamp_reset, written,
+    instance_temperature_defaults, node_stamps, reconstructed_loads, stamp_reset, written,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -403,7 +403,8 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
         instance_temperature_defaults(instance, self.circuit_kelvin)
     }
 
-    reconstructed_reset_loads!(
+    reconstructed_loads!(
+        reset,
         /// `DIOacLoad` after `cktsens.c`'s reset load: the series conductance
         /// `DIOtConductance` of `current`, the junction conductance
         /// `CKTstate0[DIOconduct]` that `dioload.c` stored at `vd = 0` with the

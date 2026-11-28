@@ -56,7 +56,7 @@ use crate::devices::schema::{
 };
 use crate::devices::sensitivity::{
     ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
-    SensitivityParameter, SensitivityRecord, StampPart, node_stamps, reconstructed_reset_loads,
+    SensitivityParameter, SensitivityRecord, StampPart, node_stamps, reconstructed_loads,
     stamp_reset,
 };
 use crate::devices::{
@@ -1091,7 +1091,8 @@ impl SensitivityKernel for Hfet2Sensitivity<'_> {
         Ok(())
     }
 
-    reconstructed_reset_loads!(
+    reconstructed_loads!(
+        reset,
         /// `HFET2acLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
         /// `ggd` are the `CKTstate0` values `hfet2load.c` stored at zero gate
         /// voltages with the reset records, the charge slots `qgs`/`qgd` are
