@@ -996,7 +996,7 @@ fn solve_retained_rhs(
     };
     let result = solve(rhs, out);
     if let Some(original) = &symbolic.original {
-        if let Ok(true) = result.and_then(|()| {
+        if result.and_then(|()| {
             refine_retained_rhs(
                 &original.stamps,
                 rhs,
@@ -1006,7 +1006,8 @@ fn solve_retained_rhs(
                 transpose,
                 solve,
             )
-        }) {
+        }) == Ok(true)
+        {
             return Ok(());
         }
     } else {

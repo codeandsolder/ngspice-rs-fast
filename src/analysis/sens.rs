@@ -2025,6 +2025,26 @@ fn run_ac(
     Ok(())
 }
 
+fn dc_adjoint(
+    pattern: &std::sync::Arc<crate::maths::Pattern>,
+    rhs: &Vector,
+) -> SpiceResult<Vector> {
+    let mut adjoint = Vector::default();
+    if !solve_last_factors_into(
+        pattern,
+        rhs,
+        &mut RetainedSolveWorkspace::default(),
+        &mut adjoint,
+        true,
+    )? {
+        return Err(SpiceError::Numerical {
+            context: ".sens".to_owned(),
+            message: "the operating point left no factored circuit matrix".to_owned(),
+        });
+    }
+    Ok(adjoint)
+}
+
 fn run_dc(
     walk: &mut ParameterWalk<'_>,
     solved: crate::analysis::newton::NewtonSolution<TrialState>,
@@ -2078,19 +2098,7 @@ fn run_dc(
         trial,
         circuit,
     };
-    let mut adjoint = Vector::default();
-    if !solve_last_factors_into(
-        &at.pattern,
-        &probe.dual(n),
-        &mut RetainedSolveWorkspace::default(),
-        &mut adjoint,
-        true,
-    )? {
-        return Err(SpiceError::Numerical {
-            context: ".sens".to_owned(),
-            message: "the operating point left no factored circuit matrix".to_owned(),
-        });
-    }
+    let adjoint = dc_adjoint(&at.pattern, &probe.dual(n))?;
     let mut point = Vec::with_capacity(plot.variables().len());
     let mut scratch = DcAssembly::new(n);
     let mut resolution = walk
