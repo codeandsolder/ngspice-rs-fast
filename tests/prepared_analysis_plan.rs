@@ -146,7 +146,7 @@ fn unresolved_source_automatic_integration_is_not_replaced_by_native_guess() -> 
 #[test]
 fn hspice_nested_ac_binds_shared_device_parameters_and_temperature() -> anyhow::Result<()> {
     let (_dir, bundle, netlist) = produce(
-        "Nested AC\n.param r=1k\nv1 in 0 0 AC 1\nr1 in out rm {r}\nr2 out 0 rm {r}\nc1 out 0 1u\n.model rm r(tc1=0.01 tnom=25)\n.ac LIN 3 1k 3k SWEEP r LIN 2 1k 2k SWEEP TEMP 25 75 50\n.end\n",
+        "Nested AC\n.param r=1k\nv1 in 0 0 AC 1\nr1 in out {r} tc1=0.01\nr2 out 0 {r} tc1=0.01\nc1 out 0 1u\n.option tnom=25\n.ac LIN 3 1k 3k SWEEP r LIN 2 1k 2k SWEEP TEMP 25 75 50\n.end\n",
         InputFormat::HspiceDeck,
     )?;
     let work = WorkBudget::default();
