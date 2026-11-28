@@ -2,7 +2,9 @@
 //! Ownership: BSIM4 load inventory fields cbs/cbd/gbs/gbd and capbs/capbd;
 //! charge also writes QBS/QBD (no integration here).
 use super::{DEXP, EXP_THRESHOLD, Instance, LoadCkt, MIN_EXP, Model, SizeParam, state};
-use crate::devices::nonlinear::{exponential_junction_at_argument, reverse_depletion};
+use crate::devices::bsim_physics::{JunctionCapacitance, depletion};
+use crate::devices::nonlinear::exponential_junction_at_argument;
+use crate::primitives::SpiceResult;
 
 /// Body-source and body-drain voltage, selecting bulk-resistance internal
 /// nodes when present. Both are already polarity-normalized and limited.
@@ -274,55 +276,6 @@ pub(super) fn current(
     }
 }
 
-#[derive(Clone, Copy)]
-struct JunctionCapacitance {
-    zero: f64,
-    potential: f64,
-    grading: f64,
-}
-
-/// The reverse integral shares the diode/BJT depletion law. The forward
-/// BSIM4 continuation is its quadratic Taylor polynomial at zero bias.
-/// State writes remain in the reference bottom/sidewall/gate order.
-fn depletion(
-    voltage: f64,
-    parts: [JunctionCapacitance; 3],
-    slot: usize,
-    ckt: &mut dyn LoadCkt,
-) -> f64 {
-    let [bottom, side, gate] = parts;
-    if voltage == 0. {
-        ckt.set_state0(slot, 0.);
-        bottom.zero + side.zero + gate.zero
-    } else if voltage < 0. {
-        let mut capacitance = 0.;
-        for (index, part) in parts.into_iter().enumerate() {
-            if part.zero > 0. {
-                let (charge, cap) =
-                    reverse_depletion(voltage, part.zero, part.potential, part.grading);
-                if index == 0 {
-                    ckt.set_state0(slot, charge);
-                    capacitance = cap;
-                } else {
-                    ckt.set_state0(slot, ckt.state0(slot) + charge);
-                    capacitance += cap;
-                }
-            } else if index == 0 {
-                ckt.set_state0(slot, 0.);
-            }
-        }
-        capacitance
-    } else {
-        let cap0 = bottom.zero + side.zero + gate.zero;
-        let increment = voltage
-            * (bottom.zero * bottom.grading / bottom.potential
-                + side.zero * side.grading / side.potential
-                + gate.zero * gate.grading / gate.potential);
-        ckt.set_state0(slot, voltage * 0.5_f64.mul_add(increment, cap0));
-        cap0 + increment
-    }
-}
-
 /// Evaluate depletion charge and capacitance (C's finished label).
 pub(super) fn charge(
     model: &Model,
@@ -330,8 +283,8 @@ pub(super) fn charge(
     size: &SizeParam,
     ckt: &mut dyn LoadCkt,
     bias: JunctionBias,
-) {
-    here.capbs = depletion(
+) -> SpiceResult<()> {
+    let (source_charge, source_capacitance) = depletion(
         bias.source,
         [
             JunctionCapacitance {
@@ -350,10 +303,10 @@ pub(super) fn charge(
                 grading: model.SbulkJctGateSideGradingCoeff,
             },
         ],
-        state::QBS,
-        ckt,
-    );
-    here.capbd = depletion(
+    )?;
+    ckt.set_state0(state::QBS, source_charge);
+    here.capbs = source_capacitance;
+    let (drain_charge, drain_capacitance) = depletion(
         bias.drain,
         [
             JunctionCapacitance {
@@ -372,9 +325,10 @@ pub(super) fn charge(
                 grading: model.DbulkJctGateSideGradingCoeff,
             },
         ],
-        state::QBD,
-        ckt,
-    );
+    )?;
+    ckt.set_state0(state::QBD, drain_charge);
+    here.capbd = drain_capacitance;
+    Ok(())
 }
 
 #[cfg(test)]
