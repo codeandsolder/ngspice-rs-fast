@@ -1068,7 +1068,9 @@ impl EquilibratedSparseLu {
 
     fn solve_factors_in(&self, rhs: &Vector, workspace: &mut Vec<f64>) -> SpiceResult<Vector> {
         let scaled_rhs = Equilibration::transform_real(rhs, &self.scaling.rows)?;
-        let y = self.factor.solve_with_workspace(&scaled_rhs, workspace)?;
+        let mut y = Vector::default();
+        self.factor
+            .solve_into(&scaled_rhs, workspace, &mut y, false)?;
         Equilibration::transform_real(&y, &self.scaling.columns)
     }
 

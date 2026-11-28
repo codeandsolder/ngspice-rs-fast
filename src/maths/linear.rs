@@ -454,11 +454,7 @@ fn solve_real(
 
 impl SparseSymbolic {
     fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        self.solve_with_workspace(rhs, &mut Vec::new())
-    }
-
-    fn solve_with_workspace(&self, rhs: &Vector, workspace: &mut Vec<f64>) -> SpiceResult<Vector> {
-        solve_real(&self.sparse, self.n, rhs, workspace, false)
+        solve_real(&self.sparse, self.n, rhs, &mut Vec::new(), false)
     }
 
     /// Whether a matrix has exactly this assembled pattern.
@@ -484,69 +480,6 @@ impl SparseSymbolic {
             }
         }
     }
-}
-
-/// Solve a sparse matrix, reusing a compatible pivot ordering.
-///
-/// Solves `matrix x = rhs`, refactoring with `ordering`'s pivots when the
-/// pattern is unchanged (`SMPluFac`) and ordering afresh otherwise
-/// (`SMPreorder`), then keeps the new factors' order for the next call. The
-/// previous factors are refactored in place when nothing else holds them.
-///
-/// # Errors
-/// As [`SparseLu::new`] and [`SparseLu::solve`].
-pub fn solve_with_ordering(
-    matrix: &SparseMatrix,
-    rhs: &Vector,
-    ordering: &mut Option<SparseSymbolic>,
-) -> SpiceResult<Vector> {
-    if let Some((pattern, _)) = matrix.bound_values() {
-        // A bound matrix uses its pattern's single persistent order instead.
-        return pattern.with_ordering(|state| {
-            let mut cached = state
-                .frame
-                .take()
-                .map(|frame| frame.into_real(pattern, &mut state.work));
-            let x = solve_reusing(
-                matrix,
-                rhs,
-                &mut cached,
-                &mut state.solve_workspace,
-                &mut state.work,
-            );
-            state.frame = cached.map(CachedFrame::Real);
-            x
-        });
-    }
-    solve_reusing(
-        matrix,
-        rhs,
-        ordering,
-        &mut Vec::new(),
-        &mut PatternWork::default(),
-    )
-}
-
-fn solve_reusing(
-    matrix: &SparseMatrix,
-    rhs: &Vector,
-    ordering: &mut Option<SparseSymbolic>,
-    workspace: &mut Vec<f64>,
-    work: &mut PatternWork,
-) -> SpiceResult<Vector> {
-    let previous = ordering.take();
-    let matrix = work.factor.assembly(prepare_matrix(matrix))?;
-    let factor = match previous {
-        Some(previous) if previous.matches(&matrix) => {
-            SparseLu::refactor(previous, &matrix, workspace, &mut work.factor)?
-        }
-        _ => SparseLu::factor_prepared(&matrix, &mut work.factor)?,
-    };
-    let result = factor.symbolic.solve_with_workspace(rhs, workspace);
-    work.record_rhs(&result);
-    // An invalid RHS does not invalidate the matrix's newly computed LU.
-    *ordering = Some(factor.symbolic);
-    result
 }
 
 /// `NIacIter`'s factorization (`niaciter.c`) of a complex system loaded into
@@ -930,52 +863,37 @@ fn ni_step(
     result
 }
 
-/// Solve with a circuit's retained sparse matrix factors.
-///
-/// `SMPsolve` with the factors a circuit pattern's frame holds now: those of
-/// the last factorization of the circuit matrix (after `CKTop`, the last
-/// `NIiter` pass's load), as `.tf` (`tfanal.c`) solves its unit excitations.
-/// `None` when the frame holds no factors.
-///
-/// # Errors
-/// An invalid RHS or a non-finite solution.
-pub fn solve_last_factors(pattern: &Arc<Pattern>, rhs: &Vector) -> SpiceResult<Option<Vector>> {
-    solve_last_factors_direction(pattern, rhs, false)
+/// Caller-owned scratch for retained primal and adjoint solves.
+#[derive(Debug, Default)]
+pub struct RetainedSolveWorkspace {
+    solve: Vec<f64>,
+    residual: Vector,
+    next: Vector,
 }
 
-/// Solve `A^T λ = g` from the circuit's retained primal factorization.
-///
-/// This is an ordinary *transpose*, not an inverse of the transposed input
-/// stamps and not a separately factorized Jacobian. Objective derivatives
-/// use one such solve for all parameter residuals at the same bias.
-///
+/// Solve against the circuit's last retained factorization, in either
+/// orientation. Returns false if no compatible factored frame remains.
+/// On success the solution is written to the caller's output.
 /// # Errors
-/// Invalid RHS or non-finite solution. Returns `None` if the circuit's
-/// previously factored matrix has been invalidated.
-pub(crate) fn solve_last_factors_transposed(
+/// Invalid RHS, failed residual refinement or non-finite solution.
+pub fn solve_last_factors_into(
     pattern: &Arc<Pattern>,
     rhs: &Vector,
-) -> SpiceResult<Option<Vector>> {
-    solve_last_factors_direction(pattern, rhs, true)
-}
-
-fn solve_last_factors_direction(
-    pattern: &Arc<Pattern>,
-    rhs: &Vector,
+    workspace: &mut RetainedSolveWorkspace,
+    out: &mut Vector,
     transpose: bool,
-) -> SpiceResult<Option<Vector>> {
+) -> SpiceResult<bool> {
     pattern.with_ordering(|state| {
         match &mut state.frame {
             Some(CachedFrame::Real(symbolic))
                 if matches!(&symbolic.key, Key::Pattern(weak) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(pattern)))
                     && symbolic.sparse.is_factored() =>
             {
-                Some(solve_retained_rhs(
-                    symbolic, rhs, transpose, &mut state.solve_workspace, &mut state.work,
-                ))
+                solve_retained_rhs(symbolic, rhs, transpose, workspace, out, &mut state.work)?;
+                Ok(true)
             }
-            _ => None,
-        }.transpose()
+            _ => Ok(false),
+        }
     })
 }
 
@@ -1007,31 +925,31 @@ const RECOVERED_RHS_STALL_STEPS: usize = 8;
 /// would miss those terms. A stalled, exhausted or non-finite correction
 /// requests precision escalation instead of returning an unreliable iterate.
 fn refine_retained_rhs(
-    order: usize,
     stamps: &[crate::maths::Triplet],
     rhs: &Vector,
-    initial: Vector,
+    current: &mut Vector,
+    residual: &mut Vector,
+    next: &mut Vector,
     transpose: bool,
     mut solve: impl FnMut(&Vector, &mut Vector) -> SpiceResult<()>,
-) -> SpiceResult<Option<Vector>> {
+) -> SpiceResult<bool> {
     use crate::maths::equilibration::OriginalResidual;
 
     let entries = recovery::operator_entries(stamps)?;
-    let original = OriginalResidual::real(order, &entries, transpose)?;
-    let mut current = initial;
+    let original = OriginalResidual::real(rhs.len(), &entries, transpose)?;
     let mut best_change = f64::INFINITY;
-    let mut residual = Vector::zeros(order);
-    let mut next = Vector::default();
+    residual.overwrite_storage().resize(rhs.len(), 0.);
     let mut stalled = 0;
     for _ in 0..MAX_RECOVERED_RHS_CORRECTIONS {
         original.correction_into(rhs.as_slice(), current.as_slice(), residual.as_mut_slice())?;
-        solve(&residual, &mut next)?;
-        let relative = update_coordinates(&mut next, &current);
+        solve(residual, next)?;
+        let relative = update_coordinates(next, current);
         if !next.is_finite() || !relative.is_finite() {
-            return Ok(None);
+            return Ok(false);
         }
+        std::mem::swap(current, next);
         if relative <= f64::EPSILON.sqrt() {
-            return Ok(Some(next));
+            return Ok(true);
         }
         if relative < best_change {
             best_change = relative;
@@ -1042,18 +960,18 @@ fn refine_retained_rhs(
                 break;
             }
         }
-        std::mem::swap(&mut current, &mut next);
     }
-    Ok(None)
+    Ok(false)
 }
 
 fn solve_retained_rhs(
     symbolic: &mut SparseSymbolic,
     rhs: &Vector,
     transpose: bool,
-    workspace: &mut Vec<f64>,
+    workspace: &mut RetainedSolveWorkspace,
+    out: &mut Vector,
     work: &mut PatternWork,
-) -> SpiceResult<Vector> {
+) -> SpiceResult<()> {
     if rhs.len() != symbolic.n || !rhs.is_finite() {
         let result = Err(numerical("retained sparse solve", "invalid RHS"));
         work.record_rhs(&result);
@@ -1062,29 +980,43 @@ fn solve_retained_rhs(
     if let Some(original) = &mut symbolic.original
         && original.promoted()
     {
-        return original.solve_wide(symbolic.n, rhs, transpose, work);
+        return original.solve_wide(symbolic.n, rhs, transpose, work, out);
     }
     let mut solve = |rhs: &Vector, out: &mut Vector| {
-        let result = solve_real_into(&symbolic.sparse, symbolic.n, rhs, workspace, out, transpose);
+        let result = solve_real_into(
+            &symbolic.sparse,
+            symbolic.n,
+            rhs,
+            &mut workspace.solve,
+            out,
+            transpose,
+        );
         work.record_rhs(&result);
         result
     };
-    let mut initial = Vector::default();
-    let result = solve(rhs, &mut initial);
+    let result = solve(rhs, out);
     if let Some(original) = &symbolic.original {
-        if let Ok(Some(solution)) = result.and_then(|()| {
-            refine_retained_rhs(symbolic.n, &original.stamps, rhs, initial, transpose, solve)
+        if let Ok(true) = result.and_then(|()| {
+            refine_retained_rhs(
+                &original.stamps,
+                rhs,
+                out,
+                &mut workspace.residual,
+                &mut workspace.next,
+                transpose,
+                solve,
+            )
         }) {
-            return Ok(solution);
+            return Ok(());
         }
     } else {
-        return result.map(|()| initial);
+        return result;
     }
     symbolic
         .original
         .as_mut()
         .ok_or_else(|| numerical("retained sparse recovery", "missing unfolded operator"))?
-        .solve_wide(symbolic.n, rhs, transpose, work)
+        .solve_wide(symbolic.n, rhs, transpose, work, out)
 }
 
 /// Owned numeric sparse LU factors.
@@ -1229,33 +1161,38 @@ impl SparseLu {
         self.symbolic.solve(rhs)
     }
 
-    /// Solves with this immutable snapshot and caller-owned numeric scratch.
+    /// Solves into reusable output with caller-owned numeric scratch.
+    /// When transposed, solves the system A^T x = b with the same factors.
     /// # Errors
     /// Invalid RHS or non-finite solution.
-    pub fn solve_with_workspace(
+    pub fn solve_into(
         &self,
         rhs: &Vector,
         workspace: &mut Vec<f64>,
-    ) -> SpiceResult<Vector> {
-        self.symbolic.solve_with_workspace(rhs, workspace)
+        out: &mut Vector,
+        transposed: bool,
+    ) -> SpiceResult<()> {
+        solve_real_into(
+            &self.symbolic.sparse,
+            self.symbolic.n,
+            rhs,
+            workspace,
+            out,
+            transposed,
+        )
     }
 
-    /// Solves the transposed system `A^T x = b` with the same factors.
+    /// Solves the transposed system with the same factors.
     /// # Errors
     /// Invalid RHS or non-finite solution.
     pub fn solve_transposed(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        self.solve_transposed_with_workspace(rhs, &mut Vec::new())
-    }
-
-    /// Transposed solve with caller-owned scratch.
-    /// # Errors
-    /// Invalid RHS or non-finite solution.
-    pub fn solve_transposed_with_workspace(
-        &self,
-        rhs: &Vector,
-        workspace: &mut Vec<f64>,
-    ) -> SpiceResult<Vector> {
-        solve_real(&self.symbolic.sparse, self.symbolic.n, rhs, workspace, true)
+        solve_real(
+            &self.symbolic.sparse,
+            self.symbolic.n,
+            rhs,
+            &mut Vec::new(),
+            true,
+        )
     }
 
     /// Solve consecutive RHS-major vectors using one factor traversal per tile.
@@ -1327,36 +1264,28 @@ impl DenseLu {
     /// # Errors
     /// Invalid RHS or non-finite solution.
     pub fn solve(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        self.solve_with_workspace(rhs, &mut Vec::new())
+        solve_real(&self.sparse, self.n, rhs, &mut Vec::new(), false)
     }
 
-    /// Solves with caller-owned numeric scratch.
+    /// Solves into reusable output with caller-owned numeric scratch.
+    /// When transposed, solves the system A^T x = b with the same factors.
     /// # Errors
     /// Invalid RHS or non-finite solution.
-    pub fn solve_with_workspace(
+    pub fn solve_into(
         &self,
         rhs: &Vector,
         workspace: &mut Vec<f64>,
-    ) -> SpiceResult<Vector> {
-        solve_real(&self.sparse, self.n, rhs, workspace, false)
+        out: &mut Vector,
+        transposed: bool,
+    ) -> SpiceResult<()> {
+        solve_real_into(&self.sparse, self.n, rhs, workspace, out, transposed)
     }
 
     /// Solves the transposed system with the same factors.
     /// # Errors
     /// Invalid RHS or non-finite solution.
     pub fn solve_transposed(&self, rhs: &Vector) -> SpiceResult<Vector> {
-        self.solve_transposed_with_workspace(rhs, &mut Vec::new())
-    }
-
-    /// Transposed solve with caller-owned numeric scratch.
-    /// # Errors
-    /// Invalid RHS or non-finite solution.
-    pub fn solve_transposed_with_workspace(
-        &self,
-        rhs: &Vector,
-        workspace: &mut Vec<f64>,
-    ) -> SpiceResult<Vector> {
-        solve_real(&self.sparse, self.n, rhs, workspace, true)
+        solve_real(&self.sparse, self.n, rhs, &mut Vec::new(), true)
     }
 }
 
@@ -1364,6 +1293,33 @@ impl DenseLu {
 mod tests {
     use super::*;
     use crate::maths::complex::ComplexMatrix;
+
+    fn retained(
+        pattern: &Arc<Pattern>,
+        rhs: &Vector,
+        transpose: bool,
+    ) -> SpiceResult<Option<Vector>> {
+        let mut out = Vector::default();
+        Ok(solve_last_factors_into(
+            pattern,
+            rhs,
+            &mut RetainedSolveWorkspace::default(),
+            &mut out,
+            transpose,
+        )?
+        .then_some(out))
+    }
+
+    fn solve_last_factors(pattern: &Arc<Pattern>, rhs: &Vector) -> SpiceResult<Option<Vector>> {
+        retained(pattern, rhs, false)
+    }
+
+    fn solve_last_factors_transposed(
+        pattern: &Arc<Pattern>,
+        rhs: &Vector,
+    ) -> SpiceResult<Option<Vector>> {
+        retained(pattern, rhs, true)
+    }
 
     #[test]
     fn dense_and_sparse_transposed_solves_share_workspace_and_preserve_order() {
@@ -1377,25 +1333,25 @@ mod tests {
         let sparse = SparseLu::new(&sparse, None).unwrap();
         let rhs = Vector::from_slice(&[5., 5.]);
         let mut workspace = Vec::new();
-        let x = sparse
-            .solve_transposed_with_workspace(&rhs, &mut workspace)
+        let mut x = Vector::default();
+        sparse
+            .solve_into(&rhs, &mut workspace, &mut x, true)
             .unwrap();
         assert!((x.get(0).unwrap() - 1.).abs() < 1e-14);
         assert!((x.get(1).unwrap() - 1.).abs() < 1e-14);
         let storage = workspace.as_ptr();
-        assert_eq!(
-            dense
-                .solve_transposed_with_workspace(&rhs, &mut workspace)
-                .unwrap(),
-            x
-        );
+        let output = x.as_slice().as_ptr();
+        dense
+            .solve_into(&rhs, &mut workspace, &mut x, true)
+            .unwrap();
         assert_eq!(sparse.solve_transposed(&rhs).unwrap(), x);
         assert_eq!(dense.solve_transposed(&rhs).unwrap(), x);
-        assert_eq!(
-            sparse.solve_with_workspace(&rhs, &mut workspace).unwrap(),
-            sparse.solve(&rhs).unwrap()
-        );
+        sparse
+            .solve_into(&rhs, &mut workspace, &mut x, false)
+            .unwrap();
+        assert_eq!(sparse.solve(&rhs).unwrap(), x);
         assert_eq!(workspace.as_ptr(), storage);
+        assert_eq!(x.as_slice().as_ptr(), output);
         assert!(dense.solve_transposed(&Vector::zeros(1)).is_err());
     }
 
@@ -1407,17 +1363,23 @@ mod tests {
             a.set(r, c, v).unwrap();
         }
         let rhs = Vector::from_slice(&[4., 5.]);
-        let first = solve_with_ordering(&a, &rhs, &mut None).unwrap();
-        let storage = pattern.with_ordering(|state| state.solve_workspace.as_ptr());
-        let second = solve_with_ordering(&a, &rhs, &mut None).unwrap();
-        assert_eq!(first, second);
-        assert!(solve_with_ordering(&a, &Vector::zeros(1), &mut None).is_err());
+        let mut workspace = NiWorkspace::default();
+        let mut out = Vector::default();
+        assert!(matches!(
+            solve_ni(&a, &rhs, &mut workspace, &mut out, false, 0.).unwrap(),
+            NiStep::Solved
+        ));
+        let first = out.clone();
+        let output = out.as_slice().as_ptr();
+        assert!(matches!(
+            solve_ni(&a, &rhs, &mut workspace, &mut out, false, 0.).unwrap(),
+            NiStep::Solved
+        ));
+        assert_eq!(first, out);
+        assert!(solve_ni(&a, &Vector::zeros(1), &mut workspace, &mut out, false, 0.).is_err());
         let retained = solve_last_factors(&pattern, &rhs).unwrap().unwrap();
         assert_eq!(retained, first);
-        assert_eq!(
-            storage,
-            pattern.with_ordering(|state| state.solve_workspace.as_ptr())
-        );
+        assert_eq!(output, out.as_slice().as_ptr());
     }
 
     #[test]
@@ -1899,13 +1861,6 @@ mod tests {
         assert_eq!(original.solve(&rhs).unwrap().as_slice(), &[2., 2.]);
         assert_eq!(reused.solve(&rhs).unwrap().as_slice(), &[1., 2.]);
 
-        let mut ordering = Some(original.symbolic().clone());
-        assert_eq!(
-            solve_with_ordering(&a, &rhs, &mut ordering)
-                .unwrap()
-                .as_slice(),
-            &[1., 2.]
-        );
         let mut x = Vector::default();
         let mut ni_workspace = NiWorkspace::default();
         let NiStep::Solved = solve_ni(&a, &rhs, &mut ni_workspace, &mut x, false, 0.).unwrap()

@@ -552,6 +552,8 @@ pub fn solve(
     let mut factor: Option<SparseLu> = None;
     let mut rejected = 0;
     let mut factor_workspace = Vec::new();
+    let mut delta = Vector::default();
+    let mut rhs = Vector::default();
     let mut peak_factor_entries = 0;
     for corrections in 0..=limits.iterations {
         let residual = work.evaluate(model, &coefficients, true)?;
@@ -579,14 +581,11 @@ pub fn solve(
             .as_ref()
             .ok_or_else(|| failure("missing Newton Jacobian workspace"))?;
         let next = SparseLu::new(matrix, factor.as_ref().map(SparseLu::symbolic))?;
-        let rhs = Vector::from(
-            scaled
-                .as_slice()
-                .iter()
-                .map(|value| -value)
-                .collect::<Vec<_>>(),
-        );
-        let delta = next.solve_with_workspace(&rhs, &mut factor_workspace)?;
+        rhs.copy_values_from(&scaled);
+        for value in rhs.as_mut_slice() {
+            *value = -*value;
+        }
+        next.solve_into(&rhs, &mut factor_workspace, &mut delta, false)?;
         peak_factor_entries = peak_factor_entries.max(next.factor_storage().factor_entries);
         factor = Some(next);
         let mut accepted = false;

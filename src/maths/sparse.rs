@@ -89,9 +89,6 @@ pub(super) struct OrderingState {
     pub(super) frame: Option<crate::maths::linear::CachedFrame>,
     pub(super) ac_reorder: bool,
     pub(super) work: crate::maths::PatternWork,
-    /// Reused real factor/triangular-solve scratch, owned by the circuit
-    /// transaction rather than by an immutable factor snapshot.
-    pub(super) solve_workspace: Vec<Real>,
 }
 
 impl Default for OrderingState {
@@ -100,7 +97,6 @@ impl Default for OrderingState {
             frame: None,
             ac_reorder: true,
             work: crate::maths::PatternWork::default(),
-            solve_workspace: Vec::new(),
         }
     }
 }
@@ -1813,7 +1809,6 @@ mod tests {
                 .spawn(|| {
                     pattern.with_ordering(|state| {
                         state.ac_reorder = false;
-                        state.solve_workspace.push(42.);
                         state.work.factor.successful_factors = 9;
                         panic!("interrupted ordering transaction");
                     })
@@ -1823,7 +1818,6 @@ mod tests {
         });
         pattern.with_ordering(|state| {
             assert!(state.ac_reorder);
-            assert!(state.solve_workspace.is_empty());
             assert_eq!(state.work, crate::maths::PatternWork::default());
             state.ac_reorder = false;
         });

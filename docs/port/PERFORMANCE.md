@@ -64,6 +64,23 @@ Future vectorization must show **whole-load** gains with C-reference fidelity
 before reinstating a batch planner. The regular diode physics tests, full C
 golden verification and ordered scalar stamps remain the regression gates.
 
+## Real Newton workspace ownership (#293)
+
+The Newton driver retains current, next, correction RHS and factor scratch in
+its execution workspace. Each successful iteration swaps the two solution
+vectors; convergence transfers both vectors with the trial that was loaded at
+the accepted iterate. Transient retries and continuation stages recycle consumed
+vectors only after the last reader. The retained primal/adjoint solve and
+immutable LU snapshot interfaces accept caller-owned scratch and output, so
+repeated right-hand sides need not allocate solution vectors.
+
+A circuit's bound pattern still owns its mutable real/complex factor-frame
+transaction: sequential analyses intentionally inherit that frame and its pivot
+history. Independent optimizer sessions construct independent circuits and
+caches. Immutable snapshots remain independent of subsequent refactors;
+separating the topology from this transaction further requires evidence of
+shared-pattern contention or copy-on-write costs, not just removal of a lock.
+
 ## Measurements
 
 Records contain workload, phase, operation count and elapsed nanoseconds.
@@ -72,7 +89,7 @@ Repeat steady-state phases three times; use medians per operation.
 - Pattern creation, triplet assembly and bound element assembly are separate
   phases. Coefficient nonzero counts describe matrix sparsity (divide by n²).
 - Fresh order/factor includes factor-frame construction; retained solve uses a
-  factor snapshot with caller-owned scratch. The two NI solve phases exercise
+  factor snapshot with caller-owned scratch and output. The two NI solve phases exercise
   the same bound matrix with changed and then identical coefficients.
 - FactorStorage records structural original handle creations, total stored LU
   entries, fill-in handle creations, translated/external order and logical
