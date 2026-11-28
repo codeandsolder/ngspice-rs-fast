@@ -471,3 +471,256 @@ fn series_inductor_shunt_noise_uses_frequency_domain_multiplicity() -> SpiceResu
     }
     Ok(())
 }
+
+#[test]
+fn conditional_voltage_capacitance_depends_on_expanded_electrical_consumers() -> SpiceResult<()> {
+    // The prepared current operator binds device-name formals explicitly.
+    // Native ngspice i(formal) intentionally does not have this semantics.
+    let mut deck = String::from("conditional physical source capacitance\n");
+    for index in 1..=10 {
+        writeln!(
+            deck,
+            "v{index} out{index} 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1"
+        )
+        .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
+        writeln!(deck, "r{index} out{index} 0 3")
+            .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
+    }
+    deck.push_str(".func probe(x) {branch_or_sampled_current(i(x))}\n.func nested(y) {probe(y)}\n.func direct() {branch_or_sampled_current(i(v2))}\n.func unused() {branch_or_sampled_current(i(v3))}\nb1 b1out 0 v=nested(v1)\nb2 b2out 0 v=direct()\n.save i(v3)\nf1 0 f1out v4 1\nrf1 f1out 0 1\nh1 h1out 0 v5 1\nfpoly 0 fpolyout poly(2) v6 v7 0 1 1\nrfpoly fpolyout 0 1\nb8 b8out 0 v=0*i(v8)\nb9 b9out 0 v=ternary_fcn(0,i(v9),1)\nb10 b10out 0 v=ternary_fcn(v(out1)>0,i(v10),0)\n.end\n");
+    let mut circuit = circuit(&deck)?;
+    let ac = run(
+        &mut circuit,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    let sensed = Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71);
+    let unsensed = Complex::new(0.596_608_345_906_663_5, -0.044_983_209_517_697_58);
+    for index in 1..=10 {
+        let expected = if index == 3 { unsensed } else { sensed };
+        let name = format!("v(out{index})");
+        let actual = ac.value(&name, 0).ok_or_else(|| {
+            ngspice_rs::primitives::SpiceError::circuit(format!("missing {name}"))
+        })?;
+        close(actual, expected, 1e-10, 1e-12);
+    }
+    Ok(())
+}
+
+#[test]
+fn conditional_voltage_capacitance_is_selected_per_subcircuit_occurrence() -> SpiceResult<()> {
+    let mut circuit = circuit(
+        "conditional source occurrences\nx1 a cell\nx2 b cell\n.subckt cell p\nv1 p 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nr1 p 0 3\n.ends\nb1 sense 0 v=i(x1::v1)\n.save i(x2::v1)\n.end\n",
+    )?;
+    let ac = run(
+        &mut circuit,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    for (name, expected) in [
+        (
+            "v(a)",
+            Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71),
+        ),
+        (
+            "v(b)",
+            Complex::new(0.596_608_345_906_663_5, -0.044_983_209_517_697_58),
+        ),
+    ] {
+        let actual = ac.value(name, 0).ok_or_else(|| {
+            ngspice_rs::primitives::SpiceError::circuit(format!("missing {name}"))
+        })?;
+        close(actual, expected, 1e-10, 1e-12);
+    }
+    Ok(())
+}
+
+#[test]
+fn conditional_voltage_topology_rejects_late_electrical_changes_atomically() -> SpiceResult<()> {
+    use ngspice_rs::devices::{
+        ControlReference, ControlledKind, ControlledSource, ModelContext, ModelResolver,
+    };
+    use ngspice_rs::primitives::NodeId;
+
+    let source = Parser::new().parse_deck(&parse_deck_text(
+        Path::new("network.cir"),
+        "incremental source\nv1 out 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nr1 out 0 3\n.end\n",
+    ))?;
+    let consumer = Parser::new().parse_deck(&parse_deck_text(
+        Path::new("consumer.cir"),
+        "late control\nh1 sense 0 v1 1\n.end\n",
+    ))?;
+    let mut existing = Circuit::from_netlist(&source)?;
+    let count = existing.devices().len();
+    let nodes = existing.nodes().len();
+    let models = ModelResolver::new(&[])?;
+    let context = ModelContext::default();
+    let result = existing.add_instances(&consumer.devices, &models, &context);
+    assert!(matches!(result, Err(error) if error.to_string().contains("re-elaborate")));
+    assert_eq!(existing.devices().len(), count);
+    assert_eq!(existing.nodes().len(), nodes);
+    let out = existing
+        .nodes()
+        .get("out")
+        .ok_or_else(|| ngspice_rs::primitives::SpiceError::circuit("missing output"))?;
+    let direct = ControlledSource::current_controlled(
+        "h2",
+        ControlledKind::Ccvs,
+        [out, NodeId::GROUND],
+        ControlReference {
+            name: "v1".into(),
+            location: None,
+        },
+        1.,
+    )?;
+    let result = existing.add_device(Box::new(direct));
+    assert!(matches!(result, Err(error) if error.to_string().contains("re-elaborate")));
+    assert_eq!(existing.devices().len(), count);
+    let mut reverse = Circuit::new();
+    reverse.add_instances(&consumer.devices, &models, &context)?;
+    reverse.add_instances(&source.devices, &models, &context)?;
+    let ac = run(
+        &mut reverse,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    close(
+        ac.value("v(out)", 0)
+            .ok_or_else(|| ngspice_rs::primitives::SpiceError::circuit("missing output"))?,
+        Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71),
+        1e-10,
+        1e-12,
+    );
+    Ok(())
+}
+
+#[test]
+fn descendant_references_bind_at_the_containing_occurrence() -> SpiceResult<()> {
+    let mut first = circuit(
+        "descendant references\nx1.a a outer\nx2.b b outer\n.subckt outer p\nxinner.a p inner\n.ends\n.subckt inner p\nvdrive.a p 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nrload p 0 3\n.ends\n.func read(x) {branch_or_sampled_current(i(x))}\nb1 sense 0 v=read(x1.a::xinner.a::vdrive.a)\n.save i(x2.b::xinner.a::vdrive.a)\n.end\n",
+    )?;
+    let ac = run(
+        &mut first,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    for (name, expected) in [
+        (
+            "v(a)",
+            Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71),
+        ),
+        (
+            "v(b)",
+            Complex::new(0.596_608_345_906_663_5, -0.044_983_209_517_697_58),
+        ),
+    ] {
+        close(ac.value(name, 0).unwrap(), expected, 1e-10, 1e-12);
+    }
+    let mut relative = circuit(
+        "relative references\nx1 a outer\nx2 b outer\n.subckt outer p\nxinner p inner\nf1 0 sense xinner::vdrive 1\nr1 sense 0 1\n.ends\n.subckt inner p\nvdrive p 0 ac 1 pn_rseries=2 pn_ccontrol=1u pn_control=1\nrload p 0 3\n.ends\n.end\n",
+    )?;
+    let ac = run(
+        &mut relative,
+        AnalysisKind::Ac,
+        &["lin", "1", "10000", "10000"],
+    )?;
+    for name in ["v(a)", "v(b)"] {
+        close(
+            ac.value(name, 0).unwrap(),
+            Complex::new(0.602_261_102_728_891, 0.029_988_806_345_131_71),
+            1e-10,
+            1e-12,
+        );
+    }
+    Ok(())
+}
+
+/// The producer's LTspice reference includes a zero coupling coefficient:
+/// the K card still selects the ideal-winding topology for both occurrences.
+#[test]
+fn winding_loss_and_bias_follow_resolved_coupling_membership() -> SpiceResult<()> {
+    for (initialization, coupled, uncoupled) in [
+        ("", 0., 0.000_199_980_001_999_800_03),
+        (
+            "ic=.1 pn_terminal_bias_op=0 pn_terminal_bias_tran=0 pn_terminal_bias_zero_series=1e-5 pn_exact_ic=1",
+            0.999_900_009_999_000_3,
+            1.,
+        ),
+    ] {
+        let deck = format!(
+            "conditional winding loss\nv1 supply 0 2\nr1 supply a 10\nr2 supply b 10\nr3 supply c 10\nx1 a cell\nx2 b cell\nx3 c cell\n.subckt cell p\nl1 p 0 3m pn_rseries_uncoupled=1m {initialization}\n.ends\nk1 x1::l1 x2::l1 0\n.end\n"
+        );
+        let mut circuit = circuit(&deck)?;
+        let op = run(&mut circuit, AnalysisKind::OperatingPoint, &[])?;
+        for (name, expected) in [("v(a)", coupled), ("v(b)", coupled), ("v(c)", uncoupled)] {
+            close(
+                op.value(name, 0).unwrap(),
+                Complex::real(expected),
+                1e-9,
+                1e-12,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn conditional_network_alternatives_are_exclusive() {
+    for (instance, diagnostic) in [
+        (
+            "v1 p 0 1 pn_ccontrol=1u pn_cparallel=1u",
+            "pn_ccontrol conflicts",
+        ),
+        (
+            "v1 p 0 1 pn_ccontrol=1u pn_cseries_shunt=1u",
+            "pn_ccontrol conflicts",
+        ),
+        (
+            "l1 p 0 1m pn_rseries=1 pn_rseries_uncoupled=1",
+            "pn_rseries_uncoupled conflicts",
+        ),
+        (
+            "l1 p 0 1m pn_terminal_bias_zero_series=1e-5",
+            "pn_terminal_bias_zero_series requires",
+        ),
+    ] {
+        let result = circuit(&format!("invalid alternative\n{instance}\n.end\n"));
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains(diagnostic)),
+            "{instance}"
+        );
+    }
+}
+
+#[test]
+fn descendant_paths_require_actual_lexical_occurrences() {
+    // A native root-level branch with a coincidentally matching flattened
+    // name cannot satisfy an explicit path through a nonexistent X card.
+    let result = circuit(
+        "missing occurrence\nv.xmissing.vdrive out 0 1\nrload out 0 3\nb1 sense 0 v=i(xmissing::vdrive)\n.end\n",
+    );
+    assert!(
+        matches!(result, Err(error) if error.to_string().contains("unresolved or ambiguous descendant device reference"))
+    );
+}
+
+#[test]
+fn late_coupling_membership_requires_atomic_reelaboration() -> SpiceResult<()> {
+    use ngspice_rs::devices::{ModelContext, ModelResolver};
+    let source = Parser::new().parse_deck(&parse_deck_text(
+        Path::new("windings.cir"),
+        "windings\nl1 a 0 1m pn_rseries_uncoupled=1m\nl2 b 0 1m pn_rseries_uncoupled=1m\n.end\n",
+    ))?;
+    let coupling = Parser::new().parse_deck(&parse_deck_text(
+        Path::new("coupling.cir"),
+        "late coupling\nk1 l1 l2 0\n.end\n",
+    ))?;
+    let mut existing = Circuit::from_netlist(&source)?;
+    let count = existing.devices().len();
+    let nodes = existing.nodes().len();
+    let models = ModelResolver::new(&[])?;
+    let result = existing.add_instances(&coupling.devices, &models, &ModelContext::default());
+    assert!(matches!(result, Err(error) if error.to_string().contains("re-elaborate")));
+    assert_eq!(existing.devices().len(), count);
+    assert_eq!(existing.nodes().len(), nodes);
+    Ok(())
+}

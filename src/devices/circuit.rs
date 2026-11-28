@@ -139,6 +139,8 @@ struct DeviceOrigin {
     generated_by: Option<usize>,
     /// A source-level storage network is not an independently settable primitive.
     prepared_storage: bool,
+    /// The resolved occurrence-level choice is immutable with its network.
+    conditional_network_selection: Option<super::passive_network::ConditionalNetworkSelection>,
 }
 
 /// One elaborated device together with its setup provenance.
@@ -1613,6 +1615,7 @@ impl Circuit {
             .ok_or_else(|| SpiceError::circuit("device ordinal out of bounds"))?
             .origin;
         if origin.prepared_storage
+            || origin.conditional_network_selection.is_some()
             || !origin.internal_nodes.is_empty()
             || origin.generated_by.is_some()
             || self
@@ -1637,6 +1640,11 @@ impl Circuit {
             .and_then(|n| n.checked_add(device.state_count()))
             .ok_or_else(|| resource_error(None, "replacement state slots overflow"))?;
         self.elaboration_limits.check(size, None)?;
+        Self::validate_conditional_network_topology(
+            self.devices.iter(),
+            Some((index, device.as_ref())),
+            None,
+        )?;
         self.invalidate_topology();
         self.devices[index] = ElaboratedDevice {
             device,
@@ -2494,11 +2502,64 @@ impl Circuit {
         self.runtime.last_digital_stats = stats;
     }
 
+    fn validate_conditional_network_topology<'a>(
+        devices: impl Iterator<Item = &'a ElaboratedDevice> + Clone,
+        replacement: Option<(usize, &'a dyn Device)>,
+        addition: Option<&'a dyn Device>,
+    ) -> SpiceResult<()> {
+        if !devices
+            .clone()
+            .any(|entry| entry.origin.conditional_network_selection.is_some())
+        {
+            return Ok(());
+        }
+        use super::passive_network::ConditionalNetworkSelection;
+        let resolved = || {
+            devices
+                .clone()
+                .enumerate()
+                .map(|(index, entry)| {
+                    replacement
+                        .filter(|(ordinal, _)| *ordinal == index)
+                        .map_or(entry.device.as_ref(), |(_, device)| device)
+                })
+                .chain(addition)
+        };
+        let controls = resolved()
+            .flat_map(Device::controlling_sources)
+            .map(|control| control.name.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let coupled = resolved()
+            .filter_map(Device::mutual_coupling)
+            .flat_map(|coupling| coupling.inductors)
+            .map(|inductor| inductor.name.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        for entry in devices {
+            let changed = match entry.origin.conditional_network_selection {
+                Some(ConditionalNetworkSelection::Voltage { referenced }) => {
+                    referenced != controls.contains(&entry.name().to_ascii_lowercase())
+                }
+                Some(ConditionalNetworkSelection::Inductor { coupled: selected }) => {
+                    selected != coupled.contains(&entry.name().to_ascii_lowercase())
+                }
+                None => false,
+            };
+            if changed {
+                return Err(SpiceError::circuit(format!(
+                    "electrical references to {} change its conditional network topology; re-elaborate the circuit",
+                    entry.name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_topology(&mut self) -> SpiceResult<()> {
         // Validate graph before any predecessor binding or numbering mutation.
         self.elaboration_limits
             .check(self.elaboration_size()?, None)?;
         let names = self.validate_topology()?;
+        Self::validate_conditional_network_topology(self.devices.iter(), None, None)?;
         let mut previous = crate::devices::Waveform::Constant(0.);
         let mut previous_dc = 0.;
         for entry in self.devices.iter_mut().rev() {
@@ -3013,6 +3074,11 @@ impl Circuit {
             .elaboration_size()?
             .checked_add(ElaborationSize::new(1, 0, device.state_count()), None)?;
         self.elaboration_limits.check(size, None)?;
+        Self::validate_conditional_network_topology(
+            self.devices.iter(),
+            None,
+            Some(device.as_ref()),
+        )?;
         self.devices
             .try_reserve(1)
             .map_err(|error| resource_error(None, format!("cannot reserve device: {error}")))?;
@@ -3098,6 +3164,11 @@ impl Circuit {
                     .map(|node| node.id)
                     .collect();
             }
+            Self::validate_conditional_network_topology(
+                devices.iter().chain(staged.iter()),
+                None,
+                None,
+            )?;
             reserve(devices, staged.len(), None)?;
             Ok(staged)
         })?;
@@ -5133,11 +5204,19 @@ impl Circuit {
             &absent,
         )?;
         let aliases = instances.probe_aliases;
+        let network_references = instances.network_references;
         let instances = instances.instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
-        let mut plan =
-            PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
+        let mut plan = PlannedBatch::prepare(
+            instances,
+            models,
+            context,
+            &self.nodes,
+            existing,
+            limits,
+            &network_references,
+        )?;
         plan.resistors = (!resistors.is_empty()).then_some(resistors);
         plan.deck_nodes.extend(absent.terminals.iter().cloned());
         let devices = &mut self.devices;
@@ -5151,6 +5230,11 @@ impl Circuit {
                 nodes.set_kind(id, NodeKind::ProbeAlias)?;
             }
             absent.validate_voltage_binding(nodes)?;
+            Self::validate_conditional_network_topology(
+                devices.iter().chain(staged.iter()),
+                None,
+                None,
+            )?;
             // Observation-only records consume the ordinary resource budget,
             // but never introduce a device, unknown, or state slot.
             limits.check(
@@ -5352,10 +5436,17 @@ impl Circuit {
             }
             let prepared_storage = matches!(instance.designator, 'c' | 'l')
                 && device.name().eq_ignore_ascii_case(&instance.name);
+            let conditional_network_selection =
+                if device.name().eq_ignore_ascii_case(&instance.name) {
+                    network.conditional_selection()
+                } else {
+                    None
+                };
             staged.push(ElaboratedDevice {
                 device,
                 origin: DeviceOrigin {
                     prepared_storage,
+                    conditional_network_selection,
                     ..DeviceOrigin::default()
                 },
             });
