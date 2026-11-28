@@ -1313,6 +1313,93 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in physical impulse-queue occupancy measurement"]
+    fn physical_impulse_queue_occupancy() {
+        for (conductors, sections, coupled) in [
+            (1, 16, false),
+            (4, 8, false),
+            (16, 4, false),
+            (32, 4, false),
+            (4, 1, true),
+            (16, 1, true),
+            (4, 4, true),
+        ] {
+            let mut r = Vec::new();
+            let mut l = Vec::new();
+            let mut g = Vec::new();
+            let mut c = Vec::new();
+            for row in 0..conductors {
+                let mode = Real::from(u32::try_from(row).unwrap());
+                for col in row..conductors {
+                    let diagonal = row == col;
+                    r.push(if diagonal {
+                        20. + 0.1 * mode
+                    } else if coupled {
+                        0.15
+                    } else {
+                        0.
+                    });
+                    l.push(if diagonal {
+                        250e-9 * (1. + mode / 32.)
+                    } else {
+                        0.
+                    });
+                    c.push(if diagonal {
+                        100e-12 * (1. + mode / 32.)
+                    } else {
+                        0.
+                    });
+                    g.push(0.);
+                }
+            }
+            let material = CoupledLinePlan::from_packed(
+                conductors,
+                1.,
+                &r,
+                &l,
+                &g,
+                &c,
+                CoupledLineLimits::default(),
+            )
+            .unwrap();
+            let basis = ModalBasis::prepare(&material).unwrap().unwrap();
+            let plan = LossyPlan::prepare(basis, &material, sections).unwrap();
+            if plan.continuous.is_some() {
+                println!(
+                    "conductors={conductors},sections={sections},coupled={coupled},continuous=true"
+                );
+                continue;
+            }
+            let ports = plan.launch.len();
+            let stop = 30e-9;
+            let mut stepped = Kernel::empty(ports);
+            let mut whole = Kernel::empty(ports);
+            let initial = plan.half.iter().copied().fold(Real::INFINITY, Real::min) / 2.;
+            plan.extend_kernel(&mut stepped, initial, 0).unwrap();
+            let mut peak = stepped.pending.len();
+            let mut sum = peak;
+            let mut samples = 1;
+            while let Some(time) = stepped.pending.first_key_value().map(|(key, _)| key.time)
+                && time <= stop
+            {
+                plan.extend_kernel(&mut stepped, time, 0).unwrap();
+                peak = peak.max(stepped.pending.len());
+                sum += stepped.pending.len();
+                samples += 1;
+            }
+            plan.extend_kernel(&mut stepped, stop, 0).unwrap();
+            plan.extend_kernel(&mut whole, stop, 0).unwrap();
+            assert_eq!(stepped, whole);
+            println!(
+                "conductors={conductors},sections={sections},coupled={coupled},samples={samples},peak_boundary_pending={peak},mean_boundary_pending={},records={},workspace={}",
+                sum / samples,
+                stepped.records,
+                stepped.workspace(ports),
+            );
+        }
+    }
+
+    #[test]
     fn bounded_path_roundoff_preserves_first_arrivals_and_small_transfer_coefficients() {
         let material = CoupledLinePlan::from_packed(
             2,
