@@ -1801,6 +1801,8 @@ pub struct TransientEventContext<'a> {
     pub time: Real,
     /// The candidate solution.
     pub solution: &'a Vector,
+    /// First branch-current row of this device, when allocated.
+    pub branch: Option<usize>,
     /// The circuit's ground-eliminated node numbering.
     pub unknowns: &'a MnaUnknowns,
 }

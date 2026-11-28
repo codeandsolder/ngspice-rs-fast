@@ -793,6 +793,7 @@ impl VoltageHistory {
 
 struct EventDevice<'a> {
     source: &'a dyn crate::devices::traits::DeviceTransientEvents,
+    branch: Option<usize>,
     rows: std::ops::Range<usize>,
 }
 
@@ -1078,6 +1079,7 @@ fn event_devices(circuit: &Circuit) -> SpiceResult<Vec<EventDevice<'_>>> {
         .map(|(index, source)| {
             Ok(EventDevice {
                 source,
+                branch: circuit.branch_rows(index).and_then(|mut rows| rows.next()),
                 rows: circuit
                     .state_rows(index)
                     .ok_or_else(|| failure("missing event device state range"))?,
@@ -1601,6 +1603,7 @@ impl Driver<'_> {
                     .ok_or_else(|| failure("invalid event state window"))?,
                 time,
                 solution,
+                branch: event.branch,
                 unknowns: self.circuit.unknowns(),
             };
             if let Some(at) = self

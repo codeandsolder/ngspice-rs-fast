@@ -83,9 +83,9 @@ analysis kinds fail explicitly. Analog-only circuits construct no event
 network. Separate accepted event counters are available via
 `Circuit::last_digital_stats`.
 
-The `preprocess_timed_switch` descriptor is available for typed syntax;
-its conductance kernel is a separate implementation task. Operations outside
-0–16 are rejected rather than approximated.
+Operations outside 0–16 are rejected rather than approximated.
+The `preprocess_timed_switch` descriptor binds the native conductance
+kernel described below.
 
 ## Numerical verification
 
@@ -122,8 +122,10 @@ Reference provenance and regeneration instructions are in
 
 The prepared `preprocess_timed_switch` source descriptor binds a physical
 conductance with an unloaded single-ended/differential voltage receiver
-and a differential conducting branch. Independent input loading remains
-an ordinary circuit element. Each instance has seven finite accepted
+(`%v`, `%vd`) or an ideal zero-voltage current sensor (`%i`, `%id`)
+and a differential conducting branch. Current is signed from the first
+control terminal to the second; the single-ended sensor references ground.
+Independent input loading remains an ordinary circuit element. Each instance has seven finite accepted
 history slots: the previous time/control, phase anchor time and phase,
 target, requested direction, and optional deadline. Newton candidates
 derive a new state exclusively from the preceding accepted state.
@@ -132,7 +134,18 @@ The logarithmic conductance law interpolates smoothly between exact
 reciprocal-resistance rails. DC qualifies the initial hint with strict
 threshold comparisons; AC freezes the converged conductance with no
 incremental control-to-branch gain. No fictitious storage or conductance
-floor is introduced.
+floor is introduced. The frozen conducting branch contributes thermal
+current noise with spectral density `4 k T G` in either mode.
+
+The explicit Boolean model parameter `instantaneous=1` selects an abrupt
+inertial transition instead of a finite slew. `TD_ON` and `TD_OFF` remain
+the directional propagation delays; `TON` and `TOFF` must be omitted in
+this mode. Short requests cancel, but a pending deadline coincident with
+a reversing threshold crossing commits before the reversal is scheduled.
+This deadline-first policy is independently qualified against the built-in
+ngspice digital inertial buffer. It is not a claim that every external
+dialect uses this event policy. The default finite-slew mode retains its
+existing crossing-first cancellation rule.
 
 An opt-in device-local event interface lets the existing transient
 driver land on accepted deadlines and ramp endpoints, and localize
