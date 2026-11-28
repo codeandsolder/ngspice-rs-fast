@@ -1,7 +1,7 @@
 //! Circuit-side binding for the shared native compact-model contract.
 //! The engine owns numerical rows, integration and accepted/trial history.
 
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use model_kernel_api::noise::{Sink, Source};
 use model_kernel_api::{
@@ -192,6 +192,17 @@ pub(super) struct SourceBinding {
     pub absolute_temperature_slot: Option<usize>,
 }
 
+/// A circuit recipe may supply one validated initial seed. Each analysis
+/// consumes it into an independent scalar or a lane of one typed tile.
+/// A grouped device never holds a second scalar physical instance.
+#[derive(Debug)]
+enum Physical<K: Kernel> {
+    Seed(Option<Prepared<K>>),
+    Pending(Option<Prepared<K>>),
+    Scalar(Rc<Prepared<K>>),
+    Lane(batch::PreparedLane<K>),
+}
+
 /// Native prepared model integrated through the normal device trial lifecycle.
 #[derive(Debug)]
 pub struct PreparedDevice<K: Kernel> {
@@ -201,7 +212,7 @@ pub struct PreparedDevice<K: Kernel> {
     artifact: Arc<Artifact<K>>,
     values: Box<[Real]>,
     temperature: InstanceTemperature,
-    prepared: Prepared<K>,
+    physical: RefCell<Physical<K>>,
     source: Option<Arc<SourceBinding>>,
     trial_workspace: Option<RefCell<TrialWorkspace>>,
     voltage: RefCell<Vec<Real>>,
@@ -241,6 +252,18 @@ impl<K: Kernel> PreparedDevice<K> {
         values: &[Real],
         temperature: InstanceTemperature,
     ) -> SpiceResult<Self> {
+        let mut device = Self::from_recipe(artifact, name, terminals, values, temperature)?;
+        *device.physical.get_mut() = Physical::Seed(Some(device.prepare_physical()?));
+        Ok(device)
+    }
+
+    fn from_recipe(
+        artifact: &Arc<Artifact<K>>,
+        name: String,
+        terminals: Vec<NodeId>,
+        values: &[Real],
+        temperature: InstanceTemperature,
+    ) -> SpiceResult<Self> {
         if terminals.len() != artifact.descriptor().equations.len() {
             return Err(SpiceError::circuit("prepared coordinate count mismatch"));
         }
@@ -249,9 +272,6 @@ impl<K: Kernel> PreparedDevice<K> {
         {
             return Err(SpiceError::circuit("invalid circuit temperature"));
         }
-        let prepared = artifact
-            .prepare(values, temperature.ambient_kelvin())
-            .map_err(kernel_error)?;
         let width = terminals.len();
         let external_terminals = artifact
             .descriptor()
@@ -276,7 +296,7 @@ impl<K: Kernel> PreparedDevice<K> {
             artifact: Arc::clone(artifact),
             values: values.into(),
             temperature,
-            prepared,
+            physical: RefCell::new(Physical::Seed(None)),
             source: None,
             trial_workspace: (artifact.descriptor().trial != TrialCapabilities::ENGINE)
                 .then(|| TrialWorkspace::new(width).map(RefCell::new))
@@ -381,17 +401,121 @@ impl<K: Kernel> PreparedDevice<K> {
     }
 
     fn rebound(&self, values: &[Real], temperature: InstanceTemperature) -> SpiceResult<Self> {
-        let mut device = Self::from_rows(
+        let mut device = self.recipe_rebound(values, temperature)?;
+        *device.physical.get_mut() = Physical::Seed(Some(device.prepare_physical()?));
+        Ok(device)
+    }
+
+    fn recipe_rebound(
+        &self,
+        values: &[Real],
+        temperature: InstanceTemperature,
+    ) -> SpiceResult<Self> {
+        let mut device = Self::from_recipe(
             &self.artifact,
             self.name.clone(),
             self.terminals.to_vec(),
             values,
             temperature,
         )?;
-        if let Some(source) = &self.source {
-            device.source = Some(Arc::clone(source));
-        }
+        device.source.clone_from(&self.source);
         Ok(device)
+    }
+
+    fn prepare_physical(&self) -> SpiceResult<Prepared<K>> {
+        self.artifact
+            .prepare(&self.values, self.temperature.ambient_kelvin())
+            .map_err(kernel_error)
+    }
+
+    fn same_physics(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.artifact, &other.artifact)
+            && self.temperature.ambient_kelvin().to_bits()
+                == other.temperature.ambient_kelvin().to_bits()
+            && self
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .eq(other.values.iter().map(|value| value.to_bits()))
+    }
+
+    /// Transfer the circuit's unused initial data into an unpublished run.
+    fn initial_seed(&self) -> Option<Prepared<K>> {
+        let mut physical = self.physical.borrow_mut();
+        match &mut *physical {
+            Physical::Seed(seed) => seed.take(),
+            Physical::Scalar(data) if Rc::strong_count(data) == 1 => {
+                if let Physical::Scalar(data) =
+                    std::mem::replace(&mut *physical, Physical::Seed(None))
+                {
+                    Rc::into_inner(data)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // Only unpublished candidate-local data may be moved into a new tile.
+    fn take_prepared(&self) -> SpiceResult<Prepared<K>> {
+        let mut physical = self.physical.borrow_mut();
+        let seed = match std::mem::replace(&mut *physical, Physical::Pending(None)) {
+            Physical::Seed(seed) | Physical::Pending(seed) => seed,
+            Physical::Scalar(data) => Rc::into_inner(data),
+            Physical::Lane(lane) => {
+                *physical = Physical::Lane(lane);
+                return Err(SpiceError::circuit(
+                    "attempt to move an already bound prepared lane",
+                ));
+            }
+        };
+        seed.map_or_else(|| self.prepare_physical(), Ok)
+    }
+
+    fn ensure_physical(&self) -> SpiceResult<()> {
+        let mut physical = self.physical.borrow_mut();
+        match &mut *physical {
+            Physical::Seed(seed) => {
+                // A direct device API call outside a run can consume its own
+                // baseline seed. A run-local numerical load must be bound.
+                let data = seed.take().map_or_else(|| self.prepare_physical(), Ok)?;
+                *physical = Physical::Scalar(Rc::new(data));
+            }
+            Physical::Pending(_) => {
+                return Err(SpiceError::circuit("unbound run-local prepared recipe"));
+            }
+            Physical::Scalar(_) | Physical::Lane(_) => {}
+        }
+        Ok(())
+    }
+
+    fn with_physical<T>(
+        &self,
+        scalar: impl FnOnce(&Prepared<K>) -> model_kernel_api::Result<T>,
+        lane: impl FnOnce(&batch::PreparedLane<K>) -> model_kernel_api::Result<T>,
+    ) -> SpiceResult<T> {
+        self.ensure_physical()?;
+        match &*self.physical.borrow() {
+            Physical::Scalar(data) => scalar(data),
+            Physical::Lane(data) => lane(data),
+            Physical::Seed(_) | Physical::Pending(_) => {
+                return Err(SpiceError::circuit("unbound prepared recipe"));
+            }
+        }
+        .map_err(evaluation_error)
+    }
+
+    fn evaluate_point(&self, coordinates: &[Real], point: &mut Point<'_>) -> SpiceResult<()> {
+        self.ensure_physical()?;
+        match &*self.physical.borrow() {
+            Physical::Scalar(data) => self.artifact.evaluate(data, coordinates, point),
+            Physical::Lane(data) => data.evaluate(coordinates, point),
+            Physical::Seed(_) | Physical::Pending(_) => {
+                return Err(SpiceError::circuit("unbound prepared recipe"));
+            }
+        }
+        .map_err(evaluation_error)
     }
 
     fn source_parameter(&self, name: &str) -> Option<&SourceParameter> {
@@ -686,17 +810,19 @@ impl<K: Kernel> Device for PreparedDevice<K> {
                 _ => TrialPhase::Exact,
             }
         };
-        let outcome = self
-            .artifact
-            .linearize_trial(
-                &self.prepared,
-                TrialInput {
-                    proposed: &workspace.proposed,
-                    phase,
-                },
-                coordinates,
-            )
-            .map_err(evaluation_error)?;
+        let input = TrialInput {
+            proposed: &workspace.proposed,
+            phase,
+        };
+        self.ensure_physical()?;
+        let outcome = match &*self.physical.borrow() {
+            Physical::Scalar(data) => self.artifact.linearize_trial(data, input, coordinates),
+            Physical::Lane(data) => data.linearize(input, coordinates),
+            Physical::Seed(_) | Physical::Pending(_) => {
+                return Err(SpiceError::circuit("unbound prepared recipe"));
+            }
+        }
+        .map_err(evaluation_error)?;
         for (index, &coordinate) in coordinates.iter().enumerate() {
             states.set(offset + index, coordinate)?;
         }
@@ -739,12 +865,8 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         self.read_coordinates(proposed, |node| context.voltage(node));
         let mut old = previous_buffer.point();
         let mut candidate = candidate_buffer.point();
-        self.artifact
-            .evaluate(&self.prepared, previous, &mut old)
-            .map_err(evaluation_error)?;
-        self.artifact
-            .evaluate(&self.prepared, proposed, &mut candidate)
-            .map_err(evaluation_error)?;
+        self.evaluate_point(previous, &mut old)?;
+        self.evaluate_point(proposed, &mut candidate)?;
         // The ABI row kinds distinguish residual dimensions. Only electrical
         // rows have an engine-supplied absolute current tolerance today.
         // For non-electrical family equations use relative comparison, not
@@ -759,27 +881,25 @@ impl<K: Kernel> Device for PreparedDevice<K> {
                 0.
             };
         }
-        let outcome = self
-            .artifact
-            .check_trial_convergence(
-                &self.prepared,
-                ConvergenceInput {
-                    previous: TrialSample {
-                        coordinates: previous,
-                        residual: old.current,
-                        jacobian: old.conductance,
-                    },
-                    candidate: TrialSample {
-                        coordinates: proposed,
-                        residual: candidate.current,
-                        jacobian: candidate.conductance,
-                    },
-                    candidate_outcome: TrialOutcome::Exact,
-                    relative_tolerance: context.reltol,
-                    absolute_tolerances: tolerances,
-                },
-            )
-            .map_err(evaluation_error)?;
+        let input = ConvergenceInput {
+            previous: TrialSample {
+                coordinates: previous,
+                residual: old.current,
+                jacobian: old.conductance,
+            },
+            candidate: TrialSample {
+                coordinates: proposed,
+                residual: candidate.current,
+                jacobian: candidate.conductance,
+            },
+            candidate_outcome: TrialOutcome::Exact,
+            relative_tolerance: context.reltol,
+            absolute_tolerances: tolerances,
+        };
+        let outcome = self.with_physical(
+            |data| self.artifact.check_trial_convergence(data, input),
+            |lane| lane.convergence(input),
+        )?;
         Ok(outcome == Convergence::Retry)
     }
 
@@ -810,7 +930,8 @@ impl<K: Kernel> Device for PreparedDevice<K> {
     }
 
     fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
-        self.check_context(context.temperature, context.gmin)
+        self.check_context(context.temperature, context.gmin)?;
+        self.ensure_physical()
     }
 
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
@@ -825,9 +946,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         self.linearize_prepared(&mut context.states, &mut voltage)?;
         let mut buffer = self.output.borrow_mut();
         let mut output = buffer.point();
-        self.artifact
-            .evaluate(&self.prepared, &voltage, &mut output)
-            .map_err(evaluation_error)?;
+        self.evaluate_point(&voltage, &mut output)?;
         self.stamp_point(context, &output, &voltage)
     }
 
@@ -901,6 +1020,17 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         value: Real,
         context: &crate::devices::ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
+        let device = self.stage_bound_parameter(key, value, context)?;
+        device.validate_dc_inputs(context)?;
+        Ok(device)
+    }
+
+    fn stage_bound_parameter(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+        value: Real,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Box<dyn Device>> {
         let (slot, value) = match key {
             crate::devices::sweep::ParameterKey::Native(name) => {
                 let parameter = self
@@ -930,26 +1060,54 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         *values
             .get_mut(slot)
             .ok_or_else(|| SpiceError::circuit("invalid prepared parameter slot"))? = value;
-        Ok(Box::new(self.rebound(
+        Ok(Box::new(self.recipe_rebound(
             &values,
             self.temperature.at(context.temperature),
         )?))
     }
 
-    fn reprepare_context(
+    fn prepared_run_instance(
         &self,
         context: &crate::devices::ModelContext,
-    ) -> SpiceResult<Option<Box<dyn Device>>> {
-        if self
-            .check_context(context.temperature, context.gmin)
-            .is_ok()
-        {
-            return Ok(None);
-        }
-        Ok(Some(Box::new(self.rebound(
+        previous: Option<&dyn Device>,
+    ) -> SpiceResult<Box<dyn Device>> {
+        let mut candidate = self.recipe_rebound(
             &self.context_values(context),
             self.temperature.at(context.temperature),
-        )?)))
+        )?;
+        let previous =
+            previous.and_then(|device| (device as &dyn std::any::Any).downcast_ref::<Self>());
+        *candidate.physical.get_mut() = Physical::Pending(None);
+        if let Some(previous) = previous {
+            let old = previous.physical.borrow();
+            if let Physical::Scalar(data) = &*old {
+                if candidate.same_physics(previous) {
+                    *candidate.physical.get_mut() = Physical::Scalar(Rc::clone(data));
+                } else if candidate.same_physics(self) {
+                    *candidate.physical.get_mut() = Physical::Pending(self.initial_seed());
+                }
+            }
+            // Grouped candidates never move an unused baseline seed into an
+            // existing tile; the typed lane transaction owns that preparation.
+        } else if candidate.same_physics(self) {
+            *candidate.physical.get_mut() = Physical::Pending(self.initial_seed());
+        }
+        Ok(Box::new(candidate))
+    }
+
+    fn activate_prepared_scalar(&self) -> SpiceResult<()> {
+        let mut physical = self.physical.borrow_mut();
+        match &mut *physical {
+            Physical::Pending(seed) | Physical::Seed(seed) => {
+                let data = seed.take().map_or_else(|| self.prepare_physical(), Ok)?;
+                *physical = Physical::Scalar(Rc::new(data));
+                Ok(())
+            }
+            Physical::Scalar(_) => Ok(()),
+            Physical::Lane(_) => Err(SpiceError::circuit(
+                "grouped prepared lane cannot become a singleton without rebinding",
+            )),
+        }
     }
 
     fn prepared_batch_key(&self) -> Option<batch::Key> {
@@ -961,7 +1119,6 @@ impl<K: Kernel> Device for PreparedDevice<K> {
             key: batch::Key::new(&self.artifact),
             values: &self.values,
             ambient: self.temperature.ambient_kelvin(),
-            circuit_temperature: self.temperature.circuit_celsius,
         })
     }
 
@@ -1022,14 +1179,22 @@ impl<K: Kernel> Device for PreparedDevice<K> {
                     terminals: &self.terminals,
                     sources,
                 };
-                self.artifact
-                    .evaluate_noise(
-                        &self.prepared,
+                self.ensure_physical()?;
+                match &*self.physical.borrow() {
+                    Physical::Scalar(data) => self.artifact.evaluate_noise(
+                        data,
                         &voltage,
                         context.model_context.frequency,
                         &mut sink,
-                    )
-                    .map_err(evaluation_error)?;
+                    ),
+                    Physical::Lane(data) => {
+                        data.noise(&voltage, context.model_context.frequency, &mut sink)
+                    }
+                    Physical::Seed(_) | Physical::Pending(_) => {
+                        return Err(SpiceError::circuit("unbound prepared recipe"));
+                    }
+                }
+                .map_err(evaluation_error)?;
                 if sources.len() == start {
                     return Err(SpiceError::circuit(
                         "computed model noise has no generators",
@@ -1064,9 +1229,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         });
         let mut buffer = self.output.borrow_mut();
         let mut output = buffer.point();
-        self.artifact
-            .evaluate(&self.prepared, &voltage, &mut output)
-            .map_err(evaluation_error)?;
+        self.evaluate_point(&voltage, &mut output)?;
         self.stamp_small_signal(context, &output)
     }
 
@@ -1085,9 +1248,7 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         self.read_coordinates(&mut coordinates, |node| context.voltage(node));
         let mut buffer = self.output.borrow_mut();
         let mut point = buffer.point();
-        self.artifact
-            .evaluate(&self.prepared, &coordinates, &mut point)
-            .map_err(evaluation_error)?;
+        self.evaluate_point(&coordinates, &mut point)?;
         let width = self.terminals.len();
         for (i, &node) in self.terminals.iter().enumerate() {
             if let Some(row) = context.unknowns.node_row(node) {
@@ -1104,3 +1265,6 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod ownership_tests;
