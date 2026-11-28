@@ -91,22 +91,6 @@ struct CurrentTargets {
     instantaneous: BTreeSet<String>,
 }
 
-// A source-prepared storage network with resolved m=0 has no physical
-// current coordinate. Keep its scalar validation in NetworkPlan, but do not
-// attempt to bind the absent branch when a behavioral expression reads it.
-fn removed_network(instance: &DeviceInstance) -> SpiceResult<bool> {
-    if matches!(instance.designator, 'c' | 'l')
-        && instance
-            .parameters
-            .iter()
-            .any(|p| crate::netlist::network_parameter(instance.designator, &p.name))
-        && let Some(m) = instance.parameters.iter().rfind(|p| p.name == "m")
-    {
-        return Ok(crate::devices::factory::scalar_number(m)? == 0.);
-    }
-    Ok(false)
-}
-
 /// A genuine voltage-imposing or winding branch, not merely an internal
 /// constitutive row or an artificial observation probe. This selection is
 /// intentionally independent of the factory's current-coordinate allocation.
@@ -154,6 +138,7 @@ fn measured_targets(
     models: &crate::devices::models::ModelResolver<'_>,
     resistors: &crate::devices::pwl_resistor::BoundResistors,
     existing: &[crate::devices::ElaboratedDevice],
+    absent: &crate::devices::passive_network::AbsentStorage,
 ) -> SpiceResult<CurrentTargets> {
     let mut referenced = BTreeMap::new();
     for expression in instances.iter().flat_map(expressions) {
@@ -169,6 +154,14 @@ fn measured_targets(
         return Ok(CurrentTargets::default());
     }
     let mut targets = CurrentTargets::default();
+    for name in referenced.keys() {
+        if absent.names.contains(name) {
+            targets.zero.insert(name.clone());
+        }
+        if absent.windings.contains(name) {
+            targets.instantaneous.insert(name.clone());
+        }
+    }
     for device in existing {
         let name = device.name().to_ascii_lowercase();
         if referenced.contains_key(&name)
@@ -187,10 +180,6 @@ fn measured_targets(
             instance.parameters.iter().any(|p| p.name == "v"),
         ) {
             targets.instantaneous.insert(name.clone());
-        }
-        if removed_network(instance)? {
-            targets.zero.insert(name);
-            continue;
         }
         if !resistors.contains_key(&instance.name) && !has_native_current(instance, models)? {
             // A series probe reads the first physical terminal. A terminal-less
@@ -227,13 +216,14 @@ pub(in crate::devices) fn expand<'a>(
     existing: &[crate::devices::ElaboratedDevice],
     capacity: usize,
     resistors: &crate::devices::pwl_resistor::BoundResistors,
+    absent_terminals: &BTreeSet<String>,
 ) -> SpiceResult<ExpandedInstances<'a>> {
     let count = dynamic_count(instances);
     let CurrentTargets {
         probes: measured,
         zero,
         instantaneous,
-    } = measured_targets(instances, models, resistors, existing)?;
+    } = measured_targets(instances, models, resistors, existing, absent)?;
     if count == 0 && measured.is_empty() && zero.is_empty() {
         return Ok(ExpandedInstances {
             instances: Cow::Borrowed(instances),
@@ -248,11 +238,15 @@ pub(in crate::devices) fn expand<'a>(
         .saturating_add(count)
         .saturating_add(measured.len())
         .min(capacity);
-    let (occupied_nodes, occupied_devices) = occupied_names(
+    let (mut occupied_nodes, occupied_devices) = occupied_names(
         instances,
         nodes,
-        existing.iter().map(|device| device.name()),
+        existing
+            .iter()
+            .map(|device| device.name())
+            .chain(absent.names.iter().map(String::as_str)),
     );
+    occupied_nodes.extend(absent.terminals.iter().cloned());
     let mut expansion = Expansion {
         nodes: occupied_nodes,
         devices: occupied_devices,

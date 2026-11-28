@@ -5,8 +5,10 @@
 //! resolved separately; the winding, storage and terminal identities are
 //! intentionally distinct.
 
+mod absent;
 mod bias;
 mod damping;
+pub(super) use absent::AbsentStorage;
 mod report;
 use bias::TerminalBias;
 use damping::DampingShunt;
@@ -719,6 +721,28 @@ pub(super) enum NetworkPlan {
 }
 
 impl NetworkPlan {
+    /// Detect a resolved zero-copy prepared network before dynamic expansion.
+    pub(super) fn is_removed(instance: &crate::netlist::ast::DeviceInstance) -> SpiceResult<bool> {
+        if !matches!(instance.designator, 'c' | 'l')
+            || !instance
+                .parameters
+                .iter()
+                .any(|p| crate::netlist::network_parameter(instance.designator, &p.name))
+        {
+            return Ok(false);
+        }
+        let Some(m) = instance.parameters.iter().rfind(|p| p.name == "m") else {
+            return Ok(false);
+        };
+        if super::factory::scalar_number(m)? != 0. {
+            return Ok(false);
+        }
+        Ok(matches!(
+            Self::prepare(instance)?,
+            Some(Self::Storage(None))
+        ))
+    }
+
     pub(super) fn prepare(
         instance: &crate::netlist::ast::DeviceInstance,
     ) -> SpiceResult<Option<Self>> {
@@ -838,6 +862,8 @@ impl NetworkPlan {
         let initialization = Self::initialization(kind, initial, multiplicity, values)?;
         let Some(mut network) = PreparedPassiveNetwork::prepare(&coefficients, initialization)?
         else {
+            report::parse(values, 0.)?;
+            report::parse_control(values)?;
             return Ok(Self::Storage(None));
         };
         if let Some(voltage) = get("pn_parallel_ic") {
@@ -979,6 +1005,11 @@ impl NetworkPlan {
         instance: &crate::netlist::ast::DeviceInstance,
         nodes: &mut NodeAppend<'_>,
     ) -> SpiceResult<Vec<Box<dyn Device>>> {
+        if matches!(self, Self::Storage(None)) {
+            return Err(SpiceError::circuit(
+                "absent storage reached physical expansion",
+            ));
+        }
         let terminals = nodes.intern_array::<2>(&instance.nodes)?;
         let name = &instance.name;
         match self {
@@ -990,7 +1021,9 @@ impl NetworkPlan {
                 },
                 terminals,
             ),
-            Self::Storage(None) => Ok(Vec::new()),
+            Self::Storage(None) => Err(SpiceError::circuit(
+                "absent storage reached physical expansion",
+            )),
             Self::Voltage(network) => network.build(
                 nodes,
                 &VoltageNetworkBinding {
@@ -1012,24 +1045,35 @@ pub(crate) enum ReportPhase {
     Transient,
 }
 
-/// Bound projection of one reported current, independent of the solver.
+/// Bound output projection, independent of the solver's unknown layout.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CurrentOutputLaw {
-    row: usize,
-    voltage_rows: [Option<usize>; 2],
-    conductance: Real,
+pub(crate) enum OutputProjection {
+    /// An observation-only value with no physical MNA coordinate.
+    Zero,
+    /// A physical current and its phase-specific voltage contribution.
+    Current {
+        row: usize,
+        voltage_rows: [Option<usize>; 2],
+        conductance: Real,
+    },
 }
 
-impl CurrentOutputLaw {
+impl OutputProjection {
     pub(crate) fn evaluate(self, mut value: impl FnMut(usize) -> Complex) -> Complex {
-        let current = value(self.row);
-        if self.conductance == 0. {
+        let Self::Current {
+            row,
+            voltage_rows,
+            conductance,
+        } = self
+        else {
+            return Complex::ZERO;
+        };
+        let current = value(row);
+        if conductance == 0. {
             return current;
         }
-        let [p, n] = self
-            .voltage_rows
-            .map(|row| row.map_or(Complex::ZERO, &mut value));
-        current + (p - n) * Complex::real(self.conductance)
+        let [p, n] = voltage_rows.map(|row| row.map_or(Complex::ZERO, &mut value));
+        current + (p - n) * Complex::real(conductance)
     }
 }
 
@@ -1072,7 +1116,7 @@ impl BoundCurrentReport {
         })
     }
 
-    pub(crate) fn law(&self, phase: ReportPhase) -> SpiceResult<CurrentOutputLaw> {
+    pub(crate) fn law(&self, phase: ReportPhase) -> SpiceResult<OutputProjection> {
         let law = match phase {
             ReportPhase::Steady => self.reporting.steady,
             ReportPhase::SmallSignal => self.reporting.small_signal,
@@ -1084,7 +1128,7 @@ impl BoundCurrentReport {
                 .primary_row
                 .ok_or_else(|| SpiceError::circuit("unbound primary current"))?,
         };
-        Ok(CurrentOutputLaw {
+        Ok(OutputProjection::Current {
             row,
             voltage_rows: self.voltage_rows,
             conductance: law.voltage_conductance,
