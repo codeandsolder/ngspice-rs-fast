@@ -1458,12 +1458,24 @@ impl Device for Bjt {
             for branch in [be, bc] {
                 branch.zero_derivative(&mut context.states)?;
             }
-            // C never writes `cqsub`/`cqbx` outside transient and
-            // `MODEINITSMSIG`, yet reads them into `ceqsub`/`ceqbx`: a DC load
-            // after a small-signal analysis of the same deck sees the
-            // capacitances that analysis stored there.
-            cqsub = sub.retain_derivative(&mut context.states)?;
-            cqbx = bx.retain_derivative(&mut context.states)?;
+            if matches!(
+                context.mode,
+                crate::devices::AnalysisMode::Instantaneous { .. }
+            ) {
+                // A physical residual has no discretized history currents.
+                // The exact local charge rates are restored from the solved
+                // trial by the physical candidate and observation paths.
+                sub.zero_derivative(&mut context.states)?;
+                bx.zero_derivative(&mut context.states)?;
+                cqsub = 0.;
+                cqbx = 0.;
+            } else {
+                // C never writes `cqsub`/`cqbx` outside transient and
+                // `MODEINITSMSIG`, yet reads them into `ceqsub`/`ceqbx`: a DC
+                // load after a small-signal analysis sees those capacitances.
+                cqsub = sub.retain_derivative(&mut context.states)?;
+                cqbx = bx.retain_derivative(&mut context.states)?;
+            }
         }
         for branch in [be, bc, bx, sub] {
             branch.store(&mut context.states)?;
