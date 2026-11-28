@@ -130,6 +130,10 @@ impl PassiveInitialization {
         !self.bias.is_empty()
     }
 
+    pub(super) fn constrains(&self, analysis: AnalysisKind) -> bool {
+        self.bias.contains_key(&analysis)
+    }
+
     pub(super) const fn needs_branch(&self) -> bool {
         self.hard_branch
     }
@@ -285,6 +289,10 @@ impl NodeInitialization {
 
     pub(crate) const fn hint(&self) -> (Real, &crate::primitives::SourceLoc) {
         (self.hint, &self.location)
+    }
+
+    pub(super) fn constrains(&self, analysis: AnalysisKind) -> bool {
+        self.bias.contains_key(&analysis)
     }
 
     pub(super) fn stamp(

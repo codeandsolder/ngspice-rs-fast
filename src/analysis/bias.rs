@@ -1476,8 +1476,11 @@ impl Engine<'_> {
                 history: self.history,
                 forcing: self.forcing,
                 explicit_bias: !nodes.initial.is_empty()
-                    || (context.bias_analysis.is_some()
-                        && self.prepared.circuit().has_prepared_bias()),
+                    || context.bias_analysis.is_some_and(|analysis| {
+                        self.prepared
+                            .circuit()
+                            .has_explicit_bias_constraints(analysis)
+                    }),
             },
             workspace: &mut self.workspace,
         }
