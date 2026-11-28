@@ -144,13 +144,17 @@ pub(super) fn validate_start(
         .validate_context(&point.model)
 }
 
-fn header(circuit: &Circuit, axes: &[BoundAxis]) -> SpiceResult<Plot> {
+fn header(
+    circuit: &Circuit,
+    axes: &[BoundAxis],
+) -> SpiceResult<crate::analysis::linear::LinearOutput> {
     plot(
         circuit,
         "dc1",
         "DC transfer characteristic",
         Some(axes[0].spec.target.scale()),
         false,
+        crate::devices::passive_network::ReportPhase::Steady,
     )
 }
 
@@ -207,7 +211,7 @@ fn preflight(
             let c = current
                 .as_ref()
                 .ok_or_else(|| unsupported("missing geometry candidate"))?;
-            columns.map(&header(&c.circuit, axes)?);
+            columns.map(&header(&c.circuit, axes)?.header);
             crate::analysis::initial::resolve(&c.circuit, request)?;
         }
         let c = current
@@ -290,6 +294,8 @@ pub(super) fn run(
         nodesets: Vec::new(),
     };
     let mut mapping = Vec::new();
+    let mut output = None;
+    let mut values_row = Vec::new();
     let mut row = vec![Complex::real(Real::NAN); result.variable_count()];
     let mut projected = Vec::new();
     let GridPair { inner, outer } = GridPair::new(&sweep.grids);
@@ -308,7 +314,9 @@ pub(super) fn run(
                     previous.as_mut_slice()[hint.row] = hint.value;
                 }
                 history = Some(c.circuit.state_history()?);
-                mapping = columns.map(&header(&c.circuit, axes)?);
+                let bound = header(&c.circuit, axes)?;
+                mapping = columns.map(&bound.header);
+                output = Some(bound);
                 first = true;
             }
             let c = current
@@ -344,10 +352,15 @@ pub(super) fn run(
                 history.retain_latest();
             }
             row.fill(Complex::real(Real::NAN));
-            let values = std::iter::once(Complex::real(inner_value))
-                .chain(x.as_slice().iter().map(|v| Complex::real(*v)))
-                .chain(observed);
-            for (index, value) in mapping.iter().copied().zip(values) {
+            values_row.clear();
+            values_row.push(Complex::real(inner_value));
+            values_row.extend(x.as_slice().iter().map(|v| Complex::real(*v)));
+            output
+                .as_ref()
+                .ok_or_else(|| unsupported("missing geometry output"))?
+                .append_reports(&mut values_row);
+            values_row.extend(observed);
+            for (index, value) in mapping.iter().copied().zip(values_row.iter().copied()) {
                 *row.get_mut(index).ok_or_else(|| {
                     unsupported("geometry sweep schema changed after validation")
                 })? = value;

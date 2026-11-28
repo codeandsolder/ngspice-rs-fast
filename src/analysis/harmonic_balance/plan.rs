@@ -483,16 +483,17 @@ impl HarmonicBalancePlan {
             &tolerances,
             self.limits,
         )?;
-        let header = crate::analysis::linear::plot(
+        let output = crate::analysis::linear::plot(
             circuit,
             "hb",
             "Harmonic Balance",
             Some(("frequency", "frequency")),
             true,
+            crate::devices::passive_network::ReportPhase::SmallSignal,
         )?;
-        sink.begin(&header)?;
+        sink.begin(&output.header)?;
         let m = lattice.coordinates();
-        let mut row = Vec::with_capacity(circuit.unknown_count() + 1);
+        let mut row = Vec::with_capacity(output.header.variable_count());
         for (index, frequency) in std::iter::once(0.)
             .chain(lattice.harmonics().iter().map(Harmonic::frequency))
             .enumerate()
@@ -506,6 +507,8 @@ impl HarmonicBalancePlan {
                     Complex::new(coefficients[2 * index - 1], -coefficients[2 * index])
                 });
             }
+            output.append_reports(&mut row);
+            output.header.check_point(&row)?;
             sink.point(&row)?;
         }
         sink.end()

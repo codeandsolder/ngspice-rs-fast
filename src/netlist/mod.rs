@@ -57,3 +57,66 @@ pub use writer::{WriteLimits, write_netlist, write_netlist_to};
 /// The C reference for the whole front end, used in `NotYetPorted` errors.
 pub const C_REFERENCE: &str =
     "src/frontend/inp.c, src/frontend/inpcom.c, src/spicelib/parser/inp*.c";
+
+/// Explicit physical network setters shared by the normalized native grammar
+/// and writer. No source-dialect defaults are selected here.
+pub(crate) fn network_parameter(designator: char, name: &str) -> bool {
+    if matches!(designator, 'c' | 'l' | 'v')
+        && matches!(
+            name,
+            "pn_control"
+                | "pn_report_dc"
+                | "pn_report_ac"
+                | "pn_report_tran"
+                | "pn_report_dc_g"
+                | "pn_report_ac_g"
+                | "pn_report_tran_g"
+        )
+    {
+        return true;
+    }
+    match designator {
+        'c' | 'l' => matches!(
+            name,
+            "pn_report_dc_rparallel_factor"
+                | "pn_report_ac_rparallel_factor"
+                | "pn_report_tran_rparallel_factor"
+                | "pn_rseries"
+                | "pn_lseries"
+                | "pn_rseries_shunt"
+                | "pn_rstorage_shunt"
+                | "pn_rparallel"
+                | "pn_cparallel"
+                | "pn_bias_op"
+                | "pn_bias_dc"
+                | "pn_bias_ac"
+                | "pn_bias_tran"
+                | "pn_gseries_dc"
+                | "pn_gseries_ac"
+                | "pn_gseries_tran"
+                | "pn_gseries_dc_gmin"
+                | "pn_gseries_ac_gmin"
+                | "pn_gseries_tran_gmin"
+                | "pn_gseries_noise"
+                | "pn_gstorage_dc"
+                | "pn_gstorage_ac"
+                | "pn_gstorage_tran"
+                | "pn_gstorage_dc_gmin"
+                | "pn_gstorage_ac_gmin"
+                | "pn_gstorage_tran_gmin"
+                | "pn_gstorage_noise"
+                | "pn_gterminal_dc"
+                | "pn_gterminal_ac"
+                | "pn_gterminal_tran"
+                | "pn_gterminal_dc_gmin"
+                | "pn_gterminal_ac_gmin"
+                | "pn_gterminal_tran_gmin"
+                | "pn_gterminal_noise"
+        ),
+        'v' => matches!(
+            name,
+            "pn_rseries" | "pn_cparallel" | "pn_cseries_shunt" | "pn_temp"
+        ),
+        _ => false,
+    }
+}

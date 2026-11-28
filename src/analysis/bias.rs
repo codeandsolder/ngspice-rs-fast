@@ -1460,7 +1460,9 @@ impl Engine<'_> {
         let reduced = options.max_iterations < limit;
         // Sources load their value scaled by CKTsrcFact (vsrcload.c).
         let context = junction
-            .map_or(*self.context, |junction| self.context.with_gmin(junction))
+            .map_or(*self.context, |junction| {
+                self.context.with_junction_gmin(junction)
+            })
             .with_source_factor(scale);
         let nodes = self.nodes;
         let branches = &self.branches;
