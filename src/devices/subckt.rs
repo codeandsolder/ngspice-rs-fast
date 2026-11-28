@@ -1290,6 +1290,9 @@ impl<'a> Expander<'a> {
             let rewrite = |name: &str| {
                 if terminal.kind == CodePortKind::Digital {
                     Self::rewrite_digital_node(name, &terminals.digital, path)
+                } else if terminal.kind == CodePortKind::BranchCurrent {
+                    let designator = name.chars().next().unwrap_or_default().to_ascii_lowercase();
+                    device_name(name, designator, path)
                 } else {
                     self.rewrite_node(name, &terminals.analog, path)
                 }

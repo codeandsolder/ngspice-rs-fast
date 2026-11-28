@@ -43,8 +43,8 @@ mod sens;
 pub(super) mod taylor;
 pub(super) mod thermal;
 use thermal::{
-    BOLTZMANN, DerivedCache, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureKey, band_gap,
-    potential_shift,
+    BOLTZMANN, CHARGE, DerivedCache, K_OVER_Q, PotentialTemperature, REFTEMP, TemperatureKey,
+    band_gap, potential_shift,
 };
 
 /// A series branch between two aliases of one electrical node contributes
@@ -1087,10 +1087,10 @@ impl DiodeParameters {
         };
         let fact2 = t / REFTEMP;
         let arg = -egfet / (2. * BOLTZMANN * t) + 1.115_087_7 / (BOLTZMANN * (REFTEMP + REFTEMP));
-        let pbfact = potential_shift(vt, fact2, arg);
+        let pbfact = potential_shift(vt, fact2, arg, CHARGE);
         let arg1 = -egfet1 / (BOLTZMANN * 2. * tn) + 1.115_087_7 / (2. * BOLTZMANN * REFTEMP);
         let fact1 = tn / REFTEMP;
-        let pbfact1 = potential_shift(vtnom, fact1, arg1);
+        let pbfact1 = potential_shift(vtnom, fact1, arg1, CHARGE);
         let actual = PotentialTemperature::new(t, pbfact);
         let nominal = PotentialTemperature::new(tn, pbfact1);
         let (bottom, sidewall) = self.depletion_at_temperature(t, &actual, &nominal, grading);

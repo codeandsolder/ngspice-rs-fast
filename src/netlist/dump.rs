@@ -631,7 +631,14 @@ fn write_scope_options(ctx: &Ctx<'_>, out: &mut Out, indent: usize, scope: &Scop
     for (n, card) in scope.options.iter().enumerate() {
         out.line(
             indent + 1,
-            format!("option-card [{n}] @{}", ctx.loc(&card.location)),
+            format!(
+                "{}-card [{n}] @{}",
+                match card.kind {
+                    crate::netlist::ast::OptionCardKind::Options => "option",
+                    crate::netlist::ast::OptionCardKind::Temperature => "temperature",
+                },
+                ctx.loc(&card.location)
+            ),
         );
         for (m, setting) in card.settings.iter().enumerate() {
             let value = setting

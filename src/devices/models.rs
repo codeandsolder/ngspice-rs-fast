@@ -50,6 +50,10 @@ pub enum ModelFamily {
     Capacitor,
     /// Scalar inductor.
     Inductor,
+    /// Prepared polynomial charge law.
+    PolynomialCapacitor,
+    /// Prepared polynomial flux law.
+    PolynomialInductor,
     /// Junction diode.
     Diode,
     /// Explicit source-selected `SIMetrix` level-1 diode.
@@ -60,6 +64,10 @@ pub enum ModelFamily {
     Npn,
     /// PNP classic BJT.
     Pnp,
+    /// Classic NPN Gummel-Poon with the historical thermal constants.
+    GummelPoonLegacyNpn,
+    /// Classic PNP Gummel-Poon with the historical thermal constants.
+    GummelPoonLegacyPnp,
     /// NMOS (classic, BSIM3 and BSIM4 backends).
     Nmos,
     /// PMOS (classic, BSIM3 and BSIM4 backends).
@@ -99,6 +107,10 @@ pub enum ModelFamily {
     LogicVoltage,
     /// Timed conductance switch.
     TimedSwitch,
+    /// XSPICE cubic logarithmic switch.
+    PSwitch,
+    /// XSPICE exponential analog switch.
+    ASwitch,
 }
 
 impl ModelFamily {
@@ -109,11 +121,19 @@ impl ModelFamily {
             "r" | "res" => Some(Self::Resistor),
             "c" => Some(Self::Capacitor),
             "l" => Some(Self::Inductor),
+            model_normalize_ngspice::passive_storage::PSPICE_CAPACITOR => {
+                Some(Self::PolynomialCapacitor)
+            }
+            model_normalize_ngspice::passive_storage::PSPICE_INDUCTOR => {
+                Some(Self::PolynomialInductor)
+            }
             "d" => Some(Self::Diode),
             model_kernel_diode::MODEL_FAMILY => Some(Self::SimetrixDiodeLevel1),
             super::ideal_diode::MODEL_FAMILY => Some(Self::LtspiceIdealDiode),
             "npn" => Some(Self::Npn),
             "pnp" => Some(Self::Pnp),
+            "gummel_poon_legacy_npn" => Some(Self::GummelPoonLegacyNpn),
+            "gummel_poon_legacy_pnp" => Some(Self::GummelPoonLegacyPnp),
             "nmos" => Some(Self::Nmos),
             "pmos" => Some(Self::Pmos),
             "sw" => Some(Self::Switch),
@@ -130,6 +150,8 @@ impl ModelFamily {
             "preprocess_logic_event" => Some(Self::LogicEvent),
             "preprocess_logic_voltage" => Some(Self::LogicVoltage),
             "preprocess_timed_switch" => Some(Self::TimedSwitch),
+            "pswitch" => Some(Self::PSwitch),
+            "aswitch" => Some(Self::ASwitch),
             // `inpdomod.c` accepts the HFET spellings as the same families;
             // `level` then selects the device (5 is `hfet1/`, 6 `hfet2/`).
             "nmf" | "nhfet" => Some(Self::Nmf),
@@ -144,10 +166,10 @@ impl ModelFamily {
     pub const fn designator(self) -> char {
         match self {
             Self::Resistor => 'r',
-            Self::Capacitor => 'c',
-            Self::Inductor => 'l',
+            Self::Capacitor | Self::PolynomialCapacitor => 'c',
+            Self::Inductor | Self::PolynomialInductor => 'l',
             Self::Diode | Self::SimetrixDiodeLevel1 | Self::LtspiceIdealDiode => 'd',
-            Self::Npn | Self::Pnp => 'q',
+            Self::Npn | Self::Pnp | Self::GummelPoonLegacyNpn | Self::GummelPoonLegacyPnp => 'q',
             Self::Nmos | Self::Pmos => 'm',
             Self::Switch | Self::LtspiceSwitch => 's',
             Self::CurrentSwitch => 'w',
@@ -160,7 +182,9 @@ impl ModelFamily {
             | Self::FrequencyTransfer
             | Self::LogicEvent
             | Self::LogicVoltage
-            | Self::TimedSwitch => 'a',
+            | Self::TimedSwitch
+            | Self::PSwitch
+            | Self::ASwitch => 'a',
             Self::Nmf | Self::Pmf => 'z',
         }
     }
@@ -176,6 +200,10 @@ pub enum ModelBackend {
     Capacitor,
     /// Scalar inductor.
     Inductor,
+    /// Prepared polynomial charge law.
+    PolynomialCapacitor,
+    /// Prepared polynomial flux law.
+    PolynomialInductor,
     /// Junction diode.
     Diode,
     /// Explicit source-selected `SIMetrix` level-1 diode.
@@ -234,6 +262,10 @@ pub enum ModelBackend {
     LogicVoltage,
     /// Timed conductance switch.
     TimedSwitch,
+    /// XSPICE cubic logarithmic switch.
+    PSwitch,
+    /// XSPICE exponential analog switch.
+    ASwitch,
 }
 
 /// Authoritative backend catalog entry. Selector aliases are the C levels
@@ -266,9 +298,7 @@ impl ModelBackend {
     /// Families differing only in polarity share the same selector catalog.
     pub(crate) const fn catalog(designator: char) -> &'static [BackendSpec] {
         match designator.to_ascii_lowercase() {
-            'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
-            'c' => const { &[BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1])] },
-            'l' => const { &[BackendSpec::new(Self::Inductor, "Scalar inductor", &[1])] },
+            'r' | 'c' | 'l' => Self::passive_catalog(designator),
             'd' => {
                 const {
                     &[
@@ -284,7 +314,17 @@ impl ModelBackend {
                     ]
                 }
             }
-            'q' => const { &[BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2])] },
+            'q' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Bjt, "Gummel-Poon", &[0, 1, 2]),
+                        BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal NPN", &[1])
+                            .for_family(ModelFamily::GummelPoonLegacyNpn),
+                        BackendSpec::new(Self::Bjt, "Gummel-Poon legacy thermal PNP", &[1])
+                            .for_family(ModelFamily::GummelPoonLegacyPnp),
+                    ]
+                }
+            }
             'm' => {
                 const {
                     &[
@@ -350,6 +390,43 @@ impl ModelBackend {
                             .for_family(ModelFamily::LogicVoltage),
                         BackendSpec::new(Self::TimedSwitch, "Timed conductance", &[1])
                             .for_family(ModelFamily::TimedSwitch),
+                        BackendSpec::new(Self::PSwitch, "Continuous cubic switch", &[1])
+                            .for_family(ModelFamily::PSwitch),
+                        BackendSpec::new(Self::ASwitch, "Continuous analog switch", &[1])
+                            .for_family(ModelFamily::ASwitch),
+                    ]
+                }
+            }
+            _ => &[],
+        }
+    }
+
+    const fn passive_catalog(designator: char) -> &'static [BackendSpec] {
+        match designator.to_ascii_lowercase() {
+            'r' => const { &[BackendSpec::new(Self::Resistor, "Scalar resistor", &[0, 1])] },
+            'c' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Capacitor, "Scalar capacitor", &[1]),
+                        BackendSpec::new(
+                            Self::PolynomialCapacitor,
+                            "Prepared polynomial charge",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::PolynomialCapacitor),
+                    ]
+                }
+            }
+            'l' => {
+                const {
+                    &[
+                        BackendSpec::new(Self::Inductor, "Scalar inductor", &[1]),
+                        BackendSpec::new(
+                            Self::PolynomialInductor,
+                            "Prepared polynomial flux",
+                            &[1],
+                        )
+                        .for_family(ModelFamily::PolynomialInductor),
                     ]
                 }
             }
@@ -1242,6 +1319,16 @@ fn level_setters(card: &ModelCard, family: ModelFamily) -> SpiceResult<LevelSett
                 return Err(SpiceError::parse(
                     p.location.clone(),
                     format!("SIMetrix diode requires LEVEL=1, got {raw}"),
+                ));
+            }
+            if matches!(
+                family,
+                ModelFamily::GummelPoonLegacyNpn | ModelFamily::GummelPoonLegacyPnp
+            ) && raw.to_bits() != 1_f64.to_bits()
+            {
+                return Err(SpiceError::parse(
+                    p.location.clone(),
+                    format!("legacy Gummel-Poon requires LEVEL=1, got {raw}"),
                 ));
             }
             if family == ModelFamily::LtspiceSwitch

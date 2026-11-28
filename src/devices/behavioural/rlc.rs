@@ -428,7 +428,7 @@ impl Device for Passive {
             (self.law == Law::Capacitance).then_some(crate::devices::InitialVoltageStorage {
                 voltage: self.initial,
                 slot: 0,
-                scale: -1.,
+                history: crate::devices::traits::VoltageStorageHistory::Linear(-1.),
                 equation: Some(1),
             }),
         )

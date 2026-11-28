@@ -375,3 +375,43 @@ fn tran_uic_is_a_request_flag_the_companion_driver_runs() {
     let mut circuit = config.circuit(&netlist).unwrap();
     request.run(&mut circuit, &config.context()).unwrap();
 }
+
+#[test]
+fn scalar_temperature_directive_has_frontend_precedence() {
+    for options in [
+        ".temp -30\n.options temp=75 tnom=20",
+        ".options temp=75 tnom=20\n.temp -30",
+        ".temp 75\n.temp -30\n.options tnom=20",
+        ".param tt=-35\n.temp {tt+5}\n.options tnom=20 temp=75",
+        ".param tt=-30\n.temp 'tt'\n.options tnom=20",
+    ] {
+        let c = config(options).unwrap();
+        assert_eq!(c.context().temperature, -30., "{options}");
+        assert_eq!(c.context().nominal_temperature, 20., "{options}");
+    }
+    let n = deck("r1 a 0 1k\n.temp -30\n.option temp=75 tnom=20");
+    let overridden = RunConfig::from_options(
+        &n.options,
+        &RunOverrides {
+            temperature: Some(85.),
+            nominal_temperature: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(overridden.context().temperature, 85.);
+    assert_eq!(overridden.context().nominal_temperature, 20.);
+    for directive in [".temp -273.15", ".temp -300"] {
+        let error = config(directive).unwrap_err();
+        assert!(matches!(error, SpiceError::Parse { .. }), "{error}");
+        assert!(error.to_string().contains("cfg.cir:3"), "{error}");
+    }
+}
+
+#[test]
+fn temperature_directives_follow_instantiated_scopes() {
+    let body = ".subckt inner b params: tt=75\n.temp {tt}\nr1 b 0 1k\n.ends\n.subckt outer a\nxinner a inner tt=-30\n.ends";
+    let unused = config(body).unwrap();
+    assert_eq!(unused.context().temperature, 27.);
+    let instantiated = config(&format!("{body}\n.temp 75\nxouter a outer")).unwrap();
+    assert_eq!(instantiated.context().temperature, -30.);
+}

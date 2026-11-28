@@ -151,7 +151,20 @@ pub(in crate::analysis) fn conditioned_derivative(
         }
         // Smooth curvature causes one-sided slopes to coalesce as h shrinks.
         // A cusp keeps their separation; a parameter jump increases it.
-        if fine.symmetric && coarse.asymmetry > 0. && fine.asymmetry > coarse.asymmetry * 0.75 {
+        // Do not infer a cusp from relative differences below the binary64
+        // finite-difference resolution scale (sqrt(epsilon)): subtracting
+        // two rounded residuals can make those differences grow as h shrinks.
+        // This is a significance test, not a physical error guarantee.
+        let slope_scale = coarse
+            .derivative
+            .re
+            .abs()
+            .max(coarse.derivative.im.abs())
+            .max(fine.derivative.re.abs())
+            .max(fine.derivative.im.abs());
+        let resolution = Real::EPSILON.sqrt() * slope_scale;
+        if fine.symmetric && fine.asymmetry > resolution && fine.asymmetry > coarse.asymmetry * 0.75
+        {
             continue;
         }
         let factor = if fine.symmetric { 3. } else { 1. };
@@ -2385,6 +2398,25 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert!((value.re - 3.).abs() < 1e-12);
+        // A one-ulp baseline error is amplified as the step shrinks, even
+        // for an affine residual. Its insignificant asymmetry is not a cusp.
+        let p = 1.2e-14;
+        let gain: f64 = -9.585_764_503_17e11;
+        let baseline = (gain * p).next_up();
+        let (value, _) =
+            conditioned_derivative(p, |point| Ok(Some(Complex::real(gain * point - baseline))))
+                .unwrap()
+                .unwrap();
+        assert!(((value.re - gain) / gain).abs() < 1e-10);
+
+        // A nonzero mean slope must not hide a genuine cusp.
+        assert!(
+            conditioned_derivative(0., |point| {
+                Ok(Some(Complex::real(3. * point + point.abs())))
+            })
+            .unwrap()
+            .is_none()
+        );
         // A central secant across a cusp would be a fake zero derivative.
         assert!(
             conditioned_derivative(0., |point| { Ok(Some(Complex::real(point.abs()))) })

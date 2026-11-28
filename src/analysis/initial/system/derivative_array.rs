@@ -389,11 +389,19 @@ fn companions<'a>(
         );
     }
     for cap in &storage.capacitors {
-        add(
-            StoredQuantity::Voltage(cap.positive, cap.negative, cap.scale),
-            cap.slot,
-            false,
-        );
+        use crate::devices::traits::VoltageStorageHistory;
+        let quantity = match cap.history {
+            VoltageStorageHistory::Linear(scale) => {
+                StoredQuantity::Voltage(cap.positive, cap.negative, scale)
+            }
+            VoltageStorageHistory::Polynomial { equation_scale, .. } => StoredQuantity::Equation(
+                cap.equation
+                    .ok_or_else(|| failure("missing nonlinear voltage evolution row"))?
+                    .0,
+                equation_scale,
+            ),
+        };
+        add(quantity, cap.slot, false);
     }
     for (&AbsoluteRow(row), coordinate) in &storage.fixed_coordinates {
         let slots = circuit

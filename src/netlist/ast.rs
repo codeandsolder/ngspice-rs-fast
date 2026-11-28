@@ -371,6 +371,8 @@ pub enum CodePortKind {
     Current,
     /// Differential current.
     CurrentDifferential,
+    /// Current through an existing named voltage-defined branch.
+    BranchCurrent,
     /// Digital event terminal.
     Digital,
     /// Single-ended conductance.
@@ -398,6 +400,7 @@ impl CodePortKind {
             Self::VoltageDifferential => Some("%vd"),
             Self::Current => Some("%i"),
             Self::CurrentDifferential => Some("%id"),
+            Self::BranchCurrent => Some("%vnam"),
             Self::Digital => Some("%d"),
             Self::Conductance => Some("%g"),
             Self::ConductanceDifferential => Some("%gd"),
@@ -410,7 +413,7 @@ impl CodePortKind {
 pub struct CodeTerminal {
     /// Type of this element, including changes within a vector.
     pub kind: CodePortKind,
-    /// Positive or single-ended node, case folded.
+    /// Positive or single-ended node, or a named branch for %vnam, case folded.
     pub positive: NodeName,
     /// Explicit negative node, absent for single-ended terminals.
     pub negative: Option<NodeName>,
@@ -640,13 +643,25 @@ pub struct ArgumentExpression {
     pub expression: crate::netlist::expr::ParameterExpression,
 }
 
-/// A `.option`/`.options`/`.opt` card: ordered settings, duplicates preserved.
+/// Origin of a deck configuration card. A scalar `.temp` has distinct
+/// precedence from ordinary option setters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionCardKind {
+    /// Ordinary options and bounded front-end setters.
+    Options,
+    /// Scalar circuit temperature, applied after ordinary deck options.
+    Temperature,
+}
+
+/// A configuration card: ordered settings, duplicates preserved.
 ///
 /// C: `inp2dot.c` hands the card to `INPdoOpts()` (`inpdoopt.c`), which applies
 /// settings left to right. This AST validates syntax only; whether a name is a
 /// supported option is decided by the run-configuration consumer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OptionCard {
+    /// Directive kind, retained through elaboration and writing.
+    pub kind: OptionCardKind,
     /// Settings in source order. Repeats are retained; later settings override
     /// earlier ones when a consumer applies them in order.
     pub settings: Vec<OptionSetting>,
