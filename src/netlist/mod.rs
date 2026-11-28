@@ -86,6 +86,8 @@ pub(crate) fn network_parameter(designator: char, name: &str) -> bool {
                 | "pn_rseries_shunt"
                 | "pn_rstorage_shunt"
                 | "pn_rparallel"
+                | "pn_rparallel_noise_abs"
+                | "pn_noiseless"
                 | "pn_cparallel"
                 | "pn_bias_op"
                 | "pn_bias_dc"

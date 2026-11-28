@@ -45,12 +45,12 @@ impl PassiveBias {
             } => {
                 voltage.is_finite()
                     && conductance
-                        .is_none_or(|g| g.is_finite() && g > 0. && (g * voltage).is_finite())
+                        .is_none_or(|g| g.is_finite() && g != 0. && (g * voltage).is_finite())
             }
             Self::Current {
                 current,
                 conductance,
-            } => current.is_finite() && conductance.is_finite() && conductance >= 0.,
+            } => current.is_finite() && conductance.is_finite(),
         }
     }
 
@@ -355,11 +355,12 @@ impl NodeInitialization {
         }
         let mut bias = BTreeMap::new();
         for (analysis, voltage, conductance) in constraints {
-            if !(PassiveBias::Voltage {
-                voltage,
-                conductance: Some(conductance),
-            })
-            .validate()
+            if conductance <= 0.
+                || !(PassiveBias::Voltage {
+                    voltage,
+                    conductance: Some(conductance),
+                })
+                .validate()
             {
                 return Err(SpiceError::parse(
                     location,

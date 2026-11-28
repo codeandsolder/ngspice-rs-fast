@@ -118,6 +118,31 @@ fn record_dc_state(context: &mut StampContext<'_>, quantity: Real) -> SpiceResul
     context.states.set(DERIVATIVE, 0.0)
 }
 
+/// Thermal source law independent of the electrical conductance stamp.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ThermalConductance {
+    /// Preserve the reference resistor's signed density arithmetic.
+    #[default]
+    Signed,
+    /// Use the magnitude of the electrical conductance.
+    Magnitude,
+    /// A physical generator with negative conductance has undefined PSD.
+    Nonnegative,
+}
+
+impl ThermalConductance {
+    fn evaluate(self, conductance: Real) -> SpiceResult<Real> {
+        match self {
+            Self::Signed => Ok(conductance),
+            Self::Magnitude => Ok(conductance.abs()),
+            Self::Nonnegative if conductance >= 0. => Ok(conductance),
+            Self::Nonnegative => Err(SpiceError::circuit(
+                "undefined thermal noise of negative physical conductance",
+            )),
+        }
+    }
+}
+
 /// A resistor's `.noise` description (`resnoise.c`, with the `ressetup.c`
 /// defaults): the `noisy` switch, the flicker law
 /// `m KF abs(I/m)^AF / (area f^EF)` and the noise temperature.
@@ -126,10 +151,8 @@ pub struct ResistorNoise {
     /// C `RESnoisy`: `false` (`noisy=0`) removes the resistor from `.noise`
     /// entirely, names included. Default `true`.
     pub noisy: bool,
-    /// Use the magnitude of the signed conductance for the thermal generator.
-    /// This is an explicit noise law for synthesized active series impedances,
-    /// not the default resistor law.
-    pub absolute_thermal_conductance: bool,
+    /// Thermal generator law, independent of signed electrical impedance.
+    pub thermal_conductance: ThermalConductance,
     /// Flicker coefficient `KF` (default 0, no flicker noise).
     pub kf: Real,
     /// Flicker current exponent `AF` (default 1).
@@ -151,7 +174,7 @@ impl Default for ResistorNoise {
     fn default() -> Self {
         Self {
             noisy: true,
-            absolute_thermal_conductance: false,
+            thermal_conductance: ThermalConductance::Signed,
             kf: 0.0,
             af: 1.0,
             ef: 1.0,
@@ -414,7 +437,7 @@ impl Device for Resistor {
         context: &NoiseContext<'_>,
         sources: &mut Vec<NoiseSource>,
     ) -> SpiceResult<DeviceNoise<'_>> {
-        Ok(resistor_noise(
+        resistor_noise(
             self.terminals,
             1. / self.resistance,
             &self.noise,
@@ -422,7 +445,7 @@ impl Device for Resistor {
             context,
             None,
             sources,
-        ))
+        )
     }
 }
 
@@ -464,10 +487,11 @@ pub(super) fn resistor_noise<'a>(
     context: &NoiseContext<'_>,
     temperature_kelvin: Option<Real>,
     sources: &mut Vec<NoiseSource>,
-) -> DeviceNoise<'a> {
+) -> SpiceResult<DeviceNoise<'a>> {
     if !n.noisy {
-        return DeviceNoise::Noiseless;
+        return Ok(DeviceNoise::Noiseless);
     }
+    let thermal = n.thermal_conductance.evaluate(conductance)?;
     let current = (context.voltage(terminals[0]) - context.voltage(terminals[1])) * conductance;
     let temperature = temperature_kelvin.unwrap_or_else(|| {
         n.temperature
@@ -481,11 +505,7 @@ pub(super) fn resistor_noise<'a>(
             "_thermal",
             terminals,
             NoiseKind::Thermal {
-                conductance: if n.absolute_thermal_conductance {
-                    conductance.abs()
-                } else {
-                    conductance
-                },
+                conductance: thermal,
                 temperature,
             },
         ),
@@ -501,11 +521,11 @@ pub(super) fn resistor_noise<'a>(
             },
         ),
     ]);
-    DeviceNoise::Sources {
+    Ok(DeviceNoise::Sources {
         family: NoiseFamily::Resistor,
         model,
         total: true,
-    }
+    })
 }
 
 /// Borrowed inputs to the charge/flux equation kernels. The owning device
@@ -762,7 +782,7 @@ impl Capacitor {
     ///
     /// # Errors
     ///
-    /// [`SpiceError::Circuit`] for negative/non-finite capacitance or non-finite
+    /// [`SpiceError::Circuit`] for non-finite capacitance or non-finite
     /// IC. A zero capacitance is accepted, as in C (it stamps nothing).
     pub fn new(
         name: impl Into<String>,
@@ -771,12 +791,9 @@ impl Capacitor {
         initial_voltage: Option<Real>,
     ) -> SpiceResult<Self> {
         let name = name.into();
-        if !capacitance.is_finite()
-            || capacitance < 0.0
-            || initial_voltage.is_some_and(|v| !v.is_finite())
-        {
+        if !capacitance.is_finite() || initial_voltage.is_some_and(|v| !v.is_finite()) {
             return Err(SpiceError::circuit(format!(
-                "capacitor {name}: capacitance must be nonnegative and finite; initial voltage must be finite"
+                "capacitor {name}: capacitance must be finite; initial voltage must be finite"
             )));
         }
         Ok(Self {
@@ -1039,7 +1056,7 @@ impl Inductor {
     ///
     /// # Errors
     ///
-    /// [`SpiceError::Circuit`] for negative/non-finite inductance or non-finite
+    /// [`SpiceError::Circuit`] for non-finite inductance or non-finite
     /// IC. A zero inductance is accepted, as in C (a short at every analysis).
     pub fn new(
         name: impl Into<String>,
@@ -1048,12 +1065,9 @@ impl Inductor {
         initial_current: Option<Real>,
     ) -> SpiceResult<Self> {
         let name = name.into();
-        if !inductance.is_finite()
-            || inductance < 0.0
-            || initial_current.is_some_and(|v| !v.is_finite())
-        {
+        if !inductance.is_finite() || initial_current.is_some_and(|v| !v.is_finite()) {
             return Err(SpiceError::circuit(format!(
-                "inductor {name}: inductance must be nonnegative and finite; initial current must be finite"
+                "inductor {name}: inductance must be finite; initial current must be finite"
             )));
         }
         Ok(Self {
