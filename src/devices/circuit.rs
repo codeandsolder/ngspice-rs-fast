@@ -2124,6 +2124,11 @@ impl Circuit {
                 .ok_or_else(|| SpiceError::circuit("stale coupling override"))?
                 .coefficient;
             let inductance = coefficient * (a.coupling_base * b.coupling_base).abs().sqrt();
+            if inductance != 0. && (a.effective == 0. || b.effective == 0.) {
+                return Err(SpiceError::circuit(
+                    "nonzero mutual inductance with zero effective self-inductance is not positive semidefinite",
+                ));
+            }
             if !inductance.is_finite() {
                 return Err(SpiceError::circuit(format!(
                     "{}: nonfinite mutual inductance",

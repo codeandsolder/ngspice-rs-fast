@@ -24,7 +24,9 @@ use crate::primitives::{NodeId, Real, SpiceError, SpiceResult};
 use crate::devices::noise::{
     CELSIUS_TO_KELVIN, DeviceNoise, FlickerLaw, NoiseContext, NoiseFamily, NoiseKind, NoiseSource,
 };
+use crate::devices::passive::physics::ContextualStorage;
 use crate::devices::traits::{AnalysisMode, Device, StampContext};
+use std::sync::Arc;
 
 /// State slots of a capacitor (`CAPqcap`, `CAPccap`) or inductor
 /// (`INDflux`, `INDvolt`): the integrated quantity and its derivative.
@@ -772,6 +774,7 @@ pub struct Capacitor {
     terminals: [NodeId; 2],
     /// Capacitance in farads.
     capacitance: Real,
+    contextual: Option<Arc<ContextualStorage>>,
     /// Initial voltage, from `ic=`; `None` when not given.
     initial_voltage: Option<Real>,
     bias: Option<Box<crate::devices::passive_bias::PassiveInitialization>>,
@@ -800,8 +803,30 @@ impl Capacitor {
             name,
             terminals,
             capacitance,
+            contextual: None,
             initial_voltage,
             bias: None,
+        })
+    }
+
+    pub(super) fn with_contextual_storage(mut self, recipe: Arc<ContextualStorage>) -> Self {
+        self.contextual = Some(recipe);
+        self
+    }
+
+    fn effective(&self, context: &crate::devices::ModelContext) -> SpiceResult<Real> {
+        self.contextual
+            .as_ref()
+            .map_or(Ok(self.capacitance), |recipe| recipe.effective(context))
+    }
+
+    fn contextual_load(
+        &self,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<ReactiveLoad<'_>> {
+        Ok(ReactiveLoad {
+            value: self.effective(context)?,
+            ..self.load()
         })
     }
 
@@ -866,8 +891,12 @@ impl Device for Capacitor {
         context: &crate::devices::ModelContext,
     ) -> SpiceResult<Option<Real>> {
         Ok(match keyword {
-            "c" | "cap" | "capacitance" => Some(self.capacitance),
-            "temp" => Some(context.temperature),
+            "c" | "cap" | "capacitance" => Some(self.effective(context)?),
+            "temp" => Some(
+                self.contextual
+                    .as_ref()
+                    .map_or(context.temperature, |recipe| recipe.temperature(context)),
+            ),
             "m" | "scale" => Some(1.),
             "tc1" | "tc2" | "dtemp" => Some(0.),
             _ => None,
@@ -981,15 +1010,22 @@ impl Device for Capacitor {
         Some(QUANTITY)
     }
 
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.effective(context).map(|_| ())
+    }
+
     fn storage_element(
         &self,
-        _context: &crate::devices::models::ModelContext,
+        context: &crate::devices::models::ModelContext,
     ) -> Option<SpiceResult<crate::devices::traits::StorageElement>> {
-        Some(Ok(crate::devices::traits::StorageElement {
-            kind: crate::devices::traits::StorageKind::Capacitor,
-            value: self.capacitance,
-            initial: self.load().initial,
-        }))
+        Some(
+            self.effective(context)
+                .map(|value| crate::devices::traits::StorageElement {
+                    kind: crate::devices::traits::StorageKind::Capacitor,
+                    value,
+                    initial: self.load().initial,
+                }),
+        )
     }
 
     /// `capload.c`: an open circuit at DC (recording `q = C v` when state
@@ -997,13 +1033,15 @@ impl Device for Capacitor {
     /// from current from the first terminal to the second. `ic=` is not
     /// applied here; initial-condition policy belongs to the analysis.
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        self.load().stamp_capacitor(context)
+        self.contextual_load(&context.model_context())?
+            .stamp_capacitor(context)
     }
     fn assemble_linear(
         &self,
         context: &mut crate::devices::linear::LinearContext<'_>,
     ) -> SpiceResult<()> {
-        self.load().assemble_capacitor(context)
+        self.contextual_load(context.model_context)?
+            .assemble_capacitor(context)
     }
 
     /// `.sens`: C's capacitor records with the default model
@@ -1018,7 +1056,7 @@ impl Device for Capacitor {
             &self.name,
             self.terminals,
             PassiveInputs::Literal {
-                value: self.capacitance,
+                value: self.effective(context)?,
                 initial_condition: self.initial_voltage,
             },
             context,
@@ -1046,6 +1084,7 @@ pub struct Inductor {
     terminals: [NodeId; 2],
     /// Inductance in henries.
     inductance: Real,
+    contextual: Option<Arc<ContextualStorage>>,
     /// Initial current, from `ic=`; `None` when not given.
     initial_current: Option<Real>,
     bias: Option<Box<crate::devices::passive_bias::PassiveInitialization>>,
@@ -1074,8 +1113,30 @@ impl Inductor {
             name,
             terminals,
             inductance,
+            contextual: None,
             initial_current,
             bias: None,
+        })
+    }
+
+    pub(super) fn with_contextual_storage(mut self, recipe: Arc<ContextualStorage>) -> Self {
+        self.contextual = Some(recipe);
+        self
+    }
+
+    fn effective(&self, context: &crate::devices::ModelContext) -> SpiceResult<Real> {
+        self.contextual
+            .as_ref()
+            .map_or(Ok(self.inductance), |recipe| recipe.effective(context))
+    }
+
+    fn contextual_load(
+        &self,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<ReactiveLoad<'_>> {
+        Ok(ReactiveLoad {
+            value: self.effective(context)?,
+            ..self.load()
         })
     }
 
@@ -1138,8 +1199,12 @@ impl Device for Inductor {
         context: &crate::devices::ModelContext,
     ) -> SpiceResult<Option<Real>> {
         Ok(match keyword {
-            "l" | "inductance" => Some(self.inductance),
-            "temp" => Some(context.temperature),
+            "l" | "inductance" => Some(self.effective(context)?),
+            "temp" => Some(
+                self.contextual
+                    .as_ref()
+                    .map_or(context.temperature, |recipe| recipe.temperature(context)),
+            ),
             "m" | "scale" => Some(1.),
             "tc1" | "tc2" | "dtemp" => Some(0.),
             _ => None,
@@ -1225,26 +1290,38 @@ impl Device for Inductor {
         Some(QUANTITY)
     }
 
+    fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
+        self.effective(context).map(|_| ())
+    }
+
     fn storage_element(
         &self,
-        _context: &crate::devices::models::ModelContext,
+        context: &crate::devices::models::ModelContext,
     ) -> Option<SpiceResult<crate::devices::traits::StorageElement>> {
-        Some(Ok(crate::devices::traits::StorageElement {
-            kind: crate::devices::traits::StorageKind::Inductor,
-            value: self.inductance,
-            initial: self.load().initial,
-        }))
+        Some(
+            self.effective(context)
+                .map(|value| crate::devices::traits::StorageElement {
+                    kind: crate::devices::traits::StorageKind::Inductor,
+                    value,
+                    initial: self.load().initial,
+                }),
+        )
     }
 
     fn inductance(
         &self,
-        _context: &crate::devices::models::ModelContext,
+        context: &crate::devices::models::ModelContext,
     ) -> Option<SpiceResult<crate::devices::traits::InductanceValue>> {
-        Some(Ok(crate::devices::traits::InductanceValue {
-            effective: self.inductance,
-            coupling_base: self.inductance,
-            initial: self.load().initial.unwrap_or(0.),
-            exact_startup: self.exact_startup_storage(),
+        Some(self.effective(context).map(|effective| {
+            crate::devices::traits::InductanceValue {
+                effective,
+                coupling_base: self
+                    .contextual
+                    .as_ref()
+                    .map_or(effective, |recipe| recipe.coupling_base(effective)),
+                initial: self.load().initial.unwrap_or(0.),
+                exact_startup: self.exact_startup_storage(),
+            }
         }))
     }
 
@@ -1260,13 +1337,15 @@ impl Device for Inductor {
     /// veq`, with `veq` from the integrated coupled flux. At DC the coupled
     /// inductors stay shorts.
     fn stamp(&self, context: &mut StampContext<'_>) -> SpiceResult<()> {
-        self.load().stamp_inductor(context)
+        self.contextual_load(&context.model_context())?
+            .stamp_inductor(context)
     }
     fn assemble_linear(
         &self,
         context: &mut crate::devices::linear::LinearContext<'_>,
     ) -> SpiceResult<()> {
-        self.load().assemble_inductor(context)
+        self.contextual_load(context.model_context)?
+            .assemble_inductor(context)
     }
 
     /// `.sens`: C's inductor records with the default model
@@ -1281,7 +1360,7 @@ impl Device for Inductor {
             &self.name,
             self.terminals,
             PassiveInputs::Literal {
-                value: self.inductance,
+                value: self.effective(context)?,
                 initial_condition: self.initial_current,
             },
             context,
