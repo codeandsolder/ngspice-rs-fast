@@ -182,7 +182,7 @@ fn invalid_model_and_instance_fields_are_not_ignored() -> Result<()> {
         ))?;
         assert!(Circuit::from_netlist(&deck).is_err(), "{parameters}");
     }
-    for fields in ["m=0", "n=0", "temp=-300", "dtemp=1"] {
+    for fields in ["area=-1", "n=0", "temp=-300", "dtemp=1"] {
         let deck = parse(&format!(
             "bad\nD1 a 0 dm {fields}\n.model dm ltspice_ideal_diode(ron=2)\n.end\n"
         ))?;
@@ -565,7 +565,7 @@ fn vendor_signed_noise() -> Result<()> {
     ];
     for (model, bias, voltage, gain, thermal, shot, flicker_low, flicker_high) in rows {
         let deck = parse(&format!(
-            "signed noise\nV1 in 0 DC {bias} AC 1\nR1 in out 0.1\nD1 out 0 dm\n.model dm ltspice_ideal_diode({model})\n.options gmin=1e-12 temp=27 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.op\n.ac lin 2 1k 1meg\n.noise V(out) V1 lin 2 1k 1meg 1\n.end\n"
+            "signed noise\nV1 in 0 DC {bias} AC 1\nR1 in out 0.1\nD1 out 0 dm\n.model dm ltspice_ideal_diode({model})\n.options gmin=1e-12 temp=27 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.op\n.ac lin 3 1k 1meg\n.noise V(out) V1 lin 3 1k 1meg 1\n.end\n"
         ))?;
         let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
         let mut circuit = config.circuit(&deck)?;
@@ -586,7 +586,7 @@ fn vendor_signed_noise() -> Result<()> {
             .plan_for(&deck.analyses[2])?
             .run_plots(&mut circuit, &context)?;
         let spectrum = &plots[0];
-        for (row, flicker) in [flicker_low, flicker_high].into_iter().enumerate() {
+        for (row, flicker) in [(0, flicker_low), (2, flicker_high)] {
             close(ac.value("v(out)", row).ok_or("AC gain")?.re, gain, 0., 1e-8);
             for (column, expected) in [
                 ("onoise_d1_rs", thermal),
@@ -600,6 +600,57 @@ fn vendor_signed_noise() -> Result<()> {
                     2e-6,
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vendor_instance_geometry_boundaries() -> Result<()> {
+    // Independently measured LTspice 24.0.12 AC and OP, imposed 2 V.
+    // Zero/negative M or zero AREA disables the complete instance, even
+    // its Gmin floor; a negative nonzero N reverses local voltage.
+    for (fields, current, conductance) in [
+        ("m=0", 0., 0.),
+        ("m=-2", 0., 0.),
+        ("area=0", 0., 0.),
+        ("m=.5", 0.255_000_000_000_002, 0.250_000_000_000_001),
+        ("n=-2", -0.010_000_000_000_001, -0.005_000_000_000_000_5),
+        ("n=.5", 1.510_000_000_000_004, 1.000_000_000_000_002),
+    ] {
+        let deck = parse(&format!(
+            "geometry boundary\nV1 a 0 DC 2 AC 1\nD1 a 0 dm {fields}\n.model dm ltspice_ideal_diode(ron=2 roff=100 vfwd=1 vrev=2 rrev=3)\n.options gmin=1e-12 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.op\n.ac lin 3 1k 1meg\n.noise V(a) V1 lin 3 1k 1meg 1\n.end\n"
+        ))?;
+        let config = ngspice_rs::analysis::RunConfig::from_netlist(&deck)?;
+        let mut circuit = config.circuit(&deck)?;
+        let context = config.context();
+        let op = config
+            .plan_for(&deck.analyses[0])?
+            .run(&mut circuit, &context)?;
+        close(
+            -op.value("i(v1)", 0).ok_or("OP source current")?.re,
+            current,
+            1e-13,
+            1e-10,
+        );
+        let ac = config
+            .plan_for(&deck.analyses[1])?
+            .run(&mut circuit, &context)?;
+        close(
+            -ac.value("i(v1)", 0).ok_or("AC source current")?.re,
+            conductance,
+            1e-13,
+            1e-10,
+        );
+        if fields == "n=-2" {
+            // Vendor exposes NaN for the negative shot PSD. Diagnose it
+            // instead of silently turning it into a positive density.
+            assert!(
+                config
+                    .plan_for(&deck.analyses[2])?
+                    .run_plots(&mut circuit, &context)
+                    .is_err()
+            );
         }
     }
     Ok(())

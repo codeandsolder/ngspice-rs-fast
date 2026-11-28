@@ -109,7 +109,12 @@ noise machinery sums independent generator powers; instance temperature
 overrides circuit temperature. The two simulators use slightly different
 physical constants, accounted for by the measured comparison tolerance.
 
-Area is observable metadata but electrically inert in the ideal family.
+Positive area is observable metadata but otherwise electrically inert.
+Zero area and nonpositive M disable the entire instance, including its
+parallel floor and noise. Negative area and zero N are rejected. Negative
+nonzero N retains the signed DC/AC response; noise at nonzero current
+is explicitly rejected because the vendor produces negative shot-noise
+power and a NaN component. Temperatures must be above absolute zero.
 The tested semiconductor-only setters (including RS, IS, junction charge
 and temperature coefficients) and the OFF flag do not modify this law.
 Unrecognized fields and nonrepresentable noise remain explicit errors.

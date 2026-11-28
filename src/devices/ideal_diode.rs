@@ -63,14 +63,6 @@ fn invalid(location: &SourceLoc, name: &str, value: Real) -> SpiceError {
     )
 }
 
-fn positive(value: Real, location: &SourceLoc, name: &str) -> SpiceResult<Real> {
-    if value.is_finite() && value > 0. {
-        Ok(value)
-    } else {
-        Err(invalid(location, name, value))
-    }
-}
-
 fn nonnegative(value: Real, location: &SourceLoc, name: &str) -> SpiceResult<Real> {
     if value.is_finite() && value >= 0. {
         Ok(value)
@@ -211,11 +203,15 @@ impl Default for Instance {
 }
 
 impl Instance {
+    fn disabled(self) -> bool {
+        self.multiplier <= 0. || self.area == 0.
+    }
+
     fn set(&mut self, key: &str, value: Real, location: &SourceLoc) -> SpiceResult<()> {
         match key {
-            "m" => self.multiplier = positive(value, location, key)?,
-            "n" => self.series = positive(value, location, key)?,
-            "area" => self.area = positive(value, location, key)?,
+            "m" if value.is_finite() => self.multiplier = value,
+            "n" if value.is_finite() && value != 0. => self.series = value,
+            "area" => self.area = nonnegative(value, location, key)?,
             "temp" if value.is_finite() && value > -273.15 => self.temperature = Some(value),
             _ => return Err(invalid(location, key, value)),
         }
@@ -283,6 +279,12 @@ impl IdealDiode {
     }
 
     fn scaled_point(&self, voltage: Real, prepared: Prepared) -> SpiceResult<Point> {
+        if self.instance.disabled() {
+            return Ok(Point {
+                current: 0.,
+                conductance: 0.,
+            });
+        }
         let local_voltage = voltage / self.instance.series;
         let local = prepared.point(local_voltage);
         let current = prepared
@@ -338,7 +340,7 @@ impl Device for IdealDiode {
         let raw = context.node_voltage(a) - context.node_voltage(c);
         let mut voltage = raw;
         let prepared = self.prepared_at(&context.model_context())?;
-        if prepared.has_limit() {
+        if prepared.has_limit() && !self.instance.disabled() {
             let states = &mut context.states;
             match Linearization::classify(states) {
                 Linearization::Initial | Linearization::Limited => {
@@ -397,6 +399,9 @@ impl Device for IdealDiode {
         context: &NoiseContext<'_>,
         sources: &mut Vec<NoiseSource>,
     ) -> SpiceResult<DeviceNoise<'_>> {
+        if self.instance.disabled() {
+            return Ok(DeviceNoise::Noiseless);
+        }
         let [a, c] = self.terminals;
         let point = self.point(
             context.voltage(a) - context.voltage(c),
@@ -407,6 +412,12 @@ impl Device for IdealDiode {
             .temperature
             .map_or_else(|| context.circuit_kelvin(), |t| t + CELSIUS_TO_KELVIN);
         let current = point.current.abs();
+        if self.instance.series < 0. && current > 0. {
+            return Err(SpiceError::circuit(format!(
+                "{}: negative series multiplicity produces negative shot-noise density",
+                self.name
+            )));
+        }
         let flicker = law::flicker_numerator(self.model.kf, self.model.af, current);
         if !flicker.is_finite() {
             return Err(SpiceError::circuit(
