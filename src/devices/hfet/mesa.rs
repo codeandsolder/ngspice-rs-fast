@@ -45,9 +45,9 @@ use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE};
 use crate::devices::nonlinear::unaliased_conductance;
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, ResetAcDevice,
-    SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord, StampPart,
-    node_stamps, stamp_reset,
+    ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
+    SensitivityParameter, SensitivityRecord, StampPart, node_stamps, reconstructed_reset_loads,
+    stamp_reset,
 };
 use crate::devices::sweep::check_swept;
 use crate::devices::{
@@ -1913,31 +1913,18 @@ impl SensitivityKernel for MesaSensitivity<'_> {
         Ok(())
     }
 
-    fn dc_load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<DcSensitivityLoad> {
-        Ok(DcSensitivityLoad::replacement(self.mesa(current)?))
-    }
-
-    /// `MESAacLoad` after `cktsens.c`'s reset load: `ggs`/`ggd` in
-    /// `CKTstate0` and the instance fields `gm0`..`gds0`/`delidgch0`.. that
-    /// `mesaload.c` wrote at zero gate voltages with the reset records (at the
-    /// reset's `vds = 0` C's `lambda` blend multiplies zero, so `gm`/`gds` are
-    /// the load's own); the charge slots and `ggspp`/`ggdpp` are zero; the
-    /// conductances and `m` come from `current`. Level 4's `mesa3` never
-    /// writes those fields, so its AC load has no `gm`/`gds` at all, which
-    /// here (unlike `.ac` at an operating point) is reproduced: they are
-    /// zero whatever ran before.
-    fn ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<AcSensitivityLoad> {
-        AcSensitivityLoad::reset(reset, current, |records| self.mesa(records))
-    }
+    reconstructed_reset_loads!(
+        /// `MESAacLoad` after `cktsens.c`'s reset load: `ggs`/`ggd` in
+        /// `CKTstate0` and the instance fields `gm0`..`gds0`/`delidgch0`.. that
+        /// `mesaload.c` wrote at zero gate voltages with the reset records (at the
+        /// reset's `vds = 0` C's `lambda` blend multiplies zero, so `gm`/`gds` are
+        /// the load's own); the charge slots and `ggspp`/`ggdpp` are zero; the
+        /// conductances and `m` come from `current`. Level 4's `mesa3` never
+        /// writes those fields, so its AC load has no `gm`/`gds` at all, which
+        /// here (unlike `.ac` at an operating point) is reproduced: they are
+        /// zero whatever ran before.
+        mesa
+    );
 }
 
 impl MesaSensitivity<'_> {

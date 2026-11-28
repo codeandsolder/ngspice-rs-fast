@@ -593,6 +593,34 @@ impl AcSensitivityLoad {
     }
 }
 
+// Implement the two disjoint replay hooks for families that reconstruct an
+// ordinary DC device and use two snapshots of that device for historical AC.
+// This macro only supplies the trait methods; all reconstruction and stamp
+// computation remains in the typed device implementation.
+macro_rules! reconstructed_reset_loads {
+    ($(#[$ac_doc:meta])* $reconstruct:ident) => {
+        fn dc_load(
+            &self,
+            _setup: $crate::devices::sensitivity::RecordPair<'_>,
+            current: $crate::devices::sensitivity::RecordPair<'_>,
+        ) -> $crate::primitives::SpiceResult<$crate::devices::sensitivity::DcSensitivityLoad> {
+            Ok($crate::devices::sensitivity::DcSensitivityLoad::replacement(self.$reconstruct(current)?))
+        }
+
+        $(#[$ac_doc])*
+        fn ac_load(
+            &self,
+            _setup: $crate::devices::sensitivity::RecordPair<'_>,
+            reset: $crate::devices::sensitivity::AcReset<'_>,
+            current: $crate::devices::sensitivity::RecordPair<'_>,
+        ) -> $crate::primitives::SpiceResult<$crate::devices::sensitivity::AcSensitivityLoad> {
+            $crate::devices::sensitivity::AcSensitivityLoad::reset(reset, current, |records| self.$reconstruct(records))
+        }
+    };
+}
+
+pub(in crate::devices) use reconstructed_reset_loads;
+
 /// One device as `.sens` sees it: C's parameter tables, its records, and its
 /// setter, setup, temperature and load routines replayed on those records.
 pub trait DeviceSensitivity: fmt::Debug + sealed::Sealed {
@@ -953,6 +981,19 @@ pub(in crate::devices) fn instance_temperature_defaults(
         instance.store("temp", circuit_kelvin + dtemp)?;
     }
     Ok(())
+}
+
+/// Apply the nominal-model and instance-temperature defaults, in that order.
+pub(in crate::devices) fn junction_temperature_defaults(
+    model: &mut SensitivityRecord,
+    instance: &mut SensitivityRecord,
+    nominal_kelvin: Real,
+    circuit_kelvin: Real,
+) -> SpiceResult<()> {
+    if !model.given("tnom") {
+        model.store("tnom", nominal_kelvin)?;
+    }
+    instance_temperature_defaults(instance, circuit_kelvin)
 }
 
 /// What `cktsens.c`'s per-frequency reset leaves for an AC load

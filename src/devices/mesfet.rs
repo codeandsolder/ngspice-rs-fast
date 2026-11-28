@@ -81,8 +81,8 @@ use crate::devices::schema::{
     self, ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, ResetAcDevice,
-    SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord,
+    ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
+    SensitivityParameter, SensitivityRecord, reconstructed_reset_loads,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -965,26 +965,13 @@ impl SensitivityKernel for MesfetSensitivity<'_> {
         Ok(())
     }
 
-    fn dc_load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<DcSensitivityLoad> {
-        Ok(DcSensitivityLoad::replacement(self.mesfet(current)?))
-    }
-
-    /// `MESacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
-    /// `ggd` are the `CKTstate0` values `mesload.c` stored at zero junction
-    /// voltages with the reset records, the charge slots `qgs`/`qgd` are
-    /// zero, and `RD`/`RS`, `area` and `m` come from `current`.
-    fn ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<AcSensitivityLoad> {
-        AcSensitivityLoad::reset(reset, current, |records| self.mesfet(records))
-    }
+    reconstructed_reset_loads!(
+        /// `MESacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
+        /// `ggd` are the `CKTstate0` values `mesload.c` stored at zero junction
+        /// voltages with the reset records, the charge slots `qgs`/`qgd` are
+        /// zero, and `RD`/`RS`, `area` and `m` come from `current`.
+        mesfet
+    );
 }
 
 impl MesfetSensitivity<'_> {

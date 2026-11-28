@@ -89,9 +89,9 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, CELSIUS_TO_KELVIN, DcSensitivityLoad, ParameterScope, RecordPair,
-    ResetAcDevice, SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord,
-    instance_temperature_defaults,
+    CELSIUS_TO_KELVIN, ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily,
+    SensitivityKernel, SensitivityParameter, SensitivityRecord, junction_temperature_defaults,
+    reconstructed_reset_loads,
 };
 use crate::devices::{Device, LinearContext, ModelContext, ResolvedModel, StampContext};
 use crate::maths::Vector;
@@ -1500,33 +1500,17 @@ impl SensitivityKernel for Jfet2Sensitivity<'_> {
         model: &mut SensitivityRecord,
         instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        if !model.given("tnom") {
-            model.store("tnom", self.nominal_kelvin)?;
-        }
-        instance_temperature_defaults(instance, self.circuit_kelvin)
+        junction_temperature_defaults(model, instance, self.nominal_kelvin, self.circuit_kelvin)
     }
 
-    fn dc_load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<DcSensitivityLoad> {
-        Ok(DcSensitivityLoad::replacement(self.jfet2(current)?))
-    }
-
-    /// `JFET2acLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
-    /// `ggd`, `vgs`, `vgd` and `cd` are the `CKTstate0` values `jfet2load.c`
-    /// stored at zero junction voltages with the reset records, the charge
-    /// slots `qgs`/`qgd`/`qds` are zero, and `PSacload`'s model coefficients,
-    /// the series conductances, `area` and `m` come from `current`.
-    fn ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<AcSensitivityLoad> {
-        AcSensitivityLoad::reset(reset, current, |records| self.jfet2(records))
-    }
+    reconstructed_reset_loads!(
+        /// `JFET2acLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
+        /// `ggd`, `vgs`, `vgd` and `cd` are the `CKTstate0` values `jfet2load.c`
+        /// stored at zero junction voltages with the reset records, the charge
+        /// slots `qgs`/`qgd`/`qds` are zero, and `PSacload`'s model coefficients,
+        /// the series conductances, `area` and `m` come from `current`.
+        jfet2
+    );
 }
 
 impl Jfet2Sensitivity<'_> {

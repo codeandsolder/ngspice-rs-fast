@@ -20,9 +20,9 @@ use super::{
 };
 use crate::devices::LinearContext;
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, CELSIUS_TO_KELVIN, DcSensitivityLoad, ParameterScope, RecordPair,
-    ResetAcDevice, SensitivityFamily, SensitivityKernel, SensitivityParameter as P,
-    SensitivityRecord, StampPart, instance_temperature_defaults, node_stamps, stamp_reset, written,
+    CELSIUS_TO_KELVIN, ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily,
+    SensitivityKernel, SensitivityParameter as P, SensitivityRecord, StampPart,
+    instance_temperature_defaults, node_stamps, reconstructed_reset_loads, stamp_reset, written,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -403,27 +403,14 @@ impl SensitivityKernel for DiodeSensitivity<'_> {
         instance_temperature_defaults(instance, self.circuit_kelvin)
     }
 
-    fn dc_load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<DcSensitivityLoad> {
-        Ok(DcSensitivityLoad::replacement(self.diode(current)?))
-    }
-
-    /// `DIOacLoad` after `cktsens.c`'s reset load: the series conductance
-    /// `DIOtConductance` of `current`, the junction conductance
-    /// `CKTstate0[DIOconduct]` that `dioload.c` stored at `vd = 0` with the
-    /// `state` records, and no capacitance (`DIOcapCurrent` is written only by
-    /// a small-signal load, so it is still zero).
-    fn ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<AcSensitivityLoad> {
-        AcSensitivityLoad::reset(reset, current, |records| self.diode(records))
-    }
+    reconstructed_reset_loads!(
+        /// `DIOacLoad` after `cktsens.c`'s reset load: the series conductance
+        /// `DIOtConductance` of `current`, the junction conductance
+        /// `CKTstate0[DIOconduct]` that `dioload.c` stored at `vd = 0` with the
+        /// `state` records, and no capacitance (`DIOcapCurrent` is written only by
+        /// a small-signal load, so it is still zero).
+        diode
+    );
 }
 
 impl DiodeSensitivity<'_> {

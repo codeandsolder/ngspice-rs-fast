@@ -64,9 +64,9 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, ResetAcDevice,
-    SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord,
-    instance_temperature_defaults,
+    ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
+    SensitivityParameter, SensitivityRecord, junction_temperature_defaults,
+    reconstructed_reset_loads,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -1322,33 +1322,17 @@ impl SensitivityKernel for JfetSensitivity<'_> {
         model: &mut SensitivityRecord,
         instance: &mut SensitivityRecord,
     ) -> SpiceResult<()> {
-        if !model.given("tnom") {
-            model.store("tnom", self.nominal_kelvin)?;
-        }
-        instance_temperature_defaults(instance, self.circuit_kelvin)
+        junction_temperature_defaults(model, instance, self.nominal_kelvin, self.circuit_kelvin)
     }
 
-    fn dc_load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<DcSensitivityLoad> {
-        Ok(DcSensitivityLoad::replacement(self.jfet(current)?))
-    }
-
-    /// `JFETacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
-    /// `ggd` are the `CKTstate0` values `jfetload.c` stored at zero junction
-    /// voltages with the reset records, the charge slots `qgs`/`qgd` (written
-    /// only by a small-signal or transient load) are zero, and the series
-    /// conductances and `m` come from `current`.
-    fn ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<AcSensitivityLoad> {
-        AcSensitivityLoad::reset(reset, current, |records| self.jfet(records))
-    }
+    reconstructed_reset_loads!(
+        /// `JFETacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
+        /// `ggd` are the `CKTstate0` values `jfetload.c` stored at zero junction
+        /// voltages with the reset records, the charge slots `qgs`/`qgd` (written
+        /// only by a small-signal or transient load) are zero, and the series
+        /// conductances and `m` come from `current`.
+        jfet
+    );
 }
 
 impl JfetSensitivity<'_> {

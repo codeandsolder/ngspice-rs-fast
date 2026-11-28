@@ -55,9 +55,9 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, ResetAcDevice,
-    SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord, StampPart,
-    node_stamps, stamp_reset,
+    ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
+    SensitivityParameter, SensitivityRecord, StampPart, node_stamps, reconstructed_reset_loads,
+    stamp_reset,
 };
 use crate::devices::{
     AnalysisMode, Device, DeviceState, LinearContext, ModelContext, ResolvedModel, StampContext,
@@ -1091,26 +1091,13 @@ impl SensitivityKernel for Hfet2Sensitivity<'_> {
         Ok(())
     }
 
-    fn dc_load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<DcSensitivityLoad> {
-        Ok(DcSensitivityLoad::replacement(self.hfet2(current)?))
-    }
-
-    /// `HFET2acLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
-    /// `ggd` are the `CKTstate0` values `hfet2load.c` stored at zero gate
-    /// voltages with the reset records, the charge slots `qgs`/`qgd` are
-    /// zero, and `RD`/`RS` and `m` come from `current`.
-    fn ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<AcSensitivityLoad> {
-        AcSensitivityLoad::reset(reset, current, |records| self.hfet2(records))
-    }
+    reconstructed_reset_loads!(
+        /// `HFET2acLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
+        /// `ggd` are the `CKTstate0` values `hfet2load.c` stored at zero gate
+        /// voltages with the reset records, the charge slots `qgs`/`qgd` are
+        /// zero, and `RD`/`RS` and `m` come from `current`.
+        hfet2
+    );
 }
 
 impl Hfet2Sensitivity<'_> {

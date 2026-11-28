@@ -61,9 +61,9 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, ResetAcDevice,
-    SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord, StampPart,
-    node_stamps, stamp_reset,
+    ParameterScope, RecordPair, ResetAcDevice, SensitivityFamily, SensitivityKernel,
+    SensitivityParameter, SensitivityRecord, StampPart, node_stamps, reconstructed_reset_loads,
+    stamp_reset,
 };
 use crate::devices::{
     AnalysisMode, Device, DeviceState, LinearContext, ModelContext, ResolvedModel, StampContext,
@@ -1829,28 +1829,15 @@ impl SensitivityKernel for Hfet1Sensitivity<'_> {
         Ok(())
     }
 
-    fn dc_load(
-        &self,
-        _setup: RecordPair<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<DcSensitivityLoad> {
-        Ok(DcSensitivityLoad::replacement(self.hfet1(current)?))
-    }
-
-    /// `HFETAacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
-    /// `ggd`, `ggspp`, `ggdpp` are the `CKTstate0` values `hfetload.c` stored
-    /// at zero gate voltages with the reset records, the charge slots
-    /// `qgs`/`qgd` are zero, and the model conductances, `CDS`, the
-    /// frequency-dependent output conductance (`kappa`, `fgds`, `delf`) and
-    /// `m` come from `current`.
-    fn ac_load(
-        &self,
-        _setup: RecordPair<'_>,
-        reset: AcReset<'_>,
-        current: RecordPair<'_>,
-    ) -> SpiceResult<AcSensitivityLoad> {
-        AcSensitivityLoad::reset(reset, current, |records| self.hfet1(records))
-    }
+    reconstructed_reset_loads!(
+        /// `HFETAacLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
+        /// `ggd`, `ggspp`, `ggdpp` are the `CKTstate0` values `hfetload.c` stored
+        /// at zero gate voltages with the reset records, the charge slots
+        /// `qgs`/`qgd` are zero, and the model conductances, `CDS`, the
+        /// frequency-dependent output conductance (`kappa`, `fgds`, `delf`) and
+        /// `m` come from `current`.
+        hfet1
+    );
 }
 
 impl Hfet1Sensitivity<'_> {
