@@ -167,7 +167,8 @@ impl TerminalLayout {
                     if let Some(row) = circuit.unknowns().node_row(node)
                         && let Ok(index) = self.by_row.binary_search_by_key(&row, |&(row, _)| row)
                     {
-                        currents[self.by_row[index].1] += sign * history.scale * rate;
+                        let current = &mut currents[self.by_row[index].1];
+                        *current = (sign * history.scale).mul_add(rate, *current);
                     }
                 }
             }

@@ -34,6 +34,7 @@ use crate::devices::linear::Forcing;
 use crate::devices::state::DeviceState;
 
 /// Device-local physical charge history and its electrical incidence.
+///
 /// The stored rate is multiplied by `scale` and enters the positive node,
 /// leaving the negative node. Internal state equations are not terminals.
 #[derive(Clone, Copy, Debug)]
