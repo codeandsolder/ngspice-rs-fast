@@ -1375,10 +1375,29 @@ fn prepared_hidden_node_transactions_rollback_on_invalid_or_duplicate_instance()
     assert_eq!(circuit.devices().len(), 1);
 }
 
+const VDMOS_OP_DECK: &str = include_str!("fixtures/prepared_vdmos/op.cir");
+const VDMOS_OP_REFERENCE: &str = include_str!("fixtures/prepared_vdmos/op.expected");
+
 #[test]
-#[ignore = "requires independent ngspice 47"]
 fn actual_vdmos_operating_point_matches_c_reference() {
+    check_vdmos_reference(VDMOS_OP_REFERENCE);
+}
+
+#[test]
+#[ignore = "requires independent ngspice 47 in the test runtime"]
+fn actual_vdmos_live_reference() {
     use ngspice_conformance::ngspice::{Ngspice, Scratch};
+    let scratch = Scratch::new("vdmos-engine").unwrap();
+    std::fs::write(scratch.path().join("ref.cir"), VDMOS_OP_DECK).unwrap();
+    let result = Ngspice::pinned()
+        .unwrap()
+        .run(scratch.path(), &["-b", "ref.cir"])
+        .unwrap();
+    result.require_success("VDMOS engine").unwrap();
+    check_vdmos_reference(&String::from_utf8_lossy(&result.stdout));
+}
+
+fn check_vdmos_reference(output: &str) {
     use ngspice_rs::analysis::{bias::solve_dc, newton::NewtonOptions};
     let model = vdmos_fixture();
     let circuit = vdmos_circuit(&model, 3);
@@ -1398,15 +1417,6 @@ fn actual_vdmos_operating_point_matches_c_reference() {
     )
     .unwrap()
     .values;
-    let scratch = Scratch::new("vdmos-engine").unwrap();
-    let deck = "Public VDMOS artifact engine reference\nvd0 d0 0 .25\nvg0 g0 0 4\nvd1 d1 0 .25\nvg1 g1 0 4\nvd2 d2 0 .25\nvg2 g2 0 4\nm0 d0 g0 0 dut m=1\nm1 d1 g1 0 dut m=2\nm2 d2 g2 0 dut m=3\n.model dut vdmos(vto=3 kp=2 rd=.02 rg=1 rs=.01 rb=.015 cgs=1n cgdmin=20p cgdmax=800p cjo=100p kf=1e-15)\n.options reltol=1e-10 abstol=1e-13 vntol=1e-10\n.control\nset numdgt=17\nop\nprint i(vd0) i(vd1) i(vd2)\nquit\n.endc\n.end\n";
-    std::fs::write(scratch.path().join("ref.cir"), deck).unwrap();
-    let result = Ngspice::pinned()
-        .unwrap()
-        .run(scratch.path(), &["-b", "ref.cir"])
-        .unwrap();
-    result.require_success("VDMOS engine").unwrap();
-    let output = String::from_utf8_lossy(&result.stdout);
     for lane in 0..3 {
         let name = format!("i(vd{lane})");
         let reference: f64 = output
