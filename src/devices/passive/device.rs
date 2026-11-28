@@ -54,11 +54,10 @@ impl Device for ModelPassive {
         &mut self,
         policy: crate::devices::passive_bias::PassiveInitialization,
     ) -> SpiceResult<()> {
-        policy.check_kind(self.storage_kind().ok_or_else(|| {
+        let kind = self.storage_kind().ok_or_else(|| {
             SpiceError::circuit("prepared initialization requires reactive storage")
-        })?)?;
-        self.bias = Some(Box::new(policy));
-        Ok(())
+        })?;
+        crate::devices::passive_bias::bind(&mut self.bias, kind, policy)
     }
 
     fn has_passive_bias(&self) -> bool {
@@ -66,9 +65,7 @@ impl Device for ModelPassive {
     }
 
     fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
-        self.bias
-            .as_deref()
-            .is_some_and(|policy| policy.constrains(analysis))
+        crate::devices::passive_bias::has_active_constraints(self.bias.as_deref(), analysis)
     }
 
     fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {

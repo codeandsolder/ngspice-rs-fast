@@ -774,9 +774,11 @@ impl Device for Capacitor {
         &mut self,
         policy: crate::devices::passive_bias::PassiveInitialization,
     ) -> SpiceResult<()> {
-        policy.check_kind(crate::devices::traits::StorageKind::Capacitor)?;
-        self.bias = Some(Box::new(policy));
-        Ok(())
+        crate::devices::passive_bias::bind(
+            &mut self.bias,
+            crate::devices::traits::StorageKind::Capacitor,
+            policy,
+        )
     }
 
     fn has_passive_bias(&self) -> bool {
@@ -784,9 +786,7 @@ impl Device for Capacitor {
     }
 
     fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
-        self.bias
-            .as_deref()
-            .is_some_and(|policy| policy.constrains(analysis))
+        crate::devices::passive_bias::has_active_constraints(self.bias.as_deref(), analysis)
     }
 
     fn setup_matrix(
@@ -1053,9 +1053,11 @@ impl Device for Inductor {
         &mut self,
         policy: crate::devices::passive_bias::PassiveInitialization,
     ) -> SpiceResult<()> {
-        policy.check_kind(crate::devices::traits::StorageKind::Inductor)?;
-        self.bias = Some(Box::new(policy));
-        Ok(())
+        crate::devices::passive_bias::bind(
+            &mut self.bias,
+            crate::devices::traits::StorageKind::Inductor,
+            policy,
+        )
     }
 
     fn has_passive_bias(&self) -> bool {
@@ -1063,9 +1065,7 @@ impl Device for Inductor {
     }
 
     fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
-        self.bias
-            .as_deref()
-            .is_some_and(|policy| policy.constrains(analysis))
+        crate::devices::passive_bias::has_active_constraints(self.bias.as_deref(), analysis)
     }
 
     fn setup_matrix(
