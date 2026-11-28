@@ -285,7 +285,16 @@ fn prepared_bsim_candidates_match_fresh_elaboration_and_rollback() {
             Circuit::from_netlist_with_context(&parse(&source("w=20u m=3")), &warm).unwrap();
         let expected = snapshot(&fresh.prepare_run(), &warm).unwrap();
         assert_ne!(baseline, expected);
-        let invalid = changed
+        // The fixed context carries two explicit coordinates. Request a
+        // different valid width on the first lane and a structural failure on
+        // the second, rather than overflowing the context before preparation.
+        let invalid = warm
+            .with_instance_override(
+                width
+                    .at_source(parse_spice_number("21u").unwrap(), warm.geometry_scale)
+                    .unwrap(),
+            )
+            .unwrap()
             .with_instance_override(
                 circuit
                     .bind_instance_target("m2", "nrd")
