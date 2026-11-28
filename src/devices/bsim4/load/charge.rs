@@ -49,6 +49,7 @@ use super::{
     bias::LoadBias,
     channel::{Electrostatics, Transport},
 };
+use crate::devices::bsim_physics::{ChargeChain, channel_inversion};
 use crate::primitives::SpiceResult;
 
 /// Intrinsic terminal charges before extrinsic overlap and junction assembly.
@@ -575,59 +576,27 @@ pub(super) fn intrinsic(
             dVdseffCV_dVg = smoothing.saturation_partial * (1.0 / AbulkCV);
             dVdseffCV_dVd = smoothing.drain_partial;
             dVdseffCV_dVb = -smoothing.saturation_partial * VdsatCV * dAbulkCV_dVb / AbulkCV;
-            T0 = AbulkCV * VdseffCV;
-            T1 = 12.0 * (Vgsteff - 0.5 * T0 + 1.0e-20);
-            T2 = VdseffCV / T1;
-            T3 = T0 * T2;
-            T4 = (1.0 - 12.0 * T2 * T2 * AbulkCV);
-            T5 = (6.0 * T0 * (4.0 * Vgsteff - T0) / (T1 * T1) - 0.5);
-            T6 = 12.0 * T2 * T2 * Vgsteff;
-            qgate = CoxWL * (Vgsteff - 0.5 * VdseffCV + T3);
-            Cgg1 = CoxWL * (T4 + T5 * dVdseffCV_dVg);
-            Cgd1 = CoxWL * T5 * dVdseffCV_dVd + Cgg1 * dVgsteff_dVd;
-            Cgb1 = CoxWL * (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb) + Cgg1 * dVgsteff_dVb;
-            Cgg1 *= dVgsteff_dVg;
-            T7 = 1.0 - AbulkCV;
-            qbulk = CoxWL * T7 * (0.5 * VdseffCV - T3);
-            T4 = -T7 * (T4 - 1.0);
-            T5 = -T7 * T5;
-            T6 = -(T7 * T6 + (0.5 * VdseffCV - T3));
-            Cbg1 = CoxWL * (T4 + T5 * dVdseffCV_dVg);
-            Cbd1 = CoxWL * T5 * dVdseffCV_dVd + Cbg1 * dVgsteff_dVd;
-            Cbb1 = CoxWL * (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb) + Cbg1 * dVgsteff_dVb;
-            Cbg1 *= dVgsteff_dVg;
-            if model.xpart > 0.5 {
-                T1 = T1 + T1;
-                qsrc = -CoxWL * (0.5 * Vgsteff + 0.25 * T0 - T0 * T0 / T1);
-                T7 = (4.0 * Vgsteff - T0) / (T1 * T1);
-                T4 = -(0.5 + 24.0 * T0 * T0 / (T1 * T1));
-                T5 = -(0.25 * AbulkCV - 12.0 * AbulkCV * T0 * T7);
-                T6 = -(0.25 * VdseffCV - 12.0 * T0 * VdseffCV * T7);
-                Csg = CoxWL * (T4 + T5 * dVdseffCV_dVg);
-                Csd = CoxWL * T5 * dVdseffCV_dVd + Csg * dVgsteff_dVd;
-                Csb = CoxWL * (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb) + Csg * dVgsteff_dVb;
-                Csg *= dVgsteff_dVg;
-            } else if model.xpart < 0.5 {
-                T1 = T1 / 12.0;
-                T2 = 0.5 * CoxWL / (T1 * T1);
-                T3 = Vgsteff * (2.0 * T0 * T0 / 3.0 + Vgsteff * (Vgsteff - 4.0 * T0 / 3.0))
-                    - 2.0 * T0 * T0 * T0 / 15.0;
-                qsrc = -T2 * T3;
-                T7 = 4.0 / 3.0 * Vgsteff * (Vgsteff - T0) + 0.4 * T0 * T0;
-                T4 = -2.0 * qsrc / T1
-                    - T2 * (Vgsteff * (3.0 * Vgsteff - 8.0 * T0 / 3.0) + 2.0 * T0 * T0 / 3.0);
-                T5 = (qsrc / T1 + T2 * T7) * AbulkCV;
-                T6 = (qsrc / T1 * VdseffCV + T2 * T7 * VdseffCV);
-                Csg = (T4 + T5 * dVdseffCV_dVg);
-                Csd = T5 * dVdseffCV_dVd + Csg * dVgsteff_dVd;
-                Csb = (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb) + Csg * dVgsteff_dVb;
-                Csg *= dVgsteff_dVg;
-            } else {
-                qsrc = -0.5 * (qgate + qbulk);
-                Csg = -0.5 * (Cgg1 + Cbg1);
-                Csb = -0.5 * (Cgb1 + Cbb1);
-                Csd = -0.5 * (Cgd1 + Cbd1);
-            }
+            let [inversion, bulk, source] =
+                channel_inversion(&Vgsteff, &VdseffCV, &AbulkCV, &CoxWL, model.xpart)?;
+            let chain = ChargeChain {
+                overdrive: [dVgsteff_dVg, dVgsteff_dVd, dVgsteff_dVb],
+                drain: [
+                    dVdseffCV_dVg * dVgsteff_dVg,
+                    dVdseffCV_dVg.mul_add(dVgsteff_dVd, dVdseffCV_dVd),
+                    dVdseffCV_dVg.mul_add(dVgsteff_dVb, dVdseffCV_dVb),
+                ],
+                bulk: [0., 0., dAbulkCV_dVb],
+                relative_oxide: [0.; 3],
+            };
+            let [ig, id, ib] = chain.apply(&inversion);
+            [Cbg1, Cbd1, Cbb1] = chain.apply(&bulk);
+            [Csg, Csd, Csb] = chain.apply(&source);
+            Cgg1 = ig - Cbg1;
+            Cgd1 = id - Cbd1;
+            Cgb1 = ib - Cbb1;
+            qgate = inversion.value - bulk.value;
+            qbulk = bulk.value;
+            qsrc = source.value;
             qgate += Qac0 + Qsub0;
             qbulk -= (Qac0 + Qsub0);
             qdrn = -(qgate + qbulk + qsrc);
@@ -744,75 +713,25 @@ pub(super) fn intrinsic(
             dVdseffCV_dVg = smoothing.saturation_partial * (dVgDP_dVg / AbulkCV);
             dVdseffCV_dVd = smoothing.drain_partial;
             dVdseffCV_dVb = -smoothing.saturation_partial * VdsatCV * dAbulkCV_dVb / AbulkCV;
-            T0 = AbulkCV * VdseffCV;
-            T1 = VgDP;
-            T2 = 12.0 * (T1 - 0.5 * T0 + 1.0e-20);
-            T3 = T0 / T2;
-            T4 = 1.0 - 12.0 * T3 * T3;
-            T5 = AbulkCV * (6.0 * T0 * (4.0 * T1 - T0) / (T2 * T2) - 0.5);
-            T6 = T5 * VdseffCV / AbulkCV;
-            qgate = CoxWLcen * (T1 - T0 * (0.5 - T3));
-            QovCox = qgate / Coxeff;
-            Cgg1 = CoxWLcen * (T4 * dVgDP_dVg + T5 * dVdseffCV_dVg);
-            Cgd1 = CoxWLcen * T5 * dVdseffCV_dVd + Cgg1 * dVgsteff_dVd + QovCox * dCoxeff_dVd;
-            Cgb1 = CoxWLcen * (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb)
-                + Cgg1 * dVgsteff_dVb
-                + QovCox * dCoxeff_dVb;
-            Cgg1 = Cgg1 * dVgsteff_dVg + QovCox * dCoxeff_dVg;
-            T7 = 1.0 - AbulkCV;
-            T8 = T2 * T2;
-            T9 = 12.0 * T7 * T0 * T0 / (T8 * AbulkCV);
-            T10 = T9 * dVgDP_dVg;
-            T11 = -T7 * T5 / AbulkCV;
-            T12 = -(T9 * T1 / AbulkCV + VdseffCV * (0.5 - T0 / T2));
-            qbulk = CoxWLcen * T7 * (0.5 * VdseffCV - T0 * VdseffCV / T2);
-            QovCox = qbulk / Coxeff;
-            Cbg1 = CoxWLcen * (T10 + T11 * dVdseffCV_dVg);
-            Cbd1 = CoxWLcen * T11 * dVdseffCV_dVd + Cbg1 * dVgsteff_dVd + QovCox * dCoxeff_dVd;
-            Cbb1 = CoxWLcen * (T11 * dVdseffCV_dVb + T12 * dAbulkCV_dVb)
-                + Cbg1 * dVgsteff_dVb
-                + QovCox * dCoxeff_dVb;
-            Cbg1 = Cbg1 * dVgsteff_dVg + QovCox * dCoxeff_dVg;
-            if model.xpart > 0.5 {
-                qsrc = -CoxWLcen * (T1 / 2.0 + T0 / 4.0 - 0.5 * T0 * T0 / T2);
-                QovCox = qsrc / Coxeff;
-                T2 += T2;
-                T3 = T2 * T2;
-                T7 = -(0.25 - 12.0 * T0 * (4.0 * T1 - T0) / T3);
-                T4 = -(0.5 + 24.0 * T0 * T0 / T3) * dVgDP_dVg;
-                T5 = T7 * AbulkCV;
-                T6 = T7 * VdseffCV;
-                Csg = CoxWLcen * (T4 + T5 * dVdseffCV_dVg);
-                Csd = CoxWLcen * T5 * dVdseffCV_dVd + Csg * dVgsteff_dVd + QovCox * dCoxeff_dVd;
-                Csb = CoxWLcen * (T5 * dVdseffCV_dVb + T6 * dAbulkCV_dVb)
-                    + Csg * dVgsteff_dVb
-                    + QovCox * dCoxeff_dVb;
-                Csg = Csg * dVgsteff_dVg + QovCox * dCoxeff_dVg;
-            } else if model.xpart < 0.5 {
-                T2 = T2 / 12.0;
-                T3 = 0.5 * CoxWLcen / (T2 * T2);
-                T4 = T1 * (2.0 * T0 * T0 / 3.0 + T1 * (T1 - 4.0 * T0 / 3.0))
-                    - 2.0 * T0 * T0 * T0 / 15.0;
-                qsrc = -T3 * T4;
-                QovCox = qsrc / Coxeff;
-                T8 = 4.0 / 3.0 * T1 * (T1 - T0) + 0.4 * T0 * T0;
-                T5 = -2.0 * qsrc / T2
-                    - T3 * (T1 * (3.0 * T1 - 8.0 * T0 / 3.0) + 2.0 * T0 * T0 / 3.0);
-                T6 = AbulkCV * (qsrc / T2 + T3 * T8);
-                T7 = T6 * VdseffCV / AbulkCV;
-                Csg = T5 * dVgDP_dVg + T6 * dVdseffCV_dVg;
-                Csd = Csg * dVgsteff_dVd + T6 * dVdseffCV_dVd + QovCox * dCoxeff_dVd;
-                Csb = Csg * dVgsteff_dVb
-                    + T6 * dVdseffCV_dVb
-                    + T7 * dAbulkCV_dVb
-                    + QovCox * dCoxeff_dVb;
-                Csg = Csg * dVgsteff_dVg + QovCox * dCoxeff_dVg;
-            } else {
-                qsrc = -0.5 * qgate;
-                Csg = -0.5 * Cgg1;
-                Csd = -0.5 * Cgd1;
-                Csb = -0.5 * Cgb1;
-            }
+            let [inversion, bulk, source] =
+                channel_inversion(&VgDP, &VdseffCV, &AbulkCV, &CoxWLcen, model.xpart)?;
+            let chain = ChargeChain {
+                overdrive: [dVgsteff_dVg, dVgsteff_dVd, dVgsteff_dVb]
+                    .map(|slope| slope * dVgDP_dVg),
+                drain: [
+                    dVdseffCV_dVg * dVgsteff_dVg,
+                    dVdseffCV_dVg.mul_add(dVgsteff_dVd, dVdseffCV_dVd),
+                    dVdseffCV_dVg.mul_add(dVgsteff_dVb, dVdseffCV_dVb),
+                ],
+                bulk: [0., 0., dAbulkCV_dVb],
+                relative_oxide: [dCoxeff_dVg, dCoxeff_dVd, dCoxeff_dVb].map(|slope| slope / Coxeff),
+            };
+            [Cgg1, Cgd1, Cgb1] = chain.apply(&inversion);
+            [Cbg1, Cbd1, Cbb1] = chain.apply(&bulk);
+            [Csg, Csd, Csb] = chain.apply(&source);
+            qgate = inversion.value;
+            qbulk = bulk.value;
+            qsrc = source.value;
             qgate += Qac0 + Qsub0 - qbulk;
             qbulk -= (Qac0 + Qsub0);
             qdrn = -(qgate + qbulk + qsrc);

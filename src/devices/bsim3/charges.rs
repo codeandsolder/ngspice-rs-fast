@@ -26,7 +26,8 @@ use super::defaults::ModelDefaults;
 use super::setup::InstanceSetup;
 use super::temperature::TemperatureModel;
 use crate::devices::bsim_physics::{
-    JunctionCapacitance, depletion, depletion_charge, overlap, smooth_positive,
+    ChargeChain, JunctionCapacitance, channel_inversion, depletion, depletion_charge, overlap,
+    smooth_positive,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -416,129 +417,30 @@ impl ChargeModel<'_> {
             dvdseff_cv_dvb = 0.0;
         }
 
-        // Gate charge and its derivatives.
-        let t0 = abulk_cv * vdseff_cv;
-        let t1 = vgdp;
-        let t2 = 12.0 * (0.5f64.mul_add(-t0, t1) + 1.0e-20);
-        let t3 = t0 / t2;
-        let t4 = (12.0 * t3).mul_add(-t3, 1.0);
-        let t5 = abulk_cv * (6.0 * t0 * 4.0f64.mul_add(t1, -t0) / (t2 * t2) - 0.5);
-        let t6 = t5 * vdseff_cv / abulk_cv;
-
-        let qgate = cox_wl_cen * t0.mul_add(-(0.5 - t3), t1);
+        let [inversion, bulk, source] = channel_inversion(
+            &vgdp,
+            &vdseff_cv,
+            &abulk_cv,
+            &cox_wl_cen,
+            m.values.xpart.value,
+        )?;
+        let chain = ChargeChain {
+            overdrive: [dvgsteff_dvg, dvgsteff_dvd, dvgsteff_dvb].map(|slope| dvgdp_dvg * slope),
+            drain: [
+                dvdseff_cv_dvg * dvgsteff_dvg,
+                dvdseff_cv_dvg.mul_add(dvgsteff_dvd, dvdseff_cv_dvd),
+                dvdseff_cv_dvg.mul_add(dvgsteff_dvb, dvdseff_cv_dvb),
+            ],
+            bulk: [0., 0., dabulk_cv_dvb],
+            relative_oxide: [dcoxeff_dvg, dcoxeff_dvd, dcoxeff_dvb].map(|slope| slope / coxeff),
+        };
+        let [cgg1, cgd1, cgb1] = chain.apply(&inversion);
+        let [cbg1, cbd1, cbb1] = chain.apply(&bulk);
+        let [csg, csd, mut csb] = chain.apply(&source);
+        let qgate = inversion.value;
         let qinoi = qgate;
-        let qov_cox = qgate / coxeff;
-        let mut cgg1 = cox_wl_cen * t5.mul_add(dvdseff_cv_dvg, t4 * dvgdp_dvg);
-        let cgd1 = qov_cox.mul_add(
-            dcoxeff_dvd,
-            cgg1.mul_add(dvgsteff_dvd, cox_wl_cen * t5 * dvdseff_cv_dvd),
-        );
-        let cgb1 = qov_cox.mul_add(
-            dcoxeff_dvb,
-            cgg1.mul_add(
-                dvgsteff_dvb,
-                cox_wl_cen * t6.mul_add(dabulk_cv_dvb, t5 * dvdseff_cv_dvb),
-            ),
-        );
-        cgg1 = qov_cox.mul_add(dcoxeff_dvg, cgg1 * dvgsteff_dvg);
-
-        // Bulk charge and its derivatives.
-        let t7 = 1.0 - abulk_cv;
-        let t8 = t2 * t2;
-        let t9 = 12.0 * t7 * t0 * t0 / (t8 * abulk_cv);
-        let t10 = t9 * dvgdp_dvg;
-        let t11 = -t7 * t5 / abulk_cv;
-        let t12 = -f64::mul_add(vdseff_cv, 0.5 - t0 / t2, t9 * t1 / abulk_cv);
-
-        let qbulk = cox_wl_cen * t7 * 0.5f64.mul_add(vdseff_cv, -(t0 * vdseff_cv / t2));
-        let qov_cox = qbulk / coxeff;
-        let mut cbg1 = cox_wl_cen * t11.mul_add(dvdseff_cv_dvg, t10);
-        let cbd1 = qov_cox.mul_add(
-            dcoxeff_dvd,
-            cbg1.mul_add(dvgsteff_dvd, cox_wl_cen * t11 * dvdseff_cv_dvd),
-        );
-        let cbb1 = qov_cox.mul_add(
-            dcoxeff_dvb,
-            cbg1.mul_add(
-                dvgsteff_dvb,
-                cox_wl_cen * t12.mul_add(dabulk_cv_dvb, t11 * dvdseff_cv_dvb),
-            ),
-        );
-        cbg1 = qov_cox.mul_add(dcoxeff_dvg, cbg1 * dvgsteff_dvg);
-
-        // Source charge partition (XPART: > 0.5 = 0/100, < 0.5 = 40/60).
-        let xpart = m.values.xpart.value;
-        let (qsrc, csg, csd, mut csb);
-        if xpart > 0.5 {
-            let qsrc0 = -cox_wl_cen * (t1 / 2.0 + t0 / 4.0 - 0.5 * t0 * t0 / t2);
-            let qov_cox = qsrc0 / coxeff;
-            let t2 = t2 + t2;
-            let t3 = t2 * t2;
-            let t7p = -(0.25 - 12.0 * t0 * 4.0f64.mul_add(t1, -t0) / t3);
-            let t4p = -(0.5 + 24.0 * t0 * t0 / t3) * dvgdp_dvg;
-            let t5p = t7p * abulk_cv;
-            let t6p = t7p * vdseff_cv;
-            let csg0 = cox_wl_cen * t5p.mul_add(dvdseff_cv_dvg, t4p);
-            let csd0 = qov_cox.mul_add(
-                dcoxeff_dvd,
-                csg0.mul_add(dvgsteff_dvd, cox_wl_cen * t5p * dvdseff_cv_dvd),
-            );
-            let csb0 = qov_cox.mul_add(
-                dcoxeff_dvb,
-                csg0.mul_add(
-                    dvgsteff_dvb,
-                    cox_wl_cen * t6p.mul_add(dabulk_cv_dvb, t5p * dvdseff_cv_dvb),
-                ),
-            );
-            let csg1 = qov_cox.mul_add(dcoxeff_dvg, csg0 * dvgsteff_dvg);
-            qsrc = qsrc0;
-            csg = csg1;
-            csd = csd0;
-            csb = csb0;
-        } else if xpart < 0.5 {
-            // 40/60 partition, C's default (`b3set.c` xpart = 0).
-            let t2 = t2 / 12.0;
-            let t3 = 0.5 * cox_wl_cen / (t2 * t2);
-            let t4 = f64::mul_add(
-                t1,
-                f64::mul_add(t1, t1 - 4.0 * t0 / 3.0, 2.0 * t0 * t0 / 3.0),
-                -(2.0 * t0 * t0 * t0 / 15.0),
-            );
-            let qsrc0 = -t3 * t4;
-            let qov_cox = qsrc0 / coxeff;
-            let t8 = (0.4 * t0).mul_add(t0, 4.0 / 3.0 * t1 * (t1 - t0));
-            let t5 = t3.mul_add(
-                -f64::mul_add(
-                    t1,
-                    3.0f64.mul_add(t1, -(8.0 * t0 / 3.0)),
-                    2.0 * t0 * t0 / 3.0,
-                ),
-                -2.0 * qsrc0 / t2,
-            );
-            let t6 = abulk_cv * t3.mul_add(t8, qsrc0 / t2);
-            let t7 = t6 * vdseff_cv / abulk_cv;
-            let csg0 = t6.mul_add(dvdseff_cv_dvg, t5 * dvgdp_dvg);
-            let csd0 =
-                qov_cox.mul_add(dcoxeff_dvd, t6.mul_add(dvdseff_cv_dvd, csg0 * dvgsteff_dvd));
-            let csb0 = qov_cox.mul_add(
-                dcoxeff_dvb,
-                t7.mul_add(
-                    dabulk_cv_dvb,
-                    t6.mul_add(dvdseff_cv_dvb, csg0 * dvgsteff_dvb),
-                ),
-            );
-            let csg1 = qov_cox.mul_add(dcoxeff_dvg, csg0 * dvgsteff_dvg);
-            qsrc = qsrc0;
-            csg = csg1;
-            csd = csd0;
-            csb = csb0;
-        } else {
-            let qsrc0 = -0.5 * qgate;
-            qsrc = qsrc0;
-            csg = -0.5 * cgg1;
-            csd = -0.5 * cgd1;
-            csb = -0.5 * cgb1;
-        }
+        let qbulk = bulk.value;
+        let qsrc = source.value;
 
         // Fold the accumulation/subthreshold charges into gate and bulk.
         let qgate = qgate + qac0 + qsub0 - qbulk;
