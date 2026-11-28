@@ -1265,3 +1265,6 @@ impl<K: Kernel> Device for PreparedDevice<K> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod ownership_tests;

@@ -494,7 +494,18 @@ impl<'a> PreparedRun<'a> {
         #[cfg(test)]
         preparation_metrics::record(|counts| counts.contexts += 1);
         context.validate(&MODEL_CONTEXT_LOCATION)?;
-        let mut replacements = self.circuit.replacements(context)?;
+        let replacements = self.circuit.replacements(context)?;
+        self.install_point(context, replacements, std::cell::OnceCell::new())?;
+        std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
+            .map_err(|_| SpiceError::circuit("missing prepared model context"))
+    }
+
+    fn install_point(
+        &self,
+        context: &ModelContext,
+        mut replacements: Vec<(usize, Box<dyn Device>)>,
+        mutual: std::cell::OnceCell<PreparedMutualTerms>,
+    ) -> SpiceResult<()> {
         let prepared_batches = {
             let previous = self.point.borrow();
             self.prepare_instances(context, &mut replacements, previous.as_ref())?;
@@ -522,11 +533,10 @@ impl<'a> PreparedRun<'a> {
             context: *context,
             context_valid: true,
             replacements,
-            mutual: std::cell::OnceCell::new(),
+            mutual,
             prepared_batches: std::cell::RefCell::new(prepared_batches),
         }));
-        std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
-            .map_err(|_| SpiceError::circuit("missing prepared model context"))
+        Ok(())
     }
 
     fn prepare_instances(
@@ -3535,7 +3545,9 @@ impl Circuit {
     /// The replacement preserves terminals, branch rows and device state
     /// layout so finalized topology and symbolic matrices remain valid.
     pub(crate) fn reseed_stochastic_sources(&mut self, identity: u64) {
-        self.invalidate_prepared_context();
+        if !self.bindings.stochastic_sources.is_empty() {
+            self.invalidate_prepared_context();
+        }
         for &ordinal in &self.bindings.stochastic_sources {
             if let Some(source) = self.devices.get_mut(ordinal)
                 && let Some(replacement) = source.device.with_stochastic_candidate(identity)
@@ -3555,7 +3567,6 @@ impl Circuit {
     /// changes its candidate. Preserve finalized bindings, sparse pattern and
     /// prepared names; only independent simulation state is invalidated.
     pub(crate) fn clear_candidate_analysis_state(&mut self) {
-        self.invalidate_prepared_context();
         self.runtime.continuation_diagonal.set(0.);
         self.runtime.completed.clear();
         self.runtime.carried_state.get_mut().take();
@@ -3565,12 +3576,10 @@ impl Circuit {
         *self.runtime.initial_revision.get_mut() = Arc::new(());
     }
 
-    /// Validate an arbitrary sparse numeric candidate overlay transactionally.
-    /// This uses the same ordered replacement construction, physical setters
-    /// and mutual-coupling checks as an actual prepared simulation load, but
-    /// does not publish any value on failure. The caller owns the resulting
-    /// overlay and commits it to its exclusive circuit after validation.
-    pub(crate) fn validate_candidate_overrides(
+    /// Prepare a complete proposed overlay before changing the published
+    /// override list. Ordinary replacements and mutual terms validate first;
+    /// the prepared plan then stages all physical lanes as one transaction.
+    fn prepare_candidate_overrides(
         &self,
         context: &ModelContext,
         overrides: &[CandidateNumericOverride],
@@ -3579,20 +3588,41 @@ impl Circuit {
         preparation_metrics::record(|counts| counts.replacement_validations += 1);
         context.validate(&MODEL_CONTEXT_LOCATION)?;
         let replacements = self.replacements_with_overrides(context, overrides)?;
-        self.mutual_terms_with_replacements(context, &replacements)?;
+        let mutual = self.mutual_terms_with_replacements(context, &replacements)?;
         let inputs = PreparedRun::dc_device_context(context);
         for (_, device) in &replacements {
-            device.validate_dc_inputs(&inputs)?;
+            if device.prepared_batch_key().is_none() {
+                device.validate_dc_inputs(&inputs)?;
+            }
+        }
+        if !self.bindings.prepared_devices.is_empty() {
+            let run = self.prepare_run();
+            run.install_point(context, replacements, std::cell::OnceCell::from(mutual))?;
         }
         Ok(())
     }
 
-    /// Commit already-validated worker-owned numeric candidates. An exclusive
-    /// circuit borrow rules out stale prepared analysis scopes during update.
-    pub(crate) fn set_candidate_overrides(&mut self, overrides: Vec<CandidateNumericOverride>) {
-        self.invalidate_prepared_context();
+    /// Validate and publish an optimizer candidate in one transaction.
+    /// The next analysis leases the physical preparation used by validation,
+    /// rather than preparing an independent copy of changed instances.
+    pub(crate) fn commit_candidate_overrides(
+        &mut self,
+        context: &ModelContext,
+        overrides: Vec<CandidateNumericOverride>,
+    ) -> SpiceResult<()> {
+        self.prepare_candidate_overrides(context, &overrides)?;
         self.runtime.candidate_overrides = overrides;
         self.runtime.control_overrides.clear();
+        self.clear_candidate_analysis_state();
+        Ok(())
+    }
+
+    /// Discard the baseline overlay when a structural candidate becomes active.
+    pub(crate) fn reset_candidate_overrides(&mut self) {
+        self.invalidate_prepared_context();
+        self.runtime.candidate_overrides.clear();
+        self.runtime.control_overrides.clear();
+        self.clear_candidate_analysis_state();
     }
 
     /// Validate and publish persistent script edits over the current candidate.
@@ -3604,6 +3634,7 @@ impl Circuit {
         edits: &[InstanceOverride],
     ) -> SpiceResult<()> {
         if edits.is_empty() {
+            self.invalidate_prepared_context();
             self.runtime.control_overrides.clear();
             self.clear_candidate_analysis_state();
             return Ok(());
@@ -3626,7 +3657,7 @@ impl Circuit {
         let mut context = *context;
         context.resistor_overrides.fill(None);
         context.instance_overrides.fill(None);
-        self.validate_candidate_overrides(&context, &combined)?;
+        self.prepare_candidate_overrides(&context, &combined)?;
         self.runtime.control_overrides = combined;
         self.clear_candidate_analysis_state();
         Ok(())

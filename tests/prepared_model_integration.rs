@@ -2389,3 +2389,64 @@ fn vdmos_candidate_preparation_benchmark() {
         changed[15], all[15]
     );
 }
+
+#[test]
+fn prepared_tiles_rebuild_after_membership_and_artifact_edits() {
+    let (mut circuit, preparations) = counted_circuit();
+    let context = ModelContext::default();
+    let old_target = circuit.bind_instance_target("m3", "g").unwrap();
+    let original = counted_load(&circuit.prepare_run(), &context).unwrap();
+    assert_eq!(original.len(), 129);
+    let artifact = Artifact::new(
+        descriptor(Capability::Computed),
+        CountingKernel {
+            preparations: Arc::clone(&preparations),
+        },
+    )
+    .unwrap();
+    // Same model schema but distinct exact artifact: old tile membership is
+    // invalid, even though dimensions and names can remain unchanged.
+    let node = circuit.nodes().get("n3").unwrap();
+    circuit
+        .replace_device(
+            3,
+            Box::new(
+                PreparedDevice::new(
+                    &artifact,
+                    "m3",
+                    vec![node, NodeId::GROUND],
+                    &[2e-3, 2e-4, 1e-6, 2e-7],
+                    InstanceTemperature::circuit(27.),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    circuit.finalize().unwrap();
+    let stale = context
+        .with_instance_override(old_target.at(3e-3).unwrap())
+        .unwrap();
+    assert!(counted_load(&circuit.prepare_run(), &stale).is_err());
+    let rebuilt = counted_load(&circuit.prepare_run(), &context).unwrap();
+    let row = circuit.unknowns().node_row(node).unwrap();
+    assert_eq!(
+        rebuilt
+            .iter()
+            .zip(&original)
+            .filter(|(a, b)| a != b)
+            .count(),
+        1
+    );
+    assert!(f64::from_bits(rebuilt[row]) > f64::from_bits(original[row]));
+    let target = circuit.bind_instance_target("m3", "g").unwrap();
+    let changed = context
+        .with_instance_override(target.at(4e-3).unwrap())
+        .unwrap();
+    let before = preparations.load(std::sync::atomic::Ordering::Relaxed);
+    let next = counted_load(&circuit.prepare_run(), &changed).unwrap();
+    assert!(f64::from_bits(next[row]) > f64::from_bits(rebuilt[row]));
+    assert_eq!(
+        preparations.load(std::sync::atomic::Ordering::Relaxed),
+        before + 1
+    );
+}
