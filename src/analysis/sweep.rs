@@ -933,7 +933,22 @@ struct SweepSolver<'a> {
 }
 
 impl SweepSolver<'_> {
+    /// A sweep consumes only the accepted iterate and its trial. Recover
+    /// the unused next iterate before handing the point to its accept hooks.
     fn solve(
+        &self,
+        point: &PointContext<'_>,
+        previous: &Vector,
+        history: &crate::devices::StateHistory,
+        first: bool,
+        workspace: &mut crate::analysis::newton::CircuitNewtonWorkspace,
+    ) -> SpiceResult<(Vector, crate::devices::TrialState)> {
+        let solution = self.solve_newton(point, previous, history, first, workspace)?;
+        workspace.recycle_next(solution.next);
+        Ok((solution.values, solution.trial))
+    }
+
+    fn solve_newton(
         &self,
         point: &PointContext<'_>,
         previous: &Vector,
@@ -1099,10 +1114,8 @@ fn run_fixed(
             let model = point_context.model;
             let overrides = point_context.source_values();
             // dctrcurv.c runs NIiter at every point, linear circuits included.
-            let solution =
+            let (x, trial) =
                 solver.solve(&point_context, &previous, &history, first, &mut workspace)?;
-            let x = solution.values;
-            let trial = solution.trial;
             let first_point = std::mem::replace(&mut first, false);
             // Only a solved point is accepted; a failure above returns before
             // any accept hook runs for it. A nonlinear point's state becomes the
@@ -1148,7 +1161,6 @@ fn run_fixed(
                 sink.point(&point)?;
             }
             workspace.recycle_current(std::mem::replace(&mut previous, x));
-            workspace.recycle_next(solution.next);
         }
     }
     sink.end()

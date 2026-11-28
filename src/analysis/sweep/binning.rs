@@ -333,9 +333,7 @@ pub(super) fn run(
                 warm_settings: warm.as_ref(),
                 nodes: &nodes,
             };
-            let solution = solver.solve(&point, &previous, history, first, &mut workspace)?;
-            let x = solution.values;
-            let trial = solution.trial;
+            let (x, trial) = solver.solve(&point, &previous, history, first, &mut workspace)?;
             let load = crate::devices::LoadRequest {
                 mode: crate::devices::AnalysisMode::DcSweep,
                 solution: &x,
@@ -368,7 +366,6 @@ pub(super) fn run(
             }
             emit(sink, &result, &row, selected.as_deref(), &mut projected)?;
             workspace.recycle_current(std::mem::replace(&mut previous, x));
-            workspace.recycle_next(solution.next);
         }
     }
     sink.end()

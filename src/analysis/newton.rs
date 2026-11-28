@@ -629,8 +629,9 @@ impl<T> LoadStorage<T> {
     }
 }
 
-/// Persistent numerical scratch for a single circuit/analysis driver. A
-/// changed matrix pattern is recognized before reusing any bound stamps;
+/// Persistent numerical scratch for a single circuit/analysis driver.
+///
+/// A changed matrix pattern is recognized before reusing any bound stamps;
 /// state reuse is checked independently against accepted history revision.
 #[derive(Default)]
 pub struct CircuitNewtonWorkspace {

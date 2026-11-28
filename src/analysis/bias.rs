@@ -875,7 +875,7 @@ impl OperatingPointStart {
     }
 
     /// Solve from the original node hints or the previous converged point.
-    /// The phase policy remains CKTop in both cases.
+    /// The phase policy remains `CKTop` in both cases.
     pub(super) fn solve(
         &self,
         prepared: &PreparedRun<'_>,
