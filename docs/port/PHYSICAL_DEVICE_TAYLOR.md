@@ -141,7 +141,34 @@ not determine higher derivatives. The ABI work is tracked in
 
 Conservative BSIM charge modes and their exact multivariate kernels are
 tracked in [#256](https://github.com/codeandsolder/ngspice-rs-fast/issues/256).
-Continuous switch and prepared PWL-resistor branch laws are tracked in
+## Continuous switches and prepared PWL resistors
+
+The memoryless continuous switch and PWL-resistor kernels implement
 [#257](https://github.com/codeandsolder/ngspice-rs-fast/issues/257).
-These are separate implementation and qualification obligations, not
-claims that their current scalar models support high-index derivatives.
+Native XSPICE P- and A-switches share the local resistance germ between
+scalar and Taylor evaluation. Linear, logarithmic and exponential laws
+retain the signed normalized control coordinate and the actual bounded
+or extrapolated resistance law, including its floor. The output current
+and control Jacobian follow the physical product of terminal voltage
+and conductance. Input conductance and ideal current-sense branch
+equations retain their ordinary MNA incidence.
+
+The explicit LTspice cubic and arctangent laws share scalar and
+Taylor arithmetic, including directional offsets, hard current
+limiting and the actual fixed ten-step epsilon-join iteration.
+Physical derivatives are not the distinct reference AC chord or
+implicit join sensitivity. Optional series inductance contributes
+its own branch flux and voltage equation. Discrete switching remains
+outside the memoryless contract.
+
+Voltage- and current-defined prepared PWL resistors use the actual
+independent coordinate jet to select the local affine equation.
+Initial segment hints are advisory; the candidate segment and its
+neighboring physical boundaries participate in event localization.
+For continuous switches, endpoint, floor, limiting and directional
+joins likewise expose their active local guards. At a join, the first
+nonzero time-series coefficient determines the one-sided germ.
+
+Integration tests qualify derivative-array trajectories across these
+joins, including named and physical current-sense ports, signed
+terminal incidence, and negative-slope PWL branches.
