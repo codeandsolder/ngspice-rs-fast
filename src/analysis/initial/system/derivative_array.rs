@@ -561,6 +561,7 @@ pub(in crate::analysis::initial) struct RightLimit {
     pub order_hint: usize,
     pub guards: crate::devices::physical_dae::BranchTrace,
     pub candidate_states: Vec<(usize, Real)>,
+    pub terminal_currents: crate::devices::physical_dae::PhysicalTerminalCurrents,
 }
 
 #[derive(Clone, Copy)]
@@ -871,6 +872,7 @@ fn solve(
                 order_hint: state.len().saturating_sub(3).max(2),
                 guards: point.guards.unwrap_or_default(),
                 candidate_states: point.candidate_states,
+                terminal_currents: point.terminal_currents,
             })));
         }
     }

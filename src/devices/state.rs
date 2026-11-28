@@ -157,6 +157,7 @@ pub struct StateHistory {
     binding: Option<StateBinding>,
     revision: Arc<()>,
     accepted: Vec<Arc<[Real]>>,
+    physical_currents: Option<Arc<super::physical_dae::PhysicalTerminalCurrents>>,
     /// C's `CKTstate0` as the previous analysis of the deck left it (C runs
     /// every analysis on the same state vectors), read through
     /// [`DeviceState::carried`].
@@ -174,6 +175,13 @@ struct StateBinding {
 }
 
 impl StateHistory {
+    pub(super) fn physical_currents(&self, device: usize) -> Option<&[Real]> {
+        self.physical_currents
+            .as_deref()?
+            .get(&device)
+            .map(Vec::as_slice)
+    }
+
     /// An empty history for `len` state slots.
     #[must_use = "the new history owns the accepted and trial state storage"]
     pub fn new(len: usize) -> Self {
@@ -182,6 +190,7 @@ impl StateHistory {
             binding: None,
             revision: Arc::new(()),
             accepted: Vec::new(),
+            physical_currents: None,
             carried: None,
             delays: BTreeMap::new(),
         }
@@ -200,6 +209,7 @@ impl StateHistory {
             binding: Some(StateBinding { topology, rows }),
             revision,
             accepted: Vec::new(),
+            physical_currents: None,
             carried,
             delays: delays.into_iter().collect(),
         }
@@ -409,6 +419,7 @@ impl StateHistory {
                 mode,
                 previous: previous.map(|previous| Arc::clone(&previous.values)),
                 nonconvergent: false,
+                physical_currents: None,
                 patches: previous.map_or_default(|previous| previous.patches.clone()),
             };
         };
@@ -426,6 +437,7 @@ impl StateHistory {
         reused.mode = mode;
         reused.previous = previous.map(|previous| Arc::clone(&previous.values));
         reused.nonconvergent = false;
+        reused.physical_currents = None;
         reused.patches = previous.map_or_default(|previous| previous.patches.clone());
         reused
     }
@@ -480,6 +492,7 @@ impl StateHistory {
     }
 
     fn commit_validated(&mut self, trial: TrialState, publication: HistoryPublication) {
+        self.physical_currents = trial.physical_currents;
         match publication {
             HistoryPublication::Initialize => self.accepted.resize(ACCEPTED_DEPTH, trial.values),
             HistoryPublication::Rotate => {
@@ -567,6 +580,7 @@ impl StateHistory {
     /// restarts.
     pub fn clear(&mut self) {
         self.accepted.clear();
+        self.physical_currents = None;
         self.revision = Arc::new(());
         for history in self.delays.values_mut() {
             history.clear();
@@ -782,6 +796,7 @@ pub struct TrialState {
     mode: LoadMode,
     previous: Option<Arc<[Real]>>,
     nonconvergent: bool,
+    physical_currents: Option<Arc<super::physical_dae::PhysicalTerminalCurrents>>,
     /// `MODEINITTRAN` writes into `CKTstate1` (absolute slot, value), seen by
     /// the later loads of the same solve and applied when the trial is
     /// committed ([`DeviceState::patch_state1`]).
@@ -789,6 +804,20 @@ pub struct TrialState {
 }
 
 impl TrialState {
+    pub(super) fn physical_currents(&self, device: usize) -> Option<&[Real]> {
+        self.physical_currents
+            .as_deref()?
+            .get(&device)
+            .map(Vec::as_slice)
+    }
+
+    pub(super) fn set_physical_currents(
+        &mut self,
+        currents: super::physical_dae::PhysicalTerminalCurrents,
+    ) {
+        self.physical_currents = (!currents.is_empty()).then(|| Arc::new(currents));
+    }
+
     /// Once this trial's load and device convergence check have completed,
     /// later Newton iterations need only its values and staged state1 patches.
     /// Release its predecessor snapshot to make that older, discarded state

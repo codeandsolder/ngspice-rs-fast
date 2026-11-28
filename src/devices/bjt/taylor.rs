@@ -281,6 +281,14 @@ impl Bjt {
             controls[SUB].input(SUB, context)?,
             controls[BB].input(BB, context)?,
         ];
+        for (index, slot) in [
+            (BE, slot::VBE),
+            (BC, slot::VBC),
+            (SUB, slot::VSUB),
+            (BX, slot::VBX),
+        ] {
+            context.candidate_state(slot, voltages[index].value.value())?;
+        }
         let point = thermal.taylor_point(
             &voltages,
             context.model.gmin,

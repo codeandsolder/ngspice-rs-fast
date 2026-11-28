@@ -120,6 +120,7 @@ pub(super) struct ObservationPlan {
     topology: Option<TopologyId>,
     queries: Vec<Observation>,
     loads: Vec<TerminalLayout>,
+    load_by_device: BTreeMap<usize, usize>,
 }
 
 /// Physical terminal rows in first-port order, with a separate lookup index
@@ -284,6 +285,17 @@ impl PointLoads<'_, '_> {
         slot: usize,
         name: &str,
     ) -> SpiceResult<Option<Real>> {
+        let captured = self.previous.map_or_else(
+            || self.request.history.physical_currents(layout.device),
+            |trial| trial.physical_currents(layout.device),
+        );
+        if let Some(currents) = captured {
+            return currents
+                .get(slot)
+                .copied()
+                .map(Some)
+                .ok_or_else(|| gap(name));
+        }
         let device = self.point.device(self.circuit, layout.device);
         let states = self
             .circuit
@@ -530,7 +542,14 @@ impl ObservationPlan {
                 selector,
             });
         }
+        plan.load_by_device = load_by_device;
         Ok(plan)
+    }
+
+    pub(super) fn capture_rows(&self, device: usize) -> Option<&[(usize, usize)]> {
+        self.load_by_device
+            .get(&device)
+            .map(|&load| self.loads[load].by_row.as_slice())
     }
 
     fn validate(&self, circuit: &Circuit) -> SpiceResult<()> {

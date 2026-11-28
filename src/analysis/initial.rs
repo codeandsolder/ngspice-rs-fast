@@ -1123,6 +1123,7 @@ pub(super) struct DerivativePoint {
     pub canonical: Vec<(usize, Real)>,
     pub order_hint: usize,
     pub guards: crate::devices::physical_dae::BranchTrace,
+    pub terminal_currents: crate::devices::physical_dae::PhysicalTerminalCurrents,
 }
 
 /// Calculate the right-limit state and all declared initial storage rates.
@@ -1197,6 +1198,7 @@ pub(super) fn consistent_derivative_start(
             solution: right.state,
             order_hint: right.order_hint,
             guards: right.guards,
+            terminal_currents: right.terminal_currents,
             canonical,
         })
     })();
@@ -1247,6 +1249,7 @@ pub(super) fn consistent_derivative_step(
         solution: right.state,
         order_hint: right.order_hint,
         guards: right.guards,
+        terminal_currents: right.terminal_currents,
         canonical,
     }))
 }
@@ -1284,6 +1287,7 @@ pub(super) fn consistent_derivative_event(
         solution: right.state,
         order_hint: right.order_hint,
         guards: right.guards,
+        terminal_currents: right.terminal_currents,
         canonical,
     })
 }

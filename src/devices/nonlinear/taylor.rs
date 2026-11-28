@@ -375,6 +375,7 @@ impl Diode {
                 .collect()
         };
         context.record_charge(super::DIODE_CHARGE_SLOT, &charge.value, gradients)?;
+        context.candidate_state(super::DIODE_VOLTAGE_SLOT, v.value())?;
         let external = context.unknowns.node_row(self.terminals[0]);
         if external != rows[0] {
             for (row, sign) in [external, rows[0]].into_iter().zip([1., -1.]) {

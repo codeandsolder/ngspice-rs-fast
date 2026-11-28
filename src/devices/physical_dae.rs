@@ -336,6 +336,7 @@ pub struct PhysicalDaeTaylor {
     pub capacitance: Vec<SparseMatrix>,
     pub(crate) guards: Option<BranchTrace>,
     pub(crate) candidate_states: Vec<(usize, Real)>,
+    pub(crate) terminal_currents: PhysicalTerminalCurrents,
     pub(crate) storage: BTreeMap<usize, LocalChargeTaylor>,
     storage_coefficients: usize,
 }
@@ -354,6 +355,7 @@ impl PhysicalDaeTaylor {
             capacitance: Vec::with_capacity(state.len()),
             guards: None,
             candidate_states: Vec::new(),
+            terminal_currents: BTreeMap::new(),
             storage: BTreeMap::new(),
             storage_coefficients: 0,
         };
@@ -460,6 +462,50 @@ fn absolute_gradients<const N: usize>(
         .collect()
 }
 
+/// Currents at the externally bound observation ports of the final germ.
+pub(crate) type PhysicalTerminalCurrents = BTreeMap<usize, Vec<Real>>;
+
+/// Accumulate only the requested device's external rows, directly from the
+/// physical stamp. Keep F and normalized Q' separate until the final sum.
+pub(super) struct TerminalCapture<'a> {
+    rows: &'a [(usize, usize)],
+    residual: Vec<Real>,
+    charge_rate: Vec<Real>,
+}
+
+impl<'a> TerminalCapture<'a> {
+    pub(super) fn new(rows: &'a [(usize, usize)]) -> Self {
+        Self {
+            rows,
+            residual: vec![0.; rows.len()],
+            charge_rate: vec![0.; rows.len()],
+        }
+    }
+
+    fn add(&mut self, row: usize, value: Real, charge: bool) {
+        if let Ok(index) = self.rows.binary_search_by_key(&row, |&(row, _)| row) {
+            let slot = self.rows[index].1;
+            if charge {
+                self.charge_rate[slot] += value;
+            } else {
+                self.residual[slot] += value;
+            }
+        }
+    }
+
+    fn finish(mut self, scale: Real) -> SpiceResult<Vec<Real>> {
+        for (residual, charge) in self.residual.iter_mut().zip(self.charge_rate) {
+            *residual += charge / scale;
+        }
+        let ground = -self.residual.iter().sum::<Real>();
+        self.residual.push(ground);
+        if self.residual.iter().any(|value| !value.is_finite()) {
+            return Err(SpiceError::circuit("nonfinite physical terminal current"));
+        }
+        Ok(self.residual)
+    }
+}
+
 /// Device-local bindings and accumulation target for exact physical jets.
 /// Construction is restricted to the prepared physical DAE evaluator.
 pub struct TaylorContext<'a> {
@@ -472,9 +518,21 @@ pub struct TaylorContext<'a> {
     pub(crate) state: &'a [Vector],
     pub(crate) time: &'a crate::maths::taylor::Jet,
     pub(crate) output: &'a mut PhysicalDaeTaylor,
+    pub(super) terminal_capture: Option<TerminalCapture<'a>>,
 }
 
 impl TaylorContext<'_> {
+    pub(super) fn finish_terminal_capture(&mut self) -> SpiceResult<()> {
+        if let Some(capture) = self.terminal_capture.take() {
+            // Left germs have reversed time coefficients and a negative
+            // normalization scale; their physical derivative is unchanged.
+            let scale = self.time.coefficients().get(1).copied().unwrap_or(1.);
+            let currents = capture.finish(scale)?;
+            self.output.terminal_currents.insert(self.device, currents);
+        }
+        Ok(())
+    }
+
     pub(crate) fn constitutive_guards(&mut self) -> ConstitutiveGuards<'_> {
         ConstitutiveGuards {
             trace: self.output.guards.as_mut(),
@@ -522,6 +580,9 @@ impl TaylorContext<'_> {
         scale: Real,
     ) -> SpiceResult<()> {
         if let Some(row) = row {
+            if let Some(capture) = &mut self.terminal_capture {
+                capture.add(row, scale * jet.value(), false);
+            }
             for (vector, &value) in self.output.residual.iter_mut().zip(jet.coefficients()) {
                 vector.add_to(row, scale * value)?;
             }
@@ -619,6 +680,14 @@ impl TaylorContext<'_> {
         };
         for (row, sign) in rows.into_iter().zip([1., -1.]) {
             if let Some(row) = row {
+                if let Some(capture) = &mut self.terminal_capture {
+                    let coefficient = value
+                        .coefficients()
+                        .get(usize::from(charge))
+                        .copied()
+                        .unwrap_or(0.);
+                    capture.add(row, sign * coefficient, charge);
+                }
                 for (vector, &coefficient) in values.iter_mut().zip(value.coefficients()) {
                     vector.add_to(row, sign * coefficient)?;
                 }
@@ -685,6 +754,14 @@ impl TaylorContext<'_> {
         };
         for (row, sign) in rows.into_iter().zip([1., -1.]) {
             if let Some(row) = row {
+                if let Some(capture) = &mut self.terminal_capture {
+                    let coefficient = value
+                        .coefficients()
+                        .get(usize::from(charge))
+                        .copied()
+                        .unwrap_or(0.);
+                    capture.add(row, sign * coefficient, charge);
+                }
                 for (vector, &coefficient) in values.iter_mut().zip(value.coefficients()) {
                     vector.add_to(row, sign * coefficient)?;
                 }
@@ -709,6 +786,9 @@ impl TaylorContext<'_> {
         if let (Some(row), Some(column)) = (row, column)
             && coefficient != 0.
         {
+            if let Some(capture) = &mut self.terminal_capture {
+                capture.add(row, coefficient * self.state[0].as_slice()[column], false);
+            }
             self.output.conductance[0].add(row, column, coefficient)?;
             for (vector, x) in self.output.residual.iter_mut().zip(self.state) {
                 vector.add_to(row, coefficient * x.as_slice()[column])?;
@@ -726,6 +806,11 @@ impl TaylorContext<'_> {
         if let (Some(row), Some(column)) = (row, column)
             && coefficient != 0.
         {
+            if let Some(capture) = &mut self.terminal_capture
+                && let Some(rate) = self.state.get(1)
+            {
+                capture.add(row, coefficient * rate.as_slice()[column], true);
+            }
             self.output.capacitance[0].add(row, column, coefficient)?;
             for (vector, x) in self.output.charge.iter_mut().zip(self.state) {
                 vector.add_to(row, coefficient * x.as_slice()[column])?;

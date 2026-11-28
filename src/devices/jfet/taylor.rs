@@ -67,6 +67,7 @@ impl Jfet {
             controls[0].input(0, context)?,
             controls[1].input(1, context)?,
         ];
+        let mut gate = [(0., 0.); 2];
         for (index, cap, charge_slot) in [(0, op.czgs, slot::QGS), (1, op.czgd, slot::QGD)] {
             let v = &voltage[index];
             let current = junction_differential(
@@ -77,6 +78,12 @@ impl Jfet {
                 index * 2,
             )?
             .add(&v.clone().scale(context.model.gmin));
+            gate[index] = (
+                current.value.value(),
+                current.gradient[index]
+                    .as_ref()
+                    .map_or(0., crate::maths::taylor::Jet::value),
+            );
             context.local_law(controls[index].rows, &current, &controls, pol * m, None)?;
             let charge = depletion_differential(
                 v,
@@ -101,6 +108,24 @@ impl Jfet {
             &mut context.constitutive_guards(),
         )?;
         context.local_law([drain, source], &channel, &controls, pol * m, None)?;
+        let [gs, gd] = channel
+            .gradient
+            .each_ref()
+            .map(|g| g.as_ref().map_or(0., crate::maths::taylor::Jet::value));
+        let [(cgs, ggs), (cgd, ggd)] = gate;
+        for (slot, value) in [
+            (slot::VGS, voltage[0].value.value()),
+            (slot::VGD, voltage[1].value.value()),
+            (slot::CG, cgs + cgd),
+            (slot::CD, channel.value.value() - cgd),
+            (slot::CGD, cgd),
+            (slot::GM, gs + gd),
+            (slot::GDS, -gd),
+            (slot::GGS, ggs),
+            (slot::GGD, ggd),
+        ] {
+            context.candidate_state(slot, value)?;
+        }
         for (outer, inner, conductance) in [
             (self.terminals[0], drain, op.gdpr),
             (self.terminals[2], source, op.gspr),

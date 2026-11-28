@@ -2220,6 +2220,7 @@ impl Driver<'_> {
                 ..*request
             },
             &consistent.canonical,
+            consistent.terminal_currents,
         )?;
         Ok(TrialPoint {
             x,

@@ -810,21 +810,34 @@ impl<'a> PreparedRun<'a> {
         for index in self.circuit.load_order() {
             let device = point.device(self.circuit, index);
             if device.is_nonlinear() {
-                device
-                    .assemble_nonlinear_taylor(&mut crate::devices::physical_dae::TaylorContext {
-                        device: index,
-                        state_rows: self
-                            .circuit
-                            .state_rows(index)
-                            .ok_or_else(|| SpiceError::circuit("missing Taylor state range"))?,
-                        model,
-                        unknowns: &self.circuit.bindings.unknowns,
-                        branch: self.circuit.bindings.branch_rows[index].clone().next(),
-                        controls: self.circuit.controls(index)?,
-                        state,
-                        time,
-                        output,
+                let terminal_capture = output
+                    .guards
+                    .is_some()
+                    .then(|| {
+                        self.circuit
+                            .runtime
+                            .observations
+                            .capture_rows(index)
+                            .map(crate::devices::physical_dae::TerminalCapture::new)
                     })
+                    .flatten();
+                let mut context = crate::devices::physical_dae::TaylorContext {
+                    device: index,
+                    state_rows: self
+                        .circuit
+                        .state_rows(index)
+                        .ok_or_else(|| SpiceError::circuit("missing Taylor state range"))?,
+                    model,
+                    unknowns: &self.circuit.bindings.unknowns,
+                    branch: self.circuit.bindings.branch_rows[index].clone().next(),
+                    controls: self.circuit.controls(index)?,
+                    state,
+                    time,
+                    output,
+                    terminal_capture,
+                };
+                device
+                    .assemble_nonlinear_taylor(&mut context)
                     .map_err(|error| match error {
                         SpiceError::Circuit { message } => SpiceError::circuit(format!(
                             "{}: physical Taylor evaluation at t = {:e}: {message}",
@@ -833,6 +846,7 @@ impl<'a> PreparedRun<'a> {
                         )),
                         other => other,
                     })?;
+                context.finish_terminal_capture()?;
             }
         }
         Ok(())
@@ -845,6 +859,7 @@ impl<'a> PreparedRun<'a> {
         &self,
         request: &LoadRequest<'_>,
         canonical: &[(usize, Real)],
+        terminal_currents: crate::devices::physical_dae::PhysicalTerminalCurrents,
     ) -> SpiceResult<TrialState> {
         let mut trial = request.history.trial();
         let mut covered = vec![false; trial.values().len()];
@@ -889,6 +904,7 @@ impl<'a> PreparedRun<'a> {
                 .history
                 .set_candidate_slot(&mut trial, slot, value)?;
         }
+        trial.set_physical_currents(terminal_currents);
         trial.snapshot()?;
         Ok(trial)
     }
