@@ -150,7 +150,7 @@ pub(super) struct LogicKernel {
     pub(super) operation: Operation,
     pub(super) inputs: usize,
     pub(super) initial: Logic,
-    pub(super) delay: Real,
+    pub(super) delays: Delays,
     pub(super) mode: DelayMode,
 }
 
@@ -199,6 +199,10 @@ impl CodeModel for LogicKernel {
             state.deadline = None;
         }
         let desired = self.operation.desired(inputs, state, context.initial)?;
+        let transition = |from: Logic, to: Logic| {
+            self.delays
+                .transition(Drive::strong(from), Drive::strong(to))
+        };
         let delay = if context.initial {
             state.committed = desired;
             state.requested = desired;
@@ -206,9 +210,10 @@ impl CodeModel for LogicKernel {
         } else if self.mode == DelayMode::Transport {
             // The requested logical state changes immediately; the queue
             // delivers its output at the propagation time.
+            let delay = transition(state.requested, desired);
             state.committed = desired;
             state.requested = desired;
-            self.delay
+            delay
         } else {
             if state
                 .deadline
@@ -223,8 +228,9 @@ impl CodeModel for LogicKernel {
                 state.deadline = None;
             } else if state.deadline.is_none() || desired != state.requested {
                 state.requested = desired;
-                let deadline = context.time + self.delay;
-                if self.delay == 0. {
+                let delay = transition(state.committed, desired);
+                let deadline = context.time + delay;
+                if delay == 0. {
                     state.committed = desired;
                     state.deadline = None;
                 } else if !deadline.is_finite() || deadline <= context.time {
@@ -251,6 +257,57 @@ mod tests {
     use crate::analysis::digital::{Engine, Limits, Network};
 
     #[test]
+    fn independent_rise_fall_paths_and_explicit_zero() -> SpiceResult<()> {
+        let zero = Drive::strong(Logic::Zero);
+        let one = Drive::strong(Logic::One);
+        assert_eq!(
+            Delays::paths([0., 3., 4., 5., 6., 7.])?.transition(zero, one),
+            0.
+        );
+        for mode in [DelayMode::Inertial, DelayMode::Transport] {
+            let mut network = Network::default();
+            let input = network.add_net();
+            let output = network.add_net();
+            let source = network.add_source(input)?;
+            network.add_model(
+                LogicKernel {
+                    operation: Operation::Gate(GateKind::Buffer),
+                    inputs: 1,
+                    initial: Logic::Zero,
+                    delays: Delays::paths([2., 3., 4., 5., 6., 7.])?,
+                    mode,
+                },
+                &[input],
+                &[output],
+            )?;
+            let mut engine = Engine::new(network, Limits::default())?;
+            let mut trial = engine.trial();
+            for (at, bit) in [
+                (0., Logic::Zero),
+                (1., Logic::One),
+                (5., Logic::Zero),
+                (10., Logic::One),
+                (11., Logic::Zero),
+            ] {
+                trial.schedule(source, at, Drive::strong(bit))?;
+            }
+            trial.advance_to(20.)?;
+            let actual: Vec<_> = trial
+                .changes()
+                .iter()
+                .filter(|change| change.net == output)
+                .map(|change| (change.time, change.drive.logic))
+                .collect();
+            let mut expected = vec![(0., Logic::Zero), (3., Logic::One), (8., Logic::Zero)];
+            if mode == DelayMode::Transport {
+                expected.extend([(12., Logic::One), (14., Logic::Zero)]);
+            }
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn deadline_cancellation_and_rejected_trial_preserve_state() -> SpiceResult<()> {
         let mut network = Network::default();
         let input = network.add_net();
@@ -261,7 +318,7 @@ mod tests {
                 operation: Operation::Gate(GateKind::And),
                 inputs: 1,
                 initial: Logic::Zero,
-                delay: 2.,
+                delays: Delays::new(2., 2.)?,
                 mode: DelayMode::Inertial,
             },
             &[input],
@@ -307,7 +364,7 @@ mod tests {
                 operation: Operation::from_value(13., 2)?,
                 inputs: 2,
                 initial: Logic::Zero,
-                delay: 2.,
+                delays: Delays::new(2., 2.)?,
                 mode: DelayMode::Inertial,
             },
             &[data, clock],

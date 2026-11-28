@@ -147,6 +147,7 @@ impl SourceModel {
             Self::LogicEvent => match name {
                 "operation" | "ic" => Some(Integer),
                 "delay" | "low" | "high" => Some(Real),
+                "delay_paths" => Some(RealVector),
                 "inertial" => Some(Boolean),
                 "inverted" => Some(BooleanVector),
                 "rx_ic" => Some(IntegerVector),
@@ -296,7 +297,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug)]
 struct LogicMaterial {
     operation: Real,
-    delay: Real,
+    delays: Delays,
     inertial: bool,
     initial: Logic,
     low: Real,
@@ -309,7 +310,7 @@ impl Default for LogicMaterial {
     fn default() -> Self {
         Self {
             operation: 0.,
-            delay: 0.,
+            delays: Delays::ZERO,
             inertial: true,
             initial: Logic::Zero,
             low: 2.,
@@ -340,10 +341,28 @@ impl LogicMaterial {
     fn compile(card: &ModelCard) -> SpiceResult<Self> {
         SourceModel::LogicEvent.validate_parameters(card)?;
         let mut material = Self::default();
+        let mut timing_given = false;
         for parameter in &card.parameters {
             match parameter.name.as_str() {
                 "operation" => material.operation = numeric_scalar(parameter)?,
-                "delay" => material.delay = numeric_scalar(parameter)?,
+                "delay" | "delay_paths" => {
+                    if timing_given {
+                        return Err(SpiceError::circuit(
+                            "specify exactly one logic timing declaration",
+                        ));
+                    }
+                    timing_given = true;
+                    material.delays = if parameter.name == "delay" {
+                        let delay = numeric_scalar(parameter)?;
+                        Delays::new(delay, delay)?
+                    } else {
+                        let paths: [Real; 6] =
+                            numeric_vector(parameter)?.try_into().map_err(|_| {
+                                SpiceError::circuit("delay_paths requires six directional values")
+                            })?;
+                        Delays::paths(paths)?
+                    };
+                }
                 "inertial" => material.inertial = binary(numeric_scalar(parameter)?)?,
                 "ic" => material.initial = logic(numeric_scalar(parameter)?)?,
                 "low" => material.low = numeric_scalar(parameter)?,
@@ -367,7 +386,6 @@ impl LogicMaterial {
                 _ => return Err(SpiceError::circuit("unregistered logic parameter")),
             }
         }
-        Delays::new(material.delay, material.delay)?;
         Adc::qualified(material.low, material.high, material.initial, false)?;
         Ok(material)
     }
@@ -390,7 +408,7 @@ impl LogicMaterial {
             operation: Operation::from_value(self.operation, inputs)?,
             inputs,
             initial: self.initial,
-            delay: self.delay,
+            delays: self.delays,
             mode: if self.inertial {
                 DelayMode::Inertial
             } else {

@@ -395,7 +395,7 @@ impl State {
         let delay = if at == Time(0) {
             0.
         } else {
-            output.delays.transition(old.logic, output.drive.logic)
+            output.delays.transition(old, output.drive)
         };
         let time = Time::new(at.value() + delay)?;
         if delay > 0. && time == at {

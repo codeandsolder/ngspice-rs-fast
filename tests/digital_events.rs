@@ -860,3 +860,90 @@ fn sequential_logic_matches_xspice() -> SpiceResult<()> {
     }
     Ok(())
 }
+
+#[derive(Debug)]
+struct DrivePathEcho(Delays);
+
+impl ngspice_rs::devices::code_model::CodeModel for DrivePathEcho {
+    type State = ();
+
+    fn schema(&self) -> ngspice_rs::devices::code_model::ModelSchema {
+        ngspice_rs::devices::code_model::ModelSchema::digital(1, 1)
+    }
+
+    fn initial_state(&self) -> Self::State {}
+
+    fn evaluate(
+        &self,
+        _context: ngspice_rs::devices::code_model::EventContext,
+        inputs: &[Drive],
+        _state: &mut (),
+    ) -> SpiceResult<Vec<ngspice_rs::devices::code_model::Output>> {
+        Ok(vec![ngspice_rs::devices::code_model::Output {
+            drive: inputs[0],
+            delays: self.0,
+            mode: DelayMode::Transport,
+        }])
+    }
+}
+
+#[test]
+fn six_physical_paths_include_strength_and_disconnection() -> SpiceResult<()> {
+    let delays = Delays::paths([2., 3., 4., 5., 6., 7.])?;
+    assert!(Delays::paths([2., 3., -1., 5., 6., 7.]).is_err());
+    assert!(Delays::paths([2., 3., 4., 5., f64::NAN, 7.]).is_err());
+    assert!(
+        ngspice_rs::devices::code_model::DacConfig::new(
+            Dac {
+                low: 0.,
+                high: 1.,
+                unknown: 0.5
+            },
+            delays
+        )
+        .is_err()
+    );
+    let mut network = Network::default();
+    let input = network.add_net();
+    let output = network.add_net();
+    let source = network.add_source(input)?;
+    network.add_model(DrivePathEcho(delays), &[input], &[output])?;
+    let mut engine = Engine::new(network, Limits::default())?;
+    let zero = Drive::strong(Logic::Zero);
+    let one = Drive::strong(Logic::One);
+    let z = Drive::default();
+    let mut trial = engine.trial();
+    for (at, drive) in [
+        (0., zero),
+        (10., one),
+        (20., zero),
+        (30., z),
+        (40., zero),
+        (50., one),
+        (60., z),
+        (70., one),
+    ] {
+        trial.schedule(source, at, drive)?;
+    }
+    trial.advance_to(80.)?;
+    let actual: Vec<_> = trial
+        .changes()
+        .iter()
+        .filter(|change| change.net == output)
+        .map(|change| (change.time, change.drive))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (0., zero),
+            (12., one),
+            (23., zero),
+            (34., z),
+            (46., zero),
+            (52., one),
+            (65., z),
+            (77., one)
+        ]
+    );
+    trial.commit()
+}

@@ -92,14 +92,30 @@ pub enum DelayMode {
     Inertial,
 }
 
-/// Validated rise/fall propagation delays.
+/// Validated propagation delays. Two-state models use rise/fall; a
+/// disconnectable driver can specify four additional high-impedance paths.
 #[derive(Clone, Copy, Debug)]
 pub struct Delays {
     rise: Real,
     fall: Real,
+    impedance: Option<ImpedanceDelays>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ImpedanceDelays {
+    low_to_z: Real,
+    high_to_z: Real,
+    z_to_low: Real,
+    z_to_high: Real,
 }
 
 impl Delays {
+    pub(super) const ZERO: Self = Self {
+        rise: 0.,
+        fall: 0.,
+        impedance: None,
+    };
+
     /// Construct finite, nonnegative delays.
     ///
     /// # Errors
@@ -108,16 +124,69 @@ impl Delays {
         if !rise.is_finite() || !fall.is_finite() || rise < 0. || fall < 0. {
             return Err(SpiceError::circuit("invalid digital propagation delay"));
         }
-        Ok(Self { rise, fall })
+        Ok(Self {
+            rise,
+            fall,
+            impedance: None,
+        })
     }
 
-    /// Select delay by target state, with unknown transitions using the
-    /// previous state (upstream `d_and/cfunc.mod`).
+    /// Construct six independent physical transition paths in the order
+    /// low→high, high→low, low→Z, high→Z, Z→low, Z→high.
+    ///
+    /// # Errors
+    /// Any delay is negative or nonfinite.
+    pub fn paths(values: [Real; 6]) -> SpiceResult<Self> {
+        let [rise, fall, low_to_z, high_to_z, z_to_low, z_to_high] = values;
+        let mut delays = Self::new(rise, fall)?;
+        if [low_to_z, high_to_z, z_to_low, z_to_high]
+            .into_iter()
+            .any(|value| !value.is_finite() || value < 0.)
+        {
+            return Err(SpiceError::circuit(
+                "invalid high-impedance propagation delay",
+            ));
+        }
+        delays.impedance = Some(ImpedanceDelays {
+            low_to_z,
+            high_to_z,
+            z_to_low,
+            z_to_high,
+        });
+        Ok(delays)
+    }
+
+    /// Select the physical transition using both logic and drive strength.
+    /// An unknown endpoint of an explicitly specified Z path uses the later
+    /// of its two possible known transitions. Ordinary XSPICE rise/fall
+    /// timing retains the previous-state rule for unknown transitions.
     #[must_use = "the returned delay determines the scheduled transition time"]
-    pub const fn transition(self, previous: Logic, next: Logic) -> Real {
-        match next {
+    pub fn transition(self, previous: Drive, next: Drive) -> Real {
+        if let Some(paths) = self.impedance {
+            let old_z = previous.strength == Strength::HighImpedance;
+            let new_z = next.strength == Strength::HighImpedance;
+            match (old_z, new_z) {
+                (true, true) => return 0.,
+                (false, true) => {
+                    return match previous.logic {
+                        Logic::Zero => paths.low_to_z,
+                        Logic::One => paths.high_to_z,
+                        Logic::Unknown => paths.low_to_z.max(paths.high_to_z),
+                    };
+                }
+                (true, false) => {
+                    return match next.logic {
+                        Logic::Zero => paths.z_to_low,
+                        Logic::One => paths.z_to_high,
+                        Logic::Unknown => paths.z_to_low.max(paths.z_to_high),
+                    };
+                }
+                (false, false) => {}
+            }
+        }
+        match next.logic {
             Logic::One => self.rise,
-            Logic::Unknown if matches!(previous, Logic::Zero) => self.rise,
+            Logic::Unknown if previous.logic == Logic::Zero => self.rise,
             Logic::Zero | Logic::Unknown => self.fall,
         }
     }
@@ -702,8 +771,14 @@ impl DacConfig {
     /// Validate levels and full-scale transition times.
     ///
     /// # Errors
-    /// Invalid voltage range or unknown-state level.
+    /// Invalid voltage range, unknown-state level, or impedance timing on
+    /// a voltage-only bridge.
     pub fn new(levels: Dac, slew: Delays) -> SpiceResult<Self> {
+        if slew.impedance.is_some() {
+            return Err(SpiceError::circuit(
+                "voltage DAC requires rise/fall slew times, not impedance delays",
+            ));
+        }
         let span = levels.high - levels.low;
         if !span.is_finite()
             || span <= 0.
