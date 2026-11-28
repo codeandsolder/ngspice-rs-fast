@@ -1336,7 +1336,6 @@ fn run_transient_inner(
         circuit,
         prepared: circuit.prepare_run(),
         system: &system,
-        settings,
         timing,
         model_context,
         bias,
@@ -1358,6 +1357,7 @@ fn run_transient_inner(
         derivative_predictor: None,
         physical_events,
         accepted_guards: BranchTrace::default(),
+        settings,
     };
     driver.run(purpose, sink)
 }
