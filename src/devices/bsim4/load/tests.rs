@@ -1222,3 +1222,125 @@ fn physical_incidence_matches_reference_stamp_and_history() -> SpiceResult<()> {
     }
     Ok(())
 }
+
+/// At exact drain/source equality the physical jet must select its channel
+/// orientation from the one-sided trajectory, not the scalar tie-breaker.
+#[test]
+fn physical_taylor_selects_one_sided_channel_orientation() -> SpiceResult<()> {
+    use crate::devices::{Circuit, Limit, ModelContext, TransientTiming};
+    use crate::maths::Vector;
+    use crate::netlist::{Parser, source::parse_deck_text};
+    use std::path::Path;
+
+    for (level, cap) in [(8, 3), (54, 0), (54, 1), (54, 2)] {
+        for (family, polarity) in [("nmos", 1.), ("pmos", -1.)] {
+            let text = format!(
+                "MOS channel reversal\nm1 d g s b nch l=1u w=10u m=2 ad=10p as=12p pd=12u ps=14u\n.model nch {family} level={level} capmod={cap} cgdo=1n cgso=2n cgbo=1n\n.end"
+            );
+            let deck =
+                Parser::new().parse_deck(&parse_deck_text(Path::new("mos-reversal.cir"), &text))?;
+            let mut c = Circuit::from_netlist(&deck)?;
+            c.finalize()?;
+            let prepared = c.prepare_run();
+            let mut dae = prepared.prepare_physical_dae(
+                &ModelContext::default(),
+                TransientTiming::new(1e-6, 1e-3)?,
+            )?;
+            let rows = ["d", "g", "s", "b"]
+                .map(|name| c.unknowns().node_row(c.nodes().get(name).unwrap()).unwrap());
+            for limit in [Limit::Left, Limit::Right] {
+                let mut state = vec![Vector::zeros(c.unknown_count()); 9];
+                for (row, value) in rows.into_iter().zip([0., 1.4, 0., -0.5]) {
+                    state[0].set(row, polarity * value)?;
+                }
+                state[1].set(rows[0], polarity * 1e-3)?;
+                state[1].set(rows[1], polarity * 2e-3)?;
+                let scale = 1e-6;
+                let horizon = 0.25 * scale;
+                let jet = dae.evaluate_taylor_with_guards(&state, 0., scale, limit)?;
+                let guards = jet.guards.as_ref().unwrap();
+                // The exact reversal also precedes a nearby CLM activation
+                // (drain-excess > 1e-10 V). Compare only inside the active
+                // analytic region, and separately qualify the re-expansion
+                // beyond the predicted boundary.
+                let event = guards.predicted_offset(horizon, scale)?;
+                if level == 54 {
+                    assert!(event.is_some(), "BSIM4 near-zero branch event not observed");
+                }
+                let direction = if limit == Limit::Left { -1. } else { 1. };
+                let time = direction * event.map_or(horizon, |offset| offset * 0.5) / scale;
+                let mut sample = state[0].clone();
+                for row in rows {
+                    sample.set(
+                        row,
+                        time.mul_add(state[1].get(row).unwrap(), state[0].get(row).unwrap()),
+                    )?;
+                }
+                let mut recentered = state.clone();
+                recentered[0] = sample.clone();
+                let observed =
+                    dae.evaluate_taylor_with_guards(&recentered, time * scale, scale, limit)?;
+                assert!(
+                    guards.same_regions(observed.guards.as_ref().unwrap()),
+                    "same-side sample must remain in the active branch: {level} {cap} {polarity} {limit:?}"
+                );
+                let point = dae.evaluate(&sample, time * scale, limit)?;
+                let close = |a: f64, b: f64, absolute: f64, label: &str| {
+                    assert!(
+                        (a - b).abs() <= absolute + 3e-7 * a.abs().max(b.abs()),
+                        "level={level} capmod={cap} polarity={polarity} side={limit:?} {label}: {a:e} vs {b:e}"
+                    );
+                };
+                for row in rows {
+                    let f = jet
+                        .residual
+                        .iter()
+                        .rev()
+                        .fold(0., |v: f64, a| v.mul_add(time, a.get(row).unwrap()));
+                    let q = jet
+                        .charge
+                        .iter()
+                        .rev()
+                        .fold(0., |v: f64, a| v.mul_add(time, a.get(row).unwrap()));
+                    close(
+                        f,
+                        point.residual.get(row).unwrap(),
+                        1e-13,
+                        &format!("F[{row}]"),
+                    );
+                    close(
+                        q,
+                        point.charge.get(row).unwrap(),
+                        1e-21,
+                        &format!("Q[{row}]"),
+                    );
+                    for col in rows {
+                        let g = jet
+                            .conductance
+                            .iter()
+                            .rev()
+                            .fold(0., |v: f64, a| v.mul_add(time, a.get(row, col)));
+                        let cap = jet
+                            .capacitance
+                            .iter()
+                            .rev()
+                            .fold(0., |v: f64, a| v.mul_add(time, a.get(row, col)));
+                        close(
+                            g,
+                            point.conductance.get(row, col),
+                            1e-10,
+                            &format!("G[{row},{col}]"),
+                        );
+                        close(
+                            cap,
+                            point.capacitance.get(row, col),
+                            1e-20,
+                            &format!("C[{row},{col}]"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
