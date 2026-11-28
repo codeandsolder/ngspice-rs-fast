@@ -95,7 +95,7 @@ impl TransientSchedule {
             // Reserve a conservative closed-grid bound before any solving.
             // One extra point per segment covers binary64 endpoint rounding.
             let mut count = 1usize;
-            let mut anchor = 0.;
+            let mut anchor: Real = 0.;
             for segment in &output {
                 if segment.until > start {
                     let begin = if sampling == OutputSampling::Land {
