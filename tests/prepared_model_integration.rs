@@ -1887,3 +1887,158 @@ fn kernel_trial_policy_preserves_reference_provenance_and_exact_acceptance() {
         );
     }
 }
+
+#[derive(Debug)]
+struct TrialElectrothermal;
+
+impl Kernel for TrialElectrothermal {
+    type Prepared = ElectrothermalPrepared;
+
+    fn prepare(
+        &self,
+        parameters: &[Real],
+        temperature: Real,
+    ) -> model_kernel_api::Result<Self::Prepared> {
+        ElectrothermalKernel.prepare(parameters, temperature)
+    }
+
+    fn evaluate(
+        &self,
+        prepared: &Self::Prepared,
+        coordinates: &[Real],
+        point: &mut Point<'_>,
+    ) -> model_kernel_api::Result<()> {
+        ElectrothermalKernel.evaluate(prepared, coordinates, point)
+    }
+
+    fn initialize_trial(
+        &self,
+        prepared: &Self::Prepared,
+        coordinates: &mut [Real],
+    ) -> model_kernel_api::Result<()> {
+        coordinates[2] = prepared.ambient_kelvin + 5.;
+        coordinates[3] = 0.125;
+        Ok(())
+    }
+
+    fn limit_trial(
+        &self,
+        _: &Self::Prepared,
+        reference: model_kernel_api::trial::TrialReference<'_>,
+        coordinates: &mut [Real],
+    ) -> model_kernel_api::Result<()> {
+        let reference = reference.coordinates();
+        coordinates[2] = coordinates[2].clamp(reference[2] - 2., reference[2] + 2.);
+        coordinates[3] = coordinates[3].clamp(reference[3] - 0.1, reference[3] + 0.1);
+        Ok(())
+    }
+}
+
+#[test]
+fn kernel_trial_policy_stamps_limited_thermal_and_internal_coordinates() {
+    use model_kernel_api::trial::{TrialCapabilities, TrialPolicy};
+    use ngspice_rs::devices::IterationPhase;
+
+    let mut descriptor = electrothermal_descriptor();
+    descriptor.trial = TrialCapabilities {
+        initialization: TrialPolicy::Kernel,
+        limiting: TrialPolicy::Kernel,
+        convergence: TrialPolicy::Engine,
+    };
+    let artifact = Artifact::new(descriptor, TrialElectrothermal).unwrap();
+    // A one-lane instance and a homogeneous tile must stamp the same
+    // affine residuals even when local thermal and internal coordinates
+    // differ from the circuit's proposed MNA coordinates.
+    for count in [1, 2] {
+        let mut circuit = Circuit::new();
+        let mut nodes = Vec::new();
+        for index in 0..count {
+            let p = circuit.add_node(&format!("p{index}")).unwrap();
+            let t = circuit.add_node(&format!("t{index}")).unwrap();
+            let q = circuit.add_node(&format!("q{index}")).unwrap();
+            nodes.push([p, t, q]);
+            PreparedDevice::bind(
+                &mut circuit,
+                &artifact,
+                &format!("x{index}"),
+                &[p, NodeId::GROUND, t, q],
+                &ELECTROTHERMAL_PARAMETERS,
+                InstanceTemperature::circuit(27.),
+            )
+            .unwrap();
+        }
+        circuit.finalize().unwrap();
+        let n = circuit.unknown_count();
+        let rows: Vec<_> = nodes
+            .iter()
+            .map(|nodes| nodes.map(|node| circuit.unknowns().node_row(node).unwrap()))
+            .collect();
+        let mut solution = Vector::zeros(n);
+        for [p, t, q] in &rows {
+            solution.set(*p, 0.5).unwrap();
+            solution.set(*t, 10.).unwrap();
+            solution.set(*q, 0.8).unwrap();
+        }
+        let history = circuit.state_history().unwrap();
+        let (matrix, rhs, cold) = trial_load(
+            &circuit,
+            &history,
+            solution.as_slice(),
+            history.trial_in(IterationPhase::Junction, None).unwrap(),
+            None,
+        );
+        assert!(cold.is_nonconvergent());
+        let prepared = artifact
+            .prepare(&ELECTROTHERMAL_PARAMETERS, 300.15)
+            .unwrap();
+        let mut buffer = model_kernel_api::PointBuffer::new(4).unwrap();
+        let mut point = buffer.point();
+        let actual = [0.5, 0., 305.15, 0.125];
+        artifact.evaluate(&prepared, &actual, &mut point).unwrap();
+        let mna = [0.5, 0., 5., 0.125];
+        for (lane, [p, t, q]) in rows.iter().enumerate() {
+            let local_rows = [Some(*p), None, Some(*t), Some(*q)];
+            for (i, row) in local_rows.into_iter().enumerate() {
+                let Some(row) = row else {
+                    continue;
+                };
+                let expected_rhs = (0..4).fold(-point.current[i], |r, j| {
+                    point.conductance[4 * i + j].mul_add(mna[j], r)
+                });
+                close(rhs.as_slice()[row], expected_rhs);
+                for (j, col) in local_rows.into_iter().enumerate() {
+                    if let Some(col) = col {
+                        close(matrix.get(row, col), point.conductance[4 * i + j]);
+                    }
+                }
+                close(cold.values()[13 * lane + 2 * i], point.charge[i]);
+            }
+            close(cold.values()[13 * lane + 10], 305.15);
+            close(cold.values()[13 * lane + 11], 0.125);
+        }
+        let (_, _, limited) = trial_load(
+            &circuit,
+            &history,
+            solution.as_slice(),
+            history.trial_in(IterationPhase::Fix, Some(&cold)).unwrap(),
+            None,
+        );
+        assert!(limited.is_nonconvergent());
+        for lane in 0..count {
+            close(limited.values()[13 * lane + 10], 307.15);
+            close(limited.values()[13 * lane + 11], 0.225);
+        }
+        let (_, _, exact) = trial_load(
+            &circuit,
+            &history,
+            solution.as_slice(),
+            history.trial(),
+            None,
+        );
+        assert!(!exact.is_nonconvergent());
+        for lane in 0..count {
+            close(exact.values()[13 * lane + 10], 310.15);
+            close(exact.values()[13 * lane + 11], 0.8);
+        }
+    }
+}
