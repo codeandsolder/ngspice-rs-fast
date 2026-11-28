@@ -1735,6 +1735,20 @@ pub trait Device: fmt::Debug + std::any::Any {
         }
     }
 
+    /// Stage an effective recipe before the candidate's physical preparation.
+    /// Ordinary devices validate immediately; prepared kernels validate the
+    /// final combined recipe once at the candidate boundary.
+    /// # Errors
+    /// Invalid parameter or structural change.
+    fn stage_bound_parameter(
+        &self,
+        key: crate::devices::sweep::ParameterKey,
+        value: Real,
+        context: &crate::devices::ModelContext,
+    ) -> SpiceResult<Box<dyn Device>> {
+        self.with_bound_parameter(key, value, context)
+    }
+
     /// Whether typed instance setters preserve the selected model declaration.
     /// Model-backed devices opt in only when no setter can change model
     /// selection (including binning). The candidate validator still checks
@@ -1743,15 +1757,27 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
-    /// Reprepare immutable context-dependent data at a context transition.
-    /// Ordinary native devices need no replacement.
+    /// Construct a run-local prepared recipe. A previous candidate may lend
+    /// immutable singleton data; grouped physical lanes are bound by its plan.
     /// # Errors
-    /// Invalid effective physical parameters.
-    fn reprepare_context(
+    /// Invalid context or unsupported prepared device.
+    fn prepared_run_instance(
         &self,
         _context: &crate::devices::ModelContext,
-    ) -> SpiceResult<Option<Box<dyn Device>>> {
-        Ok(None)
+        _previous: Option<&dyn Device>,
+    ) -> SpiceResult<Box<dyn Device>> {
+        Err(SpiceError::circuit(
+            "device has no prepared run implementation",
+        ))
+    }
+
+    /// Validate and activate an independent singleton's prepared data.
+    /// # Errors
+    /// Invalid physical parameters or unsupported prepared device.
+    fn activate_prepared_scalar(&self) -> SpiceResult<()> {
+        Err(SpiceError::circuit(
+            "device has no prepared scalar implementation",
+        ))
     }
 
     /// The canonical (lowercase, alias-folded) keyword of a settable real

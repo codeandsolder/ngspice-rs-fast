@@ -419,8 +419,7 @@ pub(super) struct PreparedPoint {
     context: ModelContext,
     replacements: Vec<(usize, Box<dyn Device>)>,
     mutual: std::cell::OnceCell<PreparedMutualTerms>,
-    prepared_batches:
-        std::cell::OnceCell<std::cell::RefCell<crate::devices::prepared_model::batch::Plan>>,
+    prepared_batches: std::cell::RefCell<crate::devices::prepared_model::batch::Plan>,
 }
 
 fn effective_device<'a>(
@@ -443,24 +442,8 @@ impl PreparedPoint {
 
     fn batches(
         &self,
-        circuit: &Circuit,
     ) -> SpiceResult<std::cell::RefMut<'_, crate::devices::prepared_model::batch::Plan>> {
-        if self.prepared_batches.get().is_none() {
-            let plan = crate::devices::prepared_model::batch::Plan::new(
-                circuit.devices.len(),
-                &circuit.bindings.unknowns,
-                circuit
-                    .bindings
-                    .prepared_devices
-                    .iter()
-                    .copied()
-                    .map(|index| (index, self.device(circuit, index))),
-            )?;
-            let _ = self.prepared_batches.set(std::cell::RefCell::new(plan));
-        }
         self.prepared_batches
-            .get()
-            .ok_or_else(|| SpiceError::circuit("missing prepared batch plan"))?
             .try_borrow_mut()
             .map_err(|_| SpiceError::circuit("prepared batch plan already active"))
     }
@@ -498,45 +481,60 @@ impl<'a> PreparedRun<'a> {
         preparation_metrics::record(|counts| counts.contexts += 1);
         context.validate(&MODEL_CONTEXT_LOCATION)?;
         let mut replacements = self.circuit.replacements(context)?;
-        for &index in &self.circuit.bindings.prepared_devices {
-            match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
-                Ok(slot) => {
-                    if let Some(device) = replacements[slot].1.reprepare_context(context)? {
-                        replacements[slot].1 = device;
-                    }
-                }
-                Err(slot) => {
-                    if let Some(device) = self.circuit.devices[index].reprepare_context(context)? {
-                        replacements.insert(slot, (index, device));
-                    }
-                }
-            }
-        }
-        let prepared_batches = std::cell::OnceCell::new();
-        {
+        let prepared_batches = {
             let previous = self.point.borrow();
-            if let Some(plan) = previous
-                .as_ref()
-                .and_then(|point| point.prepared_batches.get())
-            {
-                let mut plan = plan
-                    .try_borrow_mut()
-                    .map_err(|_| SpiceError::circuit("prepared batch plan already active"))?;
+            self.prepare_instances(context, &mut replacements, previous.as_ref())?;
+            if let Some(previous) = previous.as_ref() {
+                let mut plan = previous.batches()?;
                 plan.rebind(
                     |index| effective_device(self.circuit, &replacements, index),
                     &self.circuit.bindings.unknowns,
                 )?;
-                let _ = prepared_batches.set(std::cell::RefCell::new(std::mem::take(&mut *plan)));
+                std::mem::take(&mut *plan)
+            } else {
+                crate::devices::prepared_model::batch::Plan::new(
+                    self.circuit.devices.len(),
+                    &self.circuit.bindings.unknowns,
+                    self.circuit
+                        .bindings
+                        .prepared_devices
+                        .iter()
+                        .copied()
+                        .map(|index| (index, effective_device(self.circuit, &replacements, index))),
+                )?
             }
-        }
+        };
         self.point.replace(Some(PreparedPoint {
             context: *context,
             replacements,
             mutual: std::cell::OnceCell::new(),
-            prepared_batches,
+            prepared_batches: std::cell::RefCell::new(prepared_batches),
         }));
         std::cell::Ref::filter_map(self.point.borrow(), Option::as_ref)
             .map_err(|_| SpiceError::circuit("missing prepared model context"))
+    }
+
+    fn prepare_instances(
+        &self,
+        context: &ModelContext,
+        replacements: &mut Vec<(usize, Box<dyn Device>)>,
+        previous: Option<&PreparedPoint>,
+    ) -> SpiceResult<()> {
+        for &index in &self.circuit.bindings.prepared_devices {
+            let prior = previous.map(|point| point.device(self.circuit, index));
+            match replacements.binary_search_by_key(&index, |(ordinal, _)| *ordinal) {
+                Ok(slot) => {
+                    let instance = replacements[slot].1.prepared_run_instance(context, prior)?;
+                    replacements[slot].1 = instance;
+                }
+                Err(slot) => {
+                    let instance =
+                        self.circuit.devices[index].prepared_run_instance(context, prior)?;
+                    replacements.insert(slot, (index, instance));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Begin a proposal without eagerly evaluating devices: preserve load-order
@@ -3669,7 +3667,7 @@ impl Circuit {
                 if value.topology() != topology {
                     return Err(SpiceError::circuit("foreign or stale instance override"));
                 }
-                original.with_bound_parameter(value.parameter(), value.value(), context)?
+                original.stage_bound_parameter(value.parameter(), value.value(), context)?
             }
         };
         #[cfg(test)]
@@ -3756,7 +3754,7 @@ impl Circuit {
                     preparation_metrics::record(|counts| counts.setters += 1);
                     if let Some(index) = device_slots.get(&ordinal).copied() {
                         let previous = replacements[index].1.as_ref();
-                        replacements[index].1 = previous.with_bound_parameter(
+                        replacements[index].1 = previous.stage_bound_parameter(
                             value.parameter(),
                             value.value(),
                             context,
@@ -3765,7 +3763,7 @@ impl Circuit {
                         device_slots.insert(ordinal, replacements.len());
                         replacements.push((
                             ordinal,
-                            original.with_bound_parameter(
+                            original.stage_bound_parameter(
                                 value.parameter(),
                                 value.value(),
                                 context,
@@ -3938,7 +3936,7 @@ impl Circuit {
         voltage_source_value: &mut Real,
         mut ltra: Option<&mut LtraWorkspace>,
     ) -> SpiceResult<()> {
-        let mut batches = point.batches(self)?;
+        let mut batches = point.batches()?;
         batches.begin();
         for (position, index) in self.load_order().enumerate() {
             let device = point.device(self, index);
@@ -4653,7 +4651,7 @@ impl Circuit {
         })?;
         system.a.set_pivot_tolerances(context.pivot);
         system.a.set_unknown_names(Some(self.unknown_names()));
-        let mut batches = point.batches(self)?;
+        let mut batches = point.batches()?;
         batches.begin();
         for index in self.load_order() {
             let device = point.device(self, index);

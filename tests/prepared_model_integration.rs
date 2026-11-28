@@ -1571,11 +1571,20 @@ impl Kernel for CountingKernel {
     ) -> model_kernel_api::Result<()> {
         PolynomialKernel.evaluate(prepared, coordinates, out)
     }
+    fn evaluate_noise(
+        &self,
+        prepared: &Polynomial,
+        coordinates: &[Real],
+        frequency: Real,
+        sink: &mut dyn model_kernel_api::noise::Sink,
+    ) -> model_kernel_api::Result<()> {
+        PolynomialKernel.evaluate_noise(prepared, coordinates, frequency, sink)
+    }
 }
 
-#[test]
-fn prepared_run_reuses_unaffected_tiles_across_context_changes() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+fn counted_circuit() -> (Circuit, Arc<std::sync::atomic::AtomicUsize>) {
+    use ngspice_rs::devices::prepared_model::AmbientTemperature;
+    use std::sync::atomic::AtomicUsize;
     let preparations = Arc::new(AtomicUsize::new(0));
     let model = Artifact::new(
         descriptor(Capability::Computed),
@@ -1585,8 +1594,16 @@ fn prepared_run_reuses_unaffected_tiles_across_context_changes() {
     )
     .unwrap();
     let mut circuit = Circuit::new();
-    let node = circuit.add_node("n").unwrap();
     for lane in 0..129 {
+        let node = circuit.add_node(&format!("n{lane}")).unwrap();
+        let temperature = if lane == 128 {
+            InstanceTemperature {
+                circuit_celsius: 27.,
+                ambient: AmbientTemperature::AbsoluteKelvin(300.15),
+            }
+        } else {
+            InstanceTemperature::circuit(27.)
+        };
         circuit
             .add_device(Box::new(
                 PreparedDevice::new(
@@ -1594,59 +1611,150 @@ fn prepared_run_reuses_unaffected_tiles_across_context_changes() {
                     format!("m{lane}"),
                     vec![node, NodeId::GROUND],
                     &[1e-3, 2e-4, 1e-6, 2e-7],
-                    InstanceTemperature::circuit(27.),
+                    temperature,
                 )
                 .unwrap(),
             ))
             .unwrap();
     }
     circuit.finalize().unwrap();
+    (circuit, preparations)
+}
+
+fn counted_load(
+    run: &ngspice_rs::devices::PreparedRun<'_>,
+    context: &ModelContext,
+) -> ngspice_rs::primitives::SpiceResult<Vec<u64>> {
+    let n = run.circuit().unknown_count();
+    let history = run.circuit().state_history()?;
+    let mut matrix = SparseMatrix::new(n, n);
+    let mut rhs = Vector::zeros(n);
+    let mut trial = history.trial();
+    run.load(
+        &LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &Vector::from_slice(&vec![0.25; n]),
+            model_context: context,
+            integration: None,
+            history: &history,
+            forcing: None,
+        },
+        &mut matrix,
+        &mut rhs,
+        &mut trial,
+    )?;
+    Ok((0..n).map(|row| matrix.get(row, row).to_bits()).collect())
+}
+
+#[test]
+fn prepared_run_reuses_unaffected_tiles_across_context_changes() {
+    use ngspice_rs::devices::noise::NoisePlan;
+    use std::{sync::atomic::Ordering, time::Instant};
+    let start = Instant::now();
+    let (circuit, preparations) = counted_circuit();
+    let initial_bind = start.elapsed();
     let run = circuit.prepare_run();
-    let history = circuit.state_history().unwrap();
-    let n = circuit.unknown_count();
-    let load = |context: &ModelContext| {
-        let mut matrix = SparseMatrix::new(n, n);
-        let mut rhs = Vector::zeros(n);
-        let mut trial = history.trial();
-        run.load(
-            &LoadRequest {
-                mode: AnalysisMode::OperatingPoint,
-                solution: &Vector::from_slice(&[0.25]),
-                model_context: context,
-                integration: None,
-                history: &history,
-                forcing: None,
-            },
-            &mut matrix,
-            &mut rhs,
-            &mut trial,
-        )
-        .unwrap();
-        matrix.get(0, 0)
-    };
     let count = || preparations.load(Ordering::Relaxed);
     assert_eq!(count(), 129);
     let context = ModelContext::default();
-    let original = load(&context);
-    assert_eq!(count(), 129 + 128);
-    assert_eq!(load(&context).to_bits(), original.to_bits());
+    let start = Instant::now();
+    run.validate_context(&context).unwrap();
+    let initial_transfer = start.elapsed();
+    assert_eq!(count(), 129);
+    let original = counted_load(&run, &context).unwrap();
+    assert_eq!(counted_load(&run, &context).unwrap(), original);
     assert_eq!(
-        load(&context.with_frequency(1000.)).to_bits(),
-        original.to_bits()
+        counted_load(&run, &context.with_frequency(1000.)).unwrap(),
+        original
     );
-    assert_eq!(count(), 129 + 128);
-    let name = &model.descriptor().parameters[0].name;
-    let target = circuit.bind_instance_target("m3", name).unwrap();
+    assert_eq!(count(), 129);
+
+    let target = circuit.bind_instance_target("m3", "g").unwrap();
+    let second = circuit.bind_instance_target("m3", "c").unwrap();
     let changed = context
         .with_instance_override(target.at(2e-3).unwrap())
+        .unwrap()
+        .with_instance_override(second.at(2e-6).unwrap())
         .unwrap();
-    assert!(load(&changed) > original);
-    assert_eq!(count(), 129 + 128 + 1 + 64);
-    let after = count();
-    load(&changed);
-    assert_eq!(count(), after);
-    assert_eq!(load(&context).to_bits(), original.to_bits());
-    assert_eq!(count(), after + 64);
+    let start = Instant::now();
+    run.validate_context(&changed).unwrap();
+    let one_lane = start.elapsed();
+    assert_eq!(count(), 130, "two setters on one lane must prepare once");
+    let new = counted_load(&run, &changed).unwrap();
+    let row = circuit
+        .unknowns()
+        .node_row(circuit.nodes().get("n3").unwrap())
+        .unwrap();
+    assert_eq!(new.iter().zip(&original).filter(|(a, b)| a != b).count(), 1);
+    assert!(f64::from_bits(new[row]) > f64::from_bits(original[row]));
+    let bias = Vector::from_slice(&vec![0.25; circuit.unknown_count()]);
+    let linear = run.small_signal_system_at(&changed, &bias, None).unwrap();
+    for (row, bits) in new.iter().enumerate() {
+        assert_eq!(linear.a.get(row, row).to_bits(), *bits);
+    }
+    let noise = NoisePlan::bind(&run, &changed, &bias, None).unwrap();
+    assert_eq!(noise.source_count(), 129);
+    assert_eq!(count(), 130, "AC and noise use the same physical lane");
+    assert_eq!(counted_load(&run, &context).unwrap(), original);
+    assert_eq!(count(), 131);
+
+    let warm = ModelContext::new(37., 27.);
+    assert_eq!(counted_load(&run, &warm).unwrap(), original);
+    assert_eq!(count(), 131 + 128, "fixed ambient singleton is unchanged");
+    assert_eq!(counted_load(&run, &context).unwrap(), original);
+    assert_eq!(count(), 131 + 256);
+    println!(
+        "129-lane bind {initial_bind:?}; initial ownership transfer {initial_transfer:?}; one changed lane {one_lane:?}"
+    );
+}
+
+#[test]
+fn prepared_tiles_roll_back_all_groups_and_keep_live_runs_independent() {
+    use std::sync::atomic::Ordering;
+    let (circuit, preparations) = counted_circuit();
+    let a = circuit.prepare_run();
+    let b = circuit.prepare_run();
+    let context = ModelContext::default();
+    let original = counted_load(&a, &context).unwrap();
+    let changed = context
+        .with_instance_override(
+            circuit
+                .bind_instance_target("m3", "g")
+                .unwrap()
+                .at(2e-3)
+                .unwrap(),
+        )
+        .unwrap();
+    let b_point = counted_load(&b, &changed).unwrap();
+    assert_ne!(b_point, original);
+    assert_eq!(counted_load(&a, &context).unwrap(), original);
+    assert_eq!(preparations.load(Ordering::Relaxed), 258);
+    let invalid = changed
+        .with_instance_override(
+            circuit
+                .bind_instance_target("m80", "g")
+                .unwrap()
+                .at(-1.)
+                .unwrap(),
+        )
+        .unwrap()
+        .with_instance_override(
+            circuit
+                .bind_instance_target("m128", "g")
+                .unwrap()
+                .at(3e-3)
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(counted_load(&a, &invalid).is_err());
+    let after_failure = preparations.load(Ordering::Relaxed);
+    assert_eq!(counted_load(&a, &context).unwrap(), original);
+    assert_eq!(counted_load(&b, &changed).unwrap(), b_point);
+    assert_eq!(preparations.load(Ordering::Relaxed), after_failure);
+    assert_eq!(counted_load(&a, &changed).unwrap(), b_point);
+    assert_eq!(preparations.load(Ordering::Relaxed), after_failure + 1);
+    assert_eq!(counted_load(&a, &context).unwrap(), original);
+    assert_eq!(preparations.load(Ordering::Relaxed), after_failure + 2);
 }
 
 #[derive(Debug, Default)]
