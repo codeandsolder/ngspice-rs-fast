@@ -76,7 +76,7 @@ const fn height(count: usize) -> usize {
     if count <= 1 {
         0
     } else {
-        (usize::BITS - (count - 1).leading_zeros()) as usize
+        (count - 1).bit_width() as usize
     }
 }
 
