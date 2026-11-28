@@ -31,8 +31,9 @@ one device's own integration history. In particular, parallel
 junctions, capacitors, and multi-terminal transistor charge partitions
 must not each be assigned that sum.
 
-Devices declare their local charge/charge-rate history slot pairs.
-The prepared circuit binds them to distinct absolute slot pairs.
+Devices declare each local charge/charge-rate history pair together with
+its electrical node incidence and signed scale. The prepared circuit
+binds them to distinct absolute slot pairs.
 A Taylor evaluation records the device-local charge jet and its
 sparse state-gradient jets in addition to its global MNA stamps.
 Each declared pair must be present exactly once; invalid ranges,
@@ -51,6 +52,18 @@ constraints are not imposed on an already determined trajectory.
 The verified right-limit charge and rate replace the corresponding
 candidate history slots, so the trial's temporary companion
 linearization does not define accepted physical history.
+
+For instantaneous physical terminal observations, the isolated static
+device load contains no integration companion. Reconstruct displacement
+current by applying each declared electrical incidence and scale to the
+solved local charge rate, not to the temporary observation scratch state.
+Only external rows receive these corrections: the static current at an
+external series-resistance terminal already includes the internal
+displacement current through solved KCL. Ground is the negative sum of
+distinct external rows. This works independently of device multiplicity,
+polarity and recovery-coordinate normalization. Behavioural branch-event
+values remain the solved candidate values rather than a scalar
+re-evaluation at an isolated branch boundary.
 
 ## Native diode
 
@@ -125,3 +138,10 @@ Prepared compact models must expose the same exact Taylor equations at the
 producer-owned kernel boundary. Scalar residual and Jacobian values do
 not determine higher derivatives. The ABI work is tracked in
 [preprocess #79](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/79).
+
+Conservative BSIM charge modes and their exact multivariate kernels are
+tracked in [#256](https://github.com/codeandsolder/ngspice-rs-fast/issues/256).
+Continuous switch and prepared PWL-resistor branch laws are tracked in
+[#257](https://github.com/codeandsolder/ngspice-rs-fast/issues/257).
+These are separate implementation and qualification obligations, not
+claims that their current scalar models support high-index derivatives.
