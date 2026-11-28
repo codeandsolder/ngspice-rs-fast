@@ -22,3 +22,10 @@ iteration policy, but does not identify LTspice's precise internal iteration
 algorithm. The native regression uses the same physical network and excitation,
 with explicit phase-selected control; integration methods need not produce
 identical adaptive output grids.
+
+A separate strong-feedback check varied the feedback coefficient to 5, 10,
+20 and 100 ohms, retaining the tight trapezoidal deck. All four failed with
+LTspice's `Time step too small` error (gain 5 reached approximately 4 ps;
+10, 20 and 100 failed at the initial transient point). This is consistent
+with convergence limitations of an iteration-sampled feedback law. It is
+not a requirement that the native solver reproduce vendor failures.
