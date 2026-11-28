@@ -89,8 +89,9 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, CELSIUS_TO_KELVIN, ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel,
-    SensitivityLoad, SensitivityMode, SensitivityParameter, SensitivityRecord,
+    AcReset, AcSensitivityLoad, AcSensitivityStamp, CELSIUS_TO_KELVIN, DcSensitivityLoad,
+    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityParameter,
+    SensitivityRecord,
 };
 use crate::devices::{Device, LinearContext, ModelContext, ResolvedModel, StampContext};
 use crate::maths::Vector;
@@ -1512,18 +1513,12 @@ impl SensitivityKernel for Jfet2Sensitivity<'_> {
         Ok(())
     }
 
-    fn load(
+    fn dc_load(
         &self,
         _setup: RecordPair<'_>,
         current: RecordPair<'_>,
-        mode: SensitivityMode,
-    ) -> SpiceResult<SensitivityLoad> {
-        if mode == SensitivityMode::Ac {
-            return Err(SpiceError::circuit(
-                "a JFET2's AC sensitivity load is its reset load",
-            ));
-        }
-        Ok(SensitivityLoad::Replacement(Box::new(self.jfet2(current)?)))
+    ) -> SpiceResult<DcSensitivityLoad> {
+        Ok(DcSensitivityLoad::replacement(self.jfet2(current)?))
     }
 
     /// `JFET2acLoad` after `cktsens.c`'s reset load: `gm`, `gds`, `ggs`,
@@ -1531,17 +1526,17 @@ impl SensitivityKernel for Jfet2Sensitivity<'_> {
     /// stored at zero junction voltages with the reset records, the charge
     /// slots `qgs`/`qgd`/`qds` are zero, and `PSacload`'s model coefficients,
     /// the series conductances, `area` and `m` come from `current`.
-    fn reset_ac_load(
+    fn ac_load(
         &self,
         _setup: RecordPair<'_>,
         reset: AcReset<'_>,
         current: RecordPair<'_>,
-    ) -> SpiceResult<SensitivityLoad> {
-        Ok(SensitivityLoad::Replacement(Box::new(ResetJfet2 {
+    ) -> SpiceResult<AcSensitivityLoad> {
+        Ok(AcSensitivityLoad::stamp(ResetJfet2 {
             state: self.jfet2(reset.state)?,
             current: self.jfet2(current)?,
             omega: reset.omega,
-        })))
+        }))
     }
 }
 
@@ -1616,7 +1611,7 @@ impl Jfet2Sensitivity<'_> {
 }
 
 /// A JFET2's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::reset_ac_load`]).
+/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
 #[derive(Debug)]
 struct ResetJfet2 {
     /// Built from the reset load's records: the junction conductances.
@@ -1628,30 +1623,11 @@ struct ResetJfet2 {
     omega: Real,
 }
 
-impl Device for ResetJfet2 {
-    fn name(&self) -> &str {
-        &self.current.name
-    }
-
-    fn designator(&self) -> char {
-        'j'
-    }
-
-    fn terminals(&self) -> &[NodeId] {
-        &self.current.terminals
-    }
-
-    fn stamp(&self, _context: &mut StampContext<'_>) -> SpiceResult<()> {
-        Err(SpiceError::circuit(format!(
-            "{}: an AC sensitivity stand-in has no DC load",
-            self.current.name
-        )))
-    }
-
+impl AcSensitivityStamp for ResetJfet2 {
     /// `jfet2acld.c`'s stamps in its order: `PSacload`'s imaginary parts,
     /// then the real parts (the gate charges' `xgs`/`xgd` are zero).
-    fn assemble_linear(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        use crate::devices::sensitivity::{ResetStamp, ResetStamps, StampAt, StampPart};
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+        use crate::devices::sensitivity::{StampPart, node_stamps, stamp_reset};
         let gmin = context.model_context.gmin;
         let state = &self.state;
         let state_op = state.operating(context.model_context)?;
@@ -1675,16 +1651,11 @@ impl Device for ResetJfet2 {
             (sp, g, -(m * xgm)),
             (sp, dp, -(m * xgds)),
         ];
-        let stamps = imaginary
-            .into_iter()
-            .map(|(a, b, value)| ResetStamp {
-                at: StampAt::Nodes(a, b),
-                value,
-                part: StampPart::Imaginary,
-            })
-            .collect();
-        ResetStamps::new(&current.name, 'j', &current.terminals, stamps)?
-            .assemble_linear(context)?;
+        stamp_reset(
+            &current.name,
+            node_stamps(&imaginary, StampPart::Imaginary),
+            context,
+        )?;
         jfet::linear::ac_conductances(
             context,
             &current.terminals,
