@@ -76,6 +76,42 @@ their output; their inputs must therefore be defined throughout the run.
 The C47 reference does not accept an idt() expression. Integrators are
 instead representable as rational transfer blocks.
 
+## Tabulated frequency response
+
+The native `xfer` code model implements an inline XSPICE frequency table:
+
+```spice
+A1 %vd(in ref) %v(out) response
+.model response xfer(r_i=true table=[100 2 0 300 0 2])
+```
+
+The first ordinate is frequency in Hz, followed by either real/imaginary
+(`r_i=true`) or magnitude/phase (`r_i=false`, default). In polar mode,
+`db=true` (default) converts the magnitude from dB, and `rad=false`
+(default) converts degrees to radians. `span` (default 3) sets the row
+width and `offset` (default 1) selects the consecutive pair of ordinates
+within each row. Frequencies must be finite, nonnegative and strictly
+increasing. The selected complex gains are finite; linear magnitude is
+nonnegative. A single row is a constant AC response. Scalar and vector
+parameters are evaluated in the declaring lexical scope and each model
+candidate retains its own immutable table.
+
+AC interpolates linearly in Cartesian coordinates at the physical frequency
+and clamps beyond the endpoints. DC uses only the first real ordinate,
+regardless of the first frequency, as `cm_xfer` does. The same port
+incidence as `s_xfer` preserves oriented output and input sensing currents
+(`i(a1)`, `i(a1:input)` for a current input). AC uses an explicitly
+frequency-dependent complex stamp, not a division by angular frequency
+or a fake capacitor. The native source-preparation command can lower E/G
+FREQ with arbitrary control expressions into this model while retaining
+the original E/G names and branch identities.
+
+An arbitrary sampled table is not a causal realization: transient,
+physical DAE and pole-zero analyses reject it explicitly. External file
+admission and Touchstone extraction belong in source preparation; this
+native model consumes resolved inline vectors only. A causal rational fit
+must be represented as a separate `s_xfer` or verified macromodel.
+
 ## Rational transfer models
 
 The native XSPICE `s_xfer` model realizes H(s)=g N(s/w)/D(s/w), with

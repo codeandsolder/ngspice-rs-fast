@@ -738,3 +738,19 @@ fn active_diode_recovery_dc_sensitivity_preserves_the_static_root() {
         assert!(value(&active, "v(d1:qpscale)").abs() < 1e-12);
     }
 }
+
+/// The source-voltage derivative uses a new transposed RHS, not the
+/// corrected DC branch current. Both zero and nonzero bias must retain the
+/// original operator, including contributions lost in rounded assembly.
+#[test]
+fn near_short_source_derivative_uses_the_physical_adjoint() {
+    for voltage in [0., 1.] {
+        for (r, physical) in [("0", 1e-12), ("1e-10", 1e-10), ("1e-8", 1e-8)] {
+            let body = format!("v1 a 0 {voltage}\nr1 a b {r}\nr2 b 0 1k\n.sens i(v1)");
+            let plot = sens(&body).unwrap();
+            let total = physical + 1000.;
+            close(value(&plot, "v(v1)"), -1. / total, 1e-8);
+            close(value(&plot, "v(r2)"), voltage / (total * total), 2e-6);
+        }
+    }
+}

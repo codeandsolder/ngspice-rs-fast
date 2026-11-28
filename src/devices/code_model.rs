@@ -3,6 +3,7 @@
 
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
+mod frequency;
 pub mod rational;
 pub mod source;
 mod source_logic;

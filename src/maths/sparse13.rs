@@ -115,18 +115,18 @@ impl LaneParts {
         im: f64x4::splat(0.),
     };
 
-    fn from_lanes<T: Scalar>(values: [T; RHS_BATCH_WIDTH]) -> Self {
+    fn from_lanes<T: BatchScalar>(values: [T; RHS_BATCH_WIDTH]) -> Self {
         Self {
             re: f64x4::from_array(values.map(Scalar::real)),
-            im: f64x4::from_array(values.map(Scalar::imaginary)),
+            im: f64x4::from_array(values.map(BatchScalar::imaginary)),
         }
     }
 
-    fn get<T: Scalar>(self, lane: usize) -> T {
+    fn get<T: BatchScalar>(self, lane: usize) -> T {
         T::from_parts(self.re[lane], self.im[lane])
     }
 
-    fn set<T: Scalar>(&mut self, lane: usize, value: T) {
+    fn set<T: BatchScalar>(&mut self, lane: usize, value: T) {
         self.re[lane] = value.real();
         self.im[lane] = value.imaginary();
     }
@@ -139,7 +139,7 @@ impl LaneParts {
     }
 }
 
-fn read_tile_row<T: Scalar>(work: &SolveBatchWorkspace<T>, index: usize) -> LaneParts {
+fn read_tile_row<T: BatchScalar>(work: &SolveBatchWorkspace<T>, index: usize) -> LaneParts {
     LaneParts {
         re: work.real[index],
         im: if T::HAS_IMAGINARY {
@@ -150,7 +150,11 @@ fn read_tile_row<T: Scalar>(work: &SolveBatchWorkspace<T>, index: usize) -> Lane
     }
 }
 
-fn write_tile_row<T: Scalar>(work: &mut SolveBatchWorkspace<T>, index: usize, value: LaneParts) {
+fn write_tile_row<T: BatchScalar>(
+    work: &mut SolveBatchWorkspace<T>,
+    index: usize,
+    value: LaneParts,
+) {
     work.real[index] = value.re;
     if T::HAS_IMAGINARY {
         work.imag[index] = value.im;
@@ -168,7 +172,7 @@ pub(super) struct BatchUpdate {
 }
 
 impl BatchUpdate {
-    fn new<T: Scalar>(numerator: LaneParts, pivot: T, inverse: T) -> Self {
+    fn new<T: BatchScalar>(numerator: LaneParts, pivot: T, inverse: T) -> Self {
         let zero = f64x4::splat(0.);
         let active = numerator.re.simd_ne(zero) | numerator.im.simd_ne(zero);
         if !active.any() {
@@ -199,7 +203,7 @@ impl BatchUpdate {
         }
     }
 
-    fn recover<T: Scalar>(
+    fn recover<T: BatchScalar>(
         &self,
         old: LaneParts,
         ordinary: LaneParts,
@@ -497,11 +501,12 @@ pub(super) trait Scalar:
 {
     /// Additive identity.
     const ZERO: Self;
-    const HAS_IMAGINARY: bool;
-    fn imaginary(self) -> f64;
-    fn from_parts(real: f64, imaginary: f64) -> Self;
-    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts;
-    fn batch_normal(parts: LaneParts) -> LaneMask;
+    /// Only binary64 real scalars can use the binary64 gather kernel.
+    const GATHER_REAL: bool = false;
+    fn from_real(real: f64) -> Self;
+    fn is_unit_real(self) -> bool {
+        self.real().abs() == 1.
+    }
     /// C `ELEMENT_MAG`: `|re| + |im|`.
     fn mag(self) -> f64;
     /// Real part, used by `CountTwins`' `ABS(Real) == 1.0` test.
@@ -537,9 +542,6 @@ pub(super) trait Scalar:
     /// Update a Schur entry using the rounded multiplier only when well
     /// conditioned; otherwise recover the unnormalized cross-product.
     fn schur(self, pivot: Self, upper: Self, mult: Self, lower: Self, normal: bool) -> Self;
-    /// Update four independently normalized RHS lanes, recovering unsafe
-    /// ordinary results with the same scalar kernel.
-    fn schur_batch(acc: LaneParts, pivot: Self, lower: Self, update: &BatchUpdate) -> LaneParts;
     /// Classify the multiplier once before traversing the lower column.
     fn normal_multiplier(self) -> bool;
     /// Whether the value is exactly zero (`== 0.0` on every part).
@@ -550,23 +552,21 @@ pub(super) trait Scalar:
     fn add_real(self, r: f64) -> Self;
 }
 
+/// Scalar types representable in the packed binary64 SIMD lanes.
+pub(super) trait BatchScalar: Scalar {
+    const HAS_IMAGINARY: bool;
+    fn imaginary(self) -> f64;
+    fn from_parts(real: f64, imaginary: f64) -> Self;
+    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts;
+    fn batch_normal(parts: LaneParts) -> LaneMask;
+    fn schur_batch(acc: LaneParts, pivot: Self, lower: Self, update: &BatchUpdate) -> LaneParts;
+}
+
 impl Scalar for f64 {
     const ZERO: Self = 0.0;
-    const HAS_IMAGINARY: bool = false;
-    fn imaginary(self) -> f64 {
-        0.
-    }
-    fn from_parts(real: f64, _imaginary: f64) -> Self {
+    const GATHER_REAL: bool = true;
+    fn from_real(real: f64) -> Self {
         real
-    }
-    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts {
-        LaneParts {
-            re: parts.re * f64x4::splat(value),
-            im: f64x4::splat(0.),
-        }
-    }
-    fn batch_normal(parts: LaneParts) -> LaneMask {
-        parts.re.is_normal()
     }
     fn mag(self) -> f64 {
         self.abs()
@@ -597,6 +597,37 @@ impl Scalar for f64 {
             result
         }
     }
+    fn normal_multiplier(self) -> bool {
+        self.is_normal()
+    }
+    fn is_zero(self) -> bool {
+        self == 0.0
+    }
+    fn is_finite(self) -> bool {
+        Self::is_finite(self)
+    }
+    fn add_real(self, r: f64) -> Self {
+        self + r
+    }
+}
+
+impl BatchScalar for f64 {
+    const HAS_IMAGINARY: bool = false;
+    fn imaginary(self) -> f64 {
+        0.
+    }
+    fn from_parts(real: f64, _imaginary: f64) -> Self {
+        real
+    }
+    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts {
+        LaneParts {
+            re: parts.re * f64x4::splat(value),
+            im: f64x4::splat(0.),
+        }
+    }
+    fn batch_normal(parts: LaneParts) -> LaneMask {
+        parts.re.is_normal()
+    }
     #[inline]
     fn schur_batch(acc: LaneParts, pivot: Self, lower: Self, update: &BatchUpdate) -> LaneParts {
         let result = acc.re - update.multiplier.re * f64x4::splat(lower);
@@ -614,39 +645,12 @@ impl Scalar for f64 {
             fast,
         )
     }
-    fn normal_multiplier(self) -> bool {
-        self.is_normal()
-    }
-    fn is_zero(self) -> bool {
-        self == 0.0
-    }
-    fn is_finite(self) -> bool {
-        Self::is_finite(self)
-    }
-    fn add_real(self, r: f64) -> Self {
-        self + r
-    }
 }
 
 impl Scalar for Complex {
     const ZERO: Self = Self::ZERO;
-    const HAS_IMAGINARY: bool = true;
-    fn imaginary(self) -> f64 {
-        self.im
-    }
-    fn from_parts(real: f64, imaginary: f64) -> Self {
-        Self::new(real, imaginary)
-    }
-    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts {
-        let re = f64x4::splat(value.re);
-        let im = f64x4::splat(value.im);
-        LaneParts {
-            re: parts.re * re - parts.im * im,
-            im: parts.re * im + parts.im * re,
-        }
-    }
-    fn batch_normal(parts: LaneParts) -> LaneMask {
-        (parts.re.abs() + parts.im.abs()).is_normal()
+    fn from_real(real: f64) -> Self {
+        Self::real(real)
     }
     fn mag(self) -> f64 {
         self.re.abs() + self.im.abs()
@@ -721,6 +725,39 @@ impl Scalar for Complex {
             result
         }
     }
+    fn normal_multiplier(self) -> bool {
+        (self.re.abs() + self.im.abs()).is_normal()
+    }
+    fn is_zero(self) -> bool {
+        self.re == 0.0 && self.im == 0.0
+    }
+    fn is_finite(self) -> bool {
+        Self::is_finite(self)
+    }
+    fn add_real(self, r: f64) -> Self {
+        Self::new(self.re + r, self.im)
+    }
+}
+
+impl BatchScalar for Complex {
+    const HAS_IMAGINARY: bool = true;
+    fn imaginary(self) -> f64 {
+        self.im
+    }
+    fn from_parts(real: f64, imaginary: f64) -> Self {
+        Self::new(real, imaginary)
+    }
+    fn batch_mul(parts: LaneParts, value: Self) -> LaneParts {
+        let re = f64x4::splat(value.re);
+        let im = f64x4::splat(value.im);
+        LaneParts {
+            re: parts.re * re - parts.im * im,
+            im: parts.re * im + parts.im * re,
+        }
+    }
+    fn batch_normal(parts: LaneParts) -> LaneMask {
+        (parts.re.abs() + parts.im.abs()).is_normal()
+    }
     #[inline]
     fn schur_batch(acc: LaneParts, pivot: Self, lower: Self, update: &BatchUpdate) -> LaneParts {
         let product = Self::batch_mul(update.multiplier, lower);
@@ -733,18 +770,6 @@ impl Scalar for Complex {
         let fast = (update.normal & norm.is_normal() & norm.simd_gt(scale))
             | (result.re.is_finite() & result.im.is_finite() & LaneMask::splat(lower.is_zero()));
         update.recover(acc, result, pivot, lower, fast)
-    }
-    fn normal_multiplier(self) -> bool {
-        (self.re.abs() + self.im.abs()).is_normal()
-    }
-    fn is_zero(self) -> bool {
-        self.re == 0.0 && self.im == 0.0
-    }
-    fn is_finite(self) -> bool {
-        Self::is_finite(self)
-    }
-    fn add_real(self, r: f64) -> Self {
-        Self::new(self.re + r, self.im)
     }
 }
 
@@ -1102,7 +1127,7 @@ impl<I: PlanIndex> FactorRuns<I> {
         raw_only: bool,
     ) -> bool {
         self.forward(values, diag, inverses, x, transposed);
-        if !T::HAS_IMAGINARY && !raw_only {
+        if T::GATHER_REAL && !raw_only {
             let axis = if transposed {
                 &self.columns
             } else {
@@ -1118,7 +1143,7 @@ impl<I: PlanIndex> FactorRuns<I> {
                 if !valid {
                     return false;
                 }
-                x[i] = T::from_parts(value, 0.);
+                x[i] = T::from_real(value);
             }
         } else {
             self.backward_raw(values, diag, inverses, x, transposed);
@@ -1126,7 +1151,7 @@ impl<I: PlanIndex> FactorRuns<I> {
         true
     }
 
-    fn solve_batch<T: Scalar>(
+    fn solve_batch<T: BatchScalar>(
         &self,
         values: &[T],
         diag: &[usize],
@@ -2462,13 +2487,13 @@ impl<T: Scalar> Sparse<T> {
         let (mut out1, mut out2) = (NONE, NONE);
         let mut t1 = topology.first_in_col[col];
         while t1 != NONE {
-            if self.values[t1].real().abs() == 1.0 {
+            if self.values[t1].is_unit_real() {
                 let row = topology.elements[t1].row;
                 let mut t2 = topology.first_in_col[row];
                 while t2 != NONE && topology.elements[t2].row != col {
                     t2 = topology.elements[t2].next_in_col;
                 }
-                if t2 != NONE && self.values[t2].real().abs() == 1.0 {
+                if t2 != NONE && self.values[t2].is_unit_real() {
                     twins += 1;
                     if twins >= 2 {
                         return (twins, out1, out2);
@@ -3499,7 +3524,10 @@ impl<T: Scalar> FactorView<'_, T> {
         workspace: &mut SolveBatchWorkspace<T>,
         out: &mut Vec<T>,
         transposed: bool,
-    ) -> Result<(), BatchSolveFailure> {
+    ) -> Result<(), BatchSolveFailure>
+    where
+        T: BatchScalar,
+    {
         let frame = self.frame;
         let n = frame.ext_size;
         out.clear();
@@ -4287,7 +4315,7 @@ mod tests {
         assert_eq!(transposed[3], -17.);
     }
 
-    fn check_batch<T: Scalar>(matrix: &Sparse<T>, rhs: &[T], bits: impl Fn(T) -> [u64; 2]) {
+    fn check_batch<T: BatchScalar>(matrix: &Sparse<T>, rhs: &[T], bits: impl Fn(T) -> [u64; 2]) {
         let factor = matrix.factors().unwrap();
         let n = matrix.ext_size;
         let mut batch = SolveBatchWorkspace::default();
@@ -4454,7 +4482,7 @@ mod tests {
         check_batch(&matrix, &rhs, |z| [z.re.to_bits(), z.im.to_bits()]);
     }
 
-    fn time_rhs_batches<T: Scalar>(matrix: &Sparse<T>, rhs: &[T], scalar: &str) {
+    fn time_rhs_batches<T: BatchScalar>(matrix: &Sparse<T>, rhs: &[T], scalar: &str) {
         use std::hint::black_box;
         use std::time::Instant;
 
