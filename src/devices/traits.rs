@@ -1914,6 +1914,8 @@ pub struct TransientEventContext<'a> {
     pub solution: &'a Vector,
     /// First branch-current row of this device, when allocated.
     pub branch: Option<usize>,
+    /// Resolved branch rows named by this device's controlling sources.
+    pub controls: &'a [usize],
     /// The circuit's ground-eliminated node numbering.
     pub unknowns: &'a MnaUnknowns,
 }

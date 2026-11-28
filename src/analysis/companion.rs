@@ -883,6 +883,7 @@ impl DerivativePredictor {
 struct EventDevice<'a> {
     source: &'a dyn crate::devices::traits::DeviceTransientEvents,
     branch: Option<usize>,
+    controls: Vec<usize>,
     rows: std::ops::Range<usize>,
 }
 
@@ -1186,6 +1187,7 @@ fn event_devices(circuit: &Circuit) -> SpiceResult<Vec<EventDevice<'_>>> {
             Ok(EventDevice {
                 source,
                 branch: circuit.branch_rows(index).and_then(|mut rows| rows.next()),
+                controls: circuit.control_rows(index)?,
                 rows: circuit
                     .state_rows(index)
                     .ok_or_else(|| failure("missing event device state range"))?,
@@ -1716,6 +1718,7 @@ impl Driver<'_> {
                 time,
                 solution,
                 branch: event.branch,
+                controls: &event.controls,
                 unknowns: self.circuit.unknowns(),
             };
             if let Some(at) = self

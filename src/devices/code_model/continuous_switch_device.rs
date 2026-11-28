@@ -1,7 +1,8 @@
 //! Native continuous switch binding and signed MNA residual/Jacobian.
 
 use super::continuous_switch::{Material, Point};
-use super::source::SourceModel;
+use super::source::{SourceModel, analog_pair};
+use super::switch_control::{SwitchControl, read_pair};
 use crate::devices::models::{PreparationKey, ResolvedModel};
 use crate::devices::physical_dae::{TaylorContext, TaylorControl};
 use crate::devices::setup::MatrixSetup;
@@ -10,22 +11,15 @@ use crate::devices::{
     BranchQuantity, Device, InitialVoltageLaw, InitialVoltageRelation, LinearContext, StampContext,
 };
 use crate::maths::Vector;
-use crate::netlist::ast::{CodePortKind, CodeTerminal, DeviceInstance};
+use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeAppend, NodeId, Real, SpiceError, SpiceResult};
-
-#[derive(Debug)]
-enum Control {
-    Voltage,
-    Current,
-    Named(ControlReference),
-}
 
 #[derive(Debug)]
 struct ContinuousSwitch {
     name: String,
     model: String,
     material: Material,
-    control: Control,
+    control: SwitchControl,
     // Output and control pairs; a named branch has no control nodes.
     terminals: [NodeId; 4],
 }
@@ -36,17 +30,6 @@ struct Coordinates {
     input: [Option<usize>; 2],
     control: [Option<usize>; 2],
     ammeter: Option<usize>,
-}
-
-fn read_pair(rows: [Option<usize>; 2], values: &Vector) -> SpiceResult<Real> {
-    let read = |row: Option<usize>| {
-        row.map_or(Ok(0.), |row| {
-            values
-                .get(row)
-                .ok_or_else(|| SpiceError::circuit("unbound continuous switch coordinate"))
-        })
-    };
-    Ok(read(rows[0])? - read(rows[1])?)
 }
 
 impl Coordinates {
@@ -115,25 +98,12 @@ impl ContinuousSwitch {
     ) -> SpiceResult<Coordinates> {
         let output = [node(self.terminals[0]), node(self.terminals[1])];
         let input = self.input().map(node);
-        let (control, ammeter) = match &self.control {
-            Control::Voltage => (input, None),
-            Control::Current => {
-                let row = branch
-                    .ok_or_else(|| SpiceError::circuit("missing switch current input branch"))?;
-                ([Some(row), None], Some(row))
-            }
-            Control::Named(_) => {
-                let [row] = controls else {
-                    return Err(SpiceError::circuit("missing named switch current input"));
-                };
-                ([Some(*row), None], None)
-            }
-        };
+        let bound = self.control.rows(input, branch, controls)?;
         Ok(Coordinates {
             output,
             input,
-            control,
-            ammeter,
+            control: bound.coordinates,
+            ammeter: bound.ammeter,
         })
     }
 
@@ -175,7 +145,7 @@ impl Device for ContinuousSwitch {
     }
 
     fn terminals(&self) -> &[NodeId] {
-        if matches!(self.control, Control::Named(_)) {
+        if self.control.is_named() {
             &self.terminals[..2]
         } else {
             &self.terminals
@@ -183,7 +153,7 @@ impl Device for ContinuousSwitch {
     }
 
     fn branch_currents(&self) -> usize {
-        usize::from(matches!(self.control, Control::Current))
+        usize::from(self.control.is_sensor())
     }
 
     fn branch_quantity(&self, _branch: usize) -> BranchQuantity {
@@ -191,14 +161,11 @@ impl Device for ContinuousSwitch {
     }
 
     fn controlling_sources(&self) -> &[ControlReference] {
-        match &self.control {
-            Control::Named(reference) => std::slice::from_ref(reference),
-            _ => &[],
-        }
+        self.control.references()
     }
 
     fn initial_voltage_relations(&self, _inductors_short: bool) -> Vec<InitialVoltageRelation> {
-        if matches!(self.control, Control::Current) {
+        if self.control.is_sensor() {
             vec![InitialVoltageRelation {
                 terminals: self.input(),
                 law: InitialVoltageLaw::Fixed(0.),
@@ -340,13 +307,6 @@ impl Device for ContinuousSwitch {
     }
 }
 
-fn pair(terminal: &CodeTerminal, nodes: &mut NodeAppend<'_>) -> SpiceResult<[NodeId; 2]> {
-    Ok([
-        nodes.intern(&terminal.positive)?,
-        nodes.intern(terminal.negative.as_deref().unwrap_or("0"))?,
-    ])
-}
-
 pub(super) fn instantiate(
     schema: SourceModel,
     instance: &DeviceInstance,
@@ -360,31 +320,10 @@ pub(super) fn instantiate(
         return Err(SpiceError::circuit("continuous switch port count mismatch"));
     };
     let input = &input.terminals[0];
-    let control = match input.kind {
-        CodePortKind::Voltage
-        | CodePortKind::VoltageDifferential
-        | CodePortKind::Conductance
-        | CodePortKind::ConductanceDifferential => Control::Voltage,
-        CodePortKind::Current | CodePortKind::CurrentDifferential => Control::Current,
-        CodePortKind::BranchCurrent => Control::Named(ControlReference {
-            name: input.positive.clone(),
-            location: Some(instance.location.clone()),
-        }),
-        _ => return Err(SpiceError::circuit("invalid continuous switch control")),
-    };
+    let control = SwitchControl::parse(input, &instance.location)?;
     nodes.transaction(|nodes| {
-        let [p, n] = pair(&output.terminals[0], nodes)?;
-        let [cp, cn] = if matches!(control, Control::Named(_)) {
-            [NodeId::GROUND; 2]
-        } else {
-            pair(input, nodes)?
-        };
-        if matches!(control, Control::Current) && cp == cn {
-            return Err(SpiceError::parse(
-                instance.location.clone(),
-                "shorted ideal switch current input",
-            ));
-        }
+        let [p, n] = analog_pair(&output.terminals[0], nodes)?;
+        let [cp, cn] = control.bind_nodes(input, nodes, &instance.location)?;
         Ok(Box::new(ContinuousSwitch {
             name: instance.name.clone(),
             model: model.card().name.clone(),

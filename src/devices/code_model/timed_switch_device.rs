@@ -1,8 +1,11 @@
 //! Native physical binding for the prepared timed-switch schema.
 use super::source::{SourceModel, numeric_scalar};
-use super::timed_switch::{Material, Parameters, State, Transition};
+use super::switch_control::{SwitchControl, read_pair};
+use super::timed_switch::{Material, Parameters, RisingBoundary, State, Transition};
 use crate::devices::noise::{DeviceNoise, NoiseContext, NoiseFamily, NoiseKind, NoiseSource};
-use crate::devices::traits::{ConvergenceContext, DeviceTransientEvents, TransientEventContext};
+use crate::devices::traits::{
+    ControlReference, ConvergenceContext, DeviceTransientEvents, MnaUnknowns, TransientEventContext,
+};
 use crate::devices::{AnalysisMode, Device, LinearContext, StampContext};
 use crate::maths::Vector;
 use crate::netlist::ast::ModelCard;
@@ -32,6 +35,13 @@ pub(super) fn compile(card: &ModelCard) -> SpiceResult<Material> {
                 explicit_duration = true;
             }
             "instantaneous" => instantaneous = matches!(value, 1.),
+            "inclusive_rise" => {
+                p.rising_boundary = if matches!(value, 1.) {
+                    RisingBoundary::Inclusive
+                } else {
+                    RisingBoundary::Strict
+                }
+            }
             "td_off" => p.delay[0] = value,
             "td_on" => p.delay[1] = value,
             "vt" => p.center = value,
@@ -65,8 +75,8 @@ pub(super) struct TimedSwitch {
     pub(super) model_name: String,
     /// Source port order: control, conducting branch.
     pub(super) terminals: [NodeId; 4],
-    /// A current control is an ideal zero-voltage sensing branch.
-    pub(super) sense_current: bool,
+    /// Differential voltage, local ammeter, or existing named branch.
+    pub(super) control: SwitchControl,
     pub(super) material: Material,
 }
 
@@ -81,17 +91,17 @@ impl TimedSwitch {
 
     fn control(
         &self,
-        voltage: impl Fn(NodeId) -> Real,
+        unknowns: &MnaUnknowns,
         branch: Option<usize>,
+        controls: &[usize],
         solution: &Vector,
     ) -> SpiceResult<Real> {
-        if self.sense_current {
-            branch
-                .and_then(|row| solution.get(row))
-                .ok_or_else(|| SpiceError::circuit("missing timed switch sensor current"))
-        } else {
-            Ok(voltage(self.terminals[0]) - voltage(self.terminals[1]))
-        }
+        let rows = self.control.rows(
+            self.sense_terminals().map(|node| unknowns.node_row(node)),
+            branch,
+            controls,
+        )?;
+        read_pair(rows.coordinates, solution)
     }
 
     fn frozen_state(
@@ -129,23 +139,30 @@ impl Device for TimedSwitch {
         Some(&self.model_name)
     }
     fn terminals(&self) -> &[NodeId] {
-        &self.terminals
+        if self.control.is_named() {
+            &self.terminals[2..]
+        } else {
+            &self.terminals
+        }
+    }
+    fn controlling_sources(&self) -> &[ControlReference] {
+        self.control.references()
     }
     fn branch_currents(&self) -> usize {
-        usize::from(self.sense_current)
+        usize::from(self.control.is_sensor())
     }
     fn branch_quantity(&self, _branch: usize) -> crate::devices::BranchQuantity {
         crate::devices::BranchQuantity::InputCurrent
     }
     fn findable_branch(&self) -> Option<usize> {
-        self.sense_current.then_some(0)
+        self.control.is_sensor().then_some(0)
     }
     fn initial_voltage_relations(
         &self,
         _inductors_short: bool,
     ) -> Vec<crate::devices::InitialVoltageRelation> {
         use crate::devices::{InitialVoltageLaw, InitialVoltageRelation};
-        if self.sense_current {
+        if self.control.is_sensor() {
             vec![InitialVoltageRelation {
                 terminals: self.sense_terminals(),
                 law: InitialVoltageLaw::Fixed(0.),
@@ -180,7 +197,7 @@ impl Device for TimedSwitch {
     ) -> SpiceResult<bool> {
         let [p, n] = self.branch();
         setup.conductance(p, n);
-        if self.sense_current {
+        if self.control.is_sensor() {
             let [cp, cn] = self.sense_terminals();
             setup.voltage_branch(cp, cn, setup.branch(0)?);
         }
@@ -197,12 +214,12 @@ impl Device for TimedSwitch {
                 ));
             }
         };
-        let branch = if self.sense_current {
+        let branch = if self.control.is_sensor() {
             Some(context.branch(0)?)
         } else {
             None
         };
-        let control = self.control(|node| context.node_voltage(node), branch, context.solution)?;
+        let control = self.control(context.unknowns, branch, context.controls, context.solution)?;
         let mut accepted = [0.; State::SLOTS];
         let history = if time > 0. {
             for (slot, value) in accepted.iter_mut().enumerate() {
@@ -246,8 +263,9 @@ impl Device for TimedSwitch {
     fn convergence_test(&self, context: &ConvergenceContext<'_>) -> SpiceResult<bool> {
         let time = context.time;
         let control = self.control(
-            |node| context.voltage(node),
+            context.unknowns,
             context.branch,
+            context.controls,
             context.solution,
         )?;
         let accepted = context
@@ -283,20 +301,10 @@ impl Device for TimedSwitch {
         bias: &Vector,
     ) -> SpiceResult<()> {
         let state = self.frozen_state(context.states, || {
-            self.control(
-                |node| {
-                    context
-                        .unknowns
-                        .node_row(node)
-                        .and_then(|row| bias.get(row))
-                        .unwrap_or(0.)
-                },
-                context.branch,
-                bias,
-            )
+            self.control(context.unknowns, context.branch, context.controls, bias)
         })?;
         context.nodal(self.branch(), state.at_conductance(self.material)?, false)?;
-        if self.sense_current {
+        if self.control.is_sensor() {
             context.branch(self.sense_terminals())?;
         }
         Ok(())
@@ -310,7 +318,7 @@ impl Device for TimedSwitch {
         let state = self.frozen_state(context.states, || {
             // Analysis supplies the solved device-local bias state. The
             // unloaded voltage receiver also supports a memoryless fallback.
-            self.control(|node| context.voltage(node), None, context.bias)
+            self.control(context.unknowns, None, context.controls, context.bias)
         })?;
         sources.push(NoiseSource::new(
             "",
@@ -321,7 +329,7 @@ impl Device for TimedSwitch {
             },
         ));
         Ok(DeviceNoise::Sources {
-            family: if self.sense_current {
+            family: if self.control.is_current() {
                 NoiseFamily::CurrentSwitch
             } else {
                 NoiseFamily::VoltageSwitch
@@ -357,8 +365,9 @@ impl DeviceTransientEvents for TimedSwitch {
     ) -> SpiceResult<Option<Real>> {
         let old = State::from_values(context.accepted)?;
         let control = self.control(
-            |node| context.voltage(node),
+            context.unknowns,
             context.branch,
+            context.controls,
             context.solution,
         )?;
         let candidate = self.material.advance(old, context.time, control)?;

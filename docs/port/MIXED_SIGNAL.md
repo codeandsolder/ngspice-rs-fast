@@ -122,9 +122,11 @@ Reference provenance and regeneration instructions are in
 
 The prepared `preprocess_timed_switch` source descriptor binds a physical
 conductance with an unloaded single-ended/differential voltage receiver
-(`%v`, `%vd`) or an ideal zero-voltage current sensor (`%i`, `%id`)
-and a differential conducting branch. Current is signed from the first
-control terminal to the second; the single-ended sensor references ground.
+(`%v`, `%vd`), an ideal zero-voltage current sensor (`%i`, `%id`), or
+an existing named branch (`%vnam(name)`), and a differential conducting
+branch. Current is signed from the first control terminal to the second;
+the single-ended sensor references ground. A named branch is sampled
+directly without inserting a sensor or another electrical branch.
 Independent input loading remains an ordinary circuit element. Each instance has seven finite accepted
 history slots: the previous time/control, phase anchor time and phase,
 target, requested direction, and optional deadline. Newton candidates
@@ -132,7 +134,11 @@ derive a new state exclusively from the preceding accepted state.
 
 The logarithmic conductance law interpolates smoothly between exact
 reciprocal-resistance rails. DC qualifies the initial hint with strict
-threshold comparisons; AC freezes the converged conductance with no
+threshold comparisons by default. The explicit Boolean `inclusive_rise=1`
+selects an inclusive off-to-on comparison at the upper threshold, while
+the on-to-off comparison remains strict. This applies to zero and nonzero
+propagation delays, independently of transition shape or cancellation policy.
+AC freezes the converged conductance with no
 incremental control-to-branch gain. No fictitious storage or conductance
 floor is introduced. The frozen conducting branch contributes thermal
 current noise with spectral density `4 k T G` in either mode.

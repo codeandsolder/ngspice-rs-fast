@@ -270,6 +270,7 @@ fn invalid_scoped_physics_and_ports_are_rejected() {
         "ic=2",
         "extra=1",
         "instantaneous=2",
+        "inclusive_rise=2",
         "instantaneous=1 ton=1n",
         "instantaneous=1 toff=0",
     ] {
@@ -373,6 +374,10 @@ fn instantaneous_inertial_pulses_match_independent_scheduler() -> SpiceResult<()
         vref rtn 0 .75\n\
         vdrive control rtn {wave}\n\
         idrive rtn sensor {wave}\n\
+        idrive_named rtn named_sensor {wave}\n\
+        vsense named_sensor rtn 0\n\
+        vbn r rtn 1\n\
+        an %vnam(vsense) %gd(r rtn) m\n\
         vbv p rtn 1\n\
         vbi q rtn -2\n\
         av %vd(control rtn) %gd(p rtn) m\n\
@@ -403,7 +408,8 @@ fn instantaneous_inertial_pulses_match_independent_scheduler() -> SpiceResult<()
                 .saturating_sub(1);
             let g_v = -value(&plot, "i(vbv)", index);
             let g_i = value(&plot, "i(vbi)", index) / 2.;
-            for g in [g_v, g_i] {
+            let g_named = -value(&plot, "i(vbn)", index);
+            for g in [g_v, g_i, g_named] {
                 assert!(
                     (g - 0.1).abs() <= 1e-12 || (g - 1e-6).abs() <= 1e-12,
                     "non-rail conductance {g:e}"
@@ -426,6 +432,13 @@ fn instantaneous_inertial_pulses_match_independent_scheduler() -> SpiceResult<()
             close(
                 &format!("current at {time:e}, step {step}"),
                 g_i,
+                expected,
+                1e-9,
+                1e-13,
+            );
+            close(
+                &format!("named branch at {time:e}, step {step}"),
+                g_named,
                 expected,
                 1e-9,
                 1e-13,
@@ -470,6 +483,7 @@ fn instantaneous_switch_dc_ac_and_thermal_noise() -> SpiceResult<()> {
     for (control, terminal) in [
         ("vcontrol cp rtn -1 ac 1", "%vd(cp rtn)"),
         ("icontrol rtn cp -1 ac 1", "%id(cp rtn)"),
+        ("icontrol rtn cp -1 ac 1\nvsense cp rtn 0", "%vnam(vsense)"),
     ] {
         for (ic, resistance) in [(0, 1e6), (1, 10.)] {
             let source = format!(

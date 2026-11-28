@@ -14,6 +14,7 @@ pub(super) struct Material {
     transition: Transition,
     delay: [Real; 2],
     threshold: [Real; 2],
+    rising_boundary: RisingBoundary,
     tolerance: Real,
     initial: bool,
 }
@@ -28,6 +29,15 @@ pub(super) enum Transition {
     InstantInertial,
 }
 
+/// Source-selected comparison at the rising threshold. Falling transitions
+/// remain strict; the generic finite-slew law retains its original default.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) enum RisingBoundary {
+    #[default]
+    Strict,
+    Inclusive,
+}
+
 /// Cold parameters, in off/on or falling/rising order.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Parameters {
@@ -36,6 +46,7 @@ pub(super) struct Parameters {
     pub(super) delay: [Real; 2],
     pub(super) center: Real,
     pub(super) hysteresis: Real,
+    pub(super) rising_boundary: RisingBoundary,
     pub(super) tolerance: Real,
     pub(super) initial: bool,
 }
@@ -48,6 +59,7 @@ impl Default for Parameters {
             delay: [0.; 2],
             center: 0.5,
             hysteresis: 1.,
+            rising_boundary: RisingBoundary::Strict,
             tolerance: 10e-12,
             initial: false,
         }
@@ -82,6 +94,7 @@ impl Material {
             transition: p.transition,
             delay: p.delay,
             threshold,
+            rising_boundary: p.rising_boundary,
             tolerance: p.tolerance,
             initial: p.initial,
         })
@@ -92,12 +105,13 @@ impl Material {
     }
 
     fn receive(self, control: Real, previous: bool) -> bool {
-        if control > self.threshold[1] {
-            true
-        } else if control < self.threshold[0] {
-            false
+        if previous {
+            control >= self.threshold[0]
         } else {
-            previous
+            match self.rising_boundary {
+                RisingBoundary::Strict => control > self.threshold[1],
+                RisingBoundary::Inclusive => control >= self.threshold[1],
+            }
         }
     }
 
@@ -159,7 +173,7 @@ impl Material {
 
     #[expect(
         clippy::float_cmp,
-        reason = "exact threshold equality preserves the previous discrete receiver state"
+        reason = "an already accepted exact threshold point does not require midpoint refinement"
     )]
     pub(super) fn retry_at(self, old: State, candidate: State) -> Option<Real> {
         let time = candidate.time;
@@ -702,6 +716,41 @@ mod tests {
         let retry = material.advance(lower_equality, 7., -3.)?;
         assert_eq!(retry.at_conductance(material)?, 1e3);
         assert_eq!(retry.next_boundary(material)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn inclusive_rising_boundary_preserves_falling_equality_and_delays() -> SpiceResult<()> {
+        let material = Material::compile(Parameters {
+            transition: Transition::InstantInertial,
+            rising_boundary: RisingBoundary::Inclusive,
+            resistance: [100., 1e-3],
+            delay: [0., 2.],
+            center: -3.,
+            hysteresis: 1.,
+            ..Parameters::default()
+        })?;
+        assert_eq!(material.equilibrium(-2.)?.at_conductance(material)?, 1e3);
+        let initial = material.equilibrium(-5.)?;
+        let pending = material.advance(initial, 3., -2.)?;
+        assert_eq!(pending.next_boundary(material)?, Some(5.));
+        assert_eq!(pending.at_conductance(material)?, 0.01);
+        let landed = material.advance(pending, 5., -2.)?;
+        assert_eq!(landed.at_conductance(material)?, 1e3);
+        let equality = material.advance(landed, 6., -4.)?;
+        assert_eq!(equality.at_conductance(material)?, 1e3);
+        let off = material.advance(equality, 7., -5.)?;
+        assert_eq!(off.at_conductance(material)?, 0.01);
+        let zero = Material::compile(Parameters {
+            transition: Transition::InstantInertial,
+            rising_boundary: RisingBoundary::Inclusive,
+            center: 0.,
+            hysteresis: 0.,
+            ..Parameters::default()
+        })?;
+        let at = zero.advance(zero.equilibrium(-1.)?, 1., 0.)?;
+        assert!(at.target);
+        assert!(zero.advance(at, 2., 0.)?.target);
         Ok(())
     }
 
