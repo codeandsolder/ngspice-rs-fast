@@ -245,7 +245,10 @@ impl Runner<'_> {
         sink: &mut dyn PointSink,
     ) -> SpiceResult<TransientEnd> {
         self.integrate(
-            self.plan.transient.over_period(period, self.resolution),
+            self.plan
+                .transient
+                .clone()
+                .over_period(period, self.resolution),
             TransientRun::Shooting {
                 seed: state,
                 points,
@@ -258,7 +261,7 @@ impl Runner<'_> {
     fn startup(&mut self) -> SpiceResult<Vector> {
         let duration = self.plan.startup.max(self.plan.transient.step());
         self.integrate(
-            self.plan.transient.over_duration(duration),
+            self.plan.transient.clone().over_duration(duration),
             TransientRun::Seed,
             &mut Discard,
         )

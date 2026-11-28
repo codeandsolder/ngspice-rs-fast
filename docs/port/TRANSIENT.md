@@ -549,3 +549,21 @@ both limits of the single in-run breakpoint; worst error 0.000 of the bound).
 * No `gmin`/source stepping: a floating or source-looped DC bias is an error.
 * General DAE structure is not analysed (no index check); a singular trial
   matrix is an explicit error naming the unknown, as `NIiter` reports it.
+
+### Resolved segmented timing
+
+Programmatic transient inputs may carry a validated `TransientSchedule`
+instead of positional time operands. Output intervals and integration ceilings
+are independent, ordered absolute-time partitions of the same duration. The
+output grid starts at the output gate, includes subsequent segment boundaries
+and the final stop once, and is generated lazily. Under UIC the initial zero
+time row remains suppressed. Integration continues from time zero regardless
+of the output gate.
+
+The adaptive driver lands on output samples and ceiling changes without
+resetting accepted integration history or treating timing boundaries as physical
+discontinuities. Coincident source events retain physical-event precedence.
+The initial output interval remains the run's source timing reference; varying
+source defaults require explicit source-policy binding before execution.
+The minimum step policy uses the smallest resolved integration ceiling.
+Native positional transient inputs retain their adaptive accepted-point output.

@@ -518,6 +518,9 @@ fn validate_input(input: &AnalysisInput) -> SpiceResult<()> {
             | AnalysisKind::Noise
             | AnalysisKind::Distortion
     );
+    if input.transient_schedule.is_some() && input.kind != AnalysisKind::Transient {
+        return Err(unsupported("timing schedule requires a transient analysis"));
+    }
     if input.uic
         && !matches!(
             input.kind,
@@ -551,15 +554,23 @@ fn resolve_time_domain(
     specific: SpecificOptions,
     newton: &crate::analysis::newton::NewtonOptions,
     uic: bool,
+    schedule: Option<super::TransientSchedule>,
 ) -> SpiceResult<PlanKind> {
     let SpecificOptions::Transient(options) = specific else {
         return Err(unsupported("missing transient options"));
     };
     if kind == AnalysisKind::Transient {
-        Ok(PlanKind::Transient {
-            settings: super::companion::TransientPlan::resolve(positional, options, newton)?,
-            uic,
-        })
+        let settings = if let Some(schedule) = schedule {
+            if !positional.is_empty() {
+                return Err(unsupported(
+                    "transient schedule conflicts with positional time bounds",
+                ));
+            }
+            super::companion::TransientPlan::from_schedule(schedule, options, newton)
+        } else {
+            super::companion::TransientPlan::resolve(positional, options, newton)?
+        };
+        Ok(PlanKind::Transient { settings, uic })
     } else {
         Ok(PlanKind::PeriodicSteadyState {
             settings: super::pss::PssPlan::resolve(positional, options, newton)?,
@@ -630,9 +641,14 @@ impl AnalysisPlan {
                     retain_bias,
                 }
             }
-            AnalysisKind::Transient | AnalysisKind::PeriodicSteadyState => {
-                resolve_time_domain(kind, &positional, specific, &dc.newton, input.uic)?
-            }
+            AnalysisKind::Transient | AnalysisKind::PeriodicSteadyState => resolve_time_domain(
+                kind,
+                &positional,
+                specific,
+                &dc.newton,
+                input.uic,
+                input.transient_schedule,
+            )?,
             AnalysisKind::HarmonicBalance => resolve_harmonic_balance(&positional, specific)?,
             AnalysisKind::PoleZero => PlanKind::PoleZero {
                 card: pz::parse(&positional)?,

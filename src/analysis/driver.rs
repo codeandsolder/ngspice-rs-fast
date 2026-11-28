@@ -59,6 +59,9 @@ pub struct AnalysisInput {
     /// positional time arguments. The companion transient driver implements it
     /// (`dctran.c` `MODEUIC`).
     pub uic: bool,
+    /// Independently resolved transient sampling and integration schedules.
+    /// Mutually exclusive with positional transient time arguments.
+    pub transient_schedule: Option<crate::analysis::TransientSchedule>,
     /// The deck's `.ic` entries in deck order (see [`NodeCondition`]). Enforced
     /// by the companion transient initial operating point unless `uic`; ignored
     /// by `.op`/`.dc`/`.ac`, exactly as C (`cktload.c`), but always validated.
@@ -82,6 +85,7 @@ impl AnalysisInput {
             kind,
             arguments: Vec::new(),
             uic: false,
+            transient_schedule: None,
             initial_conditions: Vec::new(),
             nodesets: Vec::new(),
             noise: None,

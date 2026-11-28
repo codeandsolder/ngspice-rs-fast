@@ -91,6 +91,8 @@
 //! `nicomcof.c` (default 0.5).
 
 mod branch_events;
+mod schedule;
+pub use schedule::{TimingSegment, TransientSchedule};
 
 use crate::devices::physical_dae::BranchTrace;
 use crate::devices::{
@@ -144,12 +146,13 @@ struct Tolerances {
 }
 
 /// A validated `.tran` request for the companion backend.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TransientPlan {
     step: Real,
     stop: Real,
     start: Real,
     max_step: Real,
+    schedule: Option<TransientSchedule>,
     minbreak: Real,
     voltage_lte: Option<crate::analysis::plan::VoltageLte>,
     method: IntegrationMethod,
@@ -211,6 +214,7 @@ impl TransientPlan {
             stop: end_time,
             start: start_time,
             max_step,
+            schedule: None,
             minbreak: options.minbreak,
             voltage_lte: options.voltage_lte,
             method: options.method,
@@ -226,6 +230,16 @@ impl TransientPlan {
             tran_max_iter: options.tran_max_iter,
             xmu: options.xmu,
         }
+    }
+
+    pub(super) fn from_schedule(
+        schedule: TransientSchedule,
+        options: crate::analysis::plan::TransientOptions,
+        newton: &crate::analysis::newton::NewtonOptions,
+    ) -> Self {
+        let mut plan = Self::from_bounds(schedule.bounds(), options, newton);
+        plan.schedule = Some(schedule);
+        plan
     }
 
     /// Requested output time step.
@@ -283,18 +297,19 @@ impl TransientPlan {
     }
 
     /// Reuse the resolved integrator settings for an autonomous one-period map.
-    pub(super) const fn over_duration(mut self, duration: Real) -> Self {
+    pub(super) fn over_duration(mut self, duration: Real) -> Self {
         self.stop = duration;
         self.start = 0.;
+        self.schedule = None;
         self
     }
 
-    pub(super) const fn with_max_steps(mut self, steps: usize) -> Self {
+    pub(super) fn with_max_steps(mut self, steps: usize) -> Self {
         self.max_steps = steps;
         self
     }
 
-    pub(super) const fn over_period(mut self, period: Real, resolution: Real) -> Self {
+    pub(super) fn over_period(mut self, period: Real, resolution: Real) -> Self {
         self.step = period / resolution;
         self.max_step = self.step;
         self.over_duration(period)
@@ -312,7 +327,11 @@ impl TransientPlan {
 
     /// C `CKTdelmin`.
     fn min_step(&self) -> Real {
-        1e-11 * self.max_step
+        1e-11
+            * self
+                .schedule
+                .as_ref()
+                .map_or(self.max_step, TransientSchedule::minimum_ceiling)
     }
 }
 
@@ -429,6 +448,7 @@ struct AttemptedStep {
     boundary: Boundary,
     coefficients: Coefficients,
     event_start: Option<Real>,
+    exact_start: Option<Real>,
 }
 
 #[derive(PartialEq, Debug)]
@@ -462,7 +482,14 @@ impl AcceptedCursor {
     ) -> SpiceResult<ReadyStep> {
         let mut clock = self.clock;
         let min_step = settings.min_step();
-        clock.next.delta = clock.next.delta.min(settings.max_step);
+        let ceiling = settings
+            .schedule
+            .as_ref()
+            .map(|schedule| schedule.ceiling_at(clock.time));
+        clock.next.delta = clock
+            .next
+            .delta
+            .min(ceiling.map_or(settings.max_step, |segment| segment.step));
         // First timepoint after a breakpoint: reduce the order and step.
         if almost_equal_ulps(clock.time, breaks.first(), 100)
             || breaks.first() - clock.time <= min_step
@@ -498,12 +525,16 @@ impl AcceptedCursor {
             clock.save_delta = clock.next.delta;
             clock.next.delta = (breaks.first() - clock.time) / 2.0;
         }
-        Ok(ReadyStep {
+        let mut ready = ReadyStep {
             clock,
             boundary,
             event_landing: None,
             probe_landing: None,
-        })
+        };
+        if let Some(segment) = ceiling {
+            ready.limit_to_sample(segment.until);
+        }
+        Ok(ready)
     }
 }
 
@@ -512,13 +543,30 @@ impl ReadyStep {
     // order and one-sided forcing policy unless a real breakpoint coincides.
     fn limit_to_sample(&mut self, at: Real) {
         let distance = at - self.clock.time;
-        if self.clock.next.delta > distance {
+        if distance <= 0. {
+            return;
+        }
+        let end = self.end_time();
+        if self.clock.next.delta >= distance || end >= at {
+            if end > at {
+                self.boundary = Boundary::Ordinary;
+                self.event_landing = None;
+            }
             self.clock.next.delta = distance;
-            self.boundary = Boundary::Ordinary;
-        } else if !almost_equal_ulps(self.clock.time + self.clock.next.delta, at, 100)
-            && self.clock.next.delta * 1.9 > distance
-        {
+            self.probe_landing = Some(at);
+        } else if !almost_equal_ulps(end, at, 100) && self.clock.next.delta * 1.9 > distance {
             self.clock.next.delta = distance / 2.;
+            self.boundary = Boundary::Ordinary;
+            self.event_landing = None;
+            self.probe_landing = None;
+        }
+    }
+
+    fn shorten(&mut self, maximum: Real) {
+        if self.clock.next.delta > maximum {
+            self.clock.next.delta = maximum;
+            self.event_landing = None;
+            self.probe_landing = None;
             self.boundary = Boundary::Ordinary;
         }
     }
@@ -549,6 +597,10 @@ impl ReadyStep {
         let end = self.end_time();
         let mut clock = self.clock;
         let event_start = self.event_landing.map(|_| clock.time);
+        let exact_start = self
+            .event_landing
+            .or(self.probe_landing)
+            .map(|_| clock.time);
         clock.time = end;
         let coefficients = steps.trial(
             settings.method,
@@ -561,6 +613,7 @@ impl ReadyStep {
             boundary: self.boundary,
             coefficients,
             event_start,
+            exact_start,
         })
     }
 }
@@ -570,7 +623,7 @@ impl AttemptedStep {
         let mut clock = self.clock;
         // C adds then subtracts; restoring the previous accepted time would
         // change rounding. Only this retry cursor, never the history, moves.
-        clock.time = self.event_start.unwrap_or(clock.time - clock.next.delta);
+        clock.time = self.exact_start.unwrap_or(clock.time - clock.next.delta);
         if next.delta <= min_step {
             if clock.next.delta > min_step {
                 next.delta = min_step;
@@ -674,6 +727,34 @@ impl SampleGrid {
             self.index += 1;
         }
         Ok(self.time())
+    }
+}
+
+enum OutputGrid {
+    Orbit(SampleGrid),
+    Scheduled(schedule::ScheduledGrid),
+}
+
+impl OutputGrid {
+    fn time(&self) -> Real {
+        match self {
+            Self::Orbit(grid) => grid.time(),
+            Self::Scheduled(grid) => grid.time(),
+        }
+    }
+
+    fn at_sample(&self, time: Real) -> bool {
+        match self {
+            Self::Orbit(grid) => grid.at_sample(time),
+            Self::Scheduled(grid) => time.to_bits() == grid.time().to_bits(),
+        }
+    }
+
+    fn advance(&mut self, on_sample: bool) -> SpiceResult<Real> {
+        match self {
+            Self::Orbit(grid) => grid.advance(on_sample),
+            Self::Scheduled(grid) => grid.advance(on_sample),
+        }
     }
 }
 
@@ -944,9 +1025,10 @@ pub fn companion_transient_into(
     context: &AnalysisContext,
     sink: &mut dyn PointSink,
 ) -> SpiceResult<TransientStats> {
-    let settings = *request
+    let settings = request
         .transient()
-        .ok_or_else(|| unsupported("companion requires a transient plan"))?;
+        .ok_or_else(|| unsupported("companion requires a transient plan"))?
+        .clone();
     let result = run_transient(
         circuit,
         request,
@@ -992,9 +1074,10 @@ pub fn mixed_signal_transient_into(
     mixed: &mut super::digital::MixedSignal,
     sink: &mut dyn PointSink,
 ) -> SpiceResult<TransientStats> {
-    let settings = *request
+    let settings = request
         .transient()
-        .ok_or_else(|| unsupported("mixed signal requires a transient plan"))?;
+        .ok_or_else(|| unsupported("mixed signal requires a transient plan"))?
+        .clone();
     if request.uic() {
         return Err(unsupported("mixed-signal UIC initialization"));
     }
@@ -1392,8 +1475,14 @@ impl Driver<'_> {
             .as_ref()
             .map(|values| vec![0.0_f64; values.len()]);
         let mut sample = match purpose {
-            TransientRun::Shooting { points, .. } => Some(SampleGrid::new(points, stop)),
-            _ => None,
+            TransientRun::Shooting { points, .. } => {
+                Some(OutputGrid::Orbit(SampleGrid::new(points, stop)))
+            }
+            _ => self
+                .settings
+                .schedule
+                .as_ref()
+                .map(|schedule| OutputGrid::Scheduled(schedule.grid())),
         };
         let capture_boundary = matches!(
             purpose,
@@ -1406,7 +1495,7 @@ impl Driver<'_> {
             self.accumulate_charge_scales(charge_scales.as_deref_mut())?;
             let time = accepted.cursor.clock.time;
             let on_sample = sample.as_ref().is_none_or(|grid| grid.at_sample(time));
-            let output_time = sample.as_ref().map_or(time, SampleGrid::time);
+            let output_time = sample.as_ref().map_or(time, OutputGrid::time);
             self.accept_breaks(&mut accepted, &mut sources, &mut breaks)?;
             if on_sample && accepted.cursor.clock.time >= start {
                 self.emit_accepted(
@@ -1418,7 +1507,9 @@ impl Driver<'_> {
                     &mut point,
                 )?;
             }
-            let exact_stop = self.physical_events.is_some() || sources.has_exact();
+            let exact_stop = self.settings.schedule.is_some()
+                || self.physical_events.is_some()
+                || sources.has_exact();
             if (exact_stop && time >= stop) || (!exact_stop && almost_equal_ulps(time, stop, 100)) {
                 break;
             }
@@ -1605,7 +1696,7 @@ impl Driver<'_> {
         if let Some(mixed) = self.mixed.as_deref() {
             if mixed.boundary() && time > 0. {
                 ready.clock.next.order = Order::One;
-                ready.clock.next.delta = ready.clock.next.delta.min(0.1 * ready.clock.save_delta);
+                ready.shorten(0.1 * ready.clock.save_delta);
             }
             if let Some(at) = mixed.next_ramp_boundary(time)? {
                 ready.limit_to_event(at);
@@ -1628,7 +1719,7 @@ impl Driver<'_> {
             && time - at > min_step
         {
             let start = attempt
-                .event_start
+                .exact_start
                 .unwrap_or(time - attempt.clock.next.delta);
             let delta = (at - start).max(min_step).max(start.next_up() - start);
             if delta < attempt.clock.next.delta {
@@ -1716,7 +1807,7 @@ impl Driver<'_> {
             && time - at > min_step
         {
             let start = attempt
-                .event_start
+                .exact_start
                 .unwrap_or(time - attempt.clock.next.delta);
             let delta = (at - start).max(min_step).max(start.next_up() - start);
             if delta < attempt.clock.next.delta {
@@ -1965,10 +2056,13 @@ impl Driver<'_> {
     ) -> SpiceResult<CandidateOutput> {
         let time = attempt.clock.time;
         let observed = if time < self.settings.start
-            || output
-                .sample_at
-                .is_some_and(|at| !almost_equal_ulps(time, at, 100))
-        {
+            || output.sample_at.is_some_and(|at| {
+                if self.settings.schedule.is_some() {
+                    time.to_bits() != at.to_bits()
+                } else {
+                    !almost_equal_ulps(time, at, 100)
+                }
+            }) {
             None
         } else {
             Some(observe()?)
@@ -2663,6 +2757,7 @@ mod step_control_tests {
             stop: 10.,
             start: 0.,
             max_step: 1.,
+            schedule: None,
             minbreak: 0.,
             voltage_lte: None,
             max_order: 2,
@@ -2750,6 +2845,36 @@ mod step_control_tests {
             .retry(proposal(0.02), 0.001)
             .unwrap();
         assert_eq!(retry.clock.time.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn sample_landings_preserve_history_order_and_retry_origin() {
+        let mut ready = ready();
+        ready.clock.time = 0.1;
+        ready.clock.next.delta = 0.4;
+        ready.clock.next.order = Order::Two;
+        ready.limit_to_sample(0.3);
+        assert_eq!(ready.end_time().to_bits(), 0.3_f64.to_bits());
+        assert_eq!(ready.boundary, Boundary::Ordinary);
+        assert_eq!(ready.clock.next.order, Order::Two);
+        let mut steps = StepHistory::with_fill(1.);
+        let first = settings().method;
+        steps.accept(&steps.trial(first, 1, 0.1, 0.5).unwrap());
+        let attempt = ready.begin(&steps, &settings()).unwrap();
+        assert_eq!(
+            attempt
+                .retry(proposal(0.02), 0.001)
+                .unwrap()
+                .clock
+                .time
+                .to_bits(),
+            0.1_f64.to_bits()
+        );
+        ready.limit_to_event(0.3);
+        assert_eq!(ready.boundary, Boundary::Forced);
+        ready.shorten(0.01);
+        assert!(ready.end_time() < 0.3);
+        assert_eq!(ready.boundary, Boundary::Ordinary);
     }
 
     #[test]
