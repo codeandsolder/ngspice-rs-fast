@@ -143,16 +143,18 @@ impl PlannedExpansion {
         instance: &DeviceInstance,
         models: &ModelResolver<'_>,
         context: &ModelContext,
+        graph: &super::passive_network::topology::ReferenceGraph,
     ) -> SpiceResult<Option<Self>> {
-        let kind = if let Some(plan) = super::passive_network::NetworkPlan::prepare(instance)? {
-            ExpansionKind::Network(plan)
-        } else {
-            match instance.designator.to_ascii_lowercase() {
-                'u' => ExpansionKind::Urc(UrcPlan::prepare(instance, models, context)?),
-                'y' => ExpansionKind::Txl(TxlPlan::prepare(instance, models, context)?),
-                _ => return Ok(None),
-            }
-        };
+        let kind =
+            if let Some(plan) = super::passive_network::NetworkPlan::prepare(instance, graph)? {
+                ExpansionKind::Network(plan)
+            } else {
+                match instance.designator.to_ascii_lowercase() {
+                    'u' => ExpansionKind::Urc(UrcPlan::prepare(instance, models, context)?),
+                    'y' => ExpansionKind::Txl(TxlPlan::prepare(instance, models, context)?),
+                    _ => return Ok(None),
+                }
+            };
         let size = match &kind {
             ExpansionKind::Urc(plan) => plan.size(&instance.location)?,
             ExpansionKind::Txl(plan) => plan.size(),
@@ -206,13 +208,15 @@ impl<'a> PlannedBatch<'a> {
         nodes: &NodeTable,
         existing: ElaborationSize,
         limits: ElaborationLimits,
+        graph: &super::passive_network::topology::ReferenceGraph,
     ) -> SpiceResult<Self> {
         let mut known = existing;
         let mut expansions = Vec::new();
         let mut generated_terminals = BTreeSet::new();
         for (ordinal, instance) in instances.iter().enumerate() {
             let at = Some(&instance.location);
-            let Some(plan) = PlannedExpansion::prepare(ordinal, instance, models, context)? else {
+            let Some(plan) = PlannedExpansion::prepare(ordinal, instance, models, context, graph)?
+            else {
                 known = known.checked_add(ElaborationSize::new(1, 0, 0), at)?;
                 limits.check(known, at)?;
                 continue;

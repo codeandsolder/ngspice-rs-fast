@@ -75,6 +75,14 @@ pub(crate) fn network_parameter(designator: char, name: &str) -> bool {
     {
         return true;
     }
+    if designator == 'l'
+        && matches!(
+            name,
+            "pn_rseries_uncoupled" | "pn_terminal_bias_zero_series"
+        )
+    {
+        return true;
+    }
     match designator {
         'c' | 'l' => matches!(
             name,
@@ -121,7 +129,7 @@ pub(crate) fn network_parameter(designator: char, name: &str) -> bool {
         ),
         'v' => matches!(
             name,
-            "pn_rseries" | "pn_cparallel" | "pn_cseries_shunt" | "pn_temp"
+            "pn_rseries" | "pn_cparallel" | "pn_cseries_shunt" | "pn_ccontrol" | "pn_temp"
         ),
         _ => false,
     }

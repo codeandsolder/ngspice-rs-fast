@@ -8,6 +8,7 @@
 mod bias;
 mod damping;
 mod report;
+pub(in crate::devices) mod topology;
 use bias::TerminalBias;
 use damping::DampingShunt;
 pub use damping::{AnalysisDamping, ConductanceLaw};
@@ -721,6 +722,7 @@ pub(super) enum NetworkPlan {
 impl NetworkPlan {
     pub(super) fn prepare(
         instance: &crate::netlist::ast::DeviceInstance,
+        graph: &topology::ReferenceGraph,
     ) -> SpiceResult<Option<Self>> {
         use crate::netlist::ast::ParameterKind;
 
@@ -756,6 +758,7 @@ impl NetworkPlan {
                 ordinary.parameters.push(p.clone());
             }
         }
+        graph.select(instance, &mut values)?;
         let get = |key| values.get(key).copied();
         let zero = |key| get(key).unwrap_or(0.);
         if instance.designator == 'v' {

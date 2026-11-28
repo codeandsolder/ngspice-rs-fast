@@ -4860,6 +4860,7 @@ impl Circuit {
     ) -> SpiceResult<()> {
         let existing = self.elaboration_size()?;
         let limits = self.elaboration_limits;
+        let graph = super::passive_network::topology::ReferenceGraph::collect(instances);
         let instances = crate::devices::behavioural::dynamic::expand(
             instances,
             &self.nodes,
@@ -4872,8 +4873,15 @@ impl Circuit {
         let instances = instances.instances.as_ref();
         // All generated plans are parsed and budgeted before any of them
         // create a ladder. Ordinary factories keep their existing order.
-        let mut plan =
-            PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
+        let mut plan = PlannedBatch::prepare(
+            instances,
+            models,
+            context,
+            &self.nodes,
+            existing,
+            limits,
+            &graph,
+        )?;
         plan.resistors = (!resistors.is_empty()).then_some(resistors);
         let seen: BTreeSet<String> = self
             .devices
