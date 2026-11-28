@@ -93,3 +93,30 @@ cannot replace an outstanding causal deadline. Simultaneous ambiguous causes
 select the latest participating path in this deterministic contract, with
 known active asynchronous controls dominating a normal capture. It does not
 assert a particular source vendor's simultaneous-event policy.
+
+## Ordinal drive and digital fanout loading
+
+`strength_paths=[L H X]` selects explicit 0–63 drive ranks by output logic
+state. Rank 0 disconnects without erasing the model's requested logical
+state, enabling open-drain outputs. `override_margin` (1–63, default 1)
+is the minimum ordinal difference needed to override a conflicting
+connected driver; declarations on one output net must agree. Resolution
+compares the maximum rank of each possible state against the strongest,
+independently of iteration order. `strength=1` and `strength=2` designate
+the lowest connected and forcing ranks; they cannot be combined with
+`strength_paths`. The seven-value conductance bridge explicitly groups
+ranks 1–62 in the resistive class and rank 63 in the forcing class.
+The engine does not infer a resistance from an ordinal or choose a
+source dialect's quantization/overdrive conversion.
+
+`input_capacitance=[...]` declares one digital input capacitance per
+terminal; `output_capacitance` declares output capacitance. The
+flattened topology sums every attached digital terminal occurrence once,
+including multiple pins on one net and inactive output drivers. The
+optional `load_resistance=[R_L R_H R_Z]` requests additive delay
+`R_target * C_total * ln(2)` on each nonzero propagation path, including
+causal paths. All values are finite and nonnegative. An explicitly
+zero propagation path remains zero. Analog receiver capacitance belongs
+in physical circuit elements, not the digital timing approximation.
+This is a fixed-topology fanout loading model; it does not replace
+analog RC dynamics or infer source-specific converter switching offsets.

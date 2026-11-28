@@ -80,7 +80,7 @@ fn four_states_round_trip_and_time_scale_preserves_causality() -> SpiceResult<()
         assert_eq!(Bit::from_drive(bit.drive()), bit);
         assert_eq!(Bit::decode(bit as u8)?, bit);
     }
-    assert_eq!(Bit::Z.drive().strength, Strength::HighImpedance);
+    assert_eq!(Bit::Z.drive().strength, Strength::HIGH_IMPEDANCE);
     assert!(Bit::decode(4).is_err());
     for precision in -15..=0 {
         let scale = TimeScale::new(precision)?;

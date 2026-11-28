@@ -155,15 +155,16 @@ impl SourceModel {
                 _ => None,
             },
             Self::LogicEvent => match name {
-                "operation" | "ic" | "strength" | "timing_violation" => Some(Integer),
-                "delay" | "low" | "high" => Some(Real),
-                "delay_paths" | "delay_gate" | "delay_preset" | "delay_clear" | "timing_setup"
-                | "timing_hold" | "timing_clock_min" | "timing_async_min" | "timing_recovery" => {
-                    Some(RealVector)
+                "operation" | "ic" | "strength" | "override_margin" | "timing_violation" => {
+                    Some(Integer)
                 }
+                "delay" | "low" | "high" | "output_capacitance" => Some(Real),
+                "input_capacitance" | "load_resistance" | "delay_paths" | "delay_gate"
+                | "delay_preset" | "delay_clear" | "timing_setup" | "timing_hold"
+                | "timing_clock_min" | "timing_async_min" | "timing_recovery" => Some(RealVector),
                 "inertial" => Some(Boolean),
                 "inverted" => Some(BooleanVector),
-                "rx_ic" | "async_policy" => Some(IntegerVector),
+                "rx_ic" | "async_policy" | "strength_paths" => Some(IntegerVector),
                 _ => None,
             },
             Self::LogicVoltage => match name {
@@ -302,7 +303,7 @@ fn validate_value(
 }
 
 use super::sequential_timing::TimingSpec;
-use super::source_logic::{AsyncPolicy, CausalPaths, LogicKernel, Operation};
+use super::source_logic::{AsyncPolicy, CausalPaths, DriveStrengths, LogicKernel, Operation};
 use super::{
     Adc, AnalogOutputConfig, AnalogOutputDevice, ConductanceConfig, DacConfig, DelayMode, Delays,
     Logic, OutputPort, Strength,
@@ -322,7 +323,11 @@ struct LogicMaterial {
     causal: CausalPaths,
     inertial: bool,
     initial: Logic,
-    strength: Strength,
+    strength: DriveStrengths,
+    margin: Option<std::num::NonZeroU8>,
+    input_capacitance: Option<Vec<Real>>,
+    output_capacitance: Real,
+    load_resistance: Option<[Real; 3]>,
     asynchronous: Option<AsyncPolicy>,
     timing: TimingSpec,
     low: Real,
@@ -339,7 +344,11 @@ impl Default for LogicMaterial {
             causal: CausalPaths::default(),
             inertial: true,
             initial: Logic::Zero,
-            strength: Strength::Strong,
+            strength: DriveStrengths::uniform(Strength::STRONG),
+            margin: None,
+            input_capacitance: None,
+            output_capacitance: 0.,
+            load_resistance: None,
             asynchronous: None,
             timing: TimingSpec::default(),
             low: 2.,
@@ -374,11 +383,29 @@ fn three_logic(value: Real) -> SpiceResult<Logic> {
     }
 }
 
+fn rank(value: Real) -> SpiceResult<Strength> {
+    Strength::from_rank(
+        crate::primitives::exact_nonnegative_integer(value)
+            .ok_or_else(|| SpiceError::circuit("invalid digital strength rank"))?,
+    )
+}
+
+fn nonnegative(value: Real) -> SpiceResult<Real> {
+    if value.is_finite() && value >= 0. {
+        Ok(value)
+    } else {
+        Err(SpiceError::circuit(
+            "invalid digital electrical loading parameter",
+        ))
+    }
+}
+
 impl LogicMaterial {
     fn compile(card: &ModelCard) -> SpiceResult<Self> {
         SourceModel::LogicEvent.validate_parameters(card)?;
         let mut material = Self::default();
         let mut timing_given = false;
+        let mut strength_given = false;
         for parameter in &card.parameters {
             match parameter.name.as_str() {
                 "operation" => material.operation = numeric_scalar(parameter)?,
@@ -422,16 +449,60 @@ impl LogicMaterial {
                 }
                 "inertial" => material.inertial = binary(numeric_scalar(parameter)?)?,
                 "ic" => material.initial = three_logic(numeric_scalar(parameter)?)?,
-                "strength" => {
-                    material.strength = match numeric_scalar(parameter)? {
-                        1. => Strength::Resistive,
-                        2. => Strength::Strong,
-                        _ => {
-                            return Err(SpiceError::circuit(
-                                "logic strength must be resistive (1) or strong (2)",
-                            ));
-                        }
+                "strength" | "strength_paths" => {
+                    if strength_given {
+                        return Err(SpiceError::circuit(
+                            "specify exactly one logic strength declaration",
+                        ));
                     }
+                    strength_given = true;
+                    material.strength = if parameter.name == "strength" {
+                        DriveStrengths::uniform(match numeric_scalar(parameter)? {
+                            1. => Strength::RESISTIVE,
+                            2. => Strength::STRONG,
+                            _ => {
+                                return Err(SpiceError::circuit(
+                                    "logic strength must be resistive (1) or strong (2)",
+                                ));
+                            }
+                        })
+                    } else {
+                        let [low, high, unknown]: [Real; 3] =
+                            numeric_vector(parameter)?.try_into().map_err(|_| {
+                                SpiceError::circuit("strength_paths requires L/H/X ranks")
+                            })?;
+                        DriveStrengths([rank(low)?, rank(high)?, rank(unknown)?])
+                    };
+                }
+                "override_margin" => {
+                    material.margin = Some(
+                        std::num::NonZeroU8::new(rank(numeric_scalar(parameter)?)?.rank())
+                            .ok_or_else(|| {
+                                SpiceError::circuit("digital net strength margin must be nonzero")
+                            })?,
+                    );
+                }
+                "input_capacitance" => {
+                    material.input_capacitance = Some(
+                        numeric_vector(parameter)?
+                            .into_iter()
+                            .map(nonnegative)
+                            .collect::<SpiceResult<_>>()?,
+                    );
+                }
+                "output_capacitance" => {
+                    material.output_capacitance = nonnegative(numeric_scalar(parameter)?)?
+                }
+                "load_resistance" => {
+                    let values: [Real; 3] = numeric_vector(parameter)?
+                        .into_iter()
+                        .map(nonnegative)
+                        .collect::<SpiceResult<Vec<_>>>()?
+                        .try_into()
+                        .map_err(|_| {
+                            SpiceError::circuit("load_resistance requires L/H/Z resistances")
+                        })?;
+                    material.load_resistance = Some(values);
                 }
                 "async_policy" => {
                     let [preset, clear, both]: [Real; 3] = numeric_vector(parameter)?.try_into()
@@ -488,6 +559,10 @@ impl LogicMaterial {
                 .receiver_initial
                 .as_ref()
                 .is_some_and(|values| values.len() != inputs)
+            || self
+                .input_capacitance
+                .as_ref()
+                .is_some_and(|values| values.len() != inputs)
         {
             return Err(SpiceError::circuit(
                 "logic parameter vector length must match input port",
@@ -498,10 +573,22 @@ impl LogicMaterial {
         let mut analog = Vec::with_capacity(inputs.saturating_mul(2));
         for (index, terminal) in terminals.iter().enumerate() {
             let inverted = self.inverted.as_ref().is_some_and(|values| values[index]);
+            let capacitance = self
+                .input_capacitance
+                .as_ref()
+                .map_or(0., |values| values[index]);
             if terminal.kind == Digital {
                 invert.push(terminal.inverted ^ inverted);
-                bindings.push(LogicInput::Digital(terminal.positive.clone()));
+                bindings.push(LogicInput::Digital {
+                    name: terminal.positive.clone(),
+                    capacitance,
+                });
             } else {
+                if capacitance != 0. {
+                    return Err(SpiceError::circuit(
+                        "analog receiver capacitance must be a physical circuit element",
+                    ));
+                }
                 invert.push(false);
                 let terminals = analog_pair(terminal, nodes)?;
                 analog.extend(terminals);
@@ -546,7 +633,10 @@ enum LogicInput {
         terminals: [NodeId; 2],
         thresholds: Adc,
     },
-    Digital(String),
+    Digital {
+        name: String,
+        capacitance: Real,
+    },
 }
 
 #[derive(Debug)]
@@ -556,6 +646,9 @@ struct LogicReceiverDevice {
     terminals: Vec<NodeId>,
     output: String,
     kernel: LogicKernel,
+    margin: Option<std::num::NonZeroU8>,
+    output_capacitance: Real,
+    load_resistance: Option<[Real; 3]>,
     inputs: Vec<LogicInput>,
 }
 
@@ -651,6 +744,9 @@ pub(in crate::devices) fn instantiate(
                 terminals,
                 output: output.terminals[0].positive.clone(),
                 kernel,
+                margin: material.margin,
+                output_capacitance: material.output_capacitance,
+                load_resistance: material.load_resistance,
                 inputs,
             }))
         }
@@ -733,14 +829,18 @@ fn bind_receiver(
     network: &mut Network,
     names: &mut BTreeMap<String, NetId>,
     adcs: &mut Vec<AdcBinding>,
+    capacitances: &BTreeMap<&str, Real>,
     limits: ElaborationLimits,
 ) -> SpiceResult<()> {
     let output = digital_net(network, names, &device.output, limits.nodes)?;
+    if let Some(margin) = device.margin {
+        network.set_override_margin(output, margin)?;
+    }
     let mut inputs = Vec::with_capacity(device.inputs.len());
     let zero = Delays::ZERO;
     for input in &device.inputs {
         let net = match input {
-            LogicInput::Digital(name) => digital_net(network, names, name, limits.nodes)?,
+            LogicInput::Digital { name, .. } => digital_net(network, names, name, limits.nodes)?,
             LogicInput::Analog {
                 terminals,
                 thresholds,
@@ -766,7 +866,51 @@ fn bind_receiver(
         };
         inputs.push(net);
     }
-    network.add_named_model(&device.name, device.kernel.clone(), &inputs, &[output])
+    let mut kernel = device.kernel.clone();
+    if let Some(resistances) = device.load_resistance {
+        let total = capacitances
+            .get(device.output.as_str())
+            .copied()
+            .unwrap_or(0.);
+        let load = resistances.map(|resistance| resistance * (total * std::f64::consts::LN_2));
+        if load.iter().any(|value| !value.is_finite()) {
+            return Err(SpiceError::circuit("digital loading delay overflow"));
+        }
+        kernel.delays = kernel.delays.with_load(load)?;
+        kernel.causal = kernel.causal.with_load(load)?;
+    }
+    network.add_named_model(&device.name, kernel, &inputs, &[output])
+}
+
+/// Sum terminal capacitance once after flattening, including every
+/// occurrence even when the same net is attached to multiple input ports.
+fn digital_capacitances(devices: &[ElaboratedDevice]) -> SpiceResult<BTreeMap<&str, Real>> {
+    let mut totals = BTreeMap::<&str, Real>::new();
+    for device in devices {
+        if device.designator() != 'a' {
+            continue;
+        }
+        let Some(receiver) =
+            (device.as_ref() as &dyn std::any::Any).downcast_ref::<LogicReceiverDevice>()
+        else {
+            continue;
+        };
+        let mut add = |name, value| -> SpiceResult<()> {
+            let total = totals.entry(name).or_default();
+            *total += value;
+            if !total.is_finite() {
+                return Err(SpiceError::circuit("digital net capacitance overflow"));
+            }
+            Ok(())
+        };
+        add(receiver.output.as_str(), receiver.output_capacitance)?;
+        for input in &receiver.inputs {
+            if let LogicInput::Digital { name, capacitance } = input {
+                add(name.as_str(), *capacitance)?;
+            }
+        }
+    }
+    Ok(totals)
 }
 
 /// Build the fixed mixed-domain topology once after native device binding.
@@ -775,6 +919,7 @@ pub(in crate::devices) fn mixed_topology(
     devices: &[ElaboratedDevice],
     limits: ElaborationLimits,
 ) -> SpiceResult<Option<NativeTopology>> {
+    let capacitances = digital_capacitances(devices)?;
     let mut topology = None;
     for device in devices {
         if device.designator() != 'a' {
@@ -795,7 +940,7 @@ pub(in crate::devices) fn mixed_topology(
             Vec<AnalogOutputBinding>,
         ) = topology.get_or_insert_with(Default::default);
         if let Some(receiver) = receiver {
-            bind_receiver(receiver, network, names, adcs, limits)?;
+            bind_receiver(receiver, network, names, adcs, &capacitances, limits)?;
         }
         if let Some((device, binding)) = voltage {
             let net = digital_net(network, names, &binding.net, limits.nodes)?;

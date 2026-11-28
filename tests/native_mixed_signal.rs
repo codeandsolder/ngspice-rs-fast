@@ -256,6 +256,15 @@ fn scoped_arrays_and_typed_port_validation() -> SpiceResult<()> {
         "ic=3",
         "strength=0",
         "strength=3",
+        "strength_paths=[1 2]",
+        "strength_paths=[0 64 1]",
+        "strength=1 strength_paths=[0 1 1]",
+        "override_margin=0",
+        "override_margin=64",
+        "load_resistance=[1 2]",
+        "load_resistance=[1 2 -3]",
+        "input_capacitance=[1p]",
+        "output_capacitance=-1p",
         "async_policy=[1 1 2]",
         "async_policy=[1 1 3]",
         "inverted=[1 0]",
@@ -716,6 +725,52 @@ fn powered_output_reacts_to_strength_only_transitions() -> SpiceResult<()> {
             "t={time:e}: {} != {expected}",
             output(&plot, index)
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn level_specific_strength_and_net_margin() -> SpiceResult<()> {
+    // Each high output can disconnect without changing its logical state;
+    // a weak high then wins over the open-drain output, but not a low.
+    for (input, rank, expected) in [(0, 40, 0.), (4, 40, 5.), (0, 29, 2.5), (0, 26, 5.)] {
+        let mut c = circuit(&format!(
+            "vd data 0 {input}\n             a1 %v[data] bus open\n.model open preprocess_logic_event(operation=25 strength_paths=[{rank} 0 {rank}] override_margin=3)\n             a2 %v[high] bus pull\n.model pull preprocess_logic_event(operation=25 strength_paths=[29 29 29] override_margin=3)\n             vh high 0 4\na3 bus out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k"
+        ))?;
+        close(
+            output(&run(&mut c, AnalysisKind::OperatingPoint, &[])?, 0),
+            expected,
+        );
+    }
+    let body = "vhi hi 0 4\na1 %v[hi] bus m1\n.model m1 preprocess_logic_event(operation=25 override_margin=3)\n                a2 %v[hi] bus m2\n.model m2 preprocess_logic_event(operation=25 override_margin=4)\n                a3 bus out b\n.model b preprocess_logic_voltage\nrload out 0 1k";
+    assert!(
+        circuit(body)
+            .unwrap_err()
+            .to_string()
+            .contains("strength margin")
+    );
+    Ok(())
+}
+
+#[test]
+fn digital_fanout_loading_is_occurrence_based_and_respects_zero_paths() -> SpiceResult<()> {
+    let mut c = circuit(
+        "vd data 0 PWL(0 0 1u 0 1002n 4 3u 4 3002n 0 5u 0)\n         a1 %v[data] bus driver\n.model driver preprocess_logic_event(operation=25 delay_paths=[10n 0] output_capacitance=2n load_resistance=[100 20 0])\n         a2 %v[data 0] bus off\n.model off preprocess_logic_event(operation=21 output_capacitance=4n)\n         a3 %d[bus bus] q load\n.model load preprocess_logic_event(operation=0 input_capacitance=[3n 5n])\n         a4 q out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k",
+    )?;
+    let plot = run(&mut c, AnalysisKind::Transient, &["1n", "5u", "0", "1n"])?;
+    let expected_rise = 1.0015e-6 + 10e-9 + 20. * 14e-9 * std::f64::consts::LN_2;
+    let expected_fall = 3.001e-6;
+    let edges: Vec<_> = (1..plot.point_count())
+        .filter(|&i| (output(&plot, i) > 2.5) != (output(&plot, i - 1) > 2.5))
+        .map(|i| (plot.value("time", i).unwrap().re, output(&plot, i)))
+        .collect();
+    assert_eq!(edges.len(), 2, "{edges:?}");
+    for ((time, voltage), (at, expected)) in edges
+        .into_iter()
+        .zip([(expected_rise, 5.), (expected_fall, 0.)])
+    {
+        close(voltage, expected);
+        assert!((time - at).abs() <= 1e-9, "{time:e} != {at:e}");
     }
     Ok(())
 }

@@ -34,16 +34,37 @@ impl Logic {
     }
 }
 
-/// Drive strength, in increasing resolution priority.
+/// Ordinal drive strength, from disconnected (0) to forcing (63).
+/// Resistance quantization is a producer policy, not an engine assumption.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
-pub enum Strength {
+pub struct Strength(u8);
+
+impl Strength {
     /// Disconnected output.
-    #[default]
-    HighImpedance,
-    /// Resistive output.
-    Resistive,
-    /// Strong output.
-    Strong,
+    pub const HIGH_IMPEDANCE: Self = Self(0);
+    /// Lowest connected rank.
+    pub const RESISTIVE: Self = Self(1);
+    /// Maximum forcing rank.
+    pub const STRONG: Self = Self(63);
+
+    /// Explicit ordinal strength, in the inclusive range 0..=63.
+    ///
+    /// # Errors
+    /// Invalid rank.
+    pub fn from_rank(rank: u8) -> SpiceResult<Self> {
+        if rank > 63 {
+            return Err(SpiceError::circuit(
+                "digital strength rank must be in 0..=63",
+            ));
+        }
+        Ok(Self(rank))
+    }
+
+    /// The ordinal used by net resolution.
+    #[must_use = "the returned rank is the resolution priority"]
+    pub const fn rank(self) -> u8 {
+        self.0
+    }
 }
 
 /// State and strength of a digital output.
@@ -61,25 +82,46 @@ impl Drive {
     pub const fn strong(logic: Logic) -> Self {
         Self {
             logic,
-            strength: Strength::Strong,
+            strength: Strength::STRONG,
         }
     }
 
-    /// Resolve concurrent drives, ignoring disconnected outputs.
-    #[must_use = "the returned drive is the resolved result of all concurrent outputs"]
+    /// Resolve concurrent drives using exact ordinal strength comparison.
+    #[must_use = "the resolved drive is the result of all concurrent outputs"]
     pub fn resolve(drives: impl IntoIterator<Item = Self>) -> Self {
-        drives
-            .into_iter()
-            .filter(|d| d.strength != Strength::HighImpedance)
-            .fold(Self::default(), |a, b| match a.strength.cmp(&b.strength) {
-                std::cmp::Ordering::Less => b,
-                std::cmp::Ordering::Greater => a,
-                std::cmp::Ordering::Equal if a.logic == b.logic => a,
-                std::cmp::Ordering::Equal => Self {
-                    logic: Logic::Unknown,
-                    strength: a.strength,
-                },
-            })
+        Self::resolve_with_margin(drives, std::num::NonZeroU8::MIN)
+    }
+
+    /// Resolve all competing states together. A differing state within the
+    /// declared rank margin of the strongest driver makes the net unknown.
+    /// No pairwise fold: the result is independent of driver iteration order.
+    #[must_use = "the resolved drive is the result of all concurrent outputs"]
+    pub fn resolve_with_margin(
+        drives: impl IntoIterator<Item = Self>,
+        margin: std::num::NonZeroU8,
+    ) -> Self {
+        let mut ranks = [Strength::HIGH_IMPEDANCE; 3];
+        for drive in drives {
+            let index = match drive.logic {
+                Logic::Zero => 0,
+                Logic::One => 1,
+                Logic::Unknown => 2,
+            };
+            ranks[index] = ranks[index].max(drive.strength);
+        }
+        let strength = ranks[0].max(ranks[1]).max(ranks[2]);
+        if strength == Strength::HIGH_IMPEDANCE {
+            return Self::default();
+        }
+        let competes = |rank: Strength| {
+            rank != Strength::HIGH_IMPEDANCE && strength.rank() - rank.rank() < margin.get()
+        };
+        let logic = match ranks.map(competes) {
+            [true, false, false] => Logic::Zero,
+            [false, true, false] => Logic::One,
+            _ => Logic::Unknown,
+        };
+        Self { logic, strength }
     }
 }
 
@@ -157,6 +199,25 @@ impl Delays {
         Ok(delays)
     }
 
+    /// Add precomputed loading delays for target L, H and Z. A declared
+    /// zero propagation path remains zero; it is not replaced by an RC
+    /// estimate. The ordinary two-state law retains its unknown-state rule.
+    pub(super) fn with_load(self, load: [Real; 3]) -> SpiceResult<Self> {
+        let add = |path: Real, extra: Real| if path == 0. { 0. } else { path + extra };
+        if let Some(paths) = self.impedance {
+            Self::paths([
+                add(self.rise, load[1]),
+                add(self.fall, load[0]),
+                add(paths.low_to_z, load[2]),
+                add(paths.high_to_z, load[2]),
+                add(paths.z_to_low, load[0]),
+                add(paths.z_to_high, load[1]),
+            ])
+        } else {
+            Self::new(add(self.rise, load[1]), add(self.fall, load[0]))
+        }
+    }
+
     /// Select the physical transition using both logic and drive strength.
     /// An unknown endpoint of an explicitly specified Z path uses the later
     /// of its two possible known transitions. Ordinary XSPICE rise/fall
@@ -164,8 +225,8 @@ impl Delays {
     #[must_use = "the returned delay determines the scheduled transition time"]
     pub fn transition(self, previous: Drive, next: Drive) -> Real {
         if let Some(paths) = self.impedance {
-            let old_z = previous.strength == Strength::HighImpedance;
-            let new_z = next.strength == Strength::HighImpedance;
+            let old_z = previous.strength == Strength::HIGH_IMPEDANCE;
+            let new_z = next.strength == Strength::HIGH_IMPEDANCE;
             match (old_z, new_z) {
                 (true, true) => return 0.,
                 (false, true) => {
@@ -905,9 +966,9 @@ impl ConductanceConfig {
             Logic::Unknown => 2,
         };
         self.values[match drive.strength {
-            Strength::Strong => index,
-            Strength::Resistive => 3 + index,
-            Strength::HighImpedance => 6,
+            Strength::STRONG => index,
+            Strength::HIGH_IMPEDANCE => 6,
+            _ => 3 + index,
         }]
     }
 }

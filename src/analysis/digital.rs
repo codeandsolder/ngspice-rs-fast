@@ -68,6 +68,7 @@ enum Event {
 
 #[derive(Debug, Default)]
 struct Net {
+    margin: Option<std::num::NonZeroU8>,
     drivers: Vec<usize>,
     subscribers: Vec<usize>,
 }
@@ -177,6 +178,27 @@ impl Network {
         if id.0 >= self.nets.len() {
             return Err(SpiceError::circuit("unknown digital net"));
         }
+        Ok(())
+    }
+
+    /// Declare the minimum rank difference required to override a
+    /// conflicting connected driver. Repeated declarations must agree.
+    ///
+    /// # Errors
+    /// Unknown net, inconsistent declaration, or rank margin above 63.
+    pub fn set_override_margin(
+        &mut self,
+        net: NetId,
+        margin: std::num::NonZeroU8,
+    ) -> SpiceResult<()> {
+        self.check_net(net)?;
+        let slot = &mut self.nets[net.0].margin;
+        if margin.get() > 63 || slot.is_some_and(|prior| prior != margin) {
+            return Err(SpiceError::circuit(
+                "inconsistent or invalid digital net strength margin",
+            ));
+        }
+        *slot = Some(margin);
         Ok(())
     }
 
@@ -717,7 +739,10 @@ impl State {
             }
             for net in affected {
                 let binding = &network.nets[net.0];
-                let resolved = Drive::resolve(binding.drivers.iter().map(|&id| self.drivers[id]));
+                let resolved = Drive::resolve_with_margin(
+                    binding.drivers.iter().map(|&id| self.drivers[id]),
+                    binding.margin.unwrap_or(std::num::NonZeroU8::MIN),
+                );
                 if self.nets[net.0] != resolved {
                     self.nets[net.0] = resolved;
                     changes.push(Change {

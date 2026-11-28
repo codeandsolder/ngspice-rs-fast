@@ -259,7 +259,7 @@ impl Operation {
         inputs: &[Drive],
         state: &mut LogicState,
         initial: bool,
-        strength: Strength,
+        strength: DriveStrengths,
     ) -> SpiceResult<(Drive, Causes)> {
         let prior = state.requested.logic;
         let mut causes = Causes::PRIMARY;
@@ -340,7 +340,7 @@ impl Operation {
             }
             _ => return Err(SpiceError::circuit("invalid logic input dimensions")),
         };
-        Ok((Drive { logic, strength }, causes))
+        Ok((strength.drive(logic), causes))
     }
 }
 
@@ -433,6 +433,15 @@ impl CausalPaths {
         Ok(())
     }
 
+    pub(super) fn with_load(self, load: [Real; 3]) -> SpiceResult<Self> {
+        let apply = |path: Option<Delays>| path.map(|delays| delays.with_load(load)).transpose();
+        Ok(Self {
+            gate: apply(self.gate)?,
+            preset: apply(self.preset)?,
+            clear: apply(self.clear)?,
+        })
+    }
+
     fn delay(self, primary: Delays, causes: Causes, from: Drive, to: Drive) -> Real {
         [
             (causes.primary, primary),
@@ -447,6 +456,29 @@ impl CausalPaths {
     }
 }
 
+/// Output strength may depend on the logical state (open-drain is the
+/// important zero/high-impedance example). It does not erase stored logic.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DriveStrengths(pub(super) [Strength; 3]);
+
+impl DriveStrengths {
+    pub(super) const fn uniform(strength: Strength) -> Self {
+        Self([strength; 3])
+    }
+
+    const fn drive(self, logic: Logic) -> Drive {
+        let index = match logic {
+            Logic::Zero => 0,
+            Logic::One => 1,
+            Logic::Unknown => 2,
+        };
+        Drive {
+            logic,
+            strength: self.0[index],
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct LogicKernel {
     pub(super) operation: Operation,
@@ -455,7 +487,7 @@ pub(super) struct LogicKernel {
     pub(super) delays: Delays,
     pub(super) causal: CausalPaths,
     pub(super) mode: DelayMode,
-    pub(super) strength: Strength,
+    pub(super) strength: DriveStrengths,
     /// Input inversion at digital terminals, after net resolution.
     pub(super) invert: Vec<bool>,
     pub(super) timing: Option<TimingContract>,
@@ -482,14 +514,8 @@ impl CodeModel for LogicKernel {
 
     fn initial_state(&self) -> Self::State {
         LogicState {
-            committed: Drive {
-                logic: self.initial,
-                strength: self.strength,
-            },
-            requested: Drive {
-                logic: self.initial,
-                strength: self.strength,
-            },
+            committed: self.strength.drive(self.initial),
+            requested: self.strength.drive(self.initial),
             deadline: None,
             clock: Logic::Unknown,
             data: Logic::Unknown,
@@ -519,10 +545,7 @@ impl CodeModel for LogicKernel {
             ));
         }
         if context.initial {
-            state.committed = Drive {
-                logic: self.initial,
-                strength: self.strength,
-            };
+            state.committed = self.strength.drive(self.initial);
             state.requested = state.committed;
             state.deadline = None;
         }
@@ -557,7 +580,7 @@ impl CodeModel for LogicKernel {
             self.operation
                 .desired(inputs, state, context.initial, self.strength)?;
         if unknown {
-            desired.logic = Logic::Unknown;
+            desired = self.strength.drive(Logic::Unknown);
         }
         let transition = |from, to| self.causal.delay(self.delays, causes, from, to);
         let delay = if context.initial {
@@ -629,7 +652,7 @@ mod tests {
                 initial: Logic::Zero,
                 delays: Delays::new(1e-6, 1e-6)?,
                 mode: DelayMode::Transport,
-                strength: Strength::Strong,
+                strength: DriveStrengths::uniform(Strength::STRONG),
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: None,
@@ -641,7 +664,7 @@ mod tests {
         let mut trial = engine.trial();
         let weak = Drive {
             logic: Logic::Zero,
-            strength: Strength::Resistive,
+            strength: Strength::RESISTIVE,
         };
         trial.schedule(pull, 0., weak)?;
         // Reference values use exact source and output timestamps from the
@@ -670,9 +693,9 @@ mod tests {
             let drive = Drive {
                 logic: bit(fields[3]),
                 strength: if fields[3].ends_with('s') {
-                    Strength::Strong
+                    Strength::STRONG
                 } else {
-                    Strength::Resistive
+                    Strength::RESISTIVE
                 },
             };
             // Decimal C trace roundtrips to the same binary64 timestamp.
@@ -708,7 +731,7 @@ mod tests {
                 initial: Logic::Zero,
                 delays: Delays::ZERO,
                 mode: DelayMode::Inertial,
-                strength: Strength::Strong,
+                strength: DriveStrengths::uniform(Strength::STRONG),
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: None,
@@ -781,7 +804,7 @@ mod tests {
                             clear: Some(Delays::new(9. * unit, 10. * unit)?),
                         },
                         mode,
-                        strength: Strength::Strong,
+                        strength: DriveStrengths::uniform(Strength::STRONG),
                         invert: Vec::new(),
                         timing: None,
                     },
@@ -863,7 +886,7 @@ mod tests {
                 initial: Logic::Zero,
                 delays: Delays::ZERO,
                 mode: DelayMode::Inertial,
-                strength: Strength::Strong,
+                strength: DriveStrengths::uniform(Strength::STRONG),
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: spec.bind(operation, 2)?,
@@ -918,7 +941,7 @@ mod tests {
                 initial: Logic::Zero,
                 delays: Delays::ZERO,
                 mode: DelayMode::Inertial,
-                strength: Strength::Strong,
+                strength: DriveStrengths::uniform(Strength::STRONG),
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: spec.bind(operation, 2)?,
@@ -975,7 +998,7 @@ mod tests {
                     initial: Logic::Zero,
                     delays: Delays::paths([2., 3., 4., 5., 6., 7.])?,
                     mode,
-                    strength: Strength::Strong,
+                    strength: DriveStrengths::uniform(Strength::STRONG),
                     invert: Vec::new(),
                     causal: CausalPaths::default(),
                     timing: None,
@@ -1023,7 +1046,7 @@ mod tests {
                 initial: Logic::Zero,
                 delays: Delays::new(2., 2.)?,
                 mode: DelayMode::Inertial,
-                strength: Strength::Strong,
+                strength: DriveStrengths::uniform(Strength::STRONG),
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: None,
@@ -1073,7 +1096,7 @@ mod tests {
                 initial: Logic::Zero,
                 delays: Delays::new(2., 2.)?,
                 mode: DelayMode::Inertial,
-                strength: Strength::Strong,
+                strength: DriveStrengths::uniform(Strength::STRONG),
                 invert: Vec::new(),
                 causal: CausalPaths::default(),
                 timing: None,

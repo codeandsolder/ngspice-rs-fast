@@ -35,7 +35,7 @@ fn simultaneous_drives_resolve_before_fanout() -> SpiceResult<()> {
         1.,
         Drive {
             logic: Logic::Zero,
-            strength: Strength::Resistive,
+            strength: Strength::RESISTIVE,
         },
     )?;
     trial.advance_to(1.)?;
@@ -163,7 +163,7 @@ fn zero_delay_oscillation_is_bounded_and_cannot_commit() -> SpiceResult<()> {
         0.,
         Drive {
             logic: Logic::Zero,
-            strength: Strength::Resistive,
+            strength: Strength::RESISTIVE,
         },
     )?;
     assert!(trial.advance_to(0.).is_err());
@@ -946,4 +946,43 @@ fn six_physical_paths_include_strength_and_disconnection() -> SpiceResult<()> {
         ]
     );
     trial.commit()
+}
+
+#[test]
+fn ordinal_drive_resolution_is_order_independent_and_margin_exact() -> SpiceResult<()> {
+    use std::num::NonZeroU8;
+    let rank = |logic, level| -> SpiceResult<Drive> {
+        Ok(Drive {
+            logic,
+            strength: Strength::from_rank(level)?,
+        })
+    };
+    let strongest = rank(Logic::One, 35)?;
+    let competing = rank(Logic::Zero, 32)?;
+    let weaker = rank(Logic::One, 30)?;
+    let margin = NonZeroU8::new(4).unwrap();
+    let expected = rank(Logic::Unknown, 35)?;
+    for drives in [
+        [strongest, competing, weaker],
+        [strongest, weaker, competing],
+        [competing, strongest, weaker],
+        [competing, weaker, strongest],
+        [weaker, strongest, competing],
+        [weaker, competing, strongest],
+    ] {
+        assert_eq!(Drive::resolve_with_margin(drives, margin), expected);
+    }
+    assert_eq!(
+        Drive::resolve_with_margin([strongest, rank(Logic::Zero, 31)?], margin),
+        strongest,
+    );
+    assert_eq!(
+        Drive::resolve_with_margin([strongest, rank(Logic::Unknown, 32)?], margin),
+        expected,
+    );
+    assert_eq!(
+        Drive::resolve_with_margin([rank(Logic::Zero, 0)?, rank(Logic::One, 0)?], margin),
+        Drive::default(),
+    );
+    Ok(())
 }
