@@ -1,0 +1,10 @@
+LTspice passive current identity transient
+.options reltol=1e-8 abstol=1e-12 vntol=1e-10 plotwinsize=0
+V1 s1 0 PULSE(0 1 1u 0.1u 0.1u 10u 20u)
+R1 s1 p1 2
+L1 p1 0 3m Rser=5 Rpar=100 Cpar=1u m=3
+V2 s2 0 PULSE(0 1 1u 0.1u 0.1u 10u 20u)
+R2 s2 p2 2
+C2 p2 0 2u Rser=5 Rpar=100 Cpar=1u Lser=3m RLshunt=20 m=3
+.tran 0 30u 0 .1u
+.end

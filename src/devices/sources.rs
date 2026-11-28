@@ -147,10 +147,18 @@ pub struct SourceInputs {
     pub waveform: Option<Waveform>,
 }
 
+#[derive(Debug, Clone, Default)]
+enum SourceRole {
+    #[default]
+    Excitation,
+    Probe(Option<Arc<super::passive_network::CurrentReportSpec>>),
+}
+
 /// Independent V or I source. AC, DC and transient excitations are distinct.
 #[derive(Debug, Clone)]
 pub struct IndependentSource {
     name: Arc<String>,
+    role: SourceRole,
     /// Inline `[positive, negative, internal]`. The third entry is exposed
     /// only when a port is present.
     terminals: [NodeId; 3],
@@ -169,6 +177,7 @@ pub struct IndependentSource {
     distortion: [Option<crate::devices::distortion::DistortionInput>; 2],
 }
 /// Validated excitation before circuit topology is bound.
+#[derive(Debug, Clone)]
 pub(super) struct SourceExcitation {
     voltage: bool,
     dc: DcExcitation,
@@ -244,6 +253,7 @@ impl SourceExcitation {
         };
         IndependentSource {
             name: Arc::new(name),
+            role: SourceRole::Excitation,
             terminals: [terminals[0], terminals[1], NodeId::GROUND],
             voltage: self.voltage,
             dc: self.dc,
@@ -260,6 +270,36 @@ impl SourceExcitation {
 }
 
 impl IndependentSource {
+    /// An ideal zero-voltage sensing branch has no independent excitation.
+    /// It must not alter RF predecessor forcing or expose a sweep parameter.
+    pub(super) fn current_probe(
+        name: impl Into<String>,
+        terminals: [NodeId; 2],
+        reporting: Option<super::passive_network::CurrentReportSpec>,
+    ) -> SpiceResult<Self> {
+        let mut probe = Self::new(
+            name,
+            terminals,
+            true,
+            0.,
+            Complex::ZERO,
+            Waveform::Constant(0.),
+        )?;
+        probe.role = SourceRole::Probe(reporting.map(Arc::new));
+        Ok(probe)
+    }
+
+    pub(super) const fn is_current_probe(&self) -> bool {
+        matches!(self.role, SourceRole::Probe(_))
+    }
+
+    pub(super) fn current_report(&self) -> Option<&super::passive_network::CurrentReportSpec> {
+        match &self.role {
+            SourceRole::Probe(report) => report.as_deref(),
+            SourceRole::Excitation => None,
+        }
+    }
+
     /// Creates an independent source. `voltage=false` selects a current source.
     /// A directly supplied rectangular AC coefficient is retained exactly;
     /// a nonzero coefficient counts as an AC excitation.
@@ -530,6 +570,9 @@ impl Device for IndependentSource {
     }
 
     fn instance_parameter(&self, keyword: &str) -> Option<&'static str> {
+        if self.is_current_probe() {
+            return None;
+        }
         match keyword.to_ascii_lowercase().as_str() {
             "acmag" => Some("acmag"),
             "acphase" => Some("acphase"),
@@ -543,6 +586,11 @@ impl Device for IndependentSource {
         value: Real,
         _context: &crate::devices::ModelContext,
     ) -> SpiceResult<Box<dyn Device>> {
+        if self.is_current_probe() {
+            return Err(SpiceError::circuit(
+                "current probe has no sweepable excitation",
+            ));
+        }
         crate::devices::sweep::check_swept(&self.name, parameter, value, true, "finite")?;
         let mut copy = self.clone();
         match parameter {
@@ -616,7 +664,7 @@ impl Device for IndependentSource {
     }
 
     fn independent_waveform(&self) -> Option<(crate::devices::SourceKind, &Waveform)> {
-        Some((self.source_kind(), self.effective_waveform()))
+        (!self.is_current_probe()).then(|| (self.source_kind(), self.effective_waveform()))
     }
     fn has_stochastic_source(&self) -> bool {
         Self::has_stochastic_waveform(self.effective_waveform())
@@ -648,7 +696,7 @@ impl Device for IndependentSource {
     }
 
     fn input_source(&self) -> Option<crate::devices::noise::InputSource> {
-        Some(crate::devices::noise::InputSource {
+        (!self.is_current_probe()).then(|| crate::devices::noise::InputSource {
             kind: self.source_kind(),
             ac_given: self.ac_given(),
         })
@@ -675,7 +723,7 @@ impl Device for IndependentSource {
         previous: &Waveform,
         previous_dc: Real,
     ) -> SpiceResult<Option<(Waveform, Real)>> {
-        if !self.voltage {
+        if !self.voltage || self.is_current_probe() {
             return Ok(None);
         }
         self.dc.accumulate(None);
@@ -767,7 +815,7 @@ impl Device for IndependentSource {
             }
             value
         };
-        if self.voltage {
+        if self.voltage && !self.is_current_probe() {
             *context.voltage_source_value = value;
         }
         if let Some(port) = &self.port {
@@ -805,6 +853,9 @@ impl Device for IndependentSource {
                     rows.push(row, sign * self.multiplier.unwrap_or(1.))?;
                 }
             }
+        }
+        if self.is_current_probe() {
+            return Ok(());
         }
         context.system.sources.push(LinearSource {
             name: self.name.clone(),

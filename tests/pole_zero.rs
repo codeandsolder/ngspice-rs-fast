@@ -344,10 +344,23 @@ fn a_vanishing_determinant_is_c_input_shorted_error() {
 }
 
 #[test]
-fn devices_without_a_c_pole_zero_load_are_refused() {
-    // POLY lowers to an XSPICE code model: C has no pole-zero load for it.
-    let message = error(
+fn native_polynomial_source_preserves_the_rc_pole() {
+    let plot = run(
         "vin in 0 dc 0 ac 1\nr1 in a 1k\nc1 a 0 1u\ne1 b 0 poly(1) a 0 0 2\nr2 b 0 1k\n",
+        ".pz in 0 b 0 vol pz",
+    )
+    .unwrap();
+    let poles = roots(&plot, "pole");
+    assert_eq!(poles.len(), 1);
+    assert_close(poles[0], -1000., 0., 1e-12);
+    assert!(roots(&plot, "zero").is_empty());
+}
+
+#[test]
+fn devices_without_a_c_pole_zero_load_are_refused() {
+    // TABLE still lowers to an XSPICE code model with no C pole-zero load.
+    let message = error(
+        "vin in 0 dc 0 ac 1\nr1 in a 1k\nc1 a 0 1u\ne1 b 0 table {v(a)} = (0,0) (1,2)\nr2 b 0 1k\n",
         ".pz in 0 b 0 vol pz",
     );
     assert!(message.contains("XSPICE code-model"), "{message}");

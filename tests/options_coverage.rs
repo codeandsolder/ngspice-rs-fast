@@ -318,6 +318,58 @@ fn mixed_unit_regularization_keeps_differentiator_laws_and_source_voltage() {
 }
 
 #[test]
+fn retained_regularization_preserves_physical_event_currents() {
+    // Check both sides of slope changes and ordinary accepted points. The
+    // differentiator changes its output at the events, but the original
+    // electrical KCL equations must hold on either side.
+    let circuit =
+        "v1 in 0 pwl(0 1 10u 1 20u 2 30u 2 40u 1 50u 1)\nb1 y 0 v=1u*ddt(v(in)^2)\nr1 y 0 1k";
+    for method in ["trap", "gear"] {
+        let analysis = format!(".options method={method} reltol=1e-6 vntol=1n\n.tran 1u 50u 0 1u");
+        let retained = simulate(&format!(
+            "{circuit}\n.options gshunt=1u noopiter gminsteps=1\n{analysis}"
+        ))
+        .unwrap();
+        let explicit = simulate(&format!(
+            "{circuit}\nrsh1 in 0 1meg\nrsh2 y 0 1meg\n{analysis}"
+        ))
+        .unwrap();
+        for plot in [&retained, &explicit] {
+            for point in 0..plot.point_count() {
+                let input = plot.value("v(in)", point).unwrap().re;
+                let output = plot.value("v(y)", point).unwrap().re;
+                close(
+                    plot.value("i(v1)", point).unwrap().re,
+                    -1e-6 * input,
+                    1e-6,
+                    1e-12,
+                );
+                close(
+                    plot.value("i(b1)", point).unwrap().re,
+                    -1.001e-3 * output,
+                    1e-6,
+                    1e-12,
+                );
+                close(
+                    plot.value("state(b__dynamic_0,0)", point).unwrap().re,
+                    input * input,
+                    1e-6,
+                    1e-12,
+                );
+            }
+            for time in [10e-6, 20e-6, 30e-6, 40e-6, 50e-6] {
+                assert!(
+                    (0..plot.point_count()).any(|point| {
+                        (plot.value("time", point).unwrap().re - time).abs() <= 1e-12
+                    }),
+                    "missing accepted event at {time:e}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn physical_shunts_never_load_solver_owned_derivative_signals() {
     // A smooth zero-initial-charge excitation supports the strict tolerance
     // test with capacitive loads. Nonzero initial charge on a differentiator

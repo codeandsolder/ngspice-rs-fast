@@ -762,6 +762,7 @@ enum LoadFlag {
     ReferenceJacobian = 1 << 2,
     InitialTransient = 1 << 3,
     Uic = 1 << 4,
+    PreparedExact = 1 << 5,
 }
 
 /// Immutable metadata copied from the Newton trial into each device window.
@@ -888,6 +889,12 @@ impl TrialState {
     #[must_use = "discarding the returned trial loses the initial transient load setting"]
     pub const fn with_initial_transient(mut self, enabled: bool) -> Self {
         self.mode.set(LoadFlag::InitialTransient, enabled);
+        self
+    }
+
+    /// Keep prepared-kernel evaluation exact while explicit bias constraints apply.
+    pub(crate) const fn with_prepared_exact(mut self, enabled: bool) -> Self {
+        self.mode.set(LoadFlag::PreparedExact, enabled);
         self
     }
 
@@ -1088,6 +1095,10 @@ impl<'a> DeviceState<'a> {
     #[must_use = "the flag determines whether UIC initialization applies"]
     pub const fn uic(&self) -> bool {
         self.mode.enabled(LoadFlag::Uic)
+    }
+
+    pub(crate) const fn prepared_exact(&self) -> bool {
+        self.mode.enabled(LoadFlag::PreparedExact)
     }
 
     /// C `DEVpred` (`devsup.c`): `(1 + r) state1 - r state2` with

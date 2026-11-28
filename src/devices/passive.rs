@@ -424,6 +424,7 @@ impl PassiveParameters {
     const fn resistor_noise_parameters(&self) -> crate::devices::ResistorNoise {
         crate::devices::ResistorNoise {
             noisy: self.noisy,
+            absolute_thermal_conductance: false,
             kf: self.kf,
             af: self.af,
             ef: self.ef,

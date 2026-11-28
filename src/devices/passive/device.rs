@@ -65,6 +65,12 @@ impl Device for ModelPassive {
         crate::devices::passive_bias::has_constraints(self.bias.as_deref())
     }
 
+    fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
+        self.bias
+            .as_deref()
+            .is_some_and(|policy| policy.constrains(analysis))
+    }
+
     fn validate_dc_inputs(&self, context: &crate::devices::ModelContext) -> SpiceResult<()> {
         match self.parameters.kind {
             PassiveKind::Resistor => self

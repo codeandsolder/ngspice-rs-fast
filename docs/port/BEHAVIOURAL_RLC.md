@@ -76,6 +76,42 @@ their output; their inputs must therefore be defined throughout the run.
 The C47 reference does not accept an idt() expression. Integrators are
 instead representable as rational transfer blocks.
 
+## Tabulated frequency response
+
+The native `xfer` code model implements an inline XSPICE frequency table:
+
+```spice
+A1 %vd(in ref) %v(out) response
+.model response xfer(r_i=true table=[100 2 0 300 0 2])
+```
+
+The first ordinate is frequency in Hz, followed by either real/imaginary
+(`r_i=true`) or magnitude/phase (`r_i=false`, default). In polar mode,
+`db=true` (default) converts the magnitude from dB, and `rad=false`
+(default) converts degrees to radians. `span` (default 3) sets the row
+width and `offset` (default 1) selects the consecutive pair of ordinates
+within each row. Frequencies must be finite, nonnegative and strictly
+increasing. The selected complex gains are finite; linear magnitude is
+nonnegative. A single row is a constant AC response. Scalar and vector
+parameters are evaluated in the declaring lexical scope and each model
+candidate retains its own immutable table.
+
+AC interpolates linearly in Cartesian coordinates at the physical frequency
+and clamps beyond the endpoints. DC uses only the first real ordinate,
+regardless of the first frequency, as `cm_xfer` does. The same port
+incidence as `s_xfer` preserves oriented output and input sensing currents
+(`i(a1)`, `i(a1:input)` for a current input). AC uses an explicitly
+frequency-dependent complex stamp, not a division by angular frequency
+or a fake capacitor. The native source-preparation command can lower E/G
+FREQ with arbitrary control expressions into this model while retaining
+the original E/G names and branch identities.
+
+An arbitrary sampled table is not a causal realization: transient,
+physical DAE and pole-zero analyses reject it explicitly. External file
+admission and Touchstone extraction belong in source preparation; this
+native model consumes resolved inline vectors only. A causal rational fit
+must be represented as a separate `s_xfer` or verified macromodel.
+
 ## Rational transfer models
 
 The native XSPICE `s_xfer` model realizes H(s)=g N(s/w)/D(s/w), with
@@ -249,9 +285,38 @@ The derivative-order bound and projected rank tests are not a proof of
 solvability for every singular or nonanalytic nonlinear DAE. Delayed rank
 emergence from time-dependent coefficients is covered at startup and exact
 interior events, including coefficients vanishing through dozens of Taylor
-orders. Recovery from a singular provisional Newton seed and genuinely
-singular nonlinear germs is tracked in
-[#251](https://github.com/codeandsolder/ngspice-rs-fast/issues/251).
+orders.
+
+When the ordinary order search exhausts with an unrepresented nonlinear
+physical residual, the solver can explore homogeneous nullspace
+directions of the mandatory derivative array. Probe amplitudes are
+bracketed by the response of the physical residual, not by a fixed
+voltage or time scale. Opposite directions and coupled combinations
+are tried; the perturbed state is only a disposable Newton seed.
+Recovered candidates must increase mandatory projected rank, satisfy
+the original physical residuals and storage constraints, and pass the
+same order lookahead checks. A residual-space arithmetic error envelope
+is propagated through the selected tangent basis for comparison of
+candidate states and normalized rates. Resolved distinct germs are
+reported as ambiguous. A search that cannot establish a determined
+prefix reports its numerical limit instead of installing an arbitrary
+derivative gauge. This bounded local recovery does not enumerate every
+nonlinear branch or prove global uniqueness, and an exactly singular
+homogeneous repeated root can still remain unresolved.
+
+The last accepted physical state and rate provide an extrapolated
+Newton seed for subsequent trials. When the extrapolated sum cancels
+within its floating-point rounding envelope, use zero as the seed, not
+as a physical constraint. This allows an exact singular crossing to be
+solved without carrying a spurious nonzero roundoff residual into the
+branch guard. A localized event uses its actual left-limit solution and
+rate instead. Neither rejected trials nor branch
+probes update the accepted predictor. The verified derivative array
+also supplies the executed guard trace and canonical candidate states,
+without re-evaluating the scalar expression on a potentially different
+branch. A domain failure in a predictor falls back to the ordinary
+state and zero-rate guess without changing the constraints.
+See [#251](https://github.com/codeandsolder/ngspice-rs-fast/issues/251).
 
 Nonlinear C/L `ic=` is intentionally retained under UIC, rather than
 discarded by the frontend as observed in ngspice 47 (instance and node

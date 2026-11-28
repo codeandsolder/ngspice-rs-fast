@@ -2,8 +2,9 @@
 //! derivative-array solves against the same accepted integration history.
 
 use super::{
-    AcceptedCandidate, AcceptedPoint, AttemptedStep, Boundary, Driver, NextStep, Order,
-    OutputSelection, ReadyStep, StepClock, StepDecision, Trial, TrialPoint, failure,
+    AcceptedCandidate, AcceptedPoint, AttemptedStep, Boundary, DerivativePredictor, Driver,
+    NextStep, Order, OutputSelection, PhysicalTrial, ReadyStep, StepClock, StepDecision,
+    TrialPoint, failure,
 };
 use crate::maths::Vector;
 use crate::primitives::{Real, SpiceResult};
@@ -81,7 +82,7 @@ impl Driver<'_> {
             }
             let attempt = ready.begin(&self.steps, &self.settings)?;
             let point = match self.derivative_trial(&attempt, &iterate)? {
-                Trial::NotConverged { last } => {
+                PhysicalTrial::NotConverged { last } => {
                     iterate = last;
                     self.stats.rejected += 1;
                     let next = NextStep {
@@ -91,7 +92,7 @@ impl Driver<'_> {
                     ready = search.retry(attempt, next, min_step)?;
                     continue;
                 }
-                Trial::Converged(point) => point,
+                PhysicalTrial::Converged(point) => point,
             };
             let point = match self.resolve_branch(&mut search, &attempt, point)? {
                 BranchResolution::Point(point) => point,
@@ -171,10 +172,10 @@ impl Driver<'_> {
             x,
             state,
             guards,
-            order_hint,
+            seed,
         } = if event {
             next.order = Order::One;
-            self.derivative_event(&attempt, &point.x, &point.state)?
+            self.derivative_event(&attempt, &point)?
         } else {
             point
         };
@@ -194,7 +195,11 @@ impl Driver<'_> {
         };
         let accepted = self.commit_candidate(attempt, next, candidate, None)?;
         self.accepted_guards = guards;
-        self.derivative_order = order_hint;
+        self.derivative_predictor = Some(DerivativePredictor {
+            time,
+            state: accepted.solution.clone(),
+            seed,
+        });
         Ok(accepted)
     }
 
@@ -325,7 +330,7 @@ impl Driver<'_> {
         time: Real,
         left: bool,
         seed: &Vector,
-    ) -> SpiceResult<Trial> {
+    ) -> SpiceResult<PhysicalTrial> {
         let mut ready = Self::branch_probe_step(start, original, time);
         // Bind the exact probe time rather than reconstituting it by
         // adding a rounded delta. For a right probe no event is accepted.
@@ -358,7 +363,7 @@ impl Driver<'_> {
         // not trusted without this independent solve.
         self.count_branch_probe()?;
         if original.event_start.is_none()
-            && let Trial::Converged(left) =
+            && let PhysicalTrial::Converged(left) =
                 self.probe_branch(start, original, bracket.right, true, seed)?
             && self.accepted_guards.same_regions(&left.guards)
         {
@@ -374,14 +379,14 @@ impl Driver<'_> {
             let at = Real::midpoint(bracket.left, bracket.right);
             self.count_branch_probe()?;
             match self.probe_branch(start, original, at, false, seed)? {
-                Trial::Converged(point) => {
+                PhysicalTrial::Converged(point) => {
                     if self.accepted_guards.same_regions(&point.guards) {
                         bracket.left = at;
                     } else {
                         bracket.right = at;
                     }
                 }
-                Trial::NotConverged { .. } => {
+                PhysicalTrial::NotConverged { .. } => {
                     let retry = Real::midpoint(start.time, at);
                     if retry <= start.time || retry - start.time <= self.settings.min_step() {
                         return Err(failure(format!(
@@ -428,11 +433,16 @@ impl Driver<'_> {
                 x: seed.clone(),
                 state,
                 guards: self.accepted_guards.clone(),
-                order_hint: self.derivative_order,
+                seed: self
+                    .derivative_predictor
+                    .as_ref()
+                    .ok_or_else(|| failure("missing accepted physical predictor"))?
+                    .seed
+                    .clone(),
             });
         }
         match self.probe_branch(start, attempt, bracket.left, false, seed)? {
-            Trial::Converged(point) if self.accepted_guards.same_regions(&point.guards) => {
+            PhysicalTrial::Converged(point) if self.accepted_guards.same_regions(&point.guards) => {
                 Ok(point)
             }
             _ => Err(failure(format!(
