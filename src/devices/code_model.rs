@@ -4,6 +4,7 @@
 use crate::primitives::{Real, SpiceError, SpiceResult};
 pub mod analog;
 pub mod rational;
+mod sequential_timing;
 pub mod source;
 mod source_logic;
 mod timed_switch;
@@ -215,6 +216,20 @@ pub struct EventContext {
     pub initial: bool,
 }
 
+/// A diagnostic emitted by a successfully evaluated digital model. The
+/// event engine assigns its model identity and physical timestamp at acceptance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelDiagnostic {
+    /// Type of timing constraint (setup, hold, pulse width, recovery).
+    pub kind: &'static str,
+    /// Zero-based input port involved in the constraint.
+    pub input: usize,
+    /// Observed interval in seconds.
+    pub elapsed: Real,
+    /// Required minimum interval in seconds.
+    pub minimum: Real,
+}
+
 /// Number of ordered input and output ports in one signal domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PortCount {
@@ -301,6 +316,12 @@ pub trait CodeModel: std::fmt::Debug + Send + Sync + 'static {
         Err(SpiceError::circuit(
             "model does not support autonomous lookahead",
         ))
+    }
+
+    /// Drain diagnostics produced by the most recent input evaluation. The
+    /// engine records these in the same disposable transaction as outputs.
+    fn take_diagnostics(&self, _state: &mut Self::State) -> Vec<ModelDiagnostic> {
+        Vec::new()
     }
 
     /// Evaluate the model against resolved inputs.

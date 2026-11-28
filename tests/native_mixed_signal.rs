@@ -626,3 +626,29 @@ fn source_bound_asymmetric_tristate_delivery() -> SpiceResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn source_bound_sequential_timing_policies() -> SpiceResult<()> {
+    for (policy, expected) in [(0, None), (1, Some(2.5)), (2, Some(5.))] {
+        let mut c = circuit(&format!(
+            "vd d 0 PWL(0 0 1u 0 1002n 4 3u 4)\nvc clk 0 PWL(0 0 1050n 0 1052n 4 3u 4)\n\
+             a1 %v[d clk] q ff\n.model ff preprocess_logic_event(operation=11 timing_setup=[100n] timing_hold=[0] timing_violation={policy})\n\
+             a2 q out bridge\n.model bridge preprocess_logic_voltage(out_high=5)\nr1 out 0 1k"
+        ))?;
+        let result = run(&mut c, AnalysisKind::Transient, &["1n", "3u", "0", "25n"]);
+        if let Some(expected) = expected {
+            let plot = result?;
+            close(output(&plot, plot.point_count() - 1), expected);
+            let warnings = c.last_digital_diagnostics();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].model.as_ref(), "a1");
+            assert_eq!(warnings[0].detail.kind, "setup");
+            assert_eq!(warnings[0].detail.input, 0);
+            assert!((warnings[0].detail.elapsed - 50e-9).abs() <= 1e-12);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("setup violation"));
+            assert!(c.last_digital_diagnostics().is_empty());
+        }
+    }
+    Ok(())
+}

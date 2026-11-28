@@ -2,9 +2,12 @@
 //! iterations. See upstream XSPICE evtqueue.c, evtiter.c and evtbackup.c.
 
 use std::collections::{BTreeMap, BTreeSet};
+mod diagnostics;
+use diagnostics::DiagnosticLog;
+pub use diagnostics::EventDiagnostic;
 
 use crate::devices::code_model::{
-    AutonomousAdvance, CodeModel, DelayMode, Drive, EventContext, Output,
+    AutonomousAdvance, CodeModel, DelayMode, Drive, EventContext, ModelDiagnostic, Output,
 };
 use crate::primitives::{Real, SpiceError, SpiceResult};
 
@@ -99,7 +102,7 @@ trait ErasedModel: std::fmt::Debug {
         context: EventContext,
         inputs: &[Drive],
         state: &mut dyn ModelState,
-    ) -> SpiceResult<Vec<Output>>;
+    ) -> SpiceResult<(Vec<Output>, Vec<ModelDiagnostic>)>;
 }
 
 impl<M: CodeModel> ErasedModel for M {
@@ -131,16 +134,18 @@ impl<M: CodeModel> ErasedModel for M {
         context: EventContext,
         inputs: &[Drive],
         state: &mut dyn ModelState,
-    ) -> SpiceResult<Vec<Output>> {
+    ) -> SpiceResult<(Vec<Output>, Vec<ModelDiagnostic>)> {
         let state = (state as &mut dyn std::any::Any)
             .downcast_mut::<M::State>()
             .ok_or_else(|| SpiceError::circuit("digital model state identity mismatch"))?;
-        CodeModel::evaluate(self, context, inputs, state)
+        let outputs = CodeModel::evaluate(self, context, inputs, state)?;
+        Ok((outputs, CodeModel::take_diagnostics(self, state)))
     }
 }
 
 #[derive(Debug)]
 struct Model {
+    name: std::sync::Arc<str>,
     kernel: Box<dyn ErasedModel>,
     inputs: Vec<NetId>,
     outputs: Vec<usize>,
@@ -205,6 +210,26 @@ impl Network {
         inputs: &[NetId],
         outputs: &[NetId],
     ) -> SpiceResult<()> {
+        self.add_named_model(
+            &format!("model#{}", self.models.len()),
+            model,
+            inputs,
+            outputs,
+        )
+    }
+
+    /// Bind a named instance for timing diagnostics, using the same port
+    /// and resource checks as an ordinary event model.
+    ///
+    /// # Errors
+    /// Unknown nets or port-count mismatch.
+    pub fn add_named_model<M: CodeModel>(
+        &mut self,
+        name: &str,
+        model: M,
+        inputs: &[NetId],
+        outputs: &[NetId],
+    ) -> SpiceResult<()> {
         if model.schema()
             != crate::devices::code_model::ModelSchema::digital(inputs.len(), outputs.len())
         {
@@ -222,6 +247,7 @@ impl Network {
         }
         let drivers = outputs.iter().map(|&net| self.add_driver(net)).collect();
         self.models.push(Model {
+            name: name.into(),
             kernel: Box::new(model),
             inputs: inputs.to_vec(),
             outputs: drivers,
@@ -259,6 +285,8 @@ pub struct Stats {
     pub rounds: usize,
     /// Autonomous horizon probes of external simulators.
     pub probes: usize,
+    /// Timing diagnostics committed during model evaluation.
+    pub diagnostics: usize,
 }
 
 /// Resolved net change after all output events at a time/delta are applied.
@@ -301,6 +329,7 @@ struct State {
     models: Vec<Box<dyn ModelState>>,
     predictions: Vec<Option<Prediction>>,
     stats: Stats,
+    diagnostics: DiagnosticLog,
 }
 
 impl State {
@@ -323,6 +352,7 @@ impl State {
                 .collect(),
             predictions: vec![None; network.models.len()],
             stats: Stats::default(),
+            diagnostics: DiagnosticLog::default(),
         }
     }
 
@@ -420,7 +450,12 @@ impl State {
         let events = self.stats.events - before.events;
         let evaluations = self.stats.evaluations - before.evaluations;
         let probes = self.stats.probes - before.probes;
-        if events.saturating_add(evaluations).saturating_add(probes) > limit {
+        if events
+            .saturating_add(evaluations)
+            .saturating_add(probes)
+            .saturating_add(self.stats.diagnostics - before.diagnostics)
+            > limit
+        {
             return Err(SpiceError::circuit("digital event work limit exceeded"));
         }
         Ok(())
@@ -438,7 +473,7 @@ impl State {
             self.charge_work(before, limit)?;
             let instance = &network.models[index];
             let inputs: Vec<_> = instance.inputs.iter().map(|id| self.nets[id.0]).collect();
-            let outputs = instance.kernel.evaluate(
+            let (outputs, diagnostics) = instance.kernel.evaluate(
                 EventContext {
                     time: self.time.value(),
                     delta: self.delta,
@@ -447,6 +482,20 @@ impl State {
                 &inputs,
                 self.models[index].as_mut(),
             )?;
+            self.stats.diagnostics = self
+                .stats
+                .diagnostics
+                .checked_add(diagnostics.len())
+                .ok_or_else(|| SpiceError::circuit("digital diagnostic count overflow"))?;
+            self.charge_work(before, limit)?;
+            for detail in diagnostics {
+                self.diagnostics.push(EventDiagnostic {
+                    model: instance.name.clone(),
+                    time: self.time.value(),
+                    delta: self.delta,
+                    detail,
+                });
+            }
             self.accept_model_outputs(network, index, outputs)?;
         }
         Ok(())
@@ -755,6 +804,12 @@ impl Engine {
         self.accepted.stats
     }
 
+    /// Chronologically ordered diagnostics from committed event evaluations.
+    #[must_use = "the returned records report accepted timing violations"]
+    pub fn diagnostics(&self) -> Vec<EventDiagnostic> {
+        self.accepted.diagnostics.records()
+    }
+
     /// Start a disposable trial. Dropping it leaves all accepted state and
     /// queued events untouched (including model state and cancellation).
     pub fn trial(&mut self) -> Trial<'_> {
@@ -836,6 +891,13 @@ impl Trial<'_> {
     #[must_use = "the returned option identifies the provisional net drive without committing trial state"]
     pub fn value(&self, net: NetId) -> Option<Drive> {
         self.state.nets.get(net.0).copied()
+    }
+
+    /// Diagnostics in the disposable event state, including prior committed
+    /// diagnostics. Dropping the trial discards newly generated records.
+    #[must_use = "the returned records describe trial timing violations"]
+    pub fn diagnostics(&self) -> Vec<EventDiagnostic> {
+        self.state.diagnostics.records()
     }
 
     /// Resolved net transitions in this trial, in deterministic order.

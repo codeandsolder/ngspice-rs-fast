@@ -219,6 +219,7 @@ pub(super) struct CircuitRuntime {
     continuation_diagonal: std::cell::Cell<Real>,
     completed: Vec<crate::primitives::AnalysisKind>,
     last_digital_stats: Option<crate::analysis::digital::Stats>,
+    last_digital_diagnostics: Vec<crate::analysis::digital::EventDiagnostic>,
     final_transient: std::cell::RefCell<Option<StateSnapshot>>,
     unknown_names: std::cell::RefCell<Option<crate::maths::UnknownNames>>,
     fixed_stamps: std::cell::RefCell<crate::maths::FixedStamps>,
@@ -2224,6 +2225,7 @@ impl Circuit {
     ) -> SpiceResult<Option<crate::analysis::digital::MixedSignal>> {
         self.finalize()?;
         self.runtime.last_digital_stats = None;
+        self.runtime.last_digital_diagnostics.clear();
         self.bindings
             .native_mixed
             .as_ref()
@@ -2237,11 +2239,19 @@ impl Circuit {
         self.runtime.last_digital_stats
     }
 
-    pub(crate) const fn record_digital_stats(
+    /// Timing diagnostics from the most recent successful native mixed analysis.
+    #[must_use = "the returned diagnostics describe accepted timing violations"]
+    pub fn last_digital_diagnostics(&self) -> &[crate::analysis::digital::EventDiagnostic] {
+        &self.runtime.last_digital_diagnostics
+    }
+
+    pub(crate) fn record_digital_results(
         &mut self,
-        stats: Option<crate::analysis::digital::Stats>,
+        engine: Option<&crate::analysis::digital::Engine>,
     ) {
-        self.runtime.last_digital_stats = stats;
+        self.runtime.last_digital_stats = engine.map(crate::analysis::digital::Engine::stats);
+        self.runtime.last_digital_diagnostics =
+            engine.map_or_else(Vec::new, crate::analysis::digital::Engine::diagnostics);
     }
 
     fn prepare_topology(&mut self) -> SpiceResult<()> {

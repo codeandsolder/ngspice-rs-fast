@@ -1,5 +1,7 @@
 //! Qualified receiver logic. Internal timer state is committed only through
 //! the event engine; inertial timers wake the model, not an analog load.
+use super::ModelDiagnostic;
+use super::sequential_timing::{TimingContract, TimingState};
 use super::{
     CodeModel, DelayMode, Delays, Drive, EventContext, GateKind, Logic, ModelSchema, Output,
     Strength,
@@ -67,7 +69,7 @@ pub(super) enum ClockedKind {
 }
 
 impl ClockedKind {
-    const fn arity(self) -> usize {
+    pub(super) const fn arity(self) -> usize {
         match self {
             Self::Sr | Self::Jk => 3,
             Self::Data | Self::Toggle => 2,
@@ -299,6 +301,7 @@ pub(super) struct LogicKernel {
     pub(super) strength: Strength,
     /// Input inversion at digital terminals, after net resolution.
     pub(super) invert: Vec<bool>,
+    pub(super) timing: Option<TimingContract>,
 }
 
 #[derive(Clone, Debug)]
@@ -307,6 +310,8 @@ pub(super) struct LogicState {
     requested: Drive,
     deadline: Option<Real>,
     clock: Logic,
+    timing: Option<TimingState>,
+    diagnostics: Vec<ModelDiagnostic>,
 }
 
 impl CodeModel for LogicKernel {
@@ -328,7 +333,13 @@ impl CodeModel for LogicKernel {
             },
             deadline: None,
             clock: Logic::Unknown,
+            timing: self.timing.as_ref().map(TimingContract::initial_state),
+            diagnostics: Vec::new(),
         }
+    }
+
+    fn take_diagnostics(&self, state: &mut Self::State) -> Vec<ModelDiagnostic> {
+        std::mem::take(&mut state.diagnostics)
     }
 
     fn next_wakeup(&self, state: &Self::State) -> Option<Real> {
@@ -374,9 +385,19 @@ impl CodeModel for LogicKernel {
         } else {
             inputs
         };
-        let desired = self
+        let unknown = match (&self.timing, &mut state.timing) {
+            (Some(contract), Some(timing)) => {
+                contract.observe(context, inputs, timing, &mut state.diagnostics)?
+            }
+            (None, None) => false,
+            _ => return Err(SpiceError::circuit("sequential timing state mismatch")),
+        };
+        let mut desired = self
             .operation
             .desired(inputs, state, context.initial, self.strength)?;
+        if unknown {
+            desired.logic = Logic::Unknown;
+        }
         let transition = |from, to| self.delays.transition(from, to);
         let delay = if context.initial {
             state.committed = desired;
@@ -449,6 +470,7 @@ mod tests {
                 mode: DelayMode::Transport,
                 strength: Strength::Strong,
                 invert: Vec::new(),
+                timing: None,
             },
             &[data, enable],
             &[bus],
@@ -526,6 +548,7 @@ mod tests {
                 mode: DelayMode::Inertial,
                 strength: Strength::Strong,
                 invert: Vec::new(),
+                timing: None,
             },
             &inputs,
             &[out],
@@ -559,6 +582,62 @@ mod tests {
     }
 
     #[test]
+    fn timing_warning_is_committed_once_without_poisoning_output() -> SpiceResult<()> {
+        use super::super::sequential_timing::TimingSpec;
+        let mut network = Network::default();
+        let data = network.add_net();
+        let clock = network.add_net();
+        let output = network.add_net();
+        let d = network.add_source(data)?;
+        let c = network.add_source(clock)?;
+        let operation = Operation::from_value(11., 2, None)?;
+        let mut spec = TimingSpec::default();
+        spec.set_vector("timing_setup", vec![2.])?;
+        spec.set_policy(2.)?;
+        network.add_named_model(
+            "xstage.a1",
+            LogicKernel {
+                operation,
+                inputs: 2,
+                initial: Logic::Zero,
+                delays: Delays::ZERO,
+                mode: DelayMode::Inertial,
+                strength: Strength::Strong,
+                invert: Vec::new(),
+                timing: spec.bind(operation, 2)?,
+            },
+            &[data, clock],
+            &[output],
+        )?;
+        let mut engine = Engine::new(network, Limits::default())?;
+        let mut initial = engine.trial();
+        initial.schedule(d, 0., Drive::strong(Logic::Zero))?;
+        initial.schedule(c, 0., Drive::strong(Logic::Zero))?;
+        initial.schedule(d, 1., Drive::strong(Logic::One))?;
+        initial.advance_to(1.)?;
+        initial.commit()?;
+        let mut rejected = engine.trial();
+        rejected.schedule(c, 2., Drive::strong(Logic::One))?;
+        rejected.advance_to(2.)?;
+        assert_eq!(rejected.diagnostics().len(), 1);
+        assert_eq!(rejected.value(output), Some(Drive::strong(Logic::One)));
+        drop(rejected);
+        assert!(engine.diagnostics().is_empty());
+        assert_eq!(engine.value(output), Some(Drive::strong(Logic::Zero)));
+        let mut accepted = engine.trial();
+        accepted.schedule(c, 2., Drive::strong(Logic::One))?;
+        accepted.advance_to(4.)?;
+        accepted.commit()?;
+        let records = engine.diagnostics();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].model.as_ref(), "xstage.a1");
+        assert_eq!(records[0].detail.kind, "setup");
+        assert_eq!(engine.stats().diagnostics, 1);
+        assert_eq!(engine.value(output), Some(Drive::strong(Logic::One)));
+        Ok(())
+    }
+
+    #[test]
     fn independent_rise_fall_paths_and_explicit_zero() -> SpiceResult<()> {
         let zero = Drive::strong(Logic::Zero);
         let one = Drive::strong(Logic::One);
@@ -580,6 +659,7 @@ mod tests {
                     mode,
                     strength: Strength::Strong,
                     invert: Vec::new(),
+                    timing: None,
                 },
                 &[input],
                 &[output],
@@ -626,6 +706,7 @@ mod tests {
                 mode: DelayMode::Inertial,
                 strength: Strength::Strong,
                 invert: Vec::new(),
+                timing: None,
             },
             &[input],
             &[output],
@@ -674,6 +755,7 @@ mod tests {
                 mode: DelayMode::Inertial,
                 strength: Strength::Strong,
                 invert: Vec::new(),
+                timing: None,
             },
             &[data, clock],
             &[output],

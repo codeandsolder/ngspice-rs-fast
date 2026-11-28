@@ -146,9 +146,10 @@ impl SourceModel {
                 _ => None,
             },
             Self::LogicEvent => match name {
-                "operation" | "ic" | "strength" => Some(Integer),
+                "operation" | "ic" | "strength" | "timing_violation" => Some(Integer),
                 "delay" | "low" | "high" => Some(Real),
-                "delay_paths" => Some(RealVector),
+                "delay_paths" | "timing_setup" | "timing_hold" | "timing_clock_min"
+                | "timing_async_min" | "timing_recovery" => Some(RealVector),
                 "inertial" => Some(Boolean),
                 "inverted" => Some(BooleanVector),
                 "rx_ic" | "async_policy" => Some(IntegerVector),
@@ -285,6 +286,7 @@ fn validate_value(
     Ok(())
 }
 
+use super::sequential_timing::TimingSpec;
 use super::source_logic::{AsyncPolicy, LogicKernel, Operation};
 use super::{Adc, DacConfig, DacPort, DacSource, DelayMode, Delays, Logic, Strength};
 use crate::analysis::digital::{AdcBinding, DacBinding, NativeTopology, NetId, Network};
@@ -303,6 +305,7 @@ struct LogicMaterial {
     initial: Logic,
     strength: Strength,
     asynchronous: Option<AsyncPolicy>,
+    timing: TimingSpec,
     low: Real,
     high: Real,
     inverted: Option<Vec<bool>>,
@@ -318,6 +321,7 @@ impl Default for LogicMaterial {
             initial: Logic::Zero,
             strength: Strength::Strong,
             asynchronous: None,
+            timing: TimingSpec::default(),
             low: 2.,
             high: 3.,
             inverted: None,
@@ -398,6 +402,13 @@ impl LogicMaterial {
                         both: three_logic(both)?,
                     });
                 }
+                "timing_setup" | "timing_hold" | "timing_clock_min" | "timing_async_min"
+                | "timing_recovery" => {
+                    material
+                        .timing
+                        .set_vector(&parameter.name, numeric_vector(parameter)?)?;
+                }
+                "timing_violation" => material.timing.set_policy(numeric_scalar(parameter)?)?,
                 "low" => material.low = numeric_scalar(parameter)?,
                 "high" => material.high = numeric_scalar(parameter)?,
                 "inverted" => {
@@ -467,8 +478,11 @@ impl LogicMaterial {
                 });
             }
         }
+        let operation = Operation::from_value(self.operation, inputs, self.asynchronous)?;
+        let timing = self.timing.bind(operation, inputs)?;
         let kernel = LogicKernel {
-            operation: Operation::from_value(self.operation, inputs, self.asynchronous)?,
+            operation,
+            timing,
             inputs,
             initial: self.initial,
             delays: self.delays,
@@ -687,7 +701,7 @@ fn bind_receiver(
         };
         inputs.push(net);
     }
-    network.add_model(device.kernel.clone(), &inputs, &[output])
+    network.add_named_model(&device.name, device.kernel.clone(), &inputs, &[output])
 }
 
 /// Build the fixed mixed-domain topology once after native device binding.
