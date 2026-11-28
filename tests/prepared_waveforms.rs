@@ -1028,7 +1028,7 @@ fn actual_ltspice_prepared_waveforms_drive_transient_with_exact_cutoffs() {
     let dir = tempfile::tempdir().unwrap();
     let bundle = prepare_deck(
         dir.path(),
-        "* linked LTspice waveform witness\nV1 a 0 DC 7 SINE(1 2 1Meg 1u 1e5 30 1.5)\nV2 b 0 EXP(1 3 5u 2u 1u 3u)\nI1 0 c PULSE(0 1 1u .1u .1u 8u 10u 1.5)\nR1 c 0 1\nV3 d 0 SINE(1 2 0 1u 1e5 30)\n.end\n",
+        "* linked LTspice waveform witness\n.param cycle_count=1.5\nV1 a 0 DC 7 SINE(1 2 1Meg 1u 1e5 30 1.5)\nV2 b 0 EXP(1 3 5u 2u 1u 3u)\nI1 0 c PULSE(0 1 1u .1u .1u 8u 10u {cycle_count})\nR1 c 0 1\nV3 d 0 SINE(1 2 0 1u 1e5 30)\n.end\n",
         InputFormat::LtspiceDeck,
     );
     assert_eq!(bundle.waveforms.len(), 4);
