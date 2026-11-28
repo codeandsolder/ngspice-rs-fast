@@ -431,7 +431,26 @@ impl Device for PwlResistor {
             .curve
             .segments
             .partition_point(|segment| independent.compare(segment.upper) != Some(Ordering::Less));
-        let segment = &self.curve.segments[index.min(self.curve.segments.len() - 1)];
+        let index = index.min(self.curve.segments.len() - 1);
+        let segment = &self.curve.segments[index];
+        context.candidate_state(0, independent.value())?;
+        if let Some(trace) = &mut context.output.guards {
+            use crate::devices::physical_dae::{LocalGuard, Region};
+            let lower = index
+                .checked_sub(1)
+                .map(|previous| self.curve.segments[previous].upper);
+            let upper = segment.upper.is_finite().then_some(segment.upper);
+            trace.extend(
+                context.device,
+                vec![LocalGuard {
+                    slot: 0,
+                    operand: 0,
+                    region: Region::Interval(index),
+                    argument: independent,
+                    boundaries: [lower, upper],
+                }],
+            )?;
+        }
         let (voltage, current) = self.curve.coefficients(segment);
         let row = Some(branch);
         for (node, sign) in [(p, 1.), (n, -1.)] {

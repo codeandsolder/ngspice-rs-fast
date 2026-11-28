@@ -1270,6 +1270,15 @@ mod boundary_tests {
                 &AnalysisContext::default(),
             )
             .unwrap_err();
-        assert!(error.to_string().contains("nonempty square"), "{error}");
+        // Zero-dimensional MNA is valid for circuits consisting solely of
+        // absent storage. A genuinely empty OP has no observable columns.
+        assert!(
+            matches!(
+                error,
+                SpiceError::Numerical { ref context, ref message }
+                if context == "plot op1" && message.contains("zero variables")
+            ),
+            "{error}"
+        );
     }
 }

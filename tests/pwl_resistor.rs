@@ -300,3 +300,40 @@ fn physical_taylor_tangent_at_knot_uses_one_sided_germ() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn derivative_arrays_follow_both_pwl_axes_through_actual_knots() -> anyhow::Result<()> {
+    // Voltage source and current source drive independent PWL axes through
+    // negative slopes and all three interior joins, regardless of IC hints.
+    let (deck, bundle) = source(
+        &format!(
+            "Vdrive p 0 PWL(0 -0.5 3m 2.5)\nIforce 0 q PWL(0 -0.5 3m 2.5)\n!R1 p 0 MR IC=3\n!R2 q 0 MC IC=1\nB1 a 0 v=1m*ddt(i(vdrive))\nB2 b 0 v=1m*ddt(v(q))\nR3 a 0 1k\nR4 b 0 1k\n{VOLTAGE}\n{CURRENT}"
+        ),
+        InputFormat::ExpandedDeck,
+    )?;
+    let (mut c, config) = circuit(&deck, &bundle)?;
+    let p = run(
+        &mut c,
+        &config,
+        AnalysisKind::Transient,
+        &["5u", "3m", "0", "20u"],
+    )?;
+    let mut counts = [0; 4];
+    for k in 0..p.point_count() {
+        let t = p.value("time", k).unwrap().re;
+        let x = 1000_f64.mul_add(t, -0.5);
+        near(&p, "i(vdrive)", k, -expected(x));
+        near(&p, "v(q)", k, expected(x));
+        if t == 0. || (t - 3e-3).abs() < 1e-12 || [0., 1., 2.].iter().any(|k| (x - k).abs() < 1e-7)
+        {
+            continue;
+        }
+        let segment = [0., 1., 2.].partition_point(|k| x > *k);
+        let slope = [3., -2., 2., 1.][segment];
+        near(&p, "v(a)", k, -slope);
+        near(&p, "v(b)", k, slope);
+        counts[segment] += 1;
+    }
+    assert!(counts.into_iter().all(|count| count > 10));
+    Ok(())
+}

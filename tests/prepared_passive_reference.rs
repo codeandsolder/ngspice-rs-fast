@@ -10,7 +10,10 @@ use ngspice_rs::{
 };
 use ngspice_rs_preprocess::{
     Cancellation, InputFormat, Options, PreparedBundle, Request, SourceInput,
-    analysis_plan::{AnalysisKind as SourceAnalysis, Directive, Disposition},
+    analysis_plan::{
+        AnalysisKind as SourceAnalysis, Directive, Disposition,
+        sweep::{CoordinateLaw, SweepTarget},
+    },
     prepare,
 };
 
@@ -30,8 +33,38 @@ fn prepared(path: &Path) -> SpiceResult<(Netlist, Vec<AnalysisInput>)> {
     let requests = plan
         .entries
         .iter()
-        .filter(|entry| matches!(entry.directive, Directive::Analysis { .. }))
+        .filter(|entry| entry.is_analysis())
         .map(|entry| {
+            if let Directive::DcSweep { axes } = &entry.directive {
+                let mut arguments = Vec::new();
+                for axis in axes {
+                    let SweepTarget::Source { name } = &axis.target else {
+                        return Err(ngspice_rs::primitives::SpiceError::circuit(
+                            "expected independent-source reference sweep",
+                        ));
+                    };
+                    let CoordinateLaw::Linear {
+                        start,
+                        stop,
+                        increment,
+                    } = &axis.law
+                    else {
+                        return Err(ngspice_rs::primitives::SpiceError::circuit(
+                            "expected linear reference sweep",
+                        ));
+                    };
+                    arguments.extend([
+                        name.clone(),
+                        start.clone(),
+                        stop.clone(),
+                        increment.clone(),
+                    ]);
+                }
+                return Ok(AnalysisInput::with_arguments(
+                    AnalysisKind::DcSweep,
+                    bind_source_sweep(&bundle, &arguments)?,
+                ));
+            }
             let Directive::Analysis {
                 analysis,
                 arguments,
@@ -57,9 +90,6 @@ fn prepared(path: &Path) -> SpiceResult<(Netlist, Vec<AnalysisInput>)> {
             };
             let arguments = match entry.disposition {
                 Disposition::NativeRequest => arguments.clone(),
-                Disposition::RequiresBinding if kind == AnalysisKind::DcSweep => {
-                    bind_source_sweep(&bundle, arguments)?
-                }
                 _ => {
                     return Err(ngspice_rs::primitives::SpiceError::circuit(
                         "unsupported reference analysis binding",

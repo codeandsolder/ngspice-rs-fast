@@ -227,7 +227,7 @@ fn uic_storage_ic_overrides_differential_node_hint_without_bias_stamps() {
 #[test]
 fn prepared_hard_bias_survives_binned_geometry_candidates() {
     use model_normalize_ngspice::passive_ic::{
-        InitialConditions, PassiveInitialCondition, PassiveKind,
+        InitialConditions, MissingStorage, PassiveInitialCondition, PassiveKind,
     };
     use model_normalize_ngspice::waveform::{PreparedWaveform, SymbolicPoint, WaveformSpec};
     use ngspice_rs::netlist::prepared_initialization::PreparedInitialConditions;
@@ -255,6 +255,7 @@ m1 d g 0 0 nch l=1u w=1u
         dir.path(),
         InitialConditions {
             devices: vec![PassiveInitialCondition {
+                missing_storage: MissingStorage::NodeHints,
                 artifact: "deck.cir".to_owned(),
                 scope: Vec::new(),
                 device: "c1".to_owned(),

@@ -177,14 +177,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "model-import-ltspice"
+version = "0.1.0"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=156dcbed1c565a46222a8fd5c744e89774aafc54#156dcbed1c565a46222a8fd5c744e89774aafc54"
+dependencies = [
+ "anyhow",
+ "model-preprocess-command",
+]
+
+[[package]]
 name = "model-kernel-api"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=09159f0755333cf26c7ef5650048afe3d53a83eb#09159f0755333cf26c7ef5650048afe3d53a83eb"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=156dcbed1c565a46222a8fd5c744e89774aafc54#156dcbed1c565a46222a8fd5c744e89774aafc54"
 
 [[package]]
 name = "model-kernel-diode"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=09159f0755333cf26c7ef5650048afe3d53a83eb#09159f0755333cf26c7ef5650048afe3d53a83eb"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=156dcbed1c565a46222a8fd5c744e89774aafc54#156dcbed1c565a46222a8fd5c744e89774aafc54"
 dependencies = [
  "model-kernel-api",
 ]
@@ -192,7 +201,7 @@ dependencies = [
 [[package]]
 name = "model-kernel-vdmos"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=09159f0755333cf26c7ef5650048afe3d53a83eb#09159f0755333cf26c7ef5650048afe3d53a83eb"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=156dcbed1c565a46222a8fd5c744e89774aafc54#156dcbed1c565a46222a8fd5c744e89774aafc54"
 dependencies = [
  "model-kernel-api",
 ]
@@ -200,7 +209,7 @@ dependencies = [
 [[package]]
 name = "model-normalize-ngspice"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=09159f0755333cf26c7ef5650048afe3d53a83eb#09159f0755333cf26c7ef5650048afe3d53a83eb"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=156dcbed1c565a46222a8fd5c744e89774aafc54#156dcbed1c565a46222a8fd5c744e89774aafc54"
 dependencies = [
  "anyhow",
  "model-preprocess-command",
@@ -212,7 +221,7 @@ dependencies = [
 [[package]]
 name = "model-preprocess-command"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=09159f0755333cf26c7ef5650048afe3d53a83eb#09159f0755333cf26c7ef5650048afe3d53a83eb"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=156dcbed1c565a46222a8fd5c744e89774aafc54#156dcbed1c565a46222a8fd5c744e89774aafc54"
 dependencies = [
  "anyhow",
  "libc",
@@ -224,7 +233,7 @@ dependencies = [
 [[package]]
 name = "model-preprocess-simplis"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=09159f0755333cf26c7ef5650048afe3d53a83eb#09159f0755333cf26c7ef5650048afe3d53a83eb"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=156dcbed1c565a46222a8fd5c744e89774aafc54#156dcbed1c565a46222a8fd5c744e89774aafc54"
 dependencies = [
  "anyhow",
  "model-kernel-diode",
@@ -238,17 +247,17 @@ dependencies = [
 [[package]]
 name = "model-statistics"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=09159f0755333cf26c7ef5650048afe3d53a83eb#09159f0755333cf26c7ef5650048afe3d53a83eb"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=156dcbed1c565a46222a8fd5c744e89774aafc54#156dcbed1c565a46222a8fd5c744e89774aafc54"
 dependencies = [
  "anyhow",
  "serde",
- "sha2",
+ "xxhash-rust",
 ]
 
 [[package]]
 name = "model-translate-simplis"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=09159f0755333cf26c7ef5650048afe3d53a83eb#09159f0755333cf26c7ef5650048afe3d53a83eb"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=156dcbed1c565a46222a8fd5c744e89774aafc54#156dcbed1c565a46222a8fd5c744e89774aafc54"
 dependencies = [
  "anyhow",
  "model-normalize-ngspice",
@@ -256,7 +265,6 @@ dependencies = [
  "model-preprocess-simplis",
  "model-statistics",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -288,9 +296,10 @@ dependencies = [
 [[package]]
 name = "ngspice-rs-preprocess"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=09159f0755333cf26c7ef5650048afe3d53a83eb#09159f0755333cf26c7ef5650048afe3d53a83eb"
+source = "git+https://github.com/codeandsolder/ngspice-rs-preprocess.git?rev=156dcbed1c565a46222a8fd5c744e89774aafc54#156dcbed1c565a46222a8fd5c744e89774aafc54"
 dependencies = [
  "anyhow",
+ "model-import-ltspice",
  "model-normalize-ngspice",
  "model-preprocess-command",
  "model-preprocess-simplis",
@@ -518,6 +527,12 @@ dependencies = [
  "ngspice-rs",
  "syn",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "zmij"
