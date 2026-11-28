@@ -6,11 +6,10 @@
 //! intentionally distinct.
 
 mod damping;
-pub(crate) mod report;
+mod report;
 use damping::DampingShunt;
 pub use damping::{AnalysisDamping, ConductanceLaw};
 pub(super) use report::CurrentReportSpec;
-pub(crate) use report::{BoundCurrentReport, CurrentOutputLaw, ReportPhase};
 pub use report::{CurrentReference, CurrentReporting, CurrentReportingLaw};
 
 use crate::devices::{
@@ -20,7 +19,7 @@ use crate::devices::{
     rlc::REACTIVE_STATE_COUNT,
     sources::{SourceExcitation, SourceInputs},
 };
-use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
+use crate::primitives::{Complex, NodeAppend, NodeId, NodeKind, Real, SpiceError, SpiceResult};
 
 /// Resolved physical coefficients of one parallel copy of a storage network.
 ///
@@ -915,5 +914,94 @@ impl NetworkPlan {
                 terminals,
             ),
         }
+    }
+}
+
+/// The output phase is not the enclosing bias analysis: the retained bias
+/// plot of an AC run uses the steady reporting convention.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReportPhase {
+    Steady,
+    SmallSignal,
+    Transient,
+}
+
+/// Bound projection of one reported current, independent of the solver.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CurrentOutputLaw {
+    row: usize,
+    voltage_rows: [Option<usize>; 2],
+    conductance: Real,
+}
+
+impl CurrentOutputLaw {
+    pub(crate) fn evaluate(self, mut value: impl FnMut(usize) -> Complex) -> Complex {
+        let current = value(self.row);
+        if self.conductance == 0. {
+            return current;
+        }
+        let [p, n] = self
+            .voltage_rows
+            .map(|row| row.map_or(Complex::ZERO, &mut value));
+        current + (p - n) * Complex::real(self.conductance)
+    }
+}
+
+/// All phase-specific projections and the original physical device identity.
+#[derive(Debug)]
+pub(crate) struct BoundCurrentReport {
+    pub(crate) original_device: usize,
+    pub(crate) original: String,
+    pub(crate) intrinsic: String,
+    terminal_row: usize,
+    primary_row: Option<usize>,
+    voltage_rows: [Option<usize>; 2],
+    reporting: CurrentReporting,
+}
+
+impl BoundCurrentReport {
+    pub(in crate::devices) fn new(
+        spec: &CurrentReportSpec,
+        original_device: usize,
+        terminal_row: usize,
+        primary_row: Option<usize>,
+        voltage_rows: [Option<usize>; 2],
+    ) -> SpiceResult<Self> {
+        let reporting = spec
+            .reporting
+            .ok_or_else(|| SpiceError::circuit("missing current reporting law"))?;
+        if primary_row.is_none() && reporting.needs_primary() {
+            return Err(SpiceError::circuit(
+                "reported current has no primary branch",
+            ));
+        }
+        Ok(Self {
+            original_device,
+            original: spec.original.clone(),
+            intrinsic: format!("{}#intrinsic", spec.original),
+            terminal_row,
+            primary_row,
+            voltage_rows,
+            reporting,
+        })
+    }
+
+    pub(crate) fn law(&self, phase: ReportPhase) -> SpiceResult<CurrentOutputLaw> {
+        let law = match phase {
+            ReportPhase::Steady => self.reporting.steady,
+            ReportPhase::SmallSignal => self.reporting.small_signal,
+            ReportPhase::Transient => self.reporting.transient,
+        };
+        let row = match law.reference {
+            CurrentReference::Terminal => self.terminal_row,
+            CurrentReference::Primary => self
+                .primary_row
+                .ok_or_else(|| SpiceError::circuit("unbound primary current"))?,
+        };
+        Ok(CurrentOutputLaw {
+            row,
+            voltage_rows: self.voltage_rows,
+            conductance: law.voltage_conductance,
+        })
     }
 }
