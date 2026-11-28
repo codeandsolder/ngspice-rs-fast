@@ -265,10 +265,6 @@ fn reverse_tunneling<S: Constitutive>(
 }
 
 /// Evaluate the four load-owned junction conduction members.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "ordered saturation-current geometry products must match temperature preparation of the limiting continuations"
-)]
 pub(super) fn current(
     model: &Model,
     here: &mut Instance,
@@ -280,6 +276,10 @@ pub(super) fn current(
     Ok(())
 }
 
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "ordered saturation-current geometry products must match temperature preparation of the limiting continuations"
+)]
 pub(super) fn current_constitutive<S: Constitutive>(
     model: &Model,
     here: &mut Instance,
@@ -386,8 +386,8 @@ pub(super) fn charge(
     ckt: &mut dyn LoadCkt,
     bias: JunctionBias,
 ) -> SpiceResult<()> {
-    charge_constitutive(model, here, size, bias, |slot, charge| {
-        ckt.set_state0(slot, *charge)
+    charge_constitutive(model, here, size, &bias, |slot, charge| {
+        ckt.set_state0(slot, *charge);
     })?;
     Ok(())
 }
@@ -396,7 +396,7 @@ pub(super) fn charge_constitutive<S: Constitutive>(
     model: &Model,
     here: &mut Instance,
     size: &SizeParam,
-    bias: JunctionBias<S>,
+    bias: &JunctionBias<S>,
     mut record: impl FnMut(usize, &S),
 ) -> SpiceResult<[S; 2]> {
     let (source_charge, source_capacitance) = depletion(

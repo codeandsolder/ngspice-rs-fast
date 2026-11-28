@@ -195,16 +195,16 @@ impl<const N: usize> Constitutive for Differential<N> {
 
 /// An actual bias-dependent branch comparison in a constitutive evaluation.
 /// The caller publishes these in executed order as device-local guards.
-pub(crate) struct BranchComparison {
+pub struct BranchComparison {
     pub(crate) argument: Jet,
     pub(crate) boundary: Real,
 }
 
 /// Differential arithmetic with a disposable branch observer. The scalar
 /// arithmetic and ordinary jet arithmetic retain their existing layouts.
-/// Numerical rationalization uses primal(), which does not record an event.
+/// Numerical rationalization uses `primal()`, which does not record an event.
 #[derive(Clone)]
-pub(crate) struct ObservedDifferential<'a, const N: usize> {
+pub struct ObservedDifferential<'a, const N: usize> {
     pub(crate) inner: Differential<N>,
     trace: Option<&'a RefCell<Vec<BranchComparison>>>,
 }

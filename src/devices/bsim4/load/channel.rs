@@ -125,12 +125,12 @@ pub(super) fn electrostatics_constitutive<S: Constitutive>(
 ) -> SpiceResult<Electrostatics<S>> {
     let vbd = vbs.clone().add(&vds.clone().scale(-1.));
     let vgd = vgs.clone().add(&vds.clone().scale(-1.));
-    let (Vds, Vgs, Vbs) = if vds.compare(0.) != Some(Ordering::Less) {
-        here.mode = 1;
-        (vds, vgs.clone(), vbs)
-    } else {
+    let (Vds, Vgs, Vbs) = if vds.compare(0.) == Some(Ordering::Less) {
         here.mode = -1;
         (vds.scale(-1.), vgd.clone(), vbd)
+    } else {
+        here.mode = 1;
+        (vds, vgs.clone(), vbs)
     };
     let (epsrox, toxe, epssub) = if model.mtrlMod != 0 {
         (3.9, model.eot, EPS0 * model.epsrsub)
@@ -420,9 +420,7 @@ fn mobility_degradation<S: Constitutive>(
             let coefficient = body.clone().scale(uc).offset(ua);
             let slope = (coefficient.primal() + 2. * ub * field.primal()) / tox;
             let bulk = uc * field.primal();
-            let term = field
-                .clone()
-                .multiply(&field.clone().scale(ub).add(&coefficient));
+            let term = field.clone().multiply(&field.scale(ub).add(&coefficient));
             (term, slope, bulk)
         } else {
             let coefficient = body.clone().scale(uc).offset(1.);
@@ -490,7 +488,7 @@ fn external_conductance<S: Constitutive>(
     let (effective, _) = smooth_positive(gate.offset(-p.vfbsd), 2.5e-5)?;
     let argument = effective
         .constant(1.)
-        .divide(&effective.clone().scale(p.prwg).offset(1.))?
+        .divide(&effective.scale(p.prwg).offset(1.))?
         .add(&body.scale(-p.prwb));
     let (positive, _) = smooth_positive(argument, 0.0025)?;
     let r = positive.scale(resistance).offset(minimum);
@@ -591,7 +589,7 @@ pub(super) fn transport_constitutive<S: Constitutive>(
     if model.lambdaGiven && model.lambda > 0. {
         let correction = c(p.lambda / leff).divide(&mobility)?;
         let ratio = excess.clone().scale(leff / p.litl).divide(&field)?;
-        let square = ratio.clone().offset(1.);
+        let square = ratio.offset(1.);
         let square = square.clone().multiply(&square);
         let overshoot = c(1.).add(&c(-2.).divide(&square.offset(1.))?);
         let mut factor = correction.mul_add(&overshoot, &c(1.));

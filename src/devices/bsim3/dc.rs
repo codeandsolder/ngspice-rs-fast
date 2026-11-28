@@ -10,10 +10,6 @@
     reason = "C-translated equation symbols keep their original distinct names for source-level audit"
 )]
 #![expect(
-    clippy::float_cmp,
-    reason = "C device branches compare floating-point values exactly, including nonfinite cases"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "a complete translated C numerical routine remains contiguous for equation parity review"
 )]
@@ -38,7 +34,7 @@ const CHARGE_Q: Real = 1.602_19e-19;
 
 /// Terminal bias applied to the intrinsic device (the `dNodePrime`/
 /// `sNodePrime` reference C uses), already multiplied by the model polarity.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bias<S = Real> {
     /// Body-source voltage.
     pub vbs: S,
@@ -341,9 +337,7 @@ impl DcModel<'_> {
         let (cbd, gbd) = junction(drain_sat_current, vbd_in, p.vjdm, p.isevjdm)?;
 
         // Normal versus inverse mode. The inverse case mirrors gate/drain.
-        let (mode, vds, vgs, vbs) = if bias.vds.compare(0.) != Some(Ordering::Less) {
-            (1, bias.vds, bias.vgs, bias.vbs)
-        } else {
+        let (mode, vds, vgs, vbs) = if bias.vds.compare(0.) == Some(Ordering::Less) {
             let drain = bias.vds.scale(-1.);
             (
                 -1,
@@ -351,6 +345,8 @@ impl DcModel<'_> {
                 bias.vgs.add(&drain),
                 bias.vbs.add(&drain),
             )
+        } else {
+            (1, bias.vds, bias.vgs, bias.vbs)
         };
         let gbs = gbs.primal();
         let gbd = gbd.primal();
@@ -662,18 +658,26 @@ impl DcModel<'_> {
                     leff * (dabulk_dvb - over_field.primal() * desatl_dvb / esatl.primal());
                 // b3ld.c's scalar reference stamp divides by Esat here.
                 let numerator_dvd = -over_field.primal() * desatl_dvd / esat.primal();
-                let dvg = diff_vds.primal()
-                    * (numerator.primal() * factor_partial * dabulk_dvg
-                        + factor.primal() * numerator_dvg)
-                    - clm_slope.primal() * dvdseff_dvg;
+                let dvg = clm_slope.primal().mul_add(
+                    -dvdseff_dvg,
+                    diff_vds.primal()
+                        * factor.primal().mul_add(
+                            numerator_dvg,
+                            numerator.primal() * factor_partial * dabulk_dvg,
+                        ),
+                );
                 let dvd = clm_slope.primal().mul_add(
                     1. - dvdseff_dvd,
                     factor.primal() * numerator_dvd * diff_vds.primal(),
                 );
-                let dvb = diff_vds.primal()
-                    * (numerator.primal() * factor_partial * dabulk_dvb
-                        + factor.primal() * numerator_dvb)
-                    - clm_slope.primal() * dvdseff_dvb;
+                let dvb = clm_slope.primal().mul_add(
+                    -dvdseff_dvb,
+                    diff_vds.primal()
+                        * factor.primal().mul_add(
+                            numerator_dvb,
+                            numerator.primal() * factor_partial * dabulk_dvb,
+                        ),
+                );
                 (vaclm, dvg, dvd, dvb)
             } else {
                 (vds.constant(MAX_EXP), 0., 0., 0.)

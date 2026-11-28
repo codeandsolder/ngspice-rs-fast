@@ -789,7 +789,7 @@ impl<'a> PreparedRun<'a> {
             let device = point.device(self.circuit, index);
             if (!time_dependent && device.depends_on_time())
                 || device.depends_on_frequency()
-                || device.small_signal_depends_on_frequency()
+                || !device.supports_memoryless_physical_dae()
                 || device.delay_line().is_some()
                 || device.has_discrete_state()
             {

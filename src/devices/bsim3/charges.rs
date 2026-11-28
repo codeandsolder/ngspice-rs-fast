@@ -143,7 +143,7 @@ impl<S> ChargeEvaluation<S> {
 
 /// C's `qgate`/`qbulk`/`qdrn`/`qsrc` after the overlap-charge adjustment and
 /// the `CKTstate0` charge values `b3ask.c` reports.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlapCharges<S = Real> {
     /// Gate charge including overlaps and gate-bulk.
     pub qgate: S,
@@ -318,17 +318,17 @@ impl ChargeModel<'_> {
         let threshold_offset = cv.vth.clone().offset(-vfbzb - cv.phi).scale(4.);
         let tox_cm = 2. * tox_cm;
         let (field, dfield_dvd, dfield_dvb) =
-            if threshold_offset.compare(0.) != Some(Ordering::Less) {
-                (
-                    vgsteff.clone().add(&threshold_offset).scale(tox_cm.recip()),
-                    4.0_f64.mul_add(cv.d_vth_dvd, dvgsteff_dvd) / tox_cm,
-                    4.0_f64.mul_add(cv.d_vth_dvb, dvgsteff_dvb) / tox_cm,
-                )
-            } else {
+            if threshold_offset.compare(0.) == Some(Ordering::Less) {
                 (
                     vgsteff.offset(1e-20).scale(tox_cm.recip()),
                     dvgsteff_dvd / tox_cm,
                     dvgsteff_dvb / tox_cm,
+                )
+            } else {
+                (
+                    vgsteff.add(&threshold_offset).scale(tox_cm.recip()),
+                    4.0_f64.mul_add(cv.d_vth_dvd, dvgsteff_dvd) / tox_cm,
+                    4.0_f64.mul_add(cv.d_vth_dvb, dvgsteff_dvb) / tox_cm,
                 )
             };
         let power = field.clone().ln()?.scale(0.7).exp();

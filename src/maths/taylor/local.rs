@@ -8,7 +8,7 @@ use crate::primitives::{Real, SpiceResult};
 use std::cmp::Ordering;
 
 #[derive(Clone)]
-pub(crate) struct Local<S, const N: usize> {
+pub struct Local<S, const N: usize> {
     pub(crate) value: S,
     pub(crate) partials: [Real; N],
 }

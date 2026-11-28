@@ -1595,6 +1595,11 @@ impl Device for Bsim4 {
         true
     }
 
+    fn supports_memoryless_physical_dae(&self) -> bool {
+        self.any_setup()
+            .is_some_and(|prepared| prepared.instance.trnqsMod == 0)
+    }
+
     fn assemble_small_signal(
         &self,
         context: &mut LinearContext<'_>,

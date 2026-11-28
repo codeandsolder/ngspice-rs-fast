@@ -1223,6 +1223,15 @@ pub trait Device: fmt::Debug + std::any::Any {
         false
     }
 
+    /// Whether the device's physical time-domain equations admit a memoryless
+    /// residual/charge representation. An AC implementation that reassembles
+    /// at each frequency does not necessarily imply time-domain memory.
+    /// Frequency-dependent small-signal devices require explicit qualification
+    /// before opting into physical storage.
+    fn supports_memoryless_physical_dae(&self) -> bool {
+        !self.small_signal_depends_on_frequency()
+    }
+
     /// Identity of a homogeneous prepared artifact, if this device supports
     /// tile evaluation. Only exact artifact identity may share a tile.
     fn prepared_batch_key(&self) -> Option<crate::devices::prepared_model::batch::Key> {

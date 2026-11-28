@@ -4,10 +4,6 @@
     reason = "C equation names preserve the reference distinctions"
 )]
 #![expect(
-    clippy::float_cmp,
-    reason = "C branch predicates compare floating point exactly"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "preserve cohesive C physics equation sequence"
 )]
@@ -198,7 +194,7 @@ fn tunneling_barrier<S: Constitutive>(
         let slope = voltage.constant(c).mul_add(&left, &right.clone().scale(-b));
         (left.multiply(&right).scale(scale), slope)
     } else {
-        let linear = a * c - b;
+        let linear = a.mul_add(c, -b);
         let quadratic = b * c;
         let argument = voltage
             .clone()
@@ -225,6 +221,7 @@ fn tunneling_barrier<S: Constitutive>(
 }
 
 /// One edge's GIDL/GISL model coefficients.
+#[derive(Clone, Copy)]
 struct EdgeLeakage {
     amplitude: f64,
     field: f64,
@@ -238,9 +235,8 @@ struct EdgeLeakage {
 fn edge_leakage<S: Constitutive>(
     model: &Model,
     p: &SizeParam,
-    voltage: S,
-    gate: S,
-    gate_partial: f64,
+    voltage: &S,
+    (gate, gate_partial): (S, f64),
     junction: S,
     parameters: EdgeLeakage,
     oxide: f64,
@@ -412,9 +408,8 @@ pub(super) fn evaluate_constitutive<S: Constitutive>(
     let gidl = edge_leakage(
         model,
         p,
-        vds.clone(),
-        electro.vgs_eff_raw.clone(),
-        here.dvgs_eff_dvg,
+        &vds,
+        (electro.vgs_eff_raw.clone(), here.dvgs_eff_dvg),
         vbd,
         EdgeLeakage {
             amplitude: p.agidl,
@@ -431,9 +426,8 @@ pub(super) fn evaluate_constitutive<S: Constitutive>(
     let gisl = edge_leakage(
         model,
         p,
-        vds.scale(-1.),
-        electro.vgd_eff_raw.clone(),
-        here.dvgd_eff_dvg,
+        &vds.scale(-1.),
+        (electro.vgd_eff_raw.clone(), here.dvgd_eff_dvg),
         vbs,
         EdgeLeakage {
             amplitude: p.agisl,
@@ -530,7 +524,7 @@ pub(super) fn evaluate_constitutive<S: Constitutive>(
         let partition_coefficient = if model.pigcdGiven {
             c(p.pigcd)
         } else {
-            let width = overdrive.clone().offset(1e-20);
+            let width = overdrive.offset(1e-20);
             let coefficient = c(-p.Bechvb).divide(&width)?.divide(&width)?;
             coefficient.multiply(&effective.clone().scale(-0.5).divide(&width)?.offset(1.))
         };

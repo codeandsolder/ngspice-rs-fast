@@ -42,6 +42,10 @@ pub(in crate::devices::bsim4) struct PhysicalPoint<S> {
 
 /// Evaluate at polarity-normalized voltages relative to source prime.
 /// The caller maps aliases and applies current and charge multiplicities.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the physical current and charge incidence audit contiguous, including shared prime-node orientation and independent histories"
+)]
 pub(in crate::devices::bsim4) fn evaluate<S: Constitutive>(
     model: &Model,
     here: &mut Instance,
@@ -66,8 +70,8 @@ pub(in crate::devices::bsim4) fn evaluate<S: Constitutive>(
     let vd = drop(d, s);
     let vg = drop(g, s);
     let vb = drop(b, s);
-    let vdes = drop(de, s);
-    let vses = drop(se, s);
+    let external_drain = drop(de, s);
+    let external_source = drop(se, s);
     let junction_bias = junction::JunctionBias {
         source: drop(sb, s),
         drain: drop(db, d),
@@ -91,8 +95,8 @@ pub(in crate::devices::bsim4) fn evaluate<S: Constitutive>(
             vb.clone(),
             vg.clone(),
             vd.clone(),
-            vdes.clone(),
-            vses.clone(),
+            external_drain.clone(),
+            external_source.clone(),
         ],
         &electro,
     )?;
@@ -105,7 +109,7 @@ pub(in crate::devices::bsim4) fn evaluate<S: Constitutive>(
         &transport,
     )?;
     let intrinsic = charge::intrinsic_constitutive(model, here, size, true, &electro, &transport)?;
-    let [qbs, qbd] = junction::charge_constitutive(model, here, size, junction_bias, |_, _| {})?;
+    let [qbs, qbd] = junction::charge_constitutive(model, here, size, &junction_bias, |_, _| {})?;
     let (fd, fs) = if here.mode > 0 { (d, s) } else { (s, d) };
     let mut branches = vec![
         ([fd, fs], currents.channel),
@@ -210,8 +214,8 @@ pub(in crate::devices::bsim4) fn evaluate<S: Constitutive>(
         (state::VDBS, drop(db, s).primal()),
         (state::VDBD, drop(db, d).primal()),
         (state::VSBS, drop(sb, s).primal()),
-        (state::VSES, vses.primal()),
-        (state::VDES, vdes.primal()),
+        (state::VSES, external_source.primal()),
+        (state::VDES, external_drain.primal()),
         (state::QDEF, 0.),
         (state::QS, qs.primal()),
     ];

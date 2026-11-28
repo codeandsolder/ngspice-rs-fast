@@ -550,7 +550,7 @@ impl ThresholdRollOff {
             Self::Bsim3 => {
                 if argument.compare(-EXP_LIMIT) != Some(Ordering::Greater) {
                     return Ok((
-                        argument.constant(MIN_EXP * (1. + 2. * MIN_EXP)),
+                        argument.constant(MIN_EXP * 2.0_f64.mul_add(MIN_EXP, 1.)),
                         argument.constant(0.),
                     ));
                 }
