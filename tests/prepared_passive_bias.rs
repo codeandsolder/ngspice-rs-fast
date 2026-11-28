@@ -506,3 +506,50 @@ fn polynomial_uic_distinguishes_omission_zero_and_signed_coordinates() {
         }
     }
 }
+
+#[test]
+fn polynomial_exact_history_is_independent_of_reported_bias() {
+    for derivative in [false, true] {
+        let body = format!(
+            "i1 0 b 1m\nc1 b 0 cm 1u\n.model cm pspice_cap(vc1=0.25)\nv1 e 0 1\nl1 e 0 lm 1m\n.model lm pspice_ind(il1=0.25)\n{}\n.tran 1u 100u 0 1u",
+            if derivative {
+                "vtime z 0 PWL(0 0 100u 1)\nb1 obs 0 v=100u*ddt(v(z))\nr1 obs 0 1k"
+            } else {
+                ""
+            },
+        );
+        let (n, config, mut c) = deck(&body);
+        for (name, kind, constraint) in [
+            ("c1", StorageKind::Capacitor, voltage(-0.5, Some(1e-3))),
+            ("l1", StorageKind::Inductor, current(-0.5, 0.1)),
+        ] {
+            c.bind_passive_initialization(
+                name,
+                PassiveInitialization::new(
+                    kind,
+                    Some(-0.5),
+                    [(AnalysisKind::Transient, constraint)],
+                )
+                .unwrap()
+                .with_exact_history()
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        c.finalize().unwrap();
+        let p = config
+            .plan_for(&n.analyses[0])
+            .unwrap()
+            .run(&mut c, &config.context())
+            .unwrap();
+        close(p.value("v(b)", 0).unwrap().re, 0.5, 1e-9);
+        close(p.value("i(l1)", 0).unwrap().re, -0.4, 1e-9);
+        assert!(p.point_count() > 5);
+        for index in 1..p.point_count() {
+            let time = p.value("time", index).unwrap().re;
+            let expected = 8000_f64.mul_add(time, 12.25).sqrt() - 4.;
+            close(p.value("v(b)", index).unwrap().re, expected, 5e-5);
+            close(p.value("i(l1)", index).unwrap().re, expected, 5e-5);
+        }
+    }
+}
