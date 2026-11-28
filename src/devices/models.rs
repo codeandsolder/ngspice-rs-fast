@@ -853,6 +853,9 @@ pub struct ModelContext {
     /// artificial nodal continuation conductance of DC gmin stepping. Default
     /// [`DEFAULT_GMIN`]; must be finite and nonnegative.
     pub gmin: Real,
+    /// Configured junction conductance, unchanged by temporary continuation.
+    /// Source-resolved physical damping may depend on this setting.
+    pub configured_gmin: Real,
     /// Physical shunts used at topology elaboration.
     pub shunts: TopologyShunts,
     /// Global source geometry scale, applied only when resolving setters.
@@ -898,6 +901,7 @@ impl ModelContext {
             resistor_overrides: [None; MAX_RESISTOR_OVERRIDES],
             instance_overrides: [None; MAX_INSTANCE_OVERRIDES],
             gmin: DEFAULT_GMIN,
+            configured_gmin: DEFAULT_GMIN,
             shunts: TopologyShunts {
                 resistance: None,
                 capacitance: 0.,
@@ -947,6 +951,13 @@ impl ModelContext {
     /// [`Self::gmin`]).
     #[must_use = "discarding the returned context loses the requested minimum conductance"]
     pub const fn with_gmin(mut self, gmin: Real) -> Self {
+        self.gmin = gmin;
+        self.configured_gmin = gmin;
+        self
+    }
+
+    /// Temporary junction-only conductance for a convergence attempt.
+    pub(crate) const fn with_junction_gmin(mut self, gmin: Real) -> Self {
         self.gmin = gmin;
         self
     }
@@ -1070,6 +1081,12 @@ impl ModelContext {
                     "junction gmin must be finite and nonnegative, got {}",
                     self.gmin
                 ),
+            ));
+        }
+        if !(self.configured_gmin.is_finite() && self.configured_gmin >= 0.) {
+            return Err(SpiceError::parse(
+                location.clone(),
+                "configured gmin must be finite and nonnegative",
             ));
         }
         if !(self.reltol.is_finite() && self.reltol > 0.) {

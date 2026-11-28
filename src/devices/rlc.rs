@@ -1309,6 +1309,7 @@ mod tests {
             temperature: 27.0,
             nominal_temperature: 27.0,
             gmin: crate::devices::DEFAULT_GMIN,
+            configured_gmin: crate::devices::DEFAULT_GMIN,
             reltol: crate::devices::DEFAULT_RELTOL,
             frequency: 0.,
             mode: crate::devices::traits::AnalysisMode::Transient { time: 0., dt: 1e-6 },

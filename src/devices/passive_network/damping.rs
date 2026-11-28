@@ -135,7 +135,7 @@ impl Device for DampingShunt {
         let g = self
             .damping
             .stamp_law(context.mode, context.analysis_kind)
-            .evaluate(context.gmin)?;
+            .evaluate(context.configured_gmin)?;
         stamp_conductance(self.terminals, g, context)
     }
 
@@ -143,7 +143,7 @@ impl Device for DampingShunt {
         let g = self
             .damping
             .law(context.model_context.analysis_kind)
-            .evaluate(context.model_context.gmin)?;
+            .evaluate(context.model_context.configured_gmin)?;
         assemble_conductance(self.terminals, g, context)
     }
 
@@ -155,7 +155,7 @@ impl Device for DampingShunt {
         let g = self
             .damping
             .small_signal
-            .evaluate(context.model_context.gmin)?;
+            .evaluate(context.model_context.configured_gmin)?;
         assemble_conductance(self.terminals, g, context)
     }
 
@@ -176,7 +176,7 @@ impl Device for DampingShunt {
             "g" | "conductance" => self
                 .damping
                 .law(context.analysis_kind)
-                .evaluate(context.gmin)
+                .evaluate(context.configured_gmin)
                 .map(Some),
             _ => Ok(None),
         }
@@ -194,7 +194,7 @@ impl Device for DampingShunt {
         let g = self
             .damping
             .small_signal
-            .evaluate(context.model_context.gmin)?;
+            .evaluate(context.model_context.configured_gmin)?;
         Ok(resistor_noise(
             self.terminals,
             g,

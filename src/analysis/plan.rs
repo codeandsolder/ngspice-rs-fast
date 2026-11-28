@@ -879,9 +879,10 @@ impl AnalysisPlan {
             return Err(unsupported("sensitivity resolution requires a .sens plan"));
         };
         circuit.validate_prepared_analysis(self.kind(), self.uic())?;
+        let analysis_kind = circuit.requires_analysis_context().then(|| self.kind());
         let context = &crate::analysis::AnalysisContext {
-            analysis_kind: circuit.requires_analysis_context().then(|| self.kind()),
-            bias_analysis: circuit.requires_analysis_context().then(|| self.kind()),
+            analysis_kind,
+            bias_analysis: analysis_kind,
             ..*context
         };
         let (plot, resolution) =
@@ -899,10 +900,10 @@ impl AnalysisPlan {
     ) -> SpiceResult<()> {
         use crate::analysis::{ac, disto, linear, noise, pz, sens, sparam, sweep, tf};
         circuit.validate_prepared_analysis(self.kind(), self.uic())?;
+        let analysis_kind = circuit.requires_analysis_context().then(|| self.kind());
         let context = &crate::analysis::AnalysisContext {
-            analysis_kind: circuit.requires_analysis_context().then(|| self.kind()),
-            bias_analysis: (!self.uic() && circuit.requires_analysis_context())
-                .then(|| self.kind()),
+            analysis_kind,
+            bias_analysis: analysis_kind.filter(|_| !self.uic()),
             ..*context
         };
         if let Some(mut mixed) = circuit.prepare_native_mixed()? {
@@ -985,10 +986,10 @@ impl AnalysisPlan {
             return Err(unsupported("periodic orbit requires a .pss plan"));
         };
         circuit.validate_prepared_analysis(self.kind(), self.uic())?;
+        let analysis_kind = circuit.requires_analysis_context().then(|| self.kind());
         let context = &crate::analysis::AnalysisContext {
-            analysis_kind: circuit.requires_analysis_context().then(|| self.kind()),
-            bias_analysis: (!self.uic() && circuit.requires_analysis_context())
-                .then(|| self.kind()),
+            analysis_kind,
+            bias_analysis: analysis_kind.filter(|_| !self.uic()),
             ..*context
         };
         super::pss::run(circuit, self, context, settings, warm, sink)

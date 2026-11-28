@@ -754,6 +754,8 @@ pub struct StampContext<'a> {
     pub nominal_temperature: Real,
     /// Junction minimum conductance (S), [`crate::devices::ModelContext::gmin`].
     pub gmin: Real,
+    /// Configured physical damping conductance basis, not temporary junction gmin.
+    pub configured_gmin: Real,
     /// Resolved circuit relative tolerance, not a Newton-local override.
     pub reltol: Real,
     /// The `hertz` frequency (Hz), [`crate::devices::ModelContext::frequency`].
@@ -795,7 +797,8 @@ impl StampContext<'_> {
     pub const fn model_context(&self) -> crate::devices::ModelContext {
         let mut context =
             crate::devices::ModelContext::new(self.temperature, self.nominal_temperature)
-                .with_gmin(self.gmin)
+                .with_gmin(self.configured_gmin)
+                .with_junction_gmin(self.gmin)
                 .with_reltol(self.reltol)
                 .with_frequency(self.frequency);
         context.analysis_kind = self.analysis_kind;

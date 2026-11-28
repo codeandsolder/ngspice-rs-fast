@@ -63,7 +63,7 @@ fn close(got: Complex, want: Complex) {
 }
 
 fn admittance(
-    input: PassiveNetworkCoefficients,
+    input: &PassiveNetworkCoefficients,
     name: &str,
     frequency: &str,
 ) -> SpiceResult<Complex> {
@@ -120,7 +120,7 @@ fn capacitor_series_and_parallel_topology_matches_measured_admittance() -> Spice
             Complex::new(0.043496142969925, 0.0480014503017573) * Complex::real(3.),
         ),
     ] {
-        close(admittance(input, "c1", "5050")?, measured);
+        close(admittance(&input, "c1", "5050")?, measured);
     }
     Ok(())
 }
@@ -159,7 +159,7 @@ fn winding_parasitics_and_parallel_copies_match_measured_admittance() -> SpiceRe
             Complex::new(0.185112594692246, -0.0653875743936265) * Complex::real(3.),
         ),
     ] {
-        close(admittance(input, "l1", "100")?, measured);
+        close(admittance(&input, "l1", "100")?, measured);
     }
     Ok(())
 }
@@ -184,10 +184,10 @@ fn winding_shunt_and_external_shunt_are_physically_distinct() -> SpiceResult<()>
         ..base
     };
     close(
-        admittance(winding, "l1", "100")?,
+        admittance(&winding, "l1", "100")?,
         one / (r + one / (one / z + g)),
     );
-    close(admittance(external, "l1", "100")?, one / (r + z) + g);
+    close(admittance(&external, "l1", "100")?, one / (r + z) + g);
     Ok(())
 }
 
@@ -197,7 +197,7 @@ fn zero_series_and_removed_networks_do_not_create_artificial_resistors() -> Spic
     let input = coefficients(StorageKind::Capacitor, 2e-6);
     assert!(
         PreparedPassiveNetwork::prepare(
-            PassiveNetworkCoefficients {
+            &PassiveNetworkCoefficients {
                 multiplicity: 0.,
                 ..input
             },
@@ -205,7 +205,7 @@ fn zero_series_and_removed_networks_do_not_create_artificial_resistors() -> Spic
         )?
         .is_none()
     );
-    let network = PreparedPassiveNetwork::prepare(input, None)?.unwrap();
+    let network = PreparedPassiveNetwork::prepare(&input, None)?.unwrap();
     let before = circuit.devices().len();
     network.bind(&mut circuit, "c1", [port, NodeId::GROUND])?;
     assert_eq!(circuit.devices().len() - before, 2);
@@ -222,7 +222,7 @@ fn duplicate_names_and_budget_errors_rollback_all_nodes_and_devices() -> SpiceRe
         series_inductance: 3e-3,
         ..coefficients(StorageKind::Capacitor, 2e-6)
     };
-    let network = PreparedPassiveNetwork::prepare(input, None)?.unwrap();
+    let network = PreparedPassiveNetwork::prepare(&input, None)?.unwrap();
     circuit.add_node("c1#passive3")?;
     let before = circuit.nodes().nodes().to_vec();
     let devices = circuit.devices().len();
@@ -276,7 +276,7 @@ fn noise_matches_equivalent_native_network() -> SpiceResult<()> {
         temperature: Some(87.),
         ..coefficients(StorageKind::Capacitor, 2e-6)
     };
-    PreparedPassiveNetwork::prepare(input, None)?
+    PreparedPassiveNetwork::prepare(&input, None)?
         .unwrap()
         .bind(&mut circuit, "c1", [port, NodeId::GROUND])?;
     let args = ["v(port)", "vdrive", "dec", "5", "10", "100k"];
@@ -307,7 +307,7 @@ fn coupling_uses_winding_identity_not_terminal_probe() -> SpiceResult<()> {
         100.,
     )?))?;
     let primary = PreparedPassiveNetwork::prepare(
-        PassiveNetworkCoefficients {
+        &PassiveNetworkCoefficients {
             series_resistance: 5.,
             parallel_resistance: Some(100.),
             parallel_capacitance: 1e-6,
@@ -317,7 +317,7 @@ fn coupling_uses_winding_identity_not_terminal_probe() -> SpiceResult<()> {
     )?
     .unwrap()
     .bind(&mut circuit, "l1", [port, NodeId::GROUND])?;
-    PreparedPassiveNetwork::prepare(coefficients(StorageKind::Inductor, 12e-3), None)?
+    PreparedPassiveNetwork::prepare(&coefficients(StorageKind::Inductor, 12e-3), None)?
         .unwrap()
         .bind(&mut circuit, "l2", [secondary, NodeId::GROUND])?;
     circuit.add_device(Box::new(MutualInductance::new(
@@ -374,7 +374,7 @@ fn startup_bias_applies_to_storage_and_not_to_parallel_terminal_paths() -> Spice
         )],
     )?;
     let binding = PreparedPassiveNetwork::prepare(
-        PassiveNetworkCoefficients {
+        &PassiveNetworkCoefficients {
             series_resistance: 0.001,
             ..coefficients(StorageKind::Capacitor, 2e-6)
         },

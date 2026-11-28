@@ -360,3 +360,47 @@ fn series_inductance_shunt_supports_distinct_multiplicity_laws() -> SpiceResult<
     }
     Ok(())
 }
+
+#[test]
+fn physical_damping_ignores_temporary_junction_continuation() -> SpiceResult<()> {
+    use ngspice_rs::{
+        devices::{AnalysisMode, LoadRequest, ModelContext},
+        maths::{SparseMatrix, Vector},
+    };
+    let mut circuit = circuit(
+        "continuation damping\nv1 s 0 1\nr1 s p 10\nc1 p 0 1u pn_gterminal_dc_gmin=1e10\n.end\n",
+    )?;
+    let configured = ModelContext::default().with_gmin(1e-12);
+    let continuation = ModelContext {
+        gmin: 1e-6,
+        ..configured
+    };
+    let normal = circuit.linear_system_with_context(&configured)?;
+    let continued = circuit.linear_system_with_context(&continuation)?;
+    assert_eq!(normal.a, continued.a);
+    let n = circuit.unknown_count();
+    let solution = Vector::zeros(n);
+    let history = circuit.state_history()?;
+    let stamp = |model_context| -> SpiceResult<SparseMatrix> {
+        let request = LoadRequest {
+            mode: AnalysisMode::OperatingPoint,
+            solution: &solution,
+            model_context,
+            integration: None,
+            history: &history,
+            forcing: None,
+        };
+        let mut matrix = SparseMatrix::new(n, n);
+        circuit.load(
+            &request,
+            &mut matrix,
+            &mut Vector::zeros(n),
+            &mut history.trial(),
+        )?;
+        Ok(matrix)
+    };
+    assert_eq!(stamp(&configured)?, stamp(&continuation)?);
+    let overridden = circuit.linear_system_with_context(&configured.with_gmin(2e-12))?;
+    assert_ne!(normal.a, overridden.a);
+    Ok(())
+}

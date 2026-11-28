@@ -6,7 +6,7 @@
 //! intentionally distinct.
 
 mod damping;
-mod report;
+pub(crate) mod report;
 use damping::DampingShunt;
 pub use damping::{AnalysisDamping, ConductanceLaw};
 pub(super) use report::CurrentReportSpec;
@@ -181,7 +181,7 @@ impl PreparedPassiveNetwork {
     /// Invalid physical coefficients, temperature, multiplicity, scaled
     /// values, or a startup constraint incompatible with the storage family.
     pub fn prepare(
-        input: PassiveNetworkCoefficients,
+        input: &PassiveNetworkCoefficients,
         initialization: Option<PassiveInitialization>,
     ) -> SpiceResult<Option<Self>> {
         Self::validate(input, initialization.as_ref())?;
@@ -273,7 +273,7 @@ impl PreparedPassiveNetwork {
     }
 
     fn validate(
-        input: PassiveNetworkCoefficients,
+        input: &PassiveNetworkCoefficients,
         initialization: Option<&PassiveInitialization>,
     ) -> SpiceResult<()> {
         if !input.multiplicity.is_finite()
@@ -784,7 +784,7 @@ impl NetworkPlan {
             terminal_damping: Self::damping(values, "terminal")?,
         };
         let initialization = Self::initialization(kind, initial, multiplicity, values)?;
-        let Some(mut network) = PreparedPassiveNetwork::prepare(coefficients, initialization)?
+        let Some(mut network) = PreparedPassiveNetwork::prepare(&coefficients, initialization)?
         else {
             return Ok(Self::Storage(None));
         };
