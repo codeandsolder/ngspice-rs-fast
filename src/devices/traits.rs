@@ -1073,15 +1073,25 @@ pub trait Device: fmt::Debug + std::any::Any {
         ))
     }
 
+    /// Occurrence-bound physical passive startup policy, if installed.
+    fn passive_initialization(
+        &self,
+    ) -> Option<&crate::devices::passive_bias::PassiveInitialization> {
+        None
+    }
+
     /// True when bias equations need physical nodal continuation rather
     /// than perturbing a numerical pivot diagonal.
     fn has_passive_bias(&self) -> bool {
-        false
+        crate::devices::passive_bias::has_constraints(self.passive_initialization())
     }
 
     /// Whether an explicit physical initialization equation applies in this bias analysis.
-    fn has_active_passive_bias(&self, _analysis: crate::primitives::AnalysisKind) -> bool {
-        false
+    fn has_active_passive_bias(&self, analysis: crate::primitives::AnalysisKind) -> bool {
+        crate::devices::passive_bias::has_active_constraints(
+            self.passive_initialization(),
+            analysis,
+        )
     }
 
     /// Whether real loads require the enclosing analysis selected by the
