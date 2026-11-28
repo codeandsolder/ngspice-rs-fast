@@ -474,6 +474,8 @@ fn series_inductor_shunt_noise_uses_frequency_domain_multiplicity() -> SpiceResu
 
 #[test]
 fn conditional_voltage_capacitance_depends_on_expanded_electrical_consumers() -> SpiceResult<()> {
+    // The prepared current operator binds device-name formals explicitly.
+    // Native ngspice i(formal) intentionally does not have this semantics.
     let mut deck = String::from("conditional physical source capacitance\n");
     for index in 1..=7 {
         writeln!(
@@ -484,7 +486,7 @@ fn conditional_voltage_capacitance_depends_on_expanded_electrical_consumers() ->
         writeln!(deck, "r{index} out{index} 0 3")
             .map_err(|error| ngspice_rs::primitives::SpiceError::circuit(error.to_string()))?;
     }
-    deck.push_str(".func probe(x) {i(x)}\n.func nested(y) {probe(y)}\n.func direct() {i(v2)}\n.func unused() {i(v3)}\nb1 b1out 0 v=nested(v1)\nb2 b2out 0 v=direct()\n.save i(v3)\nf1 0 f1out v4 1\nrf1 f1out 0 1\nh1 h1out 0 v5 1\nfpoly 0 fpolyout poly(2) v6 v7 0 1 1\nrfpoly fpolyout 0 1\n.end\n");
+    deck.push_str(".func probe(x) {branch_or_sampled_current(i(x))}\n.func nested(y) {probe(y)}\n.func direct() {branch_or_sampled_current(i(v2))}\n.func unused() {branch_or_sampled_current(i(v3))}\nb1 b1out 0 v=nested(v1)\nb2 b2out 0 v=direct()\n.save i(v3)\nf1 0 f1out v4 1\nrf1 f1out 0 1\nh1 h1out 0 v5 1\nfpoly 0 fpolyout poly(2) v6 v7 0 1 1\nrfpoly fpolyout 0 1\n.end\n");
     let mut circuit = circuit(&deck)?;
     let ac = run(
         &mut circuit,
@@ -535,7 +537,7 @@ fn conditional_voltage_capacitance_is_selected_per_subcircuit_occurrence() -> Sp
 #[test]
 fn conditional_voltage_topology_rejects_late_electrical_changes_atomically() -> SpiceResult<()> {
     use ngspice_rs::devices::{
-        ControlReference, ControlledKind, ControlledSource, ModelContext, models::ModelResolver,
+        ControlReference, ControlledKind, ControlledSource, ModelContext, ModelResolver,
     };
     use ngspice_rs::primitives::NodeId;
 
