@@ -32,6 +32,7 @@ mod channel;
 mod charge;
 mod junction;
 mod leakage;
+pub(super) mod physical;
 mod reduction;
 mod stamp;
 
@@ -53,12 +54,6 @@ const CHARGE: f64 = 1.602_176_620_8e-19;
 /// `CONSTvt0 = CONSTboltz * REFTEMP / CHARGE` (`main.c`), REFTEMP = 27 C.
 const CONST_VT0: f64 = 1.380_648_52e-23 * (27.0 + 273.15) / CHARGE;
 
-fn exp(x: f64) -> f64 {
-    x.exp()
-}
-fn log(x: f64) -> f64 {
-    x.ln()
-}
 fn sqrt(x: f64) -> f64 {
     x.sqrt()
 }

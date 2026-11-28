@@ -27,9 +27,15 @@ use super::host::{LoadCkt, SmallSignalCkt, mode, node, state};
 use super::{Inputs, ModelParameters, acld, apply, cvtest, elements, load, noise, pzld, set, temp};
 use crate::devices::linear::LinearContext;
 use crate::devices::models::{ModelContext, PreparationKey, ResolvedModel};
+use crate::devices::physical_dae::{LocalGuard, TaylorContext, TaylorControl};
 use crate::devices::schema::temperature_kelvin;
 use crate::devices::state::IterationPhase;
-use crate::devices::traits::{AnalysisMode, ConvergenceContext, Device, StampContext};
+use crate::devices::traits::{
+    AnalysisMode, ChargeContext, ConvergenceContext, Device, PhysicalChargeHistory, StampContext,
+};
+use crate::maths::taylor::{
+    BranchComparison, Jet, ObservedDifferential, differential::Differential,
+};
 use crate::netlist::ast::DeviceInstance;
 use crate::primitives::{NodeAppend, NodeId, NodeKind, Real, SourceLoc, SpiceError, SpiceResult};
 
@@ -372,6 +378,103 @@ impl Bsim4 {
             .ok()
             .and_then(|i| self.nodes.get(i))
             .copied()
+    }
+
+    fn physical_source(&self, here: &Instance) -> SpiceResult<NodeId> {
+        self.node_id(here.sNodePrime)
+            .or_else(|| (here.sNodePrime == node::GROUND).then_some(NodeId::GROUND))
+            .ok_or_else(|| SpiceError::circuit("invalid BSIM4 source prime"))
+    }
+
+    fn physical_scalar_point(
+        &self,
+        prepared: &Prepared,
+        here: &mut Instance,
+        gmin: Real,
+        voltage: impl Fn(NodeId) -> Real,
+    ) -> SpiceResult<load::physical::PhysicalPoint<Differential<{ node::COUNT }>>> {
+        let source = self.physical_source(here)?;
+        let polarity = Real::from(prepared.model.r#type);
+        let reference = voltage(source);
+        let values = self
+            .nodes
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                Differential::variable(
+                    index,
+                    Jet::constant(0, polarity * (voltage(id) - reference)),
+                )
+            })
+            .collect::<SpiceResult<Vec<_>>>()?;
+        load::physical::evaluate(
+            &prepared.model,
+            here,
+            &prepared.size,
+            prepared.model_temperature(),
+            gmin,
+            |local| {
+                usize::try_from(local)
+                    .ok()
+                    .and_then(|i| values.get(i))
+                    .cloned()
+                    .unwrap_or_else(|| Differential::constant(0, 0.))
+            },
+        )
+    }
+
+    fn stamp_physical_static(
+        &self,
+        prepared: &Prepared,
+        here: &mut Instance,
+        context: &mut StampContext<'_>,
+    ) -> SpiceResult<()> {
+        let source = self.physical_source(here)?;
+        let pol = Real::from(prepared.model.r#type);
+        let scale = here.mult_i * here.m;
+        let point = self.physical_scalar_point(prepared, here, context.gmin, |node| {
+            context.node_voltage(node)
+        })?;
+        let normalized = self
+            .nodes
+            .map(|node| pol * (context.node_voltage(node) - context.node_voltage(source)));
+        for ([a, b], law) in point.currents {
+            let a = self.node_id(a).unwrap_or(NodeId::GROUND);
+            let b = self.node_id(b).unwrap_or(NodeId::GROUND);
+            if a == b {
+                continue;
+            }
+            law.value.check()?;
+            let mut rhs = -law.value.value();
+            for ((control, value), partial) in
+                self.nodes.into_iter().zip(normalized).zip(law.gradient)
+            {
+                if control == source {
+                    continue;
+                }
+                if let Some(partial) = partial {
+                    partial.check()?;
+                    let derivative = partial.value();
+                    rhs = derivative.mul_add(value, rhs);
+                    if derivative != 0. {
+                        let conductance = scale * derivative;
+                        context.stamp(a, control, conductance)?;
+                        context.stamp(a, source, -conductance)?;
+                        context.stamp(b, control, -conductance)?;
+                        context.stamp(b, source, conductance)?;
+                    }
+                }
+            }
+            context.stamp_rhs(a, pol * scale * rhs)?;
+            context.stamp_rhs(b, -pol * scale * rhs)?;
+        }
+        for (slot, _, law) in point.charges {
+            context.states.set(slot, law.value.value())?;
+        }
+        for (slot, value) in point.auxiliary {
+            context.states.set(slot, value)?;
+        }
+        Ok(())
     }
 
     /// `h`'s node fields after `CKTpzSetup` has re-run `BSIM4setup`
@@ -1193,6 +1296,9 @@ impl Device for Bsim4 {
         let (mode, limiting) = load_mode(context)?;
         let mut shared = self.borrow_shared_mut()?;
         let h = shared.live_instance(&prepared)?;
+        if matches!(context.mode, AnalysisMode::Instantaneous { .. }) {
+            return self.stamp_physical_static(&prepared, h, context);
+        }
         if mode & mode::MODEUIC != 0 && context.states.initial_conditions() {
             // b4getic.c: unset IC components are the solution's terminal
             // voltages (CKTic runs only under MODEUIC).
@@ -1233,6 +1339,128 @@ impl Device for Bsim4 {
         };
         load::load(&prepared.model, h, &prepared.size, &mut host)?;
         host.finish()
+    }
+
+    fn physical_charge_histories(
+        &self,
+        visit: &mut dyn FnMut(PhysicalChargeHistory) -> SpiceResult<()>,
+    ) -> SpiceResult<()> {
+        let prepared = self
+            .any_setup()
+            .ok_or_else(|| SpiceError::circuit("missing BSIM4 physical setup"))?;
+        let here = &prepared.instance;
+        load::physical::require_quasi_static(here)?;
+        let scale = Real::from(prepared.model.r#type) * here.mult_q * here.m;
+        for (slot, nodes) in load::physical::charge_layout(here) {
+            visit(PhysicalChargeHistory {
+                slot,
+                nodes: nodes.map(|local| self.node_id(local).unwrap_or(NodeId::GROUND)),
+                scale,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn assemble_nonlinear_taylor(&self, context: &mut TaylorContext<'_>) -> SpiceResult<()> {
+        let prepared = self.ensure(context.model.temperature, context.model.nominal_temperature)?;
+        let mut here = prepared.instance.clone();
+        let source = self.physical_source(&here)?;
+        let source_row = context.unknowns.node_row(source);
+        let polarity = Real::from(prepared.model.r#type);
+        let controls = self.nodes.map(|node| TaylorControl {
+            rows: [context.unknowns.node_row(node), source_row],
+            polarity,
+        });
+        let comparisons: Option<RefCell<Vec<BranchComparison>>> =
+            context.output.guards.is_some().then(RefCell::default);
+        let values = controls
+            .iter()
+            .enumerate()
+            .map(|(index, control)| {
+                Ok(ObservedDifferential::new(
+                    control.input::<{ node::COUNT }>(index, context)?,
+                    comparisons.as_ref(),
+                ))
+            })
+            .collect::<SpiceResult<Vec<_>>>()?;
+        let point = load::physical::evaluate(
+            &prepared.model,
+            &mut here,
+            &prepared.size,
+            prepared.model_temperature(),
+            context.model.gmin,
+            |local| {
+                usize::try_from(local)
+                    .ok()
+                    .and_then(|i| values.get(i))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        ObservedDifferential::new(
+                            Differential::constant(context.time.order(), 0.),
+                            comparisons.as_ref(),
+                        )
+                    })
+            },
+        )?;
+        let unknowns = context.unknowns;
+        let rows = |nodes: [i32; 2]| {
+            nodes.map(|local| self.node_id(local).and_then(|node| unknowns.node_row(node)))
+        };
+        for (nodes, law) in point.currents {
+            context.local_law(
+                rows(nodes),
+                &law.inner,
+                &controls,
+                polarity * here.mult_i * here.m,
+                None,
+            )?;
+        }
+        for (slot, nodes, law) in point.charges {
+            context.local_law(
+                rows(nodes),
+                &law.inner,
+                &controls,
+                polarity * here.mult_q * here.m,
+                Some(slot),
+            )?;
+        }
+        for (slot, value) in point.auxiliary {
+            context.candidate_state(slot, value)?;
+        }
+        if let (Some(trace), Some(comparisons)) = (&mut context.output.guards, comparisons.as_ref())
+        {
+            let guards = std::mem::take(&mut *comparisons.borrow_mut())
+                .into_iter()
+                .enumerate()
+                .map(|(slot, comparison)| {
+                    LocalGuard::sign(slot, 0, comparison.argument, comparison.boundary)
+                })
+                .collect();
+            trace.extend(context.device, guards)?;
+        }
+        Ok(())
+    }
+
+    fn assemble_nonlinear_charge(&self, context: &mut ChargeContext<'_>) -> SpiceResult<()> {
+        let prepared = self.ensure(context.model.temperature, context.model.nominal_temperature)?;
+        let mut here = prepared.instance.clone();
+        let source = self.physical_source(&here)?;
+        let scale = here.mult_q * here.m;
+        let polarity = Real::from(prepared.model.r#type);
+        let point =
+            self.physical_scalar_point(&prepared, &mut here, context.model.gmin, |node| {
+                context.voltage(node)
+            })?;
+        for (_, nodes, law) in point.charges {
+            let output = nodes.map(|local| self.node_id(local).unwrap_or(NodeId::GROUND));
+            context.branch(output, polarity * scale * law.value.value(), 0.)?;
+            for (control, gradient) in self.nodes.into_iter().zip(law.gradient) {
+                if let Some(gradient) = gradient {
+                    context.coupling(output, [control, source], scale * gradient.value())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `BSIM4convTest` on the live instance the last load left, reading
