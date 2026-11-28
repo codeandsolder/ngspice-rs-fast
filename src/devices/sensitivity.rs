@@ -525,6 +525,30 @@ pub trait AcSensitivityStamp: fmt::Debug {
     fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()>;
 }
 
+/// A reconstructed physical device whose historical AC load combines the
+/// reset-state conductances with the current instance and model fields.
+pub(in crate::devices) trait ResetAcDevice: Device {
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()>;
+}
+
+#[derive(Debug)]
+struct ResetDevicePair<D> {
+    state: D,
+    current: D,
+    omega: Real,
+}
+
+impl<D: ResetAcDevice> AcSensitivityStamp for ResetDevicePair<D> {
+    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+        D::stamp_reset_ac(&self.state, &self.current, self.omega, context)
+    }
+}
+
 /// An explicit choice of ordinary device AC assembly or a specialized
 /// AC-only stamp (including the historical reset protocol).
 #[derive(Debug)]
@@ -542,6 +566,19 @@ impl AcSensitivityLoad {
 
     pub(in crate::devices) fn stamp(stamp: impl AcSensitivityStamp + 'static) -> Self {
         Self::Stamp(Box::new(stamp))
+    }
+
+    /// Reconstruct the two distinct device snapshots in historical load order.
+    pub(in crate::devices) fn reset<D: ResetAcDevice>(
+        reset: AcReset<'_>,
+        current: RecordPair<'_>,
+        reconstruct: impl Fn(RecordPair<'_>) -> SpiceResult<D>,
+    ) -> SpiceResult<Self> {
+        Ok(Self::stamp(ResetDevicePair {
+            state: reconstruct(reset.state)?,
+            current: reconstruct(current)?,
+            omega: reset.omega,
+        }))
     }
 
     pub(super) fn assemble(
@@ -900,6 +937,22 @@ impl<T: SensitivityKernel + ?Sized> DeviceSensitivity for T {
     fn coupled_inductors(&self) -> Option<[&str; 2]> {
         SensitivityKernel::coupled_inductors(self)
     }
+}
+
+/// Replay the common temperature defaults without changing the given flags.
+/// The model nominal temperature is handled by the family before this call.
+pub(in crate::devices) fn instance_temperature_defaults(
+    instance: &mut SensitivityRecord,
+    circuit_kelvin: Real,
+) -> SpiceResult<()> {
+    if !instance.given("dtemp") {
+        instance.store("dtemp", 0.)?;
+    }
+    if !instance.given("temp") {
+        let dtemp = instance.value("dtemp")?;
+        instance.store("temp", circuit_kelvin + dtemp)?;
+    }
+    Ok(())
 }
 
 /// What `cktsens.c`'s per-frequency reset leaves for an AC load

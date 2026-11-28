@@ -89,9 +89,9 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, AcSensitivityStamp, CELSIUS_TO_KELVIN, DcSensitivityLoad,
-    ParameterScope, RecordPair, SensitivityFamily, SensitivityKernel, SensitivityParameter,
-    SensitivityRecord,
+    AcReset, AcSensitivityLoad, CELSIUS_TO_KELVIN, DcSensitivityLoad, ParameterScope, RecordPair,
+    ResetAcDevice, SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord,
+    instance_temperature_defaults,
 };
 use crate::devices::{Device, LinearContext, ModelContext, ResolvedModel, StampContext};
 use crate::maths::Vector;
@@ -1503,14 +1503,7 @@ impl SensitivityKernel for Jfet2Sensitivity<'_> {
         if !model.given("tnom") {
             model.store("tnom", self.nominal_kelvin)?;
         }
-        if !instance.given("dtemp") {
-            instance.store("dtemp", 0.)?;
-        }
-        if !instance.given("temp") {
-            let dtemp = instance.value("dtemp")?;
-            instance.store("temp", self.circuit_kelvin + dtemp)?;
-        }
-        Ok(())
+        instance_temperature_defaults(instance, self.circuit_kelvin)
     }
 
     fn dc_load(
@@ -1532,11 +1525,7 @@ impl SensitivityKernel for Jfet2Sensitivity<'_> {
         reset: AcReset<'_>,
         current: RecordPair<'_>,
     ) -> SpiceResult<AcSensitivityLoad> {
-        Ok(AcSensitivityLoad::stamp(ResetJfet2 {
-            state: self.jfet2(reset.state)?,
-            current: self.jfet2(current)?,
-            omega: reset.omega,
-        }))
+        AcSensitivityLoad::reset(reset, current, |records| self.jfet2(records))
     }
 }
 
@@ -1610,34 +1599,23 @@ impl Jfet2Sensitivity<'_> {
     }
 }
 
-/// A JFET2's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
-#[derive(Debug)]
-struct ResetJfet2 {
-    /// Built from the reset load's records: the junction conductances.
-    state: Jfet2,
-    /// Built from the current records: `PSacload`'s coefficients, series
-    /// conductances and `m`.
-    current: Jfet2,
-    /// `CKTomega`.
-    omega: Real,
-}
-
-impl AcSensitivityStamp for ResetJfet2 {
+impl ResetAcDevice for Jfet2 {
     /// `jfet2acld.c`'s stamps in its order: `PSacload`'s imaginary parts,
     /// then the real parts (the gate charges' `xgs`/`xgd` are zero).
-    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()> {
         use crate::devices::sensitivity::{StampPart, node_stamps, stamp_reset};
         let gmin = context.model_context.gmin;
-        let state = &self.state;
         let state_op = state.operating(context.model_context)?;
         let [vgs, vgd] = state.normalized([0.; 3]);
         let point = state.point(&state_op, vgs, vgd, gmin, None)?;
         let (cdrain, gm, gds) = point.channel;
         let cd = cdrain - point.gd.0;
-        let current = &self.current;
         let op = current.operating(context.model_context)?;
-        let omega = self.omega;
         let (gm, xgm, gds, xgds) = current.model.acload(&op, vgs, vgd, cd, omega, gm, gds);
         // `xgds += qds * CKTomega` with the reset's zero charge.
         let xgds = 0.0f64.mul_add(omega, xgds);

@@ -45,7 +45,7 @@ use crate::devices::initial::InstanceInitial;
 use crate::devices::jfet::{self, BOLTZMANN, CHARGE};
 use crate::devices::nonlinear::unaliased_conductance;
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, AcSensitivityStamp, DcSensitivityLoad, ParameterScope, RecordPair,
+    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, ResetAcDevice,
     SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord, StampPart,
     node_stamps, stamp_reset,
 };
@@ -1936,10 +1936,7 @@ impl SensitivityKernel for MesaSensitivity<'_> {
         reset: AcReset<'_>,
         current: RecordPair<'_>,
     ) -> SpiceResult<AcSensitivityLoad> {
-        Ok(AcSensitivityLoad::stamp(ResetMesa {
-            state: self.mesa(reset.state)?,
-            current: self.mesa(current)?,
-        }))
+        AcSensitivityLoad::reset(reset, current, |records| self.mesa(records))
     }
 }
 
@@ -2038,23 +2035,16 @@ impl MesaSensitivity<'_> {
     }
 }
 
-/// A MESA's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
-#[derive(Debug)]
-struct ResetMesa {
-    /// Built from the reset load's records: the gate and channel
-    /// conductances.
-    state: Mesa,
-    /// Built from the current records: the series conductances and `m`.
-    current: Mesa,
-}
-
-impl AcSensitivityStamp for ResetMesa {
+impl ResetAcDevice for Mesa {
     /// `mesaacl.c`'s real stamps in its order; `xgs`/`xgd` are zero.
-    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        _omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()> {
         let model_context = context.model_context;
         let (temperature, nominal) = (model_context.temperature, model_context.nominal_temperature);
-        let state = &self.state;
         let derived = state.derived(temperature, nominal)?;
         // `von` with a zero `CKTrhsOld` source-prime voltage.
         let von = state.model.ks.mul_add(0. - state.model.vsg, derived.tvto);
@@ -2065,7 +2055,6 @@ impl AcSensitivityStamp for ResetMesa {
             (point.gm, point.gds)
         };
         let (ggs, ggd, ggspp, ggdpp) = (point.ggs, point.ggd, 0., 0.);
-        let current = &self.current;
         let c = current.derived(temperature, nominal)?;
         let m = current.instance.m;
         let n = current.nodes;

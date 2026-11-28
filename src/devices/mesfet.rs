@@ -81,7 +81,7 @@ use crate::devices::schema::{
     self, ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, AcSensitivityStamp, DcSensitivityLoad, ParameterScope, RecordPair,
+    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, ResetAcDevice,
     SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord,
 };
 use crate::devices::{
@@ -983,10 +983,7 @@ impl SensitivityKernel for MesfetSensitivity<'_> {
         reset: AcReset<'_>,
         current: RecordPair<'_>,
     ) -> SpiceResult<AcSensitivityLoad> {
-        Ok(AcSensitivityLoad::stamp(ResetMesfet {
-            state: self.mesfet(reset.state)?,
-            current: self.mesfet(current)?,
-        }))
+        AcSensitivityLoad::reset(reset, current, |records| self.mesfet(records))
     }
 }
 
@@ -1027,31 +1024,24 @@ impl MesfetSensitivity<'_> {
     }
 }
 
-/// A MESFET's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
-#[derive(Debug)]
-struct ResetMesfet {
-    /// Built from the reset load's records: the junction conductances.
-    state: Mesfet,
-    /// Built from the current records: series conductances and `m`.
-    current: Mesfet,
-}
-
-impl AcSensitivityStamp for ResetMesfet {
+impl ResetAcDevice for Mesfet {
     /// `mesacl.c`'s real stamps (`jfetacld.c`'s list); its `xgs`/`xgd`
     /// imaginary parts are zero.
-    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
-        let state = &self.state;
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        _omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()> {
         let op = state.operating()?;
         let [vgs, vgd] = state.normalized([0.; 3]);
         let point = state.point(&op, vgs, vgd, context.model_context.gmin)?;
-        let c = &self.current;
         jfet::linear::ac_conductances(
             context,
-            &c.terminals,
-            c.inner,
-            c.instance.m,
-            jfet::series_conductances(c.instance.area, c.model.rd, c.model.rs),
+            &current.terminals,
+            current.inner,
+            current.instance.m,
+            jfet::series_conductances(current.instance.area, current.model.rd, current.model.rs),
             [point.channel.gm, point.channel.gds, point.gs.1, point.gd.1],
         )
     }

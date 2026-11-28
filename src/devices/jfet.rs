@@ -64,8 +64,9 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U, ScalarValues,
 };
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, AcSensitivityStamp, DcSensitivityLoad, ParameterScope, RecordPair,
+    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, ResetAcDevice,
     SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord,
+    instance_temperature_defaults,
 };
 use crate::devices::{
     Device, LinearContext, ModelContext, ModelFamily, ResolvedModel, StampContext,
@@ -1324,14 +1325,7 @@ impl SensitivityKernel for JfetSensitivity<'_> {
         if !model.given("tnom") {
             model.store("tnom", self.nominal_kelvin)?;
         }
-        if !instance.given("dtemp") {
-            instance.store("dtemp", 0.)?;
-        }
-        if !instance.given("temp") {
-            let dtemp = instance.value("dtemp")?;
-            instance.store("temp", self.circuit_kelvin + dtemp)?;
-        }
-        Ok(())
+        instance_temperature_defaults(instance, self.circuit_kelvin)
     }
 
     fn dc_load(
@@ -1353,10 +1347,7 @@ impl SensitivityKernel for JfetSensitivity<'_> {
         reset: AcReset<'_>,
         current: RecordPair<'_>,
     ) -> SpiceResult<AcSensitivityLoad> {
-        Ok(AcSensitivityLoad::stamp(ResetJfet {
-            state: self.jfet(reset.state)?,
-            current: self.jfet(current)?,
-        }))
+        AcSensitivityLoad::reset(reset, current, |records| self.jfet(records))
     }
 }
 
@@ -1411,31 +1402,25 @@ impl JfetSensitivity<'_> {
     }
 }
 
-/// A JFET's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
-#[derive(Debug)]
-struct ResetJfet {
-    /// Built from the reset load's records: the junction conductances.
-    state: Jfet,
-    /// Built from the current records: series conductances and `m`.
-    current: Jfet,
-}
-
-impl AcSensitivityStamp for ResetJfet {
+impl ResetAcDevice for Jfet {
     /// `jfetacld.c`'s real stamps; its `xgs`/`xgd` imaginary parts are zero.
-    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        _omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()> {
         let model = context.model_context;
-        let state = &self.state;
         let op = state.operating(model)?;
         let [vgs, vgd] = state.normalized([0.; 3]);
         let e = state.evaluate(&op, vgs, vgd, model.gmin)?;
-        let current = self.current.operating(model)?;
+        let current_op = current.operating(model)?;
         ac_conductances(
             context,
-            &self.current.terminals,
-            self.current.inner,
-            self.current.instance.m,
-            [current.gdpr, current.gspr],
+            &current.terminals,
+            current.inner,
+            current.instance.m,
+            [current_op.gdpr, current_op.gspr],
             [e.load.gm, e.load.gds, e.load.ggs, e.load.ggd],
         )
     }

@@ -61,7 +61,7 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, AcSensitivityStamp, DcSensitivityLoad, ParameterScope, RecordPair,
+    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, ResetAcDevice,
     SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord, StampPart,
     node_stamps, stamp_reset,
 };
@@ -1849,11 +1849,7 @@ impl SensitivityKernel for Hfet1Sensitivity<'_> {
         reset: AcReset<'_>,
         current: RecordPair<'_>,
     ) -> SpiceResult<AcSensitivityLoad> {
-        Ok(AcSensitivityLoad::stamp(ResetHfet1 {
-            state: self.hfet1(reset.state)?,
-            current: self.hfet1(current)?,
-            omega: reset.omega,
-        }))
+        AcSensitivityLoad::reset(reset, current, |records| self.hfet1(records))
     }
 }
 
@@ -1947,25 +1943,16 @@ impl Hfet1Sensitivity<'_> {
     }
 }
 
-/// An HFET1's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
-#[derive(Debug)]
-struct ResetHfet1 {
-    /// Built from the reset load's records: the gate and channel
-    /// conductances.
-    state: Hfet1,
-    /// Built from the current records: conductances, `CDS`, `m`.
-    current: Hfet1,
-    /// `CKTomega`.
-    omega: Real,
-}
-
-impl AcSensitivityStamp for ResetHfet1 {
+impl ResetAcDevice for Hfet1 {
     /// `hfetacl.c`'s stamps in its order: the real parts, then the
     /// imaginary ones (`xgs`/`xgd` zero, `xds = CDS * CKTomega`).
-    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()> {
         let temperature = context.model_context.temperature;
-        let state = &self.state;
         // `type * (0 - 0)`: a signed zero, as C's at zero node voltages.
         let zero = state.model.pol * 0.;
         let point = state.point(
@@ -1977,9 +1964,7 @@ impl AcSensitivityStamp for ResetHfet1 {
         let (gm, ggs, ggd) = (point.gm, point.ggs, point.ggd);
         // Only the transient companion writes `ggspp`/`ggdpp`.
         let (ggspp, ggdpp) = (0., 0.);
-        let current = &self.current;
         let derived = current.derived(temperature)?;
-        let omega = self.omega;
         let xds = current.model.cds * omega;
         let (xgs, xgd) = (0. * omega, 0. * omega);
         let mut gds = point.gds;

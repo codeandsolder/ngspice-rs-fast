@@ -55,7 +55,7 @@ use crate::devices::schema::{
     ScalarDomain as D, ScalarParameter as P, ScalarSchema, ScalarUnit as U,
 };
 use crate::devices::sensitivity::{
-    AcReset, AcSensitivityLoad, AcSensitivityStamp, DcSensitivityLoad, ParameterScope, RecordPair,
+    AcReset, AcSensitivityLoad, DcSensitivityLoad, ParameterScope, RecordPair, ResetAcDevice,
     SensitivityFamily, SensitivityKernel, SensitivityParameter, SensitivityRecord, StampPart,
     node_stamps, stamp_reset,
 };
@@ -1109,10 +1109,7 @@ impl SensitivityKernel for Hfet2Sensitivity<'_> {
         reset: AcReset<'_>,
         current: RecordPair<'_>,
     ) -> SpiceResult<AcSensitivityLoad> {
-        Ok(AcSensitivityLoad::stamp(ResetHfet2 {
-            state: self.hfet2(reset.state)?,
-            current: self.hfet2(current)?,
-        }))
+        AcSensitivityLoad::reset(reset, current, |records| self.hfet2(records))
     }
 }
 
@@ -1179,29 +1176,22 @@ impl Hfet2Sensitivity<'_> {
     }
 }
 
-/// An HFET2's AC load in `cktsens.c`'s sweep
-/// ([`crate::devices::sensitivity::DeviceSensitivity::ac_load`]).
-#[derive(Debug)]
-struct ResetHfet2 {
-    /// Built from the reset load's records: the gate and channel
-    /// conductances.
-    state: Hfet2,
-    /// Built from the current records: series conductances and `m`.
-    current: Hfet2,
-}
-
-impl AcSensitivityStamp for ResetHfet2 {
+impl ResetAcDevice for Hfet2 {
     /// `hfet2acl.c`'s real stamps; its `xgs`/`xgd` imaginary parts are zero.
-    fn stamp_ac(&self, context: &mut LinearContext<'_>) -> SpiceResult<()> {
+    fn stamp_reset_ac(
+        state: &Self,
+        current: &Self,
+        _omega: Real,
+        context: &mut LinearContext<'_>,
+    ) -> SpiceResult<()> {
         let temperature = context.model_context.temperature;
-        let state = &self.state;
         // `type * (0 - 0)`: a signed zero, as C's at zero node voltages.
         let zero = state.model.pol * 0.;
         let point = state.point(&state.derived(temperature)?, zero, zero)?;
-        let derived = self.current.derived(temperature)?;
+        let derived = current.derived(temperature)?;
         let (gm, gds, ggs, ggd) = (point.gm, point.gds, point.ggs, point.ggd);
-        let m = self.current.instance.m;
-        let n = self.current.nodes;
+        let m = current.instance.m;
+        let n = current.nodes;
         let [gdpr, gspr] = n.series(&derived);
         let stamps = [
             (n.d, n.d, m * gdpr),
@@ -1221,7 +1211,7 @@ impl AcSensitivityStamp for ResetHfet2 {
             (n.sp, n.dp, -(m * gds)),
         ];
         stamp_reset(
-            &self.current.name,
+            &current.name,
             node_stamps(&stamps, StampPart::Real),
             context,
         )
