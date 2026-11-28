@@ -776,14 +776,13 @@ fn validate_iteration_input(
 ) -> SpiceResult<()> {
     options.validate()?;
     let n = initial.len();
-    if n == 0
-        || n != branch_rows.len()
+    if n != branch_rows.len()
         || limited_rows.is_some_and(|rows| rows.len() != n)
         || coordinate_kinds.is_some_and(|rows| rows.len() != n)
         || !initial.is_finite()
     {
         return Err(failure(
-            "Newton requires a nonempty square system, finite solution and matching row kinds",
+            "Newton requires a square system, finite solution and matching row kinds",
         ));
     }
     Ok(())
@@ -1076,6 +1075,12 @@ fn linearised_solve(
     options: &NewtonOptions,
     linearization: Linearization,
 ) -> SpiceResult<crate::maths::NiStep> {
+    // A validated zero-dimensional MNA system has exactly one solution.
+    // Keep ordinary load, phase, convergence and trial handling intact;
+    // the numerical factorization interface still requires a nonempty matrix.
+    if guess.is_empty() {
+        return Ok(crate::maths::NiStep::Solved(Vector::zeros(0)));
+    }
     let capturing = linearization.correction.capturing();
     let correction = if capturing {
         Some(matrix.original_correction(rhs, guess)?)

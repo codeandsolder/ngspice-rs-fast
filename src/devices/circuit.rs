@@ -130,6 +130,8 @@ struct DeviceOrigin {
     internal_nodes: Vec<NodeId>,
     /// The URC setup which generated this device and its model.
     generated_by: Option<usize>,
+    /// A source-level storage network is not an independently settable primitive.
+    prepared_storage: bool,
 }
 
 /// One elaborated device together with its setup provenance.
@@ -159,6 +161,7 @@ impl AsRef<dyn Device> for ElaboratedDevice {
 pub struct Circuit {
     nodes: NodeTable,
     devices: Vec<ElaboratedDevice>,
+    absent_storage: super::passive_network::AbsentStorage,
     bindings: TopologyBindings,
     mutual_limits: MutualLimits,
     elaboration_limits: ElaborationLimits,
@@ -1392,12 +1395,42 @@ impl Circuit {
         })
     }
 
-    fn elaboration_size(&self) -> SpiceResult<ElaborationSize> {
+    fn physical_elaboration_size(&self) -> SpiceResult<ElaborationSize> {
         Ok(ElaborationSize::new(
             self.devices.len(),
             self.nodes.len() - 1,
             Self::declared_state_slots(&self.devices, None)?,
         ))
+    }
+
+    fn elaboration_size(&self) -> SpiceResult<ElaborationSize> {
+        self.physical_elaboration_size()?.checked_add(
+            ElaborationSize::new(
+                self.absent_storage.names.len(),
+                self.absent_storage.isolated(&self.nodes).count(),
+                0,
+            ),
+            None,
+        )
+    }
+
+    /// Source-visible currents that are identically zero, without a device.
+    pub(crate) fn absent_storage_currents(&self) -> impl Iterator<Item = &str> {
+        self.absent_storage.names.iter().map(String::as_str)
+    }
+
+    pub(crate) fn absent_storage_voltage_nodes(&self) -> impl Iterator<Item = &str> {
+        self.absent_storage.isolated(&self.nodes)
+    }
+
+    pub(super) fn is_absent_storage(&self, name: &str) -> bool {
+        self.absent_storage.contains(name)
+    }
+
+    pub(crate) fn projected_output_count(&self) -> usize {
+        self.reported_currents().len()
+            + self.absent_storage.names.len()
+            + self.absent_storage.isolated(&self.nodes).count()
     }
 
     /// The node table.
@@ -1464,7 +1497,8 @@ impl Circuit {
             .get(index)
             .ok_or_else(|| SpiceError::circuit("device ordinal out of bounds"))?
             .origin;
-        if !origin.internal_nodes.is_empty()
+        if origin.prepared_storage
+            || !origin.internal_nodes.is_empty()
             || origin.generated_by.is_some()
             || self
                 .devices
@@ -1474,6 +1508,12 @@ impl Circuit {
             return Err(SpiceError::circuit(
                 "replace generated or private-node devices by re-elaboration",
             ));
+        }
+        if self.is_absent_storage(device.name()) {
+            return Err(SpiceError::circuit(format!(
+                "duplicate instance name '{}'",
+                device.name()
+            )));
         }
         let mut size = self.elaboration_size()?;
         size.states = size
@@ -1700,7 +1740,9 @@ impl Circuit {
         let limit = self.elaboration_limits.nodes;
         let node = self.nodes.transaction(|nodes| {
             let node = nodes.intern(name)?;
-            if nodes.len() - 1 > limit {
+            self.absent_storage.validate_voltage_binding(nodes)?;
+            if (nodes.len() - 1).saturating_add(self.absent_storage.isolated(nodes).count()) > limit
+            {
                 return Err(resource_error(
                     None,
                     format!("aggregate non-ground nodes exceed {limit}"),
@@ -2225,6 +2267,13 @@ impl Circuit {
                     None => SpiceError::circuit(message),
                 };
                 let Some(index) = names.get(&control.name) else {
+                    if self.is_absent_storage(&control.name) {
+                        return Err(failure(format!(
+                            "{}: zero-multiplicity storage {} has no physical controlling branch",
+                            device.name(),
+                            control.name
+                        )));
+                    }
                     return Err(failure(format!(
                         "{}: unknown controlling source {}",
                         device.name(),
@@ -2781,7 +2830,7 @@ impl Circuit {
                 || names.get(device.name()).is_some(),
                 |seen| !seen.insert(device.name().to_lowercase()),
             );
-            if duplicate {
+            if duplicate || self.is_absent_storage(device.name()) {
                 return Err(SpiceError::circuit(format!(
                     "duplicate instance name '{}'",
                     device.name()
@@ -2807,7 +2856,7 @@ impl Circuit {
                 )));
             }
         }
-        if self.device(device.name()).is_some() {
+        if self.device(device.name()).is_some() || self.is_absent_storage(device.name()) {
             return Err(SpiceError::circuit(format!(
                 "duplicate instance name '{}'",
                 device.name()
@@ -2855,11 +2904,13 @@ impl Circuit {
             .devices
             .iter()
             .map(|d| d.name().to_lowercase())
+            .chain(self.absent_storage.names.iter().cloned())
             .collect();
         let devices = &mut self.devices;
         let staged = self.nodes.transaction(|nodes| {
             let mark = nodes.len();
             let generated = build(nodes)?;
+            self.absent_storage.validate_voltage_binding(nodes)?;
             let mut staged = Vec::new();
             reserve(&mut staged, generated.len(), None)?;
             for device in generated {
@@ -3297,6 +3348,14 @@ impl Circuit {
             });
         };
         let device = &self.devices[index];
+        if device.origin.prepared_storage {
+            return Err(SpiceError::Unsupported {
+                feature: format!(
+                    "prepared storage network {name}: re-elaborate the source occurrence to change {keyword}"
+                ),
+                location: None,
+            });
+        }
         if let Some(parameter) = device.bind_numeric_parameter(keyword) {
             return Ok((index, parameter));
         }
@@ -4853,15 +4912,41 @@ impl Circuit {
         context: &ModelContext,
         resistors: &crate::devices::pwl_resistor::BoundResistors,
     ) -> SpiceResult<()> {
-        let existing = self.elaboration_size()?;
+        let existing = self.physical_elaboration_size()?;
         let limits = self.elaboration_limits;
+        let mut absent = self.absent_storage.clone();
+        let present = absent.partition(instances, &self.nodes)?;
+        let mut seen: BTreeSet<String> = self
+            .devices
+            .iter()
+            .map(|device| device.name().to_lowercase())
+            .collect();
+        if let Some(name) = absent.names.intersection(&seen).next() {
+            return Err(SpiceError::circuit(format!(
+                "duplicate instance name '{name}'"
+            )));
+        }
+        limits.check(
+            existing.checked_add(ElaborationSize::new(absent.names.len(), 0, 0), None)?,
+            None,
+        )?;
+        seen.extend(absent.names.iter().cloned());
+        let existing_names = self
+            .devices
+            .iter()
+            .map(|device| device.name())
+            .chain(absent.names.iter().map(String::as_str));
         let instances = crate::devices::behavioural::dynamic::expand(
-            instances,
+            present.as_ref(),
             &self.nodes,
             models,
-            self.devices.iter().map(|device| device.name()),
-            limits.devices.saturating_sub(existing.devices),
+            existing_names,
+            limits
+                .devices
+                .saturating_sub(existing.devices)
+                .saturating_sub(absent.names.len()),
             resistors,
+            &absent.terminals,
         )?;
         let aliases = instances.probe_aliases;
         let instances = instances.instances.as_ref();
@@ -4870,11 +4955,7 @@ impl Circuit {
         let mut plan =
             PlannedBatch::prepare(instances, models, context, &self.nodes, existing, limits)?;
         plan.resistors = (!resistors.is_empty()).then_some(resistors);
-        let seen: BTreeSet<String> = self
-            .devices
-            .iter()
-            .map(|device| device.name().to_lowercase())
-            .collect();
+        plan.deck_nodes.extend(absent.terminals.iter().cloned());
         let devices = &mut self.devices;
         let staged = self.nodes.transaction(|nodes| {
             let staged =
@@ -4885,6 +4966,25 @@ impl Circuit {
                 })?;
                 nodes.set_kind(id, NodeKind::ProbeAlias)?;
             }
+            absent.validate_voltage_binding(nodes)?;
+            // Observation-only records consume the ordinary resource budget,
+            // but never introduce a device, unknown, or state slot.
+            limits.check(
+                ElaborationSize::new(existing.devices, nodes.len() - 1, existing.states)
+                    .checked_add(
+                        ElaborationSize::new(
+                            staged.len(),
+                            0,
+                            Self::declared_state_slots(&staged, None)?,
+                        ),
+                        None,
+                    )?
+                    .checked_add(
+                        ElaborationSize::new(absent.names.len(), absent.isolated(nodes).count(), 0),
+                        None,
+                    )?,
+                None,
+            )?;
             // The node transaction commits only after the final device and
             // provenance vector can hold the entire staged suffix.
             devices.try_reserve(staged.len()).map_err(|error| {
@@ -4895,9 +4995,10 @@ impl Circuit {
             })?;
             Ok(staged)
         })?;
-        if !staged.is_empty() {
+        if !staged.is_empty() || absent.names.len() != self.absent_storage.names.len() {
             self.invalidate_topology();
         }
+        self.absent_storage = absent;
         self.devices.extend(staged);
         Ok(())
     }
@@ -5065,9 +5166,14 @@ impl Circuit {
                     device.name()
                 )));
             }
+            let prepared_storage = matches!(instance.designator, 'c' | 'l')
+                && device.name().eq_ignore_ascii_case(&instance.name);
             staged.push(ElaboratedDevice {
                 device,
-                origin: DeviceOrigin::default(),
+                origin: DeviceOrigin {
+                    prepared_storage,
+                    ..DeviceOrigin::default()
+                },
             });
         }
         if let Some(first) = staged.get_mut(first_device) {
@@ -5103,6 +5209,7 @@ impl Circuit {
                 internal_nodes,
                 model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
                 generated_by: None,
+                ..DeviceOrigin::default()
             },
         });
         Ok(())
@@ -5147,6 +5254,7 @@ impl Circuit {
                     },
                     model: instance.model.as_ref().map(|m| m.to_ascii_lowercase()),
                     generated_by: None,
+                    ..DeviceOrigin::default()
                 }
             } else {
                 // The generated diode's prime node belongs to diosetup.
@@ -5171,6 +5279,7 @@ impl Circuit {
                     internal_nodes,
                     model: Some(format!("{lower}#{suffix}")),
                     generated_by: Some(line),
+                    ..DeviceOrigin::default()
                 }
             };
             staged.push(ElaboratedDevice { device, origin });
@@ -5442,6 +5551,7 @@ impl Circuit {
             .devices
             .iter()
             .map(|device| device.name().to_ascii_lowercase())
+            .chain(self.absent_storage.names.iter().cloned())
             .collect();
         let nodes: Vec<_> = self.physical_voltage_nodes().collect();
         let resistors = if shunts.resistance.is_some() {

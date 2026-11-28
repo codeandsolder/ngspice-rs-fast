@@ -80,8 +80,7 @@ fn unit(device: char, key: &str) -> &'static str {
 pub struct Observation {
     name: String,
     unit: &'static str,
-    device: usize,
-    selector: Selector,
+    target: ObservationTarget,
 }
 
 impl Observation {
@@ -96,6 +95,12 @@ impl Observation {
     pub const fn unit(&self) -> &'static str {
         self.unit
     }
+}
+
+#[derive(Debug)]
+enum ObservationTarget {
+    Zero,
+    Physical { device: usize, selector: Selector },
 }
 
 #[derive(Debug)]
@@ -425,11 +430,18 @@ impl PointLoads<'_, '_> {
 
     fn observe(&mut self, query: &Observation) -> SpiceResult<Real> {
         let name = query.name();
-        let device = self.point.device(self.circuit, query.device);
+        let ObservationTarget::Physical {
+            device: index,
+            selector,
+        } = &query.target
+        else {
+            return Ok(0.);
+        };
+        let device = self.point.device(self.circuit, *index);
         let row_value =
             |row: Option<usize>| row.map_or(0., |row| self.request.solution.as_slice()[row]);
         let context = self.request.model_context;
-        match &query.selector {
+        match selector {
             Selector::Current { load, slot } => self.current(*load, *slot, name),
             Selector::Power { load, slot, rows } => {
                 let current = self.current(*load, *slot, name)? * device.observation_current_sign();
@@ -467,8 +479,28 @@ impl ObservationPlan {
         for name in names {
             let name = name.to_ascii_lowercase();
             let (instance, key) = query(&name)?;
-            if name.starts_with("i(") && circuit.intrinsic_current_device_index(instance).is_some()
+            if name.starts_with("i(")
+                && (circuit.intrinsic_current_device_index(instance).is_some()
+                    || circuit.is_absent_storage(instance))
             {
+                continue;
+            }
+            if circuit.is_absent_storage(instance) {
+                if !matches!(key, "i" | "current" | "p" | "power" | "m") {
+                    return Err(gap(&name));
+                }
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if plan.queries.len() >= 1024 {
+                    return Err(gap("more than 1024 requested quantities"));
+                }
+                let unit = unit(instance.chars().next().unwrap_or('c'), key);
+                plan.queries.push(Observation {
+                    name,
+                    unit,
+                    target: ObservationTarget::Zero,
+                });
                 continue;
             }
             let index = circuit
@@ -531,8 +563,10 @@ impl ObservationPlan {
             plan.queries.push(Observation {
                 unit: unit(device.designator(), key),
                 name,
-                device: index,
-                selector,
+                target: ObservationTarget::Physical {
+                    device: index,
+                    selector,
+                },
             });
         }
         Ok(plan)
@@ -683,7 +717,14 @@ impl Circuit {
         }
         let point = run.point(context)?;
         let ask = |query: &Observation| {
-            let key = match &query.selector {
+            let ObservationTarget::Physical {
+                device: index,
+                selector,
+            } = &query.target
+            else {
+                return Ok(Complex::real(0.));
+            };
+            let key = match selector {
                 Selector::SourceDc => "dc",
                 Selector::Parameter(key) => key,
                 Selector::Current { .. } | Selector::Power { .. } => {
@@ -691,7 +732,7 @@ impl Circuit {
                 }
             };
             let value = point
-                .device(self, query.device)
+                .device(self, *index)
                 .observation_parameter(key, context)?
                 .ok_or_else(|| gap(query.name()))?;
             if !value.is_finite() {

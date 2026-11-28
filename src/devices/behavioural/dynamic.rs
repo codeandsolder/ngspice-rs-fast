@@ -155,6 +155,7 @@ pub(in crate::devices) fn expand<'a, 'n>(
     existing_names: impl Iterator<Item = &'n str>,
     capacity: usize,
     resistors: &crate::devices::pwl_resistor::BoundResistors,
+    absent_terminals: &BTreeSet<String>,
 ) -> SpiceResult<ExpandedInstances<'a>> {
     let count = derivative_count(instances);
     let measured = measured_targets(instances, models, resistors)?;
@@ -172,7 +173,8 @@ pub(in crate::devices) fn expand<'a, 'n>(
         .ok_or_else(|| {
             SpiceError::circuit("dynamic expression exceeds device elaboration limit")
         })?;
-    let (occupied_nodes, occupied_devices) = occupied_names(instances, nodes, existing_names);
+    let (mut occupied_nodes, occupied_devices) = occupied_names(instances, nodes, existing_names);
+    occupied_nodes.extend(absent_terminals.iter().cloned());
     let mut expansion = Expansion {
         nodes: occupied_nodes,
         devices: occupied_devices,

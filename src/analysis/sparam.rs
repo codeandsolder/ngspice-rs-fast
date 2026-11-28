@@ -278,7 +278,7 @@ impl<'a> RfPlan<'a> {
             unknowns,
             sum(&[
                 circuit.observations().len(),
-                circuit.reported_currents().len(),
+                circuit.projected_output_count(),
             ])?,
             grid.len(),
             noise,
